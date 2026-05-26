@@ -60,7 +60,7 @@ fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &m
     }
 }
 
-fn build_huffman_codes(histograms: &[Histogram]) -> Vec<PrefixCode> {
+pub(crate) fn build_huffman_codes(histograms: &[Histogram]) -> Vec<PrefixCode> {
     let mut out: Vec<PrefixCode> = Vec::with_capacity(histograms.len());
     for h in histograms {
         let counts: [u32; ALPHABET_SIZE] = h.counts;

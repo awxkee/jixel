@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub(crate) const ALPHABET_SIZE: usize = 64;
+pub(crate) const ALPHABET_SIZE: usize = 128;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrefixCode {

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 fn main() {
-    let output = "encoded_lossy_avx.jxl";
+    let output = "encoded_lossless.jxl";
     let image = image::open(Path::new("./assets/abstract_alpha.png")).unwrap();
     let width = image.width();
     let height = image.height();
@@ -35,7 +35,7 @@ fn main() {
         image.width() as usize,
         image.height() as usize,
         distance_from_quality(99.),
-        false,
+        true,
     );
     std::fs::write(&output, &bytes).expect("failed to write output");
 }
