@@ -63,7 +63,7 @@ fn histogram_distance(a: &Histogram, b: &Histogram, a_cost: f32, b_cost: f32) ->
 
 /// Cluster `histograms` in place down to at most 8 distinct ones; produce
 /// `context_map[i] = cluster index for histogram i`.
-pub fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &mut Vec<u8>) {
+pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &mut Vec<u8>) {
     if histograms.len() <= 1 {
         context_map.clear();
         context_map.resize(histograms.len(), 0);
