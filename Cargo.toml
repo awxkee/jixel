@@ -5,6 +5,16 @@ members = ["app"]
 name = "jixel"
 version = "0.1.0"
 edition = "2024"
+description = "Tiny JPEG XL encoder"
+readme = "README.md"
+keywords = ["jpegxl", "jxl", "encoder", "image", "compression"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/jixel"
+categories = ["multimedia::images", "compression", "encoding"]
+homepage = "https://github.com/awxkee/jixel"
+repository = "https://github.com/awxkee/jixel"
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.93.0"
 
 [dependencies]
