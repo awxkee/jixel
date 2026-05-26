@@ -1,0 +1,14 @@
+[workspace]
+members = ["app"]
+
+[package]
+name = "jixel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+default = ["neon", "fixed-xyb"]
+fixed-xyb = []
+neon = []
