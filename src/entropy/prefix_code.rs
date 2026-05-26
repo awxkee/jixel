@@ -27,16 +27,16 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub const ALPHABET_SIZE: usize = 64;
+pub(crate) const ALPHABET_SIZE: usize = 64;
 
 #[derive(Clone, Copy)]
-pub struct PrefixCode {
-    pub depths: [u8; ALPHABET_SIZE],
-    pub bits: [u16; ALPHABET_SIZE],
+pub(crate) struct PrefixCode {
+    pub(crate) depths: [u8; ALPHABET_SIZE],
+    pub(crate) bits: [u16; ALPHABET_SIZE],
 }
 
 impl PrefixCode {
-    pub const fn zero() -> Self {
+    pub(crate) const fn zero() -> Self {
         Self {
             depths: [0; ALPHABET_SIZE],
             bits: [0; ALPHABET_SIZE],
@@ -74,7 +74,7 @@ fn reverse_bits(num_bits: u32, bits: u16) -> u16 {
 /// Compute canonical bit patterns from given bit depths.
 ///   depth[i] = 0 means symbol absent; depth[i] > 0 is the code length.
 /// Output: bits[i] = the (bit-reversed) prefix code for symbol i.
-pub fn convert_bit_depths_to_symbols(depth: &[u8], bits: &mut [u16]) {
+pub(crate) fn convert_bit_depths_to_symbols(depth: &[u8], bits: &mut [u16]) {
     const MAX_BITS: usize = 16;
     let mut bl_count = [0u16; MAX_BITS];
     for &d in depth {

@@ -29,15 +29,15 @@
 
 use super::prefix_code::PrefixCode;
 
-pub struct EntropyCode<'a> {
-    pub context_map: &'a [u8],
-    pub num_contexts: usize,
-    pub prefix_codes: &'a [PrefixCode],
+pub(crate) struct EntropyCode<'a> {
+    pub(crate) context_map: &'a [u8],
+    pub(crate) num_contexts: usize,
+    pub(crate) prefix_codes: &'a [PrefixCode],
     #[allow(unused)]
-    pub num_prefix_codes: usize,
+    pub(crate) num_prefix_codes: usize,
     /// Original (pre-cluster) context map. None for static codes.
-    pub orig_context_map: Option<&'a [u8]>,
-    pub orig_num_contexts: usize,
+    pub(crate) orig_context_map: Option<&'a [u8]>,
+    pub(crate) orig_num_contexts: usize,
 }
 
 impl<'a> EntropyCode<'a> {
@@ -56,16 +56,16 @@ impl<'a> EntropyCode<'a> {
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
 /// suitable for runtime-built codes.
-pub struct OwnedEntropyCode {
-    pub context_map: Vec<u8>,
-    pub prefix_codes: Vec<PrefixCode>,
+pub(crate) struct OwnedEntropyCode {
+    pub(crate) context_map: Vec<u8>,
+    pub(crate) prefix_codes: Vec<PrefixCode>,
     /// Pre-cluster context map, if clustering was applied.
-    pub orig_context_map: Option<Vec<u8>>,
-    pub orig_num_contexts: usize,
+    pub(crate) orig_context_map: Option<Vec<u8>>,
+    pub(crate) orig_num_contexts: usize,
 }
 
 impl OwnedEntropyCode {
-    pub fn as_ref(&self) -> EntropyCode<'_> {
+    pub(crate) fn as_ref(&self) -> EntropyCode<'_> {
         EntropyCode {
             context_map: &self.context_map,
             num_contexts: self.context_map.len(),
