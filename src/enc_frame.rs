@@ -176,10 +176,6 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     }
 }
 
-// -----------------------------------------------------------------------------
-// DC tokens, AC metadata tokens, context tree tokens.
-// -----------------------------------------------------------------------------
-
 #[inline]
 fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
     let mn = n.min(w);

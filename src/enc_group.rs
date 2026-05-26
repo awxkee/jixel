@@ -196,6 +196,9 @@ pub fn write_ac_group(
             let mut coeffs_x = [0.0f32; 64];
             let mut coeffs_y = [0.0f32; 64];
             let mut coeffs_b = [0.0f32; 64];
+
+            let mut tmp_in = [0.0f32; 64];
+
             for c in 0..3 {
                 let dst: &mut [f32; 64] = match c {
                     0 => &mut coeffs_x,
@@ -204,7 +207,6 @@ pub fn write_ac_group(
                 };
                 let plane = opsin.plane(c);
                 let src_x = bx * 8; // stripe-local
-                let mut tmp_in = [0.0f32; 64];
                 for (yy, dst_tmp) in tmp_in.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let row = plane.row(opsin_y0 + yy);
                     dst_tmp.copy_from_slice(&row[src_x..src_x + 8]);
