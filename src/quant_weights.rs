@@ -27,12 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(clippy::excessive_precision)]
-pub const INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
-pub const DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
+pub(crate) const INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
+pub(crate) const DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
 
 /// Per-channel dequant matrices for 8x8 DCT.
 /// Indexed [channel][y * 8 + x]. Channel 0 = X, 1 = Y, 2 = B.
-pub const DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
+pub(crate) const DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
     // Channel 0 (X): kQuantWeights[0..64]
     [
         3.1746033e-04,
@@ -236,16 +236,16 @@ pub const DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
     ],
 ];
 
-pub struct DequantMatrices {
-    pub matrix: [[f32; 64]; 3],
+pub(crate) struct DequantMatrices {
+    pub(crate) matrix: [[f32; 64]; 3],
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT — using these for DC would
     /// silently produce wrong values, so zero it as a safety measure.
-    pub inv_matrix: [[f32; 64]; 3],
+    pub(crate) inv_matrix: [[f32; 64]; 3],
 }
 
 impl DequantMatrices {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let matrix = DEQUANT_MATRIX_8X8;
         let mut inv = [[0.0f32; 64]; 3];
         for c in 0..3 {
@@ -261,12 +261,12 @@ impl DequantMatrices {
     }
 
     #[inline]
-    pub fn matrix(&self, c: usize) -> &[f32; 64] {
+    pub(crate) fn matrix(&self, c: usize) -> &[f32; 64] {
         &self.matrix[c]
     }
 
     #[inline]
-    pub fn inv_matrix(&self, c: usize) -> &[f32; 64] {
+    pub(crate) fn inv_matrix(&self, c: usize) -> &[f32; 64] {
         &self.inv_matrix[c]
     }
 }

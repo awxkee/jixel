@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub struct BitWriter {
+pub(crate) struct BitWriter {
     storage: Vec<u8>,
     bits_written: usize,
 }
@@ -36,22 +36,22 @@ impl BitWriter {
     /// Upper bound on `n_bits` per `write` call. Mirrors libjxl's
     /// kMaxBitsPerCall — the running byte (up to 7 valid bits) plus the new
     /// bits must fit in 64 bits with room for the next zero-init byte.
-    pub const MAX_BITS_PER_CALL: usize = 56;
+    pub(crate) const MAX_BITS_PER_CALL: usize = 56;
 
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             storage: Vec::new(),
             bits_written: 0,
         }
     }
 
-    pub fn bits_written(&self) -> usize {
+    pub(crate) fn bits_written(&self) -> usize {
         self.bits_written
     }
 
     /// Write `n_bits` low-order bits of `bits`. Requires `n_bits <= 56` and
     /// upper bits of `bits` to be zero.
-    pub fn write(&mut self, n_bits: usize, bits: u64) {
+    pub(crate) fn write(&mut self, n_bits: usize, bits: u64) {
         debug_assert!(n_bits <= Self::MAX_BITS_PER_CALL);
         debug_assert!(n_bits == 64 || (bits >> n_bits) == 0);
 
@@ -82,7 +82,7 @@ impl BitWriter {
     }
 
     /// Zero-pad to the next byte boundary.
-    pub fn zero_pad_to_byte(&mut self) {
+    pub(crate) fn zero_pad_to_byte(&mut self) {
         let rem = (8 - (self.bits_written % 8)) % 8;
         if rem != 0 {
             self.write(rem, 0);
@@ -92,7 +92,7 @@ impl BitWriter {
 
     /// Append the contents of each writer in `others` onto self, after first
     /// padding both self and each `other` to byte boundaries.
-    pub fn append_byte_aligned(&mut self, others: &mut [BitWriter]) {
+    pub(crate) fn append_byte_aligned(&mut self, others: &mut [BitWriter]) {
         let mut extra = 0usize;
         for w in others.iter() {
             extra += (w.bits_written + 7) / 8;
@@ -123,7 +123,7 @@ impl BitWriter {
     }
 
     /// Append `other`'s bits onto self, bit-by-bit (general, not byte-aligned).
-    pub fn append(&mut self, other: &BitWriter) {
+    pub(crate) fn append(&mut self, other: &BitWriter) {
         let full_bytes = other.bits_written / 8;
         let trailing_bits = other.bits_written % 8;
         for i in 0..full_bytes {
@@ -137,7 +137,7 @@ impl BitWriter {
     }
 
     /// Consume self and return the byte buffer. Self must be byte-aligned.
-    pub fn into_bytes(mut self) -> Vec<u8> {
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         debug_assert_eq!(self.bits_written % 8, 0);
         self.storage.truncate(self.bits_written / 8);
         self.storage

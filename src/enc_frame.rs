@@ -32,6 +32,7 @@ use crate::bit_writer::BitWriter;
 use crate::dc_group_data::DcGroupData;
 use crate::enc_group::write_ac_group;
 use crate::enc_xyb::to_xyb;
+use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     EntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
@@ -72,7 +73,7 @@ struct ImageDim {
     num_dc_groups: usize,
 }
 
-fn div_ceil(a: usize, b: usize) -> usize {
+pub(crate) fn div_ceil(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
@@ -440,7 +441,7 @@ fn write_dc_global(
     distp: &DistanceParams,
     num_dc_groups: usize,
     dc_code: &EntropyCode,
-    alpha: Option<&[u8]>,
+    alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
     w: &mut BitWriter,
@@ -564,12 +565,17 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
 // Top-level frame encode.
 // -----------------------------------------------------------------------------
 
-pub fn encode_frame(distance: f32, linear: &Image3F, alpha: Option<&[u8]>, writer: &mut BitWriter) {
+pub fn encode_frame(
+    distance: f32,
+    linear: &Image3F,
+    alpha: Option<&AlphaPlane>,
+    writer: &mut BitWriter,
+) {
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
     let distp = compute_distance_params(distance);
     let matrices = DequantMatrices::new();
-    let dc_code = EntropyCode::r#static(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
-    let ac_code = EntropyCode::r#static(&K_AC_CONTEXT_MAP, &K_AC_PREFIX_CODES);
+    let dc_code = EntropyCode::new(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
+    let ac_code = EntropyCode::new(&K_AC_CONTEXT_MAP, &K_AC_PREFIX_CODES);
 
     // Section layout:
     //   0                                  : DC global
@@ -628,7 +634,7 @@ fn process_dc_group(
     ac_code: &EntropyCode,
     dc_gx: usize,
     dc_gy: usize,
-    alpha: Option<&[u8]>,
+    alpha: Option<&AlphaPlane>,
     sections: &mut [BitWriter],
 ) {
     // DC group rect in pixels (clamped to image bounds).

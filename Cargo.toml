@@ -5,10 +5,12 @@ members = ["app"]
 name = "jixel"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.93.0"
 
 [dependencies]
 
 [features]
-default = ["neon", "fixed-xyb"]
+default = ["avx", "neon", "fixed-xyb"]
+avx = []
 fixed-xyb = []
 neon = []

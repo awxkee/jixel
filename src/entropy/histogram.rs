@@ -30,13 +30,13 @@
 use super::prefix_code::ALPHABET_SIZE;
 
 #[derive(Clone)]
-pub struct Histogram {
-    pub counts: [u32; ALPHABET_SIZE],
-    pub total_count: u32,
+pub(crate) struct Histogram {
+    pub(crate) counts: [u32; ALPHABET_SIZE],
+    pub(crate) total_count: u32,
 }
 
 impl Histogram {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             counts: [0; ALPHABET_SIZE],
             total_count: 0,
@@ -44,7 +44,7 @@ impl Histogram {
     }
 
     #[inline]
-    pub fn add(&mut self, symbol: u32) {
+    pub(crate) fn add(&mut self, symbol: u32) {
         self.counts[symbol as usize] += 1;
         self.total_count += 1;
     }

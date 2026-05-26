@@ -205,9 +205,9 @@ pub fn write_ac_group(
                 let plane = opsin.plane(c);
                 let src_x = bx * 8; // stripe-local
                 let mut tmp_in = [0.0f32; 64];
-                for yy in 0..8 {
+                for (yy, dst_tmp) in tmp_in.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     let row = plane.row(opsin_y0 + yy);
-                    tmp_in[yy * 8..yy * 8 + 8].copy_from_slice(&row[src_x..src_x + 8]);
+                    dst_tmp.copy_from_slice(&row[src_x..src_x + 8]);
                 }
                 dct8x8(&tmp_in, dst);
             }

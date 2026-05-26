@@ -7,29 +7,35 @@
 #![forbid(unsafe_code)]
 
 use image::codecs::png::PngEncoder;
-use jixel::srgb_to_linear_u8;
-use jxl_encoder::quality_to_distance;
+use jixel::distance_from_quality;
 use std::path::Path;
 use std::time::Instant;
 
 fn main() {
-    let output = "encoded_lossy2.jxl";
+    let output = "encoded_lossy_avx.jxl";
     let image = image::open(Path::new("./assets/abstract_alpha.png")).unwrap();
+    let width = image.width();
+    let height = image.height();
+    let rgb_img = image.to_rgb8();
+    let src_rgb = rgb_img.as_raw();
     // for i in 0..10 {
     //     let instant = Instant::now();
-    //     let bytes = jixel::encode_image(
-    //         image.to_rgb8().as_raw(),
+    //     let d_bytes = jixel::encode_image_with_alpha(
+    //         image.to_rgba8().as_raw(),
     //         image.width() as usize,
     //         image.height() as usize,
-    //         0.01,
+    //         distance_from_quality(99.),
+    //         true,
     //     );
     //     println!("Encoded in {}ms", instant.elapsed().as_millis());
     // }
+    // // let img10 = image.to_rgba16().iter().map(|x| x >> 4).collect::<Vec<_>>();
     let bytes = jixel::encode_image_with_alpha(
         image.to_rgba8().as_raw(),
         image.width() as usize,
         image.height() as usize,
-        quality_to_distance(99.),
+        distance_from_quality(99.),
+        false,
     );
     std::fs::write(&output, &bytes).expect("failed to write output");
 }

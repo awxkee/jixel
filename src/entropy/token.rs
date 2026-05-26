@@ -39,11 +39,6 @@ impl Token {
     }
 }
 
-// Hybrid-uint config parameters (signaled in write_prefix_codes).
-pub const HYBRID_UINT_SPLIT_EXPONENT: u32 = 4;
-pub const HYBRID_UINT_MSB_IN_TOKEN: u32 = 2;
-pub const HYBRID_UINT_LSB_IN_TOKEN: u32 = 0;
-
 /// Hybrid-uint encode: split a u32 into (token, nbits, bits).
 /// With config (4, 2, 0):
 ///   value < 16              -> (value, 0, 0)

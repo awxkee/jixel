@@ -27,17 +27,20 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::bit_writer::BitWriter;
+use crate::color::{lut_high_bit, srgb_to_linear_u8};
 use crate::color_encoding::{ColorEncoding, write_color_encoding};
 use crate::enc_frame::encode_frame;
+use crate::enc_lossless::encode_frame_lossless;
 use crate::image::Image3F;
-use crate::srgb_to_linear_u8;
 
 /// 8-bit alpha plane (row-major, stride = `xsize`).
-pub type AlphaPlane = Vec<u8>;
-
-// -----------------------------------------------------------------------------
-// Codestream constants.
-// -----------------------------------------------------------------------------
+#[derive(Debug, Clone)]
+pub enum AlphaPlane {
+    /// 8-bit alpha, values 0..=255.
+    U8(Vec<u8>),
+    /// 10-bit (`bits=10`, values 0..=1023) or 12-bit (`bits=12`, values 0..=4095) alpha.
+    U16 { data: Vec<u16>, bits: u8 },
+}
 
 /// Codestream marker byte that follows the leading 0xFF. Identifies this as
 /// a raw JXL codestream (vs an ISOBMFF-wrapped one).
@@ -51,37 +54,92 @@ const MIN_DISTANCE: f32 = 0.03;
 /// 30 bits, so 2^30 is the largest representable dimension.
 const MAX_DIMENSION: usize = 0x3FFF_FFFF;
 
-// -----------------------------------------------------------------------------
-// Encode configuration.
-// -----------------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitsPerSample {
+    Eight,
+    Ten,
+    Twelve,
+}
 
-/// Configuration for a single encode call.
-///
-/// Defaults are tuned to match the legacy `encode_file(image, distance)`
-/// behaviour: linear-RGB float input, sRGB primaries, linear transfer, D65.
+impl Default for BitsPerSample {
+    fn default() -> Self {
+        Self::Eight
+    }
+}
+
+impl BitsPerSample {
+    pub(crate) fn bits(self) -> u32 {
+        match self {
+            BitsPerSample::Eight => 8,
+            BitsPerSample::Ten => 10,
+            BitsPerSample::Twelve => 12,
+        }
+    }
+}
+
+impl AlphaPlane {
+    /// Create an 8-bit alpha plane.
+    #[inline]
+    pub fn from_u8(data: Vec<u8>) -> Self {
+        Self::U8(data)
+    }
+
+    /// Create a 10-bit alpha plane (values 0..=1023).
+    #[inline]
+    pub fn from_u16_10bit(data: Vec<u16>) -> Self {
+        Self::U16 { data, bits: 10 }
+    }
+
+    /// Create a 12-bit alpha plane (values 0..=4095).
+    #[inline]
+    pub fn from_u16_12bit(data: Vec<u16>) -> Self {
+        Self::U16 { data, bits: 12 }
+    }
+
+    /// Number of pixels.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::U8(v) => v.len(),
+            Self::U16 { data, .. } => data.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bit depth of the alpha samples (8, 10, or 12).
+    #[inline]
+    pub fn bits(&self) -> u8 {
+        match self {
+            Self::U8(_) => 8,
+            Self::U16 { bits, .. } => *bits,
+        }
+    }
+
+    /// Read pixel `idx` as `i32`.  Encoder hot path — kept tiny for inlining.
+    #[inline]
+    pub fn get_i32(&self, idx: usize) -> i32 {
+        match self {
+            Self::U8(v) => v[idx] as i32,
+            Self::U16 { data, .. } => data[idx] as i32,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
-    /// Butteraugli target distance. Smaller = higher quality, larger files.
-    /// Clamped to a minimum of 0.03; lossless is not supported.
     pub distance: f32,
-
-    /// Color encoding signalled in the codestream.
     pub color_encoding: ColorEncoding,
-
-    /// Optional embedded ICC profile bytes.
-    ///
-    /// **Not yet implemented**: the JXL ICC stream uses a custom compression
-    /// scheme (41-context arithmetic coding + tag-list commands) that hasn't
-    /// been ported. Setting this currently panics on encode. The field is
-    /// retained so the API doesn't need to change once support lands.
     pub icc_profile: Option<Vec<u8>>,
-
-    /// Optional 8-bit alpha plane (row-major, stride = `image.xsize()`,
-    /// length = `image.xsize() * image.ysize()`). When set, the encoded
-    /// codestream declares one extra channel (Alpha, U8, unassociated) and
-    /// the plane is stored losslessly via a minimum-viable Modular sub-
-    /// bitstream (single-leaf MA tree, Gradient predictor).
     pub alpha: Option<AlphaPlane>,
+    /// Bit depth declared in the codestream (default: 8).
+    pub bits_per_sample: BitsPerSample,
+    /// If true, encode losslessly via the modular encoder. `distance` is then
+    /// ignored. RGB and alpha both round-trip bit-perfectly.
+    pub lossless: bool,
 }
 
 impl Default for EncodeConfig {
@@ -91,6 +149,8 @@ impl Default for EncodeConfig {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             alpha: None,
+            bits_per_sample: BitsPerSample::Eight,
+            lossless: false,
         }
     }
 }
@@ -127,6 +187,16 @@ impl EncodeConfig {
     /// Length must equal `xsize * ysize` of the image passed to encode.
     pub fn with_alpha(mut self, alpha: AlphaPlane) -> Self {
         self.alpha = Some(alpha);
+        self
+    }
+
+    pub fn with_bits_per_sample(mut self, bps: BitsPerSample) -> Self {
+        self.bits_per_sample = bps;
+        self
+    }
+
+    pub fn with_lossless(mut self, lossless: bool) -> Self {
+        self.lossless = lossless;
         self
     }
 }
@@ -239,6 +309,7 @@ pub fn encode_image_with_alpha(
     width: usize,
     height: usize,
     distance: f32,
+    lossless: bool,
 ) -> Vec<u8> {
     assert!(width > 0 && height > 0, "empty image");
     assert_eq!(
@@ -248,8 +319,7 @@ pub fn encode_image_with_alpha(
     );
     let distance = distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
-    let mut alpha_plane = AlphaPlane::new();
-    alpha_plane.resize(width * height, 0);
+    let mut alpha_plane = vec![0u8; width * height];
     for (y, (row, alpha_row)) in input
         .chunks_exact(width * 4)
         .zip(alpha_plane.chunks_exact_mut(width))
@@ -271,7 +341,87 @@ pub fn encode_image_with_alpha(
     }
     encode_with_config(
         &linear,
-        &EncodeConfig::with_distance(distance).with_alpha(alpha_plane),
+        &EncodeConfig::with_distance(distance)
+            .with_alpha(AlphaPlane::from_u8(alpha_plane))
+            .with_lossless(lossless),
+    )
+}
+
+/// Encode a 10-bit RGBA image (`u16` channels, values 0..=1023).
+/// Input is interleaved RGBA, each channel a `u16` in native byte order.
+/// Alpha is stored losslessly; RGB is encoded at the given distance.
+pub fn encode_image_with_alpha_10bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    distance: f32,
+) -> Vec<u8> {
+    encode_high_depth_rgba(input, width, height, distance, BitsPerSample::Ten)
+}
+
+/// Encode a 12-bit RGBA image (`u16` channels, values 0..=4095).
+/// Input is interleaved RGBA, each channel a `u16` in native byte order.
+/// Alpha is stored losslessly; RGB is encoded at the given distance.
+pub fn encode_image_with_alpha_12bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    distance: f32,
+) -> Vec<u8> {
+    encode_high_depth_rgba(input, width, height, distance, BitsPerSample::Twelve)
+}
+
+/// Shared implementation for 10-bit and 12-bit RGBA encoding.
+fn encode_high_depth_rgba(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    distance: f32,
+    bps: BitsPerSample,
+) -> Vec<u8> {
+    assert!(width > 0 && height > 0);
+    assert_eq!(
+        input.len(),
+        width * height * 4,
+        "expected width * height * 4 u16 values"
+    );
+    let distance = distance.max(MIN_DISTANCE);
+    let mut linear = Image3F::new(width, height);
+    let mut alpha_plane = vec![0u16; width * height];
+
+    let lut = &lut_high_bit(bps.bits() as u8).table;
+
+    let bp_max = (1 << bps.bits()) - 1;
+
+    for (y, (row, alpha_row)) in input
+        .chunks_exact(width * 4)
+        .zip(alpha_plane.chunks_exact_mut(width))
+        .enumerate()
+    {
+        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+        for ((((r, g), b), src), alpha) in r_row
+            .iter_mut()
+            .zip(g_row.iter_mut())
+            .zip(b_row.iter_mut())
+            .zip(row.as_chunks::<4>().0.iter())
+            .zip(alpha_row.iter_mut())
+        {
+            *r = lut[src[0] as usize];
+            *g = lut[src[1] as usize];
+            *b = lut[src[2] as usize];
+            *alpha = src[3].min(bp_max);
+        }
+    }
+
+    encode_with_config(
+        &linear,
+        &EncodeConfig::with_distance(distance)
+            .with_alpha(match bps {
+                BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
+                BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
+                BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
+            })
+            .with_bits_per_sample(bps),
     )
 }
 
@@ -284,9 +434,7 @@ pub fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
     );
     assert!(
         config.icc_profile.is_none(),
-        "ICC profile injection is not yet supported by jixel; only built-in \
-         color encodings (sRGB / Display P3 / BT.2020 / etc.) are currently \
-         representable. Track this as a future enhancement."
+        "ICC profile injection is not yet supported by jixel"
     );
     if let Some(alpha) = config.alpha.as_ref() {
         let expected = input.xsize() * input.ysize();
@@ -299,22 +447,23 @@ pub fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
     }
 
     let distance = config.distance.max(MIN_DISTANCE);
-    let has_alpha = config.alpha.is_some();
-
     let mut w = BitWriter::new();
-
-    // Codestream signature.
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
-
-    // Header: image dimensions.
     write_size_header(input.xsize(), input.ysize(), &mut w);
-
-    // Header: image metadata (the bit layout is fixed by the JXL spec).
-    write_image_metadata(&config.color_encoding, has_alpha, &mut w);
-
-    encode_frame(distance, input, config.alpha.as_deref(), &mut w);
-
+    write_image_metadata(
+        &config.color_encoding,
+        config.alpha.as_ref(),
+        config.bits_per_sample,
+        config.lossless,
+        &mut w,
+    );
+    if config.lossless {
+        encode_frame_lossless(input, config.alpha.as_ref(), config.bits_per_sample, &mut w);
+    } else {
+        encode_frame(distance, input, config.alpha.as_ref(), &mut w);
+    }
+    encode_frame(distance, input, config.alpha.as_ref(), &mut w);
     w.into_bytes()
 }
 
@@ -343,63 +492,60 @@ fn write_size_header(xsize: usize, ysize: usize, w: &mut BitWriter) {
     write_size(xsize as u32, w);
 }
 
-// -----------------------------------------------------------------------------
-// Image metadata.
-// -----------------------------------------------------------------------------
-
-/// jixel always writes XYB-encoded f32 RGB images.
-/// When `has_alpha` is true, also declares one Alpha extra channel.
-fn write_image_metadata(color_encoding: &ColorEncoding, has_alpha: bool, w: &mut BitWriter) {
-    // ImageMetadata: not all-default, since we need to flip a few fields.
+fn write_image_metadata(
+    color_encoding: &ColorEncoding,
+    alpha: Option<&AlphaPlane>,
+    bps: BitsPerSample,
+    lossless: bool,
+    w: &mut BitWriter,
+) {
     w.write(1, 0); // all_default = false
-    w.write(1, 0); // extra_fields = false (no preview / animation / extra)
-
-    // BitDepth: U8 sample format.
-    //
-    // Note: with `xyb_encoded = true` (which jixel always sets), the color
-    // channels are stored as quantized XYB coefficients regardless of this
-    // field — it's purely metadata describing the original source. We choose
-    // U8 here because:
-    //
-    //   1. It matches what cjxl emits for ordinary 8-bit input images, and
-    //      thus exercises the most well-trodden decoder path in libjxl.
-    //
-    //   2. When `has_alpha = true`, the alpha ExtraChannelInfo's `bit_depth`
-    //      defaults to this value. Declaring the image as F32 here caused
-    //      libjxl 0.7's output stage to apply a 2× scaling to alpha pixels
-    //      (the alpha pipeline indexes off `full_image.bitdepth`, which is
-    //      taken from this field). Declaring U8 makes that go away.
-    //
-    //   3. The encoder doesn't currently round-trip bit-depth information
-    //      from the input; everything goes through f32 internally, gets XYB-
-    //      encoded, and quantized. So declaring U8 vs F32 makes no difference
-    //      to output quality for the color channels.
+    w.write(1, 0); // extra_fields = false
     w.write(1, 0); // floating_point_sample = false
-    w.write(2, 0); // bits_per_sample selector = 0 → 8
+    match bps {
+        BitsPerSample::Eight => w.write(2, 0),  // selector 0 → 8
+        BitsPerSample::Ten => w.write(2, 1),    // selector 1 → 10
+        BitsPerSample::Twelve => w.write(2, 2), // selector 2 → 12
+    }
+    w.write(1, 1); // modular_16_bit_buffer_sufficient = true
 
-    w.write(1, 1); // modular_16_bit_buffer_sufficient = true (8-bit fits in i16)
-
-    // num_extra_channels: u2S(0, 1, 2, Bits(4)+3) — selector "01" gives value 1.
-    if has_alpha {
+    if let Some(alpha) = alpha {
         w.write(2, 1); // num_extra_channels = 1
-
-        // ExtraChannelInfo for the alpha channel — all defaults work now that
-        // the image bit_depth above is U8 (defaults: ec_type=Alpha, bit_depth
-        // inherited as U8, dim_shift=0, empty name, alpha_associated=false).
-        w.write(1, 1); // all_default = true
+        // Alpha ECI bit depth MUST match the actual stored sample width.
+        // - 8-bit alpha: U8 (all_default=true gives U8 inherently)
+        // - 10-bit alpha: declare ECI as 10-bit explicitly
+        // - 12-bit alpha: declare ECI as 12-bit explicitly
+        //
+        // Mismatches show as wrong opacity: e.g. declaring 10-bit while storing
+        // u8 makes the decoder compute opacity = stored/1023 ≈ 0.25 for fully-
+        // opaque pixels.
+        match alpha.bits() {
+            8 => {
+                w.write(1, 1); // all_default = true → U8 alpha
+            }
+            bits => {
+                w.write(1, 0); // all_default = false
+                w.write(2, 0); // ec_type = Alpha (selector 0)
+                w.write(1, 0); // floating_point_sample = false
+                match bits {
+                    10 => w.write(2, 1), // selector 1 → 10
+                    12 => w.write(2, 2), // selector 2 → 12
+                    _ => panic!("unsupported alpha bit depth: {bits}"),
+                }
+                w.write(2, 0); // dim_shift = 0
+                w.write(2, 0); // name length = 0
+                w.write(1, 0); // alpha_associated = false
+            }
+        }
     } else {
         w.write(2, 0); // num_extra_channels = 0
     }
 
-    w.write(1, 1); // xyb_encoded = true
-
-    // ColorEncoding: handled by the typed helper.
+    // For lossy VarDCT we use XYB (=1). For lossless modular, the codestream
+    // carries un-transformed pixel values (xyb_encoded = 0).
+    w.write(1, if lossless { 0 } else { 1 }); // xyb_encoded
     write_color_encoding(color_encoding, w);
-
-    // Extensions and transform data.
-    w.write(2, 0); // extensions: none
-    w.write(1, 1); // all_default transform data (default OpsinInverseMatrix etc.)
-
-    // The codestream is byte-aligned before the frame.
+    w.write(2, 0);
+    w.write(1, 1);
     w.zero_pad_to_byte();
 }

@@ -50,8 +50,62 @@ fn lut() -> &'static [f32; 256] {
 }
 
 #[inline]
-pub fn srgb_to_linear_u8(v: u8) -> f32 {
+pub(crate) fn srgb_to_linear_u8(v: u8) -> f32 {
     lut()[v as usize]
+}
+
+pub(crate) struct LutHighBit {
+    pub(crate) table: Box<[f32; 65536]>,
+    _max: f32,
+}
+
+impl LutHighBit {
+    fn new(bits: u8) -> Self {
+        let size = 1usize << bits;
+        let max = (size - 1) as f32;
+        let mut table = Box::new([0f32; 65536]);
+        for (i, dst) in table[..size].iter_mut().enumerate() {
+            *dst = srgb_to_linear_u16(i as u16, max);
+        }
+        Self { table, _max: max }
+    }
+}
+
+/// sRGB transfer function: u16 (0..=max) → linear-light f32.
+///
+/// `max` is `(1 << bits) - 1`, e.g. 1023 for 10-bit, 4095 for 12-bit.
+/// No LUT — these depths are rarer and a LUT would be large.
+#[inline]
+pub(crate) fn srgb_to_linear_u16(v: u16, max: f32) -> f32 {
+    let v = v as f32 / max;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+pub(crate) fn lut_high_bit(bits: u8) -> &'static LutHighBit {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<u8, &'static LutHighBit>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    map.entry(bits)
+        .or_insert_with(|| Box::leak(Box::new(LutHighBit::new(bits))))
+}
+
+#[inline]
+pub(crate) fn linear_to_srgb_u_n(v: f32, bits: u8) -> u16 {
+    let v = v.clamp(0.0, 1.0);
+    let srgb = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    let max = ((1u32 << bits) - 1) as f32;
+    (srgb * max).round() as u16
 }
 
 #[cfg(test)]

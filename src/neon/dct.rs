@@ -31,24 +31,24 @@ use crate::dct::{WC4, WC8};
 use std::arch::aarch64::*;
 
 #[derive(Clone, Copy)]
-struct Col8 {
+struct NeonDoubledVector {
     lo: float32x4_t,
     hi: float32x4_t,
 }
 
-impl Col8 {
+impl NeonDoubledVector {
     #[inline]
     #[target_feature(enable = "neon")]
-    fn add(self, rhs: Col8) -> Col8 {
-        Col8 {
+    fn add(self, rhs: NeonDoubledVector) -> NeonDoubledVector {
+        NeonDoubledVector {
             lo: vaddq_f32(self.lo, rhs.lo),
             hi: vaddq_f32(self.hi, rhs.hi),
         }
     }
     #[inline]
     #[target_feature(enable = "neon")]
-    fn sub(self, rhs: Col8) -> Col8 {
-        Col8 {
+    fn sub(self, rhs: NeonDoubledVector) -> NeonDoubledVector {
+        NeonDoubledVector {
             lo: vsubq_f32(self.lo, rhs.lo),
             hi: vsubq_f32(self.hi, rhs.hi),
         }
@@ -56,16 +56,16 @@ impl Col8 {
 
     #[inline]
     #[target_feature(enable = "neon")]
-    fn muls(self, s: f32) -> Col8 {
-        Col8 {
+    fn muls(self, s: f32) -> NeonDoubledVector {
+        NeonDoubledVector {
             lo: vmulq_n_f32(self.lo, s),
             hi: vmulq_n_f32(self.hi, s),
         }
     }
     #[inline]
     #[target_feature(enable = "neon")]
-    fn fma(self, b: Col8, s: f32) -> Col8 {
-        Col8 {
+    fn fma(self, b: NeonDoubledVector, s: f32) -> NeonDoubledVector {
+        NeonDoubledVector {
             lo: vfmaq_n_f32(self.lo, b.lo, s),
             hi: vfmaq_n_f32(self.hi, b.hi, s),
         }
@@ -74,7 +74,7 @@ impl Col8 {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn dct1d_4_v(c: &mut [Col8; 4]) {
+fn dct1d_4_v(c: &mut [NeonDoubledVector; 4]) {
     let t0 = c[0].add(c[3]);
     let t1 = c[1].add(c[2]);
     let sum = t0.add(t1);
@@ -94,7 +94,7 @@ fn dct1d_4_v(c: &mut [Col8; 4]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn dct1d_8_v(c: &mut [Col8; 8]) {
+fn dct1d_8_v(c: &mut [NeonDoubledVector; 8]) {
     let mut evens = [
         c[0].add(c[7]),
         c[1].add(c[6]),
@@ -111,12 +111,10 @@ fn dct1d_8_v(c: &mut [Col8; 8]) {
     ];
     dct1d_4_v(&mut odds);
 
-    // B<4>
     odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
     odds[1] = odds[1].add(odds[2]);
     odds[2] = odds[2].add(odds[3]);
 
-    // InverseEvenOdd<8>
     c[0] = evens[0];
     c[1] = odds[0];
     c[2] = evens[1];
@@ -160,29 +158,29 @@ fn transpose_4x4(
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn transpose_8x8(c: &mut [Col8; 8]) {
+fn transpose_8x8(c: &mut [NeonDoubledVector; 8]) {
     let (a0, a1, a2, a3) = transpose_4x4(c[0].lo, c[1].lo, c[2].lo, c[3].lo);
     let (b0, b1, b2, b3) = transpose_4x4(c[0].hi, c[1].hi, c[2].hi, c[3].hi);
     let (cc0, cc1, cc2, cc3) = transpose_4x4(c[4].lo, c[5].lo, c[6].lo, c[7].lo);
     let (d0, d1, d2, d3) = transpose_4x4(c[4].hi, c[5].hi, c[6].hi, c[7].hi);
 
-    c[0] = Col8 { lo: a0, hi: cc0 };
-    c[1] = Col8 { lo: a1, hi: cc1 };
-    c[2] = Col8 { lo: a2, hi: cc2 };
-    c[3] = Col8 { lo: a3, hi: cc3 };
-    c[4] = Col8 { lo: b0, hi: d0 };
-    c[5] = Col8 { lo: b1, hi: d1 };
-    c[6] = Col8 { lo: b2, hi: d2 };
-    c[7] = Col8 { lo: b3, hi: d3 };
+    c[0] = NeonDoubledVector { lo: a0, hi: cc0 };
+    c[1] = NeonDoubledVector { lo: a1, hi: cc1 };
+    c[2] = NeonDoubledVector { lo: a2, hi: cc2 };
+    c[3] = NeonDoubledVector { lo: a3, hi: cc3 };
+    c[4] = NeonDoubledVector { lo: b0, hi: d0 };
+    c[5] = NeonDoubledVector { lo: b1, hi: d1 };
+    c[6] = NeonDoubledVector { lo: b2, hi: d2 };
+    c[7] = NeonDoubledVector { lo: b3, hi: d3 };
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load(ptr: &[f32; 64], stride: usize) -> [Col8; 8] {
-    let row = |y: usize| -> Col8 {
+fn load(ptr: &[f32; 64], stride: usize) -> [NeonDoubledVector; 8] {
+    let row = |y: usize| -> NeonDoubledVector {
         unsafe {
             let p = &ptr[y * stride..];
-            Col8 {
+            NeonDoubledVector {
                 lo: vld1q_f32(p.as_ptr()),
                 hi: vld1q_f32(p[4..].as_ptr()),
             }
@@ -202,7 +200,7 @@ fn load(ptr: &[f32; 64], stride: usize) -> [Col8; 8] {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn scale_and_store(cols: &[Col8; 8], scale: f32, out: &mut [f32; 64]) {
+fn scale_and_store(cols: &[NeonDoubledVector; 8], scale: f32, out: &mut [f32; 64]) {
     for (k, col) in cols.iter().enumerate() {
         unsafe {
             vst1q_f32(out[k * 8..].as_mut_ptr(), vmulq_n_f32(col.lo, scale));

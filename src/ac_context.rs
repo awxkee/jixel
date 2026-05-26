@@ -27,23 +27,23 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub const K_NON_ZERO_BUCKETS: usize = 37;
-pub const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
-pub const K_NUM_BLOCK_CTXS: usize = 4;
-pub const K_NUM_AC_CONTEXTS: usize =
+pub(crate) const K_NON_ZERO_BUCKETS: usize = 37;
+pub(crate) const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
+pub(crate) const K_NUM_BLOCK_CTXS: usize = 4;
+pub(crate) const K_NUM_AC_CONTEXTS: usize =
     K_NUM_BLOCK_CTXS * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT); // 1980
 
-pub const K_NUM_AC_STRATEGY_CODES: usize = 27;
+pub(crate) const K_NUM_AC_STRATEGY_CODES: usize = 27;
 
 /// Frequency-band context per zigzag position. Index 0 is unused (DC).
-pub const K_COEFF_FREQ_CONTEXT: [u16; 64] = [
+pub(crate) const K_COEFF_FREQ_CONTEXT: [u16; 64] = [
     0xBAD, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19,
     19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27,
     27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
 ];
 
 /// Remaining-nonzeros context bucket.
-pub const K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
+pub(crate) const K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
     0xBAD, 0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152,
     152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206,
     206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
@@ -51,7 +51,7 @@ pub const K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
 ];
 
 /// Static block context map signaled in WriteDCGlobal.
-pub const K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
+pub(crate) const K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
     0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Y
     2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // X
     2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // B
@@ -60,7 +60,7 @@ pub const K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
 /// 3 channels x 27 strategy codes — only entry [c * 27 + 0] is ever read in
 /// jixel since we only use AcStrategy::DCT (code 0).
 #[rustfmt::skip]
-pub const K_BLOCK_CONTEXT_MAP: [u8; 81] = [
+pub(crate) const K_BLOCK_CONTEXT_MAP: [u8; 81] = [
     // X
     2, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -73,12 +73,12 @@ pub const K_BLOCK_CONTEXT_MAP: [u8; 81] = [
 ];
 
 #[inline]
-pub fn block_context(c: usize, ac_strategy_code: u8) -> u32 {
+pub(crate) fn block_context(c: usize, ac_strategy_code: u8) -> u32 {
     K_BLOCK_CONTEXT_MAP[c * K_NUM_AC_STRATEGY_CODES + ac_strategy_code as usize] as u32
 }
 
 #[inline]
-pub fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
+pub(crate) fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
     let bucket = if non_zeros < 8 {
         non_zeros
     } else if non_zeros >= 64 {
@@ -92,13 +92,13 @@ pub fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
 /// 8x8 specialization: covered_blocks = 1, log2_covered_blocks = 0, so
 /// nonzeros_left and k pass through directly.
 #[inline]
-pub fn zero_density_context_8x8(nonzeros_left: usize, k: usize, prev: usize) -> usize {
+pub(crate) fn zero_density_context_8x8(nonzeros_left: usize, k: usize, prev: usize) -> usize {
     (K_COEFF_NUM_NONZERO_CONTEXT[nonzeros_left] as usize + K_COEFF_FREQ_CONTEXT[k] as usize) * 2
         + prev
 }
 
 #[inline]
-pub const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
+pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
     K_NUM_BLOCK_CTXS as u32 * K_NON_ZERO_BUCKETS as u32
         + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
 }
@@ -106,7 +106,7 @@ pub const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
 /// 8x8 zigzag order. Coefficient at zigzag position k is at raw index
 /// K_COEFF_ORDER_8X8[k].
 #[rustfmt::skip]
-pub const K_COEFF_ORDER_8X8: [u8; 64] = [
+pub(crate) const K_COEFF_ORDER_8X8: [u8; 64] = [
     0,   1,   8,   16, 9,   2,   3,   10,
     17,  24,  32,  25, 18,  11,  4,   5,
     12,  19,  26,  33, 40,  48,  41,  34,

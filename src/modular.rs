@@ -27,11 +27,16 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::bit_writer::BitWriter;
+use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     EntropyCode, OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
     write_prefix_codes, write_token,
 };
 use crate::static_entropy_codes::{K_CONTEXT_TREE_TOKENS, K_DC_CONTEXT_MAP, K_DC_PREFIX_CODES};
+
+// ---------------------------------------------------------------------------
+// MA tree token contexts (mirrors libjxl ma_common.h).
+// ---------------------------------------------------------------------------
 
 const TREE_CTX_PROPERTY: u32 = 1;
 const TREE_CTX_PREDICTOR: u32 = 2;
@@ -57,7 +62,12 @@ const GROUP_DIM: usize = 256;
 /// * **Large images**: writes only the 4-bit GroupHeader
 ///   (`use_global_tree=1`).  Per-AC-group pixel tokens are written later by
 ///   [`write_ac_group_alpha`].
-pub fn write_lfglobal_alpha_section(alpha: &[u8], xsize: usize, ysize: usize, w: &mut BitWriter) {
+pub fn write_lfglobal_alpha_section(
+    alpha: &AlphaPlane,
+    xsize: usize,
+    ysize: usize,
+    w: &mut BitWriter,
+) {
     assert_eq!(alpha.len(), xsize * ysize);
     if xsize <= GROUP_DIM && ysize <= GROUP_DIM {
         // Small path: everything in the LfGlobal section.
@@ -79,7 +89,12 @@ pub fn write_lfglobal_alpha_section(alpha: &[u8], xsize: usize, ysize: usize, w:
 /// continue to compile without changes.  Delegates to
 /// [`write_lfglobal_alpha_section`].
 #[inline]
-pub fn write_global_alpha_modular(alpha: &[u8], xsize: usize, ysize: usize, w: &mut BitWriter) {
+pub fn write_global_alpha_modular(
+    alpha: &AlphaPlane,
+    xsize: usize,
+    ysize: usize,
+    w: &mut BitWriter,
+) {
     write_lfglobal_alpha_section(alpha, xsize, ysize, w);
 }
 
@@ -99,7 +114,7 @@ pub fn write_global_alpha_modular(alpha: &[u8], xsize: usize, ysize: usize, w: &
 ///   stream_id = 1 + num_lf_groups * 3 + 17 + num_groups * 0 + group_index
 ///   (17 = NUM_QUANT_TABLES in libjxl)
 pub fn write_ac_group_alpha(
-    alpha: &[u8],
+    alpha: &AlphaPlane,
     full_xsize: usize,
     full_ysize: usize,
     x0: usize,
@@ -108,7 +123,7 @@ pub fn write_ac_group_alpha(
     gh: usize,
     group_index: usize, // 0-based AC group index
     num_lf_groups: usize,
-    num_groups: usize,
+    _num_groups: usize,
     w: &mut BitWriter,
 ) {
     // Small-image path: nothing to write per group.
@@ -130,30 +145,30 @@ pub fn write_ac_group_alpha(
     // context_id = the leaf_id the global tree reaches for this pixel.
     // cluster    = K_DC_CONTEXT_MAP[context_id].
     // The token is written with K_DC_PREFIX_CODES[cluster].
-    let dc_code = EntropyCode::r#static(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
+    let dc_code = EntropyCode::new(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
 
     for gy in 0..gh {
         let img_y = y0 + gy;
         for gx in 0..gw {
             let img_x = x0 + gx;
-            let v = alpha[img_y * full_xsize + img_x] as i32;
+            let v = alpha.get_i32(img_y * full_xsize + img_x);
 
             // Use SUB-IMAGE-LOCAL coordinates for neighbor lookup so we match
             // what the decoder sees.  The decoder builds a sub-image of size
             // gw×gh; pixel (gx=0, gy=0) has no left or top neighbor regardless
             // of where the group sits in the full image.
             let w_ = if gx > 0 {
-                alpha[img_y * full_xsize + img_x - 1] as i32
+                alpha.get_i32(img_y * full_xsize + img_x - 1)
             } else {
                 0
             };
             let n_ = if gy > 0 {
-                alpha[(img_y - 1) * full_xsize + img_x] as i32
+                alpha.get_i32((img_y - 1) * full_xsize + img_x)
             } else {
                 0
             };
             let nw_ = if gx > 0 && gy > 0 {
-                alpha[(img_y - 1) * full_xsize + img_x - 1] as i32
+                alpha.get_i32((img_y - 1) * full_xsize + img_x - 1)
             } else {
                 0
             };
@@ -219,6 +234,7 @@ fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWri
 fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
     let mut code = optimize_entropy_code(tokens, 1);
     for pc in &mut code.prefix_codes {
+        // Count non-zero depths and remember the position of the only one (if any).
         let mut nonzero = 0;
         let mut idx = 0;
         for (i, &d) in pc.depths.iter().enumerate() {
@@ -231,8 +247,38 @@ fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
             }
         }
         if nonzero == 1 {
-            pc.depths[idx] = 0;
-            pc.bits[idx] = 0;
+            // Single-symbol case.
+            //
+            // JXL has two distinct encodings for a degenerate prefix code:
+            //
+            //   (a) alphabet_size == 1: the decoder consumes ZERO bits per token
+            //       and emits token value 0 every time. This only works if the
+            //       single live symbol is token 0 — otherwise the decoder gets
+            //       the wrong token AND leaves our extra-bit payload unconsumed,
+            //       desynchronising the bitstream.
+            //
+            //   (b) A valid 2-symbol simple Huffman code where both symbols share
+            //       a 1-bit code. The encoder always picks our real token (cost:
+            //       1 wasted bit per pixel), the decoder synchronises correctly.
+            //
+            // CreateHuffmanTree gives us depth=1 with bits=0 for the placeholder,
+            // but the actual encoded value would be `0` — wrong if our token > 0.
+            // We use (a) only when the symbol IS token 0, and (b) otherwise.
+            if idx == 0 {
+                // Plain (a): zero depth & bits so write_prefix_code emits the
+                // "alphabet_size == 1" header (4 bits, value 1) and write_token
+                // emits zero bits.
+                pc.depths[idx] = 0;
+                pc.bits[idx] = 0;
+            } else {
+                // (b): synthesise a second symbol at index 0 with depth 1 and
+                // assign codes {0 → "0", idx → "1"} so the encoder always emits
+                // "1" + extra bits, and the decoder follows the same logic.
+                pc.depths[0] = 1;
+                pc.bits[0] = 0;
+                pc.depths[idx] = 1;
+                pc.bits[idx] = 1;
+            }
         }
     }
     code
@@ -264,7 +310,7 @@ fn alpha_context_id(
     y: usize,
     w_px: i32,
     n_px: i32,
-    nw_px: i32,
+    _nw_px: i32,
     grad_raw: i32,
     group_id: usize,
 ) -> usize {
@@ -375,7 +421,7 @@ fn traverse_tree(tree: &[TreeNode], props: &[i32]) -> usize {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn gradient(w: i32, n: i32, nw: i32) -> i32 {
+pub fn gradient(w: i32, n: i32, nw: i32) -> i32 {
     let lo = w.min(n);
     let hi = w.max(n);
     (w + n - nw).clamp(lo, hi)
@@ -384,8 +430,8 @@ fn gradient(w: i32, n: i32, nw: i32) -> i32 {
 /// Tokenize a rectangular slice [x0..x0+gw, y0..y0+gh] of `alpha` (which
 /// has the given `full_xsize` stride) using context = 0.
 fn tokenize_channel(
-    alpha: &[u8],
-    full_xsize: usize,
+    alpha: &AlphaPlane,
+    _full_xsize: usize,
     _full_ysize: usize,
     x0: usize,
     y0: usize,
@@ -397,19 +443,19 @@ fn tokenize_channel(
     let mut tokens = Vec::with_capacity(gw * gh);
     for y in y0..y0 + gh {
         for x in x0..x0 + gw {
-            let v = alpha[y * stride + x] as i32;
+            let v = alpha.get_i32(y * stride + x);
             let w_ = if x > 0 {
-                alpha[y * stride + x - 1] as i32
+                alpha.get_i32(y * stride + x - 1)
             } else {
                 0
             };
             let n_ = if y > 0 {
-                alpha[(y - 1) * stride + x] as i32
+                alpha.get_i32((y - 1) * stride + x)
             } else {
                 0
             };
             let nw_ = if x > 0 && y > 0 {
-                alpha[(y - 1) * stride + x - 1] as i32
+                alpha.get_i32((y - 1) * stride + x - 1)
             } else {
                 0
             };
@@ -427,6 +473,7 @@ fn tokenize_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode_image::AlphaPlane;
 
     #[test]
     fn gradient_basic() {
@@ -440,7 +487,8 @@ mod tests {
     #[test]
     fn tokenize_constant_zero() {
         let chan = vec![0u8; 16 * 16];
-        let toks = tokenize_channel(&chan, 16, 16, 0, 0, 16, 16, 16);
+        let alpha = AlphaPlane::from_u8(chan);
+        let toks = tokenize_channel(&alpha, 16, 16, 0, 0, 16, 16, 16);
         for t in &toks {
             assert_eq!(t.value, 0);
         }
@@ -450,7 +498,8 @@ mod tests {
     fn write_alpha_small_emits_bytes() {
         let mut w = BitWriter::new();
         let chan = vec![128u8; 8 * 8];
-        write_global_alpha_modular(&chan, 8, 8, &mut w);
+        let alpha = AlphaPlane::from_u8(chan);
+        write_global_alpha_modular(&alpha, 8, 8, &mut w);
         let bits = w.bits_written();
         w.zero_pad_to_byte();
         assert!(w.into_bytes().len() > 0);
@@ -461,7 +510,8 @@ mod tests {
     fn write_alpha_large_emits_header_only() {
         let mut w = BitWriter::new();
         let chan = vec![200u8; 512 * 400];
-        write_lfglobal_alpha_section(&chan, 512, 400, &mut w);
+        let alpha = AlphaPlane::from_u8(chan);
+        write_lfglobal_alpha_section(&alpha, 512, 400, &mut w);
         // Large path: only 4 bits (GroupHeader).
         assert_eq!(w.bits_written(), 4);
     }

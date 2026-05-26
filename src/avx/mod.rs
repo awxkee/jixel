@@ -26,30 +26,6 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-mod ac_context;
-#[cfg(all(target_arch = "x86_64", feature = "avx"))]
-mod avx;
-mod bit_writer;
-mod color;
-mod color_encoding;
-mod dc_group_data;
 mod dct;
-mod enc_frame;
-mod enc_group;
-mod enc_lossless;
-mod enc_xyb;
-mod encode_image;
-mod entropy;
-mod image;
-mod modular;
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-mod neon;
-mod quant_weights;
-mod static_entropy_codes;
 
-pub use color_encoding::{ColorEncoding, ColorSpace, TransferFunction, WhitePoint};
-pub use encode_image::{
-    distance_from_quality, encode_image, encode_image_with_alpha, encode_image_with_alpha_10bit,
-    encode_image_with_alpha_12bit, encode_with_config,
-};
-pub use image::Image3F;
+pub(crate) use dct::dct8x8_avx2;

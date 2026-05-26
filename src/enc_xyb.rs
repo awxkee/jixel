@@ -65,7 +65,7 @@ fn to_xyb_f32(image: &mut Image3F) {
         for ((r, g), b) in r_row.iter_mut().zip(g_row.iter_mut()).zip(b_row.iter_mut()) {
             let (xv, yv, bv) = rgb_to_xyb_pixel_f32(*r, *g, *b);
             *r = xv;
-            *b = yv;
+            *g = yv;
             *b = bv;
         }
     }

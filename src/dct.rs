@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use std::sync::{Arc, OnceLock};
 
 #[cfg(any(
     all(
@@ -115,44 +116,68 @@ fn dct1d_8(buf: &mut [f32]) {
     }
 }
 
-pub(crate) fn dct8x8(input: &[f32; 64], output: &mut [f32; 64]) {
-    #[cfg(target_arch = "aarch64")]
+pub(crate) type DctFn = dyn Fn(&[f32; 64], &mut [f32; 64]) + Send + Sync;
+
+static DCT_METHOD: OnceLock<Arc<DctFn>> = OnceLock::new();
+
+fn select_dct() -> Arc<DctFn> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        unsafe {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
             use crate::neon::dct8x8_neon;
-            dct8x8_neon(input, output);
+            return Arc::new(|input, output| unsafe {
+                dct8x8_neon(input, output);
+            });
         }
-        return;
     }
-    #[cfg(not(target_arch = "aarch64"))]
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
-        let mut tmp = [0.0f32; 64];
-
-        for (src_row, tmp) in input
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .zip(tmp.as_chunks_mut::<8>().0.iter_mut())
-        {
-            let mut row = [0.0f32; 8];
-            for (dst, src) in row.iter_mut().zip(src_row.iter()) {
-                *dst = *src;
-            }
-            dct1d_8(&mut row);
-            for (dst, src) in tmp.iter_mut().zip(row.iter()) {
-                *dst = *src;
-            }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct8x8_avx2(input, output);
+            });
         }
+    }
 
-        for (x, out_row) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-            let mut col = [0.0f32; 8];
-            for (col_slot, tmp_row) in col.iter_mut().zip(tmp.chunks_exact(8)) {
-                *col_slot = tmp_row[x];
-            }
-            dct1d_8(&mut col);
-            for (dst, src) in out_row.iter_mut().zip(col.iter()) {
-                *dst = *src * (1.0 / 64.0);
-            }
+    Arc::new(|input, output| {
+        dct8x8_scalar(input, output);
+    })
+}
+
+#[inline]
+pub(crate) fn dct8x8(input: &[f32; 64], output: &mut [f32; 64]) {
+    DCT_METHOD.get_or_init(select_dct)(input, output);
+}
+
+fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    let mut tmp = [0.0f32; 64];
+
+    for (src_row, tmp) in input
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(tmp.as_chunks_mut::<8>().0.iter_mut())
+    {
+        let mut row = [0.0f32; 8];
+        for (dst, src) in row.iter_mut().zip(src_row.iter()) {
+            *dst = *src;
+        }
+        dct1d_8(&mut row);
+        for (dst, src) in tmp.iter_mut().zip(row.iter()) {
+            *dst = *src;
+        }
+    }
+
+    for (x, out_row) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let mut col = [0.0f32; 8];
+        for (col_slot, tmp_row) in col.iter_mut().zip(tmp.chunks_exact(8)) {
+            *col_slot = tmp_row[x];
+        }
+        dct1d_8(&mut col);
+        for (dst, src) in out_row.iter_mut().zip(col.iter()) {
+            *dst = *src * (1.0 / 64.0);
         }
     }
 }

@@ -197,33 +197,4 @@ impl Rect {
             ysize,
         }
     }
-
-    /// Clamp `xsize_max`/`ysize_max` to the boundaries (xend, yend) starting
-    /// from (x0, y0).
-    pub fn clamped(
-        x0: usize,
-        y0: usize,
-        xsize_max: usize,
-        ysize_max: usize,
-        xend: usize,
-        yend: usize,
-    ) -> Self {
-        let xsize = xsize_max.min(xend.saturating_sub(x0));
-        let ysize = ysize_max.min(yend.saturating_sub(y0));
-        Self {
-            x0,
-            y0,
-            xsize,
-            ysize,
-        }
-    }
-
-    #[inline]
-    pub fn x1(&self) -> usize {
-        self.x0 + self.xsize
-    }
-    #[inline]
-    pub fn y1(&self) -> usize {
-        self.y0 + self.ysize
-    }
 }

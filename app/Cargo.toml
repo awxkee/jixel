@@ -6,4 +6,3 @@ edition = "2024"
 [dependencies]
 jixel = {path = "../"}
 image = "0.25.10"
-jxl-encoder = "0.3.1"

@@ -30,16 +30,16 @@
 use crate::ac_context::K_NUM_AC_CONTEXTS;
 use crate::entropy::PrefixCode;
 
-pub const K_NUM_DC_CONTEXTS: usize = 45;
-pub const K_NUM_DC_PREFIX_CODES: usize = 8;
+pub(crate) const K_NUM_DC_CONTEXTS: usize = 45;
+pub(crate) const K_NUM_DC_PREFIX_CODES: usize = 8;
 
 #[rustfmt::skip]
-pub const K_DC_CONTEXT_MAP: [u8; K_NUM_DC_CONTEXTS] = [
+pub(crate) const K_DC_CONTEXT_MAP: [u8; K_NUM_DC_CONTEXTS] = [
     0, 1, 2, 2, 1, 1, 3, 0, 3, 0, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6,
     6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 6, 7, 6, 7, 6, 6, 5, 5,
 ];
 
-pub const K_DC_PREFIX_CODES: [PrefixCode; K_NUM_DC_PREFIX_CODES] = [
+pub(crate) const K_DC_PREFIX_CODES: [PrefixCode; K_NUM_DC_PREFIX_CODES] = [
     PrefixCode {
         depths: [
             6, 7, 7, 7, 7, 7, 7, 7, 1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
@@ -162,7 +162,7 @@ pub const K_DC_PREFIX_CODES: [PrefixCode; K_NUM_DC_PREFIX_CODES] = [
     },
 ];
 
-pub const K_NUM_AC_PREFIX_CODES: usize = 8;
+pub(crate) const K_NUM_AC_PREFIX_CODES: usize = 8;
 
 // Context map for AC coefficients. Length is K_NUM_AC_CONTEXTS = 1980.
 //
@@ -176,7 +176,7 @@ pub const K_NUM_AC_PREFIX_CODES: usize = 8;
 // In jixel only the 8x8 cases are reachable, but the unreachable entries
 // must stay in place so context indices don't shift.
 #[rustfmt::skip]
-pub const K_AC_CONTEXT_MAP: [u8; K_NUM_AC_CONTEXTS] = [
+pub(crate) const K_AC_CONTEXT_MAP: [u8; K_NUM_AC_CONTEXTS] = [
     // ---- Number-of-nonzeros contexts: 4 cols x 37 rows ----
     //   8x8_Y  8x16_Y  8x8_XB  8x16_XB
         0, 1, 2, 1,    // pred 0
@@ -507,7 +507,7 @@ const _: () = {
     assert!(K_AC_CONTEXT_MAP.len() == K_NUM_AC_CONTEXTS);
 };
 
-pub const K_AC_PREFIX_CODES: [PrefixCode; K_NUM_AC_PREFIX_CODES] = [
+pub(crate) const K_AC_PREFIX_CODES: [PrefixCode; K_NUM_AC_PREFIX_CODES] = [
     PrefixCode {
         depths: [
             4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 5, 5, 4, 5, 6, 6, 6, 7, 9, 9, 9,
@@ -629,7 +629,7 @@ pub const K_AC_PREFIX_CODES: [PrefixCode; K_NUM_AC_PREFIX_CODES] = [
         ],
     },
 ];
-pub const K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
+pub(crate) const K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
     44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
     43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
     43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
@@ -674,7 +674,7 @@ pub const K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
     12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
     12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
 ];
-pub const K_CONTEXT_TREE_TOKENS: [(u32, u32); 313] = [
+pub(crate) const K_CONTEXT_TREE_TOKENS: [(u32, u32); 313] = [
     (1, 2),
     (0, 4),
     (1, 1),

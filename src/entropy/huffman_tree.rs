@@ -63,9 +63,9 @@ pub fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
 
         // Gather nonzero-count leaves in reverse order; stable sort keeps
         // tie-breaking deterministic and matching libjxl.
-        for i in (0..length).rev() {
-            if data[i] != 0 {
-                let count = data[i].max(count_limit.saturating_sub(1));
+        for (i, &data) in data[..length].iter().enumerate().rev() {
+            if data != 0 {
+                let count = data.max(count_limit.saturating_sub(1));
                 tree.push(HuffmanNode {
                     total_count: count,
                     index_left: -1,

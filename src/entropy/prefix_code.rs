@@ -89,14 +89,14 @@ pub fn convert_bit_depths_to_symbols(depth: &[u8], bits: &mut [u16]) {
         next_code[i] = code as u16;
     }
 
-    for i in 0..depth.len() {
-        if depth[i] != 0 {
-            let d = depth[i] as u32;
+    for (bits, &depth) in bits.iter_mut().zip(depth.iter()) {
+        if depth != 0 {
+            let d = depth as u32;
             let raw = next_code[d as usize];
-            bits[i] = reverse_bits(d, raw);
+            *bits = reverse_bits(d, raw);
             next_code[d as usize] += 1;
         } else {
-            bits[i] = 0;
+            *bits = 0;
         }
     }
 }

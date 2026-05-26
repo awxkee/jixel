@@ -535,8 +535,8 @@ pub fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
             }
         }
         None => {
-            for i in 0..code.num_contexts {
-                tokens.push(Token::new(0, code.context_map[i] as u32));
+            for &code in code.context_map.iter() {
+                tokens.push(Token::new(0, code as u32));
             }
         }
     };

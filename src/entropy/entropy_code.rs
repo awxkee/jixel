@@ -42,7 +42,7 @@ pub struct EntropyCode<'a> {
 
 impl<'a> EntropyCode<'a> {
     /// Static entropy code: no clustering was applied.
-    pub fn r#static(context_map: &'a [u8], prefix_codes: &'a [PrefixCode]) -> Self {
+    pub(crate) fn new(context_map: &'a [u8], prefix_codes: &'a [PrefixCode]) -> Self {
         Self {
             context_map,
             num_contexts: context_map.len(),

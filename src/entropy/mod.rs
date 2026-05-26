@@ -35,11 +35,11 @@ mod prefix_code;
 mod token;
 mod write;
 
-pub use entropy_code::{EntropyCode, OwnedEntropyCode};
-pub use histogram::Histogram;
-pub use prefix_code::{ALPHABET_SIZE, PrefixCode};
-pub use token::{Token, pack_signed, uint_encode};
-pub use write::{
+pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
+pub(crate) use histogram::Histogram;
+pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
+pub(crate) use token::{Token, pack_signed, uint_encode};
+pub(crate) use write::{
     optimize_entropy_code, optimize_prefix_codes, write_context_map, write_entropy_code,
     write_prefix_codes, write_token,
 };

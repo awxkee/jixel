@@ -30,55 +30,39 @@ use crate::image::{Image3S, ImageB, ImageSB};
 
 /// AC-strategy "image" — in jixel, all blocks are DCT-8x8 (raw strategy 0)
 /// so this just records the dimensions for iteration.
-pub struct AcStrategyImage {
+pub(crate) struct AcStrategyImage {
     xsize: usize,
     ysize: usize,
 }
 
 impl AcStrategyImage {
-    pub fn new(xsize: usize, ysize: usize) -> Self {
+    pub(crate) fn new(xsize: usize, ysize: usize) -> Self {
         Self { xsize, ysize }
     }
     #[inline]
-    pub fn xsize(&self) -> usize {
+    pub(crate) fn xsize(&self) -> usize {
         self.xsize
     }
     #[inline]
-    pub fn ysize(&self) -> usize {
+    pub(crate) fn ysize(&self) -> usize {
         self.ysize
     }
-
-    /// Every block is its own first block (no multi-block transforms).
     #[inline]
-    pub fn is_first_block(&self, _x: usize, _y: usize) -> bool {
-        true
-    }
-    /// Raw strategy = 0 (DCT-8x8) everywhere.
-    #[inline]
-    pub fn raw_strategy(&self, _x: usize, _y: usize) -> u8 {
-        0
-    }
-    /// Strategy code for context lookup = 0 everywhere.
-    #[inline]
-    pub fn strategy_code(&self, _x: usize, _y: usize) -> u8 {
-        0
-    }
-    #[inline]
-    pub fn covered_blocks_x(&self) -> usize {
+    pub(crate) fn covered_blocks_x(&self) -> usize {
         1
     }
     #[inline]
-    pub fn covered_blocks_y(&self) -> usize {
+    pub(crate) fn covered_blocks_y(&self) -> usize {
         1
     }
 }
 
-pub struct DcGroupData {
-    pub quant_dc: Image3S,
-    pub raw_quant_field: ImageB,
-    pub ac_strategy: AcStrategyImage,
-    pub ytox_map: ImageSB,
-    pub ytob_map: ImageSB,
+pub(crate) struct DcGroupData {
+    pub(crate) quant_dc: Image3S,
+    pub(crate) raw_quant_field: ImageB,
+    pub(crate) ac_strategy: AcStrategyImage,
+    pub(crate) ytox_map: ImageSB,
+    pub(crate) ytob_map: ImageSB,
 }
 
 // kTileDimInBlocks = 8 (a 64x64 tile contains 8x8 blocks).
@@ -87,7 +71,7 @@ pub struct DcGroupData {
 const TILE_DIM_IN_BLOCKS: usize = 8;
 
 impl DcGroupData {
-    pub fn new(xsize_blocks: usize, ysize_blocks: usize) -> Self {
+    pub(crate) fn new(xsize_blocks: usize, ysize_blocks: usize) -> Self {
         let xtiles = (xsize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
         let ytiles = (ysize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
         Self {
