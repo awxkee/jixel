@@ -52,7 +52,7 @@ mod static_entropy_codes;
 
 pub use color_encoding::{ColorEncoding, ColorSpace, TransferFunction, WhitePoint};
 pub use encode_image::{
-    EncodeConfig, distance_from_quality, encode_image, encode_image_with_alpha,
-    encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
+    EncodeConfig, distance_from_quality, encode_image, encode_image_10bit, encode_image_12bit,
+    encode_image_with_alpha, encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
 };
 pub use err::EncodeError;

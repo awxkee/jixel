@@ -384,8 +384,6 @@ pub fn encode_image_with_alpha(
     )
 }
 
-/// Encode a 10-bit RGBA image (`u16` channels, values 0..=1023).
-/// Input is interleaved RGBA, each channel a `u16` in native byte order.
 pub fn encode_image_with_alpha_10bit(
     input: &[u16],
     width: usize,
@@ -395,8 +393,6 @@ pub fn encode_image_with_alpha_10bit(
     encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Ten)
 }
 
-/// Encode a 12-bit RGBA image (`u16` channels, values 0..=4095).
-/// Input is interleaved RGBA, each channel a `u16` in native byte order.
 pub fn encode_image_with_alpha_12bit(
     input: &[u16],
     width: usize,
@@ -404,6 +400,24 @@ pub fn encode_image_with_alpha_12bit(
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Twelve)
+}
+
+pub fn encode_image_10bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Ten)
+}
+
+pub fn encode_image_12bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Twelve)
 }
 
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
