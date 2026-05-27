@@ -111,7 +111,7 @@ fn dct1d_8_v(c: &mut [NeonDoubledVector; 8]) {
     ];
     dct1d_4_v(&mut odds);
 
-    odds[0] = odds[0].fma(odds[1], std::f32::consts::SQRT_2);
+    odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
     odds[1] = odds[1].add(odds[2]);
     odds[2] = odds[2].add(odds[3]);
 

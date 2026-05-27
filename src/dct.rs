@@ -69,9 +69,8 @@ fn dct1d_2(buf: &mut [f32]) {
 
 #[allow(unused)]
 #[inline(always)]
-fn dct1d_4(buf: &mut [f32]) {
+fn dct1d_4(buf: &mut [f32; 4]) {
     let mut tmp = [0.0f32; 4];
-    // AddReverse: even half
     tmp[0] = buf[0] + buf[3];
     tmp[1] = buf[1] + buf[2];
     dct1d_2(&mut tmp[0..2]);
@@ -94,14 +93,11 @@ fn dct1d_8(buf: &mut [f32]) {
     for i in 0..4 {
         tmp[i] = buf[i] + buf[7 - i];
     }
-    dct1d_4(&mut tmp[0..4]);
+    dct1d_4(<&mut [f32; 4]>::try_from(&mut tmp[0..4]).unwrap());
     for i in 0..4 {
-        tmp[4 + i] = buf[i] - buf[7 - i];
+        tmp[4 + i] = (buf[i] - buf[7 - i]) * WC8[i];
     }
-    for i in 0..4 {
-        tmp[4 + i] *= WC8[i];
-    }
-    dct1d_4(&mut tmp[4..8]);
+    dct1d_4(<&mut [f32; 4]>::try_from(&mut tmp[4..8]).unwrap());
     tmp[4] = fmla(tmp[4], std::f32::consts::SQRT_2, tmp[5]);
     tmp[5] += tmp[6];
     tmp[6] += tmp[7];
