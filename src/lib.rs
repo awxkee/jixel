@@ -28,6 +28,7 @@
  */
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 mod ac_context;
+mod adaptive_quant;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
@@ -35,6 +36,7 @@ mod color;
 mod color_encoding;
 mod dc_group_data;
 mod dct;
+mod enc_ac_strategy;
 mod enc_frame;
 mod enc_group;
 mod enc_lossless;

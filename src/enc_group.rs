@@ -27,28 +27,19 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::ac_context::{
-    K_COEFF_ORDER_8X8, block_context, non_zero_context, zero_density_context_8x8,
-    zero_density_contexts_offset,
+    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, block_context, non_zero_context, zero_density_context,
+    zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::bit_writer::BitWriter;
-use crate::dc_group_data::DcGroupData;
-use crate::dct::dct8x8;
+use crate::dc_group_data::{
+    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
+};
+use crate::dct::{dc_from_dct8x16, dc_from_dct16x8, dct8x8, dct8x16, dct16x8};
 use crate::entropy::{EntropyCode, Token, pack_signed, write_token};
 use crate::image::{Image3B, Image3F, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
-
-#[inline]
-fn num_nonzero_except_dc(block: &[i32; 64]) -> i32 {
-    let mut count: i32 = 0;
-    for k in 1..64 {
-        if block[k] != 0 {
-            count += 1;
-        }
-    }
-    count
-}
 
 #[inline]
 fn predict_from_top_and_left(row_top: Option<&[u8]>, row: &[u8], x: usize, default_val: u8) -> u8 {
@@ -60,18 +51,57 @@ fn predict_from_top_and_left(row_top: Option<&[u8]>, row: &[u8], x: usize, defau
     } else if row_top.is_none() {
         row[x - 1]
     } else {
-        (row_top.unwrap()[x] as u16 + row[x - 1] as u16).div_ceil(2) as u8
+        ((row_top.unwrap()[x] as u16 + row[x - 1] as u16 + 1) / 2) as u8
     }
 }
 
-fn quantize_block_8x8_ac(
-    block_in: &[f32; 64],
+/// Number of non-zero coefficients in an 8×8 quantized block, excluding the
+/// DC position (k=0). Returns the count for use as nzeros token.
+#[inline]
+fn num_nonzero_except_dc(block: &[i32; 64]) -> i32 {
+    let mut count: i32 = 0;
+    for k in 1..64 {
+        if block[k] != 0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Multi-block analog: counts nonzeros in `size = cx*cy*64` coefficients,
+/// masking out the `covered_blocks = cx*cy` LF positions (the first cx*cy
+/// in storage row-major order). For DCT16X8/DCT8X16 (cx=2, cy=1 after swap),
+/// the LF positions are coeffs[0] and coeffs[1] in the 8x16 stride-16 layout.
+#[inline]
+fn num_nonzero_except_llf(block: &[i32], cx: usize, cy: usize) -> i32 {
+    let size = cx * cy * 64;
+    let covered = cx * cy;
+    let mut count: i32 = 0;
+    for k in covered..size {
+        if block[k] != 0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Generalized AC quantization for an `xsize × ysize` (in 8x8 blocks) region.
+/// `xsize=1, ysize=1` reproduces the 8×8 path. The block buffer has
+/// `xsize*ysize*64` floats in row-major order with row stride `xsize*8`.
+///
+/// Thresholds mirror libjxl-tiny: per-quadrant in the 8×8 case; biased lower
+/// for multi-block; for the 1×N or N×1 case the second half of the columns
+/// (or rows for ysize=1, xsize=1 special) uses the second threshold pair.
+fn quantize_block_ac(
+    block_in: &[f32],
     c: usize,
-    qm: &[f32; 64],
+    qm: &[f32],
     quant: i32,
     scale: f32,
     qm_multiplier: f32,
-    block_out: &mut [i32; 64],
+    xsize: usize,
+    ysize: usize,
+    block_out: &mut [i32],
 ) {
     let qac = scale * quant as f32;
     let mut thr = [0.58f32, 0.635, 0.66, 0.7];
@@ -85,13 +115,27 @@ fn quantize_block_8x8_ac(
             thr[i] = 0.75;
         }
     }
+    if xsize > 1 || ysize > 1 {
+        let delta =
+            (0.003_f32 * xsize as f32 * ysize as f32).clamp(0.0, if c > 0 { 0.08 } else { 0.12 });
+        for i in 0..4 {
+            thr[i] -= delta;
+        }
+    }
     let q_scaled = qac * qm_multiplier;
-    for y in 0..8 {
-        let yfix = if y >= 4 { 2 } else { 0 };
-        for x in 0..8 {
-            let q_x = if x >= 4 { 1 } else { 0 };
-            let threshold = thr[yfix + q_x];
-            let idx = y * 8 + x;
+    let width = xsize * 8;
+    let height = ysize * 8;
+    for y in 0..height {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for x in 0..width {
+            let threshold = if xsize == 1 {
+                // For DCT8 (xsize=1, ysize=1), threshold splits at x>=4.
+                thr[yfix + if x >= width / 2 { 1 } else { 0 }]
+            } else {
+                // Multi-block: split at x >= width/2.
+                thr[yfix + if x >= width / 2 { 1 } else { 0 }]
+            };
+            let idx = y * width + x;
             let q = qm[idx] * q_scaled;
             let val = q * block_in[idx];
             block_out[idx] = if val.abs() >= threshold {
@@ -103,14 +147,11 @@ fn quantize_block_8x8_ac(
     }
 }
 
-const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.070_054_5;
+const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
 const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
 
 #[inline]
 fn adjust_quant_bias_y(quant: i32) -> f32 {
-    // Mirrors libjxl-tiny's AdjustQuantBias for c=1.
-    // |q| < 1.125 → q == 0 ? 0 : (sign(q) * bias[1])
-    // else        → q - bias[3]/q
     let aq = quant.unsigned_abs() as f32;
     if aq < 1.125 {
         if quant == 0 {
@@ -126,33 +167,27 @@ fn adjust_quant_bias_y(quant: i32) -> f32 {
     }
 }
 
+/// Y-channel quantize then dequantize-with-bias for CfL roundtrip. `inout`
+/// holds size=xsize*ysize*64 floats. `quantized` holds size integers.
 fn quantize_roundtrip_y_block(
-    qm: &[f32; 64],
-    dqm: &[f32; 64],
+    qm: &[f32],
+    dqm: &[f32],
     scale: f32,
     quant: i32,
-    inout: &mut [f32; 64],
-    quantized: &mut [i32; 64],
+    xsize: usize,
+    ysize: usize,
+    inout: &mut [f32],
+    quantized: &mut [i32],
 ) {
-    quantize_block_8x8_ac(inout, 1, qm, quant, scale, 1.0, quantized);
+    quantize_block_ac(inout, 1, qm, quant, scale, 1.0, xsize, ysize, quantized);
     let inv_qac = 1.0 / (scale * quant as f32);
-    for k in 0..64 {
+    let size = xsize * ysize * 64;
+    for k in 0..size {
         inout[k] = adjust_quant_bias_y(quantized[k]) * dqm[k] * inv_qac;
     }
 }
 
 /// Process and tokenize one stripe of an AC group.
-///
-/// * `opsin`        — XYB pixels of the stripe; row-major in each plane.
-/// * `group_brect`  — Stripe position WITHIN THE DC GROUP, in blocks.
-/// * `matrices`     — Dequant matrices.
-/// * `scale`        — AC scale (= global_scale / 65536).
-/// * `scale_dc`     — DC scale (= quant_dc * scale).
-/// * `x_qm_scale`   — Header-signaled X matrix multiplier knob.
-/// * `dc_data`      — DC group accumulator (sized to the DC group).
-/// * `ac_code`      — Static AC entropy code.
-/// * `num_nzeros`   — Per-AC-group block nonzero counts (sized 32x32), addressed at `(group_brect.y0 % 32 + by, bx)`.
-/// * `writer`       — Section bit writer for this AC group.
 #[allow(clippy::too_many_arguments)]
 pub fn write_ac_group(
     opsin: &Image3F,
@@ -174,113 +209,241 @@ pub fn write_ac_group(
         INV_DC_QUANT[1] * scale_dc,
         INV_DC_QUANT[2] * scale_dc,
     ];
-    // cfl_factor for X = 0.0; for B = kInvDCQuant[2] * kDCQuant[1].
     let cfl_factor_b = INV_DC_QUANT[2] * DC_QUANT[1];
     let x_qm_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
 
+    // Per-channel scratch for largest multi-block (cx=2, cy=1 → 128 floats).
+    let mut coeffs = [[0.0f32; 128]; 3];
+    let mut quantized = [[0i32; 128]; 3];
+
     for by in 0..ysize_blocks {
         let nz_by = nzeros_by0 + by;
-        let opsin_y0 = by * 8; // stripe-local
-
-        // dc_data raw_quant_field row at this stripe row.
         let global_by = group_brect.y0 + by;
 
         for bx in 0..xsize_blocks {
             let global_bx = group_brect.x0 + bx;
+
+            // Skip non-first blocks of multi-block transforms.
+            if !dc_data.ac_strategy.is_first_block(global_bx, global_by) {
+                continue;
+            }
+
+            let raw_strategy = dc_data.ac_strategy.raw_strategy(global_bx, global_by);
+            let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
+            let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
+            // libjxl-tiny normalizes: cx >= cy. For DCT16X8 (1×2) and DCT8X16
+            // (2×1), both end up as cx=2, cy=1, matching the 8×16 storage.
+            let (cx, cy) = if cov_y > cov_x {
+                (cov_y, cov_x)
+            } else {
+                (cov_x, cov_y)
+            };
+            let size = cx * cy * 64;
             let quant_ac = dc_data.raw_quant_field.row(global_by)[global_bx] as i32;
 
-            // --- DCT each channel from pixels ---
-            let mut coeffs_x = [0.0f32; 64];
-            let mut coeffs_y = [0.0f32; 64];
-            let mut coeffs_b = [0.0f32; 64];
-
-            let mut tmp_in = [0.0f32; 64];
-
+            // ---- Forward DCT for all 3 channels ----
+            let opsin_bx = bx * 8;
+            let opsin_by = by * 8;
             for c in 0..3 {
-                let dst: &mut [f32; 64] = match c {
-                    0 => &mut coeffs_x,
-                    1 => &mut coeffs_y,
-                    _ => &mut coeffs_b,
-                };
                 let plane = opsin.plane(c);
-                let src_x = bx * 8; // stripe-local
-                for (yy, dst_tmp) in tmp_in.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                    let row = plane.row(opsin_y0 + yy);
-                    dst_tmp.copy_from_slice(&row[src_x..src_x + 8]);
+                match raw_strategy {
+                    STRATEGY_DCT => {
+                        let mut tmp = [0.0f32; 64];
+                        for yy in 0..8 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
+                        }
+                        let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
+                        dct8x8(&tmp, dst);
+                    }
+                    STRATEGY_DCT16X8 => {
+                        let mut tmp = [0.0f32; 128]; // 16 rows × 8 cols, stride 8
+                        for yy in 0..16 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
+                        }
+                        let dst: &mut [f32; 128] = (&mut coeffs[c][..]).try_into().unwrap();
+                        dct16x8(&tmp, dst);
+                    }
+                    STRATEGY_DCT8X16 => {
+                        let mut tmp = [0.0f32; 128]; // 8 rows × 16 cols, stride 16
+                        for yy in 0..8 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 16..yy * 16 + 16]
+                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
+                        }
+                        let dst: &mut [f32; 128] = (&mut coeffs[c][..]).try_into().unwrap();
+                        dct8x16(&tmp, dst);
+                    }
+                    _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
-                dct8x8(&tmp_in, dst);
             }
 
-            // --- Y DC and AC quantize, with roundtrip for CfL ---
-            let y_dc_raw = coeffs_y[0];
-            let y_dc_q = (inv_factor[1] * y_dc_raw).round() as i16;
-            dc_data.quant_dc.plane_row_mut(1, global_by)[global_bx] = y_dc_q;
+            // ---- Extract DC values and write to DC plane ----
+            // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
+            let mut dc_vals = [[0.0f32; 2]; 3];
+            match raw_strategy {
+                STRATEGY_DCT => {
+                    for c in 0..3 {
+                        dc_vals[c][0] = coeffs[c][0];
+                    }
+                }
+                STRATEGY_DCT16X8 => {
+                    for c in 0..3 {
+                        let cb: &[f32; 128] = (&coeffs[c][..]).try_into().unwrap();
+                        let mut dc2 = [0.0f32; 2];
+                        dc_from_dct16x8(cb, &mut dc2);
+                        dc_vals[c][0] = dc2[0]; // top covered block
+                        dc_vals[c][1] = dc2[1]; // bottom covered block
+                    }
+                }
+                STRATEGY_DCT8X16 => {
+                    for c in 0..3 {
+                        let cb: &[f32; 128] = (&coeffs[c][..]).try_into().unwrap();
+                        let mut dc2 = [0.0f32; 2];
+                        dc_from_dct8x16(cb, &mut dc2);
+                        dc_vals[c][0] = dc2[0]; // left covered block
+                        dc_vals[c][1] = dc2[1]; // right covered block
+                    }
+                }
+                _ => unreachable!(),
+            }
 
-            let mut quant_y = [0i32; 64];
+            // ---- Y channel: roundtrip-quantize, then place DC ----
+            // DC for storage (per covered block, using pre-swap cov_x/cov_y).
+            let mut y_dc_q_arr = [[0i16; 2]; 2]; // [iy][ix] for max 2x2 — only iy*ix entries used
+            for iy in 0..cov_y {
+                for ix in 0..cov_x {
+                    let didx = iy * cov_x + ix;
+                    let y_dc_q = (inv_factor[1] * dc_vals[1][didx]).round() as i16;
+                    dc_data.quant_dc.plane_row_mut(1, global_by + iy)[global_bx + ix] = y_dc_q;
+                    y_dc_q_arr[iy][ix] = y_dc_q;
+                }
+            }
+            // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
             quantize_roundtrip_y_block(
-                matrices.inv_matrix(1),
-                matrices.matrix(1),
+                if raw_strategy == STRATEGY_DCT {
+                    matrices.inv_matrix(1)
+                } else {
+                    matrices.inv_matrix_16x8(1)
+                },
+                if raw_strategy == STRATEGY_DCT {
+                    matrices.matrix(1)
+                } else {
+                    matrices.matrix_16x8(1)
+                },
                 scale,
                 quant_ac,
-                &mut coeffs_y,
-                &mut quant_y,
+                cx,
+                cy,
+                &mut coeffs[1][..size],
+                &mut quantized[1][..size],
             );
 
-            // --- B minus Y CfL (base correlation = 1.0); X has no CfL ---
-            // Save raw X DC first (X has no CfL so we use raw coeffs_x[0]).
-            let x_dc_raw = coeffs_x[0];
-            // For B, libjxl-tiny applies CfL *first*, then computes DC from the
-            // post-CfL coefficient block (so b_dc_for_storage = b_dc_raw - y_dc_dq).
-            for k in 0..64 {
-                coeffs_b[k] -= coeffs_y[k];
+            // ---- B minus Y CfL ----
+            // Save raw X DC for X-channel DC computation (X has no CfL).
+            let x_dc_raw = dc_vals[0]; // [top/left, bottom/right]
+            // Apply B -= Y on all coefficients.
+            for k in 0..size {
+                coeffs[2][k] -= coeffs[1][k];
             }
-            // Now coeffs_b[0] = b_dc_raw - y_dc_dq (the post-CfL DC).
+            // Recompute B DC after CfL (b_dc_post_cfl = b_dc_raw - y_dc_dq).
+            // Since coeffs[1] is now the DEQUANTIZED Y (from roundtrip), the LF
+            // positions of coeffs[2] reflect b - y_dq. Extract post-CfL DC.
+            let mut b_dc_post = [0.0f32; 2];
+            match raw_strategy {
+                STRATEGY_DCT => {
+                    b_dc_post[0] = coeffs[2][0];
+                }
+                STRATEGY_DCT16X8 => {
+                    let cb: &[f32; 128] = (&coeffs[2][..]).try_into().unwrap();
+                    dc_from_dct16x8(cb, &mut b_dc_post);
+                }
+                STRATEGY_DCT8X16 => {
+                    let cb: &[f32; 128] = (&coeffs[2][..]).try_into().unwrap();
+                    dc_from_dct8x16(cb, &mut b_dc_post);
+                }
+                _ => unreachable!(),
+            }
 
-            // X DC + AC
-            let x_dc_q = (inv_factor[0] * x_dc_raw).round() as i16;
-            dc_data.quant_dc.plane_row_mut(0, global_by)[global_bx] = x_dc_q;
-            let mut quant_x = [0i32; 64];
-            quantize_block_8x8_ac(
-                &coeffs_x,
+            // ---- X channel: quantize AC, write DC ----
+            for iy in 0..cov_y {
+                for ix in 0..cov_x {
+                    let didx = iy * cov_x + ix;
+                    let x_dc_q = (inv_factor[0] * x_dc_raw[didx]).round() as i16;
+                    dc_data.quant_dc.plane_row_mut(0, global_by + iy)[global_bx + ix] = x_dc_q;
+                }
+            }
+            // Note: jixel uses CfL X correlation = 0 (no x_factor); coeffs[0] unchanged.
+            quantize_block_ac(
+                &coeffs[0][..size],
                 0,
-                matrices.inv_matrix(0),
+                if raw_strategy == STRATEGY_DCT {
+                    &matrices.inv_matrix(0)[..]
+                } else {
+                    &matrices.inv_matrix_16x8(0)[..]
+                },
                 quant_ac,
                 scale,
                 x_qm_mul,
-                &mut quant_x,
+                cx,
+                cy,
+                &mut quantized[0][..size],
             );
 
-            // B DC + AC
-            // dc_b_for_storage = round((post-CfL b_dc) * inv_factor[2] - y_dc_q * cfl_factor_b)
-            let b_dc_post_cfl = coeffs_b[0];
-            let b_dc_q =
-                (b_dc_post_cfl * inv_factor[2] - y_dc_q as f32 * cfl_factor_b).round() as i16;
-            dc_data.quant_dc.plane_row_mut(2, global_by)[global_bx] = b_dc_q;
-            let mut quant_b = [0i32; 64];
-            quantize_block_8x8_ac(
-                &coeffs_b,
+            // ---- B channel: write CfL'd DC, quantize AC ----
+            for iy in 0..cov_y {
+                for ix in 0..cov_x {
+                    let didx = iy * cov_x + ix;
+                    let b_dc_q = (b_dc_post[didx] * inv_factor[2]
+                        - y_dc_q_arr[iy][ix] as f32 * cfl_factor_b)
+                        .round() as i16;
+                    dc_data.quant_dc.plane_row_mut(2, global_by + iy)[global_bx + ix] = b_dc_q;
+                }
+            }
+            quantize_block_ac(
+                &coeffs[2][..size],
                 2,
-                matrices.inv_matrix(2),
+                if raw_strategy == STRATEGY_DCT {
+                    &matrices.inv_matrix(2)[..]
+                } else {
+                    &matrices.inv_matrix_16x8(2)[..]
+                },
                 quant_ac,
                 scale,
                 1.0,
-                &mut quant_b,
+                cx,
+                cy,
+                &mut quantized[2][..size],
             );
 
-            // --- Tokenize in order Y, X, B ---
+            // ---- Tokenize in order Y, X, B ----
+            let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+            let covered_blocks = cx * cy;
+            let log2_covered_blocks = if covered_blocks == 1 { 0 } else { 1 };
+
             for &c in &[1usize, 0, 2] {
-                let block: &[i32; 64] = match c {
-                    0 => &quant_x,
-                    1 => &quant_y,
-                    _ => &quant_b,
+                let block = &quantized[c][..size];
+
+                let nzeros = if covered_blocks == 1 {
+                    num_nonzero_except_dc(<&[i32; 64]>::try_from(block).unwrap())
+                } else {
+                    num_nonzero_except_llf(block, cx, cy)
                 };
 
-                let nzeros = num_nonzero_except_dc(block);
-                num_nzeros.plane_row_mut(c, nz_by)[bx] = nzeros as u8;
+                // libjxl-tiny: NumNonZeroExceptLLF stores `(nzeros + covered_blocks - 1) >> log2_covered_blocks`
+                // to all covered cells in num_nzeros.
+                let shifted = ((nzeros as usize + covered_blocks - 1) >> log2_covered_blocks) as u8;
+                // Pre-swap iteration (cov_x, cov_y from raw strategy).
+                for iy in 0..cov_y {
+                    for ix in 0..cov_x {
+                        num_nzeros.plane_row_mut(c, nz_by + iy)[bx + ix] = shifted;
+                    }
+                }
 
-                // Predict from top row (if any) and left.
+                // Predict from top and left.
                 let row_top: Option<&[u8]> = if nz_by == 0 {
                     None
                 } else {
@@ -289,31 +452,50 @@ pub fn write_ac_group(
                 let row = num_nzeros.plane_row(c, nz_by);
                 let predicted = predict_from_top_and_left(row_top, row, bx, 32);
 
-                let block_ctx = block_context(c, /*ac_strategy_code=*/ 0);
+                let block_ctx = block_context(c, strategy_code);
                 let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
                 let histo_offset = zero_density_contexts_offset(block_ctx);
 
                 write_token(Token::new(nzero_ctx, nzeros as u32), ac_code, writer);
 
-                // size/16 = 4 for 8x8 blocks
-                let mut prev: usize = if nzeros > 4 { 0 } else { 1 };
+                // Choose the natural coefficient order.
+                let order: &[u8] = if covered_blocks == 1 {
+                    &K_COEFF_ORDER_8X8[..]
+                } else {
+                    &K_COEFF_ORDER_16X8[..]
+                };
+
+                let mut prev: usize = if nzeros as usize > size / 16 { 0 } else { 1 };
                 let mut remaining = nzeros;
-                let mut k = 1usize;
-                while k < 64 && remaining != 0 {
-                    let coef = block[K_COEFF_ORDER_8X8[k] as usize];
+                // Skip the first `covered_blocks` positions (LF).
+                let mut k = covered_blocks;
+                while k < size && remaining != 0 {
+                    let coef = block[order[k] as usize];
                     let ctx = histo_offset as usize
-                        + zero_density_context_8x8(remaining as usize, k, prev);
-                    let u = pack_signed(coef);
-                    write_token(Token::new(ctx as u32, u), ac_code, writer);
+                        + if covered_blocks == 1 {
+                            zero_density_context_8x8(remaining as usize, k, prev)
+                        } else {
+                            zero_density_context(
+                                remaining as usize,
+                                k,
+                                covered_blocks,
+                                log2_covered_blocks,
+                                prev,
+                            )
+                        };
+                    write_token(Token::new(ctx as u32, pack_signed(coef)), ac_code, writer);
                     prev = if coef != 0 { 1 } else { 0 };
                     if coef != 0 {
                         remaining -= 1;
                     }
                     k += 1;
                 }
-                debug_assert_eq!(remaining, 0);
+                debug_assert_eq!(
+                    remaining, 0,
+                    "remaining nzeros at end: strategy={} c={}",
+                    strategy_code, c
+                );
             }
         }
     }
-    let _ = (xsize_blocks, ysize_blocks);
 }

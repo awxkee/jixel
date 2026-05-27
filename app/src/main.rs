@@ -13,18 +13,16 @@ use std::path::Path;
 use std::time::Instant;
 
 fn main() {
-    let output = "encoded_lossless.jxl";
+    let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image =
-        image::open(Path::new("./assets/qqq2.jpg"))
-            .unwrap()
-            .resize(64, 64, FilterType::CatmullRom);
+    let image = image::open(Path::new("./assets/qqq2.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
-    let src_rgb = rgb_img.as_raw();
+    let rgba_img = image.to_rgba8();
+    // let src_rgb = rgb_img.as_raw();
     // for i in 0..10 {
     //     let instant = Instant::now();
     //     let d_bytes = jixel::encode_image_with_alpha(
-    //         image.to_rgba8().as_raw(),
+    //         &rgba_img,
     //         image.width() as usize,
     //         image.height() as usize,
     //         &EncodeConfig::default()
@@ -34,15 +32,15 @@ fn main() {
     //     );
     //     println!("Encoded in {}ms", instant.elapsed().as_millis());
     // }
-    let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
-    let bytes = jixel::encode_image_10bit(
-        &img10,
+    // let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
+    let bytes = jixel::encode_image(
+        &rgb_img,
         image.width() as usize,
         image.height() as usize,
         &EncodeConfig::default()
             .with_lossless(false)
-            .with_quality(99.)
-            .with_color_encoding(ColorEncoding::display_p3()), // .with_icc_profile(display_p3.to_vec()),
+            .with_quality(100.)
+            .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");

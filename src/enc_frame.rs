@@ -73,8 +73,8 @@ struct ImageDim {
     num_dc_groups: usize,
 }
 
-pub(crate) fn div_ceil(a: usize, b: usize) -> usize {
-    a.div_ceil(b)
+fn div_ceil(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
 }
 
 impl ImageDim {
@@ -105,6 +105,7 @@ impl ImageDim {
 // -----------------------------------------------------------------------------
 
 struct DistanceParams {
+    distance: f32,
     global_scale: i32,
     quant_dc: i32,
     scale: f32,
@@ -167,6 +168,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     }
 
     DistanceParams {
+        distance,
         global_scale,
         quant_dc: qd,
         scale: scale_f,
@@ -175,6 +177,10 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         epf_iters,
     }
 }
+
+// -----------------------------------------------------------------------------
+// DC tokens, AC metadata tokens, context tree tokens.
+// -----------------------------------------------------------------------------
 
 #[inline]
 fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
@@ -271,18 +277,20 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
                 };
                 let guess = clamped_gradient(top as i32, left as i32, topleft as i32);
                 let residual = here as i32 - guess;
-                let ctx_id = 2u32 - c as u32;
+                let ctx_id = (2u32 - c as u32) as u32;
                 write_token(Token::new(ctx_id, pack_signed(residual)), dc_code, writer);
             }
         }
     }
 
-    // --- (b) AC strategy tokens ---
+    // --- (b) AC strategy tokens — emitted once per FIRST block ---
     let mut left: i32 = 0;
-    for _y in 0..ysize_blocks {
-        for _x in 0..xsize_blocks {
-            // jixel: every block is its own first-block, raw_strategy == 0.
-            let cur: i32 = 0;
+    for y in 0..ysize_blocks {
+        for x in 0..xsize_blocks {
+            if !dc_data.ac_strategy.is_first_block(x, y) {
+                continue;
+            }
+            let cur = dc_data.ac_strategy.strategy_code(x, y) as i32;
             let ctx_id = if left > 11 {
                 7
             } else if left > 5 {
@@ -296,12 +304,15 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
             left = cur;
         }
     }
-
-    // --- (c) Quant field residuals ---
-    let mut left: i32 = 0; // initial left = strategy_code(0,0) = 0 (DCT-8x8)
+    // --- (c) Quant field residuals — emitted once per FIRST block ---
+    // Initial `left` = strategy_code(0, 0) of first block (always a first block).
+    let mut left: i32 = dc_data.ac_strategy.strategy_code(0, 0) as i32;
     for y in 0..ysize_blocks {
         let row_qf = dc_data.raw_quant_field.row(y);
         for x in 0..xsize_blocks {
+            if !dc_data.ac_strategy.is_first_block(x, y) {
+                continue;
+            }
             let cur: i32 = row_qf[x] as i32 - 1;
             let residual: i32 = cur - left;
             let ctx_id = if left > 11 {
@@ -317,7 +328,6 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
             left = cur;
         }
     }
-
     // --- (d) EPF tokens: (0, PackSigned(4)) per block ---
     let nblocks = xsize_blocks * ysize_blocks;
     for _ in 0..nblocks {
@@ -504,7 +514,7 @@ fn write_dc_group(dc_data: &DcGroupData, dc_code: &EntropyCode, w: &mut BitWrite
     write_dc_tokens(dc_data, dc_code, w);
 
     let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
-    let num_ac_blocks = num_blocks; // every block is its own first-block
+    let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
     // CeilLog2Nonzero(num_blocks)
     let nb_bits = if num_blocks <= 1 {
         0
@@ -550,18 +560,14 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     }
     let sizes: Vec<usize> = sections
         .iter()
-        .map(|s| s.bits_written().div_ceil(8))
+        .map(|s| (s.bits_written() + 7) / 8)
         .collect();
     write_toc(&sizes, writer);
     // After write_toc, writer is byte-aligned.
     writer.append_byte_aligned(sections);
 }
 
-// -----------------------------------------------------------------------------
-// Top-level frame encode.
-// -----------------------------------------------------------------------------
-
-pub fn encode_frame(
+pub(crate) fn encode_frame(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
@@ -644,6 +650,27 @@ fn process_dc_group(
     let dc_group_ysize_groups = div_ceil(dc_group_ysize, K_GROUP_DIM);
 
     let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
+
+    // Bogus adaptive quantization: fill raw_quant_field with per-block multipliers
+    // derived from local luma gradient magnitude in `linear`. Without this, every
+    // block uses quant=1 (the flat libjxl effort-1 behaviour).
+    crate::adaptive_quant::fill_quant_field(
+        linear,
+        &mut dc_data.raw_quant_field,
+        dc_group_x0,
+        dc_group_y0,
+    );
+
+    // Block selection: choose DCT16X8 / DCT8X16 for super-blocks where they
+    // beat per-block DCT8. AdjustQuantField propagates max-quant across
+    // covered blocks of each chosen multi-block transform.
+    crate::enc_ac_strategy::fill_ac_strategy(
+        linear,
+        distp.distance,
+        matrices,
+        &mut dc_data.raw_quant_field,
+        &mut dc_data.ac_strategy,
+    );
 
     // For each AC group within this DC group.
     let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
