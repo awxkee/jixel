@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-jixel = {path = "../"}
+jixel = {path = "../", default-features = false, features = ["fixed-xyb", "neon", "avx"]}
 image = "0.25.10"

@@ -295,13 +295,17 @@ fn load8_128(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 8] {
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
-    let left = load8_128(input, 16);
-    let right = load8_128(&input[8..], 16);
+    let mut left = load8_128(input, 16);
+    let mut right = load8_128(&input[8..], 16);
 
     let mut c = [NeonDoubledVector {
         lo: vdupq_n_f32(0.0),
         hi: vdupq_n_f32(0.0),
     }; 16];
+
+    transpose_8x8(&mut left);
+    transpose_8x8(&mut right);
+
     c[0..8].copy_from_slice(&left);
     c[8..16].copy_from_slice(&right);
 
@@ -360,5 +364,363 @@ pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
             vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(bot[m].lo, scale)); // v = 8..12
             vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(bot[m].hi, scale)); // v = 12..16
         }
+    }
+}
+
+#[cfg(test)]
+mod neon_dct_tests {
+    use super::*;
+    use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
+
+    const ATOL: f32 = 1e-4;
+
+    fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
+        assert_eq!(neon.len(), scalar.len(), "{label}: length mismatch");
+        let mut max_err: f32 = 0.0;
+        let mut worst = 0usize;
+        for (i, (n, s)) in neon.iter().zip(scalar.iter()).enumerate() {
+            let e = (n - s).abs();
+            if e > max_err {
+                max_err = e;
+                worst = i;
+            }
+        }
+        assert!(
+            max_err < ATOL,
+            "{label}: max error {max_err:.2e} at index {worst} \
+             (neon={:.6}, scalar={:.6})",
+            neon[worst],
+            scalar[worst]
+        );
+    }
+
+    /// Deterministic pseudo-random f32 in [-1, 1] seeded by index.
+    fn rng_f32(seed: u64) -> f32 {
+        // xorshift64
+        let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        // map to [-1, 1]
+        let u = (x >> 41) as f32; // 23-bit mantissa
+        u / (1u32 << 23) as f32 * 2.0 - 1.0
+    }
+
+    fn fill<const N: usize>(seed: u64) -> [f32; N] {
+        let mut buf = [0.0f32; N];
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = rng_f32(seed.wrapping_add((i as u64).wrapping_mul(6364136223846793005)));
+        }
+        buf
+    }
+
+    // ── dct8x8 ────────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_vs_scalar_random() {
+        use crate::neon::dct8x8_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed);
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct8x8_neon(&input, &mut got) };
+            dct8x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_dc_only() {
+        // All-constant input: only DC coefficient should be non-zero.
+        use crate::neon::dct8x8_neon;
+        let input = [0.5f32; 64];
+        let mut got = [0.0f32; 64];
+        let mut want = [0.0f32; 64];
+        unsafe { dct8x8_neon(&input, &mut got) };
+        dct8x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x8 dc-only");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_zero() {
+        use crate::neon::dct8x8_neon;
+        let input = [0.0f32; 64];
+        let mut got = [0.0f32; 64];
+        let mut want = [0.0f32; 64];
+        unsafe { dct8x8_neon(&input, &mut got) };
+        dct8x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x8 zero");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_linearity() {
+        // DCT is linear: DCT(a + b) == DCT(a) + DCT(b)
+        use crate::neon::dct8x8_neon;
+        let a: [f32; 64] = fill(100);
+        let b: [f32; 64] = fill(200);
+        let mut sum = [0.0f32; 64];
+        for i in 0..64 {
+            sum[i] = a[i] + b[i];
+        }
+
+        let mut da = [0.0f32; 64];
+        let mut db = [0.0f32; 64];
+        let mut dsum = [0.0f32; 64];
+        unsafe {
+            dct8x8_neon(&a, &mut da);
+            dct8x8_neon(&b, &mut db);
+            dct8x8_neon(&sum, &mut dsum);
+        }
+        let expected: Vec<f32> = (0..64).map(|i| da[i] + db[i]).collect();
+        assert_close(&dsum, &expected, "dct8x8 linearity");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_basis_vectors() {
+        // Feed each of the 64 basis vectors (single 1.0) and compare to scalar.
+        use crate::neon::dct8x8_neon;
+        for k in 0..64 {
+            let mut input = [0.0f32; 64];
+            input[k] = 1.0;
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct8x8_neon(&input, &mut got) };
+            dct8x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x8 basis[{k}]"));
+        }
+    }
+
+    // ── dct8x16 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_vs_scalar_random() {
+        use crate::neon::dct8x16_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 128] = fill(seed.wrapping_add(0xdead));
+            let mut got = [0.0f32; 128];
+            let mut want = [0.0f32; 128];
+            unsafe { dct8x16_neon(&input, &mut got) };
+            dct8x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_dc_only() {
+        use crate::neon::dct8x16_neon;
+        let input = [0.5f32; 128];
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct8x16_neon(&input, &mut got) };
+        dct8x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x16 dc-only");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_zero() {
+        use crate::neon::dct8x16_neon;
+        let input = [0.0f32; 128];
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct8x16_neon(&input, &mut got) };
+        dct8x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x16 zero");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_basis_vectors() {
+        use crate::neon::dct8x16_neon;
+        for k in 0..128 {
+            let mut input = [0.0f32; 128];
+            input[k] = 1.0;
+            let mut got = [0.0f32; 128];
+            let mut want = [0.0f32; 128];
+            unsafe { dct8x16_neon(&input, &mut got) };
+            dct8x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x16 basis[{k}]"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_linearity() {
+        use crate::neon::dct8x16_neon;
+        let a: [f32; 128] = fill(300);
+        let b: [f32; 128] = fill(400);
+        let mut sum = [0.0f32; 128];
+        for i in 0..128 {
+            sum[i] = a[i] + b[i];
+        }
+        let mut da = [0.0f32; 128];
+        let mut db = [0.0f32; 128];
+        let mut dsum = [0.0f32; 128];
+        unsafe {
+            dct8x16_neon(&a, &mut da);
+            dct8x16_neon(&b, &mut db);
+            dct8x16_neon(&sum, &mut dsum);
+        }
+        let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
+        assert_close(&dsum, &expected, "dct8x16 linearity");
+    }
+
+    // ── dct16x8 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_vs_scalar_random() {
+        use crate::neon::dct16x8_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 128] = fill(seed.wrapping_add(0xbeef));
+            let mut got = [0.0f32; 128];
+            let mut want = [0.0f32; 128];
+            unsafe { dct16x8_neon(&input, &mut got) };
+            dct16x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_dc_only() {
+        use crate::neon::dct16x8_neon;
+        let input = [0.5f32; 128];
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct16x8_neon(&input, &mut got) };
+        dct16x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x8 dc-only");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_zero() {
+        use crate::neon::dct16x8_neon;
+        let input = [0.0f32; 128];
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct16x8_neon(&input, &mut got) };
+        dct16x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x8 zero");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_basis_vectors() {
+        use crate::neon::dct16x8_neon;
+        for k in 0..128 {
+            let mut input = [0.0f32; 128];
+            input[k] = 1.0;
+            let mut got = [0.0f32; 128];
+            let mut want = [0.0f32; 128];
+            unsafe { dct16x8_neon(&input, &mut got) };
+            dct16x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x8 basis[{k}]"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_linearity() {
+        use crate::neon::dct16x8_neon;
+        let a: [f32; 128] = fill(500);
+        let b: [f32; 128] = fill(600);
+        let mut sum = [0.0f32; 128];
+        for i in 0..128 {
+            sum[i] = a[i] + b[i];
+        }
+        let mut da = [0.0f32; 128];
+        let mut db = [0.0f32; 128];
+        let mut dsum = [0.0f32; 128];
+        unsafe {
+            dct16x8_neon(&a, &mut da);
+            dct16x8_neon(&b, &mut db);
+            dct16x8_neon(&sum, &mut dsum);
+        }
+        let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
+        assert_close(&dsum, &expected, "dct16x8 linearity");
+    }
+
+    // ── Cross-shape consistency ────────────────────────────────────────────────
+    // A 16x8 block is the transpose of an 8x16 block.
+    // DCT(A^T)[u][v] relates to DCT(A)[v][u] by the separable 2-D DCT symmetry.
+    // We test a weaker property: both kernels produce the same DC coefficient
+    // for an all-constant input (DC is rotation-invariant).
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dc_coefficient_constant_input() {
+        use crate::neon::{dct8x16_neon, dct16x8_neon};
+        let input = [0.25f32; 128];
+
+        let mut out8x16 = [0.0f32; 128];
+        let mut out16x8 = [0.0f32; 128];
+        unsafe {
+            dct8x16_neon(&input, &mut out8x16);
+            dct16x8_neon(&input, &mut out16x8);
+        }
+        // DC is at index 0 in both output layouts.
+        assert!(
+            (out8x16[0] - out16x8[0]).abs() < ATOL,
+            "DC mismatch: 8x16={} 16x8={}",
+            out8x16[0],
+            out16x8[0]
+        );
+    }
+
+    // ── Extreme values ────────────────────────────────────────────────────────
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x8_neon_extreme_values() {
+        use crate::neon::dct8x8_neon;
+        // Alternating +1/-1 (highest-frequency input)
+        let mut input = [0.0f32; 64];
+        for i in 0..64 {
+            input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut got = [0.0f32; 64];
+        let mut want = [0.0f32; 64];
+        unsafe { dct8x8_neon(&input, &mut got) };
+        dct8x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x8 alternating +-1");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x8_neon_extreme_values() {
+        use crate::neon::dct16x8_neon;
+        let mut input = [0.0f32; 128];
+        for i in 0..128 {
+            input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct16x8_neon(&input, &mut got) };
+        dct16x8_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x8 alternating +-1");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x16_neon_extreme_values() {
+        use crate::neon::dct8x16_neon;
+        let mut input = [0.0f32; 128];
+        for i in 0..128 {
+            input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut got = [0.0f32; 128];
+        let mut want = [0.0f32; 128];
+        unsafe { dct8x16_neon(&input, &mut got) };
+        dct8x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct8x16 alternating +-1");
     }
 }
