@@ -104,17 +104,9 @@ fn block_quant(
     }
     let avg_grad = grad_sum / n as f32;
 
-    // Empirical mapping. Tuned so most blocks stay near q=1 and only sharp
-    // edges/foliage push higher; the cap at q=6 keeps the bit overhead per
-    // boosted block bounded (~6× baseline) rather than 16× baseline:
-    //   avg_grad <= 0.03   -> q = 1
-    //   avg_grad = 0.05    -> q = 2
-    //   avg_grad = 0.1     -> q = 3
-    //   avg_grad = 0.2     -> q = 4
-    //   avg_grad >= 0.45   -> q = 6   (saturate)
     let shifted = (avg_grad - 0.03).max(0.0);
-    let q = 1.0 + 6.0 * shifted.sqrt();
-    q.round().clamp(1.0, 6.0) as u8
+    let q = 2.0 + 4.0 * shifted.sqrt();
+    q.round().clamp(2.0, 6.0) as u8
 }
 
 #[cfg(test)]
@@ -137,13 +129,18 @@ mod tests {
         fill_quant_field(&img, &mut qf, 0, 0);
         for by in 0..2 {
             for bx in 0..2 {
-                assert_eq!(qf.row(by)[bx], 1, "flat block should be q=1");
+                assert_eq!(
+                    qf.row(by)[bx],
+                    2,
+                    "flat block should be q=2 (smooth-area boost)"
+                );
             }
         }
     }
 
     #[test]
     fn high_contrast_pattern_gives_higher_quant() {
+        // Checkerboard pattern: every other pixel toggles between 0 and 1.
         let mut img = Image3F::new(16, 16);
         for y in 0..16 {
             let [r, g, b] = img.all_plane_rows_mut(y);
@@ -204,7 +201,7 @@ mod tests {
         // Edge blocks shouldn't crash and should also be q=1.
         for by in 0..2 {
             for bx in 0..2 {
-                assert_eq!(qf.row(by)[bx], 1);
+                assert_eq!(qf.row(by)[bx], 2);
             }
         }
     }

@@ -563,7 +563,7 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     writer.append_byte_aligned(sections);
 }
 
-pub fn encode_frame(
+pub(crate) fn encode_frame(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
@@ -752,6 +752,18 @@ fn process_dc_group(
         matrices,
         &mut dc_data.raw_quant_field,
         &mut dc_data.ac_strategy,
+    );
+    // Per-tile CfL: find optimal Y→X and Y→B slopes per 64×64 tile, written
+    // into ytox_map/ytob_map and applied during DCT in write_ac_group.
+    crate::enc_color_correlation::fill_cmap(
+        opsin,
+        matrices,
+        dc_group_x0 / K_BLOCK_DIM,
+        dc_group_y0 / K_BLOCK_DIM,
+        dc_group_xsize_blocks,
+        dc_group_ysize_blocks,
+        &mut dc_data.ytox_map,
+        &mut dc_data.ytob_map,
     );
 
     let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
