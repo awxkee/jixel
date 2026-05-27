@@ -74,7 +74,7 @@ struct ImageDim {
 }
 
 fn div_ceil(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }
 
 impl ImageDim {
@@ -277,7 +277,7 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
                 };
                 let guess = clamped_gradient(top as i32, left as i32, topleft as i32);
                 let residual = here as i32 - guess;
-                let ctx_id = (2u32 - c as u32) as u32;
+                let ctx_id = 2u32 - c as u32;
                 write_token(Token::new(ctx_id, pack_signed(residual)), dc_code, writer);
             }
         }
@@ -560,7 +560,7 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     }
     let sizes: Vec<usize> = sections
         .iter()
-        .map(|s| (s.bits_written() + 7) / 8)
+        .map(|s| s.bits_written().div_ceil(8))
         .collect();
     write_toc(&sizes, writer);
     // After write_toc, writer is byte-aligned.

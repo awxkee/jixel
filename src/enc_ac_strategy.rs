@@ -203,9 +203,10 @@ pub fn find_best_16x16_transform(
     let k8x8_mul1 = -0.55 * 0.75;
     let k8x8_mul2 = 1.073_575_8 * 0.75;
     let mul8x8 = k8x8_mul2 + k8x8_mul1 / (distance + k8x8_base);
+    const K_MUL16X8_TUNING: f32 = 1.5;
     let k8x16_base = 1.6;
-    let k8x16_mul1 = -0.55;
-    let k8x16_mul2 = 0.901_958_8;
+    let k8x16_mul1 = -0.55 * K_MUL16X8_TUNING;
+    let k8x16_mul2 = 0.901_958_8 * K_MUL16X8_TUNING;
     let mul16x8 = k8x16_mul2 + k8x16_mul1 / (distance + k8x16_base);
 
     // Cache the QF rect over the 2x2 super-block: 2 rows × 2 cols.
@@ -304,12 +305,12 @@ pub fn find_best_16x16_transform(
     if cost16x8 < cost8x16 {
         // Try DCT16X8 in each column independently.
         if entropy_16x8_left < entropy[0][0] + entropy[1][0]
-            && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT8X16)
+            && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
         {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X8);
         }
         if entropy_16x8_right < entropy[0][1] + entropy[1][1]
-            && ac_strategy.can_place_strategy(bx0 + 1, by0, STRATEGY_DCT8X16)
+            && ac_strategy.can_place_strategy(bx0 + 1, by0, STRATEGY_DCT16X8)
         {
             ac_strategy.set_first(bx0 + 1, by0, STRATEGY_DCT16X8);
         }

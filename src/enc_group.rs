@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(clippy::excessive_precision)]
 use crate::ac_context::{
     K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, block_context, non_zero_context, zero_density_context,
     zero_density_context_8x8, zero_density_contexts_offset,
@@ -51,7 +52,7 @@ fn predict_from_top_and_left(row_top: Option<&[u8]>, row: &[u8], x: usize, defau
     } else if row_top.is_none() {
         row[x - 1]
     } else {
-        ((row_top.unwrap()[x] as u16 + row[x - 1] as u16 + 1) / 2) as u8
+        (row_top.unwrap()[x] as u16 + row[x - 1] as u16).div_ceil(2) as u8
     }
 }
 

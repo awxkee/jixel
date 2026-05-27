@@ -28,7 +28,7 @@
  */
 
 fn srgb_to_linear_u8_ref(v: u8) -> f32 {
-    let v = v as f64 / 255.0;
+    let v = v as f64 * (1. / 255.0);
     (if v <= 0.04045 {
         v / 12.92
     } else {

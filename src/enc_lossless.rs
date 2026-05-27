@@ -216,20 +216,6 @@ fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
     w.write(2, 0b00); // no FH extensions
 }
 
-// ---------------------------------------------------------------------------
-// Modular transform header.
-//
-//   transforms count: u2S(0, Bits(2)+1, Bits(4)+5, Bits(8)+21)
-//   per-Transform:
-//     id            : Bits(2)       (0 = RCT, 1 = Palette, 2 = Squeeze)
-//     begin_channel : u2S(Bits(3), Bits(6)+8, Bits(10)+72, Bits(13)+1096)
-//     rct_type      : u2S(6, Bits(2), Bits(4)+2, Bits(6)+10)   (only if id == RCT)
-//
-// For nb_chans >= 3 we declare a single RCT transform with rct_type = 6
-// (YCoCg) starting at channel 0.  For 1-channel (no transforms) we just
-// emit `transforms=0` (2 bits).
-// ---------------------------------------------------------------------------
-
 fn write_modular_transforms(nb_chans: usize, w: &mut BitWriter) {
     if nb_chans >= 3 {
         // transforms count u2S(0, 1, Bits(4)+2, Bits(8)+18): selector 1 = Val(1) → 1 transform.

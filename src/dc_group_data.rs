@@ -90,24 +90,6 @@ impl AcStrategyImage {
         const LUT: [u8; NUM_STRATEGIES] = [1, 2, 1];
         LUT[strategy as usize] as usize
     }
-    #[inline]
-    pub(crate) fn covered_blocks_x_at(&self, x: usize, y: usize) -> usize {
-        Self::covered_blocks_x_of(self.raw_strategy(x, y))
-    }
-    #[inline]
-    pub(crate) fn covered_blocks_y_at(&self, x: usize, y: usize) -> usize {
-        Self::covered_blocks_y_of(self.raw_strategy(x, y))
-    }
-
-    /// Legacy 1×1 accessor (used by old code paths).
-    #[inline]
-    pub(crate) fn covered_blocks_x(&self) -> usize {
-        1
-    }
-    #[inline]
-    pub(crate) fn covered_blocks_y(&self) -> usize {
-        1
-    }
 
     /// Mark (x, y) as the first block of a multi-block transform with the
     /// given `strategy`. Fills covered cells with non-first markers.
@@ -186,8 +168,8 @@ const TILE_DIM_IN_BLOCKS: usize = 8;
 
 impl DcGroupData {
     pub(crate) fn new(xsize_blocks: usize, ysize_blocks: usize) -> Self {
-        let xtiles = (xsize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
-        let ytiles = (ysize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
+        let xtiles = xsize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
+        let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         Self {
             quant_dc: Image3S::new(xsize_blocks, ysize_blocks),
             raw_quant_field: ImageB::new_fill(xsize_blocks, ysize_blocks, 1),

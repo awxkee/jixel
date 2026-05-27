@@ -180,7 +180,7 @@ fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
 pub(crate) const WC16: [f32; 8] = [
     0.502_419_3, // 1/(2·cos( π/32))
     0.522_498_6, // 1/(2·cos(3π/32))
-    0.566_944_0, // 1/(2·cos(5π/32))
+    0.566_944,   // 1/(2·cos(5π/32))
     0.646_821_8, // 1/(2·cos(7π/32))
     0.788_154_6, // 1/(2·cos(9π/32))
     1.060_677_7, // 1/(2·cos(11π/32))
@@ -271,7 +271,7 @@ fn select_dct_8x16() -> Arc<DctFn<128>> {
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return Arc::new(|input, output| unsafe {
-                crate::avx::dct8x8_avx2(input, output);
+                crate::avx::dct8x16_avx2(input, output);
             });
         }
     }
@@ -329,7 +329,7 @@ fn select_dct_16x8() -> Arc<DctFn<128>> {
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return Arc::new(|input, output| unsafe {
-                crate::avx::dct8x8_avx2(input, output);
+                crate::avx::dct16x8_avx2(input, output);
             });
         }
     }
