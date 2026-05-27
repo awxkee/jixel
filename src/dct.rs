@@ -142,7 +142,7 @@ pub(crate) fn dct8x8(input: &[f32; 64], output: &mut [f32; 64]) {
     DCT_METHOD.get_or_init(select_dct)(input, output);
 }
 
-fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     let mut tmp = [0.0f32; 64];
 
     for (src_row, tmp) in input
@@ -284,7 +284,7 @@ pub(crate) fn dct8x16(input: &[f32; 128], output: &mut [f32; 128]) {
     DCT_METHOD_8X16.get_or_init(select_dct_8x16)(input, output);
 }
 
-fn dct8x16_scalar(input: &[f32], output: &mut [f32; 128]) {
+pub(crate) fn dct8x16_scalar(input: &[f32], output: &mut [f32; 128]) {
     let mut after_row_dct = [0.0f32; 128];
     for (src, dst) in input
         .as_chunks::<16>()
@@ -339,7 +339,7 @@ pub(crate) fn dct16x8(input: &[f32; 128], output: &mut [f32; 128]) {
     DCT_METHOD_16X8.get_or_init(select_dct_16x8)(input, output);
 }
 
-fn dct16x8_scalar(input: &[f32; 128], output: &mut [f32; 128]) {
+pub(crate) fn dct16x8_scalar(input: &[f32; 128], output: &mut [f32; 128]) {
     let mut after_col_dct = [0.0f32; 128];
     for u in 0..8 {
         let mut col = [0.0f32; 16];
