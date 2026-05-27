@@ -429,7 +429,7 @@ fn encode_high_depth_rgba(
     config: &EncodeConfig,
     bps: BitsPerSample,
 ) -> Result<Vec<u8>, EncodeError> {
-    let expected = width * height * 4;
+    let expected = width * height * if has_alpha { 4 } else { 3 };
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -452,44 +452,68 @@ fn encode_high_depth_rgba(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
-    let mut alpha_plane = vec![0u16; width * height];
 
     let lut = &lut_high_bit(bps.bits() as u8).table;
 
     let bp_max = (1 << bps.bits()) - 1;
 
-    for (y, (row, alpha_row)) in input
-        .chunks_exact(width * 4)
-        .zip(alpha_plane.chunks_exact_mut(width))
-        .enumerate()
-    {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for ((((r, g), b), src), alpha) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.as_chunks::<4>().0.iter())
-            .zip(alpha_row.iter_mut())
+    if has_alpha {
+        let mut alpha_plane = vec![0u16; width * height];
+        for (y, (row, alpha_row)) in input
+            .chunks_exact(width * 4)
+            .zip(alpha_plane.chunks_exact_mut(width))
+            .enumerate()
         {
-            *r = lut[src[0] as usize];
-            *g = lut[src[1] as usize];
-            *b = lut[src[2] as usize];
-            *alpha = src[3].min(bp_max);
+            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+            for ((((r, g), b), src), alpha) in r_row
+                .iter_mut()
+                .zip(g_row.iter_mut())
+                .zip(b_row.iter_mut())
+                .zip(row.as_chunks::<4>().0.iter())
+                .zip(alpha_row.iter_mut())
+            {
+                *r = lut[src[0] as usize];
+                *g = lut[src[1] as usize];
+                *b = lut[src[2] as usize];
+                *alpha = src[3].min(bp_max);
+            }
         }
-    }
 
-    encode_with_config(
-        &linear,
-        &EncodeConfigImpl::with_distance(distance)
-            .with_alpha(match bps {
-                BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
-                BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
-                BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
-            })
-            .with_bits_per_sample(bps)
-            .with_icc_profile(config.icc_profile.clone())
-            .with_color_encoding(config.color_encoding),
-    )
+        encode_with_config(
+            &linear,
+            &EncodeConfigImpl::with_distance(distance)
+                .with_alpha(match bps {
+                    BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
+                    BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
+                    BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
+                })
+                .with_bits_per_sample(bps)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        )
+    } else {
+        for (y, row) in input.chunks_exact(width * 3).enumerate() {
+            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+            for (((r, g), b), src) in r_row
+                .iter_mut()
+                .zip(g_row.iter_mut())
+                .zip(b_row.iter_mut())
+                .zip(row.as_chunks::<3>().0.iter())
+            {
+                *r = lut[src[0] as usize];
+                *g = lut[src[1] as usize];
+                *b = lut[src[2] as usize];
+            }
+        }
+
+        encode_with_config(
+            &linear,
+            &EncodeConfigImpl::with_distance(distance)
+                .with_bits_per_sample(bps)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        )
+    }
 }
 
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
