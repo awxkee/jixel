@@ -55,17 +55,12 @@ const MIN_DISTANCE: f32 = 0.03;
 /// 30 bits, so 2^30 is the largest representable dimension.
 pub(crate) const MAX_DIMENSION: usize = 0x3FFF_FFFF;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BitsPerSample {
+    #[default]
     Eight,
     Ten,
     Twelve,
-}
-
-impl Default for BitsPerSample {
-    fn default() -> Self {
-        Self::Eight
-    }
 }
 
 impl BitsPerSample {

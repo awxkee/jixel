@@ -60,7 +60,7 @@ fn predict_from_top_and_left(row_top: Option<&[u8]>, row: &[u8], x: usize, defau
     } else if row_top.is_none() {
         row[x - 1]
     } else {
-        ((row_top.unwrap()[x] as u16 + row[x - 1] as u16 + 1) / 2) as u8
+        (row_top.unwrap()[x] as u16 + row[x - 1] as u16).div_ceil(2) as u8
     }
 }
 
@@ -103,7 +103,7 @@ fn quantize_block_8x8_ac(
     }
 }
 
-const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
+const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.070_054_5;
 const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
 
 #[inline]
@@ -151,8 +151,7 @@ fn quantize_roundtrip_y_block(
 /// * `x_qm_scale`   — Header-signaled X matrix multiplier knob.
 /// * `dc_data`      — DC group accumulator (sized to the DC group).
 /// * `ac_code`      — Static AC entropy code.
-/// * `num_nzeros`   — Per-AC-group block nonzero counts (sized 32x32),
-///                    addressed at `(group_brect.y0 % 32 + by, bx)`.
+/// * `num_nzeros`   — Per-AC-group block nonzero counts (sized 32x32), addressed at `(group_brect.y0 % 32 + by, bx)`.
 /// * `writer`       — Section bit writer for this AC group.
 #[allow(clippy::too_many_arguments)]
 pub fn write_ac_group(

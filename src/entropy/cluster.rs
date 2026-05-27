@@ -149,8 +149,8 @@ pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &
     let mut next_index = 0u32;
     let mut reordered: Vec<Histogram> = Vec::new();
     for &s in &symbols {
-        if !new_index.contains_key(&s) {
-            new_index.insert(s, next_index);
+        if let std::collections::hash_map::Entry::Vacant(e) = new_index.entry(s) {
+            e.insert(next_index);
             reordered.push(tmp[s as usize].clone());
             next_index += 1;
         }

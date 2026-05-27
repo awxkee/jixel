@@ -36,12 +36,12 @@ const M10: f32 = 0.23;
 const M12: f32 = 0.078;
 const M11: f32 = 1.0 - M12 - M10;
 
-const M20: f32 = 0.24342268924547819;
-const M21: f32 = 0.20476744424496821;
+const M20: f32 = 0.243_422_69;
+const M21: f32 = 0.204_767_45;
 const M22: f32 = 1.0 - M20 - M21;
 
-const OPSIN_BIAS: f32 = 0.0037930732552754493;
-const NEG_BIAS_CBRT: f32 = -0.15595420054;
+const OPSIN_BIAS: f32 = 0.003_793_073_4;
+const NEG_BIAS_CBRT: f32 = -0.155_954_2;
 
 #[cfg_attr(feature = "fixed-xyb", allow(dead_code))]
 #[inline(always)]

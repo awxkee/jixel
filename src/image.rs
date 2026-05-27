@@ -58,7 +58,6 @@ impl<T: Copy + Default> Plane<T> {
     pub fn ysize(&self) -> usize {
         self.ysize
     }
-    /// Stride in elements (== xsize in jixel since rows have no padding).
 
     #[inline]
     pub fn row(&self, y: usize) -> &[T] {

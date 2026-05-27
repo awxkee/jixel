@@ -95,7 +95,7 @@ impl BitWriter {
     pub(crate) fn append_byte_aligned(&mut self, others: &mut [BitWriter]) {
         let mut extra = 0usize;
         for w in others.iter() {
-            extra += (w.bits_written + 7) / 8;
+            extra += w.bits_written.div_ceil(8);
         }
         if extra == 0 {
             return;

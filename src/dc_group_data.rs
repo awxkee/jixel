@@ -64,8 +64,8 @@ const TILE_DIM_IN_BLOCKS: usize = 8;
 
 impl DcGroupData {
     pub(crate) fn new(xsize_blocks: usize, ysize_blocks: usize) -> Self {
-        let xtiles = (xsize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
-        let ytiles = (ysize_blocks + TILE_DIM_IN_BLOCKS - 1) / TILE_DIM_IN_BLOCKS;
+        let xtiles = xsize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
+        let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         Self {
             quant_dc: Image3S::new(xsize_blocks, ysize_blocks),
             raw_quant_field: ImageB::new_fill(xsize_blocks, ysize_blocks, 1),

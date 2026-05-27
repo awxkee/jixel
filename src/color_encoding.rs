@@ -176,11 +176,6 @@ fn write_jxl_enum(value: u32, w: &mut BitWriter) {
 ///   6. `tf.have_gamma` (1 bit) — 0; we always select a named transfer fn.
 ///   7. `tf.transfer_function` (enum) — only present if `!want_icc`.
 ///   8. `rendering_intent` (enum) — only present if `!want_icc`.
-
-/// Like `write_color_encoding`, but with explicit `want_icc` selector.  When
-/// `want_icc == true`, only `color_space` is emitted — the white point,
-/// primaries, transfer, and rendering intent fields are conditional on
-/// `!want_icc` and must be skipped (the ICC profile carries that data).
 pub(crate) fn write_color_encoding_with_icc(
     enc: &ColorEncoding,
     want_icc: bool,

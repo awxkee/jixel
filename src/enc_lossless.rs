@@ -701,5 +701,5 @@ fn write_local_tree_lz77(n_leaves: usize, pixel_code: &OwnedEntropyCode, w: &mut
 
 #[inline]
 fn div_ceil(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }

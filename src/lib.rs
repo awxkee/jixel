@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 mod ac_context;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;

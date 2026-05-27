@@ -83,7 +83,7 @@ pub fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
         }
 
         // Stable sort by ascending count.
-        tree.sort_by(|a, b| a.total_count.cmp(&b.total_count));
+        tree.sort_by_key(|a| a.total_count);
 
         tree.push(SENTINEL);
         tree.push(SENTINEL);

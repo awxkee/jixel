@@ -115,13 +115,13 @@ fn encode_varint(value: u64, out: &mut Vec<u8>) {
 
 // libjxl's ByteKind1 / ByteKind2 used to choose one of 41 ICC ANS contexts.
 fn byte_kind_1(b: u8) -> u8 {
-    if (b'a'..=b'z').contains(&b) {
+    if b.is_ascii_lowercase() {
         return 0;
     }
-    if (b'A'..=b'Z').contains(&b) {
+    if b.is_ascii_uppercase() {
         return 0;
     }
-    if (b'0'..=b'9').contains(&b) {
+    if b.is_ascii_digit() {
         return 1;
     }
     if b == b'.' || b == b',' {
@@ -145,13 +145,13 @@ fn byte_kind_1(b: u8) -> u8 {
     7
 }
 fn byte_kind_2(b: u8) -> u8 {
-    if (b'a'..=b'z').contains(&b) {
+    if b.is_ascii_lowercase() {
         return 0;
     }
-    if (b'A'..=b'Z').contains(&b) {
+    if b.is_ascii_uppercase() {
         return 0;
     }
-    if (b'0'..=b'9').contains(&b) {
+    if b.is_ascii_digit() {
         return 1;
     }
     if b == b'.' || b == b',' {
@@ -228,24 +228,24 @@ fn write_u64(value: u64, w: &mut BitWriter) {
         w.write(2, 0);
     } else if value <= 16 {
         w.write(2, 1);
-        w.write(4, (value - 1) as u64);
+        w.write(4, value - 1);
     } else if value <= 272 {
         w.write(2, 2);
-        w.write(8, (value - 17) as u64);
+        w.write(8, value - 17);
     } else {
         w.write(2, 3);
-        w.write(12, (value & 4095) as u64);
+        w.write(12, value & 4095);
         let mut v = value >> 12;
         let mut shift: u32 = 12;
         while v > 0 && shift < 60 {
             w.write(1, 1);
-            w.write(8, (v & 255) as u64);
+            w.write(8, v & 255);
             v >>= 8;
             shift += 8;
         }
         if v > 0 {
             w.write(1, 1);
-            w.write(4, (v & 15) as u64);
+            w.write(4, v & 15);
         } else {
             w.write(1, 0);
         }

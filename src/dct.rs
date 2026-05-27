@@ -54,14 +54,9 @@ pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
     a * b + c
 }
 
-pub(crate) const WC4: [f32; 2] = [0.541196100146197, 1.3065629648763764];
+pub(crate) const WC4: [f32; 2] = [0.541_196_1, 1.306_563];
 
-pub(crate) const WC8: [f32; 4] = [
-    0.5097955791041592,
-    0.6013448869350453,
-    0.8999762231364156,
-    2.5629154477415055,
-];
+pub(crate) const WC8: [f32; 4] = [0.509_795_6, 0.601_344_9, 0.899_976_2, 2.562_915_6];
 
 #[allow(unused)]
 #[inline(always)]
@@ -108,8 +103,8 @@ fn dct1d_8(buf: &mut [f32]) {
     }
     dct1d_4(&mut tmp[4..8]);
     tmp[4] = fmla(tmp[4], std::f32::consts::SQRT_2, tmp[5]);
-    tmp[5] = tmp[5] + tmp[6];
-    tmp[6] = tmp[6] + tmp[7];
+    tmp[5] += tmp[6];
+    tmp[6] += tmp[7];
     for i in 0..4 {
         buf[2 * i] = tmp[i];
         buf[2 * i + 1] = tmp[4 + i];
