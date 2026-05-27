@@ -41,6 +41,7 @@ mod color_encoding;
 mod dc_group_data;
 mod dct;
 mod enc_ac_strategy;
+mod enc_color_correlation;
 mod enc_frame;
 mod enc_group;
 mod enc_lossless;
