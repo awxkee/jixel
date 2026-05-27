@@ -27,16 +27,16 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(clippy::excessive_precision)]
+
 use crate::ac_context::{
     K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, block_context, non_zero_context, zero_density_context,
     zero_density_context_8x8, zero_density_contexts_offset,
 };
-use crate::bit_writer::BitWriter;
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
 };
 use crate::dct::{dc_from_dct8x16, dc_from_dct16x8, dct8x8, dct8x16, dct16x8};
-use crate::entropy::{EntropyCode, Token, pack_signed, write_token};
+use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
 
@@ -188,9 +188,8 @@ fn quantize_roundtrip_y_block(
     }
 }
 
-/// Process and tokenize one stripe of an AC group.
 #[allow(clippy::too_many_arguments)]
-pub fn write_ac_group(
+pub(crate) fn write_ac_group(
     opsin: &Image3F,
     group_brect: Rect,
     matrices: &DequantMatrices,
@@ -198,9 +197,8 @@ pub fn write_ac_group(
     scale_dc: f32,
     x_qm_scale: u32,
     dc_data: &mut DcGroupData,
-    ac_code: &EntropyCode,
     num_nzeros: &mut Image3B,
-    writer: &mut BitWriter,
+    out: &mut Vec<Token>,
 ) {
     let xsize_blocks = group_brect.xsize;
     let ysize_blocks = group_brect.ysize;
@@ -457,7 +455,7 @@ pub fn write_ac_group(
                 let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
                 let histo_offset = zero_density_contexts_offset(block_ctx);
 
-                write_token(Token::new(nzero_ctx, nzeros as u32), ac_code, writer);
+                write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
 
                 // Choose the natural coefficient order.
                 let order: &[u8] = if covered_blocks == 1 {
@@ -484,7 +482,7 @@ pub fn write_ac_group(
                                 prev,
                             )
                         };
-                    write_token(Token::new(ctx as u32, pack_signed(coef)), ac_code, writer);
+                    write_token_into(Token::new(ctx as u32, pack_signed(coef)), out);
                     prev = if coef != 0 { 1 } else { 0 };
                     if coef != 0 {
                         remaining -= 1;
@@ -499,4 +497,9 @@ pub fn write_ac_group(
             }
         }
     }
+}
+
+#[inline]
+fn write_token_into(t: Token, out: &mut Vec<Token>) {
+    out.push(t);
 }

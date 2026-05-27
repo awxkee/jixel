@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_context::K_COMPACT_BLOCK_CONTEXT_MAP;
+use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
 use crate::dc_group_data::DcGroupData;
 use crate::enc_group::write_ac_group;
@@ -39,8 +39,7 @@ use crate::entropy::{
 use crate::image::{Image3B, Image3F, Rect};
 use crate::quant_weights::DequantMatrices;
 use crate::static_entropy_codes::{
-    K_AC_CONTEXT_MAP, K_AC_PREFIX_CODES, K_CONTEXT_TREE_TOKENS, K_DC_CONTEXT_MAP,
-    K_DC_PREFIX_CODES, K_GRADIENT_CONTEXT_LUT,
+    K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
 
 const K_BLOCK_DIM: usize = 8;
@@ -195,7 +194,11 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
 }
 
 /// Emit DC tokens for one DC group (in channel order Y, X, B).
-fn write_dc_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer: &mut BitWriter) {
+/// Same as write_dc_tokens, but returns the tokens instead of writing them.
+/// Use this to build adaptive entropy codes from the actual token distribution
+/// before committing the bit pattern.
+fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
+    let mut tokens = Vec::new();
     for c in [1usize, 0, 2] {
         let plane = dc_data.quant_dc.plane(c);
         let ysize = plane.ysize();
@@ -204,10 +207,6 @@ fn write_dc_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer: &mut Bi
             for x in 0..xsize {
                 let qrow_here = plane.row(y)[x] as i64;
                 let row_above = if y > 0 { Some(plane.row(y - 1)) } else { None };
-                // libjxl-tiny formulas:
-                //   left = x ? qrow[x-1] : y ? qrow_above[x] : 0
-                //   top  = y ? qrow_above[x] : left
-                //   topleft = (x && y) ? qrow_above[x-1] : left
                 let left: i64 = if x > 0 {
                     plane.row(y)[x - 1] as i64
                 } else if let Some(rt) = row_above {
@@ -232,23 +231,27 @@ fn write_dc_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer: &mut Bi
                 );
                 let residual = qrow_here as i32 - guess;
                 let ctx_id = K_GRADIENT_CONTEXT_LUT[grad_prop as usize] as u32;
-                write_token(Token::new(ctx_id, pack_signed(residual)), dc_code, writer);
+                tokens.push(Token::new(ctx_id, pack_signed(residual)));
             }
         }
     }
+    tokens
 }
 
 /// AC metadata: ytox/ytob CfL maps (all 0), AC strategy (all 0 = DCT-8x8),
 /// quant field residuals (all 0), and EPF (token (0, PackSigned(4)) per block).
 ///
 /// In libjxl-tiny ALL four sub-streams use the same shared dc_code.
-fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer: &mut BitWriter) {
+/// Same as write_ac_metadata_tokens, but returns the tokens. Mirror of
+/// collect_dc_tokens for the AC metadata (YtoX/B, ACS, QF, EPF).
+fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
+    let mut tokens = Vec::new();
     let xsize_blocks = dc_data.ac_strategy.xsize();
     let ysize_blocks = dc_data.ac_strategy.ysize();
     let xtiles = dc_data.ytox_map.xsize();
     let ytiles = dc_data.ytox_map.ysize();
 
-    // --- (a) YtoX and YtoB tokens, with gradient prediction ---
+    // (a) YtoX and YtoB tokens with gradient prediction.
     for c in 0..2usize {
         let cfl_map = if c == 0 {
             &dc_data.ytox_map
@@ -282,12 +285,12 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
                 let guess = clamped_gradient(top as i32, left as i32, topleft as i32);
                 let residual = here as i32 - guess;
                 let ctx_id = 2u32 - c as u32;
-                write_token(Token::new(ctx_id, pack_signed(residual)), dc_code, writer);
+                tokens.push(Token::new(ctx_id, pack_signed(residual)));
             }
         }
     }
 
-    // --- (b) AC strategy tokens — emitted once per FIRST block ---
+    // (b) AC strategy tokens.
     let mut left: i32 = 0;
     for y in 0..ysize_blocks {
         for x in 0..xsize_blocks {
@@ -304,12 +307,11 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
             } else {
                 10
             } as u32;
-            write_token(Token::new(ctx_id, pack_signed(cur)), dc_code, writer);
+            tokens.push(Token::new(ctx_id, pack_signed(cur)));
             left = cur;
         }
     }
-    // --- (c) Quant field residuals — emitted once per FIRST block ---
-    // Initial `left` = strategy_code(0, 0) of first block (always a first block).
+    // (c) QF residuals.
     let mut left: i32 = dc_data.ac_strategy.strategy_code(0, 0) as i32;
     for y in 0..ysize_blocks {
         let row_qf = dc_data.raw_quant_field.row(y);
@@ -328,15 +330,16 @@ fn write_ac_metadata_tokens(dc_data: &DcGroupData, dc_code: &EntropyCode, writer
             } else {
                 6
             } as u32;
-            write_token(Token::new(ctx_id, pack_signed(residual)), dc_code, writer);
+            tokens.push(Token::new(ctx_id, pack_signed(residual)));
             left = cur;
         }
     }
-    // --- (d) EPF tokens: (0, PackSigned(4)) per block ---
+    // (d) EPF tokens.
     let nblocks = xsize_blocks * ysize_blocks;
     for _ in 0..nblocks {
-        write_token(Token::new(0, pack_signed(4)), dc_code, writer);
+        tokens.push(Token::new(0, pack_signed(4)));
     }
+    tokens
 }
 
 /// Build and emit the context tree.
@@ -507,9 +510,8 @@ fn write_dc_global(
 }
 
 fn write_ac_global(num_groups: usize, ac_code: &EntropyCode, w: &mut BitWriter) {
-    w.write(1, 1); // all default quant matrices
+    w.write(1, 1);
     if num_groups > 1 {
-        // CeilLog2Nonzero(num_groups)
         let bits = 32
             - (num_groups as u32).leading_zeros()
             - if num_groups.is_power_of_two() { 1 } else { 0 };
@@ -518,30 +520,9 @@ fn write_ac_global(num_groups: usize, ac_code: &EntropyCode, w: &mut BitWriter) 
         }
     }
     w.write(2, 3);
-    w.write(13, 0); // all default coeff order
-    w.write(1, 0); // no lz77
+    w.write(13, 0);
+    w.write(1, 0);
     write_entropy_code(ac_code, w);
-}
-
-fn write_dc_group(dc_data: &DcGroupData, dc_code: &EntropyCode, w: &mut BitWriter) {
-    w.write(2, 0); // extra_dc_precision
-    w.write(4, 3); // use global tree, default wp, no transforms
-    write_dc_tokens(dc_data, dc_code, w);
-
-    let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
-    let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
-    // CeilLog2Nonzero(num_blocks)
-    let nb_bits = if num_blocks <= 1 {
-        0
-    } else {
-        32 - (num_blocks as u32).leading_zeros() as usize
-            - if num_blocks.is_power_of_two() { 1 } else { 0 }
-    };
-    if nb_bits != 0 {
-        w.write(nb_bits, (num_ac_blocks - 1) as u64);
-    }
-    w.write(4, 3);
-    write_ac_metadata_tokens(dc_data, dc_code, w);
 }
 
 fn write_toc(sizes: &[usize], w: &mut BitWriter) {
@@ -582,7 +563,7 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     writer.append_byte_aligned(sections);
 }
 
-pub(crate) fn encode_frame(
+pub fn encode_frame(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
@@ -591,46 +572,56 @@ pub(crate) fn encode_frame(
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
     let distp = compute_distance_params(distance);
     let matrices = DequantMatrices::new();
-    let dc_code = EntropyCode::new(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
-    let ac_code = EntropyCode::new(&K_AC_CONTEXT_MAP, &K_AC_PREFIX_CODES);
 
     let mut opsin = linear.clone();
     to_xyb(&mut opsin);
-
-    // Forward gaborish. Decoder runs the inverse on the way out; the pair
-    // forms a pre/de-emphasis around the lossy round-trip.
     if distp.gab_enabled {
         crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
     }
 
-    // Section layout:
-    //   0                                  : DC global
-    //   1..1+num_dc_groups                 : DC groups
-    //   1+num_dc_groups                    : AC global
-    //   2+num_dc_groups..                  : AC groups
     let num_sections = 2 + dim.num_dc_groups + dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
-    // Process DC groups.
+    // Phase 1: process each DC group, computing dc_data and collecting
+    // per-AC-group token vectors. Nothing is written yet.
+    let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(dim.num_dc_groups);
+    let mut all_pending: Vec<PendingAcGroup> = Vec::new();
     for dc_gy in 0..dim.ysize_dc_groups {
         for dc_gx in 0..dim.xsize_dc_groups {
-            process_dc_group(
-                linear,
-                &opsin,
-                &dim,
-                &distp,
-                &matrices,
-                &dc_code,
-                &ac_code,
-                dc_gx,
-                dc_gy,
-                alpha,
-                &mut sections,
-            );
+            let (dc_data, mut pending) =
+                process_dc_group(linear, &opsin, &dim, &distp, &matrices, dc_gx, dc_gy);
+            dc_datas.push(dc_data);
+            all_pending.append(&mut pending);
         }
     }
 
-    // Globals (after AC groups so we have the data; semantically order independent).
+    // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
+    let mut dc_tokens_per_group: Vec<Vec<Token>> = Vec::with_capacity(dim.num_dc_groups);
+    let mut meta_tokens_per_group: Vec<Vec<Token>> = Vec::with_capacity(dim.num_dc_groups);
+    let mut all_dc_tokens: Vec<Token> = Vec::new();
+    for dc_data in &dc_datas {
+        let dc_t = collect_dc_tokens(dc_data);
+        let mt_t = collect_ac_metadata_tokens(dc_data);
+        all_dc_tokens.extend_from_slice(&dc_t);
+        all_dc_tokens.extend_from_slice(&mt_t);
+        dc_tokens_per_group.push(dc_t);
+        meta_tokens_per_group.push(mt_t);
+    }
+    let dc_code_owned = optimize_entropy_code(&all_dc_tokens, K_NUM_DC_CONTEXTS);
+    let dc_code = dc_code_owned.as_ref();
+
+    // Phase 3: build adaptive AC entropy code from all AC group tokens.
+    // K_NUM_AC_CONTEXTS = 1980 source contexts; optimize_entropy_code
+    // clusters them down to <=8 prefix codes based on actual histograms.
+    let mut all_ac_tokens: Vec<Token> = Vec::new();
+    for pg in &all_pending {
+        all_ac_tokens.extend_from_slice(&pg.tokens);
+    }
+    let ac_code_owned = optimize_entropy_code(&all_ac_tokens, K_NUM_AC_CONTEXTS);
+    let ac_code = ac_code_owned.as_ref();
+    drop(all_ac_tokens); // free memory before we re-emit
+
+    // Phase 4: write DC global with adaptive DC code.
     write_dc_global(
         &distp,
         dim.num_dc_groups,
@@ -640,13 +631,75 @@ pub(crate) fn encode_frame(
         dim.ysize,
         &mut sections[0],
     );
+
+    // Phase 5: write each DC group section with adaptive DC code.
+    for (i, dc_data) in dc_datas.iter().enumerate() {
+        let dc_group_idx = 1 + i;
+        let w = &mut sections[dc_group_idx];
+        w.write(2, 0); // extra_dc_precision
+        w.write(4, 3); // use global tree, default wp, no transforms
+        for t in &dc_tokens_per_group[i] {
+            write_token(*t, &dc_code, w);
+        }
+        let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
+        let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
+        let nb_bits = if num_blocks <= 1 {
+            0
+        } else {
+            32 - (num_blocks as u32).leading_zeros() as usize
+                - if num_blocks.is_power_of_two() { 1 } else { 0 }
+        };
+        if nb_bits != 0 {
+            w.write(nb_bits, (num_ac_blocks - 1) as u64);
+        }
+        w.write(4, 3);
+        for t in &meta_tokens_per_group[i] {
+            write_token(*t, &dc_code, w);
+        }
+    }
+
+    // Phase 6: AC global with adaptive AC code.
     write_ac_global(
         dim.num_groups,
         &ac_code,
         &mut sections[1 + dim.num_dc_groups],
     );
 
-    // Frame header into writer, then TOC + sections.
+    // Phase 7: write each AC group section: AC tokens (adaptive code) then
+    // modular alpha if any. Alpha geometry is recomputed from `dim`.
+    for pg in &all_pending {
+        let w = &mut sections[pg.section_idx];
+        for t in &pg.tokens {
+            write_token(*t, &ac_code, w);
+        }
+    }
+    // Modular alpha: per AC group, written after AC tokens in the same section.
+    if let Some(alpha_plane) = alpha {
+        for image_gy in 0..dim.ysize_groups {
+            for image_gx in 0..dim.xsize_groups {
+                let group_x0 = image_gx * K_GROUP_DIM;
+                let group_y0 = image_gy * K_GROUP_DIM;
+                let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
+                let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
+                let abs_group_id = image_gy * dim.xsize_groups + image_gx;
+                let ac_group_idx = 2 + dim.num_dc_groups + image_gy * dim.xsize_groups + image_gx;
+                crate::modular::write_ac_group_alpha(
+                    alpha_plane,
+                    dim.xsize,
+                    dim.ysize,
+                    group_x0,
+                    group_y0,
+                    group_xsize,
+                    group_ysize,
+                    abs_group_id,
+                    dim.num_dc_groups,
+                    dim.num_groups,
+                    &mut sections[ac_group_idx],
+                );
+            }
+        }
+    }
+
     write_frame_header(
         distp.x_qm_scale,
         distp.epf_iters,
@@ -657,6 +710,14 @@ pub(crate) fn encode_frame(
     combine_sections(&mut sections, writer);
 }
 
+/// Per-AC-group buffered tokens, paired with the absolute section index
+/// for that group. Emitted in phase 4 of encode_frame once the adaptive AC
+/// code is known.
+pub(crate) struct PendingAcGroup {
+    pub section_idx: usize,
+    pub tokens: Vec<Token>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_dc_group(
     linear: &Image3F,
@@ -664,13 +725,9 @@ fn process_dc_group(
     dim: &ImageDim,
     distp: &DistanceParams,
     matrices: &DequantMatrices,
-    dc_code: &EntropyCode,
-    ac_code: &EntropyCode,
     dc_gx: usize,
     dc_gy: usize,
-    alpha: Option<&AlphaPlane>,
-    sections: &mut [BitWriter],
-) {
+) -> (DcGroupData, Vec<PendingAcGroup>) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
     let dc_group_y0 = dc_gy * K_DC_GROUP_DIM;
@@ -683,20 +740,12 @@ fn process_dc_group(
 
     let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
 
-    // Bogus adaptive quantization: fill raw_quant_field with per-block multipliers
-    // derived from local luma gradient magnitude in `linear`. Without this, every
-    // block uses quant=1 (the flat libjxl effort-1 behaviour).
     crate::adaptive_quant::fill_quant_field(
         linear,
         &mut dc_data.raw_quant_field,
         dc_group_x0,
         dc_group_y0,
     );
-
-    // Block selection: choose DCT16X8 / DCT8X16 for super-blocks where they
-    // beat per-block DCT8. AdjustQuantField propagates max-quant across
-    // covered blocks of each chosen multi-block transform.
-    // Uses opsin (XYB, post-gaborish) so cost estimates use the right scale.
     crate::enc_ac_strategy::fill_ac_strategy(
         opsin,
         distp.distance,
@@ -705,8 +754,8 @@ fn process_dc_group(
         &mut dc_data.ac_strategy,
     );
 
-    // For each AC group within this DC group.
     let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
+    let mut pending: Vec<PendingAcGroup> = Vec::with_capacity(num_groups_here);
     for gix in 0..num_groups_here {
         let gx = gix % dc_group_xsize_groups;
         let gy = gix / dc_group_xsize_groups;
@@ -714,17 +763,15 @@ fn process_dc_group(
         let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
         let ac_group_idx = 2 + dim.num_dc_groups + image_gy * dim.xsize_groups + image_gx;
 
-        // Group rect in pixels (clamped).
         let group_x0 = image_gx * K_GROUP_DIM;
         let group_y0 = image_gy * K_GROUP_DIM;
         let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
         let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
         let group_ysize_tiles = div_ceil(group_ysize, K_TILE_DIM);
 
-        // num_nzeros is per AC group, 32x32 blocks.
         let mut num_nzeros = Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS);
+        let mut tokens: Vec<Token> = Vec::new();
 
-        // Process stripe by stripe.
         for ty in 0..group_ysize_tiles {
             let stripe_x0 = group_x0;
             let stripe_y0 = group_y0 + ty * K_TILE_DIM;
@@ -733,7 +780,6 @@ fn process_dc_group(
             let stripe_xsize_padded = div_ceil(stripe_xsize, K_BLOCK_DIM) * K_BLOCK_DIM;
             let stripe_ysize_padded = div_ceil(stripe_ysize, K_BLOCK_DIM) * K_BLOCK_DIM;
 
-            // Build the stripe image (XYB).
             let stripe = build_stripe(
                 opsin,
                 stripe_x0,
@@ -744,7 +790,6 @@ fn process_dc_group(
                 stripe_ysize_padded,
             );
 
-            // stripe_brect is the block-rectangle of this stripe WITHIN THE DC GROUP.
             let stripe_brect_x0 = gx * K_GROUP_DIM_IN_BLOCKS;
             let stripe_brect_y0 = gy * K_GROUP_DIM_IN_BLOCKS + ty * K_TILE_DIM_IN_BLOCKS;
             let stripe_brect = Rect::new(
@@ -762,37 +807,17 @@ fn process_dc_group(
                 distp.scale_dc,
                 distp.x_qm_scale,
                 &mut dc_data,
-                ac_code,
                 &mut num_nzeros,
-                &mut sections[ac_group_idx],
+                &mut tokens,
             );
         }
 
-        // Per-AC-group modular alpha subbitstream, written AFTER all AC
-        // coefficient stripes so it appears after the coefficients in the
-        // bitstream, matching what the decoder expects.  No-op for small images
-        // (those already have all alpha data in the LfGlobal section).
-        if let Some(alpha_plane) = alpha {
-            let abs_group_id = image_gy * dim.xsize_groups + image_gx;
-            crate::modular::write_ac_group_alpha(
-                alpha_plane,
-                dim.xsize,
-                dim.ysize,
-                group_x0,
-                group_y0,
-                group_xsize,
-                group_ysize,
-                abs_group_id,
-                dim.num_dc_groups,
-                dim.num_groups,
-                &mut sections[ac_group_idx],
-            );
-        }
+        pending.push(PendingAcGroup {
+            section_idx: ac_group_idx,
+            tokens,
+        });
     }
-
-    // DC group section.
-    let dc_group_idx = 1 + dc_gy * dim.xsize_dc_groups + dc_gx;
-    write_dc_group(&dc_data, dc_code, &mut sections[dc_group_idx]);
+    (dc_data, pending)
 }
 
 /// Carve a stripe out of the (already-XYB-converted, gaborized) opsin image,

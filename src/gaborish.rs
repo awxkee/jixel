@@ -87,7 +87,6 @@ fn reflect(i: isize, len: isize) -> usize {
 
 /// Symmetric 5×5 convolution on one plane, in place (via temp buffer).
 /// Reads neighbors using mirror-reflected indices.
-#[inline(never)]
 fn symmetric5_plane(
     image: &mut Image3F,
     c: usize,
@@ -256,8 +255,6 @@ mod tests {
 
     #[test]
     fn constant_input_unchanged() {
-        // For a constant image, gaborish_inverse should yield (approximately)
-        // the same constant (since sum of kernel weights = 1).
         let mut img = Image3F::new(16, 16);
         for c in 0..3 {
             for y in 0..16 {
@@ -287,7 +284,6 @@ mod tests {
 
     #[test]
     fn sharpens_step_edge() {
-        // A step from 0 to 1 at column 8 should get a slight overshoot from
         // the sharpening kernel.
         let mut img = Image3F::new(16, 16);
         for c in 0..3 {
