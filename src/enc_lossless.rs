@@ -39,28 +39,6 @@ const PREDICTOR_GRADIENT: u32 = 5;
 const GROUP_DIM: usize = 256;
 const LF_GROUP_DIM: usize = 2048;
 
-// ---------------------------------------------------------------------------
-// LZ77 parameters.
-// ---------------------------------------------------------------------------
-//
-// JXL's prefix-code alphabet is shared between regular value tokens and LZ77
-// length codes.  Length codes occupy alphabet slots `min_symbol .. min_symbol
-// + kNumLZ77`.  The length value (`run_length - min_length`) is hybrid-encoded
-// with `length_uint_config`, producing a token offset that's added to
-// `min_symbol`.
-//
-// We pick:
-//   min_symbol = 64 (safely above the largest regular token we emit, even for
-//                    12-bit YCoCg residuals where the max is ~59).
-//   min_length = 3  (smallest run length we'll back-reference).
-//   length_uint_config = (4, 0, 0): values 0..15 use the symbol directly, with
-//                       no extra bits; values 16+ are hybrid-encoded.
-//
-// We only emit distance=1 references (consecutive runs of identical tokens),
-// which means the distance histogram has a single symbol (0).
-//
-// All alphabet symbols therefore fit within `ALPHABET_SIZE = 128`.
-
 const LZ77_MIN_SYMBOL: u32 = 64;
 const LZ77_MIN_LENGTH: u32 = 3;
 // Distance value we emit for run-length encoding (distance = 1 → previous token).
