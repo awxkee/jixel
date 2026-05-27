@@ -243,21 +243,6 @@ impl EncodeConfig {
     }
 }
 
-/// Convert a JPEG-style quality value (0..=100, higher = better) to a
-/// butteraugli distance (smaller = better).
-///
-/// The mapping matches libjxl's `JxlEncoderDistanceFromQuality`:
-///   * `quality == 100` → distance ≈ 0.1
-///   * `quality == 90`  → distance == 1.0 (the published "visually lossless" point)
-///   * `quality == 30`  → distance == 6.4 (knee of the curve)
-///   * `quality == 0`   → distance == 25.0 (clamp ceiling)
-///
-/// For `quality >= 30` the mapping is linear: `distance = 0.1 + (100 - q) * 0.09`.
-/// For `quality < 30` it transitions to a faster ramp using `2.5^((30 - q) / 5)`.
-/// Out-of-range inputs are clamped (`quality > 100` becomes 100, `quality < 0`
-/// becomes 0 by way of the 25.0 clamp).
-///
-/// `NaN` is rejected.
 pub fn distance_from_quality(quality: f32) -> f32 {
     assert!(!quality.is_nan(), "quality must not be NaN");
     // Clamp at 100 from above (lossless isn't supported anyway; you'll
@@ -281,12 +266,22 @@ pub fn encode_image(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    assert!(width > 0 && height > 0, "empty image");
-    assert_eq!(
-        input.len(),
-        width * height * 3,
-        "input buffer size mismatch"
-    );
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+    let expected = width * height * 3;
+    if input.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected,
+            actual: input.len(),
+        });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
     if config.lossless {
         return encode_with_config_loseless(
             input,
@@ -333,12 +328,23 @@ pub fn encode_image_with_alpha(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    assert!(width > 0 && height > 0, "empty image");
-    assert_eq!(
-        input.len(),
-        width * height * 4,
-        "input buffer size mismatch"
-    );
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+    let expected = width * height * 4;
+    if input.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected,
+            actual: input.len(),
+        });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
+
     if config.lossless {
         return encode_with_config_loseless(
             input,
