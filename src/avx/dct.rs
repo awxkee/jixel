@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dct::{WC4, WC8};
+use crate::dct::{WC4, WC8, WC16};
 use std::arch::x86_64::*;
 
 #[inline]
@@ -104,7 +104,6 @@ fn dct1d_8_flat(c: &mut [__m256; 8]) {
     let o2 = _mm256_mul_ps(_mm256_sub_ps(c[2], c[5]), _mm256_set1_ps(WC8[2]));
     let o3 = _mm256_mul_ps(_mm256_sub_ps(c[3], c[4]), _mm256_set1_ps(WC8[3]));
 
-    // DCT4 on evens
     let et0 = _mm256_add_ps(e0, e3);
     let et1 = _mm256_add_ps(e1, e2);
     let esum = _mm256_add_ps(et0, et1);
@@ -116,7 +115,6 @@ fn dct1d_8_flat(c: &mut [__m256; 8]) {
     let et2pp = _mm256_fmadd_ps(et2p, _mm256_set1_ps(std::f32::consts::SQRT_2), et3p);
     let evens = [esum, et2pp, ediff, et3p];
 
-    // DCT4 on odds
     let ot0 = _mm256_add_ps(o0, o3);
     let ot1 = _mm256_add_ps(o1, o2);
     let osum = _mm256_add_ps(ot0, ot1);
@@ -154,6 +152,116 @@ pub(crate) fn dct8x8_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
     for (k, row) in rows.iter().enumerate() {
         unsafe {
             _mm256_storeu_ps(output[k * 8..].as_mut_ptr(), _mm256_mul_ps(*row, scale));
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_16_flat(c: &mut [__m256; 16]) {
+    let mut evens = [
+        _mm256_add_ps(c[0], c[15]),
+        _mm256_add_ps(c[1], c[14]),
+        _mm256_add_ps(c[2], c[13]),
+        _mm256_add_ps(c[3], c[12]),
+        _mm256_add_ps(c[4], c[11]),
+        _mm256_add_ps(c[5], c[10]),
+        _mm256_add_ps(c[6], c[9]),
+        _mm256_add_ps(c[7], c[8]),
+    ];
+    let mut odds = [
+        _mm256_mul_ps(_mm256_sub_ps(c[0], c[15]), _mm256_set1_ps(WC16[0])),
+        _mm256_mul_ps(_mm256_sub_ps(c[1], c[14]), _mm256_set1_ps(WC16[1])),
+        _mm256_mul_ps(_mm256_sub_ps(c[2], c[13]), _mm256_set1_ps(WC16[2])),
+        _mm256_mul_ps(_mm256_sub_ps(c[3], c[12]), _mm256_set1_ps(WC16[3])),
+        _mm256_mul_ps(_mm256_sub_ps(c[4], c[11]), _mm256_set1_ps(WC16[4])),
+        _mm256_mul_ps(_mm256_sub_ps(c[5], c[10]), _mm256_set1_ps(WC16[5])),
+        _mm256_mul_ps(_mm256_sub_ps(c[6], c[9]), _mm256_set1_ps(WC16[6])),
+        _mm256_mul_ps(_mm256_sub_ps(c[7], c[8]), _mm256_set1_ps(WC16[7])),
+    ];
+
+    dct1d_8_flat(&mut evens);
+    dct1d_8_flat(&mut odds);
+
+    odds[0] = _mm256_fmadd_ps(odds[0], _mm256_set1_ps(std::f32::consts::SQRT_2), odds[1]);
+    odds[1] = _mm256_add_ps(odds[1], odds[2]);
+    odds[2] = _mm256_add_ps(odds[2], odds[3]);
+    odds[3] = _mm256_add_ps(odds[3], odds[4]);
+    odds[4] = _mm256_add_ps(odds[4], odds[5]);
+    odds[5] = _mm256_add_ps(odds[5], odds[6]);
+    odds[6] = _mm256_add_ps(odds[6], odds[7]);
+
+    // ── Interleave even/odd into output ───────────────────────────────────────
+    c[0] = evens[0];
+    c[1] = odds[0];
+    c[2] = evens[1];
+    c[3] = odds[1];
+    c[4] = evens[2];
+    c[5] = odds[2];
+    c[6] = evens[3];
+    c[7] = odds[3];
+    c[8] = evens[4];
+    c[9] = odds[4];
+    c[10] = evens[5];
+    c[11] = odds[5];
+    c[12] = evens[6];
+    c[13] = odds[6];
+    c[14] = evens[7];
+    c[15] = odds[7];
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct8x16_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
+    let mut rows_lo: [__m256; 8] =
+        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input[k * 16..].as_ptr()) });
+    let mut rows_hi: [__m256; 8] =
+        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input[k * 16 + 8..].as_ptr()) });
+
+    transpose_8x8(&mut rows_lo);
+    transpose_8x8(&mut rows_hi);
+
+    let mut c = [_mm256_undefined_ps(); 16];
+    c[0..8].copy_from_slice(&rows_lo);
+    c[8..16].copy_from_slice(&rows_hi);
+
+    dct1d_16_flat(&mut c);
+    let mut cl: [__m256; 8] = c[0..8].try_into().unwrap();
+    let mut cr: [__m256; 8] = c[8..16].try_into().unwrap();
+    transpose_8x8(&mut cl);
+    transpose_8x8(&mut cr);
+    dct1d_8_flat(&mut cl);
+    dct1d_8_flat(&mut cr);
+
+    let scale = _mm256_set1_ps(1.0 / 128.0);
+    for m in 0..8 {
+        let base = &mut output[m * 16..];
+        unsafe {
+            _mm256_storeu_ps(base.as_mut_ptr(), _mm256_mul_ps(cl[m], scale));
+            _mm256_storeu_ps(base[8..].as_mut_ptr(), _mm256_mul_ps(cr[m], scale));
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
+    let mut c: [__m256; 16] =
+        std::array::from_fn(|v| unsafe { _mm256_loadu_ps(input[v * 8..].as_ptr()) });
+
+    dct1d_16_flat(&mut c);
+
+    let mut top: [__m256; 8] = c[0..8].try_into().unwrap();
+    let mut bot: [__m256; 8] = c[8..16].try_into().unwrap();
+    transpose_8x8(&mut top);
+    transpose_8x8(&mut bot);
+    dct1d_8_flat(&mut top);
+    dct1d_8_flat(&mut bot);
+
+    let scale = _mm256_set1_ps(1.0 / 128.0);
+    for m in 0..8 {
+        let base = &mut output[m * 16..];
+        unsafe {
+            _mm256_storeu_ps(base.as_mut_ptr(), _mm256_mul_ps(top[m], scale));
+            _mm256_storeu_ps(base[8..].as_mut_ptr(), _mm256_mul_ps(bot[m], scale));
         }
     }
 }

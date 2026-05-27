@@ -103,6 +103,19 @@ pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
         + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
 }
 
+#[inline]
+pub(crate) fn zero_density_context(
+    nonzeros_left: usize,
+    k: usize,
+    covered_blocks: usize,
+    log2_covered_blocks: usize,
+    prev: usize,
+) -> usize {
+    let nz = (nonzeros_left + covered_blocks - 1) >> log2_covered_blocks;
+    let kk = k >> log2_covered_blocks;
+    (K_COEFF_NUM_NONZERO_CONTEXT[nz] as usize + K_COEFF_FREQ_CONTEXT[kk] as usize) * 2 + prev
+}
+
 /// 8x8 zigzag order. Coefficient at zigzag position k is at raw index
 /// K_COEFF_ORDER_8X8[k].
 #[rustfmt::skip]
@@ -115,4 +128,20 @@ pub(crate) const K_COEFF_ORDER_8X8: [u8; 64] = [
     29,  22,  15,  23, 30,  37,  44,  51,
     58,  59,  52,  45, 38,  31,  39,  46,
     53,  60,  61,  54, 47,  55,  62,  63,
+];
+
+/// 16x8 / 8x16 coefficient order (shared, libjxl-tiny `kCoeffOrders` offset 64).
+/// 128 entries. Positions 0 and 1 are LF positions; HF positions are zigzagged
+/// over the 16x8 grid.
+#[rustfmt::skip]
+pub const K_COEFF_ORDER_16X8: [u8; 128] = [
+    0,   1,   16,  2,   3,   17,  32,  18,  4,   5,   19,
+    33,  48,  34,  20,  6,   7,   21,  35,  49,  64,  50,  36,  22,  8,   9,
+    23,  37,  51,  65,  80,  66,  52,  38,  24,  10,  11,  25,  39,  53,  67,
+    81,  96,  82,  68,  54,  40,  26,  12,  13,  27,  41,  55,  69,  83,  97,
+    112, 98,  84,  70,  56,  42,  28,  14,  15,  29,  43,  57,  71,  85,  99,
+    113, 114, 100, 86,  72,  58,  44,  30,  31,  45,  59,  73,  87,  101, 115,
+    116, 102, 88,  74,  60,  46,  47,  61,  75,  89,  103, 117, 118, 104, 90,
+    76,  62,  63,  77,  91,  105, 119, 120, 106, 92,  78,  79,  93,  107, 121,
+    122, 108, 94,  95,  109, 123, 124, 110, 111, 125, 126, 127,
 ];

@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8};
+use crate::dct::{WC4, WC8, WC16};
 use std::arch::aarch64::*;
 
 #[derive(Clone, Copy)]
@@ -176,7 +176,7 @@ fn transpose_8x8(c: &mut [NeonDoubledVector; 8]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load(ptr: &[f32; 64], stride: usize) -> [NeonDoubledVector; 8] {
+fn load<const N: usize>(ptr: &[f32; N], stride: usize) -> [NeonDoubledVector; 8] {
     let row = |y: usize| -> NeonDoubledVector {
         unsafe {
             let p = &ptr[y * stride..];
@@ -216,4 +216,149 @@ pub(crate) fn dct8x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     transpose_8x8(&mut cols);
     dct1d_8_v(&mut cols);
     scale_and_store(&cols, 1.0 / 64.0, output);
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_16_v(c: &mut [NeonDoubledVector; 16]) {
+    let mut evens = [
+        c[0].add(c[15]),
+        c[1].add(c[14]),
+        c[2].add(c[13]),
+        c[3].add(c[12]),
+        c[4].add(c[11]),
+        c[5].add(c[10]),
+        c[6].add(c[9]),
+        c[7].add(c[8]),
+    ];
+    let mut odds = [
+        c[0].sub(c[15]).muls(WC16[0]),
+        c[1].sub(c[14]).muls(WC16[1]),
+        c[2].sub(c[13]).muls(WC16[2]),
+        c[3].sub(c[12]).muls(WC16[3]),
+        c[4].sub(c[11]).muls(WC16[4]),
+        c[5].sub(c[10]).muls(WC16[5]),
+        c[6].sub(c[9]).muls(WC16[6]),
+        c[7].sub(c[8]).muls(WC16[7]),
+    ];
+
+    dct1d_8_v(&mut evens);
+    dct1d_8_v(&mut odds);
+
+    odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
+    odds[1] = odds[1].add(odds[2]);
+    odds[2] = odds[2].add(odds[3]);
+    odds[3] = odds[3].add(odds[4]);
+    odds[4] = odds[4].add(odds[5]);
+    odds[5] = odds[5].add(odds[6]);
+    odds[6] = odds[6].add(odds[7]);
+
+    c[0] = evens[0];
+    c[1] = odds[0];
+    c[2] = evens[1];
+    c[3] = odds[1];
+    c[4] = evens[2];
+    c[5] = odds[2];
+    c[6] = evens[3];
+    c[7] = odds[3];
+    c[8] = evens[4];
+    c[9] = odds[4];
+    c[10] = evens[5];
+    c[11] = odds[5];
+    c[12] = evens[6];
+    c[13] = odds[6];
+    c[14] = evens[7];
+    c[15] = odds[7];
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load8_128(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 8] {
+    let row = |y: usize| unsafe {
+        let p = ptr.get_unchecked(y * stride..);
+        NeonDoubledVector {
+            lo: vld1q_f32(p.as_ptr()),
+            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
+        }
+    };
+    [
+        row(0),
+        row(1),
+        row(2),
+        row(3),
+        row(4),
+        row(5),
+        row(6),
+        row(7),
+    ]
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
+    let left = load8_128(input, 16);
+    let right = load8_128(&input[8..], 16);
+
+    let mut c = [NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    }; 16];
+    c[0..8].copy_from_slice(&left);
+    c[8..16].copy_from_slice(&right);
+
+    dct1d_16_v(&mut c);
+
+    let mut cl: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
+    let mut cr: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
+    transpose_8x8(&mut cl);
+    transpose_8x8(&mut cr);
+    dct1d_8_v(&mut cl);
+    dct1d_8_v(&mut cr);
+
+    let scale = 1.0 / 128.0;
+    for m in 0..8 {
+        let base = &mut output[m * 16..];
+        unsafe {
+            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(cl[m].lo, scale));
+            vst1q_f32(&mut base[4], vmulq_n_f32(cl[m].hi, scale));
+            vst1q_f32(&mut base[8], vmulq_n_f32(cr[m].lo, scale));
+            vst1q_f32(&mut base[12], vmulq_n_f32(cr[m].hi, scale));
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
+    let mut c = [NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    }; 16];
+    for v in 0..16 {
+        let p = &input[v * 8..];
+        unsafe {
+            c[v] = NeonDoubledVector {
+                lo: vld1q_f32(p.as_ptr()),
+                hi: vld1q_f32(p[4..].as_ptr()),
+            };
+        }
+    }
+
+    dct1d_16_v(&mut c);
+
+    let mut top: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
+    let mut bot: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
+    transpose_8x8(&mut top);
+    transpose_8x8(&mut bot);
+    dct1d_8_v(&mut top);
+    dct1d_8_v(&mut bot);
+
+    let scale = 1.0 / 128.0;
+    for m in 0..8 {
+        let base = &mut output[m * 16..];
+        unsafe {
+            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(top[m].lo, scale)); // v = 0..4
+            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(top[m].hi, scale)); // v = 4..8
+            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(bot[m].lo, scale)); // v = 8..12
+            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(bot[m].hi, scale)); // v = 12..16
+        }
+    }
 }

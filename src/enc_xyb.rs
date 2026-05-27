@@ -75,7 +75,7 @@ const FP_SHIFT: u32 = 20;
 const FP_ONE: i32 = 1 << FP_SHIFT; // 1_048_576
 
 const CBRT_LUT_MAX_F: f32 = 1.1;
-const CBRT_LUT_LEN: usize = 128;
+const CBRT_LUT_LEN: usize = 356;
 
 struct FixedTables {
     // Matrix rows in Q20.
