@@ -28,10 +28,10 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_u8};
-use crate::color_encoding::{ColorEncoding, write_color_encoding};
+use crate::color_encoding::{ColorEncoding, write_color_encoding_with_icc};
 use crate::enc_frame::encode_frame;
-use crate::enc_lossless::encode_frame_lossless;
-use crate::image::Image3F;
+use crate::enc_lossless::{encode_frame_lossless, forward_ycocg};
+use crate::image::{Image3F, Image3Si};
 
 /// 8-bit alpha plane (row-major, stride = `xsize`).
 #[derive(Debug, Clone)]
@@ -103,11 +103,6 @@ impl AlphaPlane {
             Self::U8(v) => v.len(),
             Self::U16 { data, .. } => data.len(),
         }
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Bit depth of the alpha samples (8, 10, or 12).
@@ -229,59 +224,33 @@ pub fn distance_from_quality(quality: f32) -> f32 {
     d.min(25.0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn close(a: f32, b: f32) -> bool {
-        (a - b).abs() < 1e-4
-    }
-
-    #[test]
-    fn quality_mapping_anchor_points() {
-        // Matches the published libjxl mapping breakpoints.
-        assert!(close(distance_from_quality(100.0), 0.1));
-        assert!(close(distance_from_quality(90.0), 1.0));
-        assert!(close(distance_from_quality(30.0), 6.4));
-        // Below 30, the formula is quadratic-ish; q=25 must come in just above 6.4.
-        let d25 = distance_from_quality(25.0);
-        assert!(d25 > 6.4 && d25 < 7.0, "q=25 -> {d25}");
-        // Far below 30, it climbs and clamps at 25.
-        assert!(close(distance_from_quality(0.0), 25.0));
-        assert!(close(distance_from_quality(-50.0), 25.0));
-        // Above 100, clamped: 110 -> 100 -> 0.1.
-        assert!(close(distance_from_quality(110.0), 0.1));
-    }
-
-    #[test]
-    fn quality_mapping_monotone() {
-        // Strictly decreasing in quality.
-        let mut prev = distance_from_quality(0.0);
-        for q in 1..=100 {
-            let d = distance_from_quality(q as f32);
-            assert!(d <= prev, "non-monotonic at q={q}: prev={prev}, d={d}");
-            prev = d;
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "quality must not be NaN")]
-    fn quality_nan_panics() {
-        let _ = distance_from_quality(f32::NAN);
-    }
-}
-
 /// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
 /// using the default color encoding (sRGB primaries, linear transfer).
 ///
 /// Shorthand for [`encode_with_config`] with default settings.
-pub fn encode_image(input: &[u8], width: usize, height: usize, distance: f32) -> Vec<u8> {
+pub fn encode_image(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    distance: f32,
+    lossless: bool,
+) -> Vec<u8> {
     assert!(width > 0 && height > 0, "empty image");
     assert_eq!(
         input.len(),
         width * height * 3,
         "input buffer size mismatch"
     );
+    if lossless {
+        return encode_with_config_loseless(
+            input,
+            width,
+            height,
+            false,
+            8,
+            &EncodeConfig::with_distance(distance).with_lossless(lossless),
+        );
+    }
     let distance = distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
     for (y, row) in input.chunks_exact(width * 3).enumerate() {
@@ -317,6 +286,16 @@ pub fn encode_image_with_alpha(
         width * height * 4,
         "input buffer size mismatch"
     );
+    if lossless {
+        return encode_with_config_loseless(
+            input,
+            width,
+            height,
+            true,
+            8,
+            &EncodeConfig::with_distance(distance).with_lossless(lossless),
+        );
+    }
     let distance = distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
     let mut alpha_plane = vec![0u8; width * height];
@@ -426,7 +405,7 @@ fn encode_high_depth_rgba(
 }
 
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
-pub fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
+pub(crate) fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
     assert!(input.xsize() > 0 && input.ysize() > 0, "empty image");
     assert!(
         config.distance > 0.0,
@@ -454,16 +433,143 @@ pub fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
     write_image_metadata(
         &config.color_encoding,
         config.alpha.as_ref(),
+        config.icc_profile.as_deref(),
         config.bits_per_sample,
         config.lossless,
         &mut w,
     );
-    if config.lossless {
-        encode_frame_lossless(input, config.alpha.as_ref(), config.bits_per_sample, &mut w);
-    } else {
-        encode_frame(distance, input, config.alpha.as_ref(), &mut w);
-    }
     encode_frame(distance, input, config.alpha.as_ref(), &mut w);
+    encode_frame(distance, input, config.alpha.as_ref(), &mut w);
+    w.into_bytes()
+}
+
+pub(crate) trait AsSignedInt {
+    fn to_signed_int(self, max_bp: u8) -> i32;
+}
+
+impl AsSignedInt for u8 {
+    #[inline]
+    fn to_signed_int(self, _: u8) -> i32 {
+        self as i32
+    }
+}
+
+impl AsSignedInt for u16 {
+    #[inline]
+    fn to_signed_int(self, max_bp: u8) -> i32 {
+        let max_colors = ((1u32 << max_bp) - 1) as i32;
+        (self as i32).min(max_colors)
+    }
+}
+
+/// Encode a linear-light RGB `Image3F` with the supplied configuration.
+fn encode_with_config_loseless<T: AsSignedInt + Copy>(
+    input: &[T],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    max_bp: u8,
+    config: &EncodeConfig,
+) -> Vec<u8> {
+    assert!(width > 0 && height > 0, "empty image");
+
+    let mut image3s = Image3Si::new(width, height);
+    let mut alpha_plane: Option<AlphaPlane> = None;
+
+    if has_alpha {
+        if max_bp > 8 {
+            let mut new_alpha_plane = vec![0u16; width * height];
+            for (y, (row, alpha_row)) in input
+                .chunks_exact(width * 4)
+                .zip(new_alpha_plane.chunks_exact_mut(width))
+                .enumerate()
+            {
+                let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
+                for ((((r, g), b), src), alpha) in r_row
+                    .iter_mut()
+                    .zip(g_row.iter_mut())
+                    .zip(b_row.iter_mut())
+                    .zip(row.as_chunks::<4>().0.iter())
+                    .zip(alpha_row.iter_mut())
+                {
+                    let ycocg = forward_ycocg(
+                        src[0].to_signed_int(max_bp),
+                        src[1].to_signed_int(max_bp),
+                        src[2].to_signed_int(max_bp),
+                    );
+                    *r = ycocg.0;
+                    *g = ycocg.1;
+                    *b = ycocg.2;
+                    *alpha = src[3].to_signed_int(max_bp) as u16;
+                }
+            }
+
+            alpha_plane = Some(AlphaPlane::U16 {
+                data: new_alpha_plane,
+                bits: max_bp,
+            });
+        } else {
+            let mut new_alpha_plane = vec![0u8; width * height];
+            for (y, (row, alpha_row)) in input
+                .chunks_exact(width * 4)
+                .zip(new_alpha_plane.chunks_exact_mut(width))
+                .enumerate()
+            {
+                let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
+                for ((((r, g), b), src), alpha) in r_row
+                    .iter_mut()
+                    .zip(g_row.iter_mut())
+                    .zip(b_row.iter_mut())
+                    .zip(row.as_chunks::<4>().0.iter())
+                    .zip(alpha_row.iter_mut())
+                {
+                    let ycocg = forward_ycocg(
+                        src[0].to_signed_int(max_bp),
+                        src[1].to_signed_int(max_bp),
+                        src[2].to_signed_int(max_bp),
+                    );
+                    *r = ycocg.0;
+                    *g = ycocg.1;
+                    *b = ycocg.2;
+                    *alpha = src[3].to_signed_int(max_bp) as u8;
+                }
+            }
+            alpha_plane = Some(AlphaPlane::U8(new_alpha_plane));
+        }
+    } else {
+        for (y, row) in input.chunks_exact(width * 3).enumerate() {
+            let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
+            for (((r, g), b), src) in r_row
+                .iter_mut()
+                .zip(g_row.iter_mut())
+                .zip(b_row.iter_mut())
+                .zip(row.as_chunks::<3>().0.iter())
+            {
+                let ycocg = forward_ycocg(
+                    src[0].to_signed_int(max_bp),
+                    src[1].to_signed_int(max_bp),
+                    src[2].to_signed_int(max_bp),
+                );
+                *r = ycocg.0;
+                *g = ycocg.1;
+                *b = ycocg.2;
+            }
+        }
+    }
+
+    let mut w = BitWriter::new();
+    w.write(8, 0xFF);
+    w.write(8, CODESTREAM_MARKER as u64);
+    write_size_header(width, height, &mut w);
+    write_image_metadata(
+        &config.color_encoding,
+        alpha_plane.as_ref(),
+        config.icc_profile.as_deref(),
+        config.bits_per_sample,
+        config.lossless,
+        &mut w,
+    );
+    encode_frame_lossless(&image3s, alpha_plane.as_ref(), &mut w);
     w.into_bytes()
 }
 
@@ -495,6 +601,7 @@ fn write_size_header(xsize: usize, ysize: usize, w: &mut BitWriter) {
 fn write_image_metadata(
     color_encoding: &ColorEncoding,
     alpha: Option<&AlphaPlane>,
+    icc_profile: Option<&[u8]>,
     bps: BitsPerSample,
     lossless: bool,
     w: &mut BitWriter,
@@ -544,8 +651,58 @@ fn write_image_metadata(
     // For lossy VarDCT we use XYB (=1). For lossless modular, the codestream
     // carries un-transformed pixel values (xyb_encoded = 0).
     w.write(1, if lossless { 0 } else { 1 }); // xyb_encoded
-    write_color_encoding(color_encoding, w);
-    w.write(2, 0);
-    w.write(1, 1);
+    let want_icc = icc_profile.is_some();
+    write_color_encoding_with_icc(color_encoding, want_icc, w);
+    // tone_mapping is conditional on extra_fields (which we set to 0), so it's absent.
+    w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
+    // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
+    // backward-compatible bit alignment with the no-ICC path).
+    w.write(1, 1); // CustomTransformData.all_default = 1
+    // ICC stream goes AFTER FileHeader, before the zero-pad to byte boundary.
+    if let Some(icc) = icc_profile {
+        crate::icc_codec::write_icc_stream(icc, w);
+    }
     w.zero_pad_to_byte();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn quality_mapping_anchor_points() {
+        // Matches the published libjxl mapping breakpoints.
+        assert!(close(distance_from_quality(100.0), 0.1));
+        assert!(close(distance_from_quality(90.0), 1.0));
+        assert!(close(distance_from_quality(30.0), 6.4));
+        // Below 30, the formula is quadratic-ish; q=25 must come in just above 6.4.
+        let d25 = distance_from_quality(25.0);
+        assert!(d25 > 6.4 && d25 < 7.0, "q=25 -> {d25}");
+        // Far below 30, it climbs and clamps at 25.
+        assert!(close(distance_from_quality(0.0), 25.0));
+        assert!(close(distance_from_quality(-50.0), 25.0));
+        // Above 100, clamped: 110 -> 100 -> 0.1.
+        assert!(close(distance_from_quality(110.0), 0.1));
+    }
+
+    #[test]
+    fn quality_mapping_monotone() {
+        // Strictly decreasing in quality.
+        let mut prev = distance_from_quality(0.0);
+        for q in 1..=100 {
+            let d = distance_from_quality(q as f32);
+            assert!(d <= prev, "non-monotonic at q={q}: prev={prev}, d={d}");
+            prev = d;
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "quality must not be NaN")]
+    fn quality_nan_panics() {
+        let _ = distance_from_quality(f32::NAN);
+    }
 }

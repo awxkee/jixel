@@ -47,14 +47,6 @@ impl AcStrategyImage {
     pub(crate) fn ysize(&self) -> usize {
         self.ysize
     }
-    #[inline]
-    pub(crate) fn covered_blocks_x(&self) -> usize {
-        1
-    }
-    #[inline]
-    pub(crate) fn covered_blocks_y(&self) -> usize {
-        1
-    }
 }
 
 pub(crate) struct DcGroupData {

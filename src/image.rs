@@ -65,6 +65,11 @@ impl<T: Copy + Default> Plane<T> {
     }
 
     #[inline]
+    pub fn view(&self) -> &[T] {
+        self.data.as_slice()
+    }
+
+    #[inline]
     pub fn row(&self, y: usize) -> &[T] {
         let w = self.xsize;
         &self.data[y * w..(y + 1) * w]
@@ -115,8 +120,6 @@ impl<T: Copy + Default> Plane<T> {
 
 pub type ImageB = Plane<u8>;
 pub type ImageSB = Plane<i8>;
-pub type ImageS = Plane<i16>;
-pub type ImageF = Plane<f32>;
 
 pub struct Image3<T> {
     planes: [Plane<T>; 3],
@@ -176,6 +179,7 @@ impl<T: Copy + Default> Image3<T> {
 
 pub type Image3B = Image3<u8>;
 pub type Image3S = Image3<i16>;
+pub type Image3Si = Image3<i32>;
 pub type Image3F = Image3<f32>;
 
 /// Axis-aligned rectangle within an image (coordinates in units of the image:

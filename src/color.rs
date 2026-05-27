@@ -96,18 +96,6 @@ pub(crate) fn lut_high_bit(bits: u8) -> &'static LutHighBit {
         .or_insert_with(|| Box::leak(Box::new(LutHighBit::new(bits))))
 }
 
-#[inline]
-pub(crate) fn linear_to_srgb_u_n(v: f32, bits: u8) -> u16 {
-    let v = v.clamp(0.0, 1.0);
-    let srgb = if v <= 0.003_130_8 {
-        v * 12.92
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    };
-    let max = ((1u32 << bits) - 1) as f32;
-    (srgb * max).round() as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

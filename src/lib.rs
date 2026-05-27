@@ -40,6 +40,7 @@ mod enc_lossless;
 mod enc_xyb;
 mod encode_image;
 mod entropy;
+mod icc_codec;
 mod image;
 mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -50,6 +51,6 @@ mod static_entropy_codes;
 pub use color_encoding::{ColorEncoding, ColorSpace, TransferFunction, WhitePoint};
 pub use encode_image::{
     distance_from_quality, encode_image, encode_image_with_alpha, encode_image_with_alpha_10bit,
-    encode_image_with_alpha_12bit, encode_with_config,
+    encode_image_with_alpha_12bit,
 };
 pub use image::Image3F;

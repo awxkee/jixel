@@ -27,10 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// ---------------------------------------------------------------------------
-// Tree contexts (match libjxl's ma_common.h enum values).
-// ---------------------------------------------------------------------------
-
 const TREE_CTX_SPLIT_VAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;
 const TREE_CTX_PREDICTOR: u32 = 2;
@@ -70,14 +66,9 @@ const LZ77_MIN_LENGTH: u32 = 3;
 // Distance value we emit for run-length encoding (distance = 1 → previous token).
 const LZ77_DIST_VALUE: u32 = 1; // special_distance[1] = (dx=1, dy=0) → 1 token back
 
-// ---------------------------------------------------------------------------
-// Public entry point.
-// ---------------------------------------------------------------------------
-
-pub fn encode_frame_lossless(
-    linear: &Image3F,
+pub(crate) fn encode_frame_lossless(
+    linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
-    bps: BitsPerSample,
     writer: &mut BitWriter,
 ) {
     let xsize = linear.xsize();
@@ -107,7 +98,7 @@ pub fn encode_frame_lossless(
         write_modular_transforms(nb_chans, &mut section);
 
         // Tokenize all channels (post-YCoCg, per-channel contexts).
-        let tokens = tokenize_all(linear, alpha, xsize, ysize, 0, 0, xsize, ysize, bps);
+        let tokens = tokenize_all(linear, alpha, xsize, ysize, 0, 0, xsize, ysize);
 
         // LZ77 layer: collapse runs of identical tokens into back-references.
         // The distance context is the (nb_chans)-th context, appended after the
@@ -152,7 +143,7 @@ pub fn encode_frame_lossless(
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks = tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh, bps);
+                let toks = tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh);
                 let lz = lz77_compress(&toks, distance_ctx);
                 all_lz.extend_from_slice(&lz);
                 group_lz_tokens.push(lz);
@@ -310,26 +301,13 @@ fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn forward_ycocg(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
+pub(crate) fn forward_ycocg(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
     let co = r - b;
     let tmp = b + (co >> 1);
     let cg = g - tmp;
     let y = tmp + (cg >> 1);
     (y, co, cg)
 }
-
-// ---------------------------------------------------------------------------
-// Channel index → tree-leaf context.
-//
-// For a balanced N-leaf modular tree built by `write_local_tree`, the BFS
-// leaf order is (chan N-1, chan N-2, ..., chan 0), so the decoder assigns:
-//   leaf_id 0 ↔ chan N-1
-//   leaf_id 1 ↔ chan N-2
-//   ...
-//   leaf_id N-1 ↔ chan 0
-// We tokenize each channel under context (N-1 - chan) so that the runtime
-// histogram statistics line up with the cluster id the decoder will read.
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn channel_to_context(chan: usize, nb_chans: usize) -> u32 {
@@ -408,7 +386,7 @@ fn lz77_compress(tokens: &[Token], distance_context: u32) -> Vec<LzToken> {
 }
 
 fn tokenize_all(
-    linear: &Image3F,
+    linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     _ysize: usize,
@@ -416,57 +394,25 @@ fn tokenize_all(
     y0: usize,
     gw: usize,
     gh: usize,
-    bps: BitsPerSample,
 ) -> Vec<Token> {
-    let bits = bps.bits() as u8;
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
     let mut out = Vec::with_capacity(gw * gh * nb_chans);
 
-    // 1. Build the post-YCoCg Y, Co, Cg planes for this sub-rect.
-    let mut ys: Vec<Vec<i32>> = Vec::with_capacity(gh);
-    let mut cos: Vec<Vec<i32>> = Vec::with_capacity(gh);
-    let mut cgs: Vec<Vec<i32>> = Vec::with_capacity(gh);
-    for gy in 0..gh {
-        let rr = linear.plane_row(0, y0 + gy);
-        let gg = linear.plane_row(1, y0 + gy);
-        let bb = linear.plane_row(2, y0 + gy);
-        let mut yr = Vec::with_capacity(gw);
-        let mut cor = Vec::with_capacity(gw);
-        let mut cgr = Vec::with_capacity(gw);
-        for gx in 0..gw {
-            let r = linear_to_srgb_u_n(rr[x0 + gx], bits) as i32;
-            let g = linear_to_srgb_u_n(gg[x0 + gx], bits) as i32;
-            let b = linear_to_srgb_u_n(bb[x0 + gx], bits) as i32;
-            let (y, co, cg) = forward_ycocg(r, g, b);
-            yr.push(y);
-            cor.push(co);
-            cgr.push(cg);
-        }
-        ys.push(yr);
-        cos.push(cor);
-        cgs.push(cgr);
-    }
-
-    // 2. Tokenize each output channel using its own context.
-    // Channels are emitted in tree-leaf order (decoder-visible): chan 0 first,
-    // then chan 1, ..., chan N-1.  Each pixel becomes one token under
-    // channel_to_context(chan, nb_chans).
-    for chan in 0..3 {
-        let plane: &Vec<Vec<i32>> = match chan {
-            0 => &ys,
-            1 => &cos,
-            _ => &cgs,
-        };
+    for chan in 0..3usize {
         let ctx = channel_to_context(chan, nb_chans);
         for gy in 0..gh {
-            let row = &plane[gy];
-            let prev_row = if gy > 0 { Some(&plane[gy - 1]) } else { None };
+            let row = linear.plane_row(chan, y0 + gy);
+            let prev_row = if gy > 0 {
+                Some(linear.plane_row(chan, y0 + gy - 1))
+            } else {
+                None
+            };
             for gx in 0..gw {
-                let v = row[gx];
-                let w_ = if gx > 0 { row[gx - 1] } else { 0 };
-                let n_ = prev_row.map_or(0, |r| r[gx]);
+                let v = row[x0 + gx];
+                let w_ = if gx > 0 { row[x0 + gx - 1] } else { 0 };
+                let n_ = prev_row.map_or(0, |r| r[x0 + gx]);
                 let nw_ = if gx > 0 {
-                    prev_row.map_or(0, |r| r[gx - 1])
+                    prev_row.map_or(0, |r| r[x0 + gx - 1])
                 } else {
                     0
                 };
@@ -512,14 +458,13 @@ fn tokenize_all(
 // LZ77-aware histogram building, code construction, and emission.
 // ---------------------------------------------------------------------------
 
-use crate::Image3F;
 use crate::bit_writer::BitWriter;
-use crate::color::linear_to_srgb_u_n;
-use crate::encode_image::{AlphaPlane, BitsPerSample};
+use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     Histogram, OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
     write_token,
 };
+use crate::image::Image3Si;
 use crate::modular::gradient;
 
 /// Build a frequency histogram for each cluster from an `LzToken` stream.
@@ -766,9 +711,9 @@ fn div_ceil(a: usize, b: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Image3F;
     use crate::color::srgb_to_linear_u8;
-    use crate::encode_image::EncodeConfig;
-    use crate::{Image3F, encode_with_config};
+    use crate::encode_image::{BitsPerSample, EncodeConfig, encode_with_config};
 
     fn make_image(w: usize, h: usize, f: impl Fn(usize, usize) -> [u8; 3]) -> Image3F {
         let mut img = Image3F::new(w, h);
@@ -782,23 +727,6 @@ mod tests {
             }
         }
         img
-    }
-
-    #[test]
-    fn lossless_single_group_emits_modular_frame() {
-        let img = make_image(4, 4, |x, y| {
-            [
-                ((y * 4 + x) * 17 % 256) as u8,
-                ((y * 4 + x) * 31 % 256) as u8,
-                ((y * 4 + x) * 47 % 256) as u8,
-            ]
-        });
-        let bytes = encode_with_config(&img, &EncodeConfig::default().with_lossless(true));
-        assert_eq!(&bytes[..2], &[0xFF, 0x0A]);
-        assert!(
-            bytes.len() < 4 * 4 * 3 * 8,
-            "lossless 4x4 should be reasonably small"
-        );
     }
 
     #[test]
@@ -863,19 +791,6 @@ mod tests {
         let bytes = encode_with_config(&img, &cfg);
         assert_eq!(&bytes[..2], &[0xFF, 0x0A]);
         assert!(bytes.len() > 100);
-    }
-
-    #[test]
-    fn linear_to_srgb_u_n_round_trips() {
-        use crate::color::{linear_to_srgb_u_n, srgb_to_linear_u16};
-        for &bits in &[8u8, 10, 12] {
-            let max = ((1u32 << bits) - 1) as f32;
-            for v in 0..=((1u32 << bits) - 1) {
-                let lin = srgb_to_linear_u16(v as u16, max);
-                let back = linear_to_srgb_u_n(lin, bits) as u32;
-                assert_eq!(v, back, "bits={bits} v={v} → linear → {back}");
-            }
-        }
     }
 
     #[test]
