@@ -59,15 +59,6 @@ impl<T: Copy + Default> Plane<T> {
         self.ysize
     }
     /// Stride in elements (== xsize in jixel since rows have no padding).
-    #[inline]
-    pub fn pixels_per_row(&self) -> usize {
-        self.xsize
-    }
-
-    #[inline]
-    pub fn view(&self) -> &[T] {
-        self.data.as_slice()
-    }
 
     #[inline]
     pub fn row(&self, y: usize) -> &[T] {
@@ -79,27 +70,6 @@ impl<T: Copy + Default> Plane<T> {
     pub fn row_mut(&mut self, y: usize) -> &mut [T] {
         let w = self.xsize;
         &mut self.data[y * w..(y + 1) * w]
-    }
-
-    pub fn fill(&mut self, val: T)
-    where
-        T: Copy,
-    {
-        self.data.fill(val);
-    }
-
-    /// Borrow two rows simultaneously (immutable). Useful for context predictors.
-    #[inline]
-    pub fn two_rows(&self, y_top: usize, y_bot: usize) -> (&[T], &[T]) {
-        let w = self.xsize;
-        debug_assert!(y_top != y_bot);
-        if y_top < y_bot {
-            let (a, b) = self.data.split_at(y_bot * w);
-            (&a[y_top * w..(y_top + 1) * w], &b[..w])
-        } else {
-            let (a, b) = self.data.split_at(y_top * w);
-            (&b[..w], &a[y_bot * w..(y_bot + 1) * w])
-        }
     }
 
     /// Borrow one row immutably and a different one mutably. Useful for
@@ -144,11 +114,6 @@ impl<T: Copy + Default> Image3<T> {
     #[inline]
     pub fn ysize(&self) -> usize {
         self.planes[0].ysize
-    }
-
-    #[inline]
-    pub fn pixels_per_row(&self) -> usize {
-        self.planes[0].xsize
     }
 
     #[inline]

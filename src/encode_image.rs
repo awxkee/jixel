@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::EncodeError;
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_u8};
 use crate::color_encoding::{ColorEncoding, write_color_encoding_with_icc};
@@ -52,7 +53,7 @@ const MIN_DISTANCE: f32 = 0.03;
 
 /// JXL's image dimension field encodes (size - 1) in either 9, 13, 18, or
 /// 30 bits, so 2^30 is the largest representable dimension.
-const MAX_DIMENSION: usize = 0x3FFF_FFFF;
+pub(crate) const MAX_DIMENSION: usize = 0x3FFF_FFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitsPerSample {
@@ -129,6 +130,16 @@ pub struct EncodeConfig {
     pub distance: f32,
     pub color_encoding: ColorEncoding,
     pub icc_profile: Option<Vec<u8>>,
+    /// If true, encode losslessly via the modular encoder. `distance` is then
+    /// ignored. RGB and alpha both round-trip bit-perfectly.
+    pub lossless: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EncodeConfigImpl {
+    pub distance: f32,
+    pub color_encoding: ColorEncoding,
+    pub icc_profile: Option<Vec<u8>>,
     pub alpha: Option<AlphaPlane>,
     /// Bit depth declared in the codestream (default: 8).
     pub bits_per_sample: BitsPerSample,
@@ -143,6 +154,17 @@ impl Default for EncodeConfig {
             distance: 1.0,
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
+            lossless: false,
+        }
+    }
+}
+
+impl Default for EncodeConfigImpl {
+    fn default() -> Self {
+        Self {
+            distance: 1.0,
+            color_encoding: ColorEncoding::default(),
+            icc_profile: None,
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
@@ -150,7 +172,7 @@ impl Default for EncodeConfig {
     }
 }
 
-impl EncodeConfig {
+impl EncodeConfigImpl {
     /// Convenience builder with the given butteraugli distance and otherwise
     /// default settings (sRGB primaries, linear transfer).
     pub fn with_distance(distance: f32) -> Self {
@@ -160,21 +182,9 @@ impl EncodeConfig {
         }
     }
 
-    /// Convenience builder with quality on a libjpeg-like 0..=100 scale.
-    /// See [`distance_from_quality`] for the mapping.
-    pub fn with_quality(quality: f32) -> Self {
-        Self::with_distance(distance_from_quality(quality))
-    }
-
-    /// Replace the color encoding (white point / primaries / transfer / intent).
-    pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
-        self.color_encoding = enc;
-        self
-    }
-
     /// Attach an ICC profile. **Panics at encode time** — see field docs.
-    pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
-        self.icc_profile = Some(icc);
+    pub fn with_icc_profile(mut self, icc: Option<Vec<u8>>) -> Self {
+        self.icc_profile = icc;
         self
     }
 
@@ -190,6 +200,43 @@ impl EncodeConfig {
         self
     }
 
+    pub fn with_lossless(mut self, lossless: bool) -> Self {
+        self.lossless = lossless;
+        self
+    }
+
+    /// Replace the color encoding (white point / primaries / transfer / intent).
+    pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
+        self.color_encoding = enc;
+        self
+    }
+}
+
+impl EncodeConfig {
+    /// Convenience builder with the given butteraugli distance and otherwise
+    /// default settings (sRGB primaries, linear transfer).
+    pub fn with_distance(mut self, distance: f32) -> Self {
+        self.distance = distance;
+        self
+    }
+
+    /// Convenience builder with quality on a libjpeg-like 0..=100 scale.
+    /// See [`distance_from_quality`] for the mapping.
+    pub fn with_quality(self, quality: f32) -> Self {
+        self.with_distance(distance_from_quality(quality))
+    }
+
+    /// Replace the color encoding (white point / primaries / transfer / intent).
+    pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
+        self.color_encoding = enc;
+        self
+    }
+
+    /// Attach an ICC profile. **Panics at encode time** — see field docs.
+    pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
+        self.icc_profile = Some(icc);
+        self
+    }
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
         self
@@ -232,26 +279,28 @@ pub fn encode_image(
     input: &[u8],
     width: usize,
     height: usize,
-    distance: f32,
-    lossless: bool,
-) -> Vec<u8> {
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
     assert!(width > 0 && height > 0, "empty image");
     assert_eq!(
         input.len(),
         width * height * 3,
         "input buffer size mismatch"
     );
-    if lossless {
+    if config.lossless {
         return encode_with_config_loseless(
             input,
             width,
             height,
             false,
             8,
-            &EncodeConfig::with_distance(distance).with_lossless(lossless),
+            &EncodeConfigImpl::with_distance(config.distance)
+                .with_lossless(config.lossless)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
         );
     }
-    let distance = distance.max(MIN_DISTANCE);
+    let distance = config.distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
     for (y, row) in input.chunks_exact(width * 3).enumerate() {
         let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
@@ -266,7 +315,12 @@ pub fn encode_image(
             *b = srgb_to_linear_u8(src[2]);
         }
     }
-    encode_with_config(&linear, &EncodeConfig::with_distance(distance))
+    encode_with_config(
+        &linear,
+        &EncodeConfigImpl::with_distance(distance)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_color_encoding(config.color_encoding),
+    )
 }
 
 /// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
@@ -277,26 +331,28 @@ pub fn encode_image_with_alpha(
     input: &[u8],
     width: usize,
     height: usize,
-    distance: f32,
-    lossless: bool,
-) -> Vec<u8> {
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
     assert!(width > 0 && height > 0, "empty image");
     assert_eq!(
         input.len(),
         width * height * 4,
         "input buffer size mismatch"
     );
-    if lossless {
+    if config.lossless {
         return encode_with_config_loseless(
             input,
             width,
             height,
             true,
             8,
-            &EncodeConfig::with_distance(distance).with_lossless(lossless),
+            &EncodeConfigImpl::with_distance(config.distance)
+                .with_lossless(config.lossless)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
         );
     }
-    let distance = distance.max(MIN_DISTANCE);
+    let distance = config.distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
     let mut alpha_plane = vec![0u8; width * height];
     for (y, (row, alpha_row)) in input
@@ -320,34 +376,33 @@ pub fn encode_image_with_alpha(
     }
     encode_with_config(
         &linear,
-        &EncodeConfig::with_distance(distance)
+        &EncodeConfigImpl::with_distance(distance)
             .with_alpha(AlphaPlane::from_u8(alpha_plane))
-            .with_lossless(lossless),
+            .with_icc_profile(config.icc_profile.clone())
+            .with_color_encoding(config.color_encoding),
     )
 }
 
 /// Encode a 10-bit RGBA image (`u16` channels, values 0..=1023).
 /// Input is interleaved RGBA, each channel a `u16` in native byte order.
-/// Alpha is stored losslessly; RGB is encoded at the given distance.
 pub fn encode_image_with_alpha_10bit(
     input: &[u16],
     width: usize,
     height: usize,
-    distance: f32,
-) -> Vec<u8> {
-    encode_high_depth_rgba(input, width, height, distance, BitsPerSample::Ten)
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Ten)
 }
 
 /// Encode a 12-bit RGBA image (`u16` channels, values 0..=4095).
 /// Input is interleaved RGBA, each channel a `u16` in native byte order.
-/// Alpha is stored losslessly; RGB is encoded at the given distance.
 pub fn encode_image_with_alpha_12bit(
     input: &[u16],
     width: usize,
     height: usize,
-    distance: f32,
-) -> Vec<u8> {
-    encode_high_depth_rgba(input, width, height, distance, BitsPerSample::Twelve)
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_high_depth_rgba(input, width, height, true, config, BitsPerSample::Twelve)
 }
 
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
@@ -355,16 +410,32 @@ fn encode_high_depth_rgba(
     input: &[u16],
     width: usize,
     height: usize,
-    distance: f32,
+    has_alpha: bool,
+    config: &EncodeConfig,
     bps: BitsPerSample,
-) -> Vec<u8> {
-    assert!(width > 0 && height > 0);
-    assert_eq!(
-        input.len(),
-        width * height * 4,
-        "expected width * height * 4 u16 values"
-    );
-    let distance = distance.max(MIN_DISTANCE);
+) -> Result<Vec<u8>, EncodeError> {
+    let expected = width * height * 4;
+    if input.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected,
+            actual: input.len(),
+        });
+    }
+
+    if config.lossless {
+        return encode_with_config_loseless(
+            input,
+            width,
+            height,
+            has_alpha,
+            bps.bits() as u8,
+            &EncodeConfigImpl::with_distance(config.distance)
+                .with_lossless(config.lossless)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        );
+    }
+    let distance = config.distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
     let mut alpha_plane = vec![0u16; width * height];
 
@@ -394,35 +465,44 @@ fn encode_high_depth_rgba(
 
     encode_with_config(
         &linear,
-        &EncodeConfig::with_distance(distance)
+        &EncodeConfigImpl::with_distance(distance)
             .with_alpha(match bps {
                 BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
                 BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
                 BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
             })
-            .with_bits_per_sample(bps),
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_color_encoding(config.color_encoding),
     )
 }
 
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
-pub(crate) fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<u8> {
-    assert!(input.xsize() > 0 && input.ysize() > 0, "empty image");
-    assert!(
-        config.distance > 0.0,
-        "distance must be positive (lossless not supported)"
-    );
-    assert!(
-        config.icc_profile.is_none(),
-        "ICC profile injection is not yet supported by jixel"
-    );
+pub(crate) fn encode_with_config(
+    input: &Image3F,
+    config: &EncodeConfigImpl,
+) -> Result<Vec<u8>, EncodeError> {
+    if input.xsize() == 0 || input.ysize() == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if input.xsize() > MAX_DIMENSION || input.ysize() > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge {
+            width: input.xsize(),
+            height: input.ysize(),
+        });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
+
     if let Some(alpha) = config.alpha.as_ref() {
         let expected = input.xsize() * input.ysize();
-        assert_eq!(
-            alpha.len(),
-            expected,
-            "alpha plane has wrong size: {} (expected {expected})",
-            alpha.len()
-        );
+        if alpha.len() != expected {
+            return Err(EncodeError::AlphaSizeMismatch {
+                expected,
+                actual: alpha.len(),
+            });
+        }
     }
 
     let distance = config.distance.max(MIN_DISTANCE);
@@ -440,7 +520,7 @@ pub(crate) fn encode_with_config(input: &Image3F, config: &EncodeConfig) -> Vec<
     );
     encode_frame(distance, input, config.alpha.as_ref(), &mut w);
     encode_frame(distance, input, config.alpha.as_ref(), &mut w);
-    w.into_bytes()
+    Ok(w.into_bytes())
 }
 
 pub(crate) trait AsSignedInt {
@@ -469,9 +549,25 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     height: usize,
     has_alpha: bool,
     max_bp: u8,
-    config: &EncodeConfig,
-) -> Vec<u8> {
-    assert!(width > 0 && height > 0, "empty image");
+    config: &EncodeConfigImpl,
+) -> Result<Vec<u8>, EncodeError> {
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    let expected = width * height * if has_alpha { 4 } else { 3 };
+    if input.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected,
+            actual: input.len(),
+        });
+    }
+
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
 
     let mut image3s = Image3Si::new(width, height);
     let mut alpha_plane: Option<AlphaPlane> = None;
@@ -570,7 +666,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         &mut w,
     );
     encode_frame_lossless(&image3s, alpha_plane.as_ref(), &mut w);
-    w.into_bytes()
+    Ok(w.into_bytes())
 }
 
 /// Write a single dimension using JXL's 4-bucket variable-length encoding.

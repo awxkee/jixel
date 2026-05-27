@@ -420,6 +420,7 @@ mod tests {
         icc[36..40].copy_from_slice(b"acsp");
         let mut w = BitWriter::new();
         write_icc_stream(&icc, &mut w);
+        w.zero_pad_to_byte();
         let bytes = w.into_bytes();
         assert!(!bytes.is_empty());
     }

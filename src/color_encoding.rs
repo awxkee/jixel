@@ -86,7 +86,7 @@ pub enum RenderingIntent {
 /// the original image was authored in. The white point is fixed by the
 /// primaries for the named enumerants (e.g. sRGB primaries imply D65), but
 /// JXL still carries it as a separate field, so we expose it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ColorEncoding {
     pub white_point: WhitePoint,
     pub primaries: Primaries,
