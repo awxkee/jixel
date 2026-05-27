@@ -27,7 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-pub struct Plane<T> {
+#[derive(Clone)]
+pub(crate) struct Plane<T> {
     data: Vec<T>,
     xsize: usize,
     ysize: usize,
@@ -90,7 +91,8 @@ impl<T: Copy + Default> Plane<T> {
 pub type ImageB = Plane<u8>;
 pub type ImageSB = Plane<i8>;
 
-pub struct Image3<T> {
+#[derive(Clone)]
+pub(crate) struct Image3<T> {
     planes: [Plane<T>; 3],
 }
 

@@ -112,6 +112,7 @@ struct DistanceParams {
     scale_dc: f32,
     x_qm_scale: u32,
     epf_iters: u32,
+    gab_enabled: bool,
 }
 
 fn clamp1<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
@@ -175,6 +176,9 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
+        // Always-on for lossy. libjxl default. Costs ~0.05 dB worth of file
+        // size but recovers high-frequency sharpness lost in quantization.
+        gab_enabled: true,
     }
 }
 
@@ -363,7 +367,13 @@ fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
 // Frame header, quant scales, DC global, AC global, DC group, TOC.
 // -----------------------------------------------------------------------------
 
-fn write_frame_header(x_qm_scale: u32, epf_iters: u32, has_alpha: bool, w: &mut BitWriter) {
+fn write_frame_header(
+    x_qm_scale: u32,
+    epf_iters: u32,
+    gab_enabled: bool,
+    has_alpha: bool,
+    w: &mut BitWriter,
+) {
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
@@ -399,11 +409,16 @@ fn write_frame_header(x_qm_scale: u32, epf_iters: u32, has_alpha: bool, w: &mut 
 
     w.write(1, 1); // last frame
     w.write(2, 0); // no name
-    if epf_iters == 2 {
-        w.write(1, 1); // default loop filter
+    if epf_iters == 2 && gab_enabled {
+        w.write(1, 1); // default loop filter (gab=1, epf=2)
     } else {
         w.write(1, 0); // not default
-        w.write(1, 0); // no gaborish
+        if gab_enabled {
+            w.write(1, 1); // gaborish enabled
+            w.write(1, 0); // gab_custom = false (use defaults)
+        } else {
+            w.write(1, 0); // no gaborish
+        }
         w.write(2, epf_iters as u64);
         if epf_iters > 0 {
             w.write(1, 0); // default epf sharpness
@@ -579,6 +594,15 @@ pub(crate) fn encode_frame(
     let dc_code = EntropyCode::new(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
     let ac_code = EntropyCode::new(&K_AC_CONTEXT_MAP, &K_AC_PREFIX_CODES);
 
+    let mut opsin = linear.clone();
+    to_xyb(&mut opsin);
+
+    // Forward gaborish. Decoder runs the inverse on the way out; the pair
+    // forms a pre/de-emphasis around the lossy round-trip.
+    if distp.gab_enabled {
+        crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
+    }
+
     // Section layout:
     //   0                                  : DC global
     //   1..1+num_dc_groups                 : DC groups
@@ -592,6 +616,7 @@ pub(crate) fn encode_frame(
         for dc_gx in 0..dim.xsize_dc_groups {
             process_dc_group(
                 linear,
+                &opsin,
                 &dim,
                 &distp,
                 &matrices,
@@ -622,13 +647,20 @@ pub(crate) fn encode_frame(
     );
 
     // Frame header into writer, then TOC + sections.
-    write_frame_header(distp.x_qm_scale, distp.epf_iters, alpha.is_some(), writer);
+    write_frame_header(
+        distp.x_qm_scale,
+        distp.epf_iters,
+        distp.gab_enabled,
+        alpha.is_some(),
+        writer,
+    );
     combine_sections(&mut sections, writer);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn process_dc_group(
     linear: &Image3F,
+    opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
     matrices: &DequantMatrices,
@@ -664,8 +696,9 @@ fn process_dc_group(
     // Block selection: choose DCT16X8 / DCT8X16 for super-blocks where they
     // beat per-block DCT8. AdjustQuantField propagates max-quant across
     // covered blocks of each chosen multi-block transform.
+    // Uses opsin (XYB, post-gaborish) so cost estimates use the right scale.
     crate::enc_ac_strategy::fill_ac_strategy(
-        linear,
+        opsin,
         distp.distance,
         matrices,
         &mut dc_data.raw_quant_field,
@@ -702,7 +735,7 @@ fn process_dc_group(
 
             // Build the stripe image (XYB).
             let stripe = build_stripe(
-                linear,
+                opsin,
                 stripe_x0,
                 stripe_y0,
                 stripe_xsize,
@@ -762,9 +795,10 @@ fn process_dc_group(
     write_dc_group(&dc_data, dc_code, &mut sections[dc_group_idx]);
 }
 
-/// Carve a stripe out of the linear image, convert to XYB, pad to whole blocks.
+/// Carve a stripe out of the (already-XYB-converted, gaborized) opsin image,
+/// padding to whole blocks by edge-replication.
 fn build_stripe(
-    linear: &Image3F,
+    opsin: &Image3F,
     x0: usize,
     y0: usize,
     xsize: usize,
@@ -776,7 +810,7 @@ fn build_stripe(
     for c in 0..3 {
         // Copy actual content.
         for y in 0..ysize {
-            let src_row = linear.plane_row(c, y0 + y);
+            let src_row = opsin.plane_row(c, y0 + y);
             let dst_row = stripe.plane_row_mut(c, y);
             dst_row[..xsize].copy_from_slice(&src_row[x0..x0 + xsize]);
             let last = dst_row[xsize - 1];
@@ -790,6 +824,5 @@ fn build_stripe(
             dst.copy_from_slice(src);
         }
     }
-    to_xyb(&mut stripe);
     stripe
 }

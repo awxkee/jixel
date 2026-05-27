@@ -362,7 +362,7 @@ pub fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mut crate
 
 /// Run block selection across the whole image (raster order, 2×2 super-blocks).
 /// Blocks not covered by a multi-block transform stay as DCT8.
-pub fn fill_ac_strategy(
+pub(crate) fn fill_ac_strategy(
     opsin: &Image3F,
     distance: f32,
     matrices: &DequantMatrices,

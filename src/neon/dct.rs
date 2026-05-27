@@ -369,7 +369,6 @@ pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
 
 #[cfg(test)]
 mod neon_dct_tests {
-    use super::*;
     use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
 
     const ATOL: f32 = 1e-4;

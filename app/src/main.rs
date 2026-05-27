@@ -19,19 +19,19 @@ fn main() {
     let rgb_img = image.to_rgb8();
     let rgba_img = image.to_rgba8();
     // let src_rgb = rgb_img.as_raw();
-    // for i in 0..10 {
-    //     let instant = Instant::now();
-    //     let d_bytes = jixel::encode_image_with_alpha(
-    //         &rgba_img,
-    //         image.width() as usize,
-    //         image.height() as usize,
-    //         &EncodeConfig::default()
-    //             .with_lossless(true)
-    //             .with_quality(99.)
-    //             .with_icc_profile(display_p3.to_vec()),
-    //     );
-    //     println!("Encoded in {}ms", instant.elapsed().as_millis());
-    // }
+    for i in 0..10 {
+        let instant = Instant::now();
+        let d_bytes = jixel::encode_image_with_alpha(
+            &rgba_img,
+            image.width() as usize,
+            image.height() as usize,
+            &EncodeConfig::default()
+                .with_lossless(true)
+                .with_quality(99.)
+                .with_icc_profile(display_p3.to_vec()),
+        );
+        println!("Encoded in {}ms", instant.elapsed().as_millis());
+    }
     // let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
     let bytes = jixel::encode_image(
         &rgb_img,
