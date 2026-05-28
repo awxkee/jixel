@@ -1,4 +1,31 @@
-//! jixbench — RD benchmark + chart tool for the jixel encoder.
+/*
+ * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 use anyhow::{Context, Result, bail};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
@@ -6,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
+
 fn register_fonts() {
     use plotters::style::FontStyle;
     for style in [
@@ -24,6 +52,7 @@ struct Point {
     bpp: f64,
     bytes: u64,
     ss2: f64,
+    distance: f32,
 }
 
 /// A labelled series of points (one encoder, or one cjxl effort).
@@ -72,9 +101,6 @@ fn main() -> Result<()> {
     check_tool("djxl")?;
 
     let tmp = out_dir.join("_tmp");
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
     std::fs::create_dir_all(&tmp)?;
 
     for img in &images {
@@ -157,6 +183,7 @@ fn bench_jixel(
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
         ss2,
+        distance: d,
     })
 }
 
@@ -194,7 +221,6 @@ fn bench_cjxl(
             img.display()
         );
     }
-
     let bytes = std::fs::metadata(&jxl)?.len();
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
     let ss2 = score(orig, &dec, w, h)?;
@@ -202,6 +228,7 @@ fn bench_cjxl(
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
         ss2,
+        distance: d,
     })
 }
 
@@ -264,7 +291,7 @@ fn load_rgb(path: &Path) -> Result<(Vec<u8>, usize, usize)> {
 }
 
 fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
-    let root = BitMapBackend::new(path, (900, 640)).into_drawing_area();
+    let root = BitMapBackend::new(path, (1920, 1080)).into_drawing_area();
     root.fill(&WHITE)?;
     let (xmin, xmax, ymin, ymax) = bounds(series);
     let mut chart = ChartBuilder::on(&root)
@@ -291,8 +318,21 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
             });
         chart.draw_series(
             pts.iter()
-                .map(|&(x, y)| Circle::new((x, y), 3, s.color.filled())),
+                .map(|&(x, y)| Circle::new((x, y), 4, s.color.filled())),
         )?;
+        // Distance label above each dot, offset slightly so it doesn't overlap the circle.
+        let series_color = s.color;
+        chart.draw_series(s.points.iter().map(|pt| {
+            let label = if pt.distance.fract() == 0.0 {
+                format!("-d {}", pt.distance as u32)
+            } else {
+                // Trim trailing zeros: 0.50 → "0.5"
+                let tmp = format!("-d {:.2}", pt.distance);
+                tmp.trim_end_matches('0').trim_end_matches('.').to_string()
+            };
+            let style = ("sans-serif", 14).into_font().color(&series_color);
+            Text::new(label, (pt.bpp + 0.01, pt.ss2 + 0.4), style)
+        }))?;
     }
     chart
         .configure_series_labels()

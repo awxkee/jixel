@@ -27,12 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(clippy::excessive_precision)]
-pub(crate) const INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
-pub(crate) const DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
+pub(crate) static INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
+pub(crate) static DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
 
 /// Per-channel dequant matrices for 8x8 DCT.
 /// Indexed [channel][y * 8 + x]. Channel 0 = X, 1 = Y, 2 = B.
-pub(crate) const DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
+pub(crate) static DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
     // Channel 0 (X): kQuantWeights[0..64]
     [
         3.1746033e-04,
@@ -241,7 +241,7 @@ pub(crate) const DEQUANT_MATRIX_8X8: [[f32; 64]; 3] = [
 /// DCT16X8 layout: weights[c][y*8 + x], y in 0..16, x in 0..8.
 /// DCT8X16 reuses the same 128 floats; both have the same per-channel offset
 /// in libjxl-tiny's `kQuantWeights` table (offset 3, 5, 7 in blocks).
-pub(crate) const DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
+pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
     // Channel 0 (X)
     [
         1.3810680e-04,
@@ -659,7 +659,7 @@ pub(crate) struct DequantMatrices {
 /// inverse step size at the DC (radius 0) position; subsequent values are
 /// multiplicative deltas between successive bands. Same format as
 /// jxl-rs `dct16x16()`.
-const DCT16X16_BANDS: [[f32; 7]; 3] = [
+static DCT16X16_BANDS: [[f32; 7]; 3] = [
     // X
     [
         8996.872_571_181_412,

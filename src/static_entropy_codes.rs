@@ -33,7 +33,7 @@ pub(crate) const K_NUM_DC_CONTEXTS: usize = 45;
 
 // Context map for AC coefficients. Length is K_NUM_AC_CONTEXTS = 1980.
 #[rustfmt::skip]
-pub(crate) const K_AC_CONTEXT_MAP: [u8; K_NUM_AC_CONTEXTS] = [
+pub(crate) static K_AC_CONTEXT_MAP: [u8; K_NUM_AC_CONTEXTS] = [
     // ---- Number-of-nonzeros contexts: 4 cols x 37 rows ----
     //   8x8_Y  8x16_Y  8x8_XB  8x16_XB
         0, 1, 2, 1,    // pred 0
@@ -364,7 +364,7 @@ const _: () = {
     assert!(K_AC_CONTEXT_MAP.len() == K_NUM_AC_CONTEXTS);
 };
 
-pub(crate) const K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
+pub(crate) static K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
     44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 44, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
     43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
     43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43,
@@ -409,7 +409,7 @@ pub(crate) const K_GRADIENT_CONTEXT_LUT: [u8; 1024] = [
     12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
     12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
 ];
-pub(crate) const K_CONTEXT_TREE_TOKENS: [(u32, u32); 313] = [
+pub(crate) static K_CONTEXT_TREE_TOKENS: [(u32, u32); 313] = [
     (1, 2),
     (0, 4),
     (1, 1),

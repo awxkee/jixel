@@ -36,14 +36,14 @@ pub(crate) const K_NUM_AC_CONTEXTS: usize =
 pub(crate) const K_NUM_AC_STRATEGY_CODES: usize = 27;
 
 /// Frequency-band context per zigzag position. Index 0 is unused (DC).
-pub(crate) const K_COEFF_FREQ_CONTEXT: [u16; 64] = [
+pub(crate) static K_COEFF_FREQ_CONTEXT: [u16; 64] = [
     0xBAD, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19,
     19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27,
     27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
 ];
 
 /// Remaining-nonzeros context bucket.
-pub(crate) const K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
+pub(crate) static K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
     0xBAD, 0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152,
     152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206,
     206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
@@ -51,14 +51,14 @@ pub(crate) const K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
 ];
 
 /// Static block context map signaled in WriteDCGlobal.
-pub(crate) const K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
+pub(crate) static K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
     0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Y
     2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // X
     2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // B
 ];
 
 #[rustfmt::skip]
-pub(crate) const K_BLOCK_CONTEXT_MAP: [u8; 81] = [
+pub(crate) static K_BLOCK_CONTEXT_MAP: [u8; 81] = [
     // X row. Position 4 = DCT16X16 (decoder ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
     2, 0, 0, 0, 2, 0, 3, 3, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -121,7 +121,7 @@ pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
 /// 8x8 zigzag order. Coefficient at zigzag position k is at raw index
 /// K_COEFF_ORDER_8X8[k].
 #[rustfmt::skip]
-pub(crate) const K_COEFF_ORDER_8X8: [u8; 64] = [
+pub(crate) static K_COEFF_ORDER_8X8: [u8; 64] = [
     0,   1,   8,   16, 9,   2,   3,   10,
     17,  24,  32,  25, 18,  11,  4,   5,
     12,  19,  26,  33, 40,  48,  41,  34,
@@ -136,7 +136,7 @@ pub(crate) const K_COEFF_ORDER_8X8: [u8; 64] = [
 /// 128 entries. Positions 0 and 1 are LF positions; HF positions are zigzagged
 /// over the 16x8 grid.
 #[rustfmt::skip]
-pub(crate) const K_COEFF_ORDER_16X8: [u8; 128] = [
+pub(crate) static K_COEFF_ORDER_16X8: [u8; 128] = [
     0,   1,   16,  2,   3,   17,  32,  18,  4,   5,   19,
     33,  48,  34,  20,  6,   7,   21,  35,  49,  64,  50,  36,  22,  8,   9,
     23,  37,  51,  65,  80,  66,  52,  38,  24,  10,  11,  25,  39,  53,  67,
@@ -149,7 +149,7 @@ pub(crate) const K_COEFF_ORDER_16X8: [u8; 128] = [
 ];
 
 #[rustfmt::skip]
-pub(crate) const K_COEFF_ORDER_16X16: [u8; 256] = [
+pub(crate) static  K_COEFF_ORDER_16X16: [u8; 256] = [
        0,    1,   16,   17,   32,    2,    3,   18,
       33,   48,   64,   49,   34,   19,    4,    5,
       20,   35,   50,   65,   80,   96,   81,   66,

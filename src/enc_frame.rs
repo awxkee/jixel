@@ -890,11 +890,10 @@ fn build_stripe(
         for y in 0..ysize {
             let src_row = opsin.plane_row(c, y0 + y);
             let dst_row = stripe.plane_row_mut(c, y);
-            dst_row[..xsize].copy_from_slice(&src_row[x0..x0 + xsize]);
-            let last = dst_row[xsize - 1];
-            for x in xsize..xsize_padded {
-                dst_row[x] = last;
-            }
+            let (data, padding) = dst_row.split_at_mut(xsize);
+            data.copy_from_slice(&src_row[x0..x0 + xsize]);
+            let last = *data.last().unwrap();
+            padding[..xsize_padded - xsize].fill(last);
         }
         // Replicate bottom row.
         for y in ysize..ysize_padded {

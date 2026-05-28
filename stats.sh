@@ -27,4 +27,4 @@
 # // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-cargo run --package stats --release -- assets/abstract.jpg --distances 0.3,0.5,1,2 --efforts 5,7 --out charts
+cargo run --package stats --release -- assets/abstract.jpg --distances 0.3,0.5,1,2 --efforts 3,7 --out charts

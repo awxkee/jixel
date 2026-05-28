@@ -52,10 +52,6 @@ pub fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
     w.write(d + nbits as usize, data);
 }
 
-// ---------------------------------------------------------------------------
-// Building histograms / Huffman codes from tokens.
-// ---------------------------------------------------------------------------
-
 fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
     for t in tokens {
         let (tok, _, _) = uint_encode(t.value);
