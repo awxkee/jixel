@@ -1,3 +1,6 @@
 /target
 app/target
 .idea
+charts
+assets
+*.jxl
