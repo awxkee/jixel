@@ -32,9 +32,9 @@ fn main() {
     //     );
     //     println!("Encoded in {}ms", instant.elapsed().as_millis());
     // }
-    // let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
-    let bytes = jixel::encode_image(
-        &rgb_img,
+    let img10 = image.to_luma16().iter().map(|x| x >> 6).collect::<Vec<_>>();
+    let bytes = jixel::encode_image_gray_10bit(
+        &img10,
         image.width() as usize,
         image.height() as usize,
         &EncodeConfig::default()
