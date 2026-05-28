@@ -57,18 +57,16 @@ pub(crate) const K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
     2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // B
 ];
 
-/// 3 channels x 27 strategy codes — only entry [c * 27 + 0] is ever read in
-/// jixel since we only use AcStrategy::DCT (code 0).
 #[rustfmt::skip]
 pub(crate) const K_BLOCK_CONTEXT_MAP: [u8; 81] = [
-    // X
-    2, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0,
+    // X row. Position 4 = DCT16X16 (decoder ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
+    2, 0, 0, 0, 2, 0, 3, 3, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    // Y
+    // Y row. Position 4 = DCT16X16 (decoder ctx 0). Positions 6, 7 = DCT16X8/8X16 (ctx 1).
     0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    // B
-    2, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0,
+    // B row. Position 4 = DCT16X16 (decoder ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
+    2, 0, 0, 0, 2, 0, 3, 3, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
@@ -97,12 +95,10 @@ pub(crate) fn zero_density_context_8x8(nonzeros_left: usize, k: usize, prev: usi
         + prev
 }
 
-#[inline]
-pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
-    K_NUM_BLOCK_CTXS as u32 * K_NON_ZERO_BUCKETS as u32
-        + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
-}
-
+/// General `zero_density_context` from libjxl-tiny. For 8x8 use
+/// `zero_density_context_8x8`. For multi-block transforms, `covered_blocks` is
+/// the number of 8x8 sub-blocks (2 for DCT16X8/DCT8X16) and `log2_covered_blocks`
+/// is `log2(covered_blocks)` (1 for the rectangular pair).
 #[inline]
 pub(crate) fn zero_density_context(
     nonzeros_left: usize,
@@ -114,6 +110,12 @@ pub(crate) fn zero_density_context(
     let nz = (nonzeros_left + covered_blocks - 1) >> log2_covered_blocks;
     let kk = k >> log2_covered_blocks;
     (K_COEFF_NUM_NONZERO_CONTEXT[nz] as usize + K_COEFF_FREQ_CONTEXT[kk] as usize) * 2 + prev
+}
+
+#[inline]
+pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
+    K_NUM_BLOCK_CTXS as u32 * K_NON_ZERO_BUCKETS as u32
+        + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
 }
 
 /// 8x8 zigzag order. Coefficient at zigzag position k is at raw index
@@ -134,7 +136,7 @@ pub(crate) const K_COEFF_ORDER_8X8: [u8; 64] = [
 /// 128 entries. Positions 0 and 1 are LF positions; HF positions are zigzagged
 /// over the 16x8 grid.
 #[rustfmt::skip]
-pub const K_COEFF_ORDER_16X8: [u8; 128] = [
+pub(crate) const K_COEFF_ORDER_16X8: [u8; 128] = [
     0,   1,   16,  2,   3,   17,  32,  18,  4,   5,   19,
     33,  48,  34,  20,  6,   7,   21,  35,  49,  64,  50,  36,  22,  8,   9,
     23,  37,  51,  65,  80,  66,  52,  38,  24,  10,  11,  25,  39,  53,  67,
@@ -144,4 +146,40 @@ pub const K_COEFF_ORDER_16X8: [u8; 128] = [
     116, 102, 88,  74,  60,  46,  47,  61,  75,  89,  103, 117, 118, 104, 90,
     76,  62,  63,  77,  91,  105, 119, 120, 106, 92,  78,  79,  93,  107, 121,
     122, 108, 94,  95,  109, 123, 124, 110, 111, 125, 126, 127,
+];
+
+#[rustfmt::skip]
+pub(crate) const K_COEFF_ORDER_16X16: [u8; 256] = [
+       0,    1,   16,   17,   32,    2,    3,   18,
+      33,   48,   64,   49,   34,   19,    4,    5,
+      20,   35,   50,   65,   80,   96,   81,   66,
+      51,   36,   21,    6,    7,   22,   37,   52,
+      67,   82,   97,  112,  128,  113,   98,   83,
+      68,   53,   38,   23,    8,    9,   24,   39,
+      54,   69,   84,   99,  114,  129,  144,  160,
+     145,  130,  115,  100,   85,   70,   55,   40,
+      25,   10,   11,   26,   41,   56,   71,   86,
+     101,  116,  131,  146,  161,  176,  192,  177,
+     162,  147,  132,  117,  102,   87,   72,   57,
+      42,   27,   12,   13,   28,   43,   58,   73,
+      88,  103,  118,  133,  148,  163,  178,  193,
+     208,  224,  209,  194,  179,  164,  149,  134,
+     119,  104,   89,   74,   59,   44,   29,   14,
+      15,   30,   45,   60,   75,   90,  105,  120,
+     135,  150,  165,  180,  195,  210,  225,  240,
+     241,  226,  211,  196,  181,  166,  151,  136,
+     121,  106,   91,   76,   61,   46,   31,   47,
+      62,   77,   92,  107,  122,  137,  152,  167,
+     182,  197,  212,  227,  242,  243,  228,  213,
+     198,  183,  168,  153,  138,  123,  108,   93,
+      78,   63,   79,   94,  109,  124,  139,  154,
+     169,  184,  199,  214,  229,  244,  245,  230,
+     215,  200,  185,  170,  155,  140,  125,  110,
+      95,  111,  126,  141,  156,  171,  186,  201,
+     216,  231,  246,  247,  232,  217,  202,  187,
+     172,  157,  142,  127,  143,  158,  173,  188,
+     203,  218,  233,  248,  249,  234,  219,  204,
+     189,  174,  159,  175,  190,  205,  220,  235,
+     250,  251,  236,  221,  206,  191,  207,  222,
+     237,  252,  253,  238,  223,  239,  254,  255,
 ];

@@ -29,13 +29,16 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::ac_context::{
-    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, block_context, non_zero_context, zero_density_context,
-    zero_density_context_8x8, zero_density_contexts_offset,
+    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, block_context, non_zero_context,
+    zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
+    STRATEGY_DCT16X16,
 };
-use crate::dct::{dc_from_dct8x16, dc_from_dct16x8, dct8x8, dct8x16, dct16x8};
+use crate::dct::{
+    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dct8x8, dct8x16, dct16x8, dct16x16,
+};
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
@@ -69,18 +72,26 @@ fn num_nonzero_except_dc(block: &[i32; 64]) -> i32 {
     count
 }
 
-/// Multi-block analog: counts nonzeros in `size = cx*cy*64` coefficients,
-/// masking out the `covered_blocks = cx*cy` LF positions (the first cx*cy
-/// in storage row-major order). For DCT16X8/DCT8X16 (cx=2, cy=1 after swap),
-/// the LF positions are coeffs[0] and coeffs[1] in the 8x16 stride-16 layout.
+/// Multi-block analog: counts nonzeros in `size = cx*cy*64` coefficients
+/// excluding the `cx × cy` LLF positions. For DCT16X8/DCT8X16 (cx=2, cy=1
+/// after the cx>=cy swap), the LLF positions are coeffs[0] and coeffs[1] in
+/// the 8x16 stride-16 layout — contiguous. For DCT16X16 (cx=cy=2) the LLF
+/// positions are {0, 1, 16, 17} in the 16x16 stride-16 layout — NOT
+/// contiguous, so we mask them explicitly using the row-stride.
 #[inline]
 fn num_nonzero_except_llf(block: &[i32], cx: usize, cy: usize) -> i32 {
-    let size = cx * cy * 64;
-    let covered = cx * cy;
+    let row_stride = cx * 8;
+    let xsize_pixels = cx * 8;
+    let ysize_pixels = cy * 8;
     let mut count: i32 = 0;
-    for k in covered..size {
-        if block[k] != 0 {
-            count += 1;
+    for v in 0..ysize_pixels {
+        for u in 0..xsize_pixels {
+            if v < cy && u < cx {
+                continue;
+            }
+            if block[v * row_stride + u] != 0 {
+                count += 1;
+            }
         }
     }
     count
@@ -126,6 +137,21 @@ fn quantize_block_ac(
     let q_scaled = qac * qm_multiplier;
     let width = xsize * 8;
     let height = ysize * 8;
+    // The quant matrix, input, and output must all be sized for this transform.
+    // A mismatch here means the caller selected the wrong matrix for the
+    // strategy (e.g. handing the 64-entry DCT8 matrix to a DCT16X8/DCT16X16
+    // block). Fail with a clear message rather than an opaque index panic.
+    debug_assert_eq!(
+        qm.len(),
+        width * height,
+        "quant matrix size {} != transform size {}x{}={} (wrong matrix for strategy?)",
+        qm.len(),
+        width,
+        height,
+        width * height
+    );
+    debug_assert!(block_in.len() >= width * height, "block_in too small");
+    debug_assert!(block_out.len() >= width * height, "block_out too small");
     for y in 0..height {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         for x in 0..width {
@@ -188,6 +214,9 @@ fn quantize_roundtrip_y_block(
     }
 }
 
+/// Process and tokenize one stripe of an AC group, pushing tokens into `out`.
+/// Callers buffer tokens across all AC groups, build an adaptive entropy code
+/// from the aggregate distribution, then emit them in `encode_frame`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ac_group(
     opsin: &Image3F,
@@ -213,9 +242,9 @@ pub(crate) fn write_ac_group(
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
 
-    // Per-channel scratch for largest multi-block (cx=2, cy=1 → 128 floats).
-    let mut coeffs = [[0.0f32; 128]; 3];
-    let mut quantized = [[0i32; 128]; 3];
+    // Per-channel scratch sized for the largest transform (DCT16X16 = 2×2 blocks = 256 floats).
+    let mut coeffs = [[0.0f32; 256]; 3];
+    let mut quantized = [[0i32; 256]; 3];
 
     for by in 0..ysize_blocks {
         let nz_by = nzeros_by0 + by;
@@ -263,7 +292,7 @@ pub(crate) fn write_ac_group(
                             let row = plane.row(opsin_by + yy);
                             tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
                         }
-                        let dst: &mut [f32; 128] = (&mut coeffs[c][..]).try_into().unwrap();
+                        let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         dct16x8(&tmp, dst);
                     }
                     STRATEGY_DCT8X16 => {
@@ -273,8 +302,18 @@ pub(crate) fn write_ac_group(
                             tmp[yy * 16..yy * 16 + 16]
                                 .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
                         }
-                        let dst: &mut [f32; 128] = (&mut coeffs[c][..]).try_into().unwrap();
+                        let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         dct8x16(&tmp, dst);
+                    }
+                    STRATEGY_DCT16X16 => {
+                        let mut tmp = [0.0f32; 256]; // 16 rows × 16 cols, stride 16
+                        for yy in 0..16 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 16..yy * 16 + 16]
+                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
+                        }
+                        let dst: &mut [f32; 256] = (&mut coeffs[c][..256]).try_into().unwrap();
+                        dct16x16(&tmp, dst);
                     }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
@@ -282,7 +321,9 @@ pub(crate) fn write_ac_group(
 
             // ---- Extract DC values and write to DC plane ----
             // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
-            let mut dc_vals = [[0.0f32; 2]; 3];
+            // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
+            // indexing is didx = iy * cov_x + ix.
+            let mut dc_vals = [[0.0f32; 4]; 3];
             match raw_strategy {
                 STRATEGY_DCT => {
                     for c in 0..3 {
@@ -291,7 +332,7 @@ pub(crate) fn write_ac_group(
                 }
                 STRATEGY_DCT16X8 => {
                     for c in 0..3 {
-                        let cb: &[f32; 128] = (&coeffs[c][..]).try_into().unwrap();
+                        let cb: &[f32; 128] = (&coeffs[c][..128]).try_into().unwrap();
                         let mut dc2 = [0.0f32; 2];
                         dc_from_dct16x8(cb, &mut dc2);
                         dc_vals[c][0] = dc2[0]; // top covered block
@@ -300,11 +341,25 @@ pub(crate) fn write_ac_group(
                 }
                 STRATEGY_DCT8X16 => {
                     for c in 0..3 {
-                        let cb: &[f32; 128] = (&coeffs[c][..]).try_into().unwrap();
+                        let cb: &[f32; 128] = (&coeffs[c][..128]).try_into().unwrap();
                         let mut dc2 = [0.0f32; 2];
                         dc_from_dct8x16(cb, &mut dc2);
                         dc_vals[c][0] = dc2[0]; // left covered block
                         dc_vals[c][1] = dc2[1]; // right covered block
+                    }
+                }
+                STRATEGY_DCT16X16 => {
+                    // dc_from_dct16x16 returns 4 DC values in [TL, TR, BL, BR]
+                    // order, matching the [iy=0,1][ix=0,1] grid the caller uses
+                    // (didx = iy * 2 + ix).
+                    for c in 0..3 {
+                        let cb: &[f32; 256] = (&coeffs[c][..256]).try_into().unwrap();
+                        let mut dc4 = [0.0f32; 4];
+                        dc_from_dct16x16(cb, &mut dc4);
+                        dc_vals[c][0] = dc4[0];
+                        dc_vals[c][1] = dc4[1];
+                        dc_vals[c][2] = dc4[2];
+                        dc_vals[c][3] = dc4[3];
                     }
                 }
                 _ => unreachable!(),
@@ -322,17 +377,16 @@ pub(crate) fn write_ac_group(
                 }
             }
             // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
+            // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
+            // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
+            let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
+                STRATEGY_DCT      => (&matrices.inv_matrix(1)[..],      &matrices.matrix(1)[..]),
+                STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
+                _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
+            };
             quantize_roundtrip_y_block(
-                if raw_strategy == STRATEGY_DCT {
-                    matrices.inv_matrix(1)
-                } else {
-                    matrices.inv_matrix_16x8(1)
-                },
-                if raw_strategy == STRATEGY_DCT {
-                    matrices.matrix(1)
-                } else {
-                    matrices.matrix_16x8(1)
-                },
+                inv_qm_y,
+                qm_y,
                 scale,
                 quant_ac,
                 cx,
@@ -341,49 +395,77 @@ pub(crate) fn write_ac_group(
                 &mut quantized[1][..size],
             );
 
-            // ---- B minus Y CfL ----
-            // Save raw X DC for X-channel DC computation (X has no CfL).
-            let x_dc_raw = dc_vals[0]; // [top/left, bottom/right]
-            // Apply B -= Y on all coefficients.
+            // ---- Per-tile CfL factors ----
+            let tx = global_bx / 8;
+            let ty = global_by / 8;
+            let cmap_x = dc_data.ytox_map.row(ty)[tx];
+            let cmap_b = dc_data.ytob_map.row(ty)[tx];
+            // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
+            let x_factor = crate::enc_color_correlation::y_to_x_ratio(cmap_x);
+            let b_factor = crate::enc_color_correlation::y_to_b_ratio(cmap_b);
+
+            // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
+            // (Y has already been quant-roundtripped, so coeffs[1] reflects what the
+            // decoder will use to reverse the CfL.)
             for k in 0..size {
-                coeffs[2][k] -= coeffs[1][k];
+                coeffs[0][k] -= x_factor * coeffs[1][k];
+                coeffs[2][k] -= b_factor * coeffs[1][k];
             }
-            // Recompute B DC after CfL (b_dc_post_cfl = b_dc_raw - y_dc_dq).
-            // Since coeffs[1] is now the DEQUANTIZED Y (from roundtrip), the LF
-            // positions of coeffs[2] reflect b - y_dq. Extract post-CfL DC.
-            let mut b_dc_post = [0.0f32; 2];
+            // ---- Extract post-CfL X and B DC ----
+            let mut x_dc_post = [0.0f32; 4];
+            let mut b_dc_post = [0.0f32; 4];
             match raw_strategy {
                 STRATEGY_DCT => {
+                    x_dc_post[0] = coeffs[0][0];
                     b_dc_post[0] = coeffs[2][0];
                 }
                 STRATEGY_DCT16X8 => {
-                    let cb: &[f32; 128] = (&coeffs[2][..]).try_into().unwrap();
-                    dc_from_dct16x8(cb, &mut b_dc_post);
+                    let xb: &[f32; 128] = (&coeffs[0][..128]).try_into().unwrap();
+                    let bb: &[f32; 128] = (&coeffs[2][..128]).try_into().unwrap();
+                    let mut xd = [0.0f32; 2];
+                    let mut bd = [0.0f32; 2];
+                    dc_from_dct16x8(xb, &mut xd);
+                    dc_from_dct16x8(bb, &mut bd);
+                    x_dc_post[..2].copy_from_slice(&xd);
+                    b_dc_post[..2].copy_from_slice(&bd);
                 }
                 STRATEGY_DCT8X16 => {
-                    let cb: &[f32; 128] = (&coeffs[2][..]).try_into().unwrap();
-                    dc_from_dct8x16(cb, &mut b_dc_post);
+                    let xb: &[f32; 128] = (&coeffs[0][..128]).try_into().unwrap();
+                    let bb: &[f32; 128] = (&coeffs[2][..128]).try_into().unwrap();
+                    let mut xd = [0.0f32; 2];
+                    let mut bd = [0.0f32; 2];
+                    dc_from_dct8x16(xb, &mut xd);
+                    dc_from_dct8x16(bb, &mut bd);
+                    x_dc_post[..2].copy_from_slice(&xd);
+                    b_dc_post[..2].copy_from_slice(&bd);
+                }
+                STRATEGY_DCT16X16 => {
+                    let xb: &[f32; 256] = (&coeffs[0][..256]).try_into().unwrap();
+                    let bb: &[f32; 256] = (&coeffs[2][..256]).try_into().unwrap();
+                    dc_from_dct16x16(xb, &mut x_dc_post);
+                    dc_from_dct16x16(bb, &mut b_dc_post);
                 }
                 _ => unreachable!(),
             }
 
-            // ---- X channel: quantize AC, write DC ----
+            // ---- X channel: write post-CfL DC, quantize AC ----
             for iy in 0..cov_y {
                 for ix in 0..cov_x {
                     let didx = iy * cov_x + ix;
-                    let x_dc_q = (inv_factor[0] * x_dc_raw[didx]).round() as i16;
+                    // base_correlation_x = 0 so no Y contribution to X DC store.
+                    let x_dc_q = (inv_factor[0] * x_dc_post[didx]).round() as i16;
                     dc_data.quant_dc.plane_row_mut(0, global_by + iy)[global_bx + ix] = x_dc_q;
                 }
             }
-            // Note: jixel uses CfL X correlation = 0 (no x_factor); coeffs[0] unchanged.
+            let inv_qm_x: &[f32] = match raw_strategy {
+                STRATEGY_DCT => &matrices.inv_matrix(0)[..],
+                STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
+                _ => &matrices.inv_matrix_16x8(0)[..],
+            };
             quantize_block_ac(
                 &coeffs[0][..size],
                 0,
-                if raw_strategy == STRATEGY_DCT {
-                    &matrices.inv_matrix(0)[..]
-                } else {
-                    &matrices.inv_matrix_16x8(0)[..]
-                },
+                inv_qm_x,
                 quant_ac,
                 scale,
                 x_qm_mul,
@@ -402,14 +484,15 @@ pub(crate) fn write_ac_group(
                     dc_data.quant_dc.plane_row_mut(2, global_by + iy)[global_bx + ix] = b_dc_q;
                 }
             }
+            let inv_qm_b: &[f32] = match raw_strategy {
+                STRATEGY_DCT => &matrices.inv_matrix(2)[..],
+                STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
+                _ => &matrices.inv_matrix_16x8(2)[..],
+            };
             quantize_block_ac(
                 &coeffs[2][..size],
                 2,
-                if raw_strategy == STRATEGY_DCT {
-                    &matrices.inv_matrix(2)[..]
-                } else {
-                    &matrices.inv_matrix_16x8(2)[..]
-                },
+                inv_qm_b,
                 quant_ac,
                 scale,
                 1.0,
@@ -421,7 +504,13 @@ pub(crate) fn write_ac_group(
             // ---- Tokenize in order Y, X, B ----
             let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
             let covered_blocks = cx * cy;
-            let log2_covered_blocks = if covered_blocks == 1 { 0 } else { 1 };
+            // log2(covered_blocks): 0 for 1, 1 for 2 (16X8/8X16), 2 for 4 (16X16).
+            let log2_covered_blocks = match covered_blocks {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => unreachable!("invalid covered_blocks {}", covered_blocks),
+            };
 
             for &c in &[1usize, 0, 2] {
                 let block = &quantized[c][..size];
@@ -457,11 +546,13 @@ pub(crate) fn write_ac_group(
 
                 write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
 
-                // Choose the natural coefficient order.
-                let order: &[u8] = if covered_blocks == 1 {
-                    &K_COEFF_ORDER_8X8[..]
-                } else {
-                    &K_COEFF_ORDER_16X8[..]
+                // Choose the natural coefficient order. For DCT16X16 we use
+                // the 256-entry natural radial zigzag; for 16X8/8X16 the
+                // 128-entry shared order; otherwise the 8X8 zigzag.
+                let order: &[u8] = match raw_strategy {
+                    STRATEGY_DCT => &K_COEFF_ORDER_8X8[..],
+                    STRATEGY_DCT16X16 => &K_COEFF_ORDER_16X16[..],
+                    _ => &K_COEFF_ORDER_16X8[..],
                 };
 
                 let mut prev: usize = if nzeros as usize > size / 16 { 0 } else { 1 };

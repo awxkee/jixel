@@ -167,6 +167,19 @@ pub(crate) fn fill_cmap(
     }
 }
 
+/// Returns the per-tile factor as a slope (= base_correlation + cmap/84).
+#[inline]
+pub(crate) fn y_to_x_ratio(cmap_x: i8) -> f32 {
+    // base_correlation_x = 0
+    cmap_x as f32 * K_INV_COLOR_FACTOR
+}
+
+#[inline]
+pub(crate) fn y_to_b_ratio(cmap_b: i8) -> f32 {
+    // base_correlation_b = 1
+    1.0 + cmap_b as f32 * K_INV_COLOR_FACTOR
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

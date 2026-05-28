@@ -26,8 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dc_group_data::{AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8};
-use crate::dct::{dct8x8, dct8x16, dct16x8};
+use crate::dc_group_data::{
+    AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
+};
+use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16};
 use crate::image::Image3F;
 use crate::quant_weights::DequantMatrices;
 
@@ -63,7 +65,8 @@ fn estimate_entropy(
     }
 
     // Forward DCT each channel into block[c * size .. (c+1) * size].
-    let mut block = [0.0f32; 3 * 128];
+    // Buffer sized for the largest candidate (DCT16X16 = 256 floats per channel).
+    let mut block = [0.0f32; 3 * 256];
     for c in 0..3 {
         let plane = opsin.plane(c);
         match raw_strategy {
@@ -96,6 +99,16 @@ fn estimate_entropy(
                     (&mut block[c * size..c * size + 128]).try_into().unwrap();
                 dct8x16(&tmp, dst);
             }
+            STRATEGY_DCT16X16 => {
+                let mut tmp = [0.0f32; 256];
+                for yy in 0..16 {
+                    let row = plane.row(by_pix + yy);
+                    tmp[yy * 16..yy * 16 + 16].copy_from_slice(&row[bx_pix..bx_pix + 16]);
+                }
+                let dst: &mut [f32; 256] =
+                    (&mut block[c * size..c * size + 256]).try_into().unwrap();
+                dct16x16(&tmp, dst);
+            }
             _ => unreachable!(),
         }
     }
@@ -112,7 +125,10 @@ fn estimate_entropy(
         }
     }
     let quant = max_quant as f32;
-    let masking = 1.0; // jixel: skip mask estimation (libjxl-tiny uses it too)
+    // libjxl-tiny normally derives masking from a per-block mask field. jixel
+    // doesn't compute one; the K_MUL16X8_TUNING constant below compensates by
+    // making multi-block transforms uniformly more expensive in cost space.
+    let masking = 1.0f32;
 
     // libjxl-tiny constants for entropy estimation
     const K_INFO_LOSS_MULTIPLIER: f32 = 138.0;
@@ -132,10 +148,10 @@ fn estimate_entropy(
     let mut info_loss2 = 0.0f32;
 
     for c in 0..3 {
-        let inv_matrix: &[f32] = if raw_strategy == STRATEGY_DCT {
-            &matrices.inv_matrix(c)[..]
-        } else {
-            &matrices.inv_matrix_16x8(c)[..]
+        let inv_matrix: &[f32] = match raw_strategy {
+            STRATEGY_DCT => &matrices.inv_matrix(c)[..],
+            STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
+            _ => &matrices.inv_matrix_16x8(c)[..],
         };
         let cmap_factor = cmap_factors[c];
         let mut entropy_acc = 0.0f32;
@@ -203,11 +219,18 @@ pub fn find_best_16x16_transform(
     let k8x8_mul1 = -0.55 * 0.75;
     let k8x8_mul2 = 1.073_575_8 * 0.75;
     let mul8x8 = k8x8_mul2 + k8x8_mul1 / (distance + k8x8_base);
+
     const K_MUL16X8_TUNING: f32 = 1.5;
     let k8x16_base = 1.6;
     let k8x16_mul1 = -0.55 * K_MUL16X8_TUNING;
     let k8x16_mul2 = 0.901_958_8 * K_MUL16X8_TUNING;
     let mul16x8 = k8x16_mul2 + k8x16_mul1 / (distance + k8x16_base);
+
+    const K_MUL16X16_TUNING: f32 = 1.8;
+    let k16x16_base = 1.6;
+    let k16x16_mul1 = -0.55 * K_MUL16X16_TUNING;
+    let k16x16_mul2 = 0.901_958_8 * K_MUL16X16_TUNING;
+    let mul16x16 = k16x16_mul2 + k16x16_mul1 / (distance + k16x16_base);
 
     // Cache the QF rect over the 2x2 super-block: 2 rows × 2 cols.
     // quant_per_block is indexed via [by0*qf_stride .. (by0+2)*qf_stride].
@@ -242,7 +265,7 @@ pub fn find_best_16x16_transform(
     }
 
     // Estimate the 2 candidate DCT16X8 (vertical pair) and 2 candidate DCT8X16
-    // (horizontal pair) options.
+    // (horizontal pair) options, plus the single DCT16X16 covering all 4 blocks.
     let entropy_16x8_left = mul16x8
         * estimate_entropy(
             STRATEGY_DCT16X8,
@@ -295,14 +318,38 @@ pub fn find_best_16x16_transform(
             &qf_local,
             2,
         );
+    let entropy_16x16 = mul16x16
+        * estimate_entropy(
+            STRATEGY_DCT16X16,
+            opsin,
+            bx0,
+            by0,
+            0,
+            0,
+            distance,
+            matrices,
+            &qf_local,
+            2,
+        );
 
     // Cost of choosing per-column DCT16X8 vs the 2 DCT8s in that column.
     let cost16x8 = entropy_16x8_left.min(entropy[0][0] + entropy[1][0])
         + entropy_16x8_right.min(entropy[0][1] + entropy[1][1]);
     let cost8x16 = entropy_8x16_top.min(entropy[0][0] + entropy[0][1])
         + entropy_8x16_bottom.min(entropy[1][0] + entropy[1][1]);
+    // Cost of choosing the single DCT16X16 over all four blocks.
+    let cost16x16 = entropy_16x16;
+    let total_dct8 = entropy[0][0] + entropy[0][1] + entropy[1][0] + entropy[1][1];
 
-    if cost16x8 < cost8x16 {
+    // Pick the cheapest option overall. DCT16X16 wins if it's both the best
+    // rectangular choice *and* cheaper than 4 separate DCT8s.
+    let best_rect = cost16x8.min(cost8x16);
+    if cost16x16 < best_rect
+        && cost16x16 < total_dct8
+        && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
+    {
+        ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
+    } else if cost16x8 < cost8x16 {
         // Try DCT16X8 in each column independently.
         if entropy_16x8_left < entropy[0][0] + entropy[1][0]
             && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
@@ -362,7 +409,7 @@ pub fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mut crate
 
 /// Run block selection across the whole image (raster order, 2×2 super-blocks).
 /// Blocks not covered by a multi-block transform stay as DCT8.
-pub(crate) fn fill_ac_strategy(
+pub fn fill_ac_strategy(
     opsin: &Image3F,
     distance: f32,
     matrices: &DequantMatrices,

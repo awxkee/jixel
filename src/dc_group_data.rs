@@ -31,10 +31,11 @@ use crate::image::{Image3S, ImageB, ImageSB};
 pub(crate) const STRATEGY_DCT: u8 = 0;
 pub(crate) const STRATEGY_DCT16X8: u8 = 1;
 pub(crate) const STRATEGY_DCT8X16: u8 = 2;
-pub(crate) const NUM_STRATEGIES: usize = 3;
+pub(crate) const STRATEGY_DCT16X16: u8 = 3;
+pub(crate) const NUM_STRATEGIES: usize = 4;
 
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
-pub(crate) const STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [0, 6, 7];
+pub(crate) const STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [0, 6, 7, 4];
 
 const FIRST_BLOCK_BIT: u8 = 1;
 
@@ -80,14 +81,14 @@ impl AcStrategyImage {
 
     #[inline]
     pub(crate) fn covered_blocks_x_of(strategy: u8) -> usize {
-        // {DCT: 1, DCT16X8: 1, DCT8X16: 2}
-        const LUT: [u8; NUM_STRATEGIES] = [1, 1, 2];
+        // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2}
+        const LUT: [u8; NUM_STRATEGIES] = [1, 1, 2, 2];
         LUT[strategy as usize] as usize
     }
     #[inline]
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
-        // {DCT: 1, DCT16X8: 2, DCT8X16: 1}
-        const LUT: [u8; NUM_STRATEGIES] = [1, 2, 1];
+        // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2}
+        const LUT: [u8; NUM_STRATEGIES] = [1, 2, 1, 2];
         LUT[strategy as usize] as usize
     }
 
