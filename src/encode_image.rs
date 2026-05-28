@@ -26,13 +26,13 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::EncodeError;
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_u8};
-use crate::color_encoding::{ColorEncoding, write_color_encoding_with_icc};
+use crate::color_encoding::write_color_encoding_with_icc;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, forward_ycocg};
 use crate::image::{Image3F, Image3Si};
+use crate::{ColorEncoding, EncodeError};
 
 /// 8-bit alpha plane (row-major, stride = `xsize`).
 #[derive(Debug, Clone)]
@@ -132,15 +132,20 @@ pub struct EncodeConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EncodeConfigImpl {
-    pub distance: f32,
-    pub color_encoding: ColorEncoding,
-    pub icc_profile: Option<Vec<u8>>,
-    pub alpha: Option<AlphaPlane>,
+    pub(crate) distance: f32,
+    pub(crate) color_encoding: ColorEncoding,
+    pub(crate) icc_profile: Option<Vec<u8>>,
+    pub(crate) alpha: Option<AlphaPlane>,
     /// Bit depth declared in the codestream (default: 8).
-    pub bits_per_sample: BitsPerSample,
+    pub(crate) bits_per_sample: BitsPerSample,
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
-    pub lossless: bool,
+    pub(crate) lossless: bool,
+    /// If true, the image is grayscale: the codestream declares a Gray color
+    /// space so the decoder emits a single-channel (L / LA) image. Internally
+    /// the data still flows through the XYB pipeline with R=G=B, so the X and B
+    /// chroma channels are ~constant and cost almost nothing.
+    pub(crate) grayscale: bool,
 }
 
 impl Default for EncodeConfig {
@@ -163,6 +168,7 @@ impl Default for EncodeConfigImpl {
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
+            grayscale: false,
         }
     }
 }
@@ -197,6 +203,12 @@ impl EncodeConfigImpl {
 
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
+        self
+    }
+
+    /// Mark the image as grayscale (declares a Gray color space).
+    pub fn with_grayscale(mut self, grayscale: bool) -> Self {
+        self.grayscale = grayscale;
         self
     }
 
@@ -420,6 +432,138 @@ pub fn encode_image_12bit(
     encode_high_depth_rgba(input, width, height, false, config, BitsPerSample::Twelve)
 }
 
+/// Encode an 8-bit grayscale image. `input` is `width * height` luma bytes.
+/// The codestream declares a Gray color space, so the decoder emits a
+/// single-channel (L) image. Internally the luma is run through the XYB
+/// pipeline with R=G=B; the chroma channels are ~constant and cost almost
+/// nothing.
+pub fn encode_image_gray(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_gray_impl(input, None, width, height, config)
+}
+
+pub fn encode_image_gray_alpha(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if input.len() != width * height * 2 {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height * 2,
+            actual: input.len(),
+        });
+    }
+    let (luma, alpha): (Vec<u8>, Vec<u8>) = input
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| (px[0], px[1]))
+        .unzip();
+    encode_gray_impl(&luma, Some(alpha), width, height, config)
+}
+
+/// Shared grayscale encode path. `luma` is `width * height` bytes; `alpha`, if
+/// present, is the same length.
+fn encode_gray_impl(
+    luma: &[u8],
+    alpha: Option<Vec<u8>>,
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+    if luma.len() != width * height {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height,
+            actual: luma.len(),
+        });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
+    if config.lossless {
+        // Lossless grayscale: route through the modular path as an RGB triplet
+        // (R=G=B). The Gray color space still makes the decoder emit L/LA.
+        let nchan = if alpha.is_some() { 4 } else { 3 };
+        let mut interleaved = vec![0u8; width * height * nchan];
+        match alpha.as_ref() {
+            None => {
+                // 3-channel: interleaved = [R, G, B] = [v, v, v]
+                for (out, &v) in interleaved
+                    .as_chunks_mut::<3>()
+                    .0
+                    .iter_mut()
+                    .zip(luma.iter())
+                {
+                    out[0] = v;
+                    out[1] = v;
+                    out[2] = v;
+                }
+            }
+            Some(a) => {
+                // 4-channel: interleaved = [R, G, B, A] = [v, v, v, a]
+                for (out, (&v, &av)) in interleaved
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(luma.iter().zip(a.iter()))
+                {
+                    out[0] = v;
+                    out[1] = v;
+                    out[2] = v;
+                    out[3] = av;
+                }
+            }
+        }
+        return encode_with_config_loseless(
+            &interleaved,
+            width,
+            height,
+            alpha.is_some(),
+            8,
+            &EncodeConfigImpl::with_distance(config.distance)
+                .with_lossless(true)
+                .with_grayscale(true)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        );
+    }
+    let distance = config.distance.max(MIN_DISTANCE);
+    let mut linear = Image3F::new(width, height);
+    for (y, row) in luma.chunks_exact(width).enumerate() {
+        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+        for (((r, g), b), &v) in r_row
+            .iter_mut()
+            .zip(g_row.iter_mut())
+            .zip(b_row.iter_mut())
+            .zip(row.iter())
+        {
+            let lin = srgb_to_linear_u8(v);
+            *r = lin;
+            *g = lin;
+            *b = lin;
+        }
+    }
+    let mut cfg = EncodeConfigImpl::with_distance(distance)
+        .with_grayscale(true)
+        .with_icc_profile(config.icc_profile.clone())
+        .with_color_encoding(config.color_encoding);
+    if let Some(a) = alpha {
+        cfg = cfg.with_alpha(AlphaPlane::from_u8(a));
+    }
+    encode_with_config(&linear, &cfg)
+}
+
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
 fn encode_high_depth_rgba(
     input: &[u16],
@@ -555,6 +699,7 @@ pub(crate) fn encode_with_config(
         config.icc_profile.as_deref(),
         config.bits_per_sample,
         config.lossless,
+        config.grayscale,
         &mut w,
     );
     encode_frame(distance, input, config.alpha.as_ref(), &mut w);
@@ -701,6 +846,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.icc_profile.as_deref(),
         config.bits_per_sample,
         config.lossless,
+        config.grayscale,
         &mut w,
     );
     encode_frame_lossless(&image3s, alpha_plane.as_ref(), &mut w);
@@ -738,6 +884,7 @@ fn write_image_metadata(
     icc_profile: Option<&[u8]>,
     bps: BitsPerSample,
     lossless: bool,
+    grayscale: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
@@ -786,7 +933,7 @@ fn write_image_metadata(
     // carries un-transformed pixel values (xyb_encoded = 0).
     w.write(1, if lossless { 0 } else { 1 }); // xyb_encoded
     let want_icc = icc_profile.is_some();
-    write_color_encoding_with_icc(color_encoding, want_icc, w);
+    write_color_encoding_with_icc(color_encoding, want_icc, grayscale, w);
     // tone_mapping is conditional on extra_fields (which we set to 0), so it's absent.
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for

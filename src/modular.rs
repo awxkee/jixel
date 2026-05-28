@@ -29,15 +29,11 @@
 use crate::bit_writer::BitWriter;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
-    EntropyCode, OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
+    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
     write_prefix_codes, write_token,
 };
-use crate::static_entropy_codes::{K_CONTEXT_TREE_TOKENS, K_DC_CONTEXT_MAP, K_DC_PREFIX_CODES};
 
-// ---------------------------------------------------------------------------
-// MA tree token contexts (mirrors libjxl ma_common.h).
-// ---------------------------------------------------------------------------
-
+const TREE_CTX_SPLITVAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;
 const TREE_CTX_PREDICTOR: u32 = 2;
 const TREE_CTX_OFFSET: u32 = 3;
@@ -62,7 +58,7 @@ const GROUP_DIM: usize = 256;
 /// * **Large images**: writes only the 4-bit GroupHeader
 ///   (`use_global_tree=1`).  Per-AC-group pixel tokens are written later by
 ///   [`write_ac_group_alpha`].
-pub fn write_lfglobal_alpha_section(
+pub(crate) fn write_lfglobal_alpha_section(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
@@ -89,7 +85,7 @@ pub fn write_lfglobal_alpha_section(
 /// continue to compile without changes.  Delegates to
 /// [`write_lfglobal_alpha_section`].
 #[inline]
-pub fn write_global_alpha_modular(
+pub(crate) fn write_global_alpha_modular(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
@@ -98,22 +94,7 @@ pub fn write_global_alpha_modular(
     write_lfglobal_alpha_section(alpha, xsize, ysize, w);
 }
 
-/// Write the per-AC-group modular subbitstream for the alpha channel.
-///
-/// `alpha`      – full alpha plane (row-major, `full_xsize * full_ysize` bytes).
-/// `full_xsize` – total image width (same stride as `alpha`).
-/// `full_ysize` – total image height.
-/// `x0`, `y0`  – top-left of this AC group in the full image.
-/// `gw`, `gh`  – width and height of this AC group (clamped at image edges).
-/// `group_id`  – absolute AC group index (y_group * xsize_groups + x_group).
-/// `num_lf_groups` – number of DC/LF groups (= xsize_dc_groups * ysize_dc_groups).
-/// `num_groups`    – total number of AC groups (= xsize_groups * ysize_groups).
-///
-/// The JXL decoder passes the modular stream ID as `group_id` in the property
-/// vector used to traverse the MA tree.  For a pass-0 AC group the formula is:
-///   stream_id = 1 + num_lf_groups * 3 + 17 + num_groups * 0 + group_index
-///   (17 = NUM_QUANT_TABLES in libjxl)
-pub fn write_ac_group_alpha(
+pub(crate) fn write_ac_group_alpha(
     alpha: &AlphaPlane,
     full_xsize: usize,
     full_ysize: usize,
@@ -121,42 +102,25 @@ pub fn write_ac_group_alpha(
     y0: usize,
     gw: usize,
     gh: usize,
-    group_index: usize, // 0-based AC group index
-    num_lf_groups: usize,
-    _num_groups: usize,
     w: &mut BitWriter,
 ) {
-    // Small-image path: nothing to write per group.
+    // Small-image path: alpha lives entirely in LfGlobal; nothing per group.
     if full_xsize <= GROUP_DIM && full_ysize <= GROUP_DIM {
         return;
     }
 
-    assert_eq!(alpha.len(), full_xsize * full_ysize);
-
-    // Compute the stream_id that the decoder will use as property[1] (group_id)
-    // when traversing the MA tree.
-    const NUM_QUANT_TABLES: usize = 17;
-    let stream_id = 1 + num_lf_groups * 3 + NUM_QUANT_TABLES + group_index;
-
-    // GroupHeader: use_global_tree=1, wp_header.all_default=1, 0 transforms.
-    write_group_header_global_tree(w);
-
-    // Write pixel tokens using the GLOBAL tree (K_CONTEXT_TREE_TOKENS).
-    // context_id = the leaf_id the global tree reaches for this pixel.
-    // cluster    = K_DC_CONTEXT_MAP[context_id].
-    // The token is written with K_DC_PREFIX_CODES[cluster].
-    let dc_code = EntropyCode::new(&K_DC_CONTEXT_MAP, &K_DC_PREFIX_CODES);
-
+    // Tokenize into two contexts using the SAME split the decoder applies via a
+    // 2-leaf local tree on the raw gradient property [9] = W+N-NW at splitval 0:
+    //   grad > 0 -> leaf 0, else -> leaf 1.
+    // For a constant group every pixel predicts perfectly (residual 0) and lands
+    // in leaf 0 except the top-left corner (grad 0 -> leaf 1), so leaf 0 becomes
+    // a single-symbol code costing ~0 bits.
+    let mut tokens: Vec<Token> = Vec::with_capacity(gw * gh);
     for gy in 0..gh {
         let img_y = y0 + gy;
         for gx in 0..gw {
             let img_x = x0 + gx;
             let v = alpha.get_i32(img_y * full_xsize + img_x);
-
-            // Use SUB-IMAGE-LOCAL coordinates for neighbor lookup so we match
-            // what the decoder sees.  The decoder builds a sub-image of size
-            // gw×gh; pixel (gx=0, gy=0) has no left or top neighbor regardless
-            // of where the group sits in the full image.
             let w_ = if gx > 0 {
                 alpha.get_i32(img_y * full_xsize + img_x - 1)
             } else {
@@ -172,16 +136,91 @@ pub fn write_ac_group_alpha(
             } else {
                 0
             };
-
             let pred = gradient(w_, n_, nw_);
-            let residual = v - pred;
-
-            // Compute context_id by traversing the global tree.
-            let context_id = alpha_context_id(gx, gy, w_, n_, nw_, n_ + w_ - nw_, stream_id);
-            let tok = Token::new(context_id as u32, pack_signed(residual));
-            write_token(tok, &dc_code, w);
+            let grad_raw = w_ + n_ - nw_;
+            let ctx = if grad_raw > 0 { 0u32 } else { 1u32 };
+            tokens.push(Token::new(ctx, pack_signed(v - pred)));
         }
     }
+
+    write_group_header_local_tree(w);
+
+    // Build the tree (split node + 2 gradient leaves) and write it.
+    write_split_tree(w);
+
+    // Decide between plain and LZ77 coding of the pixel residuals. Smooth/photo
+    // alpha produces long runs of identical residuals (mostly zero) that LZ77
+    // collapses far below the 1 bit/pixel Huffman floor; constant alpha is
+    // already ~free via the single-symbol leaf, so plain usually wins there.
+    const NUM_CTX: usize = 2; // leaf 0, leaf 1
+
+    // LZ77 over the RASTER residual sequence: the decoder calls `next` exactly
+    // once per pixel and, while a copy is in progress, returns window values
+    // without reading a symbol. So a copy that starts at raster pixel i (length
+    // symbol coded on pixel i's context, distance 1 = repeat previous value)
+    // replays the previous residual for the next L pixels in raster order. We
+    // therefore collapse runs of identical packed residuals in raster order.
+    let lz_stream = lz77_compress_alpha(&tokens);
+
+    let plain_code = build_pixel_code_n(&tokens, NUM_CTX);
+    let plain_bits = estimate_plain_bits(&tokens, &plain_code);
+
+    let lz_num_ctx = NUM_CTX + 1; // + distance context
+    let lz_streams = [lz_stream];
+    let lz_code = crate::enc_lz77_ac::build_lz_code_no_cluster(&lz_streams, lz_num_ctx);
+    let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(&lz_streams, &lz_code, lz_num_ctx);
+
+    if lz_bits + 64 < plain_bits {
+        crate::enc_lz77_ac::write_ac_lz_header_and_code(&lz_code, w);
+        for t in &lz_streams[0] {
+            crate::enc_lz77_ac::write_ac_lz(*t, &lz_code, lz_num_ctx, w);
+        }
+    } else {
+        w.write(1, 0); // no LZ77 for pixel entropy code
+        write_entropy_code(&plain_code.as_ref(), w);
+        let code_ref = plain_code.as_ref();
+        for tok in &tokens {
+            write_token(*tok, &code_ref, w);
+        }
+    }
+}
+
+/// Collapse runs of identical packed residuals in RASTER order into LZ77 copies.
+/// A run of L identical values is emitted as one literal (first pixel) followed,
+/// when `L-1 >= LZ77_MIN_LENGTH`, by a copy of `L-1` covering the rest. The copy
+/// length symbol is coded on the context of the first copied pixel (the pixel
+/// right after the literal), matching how the decoder reads it.
+fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::enc_lz77_ac::AcLz> {
+    use crate::enc_lz77_ac::{AcLz, LZ77_MIN_LENGTH};
+    let mut out: Vec<AcLz> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let v = tokens[i].value;
+        // Always emit the first element of the run as a literal (on its context).
+        out.push(AcLz::Lit {
+            context: tokens[i].context,
+            value: v,
+        });
+        // Extend the run over identical *values* (context is irrelevant during a
+        // copy — the decoder ignores it while replaying window values).
+        let mut j = i + 1;
+        while j < tokens.len() && tokens[j].value == v {
+            j += 1;
+        }
+        let run_extra = (j - i - 1) as u32; // copied pixels after the literal
+        if run_extra >= LZ77_MIN_LENGTH {
+            // Copy covers pixels [i+1, j); length symbol coded on pixel (i+1)'s
+            // context, distance 1 (repeat previous value).
+            out.push(AcLz::Copy {
+                context: tokens[i + 1].context,
+                length_value: run_extra - LZ77_MIN_LENGTH,
+            });
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +270,77 @@ fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWri
     write_prefix_codes(&pixel_code.prefix_codes, w);
 }
 
+/// Like `write_tree_and_pixel_histograms` but emits a 2-leaf tree that splits on
+/// modular property 9 (the raw gradient W+N-NW) at splitval 0. Pixels with
+/// grad > 0 take leaf 0, others leaf 1; both leaves predict with Gradient. The
+/// tree is decoded breadth-first: a split node (property+1, splitval) followed
+/// by its two leaf nodes. Two pixel prefix codes follow (one per leaf), written
+/// via the context map the decoder builds from num_contexts = 2.
+/// Write the 2-leaf alpha tree: a split node on property 9 (raw gradient) at
+/// splitval 0, followed by two Gradient-predictor leaves. The pixel entropy
+/// code is written separately by the caller (so it can choose plain vs LZ77).
+fn write_split_tree(w: &mut BitWriter) {
+    // Property index 9 = raw gradient (W+N-NW) in libjxl's property order.
+    const PROP_GRAD: u32 = 9;
+    let tree_tokens = [
+        // Split node: property = PROP_GRAD (encoded as property+1), splitval 0.
+        Token::new(TREE_CTX_PROPERTY, PROP_GRAD + 1),
+        Token::new(TREE_CTX_SPLITVAL, pack_signed(0)),
+        // Leaf 0 (grad > 0): Gradient predictor, offset 0, multiplier 1.
+        Token::new(TREE_CTX_PROPERTY, 0),
+        Token::new(TREE_CTX_PREDICTOR, PREDICTOR_GRADIENT),
+        Token::new(TREE_CTX_OFFSET, pack_signed(0)),
+        Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
+        Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
+        // Leaf 1 (grad <= 0): same.
+        Token::new(TREE_CTX_PROPERTY, 0),
+        Token::new(TREE_CTX_PREDICTOR, PREDICTOR_GRADIENT),
+        Token::new(TREE_CTX_OFFSET, pack_signed(0)),
+        Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
+        Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
+    ];
+    let tree_code = optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS);
+    let tree_code_ref = tree_code.as_ref();
+
+    w.write(1, 0); // no LZ77 for tree entropy code
+    write_entropy_code(&tree_code_ref, w);
+    for tok in &tree_tokens {
+        write_token(*tok, &tree_code_ref, w);
+    }
+}
+
+/// Estimate the encoded size in bits of the plain (non-LZ) pixel token stream.
+fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
+    let code_ref = code.as_ref();
+    let mut bits: u64 = 0;
+    for t in tokens {
+        let (sym, nbits, _) = crate::entropy::uint_encode(t.value);
+        let cl = code_ref.context_map[t.context as usize] as usize;
+        let pc = &code_ref.prefix_codes[cl];
+        // Single-symbol contexts cost 0 code bits (only extra bits).
+        let d = if pc.single_symbol {
+            0
+        } else {
+            pc.depths[sym as usize] as u64
+        };
+        bits += d + nbits as u64;
+    }
+    bits
+}
+
 fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
-    let mut code = optimize_entropy_code(tokens, 1);
+    build_pixel_code_n(tokens, 1)
+}
+
+fn build_pixel_code_n(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+    let mut code = if num_contexts > 1 {
+        // Keep contexts separate — the whole point of the multi-leaf alpha tree
+        // is that the bulk-zero leaf must not be merged with the rare-corner
+        // leaf, or it loses its single-symbol (zero-bit) property.
+        crate::entropy::build_entropy_code_no_cluster(tokens, num_contexts)
+    } else {
+        optimize_entropy_code(tokens, num_contexts)
+    };
     for pc in &mut code.prefix_codes {
         // Count non-zero depths and remember the position of the only one (if any).
         let mut nonzero = 0;
@@ -280,144 +388,13 @@ fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
                 pc.bits[idx] = 1;
             }
         }
+        pc.update_single_symbol();
     }
     code
 }
 
-// ---------------------------------------------------------------------------
-// Global-tree path helpers (large images).
-// ---------------------------------------------------------------------------
-
-/// Walk K_CONTEXT_TREE_TOKENS to return the leaf_id (= context_id) that the
-/// global modular tree assigns to a pixel in the alpha channel.
-///
-/// Property layout (mirrors libjxl context_predict.h):
-///   [0] = channel_id  (0 for alpha in VarDCT mode)
-///   [1] = group_id
-///   [2] = y  (unused here — node splits only on 1, 4, 5, 6, 9 in practice)
-///   [3] = x
-///   [4] = abs(N)
-///   [5] = abs(W)
-///   [6] = N (top neighbor)
-///   [7] = W (left neighbor)
-///   [8] = W + N - NW  (raw gradient)
-///   [9] = abs(W + N - NW)  (absolute value of raw gradient)
-///
-/// All reachable leaves for channel_id=0 have predictor=Gradient, offset=0,
-/// multiplier=1; only the leaf_id (= context_id for the histogram) differs.
-fn alpha_context_id(
-    x: usize,
-    y: usize,
-    w_px: i32,
-    n_px: i32,
-    _nw_px: i32,
-    grad_raw: i32,
-    group_id: usize,
-) -> usize {
-    // Properties indexed as in libjxl context_predict.h.
-    // We only need the ones the tree actually splits on.
-    let props: [i32; 16] = [
-        0,               // [0] channel_id = 0 (alpha is the only modular channel)
-        group_id as i32, // [1] group_id
-        y as i32,        // [2] y
-        x as i32,        // [3] x
-        n_px.abs(),      // [4] abs(N)
-        w_px.abs(),      // [5] abs(W)
-        n_px,            // [6] N
-        w_px,            // [7] W
-        grad_raw,        // [8] W + N - NW  (raw gradient)
-        grad_raw.abs(),  // [9] abs(W + N - NW)
-        0,
-        0,
-        0,
-        0,
-        0,
-        0, // [10..15] reference-channel props (unused for single channel)
-    ];
-
-    // Walk the tree.  K_CONTEXT_TREE_TOKENS encodes a sequence:
-    //   property_token (ctx=1): 0 means leaf, else (prop+1)
-    //   if leaf:  predictor (ctx=2), offset (ctx=3), mul_log (ctx=4), mul_bits (ctx=5)
-    //   if split: splitval (ctx=0)  then two children pushed to to_decode.
-    //
-    // We pre-parse the tree into a flat array of TreeNode, once at first call,
-    // and then traverse.
-    static TREE: std::sync::OnceLock<Vec<TreeNode>> = std::sync::OnceLock::new();
-    let tree = TREE.get_or_init(build_global_tree);
-    traverse_tree(tree, &props)
-}
-
-#[derive(Clone)]
-enum TreeNode {
-    Leaf {
-        id: usize,
-    },
-    Split {
-        property: usize,
-        splitval: i32,
-        left: usize,
-        right: usize,
-    },
-}
-
-fn unpack_signed(u: u32) -> i32 {
-    ((u >> 1) ^ ((!u) & 1).wrapping_sub(1)) as i32
-}
-
-fn build_global_tree() -> Vec<TreeNode> {
-    let mut nodes: Vec<TreeNode> = Vec::with_capacity(89);
-    let mut to_decode = 1usize;
-    let mut idx = 0usize;
-    let mut leaf_id = 0usize;
-
-    while to_decode > 0 {
-        to_decode -= 1;
-        let (_, val) = K_CONTEXT_TREE_TOKENS[idx];
-        idx += 1;
-        if val == 0 {
-            // leaf — skip 4 more tokens (predictor, offset, mul_log, mul_bits)
-            idx += 4;
-            nodes.push(TreeNode::Leaf { id: leaf_id });
-            leaf_id += 1;
-        } else {
-            let property = (val - 1) as usize;
-            let (_, sv) = K_CONTEXT_TREE_TOKENS[idx];
-            idx += 1;
-            let splitval = unpack_signed(sv);
-            let left = nodes.len() + to_decode + 1;
-            let right = nodes.len() + to_decode + 2;
-            nodes.push(TreeNode::Split {
-                property,
-                splitval,
-                left,
-                right,
-            });
-            to_decode += 2;
-        }
-    }
-    nodes
-}
-
-fn traverse_tree(tree: &[TreeNode], props: &[i32]) -> usize {
-    let mut idx = 0;
-    loop {
-        match &tree[idx] {
-            TreeNode::Leaf { id } => return *id,
-            TreeNode::Split {
-                property,
-                splitval,
-                left,
-                right,
-            } => {
-                let v = props.get(*property).copied().unwrap_or(0);
-                idx = if v > *splitval { *left } else { *right };
-            }
-        }
-    }
-}
-
 #[inline]
-pub fn gradient(w: i32, n: i32, nw: i32) -> i32 {
+pub(crate) fn gradient(w: i32, n: i32, nw: i32) -> i32 {
     let lo = w.min(n);
     let hi = w.max(n);
     (w + n - nw).clamp(lo, hi)
@@ -506,23 +483,5 @@ mod tests {
         write_lfglobal_alpha_section(&alpha, 512, 400, &mut w);
         // Large path: only 4 bits (GroupHeader).
         assert_eq!(w.bits_written(), 4);
-    }
-
-    #[test]
-    fn global_tree_all_gradient_for_alpha() {
-        // Verify that for channel=0 (alpha), the global tree always gives
-        // predictor=Gradient. We check this by confirming alpha_context_id
-        // never panics and the leaf_id maps to a valid context.
-        for group_id in 0..30 {
-            for abs_n in [0i32, 50, 128, 200] {
-                for abs_w in [0i32, 50, 128, 200] {
-                    for grad in [-200i32, 0, 200] {
-                        let cid = alpha_context_id(1, 1, abs_w, abs_n, 0, grad, group_id);
-                        // context must be a valid leaf index (< 45)
-                        assert!(cid < 45, "context_id={cid} out of range");
-                    }
-                }
-            }
-        }
     }
 }

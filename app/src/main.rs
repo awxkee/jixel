@@ -33,13 +33,13 @@ fn main() {
     //     println!("Encoded in {}ms", instant.elapsed().as_millis());
     // }
     // let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
-    let bytes = jixel::encode_image(
-        &rgb_img,
+    let bytes = jixel::encode_image_with_alpha(
+        &rgba_img,
         image.width() as usize,
         image.height() as usize,
         &EncodeConfig::default()
             .with_lossless(false)
-            .with_quality(90.)
+            .with_quality(99.)
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();

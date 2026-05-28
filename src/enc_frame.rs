@@ -199,6 +199,7 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
 /// before committing the bit pattern.
 fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
     let mut tokens = Vec::new();
+
     for c in [1usize, 0, 2] {
         let plane = dc_data.quant_dc.plane(c);
         let ysize = plane.ysize();
@@ -566,6 +567,7 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
             sections[0].append(s);
         }
     }
+
     let sizes: Vec<usize> = sections
         .iter()
         .map(|s| s.bits_written().div_ceil(8))
@@ -643,6 +645,8 @@ pub(crate) fn encode_frame(
     );
     let plain_bits =
         crate::enc_lz77_ac::estimate_ac_plain_bits(&all_ac_tokens, &ac_plain_code_owned);
+    // Require a real margin to cover the LZ77 header + distance-context cost.
+
     let use_lz77 = lz_bits + 512 < plain_bits;
 
     // Phase 4: write DC global with adaptive DC code.
@@ -695,6 +699,9 @@ pub(crate) fn encode_frame(
         &mut sections[1 + dim.num_dc_groups],
     );
 
+    // Phase 7: write each AC group section. With LZ77 we emit the compressed
+    // stream; without it, the raw tokens via the plain code. Modular alpha (if
+    // any) is written after the AC tokens in the same section.
     for (i, pg) in all_pending.iter().enumerate() {
         let w = &mut sections[pg.section_idx];
         if use_lz77 {
@@ -717,7 +724,7 @@ pub(crate) fn encode_frame(
                 let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
                 let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
                 let abs_group_id = image_gy * dim.xsize_groups + image_gx;
-                let ac_group_idx = 2 + dim.num_dc_groups + image_gy * dim.xsize_groups + image_gx;
+                let ac_group_idx = 2 + dim.num_dc_groups + abs_group_id;
                 crate::modular::write_ac_group_alpha(
                     alpha_plane,
                     dim.xsize,
@@ -726,9 +733,6 @@ pub(crate) fn encode_frame(
                     group_y0,
                     group_xsize,
                     group_ysize,
-                    abs_group_id,
-                    dim.num_dc_groups,
-                    dim.num_groups,
                     &mut sections[ac_group_idx],
                 );
             }
