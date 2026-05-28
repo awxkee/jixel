@@ -379,6 +379,50 @@ pub(crate) fn dc_from_dct8x16(coeffs: &[f32; 128], dc: &mut [f32; 2]) {
     dc[1] = s0 - s1;
 }
 
+pub(crate) fn dct16x16(input: &[f32; 256], output: &mut [f32; 256]) {
+    let mut after_col_dct = [0.0f32; 256];
+    let mut col = [0.0f32; 16];
+    for u in 0..16 {
+        for i in 0..16 {
+            col[i] = input[i * 16 + u];
+        }
+        dct1d_16(&mut col);
+        for v in 0..16 {
+            after_col_dct[v * 16 + u] = col[v];
+        }
+    }
+
+    let scale = 1.0 / 256.0;
+    for v in 0..16 {
+        let row = &mut after_col_dct[v * 16..v * 16 + 16];
+        dct1d_16(row.try_into().unwrap());
+        for u in 0..16 {
+            output[u * 16 + v] = row[u] * scale;
+        }
+    }
+}
+
+pub(crate) fn dc_from_dct16x16(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
+    // Scale the 2×2 LF patch by the outer product of the resample scales.
+    let s00 = coeffs[0] * RESAMPLE_SCALE_16_TO_2[0] * RESAMPLE_SCALE_16_TO_2[0];
+    let s01 = coeffs[1] * RESAMPLE_SCALE_16_TO_2[0] * RESAMPLE_SCALE_16_TO_2[1];
+    let s10 = coeffs[16] * RESAMPLE_SCALE_16_TO_2[1] * RESAMPLE_SCALE_16_TO_2[0];
+    let s11 = coeffs[17] * RESAMPLE_SCALE_16_TO_2[1] * RESAMPLE_SCALE_16_TO_2[1];
+    // 2-D 2-point IDCT.
+    //   TL = s00 + s01 + s10 + s11
+    //   TR = s00 + s01 - s10 - s11
+    //   BL = s00 - s01 + s10 - s11
+    //   BR = s00 - s01 - s10 + s11
+    let r00 = s00 + s01;
+    let r01 = s00 - s01;
+    let r10 = s10 + s11;
+    let r11 = s10 - s11;
+    dc[0] = r00 + r10; // top-left
+    dc[1] = r00 - r10; // top-right
+    dc[2] = r01 + r11; // bottom-left
+    dc[3] = r01 - r11; // bottom-right
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

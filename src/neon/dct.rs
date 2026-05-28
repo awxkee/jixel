@@ -413,8 +413,6 @@ mod neon_dct_tests {
         buf
     }
 
-    // ── dct8x8 ────────────────────────────────────────────────────────────────
-
     #[test]
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     fn test_dct8x8_neon_vs_scalar_random() {

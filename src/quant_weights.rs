@@ -646,6 +646,103 @@ pub(crate) struct DequantMatrices {
     /// 128 floats per channel (libjxl-tiny convention).
     pub(crate) matrix_16x8: [[f32; 128]; 3],
     pub(crate) inv_matrix_16x8: [[f32; 128]; 3],
+    /// 16×16 dequant matrix (256 floats per channel). Generated at
+    /// construction time from the libjxl polynomial parameters since it isn't
+    /// part of libjxl-tiny.
+    pub(crate) matrix_16x16: [[f32; 256]; 3],
+    pub(crate) inv_matrix_16x16: [[f32; 256]; 3],
+}
+
+/// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
+/// bands per channel. Channel order is X, Y, B (jixel convention). Source:
+/// libjxl `lib/jxl/quant_weights.cc`. The first value of each row is the
+/// inverse step size at the DC (radius 0) position; subsequent values are
+/// multiplicative deltas between successive bands. Same format as
+/// jxl-rs `dct16x16()`.
+const DCT16X16_BANDS: [[f32; 7]; 3] = [
+    // X
+    [
+        8996.872_571_181_412,
+        -1.300_077_739_335_380_4,
+        -0.494_245_298_245_712_25,
+        -0.439_093_774_457_103_44,
+        -0.635_010_183_269_574_4,
+        -0.901_772_640_508_276_1,
+        -1.616_209_923_988_741_4,
+    ],
+    // Y
+    [
+        3191.483_662_968_442_3,
+        -0.674_245_821_041_943_55,
+        -0.807_458_134_284_710,
+        -0.449_258_374_848_434_4,
+        -0.358_654_409_810_334_03,
+        -0.313_223_891_118_773_05,
+        -0.376_150_253_157_254_83,
+    ],
+    // B
+    [
+        1157.504_081_454_872,
+        -2.053_142_316_580_441_4,
+        -1.4,
+        -0.506_871_300_333_784,
+        -0.427_087_306_247_339_04,
+        -1.485_683_453_929_624_4,
+        -4.920_914_288_440_160,
+    ],
+];
+
+/// libjxl band-step multiplicative helper. Positive → 1+v, negative → 1/(1-v).
+/// Matches `jxl::DequantMatricesLibrary::Mult` and jxl-rs `mult`.
+#[inline]
+fn band_mult(v: f32) -> f32 {
+    if v > 0.0 { 1.0 + v } else { 1.0 / (1.0 - v) }
+}
+
+/// libjxl interpolation between band weights. The two surrounding band values
+/// `a`, `b` are interpolated geometrically (exponential) using the fractional
+/// scaled distance.
+#[inline]
+fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32; 7]) -> f32 {
+    let idx_f = scaled_pos.floor();
+    let frac = scaled_pos - idx_f;
+    let idx = idx_f as usize;
+    let a = bands[idx];
+    let b = bands[idx + 1];
+    (b / a).powf(frac) * a
+}
+
+/// Reproduce libjxl `get_quant_weights(16, 16, params, out)` for the DCT16X16
+/// matrix: for each pixel position (y, x) within a 16×16 block, look up the
+/// quant weight along the radial scaled distance into the 7 polynomial bands.
+/// Returns the inverse weights (so caller's matrix entry = 1/band-interp,
+/// matching the layout of `DEQUANT_MATRIX_8X8` etc).
+fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
+    const NUM_BANDS: usize = 7;
+    let mut out = [[0.0f32; 256]; 3];
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT16X16_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT16X16_BANDS[c][i]);
+        }
+        // libjxl: `scale = (num_bands - 1) / (sqrt(2) + 1e-6)` — the (15,15)
+        // corner radial distance scales to (num_bands - 1).
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 15.0;
+        for y in 0..16 {
+            let dy = y as f32 * rcp;
+            let dy2 = dy * dy;
+            for x in 0..16 {
+                let dx = x as f32 * rcp;
+                let dist = (dx * dx + dy2).sqrt();
+                let weight = interpolate_vec_bands(dist, &bands);
+                // libjxl stores 1/weight as the matrix entry (step size).
+                out[c][y * 16 + x] = 1.0 / weight;
+            }
+        }
+    }
+    out
 }
 
 impl DequantMatrices {
@@ -661,15 +758,22 @@ impl DequantMatrices {
         let matrix_16x8 = DEQUANT_MATRIX_16X8;
         let mut inv_16x8 = [[0.0f32; 128]; 3];
         for c in 0..3 {
-            // DC slot (position 0) is the only LLF position whose dequant
-            // value the AC quantizer should never use — DC for multi-block
-            // transforms is extracted via DCFromLowestFrequencies and stored
-            // in the DC plane. Position 8 (for DCT16X8) and position 1 (for
-            // DCT8X16) are the OTHER LF position; we leave them populated
-            // since the decoder will overwrite them anyway via
-            // LowestFrequenciesFromDC.
             for k in 1..128 {
                 inv_16x8[c][k] = 1.0 / matrix_16x8[c][k];
+            }
+        }
+
+        let matrix_16x16 = compute_dct16x16_matrix();
+        let mut inv_16x16 = [[0.0f32; 256]; 3];
+        for c in 0..3 {
+            // Same convention as inv_matrix and inv_matrix_16x8: DC slot
+            // (index 0) is zeroed (handled by DC plane / LF-from-DC). For
+            // 16×16 the LLF region is 2×2: positions {0, 1, 16, 17}. We
+            // leave non-DC LF positions populated because the decoder
+            // will overwrite them via LowestFrequenciesFromDC anyway, just
+            // like for 16×8 / 8×16.
+            for k in 1..256 {
+                inv_16x16[c][k] = 1.0 / matrix_16x16[c][k];
             }
         }
 
@@ -678,6 +782,8 @@ impl DequantMatrices {
             inv_matrix: inv,
             matrix_16x8,
             inv_matrix_16x8: inv_16x8,
+            matrix_16x16,
+            inv_matrix_16x16: inv_16x16,
         }
     }
 
@@ -700,10 +806,75 @@ impl DequantMatrices {
     pub(crate) fn inv_matrix_16x8(&self, c: usize) -> &[f32; 128] {
         &self.inv_matrix_16x8[c]
     }
+
+    #[inline]
+    pub(crate) fn matrix_16x16(&self, c: usize) -> &[f32; 256] {
+        &self.matrix_16x16[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_16x16(&self, c: usize) -> &[f32; 256] {
+        &self.inv_matrix_16x16[c]
+    }
 }
 
 impl Default for DequantMatrices {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod test_16x16 {
+    use super::*;
+    #[test]
+    fn dct16x16_matrix_dc_matches_libjxl_polynomial() {
+        let m = DequantMatrices::new();
+        // bands[0] = 8996.87 for X → 1/bands[0] ≈ 1.112e-4 at radial position 0
+        let x_dc = m.matrix_16x16(0)[0];
+        assert!(
+            (x_dc - 1.0 / 8996.872_57).abs() < 1e-7,
+            "X[0,0]={}, expected ~{}",
+            x_dc,
+            1.0 / 8996.872_57
+        );
+        // bands[0] = 3191.48 for Y → 1/bands[0] ≈ 3.133e-4
+        let y_dc = m.matrix_16x16(1)[0];
+        assert!(
+            (y_dc - 1.0 / 3191.483_66).abs() < 1e-7,
+            "Y[0,0]={}, expected ~{}",
+            y_dc,
+            1.0 / 3191.483_66
+        );
+        // bands[0] = 1157.50 for B → 1/bands[0] ≈ 8.64e-4
+        let b_dc = m.matrix_16x16(2)[0];
+        assert!(
+            (b_dc - 1.0 / 1157.504_08).abs() < 1e-7,
+            "B[0,0]={}, expected ~{}",
+            b_dc,
+            1.0 / 1157.504_08
+        );
+        // Compare highest-frequency corner with reference (computed by hand /
+        // jxl-rs golden): the actual values aren't pub(crate)lished as a static
+        // table, but they should all be positive and increase along the
+        // radial direction.
+        for c in 0..3 {
+            let m_c = m.matrix_16x16(c);
+            for k in 0..256 {
+                assert!(
+                    m_c[k] > 0.0,
+                    "matrix[{},{}] = {} not positive",
+                    c,
+                    k,
+                    m_c[k]
+                );
+            }
+            assert!(
+                m_c[255] > m_c[0],
+                "matrix[{}] HF should exceed DC: {} <= {}",
+                c,
+                m_c[255],
+                m_c[0]
+            );
+        }
     }
 }
