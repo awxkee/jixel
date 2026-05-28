@@ -1,5 +1,5 @@
 [workspace]
-members = ["app"]
+members = ["app", "stats"]
 
 [package]
 name = "jixel"
