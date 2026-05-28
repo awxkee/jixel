@@ -235,24 +235,8 @@ pub fn fill_quant_field(
     // Accumulator for the current group of 4 rows, width region_px_w.
     let mut row_acc = vec![0.0f32; region_px_w];
 
-    let clampx = |x: isize| -> usize {
-        if x < 0 {
-            0
-        } else if (x as usize) >= img_xsize {
-            img_xsize - 1
-        } else {
-            x as usize
-        }
-    };
-    let clampy = |y: isize| -> usize {
-        if y < 0 {
-            0
-        } else if (y as usize) >= img_ysize {
-            img_ysize - 1
-        } else {
-            y as usize
-        }
-    };
+    let clampx = |x: isize| -> usize { x.max(0).min(img_xsize as isize - 1) as usize };
+    let clampy = |y: isize| -> usize { y.max(0).min(img_ysize as isize - 1) as usize };
 
     for ry in 0..region_px_h {
         let gy = y0 + ry;

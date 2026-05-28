@@ -47,6 +47,7 @@ mod enc_color_correlation;
 mod enc_frame;
 mod enc_group;
 mod enc_lossless;
+mod enc_lz77_ac;
 mod enc_xyb;
 mod encode_image;
 mod entropy;
