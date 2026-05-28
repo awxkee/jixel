@@ -5,16 +5,9 @@ edition = "2024"
 
 [dependencies]
 jixel = { path = ".." }
-
-# Pure-Rust chart rendering. ab_glyph + the embedded font means no system-font
-# dependency (renders headless / in CI). Avoids font-kit (needs newer rustc).
 plotters = { version = "0.3", default-features = false, features = [
     "bitmap_backend", "bitmap_encoder", "ab_glyph", "line_series", "point_series",
 ] }
 ssimulacra2 = "0.5.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-
 anyhow = "1"
-
-[profile.release]
-opt-level = 3

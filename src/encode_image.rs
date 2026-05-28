@@ -564,6 +564,181 @@ fn encode_gray_impl(
     encode_with_config(&linear, &cfg)
 }
 
+/// Encode a 10-bit grayscale image. `input` is `width * height` luma samples (0..=1023).
+pub fn encode_image_gray_10bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_gray_high_depth_impl(input, None, width, height, config, BitsPerSample::Ten)
+}
+
+/// Encode a 12-bit grayscale image. `input` is `width * height` luma samples (0..=4095).
+pub fn encode_image_gray_12bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_gray_high_depth_impl(input, None, width, height, config, BitsPerSample::Twelve)
+}
+
+/// Encode a 10-bit grayscale+alpha image. `input` is interleaved `[L, A]` pairs,
+/// `width * height * 2` samples total, each in 0..=1023.
+pub fn encode_image_gray_alpha_10bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if input.len() != width * height * 2 {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height * 2,
+            actual: input.len(),
+        });
+    }
+    let (luma, alpha): (Vec<u16>, Vec<u16>) = input
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| (px[0], px[1]))
+        .unzip();
+    encode_gray_high_depth_impl(&luma, Some(alpha), width, height, config, BitsPerSample::Ten)
+}
+
+/// Encode a 12-bit grayscale+alpha image. `input` is interleaved `[L, A]` pairs,
+/// `width * height * 2` samples total, each in 0..=4095.
+pub fn encode_image_gray_alpha_12bit(
+    input: &[u16],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if input.len() != width * height * 2 {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height * 2,
+            actual: input.len(),
+        });
+    }
+    let (luma, alpha): (Vec<u16>, Vec<u16>) = input
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| (px[0], px[1]))
+        .unzip();
+    encode_gray_high_depth_impl(&luma, Some(alpha), width, height, config, BitsPerSample::Twelve)
+}
+
+/// Shared high-bit-depth grayscale encode path.
+/// `luma` is `width * height` samples; `alpha`, if present, is the same length.
+fn encode_gray_high_depth_impl(
+    luma: &[u16],
+    alpha: Option<Vec<u16>>,
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    bps: BitsPerSample,
+) -> Result<Vec<u8>, EncodeError> {
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+    if luma.len() != width * height {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height,
+            actual: luma.len(),
+        });
+    }
+    if !config.distance.is_finite() || config.distance <= 0.0 {
+        return Err(EncodeError::InvalidDistance(config.distance));
+    }
+
+    if config.lossless {
+        // Re-interleave as [L, L, L] or [L, L, L, A] so the existing
+        // lossless RGB path can handle it.
+        let nchan = if alpha.is_some() { 4 } else { 3 };
+        let mut interleaved = vec![0u16; width * height * nchan];
+        match alpha.as_ref() {
+            None => {
+                for (out, &v) in interleaved
+                    .as_chunks_mut::<3>()
+                    .0
+                    .iter_mut()
+                    .zip(luma.iter())
+                {
+                    out[0] = v;
+                    out[1] = v;
+                    out[2] = v;
+                }
+            }
+            Some(a) => {
+                for (out, (&v, &av)) in interleaved
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(luma.iter().zip(a.iter()))
+                {
+                    out[0] = v;
+                    out[1] = v;
+                    out[2] = v;
+                    out[3] = av;
+                }
+            }
+        }
+        return encode_with_config_loseless(
+            &interleaved,
+            width,
+            height,
+            alpha.is_some(),
+            bps.bits() as u8,
+            &EncodeConfigImpl::with_distance(config.distance)
+                .with_lossless(true)
+                .with_grayscale(true)
+                .with_bits_per_sample(bps)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        );
+    }
+
+    let distance = config.distance.max(MIN_DISTANCE);
+    let lut = &lut_high_bit(bps.bits() as u8).table;
+    let mut linear = Image3F::new(width, height);
+
+    for (y, row) in luma.chunks_exact(width).enumerate() {
+        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+        for (((r, g), b), &v) in r_row
+            .iter_mut()
+            .zip(g_row.iter_mut())
+            .zip(b_row.iter_mut())
+            .zip(row.iter())
+        {
+            let lin = lut[v as usize];
+            *r = lin;
+            *g = lin;
+            *b = lin;
+        }
+    }
+
+    let alpha_plane = alpha.map(|a| match bps {
+        BitsPerSample::Ten => AlphaPlane::from_u16_10bit(a),
+        BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(a),
+        BitsPerSample::Eight => unreachable!("high-depth gray path called with 8-bit bps"),
+    });
+
+    let mut cfg = EncodeConfigImpl::with_distance(distance)
+        .with_grayscale(true)
+        .with_bits_per_sample(bps)
+        .with_icc_profile(config.icc_profile.clone())
+        .with_color_encoding(config.color_encoding);
+    if let Some(ap) = alpha_plane {
+        cfg = cfg.with_alpha(ap);
+    }
+    encode_with_config(&linear, &cfg)
+}
+
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
 fn encode_high_depth_rgba(
     input: &[u16],
