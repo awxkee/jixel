@@ -405,8 +405,22 @@ pub(crate) fn write_ac_group(
             let b_factor = crate::enc_color_correlation::y_to_b_ratio(cmap_b);
 
             // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
-            // (Y has already been quant-roundtripped, so coeffs[1] reflects what the
-            // decoder will use to reverse the CfL.)
+            // The decoder reverses CfL in coefficient space (DequantLane) using the
+            // dequantized Y AC coefficients, whose cx*cy LLF positions are zero at
+            // that point — they are filled from the DC plane (LowestFrequenciesFromDC)
+            // only afterwards. So the encoder must subtract using a Y whose LLF
+            // positions are likewise zero; otherwise the AC-quantized LLF energy of Y
+            // gets folded into the B/X DC (via the DCFromLowestFrequencies extraction
+            // below) with no decoder-side counterpart, corrupting chroma by up to a
+            // full-scale per-block shift (worst on B, where b_factor ≈ 1).
+            {
+                let wc = cx * 8;
+                for iy in 0..cy {
+                    for ix in 0..cx {
+                        coeffs[1][iy * wc + ix] = 0.0;
+                    }
+                }
+            }
             for k in 0..size {
                 coeffs[0][k] -= x_factor * coeffs[1][k];
                 coeffs[2][k] -= b_factor * coeffs[1][k];

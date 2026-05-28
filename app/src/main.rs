@@ -15,7 +15,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/qqq2.jpg")).unwrap();
+    let image = image::open(Path::new("./assets/qqq1.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     let rgba_img = image.to_rgba8();
     // let src_rgb = rgb_img.as_raw();
@@ -33,8 +33,8 @@ fn main() {
     //     println!("Encoded in {}ms", instant.elapsed().as_millis());
     // }
     // let img10 = image.to_rgb16().iter().map(|x| x >> 6).collect::<Vec<_>>();
-    let bytes = jixel::encode_image_with_alpha(
-        &rgba_img,
+    let bytes = jixel::encode_image(
+        &rgb_img,
         image.width() as usize,
         image.height() as usize,
         &EncodeConfig::default()

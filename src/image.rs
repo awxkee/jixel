@@ -35,7 +35,7 @@ pub(crate) struct Plane<T> {
 }
 
 impl<T: Copy + Default> Plane<T> {
-    pub fn new(xsize: usize, ysize: usize) -> Self {
+    pub(crate) fn new(xsize: usize, ysize: usize) -> Self {
         Self {
             data: vec![T::default(); xsize * ysize],
             xsize,
@@ -43,7 +43,7 @@ impl<T: Copy + Default> Plane<T> {
         }
     }
 
-    pub fn new_fill(xsize: usize, ysize: usize, val: T) -> Self {
+    pub(crate) fn new_fill(xsize: usize, ysize: usize, val: T) -> Self {
         Self {
             data: vec![val; xsize * ysize],
             xsize,
@@ -52,22 +52,22 @@ impl<T: Copy + Default> Plane<T> {
     }
 
     #[inline]
-    pub fn xsize(&self) -> usize {
+    pub(crate) fn xsize(&self) -> usize {
         self.xsize
     }
     #[inline]
-    pub fn ysize(&self) -> usize {
+    pub(crate) fn ysize(&self) -> usize {
         self.ysize
     }
 
     #[inline]
-    pub fn row(&self, y: usize) -> &[T] {
+    pub(crate) fn row(&self, y: usize) -> &[T] {
         let w = self.xsize;
         &self.data[y * w..(y + 1) * w]
     }
 
     #[inline]
-    pub fn row_mut(&mut self, y: usize) -> &mut [T] {
+    pub(crate) fn row_mut(&mut self, y: usize) -> &mut [T] {
         let w = self.xsize;
         &mut self.data[y * w..(y + 1) * w]
     }
@@ -75,7 +75,7 @@ impl<T: Copy + Default> Plane<T> {
     /// Borrow one row immutably and a different one mutably. Useful for
     /// replicating a row to fill padding.
     #[inline]
-    pub fn two_rows_mut_safe(&mut self, y_src: usize, y_dst: usize) -> (&[T], &mut [T]) {
+    pub(crate) fn two_rows_mut_safe(&mut self, y_src: usize, y_dst: usize) -> (&[T], &mut [T]) {
         let w = self.xsize;
         debug_assert!(y_src != y_dst);
         if y_src < y_dst {
@@ -88,8 +88,8 @@ impl<T: Copy + Default> Plane<T> {
     }
 }
 
-pub type ImageB = Plane<u8>;
-pub type ImageSB = Plane<i8>;
+pub(crate) type ImageB = Plane<u8>;
+pub(crate) type ImageSB = Plane<i8>;
 
 #[derive(Clone)]
 pub(crate) struct Image3<T> {
@@ -97,7 +97,7 @@ pub(crate) struct Image3<T> {
 }
 
 impl<T: Copy + Default> Image3<T> {
-    pub fn new(xsize: usize, ysize: usize) -> Self {
+    pub(crate) fn new(xsize: usize, ysize: usize) -> Self {
         Self {
             planes: [
                 Plane::new(xsize, ysize),
@@ -108,58 +108,58 @@ impl<T: Copy + Default> Image3<T> {
     }
 
     #[inline]
-    pub fn xsize(&self) -> usize {
+    pub(crate) fn xsize(&self) -> usize {
         self.planes[0].xsize
     }
 
     #[inline]
-    pub fn ysize(&self) -> usize {
+    pub(crate) fn ysize(&self) -> usize {
         self.planes[0].ysize
     }
 
     #[inline]
-    pub fn plane(&self, c: usize) -> &Plane<T> {
+    pub(crate) fn plane(&self, c: usize) -> &Plane<T> {
         &self.planes[c]
     }
     #[inline]
-    pub fn plane_mut(&mut self, c: usize) -> &mut Plane<T> {
+    pub(crate) fn plane_mut(&mut self, c: usize) -> &mut Plane<T> {
         &mut self.planes[c]
     }
 
     #[inline]
-    pub fn plane_row(&self, c: usize, y: usize) -> &[T] {
+    pub(crate) fn plane_row(&self, c: usize, y: usize) -> &[T] {
         self.planes[c].row(y)
     }
 
     #[inline]
-    pub fn plane_row_mut(&mut self, c: usize, y: usize) -> &mut [T] {
+    pub(crate) fn plane_row_mut(&mut self, c: usize, y: usize) -> &mut [T] {
         self.planes[c].row_mut(y)
     }
 
     /// Borrow one row from each plane simultaneously (mutable).
-    pub fn all_plane_rows_mut(&mut self, y: usize) -> [&mut [T]; 3] {
+    pub(crate) fn all_plane_rows_mut(&mut self, y: usize) -> [&mut [T]; 3] {
         let [p0, p1, p2] = &mut self.planes;
         [p0.row_mut(y), p1.row_mut(y), p2.row_mut(y)]
     }
 }
 
-pub type Image3B = Image3<u8>;
-pub type Image3S = Image3<i16>;
-pub type Image3Si = Image3<i32>;
-pub type Image3F = Image3<f32>;
+pub(crate) type Image3B = Image3<u8>;
+pub(crate) type Image3S = Image3<i16>;
+pub(crate) type Image3Si = Image3<i32>;
+pub(crate) type Image3F = Image3<f32>;
 
 /// Axis-aligned rectangle within an image (coordinates in units of the image:
 /// pixels, blocks, or tiles depending on context).
 #[derive(Clone, Copy, Debug)]
-pub struct Rect {
-    pub x0: usize,
-    pub y0: usize,
-    pub xsize: usize,
-    pub ysize: usize,
+pub(crate) struct Rect {
+    pub(crate) x0: usize,
+    pub(crate) y0: usize,
+    pub(crate) xsize: usize,
+    pub(crate) ysize: usize,
 }
 
 impl Rect {
-    pub const fn new(x0: usize, y0: usize, xsize: usize, ysize: usize) -> Self {
+    pub(crate) const fn new(x0: usize, y0: usize, xsize: usize, ysize: usize) -> Self {
         Self {
             x0,
             y0,
