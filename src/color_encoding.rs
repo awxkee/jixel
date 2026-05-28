@@ -179,18 +179,27 @@ fn write_jxl_enum(value: u32, w: &mut BitWriter) {
 pub(crate) fn write_color_encoding_with_icc(
     enc: &ColorEncoding,
     want_icc: bool,
+    grayscale: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
     w.write(1, if want_icc { 1 } else { 0 }); // want_icc
-    w.write(2, ColorSpace::Rgb as u64); // color_space = RGB
+    let color_space = if grayscale {
+        ColorSpace::Gray
+    } else {
+        ColorSpace::Rgb
+    };
+    w.write(2, color_space as u64); // color_space
     if want_icc {
         // Remaining fields gated on !want_icc; they're absent from the stream.
         let _ = enc;
         return;
     }
     write_jxl_enum(enc.white_point as u32, w);
-    write_jxl_enum(enc.primaries as u32, w);
+    if !grayscale {
+        // Primaries are only present for non-gray color spaces.
+        write_jxl_enum(enc.primaries as u32, w);
+    }
     w.write(1, 0); // have_gamma = false
     write_jxl_enum(enc.transfer as u32, w);
     write_jxl_enum(enc.rendering_intent as u32, w);

@@ -40,6 +40,13 @@ use crate::bit_writer::BitWriter;
 pub fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
     let (tok, nbits, bits) = uint_encode(t.value);
     let pc = &code.prefix_codes[code.context_map[t.context as usize] as usize];
+    if pc.single_symbol {
+        // Single-symbol prefix code: the codeword is zero-length (JXL encodes
+        // such a context with no bits, and the decoder reads the symbol without
+        // consuming any). Emit only the extra-bits payload.
+        w.write(nbits as usize, bits as u64);
+        return;
+    }
     let d = pc.depths[tok as usize] as usize;
     let data = (pc.bits[tok as usize] as u64) | ((bits as u64) << d);
     w.write(d + nbits as usize, data);
@@ -74,7 +81,13 @@ pub(crate) fn build_huffman_codes(histograms: &[Histogram]) -> Vec<PrefixCode> {
         }
         let mut bits = [0u16; ALPHABET_SIZE];
         convert_bit_depths_to_symbols(&depths, &mut bits);
-        out.push(PrefixCode { depths, bits });
+        let mut pc = PrefixCode {
+            depths,
+            bits,
+            single_symbol: false,
+        };
+        pc.update_single_symbol();
+        out.push(pc);
     }
     out
 }
@@ -106,6 +119,22 @@ pub fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> OwnedEntr
     build_histograms(tokens, None, &mut histograms);
     let mut context_map: Vec<u8> = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map);
+    let prefix_codes = build_huffman_codes(&histograms);
+    OwnedEntropyCode {
+        context_map,
+        prefix_codes,
+        orig_context_map: None,
+        orig_num_contexts: num_contexts,
+    }
+}
+
+pub(crate) fn build_entropy_code_no_cluster(
+    tokens: &[Token],
+    num_contexts: usize,
+) -> OwnedEntropyCode {
+    let mut histograms = vec![Histogram::new(); num_contexts];
+    build_histograms(tokens, None, &mut histograms);
+    let context_map: Vec<u8> = (0..num_contexts as u8).collect();
     let prefix_codes = build_huffman_codes(&histograms);
     OwnedEntropyCode {
         context_map,

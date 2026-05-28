@@ -40,20 +40,6 @@ pub(crate) struct EntropyCode<'a> {
     pub(crate) orig_num_contexts: usize,
 }
 
-impl<'a> EntropyCode<'a> {
-    /// Static entropy code: no clustering was applied.
-    pub(crate) fn new(context_map: &'a [u8], prefix_codes: &'a [PrefixCode]) -> Self {
-        Self {
-            context_map,
-            num_contexts: context_map.len(),
-            prefix_codes,
-            num_prefix_codes: prefix_codes.len(),
-            orig_context_map: None,
-            orig_num_contexts: 0,
-        }
-    }
-}
-
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
 /// suitable for runtime-built codes.
 pub(crate) struct OwnedEntropyCode {

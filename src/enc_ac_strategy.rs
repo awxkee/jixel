@@ -220,16 +220,17 @@ pub fn find_best_16x16_transform(
     let k8x8_mul2 = 1.073_575_8 * 0.75;
     let mul8x8 = k8x8_mul2 + k8x8_mul1 / (distance + k8x8_base);
 
-    const K_MUL16X8_TUNING: f32 = 1.5;
+    let acs_bias = 1.0 + 0.5 * ((0.7 - distance) / 0.7).clamp(0.0, 1.0);
+    let k_mul16x8_tuning: f32 = 1.5 * acs_bias;
     let k8x16_base = 1.6;
-    let k8x16_mul1 = -0.55 * K_MUL16X8_TUNING;
-    let k8x16_mul2 = 0.901_958_8 * K_MUL16X8_TUNING;
+    let k8x16_mul1 = -0.55 * k_mul16x8_tuning;
+    let k8x16_mul2 = 0.901_958_8 * k_mul16x8_tuning;
     let mul16x8 = k8x16_mul2 + k8x16_mul1 / (distance + k8x16_base);
 
-    const K_MUL16X16_TUNING: f32 = 1.8;
+    let k_mul16x16_tuning: f32 = 1.8 * acs_bias;
     let k16x16_base = 1.6;
-    let k16x16_mul1 = -0.55 * K_MUL16X16_TUNING;
-    let k16x16_mul2 = 0.901_958_8 * K_MUL16X16_TUNING;
+    let k16x16_mul1 = -0.55 * k_mul16x16_tuning;
+    let k16x16_mul2 = 0.901_958_8 * k_mul16x16_tuning;
     let mul16x16 = k16x16_mul2 + k16x16_mul1 / (distance + k16x16_base);
 
     // Cache the QF rect over the 2x2 super-block: 2 rows × 2 cols.
@@ -409,7 +410,7 @@ pub fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mut crate
 
 /// Run block selection across the whole image (raster order, 2×2 super-blocks).
 /// Blocks not covered by a multi-block transform stay as DCT8.
-pub fn fill_ac_strategy(
+pub(crate) fn fill_ac_strategy(
     opsin: &Image3F,
     distance: f32,
     matrices: &DequantMatrices,

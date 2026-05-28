@@ -33,6 +33,7 @@ pub(crate) const ALPHABET_SIZE: usize = 128;
 pub(crate) struct PrefixCode {
     pub(crate) depths: [u8; ALPHABET_SIZE],
     pub(crate) bits: [u16; ALPHABET_SIZE],
+    pub(crate) single_symbol: bool,
 }
 
 impl PrefixCode {
@@ -40,7 +41,13 @@ impl PrefixCode {
         Self {
             depths: [0; ALPHABET_SIZE],
             bits: [0; ALPHABET_SIZE],
+            single_symbol: false,
         }
+    }
+
+    /// Recompute `single_symbol` from the current depths (one nonzero entry).
+    pub(crate) fn update_single_symbol(&mut self) {
+        self.single_symbol = self.depths.iter().filter(|&&d| d != 0).count() == 1;
     }
 }
 

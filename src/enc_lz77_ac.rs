@@ -89,6 +89,71 @@ pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
     out
 }
 
+pub(crate) fn build_lz_code_no_cluster(
+    streams: &[Vec<AcLz>],
+    num_contexts: usize,
+) -> OwnedEntropyCode {
+    let distance_context = (num_contexts - 1) as u32;
+    let mut histograms = vec![Histogram::new(); num_contexts];
+    for stream in streams {
+        for t in stream {
+            match *t {
+                AcLz::Lit { context, value } => {
+                    let (sym, _, _) = uint_encode(value);
+                    histograms[context as usize].add(sym);
+                }
+                AcLz::Copy {
+                    context,
+                    length_value,
+                } => {
+                    let (len_tok, _, _) = lz77_length_encode(length_value);
+                    histograms[context as usize].add(LZ77_MIN_SYMBOL + len_tok);
+                    histograms[distance_context as usize].add(LZ77_DIST_VALUE);
+                }
+            }
+        }
+    }
+    let context_map: Vec<u8> = (0..num_contexts as u8).collect();
+    let mut prefix_codes = build_huffman_codes(&histograms);
+
+    for pc in &mut prefix_codes {
+        let mut nonzero = 0usize;
+        let mut idx = 0usize;
+        for (i, &d) in pc.depths.iter().enumerate() {
+            if d != 0 {
+                nonzero += 1;
+                idx = i;
+                if nonzero > 1 {
+                    break;
+                }
+            }
+        }
+        if nonzero == 1 {
+            if idx == 0 {
+                pc.depths[0] = 0;
+                pc.bits[0] = 0;
+            } else {
+                pc.depths[0] = 1;
+                pc.bits[0] = 0;
+                pc.depths[idx] = 1;
+                pc.bits[idx] = 1;
+            }
+        }
+        pc.update_single_symbol();
+    }
+    OwnedEntropyCode {
+        context_map,
+        prefix_codes,
+        orig_context_map: None,
+        orig_num_contexts: num_contexts,
+    }
+}
+
+/// Build per-context histograms over the LZ-compressed stream, then cluster
+/// them (libjxl-tiny clusters to <= 8). `num_contexts` already includes the
+/// trailing distance context. Returns an `OwnedEntropyCode` whose
+/// `orig_context_map` has `num_contexts` entries (the distance context is the
+/// last), so `write_entropy_code` signals it correctly.
 pub(crate) fn build_ac_lz_code(streams: &[Vec<AcLz>], num_contexts: usize) -> OwnedEntropyCode {
     let distance_context = (num_contexts - 1) as u32;
     let mut histograms = vec![Histogram::new(); num_contexts];
@@ -139,7 +204,13 @@ pub(crate) fn estimate_ac_lz_bits(
                 AcLz::Lit { context, value } => {
                     let (sym, nbits, _) = uint_encode(value);
                     let cl = code.context_map[context as usize] as usize;
-                    bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
+                    let pc = &code.prefix_codes[cl];
+                    let d = if pc.single_symbol {
+                        0
+                    } else {
+                        pc.depths[sym as usize] as u64
+                    };
+                    bits += d + nbits as u64;
                 }
                 AcLz::Copy {
                     context,
@@ -148,10 +219,22 @@ pub(crate) fn estimate_ac_lz_bits(
                     let (len_tok, len_nbits, _) = lz77_length_encode(length_value);
                     let sym = LZ77_MIN_SYMBOL + len_tok;
                     let cl = code.context_map[context as usize] as usize;
-                    bits += code.prefix_codes[cl].depths[sym as usize] as u64 + len_nbits as u64;
+                    let pc = &code.prefix_codes[cl];
+                    let d = if pc.single_symbol {
+                        0
+                    } else {
+                        pc.depths[sym as usize] as u64
+                    };
+                    bits += d + len_nbits as u64;
                     let (dsym, dnbits, _) = uint_encode(LZ77_DIST_VALUE);
                     let dcl = code.context_map[distance_context] as usize;
-                    bits += code.prefix_codes[dcl].depths[dsym as usize] as u64 + dnbits as u64;
+                    let dpc = &code.prefix_codes[dcl];
+                    let dd = if dpc.single_symbol {
+                        0
+                    } else {
+                        dpc.depths[dsym as usize] as u64
+                    };
+                    bits += dd + dnbits as u64;
                 }
             }
         }
@@ -159,6 +242,8 @@ pub(crate) fn estimate_ac_lz_bits(
     bits
 }
 
+/// Estimate the encoded size in bits of the original (non-LZ) token stream
+/// under a plain code built over `K_NUM_AC_CONTEXTS` contexts.
 pub(crate) fn estimate_ac_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
     let mut bits: u64 = 0;
     for t in tokens {
@@ -181,9 +266,13 @@ pub(crate) fn write_ac_lz(
             let (sym, nbits, bits) = uint_encode(value);
             let cluster = code.context_map[context as usize] as usize;
             let pc = &code.prefix_codes[cluster];
-            let d = pc.depths[sym as usize] as usize;
-            let data = (pc.bits[sym as usize] as u64) | ((bits as u64) << d);
-            w.write(d + nbits as usize, data);
+            if pc.single_symbol {
+                w.write(nbits as usize, bits as u64);
+            } else {
+                let d = pc.depths[sym as usize] as usize;
+                let data = (pc.bits[sym as usize] as u64) | ((bits as u64) << d);
+                w.write(d + nbits as usize, data);
+            }
         }
         AcLz::Copy {
             context,
@@ -193,22 +282,33 @@ pub(crate) fn write_ac_lz(
             let sym = LZ77_MIN_SYMBOL + len_tok;
             let pcluster = code.context_map[context as usize] as usize;
             let pc = &code.prefix_codes[pcluster];
-            let d = pc.depths[sym as usize] as usize;
-            debug_assert!(d > 0, "LZ77 AC length symbol {} unrepresented", sym);
-            let data = (pc.bits[sym as usize] as u64) | ((len_bits as u64) << d);
-            w.write(d + len_nbits as usize, data);
+            if pc.single_symbol {
+                w.write(len_nbits as usize, len_bits as u64);
+            } else {
+                let d = pc.depths[sym as usize] as usize;
+                debug_assert!(d > 0, "LZ77 AC length symbol {} unrepresented", sym);
+                let data = (pc.bits[sym as usize] as u64) | ((len_bits as u64) << d);
+                w.write(d + len_nbits as usize, data);
+            }
 
             // Distance symbol: value LZ77_DIST_VALUE, coded on the distance ctx.
             let (dsym, dnbits, dbits) = uint_encode(LZ77_DIST_VALUE);
             let dcluster = code.context_map[distance_context] as usize;
             let dpc = &code.prefix_codes[dcluster];
-            let dd = dpc.depths[dsym as usize] as usize;
-            let ddata = (dpc.bits[dsym as usize] as u64) | ((dbits as u64) << dd);
-            w.write(dd + dnbits as usize, ddata);
+            if dpc.single_symbol {
+                w.write(dnbits as usize, dbits as u64);
+            } else {
+                let dd = dpc.depths[dsym as usize] as usize;
+                let ddata = (dpc.bits[dsym as usize] as u64) | ((dbits as u64) << dd);
+                w.write(dd + dnbits as usize, ddata);
+            }
         }
     }
 }
 
+/// Write the AC LZ77 sub-bundle header (mirrors `write_lz77_header` in the
+/// lossless path): enabled bit + min_symbol (64) + min_length (3) +
+/// length_uint_config(split=4, msb=0, lsb=0). Then the entropy code.
 pub(crate) fn write_ac_lz_header_and_code(code: &OwnedEntropyCode, w: &mut BitWriter) {
     w.write(1, 1); // lz77 enabled
     // min_symbol: U32(Val(224), Val(512), Val(4096), BitsOffset(15,8)).
