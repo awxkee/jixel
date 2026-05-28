@@ -251,6 +251,13 @@ pub fn fill_quant_field(
         let row_x1 = opsin.plane_row(0, gy1);
         let row_x2 = opsin.plane_row(0, gy2);
 
+        assert!(row_y.len() >= img_xsize);
+        assert!(row_y1.len() >= img_xsize);
+        assert!(row_y2.len() >= img_xsize);
+        assert!(row_x.len() >= img_xsize);
+        assert!(row_x1.len() >= img_xsize);
+        assert!(row_x2.len() >= img_xsize);
+
         for rx in 0..region_px_w {
             let gx = x0 + rx;
             let gx_c = clampx(gx as isize);
