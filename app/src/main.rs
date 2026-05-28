@@ -39,7 +39,7 @@ fn main() {
         image.height() as usize,
         &EncodeConfig::default()
             .with_lossless(false)
-            .with_quality(99.)
+            .with_quality(90.)
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();

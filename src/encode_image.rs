@@ -558,7 +558,6 @@ pub(crate) fn encode_with_config(
         &mut w,
     );
     encode_frame(distance, input, config.alpha.as_ref(), &mut w);
-    encode_frame(distance, input, config.alpha.as_ref(), &mut w);
     Ok(w.into_bytes())
 }
 

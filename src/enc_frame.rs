@@ -509,7 +509,12 @@ fn write_dc_global(
     }
 }
 
-fn write_ac_global(num_groups: usize, ac_code: &EntropyCode, w: &mut BitWriter) {
+fn write_ac_global(
+    num_groups: usize,
+    ac_code: &crate::entropy::OwnedEntropyCode,
+    use_lz77: bool,
+    w: &mut BitWriter,
+) {
     w.write(1, 1);
     if num_groups > 1 {
         let bits = 32
@@ -521,8 +526,15 @@ fn write_ac_global(num_groups: usize, ac_code: &EntropyCode, w: &mut BitWriter) 
     }
     w.write(2, 3);
     w.write(13, 0);
-    w.write(1, 0);
-    write_entropy_code(ac_code, w);
+    if use_lz77 {
+        // LZ77 enabled: write the sub-bundle header + the entropy code (whose
+        // context map already carries the trailing distance context).
+        crate::enc_lz77_ac::write_ac_lz_header_and_code(ac_code, w);
+    } else {
+        // No LZ77: the original plain path.
+        w.write(1, 0);
+        write_entropy_code(&ac_code.as_ref(), w);
+    }
 }
 
 fn write_toc(sizes: &[usize], w: &mut BitWriter) {
@@ -610,16 +622,28 @@ pub(crate) fn encode_frame(
     let dc_code_owned = optimize_entropy_code(&all_dc_tokens, K_NUM_DC_CONTEXTS);
     let dc_code = dc_code_owned.as_ref();
 
-    // Phase 3: build adaptive AC entropy code from all AC group tokens.
-    // K_NUM_AC_CONTEXTS = 1980 source contexts; optimize_entropy_code
-    // clusters them down to <=8 prefix codes based on actual histograms.
+    let ac_num_contexts = K_NUM_AC_CONTEXTS + 1;
+    let mut ac_lz_per_group: Vec<Vec<crate::enc_lz77_ac::AcLz>> =
+        Vec::with_capacity(all_pending.len());
+    for pg in &all_pending {
+        ac_lz_per_group.push(crate::enc_lz77_ac::lz77_compress_ac(&pg.tokens));
+    }
+    let ac_lz_code_owned = crate::enc_lz77_ac::build_ac_lz_code(&ac_lz_per_group, ac_num_contexts);
+
     let mut all_ac_tokens: Vec<Token> = Vec::new();
     for pg in &all_pending {
         all_ac_tokens.extend_from_slice(&pg.tokens);
     }
-    let ac_code_owned = optimize_entropy_code(&all_ac_tokens, K_NUM_AC_CONTEXTS);
-    let ac_code = ac_code_owned.as_ref();
-    drop(all_ac_tokens); // free memory before we re-emit
+    let ac_plain_code_owned = optimize_entropy_code(&all_ac_tokens, K_NUM_AC_CONTEXTS);
+
+    let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(
+        &ac_lz_per_group,
+        &ac_lz_code_owned,
+        ac_num_contexts,
+    );
+    let plain_bits =
+        crate::enc_lz77_ac::estimate_ac_plain_bits(&all_ac_tokens, &ac_plain_code_owned);
+    let use_lz77 = lz_bits + 512 < plain_bits;
 
     // Phase 4: write DC global with adaptive DC code.
     write_dc_global(
@@ -658,19 +682,30 @@ pub(crate) fn encode_frame(
         }
     }
 
-    // Phase 6: AC global with adaptive AC code.
+    // Phase 6: AC global with the chosen AC code (LZ77 enabled only if it won).
+    let ac_code_chosen = if use_lz77 {
+        &ac_lz_code_owned
+    } else {
+        &ac_plain_code_owned
+    };
     write_ac_global(
         dim.num_groups,
-        &ac_code,
+        ac_code_chosen,
+        use_lz77,
         &mut sections[1 + dim.num_dc_groups],
     );
 
-    // Phase 7: write each AC group section: AC tokens (adaptive code) then
-    // modular alpha if any. Alpha geometry is recomputed from `dim`.
-    for pg in &all_pending {
+    for (i, pg) in all_pending.iter().enumerate() {
         let w = &mut sections[pg.section_idx];
-        for t in &pg.tokens {
-            write_token(*t, &ac_code, w);
+        if use_lz77 {
+            for t in &ac_lz_per_group[i] {
+                crate::enc_lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, w);
+            }
+        } else {
+            let code_ref = ac_plain_code_owned.as_ref();
+            for t in &pg.tokens {
+                write_token(*t, &code_ref, w);
+            }
         }
     }
     // Modular alpha: per AC group, written after AC tokens in the same section.

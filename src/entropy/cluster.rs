@@ -69,7 +69,7 @@ pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &
         context_map.resize(histograms.len(), 0);
         return;
     }
-    const CLUSTERS_LIMIT: usize = 8;
+    const CLUSTERS_LIMIT: usize = 64;
     let max_histograms = CLUSTERS_LIMIT.min(histograms.len());
 
     let inp: Vec<Histogram> = histograms.clone();
