@@ -27,182 +27,373 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+// AC-quantization field, ported faithfully from libjxl-tiny's
+// `ComputeAdaptiveQuantFieldTile` (enc_adaptive_quantization.cc). Operates on
+// the XYB `opsin` image (NOT linear RGB). Produces the per-8x8-block integer
+// `raw_quant_field` via `clamp(round(aq_map * inv_scale), 1, 255)`, exactly as
+// libjxl-tiny does. This replaces the earlier gradient heuristic, which
+// produced values in 2..=6 (mostly the floor) and quantized ~2.6x too coarsely.
+
 use crate::image::{Image3F, ImageB};
 
-const LUMA_R: f32 = 0.299;
-const LUMA_G: f32 = 0.587;
-const LUMA_B: f32 = 0.114;
+// ---- Sigmoid-like gamma constants (butteraugli <-> opsin space) ----
+const K_SG_MUL: f32 = 226.0480446705883;
+const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
+const K_LOG2: f32 = 0.693147181;
+const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_LOG2;
+const K_SG_V_OFFSET: f32 = 7.14672470003;
+
+const K_AC_QUANT: f32 = 0.8294;
+const MATCH_GAMMA_OFFSET: f32 = 0.019;
+const K_X_MUL: f32 = 23.426802998210313;
+
+/// Ratio of derivatives of cubic-root to simple-gamma; moves quantization from
+/// jxl's opsin (cube-root-of-photons) space to butteraugli's log-gamma space.
+#[inline]
+fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
+    let k_epsilon = 1e-2f32;
+    let v = if v < 0.0 { 0.0 } else { v };
+    let k_num_mul = K_SG_RET_MUL * 3.0 * K_SG_MUL;
+    let k_v_offset = K_SG_V_OFFSET * K_LOG2 + k_epsilon;
+    let k_den_mul = K_LOG2 * K_SG_MUL;
+    let v2 = v * v;
+    let num = k_num_mul * v2 + k_epsilon;
+    let den = (k_den_mul * v) * v2 + k_v_offset;
+    if invert { num / den } else { den / num }
+}
+
+/// Visual-masking transform applied to the accumulated per-block difference.
+#[inline]
+fn compute_mask(out_val: f32) -> f32 {
+    let k_base = -0.74174993f32;
+    let k_mul4 = 3.2353257320940401f32;
+    let k_mul2 = 12.906028311180409f32;
+    let k_offset2 = 305.04035728311436f32;
+    let k_mul3 = 5.0220313103171232f32;
+    let k_offset3 = 2.1925739705298404f32;
+    let k_offset4 = 0.25f32 * k_offset3;
+    let k_mul0 = 0.74760422233706747f32;
+
+    let v1 = (out_val * k_mul0).max(1e-3);
+    let v2 = 1.0 / (v1 + k_offset2);
+    let v3 = 1.0 / (v1 * v1 + k_offset3);
+    let v4 = 1.0 / (v1 * v1 + k_offset4);
+    k_base + k_mul4 * v4 + k_mul2 * v2 + k_mul3 * v3
+}
+
+/// `0.25 * sqrt(v * sqrt(kMul*1e8) + kLogOffset)`.
+#[inline]
+fn masking_sqrt(v: f32) -> f32 {
+    let k_log_offset = 26.481471032459346f32;
+    let k_mul = 211.50759899638012f32;
+    let mul_v = k_mul * 1e8;
+    0.25 * (v * mul_v.sqrt() + k_log_offset).sqrt()
+}
+
+/// HF modulation: sum of |right| and |below| abs differences in the 8x8 Y block.
+fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
+    let mut sum = 0.0f32;
+    for dy in 0..8 {
+        let row = xyb_y.plane_row(1, y + dy);
+        let row_next = if dy == 7 {
+            row
+        } else {
+            xyb_y.plane_row(1, y + dy + 1)
+        };
+        for dx in 0..8 {
+            let p = row[x + dx];
+            // right difference, skipping the last column (matches kMaskRight)
+            if dx < 7 {
+                sum += (p - row[x + dx + 1]).abs();
+            }
+            sum += (p - row_next[x + dx]).abs();
+        }
+    }
+    sum * (-2.0052193233688884f32 / 112.0) + out_val
+}
+
+/// Color modulation: boost precision in strongly red or blue blocks.
+fn color_modulation(
+    x: usize,
+    y: usize,
+    xyb: &Image3F,
+    butteraugli_target: f32,
+    out_val: f32,
+) -> f32 {
+    let k_strength_mul = 2.177823400325309f32;
+    let k_red_ramp_start = 0.0073200141118951231f32;
+    let k_red_ramp_length = 0.019421555948474039f32;
+    let k_blue_ramp_length = 0.086890611400405895f32;
+    let k_blue_ramp_start = 0.26973418507870539f32;
+    let strength = k_strength_mul * (1.0 - 0.25 * butteraugli_target);
+    if strength < 0.0 {
+        return out_val;
+    }
+    let red_strength = strength * 5.992297772961519f32;
+    let blue_strength = strength;
+    let offset = strength * -0.009174542291185913f32;
+    let mut out_val = out_val + offset;
+
+    let mut red_coverage = 0.0f32;
+    let mut blue_coverage = 0.0f32;
+    for dy in 0..8 {
+        let row_x = xyb.plane_row(0, y + dy);
+        let row_y = xyb.plane_row(1, y + dy);
+        let row_b = xyb.plane_row(2, y + dy);
+        for dx in 0..8 {
+            let pixel_x = (row_x[x + dx] - k_red_ramp_start).max(0.0);
+            let pixel_y = row_y[x + dx];
+            let pixel_b = (row_b[x + dx] - (pixel_y + k_blue_ramp_start)).max(0.0);
+            blue_coverage += pixel_b.min(k_blue_ramp_length);
+            red_coverage += pixel_x.min(k_red_ramp_length);
+        }
+    }
+    let ratio = 30.610615782142737f32; // out of 64 pixels
+    let mut overall_red = red_coverage.min(ratio * k_red_ramp_length);
+    overall_red *= red_strength / ratio;
+    let mut overall_blue = blue_coverage.min(ratio * k_blue_ramp_length);
+    overall_blue *= blue_strength / ratio;
+
+    out_val = out_val + overall_red + overall_blue;
+    out_val
+}
+
+/// Gamma modulation: accounts for the local gamma of the 8x8 block.
+fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
+    let k_bias = 0.16f32;
+    let mut overall_ratio = 0.0f32;
+    for dy in 0..8 {
+        let row_x = xyb.plane_row(0, y + dy);
+        let row_y = xyb.plane_row(1, y + dy);
+        for dx in 0..8 {
+            let iny = row_y[x + dx] + k_bias;
+            let inx = row_x[x + dx];
+            let r = iny - inx;
+            let g = iny + inx;
+            let ratio_r = ratio_cubic_to_simple_gamma(r, true);
+            let ratio_g = ratio_cubic_to_simple_gamma(g, true);
+            overall_ratio += 0.5 * (ratio_r + ratio_g);
+        }
+    }
+    overall_ratio *= 1.0 / 64.0;
+    // ln(2) folded in: -0.15526878... * ln(2) * log2(x) == -0.15... * ln(x)
+    let k_gam = -0.15526878023684174f32 * 0.693147180559945f32;
+    k_gam * overall_ratio.log2() + out_val
+}
 
 #[inline]
-fn luma(r: f32, g: f32, b: f32) -> f32 {
-    LUMA_R * r + LUMA_G * g + LUMA_B * b
+fn store_min4(v: f32, mins: &mut [f32; 4]) {
+    if v < mins[3] {
+        if v < mins[0] {
+            mins[3] = mins[2];
+            mins[2] = mins[1];
+            mins[1] = mins[0];
+            mins[0] = v;
+        } else if v < mins[1] {
+            mins[3] = mins[2];
+            mins[2] = mins[1];
+            mins[1] = v;
+        } else if v < mins[2] {
+            mins[3] = mins[2];
+            mins[2] = v;
+        } else {
+            mins[3] = v;
+        }
+    }
 }
 
-/// Fill `raw_quant_field` with per-block quantization multipliers derived from
-/// local luma gradient magnitude in `linear`.
+/// Fill `raw_quant_field` (block-resolution) for the DC-group region whose
+/// top-left pixel is (x0, y0) in the full `opsin` (XYB) image.
 ///
-/// `(x0, y0)` is the pixel offset within `linear` corresponding to the (0, 0)
-/// block of `raw_quant_field`. Blocks that straddle the image edge are
-/// computed from whatever pixels exist.
-pub fn fill_quant_field(linear: &Image3F, raw_quant_field: &mut ImageB, x0: usize, y0: usize) {
+/// `distance` is the butteraugli target; `inv_scale = 1.0 / distance_params.scale`.
+pub fn fill_quant_field(
+    opsin: &Image3F,
+    raw_quant_field: &mut ImageB,
+    x0: usize,
+    y0: usize,
+    distance: f32,
+    inv_scale: f32,
+) {
     let xsize_blocks = raw_quant_field.xsize();
     let ysize_blocks = raw_quant_field.ysize();
-    let img_xsize = linear.xsize();
-    let img_ysize = linear.ysize();
+    let img_xsize = opsin.xsize();
+    let img_ysize = opsin.ysize();
+
+    let scale = K_AC_QUANT / distance;
+
+    // Pixel extent of this DC-group region (padded to whole blocks but clamped
+    // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
+    let region_px_w = xsize_blocks * 8;
+    let region_px_h = ysize_blocks * 8;
+
+    // ---- Stage 1: per-pixel diff, accumulated in 4-row groups, subsampled 4x.
+    // `pre` has resolution (region_px_w/4) x (region_px_h/4) == (2*xblocks) x (2*yblocks).
+    let pre_w = region_px_w / 4;
+    let pre_h = region_px_h / 4;
+    let mut pre = vec![0.0f32; pre_w * pre_h];
+
+    // Accumulator for the current group of 4 rows, width region_px_w.
+    let mut row_acc = vec![0.0f32; region_px_w];
+
+    let clampx = |x: isize| -> usize {
+        if x < 0 {
+            0
+        } else if (x as usize) >= img_xsize {
+            img_xsize - 1
+        } else {
+            x as usize
+        }
+    };
+    let clampy = |y: isize| -> usize {
+        if y < 0 {
+            0
+        } else if (y as usize) >= img_ysize {
+            img_ysize - 1
+        } else {
+            y as usize
+        }
+    };
+
+    for ry in 0..region_px_h {
+        let gy = y0 + ry;
+        // Skip work for rows entirely outside the image (replicate edge instead).
+        let gy_c = clampy(gy as isize);
+        let gy1 = clampy(gy as isize - 1);
+        let gy2 = clampy(gy as isize + 1);
+        let row_y = opsin.plane_row(1, gy_c);
+        let row_y1 = opsin.plane_row(1, gy1);
+        let row_y2 = opsin.plane_row(1, gy2);
+        let row_x = opsin.plane_row(0, gy_c);
+        let row_x1 = opsin.plane_row(0, gy1);
+        let row_x2 = opsin.plane_row(0, gy2);
+
+        for rx in 0..region_px_w {
+            let gx = x0 + rx;
+            let gx_c = clampx(gx as isize);
+            let gx1 = clampx(gx as isize - 1);
+            let gx2 = clampx(gx as isize + 1);
+
+            let in_y = row_y[gx_c];
+            let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
+            let gammac = ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
+            let mut diff = gammac * (in_y - base);
+            diff *= diff;
+
+            let in_x = row_x[gx_c];
+            let base_x = 0.25 * (row_x2[gx_c] + row_x1[gx_c] + row_x[gx1] + row_x[gx2]);
+            let mut diff_x = gammac * (in_x - base_x);
+            diff_x *= diff_x;
+            diff += K_X_MUL * diff_x;
+            diff = masking_sqrt(diff);
+
+            if (ry & 3) != 0 {
+                row_acc[rx] += diff;
+            } else {
+                row_acc[rx] = diff;
+            }
+        }
+
+        // Every 4th row, downsample the accumulated 4-row band by 4 in x.
+        if ry % 4 == 3 {
+            let out_y = ry / 4;
+            let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
+            for px in 0..pre_w {
+                prow[px] = (row_acc[px * 4]
+                    + row_acc[px * 4 + 1]
+                    + row_acc[px * 4 + 2]
+                    + row_acc[px * 4 + 3])
+                    * 0.25;
+            }
+        }
+    }
+
+    // ---- Stage 2: FuzzyErosion (3x3 weighted-min pooling) over `pre`, then
+    // downsample 2x into the block-resolution aq_map.
+    // pre is (2*xblocks) x (2*yblocks); aq_map is xblocks x yblocks.
+    let mut aq_map = vec![0.0f32; xsize_blocks * ysize_blocks];
+    let k_mul = 0.05f32; // same weight for center and all four mins
+    for fy in 0..pre_h {
+        let ym1 = if fy >= 1 { fy - 1 } else { fy };
+        let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
+        let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
+        let row = &pre[fy * pre_w..fy * pre_w + pre_w];
+        let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
+        let out_y = fy / 2;
+        for fx in 0..pre_w {
+            let xm1 = if fx >= 1 { fx - 1 } else { fx };
+            let xp1 = if fx + 1 < pre_w { fx + 1 } else { fx };
+            // First four values, sorted ascending into mins[0..4].
+            let mut mins = [row[fx], row[xm1], row[xp1], rowt[xm1]];
+            mins.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // Remaining five neighbours.
+            store_min4(rowt[fx], &mut mins);
+            store_min4(rowt[xp1], &mut mins);
+            store_min4(rowb[xm1], &mut mins);
+            store_min4(rowb[fx], &mut mins);
+            store_min4(rowb[xp1], &mut mins);
+            let v = k_mul * row[fx]
+                + k_mul * mins[0]
+                + k_mul * mins[1]
+                + k_mul * mins[2]
+                + k_mul * mins[3];
+            let out_x = fx / 2;
+            let idx = out_y * xsize_blocks + out_x;
+            if fx % 2 == 0 && fy % 2 == 0 {
+                aq_map[idx] = v;
+            } else {
+                aq_map[idx] += v;
+            }
+        }
+    }
+
+    // ---- Stage 3: PerBlockModulations + write integer quant field.
+    let mut base_level = 0.5 * scale;
+    let k_dampen_ramp_start = 7.0f32;
+    let k_dampen_ramp_end = 14.0f32;
+    let mut dampen = 1.0f32;
+    if distance >= k_dampen_ramp_start {
+        dampen =
+            1.0 - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
+        if dampen < 0.0 {
+            dampen = 0.0;
+        }
+    }
+    let mul = scale * dampen;
+    let add = (1.0 - dampen) * base_level;
+    let _ = &mut base_level;
 
     for by in 0..ysize_blocks {
+        let py = y0 + by * 8;
+        // If the block's pixels are completely outside the image, leave field=1.
         for bx in 0..xsize_blocks {
-            let px_x0 = x0 + bx * 8;
-            let px_y0 = y0 + by * 8;
-            let q = block_quant(linear, px_x0, px_y0, img_xsize, img_ysize);
-            raw_quant_field.row_mut(by)[bx] = q;
+            let px = x0 + bx * 8;
+            // Pixels read by modulations are clamped to image edges below; but
+            // libjxl pads to whole blocks. Our opsin is image-sized, so guard.
+            if px >= img_xsize || py >= img_ysize {
+                raw_quant_field.row_mut(by)[bx] = 1;
+                continue;
+            }
+            // For blocks touching the right/bottom edge, libjxl operates on a
+            // padded image; we clamp reads to valid rows/cols by using bounded
+            // block coordinates. The modulation funcs index up to +7; clamp.
+            let bx_px = px.min(img_xsize.saturating_sub(8));
+            let by_px = py.min(img_ysize.saturating_sub(8));
+
+            let mut out_val = aq_map[by * xsize_blocks + bx];
+            out_val = compute_mask(out_val);
+            out_val = hf_modulation(bx_px, by_px, opsin, out_val);
+            out_val = color_modulation(bx_px, by_px, opsin, distance, out_val);
+            out_val = gamma_modulation(bx_px, by_px, opsin, out_val);
+            // Multiplicative field: exponent modulation done above.
+            let qf = fast_pow2(out_val * 1.442695041) * mul + add;
+            let qi = (qf * inv_scale + 0.5) as i32;
+            raw_quant_field.row_mut(by)[bx] = qi.clamp(1, 255) as u8;
         }
     }
 }
 
-/// Compute the quantization multiplier for a single 8×8 block whose top-left
-/// pixel is at (px_x0, px_y0). Returns a value in 1..=16.
-fn block_quant(
-    linear: &Image3F,
-    px_x0: usize,
-    px_y0: usize,
-    img_xsize: usize,
-    img_ysize: usize,
-) -> u8 {
-    let mut grad_sum = 0.0f32;
-    let mut n = 0u32;
-
-    let py_end = (px_y0 + 8).min(img_ysize);
-    let px_end = (px_x0 + 8).min(img_xsize);
-
-    for py in px_y0..py_end {
-        let row_r = linear.plane_row(0, py);
-        let row_g = linear.plane_row(1, py);
-        let row_b = linear.plane_row(2, py);
-
-        // Precompute below-row pointers once per py (replicate at last row).
-        let py_below = if py + 1 < img_ysize { py + 1 } else { py };
-        let below_r = linear.plane_row(0, py_below);
-        let below_g = linear.plane_row(1, py_below);
-        let below_b = linear.plane_row(2, py_below);
-
-        for px in px_x0..px_end {
-            let l_here = luma(row_r[px], row_g[px], row_b[px]);
-            // Horizontal: forward difference, clamp to edge.
-            let px_right = if px + 1 < img_xsize { px + 1 } else { px };
-            let l_right = luma(row_r[px_right], row_g[px_right], row_b[px_right]);
-            // Vertical: forward difference.
-            let l_below = luma(below_r[px], below_g[px], below_b[px]);
-
-            grad_sum += (l_right - l_here).abs() + (l_below - l_here).abs();
-            n += 1;
-        }
-    }
-
-    if n == 0 {
-        return 1;
-    }
-    let avg_grad = grad_sum / n as f32;
-
-    let shifted = (avg_grad - 0.03).max(0.0);
-    let q = 2.0 + 4.0 * shifted.sqrt();
-    q.round().clamp(2.0, 6.0) as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::image::Image3F;
-
-    #[test]
-    fn flat_image_gives_quant_one() {
-        let mut img = Image3F::new(16, 16);
-        for y in 0..16 {
-            let [r, g, b] = img.all_plane_rows_mut(y);
-            for x in 0..16 {
-                r[x] = 0.5;
-                g[x] = 0.5;
-                b[x] = 0.5;
-            }
-        }
-        let mut qf = ImageB::new_fill(2, 2, 99);
-        fill_quant_field(&img, &mut qf, 0, 0);
-        for by in 0..2 {
-            for bx in 0..2 {
-                assert_eq!(
-                    qf.row(by)[bx],
-                    2,
-                    "flat block should be q=2 (smooth-area boost)"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn high_contrast_pattern_gives_higher_quant() {
-        // Checkerboard pattern: every other pixel toggles between 0 and 1.
-        let mut img = Image3F::new(16, 16);
-        for y in 0..16 {
-            let [r, g, b] = img.all_plane_rows_mut(y);
-            for x in 0..16 {
-                let v = if (x + y) & 1 == 0 { 0.0 } else { 1.0 };
-                r[x] = v;
-                g[x] = v;
-                b[x] = v;
-            }
-        }
-        let mut qf = ImageB::new_fill(2, 2, 0);
-        fill_quant_field(&img, &mut qf, 0, 0);
-        for by in 0..2 {
-            for bx in 0..2 {
-                assert!(
-                    qf.row(by)[bx] > 1,
-                    "checkerboard block should be q>1, got {}",
-                    qf.row(by)[bx]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn quant_field_is_clamped() {
-        // Strong stripe pattern: max-out the gradient.
-        let mut img = Image3F::new(8, 8);
-        for y in 0..8 {
-            let [r, g, b] = img.all_plane_rows_mut(y);
-            for x in 0..8 {
-                let v = if x & 1 == 0 { 0.0 } else { 1.0 };
-                r[x] = v;
-                g[x] = v;
-                b[x] = v;
-            }
-        }
-        let mut qf = ImageB::new_fill(1, 1, 0);
-        fill_quant_field(&img, &mut qf, 0, 0);
-        let q = qf.row(0)[0];
-        assert!(q >= 1 && q <= 16, "q out of range: {q}");
-    }
-
-    #[test]
-    fn handles_edge_blocks() {
-        // 12x12 image with 2x2 blocks-worth of qf -> the last block in each
-        // direction only has 4 valid pixels.
-        let mut img = Image3F::new(12, 12);
-        for y in 0..12 {
-            let [r, g, b] = img.all_plane_rows_mut(y);
-            for x in 0..12 {
-                r[x] = 0.5;
-                g[x] = 0.5;
-                b[x] = 0.5;
-            }
-        }
-        let mut qf = ImageB::new_fill(2, 2, 99);
-        fill_quant_field(&img, &mut qf, 0, 0);
-        // Edge blocks shouldn't crash and should also be q=1.
-        for by in 0..2 {
-            for bx in 0..2 {
-                assert_eq!(qf.row(by)[bx], 2);
-            }
-        }
-    }
+/// 2^x. std f32 powi/exp is fine here (not perf-critical vs DCT); use exp2.
+#[inline]
+fn fast_pow2(x: f32) -> f32 {
+    x.exp2()
 }

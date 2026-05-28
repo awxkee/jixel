@@ -379,7 +379,39 @@ pub(crate) fn dc_from_dct8x16(coeffs: &[f32; 128], dc: &mut [f32; 2]) {
     dc[1] = s0 - s1;
 }
 
+static DCT_METHOD_16X16: OnceLock<Arc<DctFn<256>>> = OnceLock::new();
+
+fn select_dct_16x16() -> Arc<DctFn<256>> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            use crate::neon::dct16x16_neon;
+            return Arc::new(|input, output| unsafe {
+                dct16x16_neon(input, output);
+            });
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct16x16_avx2(input, output);
+            });
+        }
+    }
+
+    Arc::new(|input, output| {
+        dct16x16_scalar(input, output);
+    })
+}
+
 pub(crate) fn dct16x16(input: &[f32; 256], output: &mut [f32; 256]) {
+    DCT_METHOD_16X16.get_or_init(select_dct_16x16)(input, output);
+}
+
+pub(crate) fn dct16x16_scalar(input: &[f32; 256], output: &mut [f32; 256]) {
     let mut after_col_dct = [0.0f32; 256];
     let mut col = [0.0f32; 16];
     for u in 0..16 {

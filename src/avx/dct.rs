@@ -265,3 +265,277 @@ pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
         }
     }
 }
+
+// ─── dct16x16 (AVX2) ──────────────────────────────────────────────────────────
+//
+// input  layout: input[row * 16 + col],  row, col ∈ 0..16
+// output layout: output[u * 16 + v],     u = col-freq, v = row-freq
+//
+// Uses 12 × transpose_8x8 and 32 contiguous 256-bit stores — no scatter.
+//
+//  Phase 1 (col-DCT):
+//   Load 4 sub-blocks → transpose each → assemble c_top/c_bot →
+//   dct1d_16_flat × 2 → split → transpose × 4
+//
+//  Phase 2 (row-DCT):
+//   Assemble d_a/d_b → dct1d_16_flat × 2 → split → transpose × 4 →
+//   scale and store contiguously
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct16x16_avx2(input: &[f32; 256], output: &mut [f32; 256]) {
+    unsafe {
+        // ── Phase 1: col-DCT-16 ───────────────────────────────────────────────
+
+        // Load four 8×8 sub-blocks.
+        let mut top_lo: [__m256; 8] =   // rows 0..8,  cols 0..8
+            std::array::from_fn(|k| _mm256_loadu_ps(input[k * 16..].as_ptr()));
+        let mut bot_lo: [__m256; 8] =   // rows 8..16, cols 0..8
+            std::array::from_fn(|k| _mm256_loadu_ps(input[(k + 8) * 16..].as_ptr()));
+        let mut top_hi: [__m256; 8] =   // rows 0..8,  cols 8..16
+            std::array::from_fn(|k| _mm256_loadu_ps(input[k * 16 + 8..].as_ptr()));
+        let mut bot_hi: [__m256; 8] =   // rows 8..16, cols 8..16
+            std::array::from_fn(|k| _mm256_loadu_ps(input[(k + 8) * 16 + 8..].as_ptr()));
+
+        // Transpose: after this block[col].lane[row] = input[row][col].
+        transpose_8x8(&mut top_lo);
+        transpose_8x8(&mut bot_lo);
+        transpose_8x8(&mut top_hi);
+        transpose_8x8(&mut bot_hi);
+
+        // Assemble 16-step arrays: index = original col (time-step), lane = row.
+        //   c_top[k].lane[r] = input[r][k]     r = 0..8
+        //   c_bot[k].lane[r] = input[r+8][k]   r = 0..8
+        let mut c_top = [_mm256_undefined_ps(); 16];
+        let mut c_bot = [_mm256_undefined_ps(); 16];
+        c_top[0..8].copy_from_slice(&top_lo);
+        c_top[8..16].copy_from_slice(&top_hi);
+        c_bot[0..8].copy_from_slice(&bot_lo);
+        c_bot[8..16].copy_from_slice(&bot_hi);
+
+        // Col-DCT-16: for each lane (row 0..8), DCT-16 across the 16 cols.
+        dct1d_16_flat(&mut c_top);
+        dct1d_16_flat(&mut c_bot);
+
+        // Split into col-freq halves and transpose for the row-DCT pass.
+        let mut tlo: [__m256; 8] = c_top[0..8].try_into().unwrap();
+        let mut thi: [__m256; 8] = c_top[8..16].try_into().unwrap();
+        let mut blo: [__m256; 8] = c_bot[0..8].try_into().unwrap();
+        let mut bhi: [__m256; 8] = c_bot[8..16].try_into().unwrap();
+        transpose_8x8(&mut tlo);
+        transpose_8x8(&mut thi);
+        transpose_8x8(&mut blo);
+        transpose_8x8(&mut bhi);
+
+        // ── Phase 2: row-DCT-16 ───────────────────────────────────────────────
+
+        // Assemble: index = row (time-step 0..16), lane = col-freq (0..8 or 8..16).
+        //   d_a rows 0..8  from tlo, rows 8..16 from blo  → col-freqs 0..8  in lanes
+        //   d_b rows 0..8  from thi, rows 8..16 from bhi  → col-freqs 8..16 in lanes
+        let mut d_a = [_mm256_undefined_ps(); 16];
+        let mut d_b = [_mm256_undefined_ps(); 16];
+        d_a[0..8].copy_from_slice(&tlo);
+        d_a[8..16].copy_from_slice(&blo);
+        d_b[0..8].copy_from_slice(&thi);
+        d_b[8..16].copy_from_slice(&bhi);
+
+        // Row-DCT-16: for each lane (col-freq 0..8), DCT-16 across the 16 rows.
+        dct1d_16_flat(&mut d_a);
+        dct1d_16_flat(&mut d_b);
+
+        // ── Store via final transpose → contiguous writes ─────────────────────
+        //
+        // After row-DCT:
+        //   d_a[u].lane[v] = output[v*16 + u] * 256   u = row-freq 0..16, v = col-freq 0..8
+        //   d_b[u].lane[v] = output[(v+8)*16 + u] * 256
+        //
+        // We want output[col_freq * 16 + 0..16] to be written as two sequential stores.
+        // Transpose d_a and d_b (each 16×8 → two 8×8 blocks) to get row-major order.
+        let mut d_a_lo: [__m256; 8] = d_a[0..8].try_into().unwrap(); // row-freqs 0..8
+        let mut d_a_hi: [__m256; 8] = d_a[8..16].try_into().unwrap(); // row-freqs 8..16
+        let mut d_b_lo: [__m256; 8] = d_b[0..8].try_into().unwrap();
+        let mut d_b_hi: [__m256; 8] = d_b[8..16].try_into().unwrap();
+        transpose_8x8(&mut d_a_lo);
+        transpose_8x8(&mut d_a_hi);
+        transpose_8x8(&mut d_b_lo);
+        transpose_8x8(&mut d_b_hi);
+
+        // After final transpose:
+        //   d_a_lo[v].lane[u] = output[v*16 + u]       v = col-freq 0..8,  u = row-freq 0..8
+        //   d_a_hi[v].lane[u] = output[v*16 + u+8]     v = col-freq 0..8,  u = row-freq 8..16
+        //   d_b_lo[v].lane[u] = output[(v+8)*16 + u]   v = col-freq 0..8 → actual col-freq v+8
+        //   d_b_hi[v].lane[u] = output[(v+8)*16 + u+8]
+
+        let scale = _mm256_set1_ps(1.0 / 256.0);
+        for v in 0..8 {
+            let base_a = v * 16;
+            _mm256_storeu_ps(
+                output[base_a..].as_mut_ptr(),
+                _mm256_mul_ps(d_a_lo[v], scale),
+            );
+            _mm256_storeu_ps(
+                output[base_a + 8..].as_mut_ptr(),
+                _mm256_mul_ps(d_a_hi[v], scale),
+            );
+            let base_b = (v + 8) * 16;
+            _mm256_storeu_ps(
+                output[base_b..].as_mut_ptr(),
+                _mm256_mul_ps(d_b_lo[v], scale),
+            );
+            _mm256_storeu_ps(
+                output[base_b + 8..].as_mut_ptr(),
+                _mm256_mul_ps(d_b_hi[v], scale),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const ATOL: f32 = 1e-4;
+
+    fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
+        assert_eq!(neon.len(), scalar.len(), "{label}: length mismatch");
+        let mut max_err: f32 = 0.0;
+        let mut worst = 0usize;
+        for (i, (n, s)) in neon.iter().zip(scalar.iter()).enumerate() {
+            let e = (n - s).abs();
+            if e > max_err {
+                max_err = e;
+                worst = i;
+            }
+        }
+        assert!(
+            max_err < ATOL,
+            "{label}: max error {max_err:.2e} at index {worst} \
+             (neon={:.6}, scalar={:.6})",
+            neon[worst],
+            scalar[worst]
+        );
+    }
+
+    fn rng_f32(seed: u64) -> f32 {
+        // xorshift64
+        let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        // map to [-1, 1]
+        let u = (x >> 41) as f32; // 23-bit mantissa
+        u / (1u32 << 23) as f32 * 2.0 - 1.0
+    }
+
+    fn fill<const N: usize>(seed: u64) -> [f32; N] {
+        let mut buf = [0.0f32; N];
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = rng_f32(seed.wrapping_add((i as u64).wrapping_mul(6364136223846793005)));
+        }
+        buf
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_vs_scalar_random() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        use crate::dct::dct16x16_scalar;
+        for seed in 0u64..32 {
+            let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
+            let mut got = [0.0f32; 256];
+            let mut want = [0.0f32; 256];
+            unsafe { dct16x16_avx2(&input, &mut got) };
+            dct16x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_dc_only() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        use crate::dct::dct16x16_scalar;
+        let input = [0.5f32; 256];
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_avx2(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 dc-only");
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_zero() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        use crate::dct::dct16x16_scalar;
+        let input = [0.0f32; 256];
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_avx2(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 zero");
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_basis_vectors() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        use crate::dct::dct16x16_scalar;
+        for k in 0..256 {
+            let mut input = [0.0f32; 256];
+            input[k] = 1.0;
+            let mut got = [0.0f32; 256];
+            let mut want = [0.0f32; 256];
+            unsafe { dct16x16_avx2(&input, &mut got) };
+            dct16x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
+        }
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_linearity() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        let a: [f32; 256] = fill(700);
+        let b: [f32; 256] = fill(800);
+        let mut sum = [0.0f32; 256];
+        for i in 0..256 {
+            sum[i] = a[i] + b[i];
+        }
+        let mut da = [0.0f32; 256];
+        let mut db = [0.0f32; 256];
+        let mut dsum = [0.0f32; 256];
+        unsafe {
+            dct16x16_avx2(&a, &mut da);
+            dct16x16_avx2(&b, &mut db);
+            dct16x16_avx2(&sum, &mut dsum);
+        }
+        let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
+        assert_close(&dsum, &expected, "dct16x16 linearity");
+    }
+
+    #[test]
+    fn test_dct16x16_avx2_extreme_values() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x16_avx2;
+        use crate::dct::dct16x16_scalar;
+        let mut input = [0.0f32; 256];
+        for i in 0..256 {
+            input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_avx2(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 alternating +-1");
+    }
+}

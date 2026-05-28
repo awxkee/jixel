@@ -720,7 +720,7 @@ pub(crate) struct PendingAcGroup {
 
 #[allow(clippy::too_many_arguments)]
 fn process_dc_group(
-    linear: &Image3F,
+    _linear: &Image3F,
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
@@ -741,10 +741,12 @@ fn process_dc_group(
     let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
 
     crate::adaptive_quant::fill_quant_field(
-        linear,
+        opsin,
         &mut dc_data.raw_quant_field,
         dc_group_x0,
         dc_group_y0,
+        distp.distance,
+        1.0 / distp.scale,
     );
     crate::enc_ac_strategy::fill_ac_strategy(
         opsin,
