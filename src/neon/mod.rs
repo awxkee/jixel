@@ -28,4 +28,4 @@
  */
 mod dct;
 
-pub(crate) use dct::{dct8x8_neon, dct8x16_neon, dct16x8_neon};
+pub(crate) use dct::{dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon};

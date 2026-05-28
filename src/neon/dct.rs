@@ -367,6 +367,83 @@ pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
     }
 }
 
+// ─── Helper: load 16 rows × 8 cols with arbitrary stride ─────────────────────
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load16_256(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 16] {
+    let row = |y: usize| unsafe {
+        let p = ptr.get_unchecked(y * stride..);
+        NeonDoubledVector {
+            lo: vld1q_f32(p.as_ptr()),
+            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
+        }
+    };
+    [
+        row(0),
+        row(1),
+        row(2),
+        row(3),
+        row(4),
+        row(5),
+        row(6),
+        row(7),
+        row(8),
+        row(9),
+        row(10),
+        row(11),
+        row(12),
+        row(13),
+        row(14),
+        row(15),
+    ]
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
+    let mut c_l = load16_256(input.as_slice(), 16);
+    let mut c_r = load16_256(&input[8..], 16);
+
+    dct1d_16_v(&mut c_l);
+    dct1d_16_v(&mut c_r);
+
+    // Step 4: split into row-freq groups 0..8 and 8..16.
+    let mut top_l: [NeonDoubledVector; 8] = c_l[0..8].try_into().unwrap();
+    let mut bot_l: [NeonDoubledVector; 8] = c_l[8..16].try_into().unwrap();
+    let mut top_r: [NeonDoubledVector; 8] = c_r[0..8].try_into().unwrap();
+    let mut bot_r: [NeonDoubledVector; 8] = c_r[8..16].try_into().unwrap();
+
+    transpose_8x8(&mut top_l);
+    transpose_8x8(&mut bot_l);
+    transpose_8x8(&mut top_r);
+    transpose_8x8(&mut bot_r);
+
+    let mut d_a = [NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    }; 16];
+    let mut d_b = d_a;
+    d_a[0..8].copy_from_slice(&top_l);
+    d_a[8..16].copy_from_slice(&top_r);
+    d_b[0..8].copy_from_slice(&bot_l);
+    d_b[8..16].copy_from_slice(&bot_r);
+
+    // Step 7: DCT-16 along the column dimension.
+    dct1d_16_v(&mut d_a);
+    dct1d_16_v(&mut d_b);
+
+    let scale = 1.0 / 256.0;
+    for u in 0..16 {
+        let base = &mut output[u * 16..];
+        unsafe {
+            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(d_a[u].lo, scale));
+            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(d_a[u].hi, scale));
+            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(d_b[u].lo, scale));
+            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(d_b[u].hi, scale));
+        }
+    }
+}
+
 #[cfg(test)]
 mod neon_dct_tests {
     use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
@@ -719,5 +796,100 @@ mod neon_dct_tests {
         unsafe { dct8x16_neon(&input, &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 alternating +-1");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_vs_scalar_random() {
+        use crate::dct::dct16x16_scalar;
+        use crate::neon::dct16x16_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
+            let mut got = [0.0f32; 256];
+            let mut want = [0.0f32; 256];
+            unsafe { dct16x16_neon(&input, &mut got) };
+            dct16x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_dc_only() {
+        use crate::dct::dct16x16_scalar;
+        use crate::neon::dct16x16_neon;
+        let input = [0.5f32; 256];
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_neon(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 dc-only");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_zero() {
+        use crate::dct::dct16x16_scalar;
+        use crate::neon::dct16x16_neon;
+        let input = [0.0f32; 256];
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_neon(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 zero");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_basis_vectors() {
+        use crate::dct::dct16x16_scalar;
+        use crate::neon::dct16x16_neon;
+        for k in 0..256 {
+            let mut input = [0.0f32; 256];
+            input[k] = 1.0;
+            let mut got = [0.0f32; 256];
+            let mut want = [0.0f32; 256];
+            unsafe { dct16x16_neon(&input, &mut got) };
+            dct16x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_linearity() {
+        use crate::neon::dct16x16_neon;
+        let a: [f32; 256] = fill(700);
+        let b: [f32; 256] = fill(800);
+        let mut sum = [0.0f32; 256];
+        for i in 0..256 {
+            sum[i] = a[i] + b[i];
+        }
+        let mut da = [0.0f32; 256];
+        let mut db = [0.0f32; 256];
+        let mut dsum = [0.0f32; 256];
+        unsafe {
+            dct16x16_neon(&a, &mut da);
+            dct16x16_neon(&b, &mut db);
+            dct16x16_neon(&sum, &mut dsum);
+        }
+        let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
+        assert_close(&dsum, &expected, "dct16x16 linearity");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x16_neon_extreme_values() {
+        use crate::dct::dct16x16_scalar;
+        use crate::neon::dct16x16_neon;
+        let mut input = [0.0f32; 256];
+        for i in 0..256 {
+            input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut got = [0.0f32; 256];
+        let mut want = [0.0f32; 256];
+        unsafe { dct16x16_neon(&input, &mut got) };
+        dct16x16_scalar(&input, &mut want);
+        assert_close(&got, &want, "dct16x16 alternating +-1");
     }
 }
