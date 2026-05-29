@@ -27,14 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #[derive(Clone, Copy, Debug)]
-pub struct Token {
+pub(crate) struct Token {
     pub context: u32,
     pub value: u32,
 }
 
 impl Token {
     #[inline]
-    pub const fn new(context: u32, value: u32) -> Self {
+    pub(crate) const fn new(context: u32, value: u32) -> Self {
         Self { context, value }
     }
 }
@@ -46,7 +46,7 @@ impl Token {
 ///                              nbits = n - 2,
 ///                              bits  = low (n - 2) bits of value.
 #[inline]
-pub fn uint_encode(value: u32) -> (u32, u32, u32) {
+pub(crate) fn uint_encode(value: u32) -> (u32, u32, u32) {
     if value < 16 {
         (value, 0, 0)
     } else {
@@ -63,7 +63,7 @@ pub fn uint_encode(value: u32) -> (u32, u32, u32) {
 /// Map a signed integer to a non-negative one via "zigzag" encoding.
 /// 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, ...
 #[inline]
-pub fn pack_signed(value: i32) -> u32 {
+pub(crate) fn pack_signed(value: i32) -> u32 {
     ((value << 1) ^ (value >> 31)) as u32
 }
 

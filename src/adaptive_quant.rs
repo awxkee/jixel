@@ -34,6 +34,7 @@
 // libjxl-tiny does. This replaces the earlier gradient heuristic, which
 // produced values in 2..=6 (mostly the floor) and quantized ~2.6x too coarsely.
 
+use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 
 // ---- Sigmoid-like gamma constants (butteraugli <-> opsin space) ----
@@ -78,7 +79,7 @@ fn compute_mask(out_val: f32) -> f32 {
     let v2 = 1.0 / (v1 + k_offset2);
     let v3 = 1.0 / (v1 * v1 + k_offset3);
     let v4 = 1.0 / (v1 * v1 + k_offset4);
-    k_base + k_mul4 * v4 + k_mul2 * v2 + k_mul3 * v3
+    fmla(k_mul4, v4, fmla(k_mul2, v2, fmla(k_mul3, v3, k_base)))
 }
 
 /// `0.25 * sqrt(v * sqrt(kMul*1e8) + kLogOffset)`.
@@ -87,7 +88,7 @@ fn masking_sqrt(v: f32) -> f32 {
     let k_log_offset = 26.481471032459346f32;
     let k_mul = 211.50759899638012f32;
     let mul_v = k_mul * 1e8;
-    0.25 * (v * mul_v.sqrt() + k_log_offset).sqrt()
+    0.25 * fmla(v, mul_v.sqrt(), k_log_offset).sqrt()
 }
 
 /// HF modulation: sum of |right| and |below| abs differences in the 8x8 Y block.
@@ -109,7 +110,7 @@ fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
             sum += (p - row_next[x + dx]).abs();
         }
     }
-    sum * (-2.0052193233688884f32 / 112.0) + out_val
+    fmla(sum, -2.0052193233688884f32 / 112.0, out_val)
 }
 
 /// Color modulation: boost precision in strongly red or blue blocks.
@@ -137,13 +138,12 @@ fn color_modulation(
     let mut red_coverage = 0.0f32;
     let mut blue_coverage = 0.0f32;
     for dy in 0..8 {
-        let row_x = xyb.plane_row(0, y + dy);
-        let row_y = xyb.plane_row(1, y + dy);
-        let row_b = xyb.plane_row(2, y + dy);
-        for dx in 0..8 {
-            let pixel_x = (row_x[x + dx] - k_red_ramp_start).max(0.0);
-            let pixel_y = row_y[x + dx];
-            let pixel_b = (row_b[x + dx] - (pixel_y + k_blue_ramp_start)).max(0.0);
+        let row_x = &xyb.plane_row(0, y + dy)[x..x + 8];
+        let row_y = &xyb.plane_row(1, y + dy)[x..x + 8];
+        let row_b = &xyb.plane_row(2, y + dy)[x..x + 8];
+        for ((&in_x, &pixel_y), &in_b) in row_x.iter().zip(row_y.iter()).zip(row_b.iter()) {
+            let pixel_x = (in_x - k_red_ramp_start).max(0.0);
+            let pixel_b = (in_b - (pixel_y + k_blue_ramp_start)).max(0.0);
             blue_coverage += pixel_b.min(k_blue_ramp_length);
             red_coverage += pixel_x.min(k_red_ramp_length);
         }
@@ -178,7 +178,7 @@ fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     overall_ratio *= 1.0 / 64.0;
     // ln(2) folded in: -0.15526878... * ln(2) * log2(x) == -0.15... * ln(x)
     let k_gam = -0.15526878023684174f32 * 0.693147180559945f32;
-    k_gam * overall_ratio.log2() + out_val
+    fmla(k_gam, dirty_log2f(overall_ratio), out_val)
 }
 
 #[inline]
@@ -202,11 +202,28 @@ fn store_min4(v: f32, mins: &mut [f32; 4]) {
     }
 }
 
+#[inline(always)]
+fn sort4(a: &mut [f32; 4]) {
+    // Optimal 5-comparison sorting network for 4 elements
+    macro_rules! cswap {
+        ($i:expr, $j:expr) => {
+            if a[$i] > a[$j] {
+                a.swap($i, $j);
+            }
+        };
+    }
+    cswap!(0, 1);
+    cswap!(2, 3);
+    cswap!(0, 2);
+    cswap!(1, 3);
+    cswap!(1, 2);
+}
+
 /// Fill `raw_quant_field` (block-resolution) for the DC-group region whose
 /// top-left pixel is (x0, y0) in the full `opsin` (XYB) image.
 ///
 /// `distance` is the butteraugli target; `inv_scale = 1.0 / distance_params.scale`.
-pub fn fill_quant_field(
+pub(crate) fn fill_quant_field(
     opsin: &Image3F,
     raw_quant_field: &mut ImageB,
     x0: usize,
@@ -315,8 +332,8 @@ pub fn fill_quant_field(
             let xp1 = if fx + 1 < pre_w { fx + 1 } else { fx };
             // First four values, sorted ascending into mins[0..4].
             let mut mins = [row[fx], row[xm1], row[xp1], rowt[xm1]];
-            mins.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            // Remaining five neighbours.
+            sort4(&mut mins);
+            // Remaining five neighbors.
             store_min4(rowt[fx], &mut mins);
             store_min4(rowt[xp1], &mut mins);
             store_min4(rowb[xm1], &mut mins);
@@ -355,13 +372,13 @@ pub fn fill_quant_field(
 
     for by in 0..ysize_blocks {
         let py = y0 + by * 8;
+        let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
+        let qf_row = raw_quant_field.row_mut(by);
         // If the block's pixels are completely outside the image, leave field=1.
-        for bx in 0..xsize_blocks {
+        for (bx, (qf_out, &aq)) in qf_row.iter_mut().zip(aq_row.iter()).enumerate() {
             let px = x0 + bx * 8;
-            // Pixels read by modulations are clamped to image edges below; but
-            // libjxl pads to whole blocks. Our opsin is image-sized, so guard.
             if px >= img_xsize || py >= img_ysize {
-                raw_quant_field.row_mut(by)[bx] = 1;
+                *qf_out = 1;
                 continue;
             }
             // For blocks touching the right/bottom edge, libjxl operates on a
@@ -370,21 +387,94 @@ pub fn fill_quant_field(
             let bx_px = px.min(img_xsize.saturating_sub(8));
             let by_px = py.min(img_ysize.saturating_sub(8));
 
-            let mut out_val = aq_map[by * xsize_blocks + bx];
+            let mut out_val = aq;
             out_val = compute_mask(out_val);
             out_val = hf_modulation(bx_px, by_px, opsin, out_val);
             out_val = color_modulation(bx_px, by_px, opsin, distance, out_val);
             out_val = gamma_modulation(bx_px, by_px, opsin, out_val);
             // Multiplicative field: exponent modulation done above.
-            let qf = fast_pow2(out_val * 1.442695041) * mul + add;
-            let qi = (qf * inv_scale + 0.5) as i32;
-            raw_quant_field.row_mut(by)[bx] = qi.clamp(1, 255) as u8;
+            let qf = fast_exp2(out_val * 1.442695041) * mul + add;
+            let qi = fmla(qf, inv_scale, 0.5) as i32;
+            *qf_out = qi.clamp(1, 255) as u8;
         }
     }
 }
 
-/// 2^x. std f32 powi/exp is fine here (not perf-critical vs DCT); use exp2.
+const TBLSIZE: usize = 64;
+
+#[repr(align(64))]
+struct Exp2Table([(u32, u32); TBLSIZE]);
+
+#[rustfmt::skip]
+static EXP2FT: Exp2Table = Exp2Table([(0x3F3504F3, 0xB2D4175E),(0x3F36FD92, 0x3268D5EF),(0x3F38FBAF, 0xB30E8719),(0x3F3AFF5B, 0x3319E7DA),(0x3F3D08A4, 0x333CD82F),(0x3F3F179A, 0x330E1902),(0x3F412C4D, 0x32CCF4D7),(0x3F4346CD, 0x328F330E),(0x3F45672A, 0xB201B5B7),(0x3F478D75, 0x32CCCE34),(0x3F49B9BE, 0x335E937C),(0x3F4BEC15, 0x2FF41909),(0x3F4E248C, 0xB21760EA),(0x3F506334, 0x3283628B),(0x3F52A81E, 0x3340F500),(0x3F54F35B, 0x331202BD),(0x3F5744FD, 0x32B66A3E),(0x3F599D16, 0x32D0D9B1),(0x3F5BFBB8, 0x332ED93F),(0x3F5E60F5, 0x3350A709),(0x3F60CCDF, 0x32025744),(0x3F633F89, 0xB33A7C4D),(0x3F65B907, 0x321DA4E9),(0x3F68396A, 0xB2FF36A7),(0x3F6AC0C7, 0x3217E40E),(0x3F6D4F30, 0xB2400CBB),(0x3F6FE4BA, 0x331A2ACC),(0x3F728177, 0xB2B7D3E5),(0x3F75257D, 0xB1FED2BE),(0x3F77D0DF, 0xB32B73BA),(0x3F7A83B3, 0x32579081),(0x3F7D3E0C, 0xB19726B5),(0x3F800000, 0x00000000),(0x3F8164D2, 0x320C09FB),(0x3F82CD87, 0x3391E031),(0x3F843A29, 0x33287EEF),(0x3F85AAC3, 0xB38F6665),(0x3F871F62, 0x339004AB),(0x3F88980F, 0x33AC4561),(0x3F8A14D5, 0xB39CDAEA),(0x3F8B95C2, 0x32949D5C),(0x3F8D1ADF, 0xB36F79FA),(0x3F8EA43A, 0x33971DC2),(0x3F9031DC, 0xB32BD022),(0x3F91C3D3, 0xB3928952),(0x3F935A2B, 0xB2EBFECF),(0x3F94F4F0, 0x3357B8BB),(0x3F96942D, 0xB307353B),(0x3F9837F0, 0xB345DFE9),(0x3F99E046, 0x3382A804),(0x3F9B8D3A, 0x3326993E),(0x3F9D3EDA, 0x3350A029),(0x3F9EF532, 0xB3605F62),(0x3FA0B051, 0xB210909B),(0x3FA27043, 0xB0DDC369),(0x3FA43516, 0x33385844),(0x3FA5FED7, 0x33400757),(0x3FA7CD94, 0x3325446E),(0x3FA9A15B, 0x33237A50),(0x3FAB7A3A, 0x33201CA4),(0x3FAD583F, 0x32394687),(0x3FAF3B79, 0x332E1225),(0x3FB123F6, 0x33838969),(0x3FB311C4, 0xB219F2BA)]);
+
+#[inline(always)]
+pub(crate) fn f_fmlaf(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "fma"
+        ),
+        target_arch = "aarch64"
+    ))]
+    {
+        f32::mul_add(a, b, c)
+    }
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "fma"
+        ),
+        target_arch = "aarch64"
+    )))]
+    {
+        a * b + c
+    }
+}
+
 #[inline]
-fn fast_pow2(x: f32) -> f32 {
-    x.exp2()
+fn fast_exp2(d: f32) -> f32 {
+    let redux = f32::from_bits(0x4b400000) / TBLSIZE as f32;
+
+    let ui = f32::to_bits(d + redux);
+    let mut i0 = ui;
+    i0 = i0.wrapping_add(TBLSIZE as u32 / 2);
+    let k = i0 / TBLSIZE as u32;
+    i0 &= TBLSIZE as u32 - 1;
+    let mut uf = f32::from_bits(ui);
+    uf -= redux;
+
+    let item = EXP2FT.0[i0 as usize];
+    let z0: f32 = f32::from_bits(item.0);
+
+    let f: f32 = d - uf;
+
+    let mut u = 0.24022650695908768;
+    u = f_fmlaf(u, f, 0.69314718055994973);
+    u *= f;
+
+    #[inline]
+    fn pow2if(q: i32) -> f32 {
+        f32::from_bits((q.wrapping_add(0x7f) as u32) << 23)
+    }
+
+    let i2 = pow2if(k as i32);
+    f_fmlaf(u, z0, z0) * i2
+}
+
+pub(crate) fn dirty_log2f(d: f32) -> f32 {
+    let mut ix = d.to_bits();
+    /* reduce x into [sqrt(2)/2, sqrt(2)] */
+    ix = ix.wrapping_add(0x3f800000 - 0x3f3504f3);
+    let n = (ix >> 23) as i32 - 0x7f;
+    ix = (ix & 0x007fffff).wrapping_add(0x3f3504f3);
+    let a = f32::from_bits(ix);
+
+    let x = (a - 1.) / (a + 1.);
+
+    let x2 = x * x;
+    let mut u = 0.4121985850084821691e+0;
+    u = f_fmlaf(u, x2, 0.5770780163490337802e+0);
+    u = f_fmlaf(u, x2, 0.9617966939259845749e+0);
+    f_fmlaf(x2 * x, u, f_fmlaf(x, 0.2885390081777926802e+1, n as f32))
 }

@@ -152,20 +152,29 @@ fn quantize_block_ac(
     );
     debug_assert!(block_in.len() >= width * height, "block_in too small");
     debug_assert!(block_out.len() >= width * height, "block_out too small");
+    let n = width * height;
+    let qm = &qm[..n];
+    let block_in = &block_in[..n];
+    let block_out = &mut block_out[..n];
+    let half = width / 2;
     for y in 0..height {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for x in 0..width {
-            let threshold = if xsize == 1 {
-                // For DCT8 (xsize=1, ysize=1), threshold splits at x>=4.
-                thr[yfix + if x >= width / 2 { 1 } else { 0 }]
-            } else {
-                // Multi-block: split at x >= width/2.
-                thr[yfix + if x >= width / 2 { 1 } else { 0 }]
-            };
-            let idx = y * width + x;
-            let q = qm[idx] * q_scaled;
-            let val = q * block_in[idx];
-            block_out[idx] = if val.abs() >= threshold {
+        let thr_lo = thr[yfix];
+        let thr_hi = thr[yfix + 1];
+        let row = y * width;
+        let qm_row = &qm[row..row + width];
+        let in_row = &block_in[row..row + width];
+        let out_row = &mut block_out[row..row + width];
+        for (x, ((&qmv, &inv), out)) in qm_row
+            .iter()
+            .zip(in_row.iter())
+            .zip(out_row.iter_mut())
+            .enumerate()
+        {
+            let threshold = if x >= half { thr_hi } else { thr_lo };
+            let q = qmv * q_scaled;
+            let val = q * inv;
+            *out = if val.abs() >= threshold {
                 val.round() as i32
             } else {
                 0
@@ -209,8 +218,11 @@ fn quantize_roundtrip_y_block(
     quantize_block_ac(inout, 1, qm, quant, scale, 1.0, xsize, ysize, quantized);
     let inv_qac = 1.0 / (scale * quant as f32);
     let size = xsize * ysize * 64;
-    for k in 0..size {
-        inout[k] = adjust_quant_bias_y(quantized[k]) * dqm[k] * inv_qac;
+    for (out, (&q, &dq)) in inout[..size]
+        .iter_mut()
+        .zip(quantized[..size].iter().zip(dqm[..size].iter()))
+    {
+        *out = adjust_quant_bias_y(q) * dq * inv_qac;
     }
 }
 
@@ -245,6 +257,7 @@ pub(crate) fn write_ac_group(
     // Per-channel scratch sized for the largest transform (DCT16X16 = 2×2 blocks = 256 floats).
     let mut coeffs = [[0.0f32; 256]; 3];
     let mut quantized = [[0i32; 256]; 3];
+    let mut tmp = [0.0f32; 256];
 
     for by in 0..ysize_blocks {
         let nz_by = nzeros_by0 + by;
@@ -278,42 +291,42 @@ pub(crate) fn write_ac_group(
                 let plane = opsin.plane(c);
                 match raw_strategy {
                     STRATEGY_DCT => {
-                        let mut tmp = [0.0f32; 64];
                         for yy in 0..8 {
                             let row = plane.row(opsin_by + yy);
                             tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
-                        dct8x8(&tmp, dst);
+                        let tmp_64 = tmp.as_chunks::<64>().0;
+                        dct8x8(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT16X8 => {
-                        let mut tmp = [0.0f32; 128]; // 16 rows × 8 cols, stride 8
                         for yy in 0..16 {
                             let row = plane.row(opsin_by + yy);
                             tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
-                        dct16x8(&tmp, dst);
+                        let tmp_128 = tmp.as_chunks::<128>().0;
+                        dct16x8(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT8X16 => {
-                        let mut tmp = [0.0f32; 128]; // 8 rows × 16 cols, stride 16
                         for yy in 0..8 {
                             let row = plane.row(opsin_by + yy);
                             tmp[yy * 16..yy * 16 + 16]
                                 .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
-                        dct8x16(&tmp, dst);
+                        let tmp_128 = tmp.as_chunks::<128>().0;
+                        dct8x16(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT16X16 => {
-                        let mut tmp = [0.0f32; 256]; // 16 rows × 16 cols, stride 16
                         for yy in 0..16 {
                             let row = plane.row(opsin_by + yy);
                             tmp[yy * 16..yy * 16 + 16]
                                 .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
                         }
                         let dst: &mut [f32; 256] = (&mut coeffs[c][..256]).try_into().unwrap();
-                        dct16x16(&tmp, dst);
+                        let tmp_256 = tmp.as_chunks::<256>().0;
+                        dct16x16(&tmp_256[0], dst);
                     }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }

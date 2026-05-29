@@ -823,7 +823,8 @@ fn process_dc_group(
         let group_ysize_tiles = div_ceil(group_ysize, K_TILE_DIM);
 
         let mut num_nzeros = Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS);
-        let mut tokens: Vec<Token> = Vec::new();
+        let mut tokens: Vec<Token> =
+            Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4);
 
         for ty in 0..group_ysize_tiles {
             let stripe_x0 = group_x0;

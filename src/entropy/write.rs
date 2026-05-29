@@ -37,7 +37,7 @@ use crate::bit_writer::BitWriter;
 
 /// Hot-path token writer. Matches libjxl-tiny's inline WriteToken.
 #[inline]
-pub fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
     let (tok, nbits, bits) = uint_encode(t.value);
     let pc = &code.prefix_codes[code.context_map[t.context as usize] as usize];
     if pc.single_symbol {
@@ -91,7 +91,7 @@ pub(crate) fn build_huffman_codes(histograms: &[Histogram]) -> Vec<PrefixCode> {
 /// Build a prefix-codes-only EntropyCode given a fixed context_map and the
 /// number of contexts (= number of prefix codes). Used when the context map
 /// is known up front (e.g. the static AC code).
-pub fn optimize_prefix_codes(
+pub(crate) fn optimize_prefix_codes(
     tokens: &[Token],
     context_map: Vec<u8>,
     num_contexts: usize,
@@ -110,7 +110,7 @@ pub fn optimize_prefix_codes(
 /// Build an entropy code from scratch given tokens and the number of
 /// (original, pre-cluster) contexts: builds per-context histograms, clusters
 /// them into ≤ 8 groups, then builds Huffman codes for the clusters.
-pub fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+pub(crate) fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, None, &mut histograms);
     let mut context_map: Vec<u8> = Vec::new();
@@ -502,7 +502,7 @@ fn write_prefix_code_single(code: &PrefixCode, w: &mut BitWriter) {
 }
 
 /// Write a vector of prefix codes (per WritePrefixCodes in libjxl-tiny).
-pub fn write_prefix_codes(codes: &[PrefixCode], w: &mut BitWriter) {
+pub(crate) fn write_prefix_codes(codes: &[PrefixCode], w: &mut BitWriter) {
     w.write(1, 1); // use_prefix_code
     for _ in 0..codes.len() {
         w.write(4, 4);
@@ -534,7 +534,7 @@ pub fn write_prefix_codes(codes: &[PrefixCode], w: &mut BitWriter) {
 }
 
 /// Emit a context map. Mirrors libjxl-tiny's WriteContextMap.
-pub fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
     let num_contexts = if code.orig_context_map.is_some() {
         code.orig_num_contexts
     } else {
@@ -575,7 +575,7 @@ pub fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
 }
 
 /// WriteContextMap + WritePrefixCodes.
-pub fn write_entropy_code(code: &EntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_entropy_code(code: &EntropyCode, w: &mut BitWriter) {
     write_context_map(code, w);
     write_prefix_codes(code.prefix_codes, w);
 }
