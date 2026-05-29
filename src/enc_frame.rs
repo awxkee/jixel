@@ -480,6 +480,8 @@ fn write_dc_global(
     {
         // Empty prefix-codes slice; WriteContextMap builds its own.
         let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+        let empty_freqs: [Vec<u16>; 0] = [];
+        let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
         let cm_entropy = EntropyCode {
             context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
             num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
@@ -487,6 +489,9 @@ fn write_dc_global(
             num_prefix_codes: 0,
             orig_context_map: None,
             orig_num_contexts: 0,
+            use_prefix_code: true,
+            ans_freqs: &empty_freqs,
+            ans_symbols: &empty_syms,
         };
         crate::entropy::write_context_map(&cm_entropy, w);
     }
@@ -636,7 +641,8 @@ pub(crate) fn encode_frame(
     for pg in &all_pending {
         all_ac_tokens.extend_from_slice(&pg.tokens);
     }
-    let ac_plain_code_owned = optimize_entropy_code(&all_ac_tokens, K_NUM_AC_CONTEXTS);
+    let ac_plain_code_owned =
+        crate::entropy::optimize_entropy_code_ac(&all_ac_tokens, K_NUM_AC_CONTEXTS);
 
     let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(
         &ac_lz_per_group,
@@ -710,8 +716,18 @@ pub(crate) fn encode_frame(
             }
         } else {
             let code_ref = ac_plain_code_owned.as_ref();
-            for t in &pg.tokens {
-                write_token(*t, &code_ref, w);
+            if code_ref.use_prefix_code {
+                for t in &pg.tokens {
+                    write_token(*t, &code_ref, w);
+                }
+            } else {
+                // rANS: the whole group's tokens are encoded as one LIFO unit.
+                crate::entropy::write_ans_tokens(
+                    &pg.tokens,
+                    code_ref.context_map,
+                    code_ref.ans_symbols,
+                    w,
+                );
             }
         }
     }

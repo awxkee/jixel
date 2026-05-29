@@ -146,6 +146,9 @@ pub(crate) fn build_lz_code_no_cluster(
         prefix_codes,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code: true,
+        ans_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
     }
 }
 
@@ -185,6 +188,9 @@ pub(crate) fn build_ac_lz_code(streams: &[Vec<AcLz>], num_contexts: usize) -> Ow
         prefix_codes,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code: true,
+        ans_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
     }
 }
 

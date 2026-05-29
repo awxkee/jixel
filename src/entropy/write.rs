@@ -27,6 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::ans::{
+    AnsEncSymbolInfo, build_symbol_info, choose_use_prefix_code, encode_histogram, normalize_counts,
+};
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
 use super::histogram::Histogram;
@@ -34,6 +37,16 @@ use super::huffman_tree::create_huffman_tree;
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
 use super::token::{Token, uint_encode};
 use crate::bit_writer::BitWriter;
+
+pub(crate) const ANS_ENABLED: bool = true;
+
+#[allow(unused)]
+pub(crate) const ANS_LOG_ALPHA_SIZE: u32 = 7;
+
+/// Default (prefix-only) ANS fields for a freshly built code.
+fn no_ans() -> (bool, Vec<Vec<u16>>, Vec<Vec<AnsEncSymbolInfo>>) {
+    (true, Vec::new(), Vec::new())
+}
 
 /// Hot-path token writer. Matches libjxl-tiny's inline WriteToken.
 #[inline]
@@ -99,28 +112,69 @@ pub(crate) fn optimize_prefix_codes(
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, Some(&context_map), &mut histograms);
     let prefix_codes = build_huffman_codes(&histograms);
+    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         orig_context_map: None,
         orig_num_contexts: 0,
+        use_prefix_code,
+        ans_freqs,
+        ans_symbols,
     }
 }
 
-/// Build an entropy code from scratch given tokens and the number of
-/// (original, pre-cluster) contexts: builds per-context histograms, clusters
-/// them into ≤ 8 groups, then builds Huffman codes for the clusters.
 pub(crate) fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, None, &mut histograms);
     let mut context_map: Vec<u8> = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map);
     let prefix_codes = build_huffman_codes(&histograms);
+    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code,
+        ans_freqs,
+        ans_symbols,
+    }
+}
+
+/// AC-plain entropy code: identical to optimize_entropy_code, but when
+/// ANS_ENABLED it may select rANS for the (clustered) histograms. Used ONLY for
+/// the plain AC token bundle, whose header (write_ac_global) and token site
+/// (enc_frame) both branch on use_prefix_code. No other bundle calls this, so
+/// the gate cannot desynchronize a header from its token stream elsewhere.
+pub(crate) fn optimize_entropy_code_ac(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+    let mut histograms = vec![Histogram::new(); num_contexts];
+    build_histograms(tokens, None, &mut histograms);
+    let mut context_map: Vec<u8> = Vec::new();
+    cluster_histograms(&mut histograms, &mut context_map);
+    let prefix_codes = build_huffman_codes(&histograms);
+
+    let (mut use_prefix_code, mut ans_freqs, mut ans_symbols) = no_ans();
+    if ANS_ENABLED {
+        let depths: Vec<[u8; ALPHABET_SIZE]> = prefix_codes.iter().map(|c| c.depths).collect();
+        use_prefix_code = choose_use_prefix_code(&histograms, &depths);
+        if !use_prefix_code {
+            for h in &histograms {
+                let f = normalize_counts(&h.counts);
+                ans_symbols.push(build_symbol_info(&f));
+                ans_freqs.push(f);
+            }
+        }
+    }
+
+    OwnedEntropyCode {
+        context_map,
+        prefix_codes,
+        orig_context_map: None,
+        orig_num_contexts: num_contexts,
+        use_prefix_code,
+        ans_freqs,
+        ans_symbols,
     }
 }
 
@@ -132,11 +186,15 @@ pub(crate) fn build_entropy_code_no_cluster(
     build_histograms(tokens, None, &mut histograms);
     let context_map: Vec<u8> = (0..num_contexts as u8).collect();
     let prefix_codes = build_huffman_codes(&histograms);
+    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code,
+        ans_freqs,
+        ans_symbols,
     }
 }
 
@@ -574,8 +632,27 @@ pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
     }
 }
 
-/// WriteContextMap + WritePrefixCodes.
+/// WriteContextMap + the per-bundle code parameters (prefix codes or ANS).
 pub(crate) fn write_entropy_code(code: &EntropyCode, w: &mut BitWriter) {
     write_context_map(code, w);
-    write_prefix_codes(code.prefix_codes, w);
+    if code.use_prefix_code {
+        write_prefix_codes(code.prefix_codes, w);
+    } else {
+        write_ans_params(code, w);
+    }
+}
+
+fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
+    w.write(1, 0); // use_prefix_code = 0
+    w.write(2, (ANS_LOG_ALPHA_SIZE - 5) as u64); // log_alpha_size = 7
+    // Per-histogram hybrid-uint config (4, 2, 0) under log_alpha_size = 7.
+    for _ in 0..code.ans_freqs.len() {
+        w.write(3, 4); // split_exponent  (VERIFY width = CeilLog2(log_alpha+1))
+        w.write(3, 2); // msb_in_token
+        w.write(2, 0); // lsb_in_token
+    }
+    // The normalized distributions, in clustered-histogram order.
+    for freqs in code.ans_freqs.iter() {
+        encode_histogram(freqs, ANS_LOG_ALPHA_SIZE, w);
+    }
 }

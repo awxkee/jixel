@@ -480,6 +480,9 @@ fn build_lz_pixel_code(toks: &[LzToken], nb_chans: usize) -> OwnedEntropyCode {
         prefix_codes: build_huffman_codes(&histograms),
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code: true,
+        ans_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
     };
 
     // Apply the single-symbol patch (mirrors build_pixel_code) per cluster so
