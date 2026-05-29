@@ -24,3 +24,6 @@ default = ["avx", "neon", "fixed-xyb"]
 avx = []
 fixed-xyb = []
 neon = []
+
+[profile.release]
+debug = 1

@@ -32,8 +32,8 @@ use crate::entropy::{
     write_entropy_code, write_token,
 };
 
-pub const K_ICC_HEADER_SIZE: usize = 128;
-pub const K_NUM_ICC_CONTEXTS: usize = 41;
+pub(crate) const K_ICC_HEADER_SIZE: usize = 128;
+pub(crate) const K_NUM_ICC_CONTEXTS: usize = 41;
 
 // Commands recognised by the decoder's UnpredictICC.
 const K_COMMAND_INSERT: u8 = 1;
@@ -168,7 +168,7 @@ fn byte_kind_2(b: u8) -> u8 {
 
 /// Context index for byte `i` of the predicted/encoded stream, given the two
 /// previous bytes.  Returns a value in `0..K_NUM_ICC_CONTEXTS`.
-pub fn iccans_context(i: usize, prev1: u8, prev2: u8) -> usize {
+pub(crate) fn iccans_context(i: usize, prev1: u8, prev2: u8) -> usize {
     if i <= 128 {
         return 0;
     }
@@ -178,7 +178,7 @@ pub fn iccans_context(i: usize, prev1: u8, prev2: u8) -> usize {
 /// Run libjxl's minimal-strategy `PredictICC`: header delta + 1 insert command.
 /// Returns the byte stream the decoder's `UnpredictICC` will turn back into the
 /// original ICC profile.
-pub fn predict_icc_minimal(icc: &[u8]) -> Vec<u8> {
+pub(crate) fn predict_icc_minimal(icc: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(icc.len() + 32);
 
     // 1. Output size (decoder verifies it matches the reconstructed profile).

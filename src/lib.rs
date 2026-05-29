@@ -33,6 +33,7 @@
     clippy::inconsistent_digit_grouping,
     clippy::approx_constant
 )]
+#![deny(unreachable_pub)]
 mod ac_context;
 mod adaptive_quant;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]

@@ -50,7 +50,7 @@ fn set_depth(idx: usize, pool: &[HuffmanNode], depth: &mut [u8], level: u8) {
     }
 }
 
-pub fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
+pub(crate) fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
     let length = data.len();
     debug_assert!(depth.len() >= length);
     for d in depth[..length].iter_mut() {

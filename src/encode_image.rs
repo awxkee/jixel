@@ -36,7 +36,7 @@ use crate::{ColorEncoding, EncodeError};
 
 /// 8-bit alpha plane (row-major, stride = `xsize`).
 #[derive(Debug, Clone)]
-pub enum AlphaPlane {
+pub(crate) enum AlphaPlane {
     /// 8-bit alpha, values 0..=255.
     U8(Vec<u8>),
     /// 10-bit (`bits=10`, values 0..=1023) or 12-bit (`bits=12`, values 0..=4095) alpha.
@@ -56,7 +56,7 @@ const MIN_DISTANCE: f32 = 0.03;
 pub(crate) const MAX_DIMENSION: usize = 0x3FFF_FFFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BitsPerSample {
+pub(crate) enum BitsPerSample {
     #[default]
     Eight,
     Ten,
@@ -76,25 +76,25 @@ impl BitsPerSample {
 impl AlphaPlane {
     /// Create an 8-bit alpha plane.
     #[inline]
-    pub fn from_u8(data: Vec<u8>) -> Self {
+    pub(crate) fn from_u8(data: Vec<u8>) -> Self {
         Self::U8(data)
     }
 
     /// Create a 10-bit alpha plane (values 0..=1023).
     #[inline]
-    pub fn from_u16_10bit(data: Vec<u16>) -> Self {
+    pub(crate) fn from_u16_10bit(data: Vec<u16>) -> Self {
         Self::U16 { data, bits: 10 }
     }
 
     /// Create a 12-bit alpha plane (values 0..=4095).
     #[inline]
-    pub fn from_u16_12bit(data: Vec<u16>) -> Self {
+    pub(crate) fn from_u16_12bit(data: Vec<u16>) -> Self {
         Self::U16 { data, bits: 12 }
     }
 
     /// Number of pixels.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Self::U8(v) => v.len(),
             Self::U16 { data, .. } => data.len(),
@@ -103,7 +103,7 @@ impl AlphaPlane {
 
     /// Bit depth of the alpha samples (8, 10, or 12).
     #[inline]
-    pub fn bits(&self) -> u8 {
+    pub(crate) fn bits(&self) -> u8 {
         match self {
             Self::U8(_) => 8,
             Self::U16 { bits, .. } => *bits,
@@ -112,7 +112,7 @@ impl AlphaPlane {
 
     /// Read pixel `idx` as `i32`.  Encoder hot path — kept tiny for inlining.
     #[inline]
-    pub fn get_i32(&self, idx: usize) -> i32 {
+    pub(crate) fn get_i32(&self, idx: usize) -> i32 {
         match self {
             Self::U8(v) => v[idx] as i32,
             Self::U16 { data, .. } => data[idx] as i32,
@@ -176,7 +176,7 @@ impl Default for EncodeConfigImpl {
 impl EncodeConfigImpl {
     /// Convenience builder with the given butteraugli distance and otherwise
     /// default settings (sRGB primaries, linear transfer).
-    pub fn with_distance(distance: f32) -> Self {
+    pub(crate) fn with_distance(distance: f32) -> Self {
         Self {
             distance,
             ..Self::default()
@@ -184,36 +184,36 @@ impl EncodeConfigImpl {
     }
 
     /// Attach an ICC profile. **Panics at encode time** — see field docs.
-    pub fn with_icc_profile(mut self, icc: Option<Vec<u8>>) -> Self {
+    pub(crate) fn with_icc_profile(mut self, icc: Option<Vec<u8>>) -> Self {
         self.icc_profile = icc;
         self
     }
 
     /// Attach an 8-bit alpha plane to be encoded losslessly via Modular.
     /// Length must equal `xsize * ysize` of the image passed to encode.
-    pub fn with_alpha(mut self, alpha: AlphaPlane) -> Self {
+    pub(crate) fn with_alpha(mut self, alpha: AlphaPlane) -> Self {
         self.alpha = Some(alpha);
         self
     }
 
-    pub fn with_bits_per_sample(mut self, bps: BitsPerSample) -> Self {
+    pub(crate) fn with_bits_per_sample(mut self, bps: BitsPerSample) -> Self {
         self.bits_per_sample = bps;
         self
     }
 
-    pub fn with_lossless(mut self, lossless: bool) -> Self {
+    pub(crate) fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
         self
     }
 
     /// Mark the image as grayscale (declares a Gray color space).
-    pub fn with_grayscale(mut self, grayscale: bool) -> Self {
+    pub(crate) fn with_grayscale(mut self, grayscale: bool) -> Self {
         self.grayscale = grayscale;
         self
     }
 
     /// Replace the color encoding (white point / primaries / transfer / intent).
-    pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
+    pub(crate) fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
         self.color_encoding = enc;
         self
     }
@@ -604,7 +604,14 @@ pub fn encode_image_gray_alpha_10bit(
         .iter()
         .map(|px| (px[0], px[1]))
         .unzip();
-    encode_gray_high_depth_impl(&luma, Some(alpha), width, height, config, BitsPerSample::Ten)
+    encode_gray_high_depth_impl(
+        &luma,
+        Some(alpha),
+        width,
+        height,
+        config,
+        BitsPerSample::Ten,
+    )
 }
 
 /// Encode a 12-bit grayscale+alpha image. `input` is interleaved `[L, A]` pairs,
@@ -627,7 +634,14 @@ pub fn encode_image_gray_alpha_12bit(
         .iter()
         .map(|px| (px[0], px[1]))
         .unzip();
-    encode_gray_high_depth_impl(&luma, Some(alpha), width, height, config, BitsPerSample::Twelve)
+    encode_gray_high_depth_impl(
+        &luma,
+        Some(alpha),
+        width,
+        height,
+        config,
+        BitsPerSample::Twelve,
+    )
 }
 
 /// Shared high-bit-depth grayscale encode path.

@@ -39,25 +39,9 @@ const K_INV_COLOR_FACTOR: f32 = 1.0 / 84.0;
 /// Regularisation toward base correlation. Matches libjxl-tiny.
 const K_DISTANCE_MULTIPLIER_AC: f32 = 1e-3;
 
-/// Solve the regularised 1D least squares:
-///     minimise sum_i ((a_i · x + b_i)^2) + distance_mul · x^2 · num
-/// where a_i = K_INV_COLOR_FACTOR · values_m[i],
-///       b_i = base · values_m[i] − values_s[i].
-///
-/// Returns the optimal slope quantised to int32 in [-128, 127], suitable for
-/// storage as i8 in the YtoX/YtoB map.
-fn find_best_multiplier(values_m: &[f32], values_s: &[f32], base: f32, distance_mul: f32) -> i32 {
-    let num = values_m.len();
+fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32) -> i32 {
     if num == 0 {
         return 0;
-    }
-    let mut ca = 0.0f32;
-    let mut cb = 0.0f32;
-    for i in 0..num {
-        let a = K_INV_COLOR_FACTOR * values_m[i];
-        let b = base * values_m[i] - values_s[i];
-        ca += a * a;
-        cb += a * b;
     }
     let x = -cb / (ca + num as f32 * distance_mul * 0.5);
     x.round().clamp(-128.0, 127.0) as i32
@@ -73,11 +57,6 @@ fn compute_cmap_tile(
     by_count: usize,
     matrices: &DequantMatrices,
 ) -> (i32, i32) {
-    let mut coeffs_yx: Vec<f32> = Vec::with_capacity(bx_count * by_count * 64);
-    let mut coeffs_x: Vec<f32> = Vec::with_capacity(bx_count * by_count * 64);
-    let mut coeffs_yb: Vec<f32> = Vec::with_capacity(bx_count * by_count * 64);
-    let mut coeffs_b: Vec<f32> = Vec::with_capacity(bx_count * by_count * 64);
-
     let qm_x = matrices.inv_matrix(0);
     let qm_b = matrices.inv_matrix(2);
 
@@ -85,6 +64,17 @@ fn compute_cmap_tile(
     let mut block_x = [0.0f32; 64];
     let mut block_b = [0.0f32; 64];
     let mut tmp = [0.0f32; 64];
+
+    // Accumulate the two regressions' normal-equation sums directly rather than
+    // materialising four per-sample coefficient vectors and re-reading them.
+    // The accumulation order (block-major, coefficient-minor, ca-before-cb)
+    // matches the previous push-then-iterate path exactly, and each per-sample
+    // expression is unchanged, so the resulting (ytox, ytob) is bit-identical.
+    let mut ca_x = 0.0f32;
+    let mut cb_x = 0.0f32;
+    let mut ca_b = 0.0f32;
+    let mut cb_b = 0.0f32;
+    let mut num = 0usize;
 
     for by in 0..by_count {
         for bx in 0..bx_count {
@@ -119,18 +109,28 @@ fn compute_cmap_tile(
             block_x[0] = 0.0;
             block_b[0] = 0.0;
 
-            // Weight by inverse quant matrix, store as sample sequence.
             for i in 0..64 {
-                coeffs_yx.push(block_y[i] * qm_x[i]);
-                coeffs_x.push(block_x[i] * qm_x[i]);
-                coeffs_yb.push(block_y[i] * qm_b[i]);
-                coeffs_b.push(block_b[i] * qm_b[i]);
+                // YtoX regression: m = Y·qm_x, s = X·qm_x, base = 0.0.
+                let m_x = block_y[i] * qm_x[i];
+                let s_x = block_x[i] * qm_x[i];
+                let a_x = K_INV_COLOR_FACTOR * m_x;
+                let b_x = 0.0 * m_x - s_x;
+                ca_x += a_x * a_x;
+                cb_x += a_x * b_x;
+                // YtoB regression: m = Y·qm_b, s = B·qm_b, base = 1.0.
+                let m_b = block_y[i] * qm_b[i];
+                let s_b = block_b[i] * qm_b[i];
+                let a_b = K_INV_COLOR_FACTOR * m_b;
+                let b_b = 1.0 * m_b - s_b;
+                ca_b += a_b * a_b;
+                cb_b += a_b * b_b;
             }
+            num += 64;
         }
     }
 
-    let ytox = find_best_multiplier(&coeffs_yx, &coeffs_x, 0.0, K_DISTANCE_MULTIPLIER_AC);
-    let ytob = find_best_multiplier(&coeffs_yb, &coeffs_b, 1.0, K_DISTANCE_MULTIPLIER_AC);
+    let ytox = solve_multiplier(ca_x, cb_x, num, K_DISTANCE_MULTIPLIER_AC);
+    let ytob = solve_multiplier(ca_b, cb_b, num, K_DISTANCE_MULTIPLIER_AC);
     (ytox, ytob)
 }
 

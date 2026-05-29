@@ -206,19 +206,22 @@ fn bench_cjxl(
     npx: f64,
 ) -> Result<Point> {
     let jxl = tmp.join(format!("{stem}_cjxl_e{effort}_{d}.jxl"));
+    let ext = img.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let _ = std::fs::remove_file(&jxl);
-    let output = Command::new("cjxl")
-        .arg(img)
+    let mut cmd = Command::new("cjxl");
+    cmd.arg(img)
         .arg(&jxl)
         .arg("-d")
         .arg(d.to_string())
         .arg("-e")
         .arg(effort.to_string())
-        .arg("--lossless_jpeg=0")
-        .arg("--quiet")
-        .output()
-        .context("running cjxl")?;
+        .arg("--quiet");
 
+    if ext != "png" {
+        cmd.arg("--lossless_jpeg=0");
+    }
+
+    let output = cmd.output().context("running cjxl")?;
     if !output.status.success() || !jxl.exists() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -245,15 +248,18 @@ fn decode_to_rgb(jxl: &Path, tmp: &Path, w: usize, h: usize) -> Result<Vec<u8>> 
         jxl.file_stem().unwrap().to_str().unwrap()
     ));
     let _ = std::fs::remove_file(&png);
-    let status = Command::new("djxl")
+    let output = Command::new("djxl")
         .arg(jxl)
         .arg(&png)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .context("running djxl")?;
-    if !status.success() || !png.exists() {
-        bail!("djxl failed for {}", jxl.display());
+    if !output.status.success() || !png.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "djxl failed for {}\nstdout: {stdout}\nstderr: {stderr}",
+            jxl.display()
+        );
     }
     let (rgb, dw, dh) = load_rgb(&png)?;
     if dw != w || dh != h {
