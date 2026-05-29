@@ -32,6 +32,7 @@ use crate::dc_group_data::{
 use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16};
 use crate::image::Image3F;
 use crate::quant_weights::DequantMatrices;
+use crate::util::FastRound;
 
 // libjxl-tiny constants for entropy estimation. Hoisted to module scope so the
 // per-coefficient helper below can reference them without re-declaring per call.
@@ -57,7 +58,7 @@ fn accumulate_coeff(
     info_loss: &mut f32,
     info_loss2: &mut f32,
 ) {
-    let rval = val.round();
+    let rval = val.fast_round();
     let diff = (val - rval).abs();
     *info_loss += diff;
     *info_loss2 += diff * diff;

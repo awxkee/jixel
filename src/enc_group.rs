@@ -42,6 +42,7 @@ use crate::dct::{
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
+use crate::util::FastRound;
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
 
@@ -175,7 +176,7 @@ fn quantize_block_ac(
             let q = qmv * q_scaled;
             let val = q * inv;
             *out = if val.abs() >= threshold {
-                val.round() as i32
+                val.fast_round() as i32
             } else {
                 0
             };
@@ -384,7 +385,7 @@ pub(crate) fn write_ac_group(
             for iy in 0..cov_y {
                 for ix in 0..cov_x {
                     let didx = iy * cov_x + ix;
-                    let y_dc_q = (inv_factor[1] * dc_vals[1][didx]).round() as i16;
+                    let y_dc_q = (inv_factor[1] * dc_vals[1][didx]).fast_round() as i16;
                     dc_data.quant_dc.plane_row_mut(1, global_by + iy)[global_bx + ix] = y_dc_q;
                     y_dc_q_arr[iy][ix] = y_dc_q;
                 }
@@ -480,7 +481,7 @@ pub(crate) fn write_ac_group(
                 for ix in 0..cov_x {
                     let didx = iy * cov_x + ix;
                     // base_correlation_x = 0 so no Y contribution to X DC store.
-                    let x_dc_q = (inv_factor[0] * x_dc_post[didx]).round() as i16;
+                    let x_dc_q = (inv_factor[0] * x_dc_post[didx]).fast_round() as i16;
                     dc_data.quant_dc.plane_row_mut(0, global_by + iy)[global_bx + ix] = x_dc_q;
                 }
             }
@@ -507,7 +508,7 @@ pub(crate) fn write_ac_group(
                     let didx = iy * cov_x + ix;
                     let b_dc_q = (b_dc_post[didx] * inv_factor[2]
                         - y_dc_q_arr[iy][ix] as f32 * cfl_factor_b)
-                        .round() as i16;
+                        .fast_round() as i16;
                     dc_data.quant_dc.plane_row_mut(2, global_by + iy)[global_bx + ix] = b_dc_q;
                 }
             }
