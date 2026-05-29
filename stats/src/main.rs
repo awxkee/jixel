@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
 

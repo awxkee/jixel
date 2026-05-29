@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod ans;
 mod cluster;
 mod entropy_code;
 mod histogram;
@@ -35,12 +36,14 @@ mod prefix_code;
 mod token;
 mod write;
 
+pub(crate) use ans::{AnsEncSymbolInfo, write_ans_tokens};
 pub(crate) use cluster::cluster_histograms;
 pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;
 pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
 pub(crate) use token::{Token, pack_signed, uint_encode};
 pub(crate) use write::{
-    build_entropy_code_no_cluster, build_huffman_codes, optimize_entropy_code, write_context_map,
-    write_entropy_code, write_prefix_codes, write_token,
+    build_entropy_code_no_cluster, build_huffman_codes, optimize_entropy_code,
+    optimize_entropy_code_ac, write_context_map, write_entropy_code, write_prefix_codes,
+    write_token,
 };

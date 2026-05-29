@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::ans::AnsEncSymbolInfo;
 use super::prefix_code::PrefixCode;
 
 pub(crate) struct EntropyCode<'a> {
@@ -38,6 +39,10 @@ pub(crate) struct EntropyCode<'a> {
     /// Original (pre-cluster) context map. None for static codes.
     pub(crate) orig_context_map: Option<&'a [u8]>,
     pub(crate) orig_num_contexts: usize,
+    /// When false, the bundle is encoded with rANS using the fields below.
+    pub(crate) use_prefix_code: bool,
+    pub(crate) ans_freqs: &'a [Vec<u16>],
+    pub(crate) ans_symbols: &'a [Vec<AnsEncSymbolInfo>],
 }
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
@@ -48,6 +53,10 @@ pub(crate) struct OwnedEntropyCode {
     /// Pre-cluster context map, if clustering was applied.
     pub(crate) orig_context_map: Option<Vec<u8>>,
     pub(crate) orig_num_contexts: usize,
+    /// rANS selection + tables. Empty / true when the prefix path is used.
+    pub(crate) use_prefix_code: bool,
+    pub(crate) ans_freqs: Vec<Vec<u16>>,
+    pub(crate) ans_symbols: Vec<Vec<AnsEncSymbolInfo>>,
 }
 
 impl OwnedEntropyCode {
@@ -59,6 +68,9 @@ impl OwnedEntropyCode {
             num_prefix_codes: self.prefix_codes.len(),
             orig_context_map: self.orig_context_map.as_deref(),
             orig_num_contexts: self.orig_num_contexts,
+            use_prefix_code: self.use_prefix_code,
+            ans_freqs: &self.ans_freqs,
+            ans_symbols: &self.ans_symbols,
         }
     }
 }

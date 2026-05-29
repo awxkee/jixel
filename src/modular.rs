@@ -223,10 +223,6 @@ fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::enc_lz77_ac::AcLz> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// GroupHeader helpers.
-// ---------------------------------------------------------------------------
-
 /// GroupHeader: use_global_tree=0, wp_header.all_default=1, 0 transforms.
 /// (4 bits)  Used for the LfGlobal local-tree path.
 fn write_group_header_local_tree(w: &mut BitWriter) {

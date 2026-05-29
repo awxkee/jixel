@@ -303,6 +303,9 @@ fn build_icc_code(enc: &[u8]) -> OwnedEntropyCode {
         prefix_codes: build_huffman_codes(&histograms),
         orig_context_map: None,
         orig_num_contexts: num_contexts,
+        use_prefix_code: true,
+        ans_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
     };
     for pc in &mut code.prefix_codes {
         single_symbol_patch(pc);
