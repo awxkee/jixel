@@ -93,7 +93,7 @@ fn dct1d_8(buf: &mut [f32]) {
     for i in 0..4 {
         tmp[i] = buf[i] + buf[7 - i];
     }
-    dct1d_4(<&mut [f32; 4]>::try_from(&mut tmp[0..4]).unwrap());
+    dct1d_4(<&mut [f32; 4]>::try_from(&mut tmp[..4]).unwrap());
     for i in 0..4 {
         tmp[4 + i] = (buf[i] - buf[7 - i]) * WC8[i];
     }

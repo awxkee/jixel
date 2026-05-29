@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::dct8x8;
+use crate::dct::{dct8x8, fmla};
 use crate::image::{Image3F, ImageSB};
 use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
@@ -44,7 +44,7 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32) -> i32 {
     if num == 0 {
         return 0;
     }
-    let x = -cb / (ca + num as f32 * distance_mul * 0.5);
+    let x = -cb / fmla(num as f32 * distance_mul, 0.5, ca);
     x.fast_round().clamp(-128.0, 127.0) as i32
 }
 

@@ -142,12 +142,20 @@ fn cbrt_q20(x_q20: i32, t: &FixedTables) -> i32 {
     let idx = (idx_full >> FP_SHIFT) as usize;
     let idx = idx.min(CBRT_LUT_LEN - 1);
     //
-    let frac = (idx_full & (FP_ONE as u32 - 1)) as i32;
+    let frac = (idx_full & (FP_ONE as u32 - 1)) as i64;
 
     let a = t.cbrt_lut[idx];
     let b = t.cbrt_lut[idx + 1];
     // Linear interpolation: a + (b-a)*frac/2^20, Q20.
-    a + (((b - a) as i64 * frac as i64) >> FP_SHIFT) as i32
+    let mut y = a + (((b - a) as i64 * frac) >> FP_SHIFT) as i32; // Q20
+
+    // Newton for y = x^(1/3):  y <- (2y + x/y^2) / 3
+    if y > 0 {
+        let y2 = (y as i64) * (y as i64); // Q40
+        let term = ((x_q20 as i64) << (2 * FP_SHIFT)) / y2;
+        y = ((2 * (y as i64) + term) / 3) as i32;
+    }
+    y
 }
 
 #[inline(always)]
