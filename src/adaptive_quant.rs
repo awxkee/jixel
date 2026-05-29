@@ -101,6 +101,8 @@ fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
         } else {
             xyb_y.plane_row(1, y + dy + 1)
         };
+        assert!(row.len() >= x + 8);
+        assert!(row_next.len() >= x + 8);
         for dx in 0..8 {
             let p = row[x + dx];
             // right difference, skipping the last column (matches kMaskRight)
@@ -172,7 +174,7 @@ fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
             let g = iny + inx;
             let ratio_r = ratio_cubic_to_simple_gamma(r, true);
             let ratio_g = ratio_cubic_to_simple_gamma(g, true);
-            overall_ratio += 0.5 * (ratio_r + ratio_g);
+            overall_ratio = fmla(0.5, ratio_r + ratio_g, overall_ratio);
         }
     }
     overall_ratio *= 1.0 / 64.0;
