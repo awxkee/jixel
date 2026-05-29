@@ -87,3 +87,35 @@ impl fmt::Display for EncodeError {
 }
 
 impl std::error::Error for EncodeError {}
+
+pub(crate) trait FastRound {
+    fn fast_round(self) -> Self;
+}
+
+impl FastRound for f32 {
+    fn fast_round(self) -> Self {
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "sse4.1"
+        ))]
+        {
+            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
+            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.round()
+        }
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse4.1"
+            )
+        )))]
+        {
+            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
+            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
+        }
+    }
+}

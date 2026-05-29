@@ -52,7 +52,6 @@ mod enc_lz77_ac;
 mod enc_xyb;
 mod encode_image;
 mod entropy;
-mod err;
 mod gaborish;
 mod icc_codec;
 mod image;
@@ -61,6 +60,7 @@ mod modular;
 mod neon;
 mod quant_weights;
 mod static_entropy_codes;
+mod util;
 
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
@@ -71,4 +71,4 @@ pub use encode_image::{
     encode_image_gray_alpha_10bit, encode_image_gray_alpha_12bit, encode_image_with_alpha,
     encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
 };
-pub use err::EncodeError;
+pub use util::EncodeError;

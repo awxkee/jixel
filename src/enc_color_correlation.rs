@@ -30,6 +30,7 @@
 use crate::dct::dct8x8;
 use crate::image::{Image3F, ImageSB};
 use crate::quant_weights::DequantMatrices;
+use crate::util::FastRound;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM_IN_BLOCKS: usize = 8;
@@ -44,7 +45,7 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32) -> i32 {
         return 0;
     }
     let x = -cb / (ca + num as f32 * distance_mul * 0.5);
-    x.round().clamp(-128.0, 127.0) as i32
+    x.fast_round().clamp(-128.0, 127.0) as i32
 }
 
 /// Compute (ytox, ytob) for one tile. `tile_brect_*` are block coordinates
