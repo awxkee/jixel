@@ -72,18 +72,14 @@ struct ImageDim {
     num_dc_groups: usize,
 }
 
-fn div_ceil(a: usize, b: usize) -> usize {
-    a.div_ceil(b)
-}
-
 impl ImageDim {
     fn new(xsize: usize, ysize: usize) -> Self {
-        let xsize_blocks = div_ceil(xsize, K_BLOCK_DIM);
-        let ysize_blocks = div_ceil(ysize, K_BLOCK_DIM);
-        let xsize_groups = div_ceil(xsize, K_GROUP_DIM);
-        let ysize_groups = div_ceil(ysize, K_GROUP_DIM);
-        let xsize_dc_groups = div_ceil(xsize, K_DC_GROUP_DIM);
-        let ysize_dc_groups = div_ceil(ysize, K_DC_GROUP_DIM);
+        let xsize_blocks = xsize.div_ceil(K_BLOCK_DIM);
+        let ysize_blocks = ysize.div_ceil(K_BLOCK_DIM);
+        let xsize_groups = xsize.div_ceil(K_GROUP_DIM);
+        let ysize_groups = ysize.div_ceil(K_GROUP_DIM);
+        let xsize_dc_groups = xsize.div_ceil(K_DC_GROUP_DIM);
+        let ysize_dc_groups = ysize.div_ceil(K_DC_GROUP_DIM);
         Self {
             xsize,
             ysize,
@@ -98,10 +94,6 @@ impl ImageDim {
         }
     }
 }
-
-// -----------------------------------------------------------------------------
-// Distance-derived parameters.
-// -----------------------------------------------------------------------------
 
 struct DistanceParams {
     distance: f32,
@@ -175,7 +167,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
-        gab_enabled: distance > 1.0,
+        gab_enabled: distance > 1.412,
     }
 }
 
@@ -778,10 +770,10 @@ fn process_dc_group(
     let dc_group_y0 = dc_gy * K_DC_GROUP_DIM;
     let dc_group_xsize = K_DC_GROUP_DIM.min(dim.xsize.saturating_sub(dc_group_x0));
     let dc_group_ysize = K_DC_GROUP_DIM.min(dim.ysize.saturating_sub(dc_group_y0));
-    let dc_group_xsize_blocks = div_ceil(dc_group_xsize, K_BLOCK_DIM);
-    let dc_group_ysize_blocks = div_ceil(dc_group_ysize, K_BLOCK_DIM);
-    let dc_group_xsize_groups = div_ceil(dc_group_xsize, K_GROUP_DIM);
-    let dc_group_ysize_groups = div_ceil(dc_group_ysize, K_GROUP_DIM);
+    let dc_group_xsize_blocks = dc_group_xsize.div_ceil(K_BLOCK_DIM);
+    let dc_group_ysize_blocks = dc_group_ysize.div_ceil(K_BLOCK_DIM);
+    let dc_group_xsize_groups = dc_group_xsize.div_ceil(K_GROUP_DIM);
+    let dc_group_ysize_groups = dc_group_ysize.div_ceil(K_GROUP_DIM);
 
     let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
 
@@ -826,7 +818,7 @@ fn process_dc_group(
         let group_y0 = image_gy * K_GROUP_DIM;
         let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
         let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
-        let group_ysize_tiles = div_ceil(group_ysize, K_TILE_DIM);
+        let group_ysize_tiles = group_ysize.div_ceil(K_TILE_DIM);
 
         let mut num_nzeros = Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS);
         let mut tokens: Vec<Token> =
@@ -837,8 +829,8 @@ fn process_dc_group(
             let stripe_y0 = group_y0 + ty * K_TILE_DIM;
             let stripe_xsize = group_xsize;
             let stripe_ysize = K_TILE_DIM.min(dim.ysize.saturating_sub(stripe_y0));
-            let stripe_xsize_padded = div_ceil(stripe_xsize, K_BLOCK_DIM) * K_BLOCK_DIM;
-            let stripe_ysize_padded = div_ceil(stripe_ysize, K_BLOCK_DIM) * K_BLOCK_DIM;
+            let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
+            let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
 
             let stripe = build_stripe(
                 opsin,

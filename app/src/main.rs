@@ -15,10 +15,10 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    // let rgb_img = image.to_rgb8();
     let image = image::open(Path::new("./assets/abstract_alpha.png")).unwrap();
+    let rgb_img = image.to_rgb8();
     let rgba_img = image.to_rgba8();
-    // let src_rgb = rgb_img.as_raw();
+    let src_rgb = rgb_img.as_raw();
     // for i in 0..10 {
     //     let instant = Instant::now();
     //     let d_bytes = jixel::encode_image_with_alpha(
@@ -40,7 +40,7 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(false)
+            .with_lossless(true)
             .with_quality(90.)
             .with_color_encoding(ColorEncoding::srgb()),
     )
