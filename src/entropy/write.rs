@@ -441,7 +441,11 @@ fn write_huffman_tree(depth: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut extra: Vec<u8> = Vec::new();
     let mut tree_size = 0usize;
     let (use_rle_nz, use_rle_zero) = if depth.len() > 50 {
-        decide_over_rle_use(&depth[..new_length])
+        let (_nz, zero) = decide_over_rle_use(&depth[..new_length]);
+        // NOTE: the non-zero run-length path (code 16) is disabled pending a
+        // round-trip fix; it desynchronizes djxl on dense float histograms even
+        // though the emitter matches libjxl. The zero path (code 17) is proven.
+        (false, zero)
     } else {
         (false, false)
     };

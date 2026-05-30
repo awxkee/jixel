@@ -62,9 +62,15 @@ pub(crate) fn uint_encode(value: u32) -> (u32, u32, u32) {
 
 /// Map a signed integer to a non-negative one via "zigzag" encoding.
 /// 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, ...
+/// Computed in i64 so it is exact across the full i32 range (the naive
+/// `value << 1` overflows i32 for |value| >= 2^30, which occurs with the large
+/// residuals produced when coding raw float bits). Identical result to the
+/// naive form for all values that don't overflow, so 8/16-bit output is
+/// unchanged. Matches libjxl's PackSigned (which uses int64 internally).
 #[inline]
 pub(crate) fn pack_signed(value: i32) -> u32 {
-    ((value << 1) ^ (value >> 31)) as u32
+    let v = value as i64;
+    ((v << 1) ^ (v >> 63)) as u32
 }
 
 #[cfg(test)]

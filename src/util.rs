@@ -35,20 +35,30 @@ pub enum EncodeError {
     /// Image width or height is zero.
     EmptyImage,
     /// The input buffer length does not match `width * height * channels`.
-    InputSizeMismatch { expected: usize, actual: usize },
+    InputSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     /// The alpha plane length does not match `width * height`.
-    AlphaSizeMismatch { expected: usize, actual: usize },
+    AlphaSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     /// `distance` must be a positive finite number.
     InvalidDistance(f32),
     /// Quality value was NaN.
     QualityIsNaN,
     /// One or both image dimensions exceed the maximum representable value
     /// (2^30 − 1).
-    DimensionTooLarge { width: usize, height: usize },
+    DimensionTooLarge {
+        width: usize,
+        height: usize,
+    },
     /// An alpha bit depth other than 8, 10, or 12 was supplied.
     UnsupportedAlphaBitDepth(u8),
     /// ICC profile injection is not yet implemented.
     IccProfileNotSupported,
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -82,6 +92,7 @@ impl fmt::Display for EncodeError {
             Self::IccProfileNotSupported => {
                 write!(f, "ICC profile injection is not yet supported by jixel")
             }
+            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }

@@ -30,7 +30,7 @@ use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::enc_frame::encode_frame;
-use crate::enc_lossless::{encode_frame_lossless, forward_ycocg};
+use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::image::{Image3F, Image3Si};
 use crate::{ColorEncoding, EncodeError};
 
@@ -39,7 +39,7 @@ fn checked_buffer_size<T>(
     height: usize,
     channels: usize,
 ) -> Result<usize, EncodeError> {
-    let pixel_size = size_of::<T>();
+    let pixel_size = core::mem::size_of::<T>();
     let total_size = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(channels));
@@ -69,6 +69,9 @@ pub(crate) enum AlphaPlane {
     U8(Vec<u8>),
     /// 10-bit (`bits=10`, values 0..=1023) or 12-bit (`bits=12`, values 0..=4095) alpha.
     U16 { data: Vec<u16>, bits: u8 },
+    /// IEEE-754 single-precision alpha, stored as the raw 32-bit float bits
+    /// reinterpreted as `i32` (matching libjxl's float_to_int for 32-bit float).
+    F32(Vec<i32>),
 }
 
 /// Codestream marker byte that follows the leading 0xFF. Identifies this as
@@ -154,6 +157,7 @@ impl AlphaPlane {
         match self {
             Self::U8(v) => v.len(),
             Self::U16 { data, .. } => data.len(),
+            Self::F32(v) => v.len(),
         }
     }
 
@@ -163,7 +167,14 @@ impl AlphaPlane {
         match self {
             Self::U8(_) => 8,
             Self::U16 { bits, .. } => *bits,
+            Self::F32(_) => 32,
         }
+    }
+
+    /// True if the alpha samples are IEEE-754 float (stored as raw bits).
+    #[inline]
+    pub(crate) fn is_float(&self) -> bool {
+        matches!(self, Self::F32(_))
     }
 
     /// Read pixel `idx` as `i32`.  Encoder hot path — kept tiny for inlining.
@@ -172,6 +183,7 @@ impl AlphaPlane {
         match self {
             Self::U8(v) => v[idx] as i32,
             Self::U16 { data, .. } => data[idx] as i32,
+            Self::F32(v) => v[idx],
         }
     }
 }
@@ -1000,6 +1012,81 @@ fn encode_high_depth_rgba(
 /// if present, is linear opacity quantized to a 16-bit integer extra channel
 /// (alpha rarely needs float precision, and this reuses the 16-bit alpha path).
 /// Lossless float is not supported here; `config.lossless` is ignored.
+/// f32 lossless (v1): non-negative float RGB only. Reinterprets each float's
+/// IEEE-754 bits as an int32 modular channel (matching libjxl's float_to_int
+/// for 32-bit float) and codes them with no RCT and no LZ77.
+fn encode_f32_lossless_rgba(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    if width == 0 || height == 0 {
+        return Err(EncodeError::EmptyImage);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
+    }
+
+    // Guard once: v1 supports only finite, non-negative floats (negatives map to
+    // large-magnitude negative int32 bits whose residuals overflow i32, which
+    // needs the future 64-bit token path). Applies to RGB and alpha alike.
+    for &v in input.iter() {
+        if !v.is_finite() || v < 0.0 {
+            return Err(EncodeError::Unsupported(
+                "f32 lossless v1 supports only finite non-negative values",
+            ));
+        }
+    }
+
+    let nchan = if has_alpha { 4 } else { 3 };
+    let mut image3s = Image3Si::new(width, height);
+    let mut alpha_bits: Vec<i32> = if has_alpha {
+        Vec::with_capacity(width * height)
+    } else {
+        Vec::new()
+    };
+    for (y, row) in input.chunks_exact(width * nchan).enumerate() {
+        let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
+        for (x, src) in row.chunks_exact(nchan).enumerate() {
+            r_row[x] = src[0].to_bits() as i32;
+            g_row[x] = src[1].to_bits() as i32;
+            b_row[x] = src[2].to_bits() as i32;
+            if has_alpha {
+                alpha_bits.push(src[3].to_bits() as i32);
+            }
+        }
+    }
+    let alpha = if has_alpha {
+        Some(AlphaPlane::F32(alpha_bits))
+    } else {
+        None
+    };
+
+    let mut w = BitWriter::new();
+    w.write(8, 0xFF);
+    w.write(8, CODESTREAM_MARKER as u64);
+    write_size_header(width, height, &mut w);
+    write_image_metadata(
+        &config.color_encoding,
+        alpha.as_ref(),
+        config.icc_profile.as_deref(),
+        BitsPerSample::F32,
+        true,
+        false,
+        &mut w,
+    );
+    encode_frame_lossless_float(&image3s, alpha.as_ref(), &mut w);
+    let codestream = w.into_bytes();
+    let alpha_bits_md = if has_alpha { 32 } else { 0 };
+    if needs_level_10(32, true, alpha_bits_md) {
+        Ok(wrap_jxl_container(codestream, 10))
+    } else {
+        Ok(codestream)
+    }
+}
+
 fn encode_float_rgba(
     input: &[f32],
     width: usize,
@@ -1014,6 +1101,9 @@ fn encode_float_rgba(
             expected,
             actual: input.len(),
         });
+    }
+    if config.lossless && matches!(bps, BitsPerSample::F32) {
+        return encode_f32_lossless_rgba(input, width, height, has_alpha, config);
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let mut linear = Image3F::new(width, height);
@@ -1200,6 +1290,7 @@ pub(crate) fn encode_with_config(
         let expected = match &alpha {
             AlphaPlane::U8(_) => checked_buffer_size::<u8>(input.xsize(), input.ysize(), 1)?,
             AlphaPlane::U16 { .. } => checked_buffer_size::<u16>(input.xsize(), input.ysize(), 1)?,
+            AlphaPlane::F32(_) => checked_buffer_size::<f32>(input.xsize(), input.ysize(), 1)?,
         };
         if alpha.len() != expected {
             return Err(EncodeError::AlphaSizeMismatch {
@@ -1376,7 +1467,9 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.grayscale,
         &mut w,
     );
-    encode_frame_lossless(&image3s, alpha_plane.as_ref(), &mut w);
+    let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
+    let eff_bits = (max_bp as u32).max(alpha_bits);
+    encode_frame_lossless(&image3s, alpha_plane.as_ref(), eff_bits, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     if needs_level_10(max_bp as u32, true, alpha_bits) {
@@ -1525,7 +1618,11 @@ fn write_image_metadata(
             bits => {
                 w.write(1, 0); // all_default = false
                 w.write(2, 0); // ec_type = Alpha (selector 0)
-                write_int_bit_depth(bits as u32, w); // float flag + bits selector
+                if alpha.is_float() {
+                    write_float_bit_depth(32, 8, w); // f32 alpha bit depth
+                } else {
+                    write_int_bit_depth(bits as u32, w);
+                }
                 w.write(2, 0); // dim_shift = 0
                 w.write(2, 0); // name length = 0
                 w.write(1, 0); // alpha_associated = false
