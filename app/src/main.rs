@@ -16,7 +16,7 @@ fn main() {
     let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
     // let rgb_img = image.to_rgb8();
-    let image = image::open(Path::new("./assets/volcanic.jpg")).unwrap();
+    let image = image::open(Path::new("./assets/digital_art_portrait.jpg")).unwrap();
     let rgba_img = image.to_rgba8();
     // let src_rgb = rgb_img.as_raw();
     // for i in 0..10 {
@@ -34,8 +34,8 @@ fn main() {
     // }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let img10 = image.to_rgb8(); //vec![0u8; width * height * 3];
-    let bytes = jixel::encode_image(
+    let img10 = image.to_rgba16(); //vec![0u8; width * height * 3];
+    let bytes = jixel::encode_image_with_alpha_16bit(
         &img10,
         width,
         height,

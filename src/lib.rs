@@ -67,8 +67,9 @@ pub use color_encoding::{
 };
 pub use encode_image::{
     EncodeConfig, distance_from_quality, encode_image, encode_image_10bit, encode_image_12bit,
-    encode_image_gray, encode_image_gray_10bit, encode_image_gray_12bit, encode_image_gray_alpha,
-    encode_image_gray_alpha_10bit, encode_image_gray_alpha_12bit, encode_image_with_alpha,
-    encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
+    encode_image_16bit, encode_image_gray, encode_image_gray_10bit, encode_image_gray_12bit,
+    encode_image_gray_16bit, encode_image_gray_alpha, encode_image_gray_alpha_10bit,
+    encode_image_gray_alpha_12bit, encode_image_gray_alpha_16bit, encode_image_with_alpha,
+    encode_image_with_alpha_10bit, encode_image_with_alpha_12bit, encode_image_with_alpha_16bit,
 };
 pub use util::EncodeError;
