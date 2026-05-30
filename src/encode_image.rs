@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::bit_writer::BitWriter;
-use crate::color::{lut_high_bit, srgb_to_linear_u8};
+use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, forward_ycocg};
@@ -62,6 +62,10 @@ pub(crate) enum BitsPerSample {
     Ten,
     Twelve,
     Sixteen,
+    /// IEEE-754 half (16-bit, 5 exponent bits). Lossy only.
+    F16,
+    /// IEEE-754 single (32-bit, 8 exponent bits). Lossy only.
+    F32,
 }
 
 impl BitsPerSample {
@@ -71,6 +75,22 @@ impl BitsPerSample {
             BitsPerSample::Ten => 10,
             BitsPerSample::Twelve => 12,
             BitsPerSample::Sixteen => 16,
+            BitsPerSample::F16 => 16,
+            BitsPerSample::F32 => 32,
+        }
+    }
+
+    /// True for IEEE-754 float sample formats (f16/f32).
+    pub(crate) fn is_float(self) -> bool {
+        matches!(self, BitsPerSample::F16 | BitsPerSample::F32)
+    }
+
+    /// Number of exponent bits (5 for f16, 8 for f32); 0 for integer formats.
+    pub(crate) fn exp_bits(self) -> u32 {
+        match self {
+            BitsPerSample::F16 => 5,
+            BitsPerSample::F32 => 8,
+            _ => 0,
         }
     }
 }
@@ -811,6 +831,9 @@ fn encode_gray_high_depth_impl(
         BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(a),
         BitsPerSample::Sixteen => AlphaPlane::from_u16_16bit(a),
         BitsPerSample::Eight => unreachable!("high-depth gray path called with 8-bit bps"),
+        BitsPerSample::F16 | BitsPerSample::F32 => {
+            unreachable!("float path does not use the integer alpha match")
+        }
     });
 
     let mut cfg = EncodeConfigImpl::with_distance(distance)
@@ -897,6 +920,9 @@ fn encode_high_depth_rgba(
                     BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
                     BitsPerSample::Sixteen => AlphaPlane::from_u16_16bit(alpha_plane),
                     BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
+                    BitsPerSample::F16 | BitsPerSample::F32 => {
+                        unreachable!("float path does not use the integer alpha match")
+                    }
                 })
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
@@ -925,6 +951,188 @@ fn encode_high_depth_rgba(
                 .with_color_encoding(config.color_encoding),
         )
     }
+}
+
+/// Shared float (f16/f32) RGB(A) **lossy** encode path. `input` is interleaved
+/// f32 samples (sRGB-encoded, normalized to [0, 1]), 3 or 4 per pixel. Alpha,
+/// if present, is linear opacity quantized to a 16-bit integer extra channel
+/// (alpha rarely needs float precision, and this reuses the 16-bit alpha path).
+/// Lossless float is not supported here; `config.lossless` is ignored.
+fn encode_float_rgba(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    config: &EncodeConfig,
+    bps: BitsPerSample,
+) -> Result<Vec<u8>, EncodeError> {
+    let expected = width * height * if has_alpha { 4 } else { 3 };
+    if input.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected,
+            actual: input.len(),
+        });
+    }
+    let distance = config.distance.max(MIN_DISTANCE);
+    let mut linear = Image3F::new(width, height);
+
+    if has_alpha {
+        let mut alpha_plane = vec![0u16; width * height];
+        for (y, (row, alpha_row)) in input
+            .chunks_exact(width * 4)
+            .zip(alpha_plane.chunks_exact_mut(width))
+            .enumerate()
+        {
+            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+            for ((((r, g), b), src), a) in r_row
+                .iter_mut()
+                .zip(g_row.iter_mut())
+                .zip(b_row.iter_mut())
+                .zip(row.as_chunks::<4>().0.iter())
+                .zip(alpha_row.iter_mut())
+            {
+                *r = srgb_to_linear_f32(src[0]);
+                *g = srgb_to_linear_f32(src[1]);
+                *b = srgb_to_linear_f32(src[2]);
+                *a = (src[3].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+            }
+        }
+        encode_with_config(
+            &linear,
+            &EncodeConfigImpl::with_distance(distance)
+                .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
+                .with_bits_per_sample(bps)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        )
+    } else {
+        for (y, row) in input.chunks_exact(width * 3).enumerate() {
+            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+            for (((r, g), b), src) in r_row
+                .iter_mut()
+                .zip(g_row.iter_mut())
+                .zip(b_row.iter_mut())
+                .zip(row.as_chunks::<3>().0.iter())
+            {
+                *r = srgb_to_linear_f32(src[0]);
+                *g = srgb_to_linear_f32(src[1]);
+                *b = srgb_to_linear_f32(src[2]);
+            }
+        }
+        encode_with_config(
+            &linear,
+            &EncodeConfigImpl::with_distance(distance)
+                .with_bits_per_sample(bps)
+                .with_icc_profile(config.icc_profile.clone())
+                .with_color_encoding(config.color_encoding),
+        )
+    }
+}
+
+/// Float (f16/f32) grayscale **lossy** encode path. `luma` is `width * height`
+/// f32 samples (sRGB-encoded, [0, 1]).
+fn encode_float_gray(
+    luma: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    bps: BitsPerSample,
+) -> Result<Vec<u8>, EncodeError> {
+    if luma.len() != width * height {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height,
+            actual: luma.len(),
+        });
+    }
+    let distance = config.distance.max(MIN_DISTANCE);
+    let mut linear = Image3F::new(width, height);
+    for (y, row) in luma.chunks_exact(width).enumerate() {
+        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
+        for (((r, g), b), &v) in r_row
+            .iter_mut()
+            .zip(g_row.iter_mut())
+            .zip(b_row.iter_mut())
+            .zip(row.iter())
+        {
+            let lin = srgb_to_linear_f32(v);
+            *r = lin;
+            *g = lin;
+            *b = lin;
+        }
+    }
+    encode_with_config(
+        &linear,
+        &EncodeConfigImpl::with_distance(distance)
+            .with_grayscale(true)
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_color_encoding(config.color_encoding),
+    )
+}
+
+/// Encode a 32-bit float RGB image (lossy). `input` is interleaved `[R, G, B]`,
+/// `width * height * 3` samples, each sRGB-encoded in [0, 1].
+pub fn encode_image_f32(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_rgba(input, width, height, false, config, BitsPerSample::F32)
+}
+
+/// Encode a 16-bit-half float RGB image (lossy). Input is f32 in [0, 1]; the
+/// stream is declared as f16.
+pub fn encode_image_f16(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_rgba(input, width, height, false, config, BitsPerSample::F16)
+}
+
+/// Encode a 32-bit float RGBA image (lossy). `input` is interleaved
+/// `[R, G, B, A]`; RGB sRGB-encoded in [0, 1], A linear opacity in [0, 1]
+/// (quantized to a 16-bit alpha channel).
+pub fn encode_image_with_alpha_f32(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_rgba(input, width, height, true, config, BitsPerSample::F32)
+}
+
+/// Encode a 16-bit-half float RGBA image (lossy).
+pub fn encode_image_with_alpha_f16(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_rgba(input, width, height, true, config, BitsPerSample::F16)
+}
+
+/// Encode a 32-bit float grayscale image (lossy). `input` is `width * height`
+/// luma samples, sRGB-encoded in [0, 1].
+pub fn encode_image_gray_f32(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_gray(input, width, height, config, BitsPerSample::F32)
+}
+
+/// Encode a 16-bit-half float grayscale image (lossy).
+pub fn encode_image_gray_f16(
+    input: &[f32],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_float_gray(input, width, height, config, BitsPerSample::F16)
 }
 
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
@@ -1209,6 +1417,26 @@ fn write_int_bit_depth(bits: u32, w: &mut BitWriter) {
     }
 }
 
+/// Write a JXL `BitDepth` field for an **IEEE-754 float** sample.
+///
+/// Layout: `floating_point_sample` (1 bit, = 1) followed by
+/// `U32(Val(32), Val(16), Val(24), BitsOffset(6, 1))` for the total bit width
+/// (f32 → selector 0, f16 → selector 1), then 4 bits = `exp_bits - 1`
+/// (f32: 8 → 7 = 0b0111; f16: 5 → 4 = 0b0100).
+fn write_float_bit_depth(bits: u32, exp_bits: u32, w: &mut BitWriter) {
+    w.write(1, 1); // floating_point_sample = true
+    match bits {
+        32 => w.write(2, 0),
+        16 => w.write(2, 1),
+        24 => w.write(2, 2),
+        _ => {
+            w.write(2, 3);
+            w.write(6, (bits - 1) as u64);
+        }
+    }
+    w.write(4, (exp_bits - 1) as u64);
+}
+
 fn write_image_metadata(
     color_encoding: &ColorEncoding,
     alpha: Option<&AlphaPlane>,
@@ -1220,7 +1448,11 @@ fn write_image_metadata(
 ) {
     w.write(1, 0); // all_default = false
     w.write(1, 0); // extra_fields = false
-    write_int_bit_depth(bps.bits(), w);
+    if bps.is_float() {
+        write_float_bit_depth(bps.bits(), bps.exp_bits(), w);
+    } else {
+        write_int_bit_depth(bps.bits(), w);
+    }
     // modular_16_bit_buffer_sufficient: a modular integer channel of N bits needs
     // N+1 signed buffer bits (libjxl enc_modular). So any 16-bit modular channel
     // needs 17 bits → 16-bit buffers are NOT sufficient. Modular channels here:

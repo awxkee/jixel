@@ -131,14 +131,17 @@ pub(crate) fn write_ac_group_alpha(
                 0
             };
             let pred = gradient(w_, n_, nw_);
-            // Single context (leaf 0). Matches the single-leaf tree below.
-            tokens.push(Token::new(0, pack_signed(v - pred)));
+            let ctx = if w_ + n_ - nw_ > 0 { 0u32 } else { 1u32 };
+            tokens.push(Token::new(ctx, pack_signed(v - pred)));
         }
     }
 
-    let pixel_code = build_pixel_code(&tokens); // single context
+    const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
+    let pixel_code = build_pixel_code_n(&tokens, NUM_CTX);
     write_group_header_local_tree(w); // use_global_tree=0, wp default, 0 transforms
-    write_tree_and_pixel_histograms(&pixel_code, w); // single-leaf Gradient tree + code
+    write_split_tree(w); // 2-leaf Gradient tree, split on property 9 at 0
+    w.write(1, 0); // no LZ77 for the pixel entropy code
+    write_entropy_code(&pixel_code.as_ref(), w); // context map + 2 prefix codes
     let code_ref = pixel_code.as_ref();
     for tok in &tokens {
         write_token(*tok, &code_ref, w);
