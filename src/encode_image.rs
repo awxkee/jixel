@@ -790,13 +790,13 @@ fn encode_gray_high_depth_impl(
             actual: luma.len(),
         });
     }
-    if let Some(alpha) = alpha.as_ref() {
-        if alpha.len() != expected {
-            return Err(EncodeError::InputSizeMismatch {
-                expected: width * height,
-                actual: luma.len(),
-            });
-        }
+    if let Some(alpha) = alpha.as_ref()
+        && alpha.len() != expected
+    {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height,
+            actual: luma.len(),
+        });
     }
     if !config.distance.is_finite() || config.distance <= 0.0 {
         return Err(EncodeError::InvalidDistance(config.distance));

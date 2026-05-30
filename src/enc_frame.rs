@@ -361,10 +361,6 @@ fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Frame header, quant scales, DC global, AC global, DC group, TOC.
-// -----------------------------------------------------------------------------
-
 fn write_frame_header(
     x_qm_scale: u32,
     epf_iters: u32,
