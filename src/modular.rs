@@ -109,12 +109,6 @@ pub(crate) fn write_ac_group_alpha(
         return;
     }
 
-    // Tokenize into two contexts using the SAME split the decoder applies via a
-    // 2-leaf local tree on the raw gradient property [9] = W+N-NW at splitval 0:
-    //   grad > 0 -> leaf 0, else -> leaf 1.
-    // For a constant group every pixel predicts perfectly (residual 0) and lands
-    // in leaf 0 except the top-left corner (grad 0 -> leaf 1), so leaf 0 becomes
-    // a single-symbol code costing ~0 bits.
     let mut tokens: Vec<Token> = Vec::with_capacity(gw * gh);
     for gy in 0..gh {
         let img_y = y0 + gy;
@@ -137,51 +131,20 @@ pub(crate) fn write_ac_group_alpha(
                 0
             };
             let pred = gradient(w_, n_, nw_);
-            let grad_raw = w_ + n_ - nw_;
-            let ctx = if grad_raw > 0 { 0u32 } else { 1u32 };
+            let ctx = if w_ + n_ - nw_ > 0 { 0u32 } else { 1u32 };
             tokens.push(Token::new(ctx, pack_signed(v - pred)));
         }
     }
 
-    write_group_header_local_tree(w);
-
-    // Build the tree (split node + 2 gradient leaves) and write it.
-    write_split_tree(w);
-
-    // Decide between plain and LZ77 coding of the pixel residuals. Smooth/photo
-    // alpha produces long runs of identical residuals (mostly zero) that LZ77
-    // collapses far below the 1 bit/pixel Huffman floor; constant alpha is
-    // already ~free via the single-symbol leaf, so plain usually wins there.
-    const NUM_CTX: usize = 2; // leaf 0, leaf 1
-
-    // LZ77 over the RASTER residual sequence: the decoder calls `next` exactly
-    // once per pixel and, while a copy is in progress, returns window values
-    // without reading a symbol. So a copy that starts at raster pixel i (length
-    // symbol coded on pixel i's context, distance 1 = repeat previous value)
-    // replays the previous residual for the next L pixels in raster order. We
-    // therefore collapse runs of identical packed residuals in raster order.
-    let lz_stream = lz77_compress_alpha(&tokens);
-
-    let plain_code = build_pixel_code_n(&tokens, NUM_CTX);
-    let plain_bits = estimate_plain_bits(&tokens, &plain_code);
-
-    let lz_num_ctx = NUM_CTX + 1; // + distance context
-    let lz_streams = [lz_stream];
-    let lz_code = crate::enc_lz77_ac::build_lz_code_no_cluster(&lz_streams, lz_num_ctx);
-    let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(&lz_streams, &lz_code, lz_num_ctx);
-
-    if lz_bits + 64 < plain_bits {
-        crate::enc_lz77_ac::write_ac_lz_header_and_code(&lz_code, w);
-        for t in &lz_streams[0] {
-            crate::enc_lz77_ac::write_ac_lz(*t, &lz_code, lz_num_ctx, w);
-        }
-    } else {
-        w.write(1, 0); // no LZ77 for pixel entropy code
-        write_entropy_code(&plain_code.as_ref(), w);
-        let code_ref = plain_code.as_ref();
-        for tok in &tokens {
-            write_token(*tok, &code_ref, w);
-        }
+    const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
+    let pixel_code = build_pixel_code_n(&tokens, NUM_CTX);
+    write_group_header_local_tree(w); // use_global_tree=0, wp default, 0 transforms
+    write_split_tree(w); // 2-leaf Gradient tree, split on property 9 at 0
+    w.write(1, 0); // no LZ77 for the pixel entropy code
+    write_entropy_code(&pixel_code.as_ref(), w); // context map + 2 prefix codes
+    let code_ref = pixel_code.as_ref();
+    for tok in &tokens {
+        write_token(*tok, &code_ref, w);
     }
 }
 
@@ -190,6 +153,7 @@ pub(crate) fn write_ac_group_alpha(
 /// when `L-1 >= LZ77_MIN_LENGTH`, by a copy of `L-1` covering the rest. The copy
 /// length symbol is coded on the context of the first copied pixel (the pixel
 /// right after the literal), matching how the decoder reads it.
+#[allow(dead_code)]
 fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::enc_lz77_ac::AcLz> {
     use crate::enc_lz77_ac::{AcLz, LZ77_MIN_LENGTH};
     let mut out: Vec<AcLz> = Vec::with_capacity(tokens.len());
@@ -275,6 +239,7 @@ fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWri
 /// Write the 2-leaf alpha tree: a split node on property 9 (raw gradient) at
 /// splitval 0, followed by two Gradient-predictor leaves. The pixel entropy
 /// code is written separately by the caller (so it can choose plain vs LZ77).
+#[allow(dead_code)]
 fn write_split_tree(w: &mut BitWriter) {
     // Property index 9 = raw gradient (W+N-NW) in libjxl's property order.
     const PROP_GRAD: u32 = 9;
@@ -306,6 +271,7 @@ fn write_split_tree(w: &mut BitWriter) {
 }
 
 /// Estimate the encoded size in bits of the plain (non-LZ) pixel token stream.
+#[allow(dead_code)]
 fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
     let code_ref = code.as_ref();
     let mut bits: u64 = 0;

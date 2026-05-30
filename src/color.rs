@@ -71,6 +71,16 @@ impl LutHighBit {
     }
 }
 
+#[inline]
+pub(crate) fn srgb_to_linear_f32(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// sRGB transfer function: u16 (0..=max) → linear-light f32.
 ///
 /// `max` is `(1 << bits) - 1`, e.g. 1023 for 10-bit, 4095 for 12-bit.
