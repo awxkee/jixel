@@ -167,6 +167,8 @@ fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     for dy in 0..8 {
         let row_x = xyb.plane_row(0, y + dy);
         let row_y = xyb.plane_row(1, y + dy);
+        assert!(row_x.len() >= x + 8);
+        assert!(row_y.len() >= x + 8);
         for dx in 0..8 {
             let iny = row_y[x + dx] + k_bias;
             let inx = row_x[x + dx];
