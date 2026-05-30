@@ -34,6 +34,34 @@ use crate::enc_lossless::{encode_frame_lossless, forward_ycocg};
 use crate::image::{Image3F, Image3Si};
 use crate::{ColorEncoding, EncodeError};
 
+fn checked_buffer_size<T>(
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<usize, EncodeError> {
+    let pixel_size = size_of::<T>();
+    let total_size = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(channels));
+
+    _ = total_size
+        .and_then(|v| v.checked_mul(pixel_size))
+        .and_then(|v| isize::try_from(v).ok())
+        .map(|v| v as usize)
+        .ok_or(EncodeError::DimensionTooLarge {
+            width: height,
+            height,
+        })?;
+
+    total_size
+        .and_then(|v| isize::try_from(v).ok())
+        .map(|v| v as usize)
+        .ok_or(EncodeError::DimensionTooLarge {
+            width: height,
+            height,
+        })
+}
+
 /// 8-bit alpha plane (row-major, stride = `xsize`).
 #[derive(Debug, Clone)]
 pub(crate) enum AlphaPlane {
@@ -307,7 +335,7 @@ pub fn encode_image(
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(EncodeError::DimensionTooLarge { width, height });
     }
-    let expected = width * height * 3;
+    let expected = checked_buffer_size::<u8>(width, height, 3)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -369,7 +397,7 @@ pub fn encode_image_with_alpha(
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(EncodeError::DimensionTooLarge { width, height });
     }
-    let expected = width * height * 4;
+    let expected = checked_buffer_size::<u8>(width, height, 4)?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -502,7 +530,8 @@ pub fn encode_image_gray_alpha(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if input.len() != width * height * 2 {
+    let expected = checked_buffer_size::<u8>(width, height, 2)?;
+    if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height * 2,
             actual: input.len(),
@@ -532,7 +561,8 @@ fn encode_gray_impl(
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(EncodeError::DimensionTooLarge { width, height });
     }
-    if luma.len() != width * height {
+    let expected = checked_buffer_size::<u8>(width, height, 1)?;
+    if luma.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height,
             actual: luma.len(),
@@ -642,7 +672,8 @@ pub fn encode_image_gray_alpha_10bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if input.len() != width * height * 2 {
+    let expected = checked_buffer_size::<u16>(width, height, 2)?;
+    if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height * 2,
             actual: input.len(),
@@ -672,7 +703,8 @@ pub fn encode_image_gray_alpha_12bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if input.len() != width * height * 2 {
+    let expected = checked_buffer_size::<u16>(width, height, 2)?;
+    if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height * 2,
             actual: input.len(),
@@ -712,7 +744,8 @@ pub fn encode_image_gray_alpha_16bit(
     height: usize,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if input.len() != width * height * 2 {
+    let expected = checked_buffer_size::<u16>(width, height, 2)?;
+    if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height * 2,
             actual: input.len(),
@@ -750,7 +783,16 @@ fn encode_gray_high_depth_impl(
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
         return Err(EncodeError::DimensionTooLarge { width, height });
     }
-    if luma.len() != width * height {
+    let expected = checked_buffer_size::<u16>(width, height, 1)?;
+    if luma.len() != expected {
+        return Err(EncodeError::InputSizeMismatch {
+            expected: width * height,
+            actual: luma.len(),
+        });
+    }
+    if let Some(alpha) = alpha.as_ref()
+        && alpha.len() != expected
+    {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height,
             actual: luma.len(),
@@ -856,7 +898,7 @@ fn encode_high_depth_rgba(
     config: &EncodeConfig,
     bps: BitsPerSample,
 ) -> Result<Vec<u8>, EncodeError> {
-    let expected = width * height * if has_alpha { 4 } else { 3 };
+    let expected = checked_buffer_size::<u16>(width, height, if has_alpha { 4 } else { 3 })?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -966,7 +1008,7 @@ fn encode_float_rgba(
     config: &EncodeConfig,
     bps: BitsPerSample,
 ) -> Result<Vec<u8>, EncodeError> {
-    let expected = width * height * if has_alpha { 4 } else { 3 };
+    let expected = checked_buffer_size::<f32>(width, height, if has_alpha { 4 } else { 3 })?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -1038,7 +1080,8 @@ fn encode_float_gray(
     config: &EncodeConfig,
     bps: BitsPerSample,
 ) -> Result<Vec<u8>, EncodeError> {
-    if luma.len() != width * height {
+    let expected = checked_buffer_size::<f32>(width, height, 1)?;
+    if luma.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected: width * height,
             actual: luma.len(),
@@ -1154,7 +1197,10 @@ pub(crate) fn encode_with_config(
     }
 
     if let Some(alpha) = config.alpha.as_ref() {
-        let expected = input.xsize() * input.ysize();
+        let expected = match &alpha {
+            AlphaPlane::U8(_) => checked_buffer_size::<u8>(input.xsize(), input.ysize(), 1)?,
+            AlphaPlane::U16 { .. } => checked_buffer_size::<u16>(input.xsize(), input.ysize(), 1)?,
+        };
         if alpha.len() != expected {
             return Err(EncodeError::AlphaSizeMismatch {
                 expected,
@@ -1218,7 +1264,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     if width == 0 || height == 0 {
         return Err(EncodeError::EmptyImage);
     }
-    let expected = width * height * if has_alpha { 4 } else { 3 };
+    let expected = checked_buffer_size::<T>(width, height, if has_alpha { 4 } else { 3 })?;
     if input.len() != expected {
         return Err(EncodeError::InputSizeMismatch {
             expected,
@@ -1545,5 +1591,420 @@ mod tests {
     #[should_panic(expected = "quality must not be NaN")]
     fn quality_nan_panics() {
         let _ = distance_from_quality(f32::NAN);
+    }
+}
+
+#[cfg(test)]
+mod encode_smoke_tests {
+    use super::*;
+
+    const W: usize = 16;
+    const H: usize = 16;
+
+    fn rgb8() -> Vec<u8> {
+        (0..W * H * 3).map(|i| (i % 256) as u8).collect()
+    }
+
+    fn rgba8() -> Vec<u8> {
+        (0..W * H * 4).map(|i| (i % 256) as u8).collect()
+    }
+
+    fn rgb16() -> Vec<u16> {
+        (0..W * H * 3).map(|i| (i % 65536) as u16).collect()
+    }
+
+    fn rgba16() -> Vec<u16> {
+        (0..W * H * 4).map(|i| (i % 65536) as u16).collect()
+    }
+
+    fn gray8() -> Vec<u8> {
+        (0..W * H).map(|i| (i % 256) as u8).collect()
+    }
+
+    fn gray_alpha8() -> Vec<u8> {
+        (0..W * H * 2).map(|i| (i % 256) as u8).collect()
+    }
+
+    fn gray16() -> Vec<u16> {
+        (0..W * H).map(|i| (i % 65536) as u16).collect()
+    }
+
+    fn gray_alpha16() -> Vec<u16> {
+        (0..W * H * 2).map(|i| (i % 65536) as u16).collect()
+    }
+
+    fn rgb10() -> Vec<u16> {
+        (0..W * H * 3).map(|i| (i % 1024) as u16).collect()
+    }
+
+    fn rgba10() -> Vec<u16> {
+        (0..W * H * 4).map(|i| (i % 1024) as u16).collect()
+    }
+
+    fn rgb12() -> Vec<u16> {
+        (0..W * H * 3).map(|i| (i % 4096) as u16).collect()
+    }
+
+    fn rgba12() -> Vec<u16> {
+        (0..W * H * 4).map(|i| (i % 4096) as u16).collect()
+    }
+
+    fn gray10() -> Vec<u16> {
+        (0..W * H).map(|i| (i % 1024) as u16).collect()
+    }
+
+    fn gray_alpha10() -> Vec<u16> {
+        (0..W * H * 2).map(|i| (i % 1024) as u16).collect()
+    }
+
+    fn gray12() -> Vec<u16> {
+        (0..W * H).map(|i| (i % 4096) as u16).collect()
+    }
+
+    fn gray_alpha12() -> Vec<u16> {
+        (0..W * H * 2).map(|i| (i % 4096) as u16).collect()
+    }
+
+    fn rgb_f32() -> Vec<f32> {
+        (0..W * H * 3).map(|i| (i % 256) as f32 / 255.0).collect()
+    }
+
+    fn rgba_f32() -> Vec<f32> {
+        (0..W * H * 4).map(|i| (i % 256) as f32 / 255.0).collect()
+    }
+
+    fn gray_f32() -> Vec<f32> {
+        (0..W * H).map(|i| (i % 256) as f32 / 255.0).collect()
+    }
+
+    fn lossy() -> EncodeConfig {
+        EncodeConfig::default().with_distance(1.0)
+    }
+
+    fn lossless() -> EncodeConfig {
+        EncodeConfig::default().with_lossless(true)
+    }
+
+    fn ok(r: Result<Vec<u8>, EncodeError>) {
+        let bytes = r.expect("encode failed");
+        assert!(!bytes.is_empty(), "encoded output is empty");
+    }
+
+    // --- encode_image (RGB u8) ---
+
+    #[test]
+    fn rgb8_lossy() {
+        ok(encode_image(&rgb8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgb8_lossless() {
+        ok(encode_image(&rgb8(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgb8_quality() {
+        ok(encode_image(
+            &rgb8(),
+            W,
+            H,
+            &EncodeConfig::default().with_quality(85.0),
+        ));
+    }
+
+    // --- encode_image_with_alpha (RGBA u8) ---
+
+    #[test]
+    fn rgba8_lossy() {
+        ok(encode_image_with_alpha(&rgba8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba8_lossless() {
+        ok(encode_image_with_alpha(&rgba8(), W, H, &lossless()));
+    }
+
+    // --- 16-bit RGB / RGBA ---
+
+    #[test]
+    fn rgb16_lossy() {
+        ok(encode_image_16bit(&rgb16(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgb16_lossless() {
+        ok(encode_image_16bit(&rgb16(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgba16_lossy() {
+        ok(encode_image_with_alpha_16bit(&rgba16(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba16_lossless() {
+        ok(encode_image_with_alpha_16bit(&rgba16(), W, H, &lossless()));
+    }
+
+    // --- 10-bit RGB / RGBA ---
+
+    #[test]
+    fn rgb10_lossy() {
+        ok(encode_image_10bit(&rgb10(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgb10_lossless() {
+        ok(encode_image_10bit(&rgb10(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgba10_lossy() {
+        ok(encode_image_with_alpha_10bit(&rgba10(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba10_lossless() {
+        ok(encode_image_with_alpha_10bit(&rgba10(), W, H, &lossless()));
+    }
+
+    // --- 12-bit RGB / RGBA ---
+
+    #[test]
+    fn rgb12_lossy() {
+        ok(encode_image_12bit(&rgb12(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgb12_lossless() {
+        ok(encode_image_12bit(&rgb12(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgba12_lossy() {
+        ok(encode_image_with_alpha_12bit(&rgba12(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba12_lossless() {
+        ok(encode_image_with_alpha_12bit(&rgba12(), W, H, &lossless()));
+    }
+
+    // --- float RGB / RGBA ---
+
+    #[test]
+    fn rgb_f32_lossy() {
+        ok(encode_image_f32(&rgb_f32(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgb_f16_lossy() {
+        ok(encode_image_f16(&rgb_f32(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba_f32_lossy() {
+        ok(encode_image_with_alpha_f32(&rgba_f32(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn rgba_f16_lossy() {
+        ok(encode_image_with_alpha_f16(&rgba_f32(), W, H, &lossy()));
+    }
+
+    // --- grayscale u8 ---
+
+    #[test]
+    fn gray8_lossy() {
+        ok(encode_image_gray(&gray8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray8_lossless() {
+        ok(encode_image_gray(&gray8(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn gray_alpha8_lossy() {
+        ok(encode_image_gray_alpha(&gray_alpha8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray_alpha8_lossless() {
+        ok(encode_image_gray_alpha(&gray_alpha8(), W, H, &lossless()));
+    }
+
+    // --- grayscale 10-bit ---
+
+    #[test]
+    fn gray10_lossy() {
+        ok(encode_image_gray_10bit(&gray10(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray10_lossless() {
+        ok(encode_image_gray_10bit(&gray10(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn gray_alpha10_lossy() {
+        ok(encode_image_gray_alpha_10bit(
+            &gray_alpha10(),
+            W,
+            H,
+            &lossy(),
+        ));
+    }
+
+    #[test]
+    fn gray_alpha10_lossless() {
+        ok(encode_image_gray_alpha_10bit(
+            &gray_alpha10(),
+            W,
+            H,
+            &lossless(),
+        ));
+    }
+
+    // --- grayscale 12-bit ---
+
+    #[test]
+    fn gray12_lossy() {
+        ok(encode_image_gray_12bit(&gray12(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray12_lossless() {
+        ok(encode_image_gray_12bit(&gray12(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn gray_alpha12_lossy() {
+        ok(encode_image_gray_alpha_12bit(
+            &gray_alpha12(),
+            W,
+            H,
+            &lossy(),
+        ));
+    }
+
+    #[test]
+    fn gray_alpha12_lossless() {
+        ok(encode_image_gray_alpha_12bit(
+            &gray_alpha12(),
+            W,
+            H,
+            &lossless(),
+        ));
+    }
+
+    // --- grayscale 16-bit ---
+
+    #[test]
+    fn gray16_lossy() {
+        ok(encode_image_gray_16bit(&gray16(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray16_lossless() {
+        ok(encode_image_gray_16bit(&gray16(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn gray_alpha16_lossy() {
+        ok(encode_image_gray_alpha_16bit(
+            &gray_alpha16(),
+            W,
+            H,
+            &lossy(),
+        ));
+    }
+
+    #[test]
+    fn gray_alpha16_lossless() {
+        ok(encode_image_gray_alpha_16bit(
+            &gray_alpha16(),
+            W,
+            H,
+            &lossless(),
+        ));
+    }
+
+    // --- grayscale float ---
+
+    #[test]
+    fn gray_f32_lossy() {
+        ok(encode_image_gray_f32(&gray_f32(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn gray_f16_lossy() {
+        ok(encode_image_gray_f16(&gray_f32(), W, H, &lossy()));
+    }
+
+    // --- error paths ---
+
+    #[test]
+    fn empty_width_rejected() {
+        assert!(matches!(
+            encode_image(&[], 0, H, &lossy()),
+            Err(EncodeError::EmptyImage)
+        ));
+    }
+
+    #[test]
+    fn empty_height_rejected() {
+        assert!(matches!(
+            encode_image(&[], W, 0, &lossy()),
+            Err(EncodeError::EmptyImage)
+        ));
+    }
+
+    #[test]
+    fn wrong_buffer_size_rejected() {
+        let short = vec![0u8; W * H]; // too short for RGB
+        assert!(matches!(
+            encode_image(&short, W, H, &lossy()),
+            Err(EncodeError::InputSizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_distance_rejected() {
+        assert!(matches!(
+            encode_image(&rgb8(), W, H, &EncodeConfig::default().with_distance(-1.0)),
+            Err(EncodeError::InvalidDistance(_))
+        ));
+    }
+
+    #[test]
+    fn dimension_too_large_rejected() {
+        let huge = MAX_DIMENSION + 1;
+        assert!(matches!(
+            encode_image(&[], huge, H, &lossy()),
+            Err(EncodeError::DimensionTooLarge { .. })
+        ));
+    }
+
+    // --- 1x1 edge cases ---
+
+    #[test]
+    fn one_by_one_rgb8() {
+        ok(encode_image(&[128u8, 64, 32], 1, 1, &lossy()));
+    }
+
+    #[test]
+    fn one_by_one_rgba8_lossless() {
+        ok(encode_image_with_alpha(
+            &[128u8, 64, 32, 255],
+            1,
+            1,
+            &lossless(),
+        ));
+    }
+
+    #[test]
+    fn one_by_one_gray8() {
+        ok(encode_image_gray(&[200u8], 1, 1, &lossy()));
     }
 }

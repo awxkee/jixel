@@ -92,23 +92,24 @@ fn masking_sqrt(v: f32) -> f32 {
 
 /// HF modulation: sum of |right| and |below| abs differences in the 8x8 Y block.
 fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
+    let ys = xyb_y.ysize();
+    let xs = xyb_y.xsize();
     let mut sum = 0.0f32;
     for dy in 0..8 {
-        let row = xyb_y.plane_row(1, y + dy);
+        let row = xyb_y.plane_row(1, (y + dy).min(ys - 1));
         let row_next = if dy == 7 {
             row
         } else {
-            xyb_y.plane_row(1, y + dy + 1)
+            xyb_y.plane_row(1, (y + dy + 1).min(ys - 1))
         };
-        assert!(row.len() >= x + 8);
-        assert!(row_next.len() >= x + 8);
         for dx in 0..8 {
-            let p = row[x + dx];
+            let c0 = (x + dx).min(xs - 1);
+            let p = row[c0];
             // right difference, skipping the last column (matches kMaskRight)
             if dx < 7 {
-                sum += (p - row[x + dx + 1]).abs();
+                sum += (p - row[(x + dx + 1).min(xs - 1)]).abs();
             }
-            sum += (p - row_next[x + dx]).abs();
+            sum += (p - row_next[c0]).abs();
         }
     }
     fmla(sum, -2.0052193233688884f32 / 112.0, out_val)
@@ -138,11 +139,18 @@ fn color_modulation(
 
     let mut red_coverage = 0.0f32;
     let mut blue_coverage = 0.0f32;
+    let ys = xyb.ysize();
+    let xs = xyb.xsize();
     for dy in 0..8 {
-        let row_x = &xyb.plane_row(0, y + dy)[x..x + 8];
-        let row_y = &xyb.plane_row(1, y + dy)[x..x + 8];
-        let row_b = &xyb.plane_row(2, y + dy)[x..x + 8];
-        for ((&in_x, &pixel_y), &in_b) in row_x.iter().zip(row_y.iter()).zip(row_b.iter()) {
+        let ry = (y + dy).min(ys - 1);
+        let row_x = xyb.plane_row(0, ry);
+        let row_y = xyb.plane_row(1, ry);
+        let row_b = xyb.plane_row(2, ry);
+        for dx in 0..8 {
+            let cx = (x + dx).min(xs - 1);
+            let in_x = row_x[cx];
+            let pixel_y = row_y[cx];
+            let in_b = row_b[cx];
             let pixel_x = (in_x - k_red_ramp_start).max(0.0);
             let pixel_b = (in_b - (pixel_y + k_blue_ramp_start)).max(0.0);
             blue_coverage += pixel_b.min(k_blue_ramp_length);
@@ -163,14 +171,16 @@ fn color_modulation(
 fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     let k_bias = 0.16f32;
     let mut overall_ratio = 0.0f32;
+    let ys = xyb.ysize();
+    let xs = xyb.xsize();
     for dy in 0..8 {
-        let row_x = xyb.plane_row(0, y + dy);
-        let row_y = xyb.plane_row(1, y + dy);
-        assert!(row_x.len() >= x + 8);
-        assert!(row_y.len() >= x + 8);
+        let ry = (y + dy).min(ys - 1);
+        let row_x = xyb.plane_row(0, ry);
+        let row_y = xyb.plane_row(1, ry);
         for dx in 0..8 {
-            let iny = row_y[x + dx] + k_bias;
-            let inx = row_x[x + dx];
+            let cx = (x + dx).min(xs - 1);
+            let iny = row_y[cx] + k_bias;
+            let inx = row_x[cx];
             let r = iny - inx;
             let g = iny + inx;
             let ratio_r = ratio_cubic_to_simple_gamma(r, true);

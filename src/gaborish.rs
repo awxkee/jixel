@@ -30,11 +30,11 @@ use crate::dct::fmla;
 use crate::image::Image3F;
 
 const K_GABORISH: [f32; 5] = [
-    -0.092_359_15,
-    -0.039_253_623,
-    0.016_176_495,
-    0.000_834_584,
-    0.004_512_465,
+    -0.09495815671340026,
+    -0.041031725066768575,
+    0.013710004822696948,
+    0.006510206083837737,
+    -0.0014789063378272242,
 ];
 
 /// Apply the forward (encoder-side) gaborish filter in place. The kernel
@@ -52,13 +52,14 @@ pub(crate) fn gaborish_inverse(image: &mut Image3F, mul: f32) {
     let w_r2 = mul * K_GABORISH[2];
     let w_l = mul * K_GABORISH[3];
     let w_d2 = mul * K_GABORISH[4];
-    let mut sum = 1.0_f64;
-    sum += 4.0 * w_r as f64;
-    sum += 4.0 * w_r2 as f64;
-    sum += 4.0 * w_d as f64;
-    sum += 4.0 * w_d2 as f64;
-    sum += 8.0 * w_l as f64;
-    let norm = (1.0 / sum) as f32;
+    let mut sum = 1.0
+        + mul
+            * 4.
+            * (K_GABORISH[0] + K_GABORISH[1] + K_GABORISH[2] + K_GABORISH[4] + 2. * K_GABORISH[3]);
+    if sum < 1e-5 {
+        sum = 1e-5;
+    }
+    let norm = 1.0 / sum;
     let n_c = norm;
     let n_r = norm * w_r;
     let n_d = norm * w_d;
