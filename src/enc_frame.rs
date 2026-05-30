@@ -175,15 +175,9 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
-        // Always-on for lossy. libjxl default. Costs ~0.05 dB worth of file
-        // size but recovers high-frequency sharpness lost in quantization.
-        gab_enabled: true,
+        gab_enabled: distance > 1.0,
     }
 }
-
-// -----------------------------------------------------------------------------
-// DC tokens, AC metadata tokens, context tree tokens.
-// -----------------------------------------------------------------------------
 
 #[inline]
 fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
@@ -205,8 +199,8 @@ fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
         let ysize = plane.ysize();
         let xsize = plane.xsize();
         for y in 0..ysize {
-            for x in 0..xsize {
-                let qrow_here = plane.row(y)[x] as i64;
+            let grow_row = plane.row(y);
+            for (x, &qrow_here) in grow_row[..xsize].iter().enumerate() {
                 let row_above = if y > 0 { Some(plane.row(y - 1)) } else { None };
                 let left: i64 = if x > 0 {
                     plane.row(y)[x - 1] as i64
@@ -260,8 +254,8 @@ fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
             &dc_data.ytob_map
         };
         for y in 0..ytiles {
-            for x in 0..xtiles {
-                let here: i64 = cfl_map.row(y)[x] as i64;
+            let cfl_row = cfl_map.row(y);
+            for (x, &here) in cfl_row[..xtiles].iter().enumerate() {
                 let row_above = if y > 0 {
                     Some(cfl_map.row(y - 1))
                 } else {

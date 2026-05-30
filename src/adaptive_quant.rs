@@ -37,14 +37,13 @@
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 
-// ---- Sigmoid-like gamma constants (butteraugli <-> opsin space) ----
 const K_SG_MUL: f32 = 226.0480446705883;
 const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
 const K_LOG2: f32 = 0.693147181;
 const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_LOG2;
 const K_SG_V_OFFSET: f32 = 7.14672470003;
 
-const K_AC_QUANT: f32 = 0.8294;
+const K_AC_QUANT: f32 = 0.8974;
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
 const K_X_MUL: f32 = 23.426802998210313;
 
@@ -240,7 +239,7 @@ pub(crate) fn fill_quant_field(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = K_AC_QUANT / distance;
+    let scale = K_AC_QUANT / distance.powf(0.7934);
 
     // Pixel extent of this DC-group region (padded to whole blocks but clamped
     // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
