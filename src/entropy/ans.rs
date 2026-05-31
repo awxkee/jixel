@@ -315,8 +315,8 @@ fn store_varlen_u8(n: u32, w: &mut BitWriter) {
     }
 }
 
-const K_BIT_WIDTH_LENGTHS: [u8; 14] = [5, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 6, 7, 7];
-const K_BIT_WIDTH_SYMBOLS: [u8; 14] = [17, 11, 15, 3, 9, 7, 4, 2, 5, 6, 0, 33, 1, 65];
+static K_BIT_WIDTH_LENGTHS: [u8; 14] = [5, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 6, 7, 7];
+static K_BIT_WIDTH_SYMBOLS: [u8; 14] = [17, 11, 15, 3, 9, 7, 4, 2, 5, 6, 0, 33, 1, 65];
 
 /// Serialize one normalized histogram. `_log_alpha_size` is accepted for API
 /// symmetry; the body trims to the true alphabet size.

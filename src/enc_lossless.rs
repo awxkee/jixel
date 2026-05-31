@@ -621,8 +621,8 @@ fn encode_squeeze_single_group(
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_GRADIENT);
-            let bw = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT);
+            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED);
             if bw <= bg {
                 PREDICTOR_WEIGHTED
             } else {
@@ -636,7 +636,7 @@ fn encode_squeeze_single_group(
         let data = &ch.data;
         let w = ch.w;
         let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        tokenize_plane(ctx, &get, ch.w, ch.h, predictors[c], &mut tokens);
+        tokenize_plane(ctx, get, ch.w, ch.h, predictors[c], &mut tokens);
     }
 
     write_frame_header_modular(alpha.is_some(), writer);
@@ -727,8 +727,8 @@ fn encode_squeeze_multigroup(
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_GRADIENT);
-            let bw = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT);
+            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED);
             if bw <= bg {
                 PREDICTOR_WEIGHTED
             } else {
@@ -747,7 +747,7 @@ fn encode_squeeze_multigroup(
         let data = &ch.data;
         let w = ch.w;
         let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        tokenize_plane(ctx, &get, ch.w, ch.h, predictors[c], &mut global_tokens);
+        tokenize_plane(ctx, get, ch.w, ch.h, predictors[c], &mut global_tokens);
     }
     let global_lz = lz77_compress(&global_tokens, distance_ctx);
     let mut all_lz: Vec<LzToken> = global_lz.clone();
@@ -784,7 +784,7 @@ fn encode_squeeze_multigroup(
             let data = &ch.data;
             let w = ch.w;
             let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-            tokenize_plane(ctx, &get, rw, rh, pred, &mut gtok);
+            tokenize_plane(ctx, get, rw, rh, pred, &mut gtok);
             within += 1;
         }
         lz77_compress(&gtok, distance_ctx)
@@ -988,7 +988,7 @@ fn try_encode_palette_single_group(
     let mut tokens: Vec<Token> = Vec::with_capacity(3 * nb_colors + npx);
     tokenize_plane(
         channel_to_context(0, nb_chans),
-        &pget,
+        pget,
         nb_colors,
         3,
         preds[0],
@@ -996,7 +996,7 @@ fn try_encode_palette_single_group(
     );
     tokenize_plane(
         channel_to_context(1, nb_chans),
-        &iget,
+        iget,
         xsize,
         ysize,
         preds[1],
@@ -1162,14 +1162,14 @@ fn tokenize_all(
     for chan in 0..num_color {
         let ctx = channel_to_context(chan, nb_chans);
         let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
-        tokenize_plane(ctx, &get, gw, gh, predictors[chan], &mut out);
+        tokenize_plane(ctx, get, gw, gh, predictors[chan], &mut out);
     }
 
     // Alpha (untransformed) is the modular channel right after the color ones.
     if let Some(a) = alpha {
         let ctx = channel_to_context(num_color, nb_chans);
         let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
-        tokenize_plane(ctx, &get, gw, gh, predictors[num_color], &mut out);
+        tokenize_plane(ctx, get, gw, gh, predictors[num_color], &mut out);
     }
 
     out
@@ -1326,7 +1326,7 @@ fn choose_predictors(
     for chan in 0..3usize {
         let pd = linear.plane_data(chan);
         let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
-        let (bg, bw) = estimate_grad_and_wp_bits(&get, xsize, ysize);
+        let (bg, bw) = estimate_grad_and_wp_bits(get, xsize, ysize);
         preds[chan] = if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
@@ -1335,7 +1335,7 @@ fn choose_predictors(
     }
     if let Some(a) = alpha {
         let get = |gx: usize, gy: usize| a.get_i32(gy * xsize + gx);
-        let (bg, bw) = estimate_grad_and_wp_bits(&get, xsize, ysize);
+        let (bg, bw) = estimate_grad_and_wp_bits(get, xsize, ysize);
         preds[3] = if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
@@ -1590,13 +1590,13 @@ fn try_encode_context_tree_single_group(
     for chan in 0..3usize {
         let pd = linear.plane_data(chan);
         let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
-        let (r, p) = collect_channel(&get, xsize, ysize, predictors[chan]);
+        let (r, p) = collect_channel(get, xsize, ysize, predictors[chan]);
         chan_res.push(r);
         chan_prp.push(p);
     }
     if let Some(a) = alpha {
         let get = |gx: usize, gy: usize| a.get_i32(gy * xsize + gx);
-        let (r, p) = collect_channel(&get, xsize, ysize, predictors[3]);
+        let (r, p) = collect_channel(get, xsize, ysize, predictors[3]);
         chan_res.push(r);
         chan_prp.push(p);
     }
@@ -1697,11 +1697,11 @@ fn try_encode_context_tree_multi_group(
             for chan in 0..3usize {
                 let pd = linear.plane_data(chan);
                 let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-                chans.push(collect_channel(&get, gw, gh, predictors[chan]));
+                chans.push(collect_channel(get, gw, gh, predictors[chan]));
             }
             if let Some(a) = alpha {
                 let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                chans.push(collect_channel(&get, gw, gh, predictors[3]));
+                chans.push(collect_channel(get, gw, gh, predictors[3]));
             }
             groups.push(chans);
         }

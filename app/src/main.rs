@@ -15,7 +15,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/abstract.jpg")).unwrap();
+    let image = image::open(Path::new("./assets/nature1.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     let rgba_img = image.to_rgba8();
     let src_rgb = rgb_img.as_raw();
@@ -35,9 +35,8 @@ fn main() {
     }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let img10 = vec![0u8; width * height * 3];
     let bytes = jixel::encode_image(
-        &img10,
+        &rgb_img,
         width,
         height,
         &EncodeConfig::default()

@@ -166,34 +166,54 @@ pub(crate) fn fwd_v_squeeze(chin: &Channel) -> (Channel, Channel) {
         hshift: chin.hshift,
         vshift: chin.vshift + 1,
     };
-    for x in 0..w {
-        for y in 0..rh {
-            let a_pix = chin.data[(2 * y) * w + x];
-            let b_pix = chin.data[(2 * y + 1) * w + x];
+    for y in 0..rh {
+        let row_a = &chin.data[(2 * y) * w..(2 * y) * w + w];
+        let row_b = &chin.data[(2 * y + 1) * w..(2 * y + 1) * w + w];
+        let row_top: Option<&[i32]> = if y > 0 {
+            Some(&chin.data[(2 * y - 1) * w..(2 * y - 1) * w + w])
+        } else {
+            None
+        };
+        // next-average source: a full pair (2y+2,2y+3), a lone row (2y+2), or none.
+        let next_pair: Option<(&[i32], &[i32])> = if 2 * y + 2 < 2 * rh {
+            Some((
+                &chin.data[(2 * y + 2) * w..(2 * y + 2) * w + w],
+                &chin.data[(2 * y + 3) * w..(2 * y + 3) * w + w],
+            ))
+        } else {
+            None
+        };
+        let next_lone: Option<&[i32]> = if next_pair.is_none() && h & 1 == 1 {
+            Some(&chin.data[(2 * y + 2) * w..(2 * y + 2) * w + w])
+        } else {
+            None
+        };
+        let avg_out = &mut avg.data[y * w..y * w + w];
+        let res_out = &mut res.data[y * w..y * w + w];
+        for x in 0..w {
+            let a_pix = row_a[x];
+            let b_pix = row_b[x];
             let av = average(a_pix, b_pix);
-            avg.data[y * w + x] = av;
+            avg_out[x] = av;
             let diff = a_pix - b_pix;
-            let next_avg = if 2 * y + 2 < 2 * rh {
-                average(
-                    chin.data[(2 * y + 2) * w + x],
-                    chin.data[(2 * y + 3) * w + x],
-                )
-            } else if h & 1 == 1 {
-                chin.data[(2 * y + 2) * w + x]
-            } else {
-                av
+            let next_avg = match next_pair {
+                Some((r2, r3)) => average(r2[x], r3[x]),
+                None => match next_lone {
+                    Some(r2) => r2[x],
+                    None => av,
+                },
             };
-            let top = if y > 0 {
-                chin.data[(2 * y - 1) * w + x]
-            } else {
-                av
+            let top = match row_top {
+                Some(rt) => rt[x],
+                None => av,
             };
             let tendency = smooth_tendency(top as i64, av as i64, next_avg as i64);
-            res.data[y * w + x] = (diff as i64 - tendency) as i32;
+            res_out[x] = (diff as i64 - tendency) as i32;
         }
-        if h & 1 == 1 {
-            avg.data[(oh - 1) * w + x] = chin.data[(2 * (oh - 1)) * w + x];
-        }
+    }
+    if h & 1 == 1 {
+        let src = &chin.data[(2 * (oh - 1)) * w..(2 * (oh - 1)) * w + w];
+        avg.data[(oh - 1) * w..(oh - 1) * w + w].copy_from_slice(src);
     }
     (avg, res)
 }

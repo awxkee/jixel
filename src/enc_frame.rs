@@ -785,13 +785,13 @@ fn process_dc_group(
         distp.distance,
         1.0 / distp.scale,
     );
-    crate::enc_ac_strategy::fill_ac_strategy(
-        opsin,
-        distp.distance,
-        matrices,
-        &mut dc_data.raw_quant_field,
-        &mut dc_data.ac_strategy,
-    );
+    // crate::enc_ac_strategy::fill_ac_strategy(
+    //     opsin,
+    //     distp.distance,
+    //     matrices,
+    //     &mut dc_data.raw_quant_field,
+    //     &mut dc_data.ac_strategy,
+    // );
     // Per-tile CfL: find optimal Y→X and Y→B slopes per 64×64 tile, written
     // into ytox_map/ytob_map and applied during DCT in write_ac_group.
     crate::enc_color_correlation::fill_cmap(
