@@ -489,6 +489,9 @@ dependencies = [
 [[package]]
 name = "jixel"
 version = "0.1.4"
+dependencies = [
+ "pxfm",
+]
 
 [[package]]
 name = "jobserver"

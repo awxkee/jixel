@@ -383,18 +383,25 @@ pub(crate) fn write_ac_group(
             // DC for storage (per covered block, using pre-swap cov_x/cov_y).
             let mut y_dc_q_arr = [[0i16; 2]; 2]; // [iy][ix] for max 2x2 — only iy*ix entries used
             for iy in 0..cov_y {
-                for ix in 0..cov_x {
+                let quant_target = &mut dc_data.quant_dc.plane_row_mut(1, global_by + iy)
+                    [global_bx..global_bx + cov_x];
+                let y_dc_q_target = &mut y_dc_q_arr[iy];
+                for (ix, (quant, dc_target)) in quant_target
+                    .iter_mut()
+                    .zip(y_dc_q_target.iter_mut())
+                    .enumerate()
+                {
                     let didx = iy * cov_x + ix;
                     let y_dc_q = (inv_factor[1] * dc_vals[1][didx]).fast_round() as i16;
-                    dc_data.quant_dc.plane_row_mut(1, global_by + iy)[global_bx + ix] = y_dc_q;
-                    y_dc_q_arr[iy][ix] = y_dc_q;
+                    *quant = y_dc_q;
+                    *dc_target = y_dc_q;
                 }
             }
             // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
             // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
             // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
-                STRATEGY_DCT      => (&matrices.inv_matrix(1)[..],      &matrices.matrix(1)[..]),
+                STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
@@ -435,9 +442,17 @@ pub(crate) fn write_ac_group(
                     }
                 }
             }
-            for k in 0..size {
-                coeffs[0][k] -= x_factor * coeffs[1][k];
-                coeffs[2][k] -= b_factor * coeffs[1][k];
+            {
+                let [c0, c1, c2] = &mut coeffs;
+                let y = &c1[..size];
+                for ((a, b), &yi) in c0[..size]
+                    .iter_mut()
+                    .zip(c2[..size].iter_mut())
+                    .zip(y.iter())
+                {
+                    *a -= x_factor * yi;
+                    *b -= b_factor * yi;
+                }
             }
             // ---- Extract post-CfL X and B DC ----
             let mut x_dc_post = [0.0f32; 4];
@@ -478,11 +493,13 @@ pub(crate) fn write_ac_group(
 
             // ---- X channel: write post-CfL DC, quantize AC ----
             for iy in 0..cov_y {
-                for ix in 0..cov_x {
+                let quant_dc_row = &mut dc_data.quant_dc.plane_row_mut(0, global_by + iy)
+                    [global_bx..global_bx + cov_x];
+                for (ix, target_quant) in quant_dc_row.iter_mut().enumerate() {
                     let didx = iy * cov_x + ix;
                     // base_correlation_x = 0 so no Y contribution to X DC store.
                     let x_dc_q = (inv_factor[0] * x_dc_post[didx]).fast_round() as i16;
-                    dc_data.quant_dc.plane_row_mut(0, global_by + iy)[global_bx + ix] = x_dc_q;
+                    *target_quant = x_dc_q;
                 }
             }
             let inv_qm_x: &[f32] = match raw_strategy {
@@ -504,12 +521,16 @@ pub(crate) fn write_ac_group(
 
             // ---- B channel: write CfL'd DC, quantize AC ----
             for iy in 0..cov_y {
-                for ix in 0..cov_x {
+                let quant_dc_row = &mut dc_data.quant_dc.plane_row_mut(2, global_by + iy)
+                    [global_bx..global_bx + cov_x];
+                let y_dc_q_row = &y_dc_q_arr[iy];
+                for (ix, (quant_target, &dc_val)) in
+                    quant_dc_row.iter_mut().zip(y_dc_q_row.iter()).enumerate()
+                {
                     let didx = iy * cov_x + ix;
-                    let b_dc_q = (b_dc_post[didx] * inv_factor[2]
-                        - y_dc_q_arr[iy][ix] as f32 * cfl_factor_b)
+                    let b_dc_q = (b_dc_post[didx] * inv_factor[2] - dc_val as f32 * cfl_factor_b)
                         .fast_round() as i16;
-                    dc_data.quant_dc.plane_row_mut(2, global_by + iy)[global_bx + ix] = b_dc_q;
+                    *quant_target = b_dc_q;
                 }
             }
             let inv_qm_b: &[f32] = match raw_strategy {

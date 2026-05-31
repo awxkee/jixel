@@ -18,6 +18,7 @@ exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
 rust-version = "1.93.0"
 
 [dependencies]
+pxfm = "0.1.29"
 
 [features]
 default = ["avx", "neon"]

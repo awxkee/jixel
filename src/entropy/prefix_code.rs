@@ -62,7 +62,7 @@ impl Default for PrefixCode {
 /// building canonical codes in the standard way we have to bit-reverse.
 fn reverse_bits(num_bits: u32, bits: u16) -> u16 {
     // Pre-reversed nibble LUT.
-    const LUT: [u16; 16] = [
+    static LUT: [u16; 16] = [
         0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf,
     ];
     let mut retval: u16 = LUT[(bits & 0xf) as usize];
