@@ -39,7 +39,7 @@ fn checked_buffer_size<T>(
     height: usize,
     channels: usize,
 ) -> Result<usize, EncodeError> {
-    let pixel_size = core::mem::size_of::<T>();
+    let pixel_size = size_of::<T>();
     let total_size = width
         .checked_mul(height)
         .and_then(|v| v.checked_mul(channels));

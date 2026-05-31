@@ -203,10 +203,6 @@ fn write_group_header_global_tree(w: &mut BitWriter) {
     w.write(2, 0); // 0 transforms
 }
 
-// ---------------------------------------------------------------------------
-// Local-tree path helpers (small images).
-// ---------------------------------------------------------------------------
-
 fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWriter) {
     let tree_tokens = [
         Token::new(TREE_CTX_PROPERTY, 0),
