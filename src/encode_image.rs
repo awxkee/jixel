@@ -223,6 +223,10 @@ pub struct EncodeConfig {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
+    /// If true (and lossless), use the progressive Squeeze transform: a low-res
+    /// preview that refines to bit-exact. Works at any size (single- and
+    /// multi-group) and with alpha.
+    pub progressive: bool,
     /// HDR luminance signaling. When `Some(nits)`, the codestream's tone-mapping
     /// metadata declares this peak display luminance (`intensity_target`), e.g.
     /// `10000.0` for PQ/HDR10 or a measured mastering peak. `None` leaves the
@@ -247,6 +251,7 @@ pub(crate) struct EncodeConfigImpl {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub(crate) lossless: bool,
+    pub(crate) progressive: bool,
     /// If true, the image is grayscale: the codestream declares a Gray color
     /// space so the decoder emits a single-channel (L / LA) image. Internally
     /// the data still flows through the XYB pipeline with R=G=B, so the X and B
@@ -266,6 +271,7 @@ impl Default for EncodeConfig {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             lossless: false,
+            progressive: false,
             intensity_target: None,
             min_nits: 0.0,
             relative_to_max_display: false,
@@ -283,6 +289,7 @@ impl Default for EncodeConfigImpl {
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
+            progressive: false,
             grayscale: false,
             intensity_target: None,
             min_nits: 0.0,
@@ -322,6 +329,11 @@ impl EncodeConfigImpl {
 
     pub(crate) fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
+        self
+    }
+
+    pub(crate) fn with_progressive(mut self, progressive: bool) -> Self {
+        self.progressive = progressive;
         self
     }
 
@@ -414,6 +426,12 @@ impl EncodeConfig {
         self.lossless = lossless;
         self
     }
+
+    /// Enable progressive lossless. Only effective when `lossless`.
+    pub fn with_progressive(mut self, progressive: bool) -> Self {
+        self.progressive = progressive;
+        self
+    }
 }
 
 pub fn distance_from_quality(quality: f32) -> f32 {
@@ -464,6 +482,7 @@ pub fn encode_image(
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
+                .with_progressive(config.progressive)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
@@ -529,6 +548,7 @@ pub fn encode_image_with_alpha(
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
+                .with_progressive(config.progressive)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
@@ -1582,7 +1602,15 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     );
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     let eff_bits = (max_bp as u32).max(alpha_bits);
-    encode_frame_lossless(&image3s, alpha_plane.as_ref(), eff_bits, &mut w);
+    let num_color = if config.grayscale { 1 } else { 3 };
+    encode_frame_lossless(
+        &image3s,
+        alpha_plane.as_ref(),
+        eff_bits,
+        config.progressive,
+        num_color,
+        &mut w,
+    );
     let codestream = w.into_bytes();
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     if needs_level_10(max_bp as u32, true, alpha_bits) {

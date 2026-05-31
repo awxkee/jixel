@@ -156,7 +156,7 @@ pub(crate) fn f32_to_f16(value: f32) -> u16 {
         let full = mant | 0x80_0000;
         let half_mant = full >> (shift + 13);
         let round = (full >> (shift + 12)) & 1;
-        return sign | (half_mant as u16) + round as u16;
+        return sign | ((half_mant as u16) + round as u16);
     }
     // Normalized: pack and round-to-nearest-even; a mantissa carry naturally
     // increments the exponent via the addition.

@@ -59,6 +59,7 @@ mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
 mod quant_weights;
+mod squeeze;
 mod static_entropy_codes;
 mod util;
 
