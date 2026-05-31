@@ -1183,7 +1183,7 @@ fn tokenize_all(
 ///   toptop  = y>1 ? NN : top.
 fn tokenize_plane(
     ctx: u32,
-    get: &dyn Fn(usize, usize) -> i32,
+    get: impl Fn(usize, usize) -> i32,
     gw: usize,
     gh: usize,
     pred_id: u32,
@@ -1236,27 +1236,30 @@ fn tokenize_plane(
 /// predictor per channel; the choice never affects decodability (the tree tells
 /// the decoder which predictor each channel uses).
 fn estimate_channel_bits(
-    get: &dyn Fn(usize, usize) -> i32,
+    get: impl Fn(usize, usize) -> i32,
     w: usize,
     h: usize,
     pred_id: u32,
 ) -> f64 {
     let mut toks: Vec<Token> = Vec::with_capacity(w * h);
     tokenize_plane(0, get, w, h, pred_id, &mut toks);
-    // order-0 entropy of the packed residual values
-    use std::collections::HashMap;
-    let mut hist: HashMap<u32, u64> = HashMap::new();
-    for t in &toks {
-        *hist.entry(t.value).or_insert(0) += 1;
-    }
-    let total = toks.len() as f64;
-    if total == 0.0 {
+    if toks.is_empty() {
         return 0.0;
     }
+    // order-0 entropy of the packed residual values via a direct-indexed
+    // histogram (deterministic order, no hashing).
+    let max = toks.iter().map(|t| t.value).max().unwrap_or(0) as usize;
+    let mut hist = vec![0u64; max + 1];
+    for t in &toks {
+        hist[t.value as usize] += 1;
+    }
+    let total = toks.len() as f64;
     let mut bits = 0.0;
-    for &c in hist.values() {
-        let p = c as f64 / total;
-        bits -= c as f64 * p.log2();
+    for &c in hist.iter() {
+        if c != 0 {
+            let p = c as f64 / total;
+            bits -= c as f64 * p.log2();
+        }
     }
     bits
 }
@@ -1264,6 +1267,55 @@ fn estimate_channel_bits(
 /// Choose Gradient(5) or Weighted(6) per channel by estimated cost over the
 /// whole image. Guarantees the lossless stream is never worse than all-Gradient
 /// or all-WP. Returns one predictor id per channel (indices 0..nb_chans).
+/// Compute the order-0 entropy estimate for BOTH the Gradient and Weighted
+/// predictors in a single traversal. Equivalent to calling
+/// `estimate_channel_bits` twice (Gradient then Weighted) — same neighbour
+/// convention, same WP state evolution, same packed residuals — but the pixel
+/// fetches and loop overhead happen once instead of twice. Returns
+/// `(gradient_bits, weighted_bits)`.
+fn estimate_grad_and_wp_bits(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> (f64, f64) {
+    if w == 0 || h == 0 {
+        return (0.0, 0.0);
+    }
+    let mut wp = WpState::new(w);
+    let mut grad: Vec<u32> = Vec::with_capacity(w * h);
+    let mut wpr: Vec<u32> = Vec::with_capacity(w * h);
+    for gy in 0..h {
+        for gx in 0..w {
+            let v = get(gx, gy) as i64;
+            let w_ = if gx > 0 {
+                get(gx - 1, gy) as i64
+            } else if gy > 0 {
+                get(gx, gy - 1) as i64
+            } else {
+                0
+            };
+            let n_ = if gy > 0 { get(gx, gy - 1) as i64 } else { w_ };
+            let nw_ = if gx > 0 && gy > 0 {
+                get(gx - 1, gy - 1) as i64
+            } else {
+                w_
+            };
+            let ne_ = if gx + 1 < w && gy > 0 {
+                get(gx + 1, gy - 1) as i64
+            } else {
+                n_
+            };
+            let nn_ = if gy > 1 { get(gx, gy - 2) as i64 } else { n_ };
+            // Weighted (advances WP state exactly as the WP-only pass does).
+            let wp_pred = wp.predict(gx, gy, n_, w_, ne_, nw_, nn_);
+            wp.update(v, gx, gy);
+            wpr.push(pack_signed((v - wp_pred) as i32));
+            // Gradient (== libjxl ClampedGradient, same border convention).
+            let lo = w_.min(n_);
+            let hi = w_.max(n_);
+            let g_pred = (w_ + n_ - nw_).clamp(lo, hi);
+            grad.push(pack_signed((v - g_pred) as i32));
+        }
+    }
+    (order0_entropy(&grad), order0_entropy(&wpr))
+}
+
 fn choose_predictors(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -1272,9 +1324,9 @@ fn choose_predictors(
 ) -> [u32; 4] {
     let mut preds = [PREDICTOR_WEIGHTED; 4];
     for chan in 0..3usize {
-        let get = |gx: usize, gy: usize| linear.plane_row(chan, gy)[gx];
-        let bg = estimate_channel_bits(&get, xsize, ysize, PREDICTOR_GRADIENT);
-        let bw = estimate_channel_bits(&get, xsize, ysize, PREDICTOR_WEIGHTED);
+        let pd = linear.plane_data(chan);
+        let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
+        let (bg, bw) = estimate_grad_and_wp_bits(&get, xsize, ysize);
         preds[chan] = if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
@@ -1283,8 +1335,7 @@ fn choose_predictors(
     }
     if let Some(a) = alpha {
         let get = |gx: usize, gy: usize| a.get_i32(gy * xsize + gx);
-        let bg = estimate_channel_bits(&get, xsize, ysize, PREDICTOR_GRADIENT);
-        let bw = estimate_channel_bits(&get, xsize, ysize, PREDICTOR_WEIGHTED);
+        let (bg, bw) = estimate_grad_and_wp_bits(&get, xsize, ysize);
         preds[3] = if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
@@ -1393,19 +1444,23 @@ fn clamped_gradient(w: i64, n: i64, nw: i64) -> i64 {
 }
 
 fn order0_entropy(vals: &[u32]) -> f64 {
-    use std::collections::HashMap;
     if vals.is_empty() {
         return 0.0;
     }
-    let mut h: HashMap<u32, u64> = HashMap::new();
+    // Direct-indexed frequency histogram (residual symbols are small-range), in
+    // place of a HashMap: no hashing, and a deterministic accumulation order.
+    let max = vals.iter().copied().max().unwrap_or(0) as usize;
+    let mut hist = vec![0u64; max + 1];
     for &v in vals {
-        *h.entry(v).or_insert(0) += 1;
+        hist[v as usize] += 1;
     }
     let total = vals.len() as f64;
     let mut bits = 0.0;
-    for &c in h.values() {
-        let p = c as f64 / total;
-        bits -= c as f64 * p.log2();
+    for &c in hist.iter() {
+        if c != 0 {
+            let p = c as f64 / total;
+            bits -= c as f64 * p.log2();
+        }
     }
     bits
 }
@@ -1413,7 +1468,7 @@ fn order0_entropy(vals: &[u32]) -> f64 {
 /// Run WP over one channel's group rectangle, returning per-pixel
 /// (packed residual under `pred_id`, WP property p[15]) in row-major order.
 fn collect_channel(
-    get: &dyn Fn(usize, usize) -> i32,
+    get: impl Fn(usize, usize) -> i32,
     gw: usize,
     gh: usize,
     pred_id: u32,
@@ -1459,22 +1514,54 @@ fn collect_channel(
 
 /// Pick the best activity threshold for a channel among candidates, returning
 /// (best_t, best_bucketed_bits, flat_bits).
+fn entropy_of_hist(hist: &[u64], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let t = total as f64;
+    let mut bits = 0.0;
+    for &c in hist.iter() {
+        if c != 0 {
+            let p = c as f64 / t;
+            bits -= c as f64 * p.log2();
+        }
+    }
+    bits
+}
+
 fn pick_threshold(res: &[u32], prp: &[i64]) -> (i32, f64, f64) {
     let flat = order0_entropy(res);
+    let max = res.iter().copied().max().unwrap_or(0) as usize;
+    // Reusable per-bucket histograms; for each candidate threshold we fill them
+    // in a single pass over (res, prp) instead of materializing three bucket
+    // Vecs and re-scanning each. Same frequencies, same entropy, same choice.
+    let mut h0 = vec![0u64; max + 1];
+    let mut h1 = vec![0u64; max + 1];
+    let mut h2 = vec![0u64; max + 1];
     let mut best_t = 0i32;
     let mut best_bits = f64::INFINITY;
     for &t in &[8i64, 16, 24, 32, 48, 64, 96] {
-        let mut b0: Vec<u32> = Vec::new();
-        let mut b1: Vec<u32> = Vec::new();
-        let mut b2: Vec<u32> = Vec::new();
-        for (i, &p) in prp.iter().enumerate() {
+        h0.fill(0);
+        h1.fill(0);
+        h2.fill(0);
+        let (mut n0, mut n1, mut n2) = (0u64, 0u64, 0u64);
+        for (&r, &p) in res.iter().zip(prp.iter()) {
             match bucket_of(p, t) {
-                0 => b0.push(res[i]),
-                1 => b1.push(res[i]),
-                _ => b2.push(res[i]),
+                0 => {
+                    h0[r as usize] += 1;
+                    n0 += 1;
+                }
+                1 => {
+                    h1[r as usize] += 1;
+                    n1 += 1;
+                }
+                _ => {
+                    h2[r as usize] += 1;
+                    n2 += 1;
+                }
             }
         }
-        let bits = order0_entropy(&b0) + order0_entropy(&b1) + order0_entropy(&b2);
+        let bits = entropy_of_hist(&h0, n0) + entropy_of_hist(&h1, n1) + entropy_of_hist(&h2, n2);
         if bits < best_bits {
             best_bits = bits;
             best_t = t as i32;
@@ -1501,7 +1588,8 @@ fn try_encode_context_tree_single_group(
     let mut chan_res: Vec<Vec<u32>> = Vec::with_capacity(nb_chans);
     let mut chan_prp: Vec<Vec<i64>> = Vec::with_capacity(nb_chans);
     for chan in 0..3usize {
-        let get = |gx: usize, gy: usize| linear.plane_row(chan, gy)[gx];
+        let pd = linear.plane_data(chan);
+        let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
         let (r, p) = collect_channel(&get, xsize, ysize, predictors[chan]);
         chan_res.push(r);
         chan_prp.push(p);
@@ -1534,6 +1622,9 @@ fn try_encode_context_tree_single_group(
     let tree = build_context_tree(nb_chans, predictors, &ts);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
+    // Flat lookup over the dense (chan*3+bucket) property space, replacing a
+    // per-pixel HashMap probe in the tokenize loop.
+    let ctx_lut: Vec<u32> = (0..(nb_chans as u32) * 3).map(|k| ctx_map[&k]).collect();
     let num_pixel_ctx = nb_chans * 3;
 
     // Tokenize: each pixel routed to context (channel,bucket).
@@ -1544,7 +1635,7 @@ fn try_encode_context_tree_single_group(
         let t = ts[chan] as i64;
         for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
             let bucket = bucket_of(prp, t);
-            let ctx = ctx_map[&((chan as u32) * 3 + bucket)];
+            let ctx = ctx_lut[chan * 3 + bucket as usize];
             tokens.push(Token::new(ctx, res));
         }
     }
@@ -1604,7 +1695,8 @@ fn try_encode_context_tree_multi_group(
             let gh = GROUP_DIM.min(ysize - y0);
             let mut chans: Vec<(Vec<u32>, Vec<i64>)> = Vec::with_capacity(nb_chans);
             for chan in 0..3usize {
-                let get = |lx: usize, ly: usize| linear.plane_row(chan, y0 + ly)[x0 + lx];
+                let pd = linear.plane_data(chan);
+                let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
                 chans.push(collect_channel(&get, gw, gh, predictors[chan]));
             }
             if let Some(a) = alpha {
@@ -1640,6 +1732,9 @@ fn try_encode_context_tree_multi_group(
     let tree = build_context_tree(nb_chans, predictors, &ts);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
+    // Flat lookup over the dense (chan*3+bucket) property space, replacing a
+    // per-pixel HashMap probe in the tokenize loop.
+    let ctx_lut: Vec<u32> = (0..(nb_chans as u32) * 3).map(|k| ctx_map[&k]).collect();
     let num_pixel_ctx = nb_chans * 3;
     let distance_ctx = num_pixel_ctx as u32;
 
@@ -1653,7 +1748,7 @@ fn try_encode_context_tree_multi_group(
             let t = ts[chan] as i64;
             for i in 0..res.len() {
                 let bucket = bucket_of(prp[i], t);
-                let ctx = ctx_map[&((chan as u32) * 3 + bucket)];
+                let ctx = ctx_lut[chan * 3 + bucket as usize];
                 toks.push(Token::new(ctx, res[i]));
             }
         }

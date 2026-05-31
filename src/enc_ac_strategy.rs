@@ -194,13 +194,15 @@ fn estimate_entropy(
         let mut entropy_acc = 0.0f32;
         let mut nzeros = 0usize;
         let base = c * size;
-        // Channels with no chroma-from-luma (X, Y here) avoid the per-coefficient
-        // `- cmap_factor * in_y` multiply+subtract entirely. For c == 2 (B), the
-        // CfL term is applied. `1.0 * y == y` and `x - 0.0 == x` for finite
-        // values, so both branches are bit-identical to the original expression.
+        // Iterator-zipped loops over equal-length slices: removes the per-
+        // coefficient bounds checks on both `block` and `inv_matrix` (the matrix
+        // length equals `size` for every candidate). Arithmetic and order are
+        // unchanged, so the cost estimate is bit-identical.
+        let blk = &block[base..base + size];
+        let invm = &inv_matrix[..size];
         if cmap_factor == 0.0 {
-            for i in 0..size {
-                let val = block[base + i] * inv_matrix[i] * quant;
+            for (&bi, &mi) in blk.iter().zip(invm.iter()) {
+                let val = bi * mi * quant;
                 accumulate_coeff(
                     val,
                     &mut entropy_acc,
@@ -210,9 +212,9 @@ fn estimate_entropy(
                 );
             }
         } else {
-            for i in 0..size {
-                let in_y = block[size + i]; // channel 1 (Y)
-                let val = (block[base + i] - cmap_factor * in_y) * inv_matrix[i] * quant;
+            let yv = &block[size..size + size]; // channel 1 (Y)
+            for ((&bi, &mi), &yi) in blk.iter().zip(invm.iter()).zip(yv.iter()) {
+                let val = (bi - cmap_factor * yi) * mi * quant;
                 accumulate_coeff(
                     val,
                     &mut entropy_acc,
@@ -439,8 +441,6 @@ pub(crate) fn adjust_quant_field(
     ac_strategy: &AcStrategyImage,
     quant_field: &mut crate::image::ImageB,
 ) {
-    let xsize = ac_strategy.xsize();
-    let ysize = ac_strategy.ysize();
     for (x, y, raw_strategy) in ac_strategy.iter_first_blocks() {
         let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
         let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
@@ -450,20 +450,20 @@ pub(crate) fn adjust_quant_field(
         // Find max quant across covered blocks.
         let mut max_q: u8 = 0;
         for iy in 0..cov_y {
-            for ix in 0..cov_x {
-                let q = quant_field.row(y + iy)[x + ix];
+            let quant_row = &quant_field.row(y + iy)[x..x + cov_x];
+            for &q in quant_row.iter() {
                 if q > max_q {
                     max_q = q;
                 }
             }
         }
         for iy in 0..cov_y {
-            for ix in 0..cov_x {
-                quant_field.row_mut(y + iy)[x + ix] = max_q;
+            let quant_row = &mut quant_field.row_mut(y + iy)[x..x + cov_x];
+            for q in quant_row.iter_mut() {
+                *q = max_q;
             }
         }
     }
-    let _ = (xsize, ysize);
 }
 
 /// Run block selection across the whole image (raster order, 2×2 super-blocks).

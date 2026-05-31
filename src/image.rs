@@ -131,6 +131,13 @@ impl<T: Copy + Default> Image3<T> {
         self.planes[c].row(y)
     }
 
+    /// Whole plane as a contiguous row-major slice (length `xsize*ysize`).
+    /// Lets hot inner loops index `data[y*w + x]` directly instead of paying a
+    /// row-slice creation per access through `plane_row`.
+    pub(crate) fn plane_data(&self, c: usize) -> &[T] {
+        &self.planes[c].data
+    }
+
     #[inline]
     pub(crate) fn plane_row_mut(&mut self, c: usize, y: usize) -> &mut [T] {
         self.planes[c].row_mut(y)

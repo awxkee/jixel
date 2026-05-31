@@ -151,7 +151,13 @@ pub(crate) fn fill_cmap(
     let xtiles = ytox_map.xsize();
     let ytiles = ytox_map.ysize();
     for ty in 0..ytiles {
-        for tx in 0..xtiles {
+        let ytox_lane = ytox_map.row_mut(ty);
+        let ytob_lane = ytob_map.row_mut(ty);
+        for (tx, (v_ytox, v_ytob)) in ytox_lane[..xtiles]
+            .iter_mut()
+            .zip(ytob_lane[..xtiles].iter_mut())
+            .enumerate()
+        {
             let bx0 = dc_group_x0_blocks + tx * K_TILE_DIM_IN_BLOCKS;
             let by0 = dc_group_y0_blocks + ty * K_TILE_DIM_IN_BLOCKS;
             let bx_count = K_TILE_DIM_IN_BLOCKS
@@ -162,8 +168,8 @@ pub(crate) fn fill_cmap(
                 continue;
             }
             let (ytox, ytob) = compute_cmap_tile(opsin, bx0, by0, bx_count, by_count, matrices);
-            ytox_map.row_mut(ty)[tx] = ytox as i8;
-            ytob_map.row_mut(ty)[tx] = ytob as i8;
+            *v_ytox = ytox as i8;
+            *v_ytob = ytob as i8;
         }
     }
 }

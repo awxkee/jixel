@@ -435,9 +435,17 @@ pub(crate) fn write_ac_group(
                     }
                 }
             }
-            for k in 0..size {
-                coeffs[0][k] -= x_factor * coeffs[1][k];
-                coeffs[2][k] -= b_factor * coeffs[1][k];
+            {
+                let [c0, c1, c2] = &mut coeffs;
+                let y = &c1[..size];
+                for ((a, b), &yi) in c0[..size]
+                    .iter_mut()
+                    .zip(c2[..size].iter_mut())
+                    .zip(y.iter())
+                {
+                    *a -= x_factor * yi;
+                    *b -= b_factor * yi;
+                }
             }
             // ---- Extract post-CfL X and B DC ----
             let mut x_dc_post = [0.0f32; 4];
