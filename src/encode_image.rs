@@ -188,6 +188,33 @@ impl AlphaPlane {
     }
 }
 
+/// The JXL ToneMapping bundle (HDR luminance metadata). All fields are
+/// optional refinements on top of the SDR defaults; set them for fuller
+/// mastering metadata. Constraints (enforced by decoders): `intensity_target`
+/// must be > 0 and `0 <= min_nits <= intensity_target`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToneMappingParams {
+    /// Peak display luminance in nits. `None` keeps the 255-nit SDR default.
+    pub intensity_target: Option<f32>,
+    /// Minimum display luminance (mastering black level) in nits. Default 0.
+    pub min_nits: f32,
+    /// If true, sample values are relative to the max display luminance. Default false.
+    pub relative_to_max_display: bool,
+    /// Luminance below which the transfer is linear. Relative (0..1) when
+    /// `relative_to_max_display`, otherwise in nits. Default 0.
+    pub linear_below: f32,
+}
+
+impl ToneMappingParams {
+    /// True when every field is at its JXL default (no ToneMapping bundle needed).
+    fn is_default(&self) -> bool {
+        self.intensity_target.is_none()
+            && self.min_nits == 0.0
+            && !self.relative_to_max_display
+            && self.linear_below == 0.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub distance: f32,
@@ -196,6 +223,17 @@ pub struct EncodeConfig {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
+    /// HDR luminance signaling. When `Some(nits)`, the codestream's tone-mapping
+    /// metadata declares this peak display luminance (`intensity_target`), e.g.
+    /// `10000.0` for PQ/HDR10 or a measured mastering peak. `None` leaves the
+    /// SDR default. Must be > 0.
+    pub intensity_target: Option<f32>,
+    /// HDR mastering black level in nits (ToneMapping `min_nits`). Default 0.
+    pub min_nits: f32,
+    /// ToneMapping `relative_to_max_display`. Default false.
+    pub relative_to_max_display: bool,
+    /// ToneMapping `linear_below` (nits, or 0..1 if relative). Default 0.
+    pub linear_below: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +252,11 @@ pub(crate) struct EncodeConfigImpl {
     /// the data still flows through the XYB pipeline with R=G=B, so the X and B
     /// chroma channels are ~constant and cost almost nothing.
     pub(crate) grayscale: bool,
+    /// HDR peak display luminance in nits (see `EncodeConfig::intensity_target`).
+    pub(crate) intensity_target: Option<f32>,
+    pub(crate) min_nits: f32,
+    pub(crate) relative_to_max_display: bool,
+    pub(crate) linear_below: f32,
 }
 
 impl Default for EncodeConfig {
@@ -223,6 +266,10 @@ impl Default for EncodeConfig {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             lossless: false,
+            intensity_target: None,
+            min_nits: 0.0,
+            relative_to_max_display: false,
+            linear_below: 0.0,
         }
     }
 }
@@ -237,6 +284,10 @@ impl Default for EncodeConfigImpl {
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             grayscale: false,
+            intensity_target: None,
+            min_nits: 0.0,
+            relative_to_max_display: false,
+            linear_below: 0.0,
         }
     }
 }
@@ -285,6 +336,20 @@ impl EncodeConfigImpl {
         self.color_encoding = enc;
         self
     }
+
+    pub(crate) fn tone_mapping(&self) -> ToneMappingParams {
+        ToneMappingParams {
+            intensity_target: self.intensity_target,
+            min_nits: self.min_nits,
+            relative_to_max_display: self.relative_to_max_display,
+            linear_below: self.linear_below,
+        }
+    }
+
+    pub(crate) fn with_intensity_target(mut self, nits: Option<f32>) -> Self {
+        self.intensity_target = nits;
+        self
+    }
 }
 
 impl EncodeConfig {
@@ -305,6 +370,39 @@ impl EncodeConfig {
     pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
         self.color_encoding = enc;
         self
+    }
+
+    /// Signal HDR peak display luminance (nits) in the tone-mapping metadata.
+    pub fn with_intensity_target(mut self, nits: f32) -> Self {
+        self.intensity_target = Some(nits);
+        self
+    }
+
+    /// HDR mastering black level in nits (ToneMapping `min_nits`).
+    pub fn with_min_nits(mut self, nits: f32) -> Self {
+        self.min_nits = nits;
+        self
+    }
+
+    /// Set ToneMapping `relative_to_max_display`.
+    pub fn with_relative_to_max_display(mut self, rel: bool) -> Self {
+        self.relative_to_max_display = rel;
+        self
+    }
+
+    /// Set ToneMapping `linear_below` (nits, or 0..1 when relative).
+    pub fn with_linear_below(mut self, v: f32) -> Self {
+        self.linear_below = v;
+        self
+    }
+
+    pub(crate) fn tone_mapping(&self) -> ToneMappingParams {
+        ToneMappingParams {
+            intensity_target: self.intensity_target,
+            min_nits: self.min_nits,
+            relative_to_max_display: self.relative_to_max_display,
+            linear_below: self.linear_below,
+        }
     }
 
     /// Attach an ICC profile. **Panics at encode time** — see field docs.
@@ -367,7 +465,8 @@ pub fn encode_image(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -389,7 +488,8 @@ pub fn encode_image(
         &linear,
         &EncodeConfigImpl::with_distance(distance)
             .with_icc_profile(config.icc_profile.clone())
-            .with_color_encoding(config.color_encoding),
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target),
     )
 }
 
@@ -430,7 +530,8 @@ pub fn encode_image_with_alpha(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -460,7 +561,8 @@ pub fn encode_image_with_alpha(
         &EncodeConfigImpl::with_distance(distance)
             .with_alpha(AlphaPlane::from_u8(alpha_plane))
             .with_icc_profile(config.icc_profile.clone())
-            .with_color_encoding(config.color_encoding),
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target),
     )
 }
 
@@ -627,7 +729,8 @@ fn encode_gray_impl(
                 .with_lossless(true)
                 .with_grayscale(true)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -857,7 +960,8 @@ fn encode_gray_high_depth_impl(
                 .with_grayscale(true)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         );
     }
 
@@ -929,7 +1033,8 @@ fn encode_high_depth_rgba(
                 .with_lossless(config.lossless)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -980,7 +1085,8 @@ fn encode_high_depth_rgba(
                 })
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         )
     } else {
         for (y, row) in input.chunks_exact(width * 3).enumerate() {
@@ -1002,7 +1108,8 @@ fn encode_high_depth_rgba(
             &EncodeConfigImpl::with_distance(distance)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         )
     }
 }
@@ -1069,6 +1176,7 @@ fn encode_f32_lossless_rgba(
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
     write_image_metadata(
+        config.tone_mapping(),
         &config.color_encoding,
         alpha.as_ref(),
         config.icc_profile.as_deref(),
@@ -1135,7 +1243,8 @@ fn encode_float_rgba(
                 .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         )
     } else {
         for (y, row) in input.chunks_exact(width * 3).enumerate() {
@@ -1156,7 +1265,8 @@ fn encode_float_rgba(
             &EncodeConfigImpl::with_distance(distance)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
-                .with_color_encoding(config.color_encoding),
+                .with_color_encoding(config.color_encoding)
+                .with_intensity_target(config.intensity_target),
         )
     }
 }
@@ -1199,7 +1309,8 @@ fn encode_float_gray(
             .with_grayscale(true)
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
-            .with_color_encoding(config.color_encoding),
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target),
     )
 }
 
@@ -1306,6 +1417,7 @@ pub(crate) fn encode_with_config(
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(input.xsize(), input.ysize(), &mut w);
     write_image_metadata(
+        config.tone_mapping(),
         &config.color_encoding,
         config.alpha.as_ref(),
         config.icc_profile.as_deref(),
@@ -1459,6 +1571,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
     write_image_metadata(
+        config.tone_mapping(),
         &config.color_encoding,
         alpha_plane.as_ref(),
         config.icc_profile.as_deref(),
@@ -1577,6 +1690,7 @@ fn write_float_bit_depth(bits: u32, exp_bits: u32, w: &mut BitWriter) {
 }
 
 fn write_image_metadata(
+    tm: ToneMappingParams,
     color_encoding: &ColorEncoding,
     alpha: Option<&AlphaPlane>,
     icc_profile: Option<&[u8]>,
@@ -1586,7 +1700,16 @@ fn write_image_metadata(
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
-    w.write(1, 0); // extra_fields = false
+    // tone_mapping (HDR luminance) is gated by extra_fields; set it when the
+    // ToneMapping bundle differs from its SDR default in any field.
+    let extra_fields = !tm.is_default();
+    w.write(1, if extra_fields { 1 } else { 0 }); // extra_fields
+    if extra_fields {
+        w.write(3, 0); // orientation - 1 = 0 (identity)
+        w.write(1, 0); // have_intrinsic_size = false
+        w.write(1, 0); // have_preview = false
+        w.write(1, 0); // have_animation = false
+    }
     if bps.is_float() {
         write_float_bit_depth(bps.bits(), bps.exp_bits(), w);
     } else {
@@ -1637,7 +1760,18 @@ fn write_image_metadata(
     w.write(1, if lossless { 0 } else { 1 }); // xyb_encoded
     let want_icc = icc_profile.is_some();
     write_color_encoding_with_icc(color_encoding, want_icc, grayscale, w);
-    // tone_mapping is conditional on extra_fields (which we set to 0), so it's absent.
+    // tone_mapping bundle (gated by extra_fields). ToneMapping fields:
+    // intensity_target (F16), min_nits (F16), relative_to_max_display (bool),
+    // linear_below (F16). We signal intensity_target and leave the rest default.
+    if extra_fields {
+        // ToneMapping bundle, all fields explicit (all_default = false).
+        w.write(1, 0);
+        let it = tm.intensity_target.unwrap_or(255.0);
+        w.write(16, crate::util::f32_to_f16(it) as u64); // intensity_target
+        w.write(16, crate::util::f32_to_f16(tm.min_nits) as u64); // min_nits
+        w.write(1, if tm.relative_to_max_display { 1 } else { 0 }); // relative_to_max_display
+        w.write(16, crate::util::f32_to_f16(tm.linear_below) as u64); // linear_below
+    }
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).

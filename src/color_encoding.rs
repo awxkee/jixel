@@ -146,6 +146,16 @@ impl ColorEncoding {
             rendering_intent: RenderingIntent::Relative,
         }
     }
+
+    /// Rec. 2020 / BT.2020 with HLG transfer (broadcast HDR / HLG10-style).
+    pub const fn bt2020_hlg() -> Self {
+        Self {
+            white_point: WhitePoint::D65,
+            primaries: Primaries::Bt2100,
+            transfer: TransferFunction::Hlg,
+            rendering_intent: RenderingIntent::Relative,
+        }
+    }
 }
 
 fn write_jxl_enum(value: u32, w: &mut BitWriter) {
