@@ -233,11 +233,11 @@ pub(crate) fn encode_frame_lossless(
     let ysize = linear.ysize();
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
 
-    let xsize_groups = div_ceil(xsize, GROUP_DIM);
-    let ysize_groups = div_ceil(ysize, GROUP_DIM);
+    let xsize_groups = xsize.div_ceil(GROUP_DIM);
+    let ysize_groups = ysize.div_ceil(GROUP_DIM);
     let num_ac_groups = xsize_groups * ysize_groups;
-    let xsize_dc_groups = div_ceil(xsize, LF_GROUP_DIM);
-    let ysize_dc_groups = div_ceil(ysize, LF_GROUP_DIM);
+    let xsize_dc_groups = xsize.div_ceil(LF_GROUP_DIM);
+    let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
     let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
     let single_group = num_ac_groups == 1;
 
@@ -412,10 +412,6 @@ pub(crate) fn encode_frame_lossless(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Frame header.
-// ---------------------------------------------------------------------------
 
 fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
@@ -606,10 +602,6 @@ fn try_encode_palette_single_group(
     writer.zero_pad_to_byte();
     true
 }
-
-// ---------------------------------------------------------------------------
-// TOC.
-// ---------------------------------------------------------------------------
 
 fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
     const OFFSETS: [usize; 4] = [0, 1024, 17_408, 4_211_712];
@@ -1130,10 +1122,10 @@ fn try_encode_context_tree_single_group(
         let res = &chan_res[chan];
         let prp = &chan_prp[chan];
         let t = ts[chan] as i64;
-        for i in 0..res.len() {
-            let bucket = bucket_of(prp[i], t);
+        for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
+            let bucket = bucket_of(prp, t);
             let ctx = ctx_map[&((chan as u32) * 3 + bucket)];
-            tokens.push(Token::new(ctx, res[i]));
+            tokens.push(Token::new(ctx, res));
         }
     }
 
@@ -1299,10 +1291,6 @@ fn try_encode_context_tree_multi_group(
     }
     true
 }
-
-// ---------------------------------------------------------------------------
-// LZ77-aware histogram building, code construction, and emission.
-// ---------------------------------------------------------------------------
 
 use crate::bit_writer::BitWriter;
 use crate::encode_image::AlphaPlane;
@@ -1554,11 +1542,6 @@ fn write_tree_lz77(
     write_entropy_code(&pixel_code.as_ref(), w);
 }
 
-#[inline]
-fn div_ceil(a: usize, b: usize) -> usize {
-    a.div_ceil(b)
-}
-
 // ---------------------------------------------------------------------------
 // f32 lossless (v1): non-negative float, RGB, no alpha. The 32-bit float bits
 // are reinterpreted as int32 channels (matching libjxl float_to_int for
@@ -1597,11 +1580,11 @@ pub(crate) fn encode_frame_lossless_float(
     let ysize = linear.ysize();
     let nb_chans = 3usize + if alpha.is_some() { 1 } else { 0 };
 
-    let xsize_groups = div_ceil(xsize, GROUP_DIM);
-    let ysize_groups = div_ceil(ysize, GROUP_DIM);
+    let xsize_groups = xsize.div_ceil(GROUP_DIM);
+    let ysize_groups = ysize.div_ceil(GROUP_DIM);
     let num_ac_groups = xsize_groups * ysize_groups;
-    let xsize_dc_groups = div_ceil(xsize, LF_GROUP_DIM);
-    let ysize_dc_groups = div_ceil(ysize, LF_GROUP_DIM);
+    let xsize_dc_groups = xsize.div_ceil(LF_GROUP_DIM);
+    let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
     let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
     let single_group = num_ac_groups == 1;
 

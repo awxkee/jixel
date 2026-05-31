@@ -488,8 +488,8 @@ fn store_huffman_tree(depths: &[u8], w: &mut BitWriter) {
 
     let mut num_codes = 0;
     let mut code_one: i32 = 0;
-    for i in 0..NUM_CODE_LENGTH_CODES {
-        if histo[i] != 0 {
+    for (i, &hist) in histo.iter().enumerate() {
+        if hist != 0 {
             if num_codes == 0 {
                 code_one = i as i32;
                 num_codes = 1;

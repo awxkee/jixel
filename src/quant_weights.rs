@@ -27,6 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(clippy::excessive_precision)]
+
+use crate::dct::fmla;
+
 pub(crate) static INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
 pub(crate) static DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
 
@@ -735,7 +738,7 @@ fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
             let dy2 = dy * dy;
             for x in 0..16 {
                 let dx = x as f32 * rcp;
-                let dist = (dx * dx + dy2).sqrt();
+                let dist = fmla(dx, dx, dy2).sqrt();
                 let weight = interpolate_vec_bands(dist, &bands);
                 // libjxl stores 1/weight as the matrix entry (step size).
                 out[c][y * 16 + x] = 1.0 / weight;
