@@ -130,3 +130,59 @@ impl FastRound for f32 {
         }
     }
 }
+
+/// Convert an `f32` to IEEE-754 binary16 (half-float) bits, matching JXL's F16
+/// coder (sign | 5-bit biased exponent | 10-bit mantissa, round-to-nearest-even).
+/// Used for HDR tone-mapping metadata (`intensity_target`, `min_nits`, ...).
+/// Values out of the finite half range are clamped to the max finite half;
+/// inf/NaN are not expected here (JXL rejects them in F16 fields).
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127; // unbiased
+    let mant = bits & 0x7F_FFFF; // 23-bit mantissa
+    if value == 0.0 {
+        return sign;
+    }
+    if exp > 15 {
+        return sign | 0x7BFF; // clamp to max finite half (65504)
+    }
+    if exp < -24 {
+        return sign; // underflow to zero
+    }
+    if exp < -14 {
+        // Subnormal half: shift the implicit-1 mantissa down.
+        let shift = (14 - exp) as u32; // 0..=10 extra
+        let full = mant | 0x80_0000;
+        let half_mant = full >> (shift + 13);
+        let round = (full >> (shift + 12)) & 1;
+        return sign | ((half_mant as u16) + round as u16);
+    }
+    // Normalized: pack and round-to-nearest-even; a mantissa carry naturally
+    // increments the exponent via the addition.
+    let e16 = (exp + 15) as u16;
+    let mant16 = (mant >> 13) as u16;
+    let remainder = mant & 0x1FFF; // dropped low 13 bits
+    let half = 0x1000u32;
+    let mut out = (e16 << 10) | mant16;
+    if remainder > half || (remainder == half && (mant16 & 1) == 1) {
+        out += 1; // round up (carry into exponent if mantissa overflows)
+    }
+    if out >= 0x7C00 {
+        out = 0x7BFF; // never emit inf from rounding
+    }
+    sign | out
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::f32_to_f16;
+    #[test]
+    fn known_hdr_luminances() {
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(255.0), 0x5BF8);
+        assert_eq!(f32_to_f16(1000.0), 0x63D0);
+        assert_eq!(f32_to_f16(4000.0), 0x6BD0);
+        assert_eq!(f32_to_f16(10000.0), 0x70E2);
+    }
+}

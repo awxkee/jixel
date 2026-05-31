@@ -216,6 +216,8 @@ pub(crate) fn encode_frame_lossless(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     max_bits: u32,
+    progressive: bool,
+    num_color: usize,
     writer: &mut BitWriter,
 ) {
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
@@ -231,7 +233,7 @@ pub(crate) fn encode_frame_lossless(
     };
     let xsize = linear.xsize();
     let ysize = linear.ysize();
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
 
     let xsize_groups = xsize.div_ceil(GROUP_DIM);
     let ysize_groups = ysize.div_ceil(GROUP_DIM);
@@ -246,8 +248,42 @@ pub(crate) fn encode_frame_lossless(
     // large win for low-color/graphic content. Falls through to the normal
     // RCT+predictor path when it doesn't apply.
     if single_group
+        && num_color == 3
         && alpha.is_none()
         && try_encode_palette_single_group(linear, xsize, ysize, min_symbol, writer)
+    {
+        return;
+    }
+
+    // Stage-2 progressive lossless (opt-in): Squeeze pyramid (RGB + optional alpha).
+    if single_group
+        && num_color == 3
+        && (progressive || std::env::var("JIXEL_SQUEEZE").as_deref() == Ok("1"))
+    {
+        encode_squeeze_single_group(linear, alpha, xsize, ysize, min_symbol, writer);
+        return;
+    }
+
+    // Progressive multi-group (Stage A: all squeezed channels fit the global
+    // stream). Falls through to the non-progressive path if a channel is still
+    // larger than a group (Stage B).
+    if !single_group
+        && num_color == 3
+        && (progressive || std::env::var("JIXEL_SQUEEZE").as_deref() == Ok("1"))
+        && encode_squeeze_multigroup(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            min_symbol,
+            xsize_groups,
+            ysize_groups,
+            xsize_dc_groups,
+            ysize_dc_groups,
+            num_dc_groups,
+            num_ac_groups,
+            writer,
+        )
     {
         return;
     }
@@ -255,24 +291,34 @@ pub(crate) fn encode_frame_lossless(
     // Pick Gradient(5) or Weighted(6) per channel by estimated cost (one global
     // choice, used for the tree and every group). Never worse than all-WP.
     let predictors = choose_predictors(linear, alpha, xsize, ysize);
+    // Contiguous per-modular-channel predictors: the `num_color` color channels
+    // (Y for gray; Y/Co/Cg for color) followed by alpha. For 3-color this is just
+    // predictors[..nb_chans]; for gray it is [Y_pred, (alpha_pred)].
+    let chan_preds: Vec<u32> = {
+        let mut v: Vec<u32> = (0..num_color).map(|c| predictors[c]).collect();
+        if alpha.is_some() {
+            v.push(predictors[3]);
+        }
+        v
+    };
 
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
-    if single_group {
-        if try_encode_context_tree_single_group(
-            linear,
-            alpha,
-            xsize,
-            ysize,
-            &predictors,
-            min_symbol,
-            writer,
-        ) {
-            return;
-        }
-    } else {
-        if try_encode_context_tree_multi_group(
+    if num_color == 3 {
+        if single_group {
+            if try_encode_context_tree_single_group(
+                linear,
+                alpha,
+                xsize,
+                ysize,
+                &predictors,
+                min_symbol,
+                writer,
+            ) {
+                return;
+            }
+        } else if try_encode_context_tree_multi_group(
             linear,
             alpha,
             xsize,
@@ -303,7 +349,18 @@ pub(crate) fn encode_frame_lossless(
         write_modular_transforms(nb_chans, &mut section);
 
         // Tokenize all channels (post-YCoCg, per-channel contexts).
-        let tokens = tokenize_all(linear, alpha, xsize, ysize, 0, 0, xsize, ysize, &predictors);
+        let tokens = tokenize_all(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            0,
+            0,
+            xsize,
+            ysize,
+            num_color,
+            &chan_preds,
+        );
 
         // LZ77 layer: collapse runs of identical tokens into back-references.
         // The distance context is the (nb_chans)-th context, appended after the
@@ -313,7 +370,7 @@ pub(crate) fn encode_frame_lossless(
 
         // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
         let code = build_lz_pixel_code(&lz_tokens, nb_chans, min_symbol);
-        write_local_tree_lz77(&predictors[..nb_chans], &code, min_symbol, &mut section);
+        write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut section);
 
         // Emit the LZ77'd token stream.
         for t in &lz_tokens {
@@ -348,7 +405,18 @@ pub(crate) fn encode_frame_lossless(
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks = tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh, &predictors);
+                let toks = tokenize_all(
+                    linear,
+                    alpha,
+                    xsize,
+                    ysize,
+                    x0,
+                    y0,
+                    gw,
+                    gh,
+                    num_color,
+                    &chan_preds,
+                );
                 let lz = lz77_compress(&toks, distance_ctx);
                 all_lz.extend_from_slice(&lz);
                 group_lz_tokens.push(lz);
@@ -359,7 +427,7 @@ pub(crate) fn encode_frame_lossless(
         // ----- Section 0: DC global -----
         sections[0].write(1, 1); // dc_quant all_default = 1
         sections[0].write(1, 1); // has_tree = 1
-        write_local_tree_lz77(&predictors[..nb_chans], &code, min_symbol, &mut sections[0]);
+        write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut sections[0]);
         // GroupHeader for the global modular image: use_global_tree=1, wp=1, RCT transform.
         sections[0].write(1, 1);
         sections[0].write(1, 1);
@@ -454,6 +522,356 @@ fn write_modular_transforms(nb_chans: usize, w: &mut BitWriter) {
     } else {
         w.write(2, 0b00); // 0 transforms
     }
+}
+
+/// Transform list for RCT + a Squeeze with the given step sequence.
+/// Byte-exact to libjxl Transform/SqueezeParams field encoding.
+fn write_modular_transforms_rct_squeeze(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
+    // transforms count = 2 -> selector 2 + Bits(4)=0.
+    w.write(2, 0b10);
+    w.write(4, 0);
+    // Transform[0] = RCT (YCoCg), begin_c=0.
+    w.write(2, 0b00);
+    w.write(2, 0b00);
+    w.write(3, 0);
+    w.write(2, 0b00);
+    // Transform[1] = Squeeze.
+    w.write(2, 0b10); // id = kSqueeze
+    // num_squeezes: U32(Val0, BitsOffset(4,1), BitsOffset(6,9), BitsOffset(8,41)).
+    let n = steps.len() as u32;
+    if n == 0 {
+        w.write(2, 0b00);
+    } else if n <= 16 {
+        w.write(2, 0b01);
+        w.write(4, (n - 1) as u64);
+    } else if n <= 72 {
+        w.write(2, 0b10);
+        w.write(6, (n - 9) as u64);
+    } else {
+        w.write(2, 0b11);
+        w.write(8, (n - 41) as u64);
+    }
+    for s in steps {
+        w.write(1, if s.horizontal { 1 } else { 0 });
+        w.write(1, if s.in_place { 1 } else { 0 });
+        // begin_c: U32(Bits3, ...): for small values use selector 0 = Bits(3).
+        debug_assert!(s.begin_c < 8);
+        w.write(2, 0b00);
+        w.write(3, s.begin_c as u64);
+        // num_c: U32(Val1,Val2,Val3,BitsOffset(4,4)).
+        match s.num_c {
+            1 => w.write(2, 0b00),
+            2 => w.write(2, 0b01),
+            3 => w.write(2, 0b10),
+            n => {
+                w.write(2, 0b11);
+                w.write(4, (n - 4) as u64);
+            }
+        }
+    }
+}
+
+/// Stage-2 progressive-lossless path (opt-in, JIXEL_SQUEEZE=1): single-group,
+/// no alpha. Applies one horizontal in-place Squeeze to the RCT'd channels,
+/// producing [avgY,avgCo,avgCg,resY,resCo,resCg], then tokenizes the 6 channels
+/// with the Gradient predictor. Lossless: djxl reconstructs bit-exact after
+/// inverse-Squeeze + inverse-RCT; the 3 half-width avg channels form the preview.
+fn encode_squeeze_single_group(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    min_symbol: u32,
+    writer: &mut BitWriter,
+) {
+    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
+    // Lift the 3 RCT'd planes (and alpha, if present) into channels.
+    let num_c = if alpha.is_some() { 4 } else { 3 };
+    let mut channels: Vec<Channel> = Vec::with_capacity(num_c);
+    for c in 0..3usize {
+        let mut ch = Channel::new(xsize, ysize);
+        for y in 0..ysize {
+            let row = linear.plane_row(c, y);
+            ch.data[y * xsize..y * xsize + xsize].copy_from_slice(&row[..xsize]);
+        }
+        channels.push(ch);
+    }
+    if let Some(a) = alpha {
+        let mut ch = Channel::new(xsize, ysize);
+        for y in 0..ysize {
+            for x in 0..xsize {
+                ch.data[y * xsize + x] = a.get_i32(y * xsize + x);
+            }
+        }
+        channels.push(ch);
+    }
+    // Apply the alternating H/V pyramid over all channels (explicit sequence).
+    let steps = default_squeeze_steps(xsize, ysize, num_c);
+    for s in &steps {
+        apply_step_forward(&mut channels, s);
+    }
+    let nb = channels.len();
+
+    // Per-channel predictor selection (Gradient vs Weighted) by estimated cost,
+    // mirroring the main path — recovers the size squeeze otherwise leaves on
+    // the table (residual channels often prefer a different predictor).
+    let predictors: Vec<u32> = channels
+        .iter()
+        .map(|ch| {
+            let data = &ch.data;
+            let w = ch.w;
+            let get = move |gx: usize, gy: usize| data[gy * w + gx];
+            let bg = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_GRADIENT);
+            let bw = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            if bw <= bg {
+                PREDICTOR_WEIGHTED
+            } else {
+                PREDICTOR_GRADIENT
+            }
+        })
+        .collect();
+    let mut tokens: Vec<Token> = Vec::new();
+    for (c, ch) in channels.iter().enumerate() {
+        let ctx = channel_to_context(c, nb);
+        let data = &ch.data;
+        let w = ch.w;
+        let get = move |gx: usize, gy: usize| data[gy * w + gx];
+        tokenize_plane(ctx, &get, ch.w, ch.h, predictors[c], &mut tokens);
+    }
+
+    write_frame_header_modular(alpha.is_some(), writer);
+    let mut section = BitWriter::new();
+    section.write(1, 1); // dc_quant all_default = 1
+    section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
+    section.write(1, 0); // use_global_tree = 0
+    section.write(1, 1); // wp_default = 1
+    write_modular_transforms_rct_squeeze(&steps, &mut section);
+
+    let distance_ctx = nb as u32;
+    let lz_tokens = lz77_compress(&tokens, distance_ctx);
+    let code = build_lz_pixel_code(&lz_tokens, nb, min_symbol);
+    write_local_tree_lz77(&predictors, &code, min_symbol, &mut section);
+    for t in &lz_tokens {
+        write_lz_token(*t, &code, min_symbol, &mut section);
+    }
+    section.zero_pad_to_byte();
+
+    writer.write(1, 0); // no permutation
+    writer.zero_pad_to_byte();
+    write_toc_entry(section.bits_written() / 8, writer);
+    writer.zero_pad_to_byte();
+    writer.append(&section);
+    writer.zero_pad_to_byte();
+}
+
+/// Stage-2 progressive lossless, multi-group (image > one AC group).
+///
+/// Applies the Squeeze pyramid to the whole frame, then splits channels per the
+/// JXL rule: channels that fit a group form the global modular image (LfGlobal /
+/// section 0); larger channels are partitioned into AC groups, each carrying the
+/// `frame_rect >> shift` crop of every large channel. A single global tree (chain
+/// on the channel property) serves all streams; the within-group channel index is
+/// what the tree sees, so group crops share contexts with the leading globals.
+#[allow(clippy::too_many_arguments)]
+fn encode_squeeze_multigroup(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    min_symbol: u32,
+    xsize_groups: usize,
+    ysize_groups: usize,
+    xsize_dc_groups: usize,
+    ysize_dc_groups: usize,
+    num_dc_groups: usize,
+    num_ac_groups: usize,
+    writer: &mut BitWriter,
+) -> bool {
+    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
+    let num_c = if alpha.is_some() { 4 } else { 3 };
+    let mut channels: Vec<Channel> = Vec::with_capacity(num_c);
+    for c in 0..3usize {
+        let mut ch = Channel::new(xsize, ysize);
+        for y in 0..ysize {
+            let row = linear.plane_row(c, y);
+            ch.data[y * xsize..y * xsize + xsize].copy_from_slice(&row[..xsize]);
+        }
+        channels.push(ch);
+    }
+    if let Some(a) = alpha {
+        let mut ch = Channel::new(xsize, ysize);
+        for y in 0..ysize {
+            for x in 0..xsize {
+                ch.data[y * xsize + x] = a.get_i32(y * xsize + x);
+            }
+        }
+        channels.push(ch);
+    }
+    let steps = default_squeeze_steps(xsize, ysize, num_c);
+    for s in &steps {
+        apply_step_forward(&mut channels, s);
+    }
+    let nb = channels.len();
+
+    // Channel -> stream split (JXL rule): the leading run of channels that fit a
+    // group is the global modular image; the first channel still larger than a
+    // group starts the suffix that is partitioned into AC groups.
+    let split = channels
+        .iter()
+        .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
+        .unwrap_or(nb);
+
+    let predictors: Vec<u32> = channels
+        .iter()
+        .map(|ch| {
+            let data = &ch.data;
+            let w = ch.w;
+            let get = move |gx: usize, gy: usize| data[gy * w + gx];
+            let bg = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_GRADIENT);
+            let bw = estimate_channel_bits(&get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            if bw <= bg {
+                PREDICTOR_WEIGHTED
+            } else {
+                PREDICTOR_GRADIENT
+            }
+        })
+        .collect();
+
+    let distance_ctx = nb as u32;
+
+    // Global stream: the small channels [0, split), whole.
+    let mut global_tokens: Vec<Token> = Vec::new();
+    for c in 0..split {
+        let ch = &channels[c];
+        let ctx = channel_to_context(c, nb);
+        let data = &ch.data;
+        let w = ch.w;
+        let get = move |gx: usize, gy: usize| data[gy * w + gx];
+        tokenize_plane(ctx, &get, ch.w, ch.h, predictors[c], &mut global_tokens);
+    }
+    let global_lz = lz77_compress(&global_tokens, distance_ctx);
+    let mut all_lz: Vec<LzToken> = global_lz.clone();
+
+    // One group's worth of cropped large-channel tokens. `gdim` is the group's
+    // frame-space size (GROUP_DIM for AC, LF_GROUP_DIM for DC); a channel is
+    // included when min(hshift,vshift) is inside [minsh,maxsh], and contributes
+    // its `(group_rect >> shift)` crop. The decoder rebuilds the same scan, so
+    // the within-group index (sequential over non-empty crops) is exactly the
+    // `chan` property the global tree keys on.
+    let crop_group = |gdim: usize, gx: usize, gy: usize, minsh: i32, maxsh: i32| -> Vec<LzToken> {
+        let mut gtok: Vec<Token> = Vec::new();
+        let mut within = 0usize;
+        for c in split..nb {
+            let ch = &channels[c];
+            let msh = ch.hshift.min(ch.vshift);
+            if msh < minsh || msh > maxsh {
+                continue;
+            }
+            let hs = ch.hshift as usize;
+            let vs = ch.vshift as usize;
+            let rx0 = (gx * gdim) >> hs;
+            let ry0 = (gy * gdim) >> vs;
+            if rx0 >= ch.w || ry0 >= ch.h {
+                continue;
+            }
+            let rw = (gdim >> hs).min(ch.w - rx0);
+            let rh = (gdim >> vs).min(ch.h - ry0);
+            if rw == 0 || rh == 0 {
+                continue;
+            }
+            let ctx = channel_to_context(within, nb);
+            let pred = predictors[within];
+            let data = &ch.data;
+            let w = ch.w;
+            let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
+            tokenize_plane(ctx, &get, rw, rh, pred, &mut gtok);
+            within += 1;
+        }
+        lz77_compress(&gtok, distance_ctx)
+    };
+
+    // DC (LF) groups carry the deeply-squeezed large channels (min shift >= 3),
+    // partitioned into LF_GROUP_DIM rects. Empty unless the image is large enough
+    // that a >=3x-squeezed channel still exceeds a group (dimension > ~2048).
+    let mut dc_group_lz: Vec<Vec<LzToken>> = Vec::with_capacity(num_dc_groups);
+    for rgy in 0..ysize_dc_groups {
+        for rgx in 0..xsize_dc_groups {
+            let glz = crop_group(LF_GROUP_DIM, rgx, rgy, 3, 1000);
+            all_lz.extend_from_slice(&glz);
+            dc_group_lz.push(glz);
+        }
+    }
+
+    // AC groups carry the shallow large channels (min shift <= 2), in GROUP_DIM rects.
+    let mut ac_group_lz: Vec<Vec<LzToken>> = Vec::with_capacity(num_ac_groups);
+    for gy in 0..ysize_groups {
+        for gx in 0..xsize_groups {
+            let glz = crop_group(GROUP_DIM, gx, gy, 0, 2);
+            all_lz.extend_from_slice(&glz);
+            ac_group_lz.push(glz);
+        }
+    }
+
+    let code = build_lz_pixel_code(&all_lz, nb, min_symbol);
+
+    write_frame_header_modular(alpha.is_some(), writer);
+
+    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
+    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
+
+    // ----- Section 0: LfGlobal = global tree + global modular image -----
+    sections[0].write(1, 1); // dc_quant all_default = 1
+    sections[0].write(1, 1); // has_tree = 1
+    write_local_tree_lz77(&predictors, &code, min_symbol, &mut sections[0]);
+    sections[0].write(1, 1); // use_global_tree = 1
+    sections[0].write(1, 1); // wp_default = 1
+    write_modular_transforms_rct_squeeze(&steps, &mut sections[0]);
+    for t in &global_lz {
+        write_lz_token(*t, &code, min_symbol, &mut sections[0]);
+    }
+    sections[0].zero_pad_to_byte();
+
+    // ----- DC groups: GroupHeader + any min-shift>=3 large-channel crops -----
+    for i in 0..num_dc_groups {
+        sections[1 + i].write(1, 1); // use_global_tree
+        sections[1 + i].write(1, 1); // wp_default
+        sections[1 + i].write(2, 0); // 0 transforms (declared globally)
+        for t in &dc_group_lz[i] {
+            write_lz_token(*t, &code, min_symbol, &mut sections[1 + i]);
+        }
+        sections[1 + i].zero_pad_to_byte();
+    }
+
+    // ----- AC global: trivial -----
+    let ac_global_idx = 1 + num_dc_groups;
+    sections[ac_global_idx].write(1, 1);
+    sections[ac_global_idx].write(1, 1);
+    sections[ac_global_idx].zero_pad_to_byte();
+
+    // ----- AC groups: GroupHeader + the cropped large-channel tokens -----
+    for g in 0..num_ac_groups {
+        let idx = 2 + num_dc_groups + g;
+        sections[idx].write(1, 1); // use_global_tree
+        sections[idx].write(1, 1); // wp_default
+        sections[idx].write(2, 0); // 0 transforms (declared globally)
+        for t in &ac_group_lz[g] {
+            write_lz_token(*t, &code, min_symbol, &mut sections[idx]);
+        }
+        sections[idx].zero_pad_to_byte();
+    }
+
+    // TOC + sections.
+    writer.write(1, 0); // no permutation
+    writer.zero_pad_to_byte();
+    for s in &sections {
+        write_toc_entry(s.bits_written() / 8, writer);
+    }
+    writer.zero_pad_to_byte();
+    for s in &sections {
+        writer.append(s);
+        writer.zero_pad_to_byte();
+    }
+    true
 }
 
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
@@ -734,22 +1152,24 @@ fn tokenize_all(
     y0: usize,
     gw: usize,
     gh: usize,
+    num_color: usize,
     predictors: &[u32],
 ) -> Vec<Token> {
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
     let mut out = Vec::with_capacity(gw * gh * nb_chans);
 
-    for chan in 0..3usize {
+    // Color channels: plane 0 (Y/luma) for gray, planes 0..3 (Y/Co/Cg) for color.
+    for chan in 0..num_color {
         let ctx = channel_to_context(chan, nb_chans);
         let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
         tokenize_plane(ctx, &get, gw, gh, predictors[chan], &mut out);
     }
 
-    // Alpha (untransformed) under its own context.
+    // Alpha (untransformed) is the modular channel right after the color ones.
     if let Some(a) = alpha {
-        let ctx = channel_to_context(3, nb_chans);
+        let ctx = channel_to_context(num_color, nb_chans);
         let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
-        tokenize_plane(ctx, &get, gw, gh, predictors[3], &mut out);
+        tokenize_plane(ctx, &get, gw, gh, predictors[num_color], &mut out);
     }
 
     out
@@ -1478,7 +1898,19 @@ fn build_balanced_tree_tokens(predictors: &[u32]) -> Vec<Token> {
             push_leaf(&mut t, predictors[1]); // chan 1
             push_leaf(&mut t, predictors[0]); // chan 0
         }
-        _ => unreachable!("write_local_tree supports 1..=4 leaves"),
+        _ => {
+            // N>=5: right-leaning chain. BFS emission yields leaves in order
+            // chan(N-1)..chan0 -> contexts 0..N-1, matching channel_to_context.
+            // Peels off the highest channel at each split: split(0,k) sends
+            // channel>k (== k+1) to a leaf, else continue.
+            for k in (1..=(n_leaves - 2)).rev() {
+                push_split(&mut t, 0, k as i32);
+                push_leaf(&mut t, predictors[k + 1]);
+            }
+            push_split(&mut t, 0, 0);
+            push_leaf(&mut t, predictors[1]);
+            push_leaf(&mut t, predictors[0]);
+        }
     }
     t
 }
@@ -1607,7 +2039,18 @@ pub(crate) fn encode_frame_lossless_float(
         section.write(1, 1); // wp_default = 1
         section.write(2, 0b00); // 0 transforms (no RCT for float bits)
 
-        let tokens = tokenize_all(linear, alpha, xsize, ysize, 0, 0, xsize, ysize, &predictors);
+        let tokens = tokenize_all(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            0,
+            0,
+            xsize,
+            ysize,
+            3,
+            &predictors,
+        );
         let code = optimize_entropy_code(&tokens, nb_chans);
         write_tree_and_pixel_code_nolz(&tree_tokens, &code, &mut section);
         for t in &tokens {
@@ -1634,7 +2077,8 @@ pub(crate) fn encode_frame_lossless_float(
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks = tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh, &predictors);
+                let toks =
+                    tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh, 3, &predictors);
                 all_tokens.extend_from_slice(&toks);
                 group_tokens.push(toks);
             }

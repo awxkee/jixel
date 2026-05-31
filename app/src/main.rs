@@ -34,18 +34,15 @@ fn main() {
     // }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let img10 = image
-        .to_luma16()
-        .iter()
-        .map(|&x| x >> 6)
-        .collect::<Vec<_>>(); //vec![0u8; width * height * 3];
-    let bytes = jixel::encode_image_gray_10bit(
+    let img10 = image.to_luma32f(); //vec![0u8; width * height * 3];
+    let bytes = jixel::encode_image_gray_f32(
         &img10,
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(false)
+            .with_lossless(true)
             .with_quality(90.)
+            .with_progressive(true)
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
