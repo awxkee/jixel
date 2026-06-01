@@ -63,8 +63,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo clippy --all-features -- -D warnings
-      - run: cargo clippy --no-default-features --feature avx -- -D warnings
-      - run: cargo clippy --no-default-features --feature sse -- -D warnings
+      - run: cargo clippy --no-default-features --features avx -- -D warnings
+      - run: cargo clippy --no-default-features --features sse -- -D warnings
 
   clippy_x86_nightly:
     name: Clippy x86 Nightly
