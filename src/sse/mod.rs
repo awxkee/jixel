@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 mod adaptive_quant;
-mod lossless_grad_sse_fjxl;
+mod lossless_grad;
 
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use lossless_grad_sse_fjxl::grad_pack_interior;
+pub(crate) use lossless_grad::grad_pack_interior;

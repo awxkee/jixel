@@ -575,8 +575,9 @@ pub(crate) fn write_ac_group(
                 let shifted = ((nzeros as usize + covered_blocks - 1) >> log2_covered_blocks) as u8;
                 // Pre-swap iteration (cov_x, cov_y from raw strategy).
                 for iy in 0..cov_y {
-                    for ix in 0..cov_x {
-                        num_nzeros.plane_row_mut(c, nz_by + iy)[bx + ix] = shifted;
+                    let target_row = &mut num_nzeros.plane_row_mut(c, nz_by + iy)[bx..bx + cov_x];
+                    for target in target_row.iter_mut() {
+                        *target = shifted;
                     }
                 }
 
