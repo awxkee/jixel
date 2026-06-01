@@ -51,7 +51,11 @@ fn main() {
     //         .with_color_encoding(ColorEncoding::srgb()),
     // )
     // .unwrap();
-    let rgb_img = image.to_luma16().iter().map(|&x| x >> 6).collect::<Vec<_>>();
+    let rgb_img = image
+        .to_luma16()
+        .iter()
+        .map(|&x| x >> 6)
+        .collect::<Vec<_>>();
     let bytes = jixel::encode_fast_lossless_u16(
         &rgb_img,
         image.width() as usize,

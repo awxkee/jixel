@@ -28,8 +28,8 @@
  */
 mod adaptive_quant;
 mod dct;
-mod lossless_grad_sse_fjxl;
+mod lossless_grad;
 
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use dct::{dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon};
-pub(crate) use lossless_grad_sse_fjxl::grad_pack_interior;
+pub(crate) use lossless_grad::grad_pack_interior;

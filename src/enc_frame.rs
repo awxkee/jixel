@@ -54,10 +54,6 @@ const K_GRAD_RANGE_MID: i64 = 512;
 const K_GRAD_RANGE_MIN: i64 = 0;
 const K_GRAD_RANGE_MAX: i64 = 1023;
 
-// -----------------------------------------------------------------------------
-// Image dimensions.
-// -----------------------------------------------------------------------------
-
 #[allow(dead_code)]
 struct ImageDim {
     xsize: usize,
@@ -106,22 +102,12 @@ struct DistanceParams {
     gab_enabled: bool,
 }
 
-fn clamp1<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
-    if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
-    }
-}
-
 fn quant_dc(distance: f32) -> f32 {
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
     let effective = k_dc_mul * (distance / k_dc_mul).powf(k_dc_quant_pow);
-    let effective = clamp1(effective, 0.5 * distance, distance);
+    let effective = f32::clamp(effective, 0.5 * distance, distance);
     (k_dc_quant / effective).min(50.0)
 }
 
@@ -133,12 +119,12 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
 
     let qdc = quant_dc(distance);
     let mut scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * K_QUANT_FIELD_TARGET);
-    scale = clamp1(scale, 1.0, (1 << 15) as f32);
+    scale = f32::clamp(scale, 1.0, (1 << 15) as f32);
     let scaled_quant_dc = (qdc * K_GLOBAL_SCALE_NUMERATOR as f32 * 1.6) as i32;
-    let global_scale = clamp1(scale as i32, 1, scaled_quant_dc);
+    let global_scale = i32::clamp(scale as i32, 1, scaled_quant_dc);
     let scale_f = global_scale as f32 / K_GLOBAL_SCALE_DENOM as f32;
     let qd = ((qdc / scale_f) + 0.5) as i32;
-    let qd = clamp1(qd, 1, 1 << 16);
+    let qd = i32::clamp(qd, 1, 1 << 16);
     let scale_dc = qd as f32 * scale_f;
 
     let mut x_qm_scale: u32 = 2;
@@ -211,7 +197,7 @@ fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
                     left
                 };
                 let guess = clamped_gradient(top as i32, left as i32, topleft as i32);
-                let grad_prop = clamp1(
+                let grad_prop = i64::clamp(
                     K_GRAD_RANGE_MID + top + left - topleft,
                     K_GRAD_RANGE_MIN,
                     K_GRAD_RANGE_MAX,
