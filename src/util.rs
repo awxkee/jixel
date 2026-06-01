@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::ColorSpace;
 use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
 
@@ -59,6 +60,16 @@ pub enum EncodeError {
     /// ICC profile injection is not yet implemented.
     IccProfileNotSupported,
     Unsupported(&'static str),
+    BadChannelCount(usize),
+    BadBitDepth(u32),
+    BadOrientation(u8),
+    IccNotSupported,
+    SizeOverflow,
+    InputLength {
+        expected: usize,
+        got: usize,
+    },
+    UnsupportedColorSpace(ColorSpace),
 }
 
 impl fmt::Display for EncodeError {
@@ -93,6 +104,20 @@ impl fmt::Display for EncodeError {
                 write!(f, "ICC profile injection is not yet supported by jixel")
             }
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Self::BadChannelCount(n) => write!(f, "channel count {} not in 1..=4", n),
+            Self::BadBitDepth(b) => write!(f, "bits_per_sample {} not in 1..=16", b),
+            Self::BadOrientation(o) => write!(f, "orientation {} not in 1..=8", o),
+            Self::IccNotSupported => write!(
+                f,
+                "embedded ICC not yet supported; use an enumerated colour space"
+            ),
+            Self::SizeOverflow => write!(f, "image size overflows usize"),
+            Self::InputLength { expected, got } => {
+                write!(f, "input length {} != expected {}", got, expected)
+            }
+            EncodeError::UnsupportedColorSpace(colorspace) => {
+                f.write_fmt(format_args!("unsupported color space: {:?}", colorspace))
+            }
         }
     }
 }

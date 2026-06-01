@@ -36,6 +36,7 @@
 
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
+use std::sync::OnceLock;
 
 const K_SG_MUL: f32 = 226.0480446705883;
 const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
@@ -43,14 +44,14 @@ const K_LOG2: f32 = 0.693147181;
 const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_LOG2;
 const K_SG_V_OFFSET: f32 = 7.14672470003;
 
-const K_AC_QUANT: f32 = 0.8974;
+pub(crate) const K_AC_QUANT: f32 = 0.8974;
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
 const K_X_MUL: f32 = 23.426802998210313;
 
 /// Ratio of derivatives of cubic-root to simple-gamma; moves quantization from
 /// jxl's opsin (cube-root-of-photons) space to butteraugli's log-gamma space.
 #[inline]
-fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
+pub(crate) fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
     let k_epsilon = 1e-2f32;
     let v = if v < 0.0 { 0.0 } else { v };
     let k_num_mul = K_SG_RET_MUL * 3.0 * K_SG_MUL;
@@ -64,7 +65,7 @@ fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
 
 /// Visual-masking transform applied to the accumulated per-block difference.
 #[inline]
-fn compute_mask(out_val: f32) -> f32 {
+pub(crate) fn compute_mask(out_val: f32) -> f32 {
     let k_base = -0.74174993f32;
     let k_mul4 = 3.2353257320940401f32;
     let k_mul2 = 12.906028311180409f32;
@@ -83,7 +84,7 @@ fn compute_mask(out_val: f32) -> f32 {
 
 /// `0.25 * sqrt(v * sqrt(kMul*1e8) + kLogOffset)`.
 #[inline]
-fn masking_sqrt(v: f32) -> f32 {
+pub(crate) fn masking_sqrt(v: f32) -> f32 {
     let k_log_offset = 26.481471032459346f32;
     let k_mul = 211.50759899638012f32;
     let mul_v = k_mul * 1e8;
@@ -91,7 +92,7 @@ fn masking_sqrt(v: f32) -> f32 {
 }
 
 /// HF modulation: sum of |right| and |below| abs differences in the 8x8 Y block.
-fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
+pub(crate) fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
     let ys = xyb_y.ysize();
     let xs = xyb_y.xsize();
     let mut sum = 0.0f32;
@@ -116,7 +117,7 @@ fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
 }
 
 /// Color modulation: boost precision in strongly red or blue blocks.
-fn color_modulation(
+pub(crate) fn color_modulation(
     x: usize,
     y: usize,
     xyb: &Image3F,
@@ -168,7 +169,7 @@ fn color_modulation(
 }
 
 /// Gamma modulation: accounts for the local gamma of the 8x8 block.
-fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
+pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     let k_bias = 0.16f32;
     let mut overall_ratio = 0.0f32;
     let ys = xyb.ysize();
@@ -195,7 +196,7 @@ fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
 }
 
 #[inline]
-fn store_min4(v: f32, mins: &mut [f32; 4]) {
+pub(crate) fn store_min4(v: f32, mins: &mut [f32; 4]) {
     if v < mins[3] {
         if v < mins[0] {
             mins[3] = mins[2];
@@ -216,7 +217,7 @@ fn store_min4(v: f32, mins: &mut [f32; 4]) {
 }
 
 #[inline(always)]
-fn sort4(a: &mut [f32; 4]) {
+pub(crate) fn sort4(a: &mut [f32; 4]) {
     // Optimal 5-comparison sorting network for 4 elements
     macro_rules! cswap {
         ($i:expr, $j:expr) => {
@@ -237,6 +238,47 @@ fn sort4(a: &mut [f32; 4]) {
 ///
 /// `distance` is the butteraugli target; `inv_scale = 1.0 / distance_params.scale`.
 pub(crate) fn fill_quant_field(
+    opsin: &Image3F,
+    raw_quant_field: &mut ImageB,
+    x0: usize,
+    y0: usize,
+    distance: f32,
+    inv_scale: f32,
+) {
+    #[allow(clippy::type_complexity)]
+    static STORED_FN: OnceLock<fn(&Image3F, &mut ImageB, usize, usize, f32, f32)> = OnceLock::new();
+
+    let f = STORED_FN.get_or_init(|| {
+        #[cfg(all(target_arch = "x86_64", feature = "sse"))]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+                crate::avx::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+            };
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if is_x86_feature_detected!("sse4.1") {
+            return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+                crate::sse::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+            };
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            use crate::neon::fill_quant_field;
+            |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+                fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        {
+            fill_quant_field_scalar
+        }
+    });
+
+    f(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+}
+
+#[allow(unused)]
+fn fill_quant_field_scalar(
     opsin: &Image3F,
     raw_quant_field: &mut ImageB,
     x0: usize,
@@ -446,7 +488,7 @@ pub(crate) fn f_fmlaf(a: f32, b: f32, c: f32) -> f32 {
 }
 
 #[inline]
-fn fast_exp2(d: f32) -> f32 {
+pub(crate) fn fast_exp2(d: f32) -> f32 {
     let redux = f32::from_bits(0x4b400000) / TBLSIZE as f32;
 
     let ui = f32::to_bits(d + redux);

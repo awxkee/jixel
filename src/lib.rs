@@ -52,6 +52,7 @@ mod enc_lz77_ac;
 mod enc_xyb;
 mod encode_image;
 mod entropy;
+mod fast_loseless;
 mod gaborish;
 mod icc_codec;
 mod image;
@@ -60,6 +61,8 @@ mod modular;
 mod neon;
 mod quant_weights;
 mod squeeze;
+#[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "avx"))]
+mod sse;
 mod static_entropy_codes;
 mod util;
 
@@ -75,4 +78,5 @@ pub use encode_image::{
     encode_image_with_alpha, encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
     encode_image_with_alpha_16bit, encode_image_with_alpha_f16, encode_image_with_alpha_f32,
 };
+pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
 pub use util::EncodeError;

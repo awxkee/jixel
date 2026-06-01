@@ -26,6 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod adaptive_quant;
 mod dct;
+mod lossless_grad_sse_fjxl;
 
+pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use dct::{dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon};
+pub(crate) use lossless_grad_sse_fjxl::grad_pack_interior;
