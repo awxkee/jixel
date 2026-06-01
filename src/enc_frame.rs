@@ -344,6 +344,7 @@ fn write_frame_header(
     epf_iters: u32,
     gab_enabled: bool,
     has_alpha: bool,
+    coeff_shifts: &[u32],
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
@@ -361,7 +362,35 @@ fn write_frame_header(
 
     w.write(3, x_qm_scale as u64);
     w.write(3, 2); // b_qm_scale
-    w.write(2, 0); // one pass
+    // Passes bundle (jxl-frame header.rs:127-132):
+    //   num_passes: U32(1,2,3,4+u(3))   default 1
+    //   if num_passes != 1:
+    //     num_ds:    U32(0,1,2,3+u(1))  -> 0 (no downsampling)
+    //     shift:     Vec[u(2)] len (num_passes-1)
+    //     downsample/last_pass: Vec len num_ds (empty here)
+    // For VarDCT AC the per-pass coeff_shift used by the decoder is
+    // passes.shift[pass]; the last pass implicitly has shift 0, so we only emit
+    // shifts for passes 0..num_passes-1 and require coeff_shifts.last()==0.
+    let num_passes = coeff_shifts.len();
+    debug_assert!((1..=11).contains(&num_passes), "num_passes out of range");
+    debug_assert!(num_passes == 1 || coeff_shifts[num_passes - 1] == 0);
+    if num_passes == 1 {
+        w.write(2, 0); // num_passes = 1 (U32 selector 0)
+    } else {
+        // U32(1,2,3,4+u(3)): selectors 0->1, 1->2, 2->3, 3->4+u(3).
+        match num_passes {
+            2 => w.write(2, 1),
+            3 => w.write(2, 2),
+            n => {
+                w.write(2, 3);
+                w.write(3, (n - 4) as u64);
+            }
+        }
+        w.write(2, 0); // num_ds = 0 (U32 selector 0)
+        for &s in &coeff_shifts[..num_passes - 1] {
+            w.write(2, s as u64); // shift[p] = coeff_shift of pass p (u(2))
+        }
+    }
     w.write(1, 0); // no custom frame size or origin
 
     // Color-channel BlendingInfo: mode=Replace, full_frame=true means
@@ -485,7 +514,8 @@ fn write_dc_global(
 
 fn write_ac_global(
     num_groups: usize,
-    ac_code: &crate::entropy::OwnedEntropyCode,
+    ac_codes: &[crate::entropy::OwnedEntropyCode],
+    lz_code: &crate::entropy::OwnedEntropyCode,
     use_lz77: bool,
     w: &mut BitWriter,
 ) {
@@ -498,16 +528,19 @@ fn write_ac_global(
             w.write(bits as usize, 0);
         }
     }
-    w.write(2, 3);
-    w.write(13, 0);
-    if use_lz77 {
-        // LZ77 enabled: write the sub-bundle header + the entropy code (whose
-        // context map already carries the trailing distance context).
-        crate::enc_lz77_ac::write_ac_lz_header_and_code(ac_code, w);
-    } else {
-        // No LZ77: the original plain path.
-        w.write(1, 0);
-        write_entropy_code(&ac_code.as_ref(), w);
+    // HfGlobal parses `num_passes` HfPass blocks (jxl-frame hf_global.rs:57-59),
+    // each = used_orders(U32 sel 3 + u(13)=0 -> natural order) + hf_dist entropy
+    // code. Each pass gets its own code (ac_codes[p]); the single-pass LZ77 path
+    // instead writes the LZ code in its one HfPass.
+    for code in ac_codes {
+        w.write(2, 3);
+        w.write(13, 0);
+        if use_lz77 {
+            crate::enc_lz77_ac::write_ac_lz_header_and_code(lz_code, w);
+        } else {
+            w.write(1, 0);
+            write_entropy_code(&code.as_ref(), w);
+        }
     }
 }
 
@@ -554,11 +587,17 @@ pub(crate) fn encode_frame(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
     writer: &mut BitWriter,
 ) {
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
     let distp = compute_distance_params(distance);
     let matrices = DequantMatrices::new();
+
+    // Progressive lossy splits each quantized AC coeff across `num_passes`
+    // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
+    // C = sum_p (sent_p << shift_p) (jxl-vardct hf_coeff.rs:185,191).
+    let num_passes = coeff_shifts.len();
 
     let mut opsin = linear.clone();
     to_xyb(&mut opsin);
@@ -566,7 +605,7 @@ pub(crate) fn encode_frame(
         crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
     }
 
-    let num_sections = 2 + dim.num_dc_groups + dim.num_groups;
+    let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
     // Phase 1: process each DC group, computing dc_data and collecting
@@ -575,8 +614,17 @@ pub(crate) fn encode_frame(
     let mut all_pending: Vec<PendingAcGroup> = Vec::new();
     for dc_gy in 0..dim.ysize_dc_groups {
         for dc_gx in 0..dim.xsize_dc_groups {
-            let (dc_data, mut pending) =
-                process_dc_group(linear, &opsin, &dim, &distp, &matrices, dc_gx, dc_gy);
+            let (dc_data, mut pending) = process_dc_group(
+                linear,
+                &opsin,
+                &dim,
+                &distp,
+                &matrices,
+                dc_gx,
+                dc_gy,
+                num_passes,
+                coeff_shifts,
+            );
             dc_datas.push(dc_data);
             all_pending.append(&mut pending);
         }
@@ -598,30 +646,45 @@ pub(crate) fn encode_frame(
     let dc_code = dc_code_owned.as_ref();
 
     let ac_num_contexts = K_NUM_AC_CONTEXTS + 1;
-    let mut ac_lz_per_group: Vec<Vec<crate::enc_lz77_ac::AcLz>> =
-        Vec::with_capacity(all_pending.len());
+
+    // Per-pass aggregated tokens -> per-pass entropy code. Pass 0 (coarse) and
+    // the residual pass(es) have very different token distributions, so a single
+    // shared code is wasteful; each HfPass gets a code built from its own tokens.
+    let mut pass_tokens_agg: Vec<Vec<Token>> = vec![Vec::new(); num_passes];
     for pg in &all_pending {
-        ac_lz_per_group.push(crate::enc_lz77_ac::lz77_compress_ac(&pg.tokens));
+        for (p, pass_tokens) in pg.tokens.iter().enumerate() {
+            pass_tokens_agg[p].extend_from_slice(pass_tokens);
+        }
     }
-    let ac_lz_code_owned = crate::enc_lz77_ac::build_ac_lz_code(&ac_lz_per_group, ac_num_contexts);
+    let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> = pass_tokens_agg
+        .iter()
+        .map(|toks| crate::entropy::optimize_entropy_code_ac(toks, K_NUM_AC_CONTEXTS))
+        .collect();
 
-    let mut all_ac_tokens: Vec<Token> = Vec::new();
-    for pg in &all_pending {
-        all_ac_tokens.extend_from_slice(&pg.tokens);
+    // LZ77 path is single-pass only for now: it compresses one token stream per
+    // group. Multi-pass uses the per-pass plain codes.
+    let mut ac_lz_per_group: Vec<Vec<crate::enc_lz77_ac::AcLz>> = Vec::new();
+    let ac_lz_code_owned;
+    let use_lz77;
+    if num_passes == 1 {
+        ac_lz_per_group = Vec::with_capacity(all_pending.len());
+        for pg in &all_pending {
+            ac_lz_per_group.push(crate::enc_lz77_ac::lz77_compress_ac(&pg.tokens[0]));
+        }
+        ac_lz_code_owned = crate::enc_lz77_ac::build_ac_lz_code(&ac_lz_per_group, ac_num_contexts);
+        let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(
+            &ac_lz_per_group,
+            &ac_lz_code_owned,
+            ac_num_contexts,
+        );
+        let plain_bits =
+            crate::enc_lz77_ac::estimate_ac_plain_bits(&pass_tokens_agg[0], &ac_code_per_pass[0]);
+        // Require a real margin to cover the LZ77 header + distance-context cost.
+        use_lz77 = lz_bits + 512 < plain_bits;
+    } else {
+        ac_lz_code_owned = crate::enc_lz77_ac::build_ac_lz_code(&ac_lz_per_group, ac_num_contexts);
+        use_lz77 = false;
     }
-    let ac_plain_code_owned =
-        crate::entropy::optimize_entropy_code_ac(&all_ac_tokens, K_NUM_AC_CONTEXTS);
-
-    let lz_bits = crate::enc_lz77_ac::estimate_ac_lz_bits(
-        &ac_lz_per_group,
-        &ac_lz_code_owned,
-        ac_num_contexts,
-    );
-    let plain_bits =
-        crate::enc_lz77_ac::estimate_ac_plain_bits(&all_ac_tokens, &ac_plain_code_owned);
-    // Require a real margin to cover the LZ77 header + distance-context cost.
-
-    let use_lz77 = lz_bits + 512 < plain_bits;
 
     // Phase 4: write DC global with adaptive DC code.
     write_dc_global(
@@ -660,47 +723,51 @@ pub(crate) fn encode_frame(
         }
     }
 
-    // Phase 6: AC global with the chosen AC code (LZ77 enabled only if it won).
-    let ac_code_chosen = if use_lz77 {
-        &ac_lz_code_owned
-    } else {
-        &ac_plain_code_owned
-    };
+    // Phase 6: AC global. One HfPass per pass (each with its own code), or a
+    // single HfPass carrying the LZ77 code in the single-pass case.
     write_ac_global(
         dim.num_groups,
-        ac_code_chosen,
+        &ac_code_per_pass,
+        &ac_lz_code_owned,
         use_lz77,
         &mut sections[1 + dim.num_dc_groups],
     );
 
-    // Phase 7: write each AC group section. With LZ77 we emit the compressed
-    // stream; without it, the raw tokens via the plain code. Modular alpha (if
-    // any) is written after the AC tokens in the same section.
+    // Phase 7: write each (pass, group) AC section. Section index for
+    // (pass, group) = 2 + num_dc_groups + pass*num_groups + group_idx
+    // (jxl-frame toc.rs:196-200). With LZ77 (single-pass only) we emit the
+    // compressed stream; otherwise raw tokens via the shared plain code.
     for (i, pg) in all_pending.iter().enumerate() {
-        let w = &mut sections[pg.section_idx];
-        if use_lz77 {
-            for t in &ac_lz_per_group[i] {
-                crate::enc_lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, w);
-            }
-        } else {
-            let code_ref = ac_plain_code_owned.as_ref();
-            if code_ref.use_prefix_code {
-                for t in &pg.tokens {
-                    write_token(*t, &code_ref, w);
+        for (pass, pass_tokens) in pg.tokens.iter().enumerate() {
+            let section_idx = 2 + dim.num_dc_groups + pass * dim.num_groups + pg.group_idx;
+            let w = &mut sections[section_idx];
+            if use_lz77 {
+                for t in &ac_lz_per_group[i] {
+                    crate::enc_lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, w);
                 }
             } else {
-                // rANS: the whole group's tokens are encoded as one LIFO unit.
-                crate::entropy::write_ans_tokens(
-                    &pg.tokens,
-                    code_ref.context_map,
-                    code_ref.ans_symbols,
-                    w,
-                );
+                let code_ref = ac_code_per_pass[pass].as_ref();
+                if code_ref.use_prefix_code {
+                    for t in pass_tokens {
+                        write_token(*t, &code_ref, w);
+                    }
+                } else {
+                    // rANS: the whole group's tokens are encoded as one LIFO unit.
+                    crate::entropy::write_ans_tokens(
+                        pass_tokens,
+                        code_ref.context_map,
+                        code_ref.ans_symbols,
+                        w,
+                    );
+                }
             }
         }
     }
-    // Modular alpha: per AC group, written after AC tokens in the same section.
+    // Modular alpha: extra-channel modular data is decoded in the last pass
+    // (the only pass whose modular sub-image shift range is set when num_ds=0,
+    // jxl-frame lib.rs:101-108 / pass_group.rs:93). Write it into that section.
     if let Some(alpha_plane) = alpha {
+        let last_pass = num_passes - 1;
         for image_gy in 0..dim.ysize_groups {
             for image_gx in 0..dim.xsize_groups {
                 let group_x0 = image_gx * K_GROUP_DIM;
@@ -708,7 +775,8 @@ pub(crate) fn encode_frame(
                 let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
                 let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
                 let abs_group_id = image_gy * dim.xsize_groups + image_gx;
-                let ac_group_idx = 2 + dim.num_dc_groups + abs_group_id;
+                let ac_group_idx =
+                    2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id;
                 crate::modular::write_ac_group_alpha(
                     alpha_plane,
                     dim.xsize,
@@ -728,17 +796,20 @@ pub(crate) fn encode_frame(
         distp.epf_iters,
         distp.gab_enabled,
         alpha.is_some(),
+        coeff_shifts,
         writer,
     );
     combine_sections(&mut sections, writer);
 }
 
-/// Per-AC-group buffered tokens, paired with the absolute section index
-/// for that group. Emitted in phase 4 of encode_frame once the adaptive AC
-/// code is known.
+/// Per-AC-group buffered tokens. For progressive (multi-pass) encoding the
+/// quantized AC coefficients of each block are split across passes; `tokens`
+/// holds one token stream per pass. `group_idx` is the raster group index
+/// (0..num_groups); the section for (pass, group) is
+/// `2 + num_dc_groups + pass*num_groups + group_idx`.
 pub(crate) struct PendingAcGroup {
-    pub section_idx: usize,
-    pub tokens: Vec<Token>,
+    pub group_idx: usize,
+    pub tokens: Vec<Vec<Token>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,6 +821,8 @@ fn process_dc_group(
     matrices: &DequantMatrices,
     dc_gx: usize,
     dc_gy: usize,
+    num_passes: usize,
+    coeff_shifts: &[u32],
 ) -> (DcGroupData, Vec<PendingAcGroup>) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -798,17 +871,18 @@ fn process_dc_group(
         let gy = gix / dc_group_xsize_groups;
         let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
         let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
-        let ac_group_idx = 2 + dim.num_dc_groups + image_gy * dim.xsize_groups + image_gx;
-
         let group_x0 = image_gx * K_GROUP_DIM;
         let group_y0 = image_gy * K_GROUP_DIM;
         let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
         let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
         let group_ysize_tiles = group_ysize.div_ceil(K_TILE_DIM);
 
-        let mut num_nzeros = Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS);
-        let mut tokens: Vec<Token> =
-            Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4);
+        let mut num_nzeros: Vec<Image3B> = (0..num_passes)
+            .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
+            .collect();
+        let mut tokens: Vec<Vec<Token>> = (0..num_passes)
+            .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
+            .collect();
 
         for ty in 0..group_ysize_tiles {
             let stripe_x0 = group_x0;
@@ -846,12 +920,13 @@ fn process_dc_group(
                 distp.x_qm_scale,
                 &mut dc_data,
                 &mut num_nzeros,
+                coeff_shifts,
                 &mut tokens,
             );
         }
 
         pending.push(PendingAcGroup {
-            section_idx: ac_group_idx,
+            group_idx: image_gy * dim.xsize_groups + image_gx,
             tokens,
         });
     }

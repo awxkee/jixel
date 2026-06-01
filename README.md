@@ -13,7 +13,7 @@ fn main() {
         image.to_rgba8().as_raw(),
         image.width() as usize,
         image.height() as usize,
-        quality_to_distance(99.),
+        &EncodeConfig::default().with_quality(90.),
     );
     std::fs::write(&output, &bytes).expect("failed to write output");
 }
