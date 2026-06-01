@@ -239,8 +239,9 @@ pub(crate) fn write_ac_group(
     scale_dc: f32,
     x_qm_scale: u32,
     dc_data: &mut DcGroupData,
-    num_nzeros: &mut Image3B,
-    out: &mut Vec<Token>,
+    num_nzeros: &mut [Image3B],
+    coeff_shifts: &[u32],
+    out: &mut [Vec<Token>],
 ) {
     let xsize_blocks = group_brect.xsize;
     let ysize_blocks = group_brect.ysize;
@@ -562,79 +563,100 @@ pub(crate) fn write_ac_group(
             };
 
             for &c in &[1usize, 0, 2] {
-                let block = &quantized[c][..size];
+                let full_block = &quantized[c][..size];
 
-                let nzeros = if covered_blocks == 1 {
-                    num_nonzero_except_dc(<&[i32; 64]>::try_from(block).unwrap())
-                } else {
-                    num_nonzero_except_llf(block, cx, cy)
-                };
-
-                // libjxl-tiny: NumNonZeroExceptLLF stores `(nzeros + covered_blocks - 1) >> log2_covered_blocks`
-                // to all covered cells in num_nzeros.
-                let shifted = ((nzeros as usize + covered_blocks - 1) >> log2_covered_blocks) as u8;
-                // Pre-swap iteration (cov_x, cov_y from raw strategy).
-                for iy in 0..cov_y {
-                    let target_row = &mut num_nzeros.plane_row_mut(c, nz_by + iy)[bx..bx + cov_x];
-                    for target in target_row.iter_mut() {
-                        *target = shifted;
-                    }
-                }
-
-                // Predict from top and left.
-                let row_top: Option<&[u8]> = if nz_by == 0 {
-                    None
-                } else {
-                    Some(num_nzeros.plane_row(c, nz_by - 1))
-                };
-                let row = num_nzeros.plane_row(c, nz_by);
-                let predicted = predict_from_top_and_left(row_top, row, bx, 32);
-
-                let block_ctx = block_context(c, strategy_code);
-                let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
-                let histo_offset = zero_density_contexts_offset(block_ctx);
-
-                write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
-
-                // Choose the natural coefficient order. For DCT16X16 we use
-                // the 256-entry natural radial zigzag; for 16X8/8X16 the
-                // 128-entry shared order; otherwise the 8X8 zigzag.
+                // Order is pass-independent (natural order, used_orders=0).
                 let order: &[u8] = match raw_strategy {
                     STRATEGY_DCT => &K_COEFF_ORDER_8X8[..],
                     STRATEGY_DCT16X16 => &K_COEFF_ORDER_16X16[..],
                     _ => &K_COEFF_ORDER_16X8[..],
                 };
 
-                let mut prev: usize = if nzeros as usize > size / 16 { 0 } else { 1 };
-                let mut remaining = nzeros;
-                // Skip the first `covered_blocks` positions (LF).
-                let mut k = covered_blocks;
-                while k < size && remaining != 0 {
-                    let coef = block[order[k] as usize];
-                    let ctx = histo_offset as usize
-                        + if covered_blocks == 1 {
-                            zero_density_context_8x8(remaining as usize, k, prev)
-                        } else {
-                            zero_density_context(
-                                remaining as usize,
-                                k,
-                                covered_blocks,
-                                log2_covered_blocks,
-                                prev,
-                            )
-                        };
-                    write_token_into(Token::new(ctx as u32, pack_signed(coef)), out);
-                    prev = if coef != 0 { 1 } else { 0 };
-                    if coef != 0 {
-                        remaining -= 1;
+                for pass in 0..coeff_shifts.len() {
+                    // Materialize the coefficients pass `pass` transmits. With
+                    // decreasing per-pass shifts ending at 0, the decoder sums
+                    // (sent_p << shift_p) over passes to recover `full_block`
+                    // (jxl-vardct hf_coeff.rs:185,191). For 2 passes/shifts
+                    // [s,0]: pass0 = C>>s, pass1 = C-((C>>s)<<s).
+                    let mut pblock = [0i32; 256];
+                    for k in 0..size {
+                        let mut remaining = full_block[k];
+                        let mut sent = 0i32;
+                        for p in 0..=pass {
+                            sent = remaining >> coeff_shifts[p];
+                            remaining -= sent << coeff_shifts[p];
+                        }
+                        pblock[k] = sent;
                     }
-                    k += 1;
+                    let block = &pblock[..size];
+                    let num_nzeros = &mut num_nzeros[pass];
+                    let out = &mut out[pass];
+
+                    let nzeros = if covered_blocks == 1 {
+                        num_nonzero_except_dc(<&[i32; 64]>::try_from(block).unwrap())
+                    } else {
+                        num_nonzero_except_llf(block, cx, cy)
+                    };
+
+                    // libjxl-tiny: NumNonZeroExceptLLF stores `(nzeros + covered_blocks - 1) >> log2_covered_blocks`
+                    // to all covered cells in num_nzeros.
+                    let shifted =
+                        ((nzeros as usize + covered_blocks - 1) >> log2_covered_blocks) as u8;
+                    // Pre-swap iteration (cov_x, cov_y from raw strategy).
+                    for iy in 0..cov_y {
+                        let target_row =
+                            &mut num_nzeros.plane_row_mut(c, nz_by + iy)[bx..bx + cov_x];
+                        for target in target_row.iter_mut() {
+                            *target = shifted;
+                        }
+                    }
+
+                    // Predict from top and left.
+                    let row_top: Option<&[u8]> = if nz_by == 0 {
+                        None
+                    } else {
+                        Some(num_nzeros.plane_row(c, nz_by - 1))
+                    };
+                    let row = num_nzeros.plane_row(c, nz_by);
+                    let predicted = predict_from_top_and_left(row_top, row, bx, 32);
+
+                    let block_ctx = block_context(c, strategy_code);
+                    let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
+                    let histo_offset = zero_density_contexts_offset(block_ctx);
+
+                    write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
+
+                    let mut prev: usize = if nzeros as usize > size / 16 { 0 } else { 1 };
+                    let mut remaining = nzeros;
+                    // Skip the first `covered_blocks` positions (LF).
+                    let mut k = covered_blocks;
+                    while k < size && remaining != 0 {
+                        let coef = block[order[k] as usize];
+                        let ctx = histo_offset as usize
+                            + if covered_blocks == 1 {
+                                zero_density_context_8x8(remaining as usize, k, prev)
+                            } else {
+                                zero_density_context(
+                                    remaining as usize,
+                                    k,
+                                    covered_blocks,
+                                    log2_covered_blocks,
+                                    prev,
+                                )
+                            };
+                        write_token_into(Token::new(ctx as u32, pack_signed(coef)), out);
+                        prev = if coef != 0 { 1 } else { 0 };
+                        if coef != 0 {
+                            remaining -= 1;
+                        }
+                        k += 1;
+                    }
+                    debug_assert_eq!(
+                        remaining, 0,
+                        "remaining nzeros at end: strategy={} c={} pass={}",
+                        strategy_code, c, pass
+                    );
                 }
-                debug_assert_eq!(
-                    remaining, 0,
-                    "remaining nzeros at end: strategy={} c={}",
-                    strategy_code, c
-                );
             }
         }
     }

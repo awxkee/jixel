@@ -170,7 +170,7 @@ fn write_jxl_enum(value: u32, w: &mut BitWriter) {
         w.write(2, 3);
         w.write(6, (value - 18) as u64);
     } else {
-        panic!("enum value {value} out of JXL U32Coder range [0, 82)");
+        unimplemented!("enum value {} out of JXL U32Coder range [0, 82)", value);
     }
 }
 

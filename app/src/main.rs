@@ -20,52 +20,49 @@ fn main() {
     let rgba_img = image.to_rgba8();
     let gray_img = image.to_luma8();
     let src_rgb = rgb_img.as_raw();
-    for i in 0..10 {
-        let instant = Instant::now();
-        let d_bytes = jixel::encode_fast_lossless(
-            &rgb_img,
-            image.width() as usize,
-            image.height() as usize,
-            ColorSpace::Rgb,
-            false,
-            &FlMeta::srgb(),
-            // &EncodeConfig::default()
-            //     .with_lossless(true)
-            //     .with_quality(90.)
-            //     .with_progressive(false)
-            //     .with_icc_profile(display_p3.to_vec()),
-        )
-        .unwrap();
-        println!("Encoded in {}ms", instant.elapsed().as_millis());
-    }
+    // for i in 0..10 {
+    //     let instant = Instant::now();
+    //     let d_bytes = jixel::encode_image(
+    //         &rgb_img,
+    //         image.width() as usize,
+    //         image.height() as usize,
+    //         // ColorSpace::Rgb,
+    //         // false,
+    //         // &FlMeta::srgb(),
+    //         &EncodeConfig::default()
+    //             .with_lossless(false)
+    //             .with_quality(90.)
+    //             .with_progressive(false),
+    //             // .with_icc_profile(display_p3.to_vec()),
+    //     )
+    //     .unwrap();
+    //     println!("Encoded in {}ms", instant.elapsed().as_millis());
+    // }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    // let bytes = jixel::encode_image(
-    //     &rgb_img,
-    //     width,
-    //     height,
-    //     &EncodeConfig::default()
-    //         .with_lossless(false)
-    //         .with_quality(90.)
-    //         .with_progressive(false)
-    //         .with_color_encoding(ColorEncoding::srgb()),
-    // )
-    // .unwrap();
-    let rgb_img = image
-        .to_luma16()
-        .iter()
-        .map(|&x| x >> 6)
-        .collect::<Vec<_>>();
-    let bytes = jixel::encode_fast_lossless_u16(
+    let bytes = jixel::encode_image(
         &rgb_img,
-        image.width() as usize,
-        image.height() as usize,
-        ColorSpace::Gray,
-        false,
-        10,
-        &FlMeta::display_p3(),
+        width,
+        height,
+        &EncodeConfig::default()
+            .with_lossless(false)
+            .with_quality(90.)
+            .with_progressive(true)
+            .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
+    // let rgb_img = image
+    //     .to_rgb8();
+    // let bytes = jixel::encode_image(
+    //     &rgb_img,
+    //     image.width() as usize,
+    //     image.height() as usize,
+    //     ColorSpace::Gray,
+    //     false,
+    //     10,
+    //     &FlMeta::display_p3(),
+    // )
+    // .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");
 
     // let width = 2000;

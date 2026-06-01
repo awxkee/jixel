@@ -226,7 +226,25 @@ pub struct EncodeConfig {
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
+    ///
+    /// For lossy (`!lossless`) encoding, `true` selects 2-pass progressive
+    /// VarDCT (equivalent to `progressive_passes = Some(2)`).
     pub progressive: bool,
+    /// Number of VarDCT passes for **lossy** progressive encoding. `None` falls
+    /// back to `progressive` (2 passes if set, else 1). `Some(1)` = single pass;
+    /// `Some(n)` for n in 2..=4 = n-pass progressive with an automatic
+    /// coarse-to-fine bit-shift schedule (`[n-1, .., 1, 0]`). Values above 4 are
+    /// clamped (the per-pass shift field is 2 bits with no downsampling).
+    /// Ignored when `lossless`. Overridden by `progressive_shifts` if set.
+    pub progressive_passes: Option<u32>,
+    /// Explicit per-pass coefficient-shift schedule for lossy progressive
+    /// encoding, overriding `progressive_passes`. The length is the pass count;
+    /// each entry is the decoder left-shift for that pass (0..=3). A larger
+    /// pass-0 shift makes the first (preview) pass smaller and coarser. Must end
+    /// in 0 and contain only values 0..=3; otherwise it is ignored. Examples:
+    /// `[1,0]` (default 2-pass), `[2,0]` / `[3,0]` (coarser thumbnail then full),
+    /// `[2,1,0]` (3-step ramp). Ignored when `lossless`.
+    pub progressive_shifts: Option<Vec<u32>>,
     /// HDR luminance signaling. When `Some(nits)`, the codestream's tone-mapping
     /// metadata declares this peak display luminance (`intensity_target`), e.g.
     /// `10000.0` for PQ/HDR10 or a measured mastering peak. `None` leaves the
@@ -252,6 +270,10 @@ pub(crate) struct EncodeConfigImpl {
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub(crate) lossless: bool,
     pub(crate) progressive: bool,
+    /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
+    pub(crate) progressive_passes: Option<u32>,
+    /// Explicit per-pass shift schedule (see `EncodeConfig::progressive_shifts`).
+    pub(crate) progressive_shifts: Option<Vec<u32>>,
     /// If true, the image is grayscale: the codestream declares a Gray color
     /// space so the decoder emits a single-channel (L / LA) image. Internally
     /// the data still flows through the XYB pipeline with R=G=B, so the X and B
@@ -272,6 +294,8 @@ impl Default for EncodeConfig {
             icc_profile: None,
             lossless: false,
             progressive: false,
+            progressive_passes: None,
+            progressive_shifts: None,
             intensity_target: None,
             min_nits: 0.0,
             relative_to_max_display: false,
@@ -291,6 +315,8 @@ impl Default for EncodeConfigImpl {
             lossless: false,
             progressive: false,
             grayscale: false,
+            progressive_passes: None,
+            progressive_shifts: None,
             intensity_target: None,
             min_nits: 0.0,
             relative_to_max_display: false,
@@ -335,6 +361,23 @@ impl EncodeConfigImpl {
     pub(crate) fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
         self
+    }
+
+    pub(crate) fn with_progressive_passes(mut self, passes: Option<u32>) -> Self {
+        self.progressive_passes = passes;
+        self
+    }
+
+    pub(crate) fn with_progressive_shifts(mut self, shifts: Option<Vec<u32>>) -> Self {
+        self.progressive_shifts = shifts;
+        self
+    }
+
+    /// Copy all lossy-progressive settings from a public `EncodeConfig`.
+    pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
+        self.with_progressive(config.progressive)
+            .with_progressive_passes(config.progressive_passes)
+            .with_progressive_shifts(config.progressive_shifts.clone())
     }
 
     /// Mark the image as grayscale (declares a Gray color space).
@@ -506,6 +549,7 @@ pub fn encode_image(
     encode_with_config(
         &linear,
         &EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
             .with_icc_profile(config.icc_profile.clone())
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target),
@@ -579,6 +623,7 @@ pub fn encode_image_with_alpha(
     encode_with_config(
         &linear,
         &EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
             .with_alpha(AlphaPlane::from_u8(alpha_plane))
             .with_icc_profile(config.icc_profile.clone())
             .with_color_encoding(config.color_encoding)
@@ -770,6 +815,7 @@ fn encode_gray_impl(
         }
     }
     let mut cfg = EncodeConfigImpl::with_distance(distance)
+        .with_progressive_from(config)
         .with_grayscale(true)
         .with_icc_profile(config.icc_profile.clone())
         .with_color_encoding(config.color_encoding);
@@ -1015,6 +1061,7 @@ fn encode_gray_high_depth_impl(
     });
 
     let mut cfg = EncodeConfigImpl::with_distance(distance)
+        .with_progressive_from(config)
         .with_grayscale(true)
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
@@ -1094,6 +1141,7 @@ fn encode_high_depth_rgba(
         encode_with_config(
             &linear,
             &EncodeConfigImpl::with_distance(distance)
+                .with_progressive_from(config)
                 .with_alpha(match bps {
                     BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
                     BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
@@ -1126,6 +1174,7 @@ fn encode_high_depth_rgba(
         encode_with_config(
             &linear,
             &EncodeConfigImpl::with_distance(distance)
+                .with_progressive_from(config)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_color_encoding(config.color_encoding)
@@ -1260,6 +1309,7 @@ fn encode_float_rgba(
         encode_with_config(
             &linear,
             &EncodeConfigImpl::with_distance(distance)
+                .with_progressive_from(config)
                 .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
@@ -1283,6 +1333,7 @@ fn encode_float_rgba(
         encode_with_config(
             &linear,
             &EncodeConfigImpl::with_distance(distance)
+                .with_progressive_from(config)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_color_encoding(config.color_encoding)
@@ -1326,6 +1377,7 @@ fn encode_float_gray(
     encode_with_config(
         &linear,
         &EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
             .with_grayscale(true)
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
@@ -1399,6 +1451,36 @@ pub fn encode_image_gray_f16(
     encode_float_gray(input, width, height, config, BitsPerSample::F16)
 }
 
+/// Resolve the per-pass VarDCT coefficient-shift schedule for lossy encoding.
+/// Returns `[shift_pass0, .., shift_passN-1]` with the last element 0. A single
+/// pass is `[0]`. The decoder reconstructs each AC coefficient by summing
+/// `(sent_p << shift_p)` over passes, so the schedule must end in 0.
+///
+/// An explicit `shifts` is used when valid (non-empty, ends in 0, all entries
+/// 0..=3, non-increasing); otherwise it is ignored and we fall back to a count:
+/// `passes` (clamped 1..=4) or the `progressive` bool, yielding the
+/// coarse-to-fine schedule `[n-1, .., 1, 0]`.
+fn progressive_schedule(
+    progressive: bool,
+    passes: Option<u32>,
+    shifts: Option<&[u32]>,
+) -> Vec<u32> {
+    if let Some(s) = shifts {
+        let valid = !s.is_empty()
+            && s.len() <= 11
+            && *s.last().unwrap() == 0
+            && s.iter().all(|&v| v <= 3)
+            && s.windows(2).all(|w| w[0] >= w[1]);
+        if valid {
+            return s.to_vec();
+        }
+    }
+    let n = passes
+        .map(|p| p.clamp(1, 4))
+        .unwrap_or(if progressive { 2 } else { 1 }) as usize;
+    (0..n).rev().map(|p| p as u32).collect()
+}
+
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
 pub(crate) fn encode_with_config(
     input: &Image3F,
@@ -1446,7 +1528,18 @@ pub(crate) fn encode_with_config(
         config.grayscale,
         &mut w,
     );
-    encode_frame(distance, input, config.alpha.as_ref(), &mut w);
+    let coeff_shifts = progressive_schedule(
+        config.progressive,
+        config.progressive_passes,
+        config.progressive_shifts.as_deref(),
+    );
+    encode_frame(
+        distance,
+        input,
+        config.alpha.as_ref(),
+        &coeff_shifts,
+        &mut w,
+    );
     let codestream = w.into_bytes();
     let alpha_bits = config.alpha.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     if needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits) {
