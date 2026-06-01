@@ -61,7 +61,7 @@ mod modular;
 mod neon;
 mod quant_weights;
 mod squeeze;
-#[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "avx"))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
 mod static_entropy_codes;
 mod util;

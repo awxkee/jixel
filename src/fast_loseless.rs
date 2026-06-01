@@ -297,9 +297,7 @@ struct PrefixCode {
 impl PrefixCode {
     fn new(rc: &[u64; 19], lc: &[u64; 33], mn: &[u8], mx: &[u8]) -> Self {
         let mut l1 = [0u64; 20];
-        for i in 0..19 {
-            l1[i] = rc[i];
-        }
+        l1[..19].copy_from_slice(rc);
         let mut numraw = 19;
         while numraw > 0 && l1[numraw - 1] == 0 {
             numraw -= 1;
@@ -323,9 +321,7 @@ impl PrefixCode {
         let mut raw_bits = [0u16; 19];
         let mut lz_nbits = [0u8; 33];
         let mut lz_bits = [0u16; 33];
-        for i in 0..numraw {
-            raw_nbits[i] = l1n[i];
-        }
+        raw_nbits[..numraw].copy_from_slice(&l1n[..numraw]);
         for i in 0..numlz {
             lz_nbits[i] = if l2n[i] != 0 { l1n[numraw] + l2n[i] } else { 0 };
         }

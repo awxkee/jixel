@@ -249,7 +249,7 @@ pub(crate) fn fill_quant_field(
     static STORED_FN: OnceLock<fn(&Image3F, &mut ImageB, usize, usize, f32, f32)> = OnceLock::new();
 
     let f = STORED_FN.get_or_init(|| {
-        #[cfg(all(target_arch = "x86_64", feature = "sse"))]
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
                 crate::avx::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
