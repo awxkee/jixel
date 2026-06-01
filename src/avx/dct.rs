@@ -266,21 +266,6 @@ pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
     }
 }
 
-// ─── dct16x16 (AVX2) ──────────────────────────────────────────────────────────
-//
-// input  layout: input[row * 16 + col],  row, col ∈ 0..16
-// output layout: output[u * 16 + v],     u = col-freq, v = row-freq
-//
-// Uses 12 × transpose_8x8 and 32 contiguous 256-bit stores — no scatter.
-//
-//  Phase 1 (col-DCT):
-//   Load 4 sub-blocks → transpose each → assemble c_top/c_bot →
-//   dct1d_16_flat × 2 → split → transpose × 4
-//
-//  Phase 2 (row-DCT):
-//   Assemble d_a/d_b → dct1d_16_flat × 2 → split → transpose × 4 →
-//   scale and store contiguously
-
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct16x16_avx2(input: &[f32; 256], output: &mut [f32; 256]) {
     unsafe {

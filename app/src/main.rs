@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use image::imageops::FilterType;
-use jixel::{ColorEncoding, EncodeConfig};
+use jixel::{ColorEncoding, ColorSpace, EncodeConfig, FlMeta};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -15,35 +15,51 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/nature1.jpg")).unwrap();
+    let image = image::open(Path::new("./assets/digital_art_portrait.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     let rgba_img = image.to_rgba8();
+    let gray_img = image.to_luma8();
     let src_rgb = rgb_img.as_raw();
     for i in 0..10 {
         let instant = Instant::now();
-        let d_bytes = jixel::encode_image(
+        let d_bytes = jixel::encode_fast_lossless(
             &rgb_img,
             image.width() as usize,
             image.height() as usize,
-            &EncodeConfig::default()
-                .with_lossless(false)
-                .with_quality(90.)
-                .with_progressive(false)
-                .with_icc_profile(display_p3.to_vec()),
-        );
+            ColorSpace::Rgb,
+            false,
+            &FlMeta::srgb(),
+            // &EncodeConfig::default()
+            //     .with_lossless(true)
+            //     .with_quality(90.)
+            //     .with_progressive(false)
+            //     .with_icc_profile(display_p3.to_vec()),
+        )
+        .unwrap();
         println!("Encoded in {}ms", instant.elapsed().as_millis());
     }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let bytes = jixel::encode_image(
+    // let bytes = jixel::encode_image(
+    //     &rgb_img,
+    //     width,
+    //     height,
+    //     &EncodeConfig::default()
+    //         .with_lossless(false)
+    //         .with_quality(90.)
+    //         .with_progressive(false)
+    //         .with_color_encoding(ColorEncoding::srgb()),
+    // )
+    // .unwrap();
+    let rgb_img = image.to_luma16().iter().map(|&x| x >> 6).collect::<Vec<_>>();
+    let bytes = jixel::encode_fast_lossless_u16(
         &rgb_img,
-        width,
-        height,
-        &EncodeConfig::default()
-            .with_lossless(false)
-            .with_quality(90.)
-            .with_progressive(false)
-            .with_color_encoding(ColorEncoding::srgb()),
+        image.width() as usize,
+        image.height() as usize,
+        ColorSpace::Gray,
+        false,
+        10,
+        &FlMeta::display_p3(),
     )
     .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");

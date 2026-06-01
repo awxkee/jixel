@@ -1072,10 +1072,6 @@ fn channel_to_context(chan: usize, nb_chans: usize) -> u32 {
     (nb_chans - 1 - chan) as u32
 }
 
-// ---------------------------------------------------------------------------
-// LZ77 hybrid-uint encoding (length values: split_exp=4, msb=0, lsb=0).
-// ---------------------------------------------------------------------------
-
 /// Hybrid encode of `length_value` (= run_length - min_length).
 /// Returns (alphabet_token, nbits, payload).  The actual alphabet symbol is
 /// `LZ77_MIN_SYMBOL + alphabet_token`.
@@ -1092,10 +1088,6 @@ fn lz77_length_encode(length_value: u32) -> (u32, u32, u32) {
         (token, nbits, bits)
     }
 }
-
-// ---------------------------------------------------------------------------
-// LZ77 layer.
-// ---------------------------------------------------------------------------
 
 /// A unit of emission in the LZ77'd token stream.
 #[derive(Clone, Copy)]
@@ -1189,45 +1181,95 @@ fn tokenize_plane(
     pred_id: u32,
     out: &mut Vec<Token>,
 ) {
-    let mut wp = WpState::new(gw);
-    for gy in 0..gh {
-        for gx in 0..gw {
-            let v = get(gx, gy) as i64;
-            let w_ = if gx > 0 {
-                get(gx - 1, gy) as i64
-            } else if gy > 0 {
-                get(gx, gy - 1) as i64
-            } else {
-                0
-            };
-            let n_ = if gy > 0 { get(gx, gy - 1) as i64 } else { w_ };
-            let nw_ = if gx > 0 && gy > 0 {
-                get(gx - 1, gy - 1) as i64
-            } else {
-                w_
-            };
-            let ne_ = if gx + 1 < gw && gy > 0 {
-                get(gx + 1, gy - 1) as i64
-            } else {
-                n_
-            };
-            let nn_ = if gy > 1 { get(gx, gy - 2) as i64 } else { n_ };
-            // The WP state must be updated for every pixel whenever the channel
-            // uses the Weighted predictor (matches the decoder, which updates wp
-            // for every pixel when the tree references predictor 6). For the
-            // Gradient channels the WP state is unused, so we skip it.
-            let pred = if pred_id == PREDICTOR_WEIGHTED {
+    if pred_id == PREDICTOR_WEIGHTED {
+        // Weighted predictor: sequential (per-pixel error feedback), unchanged.
+        let mut wp = WpState::new(gw);
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let v = get(gx, gy) as i64;
+                let w_ = if gx > 0 {
+                    get(gx - 1, gy) as i64
+                } else if gy > 0 {
+                    get(gx, gy - 1) as i64
+                } else {
+                    0
+                };
+                let n_ = if gy > 0 { get(gx, gy - 1) as i64 } else { w_ };
+                let nw_ = if gx > 0 && gy > 0 {
+                    get(gx - 1, gy - 1) as i64
+                } else {
+                    w_
+                };
+                let ne_ = if gx + 1 < gw && gy > 0 {
+                    get(gx + 1, gy - 1) as i64
+                } else {
+                    n_
+                };
+                let nn_ = if gy > 1 { get(gx, gy - 2) as i64 } else { n_ };
                 let p = wp.predict(gx, gy, n_, w_, ne_, nw_, nn_);
                 wp.update(v, gx, gy);
-                p
-            } else {
-                // Gradient with the same border convention (== libjxl ClampedGradient).
-                let lo = w_.min(n_);
-                let hi = w_.max(n_);
-                (w_ + n_ - nw_).clamp(lo, hi)
-            };
-            out.push(Token::new(ctx, pack_signed((v - pred) as i32)));
+                out.push(Token::new(ctx, pack_signed((v - p) as i32)));
+            }
         }
+    } else {
+        // Gradient (ClampedGradient): per-pixel independent, pure integer ->
+        // vectorised over the interior of each row.
+        let mut cur = vec![0i32; gw];
+        let mut prev = vec![0i32; gw];
+        let mut buf = vec![0u32; gw];
+        for gy in 0..gh {
+            std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
+            for (gx, c) in cur.iter_mut().enumerate() {
+                *c = get(gx, gy);
+            }
+            if gy == 0 {
+                buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
+                for gx in 1..gw {
+                    buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1])); // pred = W
+                }
+            } else {
+                buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
+                grad_pack_interior(&cur, &prev, &mut buf, gw); // gx in 1..gw
+            }
+            for &b in buf.iter().take(gw) {
+                out.push(Token::new(ctx, b));
+            }
+        }
+    }
+}
+
+fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
+    #[allow(clippy::type_complexity)]
+    static STORED_FN: OnceLock<fn(&[i32], &[i32], &mut [u32], usize)> = OnceLock::new();
+    let f = STORED_FN.get_or_init(|| {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if is_x86_feature_detected!("avx2") {
+            return |c, p, o, g| unsafe { crate::avx::grad_pack_interior(c, p, o, g) };
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if is_x86_feature_detected!("sse4.1") {
+            return |c, p, o, g| unsafe { crate::sse::grad_pack_interior(c, p, o, g) };
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return |c, p, o, g| unsafe { crate::neon::grad_pack_interior(c, p, o, g) };
+        }
+        grad_pack_interior_scalar
+    });
+    f(cur, prev, out, gw)
+}
+
+fn grad_pack_interior_scalar(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
+    for gx in 1..gw {
+        let w = cur[gx - 1];
+        let n = prev[gx];
+        let nw = prev[gx - 1];
+        let ac = w.wrapping_sub(nw);
+        let bc = n.wrapping_sub(nw);
+        let grad = ac.wrapping_add(n);
+        let clamp = if (w.wrapping_sub(n) ^ bc) < 0 { n } else { w };
+        let pred = if (ac ^ bc) < 0 { grad } else { clamp };
+        out[gx] = pack_signed(cur[gx].wrapping_sub(pred));
     }
 }
 
@@ -1814,6 +1856,7 @@ use crate::entropy::{
     write_token,
 };
 use crate::image::Image3Si;
+use std::sync::OnceLock;
 
 /// Build a frequency histogram for each cluster from an `LzToken` stream.
 fn lz_build_histograms(

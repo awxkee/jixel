@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 6/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,9 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 mod adaptive_quant;
-mod dct;
 mod lossless_grad_sse_fjxl;
 
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use dct::{dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2};
 pub(crate) use lossless_grad_sse_fjxl::grad_pack_interior;
