@@ -220,6 +220,12 @@ pub struct EncodeConfig {
     pub distance: f32,
     pub color_encoding: ColorEncoding,
     pub icc_profile: Option<Vec<u8>>,
+    /// EXIF/TIFF metadata to embed via an `Exif` container box. Forces the
+    /// output into the JXL container form. Raw TIFF bytes (no "Exif\0\0" prefix).
+    pub exif: Option<Vec<u8>>,
+    /// EXIF orientation (1..=8, 1 = identity). Tells the decoder how to rotate/
+    /// flip the stored pixels for display. Out-of-range values fall back to 1.
+    pub orientation: u8,
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
@@ -263,6 +269,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) distance: f32,
     pub(crate) color_encoding: ColorEncoding,
     pub(crate) icc_profile: Option<Vec<u8>>,
+    pub(crate) exif: Option<Vec<u8>>,
+    pub(crate) orientation: u8,
     pub(crate) alpha: Option<AlphaPlane>,
     /// Bit depth declared in the codestream (default: 8).
     pub(crate) bits_per_sample: BitsPerSample,
@@ -292,6 +300,8 @@ impl Default for EncodeConfig {
             distance: 1.0,
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
+            exif: None,
+            orientation: 1,
             lossless: false,
             progressive: false,
             progressive_passes: None,
@@ -310,6 +320,8 @@ impl Default for EncodeConfigImpl {
             distance: 1.0,
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
+            exif: None,
+            orientation: 1,
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
@@ -338,6 +350,14 @@ impl EncodeConfigImpl {
     /// Attach an ICC profile. **Panics at encode time** — see field docs.
     pub(crate) fn with_icc_profile(mut self, icc: Option<Vec<u8>>) -> Self {
         self.icc_profile = icc;
+        self
+    }
+    pub(crate) fn with_exif(mut self, exif: Option<Vec<u8>>) -> Self {
+        self.exif = exif;
+        self
+    }
+    pub(crate) fn with_orientation(mut self, orientation: u8) -> Self {
+        self.orientation = orientation;
         self
     }
 
@@ -465,6 +485,16 @@ impl EncodeConfig {
         self.icc_profile = Some(icc);
         self
     }
+    /// Embed EXIF/TIFF metadata (raw TIFF bytes) via an `Exif` container box.
+    pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
+        self.exif = Some(exif);
+        self
+    }
+    /// Set the EXIF orientation (1..=8, 1 = identity).
+    pub fn with_orientation(mut self, orientation: u8) -> Self {
+        self.orientation = orientation;
+        self
+    }
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
         self
@@ -527,6 +557,8 @@ pub fn encode_image(
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         );
@@ -551,6 +583,8 @@ pub fn encode_image(
         &EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
             .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target),
     )
@@ -594,6 +628,8 @@ pub fn encode_image_with_alpha(
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         );
@@ -626,6 +662,8 @@ pub fn encode_image_with_alpha(
             .with_progressive_from(config)
             .with_alpha(AlphaPlane::from_u8(alpha_plane))
             .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target),
     )
@@ -794,6 +832,8 @@ fn encode_gray_impl(
                 .with_lossless(true)
                 .with_grayscale(true)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         );
@@ -818,6 +858,8 @@ fn encode_gray_impl(
         .with_progressive_from(config)
         .with_grayscale(true)
         .with_icc_profile(config.icc_profile.clone())
+        .with_exif(config.exif.clone())
+        .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding);
     if let Some(a) = alpha {
         cfg = cfg.with_alpha(AlphaPlane::from_u8(a));
@@ -1026,6 +1068,8 @@ fn encode_gray_high_depth_impl(
                 .with_grayscale(true)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         );
@@ -1065,6 +1109,8 @@ fn encode_gray_high_depth_impl(
         .with_grayscale(true)
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
+        .with_exif(config.exif.clone())
+        .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding);
     if let Some(ap) = alpha_plane {
         cfg = cfg.with_alpha(ap);
@@ -1100,6 +1146,8 @@ fn encode_high_depth_rgba(
                 .with_lossless(config.lossless)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         );
@@ -1153,6 +1201,8 @@ fn encode_high_depth_rgba(
                 })
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         )
@@ -1177,6 +1227,8 @@ fn encode_high_depth_rgba(
                 .with_progressive_from(config)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         )
@@ -1252,16 +1304,17 @@ fn encode_f32_lossless_rgba(
         BitsPerSample::F32,
         true,
         false,
+        config.orientation,
         &mut w,
     );
     encode_frame_lossless_float(&image3s, alpha.as_ref(), &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
-    if needs_level_10(32, true, alpha_bits_md) {
-        Ok(wrap_jxl_container(codestream, 10))
-    } else {
-        Ok(codestream)
-    }
+    Ok(finalize_container(
+        codestream,
+        config.exif.as_deref(),
+        needs_level_10(32, true, alpha_bits_md),
+    ))
 }
 
 fn encode_float_rgba(
@@ -1313,6 +1366,8 @@ fn encode_float_rgba(
                 .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         )
@@ -1336,6 +1391,8 @@ fn encode_float_rgba(
                 .with_progressive_from(config)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
+                .with_exif(config.exif.clone())
+                .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target),
         )
@@ -1381,6 +1438,8 @@ fn encode_float_gray(
             .with_grayscale(true)
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target),
     )
@@ -1526,6 +1585,7 @@ pub(crate) fn encode_with_config(
         config.bits_per_sample,
         config.lossless,
         config.grayscale,
+        config.orientation,
         &mut w,
     );
     let coeff_shifts = progressive_schedule(
@@ -1542,11 +1602,11 @@ pub(crate) fn encode_with_config(
     );
     let codestream = w.into_bytes();
     let alpha_bits = config.alpha.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
-    if needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits) {
-        Ok(wrap_jxl_container(codestream, 10))
-    } else {
-        Ok(codestream)
-    }
+    Ok(finalize_container(
+        codestream,
+        config.exif.as_deref(),
+        needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits),
+    ))
 }
 
 pub(crate) trait AsSignedInt {
@@ -1691,6 +1751,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.bits_per_sample,
         config.lossless,
         config.grayscale,
+        config.orientation,
         &mut w,
     );
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
@@ -1706,11 +1767,11 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     );
     let codestream = w.into_bytes();
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
-    if needs_level_10(max_bp as u32, true, alpha_bits) {
-        Ok(wrap_jxl_container(codestream, 10))
-    } else {
-        Ok(codestream)
-    }
+    Ok(finalize_container(
+        codestream,
+        config.exif.as_deref(),
+        needs_level_10(max_bp as u32, true, alpha_bits),
+    ))
 }
 
 /// Write a single dimension using JXL's 4-bucket variable-length encoding.
@@ -1744,14 +1805,20 @@ fn write_size_header(xsize: usize, ysize: usize, w: &mut BitWriter) {
 /// (the implicit level of a bare codestream) caps modular at 16 bits, so such
 /// files MUST be wrapped in a container declaring level 10 or a conformant
 /// decoder rejects them.
-fn needs_level_10(bits: u32, lossless: bool, alpha_bits: u32) -> bool {
+pub(crate) fn needs_level_10(bits: u32, lossless: bool, alpha_bits: u32) -> bool {
     (lossless && bits >= 16) || alpha_bits >= 16
 }
 
 /// Wrap a bare codestream in a minimal JXL (ISO BMFF) container that declares
-/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc.
-fn wrap_jxl_container(codestream: Vec<u8>, level: u8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(codestream.len() + 41);
+/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc, [Exif].
+///
+/// When `exif` is `Some`, an `Exif` box is appended after the codestream. Its
+/// payload is a 4-byte big-endian TIFF-header offset (0) followed by the raw
+/// EXIF/TIFF byte stream (the bytes that begin with the "II"/"MM" byte-order
+/// mark — *not* the JPEG "Exif\0\0" APP1 prefix).
+pub(crate) fn wrap_jxl_container(codestream: Vec<u8>, level: u8, exif: Option<&[u8]>) -> Vec<u8> {
+    let exif_extra = exif.map(|e| e.len() + 12).unwrap_or(0);
+    let mut out = Vec::with_capacity(codestream.len() + 41 + exif_extra);
     // JXL signature box.
     out.extend_from_slice(&[
         0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
@@ -1774,7 +1841,32 @@ fn wrap_jxl_container(codestream: Vec<u8>, level: u8) -> Vec<u8> {
         out.extend_from_slice(&(payload + 8).to_be_bytes());
     }
     out.extend_from_slice(&codestream);
+    // Exif metadata box (after the codestream; libjxl convention).
+    if let Some(e) = exif {
+        let content = 4u64 + e.len() as u64; // 4-byte offset + EXIF/TIFF data
+        let payload = 8u64 + content;
+        if payload <= u32::MAX as u64 {
+            out.extend_from_slice(&(payload as u32).to_be_bytes());
+            out.extend_from_slice(b"Exif");
+        } else {
+            out.extend_from_slice(&1u32.to_be_bytes());
+            out.extend_from_slice(b"Exif");
+            out.extend_from_slice(&(payload + 8).to_be_bytes());
+        }
+        out.extend_from_slice(&0u32.to_be_bytes()); // TIFF-header offset = 0
+        out.extend_from_slice(e);
+    }
     out
+}
+
+/// Decide final output form: wrap in a container when level 10 is required or
+/// when an EXIF box must be carried (a bare codestream cannot hold metadata).
+fn finalize_container(codestream: Vec<u8>, exif: Option<&[u8]>, need_l10: bool) -> Vec<u8> {
+    if need_l10 || exif.is_some() {
+        wrap_jxl_container(codestream, if need_l10 { 10 } else { 5 }, exif)
+    } else {
+        codestream
+    }
 }
 
 fn write_int_bit_depth(bits: u32, w: &mut BitWriter) {
@@ -1818,15 +1910,22 @@ fn write_image_metadata(
     bps: BitsPerSample,
     lossless: bool,
     grayscale: bool,
+    orientation: u8,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
-    // tone_mapping (HDR luminance) is gated by extra_fields; set it when the
-    // ToneMapping bundle differs from its SDR default in any field.
-    let extra_fields = !tm.is_default();
+    // EXIF orientation 1..=8 (1 = identity); out-of-range falls back to identity.
+    let orientation = if (1..=8).contains(&orientation) {
+        orientation
+    } else {
+        1
+    };
+    // tone_mapping (HDR luminance) is gated by extra_fields; a non-identity
+    // orientation also lives in the extra_fields block, so either forces it on.
+    let extra_fields = !tm.is_default() || orientation != 1;
     w.write(1, if extra_fields { 1 } else { 0 }); // extra_fields
     if extra_fields {
-        w.write(3, 0); // orientation - 1 = 0 (identity)
+        w.write(3, (orientation - 1) as u64); // orientation: 1 + u(3)
         w.write(1, 0); // have_intrinsic_size = false
         w.write(1, 0); // have_preview = false
         w.write(1, 0); // have_animation = false
