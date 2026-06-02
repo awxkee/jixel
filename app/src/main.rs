@@ -48,7 +48,8 @@ fn main() {
             .with_lossless(false)
             .with_quality(90.)
             .with_progressive(true)
-            .with_color_encoding(ColorEncoding::srgb()),
+            .with_color_encoding(ColorEncoding::srgb())
+            .with_orientation(3),
     )
     .unwrap();
     // let rgb_img = image

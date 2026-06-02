@@ -56,8 +56,11 @@ pub struct FlMeta {
     pub rendering_intent: RenderingIntent,
     /// Optional intrinsic (display) size hint as (width, height).
     pub intrinsic_size: Option<(usize, usize)>,
-    /// Embedded ICC profile. Currently rejected with `EncodeError::IccNotSupported`.
+    /// Embedded ICC profile (compressed via `icc_codec`).
     pub icc: Option<Vec<u8>>,
+    /// EXIF/TIFF metadata, embedded via an `Exif` container box. Setting this
+    /// forces the output into the JXL container form. Raw TIFF bytes.
+    pub exif: Option<Vec<u8>>,
 }
 impl Default for FlMeta {
     fn default() -> Self {
@@ -70,6 +73,7 @@ impl Default for FlMeta {
             rendering_intent: RenderingIntent::Relative,
             intrinsic_size: None,
             icc: None,
+            exif: None,
         }
     }
 }
@@ -978,6 +982,23 @@ fn validate(w: usize, h: usize, nb: usize, meta: &FlMeta) -> Result<usize, Encod
 }
 
 /// Encode an 8-bit image.
+/// Wrap the bare codestream in a JXL container when EXIF metadata must be
+/// carried; otherwise return it untouched (so the no-EXIF path is byte-exact).
+fn finalize_fl(codestream: Vec<u8>, bits: u32, alpha: bool, meta: &FlMeta) -> Vec<u8> {
+    match meta.exif.as_deref() {
+        Some(exif) => {
+            let alpha_bits = if alpha { bits } else { 0 };
+            let need_l10 = crate::encode_image::needs_level_10(bits, true, alpha_bits);
+            crate::encode_image::wrap_jxl_container(
+                codestream,
+                if need_l10 { 10 } else { 5 },
+                Some(exif),
+            )
+        }
+        None => codestream,
+    }
+}
+
 pub fn encode_fast_lossless(
     img: &[u8],
     w: usize,
@@ -994,13 +1015,18 @@ pub fn encode_fast_lossless(
             got: img.len(),
         });
     }
-    Ok(encode_planes(
-        &build_planes_u8(img, w, h, nb),
-        w,
-        h,
-        nb,
-        color_space,
+    Ok(finalize_fl(
+        encode_planes(
+            &build_planes_u8(img, w, h, nb),
+            w,
+            h,
+            nb,
+            color_space,
+            8,
+            meta,
+        ),
         8,
+        alpha,
         meta,
     ))
 }
@@ -1026,13 +1052,18 @@ pub fn encode_fast_lossless_u16(
             got: img.len(),
         });
     }
-    Ok(encode_planes(
-        &build_planes_u16(img, w, h, nb),
-        w,
-        h,
-        nb,
-        color_space,
+    Ok(finalize_fl(
+        encode_planes(
+            &build_planes_u16(img, w, h, nb),
+            w,
+            h,
+            nb,
+            color_space,
+            bits,
+            meta,
+        ),
         bits,
+        alpha,
         meta,
     ))
 }
