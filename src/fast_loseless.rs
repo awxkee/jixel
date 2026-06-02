@@ -713,9 +713,31 @@ fn write_bits_per_sample(o: &mut BitWriter, bits: u32) {
         }
     }
 }
+fn append_icc_stream(o: &mut BitWriter, icc: &[u8]) {
+    let mut tmp = crate::bit_writer::BitWriter::new();
+    crate::icc_codec::write_icc_stream(icc, &mut tmp);
+    let nbits = tmp.bits_written(); // exact bit count, captured before padding
+    tmp.zero_pad_to_byte(); // into_bytes() requires byte alignment
+    let bytes = tmp.into_bytes(); // ceil(nbits/8) bytes; pad bits are in the high bits of the last byte
+    let full = nbits / 8;
+    for &byte in &bytes[..full] {
+        o.write(8, byte as u64);
+    }
+    let rem = nbits % 8;
+    if rem != 0 {
+        // copy only the `rem` real bits; the zero-pad bits above them are discarded
+        o.write(rem as u32, (bytes[full] as u64) & ((1u64 << rem) - 1));
+    }
+}
+
 fn write_color(o: &mut BitWriter, cs: ColorSpace, m: &FlMeta) {
     o.write(1, 0); // colour_encoding all_default = 0
-    o.write(1, 0); // want_icc = 0 (ICC handled out of band)
+    if m.icc.is_some() {
+        o.write(1, 1); // want_icc = 1
+        write_enum(o, cs as u32); // colour_space (still present)
+        return; // white_point/primaries/transfer/intent are gated on !want_icc
+    }
+    o.write(1, 0); // want_icc = 0
     write_enum(o, cs as u32); // colour_space (Rgb=0, Gray=1; matches JXL enum)
     write_enum(o, m.white_point as u32); // white_point
     if cs != ColorSpace::Gray {
@@ -786,6 +808,9 @@ fn prepare_header(
     } // tone_mapping all_default (cond extra_fields)
     o.write(2, 0); // extensions = 0
     o.write(1, 1); // default_m = 1
+    if let Some(icc) = &m.icc {
+        append_icc_stream(o, icc); // ICC stream after CustomTransformData, before pad
+    }
     o.zero_pad_to_byte();
     // ---- frame header + TOC (bit-depth/colour independent) ----
     o.write(1, 0);
@@ -940,9 +965,6 @@ fn validate(w: usize, h: usize, nb: usize, meta: &FlMeta) -> Result<usize, Encod
     }
     if !(1..=8).contains(&meta.orientation) {
         return Err(EncodeError::BadOrientation(meta.orientation));
-    }
-    if meta.icc.is_some() {
-        return Err(EncodeError::IccNotSupported);
     }
     const MAX_DIM: usize = 1 << 30; // JXL spec per-axis limit
     if w > MAX_DIM || h > MAX_DIM {
@@ -1153,15 +1175,17 @@ mod tests {
             Err(EncodeError::BadOrientation(9))
         ));
     }
+
     #[test]
-    fn rejects_embedded_icc() {
+    fn accepts_embedded_icc() {
         let img = ramp8(10, 10, 3);
         let mut m = FlMeta::srgb();
+        // A minimal non-empty ICC blob; the encoder compresses it via icc_codec.
         m.icc = Some(vec![0u8; 128]);
-        assert_eq!(
-            encode_fast_lossless(&img, 10, 10, Rgb, false, &m),
-            Err(EncodeError::IccNotSupported)
-        );
+        let out = encode_fast_lossless(&img, 10, 10, Rgb, false, &m).expect("ICC encode");
+        // ICC-bearing stream must be larger than the equivalent no-ICC stream.
+        let base = encode_fast_lossless(&img, 10, 10, Rgb, false, &FlMeta::srgb()).unwrap();
+        assert!(out.len() > base.len());
     }
     #[test]
     fn rejects_wrong_length() {
