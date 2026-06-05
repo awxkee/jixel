@@ -52,22 +52,98 @@ pub enum WhitePoint {
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Primaries {
-    Srgb = 1,
-    Custom = 2,
-    Bt2100 = 9,
-    P3 = 11,
+    /// For future use by ITU-T | ISO/IEC
+    Reserved,
+    /// Rec. ITU-R BT.709-6<br />
+    /// Rec. ITU-R BT.1361-0 conventional colour gamut system and extended colour gamut system (historical)<br />
+    /// IEC 61966-2-1 sRGB or sYCC IEC 61966-2-4<br />
+    /// Society of Motion Picture and Television Engineers (MPTE) RP 177 (1993) Annex B<br />
+    Bt709 = 1,
+    /// Unspecified<br />
+    /// Image characteristics are unknown or are determined by the application.
+    Unspecified = 2,
+    /// Rec. ITU-R BT.470-6 System M (historical)<br />
+    /// United States National Television System Committee 1953 Recommendation for transmission standards for color television<br />
+    /// United States Federal Communications Commission (2003) Title 47 Code of Federal Regulations 73.682 (a) (20)<br />
+    Bt470M = 4,
+    /// Rec. ITU-R BT.470-6 System B, G (historical) Rec. ITU-R BT.601-7 625<br />
+    /// Rec. ITU-R BT.1358-0 625 (historical)<br />
+    /// Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM<br />
+    Bt470Bg = 5,
+    /// Rec. ITU-R BT.601-7 525<br />
+    /// Rec. ITU-R BT.1358-1 525 or 625 (historical) Rec. ITU-R BT.1700-0 NTSC<br />
+    /// SMPTE 170M (2004)<br />
+    /// (functionally the same as the value 7)<br />
+    Bt601 = 6,
+    /// SMPTE 240M (1999) (historical) (functionally the same as the value 6)<br />
+    Smpte240 = 7,
+    /// Generic film (colour filters using Illuminant C)<br />
+    GenericFilm = 8,
+    /// Rec. ITU-R BT.2020-2<br />
+    /// Rec. ITU-R BT.2100-0<br />
+    Bt2020 = 9,
+    /// SMPTE ST 428-1<br />
+    /// (CIE 1931 XYZ as in ISO 11664-1)<br />
+    Xyz = 10,
+    /// SMPTE RP 431-2 (2011)<br />
+    Smpte431 = 11,
+    /// SMPTE EG 432-1 (2010)<br />
+    Smpte432 = 12,
+    /// EBU Tech. 3213-E (1975)<br />
+    Ebu3213 = 22,
 }
 
 /// JXL TransferFunction enum (U32Coder).
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TransferFunction {
+    /// For future use by ITU-T | ISO/IEC
+    Reserved,
+    /// Rec. ITU-R BT.709-6<br />
+    /// Rec. ITU-R BT.1361-0 conventional colour gamut system (historical)<br />
+    /// (functionally the same as the values 6, 14 and 15)    <br />
     Bt709 = 1,
-    Unknown = 2,
+    /// Image characteristics are unknown or are determined by the application.<br />
+    Unspecified = 2,
+    /// Rec. ITU-R BT.470-6 System M (historical)<br />
+    /// United States National Television System Committee 1953 Recommendation for transmission standards for color television<br />
+    /// United States Federal Communications Commission (2003) Title 47 Code of Federal Regulations 73.682 (a) (20)<br />
+    /// Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM<br />
+    Bt470M = 4,
+    /// Rec. ITU-R BT.470-6 System B, G (historical)<br />
+    Bt470Bg = 5,
+    /// Rec. ITU-R BT.601-7 525 or 625<br />
+    /// Rec. ITU-R BT.1358-1 525 or 625 (historical)<br />
+    /// Rec. ITU-R BT.1700-0 NTSC SMPTE 170M (2004)<br />
+    /// (functionally the same as the values 1, 14 and 15)<br />
+    Bt601 = 6,
+    /// SMPTE 240M (1999) (historical)<br />
+    Smpte240 = 7,
+    /// Linear transfer characteristics<br />
     Linear = 8,
+    /// Logarithmic transfer characteristic (100:1 range)<br />
+    Log100 = 9,
+    /// Logarithmic transfer characteristic (100 * Sqrt( 10 ) : 1 range)<br />
+    Log100sqrt10 = 10,
+    /// IEC 61966-2-4<br />
+    Iec61966 = 11,
+    /// Rec. ITU-R BT.1361-0 extended colour gamut system (historical)<br />
+    Bt1361 = 12,
+    /// IEC 61966-2-1 sRGB or sYCC<br />
     Srgb = 13,
-    Pq = 16,
-    Dci = 17,
+    /// Rec. ITU-R BT.2020-2 (10-bit system)<br />
+    /// (functionally the same as the values 1, 6 and 15)<br />
+    Bt202010bit = 14,
+    /// Rec. ITU-R BT.2020-2 (12-bit system)<br />
+    /// (functionally the same as the values 1, 6 and 14)<br />
+    Bt202012bit = 15,
+    /// SMPTE ST 2084 for 10-, 12-, 14- and 16-bitsystems<br />
+    /// Rec. ITU-R BT.2100-0 perceptual quantization (PQ) system<br />
+    Smpte2084 = 16,
+    /// SMPTE ST 428-1<br />
+    Smpte428 = 17,
+    /// ARIB STD-B67<br />
+    /// Rec. ITU-R BT.2100-0 hybrid log- gamma (HLG) system<br />
     Hlg = 18,
 }
 
@@ -111,7 +187,7 @@ impl ColorEncoding {
     pub const fn srgb_linear() -> Self {
         Self {
             white_point: WhitePoint::D65,
-            primaries: Primaries::Srgb,
+            primaries: Primaries::Bt709,
             transfer: TransferFunction::Linear,
             rendering_intent: RenderingIntent::Relative,
         }
@@ -121,7 +197,7 @@ impl ColorEncoding {
     pub const fn srgb() -> Self {
         Self {
             white_point: WhitePoint::D65,
-            primaries: Primaries::Srgb,
+            primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             rendering_intent: RenderingIntent::Relative,
         }
@@ -131,7 +207,7 @@ impl ColorEncoding {
     pub const fn display_p3() -> Self {
         Self {
             white_point: WhitePoint::D65,
-            primaries: Primaries::P3,
+            primaries: Primaries::Smpte431,
             transfer: TransferFunction::Srgb,
             rendering_intent: RenderingIntent::Relative,
         }
@@ -141,8 +217,8 @@ impl ColorEncoding {
     pub const fn bt2020_pq() -> Self {
         Self {
             white_point: WhitePoint::D65,
-            primaries: Primaries::Bt2100,
-            transfer: TransferFunction::Pq,
+            primaries: Primaries::Bt2020,
+            transfer: TransferFunction::Smpte2084,
             rendering_intent: RenderingIntent::Relative,
         }
     }
@@ -151,7 +227,7 @@ impl ColorEncoding {
     pub const fn bt2020_hlg() -> Self {
         Self {
             white_point: WhitePoint::D65,
-            primaries: Primaries::Bt2100,
+            primaries: Primaries::Bt2020,
             transfer: TransferFunction::Hlg,
             rendering_intent: RenderingIntent::Relative,
         }
