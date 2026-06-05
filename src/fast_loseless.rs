@@ -68,7 +68,7 @@ impl Default for FlMeta {
             alpha_premultiplied: false,
             orientation: 1,
             white_point: WhitePoint::D65,
-            primaries: Primaries::Srgb,
+            primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
             rendering_intent: RenderingIntent::Relative,
             intrinsic_size: None,
@@ -85,15 +85,15 @@ impl FlMeta {
     /// HDR10-style: Rec.2100 primaries + PQ transfer (use with `encode_fast_lossless_u16`).
     pub fn rec2100_pq() -> Self {
         Self {
-            primaries: Primaries::Bt2100,
-            transfer: TransferFunction::Pq,
+            primaries: Primaries::Bt2020,
+            transfer: TransferFunction::Smpte2084,
             ..Self::default()
         }
     }
     /// HLG HDR: Rec.2100 primaries + HLG transfer.
     pub fn rec2100_hlg() -> Self {
         Self {
-            primaries: Primaries::Bt2100,
+            primaries: Primaries::Bt2020,
             transfer: TransferFunction::Hlg,
             ..Self::default()
         }
@@ -108,7 +108,7 @@ impl FlMeta {
     /// Display-P3 (P3 primaries, sRGB transfer).
     pub fn display_p3() -> Self {
         Self {
-            primaries: Primaries::P3,
+            primaries: Primaries::Smpte431,
             ..Self::default()
         }
     }

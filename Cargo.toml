@@ -3,7 +3,7 @@ members = ["app", "stats"]
 
 [package]
 name = "jixel"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "Tiny JPEG XL encoder"
 readme = "README.md"
@@ -22,6 +22,3 @@ default = ["avx", "neon", "sse"]
 avx = []
 neon = []
 sse = []
-
-[profile.release]
-debug = 1
