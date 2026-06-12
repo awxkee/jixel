@@ -56,8 +56,9 @@
 
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
+    STRATEGY_DCT32X32,
 };
-use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16};
+use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16, dct32x32};
 use crate::image::{Image3F, ImageB};
 use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
@@ -90,6 +91,15 @@ const R_HEADER: f32 = 0.4;
 /// when the larger transform is a genuine RD win after a real encode.
 const BIAS_RECT: f32 = 0.92;
 const BIAS_16X16: f32 = 0.86;
+/// RD acceptance threshold for the 32×32 transform: it is chosen only when its
+/// modeled cost `D + λR` is below the summed cost of the four 2×2 super-blocks
+/// it would replace (i.e. an honest, unbiased RDO decision). Unlike the smaller
+/// transforms — which carry a sub-1.0 bias because the rate model undercounts
+/// their per-block-header savings — the 32×32 is left at 1.0: it spans 32 px, so
+/// a thumb on the scale over-selects it on detailed content (ringing the SSE
+/// model underweights), regressing such images. This is the key tunable: lower
+/// it to trade detail fidelity for more aggressive low-rate smoothing.
+const BIAS_32X32: f32 = 1.0;
 
 /// Forward-transform the `strategy`'s pixel footprint at absolute pixel
 /// `(px, py)` for one channel into `out` (natural coefficient storage matching
@@ -100,7 +110,7 @@ fn forward_transform(
     plane: &crate::image::Plane<f32>,
     px: usize,
     py: usize,
-    out: &mut [f32; 256],
+    out: &mut [f32; 1024],
 ) -> (usize, usize) {
     let pw = plane.xsize();
     let ph = plane.ysize();
@@ -116,7 +126,7 @@ fn forward_transform(
             }
         }
     };
-    let mut tmp = [0.0f32; 256];
+    let mut tmp = [0.0f32; 1024];
     match strategy {
         STRATEGY_DCT => {
             gather(8, 8, &mut tmp[..64]);
@@ -145,6 +155,13 @@ fn forward_transform(
             let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
             dct16x16(src, dst);
             (2, 2)
+        }
+        STRATEGY_DCT32X32 => {
+            gather(32, 32, &mut tmp[..1024]);
+            let src: &[f32; 1024] = (&tmp[..1024]).try_into().unwrap();
+            let dst: &mut [f32; 1024] = (&mut out[..1024]).try_into().unwrap();
+            dct32x32(src, dst);
+            (4, 4)
         }
         _ => unreachable!("invalid strategy {strategy}"),
     }
@@ -308,7 +325,7 @@ fn strategy_cost(
     qm_mult_x: f32,
     matrices: &DequantMatrices,
 ) -> f32 {
-    let mut coeffs = [[0.0f32; 256]; 3];
+    let mut coeffs = [[0.0f32; 1024]; 3];
     let mut cxy = (1usize, 1usize);
     for c in 0..3 {
         cxy = forward_transform(strategy, opsin.plane(c), px, py, &mut coeffs[c]);
@@ -329,6 +346,7 @@ fn strategy_cost(
         match strategy {
             STRATEGY_DCT => &matrices.inv_matrix(c)[..],
             STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
+            STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(c)[..],
             _ => &matrices.inv_matrix_16x8(c)[..],
         }
     };
@@ -355,7 +373,7 @@ fn select_super_block(
     qm_mult_x: f32,
     matrices: &DequantMatrices,
     ac_strategy: &mut AcStrategyImage,
-) {
+) -> f32 {
     // Cost of the four individual DCT8 blocks: cost[dy][dx].
     let mut c8 = [[0.0f32; 2]; 2];
     for dy in 0..2 {
@@ -407,10 +425,10 @@ fn select_super_block(
     let total_dct8 = c8[0][0] + c8[0][1] + c8[1][0] + c8[1][1];
 
     let best_rect = cost_16x8.min(cost_8x16);
-    if cost_16x16 < best_rect
+    let pick_16x16 = cost_16x16 < best_rect
         && cost_16x16 < total_dct8
-        && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
-    {
+        && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16);
+    if pick_16x16 {
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
     } else if cost_16x8 <= cost_8x16 {
         if BIAS_RECT * v_left < c8[0][0] + c8[1][0]
@@ -434,6 +452,14 @@ fn select_super_block(
         {
             ac_strategy.set_first(bx0, by0 + 1, STRATEGY_DCT8X16);
         }
+    }
+
+    // Achieved RD cost of this 2×2 super-block's decision (used by the coarser
+    // 4×4 / DCT32X32 level to decide whether to merge).
+    if pick_16x16 {
+        cost_16x16
+    } else {
+        best_rect
     }
 }
 
@@ -480,34 +506,101 @@ pub(crate) fn fill_ac_strategy(
     let ysize = ac_strategy.ysize();
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
+    // Local helper: max quant over a w×h block region (mirrors `adjust_quant_field`).
+    let region_qac = |quant_field: &ImageB, bx: usize, by: usize, w: usize, h: usize| -> f32 {
+        let mut q: u8 = 1;
+        for iy in 0..h {
+            for ix in 0..w {
+                q = q.max(quant_field.row(by + iy)[bx + ix]);
+            }
+        }
+        scale * q as f32
+    };
+
     let mut by = 0;
     while by + 1 < ysize {
+        // A 4-block-tall band can host DCT32X32 only when 4-aligned and fitting.
+        let four_row = by % 4 == 0 && by + 4 <= ysize;
         let mut bx = 0;
         while bx + 1 < xsize {
-            // Use the local quant to scale the operating point. `qac` mirrors
-            // `scale * quant` in `quantize_block_ac`; the super-block's max quant
-            // keeps the estimate consistent with `adjust_quant_field`.
-            let mut q: u8 = 1;
-            for iy in 0..2 {
-                for ix in 0..2 {
-                    q = q.max(quant_field.row(by + iy)[bx + ix]);
+            let four_col = bx % 4 == 0 && bx + 4 <= xsize;
+            if four_row
+                && four_col
+                && ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32)
+            {
+                // Two-level RD: first select the four 2×2 sub-blocks (committing)
+                // and accumulate their achieved cost, then compare against the
+                // single DCT32X32. If the big transform wins, overwrite.
+                let mut sub_total = 0.0f32;
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        let sbx = bx + sx * 2;
+                        let sby = by + sy * 2;
+                        let qac = region_qac(quant_field, sbx, sby, 2, 2);
+                        sub_total += select_super_block(
+                            opsin,
+                            sbx,
+                            sby,
+                            dc_group_px + sbx * 8,
+                            dc_group_py + sby * 8,
+                            qac,
+                            qm_mult_x,
+                            matrices,
+                            ac_strategy,
+                        );
+                    }
                 }
+                let qac32 = region_qac(quant_field, bx, by, 4, 4);
+                let cost32 = strategy_cost(
+                    STRATEGY_DCT32X32,
+                    opsin,
+                    dc_group_px + bx * 8,
+                    dc_group_py + by * 8,
+                    qac32,
+                    qm_mult_x,
+                    matrices,
+                );
+                if BIAS_32X32 * cost32 < sub_total {
+                    // set_first overwrites the four committed sub-block placements.
+                    ac_strategy.set_first(bx, by, STRATEGY_DCT32X32);
+                }
+                bx += 4;
+            } else if four_row {
+                // 4-tall band but this column can't be part of a 4×4 region: cover
+                // it with two stacked 2×2 super-blocks so no rows are skipped.
+                for sby in [by, by + 2] {
+                    let qac = region_qac(quant_field, bx, sby, 2, 2);
+                    select_super_block(
+                        opsin,
+                        bx,
+                        sby,
+                        dc_group_px + bx * 8,
+                        dc_group_py + sby * 8,
+                        qac,
+                        qm_mult_x,
+                        matrices,
+                        ac_strategy,
+                    );
+                }
+                bx += 2;
+            } else {
+                // 2-tall band (image bottom edge): single 2×2 super-block.
+                let qac = region_qac(quant_field, bx, by, 2, 2);
+                select_super_block(
+                    opsin,
+                    bx,
+                    by,
+                    dc_group_px + bx * 8,
+                    dc_group_py + by * 8,
+                    qac,
+                    qm_mult_x,
+                    matrices,
+                    ac_strategy,
+                );
+                bx += 2;
             }
-            let qac = scale * q as f32;
-            select_super_block(
-                opsin,
-                bx,
-                by,
-                dc_group_px + bx * 8,
-                dc_group_py + by * 8,
-                qac,
-                qm_mult_x,
-                matrices,
-                ac_strategy,
-            );
-            bx += 2;
         }
-        by += 2;
+        by += if four_row { 4 } else { 2 };
     }
 
     adjust_quant_field(ac_strategy, quant_field);

@@ -654,6 +654,10 @@ pub(crate) struct DequantMatrices {
     /// part of libjxl-tiny.
     pub(crate) matrix_16x16: [[f32; 256]; 3],
     pub(crate) inv_matrix_16x16: [[f32; 256]; 3],
+    /// 32×32 dequant matrix (1024 floats per channel). Generated at
+    /// construction time from the libjxl DCT32X32 polynomial parameters.
+    pub(crate) matrix_32x32: Box<[[f32; 1024]; 3]>,
+    pub(crate) inv_matrix_32x32: Box<[[f32; 1024]; 3]>,
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -695,6 +699,45 @@ static DCT16X16_BANDS: [[f32; 7]; 3] = [
     ],
 ];
 
+/// libjxl `DequantMatricesLibraryDef::DCT32X32()` parameters: 8 distance
+/// bands per channel (X, Y, B). Same format as [`DCT16X16_BANDS`]. Source:
+/// libjxl `lib/jxl/quant_weights.cc`.
+static DCT32X32_BANDS: [[f32; 8]; 3] = [
+    // X
+    [
+        15718.408_309_825_19,
+        -1.025,
+        -0.98,
+        -0.901_2,
+        -0.4,
+        -0.488_193_95,
+        -0.421_064,
+        -0.27,
+    ],
+    // Y
+    [
+        7305.763_681_069_598,
+        -0.804_195_82,
+        -0.763_303_65,
+        -0.556_603_8,
+        -0.497_853_05,
+        -0.436_995_93,
+        -0.401_808_67,
+        -0.273_216_83,
+    ],
+    // B
+    [
+        3803.531_737_212_15,
+        -3.060_733_6,
+        -2.041_327,
+        -2.023_565,
+        -0.549_538_95,
+        -0.4,
+        -0.4,
+        -0.3,
+    ],
+];
+
 /// libjxl band-step multiplicative helper. Positive → 1+v, negative → 1/(1-v).
 /// Matches `jxl::DequantMatricesLibrary::Mult` and jxl-rs `mult`.
 #[inline]
@@ -706,7 +749,7 @@ fn band_mult(v: f32) -> f32 {
 /// `a`, `b` are interpolated geometrically (exponential) using the fractional
 /// scaled distance.
 #[inline]
-fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32; 7]) -> f32 {
+fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32]) -> f32 {
     let idx_f = scaled_pos.floor();
     let frac = scaled_pos - idx_f;
     let idx = idx_f as usize;
@@ -748,6 +791,34 @@ fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
     out
 }
 
+/// Reproduce libjxl `GetQuantWeights(32, 32, ...)` for the DCT32X32 matrix.
+/// Identical radial-band scheme as [`compute_dct16x16_matrix`] but with 8 bands
+/// over a 32×32 block. Returns a boxed table to keep it off the stack.
+fn compute_dct32x32_matrix() -> Box<[[f32; 1024]; 3]> {
+    const NUM_BANDS: usize = 8;
+    let mut out = Box::new([[0.0f32; 1024]; 3]);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT32X32_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT32X32_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 31.0;
+        for y in 0..32 {
+            let dy = y as f32 * rcp;
+            let dy2 = dy * dy;
+            for x in 0..32 {
+                let dx = x as f32 * rcp;
+                let dist = fmla(dx, dx, dy2).sqrt();
+                let weight = interpolate_vec_bands(dist, &bands);
+                out[c][y * 32 + x] = 1.0 / weight;
+            }
+        }
+    }
+    out
+}
+
 impl DequantMatrices {
     pub(crate) fn new() -> Self {
         let matrix = DEQUANT_MATRIX_8X8;
@@ -780,6 +851,16 @@ impl DequantMatrices {
             }
         }
 
+        let matrix_32x32 = compute_dct32x32_matrix();
+        let mut inv_32x32 = Box::new([[0.0f32; 1024]; 3]);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            for k in 1..1024 {
+                inv_32x32[c][k] = 1.0 / matrix_32x32[c][k];
+            }
+        }
+
         Self {
             matrix,
             inv_matrix: inv,
@@ -787,6 +868,8 @@ impl DequantMatrices {
             inv_matrix_16x8: inv_16x8,
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
+            matrix_32x32,
+            inv_matrix_32x32: inv_32x32,
         }
     }
 
@@ -817,6 +900,16 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix_16x16(&self, c: usize) -> &[f32; 256] {
         &self.inv_matrix_16x16[c]
+    }
+
+    /// 32×32 dequant matrix (1024 floats per channel).
+    #[inline]
+    pub(crate) fn matrix_32x32(&self, c: usize) -> &[f32; 1024] {
+        &self.matrix_32x32[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_32x32(&self, c: usize) -> &[f32; 1024] {
+        &self.inv_matrix_32x32[c]
     }
 }
 
