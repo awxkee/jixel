@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     }
     if images.is_empty() {
         bail!(
-            "usage: jixbench IMAGE.png [more.png ...] [--out DIR] [--distances 0.5,1,2] [--efforts 7,9]"
+            "usage: stats IMAGE.png [more.png ...] [--out DIR] [--distances 0.5,1,2] [--efforts 7,9]"
         );
     }
     register_fonts();

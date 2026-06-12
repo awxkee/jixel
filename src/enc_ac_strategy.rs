@@ -26,481 +26,489 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-// use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16};
-// use crate::image::Image3F;
-// use crate::quant_weights::DequantMatrices;
-// use crate::util::FastRound;
+//! Adaptive transform (AC strategy) selection via rate-distortion optimization.
+//!
+//! For each aligned 2×2 super-block we evaluate the candidate transform layouts
+//! — four DCT8, two vertical DCT16X8, two horizontal DCT8X16, and one DCT16X16 —
+//! and choose the one that minimizes the Lagrangian cost `J = D + λ·R`:
+//!
+//! * **D — distortion (SSE).** The transform is forward-DCT'd and quantized
+//!   exactly as the real encoder does (`enc_group::quantize_block_ac`), then the
+//!   per-coefficient quantization error is squared and summed. This error is
+//!   measured in the *dequant-normalized* coefficient space: the JXL dequant
+//!   matrices fold both the basis scaling and the perceptual weighting into the
+//!   step size, so a uniform error in this space is (by construction) a uniform
+//!   perceptual error. Summing its square is therefore a perceptual SSE that is
+//!   directly comparable across transform sizes. Unlike the old libjxl-tiny
+//!   `info_loss` heuristic, the error is *threshold-aware*: a coefficient that
+//!   the quantizer kills (`|a| < threshold → 0`) contributes its full magnitude,
+//!   not just a rounding residue.
+//!
+//! * **R — rate.** A bit estimate for the quantized AC coefficients: a per-
+//!   nonzero context/sign overhead plus a magnitude term (`log2(1+|q|)`), plus a
+//!   small `num_nonzeros` header term. This approximates the ANS-coded cost.
+//!
+//! * **λ — Lagrange multiplier.** Because the quantizer always rounds to integer
+//!   quant-units (step Δ = 1), the high-rate-optimal multiplier for entropy-
+//!   constrained scalar quantization, `λ* = Δ²·ln2/6`, is a constant independent
+//!   of the target distance. That gives a principled, distance-robust trade-off
+//!   without per-distance magic constants.
 
-// libjxl-tiny constants for entropy estimation. Hoisted to module scope so the
-// per-coefficient helper below can reference them without re-declaring per call.
-// const K_INFO_LOSS_MULTIPLIER: f32 = 138.0;
-// const K_INFO_LOSS_MULTIPLIER2: f32 = 50.468_4;
-// const K_COST_DELTA: f32 = 5.335_918_5;
-// const K_COST2: f32 = 4.462_815;
-// const K_ZEROS_MUL: f32 = 7.565_053;
+use crate::dc_group_data::{
+    AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
+};
+use crate::dct::{dct8x8, dct8x16, dct16x8, dct16x16};
+use crate::image::{Image3F, ImageB};
+use crate::quant_weights::DequantMatrices;
+use crate::util::FastRound;
+use std::sync::OnceLock;
 
-// /// Accumulate one coefficient's contribution to the entropy estimate.
-// ///
-// /// `info_loss`/`info_loss2` (the rounding-loss terms) are accumulated for every
-// /// coefficient, exactly as before. The entropy/nonzero terms only matter when
-// /// the quantized magnitude is nonzero — and `sqrt(0)*K == 0` contributes
-// /// nothing — so we gate the `sqrt` (and the `>= 1.5` branch) behind `q > 0`.
-// /// Most coefficients quantize to zero, so this skips the bulk of the `sqrt`
-// /// calls without changing the result bit-for-bit.
-// #[inline(always)]
-// fn accumulate_coeff(
-//     val: f32,
-//     entropy_acc: &mut f32,
-//     nzeros: &mut usize,
-//     info_loss: &mut f32,
-//     info_loss2: &mut f32,
-// ) {
-//     let rval = val.fast_round();
-//     let diff = (val - rval).abs();
-//     *info_loss += diff;
-//     *info_loss2 += diff * diff;
-//     let q = rval.abs();
-//     if q > 0.0 {
-//         if q >= 1.5 {
-//             *entropy_acc += K_COST2;
-//         }
-//         *entropy_acc += q.sqrt() * K_COST_DELTA;
-//         *nzeros += 1;
-//     }
-// }
-//
-// /// Estimate per-block coding cost for a candidate strategy at super-block
-// /// position (bx, by) with offset (cx, cy) inside the super-block. Mirrors
-// /// libjxl-tiny's `EstimateEntropy`.
-// ///
-// /// `opsin` is the full XYB plane; `bx`, `by` are block coordinates of the
-// /// super-block top-left in the full image; `cx`, `cy` are offsets in 0..2.
-// /// Returns the entropy estimate plus an information-loss penalty.
-// fn estimate_entropy(
-//     raw_strategy: u8,
-//     opsin: &Image3F,
-//     bx: usize,
-//     by: usize,
-//     cx: usize,
-//     cy: usize,
-//     distance: f32,
-//     matrices: &DequantMatrices,
-//     quant_per_block: &[u8], // raw_quant_field over the super-block (2x2)
-//     qf_stride: usize,
-//     scratch: &mut [f32; 1024],
-// ) -> f32 {
-//     let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
-//     let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
-//     let num_blocks = cov_x * cov_y;
-//     let size = num_blocks * 64;
-//     let bx_pix = (bx + cx) * 8;
-//     let by_pix = (by + cy) * 8;
-//
-//     // Bounds check — return huge cost if candidate would go off the image.
-//     if by_pix + 8 * cov_y > opsin.ysize() || bx_pix + 8 * cov_x > opsin.xsize() {
-//         return f32::INFINITY;
-//     }
-//
-//     // Forward DCT each channel into block[c * size .. (c+1) * size].
-//     // Buffer sized for the largest candidate (DCT16X16 = 256 floats per channel).
-//
-//     let (tmp128_0, rem) = scratch.split_at_mut(256);
-//     let mut block = rem.as_chunks_mut::<768>().0[0];
-//     let mut tmp = tmp128_0.as_chunks_mut::<256>().0[0];
-//     for c in 0..3 {
-//         let plane = opsin.plane(c);
-//         match raw_strategy {
-//             STRATEGY_DCT => {
-//                 for yy in 0..8 {
-//                     let row = plane.row(by_pix + yy);
-//                     scratch[yy * 8..yy * 8 + 8].copy_from_slice(&row[bx_pix..bx_pix + 8]);
-//                 }
-//                 let dst: &mut [f32; 64] = (&mut block[c * size..c * size + 64]).try_into().unwrap();
-//                 let tmp_64 = tmp.as_chunks::<64>().0;
-//                 dct8x8(&tmp_64[0], dst);
-//             }
-//             STRATEGY_DCT16X8 => {
-//                 for yy in 0..16 {
-//                     let row = plane.row(by_pix + yy);
-//                     tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[bx_pix..bx_pix + 8]);
-//                 }
-//                 let dst: &mut [f32; 128] =
-//                     (&mut block[c * size..c * size + 128]).try_into().unwrap();
-//                 let tmp_128 = tmp.as_chunks::<128>().0;
-//                 dct16x8(&tmp_128[0], dst);
-//             }
-//             STRATEGY_DCT8X16 => {
-//                 for yy in 0..8 {
-//                     let row = plane.row(by_pix + yy);
-//                     tmp[yy * 16..yy * 16 + 16].copy_from_slice(&row[bx_pix..bx_pix + 16]);
-//                 }
-//                 let dst: &mut [f32; 128] =
-//                     (&mut block[c * size..c * size + 128]).try_into().unwrap();
-//                 let tmp_128 = tmp.as_chunks::<128>().0;
-//                 dct8x16(&tmp_128[0], dst);
-//             }
-//             STRATEGY_DCT16X16 => {
-//                 for yy in 0..16 {
-//                     let row = plane.row(by_pix + yy);
-//                     tmp[yy * 16..yy * 16 + 16].copy_from_slice(&row[bx_pix..bx_pix + 16]);
-//                 }
-//                 let dst: &mut [f32; 256] =
-//                     (&mut block[c * size..c * size + 256]).try_into().unwrap();
-//                 let tmp_128 = tmp.as_chunks::<256>().0;
-//                 dct16x16(&tmp_128[0], dst);
-//             }
-//             _ => unreachable!(),
-//         }
-//     }
-//
-//     // Find max quant within candidate footprint (libjxl-tiny uses qf field).
-//     // We approximate using the raw quant field (the post-AQ "quant" field).
-//     let mut max_quant: u8 = 1;
-//     for iy in 0..cov_y {
-//         for ix in 0..cov_x {
-//             let q = quant_per_block[(cy + iy) * qf_stride + (cx + ix)];
-//             if q > max_quant {
-//                 max_quant = q;
-//             }
-//         }
-//     }
-//     let quant = max_quant as f32;
-//     // libjxl-tiny normally derives masking from a per-block mask field. jixel
-//     // doesn't compute one; the K_MUL16X8_TUNING constant below compensates by
-//     // making multi-block transforms uniformly more expensive in cost space.
-//     let masking = 1.0f32;
-//
-//     // libjxl-tiny constants for entropy estimation (see module scope).
-//     let slope = (distance * (1.0 / 3.0)).min(1.0);
-//     let cost1 = 1.0 + slope * 8.870_325;
-//
-//     // jixel: chroma-from-luma factors. X has no CfL (factor=0), B uses 1.0.
-//     let cmap_factors = [0.0f32, 0.0, 1.0];
-//
-//     let mut entropy = 0.0f32;
-//     let mut info_loss = 0.0f32;
-//     let mut info_loss2 = 0.0f32;
-//
-//     for c in 0..3 {
-//         let inv_matrix: &[f32] = match raw_strategy {
-//             STRATEGY_DCT => &matrices.inv_matrix(c)[..],
-//             STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
-//             _ => &matrices.inv_matrix_16x8(c)[..],
-//         };
-//         let cmap_factor = cmap_factors[c];
-//         let mut entropy_acc = 0.0f32;
-//         let mut nzeros = 0usize;
-//         let base = c * size;
-//         // Iterator-zipped loops over equal-length slices: removes the per-
-//         // coefficient bounds checks on both `block` and `inv_matrix` (the matrix
-//         // length equals `size` for every candidate). Arithmetic and order are
-//         // unchanged, so the cost estimate is bit-identical.
-//         let blk = &block[base..base + size];
-//         let invm = &inv_matrix[..size];
-//         if cmap_factor == 0.0 {
-//             for (&bi, &mi) in blk.iter().zip(invm.iter()) {
-//                 let val = bi * mi * quant;
-//                 accumulate_coeff(
-//                     val,
-//                     &mut entropy_acc,
-//                     &mut nzeros,
-//                     &mut info_loss,
-//                     &mut info_loss2,
-//                 );
-//             }
-//         } else {
-//             let yv = &block[size..size + size]; // channel 1 (Y)
-//             for ((&bi, &mi), &yi) in blk.iter().zip(invm.iter()).zip(yv.iter()) {
-//                 let val = (bi - cmap_factor * yi) * mi * quant;
-//                 accumulate_coeff(
-//                     val,
-//                     &mut entropy_acc,
-//                     &mut nzeros,
-//                     &mut info_loss,
-//                     &mut info_loss2,
-//                 );
-//             }
-//         }
-//         entropy_acc += nzeros as f32 * cost1;
-//         entropy += entropy_acc;
-//         // Bits-to-encode num_nonzeros estimate.
-//         let nbits = if nzeros + 1 > 1 {
-//             (32 - (nzeros as u32 + 1).leading_zeros()) as usize
-//         } else {
-//             1
-//         };
-//         let nbits = nbits.max(1);
-//         let log_nb = if nbits + 17 > 1 {
-//             (32 - (nbits as u32 + 17).leading_zeros()) as usize
-//         } else {
-//             1
-//         };
-//         let log_nb = log_nb.max(1);
-//         entropy += K_ZEROS_MUL * (log_nb as f32 + nbits as f32);
-//     }
-//
-//     let infoloss_score = K_INFO_LOSS_MULTIPLIER * info_loss
-//         + K_INFO_LOSS_MULTIPLIER2 * (num_blocks as f32 * info_loss2).sqrt();
-//     entropy + masking * infoloss_score
-// }
-/*
-/// Find the best transform layout for each aligned 2×2 super-block in the
-/// full image. Decides between (4 separate DCT8) vs (two DCT16X8 / two
-/// DCT8X16 — pick best orientation), and sets `ac_strategy` accordingly.
-///
-/// `opsin` is the full image; `bx0`, `by0` is the super-block top-left in
-/// the full image (must be even-aligned). `quant_per_block` is the
-/// raw_quant_field over the full image; `qf_stride` is its row stride.
-pub(crate) fn find_best_16x16_transform(
+/// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
+/// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
+/// bits, so `λ·R` is in quant-units² and adds cleanly to D.
+const RD_LAMBDA: f32 = 0.115_524_53;
+
+/// Per-channel distortion weights. The dequant matrices already normalize each
+/// channel perceptually, so equal weights are the principled default; X (red-
+/// green) gets a touch more weight because the selection's CfL model omits the
+/// Y→X subtraction (see `CMAP_FACTOR`), slightly under-counting its error.
+static CHANNEL_WEIGHT: [f32; 3] = [1.0, 1.0, 1.0];
+
+static CMAP_FACTOR: [f32; 3] = [0.0, 0.0, 1.0];
+
+/// Fixed overhead per nonzero AC coefficient (context selection + sign).
+const R_NZ_BASE: f32 = 1.6;
+/// Weight on the magnitude term `log2(1+|q|)`.
+const R_MAG: f32 = 1.0;
+/// Weight on the `num_nonzeros` header term `log2(1+nzeros)`.
+const R_HEADER: f32 = 0.4;
+
+/// Bias multipliers making multi-block transforms progressively "cheaper" to
+/// pick, compensating for (a) the selection's approximate CfL/rate model and
+/// (b) the real saving of one shared `num_nonzeros`/DC-context header per merge.
+/// Values < 1 favour the larger transform. Tuned so the RD switch only fires
+/// when the larger transform is a genuine RD win after a real encode.
+const BIAS_RECT: f32 = 0.92;
+const BIAS_16X16: f32 = 0.86;
+
+/// Forward-transform the `strategy`'s pixel footprint at absolute pixel
+/// `(px, py)` for one channel into `out` (natural coefficient storage matching
+/// `write_ac_group`). Returns `(cx, cy)` covered-block counts after the
+/// libjxl-tiny `cx ≥ cy` normalisation, i.e. the storage shape in 8-blocks.
+fn forward_transform(
+    strategy: u8,
+    plane: &crate::image::Plane<f32>,
+    px: usize,
+    py: usize,
+    out: &mut [f32; 256],
+) -> (usize, usize) {
+    let pw = plane.xsize();
+    let ph = plane.ysize();
+    // Gather `w×h` pixels with edge replication, matching `build_stripe`'s
+    // padding so the selection sees exactly what `write_ac_group` will transform.
+    let gather = |w: usize, h: usize, dst: &mut [f32]| {
+        for v in 0..h {
+            let sy = (py + v).min(ph - 1);
+            let row = plane.row(sy);
+            for u in 0..w {
+                let sx = (px + u).min(pw - 1);
+                dst[v * w + u] = row[sx];
+            }
+        }
+    };
+    let mut tmp = [0.0f32; 256];
+    match strategy {
+        STRATEGY_DCT => {
+            gather(8, 8, &mut tmp[..64]);
+            let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
+            let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+            dct8x8(src, dst);
+            (1, 1)
+        }
+        STRATEGY_DCT16X8 => {
+            gather(8, 16, &mut tmp[..128]);
+            let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
+            let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
+            dct16x8(src, dst);
+            (2, 1)
+        }
+        STRATEGY_DCT8X16 => {
+            gather(16, 8, &mut tmp[..128]);
+            let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
+            let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
+            dct8x16(src, dst);
+            (2, 1)
+        }
+        STRATEGY_DCT16X16 => {
+            gather(16, 16, &mut tmp[..256]);
+            let src: &[f32; 256] = (&tmp[..256]).try_into().unwrap();
+            let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
+            dct16x16(src, dst);
+            (2, 2)
+        }
+        _ => unreachable!("invalid strategy {strategy}"),
+    }
+}
+
+/// Replicate `quantize_block_ac`'s per-quadrant thresholds for this channel and
+/// transform shape (in 8-blocks).
+#[inline]
+fn thresholds(channel: usize, cx: usize, cy: usize) -> [f32; 4] {
+    let mut thr = [0.58f32, 0.635, 0.66, 0.7];
+    if channel == 0 {
+        for t in thr.iter_mut().skip(1) {
+            *t += 0.08;
+        }
+    }
+    if channel == 2 {
+        for t in thr.iter_mut().skip(1) {
+            *t = 0.75;
+        }
+    }
+    if cx > 1 || cy > 1 {
+        let delta =
+            (0.003_f32 * cx as f32 * cy as f32).clamp(0.0, if channel > 0 { 0.08 } else { 0.12 });
+        for t in thr.iter_mut() {
+            *t -= delta;
+        }
+    }
+    thr
+}
+
+/// Quantize one channel exactly as the encoder will, accumulating the threshold-
+/// aware squared quantization error (SSE, in quant-units²) and a rate estimate
+/// (bits). LLF positions (`x < cx && y < cy`, coded via the DC plane) are
+/// excluded from both, since DC coding is transform-choice-independent here.
+fn channel_rd(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    channel: usize,
+    qac: f32,
+    qm_mult: f32,
+    cx: usize,
+    cy: usize,
+) -> (f32, f32) {
+    let width = cx * 8;
+    let height = cy * 8;
+    let half = width / 2;
+    let thr = thresholds(channel, cx, cy);
+    let q_scaled = qac * qm_mult;
+
+    let (sse, nzeros, mag_bits) = sse_and_rate(
+        coeff, inv_matrix, q_scaled, width, height, half, cx, cy, &thr,
+    );
+
+    let header = R_HEADER * (1.0 + nzeros as f32).log2();
+    let bits = nzeros as f32 * R_NZ_BASE + R_MAG * mag_bits + header;
+    (sse, bits)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn sse_and_rate(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    thr: &[f32; 4],
+) -> (f32, usize, f32) {
+    type SseFunction = unsafe fn(
+        &[f32],
+        &[f32],
+        f32,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        &[f32; 4],
+    ) -> (f32, usize, f32);
+    static SSE_FUNCTION: OnceLock<SseFunction> = OnceLock::new();
+    let f = SSE_FUNCTION.get_or_init(|| {
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        {
+            if std::is_x86_feature_detected!("sse4.1") {
+                // Safe: feature gate + runtime detection inside.
+                return crate::sse::sse_and_rate_sse;
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::sse_and_rate_neon
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        {
+            crate::enc_ac_strategy::sse_and_rate_scalar
+        }
+    });
+
+    unsafe {
+        f(
+            coeff, inv_matrix, q_scaled, width, height, half, cx, cy, thr,
+        )
+    }
+}
+
+#[allow(unused)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sse_and_rate_scalar(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    thr: &[f32; 4],
+) -> (f32, usize, f32) {
+    let mut sse = 0.0f32;
+    let mut nzeros = 0usize;
+    let mut mag_bits = 0.0f32;
+    for y in 0..height {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        let thr_lo = thr[yfix];
+        let thr_hi = thr[yfix + 1];
+        let row = y * width;
+        for x in 0..width {
+            if x < cx && y < cy {
+                continue; // LLF → DC plane
+            }
+            let idx = row + x;
+            let threshold = if x >= half { thr_hi } else { thr_lo };
+            let a = inv_matrix[idx] * q_scaled * coeff[idx];
+            let q = if a.abs() >= threshold {
+                a.fast_round()
+            } else {
+                0.0
+            };
+            let d = a - q;
+            sse += d * d;
+            if q != 0.0 {
+                nzeros += 1;
+                mag_bits += (1.0 + q.abs()).log2();
+            }
+        }
+    }
+    (sse, nzeros, mag_bits)
+}
+
+/// Full RD cost `J = D + λR` of coding `strategy` at absolute pixel `(px, py)`.
+/// Combines the three channels with the selection-time CfL approximation.
+fn strategy_cost(
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    matrices: &DequantMatrices,
+) -> f32 {
+    let mut coeffs = [[0.0f32; 256]; 3];
+    let mut cxy = (1usize, 1usize);
+    for c in 0..3 {
+        cxy = forward_transform(strategy, opsin.plane(c), px, py, &mut coeffs[c]);
+    }
+    let (cx, cy) = cxy;
+    let size = cx * cy * 64;
+
+    // Apply the selection-time CfL model: B -= 1.0·Y (X unchanged).
+    {
+        let [_c0, c1, c2] = &mut coeffs;
+        let y = &c1[..size];
+        for (b, &yi) in c2[..size].iter_mut().zip(y.iter()) {
+            *b -= CMAP_FACTOR[2] * yi;
+        }
+    }
+
+    let inv = |c: usize| -> &[f32] {
+        match strategy {
+            STRATEGY_DCT => &matrices.inv_matrix(c)[..],
+            STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
+            _ => &matrices.inv_matrix_16x8(c)[..],
+        }
+    };
+
+    let mut d_total = 0.0f32;
+    let mut r_total = 0.0f32;
+    for c in 0..3 {
+        let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
+        let (d, r) = channel_rd(&coeffs[c][..size], inv(c), c, qac, qm_mult, cx, cy);
+        d_total += CHANNEL_WEIGHT[c] * d;
+        r_total += r;
+    }
+    d_total + RD_LAMBDA * r_total
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_super_block(
     opsin: &Image3F,
     bx0: usize,
     by0: usize,
-    distance: f32,
+    px0: usize,
+    py0: usize,
+    qac: f32,
+    qm_mult_x: f32,
     matrices: &DequantMatrices,
-    quant_per_block: &[u8],
-    qf_stride: usize,
     ac_strategy: &mut AcStrategyImage,
-    scratch: &mut [f32; 1024],
 ) {
-    // Per libjxl-tiny: per-distance multipliers.
-    let k8x8_base = 1.4;
-    let k8x8_mul1 = -0.55 * 0.75;
-    let k8x8_mul2 = 1.073_575_8 * 0.75;
-    let mul8x8 = k8x8_mul2 + k8x8_mul1 / (distance + k8x8_base);
-
-    let acs_bias = 1.0 + 0.5 * ((0.7 - distance) / 0.7).clamp(0.0, 1.0);
-    let k_mul16x8_tuning: f32 = 1.5 * acs_bias;
-    let k8x16_base = 1.6;
-    let k8x16_mul1 = -0.55 * k_mul16x8_tuning;
-    let k8x16_mul2 = 0.901_958_8 * k_mul16x8_tuning;
-    let mul16x8 = k8x16_mul2 + k8x16_mul1 / (distance + k8x16_base);
-
-    let k_mul16x16_tuning: f32 = 1.8 * acs_bias;
-    let k16x16_base = 1.6;
-    let k16x16_mul1 = -0.55 * k_mul16x16_tuning;
-    let k16x16_mul2 = 0.901_958_8 * k_mul16x16_tuning;
-    let mul16x16 = k16x16_mul2 + k16x16_mul1 / (distance + k16x16_base);
-
-    // Cache the QF rect over the 2x2 super-block: 2 rows × 2 cols.
-    // quant_per_block is indexed via [by0*qf_stride .. (by0+2)*qf_stride].
-    // Build a local 2x2 view in qf_local stored row-major (stride 2):
-    let mut qf_local = [0u8; 4];
-    for iy in 0..2 {
-        for ix in 0..2 {
-            let by = by0 + iy;
-            let bx = bx0 + ix;
-            qf_local[iy * 2 + ix] = quant_per_block[by * qf_stride + bx];
-        }
-    }
-
-    // Per-(dy,dx) entropy estimates of 4 separate DCT8 blocks.
-    let mut entropy = [[0.0f32; 2]; 2];
+    // Cost of the four individual DCT8 blocks: cost[dy][dx].
+    let mut c8 = [[0.0f32; 2]; 2];
     for dy in 0..2 {
         for dx in 0..2 {
-            let e = estimate_entropy(
+            c8[dy][dx] = strategy_cost(
                 STRATEGY_DCT,
                 opsin,
-                bx0,
-                by0,
-                dx,
-                dy,
-                distance,
+                px0 + dx * 8,
+                py0 + dy * 8,
+                qac,
+                qm_mult_x,
                 matrices,
-                &qf_local,
-                2,
-                scratch,
             );
-            entropy[dy][dx] = mul8x8 * (3.0 + e);
         }
     }
 
-    // Estimate the 2 candidate DCT16X8 (vertical pair) and 2 candidate DCT8X16
-    // (horizontal pair) options, plus the single DCT16X16 covering all 4 blocks.
-    let entropy_16x8_left = mul16x8
-        * estimate_entropy(
-            STRATEGY_DCT16X8,
-            opsin,
-            bx0,
-            by0,
-            0,
-            0,
-            distance,
-            matrices,
-            &qf_local,
-            2,
-            scratch,
-        );
-    let entropy_16x8_right = mul16x8
-        * estimate_entropy(
-            STRATEGY_DCT16X8,
-            opsin,
-            bx0,
-            by0,
-            1,
-            0,
-            distance,
-            matrices,
-            &qf_local,
-            2,
-            scratch,
-        );
-    let entropy_8x16_top = mul16x8
-        * estimate_entropy(
-            STRATEGY_DCT8X16,
-            opsin,
-            bx0,
-            by0,
-            0,
-            0,
-            distance,
-            matrices,
-            &qf_local,
-            2,
-            scratch,
-        );
-    let entropy_8x16_bottom = mul16x8
-        * estimate_entropy(
-            STRATEGY_DCT8X16,
-            opsin,
-            bx0,
-            by0,
-            0,
-            1,
-            distance,
-            matrices,
-            &qf_local,
-            2,
-            scratch,
-        );
-    let entropy_16x16 = mul16x16
-        * estimate_entropy(
-            STRATEGY_DCT16X16,
-            opsin,
-            bx0,
-            by0,
-            0,
-            0,
-            distance,
-            matrices,
-            &qf_local,
-            2,
-            scratch,
-        );
+    // Vertical pairs (DCT16X8): one per column.
+    let v_left = strategy_cost(STRATEGY_DCT16X8, opsin, px0, py0, qac, qm_mult_x, matrices);
+    let v_right = strategy_cost(
+        STRATEGY_DCT16X8,
+        opsin,
+        px0 + 8,
+        py0,
+        qac,
+        qm_mult_x,
+        matrices,
+    );
+    // Horizontal pairs (DCT8X16): one per row.
+    let h_top = strategy_cost(STRATEGY_DCT8X16, opsin, px0, py0, qac, qm_mult_x, matrices);
+    let h_bot = strategy_cost(
+        STRATEGY_DCT8X16,
+        opsin,
+        px0,
+        py0 + 8,
+        qac,
+        qm_mult_x,
+        matrices,
+    );
+    // The single DCT16X16 over all four.
+    let c16 = strategy_cost(STRATEGY_DCT16X16, opsin, px0, py0, qac, qm_mult_x, matrices);
 
-    // Cost of choosing per-column DCT16X8 vs the 2 DCT8s in that column.
-    let cost16x8 = entropy_16x8_left.min(entropy[0][0] + entropy[1][0])
-        + entropy_16x8_right.min(entropy[0][1] + entropy[1][1]);
-    let cost8x16 = entropy_8x16_top.min(entropy[0][0] + entropy[0][1])
-        + entropy_8x16_bottom.min(entropy[1][0] + entropy[1][1]);
-    // Cost of choosing the single DCT16X16 over all four blocks.
-    let cost16x16 = entropy_16x16;
-    let total_dct8 = entropy[0][0] + entropy[0][1] + entropy[1][0] + entropy[1][1];
+    // Best column-wise DCT16X8 layout vs the two DCT8s it would replace.
+    let cost_16x8 = (BIAS_RECT * v_left).min(c8[0][0] + c8[1][0])
+        + (BIAS_RECT * v_right).min(c8[0][1] + c8[1][1]);
+    // Best row-wise DCT8X16 layout.
+    let cost_8x16 =
+        (BIAS_RECT * h_top).min(c8[0][0] + c8[0][1]) + (BIAS_RECT * h_bot).min(c8[1][0] + c8[1][1]);
+    let cost_16x16 = BIAS_16X16 * c16;
+    let total_dct8 = c8[0][0] + c8[0][1] + c8[1][0] + c8[1][1];
 
-    // Pick the cheapest option overall. DCT16X16 wins if it's both the best
-    // rectangular choice *and* cheaper than 4 separate DCT8s.
-    let best_rect = cost16x8.min(cost8x16);
-    if cost16x16 < best_rect
-        && cost16x16 < total_dct8
+    let best_rect = cost_16x8.min(cost_8x16);
+    if cost_16x16 < best_rect
+        && cost_16x16 < total_dct8
         && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
     {
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
-    } else if cost16x8 < cost8x16 {
-        // Try DCT16X8 in each column independently.
-        if entropy_16x8_left < entropy[0][0] + entropy[1][0]
+    } else if cost_16x8 <= cost_8x16 {
+        if BIAS_RECT * v_left < c8[0][0] + c8[1][0]
             && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
         {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X8);
         }
-        if entropy_16x8_right < entropy[0][1] + entropy[1][1]
+        if BIAS_RECT * v_right < c8[0][1] + c8[1][1]
             && ac_strategy.can_place_strategy(bx0 + 1, by0, STRATEGY_DCT16X8)
         {
             ac_strategy.set_first(bx0 + 1, by0, STRATEGY_DCT16X8);
         }
     } else {
-        // Try DCT8X16 in each row independently.
-        if entropy_8x16_top < entropy[0][0] + entropy[0][1]
+        if BIAS_RECT * h_top < c8[0][0] + c8[0][1]
             && ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT8X16)
         {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT8X16);
         }
-        if entropy_8x16_bottom < entropy[1][0] + entropy[1][1]
+        if BIAS_RECT * h_bot < c8[1][0] + c8[1][1]
             && ac_strategy.can_place_strategy(bx0, by0 + 1, STRATEGY_DCT8X16)
         {
             ac_strategy.set_first(bx0, by0 + 1, STRATEGY_DCT8X16);
         }
     }
-}*/
+}
 
-// /// AdjustQuantField: for each multi-block transform, propagate the maximum
-// /// raw_quant across covered blocks (libjxl-tiny: AdjustQuantField). This
-// /// keeps the per-block QF consistent within a multi-block transform.
-// pub(crate) fn adjust_quant_field(
-//     ac_strategy: &AcStrategyImage,
-//     quant_field: &mut crate::image::ImageB,
-// ) {
-//     for (x, y, raw_strategy) in ac_strategy.iter_first_blocks() {
-//         let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
-//         let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
-//         if cov_x == 1 && cov_y == 1 {
-//             continue;
-//         }
-//         // Find max quant across covered blocks.
-//         let mut max_q: u8 = 0;
-//         for iy in 0..cov_y {
-//             let quant_row = &quant_field.row(y + iy)[x..x + cov_x];
-//             for &q in quant_row.iter() {
-//                 if q > max_q {
-//                     max_q = q;
-//                 }
-//             }
-//         }
-//         for iy in 0..cov_y {
-//             let quant_row = &mut quant_field.row_mut(y + iy)[x..x + cov_x];
-//             for q in quant_row.iter_mut() {
-//                 *q = max_q;
-//             }
-//         }
-//     }
-// }
-//
-// /// Run block selection across the whole image (raster order, 2×2 super-blocks).
-// /// Blocks not covered by a multi-block transform stay as DCT8.
-// pub(crate) fn fill_ac_strategy(
-//     _opsin: &Image3F,
-//     _distance: f32,
-//     _matrices: &DequantMatrices,
-//     quant_field: &mut crate::image::ImageB,
-//     ac_strategy: &mut AcStrategyImage,
-// ) {
-// let xsize = ac_strategy.xsize();
-// let ysize = ac_strategy.ysize();
-// let qf_stride = xsize;
-// let mut qf_flat = vec![0u8; xsize * ysize];
-// for y in 0..ysize {
-//     let r = quant_field.row(y);
-//     qf_flat[y * xsize..(y + 1) * xsize].copy_from_slice(&r[..xsize]);
-// }
+/// For each multi-block transform, propagate the maximum `raw_quant` across the
+/// covered blocks so the per-block quant field is consistent within a transform
+/// (libjxl-tiny `AdjustQuantField`).
+pub(crate) fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mut ImageB) {
+    for (x, y, raw_strategy) in ac_strategy.iter_first_blocks() {
+        let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
+        let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
+        if cov_x == 1 && cov_y == 1 {
+            continue;
+        }
+        let mut max_q: u8 = 0;
+        for iy in 0..cov_y {
+            for &q in &quant_field.row(y + iy)[x..x + cov_x] {
+                max_q = max_q.max(q);
+            }
+        }
+        for iy in 0..cov_y {
+            for q in &mut quant_field.row_mut(y + iy)[x..x + cov_x] {
+                *q = max_q;
+            }
+        }
+    }
+}
 
-// let mut tmp = [0.0f32; 1024];
+/// Select transforms for every aligned 2×2 super-block in the DC group, then
+/// reconcile the quant field. `(dc_group_px, dc_group_py)` is the DC group's
+/// top-left in absolute image pixels (so `opsin` can be the full image).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_ac_strategy(
+    opsin: &Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
+    _distance: f32,
+    scale: f32,
+    x_qm_scale: u32,
+    matrices: &DequantMatrices,
+    quant_field: &mut ImageB,
+    ac_strategy: &mut AcStrategyImage,
+) {
+    let xsize = ac_strategy.xsize();
+    let ysize = ac_strategy.ysize();
+    let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
-// let mut by = 0;
-// while by + 1 < ysize {
-//     let mut bx = 0;
-//     while bx + 1 < xsize {
-//         find_best_16x16_transform(
-//             opsin,
-//             bx,
-//             by,
-//             distance,
-//             matrices,
-//             &qf_flat,
-//             qf_stride,
-//             ac_strategy,
-//             &mut tmp,
-//         );
-//         bx += 2;
-//     }
-//     by += 2;
-// }
-//     adjust_quant_field(ac_strategy, quant_field);
-// }
+    let mut by = 0;
+    while by + 1 < ysize {
+        let mut bx = 0;
+        while bx + 1 < xsize {
+            // Use the local quant to scale the operating point. `qac` mirrors
+            // `scale * quant` in `quantize_block_ac`; the super-block's max quant
+            // keeps the estimate consistent with `adjust_quant_field`.
+            let mut q: u8 = 1;
+            for iy in 0..2 {
+                for ix in 0..2 {
+                    q = q.max(quant_field.row(by + iy)[bx + ix]);
+                }
+            }
+            let qac = scale * q as f32;
+            select_super_block(
+                opsin,
+                bx,
+                by,
+                dc_group_px + bx * 8,
+                dc_group_py + by * 8,
+                qac,
+                qm_mult_x,
+                matrices,
+                ac_strategy,
+            );
+            bx += 2;
+        }
+        by += 2;
+    }
+
+    adjust_quant_field(ac_strategy, quant_field);
+}
