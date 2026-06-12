@@ -26,8 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod ac_strategy;
 mod adaptive_quant;
 mod lossless_grad;
 
+pub(crate) use ac_strategy::sse_and_rate_sse;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use lossless_grad::grad_pack_interior;
