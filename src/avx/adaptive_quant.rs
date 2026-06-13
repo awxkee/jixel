@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::adaptive_quant::K_AC_QUANT;
 use std::arch::x86_64::*;
 
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
