@@ -333,12 +333,15 @@ pub(crate) fn fill_quant_field(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = crate::adaptive_quant::K_AC_QUANT / distance.powf(0.7934);
+    let scale = if distance > 1.0 {
+        K_AC_QUANT / distance
+    } else {
+        K_AC_QUANT / distance.powf(0.7934)
+    };
 
     let region_px_w = xsize_blocks * 8;
     let region_px_h = ysize_blocks * 8;
 
-    // ---- Stage 1: per-pixel masking pre-pass.
     let pre_w = region_px_w / 4;
     let pre_h = region_px_h / 4;
     let mut pre = vec![0.0f32; pre_w * pre_h];

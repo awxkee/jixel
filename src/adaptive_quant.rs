@@ -279,7 +279,11 @@ fn fill_quant_field_scalar(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = K_AC_QUANT / distance.powf(0.7934);
+    let scale = if distance > 1.0 {
+        K_AC_QUANT / distance
+    } else {
+        K_AC_QUANT / distance.powf(0.7934)
+    };
 
     // Pixel extent of this DC-group region (padded to whole blocks but clamped
     // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
