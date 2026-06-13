@@ -55,10 +55,10 @@
 //!   without per-distance magic constants.
 
 use crate::dc_group_data::{
-    AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
-    STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+    AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
+    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
 };
-use crate::dct::{dct4x4, dct8x8, dct8x16, dct16x8, dct16x16, dct32x32};
+use crate::dct::{dct4x4, dct4x8, dct8x4, dct8x8, dct8x16, dct16x8, dct16x16, dct32x32};
 use crate::image::{Image3F, ImageB};
 use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
@@ -122,6 +122,11 @@ const BIAS_16X16: f32 = 0.86;
 const BIAS_32X32: f32 = 1.0;
 
 const BIAS_4X4: f32 = 1.0;
+/// Merge bias for DCT4X8 vs the 8×8 it replaces (neutral, like the others).
+/// DCT4X8 splits the block into two 4-tall halves, giving finer vertical
+/// resolution — it tends to win on horizontal edges / horizontally-structured
+/// detail where a full 8×8 would ring.
+const BIAS_4X8: f32 = 1.0;
 
 thread_local! {
     /// Reused gather scratch for [`forward_transform`] (avoids re-zeroing 1024
@@ -204,6 +209,20 @@ fn forward_transform(
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
                 dct4x4(src, dst);
+                (1, 1)
+            }
+            STRATEGY_DCT4X8 => {
+                gather(8, 8, &mut tmp[..64]);
+                let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
+                let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+                dct4x8(src, dst);
+                (1, 1)
+            }
+            STRATEGY_DCT8X4 => {
+                gather(8, 8, &mut tmp[..64]);
+                let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
+                let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+                dct8x4(src, dst);
                 (1, 1)
             }
             _ => unreachable!("invalid strategy {strategy}"),
@@ -396,6 +415,7 @@ fn strategy_cost(
             match strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(c)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(c)[..],
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(c)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(c)[..],
                 _ => &matrices.inv_matrix_16x8(c)[..],
@@ -659,10 +679,31 @@ fn select_band(
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
             let cost8 = strategy_cost(STRATEGY_DCT, opsin, px, py, qac, qm_mult_x, matrices);
-            let cost4 = strategy_cost(STRATEGY_DCT4X4, opsin, px, py, qac, qm_mult_x, matrices);
-            if BIAS_4X4 * cost4 < cost8 {
-                ac_strategy.set_first(bx, by, STRATEGY_DCT4X4);
-                benefit += cost8 - cost4;
+            let cost4 =
+                BIAS_4X4 * strategy_cost(STRATEGY_DCT4X4, opsin, px, py, qac, qm_mult_x, matrices);
+            let cost48 =
+                BIAS_4X8 * strategy_cost(STRATEGY_DCT4X8, opsin, px, py, qac, qm_mult_x, matrices);
+            let cost84 =
+                BIAS_4X8 * strategy_cost(STRATEGY_DCT8X4, opsin, px, py, qac, qm_mult_x, matrices);
+            // Choose the cheapest sub-8×8 candidate, and take it only if it beats
+            // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
+            // horizontal res) are transposes that suit opposite edge orientations.
+            let (cand, cand_cost) = {
+                let mut best = STRATEGY_DCT4X4;
+                let mut bc = cost4;
+                if cost48 < bc {
+                    best = STRATEGY_DCT4X8;
+                    bc = cost48;
+                }
+                if cost84 < bc {
+                    best = STRATEGY_DCT8X4;
+                    bc = cost84;
+                }
+                (best, bc)
+            };
+            if cand_cost < cost8 {
+                ac_strategy.set_first(bx, by, cand);
+                benefit += cost8 - cand_cost;
             }
         }
     }
