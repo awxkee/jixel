@@ -534,7 +534,22 @@ fn select_super_block(
 /// For each multi-block transform, propagate the maximum `raw_quant` across the
 /// covered blocks so the per-block quant field is consistent within a transform
 /// (libjxl-tiny `AdjustQuantField`).
-pub(crate) fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mut ImageB) {
+pub(crate) fn adjust_quant_field(
+    ac_strategy: &AcStrategyImage,
+    butteraugli_target: f32,
+    quant_field: &mut ImageB,
+) {
+    // Max is best at low distances; mean works better at high distances. Current
+    // libjxl interpolates between them for transforms covering >= 4 blocks.
+    let mut mean_max_mixer = 1.0f32;
+    let k_limit = 1.54138f32;
+    let k_mul = 0.56391f32;
+    if butteraugli_target > k_limit {
+        mean_max_mixer -= (butteraugli_target - k_limit) * k_mul;
+        if mean_max_mixer < 0.0 {
+            mean_max_mixer = 0.0;
+        }
+    }
     for (x, y, raw_strategy) in ac_strategy.iter_first_blocks() {
         let cov_x = AcStrategyImage::covered_blocks_x_of(raw_strategy);
         let cov_y = AcStrategyImage::covered_blocks_y_of(raw_strategy);
@@ -542,14 +557,25 @@ pub(crate) fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mu
             continue;
         }
         let mut max_q: u8 = 0;
+        let mut sum: u32 = 0;
         for iy in 0..cov_y {
             for &q in &quant_field.row(y + iy)[x..x + cov_x] {
                 max_q = max_q.max(q);
+                sum += q as u32;
             }
         }
+        let covered = (cov_x * cov_y) as f32;
+        let val: u8 = if (cov_x * cov_y) >= 4 {
+            // jixel keeps the field in u8, so mix as float and round once.
+            let mean = sum as f32 / covered;
+            let mixed = max_q as f32 * mean_max_mixer + (1.0 - mean_max_mixer) * mean;
+            (mixed + 0.5).clamp(1.0, 255.0) as u8
+        } else {
+            max_q
+        };
         for iy in 0..cov_y {
             for q in &mut quant_field.row_mut(y + iy)[x..x + cov_x] {
-                *q = max_q;
+                *q = val;
             }
         }
     }
@@ -731,7 +757,7 @@ pub(crate) fn fill_ac_strategy(
     opsin: &Image3F,
     dc_group_px: usize,
     dc_group_py: usize,
-    _distance: f32,
+    distance: f32,
     scale: f32,
     x_qm_scale: u32,
     matrices: &DequantMatrices,
@@ -802,6 +828,6 @@ pub(crate) fn fill_ac_strategy(
         benefit
     };
 
-    adjust_quant_field(ac_strategy, quant_field);
+    adjust_quant_field(ac_strategy, distance, quant_field);
     benefit
 }
