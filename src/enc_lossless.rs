@@ -56,7 +56,7 @@ const WP_P3CC: i64 = 7;
 const WP_P3CD: i64 = 0;
 const WP_P3CE: i64 = 0;
 // divlookup[i] = (1<<24)/(i+1)
-const WP_DIV: [u32; 64] = [
+static WP_DIV: [u32; 64] = [
     16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152, 1864135, 1677721,
     1525201, 1398101, 1290555, 1198372, 1118481, 1048576, 986895, 932067, 883011, 838860, 798915,
     762600, 729444, 699050, 671088, 645277, 621378, 599186, 578524, 559240, 541200, 524288, 508400,
@@ -1022,8 +1022,8 @@ fn try_encode_palette_single_group(
 }
 
 fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
-    const OFFSETS: [usize; 4] = [0, 1024, 17_408, 4_211_712];
-    const BITS: [usize; 4] = [10, 14, 22, 30];
+    static OFFSETS: [usize; 4] = [0, 1024, 17_408, 4_211_712];
+    static BITS: [usize; 4] = [10, 14, 22, 30];
     let mut bucket = 0usize;
     while bucket < 3 && byte_len >= OFFSETS[bucket + 1] {
         bucket += 1;
