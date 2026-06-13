@@ -36,7 +36,7 @@ use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     EntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
-use crate::image::{Image3B, Image3F, Rect};
+use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::quant_weights::DequantMatrices;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
@@ -608,6 +608,7 @@ pub(crate) fn encode_frame(
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
+    num_threads: usize,
     writer: &mut BitWriter,
 ) {
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
@@ -629,11 +630,61 @@ pub(crate) fn encode_frame(
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
     // Phase 1: process each DC group, computing dc_data and collecting
-    // per-AC-group token vectors. Nothing is written yet.
+    // per-AC-group token vectors. Nothing is written yet. Each DC group is
+    // fully independent (reads `opsin` read-only, produces owned results), so
+    // for multi-group images we farm groups out across threads. For a single
+    // DC group (images <= 2048 px), the threads instead parallelize the
+    // AC-strategy selection *inside* `process_dc_group`. Either way the result
+    // sequence is deterministic, so output is bit-identical to single-threaded.
     let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(dim.num_dc_groups);
     let mut all_pending: Vec<PendingAcGroup> = Vec::new();
-    for dc_gy in 0..dim.ysize_dc_groups {
-        for dc_gx in 0..dim.xsize_dc_groups {
+
+    let group_coords: Vec<(usize, usize)> = (0..dim.ysize_dc_groups)
+        .flat_map(|gy| (0..dim.xsize_dc_groups).map(move |gx| (gx, gy)))
+        .collect();
+
+    if num_threads > 1 && group_coords.len() > 1 {
+        // Multi-group: parallelize across DC groups; selection inside stays
+        // serial (inner thread budget = 1) to avoid oversubscription.
+        let nthreads = num_threads.min(group_coords.len());
+        let chunk_size = group_coords.len().div_ceil(nthreads);
+        let chunks: Vec<&[(usize, usize)]> = group_coords.chunks(chunk_size).collect();
+        let results: Vec<Vec<(DcGroupData, Vec<PendingAcGroup>)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|&(dc_gx, dc_gy)| {
+                                process_dc_group(
+                                    linear,
+                                    &opsin,
+                                    &dim,
+                                    &distp,
+                                    &matrices,
+                                    dc_gx,
+                                    dc_gy,
+                                    num_passes,
+                                    coeff_shifts,
+                                    1,
+                                )
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for chunk_result in results {
+            for (dc_data, mut pending) in chunk_result {
+                dc_datas.push(dc_data);
+                all_pending.append(&mut pending);
+            }
+        }
+    } else {
+        // Single group (or single-threaded): selection parallelizes internally.
+        for &(dc_gx, dc_gy) in &group_coords {
             let (dc_data, mut pending) = process_dc_group(
                 linear,
                 &opsin,
@@ -644,6 +695,7 @@ pub(crate) fn encode_frame(
                 dc_gy,
                 num_passes,
                 coeff_shifts,
+                num_threads,
             );
             dc_datas.push(dc_data);
             all_pending.append(&mut pending);
@@ -843,6 +895,7 @@ fn process_dc_group(
     dc_gy: usize,
     num_passes: usize,
     coeff_shifts: &[u32],
+    num_threads: usize,
 ) -> (DcGroupData, Vec<PendingAcGroup>) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -874,6 +927,7 @@ fn process_dc_group(
         matrices,
         &mut dc_data.raw_quant_field,
         &mut dc_data.ac_strategy,
+        num_threads,
     );
     // Per-tile CfL: find optimal Y→X and Y→B slopes per 64×64 tile, written
     // into ytox_map/ytob_map and applied during DCT in write_ac_group.
@@ -927,71 +981,183 @@ fn process_dc_group(
 
     let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
     let mut pending: Vec<PendingAcGroup> = Vec::with_capacity(num_groups_here);
-    for gix in 0..num_groups_here {
-        let gx = gix % dc_group_xsize_groups;
-        let gy = gix / dc_group_xsize_groups;
-        let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
-        let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
-        let group_x0 = image_gx * K_GROUP_DIM;
-        let group_y0 = image_gy * K_GROUP_DIM;
-        let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
-        let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
-        let group_ysize_tiles = group_ysize.div_ceil(K_TILE_DIM);
 
-        let mut num_nzeros: Vec<Image3B> = (0..num_passes)
-            .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
-            .collect();
-        let mut tokens: Vec<Vec<Token>> = (0..num_passes)
-            .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
-            .collect();
-
-        for ty in 0..group_ysize_tiles {
-            let stripe_x0 = group_x0;
-            let stripe_y0 = group_y0 + ty * K_TILE_DIM;
-            let stripe_xsize = group_xsize;
-            let stripe_ysize = K_TILE_DIM.min(dim.ysize.saturating_sub(stripe_y0));
-            let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
-            let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
-
-            let stripe = build_stripe(
-                opsin,
-                stripe_x0,
-                stripe_y0,
-                stripe_xsize,
-                stripe_ysize,
-                stripe_xsize_padded,
-                stripe_ysize_padded,
-            );
-
-            let stripe_brect_x0 = gx * K_GROUP_DIM_IN_BLOCKS;
-            let stripe_brect_y0 = gy * K_GROUP_DIM_IN_BLOCKS + ty * K_TILE_DIM_IN_BLOCKS;
-            let stripe_brect = Rect::new(
-                stripe_brect_x0,
-                stripe_brect_y0,
-                stripe_xsize_padded / K_BLOCK_DIM,
-                stripe_ysize_padded / K_BLOCK_DIM,
-            );
-
-            write_ac_group(
-                &stripe,
-                stripe_brect,
-                matrices,
-                distp.scale,
-                distp.scale_dc,
-                distp.x_qm_scale,
-                &mut dc_data,
-                &mut num_nzeros,
-                coeff_shifts,
-                &mut tokens,
-            );
+    // Each AC group is independent: it reads `dc_data` (strategy / quant / cmap)
+    // read-only and writes only its own 32×32-block DC region. Transforms never
+    // cross a group boundary (`can_place_strategy`), so the regions are disjoint
+    // and merge deterministically — output is identical to single-threaded.
+    let merge_quant_dc = |dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S| {
+        let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+        let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+        let gwb = local.xsize();
+        let ghb = local.ysize();
+        for c in 0..3 {
+            for ly in 0..ghb {
+                let src = local.plane_row(c, ly);
+                dc.quant_dc.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
+            }
         }
+    };
 
-        pending.push(PendingAcGroup {
-            group_idx: image_gy * dim.xsize_groups + image_gx,
-            tokens,
+    if num_threads > 1 && num_groups_here > 1 {
+        let nthreads = num_threads.min(num_groups_here);
+        let chunk_size = num_groups_here.div_ceil(nthreads);
+        let index_chunks: Vec<Vec<usize>> = (0..num_groups_here)
+            .collect::<Vec<_>>()
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect();
+        let dc_ref = &dc_data;
+        let results: Vec<Vec<(usize, PendingAcGroup, Image3S)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = index_chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .into_iter()
+                            .map(|gix| {
+                                let gx = gix % dc_group_xsize_groups;
+                                let gy = gix / dc_group_xsize_groups;
+                                let (p, local) = process_ac_group(
+                                    opsin,
+                                    dim,
+                                    distp,
+                                    matrices,
+                                    dc_ref,
+                                    num_passes,
+                                    coeff_shifts,
+                                    dc_gx,
+                                    dc_gy,
+                                    gx,
+                                    gy,
+                                );
+                                (gix, p, local)
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        // Chunks are contiguous index ranges, so flattening preserves gix order.
+        for chunk_result in results {
+            for (gix, p, local) in chunk_result {
+                let gx = gix % dc_group_xsize_groups;
+                let gy = gix / dc_group_xsize_groups;
+                merge_quant_dc(&mut dc_data, gx, gy, &local);
+                pending.push(p);
+            }
+        }
+    } else {
+        for gix in 0..num_groups_here {
+            let gx = gix % dc_group_xsize_groups;
+            let gy = gix / dc_group_xsize_groups;
+            let (p, local) = process_ac_group(
+                opsin,
+                dim,
+                distp,
+                matrices,
+                &dc_data,
+                num_passes,
+                coeff_shifts,
+                dc_gx,
+                dc_gy,
+                gx,
+                gy,
+            );
+            merge_quant_dc(&mut dc_data, gx, gy, &local);
+            pending.push(p);
+        }
     }
     (dc_data, pending)
+}
+
+/// Encode a single AC group: build its tile stripes, quantize and tokenize,
+/// and place its DC coefficients into a returned group-local `quant_dc`
+/// (origin-relative, merged by the caller). Reads `dc_data` read-only.
+#[allow(clippy::too_many_arguments)]
+fn process_ac_group(
+    opsin: &Image3F,
+    dim: &ImageDim,
+    distp: &DistanceParams,
+    matrices: &DequantMatrices,
+    dc_data: &DcGroupData,
+    num_passes: usize,
+    coeff_shifts: &[u32],
+    dc_gx: usize,
+    dc_gy: usize,
+    gx: usize,
+    gy: usize,
+) -> (PendingAcGroup, Image3S) {
+    let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
+    let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
+    let group_x0 = image_gx * K_GROUP_DIM;
+    let group_y0 = image_gy * K_GROUP_DIM;
+    let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
+    let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
+    let group_ysize_tiles = group_ysize.div_ceil(K_TILE_DIM);
+    let gwb = group_xsize.div_ceil(K_BLOCK_DIM);
+    let ghb = group_ysize.div_ceil(K_BLOCK_DIM);
+    let qorigin_x = gx * K_GROUP_DIM_IN_BLOCKS;
+    let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
+
+    let mut local_quant_dc = Image3S::new(gwb, ghb);
+    let mut num_nzeros: Vec<Image3B> = (0..num_passes)
+        .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
+        .collect();
+    let mut tokens: Vec<Vec<Token>> = (0..num_passes)
+        .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
+        .collect();
+
+    for ty in 0..group_ysize_tiles {
+        let stripe_x0 = group_x0;
+        let stripe_y0 = group_y0 + ty * K_TILE_DIM;
+        let stripe_xsize = group_xsize;
+        let stripe_ysize = K_TILE_DIM.min(dim.ysize.saturating_sub(stripe_y0));
+        let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
+        let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
+
+        let stripe = build_stripe(
+            opsin,
+            stripe_x0,
+            stripe_y0,
+            stripe_xsize,
+            stripe_ysize,
+            stripe_xsize_padded,
+            stripe_ysize_padded,
+        );
+
+        let stripe_brect = Rect::new(
+            qorigin_x,
+            qorigin_y + ty * K_TILE_DIM_IN_BLOCKS,
+            stripe_xsize_padded / K_BLOCK_DIM,
+            stripe_ysize_padded / K_BLOCK_DIM,
+        );
+
+        write_ac_group(
+            &stripe,
+            stripe_brect,
+            matrices,
+            distp.scale,
+            distp.scale_dc,
+            distp.x_qm_scale,
+            dc_data,
+            &mut local_quant_dc,
+            qorigin_x,
+            qorigin_y,
+            &mut num_nzeros,
+            coeff_shifts,
+            &mut tokens,
+        );
+    }
+
+    (
+        PendingAcGroup {
+            group_idx: image_gy * dim.xsize_groups + image_gx,
+            tokens,
+        },
+        local_quant_dc,
+    )
 }
 
 /// Carve a stripe out of the (already-XYB-converted, gaborized) opsin image,

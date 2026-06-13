@@ -262,6 +262,7 @@ pub struct EncodeConfig {
     pub relative_to_max_display: bool,
     /// ToneMapping `linear_below` (nits, or 0..1 if relative). Default 0.
     pub linear_below: f32,
+    pub num_threads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +293,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) min_nits: f32,
     pub(crate) relative_to_max_display: bool,
     pub(crate) linear_below: f32,
+    /// Worker-thread count for VarDCT encoding (see `EncodeConfig::num_threads`).
+    pub(crate) num_threads: usize,
 }
 
 impl Default for EncodeConfig {
@@ -310,6 +313,7 @@ impl Default for EncodeConfig {
             min_nits: 0.0,
             relative_to_max_display: false,
             linear_below: 0.0,
+            num_threads: 1,
         }
     }
 }
@@ -333,6 +337,7 @@ impl Default for EncodeConfigImpl {
             min_nits: 0.0,
             relative_to_max_display: false,
             linear_below: 0.0,
+            num_threads: 1,
         }
     }
 }
@@ -345,6 +350,12 @@ impl EncodeConfigImpl {
             distance,
             ..Self::default()
         }
+    }
+
+    /// Set the worker-thread count (see `EncodeConfig::num_threads`).
+    pub(crate) fn with_num_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
+        self
     }
 
     /// Attach an ICC profile. **Panics at encode time** — see field docs.
@@ -505,6 +516,12 @@ impl EncodeConfig {
         self.progressive = progressive;
         self
     }
+
+    /// Set the worker-thread count (see `EncodeConfig::num_threads`).
+    pub fn with_num_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
+        self
+    }
 }
 
 pub fn distance_from_quality(quality: f32) -> f32 {
@@ -560,7 +577,8 @@ pub fn encode_image(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -586,7 +604,8 @@ pub fn encode_image(
             .with_exif(config.exif.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target),
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads),
     )
 }
 
@@ -631,7 +650,8 @@ pub fn encode_image_with_alpha(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -665,7 +685,8 @@ pub fn encode_image_with_alpha(
             .with_exif(config.exif.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target),
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads),
     )
 }
 
@@ -835,7 +856,8 @@ fn encode_gray_impl(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -1071,7 +1093,8 @@ fn encode_gray_high_depth_impl(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         );
     }
 
@@ -1149,7 +1172,8 @@ fn encode_high_depth_rgba(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -1204,7 +1228,8 @@ fn encode_high_depth_rgba(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         )
     } else {
         for (y, row) in input.chunks_exact(width * 3).enumerate() {
@@ -1230,7 +1255,8 @@ fn encode_high_depth_rgba(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         )
     }
 }
@@ -1369,7 +1395,8 @@ fn encode_float_rgba(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         )
     } else {
         for (y, row) in input.chunks_exact(width * 3).enumerate() {
@@ -1394,7 +1421,8 @@ fn encode_float_rgba(
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target),
+                .with_intensity_target(config.intensity_target)
+                .with_num_threads(config.num_threads),
         )
     }
 }
@@ -1441,7 +1469,8 @@ fn encode_float_gray(
             .with_exif(config.exif.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target),
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads),
     )
 }
 
@@ -1598,6 +1627,7 @@ pub(crate) fn encode_with_config(
         input,
         config.alpha.as_ref(),
         &coeff_shifts,
+        config.num_threads.max(1),
         &mut w,
     );
     let codestream = w.into_bytes();

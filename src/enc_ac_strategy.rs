@@ -501,49 +501,53 @@ pub(crate) fn adjust_quant_field(ac_strategy: &AcStrategyImage, quant_field: &mu
 /// reconcile the quant field. `(dc_group_px, dc_group_py)` is the DC group's
 /// top-left in absolute image pixels (so `opsin` can be the full image).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fill_ac_strategy(
+/// Max quant over a w×h block region (mirrors `adjust_quant_field`), scaled.
+#[inline]
+fn region_qac(quant_field: &ImageB, bx: usize, by: usize, w: usize, h: usize, scale: f32) -> f32 {
+    let mut q: u8 = 1;
+    for iy in 0..h {
+        for ix in 0..w {
+            q = q.max(quant_field.row(by + iy)[bx + ix]);
+        }
+    }
+    scale * q as f32
+}
+
+/// Run AC-strategy selection for block rows `by` in `[y_begin, y_end)` into
+/// `ac_strategy`, returning the accumulated DCT4X4 RD benefit for those rows.
+/// `ysize`/`xsize` are the *full* group dimensions: edge tests (`four_row`,
+/// loop bounds) use the global size, exactly as the serial loop would, so a
+/// 4-aligned `[y_begin, y_end)` partition reproduces the single-threaded
+/// decision sequence bit-for-bit. Reads `quant_field`/`opsin` only.
+#[allow(clippy::too_many_arguments)]
+fn select_band(
     opsin: &Image3F,
     dc_group_px: usize,
     dc_group_py: usize,
-    _distance: f32,
     scale: f32,
-    x_qm_scale: u32,
+    qm_mult_x: f32,
     matrices: &DequantMatrices,
-    quant_field: &mut ImageB,
+    quant_field: &ImageB,
     ac_strategy: &mut AcStrategyImage,
+    xsize: usize,
+    ysize: usize,
+    y_begin: usize,
+    y_end: usize,
 ) -> f32 {
-    let xsize = ac_strategy.xsize();
-    let ysize = ac_strategy.ysize();
-    let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
-
-    // Local helper: max quant over a w×h block region (mirrors `adjust_quant_field`).
-    let region_qac = |quant_field: &ImageB, bx: usize, by: usize, w: usize, h: usize| -> f32 {
-        let mut q: u8 = 1;
-        for iy in 0..h {
-            for ix in 0..w {
-                q = q.max(quant_field.row(by + iy)[bx + ix]);
-            }
-        }
-        scale * q as f32
-    };
-
-    let mut by = 0;
-    while by + 1 < ysize {
+    let mut by = y_begin;
+    while by + 1 < ysize && by < y_end {
         // A 4-block-tall band can host DCT32X32 only when 4-aligned and fitting.
-        let four_row = by % 4 == 0 && by + 4 <= ysize;
+        let four_row = by.is_multiple_of(4) && by + 4 <= ysize;
         let mut bx = 0;
         while bx + 1 < xsize {
             let four_col = bx % 4 == 0 && bx + 4 <= xsize;
             if four_row && four_col && ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32) {
-                // Two-level RD: first select the four 2×2 sub-blocks (committing)
-                // and accumulate their achieved cost, then compare against the
-                // single DCT32X32. If the big transform wins, overwrite.
                 let mut sub_total = 0.0f32;
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let sbx = bx + sx * 2;
                         let sby = by + sy * 2;
-                        let qac = region_qac(quant_field, sbx, sby, 2, 2);
+                        let qac = region_qac(quant_field, sbx, sby, 2, 2, scale);
                         sub_total += select_super_block(
                             opsin,
                             sbx,
@@ -557,7 +561,7 @@ pub(crate) fn fill_ac_strategy(
                         );
                     }
                 }
-                let qac32 = region_qac(quant_field, bx, by, 4, 4);
+                let qac32 = region_qac(quant_field, bx, by, 4, 4, scale);
                 let cost32 = strategy_cost(
                     STRATEGY_DCT32X32,
                     opsin,
@@ -568,15 +572,12 @@ pub(crate) fn fill_ac_strategy(
                     matrices,
                 );
                 if BIAS_32X32 * cost32 < sub_total {
-                    // set_first overwrites the four committed sub-block placements.
                     ac_strategy.set_first(bx, by, STRATEGY_DCT32X32);
                 }
                 bx += 4;
             } else if four_row {
-                // 4-tall band but this column can't be part of a 4×4 region: cover
-                // it with two stacked 2×2 super-blocks so no rows are skipped.
                 for sby in [by, by + 2] {
-                    let qac = region_qac(quant_field, bx, sby, 2, 2);
+                    let qac = region_qac(quant_field, bx, sby, 2, 2, scale);
                     select_super_block(
                         opsin,
                         bx,
@@ -591,8 +592,7 @@ pub(crate) fn fill_ac_strategy(
                 }
                 bx += 2;
             } else {
-                // 2-tall band (image bottom edge): single 2×2 super-block.
-                let qac = region_qac(quant_field, bx, by, 2, 2);
+                let qac = region_qac(quant_field, bx, by, 2, 2, scale);
                 select_super_block(
                     opsin,
                     bx,
@@ -610,14 +610,14 @@ pub(crate) fn fill_ac_strategy(
         by += if four_row { 4 } else { 2 };
     }
 
-    // DCT4X4 refinement
+    // DCT4X4 refinement for this row band.
     let mut benefit = 0.0f32;
-    for by in 0..ysize {
+    for by in y_begin..y_end {
         for bx in 0..xsize {
             if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
                 continue;
             }
-            let qac = region_qac(quant_field, bx, by, 1, 1);
+            let qac = region_qac(quant_field, bx, by, 1, 1, scale);
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
             let cost8 = strategy_cost(STRATEGY_DCT, opsin, px, py, qac, qm_mult_x, matrices);
@@ -628,6 +628,100 @@ pub(crate) fn fill_ac_strategy(
             }
         }
     }
+    benefit
+}
+
+/// Partition `[0, ysize)` into at most `n` contiguous bands whose interior
+/// boundaries are multiples of 4 (so DCT32X32's 4-block super-rows never span a
+/// boundary). The serial loop only ever takes non-4 (`+2`) steps at the image
+/// bottom, which lands wholly inside the final band — hence the partition
+/// reproduces the single-threaded `by` sequence exactly.
+fn selection_bands(ysize: usize, n: usize) -> Vec<(usize, usize)> {
+    let mut bounds = vec![0usize];
+    for k in 1..n {
+        let b = (ysize * k / n) / 4 * 4;
+        if b > *bounds.last().unwrap() && b < ysize {
+            bounds.push(b);
+        }
+    }
+    bounds.push(ysize);
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+pub(crate) fn fill_ac_strategy(
+    opsin: &Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
+    _distance: f32,
+    scale: f32,
+    x_qm_scale: u32,
+    matrices: &DequantMatrices,
+    quant_field: &mut ImageB,
+    ac_strategy: &mut AcStrategyImage,
+    num_threads: usize,
+) -> f32 {
+    let xsize = ac_strategy.xsize();
+    let ysize = ac_strategy.ysize();
+    let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
+
+    let bands = if num_threads > 1 && ysize >= 8 {
+        selection_bands(ysize, num_threads)
+    } else {
+        vec![(0, ysize)]
+    };
+
+    let benefit = if bands.len() <= 1 {
+        select_band(
+            opsin,
+            dc_group_px,
+            dc_group_py,
+            scale,
+            qm_mult_x,
+            matrices,
+            quant_field,
+            ac_strategy,
+            xsize,
+            ysize,
+            0,
+            ysize,
+        )
+    } else {
+        // Each band selects into its own fresh (default) strategy image, reading
+        // the shared opsin/quant_field; results merge deterministically by row.
+        let qf: &ImageB = quant_field;
+        let results: Vec<(AcStrategyImage, f32)> = std::thread::scope(|s| {
+            let handles: Vec<_> = bands
+                .iter()
+                .map(|&(y0, y1)| {
+                    s.spawn(move || {
+                        let mut local = AcStrategyImage::new(xsize, ysize);
+                        let b = select_band(
+                            opsin,
+                            dc_group_px,
+                            dc_group_py,
+                            scale,
+                            qm_mult_x,
+                            matrices,
+                            qf,
+                            &mut local,
+                            xsize,
+                            ysize,
+                            y0,
+                            y1,
+                        );
+                        (local, b)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut benefit = 0.0f32;
+        for (&(y0, y1), (local, b)) in bands.iter().zip(results.iter()) {
+            ac_strategy.copy_rows_from(local, y0, y1);
+            benefit += b;
+        }
+        benefit
+    };
 
     adjust_quant_field(ac_strategy, quant_field);
     benefit
