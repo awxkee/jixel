@@ -600,6 +600,105 @@ pub(crate) fn dct8x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct32x16_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
+    let mut after_col = [0.0f32; 512];
+    // Phase 1: 32-point column DCT over the 16 columns (8 columns per lane group).
+    for g in 0..2 {
+        let mut c = [_mm256_undefined_ps(); 32];
+        for r in 0..32 {
+            c[r] = unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) };
+        }
+        dct1d_32_flat(&mut c);
+        for v in 0..32 {
+            unsafe { _mm256_storeu_ps(after_col[v * 16 + g * 8..].as_mut_ptr(), c[v]) };
+        }
+    }
+    // Phase 2: 16-point row DCT over the 32 rows (lane = vertical-freq), stored
+    // transposed as output[u*32 + v].
+    let scale = _mm256_set1_ps(1.0 / 512.0);
+    for g in 0..4 {
+        let b = g * 8;
+        let mut c = [_mm256_undefined_ps(); 16];
+        for u in 0..16 {
+            c[u] = _mm256_set_ps(
+                after_col[(b + 7) * 16 + u],
+                after_col[(b + 6) * 16 + u],
+                after_col[(b + 5) * 16 + u],
+                after_col[(b + 4) * 16 + u],
+                after_col[(b + 3) * 16 + u],
+                after_col[(b + 2) * 16 + u],
+                after_col[(b + 1) * 16 + u],
+                after_col[b * 16 + u],
+            );
+        }
+        dct1d_16_flat(&mut c);
+        for u in 0..16 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 32 + b..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                )
+            };
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct16x32_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
+    let mut after_row = [0.0f32; 512];
+    // Phase 1: 32-point row DCT over the 16 rows (lane = row). after_row is
+    // stored hfreq-major: after_row[u*16 + row].
+    for g in 0..2 {
+        let b = g * 8;
+        let mut c = [_mm256_undefined_ps(); 32];
+        for u in 0..32 {
+            c[u] = _mm256_set_ps(
+                input[(b + 7) * 32 + u],
+                input[(b + 6) * 32 + u],
+                input[(b + 5) * 32 + u],
+                input[(b + 4) * 32 + u],
+                input[(b + 3) * 32 + u],
+                input[(b + 2) * 32 + u],
+                input[(b + 1) * 32 + u],
+                input[b * 32 + u],
+            );
+        }
+        dct1d_32_flat(&mut c);
+        for u in 0..32 {
+            unsafe { _mm256_storeu_ps(after_row[u * 16 + b..].as_mut_ptr(), c[u]) };
+        }
+    }
+    // Phase 2: 16-point column DCT over the 16 rows (lane = horizontal-freq),
+    // stored as output[v*32 + u].
+    let scale = _mm256_set1_ps(1.0 / 512.0);
+    for g in 0..4 {
+        let b = g * 8;
+        let mut c = [_mm256_undefined_ps(); 16];
+        for r in 0..16 {
+            c[r] = _mm256_set_ps(
+                after_row[(b + 7) * 16 + r],
+                after_row[(b + 6) * 16 + r],
+                after_row[(b + 5) * 16 + r],
+                after_row[(b + 4) * 16 + r],
+                after_row[(b + 3) * 16 + r],
+                after_row[(b + 2) * 16 + r],
+                after_row[(b + 1) * 16 + r],
+                after_row[b * 16 + r],
+            );
+        }
+        dct1d_16_flat(&mut c);
+        for v in 0..16 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[v * 32 + b..].as_mut_ptr(),
+                    _mm256_mul_ps(c[v], scale),
+                )
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     const ATOL: f32 = 1e-4;
@@ -674,6 +773,40 @@ mod tests {
             unsafe { dct32x32_avx2(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct32x16_avx2_vs_scalar_random() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct32x16_avx2;
+        use crate::dct::dct32x16_scalar;
+        for seed in 0u64..16 {
+            let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
+            let mut got = [0.0f32; 512];
+            let mut want = [0.0f32; 512];
+            unsafe { dct32x16_avx2(&input, &mut got) };
+            dct32x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct16x32_avx2_vs_scalar_random() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct16x32_avx2;
+        use crate::dct::dct16x32_scalar;
+        for seed in 0u64..16 {
+            let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
+            let mut got = [0.0f32; 512];
+            let mut want = [0.0f32; 512];
+            unsafe { dct16x32_avx2(&input, &mut got) };
+            dct16x32_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
     }
 

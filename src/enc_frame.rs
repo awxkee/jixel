@@ -153,7 +153,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
-        gab_enabled: distance > 1.412,
+        gab_enabled: false, //distance > 1.412,
     }
 }
 

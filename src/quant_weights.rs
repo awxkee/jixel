@@ -667,6 +667,12 @@ pub(crate) struct DequantMatrices {
     /// each row replicated to 2 rows of the 8×8 grid. Used for DCT4X8.
     pub(crate) matrix_4x8: [[f32; 64]; 3],
     pub(crate) inv_matrix_4x8: [[f32; 64]; 3],
+    /// DCT32X16 / DCT16X32 dequant matrix (512 floats per channel). Both
+    /// rectangular large transforms share these weights (libjxl
+    /// `QuantTable::DCT16X32`), computed at the normalized 16-row × 32-col
+    /// resolution so the same table applies to both orientations.
+    pub(crate) matrix_32x16: Box<[[f32; 512]; 3]>,
+    pub(crate) inv_matrix_32x16: Box<[[f32; 512]; 3]>,
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -753,6 +759,42 @@ static DCT32X32_BANDS: [[f32; 8]; 3] = [
 fn band_mult(v: f32) -> f32 {
     if v > 0.0 { 1.0 + v } else { 1.0 / (1.0 - v) }
 }
+
+static DCT16X32_BANDS: [[f32; 8]; 3] = [
+    // X
+    [
+        13844.97076442300573,
+        -0.97113799999999995,
+        -0.658,
+        -0.42026,
+        -0.22712,
+        -0.2206,
+        -0.226,
+        -0.6,
+    ],
+    // Y
+    [
+        4798.964084220744293,
+        -0.61125308982767057,
+        -0.83770786552491361,
+        -0.79014862079498627,
+        -0.2692727459704829,
+        -0.38272769465388551,
+        -0.22924222653091453,
+        -0.20719098826199578,
+    ],
+    // B
+    [
+        1807.236946760964614,
+        -1.2,
+        -1.2,
+        -0.7,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
 
 /// libjxl `DequantMatricesLibraryDef::DCT4X4()` parameters: 4 distance bands
 /// per channel (X, Y, B). The 4×4 radial weights are computed from these, then
@@ -930,6 +972,32 @@ fn compute_dct32x32_matrix() -> Box<[[f32; 1024]; 3]> {
     out
 }
 
+fn compute_dct32x16_matrix() -> Box<[[f32; 512]; 3]> {
+    const NUM_BANDS: usize = 8;
+    let mut out = Box::new([[0.0f32; 512]; 3]);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT16X32_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT16X32_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcprow = scale / 15.0; // ROWS = 16
+        let rcpcol = scale / 31.0; // COLS = 32
+        for y in 0..16 {
+            let dy = y as f32 * rcprow;
+            let dy2 = dy * dy;
+            for x in 0..32 {
+                let dx = x as f32 * rcpcol;
+                let dist = fmla(dx, dx, dy2).sqrt();
+                let weight = interpolate_vec_bands(dist, &bands);
+                out[c][y * 32 + x] = 1.0 / weight;
+            }
+        }
+    }
+    out
+}
+
 impl DequantMatrices {
     pub(crate) fn new() -> Self {
         let matrix = DEQUANT_MATRIX_8X8;
@@ -992,6 +1060,16 @@ impl DequantMatrices {
             }
         }
 
+        let matrix_32x16 = compute_dct32x16_matrix();
+        let mut inv_32x16 = Box::new([[0.0f32; 512]; 3]);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            for k in 1..512 {
+                inv_32x16[c][k] = 1.0 / matrix_32x16[c][k];
+            }
+        }
+
         Self {
             matrix,
             inv_matrix: inv,
@@ -1005,6 +1083,8 @@ impl DequantMatrices {
             inv_matrix_4x4: inv_4x4,
             matrix_4x8,
             inv_matrix_4x8: inv_4x8,
+            matrix_32x16,
+            inv_matrix_32x16: inv_32x16,
         }
     }
 
@@ -1065,6 +1145,16 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix_4x8(&self, c: usize) -> &[f32; 64] {
         &self.inv_matrix_4x8[c]
+    }
+    /// DCT32X16 / DCT16X32 dequant matrix (shared; 512 floats per channel).
+    #[inline]
+    pub(crate) fn matrix_32x16(&self, c: usize) -> &[f32; 512] {
+        &self.matrix_32x16[c]
+    }
+    /// DCT32X16 / DCT16X32 inverse dequant matrix (used during quantization).
+    #[inline]
+    pub(crate) fn inv_matrix_32x16(&self, c: usize) -> &[f32; 512] {
+        &self.inv_matrix_32x16[c]
     }
 }
 

@@ -29,16 +29,19 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::ac_context::{
-    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, K_COEFF_ORDER_32X32, block_context,
-    non_zero_context, zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
+    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, K_COEFF_ORDER_32X16,
+    K_COEFF_ORDER_32X32, block_context, non_zero_context, zero_density_context,
+    zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
+    STRATEGY_DCT32X32,
 };
 use crate::dct::{
-    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x32, dct4x4, dct4x8, dct8x4,
-    dct8x8, dct8x16, dct16x8, dct16x16, dct32x32,
+    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32, dc_from_dct32x16,
+    dc_from_dct32x32, dct4x4, dct4x8, dct8x4, dct8x8, dct8x16, dct16x8, dct16x16, dct16x32,
+    dct32x16, dct32x32,
 };
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -372,6 +375,26 @@ pub(crate) fn write_ac_group(
                         let tmp_64 = tmp.as_chunks::<64>().0;
                         dct8x4(&tmp_64[0], dst);
                     }
+                    STRATEGY_DCT32X16 => {
+                        for yy in 0..32 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 16..yy * 16 + 16]
+                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
+                        }
+                        let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
+                        let tmp_512 = tmp.as_chunks::<512>().0;
+                        dct32x16(&tmp_512[0], dst);
+                    }
+                    STRATEGY_DCT16X32 => {
+                        for yy in 0..16 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 32..yy * 32 + 32]
+                                .copy_from_slice(&row[opsin_bx..opsin_bx + 32]);
+                        }
+                        let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
+                        let tmp_512 = tmp.as_chunks::<512>().0;
+                        dct16x32(&tmp_512[0], dst);
+                    }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
             }
@@ -429,6 +452,26 @@ pub(crate) fn write_ac_group(
                         dc_vals[c][..16].copy_from_slice(&dc16);
                     }
                 }
+                STRATEGY_DCT32X16 => {
+                    // 8 DC values in a 4-row × 2-col grid (didx = iy*2 + ix),
+                    // matching cov_x=2, cov_y=4.
+                    for c in 0..3 {
+                        let cb: &[f32; 512] = (&coeffs[c][..512]).try_into().unwrap();
+                        let mut dc8 = [0.0f32; 8];
+                        dc_from_dct32x16(cb, &mut dc8);
+                        dc_vals[c][..8].copy_from_slice(&dc8);
+                    }
+                }
+                STRATEGY_DCT16X32 => {
+                    // 8 DC values in a 2-row × 4-col grid (didx = iy*4 + ix),
+                    // matching cov_x=4, cov_y=2.
+                    for c in 0..3 {
+                        let cb: &[f32; 512] = (&coeffs[c][..512]).try_into().unwrap();
+                        let mut dc8 = [0.0f32; 8];
+                        dc_from_dct16x32(cb, &mut dc8);
+                        dc_vals[c][..8].copy_from_slice(&dc8);
+                    }
+                }
                 _ => unreachable!(),
             }
 
@@ -462,6 +505,9 @@ pub(crate) fn write_ac_group(
                 }
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                 STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
+                    (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
+                }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
             quantize_roundtrip_y_block(
@@ -553,6 +599,18 @@ pub(crate) fn write_ac_group(
                     dc_from_dct32x32(xb, (&mut x_dc_post[..16]).try_into().unwrap());
                     dc_from_dct32x32(bb, (&mut b_dc_post[..16]).try_into().unwrap());
                 }
+                STRATEGY_DCT32X16 => {
+                    let xb: &[f32; 512] = (&coeffs[0][..512]).try_into().unwrap();
+                    let bb: &[f32; 512] = (&coeffs[2][..512]).try_into().unwrap();
+                    dc_from_dct32x16(xb, (&mut x_dc_post[..8]).try_into().unwrap());
+                    dc_from_dct32x16(bb, (&mut b_dc_post[..8]).try_into().unwrap());
+                }
+                STRATEGY_DCT16X32 => {
+                    let xb: &[f32; 512] = (&coeffs[0][..512]).try_into().unwrap();
+                    let bb: &[f32; 512] = (&coeffs[2][..512]).try_into().unwrap();
+                    dc_from_dct16x32(xb, (&mut x_dc_post[..8]).try_into().unwrap());
+                    dc_from_dct16x32(bb, (&mut b_dc_post[..8]).try_into().unwrap());
+                }
                 _ => unreachable!(),
             }
 
@@ -574,6 +632,7 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
                 _ => &matrices.inv_matrix_16x8(0)[..],
             };
             quantize_block_ac(
@@ -609,6 +668,7 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
                 _ => &matrices.inv_matrix_16x8(2)[..],
             };
             quantize_block_ac(
@@ -631,6 +691,7 @@ pub(crate) fn write_ac_group(
                 1 => 0,
                 2 => 1,
                 4 => 2,
+                8 => 3,
                 16 => 4,
                 _ => unreachable!("invalid covered_blocks {}", covered_blocks),
             };
@@ -648,6 +709,7 @@ pub(crate) fn write_ac_group(
                         STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => K_COEFF_ORDER_8X8[k] as usize,
                         STRATEGY_DCT16X16 => K_COEFF_ORDER_16X16[k] as usize,
                         STRATEGY_DCT32X32 => K_COEFF_ORDER_32X32[k] as usize,
+                        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => K_COEFF_ORDER_32X16[k] as usize,
                         _ => K_COEFF_ORDER_16X8[k] as usize,
                     }
                 };

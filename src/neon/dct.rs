@@ -444,9 +444,6 @@ pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
     }
 }
 
-/// Vectorized 32-point DCT-II over 8 lanes, mirroring scalar
-/// [`crate::dct::dct1d_32`]: even/odd split, recurse on two 16-point halves via
-/// [`dct1d_16_v`], then the odd-half combine.
 #[target_feature(enable = "neon")]
 fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
     let mut evens = [c[0]; 16];
@@ -497,7 +494,6 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
             }
         }
     }
-    // ── Row DCT: lane j = row g*8+j, vector index = column (strided gather). ──
     for g in 0..4 {
         let mut c = [zero; 32];
         for u in 0..32 {
@@ -660,6 +656,134 @@ pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     let b1 = output[8];
     output[0] = (b0 + b1) * 0.5;
     output[8] = (b0 - b1) * 0.5;
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
+    let zero = NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    };
+    let mut after_col = [0.0f32; 512];
+    for g in 0..2 {
+        let mut c = [zero; 32];
+        for r in 0..32 {
+            let p = unsafe { input.get_unchecked(r * 16 + g * 8..) };
+            c[r] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(p.as_ptr()) },
+                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
+            };
+        }
+        dct1d_32_v(&mut c);
+        for v in 0..32 {
+            let p = unsafe { after_col.get_unchecked_mut(v * 16 + g * 8..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), c[v].lo);
+                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+            }
+        }
+    }
+    let scale = 1.0 / 512.0;
+    for g in 0..4 {
+        let b = g * 8;
+        let mut c = [zero; 16];
+        for u in 0..16 {
+            let lanes = [
+                after_col[b * 16 + u],
+                after_col[(b + 1) * 16 + u],
+                after_col[(b + 2) * 16 + u],
+                after_col[(b + 3) * 16 + u],
+                after_col[(b + 4) * 16 + u],
+                after_col[(b + 5) * 16 + u],
+                after_col[(b + 6) * 16 + u],
+                after_col[(b + 7) * 16 + u],
+            ];
+            c[u] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
+                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            };
+        }
+        dct1d_16_v(&mut c);
+        for u in 0..16 {
+            let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
+                vst1q_f32(
+                    p.get_unchecked_mut(4..).as_mut_ptr(),
+                    vmulq_n_f32(c[u].hi, scale),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
+    let zero = NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    };
+    let mut after_row = [0.0f32; 512];
+    for g in 0..2 {
+        let b = g * 8;
+        let mut c = [zero; 32];
+        for u in 0..32 {
+            let lanes = [
+                input[b * 32 + u],
+                input[(b + 1) * 32 + u],
+                input[(b + 2) * 32 + u],
+                input[(b + 3) * 32 + u],
+                input[(b + 4) * 32 + u],
+                input[(b + 5) * 32 + u],
+                input[(b + 6) * 32 + u],
+                input[(b + 7) * 32 + u],
+            ];
+            c[u] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
+                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            };
+        }
+        dct1d_32_v(&mut c);
+        for u in 0..32 {
+            let p = unsafe { after_row.get_unchecked_mut(u * 16 + b..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), c[u].lo);
+                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[u].hi);
+            }
+        }
+    }
+    let scale = 1.0 / 512.0;
+    for g in 0..4 {
+        let b = g * 8;
+        let mut c = [zero; 16];
+        for r in 0..16 {
+            let lanes = [
+                after_row[b * 16 + r],
+                after_row[(b + 1) * 16 + r],
+                after_row[(b + 2) * 16 + r],
+                after_row[(b + 3) * 16 + r],
+                after_row[(b + 4) * 16 + r],
+                after_row[(b + 5) * 16 + r],
+                after_row[(b + 6) * 16 + r],
+                after_row[(b + 7) * 16 + r],
+            ];
+            c[r] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
+                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            };
+        }
+        dct1d_16_v(&mut c);
+        for v in 0..16 {
+            let p = unsafe { output.get_unchecked_mut(v * 32 + g * 8..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[v].lo, scale));
+                vst1q_f32(
+                    p.get_unchecked_mut(4..).as_mut_ptr(),
+                    vmulq_n_f32(c[v].hi, scale),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1073,6 +1197,36 @@ mod neon_dct_tests {
             unsafe { dct32x32_neon(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct32x16_neon_vs_scalar_random() {
+        use crate::dct::dct32x16_scalar;
+        use crate::neon::dct32x16_neon;
+        for seed in 0u64..16 {
+            let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
+            let mut got = [0.0f32; 512];
+            let mut want = [0.0f32; 512];
+            unsafe { dct32x16_neon(&input, &mut got) };
+            dct32x16_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct16x32_neon_vs_scalar_random() {
+        use crate::dct::dct16x32_scalar;
+        use crate::neon::dct16x32_neon;
+        for seed in 0u64..16 {
+            let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
+            let mut got = [0.0f32; 512];
+            let mut want = [0.0f32; 512];
+            unsafe { dct16x32_neon(&input, &mut got) };
+            dct16x32_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
     }
 

@@ -35,6 +35,6 @@ pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use dct::{
     dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2,
-    dct32x32_avx2,
+    dct16x32_avx2, dct32x16_avx2, dct32x32_avx2,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
