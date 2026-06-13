@@ -62,7 +62,7 @@ pub(crate) fn sse_and_rate_sse(
 ) -> (f32, usize, f32) {
     let n = width * height;
     assert!(coeff.len() >= n && inv_matrix.len() >= n);
-    debug_assert!(width % 4 == 0 && half % 4 == 0);
+    debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = _mm_set1_ps(q_scaled);
     let mut sse_acc = _mm_setzero_ps();

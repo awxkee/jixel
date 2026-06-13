@@ -29,15 +29,16 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::ac_context::{
-    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, block_context, non_zero_context,
-    zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
+    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, K_COEFF_ORDER_32X32, block_context,
+    non_zero_context, zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::dc_group_data::{
-    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
-    STRATEGY_DCT16X16,
+    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT8X16,
+    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
 };
 use crate::dct::{
-    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dct8x8, dct8x16, dct16x8, dct16x16,
+    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x32, dct4x4, dct8x8, dct8x16,
+    dct16x8, dct16x16, dct32x32,
 };
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Rect};
@@ -256,10 +257,11 @@ pub(crate) fn write_ac_group(
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
 
-    // Per-channel scratch sized for the largest transform (DCT16X16 = 2×2 blocks = 256 floats).
-    let mut coeffs = [[0.0f32; 256]; 3];
-    let mut quantized = [[0i32; 256]; 3];
-    let mut tmp = [0.0f32; 256];
+    // Per-channel scratch sized for the largest transform (DCT32X32 = 4×4
+    // blocks = 1024 floats).
+    let mut coeffs = [[0.0f32; 1024]; 3];
+    let mut quantized = [[0i32; 1024]; 3];
+    let mut tmp = [0.0f32; 1024];
 
     for by in 0..ysize_blocks {
         let nz_by = nzeros_by0 + by;
@@ -330,6 +332,25 @@ pub(crate) fn write_ac_group(
                         let tmp_256 = tmp.as_chunks::<256>().0;
                         dct16x16(&tmp_256[0], dst);
                     }
+                    STRATEGY_DCT32X32 => {
+                        for yy in 0..32 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 32..yy * 32 + 32]
+                                .copy_from_slice(&row[opsin_bx..opsin_bx + 32]);
+                        }
+                        let dst: &mut [f32; 1024] = (&mut coeffs[c][..1024]).try_into().unwrap();
+                        let tmp_1024 = tmp.as_chunks::<1024>().0;
+                        dct32x32(&tmp_1024[0], dst);
+                    }
+                    STRATEGY_DCT4X4 => {
+                        for yy in 0..8 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
+                        }
+                        let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
+                        let tmp_64 = tmp.as_chunks::<64>().0;
+                        dct4x4(&tmp_64[0], dst);
+                    }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
             }
@@ -338,9 +359,9 @@ pub(crate) fn write_ac_group(
             // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
             // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
             // indexing is didx = iy * cov_x + ix.
-            let mut dc_vals = [[0.0f32; 4]; 3];
+            let mut dc_vals = [[0.0f32; 16]; 3];
             match raw_strategy {
-                STRATEGY_DCT => {
+                STRATEGY_DCT | STRATEGY_DCT4X4 => {
                     for c in 0..3 {
                         dc_vals[c][0] = coeffs[c][0];
                     }
@@ -377,12 +398,22 @@ pub(crate) fn write_ac_group(
                         dc_vals[c][3] = dc4[3];
                     }
                 }
+                STRATEGY_DCT32X32 => {
+                    // dc_from_dct32x32 returns 16 DC values in the 4×4 grid the
+                    // caller uses (didx = iy * 4 + ix).
+                    for c in 0..3 {
+                        let cb: &[f32; 1024] = (&coeffs[c][..1024]).try_into().unwrap();
+                        let mut dc16 = [0.0f32; 16];
+                        dc_from_dct32x32(cb, &mut dc16);
+                        dc_vals[c][..16].copy_from_slice(&dc16);
+                    }
+                }
                 _ => unreachable!(),
             }
 
             // ---- Y channel: roundtrip-quantize, then place DC ----
             // DC for storage (per covered block, using pre-swap cov_x/cov_y).
-            let mut y_dc_q_arr = [[0i16; 2]; 2]; // [iy][ix] for max 2x2 — only iy*ix entries used
+            let mut y_dc_q_arr = [[0i16; 4]; 4]; // [iy][ix], up to 4×4 (DCT32X32)
             for iy in 0..cov_y {
                 let quant_target = &mut dc_data.quant_dc.plane_row_mut(1, global_by + iy)
                     [global_bx..global_bx + cov_x];
@@ -403,7 +434,9 @@ pub(crate) fn write_ac_group(
             // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
                 STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
+                STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
+                STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
             quantize_roundtrip_y_block(
@@ -456,10 +489,10 @@ pub(crate) fn write_ac_group(
                 }
             }
             // ---- Extract post-CfL X and B DC ----
-            let mut x_dc_post = [0.0f32; 4];
-            let mut b_dc_post = [0.0f32; 4];
+            let mut x_dc_post = [0.0f32; 16];
+            let mut b_dc_post = [0.0f32; 16];
             match raw_strategy {
-                STRATEGY_DCT => {
+                STRATEGY_DCT | STRATEGY_DCT4X4 => {
                     x_dc_post[0] = coeffs[0][0];
                     b_dc_post[0] = coeffs[2][0];
                 }
@@ -486,8 +519,14 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT16X16 => {
                     let xb: &[f32; 256] = (&coeffs[0][..256]).try_into().unwrap();
                     let bb: &[f32; 256] = (&coeffs[2][..256]).try_into().unwrap();
-                    dc_from_dct16x16(xb, &mut x_dc_post);
-                    dc_from_dct16x16(bb, &mut b_dc_post);
+                    dc_from_dct16x16(xb, (&mut x_dc_post[..4]).try_into().unwrap());
+                    dc_from_dct16x16(bb, (&mut b_dc_post[..4]).try_into().unwrap());
+                }
+                STRATEGY_DCT32X32 => {
+                    let xb: &[f32; 1024] = (&coeffs[0][..1024]).try_into().unwrap();
+                    let bb: &[f32; 1024] = (&coeffs[2][..1024]).try_into().unwrap();
+                    dc_from_dct32x32(xb, (&mut x_dc_post[..16]).try_into().unwrap());
+                    dc_from_dct32x32(bb, (&mut b_dc_post[..16]).try_into().unwrap());
                 }
                 _ => unreachable!(),
             }
@@ -505,7 +544,9 @@ pub(crate) fn write_ac_group(
             }
             let inv_qm_x: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
+                STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
+                STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
                 _ => &matrices.inv_matrix_16x8(0)[..],
             };
             quantize_block_ac(
@@ -536,7 +577,9 @@ pub(crate) fn write_ac_group(
             }
             let inv_qm_b: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],
+                STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
+                STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
                 _ => &matrices.inv_matrix_16x8(2)[..],
             };
             quantize_block_ac(
@@ -554,11 +597,12 @@ pub(crate) fn write_ac_group(
             // ---- Tokenize in order Y, X, B ----
             let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
             let covered_blocks = cx * cy;
-            // log2(covered_blocks): 0 for 1, 1 for 2 (16X8/8X16), 2 for 4 (16X16).
+            // log2(covered_blocks): 0/1/2/4 for 1/2/4/16 covered blocks.
             let log2_covered_blocks = match covered_blocks {
                 1 => 0,
                 2 => 1,
                 4 => 2,
+                16 => 4,
                 _ => unreachable!("invalid covered_blocks {}", covered_blocks),
             };
 
@@ -566,10 +610,16 @@ pub(crate) fn write_ac_group(
                 let full_block = &quantized[c][..size];
 
                 // Order is pass-independent (natural order, used_orders=0).
-                let order: &[u8] = match raw_strategy {
-                    STRATEGY_DCT => &K_COEFF_ORDER_8X8[..],
-                    STRATEGY_DCT16X16 => &K_COEFF_ORDER_16X16[..],
-                    _ => &K_COEFF_ORDER_16X8[..],
+                // DCT32X32 needs u16 indices, so resolve positions via a closure
+                // rather than a single &[u8] slice.
+                let order_pos = |k: usize| -> usize {
+                    match raw_strategy {
+                        STRATEGY_DCT => K_COEFF_ORDER_8X8[k] as usize,
+                        STRATEGY_DCT4X4 => K_COEFF_ORDER_8X8[k] as usize,
+                        STRATEGY_DCT16X16 => K_COEFF_ORDER_16X16[k] as usize,
+                        STRATEGY_DCT32X32 => K_COEFF_ORDER_32X32[k] as usize,
+                        _ => K_COEFF_ORDER_16X8[k] as usize,
+                    }
                 };
 
                 for pass in 0..coeff_shifts.len() {
@@ -578,7 +628,7 @@ pub(crate) fn write_ac_group(
                     // (sent_p << shift_p) over passes to recover `full_block`
                     // (jxl-vardct hf_coeff.rs:185,191). For 2 passes/shifts
                     // [s,0]: pass0 = C>>s, pass1 = C-((C>>s)<<s).
-                    let mut pblock = [0i32; 256];
+                    let mut pblock = [0i32; 1024];
                     for k in 0..size {
                         let mut remaining = full_block[k];
                         let mut sent = 0i32;
@@ -631,7 +681,7 @@ pub(crate) fn write_ac_group(
                     // Skip the first `covered_blocks` positions (LF).
                     let mut k = covered_blocks;
                     while k < size && remaining != 0 {
-                        let coef = block[order[k] as usize];
+                        let coef = block[order_pos(k)];
                         let ctx = histo_offset as usize
                             + if covered_blocks == 1 {
                                 zero_density_context_8x8(remaining as usize, k, prev)

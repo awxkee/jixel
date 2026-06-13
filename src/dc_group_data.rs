@@ -32,10 +32,13 @@ pub(crate) const STRATEGY_DCT: u8 = 0;
 pub(crate) const STRATEGY_DCT16X8: u8 = 1;
 pub(crate) const STRATEGY_DCT8X16: u8 = 2;
 pub(crate) const STRATEGY_DCT16X16: u8 = 3;
-pub(crate) const NUM_STRATEGIES: usize = 4;
+pub(crate) const STRATEGY_DCT32X32: u8 = 4;
+pub(crate) const STRATEGY_DCT4X4: u8 = 5;
+pub(crate) const NUM_STRATEGIES: usize = 6;
 
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
-pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [0, 6, 7, 4];
+/// DCT8=0, DCT16X16=4, DCT32X32=5, DCT16X8=6, DCT8X16=7, DCT4X4=3.
+pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [0, 6, 7, 4, 5, 3];
 
 const FIRST_BLOCK_BIT: u8 = 1;
 
@@ -81,14 +84,14 @@ impl AcStrategyImage {
 
     #[inline]
     pub(crate) fn covered_blocks_x_of(strategy: u8) -> usize {
-        // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2}
-        static LUT: [u8; NUM_STRATEGIES] = [1, 1, 2, 2];
+        // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1}
+        static LUT: [u8; NUM_STRATEGIES] = [1, 1, 2, 2, 4, 1];
         LUT[strategy as usize] as usize
     }
     #[inline]
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
-        // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2}
-        static LUT: [u8; NUM_STRATEGIES] = [1, 2, 1, 2];
+        // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1}
+        static LUT: [u8; NUM_STRATEGIES] = [1, 2, 1, 2, 4, 1];
         LUT[strategy as usize] as usize
     }
 
@@ -129,6 +132,18 @@ impl AcStrategyImage {
         if (y / GROUP) != ((y + cy - 1) / GROUP) {
             return false;
         }
+        // A multi-block transform must also stay within a single 8-block
+        // (64 px) tile, since `write_ac_group` processes one tile-tall stripe
+        // at a time. For 1×/2×-block transforms this is implied by the 2-block
+        // alignment of selection; for the 4×4 DCT32X32 it is the binding
+        // constraint.
+        const TILE: usize = 8;
+        if (x / TILE) != ((x + cx - 1) / TILE) {
+            return false;
+        }
+        if (y / TILE) != ((y + cy - 1) / TILE) {
+            return false;
+        }
         true
     }
 
@@ -163,6 +178,9 @@ pub(crate) struct DcGroupData {
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
     pub(crate) ytob_map: ImageSB,
+    /// Accumulated DCT4X4 RD benefit from `fill_ac_strategy`, used by the
+    /// frame-level activation gate. 0 until selection runs.
+    pub(crate) dct4x4_benefit: f32,
 }
 
 const TILE_DIM_IN_BLOCKS: usize = 8;
@@ -177,6 +195,7 @@ impl DcGroupData {
             ac_strategy: AcStrategyImage::new(xsize_blocks, ysize_blocks),
             ytox_map: ImageSB::new_fill(xtiles, ytiles, 0),
             ytob_map: ImageSB::new_fill(xtiles, ytiles, 0),
+            dct4x4_benefit: 0.0,
         }
     }
 }

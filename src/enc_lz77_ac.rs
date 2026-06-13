@@ -63,20 +63,37 @@ pub(crate) enum AcLz {
 
 /// Collapse runs of identical (context, value) AC tokens into back-references.
 pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
-    let mut out: Vec<AcLz> = Vec::with_capacity(tokens.len());
+    // Collapse runs of identical AC tokens into a literal + distance-1 back-ref.
+    //
+    // Runs are grouped by BOTH context and value (not value alone). This is the
+    // conservative choice: a run never spans a point where the per-coefficient
+    // context changes, so the LZ77 length symbol — which the decoder reads at the
+    // position right after the run's literal head — is always read with the same
+    // context it was coded on, and a run never crosses a block boundary (the
+    // nonzero-count token carries a different context than the coefficients).
+    //
+    // Zero-valued runs are deliberately NOT collapsed. A dense 32x32 block emits
+    // long stretches of zero coefficients in the high-frequency tail (its
+    // context buckets are 16-wide, `k >> 4`, versus 4-wide for 16x16), and
+    // back-referencing those zero runs desynced the libjxl decoder. Coding the
+    // zeros as plain literals (still efficiently entropy-coded by the
+    // zero-density context model) avoids that without affecting the far more
+    // valuable nonzero runs.
+    let n = tokens.len();
+    let mut out: Vec<AcLz> = Vec::with_capacity(n);
     let mut i = 0;
-    while i < tokens.len() {
+    while i < n {
         let t = tokens[i];
         out.push(AcLz::Lit {
             context: t.context,
             value: t.value,
         });
         let mut j = i + 1;
-        while j < tokens.len() && tokens[j].context == t.context && tokens[j].value == t.value {
+        while j < n && tokens[j].context == t.context && tokens[j].value == t.value {
             j += 1;
         }
         let run_extra = (j - i - 1) as u32; // copies after the first literal
-        if run_extra >= LZ77_MIN_LENGTH {
+        if run_extra >= LZ77_MIN_LENGTH && t.value != 0 {
             out.push(AcLz::Copy {
                 context: t.context,
                 length_value: run_extra - LZ77_MIN_LENGTH,

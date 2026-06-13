@@ -50,6 +50,11 @@ fn set_depth(idx: usize, pool: &[HuffmanNode], depth: &mut [u8], level: u8) {
     }
 }
 
+thread_local! {
+    static HT_POOL: std::cell::RefCell<Vec<HuffmanNode>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(crate) fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
     let length = data.len();
     debug_assert!(depth.len() >= length);
@@ -57,80 +62,84 @@ pub(crate) fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]
         *d = 0;
     }
 
-    let mut count_limit: u32 = 1;
-    loop {
-        let mut tree: Vec<HuffmanNode> = Vec::with_capacity(2 * length + 1);
+    HT_POOL.with(|cell| {
+        let tree = &mut *cell.borrow_mut();
+        let mut count_limit: u32 = 1;
+        loop {
+            tree.clear();
+            tree.reserve(2 * length + 1);
 
-        // Gather nonzero-count leaves in reverse order; stable sort keeps
-        // tie-breaking deterministic and matching libjxl.
-        for (i, &data) in data[..length].iter().enumerate().rev() {
-            if data != 0 {
-                let count = data.max(count_limit.saturating_sub(1));
-                tree.push(HuffmanNode {
-                    total_count: count,
-                    index_left: -1,
-                    index_right_or_value: i as i16,
-                });
-            }
-        }
-
-        let n = tree.len();
-        if n == 1 {
-            // Single symbol: placeholder depth. The simple-Huffman-tree fast
-            // path in the writer handles the actual emission.
-            depth[tree[0].index_right_or_value as usize] = 1;
-            return;
-        }
-
-        // Stable sort by ascending count.
-        tree.sort_by_key(|a| a.total_count);
-
-        tree.push(SENTINEL);
-        tree.push(SENTINEL);
-
-        let mut i = 0usize; // next leaf
-        let mut j = n + 1; // next internal node
-
-        // Build n - 1 internal nodes.
-        for _ in 0..(n - 1) {
-            let left;
-            if tree[i].total_count <= tree[j].total_count {
-                left = i;
-                i += 1;
-            } else {
-                left = j;
-                j += 1;
-            }
-            let right;
-            if tree[i].total_count <= tree[j].total_count {
-                right = i;
-                i += 1;
-            } else {
-                right = j;
-                j += 1;
+            // Gather nonzero-count leaves in reverse order; stable sort keeps
+            // tie-breaking deterministic and matching libjxl.
+            for (i, &data) in data[..length].iter().enumerate().rev() {
+                if data != 0 {
+                    let count = data.max(count_limit.saturating_sub(1));
+                    tree.push(HuffmanNode {
+                        total_count: count,
+                        index_left: -1,
+                        index_right_or_value: i as i16,
+                    });
+                }
             }
 
-            // Overwrite the trailing sentinel as the new parent.
-            let parent = tree.len() - 1;
-            tree[parent].total_count = tree[left].total_count + tree[right].total_count;
-            tree[parent].index_left = left as i16;
-            tree[parent].index_right_or_value = right as i16;
+            let n = tree.len();
+            if n == 1 {
+                // Single symbol: placeholder depth. The simple-Huffman-tree fast
+                // path in the writer handles the actual emission.
+                depth[tree[0].index_right_or_value as usize] = 1;
+                return;
+            }
 
-            // Replace the trailing sentinel for next iteration.
+            // Stable sort by ascending count.
+            tree.sort_by_key(|a| a.total_count);
+
             tree.push(SENTINEL);
+            tree.push(SENTINEL);
+
+            let mut i = 0usize; // next leaf
+            let mut j = n + 1; // next internal node
+
+            // Build n - 1 internal nodes.
+            for _ in 0..(n - 1) {
+                let left;
+                if tree[i].total_count <= tree[j].total_count {
+                    left = i;
+                    i += 1;
+                } else {
+                    left = j;
+                    j += 1;
+                }
+                let right;
+                if tree[i].total_count <= tree[j].total_count {
+                    right = i;
+                    i += 1;
+                } else {
+                    right = j;
+                    j += 1;
+                }
+
+                // Overwrite the trailing sentinel as the new parent.
+                let parent = tree.len() - 1;
+                tree[parent].total_count = tree[left].total_count + tree[right].total_count;
+                tree[parent].index_left = left as i16;
+                tree[parent].index_right_or_value = right as i16;
+
+                // Replace the trailing sentinel for next iteration.
+                tree.push(SENTINEL);
+            }
+            debug_assert_eq!(tree.len(), 2 * n + 1);
+
+            // Root is at 2n - 1.
+            set_depth(2 * n - 1, tree, depth, 0);
+
+            let max_depth = depth[..length].iter().copied().max().unwrap_or(0);
+            if max_depth <= tree_limit {
+                return;
+            }
+
+            count_limit = count_limit
+                .checked_mul(2)
+                .expect("huffman depth limit unreachable");
         }
-        debug_assert_eq!(tree.len(), 2 * n + 1);
-
-        // Root is at 2n - 1.
-        set_depth(2 * n - 1, &tree, depth, 0);
-
-        let max_depth = depth[..length].iter().copied().max().unwrap_or(0);
-        if max_depth <= tree_limit {
-            return;
-        }
-
-        count_limit = count_limit
-            .checked_mul(2)
-            .expect("huffman depth limit unreachable");
-    }
+    })
 }

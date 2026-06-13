@@ -31,5 +31,7 @@ mod dct;
 mod lossless_grad;
 
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use dct::{dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2};
+pub(crate) use dct::{
+    dct4x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct32x32_avx2,
+};
 pub(crate) use lossless_grad::grad_pack_interior;

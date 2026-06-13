@@ -29,7 +29,7 @@
 
 use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
-use crate::dc_group_data::DcGroupData;
+use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4};
 use crate::enc_group::write_ac_group;
 use crate::enc_xyb::to_xyb;
 use crate::encode_image::AlphaPlane;
@@ -313,6 +313,26 @@ fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
         tokens.push(Token::new(0, pack_signed(4)));
     }
     tokens
+}
+
+/// Real prefix-code bit cost of a DC group's AC-metadata token stream under a
+/// freshly optimized entropy code. Used by the DCT4X4 activation gate to weigh
+/// the meta-stream cost of the selected DCT4X4 blocks against their RD benefit.
+fn meta_entropy_cost(dc_data: &DcGroupData) -> u64 {
+    let toks = collect_ac_metadata_tokens(dc_data);
+    let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS);
+    let code = code_owned.as_ref();
+    let mut bits = 0u64;
+    for t in &toks {
+        let (tok, nbits, _b) = crate::entropy::uint_encode(t.value);
+        let pc = &code.prefix_codes[code.context_map[t.context as usize] as usize];
+        bits += if pc.single_symbol {
+            nbits as u64
+        } else {
+            pc.depths[tok as usize] as u64 + nbits as u64
+        };
+    }
+    bits
 }
 
 /// Build and emit the context tree.
@@ -844,7 +864,7 @@ fn process_dc_group(
         distp.distance,
         1.0 / distp.scale,
     );
-    crate::enc_ac_strategy::fill_ac_strategy(
+    dc_data.dct4x4_benefit = crate::enc_ac_strategy::fill_ac_strategy(
         opsin,
         dc_group_x0,
         dc_group_y0,
@@ -867,6 +887,43 @@ fn process_dc_group(
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
     );
+
+    // DCT4X4 activation gate. `fill_ac_strategy` greedily commits every block
+    // where DCT4X4 wins the per-block RD comparison, but a sparse set of DCT4X4
+    // blocks can disrupt the prefix-code clustering of the (otherwise nearly
+    // free) AC-strategy meta stream — most visibly the constant EPF context,
+    // which loses its zero-length codeword. Measure the *real* meta-token cost
+    // with the selected DCT4X4 blocks vs with them reverted to DCT8, and keep
+    // DCT4X4 only when the accumulated RD benefit covers the meta-cost increase
+    // (1 bit of rate contributes RD_LAMBDA to the cost). Done before
+    // `write_ac_group`, so the reverted strategy drives coefficient computation.
+    {
+        let mut positions: Vec<(usize, usize)> = Vec::new();
+        for y in 0..dc_data.ac_strategy.ysize() {
+            for x in 0..dc_data.ac_strategy.xsize() {
+                if dc_data.ac_strategy.is_first_block(x, y)
+                    && dc_data.ac_strategy.raw_strategy(x, y) == STRATEGY_DCT4X4
+                {
+                    positions.push((x, y));
+                }
+            }
+        }
+        if !positions.is_empty() {
+            let cost_with = meta_entropy_cost(&dc_data);
+            for &(x, y) in &positions {
+                dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT);
+            }
+            let cost_without = meta_entropy_cost(&dc_data);
+            let meta_delta = cost_with.saturating_sub(cost_without) as f32;
+            if dc_data.dct4x4_benefit > crate::enc_ac_strategy::RD_LAMBDA * meta_delta {
+                // Worth it: restore the DCT4X4 selection.
+                for &(x, y) in &positions {
+                    dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT4X4);
+                }
+            }
+            // else: leave reverted to DCT8.
+        }
+    }
 
     let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
     let mut pending: Vec<PendingAcGroup> = Vec::with_capacity(num_groups_here);

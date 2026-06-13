@@ -654,6 +654,15 @@ pub(crate) struct DequantMatrices {
     /// part of libjxl-tiny.
     pub(crate) matrix_16x16: [[f32; 256]; 3],
     pub(crate) inv_matrix_16x16: [[f32; 256]; 3],
+    /// 32×32 dequant matrix (1024 floats per channel). Generated at
+    /// construction time from the libjxl DCT32X32 polynomial parameters.
+    pub(crate) matrix_32x32: Box<[[f32; 1024]; 3]>,
+    pub(crate) inv_matrix_32x32: Box<[[f32; 1024]; 3]>,
+    /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
+    /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
+    /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
+    pub(crate) matrix_4x4: [[f32; 64]; 3],
+    pub(crate) inv_matrix_4x4: [[f32; 64]; 3],
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -695,6 +704,45 @@ static DCT16X16_BANDS: [[f32; 7]; 3] = [
     ],
 ];
 
+/// libjxl `DequantMatricesLibraryDef::DCT32X32()` parameters: 8 distance
+/// bands per channel (X, Y, B). Same format as [`DCT16X16_BANDS`]. Source:
+/// libjxl `lib/jxl/quant_weights.cc`.
+static DCT32X32_BANDS: [[f32; 8]; 3] = [
+    // X
+    [
+        15718.408_309_825_19,
+        -1.025,
+        -0.98,
+        -0.901_2,
+        -0.4,
+        -0.488_193_95,
+        -0.421_064,
+        -0.27,
+    ],
+    // Y
+    [
+        7305.763_681_069_598,
+        -0.804_195_82,
+        -0.763_303_65,
+        -0.556_603_8,
+        -0.497_853_05,
+        -0.436_995_93,
+        -0.401_808_67,
+        -0.273_216_83,
+    ],
+    // B
+    [
+        3803.531_737_212_15,
+        -3.060_733_6,
+        -2.041_327,
+        -2.023_565,
+        -0.549_538_95,
+        -0.4,
+        -0.4,
+        -0.3,
+    ],
+];
+
 /// libjxl band-step multiplicative helper. Positive → 1+v, negative → 1/(1-v).
 /// Matches `jxl::DequantMatricesLibrary::Mult` and jxl-rs `mult`.
 #[inline]
@@ -702,11 +750,22 @@ fn band_mult(v: f32) -> f32 {
     if v > 0.0 { 1.0 + v } else { 1.0 / (1.0 - v) }
 }
 
+/// libjxl `DequantMatricesLibraryDef::DCT4X4()` parameters: 4 distance bands
+/// per channel (X, Y, B). The 4×4 radial weights are computed from these, then
+/// each is replicated to a 2×2 cell of the 8×8 block. The `dct4multipliers`
+/// libjxl applies to the three 2×2-Hadamard DC positions are all 1.0, so they
+/// are a no-op and omitted here. Source: libjxl `lib/jxl/quant_weights.cc`.
+static DCT4X4_BANDS: [[f32; 4]; 3] = [
+    [2200.0, 0.0, 0.0, 0.0],
+    [392.0, 0.0, 0.0, 0.0],
+    [112.0, -0.25, -0.25, -0.5],
+];
+
 /// libjxl interpolation between band weights. The two surrounding band values
 /// `a`, `b` are interpolated geometrically (exponential) using the fractional
 /// scaled distance.
 #[inline]
-fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32; 7]) -> f32 {
+fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32]) -> f32 {
     let idx_f = scaled_pos.floor();
     let frac = scaled_pos - idx_f;
     let idx = idx_f as usize;
@@ -715,9 +774,43 @@ fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32; 7]) -> f32 {
     (b / a).powf(frac) * a
 }
 
-/// Reproduce libjxl `get_quant_weights(16, 16, params, out)` for the DCT16X16
-/// matrix: for each pixel position (y, x) within a 16×16 block, look up the
-/// quant weight along the radial scaled distance into the 7 polynomial bands.
+/// Reproduce libjxl's DCT4X4 quant table (`kQuantModeDCT4`): compute 4×4 radial
+/// weights via `GetQuantWeights(4, 4, bands, num_bands=4)`, then expand to the
+/// 8×8 block with `w8x8[y*8+x] = w4x4[(y/2)*4 + (x/2)]`. Returns inverse weights
+/// (matrix entry = 1/weight = step size), matching `DEQUANT_MATRIX_8X8`.
+fn compute_dct4x4_matrix() -> [[f32; 64]; 3] {
+    const NUM_BANDS: usize = 4;
+    let mut out = [[0.0f32; 64]; 3];
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT4X4_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT4X4_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 3.0; // (4 - 1)
+        // 4×4 radial weights.
+        let mut w4x4 = [0.0f32; 16];
+        for y in 0..4 {
+            let dy = y as f32 * rcp;
+            let dy2 = dy * dy;
+            for x in 0..4 {
+                let dx = x as f32 * rcp;
+                let dist = fmla(dx, dx, dy2).sqrt();
+                w4x4[y * 4 + x] = interpolate_vec_bands(dist, &bands);
+            }
+        }
+        // Expand each 4×4 weight to a 2×2 cell of the 8×8 grid; store 1/weight.
+        for y in 0..8 {
+            for x in 0..8 {
+                let w = w4x4[(y / 2) * 4 + (x / 2)];
+                out[c][y * 8 + x] = 1.0 / w;
+            }
+        }
+    }
+    out
+}
+
 /// Returns the inverse weights (so caller's matrix entry = 1/band-interp,
 /// matching the layout of `DEQUANT_MATRIX_8X8` etc).
 fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
@@ -742,6 +835,34 @@ fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
                 let weight = interpolate_vec_bands(dist, &bands);
                 // libjxl stores 1/weight as the matrix entry (step size).
                 out[c][y * 16 + x] = 1.0 / weight;
+            }
+        }
+    }
+    out
+}
+
+/// Reproduce libjxl `GetQuantWeights(32, 32, ...)` for the DCT32X32 matrix.
+/// Identical radial-band scheme as [`compute_dct16x16_matrix`] but with 8 bands
+/// over a 32×32 block. Returns a boxed table to keep it off the stack.
+fn compute_dct32x32_matrix() -> Box<[[f32; 1024]; 3]> {
+    const NUM_BANDS: usize = 8;
+    let mut out = Box::new([[0.0f32; 1024]; 3]);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT32X32_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT32X32_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 31.0;
+        for y in 0..32 {
+            let dy = y as f32 * rcp;
+            let dy2 = dy * dy;
+            for x in 0..32 {
+                let dx = x as f32 * rcp;
+                let dist = fmla(dx, dx, dy2).sqrt();
+                let weight = interpolate_vec_bands(dist, &bands);
+                out[c][y * 32 + x] = 1.0 / weight;
             }
         }
     }
@@ -780,6 +901,26 @@ impl DequantMatrices {
             }
         }
 
+        let matrix_32x32 = compute_dct32x32_matrix();
+        let mut inv_32x32 = Box::new([[0.0f32; 1024]; 3]);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            for k in 1..1024 {
+                inv_32x32[c][k] = 1.0 / matrix_32x32[c][k];
+            }
+        }
+
+        let matrix_4x4 = compute_dct4x4_matrix();
+        let mut inv_4x4 = [[0.0f32; 64]; 3];
+        for c in 0..3 {
+            // DC slot (index 0) zeroed (handled by the DC plane). For DCT4X4 the
+            // only LLF position is the DC; [1], [8], [9] are regular AC.
+            for k in 1..64 {
+                inv_4x4[c][k] = 1.0 / matrix_4x4[c][k];
+            }
+        }
+
         Self {
             matrix,
             inv_matrix: inv,
@@ -787,6 +928,10 @@ impl DequantMatrices {
             inv_matrix_16x8: inv_16x8,
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
+            matrix_32x32,
+            inv_matrix_32x32: inv_32x32,
+            matrix_4x4,
+            inv_matrix_4x4: inv_4x4,
         }
     }
 
@@ -817,6 +962,27 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix_16x16(&self, c: usize) -> &[f32; 256] {
         &self.inv_matrix_16x16[c]
+    }
+
+    /// 32×32 dequant matrix (1024 floats per channel).
+    #[inline]
+    pub(crate) fn matrix_32x32(&self, c: usize) -> &[f32; 1024] {
+        &self.matrix_32x32[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_32x32(&self, c: usize) -> &[f32; 1024] {
+        &self.inv_matrix_32x32[c]
+    }
+
+    /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid).
+    #[inline]
+    pub(crate) fn matrix_4x4(&self, c: usize) -> &[f32; 64] {
+        &self.matrix_4x4[c]
+    }
+    /// DCT4X4 inverse dequant matrix (used during quantization).
+    #[inline]
+    pub(crate) fn inv_matrix_4x4(&self, c: usize) -> &[f32; 64] {
+        &self.inv_matrix_4x4[c]
     }
 }
 
