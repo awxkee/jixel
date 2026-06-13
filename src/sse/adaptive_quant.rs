@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::adaptive_quant::K_AC_QUANT;
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
@@ -309,7 +310,11 @@ pub(crate) fn fill_quant_field(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = crate::adaptive_quant::K_AC_QUANT / distance.powf(0.7934);
+    let scale = if distance > 1.0 {
+        K_AC_QUANT / distance
+    } else {
+        K_AC_QUANT / distance.powf(0.7934)
+    };
 
     let region_px_w = xsize_blocks * 8;
     let region_px_h = ysize_blocks * 8;
