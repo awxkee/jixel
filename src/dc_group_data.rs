@@ -68,6 +68,16 @@ impl AcStrategyImage {
         self.ysize
     }
 
+    /// Copy block rows `y0..y1` from `src` into `self` (both must share
+    /// dimensions). Used to merge per-band selection results computed on
+    /// independent worker threads back into the group's strategy image.
+    pub(crate) fn copy_rows_from(&mut self, src: &AcStrategyImage, y0: usize, y1: usize) {
+        debug_assert_eq!(self.xsize, src.xsize);
+        let a = y0 * self.xsize;
+        let b = y1 * self.xsize;
+        self.cells[a..b].copy_from_slice(&src.cells[a..b]);
+    }
+
     #[inline]
     pub(crate) fn is_first_block(&self, x: usize, y: usize) -> bool {
         self.cells[y * self.xsize + x] & FIRST_BLOCK_BIT != 0

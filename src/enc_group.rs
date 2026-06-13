@@ -41,7 +41,7 @@ use crate::dct::{
     dct16x8, dct16x16, dct32x32,
 };
 use crate::entropy::{Token, pack_signed};
-use crate::image::{Image3B, Image3F, Rect};
+use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
 use crate::util::FastRound;
 
@@ -239,7 +239,10 @@ pub(crate) fn write_ac_group(
     scale: f32,
     scale_dc: f32,
     x_qm_scale: u32,
-    dc_data: &mut DcGroupData,
+    dc_data: &DcGroupData,
+    quant_dc: &mut Image3S,
+    qorigin_x: usize,
+    qorigin_y: usize,
     num_nzeros: &mut [Image3B],
     coeff_shifts: &[u32],
     out: &mut [Vec<Token>],
@@ -415,8 +418,9 @@ pub(crate) fn write_ac_group(
             // DC for storage (per covered block, using pre-swap cov_x/cov_y).
             let mut y_dc_q_arr = [[0i16; 4]; 4]; // [iy][ix], up to 4×4 (DCT32X32)
             for iy in 0..cov_y {
-                let quant_target = &mut dc_data.quant_dc.plane_row_mut(1, global_by + iy)
-                    [global_bx..global_bx + cov_x];
+                let lbx = global_bx - qorigin_x;
+                let quant_target =
+                    &mut quant_dc.plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let y_dc_q_target = &mut y_dc_q_arr[iy];
                 for (ix, (quant, dc_target)) in quant_target
                     .iter_mut()
@@ -533,8 +537,9 @@ pub(crate) fn write_ac_group(
 
             // ---- X channel: write post-CfL DC, quantize AC ----
             for iy in 0..cov_y {
-                let quant_dc_row = &mut dc_data.quant_dc.plane_row_mut(0, global_by + iy)
-                    [global_bx..global_bx + cov_x];
+                let lbx = global_bx - qorigin_x;
+                let quant_dc_row =
+                    &mut quant_dc.plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 for (ix, target_quant) in quant_dc_row.iter_mut().enumerate() {
                     let didx = iy * cov_x + ix;
                     // base_correlation_x = 0 so no Y contribution to X DC store.
@@ -563,8 +568,9 @@ pub(crate) fn write_ac_group(
 
             // ---- B channel: write CfL'd DC, quantize AC ----
             for iy in 0..cov_y {
-                let quant_dc_row = &mut dc_data.quant_dc.plane_row_mut(2, global_by + iy)
-                    [global_bx..global_bx + cov_x];
+                let lbx = global_bx - qorigin_x;
+                let quant_dc_row =
+                    &mut quant_dc.plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let y_dc_q_row = &y_dc_q_arr[iy];
                 for (ix, (quant_target, &dc_val)) in
                     quant_dc_row.iter_mut().zip(y_dc_q_row.iter()).enumerate()

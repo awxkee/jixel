@@ -9,7 +9,9 @@
 // use image::imageops::FilterType;
 use jixel::{ColorEncoding, ColorSpace, EncodeConfig, FlMeta};
 use std::fs;
+use std::num::NonZero;
 use std::path::Path;
+use std::thread::available_parallelism;
 use std::time::Instant;
 
 fn main() {
@@ -32,7 +34,12 @@ fn main() {
             &EncodeConfig::default()
                 .with_lossless(false)
                 .with_quality(90.)
-                .with_progressive(false),
+                .with_progressive(false)
+                .with_num_threads(
+                    available_parallelism()
+                        .unwrap_or(NonZero::new(1).unwrap())
+                        .get(),
+                ),
             // .with_icc_profile(display_p3.to_vec()),
         )
         .unwrap();
