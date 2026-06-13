@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16};
+use crate::dct::{WC4, WC8, WC16, WC32};
 use std::arch::aarch64::*;
 
 #[derive(Clone, Copy)]
@@ -444,6 +444,168 @@ pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
     }
 }
 
+/// Vectorized 32-point DCT-II over 8 lanes, mirroring scalar
+/// [`crate::dct::dct1d_32`]: even/odd split, recurse on two 16-point halves via
+/// [`dct1d_16_v`], then the odd-half combine.
+#[target_feature(enable = "neon")]
+fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
+    let mut evens = [c[0]; 16];
+    let mut odds = [c[0]; 16];
+    for i in 0..16 {
+        evens[i] = c[i].add(c[31 - i]);
+        odds[i] = c[i].sub(c[31 - i]).muls(WC32[i]);
+    }
+    dct1d_16_v(&mut evens);
+    dct1d_16_v(&mut odds);
+    odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
+    for i in 1..15 {
+        odds[i] = odds[i].add(odds[i + 1]);
+    }
+    for i in 0..16 {
+        c[2 * i] = evens[i];
+        c[2 * i + 1] = odds[i];
+    }
+}
+
+/// Forward 32×32 DCT (NEON), bit-identical layout/scale to
+/// [`crate::dct::dct32x32_scalar`]: column DCTs (8 columns per group, loaded
+/// contiguously by row), then row DCTs (8 rows per group, strided gather),
+/// scaled by 1/1024, output stored transposed as `output[u*32 + v]`.
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
+    let zero = NeonDoubledVector {
+        lo: vdupq_n_f32(0.0),
+        hi: vdupq_n_f32(0.0),
+    };
+    let mut after_col = [0.0f32; 1024];
+    // ── Column DCT: lane j = column g*8+j, vector index = row. ──
+    for g in 0..4 {
+        let mut c = [zero; 32];
+        for r in 0..32 {
+            let p = unsafe { input.get_unchecked(r * 32 + g * 8..) };
+            c[r] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(p.as_ptr()) },
+                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
+            };
+        }
+        dct1d_32_v(&mut c);
+        for v in 0..32 {
+            let p = unsafe { after_col.get_unchecked_mut(v * 32 + g * 8..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), c[v].lo);
+                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+            }
+        }
+    }
+    // ── Row DCT: lane j = row g*8+j, vector index = column (strided gather). ──
+    for g in 0..4 {
+        let mut c = [zero; 32];
+        for u in 0..32 {
+            let b = g * 8;
+            let lanes = [
+                after_col[b * 32 + u],
+                after_col[(b + 1) * 32 + u],
+                after_col[(b + 2) * 32 + u],
+                after_col[(b + 3) * 32 + u],
+                after_col[(b + 4) * 32 + u],
+                after_col[(b + 5) * 32 + u],
+                after_col[(b + 6) * 32 + u],
+                after_col[(b + 7) * 32 + u],
+            ];
+            c[u] = NeonDoubledVector {
+                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
+                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            };
+        }
+        dct1d_32_v(&mut c);
+        let scale = 1.0 / 1024.0;
+        for u in 0..32 {
+            // c[u].lane[j] = row-DCT freq u for row g*8+j; output is transposed.
+            let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
+            unsafe {
+                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
+                vst1q_f32(
+                    p.get_unchecked_mut(4..).as_mut_ptr(),
+                    vmulq_n_f32(c[u].hi, scale),
+                );
+            }
+        }
+    }
+}
+
+/// 4-point DCT-II over 4 lanes (one per 4×4 quadrant), mirroring scalar
+/// [`crate::dct::dct1d_4`].
+#[target_feature(enable = "neon")]
+fn dct1d_4_q(c: &mut [float32x4_t; 4]) {
+    let t0 = vaddq_f32(c[0], c[3]);
+    let t1 = vaddq_f32(c[1], c[2]);
+    let sum = vaddq_f32(t0, t1);
+    let diff = vsubq_f32(t0, t1);
+    let t2 = vmulq_n_f32(vsubq_f32(c[0], c[3]), WC4[0]);
+    let t3 = vmulq_n_f32(vsubq_f32(c[1], c[2]), WC4[1]);
+    let t2p = vaddq_f32(t2, t3);
+    let t3p = vsubq_f32(t2, t3);
+    let t2pp = vfmaq_n_f32(t3p, t2p, std::f32::consts::SQRT_2);
+    c[0] = sum;
+    c[1] = t2pp;
+    c[2] = diff;
+    c[3] = t3p;
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+    // Gather q[r*4+c].lane[k] = input[(qy*4+r)*8 + (qx*4+c)], k = qy*2+qx.
+    let mut q = [vdupq_n_f32(0.0); 16];
+    for r in 0..4 {
+        for col in 0..4 {
+            let lanes = [
+                input[r * 8 + col],             // k=0 (qy0,qx0)
+                input[r * 8 + (4 + col)],       // k=1 (qy0,qx1)
+                input[(4 + r) * 8 + col],       // k=2 (qy1,qx0)
+                input[(4 + r) * 8 + (4 + col)], // k=3 (qy1,qx1)
+            ];
+            q[r * 4 + col] = unsafe { vld1q_f32(lanes.as_ptr()) };
+        }
+    }
+    // Row DCT.
+    for r in 0..4 {
+        let mut row = [q[r * 4], q[r * 4 + 1], q[r * 4 + 2], q[r * 4 + 3]];
+        dct1d_4_q(&mut row);
+        for col in 0..4 {
+            q[r * 4 + col] = row[col];
+        }
+    }
+    // Column DCT (×1/16) → d[x*4+i] = colDCT freq i of column x.
+    let mut d = [[0.0f32; 4]; 16];
+    for col in 0..4 {
+        let mut cc = [q[col], q[4 + col], q[8 + col], q[12 + col]];
+        dct1d_4_q(&mut cc);
+        for i in 0..4 {
+            unsafe { vst1q_f32(d[col * 4 + i].as_mut_ptr(), vmulq_n_f32(cc[i], 1.0 / 16.0)) };
+        }
+    }
+    // Scatter d[iy*4+ix].lane[k] → output[(qy+iy*2)*8 + (qx+ix*2)].
+    for iy in 0..4 {
+        for ix in 0..4 {
+            let dd = &d[iy * 4 + ix];
+            for k in 0..4 {
+                let qy = k / 2;
+                let qx = k % 2;
+                output[(qy + iy * 2) * 8 + (qx + ix * 2)] = dd[k];
+            }
+        }
+    }
+    // 2×2 Hadamard on the four sub-DCs.
+    let b00 = output[0];
+    let b01 = output[1];
+    let b10 = output[8];
+    let b11 = output[9];
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
 #[cfg(test)]
 mod neon_dct_tests {
     use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
@@ -810,6 +972,36 @@ mod neon_dct_tests {
             unsafe { dct16x16_neon(&input, &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct32x32_neon_vs_scalar_random() {
+        use crate::dct::dct32x32_scalar;
+        use crate::neon::dct32x32_neon;
+        for seed in 0u64..16 {
+            let input: [f32; 1024] = fill(seed.wrapping_add(0x3232));
+            let mut got = [0.0f32; 1024];
+            let mut want = [0.0f32; 1024];
+            unsafe { dct32x32_neon(&input, &mut got) };
+            dct32x32_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct4x4_neon_vs_scalar_random() {
+        use crate::dct::dct4x4_scalar;
+        use crate::neon::dct4x4_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed.wrapping_add(0x4a4));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct4x4_neon(&input, &mut got) };
+            dct4x4_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
         }
     }
 

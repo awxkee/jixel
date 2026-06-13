@@ -455,6 +455,117 @@ pub(crate) fn dc_from_dct16x16(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
     dc[3] = r01 - r11; // bottom-right
 }
 
+fn dct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
+    let mut tmp = [0.0f32; 16];
+    for r in 0..4 {
+        let mut row = [
+            input[r * 4],
+            input[r * 4 + 1],
+            input[r * 4 + 2],
+            input[r * 4 + 3],
+        ];
+        dct1d_4(&mut row);
+        tmp[r * 4..r * 4 + 4].copy_from_slice(&row);
+    }
+    for x in 0..4 {
+        let mut col = [tmp[x], tmp[4 + x], tmp[8 + x], tmp[12 + x]];
+        dct1d_4(&mut col);
+        for i in 0..4 {
+            output[x * 4 + i] = col[i] * (1.0 / 16.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn idct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
+    // Forward did: tmp = rowDCT(input); output[x*4+i] = colDCT(tmp col x)[i]/16.
+    // Since idct1d_4 ∘ dct1d_4 = 4·I, the forward's 1/16 cancels the two inverse
+    // transforms' 4·4, so no extra scaling is needed here.
+    let mut tmp = [0.0f32; 16];
+    for x in 0..4 {
+        let col_in = [
+            input[x * 4],
+            input[x * 4 + 1],
+            input[x * 4 + 2],
+            input[x * 4 + 3],
+        ];
+        let col = idct1d_4(col_in);
+        for i in 0..4 {
+            tmp[i * 4 + x] = col[i];
+        }
+    }
+    for r in 0..4 {
+        let row_in: [f32; 4] = [tmp[r * 4], tmp[r * 4 + 1], tmp[r * 4 + 2], tmp[r * 4 + 3]];
+        let row = idct1d_4(row_in);
+        output[r * 4..r * 4 + 4].copy_from_slice(&row);
+    }
+}
+
+static DCT_METHOD_4X4: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+
+fn select_dct_4x4() -> Arc<DctFn<64>> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            use crate::neon::dct4x4_neon;
+            return Arc::new(|input, output| unsafe {
+                dct4x4_neon(input, output);
+            });
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct4x4_avx2(input, output);
+            });
+        }
+    }
+
+    Arc::new(|input, output| {
+        dct4x4_scalar(input, output);
+    })
+}
+
+pub(crate) fn dct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
+    DCT_METHOD_4X4.get_or_init(select_dct_4x4)(input, output);
+}
+
+/// Forward DCT4X4 (libjxl `Type::DCT4X4`): four 4×4 DCTs on the quadrants,
+/// interleaved into the 8×8 grid as `coeff[(qy + iy*2)*8 + (qx + ix*2)]`, then a
+/// 2×2 Hadamard over the four sub-block DCs at positions [0], [1], [8], [9].
+/// Covered blocks = 1 (a single 8×8 footprint). Pairs with `K_COEFF_ORDER_8X8`.
+pub(crate) fn dct4x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    for qy in 0..2 {
+        for qx in 0..2 {
+            let mut blk = [0.0f32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    blk[r * 4 + c] = input[(qy * 4 + r) * 8 + (qx * 4 + c)];
+                }
+            }
+            let mut d = [0.0f32; 16];
+            dct4x4_2d(&blk, &mut d);
+            for iy in 0..4 {
+                for ix in 0..4 {
+                    output[(qy + iy * 2) * 8 + (qx + ix * 2)] = d[iy * 4 + ix];
+                }
+            }
+        }
+    }
+    // 2×2 Hadamard on the four sub-DCs (block00=coeff[0], 01=[1], 10=[8], 11=[9]).
+    let b00 = output[0];
+    let b01 = output[1];
+    let b10 = output[8];
+    let b11 = output[9];
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
 /// `WcMultipliers<32>` = 1/(2·cos((2i+1)·π/64)), i = 0..16. Same source/role as
 /// [`WC16`], extended to the 32-point recursion. From libjxl `dct_scales.h`.
 pub(crate) const WC32: [f32; 16] = [
@@ -504,6 +615,26 @@ pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
 static DCT_METHOD_32X32: OnceLock<Arc<DctFn<1024>>> = OnceLock::new();
 
 fn select_dct_32x32() -> Arc<DctFn<1024>> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            use crate::neon::dct32x32_neon;
+            return Arc::new(|input, output| unsafe {
+                dct32x32_neon(input, output);
+            });
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct32x32_avx2(input, output);
+            });
+        }
+    }
+
     Arc::new(|input, output| {
         dct32x32_scalar(input, output);
     })
@@ -531,7 +662,9 @@ pub(crate) fn dct32x32_scalar(input: &[f32; 1024], output: &mut [f32; 1024]) {
 
     let scale = 1.0 / 1024.0;
     for v in 0..32 {
-        let row: &mut [f32; 32] = (&mut after_col_dct[v * 32..v * 32 + 32]).try_into().unwrap();
+        let row: &mut [f32; 32] = (&mut after_col_dct[v * 32..v * 32 + 32])
+            .try_into()
+            .unwrap();
         dct1d_32(row);
         for u in 0..32 {
             output[u * 32 + v] = row[u] * scale;
@@ -541,12 +674,7 @@ pub(crate) fn dct32x32_scalar(input: &[f32; 1024], output: &mut [f32; 1024]) {
 
 /// `DCTResampleScales<32, 4>` from libjxl `dct_scales.h`. Used to rescale the
 /// lowest 4×4 frequencies before the 4-point IDCT in [`dc_from_dct32x32`].
-const RESAMPLE_SCALE_32_TO_4: [f32; 4] = [
-    1.0,
-    0.974_886_8,
-    0.901_764_2,
-    0.787_054_9,
-];
+const RESAMPLE_SCALE_32_TO_4: [f32; 4] = [1.0, 0.974_886_8, 0.901_764_2, 0.787_054_9];
 
 /// libjxl `IDCT1DImpl<4>` (unnormalized 4-point inverse DCT), out-of-place.
 /// Used only by [`dc_from_dct32x32`] to invert the lowest frequencies into the
@@ -611,6 +739,70 @@ pub(crate) fn dc_from_dct32x32(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn idct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
+        let mut coeff = *input;
+        // Undo the 2×2 Hadamard: H is self-inverse up to scale (forward used ×0.25,
+        // so the inverse is the plain Hadamard ×1).
+        let c0 = coeff[0];
+        let c1 = coeff[1];
+        let c8 = coeff[8];
+        let c9 = coeff[9];
+        coeff[0] = c0 + c1 + c8 + c9; // b00
+        coeff[1] = c0 + c1 - c8 - c9; // b01
+        coeff[8] = c0 - c1 + c8 - c9; // b10
+        coeff[9] = c0 - c1 - c8 + c9; // b11
+        for qy in 0..2 {
+            for qx in 0..2 {
+                let mut d = [0.0f32; 16];
+                for iy in 0..4 {
+                    for ix in 0..4 {
+                        d[iy * 4 + ix] = coeff[(qy + iy * 2) * 8 + (qx + ix * 2)];
+                    }
+                }
+                let mut px = [0.0f32; 16];
+                idct4x4_2d(&d, &mut px);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        output[(qy * 4 + r) * 8 + (qx * 4 + c)] = px[r * 4 + c];
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dct4x4_idct4x4_round_trips() {
+        // dct4x4 followed by idct4x4 must recover the original 8×8 pixels.
+        let mut input = [0.0f32; 64];
+        for (i, v) in input.iter_mut().enumerate() {
+            // A non-separable, non-symmetric pattern so a transpose bug would show.
+            *v = ((i * 37 % 53) as f32) - 25.0 + (i as f32) * 0.13;
+        }
+        let mut coeff = [0.0f32; 64];
+        dct4x4(&input, &mut coeff);
+        let mut recon = [0.0f32; 64];
+        idct4x4(&coeff, &mut recon);
+        for (a, b) in input.iter().zip(recon.iter()) {
+            assert!((a - b).abs() < 1e-3, "round-trip mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn dct4x4_dc_is_block_mean() {
+        // coeff[0] after the 2×2 Hadamard is the overall block mean (the DC the
+        // decoder pulls out via dc[0] = coeff[0]).
+        let input = [3.5f32; 64];
+        let mut coeff = [0.0f32; 64];
+        dct4x4(&input, &mut coeff);
+        assert!((coeff[0] - 3.5).abs() < 1e-4, "DC {} != 3.5", coeff[0]);
+        // A flat block has no AC energy.
+        for (i, &c) in coeff.iter().enumerate() {
+            if i != 0 {
+                assert!(c.abs() < 1e-3, "coeff[{i}] = {c} should be ~0");
+            }
+        }
+    }
 
     #[test]
     fn dct1d_32_diagonalizes_dct_basis() {
