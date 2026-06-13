@@ -62,7 +62,6 @@ pub enum EncodeError {
     Unsupported(&'static str),
     BadChannelCount(usize),
     BadBitDepth(u32),
-    BadOrientation(u8),
     IccNotSupported,
     SizeOverflow,
     InputLength {
@@ -106,7 +105,6 @@ impl fmt::Display for EncodeError {
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             Self::BadChannelCount(n) => write!(f, "channel count {} not in 1..=4", n),
             Self::BadBitDepth(b) => write!(f, "bits_per_sample {} not in 1..=16", b),
-            Self::BadOrientation(o) => write!(f, "orientation {} not in 1..=8", o),
             Self::IccNotSupported => write!(
                 f,
                 "embedded ICC not yet supported; use an enumerated colour space"

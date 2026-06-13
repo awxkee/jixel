@@ -28,7 +28,9 @@
  */
 #![allow(clippy::explicit_counter_loop)]
 
-use crate::{ColorSpace, EncodeError, Primaries, RenderingIntent, TransferFunction, WhitePoint};
+use crate::{
+    ColorSpace, EncodeError, Orientation, Primaries, RenderingIntent, TransferFunction, WhitePoint,
+};
 
 const K_NUM_RAW_SYMBOLS: usize = 19;
 const K_NUM_LZ77: usize = 33;
@@ -48,8 +50,8 @@ static TOC_BITS: [u32; 4] = [12, 16, 24, 32];
 pub struct FlMeta {
     /// Whether colour channels are premultiplied by alpha.
     pub alpha_premultiplied: bool,
-    /// EXIF-style orientation, 1..=8 (1 = identity).
-    pub orientation: u8,
+    /// Image orientation (default [`Orientation::Normal`]).
+    pub orientation: Orientation,
     pub white_point: WhitePoint,
     pub primaries: Primaries,
     pub transfer: TransferFunction,
@@ -66,7 +68,7 @@ impl Default for FlMeta {
     fn default() -> Self {
         Self {
             alpha_premultiplied: false,
-            orientation: 1,
+            orientation: Orientation::Normal,
             white_point: WhitePoint::D65,
             primaries: Primaries::Bt709,
             transfer: TransferFunction::Srgb,
@@ -762,7 +764,7 @@ fn prepare_header(
     gsizes: &[usize],
 ) {
     let have_alpha = nb == 2 || nb == 4;
-    let extra_fields = m.orientation != 1 || m.intrinsic_size.is_some();
+    let extra_fields = m.orientation != Orientation::Normal || m.intrinsic_size.is_some();
     o.write(16, 0x0AFF);
     o.write(1, 0);
     wsz(o, h);
@@ -771,7 +773,7 @@ fn prepare_header(
     o.write(1, 0); // ImageMetadata all_default = 0
     if extra_fields {
         o.write(1, 1); // extra_fields = 1
-        o.write(3, (m.orientation as u64) - 1); // orientation = 1 + u(3)
+        o.write(3, m.orientation.to_u3()); // orientation = 1 + u(3)
         if let Some((iw, ih)) = m.intrinsic_size {
             o.write(1, 1); // have_intr_size
             o.write(1, 0);
@@ -960,15 +962,12 @@ fn color_channels(cs: ColorSpace) -> Result<usize, EncodeError> {
 }
 
 /// Shared validation. Returns the sample count (`w * h * nb`) on success.
-fn validate(w: usize, h: usize, nb: usize, meta: &FlMeta) -> Result<usize, EncodeError> {
+fn validate(w: usize, h: usize, nb: usize, _meta: &FlMeta) -> Result<usize, EncodeError> {
     if w == 0 || h == 0 {
         return Err(EncodeError::EmptyImage);
     }
     if !(1..=4).contains(&nb) {
         return Err(EncodeError::BadChannelCount(nb));
-    }
-    if !(1..=8).contains(&meta.orientation) {
-        return Err(EncodeError::BadOrientation(meta.orientation));
     }
     const MAX_DIM: usize = 1 << 30; // JXL spec per-axis limit
     if w > MAX_DIM || h > MAX_DIM {
@@ -1196,16 +1195,6 @@ mod tests {
             Err(EncodeError::UnsupportedColorSpace(ColorSpace::Unknown))
         ));
     }
-    #[test]
-    fn rejects_bad_orientation() {
-        let img = ramp8(10, 10, 3);
-        let mut m = FlMeta::srgb();
-        m.orientation = 9;
-        assert!(matches!(
-            encode_fast_lossless(&img, 10, 10, Rgb, false, &m),
-            Err(EncodeError::BadOrientation(9))
-        ));
-    }
 
     #[test]
     fn accepts_embedded_icc() {
@@ -1267,7 +1256,16 @@ mod tests {
     fn encodes_8bit_metadata_variants() {
         let img = ramp8(48, 48, 3);
         let mut metas = vec![FlMeta::srgb(), FlMeta::linear(), FlMeta::display_p3()];
-        for o in 1u8..=8 {
+        for o in [
+            Orientation::Normal,
+            Orientation::FlipH,
+            Orientation::Rotate180,
+            Orientation::FlipV,
+            Orientation::Transpose,
+            Orientation::Rotate90,
+            Orientation::Transverse,
+            Orientation::Rotate270,
+        ] {
             let mut m = FlMeta::srgb();
             m.orientation = o;
             metas.push(m);

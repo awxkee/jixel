@@ -29,8 +29,10 @@
 use anyhow::{Context, Result, bail};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::available_parallelism;
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
 
@@ -177,7 +179,13 @@ fn bench_jixel(
     stem: &str,
     npx: f64,
 ) -> Result<Point> {
-    let cfg = jixel::EncodeConfig::default().with_distance(d);
+    let cfg = jixel::EncodeConfig::default()
+        .with_distance(d)
+        .with_num_threads(
+            available_parallelism()
+                .unwrap_or(NonZero::new(1).unwrap())
+                .get(),
+        );
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));

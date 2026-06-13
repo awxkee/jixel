@@ -26,10 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+mod ac_strategy;
 mod adaptive_quant;
 mod dct;
 mod lossless_grad;
 
+pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use dct::{
     dct4x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct32x32_avx2,

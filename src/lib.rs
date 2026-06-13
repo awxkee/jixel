@@ -59,6 +59,7 @@ mod image;
 mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
+mod orientation;
 mod quant_weights;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
@@ -79,4 +80,5 @@ pub use encode_image::{
     encode_image_with_alpha_16bit, encode_image_with_alpha_f16, encode_image_with_alpha_f32,
 };
 pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
+pub use orientation::Orientation;
 pub use util::EncodeError;
