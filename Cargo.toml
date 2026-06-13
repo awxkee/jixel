@@ -3,7 +3,7 @@ members = ["app", "stats"]
 
 [package]
 name = "jixel"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "Tiny JPEG XL encoder"
 readme = "README.md"

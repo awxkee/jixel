@@ -32,6 +32,7 @@ use crate::color_encoding::write_color_encoding_with_icc;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::image::{Image3F, Image3Si};
+use crate::orientation::Orientation;
 use crate::{ColorEncoding, EncodeError};
 
 fn checked_buffer_size<T>(
@@ -223,9 +224,9 @@ pub struct EncodeConfig {
     /// EXIF/TIFF metadata to embed via an `Exif` container box. Forces the
     /// output into the JXL container form. Raw TIFF bytes (no "Exif\0\0" prefix).
     pub exif: Option<Vec<u8>>,
-    /// EXIF orientation (1..=8, 1 = identity). Tells the decoder how to rotate/
-    /// flip the stored pixels for display. Out-of-range values fall back to 1.
-    pub orientation: u8,
+    /// Image orientation: how the decoder should rotate/flip the stored pixels
+    /// for display (default [`Orientation::Normal`]).
+    pub orientation: Orientation,
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
@@ -271,7 +272,7 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) color_encoding: ColorEncoding,
     pub(crate) icc_profile: Option<Vec<u8>>,
     pub(crate) exif: Option<Vec<u8>>,
-    pub(crate) orientation: u8,
+    pub(crate) orientation: Orientation,
     pub(crate) alpha: Option<AlphaPlane>,
     /// Bit depth declared in the codestream (default: 8).
     pub(crate) bits_per_sample: BitsPerSample,
@@ -304,7 +305,7 @@ impl Default for EncodeConfig {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             exif: None,
-            orientation: 1,
+            orientation: Orientation::Normal,
             lossless: false,
             progressive: false,
             progressive_passes: None,
@@ -325,7 +326,7 @@ impl Default for EncodeConfigImpl {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             exif: None,
-            orientation: 1,
+            orientation: Orientation::Normal,
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
@@ -367,7 +368,7 @@ impl EncodeConfigImpl {
         self.exif = exif;
         self
     }
-    pub(crate) fn with_orientation(mut self, orientation: u8) -> Self {
+    pub(crate) fn with_orientation(mut self, orientation: Orientation) -> Self {
         self.orientation = orientation;
         self
     }
@@ -501,8 +502,8 @@ impl EncodeConfig {
         self.exif = Some(exif);
         self
     }
-    /// Set the EXIF orientation (1..=8, 1 = identity).
-    pub fn with_orientation(mut self, orientation: u8) -> Self {
+    /// Set the image [`Orientation`].
+    pub fn with_orientation(mut self, orientation: Orientation) -> Self {
         self.orientation = orientation;
         self
     }
@@ -1940,22 +1941,16 @@ fn write_image_metadata(
     bps: BitsPerSample,
     lossless: bool,
     grayscale: bool,
-    orientation: u8,
+    orientation: Orientation,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
-    // EXIF orientation 1..=8 (1 = identity); out-of-range falls back to identity.
-    let orientation = if (1..=8).contains(&orientation) {
-        orientation
-    } else {
-        1
-    };
     // tone_mapping (HDR luminance) is gated by extra_fields; a non-identity
     // orientation also lives in the extra_fields block, so either forces it on.
-    let extra_fields = !tm.is_default() || orientation != 1;
+    let extra_fields = !tm.is_default() || orientation != Orientation::Normal;
     w.write(1, if extra_fields { 1 } else { 0 }); // extra_fields
     if extra_fields {
-        w.write(3, (orientation - 1) as u64); // orientation: 1 + u(3)
+        w.write(3, orientation.to_u3()); // orientation: 1 + u(3)
         w.write(1, 0); // have_intrinsic_size = false
         w.write(1, 0); // have_preview = false
         w.write(1, 0); // have_animation = false
