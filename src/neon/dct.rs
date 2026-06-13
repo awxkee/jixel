@@ -606,6 +606,62 @@ pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     output[9] = (b00 - b01 - b10 + b11) * 0.25;
 }
 
+#[target_feature(enable = "neon")]
+pub(crate) fn dct4x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+    let rows = load(input, 8);
+    let mut top: [NeonDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut bot: [NeonDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    dct1d_4_v(&mut top);
+    dct1d_4_v(&mut bot);
+    let mut r: [NeonDoubledVector; 8] = [
+        top[0], top[1], top[2], top[3], bot[0], bot[1], bot[2], bot[3],
+    ];
+    transpose_8x8(&mut r);
+    dct1d_8_v(&mut r);
+    transpose_8x8(&mut r);
+
+    let mut buf = [0.0f32; 64];
+    scale_and_store(&r, 1.0 / 32.0, &mut buf);
+    for k in 0..8 {
+        let vf = k % 4;
+        let half = k / 4;
+        for hf in 0..8 {
+            output[(half + vf * 2) * 8 + hf] = buf[k * 8 + hf];
+        }
+    }
+    let b0 = output[0];
+    let b1 = output[8];
+    output[0] = (b0 + b1) * 0.5;
+    output[8] = (b0 - b1) * 0.5;
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+    let mut rows = load(input, 8);
+    dct1d_8_v(&mut rows);
+    transpose_8x8(&mut rows);
+    let mut left: [NeonDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut right: [NeonDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    dct1d_4_v(&mut left);
+    dct1d_4_v(&mut right);
+
+    let combo: [NeonDoubledVector; 8] = [
+        left[0], left[1], left[2], left[3], right[0], right[1], right[2], right[3],
+    ];
+    let mut buf = [0.0f32; 64];
+    scale_and_store(&combo, 1.0 / 32.0, &mut buf);
+    for hf in 0..4 {
+        for vf in 0..8 {
+            output[(hf * 2) * 8 + vf] = buf[hf * 8 + vf];
+            output[(1 + hf * 2) * 8 + vf] = buf[(4 + hf) * 8 + vf];
+        }
+    }
+    let b0 = output[0];
+    let b1 = output[8];
+    output[0] = (b0 + b1) * 0.5;
+    output[8] = (b0 - b1) * 0.5;
+}
+
 #[cfg(test)]
 mod neon_dct_tests {
     use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
@@ -821,6 +877,36 @@ mod neon_dct_tests {
             unsafe { dct16x8_neon(&input, &mut got) };
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct4x8_neon_vs_scalar_random() {
+        use crate::dct::dct4x8_scalar;
+        use crate::neon::dct4x8_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct4x8_neon(&input, &mut got) };
+            dct4x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct8x4_neon_vs_scalar_random() {
+        use crate::dct::dct8x4_scalar;
+        use crate::neon::dct8x4_neon;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct8x4_neon(&input, &mut got) };
+            dct8x4_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
     }
 

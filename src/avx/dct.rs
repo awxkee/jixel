@@ -458,11 +458,6 @@ fn dct1d_4_m128(c: &mut [__m128; 4]) {
     c[3] = o1;
 }
 
-/// Forward DCT4X4 (AVX2+FMA), bit-identical to [`crate::dct::dct4x4`]. Vectorized
-/// across the four 4×4 quadrants (lane k = quadrant, k = qy*2 + qx): gather, row
-/// DCT, column DCT (×1/16), scatter into the interleaved 8×8 grid, then the 2×2
-/// Hadamard over the four sub-DCs (done scalar on the output, as in the scalar
-/// reference).
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct4x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
     // Gather q[r*4+c].lane[k] = input[(qy*4+r)*8 + (qx*4+c)], k = qy*2+qx.
@@ -515,6 +510,94 @@ pub(crate) fn dct4x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
     output[1] = (b00 + b01 - b10 - b11) * 0.25;
     output[8] = (b00 - b01 + b10 - b11) * 0.25;
     output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
+/// Vectorized scalar `dct1d_4` across the 8 lanes of four `__m256` registers
+/// (one "row" of the recursion per register). Mirrors `dct::dct1d_4` exactly.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_4_flat(c: &mut [__m256; 4]) {
+    // even half: dct1d_2(c0+c3, c1+c2)
+    let s0 = _mm256_add_ps(c[0], c[3]);
+    let s1 = _mm256_add_ps(c[1], c[2]);
+    let e0 = _mm256_add_ps(s0, s1);
+    let e1 = _mm256_sub_ps(s0, s1);
+    // odd half: dct1d_2((c0-c3)*WC4[0], (c1-c2)*WC4[1]); then t2 = t2*SQRT2 + t3
+    let d2 = _mm256_mul_ps(_mm256_sub_ps(c[0], c[3]), _mm256_set1_ps(WC4[0]));
+    let d3 = _mm256_mul_ps(_mm256_sub_ps(c[1], c[2]), _mm256_set1_ps(WC4[1]));
+    let osum = _mm256_add_ps(d2, d3);
+    let odiff = _mm256_sub_ps(d2, d3);
+    let o0 = _mm256_fmadd_ps(osum, _mm256_set1_ps(std::f32::consts::SQRT_2), odiff);
+    c[0] = e0;
+    c[1] = o0;
+    c[2] = e1;
+    c[3] = odiff;
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct4x8_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+    let rows = load(input);
+    let mut top: [__m256; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut bot: [__m256; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    dct1d_4_flat(&mut top);
+    dct1d_4_flat(&mut bot);
+    let mut r: [__m256; 8] = [
+        top[0], top[1], top[2], top[3], bot[0], bot[1], bot[2], bot[3],
+    ];
+    transpose_8x8(&mut r);
+    dct1d_8_flat(&mut r);
+    transpose_8x8(&mut r);
+
+    let scale = _mm256_set1_ps(1.0 / 32.0);
+    let mut buf = [0.0f32; 64];
+    for k in 0..8 {
+        unsafe {
+            _mm256_storeu_ps(buf[k * 8..].as_mut_ptr(), _mm256_mul_ps(r[k], scale));
+        }
+    }
+    // buf[k*8 + hf]: k = vf for top (k<4) / bottom (k>=4), interleaved by row.
+    for k in 0..8 {
+        let vf = k % 4;
+        let half = k / 4;
+        for hf in 0..8 {
+            output[(half + vf * 2) * 8 + hf] = buf[k * 8 + hf];
+        }
+    }
+    let b0 = output[0];
+    let b1 = output[8];
+    output[0] = (b0 + b1) * 0.5;
+    output[8] = (b0 - b1) * 0.5;
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct8x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+    let mut rows = load(input);
+    dct1d_8_flat(&mut rows);
+    transpose_8x8(&mut rows); // rows[col].lane[vf]
+    let mut left: [__m256; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut right: [__m256; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    dct1d_4_flat(&mut left);
+    dct1d_4_flat(&mut right);
+
+    let scale = _mm256_set1_ps(1.0 / 32.0);
+    let mut lb = [0.0f32; 32];
+    let mut rb = [0.0f32; 32];
+    for hf in 0..4 {
+        unsafe {
+            _mm256_storeu_ps(lb[hf * 8..].as_mut_ptr(), _mm256_mul_ps(left[hf], scale));
+            _mm256_storeu_ps(rb[hf * 8..].as_mut_ptr(), _mm256_mul_ps(right[hf], scale));
+        }
+    }
+    for hf in 0..4 {
+        for vf in 0..8 {
+            output[(hf * 2) * 8 + vf] = lb[hf * 8 + vf];
+            output[(1 + hf * 2) * 8 + vf] = rb[hf * 8 + vf];
+        }
+    }
+    let b0 = output[0];
+    let b1 = output[8];
+    output[0] = (b0 + b1) * 0.5;
+    output[8] = (b0 - b1) * 0.5;
 }
 
 #[cfg(test)]
@@ -608,6 +691,40 @@ mod tests {
             unsafe { dct4x4_avx2(&input, &mut got) };
             dct4x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct4x8_avx2_vs_scalar_random() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct4x8_avx2;
+        use crate::dct::dct4x8_scalar;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct4x8_avx2(&input, &mut got) };
+            dct4x8_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct8x4_avx2_vs_scalar_random() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct8x4_avx2;
+        use crate::dct::dct8x4_scalar;
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dct8x4_avx2(&input, &mut got) };
+            dct8x4_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
     }
 

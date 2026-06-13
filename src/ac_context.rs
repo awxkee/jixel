@@ -60,15 +60,15 @@ pub(crate) static K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
 #[rustfmt::skip]
 pub(crate) static K_BLOCK_CONTEXT_MAP: [u8; 81] = [
     // X row. Position 4 = DCT16X16 (decoder ctx 2). Position 5 = DCT32X32
-    // (ord 3, ctx 2). Position 3 = DCT4X4 (ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
-    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 0, 0, 0, 0,
+    // (ord 3, ctx 2). Position 3 = DCT4X4, positions 12,13 = DCT4X8/DCT8X4 (all ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
+    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 0, 0, 2, 2,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     // Y row. Position 4 = DCT16X16 (decoder ctx 0). Positions 6, 7 = DCT16X8/8X16 (ctx 1).
     0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     // B row. Position 4 = DCT16X16 (decoder ctx 2). Position 5 = DCT32X32
-    // (ord 3, ctx 2). Position 3 = DCT4X4 (ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
-    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 0, 0, 0, 0,
+    // (ord 3, ctx 2). Position 3 = DCT4X4, positions 12,13 = DCT4X8/DCT8X4 (all ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
+    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 0, 0, 2, 2,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 

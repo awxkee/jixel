@@ -33,12 +33,12 @@ use crate::ac_context::{
     non_zero_context, zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::dc_group_data::{
-    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
+    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
 };
 use crate::dct::{
-    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x32, dct4x4, dct8x8, dct8x16,
-    dct16x8, dct16x16, dct32x32,
+    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x32, dct4x4, dct4x8, dct8x4,
+    dct8x8, dct8x16, dct16x8, dct16x16, dct32x32,
 };
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -354,6 +354,24 @@ pub(crate) fn write_ac_group(
                         let tmp_64 = tmp.as_chunks::<64>().0;
                         dct4x4(&tmp_64[0], dst);
                     }
+                    STRATEGY_DCT4X8 => {
+                        for yy in 0..8 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
+                        }
+                        let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
+                        let tmp_64 = tmp.as_chunks::<64>().0;
+                        dct4x8(&tmp_64[0], dst);
+                    }
+                    STRATEGY_DCT8X4 => {
+                        for yy in 0..8 {
+                            let row = plane.row(opsin_by + yy);
+                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
+                        }
+                        let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
+                        let tmp_64 = tmp.as_chunks::<64>().0;
+                        dct8x4(&tmp_64[0], dst);
+                    }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
             }
@@ -364,7 +382,7 @@ pub(crate) fn write_ac_group(
             // indexing is didx = iy * cov_x + ix.
             let mut dc_vals = [[0.0f32; 16]; 3];
             match raw_strategy {
-                STRATEGY_DCT | STRATEGY_DCT4X4 => {
+                STRATEGY_DCT | STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
                     for c in 0..3 {
                         dc_vals[c][0] = coeffs[c][0];
                     }
@@ -439,6 +457,9 @@ pub(crate) fn write_ac_group(
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
                 STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
                 STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                    (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
+                }
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                 STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
@@ -496,7 +517,7 @@ pub(crate) fn write_ac_group(
             let mut x_dc_post = [0.0f32; 16];
             let mut b_dc_post = [0.0f32; 16];
             match raw_strategy {
-                STRATEGY_DCT | STRATEGY_DCT4X4 => {
+                STRATEGY_DCT | STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
                     x_dc_post[0] = coeffs[0][0];
                     b_dc_post[0] = coeffs[2][0];
                 }
@@ -550,6 +571,7 @@ pub(crate) fn write_ac_group(
             let inv_qm_x: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
                 _ => &matrices.inv_matrix_16x8(0)[..],
@@ -584,6 +606,7 @@ pub(crate) fn write_ac_group(
             let inv_qm_b: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
                 _ => &matrices.inv_matrix_16x8(2)[..],
@@ -622,6 +645,7 @@ pub(crate) fn write_ac_group(
                     match raw_strategy {
                         STRATEGY_DCT => K_COEFF_ORDER_8X8[k] as usize,
                         STRATEGY_DCT4X4 => K_COEFF_ORDER_8X8[k] as usize,
+                        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => K_COEFF_ORDER_8X8[k] as usize,
                         STRATEGY_DCT16X16 => K_COEFF_ORDER_16X16[k] as usize,
                         STRATEGY_DCT32X32 => K_COEFF_ORDER_32X32[k] as usize,
                         _ => K_COEFF_ORDER_16X8[k] as usize,

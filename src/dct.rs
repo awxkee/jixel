@@ -566,8 +566,180 @@ pub(crate) fn dct4x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     output[9] = (b00 - b01 - b10 + b11) * 0.25;
 }
 
-/// `WcMultipliers<32>` = 1/(2·cos((2i+1)·π/64)), i = 0..16. Same source/role as
-/// [`WC16`], extended to the 32-point recursion. From libjxl `dct_scales.h`.
+/// `ComputeScaledDCT<4, 8>`: 4-row × 8-col separable scaled forward DCT.
+/// `input` is a 4×8 pixel block (`input[r*8 + c]`, r = 0..4, c = 0..8);
+/// `output[vf*8 + hf]` holds the coefficient at vertical freq `vf` (0..4),
+/// horizontal freq `hf` (0..8). Scaled by 1/(4·8) like the other forward DCTs
+/// (cf. `dct8x8` 1/64, `dct16x8` 1/128).
+fn dct4x8_2d(input: &[f32; 32], output: &mut [f32; 32]) {
+    let mut tmp = [0.0f32; 32];
+    // Vertical 4-point DCT per column.
+    for c in 0..8 {
+        let mut col = [input[c], input[8 + c], input[16 + c], input[24 + c]];
+        dct1d_4(&mut col);
+        for vf in 0..4 {
+            tmp[vf * 8 + c] = col[vf];
+        }
+    }
+    // Horizontal 8-point DCT per vertical-frequency row.
+    for vf in 0..4 {
+        let mut row = [0.0f32; 8];
+        row.copy_from_slice(&tmp[vf * 8..vf * 8 + 8]);
+        dct1d_8(&mut row);
+        for hf in 0..8 {
+            output[vf * 8 + hf] = row[hf] * (1.0 / 32.0);
+        }
+    }
+}
+
+pub(crate) fn dct4x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    for y in 0..2 {
+        let mut half = [0.0f32; 32];
+        for r in 0..4 {
+            for c in 0..8 {
+                half[r * 8 + c] = input[(y * 4 + r) * 8 + c];
+            }
+        }
+        let mut d = [0.0f32; 32];
+        dct4x8_2d(&half, &mut d);
+        for iy in 0..4 {
+            for ix in 0..8 {
+                output[(y + iy * 2) * 8 + ix] = d[iy * 8 + ix];
+            }
+        }
+    }
+    // 2-point Hadamard on the two sub-DCs (top = coeff[0], bottom = coeff[8]).
+    let block0 = output[0];
+    let block1 = output[8];
+    output[0] = (block0 + block1) * 0.5;
+    output[8] = (block0 - block1) * 0.5;
+}
+
+/// `ComputeScaledDCT<8, 4>`: 8-row × 4-col separable scaled forward DCT, stored
+/// **transposed** as `output[hf*8 + vf]` (hf = horizontal freq 0..4, vf =
+/// vertical freq 0..8). The transpose is what lets DCT8X4 reuse DCT4X8's
+/// (row-replicated 4×8) quant table: the swap sends vfreq↔hfreq and
+/// `rcprow`↔`rcpcol` together. Scaled by 1/(8·4) = 1/32.
+fn dct8x4_2d(input: &[f32; 32], output: &mut [f32; 32]) {
+    let mut tmp = [0.0f32; 32]; // tmp[vf*4 + c]
+    // Vertical 8-point DCT per column (4 columns).
+    for c in 0..4 {
+        let mut col = [
+            input[c],
+            input[4 + c],
+            input[8 + c],
+            input[12 + c],
+            input[16 + c],
+            input[20 + c],
+            input[24 + c],
+            input[28 + c],
+        ];
+        dct1d_8(&mut col);
+        for vf in 0..8 {
+            tmp[vf * 4 + c] = col[vf];
+        }
+    }
+    // Horizontal 4-point DCT per vertical-frequency row; store transposed.
+    for vf in 0..8 {
+        let mut row = [
+            tmp[vf * 4],
+            tmp[vf * 4 + 1],
+            tmp[vf * 4 + 2],
+            tmp[vf * 4 + 3],
+        ];
+        dct1d_4(&mut row);
+        for hf in 0..4 {
+            output[hf * 8 + vf] = row[hf] * (1.0 / 32.0);
+        }
+    }
+}
+
+pub(crate) fn dct8x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    for x in 0..2 {
+        let mut half = [0.0f32; 32]; // 8 rows × 4 cols
+        for r in 0..8 {
+            for c in 0..4 {
+                half[r * 4 + c] = input[r * 8 + (x * 4 + c)];
+            }
+        }
+        let mut d = [0.0f32; 32];
+        dct8x4_2d(&half, &mut d);
+        for iy in 0..4 {
+            for ix in 0..8 {
+                output[(x + iy * 2) * 8 + ix] = d[iy * 8 + ix];
+            }
+        }
+    }
+    let block0 = output[0];
+    let block1 = output[8];
+    output[0] = (block0 + block1) * 0.5;
+    output[8] = (block0 - block1) * 0.5;
+}
+
+static DCT_METHOD_4X8: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+
+fn select_dct_4x8() -> Arc<DctFn<64>> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            use crate::neon::dct4x8_neon;
+            return Arc::new(|input, output| unsafe {
+                dct4x8_neon(input, output);
+            });
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct4x8_avx2(input, output);
+            });
+        }
+    }
+
+    Arc::new(|input, output| {
+        dct4x8_scalar(input, output);
+    })
+}
+
+pub(crate) fn dct4x8(input: &[f32; 64], output: &mut [f32; 64]) {
+    DCT_METHOD_4X8.get_or_init(select_dct_4x8)(input, output);
+}
+
+static DCT_METHOD_8X4: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+
+fn select_dct_8x4() -> Arc<DctFn<64>> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            use crate::neon::dct8x4_neon;
+            return Arc::new(|input, output| unsafe {
+                dct8x4_neon(input, output);
+            });
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Arc::new(|input, output| unsafe {
+                crate::avx::dct8x4_avx2(input, output);
+            });
+        }
+    }
+
+    Arc::new(|input, output| {
+        dct8x4_scalar(input, output);
+    })
+}
+
+pub(crate) fn dct8x4(input: &[f32; 64], output: &mut [f32; 64]) {
+    DCT_METHOD_8X4.get_or_init(select_dct_8x4)(input, output);
+}
+
 pub(crate) const WC32: [f32; 16] = [
     0.500_602_98,
     0.505_470_96,
@@ -587,9 +759,6 @@ pub(crate) const WC32: [f32; 16] = [
     10.190_008,
 ];
 
-/// 1-D 32-point DCT-II (libjxl recursive factorization), in place. Recurses on
-/// [`dct1d_16`] for the even/odd halves exactly as [`dct1d_16`] recurses on
-/// `dct1d_8`.
 #[inline]
 pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
     let mut tmp = [0.0f32; 32];
@@ -739,6 +908,71 @@ pub(crate) fn dc_from_dct32x32(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dct4x8_dc_matches_dct8x8() {
+        // The block DC (coeff[0]) of DCT4X8 must land on the same scale as
+        // DCT8X8's, otherwise the shared DC plane / decoder reconstruction is
+        // wrong. The ×0.5 Hadamard on the two half-DCs is what enforces this.
+        for &v in &[0.0f32, 0.37, -1.2, 4.5] {
+            let block = [v; 64];
+            let mut o4 = [0.0f32; 64];
+            let mut o8 = [0.0f32; 64];
+            dct4x8(&block, &mut o4);
+            dct8x8(&block, &mut o8);
+            assert!(
+                (o4[0] - o8[0]).abs() < 1e-4,
+                "DC mismatch for v={v}: 4x8={} 8x8={}",
+                o4[0],
+                o8[0]
+            );
+        }
+    }
+
+    #[test]
+    fn dct4x8_constant_is_pure_dc() {
+        // A constant block has energy only in the DC; every AC coefficient
+        // (including the vertical-difference at [8]) must vanish.
+        let block = [2.0f32; 64];
+        let mut o = [0.0f32; 64];
+        dct4x8(&block, &mut o);
+        for (i, &c) in o.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            assert!(c.abs() < 1e-4, "AC coeff[{i}] = {c} should be ~0");
+        }
+    }
+
+    #[test]
+    fn dct8x4_dc_matches_dct8x8() {
+        for &v in &[0.0f32, 0.37, -1.2, 4.5] {
+            let block = [v; 64];
+            let mut o = [0.0f32; 64];
+            let mut o8 = [0.0f32; 64];
+            dct8x4(&block, &mut o);
+            dct8x8(&block, &mut o8);
+            assert!(
+                (o[0] - o8[0]).abs() < 1e-4,
+                "DC mismatch for v={v}: 8x4={} 8x8={}",
+                o[0],
+                o8[0]
+            );
+        }
+    }
+
+    #[test]
+    fn dct8x4_constant_is_pure_dc() {
+        let block = [2.0f32; 64];
+        let mut o = [0.0f32; 64];
+        dct8x4(&block, &mut o);
+        for (i, &c) in o.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            assert!(c.abs() < 1e-4, "AC coeff[{i}] = {c} should be ~0");
+        }
+    }
 
     pub(crate) fn idct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
         let mut coeff = *input;
