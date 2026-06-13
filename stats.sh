@@ -27,4 +27,4 @@
 # // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-cargo run --package stats --release -- assets/cityscape3.jpg --distances 0.3,0.5,1,1.5,2 --efforts 2,3,6,7 --out charts
+cargo run --package stats --release -- assets/_Z620034.png --distances 0.3,0.5,1,1.5,2 --efforts 2,3,6,7 --out charts

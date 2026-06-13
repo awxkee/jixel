@@ -38,15 +38,14 @@ use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 use std::sync::OnceLock;
 
-const K_SG_MUL: f32 = 226.0480446705883;
+const K_SG_MUL: f32 = 226.77216153508914;
 const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
 const K_LOG2: f32 = 0.693147181;
 const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_LOG2;
-const K_SG_V_OFFSET: f32 = 7.14672470003;
+const K_SG_V_OFFSET: f32 = 7.7825991679894591;
 
 pub(crate) const K_AC_QUANT: f32 = 0.8974;
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
-const K_X_MUL: f32 = 23.426802998210313;
 
 /// Ratio of derivatives of cubic-root to simple-gamma; moves quantization from
 /// jxl's opsin (cube-root-of-photons) space to butteraugli's log-gamma space.
@@ -66,14 +65,14 @@ pub(crate) fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
 /// Visual-masking transform applied to the accumulated per-block difference.
 #[inline]
 pub(crate) fn compute_mask(out_val: f32) -> f32 {
-    let k_base = -0.74174993f32;
-    let k_mul4 = 3.2353257320940401f32;
-    let k_mul2 = 12.906028311180409f32;
-    let k_offset2 = 305.04035728311436f32;
-    let k_mul3 = 5.0220313103171232f32;
-    let k_offset3 = 2.1925739705298404f32;
+    let k_base = -0.7647f32;
+    let k_mul4 = 9.4708735624378946f32;
+    let k_mul2 = 17.35036561631863f32;
+    let k_offset2 = 302.59587815579727f32;
+    let k_mul3 = 6.7943250517376494f32;
+    let k_offset3 = 3.7179635626140772f32;
     let k_offset4 = 0.25f32 * k_offset3;
-    let k_mul0 = 0.74760422233706747f32;
+    let k_mul0 = 0.80061762862741759f32;
 
     let v1 = (out_val * k_mul0).max(1e-3);
     let v2 = 1.0 / (v1 + k_offset2);
@@ -85,17 +84,19 @@ pub(crate) fn compute_mask(out_val: f32) -> f32 {
 /// `0.25 * sqrt(v * sqrt(kMul*1e8) + kLogOffset)`.
 #[inline]
 pub(crate) fn masking_sqrt(v: f32) -> f32 {
-    let k_log_offset = 26.481471032459346f32;
-    let k_mul = 211.50759899638012f32;
+    let k_log_offset = 27.505837037000106f32;
+    let k_mul = 211.66567973503678f32;
     let mul_v = k_mul * 1e8;
     0.25 * fmla(v, mul_v.sqrt(), k_log_offset).sqrt()
 }
 
-/// HF modulation: sum of |right| and |below| abs differences in the 8x8 Y block.
+/// HF modulation (current libjxl): per-difference clamp at `valmin_y`, summed
+/// over the 8x8 Y block, then `sum * kMul_y + kOffset` added to `out_val`.
 pub(crate) fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
     let ys = xyb_y.ysize();
     let xs = xyb_y.xsize();
-    let mut sum = 0.0f32;
+    let valmin_y = 0.0206f32;
+    let mut sum_y = 0.0f32;
     for dy in 0..8 {
         let row = xyb_y.plane_row(1, (y + dy).min(ys - 1));
         let row_next = if dy == 7 {
@@ -108,40 +109,25 @@ pub(crate) fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -
             let p = row[c0];
             // right difference, skipping the last column (matches kMaskRight)
             if dx < 7 {
-                sum += (p - row[(x + dx + 1).min(xs - 1)]).abs();
+                sum_y += valmin_y.min((p - row[(x + dx + 1).min(xs - 1)]).abs());
             }
-            sum += (p - row_next[c0]).abs();
+            sum_y += valmin_y.min((p - row_next[c0]).abs());
         }
     }
-    fmla(sum, -2.0052193233688884f32 / 112.0, out_val)
+    let k_mul_y = -0.38f32;
+    let k_offset = 0.42f32; // higher value -> more bpp
+    fmla(sum_y, k_mul_y, k_offset) + out_val
 }
 
-/// Color modulation: boost precision in strongly red or blue blocks.
-pub(crate) fn color_modulation(
-    x: usize,
-    y: usize,
-    xyb: &Image3F,
-    butteraugli_target: f32,
-    out_val: f32,
-) -> f32 {
-    let k_strength_mul = 2.177823400325309f32;
-    let k_red_ramp_start = 0.0073200141118951231f32;
-    let k_red_ramp_length = 0.019421555948474039f32;
-    let k_blue_ramp_length = 0.086890611400405895f32;
-    let k_blue_ramp_start = 0.26973418507870539f32;
-    let strength = k_strength_mul * (1.0 - 0.25 * butteraugli_target);
-    if strength < 0.0 {
-        return out_val;
-    }
-    let red_strength = strength * 5.992297772961519f32;
-    let blue_strength = strength;
-    let offset = strength * -0.009174542291185913f32;
-    let mut out_val = out_val + offset;
-
-    let mut red_coverage = 0.0f32;
-    let mut blue_coverage = 0.0f32;
+/// Blue modulation (current libjxl): increase precision in 8x8 blocks with
+/// significant blue content that is not near-solid blue. Combined into the
+/// field via `min`, not addition.
+pub(crate) fn blue_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     let ys = xyb.ysize();
     let xs = xyb.xsize();
+    let k_limit = 0.010474084867598155f32;
+    let k_offset = 0.0031994768654636393f32;
+    let mut sum = 0.0f32;
     for dy in 0..8 {
         let ry = (y + dy).min(ys - 1);
         let row_x = xyb.plane_row(0, ry);
@@ -149,25 +135,27 @@ pub(crate) fn color_modulation(
         let row_b = xyb.plane_row(2, ry);
         for dx in 0..8 {
             let cx = (x + dx).min(xs - 1);
-            let in_x = row_x[cx];
-            let pixel_y = row_y[cx];
-            let in_b = row_b[cx];
-            let pixel_x = (in_x - k_red_ramp_start).max(0.0);
-            let pixel_b = (in_b - (pixel_y + k_blue_ramp_start)).max(0.0);
-            blue_coverage += pixel_b.min(k_blue_ramp_length);
-            red_coverage += pixel_x.min(k_red_ramp_length);
+            let p_x = row_x[cx];
+            let p_b = row_b[cx];
+            let p_y_effective = row_y[cx] + k_offset + p_x.abs();
+            if p_b > p_y_effective {
+                sum += (p_b - p_y_effective).min(k_limit);
+            }
         }
     }
-    let ratio = 30.610615782142737f32; // out of 64 pixels
-    let mut overall_red = red_coverage.min(ratio * k_red_ramp_length);
-    overall_red *= red_strength / ratio;
-    let mut overall_blue = blue_coverage.min(ratio * k_blue_ramp_length);
-    overall_blue *= blue_strength / ratio;
-
-    out_val = out_val + overall_red + overall_blue;
-    out_val
+    let k_mul = 0.90590804735610064f32;
+    let mut scalar_sum = sum;
+    // If it is all blue, don't boost the quantization (avoid over-spending on sky).
+    if scalar_sum >= 32.0 * k_limit {
+        scalar_sum = 64.0 * k_limit - scalar_sum;
+    }
+    let k_max_limit = 15.463398341612438f32;
+    if scalar_sum >= k_max_limit * k_limit {
+        scalar_sum = k_max_limit * k_limit;
+    }
+    scalar_sum *= k_mul;
+    scalar_sum + out_val
 }
-
 /// Gamma modulation: accounts for the local gamma of the 8x8 block.
 pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     let k_bias = 0.16f32;
@@ -190,8 +178,8 @@ pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) 
         }
     }
     overall_ratio *= 1.0 / 64.0;
-    // ln(2) folded in: -0.15526878... * ln(2) * log2(x) == -0.15... * ln(x)
-    let k_gam = -0.15526878023684174f32 * 0.693147180559945f32;
+    // ideally -1.0, but optimal correction adds some entropy, so slightly less.
+    let k_gam = 0.1005613337192697f32;
     fmla(k_gam, dirty_log2f(overall_ratio), out_val)
 }
 
@@ -319,16 +307,9 @@ fn fill_quant_field_scalar(
         let row_y = opsin.plane_row(1, gy_c);
         let row_y1 = opsin.plane_row(1, gy1);
         let row_y2 = opsin.plane_row(1, gy2);
-        let row_x = opsin.plane_row(0, gy_c);
-        let row_x1 = opsin.plane_row(0, gy1);
-        let row_x2 = opsin.plane_row(0, gy2);
-
         assert!(row_y.len() >= img_xsize);
         assert!(row_y1.len() >= img_xsize);
         assert!(row_y2.len() >= img_xsize);
-        assert!(row_x.len() >= img_xsize);
-        assert!(row_x1.len() >= img_xsize);
-        assert!(row_x2.len() >= img_xsize);
 
         for rx in 0..region_px_w {
             let gx = x0 + rx;
@@ -341,12 +322,10 @@ fn fill_quant_field_scalar(
             let gammac = ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
             let mut diff = gammac * (in_y - base);
             diff *= diff;
-
-            let in_x = row_x[gx_c];
-            let base_x = 0.25 * (row_x2[gx_c] + row_x1[gx_c] + row_x[gx1] + row_x[gx2]);
-            let mut diff_x = gammac * (in_x - base_x);
-            diff_x *= diff_x;
-            diff += K_X_MUL * diff_x;
+            // current libjxl: clamp the squared luma diff before masking.
+            if diff >= 0.2 {
+                diff = 0.2;
+            }
             diff = masking_sqrt(diff);
 
             if (ry & 3) != 0 {
@@ -374,7 +353,25 @@ fn fill_quant_field_scalar(
     // downsample 2x into the block-resolution aq_map.
     // pre is (2*xblocks) x (2*yblocks); aq_map is xblocks x yblocks.
     let mut aq_map = vec![0.0f32; xsize_blocks * ysize_blocks];
-    let k_mul = 0.05f32; // same weight for center and all four mins
+    // FuzzyErosion weights (current libjxl): four smallest neighbours, weighted,
+    // butteraugli-target dependent, normalised to kTotal.
+    let fe_mul = if distance < 2.0 {
+        (2.0 - distance) * 0.5
+    } else {
+        0.0
+    };
+    let fe_base = [0.125f32, 0.1, 0.09, 0.06];
+    let fe_add = [0.0f32, -0.1, -0.09, -0.06];
+    let mut k_mul = [0.0f32; 4];
+    let mut norm_sum = 0.0f32;
+    for i in 0..4 {
+        k_mul[i] = fe_base[i] + fe_mul * fe_add[i];
+        norm_sum += k_mul[i];
+    }
+    let k_total = 0.29959705784054957f32;
+    for w in &mut k_mul {
+        *w *= k_total / norm_sum;
+    }
     for fy in 0..pre_h {
         let ym1 = if fy >= 1 { fy - 1 } else { fy };
         let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
@@ -394,11 +391,8 @@ fn fill_quant_field_scalar(
             store_min4(rowb[xm1], &mut mins);
             store_min4(rowb[fx], &mut mins);
             store_min4(rowb[xp1], &mut mins);
-            let v = k_mul * row[fx]
-                + k_mul * mins[0]
-                + k_mul * mins[1]
-                + k_mul * mins[2]
-                + k_mul * mins[3];
+            let v =
+                k_mul[0] * mins[0] + k_mul[1] * mins[1] + k_mul[2] * mins[2] + k_mul[3] * mins[3];
             let out_x = fx / 2;
             let idx = out_y * xsize_blocks + out_x;
             if fx % 2 == 0 && fy % 2 == 0 {
@@ -410,8 +404,8 @@ fn fill_quant_field_scalar(
     }
 
     // ---- Stage 3: PerBlockModulations + write integer quant field.
-    let mut base_level = 0.5 * scale;
-    let k_dampen_ramp_start = 7.0f32;
+    let mut base_level = 0.48 * scale;
+    let k_dampen_ramp_start = 2.0f32;
     let k_dampen_ramp_end = 14.0f32;
     let mut dampen = 1.0f32;
     if distance >= k_dampen_ramp_start {
@@ -442,11 +436,12 @@ fn fill_quant_field_scalar(
             let bx_px = px.min(img_xsize.saturating_sub(8));
             let by_px = py.min(img_ysize.saturating_sub(8));
 
-            let mut out_val = aq;
-            out_val = compute_mask(out_val);
-            out_val = hf_modulation(bx_px, by_px, opsin, out_val);
-            out_val = color_modulation(bx_px, by_px, opsin, distance, out_val);
-            out_val = gamma_modulation(bx_px, by_px, opsin, out_val);
+            // current libjxl PerBlockModulations order:
+            // mask -> gamma -> hf, then min with blue (computed from gamma-mask).
+            let mask_val = compute_mask(aq);
+            let mask_val = gamma_modulation(bx_px, by_px, opsin, mask_val);
+            let out_val = hf_modulation(bx_px, by_px, opsin, mask_val);
+            let out_val = out_val.min(blue_modulation(bx_px, by_px, opsin, mask_val));
             // Multiplicative field: exponent modulation done above.
             let qf = fast_exp2(out_val * 1.442695041) * mul + add;
             let qi = fmla(qf, inv_scale, 0.5) as i32;
