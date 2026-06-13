@@ -64,6 +64,39 @@ use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
 use std::sync::OnceLock;
 
+/// Rate-term lookup: `mag_bits` accumulates `log2(1 + |q|)` where `q` is always
+/// a *rounded* (hence non-negative integer-valued) quantized coefficient. Since
+/// `1 + |q|` is an exact integer-valued `f32`, the log can be precomputed once
+/// and looked up — **bit-identical** to calling `f32::log2` (same inputs, same
+/// `log2f`), but trading a per-coefficient transcendental for an L1 load. Values
+/// of `|q|` at or above the table size (rare, large coefficients) fall back to
+/// the direct computation.
+const RATE_LOG2_LUT_N: usize = 1024;
+
+#[inline]
+pub(crate) fn rate_log2_lut() -> &'static [f32; RATE_LOG2_LUT_N] {
+    static LUT: OnceLock<[f32; RATE_LOG2_LUT_N]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut a = [0.0f32; RATE_LOG2_LUT_N];
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = (1.0 + i as f32).log2();
+        }
+        a
+    })
+}
+
+/// `log2(1 + qabs)` for a non-negative integer-valued `qabs`, via [`rate_log2_lut`].
+#[inline]
+pub(crate) fn rate_log2(qabs: f32) -> f32 {
+    let k = qabs as usize;
+    let lut = rate_log2_lut();
+    if k < RATE_LOG2_LUT_N {
+        lut[k]
+    } else {
+        (1.0 + qabs).log2()
+    }
+}
+
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
 /// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
@@ -226,7 +259,7 @@ fn channel_rd(
         coeff, inv_matrix, q_scaled, width, height, half, cx, cy, &thr,
     );
 
-    let header = R_HEADER * (1.0 + nzeros as f32).log2();
+    let header = R_HEADER * rate_log2(nzeros as f32);
     let bits = nzeros as f32 * R_NZ_BASE + R_MAG * mag_bits + header;
     (sse, bits)
 }
@@ -257,10 +290,15 @@ fn sse_and_rate(
     ) -> (f32, usize, f32);
     static SSE_FUNCTION: OnceLock<SseFunction> = OnceLock::new();
     let f = SSE_FUNCTION.get_or_init(|| {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                return crate::avx::sse_and_rate_avx2;
+            }
+        }
         #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
         {
             if std::is_x86_feature_detected!("sse4.1") {
-                // Safe: feature gate + runtime detection inside.
                 return crate::sse::sse_and_rate_sse;
             }
         }
@@ -318,7 +356,7 @@ pub(crate) fn sse_and_rate_scalar(
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
-                mag_bits += (1.0 + q.abs()).log2();
+                mag_bits += rate_log2(q.abs());
             }
         }
     }

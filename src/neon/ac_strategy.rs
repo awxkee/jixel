@@ -105,7 +105,7 @@ pub(crate) fn sse_and_rate_neon(
                 let qv = qbuf[lane];
                 if qv != 0.0 {
                     nzeros += 1;
-                    mag_bits += (1.0 + qv.abs()).log2();
+                    mag_bits += crate::enc_ac_strategy::rate_log2(qv.abs());
                 }
             }
             x += 4;
