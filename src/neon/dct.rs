@@ -367,8 +367,6 @@ pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
     }
 }
 
-// ─── Helper: load 16 rows × 8 cols with arbitrary stride ─────────────────────
-
 #[inline]
 #[target_feature(enable = "neon")]
 fn load16_256(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 16] {
@@ -464,10 +462,6 @@ fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
     }
 }
 
-/// Forward 32×32 DCT (NEON), bit-identical layout/scale to
-/// [`crate::dct::dct32x32_scalar`]: column DCTs (8 columns per group, loaded
-/// contiguously by row), then row DCTs (8 rows per group, strided gather),
-/// scaled by 1/1024, output stored transposed as `output[u*32 + v]`.
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
     let zero = NeonDoubledVector {
@@ -529,8 +523,6 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
     }
 }
 
-/// 4-point DCT-II over 4 lanes (one per 4×4 quadrant), mirroring scalar
-/// [`crate::dct::dct1d_4`].
 #[target_feature(enable = "neon")]
 fn dct1d_4_q(c: &mut [float32x4_t; 4]) {
     let t0 = vaddq_f32(c[0], c[3]);
@@ -987,8 +979,6 @@ mod neon_dct_tests {
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x16 linearity");
     }
-
-    // ── dct16x8 ───────────────────────────────────────────────────────────────
 
     #[test]
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
