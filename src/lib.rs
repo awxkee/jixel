@@ -66,6 +66,8 @@ mod squeeze;
 mod sse;
 mod static_entropy_codes;
 mod util;
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+mod wasm;
 
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
