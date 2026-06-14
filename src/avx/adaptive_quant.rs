@@ -334,11 +334,7 @@ pub(crate) fn fill_quant_field(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = if distance > 1.0 {
-        K_AC_QUANT / distance
-    } else {
-        K_AC_QUANT / distance.powf(0.7934)
-    };
+    let scale = K_AC_QUANT / distance;
 
     let region_px_w = xsize_blocks * 8;
     let region_px_h = ysize_blocks * 8;
@@ -384,9 +380,6 @@ pub(crate) fn fill_quant_field(
         }
     }
 
-    // ---- Stage 2: FuzzyErosion, then 2x downsample into block-resolution aq_map.
-    // Weights (current libjxl): four smallest neighbours, butteraugli-dependent,
-    // normalised to kTotal.
     let fe_mul = if distance < 2.0 {
         (2.0 - distance) * 0.5
     } else {

@@ -316,11 +316,7 @@ pub(crate) fn fill_quant_field(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = if distance > 1.0 {
-        K_AC_QUANT / distance
-    } else {
-        K_AC_QUANT / distance.powf(0.7934)
-    };
+    let scale = K_AC_QUANT / distance;
 
     let region_px_w = xsize_blocks * 8;
     let region_px_h = ysize_blocks * 8;

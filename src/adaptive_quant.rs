@@ -44,7 +44,7 @@ const K_LOG2: f32 = 0.693147181;
 const K_SG_RET_MUL: f32 = K_SG_MUL2 * 18.6580932135 * K_LOG2;
 const K_SG_V_OFFSET: f32 = 7.7825991679894591;
 
-pub(crate) const K_AC_QUANT: f32 = 0.8974;
+pub(crate) const K_AC_QUANT: f32 = 0.8294;
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
 
 /// Ratio of derivatives of cubic-root to simple-gamma; moves quantization from
@@ -279,11 +279,7 @@ fn fill_quant_field_scalar(
     let img_xsize = opsin.xsize();
     let img_ysize = opsin.ysize();
 
-    let scale = if distance > 1.0 {
-        K_AC_QUANT / distance
-    } else {
-        K_AC_QUANT / distance.powf(0.7934)
-    };
+    let scale = K_AC_QUANT / distance;
 
     // Pixel extent of this DC-group region (padded to whole blocks but clamped
     // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
