@@ -256,10 +256,7 @@ pub(crate) fn encode_frame_lossless(
     }
 
     // Stage-2 progressive lossless (opt-in): Squeeze pyramid (RGB + optional alpha).
-    if single_group
-        && num_color == 3
-        && (progressive || std::env::var("JIXEL_SQUEEZE").as_deref() == Ok("1"))
-    {
+    if single_group && num_color == 3 && progressive {
         encode_squeeze_single_group(linear, alpha, xsize, ysize, min_symbol, writer);
         return;
     }
@@ -269,7 +266,7 @@ pub(crate) fn encode_frame_lossless(
     // larger than a group (Stage B).
     if !single_group
         && num_color == 3
-        && (progressive || std::env::var("JIXEL_SQUEEZE").as_deref() == Ok("1"))
+        && progressive
         && encode_squeeze_multigroup(
             linear,
             alpha,
