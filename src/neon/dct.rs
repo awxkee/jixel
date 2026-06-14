@@ -29,6 +29,7 @@
 
 use crate::dct::{WC4, WC8, WC16, WC32};
 use std::arch::aarch64::*;
+use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy)]
 struct NeonDoubledVector {
@@ -205,6 +206,22 @@ fn scale_and_store(cols: &[NeonDoubledVector; 8], scale: f32, out: &mut [f32; 64
         unsafe {
             vst1q_f32(out[k * 8..].as_mut_ptr(), vmulq_n_f32(col.lo, scale));
             vst1q_f32(out[k * 8 + 4..].as_mut_ptr(), vmulq_n_f32(col.hi, scale));
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn scale_and_store_uninit(
+    cols: &[NeonDoubledVector; 8],
+    scale: f32,
+    out: &mut MaybeUninit<[f32; 64]>,
+) {
+    for (k, col) in cols.iter().enumerate() {
+        unsafe {
+            let dst_ptr = out.as_mut_ptr() as *mut f32;
+            vst1q_f32(dst_ptr.add(k * 8), vmulq_n_f32(col.lo, scale));
+            vst1q_f32(dst_ptr.add(k * 8 + 4), vmulq_n_f32(col.hi, scale));
         }
     }
 }
@@ -468,8 +485,7 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
         lo: vdupq_n_f32(0.0),
         hi: vdupq_n_f32(0.0),
     };
-    let mut after_col = [0.0f32; 1024];
-    // ── Column DCT: lane j = column g*8+j, vector index = row. ──
+    let mut after_col_u = MaybeUninit::<[f32; 1024]>::uninit();
     for g in 0..4 {
         let mut c = [zero; 32];
         for r in 0..32 {
@@ -481,13 +497,17 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
         }
         dct1d_32_v(&mut c);
         for v in 0..32 {
-            let p = unsafe { after_col.get_unchecked_mut(v * 32 + g * 8..) };
+            let after_col_dst = after_col_u.as_mut_ptr() as *mut f32;
+            let p = unsafe { after_col_dst.add(v * 32 + g * 8) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[v].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+                vst1q_f32(p, c[v].lo);
+                vst1q_f32(p.add(4), c[v].hi);
             }
         }
     }
+
+    let after_col = unsafe { after_col_u.assume_init() };
+
     for g in 0..4 {
         let mut c = [zero; 32];
         for u in 0..32 {
@@ -608,8 +628,9 @@ pub(crate) fn dct4x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     dct1d_8_v(&mut r);
     transpose_8x8(&mut r);
 
-    let mut buf = [0.0f32; 64];
-    scale_and_store(&r, 1.0 / 32.0, &mut buf);
+    let mut buf_u = MaybeUninit::<[f32; 64]>::uninit();
+    scale_and_store_uninit(&r, 1.0 / 32.0, &mut buf_u);
+    let buf = unsafe { buf_u.assume_init() };
     for k in 0..8 {
         let vf = k % 4;
         let half = k / 4;
@@ -636,8 +657,9 @@ pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     let combo: [NeonDoubledVector; 8] = [
         left[0], left[1], left[2], left[3], right[0], right[1], right[2], right[3],
     ];
-    let mut buf = [0.0f32; 64];
-    scale_and_store(&combo, 1.0 / 32.0, &mut buf);
+    let mut buf_u = MaybeUninit::<[f32; 64]>::uninit();
+    scale_and_store_uninit(&combo, 1.0 / 32.0, &mut buf_u);
+    let buf = unsafe { buf_u.assume_init() };
     for hf in 0..4 {
         for vf in 0..8 {
             output[(hf * 2) * 8 + vf] = buf[hf * 8 + vf];
@@ -656,7 +678,7 @@ pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
         lo: vdupq_n_f32(0.0),
         hi: vdupq_n_f32(0.0),
     };
-    let mut after_col = [0.0f32; 512];
+    let mut after_col_u = MaybeUninit::<[f32; 512]>::uninit();
     for g in 0..2 {
         let mut c = [zero; 32];
         for r in 0..32 {
@@ -668,13 +690,17 @@ pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
         }
         dct1d_32_v(&mut c);
         for v in 0..32 {
-            let p = unsafe { after_col.get_unchecked_mut(v * 16 + g * 8..) };
+            let after_col_dst = after_col_u.as_mut_ptr() as *mut f32;
+            let p = unsafe { after_col_dst.add(v * 16 + g * 8) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[v].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+                vst1q_f32(p, c[v].lo);
+                vst1q_f32(p.add(4), c[v].hi);
             }
         }
     }
+
+    let after_col = unsafe { after_col_u.assume_init() };
+
     let scale = 1.0 / 512.0;
     for g in 0..4 {
         let b = g * 8;
@@ -715,7 +741,7 @@ pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
         lo: vdupq_n_f32(0.0),
         hi: vdupq_n_f32(0.0),
     };
-    let mut after_row = [0.0f32; 512];
+    let mut after_row_u = MaybeUninit::<[f32; 512]>::uninit();
     for g in 0..2 {
         let b = g * 8;
         let mut c = [zero; 32];
@@ -737,13 +763,17 @@ pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
         }
         dct1d_32_v(&mut c);
         for u in 0..32 {
-            let p = unsafe { after_row.get_unchecked_mut(u * 16 + b..) };
+            let after_row_ptr = after_row_u.as_mut_ptr() as *mut f32;
+            let p = unsafe { after_row_ptr.add(u * 16 + b) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[u].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[u].hi);
+                vst1q_f32(p, c[u].lo);
+                vst1q_f32(p.add(4), c[u].hi);
             }
         }
     }
+
+    let after_row = unsafe { after_row_u.assume_init() };
+
     let scale = 1.0 / 512.0;
     for g in 0..4 {
         let b = g * 8;
