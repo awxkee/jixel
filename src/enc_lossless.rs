@@ -1254,11 +1254,19 @@ fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
         if std::arch::is_aarch64_feature_detected!("neon") {
             return |c, p, o, g| unsafe { crate::neon::grad_pack_interior(c, p, o, g) };
         }
-        grad_pack_interior_scalar
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+        {
+            return crate::wasm::grad_pack_interior;
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
+        {
+            grad_pack_interior_scalar
+        }
     });
     f(cur, prev, out, gw)
 }
 
+#[allow(unused)]
 fn grad_pack_interior_scalar(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
     for gx in 1..gw {
         let w = cur[gx - 1];

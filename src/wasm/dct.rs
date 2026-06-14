@@ -28,53 +28,53 @@
  */
 
 use crate::dct::{WC4, WC8, WC16, WC32};
-use std::arch::aarch64::*;
+use core::arch::wasm32::*;
 
 #[derive(Clone, Copy)]
-struct NeonDoubledVector {
-    lo: float32x4_t,
-    hi: float32x4_t,
+struct WasmDoubledVector {
+    lo: v128,
+    hi: v128,
 }
 
-impl NeonDoubledVector {
+impl WasmDoubledVector {
     #[inline]
-    #[target_feature(enable = "neon")]
-    fn add(self, rhs: NeonDoubledVector) -> NeonDoubledVector {
-        NeonDoubledVector {
-            lo: vaddq_f32(self.lo, rhs.lo),
-            hi: vaddq_f32(self.hi, rhs.hi),
+    #[target_feature(enable = "simd128")]
+    fn add(self, rhs: WasmDoubledVector) -> WasmDoubledVector {
+        WasmDoubledVector {
+            lo: f32x4_add(self.lo, rhs.lo),
+            hi: f32x4_add(self.hi, rhs.hi),
         }
     }
     #[inline]
-    #[target_feature(enable = "neon")]
-    fn sub(self, rhs: NeonDoubledVector) -> NeonDoubledVector {
-        NeonDoubledVector {
-            lo: vsubq_f32(self.lo, rhs.lo),
-            hi: vsubq_f32(self.hi, rhs.hi),
+    #[target_feature(enable = "simd128")]
+    fn sub(self, rhs: WasmDoubledVector) -> WasmDoubledVector {
+        WasmDoubledVector {
+            lo: f32x4_sub(self.lo, rhs.lo),
+            hi: f32x4_sub(self.hi, rhs.hi),
         }
     }
 
     #[inline]
-    #[target_feature(enable = "neon")]
-    fn muls(self, s: f32) -> NeonDoubledVector {
-        NeonDoubledVector {
-            lo: vmulq_n_f32(self.lo, s),
-            hi: vmulq_n_f32(self.hi, s),
+    #[target_feature(enable = "simd128")]
+    fn muls(self, s: f32) -> WasmDoubledVector {
+        WasmDoubledVector {
+            lo: f32x4_mul(self.lo, f32x4_splat(s)),
+            hi: f32x4_mul(self.hi, f32x4_splat(s)),
         }
     }
     #[inline]
-    #[target_feature(enable = "neon")]
-    fn fma(self, b: NeonDoubledVector, s: f32) -> NeonDoubledVector {
-        NeonDoubledVector {
-            lo: vfmaq_n_f32(self.lo, b.lo, s),
-            hi: vfmaq_n_f32(self.hi, b.hi, s),
+    #[target_feature(enable = "simd128")]
+    fn fma(self, b: WasmDoubledVector, s: f32) -> WasmDoubledVector {
+        WasmDoubledVector {
+            lo: f32x4_add(self.lo, f32x4_mul(b.lo, f32x4_splat(s))),
+            hi: f32x4_add(self.hi, f32x4_mul(b.hi, f32x4_splat(s))),
         }
     }
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn dct1d_4_v(c: &mut [NeonDoubledVector; 4]) {
+#[target_feature(enable = "simd128")]
+fn dct1d_4_v(c: &mut [WasmDoubledVector; 4]) {
     let t0 = c[0].add(c[3]);
     let t1 = c[1].add(c[2]);
     let sum = t0.add(t1);
@@ -93,8 +93,8 @@ fn dct1d_4_v(c: &mut [NeonDoubledVector; 4]) {
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn dct1d_8_v(c: &mut [NeonDoubledVector; 8]) {
+#[target_feature(enable = "simd128")]
+fn dct1d_8_v(c: &mut [WasmDoubledVector; 8]) {
     let mut evens = [
         c[0].add(c[7]),
         c[1].add(c[6]),
@@ -126,63 +126,46 @@ fn dct1d_8_v(c: &mut [NeonDoubledVector; 8]) {
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn transpose_4x4(
-    r0: float32x4_t,
-    r1: float32x4_t,
-    r2: float32x4_t,
-    r3: float32x4_t,
-) -> (float32x4_t, float32x4_t, float32x4_t, float32x4_t) {
-    let v0 = vtrn1q_f32(r0, r1);
-    let v1 = vtrn2q_f32(r0, r1);
-    let v2 = vtrn1q_f32(r2, r3);
-    let v3 = vtrn2q_f32(r2, r3);
-    let c0 = vreinterpretq_f32_f64(vtrn1q_f64(
-        vreinterpretq_f64_f32(v0),
-        vreinterpretq_f64_f32(v2),
-    ));
-    let c1 = vreinterpretq_f32_f64(vtrn1q_f64(
-        vreinterpretq_f64_f32(v1),
-        vreinterpretq_f64_f32(v3),
-    ));
-    let c2 = vreinterpretq_f32_f64(vtrn2q_f64(
-        vreinterpretq_f64_f32(v0),
-        vreinterpretq_f64_f32(v2),
-    ));
-    let c3 = vreinterpretq_f32_f64(vtrn2q_f64(
-        vreinterpretq_f64_f32(v1),
-        vreinterpretq_f64_f32(v3),
-    ));
+#[target_feature(enable = "simd128")]
+fn transpose_4x4(r0: v128, r1: v128, r2: v128, r3: v128) -> (v128, v128, v128, v128) {
+    let v0 = i32x4_shuffle::<0, 4, 2, 6>(r0, r1);
+    let v1 = i32x4_shuffle::<1, 5, 3, 7>(r0, r1);
+    let v2 = i32x4_shuffle::<0, 4, 2, 6>(r2, r3);
+    let v3 = i32x4_shuffle::<1, 5, 3, 7>(r2, r3);
+    let c0 = i32x4_shuffle::<0, 1, 4, 5>(v0, v2);
+    let c1 = i32x4_shuffle::<0, 1, 4, 5>(v1, v3);
+    let c2 = i32x4_shuffle::<2, 3, 6, 7>(v0, v2);
+    let c3 = i32x4_shuffle::<2, 3, 6, 7>(v1, v3);
     (c0, c1, c2, c3)
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn transpose_8x8(c: &mut [NeonDoubledVector; 8]) {
+#[target_feature(enable = "simd128")]
+fn transpose_8x8(c: &mut [WasmDoubledVector; 8]) {
     let (a0, a1, a2, a3) = transpose_4x4(c[0].lo, c[1].lo, c[2].lo, c[3].lo);
     let (b0, b1, b2, b3) = transpose_4x4(c[0].hi, c[1].hi, c[2].hi, c[3].hi);
     let (cc0, cc1, cc2, cc3) = transpose_4x4(c[4].lo, c[5].lo, c[6].lo, c[7].lo);
     let (d0, d1, d2, d3) = transpose_4x4(c[4].hi, c[5].hi, c[6].hi, c[7].hi);
 
-    c[0] = NeonDoubledVector { lo: a0, hi: cc0 };
-    c[1] = NeonDoubledVector { lo: a1, hi: cc1 };
-    c[2] = NeonDoubledVector { lo: a2, hi: cc2 };
-    c[3] = NeonDoubledVector { lo: a3, hi: cc3 };
-    c[4] = NeonDoubledVector { lo: b0, hi: d0 };
-    c[5] = NeonDoubledVector { lo: b1, hi: d1 };
-    c[6] = NeonDoubledVector { lo: b2, hi: d2 };
-    c[7] = NeonDoubledVector { lo: b3, hi: d3 };
+    c[0] = WasmDoubledVector { lo: a0, hi: cc0 };
+    c[1] = WasmDoubledVector { lo: a1, hi: cc1 };
+    c[2] = WasmDoubledVector { lo: a2, hi: cc2 };
+    c[3] = WasmDoubledVector { lo: a3, hi: cc3 };
+    c[4] = WasmDoubledVector { lo: b0, hi: d0 };
+    c[5] = WasmDoubledVector { lo: b1, hi: d1 };
+    c[6] = WasmDoubledVector { lo: b2, hi: d2 };
+    c[7] = WasmDoubledVector { lo: b3, hi: d3 };
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn load<const N: usize>(ptr: &[f32; N], stride: usize) -> [NeonDoubledVector; 8] {
-    let row = |y: usize| -> NeonDoubledVector {
+#[target_feature(enable = "simd128")]
+fn load<const N: usize>(ptr: &[f32; N], stride: usize) -> [WasmDoubledVector; 8] {
+    let row = |y: usize| -> WasmDoubledVector {
         unsafe {
             let p = &ptr[y * stride..];
-            NeonDoubledVector {
-                lo: vld1q_f32(p.as_ptr()),
-                hi: vld1q_f32(p[4..].as_ptr()),
+            WasmDoubledVector {
+                lo: v128_load(p.as_ptr() as *const f32 as *const v128),
+                hi: v128_load(p[4..].as_ptr() as *const f32 as *const v128),
             }
         }
     };
@@ -199,18 +182,24 @@ fn load<const N: usize>(ptr: &[f32; N], stride: usize) -> [NeonDoubledVector; 8]
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn scale_and_store(cols: &[NeonDoubledVector; 8], scale: f32, out: &mut [f32; 64]) {
+#[target_feature(enable = "simd128")]
+fn scale_and_store(cols: &[WasmDoubledVector; 8], scale: f32, out: &mut [f32; 64]) {
     for (k, col) in cols.iter().enumerate() {
         unsafe {
-            vst1q_f32(out[k * 8..].as_mut_ptr(), vmulq_n_f32(col.lo, scale));
-            vst1q_f32(out[k * 8 + 4..].as_mut_ptr(), vmulq_n_f32(col.hi, scale));
+            v128_store(
+                out[k * 8..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(col.lo, f32x4_splat(scale)),
+            );
+            v128_store(
+                out[k * 8 + 4..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(col.hi, f32x4_splat(scale)),
+            );
         }
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct8x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct8x8_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
     let mut cols = load(input, 8);
     dct1d_8_v(&mut cols);
     transpose_8x8(&mut cols);
@@ -219,8 +208,8 @@ pub(crate) fn dct8x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn dct1d_16_v(c: &mut [NeonDoubledVector; 16]) {
+#[target_feature(enable = "simd128")]
+fn dct1d_16_v(c: &mut [WasmDoubledVector; 16]) {
     let mut evens = [
         c[0].add(c[15]),
         c[1].add(c[14]),
@@ -272,13 +261,13 @@ fn dct1d_16_v(c: &mut [NeonDoubledVector; 16]) {
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn load8_128(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 8] {
+#[target_feature(enable = "simd128")]
+fn load8_128(ptr: &[f32], stride: usize) -> [WasmDoubledVector; 8] {
     let row = |y: usize| unsafe {
         let p = ptr.get_unchecked(y * stride..);
-        NeonDoubledVector {
-            lo: vld1q_f32(p.as_ptr()),
-            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
+        WasmDoubledVector {
+            lo: v128_load(p.as_ptr() as *const f32 as *const v128),
+            hi: v128_load(p.get_unchecked(4..).as_ptr() as *const f32 as *const v128),
         }
     };
     [
@@ -293,14 +282,14 @@ fn load8_128(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 8] {
     ]
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct8x16_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
     let mut left = load8_128(input, 16);
     let mut right = load8_128(&input[8..], 16);
 
-    let mut c = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+    let mut c = [WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     }; 16];
 
     transpose_8x8(&mut left);
@@ -311,8 +300,8 @@ pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
 
     dct1d_16_v(&mut c);
 
-    let mut cl: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
-    let mut cr: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
+    let mut cl: [WasmDoubledVector; 8] = c[0..8].try_into().unwrap();
+    let mut cr: [WasmDoubledVector; 8] = c[8..16].try_into().unwrap();
     transpose_8x8(&mut cl);
     transpose_8x8(&mut cr);
     dct1d_8_v(&mut cl);
@@ -322,34 +311,46 @@ pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
     for m in 0..8 {
         let base = &mut output[m * 16..];
         unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(cl[m].lo, scale));
-            vst1q_f32(&mut base[4], vmulq_n_f32(cl[m].hi, scale));
-            vst1q_f32(&mut base[8], vmulq_n_f32(cr[m].lo, scale));
-            vst1q_f32(&mut base[12], vmulq_n_f32(cr[m].hi, scale));
+            v128_store(
+                base.as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(cl[m].lo, f32x4_splat(scale)),
+            );
+            v128_store(
+                &mut base[4] as *mut f32 as *mut v128,
+                f32x4_mul(cl[m].hi, f32x4_splat(scale)),
+            );
+            v128_store(
+                &mut base[8] as *mut f32 as *mut v128,
+                f32x4_mul(cr[m].lo, f32x4_splat(scale)),
+            );
+            v128_store(
+                &mut base[12] as *mut f32 as *mut v128,
+                f32x4_mul(cr[m].hi, f32x4_splat(scale)),
+            );
         }
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
-    let mut c = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct16x8_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
+    let mut c = [WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     }; 16];
     for v in 0..16 {
         let p = &input[v * 8..];
         unsafe {
-            c[v] = NeonDoubledVector {
-                lo: vld1q_f32(p.as_ptr()),
-                hi: vld1q_f32(p[4..].as_ptr()),
+            c[v] = WasmDoubledVector {
+                lo: v128_load(p.as_ptr() as *const f32 as *const v128),
+                hi: v128_load(p[4..].as_ptr() as *const f32 as *const v128),
             };
         }
     }
 
     dct1d_16_v(&mut c);
 
-    let mut top: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
-    let mut bot: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
+    let mut top: [WasmDoubledVector; 8] = c[0..8].try_into().unwrap();
+    let mut bot: [WasmDoubledVector; 8] = c[8..16].try_into().unwrap();
     transpose_8x8(&mut top);
     transpose_8x8(&mut bot);
     dct1d_8_v(&mut top);
@@ -359,22 +360,34 @@ pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
     for m in 0..8 {
         let base = &mut output[m * 16..];
         unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(top[m].lo, scale)); // v = 0..4
-            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(top[m].hi, scale)); // v = 4..8
-            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(bot[m].lo, scale)); // v = 8..12
-            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(bot[m].hi, scale)); // v = 12..16
+            v128_store(
+                base.as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(top[m].lo, f32x4_splat(scale)),
+            ); // v = 0..4
+            v128_store(
+                base[4..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(top[m].hi, f32x4_splat(scale)),
+            ); // v = 4..8
+            v128_store(
+                base[8..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(bot[m].lo, f32x4_splat(scale)),
+            ); // v = 8..12
+            v128_store(
+                base[12..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(bot[m].hi, f32x4_splat(scale)),
+            ); // v = 12..16
         }
     }
 }
 
 #[inline]
-#[target_feature(enable = "neon")]
-fn load16_256(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 16] {
+#[target_feature(enable = "simd128")]
+fn load16_256(ptr: &[f32], stride: usize) -> [WasmDoubledVector; 16] {
     let row = |y: usize| unsafe {
         let p = ptr.get_unchecked(y * stride..);
-        NeonDoubledVector {
-            lo: vld1q_f32(p.as_ptr()),
-            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
+        WasmDoubledVector {
+            lo: v128_load(p.as_ptr() as *const f32 as *const v128),
+            hi: v128_load(p.get_unchecked(4..).as_ptr() as *const f32 as *const v128),
         }
     };
     [
@@ -397,8 +410,8 @@ fn load16_256(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 16] {
     ]
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct16x16_wasm(input: &[f32; 256], output: &mut [f32; 256]) {
     let mut c_l = load16_256(input.as_slice(), 16);
     let mut c_r = load16_256(&input[8..], 16);
 
@@ -406,19 +419,19 @@ pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
     dct1d_16_v(&mut c_r);
 
     // Step 4: split into row-freq groups 0..8 and 8..16.
-    let mut top_l: [NeonDoubledVector; 8] = c_l[0..8].try_into().unwrap();
-    let mut bot_l: [NeonDoubledVector; 8] = c_l[8..16].try_into().unwrap();
-    let mut top_r: [NeonDoubledVector; 8] = c_r[0..8].try_into().unwrap();
-    let mut bot_r: [NeonDoubledVector; 8] = c_r[8..16].try_into().unwrap();
+    let mut top_l: [WasmDoubledVector; 8] = c_l[0..8].try_into().unwrap();
+    let mut bot_l: [WasmDoubledVector; 8] = c_l[8..16].try_into().unwrap();
+    let mut top_r: [WasmDoubledVector; 8] = c_r[0..8].try_into().unwrap();
+    let mut bot_r: [WasmDoubledVector; 8] = c_r[8..16].try_into().unwrap();
 
     transpose_8x8(&mut top_l);
     transpose_8x8(&mut bot_l);
     transpose_8x8(&mut top_r);
     transpose_8x8(&mut bot_r);
 
-    let mut d_a = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+    let mut d_a = [WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     }; 16];
     let mut d_b = d_a;
     d_a[0..8].copy_from_slice(&top_l);
@@ -434,16 +447,28 @@ pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
     for u in 0..16 {
         let base = &mut output[u * 16..];
         unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(d_a[u].lo, scale));
-            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(d_a[u].hi, scale));
-            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(d_b[u].lo, scale));
-            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(d_b[u].hi, scale));
+            v128_store(
+                base.as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(d_a[u].lo, f32x4_splat(scale)),
+            );
+            v128_store(
+                base[4..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(d_a[u].hi, f32x4_splat(scale)),
+            );
+            v128_store(
+                base[8..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(d_b[u].lo, f32x4_splat(scale)),
+            );
+            v128_store(
+                base[12..].as_mut_ptr() as *mut f32 as *mut v128,
+                f32x4_mul(d_b[u].hi, f32x4_splat(scale)),
+            );
         }
     }
 }
 
-#[target_feature(enable = "neon")]
-fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
+#[target_feature(enable = "simd128")]
+fn dct1d_32_v(c: &mut [WasmDoubledVector; 32]) {
     let mut evens = [c[0]; 16];
     let mut odds = [c[0]; 16];
     for i in 0..16 {
@@ -462,11 +487,11 @@ fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct32x32_wasm(input: &[f32; 1024], output: &mut [f32; 1024]) {
+    let zero = WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     };
     let mut after_col = [0.0f32; 1024];
     // ── Column DCT: lane j = column g*8+j, vector index = row. ──
@@ -474,17 +499,22 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
         let mut c = [zero; 32];
         for r in 0..32 {
             let p = unsafe { input.get_unchecked(r * 32 + g * 8..) };
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(p.as_ptr()) },
-                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
+            c[r] = WasmDoubledVector {
+                lo: unsafe { v128_load(p.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe {
+                    v128_load(p.get_unchecked(4..).as_ptr() as *const f32 as *const v128)
+                },
             };
         }
         dct1d_32_v(&mut c);
         for v in 0..32 {
             let p = unsafe { after_col.get_unchecked_mut(v * 32 + g * 8..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[v].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+                v128_store(p.as_mut_ptr() as *mut f32 as *mut v128, c[v].lo);
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    c[v].hi,
+                );
             }
         }
     }
@@ -502,9 +532,9 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
                 after_col[(b + 6) * 32 + u],
                 after_col[(b + 7) * 32 + u],
             ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            c[u] = WasmDoubledVector {
+                lo: unsafe { v128_load(lanes.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe { v128_load(lanes.as_ptr().add(4) as *const f32 as *const v128) },
             };
         }
         dct1d_32_v(&mut c);
@@ -513,37 +543,40 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
             // c[u].lane[j] = row-DCT freq u for row g*8+j; output is transposed.
             let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[u].hi, scale),
+                v128_store(
+                    p.as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[u].lo, f32x4_splat(scale)),
+                );
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[u].hi, f32x4_splat(scale)),
                 );
             }
         }
     }
 }
 
-#[target_feature(enable = "neon")]
-fn dct1d_4_q(c: &mut [float32x4_t; 4]) {
-    let t0 = vaddq_f32(c[0], c[3]);
-    let t1 = vaddq_f32(c[1], c[2]);
-    let sum = vaddq_f32(t0, t1);
-    let diff = vsubq_f32(t0, t1);
-    let t2 = vmulq_n_f32(vsubq_f32(c[0], c[3]), WC4[0]);
-    let t3 = vmulq_n_f32(vsubq_f32(c[1], c[2]), WC4[1]);
-    let t2p = vaddq_f32(t2, t3);
-    let t3p = vsubq_f32(t2, t3);
-    let t2pp = vfmaq_n_f32(t3p, t2p, std::f32::consts::SQRT_2);
+#[target_feature(enable = "simd128")]
+fn dct1d_4_q(c: &mut [v128; 4]) {
+    let t0 = f32x4_add(c[0], c[3]);
+    let t1 = f32x4_add(c[1], c[2]);
+    let sum = f32x4_add(t0, t1);
+    let diff = f32x4_sub(t0, t1);
+    let t2 = f32x4_mul(f32x4_sub(c[0], c[3]), f32x4_splat(WC4[0]));
+    let t3 = f32x4_mul(f32x4_sub(c[1], c[2]), f32x4_splat(WC4[1]));
+    let t2p = f32x4_add(t2, t3);
+    let t3p = f32x4_sub(t2, t3);
+    let t2pp = f32x4_add(t3p, f32x4_mul(t2p, f32x4_splat(std::f32::consts::SQRT_2)));
     c[0] = sum;
     c[1] = t2pp;
     c[2] = diff;
     c[3] = t3p;
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct4x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
     // Gather q[r*4+c].lane[k] = input[(qy*4+r)*8 + (qx*4+c)], k = qy*2+qx.
-    let mut q = [vdupq_n_f32(0.0); 16];
+    let mut q = [f32x4_splat(0.0); 16];
     for r in 0..4 {
         for col in 0..4 {
             let lanes = [
@@ -552,7 +585,7 @@ pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
                 input[(4 + r) * 8 + col],       // k=2 (qy1,qx0)
                 input[(4 + r) * 8 + (4 + col)], // k=3 (qy1,qx1)
             ];
-            q[r * 4 + col] = unsafe { vld1q_f32(lanes.as_ptr()) };
+            q[r * 4 + col] = unsafe { v128_load(lanes.as_ptr() as *const f32 as *const v128) };
         }
     }
     // Row DCT.
@@ -569,7 +602,12 @@ pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
         let mut cc = [q[col], q[4 + col], q[8 + col], q[12 + col]];
         dct1d_4_q(&mut cc);
         for i in 0..4 {
-            unsafe { vst1q_f32(d[col * 4 + i].as_mut_ptr(), vmulq_n_f32(cc[i], 1.0 / 16.0)) };
+            unsafe {
+                v128_store(
+                    d[col * 4 + i].as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(cc[i], f32x4_splat(1.0 / 16.0)),
+                )
+            };
         }
     }
     // Scatter d[iy*4+ix].lane[k] → output[(qy+iy*2)*8 + (qx+ix*2)].
@@ -594,14 +632,14 @@ pub(crate) fn dct4x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     output[9] = (b00 - b01 - b10 + b11) * 0.25;
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct4x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct4x8_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
     let rows = load(input, 8);
-    let mut top: [NeonDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
-    let mut bot: [NeonDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    let mut top: [WasmDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut bot: [WasmDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
     dct1d_4_v(&mut top);
     dct1d_4_v(&mut bot);
-    let mut r: [NeonDoubledVector; 8] = [
+    let mut r: [WasmDoubledVector; 8] = [
         top[0], top[1], top[2], top[3], bot[0], bot[1], bot[2], bot[3],
     ];
     transpose_8x8(&mut r);
@@ -623,17 +661,17 @@ pub(crate) fn dct4x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct8x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
     let mut rows = load(input, 8);
     dct1d_8_v(&mut rows);
     transpose_8x8(&mut rows);
-    let mut left: [NeonDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
-    let mut right: [NeonDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
+    let mut left: [WasmDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
+    let mut right: [WasmDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
     dct1d_4_v(&mut left);
     dct1d_4_v(&mut right);
 
-    let combo: [NeonDoubledVector; 8] = [
+    let combo: [WasmDoubledVector; 8] = [
         left[0], left[1], left[2], left[3], right[0], right[1], right[2], right[3],
     ];
     let mut buf = [0.0f32; 64];
@@ -650,28 +688,33 @@ pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct32x16_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
+    let zero = WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     };
     let mut after_col = [0.0f32; 512];
     for g in 0..2 {
         let mut c = [zero; 32];
         for r in 0..32 {
             let p = unsafe { input.get_unchecked(r * 16 + g * 8..) };
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(p.as_ptr()) },
-                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
+            c[r] = WasmDoubledVector {
+                lo: unsafe { v128_load(p.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe {
+                    v128_load(p.get_unchecked(4..).as_ptr() as *const f32 as *const v128)
+                },
             };
         }
         dct1d_32_v(&mut c);
         for v in 0..32 {
             let p = unsafe { after_col.get_unchecked_mut(v * 16 + g * 8..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[v].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[v].hi);
+                v128_store(p.as_mut_ptr() as *mut f32 as *mut v128, c[v].lo);
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    c[v].hi,
+                );
             }
         }
     }
@@ -690,30 +733,33 @@ pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
                 after_col[(b + 6) * 16 + u],
                 after_col[(b + 7) * 16 + u],
             ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            c[u] = WasmDoubledVector {
+                lo: unsafe { v128_load(lanes.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe { v128_load(lanes.as_ptr().add(4) as *const f32 as *const v128) },
             };
         }
         dct1d_16_v(&mut c);
         for u in 0..16 {
             let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[u].hi, scale),
+                v128_store(
+                    p.as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[u].lo, f32x4_splat(scale)),
+                );
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[u].hi, f32x4_splat(scale)),
                 );
             }
         }
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct16x32_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
+    let zero = WasmDoubledVector {
+        lo: f32x4_splat(0.0),
+        hi: f32x4_splat(0.0),
     };
     let mut after_row = [0.0f32; 512];
     for g in 0..2 {
@@ -730,17 +776,20 @@ pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
                 input[(b + 6) * 32 + u],
                 input[(b + 7) * 32 + u],
             ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            c[u] = WasmDoubledVector {
+                lo: unsafe { v128_load(lanes.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe { v128_load(lanes.as_ptr().add(4) as *const f32 as *const v128) },
             };
         }
         dct1d_32_v(&mut c);
         for u in 0..32 {
             let p = unsafe { after_row.get_unchecked_mut(u * 16 + b..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), c[u].lo);
-                vst1q_f32(p.get_unchecked_mut(4..).as_mut_ptr(), c[u].hi);
+                v128_store(p.as_mut_ptr() as *mut f32 as *mut v128, c[u].lo);
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    c[u].hi,
+                );
             }
         }
     }
@@ -759,19 +808,22 @@ pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
                 after_row[(b + 6) * 16 + r],
                 after_row[(b + 7) * 16 + r],
             ];
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
+            c[r] = WasmDoubledVector {
+                lo: unsafe { v128_load(lanes.as_ptr() as *const f32 as *const v128) },
+                hi: unsafe { v128_load(lanes.as_ptr().add(4) as *const f32 as *const v128) },
             };
         }
         dct1d_16_v(&mut c);
         for v in 0..16 {
             let p = unsafe { output.get_unchecked_mut(v * 32 + g * 8..) };
             unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[v].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[v].hi, scale),
+                v128_store(
+                    p.as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[v].lo, f32x4_splat(scale)),
+                );
+                v128_store(
+                    p.get_unchecked_mut(4..).as_mut_ptr() as *mut f32 as *mut v128,
+                    f32x4_mul(c[v].hi, f32x4_splat(scale)),
                 );
             }
         }
@@ -784,11 +836,11 @@ mod neon_dct_tests {
 
     const ATOL: f32 = 1e-4;
 
-    fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
-        assert_eq!(neon.len(), scalar.len(), "{label}: length mismatch");
+    fn assert_close(wasm: &[f32], scalar: &[f32], label: &str) {
+        assert_eq!(wasm.len(), scalar.len(), "{label}: length mismatch");
         let mut max_err: f32 = 0.0;
         let mut worst = 0usize;
-        for (i, (n, s)) in neon.iter().zip(scalar.iter()).enumerate() {
+        for (i, (n, s)) in wasm.iter().zip(scalar.iter()).enumerate() {
             let e = (n - s).abs();
             if e > max_err {
                 max_err = e;
@@ -798,8 +850,8 @@ mod neon_dct_tests {
         assert!(
             max_err < ATOL,
             "{label}: max error {max_err:.2e} at index {worst} \
-             (neon={:.6}, scalar={:.6})",
-            neon[worst],
+             (wasm={:.6}, scalar={:.6})",
+            wasm[worst],
             scalar[worst]
         );
     }
@@ -825,49 +877,49 @@ mod neon_dct_tests {
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_vs_scalar_random() {
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         for seed in 0u64..32 {
             let input: [f32; 64] = fill(seed);
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_neon(&input, &mut got) };
+            unsafe { dct8x8_wasm(&input, &mut got) };
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_dc_only() {
         // All-constant input: only DC coefficient should be non-zero.
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         let input = [0.5f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_neon(&input, &mut got) };
+        unsafe { dct8x8_wasm(&input, &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 dc-only");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_zero() {
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         let input = [0.0f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_neon(&input, &mut got) };
+        unsafe { dct8x8_wasm(&input, &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 zero");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_linearity() {
         // DCT is linear: DCT(a + b) == DCT(a) + DCT(b)
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         let a: [f32; 64] = fill(100);
         let b: [f32; 64] = fill(200);
         let mut sum = [0.0f32; 64];
@@ -879,25 +931,25 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 64];
         let mut dsum = [0.0f32; 64];
         unsafe {
-            dct8x8_neon(&a, &mut da);
-            dct8x8_neon(&b, &mut db);
-            dct8x8_neon(&sum, &mut dsum);
+            dct8x8_wasm(&a, &mut da);
+            dct8x8_wasm(&b, &mut db);
+            dct8x8_wasm(&sum, &mut dsum);
         }
         let expected: Vec<f32> = (0..64).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x8 linearity");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_basis_vectors() {
         // Feed each of the 64 basis vectors (single 1.0) and compare to scalar.
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         for k in 0..64 {
             let mut input = [0.0f32; 64];
             input[k] = 1.0;
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_neon(&input, &mut got) };
+            unsafe { dct8x8_wasm(&input, &mut got) };
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 basis[{k}]"));
         }
@@ -906,62 +958,62 @@ mod neon_dct_tests {
     // ── dct8x16 ───────────────────────────────────────────────────────────────
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_vs_scalar_random() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         for seed in 0u64..32 {
             let input: [f32; 128] = fill(seed.wrapping_add(0xdead));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_neon(&input, &mut got) };
+            unsafe { dct8x16_wasm(&input, &mut got) };
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_dc_only() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_neon(&input, &mut got) };
+        unsafe { dct8x16_wasm(&input, &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 dc-only");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_zero() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_neon(&input, &mut got) };
+        unsafe { dct8x16_wasm(&input, &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 zero");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_basis_vectors() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         for k in 0..128 {
             let mut input = [0.0f32; 128];
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_neon(&input, &mut got) };
+            unsafe { dct8x16_wasm(&input, &mut got) };
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 basis[{k}]"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_linearity() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         let a: [f32; 128] = fill(300);
         let b: [f32; 128] = fill(400);
         let mut sum = [0.0f32; 128];
@@ -972,101 +1024,101 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
         unsafe {
-            dct8x16_neon(&a, &mut da);
-            dct8x16_neon(&b, &mut db);
-            dct8x16_neon(&sum, &mut dsum);
+            dct8x16_wasm(&a, &mut da);
+            dct8x16_wasm(&b, &mut db);
+            dct8x16_wasm(&sum, &mut dsum);
         }
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x16 linearity");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_vs_scalar_random() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         for seed in 0u64..32 {
             let input: [f32; 128] = fill(seed.wrapping_add(0xbeef));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_neon(&input, &mut got) };
+            unsafe { dct16x8_wasm(&input, &mut got) };
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct4x8_neon_vs_scalar_random() {
         use crate::dct::dct4x8_scalar;
-        use crate::neon::dct4x8_neon;
+        use crate::wasm::dct4x8_wasm;
         for seed in 0u64..32 {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x8_neon(&input, &mut got) };
+            unsafe { dct4x8_wasm(&input, &mut got) };
             dct4x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x4_neon_vs_scalar_random() {
         use crate::dct::dct8x4_scalar;
-        use crate::neon::dct8x4_neon;
+        use crate::wasm::dct8x4_wasm;
         for seed in 0u64..32 {
             let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x4_neon(&input, &mut got) };
+            unsafe { dct8x4_wasm(&input, &mut got) };
             dct8x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_dc_only() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_neon(&input, &mut got) };
+        unsafe { dct16x8_wasm(&input, &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 dc-only");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_zero() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_neon(&input, &mut got) };
+        unsafe { dct16x8_wasm(&input, &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 zero");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_basis_vectors() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         for k in 0..128 {
             let mut input = [0.0f32; 128];
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_neon(&input, &mut got) };
+            unsafe { dct16x8_wasm(&input, &mut got) };
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 basis[{k}]"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_linearity() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         let a: [f32; 128] = fill(500);
         let b: [f32; 128] = fill(600);
         let mut sum = [0.0f32; 128];
@@ -1077,9 +1129,9 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
         unsafe {
-            dct16x8_neon(&a, &mut da);
-            dct16x8_neon(&b, &mut db);
-            dct16x8_neon(&sum, &mut dsum);
+            dct16x8_wasm(&a, &mut da);
+            dct16x8_wasm(&b, &mut db);
+            dct16x8_wasm(&sum, &mut dsum);
         }
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x8 linearity");
@@ -1092,16 +1144,16 @@ mod neon_dct_tests {
     // for an all-constant input (DC is rotation-invariant).
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dc_coefficient_constant_input() {
-        use crate::neon::{dct8x16_neon, dct16x8_neon};
+        use crate::wasm::{dct8x16_wasm, dct16x8_wasm};
         let input = [0.25f32; 128];
 
         let mut out8x16 = [0.0f32; 128];
         let mut out16x8 = [0.0f32; 128];
         unsafe {
-            dct8x16_neon(&input, &mut out8x16);
-            dct16x8_neon(&input, &mut out16x8);
+            dct8x16_wasm(&input, &mut out8x16);
+            dct16x8_wasm(&input, &mut out16x8);
         }
         // DC is at index 0 in both output layouts.
         assert!(
@@ -1115,9 +1167,9 @@ mod neon_dct_tests {
     // ── Extreme values ────────────────────────────────────────────────────────
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x8_neon_extreme_values() {
-        use crate::neon::dct8x8_neon;
+        use crate::wasm::dct8x8_wasm;
         // Alternating +1/-1 (highest-frequency input)
         let mut input = [0.0f32; 64];
         for i in 0..64 {
@@ -1125,162 +1177,162 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_neon(&input, &mut got) };
+        unsafe { dct8x8_wasm(&input, &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 alternating +-1");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x8_neon_extreme_values() {
-        use crate::neon::dct16x8_neon;
+        use crate::wasm::dct16x8_wasm;
         let mut input = [0.0f32; 128];
         for i in 0..128 {
             input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_neon(&input, &mut got) };
+        unsafe { dct16x8_wasm(&input, &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 alternating +-1");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct8x16_neon_extreme_values() {
-        use crate::neon::dct8x16_neon;
+        use crate::wasm::dct8x16_wasm;
         let mut input = [0.0f32; 128];
         for i in 0..128 {
             input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_neon(&input, &mut got) };
+        unsafe { dct8x16_wasm(&input, &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 alternating +-1");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_vs_scalar_random() {
         use crate::dct::dct16x16_scalar;
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         for seed in 0u64..32 {
             let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_neon(&input, &mut got) };
+            unsafe { dct16x16_wasm(&input, &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct32x32_neon_vs_scalar_random() {
         use crate::dct::dct32x32_scalar;
-        use crate::neon::dct32x32_neon;
+        use crate::wasm::dct32x32_wasm;
         for seed in 0u64..16 {
             let input: [f32; 1024] = fill(seed.wrapping_add(0x3232));
             let mut got = [0.0f32; 1024];
             let mut want = [0.0f32; 1024];
-            unsafe { dct32x32_neon(&input, &mut got) };
+            unsafe { dct32x32_wasm(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct32x16_neon_vs_scalar_random() {
         use crate::dct::dct32x16_scalar;
-        use crate::neon::dct32x16_neon;
+        use crate::wasm::dct32x16_wasm;
         for seed in 0u64..16 {
             let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct32x16_neon(&input, &mut got) };
+            unsafe { dct32x16_wasm(&input, &mut got) };
             dct32x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x32_neon_vs_scalar_random() {
         use crate::dct::dct16x32_scalar;
-        use crate::neon::dct16x32_neon;
+        use crate::wasm::dct16x32_wasm;
         for seed in 0u64..16 {
             let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct16x32_neon(&input, &mut got) };
+            unsafe { dct16x32_wasm(&input, &mut got) };
             dct16x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct4x4_neon_vs_scalar_random() {
         use crate::dct::dct4x4_scalar;
-        use crate::neon::dct4x4_neon;
+        use crate::wasm::dct4x4_wasm;
         for seed in 0u64..32 {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x4_neon(&input, &mut got) };
+            unsafe { dct4x4_wasm(&input, &mut got) };
             dct4x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_dc_only() {
         use crate::dct::dct16x16_scalar;
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         let input = [0.5f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_neon(&input, &mut got) };
+        unsafe { dct16x16_wasm(&input, &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 dc-only");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_zero() {
         use crate::dct::dct16x16_scalar;
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         let input = [0.0f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_neon(&input, &mut got) };
+        unsafe { dct16x16_wasm(&input, &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 zero");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_basis_vectors() {
         use crate::dct::dct16x16_scalar;
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         for k in 0..256 {
             let mut input = [0.0f32; 256];
             input[k] = 1.0;
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_neon(&input, &mut got) };
+            unsafe { dct16x16_wasm(&input, &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
         }
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_linearity() {
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         let a: [f32; 256] = fill(700);
         let b: [f32; 256] = fill(800);
         let mut sum = [0.0f32; 256];
@@ -1291,26 +1343,26 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 256];
         let mut dsum = [0.0f32; 256];
         unsafe {
-            dct16x16_neon(&a, &mut da);
-            dct16x16_neon(&b, &mut db);
-            dct16x16_neon(&sum, &mut dsum);
+            dct16x16_wasm(&a, &mut da);
+            dct16x16_wasm(&b, &mut db);
+            dct16x16_wasm(&sum, &mut dsum);
         }
         let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x16 linearity");
     }
 
     #[test]
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
     fn test_dct16x16_neon_extreme_values() {
         use crate::dct::dct16x16_scalar;
-        use crate::neon::dct16x16_neon;
+        use crate::wasm::dct16x16_wasm;
         let mut input = [0.0f32; 256];
         for i in 0..256 {
             input[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_neon(&input, &mut got) };
+        unsafe { dct16x16_wasm(&input, &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
     }

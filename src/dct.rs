@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#![allow(unused)]
 use std::sync::{Arc, OnceLock};
 
 #[cfg(any(
@@ -121,6 +122,13 @@ fn select_dct() -> Arc<DctFn<64>> {
                 dct8x8_neon(input, output);
             });
         }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct8x8_wasm;
+        return Arc::new(|input, output| {
+            dct8x8_wasm(input, output);
+        });
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -262,6 +270,13 @@ fn select_dct_8x16() -> Arc<DctFn<128>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct8x16_wasm;
+        return Arc::new(|input, output| {
+            dct8x16_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -272,6 +287,7 @@ fn select_dct_8x16() -> Arc<DctFn<128>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct8x16_scalar(input, output);
     })
@@ -320,6 +336,13 @@ fn select_dct_16x8() -> Arc<DctFn<128>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct16x8_wasm;
+        return Arc::new(|input, output| {
+            dct16x8_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -330,6 +353,7 @@ fn select_dct_16x8() -> Arc<DctFn<128>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct16x8_scalar(input, output);
     })
@@ -392,6 +416,13 @@ fn select_dct_16x16() -> Arc<DctFn<256>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct16x16_wasm;
+        return Arc::new(|input, output| {
+            dct16x16_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -402,6 +433,7 @@ fn select_dct_16x16() -> Arc<DctFn<256>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct16x16_scalar(input, output);
     })
@@ -514,6 +546,13 @@ fn select_dct_4x4() -> Arc<DctFn<64>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct4x4_wasm;
+        return Arc::new(|input, output| {
+            dct4x4_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -524,6 +563,7 @@ fn select_dct_4x4() -> Arc<DctFn<64>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct4x4_scalar(input, output);
     })
@@ -689,6 +729,13 @@ fn select_dct_4x8() -> Arc<DctFn<64>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct4x8_wasm;
+        return Arc::new(|input, output| {
+            dct4x8_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -699,6 +746,7 @@ fn select_dct_4x8() -> Arc<DctFn<64>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct4x8_scalar(input, output);
     })
@@ -721,6 +769,13 @@ fn select_dct_8x4() -> Arc<DctFn<64>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct8x4_wasm;
+        return Arc::new(|input, output| {
+            dct8x4_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -731,6 +786,7 @@ fn select_dct_8x4() -> Arc<DctFn<64>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct8x4_scalar(input, output);
     })
@@ -794,6 +850,13 @@ fn select_dct_32x32() -> Arc<DctFn<1024>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct32x32_wasm;
+        return Arc::new(|input, output| {
+            dct32x32_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -804,6 +867,7 @@ fn select_dct_32x32() -> Arc<DctFn<1024>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct32x32_scalar(input, output);
     })
@@ -925,6 +989,13 @@ fn select_dct_32x16() -> Arc<DctFn<512>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct32x16_wasm;
+        return Arc::new(|input, output| {
+            dct32x16_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -935,6 +1006,7 @@ fn select_dct_32x16() -> Arc<DctFn<512>> {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct32x16_scalar(input, output);
     })
@@ -982,6 +1054,13 @@ fn select_dct_16x32() -> Arc<DctFn<512>> {
             });
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        use crate::wasm::dct16x32_wasm;
+        return Arc::new(|input, output| {
+            dct16x32_wasm(input, output);
+        });
+    }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
@@ -991,7 +1070,7 @@ fn select_dct_16x32() -> Arc<DctFn<512>> {
             });
         }
     }
-
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
         dct16x32_scalar(input, output);
     })

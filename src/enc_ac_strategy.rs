@@ -357,7 +357,14 @@ fn sse_and_rate(
         {
             crate::neon::sse_and_rate_neon
         }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+        {
+            crate::wasm::sse_and_rate_wasm
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+        )))]
         {
             crate::enc_ac_strategy::sse_and_rate_scalar
         }

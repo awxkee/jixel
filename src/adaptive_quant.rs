@@ -256,7 +256,15 @@ pub(crate) fn fill_quant_field(
                 fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+        {
+            use crate::wasm::fill_quant_field;
+            fill_quant_field
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+        )))]
         {
             fill_quant_field_scalar
         }
