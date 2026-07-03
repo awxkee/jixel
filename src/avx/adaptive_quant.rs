@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::adaptive_quant::K_AC_QUANT;
+use crate::adaptive_quant::{AQ_MAP_SCRATCH, K_AC_QUANT};
 use std::arch::x86_64::*;
 
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
@@ -35,41 +35,15 @@ const MATCH_GAMMA_OFFSET: f32 = 0.019;
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 fn load8s(s: &[f32], i: usize) -> __m256 {
-    assert!(s.len() >= 8);
-    _mm256_setr_ps(
-        s[i],
-        s[i + 1],
-        s[i + 2],
-        s[i + 3],
-        s[i + 4],
-        s[i + 5],
-        s[i + 6],
-        s[i + 7],
-    )
+    unsafe { _mm256_loadu_ps(s[i..].as_ptr().cast()) }
 }
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 fn store8(v: __m256, s: &mut [f32], i: usize) {
-    assert!(s.len() >= 8);
     unsafe {
         _mm256_storeu_ps(s[i..].as_mut_ptr(), v);
     }
-}
-
-/// Horizontal sum of the 8 lanes.
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-#[allow(dead_code)]
-fn hsum(v: __m256) -> f32 {
-    let hi = _mm256_extractf128_ps::<1>(v);
-    let lo = _mm256_castps256_ps128(v);
-    let s = _mm_add_ps(lo, hi);
-    let mut shuf = _mm_movehdup_ps(s);
-    let mut sums = _mm_add_ps(s, shuf);
-    shuf = _mm_movehl_ps(shuf, sums);
-    sums = _mm_add_ss(sums, shuf);
-    _mm_cvtss_f32(sums)
 }
 
 #[inline]
@@ -162,8 +136,8 @@ fn stage1_diff_row(
     };
 
     let head_end = rx_lo.min(region_px_w);
-    for rx in 0..head_end {
-        scalar_pixel(set_mode, row_y, row_y1, row_y2, x0, img_xsize, rx, row_acc);
+    for (rx, dst) in row_acc[..head_end].iter_mut().enumerate() {
+        scalar_pixel(set_mode, row_y, row_y1, row_y2, x0, img_xsize, rx, dst);
     }
 
     let mut rx = rx_lo;
@@ -193,8 +167,8 @@ fn stage1_diff_row(
         rx += 8;
     }
 
-    for rx in rx..region_px_w {
-        scalar_pixel(set_mode, row_y, row_y1, row_y2, x0, img_xsize, rx, row_acc);
+    for (rx, dst) in (rx..region_px_w).zip(row_acc[rx..region_px_w].iter_mut()) {
+        scalar_pixel(set_mode, row_y, row_y1, row_y2, x0, img_xsize, rx, dst);
     }
 }
 
@@ -208,7 +182,7 @@ fn scalar_pixel(
     x0: usize,
     img_xsize: usize,
     rx: usize,
-    row_acc: &mut [f32],
+    row_acc: &mut f32,
 ) {
     let clampx = |x: isize| -> usize { x.max(0).min(img_xsize as isize - 1) as usize };
     let gx = x0 + rx;
@@ -226,9 +200,9 @@ fn scalar_pixel(
     }
     diff = crate::adaptive_quant::masking_sqrt(diff);
     if !set_mode {
-        row_acc[rx] += diff;
+        *row_acc += diff;
     } else {
-        row_acc[rx] = diff;
+        *row_acc = diff;
     }
 }
 
@@ -329,135 +303,145 @@ pub(crate) fn fill_quant_field(
     distance: f32,
     inv_scale: f32,
 ) {
-    let xsize_blocks = raw_quant_field.xsize();
-    let ysize_blocks = raw_quant_field.ysize();
-    let img_xsize = opsin.xsize();
-    let img_ysize = opsin.ysize();
+    AQ_MAP_SCRATCH.with_borrow_mut(|scratch| {
+        let xsize_blocks = raw_quant_field.xsize();
+        let ysize_blocks = raw_quant_field.ysize();
+        let img_xsize = opsin.xsize();
+        let img_ysize = opsin.ysize();
 
-    let scale = K_AC_QUANT / distance;
+        let scale = K_AC_QUANT / distance;
 
-    let region_px_w = xsize_blocks * 8;
-    let region_px_h = ysize_blocks * 8;
+        let region_px_w = xsize_blocks * 8;
+        let region_px_h = ysize_blocks * 8;
 
-    let pre_w = region_px_w / 4;
-    let pre_h = region_px_h / 4;
-    let mut pre = vec![0.0f32; pre_w * pre_h];
-    let mut row_acc = vec![0.0f32; region_px_w];
+        let pre_w = region_px_w / 4;
+        let pre_h = region_px_h / 4;
+        let total_secondary = region_px_w + pre_w * pre_h + pre_w;
+        if scratch.secondary.len() < total_secondary {
+            scratch.secondary.resize(total_secondary, 0.);
+        }
+        let borrowed_secondary = &mut scratch.secondary[..total_secondary];
+        let (row_acc, rem) = borrowed_secondary.split_at_mut(region_px_w);
+        let (vrow, pre) = rem.split_at_mut(pre_w);
 
-    let clampy = |y: isize| -> usize { y.max(0).min(img_ysize as isize - 1) as usize };
+        let clampy = |y: isize| -> usize { y.max(0).min(img_ysize as isize - 1) as usize };
 
-    for ry in 0..region_px_h {
-        let gy = y0 + ry;
-        let gy_c = clampy(gy as isize);
-        let gy1 = clampy(gy as isize - 1);
-        let gy2 = clampy(gy as isize + 1);
-        let row_y = opsin.plane_row(1, gy_c);
-        let row_y1 = opsin.plane_row(1, gy1);
-        let row_y2 = opsin.plane_row(1, gy2);
+        for ry in 0..region_px_h {
+            let gy = y0 + ry;
+            let gy_c = clampy(gy as isize);
+            let gy1 = clampy(gy as isize - 1);
+            let gy2 = clampy(gy as isize + 1);
+            let row_y = opsin.plane_row(1, gy_c);
+            let row_y1 = opsin.plane_row(1, gy1);
+            let row_y2 = opsin.plane_row(1, gy2);
 
-        let set_mode = (ry & 3) == 0;
-        stage1_diff_row(
-            set_mode,
-            row_y,
-            row_y1,
-            row_y2,
-            x0,
-            img_xsize,
-            region_px_w,
-            &mut row_acc,
-        );
+            let set_mode = (ry & 3) == 0;
+            stage1_diff_row(
+                set_mode,
+                row_y,
+                row_y1,
+                row_y2,
+                x0,
+                img_xsize,
+                region_px_w,
+                row_acc,
+            );
 
-        if ry % 4 == 3 {
-            let out_y = ry / 4;
-            let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
-            for px in 0..pre_w {
-                prow[px] = (row_acc[px * 4]
-                    + row_acc[px * 4 + 1]
-                    + row_acc[px * 4 + 2]
-                    + row_acc[px * 4 + 3])
-                    * 0.25;
+            if ry % 4 == 3 {
+                let out_y = ry / 4;
+                let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
+                for px in 0..pre_w {
+                    prow[px] = (row_acc[px * 4]
+                        + row_acc[px * 4 + 1]
+                        + row_acc[px * 4 + 2]
+                        + row_acc[px * 4 + 3])
+                        * 0.25;
+                }
             }
         }
-    }
 
-    let fe_mul = if distance < 2.0 {
-        (2.0 - distance) * 0.5
-    } else {
-        0.0
-    };
-    let fe_base = [0.125f32, 0.1, 0.09, 0.06];
-    let fe_add = [0.0f32, -0.1, -0.09, -0.06];
-    let mut kmul = [0.0f32; 4];
-    let mut norm_sum = 0.0f32;
-    for i in 0..4 {
-        kmul[i] = fe_base[i] + fe_mul * fe_add[i];
-        norm_sum += kmul[i];
-    }
-    let k_total = 0.29959705784054957f32;
-    for w in &mut kmul {
-        *w *= k_total / norm_sum;
-    }
-    let mut aq_map = vec![0.0f32; xsize_blocks * ysize_blocks];
-    let mut vrow = vec![0.0f32; pre_w];
-    for fy in 0..pre_h {
-        let ym1 = if fy >= 1 { fy - 1 } else { fy };
-        let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
-        let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
-        let row = &pre[fy * pre_w..fy * pre_w + pre_w];
-        let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
-        let out_y = fy / 2;
+        let fe_mul = if distance < 2.0 {
+            (2.0 - distance) * 0.5
+        } else {
+            0.0
+        };
+        let fe_base = [0.125f32, 0.1, 0.09, 0.06];
+        let fe_add = [0.0f32, -0.1, -0.09, -0.06];
+        let mut kmul = [0.0f32; 4];
+        let mut norm_sum = 0.0f32;
+        for i in 0..4 {
+            kmul[i] = fe_base[i] + fe_mul * fe_add[i];
+            norm_sum += kmul[i];
+        }
+        let k_total = 0.29959705784054957f32;
+        for w in &mut kmul {
+            *w *= k_total / norm_sum;
+        }
+        if scratch.aq_map.len() < xsize_blocks * ysize_blocks {
+            scratch.aq_map.resize(xsize_blocks * ysize_blocks, 0.);
+        }
+        let aq_map = &mut scratch.aq_map[..xsize_blocks * ysize_blocks];
+        for fy in 0..pre_h {
+            let ym1 = if fy >= 1 { fy - 1 } else { fy };
+            let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
+            let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
+            let row = &pre[fy * pre_w..fy * pre_w + pre_w];
+            let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
+            let out_y = fy / 2;
 
-        fuzzy_erosion_row(rowt, row, rowb, pre_w, &kmul, &mut vrow);
-        for fx in 0..pre_w {
-            let out_x = fx / 2;
-            let idx = out_y * xsize_blocks + out_x;
-            if fx % 2 == 0 && fy % 2 == 0 {
-                aq_map[idx] = vrow[fx];
-            } else {
-                aq_map[idx] += vrow[fx];
+            fuzzy_erosion_row(rowt, row, rowb, pre_w, &kmul, vrow);
+            for fx in 0..pre_w {
+                let out_x = fx / 2;
+                let idx = out_y * xsize_blocks + out_x;
+                if fx % 2 == 0 && fy % 2 == 0 {
+                    aq_map[idx] = vrow[fx];
+                } else {
+                    aq_map[idx] += vrow[fx];
+                }
             }
         }
-    }
 
-    // ---- Stage 3: per-block modulations + integer quant field.
-    let base_level = 0.48 * scale;
-    let k_dampen_ramp_start = 2.0f32;
-    let k_dampen_ramp_end = 14.0f32;
-    let mut dampen = 1.0f32;
-    if distance >= k_dampen_ramp_start {
-        dampen =
-            1.0 - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
-        if dampen < 0.0 {
-            dampen = 0.0;
-        }
-    }
-    let mul = scale * dampen;
-    let add = (1.0 - dampen) * base_level;
-
-    for by in 0..ysize_blocks {
-        let py = y0 + by * 8;
-        let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
-        let qf_row = raw_quant_field.row_mut(by);
-        for (bx, (qf_out, &aq)) in qf_row.iter_mut().zip(aq_row.iter()).enumerate() {
-            let px = x0 + bx * 8;
-            if px >= img_xsize || py >= img_ysize {
-                *qf_out = 1;
-                continue;
+        // ---- Stage 3: per-block modulations + integer quant field.
+        let base_level = 0.48 * scale;
+        let k_dampen_ramp_start = 2.0f32;
+        let k_dampen_ramp_end = 14.0f32;
+        let mut dampen = 1.0f32;
+        if distance >= k_dampen_ramp_start {
+            dampen = 1.0
+                - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
+            if dampen < 0.0 {
+                dampen = 0.0;
             }
-            let bx_px = px.min(img_xsize.saturating_sub(8));
-            let by_px = py.min(img_ysize.saturating_sub(8));
-            // Per-block modulations run through the (validated) scalar helpers:
-            // mask -> gamma -> hf, then min with blue. This is block-resolution
-            // work, not a hot path, so it need not be vectorised.
-            let mask_val = crate::adaptive_quant::compute_mask(aq);
-            let mask_val = crate::adaptive_quant::gamma_modulation(bx_px, by_px, opsin, mask_val);
-            let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val);
-            let out_val = out_val.min(crate::adaptive_quant::blue_modulation(
-                bx_px, by_px, opsin, mask_val,
-            ));
-            let qf = crate::adaptive_quant::fast_exp2(out_val * 1.442695041) * mul + add;
-            let qi = f32::mul_add(qf, inv_scale, 0.5) as i32;
-            *qf_out = qi.clamp(1, 255) as u8;
         }
-    }
+        let mul = scale * dampen;
+        let add = (1.0 - dampen) * base_level;
+
+        for by in 0..ysize_blocks {
+            let py = y0 + by * 8;
+            let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
+            let qf_row = raw_quant_field.row_mut(by);
+            for (bx, (qf_out, &aq)) in qf_row.iter_mut().zip(aq_row.iter()).enumerate() {
+                let px = x0 + bx * 8;
+                if px >= img_xsize || py >= img_ysize {
+                    *qf_out = 1;
+                    continue;
+                }
+                let bx_px = px.min(img_xsize.saturating_sub(8));
+                let by_px = py.min(img_ysize.saturating_sub(8));
+                // Per-block modulations run through the (validated) scalar helpers:
+                // mask -> gamma -> hf, then min with blue. This is block-resolution
+                // work, not a hot path, so it need not be vectorised.
+                let mask_val = crate::adaptive_quant::compute_mask(aq);
+                let mask_val =
+                    crate::adaptive_quant::gamma_modulation(bx_px, by_px, opsin, mask_val);
+                let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val);
+                let out_val = out_val.min(crate::adaptive_quant::blue_modulation(
+                    bx_px, by_px, opsin, mask_val,
+                ));
+                let qf = crate::adaptive_quant::fast_exp2(out_val * 1.442695041) * mul + add;
+                let qi = f32::mul_add(qf, inv_scale, 0.5) as i32;
+                *qf_out = qi.clamp(1, 255) as u8;
+            }
+        }
+    });
 }

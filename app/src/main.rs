@@ -57,7 +57,7 @@ fn main() {
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
-    std::fs::write(&output, &bytes).expect("failed to write output");
+    // std::fs::write(&output, &bytes).expect("failed to write output");
 
     // let width = 2000;
     // let height = 1000;
