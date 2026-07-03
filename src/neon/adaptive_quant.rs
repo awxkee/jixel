@@ -998,7 +998,7 @@ pub(crate) fn fill_quant_field(
         // ---- Stage 3: per-block modulations + integer quant field.
         let base_level = 0.48 * scale;
         let k_dampen_ramp_start = 2.0f32;
-        let k_dampen_ramp_end = 14.0f32;
+        let k_dampen_ramp_end = 8.0f32;
         let mut dampen = 1.0f32;
         if distance >= k_dampen_ramp_start {
             dampen = 1.0
