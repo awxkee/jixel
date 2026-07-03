@@ -234,311 +234,247 @@ pub(crate) fn dct8x8_neon(input: &[f32; 64], output: &mut [f32; 64]) {
     dct1d_8_v(&mut cols);
     scale_and_store(&cols, 1.0 / 64.0, output);
 }
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn dct1d_16_v(c: &mut [NeonDoubledVector; 16]) {
-    let mut evens = [
-        c[0].add(c[15]),
-        c[1].add(c[14]),
-        c[2].add(c[13]),
-        c[3].add(c[12]),
-        c[4].add(c[11]),
-        c[5].add(c[10]),
-        c[6].add(c[9]),
-        c[7].add(c[8]),
-    ];
-    let mut odds = [
-        c[0].sub(c[15]).muls(WC16[0]),
-        c[1].sub(c[14]).muls(WC16[1]),
-        c[2].sub(c[13]).muls(WC16[2]),
-        c[3].sub(c[12]).muls(WC16[3]),
-        c[4].sub(c[11]).muls(WC16[4]),
-        c[5].sub(c[10]).muls(WC16[5]),
-        c[6].sub(c[9]).muls(WC16[6]),
-        c[7].sub(c[8]).muls(WC16[7]),
-    ];
-
-    dct1d_8_v(&mut evens);
-    dct1d_8_v(&mut odds);
-
-    odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
-    odds[1] = odds[1].add(odds[2]);
-    odds[2] = odds[2].add(odds[3]);
-    odds[3] = odds[3].add(odds[4]);
-    odds[4] = odds[4].add(odds[5]);
-    odds[5] = odds[5].add(odds[6]);
-    odds[6] = odds[6].add(odds[7]);
-
-    c[0] = evens[0];
-    c[1] = odds[0];
-    c[2] = evens[1];
-    c[3] = odds[1];
-    c[4] = evens[2];
-    c[5] = odds[2];
-    c[6] = evens[3];
-    c[7] = odds[3];
-    c[8] = evens[4];
-    c[9] = odds[4];
-    c[10] = evens[5];
-    c[11] = odds[5];
-    c[12] = evens[6];
-    c[13] = odds[6];
-    c[14] = evens[7];
-    c[15] = odds[7];
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn load8_128(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 8] {
-    let row = |y: usize| unsafe {
-        let p = ptr.get_unchecked(y * stride..);
-        NeonDoubledVector {
-            lo: vld1q_f32(p.as_ptr()),
-            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
-        }
-    };
-    [
-        row(0),
-        row(1),
-        row(2),
-        row(3),
-        row(4),
-        row(5),
-        row(6),
-        row(7),
-    ]
-}
-
 #[target_feature(enable = "neon")]
 pub(crate) fn dct8x16_neon(input: &[f32; 128], output: &mut [f32; 128]) {
-    let mut left = load8_128(input, 16);
-    let mut right = load8_128(&input[8..], 16);
-
-    let mut c = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    }; 16];
-
-    transpose_8x8(&mut left);
-    transpose_8x8(&mut right);
-
-    c[0..8].copy_from_slice(&left);
-    c[8..16].copy_from_slice(&right);
-
-    dct1d_16_v(&mut c);
-
-    let mut cl: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
-    let mut cr: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
-    transpose_8x8(&mut cl);
-    transpose_8x8(&mut cr);
-    dct1d_8_v(&mut cl);
-    dct1d_8_v(&mut cr);
-
+    // 16-pt row DCT then 8-pt col DCT, 4-wide strips; scratch is hfreq-major.
+    let mut scratch = MaybeUninit::<[f32; 128]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for s in 0..2 {
+        let mut c = [vdupq_n_f32(0.0); 16];
+        for ct in 0..4 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(unsafe { input.get_unchecked((s * 4) * 16 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 1) * 16 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 2) * 16 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 3) * 16 + ct * 4..) }.as_ptr()),
+            );
+            c[ct * 4] = a;
+            c[ct * 4 + 1] = b;
+            c[ct * 4 + 2] = cc;
+            c[ct * 4 + 3] = d;
+        }
+        dct1d_16_s(&mut c);
+        for u in 0..16 {
+            unsafe { vst1q_f32(dst.add(u * 8 + s * 4), c[u]) };
+        }
+    }
+    let scratch = unsafe { scratch.assume_init() };
     let scale = 1.0 / 128.0;
-    for m in 0..8 {
-        let base = &mut output[m * 16..];
-        unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(cl[m].lo, scale));
-            vst1q_f32(&mut base[4], vmulq_n_f32(cl[m].hi, scale));
-            vst1q_f32(&mut base[8], vmulq_n_f32(cr[m].lo, scale));
-            vst1q_f32(&mut base[12], vmulq_n_f32(cr[m].hi, scale));
+    for q in 0..4 {
+        let mut c = [vdupq_n_f32(0.0); 8];
+        for rt in 0..2 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(unsafe { scratch.get_unchecked((q * 4) * 8 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 1) * 8 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 2) * 8 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 3) * 8 + rt * 4..) }.as_ptr()),
+            );
+            c[rt * 4] = a;
+            c[rt * 4 + 1] = b;
+            c[rt * 4 + 2] = cc;
+            c[rt * 4 + 3] = d;
+        }
+        dct1d_8_s(&mut c);
+        for v in 0..8 {
+            let p = unsafe { output.get_unchecked_mut(v * 16 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[v], scale)) };
         }
     }
 }
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct16x8_neon(input: &[f32; 128], output: &mut [f32; 128]) {
-    let mut c = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    }; 16];
-    for v in 0..16 {
-        let p = &input[v * 8..];
-        unsafe {
-            c[v] = NeonDoubledVector {
-                lo: vld1q_f32(p.as_ptr()),
-                hi: vld1q_f32(p[4..].as_ptr()),
-            };
+    // 16-pt col DCT then 8-pt row DCT, 4-wide strips; scratch is column-major.
+    let mut scratch = MaybeUninit::<[f32; 128]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for s in 0..2 {
+        let mut c: [float32x4_t; 16] = std::array::from_fn(|r| {
+            load_strip(unsafe { input.get_unchecked(r * 8 + s * 4..) }.as_ptr())
+        });
+        dct1d_16_s(&mut c);
+        for t in 0..4 {
+            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+            let tile = [a, b, cc, d];
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { vst1q_f32(dst.add((s * 4 + j) * 16 + t * 4), *v) };
+            }
         }
     }
-
-    dct1d_16_v(&mut c);
-
-    let mut top: [NeonDoubledVector; 8] = c[0..8].try_into().unwrap();
-    let mut bot: [NeonDoubledVector; 8] = c[8..16].try_into().unwrap();
-    transpose_8x8(&mut top);
-    transpose_8x8(&mut bot);
-    dct1d_8_v(&mut top);
-    dct1d_8_v(&mut bot);
-
+    let scratch = unsafe { scratch.assume_init() };
     let scale = 1.0 / 128.0;
-    for m in 0..8 {
-        let base = &mut output[m * 16..];
-        unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(top[m].lo, scale)); // v = 0..4
-            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(top[m].hi, scale)); // v = 4..8
-            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(bot[m].lo, scale)); // v = 8..12
-            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(bot[m].hi, scale)); // v = 12..16
+    for q in 0..4 {
+        let mut c: [float32x4_t; 8] = std::array::from_fn(|col| {
+            load_strip(unsafe { scratch.get_unchecked(col * 16 + q * 4..) }.as_ptr())
+        });
+        dct1d_8_s(&mut c);
+        for u in 0..8 {
+            let p = unsafe { output.get_unchecked_mut(u * 16 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
         }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
+    // 4-wide strips keep the live set at 16 vectors instead of 64; scratch is
+    // column-major (`[col * 16 + vfreq]`) for gather-free reloads.
+    let mut scratch = MaybeUninit::<[f32; 256]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for s in 0..4 {
+        let mut c: [float32x4_t; 16] = std::array::from_fn(|r| {
+            load_strip(unsafe { input.get_unchecked(r * 16 + s * 4..) }.as_ptr())
+        });
+        dct1d_16_s(&mut c);
+        for t in 0..4 {
+            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+            let tile = [a, b, cc, d];
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { vst1q_f32(dst.add((s * 4 + j) * 16 + t * 4), *v) };
+            }
+        }
+    }
+    let scratch = unsafe { scratch.assume_init() };
+    let scale = 1.0 / 256.0;
+    for q in 0..4 {
+        let mut c: [float32x4_t; 16] = std::array::from_fn(|col| {
+            load_strip(unsafe { scratch.get_unchecked(col * 16 + q * 4..) }.as_ptr())
+        });
+        dct1d_16_s(&mut c);
+        for u in 0..16 {
+            let p = unsafe { output.get_unchecked_mut(u * 16 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
+        }
+    }
+}
+
+// Single-width (4 cols/lane) 1D kernels for the tall 32-point transforms:
+// a 4-wide strip halves the live set vs. the doubled vector, then goes to scratch.
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_4_s(c: &mut [float32x4_t; 4]) {
+    let s2 = std::f32::consts::SQRT_2;
+    let t0 = vaddq_f32(c[0], c[3]);
+    let t1 = vaddq_f32(c[1], c[2]);
+    let d2 = vmulq_n_f32(vsubq_f32(c[0], c[3]), WC4[0]);
+    let d3 = vmulq_n_f32(vsubq_f32(c[1], c[2]), WC4[1]);
+    let op = vaddq_f32(d2, d3);
+    let om = vsubq_f32(d2, d3);
+    c[0] = vaddq_f32(t0, t1);
+    c[1] = vfmaq_n_f32(om, op, s2);
+    c[2] = vsubq_f32(t0, t1);
+    c[3] = om;
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_8_s(c: &mut [float32x4_t; 8]) {
+    let s2 = std::f32::consts::SQRT_2;
+    let mut e = [
+        vaddq_f32(c[0], c[7]),
+        vaddq_f32(c[1], c[6]),
+        vaddq_f32(c[2], c[5]),
+        vaddq_f32(c[3], c[4]),
+    ];
+    dct1d_4_s(&mut e);
+    let mut o = [
+        vmulq_n_f32(vsubq_f32(c[0], c[7]), WC8[0]),
+        vmulq_n_f32(vsubq_f32(c[1], c[6]), WC8[1]),
+        vmulq_n_f32(vsubq_f32(c[2], c[5]), WC8[2]),
+        vmulq_n_f32(vsubq_f32(c[3], c[4]), WC8[3]),
+    ];
+    dct1d_4_s(&mut o);
+    o[0] = vfmaq_n_f32(o[1], o[0], s2);
+    o[1] = vaddq_f32(o[1], o[2]);
+    o[2] = vaddq_f32(o[2], o[3]);
+    c[0] = e[0];
+    c[1] = o[0];
+    c[2] = e[1];
+    c[3] = o[1];
+    c[4] = e[2];
+    c[5] = o[2];
+    c[6] = e[3];
+    c[7] = o[3];
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct1d_16_s(c: &mut [float32x4_t; 16]) {
+    let s2 = std::f32::consts::SQRT_2;
+    let mut e = [c[0]; 8];
+    let mut o = [c[0]; 8];
+    for i in 0..8 {
+        e[i] = vaddq_f32(c[i], c[15 - i]);
+        o[i] = vmulq_n_f32(vsubq_f32(c[i], c[15 - i]), WC16[i]);
+    }
+    dct1d_8_s(&mut e);
+    dct1d_8_s(&mut o);
+    o[0] = vfmaq_n_f32(o[1], o[0], s2);
+    for i in 1..7 {
+        o[i] = vaddq_f32(o[i], o[i + 1]);
+    }
+    for i in 0..8 {
+        c[2 * i] = e[i];
+        c[2 * i + 1] = o[i];
     }
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn load16_256(ptr: &[f32], stride: usize) -> [NeonDoubledVector; 16] {
-    let row = |y: usize| unsafe {
-        let p = ptr.get_unchecked(y * stride..);
-        NeonDoubledVector {
-            lo: vld1q_f32(p.as_ptr()),
-            hi: vld1q_f32(p.get_unchecked(4..).as_ptr()),
-        }
-    };
-    [
-        row(0),
-        row(1),
-        row(2),
-        row(3),
-        row(4),
-        row(5),
-        row(6),
-        row(7),
-        row(8),
-        row(9),
-        row(10),
-        row(11),
-        row(12),
-        row(13),
-        row(14),
-        row(15),
-    ]
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn dct16x16_neon(input: &[f32; 256], output: &mut [f32; 256]) {
-    let mut c_l = load16_256(input.as_slice(), 16);
-    let mut c_r = load16_256(&input[8..], 16);
-
-    dct1d_16_v(&mut c_l);
-    dct1d_16_v(&mut c_r);
-
-    // Step 4: split into row-freq groups 0..8 and 8..16.
-    let mut top_l: [NeonDoubledVector; 8] = c_l[0..8].try_into().unwrap();
-    let mut bot_l: [NeonDoubledVector; 8] = c_l[8..16].try_into().unwrap();
-    let mut top_r: [NeonDoubledVector; 8] = c_r[0..8].try_into().unwrap();
-    let mut bot_r: [NeonDoubledVector; 8] = c_r[8..16].try_into().unwrap();
-
-    transpose_8x8(&mut top_l);
-    transpose_8x8(&mut bot_l);
-    transpose_8x8(&mut top_r);
-    transpose_8x8(&mut bot_r);
-
-    let mut d_a = [NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    }; 16];
-    let mut d_b = d_a;
-    d_a[0..8].copy_from_slice(&top_l);
-    d_a[8..16].copy_from_slice(&top_r);
-    d_b[0..8].copy_from_slice(&bot_l);
-    d_b[8..16].copy_from_slice(&bot_r);
-
-    // Step 7: DCT-16 along the column dimension.
-    dct1d_16_v(&mut d_a);
-    dct1d_16_v(&mut d_b);
-
-    let scale = 1.0 / 256.0;
-    for u in 0..16 {
-        let base = &mut output[u * 16..];
-        unsafe {
-            vst1q_f32(base.as_mut_ptr(), vmulq_n_f32(d_a[u].lo, scale));
-            vst1q_f32(base[4..].as_mut_ptr(), vmulq_n_f32(d_a[u].hi, scale));
-            vst1q_f32(base[8..].as_mut_ptr(), vmulq_n_f32(d_b[u].lo, scale));
-            vst1q_f32(base[12..].as_mut_ptr(), vmulq_n_f32(d_b[u].hi, scale));
-        }
-    }
-}
-
-#[target_feature(enable = "neon")]
-fn dct1d_32_v(c: &mut [NeonDoubledVector; 32]) {
-    let mut evens = [c[0]; 16];
-    let mut odds = [c[0]; 16];
+fn dct1d_32_s(c: &mut [float32x4_t; 32]) {
+    let s2 = std::f32::consts::SQRT_2;
+    let mut e = [c[0]; 16];
+    let mut o = [c[0]; 16];
     for i in 0..16 {
-        evens[i] = c[i].add(c[31 - i]);
-        odds[i] = c[i].sub(c[31 - i]).muls(WC32[i]);
+        e[i] = vaddq_f32(c[i], c[31 - i]);
+        o[i] = vmulq_n_f32(vsubq_f32(c[i], c[31 - i]), WC32[i]);
     }
-    dct1d_16_v(&mut evens);
-    dct1d_16_v(&mut odds);
-    odds[0] = odds[1].fma(odds[0], std::f32::consts::SQRT_2);
+    dct1d_16_s(&mut e);
+    dct1d_16_s(&mut o);
+    o[0] = vfmaq_n_f32(o[1], o[0], s2);
     for i in 1..15 {
-        odds[i] = odds[i].add(odds[i + 1]);
+        o[i] = vaddq_f32(o[i], o[i + 1]);
     }
     for i in 0..16 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
+        c[2 * i] = e[i];
+        c[2 * i + 1] = o[i];
     }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_strip(ptr: *const f32) -> float32x4_t {
+    unsafe { vld1q_f32(ptr) }
 }
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    };
-    let mut after_col_u = MaybeUninit::<[f32; 1024]>::uninit();
-    for g in 0..4 {
-        let mut c = [zero; 32];
-        for r in 0..32 {
-            let p = unsafe { input.get_unchecked(r * 32 + g * 8..) };
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(p.as_ptr()) },
-                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
-            };
-        }
-        dct1d_32_v(&mut c);
-        for v in 0..32 {
-            let after_col_dst = after_col_u.as_mut_ptr() as *mut f32;
-            let p = unsafe { after_col_dst.add(v * 32 + g * 8) };
-            unsafe {
-                vst1q_f32(p, c[v].lo);
-                vst1q_f32(p.add(4), c[v].hi);
+    // 4-wide strips; column pass writes transposed scratch (`[col * 32 + vfreq]`)
+    // for gather-free contiguous reloads in the row pass.
+    let mut colt = MaybeUninit::<[f32; 1024]>::uninit();
+    let dst = colt.as_mut_ptr() as *mut f32;
+    for s in 0..8 {
+        let mut c: [float32x4_t; 32] = std::array::from_fn(|r| {
+            load_strip(unsafe { input.get_unchecked(r * 32 + s * 4..) }.as_ptr())
+        });
+        dct1d_32_s(&mut c);
+        for t in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+            let tile = [a, b, cc, d];
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { vst1q_f32(dst.add((s * 4 + j) * 32 + t * 4), *v) };
             }
         }
     }
-
-    let after_col = unsafe { after_col_u.assume_init() };
-
-    for g in 0..4 {
-        let mut c = [zero; 32];
+    let colt = unsafe { colt.assume_init() };
+    let scale = 1.0 / 1024.0;
+    for q in 0..8 {
+        let mut c: [float32x4_t; 32] = std::array::from_fn(|col| {
+            load_strip(unsafe { colt.get_unchecked(col * 32 + q * 4..) }.as_ptr())
+        });
+        dct1d_32_s(&mut c);
         for u in 0..32 {
-            let b = g * 8;
-            let lanes = [
-                after_col[b * 32 + u],
-                after_col[(b + 1) * 32 + u],
-                after_col[(b + 2) * 32 + u],
-                after_col[(b + 3) * 32 + u],
-                after_col[(b + 4) * 32 + u],
-                after_col[(b + 5) * 32 + u],
-                after_col[(b + 6) * 32 + u],
-                after_col[(b + 7) * 32 + u],
-            ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
-            };
-        }
-        dct1d_32_v(&mut c);
-        let scale = 1.0 / 1024.0;
-        for u in 0..32 {
-            // c[u].lane[j] = row-DCT freq u for row g*8+j; output is transposed.
-            let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
-            unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[u].hi, scale),
-                );
-            }
+            let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
         }
     }
 }
@@ -674,136 +610,82 @@ pub(crate) fn dct8x4_neon(input: &[f32; 64], output: &mut [f32; 64]) {
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x16_neon(input: &[f32; 512], output: &mut [f32; 512]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    };
-    let mut after_col_u = MaybeUninit::<[f32; 512]>::uninit();
-    for g in 0..2 {
-        let mut c = [zero; 32];
-        for r in 0..32 {
-            let p = unsafe { input.get_unchecked(r * 16 + g * 8..) };
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(p.as_ptr()) },
-                hi: unsafe { vld1q_f32(p.get_unchecked(4..).as_ptr()) },
-            };
-        }
-        dct1d_32_v(&mut c);
-        for v in 0..32 {
-            let after_col_dst = after_col_u.as_mut_ptr() as *mut f32;
-            let p = unsafe { after_col_dst.add(v * 16 + g * 8) };
-            unsafe {
-                vst1q_f32(p, c[v].lo);
-                vst1q_f32(p.add(4), c[v].hi);
+    // Column pass then row pass, 4-wide strips; scratch is column-major
+    // (`[col * 32 + vfreq]`) so the row pass reloads contiguously.
+    let mut scratch = MaybeUninit::<[f32; 512]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for s in 0..4 {
+        let mut c: [float32x4_t; 32] = std::array::from_fn(|r| {
+            load_strip(unsafe { input.get_unchecked(r * 16 + s * 4..) }.as_ptr())
+        });
+        dct1d_32_s(&mut c);
+        for t in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+            let tile = [a, b, cc, d];
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { vst1q_f32(dst.add((s * 4 + j) * 32 + t * 4), *v) };
             }
         }
     }
-
-    let after_col = unsafe { after_col_u.assume_init() };
-
+    let scratch = unsafe { scratch.assume_init() };
     let scale = 1.0 / 512.0;
-    for g in 0..4 {
-        let b = g * 8;
-        let mut c = [zero; 16];
+    for q in 0..8 {
+        let mut c: [float32x4_t; 16] = std::array::from_fn(|col| {
+            load_strip(unsafe { scratch.get_unchecked(col * 32 + q * 4..) }.as_ptr())
+        });
+        dct1d_16_s(&mut c);
         for u in 0..16 {
-            let lanes = [
-                after_col[b * 16 + u],
-                after_col[(b + 1) * 16 + u],
-                after_col[(b + 2) * 16 + u],
-                after_col[(b + 3) * 16 + u],
-                after_col[(b + 4) * 16 + u],
-                after_col[(b + 5) * 16 + u],
-                after_col[(b + 6) * 16 + u],
-                after_col[(b + 7) * 16 + u],
-            ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
-            };
-        }
-        dct1d_16_v(&mut c);
-        for u in 0..16 {
-            let p = unsafe { output.get_unchecked_mut(u * 32 + g * 8..) };
-            unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[u].hi, scale),
-                );
-            }
+            let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
         }
     }
 }
 
 #[target_feature(enable = "neon")]
 pub(crate) fn dct16x32_neon(input: &[f32; 512], output: &mut [f32; 512]) {
-    let zero = NeonDoubledVector {
-        lo: vdupq_n_f32(0.0),
-        hi: vdupq_n_f32(0.0),
-    };
-    let mut after_row_u = MaybeUninit::<[f32; 512]>::uninit();
-    for g in 0..2 {
-        let b = g * 8;
-        let mut c = [zero; 32];
-        for u in 0..32 {
-            let lanes = [
-                input[b * 32 + u],
-                input[(b + 1) * 32 + u],
-                input[(b + 2) * 32 + u],
-                input[(b + 3) * 32 + u],
-                input[(b + 4) * 32 + u],
-                input[(b + 5) * 32 + u],
-                input[(b + 6) * 32 + u],
-                input[(b + 7) * 32 + u],
-            ];
-            c[u] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
-            };
+    // Row pass (32-pt) then column pass (16-pt), 4-wide strips; scratch is
+    // hfreq-major (`[hfreq * 16 + row]`).
+    let mut scratch = MaybeUninit::<[f32; 512]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for s in 0..4 {
+        let mut c = [vdupq_n_f32(0.0); 32];
+        for ct in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(unsafe { input.get_unchecked((s * 4) * 32 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 1) * 32 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 2) * 32 + ct * 4..) }.as_ptr()),
+                load_strip(unsafe { input.get_unchecked((s * 4 + 3) * 32 + ct * 4..) }.as_ptr()),
+            );
+            c[ct * 4] = a;
+            c[ct * 4 + 1] = b;
+            c[ct * 4 + 2] = cc;
+            c[ct * 4 + 3] = d;
         }
-        dct1d_32_v(&mut c);
+        dct1d_32_s(&mut c);
         for u in 0..32 {
-            let after_row_ptr = after_row_u.as_mut_ptr() as *mut f32;
-            let p = unsafe { after_row_ptr.add(u * 16 + b) };
-            unsafe {
-                vst1q_f32(p, c[u].lo);
-                vst1q_f32(p.add(4), c[u].hi);
-            }
+            unsafe { vst1q_f32(dst.add(u * 16 + s * 4), c[u]) };
         }
     }
-
-    let after_row = unsafe { after_row_u.assume_init() };
-
+    let scratch = unsafe { scratch.assume_init() };
     let scale = 1.0 / 512.0;
-    for g in 0..4 {
-        let b = g * 8;
-        let mut c = [zero; 16];
-        for r in 0..16 {
-            let lanes = [
-                after_row[b * 16 + r],
-                after_row[(b + 1) * 16 + r],
-                after_row[(b + 2) * 16 + r],
-                after_row[(b + 3) * 16 + r],
-                after_row[(b + 4) * 16 + r],
-                after_row[(b + 5) * 16 + r],
-                after_row[(b + 6) * 16 + r],
-                after_row[(b + 7) * 16 + r],
-            ];
-            c[r] = NeonDoubledVector {
-                lo: unsafe { vld1q_f32(lanes.as_ptr()) },
-                hi: unsafe { vld1q_f32(lanes.as_ptr().add(4)) },
-            };
+    for q in 0..8 {
+        let mut c = [vdupq_n_f32(0.0); 16];
+        for rt in 0..4 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(unsafe { scratch.get_unchecked((q * 4) * 16 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 1) * 16 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 2) * 16 + rt * 4..) }.as_ptr()),
+                load_strip(unsafe { scratch.get_unchecked((q * 4 + 3) * 16 + rt * 4..) }.as_ptr()),
+            );
+            c[rt * 4] = a;
+            c[rt * 4 + 1] = b;
+            c[rt * 4 + 2] = cc;
+            c[rt * 4 + 3] = d;
         }
-        dct1d_16_v(&mut c);
+        dct1d_16_s(&mut c);
         for v in 0..16 {
-            let p = unsafe { output.get_unchecked_mut(v * 32 + g * 8..) };
-            unsafe {
-                vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[v].lo, scale));
-                vst1q_f32(
-                    p.get_unchecked_mut(4..).as_mut_ptr(),
-                    vmulq_n_f32(c[v].hi, scale),
-                );
-            }
+            let p = unsafe { output.get_unchecked_mut(v * 32 + q * 4..) };
+            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[v], scale)) };
         }
     }
 }

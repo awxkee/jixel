@@ -1253,7 +1253,7 @@ fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
         }
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
         {
-            return crate::wasm::grad_pack_interior;
+            crate::wasm::grad_pack_interior
         }
         #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
         {

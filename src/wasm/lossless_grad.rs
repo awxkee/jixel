@@ -34,10 +34,10 @@ pub(crate) fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw:
     let zero = i32x4_splat(0);
     let mut gx = 1usize;
     while gx + 4 <= gw {
-        let left = unsafe { v128_load(cur.as_ptr().add(gx - 1) as *const i32 as *const v128) };
-        let top = unsafe { v128_load(prev.as_ptr().add(gx) as *const i32 as *const v128) };
-        let topleft = unsafe { v128_load(prev.as_ptr().add(gx - 1) as *const i32 as *const v128) };
-        let px = unsafe { v128_load(cur.as_ptr().add(gx) as *const i32 as *const v128) };
+        let left = unsafe { v128_load(cur.as_ptr().add(gx - 1).cast()) };
+        let top = unsafe { v128_load(prev.as_ptr().add(gx).cast()) };
+        let topleft = unsafe { v128_load(prev.as_ptr().add(gx - 1).cast()) };
+        let px = unsafe { v128_load(cur.as_ptr().add(gx).cast()) };
         let ac = i32x4_sub(left, topleft);
         let ab = i32x4_sub(left, top);
         let bc = i32x4_sub(top, topleft);
@@ -49,7 +49,7 @@ pub(crate) fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw:
         let res = i32x4_sub(px, pred);
         // pack_signed: (res << 1) ^ (res >> 31)
         let packed = v128_xor(i32x4_shl(res, 1), i32x4_shr(res, 31));
-        unsafe { v128_store(out.as_mut_ptr().add(gx) as *mut u32 as *mut v128, packed) };
+        unsafe { v128_store(out.as_mut_ptr().add(gx).cast(), packed) };
         gx += 4;
     }
     while gx < gw {
