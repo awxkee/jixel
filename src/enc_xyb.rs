@@ -110,7 +110,7 @@ pub(crate) fn to_xyb(image: &mut Image3F) {
                     return crate::avx::to_xyb_avx2;
                 }
             }
-            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "avx"))]
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
             {
                 if std::is_x86_feature_detected!("sse4.1") {
                     return crate::sse::to_xyb_sse41;
@@ -123,7 +123,7 @@ pub(crate) fn to_xyb(image: &mut Image3F) {
             }
             #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
             {
-                crate::wasm::to_xyb
+                crate::wasm::to_xyb_wasm
             }
             #[cfg(not(any(
                 all(target_arch = "aarch64", feature = "neon"),
