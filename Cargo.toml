@@ -14,7 +14,7 @@ documentation = "https://docs.rs/jixel"
 categories = ["multimedia::images", "compression", "encoding"]
 homepage = "https://github.com/awxkee/jixel"
 repository = "https://github.com/awxkee/jixel"
-exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*"]
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*", "/tools/*"]
 rust-version = "1.93.0"
 
 [features]
