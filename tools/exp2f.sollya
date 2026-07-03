@@ -1,0 +1,18 @@
+prec = 200;
+display = decimal;
+
+// Range after q = round(x), r = x - q.
+I = [-0.5; 0.5];
+
+p = fpminimax(2^x, [|0, 1, 2, 3, 4, 5|],
+                   [|SG, SG, SG, SG, SG, SG, SG|],
+                   I,
+                   relative);
+
+print("// Generated polynomial for exp2(r), r in [-0.5, 0.5]");
+print("// p(x) = ", p);
+print("// relative error ~= ", dirtyinfnorm((p - 2^x) / 2^x, I));
+
+for i from 0 to 5 do {
+    print("pub(crate) const EXP2_P", i, ": f32 = ", coeff(p, i), "f32;");
+};
