@@ -103,7 +103,7 @@ pub(crate) fn rate_log2(qabs: f32) -> f32 {
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
 /// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
-pub(crate) const RD_LAMBDA: f32 = 0.115_524_53;
+pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 
 /// Per-channel distortion weights. The dequant matrices already normalize each
 /// channel perceptually, so equal weights are the principled default; X (red-
