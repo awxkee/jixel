@@ -629,61 +629,58 @@ pub(crate) fn encode_frame(
     let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
-    // Phase 1: process each DC group, computing dc_data and collecting
-    // per-AC-group token vectors. Nothing is written yet. Each DC group is
-    // fully independent (reads `opsin` read-only, produces owned results), so
-    // for multi-group images we farm groups out across threads. For a single
-    // DC group (images <= 2048 px), the threads instead parallelize the
-    // AC-strategy selection *inside* `process_dc_group`. Either way the result
-    // sequence is deterministic, so output is bit-identical to single-threaded.
-    let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(dim.num_dc_groups);
-    let mut all_pending: Vec<PendingAcGroup> = Vec::new();
-
+    // Phase 1: set up every DC group, then encode every AC group. Keeping the
+    // two apart lets AC groups from all DC groups share one steal_map instead of
+    // one serialized burst per DC group. Merges back in (dc, gix) order, so the
+    // output stays bit-identical to single-threaded.
     let group_coords: Vec<(usize, usize)> = (0..dim.ysize_dc_groups)
         .flat_map(|gy| (0..dim.xsize_dc_groups).map(move |gx| (gx, gy)))
         .collect();
+    let opsin = &opsin;
 
-    if num_threads > 1 && group_coords.len() > 1 {
-        // Steal across DC groups; inner selection stays serial (budget = 1) to
-        // avoid oversubscription.
-        let opsin = &opsin;
-        let results = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
-            let (dc_gx, dc_gy) = group_coords[i];
-            process_dc_group(
-                linear,
-                opsin,
-                &dim,
-                &distp,
-                &matrices,
-                dc_gx,
-                dc_gy,
-                num_passes,
-                coeff_shifts,
-                1,
-            )
-        });
-        for (dc_data, mut pending) in results {
-            dc_datas.push(dc_data);
-            all_pending.append(&mut pending);
-        }
+    // Multiple DC groups steal in parallel (inner budget 1); a lone group takes
+    // the full budget so its AC-strategy bands parallelize.
+    let setup_budget = if group_coords.len() > 1 {
+        1
     } else {
-        // Single group (or single-threaded): selection parallelizes internally.
-        for &(dc_gx, dc_gy) in &group_coords {
-            let (dc_data, mut pending) = process_dc_group(
-                linear,
-                &opsin,
-                &dim,
-                &distp,
-                &matrices,
-                dc_gx,
-                dc_gy,
-                num_passes,
-                coeff_shifts,
-                num_threads,
-            );
-            dc_datas.push(dc_data);
-            all_pending.append(&mut pending);
-        }
+        num_threads
+    };
+    let setups = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
+        let (dc_gx, dc_gy) = group_coords[i];
+        setup_dc_group(opsin, &dim, &distp, &matrices, dc_gx, dc_gy, setup_budget)
+    });
+
+    let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(setups.len());
+    let mut ac_tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (dc_idx, (dc_data, gxs, gys)) in setups.into_iter().enumerate() {
+        ac_tasks.extend((0..gxs * gys).map(|g| (dc_idx, g % gxs, g / gxs)));
+        dc_datas.push(dc_data);
+    }
+
+    let dc_ref = &dc_datas;
+    let results = crate::thread_pool::steal_map(ac_tasks.len(), num_threads, |t| {
+        let (dc_idx, gx, gy) = ac_tasks[t];
+        let (dc_gx, dc_gy) = group_coords[dc_idx];
+        let (p, local) = process_ac_group(
+            opsin,
+            &dim,
+            &distp,
+            &matrices,
+            &dc_ref[dc_idx],
+            num_passes,
+            coeff_shifts,
+            dc_gx,
+            dc_gy,
+            gx,
+            gy,
+        );
+        (dc_idx, gx, gy, p, local)
+    });
+
+    let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
+    for (dc_idx, gx, gy, p, local) in results {
+        merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
+        all_pending.push(p);
     }
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
@@ -869,18 +866,17 @@ pub(crate) struct PendingAcGroup {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_dc_group(
-    _linear: &Image3F,
+/// Set up one DC group (quant field, AC strategy, CfL, DCT4X4 gate); its AC
+/// groups are encoded separately. Returns the data and its group-grid dims.
+fn setup_dc_group(
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
     matrices: &DequantMatrices,
     dc_gx: usize,
     dc_gy: usize,
-    num_passes: usize,
-    coeff_shifts: &[u32],
     num_threads: usize,
-) -> (DcGroupData, Vec<PendingAcGroup>) {
+) -> (DcGroupData, usize, usize) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
     let dc_group_y0 = dc_gy * K_DC_GROUP_DIM;
@@ -963,75 +959,20 @@ fn process_dc_group(
         }
     }
 
-    let num_groups_here = dc_group_xsize_groups * dc_group_ysize_groups;
-    let mut pending: Vec<PendingAcGroup> = Vec::with_capacity(num_groups_here);
+    (dc_data, dc_group_xsize_groups, dc_group_ysize_groups)
+}
 
-    // Each AC group is independent: it reads `dc_data` (strategy / quant / cmap)
-    // read-only and writes only its own 32×32-block DC region. Transforms never
-    // cross a group boundary (`can_place_strategy`), so the regions are disjoint
-    // and merge deterministically — output is identical to single-threaded.
-    let merge_quant_dc = |dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S| {
-        let ox = gx * K_GROUP_DIM_IN_BLOCKS;
-        let oy = gy * K_GROUP_DIM_IN_BLOCKS;
-        let gwb = local.xsize();
-        let ghb = local.ysize();
-        for c in 0..3 {
-            for ly in 0..ghb {
-                let src = local.plane_row(c, ly);
-                dc.quant_dc.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
-            }
-        }
-    };
-
-    if num_threads > 1 && num_groups_here > 1 {
-        let dc_ref = &dc_data;
-        // steal_map returns in gix order, so the merge stays deterministic.
-        let results = crate::thread_pool::steal_map(num_groups_here, num_threads, |gix| {
-            let gx = gix % dc_group_xsize_groups;
-            let gy = gix / dc_group_xsize_groups;
-            let (p, local) = process_ac_group(
-                opsin,
-                dim,
-                distp,
-                matrices,
-                dc_ref,
-                num_passes,
-                coeff_shifts,
-                dc_gx,
-                dc_gy,
-                gx,
-                gy,
-            );
-            (gix, p, local)
-        });
-        for (gix, p, local) in results {
-            let gx = gix % dc_group_xsize_groups;
-            let gy = gix / dc_group_xsize_groups;
-            merge_quant_dc(&mut dc_data, gx, gy, &local);
-            pending.push(p);
-        }
-    } else {
-        for gix in 0..num_groups_here {
-            let gx = gix % dc_group_xsize_groups;
-            let gy = gix / dc_group_xsize_groups;
-            let (p, local) = process_ac_group(
-                opsin,
-                dim,
-                distp,
-                matrices,
-                &dc_data,
-                num_passes,
-                coeff_shifts,
-                dc_gx,
-                dc_gy,
-                gx,
-                gy,
-            );
-            merge_quant_dc(&mut dc_data, gx, gy, &local);
-            pending.push(p);
+/// Merge an AC group's origin-relative `quant_dc` into its parent DC group.
+fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
+    let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+    let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+    let (gwb, ghb) = (local.xsize(), local.ysize());
+    for c in 0..3 {
+        for ly in 0..ghb {
+            let src = local.plane_row(c, ly);
+            dc.quant_dc.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
         }
     }
-    (dc_data, pending)
 }
 
 /// Encode a single AC group: build its tile stripes, quantize and tokenize,

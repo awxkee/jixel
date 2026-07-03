@@ -1,0 +1,65 @@
+///////////////////////////////////////////////////////////////////////
+// Direct polynomial for log2(1 + t), avoiding atanh/division.
+//
+// Rust form:
+//
+//   t = m - 1
+//   log2(1 + t) ~= t * P(t)
+//
+// where:
+//
+//   P(t) = c0 + c1*t + c2*t^2 + c3*t^3 + c4*t^4 + c5*t^5
+//
+// We generate P(t) by approximating:
+//
+//   g(t) = log2(1 + t) / t
+//
+// over t in (0, 1].  The limit at t=0 is log2(e), so we define the
+// expression in a way Sollya can handle.
+///////////////////////////////////////////////////////////////////////
+
+prec = 200!;
+display = decimal!;
+
+// Avoid exact 0 because g(t) = log2(1+t)/t is 0/0 there.
+// 2^-20 is plenty close for f32 use.
+T = [2^-20; 1];
+
+g = log2(1 + x) / x;
+
+// Degree-6 P(t), giving degree-6 total log2p1 approximation:
+//   log2(1+t) ~= t * P(t)
+p = fpminimax(
+    g,
+    6,
+    [|SG, SG, SG, SG, SG, SG, SG|],
+    T,
+    floating,
+    absolute
+);
+
+print("P(t) polynomial:");
+print(p);
+
+print("");
+print("Rust coefficients for:");
+print("log2(1+t) ~= t * (c0 + c1*t + c2*t^2 + c3*t^3 + c4*t^4 + c5*t^5)");
+
+print("");
+print("c0 = ", coeff(p, 0));
+print("c1 = ", coeff(p, 1));
+print("c2 = ", coeff(p, 2));
+print("c3 = ", coeff(p, 3));
+print("c4 = ", coeff(p, 4));
+print("c5 = ", coeff(p, 5));
+print("c6 = ", coeff(p, 6));
+
+print("");
+print("Absolute error estimate for final t*P(t):");
+err_abs = dirtyinfnorm(x * p - log2(1 + x), [0; 1]);
+print(err_abs);
+
+print("");
+print("Relative-ish weighted error estimate, excluding tiny center:");
+err_rel = dirtyinfnorm((x * p - log2(1 + x)) / log2(1 + x), [2^-20; 1]);
+print(err_rel);

@@ -343,7 +343,7 @@ fn sse_and_rate(
     let f = SSE_FUNCTION.get_or_init(|| {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         {
-            if std::is_x86_feature_detected!("avx2") {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
                 return crate::avx::sse_and_rate_avx2;
             }
         }
@@ -366,7 +366,7 @@ fn sse_and_rate(
             all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
         )))]
         {
-            crate::enc_ac_strategy::sse_and_rate_scalar
+            sse_and_rate_scalar
         }
     });
 
