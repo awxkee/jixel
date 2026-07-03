@@ -268,108 +268,34 @@ pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
 
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct16x16_avx2(input: &[f32; 256], output: &mut [f32; 256]) {
-    unsafe {
-        // ── Phase 1: col-DCT-16 ───────────────────────────────────────────────
-
-        // Load four 8×8 sub-blocks.
-        let mut top_lo: [__m256; 8] =   // rows 0..8,  cols 0..8
-            std::array::from_fn(|k| _mm256_loadu_ps(input[k * 16..].as_ptr()));
-        let mut bot_lo: [__m256; 8] =   // rows 8..16, cols 0..8
-            std::array::from_fn(|k| _mm256_loadu_ps(input[(k + 8) * 16..].as_ptr()));
-        let mut top_hi: [__m256; 8] =   // rows 0..8,  cols 8..16
-            std::array::from_fn(|k| _mm256_loadu_ps(input[k * 16 + 8..].as_ptr()));
-        let mut bot_hi: [__m256; 8] =   // rows 8..16, cols 8..16
-            std::array::from_fn(|k| _mm256_loadu_ps(input[(k + 8) * 16 + 8..].as_ptr()));
-
-        // Transpose: after this block[col].lane[row] = input[row][col].
-        transpose_8x8(&mut top_lo);
-        transpose_8x8(&mut bot_lo);
-        transpose_8x8(&mut top_hi);
-        transpose_8x8(&mut bot_hi);
-
-        // Assemble 16-step arrays: index = original col (time-step), lane = row.
-        //   c_top[k].lane[r] = input[r][k]     r = 0..8
-        //   c_bot[k].lane[r] = input[r+8][k]   r = 0..8
-        let mut c_top = [_mm256_undefined_ps(); 16];
-        let mut c_bot = [_mm256_undefined_ps(); 16];
-        c_top[0..8].copy_from_slice(&top_lo);
-        c_top[8..16].copy_from_slice(&top_hi);
-        c_bot[0..8].copy_from_slice(&bot_lo);
-        c_bot[8..16].copy_from_slice(&bot_hi);
-
-        // Col-DCT-16: for each lane (row 0..8), DCT-16 across the 16 cols.
-        dct1d_16_flat(&mut c_top);
-        dct1d_16_flat(&mut c_bot);
-
-        // Split into col-freq halves and transpose for the row-DCT pass.
-        let mut tlo: [__m256; 8] = c_top[0..8].try_into().unwrap();
-        let mut thi: [__m256; 8] = c_top[8..16].try_into().unwrap();
-        let mut blo: [__m256; 8] = c_bot[0..8].try_into().unwrap();
-        let mut bhi: [__m256; 8] = c_bot[8..16].try_into().unwrap();
-        transpose_8x8(&mut tlo);
-        transpose_8x8(&mut thi);
-        transpose_8x8(&mut blo);
-        transpose_8x8(&mut bhi);
-
-        // ── Phase 2: row-DCT-16 ───────────────────────────────────────────────
-
-        // Assemble: index = row (time-step 0..16), lane = col-freq (0..8 or 8..16).
-        //   d_a rows 0..8  from tlo, rows 8..16 from blo  → col-freqs 0..8  in lanes
-        //   d_b rows 0..8  from thi, rows 8..16 from bhi  → col-freqs 8..16 in lanes
-        let mut d_a = [_mm256_undefined_ps(); 16];
-        let mut d_b = [_mm256_undefined_ps(); 16];
-        d_a[0..8].copy_from_slice(&tlo);
-        d_a[8..16].copy_from_slice(&blo);
-        d_b[0..8].copy_from_slice(&thi);
-        d_b[8..16].copy_from_slice(&bhi);
-
-        // Row-DCT-16: for each lane (col-freq 0..8), DCT-16 across the 16 rows.
-        dct1d_16_flat(&mut d_a);
-        dct1d_16_flat(&mut d_b);
-
-        // ── Store via final transpose → contiguous writes ─────────────────────
-        //
-        // After row-DCT:
-        //   d_a[u].lane[v] = output[v*16 + u] * 256   u = row-freq 0..16, v = col-freq 0..8
-        //   d_b[u].lane[v] = output[(v+8)*16 + u] * 256
-        //
-        // We want output[col_freq * 16 + 0..16] to be written as two sequential stores.
-        // Transpose d_a and d_b (each 16×8 → two 8×8 blocks) to get row-major order.
-        let mut d_a_lo: [__m256; 8] = d_a[0..8].try_into().unwrap(); // row-freqs 0..8
-        let mut d_a_hi: [__m256; 8] = d_a[8..16].try_into().unwrap(); // row-freqs 8..16
-        let mut d_b_lo: [__m256; 8] = d_b[0..8].try_into().unwrap();
-        let mut d_b_hi: [__m256; 8] = d_b[8..16].try_into().unwrap();
-        transpose_8x8(&mut d_a_lo);
-        transpose_8x8(&mut d_a_hi);
-        transpose_8x8(&mut d_b_lo);
-        transpose_8x8(&mut d_b_hi);
-
-        // After final transpose:
-        //   d_a_lo[v].lane[u] = output[v*16 + u]       v = col-freq 0..8,  u = row-freq 0..8
-        //   d_a_hi[v].lane[u] = output[v*16 + u+8]     v = col-freq 0..8,  u = row-freq 8..16
-        //   d_b_lo[v].lane[u] = output[(v+8)*16 + u]   v = col-freq 0..8 → actual col-freq v+8
-        //   d_b_hi[v].lane[u] = output[(v+8)*16 + u+8]
-
-        let scale = _mm256_set1_ps(1.0 / 256.0);
-        for v in 0..8 {
-            let base_a = v * 16;
-            _mm256_storeu_ps(
-                output[base_a..].as_mut_ptr(),
-                _mm256_mul_ps(d_a_lo[v], scale),
-            );
-            _mm256_storeu_ps(
-                output[base_a + 8..].as_mut_ptr(),
-                _mm256_mul_ps(d_a_hi[v], scale),
-            );
-            let base_b = (v + 8) * 16;
-            _mm256_storeu_ps(
-                output[base_b..].as_mut_ptr(),
-                _mm256_mul_ps(d_b_lo[v], scale),
-            );
-            _mm256_storeu_ps(
-                output[base_b + 8..].as_mut_ptr(),
-                _mm256_mul_ps(d_b_hi[v], scale),
-            );
+    // Two 8-col strips per pass through a column-major scratch keeps the live set
+    // near 16 YMM instead of materializing all 32; row pass reloads contiguously.
+    let mut scratch = [0.0f32; 256];
+    for g in 0..2 {
+        let mut c: [__m256; 16] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) });
+        dct1d_16_flat(&mut c);
+        for t in 0..2 {
+            let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { _mm256_storeu_ps(scratch[(g * 8 + j) * 16 + t * 8..].as_mut_ptr(), *v) };
+            }
+        }
+    }
+    let scale = _mm256_set1_ps(1.0 / 256.0);
+    for g in 0..2 {
+        let mut c: [__m256; 16] = std::array::from_fn(|col| unsafe {
+            _mm256_loadu_ps(scratch[col * 16 + g * 8..].as_ptr())
+        });
+        dct1d_16_flat(&mut c);
+        for u in 0..16 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 16 + g * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                );
+            }
         }
     }
 }
@@ -400,41 +326,34 @@ fn dct1d_32_flat(c: &mut [__m256; 32]) {
 
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct32x32_avx2(input: &[f32; 1024], output: &mut [f32; 1024]) {
-    let mut after_col = [0.0f32; 1024];
+    // Column pass writes a transposed scratch (`[col*32 + vfreq]`) so the row pass
+    // reloads contiguously instead of gathering 8 scalars per vector.
+    let mut colt = [0.0f32; 1024];
     for g in 0..4 {
-        let mut c = [_mm256_undefined_ps(); 32];
-        for r in 0..32 {
-            c[r] = unsafe { _mm256_loadu_ps(input[r * 32 + g * 8..].as_ptr()) };
-        }
+        let mut c: [__m256; 32] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 32 + g * 8..].as_ptr()) });
         dct1d_32_flat(&mut c);
-        for v in 0..32 {
-            unsafe { _mm256_storeu_ps(after_col[v * 32 + g * 8..].as_mut_ptr(), c[v]) };
+        for t in 0..4 {
+            let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { _mm256_storeu_ps(colt[(g * 8 + j) * 32 + t * 8..].as_mut_ptr(), *v) };
+            }
         }
     }
     let scale = _mm256_set1_ps(1.0 / 1024.0);
     for g in 0..4 {
-        let mut c = [_mm256_undefined_ps(); 32];
-        for u in 0..32 {
-            let b = g * 8;
-            c[u] = _mm256_set_ps(
-                after_col[(b + 7) * 32 + u],
-                after_col[(b + 6) * 32 + u],
-                after_col[(b + 5) * 32 + u],
-                after_col[(b + 4) * 32 + u],
-                after_col[(b + 3) * 32 + u],
-                after_col[(b + 2) * 32 + u],
-                after_col[(b + 1) * 32 + u],
-                after_col[b * 32 + u],
-            );
-        }
+        let mut c: [__m256; 32] = std::array::from_fn(|col| unsafe {
+            _mm256_loadu_ps(colt[col * 32 + g * 8..].as_ptr())
+        });
         dct1d_32_flat(&mut c);
         for u in 0..32 {
             unsafe {
                 _mm256_storeu_ps(
                     output[u * 32 + g * 8..].as_mut_ptr(),
                     _mm256_mul_ps(c[u], scale),
-                )
-            };
+                );
+            }
         }
     }
 }
@@ -602,99 +521,70 @@ pub(crate) fn dct8x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
 
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct32x16_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
-    let mut after_col = [0.0f32; 512];
-    // Phase 1: 32-point column DCT over the 16 columns (8 columns per lane group).
+    // Column pass, then transpose each vfreq tile so the row pass loads
+    // contiguously instead of gathering 8 scalars per vector.
+    let mut cols = [[_mm256_undefined_ps(); 16]; 4];
     for g in 0..2 {
-        let mut c = [_mm256_undefined_ps(); 32];
-        for r in 0..32 {
-            c[r] = unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) };
-        }
+        let mut c: [__m256; 32] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) });
         dct1d_32_flat(&mut c);
-        for v in 0..32 {
-            unsafe { _mm256_storeu_ps(after_col[v * 16 + g * 8..].as_mut_ptr(), c[v]) };
+        for t in 0..4 {
+            let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            cols[t][g * 8..g * 8 + 8].copy_from_slice(&tile);
         }
     }
-    // Phase 2: 16-point row DCT over the 32 rows (lane = vertical-freq), stored
-    // transposed as output[u*32 + v].
     let scale = _mm256_set1_ps(1.0 / 512.0);
-    for g in 0..4 {
-        let b = g * 8;
-        let mut c = [_mm256_undefined_ps(); 16];
-        for u in 0..16 {
-            c[u] = _mm256_set_ps(
-                after_col[(b + 7) * 16 + u],
-                after_col[(b + 6) * 16 + u],
-                after_col[(b + 5) * 16 + u],
-                after_col[(b + 4) * 16 + u],
-                after_col[(b + 3) * 16 + u],
-                after_col[(b + 2) * 16 + u],
-                after_col[(b + 1) * 16 + u],
-                after_col[b * 16 + u],
-            );
-        }
-        dct1d_16_flat(&mut c);
+    for (t, tile) in cols.iter_mut().enumerate() {
+        dct1d_16_flat(tile);
         for u in 0..16 {
             unsafe {
                 _mm256_storeu_ps(
-                    output[u * 32 + b..].as_mut_ptr(),
-                    _mm256_mul_ps(c[u], scale),
-                )
-            };
+                    output[u * 32 + t * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(tile[u], scale),
+                );
+            }
         }
     }
 }
 
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct16x32_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
-    let mut after_row = [0.0f32; 512];
-    // Phase 1: 32-point row DCT over the 16 rows (lane = row). after_row is
-    // stored hfreq-major: after_row[u*16 + row].
+    // Row pass (32-pt) over 8-row strips into hfreq-major scratch, then column
+    // pass (16-pt); both use transposed contiguous loads instead of scalar gathers.
+    let mut scratch = [0.0f32; 512];
     for g in 0..2 {
-        let b = g * 8;
         let mut c = [_mm256_undefined_ps(); 32];
-        for u in 0..32 {
-            c[u] = _mm256_set_ps(
-                input[(b + 7) * 32 + u],
-                input[(b + 6) * 32 + u],
-                input[(b + 5) * 32 + u],
-                input[(b + 4) * 32 + u],
-                input[(b + 3) * 32 + u],
-                input[(b + 2) * 32 + u],
-                input[(b + 1) * 32 + u],
-                input[b * 32 + u],
-            );
+        for ct in 0..4 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                _mm256_loadu_ps(input[(g * 8 + j) * 32 + ct * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[ct * 8..ct * 8 + 8].copy_from_slice(&tile);
         }
         dct1d_32_flat(&mut c);
         for u in 0..32 {
-            unsafe { _mm256_storeu_ps(after_row[u * 16 + b..].as_mut_ptr(), c[u]) };
+            unsafe { _mm256_storeu_ps(scratch[u * 16 + g * 8..].as_mut_ptr(), c[u]) };
         }
     }
-    // Phase 2: 16-point column DCT over the 16 rows (lane = horizontal-freq),
-    // stored as output[v*32 + u].
     let scale = _mm256_set1_ps(1.0 / 512.0);
     for g in 0..4 {
-        let b = g * 8;
         let mut c = [_mm256_undefined_ps(); 16];
-        for r in 0..16 {
-            c[r] = _mm256_set_ps(
-                after_row[(b + 7) * 16 + r],
-                after_row[(b + 6) * 16 + r],
-                after_row[(b + 5) * 16 + r],
-                after_row[(b + 4) * 16 + r],
-                after_row[(b + 3) * 16 + r],
-                after_row[(b + 2) * 16 + r],
-                after_row[(b + 1) * 16 + r],
-                after_row[b * 16 + r],
-            );
+        for rt in 0..2 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                _mm256_loadu_ps(scratch[(g * 8 + j) * 16 + rt * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[rt * 8..rt * 8 + 8].copy_from_slice(&tile);
         }
         dct1d_16_flat(&mut c);
         for v in 0..16 {
             unsafe {
                 _mm256_storeu_ps(
-                    output[v * 32 + b..].as_mut_ptr(),
+                    output[v * 32 + g * 8..].as_mut_ptr(),
                     _mm256_mul_ps(c[v], scale),
-                )
-            };
+                );
+            }
         }
     }
 }

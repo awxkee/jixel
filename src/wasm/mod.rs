@@ -34,9 +34,6 @@ mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_wasm;
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use dct::{
-    dct4x4_wasm, dct4x8_wasm, dct8x4_wasm, dct8x8_wasm, dct8x16_wasm, dct16x8_wasm, dct16x16_wasm,
-    dct16x32_wasm, dct32x16_wasm, dct32x32_wasm,
-};
+pub(crate) use dct::*;
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use xyb::to_xyb_wasm;

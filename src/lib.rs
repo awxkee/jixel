@@ -67,7 +67,7 @@ mod sse;
 mod static_entropy_codes;
 mod thread_pool;
 mod util;
-#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm;
 
 pub use color_encoding::{
