@@ -36,6 +36,7 @@
 
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 const K_SG_MUL: f32 = 226.77216153508914;
@@ -273,6 +274,20 @@ pub(crate) fn fill_quant_field(
     f(opsin, raw_quant_field, x0, y0, distance, inv_scale);
 }
 
+pub(crate) struct AqMapScratch {
+    pub(crate) aq_map: Vec<f32>,
+    pub(crate) secondary: Vec<f32>,
+}
+
+thread_local! {
+    pub(crate) static AQ_MAP_SCRATCH: RefCell<AqMapScratch> = const {
+        RefCell::new(AqMapScratch {
+        aq_map: Vec::new(),
+        secondary: Vec::new(),
+    })
+    };
+}
+
 #[allow(unused)]
 fn fill_quant_field_scalar(
     opsin: &Image3F,
@@ -282,180 +297,191 @@ fn fill_quant_field_scalar(
     distance: f32,
     inv_scale: f32,
 ) {
-    let xsize_blocks = raw_quant_field.xsize();
-    let ysize_blocks = raw_quant_field.ysize();
-    let img_xsize = opsin.xsize();
-    let img_ysize = opsin.ysize();
+    AQ_MAP_SCRATCH.with_borrow_mut(|scratch| {
+        let xsize_blocks = raw_quant_field.xsize();
+        let ysize_blocks = raw_quant_field.ysize();
+        let img_xsize = opsin.xsize();
+        let img_ysize = opsin.ysize();
 
-    let scale = K_AC_QUANT / distance;
+        let scale = K_AC_QUANT / distance;
 
-    // Pixel extent of this DC-group region (padded to whole blocks but clamped
-    // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
-    let region_px_w = xsize_blocks * 8;
-    let region_px_h = ysize_blocks * 8;
+        // Pixel extent of this DC-group region (padded to whole blocks but clamped
+        // to the image — the modulation loops read up to (bx*8+7, by*8+7)).
+        let region_px_w = xsize_blocks * 8;
+        let region_px_h = ysize_blocks * 8;
 
-    // ---- Stage 1: per-pixel diff, accumulated in 4-row groups, subsampled 4x.
-    // `pre` has resolution (region_px_w/4) x (region_px_h/4) == (2*xblocks) x (2*yblocks).
-    let pre_w = region_px_w / 4;
-    let pre_h = region_px_h / 4;
-    let mut pre = vec![0.0f32; pre_w * pre_h];
+        // ---- Stage 1: per-pixel diff, accumulated in 4-row groups, subsampled 4x.
+        // `pre` has resolution (region_px_w/4) x (region_px_h/4) == (2*xblocks) x (2*yblocks).
+        let pre_w = region_px_w / 4;
+        let pre_h = region_px_h / 4;
 
-    // Accumulator for the current group of 4 rows, width region_px_w.
-    let mut row_acc = vec![0.0f32; region_px_w];
+        // Accumulator for the current group of 4 rows, width region_px_w.
+        let total_secondary = region_px_w + pre_w * pre_h;
+        if scratch.secondary.len() < total_secondary {
+            scratch.secondary.resize(total_secondary, 0.);
+        }
+        let borrowed_secondary = &mut scratch.secondary[..total_secondary];
+        let (row_acc, pre) = borrowed_secondary.split_at_mut(region_px_w);
 
-    let clampx = |x: isize| -> usize { x.max(0).min(img_xsize as isize - 1) as usize };
-    let clampy = |y: isize| -> usize { y.max(0).min(img_ysize as isize - 1) as usize };
+        let clampx = |x: isize| -> usize { x.max(0).min(img_xsize as isize - 1) as usize };
+        let clampy = |y: isize| -> usize { y.max(0).min(img_ysize as isize - 1) as usize };
 
-    for ry in 0..region_px_h {
-        let gy = y0 + ry;
-        // Skip work for rows entirely outside the image (replicate edge instead).
-        let gy_c = clampy(gy as isize);
-        let gy1 = clampy(gy as isize - 1);
-        let gy2 = clampy(gy as isize + 1);
-        let row_y = opsin.plane_row(1, gy_c);
-        let row_y1 = opsin.plane_row(1, gy1);
-        let row_y2 = opsin.plane_row(1, gy2);
-        assert!(row_y.len() >= img_xsize);
-        assert!(row_y1.len() >= img_xsize);
-        assert!(row_y2.len() >= img_xsize);
+        for ry in 0..region_px_h {
+            let gy = y0 + ry;
+            // Skip work for rows entirely outside the image (replicate edge instead).
+            let gy_c = clampy(gy as isize);
+            let gy1 = clampy(gy as isize - 1);
+            let gy2 = clampy(gy as isize + 1);
+            let row_y = opsin.plane_row(1, gy_c);
+            let row_y1 = opsin.plane_row(1, gy1);
+            let row_y2 = opsin.plane_row(1, gy2);
+            assert!(row_y.len() >= img_xsize);
+            assert!(row_y1.len() >= img_xsize);
+            assert!(row_y2.len() >= img_xsize);
 
-        for rx in 0..region_px_w {
-            let gx = x0 + rx;
-            let gx_c = clampx(gx as isize);
-            let gx1 = clampx(gx as isize - 1);
-            let gx2 = clampx(gx as isize + 1);
+            for rx in 0..region_px_w {
+                let gx = x0 + rx;
+                let gx_c = clampx(gx as isize);
+                let gx1 = clampx(gx as isize - 1);
+                let gx2 = clampx(gx as isize + 1);
 
-            let in_y = row_y[gx_c];
-            let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
-            let gammac = ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
-            let mut diff = gammac * (in_y - base);
-            diff *= diff;
-            // current libjxl: clamp the squared luma diff before masking.
-            if diff >= 0.2 {
-                diff = 0.2;
+                let in_y = row_y[gx_c];
+                let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
+                let gammac = ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
+                let mut diff = gammac * (in_y - base);
+                diff *= diff;
+                // current libjxl: clamp the squared luma diff before masking.
+                if diff >= 0.2 {
+                    diff = 0.2;
+                }
+                diff = masking_sqrt(diff);
+
+                if (ry & 3) != 0 {
+                    row_acc[rx] += diff;
+                } else {
+                    row_acc[rx] = diff;
+                }
             }
-            diff = masking_sqrt(diff);
 
-            if (ry & 3) != 0 {
-                row_acc[rx] += diff;
-            } else {
-                row_acc[rx] = diff;
+            // Every 4th row, downsample the accumulated 4-row band by 4 in x.
+            if ry % 4 == 3 {
+                let out_y = ry / 4;
+                let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
+                for px in 0..pre_w {
+                    prow[px] = (row_acc[px * 4]
+                        + row_acc[px * 4 + 1]
+                        + row_acc[px * 4 + 2]
+                        + row_acc[px * 4 + 3])
+                        * 0.25;
+                }
+            }
+        }
+
+        // ---- Stage 2: FuzzyErosion (3x3 weighted-min pooling) over `pre`, then
+        // downsample 2x into the block-resolution aq_map.
+        // pre is (2*xblocks) x (2*yblocks); aq_map is xblocks x yblocks.
+        if scratch.aq_map.len() < xsize_blocks * ysize_blocks {
+            scratch.aq_map.resize(xsize_blocks * ysize_blocks, 0.);
+        }
+        let aq_map = &mut scratch.aq_map[..xsize_blocks * ysize_blocks];
+        // FuzzyErosion weights (current libjxl): four smallest neighbors, weighted,
+        // butteraugli-target dependent, normalized to kTotal.
+        let fe_mul = if distance < 2.0 {
+            (2.0 - distance) * 0.5
+        } else {
+            0.0
+        };
+        let fe_base = [0.125f32, 0.1, 0.09, 0.06];
+        let fe_add = [0.0f32, -0.1, -0.09, -0.06];
+        let mut k_mul = [0.0f32; 4];
+        let mut norm_sum = 0.0f32;
+        for i in 0..4 {
+            k_mul[i] = fe_base[i] + fe_mul * fe_add[i];
+            norm_sum += k_mul[i];
+        }
+        let k_total = 0.29959705784054957f32;
+        for w in &mut k_mul {
+            *w *= k_total / norm_sum;
+        }
+        for fy in 0..pre_h {
+            let ym1 = if fy >= 1 { fy - 1 } else { fy };
+            let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
+            let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
+            let row = &pre[fy * pre_w..fy * pre_w + pre_w];
+            let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
+            let out_y = fy / 2;
+            for fx in 0..pre_w {
+                let xm1 = if fx >= 1 { fx - 1 } else { fx };
+                let xp1 = if fx + 1 < pre_w { fx + 1 } else { fx };
+                // First four values, sorted ascending into mins[0..4].
+                let mut mins = [row[fx], row[xm1], row[xp1], rowt[xm1]];
+                sort4(&mut mins);
+                // Remaining five neighbors.
+                store_min4(rowt[fx], &mut mins);
+                store_min4(rowt[xp1], &mut mins);
+                store_min4(rowb[xm1], &mut mins);
+                store_min4(rowb[fx], &mut mins);
+                store_min4(rowb[xp1], &mut mins);
+                let v = k_mul[0] * mins[0]
+                    + k_mul[1] * mins[1]
+                    + k_mul[2] * mins[2]
+                    + k_mul[3] * mins[3];
+                let out_x = fx / 2;
+                let idx = out_y * xsize_blocks + out_x;
+                if fx % 2 == 0 && fy % 2 == 0 {
+                    aq_map[idx] = v;
+                } else {
+                    aq_map[idx] += v;
+                }
             }
         }
 
-        // Every 4th row, downsample the accumulated 4-row band by 4 in x.
-        if ry % 4 == 3 {
-            let out_y = ry / 4;
-            let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
-            for px in 0..pre_w {
-                prow[px] = (row_acc[px * 4]
-                    + row_acc[px * 4 + 1]
-                    + row_acc[px * 4 + 2]
-                    + row_acc[px * 4 + 3])
-                    * 0.25;
+        // ---- Stage 3: PerBlockModulations + write integer quant field.
+        let mut base_level = 0.48 * scale;
+        let k_dampen_ramp_start = 2.0f32;
+        let k_dampen_ramp_end = 14.0f32;
+        let mut dampen = 1.0f32;
+        if distance >= k_dampen_ramp_start {
+            dampen = 1.0
+                - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
+            if dampen < 0.0 {
+                dampen = 0.0;
             }
         }
-    }
+        let mul = scale * dampen;
+        let add = (1.0 - dampen) * base_level;
+        let _ = &mut base_level;
 
-    // ---- Stage 2: FuzzyErosion (3x3 weighted-min pooling) over `pre`, then
-    // downsample 2x into the block-resolution aq_map.
-    // pre is (2*xblocks) x (2*yblocks); aq_map is xblocks x yblocks.
-    let mut aq_map = vec![0.0f32; xsize_blocks * ysize_blocks];
-    // FuzzyErosion weights (current libjxl): four smallest neighbours, weighted,
-    // butteraugli-target dependent, normalised to kTotal.
-    let fe_mul = if distance < 2.0 {
-        (2.0 - distance) * 0.5
-    } else {
-        0.0
-    };
-    let fe_base = [0.125f32, 0.1, 0.09, 0.06];
-    let fe_add = [0.0f32, -0.1, -0.09, -0.06];
-    let mut k_mul = [0.0f32; 4];
-    let mut norm_sum = 0.0f32;
-    for i in 0..4 {
-        k_mul[i] = fe_base[i] + fe_mul * fe_add[i];
-        norm_sum += k_mul[i];
-    }
-    let k_total = 0.29959705784054957f32;
-    for w in &mut k_mul {
-        *w *= k_total / norm_sum;
-    }
-    for fy in 0..pre_h {
-        let ym1 = if fy >= 1 { fy - 1 } else { fy };
-        let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
-        let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
-        let row = &pre[fy * pre_w..fy * pre_w + pre_w];
-        let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
-        let out_y = fy / 2;
-        for fx in 0..pre_w {
-            let xm1 = if fx >= 1 { fx - 1 } else { fx };
-            let xp1 = if fx + 1 < pre_w { fx + 1 } else { fx };
-            // First four values, sorted ascending into mins[0..4].
-            let mut mins = [row[fx], row[xm1], row[xp1], rowt[xm1]];
-            sort4(&mut mins);
-            // Remaining five neighbors.
-            store_min4(rowt[fx], &mut mins);
-            store_min4(rowt[xp1], &mut mins);
-            store_min4(rowb[xm1], &mut mins);
-            store_min4(rowb[fx], &mut mins);
-            store_min4(rowb[xp1], &mut mins);
-            let v =
-                k_mul[0] * mins[0] + k_mul[1] * mins[1] + k_mul[2] * mins[2] + k_mul[3] * mins[3];
-            let out_x = fx / 2;
-            let idx = out_y * xsize_blocks + out_x;
-            if fx % 2 == 0 && fy % 2 == 0 {
-                aq_map[idx] = v;
-            } else {
-                aq_map[idx] += v;
+        for by in 0..ysize_blocks {
+            let py = y0 + by * 8;
+            let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
+            let qf_row = raw_quant_field.row_mut(by);
+            // If the block's pixels are completely outside the image, leave field=1.
+            for (bx, (qf_out, &aq)) in qf_row.iter_mut().zip(aq_row.iter()).enumerate() {
+                let px = x0 + bx * 8;
+                if px >= img_xsize || py >= img_ysize {
+                    *qf_out = 1;
+                    continue;
+                }
+                // For blocks touching the right/bottom edge, libjxl operates on a
+                // padded image; we clamp reads to valid rows/cols by using bounded
+                // block coordinates. The modulation funcs index up to +7; clamp.
+                let bx_px = px.min(img_xsize.saturating_sub(8));
+                let by_px = py.min(img_ysize.saturating_sub(8));
+
+                // current libjxl PerBlockModulations order:
+                // mask -> gamma -> hf, then min with blue (computed from gamma-mask).
+                let mask_val = compute_mask(aq);
+                let mask_val = gamma_modulation(bx_px, by_px, opsin, mask_val);
+                let out_val = hf_modulation(bx_px, by_px, opsin, mask_val);
+                let out_val = out_val.min(blue_modulation(bx_px, by_px, opsin, mask_val));
+                // Multiplicative field: exponent modulation done above.
+                let qf = fast_exp2(out_val * 1.442695041) * mul + add;
+                let qi = fmla(qf, inv_scale, 0.5) as i32;
+                *qf_out = qi.clamp(1, 255) as u8;
             }
         }
-    }
-
-    // ---- Stage 3: PerBlockModulations + write integer quant field.
-    let mut base_level = 0.48 * scale;
-    let k_dampen_ramp_start = 2.0f32;
-    let k_dampen_ramp_end = 14.0f32;
-    let mut dampen = 1.0f32;
-    if distance >= k_dampen_ramp_start {
-        dampen =
-            1.0 - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
-        if dampen < 0.0 {
-            dampen = 0.0;
-        }
-    }
-    let mul = scale * dampen;
-    let add = (1.0 - dampen) * base_level;
-    let _ = &mut base_level;
-
-    for by in 0..ysize_blocks {
-        let py = y0 + by * 8;
-        let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
-        let qf_row = raw_quant_field.row_mut(by);
-        // If the block's pixels are completely outside the image, leave field=1.
-        for (bx, (qf_out, &aq)) in qf_row.iter_mut().zip(aq_row.iter()).enumerate() {
-            let px = x0 + bx * 8;
-            if px >= img_xsize || py >= img_ysize {
-                *qf_out = 1;
-                continue;
-            }
-            // For blocks touching the right/bottom edge, libjxl operates on a
-            // padded image; we clamp reads to valid rows/cols by using bounded
-            // block coordinates. The modulation funcs index up to +7; clamp.
-            let bx_px = px.min(img_xsize.saturating_sub(8));
-            let by_px = py.min(img_ysize.saturating_sub(8));
-
-            // current libjxl PerBlockModulations order:
-            // mask -> gamma -> hf, then min with blue (computed from gamma-mask).
-            let mask_val = compute_mask(aq);
-            let mask_val = gamma_modulation(bx_px, by_px, opsin, mask_val);
-            let out_val = hf_modulation(bx_px, by_px, opsin, mask_val);
-            let out_val = out_val.min(blue_modulation(bx_px, by_px, opsin, mask_val));
-            // Multiplicative field: exponent modulation done above.
-            let qf = fast_exp2(out_val * 1.442695041) * mul + add;
-            let qi = fmla(qf, inv_scale, 0.5) as i32;
-            *qf_out = qi.clamp(1, 255) as u8;
-        }
-    }
+    });
 }
 
 const TBLSIZE: usize = 64;

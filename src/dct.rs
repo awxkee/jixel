@@ -171,7 +171,7 @@ pub(crate) fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
 
     for (x, out_row) in output.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let mut col = [0.0f32; 8];
-        for (col_slot, tmp_row) in col.iter_mut().zip(tmp.chunks_exact(8)) {
+        for (col_slot, tmp_row) in col.iter_mut().zip(tmp.as_chunks::<8>().0.iter()) {
             *col_slot = tmp_row[x];
         }
         dct1d_8(&mut col);
