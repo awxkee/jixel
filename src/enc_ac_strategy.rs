@@ -895,31 +895,25 @@ pub(crate) fn fill_ac_strategy(
         // Each band selects into its own fresh (default) strategy image, reading
         // the shared opsin/quant_field; results merge deterministically by row.
         let qf: &ImageB = quant_field;
-        let results: Vec<(AcStrategyImage, f32)> = std::thread::scope(|s| {
-            let handles: Vec<_> = bands
-                .iter()
-                .map(|&(y0, y1)| {
-                    s.spawn(move || {
-                        let mut local = AcStrategyImage::new(xsize, ysize);
-                        let b = select_band(
-                            opsin,
-                            dc_group_px,
-                            dc_group_py,
-                            scale,
-                            qm_mult_x,
-                            matrices,
-                            qf,
-                            &mut local,
-                            xsize,
-                            ysize,
-                            y0,
-                            y1,
-                        );
-                        (local, b)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let bands_ref = &bands;
+        let results = crate::thread_pool::steal_map(bands.len(), num_threads, |i| {
+            let (y0, y1) = bands_ref[i];
+            let mut local = AcStrategyImage::new(xsize, ysize);
+            let b = select_band(
+                opsin,
+                dc_group_px,
+                dc_group_py,
+                scale,
+                qm_mult_x,
+                matrices,
+                qf,
+                &mut local,
+                xsize,
+                ysize,
+                y0,
+                y1,
+            );
+            (local, b)
         });
         let mut benefit = 0.0f32;
         for (&(y0, y1), (local, b)) in bands.iter().zip(results.iter()) {

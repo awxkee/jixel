@@ -65,6 +65,7 @@ mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
 mod static_entropy_codes;
+mod thread_pool;
 mod util;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm;
