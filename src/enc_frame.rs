@@ -644,43 +644,27 @@ pub(crate) fn encode_frame(
         .collect();
 
     if num_threads > 1 && group_coords.len() > 1 {
-        // Multi-group: parallelize across DC groups; selection inside stays
-        // serial (inner thread budget = 1) to avoid oversubscription.
-        let nthreads = num_threads.min(group_coords.len());
-        let chunk_size = group_coords.len().div_ceil(nthreads);
-        let chunks: Vec<&[(usize, usize)]> = group_coords.chunks(chunk_size).collect();
-        let results: Vec<Vec<(DcGroupData, Vec<PendingAcGroup>)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = chunks
-                .into_iter()
-                .map(|chunk| {
-                    s.spawn(|| {
-                        chunk
-                            .iter()
-                            .map(|&(dc_gx, dc_gy)| {
-                                process_dc_group(
-                                    linear,
-                                    &opsin,
-                                    &dim,
-                                    &distp,
-                                    &matrices,
-                                    dc_gx,
-                                    dc_gy,
-                                    num_passes,
-                                    coeff_shifts,
-                                    1,
-                                )
-                            })
-                            .collect()
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        // Steal across DC groups; inner selection stays serial (budget = 1) to
+        // avoid oversubscription.
+        let opsin = &opsin;
+        let results = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
+            let (dc_gx, dc_gy) = group_coords[i];
+            process_dc_group(
+                linear,
+                opsin,
+                &dim,
+                &distp,
+                &matrices,
+                dc_gx,
+                dc_gy,
+                num_passes,
+                coeff_shifts,
+                1,
+            )
         });
-        for chunk_result in results {
-            for (dc_data, mut pending) in chunk_result {
-                dc_datas.push(dc_data);
-                all_pending.append(&mut pending);
-            }
+        for (dc_data, mut pending) in results {
+            dc_datas.push(dc_data);
+            all_pending.append(&mut pending);
         }
     } else {
         // Single group (or single-threaded): selection parallelizes internally.
@@ -1000,53 +984,31 @@ fn process_dc_group(
     };
 
     if num_threads > 1 && num_groups_here > 1 {
-        let nthreads = num_threads.min(num_groups_here);
-        let chunk_size = num_groups_here.div_ceil(nthreads);
-        let index_chunks: Vec<Vec<usize>> = (0..num_groups_here)
-            .collect::<Vec<_>>()
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
         let dc_ref = &dc_data;
-        let results: Vec<Vec<(usize, PendingAcGroup, Image3S)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = index_chunks
-                .into_iter()
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk
-                            .into_iter()
-                            .map(|gix| {
-                                let gx = gix % dc_group_xsize_groups;
-                                let gy = gix / dc_group_xsize_groups;
-                                let (p, local) = process_ac_group(
-                                    opsin,
-                                    dim,
-                                    distp,
-                                    matrices,
-                                    dc_ref,
-                                    num_passes,
-                                    coeff_shifts,
-                                    dc_gx,
-                                    dc_gy,
-                                    gx,
-                                    gy,
-                                );
-                                (gix, p, local)
-                            })
-                            .collect()
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        // steal_map returns in gix order, so the merge stays deterministic.
+        let results = crate::thread_pool::steal_map(num_groups_here, num_threads, |gix| {
+            let gx = gix % dc_group_xsize_groups;
+            let gy = gix / dc_group_xsize_groups;
+            let (p, local) = process_ac_group(
+                opsin,
+                dim,
+                distp,
+                matrices,
+                dc_ref,
+                num_passes,
+                coeff_shifts,
+                dc_gx,
+                dc_gy,
+                gx,
+                gy,
+            );
+            (gix, p, local)
         });
-        // Chunks are contiguous index ranges, so flattening preserves gix order.
-        for chunk_result in results {
-            for (gix, p, local) in chunk_result {
-                let gx = gix % dc_group_xsize_groups;
-                let gy = gix / dc_group_xsize_groups;
-                merge_quant_dc(&mut dc_data, gx, gy, &local);
-                pending.push(p);
-            }
+        for (gix, p, local) in results {
+            let gx = gix % dc_group_xsize_groups;
+            let gy = gix / dc_group_xsize_groups;
+            merge_quant_dc(&mut dc_data, gx, gy, &local);
+            pending.push(p);
         }
     } else {
         for gix in 0..num_groups_here {
