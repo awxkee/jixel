@@ -39,4 +39,4 @@ pub(crate) use dct::{
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use xyb::to_xyb_avx2;
+pub(crate) use xyb::to_xyb_avx2_band;

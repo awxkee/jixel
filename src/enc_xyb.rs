@@ -83,55 +83,49 @@ fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
 }
 
-#[allow(unused)]
-fn to_xyb_f32(image: &mut Image3F) {
-    let ysize = image.ysize();
-    for y in 0..ysize {
-        let [r_row, g_row, b_row] = image.all_plane_rows_mut(y);
-        for ((r, g), b) in r_row.iter_mut().zip(g_row.iter_mut()).zip(b_row.iter_mut()) {
-            let (xv, yv, bv) = rgb_to_xyb_pixel_f32(*r, *g, *b);
-            *r = xv;
-            *g = yv;
-            *b = bv;
-        }
+type ToXybBandFn = unsafe fn([&mut [f32]; 3], usize);
+
+fn to_xyb_f32_band(band: [&mut [f32]; 3], _w: usize) {
+    let [rp, gp, bp] = band;
+    for ((r, g), b) in rp.iter_mut().zip(gp.iter_mut()).zip(bp.iter_mut()) {
+        (*r, *g, *b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
     }
 }
 
-type ToXybFn = unsafe fn(&mut Image3F);
+fn to_xyb_band_fn() -> ToXybBandFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return crate::avx::to_xyb_avx2_band;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::to_xyb_sse41_band;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return crate::neon::to_xyb_neon_band;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::to_xyb_wasm_band;
+    #[allow(unreachable_code)]
+    to_xyb_f32_band
+}
 
-/// Convert in-place from linear RGB (planes 0/1/2) to XYB.
-pub(crate) fn to_xyb(image: &mut Image3F) {
-    static TO_XYB_FN: OnceLock<ToXybFn> = OnceLock::new();
-    unsafe {
-        TO_XYB_FN.get_or_init(|| {
-            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-            {
-                if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                    return crate::avx::to_xyb_avx2;
-                }
-            }
-            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-            {
-                if std::is_x86_feature_detected!("sse4.1") {
-                    return crate::sse::to_xyb_sse41;
-                }
-            }
-            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-            {
-                use crate::neon::to_xyb_neon;
-                to_xyb_neon
-            }
-            #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-            {
-                crate::wasm::to_xyb_wasm
-            }
-            #[cfg(not(any(
-                all(target_arch = "aarch64", feature = "neon"),
-                all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
-            )))]
-            {
-                to_xyb_f32
-            }
-        })(image)
+/// Convert linear RGB (planes 0/1/2) to XYB in place, row-bands in parallel.
+pub(crate) fn to_xyb(image: &mut Image3F, num_threads: usize) {
+    static FN: OnceLock<ToXybBandFn> = OnceLock::new();
+    let f = *FN.get_or_init(to_xyb_band_fn);
+    let w = image.xsize();
+    let run = |mut band: [&mut [f32]; 3]| {
+        let [r, g, b] = &mut band;
+        unsafe { f([r, g, b], w) };
+    };
+    let bands = image.row_bands_mut(num_threads);
+    if bands.len() <= 1 {
+        bands.into_iter().for_each(run);
+    } else {
+        std::thread::scope(|s| {
+            bands.into_iter().for_each(|b| {
+                s.spawn(|| run(b));
+            });
+        });
     }
 }

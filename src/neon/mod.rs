@@ -39,4 +39,4 @@ pub(crate) use dct::{
     dct16x32_neon, dct32x16_neon, dct32x32_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use xyb::to_xyb_neon;
+pub(crate) use xyb::to_xyb_neon_band;
