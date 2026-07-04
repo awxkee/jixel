@@ -73,6 +73,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - run: rustup component add clippy
+      - run: rustup target add wasm32-unknown-unknown
       - run: cargo clippy --all-features -- -D warnings
       - run: RUSTFLAGS=-Ctarget-feature=+simd128 cargo clippy --all-features --target wasm32-unknown-unknown -- -D warnings
 
