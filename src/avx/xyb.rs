@@ -28,7 +28,6 @@
  */
 
 use crate::enc_xyb::*;
-use crate::image::Image3F;
 use std::arch::x86_64::*;
 
 #[inline]
@@ -123,11 +122,15 @@ fn rgb_to_xyb_f32x8_avx2(r: __m256, g: __m256, b: __m256) -> (__m256, __m256, __
     (x, y, tm2)
 }
 
+/// Transform one row-band in place.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn to_xyb_avx2(image: &mut Image3F) {
-    for y in 0..image.ysize() {
-        let [r_row, g_row, b_row] = image.all_plane_rows_mut(y);
-
+pub(crate) fn to_xyb_avx2_band(band: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = band;
+    for ((r_row, g_row), b_row) in rp
+        .chunks_exact_mut(w)
+        .zip(gp.chunks_exact_mut(w))
+        .zip(bp.chunks_exact_mut(w))
+    {
         let (r_chunks, r_tail) = r_row.as_chunks_mut::<8>();
         let (g_chunks, g_tail) = g_row.as_chunks_mut::<8>();
         let (b_chunks, b_tail) = b_row.as_chunks_mut::<8>();

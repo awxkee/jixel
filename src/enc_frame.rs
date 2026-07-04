@@ -621,7 +621,7 @@ pub(crate) fn encode_frame(
     let num_passes = coeff_shifts.len();
 
     let mut opsin = linear.clone();
-    to_xyb(&mut opsin);
+    to_xyb(&mut opsin, num_threads);
     if distp.gab_enabled {
         crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
     }
@@ -638,13 +638,11 @@ pub(crate) fn encode_frame(
         .collect();
     let opsin = &opsin;
 
-    // Multiple DC groups steal in parallel (inner budget 1); a lone group takes
-    // the full budget so its AC-strategy bands parallelize.
-    let setup_budget = if group_coords.len() > 1 {
-        1
-    } else {
-        num_threads
-    };
+    // Split the thread budget across nesting levels: `outer` lanes steal DC
+    // groups, each parallelizing its AC-strategy bands with the remainder, so
+    // the setup phase saturates all cores even with few (large) DC groups.
+    let outer = group_coords.len().min(num_threads.max(1));
+    let setup_budget = num_threads.max(1).div_ceil(outer);
     let setups = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
         let (dc_gx, dc_gy) = group_coords[i];
         setup_dc_group(opsin, &dim, &distp, &matrices, dc_gx, dc_gy, setup_budget)

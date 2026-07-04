@@ -28,7 +28,6 @@
  */
 
 use crate::enc_xyb::*;
-use crate::image::Image3F;
 use core::arch::wasm32::*;
 
 #[inline]
@@ -135,11 +134,15 @@ fn rgb_to_xyb_f32x4_wasm(r: v128, g: v128, b: v128) -> (v128, v128, v128) {
     (x, y, tm2)
 }
 
+/// Transform one row-band in place.
 #[target_feature(enable = "simd128")]
-pub(crate) fn to_xyb_wasm(image: &mut Image3F) {
-    for y in 0..image.ysize() {
-        let [r_row, g_row, b_row] = image.all_plane_rows_mut(y);
-
+pub(crate) fn to_xyb_wasm_band(band: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = band;
+    for ((r_row, g_row), b_row) in rp
+        .chunks_exact_mut(w)
+        .zip(gp.chunks_exact_mut(w))
+        .zip(bp.chunks_exact_mut(w))
+    {
         let (r_chunks, r_tail) = r_row.as_chunks_mut::<4>();
         let (g_chunks, g_tail) = g_row.as_chunks_mut::<4>();
         let (b_chunks, b_tail) = b_row.as_chunks_mut::<4>();

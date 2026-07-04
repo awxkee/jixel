@@ -32,7 +32,6 @@
  */
 
 use crate::enc_xyb::*;
-use crate::image::Image3F;
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -138,11 +137,15 @@ fn rgb_to_xyb_f32x4_sse41(r: __m128, g: __m128, b: __m128) -> (__m128, __m128, _
     (x, y, tm2)
 }
 
+/// Transform one row-band in place.
 #[target_feature(enable = "sse4.1")]
-pub(crate) fn to_xyb_sse41(image: &mut Image3F) {
-    for y in 0..image.ysize() {
-        let [r_row, g_row, b_row] = image.all_plane_rows_mut(y);
-
+pub(crate) fn to_xyb_sse41_band(band: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = band;
+    for ((r_row, g_row), b_row) in rp
+        .chunks_exact_mut(w)
+        .zip(gp.chunks_exact_mut(w))
+        .zip(bp.chunks_exact_mut(w))
+    {
         let (r_chunks, r_tail) = r_row.as_chunks_mut::<4>();
         let (g_chunks, g_tail) = g_row.as_chunks_mut::<4>();
         let (b_chunks, b_tail) = b_row.as_chunks_mut::<4>();

@@ -148,6 +148,28 @@ impl<T: Copy + Default> Image3<T> {
         let [p0, p1, p2] = &mut self.planes;
         [p0.row_mut(y), p1.row_mut(y), p2.row_mut(y)]
     }
+
+    /// Split every plane into `n` disjoint row-bands of `[r, g, b]` slices, for
+    /// per-pixel passes that run bands in parallel.
+    pub(crate) fn row_bands_mut(&mut self, n: usize) -> Vec<[&mut [T]; 3]> {
+        let (w, h) = (self.xsize(), self.ysize());
+        let n = n.max(1).min(h.max(1));
+        let band = h.div_ceil(n);
+        let [p0, p1, p2] = &mut self.planes;
+        let (mut d0, mut d1, mut d2) = (&mut p0.data[..], &mut p1.data[..], &mut p2.data[..]);
+        let mut bands = Vec::with_capacity(n);
+        let mut y = 0;
+        while y < h {
+            let cut = band.min(h - y) * w;
+            let (a0, r0) = d0.split_at_mut(cut);
+            let (a1, r1) = d1.split_at_mut(cut);
+            let (a2, r2) = d2.split_at_mut(cut);
+            bands.push([a0, a1, a2]);
+            (d0, d1, d2) = (r0, r1, r2);
+            y += cut / w;
+        }
+        bands
+    }
 }
 
 pub(crate) type Image3B = Image3<u8>;

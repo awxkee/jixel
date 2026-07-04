@@ -33,31 +33,34 @@ where
     T: Send,
     F: Fn(usize) -> T + Sync,
 {
-    let workers = nthreads.max(1).min(len);
-    if workers <= 1 {
+    let lanes = nthreads.max(1).min(len);
+    if lanes <= 1 {
         return (0..len).map(f).collect();
     }
 
     let cursor = AtomicUsize::new(0);
     let (f, cursor) = (&f, &cursor);
+    // Copy closure: one stealing lane. Each lane collects its own
+    // (index, value) pairs — no shared writes.
+    let lane = move || {
+        let mut out = Vec::new();
+        loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            if i >= len {
+                break out;
+            }
+            out.push((i, f(i)));
+        }
+    };
 
-    // Each lane collects its own (index, value) pairs — no shared writes.
+    // The caller runs a lane itself instead of parking in join; by the time it
+    // finishes, the cursor is drained and joins only wait out stragglers.
     let mut chunks: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(move || {
-                    let mut out = Vec::new();
-                    loop {
-                        let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        if i >= len {
-                            break out;
-                        }
-                        out.push((i, f(i)));
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let handles: Vec<_> = (1..lanes).map(|_| s.spawn(lane)).collect();
+        let own = lane();
+        let mut all: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        all.push(own);
+        all
     });
 
     // Scatter into index order.
