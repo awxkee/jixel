@@ -74,6 +74,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - run: rustup component add clippy
       - run: cargo clippy --all-features -- -D warnings
+      - run: RUSTFLAGS=-Ctarget-feature=+simd128 cargo clippy --all-features --target wasm32-unknown-unknown -- -D warnings
 
   clippy_arm:
     name: Clippy ARM
