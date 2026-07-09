@@ -155,7 +155,7 @@ pub(crate) fn quantize_ac_q_scaled(quant: i32, scale: f32, qm_multiplier: f32) -
 fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return crate::wasm::quantize_block_ac_wasm;
+        crate::wasm::quantize_block_ac_wasm
     }
 
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -215,8 +215,13 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
             };
         }
     }
-
-    quantize_block_ac_scalar
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        quantize_block_ac_scalar
+    }
 }
 
 #[inline]
@@ -224,6 +229,7 @@ pub(crate) fn selected_quantize_block_ac_fn() -> QuantizeBlockAcFn {
     *QUANTIZE_BLOCK_AC_METHOD.get_or_init(select_quantize_block_ac_fn)
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn quantize_block_ac_scalar(
     block_in: &[f32],

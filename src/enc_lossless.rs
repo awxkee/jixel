@@ -1293,7 +1293,7 @@ fn select_grad_pack_interior_fn() -> GradPackInteriorFn {
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return crate::wasm::grad_pack_interior;
+        crate::wasm::grad_pack_interior
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
