@@ -40,9 +40,9 @@ use crate::dc_group_data::{
 };
 use crate::dct::{
     dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32, dc_from_dct32x16,
-    dc_from_dct32x32, dct4x4, dct4x8, dct8x4, dct8x8, dct8x16, dct16x8, dct16x16, dct16x32,
-    dct32x16, dct32x32,
+    dc_from_dct32x32,
 };
+use crate::encoding_context::EncodingContext;
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
@@ -236,6 +236,7 @@ fn quantize_roundtrip_y_block(
 /// from the aggregate distribution, then emit them in `encode_frame`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ac_group(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     group_brect: Rect,
     matrices: &DequantMatrices,
@@ -307,7 +308,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct8x8(&tmp_64[0], dst);
+                        (ctx.dct8x8)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT16X8 => {
                         for yy in 0..16 {
@@ -316,7 +317,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         let tmp_128 = tmp.as_chunks::<128>().0;
-                        dct16x8(&tmp_128[0], dst);
+                        (ctx.dct16x8)(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT8X16 => {
                         for yy in 0..8 {
@@ -326,7 +327,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         let tmp_128 = tmp.as_chunks::<128>().0;
-                        dct8x16(&tmp_128[0], dst);
+                        (ctx.dct8x16)(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT16X16 => {
                         for yy in 0..16 {
@@ -336,7 +337,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 256] = (&mut coeffs[c][..256]).try_into().unwrap();
                         let tmp_256 = tmp.as_chunks::<256>().0;
-                        dct16x16(&tmp_256[0], dst);
+                        (ctx.dct16x16)(&tmp_256[0], dst);
                     }
                     STRATEGY_DCT32X32 => {
                         for yy in 0..32 {
@@ -346,7 +347,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 1024] = (&mut coeffs[c][..1024]).try_into().unwrap();
                         let tmp_1024 = tmp.as_chunks::<1024>().0;
-                        dct32x32(&tmp_1024[0], dst);
+                        (ctx.dct32x32)(&tmp_1024[0], dst);
                     }
                     STRATEGY_DCT4X4 => {
                         for yy in 0..8 {
@@ -355,7 +356,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct4x4(&tmp_64[0], dst);
+                        (ctx.dct4x4)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT4X8 => {
                         for yy in 0..8 {
@@ -364,7 +365,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct4x8(&tmp_64[0], dst);
+                        (ctx.dct4x8)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT8X4 => {
                         for yy in 0..8 {
@@ -373,7 +374,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct8x4(&tmp_64[0], dst);
+                        (ctx.dct8x4)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT32X16 => {
                         for yy in 0..32 {
@@ -383,7 +384,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
                         let tmp_512 = tmp.as_chunks::<512>().0;
-                        dct32x16(&tmp_512[0], dst);
+                        (ctx.dct32x16)(&tmp_512[0], dst);
                     }
                     STRATEGY_DCT16X32 => {
                         for yy in 0..16 {
@@ -393,7 +394,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
                         let tmp_512 = tmp.as_chunks::<512>().0;
-                        dct16x32(&tmp_512[0], dst);
+                        (ctx.dct16x32)(&tmp_512[0], dst);
                     }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }

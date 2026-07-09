@@ -48,6 +48,7 @@
 use super::histogram::Histogram;
 use super::token::{Token, uint_encode};
 use crate::bit_writer::BitWriter;
+use crate::entropy::fast_div_u16::FastDivU16;
 
 pub(crate) const ANS_LOG_TAB_SIZE: u32 = 12;
 pub(crate) const ANS_TAB_SIZE: u32 = 1 << ANS_LOG_TAB_SIZE; // 4096
@@ -111,7 +112,7 @@ struct AliasEntry {
     freq1_xor_freq0: u32,
 }
 
-fn init_alias_table(distribution_in: &[u16]) -> Vec<AliasEntry> {
+fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
     let range = ANS_TAB_SIZE;
     let entry_size = ENTRY_SIZE;
     let mut dist: Vec<u32> = distribution_in.iter().map(|&x| x as u32).collect();
@@ -121,7 +122,7 @@ fn init_alias_table(distribution_in: &[u16]) -> Vec<AliasEntry> {
     if dist.is_empty() {
         dist.push(range);
     }
-    let mut a = vec![AliasEntry::default(); TABLE_ENTRIES];
+    let mut a = [AliasEntry::default(); TABLE_ENTRIES];
 
     if let Some(sym) = dist.iter().position(|&v| v == ANS_TAB_SIZE) {
         for i in 0..TABLE_ENTRIES {
@@ -134,9 +135,9 @@ fn init_alias_table(distribution_in: &[u16]) -> Vec<AliasEntry> {
         return a;
     }
 
-    let mut underfull: Vec<u32> = Vec::new();
-    let mut overfull: Vec<u32> = Vec::new();
-    let mut cutoffs = vec![0u32; TABLE_ENTRIES];
+    let mut underfull: Vec<u32> = Vec::with_capacity(TABLE_ENTRIES);
+    let mut overfull: Vec<u32> = Vec::with_capacity(TABLE_ENTRIES);
+    let mut cutoffs = [0u32; TABLE_ENTRIES];
     for (i, (&dist, cutoff)) in dist.iter().zip(cutoffs.iter_mut()).enumerate() {
         *cutoff = dist;
         if *cutoff > entry_size {
@@ -185,7 +186,7 @@ struct AliasSymbol {
 }
 
 #[inline]
-fn alias_lookup(a: &[AliasEntry], value: u32) -> AliasSymbol {
+fn alias_lookup(a: &[AliasEntry; TABLE_ENTRIES], value: u32) -> AliasSymbol {
     let i = (value >> LOG_ENTRY_SIZE) as usize;
     let pos = value & ENTRY_SIZE_M1;
     let greater = pos >= a[i].cutoff;
@@ -205,7 +206,8 @@ fn alias_lookup(a: &[AliasEntry], value: u32) -> AliasSymbol {
 #[derive(Clone)]
 pub(crate) struct AnsEncSymbolInfo {
     pub(crate) freq: u16,
-    pub(crate) reverse_map: Vec<u32>,
+    divider: FastDivU16,
+    pub(crate) reverse_map: Vec<u16>,
 }
 
 /// Build the alias table for `freqs` and derive per-symbol encoder info.
@@ -216,13 +218,14 @@ pub(crate) fn build_symbol_info(freqs: &[u16]) -> Vec<AnsEncSymbolInfo> {
         .iter()
         .map(|&f| AnsEncSymbolInfo {
             freq: f,
-            reverse_map: vec![0u32; f as usize],
+            divider: FastDivU16::new_or_one(f),
+            reverse_map: vec![0u16; f as usize],
         })
         .collect();
     for slot in 0..ANS_TAB_SIZE {
         let s = alias_lookup(&alias, slot);
         if s.value < info.len() && s.offset < info[s.value].reverse_map.len() {
-            info[s.value].reverse_map[s.offset] = slot;
+            info[s.value].reverse_map[s.offset] = slot as u16;
         }
     }
     info
@@ -241,13 +244,18 @@ impl AnsCoder {
     pub(crate) fn put_symbol(&mut self, info: &AnsEncSymbolInfo) -> Option<u16> {
         let freq = info.freq as u32;
         debug_assert!(freq > 0, "ANS symbol with zero frequency");
+        debug_assert_eq!(info.reverse_map.len(), freq as usize);
+
+        let mut state = self.state;
         let mut emitted = None;
-        if (self.state >> (32 - ANS_LOG_TAB_SIZE)) >= freq {
-            emitted = Some((self.state & 0xffff) as u16);
-            self.state >>= 16;
+        if (state >> (32 - ANS_LOG_TAB_SIZE)) >= freq {
+            emitted = Some((state & 0xffff) as u16);
+            state >>= 16;
         }
-        self.state = ((self.state / freq) << ANS_LOG_TAB_SIZE)
-            + info.reverse_map[(self.state % freq) as usize];
+
+        let (q, rem) = info.divider.div_rem_fast(state, freq);
+        let mapped = info.reverse_map[rem as usize] as u32;
+        self.state = (q << ANS_LOG_TAB_SIZE) + mapped;
         emitted
     }
     #[inline]
@@ -256,35 +264,56 @@ impl AnsCoder {
     }
 }
 
+const ANS_NO_EMIT: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct PreparedAnsToken {
+    sym: u8,
+    nbits: u8,
+    hist: u8,
+    bits: u32,
+    emitted: u32,
+}
+
 pub(crate) fn write_ans_tokens(
     tokens: &[Token],
     context_map: &[u8],
     symbol_info: &[Vec<AnsEncSymbolInfo>],
     w: &mut BitWriter,
 ) {
-    let n = tokens.len();
-    let mut sym = vec![0u32; n];
-    let mut nbits = vec![0u32; n];
-    let mut bits = vec![0u32; n];
-    let mut hist = vec![0usize; n];
-    for (i, t) in tokens.iter().enumerate() {
-        let (s, nb, b) = uint_encode(t.value);
-        sym[i] = s;
-        nbits[i] = nb;
-        bits[i] = b;
-        hist[i] = context_map[t.context as usize] as usize;
+    let mut prepared = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        let (sym, nbits, bits) = uint_encode(t.value);
+        let hist = context_map[t.context as usize];
+        debug_assert!(sym < TABLE_ENTRIES as u32);
+        debug_assert!(nbits <= u8::MAX as u32);
+        prepared.push(PreparedAnsToken {
+            sym: sym as u8,
+            nbits: nbits as u8,
+            hist,
+            bits,
+            emitted: ANS_NO_EMIT,
+        });
     }
-    let mut words: Vec<Option<u16>> = vec![None; n];
+
     let mut coder = AnsCoder::new();
-    for i in (0..n).rev() {
-        words[i] = coder.put_symbol(&symbol_info[hist[i]][sym[i] as usize]);
-    }
-    w.write(32, coder.state() as u64);
-    for i in 0..n {
-        if let Some(word) = words[i] {
-            w.write(16, word as u64);
+    for slot in prepared.iter_mut().rev() {
+        let hist = slot.hist as usize;
+        let sym = slot.sym as usize;
+        debug_assert!(hist < symbol_info.len());
+        debug_assert!(sym < symbol_info[hist].len());
+        let info = &symbol_info[hist][sym];
+        if let Some(word) = coder.put_symbol(info) {
+            slot.emitted = word as u32;
         }
-        w.write(nbits[i] as usize, bits[i] as u64);
+    }
+
+    w.write(32, coder.state() as u64);
+    for slot in prepared.iter() {
+        if slot.emitted != ANS_NO_EMIT {
+            w.write(16, slot.emitted as u64);
+        }
+        w.write(slot.nbits as usize, slot.bits as u64);
     }
 }
 

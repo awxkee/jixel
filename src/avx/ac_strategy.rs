@@ -56,6 +56,7 @@ pub(crate) fn sse_and_rate_avx2(
     half: usize,
     cx: usize,
     cy: usize,
+    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -76,20 +77,21 @@ pub(crate) fn sse_and_rate_avx2(
 
     const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
-    for y in 0..height {
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-
-        let row = y * width;
-        let coeffs = &coeff[row..row + width];
-        let invs = &inv_matrix[row..row + width];
 
         for (x0, (coeff8, inv8)) in coeffs
             .as_chunks::<8>()
             .0
             .iter()
-            .zip(invs.as_chunks::<8>().0.iter())
+            .zip(inv_matrix.as_chunks::<8>().0.iter())
             .enumerate()
         {
             let x = x0 * 8;
@@ -269,7 +271,20 @@ mod tests {
                 let qs = 0.5 + rnd() * 3.0;
                 let thr = [rnd() * 0.6, rnd() * 0.6, rnd() * 0.6, rnd() * 0.6];
                 let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr);
-                let a = unsafe { sse_and_rate_avx2(&coeff, &inv, qs, w, h, half, cx, cy, &thr) };
+                let a = unsafe {
+                    sse_and_rate_avx2(
+                        &coeff,
+                        &inv,
+                        qs,
+                        w,
+                        h,
+                        half,
+                        cx,
+                        cy,
+                        crate::enc_ac_strategy::rate_log2_lut(),
+                        &thr,
+                    )
+                };
                 assert_eq!(a.1, r.1, "nzeros mismatch {w}x{h}");
                 assert_eq!(a.2, r.2, "mag_bits mismatch {w}x{h}");
                 let rel = if r.0.abs() > 1e-3 {

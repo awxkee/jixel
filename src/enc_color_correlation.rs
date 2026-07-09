@@ -27,7 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{dct8x8, fmla};
+use crate::dct::fmla;
+use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageSB};
 use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
@@ -51,6 +52,7 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32) -> i32 {
 /// Compute (ytox, ytob) for one tile. `tile_brect_*` are block coordinates
 /// (top-left inclusive) into `opsin`, sizes capped at K_TILE_DIM_IN_BLOCKS.
 fn compute_cmap_tile(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     bx0: usize,
     by0: usize,
@@ -90,19 +92,19 @@ fn compute_cmap_tile(
                 let row = opsin.plane_row(1, py + yy);
                 tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
             }
-            dct8x8(&tmp, &mut block_y);
+            (ctx.dct8x8)(&tmp, &mut block_y);
             // DCT X.
             for yy in 0..8 {
                 let row = opsin.plane_row(0, py + yy);
                 tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
             }
-            dct8x8(&tmp, &mut block_x);
+            (ctx.dct8x8)(&tmp, &mut block_x);
             // DCT B.
             for yy in 0..8 {
                 let row = opsin.plane_row(2, py + yy);
                 tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
             }
-            dct8x8(&tmp, &mut block_b);
+            (ctx.dct8x8)(&tmp, &mut block_b);
 
             // Zero DC (LF position) — libjxl-tiny zeros it so it doesn't affect
             // the regression; the per-tile AC factor controls AC only.
@@ -139,6 +141,7 @@ fn compute_cmap_tile(
 /// per-tile regression on `opsin`. `(dc_group_x0_blocks, dc_group_y0_blocks)`
 /// is the block offset of this DC group's (0, 0) tile into `opsin`.
 pub(crate) fn fill_cmap(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     matrices: &DequantMatrices,
     dc_group_x0_blocks: usize,
@@ -167,7 +170,8 @@ pub(crate) fn fill_cmap(
             if bx_count == 0 || by_count == 0 {
                 continue;
             }
-            let (ytox, ytob) = compute_cmap_tile(opsin, bx0, by0, bx_count, by_count, matrices);
+            let (ytox, ytob) =
+                compute_cmap_tile(ctx, opsin, bx0, by0, bx_count, by_count, matrices);
             *v_ytox = ytox as i8;
             *v_ytob = ytob as i8;
         }
@@ -203,7 +207,8 @@ mod tests {
             }
         }
         let matrices = DequantMatrices::new();
-        let (ytox, ytob) = compute_cmap_tile(&opsin, 0, 0, 8, 8, &matrices);
+        let ctx = EncodingContext::new();
+        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, &matrices);
         // No variation → no useful correlation → slope == 0 (the regression
         // collapses to numerator=0, denominator>0 → 0).
         assert_eq!(ytox, 0);
@@ -224,7 +229,8 @@ mod tests {
             }
         }
         let matrices = DequantMatrices::new();
-        let (ytox, ytob) = compute_cmap_tile(&opsin, 0, 0, 8, 8, &matrices);
+        let ctx = EncodingContext::new();
+        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, &matrices);
         assert!((ytox - 25).abs() < 3, "ytox = {}, expected ~25", ytox);
         // B = Y → slope 1 = base; cmap should be near 0.
         assert!(ytob.abs() < 3, "ytob = {}, expected ~0", ytob);

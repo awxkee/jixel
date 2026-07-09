@@ -59,9 +59,7 @@ use crate::dc_group_data::{
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
     STRATEGY_DCT32X32,
 };
-use crate::dct::{
-    dct4x4, dct4x8, dct8x4, dct8x8, dct8x16, dct16x8, dct16x16, dct16x32, dct32x16, dct32x32,
-};
+use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB};
 use crate::quant_weights::DequantMatrices;
 use crate::util::FastRound;
@@ -74,11 +72,12 @@ use std::sync::OnceLock;
 /// `log2f`), but trading a per-coefficient transcendental for an L1 load. Values
 /// of `|q|` at or above the table size (rare, large coefficients) fall back to
 /// the direct computation.
-const RATE_LOG2_LUT_N: usize = 1024;
+pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
+pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];
 
 #[inline]
-pub(crate) fn rate_log2_lut() -> &'static [f32; RATE_LOG2_LUT_N] {
-    static LUT: OnceLock<[f32; RATE_LOG2_LUT_N]> = OnceLock::new();
+pub(crate) fn rate_log2_lut() -> &'static RateLog2Lut {
+    static LUT: OnceLock<RateLog2Lut> = OnceLock::new();
     LUT.get_or_init(|| {
         let mut a = [0.0f32; RATE_LOG2_LUT_N];
         for (i, v) in a.iter_mut().enumerate() {
@@ -88,11 +87,10 @@ pub(crate) fn rate_log2_lut() -> &'static [f32; RATE_LOG2_LUT_N] {
     })
 }
 
-/// `log2(1 + qabs)` for a non-negative integer-valued `qabs`, via [`rate_log2_lut`].
+/// `log2(1 + qabs)` for a non-negative integer-valued `qabs`, via a resolved LUT.
 #[inline]
-pub(crate) fn rate_log2(qabs: f32) -> f32 {
+pub(crate) fn rate_log2_with_lut(lut: &RateLog2Lut, qabs: f32) -> f32 {
     let k = qabs as usize;
-    let lut = rate_log2_lut();
     if k < RATE_LOG2_LUT_N {
         lut[k]
     } else {
@@ -153,6 +151,7 @@ thread_local! {
 /// `write_ac_group`). Returns `(cx, cy)` covered-block counts after the
 /// libjxl-tiny `cx ≥ cy` normalisation, i.e. the storage shape in 8-blocks.
 fn forward_transform(
+    ctx: &EncodingContext,
     strategy: u8,
     plane: &crate::image::Plane<f32>,
     px: usize,
@@ -189,35 +188,35 @@ fn forward_transform(
                 gather(8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-                dct8x8(src, dst);
+                (ctx.dct8x8)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT16X8 => {
                 gather(8, 16, &mut tmp[..128]);
                 let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
                 let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
-                dct16x8(src, dst);
+                (ctx.dct16x8)(src, dst);
                 (2, 1)
             }
             STRATEGY_DCT8X16 => {
                 gather(16, 8, &mut tmp[..128]);
                 let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
                 let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
-                dct8x16(src, dst);
+                (ctx.dct8x16)(src, dst);
                 (2, 1)
             }
             STRATEGY_DCT16X16 => {
                 gather(16, 16, &mut tmp[..256]);
                 let src: &[f32; 256] = (&tmp[..256]).try_into().unwrap();
                 let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
-                dct16x16(src, dst);
+                (ctx.dct16x16)(src, dst);
                 (2, 2)
             }
             STRATEGY_DCT32X32 => {
                 gather(32, 32, &mut tmp[..1024]);
                 let src: &[f32; 1024] = (&tmp[..1024]).try_into().unwrap();
                 let dst: &mut [f32; 1024] = (&mut out[..1024]).try_into().unwrap();
-                dct32x32(src, dst);
+                (ctx.dct32x32)(src, dst);
                 (4, 4)
             }
             STRATEGY_DCT32X16 => {
@@ -225,7 +224,7 @@ fn forward_transform(
                 gather(16, 32, &mut tmp[..512]);
                 let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
                 let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
-                dct32x16(src, dst);
+                (ctx.dct32x16)(src, dst);
                 (4, 2)
             }
             STRATEGY_DCT16X32 => {
@@ -233,28 +232,28 @@ fn forward_transform(
                 gather(32, 16, &mut tmp[..512]);
                 let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
                 let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
-                dct16x32(src, dst);
+                (ctx.dct16x32)(src, dst);
                 (4, 2)
             }
             STRATEGY_DCT4X4 => {
                 gather(8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-                dct4x4(src, dst);
+                (ctx.dct4x4)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT4X8 => {
                 gather(8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-                dct4x8(src, dst);
+                (ctx.dct4x8)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT8X4 => {
                 gather(8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-                dct8x4(src, dst);
+                (ctx.dct8x4)(src, dst);
                 (1, 1)
             }
             _ => unreachable!("invalid strategy {strategy}"),
@@ -292,6 +291,8 @@ fn thresholds(channel: usize, cx: usize, cy: usize) -> [f32; 4] {
 /// (bits). LLF positions (`x < cx && y < cy`, coded via the DC plane) are
 /// excluded from both, since DC coding is transform-choice-independent here.
 fn channel_rd(
+    sse_and_rate_fn: SseAndRateFn,
+    rate_log2_lut: &RateLog2Lut,
     coeff: &[f32],
     inv_matrix: &[f32],
     channel: usize,
@@ -306,75 +307,74 @@ fn channel_rd(
     let thr = thresholds(channel, cx, cy);
     let q_scaled = qac * qm_mult;
 
-    let (sse, nzeros, mag_bits) = sse_and_rate(
-        coeff, inv_matrix, q_scaled, width, height, half, cx, cy, &thr,
-    );
+    let (sse, nzeros, mag_bits) = unsafe {
+        sse_and_rate_fn(
+            coeff,
+            inv_matrix,
+            q_scaled,
+            width,
+            height,
+            half,
+            cx,
+            cy,
+            rate_log2_lut,
+            &thr,
+        )
+    };
 
-    let header = R_HEADER * rate_log2(nzeros as f32);
+    let header = R_HEADER * rate_log2_with_lut(rate_log2_lut, nzeros as f32);
     let bits = nzeros as f32 * R_NZ_BASE + R_MAG * mag_bits + header;
     (sse, bits)
 }
 
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn sse_and_rate(
-    coeff: &[f32],
-    inv_matrix: &[f32],
-    q_scaled: f32,
-    width: usize,
-    height: usize,
-    half: usize,
-    cx: usize,
-    cy: usize,
-    thr: &[f32; 4],
-) -> (f32, usize, f32) {
-    type SseFunction = unsafe fn(
-        &[f32],
-        &[f32],
-        f32,
-        usize,
-        usize,
-        usize,
-        usize,
-        usize,
-        &[f32; 4],
-    ) -> (f32, usize, f32);
-    static SSE_FUNCTION: OnceLock<SseFunction> = OnceLock::new();
-    let f = SSE_FUNCTION.get_or_init(|| {
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        {
-            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                return crate::avx::sse_and_rate_avx2;
-            }
-        }
-        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-        {
-            if std::is_x86_feature_detected!("sse4.1") {
-                return crate::sse::sse_and_rate_sse;
-            }
-        }
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            crate::neon::sse_and_rate_neon
-        }
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-        {
-            crate::wasm::sse_and_rate_wasm
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", feature = "neon"),
-            all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
-        )))]
-        {
-            sse_and_rate_scalar
-        }
-    });
+pub(crate) type SseAndRateFn = unsafe fn(
+    &[f32],
+    &[f32],
+    f32,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    &RateLog2Lut,
+    &[f32; 4],
+) -> (f32, usize, f32);
 
-    unsafe {
-        f(
-            coeff, inv_matrix, q_scaled, width, height, half, cx, cy, thr,
-        )
+fn select_sse_and_rate_fn() -> SseAndRateFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return crate::avx::sse_and_rate_avx2;
+        }
     }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    {
+        if std::is_x86_feature_detected!("sse4.1") {
+            return crate::sse::sse_and_rate_sse;
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        crate::neon::sse_and_rate_neon
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return crate::wasm::sse_and_rate_wasm;
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        sse_and_rate_scalar
+    }
+}
+
+static SSE_AND_RATE_FN: OnceLock<SseAndRateFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_sse_and_rate_fn() -> SseAndRateFn {
+    *SSE_AND_RATE_FN.get_or_init(select_sse_and_rate_fn)
 }
 
 #[allow(unused)]
@@ -388,6 +388,7 @@ pub(crate) fn sse_and_rate_scalar(
     half: usize,
     cx: usize,
     cy: usize,
+    rate_log2_lut: &RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let mut sse = 0.0f32;
@@ -414,7 +415,7 @@ pub(crate) fn sse_and_rate_scalar(
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
-                mag_bits += rate_log2(q.abs());
+                mag_bits += rate_log2_with_lut(rate_log2_lut, q.abs());
             }
         }
     }
@@ -424,6 +425,7 @@ pub(crate) fn sse_and_rate_scalar(
 /// Full RD cost `J = D + λR` of coding `strategy` at absolute pixel `(px, py)`.
 /// Combines the three channels with the selection-time CfL approximation.
 fn strategy_cost(
+    ctx: &EncodingContext,
     strategy: u8,
     opsin: &Image3F,
     px: usize,
@@ -436,7 +438,7 @@ fn strategy_cost(
     SC_COEFFS_SCRATCH.with(|cell| {
         let coeffs = &mut *cell.borrow_mut();
         for c in 0..3 {
-            cxy = forward_transform(strategy, opsin.plane(c), px, py, &mut coeffs[c]);
+            cxy = forward_transform(ctx, strategy, opsin.plane(c), px, py, &mut coeffs[c]);
         }
         let (cx, cy) = cxy;
         let size = cx * cy * 64;
@@ -466,7 +468,17 @@ fn strategy_cost(
         let mut r_total = 0.0f32;
         for c in 0..3 {
             let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
-            let (d, r) = channel_rd(&coeffs[c][..size], inv(c), c, qac, qm_mult, cx, cy);
+            let (d, r) = channel_rd(
+                ctx.sse_and_rate,
+                ctx.rate_log2_lut,
+                &coeffs[c][..size],
+                inv(c),
+                c,
+                qac,
+                qm_mult,
+                cx,
+                cy,
+            );
             d_total += CHANNEL_WEIGHT[c] * d;
             r_total += r;
         }
@@ -476,6 +488,7 @@ fn strategy_cost(
 
 #[allow(clippy::too_many_arguments)]
 fn select_super_block(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     bx0: usize,
     by0: usize,
@@ -491,6 +504,7 @@ fn select_super_block(
     for dy in 0..2 {
         for dx in 0..2 {
             c8[dy][dx] = strategy_cost(
+                ctx,
                 STRATEGY_DCT,
                 opsin,
                 px0 + dx * 8,
@@ -503,8 +517,18 @@ fn select_super_block(
     }
 
     // Vertical pairs (DCT16X8): one per column.
-    let v_left = strategy_cost(STRATEGY_DCT16X8, opsin, px0, py0, qac, qm_mult_x, matrices);
+    let v_left = strategy_cost(
+        ctx,
+        STRATEGY_DCT16X8,
+        opsin,
+        px0,
+        py0,
+        qac,
+        qm_mult_x,
+        matrices,
+    );
     let v_right = strategy_cost(
+        ctx,
         STRATEGY_DCT16X8,
         opsin,
         px0 + 8,
@@ -514,8 +538,18 @@ fn select_super_block(
         matrices,
     );
     // Horizontal pairs (DCT8X16): one per row.
-    let h_top = strategy_cost(STRATEGY_DCT8X16, opsin, px0, py0, qac, qm_mult_x, matrices);
+    let h_top = strategy_cost(
+        ctx,
+        STRATEGY_DCT8X16,
+        opsin,
+        px0,
+        py0,
+        qac,
+        qm_mult_x,
+        matrices,
+    );
     let h_bot = strategy_cost(
+        ctx,
         STRATEGY_DCT8X16,
         opsin,
         px0,
@@ -525,7 +559,16 @@ fn select_super_block(
         matrices,
     );
     // The single DCT16X16 over all four.
-    let c16 = strategy_cost(STRATEGY_DCT16X16, opsin, px0, py0, qac, qm_mult_x, matrices);
+    let c16 = strategy_cost(
+        ctx,
+        STRATEGY_DCT16X16,
+        opsin,
+        px0,
+        py0,
+        qac,
+        qm_mult_x,
+        matrices,
+    );
 
     // Best column-wise DCT16X8 layout vs the two DCT8s it would replace.
     let cost_16x8 = (BIAS_RECT * v_left).min(c8[0][0] + c8[1][0])
@@ -645,6 +688,7 @@ fn region_qac(quant_field: &ImageB, bx: usize, by: usize, w: usize, h: usize, sc
 /// decision sequence bit-for-bit. Reads `quant_field`/`opsin` only.
 #[allow(clippy::too_many_arguments)]
 fn select_band(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     dc_group_px: usize,
     dc_group_py: usize,
@@ -673,6 +717,7 @@ fn select_band(
                         let sby = by + sy * 2;
                         let qac = region_qac(quant_field, sbx, sby, 2, 2, scale);
                         sub_total += select_super_block(
+                            ctx,
                             opsin,
                             sbx,
                             sby,
@@ -687,6 +732,7 @@ fn select_band(
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale);
                 let cost32 = strategy_cost(
+                    ctx,
                     STRATEGY_DCT32X32,
                     opsin,
                     dc_group_px + bx * 8,
@@ -697,6 +743,7 @@ fn select_band(
                 );
                 // Two DCT32X16 (each 2 wide × 4 tall) tiling the region: left + right.
                 let cl = strategy_cost(
+                    ctx,
                     STRATEGY_DCT32X16,
                     opsin,
                     dc_group_px + bx * 8,
@@ -706,6 +753,7 @@ fn select_band(
                     matrices,
                 );
                 let cr = strategy_cost(
+                    ctx,
                     STRATEGY_DCT32X16,
                     opsin,
                     dc_group_px + (bx + 2) * 8,
@@ -716,6 +764,7 @@ fn select_band(
                 );
                 // Two DCT16X32 (each 4 wide × 2 tall) tiling the region: top + bottom.
                 let ct = strategy_cost(
+                    ctx,
                     STRATEGY_DCT16X32,
                     opsin,
                     dc_group_px + bx * 8,
@@ -725,6 +774,7 @@ fn select_band(
                     matrices,
                 );
                 let cb = strategy_cost(
+                    ctx,
                     STRATEGY_DCT16X32,
                     opsin,
                     dc_group_px + bx * 8,
@@ -764,6 +814,7 @@ fn select_band(
                 for sby in [by, by + 2] {
                     let qac = region_qac(quant_field, bx, sby, 2, 2, scale);
                     select_super_block(
+                        ctx,
                         opsin,
                         bx,
                         sby,
@@ -779,6 +830,7 @@ fn select_band(
             } else {
                 let qac = region_qac(quant_field, bx, by, 2, 2, scale);
                 select_super_block(
+                    ctx,
                     opsin,
                     bx,
                     by,
@@ -805,13 +857,40 @@ fn select_band(
             let qac = region_qac(quant_field, bx, by, 1, 1, scale);
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
-            let cost8 = strategy_cost(STRATEGY_DCT, opsin, px, py, qac, qm_mult_x, matrices);
-            let cost4 =
-                BIAS_4X4 * strategy_cost(STRATEGY_DCT4X4, opsin, px, py, qac, qm_mult_x, matrices);
-            let cost48 =
-                BIAS_4X8 * strategy_cost(STRATEGY_DCT4X8, opsin, px, py, qac, qm_mult_x, matrices);
-            let cost84 =
-                BIAS_4X8 * strategy_cost(STRATEGY_DCT8X4, opsin, px, py, qac, qm_mult_x, matrices);
+            let cost8 = strategy_cost(ctx, STRATEGY_DCT, opsin, px, py, qac, qm_mult_x, matrices);
+            let cost4 = BIAS_4X4
+                * strategy_cost(
+                    ctx,
+                    STRATEGY_DCT4X4,
+                    opsin,
+                    px,
+                    py,
+                    qac,
+                    qm_mult_x,
+                    matrices,
+                );
+            let cost48 = BIAS_4X8
+                * strategy_cost(
+                    ctx,
+                    STRATEGY_DCT4X8,
+                    opsin,
+                    px,
+                    py,
+                    qac,
+                    qm_mult_x,
+                    matrices,
+                );
+            let cost84 = BIAS_4X8
+                * strategy_cost(
+                    ctx,
+                    STRATEGY_DCT8X4,
+                    opsin,
+                    px,
+                    py,
+                    qac,
+                    qm_mult_x,
+                    matrices,
+                );
             // Choose the cheapest sub-8×8 candidate, and take it only if it beats
             // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
             // horizontal res) are transposes that suit opposite edge orientations.
@@ -855,6 +934,7 @@ fn selection_bands(ysize: usize, n: usize) -> Vec<(usize, usize)> {
 }
 
 pub(crate) fn fill_ac_strategy(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     dc_group_px: usize,
     dc_group_py: usize,
@@ -878,6 +958,7 @@ pub(crate) fn fill_ac_strategy(
 
     let benefit = if bands.len() <= 1 {
         select_band(
+            ctx,
             opsin,
             dc_group_px,
             dc_group_py,
@@ -900,6 +981,7 @@ pub(crate) fn fill_ac_strategy(
             let (y0, y1) = bands_ref[i];
             let mut local = AcStrategyImage::new(xsize, ysize);
             let b = select_band(
+                ctx,
                 opsin,
                 dc_group_px,
                 dc_group_py,

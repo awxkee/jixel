@@ -45,6 +45,7 @@ pub(crate) fn sse_and_rate_neon(
     half: usize,
     cx: usize,
     cy: usize,
+    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -60,14 +61,16 @@ pub(crate) fn sse_and_rate_neon(
     let all_active = vdupq_n_u32(u32::MAX);
     let lane_ids = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
 
-    for y in 0..height {
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-        let row = y * width;
 
-        let coeffs = &coeff[row..row + width];
-        let inv_matrix = &inv_matrix[row..row + width];
         for (x0, (coeff, inv_matrix)) in coeffs
             .as_chunks::<4>()
             .0
