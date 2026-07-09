@@ -359,7 +359,7 @@ fn select_sse_and_rate_fn() -> SseAndRateFn {
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return crate::wasm::sse_and_rate_wasm;
+        crate::wasm::sse_and_rate_wasm
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),

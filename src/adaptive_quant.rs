@@ -245,7 +245,7 @@ fn select_fill_quant_field_fn() -> FillQuantFieldFn {
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return crate::wasm::fill_quant_field;
+        crate::wasm::fill_quant_field
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),

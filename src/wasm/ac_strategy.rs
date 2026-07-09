@@ -87,7 +87,7 @@ pub(crate) fn sse_and_rate_wasm(
             .as_chunks::<4>()
             .0
             .iter()
-            .zip(invs.as_chunks::<4>().0.iter())
+            .zip(inv_matrix.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let x = x0 * 4;
