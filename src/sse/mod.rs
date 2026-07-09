@@ -29,9 +29,11 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod lossless_grad;
+mod quant;
 mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_sse;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use quant::quantize_block_ac_sse41;
 pub(crate) use xyb::to_xyb_sse41_band;

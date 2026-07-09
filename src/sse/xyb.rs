@@ -27,10 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/*
- * // Copyright (c) Radzivon Bartoshyk 7/2026. All rights reserved.
- */
-
 use crate::enc_xyb::*;
 
 #[cfg(target_arch = "x86")]

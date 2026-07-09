@@ -238,7 +238,10 @@ mod tests {
                 sse += d * d;
                 if q != 0.0 {
                     nz += 1;
-                    mb += crate::enc_ac_strategy::rate_log2(q.abs());
+                    mb += crate::enc_ac_strategy::rate_log2_with_lut(
+                        crate::enc_ac_strategy::rate_log2_lut(),
+                        q.abs(),
+                    );
                 }
             }
         }
