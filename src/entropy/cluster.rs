@@ -31,34 +31,68 @@ use super::histogram::Histogram;
 use super::huffman_tree::create_huffman_tree;
 use super::prefix_code::ALPHABET_SIZE;
 
-fn histogram_bit_cost(h: &Histogram) -> f32 {
-    if h.total_count == 0 {
+#[inline]
+fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
+    if total_count == 0 {
         return 0.0;
     }
+
+    let mut used_symbols = 0usize;
+    for &count in counts.iter() {
+        if count != 0 {
+            used_symbols += 1;
+            if used_symbols > 2 {
+                break;
+            }
+        }
+    }
+    if used_symbols <= 2 {
+        return total_count as f32;
+    }
+
     let mut depths = [0u8; ALPHABET_SIZE];
-    let counts32: [u32; ALPHABET_SIZE] = h.counts;
-    create_huffman_tree(&counts32, 15, &mut depths);
-    let mut cost: f32 = 0.0;
-    for i in 0..ALPHABET_SIZE {
-        cost += h.counts[i] as f32 * depths[i] as f32;
+    create_huffman_tree(counts, 15, &mut depths);
+
+    let mut cost = 0.0f32;
+    for (&count, &depth) in counts.iter().zip(depths.iter()) {
+        cost += count as f32 * depth as f32;
     }
     cost
 }
 
-fn histogram_add(a: &mut Histogram, b: &Histogram) {
-    for i in 0..ALPHABET_SIZE {
-        a.counts[i] += b.counts[i];
+#[inline]
+fn histogram_bit_cost(h: &Histogram) -> f32 {
+    counts_bit_cost(&h.counts, h.total_count)
+}
+
+#[inline]
+fn add_counts(dst: &mut [u32; ALPHABET_SIZE], src: &[u32; ALPHABET_SIZE]) {
+    for (dst, &src) in dst.iter_mut().zip(src.iter()) {
+        *dst += src;
     }
+}
+
+#[inline]
+fn histogram_add(a: &mut Histogram, b: &Histogram) {
+    add_counts(&mut a.counts, &b.counts);
     a.total_count += b.total_count;
 }
 
-fn histogram_distance(a: &Histogram, b: &Histogram, a_cost: f32, b_cost: f32) -> f32 {
+#[inline]
+fn histogram_distance(
+    a: &Histogram,
+    b: &Histogram,
+    a_cost: f32,
+    b_cost: f32,
+    scratch: &mut [u32; ALPHABET_SIZE],
+) -> f32 {
     if a.total_count == 0 || b.total_count == 0 {
         return 0.0;
     }
-    let mut combined = a.clone();
-    histogram_add(&mut combined, b);
-    histogram_bit_cost(&combined) - a_cost - b_cost
+
+    *scratch = a.counts;
+    add_counts(scratch, &b.counts);
+    counts_bit_cost(scratch, a.total_count + b.total_count) - a_cost - b_cost
 }
 
 /// Cluster `histograms` in place down to at most 8 distinct ones; produce
@@ -69,95 +103,137 @@ pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &
         context_map.resize(histograms.len(), 0);
         return;
     }
-    const CLUSTERS_LIMIT: usize = 64;
-    let max_histograms = CLUSTERS_LIMIT.min(histograms.len());
 
-    let inp: Vec<Histogram> = histograms.clone();
+    const CLUSTERS_LIMIT: usize = 64;
+    const UNMAPPED: u8 = u8::MAX;
+
+    let max_histograms = CLUSTERS_LIMIT.min(histograms.len());
+    let unassigned = max_histograms as u8;
+
+    let inp = core::mem::take(histograms);
     let n = inp.len();
-    let mut symbols: Vec<u32> = vec![max_histograms as u32; n];
+    let mut symbols: Vec<u8> = vec![unassigned; n];
 
     // Pre-compute bit costs for inputs.
     let mut in_costs = vec![0.0f32; n];
     let mut dists = vec![f32::MAX; n];
     let mut largest_idx = 0usize;
-    for i in 0..n {
-        if inp[i].total_count == 0 {
-            symbols[i] = 0;
-            dists[i] = 0.0;
+    let mut largest_count = 0u32;
+
+    for (i, (((hist, symbol), dist), cost)) in inp
+        .iter()
+        .zip(symbols.iter_mut())
+        .zip(dists.iter_mut())
+        .zip(in_costs.iter_mut())
+        .enumerate()
+    {
+        let total_count = hist.total_count;
+        if total_count == 0 {
+            *symbol = 0;
+            *dist = 0.0;
             continue;
         }
-        in_costs[i] = histogram_bit_cost(&inp[i]);
-        if inp[i].total_count > inp[largest_idx].total_count {
+
+        *cost = histogram_bit_cost(hist);
+        if total_count > largest_count {
+            largest_count = total_count;
             largest_idx = i;
         }
     }
 
-    let mut out: Vec<Histogram> = Vec::new();
-    let mut out_costs: Vec<f32> = Vec::new();
+    let mut out: Vec<Histogram> = Vec::with_capacity(max_histograms);
+    let mut out_costs: Vec<f32> = Vec::with_capacity(max_histograms);
+    let mut scratch = [0u32; ALPHABET_SIZE];
 
     const MIN_DISTANCE_FOR_DISTINCT: f32 = 64.0;
     while out.len() < max_histograms {
-        symbols[largest_idx] = out.len() as u32;
+        let symbol = out.len() as u8;
+        symbols[largest_idx] = symbol;
         out.push(inp[largest_idx].clone());
         out_costs.push(in_costs[largest_idx]);
         dists[largest_idx] = 0.0;
-        largest_idx = 0;
+
         let last_idx = out.len() - 1;
-        for i in 0..n {
-            if dists[i] == 0.0 {
+        let last_hist = &out[last_idx];
+        let last_cost = out_costs[last_idx];
+        let mut next_largest_idx = 0usize;
+        let mut next_largest_dist = dists[0];
+
+        for (i, ((hist, &in_cost), dist)) in inp
+            .iter()
+            .zip(in_costs.iter())
+            .zip(dists.iter_mut())
+            .enumerate()
+        {
+            if *dist == 0.0 {
                 continue;
             }
-            let d = histogram_distance(&inp[i], &out[last_idx], in_costs[i], out_costs[last_idx]);
-            if d < dists[i] {
-                dists[i] = d;
+
+            let d = histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch);
+            if d < *dist {
+                *dist = d;
             }
-            if dists[i] > dists[largest_idx] {
-                largest_idx = i;
+            if *dist > next_largest_dist {
+                next_largest_dist = *dist;
+                next_largest_idx = i;
             }
         }
-        if dists[largest_idx] < MIN_DISTANCE_FOR_DISTINCT {
+
+        largest_idx = next_largest_idx;
+        if next_largest_dist < MIN_DISTANCE_FOR_DISTINCT {
             break;
         }
     }
 
     // Assign remaining inputs to the closest cluster, merging.
-    for i in 0..n {
-        if symbols[i] != max_histograms as u32 {
+    for ((hist, &in_cost), symbol) in inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut()) {
+        if *symbol != unassigned {
             continue;
         }
+
         let mut best = 0usize;
-        let mut best_dist = histogram_distance(&inp[i], &out[0], in_costs[i], out_costs[0]);
-        for j in 1..out.len() {
-            let d = histogram_distance(&inp[i], &out[j], in_costs[i], out_costs[j]);
+        let mut best_dist = histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+        for (j, (candidate, &candidate_cost)) in
+            out.iter().zip(out_costs.iter()).enumerate().skip(1)
+        {
+            let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
             if d < best_dist {
                 best = j;
                 best_dist = d;
             }
         }
-        let mut merged = out[best].clone();
-        histogram_add(&mut merged, &inp[i]);
-        let new_cost = histogram_bit_cost(&merged);
-        out[best] = merged;
-        out_costs[best] = new_cost;
-        symbols[i] = best as u32;
+
+        let best_hist = &mut out[best];
+        histogram_add(best_hist, hist);
+        out_costs[best] = histogram_bit_cost(best_hist);
+        *symbol = best as u8;
     }
 
     // Reindex so new symbols come in increasing order, matching HistogramReindex.
-    use std::collections::HashMap;
-    let mut new_index: HashMap<u32, u32> = HashMap::new();
-    let tmp = out.clone();
-    let mut next_index = 0u32;
-    let mut reordered: Vec<Histogram> = Vec::new();
-    for &s in &symbols {
-        if let std::collections::hash_map::Entry::Vacant(e) = new_index.entry(s) {
-            e.insert(next_index);
-            reordered.push(tmp[s as usize].clone());
+    let mut remap = [UNMAPPED; CLUSTERS_LIMIT];
+    let mut tmp: Vec<Option<Histogram>> = out.into_iter().map(Some).collect();
+    let mut reordered: Vec<Histogram> = Vec::with_capacity(tmp.len());
+    let mut next_index = 0u8;
+
+    for &symbol in &symbols {
+        debug_assert_ne!(symbol, unassigned);
+        let old_index = symbol as usize;
+        debug_assert!(old_index < tmp.len());
+
+        let mapped = &mut remap[old_index];
+        if *mapped == UNMAPPED {
+            *mapped = next_index;
+            reordered.push(
+                tmp[old_index]
+                    .take()
+                    .expect("cluster must be reindexed once"),
+            );
             next_index += 1;
         }
     }
+
     *histograms = reordered;
     context_map.clear();
-    for s in &symbols {
-        context_map.push(new_index[s] as u8);
-    }
+    context_map.reserve(symbols.len());
+    context_map.extend(symbols.iter().map(|&symbol| remap[symbol as usize]));
 }

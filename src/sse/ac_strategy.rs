@@ -58,6 +58,7 @@ pub(crate) fn sse_and_rate_sse(
     half: usize,
     cx: usize,
     cy: usize,
+    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -79,20 +80,21 @@ pub(crate) fn sse_and_rate_sse(
     // round-to-nearest-even via SSE4.1
     const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
 
-    for y in 0..height {
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-
-        let row = y * width;
-        let coeffs = &coeff[row..row + width];
-        let invs = &inv_matrix[row..row + width];
 
         for (x0, (coeff4, inv4)) in coeffs
             .as_chunks::<4>()
             .0
             .iter()
-            .zip(invs.as_chunks::<4>().0.iter())
+            .zip(inv_matrix.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let x = x0 * 4;

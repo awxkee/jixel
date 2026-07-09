@@ -146,8 +146,13 @@ fn select_dct() -> Arc<DctFn<64>> {
 }
 
 #[inline]
+pub(crate) fn selected_dct8x8() -> &'static DctFn<64> {
+    DCT_METHOD.get_or_init(select_dct).as_ref()
+}
+
+#[inline]
 pub(crate) fn dct8x8(input: &[f32; 64], output: &mut [f32; 64]) {
-    DCT_METHOD.get_or_init(select_dct)(input, output);
+    selected_dct8x8()(input, output);
 }
 
 pub(crate) fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
@@ -296,8 +301,13 @@ fn select_dct_8x16() -> Arc<DctFn<128>> {
 static DCT_METHOD_8X16: OnceLock<Arc<DctFn<128>>> = OnceLock::new();
 static DCT_METHOD_16X8: OnceLock<Arc<DctFn<128>>> = OnceLock::new();
 
+#[inline]
+pub(crate) fn selected_dct8x16() -> &'static DctFn<128> {
+    DCT_METHOD_8X16.get_or_init(select_dct_8x16).as_ref()
+}
+
 pub(crate) fn dct8x16(input: &[f32; 128], output: &mut [f32; 128]) {
-    DCT_METHOD_8X16.get_or_init(select_dct_8x16)(input, output);
+    selected_dct8x16()(input, output);
 }
 
 pub(crate) fn dct8x16_scalar(input: &[f32], output: &mut [f32; 128]) {
@@ -359,8 +369,13 @@ fn select_dct_16x8() -> Arc<DctFn<128>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct16x8() -> &'static DctFn<128> {
+    DCT_METHOD_16X8.get_or_init(select_dct_16x8).as_ref()
+}
+
 pub(crate) fn dct16x8(input: &[f32; 128], output: &mut [f32; 128]) {
-    DCT_METHOD_16X8.get_or_init(select_dct_16x8)(input, output);
+    selected_dct16x8()(input, output);
 }
 
 pub(crate) fn dct16x8_scalar(input: &[f32; 128], output: &mut [f32; 128]) {
@@ -439,8 +454,13 @@ fn select_dct_16x16() -> Arc<DctFn<256>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct16x16() -> &'static DctFn<256> {
+    DCT_METHOD_16X16.get_or_init(select_dct_16x16).as_ref()
+}
+
 pub(crate) fn dct16x16(input: &[f32; 256], output: &mut [f32; 256]) {
-    DCT_METHOD_16X16.get_or_init(select_dct_16x16)(input, output);
+    selected_dct16x16()(input, output);
 }
 
 pub(crate) fn dct16x16_scalar(input: &[f32; 256], output: &mut [f32; 256]) {
@@ -569,8 +589,13 @@ fn select_dct_4x4() -> Arc<DctFn<64>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct4x4() -> &'static DctFn<64> {
+    DCT_METHOD_4X4.get_or_init(select_dct_4x4).as_ref()
+}
+
 pub(crate) fn dct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
-    DCT_METHOD_4X4.get_or_init(select_dct_4x4)(input, output);
+    selected_dct4x4()(input, output);
 }
 
 /// Forward DCT4X4 (libjxl `Type::DCT4X4`): four 4×4 DCTs on the quadrants,
@@ -752,8 +777,13 @@ fn select_dct_4x8() -> Arc<DctFn<64>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct4x8() -> &'static DctFn<64> {
+    DCT_METHOD_4X8.get_or_init(select_dct_4x8).as_ref()
+}
+
 pub(crate) fn dct4x8(input: &[f32; 64], output: &mut [f32; 64]) {
-    DCT_METHOD_4X8.get_or_init(select_dct_4x8)(input, output);
+    selected_dct4x8()(input, output);
 }
 
 static DCT_METHOD_8X4: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
@@ -792,8 +822,13 @@ fn select_dct_8x4() -> Arc<DctFn<64>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct8x4() -> &'static DctFn<64> {
+    DCT_METHOD_8X4.get_or_init(select_dct_8x4).as_ref()
+}
+
 pub(crate) fn dct8x4(input: &[f32; 64], output: &mut [f32; 64]) {
-    DCT_METHOD_8X4.get_or_init(select_dct_8x4)(input, output);
+    selected_dct8x4()(input, output);
 }
 
 pub(crate) const WC32: [f32; 16] = [
@@ -873,8 +908,13 @@ fn select_dct_32x32() -> Arc<DctFn<1024>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct32x32() -> &'static DctFn<1024> {
+    DCT_METHOD_32X32.get_or_init(select_dct_32x32).as_ref()
+}
+
 pub(crate) fn dct32x32(input: &[f32; 1024], output: &mut [f32; 1024]) {
-    DCT_METHOD_32X32.get_or_init(select_dct_32x32)(input, output);
+    selected_dct32x32()(input, output);
 }
 
 /// Forward 32×32 DCT: column DCTs, then row DCTs, scaled by 1/(32·32). Output is
@@ -1012,8 +1052,13 @@ fn select_dct_32x16() -> Arc<DctFn<512>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct32x16() -> &'static DctFn<512> {
+    DCT_METHOD_32X16.get_or_init(select_dct_32x16).as_ref()
+}
+
 pub(crate) fn dct32x16(input: &[f32; 512], output: &mut [f32; 512]) {
-    DCT_METHOD_32X16.get_or_init(select_dct_32x16)(input, output);
+    selected_dct32x16()(input, output);
 }
 
 pub(crate) fn dct32x16_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
@@ -1076,8 +1121,13 @@ fn select_dct_16x32() -> Arc<DctFn<512>> {
     })
 }
 
+#[inline]
+pub(crate) fn selected_dct16x32() -> &'static DctFn<512> {
+    DCT_METHOD_16X32.get_or_init(select_dct_16x32).as_ref()
+}
+
 pub(crate) fn dct16x32(input: &[f32; 512], output: &mut [f32; 512]) {
-    DCT_METHOD_16X32.get_or_init(select_dct_16x32)(input, output);
+    selected_dct16x32()(input, output);
 }
 
 pub(crate) fn dct16x32_scalar(input: &[f32; 512], output: &mut [f32; 512]) {

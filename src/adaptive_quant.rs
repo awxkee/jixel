@@ -222,56 +222,45 @@ pub(crate) fn sort4(a: &mut [f32; 4]) {
     cswap!(1, 2);
 }
 
-/// Fill `raw_quant_field` (block-resolution) for the DC-group region whose
-/// top-left pixel is (x0, y0) in the full `opsin` (XYB) image.
-///
-/// `distance` is the butteraugli target; `inv_scale = 1.0 / distance_params.scale`.
-pub(crate) fn fill_quant_field(
-    opsin: &Image3F,
-    raw_quant_field: &mut ImageB,
-    x0: usize,
-    y0: usize,
-    distance: f32,
-    inv_scale: f32,
-) {
-    #[allow(clippy::type_complexity)]
-    static STORED_FN: OnceLock<fn(&Image3F, &mut ImageB, usize, usize, f32, f32)> = OnceLock::new();
+pub(crate) type FillQuantFieldFn = fn(&Image3F, &mut ImageB, usize, usize, f32, f32);
 
-    let f = STORED_FN.get_or_init(|| {
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
-                crate::avx::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
-            };
+fn select_fill_quant_field_fn() -> FillQuantFieldFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+            crate::avx::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+        };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+            crate::sse::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
+            crate::neon::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
         }
-        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-        if is_x86_feature_detected!("sse4.1") {
-            return |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
-                crate::sse::fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
-            };
-        }
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        {
-            use crate::neon::fill_quant_field;
-            |opsin, raw_quant_field, x0, y0, distance, inv_scale| unsafe {
-                fill_quant_field(opsin, raw_quant_field, x0, y0, distance, inv_scale);
-            }
-        }
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-        {
-            use crate::wasm::fill_quant_field;
-            fill_quant_field
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", feature = "neon"),
-            all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
-        )))]
-        {
-            fill_quant_field_scalar
-        }
-    });
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return crate::wasm::fill_quant_field;
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        fill_quant_field_scalar
+    }
+}
 
-    f(opsin, raw_quant_field, x0, y0, distance, inv_scale);
+static FILL_QUANT_FIELD_FN: OnceLock<FillQuantFieldFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_fill_quant_field_fn() -> FillQuantFieldFn {
+    *FILL_QUANT_FIELD_FN.get_or_init(select_fill_quant_field_fn)
 }
 
 pub(crate) struct AqMapScratch {
@@ -463,14 +452,10 @@ fn fill_quant_field_scalar(
                     *qf_out = 1;
                     continue;
                 }
-                // For blocks touching the right/bottom edge, libjxl operates on a
-                // padded image; we clamp reads to valid rows/cols by using bounded
-                // block coordinates. The modulation funcs index up to +7; clamp.
+
                 let bx_px = px.min(img_xsize.saturating_sub(8));
                 let by_px = py.min(img_ysize.saturating_sub(8));
 
-                // current libjxl PerBlockModulations order:
-                // mask -> gamma -> hf, then min with blue (computed from gamma-mask).
                 let mask_val = compute_mask(aq);
                 let mask_val = gamma_modulation(bx_px, by_px, opsin, mask_val);
                 let out_val = hf_modulation(bx_px, by_px, opsin, mask_val);

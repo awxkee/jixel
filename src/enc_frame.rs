@@ -31,8 +31,8 @@ use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
 use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4};
 use crate::enc_group::write_ac_group;
-use crate::enc_xyb::to_xyb;
 use crate::encode_image::AlphaPlane;
+use crate::encoding_context::EncodingContext;
 use crate::entropy::{
     EntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
@@ -611,6 +611,7 @@ pub(crate) fn encode_frame(
     num_threads: usize,
     writer: &mut BitWriter,
 ) {
+    let ctx = EncodingContext::new();
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
     let distp = compute_distance_params(distance);
     let matrices = DequantMatrices::new();
@@ -621,7 +622,7 @@ pub(crate) fn encode_frame(
     let num_passes = coeff_shifts.len();
 
     let mut opsin = linear.clone();
-    to_xyb(&mut opsin, num_threads);
+    crate::enc_xyb::to_xyb_with_fn(ctx.to_xyb_band, &mut opsin, num_threads);
     if distp.gab_enabled {
         crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
     }
@@ -645,7 +646,16 @@ pub(crate) fn encode_frame(
     let setup_budget = num_threads.max(1).div_ceil(outer);
     let setups = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
         let (dc_gx, dc_gy) = group_coords[i];
-        setup_dc_group(opsin, &dim, &distp, &matrices, dc_gx, dc_gy, setup_budget)
+        setup_dc_group(
+            &ctx,
+            opsin,
+            &dim,
+            &distp,
+            &matrices,
+            dc_gx,
+            dc_gy,
+            setup_budget,
+        )
     });
 
     let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(setups.len());
@@ -660,6 +670,7 @@ pub(crate) fn encode_frame(
         let (dc_idx, gx, gy) = ac_tasks[t];
         let (dc_gx, dc_gy) = group_coords[dc_idx];
         let (p, local) = process_ac_group(
+            &ctx,
             opsin,
             &dim,
             &distp,
@@ -867,6 +878,7 @@ pub(crate) struct PendingAcGroup {
 /// Set up one DC group (quant field, AC strategy, CfL, DCT4X4 gate); its AC
 /// groups are encoded separately. Returns the data and its group-grid dims.
 fn setup_dc_group(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
@@ -887,7 +899,7 @@ fn setup_dc_group(
 
     let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
 
-    crate::adaptive_quant::fill_quant_field(
+    (ctx.fill_quant_field)(
         opsin,
         &mut dc_data.raw_quant_field,
         dc_group_x0,
@@ -896,6 +908,7 @@ fn setup_dc_group(
         1.0 / distp.scale,
     );
     dc_data.dct4x4_benefit = crate::enc_ac_strategy::fill_ac_strategy(
+        ctx,
         opsin,
         dc_group_x0,
         dc_group_y0,
@@ -910,6 +923,7 @@ fn setup_dc_group(
     // Per-tile CfL: find optimal Y→X and Y→B slopes per 64×64 tile, written
     // into ytox_map/ytob_map and applied during DCT in write_ac_group.
     crate::enc_color_correlation::fill_cmap(
+        ctx,
         opsin,
         matrices,
         dc_group_x0 / K_BLOCK_DIM,
@@ -978,6 +992,7 @@ fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
 /// (origin-relative, merged by the caller). Reads `dc_data` read-only.
 #[allow(clippy::too_many_arguments)]
 fn process_ac_group(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
@@ -1036,6 +1051,7 @@ fn process_ac_group(
         );
 
         write_ac_group(
+            ctx,
             &stripe,
             stripe_brect,
             matrices,

@@ -30,6 +30,7 @@
 mod ans;
 mod cluster;
 mod entropy_code;
+mod fast_div_u16;
 mod histogram;
 mod huffman_tree;
 mod prefix_code;

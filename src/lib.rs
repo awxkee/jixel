@@ -51,6 +51,7 @@ mod enc_lossless;
 mod enc_lz77_ac;
 mod enc_xyb;
 mod encode_image;
+mod encoding_context;
 mod entropy;
 mod fast_loseless;
 mod gaborish;

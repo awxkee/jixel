@@ -30,6 +30,7 @@ mod ac_strategy;
 mod adaptive_quant;
 mod dct;
 mod lossless_grad;
+mod quant;
 mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_neon;
@@ -39,4 +40,5 @@ pub(crate) use dct::{
     dct16x32_neon, dct32x16_neon, dct32x32_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use quant::quantize_block_ac_neon;
 pub(crate) use xyb::to_xyb_neon_band;

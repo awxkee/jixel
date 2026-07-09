@@ -83,16 +83,9 @@ fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
 }
 
-type ToXybBandFn = unsafe fn([&mut [f32]; 3], usize);
+pub(crate) type ToXybBandFn = unsafe fn([&mut [f32]; 3], usize);
 
-fn to_xyb_f32_band(band: [&mut [f32]; 3], _w: usize) {
-    let [rp, gp, bp] = band;
-    for ((r, g), b) in rp.iter_mut().zip(gp.iter_mut()).zip(bp.iter_mut()) {
-        (*r, *g, *b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
-    }
-}
-
-fn to_xyb_band_fn() -> ToXybBandFn {
+fn select_to_xyb_band_fn() -> ToXybBandFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return crate::avx::to_xyb_avx2_band;
@@ -105,14 +98,36 @@ fn to_xyb_band_fn() -> ToXybBandFn {
     return crate::neon::to_xyb_neon_band;
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
     return crate::wasm::to_xyb_wasm_band;
-    #[allow(unreachable_code)]
-    to_xyb_f32_band
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        to_xyb_f32_band
+    }
 }
 
-/// Convert linear RGB (planes 0/1/2) to XYB in place, row-bands in parallel.
-pub(crate) fn to_xyb(image: &mut Image3F, num_threads: usize) {
-    static FN: OnceLock<ToXybBandFn> = OnceLock::new();
-    let f = *FN.get_or_init(to_xyb_band_fn);
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+)))]
+fn to_xyb_f32_band(band: [&mut [f32]; 3], _w: usize) {
+    let [rp, gp, bp] = band;
+    for ((r, g), b) in rp.iter_mut().zip(gp.iter_mut()).zip(bp.iter_mut()) {
+        (*r, *g, *b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
+    }
+}
+
+static TO_XYB_BAND_FN: OnceLock<ToXybBandFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_to_xyb_band_fn() -> ToXybBandFn {
+    *TO_XYB_BAND_FN.get_or_init(select_to_xyb_band_fn)
+}
+
+/// Convert linear RGB (planes 0/1/2) to XYB in place, row-bands in parallel,
+/// using an already-resolved SIMD/scalar band function.
+pub(crate) fn to_xyb_with_fn(f: ToXybBandFn, image: &mut Image3F, num_threads: usize) {
     let w = image.xsize();
     let run = |mut band: [&mut [f32]; 3]| {
         let [r, g, b] = &mut band;

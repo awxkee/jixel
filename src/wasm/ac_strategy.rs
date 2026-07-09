@@ -55,6 +55,7 @@ pub(crate) fn sse_and_rate_wasm(
     half: usize,
     cx: usize,
     cy: usize,
+    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -72,14 +73,15 @@ pub(crate) fn sse_and_rate_wasm(
     let lane_ids_arr = [0i32, 1, 2, 3];
     let lane_ids = unsafe { v128_load(lane_ids_arr.as_ptr() as *const v128) };
 
-    for y in 0..height {
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-
-        let row = y * width;
-        let coeffs = &coeff[row..row + width];
-        let invs = &inv_matrix[row..row + width];
 
         for (x0, (coeff4, inv4)) in coeffs
             .as_chunks::<4>()

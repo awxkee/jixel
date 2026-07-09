@@ -242,6 +242,7 @@ pub(crate) fn encode_frame_lossless(
     let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
     let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
     let single_group = num_ac_groups == 1;
+    let grad_pack_fn = selected_grad_pack_interior_fn();
 
     // Palette (v1): single-group, RGB (no alpha), <=256 distinct colors. Encodes
     // the image as a small palette meta-channel + an index channel, which is a
@@ -250,14 +251,22 @@ pub(crate) fn encode_frame_lossless(
     if single_group
         && num_color == 3
         && alpha.is_none()
-        && try_encode_palette_single_group(linear, xsize, ysize, min_symbol, writer)
+        && try_encode_palette_single_group(linear, xsize, ysize, min_symbol, grad_pack_fn, writer)
     {
         return;
     }
 
     // Stage-2 progressive lossless (opt-in): Squeeze pyramid (RGB + optional alpha).
     if single_group && num_color == 3 && progressive {
-        encode_squeeze_single_group(linear, alpha, xsize, ysize, min_symbol, writer);
+        encode_squeeze_single_group(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            min_symbol,
+            grad_pack_fn,
+            writer,
+        );
         return;
     }
 
@@ -279,6 +288,7 @@ pub(crate) fn encode_frame_lossless(
             ysize_dc_groups,
             num_dc_groups,
             num_ac_groups,
+            grad_pack_fn,
             writer,
         )
     {
@@ -357,6 +367,7 @@ pub(crate) fn encode_frame_lossless(
             ysize,
             num_color,
             &chan_preds,
+            grad_pack_fn,
         );
 
         // LZ77 layer: collapse runs of identical tokens into back-references.
@@ -413,6 +424,7 @@ pub(crate) fn encode_frame_lossless(
                     gh,
                     num_color,
                     &chan_preds,
+                    grad_pack_fn,
                 );
                 let lz = lz77_compress(&toks, distance_ctx);
                 all_lz.extend_from_slice(&lz);
@@ -579,6 +591,7 @@ fn encode_squeeze_single_group(
     xsize: usize,
     ysize: usize,
     min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
     writer: &mut BitWriter,
 ) {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -618,8 +631,8 @@ fn encode_squeeze_single_group(
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT);
-            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT, grad_pack_fn);
+            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED, grad_pack_fn);
             if bw <= bg {
                 PREDICTOR_WEIGHTED
             } else {
@@ -633,7 +646,15 @@ fn encode_squeeze_single_group(
         let data = &ch.data;
         let w = ch.w;
         let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        tokenize_plane(ctx, get, ch.w, ch.h, predictors[c], &mut tokens);
+        tokenize_plane(
+            ctx,
+            get,
+            ch.w,
+            ch.h,
+            predictors[c],
+            grad_pack_fn,
+            &mut tokens,
+        );
     }
 
     write_frame_header_modular(alpha.is_some(), writer);
@@ -682,6 +703,7 @@ fn encode_squeeze_multigroup(
     ysize_dc_groups: usize,
     num_dc_groups: usize,
     num_ac_groups: usize,
+    grad_pack_fn: GradPackInteriorFn,
     writer: &mut BitWriter,
 ) -> bool {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -724,8 +746,8 @@ fn encode_squeeze_multigroup(
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT);
-            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED);
+            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT, grad_pack_fn);
+            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED, grad_pack_fn);
             if bw <= bg {
                 PREDICTOR_WEIGHTED
             } else {
@@ -744,7 +766,15 @@ fn encode_squeeze_multigroup(
         let data = &ch.data;
         let w = ch.w;
         let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        tokenize_plane(ctx, get, ch.w, ch.h, predictors[c], &mut global_tokens);
+        tokenize_plane(
+            ctx,
+            get,
+            ch.w,
+            ch.h,
+            predictors[c],
+            grad_pack_fn,
+            &mut global_tokens,
+        );
     }
     let global_lz = lz77_compress(&global_tokens, distance_ctx);
     let mut all_lz: Vec<LzToken> = global_lz.clone();
@@ -781,7 +811,7 @@ fn encode_squeeze_multigroup(
             let data = &ch.data;
             let w = ch.w;
             let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-            tokenize_plane(ctx, get, rw, rh, pred, &mut gtok);
+            tokenize_plane(ctx, get, rw, rh, pred, grad_pack_fn, &mut gtok);
             within += 1;
         }
         lz77_compress(&gtok, distance_ctx)
@@ -909,6 +939,7 @@ fn try_encode_palette_single_group(
     xsize: usize,
     ysize: usize,
     min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
     writer: &mut BitWriter,
 ) -> bool {
     use std::collections::HashMap;
@@ -958,8 +989,8 @@ fn try_encode_palette_single_group(
 
     // 5) Per-channel predictor selection (gradient vs WP).
     let pick = |get: &dyn Fn(usize, usize) -> i32, w: usize, h: usize| -> u32 {
-        let bg = estimate_channel_bits(get, w, h, PREDICTOR_GRADIENT);
-        let bw = estimate_channel_bits(get, w, h, PREDICTOR_WEIGHTED);
+        let bg = estimate_channel_bits(get, w, h, PREDICTOR_GRADIENT, grad_pack_fn);
+        let bw = estimate_channel_bits(get, w, h, PREDICTOR_WEIGHTED, grad_pack_fn);
         if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
@@ -989,6 +1020,7 @@ fn try_encode_palette_single_group(
         nb_colors,
         3,
         preds[0],
+        grad_pack_fn,
         &mut tokens,
     );
     tokenize_plane(
@@ -997,6 +1029,7 @@ fn try_encode_palette_single_group(
         xsize,
         ysize,
         preds[1],
+        grad_pack_fn,
         &mut tokens,
     );
 
@@ -1143,6 +1176,7 @@ fn tokenize_all(
     gh: usize,
     num_color: usize,
     predictors: &[u32],
+    grad_pack_fn: GradPackInteriorFn,
 ) -> Vec<Token> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
     let mut out = Vec::with_capacity(gw * gh * nb_chans);
@@ -1151,14 +1185,22 @@ fn tokenize_all(
     for chan in 0..num_color {
         let ctx = channel_to_context(chan, nb_chans);
         let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
-        tokenize_plane(ctx, get, gw, gh, predictors[chan], &mut out);
+        tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
     }
 
     // Alpha (untransformed) is the modular channel right after the color ones.
     if let Some(a) = alpha {
         let ctx = channel_to_context(num_color, nb_chans);
         let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
-        tokenize_plane(ctx, get, gw, gh, predictors[num_color], &mut out);
+        tokenize_plane(
+            ctx,
+            get,
+            gw,
+            gh,
+            predictors[num_color],
+            grad_pack_fn,
+            &mut out,
+        );
     }
 
     out
@@ -1176,6 +1218,7 @@ fn tokenize_plane(
     gw: usize,
     gh: usize,
     pred_id: u32,
+    grad_pack_fn: GradPackInteriorFn,
     out: &mut Vec<Token>,
 ) {
     if pred_id == PREDICTOR_WEIGHTED {
@@ -1226,7 +1269,7 @@ fn tokenize_plane(
                 }
             } else {
                 buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
-                grad_pack_interior(&cur, &prev, &mut buf, gw); // gx in 1..gw
+                grad_pack_fn(&cur, &prev, &mut buf, gw); // gx in 1..gw
             }
             for &b in buf.iter().take(gw) {
                 out.push(Token::new(ctx, b));
@@ -1234,33 +1277,38 @@ fn tokenize_plane(
         }
     }
 }
+type GradPackInteriorFn = fn(&[i32], &[i32], &mut [u32], usize);
+fn select_grad_pack_interior_fn() -> GradPackInteriorFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |c, p, o, g| unsafe { crate::avx::grad_pack_interior(c, p, o, g) };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |c, p, o, g| unsafe { crate::sse::grad_pack_interior(c, p, o, g) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |c, p, o, g| unsafe { crate::neon::grad_pack_interior(c, p, o, g) }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return crate::wasm::grad_pack_interior;
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        grad_pack_interior_scalar
+    }
+}
 
-fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
-    #[allow(clippy::type_complexity)]
-    static STORED_FN: OnceLock<fn(&[i32], &[i32], &mut [u32], usize)> = OnceLock::new();
-    let f = STORED_FN.get_or_init(|| {
-        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-        if is_x86_feature_detected!("avx2") {
-            return |c, p, o, g| unsafe { crate::avx::grad_pack_interior(c, p, o, g) };
-        }
-        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-        if is_x86_feature_detected!("sse4.1") {
-            return |c, p, o, g| unsafe { crate::sse::grad_pack_interior(c, p, o, g) };
-        }
-        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |c, p, o, g| unsafe { crate::neon::grad_pack_interior(c, p, o, g) };
-        }
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-        {
-            crate::wasm::grad_pack_interior
-        }
-        #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
-        {
-            grad_pack_interior_scalar
-        }
-    });
-    f(cur, prev, out, gw)
+static GRAD_PACK_INTERIOR_FN: OnceLock<GradPackInteriorFn> = OnceLock::new();
+
+#[inline]
+fn selected_grad_pack_interior_fn() -> GradPackInteriorFn {
+    *GRAD_PACK_INTERIOR_FN.get_or_init(select_grad_pack_interior_fn)
 }
 
 #[allow(unused)]
@@ -1287,9 +1335,10 @@ fn estimate_channel_bits(
     w: usize,
     h: usize,
     pred_id: u32,
+    grad_pack_fn: GradPackInteriorFn,
 ) -> f64 {
     let mut toks: Vec<Token> = Vec::with_capacity(w * h);
-    tokenize_plane(0, get, w, h, pred_id, &mut toks);
+    tokenize_plane(0, get, w, h, pred_id, grad_pack_fn, &mut toks);
     if toks.is_empty() {
         return 0.0;
     }
@@ -2162,6 +2211,7 @@ pub(crate) fn encode_frame_lossless_float(
     let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
     let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
     let single_group = num_ac_groups == 1;
+    let grad_pack_fn = selected_grad_pack_interior_fn();
 
     // Float-bit values reach ~2^30, where the Weighted Predictor's internal
     // weight/divlookup arithmetic is not bit-verified against libjxl. Gradient
@@ -2193,6 +2243,7 @@ pub(crate) fn encode_frame_lossless_float(
             ysize,
             3,
             &predictors,
+            grad_pack_fn,
         );
         let code = optimize_entropy_code(&tokens, nb_chans);
         write_tree_and_pixel_code_nolz(&tree_tokens, &code, &mut section);
@@ -2220,8 +2271,19 @@ pub(crate) fn encode_frame_lossless_float(
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks =
-                    tokenize_all(linear, alpha, xsize, ysize, x0, y0, gw, gh, 3, &predictors);
+                let toks = tokenize_all(
+                    linear,
+                    alpha,
+                    xsize,
+                    ysize,
+                    x0,
+                    y0,
+                    gw,
+                    gh,
+                    3,
+                    &predictors,
+                    grad_pack_fn,
+                );
                 all_tokens.extend_from_slice(&toks);
                 group_tokens.push(toks);
             }

@@ -40,13 +40,14 @@ use crate::dc_group_data::{
 };
 use crate::dct::{
     dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32, dc_from_dct32x16,
-    dc_from_dct32x32, dct4x4, dct4x8, dct8x4, dct8x8, dct8x16, dct16x8, dct16x16, dct16x32,
-    dct32x16, dct32x32,
+    dc_from_dct32x32,
 };
+use crate::encoding_context::EncodingContext;
 use crate::entropy::{Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::quant_weights::{DC_QUANT, DequantMatrices, INV_DC_QUANT};
 use crate::util::FastRound;
+use std::sync::OnceLock;
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
 
@@ -109,7 +110,122 @@ fn num_nonzero_except_llf(block: &[i32], cx: usize, cy: usize) -> i32 {
 /// Thresholds mirror libjxl-tiny: per-quadrant in the 8×8 case; biased lower
 /// for multi-block; for the 1×N or N×1 case the second half of the columns
 /// (or rows for ysize=1, xsize=1 special) uses the second threshold pair.
-fn quantize_block_ac(
+pub(crate) type QuantizeBlockAcFn = fn(
+    block_in: &[f32],
+    c: usize,
+    qm: &[f32],
+    quant: i32,
+    scale: f32,
+    qm_multiplier: f32,
+    xsize: usize,
+    ysize: usize,
+    block_out: &mut [i32],
+);
+
+static QUANTIZE_BLOCK_AC_METHOD: OnceLock<QuantizeBlockAcFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn quantize_ac_thresholds(c: usize, xsize: usize, ysize: usize) -> [f32; 4] {
+    let mut thr = [0.58f32, 0.635, 0.66, 0.7];
+    if c == 0 {
+        for t in &mut thr[1..] {
+            *t += 0.08;
+        }
+    }
+    if c == 2 {
+        for t in &mut thr[1..] {
+            *t = 0.75;
+        }
+    }
+    if xsize > 1 || ysize > 1 {
+        let delta =
+            (0.003_f32 * xsize as f32 * ysize as f32).clamp(0.0, if c > 0 { 0.08 } else { 0.12 });
+        for t in &mut thr {
+            *t -= delta;
+        }
+    }
+    thr
+}
+
+#[inline]
+pub(crate) fn quantize_ac_q_scaled(quant: i32, scale: f32, qm_multiplier: f32) -> f32 {
+    scale * quant as f32 * qm_multiplier
+}
+
+fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return crate::wasm::quantize_block_ac_wasm;
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+                crate::neon::quantize_block_ac_neon(
+                    block_in,
+                    c,
+                    qm,
+                    quant,
+                    scale,
+                    qm_multiplier,
+                    xsize,
+                    ysize,
+                    block_out,
+                );
+            };
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+                crate::avx::quantize_block_ac_avx2(
+                    block_in,
+                    c,
+                    qm,
+                    quant,
+                    scale,
+                    qm_multiplier,
+                    xsize,
+                    ysize,
+                    block_out,
+                );
+            };
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    {
+        if is_x86_feature_detected!("sse4.1") {
+            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+                crate::sse::quantize_block_ac_sse41(
+                    block_in,
+                    c,
+                    qm,
+                    quant,
+                    scale,
+                    qm_multiplier,
+                    xsize,
+                    ysize,
+                    block_out,
+                );
+            };
+        }
+    }
+
+    quantize_block_ac_scalar
+}
+
+#[inline]
+pub(crate) fn selected_quantize_block_ac_fn() -> QuantizeBlockAcFn {
+    *QUANTIZE_BLOCK_AC_METHOD.get_or_init(select_quantize_block_ac_fn)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_block_ac_scalar(
     block_in: &[f32],
     c: usize,
     qm: &[f32],
@@ -120,26 +236,8 @@ fn quantize_block_ac(
     ysize: usize,
     block_out: &mut [i32],
 ) {
-    let qac = scale * quant as f32;
-    let mut thr = [0.58f32, 0.635, 0.66, 0.7];
-    if c == 0 {
-        for i in 1..4 {
-            thr[i] += 0.08;
-        }
-    }
-    if c == 2 {
-        for i in 1..4 {
-            thr[i] = 0.75;
-        }
-    }
-    if xsize > 1 || ysize > 1 {
-        let delta =
-            (0.003_f32 * xsize as f32 * ysize as f32).clamp(0.0, if c > 0 { 0.08 } else { 0.12 });
-        for i in 0..4 {
-            thr[i] -= delta;
-        }
-    }
-    let q_scaled = qac * qm_multiplier;
+    let thr = quantize_ac_thresholds(c, xsize, ysize);
+    let q_scaled = quantize_ac_q_scaled(quant, scale, qm_multiplier);
     let width = xsize * 8;
     let height = ysize * 8;
     // The quant matrix, input, and output must all be sized for this transform.
@@ -162,14 +260,16 @@ fn quantize_block_ac(
     let block_in = &block_in[..n];
     let block_out = &mut block_out[..n];
     let half = width / 2;
-    for y in 0..height {
+    for (y, ((qm_row, in_row), out_row)) in qm
+        .chunks_exact(width)
+        .zip(block_in.chunks_exact(width))
+        .zip(block_out.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-        let row = y * width;
-        let qm_row = &qm[row..row + width];
-        let in_row = &block_in[row..row + width];
-        let out_row = &mut block_out[row..row + width];
         for (x, ((&qmv, &inv), out)) in qm_row
             .iter()
             .zip(in_row.iter())
@@ -211,6 +311,7 @@ fn adjust_quant_bias_y(quant: i32) -> f32 {
 /// Y-channel quantize then dequantize-with-bias for CfL roundtrip. `inout`
 /// holds size=xsize*ysize*64 floats. `quantized` holds size integers.
 fn quantize_roundtrip_y_block(
+    ctx: &EncodingContext,
     qm: &[f32],
     dqm: &[f32],
     scale: f32,
@@ -220,7 +321,7 @@ fn quantize_roundtrip_y_block(
     inout: &mut [f32],
     quantized: &mut [i32],
 ) {
-    quantize_block_ac(inout, 1, qm, quant, scale, 1.0, xsize, ysize, quantized);
+    (ctx.quantize_block_ac)(inout, 1, qm, quant, scale, 1.0, xsize, ysize, quantized);
     let inv_qac = 1.0 / (scale * quant as f32);
     let size = xsize * ysize * 64;
     for (out, (&q, &dq)) in inout[..size]
@@ -236,6 +337,7 @@ fn quantize_roundtrip_y_block(
 /// from the aggregate distribution, then emit them in `encode_frame`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_ac_group(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     group_brect: Rect,
     matrices: &DequantMatrices,
@@ -307,7 +409,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct8x8(&tmp_64[0], dst);
+                        (ctx.dct8x8)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT16X8 => {
                         for yy in 0..16 {
@@ -316,7 +418,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         let tmp_128 = tmp.as_chunks::<128>().0;
-                        dct16x8(&tmp_128[0], dst);
+                        (ctx.dct16x8)(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT8X16 => {
                         for yy in 0..8 {
@@ -326,7 +428,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
                         let tmp_128 = tmp.as_chunks::<128>().0;
-                        dct8x16(&tmp_128[0], dst);
+                        (ctx.dct8x16)(&tmp_128[0], dst);
                     }
                     STRATEGY_DCT16X16 => {
                         for yy in 0..16 {
@@ -336,7 +438,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 256] = (&mut coeffs[c][..256]).try_into().unwrap();
                         let tmp_256 = tmp.as_chunks::<256>().0;
-                        dct16x16(&tmp_256[0], dst);
+                        (ctx.dct16x16)(&tmp_256[0], dst);
                     }
                     STRATEGY_DCT32X32 => {
                         for yy in 0..32 {
@@ -346,7 +448,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 1024] = (&mut coeffs[c][..1024]).try_into().unwrap();
                         let tmp_1024 = tmp.as_chunks::<1024>().0;
-                        dct32x32(&tmp_1024[0], dst);
+                        (ctx.dct32x32)(&tmp_1024[0], dst);
                     }
                     STRATEGY_DCT4X4 => {
                         for yy in 0..8 {
@@ -355,7 +457,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct4x4(&tmp_64[0], dst);
+                        (ctx.dct4x4)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT4X8 => {
                         for yy in 0..8 {
@@ -364,7 +466,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct4x8(&tmp_64[0], dst);
+                        (ctx.dct4x8)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT8X4 => {
                         for yy in 0..8 {
@@ -373,7 +475,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
                         let tmp_64 = tmp.as_chunks::<64>().0;
-                        dct8x4(&tmp_64[0], dst);
+                        (ctx.dct8x4)(&tmp_64[0], dst);
                     }
                     STRATEGY_DCT32X16 => {
                         for yy in 0..32 {
@@ -383,7 +485,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
                         let tmp_512 = tmp.as_chunks::<512>().0;
-                        dct32x16(&tmp_512[0], dst);
+                        (ctx.dct32x16)(&tmp_512[0], dst);
                     }
                     STRATEGY_DCT16X32 => {
                         for yy in 0..16 {
@@ -393,7 +495,7 @@ pub(crate) fn write_ac_group(
                         }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
                         let tmp_512 = tmp.as_chunks::<512>().0;
-                        dct16x32(&tmp_512[0], dst);
+                        (ctx.dct16x32)(&tmp_512[0], dst);
                     }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
@@ -511,6 +613,7 @@ pub(crate) fn write_ac_group(
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
             quantize_roundtrip_y_block(
+                ctx,
                 inv_qm_y,
                 qm_y,
                 scale,
@@ -635,7 +738,7 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
                 _ => &matrices.inv_matrix_16x8(0)[..],
             };
-            quantize_block_ac(
+            (ctx.quantize_block_ac)(
                 &coeffs[0][..size],
                 0,
                 inv_qm_x,
@@ -671,7 +774,7 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
                 _ => &matrices.inv_matrix_16x8(2)[..],
             };
-            quantize_block_ac(
+            (ctx.quantize_block_ac)(
                 &coeffs[2][..size],
                 2,
                 inv_qm_b,
