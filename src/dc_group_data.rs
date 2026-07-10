@@ -124,13 +124,16 @@ impl AcStrategyImage {
             self.ysize
         );
         self.cells[y * self.xsize + x] = (strategy << 1) | FIRST_BLOCK_BIT;
-        for iy in 0..cy {
-            for ix in 0..cx {
-                if iy == 0 && ix == 0 {
-                    continue;
-                }
-                self.cells[(y + iy) * self.xsize + (x + ix)] = strategy << 1;
-            }
+        let v = strategy << 1;
+
+        let mut rows = self.cells.chunks_exact_mut(self.xsize).skip(y).take(cy);
+
+        if let Some(row) = rows.next() {
+            row[x + 1..x + cx].fill(v);
+        }
+
+        for row in rows {
+            row[x..x + cx].fill(v);
         }
     }
 

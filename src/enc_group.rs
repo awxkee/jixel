@@ -160,21 +160,18 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
 
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon") {
-            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
-                crate::neon::quantize_block_ac_neon(
-                    block_in,
-                    c,
-                    qm,
-                    quant,
-                    scale,
-                    qm_multiplier,
-                    xsize,
-                    ysize,
-                    block_out,
-                );
-            };
+        |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+            crate::neon::quantize_block_ac_neon(
+                block_in,
+                c,
+                qm,
+                quant,
+                scale,
+                qm_multiplier,
+                xsize,
+                ysize,
+                block_out,
+            );
         }
     }
 
