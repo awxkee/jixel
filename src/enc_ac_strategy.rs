@@ -433,6 +433,7 @@ fn strategy_cost(
     qac: f32,
     qm_mult_x: f32,
     matrices: &DequantMatrices,
+    meta_r: f32,
 ) -> f32 {
     let mut cxy = (1usize, 1usize);
     SC_COEFFS_SCRATCH.with(|cell| {
@@ -482,13 +483,20 @@ fn strategy_cost(
             d_total += CHANNEL_WEIGHT[c] * d;
             r_total += r;
         }
-        d_total + RD_LAMBDA * r_total
+        // `meta_r` prices the per-first-block AC-metadata rate (ACS + QF
+        // tokens, ~2-4 bits each) the per-coefficient model can't see; charged
+        // once per candidate block so merged tilings are credited for the
+        // blocks they remove. Faded in above d=1 (detail-dense content prefers
+        // the unbiased model at low distance); measured never below the RD
+        // curve on photo/fractal/abstract sets, up to -7% bytes at d>=3.
+        d_total + RD_LAMBDA * (r_total + meta_r)
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn select_super_block(
     ctx: &EncodingContext,
+    meta_r: f32,
     opsin: &Image3F,
     bx0: usize,
     by0: usize,
@@ -512,6 +520,7 @@ fn select_super_block(
                 qac,
                 qm_mult_x,
                 matrices,
+                meta_r,
             );
         }
     }
@@ -526,6 +535,7 @@ fn select_super_block(
         qac,
         qm_mult_x,
         matrices,
+        meta_r,
     );
     let v_right = strategy_cost(
         ctx,
@@ -536,6 +546,7 @@ fn select_super_block(
         qac,
         qm_mult_x,
         matrices,
+        meta_r,
     );
     // Horizontal pairs (DCT8X16): one per row.
     let h_top = strategy_cost(
@@ -547,6 +558,7 @@ fn select_super_block(
         qac,
         qm_mult_x,
         matrices,
+        meta_r,
     );
     let h_bot = strategy_cost(
         ctx,
@@ -557,6 +569,7 @@ fn select_super_block(
         qac,
         qm_mult_x,
         matrices,
+        meta_r,
     );
     // The single DCT16X16 over all four.
     let c16 = strategy_cost(
@@ -568,6 +581,7 @@ fn select_super_block(
         qac,
         qm_mult_x,
         matrices,
+        meta_r,
     );
 
     // Best column-wise DCT16X8 layout vs the two DCT8s it would replace.
@@ -689,6 +703,7 @@ fn region_qac(quant_field: &ImageB, bx: usize, by: usize, w: usize, h: usize, sc
 #[allow(clippy::too_many_arguments)]
 fn select_band(
     ctx: &EncodingContext,
+    meta_r: f32,
     opsin: &Image3F,
     dc_group_px: usize,
     dc_group_py: usize,
@@ -718,6 +733,7 @@ fn select_band(
                         let qac = region_qac(quant_field, sbx, sby, 2, 2, scale);
                         sub_total += select_super_block(
                             ctx,
+                            meta_r,
                             opsin,
                             sbx,
                             sby,
@@ -740,6 +756,7 @@ fn select_band(
                     qac32,
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
                 // Two DCT32X16 (each 2 wide × 4 tall) tiling the region: left + right.
                 let cl = strategy_cost(
@@ -751,6 +768,7 @@ fn select_band(
                     region_qac(quant_field, bx, by, 2, 4, scale),
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
                 let cr = strategy_cost(
                     ctx,
@@ -761,6 +779,7 @@ fn select_band(
                     region_qac(quant_field, bx + 2, by, 2, 4, scale),
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
                 // Two DCT16X32 (each 4 wide × 2 tall) tiling the region: top + bottom.
                 let ct = strategy_cost(
@@ -772,6 +791,7 @@ fn select_band(
                     region_qac(quant_field, bx, by, 4, 2, scale),
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
                 let cb = strategy_cost(
                     ctx,
@@ -782,6 +802,7 @@ fn select_band(
                     region_qac(quant_field, bx, by + 2, 4, 2, scale),
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
                 let cost_32x32 = BIAS_32X32 * cost32;
                 let cost_32x16 = BIAS_RECT32 * (cl + cr);
@@ -815,6 +836,7 @@ fn select_band(
                     let qac = region_qac(quant_field, bx, sby, 2, 2, scale);
                     select_super_block(
                         ctx,
+                        meta_r,
                         opsin,
                         bx,
                         sby,
@@ -831,6 +853,7 @@ fn select_band(
                 let qac = region_qac(quant_field, bx, by, 2, 2, scale);
                 select_super_block(
                     ctx,
+                    meta_r,
                     opsin,
                     bx,
                     by,
@@ -857,7 +880,17 @@ fn select_band(
             let qac = region_qac(quant_field, bx, by, 1, 1, scale);
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
-            let cost8 = strategy_cost(ctx, STRATEGY_DCT, opsin, px, py, qac, qm_mult_x, matrices);
+            let cost8 = strategy_cost(
+                ctx,
+                STRATEGY_DCT,
+                opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                matrices,
+                meta_r,
+            );
             let cost4 = BIAS_4X4
                 * strategy_cost(
                     ctx,
@@ -868,6 +901,7 @@ fn select_band(
                     qac,
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
             let cost48 = BIAS_4X8
                 * strategy_cost(
@@ -879,6 +913,7 @@ fn select_band(
                     qac,
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
             let cost84 = BIAS_4X8
                 * strategy_cost(
@@ -890,6 +925,7 @@ fn select_band(
                     qac,
                     qm_mult_x,
                     matrices,
+                    meta_r,
                 );
             // Choose the cheapest sub-8×8 candidate, and take it only if it beats
             // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
@@ -949,6 +985,9 @@ pub(crate) fn fill_ac_strategy(
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
+    // Per-candidate-block metadata rate for the strategy chooser (bits),
+    // faded in above d=1 (see strategy_cost).
+    let meta_r = 2.0f32 * (distance - 1.0).clamp(0.0, 1.0);
 
     let bands = if num_threads > 1 && ysize >= 8 {
         selection_bands(ysize, num_threads)
@@ -959,6 +998,7 @@ pub(crate) fn fill_ac_strategy(
     let benefit = if bands.len() <= 1 {
         select_band(
             ctx,
+            meta_r,
             opsin,
             dc_group_px,
             dc_group_py,
@@ -982,6 +1022,7 @@ pub(crate) fn fill_ac_strategy(
             let mut local = AcStrategyImage::new(xsize, ysize);
             let b = select_band(
                 ctx,
+                meta_r,
                 opsin,
                 dc_group_px,
                 dc_group_py,

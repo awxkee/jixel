@@ -65,7 +65,7 @@ static WP_DIV: [u32; 64] = [
     289262, 284359, 279620, 275036, 270600, 266305, 262144,
 ];
 
-struct WpState {
+pub(crate) struct WpState {
     xsize: usize,
     pred_errors: [Vec<u32>; 4],
     error: Vec<i64>,
@@ -73,11 +73,11 @@ struct WpState {
     pred: i64,
     /// libjxl property kWPProp (p[15]): the signed neighbour WP-error with the
     /// largest absolute value among {W, N, NW, NE}. Set on each `predict`.
-    wp_prop: i64,
+    pub(crate) wp_prop: i64,
 }
 
 impl WpState {
-    fn new(xsize: usize) -> Self {
+    pub(crate) fn new(xsize: usize) -> Self {
         let n = (xsize + 2) * 2;
         WpState {
             xsize,
@@ -124,7 +124,16 @@ impl WpState {
     /// Predict pixel (x,y). Neighbors are in *normal* (un-shifted) value space;
     /// AddBits is applied internally, matching libjxl's `State::Predict`.
     #[inline]
-    fn predict(&mut self, x: usize, y: usize, n: i64, w: i64, ne: i64, nw: i64, nn: i64) -> i64 {
+    pub(crate) fn predict(
+        &mut self,
+        x: usize,
+        y: usize,
+        n: i64,
+        w: i64,
+        ne: i64,
+        nw: i64,
+        nn: i64,
+    ) -> i64 {
         let xsize = self.xsize;
         let cur_row = if y & 1 == 1 { 0 } else { xsize + 2 };
         let prev_row = if y & 1 == 1 { xsize + 2 } else { 0 };
@@ -190,7 +199,7 @@ impl WpState {
     }
     /// Update error state with the true value `val` (normal space).
     #[inline]
-    fn update(&mut self, val: i64, x: usize, y: usize) {
+    pub(crate) fn update(&mut self, val: i64, x: usize, y: usize) {
         let xsize = self.xsize;
         let cur_row = if y & 1 == 1 { 0 } else { xsize + 2 };
         let prev_row = if y & 1 == 1 { xsize + 2 } else { 0 };

@@ -46,7 +46,15 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
             }
         }
     }
-    if used_symbols <= 2 {
+    // A single-symbol histogram is a depth-0 simple prefix code: 0 bits per
+    // token. Costing it at 1 bit/token (as brotli does) makes the clusterer
+    // merge constant-token contexts (e.g. the EPF sharpness field) into large
+    // histograms, silently paying >=1 bit per token for a stream that should
+    // be free.
+    if used_symbols <= 1 {
+        return 0.0;
+    }
+    if used_symbols == 2 {
         return total_count as f32;
     }
 
