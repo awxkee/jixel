@@ -200,7 +200,6 @@ fn hsum8_vectors(
     s6: __m256,
     s7: __m256,
 ) -> __m256 {
-    // Return [sum(s0), sum(s1), ..., sum(s7)].
     let p01 = _mm256_hadd_ps(s0, s1);
     let p23 = _mm256_hadd_ps(s2, s3);
     let p45 = _mm256_hadd_ps(s4, s5);
@@ -209,16 +208,9 @@ fn hsum8_vectors(
     let q0123 = _mm256_hadd_ps(p01, p23);
     let q4567 = _mm256_hadd_ps(p45, p67);
 
-    let lo = _mm_add_ps(
-        _mm256_castps256_ps128(q0123),
-        _mm256_extractf128_ps::<1>(q0123),
-    );
-    let hi = _mm_add_ps(
-        _mm256_castps256_ps128(q4567),
-        _mm256_extractf128_ps::<1>(q4567),
-    );
-
-    _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(lo), hi)
+    let low_halves = _mm256_permute2f128_ps::<0x20>(q0123, q4567);
+    let high_halves = _mm256_permute2f128_ps::<0x31>(q0123, q4567);
+    _mm256_add_ps(low_halves, high_halves)
 }
 
 #[inline]
@@ -294,6 +286,7 @@ fn hf_modulation_blocks8_direct_x8(
     y: usize,
     xyb_y: &crate::image::Image3F,
     out_val: __m256,
+    strength: f32,
 ) -> __m256 {
     let valmin_y = _mm256_set1_ps(0.0206);
     let right_mask = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0);
@@ -353,7 +346,7 @@ fn hf_modulation_blocks8_direct_x8(
     let sums = hsum8_vectors(s0, s1, s2, s3, s4, s5, s6, s7);
     mlaf(
         sums,
-        _mm256_set1_ps(-0.38),
+        _mm256_set1_ps(-0.38 * strength),
         _mm256_add_ps(out_val, _mm256_set1_ps(0.42)),
     )
 }
@@ -484,6 +477,7 @@ fn write_quant_scalar_block(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     if px >= img_xsize || py >= img_ysize {
         *qf_out = 1;
@@ -494,7 +488,7 @@ fn write_quant_scalar_block(
     let by_px = py.min(img_ysize.saturating_sub(8));
     let mask_val = crate::adaptive_quant::compute_mask(aq);
     let mask_val = crate::adaptive_quant::gamma_modulation(bx_px, by_px, opsin, mask_val);
-    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val);
+    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val, hf_strength);
     let out_val = out_val.min(crate::adaptive_quant::blue_modulation(
         bx_px, by_px, opsin, mask_val,
     ));
@@ -516,6 +510,7 @@ fn write_quant_row_avx2(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     let xsize_blocks = aq_row.len().min(qf_row.len());
 
@@ -550,7 +545,7 @@ fn write_quant_row_avx2(
         let aq = load8s(aq_row, bx);
         let mask_val = compute_mask_x8(aq);
         let mask_val = gamma_modulation_blocks8_x8(px, py, opsin, mask_val);
-        let hf = hf_modulation_blocks8_direct_x8(px, py, opsin, mask_val);
+        let hf = hf_modulation_blocks8_direct_x8(px, py, opsin, mask_val, hf_strength);
         let blue = blue_modulation_blocks8_x8(px, py, opsin, mask_val);
         let out_val = _mm256_min_ps(hf, blue);
         let qf = mlaf(fast_exp2_x8(_mm256_mul_ps(out_val, exp_mul)), mul_v, add_v);
@@ -578,6 +573,7 @@ fn write_quant_row_avx2(
             mul,
             add,
             inv_scale,
+            hf_strength,
         );
     }
 
@@ -1026,13 +1022,24 @@ pub(crate) fn fill_quant_field(
         }
         let mul = scale * dampen;
         let add = (1.0 - dampen) * base_level;
+        let hf_strength = crate::adaptive_quant::hf_modulation_strength(distance);
 
         for by in 0..ysize_blocks {
             let py = y0 + by * 8;
             let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
             let qf_row = raw_quant_field.row_mut(by);
             write_quant_row_avx2(
-                opsin, aq_row, qf_row, x0, py, img_xsize, img_ysize, mul, add, inv_scale,
+                opsin,
+                aq_row,
+                qf_row,
+                x0,
+                py,
+                img_xsize,
+                img_ysize,
+                mul,
+                add,
+                inv_scale,
+                hf_strength,
             );
         }
     });

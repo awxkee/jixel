@@ -527,10 +527,15 @@ impl EncodeConfig {
 
 pub fn distance_from_quality(quality: f32) -> f32 {
     assert!(!quality.is_nan(), "quality must not be NaN");
-    // Clamp at 100 from above (lossless isn't supported anyway; you'll
-    // hit the MIN_DISTANCE floor below 0.03).
-    let q = quality.min(100.0);
-    let d = if q >= 30.0 {
+    let q = quality.clamp(0.0, 100.0);
+    let d = if q >= 99.0 {
+        // Reserve the final quality point for the practical VarDCT ceiling:
+        // q99 = 0.10, q100 = 0.05.
+        0.05 * 2.0f32.powf(100.0 - q)
+    } else if q >= 90.0 {
+        // Logarithmic upper range: q90 = 1.0, q99 = 0.1.
+        10.0f32.powf((99.0 - q) / 9.0 - 1.0)
+    } else if q >= 30.0 {
         0.1 + (100.0 - q) * 0.09
     } else {
         6.24 + 2.5f32.powf((30.0 - q) / 5.0) / 6.25
@@ -2038,8 +2043,8 @@ mod tests {
 
     #[test]
     fn quality_mapping_anchor_points() {
-        // Matches the published libjxl mapping breakpoints.
-        assert!(close(distance_from_quality(100.0), 0.1));
+        assert!(close(distance_from_quality(100.0), 0.05));
+        assert!(close(distance_from_quality(99.0), 0.1));
         assert!(close(distance_from_quality(90.0), 1.0));
         assert!(close(distance_from_quality(30.0), 6.4));
         // Below 30, the formula is quadratic-ish; q=25 must come in just above 6.4.
@@ -2048,8 +2053,8 @@ mod tests {
         // Far below 30, it climbs and clamps at 25.
         assert!(close(distance_from_quality(0.0), 25.0));
         assert!(close(distance_from_quality(-50.0), 25.0));
-        // Above 100, clamped: 110 -> 100 -> 0.1.
-        assert!(close(distance_from_quality(110.0), 0.1));
+        // Above 100, clamped to the practical VarDCT endpoint.
+        assert!(close(distance_from_quality(110.0), 0.05));
     }
 
     #[test]

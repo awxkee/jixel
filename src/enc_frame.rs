@@ -29,7 +29,7 @@
 
 use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
-use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4};
+use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, is_sub8_strategy};
 use crate::enc_group::write_ac_group;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
@@ -121,15 +121,18 @@ fn quant_dc(distance: f32) -> f32 {
 
 fn compute_distance_params(distance: f32) -> DistanceParams {
     const K_GLOBAL_SCALE_DENOM: i32 = 1 << 16;
-    const K_GLOBAL_SCALE_NUMERATOR: i32 = 4096;
     const K_AC_QUANT: f32 = 0.8;
-    const K_QUANT_FIELD_TARGET: f32 = 5.0;
+    // Keep the integer quant field away from the very coarse 2/3/4 range. The
+    // corresponding reduction in global scale preserves the effective AC
+    // quantizer while giving AQ enough integer resolution to vary smoothly.
+    const K_QUANT_FIELD_TARGET: f32 = 10.0;
 
     let qdc = quant_dc(distance);
-    let mut scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * K_QUANT_FIELD_TARGET);
-    scale = f32::clamp(scale, 1.0, (1 << 15) as f32);
-    let scaled_quant_dc = (qdc * K_GLOBAL_SCALE_NUMERATOR as f32 * 1.6) as i32;
-    let global_scale = i32::clamp(scale as i32, 1, scaled_quant_dc);
+    let scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * K_QUANT_FIELD_TARGET);
+    // AC and DC are signalled independently. Capping the AC scale by qdc made
+    // it freeze once quant_dc() reached its high-distance cap, producing a
+    // rate/quality plateau followed by a cliff when the cap finally released.
+    let global_scale = i32::clamp(scale.round() as i32, 1, 1 << 15);
     let scale_f = global_scale as f32 / K_GLOBAL_SCALE_DENOM as f32;
     let qd = ((qdc / scale_f) + 0.5) as i32;
     let qd = i32::clamp(qd, 1, 1 << 16);
@@ -145,7 +148,6 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     if distance < 0.299 {
         x_qm_scale += 1;
     }
-
     let mut epf_iters: u32 = 0;
     for t in [0.7f32, 1.5, 4.0] {
         if distance >= t {
@@ -345,8 +347,8 @@ fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
 }
 
 /// Real prefix-code bit cost of a DC group's AC-metadata token stream under a
-/// freshly optimized entropy code. Used by the DCT4X4 activation gate to weigh
-/// the meta-stream cost of the selected DCT4X4 blocks against their RD benefit.
+/// freshly optimized entropy code. Used by the sub-8x8 activation gate to weigh
+/// the exact selected set's meta-stream cost against its RD benefit.
 fn meta_entropy_cost(dc_data: &DcGroupData) -> u64 {
     let toks = collect_ac_metadata_tokens(dc_data);
     let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS);
@@ -985,46 +987,8 @@ fn setup_dc_group(
         distp.distance,
         1.0 / distp.scale,
     );
-    // Fade the AQ spatial modulation out at higher distances, toward a flat
-    // field at the group mean (libjxl's falcon mode uses a flat field). Full
-    // modulation below d=1, flat from d=2.5. Measured on photo/fractal/glow/
-    // abstract sets: never below the AQ RD curve, up to +2.4 SSIMULACRA2
-    // rate-equivalent at d>=2; low-distance detail protection is preserved.
-    let aq_w = ((2.5 - distp.distance) / 1.5).clamp(0.0, 1.0);
-    if aq_w < 1.0 {
-        let (xs, ys) = (
-            dc_data.raw_quant_field.xsize(),
-            dc_data.raw_quant_field.ysize(),
-        );
-        let mut sum = 0u64;
-        for y in 0..ys {
-            for &v in &dc_data.raw_quant_field.row(y)[..xs] {
-                sum += v as u64;
-            }
-        }
-        let mean = sum as f32 / (xs * ys) as f32;
-        for y in 0..ys {
-            for v in &mut dc_data.raw_quant_field.row_mut(y)[..xs] {
-                let m = mean + aq_w * (*v as f32 - mean);
-                *v = (m + 0.5).clamp(1.0, 255.0) as u8;
-            }
-        }
-    }
-    dc_data.dct4x4_benefit = crate::enc_ac_strategy::fill_ac_strategy(
-        ctx,
-        opsin,
-        dc_group_x0,
-        dc_group_y0,
-        distp.distance,
-        distp.scale,
-        distp.x_qm_scale,
-        matrices,
-        &mut dc_data.raw_quant_field,
-        &mut dc_data.ac_strategy,
-        num_threads,
-    );
-    // Per-tile CfL: find optimal Y→X and Y→B slopes per 64×64 tile, written
-    // into ytox_map/ytob_map and applied during DCT in write_ac_group.
+    // Compute the per-tile CfL slopes before strategy selection so candidate
+    // costs use the same Y-to-X/Y-to-B subtraction as final coefficient coding.
     crate::enc_color_correlation::fill_cmap(
         ctx,
         opsin,
@@ -1036,38 +1000,52 @@ fn setup_dc_group(
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
     );
+    dc_data.sub8_benefit = crate::enc_ac_strategy::fill_ac_strategy(
+        ctx,
+        opsin,
+        dc_group_x0,
+        dc_group_y0,
+        distp.distance,
+        distp.scale,
+        distp.x_qm_scale,
+        matrices,
+        &mut dc_data.raw_quant_field,
+        &dc_data.ytox_map,
+        &dc_data.ytob_map,
+        &mut dc_data.ac_strategy,
+        num_threads,
+    );
 
-    // DCT4X4 activation gate. `fill_ac_strategy` greedily commits every block
-    // where DCT4X4 wins the per-block RD comparison, but a sparse set of DCT4X4
-    // blocks can disrupt the prefix-code clustering of the (otherwise nearly
-    // free) AC-strategy meta stream — most visibly the constant EPF context,
-    // which loses its zero-length codeword. Measure the *real* meta-token cost
-    // with the selected DCT4X4 blocks vs with them reverted to DCT8, and keep
-    // DCT4X4 only when the accumulated RD benefit covers the meta-cost increase
-    // (1 bit of rate contributes RD_LAMBDA to the cost). Done before
-    // `write_ac_group`, so the reverted strategy drives coefficient computation.
+    // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
+    // where DCT4X4, DCT4X8, or DCT8X4 wins the per-block RD comparison, but a
+    // sparse set can disrupt prefix-code clustering of the (otherwise nearly
+    // free) AC-strategy meta stream. Measure the *real* meta-token cost with the
+    // exact selected set vs with all of it reverted to DCT8, and retain the set
+    // only when its accumulated RD benefit covers the metadata increase. Done
+    // before `write_ac_group`, so a rejected set cannot affect coefficients.
     {
-        let mut positions: Vec<(usize, usize)> = Vec::new();
+        let mut positions: Vec<(usize, usize, u8)> = Vec::new();
         for y in 0..dc_data.ac_strategy.ysize() {
             for x in 0..dc_data.ac_strategy.xsize() {
-                if dc_data.ac_strategy.is_first_block(x, y)
-                    && dc_data.ac_strategy.raw_strategy(x, y) == STRATEGY_DCT4X4
-                {
-                    positions.push((x, y));
+                if dc_data.ac_strategy.is_first_block(x, y) {
+                    let strategy = dc_data.ac_strategy.raw_strategy(x, y);
+                    if is_sub8_strategy(strategy) {
+                        positions.push((x, y, strategy));
+                    }
                 }
             }
         }
         if !positions.is_empty() {
             let cost_with = meta_entropy_cost(&dc_data);
-            for &(x, y) in &positions {
+            for &(x, y, _) in &positions {
                 dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT);
             }
             let cost_without = meta_entropy_cost(&dc_data);
             let meta_delta = cost_with.saturating_sub(cost_without) as f32;
-            if dc_data.dct4x4_benefit > crate::enc_ac_strategy::RD_LAMBDA * meta_delta {
-                // Worth it: restore the DCT4X4 selection.
-                for &(x, y) in &positions {
-                    dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT4X4);
+            if dc_data.sub8_benefit > crate::enc_ac_strategy::RD_LAMBDA * meta_delta {
+                // Worth it: restore each exact sub-8x8 selection.
+                for &(x, y, strategy) in &positions {
+                    dc_data.ac_strategy.set_first(x, y, strategy);
                 }
             }
             // else: leave reverted to DCT8.
@@ -1160,6 +1138,7 @@ fn process_ac_group(
             matrices,
             distp.scale,
             distp.scale_dc,
+            distp.distance,
             distp.x_qm_scale,
             dc_data,
             &mut local_quant_dc,
@@ -1209,4 +1188,27 @@ fn build_stripe(
         }
     }
     stripe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_distance_params, quant_dc};
+
+    #[test]
+    fn ac_scale_keeps_changing_after_dc_distance_caps() {
+        let d4 = compute_distance_params(4.0);
+        let d45 = compute_distance_params(4.5);
+        let d5 = compute_distance_params(5.0);
+        assert!(d4.global_scale > d45.global_scale);
+        assert!(d45.global_scale > d5.global_scale);
+    }
+
+    #[test]
+    fn dc_quantization_stays_independent_of_ac_scale() {
+        for distance in [0.5, 1.0, 3.5, 4.0, 4.5, 6.0] {
+            let params = compute_distance_params(distance);
+            let rounding_error = 0.5 * params.scale;
+            assert!((params.scale_dc - quant_dc(distance)).abs() <= rounding_error + f32::EPSILON);
+        }
+    }
 }

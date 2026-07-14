@@ -1,0 +1,13 @@
+[package]
+name = "tuner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "jixel-tuner"
+path = "src/main.rs"
+
+[dependencies]
+jixel = { path = "../", default-features = true, features = ["neon", "avx", "sse"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

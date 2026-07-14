@@ -40,6 +40,14 @@ pub(crate) const STRATEGY_DCT32X16: u8 = 8;
 pub(crate) const STRATEGY_DCT16X32: u8 = 9;
 pub(crate) const NUM_STRATEGIES: usize = 10;
 
+#[inline]
+pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
+    matches!(
+        strategy,
+        STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4
+    )
+}
+
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
 /// DCT8=0, DCT16X16=4, DCT32X32=5, DCT16X8=6, DCT8X16=7, DCT4X4=3, DCT4X8=12, DCT8X4=13,
 /// DCT32X16=10, DCT16X32=11.
@@ -198,9 +206,10 @@ pub(crate) struct DcGroupData {
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
     pub(crate) ytob_map: ImageSB,
-    /// Accumulated DCT4X4 RD benefit from `fill_ac_strategy`, used by the
-    /// frame-level activation gate. 0 until selection runs.
-    pub(crate) dct4x4_benefit: f32,
+    /// Accumulated RD benefit of all sub-8x8 strategies from
+    /// `fill_ac_strategy`, used by the frame-level activation gate. 0 until
+    /// selection runs.
+    pub(crate) sub8_benefit: f32,
 }
 
 const TILE_DIM_IN_BLOCKS: usize = 8;
@@ -215,7 +224,7 @@ impl DcGroupData {
             ac_strategy: AcStrategyImage::new(xsize_blocks, ysize_blocks),
             ytox_map: ImageSB::new_fill(xtiles, ytiles, 0),
             ytob_map: ImageSB::new_fill(xtiles, ytiles, 0),
-            dct4x4_benefit: 0.0,
+            sub8_benefit: 0.0,
         }
     }
 }
@@ -223,6 +232,19 @@ impl DcGroupData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sub8_strategy_set_is_complete() {
+        for strategy in 0..NUM_STRATEGIES as u8 {
+            assert_eq!(
+                is_sub8_strategy(strategy),
+                matches!(
+                    strategy,
+                    STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4
+                )
+            );
+        }
+    }
 
     #[test]
     fn default_is_dct8_first_blocks() {

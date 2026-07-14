@@ -117,6 +117,7 @@ pub(crate) type QuantizeBlockAcFn = fn(
     quant: i32,
     scale: f32,
     qm_multiplier: f32,
+    distance: f32,
     xsize: usize,
     ysize: usize,
     block_out: &mut [i32],
@@ -125,26 +126,37 @@ pub(crate) type QuantizeBlockAcFn = fn(
 static QUANTIZE_BLOCK_AC_METHOD: OnceLock<QuantizeBlockAcFn> = OnceLock::new();
 
 #[inline]
-pub(crate) fn quantize_ac_thresholds(c: usize, xsize: usize, ysize: usize) -> [f32; 4] {
-    let mut thr = [0.58f32, 0.635, 0.66, 0.7];
+pub(crate) fn quantize_ac_thresholds(
+    c: usize,
+    xsize: usize,
+    ysize: usize,
+    distance: f32,
+) -> [f32; 4] {
+    let mut normal = [0.58f32, 0.635, 0.66, 0.7];
     if c == 0 {
-        for t in &mut thr[1..] {
+        for t in &mut normal[1..] {
             *t += 0.08;
         }
     }
     if c == 2 {
-        for t in &mut thr[1..] {
+        for t in &mut normal[1..] {
             *t = 0.75;
         }
     }
     if xsize > 1 || ysize > 1 {
         let delta =
             (0.003_f32 * xsize as f32 * ysize as f32).clamp(0.0, if c > 0 { 0.08 } else { 0.12 });
-        for t in &mut thr {
+        for t in &mut normal {
             *t -= delta;
         }
     }
-    thr
+    let high_quality = match c {
+        1 => [0.50, 0.51, 0.52, 0.54],
+        0 | 2 => normal,
+        _ => unreachable!("invalid channel {c}"),
+    };
+    let t = ((distance - 0.1) / 0.9).clamp(0.0, 1.0);
+    std::array::from_fn(|i| high_quality[i] + t * (normal[i] - high_quality[i]))
 }
 
 #[inline]
@@ -160,7 +172,7 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
 
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+        |block_in, c, qm, quant, scale, qm_multiplier, distance, xsize, ysize, block_out| unsafe {
             crate::neon::quantize_block_ac_neon(
                 block_in,
                 c,
@@ -168,6 +180,7 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
                 quant,
                 scale,
                 qm_multiplier,
+                distance,
                 xsize,
                 ysize,
                 block_out,
@@ -178,7 +191,16 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") {
-            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+            return |block_in,
+                    c,
+                    qm,
+                    quant,
+                    scale,
+                    qm_multiplier,
+                    distance,
+                    xsize,
+                    ysize,
+                    block_out| unsafe {
                 crate::avx::quantize_block_ac_avx2(
                     block_in,
                     c,
@@ -186,6 +208,7 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
                     quant,
                     scale,
                     qm_multiplier,
+                    distance,
                     xsize,
                     ysize,
                     block_out,
@@ -197,7 +220,16 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
     #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
     {
         if is_x86_feature_detected!("sse4.1") {
-            return |block_in, c, qm, quant, scale, qm_multiplier, xsize, ysize, block_out| unsafe {
+            return |block_in,
+                    c,
+                    qm,
+                    quant,
+                    scale,
+                    qm_multiplier,
+                    distance,
+                    xsize,
+                    ysize,
+                    block_out| unsafe {
                 crate::sse::quantize_block_ac_sse41(
                     block_in,
                     c,
@@ -205,6 +237,7 @@ fn select_quantize_block_ac_fn() -> QuantizeBlockAcFn {
                     quant,
                     scale,
                     qm_multiplier,
+                    distance,
                     xsize,
                     ysize,
                     block_out,
@@ -235,11 +268,12 @@ pub(crate) fn quantize_block_ac_scalar(
     quant: i32,
     scale: f32,
     qm_multiplier: f32,
+    distance: f32,
     xsize: usize,
     ysize: usize,
     block_out: &mut [i32],
 ) {
-    let thr = quantize_ac_thresholds(c, xsize, ysize);
+    let thr = quantize_ac_thresholds(c, xsize, ysize, distance);
     let q_scaled = quantize_ac_q_scaled(quant, scale, qm_multiplier);
     let width = xsize * 8;
     let height = ysize * 8;
@@ -319,12 +353,15 @@ fn quantize_roundtrip_y_block(
     dqm: &[f32],
     scale: f32,
     quant: i32,
+    distance: f32,
     xsize: usize,
     ysize: usize,
     inout: &mut [f32],
     quantized: &mut [i32],
 ) {
-    (ctx.quantize_block_ac)(inout, 1, qm, quant, scale, 1.0, xsize, ysize, quantized);
+    (ctx.quantize_block_ac)(
+        inout, 1, qm, quant, scale, 1.0, distance, xsize, ysize, quantized,
+    );
     let inv_qac = 1.0 / (scale * quant as f32);
     let size = xsize * ysize * 64;
     for (out, (&q, &dq)) in inout[..size]
@@ -346,6 +383,7 @@ pub(crate) fn write_ac_group(
     matrices: &DequantMatrices,
     scale: f32,
     scale_dc: f32,
+    distance: f32,
     x_qm_scale: u32,
     dc_data: &DcGroupData,
     quant_dc: &mut Image3S,
@@ -621,6 +659,7 @@ pub(crate) fn write_ac_group(
                 qm_y,
                 scale,
                 quant_ac,
+                distance,
                 cx,
                 cy,
                 &mut coeffs[1][..size],
@@ -748,6 +787,7 @@ pub(crate) fn write_ac_group(
                 quant_ac,
                 scale,
                 x_qm_mul,
+                distance,
                 cx,
                 cy,
                 &mut quantized[0][..size],
@@ -784,6 +824,7 @@ pub(crate) fn write_ac_group(
                 quant_ac,
                 scale,
                 1.0,
+                distance,
                 cx,
                 cy,
                 &mut quantized[2][..size],
@@ -913,4 +954,29 @@ pub(crate) fn write_ac_group(
 #[inline]
 fn write_token_into(t: Token, out: &mut Vec<Token>) {
     out.push(t);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quantize_ac_thresholds;
+
+    #[test]
+    fn deadzones_fade_to_existing_values_by_distance_one() {
+        assert_eq!(
+            quantize_ac_thresholds(1, 1, 1, 0.1),
+            [0.50, 0.51, 0.52, 0.54]
+        );
+        assert_eq!(
+            quantize_ac_thresholds(2, 1, 1, 0.1),
+            [0.58, 0.75, 0.75, 0.75]
+        );
+        assert_eq!(
+            quantize_ac_thresholds(1, 1, 1, 1.0),
+            [0.58, 0.635, 0.66, 0.7]
+        );
+        assert_eq!(
+            quantize_ac_thresholds(2, 1, 1, 1.0),
+            [0.58, 0.75, 0.75, 0.75]
+        );
+    }
 }

@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "jixel"
-version = "0.2.6"
+version = "0.2.7"
 
 [[package]]
 name = "jobserver"
@@ -563,6 +563,17 @@ checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
  "rayon",
+]
+
+[[package]]
+name = "meanstats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image 0.25.10",
+ "jixel",
+ "plotters",
+ "ssimulacra2",
 ]
 
 [[package]]
@@ -1058,6 +1069,14 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "tuner"
+version = "0.1.0"
+dependencies = [
+ "image 0.25.10",
+ "jixel",
+]
 
 [[package]]
 name = "unicode-ident"

@@ -126,8 +126,8 @@ impl BitWriter {
     pub(crate) fn append(&mut self, other: &BitWriter) {
         let full_bytes = other.bits_written / 8;
         let trailing_bits = other.bits_written % 8;
-        for i in 0..full_bytes {
-            self.write(8, other.storage[i] as u64);
+        for &data in other.storage[..full_bytes].iter() {
+            self.write(8, data as u64);
         }
         if trailing_bits > 0 {
             let last = other.storage[full_bytes] as u64;
