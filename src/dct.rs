@@ -56,8 +56,10 @@ pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
 }
 
 pub(crate) const WC4: [f32; 2] = [0.541_196_1, 1.306_563];
+pub(crate) const INV_WC4: [f32; 2] = [1.0 / WC4[0], 1.0 / WC4[1]];
 
 pub(crate) const WC8: [f32; 4] = [0.509_795_6, 0.601_344_9, 0.899_976_2, 2.562_915_6];
+pub(crate) const INV_WC8: [f32; 4] = [1.0 / WC8[0], 1.0 / WC8[1], 1.0 / WC8[2], 1.0 / WC8[3]];
 
 #[allow(unused)]
 #[inline(always)]
@@ -196,6 +198,16 @@ pub(crate) const WC16: [f32; 8] = [
     1.722_447_1, // 1/(2·cos(13π/32))
     5.101_148_6, // 1/(2·cos(15π/32))
 ];
+pub(crate) const INV_WC16: [f32; 8] = [
+    1.0 / WC16[0],
+    1.0 / WC16[1],
+    1.0 / WC16[2],
+    1.0 / WC16[3],
+    1.0 / WC16[4],
+    1.0 / WC16[5],
+    1.0 / WC16[6],
+    1.0 / WC16[7],
+];
 
 #[inline(always)]
 #[allow(unused)]
@@ -208,7 +220,7 @@ pub(crate) fn dct1d_16(buf: &mut [f32; 16]) {
     }
 
     // Recurse on the even half
-    dct1d_8(&mut tmp[0..8]);
+    dct1d_8(&mut tmp[..8]);
 
     // Scale the odd half by WC16, then recurse
     for i in 0..8 {
@@ -530,9 +542,6 @@ fn dct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
 
 #[cfg(test)]
 fn idct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
-    // Forward did: tmp = rowDCT(input); output[x*4+i] = colDCT(tmp col x)[i]/16.
-    // Since idct1d_4 ∘ dct1d_4 = 4·I, the forward's 1/16 cancels the two inverse
-    // transforms' 4·4, so no extra scaling is needed here.
     let mut tmp = [0.0f32; 16];
     for x in 0..4 {
         let col_in = [
@@ -598,10 +607,6 @@ pub(crate) fn dct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
     selected_dct4x4()(input, output);
 }
 
-/// Forward DCT4X4 (libjxl `Type::DCT4X4`): four 4×4 DCTs on the quadrants,
-/// interleaved into the 8×8 grid as `coeff[(qy + iy*2)*8 + (qx + ix*2)]`, then a
-/// 2×2 Hadamard over the four sub-block DCs at positions [0], [1], [8], [9].
-/// Covered blocks = 1 (a single 8×8 footprint). Pairs with `K_COEFF_ORDER_8X8`.
 pub(crate) fn dct4x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     for qy in 0..2 {
         for qx in 0..2 {
@@ -631,11 +636,6 @@ pub(crate) fn dct4x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     output[9] = (b00 - b01 - b10 + b11) * 0.25;
 }
 
-/// `ComputeScaledDCT<4, 8>`: 4-row × 8-col separable scaled forward DCT.
-/// `input` is a 4×8 pixel block (`input[r*8 + c]`, r = 0..4, c = 0..8);
-/// `output[vf*8 + hf]` holds the coefficient at vertical freq `vf` (0..4),
-/// horizontal freq `hf` (0..8). Scaled by 1/(4·8) like the other forward DCTs
-/// (cf. `dct8x8` 1/64, `dct16x8` 1/128).
 fn dct4x8_2d(input: &[f32; 32], output: &mut [f32; 32]) {
     let mut tmp = [0.0f32; 32];
     // Vertical 4-point DCT per column.
@@ -680,11 +680,6 @@ pub(crate) fn dct4x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     output[8] = (block0 - block1) * 0.5;
 }
 
-/// `ComputeScaledDCT<8, 4>`: 8-row × 4-col separable scaled forward DCT, stored
-/// **transposed** as `output[hf*8 + vf]` (hf = horizontal freq 0..4, vf =
-/// vertical freq 0..8). The transpose is what lets DCT8X4 reuse DCT4X8's
-/// (row-replicated 4×8) quant table: the swap sends vfreq↔hfreq and
-/// `rcprow`↔`rcpcol` together. Scaled by 1/(8·4) = 1/32.
 fn dct8x4_2d(input: &[f32; 32], output: &mut [f32; 32]) {
     let mut tmp = [0.0f32; 32]; // tmp[vf*4 + c]
     // Vertical 8-point DCT per column (4 columns).
@@ -849,6 +844,24 @@ pub(crate) const WC32: [f32; 16] = [
     3.407_608_4,
     10.190_008,
 ];
+pub(crate) const INV_WC32: [f32; 16] = [
+    1.0 / WC32[0],
+    1.0 / WC32[1],
+    1.0 / WC32[2],
+    1.0 / WC32[3],
+    1.0 / WC32[4],
+    1.0 / WC32[5],
+    1.0 / WC32[6],
+    1.0 / WC32[7],
+    1.0 / WC32[8],
+    1.0 / WC32[9],
+    1.0 / WC32[10],
+    1.0 / WC32[11],
+    1.0 / WC32[12],
+    1.0 / WC32[13],
+    1.0 / WC32[14],
+    1.0 / WC32[15],
+];
 
 #[inline]
 pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
@@ -869,6 +882,219 @@ pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
     for i in 0..16 {
         buf[2 * i] = tmp[i];
         buf[2 * i + 1] = tmp[16 + i];
+    }
+}
+
+#[inline(always)]
+fn inv_dct1d_2(buf: &mut [f32]) {
+    let (s, d) = (buf[0], buf[1]);
+    buf[0] = (s + d) * 0.5;
+    buf[1] = (s - d) * 0.5;
+}
+
+#[inline(always)]
+fn inv_dct1d_4(buf: &mut [f32; 4]) {
+    const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut t = [buf[0], buf[2], buf[1], buf[3]]; // undo the even/odd interleave
+    t[2] = (t[2] - t[3]) * IS2; // undo tmp[2] = tmp[2]*SQRT2 + tmp[3]
+    inv_dct1d_2(&mut t[2..4]);
+    t[2] *= INV_WC4[0];
+    t[3] *= INV_WC4[1];
+    inv_dct1d_2(&mut t[..2]);
+    buf[0] = (t[0] + t[2]) * 0.5;
+    buf[3] = (t[0] - t[2]) * 0.5;
+    buf[1] = (t[1] + t[3]) * 0.5;
+    buf[2] = (t[1] - t[3]) * 0.5;
+}
+
+#[inline(always)]
+fn inv_dct1d_8(buf: &mut [f32]) {
+    const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut t = [0.0f32; 8];
+    for i in 0..4 {
+        t[i] = buf[2 * i];
+        t[4 + i] = buf[2 * i + 1];
+    }
+    t[6] -= t[7];
+    t[5] -= t[6];
+    t[4] = (t[4] - t[5]) * IS2;
+    inv_dct1d_4(<&mut [f32; 4]>::try_from(&mut t[4..8]).unwrap());
+    for i in 0..4 {
+        t[4 + i] *= INV_WC8[i];
+    }
+    inv_dct1d_4(<&mut [f32; 4]>::try_from(&mut t[..4]).unwrap());
+    for i in 0..4 {
+        buf[i] = (t[i] + t[4 + i]) * 0.5;
+        buf[7 - i] = (t[i] - t[4 + i]) * 0.5;
+    }
+}
+
+#[inline(always)]
+fn inv_dct1d_16(buf: &mut [f32; 16]) {
+    const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut t = [0.0f32; 16];
+    for i in 0..8 {
+        t[i] = buf[2 * i];
+        t[8 + i] = buf[2 * i + 1];
+    }
+    for i in (9..=14).rev() {
+        t[i] -= t[i + 1];
+    }
+    t[8] = (t[8] - t[9]) * IS2;
+    inv_dct1d_8(&mut t[8..16]);
+    for i in 0..8 {
+        t[8 + i] *= INV_WC16[i];
+    }
+    inv_dct1d_8(&mut t[0..8]);
+    for i in 0..8 {
+        buf[i] = (t[i] + t[8 + i]) * 0.5;
+        buf[15 - i] = (t[i] - t[8 + i]) * 0.5;
+    }
+}
+
+#[inline]
+fn inv_dct1d_32(buf: &mut [f32; 32]) {
+    const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut t = [0.0f32; 32];
+    for i in 0..16 {
+        t[i] = buf[2 * i];
+        t[16 + i] = buf[2 * i + 1];
+    }
+    for i in (17..=30).rev() {
+        t[i] -= t[i + 1];
+    }
+    t[16] = (t[16] - t[17]) * IS2;
+    inv_dct1d_16(<&mut [f32; 16]>::try_from(&mut t[16..32]).unwrap());
+    for i in 0..16 {
+        t[16 + i] *= INV_WC32[i];
+    }
+    inv_dct1d_16(<&mut [f32; 16]>::try_from(&mut t[0..16]).unwrap());
+    for i in 0..16 {
+        buf[i] = (t[i] + t[16 + i]) * 0.5;
+        buf[31 - i] = (t[i] - t[16 + i]) * 0.5;
+    }
+}
+
+macro_rules! inv_dct_square {
+    ($name:ident, $n:literal, $side:literal, $inv1d:path) => {
+        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+            for a in 0..$side {
+                for b in 0..$side {
+                    out[b * $side + a] = coeff[a * $side + b] * ($n as f32);
+                }
+            }
+            for u in 0..$side {
+                let mut col = [0.0f32; $side];
+                for v in 0..$side {
+                    col[v] = out[v * $side + u];
+                }
+                $inv1d(&mut col);
+                for v in 0..$side {
+                    out[v * $side + u] = col[v];
+                }
+            }
+            for v in 0..$side {
+                let row =
+                    <&mut [f32; $side]>::try_from(&mut out[v * $side..v * $side + $side]).unwrap();
+                $inv1d(row);
+            }
+        }
+    };
+}
+inv_dct_square!(inv_dct8x8, 64, 8, inv_dct1d_8_arr);
+inv_dct_square!(inv_dct16x16, 256, 16, inv_dct1d_16);
+inv_dct_square!(inv_dct32x32, 1024, 32, inv_dct1d_32);
+
+#[inline(always)]
+fn inv_dct1d_8_arr(buf: &mut [f32; 8]) {
+    inv_dct1d_8(buf);
+}
+
+pub(crate) fn inv_dct8x16(coeff: &[f32; 128], out: &mut [f32; 128]) {
+    for (o, c) in out.iter_mut().zip(coeff.iter()) {
+        *o = *c * 128.0;
+    }
+    for u in 0..16 {
+        let mut col = [0.0f32; 8];
+        for v in 0..8 {
+            col[v] = out[v * 16 + u];
+        }
+        inv_dct1d_8(&mut col);
+        for v in 0..8 {
+            out[v * 16 + u] = col[v];
+        }
+    }
+    for r in 0..8 {
+        inv_dct1d_16(<&mut [f32; 16]>::try_from(&mut out[r * 16..r * 16 + 16]).unwrap());
+    }
+}
+
+/// Inverse of `dct16x8` (16 tall × 8 wide pixels; forward: col-DCT16 then
+/// row-DCT8, transposed store `[u*16+v]`).
+pub(crate) fn inv_dct16x8(coeff: &[f32; 128], out: &mut [f32; 128]) {
+    let mut acd = [0.0f32; 128]; // after_col_dct[v*8+u]
+    for v in 0..16 {
+        let mut row = [0.0f32; 8];
+        for u in 0..8 {
+            row[u] = coeff[u * 16 + v] * 128.0;
+        }
+        inv_dct1d_8(&mut row);
+        for u in 0..8 {
+            acd[v * 8 + u] = row[u];
+        }
+    }
+    for u in 0..8 {
+        let mut col = [0.0f32; 16];
+        for v in 0..16 {
+            col[v] = acd[v * 8 + u];
+        }
+        inv_dct1d_16(&mut col);
+        for i in 0..16 {
+            out[i * 8 + u] = col[i];
+        }
+    }
+}
+
+pub(crate) fn inv_dct16x32(coeff: &[f32; 512], out: &mut [f32; 512]) {
+    for (o, c) in out.iter_mut().zip(coeff.iter()) {
+        *o = *c * 512.0;
+    }
+    for u in 0..32 {
+        let mut col = [0.0f32; 16];
+        for v in 0..16 {
+            col[v] = out[v * 32 + u];
+        }
+        inv_dct1d_16(&mut col);
+        for i in 0..16 {
+            out[i * 32 + u] = col[i];
+        }
+    }
+    for i in 0..16 {
+        inv_dct1d_32(<&mut [f32; 32]>::try_from(&mut out[i * 32..i * 32 + 32]).unwrap());
+    }
+}
+
+pub(crate) fn inv_dct32x16(coeff: &[f32; 512], out: &mut [f32; 512]) {
+    let mut acd = [0.0f32; 512]; // after_col_dct[v*16+u]
+    for v in 0..32 {
+        let mut row = [0.0f32; 16];
+        for u in 0..16 {
+            row[u] = coeff[u * 32 + v] * 512.0;
+        }
+        inv_dct1d_16(&mut row);
+        for u in 0..16 {
+            acd[v * 16 + u] = row[u];
+        }
+    }
+    for u in 0..16 {
+        let mut col = [0.0f32; 32];
+        for v in 0..32 {
+            col[v] = acd[v * 16 + u];
+        }
+        inv_dct1d_32(&mut col);
+        for i in 0..32 {
+            out[i * 16 + u] = col[i];
+        }
     }
 }
 
@@ -917,9 +1143,6 @@ pub(crate) fn dct32x32(input: &[f32; 1024], output: &mut [f32; 1024]) {
     selected_dct32x32()(input, output);
 }
 
-/// Forward 32×32 DCT: column DCTs, then row DCTs, scaled by 1/(32·32). Output is
-/// stored transposed (`output[u*32 + v]`), matching the 16×16 convention so the
-/// shared coefficient-order / dequant machinery applies.
 pub(crate) fn dct32x32_scalar(input: &[f32; 1024], output: &mut [f32; 1024]) {
     let mut after_col_dct = [0.0f32; 1024];
     let mut col = [0.0f32; 32];
@@ -1009,13 +1232,6 @@ pub(crate) fn dc_from_dct32x32(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
     }
 }
 
-/// Forward DCT32X16 (32 rows tall × 16 cols wide, covering 4×2 = 8 blocks).
-/// Tall transform: 32-point column DCTs first, then 16-point row DCTs, scaled by
-/// 1/(32·16). Output is stored transposed as `output[u*32 + v]` (u = horizontal
-/// freq 0..16, v = vertical freq 0..32) — the larger (32) dimension contiguous,
-/// matching the DCT16X8 convention and libjxl's `CoefficientLayout`-normalized
-/// 16-row × 32-col block, so the shared `K_COEFF_ORDER_32X16` / DCT16X32 dequant
-/// machinery applies.
 static DCT_METHOD_32X16: OnceLock<Arc<DctFn<512>>> = OnceLock::new();
 
 fn select_dct_32x16() -> Arc<DctFn<512>> {
@@ -1201,6 +1417,82 @@ pub(crate) fn dc_from_dct16x32(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_butterflies_round_trip() {
+        let mut s = 987654321u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        // 1D
+        for _ in 0..50 {
+            let mut b8 = [0.0f32; 8];
+            b8.iter_mut().for_each(|v| *v = rnd());
+            let orig = b8;
+            dct1d_8(&mut b8);
+            inv_dct1d_8(&mut b8);
+            for i in 0..8 {
+                assert!((b8[i] - orig[i]).abs() < 1e-4, "1d8 {i}");
+            }
+        }
+        // 2D square: inv_dctNxN(dctNxN(x)) == x
+        macro_rules! rt2d {
+            ($n:literal, $fwd:path, $inv:path) => {{
+                let mut x = [0.0f32; $n];
+                x.iter_mut().for_each(|v| *v = rnd());
+                let orig = x;
+                let mut c = [0.0f32; $n];
+                $fwd(&x, &mut c);
+                let mut r = [0.0f32; $n];
+                $inv(&c, &mut r);
+                let me = (0..$n)
+                    .map(|i| (r[i] - orig[i]).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(me < 1e-3, "2d {} max err {me}", $n);
+            }};
+        }
+        rt2d!(64, dct8x8, inv_dct8x8);
+        rt2d!(256, dct16x16, inv_dct16x16);
+        rt2d!(1024, dct32x32, inv_dct32x32);
+        rt2d!(128, dct8x16, inv_dct8x16);
+        rt2d!(128, dct16x8, inv_dct16x8);
+        rt2d!(512, dct16x32, inv_dct16x32);
+        rt2d!(512, dct32x16, inv_dct32x16);
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_inverse_matches_scalar() {
+        let mut s = 555u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        macro_rules! cmp {
+            ($n:literal, $sc:path, $ne:path) => {{
+                for case in 0..16 {
+                    let mut c = [0.0f32; $n];
+                    c.iter_mut().for_each(|v| *v = rnd());
+                    let mut rs = [0.0f32; $n];
+                    $sc(&c, &mut rs);
+                    let mut rn = [0.0f32; $n];
+                    unsafe { $ne(&c, &mut rn) };
+                    let me = (0..$n)
+                        .map(|i| (rs[i] - rn[i]).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(me < 1e-3, "neon vs scalar {} case {case} max diff {me}", $n);
+                }
+            }};
+        }
+        cmp!(64, inv_dct8x8, crate::neon::inv_dct8x8_neon);
+        cmp!(128, inv_dct8x16, crate::neon::inv_dct8x16_neon);
+        cmp!(128, inv_dct16x8, crate::neon::inv_dct16x8_neon);
+        cmp!(256, inv_dct16x16, crate::neon::inv_dct16x16_neon);
+        cmp!(512, inv_dct16x32, crate::neon::inv_dct16x32_neon);
+        cmp!(512, inv_dct32x16, crate::neon::inv_dct32x16_neon);
+        cmp!(1024, inv_dct32x32, crate::neon::inv_dct32x32_neon);
+    }
 
     #[test]
     fn dct4x8_dc_matches_dct8x8() {

@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16, WC32};
+use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
 
@@ -446,6 +446,234 @@ fn load_strip(ptr: *const f32) -> float32x4_t {
     unsafe { vld1q_f32(ptr) }
 }
 
+// ---------------------------------------------------------------------------
+// Inverse (synthesis) strip butterflies — 4-lane vector versions of the scalar
+// `inv_dct1d_N`, each an exact reverse of the forward `dct1d_N_s`. Composed into
+// SIMD 2D IDCTs for the reconstruction-based transform selector.
+
+const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn idct2_s(a: float32x4_t, b: float32x4_t) -> (float32x4_t, float32x4_t) {
+    (
+        vmulq_n_f32(vaddq_f32(a, b), 0.5),
+        vmulq_n_f32(vsubq_f32(a, b), 0.5),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct1d_4_s(c: &mut [float32x4_t; 4]) {
+    let (t0, t1, mut t2, t3) = (c[0], c[2], c[1], c[3]);
+    t2 = vmulq_n_f32(vsubq_f32(t2, t3), IS2);
+    let (n2, n3) = idct2_s(t2, t3);
+    let a2 = vmulq_n_f32(n2, INV_WC4[0]);
+    let a3 = vmulq_n_f32(n3, INV_WC4[1]);
+    let (m0, m1) = idct2_s(t0, t1);
+    c[0] = vmulq_n_f32(vaddq_f32(m0, a2), 0.5);
+    c[3] = vmulq_n_f32(vsubq_f32(m0, a2), 0.5);
+    c[1] = vmulq_n_f32(vaddq_f32(m1, a3), 0.5);
+    c[2] = vmulq_n_f32(vsubq_f32(m1, a3), 0.5);
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct1d_8_s(c: &mut [float32x4_t; 8]) {
+    let mut t = [c[0]; 8];
+    for i in 0..4 {
+        t[i] = c[2 * i];
+        t[4 + i] = c[2 * i + 1];
+    }
+    t[6] = vsubq_f32(t[6], t[7]);
+    t[5] = vsubq_f32(t[5], t[6]);
+    t[4] = vmulq_n_f32(vsubq_f32(t[4], t[5]), IS2);
+    let mut o: [float32x4_t; 4] = [t[4], t[5], t[6], t[7]];
+    inv_dct1d_4_s(&mut o);
+    for i in 0..4 {
+        o[i] = vmulq_n_f32(o[i], INV_WC8[i]);
+    }
+    let mut e: [float32x4_t; 4] = [t[0], t[1], t[2], t[3]];
+    inv_dct1d_4_s(&mut e);
+    for i in 0..4 {
+        c[i] = vmulq_n_f32(vaddq_f32(e[i], o[i]), 0.5);
+        c[7 - i] = vmulq_n_f32(vsubq_f32(e[i], o[i]), 0.5);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct1d_16_s(c: &mut [float32x4_t; 16]) {
+    let mut t = [c[0]; 16];
+    for i in 0..8 {
+        t[i] = c[2 * i];
+        t[8 + i] = c[2 * i + 1];
+    }
+    for i in (9..=14).rev() {
+        t[i] = vsubq_f32(t[i], t[i + 1]);
+    }
+    t[8] = vmulq_n_f32(vsubq_f32(t[8], t[9]), IS2);
+    let mut o: [float32x4_t; 8] = std::array::from_fn(|i| t[8 + i]);
+    inv_dct1d_8_s(&mut o);
+    for i in 0..8 {
+        o[i] = vmulq_n_f32(o[i], INV_WC16[i]);
+    }
+    let mut e: [float32x4_t; 8] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_8_s(&mut e);
+    for i in 0..8 {
+        c[i] = vmulq_n_f32(vaddq_f32(e[i], o[i]), 0.5);
+        c[15 - i] = vmulq_n_f32(vsubq_f32(e[i], o[i]), 0.5);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct1d_32_s(c: &mut [float32x4_t; 32]) {
+    let mut t = [c[0]; 32];
+    for i in 0..16 {
+        t[i] = c[2 * i];
+        t[16 + i] = c[2 * i + 1];
+    }
+    for i in (17..=30).rev() {
+        t[i] = vsubq_f32(t[i], t[i + 1]);
+    }
+    t[16] = vmulq_n_f32(vsubq_f32(t[16], t[17]), IS2);
+    let mut o: [float32x4_t; 16] = std::array::from_fn(|i| t[16 + i]);
+    inv_dct1d_16_s(&mut o);
+    for i in 0..16 {
+        o[i] = vmulq_n_f32(o[i], INV_WC32[i]);
+    }
+    let mut e: [float32x4_t; 16] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_16_s(&mut e);
+    for i in 0..16 {
+        c[i] = vmulq_n_f32(vaddq_f32(e[i], o[i]), 0.5);
+        c[31 - i] = vmulq_n_f32(vsubq_f32(e[i], o[i]), 0.5);
+    }
+}
+
+macro_rules! horizontal_idct_pass {
+    ($tmp:expr, $out:expr, $h:literal, $w:literal, $inv_h:path) => {{
+        for y4 in (0..$h).step_by(4) {
+            let mut c = [vdupq_n_f32(0.0); $w];
+            for u4 in (0..$w).step_by(4) {
+                let (a, b, cc, d) = transpose_4x4(
+                    load_strip(unsafe { $tmp.get_unchecked(y4 * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 1) * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 2) * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 3) * $w + u4..) }.as_ptr()),
+                );
+                c[u4] = a;
+                c[u4 + 1] = b;
+                c[u4 + 2] = cc;
+                c[u4 + 3] = d;
+            }
+            $inv_h(&mut c);
+            for x4 in (0..$w).step_by(4) {
+                let (r0, r1, r2, r3) = transpose_4x4(c[x4], c[x4 + 1], c[x4 + 2], c[x4 + 3]);
+                unsafe {
+                    vst1q_f32($out.as_mut_ptr().add(y4 * $w + x4), r0);
+                    vst1q_f32($out.as_mut_ptr().add((y4 + 1) * $w + x4), r1);
+                    vst1q_f32($out.as_mut_ptr().add((y4 + 2) * $w + x4), r2);
+                    vst1q_f32($out.as_mut_ptr().add((y4 + 3) * $w + x4), r3);
+                }
+            }
+        }
+    }};
+}
+
+/// IDCT for a natural coefficient layout `[vfreq * W + hfreq]`.
+macro_rules! inv_dct_natural_neon {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+            let mut tmp_u = MaybeUninit::<[f32; $n]>::uninit();
+            let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
+            for u4 in (0..$w).step_by(4) {
+                let mut c: [float32x4_t; $h] = std::array::from_fn(|v| {
+                    vmulq_n_f32(
+                        load_strip(unsafe { coeff.get_unchecked(v * $w + u4..) }.as_ptr()),
+                        $n as f32,
+                    )
+                });
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { vst1q_f32(tmp_ptr.add(y * $w + u4), c[y]) };
+                }
+            }
+            let tmp = unsafe { tmp_u.assume_init() };
+            horizontal_idct_pass!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+/// IDCT for a transposed coefficient layout `[hfreq * H + vfreq]`.
+macro_rules! inv_dct_transposed_neon {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+            let mut tmp_u = MaybeUninit::<[f32; $n]>::uninit();
+            let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
+            for u4 in (0..$w).step_by(4) {
+                let mut c = [vdupq_n_f32(0.0); $h];
+                for v4 in (0..$h).step_by(4) {
+                    let (a, b, cc, d) = transpose_4x4(
+                        load_strip(unsafe { coeff.get_unchecked(u4 * $h + v4..) }.as_ptr()),
+                        load_strip(unsafe { coeff.get_unchecked((u4 + 1) * $h + v4..) }.as_ptr()),
+                        load_strip(unsafe { coeff.get_unchecked((u4 + 2) * $h + v4..) }.as_ptr()),
+                        load_strip(unsafe { coeff.get_unchecked((u4 + 3) * $h + v4..) }.as_ptr()),
+                    );
+                    c[v4] = vmulq_n_f32(a, $n as f32);
+                    c[v4 + 1] = vmulq_n_f32(b, $n as f32);
+                    c[v4 + 2] = vmulq_n_f32(cc, $n as f32);
+                    c[v4 + 3] = vmulq_n_f32(d, $n as f32);
+                }
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { vst1q_f32(tmp_ptr.add(y * $w + u4), c[y]) };
+                }
+            }
+            let tmp = unsafe { tmp_u.assume_init() };
+            horizontal_idct_pass!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+inv_dct_transposed_neon!(inv_dct8x8_neon, 64, 8, 8, inv_dct1d_8_s, inv_dct1d_8_s);
+inv_dct_transposed_neon!(
+    inv_dct16x16_neon,
+    256,
+    16,
+    16,
+    inv_dct1d_16_s,
+    inv_dct1d_16_s
+);
+inv_dct_transposed_neon!(
+    inv_dct32x32_neon,
+    1024,
+    32,
+    32,
+    inv_dct1d_32_s,
+    inv_dct1d_32_s
+);
+inv_dct_natural_neon!(inv_dct8x16_neon, 128, 8, 16, inv_dct1d_8_s, inv_dct1d_16_s);
+inv_dct_transposed_neon!(inv_dct16x8_neon, 128, 16, 8, inv_dct1d_16_s, inv_dct1d_8_s);
+inv_dct_natural_neon!(
+    inv_dct16x32_neon,
+    512,
+    16,
+    32,
+    inv_dct1d_16_s,
+    inv_dct1d_32_s
+);
+inv_dct_transposed_neon!(
+    inv_dct32x16_neon,
+    512,
+    32,
+    16,
+    inv_dct1d_32_s,
+    inv_dct1d_16_s
+);
+
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
     // 4-wide strips; column pass writes transposed scratch (`[col * 32 + vfreq]`)
@@ -734,6 +962,38 @@ mod neon_dct_tests {
             *v = rng_f32(seed.wrapping_add((i as u64).wrapping_mul(6364136223846793005)));
         }
         buf
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn assert_inverse_matches_scalar<const N: usize>(
+        scalar: fn(&[f32; N], &mut [f32; N]),
+        neon: unsafe fn(&[f32; N], &mut [f32; N]),
+        label: &str,
+    ) {
+        let mut cases = Vec::with_capacity(35);
+        cases.push([0.0f32; N]);
+
+        let mut dc = [0.0f32; N];
+        dc[0] = 0.75;
+        cases.push(dc);
+
+        let mut alternating = [0.0f32; N];
+        for (i, v) in alternating.iter_mut().enumerate() {
+            *v = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+        }
+        cases.push(alternating);
+
+        for seed in 0..32 {
+            cases.push(fill(0x1d_c7_0000 + seed));
+        }
+
+        for (case, input) in cases.iter().enumerate() {
+            let mut got = [0.0f32; N];
+            let mut want = [0.0f32; N];
+            unsafe { neon(input, &mut got) };
+            scalar(input, &mut want);
+            assert_close(&got, &want, &format!("{label} case={case}"));
+        }
     }
 
     #[test]
@@ -1225,5 +1485,75 @@ mod neon_dct_tests {
         unsafe { dct16x16_neon(&input, &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct8x8_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct8x8,
+            crate::neon::inv_dct8x8_neon,
+            "idct8x8",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct8x16_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct8x16,
+            crate::neon::inv_dct8x16_neon,
+            "idct8x16",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct16x8_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x8,
+            crate::neon::inv_dct16x8_neon,
+            "idct16x8",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct16x16_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x16,
+            crate::neon::inv_dct16x16_neon,
+            "idct16x16",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct16x32_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x32,
+            crate::neon::inv_dct16x32_neon,
+            "idct16x32",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct32x16_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x16,
+            crate::neon::inv_dct32x16_neon,
+            "idct32x16",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct32x32_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x32,
+            crate::neon::inv_dct32x32_neon,
+            "idct32x32",
+        );
     }
 }

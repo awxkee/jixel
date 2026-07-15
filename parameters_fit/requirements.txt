@@ -1,0 +1,4 @@
+numpy>=1.26
+pillow>=10.0
+optuna>=4.0
+scikit-learn>=1.3

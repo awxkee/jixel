@@ -342,6 +342,7 @@ fn hf_modulation_blocks4_direct_x4(
     y: usize,
     xyb_y: &crate::image::Image3F,
     out_val: v128,
+    strength: f32,
 ) -> v128 {
     let valmin_y = f32x4_splat(0.0206);
 
@@ -379,7 +380,7 @@ fn hf_modulation_blocks4_direct_x4(
     let out = hsum4x4(s0, s1, s2, s3);
     vmlaf(
         out,
-        f32x4_splat(-0.38),
+        f32x4_splat(-0.38 * strength),
         f32x4_add(out_val, f32x4_splat(0.42)),
     )
 }
@@ -509,6 +510,7 @@ fn write_quant_scalar_block(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     if px >= img_xsize || py >= img_ysize {
         *qf_out = 1;
@@ -519,7 +521,7 @@ fn write_quant_scalar_block(
     let by_px = py.min(img_ysize.saturating_sub(8));
     let mask_val = crate::adaptive_quant::compute_mask(aq);
     let mask_val = crate::adaptive_quant::gamma_modulation(bx_px, by_px, opsin, mask_val);
-    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val);
+    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val, hf_strength);
     let out_val = out_val.min(crate::adaptive_quant::blue_modulation(
         bx_px, by_px, opsin, mask_val,
     ));
@@ -541,6 +543,7 @@ fn write_quant_row_wasm(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     let xsize_blocks = aq_row.len();
     debug_assert!(qf_row.len() >= xsize_blocks);
@@ -576,7 +579,7 @@ fn write_quant_row_wasm(
         let aq = load4s(aq_row, bx);
         let mask_val = compute_mask_x4(aq);
         let mask_val = gamma_modulation_blocks4_x4(px, py, opsin, mask_val);
-        let hf = hf_modulation_blocks4_direct_x4(px, py, opsin, mask_val);
+        let hf = hf_modulation_blocks4_direct_x4(px, py, opsin, mask_val, hf_strength);
         let blue = blue_modulation_blocks4_x4(px, py, opsin, mask_val);
         let out_val = f32x4_min(hf, blue);
         let qf = f32x4_add(
@@ -606,6 +609,7 @@ fn write_quant_row_wasm(
             mul,
             add,
             inv_scale,
+            hf_strength,
         );
     }
 
@@ -1043,13 +1047,24 @@ pub(crate) fn fill_quant_field(
         }
         let mul = scale * dampen;
         let add = (1.0 - dampen) * base_level;
+        let hf_strength = crate::adaptive_quant::hf_modulation_strength(distance);
 
         for by in 0..ysize_blocks {
             let py = y0 + by * 8;
             let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
             let qf_row = raw_quant_field.row_mut(by);
             write_quant_row_wasm(
-                opsin, aq_row, qf_row, x0, py, img_xsize, img_ysize, mul, add, inv_scale,
+                opsin,
+                aq_row,
+                qf_row,
+                x0,
+                py,
+                img_xsize,
+                img_ysize,
+                mul,
+                add,
+                inv_scale,
+                hf_strength,
             );
         }
     });

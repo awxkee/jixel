@@ -93,7 +93,17 @@ pub(crate) fn masking_sqrt(v: f32) -> f32 {
 
 /// HF modulation (current libjxl): per-difference clamp at `valmin_y`, summed
 /// over the 8x8 Y block, then `sum * kMul_y + kOffset` added to `out_val`.
-pub(crate) fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -> f32 {
+pub(crate) fn hf_modulation_strength(distance: f32) -> f32 {
+    (0.5 * distance).clamp(0.1, 1.0)
+}
+
+pub(crate) fn hf_modulation(
+    x: usize,
+    y: usize,
+    xyb_y: &Image3F,
+    out_val: f32,
+    strength: f32,
+) -> f32 {
     let ys = xyb_y.ysize();
     let xs = xyb_y.xsize();
     let valmin_y = 0.0206f32;
@@ -115,7 +125,7 @@ pub(crate) fn hf_modulation(x: usize, y: usize, xyb_y: &Image3F, out_val: f32) -
             sum_y += valmin_y.min((p - row_next[c0]).abs());
         }
     }
-    let k_mul_y = -0.38f32;
+    let k_mul_y = -0.38 * strength;
     let k_offset = 0.42f32; // higher value -> more bpp
     fmla(sum_y, k_mul_y, k_offset) + out_val
 }
@@ -458,7 +468,13 @@ fn fill_quant_field_scalar(
 
                 let mask_val = compute_mask(aq);
                 let mask_val = gamma_modulation(bx_px, by_px, opsin, mask_val);
-                let out_val = hf_modulation(bx_px, by_px, opsin, mask_val);
+                let out_val = hf_modulation(
+                    bx_px,
+                    by_px,
+                    opsin,
+                    mask_val,
+                    hf_modulation_strength(distance),
+                );
                 let out_val = out_val.min(blue_modulation(bx_px, by_px, opsin, mask_val));
                 // Multiplicative field: exponent modulation done above.
                 let qf = fast_exp2(out_val * 1.442695041) * mul + add;
@@ -546,4 +562,19 @@ pub(crate) fn dirty_log2f(d: f32) -> f32 {
     u = f_fmlaf(u, x2, 0.5770780163490337802e+0);
     u = f_fmlaf(u, x2, 0.9617966939259845749e+0);
     f_fmlaf(x2 * x, u, f_fmlaf(x, 0.2885390081777926802e+1, n as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hf_modulation_strength;
+
+    #[test]
+    fn hf_modulation_strength_protects_high_quality_detail() {
+        assert_eq!(hf_modulation_strength(0.1), 0.1);
+        assert_eq!(hf_modulation_strength(0.3), 0.15);
+        assert_eq!(hf_modulation_strength(0.5), 0.25);
+        assert_eq!(hf_modulation_strength(1.0), 0.5);
+        assert_eq!(hf_modulation_strength(2.0), 1.0);
+        assert_eq!(hf_modulation_strength(6.0), 1.0);
+    }
 }

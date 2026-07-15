@@ -4,3 +4,6 @@ app/target
 charts
 assets
 *.jxl
+parameters_fit/.venv
+meanstats_out
+docs

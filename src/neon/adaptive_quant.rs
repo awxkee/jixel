@@ -270,6 +270,7 @@ fn hf_modulation_blocks4_direct_x4(
     y: usize,
     xyb_y: &crate::image::Image3F,
     out_val: float32x4_t,
+    strength: f32,
 ) -> float32x4_t {
     let valmin_y = vdupq_n_f32(0.0206);
 
@@ -312,7 +313,7 @@ fn hf_modulation_blocks4_direct_x4(
 
     vmlaf(
         out,
-        vdupq_n_f32(-0.38),
+        vdupq_n_f32(-0.38 * strength),
         vaddq_f32(out_val, vdupq_n_f32(0.42)),
     )
 }
@@ -365,7 +366,7 @@ fn blue_modulation_blocks4_x4(
 
     const K_LIMIT: f32 = 0.010474084867598155;
     const K_MAX_LIMIT: f32 = 15.463398341612438 * K_LIMIT;
-    const SCALE: f32 = 0.90590804735610064;
+    let scale: f32 = 0.90590804735610064;
 
     // Convert:
     //
@@ -399,8 +400,8 @@ fn blue_modulation_blocks4_x4(
     // }
     sums = vminq_f32(sums, vdupq_n_f32(K_MAX_LIMIT));
 
-    // out_val + sums * SCALE
-    vfmaq_f32(out_val, sums, vdupq_n_f32(SCALE))
+    // out_val + sums * scale
+    vfmaq_f32(out_val, sums, vdupq_n_f32(scale))
 }
 
 pub(crate) const EXP2_P0: f32 = 1.00000011920928955078125_f32;
@@ -462,6 +463,7 @@ fn write_quant_scalar_block(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     if px >= img_xsize || py >= img_ysize {
         *qf_out = 1;
@@ -472,7 +474,7 @@ fn write_quant_scalar_block(
     let by_px = py.min(img_ysize.saturating_sub(8));
     let mask_val = crate::adaptive_quant::compute_mask(aq);
     let mask_val = crate::adaptive_quant::gamma_modulation(bx_px, by_px, opsin, mask_val);
-    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val);
+    let out_val = crate::adaptive_quant::hf_modulation(bx_px, by_px, opsin, mask_val, hf_strength);
     let out_val = out_val.min(crate::adaptive_quant::blue_modulation(
         bx_px, by_px, opsin, mask_val,
     ));
@@ -494,6 +496,7 @@ fn write_quant_row_neon(
     mul: f32,
     add: f32,
     inv_scale: f32,
+    hf_strength: f32,
 ) {
     let xsize_blocks = aq_row.len().min(qf_row.len());
 
@@ -528,7 +531,7 @@ fn write_quant_row_neon(
         let aq = load4s(aq_row, bx);
         let mask_val = compute_mask_x4(aq);
         let mask_val = gamma_modulation_blocks4_x4(px, py, opsin, mask_val);
-        let hf = hf_modulation_blocks4_direct_x4(px, py, opsin, mask_val);
+        let hf = hf_modulation_blocks4_direct_x4(px, py, opsin, mask_val, hf_strength);
         let blue = blue_modulation_blocks4_x4(px, py, opsin, mask_val);
         let out_val = vminq_f32(hf, blue);
         let qf = vaddq_f32(
@@ -558,6 +561,7 @@ fn write_quant_row_neon(
             mul,
             add,
             inv_scale,
+            hf_strength,
         );
     }
 
@@ -1009,13 +1013,24 @@ pub(crate) fn fill_quant_field(
         }
         let mul = scale * dampen;
         let add = (1.0 - dampen) * base_level;
+        let hf_strength = crate::adaptive_quant::hf_modulation_strength(distance);
 
         for by in 0..ysize_blocks {
             let py = y0 + by * 8;
             let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
             let qf_row = raw_quant_field.row_mut(by);
             write_quant_row_neon(
-                opsin, aq_row, qf_row, x0, py, img_xsize, img_ysize, mul, add, inv_scale,
+                opsin,
+                aq_row,
+                qf_row,
+                x0,
+                py,
+                img_xsize,
+                img_ysize,
+                mul,
+                add,
+                inv_scale,
+                hf_strength,
             );
         }
     });

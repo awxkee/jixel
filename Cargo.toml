@@ -1,9 +1,9 @@
 [workspace]
-members = ["app", "stats"]
+members = ["app", "stats", "tuner", "meanstats"]
 
 [package]
 name = "jixel"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 description = "Tiny JPEG XL encoder"
 readme = "README.md"
@@ -14,7 +14,7 @@ documentation = "https://docs.rs/jixel"
 categories = ["multimedia::images", "compression", "encoding"]
 homepage = "https://github.com/awxkee/jixel"
 repository = "https://github.com/awxkee/jixel"
-exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*", "/tools/*"]
+exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*", "/tools/*", "parameters_fit/*"]
 rust-version = "1.93.0"
 
 [features]

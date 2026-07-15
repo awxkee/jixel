@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dct::{WC4, WC8, WC16, WC32};
+use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
 use std::arch::x86_64::*;
 
 #[inline]
@@ -358,6 +358,238 @@ pub(crate) fn dct32x32_avx2(input: &[f32; 1024], output: &mut [f32; 1024]) {
     }
 }
 
+const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn idct2_flat(a: __m256, b: __m256) -> (__m256, __m256) {
+    let half = _mm256_set1_ps(0.5);
+    (
+        _mm256_mul_ps(_mm256_add_ps(a, b), half),
+        _mm256_mul_ps(_mm256_sub_ps(a, b), half),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv_dct1d_4_flat(c: &mut [__m256; 4]) {
+    let (t0, t1, mut t2, t3) = (c[0], c[2], c[1], c[3]);
+    t2 = _mm256_mul_ps(_mm256_sub_ps(t2, t3), _mm256_set1_ps(IS2));
+    let (n2, n3) = idct2_flat(t2, t3);
+    let a2 = _mm256_mul_ps(n2, _mm256_set1_ps(INV_WC4[0]));
+    let a3 = _mm256_mul_ps(n3, _mm256_set1_ps(INV_WC4[1]));
+    let (m0, m1) = idct2_flat(t0, t1);
+    let half = _mm256_set1_ps(0.5);
+    c[0] = _mm256_mul_ps(_mm256_add_ps(m0, a2), half);
+    c[3] = _mm256_mul_ps(_mm256_sub_ps(m0, a2), half);
+    c[1] = _mm256_mul_ps(_mm256_add_ps(m1, a3), half);
+    c[2] = _mm256_mul_ps(_mm256_sub_ps(m1, a3), half);
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv_dct1d_8_flat(c: &mut [__m256; 8]) {
+    let mut t = [c[0]; 8];
+    for i in 0..4 {
+        t[i] = c[2 * i];
+        t[4 + i] = c[2 * i + 1];
+    }
+    t[6] = _mm256_sub_ps(t[6], t[7]);
+    t[5] = _mm256_sub_ps(t[5], t[6]);
+    t[4] = _mm256_mul_ps(_mm256_sub_ps(t[4], t[5]), _mm256_set1_ps(IS2));
+    let mut o = [t[4], t[5], t[6], t[7]];
+    inv_dct1d_4_flat(&mut o);
+    for i in 0..4 {
+        o[i] = _mm256_mul_ps(o[i], _mm256_set1_ps(INV_WC8[i]));
+    }
+    let mut e = [t[0], t[1], t[2], t[3]];
+    inv_dct1d_4_flat(&mut e);
+    let half = _mm256_set1_ps(0.5);
+    for i in 0..4 {
+        c[i] = _mm256_mul_ps(_mm256_add_ps(e[i], o[i]), half);
+        c[7 - i] = _mm256_mul_ps(_mm256_sub_ps(e[i], o[i]), half);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv_dct1d_16_flat(c: &mut [__m256; 16]) {
+    let mut t = [c[0]; 16];
+    for i in 0..8 {
+        t[i] = c[2 * i];
+        t[8 + i] = c[2 * i + 1];
+    }
+    for i in (9..=14).rev() {
+        t[i] = _mm256_sub_ps(t[i], t[i + 1]);
+    }
+    t[8] = _mm256_mul_ps(_mm256_sub_ps(t[8], t[9]), _mm256_set1_ps(IS2));
+    let mut o: [__m256; 8] = std::array::from_fn(|i| t[8 + i]);
+    inv_dct1d_8_flat(&mut o);
+    for i in 0..8 {
+        o[i] = _mm256_mul_ps(o[i], _mm256_set1_ps(INV_WC16[i]));
+    }
+    let mut e: [__m256; 8] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_8_flat(&mut e);
+    let half = _mm256_set1_ps(0.5);
+    for i in 0..8 {
+        c[i] = _mm256_mul_ps(_mm256_add_ps(e[i], o[i]), half);
+        c[15 - i] = _mm256_mul_ps(_mm256_sub_ps(e[i], o[i]), half);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn inv_dct1d_32_flat(c: &mut [__m256; 32]) {
+    let mut t = [c[0]; 32];
+    for i in 0..16 {
+        t[i] = c[2 * i];
+        t[16 + i] = c[2 * i + 1];
+    }
+    for i in (17..=30).rev() {
+        t[i] = _mm256_sub_ps(t[i], t[i + 1]);
+    }
+    t[16] = _mm256_mul_ps(_mm256_sub_ps(t[16], t[17]), _mm256_set1_ps(IS2));
+    let mut o: [__m256; 16] = std::array::from_fn(|i| t[16 + i]);
+    inv_dct1d_16_flat(&mut o);
+    for i in 0..16 {
+        o[i] = _mm256_mul_ps(o[i], _mm256_set1_ps(INV_WC32[i]));
+    }
+    let mut e: [__m256; 16] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_16_flat(&mut e);
+    let half = _mm256_set1_ps(0.5);
+    for i in 0..16 {
+        c[i] = _mm256_mul_ps(_mm256_add_ps(e[i], o[i]), half);
+        c[31 - i] = _mm256_mul_ps(_mm256_sub_ps(e[i], o[i]), half);
+    }
+}
+
+macro_rules! horizontal_idct_pass_avx2 {
+    ($tmp:expr, $out:expr, $h:literal, $w:literal, $inv_h:path) => {{
+        for y8 in (0..$h).step_by(8) {
+            let mut c = [_mm256_undefined_ps(); $w];
+            for u8 in (0..$w).step_by(8) {
+                let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                    _mm256_loadu_ps($tmp.as_ptr().add((y8 + j) * $w + u8))
+                });
+                transpose_8x8(&mut tile);
+                c[u8..u8 + 8].copy_from_slice(&tile);
+            }
+            $inv_h(&mut c);
+            for x8 in (0..$w).step_by(8) {
+                let mut tile: [__m256; 8] = c[x8..x8 + 8].try_into().unwrap();
+                transpose_8x8(&mut tile);
+                for (j, row) in tile.iter().enumerate() {
+                    unsafe { _mm256_storeu_ps($out.as_mut_ptr().add((y8 + j) * $w + x8), *row) };
+                }
+            }
+        }
+    }};
+}
+
+macro_rules! inv_dct_natural_avx2 {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        #[target_feature(enable = "avx2")]
+        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+            let mut tmp = [0.0f32; $n];
+            let scale = _mm256_set1_ps($n as f32);
+            for u8 in (0..$w).step_by(8) {
+                let mut c: [__m256; $h] = std::array::from_fn(|v| unsafe {
+                    _mm256_mul_ps(_mm256_loadu_ps(coeff.as_ptr().add(v * $w + u8)), scale)
+                });
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { _mm256_storeu_ps(tmp.as_mut_ptr().add(y * $w + u8), c[y]) };
+                }
+            }
+            horizontal_idct_pass_avx2!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+macro_rules! inv_dct_transposed_avx2 {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        #[target_feature(enable = "avx2")]
+        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+            let mut tmp = [0.0f32; $n];
+            let scale = _mm256_set1_ps($n as f32);
+            for u8 in (0..$w).step_by(8) {
+                let mut c = [_mm256_undefined_ps(); $h];
+                for v8 in (0..$h).step_by(8) {
+                    let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                        _mm256_loadu_ps(coeff.as_ptr().add((u8 + j) * $h + v8))
+                    });
+                    transpose_8x8(&mut tile);
+                    for (j, v) in tile.iter().enumerate() {
+                        c[v8 + j] = _mm256_mul_ps(*v, scale);
+                    }
+                }
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { _mm256_storeu_ps(tmp.as_mut_ptr().add(y * $w + u8), c[y]) };
+                }
+            }
+            horizontal_idct_pass_avx2!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+inv_dct_transposed_avx2!(
+    inv_dct8x8_avx2,
+    64,
+    8,
+    8,
+    inv_dct1d_8_flat,
+    inv_dct1d_8_flat
+);
+inv_dct_natural_avx2!(
+    inv_dct8x16_avx2,
+    128,
+    8,
+    16,
+    inv_dct1d_8_flat,
+    inv_dct1d_16_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct16x8_avx2,
+    128,
+    16,
+    8,
+    inv_dct1d_16_flat,
+    inv_dct1d_8_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct16x16_avx2,
+    256,
+    16,
+    16,
+    inv_dct1d_16_flat,
+    inv_dct1d_16_flat
+);
+inv_dct_natural_avx2!(
+    inv_dct16x32_avx2,
+    512,
+    16,
+    32,
+    inv_dct1d_16_flat,
+    inv_dct1d_32_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct32x16_avx2,
+    512,
+    32,
+    16,
+    inv_dct1d_32_flat,
+    inv_dct1d_16_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct32x32_avx2,
+    1024,
+    32,
+    32,
+    inv_dct1d_32_flat,
+    inv_dct1d_32_flat
+);
+
 /// 4-point DCT-II over 4 lanes (one per 4×4 quadrant), mirroring the scalar
 /// [`crate::dct::dct1d_4`].
 #[target_feature(enable = "avx2,fma")]
@@ -632,6 +864,40 @@ mod tests {
         buf
     }
 
+    fn assert_inverse_matches_scalar<const N: usize>(
+        scalar: fn(&[f32; N], &mut [f32; N]),
+        avx2: unsafe fn(&[f32; N], &mut [f32; N]),
+        label: &str,
+    ) {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut cases = Vec::with_capacity(35);
+        cases.push([0.0f32; N]);
+
+        let mut dc = [0.0f32; N];
+        dc[0] = 0.75;
+        cases.push(dc);
+
+        let mut alternating = [0.0f32; N];
+        for (i, v) in alternating.iter_mut().enumerate() {
+            *v = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+        }
+        cases.push(alternating);
+
+        for seed in 0..32 {
+            cases.push(fill(0xa7_c2_0000 + seed));
+        }
+
+        for (case, input) in cases.iter().enumerate() {
+            let mut got = [0.0f32; N];
+            let mut want = [0.0f32; N];
+            unsafe { avx2(input, &mut got) };
+            scalar(input, &mut want);
+            assert_close(&got, &want, &format!("{label} case={case}"));
+        }
+    }
+
     #[test]
     fn test_dct16x16_avx2_vs_scalar_random() {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
@@ -839,5 +1105,68 @@ mod tests {
         unsafe { dct16x16_avx2(&input, &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
+    }
+
+    #[test]
+    fn test_idct8x8_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct8x8,
+            crate::avx::inv_dct8x8_avx2,
+            "idct8x8",
+        );
+    }
+
+    #[test]
+    fn test_idct8x16_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct8x16,
+            crate::avx::inv_dct8x16_avx2,
+            "idct8x16",
+        );
+    }
+
+    #[test]
+    fn test_idct16x8_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x8,
+            crate::avx::inv_dct16x8_avx2,
+            "idct16x8",
+        );
+    }
+
+    #[test]
+    fn test_idct16x16_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x16,
+            crate::avx::inv_dct16x16_avx2,
+            "idct16x16",
+        );
+    }
+
+    #[test]
+    fn test_idct16x32_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct16x32,
+            crate::avx::inv_dct16x32_avx2,
+            "idct16x32",
+        );
+    }
+
+    #[test]
+    fn test_idct32x16_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x16,
+            crate::avx::inv_dct32x16_avx2,
+            "idct32x16",
+        );
+    }
+
+    #[test]
+    fn test_idct32x32_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x32,
+            crate::avx::inv_dct32x32_avx2,
+            "idct32x32",
+        );
     }
 }
