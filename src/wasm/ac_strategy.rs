@@ -55,7 +55,7 @@ pub(crate) fn sse_and_rate_wasm(
     half: usize,
     cx: usize,
     cy: usize,
-    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -133,10 +133,13 @@ pub(crate) fn sse_and_rate_wasm(
             let nz = f32x4_gt(absq, zero);
             let rate_mask = v128_and(nz, active);
 
-            nzeros += i32x4_bitmask(rate_mask).count_ones() as usize;
+            let rate_bits = i32x4_bitmask(rate_mask);
+            nzeros += rate_bits.count_ones() as usize;
 
-            let ratev = wasm_log2p1_f32(absq);
-            mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
+            if rate_bits != 0 {
+                let ratev = wasm_log2p1_f32(absq);
+                mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
+            }
         }
     }
 
@@ -186,4 +189,14 @@ fn wasm_log2p1_f32(x: v128) -> v128 {
     let log2_m = f32x4_mul(t, p);
 
     f32x4_add(e, log2_m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sse_and_rate_wasm;
+
+    #[test]
+    fn test_sse_and_rate_wasm_vs_reference() {
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(sse_and_rate_wasm);
+    }
 }

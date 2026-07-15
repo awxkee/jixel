@@ -29,6 +29,7 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod dct;
+mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod xyb;
@@ -40,6 +41,7 @@ pub(crate) use dct::{
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
     inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
 };
+pub(crate) use inflated_cost::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::quantize_block_ac_avx2;
 pub(crate) use xyb::to_xyb_avx2_band;

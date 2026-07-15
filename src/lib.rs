@@ -57,6 +57,7 @@ mod fast_loseless;
 mod gaborish;
 mod icc_codec;
 mod image;
+mod inflated_cost;
 mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;

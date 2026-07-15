@@ -325,7 +325,7 @@ fn build_pixel_code_n(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode
             //
             //   (b) A valid 2-symbol simple Huffman code where both symbols share
             //       a 1-bit code. The encoder always picks our real token (cost:
-            //       1 wasted bit per pixel), the decoder synchronises correctly.
+            //       1 wasted bit per pixel), the decoder synchronizes correctly.
             //
             // CreateHuffmanTree gives us depth=1 with bits=0 for the placeholder,
             // but the actual encoded value would be `0` — wrong if our token > 0.
@@ -337,7 +337,7 @@ fn build_pixel_code_n(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode
                 pc.depths[idx] = 0;
                 pc.bits[idx] = 0;
             } else {
-                // (b): synthesise a second symbol at index 0 with depth 1 and
+                // (b): synthesize a second symbol at index 0 with depth 1 and
                 // assign codes {0 → "0", idx → "1"} so the encoder always emits
                 // "1" + extra bits, and the decoder follows the same logic.
                 pc.depths[0] = 1;

@@ -27,32 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 //! Adaptive transform (AC strategy) selection via rate-distortion optimization.
-//!
-//! For each aligned 2×2 super-block we evaluate the candidate transform layouts
-//! — four DCT8, two vertical DCT16X8, two horizontal DCT8X16, and one DCT16X16 —
-//! and choose the one that minimizes the Lagrangian cost `J = D + λ·R`:
-//!
-//! * **D — distortion (SSE).** The transform is forward-DCT'd and quantized
-//!   exactly as the real encoder does (`enc_group::quantize_block_ac`), then the
-//!   per-coefficient quantization error is squared and summed. This error is
-//!   measured in the *dequant-normalized* coefficient space: the JXL dequant
-//!   matrices fold both the basis scaling and the perceptual weighting into the
-//!   step size, so a uniform error in this space is (by construction) a uniform
-//!   perceptual error. Summing its square is therefore a perceptual SSE that is
-//!   directly comparable across transform sizes. Unlike the old libjxl-tiny
-//!   `info_loss` heuristic, the error is *threshold-aware*: a coefficient that
-//!   the quantizer kills (`|a| < threshold → 0`) contributes its full magnitude,
-//!   not just a rounding residue.
-//!
-//! * **R — rate.** A bit estimate for the quantized AC coefficients: a per-
-//!   nonzero context/sign overhead plus a magnitude term (`log2(1+|q|)`), plus a
-//!   small `num_nonzeros` header term. This approximates the ANS-coded cost.
-//!
-//! * **λ — Lagrange multiplier.** Because the quantizer always rounds to integer
-//!   quant-units (step Δ = 1), the high-rate-optimal multiplier for entropy-
-//!   constrained scalar quantization, `λ* = Δ²·ln2/6`, is a constant independent
-//!   of the target distance. That gives a principled, distance-robust trade-off
-//!   without per-distance magic constants.
 
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
@@ -61,69 +35,22 @@ use crate::dc_group_data::{
 };
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
+use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
 use crate::quant_weights::DequantMatrices;
-use crate::util::FastRound;
-use std::sync::OnceLock;
 
 /// At visually lossless / near-lossless settings, transform metadata and the
 /// occasional wrong merge cost more than the large-DCT decorrelation saves.
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.5;
-
-/// Rate-term lookup: `mag_bits` accumulates `log2(1 + |q|)` where `q` is always
-/// a *rounded* (hence non-negative integer-valued) quantized coefficient. Since
-/// `1 + |q|` is an exact integer-valued `f32`, the log can be precomputed once
-/// and looked up — **bit-identical** to calling `f32::log2` (same inputs, same
-/// `log2f`), but trading a per-coefficient transcendental for an L1 load. Values
-/// of `|q|` at or above the table size (rare, large coefficients) fall back to
-/// the direct computation.
-pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
-pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];
-
-#[inline]
-pub(crate) fn rate_log2_lut() -> &'static RateLog2Lut {
-    static LUT: OnceLock<RateLog2Lut> = OnceLock::new();
-    LUT.get_or_init(|| {
-        let mut a = [0.0f32; RATE_LOG2_LUT_N];
-        for (i, v) in a.iter_mut().enumerate() {
-            *v = (1.0 + i as f32).log2();
-        }
-        a
-    })
-}
 
 #[inline]
 fn use_dct8_only(distance: f32) -> bool {
     distance <= DCT8_ONLY_MAX_DISTANCE
 }
 
-/// `log2(1 + qabs)` for a non-negative integer-valued `qabs`, via a resolved LUT.
-#[inline]
-pub(crate) fn rate_log2_with_lut(lut: &RateLog2Lut, qabs: f32) -> f32 {
-    let k = qabs as usize;
-    if k < RATE_LOG2_LUT_N {
-        lut[k]
-    } else {
-        (1.0 + qabs).log2()
-    }
-}
-
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
 /// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
-
-/// Per-channel distortion weights. The dequant matrices already normalize each
-/// channel perceptually, so equal weights are the principled default; X (red-
-/// green) gets a touch more weight because the selection's distortion model is
-/// deliberately compact.
-static CHANNEL_WEIGHT: [f32; 3] = [1.0, 1.0, 1.0];
-
-/// Fixed overhead per nonzero AC coefficient (context selection + sign).
-const R_NZ_BASE: f32 = 1.6;
-/// Weight on the magnitude term `log2(1+|q|)`.
-const R_MAG: f32 = 1.0;
-/// Weight on the `num_nonzeros` header term `log2(1+nzeros)`.
-const R_HEADER: f32 = 0.4;
 
 const BIAS_RECT: f32 = 1.0;
 const BIAS_16X16: f32 = 1.0;
@@ -177,6 +104,32 @@ thread_local! {
         const { std::cell::RefCell::new([[0.0; 1024]; 3]) };
 }
 
+/// Gather a transform footprint with edge replication, matching
+/// `build_stripe`'s padding.
+#[inline]
+fn gather_pixels(
+    plane: &crate::image::Plane<f32>,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    dst: &mut [f32],
+) {
+    let pw = plane.xsize();
+    let ph = plane.ysize();
+    let safe_w = width.min(pw.saturating_sub(px));
+    let safe_h = height.min(ph.saturating_sub(py));
+    for v in 0..height {
+        let sy = if v < safe_h { py + v } else { ph - 1 };
+        let row = plane.row(sy);
+        let drow = &mut dst[v * width..v * width + width];
+        drow[..safe_w].copy_from_slice(&row[px..px + safe_w]);
+        if safe_w < width {
+            drow[safe_w..].fill(row[pw - 1]);
+        }
+    }
+}
+
 /// Forward-transform the `strategy`'s pixel footprint at absolute pixel
 /// `(px, py)` for one channel into `out` (natural coefficient storage matching
 /// `write_ac_group`). Returns `(cx, cy)` covered-block counts after the
@@ -189,26 +142,6 @@ fn forward_transform(
     py: usize,
     out: &mut [f32; 1024],
 ) -> (usize, usize) {
-    let pw = plane.xsize();
-    let ph = plane.ysize();
-    // Gather `w×h` pixels with edge replication, matching `build_stripe`'s
-    // padding so the selection sees exactly what `write_ac_group` will transform.
-    let gather = |w: usize, h: usize, dst: &mut [f32]| {
-        let safe_w = w.min(pw.saturating_sub(px));
-        let safe_h = h.min(ph.saturating_sub(py));
-        for v in 0..h {
-            let sy = if v < safe_h { py + v } else { ph - 1 };
-            let row = plane.row(sy);
-            let drow = &mut dst[v * w..v * w + w];
-            drow[..safe_w].copy_from_slice(&row[px..px + safe_w]);
-            if safe_w < w {
-                let edge = row[pw - 1];
-                for d in &mut drow[safe_w..] {
-                    *d = edge;
-                }
-            }
-        }
-    };
     // Reused scratch: the gather fully overwrites the region each transform reads,
     // so re-zeroing a fresh `[0.0; 1024]` on every call is pure waste (this is the
     // hottest function in selection — thousands of calls per group).
@@ -216,35 +149,35 @@ fn forward_transform(
         let tmp = &mut *cell.borrow_mut();
         match strategy {
             STRATEGY_DCT => {
-                gather(8, 8, &mut tmp[..64]);
+                gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
                 (ctx.dct8x8)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT16X8 => {
-                gather(8, 16, &mut tmp[..128]);
+                gather_pixels(plane, px, py, 8, 16, &mut tmp[..128]);
                 let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
                 let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
                 (ctx.dct16x8)(src, dst);
                 (2, 1)
             }
             STRATEGY_DCT8X16 => {
-                gather(16, 8, &mut tmp[..128]);
+                gather_pixels(plane, px, py, 16, 8, &mut tmp[..128]);
                 let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
                 let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
                 (ctx.dct8x16)(src, dst);
                 (2, 1)
             }
             STRATEGY_DCT16X16 => {
-                gather(16, 16, &mut tmp[..256]);
+                gather_pixels(plane, px, py, 16, 16, &mut tmp[..256]);
                 let src: &[f32; 256] = (&tmp[..256]).try_into().unwrap();
                 let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
                 (ctx.dct16x16)(src, dst);
                 (2, 2)
             }
             STRATEGY_DCT32X32 => {
-                gather(32, 32, &mut tmp[..1024]);
+                gather_pixels(plane, px, py, 32, 32, &mut tmp[..1024]);
                 let src: &[f32; 1024] = (&tmp[..1024]).try_into().unwrap();
                 let dst: &mut [f32; 1024] = (&mut out[..1024]).try_into().unwrap();
                 (ctx.dct32x32)(src, dst);
@@ -252,7 +185,7 @@ fn forward_transform(
             }
             STRATEGY_DCT32X16 => {
                 // 16 wide × 32 tall pixels (cov 2×4); normalized (cx,cy) = (4,2).
-                gather(16, 32, &mut tmp[..512]);
+                gather_pixels(plane, px, py, 16, 32, &mut tmp[..512]);
                 let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
                 let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
                 (ctx.dct32x16)(src, dst);
@@ -260,28 +193,28 @@ fn forward_transform(
             }
             STRATEGY_DCT16X32 => {
                 // 32 wide × 16 tall pixels (cov 4×2); normalized (cx,cy) = (4,2).
-                gather(32, 16, &mut tmp[..512]);
+                gather_pixels(plane, px, py, 32, 16, &mut tmp[..512]);
                 let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
                 let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
                 (ctx.dct16x32)(src, dst);
                 (4, 2)
             }
             STRATEGY_DCT4X4 => {
-                gather(8, 8, &mut tmp[..64]);
+                gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
                 (ctx.dct4x4)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT4X8 => {
-                gather(8, 8, &mut tmp[..64]);
+                gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
                 (ctx.dct4x8)(src, dst);
                 (1, 1)
             }
             STRATEGY_DCT8X4 => {
-                gather(8, 8, &mut tmp[..64]);
+                gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
                 let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
                 let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
                 (ctx.dct8x4)(src, dst);
@@ -290,143 +223,6 @@ fn forward_transform(
             _ => unreachable!("invalid strategy {strategy}"),
         }
     })
-}
-
-/// Quantize one channel exactly as the encoder will, accumulating the threshold-
-/// aware squared quantization error (SSE, in quant-units²) and a rate estimate
-/// (bits). LLF positions (`x < cx && y < cy`, coded via the DC plane) are
-/// excluded from both, since DC coding is transform-choice-independent here.
-fn channel_rd(
-    sse_and_rate_fn: SseAndRateFn,
-    rate_log2_lut: &RateLog2Lut,
-    coeff: &[f32],
-    inv_matrix: &[f32],
-    channel: usize,
-    qac: f32,
-    qm_mult: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-) -> (f32, f32) {
-    let width = cx * 8;
-    let height = cy * 8;
-    let half = width / 2;
-    let thr = crate::enc_group::quantize_ac_thresholds(channel, cx, cy, distance);
-    let q_scaled = qac * qm_mult;
-
-    let (sse, nzeros, mag_bits) = unsafe {
-        sse_and_rate_fn(
-            coeff,
-            inv_matrix,
-            q_scaled,
-            width,
-            height,
-            half,
-            cx,
-            cy,
-            rate_log2_lut,
-            &thr,
-        )
-    };
-
-    let header = R_HEADER * rate_log2_with_lut(rate_log2_lut, nzeros as f32);
-    let bits = nzeros as f32 * R_NZ_BASE + R_MAG * mag_bits + header;
-    (sse, bits)
-}
-
-pub(crate) type SseAndRateFn = unsafe fn(
-    &[f32],
-    &[f32],
-    f32,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    &RateLog2Lut,
-    &[f32; 4],
-) -> (f32, usize, f32);
-
-fn select_sse_and_rate_fn() -> SseAndRateFn {
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return crate::avx::sse_and_rate_avx2;
-        }
-    }
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    {
-        if std::is_x86_feature_detected!("sse4.1") {
-            return crate::sse::sse_and_rate_sse;
-        }
-    }
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        crate::neon::sse_and_rate_neon
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-    {
-        crate::wasm::sse_and_rate_wasm
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", feature = "neon"),
-        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
-    )))]
-    {
-        sse_and_rate_scalar
-    }
-}
-
-static SSE_AND_RATE_FN: OnceLock<SseAndRateFn> = OnceLock::new();
-
-#[inline]
-pub(crate) fn selected_sse_and_rate_fn() -> SseAndRateFn {
-    *SSE_AND_RATE_FN.get_or_init(select_sse_and_rate_fn)
-}
-
-#[allow(unused)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sse_and_rate_scalar(
-    coeff: &[f32],
-    inv_matrix: &[f32],
-    q_scaled: f32,
-    width: usize,
-    height: usize,
-    half: usize,
-    cx: usize,
-    cy: usize,
-    rate_log2_lut: &RateLog2Lut,
-    thr: &[f32; 4],
-) -> (f32, usize, f32) {
-    let mut sse = 0.0f32;
-    let mut nzeros = 0usize;
-    let mut mag_bits = 0.0f32;
-    for y in 0..height {
-        let yfix = if y >= height / 2 { 2 } else { 0 };
-        let thr_lo = thr[yfix];
-        let thr_hi = thr[yfix + 1];
-        let row = y * width;
-        for x in 0..width {
-            if x < cx && y < cy {
-                continue; // LLF → DC plane
-            }
-            let idx = row + x;
-            let threshold = if x >= half { thr_hi } else { thr_lo };
-            let a = inv_matrix[idx] * q_scaled * coeff[idx];
-            let q = if a.abs() >= threshold {
-                a.fast_round()
-            } else {
-                0.0
-            };
-            let d = a - q;
-            sse += d * d;
-            if q != 0.0 {
-                nzeros += 1;
-                mag_bits += rate_log2_with_lut(rate_log2_lut, q.abs());
-            }
-        }
-    }
-    (sse, nzeros, mag_bits)
 }
 
 /// Full RD cost `J = D + λR` of coding `strategy` at absolute pixel `(px, py)`.
@@ -497,6 +293,69 @@ enum DistortionModel {
     Reconstruction,
 }
 
+#[inline]
+fn apply_cfl(coeffs: &mut [[f32; 1024]; 3], size: usize, cmap_factor: [f32; 3]) {
+    let [c0, c1, c2] = coeffs;
+    let y = &c1[..size];
+    for ((x, b), &yi) in c0[..size]
+        .iter_mut()
+        .zip(c2[..size].iter_mut())
+        .zip(y.iter())
+    {
+        *x -= cmap_factor[0] * yi;
+        *b -= cmap_factor[2] * yi;
+    }
+}
+
+#[inline]
+fn inverse_matrix_for(matrices: &DequantMatrices, strategy: u8, channel: usize) -> &[f32] {
+    match strategy {
+        STRATEGY_DCT => &matrices.inv_matrix(channel)[..],
+        STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(channel)[..],
+        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(channel)[..],
+        STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(channel)[..],
+        STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(channel)[..],
+        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(channel)[..],
+        _ => &matrices.inv_matrix_16x8(channel)[..],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn coefficient_dist_and_rate(
+    ctx: &EncodingContext,
+    strategy: u8,
+    coeffs: &[[f32; 1024]; 3],
+    size: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    matrices: &DequantMatrices,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+) -> (f32, f32) {
+    let mut d_total = 0.0f32;
+    let mut r_total = 0.0f32;
+    for c in 0..3 {
+        let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
+        let (d, r) = channel_rd(
+            ctx.sse_and_rate,
+            ctx.rate_log2_lut,
+            &coeffs[c][..size],
+            inverse_matrix_for(matrices, strategy, c),
+            c,
+            qac,
+            qm_mult,
+            distance,
+            cx,
+            cy,
+        );
+        d_total += CHANNEL_WEIGHT[c] * d;
+        r_total += r;
+    }
+    (d_total, r_total)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn strategy_cost_impl(
     ctx: &EncodingContext,
@@ -522,36 +381,17 @@ fn strategy_cost_impl(
         let size = cx * cy * 64;
 
         // Apply the same per-tile CfL slopes used by final coefficient coding.
-        {
-            let [c0, c1, c2] = coeffs;
-            let y = &c1[..size];
-            for ((x, b), &yi) in c0[..size]
-                .iter_mut()
-                .zip(c2[..size].iter_mut())
-                .zip(y.iter())
-            {
-                *x -= cmap_factor[0] * yi;
-                *b -= cmap_factor[2] * yi;
-            }
-        }
-
-        let inv = |c: usize| -> &[f32] {
-            match strategy {
-                STRATEGY_DCT => &matrices.inv_matrix(c)[..],
-                STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(c)[..],
-                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(c)[..],
-                STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(c)[..],
-                STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(c)[..],
-                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(c)[..],
-                _ => &matrices.inv_matrix_16x8(c)[..],
-            }
-        };
+        apply_cfl(coeffs, size, cmap_factor);
 
         let (d_total, r_total) = match distortion_model {
             DistortionModel::Reconstruction => recon_dist_and_rate(
                 ctx.rate_log2_lut,
                 coeffs,
-                [inv(0), inv(1), inv(2)],
+                [
+                    inverse_matrix_for(matrices, strategy, 0),
+                    inverse_matrix_for(matrices, strategy, 1),
+                    inverse_matrix_for(matrices, strategy, 2),
+                ],
                 qac,
                 qm_mult_x,
                 cmap_factor[0],
@@ -564,28 +404,9 @@ fn strategy_cost_impl(
                 px,
                 py,
             ),
-            DistortionModel::Coefficient => {
-                let mut d_total = 0.0f32;
-                let mut r_total = 0.0f32;
-                for c in 0..3 {
-                    let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
-                    let (d, r) = channel_rd(
-                        ctx.sse_and_rate,
-                        ctx.rate_log2_lut,
-                        &coeffs[c][..size],
-                        inv(c),
-                        c,
-                        qac,
-                        qm_mult,
-                        distance,
-                        cx,
-                        cy,
-                    );
-                    d_total += CHANNEL_WEIGHT[c] * d;
-                    r_total += r;
-                }
-                (d_total, r_total)
-            }
+            DistortionModel::Coefficient => coefficient_dist_and_rate(
+                ctx, strategy, coeffs, size, qac, qm_mult_x, matrices, distance, cx, cy,
+            ),
         };
         // `meta_r` prices the per-first-block AC-metadata rate (ACS + QF
         // tokens, ~2-4 bits each) the per-coefficient model can't see; charged
@@ -604,333 +425,78 @@ fn strategy_cost_impl(
     })
 }
 
-fn strategy_pixel_count(strategy: u8) -> usize {
-    let (w, h) = strategy_pixel_dims(strategy);
-    w * h
+#[derive(Clone, Copy)]
+struct Sub8Costs {
+    dct8: f32,
+    dct4x4: f32,
+    dct4x8: f32,
+    dct8x4: f32,
 }
 
-/// Feed one channel's pixel block through the strategy's forward transform.
-fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
-    use crate::dct;
-    macro_rules! fwd {
-        ($f:path, $n:literal) => {{
-            let i: &[f32; $n] = input[..$n].try_into().unwrap();
-            let o: &mut [f32; $n] = (&mut out[..$n]).try_into().unwrap();
-            $f(i, o);
-        }};
-    }
-    match strategy {
-        STRATEGY_DCT4X4 => fwd!(dct::dct4x4, 64),
-        STRATEGY_DCT4X8 => fwd!(dct::dct4x8, 64),
-        STRATEGY_DCT8X4 => fwd!(dct::dct8x4, 64),
-        STRATEGY_DCT16X8 => fwd!(dct::dct16x8, 128),
-        STRATEGY_DCT8X16 => fwd!(dct::dct8x16, 128),
-        STRATEGY_DCT16X16 => fwd!(dct::dct16x16, 256),
-        STRATEGY_DCT32X32 => fwd!(dct::dct32x32, 1024),
-        STRATEGY_DCT32X16 => fwd!(dct::dct32x16, 512),
-        STRATEGY_DCT16X32 => fwd!(dct::dct16x32, 512),
-        _ => fwd!(dct::dct8x8, 64),
-    }
-}
-
-/// Transposed forward matrix `FT[n*N + k] = coeff k from pixel-impulse n`, so a
-/// spatial reconstruction is `x[n] = N · Σ_k FT[n][k] · c[k]` (exact inverse of
-/// the uniform-energy scaled DCT, `basis_energy = N`). Cached per strategy.
-fn forward_matrix(strategy: u8) -> &'static [f32] {
-    static M: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
-    &M.get_or_init(|| {
-        (0u8..10)
-            .map(|s| {
-                let n = strategy_pixel_count(s);
-                let mut ft = vec![0.0f32; n * n];
-                let mut inp = [0.0f32; 1024];
-                let mut out = [0.0f32; 1024];
-                for imp in 0..n {
-                    inp[..n].fill(0.0);
-                    inp[imp] = 1.0;
-                    forward_for(s, &inp, &mut out);
-                    ft[imp * n..imp * n + n].copy_from_slice(&out[..n]);
-                }
-                ft
-            })
-            .collect()
-    })[strategy as usize]
-}
-
-// SIMD IDCTs on AVX2/NEON, scalar butterfly fallback elsewhere.
-macro_rules! idct_simd_or_scalar {
-    ($name:ident, $n:literal, $avx:path, $neon:path, $scalar:path) => {
-        #[inline]
-        fn $name(c: &[f32; $n], o: &mut [f32; $n]) {
-            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-            if std::is_x86_feature_detected!("avx2") {
-                unsafe { $avx(c, o) };
-                return;
-            }
-            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-            {
-                unsafe { $neon(c, o) };
-                return;
-            }
-            #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
-            $scalar(c, o)
-        }
-    };
-}
-idct_simd_or_scalar!(
-    idct8x8,
-    64,
-    crate::avx::inv_dct8x8_avx2,
-    crate::neon::inv_dct8x8_neon,
-    crate::dct::inv_dct8x8
-);
-idct_simd_or_scalar!(
-    idct16x16,
-    256,
-    crate::avx::inv_dct16x16_avx2,
-    crate::neon::inv_dct16x16_neon,
-    crate::dct::inv_dct16x16
-);
-idct_simd_or_scalar!(
-    idct32x32,
-    1024,
-    crate::avx::inv_dct32x32_avx2,
-    crate::neon::inv_dct32x32_neon,
-    crate::dct::inv_dct32x32
-);
-idct_simd_or_scalar!(
-    idct8x16,
-    128,
-    crate::avx::inv_dct8x16_avx2,
-    crate::neon::inv_dct8x16_neon,
-    crate::dct::inv_dct8x16
-);
-idct_simd_or_scalar!(
-    idct16x8,
-    128,
-    crate::avx::inv_dct16x8_avx2,
-    crate::neon::inv_dct16x8_neon,
-    crate::dct::inv_dct16x8
-);
-idct_simd_or_scalar!(
-    idct16x32,
-    512,
-    crate::avx::inv_dct16x32_avx2,
-    crate::neon::inv_dct16x32_neon,
-    crate::dct::inv_dct16x32
-);
-idct_simd_or_scalar!(
-    idct32x16,
-    512,
-    crate::avx::inv_dct32x16_avx2,
-    crate::neon::inv_dct32x16_neon,
-    crate::dct::inv_dct32x16
-);
-
-/// Reconstruct the spatial error (IDCT of the coefficient error). All standard
-/// square and rectangular transforms use separable butterfly IDCTs, fully
-/// vectorized on NEON. Only the special sub-8 layouts fall back to the dense
-/// `N·FTᵀ·c` product.
-fn reconstruct_error(strategy: u8, coeff_err: &[f32], err_out: &mut [f32]) {
-    match strategy {
-        STRATEGY_DCT => idct8x8(
-            coeff_err[..64].try_into().unwrap(),
-            (&mut err_out[..64]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT16X16 => idct16x16(
-            coeff_err[..256].try_into().unwrap(),
-            (&mut err_out[..256]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT32X32 => idct32x32(
-            coeff_err[..1024].try_into().unwrap(),
-            (&mut err_out[..1024]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT8X16 => idct8x16(
-            coeff_err[..128].try_into().unwrap(),
-            (&mut err_out[..128]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT16X8 => idct16x8(
-            coeff_err[..128].try_into().unwrap(),
-            (&mut err_out[..128]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT16X32 => idct16x32(
-            coeff_err[..512].try_into().unwrap(),
-            (&mut err_out[..512]).try_into().unwrap(),
-        ),
-        STRATEGY_DCT32X16 => idct32x16(
-            coeff_err[..512].try_into().unwrap(),
-            (&mut err_out[..512]).try_into().unwrap(),
-        ),
-        _ => {
-            let n = strategy_pixel_count(strategy);
-            let ft = forward_matrix(strategy);
-            let nf = n as f32;
-            for (row, o) in err_out[..n].iter_mut().enumerate() {
-                let base = row * n;
-                let mut acc = 0.0f32;
-                for k in 0..n {
-                    acc += ft[base + k] * coeff_err[k];
-                }
-                *o = nf * acc;
-            }
-        }
-    }
-}
-
-thread_local! {
-    static RECON_SCRATCH: std::cell::RefCell<[[f32; 1024]; 4]> =
-        const { std::cell::RefCell::new([[0.0; 1024]; 4]) };
-}
-
-#[allow(clippy::too_many_arguments)]
-fn recon_dist_and_rate(
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
+#[inline]
+fn forward_sub8_transform(
+    ctx: &EncodingContext,
     strategy: u8,
+    input: &[f32; 64],
+    output: &mut [f32; 1024],
+) {
+    let dst: &mut [f32; 64] = (&mut output[..64]).try_into().unwrap();
+    match strategy {
+        STRATEGY_DCT => (ctx.dct8x8)(input, dst),
+        STRATEGY_DCT4X4 => (ctx.dct4x4)(input, dst),
+        STRATEGY_DCT4X8 => (ctx.dct4x8)(input, dst),
+        STRATEGY_DCT8X4 => (ctx.dct8x4)(input, dst),
+        _ => unreachable!("non-sub8 strategy {strategy}"),
+    }
+}
+
+/// Evaluate all sub-8 candidates after gathering each channel's shared 8x8
+/// footprint once. `cached_dct8` is the identical first-pass incumbent cost;
+/// it is absent only for an odd edge block that was not part of a 2x2 superblock.
+#[allow(clippy::too_many_arguments)]
+fn sub8_strategy_costs(
+    ctx: &EncodingContext,
     opsin: &Image3F,
     px: usize,
     py: usize,
-) -> (f32, f32) {
-    let n = strategy_pixel_count(strategy);
-    let width = cx * 8;
-    let height = cy * 8;
-    let half = width / 2;
-    let (pw, ph) = strategy_pixel_dims(strategy);
-    let thr = [
-        crate::enc_group::quantize_ac_thresholds(0, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(1, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(2, cx, cy, distance),
-    ];
-    let qs = [qac * qm_mult_x, qac, qac];
+    qac: f32,
+    qm_mult_x: f32,
+    matrices: &DequantMatrices,
+    meta_r: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    cached_dct8: Option<f32>,
+) -> Sub8Costs {
+    let mut pixels = [[0.0f32; 64]; 3];
+    for (c, input) in pixels.iter_mut().enumerate() {
+        gather_pixels(opsin.plane(c), px, py, 8, 8, input);
+    }
 
-    RECON_SCRATCH.with_borrow_mut(|buf| {
-        let (cerr_all, rest) = buf.split_at_mut(3);
-        let serr = &mut rest[0];
-        let mut r_total = 0.0f32;
-        // Per channel: coefficient error field (LLF/DC excluded → 0) + rate.
-        for c in 0..3 {
-            let cerr = &mut cerr_all[c];
-            let (mut nz, mut mag) = (0usize, 0.0f32);
-            for y in 0..height {
-                let yfix = if y >= height / 2 { 2 } else { 0 };
-                for x in 0..width {
-                    let idx = y * width + x;
-                    if x < cx && y < cy {
-                        cerr[idx] = 0.0; // LLF → DC plane, no AC error here
-                        continue;
-                    }
-                    let t = if x >= half {
-                        thr[c][yfix + 1]
-                    } else {
-                        thr[c][yfix]
-                    };
-                    let im = inv[c][idx];
-                    let a = im * qs[c] * coeffs[c][idx];
-                    let q = if a.abs() >= t { a.fast_round() } else { 0.0 };
-                    cerr[idx] = (a - q) / (im * qs[c]); // dequant coeff error
-                    if q != 0.0 {
-                        nz += 1;
-                        mag += rate_log2_with_lut(rate_log2_lut, q.abs());
-                    }
-                }
+    SC_COEFFS_SCRATCH.with(|cell| {
+        let coeffs = &mut *cell.borrow_mut();
+        let mut evaluate = |strategy| {
+            for c in 0..3 {
+                forward_sub8_transform(ctx, strategy, &pixels[c], &mut coeffs[c]);
             }
-            let header = R_HEADER * rate_log2_with_lut(rate_log2_lut, nz as f32);
-            r_total += nz as f32 * R_NZ_BASE + R_MAG * mag + header;
-        }
+            apply_cfl(coeffs, 64, cmap_factor);
+            let (distortion, rate) = coefficient_dist_and_rate(
+                ctx, strategy, coeffs, 64, qac, qm_mult_x, matrices, distance, 1, 1,
+            );
+            distortion + RD_LAMBDA * (rate + meta_r)
+        };
 
-        // Spatial error per channel (reuse serr for each; accumulate D inline).
-        // First reconstruct Y (needed for CfL), keep it.
-        let mut yerr = [0.0f32; 1024];
-        reconstruct_error(strategy, &cerr_all[1][..n], &mut yerr[..n]);
-
-        let mut d_total = 0.0f32;
-        let mut errbuf = [0.0f32; 1024];
-        let mut recon = [0.0f32; 1024];
-        let mut origbuf = [0.0f32; 1024];
-        for c in 0..3 {
-            // Per-channel decoder error (pixel space), decoder-order CfL folded in.
-            let f = if c == 0 { factor_x } else { factor_b };
-            let err: &[f32] = if c == 1 {
-                &yerr[..n]
-            } else {
-                reconstruct_error(strategy, &cerr_all[c][..n], &mut serr[..n]);
-                for idx in 0..n {
-                    errbuf[idx] = serr[idx] + f * yerr[idx];
-                }
-                &errbuf[..n]
-            };
-            // recon = original − error, then windowed structural deficit.
-            let plane = opsin.plane(c);
-            let (cw, chh) = (plane.xsize(), plane.ysize());
-            for iy in 0..ph {
-                let row = plane.row((py + iy).min(chh - 1));
-                for ix in 0..pw {
-                    let i = iy * pw + ix;
-                    let o = row[(px + ix).min(cw - 1)];
-                    origbuf[i] = o;
-                    recon[i] = o - err[i];
-                }
-            }
-            d_total += CHANNEL_WEIGHT[c] * ssim_deficit(&origbuf[..n], &recon[..n], pw, ph);
+        let dct8 = if let Some(cost) = cached_dct8 {
+            cost
+        } else {
+            evaluate(STRATEGY_DCT)
+        };
+        Sub8Costs {
+            dct8,
+            dct4x4: evaluate(STRATEGY_DCT4X4),
+            dct4x8: evaluate(STRATEGY_DCT4X8),
+            dct8x4: evaluate(STRATEGY_DCT8X4),
         }
-        (d_total, r_total)
     })
-}
-
-/// Sum of `(1 − SSIM)·window_pixels` over non-overlapping 8×8 windows — a
-/// structural distortion comparable across transform sizes (a 32×32 candidate
-/// has 16 windows, a tiled 8×8 has one each).
-fn ssim_deficit(orig: &[f32], recon: &[f32], pw: usize, ph: usize) -> f32 {
-    const C1: f32 = 1e-4;
-    const C2: f32 = 9e-4;
-    let (wx, wy) = (pw / 8, ph / 8);
-    let mut d = 0.0f32;
-    for wyi in 0..wy {
-        for wxi in 0..wx {
-            let (x0, y0) = (wxi * 8, wyi * 8);
-            let (mut so, mut sr, mut soo, mut srr, mut sor) = (0.0f32, 0.0, 0.0, 0.0, 0.0);
-            for yy in 0..8 {
-                for xx in 0..8 {
-                    let i = (y0 + yy) * pw + (x0 + xx);
-                    let (o, r) = (orig[i], recon[i]);
-                    so += o;
-                    sr += r;
-                    soo += o * o;
-                    srr += r * r;
-                    sor += o * r;
-                }
-            }
-            let (mo, mr) = (so / 64.0, sr / 64.0);
-            let vo = soo / 64.0 - mo * mo;
-            let vr = srr / 64.0 - mr * mr;
-            let cov = sor / 64.0 - mo * mr;
-            let ssim = ((2.0 * mo * mr + C1) * (2.0 * cov + C2))
-                / ((mo * mo + mr * mr + C1) * (vo + vr + C2));
-            d += (1.0 - ssim) * 64.0;
-        }
-    }
-    d
-}
-
-/// Pixel footprint (width, height) each strategy gathers/transforms.
-fn strategy_pixel_dims(strategy: u8) -> (usize, usize) {
-    match strategy {
-        STRATEGY_DCT16X8 => (8, 16),
-        STRATEGY_DCT8X16 => (16, 8),
-        STRATEGY_DCT16X16 => (16, 16),
-        STRATEGY_DCT32X16 => (16, 32),
-        STRATEGY_DCT16X32 => (32, 16),
-        STRATEGY_DCT32X32 => (32, 32),
-        _ => (8, 8),
-    }
 }
 
 #[inline]
@@ -961,6 +527,9 @@ fn select_super_block(
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
+    dct8_costs: &mut [f32],
+    dct8_cost_y0: usize,
+    dct8_cost_stride: usize,
 ) -> SuperBlockCost {
     let cmap_factor = cmap_factors(ytox_map, ytob_map, bx0, by0);
 
@@ -984,6 +553,7 @@ fn select_super_block(
                 distance,
                 cmap_factor,
             );
+            dct8_costs[(by0 + dy - dct8_cost_y0) * dct8_cost_stride + bx0 + dx] = c8[dy][dx];
         }
     }
 
@@ -1241,6 +811,9 @@ fn select_band(
     y_begin: usize,
     y_end: usize,
 ) -> f32 {
+    // First-pass DCT8 incumbents are consumed again by the sub-8 refinement.
+    // Keep only this worker's row band so parallel selection stays independent.
+    let mut dct8_costs = vec![f32::NAN; xsize * (y_end - y_begin)];
     let mut by = y_begin;
     while by + 1 < ysize && by < y_end {
         // A 4-block-tall band can host DCT32X32 only when 4-aligned and fitting.
@@ -1272,6 +845,9 @@ fn select_band(
                             ytox_map,
                             ytob_map,
                             ac_strategy,
+                            &mut dct8_costs,
+                            y_begin,
+                            xsize,
                         );
                         sub_total += costs.chosen;
                         dct8_total += costs.dct8;
@@ -1417,6 +993,9 @@ fn select_band(
                         ytox_map,
                         ytob_map,
                         ac_strategy,
+                        &mut dct8_costs,
+                        y_begin,
+                        xsize,
                     );
                 }
                 bx += 2;
@@ -1438,6 +1017,9 @@ fn select_band(
                     ytox_map,
                     ytob_map,
                     ac_strategy,
+                    &mut dct8_costs,
+                    y_begin,
+                    xsize,
                 );
                 bx += 2;
             }
@@ -1456,9 +1038,9 @@ fn select_band(
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
             let cmap_factor = cmap_factors(ytox_map, ytob_map, bx, by);
-            let cost8 = strategy_cost(
+            let cached_dct8 = dct8_costs[(by - y_begin) * xsize + bx];
+            let costs = sub8_strategy_costs(
                 ctx,
-                STRATEGY_DCT,
                 opsin,
                 px,
                 py,
@@ -1468,49 +1050,12 @@ fn select_band(
                 meta_r,
                 distance,
                 cmap_factor,
+                cached_dct8.is_finite().then_some(cached_dct8),
             );
-            let cost4 = BIAS_4X4
-                * strategy_cost(
-                    ctx,
-                    STRATEGY_DCT4X4,
-                    opsin,
-                    px,
-                    py,
-                    qac,
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
-            let cost48 = BIAS_4X8
-                * strategy_cost(
-                    ctx,
-                    STRATEGY_DCT4X8,
-                    opsin,
-                    px,
-                    py,
-                    qac,
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
-            let cost84 = BIAS_4X8
-                * strategy_cost(
-                    ctx,
-                    STRATEGY_DCT8X4,
-                    opsin,
-                    px,
-                    py,
-                    qac,
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
+            let cost8 = costs.dct8;
+            let cost4 = BIAS_4X4 * costs.dct4x4;
+            let cost48 = BIAS_4X8 * costs.dct4x8;
+            let cost84 = BIAS_4X8 * costs.dct8x4;
             // Choose the cheapest sub-8×8 candidate, and take it only if it beats
             // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
             // horizontal res) are transposes that suit opposite edge orientations.
@@ -1744,13 +1289,19 @@ fn rerank_large_transforms(
 mod tests {
     use super::{
         DCT8_ONLY_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ, MERGE_MARGIN_PAIR_HQ,
-        aggregate_qac_2x2, aggregate_quant, cmap_factors, forward_for, forward_matrix,
-        merge_beats_dct8, merge_margin, reconstruct_error, strategy_pixel_count, use_dct8_only,
+        aggregate_qac_2x2, aggregate_quant, cmap_factors, merge_beats_dct8, merge_margin,
+        strategy_cost, sub8_strategy_costs, use_dct8_only,
     };
     use crate::dc_group_data::{
-        STRATEGY_DCT, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+        STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT16X8,
+        STRATEGY_DCT16X16, STRATEGY_DCT32X32,
     };
-    use crate::image::ImageSB;
+    use crate::encoding_context::EncodingContext;
+    use crate::image::{Image3F, ImageSB};
+    use crate::inflated_cost::{
+        forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
+    };
+    use crate::quant_weights::DequantMatrices;
 
     #[test]
     fn high_quality_dct8_cutoff_is_half_distance() {
@@ -1760,6 +1311,93 @@ mod tests {
         assert!(use_dct8_only(0.5));
         assert!(!use_dct8_only(0.500_001));
         assert!(!use_dct8_only(1.0));
+    }
+
+    #[test]
+    fn bundled_sub8_costs_match_independent_evaluation_and_cached_dct8() {
+        let mut opsin = Image3F::new(11, 13);
+        let mut state = 0x1234_5678u32;
+        for c in 0..3 {
+            for y in 0..opsin.ysize() {
+                for value in opsin.plane_mut(c).row_mut(y) {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *value = (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                }
+            }
+        }
+
+        let ctx = EncodingContext::new();
+        let matrices = DequantMatrices::new();
+        let (px, py) = (7usize, 9usize); // exercise right and bottom replication
+        let qac = 3.75;
+        let qm_mult_x = 1.25;
+        let meta_r = 0.4;
+        let distance = 1.5;
+        let cmap = [0.25, 0.0, -0.375];
+        let independent = [
+            strategy_cost(
+                &ctx,
+                STRATEGY_DCT,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                &matrices,
+                meta_r,
+                distance,
+                cmap,
+            ),
+            strategy_cost(
+                &ctx,
+                STRATEGY_DCT4X4,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                &matrices,
+                meta_r,
+                distance,
+                cmap,
+            ),
+            strategy_cost(
+                &ctx,
+                STRATEGY_DCT4X8,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                &matrices,
+                meta_r,
+                distance,
+                cmap,
+            ),
+            strategy_cost(
+                &ctx,
+                STRATEGY_DCT8X4,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                &matrices,
+                meta_r,
+                distance,
+                cmap,
+            ),
+        ];
+
+        for cached in [None, Some(independent[0])] {
+            let bundled = sub8_strategy_costs(
+                &ctx, &opsin, px, py, qac, qm_mult_x, &matrices, meta_r, distance, cmap, cached,
+            );
+            let actual = [bundled.dct8, bundled.dct4x4, bundled.dct4x8, bundled.dct8x4];
+            for (a, b) in actual.into_iter().zip(independent) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
     }
 
     #[test]

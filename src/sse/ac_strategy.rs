@@ -58,7 +58,7 @@ pub(crate) fn sse_and_rate_sse(
     half: usize,
     cx: usize,
     cy: usize,
-    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -143,10 +143,13 @@ pub(crate) fn sse_and_rate_sse(
             let nz = _mm_cmpgt_ps(absq, zero);
             let rate_mask = _mm_and_ps(nz, active);
 
-            nzeros += _mm_movemask_ps(rate_mask).count_ones() as usize;
+            let rate_bits = _mm_movemask_ps(rate_mask);
+            nzeros += rate_bits.count_ones() as usize;
 
-            let ratev = sse_log2p1_f32(absq);
-            mag_acc = _mm_add_ps(mag_acc, _mm_and_ps(ratev, rate_mask));
+            if rate_bits != 0 {
+                let ratev = sse_log2p1_f32(absq);
+                mag_acc = _mm_add_ps(mag_acc, _mm_and_ps(ratev, rate_mask));
+            }
         }
     }
 
@@ -172,10 +175,7 @@ fn sse_log2p1_f32(x: __m128) -> __m128 {
     );
     let m = _mm_castsi128_ps(mant_bits);
 
-    let one = _mm_set1_ps(1.0);
-    let s = _mm_div_ps(_mm_sub_ps(m, one), _mm_add_ps(m, one));
-
-    let t = _mm_sub_ps(m, one);
+    let t = _mm_sub_ps(m, _mm_set1_ps(1.0));
 
     // stats/log2p1.sollya
     let c0 = _mm_set1_ps(1.4426934719085693359375);
@@ -194,7 +194,7 @@ fn sse_log2p1_f32(x: __m128) -> __m128 {
     p = _mm_add_ps(c1, _mm_mul_ps(t, p));
     p = _mm_add_ps(c0, _mm_mul_ps(t, p));
 
-    let log2_m = _mm_mul_ps(s, p);
+    let log2_m = _mm_mul_ps(t, p);
 
     _mm_add_ps(e, log2_m)
 }
@@ -202,6 +202,14 @@ fn sse_log2p1_f32(x: __m128) -> __m128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sse_and_rate_sse_vs_reference() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(sse_and_rate_sse);
+    }
 
     #[test]
     fn test_log2p1() {
