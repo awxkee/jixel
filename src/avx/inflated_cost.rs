@@ -1,0 +1,420 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+use crate::avx::ac_strategy::{avx2_log2p1_f32, hsum256};
+use crate::image::{Image3F, Plane};
+use crate::inflated_cost::{RateLog2Lut, recon_dist_and_rate_with_kernels, validate_ssim_inputs};
+use std::arch::x86_64::*;
+
+/// # Safety
+/// The caller must ensure AVX2 is available. Slice bounds are validated before
+/// any vector load or store.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn recon_dist_and_rate_avx2(
+    rate_log2_lut: &RateLog2Lut,
+    coeffs: &[[f32; 1024]; 3],
+    inv: [&[f32]; 3],
+    qac: f32,
+    qm_mult_x: f32,
+    factor_x: f32,
+    factor_b: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+) -> (f32, f32) {
+    recon_dist_and_rate_with_kernels(
+        rate_log2_lut,
+        coeffs,
+        inv,
+        qac,
+        qm_mult_x,
+        factor_x,
+        factor_b,
+        distance,
+        cx,
+        cy,
+        strategy,
+        opsin,
+        px,
+        py,
+        recon_quantize_avx2,
+        ssim_deficit_avx2,
+        prepare_reconstruction_avx2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+fn recon_quantize_avx2(
+    coeff: &[f32],
+    inv: &[f32],
+    quant_scale: f32,
+    thresholds: &[f32; 4],
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    coeff_error: &mut [f32],
+    _rate_log2_lut: &RateLog2Lut,
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("coefficient size overflow");
+    assert!(width.is_multiple_of(8));
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    let scale = _mm256_set1_ps(quant_scale);
+    let sign = _mm256_set1_ps(-0.0);
+    let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let all = _mm256_set1_epi32(-1);
+    const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+    let mut nonzero = 0usize;
+    let mut magnitude_bits = _mm256_setzero_ps();
+
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
+        .chunks_exact(width)
+        .zip(inv.chunks_exact(width))
+        .zip(coeff_error.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(inv_row.as_chunks::<8>().0.iter())
+            .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
+            .enumerate()
+        {
+            let x = chunk_x * 8;
+            let threshold = if x + 8 <= half {
+                _mm256_set1_ps(thresholds[yfix])
+            } else if x >= half {
+                _mm256_set1_ps(thresholds[yfix + 1])
+            } else {
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                let high = _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(half as i32 - 1));
+                _mm256_blendv_ps(
+                    _mm256_set1_ps(thresholds[yfix]),
+                    _mm256_set1_ps(thresholds[yfix + 1]),
+                    _mm256_castsi256_ps(high),
+                )
+            };
+            let coeff_v = unsafe { _mm256_loadu_ps(coeff8.as_ptr()) };
+            let inv_v = unsafe { _mm256_loadu_ps(inv8.as_ptr()) };
+            let denominator = _mm256_mul_ps(inv_v, scale);
+            let scaled = _mm256_mul_ps(denominator, coeff_v);
+            let absolute = _mm256_andnot_ps(sign, scaled);
+            let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
+            let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
+            let error = _mm256_div_ps(_mm256_sub_ps(scaled, quantized), denominator);
+
+            let active_i = if y < cy && x < cx {
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(cx as i32 - 1))
+            } else {
+                all
+            };
+            let active = _mm256_castsi256_ps(active_i);
+            unsafe {
+                _mm256_storeu_ps(error8.as_mut_ptr(), _mm256_and_ps(error, active));
+            }
+            let active_quantized = _mm256_and_ps(quantized, active);
+            let absolute_q = _mm256_andnot_ps(sign, active_quantized);
+            let nonzero_mask = _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps());
+            nonzero += _mm256_movemask_ps(nonzero_mask).count_ones() as usize;
+            magnitude_bits = _mm256_add_ps(
+                magnitude_bits,
+                _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
+            );
+        }
+    }
+    let header_input = _mm256_setr_ps(nonzero as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let header = _mm_cvtss_f32(_mm256_castps256_ps128(avx2_log2p1_f32(header_input)));
+    nonzero as f32 * 1.6 + hsum256(magnitude_bits) + 0.4 * header
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+fn prepare_reconstruction_avx2(
+    plane: &Plane<f32>,
+    px: usize,
+    py: usize,
+    pixel_width: usize,
+    pixel_height: usize,
+    error: &[f32],
+    original: &mut [f32],
+    reconstructed: &mut [f32],
+) {
+    let n = pixel_width
+        .checked_mul(pixel_height)
+        .expect("reconstruction size overflow");
+    assert!(pixel_width.is_multiple_of(8));
+    assert!(error.len() >= n && original.len() >= n && reconstructed.len() >= n);
+    let (image_width, image_height) = (plane.xsize(), plane.ysize());
+    assert!(image_width != 0 && image_height != 0);
+    let source_x = px.min(image_width - 1);
+    let copied = pixel_width.min(image_width - source_x);
+    for (y, ((original_row, reconstructed_row), error_row)) in original
+        .chunks_exact_mut(pixel_width)
+        .zip(reconstructed.chunks_exact_mut(pixel_width))
+        .zip(error.chunks_exact(pixel_width))
+        .take(pixel_height)
+        .enumerate()
+    {
+        let source = plane.row(py.saturating_add(y).min(image_height - 1));
+        original_row[..copied].copy_from_slice(&source[source_x..source_x + copied]);
+        original_row[copied..].fill(source[image_width - 1]);
+        for ((output, value), delta) in reconstructed_row
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(original_row.as_chunks::<8>().0.iter())
+            .zip(error_row.as_chunks::<8>().0.iter())
+        {
+            let values = unsafe { _mm256_loadu_ps(value.as_ptr()) };
+            let errors = unsafe { _mm256_loadu_ps(delta.as_ptr()) };
+            unsafe { _mm256_storeu_ps(output.as_mut_ptr(), _mm256_sub_ps(values, errors)) };
+        }
+    }
+}
+
+/// # Safety
+/// The caller must ensure AVX2 is available. Dimensions and slice lengths are
+/// checked before vector access.
+#[target_feature(enable = "avx2")]
+pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
+    validate_ssim_inputs(orig, recon, width, height);
+    const C1: f32 = 1e-4;
+    const C2: f32 = 9e-4;
+    const INV_64: f32 = 1.0 / 64.0;
+    let mut deficit = 0.0f32;
+    for wy in 0..height / 8 {
+        for wx in 0..width / 8 {
+            let (x0, y0) = (wx * 8, wy * 8);
+            let base_index = y0 * width + x0;
+            let base_o = orig[base_index];
+            let base_r = recon[base_index];
+            let base_ov = _mm256_set1_ps(base_o);
+            let base_rv = _mm256_set1_ps(base_r);
+            let (mut sum_o, mut sum_r) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for (orig_row, recon_row) in orig
+                .chunks_exact(width)
+                .zip(recon.chunks_exact(width))
+                .skip(y0)
+                .take(8)
+            {
+                sum_o = _mm256_add_ps(
+                    sum_o,
+                    _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig_row[x0..].as_ptr()) }, base_ov),
+                );
+                sum_r = _mm256_add_ps(
+                    sum_r,
+                    _mm256_sub_ps(
+                        unsafe { _mm256_loadu_ps(recon_row[x0..].as_ptr()) },
+                        base_rv,
+                    ),
+                );
+            }
+            let mean_o = base_o + hsum256(sum_o) * INV_64;
+            let mean_r = base_r + hsum256(sum_r) * INV_64;
+            let mean_ov = _mm256_set1_ps(mean_o);
+            let mean_rv = _mm256_set1_ps(mean_r);
+            let (mut var_o, mut var_r, mut cov) = (
+                _mm256_setzero_ps(),
+                _mm256_setzero_ps(),
+                _mm256_setzero_ps(),
+            );
+            for (orig_row, recon_row) in orig
+                .chunks_exact(width)
+                .zip(recon.chunks_exact(width))
+                .skip(y0)
+                .take(8)
+            {
+                let o = _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig_row[x0..].as_ptr()) }, mean_ov);
+                let r = _mm256_sub_ps(
+                    unsafe { _mm256_loadu_ps(recon_row[x0..].as_ptr()) },
+                    mean_rv,
+                );
+                var_o = _mm256_add_ps(var_o, _mm256_mul_ps(o, o));
+                var_r = _mm256_add_ps(var_r, _mm256_mul_ps(r, r));
+                cov = _mm256_add_ps(cov, _mm256_mul_ps(o, r));
+            }
+            let vo = hsum256(var_o) * INV_64;
+            let vr = hsum256(var_r) * INV_64;
+            let covariance = hsum256(cov) * INV_64;
+            let luminance = (2.0 * mean_o * mean_r + C1) / (mean_o * mean_o + mean_r * mean_r + C1);
+            let structure = (2.0 * covariance + C2) / (vo + vr + C2);
+            deficit += (1.0 - luminance * structure) * 64.0;
+        }
+    }
+    deficit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
+    use crate::dc_group_data::{
+        STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
+        STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    };
+    use crate::image::Image3F;
+    use crate::inflated_cost::{rate_log2_lut, recon_dist_and_rate_scalar, ssim_deficit_scalar};
+
+    fn available() -> bool {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
+    }
+
+    #[test]
+    fn ssim_avx2_matches_scalar() {
+        if !available() {
+            return;
+        }
+        let mut state = 91u32;
+        for (width, height) in [(8, 8), (16, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = width * height;
+            let mut orig = vec![0.0f32; n];
+            let mut recon = vec![0.0f32; n];
+            for i in 0..n {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                orig[i] = (state >> 8) as f32 / (1u32 << 24) as f32;
+                recon[i] = orig[i] + ((i % 13) as f32 - 6.0) * 0.0007;
+            }
+            let scalar = ssim_deficit_scalar(&orig, &recon, width, height);
+            let simd = unsafe { ssim_deficit_avx2(&orig, &recon, width, height) };
+            let tolerance = 2e-4f32.max(scalar.abs() * 2e-5);
+            assert!(
+                (simd - scalar).abs() <= tolerance,
+                "{width}x{height}: simd={simd} scalar={scalar}"
+            );
+        }
+    }
+
+    #[test]
+    fn recon_avx2_matches_scalar_for_all_standard_transforms() {
+        if !available() {
+            return;
+        }
+        let mut image = Image3F::new(40, 40);
+        for c in 0..3 {
+            for y in 0..40 {
+                for x in 0..40 {
+                    image.plane_mut(c).row_mut(y)[x] =
+                        0.15 * c as f32 + 0.003 * x as f32 + 0.002 * y as f32;
+                }
+            }
+        }
+        let mut coeffs = [[0.0f32; 1024]; 3];
+        let mut state = 17u32;
+        for channel in &mut coeffs {
+            for value in channel {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0;
+            }
+        }
+        let inv_storage = [vec![1.0f32; 1024], vec![0.9f32; 1024], vec![1.1f32; 1024]];
+        for (strategy, cx, cy) in [
+            (STRATEGY_DCT, 1, 1),
+            (STRATEGY_DCT8X16, 2, 1),
+            (STRATEGY_DCT16X8, 2, 1),
+            (STRATEGY_DCT16X16, 2, 2),
+            (STRATEGY_DCT16X32, 4, 2),
+            (STRATEGY_DCT32X16, 4, 2),
+            (STRATEGY_DCT32X32, 4, 4),
+        ] {
+            let inv = [
+                &inv_storage[0][..],
+                &inv_storage[1][..],
+                &inv_storage[2][..],
+            ];
+            let scalar = recon_dist_and_rate_scalar(
+                rate_log2_lut(),
+                &coeffs,
+                inv,
+                7.0,
+                1.2,
+                0.15,
+                -0.1,
+                1.5,
+                cx,
+                cy,
+                strategy,
+                &image,
+                3,
+                5,
+            );
+            let simd = unsafe {
+                recon_dist_and_rate_avx2(
+                    rate_log2_lut(),
+                    &coeffs,
+                    inv,
+                    7.0,
+                    1.2,
+                    0.15,
+                    -0.1,
+                    1.5,
+                    cx,
+                    cy,
+                    strategy,
+                    &image,
+                    3,
+                    5,
+                )
+            };
+            let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);
+            assert!(
+                (simd.1 - scalar.1).abs() <= rate_tolerance,
+                "strategy {strategy} rate: simd={} scalar={}",
+                simd.1,
+                scalar.1
+            );
+            let tolerance = 5e-4f32.max(scalar.0.abs() * 3e-5);
+            assert!(
+                (simd.0 - scalar.0).abs() <= tolerance,
+                "strategy {strategy}: simd={simd:?} scalar={scalar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssim_avx2_rejects_short_slices_before_loading() {
+        if !available() {
+            return;
+        }
+        let result =
+            std::panic::catch_unwind(|| unsafe { ssim_deficit_avx2(&[0.0; 63], &[0.0; 64], 8, 8) });
+        assert!(result.is_err());
+    }
+}

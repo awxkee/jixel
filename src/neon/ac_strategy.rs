@@ -45,7 +45,7 @@ pub(crate) fn sse_and_rate_neon(
     half: usize,
     cx: usize,
     cy: usize,
-    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -54,8 +54,7 @@ pub(crate) fn sse_and_rate_neon(
 
     let qs = vdupq_n_f32(q_scaled);
     let mut sse_acc = vdupq_n_f32(0.0);
-    let mut nzeros = 0usize;
-
+    let mut nz_acc = vdupq_n_u32(0);
     let mut mag_acc = vdupq_n_f32(0.0);
     let zero = vdupq_n_f32(0.0);
     let all_active = vdupq_n_u32(u32::MAX);
@@ -110,18 +109,28 @@ pub(crate) fn sse_and_rate_neon(
             let nz = vcgtq_f32(absq, zero);
             let rate_mask = vandq_u32(nz, active);
 
-            nzeros += vaddvq_u32(vshrq_n_u32::<31>(rate_mask)) as usize;
+            // Keep the count lane-local until the end. A horizontal reduction
+            // for every four coefficients was a sizeable part of this loop.
+            nz_acc = vaddq_u32(nz_acc, vshrq_n_u32::<31>(rate_mask));
 
-            let ratev = neon_log2p1_f32(absq);
-            mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate_mask, ratev, zero));
+            // Quantized AC coefficients are commonly zero. Do not run the
+            // seven-FMA logarithm when none of this vector contributes rate.
+            if vmaxvq_u32(rate_mask) != 0 {
+                let ratev = neon_log2p1_f32(absq);
+                mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate_mask, ratev, zero));
+            }
         }
     }
-    (vaddvq_f32(sse_acc), nzeros, vaddvq_f32(mag_acc))
+    (
+        vaddvq_f32(sse_acc),
+        vaddvq_u32(nz_acc) as usize,
+        vaddvq_f32(mag_acc),
+    )
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn neon_log2p1_f32(x: float32x4_t) -> float32x4_t {
+pub(crate) fn neon_log2p1_f32(x: float32x4_t) -> float32x4_t {
     // y = 1 + x
     let y = vaddq_f32(x, vdupq_n_f32(1.0));
 
@@ -164,8 +173,105 @@ fn neon_log2p1_f32(x: float32x4_t) -> float32x4_t {
 
 #[cfg(test)]
 mod tests {
-    use crate::neon::ac_strategy::neon_log2p1_f32;
+    use super::{neon_log2p1_f32, sse_and_rate_neon};
     use std::arch::aarch64::{vdupq_n_f32, vgetq_lane_f32};
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        coeff: &[f32],
+        inv: &[f32],
+        qs: f32,
+        w: usize,
+        h: usize,
+        half: usize,
+        cx: usize,
+        cy: usize,
+        thr: &[f32; 4],
+    ) -> (f32, usize, f32) {
+        let (mut sse, mut nzeros, mut mag_bits) = (0.0f32, 0usize, 0.0f32);
+        for y in 0..h {
+            let yfix = if y >= h / 2 { 2 } else { 0 };
+            for x in 0..w {
+                if x < cx && y < cy {
+                    continue;
+                }
+                let i = y * w + x;
+                let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
+                let a = inv[i] * qs * coeff[i];
+                let q = if a.abs() >= threshold {
+                    a.round_ties_even()
+                } else {
+                    0.0
+                };
+                let d = a - q;
+                sse += d * d;
+                if q != 0.0 {
+                    nzeros += 1;
+                    mag_bits += (1.0 + q.abs()).log2();
+                }
+            }
+        }
+        (sse, nzeros, mag_bits)
+    }
+
+    #[test]
+    fn test_sse_and_rate_neon_vs_reference() {
+        let mut state = 0x5e5e_a11d_0f00_d00du64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32 as f32 / u32::MAX as f32
+        };
+
+        for &(w, h, half, cx, cy) in &[
+            (8usize, 8usize, 4usize, 1usize, 1usize),
+            (16, 8, 8, 2, 1),
+            (8, 16, 4, 1, 2),
+            (16, 16, 8, 2, 2),
+            (32, 32, 16, 4, 4),
+        ] {
+            for case in 0..100 {
+                let n = w * h;
+                // Alternate sparse and dense inputs so the all-zero-vector
+                // fast path and the logarithm path are both exercised.
+                let coeff_scale = if case % 2 == 0 { 0.2 } else { 200.0 };
+                let coeff: Vec<f32> = (0..n).map(|_| (random() - 0.5) * coeff_scale).collect();
+                let inv: Vec<f32> = (0..n).map(|_| 0.001 + random() * 0.5).collect();
+                let qs = 0.5 + random() * 3.0;
+                let thr = [
+                    random() * 0.6,
+                    random() * 0.6,
+                    random() * 0.6,
+                    random() * 0.6,
+                ];
+                let expected = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr);
+                let actual = unsafe {
+                    sse_and_rate_neon(
+                        &coeff,
+                        &inv,
+                        qs,
+                        w,
+                        h,
+                        half,
+                        cx,
+                        cy,
+                        crate::inflated_cost::rate_log2_lut(),
+                        &thr,
+                    )
+                };
+
+                assert_eq!(actual.1, expected.1, "nzeros mismatch for {w}x{h}");
+                let sse_rel = (actual.0 - expected.0).abs() / expected.0.abs().max(1.0);
+                let mag_rel = (actual.2 - expected.2).abs() / expected.2.abs().max(1.0);
+                assert!(sse_rel < 1e-4, "SSE relative error {sse_rel} for {w}x{h}");
+                assert!(
+                    mag_rel < 1e-5,
+                    "magnitude-rate relative error {mag_rel} for {w}x{h}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_log2p1() {

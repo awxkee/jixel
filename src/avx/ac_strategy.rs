@@ -30,7 +30,7 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx")]
-fn hsum256(v: __m256) -> f32 {
+pub(crate) fn hsum256(v: __m256) -> f32 {
     let lo = _mm256_castps256_ps128(v);
     let hi = _mm256_extractf128_ps::<1>(v);
     let s = _mm_add_ps(lo, hi);
@@ -56,7 +56,7 @@ pub(crate) fn sse_and_rate_avx2(
     half: usize,
     cx: usize,
     cy: usize,
-    _rate_log2_lut: &crate::enc_ac_strategy::RateLog2Lut,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
 ) -> (f32, usize, f32) {
     let n = width * height;
@@ -144,10 +144,13 @@ pub(crate) fn sse_and_rate_avx2(
             let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, zero);
             let rate_mask = _mm256_and_ps(nz, active);
 
-            nzeros += _mm256_movemask_ps(rate_mask).count_ones() as usize;
+            let rate_bits = _mm256_movemask_ps(rate_mask);
+            nzeros += rate_bits.count_ones() as usize;
 
-            let ratev = avx2_log2p1_f32(absq);
-            mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
+            if rate_bits != 0 {
+                let ratev = avx2_log2p1_f32(absq);
+                mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
+            }
         }
     }
 
@@ -156,7 +159,7 @@ pub(crate) fn sse_and_rate_avx2(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn avx2_log2p1_f32(x: __m256) -> __m256 {
+pub(crate) fn avx2_log2p1_f32(x: __m256) -> __m256 {
     // y = 1 + x
     let y = _mm256_add_ps(x, _mm256_set1_ps(1.0));
 
@@ -238,8 +241,8 @@ mod tests {
                 sse += d * d;
                 if q != 0.0 {
                     nz += 1;
-                    mb += crate::enc_ac_strategy::rate_log2_with_lut(
-                        crate::enc_ac_strategy::rate_log2_lut(),
+                    mb += crate::inflated_cost::rate_log2_with_lut(
+                        crate::inflated_cost::rate_log2_lut(),
                         q.abs(),
                     );
                 }
@@ -267,9 +270,10 @@ mod tests {
             (16, 8, 8, 2, 1),
             (8, 16, 4, 1, 2),
         ] {
-            for _ in 0..200 {
+            for case in 0..200 {
                 let n = w * h;
-                let coeff: Vec<f32> = (0..n).map(|_| (rnd() - 0.5) * 200.0).collect();
+                let coeff_scale = if case % 2 == 0 { 0.2 } else { 200.0 };
+                let coeff: Vec<f32> = (0..n).map(|_| (rnd() - 0.5) * coeff_scale).collect();
                 let inv: Vec<f32> = (0..n).map(|_| 0.001 + rnd() * 0.5).collect();
                 let qs = 0.5 + rnd() * 3.0;
                 let thr = [rnd() * 0.6, rnd() * 0.6, rnd() * 0.6, rnd() * 0.6];
@@ -284,7 +288,7 @@ mod tests {
                         half,
                         cx,
                         cy,
-                        crate::enc_ac_strategy::rate_log2_lut(),
+                        crate::inflated_cost::rate_log2_lut(),
                         &thr,
                     )
                 };

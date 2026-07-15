@@ -1,0 +1,396 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+use super::ac_strategy::neon_log2p1_f32;
+use crate::image::{Image3F, Plane};
+use crate::inflated_cost::{RateLog2Lut, recon_dist_and_rate_with_kernels, validate_ssim_inputs};
+use std::arch::aarch64::*;
+
+/// # Safety
+/// AArch64 NEON must be available. All slice bounds are validated before loads.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+pub(crate) fn recon_dist_and_rate_neon(
+    rate_log2_lut: &RateLog2Lut,
+    coeffs: &[[f32; 1024]; 3],
+    inv: [&[f32]; 3],
+    qac: f32,
+    qm_mult_x: f32,
+    factor_x: f32,
+    factor_b: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+) -> (f32, f32) {
+    recon_dist_and_rate_with_kernels(
+        rate_log2_lut,
+        coeffs,
+        inv,
+        qac,
+        qm_mult_x,
+        factor_x,
+        factor_b,
+        distance,
+        cx,
+        cy,
+        strategy,
+        opsin,
+        px,
+        py,
+        recon_quantize_neon,
+        ssim_deficit_neon,
+        prepare_reconstruction_neon,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn recon_quantize_neon(
+    coeff: &[f32],
+    inv: &[f32],
+    quant_scale: f32,
+    thresholds: &[f32; 4],
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    coeff_error: &mut [f32],
+    _rate_log2_lut: &RateLog2Lut,
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("coefficient size overflow");
+    assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    let scale = vdupq_n_f32(quant_scale);
+    let zero = vdupq_n_f32(0.0);
+    let all = vdupq_n_u32(u32::MAX);
+    let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
+    let mut nonzero = 0usize;
+    let mut magnitude_bits = vdupq_n_f32(0.0);
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
+        .chunks_exact(width)
+        .zip(inv.chunks_exact(width))
+        .zip(coeff_error.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(inv_row.as_chunks::<4>().0.iter())
+            .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+            .enumerate()
+        {
+            let x = chunk_x * 4;
+            let threshold = vdupq_n_f32(if x >= half {
+                thresholds[yfix + 1]
+            } else {
+                thresholds[yfix]
+            });
+            let coeff_v = unsafe { vld1q_f32(coeff4.as_ptr()) };
+            let inv_v = unsafe { vld1q_f32(inv4.as_ptr()) };
+            let denominator = vmulq_f32(inv_v, scale);
+            let scaled = vmulq_f32(denominator, coeff_v);
+            let keep = vcgeq_f32(vabsq_f32(scaled), threshold);
+            let quantized =
+                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndnq_f32(scaled)), keep));
+            let error = vdivq_f32(vsubq_f32(scaled, quantized), denominator);
+            let active = if y < cy && x < cx {
+                vcgeq_u32(
+                    vaddq_u32(vdupq_n_u32(x as u32), lanes),
+                    vdupq_n_u32(cx as u32),
+                )
+            } else {
+                all
+            };
+            unsafe { vst1q_f32(error4.as_mut_ptr(), vbslq_f32(active, error, zero)) };
+            let active_quantized = vbslq_f32(active, quantized, zero);
+            let absolute_q = vabsq_f32(active_quantized);
+            let nonzero_mask = vcgtq_f32(absolute_q, zero);
+            nonzero += vaddvq_u32(vshrq_n_u32::<31>(nonzero_mask)) as usize;
+            magnitude_bits = vaddq_f32(
+                magnitude_bits,
+                vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
+            );
+        }
+    }
+    let header = vgetq_lane_f32::<0>(neon_log2p1_f32(vsetq_lane_f32::<0>(
+        nonzero as f32,
+        vdupq_n_f32(0.0),
+    )));
+    nonzero as f32 * 1.6 + vaddvq_f32(magnitude_bits) + 0.4 * header
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn prepare_reconstruction_neon(
+    plane: &Plane<f32>,
+    px: usize,
+    py: usize,
+    pixel_width: usize,
+    pixel_height: usize,
+    error: &[f32],
+    original: &mut [f32],
+    reconstructed: &mut [f32],
+) {
+    let n = pixel_width
+        .checked_mul(pixel_height)
+        .expect("reconstruction size overflow");
+    assert!(pixel_width.is_multiple_of(4));
+    assert!(error.len() >= n && original.len() >= n && reconstructed.len() >= n);
+    let (image_width, image_height) = (plane.xsize(), plane.ysize());
+    assert!(image_width != 0 && image_height != 0);
+    let source_x = px.min(image_width - 1);
+    let copied = pixel_width.min(image_width - source_x);
+    for (y, ((original_row, reconstructed_row), error_row)) in original
+        .chunks_exact_mut(pixel_width)
+        .zip(reconstructed.chunks_exact_mut(pixel_width))
+        .zip(error.chunks_exact(pixel_width))
+        .take(pixel_height)
+        .enumerate()
+    {
+        let source = plane.row(py.saturating_add(y).min(image_height - 1));
+        original_row[..copied].copy_from_slice(&source[source_x..source_x + copied]);
+        original_row[copied..].fill(source[image_width - 1]);
+        for ((output, value), delta) in reconstructed_row
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(original_row.as_chunks::<4>().0.iter())
+            .zip(error_row.as_chunks::<4>().0.iter())
+        {
+            let values = unsafe { vld1q_f32(value.as_ptr()) };
+            let errors = unsafe { vld1q_f32(delta.as_ptr()) };
+            unsafe { vst1q_f32(output.as_mut_ptr(), vsubq_f32(values, errors)) };
+        }
+    }
+}
+
+/// # Safety
+/// AArch64 NEON must be available. Dimensions and slice lengths are validated.
+#[target_feature(enable = "neon")]
+pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
+    validate_ssim_inputs(orig, recon, width, height);
+    const C1: f32 = 1e-4;
+    const C2: f32 = 9e-4;
+    const INV_64: f32 = 1.0 / 64.0;
+    let mut deficit = 0.0f32;
+    for wy in 0..height / 8 {
+        for wx in 0..width / 8 {
+            let (x0, y0) = (wx * 8, wy * 8);
+            let base_index = y0 * width + x0;
+            let base_o = orig[base_index];
+            let base_r = recon[base_index];
+            let base_ov = vdupq_n_f32(base_o);
+            let base_rv = vdupq_n_f32(base_r);
+            let (mut sum_o, mut sum_r) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+            for (orig_row, recon_row) in orig
+                .chunks_exact(width)
+                .zip(recon.chunks_exact(width))
+                .skip(y0)
+                .take(8)
+            {
+                sum_o = vaddq_f32(
+                    sum_o,
+                    vsubq_f32(unsafe { vld1q_f32(orig_row[x0..].as_ptr()) }, base_ov),
+                );
+                sum_o = vaddq_f32(
+                    sum_o,
+                    vsubq_f32(unsafe { vld1q_f32(orig_row[x0 + 4..].as_ptr()) }, base_ov),
+                );
+                sum_r = vaddq_f32(
+                    sum_r,
+                    vsubq_f32(unsafe { vld1q_f32(recon_row[x0..].as_ptr()) }, base_rv),
+                );
+                sum_r = vaddq_f32(
+                    sum_r,
+                    vsubq_f32(unsafe { vld1q_f32(recon_row[x0 + 4..].as_ptr()) }, base_rv),
+                );
+            }
+            let mean_o = base_o + vaddvq_f32(sum_o) * INV_64;
+            let mean_r = base_r + vaddvq_f32(sum_r) * INV_64;
+            let mean_ov = vdupq_n_f32(mean_o);
+            let mean_rv = vdupq_n_f32(mean_r);
+            let (mut var_o, mut var_r, mut cov) =
+                (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+            for (orig_row, recon_row) in orig
+                .chunks_exact(width)
+                .zip(recon.chunks_exact(width))
+                .skip(y0)
+                .take(8)
+            {
+                for x in [0usize, 4] {
+                    let o = vsubq_f32(unsafe { vld1q_f32(orig_row[x0 + x..].as_ptr()) }, mean_ov);
+                    let r = vsubq_f32(unsafe { vld1q_f32(recon_row[x0 + x..].as_ptr()) }, mean_rv);
+                    var_o = vaddq_f32(var_o, vmulq_f32(o, o));
+                    var_r = vaddq_f32(var_r, vmulq_f32(r, r));
+                    cov = vaddq_f32(cov, vmulq_f32(o, r));
+                }
+            }
+            let vo = vaddvq_f32(var_o) * INV_64;
+            let vr = vaddvq_f32(var_r) * INV_64;
+            let covariance = vaddvq_f32(cov) * INV_64;
+            let luminance = (2.0 * mean_o * mean_r + C1) / (mean_o * mean_o + mean_r * mean_r + C1);
+            let structure = (2.0 * covariance + C2) / (vo + vr + C2);
+            deficit += (1.0 - luminance * structure) * 64.0;
+        }
+    }
+    deficit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{recon_dist_and_rate_neon, ssim_deficit_neon};
+    use crate::dc_group_data::{
+        STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
+        STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    };
+    use crate::image::Image3F;
+    use crate::inflated_cost::{rate_log2_lut, recon_dist_and_rate_scalar, ssim_deficit_scalar};
+
+    #[test]
+    fn ssim_neon_matches_scalar() {
+        let mut state = 91u32;
+        for (width, height) in [(8, 8), (16, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = width * height;
+            let mut orig = vec![0.0f32; n];
+            let mut recon = vec![0.0f32; n];
+            for i in 0..n {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                orig[i] = (state >> 8) as f32 / (1u32 << 24) as f32;
+                recon[i] = orig[i] + ((i % 13) as f32 - 6.0) * 0.0007;
+            }
+            let scalar = ssim_deficit_scalar(&orig, &recon, width, height);
+            let simd = unsafe { ssim_deficit_neon(&orig, &recon, width, height) };
+            let tolerance = 2e-4f32.max(scalar.abs() * 2e-5);
+            assert!(
+                (simd - scalar).abs() <= tolerance,
+                "{width}x{height}: simd={simd} scalar={scalar}"
+            );
+        }
+    }
+
+    #[test]
+    fn recon_neon_matches_scalar_for_all_standard_transforms() {
+        let mut image = Image3F::new(40, 40);
+        for c in 0..3 {
+            for y in 0..40 {
+                for x in 0..40 {
+                    image.plane_mut(c).row_mut(y)[x] =
+                        0.15 * c as f32 + 0.003 * x as f32 + 0.002 * y as f32;
+                }
+            }
+        }
+        let mut coeffs = [[0.0f32; 1024]; 3];
+        let mut state = 17u32;
+        for channel in &mut coeffs {
+            for value in channel {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0;
+            }
+        }
+        let inv_storage = [vec![1.0f32; 1024], vec![0.9f32; 1024], vec![1.1f32; 1024]];
+        for (strategy, cx, cy) in [
+            (STRATEGY_DCT, 1, 1),
+            (STRATEGY_DCT8X16, 2, 1),
+            (STRATEGY_DCT16X8, 2, 1),
+            (STRATEGY_DCT16X16, 2, 2),
+            (STRATEGY_DCT16X32, 4, 2),
+            (STRATEGY_DCT32X16, 4, 2),
+            (STRATEGY_DCT32X32, 4, 4),
+        ] {
+            let inv = [
+                &inv_storage[0][..],
+                &inv_storage[1][..],
+                &inv_storage[2][..],
+            ];
+            let scalar = recon_dist_and_rate_scalar(
+                rate_log2_lut(),
+                &coeffs,
+                inv,
+                7.0,
+                1.2,
+                0.15,
+                -0.1,
+                1.5,
+                cx,
+                cy,
+                strategy,
+                &image,
+                3,
+                5,
+            );
+            let simd = unsafe {
+                recon_dist_and_rate_neon(
+                    rate_log2_lut(),
+                    &coeffs,
+                    inv,
+                    7.0,
+                    1.2,
+                    0.15,
+                    -0.1,
+                    1.5,
+                    cx,
+                    cy,
+                    strategy,
+                    &image,
+                    3,
+                    5,
+                )
+            };
+            let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);
+            assert!(
+                (simd.1 - scalar.1).abs() <= rate_tolerance,
+                "strategy {strategy} rate: simd={} scalar={}",
+                simd.1,
+                scalar.1
+            );
+            let tolerance = 5e-4f32.max(scalar.0.abs() * 3e-5);
+            assert!(
+                (simd.0 - scalar.0).abs() <= tolerance,
+                "strategy {strategy}: simd={simd:?} scalar={scalar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssim_neon_rejects_short_slices_before_loading() {
+        let result =
+            std::panic::catch_unwind(|| unsafe { ssim_deficit_neon(&[0.0; 63], &[0.0; 64], 8, 8) });
+        assert!(result.is_err());
+    }
+}

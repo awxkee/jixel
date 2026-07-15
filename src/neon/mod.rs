@@ -29,6 +29,7 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod dct;
+mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod xyb;
@@ -40,6 +41,7 @@ pub(crate) use dct::{
     dct16x32_neon, dct32x16_neon, dct32x32_neon, inv_dct8x8_neon, inv_dct8x16_neon,
     inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon,
 };
+pub(crate) use inflated_cost::{recon_dist_and_rate_neon, ssim_deficit_neon};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::quantize_block_ac_neon;
 pub(crate) use xyb::to_xyb_neon_band;
