@@ -28,6 +28,7 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
+use crate::dark_aq::DarkAqConfig;
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
@@ -274,6 +275,10 @@ pub struct EncodeConfig {
     pub num_threads: usize,
     /// Transform-search effort (default [`Speed::Slow`]).
     pub speed: Speed,
+    /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
+    /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
+    /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
+    pub boost: Option<DarkAqConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +312,8 @@ pub(crate) struct EncodeConfigImpl {
     /// Worker-thread count for VarDCT encoding (see `EncodeConfig::num_threads`).
     pub(crate) num_threads: usize,
     pub(crate) speed: Speed,
+    /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
+    pub(crate) boost: Option<DarkAqConfig>,
 }
 
 impl Default for EncodeConfig {
@@ -326,7 +333,8 @@ impl Default for EncodeConfig {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
-            speed: Speed::Slow,
+            speed: Speed::Fast,
+            boost: Some(DarkAqConfig::default()),
         }
     }
 }
@@ -351,7 +359,8 @@ impl Default for EncodeConfigImpl {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
-            speed: Speed::Slow,
+            speed: Speed::Fast,
+            boost: Some(DarkAqConfig::default()),
         }
     }
 }
@@ -424,6 +433,12 @@ impl EncodeConfigImpl {
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
+            .with_boost(config.boost)
+    }
+
+    pub(crate) fn with_boost(mut self, boost: Option<DarkAqConfig>) -> Self {
+        self.boost = boost;
+        self
     }
 
     pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
@@ -470,6 +485,19 @@ impl EncodeConfig {
     /// See [`distance_from_quality`] for the mapping.
     pub fn with_quality(self, quality: f32) -> Self {
         self.with_distance(distance_from_quality(quality))
+    }
+
+    /// Enable superblock Variance-Boost / Dark-AQ quant-field modulation (lossy only).
+    /// [`DarkAqConfig::default`] is the validated Dark-AQ preset. See [`DarkAqConfig`].
+    pub fn with_dark_aq_config(mut self, boost: DarkAqConfig) -> Self {
+        self.boost = Some(boost);
+        self
+    }
+
+    /// Enable Dark-AQ with the validated defaults (equivalent to
+    /// `with_boost(BoostCfg::default())`).
+    pub fn with_dark_aq(self) -> Self {
+        self.with_dark_aq_config(DarkAqConfig::default())
     }
 
     /// Replace the color encoding (white point / primaries / transfer / intent).
@@ -1660,6 +1688,7 @@ pub(crate) fn encode_with_config(
         &coeff_shifts,
         config.num_threads.max(1),
         config.speed,
+        config.boost.as_ref(),
         &mut w,
     );
     let codestream = w.into_bytes();

@@ -663,6 +663,7 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     writer.append_byte_aligned(sections);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame(
     distance: f32,
     linear: &Image3F,
@@ -670,6 +671,7 @@ pub(crate) fn encode_frame(
     coeff_shifts: &[u32],
     num_threads: usize,
     speed: crate::Speed,
+    boost: Option<&crate::dark_aq::DarkAqConfig>,
     writer: &mut BitWriter,
 ) {
     let ctx = EncodingContext::new();
@@ -717,6 +719,7 @@ pub(crate) fn encode_frame(
             dc_gy,
             setup_budget,
             speed,
+            boost,
         )
     });
 
@@ -969,6 +972,7 @@ fn setup_dc_group(
     dc_gy: usize,
     num_threads: usize,
     speed: crate::Speed,
+    boost: Option<&crate::dark_aq::DarkAqConfig>,
 ) -> (DcGroupData, usize, usize) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -1054,6 +1058,20 @@ fn setup_dc_group(
             }
             // else: leave reverted to DCT8.
         }
+    }
+
+    // Optional superblock Variance-Boost + Dark-AQ (opt-in via JIXEL_BOOST). Runs
+    // after AC-strategy selection so it only reallocates quant magnitude and leaves
+    // transform choice untouched. Unset env ⇒ no-op, byte-identical field.
+    if let Some(boost) = boost {
+        crate::dark_aq::apply_boost(
+            boost,
+            opsin,
+            &mut dc_data.raw_quant_field,
+            dc_group_x0,
+            dc_group_y0,
+            distp.distance,
+        );
     }
 
     (dc_data, dc_group_xsize_groups, dc_group_ysize_groups)

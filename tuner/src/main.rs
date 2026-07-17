@@ -24,8 +24,8 @@ use std::time::Instant;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
-         (tuning parameters are read from the JIXEL_TUNING_JSON env var)"
+        "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>] [--boost <cfg>]\n\
+         (--boost: `1`/`on` for the Dark-AQ preset, or the BoostCfg CSV; omitted = off)"
     );
     std::process::exit(2);
 }
@@ -35,6 +35,7 @@ fn main() -> ExitCode {
     let mut positional: Vec<String> = Vec::new();
     let mut distance: Option<f32> = None;
     let mut threads: usize = 1;
+    let mut boost: Option<jixel::DarkAqConfig> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -43,6 +44,14 @@ fn main() -> ExitCode {
                 let v = args.get(i + 1).unwrap_or_else(|| usage());
                 distance = Some(v.parse().unwrap_or_else(|_| {
                     eprintln!("invalid --distance: {v}");
+                    std::process::exit(2);
+                }));
+                i += 2;
+            }
+            "--boost" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                boost = Some(jixel::DarkAqConfig::parse(v).unwrap_or_else(|| {
+                    eprintln!("invalid --boost config: {v}");
                     std::process::exit(2);
                 }));
                 i += 2;
@@ -81,10 +90,13 @@ fn main() -> ExitCode {
     let height = image.height() as usize;
     let rgb = image.to_rgb8();
 
-    let cfg = jixel::EncodeConfig::default()
+    let mut cfg = jixel::EncodeConfig::default()
         .with_lossless(false)
         .with_distance(distance)
         .with_num_threads(threads.max(1));
+    if let Some(b) = boost {
+        cfg = cfg.with_dark_aq_config(b);
+    }
 
     let start = Instant::now();
     let data = match jixel::encode_image(rgb.as_raw(), width, height, &cfg) {
