@@ -216,6 +216,14 @@ impl ToneMappingParams {
     }
 }
 
+/// Encoder speed/transform-search tradeoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speed {
+    Fast,
+    #[default]
+    Slow,
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub distance: f32,
@@ -264,6 +272,8 @@ pub struct EncodeConfig {
     /// ToneMapping `linear_below` (nits, or 0..1 if relative). Default 0.
     pub linear_below: f32,
     pub num_threads: usize,
+    /// Transform-search effort (default [`Speed::Slow`]).
+    pub speed: Speed,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +306,7 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) linear_below: f32,
     /// Worker-thread count for VarDCT encoding (see `EncodeConfig::num_threads`).
     pub(crate) num_threads: usize,
+    pub(crate) speed: Speed,
 }
 
 impl Default for EncodeConfig {
@@ -315,6 +326,7 @@ impl Default for EncodeConfig {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
+            speed: Speed::Slow,
         }
     }
 }
@@ -339,6 +351,7 @@ impl Default for EncodeConfigImpl {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
+            speed: Speed::Slow,
         }
     }
 }
@@ -410,6 +423,12 @@ impl EncodeConfigImpl {
         self.with_progressive(config.progressive)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
+            .with_speed(config.speed)
+    }
+
+    pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
+        self
     }
 
     /// Mark the image as grayscale (declares a Gray color space).
@@ -521,6 +540,12 @@ impl EncodeConfig {
     /// Set the worker-thread count (see `EncodeConfig::num_threads`).
     pub fn with_num_threads(mut self, n: usize) -> Self {
         self.num_threads = n;
+        self
+    }
+
+    /// Select the transform-search speed/effort tradeoff.
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
         self
     }
 }
@@ -1634,6 +1659,7 @@ pub(crate) fn encode_with_config(
         config.alpha.as_ref(),
         &coeff_shifts,
         config.num_threads.max(1),
+        config.speed,
         &mut w,
     );
     let codestream = w.into_bytes();

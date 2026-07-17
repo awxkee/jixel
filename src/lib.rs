@@ -76,8 +76,8 @@ pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
 pub use encode_image::{
-    EncodeConfig, distance_from_quality, encode_image, encode_image_10bit, encode_image_12bit,
-    encode_image_16bit, encode_image_f16, encode_image_f32, encode_image_gray,
+    EncodeConfig, Speed, distance_from_quality, encode_image, encode_image_10bit,
+    encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32, encode_image_gray,
     encode_image_gray_10bit, encode_image_gray_12bit, encode_image_gray_16bit,
     encode_image_gray_alpha, encode_image_gray_alpha_10bit, encode_image_gray_alpha_12bit,
     encode_image_gray_alpha_16bit, encode_image_gray_f16, encode_image_gray_f32,

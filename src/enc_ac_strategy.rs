@@ -1112,11 +1112,12 @@ pub(crate) fn fill_ac_strategy(
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
     num_threads: usize,
+    speed: crate::Speed,
 ) -> f32 {
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
     // DCT8 wins the high-quality RD comparison.
-    if use_dct8_only(distance) {
+    if speed == crate::Speed::Fast || use_dct8_only(distance) {
         return 0.0;
     }
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);

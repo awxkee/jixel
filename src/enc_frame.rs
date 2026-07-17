@@ -669,6 +669,7 @@ pub(crate) fn encode_frame(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     num_threads: usize,
+    speed: crate::Speed,
     writer: &mut BitWriter,
 ) {
     let ctx = EncodingContext::new();
@@ -715,6 +716,7 @@ pub(crate) fn encode_frame(
             dc_gx,
             dc_gy,
             setup_budget,
+            speed,
         )
     });
 
@@ -966,6 +968,7 @@ fn setup_dc_group(
     dc_gx: usize,
     dc_gy: usize,
     num_threads: usize,
+    speed: crate::Speed,
 ) -> (DcGroupData, usize, usize) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -1014,6 +1017,7 @@ fn setup_dc_group(
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
         num_threads,
+        speed,
     );
 
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
