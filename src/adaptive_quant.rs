@@ -588,7 +588,31 @@ pub(crate) fn dirty_log1pf(d: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{dirty_log1pf, hf_modulation_strength};
+    use super::{dirty_log1pf, dirty_log2f, hf_modulation_strength};
+
+    #[test]
+    fn dirty_log2f_matches_log2() {
+        for exponent in -20..=20 {
+            let x = 2.0f32.powi(exponent);
+            assert_eq!(dirty_log2f(x), exponent as f32, "log2({x})");
+        }
+
+        let mut max_abs = 0.0f32;
+        let mut worst_x = 0.0f32;
+        let mut x = 1.0e-6f32;
+        while x <= 1.0e6 {
+            let error = (dirty_log2f(x) - x.log2()).abs();
+            if error > max_abs {
+                max_abs = error;
+                worst_x = x;
+            }
+            x *= 1.01;
+        }
+        assert!(
+            max_abs < 2.0e-6,
+            "max absolute error {max_abs} at x={worst_x}"
+        );
+    }
 
     #[test]
     fn dirty_log1pf_matches_ln_1p() {

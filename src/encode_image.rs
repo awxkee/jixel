@@ -220,8 +220,8 @@ impl ToneMappingParams {
 /// Encoder speed/transform-search tradeoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Speed {
-    Fast,
     #[default]
+    Fast,
     Slow,
 }
 
@@ -273,7 +273,6 @@ pub struct EncodeConfig {
     /// ToneMapping `linear_below` (nits, or 0..1 if relative). Default 0.
     pub linear_below: f32,
     pub num_threads: usize,
-    /// Transform-search effort (default [`Speed::Slow`]).
     pub speed: Speed,
     /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
     /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
@@ -637,6 +636,7 @@ pub fn encode_image(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -710,6 +710,7 @@ pub fn encode_image_with_alpha(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -916,6 +917,7 @@ fn encode_gray_impl(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1153,6 +1155,7 @@ fn encode_gray_high_depth_impl(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1232,6 +1235,7 @@ fn encode_high_depth_rgba(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1392,7 +1396,7 @@ fn encode_f32_lossless_rgba(
         config.orientation,
         &mut w,
     );
-    encode_frame_lossless_float(&image3s, alpha.as_ref(), &mut w);
+    encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
     Ok(finalize_container(
@@ -1854,6 +1858,8 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         eff_bits,
         config.progressive,
         num_color,
+        config.speed,
+        config.num_threads,
         &mut w,
     );
     let codestream = w.into_bytes();
@@ -2124,6 +2130,12 @@ mod tests {
     }
 
     #[test]
+    fn default_speed_is_fast() {
+        assert_eq!(Speed::default(), Speed::Fast);
+        assert_eq!(EncodeConfig::default().speed, Speed::Fast);
+    }
+
+    #[test]
     #[should_panic(expected = "quality must not be NaN")]
     fn quality_nan_panics() {
         let _ = distance_from_quality(f32::NAN);
@@ -2236,6 +2248,44 @@ mod encode_smoke_tests {
     #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgb8_lossless_slow_adaptive() {
+        ok(encode_image(
+            &rgb8(),
+            W,
+            H,
+            &lossless().with_speed(Speed::Slow),
+        ));
+    }
+
+    #[test]
+    fn lossless_output_is_independent_of_thread_count() {
+        const WIDTH: usize = 257;
+        const HEIGHT: usize = 257;
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
+            .collect();
+
+        for speed in [Speed::Fast, Speed::Slow] {
+            let single = encode_image(
+                &input,
+                WIDTH,
+                HEIGHT,
+                &lossless().with_speed(speed).with_num_threads(1),
+            )
+            .expect("single-threaded lossless encode failed");
+            let threaded = encode_image(
+                &input,
+                WIDTH,
+                HEIGHT,
+                &lossless().with_speed(speed).with_num_threads(4),
+            )
+            .expect("multi-threaded lossless encode failed");
+
+            assert_eq!(single, threaded, "output changed for {speed:?}");
+        }
     }
 
     #[test]

@@ -227,8 +227,11 @@ pub(crate) fn encode_frame_lossless(
     max_bits: u32,
     progressive: bool,
     num_color: usize,
+    speed: crate::Speed,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) {
+    let num_threads = num_threads.max(1);
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
     // bit depths raise LZ77_MIN_SYMBOL above the max literal token so the decoder
@@ -274,6 +277,8 @@ pub(crate) fn encode_frame_lossless(
             ysize,
             min_symbol,
             grad_pack_fn,
+            speed,
+            num_threads,
             writer,
         );
         return;
@@ -298,15 +303,23 @@ pub(crate) fn encode_frame_lossless(
             num_dc_groups,
             num_ac_groups,
             grad_pack_fn,
+            speed,
+            num_threads,
             writer,
         )
     {
         return;
     }
 
-    // Pick Gradient(5) or Weighted(6) per channel by estimated cost (one global
-    // choice, used for the tree and every group). Never worse than all-WP.
-    let predictors = choose_predictors(linear, alpha, xsize, ysize);
+    // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
+    // picks Gradient(5) or Weighted(6) per channel by estimated cost (one global
+    // choice, used for the tree and every group).
+    let adaptive_search = speed == crate::Speed::Slow;
+    let predictors = if adaptive_search {
+        choose_predictors(linear, alpha, xsize, ysize, num_threads)
+    } else {
+        [PREDICTOR_WEIGHTED; 4]
+    };
     // Contiguous per-modular-channel predictors: the `num_color` color channels
     // (Y for gray; Y/Co/Cg for color) followed by alpha. For 3-color this is just
     // predictors[..nb_chans]; for gray it is [Y_pred, (alpha_pred)].
@@ -321,7 +334,7 @@ pub(crate) fn encode_frame_lossless(
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
-    if num_color == 3 {
+    if adaptive_search && num_color == 3 {
         if single_group {
             if try_encode_context_tree_single_group(
                 linear,
@@ -330,6 +343,7 @@ pub(crate) fn encode_frame_lossless(
                 ysize,
                 &predictors,
                 min_symbol,
+                num_threads,
                 writer,
             ) {
                 return;
@@ -344,6 +358,7 @@ pub(crate) fn encode_frame_lossless(
             ysize_groups,
             num_dc_groups,
             min_symbol,
+            num_threads,
             writer,
         ) {
             return;
@@ -377,6 +392,7 @@ pub(crate) fn encode_frame_lossless(
             num_color,
             &chan_preds,
             grad_pack_fn,
+            num_threads,
         );
 
         // LZ77 layer: collapse runs of identical tokens into back-references.
@@ -414,10 +430,10 @@ pub(crate) fn encode_frame_lossless(
         // resulting LzToken streams to build a single global prefix code so
         // every per-group emission is guaranteed to be representable.
         let distance_ctx = nb_chans as u32;
-        let mut group_lz_tokens: Vec<Vec<LzToken>> = Vec::with_capacity(num_ac_groups);
-        let mut all_lz: Vec<LzToken> = Vec::new();
-        for gy in 0..ysize_groups {
-            for gx in 0..xsize_groups {
+        let group_lz_tokens: Vec<Vec<LzToken>> =
+            crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+                let gx = group_index % xsize_groups;
+                let gy = group_index / xsize_groups;
                 let x0 = gx * GROUP_DIM;
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
@@ -434,11 +450,13 @@ pub(crate) fn encode_frame_lossless(
                     num_color,
                     &chan_preds,
                     grad_pack_fn,
+                    1,
                 );
-                let lz = lz77_compress(&toks, distance_ctx);
-                all_lz.extend_from_slice(&lz);
-                group_lz_tokens.push(lz);
-            }
+                lz77_compress(&toks, distance_ctx)
+            });
+        let mut all_lz: Vec<LzToken> = Vec::new();
+        for lz in &group_lz_tokens {
+            all_lz.extend_from_slice(lz);
         }
         let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol);
 
@@ -589,11 +607,10 @@ fn write_modular_transforms_rct_squeeze(steps: &[crate::squeeze::SqueezeStep], w
     }
 }
 
-/// Stage-2 progressive-lossless path (opt-in, JIXEL_SQUEEZE=1): single-group,
-/// no alpha. Applies one horizontal in-place Squeeze to the RCT'd channels,
-/// producing [avgY,avgCo,avgCg,resY,resCo,resCg], then tokenizes the 6 channels
-/// with the Gradient predictor. Lossless: djxl reconstructs bit-exact after
-/// inverse-Squeeze + inverse-RCT; the 3 half-width avg channels form the preview.
+/// Progressive-lossless single-group path. Applies the alternating Squeeze
+/// pyramid to the RCT'd channels, then tokenizes the resulting channels with
+/// fixed Weighted prediction in Fast mode or adaptive prediction in Slow mode.
+/// The decoder reconstructs the input exactly through inverse-Squeeze + inverse-RCT.
 fn encode_squeeze_single_group(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -601,6 +618,8 @@ fn encode_squeeze_single_group(
     ysize: usize,
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -661,12 +680,11 @@ fn encode_squeeze_single_group(
     }
     let nb = channels.len();
 
-    // Per-channel predictor selection (Gradient vs Weighted) by estimated cost,
-    // mirroring the main path — recovers the size squeeze otherwise leaves on
-    // the table (residual channels often prefer a different predictor).
-    let predictors: Vec<u32> = channels
-        .iter()
-        .map(|ch| {
+    // Slow selects Gradient vs Weighted per channel; Fast avoids the two full
+    // estimation passes and uses fixed Weighted prediction.
+    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+        crate::thread_pool::steal_map(channels.len(), num_threads, |c| {
+            let ch = &channels[c];
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
@@ -678,22 +696,26 @@ fn encode_squeeze_single_group(
                 PREDICTOR_GRADIENT
             }
         })
-        .collect();
-    let mut tokens: Vec<Token> = Vec::new();
-    for (c, ch) in channels.iter().enumerate() {
-        let ctx = channel_to_context(c, nb);
-        let data = &ch.data;
-        let w = ch.w;
-        let get = move |gx: usize, gy: usize| data[gy * w + gx];
+    } else {
+        vec![PREDICTOR_WEIGHTED; nb]
+    };
+    let channel_tokens = crate::thread_pool::steal_map(nb, num_threads, |c| {
+        let ch = &channels[c];
+        let mut tokens = Vec::with_capacity(ch.w * ch.h);
         tokenize_plane(
-            ctx,
-            get,
+            channel_to_context(c, nb),
+            |x, y| ch.data[y * ch.w + x],
             ch.w,
             ch.h,
             predictors[c],
             grad_pack_fn,
             &mut tokens,
         );
+        tokens
+    });
+    let mut tokens: Vec<Token> = Vec::new();
+    for channel in channel_tokens {
+        tokens.extend(channel);
     }
 
     write_frame_header_modular(alpha.is_some(), writer);
@@ -729,6 +751,111 @@ fn encode_squeeze_single_group(
 /// `frame_rect >> shift` crop of every large channel. A single global tree (chain
 /// on the channel property) serves all streams; the within-group channel index is
 /// what the tree sees, so group crops share contexts with the leading globals.
+#[derive(Default)]
+struct SqueezePredictorCost {
+    gradient_hist: Vec<u64>,
+    weighted_hist: Vec<u64>,
+    total: u64,
+}
+
+impl SqueezePredictorCost {
+    /// Add one independently predicted modular crop. Weighted prediction state
+    /// resets here because the decoder resets it for every modular sub-image.
+    fn add_crop(&mut self, get: impl Fn(usize, usize) -> i32, w: usize, h: usize) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut wp = WpState::new(w);
+        for y in 0..h {
+            for x in 0..w {
+                let value = get(x, y) as i64;
+                let west = if x > 0 {
+                    get(x - 1, y) as i64
+                } else if y > 0 {
+                    get(x, y - 1) as i64
+                } else {
+                    0
+                };
+                let north = if y > 0 { get(x, y - 1) as i64 } else { west };
+                let northwest = if x > 0 && y > 0 {
+                    get(x - 1, y - 1) as i64
+                } else {
+                    west
+                };
+                let northeast = if x + 1 < w && y > 0 {
+                    get(x + 1, y - 1) as i64
+                } else {
+                    north
+                };
+                let northnorth = if y > 1 { get(x, y - 2) as i64 } else { north };
+
+                let weighted = wp.predict(x, y, north, west, northeast, northwest, northnorth);
+                wp.update(value, x, y);
+                let lo = west.min(north);
+                let hi = west.max(north);
+                let gradient = (west + north - northwest).clamp(lo, hi);
+
+                let gradient_symbol = pack_signed((value - gradient) as i32) as usize;
+                let weighted_symbol = pack_signed((value - weighted) as i32) as usize;
+                if self.gradient_hist.len() <= gradient_symbol {
+                    self.gradient_hist.resize(gradient_symbol + 1, 0);
+                }
+                if self.weighted_hist.len() <= weighted_symbol {
+                    self.weighted_hist.resize(weighted_symbol + 1, 0);
+                }
+                self.gradient_hist[gradient_symbol] += 1;
+                self.weighted_hist[weighted_symbol] += 1;
+                self.total += 1;
+            }
+        }
+    }
+
+    fn predictor(&self) -> u32 {
+        let gradient_bits = entropy_of_hist(&self.gradient_hist, self.total);
+        let weighted_bits = entropy_of_hist(&self.weighted_hist, self.total);
+        if weighted_bits <= gradient_bits {
+            PREDICTOR_WEIGHTED
+        } else {
+            PREDICTOR_GRADIENT
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn for_each_squeeze_group_crop(
+    channels: &[crate::squeeze::Channel],
+    split: usize,
+    gdim: usize,
+    gx: usize,
+    gy: usize,
+    minsh: i32,
+    maxsh: i32,
+    mut visit: impl FnMut(usize, usize, usize, usize, usize, usize),
+) {
+    let mut within = 0usize;
+    for c in split..channels.len() {
+        let ch = &channels[c];
+        let msh = ch.hshift.min(ch.vshift);
+        if msh < minsh || msh > maxsh {
+            continue;
+        }
+        let hs = ch.hshift as usize;
+        let vs = ch.vshift as usize;
+        let rx0 = (gx * gdim) >> hs;
+        let ry0 = (gy * gdim) >> vs;
+        if rx0 >= ch.w || ry0 >= ch.h {
+            continue;
+        }
+        let rw = (gdim >> hs).min(ch.w - rx0);
+        let rh = (gdim >> vs).min(ch.h - ry0);
+        if rw == 0 || rh == 0 {
+            continue;
+        }
+        visit(within, c, rx0, ry0, rw, rh);
+        within += 1;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_squeeze_multigroup(
     linear: &Image3Si,
@@ -743,6 +870,8 @@ fn encode_squeeze_multigroup(
     num_dc_groups: usize,
     num_ac_groups: usize,
     grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) -> bool {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -779,32 +908,64 @@ fn encode_squeeze_multigroup(
         .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
         .unwrap_or(nb);
 
-    let predictors: Vec<u32> = channels
-        .iter()
-        .map(|ch| {
-            let data = &ch.data;
-            let w = ch.w;
-            let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT, grad_pack_fn);
-            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED, grad_pack_fn);
-            if bw <= bg {
-                PREDICTOR_WEIGHTED
-            } else {
-                PREDICTOR_GRADIENT
+    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+        // The MA tree sees a channel's position inside each modular sub-image,
+        // not its index in `channels`. Pool costs by that decoder-visible slot.
+        let mut costs: Vec<SqueezePredictorCost> =
+            (0..nb).map(|_| SqueezePredictorCost::default()).collect();
+        for c in 0..split {
+            let ch = &channels[c];
+            costs[c].add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h);
+        }
+        for gy in 0..ysize_dc_groups {
+            for gx in 0..xsize_dc_groups {
+                for_each_squeeze_group_crop(
+                    &channels,
+                    split,
+                    LF_GROUP_DIM,
+                    gx,
+                    gy,
+                    3,
+                    1000,
+                    |within, c, x0, y0, w, h| {
+                        let ch = &channels[c];
+                        costs[within].add_crop(|x, y| ch.data[(y0 + y) * ch.w + x0 + x], w, h);
+                    },
+                );
             }
-        })
-        .collect();
+        }
+        for gy in 0..ysize_groups {
+            for gx in 0..xsize_groups {
+                for_each_squeeze_group_crop(
+                    &channels,
+                    split,
+                    GROUP_DIM,
+                    gx,
+                    gy,
+                    0,
+                    2,
+                    |within, c, x0, y0, w, h| {
+                        let ch = &channels[c];
+                        costs[within].add_crop(|x, y| ch.data[(y0 + y) * ch.w + x0 + x], w, h);
+                    },
+                );
+            }
+        }
+        costs.iter().map(SqueezePredictorCost::predictor).collect()
+    } else {
+        vec![PREDICTOR_WEIGHTED; nb]
+    };
 
     let distance_ctx = nb as u32;
 
     // Global stream: the small channels [0, split), whole.
-    let mut global_tokens: Vec<Token> = Vec::new();
-    for c in 0..split {
+    let global_channel_tokens = crate::thread_pool::steal_map(split, num_threads, |c| {
         let ch = &channels[c];
         let ctx = channel_to_context(c, nb);
         let data = &ch.data;
         let w = ch.w;
         let get = move |gx: usize, gy: usize| data[gy * w + gx];
+        let mut tokens = Vec::with_capacity(ch.w * ch.h);
         tokenize_plane(
             ctx,
             get,
@@ -812,8 +973,13 @@ fn encode_squeeze_multigroup(
             ch.h,
             predictors[c],
             grad_pack_fn,
-            &mut global_tokens,
+            &mut tokens,
         );
+        tokens
+    });
+    let mut global_tokens: Vec<Token> = Vec::new();
+    for channel in global_channel_tokens {
+        global_tokens.extend(channel);
     }
     let global_lz = lz77_compress(&global_tokens, distance_ctx);
     let mut all_lz: Vec<LzToken> = global_lz.clone();
@@ -826,56 +992,47 @@ fn encode_squeeze_multigroup(
     // `chan` property the global tree keys on.
     let crop_group = |gdim: usize, gx: usize, gy: usize, minsh: i32, maxsh: i32| -> Vec<LzToken> {
         let mut gtok: Vec<Token> = Vec::new();
-        let mut within = 0usize;
-        for c in split..nb {
-            let ch = &channels[c];
-            let msh = ch.hshift.min(ch.vshift);
-            if msh < minsh || msh > maxsh {
-                continue;
-            }
-            let hs = ch.hshift as usize;
-            let vs = ch.vshift as usize;
-            let rx0 = (gx * gdim) >> hs;
-            let ry0 = (gy * gdim) >> vs;
-            if rx0 >= ch.w || ry0 >= ch.h {
-                continue;
-            }
-            let rw = (gdim >> hs).min(ch.w - rx0);
-            let rh = (gdim >> vs).min(ch.h - ry0);
-            if rw == 0 || rh == 0 {
-                continue;
-            }
-            let ctx = channel_to_context(within, nb);
-            let pred = predictors[within];
-            let data = &ch.data;
-            let w = ch.w;
-            let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-            tokenize_plane(ctx, get, rw, rh, pred, grad_pack_fn, &mut gtok);
-            within += 1;
-        }
+        for_each_squeeze_group_crop(
+            &channels,
+            split,
+            gdim,
+            gx,
+            gy,
+            minsh,
+            maxsh,
+            |within, c, rx0, ry0, rw, rh| {
+                let ch = &channels[c];
+                let ctx = channel_to_context(within, nb);
+                let pred = predictors[within];
+                let data = &ch.data;
+                let w = ch.w;
+                let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
+                tokenize_plane(ctx, get, rw, rh, pred, grad_pack_fn, &mut gtok);
+            },
+        );
         lz77_compress(&gtok, distance_ctx)
     };
 
     // DC (LF) groups carry the deeply-squeezed large channels (min shift >= 3),
     // partitioned into LF_GROUP_DIM rects. Empty unless the image is large enough
     // that a >=3x-squeezed channel still exceeds a group (dimension > ~2048).
-    let mut dc_group_lz: Vec<Vec<LzToken>> = Vec::with_capacity(num_dc_groups);
-    for rgy in 0..ysize_dc_groups {
-        for rgx in 0..xsize_dc_groups {
-            let glz = crop_group(LF_GROUP_DIM, rgx, rgy, 3, 1000);
-            all_lz.extend_from_slice(&glz);
-            dc_group_lz.push(glz);
-        }
+    let dc_group_lz = crate::thread_pool::steal_map(num_dc_groups, num_threads, |group_index| {
+        let gx = group_index % xsize_dc_groups;
+        let gy = group_index / xsize_dc_groups;
+        crop_group(LF_GROUP_DIM, gx, gy, 3, 1000)
+    });
+    for glz in &dc_group_lz {
+        all_lz.extend_from_slice(glz);
     }
 
     // AC groups carry the shallow large channels (min shift <= 2), in GROUP_DIM rects.
-    let mut ac_group_lz: Vec<Vec<LzToken>> = Vec::with_capacity(num_ac_groups);
-    for gy in 0..ysize_groups {
-        for gx in 0..xsize_groups {
-            let glz = crop_group(GROUP_DIM, gx, gy, 0, 2);
-            all_lz.extend_from_slice(&glz);
-            ac_group_lz.push(glz);
-        }
+    let ac_group_lz = crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+        let gx = group_index % xsize_groups;
+        let gy = group_index / xsize_groups;
+        crop_group(GROUP_DIM, gx, gy, 0, 2)
+    });
+    for glz in &ac_group_lz {
+        all_lz.extend_from_slice(glz);
     }
 
     let code = build_lz_pixel_code(&all_lz, nb, min_symbol);
@@ -1216,33 +1373,39 @@ fn tokenize_all(
     num_color: usize,
     predictors: &[u32],
     grad_pack_fn: GradPackInteriorFn,
+    num_threads: usize,
 ) -> Vec<Token> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
-    let mut out = Vec::with_capacity(gw * gh * nb_chans);
-
-    // Color channels: plane 0 (Y/luma) for gray, planes 0..3 (Y/Co/Cg) for color.
-    for chan in 0..num_color {
+    let channel_tokens = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+        let mut out = Vec::with_capacity(gw * gh);
         let ctx = channel_to_context(chan, nb_chans);
-        let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
-        tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
+        if chan < num_color {
+            let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
+            tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
+        } else {
+            let a = alpha.expect("alpha channel must exist");
+            let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
+            tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
+        }
+        out
+    });
+    let mut out = Vec::with_capacity(gw * gh * nb_chans);
+    for channel in channel_tokens {
+        out.extend(channel);
     }
-
-    // Alpha (untransformed) is the modular channel right after the color ones.
-    if let Some(a) = alpha {
-        let ctx = channel_to_context(num_color, nb_chans);
-        let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
-        tokenize_plane(
-            ctx,
-            get,
-            gw,
-            gh,
-            predictors[num_color],
-            grad_pack_fn,
-            &mut out,
-        );
-    }
-
     out
+}
+
+#[derive(Default)]
+struct GradientScratch {
+    cur: Vec<i32>,
+    prev: Vec<i32>,
+    buf: Vec<u32>,
+}
+
+thread_local! {
+    static GRADIENT_SCRATCH: RefCell<GradientScratch> =
+        RefCell::new(GradientScratch::default());
 }
 
 /// Tokenize one channel's group-local rectangle with the chosen predictor
@@ -1292,28 +1455,39 @@ fn tokenize_plane(
         }
     } else {
         // Gradient (ClampedGradient): per-pixel independent, pure integer ->
-        // vectorised over the interior of each row.
-        let mut cur = vec![0i32; gw];
-        let mut prev = vec![0i32; gw];
-        let mut buf = vec![0u32; gw];
-        for gy in 0..gh {
-            std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
-            for (gx, c) in cur.iter_mut().enumerate() {
-                *c = get(gx, gy);
+        // vectorized over the interior of each row.
+        GRADIENT_SCRATCH.with_borrow_mut(|scratch| {
+            if scratch.buf.len() < gw {
+                scratch.buf.resize(gw, 0);
             }
-            if gy == 0 {
-                buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
-                for gx in 1..gw {
-                    buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1])); // pred = W
+            if scratch.cur.len() < gw {
+                scratch.cur.resize(gw, 0);
+            }
+            if scratch.prev.len() < gw {
+                scratch.prev.resize(gw, 0);
+            }
+            let mut cur = &mut scratch.cur[..gw];
+            let mut prev = &mut scratch.prev[..gw];
+            let buf = &mut scratch.buf[..gw];
+            for gy in 0..gh {
+                std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
+                for (gx, c) in cur.iter_mut().enumerate() {
+                    *c = get(gx, gy);
                 }
-            } else {
-                buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
-                grad_pack_fn(&cur, &prev, &mut buf, gw); // gx in 1..gw
+                if gy == 0 {
+                    buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
+                    for gx in 1..gw {
+                        buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1])); // pred = W
+                    }
+                } else {
+                    buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
+                    grad_pack_fn(cur, prev, buf, gw); // gx in 1..gw
+                }
+                for &b in buf.iter().take(gw) {
+                    out.push(Token::new(ctx, b));
+                }
             }
-            for &b in buf.iter().take(gw) {
-                out.push(Token::new(ctx, b));
-            }
-        }
+        });
     }
 }
 type GradPackInteriorFn = fn(&[i32], &[i32], &mut [u32], usize);
@@ -1375,7 +1549,7 @@ fn estimate_channel_bits(
     h: usize,
     pred_id: u32,
     grad_pack_fn: GradPackInteriorFn,
-) -> f64 {
+) -> f32 {
     let mut toks: Vec<Token> = Vec::with_capacity(w * h);
     tokenize_plane(0, get, w, h, pred_id, grad_pack_fn, &mut toks);
     if toks.is_empty() {
@@ -1388,12 +1562,12 @@ fn estimate_channel_bits(
     for t in &toks {
         hist[t.value as usize] += 1;
     }
-    let total = toks.len() as f64;
+    let total = toks.len() as f32;
     let mut bits = 0.0;
     for &c in hist.iter() {
         if c != 0 {
-            let p = c as f64 / total;
-            bits -= c as f64 * p.log2();
+            let p = c as f32 / total;
+            bits -= c as f32 * p.log2();
         }
     }
     bits
@@ -1408,7 +1582,7 @@ fn estimate_channel_bits(
 /// convention, same WP state evolution, same packed residuals — but the pixel
 /// fetches and loop overhead happen once instead of twice. Returns
 /// `(gradient_bits, weighted_bits)`.
-fn estimate_grad_and_wp_bits(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> (f64, f64) {
+fn estimate_grad_and_wp_bits(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> (f32, f32) {
     if w == 0 || h == 0 {
         return (0.0, 0.0);
     }
@@ -1456,26 +1630,27 @@ fn choose_predictors(
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
+    num_threads: usize,
 ) -> [u32; 4] {
     let mut preds = [PREDICTOR_WEIGHTED; 4];
-    for chan in 0..3usize {
-        let pd = linear.plane_data(chan);
-        let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
-        let (bg, bw) = estimate_grad_and_wp_bits(get, xsize, ysize);
-        preds[chan] = if bw <= bg {
+    let num_channels = 3 + usize::from(alpha.is_some());
+    let selected = crate::thread_pool::steal_map(num_channels, num_threads, |chan| {
+        let (bg, bw) = if chan < 3 {
+            let pd = linear.plane_data(chan);
+            estimate_grad_and_wp_bits(|x, y| pd[y * xsize + x], xsize, ysize)
+        } else {
+            let a = alpha.expect("alpha channel must exist");
+            estimate_grad_and_wp_bits(|x, y| a.get_i32(y * xsize + x), xsize, ysize)
+        };
+        if bw <= bg {
             PREDICTOR_WEIGHTED
         } else {
             PREDICTOR_GRADIENT
-        };
-    }
-    if let Some(a) = alpha {
-        let get = |gx: usize, gy: usize| a.get_i32(gy * xsize + gx);
-        let (bg, bw) = estimate_grad_and_wp_bits(get, xsize, ysize);
-        preds[3] = if bw <= bg {
-            PREDICTOR_WEIGHTED
-        } else {
-            PREDICTOR_GRADIENT
-        };
+        }
+    });
+    preds[..num_channels].copy_from_slice(&selected);
+    if alpha.is_none() {
+        preds[3] = PREDICTOR_WEIGHTED;
     }
     preds
 }
@@ -1578,26 +1753,36 @@ fn clamped_gradient(w: i64, n: i64, nw: i64) -> i64 {
     (w + n - nw).clamp(lo, hi)
 }
 
-fn order0_entropy(vals: &[u32]) -> f64 {
+thread_local! {
+    static ORDER0_ENTROPY_SCRATCH: RefCell<Vec<u64>> = const { RefCell::new(vec![]) };
+}
+
+fn order0_entropy(vals: &[u32]) -> f32 {
     if vals.is_empty() {
         return 0.0;
     }
-    // Direct-indexed frequency histogram (residual symbols are small-range), in
-    // place of a HashMap: no hashing, and a deterministic accumulation order.
-    let max = vals.iter().copied().max().unwrap_or(0) as usize;
-    let mut hist = vec![0u64; max + 1];
-    for &v in vals {
-        hist[v as usize] += 1;
-    }
-    let total = vals.len() as f64;
-    let mut bits = 0.0;
-    for &c in hist.iter() {
-        if c != 0 {
-            let p = c as f64 / total;
-            bits -= c as f64 * p.log2();
+    ORDER0_ENTROPY_SCRATCH.with_borrow_mut(|cell| {
+        // Direct-indexed frequency histogram (residual symbols are small-range), in
+        // place of a HashMap: no hashing, and a deterministic accumulation order.
+        let max = vals.iter().copied().max().unwrap_or(0) as usize;
+        if cell.len() < max + 1 {
+            cell.resize(max + 1, 0);
         }
-    }
-    bits
+        let hist = &mut cell[..max + 1];
+        hist.fill(0);
+        for &v in vals {
+            hist[v as usize] += 1;
+        }
+        let total = vals.len() as f32;
+        let mut bits = 0.0;
+        for &c in hist.iter() {
+            if c != 0 {
+                let p = c as f32 / total;
+                bits -= c as f32 * dirty_log2f(p);
+            }
+        }
+        bits
+    })
 }
 
 /// Run WP over one channel's group rectangle, returning per-pixel
@@ -1649,60 +1834,80 @@ fn collect_channel(
 
 /// Pick the best activity threshold for a channel among candidates, returning
 /// (best_t, best_bucketed_bits, flat_bits).
-fn entropy_of_hist(hist: &[u64], total: u64) -> f64 {
+fn entropy_of_hist(hist: &[u64], total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    let t = total as f64;
+    let t = total as f32;
     let mut bits = 0.0;
     for &c in hist.iter() {
         if c != 0 {
-            let p = c as f64 / t;
-            bits -= c as f64 * p.log2();
+            let p = c as f32 / t;
+            bits -= c as f32 * p.log2();
         }
     }
     bits
 }
 
-fn pick_threshold(res: &[u32], prp: &[i64]) -> (i32, f64, f64) {
-    let flat = order0_entropy(res);
-    let max = res.iter().copied().max().unwrap_or(0) as usize;
-    // Reusable per-bucket histograms; for each candidate threshold we fill them
-    // in a single pass over (res, prp) instead of materializing three bucket
-    // Vecs and re-scanning each. Same frequencies, same entropy, same choice.
-    let mut h0 = vec![0u64; max + 1];
-    let mut h1 = vec![0u64; max + 1];
-    let mut h2 = vec![0u64; max + 1];
-    let mut best_t = 0i32;
-    let mut best_bits = f64::INFINITY;
-    for &t in &[8i64, 16, 24, 32, 48, 64, 96] {
-        h0.fill(0);
-        h1.fill(0);
-        h2.fill(0);
-        let (mut n0, mut n1, mut n2) = (0u64, 0u64, 0u64);
-        for (&r, &p) in res.iter().zip(prp.iter()) {
-            match bucket_of(p, t) {
-                0 => {
-                    h0[r as usize] += 1;
-                    n0 += 1;
-                }
-                1 => {
-                    h1[r as usize] += 1;
-                    n1 += 1;
-                }
-                _ => {
-                    h2[r as usize] += 1;
-                    n2 += 1;
+struct PickThresholdScratch {
+    hist_scratch: Vec<u64>,
+}
+
+impl PickThresholdScratch {
+    fn make_scratches(&mut self, size: usize) -> (&mut [u64], &mut [u64], &mut [u64]) {
+        let bucket = size + 1;
+        if self.hist_scratch.len() < bucket * 3 {
+            self.hist_scratch.resize(bucket * 3, 0);
+        }
+        let (b0, r0) = self.hist_scratch.split_at_mut(bucket);
+        let (b1, b2) = r0.split_at_mut(bucket);
+        (b0, b1, &mut b2[..bucket])
+    }
+}
+
+thread_local! {
+    static THRESHOLD_SCRATCH: RefCell<PickThresholdScratch> = const { RefCell::new(PickThresholdScratch {
+        hist_scratch: Vec::new(),
+    }) }
+}
+
+fn pick_threshold(res: &[u32], prp: &[i64]) -> (i32, f32, f32) {
+    THRESHOLD_SCRATCH.with_borrow_mut(|cell| {
+        let flat = order0_entropy(res);
+        let max = res.iter().copied().max().unwrap_or(0) as usize;
+        let (h0, h1, h2) = cell.make_scratches(max + 1);
+        let mut best_t = 0i32;
+        let mut best_bits = f32::INFINITY;
+        for &t in &[8i64, 16, 24, 32, 48, 64, 96] {
+            h0.fill(0);
+            h1.fill(0);
+            h2.fill(0);
+            let (mut n0, mut n1, mut n2) = (0u64, 0u64, 0u64);
+            for (&r, &p) in res.iter().zip(prp.iter()) {
+                match bucket_of(p, t) {
+                    0 => {
+                        h0[r as usize] += 1;
+                        n0 += 1;
+                    }
+                    1 => {
+                        h1[r as usize] += 1;
+                        n1 += 1;
+                    }
+                    _ => {
+                        h2[r as usize] += 1;
+                        n2 += 1;
+                    }
                 }
             }
+            let bits =
+                entropy_of_hist(h0, n0) + entropy_of_hist(h1, n1) + entropy_of_hist(h2, n2);
+            if bits < best_bits {
+                best_bits = bits;
+                best_t = t as i32;
+            }
         }
-        let bits = entropy_of_hist(&h0, n0) + entropy_of_hist(&h1, n1) + entropy_of_hist(&h2, n2);
-        if bits < best_bits {
-            best_bits = bits;
-            best_t = t as i32;
-        }
-    }
-    (best_t, best_bits, flat)
+        (best_t, best_bits, flat)
+    })
 }
 
 /// v1 context tree: single-group only. Returns true (and writes the full frame)
@@ -1715,40 +1920,43 @@ fn try_encode_context_tree_single_group(
     ysize: usize,
     predictors: &[u32],
     min_symbol: u32,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
 
     // Collect residuals + WP property per channel (WP runs for every channel).
-    let mut chan_res: Vec<Vec<u32>> = Vec::with_capacity(nb_chans);
-    let mut chan_prp: Vec<Vec<i64>> = Vec::with_capacity(nb_chans);
-    for chan in 0..3usize {
-        let pd = linear.plane_data(chan);
-        let get = |gx: usize, gy: usize| pd[gy * xsize + gx];
-        let (r, p) = collect_channel(get, xsize, ysize, predictors[chan]);
-        chan_res.push(r);
-        chan_prp.push(p);
-    }
-    if let Some(a) = alpha {
-        let get = |gx: usize, gy: usize| a.get_i32(gy * xsize + gx);
-        let (r, p) = collect_channel(get, xsize, ysize, predictors[3]);
-        chan_res.push(r);
-        chan_prp.push(p);
-    }
+    let collected = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+        if chan < 3 {
+            let pd = linear.plane_data(chan);
+            collect_channel(|x, y| pd[y * xsize + x], xsize, ysize, predictors[chan])
+        } else {
+            let a = alpha.expect("alpha channel must exist");
+            collect_channel(
+                |x, y| a.get_i32(y * xsize + x),
+                xsize,
+                ysize,
+                predictors[chan],
+            )
+        }
+    });
+    let (chan_res, chan_prp): (Vec<Vec<u32>>, Vec<Vec<i64>>) = collected.into_iter().unzip();
 
     // Per-channel threshold + cost comparison.
     let mut ts = [0i32; 4];
     let mut ctx_bits = 0.0;
     let mut flat_bits = 0.0;
-    for chan in 0..nb_chans {
-        let (t, cb, fb) = pick_threshold(&chan_res[chan], &chan_prp[chan]);
+    let threshold_costs = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+        pick_threshold(&chan_res[chan], &chan_prp[chan])
+    });
+    for (chan, (t, cb, fb)) in threshold_costs.into_iter().enumerate() {
         ts[chan] = t;
         ctx_bits += cb;
         flat_bits += fb;
     }
     // Guard: require the context tree to beat the flat path by more than the
     // extra-context header overhead (~64 bytes per added context, conservative).
-    let overhead_bits = (2 * nb_chans) as f64 * 64.0 * 8.0;
+    let overhead_bits = (2 * nb_chans) as f32 * 64.0 * 8.0;
     if ctx_bits + overhead_bits >= flat_bits {
         return false;
     }
@@ -1763,8 +1971,8 @@ fn try_encode_context_tree_single_group(
     let num_pixel_ctx = nb_chans * 3;
 
     // Tokenize: each pixel routed to context (channel,bucket).
-    let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize * nb_chans);
-    for chan in 0..nb_chans {
+    let channel_tokens = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+        let mut tokens = Vec::with_capacity(xsize * ysize);
         let res = &chan_res[chan];
         let prp = &chan_prp[chan];
         let t = ts[chan] as i64;
@@ -1773,6 +1981,11 @@ fn try_encode_context_tree_single_group(
             let ctx = ctx_lut[chan * 3 + bucket as usize];
             tokens.push(Token::new(ctx, res));
         }
+        tokens
+    });
+    let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize * nb_chans);
+    for channel in channel_tokens {
+        tokens.extend(channel);
     }
 
     // Frame header + single section.
@@ -1815,15 +2028,17 @@ fn try_encode_context_tree_multi_group(
     ysize_groups: usize,
     num_dc_groups: usize,
     min_symbol: u32,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
     let num_ac_groups = xsize_groups * ysize_groups;
 
     // 1) Collect (residual, WP property) per group per channel (group-local WP).
-    let mut groups: Vec<Vec<(Vec<u32>, Vec<i64>)>> = Vec::with_capacity(num_ac_groups);
-    for gy in 0..ysize_groups {
-        for gx in 0..xsize_groups {
+    let groups: Vec<Vec<(Vec<u32>, Vec<i64>)>> =
+        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+            let gx = group_index % xsize_groups;
+            let gy = group_index / xsize_groups;
             let x0 = gx * GROUP_DIM;
             let y0 = gy * GROUP_DIM;
             let gw = GROUP_DIM.min(xsize - x0);
@@ -1838,27 +2053,28 @@ fn try_encode_context_tree_multi_group(
                 let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
                 chans.push(collect_channel(get, gw, gh, predictors[3]));
             }
-            groups.push(chans);
-        }
-    }
+            chans
+        });
 
     // 2) Global per-channel threshold from aggregated stats.
     let mut ts = [0i32; 4];
     let mut ctx_bits = 0.0;
     let mut flat_bits = 0.0;
-    for chan in 0..nb_chans {
+    let threshold_costs = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
         let mut res: Vec<u32> = Vec::new();
         let mut prp: Vec<i64> = Vec::new();
         for g in &groups {
             res.extend_from_slice(&g[chan].0);
             prp.extend_from_slice(&g[chan].1);
         }
-        let (t, cb, fb) = pick_threshold(&res, &prp);
+        pick_threshold(&res, &prp)
+    });
+    for (chan, (t, cb, fb)) in threshold_costs.into_iter().enumerate() {
         ts[chan] = t;
         ctx_bits += cb;
         flat_bits += fb;
     }
-    let overhead_bits = (2 * nb_chans) as f64 * 64.0 * 8.0;
+    let overhead_bits = (2 * nb_chans) as f32 * 64.0 * 8.0;
     if ctx_bits + overhead_bits >= flat_bits {
         return false;
     }
@@ -1874,22 +2090,24 @@ fn try_encode_context_tree_multi_group(
     let distance_ctx = num_pixel_ctx as u32;
 
     // 4) Per-group tokens (reusing collected res/prop) + per-group LZ77.
-    let mut group_lz_tokens: Vec<Vec<LzToken>> = Vec::with_capacity(num_ac_groups);
-    let mut all_lz: Vec<LzToken> = Vec::new();
-    for g in &groups {
-        let mut toks: Vec<Token> = Vec::new();
-        for chan in 0..nb_chans {
-            let (res, prp) = &g[chan];
-            let t = ts[chan] as i64;
-            for i in 0..res.len() {
-                let bucket = bucket_of(prp[i], t);
-                let ctx = ctx_lut[chan * 3 + bucket as usize];
-                toks.push(Token::new(ctx, res[i]));
+    let group_lz_tokens: Vec<Vec<LzToken>> =
+        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+            let g = &groups[group_index];
+            let mut toks: Vec<Token> = Vec::new();
+            for chan in 0..nb_chans {
+                let (res, prp) = &g[chan];
+                let t = ts[chan] as i64;
+                for i in 0..res.len() {
+                    let bucket = bucket_of(prp[i], t);
+                    let ctx = ctx_lut[chan * 3 + bucket as usize];
+                    toks.push(Token::new(ctx, res[i]));
+                }
             }
-        }
-        let lz = lz77_compress(&toks, distance_ctx);
-        all_lz.extend_from_slice(&lz);
-        group_lz_tokens.push(lz);
+            lz77_compress(&toks, distance_ctx)
+        });
+    let mut all_lz: Vec<LzToken> = Vec::new();
+    for lz in &group_lz_tokens {
+        all_lz.extend_from_slice(lz);
     }
     let code = build_lz_pixel_code(&all_lz, num_pixel_ctx, min_symbol);
 
@@ -1942,6 +2160,7 @@ fn try_encode_context_tree_multi_group(
     true
 }
 
+use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
@@ -1949,6 +2168,7 @@ use crate::entropy::{
     write_token,
 };
 use crate::image::Image3Si;
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 /// Build a frequency histogram for each cluster from an `LzToken` stream.
@@ -2237,8 +2457,10 @@ fn write_tree_and_pixel_code_nolz(
 pub(crate) fn encode_frame_lossless_float(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
+    num_threads: usize,
     writer: &mut BitWriter,
 ) {
+    let num_threads = num_threads.max(1);
     let xsize = linear.xsize();
     let ysize = linear.ysize();
     let nb_chans = 3usize + if alpha.is_some() { 1 } else { 0 };
@@ -2283,6 +2505,7 @@ pub(crate) fn encode_frame_lossless_float(
             3,
             &predictors,
             grad_pack_fn,
+            num_threads,
         );
         let code = optimize_entropy_code(&tokens, nb_chans);
         write_tree_and_pixel_code_nolz(&tree_tokens, &code, &mut section);
@@ -2302,15 +2525,15 @@ pub(crate) fn encode_frame_lossless_float(
         let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
         // Tokenize each AC group (group-local) and pool for one global code.
-        let mut group_tokens: Vec<Vec<Token>> = Vec::with_capacity(num_ac_groups);
-        let mut all_tokens: Vec<Token> = Vec::new();
-        for gy in 0..ysize_groups {
-            for gx in 0..xsize_groups {
+        let group_tokens: Vec<Vec<Token>> =
+            crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+                let gx = group_index % xsize_groups;
+                let gy = group_index / xsize_groups;
                 let x0 = gx * GROUP_DIM;
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks = tokenize_all(
+                tokenize_all(
                     linear,
                     alpha,
                     xsize,
@@ -2322,10 +2545,12 @@ pub(crate) fn encode_frame_lossless_float(
                     3,
                     &predictors,
                     grad_pack_fn,
-                );
-                all_tokens.extend_from_slice(&toks);
-                group_tokens.push(toks);
-            }
+                    1,
+                )
+            });
+        let mut all_tokens: Vec<Token> = Vec::new();
+        for tokens in &group_tokens {
+            all_tokens.extend_from_slice(tokens);
         }
         let code = optimize_entropy_code(&all_tokens, nb_chans);
 
