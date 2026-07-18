@@ -517,7 +517,6 @@ pub(crate) fn f_fmlaf(a: f32, b: f32, c: f32) -> f32 {
     }
 }
 
-#[inline]
 pub(crate) fn fast_exp2(d: f32) -> f32 {
     let redux = f32::from_bits(0x4b400000) / TBLSIZE as f32;
 
@@ -564,9 +563,80 @@ pub(crate) fn dirty_log2f(d: f32) -> f32 {
     f_fmlaf(x2 * x, u, f_fmlaf(x, 0.2885390081777926802e+1, n as f32))
 }
 
+#[inline]
+pub(crate) fn dirty_log1pf(d: f32) -> f32 {
+    const LN_2: f32 = 0.6931471805599453;
+    let ix = (1.0 + d).to_bits();
+    let exponent = ix & 0x7f80_0000;
+    let n = (exponent >> 23) as i32 - 0x7f;
+
+    // Replacing the exponent with 127 normalizes 1+d to 1+t without division.
+    // For n=0 use d itself so tiny inputs do not lose precision in (1+d)-1.
+    let mantissa = f32::from_bits((ix & 0x007f_ffff) | 0x3f80_0000);
+    let t = if n == 0 { d } else { mantissa - 1.0 };
+
+    // Direct minimax ln(1+t) ~= t*P(t), t in [0, 1]. See tools/log1p.sollya.
+    let mut p = 0.014539075084030628;
+    p = f_fmlaf(p, t, -0.0675969123840332);
+    p = f_fmlaf(p, t, 0.15056970715522766);
+    p = f_fmlaf(p, t, -0.23573730885982513);
+    p = f_fmlaf(p, t, 0.33125850558280945);
+    p = f_fmlaf(p, t, -0.4998837411403656);
+    p = f_fmlaf(p, t, 0.999998927116394);
+    f_fmlaf(n as f32, LN_2, t * p)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hf_modulation_strength;
+    use super::{dirty_log1pf, dirty_log2f, hf_modulation_strength};
+
+    #[test]
+    fn dirty_log2f_matches_log2() {
+        for exponent in -20..=20 {
+            let x = 2.0f32.powi(exponent);
+            assert_eq!(dirty_log2f(x), exponent as f32, "log2({x})");
+        }
+
+        let mut max_abs = 0.0f32;
+        let mut worst_x = 0.0f32;
+        let mut x = 1.0e-6f32;
+        while x <= 1.0e6 {
+            let error = (dirty_log2f(x) - x.log2()).abs();
+            if error > max_abs {
+                max_abs = error;
+                worst_x = x;
+            }
+            x *= 1.01;
+        }
+        assert!(
+            max_abs < 2.0e-6,
+            "max absolute error {max_abs} at x={worst_x}"
+        );
+    }
+
+    #[test]
+    fn dirty_log1pf_matches_ln_1p() {
+        assert_eq!(dirty_log1pf(0.0), 0.0);
+        let mut max_abs = 0f32;
+        let mut max_rel = 0f32; // measured only for d >= 0.1
+        let mut x = 1e-5f32;
+        while x <= 5.0e6 {
+            let got = dirty_log1pf(x);
+            let want = x.ln_1p();
+            max_abs = max_abs.max((got - want).abs());
+            if x >= 0.1 {
+                max_rel = max_rel.max((got - want).abs() / want.abs());
+            }
+            x *= 1.05;
+        }
+        assert!(max_abs < 1e-5, "max absolute error {max_abs} too large");
+        assert!(max_rel < 1e-5, "max relative error {max_rel} too large");
+        // A few spot checks against std ln_1p.
+        for &v in &[0.5f32, 1.0, 42.0, 256.0, 1.0e6] {
+            let rel = (dirty_log1pf(v) - v.ln_1p()).abs() / v.ln_1p();
+            assert!(rel < 1e-5, "ln_1p({v}) rel err {rel}");
+        }
+    }
 
     #[test]
     fn hf_modulation_strength_protects_high_quality_detail() {

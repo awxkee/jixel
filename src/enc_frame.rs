@@ -557,12 +557,14 @@ fn write_dc_global(
     {
         // Empty prefix-codes slice; WriteContextMap builds its own.
         let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+        let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
         let empty_freqs: [Vec<u16>; 0] = [];
         let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
         let cm_entropy = EntropyCode {
             context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
             num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
             prefix_codes: &empty_codes,
+            hybrid_uint_configs: &empty_configs,
             num_prefix_codes: 0,
             orig_context_map: None,
             orig_num_contexts: 0,
@@ -663,12 +665,15 @@ fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     writer.append_byte_aligned(sections);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     num_threads: usize,
+    speed: crate::Speed,
+    boost: Option<&crate::dark_aq::DarkAqConfig>,
     writer: &mut BitWriter,
 ) {
     let ctx = EncodingContext::new();
@@ -715,6 +720,8 @@ pub(crate) fn encode_frame(
             dc_gx,
             dc_gy,
             setup_budget,
+            speed,
+            boost,
         )
     });
 
@@ -966,6 +973,8 @@ fn setup_dc_group(
     dc_gx: usize,
     dc_gy: usize,
     num_threads: usize,
+    speed: crate::Speed,
+    boost: Option<&crate::dark_aq::DarkAqConfig>,
 ) -> (DcGroupData, usize, usize) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -1014,6 +1023,7 @@ fn setup_dc_group(
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
         num_threads,
+        speed,
     );
 
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
@@ -1050,6 +1060,20 @@ fn setup_dc_group(
             }
             // else: leave reverted to DCT8.
         }
+    }
+
+    // Optional superblock Variance-Boost + Dark-AQ (opt-in via JIXEL_BOOST). Runs
+    // after AC-strategy selection so it only reallocates quant magnitude and leaves
+    // transform choice untouched. Unset env ⇒ no-op, byte-identical field.
+    if let Some(boost) = boost {
+        crate::dark_aq::apply_boost(
+            boost,
+            opsin,
+            &mut dc_data.raw_quant_field,
+            dc_group_x0,
+            dc_group_y0,
+            distp.distance,
+        );
     }
 
     (dc_data, dc_group_xsize_groups, dc_group_ysize_groups)

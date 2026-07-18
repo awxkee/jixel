@@ -460,8 +460,8 @@ pub(crate) type PrepareReconstructionFn =
     unsafe fn(&Plane<f32>, usize, usize, usize, usize, &[f32], &mut [f32], &mut [f32]);
 
 thread_local! {
-    static RECON_SCRATCH: std::cell::RefCell<[[f32; 1024]; 4]> =
-        const { std::cell::RefCell::new([[0.0; 1024]; 4]) };
+    static RECON_SCRATCH: std::cell::RefCell<[[f32; 1024]; 8]> =
+        const { std::cell::RefCell::new([[0.0; 1024]; 8]) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,7 +665,16 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
 
     RECON_SCRATCH.with_borrow_mut(|scratch| {
         let (coeff_error, rest) = scratch.split_at_mut(3);
-        let spatial_error = &mut rest[0];
+        let [
+            spatial_error,
+            y_error,
+            combined_error,
+            reconstructed,
+            original,
+        ] = rest
+        else {
+            unreachable!()
+        };
         let mut rate = 0.0f32;
         for c in 0..3 {
             rate += unsafe {
@@ -685,12 +694,8 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
             };
         }
 
-        let mut y_error = [0.0f32; 1024];
         reconstruct_error(strategy, &coeff_error[1][..n], &mut y_error[..n]);
         let mut distortion = 0.0f32;
-        let mut combined_error = [0.0f32; 1024];
-        let mut reconstructed = [0.0f32; 1024];
-        let mut original = [0.0f32; 1024];
         for c in 0..3 {
             let factor = if c == 0 { factor_x } else { factor_b };
             let error: &[f32] = if c == 1 {

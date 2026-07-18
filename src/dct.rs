@@ -863,6 +863,75 @@ pub(crate) const INV_WC32: [f32; 16] = [
     1.0 / WC32[15],
 ];
 
+pub(crate) const WC64: [f32; 32] = [
+    0.500_150_6,
+    0.501_358_45,
+    0.503_788_7,
+    0.507_471_14,
+    0.512_451_47,
+    0.518_792_7,
+    0.526_577_3,
+    0.535_909_83,
+    0.546_920_4,
+    0.559_769_8,
+    0.574_655_2,
+    0.591_818_5,
+    0.611_557_36,
+    0.634_238_96,
+    0.660_319_8,
+    0.690_372_1,
+    0.725_120_54,
+    0.765_494_17,
+    0.812_702_1,
+    0.868_344_7,
+    0.934_583_6,
+    1.014_408_2,
+    1.112_071_6,
+    1.233_832_7,
+    1.389_293_9,
+    1.593_972_3,
+    1.874_676,
+    2.282_05,
+    2.924_628_5,
+    4.084_611,
+    6.796_750_5,
+    20.373_878,
+];
+pub(crate) const INV_WC64: [f32; 32] = [
+    1.0 / WC64[0],
+    1.0 / WC64[1],
+    1.0 / WC64[2],
+    1.0 / WC64[3],
+    1.0 / WC64[4],
+    1.0 / WC64[5],
+    1.0 / WC64[6],
+    1.0 / WC64[7],
+    1.0 / WC64[8],
+    1.0 / WC64[9],
+    1.0 / WC64[10],
+    1.0 / WC64[11],
+    1.0 / WC64[12],
+    1.0 / WC64[13],
+    1.0 / WC64[14],
+    1.0 / WC64[15],
+    1.0 / WC64[16],
+    1.0 / WC64[17],
+    1.0 / WC64[18],
+    1.0 / WC64[19],
+    1.0 / WC64[20],
+    1.0 / WC64[21],
+    1.0 / WC64[22],
+    1.0 / WC64[23],
+    1.0 / WC64[24],
+    1.0 / WC64[25],
+    1.0 / WC64[26],
+    1.0 / WC64[27],
+    1.0 / WC64[28],
+    1.0 / WC64[29],
+    1.0 / WC64[30],
+    1.0 / WC64[31],
+];
+
 #[inline]
 pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
     let mut tmp = [0.0f32; 32];
@@ -882,6 +951,25 @@ pub(crate) fn dct1d_32(buf: &mut [f32; 32]) {
     for i in 0..16 {
         buf[2 * i] = tmp[i];
         buf[2 * i + 1] = tmp[16 + i];
+    }
+}
+
+#[inline]
+pub(crate) fn dct1d_64(buf: &mut [f32; 64]) {
+    let mut tmp = [0.0f32; 64];
+    for i in 0..32 {
+        tmp[i] = buf[i] + buf[63 - i];
+        tmp[32 + i] = (buf[i] - buf[63 - i]) * WC64[i];
+    }
+    dct1d_32(<&mut [f32; 32]>::try_from(&mut tmp[..32]).unwrap());
+    dct1d_32(<&mut [f32; 32]>::try_from(&mut tmp[32..]).unwrap());
+    tmp[32] = fmla(tmp[32], std::f32::consts::SQRT_2, tmp[33]);
+    for i in 33..63 {
+        tmp[i] += tmp[i + 1];
+    }
+    for i in 0..32 {
+        buf[2 * i] = tmp[i];
+        buf[2 * i + 1] = tmp[32 + i];
     }
 }
 
@@ -1004,6 +1092,31 @@ macro_rules! inv_dct_square {
 inv_dct_square!(inv_dct8x8, 64, 8, inv_dct1d_8_arr);
 inv_dct_square!(inv_dct16x16, 256, 16, inv_dct1d_16);
 inv_dct_square!(inv_dct32x32, 1024, 32, inv_dct1d_32);
+
+#[inline]
+fn inv_dct1d_64(buf: &mut [f32; 64]) {
+    const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut tmp = [0.0f32; 64];
+    for i in 0..32 {
+        tmp[i] = buf[2 * i];
+        tmp[32 + i] = buf[2 * i + 1];
+    }
+    for i in (33..=62).rev() {
+        tmp[i] -= tmp[i + 1];
+    }
+    tmp[32] = (tmp[32] - tmp[33]) * IS2;
+    inv_dct1d_32(<&mut [f32; 32]>::try_from(&mut tmp[32..]).unwrap());
+    for i in 0..32 {
+        tmp[32 + i] *= INV_WC64[i];
+    }
+    inv_dct1d_32(<&mut [f32; 32]>::try_from(&mut tmp[..32]).unwrap());
+    for i in 0..32 {
+        buf[i] = (tmp[i] + tmp[32 + i]) * 0.5;
+        buf[63 - i] = (tmp[i] - tmp[32 + i]) * 0.5;
+    }
+}
+
+inv_dct_square!(inv_dct64x64, 4096, 64, inv_dct1d_64);
 
 #[inline(always)]
 fn inv_dct1d_8_arr(buf: &mut [f32; 8]) {
@@ -1166,6 +1279,88 @@ pub(crate) fn dct32x32_scalar(input: &[f32; 1024], output: &mut [f32; 1024]) {
             output[u * 32 + v] = row[u] * scale;
         }
     }
+}
+
+static DCT_METHOD_64X64: OnceLock<Arc<DctFn<4096>>> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_dct64x64() -> &'static DctFn<4096> {
+    DCT_METHOD_64X64
+        .get_or_init(|| {
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return Arc::new(|input, output| unsafe {
+                    crate::neon::dct64x64_neon(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Arc::new(|input, output| unsafe {
+                    crate::avx::dct64x64_avx2(input, output)
+                });
+            }
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+            if is_x86_feature_detected!("sse4.1") {
+                return Arc::new(|input, output| unsafe {
+                    crate::sse::dct64x64_sse41(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+            return Arc::new(|input, output| unsafe { crate::wasm::dct64x64_wasm(input, output) });
+            Arc::new(dct64x64_scalar)
+        })
+        .as_ref()
+}
+
+pub(crate) fn dct64x64(input: &[f32; 4096], output: &mut [f32; 4096]) {
+    selected_dct64x64()(input, output);
+}
+
+/// Scalar DCT64 used only by the slow encoder tier.
+pub(crate) fn dct64x64_scalar(input: &[f32; 4096], output: &mut [f32; 4096]) {
+    let mut after_col_dct = [0.0f32; 4096];
+    let mut col = [0.0f32; 64];
+    for u in 0..64 {
+        for i in 0..64 {
+            col[i] = input[i * 64 + u];
+        }
+        dct1d_64(&mut col);
+        for v in 0..64 {
+            after_col_dct[v * 64 + u] = col[v];
+        }
+    }
+
+    let scale = 1.0 / 4096.0;
+    for v in 0..64 {
+        let row: &mut [f32; 64] = (&mut after_col_dct[v * 64..v * 64 + 64])
+            .try_into()
+            .unwrap();
+        dct1d_64(row);
+        for u in 0..64 {
+            output[u * 64 + v] = row[u] * scale;
+        }
+    }
+}
+
+/// Extract the 8x8 block DC grid from the lowest frequencies of DCT64X64.
+pub(crate) fn dc_from_dct64x64(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
+    const RESAMPLE: [f32; 8] = [
+        1.0,
+        0.993_686_6,
+        0.974_886_83,
+        0.944_018_07,
+        0.901_764_2,
+        0.849_057_5,
+        0.787_054_9,
+        0.717_108_13,
+    ];
+    let mut low = [0.0f32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            low[y * 8 + x] = coeffs[y * 64 + x] * RESAMPLE[x] * RESAMPLE[y];
+        }
+    }
+    inv_dct8x8(&low, dc);
 }
 
 /// `DCTResampleScales<32, 4>` from libjxl `dct_scales.h`. Used to rescale the
@@ -1973,6 +2168,98 @@ mod tests {
                 i,
                 dsum[i],
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn dct64_constant_is_pure_dc_and_extracts_block_dcs() {
+        let input = [2.0f32; 4096];
+        let mut coeffs = [0.0f32; 4096];
+        dct64x64_scalar(&input, &mut coeffs);
+        assert!((coeffs[0] - 2.0).abs() < 1e-5);
+        let ac_energy: f32 = coeffs[1..].iter().map(|v| v * v).sum();
+        assert!(ac_energy < 1e-7, "constant DCT64 AC energy {ac_energy}");
+
+        let mut dc = [0.0f32; 64];
+        dc_from_dct64x64(&coeffs, &mut dc);
+        for (i, value) in dc.into_iter().enumerate() {
+            assert!((value - 2.0).abs() < 1e-4, "dc[{i}]={value}");
+        }
+    }
+
+    #[test]
+    fn recursive_dct1d_64_matches_reference_and_inverts() {
+        let mut input = [0.0f32; 64];
+        for (i, value) in input.iter_mut().enumerate() {
+            *value = (i as f32 * 0.173).sin() + (i as f32 * 0.071).cos() * 0.25;
+        }
+        let mut expected = [0.0f32; 64];
+        for (k, dst) in expected.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for (x, &value) in input.iter().enumerate() {
+                sum += value * (std::f32::consts::PI * (2 * x + 1) as f32 * k as f32 / 128.0).cos();
+            }
+            *dst = if k == 0 {
+                sum
+            } else {
+                std::f32::consts::SQRT_2 * sum
+            };
+        }
+
+        let mut got = input;
+        dct1d_64(&mut got);
+        for i in 0..64 {
+            assert!(
+                (got[i] - expected[i]).abs() < 2e-4,
+                "dct[{i}]={} want={}",
+                got[i],
+                expected[i]
+            );
+        }
+        inv_dct1d_64(&mut got);
+        for i in 0..64 {
+            assert!(
+                (got[i] - input[i]).abs() < 2e-5,
+                "idct[{i}]={} want={}",
+                got[i],
+                input[i]
+            );
+        }
+    }
+
+    #[test]
+    fn dc_from_dct64x64_inverts_low_frequency_injection() {
+        const R: [f32; 8] = [
+            1.0,
+            0.993_686_6,
+            0.974_886_83,
+            0.944_018_07,
+            0.901_764_2,
+            0.849_057_5,
+            0.787_054_9,
+            0.717_108_13,
+        ];
+        let mut want = [0.0f32; 64];
+        for (i, value) in want.iter_mut().enumerate() {
+            *value = (i as f32 * 0.37).sin();
+        }
+        let mut low = [0.0f32; 64];
+        dct8x8_scalar(&want, &mut low);
+        let mut coeffs = [0.0f32; 4096];
+        for y in 0..8 {
+            for x in 0..8 {
+                coeffs[y * 64 + x] = low[y * 8 + x] / (R[x] * R[y]);
+            }
+        }
+        let mut got = [0.0f32; 64];
+        dc_from_dct64x64(&coeffs, &mut got);
+        for i in 0..64 {
+            assert!(
+                (got[i] - want[i]).abs() < 2e-5,
+                "dc[{i}]={} want={}",
+                got[i],
+                want[i]
             );
         }
     }

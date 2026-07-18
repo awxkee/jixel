@@ -161,6 +161,7 @@ pub(crate) fn build_lz_code_no_cluster(
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; num_contexts],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
@@ -203,6 +204,7 @@ pub(crate) fn build_ac_lz_code(streams: &[Vec<AcLz>], num_contexts: usize) -> Ow
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,

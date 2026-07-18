@@ -29,6 +29,7 @@
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
 use crate::color_encoding::write_color_encoding_with_icc;
+use crate::dark_aq::DarkAqConfig;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::image::{Image3F, Image3Si};
@@ -216,6 +217,14 @@ impl ToneMappingParams {
     }
 }
 
+/// Encoder speed/transform-search tradeoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speed {
+    #[default]
+    Fast,
+    Slow,
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub distance: f32,
@@ -264,6 +273,11 @@ pub struct EncodeConfig {
     /// ToneMapping `linear_below` (nits, or 0..1 if relative). Default 0.
     pub linear_below: f32,
     pub num_threads: usize,
+    pub speed: Speed,
+    /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
+    /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
+    /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
+    pub boost: Option<DarkAqConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +310,9 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) linear_below: f32,
     /// Worker-thread count for VarDCT encoding (see `EncodeConfig::num_threads`).
     pub(crate) num_threads: usize,
+    pub(crate) speed: Speed,
+    /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
+    pub(crate) boost: Option<DarkAqConfig>,
 }
 
 impl Default for EncodeConfig {
@@ -315,6 +332,8 @@ impl Default for EncodeConfig {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
+            speed: Speed::Fast,
+            boost: Some(DarkAqConfig::default()),
         }
     }
 }
@@ -339,6 +358,8 @@ impl Default for EncodeConfigImpl {
             relative_to_max_display: false,
             linear_below: 0.0,
             num_threads: 1,
+            speed: Speed::Fast,
+            boost: Some(DarkAqConfig::default()),
         }
     }
 }
@@ -410,6 +431,18 @@ impl EncodeConfigImpl {
         self.with_progressive(config.progressive)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
+            .with_speed(config.speed)
+            .with_boost(config.boost)
+    }
+
+    pub(crate) fn with_boost(mut self, boost: Option<DarkAqConfig>) -> Self {
+        self.boost = boost;
+        self
+    }
+
+    pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
+        self
     }
 
     /// Mark the image as grayscale (declares a Gray color space).
@@ -451,6 +484,19 @@ impl EncodeConfig {
     /// See [`distance_from_quality`] for the mapping.
     pub fn with_quality(self, quality: f32) -> Self {
         self.with_distance(distance_from_quality(quality))
+    }
+
+    /// Enable superblock Variance-Boost / Dark-AQ quant-field modulation (lossy only).
+    /// [`DarkAqConfig::default`] is the validated Dark-AQ preset. See [`DarkAqConfig`].
+    pub fn with_dark_aq_config(mut self, boost: DarkAqConfig) -> Self {
+        self.boost = Some(boost);
+        self
+    }
+
+    /// Enable Dark-AQ with the validated defaults (equivalent to
+    /// `with_boost(BoostCfg::default())`).
+    pub fn with_dark_aq(self) -> Self {
+        self.with_dark_aq_config(DarkAqConfig::default())
     }
 
     /// Replace the color encoding (white point / primaries / transfer / intent).
@@ -523,6 +569,12 @@ impl EncodeConfig {
         self.num_threads = n;
         self
     }
+
+    /// Select the transform-search speed/effort tradeoff.
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
+        self
+    }
 }
 
 pub fn distance_from_quality(quality: f32) -> f32 {
@@ -584,6 +636,7 @@ pub fn encode_image(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -657,6 +710,7 @@ pub fn encode_image_with_alpha(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -863,6 +917,7 @@ fn encode_gray_impl(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1100,6 +1155,7 @@ fn encode_gray_high_depth_impl(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1179,6 +1235,7 @@ fn encode_high_depth_rgba(
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
+                .with_speed(config.speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1339,7 +1396,7 @@ fn encode_f32_lossless_rgba(
         config.orientation,
         &mut w,
     );
-    encode_frame_lossless_float(&image3s, alpha.as_ref(), &mut w);
+    encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
     Ok(finalize_container(
@@ -1634,6 +1691,8 @@ pub(crate) fn encode_with_config(
         config.alpha.as_ref(),
         &coeff_shifts,
         config.num_threads.max(1),
+        config.speed,
+        config.boost.as_ref(),
         &mut w,
     );
     let codestream = w.into_bytes();
@@ -1799,6 +1858,8 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         eff_bits,
         config.progressive,
         num_color,
+        config.speed,
+        config.num_threads,
         &mut w,
     );
     let codestream = w.into_bytes();
@@ -2069,6 +2130,12 @@ mod tests {
     }
 
     #[test]
+    fn default_speed_is_fast() {
+        assert_eq!(Speed::default(), Speed::Fast);
+        assert_eq!(EncodeConfig::default().speed, Speed::Fast);
+    }
+
+    #[test]
     #[should_panic(expected = "quality must not be NaN")]
     fn quality_nan_panics() {
         let _ = distance_from_quality(f32::NAN);
@@ -2179,8 +2246,89 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn rgb8_slow_dct64_lossy() {
+        const SIDE: usize = 64;
+        let pixels: Vec<u8> = (0..SIDE * SIDE * 3).map(|i| (i % 251) as u8).collect();
+        ok(encode_image(
+            &pixels,
+            SIDE,
+            SIDE,
+            &EncodeConfig::default()
+                .with_distance(3.0)
+                .with_speed(Speed::Slow),
+        ));
+    }
+
+    #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgb8_lossless_slow_adaptive() {
+        ok(encode_image(
+            &rgb8(),
+            W,
+            H,
+            &lossless().with_speed(Speed::Slow),
+        ));
+    }
+
+    #[test]
+    fn lossless_output_is_independent_of_thread_count() {
+        const WIDTH: usize = 257;
+        const HEIGHT: usize = 257;
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
+            .collect();
+
+        for speed in [Speed::Fast, Speed::Slow] {
+            let single = encode_image(
+                &input,
+                WIDTH,
+                HEIGHT,
+                &lossless().with_speed(speed).with_num_threads(1),
+            )
+            .expect("single-threaded lossless encode failed");
+            let threaded = encode_image(
+                &input,
+                WIDTH,
+                HEIGHT,
+                &lossless().with_speed(speed).with_num_threads(4),
+            )
+            .expect("multi-threaded lossless encode failed");
+
+            assert_eq!(single, threaded, "output changed for {speed:?}");
+        }
+    }
+
+    #[test]
+    fn local_palette_rgb_and_rgba_are_thread_deterministic() {
+        const WIDTH: usize = 257;
+        const HEIGHT: usize = 33;
+        let rgb: Vec<u8> = (0..WIDTH * HEIGHT)
+            .flat_map(|i| {
+                let x = i % WIDTH;
+                let y = i / WIDTH;
+                let c = ((x / 8 + y / 8) & 15) as u8;
+                [c * 13, c * 7, c * 3]
+            })
+            .collect();
+        let rgba: Vec<u8> = rgb
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255 - pixel[0]])
+            .collect();
+        let one = lossless().with_speed(Speed::Slow).with_num_threads(1);
+        let many = lossless().with_speed(Speed::Slow).with_num_threads(4);
+
+        assert_eq!(
+            encode_image(&rgb, WIDTH, HEIGHT, &one).unwrap(),
+            encode_image(&rgb, WIDTH, HEIGHT, &many).unwrap()
+        );
+        assert_eq!(
+            encode_image_with_alpha(&rgba, WIDTH, HEIGHT, &one).unwrap(),
+            encode_image_with_alpha(&rgba, WIDTH, HEIGHT, &many).unwrap()
+        );
     }
 
     #[test]

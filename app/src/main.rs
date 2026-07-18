@@ -8,7 +8,7 @@
 
 use std::num::NonZero;
 // use image::imageops::FilterType;
-use jixel::{ColorEncoding, EncodeConfig};
+use jixel::{ColorEncoding, EncodeConfig, Speed};
 use std::path::Path;
 use std::thread::available_parallelism;
 use std::time::Instant;
@@ -31,9 +31,10 @@ fn main() {
             // false,
             // &FlMeta::srgb(),
             &EncodeConfig::default()
-                .with_lossless(false)
+                .with_lossless(true)
                 .with_quality(90.)
                 .with_progressive(false)
+                .with_speed(Speed::Fast)
                 .with_num_threads(
                     available_parallelism()
                         .unwrap_or(NonZero::new(1).unwrap())
@@ -51,9 +52,10 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(false)
-            .with_quality(90.)
-            .with_progressive(true)
+            .with_lossless(true)
+            .with_quality(80.)
+            .with_speed(Speed::Fast)
+            .with_progressive(false)
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();

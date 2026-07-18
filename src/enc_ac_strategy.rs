@@ -31,7 +31,7 @@
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32,
+    STRATEGY_DCT32X32, STRATEGY_DCT64X64,
 };
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
@@ -47,6 +47,11 @@ fn use_dct8_only(distance: f32) -> bool {
     distance <= DCT8_ONLY_MAX_DISTANCE
 }
 
+#[inline]
+fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
+    speed == crate::Speed::Slow && distance >= 3.0
+}
+
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
 /// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
@@ -56,11 +61,13 @@ const BIAS_RECT: f32 = 1.0;
 const BIAS_16X16: f32 = 1.0;
 const BIAS_32X32: f32 = 1.0;
 const BIAS_RECT32: f32 = 1.10;
+const BIAS_64X64: f32 = 1.0;
 
 const MERGE_MARGIN_PAIR_HQ: f32 = 0.04;
 const MERGE_MARGIN_16_HQ: f32 = 0.08;
 const MERGE_MARGIN_32_RECT_HQ: f32 = 0.11;
 const MERGE_MARGIN_32_HQ: f32 = 0.14;
+const MERGE_MARGIN_64_HQ: f32 = 0.16;
 
 const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.20;
 const MERGE_MARGIN_FADE_START: f32 = 1.0;
@@ -117,6 +124,12 @@ fn gather_pixels(
 ) {
     let pw = plane.xsize();
     let ph = plane.ysize();
+    if width <= pw.saturating_sub(px) && height <= ph.saturating_sub(py) {
+        for (v, dst) in dst.chunks_exact_mut(width).take(height).enumerate() {
+            dst.copy_from_slice(&plane.row(py + v)[px..px + width]);
+        }
+        return;
+    }
     let safe_w = width.min(pw.saturating_sub(px));
     let safe_h = height.min(ph.saturating_sub(py));
     for v in 0..height {
@@ -254,6 +267,59 @@ fn strategy_cost(
         cmap_factor,
         DistortionModel::Coefficient,
     )
+}
+
+/// Coefficient-domain cost for DCT64. Kept separate from the standard chooser
+/// so the hot-path scratch and reconstruction reranker remain sized for 32x32.
+#[allow(clippy::too_many_arguments)]
+fn strategy_cost64(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    matrices: &DequantMatrices,
+    meta_r: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+) -> f32 {
+    let mut coeffs = Box::new([[0.0f32; 4096]; 3]);
+    let mut input = Box::new([0.0f32; 4096]);
+    for (c, coeff) in coeffs.iter_mut().enumerate() {
+        gather_pixels(opsin.plane(c), px, py, 64, 64, &mut input[..]);
+        (ctx.dct64x64)(&input, coeff);
+    }
+    apply_cfl_large(&mut coeffs, cmap_factor);
+
+    let mut distortion = 0.0f32;
+    let mut rate = 0.0f32;
+    for c in 0..3 {
+        let (d, r) = channel_rd(
+            ctx.sse_and_rate,
+            ctx.rate_log2_lut,
+            &coeffs[c],
+            &matrices.inv_matrix_64x64(c)[..],
+            c,
+            qac,
+            if c == 0 { qm_mult_x } else { 1.0 },
+            distance,
+            8,
+            8,
+        );
+        distortion += CHANNEL_WEIGHT[c] * d;
+        rate += r;
+    }
+    distortion + RD_LAMBDA * (rate + meta_r)
+}
+
+#[inline]
+fn apply_cfl_large(coeffs: &mut [[f32; 4096]; 3], cmap_factor: [f32; 3]) {
+    let [x, y, b] = coeffs;
+    for ((xv, bv), &yv) in x.iter_mut().zip(b.iter_mut()).zip(y.iter()) {
+        *xv -= cmap_factor[0] * yv;
+        *bv -= cmap_factor[2] * yv;
+    }
 }
 
 /// Reconstruction-based RD cost used by the second-pass transform rerank.
@@ -1112,11 +1178,12 @@ pub(crate) fn fill_ac_strategy(
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
     num_threads: usize,
+    speed: crate::Speed,
 ) -> f32 {
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
     // DCT8 wins the high-quality RD comparison.
-    if use_dct8_only(distance) {
+    if speed == crate::Speed::Fast || use_dct8_only(distance) {
         return 0.0;
     }
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
@@ -1187,6 +1254,54 @@ pub(crate) fn fill_ac_strategy(
         benefit
     };
 
+    // DCT64 is deliberately restricted to the most expensive tier and low
+    // quality. It exactly covers one 64px strategy tile, so each aligned full
+    // tile can be represented without crossing the encoder's stripe boundary.
+    if use_dct64(speed, distance) {
+        for by in (0..ysize).step_by(8) {
+            for bx in (0..xsize).step_by(8) {
+                if !ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT64X64) {
+                    continue;
+                }
+                let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
+                let cost64 = BIAS_64X64
+                    * strategy_cost64(
+                        ctx,
+                        opsin,
+                        dc_group_px + bx * 8,
+                        dc_group_py + by * 8,
+                        region_qac(quant_field, bx, by, 8, 8, scale, distance),
+                        qm_mult_x,
+                        matrices,
+                        meta_r,
+                        distance,
+                        cmap,
+                    );
+                let mut cost32 = 0.0f32;
+                for sy in [0usize, 4] {
+                    for sx in [0usize, 4] {
+                        cost32 += strategy_cost(
+                            ctx,
+                            STRATEGY_DCT32X32,
+                            opsin,
+                            dc_group_px + (bx + sx) * 8,
+                            dc_group_py + (by + sy) * 8,
+                            region_qac(quant_field, bx + sx, by + sy, 4, 4, scale, distance),
+                            qm_mult_x,
+                            matrices,
+                            meta_r,
+                            distance,
+                            cmap,
+                        );
+                    }
+                }
+                if merge_beats_dct8(cost64, cost32, distance, MERGE_MARGIN_64_HQ) {
+                    ac_strategy.set_first(bx, by, STRATEGY_DCT64X64);
+                }
+            }
+        }
+    }
+
     // Second pass — reconstruction-based rerank. The fast selector over-merges at
     // high quality; here we revisit only the *selected* large transforms and
     // downgrade a merge to its tiled DCT8 when the SSIM-reconstruction RD cost
@@ -1233,6 +1348,11 @@ fn rerank_large_transforms(
 ) {
     let mut downgrades: Vec<(usize, usize, usize, usize)> = Vec::new();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
+        // DCT64 is an explicitly gated slow-tier choice. The reconstruction
+        // selector uses 32x32 scratch and intentionally does not rerank it.
+        if strat == STRATEGY_DCT64X64 {
+            continue;
+        }
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
         let cyb = AcStrategyImage::covered_blocks_y_of(strat);
         if cxb * cyb <= 1 {
@@ -1289,15 +1409,15 @@ fn rerank_large_transforms(
 mod tests {
     use super::{
         DCT8_ONLY_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ, MERGE_MARGIN_PAIR_HQ,
-        aggregate_qac_2x2, aggregate_quant, cmap_factors, merge_beats_dct8, merge_margin,
-        strategy_cost, sub8_strategy_costs, use_dct8_only,
+        aggregate_qac_2x2, aggregate_quant, cmap_factors, fill_ac_strategy, merge_beats_dct8,
+        merge_margin, strategy_cost, sub8_strategy_costs, use_dct8_only, use_dct64,
     };
     use crate::dc_group_data::{
-        STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT16X8,
-        STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+        AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
+        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT64X64,
     };
     use crate::encoding_context::EncodingContext;
-    use crate::image::{Image3F, ImageSB};
+    use crate::image::{Image3F, ImageB, ImageSB};
     use crate::inflated_cost::{
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
@@ -1311,6 +1431,48 @@ mod tests {
         assert!(use_dct8_only(0.5));
         assert!(!use_dct8_only(0.500_001));
         assert!(!use_dct8_only(1.0));
+    }
+
+    #[test]
+    fn dct64_is_gated_to_slow_at_distance_three() {
+        assert!(!use_dct64(crate::Speed::Fast, 3.0));
+        assert!(!use_dct64(crate::Speed::Slow, 2.999_999));
+        assert!(use_dct64(crate::Speed::Slow, 3.0));
+        assert!(use_dct64(crate::Speed::Slow, 6.0));
+    }
+
+    #[test]
+    fn dct64_selection_obeys_gate() {
+        let ctx = EncodingContext::new();
+        let opsin = Image3F::new(64, 64);
+        let matrices = DequantMatrices::new();
+        let maps = ImageSB::new_fill(1, 1, 0);
+
+        let select = |speed, distance| {
+            let mut qf = ImageB::new_fill(8, 8, 8);
+            let mut strategies = AcStrategyImage::new(8, 8);
+            fill_ac_strategy(
+                &ctx,
+                &opsin,
+                0,
+                0,
+                distance,
+                1.0,
+                2,
+                &matrices,
+                &mut qf,
+                &maps,
+                &maps,
+                &mut strategies,
+                1,
+                speed,
+            );
+            strategies.raw_strategy(0, 0)
+        };
+
+        assert_ne!(select(crate::Speed::Fast, 3.0), STRATEGY_DCT64X64);
+        assert_ne!(select(crate::Speed::Slow, 2.999), STRATEGY_DCT64X64);
+        assert_eq!(select(crate::Speed::Slow, 3.0), STRATEGY_DCT64X64);
     }
 
     #[test]

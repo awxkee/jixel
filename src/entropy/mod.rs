@@ -38,13 +38,15 @@ mod token;
 mod write;
 
 pub(crate) use ans::{AnsEncSymbolInfo, write_ans_tokens};
-pub(crate) use cluster::cluster_histograms;
+pub(crate) use cluster::{cluster_histograms, cluster_histograms_refined};
 pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;
 pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
-pub(crate) use token::{Token, pack_signed, uint_encode};
+pub(crate) use token::{
+    HybridUintConfig, Token, pack_signed, uint_encode, uint_encode_with_config,
+};
 pub(crate) use write::{
     build_entropy_code_no_cluster, build_huffman_codes, optimize_entropy_code,
-    optimize_entropy_code_ac, write_context_map, write_entropy_code, write_prefix_codes,
-    write_token,
+    optimize_entropy_code_ac, select_hybrid_config, write_context_map, write_entropy_code,
+    write_prefix_codes, write_token,
 };

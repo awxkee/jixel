@@ -223,7 +223,7 @@ fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWri
     // num_contexts = 1: decoder skips context map entirely — write prefix
     // codes directly (no write_context_map).
     w.write(1, 0); // no LZ77 for pixel entropy code
-    write_prefix_codes(&pixel_code.prefix_codes, w);
+    write_prefix_codes(&pixel_code.prefix_codes, &pixel_code.hybrid_uint_configs, w);
 }
 
 /// Like `write_tree_and_pixel_histograms` but emits a 2-leaf tree that splits on

@@ -29,11 +29,13 @@
 
 use super::ans::AnsEncSymbolInfo;
 use super::prefix_code::PrefixCode;
+use super::token::HybridUintConfig;
 
 pub(crate) struct EntropyCode<'a> {
     pub(crate) context_map: &'a [u8],
     pub(crate) num_contexts: usize,
     pub(crate) prefix_codes: &'a [PrefixCode],
+    pub(crate) hybrid_uint_configs: &'a [HybridUintConfig],
     #[allow(unused)]
     pub(crate) num_prefix_codes: usize,
     /// Original (pre-cluster) context map. None for static codes.
@@ -50,6 +52,7 @@ pub(crate) struct EntropyCode<'a> {
 pub(crate) struct OwnedEntropyCode {
     pub(crate) context_map: Vec<u8>,
     pub(crate) prefix_codes: Vec<PrefixCode>,
+    pub(crate) hybrid_uint_configs: Vec<HybridUintConfig>,
     /// Pre-cluster context map, if clustering was applied.
     pub(crate) orig_context_map: Option<Vec<u8>>,
     pub(crate) orig_num_contexts: usize,
@@ -65,6 +68,7 @@ impl OwnedEntropyCode {
             context_map: &self.context_map,
             num_contexts: self.context_map.len(),
             prefix_codes: &self.prefix_codes,
+            hybrid_uint_configs: &self.hybrid_uint_configs,
             num_prefix_codes: self.prefix_codes.len(),
             orig_context_map: self.orig_context_map.as_deref(),
             orig_num_contexts: self.orig_num_contexts,

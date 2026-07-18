@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
+use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32, WC64};
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
 
@@ -442,6 +442,27 @@ fn dct1d_32_s(c: &mut [float32x4_t; 32]) {
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn dct1d_64_s(c: &mut [float32x4_t; 64]) {
+    let mut e = [c[0]; 32];
+    let mut o = [c[0]; 32];
+    for i in 0..32 {
+        e[i] = vaddq_f32(c[i], c[63 - i]);
+        o[i] = vmulq_n_f32(vsubq_f32(c[i], c[63 - i]), WC64[i]);
+    }
+    dct1d_32_s(&mut e);
+    dct1d_32_s(&mut o);
+    o[0] = vfmaq_n_f32(o[1], o[0], std::f32::consts::SQRT_2);
+    for i in 1..31 {
+        o[i] = vaddq_f32(o[i], o[i + 1]);
+    }
+    for i in 0..32 {
+        c[2 * i] = e[i];
+        c[2 * i + 1] = o[i];
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn load_strip(ptr: *const f32) -> float32x4_t {
     unsafe { vld1q_f32(ptr) }
 }
@@ -703,6 +724,38 @@ pub(crate) fn dct32x32_neon(input: &[f32; 1024], output: &mut [f32; 1024]) {
         for u in 0..32 {
             let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
             unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct64x64_neon(input: &[f32; 4096], output: &mut [f32; 4096]) {
+    let mut scratch = MaybeUninit::<[f32; 4096]>::uninit();
+    let dst = scratch.as_mut_ptr() as *mut f32;
+    for strip in 0..16 {
+        let mut c: [float32x4_t; 64] = std::array::from_fn(|row| {
+            load_strip(unsafe { input.get_unchecked(row * 64 + strip * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for tile_idx in 0..16 {
+            let base = tile_idx * 4;
+            let (a, b, cc, d) = transpose_4x4(c[base], c[base + 1], c[base + 2], c[base + 3]);
+            for (lane, value) in [a, b, cc, d].iter().enumerate() {
+                unsafe { vst1q_f32(dst.add((strip * 4 + lane) * 64 + tile_idx * 4), *value) };
+            }
+        }
+    }
+
+    let scratch = unsafe { scratch.assume_init() };
+    let scale = 1.0 / 4096.0;
+    for strip in 0..16 {
+        let mut c: [float32x4_t; 64] = std::array::from_fn(|col| {
+            load_strip(unsafe { scratch.get_unchecked(col * 64 + strip * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for u in 0..64 {
+            let out = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
+            unsafe { vst1q_f32(out.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
         }
     }
 }
@@ -1359,6 +1412,35 @@ mod neon_dct_tests {
             unsafe { dct32x32_neon(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct64x64_neon_matches_scalar() {
+        use crate::dct::dct64x64_scalar;
+        use crate::neon::dct64x64_neon;
+
+        let mut cases = Vec::with_capacity(11);
+        cases.push([0.5f32; 4096]);
+        let mut alternating = [0.0f32; 4096];
+        for (i, value) in alternating.iter_mut().enumerate() {
+            *value = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+        }
+        cases.push(alternating);
+        let mut impulse = [0.0f32; 4096];
+        impulse[63 * 64 + 63] = 1.0;
+        cases.push(impulse);
+        for seed in 0u64..8 {
+            cases.push(fill(seed.wrapping_add(0x6464)));
+        }
+
+        for (case, input) in cases.iter().enumerate() {
+            let mut got = [0.0f32; 4096];
+            let mut want = [0.0f32; 4096];
+            unsafe { dct64x64_neon(input, &mut got) };
+            dct64x64_scalar(input, &mut want);
+            assert_close(&got, &want, &format!("dct64x64 case={case}"));
         }
     }
 
