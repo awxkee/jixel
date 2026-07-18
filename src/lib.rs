@@ -76,7 +76,7 @@ mod wasm;
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
-pub use dark_aq::{DarkAqConfig, DarkAq};
+pub use dark_aq::{DarkAq, DarkAqConfig};
 pub use encode_image::{
     EncodeConfig, Speed, distance_from_quality, encode_image, encode_image_10bit,
     encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32, encode_image_gray,

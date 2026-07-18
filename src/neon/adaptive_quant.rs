@@ -148,6 +148,34 @@ fn dirty_log2f_x4(d: float32x4_t) -> float32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
+#[allow(dead_code)]
+fn dirty_log1pf_x4(d: float32x4_t) -> float32x4_t {
+    let one = vdupq_n_f32(1.0);
+    let a = vaddq_f32(d, one);
+    let ix = vreinterpretq_u32_f32(a);
+    let exponent = vandq_u32(ix, vdupq_n_u32(0x7f80_0000));
+    let n = vreinterpretq_s32_u32(vsubq_u32(vshrq_n_u32(exponent, 23), vdupq_n_u32(0x7f)));
+    let mantissa = vreinterpretq_f32_u32(vorrq_u32(
+        vandq_u32(ix, vdupq_n_u32(0x007f_ffff)),
+        vdupq_n_u32(0x3f80_0000),
+    ));
+    let reduced = vsubq_f32(mantissa, one);
+    let t = vbslq_f32(vceqq_s32(n, vdupq_n_s32(0)), d, reduced);
+
+    let mut p = vdupq_n_f32(0.014539075084030628);
+    p = vmlaf(p, t, vdupq_n_f32(-0.0675969123840332));
+    p = vmlaf(p, t, vdupq_n_f32(0.15056970715522766));
+    p = vmlaf(p, t, vdupq_n_f32(-0.23573730885982513));
+    p = vmlaf(p, t, vdupq_n_f32(0.33125850558280945));
+    p = vmlaf(p, t, vdupq_n_f32(-0.4998837411403656));
+    p = vmlaf(p, t, vdupq_n_f32(0.999998927116394));
+
+    let n = vcvtq_f32_s32(n);
+    vmlaf(n, vdupq_n_f32(0.6931471805599453), vmulq_f32(t, p))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn compute_mask_x4(out_val: float32x4_t) -> float32x4_t {
     let k_base = vdupq_n_f32(-0.7647);
     let k_mul4 = vdupq_n_f32(9.4708735624378946);
@@ -1034,4 +1062,41 @@ pub(crate) fn fill_quant_field(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adaptive_quant::dirty_log1pf;
+
+    #[test]
+    fn dirty_log1pf_x4_matches_scalar_and_ln_1p() {
+        // NEON path only runs where the intrinsics are available.
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+        let inputs = [0.0f32, 1e-4, 0.5, 1.0, 42.0, 256.0, 1.0e5, 5.0e6];
+        for chunk in inputs.chunks(4) {
+            let mut buf = [0f32; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let out = unsafe {
+                let v = vld1q_f32(buf.as_ptr());
+                let r = dirty_log1pf_x4(v);
+                let mut o = [0f32; 4];
+                vst1q_f32(o.as_mut_ptr(), r);
+                o
+            };
+            for (i, &x) in chunk.iter().enumerate() {
+                // Lane-for-lane identical to the scalar reference.
+                assert_eq!(out[i], dirty_log1pf(x), "lane mismatch at x={x}");
+                // And close to the true ln(1+x): absolute error is tiny everywhere.
+                let want = x.ln_1p();
+                assert!(
+                    (out[i] - want).abs() < 1e-5,
+                    "ln_1p({x}) abs err {}",
+                    (out[i] - want).abs()
+                );
+            }
+        }
+    }
 }

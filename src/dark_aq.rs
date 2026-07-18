@@ -26,6 +26,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::adaptive_quant::{dirty_log1pf, fast_exp2};
 use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
 use std::cell::RefCell;
@@ -69,7 +70,7 @@ pub(crate) fn variance_boost_delta(
 ) -> i32 {
     // Work in log-variance: compresses the huge dynamic range of variance and matches
     // the reference (which is a mean of log-variances).
-    let v_log = picked_var.ln_1p();
+    let v_log = dirty_log1pf(picked_var);
     // Low-variance threshold (curve 0): ln(1 + 256).
     const LOW_LOG: f32 = 5.549_076; // (1.0 + 256.0).ln()
     const MAX_BOOST: f32 = 18.0; // max qindex *reduction* for the flattest SBs
@@ -134,6 +135,52 @@ impl DarkAq {
     }
 }
 
+#[inline]
+fn laplacian_abs_sum<const STRIDE: usize>(buf: &[[f32; STRIDE]], h: usize, w: usize) -> (f32, u32) {
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for rows in buf[..h].array_windows::<3>() {
+        let [top, middle, bottom] = rows;
+        for ((&up, &down), &[left, center, right]) in top[1..w - 1]
+            .iter()
+            .zip(bottom[1..w - 1].iter())
+            .zip(middle[..w].array_windows::<3>())
+        {
+            let l = 4.0 * center - up - down - left - right;
+            sum += l.abs();
+            n += 1;
+        }
+    }
+    (sum, n)
+}
+
+#[inline]
+fn box_downsample_2x<const SRC_STRIDE: usize, const DST_STRIDE: usize>(
+    src: &[[f32; SRC_STRIDE]],
+    h: usize,
+    w: usize,
+    dst: &mut [[f32; DST_STRIDE]],
+) -> (usize, usize) {
+    let (hh, ww) = (h / 2, w / 2);
+    for (dst_row, rows) in dst[..hh]
+        .iter_mut()
+        .zip(src[..h].array_windows::<2>().step_by(2))
+    {
+        let [top, bottom] = rows;
+        for (out, (&[top_left, top_right], &[bottom_left, bottom_right])) in
+            dst_row[..ww].iter_mut().zip(
+                top[..w]
+                    .array_windows::<2>()
+                    .step_by(2)
+                    .zip(bottom[..w].array_windows::<2>().step_by(2)),
+            )
+        {
+            *out = 0.25 * (top_left + top_right + bottom_left + bottom_right);
+        }
+    }
+    (hh, ww)
+}
+
 pub(crate) fn dark_structure_stats<T: AqLuma>(
     yp: &[T],
     pw: usize,
@@ -152,9 +199,9 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
     let mut sum = 0f32;
     for (r, row) in buf.iter_mut().enumerate().take(h) {
         let base = (sb_y + r) * pw + sb_x;
-        for c in 0..w {
-            let v = yp[base + c].to_f32() * scale;
-            row[c] = v;
+        for (yp, dst) in yp[base..base + w].iter().zip(row.iter_mut()) {
+            let v = yp.to_f32() * scale;
+            *dst = v;
             sum += v;
         }
     }
@@ -163,44 +210,15 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
         return (mean, 0.0);
     }
     // Full-resolution |Laplacian| (interior 3×3).
-    let mut lap_full = 0f32;
-    let mut nf = 0u32;
-    for r in 1..h - 1 {
-        for c in 1..w - 1 {
-            let l = 4.0 * buf[r][c] - buf[r - 1][c] - buf[r + 1][c] - buf[r][c - 1] - buf[r][c + 1];
-            lap_full += l.abs();
-            nf += 1;
-        }
-    }
+    let (lap_full, nf) = laplacian_abs_sum(&buf, h, w);
     let lap_full = lap_full / nf as f32;
     // 2× box downsample, then |Laplacian| at the coarse scale.
-    let (hh, ww) = (h / 2, w / 2);
+    let mut half = [[0f32; 32]; 32];
+    let (hh, ww) = box_downsample_2x(&buf, h, w, &mut half);
     if hh < 3 || ww < 3 {
         return (mean, 0.0);
     }
-    let mut half = [[0f32; 32]; 32];
-    for r in 0..hh {
-        for c in 0..ww {
-            half[r][c] = 0.25
-                * (buf[2 * r][2 * c]
-                    + buf[2 * r][2 * c + 1]
-                    + buf[2 * r + 1][2 * c]
-                    + buf[2 * r + 1][2 * c + 1]);
-        }
-    }
-    let mut lap_half = 0f32;
-    let mut nh = 0u32;
-    for r in 1..hh - 1 {
-        for c in 1..ww - 1 {
-            let l = 4.0 * half[r][c]
-                - half[r - 1][c]
-                - half[r + 1][c]
-                - half[r][c - 1]
-                - half[r][c + 1];
-            lap_half += l.abs();
-            nh += 1;
-        }
-    }
+    let (lap_half, nh) = laplacian_abs_sum(&half, hh, ww);
     let lap_half = lap_half / nh as f32;
     (mean, (lap_full * lap_half).sqrt())
 }
@@ -238,7 +256,7 @@ pub(crate) fn dark_protection<T: AqLuma>(
     if darkness <= 0.0 {
         return 0;
     }
-    let dark_structure = (mid_energy * darkness).ln_1p();
+    let dark_structure = dirty_log1pf(mid_energy * darkness);
     (dark_structure * d.scale)
         .min(d.max_qidx as f32)
         .max(0.0)
@@ -339,57 +357,50 @@ impl DarkAqConfig {
 /// stride `pw`). Blocks that fall outside `[w, h]` are filled with the SB mean so
 /// they neither create nor suppress boost at the image edge.
 fn subblock_variances(tile: &[f32], pw: usize, w: usize, h: usize) -> [f32; 64] {
+    debug_assert!(pw > 0 && w <= pw && tile.len() >= pw * h);
     let mut subvars = [0f32; 64];
-    // Global mean for edge padding of partial blocks.
-    let mut gsum = 0f32;
-    let mut gn = 0u32;
-    for by in 0..8 {
-        for bx in 0..8 {
+    let valid_block_rows = h.div_ceil(8).min(8);
+    let valid_block_cols = w.div_ceil(8).min(8);
+    for (by, out_row) in subvars.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        if by >= valid_block_rows {
+            out_row.fill(f32::NAN);
+            continue;
+        }
+        let y0 = by * 8;
+        let block_height = (h - y0).min(8);
+        for (bx, out) in out_row.iter_mut().enumerate() {
+            if bx >= valid_block_cols {
+                *out = f32::NAN;
+                continue;
+            }
+            let x0 = bx * 8;
+            let x1 = (x0 + 8).min(w);
             let mut sum = 0f32;
             let mut sum2 = 0f32;
             let mut n = 0u32;
-            for r in 0..8 {
-                let y = by * 8 + r;
-                if y >= h {
-                    break;
-                }
-                let base = y * pw + bx * 8;
-                for c in 0..8 {
-                    if bx * 8 + c >= w {
-                        break;
-                    }
-                    let v = tile[base + c];
+            for row in tile.chunks_exact(pw).skip(y0).take(block_height) {
+                for &v in &row[x0..x1] {
                     sum += v;
                     sum2 += v * v;
                     n += 1;
                 }
             }
-            if n == 0 {
-                subvars[by * 8 + bx] = f32::NAN; // mark; filled below
-            } else {
-                let m = sum / n as f32;
-                subvars[by * 8 + bx] = (sum2 / n as f32 - m * m).max(0.0);
-                gsum += m;
-                gn += 1;
-            }
+            debug_assert!(n > 0);
+            let m = sum / n as f32;
+            *out = (sum2 / n as f32 - m * m).max(0.0);
         }
     }
     // Partial/empty blocks (NaN) get the SB-mean variance so they don't skew the octile.
-    let fill = if gn > 0 {
-        // Mean of the valid variances is a safer neutral than 0 for the octile pick.
-        let (mut vsum, mut vn) = (0f32, 0u32);
-        for v in subvars.iter() {
-            if !v.is_nan() {
-                vsum += *v;
-                vn += 1;
-            }
+    // Mean of the valid variances is a safer neutral than 0 for the octile pick.
+    let (mut vsum, mut vn) = (0f32, 0u32);
+    for &v in &subvars {
+        if !v.is_nan() {
+            vsum += v;
+            vn += 1;
         }
-        let _ = gsum;
-        if vn > 0 { vsum / vn as f32 } else { 0.0 }
-    } else {
-        0.0
-    };
-    for v in subvars.iter_mut() {
+    }
+    let fill = if vn > 0 { vsum / vn as f32 } else { 0.0 };
+    for v in &mut subvars {
         if v.is_nan() {
             *v = fill;
         }
@@ -470,7 +481,7 @@ pub(crate) fn apply_boost(
                 let mut subvars = subblock_variances(&tile, 64, w, h);
                 let pv = sb_octile_variance(&mut subvars, cfg.octile);
                 *dst = pv;
-                ref_acc += pv.ln_1p();
+                ref_acc += dirty_log1pf(pv);
                 ref_n += 1;
             }
         }
@@ -488,8 +499,7 @@ pub(crate) fn apply_boost(
 
                 let mut delta = 0i32;
                 if vb_on {
-                    delta +=
-                        variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
+                    delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
                 }
                 if dark_on {
                     let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
@@ -502,7 +512,7 @@ pub(crate) fn apply_boost(
                     continue;
                 }
                 // qindex delta (negative = finer) → multiplicative field gain.
-                let gain = exp2_fast(-(delta as f32) * cfg.qstep);
+                let gain = fast_exp2(-(delta as f32) * cfg.qstep);
 
                 let bx0 = sbx * 8;
                 let by0 = sby * 8;
@@ -516,12 +526,6 @@ pub(crate) fn apply_boost(
             }
         }
     });
-}
-
-/// `2^x` via `exp(x * ln2)`; boost gains are far off the hot path so std math is fine.
-#[inline]
-fn exp2_fast(x: f32) -> f32 {
-    (x * std::f32::consts::LN_2).exp()
 }
 
 #[cfg(test)]
@@ -559,6 +563,122 @@ mod tests {
         assert_eq!(sb_octile_variance(&mut v.clone(), 1), 7.0);
         assert_eq!(sb_octile_variance(&mut v.clone(), 6), 47.0);
         assert_eq!(sb_octile_variance(&mut v, 8), 63.0);
+    }
+
+    #[test]
+    fn array_windows_laplacian_matches_indexed_reference() {
+        let mut buf = [[0.0f32; 64]; 64];
+        let mut state = 0x1234_5678u32;
+        for row in &mut buf {
+            for value in row {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = (state >> 8) as f32 / (1u32 << 24) as f32;
+            }
+        }
+
+        for (h, w) in [(3, 3), (3, 17), (11, 3), (17, 29), (64, 64)] {
+            let mut expected = 0.0f32;
+            let mut expected_n = 0u32;
+            for r in 1..h - 1 {
+                for c in 1..w - 1 {
+                    let l = 4.0 * buf[r][c]
+                        - buf[r - 1][c]
+                        - buf[r + 1][c]
+                        - buf[r][c - 1]
+                        - buf[r][c + 1];
+                    expected += l.abs();
+                    expected_n += 1;
+                }
+            }
+            let actual = laplacian_abs_sum(&buf, h, w);
+            assert_eq!(actual, (expected, expected_n), "shape {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn array_windows_downsample_matches_indexed_reference() {
+        let mut src = [[0.0f32; 64]; 64];
+        for (r, row) in src.iter_mut().enumerate() {
+            for (c, value) in row.iter_mut().enumerate() {
+                *value = (r * 67 + c * 13) as f32 * 0.125;
+            }
+        }
+
+        for (h, w) in [(2, 2), (2, 17), (11, 2), (17, 29), (64, 64)] {
+            let mut actual = [[f32::NAN; 32]; 32];
+            let shape = box_downsample_2x(&src, h, w, &mut actual);
+            assert_eq!(shape, (h / 2, w / 2));
+            for r in 0..h / 2 {
+                for c in 0..w / 2 {
+                    let expected = 0.25
+                        * (src[2 * r][2 * c]
+                            + src[2 * r][2 * c + 1]
+                            + src[2 * r + 1][2 * c]
+                            + src[2 * r + 1][2 * c + 1]);
+                    assert_eq!(actual[r][c], expected, "shape {w}x{h}, sample {c},{r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sliced_subblock_variances_match_indexed_reference() {
+        fn reference(tile: &[f32], pw: usize, w: usize, h: usize) -> [f32; 64] {
+            let mut out = [f32::NAN; 64];
+            for by in 0..8 {
+                for bx in 0..8 {
+                    let (mut sum, mut sum2, mut n) = (0.0f32, 0.0f32, 0u32);
+                    for r in 0..8 {
+                        let y = by * 8 + r;
+                        if y >= h {
+                            break;
+                        }
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            if x >= w {
+                                break;
+                            }
+                            let v = tile[y * pw + x];
+                            sum += v;
+                            sum2 += v * v;
+                            n += 1;
+                        }
+                    }
+                    if n != 0 {
+                        let mean = sum / n as f32;
+                        out[by * 8 + bx] = (sum2 / n as f32 - mean * mean).max(0.0);
+                    }
+                }
+            }
+            let (mut sum, mut n) = (0.0f32, 0u32);
+            for &v in &out {
+                if !v.is_nan() {
+                    sum += v;
+                    n += 1;
+                }
+            }
+            let fill = if n == 0 { 0.0 } else { sum / n as f32 };
+            for v in &mut out {
+                if v.is_nan() {
+                    *v = fill;
+                }
+            }
+            out
+        }
+
+        let mut tile = [0.0f32; 64 * 64];
+        let mut state = 0x9e37_79b9u32;
+        for value in &mut tile {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = (state >> 8) as f32 / (1u32 << 24) as f32;
+        }
+        for (h, w) in [(0, 0), (1, 1), (7, 9), (8, 8), (17, 31), (63, 64), (64, 64)] {
+            assert_eq!(
+                subblock_variances(&tile, 64, w, h),
+                reference(&tile, 64, w, h),
+                "shape {w}x{h}"
+            );
+        }
     }
 
     #[test]

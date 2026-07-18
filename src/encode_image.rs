@@ -28,8 +28,8 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
-use crate::dark_aq::DarkAqConfig;
 use crate::color_encoding::write_color_encoding_with_icc;
+use crate::dark_aq::DarkAqConfig;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::image::{Image3F, Image3Si};

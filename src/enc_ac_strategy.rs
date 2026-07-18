@@ -117,6 +117,12 @@ fn gather_pixels(
 ) {
     let pw = plane.xsize();
     let ph = plane.ysize();
+    if width <= pw.saturating_sub(px) && height <= ph.saturating_sub(py) {
+        for (v, dst) in dst.chunks_exact_mut(width).take(height).enumerate() {
+            dst.copy_from_slice(&plane.row(py + v)[px..px + width]);
+        }
+        return;
+    }
     let safe_w = width.min(pw.saturating_sub(px));
     let safe_h = height.min(ph.saturating_sub(py));
     for v in 0..height {
