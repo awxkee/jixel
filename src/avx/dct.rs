@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
+use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32, WC64};
 use std::arch::x86_64::*;
 
 #[inline]
@@ -351,6 +351,58 @@ pub(crate) fn dct32x32_avx2(input: &[f32; 1024], output: &mut [f32; 1024]) {
             unsafe {
                 _mm256_storeu_ps(
                     output[u * 32 + g * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_64_flat(c: &mut [__m256; 64]) {
+    let mut evens = [_mm256_undefined_ps(); 32];
+    let mut odds = [_mm256_undefined_ps(); 32];
+    for i in 0..32 {
+        evens[i] = _mm256_add_ps(c[i], c[63 - i]);
+        odds[i] = _mm256_mul_ps(_mm256_sub_ps(c[i], c[63 - i]), _mm256_set1_ps(WC64[i]));
+    }
+    dct1d_32_flat(&mut evens);
+    dct1d_32_flat(&mut odds);
+    odds[0] = _mm256_fmadd_ps(odds[0], _mm256_set1_ps(std::f32::consts::SQRT_2), odds[1]);
+    for i in 1..31 {
+        odds[i] = _mm256_add_ps(odds[i], odds[i + 1]);
+    }
+    for i in 0..32 {
+        c[2 * i] = evens[i];
+        c[2 * i + 1] = odds[i];
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct64x64_avx2(input: &[f32; 4096], output: &mut [f32; 4096]) {
+    let mut colt = [0.0f32; 4096];
+    for g in 0..8 {
+        let mut c: [__m256; 64] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 64 + g * 8..].as_ptr()) });
+        dct1d_64_flat(&mut c);
+        for t in 0..8 {
+            let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (j, v) in tile.iter().enumerate() {
+                unsafe { _mm256_storeu_ps(colt[(g * 8 + j) * 64 + t * 8..].as_mut_ptr(), *v) };
+            }
+        }
+    }
+    let scale = _mm256_set1_ps(1.0 / 4096.0);
+    for g in 0..8 {
+        let mut c: [__m256; 64] = std::array::from_fn(|col| unsafe {
+            _mm256_loadu_ps(colt[col * 64 + g * 8..].as_ptr())
+        });
+        dct1d_64_flat(&mut c);
+        for u in 0..64 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 64 + g * 8..].as_mut_ptr(),
                     _mm256_mul_ps(c[u], scale),
                 );
             }
@@ -929,6 +981,23 @@ mod tests {
             unsafe { dct32x32_avx2(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct64x64_avx2_vs_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::dct64x64_avx2;
+        use crate::dct::dct64x64_scalar;
+        for seed in 0u64..8 {
+            let input: [f32; 4096] = fill(seed.wrapping_add(0x6464));
+            let mut got = [0.0f32; 4096];
+            let mut want = [0.0f32; 4096];
+            unsafe { dct64x64_avx2(&input, &mut got) };
+            dct64x64_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct64x64 seed={seed}"));
         }
     }
 

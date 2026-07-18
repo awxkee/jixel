@@ -38,7 +38,7 @@ pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use dct::{
     dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2,
-    dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
+    dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, dct64x64_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
     inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
 };
 pub(crate) use inflated_cost::{recon_dist_and_rate_avx2, ssim_deficit_avx2};

@@ -2246,6 +2246,20 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn rgb8_slow_dct64_lossy() {
+        const SIDE: usize = 64;
+        let pixels: Vec<u8> = (0..SIDE * SIDE * 3).map(|i| (i % 251) as u8).collect();
+        ok(encode_image(
+            &pixels,
+            SIDE,
+            SIDE,
+            &EncodeConfig::default()
+                .with_distance(3.0)
+                .with_speed(Speed::Slow),
+        ));
+    }
+
+    #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
     }

@@ -2006,7 +2006,7 @@ fn lz77_run_token_count(tokens: &[Token]) -> usize {
         {
             end += 1;
         }
-        if end - i - 1 >= LZ77_MIN_LENGTH as usize {
+        if end - i > LZ77_MIN_LENGTH as usize {
             count += 1;
             i = end;
         } else {

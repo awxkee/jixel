@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16, WC32};
+use crate::dct::{WC4, WC8, WC16, WC32, WC64};
 use core::arch::wasm32::*;
 
 #[derive(Clone, Copy)]
@@ -411,6 +411,28 @@ fn dct1d_32_s(c: &mut [v128; 32]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn dct1d_64_s(c: &mut [v128; 64]) {
+    let s2 = f32x4_splat(std::f32::consts::SQRT_2);
+    let mut e = [f32x4_splat(0.0); 32];
+    let mut o = [f32x4_splat(0.0); 32];
+    for i in 0..32 {
+        e[i] = f32x4_add(c[i], c[63 - i]);
+        o[i] = f32x4_mul(f32x4_sub(c[i], c[63 - i]), f32x4_splat(WC64[i]));
+    }
+    dct1d_32_s(&mut e);
+    dct1d_32_s(&mut o);
+    o[0] = f32x4_add(f32x4_mul(o[0], s2), o[1]);
+    for i in 1..31 {
+        o[i] = f32x4_add(o[i], o[i + 1]);
+    }
+    for i in 0..32 {
+        c[2 * i] = e[i];
+        c[2 * i + 1] = o[i];
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
 fn load_strip(ptr: *const f32) -> v128 {
     unsafe { v128_load(ptr as *const v128) }
 }
@@ -442,6 +464,35 @@ pub(crate) fn dct32x32_wasm(input: &[f32; 1024], output: &mut [f32; 1024]) {
         dct1d_32_s(&mut c);
         for u in 0..32 {
             let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
+            unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct64x64_wasm(input: &[f32; 4096], output: &mut [f32; 4096]) {
+    let mut colt = [0.0f32; 4096];
+    for s in 0..16 {
+        let mut c: [v128; 64] = std::array::from_fn(|r| {
+            load_strip(unsafe { input.get_unchecked(r * 64 + s * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for t in 0..16 {
+            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+            for (j, v) in [a, b, cc, d].iter().enumerate() {
+                let p = unsafe { colt.get_unchecked_mut((s * 4 + j) * 64 + t * 4..) };
+                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
+            }
+        }
+    }
+    let scale = f32x4_splat(1.0 / 4096.0);
+    for q in 0..16 {
+        let mut c: [v128; 64] = std::array::from_fn(|col| {
+            load_strip(unsafe { colt.get_unchecked(col * 64 + q * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for u in 0..64 {
+            let p = unsafe { output.get_unchecked_mut(u * 64 + q * 4..) };
             unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
         }
     }
@@ -1069,6 +1120,21 @@ mod neon_dct_tests {
             unsafe { dct32x32_wasm(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    fn test_dct64x64_wasm_vs_scalar_random() {
+        use crate::dct::dct64x64_scalar;
+        use crate::wasm::dct64x64_wasm;
+        for seed in 0u64..8 {
+            let input: [f32; 4096] = fill(seed.wrapping_add(0x6464));
+            let mut got = [0.0f32; 4096];
+            let mut want = [0.0f32; 4096];
+            dct64x64_wasm(&input, &mut got);
+            dct64x64_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct64x64 seed={seed}"));
         }
     }
 
