@@ -2289,6 +2289,35 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn local_palette_rgb_and_rgba_are_thread_deterministic() {
+        const WIDTH: usize = 257;
+        const HEIGHT: usize = 33;
+        let rgb: Vec<u8> = (0..WIDTH * HEIGHT)
+            .flat_map(|i| {
+                let x = i % WIDTH;
+                let y = i / WIDTH;
+                let c = ((x / 8 + y / 8) & 15) as u8;
+                [c * 13, c * 7, c * 3]
+            })
+            .collect();
+        let rgba: Vec<u8> = rgb
+            .chunks_exact(3)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255 - pixel[0]])
+            .collect();
+        let one = lossless().with_speed(Speed::Slow).with_num_threads(1);
+        let many = lossless().with_speed(Speed::Slow).with_num_threads(4);
+
+        assert_eq!(
+            encode_image(&rgb, WIDTH, HEIGHT, &one).unwrap(),
+            encode_image(&rgb, WIDTH, HEIGHT, &many).unwrap()
+        );
+        assert_eq!(
+            encode_image_with_alpha(&rgba, WIDTH, HEIGHT, &one).unwrap(),
+            encode_image_with_alpha(&rgba, WIDTH, HEIGHT, &many).unwrap()
+        );
+    }
+
+    #[test]
     fn rgb8_quality() {
         ok(encode_image(
             &rgb8(),

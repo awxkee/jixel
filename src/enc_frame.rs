@@ -557,12 +557,14 @@ fn write_dc_global(
     {
         // Empty prefix-codes slice; WriteContextMap builds its own.
         let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+        let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
         let empty_freqs: [Vec<u16>; 0] = [];
         let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
         let cm_entropy = EntropyCode {
             context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
             num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
             prefix_codes: &empty_codes,
+            hybrid_uint_configs: &empty_configs,
             num_prefix_codes: 0,
             orig_context_map: None,
             orig_num_contexts: 0,

@@ -34,9 +34,99 @@ const TREE_CTX_OFFSET: u32 = 3;
 const TREE_CTX_MULTIPLIER_LOG: u32 = 4;
 const TREE_CTX_MULTIPLIER_BITS: u32 = 5;
 const NUM_TREE_CONTEXTS: usize = 6;
-#[allow(dead_code)]
+const PREDICTOR_LEFT: u32 = 1;
+const PREDICTOR_TOP: u32 = 2;
+const PREDICTOR_SELECT: u32 = 4;
 const PREDICTOR_GRADIENT: u32 = 5;
 const PREDICTOR_WEIGHTED: u32 = 6;
+const PREDICTOR_AVERAGE4: u32 = 13;
+static SLOW_PREDICTORS: [u32; 6] = [
+    PREDICTOR_WEIGHTED,
+    PREDICTOR_GRADIENT,
+    PREDICTOR_AVERAGE4,
+    PREDICTOR_SELECT,
+    PREDICTOR_LEFT,
+    PREDICTOR_TOP,
+];
+
+#[derive(Clone, Copy)]
+struct PredictorNeighbors {
+    left: i64,
+    top: i64,
+    top_left: i64,
+    top_right: i64,
+    left_left: i64,
+    top_top: i64,
+    top_right_right: i64,
+}
+
+#[inline]
+fn predictor_neighbors<F: Fn(usize, usize) -> i32 + ?Sized>(
+    get: &F,
+    x: usize,
+    y: usize,
+    width: usize,
+) -> PredictorNeighbors {
+    let left = if x > 0 {
+        get(x - 1, y) as i64
+    } else if y > 0 {
+        get(x, y - 1) as i64
+    } else {
+        0
+    };
+    let top = if y > 0 { get(x, y - 1) as i64 } else { left };
+    let top_left = if x > 0 && y > 0 {
+        get(x - 1, y - 1) as i64
+    } else {
+        left
+    };
+    let top_right = if x + 1 < width && y > 0 {
+        get(x + 1, y - 1) as i64
+    } else {
+        top
+    };
+    PredictorNeighbors {
+        left,
+        top,
+        top_left,
+        top_right,
+        left_left: if x > 1 { get(x - 2, y) as i64 } else { left },
+        top_top: if y > 1 { get(x, y - 2) as i64 } else { top },
+        top_right_right: if x + 2 < width && y > 0 {
+            get(x + 2, y - 1) as i64
+        } else {
+            top_right
+        },
+    }
+}
+
+#[inline]
+fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
+    match pred_id {
+        PREDICTOR_LEFT => n.left,
+        PREDICTOR_TOP => n.top,
+        PREDICTOR_SELECT => {
+            let projected = n.left + n.top - n.top_left;
+            if (projected - n.left).abs() < (projected - n.top).abs() {
+                n.left
+            } else {
+                n.top
+            }
+        }
+        PREDICTOR_GRADIENT => clamped_gradient(n.left, n.top, n.top_left),
+        PREDICTOR_WEIGHTED => weighted,
+        PREDICTOR_AVERAGE4 => {
+            (6 * n.top - 2 * n.top_top
+                + 7 * n.left
+                + n.left_left
+                + n.top_right_right
+                + 3 * n.top_right
+                + 8)
+                / 16
+        }
+        _ => unreachable!("unsupported modular predictor {pred_id}"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Self-correcting Weighted Predictor (WP), bit-faithful port of libjxl's
@@ -220,6 +310,7 @@ const LZ77_MIN_SYMBOL: u32 = 64;
 const LZ77_MIN_LENGTH: u32 = 3;
 // Distance value we emit for run-length encoding (distance = 1 → previous token).
 const LZ77_DIST_VALUE: u32 = 1; // special_distance[1] = (dx=1, dy=0) → 1 token back
+const LZ77_NUM_SPECIAL_DISTANCES: u32 = 120;
 
 pub(crate) fn encode_frame_lossless(
     linear: &Image3Si,
@@ -256,14 +347,45 @@ pub(crate) fn encode_frame_lossless(
     let single_group = num_ac_groups == 1;
     let grad_pack_fn = selected_grad_pack_interior_fn();
 
-    // Palette (v1): single-group, RGB (no alpha), <=256 distinct colors. Encodes
+    // Palette (v2): single-group, RGB/RGBA, <=256 distinct colors. Encodes
     // the image as a small palette meta-channel + an index channel, which is a
     // large win for low-color/graphic content. Falls through to the normal
     // RCT+predictor path when it doesn't apply.
     if single_group
         && num_color == 3
-        && alpha.is_none()
-        && try_encode_palette_single_group(linear, xsize, ysize, min_symbol, grad_pack_fn, writer)
+        && try_encode_palette_single_group(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            min_symbol,
+            grad_pack_fn,
+            speed,
+            writer,
+        )
+    {
+        return;
+    }
+
+    // Large graphics often exceed 256 colors globally while each 256x256 group
+    // remains low-color. Encode qualifying RGB/RGBA groups through an exact
+    // local Palette transform and leave high-color groups on the normal path.
+    if !single_group
+        && num_color == 3
+        && try_encode_local_palette_multi_group(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            xsize_groups,
+            ysize_groups,
+            num_dc_groups,
+            min_symbol,
+            grad_pack_fn,
+            speed,
+            num_threads,
+            writer,
+        )
     {
         return;
     }
@@ -312,8 +434,8 @@ pub(crate) fn encode_frame_lossless(
     }
 
     // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
-    // picks Gradient(5) or Weighted(6) per channel by estimated cost (one global
-    // choice, used for the tree and every group).
+    // searches the supported Slow predictor set per channel by estimated cost
+    // (one global choice, used for the tree and every group).
     let adaptive_search = speed == crate::Speed::Slow;
     let predictors = if adaptive_search {
         choose_predictors(linear, alpha, xsize, ysize, num_threads)
@@ -399,10 +521,15 @@ pub(crate) fn encode_frame_lossless(
         // The distance context is the (nb_chans)-th context, appended after the
         // per-channel ones.
         let distance_ctx = nb_chans as u32;
-        let lz_tokens = lz77_compress(&tokens, distance_ctx);
+        let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
 
         // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
-        let code = build_lz_pixel_code(&lz_tokens, nb_chans, min_symbol);
+        let code = build_lz_pixel_code(
+            &lz_tokens,
+            nb_chans,
+            min_symbol,
+            speed == crate::Speed::Slow,
+        );
         write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut section);
 
         // Emit the LZ77'd token stream.
@@ -452,13 +579,13 @@ pub(crate) fn encode_frame_lossless(
                     grad_pack_fn,
                     1,
                 );
-                lz77_compress(&toks, distance_ctx)
+                lz77_compress_for_speed(&toks, distance_ctx, speed)
             });
         let mut all_lz: Vec<LzToken> = Vec::new();
         for lz in &group_lz_tokens {
             all_lz.extend_from_slice(lz);
         }
-        let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol);
+        let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol, speed == crate::Speed::Slow);
 
         // ----- Section 0: DC global -----
         sections[0].write(1, 1); // dc_quant all_default = 1
@@ -680,21 +807,15 @@ fn encode_squeeze_single_group(
     }
     let nb = channels.len();
 
-    // Slow selects Gradient vs Weighted per channel; Fast avoids the two full
-    // estimation passes and uses fixed Weighted prediction.
+    // Slow searches the useful general and directional predictors per channel;
+    // Fast avoids the analysis pass and uses fixed Weighted prediction.
     let predictors: Vec<u32> = if speed == crate::Speed::Slow {
         crate::thread_pool::steal_map(channels.len(), num_threads, |c| {
             let ch = &channels[c];
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            let bg = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_GRADIENT, grad_pack_fn);
-            let bw = estimate_channel_bits(get, ch.w, ch.h, PREDICTOR_WEIGHTED, grad_pack_fn);
-            if bw <= bg {
-                PREDICTOR_WEIGHTED
-            } else {
-                PREDICTOR_GRADIENT
-            }
+            choose_predictor_for_plane(get, ch.w, ch.h)
         })
     } else {
         vec![PREDICTOR_WEIGHTED; nb]
@@ -727,8 +848,8 @@ fn encode_squeeze_single_group(
     write_modular_transforms_rct_squeeze(&steps, &mut section);
 
     let distance_ctx = nb as u32;
-    let lz_tokens = lz77_compress(&tokens, distance_ctx);
-    let code = build_lz_pixel_code(&lz_tokens, nb, min_symbol);
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
+    let code = build_lz_pixel_code(&lz_tokens, nb, min_symbol, speed == crate::Speed::Slow);
     write_local_tree_lz77(&predictors, &code, min_symbol, &mut section);
     for t in &lz_tokens {
         write_lz_token(*t, &code, min_symbol, &mut section);
@@ -753,9 +874,7 @@ fn encode_squeeze_single_group(
 /// what the tree sees, so group crops share contexts with the leading globals.
 #[derive(Default)]
 struct SqueezePredictorCost {
-    gradient_hist: Vec<u64>,
-    weighted_hist: Vec<u64>,
-    total: u64,
+    costs: PredictorCosts,
 }
 
 impl SqueezePredictorCost {
@@ -769,55 +888,24 @@ impl SqueezePredictorCost {
         for y in 0..h {
             for x in 0..w {
                 let value = get(x, y) as i64;
-                let west = if x > 0 {
-                    get(x - 1, y) as i64
-                } else if y > 0 {
-                    get(x, y - 1) as i64
-                } else {
-                    0
-                };
-                let north = if y > 0 { get(x, y - 1) as i64 } else { west };
-                let northwest = if x > 0 && y > 0 {
-                    get(x - 1, y - 1) as i64
-                } else {
-                    west
-                };
-                let northeast = if x + 1 < w && y > 0 {
-                    get(x + 1, y - 1) as i64
-                } else {
-                    north
-                };
-                let northnorth = if y > 1 { get(x, y - 2) as i64 } else { north };
-
-                let weighted = wp.predict(x, y, north, west, northeast, northwest, northnorth);
+                let neighbors = predictor_neighbors(&get, x, y, w);
+                let weighted = wp.predict(
+                    x,
+                    y,
+                    neighbors.top,
+                    neighbors.left,
+                    neighbors.top_right,
+                    neighbors.top_left,
+                    neighbors.top_top,
+                );
+                self.costs.add(value, neighbors, weighted);
                 wp.update(value, x, y);
-                let lo = west.min(north);
-                let hi = west.max(north);
-                let gradient = (west + north - northwest).clamp(lo, hi);
-
-                let gradient_symbol = pack_signed((value - gradient) as i32) as usize;
-                let weighted_symbol = pack_signed((value - weighted) as i32) as usize;
-                if self.gradient_hist.len() <= gradient_symbol {
-                    self.gradient_hist.resize(gradient_symbol + 1, 0);
-                }
-                if self.weighted_hist.len() <= weighted_symbol {
-                    self.weighted_hist.resize(weighted_symbol + 1, 0);
-                }
-                self.gradient_hist[gradient_symbol] += 1;
-                self.weighted_hist[weighted_symbol] += 1;
-                self.total += 1;
             }
         }
     }
 
     fn predictor(&self) -> u32 {
-        let gradient_bits = entropy_of_hist(&self.gradient_hist, self.total);
-        let weighted_bits = entropy_of_hist(&self.weighted_hist, self.total);
-        if weighted_bits <= gradient_bits {
-            PREDICTOR_WEIGHTED
-        } else {
-            PREDICTOR_GRADIENT
-        }
+        self.costs.best_predictor()
     }
 }
 
@@ -981,7 +1069,7 @@ fn encode_squeeze_multigroup(
     for channel in global_channel_tokens {
         global_tokens.extend(channel);
     }
-    let global_lz = lz77_compress(&global_tokens, distance_ctx);
+    let global_lz = lz77_compress_for_speed(&global_tokens, distance_ctx, speed);
     let mut all_lz: Vec<LzToken> = global_lz.clone();
 
     // One group's worth of cropped large-channel tokens. `gdim` is the group's
@@ -1010,7 +1098,7 @@ fn encode_squeeze_multigroup(
                 tokenize_plane(ctx, get, rw, rh, pred, grad_pack_fn, &mut gtok);
             },
         );
-        lz77_compress(&gtok, distance_ctx)
+        lz77_compress_for_speed(&gtok, distance_ctx, speed)
     };
 
     // DC (LF) groups carry the deeply-squeezed large channels (min shift >= 3),
@@ -1035,7 +1123,7 @@ fn encode_squeeze_multigroup(
         all_lz.extend_from_slice(glz);
     }
 
-    let code = build_lz_pixel_code(&all_lz, nb, min_symbol);
+    let code = build_lz_pixel_code(&all_lz, nb, min_symbol, speed == crate::Speed::Slow);
 
     write_frame_header_modular(alpha.is_some(), writer);
 
@@ -1100,7 +1188,7 @@ fn encode_squeeze_multigroup(
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
 /// `TransformId::kPalette`). v1: begin_c=0, num_c=3, nb_deltas=0, predictor=Zero.
 fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
-    debug_assert_eq!(num_c, 3);
+    debug_assert!(matches!(num_c, 3 | 4));
     // transforms count U32(Val(0),Val(1),...): selector 1 = Val(1) = 1 transform.
     w.write(2, 0b01);
     // id U32(Val(RCT=0),Val(Palette=1),...): selector 1 = Palette.
@@ -1108,8 +1196,8 @@ fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
     // begin_c U32(Bits(3),...): selector 0 = Bits(3), value 0.
     w.write(2, 0b00);
     w.write(3, 0);
-    // num_c U32(Val(1),Val(3),Val(4),BitsOffset(13,1)): num_c=3 -> selector 1 = Val(3).
-    w.write(2, 0b01);
+    // num_c U32(Val(1),Val(3),Val(4),BitsOffset(13,1)).
+    w.write(2, if num_c == 3 { 0b01 } else { 0b10 });
     // nb_colors U32(BitsOffset(8,0),BitsOffset(10,256),...).
     if nb_colors <= 255 {
         w.write(2, 0b00); // selector 0 = BitsOffset(8, 0)
@@ -1125,33 +1213,39 @@ fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
     w.write(4, 0);
 }
 
-/// v1 palette path: single-group, RGB (no alpha), <=256 distinct colors.
-/// Encodes a palette meta-channel (h=num_c=3, w=nb_colors) + an index channel
-/// (h=ysize, w=xsize), declaring a Palette transform so the decoder's
-/// `InvPalette` reconstructs RGB directly (no RCT). Returns true and writes the
-/// full frame if palette applies; false (writing nothing) otherwise.
+/// Single-group RGB/RGBA exact palette path. Encodes a palette meta-channel plus
+/// an index channel, declaring a Palette transform so `InvPalette` reconstructs
+/// the original channels directly (no RCT).
 fn try_encode_palette_single_group(
     linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
     writer: &mut BitWriter,
 ) -> bool {
     use std::collections::HashMap;
     let npx = xsize * ysize;
+    let num_c = 3 + usize::from(alpha.is_some());
 
-    // 1) Reconstruct RGB from YCoCg, collect distinct colors (bail past 256).
-    let mut color_of: Vec<(i32, i32, i32)> = Vec::with_capacity(npx);
-    let mut seen: HashMap<(i32, i32, i32), ()> = HashMap::new();
+    // 1) Reconstruct RGB from YCoCg, collect distinct tuples (bail past 256).
+    let plane0 = linear.plane_data(0);
+    let plane1 = linear.plane_data(1);
+    let plane2 = linear.plane_data(2);
+    let color_at = |gx: usize, gy: usize| {
+        let (r, g, b) = inverse_ycocg(
+            plane0[gy * xsize + gx],
+            plane1[gy * xsize + gx],
+            plane2[gy * xsize + gx],
+        );
+        [r, g, b, alpha.map_or(0, |a| a.get_i32(gy * xsize + gx))]
+    };
+    let mut seen: HashMap<[i32; 4], ()> = HashMap::with_capacity(257);
     for gy in 0..ysize {
-        let yr = linear.plane_row(0, gy);
-        let cor = linear.plane_row(1, gy);
-        let cgr = linear.plane_row(2, gy);
         for gx in 0..xsize {
-            let c = inverse_ycocg(yr[gx], cor[gx], cgr[gx]);
-            color_of.push(c);
-            seen.entry(c).or_insert(());
+            seen.entry(color_at(gx, gy)).or_insert(());
             if seen.len() > 256 {
                 return false;
             }
@@ -1163,43 +1257,43 @@ fn try_encode_palette_single_group(
     }
 
     // 2) Sorted palette + color->index map.
-    let mut colors: Vec<(i32, i32, i32)> = seen.keys().copied().collect();
+    let mut colors: Vec<[i32; 4]> = seen.keys().copied().collect();
     colors.sort_unstable();
-    let mut idx_of: HashMap<(i32, i32, i32), u32> = HashMap::with_capacity(nb_colors);
+    let mut idx_of: HashMap<[i32; 4], u32> = HashMap::with_capacity(nb_colors);
     for (i, c) in colors.iter().enumerate() {
         idx_of.insert(*c, i as u32);
     }
 
     // 3) Palette meta-channel (row c = component c of each color) + index channel.
-    let mut palette_ch = vec![0i32; 3 * nb_colors];
-    for (i, &(r, g, b)) in colors.iter().enumerate() {
-        palette_ch[i] = r;
-        palette_ch[nb_colors + i] = g;
-        palette_ch[2 * nb_colors + i] = b;
+    let mut palette_ch = vec![0i32; num_c * nb_colors];
+    for (i, color) in colors.iter().enumerate() {
+        for c in 0..num_c {
+            palette_ch[c * nb_colors + i] = color[c];
+        }
     }
-    let index_img: Vec<i32> = color_of.iter().map(|c| idx_of[c] as i32).collect();
+    let mut index_img = Vec::with_capacity(npx);
+    for gy in 0..ysize {
+        for gx in 0..xsize {
+            index_img.push(idx_of[&color_at(gx, gy)] as i32);
+        }
+    }
 
     // 4) Channel accessors (channel 0 = palette, channel 1 = index).
     let pget = |gx: usize, gy: usize| palette_ch[gy * nb_colors + gx];
     let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
 
-    // 5) Per-channel predictor selection (gradient vs WP).
-    let pick = |get: &dyn Fn(usize, usize) -> i32, w: usize, h: usize| -> u32 {
-        let bg = estimate_channel_bits(get, w, h, PREDICTOR_GRADIENT, grad_pack_fn);
-        let bw = estimate_channel_bits(get, w, h, PREDICTOR_WEIGHTED, grad_pack_fn);
-        if bw <= bg {
-            PREDICTOR_WEIGHTED
-        } else {
-            PREDICTOR_GRADIENT
-        }
+    // 5) Slow searches predictors per channel; Fast stays fixed Weighted.
+    let preds = if speed == crate::Speed::Slow {
+        [
+            choose_predictor_for_plane(pget, nb_colors, num_c),
+            choose_predictor_for_plane(iget, xsize, ysize),
+        ]
+    } else {
+        [PREDICTOR_WEIGHTED; 2]
     };
-    let preds = [
-        pick(&pget, nb_colors, 3), // channel 0 = palette
-        pick(&iget, xsize, ysize), // channel 1 = index
-    ];
 
     // 6) Frame header + single section (mirrors the RGB single-group layout).
-    write_frame_header_modular(false, writer);
+    write_frame_header_modular(alpha.is_some(), writer);
 
     let nb_chans = 2usize;
     let mut section = BitWriter::new();
@@ -1207,14 +1301,14 @@ fn try_encode_palette_single_group(
     section.write(1, 0); // has_tree = 0
     section.write(1, 0); // use_global_tree = 0
     section.write(1, 1); // wp_default = 1
-    write_palette_transform(3, nb_colors as u32, &mut section);
+    write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
 
-    let mut tokens: Vec<Token> = Vec::with_capacity(3 * nb_colors + npx);
+    let mut tokens: Vec<Token> = Vec::with_capacity(num_c * nb_colors + npx);
     tokenize_plane(
         channel_to_context(0, nb_chans),
         pget,
         nb_colors,
-        3,
+        num_c,
         preds[0],
         grad_pack_fn,
         &mut tokens,
@@ -1230,8 +1324,13 @@ fn try_encode_palette_single_group(
     );
 
     let distance_ctx = nb_chans as u32;
-    let lz_tokens = lz77_compress(&tokens, distance_ctx);
-    let code = build_lz_pixel_code(&lz_tokens, nb_chans, min_symbol);
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
+    let code = build_lz_pixel_code(
+        &lz_tokens,
+        nb_chans,
+        min_symbol,
+        speed == crate::Speed::Slow,
+    );
     write_local_tree_lz77(&preds, &code, min_symbol, &mut section);
     for t in &lz_tokens {
         write_lz_token(*t, &code, min_symbol, &mut section);
@@ -1244,6 +1343,412 @@ fn try_encode_palette_single_group(
     writer.zero_pad_to_byte();
     writer.append(&section);
     writer.zero_pad_to_byte();
+    true
+}
+
+struct LocalPaletteGroup {
+    palette: Vec<i32>,
+    indices: Vec<i32>,
+    nb_colors: usize,
+    w: usize,
+    h: usize,
+}
+
+fn estimated_local_stream_bits(
+    tokens: &[Token],
+    predictors: &[u32],
+    num_contexts: usize,
+    min_symbol: u32,
+    speed: crate::Speed,
+) -> usize {
+    let lz = lz77_compress_runs(tokens, num_contexts as u32);
+    let code = build_lz_pixel_code(&lz, num_contexts, min_symbol, speed == crate::Speed::Slow);
+    let mut writer = BitWriter::new();
+    write_local_tree_lz77(predictors, &code, min_symbol, &mut writer);
+    for token in &lz {
+        write_lz_token(*token, &code, min_symbol, &mut writer);
+    }
+    writer.bits_written()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_palette_is_better(
+    palette: &LocalPaletteGroup,
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    x0: usize,
+    y0: usize,
+    min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+) -> bool {
+    let nb_chans = 3 + usize::from(alpha.is_some());
+    let palette_predictors = if speed == crate::Speed::Slow {
+        [
+            choose_predictor_for_plane(
+                |x, y| palette.palette[y * palette.nb_colors + x],
+                palette.nb_colors,
+                nb_chans,
+            ),
+            choose_predictor_for_plane(
+                |x, y| palette.indices[y * palette.w + x],
+                palette.w,
+                palette.h,
+            ),
+        ]
+    } else {
+        [PREDICTOR_WEIGHTED; 2]
+    };
+    let mut palette_tokens =
+        Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h);
+    tokenize_plane(
+        channel_to_context(0, 2),
+        |x, y| palette.palette[y * palette.nb_colors + x],
+        palette.nb_colors,
+        nb_chans,
+        palette_predictors[0],
+        grad_pack_fn,
+        &mut palette_tokens,
+    );
+    tokenize_plane(
+        channel_to_context(1, 2),
+        |x, y| palette.indices[y * palette.w + x],
+        palette.w,
+        palette.h,
+        palette_predictors[1],
+        grad_pack_fn,
+        &mut palette_tokens,
+    );
+    let mut palette_transform = BitWriter::new();
+    write_palette_transform(
+        nb_chans as u32,
+        palette.nb_colors as u32,
+        &mut palette_transform,
+    );
+    let palette_bits =
+        estimated_local_stream_bits(&palette_tokens, &palette_predictors, 2, min_symbol, speed)
+            + palette_transform.bits_written();
+
+    let plain_predictors: Vec<u32> = if speed == crate::Speed::Slow {
+        (0..nb_chans)
+            .map(|chan| {
+                if chan < 3 {
+                    let plane = linear.plane_data(chan);
+                    choose_predictor_for_plane(
+                        |x, y| plane[(y0 + y) * xsize + x0 + x],
+                        palette.w,
+                        palette.h,
+                    )
+                } else {
+                    let alpha = alpha.expect("alpha channel must exist");
+                    choose_predictor_for_plane(
+                        |x, y| alpha.get_i32((y0 + y) * xsize + x0 + x),
+                        palette.w,
+                        palette.h,
+                    )
+                }
+            })
+            .collect()
+    } else {
+        vec![PREDICTOR_WEIGHTED; nb_chans]
+    };
+    let plain_tokens = tokenize_all(
+        linear,
+        alpha,
+        xsize,
+        linear.ysize(),
+        x0,
+        y0,
+        palette.w,
+        palette.h,
+        3,
+        &plain_predictors,
+        grad_pack_fn,
+        1,
+    );
+    let plain_bits = estimated_local_stream_bits(
+        &plain_tokens,
+        &plain_predictors,
+        nb_chans,
+        min_symbol,
+        speed,
+    ) + 2; // zero-transform count
+
+    palette_bits < plain_bits
+}
+
+fn build_local_palette_group(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> Option<LocalPaletteGroup> {
+    use std::collections::HashMap;
+
+    let num_c = 3 + usize::from(alpha.is_some());
+    let num_pixels = w * h;
+    let plane0 = linear.plane_data(0);
+    let plane1 = linear.plane_data(1);
+    let plane2 = linear.plane_data(2);
+    let tuple_at = |gx: usize, gy: usize| {
+        [
+            plane0[gy * xsize + gx],
+            plane1[gy * xsize + gx],
+            plane2[gy * xsize + gx],
+            alpha.map_or(0, |a| a.get_i32(gy * xsize + gx)),
+        ]
+    };
+
+    // Most photographic groups exceed the palette limit almost immediately.
+    // Probe only the distinct set first, avoiding a full-group tuple allocation
+    // on that overwhelmingly common rejection path.
+    let mut seen = HashMap::<[i32; 4], ()>::with_capacity(257);
+    for y in 0..h {
+        for x in 0..w {
+            let gx = x0 + x;
+            let gy = y0 + y;
+            seen.entry(tuple_at(gx, gy)).or_insert(());
+            if seen.len() > 256 {
+                return None;
+            }
+        }
+    }
+
+    let nb_colors = seen.len();
+    // Palette coding replaces `num_c * num_pixels` samples with one index per
+    // pixel plus `num_c * nb_colors` palette samples. Leave a small margin for
+    // the transform header and altered entropy statistics.
+    let palette_samples = num_pixels + num_c * nb_colors + 16;
+    if nb_colors == 0 || palette_samples >= num_c * num_pixels {
+        return None;
+    }
+
+    let mut colors: Vec<[i32; 4]> = seen.keys().copied().collect();
+    colors.sort_unstable();
+    let mut index_of = HashMap::<[i32; 4], i32>::with_capacity(nb_colors);
+    let mut palette = vec![0i32; num_c * nb_colors];
+    for (index, color) in colors.iter().enumerate() {
+        index_of.insert(*color, index as i32);
+        for c in 0..num_c {
+            palette[c * nb_colors + index] = color[c];
+        }
+    }
+    let mut indices = Vec::with_capacity(num_pixels);
+    for y in 0..h {
+        for x in 0..w {
+            indices.push(index_of[&tuple_at(x0 + x, y0 + y)]);
+        }
+    }
+
+    Some(LocalPaletteGroup {
+        palette,
+        indices,
+        nb_colors,
+        w,
+        h,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_local_palette_multi_group(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    xsize_groups: usize,
+    ysize_groups: usize,
+    num_dc_groups: usize,
+    min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+    num_threads: usize,
+    writer: &mut BitWriter,
+) -> bool {
+    let nb_chans = 3 + usize::from(alpha.is_some());
+    let num_ac_groups = xsize_groups * ysize_groups;
+    let palettes = crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+        let gx = group_index % xsize_groups;
+        let gy = group_index / xsize_groups;
+        let x0 = gx * GROUP_DIM;
+        let y0 = gy * GROUP_DIM;
+        let w = GROUP_DIM.min(xsize - x0);
+        let h = GROUP_DIM.min(ysize - y0);
+        let palette = build_local_palette_group(linear, alpha, xsize, x0, y0, w, h)?;
+        local_palette_is_better(
+            &palette,
+            linear,
+            alpha,
+            xsize,
+            x0,
+            y0,
+            min_symbol,
+            grad_pack_fn,
+            speed,
+        )
+        .then_some(palette)
+    });
+    if !palettes.iter().any(Option::is_some) {
+        return false;
+    }
+
+    // The global MA tree sees group-local channel slots. Pool predictor costs
+    // for palette/index channels and ordinary YCoCg(A) channels by those slots.
+    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+        crate::thread_pool::steal_map(nb_chans, num_threads, |slot| {
+            let mut cost = SqueezePredictorCost::default();
+            for (group_index, palette) in palettes.iter().enumerate() {
+                if let Some(palette) = palette {
+                    if slot == 0 {
+                        cost.add_crop(
+                            |x, y| palette.palette[y * palette.nb_colors + x],
+                            palette.nb_colors,
+                            nb_chans,
+                        );
+                    } else if slot == 1 {
+                        cost.add_crop(
+                            |x, y| palette.indices[y * palette.w + x],
+                            palette.w,
+                            palette.h,
+                        );
+                    }
+                    continue;
+                }
+
+                let gx = group_index % xsize_groups;
+                let gy = group_index / xsize_groups;
+                let x0 = gx * GROUP_DIM;
+                let y0 = gy * GROUP_DIM;
+                let w = GROUP_DIM.min(xsize - x0);
+                let h = GROUP_DIM.min(ysize - y0);
+                if slot < 3 {
+                    let plane = linear.plane_data(slot);
+                    cost.add_crop(|x, y| plane[(y0 + y) * xsize + x0 + x], w, h);
+                } else {
+                    let alpha = alpha.expect("alpha slot requires alpha channel");
+                    cost.add_crop(|x, y| alpha.get_i32((y0 + y) * xsize + x0 + x), w, h);
+                }
+            }
+            cost.predictor()
+        })
+    } else {
+        vec![PREDICTOR_WEIGHTED; nb_chans]
+    };
+
+    let distance_ctx = nb_chans as u32;
+    let group_lz_tokens: Vec<Vec<LzToken>> =
+        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+            let mut tokens = if let Some(palette) = &palettes[group_index] {
+                Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h)
+            } else {
+                Vec::new()
+            };
+            if let Some(palette) = &palettes[group_index] {
+                tokenize_plane(
+                    channel_to_context(0, nb_chans),
+                    |x, y| palette.palette[y * palette.nb_colors + x],
+                    palette.nb_colors,
+                    nb_chans,
+                    predictors[0],
+                    grad_pack_fn,
+                    &mut tokens,
+                );
+                tokenize_plane(
+                    channel_to_context(1, nb_chans),
+                    |x, y| palette.indices[y * palette.w + x],
+                    palette.w,
+                    palette.h,
+                    predictors[1],
+                    grad_pack_fn,
+                    &mut tokens,
+                );
+            } else {
+                let gx = group_index % xsize_groups;
+                let gy = group_index / xsize_groups;
+                let x0 = gx * GROUP_DIM;
+                let y0 = gy * GROUP_DIM;
+                let w = GROUP_DIM.min(xsize - x0);
+                let h = GROUP_DIM.min(ysize - y0);
+                tokens = tokenize_all(
+                    linear,
+                    alpha,
+                    xsize,
+                    ysize,
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    3,
+                    &predictors,
+                    grad_pack_fn,
+                    1,
+                );
+            }
+            lz77_compress_for_speed(&tokens, distance_ctx, speed)
+        });
+
+    let mut all_lz = Vec::with_capacity(group_lz_tokens.iter().map(Vec::len).sum());
+    for tokens in &group_lz_tokens {
+        all_lz.extend_from_slice(tokens);
+    }
+    let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol, speed == crate::Speed::Slow);
+
+    write_frame_header_modular(alpha.is_some(), writer);
+    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
+    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
+
+    sections[0].write(1, 1); // dc_quant all_default
+    sections[0].write(1, 1); // has global tree
+    write_local_tree_lz77(&predictors, &code, min_symbol, &mut sections[0]);
+    sections[0].write(1, 1); // use_global_tree
+    sections[0].write(1, 1); // wp_default
+    write_modular_transforms(nb_chans, &mut sections[0]);
+    sections[0].zero_pad_to_byte();
+
+    for i in 0..num_dc_groups {
+        sections[1 + i].write(1, 1);
+        sections[1 + i].write(1, 1);
+        sections[1 + i].write(2, 0);
+        sections[1 + i].zero_pad_to_byte();
+    }
+
+    let ac_global_idx = 1 + num_dc_groups;
+    sections[ac_global_idx].write(1, 1);
+    sections[ac_global_idx].write(1, 1);
+    sections[ac_global_idx].zero_pad_to_byte();
+
+    for group_index in 0..num_ac_groups {
+        let section_idx = 2 + num_dc_groups + group_index;
+        sections[section_idx].write(1, 1); // use_global_tree
+        sections[section_idx].write(1, 1); // wp_default
+        if let Some(palette) = &palettes[group_index] {
+            write_palette_transform(
+                nb_chans as u32,
+                palette.nb_colors as u32,
+                &mut sections[section_idx],
+            );
+        } else {
+            sections[section_idx].write(2, 0); // no local transforms
+        }
+        for token in &group_lz_tokens[group_index] {
+            write_lz_token(*token, &code, min_symbol, &mut sections[section_idx]);
+        }
+        sections[section_idx].zero_pad_to_byte();
+    }
+
+    writer.write(1, 0); // no TOC permutation
+    writer.zero_pad_to_byte();
+    for section in &sections {
+        write_toc_entry(section.bits_written() / 8, writer);
+    }
+    writer.zero_pad_to_byte();
+    for section in &sections {
+        writer.append(section);
+        writer.zero_pad_to_byte();
+    }
     true
 }
 
@@ -1327,34 +1832,286 @@ enum LzToken {
         pixel_context: u32,
         distance_context: u32,
         length_value: u32,
+        distance_value: u32,
     },
 }
 
-/// Compact a sequence of `Token`s by back-referencing runs of identical
-/// (context, value) pairs.  Returns the LZ77'd stream.
+#[inline]
+fn lz_fingerprint(tokens: &[Token], pos: usize) -> u32 {
+    let mut h = 0x9e37_79b9u32;
+    for token in &tokens[pos..tokens.len().min(pos + 3)] {
+        h ^= token.value.wrapping_mul(0x85eb_ca6b).rotate_left(13);
+        h = h.wrapping_mul(0xc2b2_ae35) ^ token.context;
+    }
+    h
+}
+
+#[inline]
+fn lz_hash(tokens: &[Token], pos: usize) -> usize {
+    const HASH_BITS: usize = 18;
+    (lz_fingerprint(tokens, pos) as usize) & ((1 << HASH_BITS) - 1)
+}
+
+fn lz_has_repetition(tokens: &[Token]) -> bool {
+    const MAX_SAMPLES: usize = 8_192;
+    const SAMPLE_TABLE_SIZE: usize = 1 << 14;
+    if tokens.len() < 256 {
+        return true;
+    }
+    let stride = tokens.len().div_ceil(MAX_SAMPLES).max(1);
+    let mut table = vec![0u32; SAMPLE_TABLE_SIZE];
+    let mut samples = 0usize;
+    let mut repeats = 0usize;
+    for pos in (0..tokens.len().saturating_sub(2)).step_by(stride) {
+        let fingerprint = lz_fingerprint(tokens, pos) | 1;
+        let slot = fingerprint as usize & (SAMPLE_TABLE_SIZE - 1);
+        repeats += usize::from(table[slot] == fingerprint);
+        table[slot] = fingerprint;
+        samples += 1;
+    }
+    // Only enable the expensive chain search for strongly repetitive streams.
+    // Sparse matches are better handled by the allocation-free run coder.
+    repeats * 5 >= samples
+}
+
+fn lz_match_len(tokens: &[Token], a: usize, b: usize) -> usize {
+    let mut len = 0usize;
+    const MAX_MATCH: usize = 1 << 20;
+    let max_len = (tokens.len() - b).min(MAX_MATCH);
+    while len < max_len {
+        let x = tokens[a + len];
+        let y = tokens[b + len];
+        if x.context != y.context || x.value != y.value {
+            break;
+        }
+        len += 1;
+        // For overlap, compare against the already-known periodic source.
+        if a + len == b {
+            let period = b - a;
+            while len < max_len {
+                let x = tokens[b + len - period];
+                let y = tokens[b + len];
+                if x.context != y.context || x.value != y.value {
+                    break;
+                }
+                len += 1;
+            }
+            break;
+        }
+    }
+    len
+}
+
+fn lz_find_match(
+    tokens: &[Token],
+    pos: usize,
+    head: &[u32],
+    prev: &[u32],
+    max_probes: usize,
+) -> (usize, usize) {
+    if pos + LZ77_MIN_LENGTH as usize > tokens.len() {
+        return (0, 0);
+    }
+    let mut candidate = head[lz_hash(tokens, pos)];
+    let mut best_len = 0usize;
+    let mut best_dist = 0usize;
+    let mut probes = 0;
+    while candidate != u32::MAX && probes < max_probes {
+        let candidate_pos = candidate as usize;
+        let distance = pos - candidate_pos;
+        if distance <= u32::MAX as usize {
+            let len = lz_match_len(tokens, candidate_pos, pos);
+            if len > best_len || (len == best_len && distance < best_dist) {
+                best_len = len;
+                best_dist = distance;
+            }
+        }
+        candidate = prev[candidate_pos];
+        probes += 1;
+    }
+    (best_len, best_dist)
+}
+
+/// Compact a sequence of `Token`s with a bounded hash-chain LZ77 search.
+#[cfg(test)]
 fn lz77_compress(tokens: &[Token], distance_context: u32) -> Vec<LzToken> {
+    lz77_compress_with_depth(tokens, distance_context, 8)
+}
+
+#[inline]
+fn lz77_compress_for_speed(
+    tokens: &[Token],
+    distance_context: u32,
+    speed: crate::Speed,
+) -> Vec<LzToken> {
+    if speed == crate::Speed::Fast || !lz_has_repetition(tokens) {
+        return lz77_compress_runs(tokens, distance_context);
+    }
+    let deep = lz77_compress_with_depth(tokens, distance_context, 8);
+    let run_token_count = lz77_run_token_count(tokens);
+    if deep.len() * 100 > run_token_count * 90 {
+        return lz77_compress_runs(tokens, distance_context);
+    }
+    let runs = lz77_compress_runs(tokens, distance_context);
+    if estimate_lz_payload_bits(&deep, distance_context) * 100
+        <= estimate_lz_payload_bits(&runs, distance_context) * 90
+    {
+        deep
+    } else {
+        runs
+    }
+}
+
+fn estimate_lz_payload_bits(tokens: &[LzToken], distance_context: u32) -> u64 {
+    let num_contexts = distance_context as usize + 1;
+    let context_map: Vec<u8> = (0..num_contexts as u8).collect();
+    let histograms = lz_build_histograms(tokens, &context_map, num_contexts, LZ77_MIN_SYMBOL);
+    let codes = crate::entropy::build_huffman_codes(&histograms);
+    let mut bits = 0u64;
+    for &token in tokens {
+        match token {
+            LzToken::Pixel { context, value } => {
+                let (symbol, nbits, _) = crate::entropy::uint_encode(value);
+                bits += codes[context as usize].depths[symbol as usize] as u64 + nbits as u64;
+            }
+            LzToken::Lz77 {
+                pixel_context,
+                length_value,
+                distance_value,
+                ..
+            } => {
+                let (symbol, nbits, _) = lz77_length_encode(length_value);
+                bits += codes[pixel_context as usize].depths[(LZ77_MIN_SYMBOL + symbol) as usize]
+                    as u64
+                    + nbits as u64;
+                let (symbol, nbits, _) = crate::entropy::uint_encode(distance_value);
+                bits +=
+                    codes[distance_context as usize].depths[symbol as usize] as u64 + nbits as u64;
+            }
+        }
+    }
+    bits
+}
+
+fn lz77_run_token_count(tokens: &[Token]) -> usize {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        count += 1;
+        let token = tokens[i];
+        let mut end = i + 1;
+        while end < tokens.len()
+            && tokens[end].context == token.context
+            && tokens[end].value == token.value
+        {
+            end += 1;
+        }
+        if end - i - 1 >= LZ77_MIN_LENGTH as usize {
+            count += 1;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn lz77_compress_runs(tokens: &[Token], distance_context: u32) -> Vec<LzToken> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+        out.push(LzToken::Pixel {
+            context: token.context,
+            value: token.value,
+        });
+        let mut end = i + 1;
+        while end < tokens.len()
+            && tokens[end].context == token.context
+            && tokens[end].value == token.value
+        {
+            end += 1;
+        }
+        let copied = end - i - 1;
+        if copied >= LZ77_MIN_LENGTH as usize {
+            out.push(LzToken::Lz77 {
+                pixel_context: token.context,
+                distance_context,
+                length_value: copied as u32 - LZ77_MIN_LENGTH,
+                distance_value: LZ77_DIST_VALUE,
+            });
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn lz77_compress_with_depth(
+    tokens: &[Token],
+    distance_context: u32,
+    max_probes: usize,
+) -> Vec<LzToken> {
     let mut out: Vec<LzToken> = Vec::with_capacity(tokens.len());
+    let mut head = vec![u32::MAX; 1 << 18];
+    let mut prev = vec![u32::MAX; tokens.len()];
     let mut i = 0;
     while i < tokens.len() {
-        let t = tokens[i];
-        out.push(LzToken::Pixel {
-            context: t.context,
-            value: t.value,
-        });
-        // Find how many subsequent tokens are identical to `t`.
-        let mut j = i + 1;
-        while j < tokens.len() && tokens[j].context == t.context && tokens[j].value == t.value {
-            j += 1;
-        }
-        let run_extra = (j - i - 1) as u32; // copies after the first one
-        if run_extra >= LZ77_MIN_LENGTH {
+        let (match_len, distance) = lz_find_match(tokens, i, &head, &prev, max_probes);
+        // Four literals are the conservative break-even after the length and
+        // distance symbols. Longer distances need one more copied token.
+        let threshold = if distance <= 16 { 4 } else { 5 };
+        if match_len >= threshold {
+            // One-token lazy matching: do not consume a merely adequate match
+            // when the next position opens a materially longer one.
+            let hash = lz_hash(tokens, i);
+            let old_head = head[hash];
+            prev[i] = old_head;
+            head[hash] = i as u32;
+            let (next_len, _) = if i + 1 < tokens.len() {
+                lz_find_match(tokens, i + 1, &head, &prev, max_probes)
+            } else {
+                (0, 0)
+            };
+            if next_len > match_len + 1 {
+                let t = tokens[i];
+                out.push(LzToken::Pixel {
+                    context: t.context,
+                    value: t.value,
+                });
+                i += 1;
+                continue;
+            }
+            head[hash] = old_head;
+            prev[i] = u32::MAX;
+
+            let distance_value = if distance == 1 {
+                LZ77_DIST_VALUE
+            } else {
+                LZ77_NUM_SPECIAL_DISTANCES + distance as u32 - 1
+            };
             out.push(LzToken::Lz77 {
-                pixel_context: t.context,
+                pixel_context: tokens[i].context,
                 distance_context,
-                length_value: run_extra - LZ77_MIN_LENGTH,
+                length_value: match_len as u32 - LZ77_MIN_LENGTH,
+                distance_value,
             });
-            i = j;
+            for p in i..i + match_len {
+                let hash = lz_hash(tokens, p);
+                prev[p] = head[hash];
+                head[hash] = p as u32;
+            }
+            i += match_len;
         } else {
+            let t = tokens[i];
+            out.push(LzToken::Pixel {
+                context: t.context,
+                value: t.value,
+            });
+            let hash = lz_hash(tokens, i);
+            prev[i] = head[hash];
+            head[hash] = i as u32;
             i += 1;
         }
     }
@@ -1453,7 +2210,7 @@ fn tokenize_plane(
                 out.push(Token::new(ctx, pack_signed((v - p) as i32)));
             }
         }
-    } else {
+    } else if pred_id == PREDICTOR_GRADIENT {
         // Gradient (ClampedGradient): per-pixel independent, pure integer ->
         // vectorized over the interior of each row.
         GRADIENT_SCRATCH.with_borrow_mut(|scratch| {
@@ -1477,7 +2234,8 @@ fn tokenize_plane(
                 if gy == 0 {
                     buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
                     for gx in 1..gw {
-                        buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1])); // pred = W
+                        buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1]));
+                        // pred = W
                     }
                 } else {
                     buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
@@ -1488,6 +2246,19 @@ fn tokenize_plane(
                 }
             }
         });
+    } else {
+        debug_assert!(matches!(
+            pred_id,
+            PREDICTOR_AVERAGE4 | PREDICTOR_SELECT | PREDICTOR_LEFT | PREDICTOR_TOP
+        ));
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let value = get(gx, gy) as i64;
+                let neighbors = predictor_neighbors(&get, gx, gy, gw);
+                let pred = predictor_value(pred_id, neighbors, 0);
+                out.push(Token::new(ctx, pack_signed((value - pred) as i32)));
+            }
+        }
     }
 }
 type GradPackInteriorFn = fn(&[i32], &[i32], &mut [u32], usize);
@@ -1539,90 +2310,67 @@ fn grad_pack_interior_scalar(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usi
     }
 }
 
-/// Estimate the coded cost (order-0 residual entropy, in bits) of one channel
-/// over the whole image under a given predictor. Used only to pick the cheaper
-/// predictor per channel; the choice never affects decodability (the tree tells
-/// the decoder which predictor each channel uses).
-fn estimate_channel_bits(
-    get: impl Fn(usize, usize) -> i32,
-    w: usize,
-    h: usize,
-    pred_id: u32,
-    grad_pack_fn: GradPackInteriorFn,
-) -> f32 {
-    let mut toks: Vec<Token> = Vec::with_capacity(w * h);
-    tokenize_plane(0, get, w, h, pred_id, grad_pack_fn, &mut toks);
-    if toks.is_empty() {
-        return 0.0;
-    }
-    // order-0 entropy of the packed residual values via a direct-indexed
-    // histogram (deterministic order, no hashing).
-    let max = toks.iter().map(|t| t.value).max().unwrap_or(0) as usize;
-    let mut hist = vec![0u64; max + 1];
-    for t in &toks {
-        hist[t.value as usize] += 1;
-    }
-    let total = toks.len() as f32;
-    let mut bits = 0.0;
-    for &c in hist.iter() {
-        if c != 0 {
-            let p = c as f32 / total;
-            bits -= c as f32 * p.log2();
-        }
-    }
-    bits
+#[derive(Default)]
+struct PredictorCosts {
+    histograms: [Vec<u64>; SLOW_PREDICTORS.len()],
+    total: u64,
 }
 
-/// Choose Gradient(5) or Weighted(6) per channel by estimated cost over the
-/// whole image. Guarantees the lossless stream is never worse than all-Gradient
-/// or all-WP. Returns one predictor id per channel (indices 0..nb_chans).
-/// Compute the order-0 entropy estimate for BOTH the Gradient and Weighted
-/// predictors in a single traversal. Equivalent to calling
-/// `estimate_channel_bits` twice (Gradient then Weighted) — same neighbour
-/// convention, same WP state evolution, same packed residuals — but the pixel
-/// fetches and loop overhead happen once instead of twice. Returns
-/// `(gradient_bits, weighted_bits)`.
-fn estimate_grad_and_wp_bits(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> (f32, f32) {
+impl PredictorCosts {
+    #[inline]
+    fn add(&mut self, value: i64, neighbors: PredictorNeighbors, weighted: i64) {
+        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate() {
+            let pred = predictor_value(pred_id, neighbors, weighted);
+            let symbol = pack_signed((value - pred) as i32) as usize;
+            let hist = &mut self.histograms[candidate];
+            if hist.len() <= symbol {
+                hist.resize(symbol + 1, 0);
+            }
+            hist[symbol] += 1;
+        }
+        self.total += 1;
+    }
+
+    fn best_predictor(&self) -> u32 {
+        let mut best_id = SLOW_PREDICTORS[0];
+        let mut best_bits = entropy_of_hist(&self.histograms[0], self.total);
+        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate().skip(1) {
+            let bits = entropy_of_hist(&self.histograms[candidate], self.total);
+            if bits < best_bits {
+                best_bits = bits;
+                best_id = pred_id;
+            }
+        }
+        best_id
+    }
+}
+
+/// Evaluate all Slow-mode predictors in one traversal and choose the lowest
+/// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
+fn choose_predictor_for_plane(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> u32 {
     if w == 0 || h == 0 {
-        return (0.0, 0.0);
+        return PREDICTOR_WEIGHTED;
     }
     let mut wp = WpState::new(w);
-    let mut grad: Vec<u32> = Vec::with_capacity(w * h);
-    let mut wpr: Vec<u32> = Vec::with_capacity(w * h);
+    let mut costs = PredictorCosts::default();
     for gy in 0..h {
         for gx in 0..w {
-            let v = get(gx, gy) as i64;
-            let w_ = if gx > 0 {
-                get(gx - 1, gy) as i64
-            } else if gy > 0 {
-                get(gx, gy - 1) as i64
-            } else {
-                0
-            };
-            let n_ = if gy > 0 { get(gx, gy - 1) as i64 } else { w_ };
-            let nw_ = if gx > 0 && gy > 0 {
-                get(gx - 1, gy - 1) as i64
-            } else {
-                w_
-            };
-            let ne_ = if gx + 1 < w && gy > 0 {
-                get(gx + 1, gy - 1) as i64
-            } else {
-                n_
-            };
-            let nn_ = if gy > 1 { get(gx, gy - 2) as i64 } else { n_ };
-            // Weighted (advances WP state exactly as the WP-only pass does).
-            let wp_pred = wp.predict(gx, gy, n_, w_, ne_, nw_, nn_);
-            wp.update(v, gx, gy);
-            wpr.push(pack_signed((v - wp_pred) as i32));
-            // Gradient (== libjxl ClampedGradient, same border convention).
-            let lo = w_.min(n_);
-            let hi = w_.max(n_);
-            let g_pred = (w_ + n_ - nw_).clamp(lo, hi);
-            grad.push(pack_signed((v - g_pred) as i32));
+            let value = get(gx, gy) as i64;
+            let neighbors = predictor_neighbors(&get, gx, gy, w);
+            let weighted = wp.predict(
+                gx,
+                gy,
+                neighbors.top,
+                neighbors.left,
+                neighbors.top_right,
+                neighbors.top_left,
+                neighbors.top_top,
+            );
+            costs.add(value, neighbors, weighted);
+            wp.update(value, gx, gy);
         }
     }
-    (order0_entropy(&grad), order0_entropy(&wpr))
+    costs.best_predictor()
 }
 
 fn choose_predictors(
@@ -1635,17 +2383,12 @@ fn choose_predictors(
     let mut preds = [PREDICTOR_WEIGHTED; 4];
     let num_channels = 3 + usize::from(alpha.is_some());
     let selected = crate::thread_pool::steal_map(num_channels, num_threads, |chan| {
-        let (bg, bw) = if chan < 3 {
+        if chan < 3 {
             let pd = linear.plane_data(chan);
-            estimate_grad_and_wp_bits(|x, y| pd[y * xsize + x], xsize, ysize)
+            choose_predictor_for_plane(|x, y| pd[y * xsize + x], xsize, ysize)
         } else {
             let a = alpha.expect("alpha channel must exist");
-            estimate_grad_and_wp_bits(|x, y| a.get_i32(y * xsize + x), xsize, ysize)
-        };
-        if bw <= bg {
-            PREDICTOR_WEIGHTED
-        } else {
-            PREDICTOR_GRADIENT
+            choose_predictor_for_plane(|x, y| a.get_i32(y * xsize + x), xsize, ysize)
         }
     });
     preds[..num_channels].copy_from_slice(&selected);
@@ -1659,7 +2402,7 @@ fn choose_predictors(
 // Context tree (MA tree): split each channel's entropy context on the WP error
 // property kWPProp (p[15]) into 3 activity buckets. The decoder must run the WP
 // state for every pixel of a channel whose subtree references p[15], so we run
-// WP for all channels here (the leaf predictor still chooses gradient vs WP).
+// WP for all channels here regardless of the selected leaf predictor.
 // ---------------------------------------------------------------------------
 
 const PROP_WP: u32 = 15; // kNumStaticProperties(2) + 13
@@ -1799,32 +2542,18 @@ fn collect_channel(
     for gy in 0..gh {
         for gx in 0..gw {
             let v = get(gx, gy) as i64;
-            let w_ = if gx > 0 {
-                get(gx - 1, gy) as i64
-            } else if gy > 0 {
-                get(gx, gy - 1) as i64
-            } else {
-                0
-            };
-            let n_ = if gy > 0 { get(gx, gy - 1) as i64 } else { w_ };
-            let nw_ = if gx > 0 && gy > 0 {
-                get(gx - 1, gy - 1) as i64
-            } else {
-                w_
-            };
-            let ne_ = if gx + 1 < gw && gy > 0 {
-                get(gx + 1, gy - 1) as i64
-            } else {
-                n_
-            };
-            let nn_ = if gy > 1 { get(gx, gy - 2) as i64 } else { n_ };
-            let wp_pred = wp.predict(gx, gy, n_, w_, ne_, nw_, nn_);
+            let neighbors = predictor_neighbors(&get, gx, gy, gw);
+            let wp_pred = wp.predict(
+                gx,
+                gy,
+                neighbors.top,
+                neighbors.left,
+                neighbors.top_right,
+                neighbors.top_left,
+                neighbors.top_top,
+            );
             prp.push(wp.wp_prop);
-            let pred = if pred_id == PREDICTOR_WEIGHTED {
-                wp_pred
-            } else {
-                clamped_gradient(w_, n_, nw_)
-            };
+            let pred = predictor_value(pred_id, neighbors, wp_pred);
             res.push(pack_signed((v - pred) as i32));
             wp.update(v, gx, gy);
         }
@@ -1899,8 +2628,7 @@ fn pick_threshold(res: &[u32], prp: &[i64]) -> (i32, f32, f32) {
                     }
                 }
             }
-            let bits =
-                entropy_of_hist(h0, n0) + entropy_of_hist(h1, n1) + entropy_of_hist(h2, n2);
+            let bits = entropy_of_hist(h0, n0) + entropy_of_hist(h1, n1) + entropy_of_hist(h2, n2);
             if bits < best_bits {
                 best_bits = bits;
                 best_t = t as i32;
@@ -1998,8 +2726,8 @@ fn try_encode_context_tree_single_group(
     write_modular_transforms(nb_chans, &mut section);
 
     let distance_ctx = num_pixel_ctx as u32;
-    let lz_tokens = lz77_compress(&tokens, distance_ctx);
-    let code = build_lz_pixel_code(&lz_tokens, num_pixel_ctx, min_symbol);
+    let lz_tokens = lz77_compress_runs(&tokens, distance_ctx);
+    let code = build_lz_pixel_code(&lz_tokens, num_pixel_ctx, min_symbol, true);
     write_tree_lz77(&tree_tokens, &code, min_symbol, &mut section);
     for t in &lz_tokens {
         write_lz_token(*t, &code, min_symbol, &mut section);
@@ -2103,13 +2831,13 @@ fn try_encode_context_tree_multi_group(
                     toks.push(Token::new(ctx, res[i]));
                 }
             }
-            lz77_compress(&toks, distance_ctx)
+            lz77_compress_runs(&toks, distance_ctx)
         });
     let mut all_lz: Vec<LzToken> = Vec::new();
     for lz in &group_lz_tokens {
         all_lz.extend_from_slice(lz);
     }
-    let code = build_lz_pixel_code(&all_lz, num_pixel_ctx, min_symbol);
+    let code = build_lz_pixel_code(&all_lz, num_pixel_ctx, min_symbol, true);
 
     // 5) Sections (same layout as the flat multi-group path).
     write_frame_header_modular(alpha.is_some(), writer);
@@ -2190,13 +2918,15 @@ fn lz_build_histograms(
                 pixel_context,
                 distance_context,
                 length_value,
+                distance_value,
             } => {
                 let (len_tok, _, _) = lz77_length_encode(length_value);
                 let pixel_cluster = context_map[pixel_context as usize] as usize;
                 hs[pixel_cluster].add(min_symbol + len_tok);
 
                 let dist_cluster = context_map[distance_context as usize] as usize;
-                hs[dist_cluster].add(LZ77_DIST_VALUE);
+                let (symbol, _, _) = crate::entropy::uint_encode(distance_value);
+                hs[dist_cluster].add(symbol);
             }
         }
     }
@@ -2205,7 +2935,20 @@ fn lz_build_histograms(
 
 /// Build per-cluster prefix codes from an `LzToken` stream.
 /// `nb_chans + 1` contexts: `nb_chans` channel leaves + 1 distance context.
-fn build_lz_pixel_code(toks: &[LzToken], nb_chans: usize, min_symbol: u32) -> OwnedEntropyCode {
+fn build_lz_pixel_code(
+    toks: &[LzToken],
+    nb_chans: usize,
+    min_symbol: u32,
+    refined: bool,
+) -> OwnedEntropyCode {
+    let refined = refined
+        && toks.iter().any(|token| {
+            matches!(
+                token,
+                LzToken::Lz77 { distance_value, .. }
+                    if *distance_value != LZ77_DIST_VALUE
+            )
+        });
     use crate::entropy::build_huffman_codes;
     use crate::entropy::cluster_histograms;
 
@@ -2214,11 +2957,80 @@ fn build_lz_pixel_code(toks: &[LzToken], nb_chans: usize, min_symbol: u32) -> Ow
     let mut histograms = lz_build_histograms(toks, &context_map_initial, num_contexts, min_symbol);
 
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map);
+    if refined {
+        crate::entropy::cluster_histograms_refined(&mut histograms, &mut context_map);
+    } else {
+        cluster_histograms(&mut histograms, &mut context_map);
+    }
+
+    let hybrid_uint_configs = if refined {
+        let mut raw_values = vec![Vec::<u32>::new(); histograms.len()];
+        let mut literal_values = vec![Vec::<u32>::new(); histograms.len()];
+        for &tok in toks {
+            match tok {
+                LzToken::Pixel { context, value } => {
+                    let cluster = context_map[context as usize] as usize;
+                    raw_values[cluster].push(value);
+                    literal_values[cluster].push(value);
+                }
+                LzToken::Lz77 {
+                    distance_context,
+                    distance_value,
+                    ..
+                } => {
+                    raw_values[context_map[distance_context as usize] as usize]
+                        .push(distance_value);
+                }
+            }
+        }
+        let configs: Vec<_> = raw_values
+            .iter()
+            .enumerate()
+            .map(|(cluster, values)| {
+                let selected = crate::entropy::select_hybrid_config(values);
+                if literal_values[cluster].iter().all(|&value| {
+                    crate::entropy::uint_encode_with_config(value, selected).0 < min_symbol
+                }) {
+                    selected
+                } else {
+                    crate::entropy::HybridUintConfig::DEFAULT
+                }
+            })
+            .collect();
+        histograms = vec![Histogram::new(); configs.len()];
+        for &tok in toks {
+            match tok {
+                LzToken::Pixel { context, value } => {
+                    let cluster = context_map[context as usize] as usize;
+                    let (symbol, _, _) =
+                        crate::entropy::uint_encode_with_config(value, configs[cluster]);
+                    histograms[cluster].add(symbol);
+                }
+                LzToken::Lz77 {
+                    pixel_context,
+                    distance_context,
+                    length_value,
+                    distance_value,
+                } => {
+                    let (len_tok, _, _) = lz77_length_encode(length_value);
+                    histograms[context_map[pixel_context as usize] as usize]
+                        .add(min_symbol + len_tok);
+                    let cluster = context_map[distance_context as usize] as usize;
+                    let (symbol, _, _) =
+                        crate::entropy::uint_encode_with_config(distance_value, configs[cluster]);
+                    histograms[cluster].add(symbol);
+                }
+            }
+        }
+        configs
+    } else {
+        vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()]
+    };
 
     let mut code = OwnedEntropyCode {
         context_map,
         prefix_codes: build_huffman_codes(&histograms),
+        hybrid_uint_configs,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
@@ -2260,8 +3072,9 @@ fn build_lz_pixel_code(toks: &[LzToken], nb_chans: usize, min_symbol: u32) -> Ow
 fn write_lz_token(t: LzToken, code: &OwnedEntropyCode, min_symbol: u32, w: &mut BitWriter) {
     match t {
         LzToken::Pixel { context, value } => {
-            let (sym, nbits, bits) = crate::entropy::uint_encode(value);
             let cluster = code.context_map[context as usize] as usize;
+            let (sym, nbits, bits) =
+                crate::entropy::uint_encode_with_config(value, code.hybrid_uint_configs[cluster]);
             let pc = &code.prefix_codes[cluster];
             let d = pc.depths[sym as usize] as usize;
             let data = (pc.bits[sym as usize] as u64) | ((bits as u64) << d);
@@ -2271,6 +3084,7 @@ fn write_lz_token(t: LzToken, code: &OwnedEntropyCode, min_symbol: u32, w: &mut 
             pixel_context,
             distance_context,
             length_value,
+            distance_value,
         } => {
             let (len_tok, len_nbits, len_bits) = lz77_length_encode(length_value);
             let sym = min_symbol + len_tok;
@@ -2288,10 +3102,17 @@ fn write_lz_token(t: LzToken, code: &OwnedEntropyCode, min_symbol: u32, w: &mut 
             // Distance symbol: value LZ77_DIST_VALUE = 0, no extra bits.
             let dcluster = code.context_map[distance_context as usize] as usize;
             let dc = &code.prefix_codes[dcluster];
-            let dd = dc.depths[LZ77_DIST_VALUE as usize] as usize;
+            let (dist_symbol, dist_nbits, dist_bits) = crate::entropy::uint_encode_with_config(
+                distance_value,
+                code.hybrid_uint_configs[dcluster],
+            );
+            let dd = dc.depths[dist_symbol as usize] as usize;
             // (Could be 0 if it's the only symbol in a single-symbol histogram.)
             if dd > 0 {
-                w.write(dd, dc.bits[LZ77_DIST_VALUE as usize] as u64);
+                let data = dc.bits[dist_symbol as usize] as u64 | ((dist_bits as u64) << dd);
+                w.write(dd + dist_nbits as usize, data);
+            } else if dist_nbits != 0 {
+                w.write(dist_nbits as usize, dist_bits as u64);
             }
         }
     }
@@ -2596,5 +3417,202 @@ pub(crate) fn encode_frame_lossless_float(
             writer.append(s);
             writer.zero_pad_to_byte();
         }
+    }
+}
+
+#[cfg(test)]
+mod predictor_tests {
+    use super::*;
+
+    #[test]
+    fn added_predictors_match_jxl_formulas() {
+        let n = PredictorNeighbors {
+            left: 11,
+            top: 7,
+            top_left: 5,
+            top_right: 13,
+            left_left: 3,
+            top_top: 2,
+            top_right_right: 17,
+        };
+        assert_eq!(predictor_value(PREDICTOR_LEFT, n, 99), 11);
+        assert_eq!(predictor_value(PREDICTOR_TOP, n, 99), 7);
+        assert_eq!(predictor_value(PREDICTOR_SELECT, n, 99), 11);
+        assert_eq!(predictor_value(PREDICTOR_AVERAGE4, n, 99), 11);
+
+        // Select resolves equal distances toward Top, matching libjxl's
+        // `pa < pb ? left : top`.
+        let tie = PredictorNeighbors {
+            left: 9,
+            top: 3,
+            top_left: 6,
+            ..n
+        };
+        assert_eq!(predictor_value(PREDICTOR_SELECT, tie, 99), 3);
+    }
+
+    #[test]
+    fn slow_search_selects_directional_predictors() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let mut horizontal = vec![0i32; W * H];
+        for y in 0..H {
+            horizontal[y * W] = ((y * 73) & 255) as i32;
+            for x in 1..W {
+                let delta = (((x * 17 + y * 31) ^ (x * y * 3)) % 7) as i32 - 3;
+                horizontal[y * W + x] = horizontal[y * W + x - 1] + delta;
+            }
+        }
+        let mut vertical = vec![0i32; W * H];
+        for x in 0..W {
+            vertical[x] = ((x * 73) & 255) as i32;
+            for y in 1..H {
+                let delta = (((y * 17 + x * 31) ^ (x * y * 3)) % 7) as i32 - 3;
+                vertical[y * W + x] = vertical[(y - 1) * W + x] + delta;
+            }
+        }
+
+        assert_eq!(
+            choose_predictor_for_plane(|x, y| horizontal[y * W + x], W, H),
+            PREDICTOR_SELECT
+        );
+        assert_eq!(
+            choose_predictor_for_plane(|x, y| vertical[y * W + x], W, H),
+            PREDICTOR_SELECT
+        );
+    }
+
+    #[test]
+    fn slow_search_selects_average4_for_its_recurrence() {
+        const W: usize = 64;
+        const H: usize = 64;
+        let mut plane = vec![0i32; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                if y < 2 || x < 2 {
+                    plane[i] = (((x * 97 + y * 53) ^ (x * y * 11)) & 1023) as i32 - 512;
+                    continue;
+                }
+                let top_right = if x + 1 < W {
+                    plane[(y - 1) * W + x + 1]
+                } else {
+                    plane[(y - 1) * W + x]
+                };
+                let top_right_right = if x + 2 < W {
+                    plane[(y - 1) * W + x + 2]
+                } else {
+                    top_right
+                };
+                plane[i] = (6 * plane[(y - 1) * W + x] - 2 * plane[(y - 2) * W + x]
+                    + 7 * plane[i - 1]
+                    + plane[i - 2]
+                    + top_right_right
+                    + 3 * top_right
+                    + 8)
+                    / 16;
+            }
+        }
+
+        assert_eq!(
+            choose_predictor_for_plane(|x, y| plane[y * W + x], W, H),
+            PREDICTOR_AVERAGE4
+        );
+    }
+}
+
+#[cfg(test)]
+mod lz77_tests {
+    use super::*;
+
+    fn expand(stream: &[LzToken]) -> Vec<Token> {
+        let mut out = Vec::new();
+        for &token in stream {
+            match token {
+                LzToken::Pixel { context, value } => out.push(Token::new(context, value)),
+                LzToken::Lz77 {
+                    length_value,
+                    distance_value,
+                    ..
+                } => {
+                    let distance = if distance_value == LZ77_DIST_VALUE {
+                        1
+                    } else {
+                        (distance_value - LZ77_NUM_SPECIAL_DISTANCES + 1) as usize
+                    };
+                    for _ in 0..length_value + LZ77_MIN_LENGTH {
+                        let source = out.len() - distance;
+                        out.push(out[source]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hash_chain_finds_non_run_matches_and_round_trips() {
+        let pattern: Vec<Token> = (0..37)
+            .map(|i| Token::new((i % 3) as u32, ((i * 29 + i * i) % 251) as u32))
+            .collect();
+        let mut input = pattern.clone();
+        input.extend((0..11).map(|i| Token::new(1, 900 + i)));
+        input.extend_from_slice(&pattern);
+        input.extend_from_slice(&pattern);
+
+        let compressed = lz77_compress(&input, 3);
+        assert!(compressed.iter().any(|token| matches!(
+            token,
+            LzToken::Lz77 { distance_value, .. }
+                if *distance_value >= LZ77_NUM_SPECIAL_DISTANCES
+        )));
+        let decoded = expand(&compressed);
+        assert_eq!(decoded.len(), input.len());
+        assert!(
+            decoded
+                .iter()
+                .zip(input.iter())
+                .all(|(a, b)| a.context == b.context && a.value == b.value)
+        );
+    }
+
+    #[test]
+    fn hash_chain_uses_compact_distance_for_runs() {
+        let input = vec![Token::new(0, 7); 128];
+        let compressed = lz77_compress(&input, 1);
+        assert!(compressed.iter().any(|token| matches!(
+            token,
+            LzToken::Lz77 {
+                distance_value: LZ77_DIST_VALUE,
+                ..
+            }
+        )));
+        assert_eq!(expand(&compressed).len(), input.len());
+    }
+
+    #[test]
+    fn speed_policy_keeps_fast_run_only_and_slow_structured_search() {
+        let pattern: Vec<Token> = (0..64)
+            .map(|i| Token::new((i % 3) as u32, ((i * 37 + 11) % 257) as u32))
+            .collect();
+        let mut input = pattern.clone();
+        for _ in 0..7 {
+            input.extend_from_slice(&pattern);
+        }
+
+        let fast = lz77_compress_for_speed(&input, 3, crate::Speed::Fast);
+        assert!(!fast.iter().any(|token| matches!(
+            token,
+            LzToken::Lz77 { distance_value, .. }
+                if *distance_value != LZ77_DIST_VALUE
+        )));
+
+        let slow = lz77_compress_for_speed(&input, 3, crate::Speed::Slow);
+        assert!(slow.iter().any(|token| matches!(
+            token,
+            LzToken::Lz77 { distance_value, .. }
+                if *distance_value != LZ77_DIST_VALUE
+        )));
+        assert_eq!(expand(&slow).len(), input.len());
     }
 }

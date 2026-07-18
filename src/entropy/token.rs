@@ -32,6 +32,21 @@ pub(crate) struct Token {
     pub value: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HybridUintConfig {
+    pub(crate) split_exponent: u8,
+    pub(crate) msb_in_token: u8,
+    pub(crate) lsb_in_token: u8,
+}
+
+impl HybridUintConfig {
+    pub(crate) const DEFAULT: Self = Self {
+        split_exponent: 4,
+        msb_in_token: 2,
+        lsb_in_token: 0,
+    };
+}
+
 impl Token {
     #[inline]
     pub(crate) const fn new(context: u32, value: u32) -> Self {
@@ -50,14 +65,36 @@ pub(crate) fn uint_encode(value: u32) -> (u32, u32, u32) {
     if value < 16 {
         (value, 0, 0)
     } else {
-        let n = 31 - value.leading_zeros(); // floor_log2_nonzero
-        debug_assert!(n >= 4);
+        let n = 31 - value.leading_zeros();
         let m = value - (1 << n);
         let token = (n << 2) + (m >> (n - 2));
         let nbits = n - 2;
         let bits = value & ((1u32 << nbits) - 1);
         (token, nbits, bits)
     }
+}
+
+/// Hybrid-uint encoding for an arbitrary JPEG XL UintConfig.
+#[inline]
+pub(crate) fn uint_encode_with_config(value: u32, config: HybridUintConfig) -> (u32, u32, u32) {
+    if config == HybridUintConfig::DEFAULT {
+        return uint_encode(value);
+    }
+    let split = config.split_exponent as u32;
+    let msb = config.msb_in_token as u32;
+    let lsb = config.lsb_in_token as u32;
+    debug_assert!(msb + lsb <= split);
+    if value < (1u32 << split) {
+        return (value, 0, 0);
+    }
+
+    let n = 31 - value.leading_zeros();
+    let nbits = n - msb - lsb;
+    let low_token = value & ((1u32 << lsb) - 1);
+    let high_token = (value >> (n - msb)) & ((1u32 << msb) - 1);
+    let token = (1u32 << split) + ((n - split) << (msb + lsb)) + (high_token << lsb) + low_token;
+    let bits = (value >> lsb) & ((1u32 << nbits) - 1);
+    (token, nbits, bits)
 }
 
 /// Map a signed integer to a non-negative one via "zigzag" encoding.
@@ -100,6 +137,55 @@ mod tests {
     fn uint_encode_n5() {
         // 32 = 100000, n=5, m=0, token=20, nbits=3, bits=0
         assert_eq!(uint_encode(32), (20, 3, 0));
+    }
+
+    fn uint_decode_for_test(token: u32, _nbits: u32, bits: u32, c: HybridUintConfig) -> u32 {
+        let split = c.split_exponent as u32;
+        if token < (1 << split) {
+            return token;
+        }
+        let msb = c.msb_in_token as u32;
+        let lsb = c.lsb_in_token as u32;
+        let rest = token - (1 << split);
+        let token_bits = msb + lsb;
+        let n = split + (rest >> token_bits);
+        let low = rest & ((1 << lsb) - 1);
+        let high = (rest >> lsb) & ((1 << msb) - 1);
+        (1 << n) | (high << (n - msb)) | (bits << lsb) | low
+    }
+
+    #[test]
+    fn configurable_uint_round_trips() {
+        let configs = [
+            HybridUintConfig {
+                split_exponent: 0,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            },
+            HybridUintConfig {
+                split_exponent: 3,
+                msb_in_token: 0,
+                lsb_in_token: 0,
+            },
+            HybridUintConfig {
+                split_exponent: 4,
+                msb_in_token: 1,
+                lsb_in_token: 1,
+            },
+            HybridUintConfig::DEFAULT,
+            HybridUintConfig {
+                split_exponent: 6,
+                msb_in_token: 1,
+                lsb_in_token: 0,
+            },
+        ];
+        let values = [0, 1, 2, 15, 16, 17, 31, 32, 255, 65_535, u32::MAX];
+        for config in configs {
+            for value in values {
+                let (token, nbits, bits) = uint_encode_with_config(value, config);
+                assert_eq!(uint_decode_for_test(token, nbits, bits, config), value);
+            }
+        }
     }
 
     #[test]

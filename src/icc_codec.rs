@@ -301,6 +301,7 @@ fn build_icc_code(enc: &[u8]) -> OwnedEntropyCode {
     let mut code = OwnedEntropyCode {
         context_map,
         prefix_codes: build_huffman_codes(&histograms),
+        hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,

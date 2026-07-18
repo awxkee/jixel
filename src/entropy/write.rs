@@ -35,7 +35,7 @@ use super::entropy_code::{EntropyCode, OwnedEntropyCode};
 use super::histogram::Histogram;
 use super::huffman_tree::create_huffman_tree;
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
-use super::token::{Token, uint_encode};
+use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
 
 pub(crate) const ANS_ENABLED: bool = true;
@@ -51,8 +51,9 @@ fn no_ans() -> (bool, Vec<Vec<u16>>, Vec<Vec<AnsEncSymbolInfo>>) {
 /// Hot-path token writer. Matches libjxl-tiny's inline WriteToken.
 #[inline]
 pub(crate) fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
-    let (tok, nbits, bits) = uint_encode(t.value);
-    let pc = &code.prefix_codes[code.context_map[t.context as usize] as usize];
+    let cluster = code.context_map[t.context as usize] as usize;
+    let (tok, nbits, bits) = uint_encode_with_config(t.value, code.hybrid_uint_configs[cluster]);
+    let pc = &code.prefix_codes[cluster];
     if pc.single_symbol {
         // Single-symbol prefix code: the codeword is zero-length (JXL encodes
         // such a context with no bits, and the decoder reads the symbol without
@@ -63,6 +64,124 @@ pub(crate) fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
     let d = pc.depths[tok as usize] as usize;
     let data = (pc.bits[tok as usize] as u64) | ((bits as u64) << d);
     w.write(d + nbits as usize, data);
+}
+
+const HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
+    HybridUintConfig {
+        split_exponent: 0,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 1,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 2,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 3,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 4,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 4,
+        msb_in_token: 1,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig::DEFAULT,
+    HybridUintConfig {
+        split_exponent: 4,
+        msb_in_token: 1,
+        lsb_in_token: 1,
+    },
+    HybridUintConfig {
+        split_exponent: 5,
+        msb_in_token: 0,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 5,
+        msb_in_token: 1,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 5,
+        msb_in_token: 2,
+        lsb_in_token: 0,
+    },
+    HybridUintConfig {
+        split_exponent: 6,
+        msb_in_token: 1,
+        lsb_in_token: 0,
+    },
+];
+
+pub(crate) fn select_hybrid_config(values: &[u32]) -> HybridUintConfig {
+    const MAX_SEARCH_SAMPLES: usize = 65_536;
+    let stride = values.len().div_ceil(MAX_SEARCH_SAMPLES).max(1);
+    let mut best = HybridUintConfig::DEFAULT;
+    let mut best_cost = u64::MAX;
+    for config in HYBRID_CANDIDATES {
+        let mut histogram = Histogram::new();
+        let mut extra = 0u64;
+        let mut valid = true;
+        for &value in values.iter().step_by(stride) {
+            let (symbol, nbits, _) = uint_encode_with_config(value, config);
+            if symbol as usize >= ALPHABET_SIZE {
+                valid = false;
+                break;
+            }
+            histogram.add(symbol);
+            extra += nbits as u64;
+        }
+        if !valid {
+            continue;
+        }
+        let used = histogram.counts.iter().filter(|&&count| count != 0).count();
+        let prefix = if used <= 1 {
+            0
+        } else {
+            let mut depths = [0u8; ALPHABET_SIZE];
+            create_huffman_tree(&histogram.counts, 15, &mut depths);
+            histogram
+                .counts
+                .iter()
+                .zip(depths.iter())
+                .map(|(&count, &depth)| count as u64 * depth as u64)
+                .sum::<u64>()
+        };
+        // UintConfig storage is variable-width after split_exponent, so small
+        // histograms should not pick a theoretically cheaper configuration
+        // whose header costs more than it saves.
+        let split = config.split_exponent as u32;
+        let msb = config.msb_in_token as u32;
+        let msb_width = if split == 0 {
+            0
+        } else {
+            32 - split.leading_zeros()
+        };
+        let remaining = split - msb;
+        let lsb_width = if remaining == 0 {
+            0
+        } else {
+            32 - remaining.leading_zeros()
+        };
+        let cost = prefix + extra + 4 + msb_width as u64 + lsb_width as u64;
+        if cost < best_cost {
+            best_cost = cost;
+            best = config;
+        }
+    }
+    best
 }
 
 fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
@@ -116,6 +235,7 @@ pub(crate) fn optimize_prefix_codes(
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; num_contexts],
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code,
@@ -134,6 +254,7 @@ pub(crate) fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> Ow
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code,
@@ -170,6 +291,7 @@ pub(crate) fn optimize_entropy_code_ac(tokens: &[Token], num_contexts: usize) ->
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code,
@@ -190,6 +312,7 @@ pub(crate) fn build_entropy_code_no_cluster(
     OwnedEntropyCode {
         context_map,
         prefix_codes,
+        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; num_contexts],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code,
@@ -564,12 +687,31 @@ fn write_prefix_code_single(code: &PrefixCode, w: &mut BitWriter) {
 }
 
 /// Write a vector of prefix codes (per WritePrefixCodes in libjxl-tiny).
-pub(crate) fn write_prefix_codes(codes: &[PrefixCode], w: &mut BitWriter) {
+pub(crate) fn write_prefix_codes(
+    codes: &[PrefixCode],
+    configs: &[HybridUintConfig],
+    w: &mut BitWriter,
+) {
     w.write(1, 1); // use_prefix_code
-    for _ in 0..codes.len() {
-        w.write(4, 4);
-        w.write(3, 2);
-        w.write(2, 0);
+    debug_assert_eq!(codes.len(), configs.len());
+    for &config in configs {
+        let split = config.split_exponent as u32;
+        let msb = config.msb_in_token as u32;
+        let lsb = config.lsb_in_token as u32;
+        w.write(4, split as u64);
+        let msb_width = if split == 0 {
+            0
+        } else {
+            32 - split.leading_zeros()
+        };
+        w.write(msb_width as usize, msb as u64);
+        let remaining = split - msb;
+        let lsb_width = if remaining == 0 {
+            0
+        } else {
+            32 - remaining.leading_zeros()
+        };
+        w.write(lsb_width as usize, lsb as u64);
     }
     // num_symbol per code.
     for code in codes.iter() {
@@ -630,7 +772,11 @@ pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
 
     let ctxmap_code = optimize_prefix_codes(&tokens, vec![0u8], 1);
     let ctxmap_ref = ctxmap_code.as_ref();
-    write_prefix_codes(&ctxmap_code.prefix_codes, w);
+    write_prefix_codes(
+        &ctxmap_code.prefix_codes,
+        &ctxmap_code.hybrid_uint_configs,
+        w,
+    );
     for t in &tokens {
         write_token(*t, &ctxmap_ref, w);
     }
@@ -640,7 +786,7 @@ pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
 pub(crate) fn write_entropy_code(code: &EntropyCode, w: &mut BitWriter) {
     write_context_map(code, w);
     if code.use_prefix_code {
-        write_prefix_codes(code.prefix_codes, w);
+        write_prefix_codes(code.prefix_codes, code.hybrid_uint_configs, w);
     } else {
         write_ans_params(code, w);
     }

@@ -87,6 +87,14 @@ fn histogram_add(a: &mut Histogram, b: &Histogram) {
 }
 
 #[inline]
+fn histogram_sub(a: &mut Histogram, b: &Histogram) {
+    for (dst, &src) in a.counts.iter_mut().zip(b.counts.iter()) {
+        *dst -= src;
+    }
+    a.total_count -= b.total_count;
+}
+
+#[inline]
 fn histogram_distance(
     a: &Histogram,
     b: &Histogram,
@@ -103,9 +111,36 @@ fn histogram_distance(
     counts_bit_cost(scratch, a.total_count + b.total_count) - a_cost - b_cost
 }
 
-/// Cluster `histograms` in place down to at most 8 distinct ones; produce
+#[inline]
+fn histogram_merge_increment(
+    input: &Histogram,
+    cluster: &Histogram,
+    cluster_cost: f32,
+    scratch: &mut [u32; ALPHABET_SIZE],
+) -> f32 {
+    *scratch = input.counts;
+    add_counts(scratch, &cluster.counts);
+    counts_bit_cost(scratch, input.total_count + cluster.total_count) - cluster_cost
+}
+
+/// Cluster `histograms` in place down to at most 64 distinct ones; produce
 /// `context_map[i] = cluster index for histogram i`.
 pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &mut Vec<u8>) {
+    cluster_histograms_inner(histograms, context_map, false);
+}
+
+pub(crate) fn cluster_histograms_refined(
+    histograms: &mut Vec<Histogram>,
+    context_map: &mut Vec<u8>,
+) {
+    cluster_histograms_inner(histograms, context_map, true);
+}
+
+fn cluster_histograms_inner(
+    histograms: &mut Vec<Histogram>,
+    context_map: &mut Vec<u8>,
+    refined: bool,
+) {
     if histograms.len() <= 1 {
         context_map.clear();
         context_map.resize(histograms.len(), 0);
@@ -147,6 +182,12 @@ pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &
             largest_count = total_count;
             largest_idx = i;
         }
+    }
+    if largest_count == 0 {
+        *histograms = vec![Histogram::new()];
+        context_map.clear();
+        context_map.resize(n, 0);
+        return;
     }
 
     let mut out: Vec<Histogram> = Vec::with_capacity(max_histograms);
@@ -193,28 +234,125 @@ pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &
         }
     }
 
-    // Assign remaining inputs to the closest cluster, merging.
-    for ((hist, &in_cost), symbol) in inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut()) {
-        if *symbol != unassigned {
-            continue;
+    if !refined {
+        // Low-effort path: preserve the original single-pass assignment. It is
+        // intentionally cheap and is used by Fast and the many small lossy
+        // entropy bundles.
+        for ((hist, &in_cost), symbol) in inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut()) {
+            if *symbol != unassigned {
+                continue;
+            }
+            let mut best = 0usize;
+            let mut best_dist =
+                histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+            for (j, (candidate, &candidate_cost)) in
+                out.iter().zip(out_costs.iter()).enumerate().skip(1)
+            {
+                let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
+                if d < best_dist {
+                    best = j;
+                    best_dist = d;
+                }
+            }
+            histogram_add(&mut out[best], hist);
+            out_costs[best] = histogram_bit_cost(&out[best]);
+            *symbol = best as u8;
+        }
+    } else {
+        // Assign remaining inputs against the immutable seed distributions. The
+        // old implementation updated a cluster after every assignment, making the
+        // result depend strongly on input order and allowing an early, broad
+        // histogram to attract unrelated later contexts.
+        for ((hist, &in_cost), symbol) in inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut()) {
+            if *symbol != unassigned {
+                continue;
+            }
+
+            let mut best = 0usize;
+            let mut best_dist =
+                histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+            for (j, (candidate, &candidate_cost)) in
+                out.iter().zip(out_costs.iter()).enumerate().skip(1)
+            {
+                let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
+                if d < best_dist {
+                    best = j;
+                    best_dist = d;
+                }
+            }
+
+            *symbol = best as u8;
         }
 
-        let mut best = 0usize;
-        let mut best_dist = histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
-        for (j, (candidate, &candidate_cost)) in
-            out.iter().zip(out_costs.iter()).enumerate().skip(1)
-        {
-            let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
-            if d < best_dist {
-                best = j;
-                best_dist = d;
+        // Pool the complete assigned distributions, then perform a few exact
+        // cost-decreasing relocations. For a move A -> B we account for both
+        // cost(A - input) and cost(B + input), which avoids the self-inclusion bias
+        // of nearest-centroid clustering.
+        out.fill(Histogram::new());
+        for (hist, &symbol) in inp.iter().zip(symbols.iter()) {
+            histogram_add(&mut out[symbol as usize], hist);
+        }
+        for (cost, hist) in out_costs.iter_mut().zip(out.iter()) {
+            *cost = histogram_bit_cost(hist);
+        }
+
+        for _ in 0..2 {
+            let mut changed = false;
+            for (hist, symbol) in inp.iter().zip(symbols.iter_mut()) {
+                if hist.total_count == 0 {
+                    continue;
+                }
+                let old = *symbol as usize;
+                let mut old_without = out[old].clone();
+                histogram_sub(&mut old_without, hist);
+                let remove_delta = histogram_bit_cost(&old_without) - out_costs[old];
+
+                let mut best = old;
+                let mut best_delta = 0.0f32;
+                for candidate in 0..out.len() {
+                    if candidate == old || out[candidate].total_count == 0 {
+                        continue;
+                    }
+                    let add_delta = histogram_merge_increment(
+                        hist,
+                        &out[candidate],
+                        out_costs[candidate],
+                        &mut scratch,
+                    );
+                    let delta = remove_delta + add_delta;
+                    if delta < best_delta - 0.01 {
+                        best_delta = delta;
+                        best = candidate;
+                    }
+                }
+                if best != old {
+                    histogram_sub(&mut out[old], hist);
+                    histogram_add(&mut out[best], hist);
+                    out_costs[old] = histogram_bit_cost(&out[old]);
+                    out_costs[best] = histogram_bit_cost(&out[best]);
+                    *symbol = best as u8;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
 
-        let best_hist = &mut out[best];
-        histogram_add(best_hist, hist);
-        out_costs[best] = histogram_bit_cost(best_hist);
-        *symbol = best as u8;
+        // Drop clusters emptied by relocation and update assignments before the
+        // stable first-occurrence reindex below.
+        let mut compact = vec![UNMAPPED; out.len()];
+        let mut compact_out = Vec::with_capacity(out.len());
+        for (old, hist) in out.into_iter().enumerate() {
+            if hist.total_count != 0 {
+                compact[old] = compact_out.len() as u8;
+                compact_out.push(hist);
+            }
+        }
+        for symbol in &mut symbols {
+            *symbol = compact[*symbol as usize];
+        }
+        out = compact_out;
     }
 
     // Reindex so new symbols come in increasing order, matching HistogramReindex.
