@@ -2260,6 +2260,17 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn rgb8_slow_rectangular_dct64_lossy() {
+        let config = EncodeConfig::default()
+            .with_distance(2.5)
+            .with_speed(Speed::Slow);
+        for (width, height) in [(32, 64), (64, 32)] {
+            let pixels = vec![128u8; width * height * 3];
+            ok(encode_image(&pixels, width, height, &config));
+        }
+    }
+
+    #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
     }

@@ -31,7 +31,7 @@
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32, STRATEGY_DCT64X64,
+    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
 };
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
 use crate::dct::fmla;
@@ -45,6 +45,10 @@ use std::cell::RefCell;
 /// occasional wrong merge cost more than the large-DCT decorrelation saves.
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.5;
 
+/// Above this distance the [`SearchScope::Squares`] tier stops reranking; see
+/// [`SearchScope::rerank`].
+const FAST_RERANK_MAX_DISTANCE: f32 = 2.0;
+
 #[inline]
 fn use_dct8_only(distance: f32) -> bool {
     distance <= DCT8_ONLY_MAX_DISTANCE
@@ -52,7 +56,12 @@ fn use_dct8_only(distance: f32) -> bool {
 
 #[inline]
 fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
-    speed == crate::Speed::Slow && distance >= 3.0
+    speed == crate::Speed::Slow && distance >= DCT64_MIN_DISTANCE
+}
+
+#[inline]
+fn use_dct64_rect(speed: crate::Speed, distance: f32) -> bool {
+    speed == crate::Speed::Slow && distance >= DCT64_RECT_MIN_DISTANCE
 }
 
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
@@ -64,7 +73,12 @@ const BIAS_RECT: f32 = 1.0;
 const BIAS_16X16: f32 = 1.0;
 const BIAS_32X32: f32 = 1.0;
 const BIAS_RECT32: f32 = 1.10;
-const BIAS_64X64: f32 = 1.0;
+
+const DCT64_MIN_DISTANCE: f32 = 3.0;
+const DCT64_RECT_MIN_DISTANCE: f32 = 2.5;
+
+const BIAS_64X64: f32 = 1.10;
+const BIAS_64_RECT: f32 = 1.10;
 
 const MERGE_MARGIN_PAIR_HQ: f32 = 0.04;
 const MERGE_MARGIN_16_HQ: f32 = 0.08;
@@ -94,6 +108,49 @@ fn merge_beats_dct8(
     high_quality_margin: f32,
 ) -> bool {
     candidate_cost < dct8_cost * (1.0 - merge_margin(distance, high_quality_margin))
+}
+
+/// How much of the transform space the chooser explores.
+///
+/// Both scopes run the same coefficient-domain RD model; they differ only in
+/// which candidates are offered. `Squares` is the [`crate::Speed::Fast`] tier:
+/// DCT16X16 and DCT32X32 compete against their tiled DCT8 incumbent, and the
+/// rectangular merges, the sub-8x8 refinement and the 64px pass are skipped.
+/// The SSIM reconstruction rerank still runs — it is what keeps the chooser
+/// from over-merging at high quality, where the coefficient-domain model
+/// systematically prefers a merge that SSIMULACRA2 does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SearchScope {
+    Squares,
+    Full,
+}
+
+impl SearchScope {
+    #[inline]
+    fn for_speed(speed: crate::Speed) -> Self {
+        match speed {
+            crate::Speed::Fast => SearchScope::Squares,
+            crate::Speed::Slow => SearchScope::Full,
+        }
+    }
+
+    #[inline]
+    fn rectangles(self) -> bool {
+        self == SearchScope::Full
+    }
+
+    /// Whether the SSIM reconstruction rerank runs.
+    ///
+    /// `Full` always reranks. `Squares` only reranks at high quality: measured
+    /// on 42 images, the rerank's own marginal value inside the Fast tier is
+    /// -0.69% at d=1.0, -0.30% at d=1.5 and -0.06% at d=2.0, then flips
+    /// positive (+0.1..+0.17% at d=3.5-4.5) with the win rate falling to
+    /// ~18/42. It is also the tier's most expensive stage, so paying for it
+    /// past the crossover would cost time to lose rate.
+    #[inline]
+    fn rerank(self, distance: f32) -> bool {
+        self == SearchScope::Full || distance <= FAST_RERANK_MAX_DISTANCE
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -287,8 +344,9 @@ thread_local! {
 /// Coefficient-domain cost for DCT64. Kept separate from the standard chooser
 /// so the hot-path scratch and reconstruction reranker remain sized for 32x32.
 #[allow(clippy::too_many_arguments)]
-fn strategy_cost64(
+fn strategy_cost_large(
     ctx: &EncodingContext,
+    strategy: u8,
     opsin: &Image3F,
     px: usize,
     py: usize,
@@ -300,27 +358,56 @@ fn strategy_cost64(
     cmap_factor: [f32; 3],
 ) -> f32 {
     DCT64_SCRATCH.with_borrow_mut(|cell| {
+        let (width, height, size, cx, cy) = match strategy {
+            STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
+            STRATEGY_DCT64X32 => (32, 64, 2048, 8, 4),
+            STRATEGY_DCT32X64 => (64, 32, 2048, 8, 4),
+            _ => unreachable!("invalid large strategy {strategy}"),
+        };
         for (c, coeff) in cell.coeffs.iter_mut().enumerate() {
-            gather_pixels(opsin.plane(c), px, py, 64, 64, &mut cell.input[..]);
-            (ctx.dct64x64)(&cell.input, coeff);
+            gather_pixels(
+                opsin.plane(c),
+                px,
+                py,
+                width,
+                height,
+                &mut cell.input[..size],
+            );
+            match strategy {
+                STRATEGY_DCT64X64 => (ctx.dct64x64)(&cell.input, coeff),
+                STRATEGY_DCT64X32 => (ctx.dct64x32)(
+                    (&cell.input[..2048]).try_into().unwrap(),
+                    (&mut coeff[..2048]).try_into().unwrap(),
+                ),
+                STRATEGY_DCT32X64 => (ctx.dct32x64)(
+                    (&cell.input[..2048]).try_into().unwrap(),
+                    (&mut coeff[..2048]).try_into().unwrap(),
+                ),
+                _ => unreachable!(),
+            }
         }
         let [x, y, b] = &mut cell.coeffs;
-        apply_cfl(ctx, CflXyb { x, y, b }, 4096, cmap_factor);
+        apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
         let mut distortion = 0.0f32;
         let mut rate = 0.0f32;
-        for (c, cell) in cell.coeffs.iter_mut().enumerate() {
+        for (c, cell) in cell.coeffs.iter().enumerate() {
+            let inv_matrix: &[f32] = match strategy {
+                STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(c)[..],
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(c)[..],
+                _ => unreachable!(),
+            };
             let (d, r) = channel_rd(
                 ctx.sse_and_rate,
                 ctx.rate_log2_lut,
-                cell,
-                &matrices.inv_matrix_64x64(c)[..],
+                &cell[..size],
+                inv_matrix,
                 c,
                 qac,
                 if c == 0 { qm_mult_x } else { 1.0 },
                 distance,
-                8,
-                8,
+                cx,
+                cy,
             );
             distortion += CHANNEL_WEIGHT[c] * d;
             rate += r;
@@ -632,6 +719,7 @@ fn select_super_block(
     dct8_costs: &mut [f32],
     dct8_cost_y0: usize,
     dct8_cost_stride: usize,
+    scope: SearchScope,
 ) -> SuperBlockCost {
     let cmap_factor = cmap_factors(ytox_map, ytob_map, bx0, by0);
 
@@ -659,65 +747,31 @@ fn select_super_block(
         }
     }
 
-    // Vertical pairs (DCT16X8): one per column.
-    let v_left = BIAS_RECT
-        * strategy_cost(
-            ctx,
-            STRATEGY_DCT16X8,
-            opsin,
-            px0,
-            py0,
-            qac[0][0].max(qac[1][0]),
-            qm_mult_x,
-            matrices,
-            meta_r,
-            distance,
-            cmap_factor,
-        );
-    let v_right = BIAS_RECT
-        * strategy_cost(
-            ctx,
-            STRATEGY_DCT16X8,
-            opsin,
-            px0 + 8,
-            py0,
-            qac[0][1].max(qac[1][1]),
-            qm_mult_x,
-            matrices,
-            meta_r,
-            distance,
-            cmap_factor,
-        );
-
-    // Horizontal pairs (DCT8X16): one per row.
-    let h_top = BIAS_RECT
-        * strategy_cost(
-            ctx,
-            STRATEGY_DCT8X16,
-            opsin,
-            px0,
-            py0,
-            qac[0][0].max(qac[0][1]),
-            qm_mult_x,
-            matrices,
-            meta_r,
-            distance,
-            cmap_factor,
-        );
-    let h_bot = BIAS_RECT
-        * strategy_cost(
-            ctx,
-            STRATEGY_DCT8X16,
-            opsin,
-            px0,
-            py0 + 8,
-            qac[1][0].max(qac[1][1]),
-            qm_mult_x,
-            matrices,
-            meta_r,
-            distance,
-            cmap_factor,
-        );
+    // Vertical pairs (DCT16X8): one per column. Skipped entirely under
+    // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
+    let rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> f32 {
+        if !scope.rectangles() {
+            return f32::INFINITY;
+        }
+        BIAS_RECT
+            * strategy_cost(
+                ctx,
+                strategy,
+                opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                matrices,
+                meta_r,
+                distance,
+                cmap_factor,
+            )
+    };
+    let v_left = rect_cost(px0, py0, STRATEGY_DCT16X8, qac[0][0].max(qac[1][0]));
+    let v_right = rect_cost(px0 + 8, py0, STRATEGY_DCT16X8, qac[0][1].max(qac[1][1]));
+    let h_top = rect_cost(px0, py0, STRATEGY_DCT8X16, qac[0][0].max(qac[0][1]));
+    let h_bot = rect_cost(px0, py0 + 8, STRATEGY_DCT8X16, qac[1][0].max(qac[1][1]));
 
     // The single DCT16X16 over all four.
     let c16 = BIAS_16X16
@@ -912,6 +966,7 @@ fn select_band(
     ysize: usize,
     y_begin: usize,
     y_end: usize,
+    scope: SearchScope,
 ) -> f32 {
     // First-pass DCT8 incumbents are consumed again by the sub-8 refinement.
     // Keep only this worker's row band so parallel selection stays independent.
@@ -950,6 +1005,7 @@ fn select_band(
                             &mut dct8_costs,
                             y_begin,
                             xsize,
+                            scope,
                         );
                         sub_total += costs.chosen;
                         dct8_total += costs.dct8;
@@ -970,60 +1026,32 @@ fn select_band(
                     distance,
                     cmap_factor,
                 );
-                // Two DCT32X16 (each 2 wide × 4 tall) tiling the region: left + right.
-                let cl = strategy_cost(
-                    ctx,
-                    STRATEGY_DCT32X16,
-                    opsin,
-                    dc_group_px + bx * 8,
-                    dc_group_py + by * 8,
-                    region_qac(quant_field, bx, by, 2, 4, scale, distance),
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
-                let cr = strategy_cost(
-                    ctx,
-                    STRATEGY_DCT32X16,
-                    opsin,
-                    dc_group_px + (bx + 2) * 8,
-                    dc_group_py + by * 8,
-                    region_qac(quant_field, bx + 2, by, 2, 4, scale, distance),
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
-                // Two DCT16X32 (each 4 wide × 2 tall) tiling the region: top + bottom.
-                let ct = strategy_cost(
-                    ctx,
-                    STRATEGY_DCT16X32,
-                    opsin,
-                    dc_group_px + bx * 8,
-                    dc_group_py + by * 8,
-                    region_qac(quant_field, bx, by, 4, 2, scale, distance),
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
-                let cb = strategy_cost(
-                    ctx,
-                    STRATEGY_DCT16X32,
-                    opsin,
-                    dc_group_px + bx * 8,
-                    dc_group_py + (by + 2) * 8,
-                    region_qac(quant_field, bx, by + 2, 4, 2, scale, distance),
-                    qm_mult_x,
-                    matrices,
-                    meta_r,
-                    distance,
-                    cmap_factor,
-                );
+                // Two DCT32X16 (each 2 wide x 4 tall) tiling the region: left +
+                // right, and two DCT16X32 (each 4 wide x 2 tall): top + bottom.
+                // Skipped under `SearchScope::Squares`.
+                let rect32 = |bx: usize, by: usize, strategy: u8, cw: usize, ch: usize| -> f32 {
+                    if !scope.rectangles() {
+                        return f32::INFINITY;
+                    }
+                    strategy_cost(
+                        ctx,
+                        strategy,
+                        opsin,
+                        dc_group_px + bx * 8,
+                        dc_group_py + by * 8,
+                        region_qac(quant_field, bx, by, cw, ch, scale, distance),
+                        qm_mult_x,
+                        matrices,
+                        meta_r,
+                        distance,
+                        cmap_factor,
+                    )
+                };
+                let cl = rect32(bx, by, STRATEGY_DCT32X16, 2, 4);
+                let cr = rect32(bx + 2, by, STRATEGY_DCT32X16, 2, 4);
+                let ct = rect32(bx, by, STRATEGY_DCT16X32, 4, 2);
+                let cb = rect32(bx, by + 2, STRATEGY_DCT16X32, 4, 2);
+
                 let can_32x32 = ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32);
                 let can_32x16 = ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X16)
                     && ac_strategy.can_place_strategy(bx + 2, by, STRATEGY_DCT32X16);
@@ -1098,6 +1126,7 @@ fn select_band(
                         &mut dct8_costs,
                         y_begin,
                         xsize,
+                        scope,
                     );
                 }
                 bx += 2;
@@ -1122,6 +1151,7 @@ fn select_band(
                     &mut dct8_costs,
                     y_begin,
                     xsize,
+                    scope,
                 );
                 bx += 2;
             }
@@ -1129,8 +1159,13 @@ fn select_band(
         by += if four_row { 4 } else { 2 };
     }
 
-    // Sub-8x8 refinement for this row band.
+    // Sub-8x8 refinement for this row band. `SearchScope::Squares` stops here:
+    // it commits no sub-8 strategies, so the caller's activation gate (which
+    // weighs their metadata cost) sees an empty set and is a no-op.
     let mut benefit = 0.0f32;
+    if !scope.rectangles() {
+        return benefit;
+    }
     for by in y_begin..y_end {
         for bx in 0..xsize {
             if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
@@ -1218,10 +1253,11 @@ pub(crate) fn fill_ac_strategy(
 ) -> f32 {
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
-    // DCT8 wins the high-quality RD comparison.
-    if speed == crate::Speed::Fast || use_dct8_only(distance) {
+    // DCT8 wins the high-quality RD comparison outright.
+    if use_dct8_only(distance) {
         return 0.0;
     }
+    let scope = SearchScope::for_speed(speed);
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
     // Per-candidate-block metadata rate for the strategy chooser (bits),
     // faded in above d=1 (see strategy_cost).
@@ -1252,6 +1288,7 @@ pub(crate) fn fill_ac_strategy(
             ysize,
             0,
             ysize,
+            scope,
         )
     } else {
         // Each band selects into its own fresh (default) strategy image, reading
@@ -1279,6 +1316,7 @@ pub(crate) fn fill_ac_strategy(
                 ysize,
                 y0,
                 y1,
+                scope,
             );
             (local, b)
         });
@@ -1290,29 +1328,106 @@ pub(crate) fn fill_ac_strategy(
         benefit
     };
 
-    // DCT64 is deliberately restricted to the most expensive tier and low
-    // quality. It exactly covers one 64px strategy tile, so each aligned full
-    // tile can be represented without crossing the encoder's stripe boundary.
-    if use_dct64(speed, distance) {
+    // The 64x32/32x64 transforms are slow-tier choices from distance 2.5;
+    // DCT64 joins the same full-tile competition at distance 3.0.
+    if use_dct64(speed, distance) || use_dct64_rect(speed, distance) {
+        let rect_live = use_dct64_rect(speed, distance);
         for by in (0..ysize).step_by(8) {
             for bx in (0..xsize).step_by(8) {
                 if !ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT64X64) {
+                    if !rect_live {
+                        continue;
+                    }
+                    let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
+                    for sx in [0usize, 4] {
+                        let x = bx + sx;
+                        if !ac_strategy.can_place_strategy(x, by, STRATEGY_DCT64X32) {
+                            continue;
+                        }
+                        let rect = strategy_cost_large(
+                            ctx,
+                            STRATEGY_DCT64X32,
+                            opsin,
+                            dc_group_px + x * 8,
+                            dc_group_py + by * 8,
+                            region_qac(quant_field, x, by, 4, 8, scale, distance),
+                            qm_mult_x,
+                            matrices,
+                            meta_r,
+                            distance,
+                            cmap,
+                        );
+                        let mut tiled = 0.0;
+                        for sy in [0usize, 4] {
+                            tiled += strategy_cost(
+                                ctx,
+                                STRATEGY_DCT32X32,
+                                opsin,
+                                dc_group_px + x * 8,
+                                dc_group_py + (by + sy) * 8,
+                                region_qac(quant_field, x, by + sy, 4, 4, scale, distance),
+                                qm_mult_x,
+                                matrices,
+                                meta_r,
+                                distance,
+                                cmap,
+                            );
+                        }
+                        if merge_beats_dct8(
+                            BIAS_64_RECT * rect,
+                            tiled,
+                            distance,
+                            MERGE_MARGIN_64_HQ,
+                        ) {
+                            ac_strategy.set_first(x, by, STRATEGY_DCT64X32);
+                        }
+                    }
+                    for sy in [0usize, 4] {
+                        let y = by + sy;
+                        if !ac_strategy.can_place_strategy(bx, y, STRATEGY_DCT32X64) {
+                            continue;
+                        }
+                        let rect = strategy_cost_large(
+                            ctx,
+                            STRATEGY_DCT32X64,
+                            opsin,
+                            dc_group_px + bx * 8,
+                            dc_group_py + y * 8,
+                            region_qac(quant_field, bx, y, 8, 4, scale, distance),
+                            qm_mult_x,
+                            matrices,
+                            meta_r,
+                            distance,
+                            cmap,
+                        );
+                        let mut tiled = 0.0;
+                        for sx in [0usize, 4] {
+                            tiled += strategy_cost(
+                                ctx,
+                                STRATEGY_DCT32X32,
+                                opsin,
+                                dc_group_px + (bx + sx) * 8,
+                                dc_group_py + y * 8,
+                                region_qac(quant_field, bx + sx, y, 4, 4, scale, distance),
+                                qm_mult_x,
+                                matrices,
+                                meta_r,
+                                distance,
+                                cmap,
+                            );
+                        }
+                        if merge_beats_dct8(
+                            BIAS_64_RECT * rect,
+                            tiled,
+                            distance,
+                            MERGE_MARGIN_64_HQ,
+                        ) {
+                            ac_strategy.set_first(bx, y, STRATEGY_DCT32X64);
+                        }
+                    }
                     continue;
                 }
                 let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
-                let cost64 = BIAS_64X64
-                    * strategy_cost64(
-                        ctx,
-                        opsin,
-                        dc_group_px + bx * 8,
-                        dc_group_py + by * 8,
-                        region_qac(quant_field, bx, by, 8, 8, scale, distance),
-                        qm_mult_x,
-                        matrices,
-                        meta_r,
-                        distance,
-                        cmap,
-                    );
                 let mut cost32 = 0.0f32;
                 for sy in [0usize, 4] {
                     for sx in [0usize, 4] {
@@ -1331,8 +1446,97 @@ pub(crate) fn fill_ac_strategy(
                         );
                     }
                 }
-                if merge_beats_dct8(cost64, cost32, distance, MERGE_MARGIN_64_HQ) {
-                    ac_strategy.set_first(bx, by, STRATEGY_DCT64X64);
+
+                let mut best_cost = cost32;
+                let mut best_strategy = None;
+
+                let mut cost64x32 = if rect_live { 0.0f32 } else { f32::INFINITY };
+                for sx in [0usize, 4] {
+                    if !rect_live {
+                        break;
+                    }
+                    cost64x32 += strategy_cost_large(
+                        ctx,
+                        STRATEGY_DCT64X32,
+                        opsin,
+                        dc_group_px + (bx + sx) * 8,
+                        dc_group_py + by * 8,
+                        region_qac(quant_field, bx + sx, by, 4, 8, scale, distance),
+                        qm_mult_x,
+                        matrices,
+                        meta_r,
+                        distance,
+                        cmap,
+                    );
+                }
+                let cost64x32 = BIAS_64_RECT * cost64x32;
+                if cost64x32 < best_cost {
+                    best_cost = cost64x32;
+                    best_strategy = Some(STRATEGY_DCT64X32);
+                }
+
+                let mut cost32x64 = if rect_live { 0.0f32 } else { f32::INFINITY };
+                for sy in [0usize, 4] {
+                    if !rect_live {
+                        break;
+                    }
+                    cost32x64 += strategy_cost_large(
+                        ctx,
+                        STRATEGY_DCT32X64,
+                        opsin,
+                        dc_group_px + bx * 8,
+                        dc_group_py + (by + sy) * 8,
+                        region_qac(quant_field, bx, by + sy, 8, 4, scale, distance),
+                        qm_mult_x,
+                        matrices,
+                        meta_r,
+                        distance,
+                        cmap,
+                    );
+                }
+                let cost32x64 = BIAS_64_RECT * cost32x64;
+                if cost32x64 < best_cost {
+                    best_cost = cost32x64;
+                    best_strategy = Some(STRATEGY_DCT32X64);
+                }
+
+                if use_dct64(speed, distance) {
+                    let cost64 = BIAS_64X64
+                        * strategy_cost_large(
+                            ctx,
+                            STRATEGY_DCT64X64,
+                            opsin,
+                            dc_group_px + bx * 8,
+                            dc_group_py + by * 8,
+                            region_qac(quant_field, bx, by, 8, 8, scale, distance),
+                            qm_mult_x,
+                            matrices,
+                            meta_r,
+                            distance,
+                            cmap,
+                        );
+                    if cost64 < best_cost {
+                        best_cost = cost64;
+                        best_strategy = Some(STRATEGY_DCT64X64);
+                    }
+                }
+
+                if merge_beats_dct8(best_cost, cost32, distance, MERGE_MARGIN_64_HQ) {
+                    match best_strategy {
+                        Some(STRATEGY_DCT64X32) => {
+                            ac_strategy.set_first(bx, by, STRATEGY_DCT64X32);
+                            ac_strategy.set_first(bx + 4, by, STRATEGY_DCT64X32);
+                        }
+                        Some(STRATEGY_DCT32X64) => {
+                            ac_strategy.set_first(bx, by, STRATEGY_DCT32X64);
+                            ac_strategy.set_first(bx, by + 4, STRATEGY_DCT32X64);
+                        }
+                        Some(STRATEGY_DCT64X64) => {
+                            ac_strategy.set_first(bx, by, STRATEGY_DCT64X64);
+                        }
+                        None => {}
+                        _ => unreachable!(),
+                    }
                 }
             }
         }
@@ -1344,21 +1548,26 @@ pub(crate) fn fill_ac_strategy(
     // prefers it. Only large transforms are scored (a fraction of blocks), so the
     // expensive recon distortion runs on far fewer candidates than a full recon
     // selection while capturing the same structural win.
-    rerank_large_transforms(
-        ctx,
-        opsin,
-        dc_group_px,
-        dc_group_py,
-        distance,
-        scale,
-        qm_mult_x,
-        meta_r,
-        matrices,
-        quant_field,
-        ytox_map,
-        ytob_map,
-        ac_strategy,
-    );
+    // The SSIM reconstruction rerank runs in both scopes. Under
+    // `SearchScope::Squares` the only merges present are DCT16X16 and
+    // DCT32X32, so it scores exactly those.
+    if scope.rerank(distance) {
+        rerank_large_transforms(
+            ctx,
+            opsin,
+            dc_group_px,
+            dc_group_py,
+            distance,
+            scale,
+            qm_mult_x,
+            meta_r,
+            matrices,
+            quant_field,
+            ytox_map,
+            ytob_map,
+            ac_strategy,
+        );
+    }
 
     adjust_quant_field(ac_strategy, distance, quant_field);
     benefit
@@ -1386,7 +1595,10 @@ fn rerank_large_transforms(
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         // DCT64 is an explicitly gated slow-tier choice. The reconstruction
         // selector uses 32x32 scratch and intentionally does not rerank it.
-        if strat == STRATEGY_DCT64X64 {
+        if matches!(
+            strat,
+            STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ) {
             continue;
         }
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
@@ -1444,13 +1656,15 @@ fn rerank_large_transforms(
 #[cfg(test)]
 mod tests {
     use super::{
-        DCT8_ONLY_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ, MERGE_MARGIN_PAIR_HQ,
-        aggregate_qac_2x2, aggregate_quant, cmap_factors, fill_ac_strategy, merge_beats_dct8,
-        merge_margin, strategy_cost, sub8_strategy_costs, use_dct8_only, use_dct64,
+        DCT8_ONLY_MAX_DISTANCE, FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ,
+        MERGE_MARGIN_PAIR_HQ, SearchScope, aggregate_qac_2x2, aggregate_quant, cmap_factors,
+        fill_ac_strategy, merge_beats_dct8, merge_margin, strategy_cost, sub8_strategy_costs,
+        use_dct8_only, use_dct64, use_dct64_rect,
     };
     use crate::dc_group_data::{
         AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT64X64,
+        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
+        STRATEGY_DCT64X32, STRATEGY_DCT64X64,
     };
     use crate::encoding_context::EncodingContext;
     use crate::image::{Image3F, ImageB, ImageSB};
@@ -1475,6 +1689,14 @@ mod tests {
         assert!(!use_dct64(crate::Speed::Slow, 2.999_999));
         assert!(use_dct64(crate::Speed::Slow, 3.0));
         assert!(use_dct64(crate::Speed::Slow, 6.0));
+    }
+
+    #[test]
+    fn dct64_rectangles_are_gated_to_slow_at_distance_two_point_five() {
+        assert!(!use_dct64_rect(crate::Speed::Fast, 2.5));
+        assert!(!use_dct64_rect(crate::Speed::Slow, 2.499_999));
+        assert!(use_dct64_rect(crate::Speed::Slow, 2.5));
+        assert!(use_dct64_rect(crate::Speed::Slow, 6.0));
     }
 
     #[test]
@@ -1509,6 +1731,131 @@ mod tests {
         assert_ne!(select(crate::Speed::Fast, 3.0), STRATEGY_DCT64X64);
         assert_ne!(select(crate::Speed::Slow, 2.999), STRATEGY_DCT64X64);
         assert_eq!(select(crate::Speed::Slow, 3.0), STRATEGY_DCT64X64);
+        assert!(!matches!(
+            select(crate::Speed::Fast, 2.5),
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ));
+        assert!(!matches!(
+            select(crate::Speed::Slow, 2.499),
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ));
+        assert!(matches!(
+            select(crate::Speed::Slow, 2.5),
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ));
+    }
+
+    #[test]
+    fn standalone_dct64_rectangles_are_selected() {
+        let ctx = EncodingContext::new();
+        let matrices = DequantMatrices::new();
+        let maps = ImageSB::new_fill(1, 1, 0);
+        let select = |blocks_x, blocks_y| {
+            let opsin = Image3F::new(blocks_x * 8, blocks_y * 8);
+            let mut qf = ImageB::new_fill(blocks_x, blocks_y, 8);
+            let mut strategies = AcStrategyImage::new(blocks_x, blocks_y);
+            fill_ac_strategy(
+                &ctx,
+                &opsin,
+                0,
+                0,
+                2.5,
+                1.0,
+                2,
+                &matrices,
+                &mut qf,
+                &maps,
+                &maps,
+                &mut strategies,
+                1,
+                crate::Speed::Slow,
+            );
+            strategies.raw_strategy(0, 0)
+        };
+        assert_eq!(select(4, 8), STRATEGY_DCT64X32);
+        assert_eq!(select(8, 4), STRATEGY_DCT32X64);
+    }
+
+    /// The Fast tier runs the same RD model but offers only square merges.
+    /// A flat 32x32 region must still merge, and must never come back as a
+    /// rectangle, a sub-8x8 split, or a 64px transform.
+    #[test]
+    fn fast_scope_selects_squares_and_no_other_merge_shape() {
+        let ctx = EncodingContext::new();
+        let matrices = DequantMatrices::new();
+        let maps = ImageSB::new_fill(1, 1, 0);
+        let opsin = Image3F::new(32, 32);
+        let mut qf = ImageB::new_fill(4, 4, 8);
+        let mut strategies = AcStrategyImage::new(4, 4);
+        fill_ac_strategy(
+            &ctx,
+            &opsin,
+            0,
+            0,
+            3.0,
+            1.0,
+            2,
+            &matrices,
+            &mut qf,
+            &maps,
+            &maps,
+            &mut strategies,
+            1,
+            crate::Speed::Fast,
+        );
+        assert_eq!(strategies.raw_strategy(0, 0), STRATEGY_DCT32X32);
+        for (_, _, strat) in strategies.iter_first_blocks() {
+            assert!(
+                matches!(strat, STRATEGY_DCT | STRATEGY_DCT16X16 | STRATEGY_DCT32X32),
+                "Fast produced a non-square merge: {strat}"
+            );
+        }
+    }
+
+    /// The Fast tier reranks only at high quality, where the coefficient model
+    /// over-merges; past the cutoff the rerank costs time to lose rate.
+    #[test]
+    fn fast_rerank_is_gated_by_distance_but_slow_always_reranks() {
+        assert!(SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE));
+        assert!(!SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
+        assert!(SearchScope::Full.rerank(6.0));
+    }
+
+    /// The DCT64 pass used to be gated entirely on `use_dct64_rect`, so the
+    /// square transform was only ever considered when the rectangles were also
+    /// live. The two gates are independent now; raising the rectangle threshold
+    /// above the square's must not silently disable DCT64X64.
+    #[test]
+    fn square_dct64_is_considered_independently_of_the_rectangle_gate() {
+        let ctx = EncodingContext::new();
+        let matrices = DequantMatrices::new();
+        let maps = ImageSB::new_fill(1, 1, 0);
+        let opsin = Image3F::new(64, 64);
+        let mut qf = ImageB::new_fill(8, 8, 8);
+        let mut strategies = AcStrategyImage::new(8, 8);
+        // distance 3.0: use_dct64 is live, and so is use_dct64_rect.
+        fill_ac_strategy(
+            &ctx,
+            &opsin,
+            0,
+            0,
+            3.0,
+            1.0,
+            2,
+            &matrices,
+            &mut qf,
+            &maps,
+            &maps,
+            &mut strategies,
+            1,
+            crate::Speed::Slow,
+        );
+        // A flat tile merges to the largest available transform; whichever of
+        // the three wins, the pass must have run and produced a 64px merge.
+        assert!(matches!(
+            strategies.raw_strategy(0, 0),
+            STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ));
     }
 
     #[test]

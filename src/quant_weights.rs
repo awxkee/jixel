@@ -661,6 +661,9 @@ pub(crate) struct DequantMatrices {
     /// 64x64 dequant matrix, used only by the slow large-transform path.
     pub(crate) matrix_64x64: Box<[[f32; 4096]; 3]>,
     pub(crate) inv_matrix_64x64: Box<[[f32; 4096]; 3]>,
+    /// Shared normalized 32-row × 64-column table for DCT64X32/DCT32X64.
+    pub(crate) matrix_64x32: Box<[[f32; 2048]; 3]>,
+    pub(crate) inv_matrix_64x32: Box<[[f32; 2048]; 3]>,
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
@@ -780,6 +783,40 @@ static DCT64X64_BANDS: [[f32; 8]; 3] = [
     ],
     [
         0.9 * 4992.248644553863,
+        -1.2,
+        -1.2,
+        -0.8,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
+
+/// JPEG XL default `QuantTable::DCT32X64` parameters, shared by both orientations.
+static DCT32X64_BANDS: [[f32; 8]; 3] = [
+    [
+        0.65 * 23629.073922049845,
+        -1.025,
+        -0.78,
+        -0.65012,
+        -0.19041574084286472,
+        -0.20819395464,
+        -0.421064,
+        -0.3273384553584867,
+    ],
+    [
+        0.65 * 8611.323871001005,
+        -0.3041958212306401,
+        -0.3633036457487539,
+        -0.35660379990111464,
+        -0.3443074455424403,
+        -0.33699592683512467,
+        -0.3018086652624211,
+        -0.27321683125358037,
+    ],
+    [
+        0.65 * 4492.248644553863,
         -1.2,
         -1.2,
         -0.8,
@@ -1032,6 +1069,30 @@ fn compute_dct64x64_matrix() -> Box<[[f32; 4096]; 3]> {
     out
 }
 
+fn compute_dct64x32_matrix() -> Box<[[f32; 2048]; 3]> {
+    const NUM_BANDS: usize = 8;
+    let mut out = Box::new([[0.0f32; 2048]; 3]);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT32X64_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT32X64_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcprow = scale / 31.0;
+        let rcpcol = scale / 63.0;
+        for y in 0..32 {
+            let dy = y as f32 * rcprow;
+            for x in 0..64 {
+                let dx = x as f32 * rcpcol;
+                out[c][y * 64 + x] =
+                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+            }
+        }
+    }
+    out
+}
+
 fn compute_dct32x16_matrix() -> Box<[[f32; 512]; 3]> {
     const NUM_BANDS: usize = 8;
     let mut out = Box::new([[0.0f32; 512]; 3]);
@@ -1108,6 +1169,14 @@ impl DequantMatrices {
             }
         }
 
+        let matrix_64x32 = compute_dct64x32_matrix();
+        let mut inv_64x32 = Box::new([[0.0f32; 2048]; 3]);
+        for c in 0..3 {
+            for k in 1..2048 {
+                inv_64x32[c][k] = 1.0 / matrix_64x32[c][k];
+            }
+        }
+
         let matrix_4x4 = compute_dct4x4_matrix();
         let mut inv_4x4 = [[0.0f32; 64]; 3];
         for c in 0..3 {
@@ -1149,6 +1218,8 @@ impl DequantMatrices {
             inv_matrix_32x32: inv_32x32,
             matrix_64x64,
             inv_matrix_64x64: inv_64x64,
+            matrix_64x32,
+            inv_matrix_64x32: inv_64x32,
             matrix_4x4,
             inv_matrix_4x4: inv_4x4,
             matrix_4x8,
@@ -1204,6 +1275,14 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix_64x64(&self, c: usize) -> &[f32; 4096] {
         &self.inv_matrix_64x64[c]
+    }
+
+    pub(crate) fn matrix_64x32(&self, c: usize) -> &[f32; 2048] {
+        &self.matrix_64x32[c]
+    }
+
+    pub(crate) fn inv_matrix_64x32(&self, c: usize) -> &[f32; 2048] {
+        &self.inv_matrix_64x32[c]
     }
 
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid).

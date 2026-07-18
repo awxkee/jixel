@@ -410,6 +410,81 @@ pub(crate) fn dct64x64_avx2(input: &[f32; 4096], output: &mut [f32; 4096]) {
     }
 }
 
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct64x32_avx2(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut scratch = [0.0f32; 2048];
+    for g in 0..4 {
+        let mut c: [__m256; 64] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 32 + g * 8..].as_ptr()) });
+        dct1d_64_flat(&mut c);
+        for t in 0..8 {
+            let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (j, value) in tile.iter().enumerate() {
+                unsafe {
+                    _mm256_storeu_ps(scratch[(g * 8 + j) * 64 + t * 8..].as_mut_ptr(), *value);
+                }
+            }
+        }
+    }
+
+    let scale = _mm256_set1_ps(1.0 / 2048.0);
+    for g in 0..8 {
+        let mut c: [__m256; 32] = std::array::from_fn(|col| unsafe {
+            _mm256_loadu_ps(scratch[col * 64 + g * 8..].as_ptr())
+        });
+        dct1d_32_flat(&mut c);
+        for u in 0..32 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 64 + g * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct32x64_avx2(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut scratch = [0.0f32; 2048];
+    for g in 0..4 {
+        let mut c = [_mm256_undefined_ps(); 64];
+        for t in 0..8 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                _mm256_loadu_ps(input[(g * 8 + j) * 64 + t * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[t * 8..t * 8 + 8].copy_from_slice(&tile);
+        }
+        dct1d_64_flat(&mut c);
+        for u in 0..64 {
+            unsafe { _mm256_storeu_ps(scratch[u * 32 + g * 8..].as_mut_ptr(), c[u]) };
+        }
+    }
+
+    let scale = _mm256_set1_ps(1.0 / 2048.0);
+    for g in 0..8 {
+        let mut c = [_mm256_undefined_ps(); 32];
+        for t in 0..4 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                _mm256_loadu_ps(scratch[(g * 8 + j) * 32 + t * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[t * 8..t * 8 + 8].copy_from_slice(&tile);
+        }
+        dct1d_32_flat(&mut c);
+        for v in 0..32 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[v * 64 + g * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[v], scale),
+                );
+            }
+        }
+    }
+}
+
 const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 #[inline]
@@ -998,6 +1073,36 @@ mod tests {
             unsafe { dct64x64_avx2(&input, &mut got) };
             dct64x64_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct64x64 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct64x32_avx2_vs_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        for seed in 0u64..8 {
+            let input: [f32; 2048] = fill(seed.wrapping_add(0x6432));
+            let mut got = [0.0f32; 2048];
+            let mut want = [0.0f32; 2048];
+            unsafe { crate::avx::dct64x32_avx2(&input, &mut got) };
+            crate::dct::dct64x32_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct64x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_dct32x64_avx2_vs_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        for seed in 0u64..8 {
+            let input: [f32; 2048] = fill(seed.wrapping_add(0x3264));
+            let mut got = [0.0f32; 2048];
+            let mut want = [0.0f32; 2048];
+            unsafe { crate::avx::dct32x64_avx2(&input, &mut got) };
+            crate::dct::dct32x64_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct32x64 seed={seed}"));
         }
     }
 
