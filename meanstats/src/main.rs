@@ -45,6 +45,7 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
+use jixel::Speed;
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
 use std::num::NonZero;
@@ -367,7 +368,8 @@ fn bench_jixel(
     let cfg = jixel::EncodeConfig::default()
         .with_lossless(false)
         .with_distance(d)
-        .with_num_threads(threads);
+        .with_num_threads(threads)
+        .with_speed(Speed::Slow);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));

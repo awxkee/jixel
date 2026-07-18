@@ -33,10 +33,13 @@ use crate::dc_group_data::{
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
     STRATEGY_DCT32X32, STRATEGY_DCT64X64,
 };
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
 use crate::quant_weights::DequantMatrices;
+use std::cell::RefCell;
 
 /// At visually lossless / near-lossless settings, transform metadata and the
 /// occasional wrong merge cost more than the large-DCT decorrelation saves.
@@ -269,6 +272,18 @@ fn strategy_cost(
     )
 }
 
+struct Dct64Scratch {
+    input: [f32; 4096],
+    coeffs: [[f32; 4096]; 3],
+}
+
+thread_local! {
+    static DCT64_SCRATCH: RefCell<Dct64Scratch> = const { RefCell::new(Dct64Scratch {
+        input: [0.0; 4096],
+        coeffs: [[0.0; 4096]; 3],
+    }) };
+}
+
 /// Coefficient-domain cost for DCT64. Kept separate from the standard chooser
 /// so the hot-path scratch and reconstruction reranker remain sized for 32x32.
 #[allow(clippy::too_many_arguments)]
@@ -284,42 +299,34 @@ fn strategy_cost64(
     distance: f32,
     cmap_factor: [f32; 3],
 ) -> f32 {
-    let mut coeffs = Box::new([[0.0f32; 4096]; 3]);
-    let mut input = Box::new([0.0f32; 4096]);
-    for (c, coeff) in coeffs.iter_mut().enumerate() {
-        gather_pixels(opsin.plane(c), px, py, 64, 64, &mut input[..]);
-        (ctx.dct64x64)(&input, coeff);
-    }
-    apply_cfl_large(&mut coeffs, cmap_factor);
+    DCT64_SCRATCH.with_borrow_mut(|cell| {
+        for (c, coeff) in cell.coeffs.iter_mut().enumerate() {
+            gather_pixels(opsin.plane(c), px, py, 64, 64, &mut cell.input[..]);
+            (ctx.dct64x64)(&cell.input, coeff);
+        }
+        let [x, y, b] = &mut cell.coeffs;
+        apply_cfl(ctx, CflXyb { x, y, b }, 4096, cmap_factor);
 
-    let mut distortion = 0.0f32;
-    let mut rate = 0.0f32;
-    for c in 0..3 {
-        let (d, r) = channel_rd(
-            ctx.sse_and_rate,
-            ctx.rate_log2_lut,
-            &coeffs[c],
-            &matrices.inv_matrix_64x64(c)[..],
-            c,
-            qac,
-            if c == 0 { qm_mult_x } else { 1.0 },
-            distance,
-            8,
-            8,
-        );
-        distortion += CHANNEL_WEIGHT[c] * d;
-        rate += r;
-    }
-    distortion + RD_LAMBDA * (rate + meta_r)
-}
-
-#[inline]
-fn apply_cfl_large(coeffs: &mut [[f32; 4096]; 3], cmap_factor: [f32; 3]) {
-    let [x, y, b] = coeffs;
-    for ((xv, bv), &yv) in x.iter_mut().zip(b.iter_mut()).zip(y.iter()) {
-        *xv -= cmap_factor[0] * yv;
-        *bv -= cmap_factor[2] * yv;
-    }
+        let mut distortion = 0.0f32;
+        let mut rate = 0.0f32;
+        for (c, cell) in cell.coeffs.iter_mut().enumerate() {
+            let (d, r) = channel_rd(
+                ctx.sse_and_rate,
+                ctx.rate_log2_lut,
+                cell,
+                &matrices.inv_matrix_64x64(c)[..],
+                c,
+                qac,
+                if c == 0 { qm_mult_x } else { 1.0 },
+                distance,
+                8,
+                8,
+            );
+            distortion += CHANNEL_WEIGHT[c] * d;
+            rate += r;
+        }
+        distortion + RD_LAMBDA * (rate + meta_r)
+    })
 }
 
 /// Reconstruction-based RD cost used by the second-pass transform rerank.
@@ -359,18 +366,45 @@ enum DistortionModel {
     Reconstruction,
 }
 
-#[inline]
-fn apply_cfl(coeffs: &mut [[f32; 1024]; 3], size: usize, cmap_factor: [f32; 3]) {
-    let [c0, c1, c2] = coeffs;
-    let y = &c1[..size];
-    for ((x, b), &yi) in c0[..size]
-        .iter_mut()
-        .zip(c2[..size].iter_mut())
-        .zip(y.iter())
-    {
-        *x -= cmap_factor[0] * yi;
-        *b -= cmap_factor[2] * yi;
+struct CflXyb<'a> {
+    x: &'a mut [f32],
+    y: &'a mut [f32],
+    b: &'a mut [f32],
+}
+
+pub(crate) type ApplyCflFn = fn(&mut [f32], &[f32], &mut [f32], [f32; 3]);
+
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+fn apply_cfl_scalar(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
+    assert_eq!(x.len(), y.len());
+    assert_eq!(x.len(), b.len());
+    let neg_cx = -cmap_factor[0];
+    let neg_cb = -cmap_factor[2];
+    for ((x, b), &y) in x.iter_mut().zip(b).zip(y) {
+        *x = fmla(neg_cx, y, *x);
+        *b = fmla(neg_cb, y, *b);
     }
+}
+
+pub(crate) fn selected_apply_cfl_fn() -> ApplyCflFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return |x, y, b, cmap_factor| unsafe { crate::neon::apply_cfl_neon(x, y, b, cmap_factor) };
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |x, y, b, cmap_factor| unsafe { crate::avx::apply_cfl_avx2(x, y, b, cmap_factor) };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return |x, y, b, cmap_factor| crate::wasm::apply_cfl_wasm(x, y, b, cmap_factor);
+    #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+    apply_cfl_scalar
+}
+
+fn apply_cfl(ctx: &EncodingContext, coeffs: CflXyb<'_>, size: usize, cmap_factor: [f32; 3]) {
+    let CflXyb { x, y, b } = coeffs;
+    assert!(size <= x.len() && size <= y.len() && size <= b.len());
+    (ctx.apply_cfl)(&mut x[..size], &y[..size], &mut b[..size], cmap_factor);
 }
 
 #[inline]
@@ -447,7 +481,8 @@ fn strategy_cost_impl(
         let size = cx * cy * 64;
 
         // Apply the same per-tile CfL slopes used by final coefficient coding.
-        apply_cfl(coeffs, size, cmap_factor);
+        let [x, y, b] = coeffs;
+        apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
         let (d_total, r_total) = match distortion_model {
             DistortionModel::Reconstruction => recon_dist_and_rate(
@@ -544,7 +579,8 @@ fn sub8_strategy_costs(
             for c in 0..3 {
                 forward_sub8_transform(ctx, strategy, &pixels[c], &mut coeffs[c]);
             }
-            apply_cfl(coeffs, 64, cmap_factor);
+            let [x, y, b] = &mut *coeffs;
+            apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
             let (distortion, rate) = coefficient_dist_and_rate(
                 ctx, strategy, coeffs, 64, qac, qm_mult_x, matrices, distance, 1, 1,
             );

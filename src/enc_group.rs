@@ -40,7 +40,7 @@ use crate::dc_group_data::{
 };
 use crate::dct::{
     dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32, dc_from_dct32x16,
-    dc_from_dct32x32, dc_from_dct64x64,
+    dc_from_dct32x32, dc_from_dct64x64, fmla,
 };
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{Token, pack_signed};
@@ -827,8 +827,12 @@ pub(crate) fn write_ac_group(
                     quant_dc_row.iter_mut().zip(y_dc_q_row.iter()).enumerate()
                 {
                     let didx = iy * cov_x + ix;
-                    let b_dc_q = (b_dc_post[didx] * inv_factor[2] - dc_val as f32 * cfl_factor_b)
-                        .fast_round() as i16;
+                    let b_dc_q = fmla(
+                        b_dc_post[didx],
+                        inv_factor[2],
+                        -dc_val as f32 * cfl_factor_b,
+                    )
+                    .fast_round() as i16;
                     *quant_target = b_dc_q;
                 }
             }
