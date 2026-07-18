@@ -617,9 +617,39 @@ fn encode_squeeze_single_group(
     }
     if let Some(a) = alpha {
         let mut ch = Channel::new(xsize, ysize);
-        for y in 0..ysize {
-            for x in 0..xsize {
-                ch.data[y * xsize + x] = a.get_i32(y * xsize + x);
+        match a {
+            AlphaPlane::U8(data) => {
+                for (row, src_row) in ch
+                    .data
+                    .chunks_exact_mut(xsize)
+                    .zip(data.chunks_exact(xsize))
+                {
+                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
+                        *dst = src as i32;
+                    }
+                }
+            }
+            AlphaPlane::U16 { data, bits: _ } => {
+                for (row, src_row) in ch
+                    .data
+                    .chunks_exact_mut(xsize)
+                    .zip(data.chunks_exact(xsize))
+                {
+                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
+                        *dst = src as i32;
+                    }
+                }
+            }
+            AlphaPlane::F32(data) => {
+                for (row, src_row) in ch
+                    .data
+                    .chunks_exact_mut(xsize)
+                    .zip(data.chunks_exact(xsize))
+                {
+                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
+                        *dst = src;
+                    }
+                }
             }
         }
         channels.push(ch);

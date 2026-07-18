@@ -31,15 +31,18 @@ use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
 use std::cell::RefCell;
 
+#[cfg(test)]
 pub(crate) trait AqLuma: Copy {
     fn to_f32(self) -> f32;
 }
+#[cfg(test)]
 impl AqLuma for f32 {
     #[inline(always)]
     fn to_f32(self) -> f32 {
         self
     }
 }
+#[cfg(test)]
 impl AqLuma for i32 {
     #[inline(always)]
     fn to_f32(self) -> f32 {
@@ -52,12 +55,15 @@ impl AqLuma for i32 {
 /// low-variance-biased pick (boost readily), octile 8 = only the maximum (boost only
 /// when the whole SB is low-variance). Octile 6 (index 47) is the SVT-AV1-PSY default.
 pub(crate) fn sb_octile_variance(subvars: &mut [f32; 64], octile: u8) -> f32 {
-    subvars.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     // Octile o in 1..=8 maps to sorted index o*8 - 1 (o=1 -> 7, o=4 -> 31 (median-ish),
     // o=6 -> 47 (SVT-AV1-PSY default), o=8 -> 63 (max)).
     let o = octile.clamp(1, 8) as usize;
     let idx = (o * 8 - 1).min(63);
-    subvars[idx]
+    *subvars
+        .select_nth_unstable_by(idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .1
 }
 
 /// Variance Boost qindex delta for one superblock. `picked_var` is the octile pick
@@ -181,6 +187,31 @@ fn box_downsample_2x<const SRC_STRIDE: usize, const DST_STRIDE: usize>(
     (hh, ww)
 }
 
+#[inline]
+fn dark_structure_stats_buf(buf: &[[f32; 64]], h: usize, w: usize) -> (f32, f32) {
+    let mut sum = 0.0f32;
+    for row in buf[..h].iter() {
+        for &v in &row[..w] {
+            sum += v;
+        }
+    }
+    let mean = sum / (h * w) as f32;
+    if h < 3 || w < 3 {
+        return (mean, 0.0);
+    }
+    let (lap_full, nf) = laplacian_abs_sum(buf, h, w);
+    let lap_full = lap_full / nf as f32;
+    let mut half = [[0f32; 32]; 32];
+    let (hh, ww) = box_downsample_2x(buf, h, w, &mut half);
+    if hh < 3 || ww < 3 {
+        return (mean, 0.0);
+    }
+    let (lap_half, nh) = laplacian_abs_sum(&half, hh, ww);
+    let lap_half = lap_half / nh as f32;
+    (mean, (lap_full * lap_half).sqrt())
+}
+
+#[cfg(test)]
 pub(crate) fn dark_structure_stats<T: AqLuma>(
     yp: &[T],
     pw: usize,
@@ -196,36 +227,39 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
         return (0.0, 0.0);
     }
     let mut buf = [[0f32; 64]; 64];
-    let mut sum = 0f32;
     for (r, row) in buf.iter_mut().enumerate().take(h) {
         let base = (sb_y + r) * pw + sb_x;
         for (yp, dst) in yp[base..base + w].iter().zip(row.iter_mut()) {
             let v = yp.to_f32() * scale;
             *dst = v;
-            sum += v;
         }
     }
-    let mean = sum / (h * w) as f32;
-    if h < 3 || w < 3 {
-        return (mean, 0.0);
+    dark_structure_stats_buf(&buf, h, w)
+}
+
+#[inline]
+fn dark_protection_from_stats(d: &DarkAq, base_q: i32, mean: f32, mid_energy: f32) -> i32 {
+    if !d.enabled || base_q < d.min_q || mid_energy <= 0.0 {
+        return 0;
     }
-    // Full-resolution |Laplacian| (interior 3×3).
-    let (lap_full, nf) = laplacian_abs_sum(&buf, h, w);
-    let lap_full = lap_full / nf as f32;
-    // 2× box downsample, then |Laplacian| at the coarse scale.
-    let mut half = [[0f32; 32]; 32];
-    let (hh, ww) = box_downsample_2x(&buf, h, w, &mut half);
-    if hh < 3 || ww < 3 {
-        return (mean, 0.0);
+    let dark_weight = ((d.mean_floor + d.dark_ref) / (d.mean_floor + mean))
+        .powf(d.gamma)
+        .clamp(1.0, d.max_weight);
+    let darkness = dark_weight - 1.0;
+    if darkness <= 0.0 {
+        return 0;
     }
-    let (lap_half, nh) = laplacian_abs_sum(&half, hh, ww);
-    let lap_half = lap_half / nh as f32;
-    (mean, (lap_full * lap_half).sqrt())
+    let dark_structure = dirty_log1pf(mid_energy * darkness);
+    (dark_structure * d.scale)
+        .min(d.max_qidx as f32)
+        .max(0.0)
+        .fast_round() as i32
 }
 
 /// Extra qindex reduction (>= 0) for a dark, structured SB. 0 when disabled, out of the
 /// gated quality range, or the SB carries no cross-scale structure. `scale` normalizes
-/// the plane to 8-bit range for [`dark_structure_stats`] (AV2: `1.0`; AV1: `1/(1<<(bd-8))`).
+/// the plane to 8-bit range (AV2: `1.0`; AV1: `1/(1<<(bd-8))`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dark_protection<T: AqLuma>(
     d: &DarkAq,
@@ -242,25 +276,7 @@ pub(crate) fn dark_protection<T: AqLuma>(
         return 0;
     }
     let (mean, mid_energy) = dark_structure_stats(yp, pw, sb_y, sb_x, width, height, scale);
-    if mid_energy <= 0.0 {
-        return 0;
-    }
-    // Darker SBs get a heavier weight; `dark_weight` is 1.0 at/above `dark_ref` and
-    // rises toward `max_weight` as the SB darkens. Subtracting 1 makes the protection
-    // vanish for bright/mid SBs (so it doesn't just boost all texture) and scale with
-    // how far below the reference the SB sits.
-    let dark_weight = ((d.mean_floor + d.dark_ref) / (d.mean_floor + mean))
-        .powf(d.gamma)
-        .clamp(1.0, d.max_weight);
-    let darkness = dark_weight - 1.0;
-    if darkness <= 0.0 {
-        return 0;
-    }
-    let dark_structure = dirty_log1pf(mid_energy * darkness);
-    (dark_structure * d.scale)
-        .min(d.max_qidx as f32)
-        .max(0.0)
-        .fast_round() as i32
+    dark_protection_from_stats(d, base_q, mean, mid_energy)
 }
 
 /// Superblock qindex-style AQ modulations, attached to an encode via
@@ -449,10 +465,9 @@ pub(crate) fn apply_boost(
     // recompute — SBs are cheap and this keeps memory flat). Also accumulate the
     // mean log-variance reference for the two-sided cut.
     DARK_OCTILE.with_borrow_mut(|cell| {
-        if cell.len() < sb_cols * sb_rows {
+        if vb_on && cell.len() < sb_cols * sb_rows {
             cell.resize_with(sb_cols * sb_rows, Default::default);
         }
-        let picked = &mut cell[..sb_cols * sb_rows];
         let mut ref_acc = 0f32;
         let mut ref_n = 0u32;
         let mut tile = [0f32; 64 * 64];
@@ -469,20 +484,23 @@ pub(crate) fn apply_boost(
             (w, h)
         };
 
-        for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
-            for (sbx, dst) in row.iter_mut().enumerate() {
-                let sb_x0 = x0 + sbx * 64;
-                let sb_y0 = y0 + sby * 64;
-                let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
-                if w == 0 || h == 0 {
-                    *dst = 0.0;
-                    continue;
+        if vb_on {
+            let picked = &mut cell[..sb_cols * sb_rows];
+            for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
+                for (sbx, dst) in row.iter_mut().enumerate() {
+                    let sb_x0 = x0 + sbx * 64;
+                    let sb_y0 = y0 + sby * 64;
+                    let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
+                    if w == 0 || h == 0 {
+                        *dst = 0.0;
+                        continue;
+                    }
+                    let mut subvars = subblock_variances(&tile, 64, w, h);
+                    let pv = sb_octile_variance(&mut subvars, cfg.octile);
+                    *dst = pv;
+                    ref_acc += dirty_log1pf(pv);
+                    ref_n += 1;
                 }
-                let mut subvars = subblock_variances(&tile, 64, w, h);
-                let pv = sb_octile_variance(&mut subvars, cfg.octile);
-                *dst = pv;
-                ref_acc += dirty_log1pf(pv);
-                ref_n += 1;
             }
         }
         let ref_log = if ref_n > 0 {
@@ -492,20 +510,23 @@ pub(crate) fn apply_boost(
         };
 
         // Second pass: convert each SB's summed qindex delta into a field gain and apply.
-        for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
-            for (sbx, &src) in row.iter().enumerate() {
+        for sby in 0..sb_rows {
+            for sbx in 0..sb_cols {
                 let sb_x0 = x0 + sbx * 64;
                 let sb_y0 = y0 + sby * 64;
 
                 let mut delta = 0i32;
                 if vb_on {
+                    let src = cell[sby * sb_cols + sbx];
                     delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
                 }
                 if dark_on {
                     let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
                     if w >= 3 && h >= 3 {
                         // Tile already in 8-bit-luma units (scale=1.0 here).
-                        delta -= dark_protection(&cfg.dark, base_q, &tile, 64, 0, 0, w, h, 1.0);
+                        let rows = tile.as_chunks::<64>().0;
+                        let (mean, mid_energy) = dark_structure_stats_buf(rows, h, w);
+                        delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy);
                     }
                 }
                 if delta == 0 {
@@ -563,6 +584,24 @@ mod tests {
         assert_eq!(sb_octile_variance(&mut v.clone(), 1), 7.0);
         assert_eq!(sb_octile_variance(&mut v.clone(), 6), 47.0);
         assert_eq!(sb_octile_variance(&mut v, 8), 63.0);
+    }
+
+    #[test]
+    fn octile_selection_matches_full_sort() {
+        let mut values = [0.0f32; 64];
+        let mut state = 0x6d2b_79f5u32;
+        for value in &mut values {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = (state >> 12) as f32;
+        }
+        let mut sorted = values;
+        sorted.sort_unstable_by(f32::total_cmp);
+        for octile in 1..=8 {
+            assert_eq!(
+                sb_octile_variance(&mut values, octile),
+                sorted[octile as usize * 8 - 1]
+            );
+        }
     }
 
     #[test]
@@ -676,6 +715,24 @@ mod tests {
             assert_eq!(
                 subblock_variances(&tile, 64, w, h),
                 reference(&tile, 64, w, h),
+                "shape {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_dark_tile_stats_match_gathered_path() {
+        let mut tile = [0.0f32; 64 * 64];
+        let mut state = 0xa511_e9b3u32;
+        for value in &mut tile {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = (state >> 8) as f32 / (1u32 << 24) as f32 * Y_TO_LUMA8;
+        }
+        let rows = tile.as_chunks::<64>().0;
+        for (h, w) in [(1, 1), (3, 7), (11, 17), (63, 64), (64, 64)] {
+            assert_eq!(
+                dark_structure_stats_buf(rows, h, w),
+                dark_structure_stats(&tile, 64, 0, 0, w, h, 1.0),
                 "shape {w}x{h}"
             );
         }
