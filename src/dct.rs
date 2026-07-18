@@ -1342,6 +1342,159 @@ pub(crate) fn dct64x64_scalar(input: &[f32; 4096], output: &mut [f32; 4096]) {
     }
 }
 
+static DCT_METHOD_64X32: OnceLock<Arc<DctFn<2048>>> = OnceLock::new();
+static DCT_METHOD_32X64: OnceLock<Arc<DctFn<2048>>> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_dct64x32() -> &'static DctFn<2048> {
+    DCT_METHOD_64X32
+        .get_or_init(|| {
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return Arc::new(|input, output| unsafe {
+                    crate::neon::dct64x32_neon(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Arc::new(|input, output| unsafe {
+                    crate::avx::dct64x32_avx2(input, output)
+                });
+            }
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+            if is_x86_feature_detected!("sse4.1") {
+                return Arc::new(|input, output| unsafe {
+                    crate::sse::dct64x32_sse41(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+            return Arc::new(|input, output| unsafe { crate::wasm::dct64x32_wasm(input, output) });
+            Arc::new(dct64x32_scalar)
+        })
+        .as_ref()
+}
+
+#[inline]
+pub(crate) fn selected_dct32x64() -> &'static DctFn<2048> {
+    DCT_METHOD_32X64
+        .get_or_init(|| {
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return Arc::new(|input, output| unsafe {
+                    crate::neon::dct32x64_neon(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Arc::new(|input, output| unsafe {
+                    crate::avx::dct32x64_avx2(input, output)
+                });
+            }
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+            if is_x86_feature_detected!("sse4.1") {
+                return Arc::new(|input, output| unsafe {
+                    crate::sse::dct32x64_sse41(input, output)
+                });
+            }
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+            return Arc::new(|input, output| unsafe { crate::wasm::dct32x64_wasm(input, output) });
+            Arc::new(dct32x64_scalar)
+        })
+        .as_ref()
+}
+
+/// 64 rows × 32 columns. Coefficients use the normalized 32-row × 64-column
+/// layout shared with DCT32X64: `output[horizontal_frequency * 64 + vertical_frequency]`.
+pub(crate) fn dct64x32_scalar(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut after_col_dct = [0.0f32; 2048];
+    let mut col = [0.0f32; 64];
+    for x in 0..32 {
+        for y in 0..64 {
+            col[y] = input[y * 32 + x];
+        }
+        dct1d_64(&mut col);
+        for v in 0..64 {
+            after_col_dct[v * 32 + x] = col[v];
+        }
+    }
+    let scale = 1.0 / 2048.0;
+    for v in 0..64 {
+        let row: &mut [f32; 32] = (&mut after_col_dct[v * 32..v * 32 + 32])
+            .try_into()
+            .unwrap();
+        dct1d_32(row);
+        for u in 0..32 {
+            output[u * 64 + v] = row[u] * scale;
+        }
+    }
+}
+
+/// 32 rows × 64 columns, stored directly in normalized row-major frequency layout.
+pub(crate) fn dct32x64_scalar(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut after_row_dct = [0.0f32; 2048];
+    for y in 0..32 {
+        let row: &mut [f32; 64] = (&mut after_row_dct[y * 64..y * 64 + 64])
+            .try_into()
+            .unwrap();
+        row.copy_from_slice(&input[y * 64..y * 64 + 64]);
+        dct1d_64(row);
+    }
+    let scale = 1.0 / 2048.0;
+    let mut col = [0.0f32; 32];
+    for u in 0..64 {
+        for y in 0..32 {
+            col[y] = after_row_dct[y * 64 + u];
+        }
+        dct1d_32(&mut col);
+        for v in 0..32 {
+            output[v * 64 + u] = col[v] * scale;
+        }
+    }
+}
+
+pub(crate) fn inv_dct64x32(coeff: &[f32; 2048], out: &mut [f32; 2048]) {
+    let mut after_row = [0.0f32; 2048];
+    for v in 0..64 {
+        let mut row = [0.0f32; 32];
+        for u in 0..32 {
+            row[u] = coeff[u * 64 + v] * 2048.0;
+        }
+        inv_dct1d_32(&mut row);
+        for u in 0..32 {
+            after_row[v * 32 + u] = row[u];
+        }
+    }
+    for x in 0..32 {
+        let mut col = [0.0f32; 64];
+        for v in 0..64 {
+            col[v] = after_row[v * 32 + x];
+        }
+        inv_dct1d_64(&mut col);
+        for y in 0..64 {
+            out[y * 32 + x] = col[y];
+        }
+    }
+}
+
+pub(crate) fn inv_dct32x64(coeff: &[f32; 2048], out: &mut [f32; 2048]) {
+    for (out, &coeff) in out.iter_mut().zip(coeff) {
+        *out = coeff * 2048.0;
+    }
+    for u in 0..64 {
+        let mut col = [0.0f32; 32];
+        for v in 0..32 {
+            col[v] = out[v * 64 + u];
+        }
+        inv_dct1d_32(&mut col);
+        for v in 0..32 {
+            out[v * 64 + u] = col[v];
+        }
+    }
+    for y in 0..32 {
+        inv_dct1d_64(<&mut [f32; 64]>::try_from(&mut out[y * 64..y * 64 + 64]).unwrap());
+    }
+}
+
 /// Extract the 8x8 block DC grid from the lowest frequencies of DCT64X64.
 pub(crate) fn dc_from_dct64x64(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
     const RESAMPLE: [f32; 8] = [
@@ -1361,6 +1514,64 @@ pub(crate) fn dc_from_dct64x64(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
         }
     }
     inv_dct8x8(&low, dc);
+}
+
+const RESAMPLE_SCALE_64_TO_8: [f32; 8] = [
+    1.0,
+    0.993_686_6,
+    0.974_886_83,
+    0.944_018_07,
+    0.901_764_2,
+    0.849_057_5,
+    0.787_054_9,
+    0.717_108_13,
+];
+
+#[inline]
+fn idct1d_8(mut values: [f32; 8]) -> [f32; 8] {
+    for value in &mut values {
+        *value *= 8.0;
+    }
+    inv_dct1d_8(&mut values);
+    values
+}
+
+fn dc_from_dct64x32_normalized(coeffs: &[f32; 2048]) -> [[f32; 8]; 4] {
+    let mut rows = [[0.0f32; 8]; 4];
+    for a in 0..4 {
+        let mut frequencies = [0.0f32; 8];
+        for b in 0..8 {
+            frequencies[b] =
+                coeffs[a * 64 + b] * RESAMPLE_SCALE_32_TO_4[a] * RESAMPLE_SCALE_64_TO_8[b];
+        }
+        rows[a] = idct1d_8(frequencies);
+    }
+    let mut out = [[0.0f32; 8]; 4];
+    for x in 0..8 {
+        let column = idct1d_4([rows[0][x], rows[1][x], rows[2][x], rows[3][x]]);
+        for y in 0..4 {
+            out[y][x] = column[y];
+        }
+    }
+    out
+}
+
+/// DC grid for a 64-row × 32-column transform (8 rows × 4 columns).
+pub(crate) fn dc_from_dct64x32(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let normalized = dc_from_dct64x32_normalized(coeffs);
+    for y in 0..8 {
+        for x in 0..4 {
+            dc[y * 4 + x] = normalized[x][y];
+        }
+    }
+}
+
+/// DC grid for a 32-row × 64-column transform (4 rows × 8 columns).
+pub(crate) fn dc_from_dct32x64(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let normalized = dc_from_dct64x32_normalized(coeffs);
+    for y in 0..4 {
+        dc[y * 8..y * 8 + 8].copy_from_slice(&normalized[y]);
+    }
 }
 
 /// `DCTResampleScales<32, 4>` from libjxl `dct_scales.h`. Used to rescale the
@@ -2261,6 +2472,70 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    #[test]
+    fn dct64x32_and_dct32x64_round_trip() {
+        let mut input = [0.0f32; 2048];
+        for (i, value) in input.iter_mut().enumerate() {
+            *value = ((i * 37 % 251) as f32 - 125.0) * 0.01;
+        }
+        let mut coeff = [0.0f32; 2048];
+        let mut output = [0.0f32; 2048];
+        dct64x32_scalar(&input, &mut coeff);
+        inv_dct64x32(&coeff, &mut output);
+        for (i, (&got, &want)) in output.iter().zip(&input).enumerate() {
+            assert!((got - want).abs() < 2e-4, "64x32[{i}] {got} != {want}");
+        }
+        dct32x64_scalar(&input, &mut coeff);
+        inv_dct32x64(&coeff, &mut output);
+        for (i, (&got, &want)) in output.iter().zip(&input).enumerate() {
+            assert!((got - want).abs() < 2e-4, "32x64[{i}] {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn rectangular_dct64_dc_extraction_inverts_low_frequencies() {
+        let mut spatial = [[0.0f32; 8]; 4];
+        for y in 0..4 {
+            for x in 0..8 {
+                spatial[y][x] = ((y * 8 + x) as f32 * 0.37).sin();
+            }
+        }
+        let mut rows = [[0.0f32; 8]; 4];
+        for y in 0..4 {
+            rows[y] = spatial[y];
+            dct1d_8(&mut rows[y]);
+        }
+        let mut low = [[0.0f32; 8]; 4];
+        for x in 0..8 {
+            let mut col = [rows[0][x], rows[1][x], rows[2][x], rows[3][x]];
+            dct1d_4(&mut col);
+            for y in 0..4 {
+                low[y][x] = col[y] / 32.0;
+            }
+        }
+        let mut coeff = [0.0f32; 2048];
+        for y in 0..4 {
+            for x in 0..8 {
+                coeff[y * 64 + x] =
+                    low[y][x] / (RESAMPLE_SCALE_32_TO_4[y] * RESAMPLE_SCALE_64_TO_8[x]);
+            }
+        }
+        let mut wide = [0.0f32; 32];
+        dc_from_dct32x64(&coeff, &mut wide);
+        for y in 0..4 {
+            for x in 0..8 {
+                assert!((wide[y * 8 + x] - spatial[y][x]).abs() < 2e-5);
+            }
+        }
+        let mut tall = [0.0f32; 32];
+        dc_from_dct64x32(&coeff, &mut tall);
+        for y in 0..8 {
+            for x in 0..4 {
+                assert!((tall[y * 4 + x] - spatial[x][y]).abs() < 2e-5);
+            }
         }
     }
 }

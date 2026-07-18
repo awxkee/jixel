@@ -499,6 +499,108 @@ pub(crate) fn dct64x64_wasm(input: &[f32; 4096], output: &mut [f32; 4096]) {
 }
 
 #[target_feature(enable = "simd128")]
+pub(crate) fn dct64x32_wasm(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut scratch = [0.0f32; 2048];
+    for strip in 0..8 {
+        let mut c: [v128; 64] = std::array::from_fn(|row| {
+            load_strip(unsafe { input.get_unchecked(row * 32 + strip * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for tile_idx in 0..16 {
+            let base = tile_idx * 4;
+            let (a, b, cc, d) = transpose_4x4(c[base], c[base + 1], c[base + 2], c[base + 3]);
+            for (lane, value) in [a, b, cc, d].iter().enumerate() {
+                let out =
+                    unsafe { scratch.get_unchecked_mut((strip * 4 + lane) * 64 + tile_idx * 4..) };
+                unsafe { v128_store(out.as_mut_ptr().cast(), *value) };
+            }
+        }
+    }
+
+    let scale = f32x4_splat(1.0 / 2048.0);
+    for strip in 0..16 {
+        let mut c: [v128; 32] = std::array::from_fn(|col| {
+            load_strip(unsafe { scratch.get_unchecked(col * 64 + strip * 4..) }.as_ptr())
+        });
+        dct1d_32_s(&mut c);
+        for u in 0..32 {
+            let out = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
+            unsafe { v128_store(out.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct32x64_wasm(input: &[f32; 2048], output: &mut [f32; 2048]) {
+    let mut scratch = [0.0f32; 2048];
+    for row_strip in 0..8 {
+        let mut c = [f32x4_splat(0.0); 64];
+        for tile_idx in 0..16 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(
+                    unsafe { input.get_unchecked((row_strip * 4) * 64 + tile_idx * 4..) }.as_ptr(),
+                ),
+                load_strip(
+                    unsafe { input.get_unchecked((row_strip * 4 + 1) * 64 + tile_idx * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { input.get_unchecked((row_strip * 4 + 2) * 64 + tile_idx * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { input.get_unchecked((row_strip * 4 + 3) * 64 + tile_idx * 4..) }
+                        .as_ptr(),
+                ),
+            );
+            c[tile_idx * 4] = a;
+            c[tile_idx * 4 + 1] = b;
+            c[tile_idx * 4 + 2] = cc;
+            c[tile_idx * 4 + 3] = d;
+        }
+        dct1d_64_s(&mut c);
+        for u in 0..64 {
+            let out = unsafe { scratch.get_unchecked_mut(u * 32 + row_strip * 4..) };
+            unsafe { v128_store(out.as_mut_ptr().cast(), c[u]) };
+        }
+    }
+
+    let scale = f32x4_splat(1.0 / 2048.0);
+    for freq_strip in 0..16 {
+        let mut c = [f32x4_splat(0.0); 32];
+        for row_tile in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(
+                    unsafe { scratch.get_unchecked((freq_strip * 4) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((freq_strip * 4 + 1) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((freq_strip * 4 + 2) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((freq_strip * 4 + 3) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+            );
+            c[row_tile * 4] = a;
+            c[row_tile * 4 + 1] = b;
+            c[row_tile * 4 + 2] = cc;
+            c[row_tile * 4 + 3] = d;
+        }
+        dct1d_32_s(&mut c);
+        for v in 0..32 {
+            let out = unsafe { output.get_unchecked_mut(v * 64 + freq_strip * 4..) };
+            unsafe { v128_store(out.as_mut_ptr().cast(), f32x4_mul(c[v], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
 fn dct1d_4_q(c: &mut [v128; 4]) {
     let t0 = f32x4_add(c[0], c[3]);
     let t1 = f32x4_add(c[1], c[2]);
@@ -1135,6 +1237,32 @@ mod neon_dct_tests {
             dct64x64_wasm(&input, &mut got);
             dct64x64_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct64x64 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    fn test_dct64x32_wasm_vs_scalar_random() {
+        for seed in 0u64..8 {
+            let input: [f32; 2048] = fill(seed.wrapping_add(0x6432));
+            let mut got = [0.0f32; 2048];
+            let mut want = [0.0f32; 2048];
+            crate::wasm::dct64x32_wasm(&input, &mut got);
+            crate::dct::dct64x32_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct64x32 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
+    fn test_dct32x64_wasm_vs_scalar_random() {
+        for seed in 0u64..8 {
+            let input: [f32; 2048] = fill(seed.wrapping_add(0x3264));
+            let mut got = [0.0f32; 2048];
+            let mut want = [0.0f32; 2048];
+            crate::wasm::dct32x64_wasm(&input, &mut got);
+            crate::dct::dct32x64_scalar(&input, &mut want);
+            assert_close(&got, &want, &format!("dct32x64 seed={seed}"));
         }
     }
 

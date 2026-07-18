@@ -52,6 +52,8 @@ pub(crate) struct EncodingContext {
     pub(crate) dct32x16: &'static dct::DctFn<512>,
     pub(crate) dct16x32: &'static dct::DctFn<512>,
     pub(crate) dct64x64: &'static dct::DctFn<4096>,
+    pub(crate) dct64x32: &'static dct::DctFn<2048>,
+    pub(crate) dct32x64: &'static dct::DctFn<2048>,
 }
 
 impl EncodingContext {
@@ -75,6 +77,8 @@ impl EncodingContext {
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
             dct64x64: dct::selected_dct64x64(),
+            dct64x32: dct::selected_dct64x32(),
+            dct32x64: dct::selected_dct32x64(),
         }
     }
 }

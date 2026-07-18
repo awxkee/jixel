@@ -36,6 +36,7 @@ fn main() -> ExitCode {
     let mut distance: Option<f32> = None;
     let mut threads: usize = 1;
     let mut boost: Option<jixel::DarkAqConfig> = None;
+    let mut speed = jixel::Speed::Fast;
 
     let mut i = 0;
     while i < args.len() {
@@ -62,6 +63,18 @@ fn main() -> ExitCode {
                     eprintln!("invalid --threads: {v}");
                     std::process::exit(2);
                 });
+                i += 2;
+            }
+            "--speed" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                speed = match v.as_str() {
+                    "slow" => jixel::Speed::Slow,
+                    "fast" => jixel::Speed::Fast,
+                    _ => {
+                        eprintln!("invalid --speed: {v}");
+                        std::process::exit(2);
+                    }
+                };
                 i += 2;
             }
             "-h" | "--help" => usage(),
@@ -93,7 +106,8 @@ fn main() -> ExitCode {
     let mut cfg = jixel::EncodeConfig::default()
         .with_lossless(false)
         .with_distance(distance)
-        .with_num_threads(threads.max(1));
+        .with_num_threads(threads.max(1))
+        .with_speed(speed);
     if let Some(b) = boost {
         cfg = cfg.with_dark_aq_config(b);
     }

@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::entropy::{
     Histogram, OwnedEntropyCode, Token, build_huffman_codes, cluster_histograms, uint_encode,
@@ -267,9 +267,34 @@ pub(crate) fn estimate_ac_lz_bits(
     bits
 }
 
-/// Estimate the encoded size in bits of the original (non-LZ) token stream
-/// under a plain code built over `K_NUM_AC_CONTEXTS` contexts.
 pub(crate) fn estimate_ac_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
+    if !code.use_prefix_code {
+        // rANS approaches the histogram entropy: a symbol with normalized
+        // frequency `f` out of `ANS_TAB_SIZE` costs -log2(f / ANS_TAB_SIZE).
+        let cost: Vec<Vec<f32>> = code
+            .ans_freqs
+            .iter()
+            .map(|freqs| {
+                freqs
+                    .iter()
+                    .map(|&f| {
+                        if f == 0 {
+                            crate::entropy::ANS_LOG_TAB_SIZE as f32
+                        } else {
+                            crate::entropy::ANS_LOG_TAB_SIZE as f32 - dirty_log2f(f as f32)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut bits = 0.0f64;
+        for t in tokens {
+            let (sym, nbits, _) = uint_encode(t.value);
+            let cl = code.context_map[t.context as usize] as usize;
+            bits += cost[cl][sym as usize] as f64 + nbits as f64;
+        }
+        return bits as u64;
+    }
     let mut bits: u64 = 0;
     for t in tokens {
         let (sym, nbits, _) = uint_encode(t.value);
@@ -349,4 +374,38 @@ pub(crate) fn write_ac_lz_header_and_code(code: &OwnedEntropyCode, w: &mut BitWr
     // The entropy code: its context map already carries the trailing distance
     // context as the last (orig_num_contexts-th) entry.
     write_entropy_code(&code.as_ref(), w);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_ac_plain_bits;
+    use crate::ac_context::K_NUM_AC_CONTEXTS;
+    use crate::entropy::{Token, optimize_entropy_code_ac};
+
+    /// A skewed AC stream is coded with rANS, which beats the Huffman floor of
+    /// 1 bit/symbol. The plain estimate must reflect that, otherwise the LZ77
+    /// comparison in `enc_frame` sees an inflated plain cost and switches to a
+    /// prefix-coded LZ77 bundle that is actually larger.
+    #[test]
+    fn plain_estimate_prices_the_ans_path_below_the_huffman_floor() {
+        // 99% zeros in one context: entropy is ~0.08 bit/symbol, Huffman 1.0.
+        let tokens: Vec<Token> = (0..20_000)
+            .map(|i| Token {
+                context: 0,
+                value: u32::from(i % 100 == 0),
+            })
+            .collect();
+        let code = optimize_entropy_code_ac(&tokens, K_NUM_AC_CONTEXTS);
+        assert!(
+            !code.use_prefix_code,
+            "expected the rANS path for this stream"
+        );
+
+        let estimate = estimate_ac_plain_bits(&tokens, &code);
+        let huffman_floor = tokens.len() as u64;
+        assert!(
+            estimate < huffman_floor / 2,
+            "ANS estimate {estimate} should be far below the {huffman_floor}-bit Huffman floor"
+        );
+    }
 }

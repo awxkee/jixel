@@ -31,10 +31,10 @@ fn main() {
             // false,
             // &FlMeta::srgb(),
             &EncodeConfig::default()
-                .with_lossless(true)
+                .with_lossless(false)
                 .with_quality(90.)
                 .with_progressive(false)
-                .with_speed(Speed::Fast)
+                .with_speed(Speed::Slow)
                 .with_num_threads(
                     available_parallelism()
                         .unwrap_or(NonZero::new(1).unwrap())
@@ -52,9 +52,9 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(true)
+            .with_lossless(false)
             .with_quality(80.)
-            .with_speed(Speed::Fast)
+            .with_speed(Speed::Slow)
             .with_progressive(false)
             .with_color_encoding(ColorEncoding::srgb()),
     )

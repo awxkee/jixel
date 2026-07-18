@@ -37,7 +37,7 @@ mod prefix_code;
 mod token;
 mod write;
 
-pub(crate) use ans::{AnsEncSymbolInfo, write_ans_tokens};
+pub(crate) use ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, write_ans_tokens};
 pub(crate) use cluster::{cluster_histograms, cluster_histograms_refined};
 pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;

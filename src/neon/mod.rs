@@ -40,8 +40,9 @@ pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::apply_cfl_neon;
 pub(crate) use dct::{
     dct4x4_neon, dct4x8_neon, dct8x4_neon, dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon,
-    dct16x32_neon, dct32x16_neon, dct32x32_neon, dct64x64_neon, inv_dct8x8_neon, inv_dct8x16_neon,
-    inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon,
+    dct16x32_neon, dct32x16_neon, dct32x32_neon, dct32x64_neon, dct64x32_neon, dct64x64_neon,
+    inv_dct8x8_neon, inv_dct8x16_neon, inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon,
+    inv_dct32x16_neon, inv_dct32x32_neon,
 };
 pub(crate) use inflated_cost::{recon_dist_and_rate_neon, ssim_deficit_neon};
 pub(crate) use lossless_grad::grad_pack_interior;
