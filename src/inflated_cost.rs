@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 const R_NZ_BASE: f32 = 1.6;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
-pub(crate) const CHANNEL_WEIGHT: [f32; 3] = [1.0, 1.0, 1.0];
+pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [1.0, 1.0, 1.0];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
 pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];

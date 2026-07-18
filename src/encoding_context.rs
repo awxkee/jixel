@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{adaptive_quant, dct, enc_group, enc_xyb, inflated_cost};
+use crate::{adaptive_quant, dct, enc_ac_strategy, enc_group, enc_xyb, inflated_cost};
 
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
@@ -39,6 +39,7 @@ pub(crate) struct EncodingContext {
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
     pub(crate) quantize_block_ac: enc_group::QuantizeBlockAcFn,
+    pub(crate) apply_cfl: enc_ac_strategy::ApplyCflFn,
 
     pub(crate) dct8x8: &'static dct::DctFn<64>,
     pub(crate) dct8x16: &'static dct::DctFn<128>,
@@ -61,6 +62,7 @@ impl EncodingContext {
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
             rate_log2_lut: inflated_cost::rate_log2_lut(),
             quantize_block_ac: enc_group::selected_quantize_block_ac_fn(),
+            apply_cfl: enc_ac_strategy::selected_apply_cfl_fn(),
 
             dct8x8: dct::selected_dct8x8(),
             dct8x16: dct::selected_dct8x16(),

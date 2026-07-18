@@ -27,4 +27,8 @@
 # // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-cargo run --package stats --release -- assets/PhotoTraces_Free_RAW_Photos_05_Spring_Tree.png --distances 0.3,0.5,1,1.5,2,2.5 --efforts 2,3,6,7 --out charts
+cargo run --package stats --release -- ./assets/manhattan.png --distances 0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --efforts 3,6 --out charts
+
+cargo run -p meanstats --release -- ./assets/train0 --distances 0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --threads 12
+
+cargo run -p meanstats --release -- ./assets/train0 --distances 0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --efforts 3,7 --threads 12
