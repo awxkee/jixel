@@ -1,9 +1,3 @@
-//! CLI front-end: reads a PPM (P6) file and writes a JPEG XL.
-//!
-//! ```text
-//! jxl-mini input.ppm output.jxl
-//! ```
-
 #![forbid(unsafe_code)]
 
 use std::num::NonZero;

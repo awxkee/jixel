@@ -138,21 +138,57 @@ fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
 
 // ---------------------------------------------------------------------------
 // Self-correcting Weighted Predictor (WP), bit-faithful port of libjxl's
-// `weighted::State` (context_predict.h) with the *default* header
-// (wp_default=1): p1C=16, p2C=10, p3Ca/b/c=7, p3Cd/e=0, w=[0xd,0xc,0xc,0xc].
+// `weighted::State` (context_predict.h), including the four reference presets.
 // Used for all modular channels in the lossless path; the decoder reconstructs
 // each pixel as `prediction + residual` using the identical state machine.
 // ---------------------------------------------------------------------------
 const WP_EXTRA_BITS: i64 = 3;
 const WP_PRED_ROUND: i64 = ((1 << WP_EXTRA_BITS) >> 1) - 1; // = 3
-const WP_W: [u32; 4] = [0xd, 0xc, 0xc, 0xc];
-const WP_P1C: i64 = 16;
-const WP_P2C: i64 = 10;
-const WP_P3CA: i64 = 7;
-const WP_P3CB: i64 = 7;
-const WP_P3CC: i64 = 7;
-const WP_P3CD: i64 = 0;
-const WP_P3CE: i64 = 0;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WpParams {
+    w: [u32; 4],
+    p: [i64; 7],
+}
+
+impl WpParams {
+    const PRESETS: [Self; 4] = [
+        // libjxl mode 0: lossless16 and the bitstream default.
+        Self {
+            w: [0xd, 0xc, 0xc, 0xc],
+            p: [16, 10, 7, 7, 7, 0, 0],
+        },
+        // libjxl mode 1: default lossless8.
+        Self {
+            w: [0xd, 0xc, 0xc, 0xb],
+            p: [8, 8, 4, 0, 3, 23, 2],
+        },
+        // libjxl mode 2: west-oriented lossless8.
+        Self {
+            w: [0xd, 0xc, 0xd, 0xc],
+            p: [10, 9, 7, 0, 0, 16, 9],
+        },
+        // libjxl mode 3: north-oriented lossless8.
+        Self {
+            w: [0xd, 0xd, 0xc, 0xc],
+            p: [16, 8, 0, 16, 0, 23, 0],
+        },
+    ];
+    const DEFAULT: Self = Self::PRESETS[0];
+}
+
+fn write_wp_header(params: WpParams, w: &mut BitWriter) {
+    if params == WpParams::DEFAULT {
+        w.write(1, 1);
+        return;
+    }
+    w.write(1, 0);
+    for &p in &params.p {
+        w.write(5, p as u64);
+    }
+    for &weight in &params.w {
+        w.write(4, weight as u64);
+    }
+}
 // divlookup[i] = (1<<24)/(i+1)
 static WP_DIV: [u32; 64] = [
     16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152, 1864135, 1677721,
@@ -172,10 +208,15 @@ pub(crate) struct WpState {
     /// libjxl property kWPProp (p[15]): the signed neighbour WP-error with the
     /// largest absolute value among {W, N, NW, NE}. Set on each `predict`.
     pub(crate) wp_prop: i64,
+    params: WpParams,
 }
 
 impl WpState {
     pub(crate) fn new(xsize: usize) -> Self {
+        Self::with_params(xsize, WpParams::DEFAULT)
+    }
+
+    fn with_params(xsize: usize, params: WpParams) -> Self {
         let n = (xsize + 2) * 2;
         WpState {
             xsize,
@@ -184,6 +225,7 @@ impl WpState {
             prediction: [0; 4],
             pred: 0,
             wp_prop: 0,
+            params,
         }
     }
     #[inline]
@@ -243,7 +285,7 @@ impl WpState {
             let s = self.pred_errors[i][pos_n] as u64
                 + self.pred_errors[i][pos_ne] as u64
                 + self.pred_errors[i][pos_nw] as u64;
-            weights[i] = Self::error_weight(s, WP_W[i]);
+            weights[i] = Self::error_weight(s, self.params.w[i]);
         }
         let an = Self::add_bits(n);
         let aw = Self::add_bits(w);
@@ -272,14 +314,14 @@ impl WpState {
         self.wp_prop = wpp;
         let s_wn = te_n + te_w;
         self.prediction[0] = aw + ane - an;
-        self.prediction[1] = an - (((s_wn + te_ne) * WP_P1C) >> 5);
-        self.prediction[2] = aw - (((s_wn + te_nw) * WP_P2C) >> 5);
+        self.prediction[1] = an - (((s_wn + te_ne) * self.params.p[0]) >> 5);
+        self.prediction[2] = aw - (((s_wn + te_nw) * self.params.p[1]) >> 5);
         self.prediction[3] = an
-            - ((te_nw * WP_P3CA
-                + te_n * WP_P3CB
-                + te_ne * WP_P3CC
-                + (ann - an) * WP_P3CD
-                + (anw - aw) * WP_P3CE)
+            - ((te_nw * self.params.p[2]
+                + te_n * self.params.p[3]
+                + te_ne * self.params.p[4]
+                + (ann - an) * self.params.p[5]
+                + (anw - aw) * self.params.p[6])
                 >> 5);
         let pred = Self::weighted_average(&self.prediction, &weights);
         if ((te_n ^ te_w) | (te_n ^ te_nw)) > 0 {
@@ -309,6 +351,100 @@ impl WpState {
             self.pred_errors[i][prev_row + x + 1] += e as u32;
         }
     }
+}
+
+fn wp_sample_cost(
+    get: impl Fn(usize, usize) -> i32,
+    width: usize,
+    height: usize,
+    params: WpParams,
+) -> (u64, usize) {
+    let cw = width.min(128);
+    let ch = height.min(128);
+    let xs = if width > cw { [0, width - cw] } else { [0, 0] };
+    let ys = if height > ch {
+        [0, height - ch]
+    } else {
+        [0, 0]
+    };
+    let nx = 1 + usize::from(xs[1] != xs[0]);
+    let ny = 1 + usize::from(ys[1] != ys[0]);
+    let mut cost = 0u64;
+    let mut count = 0usize;
+    for &y0 in &ys[..ny] {
+        for &x0 in &xs[..nx] {
+            let local_get = |x: usize, y: usize| get(x0 + x, y0 + y);
+            let mut wp = WpState::with_params(cw, params);
+            for y in 0..ch {
+                for x in 0..cw {
+                    let neighbors = predictor_neighbors(&local_get, x, y, cw);
+                    let value = local_get(x, y);
+                    let prediction = wp.predict(
+                        x,
+                        y,
+                        neighbors.top,
+                        neighbors.left,
+                        neighbors.top_right,
+                        neighbors.top_left,
+                        neighbors.top_top,
+                    );
+                    let packed = pack_signed(value.wrapping_sub(prediction as i32));
+                    let (_, extra_bits, _) = crate::entropy::uint_encode(packed);
+                    let magnitude_bits = packed
+                        .checked_add(1)
+                        .map_or(32, |value| 32 - value.leading_zeros());
+                    cost += extra_bits as u64 + u64::from(magnitude_bits);
+                    count += 1;
+                    wp.update(value as i64, x, y);
+                }
+            }
+        }
+    }
+    (cost, count)
+}
+
+fn choose_wp_params(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    num_color: usize,
+    header_count: usize,
+    num_threads: usize,
+) -> WpParams {
+    let width = linear.xsize();
+    let height = linear.ysize();
+    let nb_chans = num_color + usize::from(alpha.is_some());
+    let total_values = width.saturating_mul(height).saturating_mul(nb_chans);
+    let scores = crate::thread_pool::steal_map(WpParams::PRESETS.len(), num_threads, |preset| {
+        let params = WpParams::PRESETS[preset];
+        let mut sample_cost = 0u64;
+        let mut samples = 0usize;
+        for channel in 0..num_color {
+            let plane = linear.plane_data(channel);
+            let (cost, count) = wp_sample_cost(|x, y| plane[y * width + x], width, height, params);
+            sample_cost += cost;
+            samples += count;
+        }
+        if let Some(alpha) = alpha {
+            let (cost, count) =
+                wp_sample_cost(|x, y| alpha.get_i32(y * width + x), width, height, params);
+            sample_cost += cost;
+            samples += count;
+        }
+        let scaled = sample_cost as f64 * total_values as f64 / samples.max(1) as f64;
+        // A non-default header costs 51 additional bits per modular group.
+        scaled
+            + if preset == 0 {
+                0.0
+            } else {
+                (51 * header_count) as f64
+            }
+    });
+    let best = scores
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.total_cmp(b.1))
+        .map_or(0, |(index, _)| index);
+    WpParams::PRESETS[best]
 }
 
 const GROUP_DIM: usize = 256;
@@ -470,8 +606,18 @@ pub(crate) fn encode_frame_lossless(
     // searches the supported Slow predictor set per channel by estimated cost
     // (one global choice, used for the tree and every group).
     let adaptive_search = speed == crate::Speed::Slow;
+    let wp_header_count = if single_group {
+        1
+    } else {
+        2 + num_dc_groups + num_ac_groups
+    };
+    let mut wp_params = if adaptive_search {
+        choose_wp_params(linear, alpha, num_color, wp_header_count, num_threads)
+    } else {
+        WpParams::DEFAULT
+    };
     let predictors = if adaptive_search {
-        choose_predictors(linear, alpha, xsize, ysize, num_threads)
+        choose_predictors_with_wp(linear, alpha, xsize, ysize, num_threads, wp_params)
     } else {
         [PREDICTOR_WEIGHTED; 4]
     };
@@ -499,6 +645,7 @@ pub(crate) fn encode_frame_lossless(
                 &predictors,
                 min_symbol,
                 num_threads,
+                wp_params,
                 writer,
             ) {
                 return;
@@ -514,10 +661,15 @@ pub(crate) fn encode_frame_lossless(
             num_dc_groups,
             min_symbol,
             num_threads,
+            wp_params,
             writer,
         ) {
             return;
         }
+    }
+
+    if !chan_preds.contains(&PREDICTOR_WEIGHTED) {
+        wp_params = WpParams::DEFAULT;
     }
 
     write_frame_header_modular(alpha.is_some(), writer);
@@ -531,11 +683,11 @@ pub(crate) fn encode_frame_lossless(
         section.write(1, 0);
         // GroupHeader: use_global_tree=0, wp_default=1, RCT transform on R/G/B.
         section.write(1, 0);
-        section.write(1, 1);
+        write_wp_header(wp_params, &mut section);
         write_modular_transforms(nb_chans, &mut section);
 
         // Tokenize all channels (post-YCoCg, per-channel contexts).
-        let tokens = tokenize_all(
+        let tokens = tokenize_all_with_wp(
             linear,
             alpha,
             xsize,
@@ -548,6 +700,7 @@ pub(crate) fn encode_frame_lossless(
             &chan_preds,
             grad_pack_fn,
             num_threads,
+            wp_params,
         );
 
         // LZ77 layer: collapse runs of identical tokens into back-references.
@@ -598,7 +751,7 @@ pub(crate) fn encode_frame_lossless(
                 let y0 = gy * GROUP_DIM;
                 let gw = GROUP_DIM.min(xsize - x0);
                 let gh = GROUP_DIM.min(ysize - y0);
-                let toks = tokenize_all(
+                let toks = tokenize_all_with_wp(
                     linear,
                     alpha,
                     xsize,
@@ -611,6 +764,7 @@ pub(crate) fn encode_frame_lossless(
                     &chan_preds,
                     grad_pack_fn,
                     1,
+                    wp_params,
                 );
                 lz77_compress_for_speed(&toks, distance_ctx, speed)
             });
@@ -626,14 +780,14 @@ pub(crate) fn encode_frame_lossless(
         write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut sections[0]);
         // GroupHeader for the global modular image: use_global_tree=1, wp=1, RCT transform.
         sections[0].write(1, 1);
-        sections[0].write(1, 1);
+        write_wp_header(wp_params, &mut sections[0]);
         write_modular_transforms(nb_chans, &mut sections[0]);
         sections[0].zero_pad_to_byte();
 
         // ----- DC groups: empty GroupHeader only -----
         for i in 0..num_dc_groups {
             sections[1 + i].write(1, 1); // use_global_tree
-            sections[1 + i].write(1, 1); // wp_default
+            write_wp_header(wp_params, &mut sections[1 + i]);
             sections[1 + i].write(2, 0); // 0 transforms
             sections[1 + i].zero_pad_to_byte();
         }
@@ -641,7 +795,7 @@ pub(crate) fn encode_frame_lossless(
         // ----- AC global: trivial (all_default flags) -----
         let ac_global_idx = 1 + num_dc_groups;
         sections[ac_global_idx].write(1, 1);
-        sections[ac_global_idx].write(1, 1);
+        write_wp_header(wp_params, &mut sections[ac_global_idx]);
         sections[ac_global_idx].zero_pad_to_byte();
 
         // ----- AC groups: pixel data per group -----
@@ -653,7 +807,7 @@ pub(crate) fn encode_frame_lossless(
                 // GroupHeader: use_global_tree=1, wp=1, 0 transforms (the global
                 // header already declared the RCT for the whole image).
                 sections[section_idx].write(1, 1);
-                sections[section_idx].write(1, 1);
+                write_wp_header(wp_params, &mut sections[section_idx]);
                 sections[section_idx].write(2, 0);
 
                 for t in &group_lz_tokens[group_index] {
@@ -1851,17 +2005,67 @@ fn tokenize_all(
     grad_pack_fn: GradPackInteriorFn,
     num_threads: usize,
 ) -> Vec<Token> {
+    tokenize_all_with_wp(
+        linear,
+        alpha,
+        xsize,
+        _ysize,
+        x0,
+        y0,
+        gw,
+        gh,
+        num_color,
+        predictors,
+        grad_pack_fn,
+        num_threads,
+        WpParams::DEFAULT,
+    )
+}
+
+fn tokenize_all_with_wp(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    _ysize: usize,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    num_color: usize,
+    predictors: &[u32],
+    grad_pack_fn: GradPackInteriorFn,
+    num_threads: usize,
+    wp_params: WpParams,
+) -> Vec<Token> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
     let channel_tokens = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
         let mut out = Vec::with_capacity(gw * gh);
         let ctx = channel_to_context(chan, nb_chans);
         if chan < num_color {
             let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
-            tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
+            tokenize_plane_with_wp(
+                ctx,
+                get,
+                gw,
+                gh,
+                predictors[chan],
+                grad_pack_fn,
+                &mut out,
+                wp_params,
+            );
         } else {
             let a = alpha.expect("alpha channel must exist");
             let get = |gx: usize, gy: usize| a.get_i32((y0 + gy) * xsize + (x0 + gx));
-            tokenize_plane(ctx, get, gw, gh, predictors[chan], grad_pack_fn, &mut out);
+            tokenize_plane_with_wp(
+                ctx,
+                get,
+                gw,
+                gh,
+                predictors[chan],
+                grad_pack_fn,
+                &mut out,
+                wp_params,
+            );
         }
         out
     });
@@ -1899,9 +2103,31 @@ fn tokenize_plane(
     grad_pack_fn: GradPackInteriorFn,
     out: &mut Vec<Token>,
 ) {
+    tokenize_plane_with_wp(
+        ctx,
+        get,
+        gw,
+        gh,
+        pred_id,
+        grad_pack_fn,
+        out,
+        WpParams::DEFAULT,
+    );
+}
+
+fn tokenize_plane_with_wp(
+    ctx: u32,
+    get: impl Fn(usize, usize) -> i32,
+    gw: usize,
+    gh: usize,
+    pred_id: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    out: &mut Vec<Token>,
+    wp_params: WpParams,
+) {
     if pred_id == PREDICTOR_WEIGHTED {
         // Weighted predictor: sequential (per-pixel error feedback), unchanged.
-        let mut wp = WpState::new(gw);
+        let mut wp = WpState::with_params(gw, wp_params);
         for gy in 0..gh {
             for gx in 0..gw {
                 let v = get(gx, gy) as i64;
@@ -2067,10 +2293,19 @@ impl PredictorCosts {
 /// Evaluate all Slow-mode predictors in one traversal and choose the lowest
 /// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
 fn choose_predictor_for_plane(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> u32 {
+    choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT)
+}
+
+fn choose_predictor_for_plane_with_wp(
+    get: impl Fn(usize, usize) -> i32,
+    w: usize,
+    h: usize,
+    wp_params: WpParams,
+) -> u32 {
     if w == 0 || h == 0 {
         return PREDICTOR_WEIGHTED;
     }
-    let mut wp = WpState::new(w);
+    let mut wp = WpState::with_params(w, wp_params);
     let mut costs = PredictorCosts::default();
     for gy in 0..h {
         for gx in 0..w {
@@ -2092,22 +2327,28 @@ fn choose_predictor_for_plane(get: impl Fn(usize, usize) -> i32, w: usize, h: us
     costs.best_predictor()
 }
 
-fn choose_predictors(
+fn choose_predictors_with_wp(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
     num_threads: usize,
+    wp_params: WpParams,
 ) -> [u32; 4] {
     let mut preds = [PREDICTOR_WEIGHTED; 4];
     let num_channels = 3 + usize::from(alpha.is_some());
     let selected = crate::thread_pool::steal_map(num_channels, num_threads, |chan| {
         if chan < 3 {
             let pd = linear.plane_data(chan);
-            choose_predictor_for_plane(|x, y| pd[y * xsize + x], xsize, ysize)
+            choose_predictor_for_plane_with_wp(|x, y| pd[y * xsize + x], xsize, ysize, wp_params)
         } else {
             let a = alpha.expect("alpha channel must exist");
-            choose_predictor_for_plane(|x, y| a.get_i32(y * xsize + x), xsize, ysize)
+            choose_predictor_for_plane_with_wp(
+                |x, y| a.get_i32(y * xsize + x),
+                xsize,
+                ysize,
+                wp_params,
+            )
         }
     });
     preds[..num_channels].copy_from_slice(&selected);
@@ -2254,8 +2495,9 @@ fn collect_channel(
     gw: usize,
     gh: usize,
     pred_id: u32,
+    wp_params: WpParams,
 ) -> (Vec<u32>, Vec<i64>) {
-    let mut wp = WpState::new(gw);
+    let mut wp = WpState::with_params(gw, wp_params);
     let mut res: Vec<u32> = Vec::with_capacity(gw * gh);
     let mut prp = Vec::with_capacity(gw * gh);
     for gy in 0..gh {
@@ -2368,6 +2610,7 @@ fn try_encode_context_tree_single_group(
     predictors: &[u32],
     min_symbol: u32,
     num_threads: usize,
+    wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
@@ -2376,7 +2619,13 @@ fn try_encode_context_tree_single_group(
     let collected = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
         if chan < 3 {
             let pd = linear.plane_data(chan);
-            collect_channel(|x, y| pd[y * xsize + x], xsize, ysize, predictors[chan])
+            collect_channel(
+                |x, y| pd[y * xsize + x],
+                xsize,
+                ysize,
+                predictors[chan],
+                wp_params,
+            )
         } else {
             let a = alpha.expect("alpha channel must exist");
             collect_channel(
@@ -2384,6 +2633,7 @@ fn try_encode_context_tree_single_group(
                 xsize,
                 ysize,
                 predictors[chan],
+                wp_params,
             )
         }
     });
@@ -2441,7 +2691,7 @@ fn try_encode_context_tree_single_group(
     section.write(1, 1); // dc_quant all_default = 1
     section.write(1, 0); // has_tree = 0
     section.write(1, 0); // use_global_tree = 0
-    section.write(1, 1); // wp_default = 1
+    write_wp_header(wp_params, &mut section);
     write_modular_transforms(nb_chans, &mut section);
 
     let distance_ctx = num_pixel_ctx as u32;
@@ -2476,6 +2726,7 @@ fn try_encode_context_tree_multi_group(
     num_dc_groups: usize,
     min_symbol: u32,
     num_threads: usize,
+    wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
@@ -2494,11 +2745,11 @@ fn try_encode_context_tree_multi_group(
             for chan in 0..3usize {
                 let pd = linear.plane_data(chan);
                 let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-                chans.push(collect_channel(get, gw, gh, predictors[chan]));
+                chans.push(collect_channel(get, gw, gh, predictors[chan], wp_params));
             }
             if let Some(a) = alpha {
                 let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                chans.push(collect_channel(get, gw, gh, predictors[3]));
+                chans.push(collect_channel(get, gw, gh, predictors[3], wp_params));
             }
             chans
         });
@@ -2567,26 +2818,26 @@ fn try_encode_context_tree_multi_group(
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(&tree_tokens, &code, min_symbol, &mut sections[0]);
     sections[0].write(1, 1); // use_global_tree
-    sections[0].write(1, 1); // wp_default
+    write_wp_header(wp_params, &mut sections[0]);
     write_modular_transforms(nb_chans, &mut sections[0]);
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {
         section.write(1, 1);
-        section.write(1, 1);
+        write_wp_header(wp_params, section);
         section.write(2, 0);
         section.zero_pad_to_byte();
     }
 
     let ac_global_idx = 1 + num_dc_groups;
     sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].write(1, 1);
+    write_wp_header(wp_params, &mut sections[ac_global_idx]);
     sections[ac_global_idx].zero_pad_to_byte();
 
     for group_index in 0..num_ac_groups {
         let section_idx = 2 + num_dc_groups + group_index;
         sections[section_idx].write(1, 1);
-        sections[section_idx].write(1, 1);
+        write_wp_header(wp_params, &mut sections[section_idx]);
         sections[section_idx].write(2, 0);
         for t in &group_lz_tokens[group_index] {
             write_lz_token(*t, &code, min_symbol, &mut sections[section_idx]);
@@ -2959,6 +3210,49 @@ mod predictor_tests {
             choose_predictor_for_plane(|x, y| plane[y * W + x], W, H),
             PREDICTOR_AVERAGE4
         );
+    }
+
+    #[test]
+    fn wp_headers_have_expected_sizes() {
+        let mut default = BitWriter::new();
+        write_wp_header(WpParams::DEFAULT, &mut default);
+        assert_eq!(default.bits_written(), 1);
+
+        for &params in &WpParams::PRESETS[1..] {
+            let mut custom = BitWriter::new();
+            write_wp_header(params, &mut custom);
+            assert_eq!(custom.bits_written(), 52);
+        }
+    }
+
+    #[test]
+    fn directional_wp_presets_are_distinct() {
+        const W: usize = 128;
+        const H: usize = 128;
+        let mut west = vec![0i32; W * H];
+        let mut north = vec![0i32; W * H];
+        for y in 0..H {
+            west[y * W] = ((y * 977) & 65535) as i32;
+            for x in 1..W {
+                west[y * W + x] = west[y * W + x - 1] + ((x * 13 + y * 7) % 5) as i32 - 2;
+            }
+        }
+        for x in 0..W {
+            north[x] = ((x * 977) & 65535) as i32;
+            for y in 1..H {
+                north[y * W + x] = north[(y - 1) * W + x] + ((y * 13 + x * 7) % 5) as i32 - 2;
+            }
+        }
+        let west_costs: Vec<_> = WpParams::PRESETS
+            .iter()
+            .map(|&params| wp_sample_cost(|x, y| west[y * W + x], W, H, params).0)
+            .collect();
+        let north_costs: Vec<_> = WpParams::PRESETS
+            .iter()
+            .map(|&params| wp_sample_cost(|x, y| north[y * W + x], W, H, params).0)
+            .collect();
+        assert_ne!(west_costs[2], west_costs[3]);
+        assert_ne!(north_costs[2], north_costs[3]);
     }
 }
 
