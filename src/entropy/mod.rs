@@ -29,6 +29,7 @@
 
 mod ans;
 mod cluster;
+mod dlog2;
 mod entropy_code;
 mod fast_div_u16;
 mod histogram;
@@ -41,6 +42,9 @@ pub(crate) use ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, write_ans_tokens};
 pub(crate) use cluster::{cluster_histograms, cluster_histograms_refined};
 pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;
+#[cfg(test)]
+pub(crate) use huffman_tree::huffman_tree_scratch_capacity;
+pub(crate) use huffman_tree::release_huffman_tree_scratch;
 pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
 pub(crate) use token::{
     HybridUintConfig, Token, pack_signed, uint_encode, uint_encode_with_config,

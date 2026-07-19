@@ -69,7 +69,7 @@ fn compute_cmap_tile(
     let mut tmp = [0.0f32; 64];
 
     // Accumulate the two regressions' normal-equation sums directly rather than
-    // materialising four per-sample coefficient vectors and re-reading them.
+    // materializing four per-sample coefficient vectors and re-reading them.
     // The accumulation order (block-major, coefficient-minor, ca-before-cb)
     // matches the previous push-then-iterate path exactly, and each per-sample
     // expression is unchanged, so the resulting (ytox, ytob) is bit-identical.

@@ -37,7 +37,6 @@ use std::sync::{Arc, OnceLock};
     target_arch = "aarch64"
 ))]
 #[inline(always)]
-#[allow(unused)]
 pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
     f32::mul_add(a, b, c)
 }
@@ -50,7 +49,6 @@ pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
     target_arch = "aarch64"
 )))]
 #[inline(always)]
-#[allow(unused)]
 pub(crate) fn fmla(a: f32, b: f32, c: f32) -> f32 {
     a * b + c
 }

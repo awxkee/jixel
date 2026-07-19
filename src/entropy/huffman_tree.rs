@@ -55,6 +55,15 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+pub(crate) fn release_huffman_tree_scratch() {
+    HT_POOL.with_borrow_mut(|pool| *pool = Vec::new());
+}
+
+#[cfg(test)]
+pub(crate) fn huffman_tree_scratch_capacity() -> usize {
+    HT_POOL.with_borrow(|pool| pool.capacity())
+}
+
 pub(crate) fn create_huffman_tree(data: &[u32], tree_limit: u8, depth: &mut [u8]) {
     let length = data.len();
     debug_assert!(depth.len() >= length);

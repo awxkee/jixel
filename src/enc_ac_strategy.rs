@@ -164,11 +164,11 @@ struct SuperBlockCost {
 thread_local! {
     /// Reused gather scratch for [`forward_transform`] (avoids re-zeroing 1024
     /// floats on every call). Single-threaded encode; one buffer per thread.
-    static FT_GATHER_SCRATCH: std::cell::RefCell<[f32; 1024]> =
-        const { std::cell::RefCell::new([0.0; 1024]) };
+    static FT_GATHER_SCRATCH: RefCell<[f32; 1024]> =
+        const { RefCell::new([0.0; 1024]) };
     /// Reused per-channel coefficient scratch for [`strategy_cost`].
-    static SC_COEFFS_SCRATCH: std::cell::RefCell<[[f32; 1024]; 3]> =
-        const { std::cell::RefCell::new([[0.0; 1024]; 3]) };
+    static SC_COEFFS_SCRATCH: RefCell<[[f32; 1024]; 3]> =
+        const { RefCell::new([[0.0; 1024]; 3]) };
 }
 
 /// Gather a transform footprint with edge replication, matching
@@ -903,8 +903,6 @@ pub(crate) fn adjust_quant_field(
 /// reconcile the quant field. `(dc_group_px, dc_group_py)` is the DC group's
 /// top-left in absolute image pixels (so `opsin` can be the full image).
 #[allow(clippy::too_many_arguments)]
-/// Aggregate quant over a transform footprint exactly as `adjust_quant_field`
-/// will after strategy selection, then scale it for the RD model.
 #[inline]
 fn region_qac(
     quant_field: &ImageB,
@@ -915,13 +913,12 @@ fn region_qac(
     scale: f32,
     butteraugli_target: f32,
 ) -> f32 {
-    let mut max_q: u8 = 1;
+    let mut max_q = 1u8;
     let mut sum = 0u32;
-    for iy in 0..h {
-        for ix in 0..w {
-            let q = quant_field.row(by + iy)[bx + ix];
+    for y in by..by + h {
+        for &q in &quant_field.row(y)[bx..bx + w] {
             max_q = max_q.max(q);
-            sum += q as u32;
+            sum += u32::from(q);
         }
     }
     scale * aggregate_quant(max_q, sum, w * h, butteraugli_target) as f32

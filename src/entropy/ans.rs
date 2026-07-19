@@ -48,6 +48,7 @@
 use super::histogram::Histogram;
 use super::token::{Token, uint_encode};
 use crate::bit_writer::BitWriter;
+use crate::entropy::dlog2::{f_fmla, f_log2};
 use crate::entropy::fast_div_u16::FastDivU16;
 
 pub(crate) const ANS_LOG_TAB_SIZE: u32 = 12;
@@ -146,8 +147,10 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
             underfull.push(i as u32);
         }
     }
-    for i in dist.len()..TABLE_ENTRIES {
-        cutoffs[i] = 0;
+    for (i, cutoff) in
+        (dist.len()..TABLE_ENTRIES).zip(cutoffs[dist.len()..TABLE_ENTRIES].iter_mut())
+    {
+        *cutoff = 0;
         underfull.push(i as u32);
     }
     while let Some(over) = overfull.pop() {
@@ -162,20 +165,24 @@ fn init_alias_table(distribution_in: &[u16]) -> [AliasEntry; TABLE_ENTRIES] {
             overfull.push(over);
         }
     }
-    for i in 0..TABLE_ENTRIES {
-        if cutoffs[i] == entry_size {
-            a[i].right_value = i as u32;
-            a[i].offsets1 = 0;
-            a[i].cutoff = 0;
+    for (i, (&cutoff, a)) in cutoffs[..TABLE_ENTRIES]
+        .iter()
+        .zip(a[..TABLE_ENTRIES].iter_mut())
+        .enumerate()
+    {
+        if cutoff == entry_size {
+            a.right_value = i as u32;
+            a.offsets1 = 0;
+            a.cutoff = 0;
         } else {
-            a[i].offsets1 -= cutoffs[i];
-            a[i].cutoff = cutoffs[i];
+            a.offsets1 -= cutoff;
+            a.cutoff = cutoff;
         }
         let freq0 = if i < dist.len() { dist[i] } else { 0 };
-        let i1 = a[i].right_value as usize;
+        let i1 = a.right_value as usize;
         let freq1 = if i1 < dist.len() { dist[i1] } else { 0 };
-        a[i].freq0 = freq0;
-        a[i].freq1_xor_freq0 = freq1 ^ freq0;
+        a.freq0 = freq0;
+        a.freq1_xor_freq0 = freq1 ^ freq0;
     }
     a
 }
@@ -458,7 +465,7 @@ pub(crate) fn ans_data_bits(counts: &[u32], freqs: &[u16]) -> f64 {
             continue;
         }
         let f = freqs.max(1) as f64;
-        bits += count as f64 * (ANS_LOG_TAB_SIZE as f64 - f.log2());
+        bits = f_fmla(count as f64, ANS_LOG_TAB_SIZE as f64 - f_log2(f), bits);
     }
     bits
 }
@@ -466,7 +473,7 @@ pub(crate) fn ans_data_bits(counts: &[u32], freqs: &[u16]) -> f64 {
 pub(crate) fn huffman_data_bits(counts: &[u32], depths: &[u8]) -> f64 {
     let mut bits = 0.0f64;
     for (&count, &depth) in counts.iter().zip(depths[..counts.len()].iter()) {
-        bits += count as f64 * depth as f64;
+        bits = f_fmla(count as f64, depth as f64, bits);
     }
     bits
 }
@@ -481,7 +488,7 @@ pub(crate) fn ans_table_bits(freqs: &[u16]) -> f64 {
 
 pub(crate) fn huffman_tree_bits_estimate(depths: &[u8]) -> f64 {
     let used = depths.iter().filter(|&&d| d != 0).count();
-    8.0 + used as f64 * 4.0
+    f_fmla(used as f64, 4.0, 8.0)
 }
 
 /// Decide prefix vs rANS for a clustered-histogram bundle. true => prefix.
