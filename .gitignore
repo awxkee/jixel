@@ -7,3 +7,4 @@ assets
 parameters_fit/.venv
 meanstats_out
 docs
+Cargo.lock

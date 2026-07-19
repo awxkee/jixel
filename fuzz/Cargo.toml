@@ -1,0 +1,15 @@
+[package]
+name = "jixel-afl"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+afl = "0.18.2"
+jixel = { path = ".." }
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+
+[workspace]

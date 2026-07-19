@@ -552,7 +552,7 @@ fn write_quant_row_neon(
     // would otherwise read one byte/float past the image at exact right edges.
     while bx + 4 <= valid_blocks {
         let px = x0 + bx * 8;
-        if !(full_y && px <= img_xsize.saturating_sub(33)) {
+        if !(full_y && px + 33 <= img_xsize) {
             break;
         }
 
@@ -723,7 +723,7 @@ fn stage1_fused_4rows_to_pre(
         //
         //   gx >= 1 && gx + 16 < img_xsize
         //
-        if px + 4 <= pre_w && gx >= 1 && gx <= img_xsize.saturating_sub(17) {
+        if px + 4 <= pre_w && gx >= 1 && gx + 17 <= img_xsize {
             let mut c0 = zero;
             let mut c1 = zero;
             let mut c2 = zero;

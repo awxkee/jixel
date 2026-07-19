@@ -715,7 +715,7 @@ fn stage1_fused_4rows_to_pre(
         // Stage-1 vector also reads gx-1 and gx+1. Therefore, the last vector
         // reads up to gx+32, so the fully-vectorized path requires:
         //   gx >= 1 && gx + 32 < img_xsize
-        if px + 8 <= pre_w && gx >= 1 && gx <= img_xsize.saturating_sub(33) {
+        if px + 8 <= pre_w && gx >= 1 && gx + 33 <= img_xsize {
             let mut c0 = zero;
             let mut c1 = zero;
             let mut c2 = zero;
