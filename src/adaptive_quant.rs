@@ -564,7 +564,53 @@ pub(crate) fn dirty_log1pf(d: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{dirty_log1pf, dirty_log2f, hf_modulation_strength};
+    use super::{
+        Image3F, ImageB, dirty_log1pf, dirty_log2f, fill_quant_field_scalar,
+        hf_modulation_strength, selected_fill_quant_field_fn,
+    };
+
+    /// The SIMD backends take a wide vector path only for groups of blocks that
+    /// are fully interior. Images narrower than one such group (e.g. 27x28 for
+    /// the 4-block/33-column NEON and WASM gates) must fall through to the
+    /// scalar tail instead of reading past the end of a row.
+    #[test]
+    fn fill_quant_field_matches_scalar_on_small_images() {
+        for &(xsize, ysize) in &[
+            (27usize, 28usize),
+            (1, 1),
+            (7, 9),
+            (32, 32),
+            (33, 33),
+            (64, 17),
+            (65, 65),
+        ] {
+            let mut opsin = Image3F::new(xsize, ysize);
+            for c in 0..3 {
+                for y in 0..ysize {
+                    let row = opsin.plane_row_mut(c, y);
+                    for (x, v) in row.iter_mut().enumerate() {
+                        // Deterministic, non-flat content so the modulations
+                        // actually differ block to block.
+                        let t = (x * 7 + y * 13 + c * 29) as f32;
+                        *v = (t * 0.017).sin() * 0.4 + c as f32 * 0.05;
+                    }
+                }
+            }
+
+            let xsize_blocks = xsize.div_ceil(8);
+            let ysize_blocks = ysize.div_ceil(8);
+
+            let mut got = ImageB::new(xsize_blocks, ysize_blocks);
+            let mut want = ImageB::new(xsize_blocks, ysize_blocks);
+
+            selected_fill_quant_field_fn()(&opsin, &mut got, 0, 0, 1.0, 1.0);
+            fill_quant_field_scalar(&opsin, &mut want, 0, 0, 1.0, 1.0);
+
+            for by in 0..ysize_blocks {
+                assert_eq!(got.row(by), want.row(by), "{xsize}x{ysize}, block row {by}");
+            }
+        }
+    }
 
     #[test]
     fn dirty_log2f_matches_log2() {

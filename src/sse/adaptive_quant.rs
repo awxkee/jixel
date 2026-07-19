@@ -673,7 +673,7 @@ fn stage1_fused_4rows_to_pre(
 
         // Four output pre pixels consume sixteen source pixels. Each Stage-1
         // vector also reads gx-1 and gx+1, so the last vector reads up to gx+16.
-        if px + 4 <= pre_w && gx >= 1 && gx <= img_xsize.saturating_sub(17) {
+        if px + 4 <= pre_w && gx >= 1 && gx + 17 <= img_xsize {
             let mut c0 = zero;
             let mut c1 = zero;
             let mut c2 = zero;
