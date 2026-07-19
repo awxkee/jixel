@@ -48,7 +48,7 @@ fn main() {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let bytes = jixel::encode_image(
-        &image.as_bytes(),
+        &rgb_img,
         width,
         height,
         &EncodeConfig::default()

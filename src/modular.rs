@@ -45,10 +45,6 @@ const PREDICTOR_GRADIENT: u32 = 5;
 /// AC group dimension in pixels.  Matches `K_GROUP_DIM` in enc_frame.rs.
 const GROUP_DIM: usize = 256;
 
-// ---------------------------------------------------------------------------
-// Public entry points.
-// ---------------------------------------------------------------------------
-
 /// Write the LfGlobal modular section for the alpha channel.
 ///
 /// * **Small images** (`xsize ≤ GROUP_DIM && ysize ≤ GROUP_DIM`): writes the
