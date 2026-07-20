@@ -41,6 +41,7 @@ mod parse;
 
 #[allow(unused_imports)]
 pub(crate) use parse::{JpegError, parse_jpeg};
+use std::num::NonZeroUsize;
 
 use crate::util::EncodeError;
 
@@ -103,12 +104,19 @@ pub struct JpegTranscodeConfig {
     ///
     /// Defaults to `true`. See [`Self::with_jpeg_reconstruction`].
     pub jpeg_reconstruction: bool,
+    /// Worker threads used while building the codestream. Defaults to 1.
+    ///
+    /// See [`Self::with_num_threads`].
+    pub num_threads: usize,
 }
 
 impl Default for JpegTranscodeConfig {
     fn default() -> Self {
         Self {
             jpeg_reconstruction: true,
+            num_threads: std::thread::available_parallelism()
+                .unwrap_or(NonZeroUsize::new(1).unwrap())
+                .get(),
         }
     }
 }
@@ -119,6 +127,12 @@ impl JpegTranscodeConfig {
         self.jpeg_reconstruction = enabled;
         self
     }
+
+    /// Sets the number of worker threads, which does not affect the output.
+    pub fn with_num_threads(mut self, threads: usize) -> Self {
+        self.num_threads = threads.max(1);
+        self
+    }
 }
 
 /// Losslessly transcodes a JPEG file into JPEG XL, keeping the ability to
@@ -127,7 +141,6 @@ pub fn encode_jpeg_lossless(jpeg: &[u8]) -> Result<Vec<u8>, EncodeError> {
     encode_jpeg_lossless_with_config(jpeg, &JpegTranscodeConfig::default())
 }
 
-/// Losslessly transcodes a JPEG file into JPEG XL.
 pub fn encode_jpeg_lossless_with_config(
     jpeg: &[u8],
     config: &JpegTranscodeConfig,
@@ -137,7 +150,7 @@ pub fn encode_jpeg_lossless_with_config(
     // Embedded in the codestream either way: without it, dropping the `jbrd`
     // box would silently discard the profile and leave the image mislabeled.
     let icc = extract_icc(&parsed);
-    let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref())
+    let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref(), config.num_threads)
         .map_err(|e| EncodeError::Jpeg(e.to_string()))?;
 
     if !config.jpeg_reconstruction {
@@ -262,9 +275,8 @@ pub(crate) struct JpegComponent {
     pub(crate) quant_idx: u32,
     pub(crate) width_in_blocks: usize,
     pub(crate) height_in_blocks: usize,
-    /// Quantized coefficients, `width_in_blocks * height_in_blocks` blocks of
-    /// 64, each block in **natural** order.
-    pub(crate) coeffs: Vec<i32>,
+    /// Quantized coefficients
+    pub(crate) coeffs: Vec<i16>,
 }
 
 /// Everything recovered from a JPEG file, sufficient to rebuild it exactly.

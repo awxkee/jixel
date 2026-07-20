@@ -83,10 +83,21 @@ impl core::fmt::Display for JpegError {
     }
 }
 
+/// Number of bits resolved by the direct lookup table.
+///
+/// Eight covers the overwhelming majority of real codes; longer ones fall back
+/// to the canonical walk below.
+const HUFF_LUT_BITS: u32 = 8;
+const HUFF_LUT_SIZE: usize = 1 << HUFF_LUT_BITS;
+
 /// A decoding table built from a DHT segment, in the classic
 /// min-code/max-code/value-pointer form.
 #[derive(Clone)]
 struct HuffTable {
+    /// `(symbol, code length)` for every `HUFF_LUT_BITS`-bit prefix. A length of
+    /// zero means the prefix needs the slow path — either the code is longer
+    /// than the table resolves, or it is not a valid code at all.
+    lut: [(u8, u8); HUFF_LUT_SIZE],
     /// `min_code[l]` / `max_code[l]` bound the codes of length `l+1`.
     /// `max_code[l] < 0` means no codes of that length exist.
     min_code: [i32; HUFF_MAX_BIT_LENGTH],
@@ -100,6 +111,7 @@ struct HuffTable {
 impl Default for HuffTable {
     fn default() -> Self {
         Self {
+            lut: [(0, 0); HUFF_LUT_SIZE],
             min_code: [0; HUFF_MAX_BIT_LENGTH],
             max_code: [-1; HUFF_MAX_BIT_LENGTH],
             val_ptr: [0; HUFF_MAX_BIT_LENGTH],
@@ -139,6 +151,25 @@ impl HuffTable {
         if k != table.values.len() {
             return Err(JpegError::BadTable("Huffman"));
         }
+
+        // Fill the direct lookup table. A code of length `l` fixes the top `l`
+        // bits, so it owns every prefix that starts with it.
+        let mut code: u32 = 0;
+        let mut idx = 0usize;
+        for l in 1..=HUFF_LUT_BITS as usize {
+            for _ in 0..counts[l] {
+                let shift = HUFF_LUT_BITS as usize - l;
+                let base = (code as usize) << shift;
+                let sym = table.values[idx];
+                for slot in &mut table.lut[base..base + (1 << shift)] {
+                    *slot = (sym, l as u8);
+                }
+                idx += 1;
+                code += 1;
+            }
+            code <<= 1;
+        }
+
         Ok(table)
     }
 }
@@ -152,6 +183,10 @@ struct BitReader<'a> {
     /// Bit accumulator, MSB-aligned within `bits_left`.
     accum: u64,
     bits_left: u32,
+    /// Bits fabricated past the end of the segment by `fill`. They sit at the
+    /// bottom of `accum` and must not be mistaken for real buffered data when
+    /// reporting positions or padding.
+    invented: u32,
     /// Set once a marker (an unstuffed `FF xx`) has been reached.
     hit_marker: bool,
     /// Position of the `FF` byte that terminated the segment.
@@ -165,6 +200,7 @@ impl<'a> BitReader<'a> {
             pos,
             accum: 0,
             bits_left: 0,
+            invented: 0,
             hit_marker: false,
             marker_pos: pos,
         }
@@ -219,6 +255,7 @@ impl<'a> BitReader<'a> {
                 None => {
                     self.accum = (self.accum << 8) | 0xFF;
                     self.bits_left += 8;
+                    self.invented += 8;
                 }
             }
         }
@@ -241,6 +278,18 @@ impl<'a> BitReader<'a> {
         if !table.present {
             return Err(JpegError::BadEntropyData);
         }
+
+        // Fast path: resolve the code from its first `HUFF_LUT_BITS` bits.
+        // Nothing is consumed unless the lookup succeeds, so the fallback below
+        // still sees the code from its first bit.
+        self.fill(HUFF_LUT_BITS);
+        let peek = ((self.accum >> (self.bits_left - HUFF_LUT_BITS)) & 0xFF) as usize;
+        let (sym, len) = table.lut[peek];
+        if len != 0 {
+            self.bits_left -= len as u32;
+            return Ok(sym);
+        }
+
         let mut code: i32 = 0;
         for l in 0..HUFF_MAX_BIT_LENGTH {
             code = (code << 1) | self.get_bit() as i32;
@@ -272,7 +321,7 @@ impl<'a> BitReader<'a> {
     /// Number of whole bits still buffered but unconsumed, and the value of the
     /// padding bits that would round the stream up to a byte boundary.
     fn padding_bits(&self) -> (u32, u32) {
-        let pad = self.bits_left % 8;
+        let pad = self.real_bits() % 8;
         if pad == 0 {
             (0, 0)
         } else {
@@ -286,7 +335,12 @@ impl<'a> BitReader<'a> {
     /// Discards buffered bits back to a byte boundary, returning the position
     /// of the next unread byte.
     fn byte_position(&self) -> usize {
-        self.pos - (self.bits_left / 8) as usize
+        self.pos - (self.real_bits() / 8) as usize
+    }
+
+    /// Buffered bits that actually came from the stream.
+    fn real_bits(&self) -> u32 {
+        self.bits_left.saturating_sub(self.invented)
     }
 }
 
@@ -309,7 +363,7 @@ const M_COM: u8 = 0xFE;
 /// Reconstruction encodes each marker as six bits of `marker - 0xC0`, so only
 /// this range is representable at all; anything else has to be carried as
 /// inter-marker data instead.
-const IS_VALID_MARKER: [bool; 64] = {
+static IS_VALID_MARKER: [bool; 64] = {
     let mut t = [false; 64];
     let valid = [
         0xC0u8, 0xC1, 0xC2, 0xC4, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD9, 0xDA, 0xDB,
@@ -520,8 +574,9 @@ fn process_sof(data: &[u8], pos: usize, jpg: &mut JpegData) -> Result<usize, Jpe
     }
     // Duplicate component ids would make scan headers ambiguous.
     for i in 0..jpg.components.len() {
-        for j in (i + 1)..jpg.components.len() {
-            if jpg.components[i].id == jpg.components[j].id {
+        let c_component = &jpg.components[i];
+        for j in jpg.components[(i + 1)..jpg.components.len()].iter() {
+            if c_component.id == j.id {
                 return Err(JpegError::BadFrameHeader);
             }
         }
@@ -540,7 +595,7 @@ fn process_sof(data: &[u8], pos: usize, jpg: &mut JpegData) -> Result<usize, Jpe
             .checked_mul(c.height_in_blocks)
             .and_then(|b| b.checked_mul(DCT_BLOCK_SIZE))
             .ok_or(JpegError::BadFrameHeader)?;
-        c.coeffs = vec![0i32; n];
+        c.coeffs = vec![0i16; n];
     }
     Ok(end)
 }
@@ -637,8 +692,7 @@ fn process_dht(
             return Err(JpegError::BadTable("Huffman"));
         }
         let mut values = Vec::with_capacity(total);
-        for i in 0..total {
-            let v = data[p + i];
+        for (i, &v) in data[p..p + total].iter().enumerate() {
             // DC values are magnitudes 0..=15; AC symbols use the full byte.
             if tc == 0 && v > 15 {
                 return Err(JpegError::BadTable("Huffman"));
@@ -900,12 +954,16 @@ fn decode_block(
     dc_tables: &[HuffTable; 4],
     ac_tables: &[HuffTable; 4],
 ) -> Result<(), JpegError> {
-    let nblocks =
-        jpg.components[comp_idx].width_in_blocks * jpg.components[comp_idx].height_in_blocks;
+    let comp = &jpg.components[comp_idx];
+    let nblocks = comp.width_in_blocks * comp.height_in_blocks;
     if block >= nblocks {
         return Err(JpegError::BadEntropyData);
     }
+    let is_progressive = jpg.is_progressive;
     let base = block * DCT_BLOCK_SIZE;
+    // One bounds check for the whole block instead of one per coefficient; this
+    // loop is the hot path of every scan.
+    let coeffs: &mut [i16] = &mut jpg.components[comp_idx].coeffs[base..base + DCT_BLOCK_SIZE];
 
     let ss = scan.ss;
     let se = scan.se;
@@ -924,11 +982,11 @@ fn decode_block(
                 .checked_add(diff)
                 .ok_or(JpegError::BadEntropyData)?;
             state.dc_pred[comp_idx_slot(scan, comp_idx)] = pred;
-            jpg.components[comp_idx].coeffs[base] = pred << al;
+            coeffs[0] = narrow(pred << al)?;
         } else {
             // Refinement: one bit at position `al`.
             if br.get_bit() != 0 {
-                jpg.components[comp_idx].coeffs[base] |= 1 << al;
+                coeffs[0] |= 1i16 << al;
             }
         }
         if se == 0 {
@@ -937,7 +995,7 @@ fn decode_block(
     }
 
     // ---- AC ----
-    if !jpg.is_progressive {
+    if !is_progressive {
         let mut k = 1usize;
         while k <= se as usize {
             let sym = br.decode_huff(&ac_tables[csi.ac_tbl_idx as usize])?;
@@ -955,7 +1013,7 @@ fn decode_block(
                 return Err(JpegError::BadEntropyData);
             }
             let v = br.receive_extend(s);
-            jpg.components[comp_idx].coeffs[base + NATURAL_ORDER[k]] = v;
+            coeffs[NATURAL_ORDER[k]] = narrow(v)?;
             k += 1;
         }
         return Ok(());
@@ -999,7 +1057,7 @@ fn decode_block(
                 return Err(JpegError::BadEntropyData);
             }
             let v = br.receive_extend(s);
-            jpg.components[comp_idx].coeffs[base + NATURAL_ORDER[k]] = v << al;
+            coeffs[NATURAL_ORDER[k]] = narrow(v << al)?;
             num_zero_runs = 0;
             k += 1;
         }
@@ -1014,8 +1072,8 @@ fn decode_block(
         // to back" test above from firing on ordinary blocks.
         state.eob_run -= 1;
     } else {
-        let p1: i32 = 1 << al;
-        let m1: i32 = -1 << al;
+        let p1: i16 = 1i16 << al;
+        let m1: i16 = -1i16 << al;
         let mut k = ac_start;
 
         if state.eob_run <= 0 {
@@ -1023,7 +1081,7 @@ fn decode_block(
                 let sym = br.decode_huff(&ac_tables[csi.ac_tbl_idx as usize])?;
                 let mut r = (sym >> 4) as i32;
                 let s = (sym & 0x0F) as u32;
-                let mut value = 0i32;
+                let mut value = 0i16;
                 if s == 0 {
                     if r != 15 {
                         if k == ac_start && state.eob_run == 0 {
@@ -1042,17 +1100,16 @@ fn decode_block(
                 // Skip `r` zero-history coefficients, correcting non-zero
                 // ones passed on the way.
                 while k <= se as usize {
-                    let idx = base + NATURAL_ORDER[k];
-                    let cur = jpg.components[comp_idx].coeffs[idx];
+                    let idx = NATURAL_ORDER[k];
+                    let cur = coeffs[idx];
                     if cur != 0 {
                         if br.get_bit() != 0 && (cur & p1) == 0 {
-                            jpg.components[comp_idx].coeffs[idx] =
-                                if cur >= 0 { cur + p1 } else { cur + m1 };
+                            coeffs[idx] = if cur >= 0 { cur + p1 } else { cur + m1 };
                         }
                     } else {
                         if r == 0 {
                             if value != 0 {
-                                jpg.components[comp_idx].coeffs[idx] = value;
+                                coeffs[idx] = value;
                             }
                             k += 1;
                             break;
@@ -1068,11 +1125,10 @@ fn decode_block(
             // Within an EOB run only the correction bits for already-nonzero
             // coefficients are present.
             while k <= se as usize {
-                let idx = base + NATURAL_ORDER[k];
-                let cur = jpg.components[comp_idx].coeffs[idx];
+                let idx = NATURAL_ORDER[k];
+                let cur = coeffs[idx];
                 if cur != 0 && br.get_bit() != 0 && (cur & p1) == 0 {
-                    jpg.components[comp_idx].coeffs[idx] =
-                        if cur >= 0 { cur + p1 } else { cur + m1 };
+                    coeffs[idx] = if cur >= 0 { cur + p1 } else { cur + m1 };
                 }
                 k += 1;
             }
@@ -1080,6 +1136,11 @@ fn decode_block(
         state.eob_run -= 1;
     }
     Ok(())
+}
+
+#[inline]
+fn narrow(v: i32) -> Result<i16, JpegError> {
+    i16::try_from(v).map_err(|_| JpegError::BadEntropyData)
 }
 
 /// DC predictors are indexed per scan component, not per image component.

@@ -33,7 +33,9 @@ fn main() {
         }
     };
 
-    let config = jixel::JpegTranscodeConfig::default().with_jpeg_reconstruction(reconstruct);
+    let config = jixel::JpegTranscodeConfig::default()
+        .with_jpeg_reconstruction(reconstruct)
+        .with_num_threads(std::thread::available_parallelism().map_or(1, |n| n.get()));
     let jxl = match jixel::encode_jpeg_lossless_with_config(&jpeg, &config) {
         Ok(v) => v,
         Err(e) => {
