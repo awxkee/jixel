@@ -246,6 +246,11 @@ pub struct EncodeConfig {
     /// For lossy (`!lossless`) encoding, `true` selects 2-pass progressive
     /// VarDCT (equivalent to `progressive_passes = Some(2)`).
     pub progressive: bool,
+    /// Detect exact repeated, 16x16-aligned regions and encode them through the
+    /// JPEG XL patch dictionary. Supported for both lossless Modular and lossy
+    /// VarDCT encoding. The encoder measures the complete normal and patched
+    /// representations and keeps patches only when they reduce the final rate.
+    pub patches: bool,
     /// Number of VarDCT passes for **lossy** progressive encoding. `None` falls
     /// back to `progressive` (2 passes if set, else 1). `Some(1)` = single pass;
     /// `Some(n)` for n in 2..=4 = n-pass progressive with an automatic
@@ -294,6 +299,7 @@ pub(crate) struct EncodeConfigImpl {
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub(crate) lossless: bool,
     pub(crate) progressive: bool,
+    pub(crate) patches: bool,
     /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
     pub(crate) progressive_passes: Option<u32>,
     /// Explicit per-pass shift schedule (see `EncodeConfig::progressive_shifts`).
@@ -325,6 +331,7 @@ impl Default for EncodeConfig {
             orientation: Orientation::Normal,
             lossless: false,
             progressive: false,
+            patches: false,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -350,6 +357,7 @@ impl Default for EncodeConfigImpl {
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             progressive: false,
+            patches: false,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -416,6 +424,11 @@ impl EncodeConfigImpl {
         self
     }
 
+    pub(crate) fn with_patches(mut self, patches: bool) -> Self {
+        self.patches = patches;
+        self
+    }
+
     pub(crate) fn with_progressive_passes(mut self, passes: Option<u32>) -> Self {
         self.progressive_passes = passes;
         self
@@ -429,6 +442,7 @@ impl EncodeConfigImpl {
     /// Copy all lossy-progressive settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
         self.with_progressive(config.progressive)
+            .with_patches(config.patches)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
@@ -564,6 +578,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Enable exact patch-dictionary matching with full rate comparison.
+    pub fn with_patches(mut self, patches: bool) -> Self {
+        self.patches = patches;
+        self
+    }
+
     /// Set the worker-thread count (see `EncodeConfig::num_threads`).
     pub fn with_num_threads(mut self, n: usize) -> Self {
         self.num_threads = n;
@@ -631,6 +651,7 @@ pub fn encode_image(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
+                .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
@@ -705,6 +726,7 @@ pub fn encode_image_with_alpha(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_progressive(config.progressive)
+                .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
@@ -912,6 +934,7 @@ fn encode_gray_impl(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
                 .with_grayscale(true)
+                .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
@@ -1149,6 +1172,7 @@ fn encode_gray_high_depth_impl(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
                 .with_grayscale(true)
+                .with_patches(config.patches)
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
@@ -1230,6 +1254,7 @@ fn encode_high_depth_rgba(
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(config.lossless)
                 .with_bits_per_sample(bps)
+                .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
                 .with_orientation(config.orientation)
@@ -1690,6 +1715,7 @@ pub(crate) fn encode_with_config(
         input,
         config.alpha.as_ref(),
         &coeff_shifts,
+        config.patches,
         config.num_threads.max(1),
         config.speed,
         config.boost.as_ref(),
@@ -1857,6 +1883,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         alpha_plane.as_ref(),
         eff_bits,
         config.progressive,
+        config.patches,
         num_color,
         config.speed,
         config.num_threads,
@@ -2246,6 +2273,47 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn lossy_patches_are_rate_safe() {
+        let plain = encode_image(&rgb8(), W, H, &lossy()).unwrap();
+        let checked = encode_image(&rgb8(), W, H, &lossy().with_patches(true)).unwrap();
+        assert!(checked.len() <= plain.len());
+    }
+
+    #[test]
+    fn lossy_patches_reduce_repeated_regions() {
+        const PW: usize = 256;
+        const PH: usize = 256;
+        let mut state = 0x89ab_cdefu32;
+        let mut pixels = vec![0u8; PW * PH * 3];
+        for sample in &mut pixels {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = (state >> 24) as u8;
+        }
+        let tile: Vec<u8> = (0..16)
+            .flat_map(|y| pixels[(y * PW * 3)..(y * PW * 3 + 48)].iter().copied())
+            .collect();
+        for ty in 0..16 {
+            for tx in 0..16 {
+                if (tx + ty) % 2 != 0 {
+                    continue;
+                }
+                for y in 0..16 {
+                    let dst = ((ty * 16 + y) * PW + tx * 16) * 3;
+                    pixels[dst..dst + 48].copy_from_slice(&tile[y * 48..(y + 1) * 48]);
+                }
+            }
+        }
+        let plain = encode_image(&pixels, PW, PH, &lossy()).unwrap();
+        let patched = encode_image(&pixels, PW, PH, &lossy().with_patches(true)).unwrap();
+        assert!(
+            patched.len() < plain.len(),
+            "lossy patches should win on repeated complex regions: {} >= {}",
+            patched.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
     fn rgb8_slow_dct64_lossy() {
         const SIDE: usize = 64;
         let pixels: Vec<u8> = (0..SIDE * SIDE * 3).map(|i| (i % 251) as u8).collect();
@@ -2273,6 +2341,55 @@ mod encode_smoke_tests {
     #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
+    }
+
+    #[test]
+    fn rgb8_lossless_patches_reduce_repeated_tiles() {
+        const PW: usize = 96;
+        const PH: usize = 64;
+        let mut pixels = vec![0u8; PW * PH * 3];
+        for y in 0..PH {
+            for x in 0..PW {
+                let tx = x % 16;
+                let ty = y % 16;
+                let p = (y * PW + x) * 3;
+                pixels[p] = (tx * 13 + ty * 3) as u8;
+                pixels[p + 1] = (tx * 5 + ty * 11) as u8;
+                pixels[p + 2] = (tx * 7 + ty * 9) as u8;
+            }
+        }
+        let plain = encode_image(&pixels, PW, PH, &lossless()).unwrap();
+        let patched = encode_image(&pixels, PW, PH, &lossless().with_patches(true)).unwrap();
+        assert!(
+            patched.len() < plain.len(),
+            "patch dictionary should reduce a repeated-tile image: {} >= {}",
+            patched.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn rgb8_lossless_patches_fall_back_when_rate_is_worse() {
+        const PW: usize = 64;
+        const PH: usize = 64;
+        let mut state = 0x1234_5678u32;
+        let mut pixels = vec![0u8; PW * PH * 3];
+        for sample in &mut pixels {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = (state >> 24) as u8;
+        }
+        for y in 0..16 {
+            for x in 0..48 {
+                let pixel = (y * PW + x) * 3;
+                for sample in &mut pixels[pixel..pixel + 3] {
+                    *sample = 0;
+                }
+            }
+        }
+
+        let plain = encode_image(&pixels, PW, PH, &lossless()).unwrap();
+        let checked = encode_image(&pixels, PW, PH, &lossless().with_patches(true)).unwrap();
+        assert_eq!(checked, plain, "a losing patch candidate must be discarded");
     }
 
     #[test]

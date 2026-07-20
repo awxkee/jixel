@@ -12,7 +12,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Screenshot 2026-07-18 at 16.09.09.png")).unwrap();
+    let image = image::open(Path::new("./assets/digital_art_portrait.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
@@ -30,6 +30,7 @@ fn main() {
                 .with_lossless(false)
                 .with_quality(90.)
                 .with_progressive(false)
+                .with_patches(false)
                 .with_speed(Speed::Slow)
                 .with_num_threads(
                     available_parallelism()
@@ -48,22 +49,16 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(true)
+            .with_lossless(false)
             .with_quality(80.)
             .with_speed(Speed::Slow)
             .with_progressive(false)
+            .with_patches(false)
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");
 
-    let fs_read = fs::read("./assets/cityscape2_small.jpg").unwrap();
-    let reencoded = jixel::encode_jpeg_lossless_with_config(
-        &fs_read,
-        &JpegTranscodeConfig::default().with_jpeg_reconstruction(false),
-    )
-    .unwrap();
-    std::fs::write(&"lossless_jpeg.jxl", &reencoded).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;
     // let img10 = vec![0u8; width * height * 3];

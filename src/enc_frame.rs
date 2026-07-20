@@ -37,6 +37,7 @@ use crate::entropy::{
     EntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
 use crate::image::{Image3B, Image3F, Image3S, Rect};
+use crate::patches::{PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
 use crate::quant_weights::DequantMatrices;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
@@ -417,21 +418,116 @@ pub(crate) fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
     }
 }
 
+fn write_frame_dimension(value: usize, w: &mut BitWriter) {
+    let value = value as u64;
+    if value < 256 {
+        w.write(2, 0);
+        w.write(8, value);
+    } else if value < 2304 {
+        w.write(2, 1);
+        w.write(11, value - 256);
+    } else if value < 18688 {
+        w.write(2, 2);
+        w.write(14, value - 2304);
+    } else {
+        w.write(2, 3);
+        w.write(30, value - 18688);
+    }
+}
+
+fn write_frame_header_kind(
+    x_qm_scale: u32,
+    epf_iters: u32,
+    gab_enabled: bool,
+    has_alpha: bool,
+    coeff_shifts: &[u32],
+    kind: VarDctFrameKind<'_>,
+    w: &mut BitWriter,
+) {
+    match kind {
+        VarDctFrameKind::Regular => write_frame_header(
+            x_qm_scale,
+            epf_iters,
+            gab_enabled,
+            has_alpha,
+            coeff_shifts,
+            false,
+            w,
+        ),
+        VarDctFrameKind::Patched(_) => write_frame_header(
+            x_qm_scale,
+            epf_iters,
+            gab_enabled,
+            has_alpha,
+            coeff_shifts,
+            true,
+            w,
+        ),
+        VarDctFrameKind::ReferenceOnly { width, height } => {
+            w.write(1, 0); // not all default
+            w.write(2, 0b10); // reference-only frame
+            w.write(1, 0); // VarDCT
+            w.write(2, 0); // flags = 0
+            w.write(2, 0); // upsampling = 1
+            if has_alpha {
+                w.write(2, 0); // extra-channel upsampling = 1
+            }
+            w.write(3, x_qm_scale as u64);
+            w.write(3, 2); // b_qm_scale
+            // Reference-only frames omit Passes and use the implicit one pass.
+            w.write(1, 1); // custom size
+            write_frame_dimension(width, w);
+            write_frame_dimension(height, w);
+            w.write(2, PATCH_REF_ID as u64);
+            w.write(1, 1); // save_before_color_transform
+            w.write(2, 0); // empty name
+            write_loop_filter(epf_iters, gab_enabled, w);
+            w.write(2, 0); // no frame-header extensions
+        }
+    }
+}
+
+fn write_loop_filter(epf_iters: u32, gab_enabled: bool, w: &mut BitWriter) {
+    if epf_iters == 2 && gab_enabled {
+        w.write(1, 1); // default loop filter (gab=1, epf=2)
+    } else {
+        w.write(1, 0); // not default
+        if gab_enabled {
+            w.write(1, 1); // gaborish enabled
+            w.write(1, 0); // gab_custom = false (use defaults)
+        } else {
+            w.write(1, 0); // no gaborish
+        }
+        w.write(2, epf_iters as u64);
+        if epf_iters > 0 {
+            w.write(1, 0); // default epf sharpness
+            w.write(1, 0); // default epf weights
+            w.write(1, 0); // default epf sigma
+        }
+        w.write(2, 0); // no loop filter extensions
+    }
+}
+
 fn write_frame_header(
     x_qm_scale: u32,
     epf_iters: u32,
     gab_enabled: bool,
     has_alpha: bool,
     coeff_shifts: &[u32],
+    has_patches: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // flags = 0: leave decoder-side adaptive DC smoothing enabled, matching
-    // libjxl's normal lossy path (the skip flag is set only for JPEG
-    // transcoding there). The decoder denoises the DC plane for free.
-    w.write(2, 0);
+    // Keep decoder-side adaptive DC smoothing enabled. The only optional flag
+    // here is kPatches; the skip-smoothing flag remains clear.
+    if has_patches {
+        w.write(2, 1); // U64 selector for values 1..=16
+        w.write(4, 1); // flags = kPatches (2), encoded as value - 1
+    } else {
+        w.write(2, 0);
+    }
     w.write(2, 0); // no upsampling
 
     // Per-extra-channel upsampling. Same u2S(1,2,4,8) code, default 1:
@@ -490,24 +586,7 @@ fn write_frame_header(
 
     w.write(1, 1); // last frame
     w.write(2, 0); // no name
-    if epf_iters == 2 && gab_enabled {
-        w.write(1, 1); // default loop filter (gab=1, epf=2)
-    } else {
-        w.write(1, 0); // not default
-        if gab_enabled {
-            w.write(1, 1); // gaborish enabled
-            w.write(1, 0); // gab_custom = false (use defaults)
-        } else {
-            w.write(1, 0); // no gaborish
-        }
-        w.write(2, epf_iters as u64);
-        if epf_iters > 0 {
-            w.write(1, 0); // default epf sharpness
-            w.write(1, 0); // default epf weights
-            w.write(1, 0); // default epf sigma
-        }
-        w.write(2, 0); // no loop filter extensions
-    }
+    write_loop_filter(epf_iters, gab_enabled, w);
     w.write(2, 0); // no frame header extensions
 }
 
@@ -687,8 +766,94 @@ pub(crate) fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWr
     writer.append_byte_aligned(sections);
 }
 
+fn zero_alpha_for_lossy(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
+    match alpha {
+        Some(AlphaPlane::U8(_)) => Some(AlphaPlane::U8(vec![0; pixels])),
+        Some(AlphaPlane::U16 { bits, .. }) => Some(AlphaPlane::U16 {
+            data: vec![0; pixels],
+            bits: *bits,
+        }),
+        Some(AlphaPlane::F32(_)) => Some(AlphaPlane::F32(vec![0; pixels])),
+        None => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame(
+    distance: f32,
+    linear: &Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    patches: bool,
+    num_threads: usize,
+    speed: crate::Speed,
+    boost: Option<&crate::dark_aq::DarkAqConfig>,
+    writer: &mut BitWriter,
+) {
+    if patches && let Some(plan) = find_lossy_patches(linear) {
+        let mut regular_writer = BitWriter::new();
+        encode_frame_core(
+            distance,
+            linear,
+            alpha,
+            coeff_shifts,
+            num_threads,
+            speed,
+            boost,
+            VarDctFrameKind::Regular,
+            &mut regular_writer,
+        );
+
+        let atlas_alpha =
+            zero_alpha_for_lossy(alpha, plan.atlas.xsize().saturating_mul(plan.atlas.ysize()));
+        let mut patched_writer = BitWriter::new();
+        encode_frame_core(
+            distance,
+            &plan.atlas,
+            atlas_alpha.as_ref(),
+            &[0],
+            num_threads,
+            speed,
+            boost,
+            VarDctFrameKind::ReferenceOnly {
+                width: plan.atlas.xsize(),
+                height: plan.atlas.ysize(),
+            },
+            &mut patched_writer,
+        );
+        encode_frame_core(
+            distance,
+            &plan.base,
+            alpha,
+            coeff_shifts,
+            num_threads,
+            speed,
+            boost,
+            VarDctFrameKind::Patched(&plan.references),
+            &mut patched_writer,
+        );
+        if patched_writer.bits_written() < regular_writer.bits_written() {
+            writer.append(&patched_writer);
+        } else {
+            writer.append(&regular_writer);
+        }
+        return;
+    }
+    encode_frame_core(
+        distance,
+        linear,
+        alpha,
+        coeff_shifts,
+        num_threads,
+        speed,
+        boost,
+        VarDctFrameKind::Regular,
+        writer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_core(
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
@@ -696,6 +861,7 @@ pub(crate) fn encode_frame(
     num_threads: usize,
     speed: crate::Speed,
     boost: Option<&crate::dark_aq::DarkAqConfig>,
+    frame_kind: VarDctFrameKind<'_>,
     writer: &mut BitWriter,
 ) {
     let ctx = EncodingContext::new();
@@ -840,6 +1006,9 @@ pub(crate) fn encode_frame(
     }
 
     // Phase 4: write DC global with adaptive DC code.
+    if let VarDctFrameKind::Patched(references) = frame_kind {
+        crate::enc_lossless::write_patch_dictionary(references, alpha.is_some(), &mut sections[0]);
+    }
     write_dc_global(
         &distp,
         dim.num_dc_groups,
@@ -962,12 +1131,13 @@ pub(crate) fn encode_frame(
         }
     }
 
-    write_frame_header(
+    write_frame_header_kind(
         distp.x_qm_scale,
         distp.epf_iters,
         distp.gab_enabled,
         alpha.is_some(),
         coeff_shifts,
+        frame_kind,
         writer,
     );
     combine_sections(&mut sections, writer);
