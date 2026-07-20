@@ -480,7 +480,101 @@ fn lossless_tls_scratch_capacity() -> usize {
         + crate::entropy::huffman_tree_scratch_capacity()
 }
 
+fn zero_alpha_like(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
+    match alpha {
+        Some(AlphaPlane::U8(_)) => Some(AlphaPlane::U8(vec![0; pixels])),
+        Some(AlphaPlane::U16 { bits, .. }) => Some(AlphaPlane::U16 {
+            data: vec![0; pixels],
+            bits: *bits,
+        }),
+        Some(AlphaPlane::F32(_)) => Some(AlphaPlane::F32(vec![0; pixels])),
+        None => None,
+    }
+}
+
 pub(crate) fn encode_frame_lossless(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    max_bits: u32,
+    progressive: bool,
+    patches: bool,
+    num_color: usize,
+    speed: crate::Speed,
+    num_threads: usize,
+    writer: &mut BitWriter,
+) {
+    if patches
+        && num_color == 3
+        && let Some(plan) = find_lossless_patches(linear)
+    {
+        // Patches change prediction, LZ77, entropy histograms, and add both a
+        // reference-only frame and a dictionary. Their true cost cannot be
+        // inferred reliably from covered pixel area, so encode both complete
+        // alternatives and select by their final byte-aligned bit count.
+        let mut regular_writer = BitWriter::new();
+        encode_frame_lossless_core(
+            linear,
+            alpha,
+            max_bits,
+            progressive,
+            num_color,
+            speed,
+            num_threads,
+            ModularFrameKind::Regular,
+            &mut regular_writer,
+        );
+
+        let mut patched_writer = BitWriter::new();
+        let atlas_alpha =
+            zero_alpha_like(alpha, plan.atlas.xsize().saturating_mul(plan.atlas.ysize()));
+        encode_frame_lossless_core(
+            &plan.atlas,
+            atlas_alpha.as_ref(),
+            max_bits,
+            false,
+            num_color,
+            speed,
+            num_threads,
+            ModularFrameKind::ReferenceOnly {
+                width: plan.atlas.xsize(),
+                height: plan.atlas.ysize(),
+            },
+            &mut patched_writer,
+        );
+        encode_frame_lossless_core(
+            &plan.base,
+            alpha,
+            max_bits,
+            false,
+            num_color,
+            speed,
+            num_threads,
+            ModularFrameKind::Patched(&plan.references),
+            &mut patched_writer,
+        );
+
+        if patched_writer.bits_written() < regular_writer.bits_written() {
+            writer.append(&patched_writer);
+        } else {
+            writer.append(&regular_writer);
+        }
+        return;
+    }
+    encode_frame_lossless_core(
+        linear,
+        alpha,
+        max_bits,
+        progressive,
+        num_color,
+        speed,
+        num_threads,
+        ModularFrameKind::Regular,
+        writer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_lossless_core(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     max_bits: u32,
@@ -488,6 +582,7 @@ pub(crate) fn encode_frame_lossless(
     num_color: usize,
     speed: crate::Speed,
     num_threads: usize,
+    frame_kind: ModularFrameKind<'_>,
     writer: &mut BitWriter,
 ) {
     let _scratch_guard = LosslessScratchGuard;
@@ -520,7 +615,8 @@ pub(crate) fn encode_frame_lossless(
     // the image as a small palette meta-channel + an index channel, which is a
     // large win for low-color/graphic content. Falls through to the normal
     // RCT+predictor path when it doesn't apply.
-    if single_group
+    if frame_kind.is_regular()
+        && single_group
         && num_color == 3
         && try_encode_palette_single_group(
             linear,
@@ -539,7 +635,8 @@ pub(crate) fn encode_frame_lossless(
     // Large graphics often exceed 256 colors globally while each 256x256 group
     // remains low-color. Encode qualifying RGB/RGBA groups through an exact
     // local Palette transform and leave high-color groups on the normal path.
-    if !single_group
+    if frame_kind.is_regular()
+        && !single_group
         && num_color == 3
         && try_encode_local_palette_multi_group(
             linear,
@@ -560,7 +657,7 @@ pub(crate) fn encode_frame_lossless(
     }
 
     // Stage-2 progressive lossless (opt-in): Squeeze pyramid (RGB + optional alpha).
-    if single_group && num_color == 3 && progressive {
+    if frame_kind.is_regular() && single_group && num_color == 3 && progressive {
         encode_squeeze_single_group(
             linear,
             alpha,
@@ -578,7 +675,8 @@ pub(crate) fn encode_frame_lossless(
     // Progressive multi-group (Stage A: all squeezed channels fit the global
     // stream). Falls through to the non-progressive path if a channel is still
     // larger than a group (Stage B).
-    if !single_group
+    if frame_kind.is_regular()
+        && !single_group
         && num_color == 3
         && progressive
         && encode_squeeze_multigroup(
@@ -635,7 +733,7 @@ pub(crate) fn encode_frame_lossless(
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
-    if adaptive_search && num_color == 3 {
+    if frame_kind.is_regular() && adaptive_search && num_color == 3 {
         if single_group {
             if try_encode_context_tree_single_group(
                 linear,
@@ -672,11 +770,14 @@ pub(crate) fn encode_frame_lossless(
         wp_params = WpParams::DEFAULT;
     }
 
-    write_frame_header_modular(alpha.is_some(), writer);
+    write_frame_header_modular_kind(alpha.is_some(), frame_kind, writer);
 
     if single_group {
         // Single section: GroupHeader + local tree + pixel histograms + pixels.
         let mut section = BitWriter::new();
+        if let ModularFrameKind::Patched(references) = frame_kind {
+            write_patch_dictionary(references, alpha.is_some(), &mut section);
+        }
         // 1 bit: dc_quant all_default = 1
         section.write(1, 1);
         // 1 bit: has_tree = 0  (no global tree; the local tree lives in the GroupHeader).
@@ -775,6 +876,9 @@ pub(crate) fn encode_frame_lossless(
         let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol, speed == crate::Speed::Slow);
 
         // ----- Section 0: DC global -----
+        if let ModularFrameKind::Patched(references) = frame_kind {
+            write_patch_dictionary(references, alpha.is_some(), &mut sections[0]);
+        }
         sections[0].write(1, 1); // dc_quant all_default = 1
         sections[0].write(1, 1); // has_tree = 1
         write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut sections[0]);
@@ -831,11 +935,79 @@ pub(crate) fn encode_frame_lossless(
     }
 }
 
+fn write_u64(value: u64, w: &mut BitWriter) {
+    match value {
+        0 => w.write(2, 0),
+        1..=16 => {
+            w.write(2, 1);
+            w.write(4, value - 1);
+        }
+        17..=272 => {
+            w.write(2, 2);
+            w.write(8, value - 17);
+        }
+        _ => unreachable!("lossless frame flags fit the short U64 form"),
+    }
+}
+
+fn write_frame_dimension(value: usize, w: &mut BitWriter) {
+    let value = value as u64;
+    if value < 256 {
+        w.write(2, 0);
+        w.write(8, value);
+    } else if value < 2304 {
+        w.write(2, 1);
+        w.write(11, value - 256);
+    } else if value < 18688 {
+        w.write(2, 2);
+        w.write(14, value - 2304);
+    } else {
+        w.write(2, 3);
+        w.write(30, value - 18688);
+    }
+}
+
+fn write_frame_header_modular_kind(has_alpha: bool, kind: ModularFrameKind<'_>, w: &mut BitWriter) {
+    match kind {
+        ModularFrameKind::Regular => write_frame_header_modular(has_alpha, w),
+        ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, w),
+        ModularFrameKind::ReferenceOnly { width, height } => {
+            w.write(1, 0); // all_default = false
+            w.write(2, 0b10); // reference-only frame
+            w.write(1, 1); // Modular
+            write_u64(0, w); // flags
+            w.write(1, 0); // color transform = None
+            w.write(2, 0); // upsampling = 1
+            if has_alpha {
+                w.write(2, 0); // extra-channel upsampling = 1
+            }
+            w.write(2, 1); // group_size_shift = 1
+            // Reference-only frames do not serialize Passes.
+            w.write(1, 1); // custom size
+            write_frame_dimension(width, w);
+            write_frame_dimension(height, w);
+            // No blending and no is_last for reference-only frames.
+            w.write(2, PATCH_REF_ID as u64); // save_as_reference = 3
+            w.write(1, 1); // save_before_color_transform = true
+            w.write(2, 0); // empty name
+            w.write(1, 0); // loop filter not all-default
+            w.write(1, 0); // no gaborish
+            w.write(2, 0); // no EPF
+            w.write(2, 0); // no loop-filter extensions
+            w.write(2, 0); // no frame-header extensions
+        }
+    }
+}
+
 fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
+    write_frame_header_modular_flags(has_alpha, 0, w);
+}
+
+fn write_frame_header_modular_flags(has_alpha: bool, flags: u64, w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
-    w.write(2, 0b00); // flags = u64(0)
+    write_u64(flags, w);
     w.write(1, 0); // do_ycbcr = false   (xyb_encoded=0 so this is serialized)
     w.write(2, 0b00); // upsampling = 1
     if has_alpha {
@@ -855,6 +1027,53 @@ fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
     w.write(2, 0); // 0 EPF iters
     w.write(2, 0b00); // no LF extensions
     w.write(2, 0b00); // no FH extensions
+}
+
+pub(crate) fn write_patch_dictionary(
+    references: &[PatchReference],
+    has_alpha: bool,
+    w: &mut BitWriter,
+) {
+    const NUM_REF: u32 = 0;
+    const REFERENCE_FRAME: u32 = 1;
+    const PATCH_SIZE: u32 = 2;
+    const REF_POSITION: u32 = 3;
+    const POSITION: u32 = 4;
+    const BLEND_MODE: u32 = 5;
+    const OFFSET: u32 = 6;
+    const COUNT: u32 = 7;
+
+    let mut tokens = Vec::new();
+    tokens.push(Token::new(NUM_REF, references.len() as u32));
+    for reference in references {
+        tokens.push(Token::new(REFERENCE_FRAME, PATCH_REF_ID));
+        tokens.push(Token::new(REF_POSITION, reference.atlas_x as u32));
+        tokens.push(Token::new(REF_POSITION, reference.atlas_y as u32));
+        tokens.push(Token::new(PATCH_SIZE, (PATCH_TILE - 1) as u32));
+        tokens.push(Token::new(PATCH_SIZE, (PATCH_TILE - 1) as u32));
+        tokens.push(Token::new(COUNT, (reference.positions.len() - 1) as u32));
+        for (i, &(x, y)) in reference.positions.iter().enumerate() {
+            if i == 0 {
+                tokens.push(Token::new(POSITION, x as u32));
+                tokens.push(Token::new(POSITION, y as u32));
+            } else {
+                let (px, py) = reference.positions[i - 1];
+                tokens.push(Token::new(OFFSET, pack_signed(x as i32 - px as i32)));
+                tokens.push(Token::new(OFFSET, pack_signed(y as i32 - py as i32)));
+            }
+            tokens.push(Token::new(BLEND_MODE, 1)); // color = Replace
+            if has_alpha {
+                tokens.push(Token::new(BLEND_MODE, 0)); // alpha = None
+            }
+        }
+    }
+    let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS);
+    let code_ref = code.as_ref();
+    w.write(1, 0); // patch dictionary entropy stream has no LZ77
+    write_entropy_code(&code_ref, w);
+    for token in tokens {
+        write_token(token, &code_ref, w);
+    }
 }
 
 fn write_modular_transforms(nb_chans: usize, w: &mut BitWriter) {
@@ -2865,9 +3084,12 @@ use crate::entropy::{
     OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
 use crate::image::Image3Si;
+use crate::patches::{
+    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
+    find_lossless_patches,
+};
 use std::cell::RefCell;
 use std::sync::OnceLock;
-
 // ---------------------------------------------------------------------------
 // Tree writing (balanced N-leaf, Gradient predictor).
 //
