@@ -75,6 +75,78 @@ pub(crate) static K_BLOCK_CONTEXT_MAP: [u8; 81] = [
     0, 0, 0, 0, 3, 3, 3, 0, 0, 0, 0, 0, 0,
 ];
 
+static K_LARGE_TRANSFORM_CONTEXT_MAP: [u8; 39] = [
+    0, 0, 0, 4, 1, 1, 4, 4, 4, 4, 4, 4, 4, // Y
+    2, 2, 2, 4, 3, 3, 4, 4, 4, 4, 4, 4, 4, // X
+    2, 2, 2, 4, 3, 3, 4, 4, 4, 4, 4, 4, 4, // B
+];
+
+#[rustfmt::skip]
+static K_LARGE_TRANSFORM_BLOCK_CONTEXT_MAP: [u8; 81] = [
+    2, 0, 0, 2, 2, 4, 3, 3, 4, 4, 4, 4, 2, 2,
+    0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    0, 0, 0, 0, 0, 4, 1, 1, 4, 4, 4, 4, 0, 0,
+    0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    2, 0, 0, 2, 2, 4, 3, 3, 4, 4, 4, 4, 2, 2,
+    0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockContextModel {
+    Compact,
+    LargeTransform,
+}
+
+impl BlockContextModel {
+    #[inline]
+    pub(crate) const fn num_block_contexts(self) -> usize {
+        match self {
+            Self::Compact => 4,
+            Self::LargeTransform => 5,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn num_ac_contexts(self) -> usize {
+        self.num_block_contexts() * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT)
+    }
+
+    #[inline]
+    pub(crate) const fn context_map(self) -> &'static [u8; 39] {
+        match self {
+            Self::Compact => &K_COMPACT_BLOCK_CONTEXT_MAP,
+            Self::LargeTransform => &K_LARGE_TRANSFORM_CONTEXT_MAP,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn block_context(self, c: usize, ac_strategy_code: u8) -> u32 {
+        let map = match self {
+            Self::Compact => &K_BLOCK_CONTEXT_MAP,
+            Self::LargeTransform => &K_LARGE_TRANSFORM_BLOCK_CONTEXT_MAP,
+        };
+        map[c * K_NUM_AC_STRATEGY_CODES + ac_strategy_code as usize] as u32
+    }
+
+    #[inline]
+    pub(crate) fn non_zero_context(self, non_zeros: u32, block_ctx: u32) -> u32 {
+        let bucket = if non_zeros < 8 {
+            non_zeros
+        } else if non_zeros >= 64 {
+            36
+        } else {
+            4 + non_zeros / 2
+        };
+        bucket * self.num_block_contexts() as u32 + block_ctx
+    }
+
+    #[inline]
+    pub(crate) const fn zero_density_contexts_offset(self, block_ctx: u32) -> u32 {
+        self.num_block_contexts() as u32 * K_NON_ZERO_BUCKETS as u32
+            + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
+    }
+}
+
 #[inline]
 pub(crate) fn block_context(c: usize, ac_strategy_code: u8) -> u32 {
     K_BLOCK_CONTEXT_MAP[c * K_NUM_AC_STRATEGY_CODES + ac_strategy_code as usize] as u32
@@ -661,7 +733,10 @@ pub(crate) fn coeff_order_64x64() -> &'static [u16] {
 
 #[cfg(test)]
 mod tests {
-    use super::{K_COEFF_ORDER_64X32, K_COEFF_ORDER_64X64, block_context, coeff_order_64x64};
+    use super::{
+        BlockContextModel, K_COEFF_ORDER_64X32, K_COEFF_ORDER_64X64, K_NUM_AC_STRATEGY_CODES,
+        block_context, coeff_order_64x64,
+    };
 
     #[test]
     fn dct64_coefficient_order_is_static_permutation() {
@@ -744,6 +819,24 @@ mod tests {
             assert_eq!(block_context(0, code), 3);
             assert_eq!(block_context(1, code), 1);
             assert_eq!(block_context(2, code), 3);
+        }
+    }
+
+    #[test]
+    fn selectable_block_context_models_are_in_range() {
+        for model in [
+            BlockContextModel::Compact,
+            BlockContextModel::LargeTransform,
+        ] {
+            assert_eq!(
+                model.context_map().iter().copied().max().unwrap() as usize + 1,
+                model.num_block_contexts()
+            );
+            for c in 0..3 {
+                for strategy in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+                    assert!(model.block_context(c, strategy) < model.num_block_contexts() as u32);
+                }
+            }
         }
     }
 }

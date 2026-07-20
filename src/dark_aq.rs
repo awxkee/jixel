@@ -27,6 +27,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::adaptive_quant::{dirty_log1pf, fast_exp2};
+use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
 use std::cell::RefCell;
@@ -397,7 +398,7 @@ fn subblock_variances(tile: &[f32], pw: usize, w: usize, h: usize) -> [f32; 64] 
             for row in tile.chunks_exact(pw).skip(y0).take(block_height) {
                 for &v in &row[x0..x1] {
                     sum += v;
-                    sum2 += v * v;
+                    sum2 = fmla(v, v, sum2);
                     n += 1;
                 }
             }
@@ -712,11 +713,15 @@ mod tests {
             *value = (state >> 8) as f32 / (1u32 << 24) as f32;
         }
         for (h, w) in [(0, 0), (1, 1), (7, 9), (8, 8), (17, 31), (63, 64), (64, 64)] {
-            assert_eq!(
-                subblock_variances(&tile, 64, w, h),
-                reference(&tile, 64, w, h),
-                "shape {w}x{h}"
-            );
+            subblock_variances(&tile, 64, w, h)
+                .iter()
+                .zip(reference(&tile, 64, w, h).iter())
+                .for_each(|(&a, &b)| {
+                    assert!(
+                        (a - b).abs() < 1e-7,
+                        "Dark AQ reference failed with {a} and {b}"
+                    );
+                });
         }
     }
 

@@ -40,7 +40,7 @@ mod write;
 
 pub(crate) use ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, write_ans_tokens};
 pub(crate) use cluster::{cluster_histograms, cluster_histograms_refined};
-pub(crate) use entropy_code::{EntropyCode, OwnedEntropyCode};
+pub(crate) use entropy_code::{EntropyCode, FrozenTokenPrices, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;
 #[cfg(test)]
 pub(crate) use huffman_tree::huffman_tree_scratch_capacity;

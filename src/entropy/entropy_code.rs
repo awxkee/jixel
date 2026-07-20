@@ -26,10 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
-use super::ans::AnsEncSymbolInfo;
-use super::prefix_code::PrefixCode;
-use super::token::HybridUintConfig;
+use super::ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo};
+use super::prefix_code::{ALPHABET_SIZE, PrefixCode};
+use super::token::{HybridUintConfig, Token, uint_encode_with_config};
+use crate::adaptive_quant::dirty_log2f;
 
 pub(crate) struct EntropyCode<'a> {
     pub(crate) context_map: &'a [u8],
@@ -76,5 +76,52 @@ impl OwnedEntropyCode {
             ans_freqs: &self.ans_freqs,
             ans_symbols: &self.ans_symbols,
         }
+    }
+}
+
+pub(crate) struct FrozenTokenPrices {
+    context_map: Vec<u8>,
+    configs: Vec<HybridUintConfig>,
+    symbol_bits: Vec<[f32; ALPHABET_SIZE]>,
+}
+
+impl FrozenTokenPrices {
+    pub(crate) fn new(code: &OwnedEntropyCode) -> Self {
+        const UNSEEN_SYMBOL_BITS: f32 = 15.0;
+        let mut symbol_bits =
+            vec![[UNSEEN_SYMBOL_BITS; ALPHABET_SIZE]; code.hybrid_uint_configs.len()];
+        if code.use_prefix_code {
+            for (bits, prefix) in symbol_bits.iter_mut().zip(&code.prefix_codes) {
+                for (price, &depth) in bits.iter_mut().zip(&prefix.depths) {
+                    if depth != 0 {
+                        *price = if prefix.single_symbol {
+                            0.0
+                        } else {
+                            depth as f32
+                        };
+                    }
+                }
+            }
+        } else {
+            for (bits, freqs) in symbol_bits.iter_mut().zip(&code.ans_freqs) {
+                for (price, &freq) in bits.iter_mut().zip(freqs) {
+                    if freq != 0 {
+                        *price = ANS_LOG_TAB_SIZE as f32 - dirty_log2f(freq as f32);
+                    }
+                }
+            }
+        }
+        Self {
+            context_map: code.context_map.clone(),
+            configs: code.hybrid_uint_configs.clone(),
+            symbol_bits,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn token_bits(&self, token: Token) -> f32 {
+        let cluster = self.context_map[token.context as usize] as usize;
+        let (symbol, extra_bits, _) = uint_encode_with_config(token.value, self.configs[cluster]);
+        self.symbol_bits[cluster][symbol as usize] + extra_bits as f32
     }
 }

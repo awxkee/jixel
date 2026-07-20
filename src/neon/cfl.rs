@@ -30,6 +30,60 @@
 use std::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
+pub(crate) fn cfl_regression_neon(
+    y: &[f32; 64],
+    x: &[f32; 64],
+    b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+) -> [f32; 4] {
+    let inv_color = vdupq_n_f32(1.0 / 84.0);
+    let mut ca_x = vdupq_n_f32(0.0);
+    let mut cb_x = vdupq_n_f32(0.0);
+    let mut ca_b = vdupq_n_f32(0.0);
+    let mut cb_b = vdupq_n_f32(0.0);
+
+    let y_chunks = y.as_chunks::<4>().0;
+    let x_chunks = x.as_chunks::<4>().0;
+    let b_chunks = b.as_chunks::<4>().0;
+    let qm_x_chunks = qm_x.as_chunks::<4>().0;
+    let qm_b_chunks = qm_b.as_chunks::<4>().0;
+    for ((((y, x), b), qm_x), qm_b) in y_chunks
+        .iter()
+        .zip(x_chunks)
+        .zip(b_chunks)
+        .zip(qm_x_chunks)
+        .zip(qm_b_chunks)
+    {
+        let yv = unsafe { vld1q_f32(y.as_ptr()) };
+        let xv = unsafe { vld1q_f32(x.as_ptr()) };
+        let bv = unsafe { vld1q_f32(b.as_ptr()) };
+        let qx = unsafe { vld1q_f32(qm_x.as_ptr()) };
+        let qb = unsafe { vld1q_f32(qm_b.as_ptr()) };
+
+        let mx = vmulq_f32(yv, qx);
+        let sx = vmulq_f32(xv, qx);
+        let ax = vmulq_f32(inv_color, mx);
+        ca_x = vfmaq_f32(ca_x, ax, ax);
+        cb_x = vfmsq_f32(cb_x, ax, sx);
+
+        let mb = vmulq_f32(yv, qb);
+        let sb = vmulq_f32(bv, qb);
+        let ab = vmulq_f32(inv_color, mb);
+        let residual_b = vsubq_f32(mb, sb);
+        ca_b = vfmaq_f32(ca_b, ab, ab);
+        cb_b = vfmaq_f32(cb_b, ab, residual_b);
+    }
+
+    [
+        vaddvq_f32(ca_x),
+        vaddvq_f32(cb_x),
+        vaddvq_f32(ca_b),
+        vaddvq_f32(cb_b),
+    ]
+}
+
+#[target_feature(enable = "neon")]
 pub(crate) fn apply_cfl_neon(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());
     assert_eq!(x.len(), b.len());

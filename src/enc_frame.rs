@@ -27,9 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
+use crate::Speed;
+use crate::ac_context::{BlockContextModel, K_COMPACT_BLOCK_CONTEXT_MAP};
 use crate::bit_writer::BitWriter;
 use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, is_sub8_strategy};
+use crate::dct::fmla;
 use crate::enc_group::write_ac_group;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
@@ -38,7 +40,6 @@ use crate::entropy::{
 };
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::patches::{PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
-use crate::quant_weights::DequantMatrices;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
@@ -367,6 +368,168 @@ fn meta_entropy_cost(dc_data: &DcGroupData) -> u64 {
     bits
 }
 
+#[allow(clippy::too_many_arguments)]
+fn priced_cfl_tile_cost(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    dim: &ImageDim,
+    distp: &DistanceParams,
+    dc_data: &DcGroupData,
+    dc_gx: usize,
+    dc_gy: usize,
+    tx: usize,
+    ty: usize,
+    prices: &crate::entropy::FrozenTokenPrices,
+) -> f32 {
+    let tile_bx = tx * K_TILE_DIM_IN_BLOCKS;
+    let tile_by = ty * K_TILE_DIM_IN_BLOCKS;
+    let bw = K_TILE_DIM_IN_BLOCKS.min(dc_data.ac_strategy.xsize().saturating_sub(tile_bx));
+    let bh = K_TILE_DIM_IN_BLOCKS.min(dc_data.ac_strategy.ysize().saturating_sub(tile_by));
+    if bw == 0 || bh == 0 {
+        return 0.0;
+    }
+    let px = dc_gx * K_DC_GROUP_DIM + tile_bx * K_BLOCK_DIM;
+    let py = dc_gy * K_DC_GROUP_DIM + tile_by * K_BLOCK_DIM;
+    let pixel_w = (bw * K_BLOCK_DIM).min(dim.xsize.saturating_sub(px));
+    let pixel_h = (bh * K_BLOCK_DIM).min(dim.ysize.saturating_sub(py));
+    let stripe = build_stripe(
+        opsin,
+        px,
+        py,
+        pixel_w,
+        pixel_h,
+        bw * K_BLOCK_DIM,
+        bh * K_BLOCK_DIM,
+    );
+    let mut quant_dc = Image3S::new(bw, bh);
+    let mut num_nzeros = vec![Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS)];
+    let mut tokens = vec![Vec::new()];
+    let distortion = write_ac_group(
+        ctx,
+        &stripe,
+        Rect::new(tile_bx, tile_by, bw, bh),
+        distp.scale,
+        distp.scale_dc,
+        distp.distance,
+        distp.x_qm_scale,
+        dc_data,
+        &mut quant_dc,
+        tile_bx,
+        tile_by,
+        &mut num_nzeros,
+        &[0],
+        Some(prices),
+        true,
+        &mut tokens,
+    );
+    let token_bits: f32 = tokens[0].iter().map(|&t| prices.token_bits(t)).sum();
+    fmla(crate::enc_ac_strategy::RD_LAMBDA, token_bits, distortion)
+}
+
+fn cfl_candidates(current: i8, prediction: i32, no_cfl: i32) -> Vec<i8> {
+    let mut out = Vec::with_capacity(10);
+    for value in [
+        current as i32,
+        current as i32 - 4,
+        current as i32 - 2,
+        current as i32 - 1,
+        current as i32 + 1,
+        current as i32 + 2,
+        current as i32 + 4,
+        prediction,
+        0,
+        no_cfl,
+    ] {
+        let value = value.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_cfl_maps_with_prices(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    dim: &ImageDim,
+    distp: &DistanceParams,
+    dc_datas: &mut [DcGroupData],
+    group_coords: &[(usize, usize)],
+    prices: &crate::entropy::FrozenTokenPrices,
+) {
+    if distp.distance < 5.0 {
+        return;
+    }
+    for (dc_idx, dc_data) in dc_datas.iter_mut().enumerate() {
+        let (dc_gx, dc_gy) = group_coords[dc_idx];
+        for ty in 0..dc_data.ytox_map.ysize() {
+            for tx in 0..dc_data.ytox_map.xsize() {
+                for channel in 0..2 {
+                    let current = if channel == 0 {
+                        dc_data.ytox_map.row(ty)[tx]
+                    } else {
+                        dc_data.ytob_map.row(ty)[tx]
+                    };
+                    let map = if channel == 0 {
+                        &dc_data.ytox_map
+                    } else {
+                        &dc_data.ytob_map
+                    };
+                    let left = if tx > 0 {
+                        map.row(ty)[tx - 1] as i32
+                    } else if ty > 0 {
+                        map.row(ty - 1)[tx] as i32
+                    } else {
+                        0
+                    };
+                    let top = if ty > 0 {
+                        map.row(ty - 1)[tx] as i32
+                    } else {
+                        left
+                    };
+                    let top_left = if tx > 0 && ty > 0 {
+                        map.row(ty - 1)[tx - 1] as i32
+                    } else {
+                        left
+                    };
+                    let prediction = clamped_gradient(top, left, top_left);
+                    let no_cfl = if channel == 0 { 0 } else { -84 };
+                    let candidates = cfl_candidates(current, prediction, no_cfl);
+                    let mut best = current;
+                    let mut best_cost = priced_cfl_tile_cost(
+                        ctx, opsin, dim, distp, dc_data, dc_gx, dc_gy, tx, ty, prices,
+                    ) + crate::enc_ac_strategy::RD_LAMBDA
+                        * meta_entropy_cost(dc_data) as f32;
+                    for candidate in candidates {
+                        if candidate == current {
+                            continue;
+                        }
+                        if channel == 0 {
+                            dc_data.ytox_map.row_mut(ty)[tx] = candidate;
+                        } else {
+                            dc_data.ytob_map.row_mut(ty)[tx] = candidate;
+                        }
+                        let cost = priced_cfl_tile_cost(
+                            ctx, opsin, dim, distp, dc_data, dc_gx, dc_gy, tx, ty, prices,
+                        ) + crate::enc_ac_strategy::RD_LAMBDA
+                            * meta_entropy_cost(dc_data) as f32;
+                        if cost < best_cost {
+                            best = candidate;
+                            best_cost = cost;
+                        }
+                    }
+                    if channel == 0 {
+                        dc_data.ytox_map.row_mut(ty)[tx] = best;
+                    } else {
+                        dc_data.ytob_map.row_mut(ty)[tx] = best;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build and emit the context tree.
 pub(crate) fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
     // Build tokens with the patched value at index 1.
@@ -642,6 +805,7 @@ pub(crate) fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWr
 
 fn write_dc_global(
     distp: &DistanceParams,
+    block_context_model: BlockContextModel,
     num_dc_groups: usize,
     dc_code: &EntropyCode,
     alpha: Option<&AlphaPlane>,
@@ -661,9 +825,10 @@ fn write_dc_global(
         let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
         let empty_freqs: [Vec<u16>; 0] = [];
         let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+        let block_context_map = block_context_model.context_map();
         let cm_entropy = EntropyCode {
-            context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
-            num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
+            context_map: block_context_map,
+            num_contexts: block_context_map.len(),
             prefix_codes: &empty_codes,
             hybrid_uint_configs: &empty_configs,
             num_prefix_codes: 0,
@@ -780,26 +945,24 @@ fn zero_alpha_for_lossy(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<Alp
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame(
+    ctx: &EncodingContext,
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
     num_threads: usize,
-    speed: crate::Speed,
-    boost: Option<&crate::dark_aq::DarkAqConfig>,
     writer: &mut BitWriter,
 ) {
     if patches && let Some(plan) = find_lossy_patches(linear) {
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
+            ctx,
             distance,
             linear,
             alpha,
             coeff_shifts,
             num_threads,
-            speed,
-            boost,
             VarDctFrameKind::Regular,
             &mut regular_writer,
         );
@@ -808,13 +971,12 @@ pub(crate) fn encode_frame(
             zero_alpha_for_lossy(alpha, plan.atlas.xsize().saturating_mul(plan.atlas.ysize()));
         let mut patched_writer = BitWriter::new();
         encode_frame_core(
+            ctx,
             distance,
             &plan.atlas,
             atlas_alpha.as_ref(),
             &[0],
             num_threads,
-            speed,
-            boost,
             VarDctFrameKind::ReferenceOnly {
                 width: plan.atlas.xsize(),
                 height: plan.atlas.ysize(),
@@ -822,13 +984,12 @@ pub(crate) fn encode_frame(
             &mut patched_writer,
         );
         encode_frame_core(
+            ctx,
             distance,
             &plan.base,
             alpha,
             coeff_shifts,
             num_threads,
-            speed,
-            boost,
             VarDctFrameKind::Patched(&plan.references),
             &mut patched_writer,
         );
@@ -840,13 +1001,12 @@ pub(crate) fn encode_frame(
         return;
     }
     encode_frame_core(
+        ctx,
         distance,
         linear,
         alpha,
         coeff_shifts,
         num_threads,
-        speed,
-        boost,
         VarDctFrameKind::Regular,
         writer,
     );
@@ -854,20 +1014,17 @@ pub(crate) fn encode_frame(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_core(
+    ctx: &EncodingContext,
     distance: f32,
     linear: &Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     num_threads: usize,
-    speed: crate::Speed,
-    boost: Option<&crate::dark_aq::DarkAqConfig>,
     frame_kind: VarDctFrameKind<'_>,
     writer: &mut BitWriter,
 ) {
-    let ctx = EncodingContext::new();
     let dim = ImageDim::new(linear.xsize(), linear.ysize());
     let distp = compute_distance_params(distance);
-    let matrices = DequantMatrices::new();
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
@@ -899,18 +1056,7 @@ fn encode_frame_core(
     let setup_budget = num_threads.max(1).div_ceil(outer);
     let setups = crate::thread_pool::steal_map(group_coords.len(), num_threads, |i| {
         let (dc_gx, dc_gy) = group_coords[i];
-        setup_dc_group(
-            &ctx,
-            opsin,
-            &dim,
-            &distp,
-            &matrices,
-            dc_gx,
-            dc_gy,
-            setup_budget,
-            speed,
-            boost,
-        )
+        setup_dc_group(ctx, opsin, &dim, &distp, dc_gx, dc_gy, setup_budget)
     });
 
     let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(setups.len());
@@ -925,11 +1071,10 @@ fn encode_frame_core(
         let (dc_idx, gx, gy) = ac_tasks[t];
         let (dc_gx, dc_gy) = group_coords[dc_idx];
         let (p, local) = process_ac_group(
-            &ctx,
+            ctx,
             opsin,
             &dim,
             &distp,
-            &matrices,
             &dc_ref[dc_idx],
             num_passes,
             coeff_shifts,
@@ -937,6 +1082,7 @@ fn encode_frame_core(
             dc_gy,
             gx,
             gy,
+            None,
         );
         (dc_idx, gx, gy, p, local)
     });
@@ -945,6 +1091,52 @@ fn encode_frame_core(
     for (dc_idx, gx, gy, p, local) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
         all_pending.push(p);
+    }
+
+    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast {
+        let mut provisional_tokens = Vec::new();
+        for pg in &all_pending {
+            provisional_tokens.extend_from_slice(&pg.tokens[0]);
+        }
+        let provisional_code = crate::entropy::optimize_entropy_code_ac(
+            &provisional_tokens,
+            ctx.block_context_model.num_ac_contexts(),
+        );
+        let prices = crate::entropy::FrozenTokenPrices::new(&provisional_code);
+        refine_cfl_maps_with_prices(
+            ctx,
+            opsin,
+            &dim,
+            &distp,
+            &mut dc_datas,
+            &group_coords,
+            &prices,
+        );
+        let dc_ref = &dc_datas;
+        let refined = crate::thread_pool::steal_map(ac_tasks.len(), num_threads, |t| {
+            let (dc_idx, gx, gy) = ac_tasks[t];
+            let (dc_gx, dc_gy) = group_coords[dc_idx];
+            let (p, local) = process_ac_group(
+                ctx,
+                opsin,
+                &dim,
+                &distp,
+                &dc_ref[dc_idx],
+                num_passes,
+                coeff_shifts,
+                dc_gx,
+                dc_gy,
+                gx,
+                gy,
+                Some(&prices),
+            );
+            (dc_idx, gx, gy, p, local)
+        });
+        all_pending.clear();
+        for (dc_idx, gx, gy, p, local) in refined {
+            merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
+            all_pending.push(p);
+        }
     }
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
@@ -964,7 +1156,7 @@ fn encode_frame_core(
     let dc_code_owned = crate::entropy::optimize_entropy_code_ac(&all_dc_tokens, K_NUM_DC_CONTEXTS);
     let dc_code = dc_code_owned.as_ref();
 
-    let ac_num_contexts = K_NUM_AC_CONTEXTS + 1;
+    let ac_num_contexts = ctx.block_context_model.num_ac_contexts() + 1;
 
     // Per-pass aggregated tokens -> per-pass entropy code. Pass 0 (coarse) and
     // the residual pass(es) have very different token distributions, so a single
@@ -977,7 +1169,12 @@ fn encode_frame_core(
     }
     let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> = pass_tokens_agg
         .iter()
-        .map(|toks| crate::entropy::optimize_entropy_code_ac(toks, K_NUM_AC_CONTEXTS))
+        .map(|toks| {
+            crate::entropy::optimize_entropy_code_ac(
+                toks,
+                ctx.block_context_model.num_ac_contexts(),
+            )
+        })
         .collect();
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
@@ -1011,6 +1208,7 @@ fn encode_frame_core(
     }
     write_dc_global(
         &distp,
+        ctx.block_context_model,
         dim.num_dc_groups,
         &dc_code,
         alpha,
@@ -1149,8 +1347,8 @@ fn encode_frame_core(
 /// (0..num_groups); the section for (pass, group) is
 /// `2 + num_dc_groups + pass*num_groups + group_idx`.
 pub(crate) struct PendingAcGroup {
-    pub group_idx: usize,
-    pub tokens: Vec<Vec<Token>>,
+    pub(crate) group_idx: usize,
+    pub(crate) tokens: Vec<Vec<Token>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1161,12 +1359,9 @@ fn setup_dc_group(
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
-    matrices: &DequantMatrices,
     dc_gx: usize,
     dc_gy: usize,
     num_threads: usize,
-    speed: crate::Speed,
-    boost: Option<&crate::dark_aq::DarkAqConfig>,
 ) -> (DcGroupData, usize, usize) {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
@@ -1188,18 +1383,45 @@ fn setup_dc_group(
         distp.distance,
         1.0 / distp.scale,
     );
+
+    // Apply perceptual AQ before transform selection. Candidate costs and the
+    // reconstruction rerank must see the same content-adaptive quant field that
+    // will ultimately be used for coefficient coding. `fill_ac_strategy` applies
+    // the transform-size adjustment to this field after selection.
+    if let Some(boost) = ctx.boost.as_ref() {
+        crate::dark_aq::apply_boost(
+            boost,
+            opsin,
+            &mut dc_data.raw_quant_field,
+            dc_group_x0,
+            dc_group_y0,
+            distp.distance,
+        );
+    }
+
+    if ctx.speed != Speed::Fast {
+        crate::structure_aq::apply(
+            opsin,
+            &mut dc_data.raw_quant_field,
+            dc_group_x0,
+            dc_group_y0,
+            distp.distance,
+            ctx.dct8x8,
+        );
+    }
+
     // Compute the per-tile CfL slopes before strategy selection so candidate
     // costs use the same Y-to-X/Y-to-B subtraction as final coefficient coding.
     crate::enc_color_correlation::fill_cmap(
         ctx,
         opsin,
-        matrices,
         dc_group_x0 / K_BLOCK_DIM,
         dc_group_y0 / K_BLOCK_DIM,
         dc_group_xsize_blocks,
         dc_group_ysize_blocks,
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
+        distp.distance,
     );
     dc_data.sub8_benefit = crate::enc_ac_strategy::fill_ac_strategy(
         ctx,
@@ -1209,15 +1431,12 @@ fn setup_dc_group(
         distp.distance,
         distp.scale,
         distp.x_qm_scale,
-        matrices,
         &mut dc_data.raw_quant_field,
         &dc_data.ytox_map,
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
         num_threads,
-        speed,
     );
-
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
     // where DCT4X4, DCT4X8, or DCT8X4 wins the per-block RD comparison, but a
     // sparse set can disrupt prefix-code clustering of the (otherwise nearly
@@ -1254,20 +1473,6 @@ fn setup_dc_group(
         }
     }
 
-    // Optional superblock Variance-Boost + Dark-AQ (opt-in via JIXEL_BOOST). Runs
-    // after AC-strategy selection so it only reallocates quant magnitude and leaves
-    // transform choice untouched. Unset env ⇒ no-op, byte-identical field.
-    if let Some(boost) = boost {
-        crate::dark_aq::apply_boost(
-            boost,
-            opsin,
-            &mut dc_data.raw_quant_field,
-            dc_group_x0,
-            dc_group_y0,
-            distp.distance,
-        );
-    }
-
     (dc_data, dc_group_xsize_groups, dc_group_ysize_groups)
 }
 
@@ -1293,7 +1498,6 @@ fn process_ac_group(
     opsin: &Image3F,
     dim: &ImageDim,
     distp: &DistanceParams,
-    matrices: &DequantMatrices,
     dc_data: &DcGroupData,
     num_passes: usize,
     coeff_shifts: &[u32],
@@ -1301,6 +1505,7 @@ fn process_ac_group(
     dc_gy: usize,
     gx: usize,
     gy: usize,
+    rdoq_prices: Option<&crate::entropy::FrozenTokenPrices>,
 ) -> (PendingAcGroup, Image3S) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
     let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
@@ -1351,7 +1556,6 @@ fn process_ac_group(
             ctx,
             &stripe,
             stripe_brect,
-            matrices,
             distp.scale,
             distp.scale_dc,
             distp.distance,
@@ -1362,6 +1566,8 @@ fn process_ac_group(
             qorigin_y,
             &mut num_nzeros,
             coeff_shifts,
+            rdoq_prices,
+            false,
             &mut tokens,
         );
     }

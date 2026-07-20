@@ -12,6 +12,72 @@ fn store(values: &mut [f32; 4], vector: v128) {
     unsafe { v128_store(values.as_mut_ptr().cast(), vector) }
 }
 
+#[inline]
+#[target_feature(enable = "simd128")]
+fn reduce_transposed_4x4(a: v128, b: v128, c: v128, d: v128) -> [f32; 4] {
+    let ab_lo = i32x4_shuffle::<0, 4, 1, 5>(a, b);
+    let ab_hi = i32x4_shuffle::<2, 6, 3, 7>(a, b);
+    let cd_lo = i32x4_shuffle::<0, 4, 1, 5>(c, d);
+    let cd_hi = i32x4_shuffle::<2, 6, 3, 7>(c, d);
+    let lane_0 = i32x4_shuffle::<0, 1, 4, 5>(ab_lo, cd_lo);
+    let lane_1 = i32x4_shuffle::<2, 3, 6, 7>(ab_lo, cd_lo);
+    let lane_2 = i32x4_shuffle::<0, 1, 4, 5>(ab_hi, cd_hi);
+    let lane_3 = i32x4_shuffle::<2, 3, 6, 7>(ab_hi, cd_hi);
+    let sums = f32x4_add(f32x4_add(lane_0, lane_1), f32x4_add(lane_2, lane_3));
+    let mut out = [0.0f32; 4];
+    store(&mut out, sums);
+    out
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn cfl_regression_wasm(
+    y: &[f32; 64],
+    x: &[f32; 64],
+    b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+) -> [f32; 4] {
+    let inv_color = f32x4_splat(1.0 / 84.0);
+    let mut ca_x = f32x4_splat(0.0);
+    let mut cb_x = f32x4_splat(0.0);
+    let mut ca_b = f32x4_splat(0.0);
+    let mut cb_b = f32x4_splat(0.0);
+
+    let y_chunks = y.as_chunks::<4>().0;
+    let x_chunks = x.as_chunks::<4>().0;
+    let b_chunks = b.as_chunks::<4>().0;
+    let qm_x_chunks = qm_x.as_chunks::<4>().0;
+    let qm_b_chunks = qm_b.as_chunks::<4>().0;
+    for ((((y, x), b), qm_x), qm_b) in y_chunks
+        .iter()
+        .zip(x_chunks)
+        .zip(b_chunks)
+        .zip(qm_x_chunks)
+        .zip(qm_b_chunks)
+    {
+        let yv = unsafe { v128_load(y.as_ptr().cast()) };
+        let xv = unsafe { v128_load(x.as_ptr().cast()) };
+        let bv = unsafe { v128_load(b.as_ptr().cast()) };
+        let qx = unsafe { v128_load(qm_x.as_ptr().cast()) };
+        let qb = unsafe { v128_load(qm_b.as_ptr().cast()) };
+
+        let mx = f32x4_mul(yv, qx);
+        let sx = f32x4_mul(xv, qx);
+        let ax = f32x4_mul(inv_color, mx);
+        ca_x = f32x4_add(ca_x, f32x4_mul(ax, ax));
+        cb_x = f32x4_sub(cb_x, f32x4_mul(ax, sx));
+
+        let mb = f32x4_mul(yv, qb);
+        let sb = f32x4_mul(bv, qb);
+        let ab = f32x4_mul(inv_color, mb);
+        let residual_b = f32x4_sub(mb, sb);
+        ca_b = f32x4_add(ca_b, f32x4_mul(ab, ab));
+        cb_b = f32x4_add(cb_b, f32x4_mul(ab, residual_b));
+    }
+
+    reduce_transposed_4x4(ca_x, cb_x, ca_b, cb_b)
+}
+
 #[target_feature(enable = "simd128")]
 pub(crate) fn apply_cfl_wasm(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());

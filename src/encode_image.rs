@@ -32,6 +32,7 @@ use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
 use crate::enc_frame::encode_frame;
 use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
+use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, Image3Si};
 use crate::orientation::Orientation;
 use crate::{ColorEncoding, EncodeError};
@@ -318,7 +319,7 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) num_threads: usize,
     pub(crate) speed: Speed,
     /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
-    pub(crate) boost: Option<DarkAqConfig>,
+    pub(crate) dark_aq: Option<DarkAqConfig>,
 }
 
 impl Default for EncodeConfig {
@@ -367,7 +368,7 @@ impl Default for EncodeConfigImpl {
             linear_below: 0.0,
             num_threads: 1,
             speed: Speed::Fast,
-            boost: Some(DarkAqConfig::default()),
+            dark_aq: Some(DarkAqConfig::default()),
         }
     }
 }
@@ -450,7 +451,7 @@ impl EncodeConfigImpl {
     }
 
     pub(crate) fn with_boost(mut self, boost: Option<DarkAqConfig>) -> Self {
-        self.boost = boost;
+        self.dark_aq = boost;
         self
     }
 
@@ -1710,15 +1711,21 @@ pub(crate) fn encode_with_config(
         config.progressive_passes,
         config.progressive_shifts.as_deref(),
     );
+    let ctx = EncodingContext::new_for_image(
+        config.speed,
+        config.dark_aq,
+        input.xsize(),
+        input.ysize(),
+        distance,
+    );
     encode_frame(
+        &ctx,
         distance,
         input,
         config.alpha.as_ref(),
         &coeff_shifts,
         config.patches,
         config.num_threads.max(1),
-        config.speed,
-        config.boost.as_ref(),
         &mut w,
     );
     let codestream = w.into_bytes();

@@ -110,7 +110,7 @@ pub(crate) fn sse_and_rate_neon(
             let rate_mask = vandq_u32(nz, active);
 
             // Keep the count lane-local until the end. A horizontal reduction
-            // for every four coefficients was a sizeable part of this loop.
+            // for every four coefficients was a sizable part of this loop.
             nz_acc = vaddq_u32(nz_acc, vshrq_n_u32::<31>(rate_mask));
 
             // Quantized AC coefficients are commonly zero. Do not run the

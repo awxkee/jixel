@@ -37,7 +37,7 @@ mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use cfl::apply_cfl_avx2;
+pub(crate) use cfl::{apply_cfl_avx2, cfl_regression_avx2};
 pub(crate) use dct::{
     dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2,
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2,

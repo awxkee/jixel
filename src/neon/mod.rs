@@ -37,7 +37,7 @@ mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_neon;
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use cfl::apply_cfl_neon;
+pub(crate) use cfl::{apply_cfl_neon, cfl_regression_neon};
 pub(crate) use dct::{
     dct4x4_neon, dct4x8_neon, dct8x4_neon, dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon,
     dct16x32_neon, dct32x16_neon, dct32x32_neon, dct32x64_neon, dct64x32_neon, dct64x64_neon,
