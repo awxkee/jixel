@@ -88,6 +88,6 @@ pub use encode_image::{
     encode_image_with_alpha_16bit, encode_image_with_alpha_f16, encode_image_with_alpha_f32,
 };
 pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
-pub use jpeg::encode_jpeg_lossless;
+pub use jpeg::{JpegTranscodeConfig, encode_jpeg_lossless, encode_jpeg_lossless_with_config};
 pub use orientation::Orientation;
 pub use util::EncodeError;

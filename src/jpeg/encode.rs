@@ -58,7 +58,7 @@ use crate::ac_context::K_COEFF_ORDER_8X8;
 static CHANNEL_ORDER: [usize; 3] = [1, 0, 2];
 
 /// JXL channel (X, Y, B) to JPEG component (Cb, Y, Cr).
-static  JPEG_ORDER_YCBCR: [usize; 3] = [1, 0, 2];
+static JPEG_ORDER_YCBCR: [usize; 3] = [1, 0, 2];
 
 /// Geometry of the frame, in pixels, blocks and groups.
 struct Dim {
@@ -261,7 +261,7 @@ fn write_size_header(w: &mut BitWriter, xsize: usize, ysize: usize) {
 
 /// Writes `ImageMetadata`. The key choice is `xyb_encoded = 0`: the frame
 /// carries the JPEG's own channels, so the decoder must not undo XYB.
-fn write_image_metadata(w: &mut BitWriter) {
+fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>) {
     w.write(1, 0); // not all-default
     w.write(1, 0); // no extra fields (orientation, preview, animation)
     w.write(1, 0); // floating_point_sample = false
@@ -269,9 +269,22 @@ fn write_image_metadata(w: &mut BitWriter) {
     w.write(1, 1); // modular_16bit_buffer_sufficient
     w.write(2, 0); // num_extra_channels = 0
     w.write(1, 0); // xyb_encoded = 0
-    w.write(1, 1); // color encoding: all default (sRGB)
+    match icc {
+        // The JPEG's own profile, so the decoded pixels are interpreted the
+        // same way whether reconstruction data is kept.
+        Some(_) => crate::color_encoding::write_color_encoding_with_icc(
+            &crate::ColorEncoding::default(),
+            true,
+            false,
+            w,
+        ),
+        None => w.write(1, 1), // color encoding: all default (sRGB)
+    }
     w.write(2, 0); // no extensions
     w.write(1, 1); // CustomTransformData: all default
+    if let Some(icc) = icc {
+        crate::icc_codec::write_icc_stream(icc, w);
+    }
     w.zero_pad_to_byte();
 }
 
@@ -376,7 +389,10 @@ fn write_raw_quant_image(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE]) 
 }
 
 /// Encodes `jpg` as a complete JXL codestream.
-pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
+pub(crate) fn encode_jpeg_codestream(
+    jpg: &JpegData,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>, JpegError> {
     let ss = check_supported(jpg)?;
     let dim = Dim::new(jpg.width, jpg.height, &ss);
 
@@ -412,11 +428,11 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
                 let (cw, ch) = sizes[c];
                 for y in 0..ch {
                     let row = data.quant_dc.plane_row_mut(c, y);
-                    for x in 0..cw {
+                    for (x, dst) in row[..cw].iter_mut().enumerate() {
                         let block = ((by0 >> ss.vshift[c]) + y) * comp.width_in_blocks
                             + (bx0 >> ss.hshift[c])
                             + x;
-                        row[x] = comp.coeffs[block * DCT_BLOCK_SIZE] as i16;
+                        *dst = comp.coeffs[block * DCT_BLOCK_SIZE] as i16;
                     }
                 }
             }
@@ -520,7 +536,7 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
     out.write(8, 0xFF);
     out.write(8, 0x0A);
     write_size_header(&mut out, dim.xsize, dim.ysize);
-    write_image_metadata(&mut out);
+    write_image_metadata(&mut out, icc);
     write_frame_header(&mut out, &ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
@@ -549,7 +565,7 @@ fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> Vec<Vec<Token>> {
             let bh = GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
 
             let mut tokens: Vec<Token> = Vec::new();
-            // Non-zero counts of already-coded neighbours, used as context.
+            // Non-zero counts of already-coded neighbors, used as context.
             let mut num_nzeros = Image3B::new(GROUP_DIM_IN_BLOCKS, GROUP_DIM_IN_BLOCKS);
 
             for by in 0..bh {
@@ -567,9 +583,9 @@ fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> Vec<Vec<Token>> {
                         let bi = (abs_by >> vs) * comp.width_in_blocks + (abs_bx >> hs);
                         let src = &comp.coeffs[bi * DCT_BLOCK_SIZE..(bi + 1) * DCT_BLOCK_SIZE];
                         // JXL transposes the DCT relative to JPEG.
-                        for y in 0..8usize {
-                            for x in 0..8usize {
-                                block[x * 8 + y] = src[y * 8 + x];
+                        for (y, src_row) in src.as_chunks::<8>().0.iter().enumerate() {
+                            for (x, &src) in src_row.iter().enumerate() {
+                                block[x * 8 + y] = src;
                             }
                         }
 

@@ -737,7 +737,7 @@ pub(crate) fn encode_frame_lossless(
         let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
         let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
-        // Tokenize each AC group (sub-image-local neighbours, matching what
+        // Tokenize each AC group (sub-image-local neighbors, matching what
         // we'll emit below) and run LZ77 over each group's stream separately so
         // back-references stay within a group's modular sub-image.  Pool the
         // resulting LzToken streams to build a single global prefix code so

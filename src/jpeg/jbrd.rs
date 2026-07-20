@@ -164,13 +164,11 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         w.write(16, len as u64);
     }
 
-    // --- com_data ----------------------------------------------------------
     for com in &jpg.com_data {
         let len = checked_seg_len(com)?;
         w.write(16, len as u64);
     }
 
-    // --- quantization tables ----------------------------------------------
     // Only 1..=3 tables are usable: the encoding has a slot for 4 but the
     // decoder rejects it outright.
     let num_quant = jpg.quant.len();
@@ -187,7 +185,6 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         write_bool(&mut w, q.is_last);
     }
 
-    // --- components --------------------------------------------------------
     let ids: Vec<u32> = jpg.components.iter().map(|c| c.id).collect();
     let component_type = match ids.as_slice() {
         [1] => TYPE_GRAY,
@@ -219,7 +216,6 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         w.write(2, c.quant_idx as u64);
     }
 
-    // --- Huffman tables ----------------------------------------------------
     let num_huff = jpg.huffman_code.len() as u32;
     write_u32(
         &mut w,
@@ -272,7 +268,6 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         }
     }
 
-    // --- scans -------------------------------------------------------------
     // Note the field order: Al precedes Ah, and AC precedes DC, both inverted
     // relative to the JPEG marker layout.
     for scan in &jpg.scan_info {
@@ -308,13 +303,13 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
     }
 
     // A second pass over the same scans, after everything above.
-    static  COUNT_DIST: [Dist; 4] = [
+    static COUNT_DIST: [Dist; 4] = [
         Val(0),
         BitsOffset(2, 1),
         BitsOffset(4, 4),
         BitsOffset(16, 20),
     ];
-    const BLOCK_DIST: [Dist; 4] = [
+    static BLOCK_DIST: [Dist; 4] = [
         Val(0),
         BitsOffset(3, 1),
         BitsOffset(5, 9),
@@ -356,7 +351,6 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         }
     }
 
-    // --- inter-marker data sizes -------------------------------------------
     for chunk in &jpg.inter_marker_data {
         if chunk.len() > u16::MAX as usize {
             return Err(JpegError::UnsupportedMode("inter-marker chunk too large"));
@@ -379,7 +373,6 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         jpg.tail_data.len() as u32,
     )?;
 
-    // --- padding bits ------------------------------------------------------
     write_bool(&mut w, jpg.has_zero_padding_bit);
     if jpg.has_zero_padding_bit {
         if jpg.padding_bits.len() >= 1 << 24 {
