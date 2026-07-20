@@ -53,7 +53,12 @@ use std::sync::OnceLock;
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
 
 #[inline]
-fn predict_from_top_and_left(row_top: Option<&[u8]>, row: &[u8], x: usize, default_val: u8) -> u8 {
+pub(crate) fn predict_from_top_and_left(
+    row_top: Option<&[u8]>,
+    row: &[u8],
+    x: usize,
+    default_val: u8,
+) -> u8 {
     if x == 0 {
         match row_top {
             Some(t) => t[x],

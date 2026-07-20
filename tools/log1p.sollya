@@ -1,0 +1,45 @@
+prec = 200!;
+display = decimal!;
+
+// dirty_log1pf reduces 1+d = 2^n * (1+t), with t in [0, 1].
+// Approximate the remaining natural-log term directly, like log2p1.sollya:
+//
+//   ln(1+t) ~= t * P(t)
+//
+// The implementation obtains 1+t without division by replacing the exponent
+// bits of 1+d with 127. For n=0 it uses t=d directly, avoiding cancellation
+// for small log1p inputs.
+T = [2^-20; 1];
+g = log(1 + x) / x;
+
+p = fpminimax(
+    g,
+    6,
+    [|SG, SG, SG, SG, SG, SG, SG|],
+    T,
+    floating,
+    absolute
+);
+
+print("P(t) polynomial:");
+print(p);
+
+print("");
+print("Rust coefficients for ln(1+t) ~= t * P(t):");
+print("c0 = ", coeff(p, 0));
+print("c1 = ", coeff(p, 1));
+print("c2 = ", coeff(p, 2));
+print("c3 = ", coeff(p, 3));
+print("c4 = ", coeff(p, 4));
+print("c5 = ", coeff(p, 5));
+print("c6 = ", coeff(p, 6));
+
+print("");
+print("Absolute error estimate for final t*P(t):");
+err_abs = dirtyinfnorm(x * p - log(1 + x), [0; 1]);
+print(err_abs);
+
+print("");
+print("Relative error estimate, excluding the tiny center:");
+err_rel = dirtyinfnorm((x * p - log(1 + x)) / log(1 + x), T);
+print(err_rel);

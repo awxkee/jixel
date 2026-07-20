@@ -3,3 +3,5 @@
 /Cargo.lock
 findings
 in
+out_jpeg
+in_jpeg

@@ -69,6 +69,8 @@ pub enum EncodeError {
         got: usize,
     },
     UnsupportedColorSpace(ColorSpace),
+    /// The input JPEG could not be transcoded losslessly.
+    Jpeg(String),
 }
 
 impl fmt::Display for EncodeError {
@@ -107,12 +109,13 @@ impl fmt::Display for EncodeError {
             Self::BadBitDepth(b) => write!(f, "bits_per_sample {} not in 1..=16", b),
             Self::IccNotSupported => write!(
                 f,
-                "embedded ICC not yet supported; use an enumerated colour space"
+                "embedded ICC not yet supported; use an enumerated color space"
             ),
             Self::SizeOverflow => write!(f, "image size overflows usize"),
             Self::InputLength { expected, got } => {
                 write!(f, "input length {} != expected {}", got, expected)
             }
+            Self::Jpeg(msg) => write!(f, "JPEG transcoding failed: {msg}"),
             EncodeError::UnsupportedColorSpace(colorspace) => {
                 f.write_fmt(format_args!("unsupported color space: {:?}", colorspace))
             }
