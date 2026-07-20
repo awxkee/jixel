@@ -12,4 +12,8 @@ jixel = { path = ".." }
 name = "encode"
 path = "fuzz_targets/encode.rs"
 
+[[bin]]
+name = "transcode"
+path = "fuzz_targets/transcode.rs"
+
 [workspace]

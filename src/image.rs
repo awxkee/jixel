@@ -97,6 +97,18 @@ pub(crate) struct Image3<T> {
 }
 
 impl<T: Copy + Default> Image3<T> {
+    /// Builds an image whose planes have independent dimensions, as chroma
+    /// subsampling requires.
+    pub(crate) fn new_per_plane(sizes: [(usize, usize); 3]) -> Self {
+        Self {
+            planes: [
+                Plane::new(sizes[0].0, sizes[0].1),
+                Plane::new(sizes[1].0, sizes[1].1),
+                Plane::new(sizes[2].0, sizes[2].1),
+            ],
+        }
+    }
+
     pub(crate) fn new(xsize: usize, ysize: usize) -> Self {
         Self {
             planes: [

@@ -55,7 +55,7 @@ pub enum Primaries {
     /// For future use by ITU-T | ISO/IEC
     Reserved,
     /// Rec. ITU-R BT.709-6<br />
-    /// Rec. ITU-R BT.1361-0 conventional colour gamut system and extended colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 conventional color gamut system and extended color gamut system (historical)<br />
     /// IEC 61966-2-1 sRGB or sYCC IEC 61966-2-4<br />
     /// Society of Motion Picture and Television Engineers (MPTE) RP 177 (1993) Annex B<br />
     Bt709 = 1,
@@ -77,7 +77,7 @@ pub enum Primaries {
     Bt601 = 6,
     /// SMPTE 240M (1999) (historical) (functionally the same as the value 6)<br />
     Smpte240 = 7,
-    /// Generic film (colour filters using Illuminant C)<br />
+    /// Generic film (color filters using Illuminant C)<br />
     GenericFilm = 8,
     /// Rec. ITU-R BT.2020-2<br />
     /// Rec. ITU-R BT.2100-0<br />
@@ -100,7 +100,7 @@ pub enum TransferFunction {
     /// For future use by ITU-T | ISO/IEC
     Reserved,
     /// Rec. ITU-R BT.709-6<br />
-    /// Rec. ITU-R BT.1361-0 conventional colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 conventional color gamut system (historical)<br />
     /// (functionally the same as the values 6, 14 and 15)    <br />
     Bt709 = 1,
     /// Image characteristics are unknown or are determined by the application.<br />
@@ -127,7 +127,7 @@ pub enum TransferFunction {
     Log100sqrt10 = 10,
     /// IEC 61966-2-4<br />
     Iec61966 = 11,
-    /// Rec. ITU-R BT.1361-0 extended colour gamut system (historical)<br />
+    /// Rec. ITU-R BT.1361-0 extended color gamut system (historical)<br />
     Bt1361 = 12,
     /// IEC 61966-2-1 sRGB or sYCC<br />
     Srgb = 13,

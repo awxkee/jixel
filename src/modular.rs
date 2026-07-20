@@ -185,7 +185,7 @@ fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::enc_lz77_ac::AcLz> {
 
 /// GroupHeader: use_global_tree=0, wp_header.all_default=1, 0 transforms.
 /// (4 bits)  Used for the LfGlobal local-tree path.
-fn write_group_header_local_tree(w: &mut BitWriter) {
+pub(crate) fn write_group_header_local_tree(w: &mut BitWriter) {
     w.write(1, 0); // use_global_tree = false
     w.write(1, 1); // wp_header all_default
     w.write(2, 0); // 0 transforms
@@ -199,7 +199,7 @@ fn write_group_header_global_tree(w: &mut BitWriter) {
     w.write(2, 0); // 0 transforms
 }
 
-fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWriter) {
     let tree_tokens = [
         Token::new(TREE_CTX_PROPERTY, 0),
         Token::new(TREE_CTX_PREDICTOR, PREDICTOR_GRADIENT),
@@ -282,7 +282,7 @@ fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
     bits
 }
 
-fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
+pub(crate) fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
     build_pixel_code_n(tokens, 1)
 }
 

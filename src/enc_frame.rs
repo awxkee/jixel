@@ -179,7 +179,7 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
 /// Same as write_dc_tokens, but returns the tokens instead of writing them.
 /// Use this to build adaptive entropy codes from the actual token distribution
 /// before committing the bit pattern.
-fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
+pub(crate) fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
     let mut tokens = Vec::new();
 
     // Weighted-predictor DC, mirroring libjxl's kWPFixedDC path (enc_modular.cc
@@ -248,7 +248,7 @@ fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
 /// In libjxl-tiny ALL four sub-streams use the same shared dc_code.
 /// Same as write_ac_metadata_tokens, but returns the tokens. Mirror of
 /// collect_dc_tokens for the AC metadata (YtoX/B, ACS, QF, EPF).
-fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
+pub(crate) fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
     let mut tokens = Vec::new();
     let xsize_blocks = dc_data.ac_strategy.xsize();
     let ysize_blocks = dc_data.ac_strategy.ysize();
@@ -367,7 +367,7 @@ fn meta_entropy_cost(dc_data: &DcGroupData) -> u64 {
 }
 
 /// Build and emit the context tree.
-fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
+pub(crate) fn write_context_tree(num_dc_groups: usize, writer: &mut BitWriter) {
     // Build tokens with the patched value at index 1.
     let mut tokens: Vec<Token> = Vec::with_capacity(K_CONTEXT_TREE_TOKENS.len());
     for (i, &(ctx, val)) in K_CONTEXT_TREE_TOKENS.iter().enumerate() {
@@ -511,7 +511,29 @@ fn write_frame_header(
     w.write(2, 0); // no frame header extensions
 }
 
-fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWriter) {
+/// Writes the compact block-context map used whenever the default shortcut is
+/// not taken.
+pub(crate) fn write_compact_block_context_map(w: &mut BitWriter) {
+    let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+    let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
+    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let cm_entropy = EntropyCode {
+        context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
+        num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
+        prefix_codes: &empty_codes,
+        hybrid_uint_configs: &empty_configs,
+        num_prefix_codes: 0,
+        orig_context_map: None,
+        orig_num_contexts: 0,
+        use_prefix_code: true,
+        ans_freqs: &empty_freqs,
+        ans_symbols: &empty_syms,
+    };
+    crate::entropy::write_context_map(&cm_entropy, w);
+}
+
+pub(crate) fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWriter) {
     if global_scale < 2049 {
         w.write(2, 0);
         w.write(11, (global_scale - 1) as u64);
@@ -647,7 +669,7 @@ fn write_toc(sizes: &[usize], w: &mut BitWriter) {
     w.zero_pad_to_byte();
 }
 
-fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
+pub(crate) fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
     if sections.len() == 4 {
         // Single AC group case: concat sections 1..4 (bitwise) into section 0.
         let tail: Vec<BitWriter> = sections.drain(1..).collect();

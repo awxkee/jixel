@@ -48,7 +48,7 @@ static TOC_BITS: [u32; 4] = [12, 16, 24, 32];
 /// unnecessary, since the high-bit-depth entry consumes native `u16` samples.
 #[derive(Debug, Clone)]
 pub struct FlMeta {
-    /// Whether colour channels are premultiplied by alpha.
+    /// Whether color channels are premultiplied by alpha.
     pub alpha_premultiplied: bool,
     /// Image orientation (default [`Orientation::Normal`]).
     pub orientation: Orientation,
@@ -737,18 +737,18 @@ fn append_icc_stream(o: &mut BitWriter, icc: &[u8]) {
 }
 
 fn write_color(o: &mut BitWriter, cs: ColorSpace, m: &FlMeta) {
-    o.write(1, 0); // colour_encoding all_default = 0
+    o.write(1, 0); // color_encoding all_default = 0
     if m.icc.is_some() {
         o.write(1, 1); // want_icc = 1
-        write_enum(o, cs as u32); // colour_space (still present)
+        write_enum(o, cs as u32); // color_space (still present)
         return; // white_point/primaries/transfer/intent are gated on !want_icc
     }
     o.write(1, 0); // want_icc = 0
-    write_enum(o, cs as u32); // colour_space (Rgb=0, Gray=1; matches JXL enum)
+    write_enum(o, cs as u32); // color_space (Rgb=0, Gray=1; matches JXL enum)
     write_enum(o, m.white_point as u32); // white_point
     if cs != ColorSpace::Gray {
         write_enum(o, m.primaries as u32);
-    } // primaries (cond colour_space != Grey)
+    } // primaries (cond color_space != Grey)
     o.write(1, 0); // transfer fn: have_gamma = 0
     write_enum(o, m.transfer as u32); // transfer function enum
     write_enum(o, m.rendering_intent as u32); // rendering_intent
@@ -818,7 +818,7 @@ fn prepare_header(
         append_icc_stream(o, icc); // ICC stream after CustomTransformData, before pad
     }
     o.zero_pad_to_byte();
-    // ---- frame header + TOC (bit-depth/colour independent) ----
+    // ---- frame header + TOC (bit-depth/color independent) ----
     o.write(1, 0);
     o.write(2, 0);
     o.write(1, 1);
@@ -951,7 +951,7 @@ fn build_codes(
         .collect()
 }
 
-/// Number of colour channels for the supported colour spaces.
+/// Number of color channels for the supported color spaces.
 /// `Gray` -> 1, `Rgb` -> 3; `Xyb`/`Unknown` are not supported by this path.
 fn color_channels(cs: ColorSpace) -> Result<usize, EncodeError> {
     match cs {

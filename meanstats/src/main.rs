@@ -222,7 +222,7 @@ fn main() -> Result<()> {
         threads
     );
 
-    // Build the series list once; colours mirror `stats`.
+    // Build the series list once; colors mirror `stats`.
     let mut series: Vec<Series> = vec![Series {
         label: "jixel".into(),
         color: RGBColor(0xE5, 0x3E, 0x3E),
