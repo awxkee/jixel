@@ -1,4 +1,4 @@
-use jixel::encode_jpeg_lossless;
+use jixel::{JpegTranscodeConfig, encode_jpeg_lossless_with_config};
 
 const MAX_FUZZ_PIXELS: usize = 1 << 18;
 
@@ -11,7 +11,7 @@ fn declared_area(data: &[u8]) -> Option<usize> {
         }
         let marker = data[i + 1];
         // SOF0/1/2 are the only frame headers the transcoder accepts.
-        if matches!(marker, 0xC0 | 0xC1 | 0xC2) {
+        if matches!(marker, 0xC0..=0xC2) {
             let height = usize::from(data[i + 5]) << 8 | usize::from(data[i + 6]);
             let width = usize::from(data[i + 7]) << 8 | usize::from(data[i + 8]);
             return Some(width.saturating_mul(height));
@@ -82,9 +82,21 @@ fn fuzz_transcode(data: &[u8]) {
         return;
     }
 
-    match encode_jpeg_lossless(data) {
-        Err(_) => {}
-        Ok(out) => check_container(&out),
+    // Both modes share a parser and a frame encoder but differ in whether
+    // reconstruction data and a container are produced. Rejecting a malformed
+    // or unsupported JPEG is a valid outcome.
+    let config = JpegTranscodeConfig::default();
+    if let Ok(out) = encode_jpeg_lossless_with_config(data, &config) {
+        check_container(&out);
+    }
+
+    let bare = config.with_jpeg_reconstruction(false);
+    if let Ok(out) = encode_jpeg_lossless_with_config(data, &bare) {
+        // Without a container the output is a raw codestream.
+        assert!(
+            out.starts_with(&[0xFF, 0x0A]),
+            "bare output does not begin with the JXL codestream signature"
+        );
     }
 }
 

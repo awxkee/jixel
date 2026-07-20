@@ -45,6 +45,7 @@ use crate::entropy::{
 };
 use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
+use crate::thread_pool::steal_map;
 
 const BLOCK_DIM: usize = 8;
 const GROUP_DIM: usize = 256;
@@ -58,7 +59,7 @@ use crate::ac_context::K_COEFF_ORDER_8X8;
 static CHANNEL_ORDER: [usize; 3] = [1, 0, 2];
 
 /// JXL channel (X, Y, B) to JPEG component (Cb, Y, Cr).
-static  JPEG_ORDER_YCBCR: [usize; 3] = [1, 0, 2];
+static JPEG_ORDER_YCBCR: [usize; 3] = [1, 0, 2];
 
 /// Geometry of the frame, in pixels, blocks and groups.
 struct Dim {
@@ -67,10 +68,8 @@ struct Dim {
     xsize_blocks: usize,
     ysize_blocks: usize,
     xsize_groups: usize,
-    ysize_groups: usize,
     num_groups: usize,
     xsize_dc_groups: usize,
-    ysize_dc_groups: usize,
     num_dc_groups: usize,
 }
 
@@ -89,10 +88,8 @@ impl Dim {
             xsize_blocks,
             ysize_blocks,
             xsize_groups,
-            ysize_groups,
             num_groups: xsize_groups * ysize_groups,
             xsize_dc_groups,
-            ysize_dc_groups,
             num_dc_groups: xsize_dc_groups * ysize_dc_groups,
         }
     }
@@ -261,7 +258,7 @@ fn write_size_header(w: &mut BitWriter, xsize: usize, ysize: usize) {
 
 /// Writes `ImageMetadata`. The key choice is `xyb_encoded = 0`: the frame
 /// carries the JPEG's own channels, so the decoder must not undo XYB.
-fn write_image_metadata(w: &mut BitWriter) {
+fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>) {
     w.write(1, 0); // not all-default
     w.write(1, 0); // no extra fields (orientation, preview, animation)
     w.write(1, 0); // floating_point_sample = false
@@ -269,9 +266,22 @@ fn write_image_metadata(w: &mut BitWriter) {
     w.write(1, 1); // modular_16bit_buffer_sufficient
     w.write(2, 0); // num_extra_channels = 0
     w.write(1, 0); // xyb_encoded = 0
-    w.write(1, 1); // color encoding: all default (sRGB)
+    match icc {
+        // The JPEG's own profile, so the decoded pixels are interpreted the
+        // same way whether reconstruction data is kept.
+        Some(_) => crate::color_encoding::write_color_encoding_with_icc(
+            &crate::ColorEncoding::default(),
+            true,
+            false,
+            w,
+        ),
+        None => w.write(1, 1), // color encoding: all default (sRGB)
+    }
     w.write(2, 0); // no extensions
     w.write(1, 1); // CustomTransformData: all default
+    if let Some(icc) = icc {
+        crate::icc_codec::write_icc_stream(icc, w);
+    }
     w.zero_pad_to_byte();
 }
 
@@ -376,7 +386,11 @@ fn write_raw_quant_image(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE]) 
 }
 
 /// Encodes `jpg` as a complete JXL codestream.
-pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
+pub(crate) fn encode_jpeg_codestream(
+    jpg: &JpegData,
+    icc: Option<&[u8]>,
+    num_threads: usize,
+) -> Result<Vec<u8>, JpegError> {
     let ss = check_supported(jpg)?;
     let dim = Dim::new(jpg.width, jpg.height, &ss);
 
@@ -395,38 +409,44 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
         dc_quant[c] = q[0] as f32 / (255.0 * 8.0);
     }
 
-    // DC planes
-    let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(dim.num_dc_groups);
-    for gy in 0..dim.ysize_dc_groups {
-        for gx in 0..dim.xsize_dc_groups {
-            let bx0 = gx * DC_GROUP_DIM_IN_BLOCKS;
-            let by0 = gy * DC_GROUP_DIM_IN_BLOCKS;
-            let bw = DC_GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
-            let bh = DC_GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
-            let mut data = DcGroupData::new(bw, bh);
-            // Each DC plane is the luma grid scaled by its own shift.
-            let sizes = [0usize, 1, 2].map(|c| (bw >> ss.hshift[c], bh >> ss.vshift[c]));
-            data.quant_dc = crate::image::Image3S::new_per_plane(sizes);
-            for c in 0..3usize {
-                let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
-                let (cw, ch) = sizes[c];
-                for y in 0..ch {
-                    let row = data.quant_dc.plane_row_mut(c, y);
-                    for x in 0..cw {
-                        let block = ((by0 >> ss.vshift[c]) + y) * comp.width_in_blocks
-                            + (bx0 >> ss.hshift[c])
-                            + x;
-                        row[x] = comp.coeffs[block * DCT_BLOCK_SIZE] as i16;
-                    }
+    // DC planes. Each DC group reads a disjoint slab of coefficients.
+    let dc_datas: Vec<DcGroupData> = steal_map(dim.num_dc_groups, num_threads, |g| {
+        let gx = g % dim.xsize_dc_groups;
+        let gy = g / dim.xsize_dc_groups;
+        let bx0 = gx * DC_GROUP_DIM_IN_BLOCKS;
+        let by0 = gy * DC_GROUP_DIM_IN_BLOCKS;
+        let bw = DC_GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
+        let bh = DC_GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
+        let mut data = DcGroupData::new(bw, bh);
+        // Each DC plane is the luma grid scaled by its own shift.
+        let sizes = [0usize, 1, 2].map(|c| (bw >> ss.hshift[c], bh >> ss.vshift[c]));
+        data.quant_dc = crate::image::Image3S::new_per_plane(sizes);
+        for c in 0..3usize {
+            let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
+            let (cw, ch) = sizes[c];
+            for y in 0..ch {
+                let row = data.quant_dc.plane_row_mut(c, y);
+                for (x, dst) in row[..cw].iter_mut().enumerate() {
+                    let block = ((by0 >> ss.vshift[c]) + y) * comp.width_in_blocks
+                        + (bx0 >> ss.hshift[c])
+                        + x;
+                    *dst = comp.coeffs[block * DCT_BLOCK_SIZE];
                 }
             }
-            dc_datas.push(data);
         }
-    }
+        data
+    });
 
     // Tokens
-    let dc_tokens: Vec<Vec<Token>> = dc_datas.iter().map(collect_dc_tokens).collect();
-    let meta_tokens: Vec<Vec<Token>> = dc_datas.iter().map(collect_ac_metadata_tokens).collect();
+    let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) =
+        steal_map(dc_datas.len(), num_threads, |i| {
+            (
+                collect_dc_tokens(&dc_datas[i]),
+                collect_ac_metadata_tokens(&dc_datas[i]),
+            )
+        })
+        .into_iter()
+        .unzip();
 
     let mut all_dc: Vec<Token> = Vec::new();
     for t in &dc_tokens {
@@ -438,7 +458,7 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
     let dc_code = optimize_entropy_code(&all_dc, K_NUM_DC_CONTEXTS);
     let dc_code_ref = dc_code.as_ref();
 
-    let ac_tokens = tokenize_ac(jpg, &dim, &ss);
+    let ac_tokens = tokenize_ac(jpg, &dim, &ss, num_threads);
     let mut all_ac: Vec<Token> = Vec::new();
     for t in &ac_tokens {
         all_ac.extend_from_slice(t);
@@ -446,13 +466,11 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
     let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS);
     let ac_code_ref = ac_code.as_ref();
 
-    // Sections
-    let num_sections = 2 + dim.num_dc_groups + dim.num_groups;
-    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
-
-    // DC global.
+    // Sections. Each is an independent BitWriter, so the per-group ones can be
+    // filled in parallel and stitched together afterwards.
+    let mut dc_global = BitWriter::new();
     {
-        let w = &mut sections[0];
+        let w = &mut dc_global;
         write_dc_quant(w, dc_quant)?;
         write_quant_scales(65536, 1, w);
         // Written explicitly; the lossy path avoids the shortcut too.
@@ -466,8 +484,10 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
     }
 
     // DC groups.
-    for (i, data) in dc_datas.iter().enumerate() {
-        let w = &mut sections[1 + i];
+    let dc_group_sections: Vec<BitWriter> = steal_map(dim.num_dc_groups, num_threads, |i| {
+        let data = &dc_datas[i];
+        let mut section = BitWriter::new();
+        let w = &mut section;
         w.write(2, 0); // extra_dc_precision = 0
         w.write(4, 3); // global tree, default weighted predictor, no transforms
         emit_tokens(&dc_tokens[i], &dc_code_ref, w);
@@ -485,11 +505,13 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
         }
         w.write(4, 3);
         emit_tokens(&meta_tokens[i], &dc_code_ref, w);
-    }
+        section
+    });
 
     // AC global.
+    let mut ac_global = BitWriter::new();
     {
-        let w = &mut sections[1 + dim.num_dc_groups];
+        let w = &mut ac_global;
         write_dequant_matrices(w, &qtable);
         if dim.num_groups > 1 {
             let bits = usize::BITS as usize
@@ -510,17 +532,24 @@ pub(crate) fn encode_jpeg_codestream(jpg: &JpegData) -> Result<Vec<u8>, JpegErro
     }
 
     // AC groups.
-    for g in 0..dim.num_groups {
-        let w = &mut sections[2 + dim.num_dc_groups + g];
-        emit_tokens(&ac_tokens[g], &ac_code_ref, w);
-    }
+    let ac_group_sections: Vec<BitWriter> = steal_map(dim.num_groups, num_threads, |g| {
+        let mut section = BitWriter::new();
+        emit_tokens(&ac_tokens[g], &ac_code_ref, &mut section);
+        section
+    });
+
+    let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
+    sections.push(dc_global);
+    sections.extend(dc_group_sections);
+    sections.push(ac_global);
+    sections.extend(ac_group_sections);
 
     // Assemble
     let mut out = BitWriter::new();
     out.write(8, 0xFF);
     out.write(8, 0x0A);
     write_size_header(&mut out, dim.xsize, dim.ysize);
-    write_image_metadata(&mut out);
+    write_image_metadata(&mut out, icc);
     write_frame_header(&mut out, &ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
@@ -536,20 +565,36 @@ fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut
     }
 }
 
-/// Produces one token stream per AC group.
-fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> Vec<Vec<Token>> {
-    let mut out: Vec<Vec<Token>> = Vec::with_capacity(dim.num_groups);
-    let mut block = [0i32; DCT_BLOCK_SIZE];
+/// Produces one token stream per AC group, one group per work item.
+///
+/// Groups are independent: each covers a fixed slab of blocks and carries its
+/// own non-zero-count context, so nothing crosses a group boundary.
+fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling, num_threads: usize) -> Vec<Vec<Token>> {
+    steal_map(dim.num_groups, num_threads, |g| {
+        let gx = g % dim.xsize_groups;
+        let gy = g / dim.xsize_groups;
+        tokenize_ac_group(jpg, dim, ss, gx, gy)
+    })
+}
 
-    for gy in 0..dim.ysize_groups {
-        for gx in 0..dim.xsize_groups {
+/// Tokenizes the AC coefficients of one group.
+fn tokenize_ac_group(
+    jpg: &JpegData,
+    dim: &Dim,
+    ss: &Subsampling,
+    gx: usize,
+    gy: usize,
+) -> Vec<Token> {
+    let mut block = [0i32; DCT_BLOCK_SIZE];
+    {
+        {
             let bx0 = gx * GROUP_DIM_IN_BLOCKS;
             let by0 = gy * GROUP_DIM_IN_BLOCKS;
             let bw = GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
             let bh = GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
 
             let mut tokens: Vec<Token> = Vec::new();
-            // Non-zero counts of already-coded neighbours, used as context.
+            // Non-zero counts of already-coded neighbors, used as context.
             let mut num_nzeros = Image3B::new(GROUP_DIM_IN_BLOCKS, GROUP_DIM_IN_BLOCKS);
 
             for by in 0..bh {
@@ -567,9 +612,9 @@ fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> Vec<Vec<Token>> {
                         let bi = (abs_by >> vs) * comp.width_in_blocks + (abs_bx >> hs);
                         let src = &comp.coeffs[bi * DCT_BLOCK_SIZE..(bi + 1) * DCT_BLOCK_SIZE];
                         // JXL transposes the DCT relative to JPEG.
-                        for y in 0..8usize {
-                            for x in 0..8usize {
-                                block[x * 8 + y] = src[y * 8 + x];
+                        for (y, src_row) in src.as_chunks::<8>().0.iter().enumerate() {
+                            for (x, &src) in src_row.iter().enumerate() {
+                                block[x * 8 + y] = src as i32;
                             }
                         }
 
@@ -619,8 +664,7 @@ fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> Vec<Vec<Token>> {
                     }
                 }
             }
-            out.push(tokens);
+            tokens
         }
     }
-    out
 }

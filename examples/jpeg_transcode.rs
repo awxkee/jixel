@@ -8,16 +8,22 @@
 //! ```text
 //! cargo run --release --example jpeg_transcode -- photo.jpg photo.jxl
 //! ```
+//!
+//! Passing `--no-reconstruct` drops the `jbrd` box. The image is still carried
+//! losslessly, but only an equivalent JPEG can be produced from it, not the
+//! original file.
 
 use std::path::Path;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: jpeg_transcode <input.jpg> <output.jxl>");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let reconstruct = !args.iter().any(|a| a == "--no-reconstruct");
+    args.retain(|a| a != "--no-reconstruct");
+    if args.len() != 2 {
+        eprintln!("usage: jpeg_transcode [--no-reconstruct] <input.jpg> <output.jxl>");
         std::process::exit(2);
     }
-    let (input, output) = (Path::new(&args[1]), Path::new(&args[2]));
+    let (input, output) = (Path::new(&args[0]), Path::new(&args[1]));
 
     let jpeg = match std::fs::read(input) {
         Ok(b) => b,
@@ -27,7 +33,10 @@ fn main() {
         }
     };
 
-    let jxl = match jixel::encode_jpeg_lossless(&jpeg) {
+    let config = jixel::JpegTranscodeConfig::default()
+        .with_jpeg_reconstruction(reconstruct)
+        .with_num_threads(std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let jxl = match jixel::encode_jpeg_lossless_with_config(&jpeg, &config) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");

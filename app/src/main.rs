@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::num::NonZero;
 // use image::imageops::FilterType;
 use image::imageops::FilterType;
-use jixel::{ColorEncoding, EncodeConfig, Speed};
+use jixel::{ColorEncoding, EncodeConfig, JpegTranscodeConfig, Speed};
 use std::path::Path;
 use std::thread::available_parallelism;
 use std::time::Instant;
@@ -56,6 +57,13 @@ fn main() {
     .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");
 
+    let fs_read = fs::read("./assets/cityscape2_small.jpg").unwrap();
+    let reencoded = jixel::encode_jpeg_lossless_with_config(
+        &fs_read,
+        &JpegTranscodeConfig::default().with_jpeg_reconstruction(false),
+    )
+    .unwrap();
+    std::fs::write(&"lossless_jpeg.jxl", &reencoded).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;
     // let img10 = vec![0u8; width * height * 3];
