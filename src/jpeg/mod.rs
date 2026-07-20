@@ -27,13 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Bit-exact JPEG bitstream parsing for lossless JXL transcoding.
-//!
-//! These structures mirror libjxl's `JPEGData`, since the `jbrd` box is a
-//! direct serialization of them. The apparently redundant detail — marker
-//! order, raw APP/COM bytes, padding bits, trailing garbage — is all required
-//! to re-emit the original file byte for byte.
-
 mod brotli;
 mod encode;
 mod jbrd;
