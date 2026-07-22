@@ -27,19 +27,30 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{adaptive_quant, dct, enc_ac_strategy, enc_group, enc_xyb, inflated_cost};
+use crate::ac_context::BlockContextModel;
+use crate::dark_aq::DarkAqConfig;
+use crate::quant_weights::DequantMatrices;
+use crate::{
+    Speed, adaptive_quant, dct, enc_ac_strategy, enc_color_correlation, enc_group, enc_xyb,
+    inflated_cost,
+};
 
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
-#[derive(Clone, Copy)]
 pub(crate) struct EncodingContext {
+    pub(crate) speed: Speed,
+    pub(crate) boost: Option<DarkAqConfig>,
+    pub(crate) matrices: DequantMatrices,
+    pub(crate) block_context_model: BlockContextModel,
+
     pub(crate) to_xyb_band: enc_xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
     pub(crate) quantize_block_ac: enc_group::QuantizeBlockAcFn,
     pub(crate) apply_cfl: enc_ac_strategy::ApplyCflFn,
+    pub(crate) cfl_regression: enc_color_correlation::CflRegressionFn,
 
     pub(crate) dct8x8: &'static dct::DctFn<64>,
     pub(crate) dct8x16: &'static dct::DctFn<128>,
@@ -57,14 +68,20 @@ pub(crate) struct EncodingContext {
 }
 
 impl EncodingContext {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(speed: Speed, boost: Option<DarkAqConfig>) -> Self {
         Self {
+            speed,
+            boost,
+            matrices: DequantMatrices::new(),
+            block_context_model: BlockContextModel::Compact,
+
             to_xyb_band: enc_xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
             rate_log2_lut: inflated_cost::rate_log2_lut(),
             quantize_block_ac: enc_group::selected_quantize_block_ac_fn(),
             apply_cfl: enc_ac_strategy::selected_apply_cfl_fn(),
+            cfl_regression: enc_color_correlation::selected_cfl_regression_fn(),
 
             dct8x8: dct::selected_dct8x8(),
             dct8x16: dct::selected_dct8x16(),
@@ -81,11 +98,48 @@ impl EncodingContext {
             dct32x64: dct::selected_dct32x64(),
         }
     }
+
+    pub(crate) fn new_for_image(
+        speed: Speed,
+        boost: Option<DarkAqConfig>,
+        width: usize,
+        height: usize,
+        distance: f32,
+    ) -> Self {
+        let mut ctx = Self::new(speed, boost);
+        let num_blocks = width.div_ceil(8).saturating_mul(height.div_ceil(8));
+        let split_threshold = ((4096.0 * distance.max(0.03)).ceil() as usize).max(8192);
+        if distance >= 1.5 && num_blocks >= split_threshold {
+            ctx.block_context_model = BlockContextModel::LargeTransform;
+        }
+        ctx
+    }
 }
 
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new()
+        Self::new(Speed::Fast, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_context_model_is_gated_by_size_and_distance() {
+        assert_eq!(
+            EncodingContext::new_for_image(Speed::Slow, None, 768, 512, 3.0).block_context_model,
+            BlockContextModel::Compact
+        );
+        assert_eq!(
+            EncodingContext::new_for_image(Speed::Slow, None, 2000, 1400, 3.0).block_context_model,
+            BlockContextModel::LargeTransform
+        );
+        assert_eq!(
+            EncodingContext::new_for_image(Speed::Slow, None, 2000, 1400, 1.0).block_context_model,
+            BlockContextModel::Compact
+        );
     }
 }

@@ -28,8 +28,8 @@
  */
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Token {
-    pub context: u32,
-    pub value: u32,
+    pub(crate) context: u32,
+    pub(crate) value: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

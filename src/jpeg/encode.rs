@@ -29,7 +29,7 @@
 
 //! Builds a JXL VarDCT frame directly from JPEG DCT coefficients.
 
-use super::{DCT_BLOCK_SIZE, JpegData, JpegError};
+use super::{DCT_BLOCK_SIZE, JpegData, JpegError, coeff_order};
 use crate::ac_context::{
     K_NUM_AC_CONTEXTS, block_context, non_zero_context, zero_density_context_8x8,
 };
@@ -400,10 +400,10 @@ pub(crate) fn encode_jpeg_codestream(
     for c in 0..3usize {
         let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
         let q = &jpg.quant[comp.quant_idx as usize].values;
-        for y in 0..8usize {
-            for x in 0..8usize {
+        for (y, src) in q.as_chunks::<8>().0.iter().take(8).enumerate() {
+            for (x, &src) in src.iter().enumerate() {
                 // JXL transposes the DCT relative to JPEG.
-                qtable[c * DCT_BLOCK_SIZE + x * 8 + y] = q[y * 8 + x];
+                qtable[c * DCT_BLOCK_SIZE + x * 8 + y] = src;
             }
         }
         dc_quant[c] = q[0] as f32 / (255.0 * 8.0);
@@ -458,16 +458,50 @@ pub(crate) fn encode_jpeg_codestream(
     let dc_code = optimize_entropy_code(&all_dc, K_NUM_DC_CONTEXTS);
     let dc_code_ref = dc_code.as_ref();
 
-    let ac_tokens = tokenize_ac(jpg, &dim, &ss, num_threads);
-    let mut all_ac: Vec<Token> = Vec::new();
-    for t in &ac_tokens {
-        all_ac.extend_from_slice(t);
-    }
-    let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS);
-    let ac_code_ref = ac_code.as_ref();
+    let natural_scan = {
+        let mut s = [[0u8; DCT_BLOCK_SIZE]; 3];
+        for row in &mut s {
+            for (k, v) in row.iter_mut().enumerate() {
+                *v = K_COEFF_ORDER_8X8[k];
+            }
+        }
+        s
+    };
+    let baseline = build_ac_sections(jpg, &dim, &ss, &qtable, &natural_scan, None, num_threads);
+
+    let orders = compute_coeff_orders(jpg, &dim, &ss);
+    let ac = if orders.iter().any(|o| !coeff_order::is_identity(o)) {
+        let mut custom_scan = [[0u8; DCT_BLOCK_SIZE]; 3];
+        for c in 0..3 {
+            for k in 0..DCT_BLOCK_SIZE {
+                custom_scan[c][k] = K_COEFF_ORDER_8X8[orders[c][k] as usize];
+            }
+        }
+        // Permutation signaling: one order index (DCT8), three channels.
+        let mut perm_tokens: Vec<Token> = Vec::new();
+        for order in &orders {
+            coeff_order::tokenize_permutation(order, 1, &mut perm_tokens);
+        }
+        let candidate = build_ac_sections(
+            jpg,
+            &dim,
+            &ss,
+            &qtable,
+            &custom_scan,
+            Some(perm_tokens),
+            num_threads,
+        );
+        if candidate.bytes < baseline.bytes {
+            candidate
+        } else {
+            baseline
+        }
+    } else {
+        baseline
+    };
 
     // Sections. Each is an independent BitWriter, so the per-group ones can be
-    // filled in parallel and stitched together afterwards.
+    // filled in parallel and stitched together afterward.
     let mut dc_global = BitWriter::new();
     {
         let w = &mut dc_global;
@@ -508,41 +542,11 @@ pub(crate) fn encode_jpeg_codestream(
         section
     });
 
-    // AC global.
-    let mut ac_global = BitWriter::new();
-    {
-        let w = &mut ac_global;
-        write_dequant_matrices(w, &qtable);
-        if dim.num_groups > 1 {
-            let bits = usize::BITS as usize
-                - dim.num_groups.leading_zeros() as usize
-                - if dim.num_groups.is_power_of_two() {
-                    1
-                } else {
-                    0
-                };
-            if bits != 0 {
-                w.write(bits, 0); // num_histo_bits = 0
-            }
-        }
-        w.write(2, 3); // used_orders selector
-        w.write(13, 0); // natural order
-        w.write(1, 0); // no lz77
-        write_entropy_code(&ac_code_ref, w);
-    }
-
-    // AC groups.
-    let ac_group_sections: Vec<BitWriter> = steal_map(dim.num_groups, num_threads, |g| {
-        let mut section = BitWriter::new();
-        emit_tokens(&ac_tokens[g], &ac_code_ref, &mut section);
-        section
-    });
-
     let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
     sections.push(dc_global);
     sections.extend(dc_group_sections);
-    sections.push(ac_global);
-    sections.extend(ac_group_sections);
+    sections.push(ac.global);
+    sections.extend(ac.groups);
 
     // Assemble
     let mut out = BitWriter::new();
@@ -565,15 +569,135 @@ fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut
     }
 }
 
-/// Produces one token stream per AC group, one group per work item.
+/// The AC-global section and per-group sections for one coefficient ordering,
+/// with the total size used to choose between orderings.
+struct AcSections {
+    global: BitWriter,
+    groups: Vec<BitWriter>,
+    bytes: usize,
+}
+
+/// Tokenizes and entropy-codes the AC coefficients under `scan`, returning the
+/// finished sections and their total byte size.
 ///
-/// Groups are independent: each covers a fixed slab of blocks and carries its
-/// own non-zero-count context, so nothing crosses a group boundary.
-fn tokenize_ac(jpg: &JpegData, dim: &Dim, ss: &Subsampling, num_threads: usize) -> Vec<Vec<Token>> {
+/// `perm` carries the coefficient-order permutation tokens when `scan` is a
+/// custom order; `None` signals the natural order (`used_orders = 0`).
+#[allow(clippy::too_many_arguments)]
+fn build_ac_sections(
+    jpg: &JpegData,
+    dim: &Dim,
+    ss: &Subsampling,
+    qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+    scan: &[[u8; DCT_BLOCK_SIZE]; 3],
+    perm: Option<Vec<Token>>,
+    num_threads: usize,
+) -> AcSections {
+    let ac_tokens = tokenize_ac(jpg, dim, ss, scan, num_threads);
+    let mut all_ac: Vec<Token> = Vec::new();
+    for t in &ac_tokens {
+        all_ac.extend_from_slice(t);
+    }
+    let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS);
+    let ac_code_ref = ac_code.as_ref();
+
+    let mut global = BitWriter::new();
+    {
+        let w = &mut global;
+        write_dequant_matrices(w, qtable);
+        if dim.num_groups > 1 {
+            let bits = usize::BITS as usize
+                - dim.num_groups.leading_zeros() as usize
+                - if dim.num_groups.is_power_of_two() {
+                    1
+                } else {
+                    0
+                };
+            if bits != 0 {
+                w.write(bits, 0); // num_histo_bits = 0
+            }
+        }
+        // used_orders is a 13-bit mask (one bit per order index). Only order 0
+        // (DCT8) is ever used here, so the mask is 0 or 1.
+        w.write(2, 3); // used_orders U32 selector 3 = raw 13 bits
+        match &perm {
+            Some(perm_tokens) => {
+                w.write(13, 1); // custom order for DCT8
+                // Its own entropy stream, then the tokens, exactly as libjxl's
+                // EncodeCoeffOrders lays it out.
+                let perm_code =
+                    optimize_entropy_code(perm_tokens, coeff_order::PERMUTATION_CONTEXTS);
+                w.write(1, 0); // no lz77
+                write_entropy_code(&perm_code.as_ref(), w);
+                emit_tokens(perm_tokens, &perm_code.as_ref(), w);
+            }
+            None => w.write(13, 0), // natural order
+        }
+        w.write(1, 0); // no lz77
+        write_entropy_code(&ac_code_ref, w);
+    }
+
+    let groups: Vec<BitWriter> = steal_map(dim.num_groups, num_threads, |g| {
+        let mut section = BitWriter::new();
+        emit_tokens(&ac_tokens[g], &ac_code_ref, &mut section);
+        section
+    });
+
+    let bytes = global.bits_written().div_ceil(8)
+        + groups
+            .iter()
+            .map(|s| s.bits_written().div_ceil(8))
+            .sum::<usize>();
+    AcSections {
+        global,
+        groups,
+        bytes,
+    }
+}
+
+/// Derives the per-channel DCT8 coefficient order from non-zero statistics.
+fn compute_coeff_orders(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> [[u8; DCT_BLOCK_SIZE]; 3] {
+    // Slot -> source coefficient index: the natural slot's transposed-raster
+    // position mapped back into the JPEG block's own raster layout.
+    let mut slot_to_src = [0usize; DCT_BLOCK_SIZE];
+    for (slot, s) in slot_to_src.iter_mut().enumerate() {
+        let r = K_COEFF_ORDER_8X8[slot] as usize;
+        *s = (r & 7) * 8 + (r >> 3);
+    }
+
+    let mut orders = [[0u8; DCT_BLOCK_SIZE]; 3];
+    for c in 0..3usize {
+        let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
+        let cbw = dim.xsize_blocks >> ss.hshift[c];
+        let cbh = dim.ysize_blocks >> ss.vshift[c];
+        let mut nonzero = [0u64; DCT_BLOCK_SIZE];
+        for by in 0..cbh {
+            for bx in 0..cbw {
+                let base = (by * comp.width_in_blocks + bx) * DCT_BLOCK_SIZE;
+                let coeffs = &comp.coeffs[base..base + DCT_BLOCK_SIZE];
+                for slot in 1..DCT_BLOCK_SIZE {
+                    if coeffs[slot_to_src[slot]] != 0 {
+                        nonzero[slot] += 1;
+                    }
+                }
+            }
+        }
+        orders[c] = coeff_order::compute_order(&nonzero, (cbw * cbh) as u64, 1);
+    }
+    orders
+}
+
+/// Produces one token stream per AC group, one group per work item.
+fn tokenize_ac(
+    jpg: &JpegData,
+    dim: &Dim,
+    ss: &Subsampling,
+    scan: &[[u8; DCT_BLOCK_SIZE]; 3],
+    num_threads: usize,
+) -> Vec<Vec<Token>> {
     steal_map(dim.num_groups, num_threads, |g| {
         let gx = g % dim.xsize_groups;
         let gy = g / dim.xsize_groups;
-        tokenize_ac_group(jpg, dim, ss, gx, gy)
+        tokenize_ac_group(jpg, dim, ss, scan, gx, gy)
     })
 }
 
@@ -582,6 +706,7 @@ fn tokenize_ac_group(
     jpg: &JpegData,
     dim: &Dim,
     ss: &Subsampling,
+    scan: &[[u8; DCT_BLOCK_SIZE]; 3],
     gx: usize,
     gy: usize,
 ) -> Vec<Token> {
@@ -651,7 +776,7 @@ fn tokenize_ac_group(
                         let mut remaining = nzeros;
                         let mut k = 1usize;
                         while k < DCT_BLOCK_SIZE && remaining != 0 {
-                            let coef = block[K_COEFF_ORDER_8X8[k] as usize];
+                            let coef = block[scan[c][k] as usize];
                             let ctx = histo_offset as usize
                                 + zero_density_context_8x8(remaining as usize, k, prev);
                             tokens.push(Token::new(ctx as u32, pack_signed(coef)));

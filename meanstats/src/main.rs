@@ -40,7 +40,7 @@
 //! Usage:
 //! ```text
 //! meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]
-//!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 420]
+//!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]
 //!                  [--no-aom] [--no-cjxl]
 //! ```
 
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
         enc: SYS_AVIFENC.to_string(),
         dec: SYS_AVIFDEC.to_string(),
         speed: "6".to_string(),
-        yuv: "420".to_string(),
+        yuv: "444".to_string(),
     };
     let mut with_cjxl = true;
     let mut with_aom = true;
@@ -732,7 +732,7 @@ fn available(bin: &str) -> bool {
 fn usage() -> ! {
     eprintln!(
         "usage: meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]\n\
-         \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 420]\n\
+         \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
          image in FOLDER at each distance, decodes, scores SSIMULACRA2, prints the folder\n  \

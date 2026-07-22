@@ -245,12 +245,9 @@ fn gamma_modulation_blocks4_x4(
         acc3 = vaddq_f32(acc3, gamma_row_sum_x4(row_x, row_y, x + 24));
     }
 
-    let inv64 = 1.0 / 64.0;
-    let mut overall = vdupq_n_f32(0.0);
-    overall = vsetq_lane_f32::<0>(vaddvq_f32(acc0) * inv64, overall);
-    overall = vsetq_lane_f32::<1>(vaddvq_f32(acc1) * inv64, overall);
-    overall = vsetq_lane_f32::<2>(vaddvq_f32(acc2) * inv64, overall);
-    overall = vsetq_lane_f32::<3>(vaddvq_f32(acc3) * inv64, overall);
+    let partial01 = vpaddq_f32(acc0, acc1);
+    let partial23 = vpaddq_f32(acc2, acc3);
+    let overall = vmulq_n_f32(vpaddq_f32(partial01, partial23), 1.0 / 64.0);
 
     vmlaf(
         vdupq_n_f32(0.1005613337192697),

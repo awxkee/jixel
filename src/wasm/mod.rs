@@ -36,7 +36,7 @@ mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_wasm;
 pub(crate) use adaptive_quant::fill_quant_field;
-pub(crate) use cfl::apply_cfl_wasm;
+pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
 pub(crate) use dct::*;
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::quantize_block_ac_wasm;

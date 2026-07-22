@@ -29,6 +29,81 @@
 
 use std::arch::x86_64::*;
 
+#[inline]
+#[target_feature(enable = "avx2")]
+fn reduce_transposed_4x8(a: __m256, b: __m256, c: __m256, d: __m256) -> [f32; 4] {
+    // Transpose the accumulators so each four-lane group contains
+    // [ca_x, cb_x, ca_b, cb_b] for one input lane.
+    let ab_lo = _mm256_unpacklo_ps(a, b);
+    let ab_hi = _mm256_unpackhi_ps(a, b);
+    let cd_lo = _mm256_unpacklo_ps(c, d);
+    let cd_hi = _mm256_unpackhi_ps(c, d);
+    let lane_0_4 = _mm256_shuffle_ps::<0x44>(ab_lo, cd_lo);
+    let lane_1_5 = _mm256_shuffle_ps::<0xee>(ab_lo, cd_lo);
+    let lane_2_6 = _mm256_shuffle_ps::<0x44>(ab_hi, cd_hi);
+    let lane_3_7 = _mm256_shuffle_ps::<0xee>(ab_hi, cd_hi);
+
+    let sums_0_3_and_4_7 = _mm256_add_ps(
+        _mm256_add_ps(lane_0_4, lane_1_5),
+        _mm256_add_ps(lane_2_6, lane_3_7),
+    );
+    let low = _mm256_castps256_ps128(sums_0_3_and_4_7);
+    let high = _mm256_extractf128_ps::<1>(sums_0_3_and_4_7);
+    let sums = _mm_add_ps(low, high);
+    let mut out = [0.0f32; 4];
+    unsafe { _mm_storeu_ps(out.as_mut_ptr(), sums) };
+    out
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn cfl_regression_avx2(
+    y: &[f32; 64],
+    x: &[f32; 64],
+    b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+) -> [f32; 4] {
+    let inv_color = _mm256_set1_ps(1.0 / 84.0);
+    let mut ca_x = _mm256_setzero_ps();
+    let mut cb_x = _mm256_setzero_ps();
+    let mut ca_b = _mm256_setzero_ps();
+    let mut cb_b = _mm256_setzero_ps();
+
+    let y_chunks = y.as_chunks::<8>().0;
+    let x_chunks = x.as_chunks::<8>().0;
+    let b_chunks = b.as_chunks::<8>().0;
+    let qm_x_chunks = qm_x.as_chunks::<8>().0;
+    let qm_b_chunks = qm_b.as_chunks::<8>().0;
+    for ((((y, x), b), qm_x), qm_b) in y_chunks
+        .iter()
+        .zip(x_chunks)
+        .zip(b_chunks)
+        .zip(qm_x_chunks)
+        .zip(qm_b_chunks)
+    {
+        let yv = unsafe { _mm256_loadu_ps(y.as_ptr()) };
+        let xv = unsafe { _mm256_loadu_ps(x.as_ptr()) };
+        let bv = unsafe { _mm256_loadu_ps(b.as_ptr()) };
+        let qx = unsafe { _mm256_loadu_ps(qm_x.as_ptr()) };
+        let qb = unsafe { _mm256_loadu_ps(qm_b.as_ptr()) };
+
+        let mx = _mm256_mul_ps(yv, qx);
+        let sx = _mm256_mul_ps(xv, qx);
+        let ax = _mm256_mul_ps(inv_color, mx);
+        ca_x = _mm256_fmadd_ps(ax, ax, ca_x);
+        cb_x = _mm256_fnmadd_ps(ax, sx, cb_x);
+
+        let mb = _mm256_mul_ps(yv, qb);
+        let sb = _mm256_mul_ps(bv, qb);
+        let ab = _mm256_mul_ps(inv_color, mb);
+        let residual_b = _mm256_sub_ps(mb, sb);
+        ca_b = _mm256_fmadd_ps(ab, ab, ca_b);
+        cb_b = _mm256_fmadd_ps(ab, residual_b, cb_b);
+    }
+
+    reduce_transposed_4x8(ca_x, cb_x, ca_b, cb_b)
+}
+
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn apply_cfl_avx2(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());

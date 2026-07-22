@@ -28,6 +28,7 @@
  */
 
 mod brotli;
+mod coeff_order;
 mod encode;
 mod jbrd;
 mod parse;

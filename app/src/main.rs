@@ -31,7 +31,7 @@ fn main() {
                 .with_quality(90.)
                 .with_progressive(false)
                 .with_patches(false)
-                .with_speed(Speed::Slow)
+                .with_speed(Speed::Fast)
                 .with_num_threads(
                     available_parallelism()
                         .unwrap_or(NonZero::new(1).unwrap())

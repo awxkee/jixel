@@ -38,7 +38,6 @@ use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
-use crate::quant_weights::DequantMatrices;
 use std::cell::RefCell;
 
 /// At visually lossless / near-lossless settings, transform metadata and the
@@ -140,13 +139,6 @@ impl SearchScope {
     }
 
     /// Whether the SSIM reconstruction rerank runs.
-    ///
-    /// `Full` always reranks. `Squares` only reranks at high quality: measured
-    /// on 42 images, the rerank's own marginal value inside the Fast tier is
-    /// -0.69% at d=1.0, -0.30% at d=1.5 and -0.06% at d=2.0, then flips
-    /// positive (+0.1..+0.17% at d=3.5-4.5) with the win rate falling to
-    /// ~18/42. It is also the tier's most expensive stage, so paying for it
-    /// past the crossover would cost time to lose rate.
     #[inline]
     fn rerank(self, distance: f32) -> bool {
         self == SearchScope::Full || distance <= FAST_RERANK_MAX_DISTANCE
@@ -162,11 +154,8 @@ struct SuperBlockCost {
 }
 
 thread_local! {
-    /// Reused gather scratch for [`forward_transform`] (avoids re-zeroing 1024
-    /// floats on every call). Single-threaded encode; one buffer per thread.
     static FT_GATHER_SCRATCH: RefCell<[f32; 1024]> =
         const { RefCell::new([0.0; 1024]) };
-    /// Reused per-channel coefficient scratch for [`strategy_cost`].
     static SC_COEFFS_SCRATCH: RefCell<[[f32; 1024]; 3]> =
         const { RefCell::new([[0.0; 1024]; 3]) };
 }
@@ -308,7 +297,6 @@ fn strategy_cost(
     py: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
@@ -321,7 +309,6 @@ fn strategy_cost(
         py,
         qac,
         qm_mult_x,
-        matrices,
         meta_r,
         distance,
         cmap_factor,
@@ -352,11 +339,11 @@ fn strategy_cost_large(
     py: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
 ) -> f32 {
+    let matrices = &ctx.matrices;
     DCT64_SCRATCH.with_borrow_mut(|cell| {
         let (width, height, size, cx, cy) = match strategy {
             STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
@@ -426,7 +413,6 @@ fn reconstruction_strategy_cost(
     py: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
@@ -439,7 +425,6 @@ fn reconstruction_strategy_cost(
         py,
         qac,
         qm_mult_x,
-        matrices,
         meta_r,
         distance,
         cmap_factor,
@@ -495,7 +480,8 @@ fn apply_cfl(ctx: &EncodingContext, coeffs: CflXyb<'_>, size: usize, cmap_factor
 }
 
 #[inline]
-fn inverse_matrix_for(matrices: &DequantMatrices, strategy: u8, channel: usize) -> &[f32] {
+fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[f32] {
+    let matrices = &ctx.matrices;
     match strategy {
         STRATEGY_DCT => &matrices.inv_matrix(channel)[..],
         STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(channel)[..],
@@ -516,7 +502,6 @@ fn coefficient_dist_and_rate(
     size: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     distance: f32,
     cx: usize,
     cy: usize,
@@ -529,7 +514,7 @@ fn coefficient_dist_and_rate(
             ctx.sse_and_rate,
             ctx.rate_log2_lut,
             &coeffs[c][..size],
-            inverse_matrix_for(matrices, strategy, c),
+            inverse_matrix_for(ctx, strategy, c),
             c,
             qac,
             qm_mult,
@@ -552,7 +537,6 @@ fn strategy_cost_impl(
     py: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
@@ -576,9 +560,9 @@ fn strategy_cost_impl(
                 ctx.rate_log2_lut,
                 coeffs,
                 [
-                    inverse_matrix_for(matrices, strategy, 0),
-                    inverse_matrix_for(matrices, strategy, 1),
-                    inverse_matrix_for(matrices, strategy, 2),
+                    inverse_matrix_for(ctx, strategy, 0),
+                    inverse_matrix_for(ctx, strategy, 1),
+                    inverse_matrix_for(ctx, strategy, 2),
                 ],
                 qac,
                 qm_mult_x,
@@ -593,7 +577,7 @@ fn strategy_cost_impl(
                 py,
             ),
             DistortionModel::Coefficient => coefficient_dist_and_rate(
-                ctx, strategy, coeffs, size, qac, qm_mult_x, matrices, distance, cx, cy,
+                ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
             ),
         };
         // `meta_r` prices the per-first-block AC-metadata rate (ACS + QF
@@ -649,7 +633,6 @@ fn sub8_strategy_costs(
     py: usize,
     qac: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
@@ -669,7 +652,7 @@ fn sub8_strategy_costs(
             let [x, y, b] = &mut *coeffs;
             apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
             let (distortion, rate) = coefficient_dist_and_rate(
-                ctx, strategy, coeffs, 64, qac, qm_mult_x, matrices, distance, 1, 1,
+                ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1,
             );
             distortion + RD_LAMBDA * (rate + meta_r)
         };
@@ -712,7 +695,6 @@ fn select_super_block(
     qac: [[f32; 2]; 2],
     qac_scale: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
@@ -738,7 +720,6 @@ fn select_super_block(
                 py0 + dy * 8,
                 qac[dy][dx],
                 qm_mult_x,
-                matrices,
                 meta_r,
                 distance,
                 cmap_factor,
@@ -762,7 +743,6 @@ fn select_super_block(
                 py,
                 qac,
                 qm_mult_x,
-                matrices,
                 meta_r,
                 distance,
                 cmap_factor,
@@ -783,7 +763,6 @@ fn select_super_block(
             py0,
             aggregate_qac_2x2(qac, qac_scale, distance),
             qm_mult_x,
-            matrices,
             meta_r,
             distance,
             cmap_factor,
@@ -899,6 +878,87 @@ pub(crate) fn adjust_quant_field(
     }
 }
 
+#[inline]
+fn quant_refinement_steps(distance: f32) -> usize {
+    if !(1.5..5.0).contains(&distance) {
+        0
+    } else if (2.0..3.5).contains(&distance) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Refine the already-selected transform's raw quant in reconstruction space.
+/// Unlike the transform chooser's quant-unit SSE, this cost is comparable
+/// across quantizer values. Only locally winning coarser neighbours are used;
+/// high quality, very low quality, and unsupported DCT64 reconstructions keep
+/// the masking model's original quant unchanged.
+#[allow(clippy::too_many_arguments)]
+fn refine_quant_field(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
+    distance: f32,
+    scale: f32,
+    qm_mult_x: f32,
+    quant_field: &mut ImageB,
+    ytox_map: &ImageSB,
+    ytob_map: &ImageSB,
+    ac_strategy: &AcStrategyImage,
+) {
+    let steps = quant_refinement_steps(distance);
+    if steps == 0 {
+        return;
+    }
+    for (bx, by, strategy) in ac_strategy.iter_first_blocks() {
+        if matches!(
+            strategy,
+            STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ) {
+            continue;
+        }
+        let cov_x = AcStrategyImage::covered_blocks_x_of(strategy);
+        let cov_y = AcStrategyImage::covered_blocks_y_of(strategy);
+        let current_q = quant_field.row(by)[bx];
+        if current_q <= 1 {
+            continue;
+        }
+        let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
+        let px = dc_group_px + bx * 8;
+        let py = dc_group_py + by * 8;
+        let cost = |q: u8| {
+            let qac = scale * q as f32;
+            reconstruction_strategy_cost(
+                ctx, strategy, opsin, px, py, qac, qm_mult_x, 0.0, distance, cmap,
+            )
+        };
+        let mut best_q = current_q;
+        let mut best_cost = cost(current_q);
+        let second_step = if steps == 2 {
+            current_q.saturating_sub(2)
+        } else {
+            current_q.saturating_sub(1)
+        };
+        for candidate in [current_q.saturating_sub(1), second_step] {
+            if candidate == 0 || candidate == best_q {
+                continue;
+            }
+            let candidate_cost = cost(candidate);
+            if candidate_cost < best_cost {
+                best_q = candidate;
+                best_cost = candidate_cost;
+            }
+        }
+        if best_q != current_q {
+            for iy in 0..cov_y {
+                quant_field.row_mut(by + iy)[bx..bx + cov_x].fill(best_q);
+            }
+        }
+    }
+}
+
 /// Select transforms for every aligned 2×2 super-block in the DC group, then
 /// reconcile the quant field. `(dc_group_px, dc_group_py)` is the DC group's
 /// top-left in absolute image pixels (so `opsin` can be the full image).
@@ -954,7 +1014,6 @@ fn select_band(
     dc_group_py: usize,
     scale: f32,
     qm_mult_x: f32,
-    matrices: &DequantMatrices,
     quant_field: &ImageB,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
@@ -995,7 +1054,6 @@ fn select_band(
                             qac,
                             scale,
                             qm_mult_x,
-                            matrices,
                             ytox_map,
                             ytob_map,
                             ac_strategy,
@@ -1018,7 +1076,6 @@ fn select_band(
                     dc_group_py + by * 8,
                     qac32,
                     qm_mult_x,
-                    matrices,
                     meta_r,
                     distance,
                     cmap_factor,
@@ -1038,7 +1095,6 @@ fn select_band(
                         dc_group_py + by * 8,
                         region_qac(quant_field, bx, by, cw, ch, scale, distance),
                         qm_mult_x,
-                        matrices,
                         meta_r,
                         distance,
                         cmap_factor,
@@ -1116,7 +1172,6 @@ fn select_band(
                         qac,
                         scale,
                         qm_mult_x,
-                        matrices,
                         ytox_map,
                         ytob_map,
                         ac_strategy,
@@ -1141,7 +1196,6 @@ fn select_band(
                     qac,
                     scale,
                     qm_mult_x,
-                    matrices,
                     ytox_map,
                     ytob_map,
                     ac_strategy,
@@ -1180,7 +1234,6 @@ fn select_band(
                 py,
                 qac,
                 qm_mult_x,
-                matrices,
                 meta_r,
                 distance,
                 cmap_factor,
@@ -1240,14 +1293,13 @@ pub(crate) fn fill_ac_strategy(
     distance: f32,
     scale: f32,
     x_qm_scale: u32,
-    matrices: &DequantMatrices,
     quant_field: &mut ImageB,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
     num_threads: usize,
-    speed: crate::Speed,
 ) -> f32 {
+    let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
     // DCT8 wins the high-quality RD comparison outright.
@@ -1276,7 +1328,6 @@ pub(crate) fn fill_ac_strategy(
             dc_group_py,
             scale,
             qm_mult_x,
-            matrices,
             quant_field,
             ytox_map,
             ytob_map,
@@ -1304,7 +1355,6 @@ pub(crate) fn fill_ac_strategy(
                 dc_group_py,
                 scale,
                 qm_mult_x,
-                matrices,
                 qf,
                 ytox_map,
                 ytob_map,
@@ -1349,7 +1399,6 @@ pub(crate) fn fill_ac_strategy(
                             dc_group_py + by * 8,
                             region_qac(quant_field, x, by, 4, 8, scale, distance),
                             qm_mult_x,
-                            matrices,
                             meta_r,
                             distance,
                             cmap,
@@ -1364,7 +1413,6 @@ pub(crate) fn fill_ac_strategy(
                                 dc_group_py + (by + sy) * 8,
                                 region_qac(quant_field, x, by + sy, 4, 4, scale, distance),
                                 qm_mult_x,
-                                matrices,
                                 meta_r,
                                 distance,
                                 cmap,
@@ -1392,7 +1440,6 @@ pub(crate) fn fill_ac_strategy(
                             dc_group_py + y * 8,
                             region_qac(quant_field, bx, y, 8, 4, scale, distance),
                             qm_mult_x,
-                            matrices,
                             meta_r,
                             distance,
                             cmap,
@@ -1407,7 +1454,6 @@ pub(crate) fn fill_ac_strategy(
                                 dc_group_py + y * 8,
                                 region_qac(quant_field, bx + sx, y, 4, 4, scale, distance),
                                 qm_mult_x,
-                                matrices,
                                 meta_r,
                                 distance,
                                 cmap,
@@ -1436,7 +1482,6 @@ pub(crate) fn fill_ac_strategy(
                             dc_group_py + (by + sy) * 8,
                             region_qac(quant_field, bx + sx, by + sy, 4, 4, scale, distance),
                             qm_mult_x,
-                            matrices,
                             meta_r,
                             distance,
                             cmap,
@@ -1460,7 +1505,6 @@ pub(crate) fn fill_ac_strategy(
                         dc_group_py + by * 8,
                         region_qac(quant_field, bx + sx, by, 4, 8, scale, distance),
                         qm_mult_x,
-                        matrices,
                         meta_r,
                         distance,
                         cmap,
@@ -1485,7 +1529,6 @@ pub(crate) fn fill_ac_strategy(
                         dc_group_py + (by + sy) * 8,
                         region_qac(quant_field, bx, by + sy, 8, 4, scale, distance),
                         qm_mult_x,
-                        matrices,
                         meta_r,
                         distance,
                         cmap,
@@ -1507,7 +1550,6 @@ pub(crate) fn fill_ac_strategy(
                             dc_group_py + by * 8,
                             region_qac(quant_field, bx, by, 8, 8, scale, distance),
                             qm_mult_x,
-                            matrices,
                             meta_r,
                             distance,
                             cmap,
@@ -1558,7 +1600,6 @@ pub(crate) fn fill_ac_strategy(
             scale,
             qm_mult_x,
             meta_r,
-            matrices,
             quant_field,
             ytox_map,
             ytob_map,
@@ -1567,6 +1608,19 @@ pub(crate) fn fill_ac_strategy(
     }
 
     adjust_quant_field(ac_strategy, distance, quant_field);
+    refine_quant_field(
+        ctx,
+        opsin,
+        dc_group_px,
+        dc_group_py,
+        distance,
+        scale,
+        qm_mult_x,
+        quant_field,
+        ytox_map,
+        ytob_map,
+        ac_strategy,
+    );
     benefit
 }
 
@@ -1582,7 +1636,6 @@ fn rerank_large_transforms(
     scale: f32,
     qm_mult_x: f32,
     meta_r: f32,
-    matrices: &DequantMatrices,
     quant_field: &ImageB,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
@@ -1613,7 +1666,6 @@ fn rerank_large_transforms(
             py,
             qac_big,
             qm_mult_x,
-            matrices,
             meta_r,
             distance,
             cmap_factors(ytox_map, ytob_map, bx, by),
@@ -1630,7 +1682,6 @@ fn rerank_large_transforms(
                     py + iy * 8,
                     q,
                     qm_mult_x,
-                    matrices,
                     meta_r,
                     distance,
                     cmap_factors(ytox_map, ytob_map, bx + ix, by + iy),
@@ -1655,8 +1706,8 @@ mod tests {
     use super::{
         DCT8_ONLY_MAX_DISTANCE, FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ,
         MERGE_MARGIN_PAIR_HQ, SearchScope, aggregate_qac_2x2, aggregate_quant, cmap_factors,
-        fill_ac_strategy, merge_beats_dct8, merge_margin, strategy_cost, sub8_strategy_costs,
-        use_dct8_only, use_dct64, use_dct64_rect,
+        fill_ac_strategy, merge_beats_dct8, merge_margin, quant_refinement_steps, strategy_cost,
+        sub8_strategy_costs, use_dct8_only, use_dct64, use_dct64_rect,
     };
     use crate::dc_group_data::{
         AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
@@ -1668,7 +1719,6 @@ mod tests {
     use crate::inflated_cost::{
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
-    use crate::quant_weights::DequantMatrices;
 
     #[test]
     fn high_quality_dct8_cutoff_is_half_distance() {
@@ -1678,6 +1728,17 @@ mod tests {
         assert!(use_dct8_only(0.5));
         assert!(!use_dct8_only(0.500_001));
         assert!(!use_dct8_only(1.0));
+    }
+
+    #[test]
+    fn quant_refinement_is_gated_and_conservative_at_boundaries() {
+        assert_eq!(quant_refinement_steps(1.0), 0);
+        assert_eq!(quant_refinement_steps(1.5), 1);
+        assert_eq!(quant_refinement_steps(2.0), 2);
+        assert_eq!(quant_refinement_steps(3.49), 2);
+        assert_eq!(quant_refinement_steps(3.5), 1);
+        assert_eq!(quant_refinement_steps(4.99), 1);
+        assert_eq!(quant_refinement_steps(5.0), 0);
     }
 
     #[test]
@@ -1698,12 +1759,11 @@ mod tests {
 
     #[test]
     fn dct64_selection_obeys_gate() {
-        let ctx = EncodingContext::new();
         let opsin = Image3F::new(64, 64);
-        let matrices = DequantMatrices::new();
         let maps = ImageSB::new_fill(1, 1, 0);
 
         let select = |speed, distance| {
+            let ctx = EncodingContext::new(speed, None);
             let mut qf = ImageB::new_fill(8, 8, 8);
             let mut strategies = AcStrategyImage::new(8, 8);
             fill_ac_strategy(
@@ -1714,13 +1774,11 @@ mod tests {
                 distance,
                 1.0,
                 2,
-                &matrices,
                 &mut qf,
                 &maps,
                 &maps,
                 &mut strategies,
                 1,
-                speed,
             );
             strategies.raw_strategy(0, 0)
         };
@@ -1744,8 +1802,7 @@ mod tests {
 
     #[test]
     fn standalone_dct64_rectangles_are_selected() {
-        let ctx = EncodingContext::new();
-        let matrices = DequantMatrices::new();
+        let ctx = EncodingContext::new(crate::Speed::Slow, None);
         let maps = ImageSB::new_fill(1, 1, 0);
         let select = |blocks_x, blocks_y| {
             let opsin = Image3F::new(blocks_x * 8, blocks_y * 8);
@@ -1759,13 +1816,11 @@ mod tests {
                 2.5,
                 1.0,
                 2,
-                &matrices,
                 &mut qf,
                 &maps,
                 &maps,
                 &mut strategies,
                 1,
-                crate::Speed::Slow,
             );
             strategies.raw_strategy(0, 0)
         };
@@ -1778,8 +1833,7 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new();
-        let matrices = DequantMatrices::new();
+        let ctx = EncodingContext::new(crate::Speed::Fast, None);
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);
@@ -1792,13 +1846,11 @@ mod tests {
             3.0,
             1.0,
             2,
-            &matrices,
             &mut qf,
             &maps,
             &maps,
             &mut strategies,
             1,
-            crate::Speed::Fast,
         );
         assert_eq!(strategies.raw_strategy(0, 0), STRATEGY_DCT32X32);
         for (_, _, strat) in strategies.iter_first_blocks() {
@@ -1824,8 +1876,7 @@ mod tests {
     /// above the square's must not silently disable DCT64X64.
     #[test]
     fn square_dct64_is_considered_independently_of_the_rectangle_gate() {
-        let ctx = EncodingContext::new();
-        let matrices = DequantMatrices::new();
+        let ctx = EncodingContext::new(crate::Speed::Slow, None);
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(64, 64);
         let mut qf = ImageB::new_fill(8, 8, 8);
@@ -1839,13 +1890,11 @@ mod tests {
             3.0,
             1.0,
             2,
-            &matrices,
             &mut qf,
             &maps,
             &maps,
             &mut strategies,
             1,
-            crate::Speed::Slow,
         );
         // A flat tile merges to the largest available transform; whichever of
         // the three wins, the pass must have run and produced a 64px merge.
@@ -1868,8 +1917,7 @@ mod tests {
             }
         }
 
-        let ctx = EncodingContext::new();
-        let matrices = DequantMatrices::new();
+        let ctx = EncodingContext::default();
         let (px, py) = (7usize, 9usize); // exercise right and bottom replication
         let qac = 3.75;
         let qm_mult_x = 1.25;
@@ -1885,7 +1933,6 @@ mod tests {
                 py,
                 qac,
                 qm_mult_x,
-                &matrices,
                 meta_r,
                 distance,
                 cmap,
@@ -1898,7 +1945,6 @@ mod tests {
                 py,
                 qac,
                 qm_mult_x,
-                &matrices,
                 meta_r,
                 distance,
                 cmap,
@@ -1911,7 +1957,6 @@ mod tests {
                 py,
                 qac,
                 qm_mult_x,
-                &matrices,
                 meta_r,
                 distance,
                 cmap,
@@ -1924,7 +1969,6 @@ mod tests {
                 py,
                 qac,
                 qm_mult_x,
-                &matrices,
                 meta_r,
                 distance,
                 cmap,
@@ -1933,7 +1977,7 @@ mod tests {
 
         for cached in [None, Some(independent[0])] {
             let bundled = sub8_strategy_costs(
-                &ctx, &opsin, px, py, qac, qm_mult_x, &matrices, meta_r, distance, cmap, cached,
+                &ctx, &opsin, px, py, qac, qm_mult_x, meta_r, distance, cmap, cached,
             );
             let actual = [bundled.dct8, bundled.dct4x4, bundled.dct4x8, bundled.dct8x4];
             for (a, b) in actual.into_iter().zip(independent) {
