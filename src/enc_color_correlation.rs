@@ -73,9 +73,7 @@ pub(crate) fn cfl_regression_scalar(
 pub(crate) fn selected_cfl_regression_fn() -> CflRegressionFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        return |y, x, b, qm_x, qm_b| unsafe {
-            crate::neon::cfl_regression_neon(y, x, b, qm_x, qm_b)
-        };
+        |y, x, b, qm_x, qm_b| unsafe { crate::neon::cfl_regression_neon(y, x, b, qm_x, qm_b) }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
