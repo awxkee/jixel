@@ -1711,13 +1711,7 @@ pub(crate) fn encode_with_config(
         config.progressive_passes,
         config.progressive_shifts.as_deref(),
     );
-    let ctx = EncodingContext::new_for_image(
-        config.speed,
-        config.dark_aq,
-        input.xsize(),
-        input.ysize(),
-        distance,
-    );
+    let ctx = EncodingContext::new(config.speed, config.dark_aq);
     encode_frame(
         &ctx,
         distance,
