@@ -28,7 +28,7 @@
  */
 
 use crate::Speed;
-use crate::ac_context::{BlockContextModel, K_COMPACT_BLOCK_CONTEXT_MAP};
+use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
 use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, is_sub8_strategy};
 use crate::dct::fmla;
@@ -805,7 +805,6 @@ pub(crate) fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWr
 
 fn write_dc_global(
     distp: &DistanceParams,
-    block_context_model: BlockContextModel,
     num_dc_groups: usize,
     dc_code: &EntropyCode,
     alpha: Option<&AlphaPlane>,
@@ -825,7 +824,7 @@ fn write_dc_global(
         let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
         let empty_freqs: [Vec<u16>; 0] = [];
         let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
-        let block_context_map = block_context_model.context_map();
+        let block_context_map = &K_COMPACT_BLOCK_CONTEXT_MAP;
         let cm_entropy = EntropyCode {
             context_map: block_context_map,
             num_contexts: block_context_map.len(),
@@ -1098,10 +1097,8 @@ fn encode_frame_core(
         for pg in &all_pending {
             provisional_tokens.extend_from_slice(&pg.tokens[0]);
         }
-        let provisional_code = crate::entropy::optimize_entropy_code_ac(
-            &provisional_tokens,
-            ctx.block_context_model.num_ac_contexts(),
-        );
+        let provisional_code =
+            crate::entropy::optimize_entropy_code_ac(&provisional_tokens, K_NUM_AC_CONTEXTS);
         let prices = crate::entropy::FrozenTokenPrices::new(&provisional_code);
         refine_cfl_maps_with_prices(
             ctx,
@@ -1156,7 +1153,7 @@ fn encode_frame_core(
     let dc_code_owned = crate::entropy::optimize_entropy_code_ac(&all_dc_tokens, K_NUM_DC_CONTEXTS);
     let dc_code = dc_code_owned.as_ref();
 
-    let ac_num_contexts = ctx.block_context_model.num_ac_contexts() + 1;
+    let ac_num_contexts = K_NUM_AC_CONTEXTS + 1;
 
     // Per-pass aggregated tokens -> per-pass entropy code. Pass 0 (coarse) and
     // the residual pass(es) have very different token distributions, so a single
@@ -1169,12 +1166,7 @@ fn encode_frame_core(
     }
     let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> = pass_tokens_agg
         .iter()
-        .map(|toks| {
-            crate::entropy::optimize_entropy_code_ac(
-                toks,
-                ctx.block_context_model.num_ac_contexts(),
-            )
-        })
+        .map(|toks| crate::entropy::optimize_entropy_code_ac(toks, K_NUM_AC_CONTEXTS))
         .collect();
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
@@ -1208,7 +1200,6 @@ fn encode_frame_core(
     }
     write_dc_global(
         &distp,
-        ctx.block_context_model,
         dim.num_dc_groups,
         &dc_code,
         alpha,

@@ -29,9 +29,9 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::ac_context::{
-    BlockContextModel, K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16,
-    K_COEFF_ORDER_32X16, K_COEFF_ORDER_32X32, K_COEFF_ORDER_64X32, coeff_order_64x64,
-    zero_density_context, zero_density_context_8x8,
+    K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, K_COEFF_ORDER_32X16,
+    K_COEFF_ORDER_32X32, K_COEFF_ORDER_64X32, block_context, coeff_order_64x64, non_zero_context,
+    zero_density_context, zero_density_context_8x8, zero_density_contexts_offset,
 };
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
@@ -169,7 +169,6 @@ fn rdoq_block(
     cx: usize,
     cy: usize,
     distance: f32,
-    context_model: BlockContextModel,
     choices: &mut Vec<u8>,
     costs: &mut [Vec<f32>; 2],
 ) {
@@ -190,8 +189,8 @@ fn rdoq_block(
         return;
     }
 
-    let block_ctx = context_model.block_context(c, strategy_code);
-    let histo_offset = context_model.zero_density_contexts_offset(block_ctx);
+    let block_ctx = block_context(c, strategy_code);
+    let histo_offset = zero_density_contexts_offset(block_ctx);
     let log2_covered_blocks = covered_blocks.trailing_zeros() as usize;
     let context = |remaining: usize, k: usize, prev: usize| -> u32 {
         histo_offset
@@ -283,7 +282,7 @@ fn rdoq_block(
         original_after_nzeros += usize::from(block[idx] != 0);
     }
 
-    let nzero_ctx = context_model.non_zero_context(predicted as u32, block_ctx);
+    let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
     let mut best_remaining = 0;
     let mut best_cost = f32::INFINITY;
     for remaining in 0..=max_nzeros {
@@ -987,7 +986,6 @@ pub(crate) fn write_ac_group(
                         cx,
                         cy,
                         distance,
-                        ctx.block_context_model,
                         rdoq_choices,
                         rdoq_costs,
                     );
@@ -1282,13 +1280,9 @@ pub(crate) fn write_ac_group(
                         let row = num_nzeros.plane_row(c, nz_by);
                         let predicted = predict_from_top_and_left(row_top, row, bx, 32);
 
-                        let block_ctx = ctx.block_context_model.block_context(c, strategy_code);
-                        let nzero_ctx = ctx
-                            .block_context_model
-                            .non_zero_context(predicted as u32, block_ctx);
-                        let histo_offset = ctx
-                            .block_context_model
-                            .zero_density_contexts_offset(block_ctx);
+                        let block_ctx = block_context(c, strategy_code);
+                        let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
+                        let histo_offset = zero_density_contexts_offset(block_ctx);
 
                         write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
 
