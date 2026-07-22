@@ -94,7 +94,7 @@ const CFL_DEADZONE_AMOUNT: f32 = 1.5;
 const CFL_DEADZONE_LO: f32 = 1.0;
 const CFL_DEADZONE_HI: f32 = 2.0;
 
-/// Scheduled deadzone amount for a given butteraugli `distance`.
+#[inline]
 fn cfl_deadzone(distance: f32) -> f32 {
     if distance <= CFL_DEADZONE_LO {
         return CFL_DEADZONE_AMOUNT;
