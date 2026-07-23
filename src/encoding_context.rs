@@ -29,6 +29,7 @@
 
 use crate::dark_aq::DarkAqConfig;
 use crate::quant_weights::DequantMatrices;
+use crate::thread_pool::ThreadPool;
 use crate::{
     Speed, adaptive_quant, dct, enc_ac_strategy, enc_color_correlation, enc_group, enc_xyb,
     inflated_cost,
@@ -38,9 +39,10 @@ use crate::{
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
 pub(crate) struct EncodingContext {
+    pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
     pub(crate) boost: Option<DarkAqConfig>,
-    pub(crate) matrices: DequantMatrices,
+    pub(crate) matrices: &'static DequantMatrices,
     pub(crate) to_xyb_band: enc_xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -59,17 +61,20 @@ pub(crate) struct EncodingContext {
     pub(crate) dct32x32: &'static dct::DctFn<1024>,
     pub(crate) dct32x16: &'static dct::DctFn<512>,
     pub(crate) dct16x32: &'static dct::DctFn<512>,
-    pub(crate) dct64x64: &'static dct::DctFn<4096>,
-    pub(crate) dct64x32: &'static dct::DctFn<2048>,
-    pub(crate) dct32x64: &'static dct::DctFn<2048>,
 }
 
 impl EncodingContext {
-    pub(crate) fn new(speed: Speed, boost: Option<DarkAqConfig>) -> Self {
+    pub(crate) fn new(
+        speed: Speed,
+        boost: Option<DarkAqConfig>,
+        distance: f32,
+        num_threads: usize,
+    ) -> Self {
         Self {
+            thread_pool: ThreadPool::new(num_threads),
             speed,
             boost,
-            matrices: DequantMatrices::new(),
+            matrices: DequantMatrices::new(distance),
             to_xyb_band: enc_xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
@@ -88,9 +93,6 @@ impl EncodingContext {
             dct32x32: dct::selected_dct32x32(),
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
-            dct64x64: dct::selected_dct64x64(),
-            dct64x32: dct::selected_dct64x32(),
-            dct32x64: dct::selected_dct32x64(),
         }
     }
 }
@@ -98,6 +100,6 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None)
+        Self::new(Speed::Fast, None, 1.0, 1)
     }
 }

@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
@@ -58,6 +59,7 @@ pub(crate) fn write_lfglobal_alpha_section(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     assert_eq!(alpha.len(), xsize * ysize);
@@ -65,8 +67,8 @@ pub(crate) fn write_lfglobal_alpha_section(
         // Small path: everything in the LfGlobal section.
         write_group_header_local_tree(w);
         let tokens = tokenize_channel(alpha, xsize, ysize, 0, 0, xsize, ysize, xsize);
-        let pixel_code = build_pixel_code(&tokens);
-        write_tree_and_pixel_histograms(&pixel_code, w);
+        let pixel_code = build_pixel_code(&tokens, scratch);
+        write_tree_and_pixel_histograms(&pixel_code, scratch, w);
         let code_ref = pixel_code.as_ref();
         for tok in &tokens {
             write_token(*tok, &code_ref, w);
@@ -85,9 +87,10 @@ pub(crate) fn write_global_alpha_modular(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    write_lfglobal_alpha_section(alpha, xsize, ysize, w);
+    write_lfglobal_alpha_section(alpha, xsize, ysize, scratch, w);
 }
 
 pub(crate) fn write_ac_group_alpha(
@@ -98,6 +101,7 @@ pub(crate) fn write_ac_group_alpha(
     y0: usize,
     gw: usize,
     gh: usize,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     // Small-image path: alpha lives entirely in LfGlobal; nothing per group.
@@ -133,11 +137,11 @@ pub(crate) fn write_ac_group_alpha(
     }
 
     const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
-    let pixel_code = build_pixel_code_n(&tokens, NUM_CTX);
+    let pixel_code = build_pixel_code_n(&tokens, NUM_CTX, scratch);
     write_group_header_local_tree(w); // use_global_tree=0, wp default, 0 transforms
-    write_split_tree(w); // 2-leaf Gradient tree, split on property 9 at 0
+    write_split_tree(scratch, w); // 2-leaf Gradient tree, split on property 9 at 0
     w.write(1, 0); // no LZ77 for the pixel entropy code
-    write_entropy_code(&pixel_code.as_ref(), w); // context map + 2 prefix codes
+    write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w); // context map + 2 prefix codes
     let code_ref = pixel_code.as_ref();
     for tok in &tokens {
         write_token(*tok, &code_ref, w);
@@ -199,7 +203,11 @@ fn write_group_header_global_tree(w: &mut BitWriter) {
     w.write(2, 0); // 0 transforms
 }
 
-pub(crate) fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_tree_and_pixel_histograms(
+    pixel_code: &OwnedEntropyCode,
+    scratch: &mut CoderScratch,
+    w: &mut BitWriter,
+) {
     let tree_tokens = [
         Token::new(TREE_CTX_PROPERTY, 0),
         Token::new(TREE_CTX_PREDICTOR, PREDICTOR_GRADIENT),
@@ -207,11 +215,12 @@ pub(crate) fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: 
         Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
         Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
     ];
-    let tree_code = optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS);
+    let tree_code =
+        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
     let tree_code_ref = tree_code.as_ref();
 
     w.write(1, 0); // no LZ77 for tree entropy code
-    write_entropy_code(&tree_code_ref, w);
+    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
     for tok in &tree_tokens {
         write_token(*tok, &tree_code_ref, w);
     }
@@ -219,7 +228,12 @@ pub(crate) fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: 
     // num_contexts = 1: decoder skips context map entirely — write prefix
     // codes directly (no write_context_map).
     w.write(1, 0); // no LZ77 for pixel entropy code
-    write_prefix_codes(&pixel_code.prefix_codes, &pixel_code.hybrid_uint_configs, w);
+    write_prefix_codes(
+        &pixel_code.prefix_codes,
+        &pixel_code.hybrid_uint_configs,
+        &mut scratch.huffman_pool,
+        w,
+    );
 }
 
 /// Like `write_tree_and_pixel_histograms` but emits a 2-leaf tree that splits on
@@ -232,7 +246,7 @@ pub(crate) fn write_tree_and_pixel_histograms(pixel_code: &OwnedEntropyCode, w: 
 /// splitval 0, followed by two Gradient-predictor leaves. The pixel entropy
 /// code is written separately by the caller (so it can choose plain vs LZ77).
 #[allow(dead_code)]
-fn write_split_tree(w: &mut BitWriter) {
+fn write_split_tree(scratch: &mut CoderScratch, w: &mut BitWriter) {
     // Property index 9 = raw gradient (W+N-NW) in libjxl's property order.
     const PROP_GRAD: u32 = 9;
     let tree_tokens = [
@@ -252,11 +266,12 @@ fn write_split_tree(w: &mut BitWriter) {
         Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
         Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
     ];
-    let tree_code = optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS);
+    let tree_code =
+        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
     let tree_code_ref = tree_code.as_ref();
 
     w.write(1, 0); // no LZ77 for tree entropy code
-    write_entropy_code(&tree_code_ref, w);
+    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
     for tok in &tree_tokens {
         write_token(*tok, &tree_code_ref, w);
     }
@@ -282,18 +297,26 @@ fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
     bits
 }
 
-pub(crate) fn build_pixel_code(tokens: &[Token]) -> OwnedEntropyCode {
-    build_pixel_code_n(tokens, 1)
+pub(crate) fn build_pixel_code(tokens: &[Token], scratch: &mut CoderScratch) -> OwnedEntropyCode {
+    build_pixel_code_n(tokens, 1, scratch)
 }
 
-fn build_pixel_code_n(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+fn build_pixel_code_n(
+    tokens: &[Token],
+    num_contexts: usize,
+    scratch: &mut CoderScratch,
+) -> OwnedEntropyCode {
     let mut code = if num_contexts > 1 {
         // Keep contexts separate — the whole point of the multi-leaf alpha tree
         // is that the bulk-zero leaf must not be merged with the rare-corner
         // leaf, or it loses its single-symbol (zero-bit) property.
-        crate::entropy::build_entropy_code_no_cluster(tokens, num_contexts)
+        crate::entropy::build_entropy_code_no_cluster(
+            tokens,
+            num_contexts,
+            &mut scratch.huffman_pool,
+        )
     } else {
-        optimize_entropy_code(tokens, num_contexts)
+        optimize_entropy_code(tokens, num_contexts, &mut scratch.huffman_pool)
     };
     for pc in &mut code.prefix_codes {
         // Count non-zero depths and remember the position of the only one (if any).
@@ -422,7 +445,8 @@ mod tests {
         let mut w = BitWriter::new();
         let chan = vec![128u8; 8 * 8];
         let alpha = AlphaPlane::from_u8(chan);
-        write_global_alpha_modular(&alpha, 8, 8, &mut w);
+        let mut scratch = CoderScratch::default();
+        write_global_alpha_modular(&alpha, 8, 8, &mut scratch, &mut w);
         let bits = w.bits_written();
         w.zero_pad_to_byte();
         assert!(w.into_bytes().len() > 0);
@@ -434,7 +458,8 @@ mod tests {
         let mut w = BitWriter::new();
         let chan = vec![200u8; 512 * 400];
         let alpha = AlphaPlane::from_u8(chan);
-        write_lfglobal_alpha_section(&alpha, 512, 400, &mut w);
+        let mut scratch = CoderScratch::default();
+        write_lfglobal_alpha_section(&alpha, 512, 400, &mut scratch, &mut w);
         // Large path: only 4 bits (GroupHeader).
         assert_eq!(w.bits_written(), 4);
     }

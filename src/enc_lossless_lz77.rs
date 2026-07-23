@@ -28,10 +28,11 @@
  */
 use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens};
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
-    Histogram, OwnedEntropyCode, Token, optimize_entropy_code, write_entropy_code, write_token,
+    EntropyCode, Histogram, Token, build_huffman_codes_into, cluster_histograms_fixed,
+    optimize_entropy_code, write_entropy_code, write_token,
 };
-use std::cell::RefCell;
 
 pub(super) const LZ77_MIN_SYMBOL: u32 = 64;
 pub(super) const LZ77_MIN_LENGTH: u32 = 3;
@@ -57,17 +58,37 @@ pub(super) fn lz77_length_encode(length_value: u32) -> (u32, u32, u32) {
 
 /// One emission unit in an LZ77-compressed token stream.
 #[derive(Clone, Copy)]
-pub(super) enum LzToken {
-    Pixel {
-        context: u32,
-        value: u32,
-    },
-    Lz77 {
-        pixel_context: u32,
-        distance_context: u32,
-        length_value: u32,
-        distance_value: u32,
-    },
+pub(crate) struct LzToken {
+    context: u32,
+    value: u32,
+    /// Zero denotes a literal. Encoded LZ77 distances are always at least one.
+    distance: u32,
+}
+
+impl LzToken {
+    #[inline]
+    fn pixel(context: u32, value: u32) -> Self {
+        Self {
+            context,
+            value,
+            distance: 0,
+        }
+    }
+
+    #[inline]
+    fn lz77(context: u32, length_value: u32, distance_value: u32) -> Self {
+        debug_assert_ne!(distance_value, 0);
+        Self {
+            context,
+            value: length_value,
+            distance: distance_value,
+        }
+    }
+
+    #[inline]
+    fn is_lz77(self) -> bool {
+        self.distance != 0
+    }
 }
 
 #[inline]
@@ -86,34 +107,28 @@ fn hash(tokens: &[Token], pos: usize) -> usize {
     fingerprint(tokens, pos) as usize & ((1 << HASH_BITS) - 1)
 }
 
-thread_local! {
-    static REPETITIONS_SCRATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-}
-
-fn has_repetition(tokens: &[Token]) -> bool {
+fn has_repetition(tokens: &[Token], scratch: &mut Vec<u32>) -> bool {
     const MAX_SAMPLES: usize = 8_192;
     const SAMPLE_TABLE_SIZE: usize = 1 << 14;
     if tokens.len() < 256 {
         return true;
     }
-    REPETITIONS_SCRATCH.with_borrow_mut(|scratch| {
-        let stride = tokens.len().div_ceil(MAX_SAMPLES).max(1);
-        if scratch.len() < SAMPLE_TABLE_SIZE {
-            scratch.resize(SAMPLE_TABLE_SIZE, 0);
-        }
-        scratch.fill(0);
-        let table = scratch;
-        let mut samples = 0usize;
-        let mut repeats = 0usize;
-        for pos in (0..tokens.len().saturating_sub(2)).step_by(stride) {
-            let fingerprint = fingerprint(tokens, pos) | 1;
-            let slot = fingerprint as usize & (SAMPLE_TABLE_SIZE - 1);
-            repeats += usize::from(table[slot] == fingerprint);
-            table[slot] = fingerprint;
-            samples += 1;
-        }
-        repeats * 5 >= samples
-    })
+    let stride = tokens.len().div_ceil(MAX_SAMPLES).max(1);
+    if scratch.len() < SAMPLE_TABLE_SIZE {
+        scratch.resize(SAMPLE_TABLE_SIZE, 0);
+    }
+    scratch.fill(0);
+    let table = scratch;
+    let mut samples = 0usize;
+    let mut repeats = 0usize;
+    for pos in (0..tokens.len().saturating_sub(2)).step_by(stride) {
+        let fingerprint = fingerprint(tokens, pos) | 1;
+        let slot = fingerprint as usize & (SAMPLE_TABLE_SIZE - 1);
+        repeats += usize::from(table[slot] == fingerprint);
+        table[slot] = fingerprint;
+        samples += 1;
+    }
+    repeats * 5 >= samples
 }
 
 fn match_len(tokens: &[Token], a: usize, b: usize) -> usize {
@@ -174,8 +189,56 @@ fn find_match(
 }
 
 #[cfg(test)]
-fn lz77_compress(tokens: &[Token], distance_context: u32) -> Vec<LzToken> {
-    lz77_compress_with_depth(tokens, distance_context, 8)
+fn lz77_compress(tokens: &[Token]) -> Vec<LzToken> {
+    let mut scratch = CoderScratch::default();
+    lz77_compress_with_depth_into(tokens, 8, &mut scratch.lz_depth, &mut scratch.lz_candidate);
+    scratch.lz_candidate.clone()
+}
+
+#[derive(Clone)]
+struct RunLzTokens<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    pending: Option<LzToken>,
+}
+
+impl<'a> RunLzTokens<'a> {
+    fn new(tokens: &'a [Token]) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            pending: None,
+        }
+    }
+}
+
+impl Iterator for RunLzTokens<'_> {
+    type Item = LzToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(token) = self.pending.take() {
+            return Some(token);
+        }
+        let token = *self.tokens.get(self.pos)?;
+        let mut end = self.pos + 1;
+        while end < self.tokens.len()
+            && self.tokens[end].context == token.context
+            && self.tokens[end].value == token.value
+        {
+            end += 1;
+        }
+        let copied = end - self.pos - 1;
+        self.pos += 1;
+        if copied >= LZ77_MIN_LENGTH as usize {
+            self.pending = Some(LzToken::lz77(
+                token.context,
+                copied as u32 - LZ77_MIN_LENGTH,
+                LZ77_DIST_VALUE,
+            ));
+            self.pos = end;
+        }
+        Some(LzToken::pixel(token.context, token.value))
+    }
 }
 
 #[inline]
@@ -183,51 +246,72 @@ pub(super) fn lz77_compress_for_speed(
     tokens: &[Token],
     distance_context: u32,
     speed: crate::Speed,
+    scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
-    if speed == crate::Speed::Fast || !has_repetition(tokens) {
-        return lz77_compress_runs(tokens, distance_context);
+    if speed == crate::Speed::Fast || !has_repetition(tokens, &mut scratch.lz_repetitions) {
+        return lz77_compress_runs(tokens);
     }
-    let deep = lz77_compress_with_depth(tokens, distance_context, 8);
+    lz77_compress_with_depth_into(tokens, 8, &mut scratch.lz_depth, &mut scratch.lz_candidate);
     let run_token_count = run_token_count(tokens);
-    if deep.len() * 100 > run_token_count * 90 {
-        return lz77_compress_runs(tokens, distance_context);
+    if scratch.lz_candidate.len() * 100 > run_token_count * 90 {
+        return lz77_compress_runs(tokens);
     }
-    let runs = lz77_compress_runs(tokens, distance_context);
-    if estimate_payload_bits(&deep, distance_context) * 100
-        <= estimate_payload_bits(&runs, distance_context) * 90
-    {
-        deep
+    let deep_bits = estimate_payload_bits(
+        scratch.lz_candidate.iter().copied(),
+        distance_context,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    let run_bits = estimate_payload_bits(
+        RunLzTokens::new(tokens),
+        distance_context,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    if deep_bits * 100 <= run_bits * 90 {
+        scratch.lz_candidate.clone()
     } else {
-        runs
+        lz77_compress_runs(tokens)
     }
 }
 
-fn estimate_payload_bits(tokens: &[LzToken], distance_context: u32) -> u64 {
+fn estimate_payload_bits<I>(
+    tokens: I,
+    distance_context: u32,
+    scratch: &mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> u64
+where
+    I: Iterator<Item = LzToken> + Clone,
+{
     let num_contexts = distance_context as usize + 1;
-    let context_map: Vec<u8> = (0..num_contexts as u8).collect();
-    let histograms = lz_build_histograms(tokens, &context_map, num_contexts, LZ77_MIN_SYMBOL);
-    let codes = crate::entropy::build_huffman_codes(&histograms);
+    assert!(num_contexts <= LZ77_MAX_CONTEXTS);
+    let histograms = &mut scratch.histograms[..num_contexts];
+    histograms.fill(Histogram::new());
+    for (context, slot) in scratch.context_map[..num_contexts].iter_mut().enumerate() {
+        *slot = context as u8;
+    }
+    lz_add_histograms(
+        tokens.clone(),
+        &scratch.context_map[..num_contexts],
+        histograms,
+        LZ77_MIN_SYMBOL,
+        distance_context,
+    );
+    let codes = &mut scratch.prefix_codes[..num_contexts];
+    build_huffman_codes_into(histograms, codes, huffman_pool);
     let mut bits = 0u64;
-    for &token in tokens {
-        match token {
-            LzToken::Pixel { context, value } => {
-                let (symbol, nbits, _) = crate::entropy::uint_encode(value);
-                bits += codes[context as usize].depths[symbol as usize] as u64 + nbits as u64;
-            }
-            LzToken::Lz77 {
-                pixel_context,
-                length_value,
-                distance_value,
-                ..
-            } => {
-                let (symbol, nbits, _) = lz77_length_encode(length_value);
-                bits += codes[pixel_context as usize].depths[(LZ77_MIN_SYMBOL + symbol) as usize]
-                    as u64
-                    + nbits as u64;
-                let (symbol, nbits, _) = crate::entropy::uint_encode(distance_value);
-                bits +=
-                    codes[distance_context as usize].depths[symbol as usize] as u64 + nbits as u64;
-            }
+    for token in tokens {
+        if token.is_lz77() {
+            let (symbol, nbits, _) = lz77_length_encode(token.value);
+            bits += codes[token.context as usize].depths[(LZ77_MIN_SYMBOL + symbol) as usize]
+                as u64
+                + nbits as u64;
+            let (symbol, nbits, _) = crate::entropy::uint_encode(token.distance);
+            bits += codes[distance_context as usize].depths[symbol as usize] as u64 + nbits as u64;
+        } else {
+            let (symbol, nbits, _) = crate::entropy::uint_encode(token.value);
+            bits += codes[token.context as usize].depths[symbol as usize] as u64 + nbits as u64;
         }
     }
     bits
@@ -256,267 +340,212 @@ fn run_token_count(tokens: &[Token]) -> usize {
     count
 }
 
-pub(super) fn lz77_compress_runs(tokens: &[Token], distance_context: u32) -> Vec<LzToken> {
-    let mut out = Vec::with_capacity(tokens.len());
+pub(super) fn lz77_compress_runs(tokens: &[Token]) -> Vec<LzToken> {
+    let mut out = Vec::with_capacity(run_token_count(tokens));
+    out.extend(RunLzTokens::new(tokens));
+    out
+}
+
+fn lz77_compress_with_depth_into(
+    tokens: &[Token],
+    max_probes: usize,
+    scratch: &mut Vec<u32>,
+    out: &mut Vec<LzToken>,
+) {
+    out.clear();
+    debug_assert!(
+        out.capacity() >= tokens.len(),
+        "LZ77 candidate scratch was not fully preallocated"
+    );
+    const HEAD_LEN: usize = 1 << 18;
+    let total = HEAD_LEN + tokens.len();
+    if scratch.len() < total {
+        scratch.resize(total, u32::MAX);
+    }
+    scratch[..HEAD_LEN].fill(u32::MAX);
+    let (head, tail) = scratch.split_at_mut(HEAD_LEN);
+    let (prev, _) = tail.split_at_mut(tokens.len());
     let mut i = 0usize;
     while i < tokens.len() {
-        let token = tokens[i];
-        out.push(LzToken::Pixel {
-            context: token.context,
-            value: token.value,
-        });
-        let mut end = i + 1;
-        while end < tokens.len()
-            && tokens[end].context == token.context
-            && tokens[end].value == token.value
-        {
-            end += 1;
-        }
-        let copied = end - i - 1;
-        if copied >= LZ77_MIN_LENGTH as usize {
-            out.push(LzToken::Lz77 {
-                pixel_context: token.context,
-                distance_context,
-                length_value: copied as u32 - LZ77_MIN_LENGTH,
-                distance_value: LZ77_DIST_VALUE,
-            });
-            i = end;
+        let (match_len, distance) = find_match(tokens, i, head, prev, max_probes);
+        let threshold = if distance <= 16 { 4 } else { 5 };
+        if match_len >= threshold {
+            let token_hash = hash(tokens, i);
+            let old_head = head[token_hash];
+            prev[i] = old_head;
+            head[token_hash] = i as u32;
+            let (next_len, _) = if i + 1 < tokens.len() {
+                find_match(tokens, i + 1, head, prev, max_probes)
+            } else {
+                (0, 0)
+            };
+            if next_len > match_len + 1 {
+                let token = tokens[i];
+                out.push(LzToken::pixel(token.context, token.value));
+                i += 1;
+                continue;
+            }
+            head[token_hash] = old_head;
+            prev[i] = u32::MAX;
+            let distance_value = if distance == 1 {
+                LZ77_DIST_VALUE
+            } else {
+                LZ77_NUM_SPECIAL_DISTANCES + distance as u32 - 1
+            };
+            out.push(LzToken::lz77(
+                tokens[i].context,
+                match_len as u32 - LZ77_MIN_LENGTH,
+                distance_value,
+            ));
+            for pos in i..i + match_len {
+                let token_hash = hash(tokens, pos);
+                prev[pos] = head[token_hash];
+                head[token_hash] = pos as u32;
+            }
+            i += match_len;
         } else {
+            let token = tokens[i];
+            out.push(LzToken::pixel(token.context, token.value));
+            let token_hash = hash(tokens, i);
+            prev[i] = head[token_hash];
+            head[token_hash] = i as u32;
             i += 1;
         }
     }
-    out
 }
 
-thread_local! {
-    static DEPTH_SCRATCH: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-}
-
-pub(super) fn release_tls_scratch() {
-    REPETITIONS_SCRATCH.with_borrow_mut(|scratch| *scratch = Vec::new());
-    DEPTH_SCRATCH.with_borrow_mut(|scratch| *scratch = Vec::new());
-}
-
-#[cfg(test)]
-pub(super) fn tls_scratch_capacity() -> usize {
-    REPETITIONS_SCRATCH.with_borrow(|scratch| scratch.capacity())
-        + DEPTH_SCRATCH.with_borrow(|scratch| scratch.capacity())
-}
-
-fn lz77_compress_with_depth(
-    tokens: &[Token],
-    distance_context: u32,
-    max_probes: usize,
-) -> Vec<LzToken> {
-    let mut out = Vec::with_capacity(tokens.len());
-    DEPTH_SCRATCH.with_borrow_mut(|scratch| {
-        const HEAD_LEN: usize = 1 << 18;
-        let total = HEAD_LEN + tokens.len();
-        if scratch.len() < total {
-            scratch.resize(total, u32::MAX);
-        }
-        scratch[..HEAD_LEN].fill(u32::MAX);
-        let (head, tail) = scratch.split_at_mut(HEAD_LEN);
-        let (prev, _) = tail.split_at_mut(tokens.len());
-        let mut i = 0usize;
-        while i < tokens.len() {
-            let (match_len, distance) = find_match(tokens, i, head, prev, max_probes);
-            let threshold = if distance <= 16 { 4 } else { 5 };
-            if match_len >= threshold {
-                let token_hash = hash(tokens, i);
-                let old_head = head[token_hash];
-                prev[i] = old_head;
-                head[token_hash] = i as u32;
-                let (next_len, _) = if i + 1 < tokens.len() {
-                    find_match(tokens, i + 1, head, prev, max_probes)
-                } else {
-                    (0, 0)
-                };
-                if next_len > match_len + 1 {
-                    let token = tokens[i];
-                    out.push(LzToken::Pixel {
-                        context: token.context,
-                        value: token.value,
-                    });
-                    i += 1;
-                    continue;
-                }
-                head[token_hash] = old_head;
-                prev[i] = u32::MAX;
-                let distance_value = if distance == 1 {
-                    LZ77_DIST_VALUE
-                } else {
-                    LZ77_NUM_SPECIAL_DISTANCES + distance as u32 - 1
-                };
-                out.push(LzToken::Lz77 {
-                    pixel_context: tokens[i].context,
-                    distance_context,
-                    length_value: match_len as u32 - LZ77_MIN_LENGTH,
-                    distance_value,
-                });
-                for pos in i..i + match_len {
-                    let token_hash = hash(tokens, pos);
-                    prev[pos] = head[token_hash];
-                    head[token_hash] = pos as u32;
-                }
-                i += match_len;
-            } else {
-                let token = tokens[i];
-                out.push(LzToken::Pixel {
-                    context: token.context,
-                    value: token.value,
-                });
-                let token_hash = hash(tokens, i);
-                prev[i] = head[token_hash];
-                head[token_hash] = i as u32;
-                i += 1;
-            }
-        }
-    });
-    out
-}
-
-fn lz_build_histograms(
-    toks: &[LzToken],
+fn lz_add_histograms<I>(
+    toks: I,
     context_map: &[u8],
-    num_clusters: usize,
+    histograms: &mut [Histogram],
     min_symbol: u32,
-) -> Vec<Histogram> {
-    let mut hs = vec![Histogram::new(); num_clusters];
+    distance_context: u32,
+) where
+    I: IntoIterator<Item = LzToken>,
+{
     for t in toks {
-        match *t {
-            LzToken::Pixel { context, value } => {
-                let (sym, _, _) = crate::entropy::uint_encode(value);
-                let cluster = context_map[context as usize] as usize;
-                hs[cluster].add(sym);
-            }
-            LzToken::Lz77 {
-                pixel_context,
-                distance_context,
-                length_value,
-                distance_value,
-            } => {
-                let (len_tok, _, _) = lz77_length_encode(length_value);
-                let pixel_cluster = context_map[pixel_context as usize] as usize;
-                hs[pixel_cluster].add(min_symbol + len_tok);
+        if t.is_lz77() {
+            let (len_tok, _, _) = lz77_length_encode(t.value);
+            let pixel_cluster = context_map[t.context as usize] as usize;
+            histograms[pixel_cluster].add(min_symbol + len_tok);
 
-                let dist_cluster = context_map[distance_context as usize] as usize;
-                let (symbol, _, _) = crate::entropy::uint_encode(distance_value);
-                hs[dist_cluster].add(symbol);
-            }
+            let dist_cluster = context_map[distance_context as usize] as usize;
+            let (symbol, _, _) = crate::entropy::uint_encode(t.distance);
+            histograms[dist_cluster].add(symbol);
+        } else {
+            let (sym, _, _) = crate::entropy::uint_encode(t.value);
+            let cluster = context_map[t.context as usize] as usize;
+            histograms[cluster].add(sym);
         }
     }
-    hs
 }
 
 /// Build per-cluster prefix codes from an `LzToken` stream.
 /// `nb_chans + 1` contexts: `nb_chans` channel leaves + 1 distance context.
-pub(super) fn build_lz_pixel_code(
-    toks: &[LzToken],
+pub(super) fn build_lz_pixel_code<'tokens, 'scratch, I>(
+    streams: I,
     nb_chans: usize,
     min_symbol: u32,
     refined: bool,
-) -> OwnedEntropyCode {
-    let refined = refined
-        && toks.iter().any(|token| {
-            matches!(
-                token,
-                LzToken::Lz77 { distance_value, .. }
-                    if *distance_value != LZ77_DIST_VALUE
-            )
-        });
-    use crate::entropy::build_huffman_codes;
-    use crate::entropy::cluster_histograms;
-
+    scratch: &'scratch mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> EntropyCode<'scratch>
+where
+    I: Iterator<Item = &'tokens [LzToken]> + Clone,
+{
+    let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
-    let context_map_initial: Vec<u8> = (0..num_contexts).map(|i| i as u8).collect();
-    let mut histograms = lz_build_histograms(toks, &context_map_initial, num_contexts, min_symbol);
-
-    let mut context_map: Vec<u8> = Vec::new();
-    if refined {
-        crate::entropy::cluster_histograms_refined(&mut histograms, &mut context_map);
-    } else {
-        cluster_histograms(&mut histograms, &mut context_map);
+    assert!(num_contexts <= LZ77_MAX_CONTEXTS);
+    let refined = refined
+        && streams.clone().any(|toks| {
+            toks.iter()
+                .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
+        });
+    let LzEntropyScratch {
+        histograms,
+        prefix_codes,
+        context_map,
+        configs,
+        clustering,
+    } = scratch;
+    let histograms = &mut histograms[..num_contexts];
+    histograms.fill(Histogram::new());
+    for (context, slot) in context_map[..num_contexts].iter_mut().enumerate() {
+        *slot = context as u8;
+    }
+    for toks in streams.clone() {
+        lz_add_histograms(
+            toks.iter().copied(),
+            &context_map[..num_contexts],
+            histograms,
+            min_symbol,
+            distance_context,
+        );
     }
 
-    let hybrid_uint_configs = if refined {
-        let mut raw_values = vec![Vec::<u32>::new(); histograms.len()];
-        let mut literal_values = vec![Vec::<u32>::new(); histograms.len()];
-        for &tok in toks {
-            match tok {
-                LzToken::Pixel { context, value } => {
-                    let cluster = context_map[context as usize] as usize;
-                    raw_values[cluster].push(value);
-                    literal_values[cluster].push(value);
-                }
-                LzToken::Lz77 {
-                    distance_context,
-                    distance_value,
-                    ..
-                } => {
-                    raw_values[context_map[distance_context as usize] as usize]
-                        .push(distance_value);
+    let num_clusters = cluster_histograms_fixed(
+        histograms,
+        &mut context_map[..num_contexts],
+        refined,
+        clustering,
+        huffman_pool,
+    );
+    let histograms = &mut histograms[..num_clusters];
+    let configs = &mut configs[..num_clusters];
+
+    if refined {
+        let mut raw_values = vec![Vec::<u32>::new(); num_clusters];
+        let mut literal_values = vec![Vec::<u32>::new(); num_clusters];
+        for toks in streams.clone() {
+            for &tok in toks {
+                if tok.is_lz77() {
+                    raw_values[context_map[distance_context as usize] as usize].push(tok.distance);
+                } else {
+                    let cluster = context_map[tok.context as usize] as usize;
+                    raw_values[cluster].push(tok.value);
+                    literal_values[cluster].push(tok.value);
                 }
             }
         }
-        let configs: Vec<_> = raw_values
-            .iter()
-            .enumerate()
-            .map(|(cluster, values)| {
-                let selected = crate::entropy::select_hybrid_config(values);
-                if literal_values[cluster].iter().all(|&value| {
-                    crate::entropy::uint_encode_with_config(value, selected).0 < min_symbol
-                }) {
-                    selected
-                } else {
-                    crate::entropy::HybridUintConfig::DEFAULT
-                }
-            })
-            .collect();
-        histograms = vec![Histogram::new(); configs.len()];
-        for &tok in toks {
-            match tok {
-                LzToken::Pixel { context, value } => {
-                    let cluster = context_map[context as usize] as usize;
-                    let (symbol, _, _) =
-                        crate::entropy::uint_encode_with_config(value, configs[cluster]);
-                    histograms[cluster].add(symbol);
-                }
-                LzToken::Lz77 {
-                    pixel_context,
-                    distance_context,
-                    length_value,
-                    distance_value,
-                } => {
-                    let (len_tok, _, _) = lz77_length_encode(length_value);
-                    histograms[context_map[pixel_context as usize] as usize]
+        for (cluster, values) in raw_values.iter().enumerate() {
+            let selected = crate::entropy::select_hybrid_config(values, huffman_pool);
+            configs[cluster] = if literal_values[cluster].iter().all(|&value| {
+                crate::entropy::uint_encode_with_config(value, selected).0 < min_symbol
+            }) {
+                selected
+            } else {
+                crate::entropy::HybridUintConfig::DEFAULT
+            };
+        }
+        histograms.fill(Histogram::new());
+        for toks in streams {
+            for &tok in toks {
+                if tok.is_lz77() {
+                    let (len_tok, _, _) = lz77_length_encode(tok.value);
+                    histograms[context_map[tok.context as usize] as usize]
                         .add(min_symbol + len_tok);
                     let cluster = context_map[distance_context as usize] as usize;
                     let (symbol, _, _) =
-                        crate::entropy::uint_encode_with_config(distance_value, configs[cluster]);
+                        crate::entropy::uint_encode_with_config(tok.distance, configs[cluster]);
+                    histograms[cluster].add(symbol);
+                } else {
+                    let cluster = context_map[tok.context as usize] as usize;
+                    let (symbol, _, _) =
+                        crate::entropy::uint_encode_with_config(tok.value, configs[cluster]);
                     histograms[cluster].add(symbol);
                 }
             }
         }
-        configs
     } else {
-        vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()]
-    };
+        configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
+    }
 
-    let mut code = OwnedEntropyCode {
-        context_map,
-        prefix_codes: build_huffman_codes(&histograms),
-        hybrid_uint_configs,
-        orig_context_map: None,
-        orig_num_contexts: num_contexts,
-        use_prefix_code: true,
-        ans_freqs: Vec::new(),
-        ans_symbols: Vec::new(),
-    };
+    let prefix_codes = &mut prefix_codes[..num_clusters];
+    build_huffman_codes_into(histograms, prefix_codes, huffman_pool);
 
     // Apply the single-symbol patch (mirrors build_pixel_code) per cluster so
     // that contexts with one unique symbol still emit a parseable code.
-    for pc in &mut code.prefix_codes {
+    for pc in prefix_codes.iter_mut() {
         let mut nonzero = 0;
         let mut idx = 0;
         for (i, &d) in pc.depths.iter().enumerate() {
@@ -540,62 +569,62 @@ pub(super) fn build_lz_pixel_code(
             }
         }
     }
-    code
+    EntropyCode {
+        context_map: &context_map[..num_contexts],
+        num_contexts,
+        prefix_codes,
+        hybrid_uint_configs: configs,
+        num_prefix_codes: num_clusters,
+        orig_context_map: None,
+        orig_num_contexts: num_contexts,
+        use_prefix_code: true,
+        ans_freqs: &[],
+        ans_symbols: &[],
+    }
 }
 
 /// Emit one `LzToken` into the bitstream.
 #[inline]
 pub(super) fn write_lz_token(
     t: LzToken,
-    code: &OwnedEntropyCode,
+    distance_context: u32,
+    code: &EntropyCode<'_>,
     min_symbol: u32,
     w: &mut BitWriter,
 ) {
-    match t {
-        LzToken::Pixel { context, value } => {
-            let cluster = code.context_map[context as usize] as usize;
-            let (sym, nbits, bits) =
-                crate::entropy::uint_encode_with_config(value, code.hybrid_uint_configs[cluster]);
-            let pc = &code.prefix_codes[cluster];
-            let d = pc.depths[sym as usize] as usize;
-            let data = (pc.bits[sym as usize] as u64) | ((bits as u64) << d);
-            w.write(d + nbits as usize, data);
-        }
-        LzToken::Lz77 {
-            pixel_context,
-            distance_context,
-            length_value,
-            distance_value,
-        } => {
-            let (len_tok, len_nbits, len_bits) = lz77_length_encode(length_value);
-            let sym = min_symbol + len_tok;
-            let pcluster = code.context_map[pixel_context as usize] as usize;
-            let pc = &code.prefix_codes[pcluster];
-            let d = pc.depths[sym as usize] as usize;
-            debug_assert!(
-                d > 0,
-                "LZ77 length symbol {} unrepresented in histogram",
-                sym
-            );
-            let data = (pc.bits[sym as usize] as u64) | ((len_bits as u64) << d);
-            w.write(d + len_nbits as usize, data);
+    if t.is_lz77() {
+        let (len_tok, len_nbits, len_bits) = lz77_length_encode(t.value);
+        let sym = min_symbol + len_tok;
+        let pcluster = code.context_map[t.context as usize] as usize;
+        let pc = &code.prefix_codes[pcluster];
+        let d = pc.depths[sym as usize] as usize;
+        debug_assert!(
+            d > 0,
+            "LZ77 length symbol {} unrepresented in histogram",
+            sym
+        );
+        let data = (pc.bits[sym as usize] as u64) | ((len_bits as u64) << d);
+        w.write(d + len_nbits as usize, data);
 
-            // Distance symbol: value LZ77_DIST_VALUE = 0, no extra bits.
-            let dcluster = code.context_map[distance_context as usize] as usize;
-            let dc = &code.prefix_codes[dcluster];
-            let (dist_symbol, dist_nbits, dist_bits) = crate::entropy::uint_encode_with_config(
-                distance_value,
-                code.hybrid_uint_configs[dcluster],
-            );
-            let dd = dc.depths[dist_symbol as usize] as usize;
-            // (Could be 0 if it's the only symbol in a single-symbol histogram.)
-            if dd > 0 {
-                let data = dc.bits[dist_symbol as usize] as u64 | ((dist_bits as u64) << dd);
-                w.write(dd + dist_nbits as usize, data);
-            } else if dist_nbits != 0 {
-                w.write(dist_nbits as usize, dist_bits as u64);
-            }
+        let dcluster = code.context_map[distance_context as usize] as usize;
+        let dc = &code.prefix_codes[dcluster];
+        let (dist_symbol, dist_nbits, dist_bits) =
+            crate::entropy::uint_encode_with_config(t.distance, code.hybrid_uint_configs[dcluster]);
+        let dd = dc.depths[dist_symbol as usize] as usize;
+        if dd > 0 {
+            let data = dc.bits[dist_symbol as usize] as u64 | ((dist_bits as u64) << dd);
+            w.write(dd + dist_nbits as usize, data);
+        } else if dist_nbits != 0 {
+            w.write(dist_nbits as usize, dist_bits as u64);
         }
+    } else {
+        let cluster = code.context_map[t.context as usize] as usize;
+        let (sym, nbits, bits) =
+            crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cluster]);
+        let pc = &code.prefix_codes[cluster];
+        let d = pc.depths[sym as usize] as usize;
+        let data = (pc.bits[sym as usize] as u64) | ((bits as u64) << d);
+        w.write(d + nbits as usize, data);
     }
 }
 /// Write the LZ77 sub-bundle (matches `LZ77Params::VisitFields` and `DecodeUintConfig`):
@@ -625,27 +654,29 @@ fn write_lz77_header(min_symbol: u32, w: &mut BitWriter) {
 /// The pixel `code` must have `nb_chans + 1` contexts (last = distance).
 pub(super) fn write_local_tree_lz77(
     predictors: &[u32],
-    pixel_code: &OwnedEntropyCode,
+    pixel_code: &EntropyCode<'_>,
     min_symbol: u32,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     w: &mut BitWriter,
 ) {
     let tree_tokens = build_balanced_tree_tokens(predictors);
-    write_tree_lz77(&tree_tokens, pixel_code, min_symbol, w);
+    write_tree_lz77(&tree_tokens, pixel_code, min_symbol, huffman_pool, w);
 }
 
 /// Write a pre-built MA tree (token stream) + the LZ77 pixel code header.
 pub(super) fn write_tree_lz77(
     tree_tokens: &[Token],
-    pixel_code: &OwnedEntropyCode,
+    pixel_code: &EntropyCode<'_>,
     min_symbol: u32,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     w: &mut BitWriter,
 ) {
-    let tree_code = optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS);
+    let tree_code = optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS, huffman_pool);
     let tree_code_ref = tree_code.as_ref();
 
     // Tree's entropy code: no LZ77 in the tree itself.
     w.write(1, 0);
-    write_entropy_code(&tree_code_ref, w);
+    write_entropy_code(&tree_code_ref, huffman_pool, w);
     for tok in tree_tokens {
         write_token(*tok, &tree_code_ref, w);
     }
@@ -654,7 +685,7 @@ pub(super) fn write_tree_lz77(
     write_lz77_header(min_symbol, w);
     // The decoder appends an extra context (distance) when LZ77 is on, so the
     // context map we write must already include it as its last entry.
-    write_entropy_code(&pixel_code.as_ref(), w);
+    write_entropy_code(pixel_code, huffman_pool, w);
 }
 
 #[cfg(test)]
@@ -664,23 +695,18 @@ mod tests {
     fn expand(stream: &[LzToken]) -> Vec<Token> {
         let mut out = Vec::new();
         for &token in stream {
-            match token {
-                LzToken::Pixel { context, value } => out.push(Token::new(context, value)),
-                LzToken::Lz77 {
-                    length_value,
-                    distance_value,
-                    ..
-                } => {
-                    let distance = if distance_value == LZ77_DIST_VALUE {
-                        1
-                    } else {
-                        (distance_value - LZ77_NUM_SPECIAL_DISTANCES + 1) as usize
-                    };
-                    for _ in 0..length_value + LZ77_MIN_LENGTH {
-                        let source = out.len() - distance;
-                        out.push(out[source]);
-                    }
+            if token.is_lz77() {
+                let distance = if token.distance == LZ77_DIST_VALUE {
+                    1
+                } else {
+                    (token.distance - LZ77_NUM_SPECIAL_DISTANCES + 1) as usize
+                };
+                for _ in 0..token.value + LZ77_MIN_LENGTH {
+                    let source = out.len() - distance;
+                    out.push(out[source]);
                 }
+            } else {
+                out.push(Token::new(token.context, token.value));
             }
         }
         out
@@ -702,27 +728,42 @@ mod tests {
         input.extend((0..11).map(|i| Token::new(1, 900 + i)));
         input.extend_from_slice(&pattern);
         input.extend_from_slice(&pattern);
-        let compressed = lz77_compress(&input, 3);
-        assert!(compressed.iter().any(|token| matches!(
-            token,
-            LzToken::Lz77 { distance_value, .. }
-                if *distance_value >= LZ77_NUM_SPECIAL_DISTANCES
-        )));
+        let compressed = lz77_compress(&input);
+        assert!(
+            compressed
+                .iter()
+                .any(|token| token.is_lz77() && token.distance >= LZ77_NUM_SPECIAL_DISTANCES)
+        );
         assert!(same_tokens(&expand(&compressed), &input));
     }
 
     #[test]
     fn hash_chain_uses_compact_distance_for_runs() {
         let input = vec![Token::new(0, 7); 128];
-        let compressed = lz77_compress(&input, 1);
-        assert!(compressed.iter().any(|token| matches!(
-            token,
-            LzToken::Lz77 {
-                distance_value: LZ77_DIST_VALUE,
-                ..
-            }
-        )));
+        let compressed = lz77_compress(&input);
+        assert!(
+            compressed
+                .iter()
+                .any(|token| token.is_lz77() && token.distance == LZ77_DIST_VALUE)
+        );
         assert!(same_tokens(&expand(&compressed), &input));
+    }
+
+    #[test]
+    fn lz_token_is_compact() {
+        assert_eq!(std::mem::size_of::<LzToken>(), 12);
+    }
+
+    #[test]
+    fn fixed_context_storage_covers_the_largest_squeeze_tree() {
+        let steps = crate::squeeze::default_squeeze_steps(
+            crate::encode_image::MAX_DIMENSION,
+            crate::encode_image::MAX_DIMENSION,
+            4,
+        );
+        let contexts = 4 * (steps.len() + 1) + 1;
+        assert_eq!(steps.len(), 54);
+        assert_eq!(contexts, LZ77_MAX_CONTEXTS);
     }
 
     #[test]
@@ -731,18 +772,18 @@ mod tests {
             .map(|i| Token::new((i % 3) as u32, ((i * 37 + 11) % 257) as u32))
             .collect();
         let input: Vec<Token> = pattern.iter().copied().cycle().take(512).collect();
-        let fast = lz77_compress_for_speed(&input, 3, crate::Speed::Fast);
-        assert!(!fast.iter().any(|token| matches!(
-            token,
-            LzToken::Lz77 { distance_value, .. }
-                if *distance_value != LZ77_DIST_VALUE
-        )));
-        let slow = lz77_compress_for_speed(&input, 3, crate::Speed::Slow);
-        assert!(slow.iter().any(|token| matches!(
-            token,
-            LzToken::Lz77 { distance_value, .. }
-                if *distance_value != LZ77_DIST_VALUE
-        )));
+        let mut scratch = CoderScratch::default();
+        let fast = lz77_compress_for_speed(&input, 3, crate::Speed::Fast, &mut scratch);
+        assert!(
+            !fast
+                .iter()
+                .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
+        );
+        let slow = lz77_compress_for_speed(&input, 3, crate::Speed::Slow, &mut scratch);
+        assert!(
+            slow.iter()
+                .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
+        );
         assert!(same_tokens(&expand(&slow), &input));
     }
 
@@ -758,18 +799,28 @@ mod tests {
         let small = tokens(5_000, 7);
         let clean = std::thread::spawn({
             let small = small.clone();
-            move || lz77_compress_with_depth(&small, 9, 8).len()
+            move || {
+                let mut scratch = Vec::new();
+                let mut out = Vec::with_capacity(small.len());
+                lz77_compress_with_depth_into(&small, 8, &mut scratch, &mut out);
+                out.len()
+            }
         })
         .join()
         .unwrap();
-        let _ = lz77_compress_with_depth(&big, 9, 8);
-        assert_eq!(clean, lz77_compress_with_depth(&small, 9, 8).len());
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(big.len());
+        lz77_compress_with_depth_into(&big, 8, &mut scratch, &mut out);
+        lz77_compress_with_depth_into(&small, 8, &mut scratch, &mut out);
+        assert_eq!(clean, out.len());
     }
 
     #[test]
     fn deep_search_handles_varied_stream_lengths() {
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(50_000);
         for len in [1_000usize, 50_000, 3_000] {
-            let _ = lz77_compress_with_depth(&tokens(len, 5), 9, 8);
+            lz77_compress_with_depth_into(&tokens(len, 5), 8, &mut scratch, &mut out);
         }
     }
 }

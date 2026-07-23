@@ -37,6 +37,7 @@ use std::arch::aarch64::*;
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
 pub(crate) fn recon_dist_and_rate_neon(
+    scratch: &mut [[f32; 1024]; 8],
     rate_log2_lut: &RateLog2Lut,
     coeffs: &[[f32; 1024]; 3],
     inv: [&[f32]; 3],
@@ -53,6 +54,7 @@ pub(crate) fn recon_dist_and_rate_neon(
     py: usize,
 ) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
+        scratch,
         rate_log2_lut,
         coeffs,
         inv,
@@ -338,7 +340,9 @@ mod tests {
                 &inv_storage[1][..],
                 &inv_storage[2][..],
             ];
+            let mut scalar_scratch = [[0.0f32; 1024]; 8];
             let scalar = recon_dist_and_rate_scalar(
+                &mut scalar_scratch,
                 rate_log2_lut(),
                 &coeffs,
                 inv,
@@ -354,8 +358,10 @@ mod tests {
                 3,
                 5,
             );
+            let mut simd_scratch = [[0.0f32; 1024]; 8];
             let simd = unsafe {
                 recon_dist_and_rate_neon(
+                    &mut simd_scratch,
                     rate_log2_lut(),
                     &coeffs,
                     inv,

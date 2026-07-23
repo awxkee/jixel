@@ -34,6 +34,7 @@ use crate::ac_context::{
     K_NUM_AC_CONTEXTS, block_context, non_zero_context, zero_density_context_8x8,
 };
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
 use crate::enc_frame::{
     collect_ac_metadata_tokens, collect_dc_tokens, combine_sections, write_context_tree,
@@ -45,7 +46,7 @@ use crate::entropy::{
 };
 use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
-use crate::thread_pool::steal_map;
+use crate::thread_pool::ThreadPool;
 
 const BLOCK_DIM: usize = 8;
 const GROUP_DIM: usize = 256;
@@ -258,7 +259,7 @@ fn write_size_header(w: &mut BitWriter, xsize: usize, ysize: usize) {
 
 /// Writes `ImageMetadata`. The key choice is `xyb_encoded = 0`: the frame
 /// carries the JPEG's own channels, so the decoder must not undo XYB.
-fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>) {
+fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>, scratch: &mut CoderScratch) {
     w.write(1, 0); // not all-default
     w.write(1, 0); // no extra fields (orientation, preview, animation)
     w.write(1, 0); // floating_point_sample = false
@@ -280,7 +281,7 @@ fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>) {
     w.write(2, 0); // no extensions
     w.write(1, 1); // CustomTransformData: all default
     if let Some(icc) = icc {
-        crate::icc_codec::write_icc_stream(icc, w);
+        crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, w);
     }
     w.zero_pad_to_byte();
 }
@@ -341,7 +342,11 @@ fn write_color_correlation(w: &mut BitWriter) {
 
 /// Writes the JPEG's DQT as a raw quantization matrix. Only table 0 (the 8x8
 /// DCT) is used, so the rest stay on their library defaults.
-fn write_dequant_matrices(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE]) {
+fn write_dequant_matrices(
+    w: &mut BitWriter,
+    qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+    scratch: &mut CoderScratch,
+) {
     w.write(1, 0); // not all-default
     for table in 0..17usize {
         if table == 0 {
@@ -349,7 +354,7 @@ fn write_dequant_matrices(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE])
             // Fixed at 1/(8*255); the decoder checks it within 1e-8, so the
             // exact half-precision pattern matters.
             w.write(16, 0x1004);
-            write_raw_quant_image(w, qtable);
+            write_raw_quant_image(w, qtable, scratch);
         } else {
             w.write(3, 0); // kQuantModeLibrary
             // the predefined index occupies zero bits
@@ -359,7 +364,11 @@ fn write_dequant_matrices(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE])
 
 /// Emits the 8x8x3 modular sub-image of raw quantization values, where channel
 /// `c` row `y` column `x` is `qtable[c*64 + y*8 + x]`.
-fn write_raw_quant_image(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE]) {
+fn write_raw_quant_image(
+    w: &mut BitWriter,
+    qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+    scratch: &mut CoderScratch,
+) {
     crate::modular::write_group_header_local_tree(w);
 
     let mut tokens: Vec<Token> = Vec::with_capacity(3 * DCT_BLOCK_SIZE);
@@ -377,8 +386,8 @@ fn write_raw_quant_image(w: &mut BitWriter, qtable: &[i32; 3 * DCT_BLOCK_SIZE]) 
         }
     }
 
-    let code = crate::modular::build_pixel_code(&tokens);
-    crate::modular::write_tree_and_pixel_histograms(&code, w);
+    let code = crate::modular::build_pixel_code(&tokens, scratch);
+    crate::modular::write_tree_and_pixel_histograms(&code, scratch, w);
     let code_ref = code.as_ref();
     for t in &tokens {
         write_token(*t, &code_ref, w);
@@ -393,7 +402,19 @@ pub(crate) fn encode_jpeg_codestream(
 ) -> Result<Vec<u8>, JpegError> {
     let ss = check_supported(jpg)?;
     let dim = Dim::new(jpg.width, jpg.height, &ss);
+    let pool = ThreadPool::new(num_threads);
+    let mut scratch = Box::<CoderScratch>::default();
+    encode_jpeg_codestream_with_pool(jpg, icc, &ss, &dim, &pool, &mut scratch)
+}
 
+fn encode_jpeg_codestream_with_pool(
+    jpg: &JpegData,
+    icc: Option<&[u8]>,
+    ss: &Subsampling,
+    dim: &Dim,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Result<Vec<u8>, JpegError> {
     // Quantization tables, transposed into JXL's orientation
     let mut qtable = [0i32; 3 * DCT_BLOCK_SIZE];
     let mut dc_quant = [0f32; 3];
@@ -410,7 +431,7 @@ pub(crate) fn encode_jpeg_codestream(
     }
 
     // DC planes. Each DC group reads a disjoint slab of coefficients.
-    let dc_datas: Vec<DcGroupData> = steal_map(dim.num_dc_groups, num_threads, |g| {
+    let dc_datas: Vec<DcGroupData> = pool.steal_map(scratch, dim.num_dc_groups, |g, _scratch| {
         let gx = g % dim.xsize_dc_groups;
         let gy = g / dim.xsize_dc_groups;
         let bx0 = gx * DC_GROUP_DIM_IN_BLOCKS;
@@ -438,8 +459,8 @@ pub(crate) fn encode_jpeg_codestream(
     });
 
     // Tokens
-    let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) =
-        steal_map(dc_datas.len(), num_threads, |i| {
+    let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) = pool
+        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
             (
                 collect_dc_tokens(&dc_datas[i]),
                 collect_ac_metadata_tokens(&dc_datas[i]),
@@ -455,7 +476,7 @@ pub(crate) fn encode_jpeg_codestream(
     for t in &meta_tokens {
         all_dc.extend_from_slice(t);
     }
-    let dc_code = optimize_entropy_code(&all_dc, K_NUM_DC_CONTEXTS);
+    let dc_code = optimize_entropy_code(&all_dc, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let dc_code_ref = dc_code.as_ref();
 
     let natural_scan = {
@@ -467,9 +488,9 @@ pub(crate) fn encode_jpeg_codestream(
         }
         s
     };
-    let baseline = build_ac_sections(jpg, &dim, &ss, &qtable, &natural_scan, None, num_threads);
+    let baseline = build_ac_sections(jpg, dim, ss, &qtable, &natural_scan, None, pool, scratch);
 
-    let orders = compute_coeff_orders(jpg, &dim, &ss);
+    let orders = compute_coeff_orders(jpg, dim, ss);
     let ac = if orders.iter().any(|o| !coeff_order::is_identity(o)) {
         let mut custom_scan = [[0u8; DCT_BLOCK_SIZE]; 3];
         for c in 0..3 {
@@ -484,12 +505,13 @@ pub(crate) fn encode_jpeg_codestream(
         }
         let candidate = build_ac_sections(
             jpg,
-            &dim,
-            &ss,
+            dim,
+            ss,
             &qtable,
             &custom_scan,
             Some(perm_tokens),
-            num_threads,
+            pool,
+            scratch,
         );
         if candidate.bytes < baseline.bytes {
             candidate
@@ -510,37 +532,38 @@ pub(crate) fn encode_jpeg_codestream(
         // Written explicitly; the lossy path avoids the shortcut too.
         w.write(1, 0);
         w.write(16, 0); // no DC thresholds, no quant-field thresholds
-        crate::enc_frame::write_compact_block_context_map(w);
+        crate::enc_frame::write_compact_block_context_map(&mut scratch.huffman_pool, w);
         write_color_correlation(w);
-        write_context_tree(dim.num_dc_groups, w);
+        write_context_tree(dim.num_dc_groups, &mut scratch.huffman_pool, w);
         w.write(1, 0); // no lz77 for the DC histograms
-        write_entropy_code(&dc_code_ref, w);
+        write_entropy_code(&dc_code_ref, &mut scratch.huffman_pool, w);
     }
 
     // DC groups.
-    let dc_group_sections: Vec<BitWriter> = steal_map(dim.num_dc_groups, num_threads, |i| {
-        let data = &dc_datas[i];
-        let mut section = BitWriter::new();
-        let w = &mut section;
-        w.write(2, 0); // extra_dc_precision = 0
-        w.write(4, 3); // global tree, default weighted predictor, no transforms
-        emit_tokens(&dc_tokens[i], &dc_code_ref, w);
+    let dc_group_sections: Vec<BitWriter> =
+        pool.steal_map(scratch, dim.num_dc_groups, |i, _scratch| {
+            let data = &dc_datas[i];
+            let mut section = BitWriter::new();
+            let w = &mut section;
+            w.write(2, 0); // extra_dc_precision = 0
+            w.write(4, 3); // global tree, default weighted predictor, no transforms
+            emit_tokens(&dc_tokens[i], &dc_code_ref, w);
 
-        let num_blocks = data.ac_strategy.xsize() * data.ac_strategy.ysize();
-        let nb_bits = if num_blocks <= 1 {
-            0
-        } else {
-            usize::BITS as usize
-                - num_blocks.leading_zeros() as usize
-                - if num_blocks.is_power_of_two() { 1 } else { 0 }
-        };
-        if nb_bits != 0 {
-            w.write(nb_bits, (num_blocks - 1) as u64);
-        }
-        w.write(4, 3);
-        emit_tokens(&meta_tokens[i], &dc_code_ref, w);
-        section
-    });
+            let num_blocks = data.ac_strategy.xsize() * data.ac_strategy.ysize();
+            let nb_bits = if num_blocks <= 1 {
+                0
+            } else {
+                usize::BITS as usize
+                    - num_blocks.leading_zeros() as usize
+                    - if num_blocks.is_power_of_two() { 1 } else { 0 }
+            };
+            if nb_bits != 0 {
+                w.write(nb_bits, (num_blocks - 1) as u64);
+            }
+            w.write(4, 3);
+            emit_tokens(&meta_tokens[i], &dc_code_ref, w);
+            section
+        });
 
     let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
     sections.push(dc_global);
@@ -553,8 +576,8 @@ pub(crate) fn encode_jpeg_codestream(
     out.write(8, 0xFF);
     out.write(8, 0x0A);
     write_size_header(&mut out, dim.xsize, dim.ysize);
-    write_image_metadata(&mut out, icc);
-    write_frame_header(&mut out, &ss);
+    write_image_metadata(&mut out, icc, scratch);
+    write_frame_header(&mut out, ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
 }
@@ -590,20 +613,21 @@ fn build_ac_sections(
     qtable: &[i32; 3 * DCT_BLOCK_SIZE],
     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
     perm: Option<Vec<Token>>,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
 ) -> AcSections {
-    let ac_tokens = tokenize_ac(jpg, dim, ss, scan, num_threads);
+    let ac_tokens = tokenize_ac(jpg, dim, ss, scan, pool, scratch);
     let mut all_ac: Vec<Token> = Vec::new();
     for t in &ac_tokens {
         all_ac.extend_from_slice(t);
     }
-    let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS);
+    let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS, &mut scratch.huffman_pool);
     let ac_code_ref = ac_code.as_ref();
 
     let mut global = BitWriter::new();
     {
         let w = &mut global;
-        write_dequant_matrices(w, qtable);
+        write_dequant_matrices(w, qtable, scratch);
         if dim.num_groups > 1 {
             let bits = usize::BITS as usize
                 - dim.num_groups.leading_zeros() as usize
@@ -624,19 +648,22 @@ fn build_ac_sections(
                 w.write(13, 1); // custom order for DCT8
                 // Its own entropy stream, then the tokens, exactly as libjxl's
                 // EncodeCoeffOrders lays it out.
-                let perm_code =
-                    optimize_entropy_code(perm_tokens, coeff_order::PERMUTATION_CONTEXTS);
+                let perm_code = optimize_entropy_code(
+                    perm_tokens,
+                    coeff_order::PERMUTATION_CONTEXTS,
+                    &mut scratch.huffman_pool,
+                );
                 w.write(1, 0); // no lz77
-                write_entropy_code(&perm_code.as_ref(), w);
+                write_entropy_code(&perm_code.as_ref(), &mut scratch.huffman_pool, w);
                 emit_tokens(perm_tokens, &perm_code.as_ref(), w);
             }
             None => w.write(13, 0), // natural order
         }
         w.write(1, 0); // no lz77
-        write_entropy_code(&ac_code_ref, w);
+        write_entropy_code(&ac_code_ref, &mut scratch.huffman_pool, w);
     }
 
-    let groups: Vec<BitWriter> = steal_map(dim.num_groups, num_threads, |g| {
+    let groups: Vec<BitWriter> = pool.steal_map(scratch, dim.num_groups, |g, _scratch| {
         let mut section = BitWriter::new();
         emit_tokens(&ac_tokens[g], &ac_code_ref, &mut section);
         section
@@ -692,9 +719,10 @@ fn tokenize_ac(
     dim: &Dim,
     ss: &Subsampling,
     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
 ) -> Vec<Vec<Token>> {
-    steal_map(dim.num_groups, num_threads, |g| {
+    pool.steal_map(scratch, dim.num_groups, |g, _scratch| {
         let gx = g % dim.xsize_groups;
         let gy = g / dim.xsize_groups;
         tokenize_ac_group(jpg, dim, ss, scan, gx, gy)

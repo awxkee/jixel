@@ -33,7 +33,7 @@ use super::ans::{
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
 use super::histogram::Histogram;
-use super::huffman_tree::create_huffman_tree;
+use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
@@ -125,7 +125,10 @@ const HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
     },
 ];
 
-pub(crate) fn select_hybrid_config(values: &[u32]) -> HybridUintConfig {
+pub(crate) fn select_hybrid_config(
+    values: &[u32],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> HybridUintConfig {
     const MAX_SEARCH_SAMPLES: usize = 65_536;
     let stride = values.len().div_ceil(MAX_SEARCH_SAMPLES).max(1);
     let mut best = HybridUintConfig::DEFAULT;
@@ -151,7 +154,7 @@ pub(crate) fn select_hybrid_config(values: &[u32]) -> HybridUintConfig {
             0
         } else {
             let mut depths = [0u8; ALPHABET_SIZE];
-            create_huffman_tree(&histogram.counts, 15, &mut depths);
+            create_huffman_tree(&histogram.counts, 15, &mut depths, huffman_pool);
             histogram
                 .counts
                 .iter()
@@ -195,29 +198,47 @@ fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &m
     }
 }
 
-pub(crate) fn build_huffman_codes(histograms: &[Histogram]) -> Vec<PrefixCode> {
-    let mut out: Vec<PrefixCode> = Vec::with_capacity(histograms.len());
-    for h in histograms {
-        let counts: [u32; ALPHABET_SIZE] = h.counts;
-        let mut length = ALPHABET_SIZE;
-        while length > 0 && counts[length - 1] == 0 {
-            length -= 1;
-        }
-        let mut depths = [0u8; ALPHABET_SIZE];
-        if length > 0 {
-            create_huffman_tree(&counts[..length], 15, &mut depths[..length]);
-        }
-        let mut bits = [0u16; ALPHABET_SIZE];
-        convert_bit_depths_to_symbols(&depths, &mut bits);
-        let mut pc = PrefixCode {
-            depths,
-            bits,
-            single_symbol: false,
-        };
-        pc.update_single_symbol();
-        out.push(pc);
+pub(crate) fn build_huffman_codes(
+    histograms: &[Histogram],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> Vec<PrefixCode> {
+    let mut out = Vec::with_capacity(histograms.len());
+    for histogram in histograms {
+        out.push(build_huffman_code(histogram, huffman_pool));
     }
     out
+}
+
+pub(crate) fn build_huffman_codes_into(
+    histograms: &[Histogram],
+    out: &mut [PrefixCode],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) {
+    assert!(out.len() >= histograms.len());
+    for (histogram, output) in histograms.iter().zip(out.iter_mut()) {
+        *output = build_huffman_code(histogram, huffman_pool);
+    }
+}
+
+fn build_huffman_code(histogram: &Histogram, huffman_pool: &mut Vec<HuffmanNode>) -> PrefixCode {
+    let counts: [u32; ALPHABET_SIZE] = histogram.counts;
+    let mut length = ALPHABET_SIZE;
+    while length > 0 && counts[length - 1] == 0 {
+        length -= 1;
+    }
+    let mut depths = [0u8; ALPHABET_SIZE];
+    if length > 0 {
+        create_huffman_tree(&counts[..length], 15, &mut depths[..length], huffman_pool);
+    }
+    let mut bits = [0u16; ALPHABET_SIZE];
+    convert_bit_depths_to_symbols(&depths, &mut bits);
+    let mut prefix = PrefixCode {
+        depths,
+        bits,
+        single_symbol: false,
+    };
+    prefix.update_single_symbol();
+    prefix
 }
 
 /// Build a prefix-codes-only EntropyCode given a fixed context_map and the
@@ -227,10 +248,11 @@ pub(crate) fn optimize_prefix_codes(
     tokens: &[Token],
     context_map: Vec<u8>,
     num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, Some(&context_map), &mut histograms);
-    let prefix_codes = build_huffman_codes(&histograms);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
     let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
@@ -244,12 +266,16 @@ pub(crate) fn optimize_prefix_codes(
     }
 }
 
-pub(crate) fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+pub(crate) fn optimize_entropy_code(
+    tokens: &[Token],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, None, &mut histograms);
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map);
-    let prefix_codes = build_huffman_codes(&histograms);
+    cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
     let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
@@ -268,12 +294,29 @@ pub(crate) fn optimize_entropy_code(tokens: &[Token], num_contexts: usize) -> Ow
 /// the plain AC token bundle, whose header (write_ac_global) and token site
 /// (enc_frame) both branch on use_prefix_code. No other bundle calls this, so
 /// the gate cannot desynchronize a header from its token stream elsewhere.
-pub(crate) fn optimize_entropy_code_ac(tokens: &[Token], num_contexts: usize) -> OwnedEntropyCode {
+pub(crate) fn optimize_entropy_code_ac(
+    tokens: &[Token],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode {
+    optimize_entropy_code_ac_streams(std::iter::once(tokens), num_contexts, huffman_pool)
+}
+
+pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
+    streams: I,
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
     let mut histograms = vec![Histogram::new(); num_contexts];
-    build_histograms(tokens, None, &mut histograms);
+    for tokens in streams {
+        build_histograms(tokens, None, &mut histograms);
+    }
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map);
-    let prefix_codes = build_huffman_codes(&histograms);
+    cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
     let (mut use_prefix_code, mut ans_freqs, mut ans_symbols) = no_ans();
     if ANS_ENABLED {
@@ -303,11 +346,12 @@ pub(crate) fn optimize_entropy_code_ac(tokens: &[Token], num_contexts: usize) ->
 pub(crate) fn build_entropy_code_no_cluster(
     tokens: &[Token],
     num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, None, &mut histograms);
     let context_map: Vec<u8> = (0..num_contexts as u8).collect();
-    let prefix_codes = build_huffman_codes(&histograms);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
     let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
     OwnedEntropyCode {
         context_map,
@@ -602,7 +646,7 @@ fn write_huffman_tree(depth: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (tree, extra)
 }
 
-fn store_huffman_tree(depths: &[u8], w: &mut BitWriter) {
+fn store_huffman_tree(depths: &[u8], huffman_pool: &mut Vec<HuffmanNode>, w: &mut BitWriter) {
     let (huffman_tree, huffman_tree_extra) = write_huffman_tree(depths);
     let mut histo = [0u32; NUM_CODE_LENGTH_CODES];
     for &t in &huffman_tree {
@@ -625,7 +669,7 @@ fn store_huffman_tree(depths: &[u8], w: &mut BitWriter) {
 
     let mut code_length_bitdepth = [0u8; NUM_CODE_LENGTH_CODES];
     let mut code_length_bitdepth_symbols = [0u16; NUM_CODE_LENGTH_CODES];
-    create_huffman_tree(&histo, 5, &mut code_length_bitdepth);
+    create_huffman_tree(&histo, 5, &mut code_length_bitdepth, huffman_pool);
     convert_bit_depths_to_symbols(&code_length_bitdepth, &mut code_length_bitdepth_symbols);
 
     store_huffman_tree_of_huffman_tree_to_bitmask(num_codes, &code_length_bitdepth, w);
@@ -654,7 +698,11 @@ fn store_var_len_u16(n: u32, w: &mut BitWriter) {
     }
 }
 
-fn write_prefix_code_single(code: &PrefixCode, w: &mut BitWriter) {
+fn write_prefix_code_single(
+    code: &PrefixCode,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
     let mut count = 0usize;
     let mut s4: [usize; 4] = [0; 4];
     let mut length = 0usize;
@@ -682,7 +730,7 @@ fn write_prefix_code_single(code: &PrefixCode, w: &mut BitWriter) {
     if count <= 4 {
         store_simple_huffman_tree(&code.depths, &mut s4, count, max_bits, w);
     } else {
-        store_huffman_tree(&code.depths[..length], w);
+        store_huffman_tree(&code.depths[..length], huffman_pool, w);
     }
 }
 
@@ -690,6 +738,7 @@ fn write_prefix_code_single(code: &PrefixCode, w: &mut BitWriter) {
 pub(crate) fn write_prefix_codes(
     codes: &[PrefixCode],
     configs: &[HybridUintConfig],
+    huffman_pool: &mut Vec<HuffmanNode>,
     w: &mut BitWriter,
 ) {
     w.write(1, 1); // use_prefix_code
@@ -732,13 +781,17 @@ pub(crate) fn write_prefix_codes(
             }
         }
         if num_symbol > 1 {
-            write_prefix_code_single(code, w);
+            write_prefix_code_single(code, huffman_pool, w);
         }
     }
 }
 
 /// Emit a context map. Mirrors libjxl-tiny's WriteContextMap.
-pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_context_map(
+    code: &EntropyCode,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
     let num_contexts = if code.orig_context_map.is_some() {
         code.orig_num_contexts
     } else {
@@ -770,11 +823,12 @@ pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
         }
     };
 
-    let ctxmap_code = optimize_prefix_codes(&tokens, vec![0u8], 1);
+    let ctxmap_code = optimize_prefix_codes(&tokens, vec![0u8], 1, huffman_pool);
     let ctxmap_ref = ctxmap_code.as_ref();
     write_prefix_codes(
         &ctxmap_code.prefix_codes,
         &ctxmap_code.hybrid_uint_configs,
+        huffman_pool,
         w,
     );
     for t in &tokens {
@@ -783,10 +837,14 @@ pub(crate) fn write_context_map(code: &EntropyCode, w: &mut BitWriter) {
 }
 
 /// WriteContextMap + the per-bundle code parameters (prefix codes or ANS).
-pub(crate) fn write_entropy_code(code: &EntropyCode, w: &mut BitWriter) {
-    write_context_map(code, w);
+pub(crate) fn write_entropy_code(
+    code: &EntropyCode,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    write_context_map(code, huffman_pool, w);
     if code.use_prefix_code {
-        write_prefix_codes(code.prefix_codes, code.hybrid_uint_configs, w);
+        write_prefix_codes(code.prefix_codes, code.hybrid_uint_configs, huffman_pool, w);
     } else {
         write_ans_params(code, w);
     }

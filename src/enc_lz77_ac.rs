@@ -109,6 +109,7 @@ pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
 pub(crate) fn build_lz_code_no_cluster(
     streams: &[Vec<AcLz>],
     num_contexts: usize,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
 ) -> OwnedEntropyCode {
     let distance_context = (num_contexts - 1) as u32;
     let mut histograms = vec![Histogram::new(); num_contexts];
@@ -131,7 +132,7 @@ pub(crate) fn build_lz_code_no_cluster(
         }
     }
     let context_map: Vec<u8> = (0..num_contexts as u8).collect();
-    let mut prefix_codes = build_huffman_codes(&histograms);
+    let mut prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
     for pc in &mut prefix_codes {
         let mut nonzero = 0usize;
@@ -175,7 +176,11 @@ pub(crate) fn build_lz_code_no_cluster(
 /// trailing distance context. Returns an `OwnedEntropyCode` whose
 /// `orig_context_map` has `num_contexts` entries (the distance context is the
 /// last), so `write_entropy_code` signals it correctly.
-pub(crate) fn build_ac_lz_code(streams: &[Vec<AcLz>], num_contexts: usize) -> OwnedEntropyCode {
+pub(crate) fn build_ac_lz_code(
+    streams: &[Vec<AcLz>],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> OwnedEntropyCode {
     let distance_context = (num_contexts - 1) as u32;
     let mut histograms = vec![Histogram::new(); num_contexts];
     for stream in streams {
@@ -198,8 +203,8 @@ pub(crate) fn build_ac_lz_code(streams: &[Vec<AcLz>], num_contexts: usize) -> Ow
     }
 
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map);
-    let prefix_codes = build_huffman_codes(&histograms);
+    cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
     OwnedEntropyCode {
         context_map,
@@ -267,7 +272,10 @@ pub(crate) fn estimate_ac_lz_bits(
     bits
 }
 
-pub(crate) fn estimate_ac_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
+pub(crate) fn estimate_ac_plain_bits<'a, I>(streams: I, code: &OwnedEntropyCode) -> u64
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
     if !code.use_prefix_code {
         // rANS approaches the histogram entropy: a symbol with normalized
         // frequency `f` out of `ANS_TAB_SIZE` costs -log2(f / ANS_TAB_SIZE).
@@ -288,18 +296,22 @@ pub(crate) fn estimate_ac_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) 
             })
             .collect();
         let mut bits = 0.0f64;
-        for t in tokens {
-            let (sym, nbits, _) = uint_encode(t.value);
-            let cl = code.context_map[t.context as usize] as usize;
-            bits += cost[cl][sym as usize] as f64 + nbits as f64;
+        for tokens in streams {
+            for t in tokens {
+                let (sym, nbits, _) = uint_encode(t.value);
+                let cl = code.context_map[t.context as usize] as usize;
+                bits += cost[cl][sym as usize] as f64 + nbits as f64;
+            }
         }
         return bits as u64;
     }
     let mut bits: u64 = 0;
-    for t in tokens {
-        let (sym, nbits, _) = uint_encode(t.value);
-        let cl = code.context_map[t.context as usize] as usize;
-        bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
+    for tokens in streams {
+        for t in tokens {
+            let (sym, nbits, _) = uint_encode(t.value);
+            let cl = code.context_map[t.context as usize] as usize;
+            bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
+        }
     }
     bits
 }
@@ -359,7 +371,11 @@ pub(crate) fn write_ac_lz(
 /// Write the AC LZ77 sub-bundle header (mirrors `write_lz77_header` in the
 /// lossless path): enabled bit + min_symbol (64) + min_length (3) +
 /// length_uint_config(split=4, msb=0, lsb=0). Then the entropy code.
-pub(crate) fn write_ac_lz_header_and_code(code: &OwnedEntropyCode, w: &mut BitWriter) {
+pub(crate) fn write_ac_lz_header_and_code(
+    code: &OwnedEntropyCode,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    w: &mut BitWriter,
+) {
     w.write(1, 1); // lz77 enabled
     // min_symbol: U32(Val(224), Val(512), Val(4096), BitsOffset(15,8)).
     // For 64: selector 3 -> "11" + 15 bits of (64 - 8) = 56.
@@ -373,7 +389,7 @@ pub(crate) fn write_ac_lz_header_and_code(code: &OwnedEntropyCode, w: &mut BitWr
     w.write(3, 0);
     // The entropy code: its context map already carries the trailing distance
     // context as the last (orig_num_contexts-th) entry.
-    write_entropy_code(&code.as_ref(), w);
+    write_entropy_code(&code.as_ref(), huffman_pool, w);
 }
 
 #[cfg(test)]
@@ -395,13 +411,14 @@ mod tests {
                 value: u32::from(i % 100 == 0),
             })
             .collect();
-        let code = optimize_entropy_code_ac(&tokens, K_NUM_AC_CONTEXTS);
+        let mut scratch = crate::coder_scratch::CoderScratch::default();
+        let code = optimize_entropy_code_ac(&tokens, K_NUM_AC_CONTEXTS, &mut scratch.huffman_pool);
         assert!(
             !code.use_prefix_code,
             "expected the rANS path for this stream"
         );
 
-        let estimate = estimate_ac_plain_bits(&tokens, &code);
+        let estimate = estimate_ac_plain_bits(std::iter::once(tokens.as_slice()), &code);
         let huffman_floor = tokens.len() as u64;
         assert!(
             estimate < huffman_floor / 2,

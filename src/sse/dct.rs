@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16, WC32, WC64};
+use crate::dct::{WC4, WC8, WC16, WC32};
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -95,135 +95,6 @@ macro_rules! recursive_dct {
 recursive_dct!(dct1d_8_s, 8, 4, WC8, dct1d_4_s);
 recursive_dct!(dct1d_16_s, 16, 8, WC16, dct1d_8_s);
 recursive_dct!(dct1d_32_s, 32, 16, WC32, dct1d_16_s);
-recursive_dct!(dct1d_64_s, 64, 32, WC64, dct1d_32_s);
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn dct64x64_sse41(input: &[f32; 4096], output: &mut [f32; 4096]) {
-    let mut scratch = [0.0f32; 4096];
-    for strip in 0..16 {
-        let mut c: [__m128; 64] = std::array::from_fn(|row| unsafe {
-            _mm_loadu_ps(input[row * 64 + strip * 4..].as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for tile_idx in 0..16 {
-            let base = tile_idx * 4;
-            let tile = transpose_4x4(c[base], c[base + 1], c[base + 2], c[base + 3]);
-            for (lane, value) in tile.iter().enumerate() {
-                unsafe {
-                    _mm_storeu_ps(
-                        scratch[(strip * 4 + lane) * 64 + tile_idx * 4..].as_mut_ptr(),
-                        *value,
-                    );
-                }
-            }
-        }
-    }
-
-    let scale = _mm_set1_ps(1.0 / 4096.0);
-    for strip in 0..16 {
-        let mut c: [__m128; 64] = std::array::from_fn(|col| unsafe {
-            _mm_loadu_ps(scratch[col * 64 + strip * 4..].as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for u in 0..64 {
-            unsafe {
-                _mm_storeu_ps(
-                    output[u * 64 + strip * 4..].as_mut_ptr(),
-                    _mm_mul_ps(c[u], scale),
-                );
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn dct64x32_sse41(input: &[f32; 2048], output: &mut [f32; 2048]) {
-    let mut scratch = [0.0f32; 2048];
-    for strip in 0..8 {
-        let mut c: [__m128; 64] = std::array::from_fn(|row| unsafe {
-            _mm_loadu_ps(input[row * 32 + strip * 4..].as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for tile_idx in 0..16 {
-            let base = tile_idx * 4;
-            let tile = transpose_4x4(c[base], c[base + 1], c[base + 2], c[base + 3]);
-            for (lane, value) in tile.iter().enumerate() {
-                unsafe {
-                    _mm_storeu_ps(
-                        scratch[(strip * 4 + lane) * 64 + tile_idx * 4..].as_mut_ptr(),
-                        *value,
-                    );
-                }
-            }
-        }
-    }
-
-    let scale = _mm_set1_ps(1.0 / 2048.0);
-    for strip in 0..16 {
-        let mut c: [__m128; 32] = std::array::from_fn(|col| unsafe {
-            _mm_loadu_ps(scratch[col * 64 + strip * 4..].as_ptr())
-        });
-        dct1d_32_s(&mut c);
-        for u in 0..32 {
-            unsafe {
-                _mm_storeu_ps(
-                    output[u * 64 + strip * 4..].as_mut_ptr(),
-                    _mm_mul_ps(c[u], scale),
-                );
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn dct32x64_sse41(input: &[f32; 2048], output: &mut [f32; 2048]) {
-    let mut scratch = [0.0f32; 2048];
-    for row_strip in 0..8 {
-        let mut c = [_mm_setzero_ps(); 64];
-        for tile_idx in 0..16 {
-            let tile = transpose_4x4(
-                unsafe { _mm_loadu_ps(input[(row_strip * 4) * 64 + tile_idx * 4..].as_ptr()) },
-                unsafe { _mm_loadu_ps(input[(row_strip * 4 + 1) * 64 + tile_idx * 4..].as_ptr()) },
-                unsafe { _mm_loadu_ps(input[(row_strip * 4 + 2) * 64 + tile_idx * 4..].as_ptr()) },
-                unsafe { _mm_loadu_ps(input[(row_strip * 4 + 3) * 64 + tile_idx * 4..].as_ptr()) },
-            );
-            c[tile_idx * 4..tile_idx * 4 + 4].copy_from_slice(&tile);
-        }
-        dct1d_64_s(&mut c);
-        for u in 0..64 {
-            unsafe { _mm_storeu_ps(scratch[u * 32 + row_strip * 4..].as_mut_ptr(), c[u]) };
-        }
-    }
-
-    let scale = _mm_set1_ps(1.0 / 2048.0);
-    for freq_strip in 0..16 {
-        let mut c = [_mm_setzero_ps(); 32];
-        for row_tile in 0..8 {
-            let tile = transpose_4x4(
-                unsafe { _mm_loadu_ps(scratch[(freq_strip * 4) * 32 + row_tile * 4..].as_ptr()) },
-                unsafe {
-                    _mm_loadu_ps(scratch[(freq_strip * 4 + 1) * 32 + row_tile * 4..].as_ptr())
-                },
-                unsafe {
-                    _mm_loadu_ps(scratch[(freq_strip * 4 + 2) * 32 + row_tile * 4..].as_ptr())
-                },
-                unsafe {
-                    _mm_loadu_ps(scratch[(freq_strip * 4 + 3) * 32 + row_tile * 4..].as_ptr())
-                },
-            );
-            c[row_tile * 4..row_tile * 4 + 4].copy_from_slice(&tile);
-        }
-        dct1d_32_s(&mut c);
-        for v in 0..32 {
-            unsafe {
-                _mm_storeu_ps(
-                    output[v * 64 + freq_strip * 4..].as_mut_ptr(),
-                    _mm_mul_ps(c[v], scale),
-                );
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -234,39 +105,6 @@ mod tests {
             state ^= state << 17;
             (state as u32) as f32 / u32::MAX as f32 * 2.0 - 1.0
         })
-    }
-
-    #[test]
-    fn dct64x64_sse41_matches_scalar() {
-        if !is_x86_feature_detected!("sse4.1") {
-            return;
-        }
-        let mut cases = Vec::with_capacity(11);
-        cases.push([0.5f32; 4096]);
-        let mut alternating = [0.0f32; 4096];
-        for (i, value) in alternating.iter_mut().enumerate() {
-            *value = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
-        }
-        cases.push(alternating);
-        let mut impulse = [0.0f32; 4096];
-        impulse[4095] = 1.0;
-        cases.push(impulse);
-        for seed in 0..8 {
-            cases.push(fill(0x6464 + seed));
-        }
-
-        for (case, input) in cases.iter().enumerate() {
-            let mut got = [0.0f32; 4096];
-            let mut want = [0.0f32; 4096];
-            unsafe { super::dct64x64_sse41(input, &mut got) };
-            crate::dct::dct64x64_scalar(input, &mut want);
-            let max_error = got
-                .iter()
-                .zip(want.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(max_error < 1e-4, "case {case}: max error {max_error}");
-        }
     }
 
     fn check_rectangular<const N: usize>(
@@ -294,25 +132,5 @@ mod tests {
                 "{label} case {case}: max error {max_error}"
             );
         }
-    }
-
-    #[test]
-    fn dct64x32_sse41_matches_scalar() {
-        check_rectangular(
-            super::dct64x32_sse41,
-            crate::dct::dct64x32_scalar,
-            0x6432,
-            "dct64x32",
-        );
-    }
-
-    #[test]
-    fn dct32x64_sse41_matches_scalar() {
-        check_rectangular(
-            super::dct32x64_sse41,
-            crate::dct::dct32x64_scalar,
-            0x3264,
-            "dct32x64",
-        );
     }
 }

@@ -26,47 +26,305 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::any::Any;
+use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
-pub(crate) fn steal_map<T, F>(len: usize, nthreads: usize, f: F) -> Vec<T>
-where
-    T: Send,
-    F: Fn(usize) -> T + Sync,
-{
-    let lanes = nthreads.max(1).min(len);
-    if lanes <= 1 {
-        return (0..len).map(f).collect();
-    }
+use crate::coder_scratch::CoderScratch;
 
-    let cursor = AtomicUsize::new(0);
-    let (f, cursor) = (&f, &cursor);
-    // Copy closure: one stealing lane. Each lane collects its own
-    // (index, value) pairs — no shared writes.
-    let lane = move || {
-        let mut out = Vec::new();
-        loop {
-            let i = cursor.fetch_add(1, Ordering::Relaxed);
-            if i >= len {
-                break out;
+struct Completion {
+    remaining: AtomicUsize,
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
+impl Completion {
+    fn finish(&self, panic: Option<Box<dyn Any + Send>>, shared: &Shared) {
+        if let Some(payload) = panic {
+            let mut first_panic = self.panic.lock().unwrap();
+            if first_panic.is_none() {
+                *first_panic = Some(payload);
             }
-            out.push((i, f(i)));
         }
-    };
-
-    // The caller runs a lane itself instead of parking in join; by the time it
-    // finishes, the cursor is drained and joins only wait out stragglers.
-    let mut chunks: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (1..lanes).map(|_| s.spawn(lane)).collect();
-        let own = lane();
-        let mut all: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        all.push(own);
-        all
-    });
-
-    // Scatter into index order.
-    let mut slots: Vec<Option<T>> = (0..len).map(|_| None).collect();
-    for pair in chunks.drain(..).flatten() {
-        slots[pair.0] = Some(pair.1);
+        let _queue = shared.queue.lock().unwrap();
+        self.remaining.fetch_sub(1, Ordering::Release);
+        shared.activity.notify_all();
     }
-    slots.into_iter().map(|v| v.unwrap()).collect()
+}
+
+struct Task {
+    run: Box<dyn FnOnce(&mut CoderScratch) + Send + 'static>,
+    completion: Arc<Completion>,
+}
+
+impl Task {
+    fn execute(self, shared: &Shared, scratch: &mut CoderScratch) {
+        let Self { run, completion } = self;
+        let result = catch_unwind(AssertUnwindSafe(|| run(scratch)));
+        // `run` (and therefore all lifetime-erased borrowed captures) has been
+        // consumed and destroyed before completion can reach zero.
+        completion.finish(result.err(), shared);
+    }
+}
+
+struct Shared {
+    queue: Mutex<VecDeque<Task>>,
+    activity: Condvar,
+    shutdown: AtomicBool,
+}
+
+impl Shared {
+    fn push(&self, task: Task) {
+        self.queue.lock().unwrap().push_back(task);
+        self.activity.notify_one();
+    }
+
+    fn run_one(&self, scratch: &mut CoderScratch) -> bool {
+        let task = self.queue.lock().unwrap().pop_front();
+        if let Some(task) = task {
+            task.execute(self, scratch);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn wait_for_activity(&self, remaining: &AtomicUsize) {
+        let queue = self.queue.lock().unwrap();
+        if queue.is_empty()
+            && remaining.load(Ordering::Acquire) != 0
+            && !self.shutdown.load(Ordering::Acquire)
+        {
+            drop(self.activity.wait(queue).unwrap());
+        }
+    }
+}
+
+/// Fixed set of workers reused by all parallel phases of one encoding.
+///
+/// The calling thread is also a worker, so a pool configured for `n` threads
+/// owns `n - 1` background threads. Waiting workers help run queued work. That
+/// is important for nested maps (AC-strategy bands inside DC-group setup) and
+/// prevents them from deadlocking the pool.
+pub(crate) struct ThreadPool {
+    shared: Arc<Shared>,
+    workers: Vec<JoinHandle<()>>,
+    num_threads: usize,
+}
+
+impl ThreadPool {
+    pub(crate) fn new(num_threads: usize) -> Self {
+        let num_threads = num_threads.max(1);
+        // Fully construct every background-worker slot before any worker can
+        // receive a job. The calling thread owns its box directly at the
+        // encoding entry point and passes it into each map.
+        let scratches: Vec<Box<CoderScratch>> = (1..num_threads)
+            .map(|_| Box::<CoderScratch>::default())
+            .collect();
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::new()),
+            activity: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        let workers = scratches
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut scratch)| {
+                let shared = Arc::clone(&shared);
+                std::thread::Builder::new()
+                    .name(format!("jixel-worker-{}", i + 1))
+                    .spawn(move || {
+                        worker_loop(&shared, &mut scratch);
+                    })
+                    .expect("failed to start encoder worker")
+            })
+            .collect();
+        Self {
+            shared,
+            workers,
+            num_threads,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn num_threads(&self) -> usize {
+        self.num_threads
+    }
+
+    pub(crate) fn steal_map<T, F>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        len: usize,
+        f: F,
+    ) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(usize, &mut CoderScratch) -> T + Sync,
+    {
+        self.steal_map_with_threads(caller_scratch, len, self.num_threads, f)
+    }
+
+    pub(crate) fn steal_map_with_threads<T, F>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        len: usize,
+        max_threads: usize,
+        f: F,
+    ) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(usize, &mut CoderScratch) -> T + Sync,
+    {
+        let lanes = self.num_threads.min(max_threads.max(1)).min(len);
+        if lanes <= 1 {
+            return (0..len).map(|i| f(i, caller_scratch)).collect();
+        }
+
+        let cursor = AtomicUsize::new(0);
+        let chunks = Mutex::new(Vec::<Vec<(usize, T)>>::with_capacity(lanes));
+        let completion = Arc::new(Completion {
+            remaining: AtomicUsize::new(lanes),
+            panic: Mutex::new(None),
+        });
+
+        let lane = |scratch: &mut CoderScratch| {
+            let mut out = Vec::new();
+            loop {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= len {
+                    break;
+                }
+                out.push((i, f(i, scratch)));
+            }
+            chunks.lock().unwrap().push(out);
+        };
+
+        for _ in 1..lanes {
+            let run: Box<dyn FnOnce(&mut CoderScratch) + Send + '_> = Box::new(&lane);
+            // `steal_map_with_threads` does not return until every queued lane
+            // has completed, so the borrowed closure and its
+            // captures outlive each task. This is the same scoped-lifetime
+            // guarantee provided by `std::thread::scope`, applied to persistent
+            // workers instead of newly spawned threads.
+            let run = unsafe {
+                std::mem::transmute::<
+                    Box<dyn FnOnce(&mut CoderScratch) + Send + '_>,
+                    Box<dyn FnOnce(&mut CoderScratch) + Send + 'static>,
+                >(run)
+            };
+            self.shared.push(Task {
+                run,
+                completion: Arc::clone(&completion),
+            });
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| lane(caller_scratch)));
+        completion.finish(result.err(), &self.shared);
+
+        while completion.remaining.load(Ordering::Acquire) != 0 {
+            if !self.shared.run_one(caller_scratch) {
+                self.shared.wait_for_activity(&completion.remaining);
+            }
+        }
+
+        if let Some(payload) = completion.panic.lock().unwrap().take() {
+            resume_unwind(payload);
+        }
+
+        let mut slots: Vec<Option<T>> = (0..len).map(|_| None).collect();
+        for (i, value) in chunks.into_inner().unwrap().into_iter().flatten() {
+            slots[i] = Some(value);
+        }
+        slots.into_iter().map(Option::unwrap).collect()
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        let queue = self.shared.queue.lock().unwrap();
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.activity.notify_all();
+        drop(queue);
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+    }
+}
+
+fn worker_loop(shared: &Shared, scratch: &mut CoderScratch) {
+    loop {
+        let task = {
+            let mut queue = shared.queue.lock().unwrap();
+            while queue.is_empty() && !shared.shutdown.load(Ordering::Acquire) {
+                queue = shared.activity.wait(queue).unwrap();
+            }
+            if queue.is_empty() {
+                return;
+            }
+            queue.pop_front().unwrap()
+        };
+        task.execute(shared, scratch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoderScratch, ThreadPool};
+
+    #[test]
+    fn persistent_pool_preserves_index_order() {
+        let pool = ThreadPool::new(4);
+        let mut scratch = Box::<CoderScratch>::default();
+        assert_eq!(
+            pool.steal_map(&mut scratch, 257, |i, _scratch| i.wrapping_mul(17)),
+            (0usize..257)
+                .map(|i| i.wrapping_mul(17))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn nested_maps_share_the_pool() {
+        let pool = ThreadPool::new(4);
+        let mut scratch = Box::<CoderScratch>::default();
+        let result = pool.steal_map(&mut scratch, 16, |outer, scratch| {
+            pool.steal_map_with_threads(scratch, 9, 2, |inner, _scratch| outer * 100 + inner)
+        });
+        for (outer, row) in result.iter().enumerate() {
+            assert_eq!(
+                row,
+                &(0..9).map(|inner| outer * 100 + inner).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn pool_can_be_reused_for_consecutive_maps() {
+        let pool = ThreadPool::new(3);
+        let mut scratch = Box::<CoderScratch>::default();
+        for offset in 0..8 {
+            assert_eq!(
+                pool.steal_map(&mut scratch, 31, |i, _scratch| offset + i),
+                (0..31).map(|i| offset + i).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn worker_panic_is_propagated_without_losing_the_pool() {
+        let pool = ThreadPool::new(4);
+        let mut scratch = Box::<CoderScratch>::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.steal_map(&mut scratch, 64, |i, _scratch| {
+                assert_ne!(i, 17, "worker failure");
+                i
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            pool.steal_map(&mut scratch, 4, |i, _scratch| i),
+            vec![0, 1, 2, 3]
+        );
+    }
 }

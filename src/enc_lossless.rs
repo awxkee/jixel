@@ -30,8 +30,11 @@
 #[path = "enc_lossless_lz77.rs"]
 mod lz77;
 
+use crate::coder_scratch::CoderScratch;
+use crate::thread_pool::ThreadPool;
+pub(crate) use lz77::LzToken;
 use lz77::{
-    LZ77_MIN_SYMBOL, LzToken, build_lz_pixel_code, lz77_compress_for_speed, lz77_compress_runs,
+    LZ77_MIN_SYMBOL, build_lz_pixel_code, lz77_compress_for_speed, lz77_compress_runs,
     write_local_tree_lz77, write_lz_token, write_tree_lz77,
 };
 
@@ -408,13 +411,14 @@ fn choose_wp_params(
     alpha: Option<&AlphaPlane>,
     num_color: usize,
     header_count: usize,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
 ) -> WpParams {
     let width = linear.xsize();
     let height = linear.ysize();
     let nb_chans = num_color + usize::from(alpha.is_some());
     let total_values = width.saturating_mul(height).saturating_mul(nb_chans);
-    let scores = crate::thread_pool::steal_map(WpParams::PRESETS.len(), num_threads, |preset| {
+    let scores = pool.steal_map(scratch, WpParams::PRESETS.len(), |preset, _scratch| {
         let params = WpParams::PRESETS[preset];
         let mut sample_cost = 0u64;
         let mut samples = 0usize;
@@ -450,36 +454,6 @@ fn choose_wp_params(
 const GROUP_DIM: usize = 256;
 const LF_GROUP_DIM: usize = 2048;
 
-struct LosslessScratchGuard;
-
-impl Drop for LosslessScratchGuard {
-    fn drop(&mut self) {
-        release_lossless_tls_scratches();
-    }
-}
-
-fn release_lossless_tls_scratches() {
-    GRADIENT_SCRATCH.with_borrow_mut(|scratch| *scratch = GradientScratch::default());
-    ORDER0_ENTROPY_SCRATCH.with_borrow_mut(|scratch| *scratch = Vec::new());
-    THRESHOLD_SCRATCH.with_borrow_mut(|scratch| scratch.hist_scratch = Vec::new());
-    lz77::release_tls_scratch();
-    crate::entropy::release_huffman_tree_scratch();
-}
-
-#[cfg(test)]
-fn lossless_tls_scratch_capacity() -> usize {
-    let gradient = GRADIENT_SCRATCH.with_borrow(|scratch| {
-        scratch.cur.capacity() + scratch.prev.capacity() + scratch.buf.capacity()
-    });
-    let order0 = ORDER0_ENTROPY_SCRATCH.with_borrow(|scratch| scratch.capacity());
-    let threshold = THRESHOLD_SCRATCH.with_borrow(|scratch| scratch.hist_scratch.capacity());
-    gradient
-        + order0
-        + threshold
-        + lz77::tls_scratch_capacity()
-        + crate::entropy::huffman_tree_scratch_capacity()
-}
-
 fn zero_alpha_like(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
     match alpha {
         Some(AlphaPlane::U8(_)) => Some(AlphaPlane::U8(vec![0; pixels])),
@@ -503,6 +477,35 @@ pub(crate) fn encode_frame_lossless(
     num_threads: usize,
     writer: &mut BitWriter,
 ) {
+    let pool = ThreadPool::new(num_threads);
+    let mut scratch = Box::<CoderScratch>::default();
+    encode_frame_lossless_with_pool(
+        linear,
+        alpha,
+        max_bits,
+        progressive,
+        patches,
+        num_color,
+        speed,
+        &pool,
+        &mut scratch,
+        writer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_lossless_with_pool(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    max_bits: u32,
+    progressive: bool,
+    patches: bool,
+    num_color: usize,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) {
     if patches
         && num_color == 3
         && let Some(plan) = find_lossless_patches(linear)
@@ -519,7 +522,8 @@ pub(crate) fn encode_frame_lossless(
             progressive,
             num_color,
             speed,
-            num_threads,
+            pool,
+            scratch,
             ModularFrameKind::Regular,
             &mut regular_writer,
         );
@@ -534,7 +538,8 @@ pub(crate) fn encode_frame_lossless(
             false,
             num_color,
             speed,
-            num_threads,
+            pool,
+            scratch,
             ModularFrameKind::ReferenceOnly {
                 width: plan.atlas.xsize(),
                 height: plan.atlas.ysize(),
@@ -548,7 +553,8 @@ pub(crate) fn encode_frame_lossless(
             false,
             num_color,
             speed,
-            num_threads,
+            pool,
+            scratch,
             ModularFrameKind::Patched(&plan.references),
             &mut patched_writer,
         );
@@ -567,7 +573,8 @@ pub(crate) fn encode_frame_lossless(
         progressive,
         num_color,
         speed,
-        num_threads,
+        pool,
+        scratch,
         ModularFrameKind::Regular,
         writer,
     );
@@ -581,12 +588,11 @@ fn encode_frame_lossless_core(
     progressive: bool,
     num_color: usize,
     speed: crate::Speed,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
     writer: &mut BitWriter,
 ) {
-    let _scratch_guard = LosslessScratchGuard;
-    let num_threads = num_threads.max(1);
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
     // bit depths raise LZ77_MIN_SYMBOL above the max literal token so the decoder
@@ -626,6 +632,7 @@ fn encode_frame_lossless_core(
             min_symbol,
             grad_pack_fn,
             speed,
+            scratch,
             writer,
         )
     {
@@ -649,7 +656,8 @@ fn encode_frame_lossless_core(
             min_symbol,
             grad_pack_fn,
             speed,
-            num_threads,
+            pool,
+            scratch,
             writer,
         )
     {
@@ -666,7 +674,8 @@ fn encode_frame_lossless_core(
             min_symbol,
             grad_pack_fn,
             speed,
-            num_threads,
+            pool,
+            scratch,
             writer,
         );
         return;
@@ -693,7 +702,8 @@ fn encode_frame_lossless_core(
             num_ac_groups,
             grad_pack_fn,
             speed,
-            num_threads,
+            pool,
+            scratch,
             writer,
         )
     {
@@ -710,12 +720,12 @@ fn encode_frame_lossless_core(
         2 + num_dc_groups + num_ac_groups
     };
     let mut wp_params = if adaptive_search {
-        choose_wp_params(linear, alpha, num_color, wp_header_count, num_threads)
+        choose_wp_params(linear, alpha, num_color, wp_header_count, pool, scratch)
     } else {
         WpParams::DEFAULT
     };
     let predictors = if adaptive_search {
-        choose_predictors_with_wp(linear, alpha, xsize, ysize, num_threads, wp_params)
+        choose_predictors_with_wp(linear, alpha, xsize, ysize, pool, scratch, wp_params)
     } else {
         [PREDICTOR_WEIGHTED; 4]
     };
@@ -742,7 +752,8 @@ fn encode_frame_lossless_core(
                 ysize,
                 &predictors,
                 min_symbol,
-                num_threads,
+                pool,
+                scratch,
                 wp_params,
                 writer,
             ) {
@@ -758,7 +769,8 @@ fn encode_frame_lossless_core(
             ysize_groups,
             num_dc_groups,
             min_symbol,
-            num_threads,
+            pool,
+            scratch,
             wp_params,
             writer,
         ) {
@@ -776,7 +788,7 @@ fn encode_frame_lossless_core(
         // Single section: GroupHeader + local tree + pixel histograms + pixels.
         let mut section = BitWriter::new();
         if let ModularFrameKind::Patched(references) = frame_kind {
-            write_patch_dictionary(references, alpha.is_some(), &mut section);
+            write_patch_dictionary(references, alpha.is_some(), scratch, &mut section);
         }
         // 1 bit: dc_quant all_default = 1
         section.write(1, 1);
@@ -800,7 +812,8 @@ fn encode_frame_lossless_core(
             num_color,
             &chan_preds,
             grad_pack_fn,
-            num_threads,
+            pool,
+            scratch,
             wp_params,
         );
 
@@ -808,20 +821,28 @@ fn encode_frame_lossless_core(
         // The distance context is the (nb_chans)-th context, appended after the
         // per-channel ones.
         let distance_ctx = nb_chans as u32;
-        let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
+        let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
 
         // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
         let code = build_lz_pixel_code(
-            &lz_tokens,
+            std::iter::once(lz_tokens.as_slice()),
             nb_chans,
             min_symbol,
             speed == crate::Speed::Slow,
+            &mut scratch.lz_entropy,
+            &mut scratch.huffman_pool,
         );
-        write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut section);
+        write_local_tree_lz77(
+            &chan_preds,
+            &code,
+            min_symbol,
+            &mut scratch.huffman_pool,
+            &mut section,
+        );
 
         // Emit the LZ77'd token stream.
         for t in &lz_tokens {
-            write_lz_token(*t, &code, min_symbol, &mut section);
+            write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
         }
         section.zero_pad_to_byte();
 
@@ -845,7 +866,7 @@ fn encode_frame_lossless_core(
         // every per-group emission is guaranteed to be representable.
         let distance_ctx = nb_chans as u32;
         let group_lz_tokens: Vec<Vec<LzToken>> =
-            crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+            pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
                 let gx = group_index % xsize_groups;
                 let gy = group_index / xsize_groups;
                 let x0 = gx * GROUP_DIM;
@@ -864,24 +885,33 @@ fn encode_frame_lossless_core(
                     num_color,
                     &chan_preds,
                     grad_pack_fn,
-                    1,
+                    pool,
+                    scratch,
                     wp_params,
                 );
-                lz77_compress_for_speed(&toks, distance_ctx, speed)
+                lz77_compress_for_speed(&toks, distance_ctx, speed, scratch)
             });
-        let mut all_lz: Vec<LzToken> = Vec::new();
-        for lz in &group_lz_tokens {
-            all_lz.extend_from_slice(lz);
-        }
-        let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol, speed == crate::Speed::Slow);
-
         // ----- Section 0: DC global -----
         if let ModularFrameKind::Patched(references) = frame_kind {
-            write_patch_dictionary(references, alpha.is_some(), &mut sections[0]);
+            write_patch_dictionary(references, alpha.is_some(), scratch, &mut sections[0]);
         }
+        let code = build_lz_pixel_code(
+            group_lz_tokens.iter().map(Vec::as_slice),
+            nb_chans,
+            min_symbol,
+            speed == crate::Speed::Slow,
+            &mut scratch.lz_entropy,
+            &mut scratch.huffman_pool,
+        );
         sections[0].write(1, 1); // dc_quant all_default = 1
         sections[0].write(1, 1); // has_tree = 1
-        write_local_tree_lz77(&chan_preds, &code, min_symbol, &mut sections[0]);
+        write_local_tree_lz77(
+            &chan_preds,
+            &code,
+            min_symbol,
+            &mut scratch.huffman_pool,
+            &mut sections[0],
+        );
         // GroupHeader for the global modular image: use_global_tree=1, wp=1, RCT transform.
         sections[0].write(1, 1);
         write_wp_header(wp_params, &mut sections[0]);
@@ -915,7 +945,13 @@ fn encode_frame_lossless_core(
                 sections[section_idx].write(2, 0);
 
                 for t in &group_lz_tokens[group_index] {
-                    write_lz_token(*t, &code, min_symbol, &mut sections[section_idx]);
+                    write_lz_token(
+                        *t,
+                        distance_ctx,
+                        &code,
+                        min_symbol,
+                        &mut sections[section_idx],
+                    );
                 }
                 sections[section_idx].zero_pad_to_byte();
             }
@@ -1032,6 +1068,7 @@ fn write_frame_header_modular_flags(has_alpha: bool, flags: u64, w: &mut BitWrit
 pub(crate) fn write_patch_dictionary(
     references: &[PatchReference],
     has_alpha: bool,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     const NUM_REF: u32 = 0;
@@ -1067,10 +1104,10 @@ pub(crate) fn write_patch_dictionary(
             }
         }
     }
-    let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS);
+    let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
     let code_ref = code.as_ref();
     w.write(1, 0); // patch dictionary entropy stream has no LZ77
-    write_entropy_code(&code_ref, w);
+    write_entropy_code(&code_ref, &mut scratch.huffman_pool, w);
     for token in tokens {
         write_token(token, &code_ref, w);
     }
@@ -1152,7 +1189,8 @@ fn encode_squeeze_single_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -1216,7 +1254,7 @@ fn encode_squeeze_single_group(
     // Slow searches the useful general and directional predictors per channel;
     // Fast avoids the analysis pass and uses fixed Weighted prediction.
     let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        crate::thread_pool::steal_map(channels.len(), num_threads, |c| {
+        pool.steal_map(scratch, channels.len(), |c, _scratch| {
             let ch = &channels[c];
             let data = &ch.data;
             let w = ch.w;
@@ -1226,7 +1264,7 @@ fn encode_squeeze_single_group(
     } else {
         vec![PREDICTOR_WEIGHTED; nb]
     };
-    let channel_tokens = crate::thread_pool::steal_map(nb, num_threads, |c| {
+    let channel_tokens = pool.steal_map(scratch, nb, |c, scratch| {
         let ch = &channels[c];
         let mut tokens = Vec::with_capacity(ch.w * ch.h);
         tokenize_plane(
@@ -1236,6 +1274,7 @@ fn encode_squeeze_single_group(
             ch.h,
             predictors[c],
             grad_pack_fn,
+            &mut scratch.gradient,
             &mut tokens,
         );
         tokens
@@ -1254,11 +1293,24 @@ fn encode_squeeze_single_group(
     write_modular_transforms_rct_squeeze(&steps, &mut section);
 
     let distance_ctx = nb as u32;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
-    let code = build_lz_pixel_code(&lz_tokens, nb, min_symbol, speed == crate::Speed::Slow);
-    write_local_tree_lz77(&predictors, &code, min_symbol, &mut section);
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
+    let code = build_lz_pixel_code(
+        std::iter::once(lz_tokens.as_slice()),
+        nb,
+        min_symbol,
+        speed == crate::Speed::Slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    write_local_tree_lz77(
+        &predictors,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
     for t in &lz_tokens {
-        write_lz_token(*t, &code, min_symbol, &mut section);
+        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
     }
     section.zero_pad_to_byte();
 
@@ -1365,7 +1417,8 @@ fn encode_squeeze_multigroup(
     num_ac_groups: usize,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
     use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
@@ -1453,7 +1506,7 @@ fn encode_squeeze_multigroup(
     let distance_ctx = nb as u32;
 
     // Global stream: the small channels [0, split), whole.
-    let global_channel_tokens = crate::thread_pool::steal_map(split, num_threads, |c| {
+    let global_channel_tokens = pool.steal_map(scratch, split, |c, scratch| {
         let ch = &channels[c];
         let ctx = channel_to_context(c, nb);
         let data = &ch.data;
@@ -1467,6 +1520,7 @@ fn encode_squeeze_multigroup(
             ch.h,
             predictors[c],
             grad_pack_fn,
+            &mut scratch.gradient,
             &mut tokens,
         );
         tokens
@@ -1475,8 +1529,7 @@ fn encode_squeeze_multigroup(
     for channel in global_channel_tokens {
         global_tokens.extend(channel);
     }
-    let global_lz = lz77_compress_for_speed(&global_tokens, distance_ctx, speed);
-    let mut all_lz: Vec<LzToken> = global_lz.clone();
+    let global_lz = lz77_compress_for_speed(&global_tokens, distance_ctx, speed, scratch);
 
     // One group's worth of cropped large-channel tokens. `gdim` is the group's
     // frame-space size (GROUP_DIM for AC, LF_GROUP_DIM for DC); a channel is
@@ -1484,7 +1537,13 @@ fn encode_squeeze_multigroup(
     // its `(group_rect >> shift)` crop. The decoder rebuilds the same scan, so
     // the within-group index (sequential over non-empty crops) is exactly the
     // `chan` property the global tree keys on.
-    let crop_group = |gdim: usize, gx: usize, gy: usize, minsh: i32, maxsh: i32| -> Vec<LzToken> {
+    let crop_group = |gdim: usize,
+                      gx: usize,
+                      gy: usize,
+                      minsh: i32,
+                      maxsh: i32,
+                      scratch: &mut CoderScratch|
+     -> Vec<LzToken> {
         let mut gtok: Vec<Token> = Vec::new();
         for_each_squeeze_group_crop(
             &channels,
@@ -1501,35 +1560,47 @@ fn encode_squeeze_multigroup(
                 let data = &ch.data;
                 let w = ch.w;
                 let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-                tokenize_plane(ctx, get, rw, rh, pred, grad_pack_fn, &mut gtok);
+                tokenize_plane(
+                    ctx,
+                    get,
+                    rw,
+                    rh,
+                    pred,
+                    grad_pack_fn,
+                    &mut scratch.gradient,
+                    &mut gtok,
+                );
             },
         );
-        lz77_compress_for_speed(&gtok, distance_ctx, speed)
+        lz77_compress_for_speed(&gtok, distance_ctx, speed, scratch)
     };
 
     // DC (LF) groups carry the deeply-squeezed large channels (min shift >= 3),
     // partitioned into LF_GROUP_DIM rects. Empty unless the image is large enough
     // that a >=3x-squeezed channel still exceeds a group (dimension > ~2048).
-    let dc_group_lz = crate::thread_pool::steal_map(num_dc_groups, num_threads, |group_index| {
+    let dc_group_lz = pool.steal_map(scratch, num_dc_groups, |group_index, scratch| {
         let gx = group_index % xsize_dc_groups;
         let gy = group_index / xsize_dc_groups;
-        crop_group(LF_GROUP_DIM, gx, gy, 3, 1000)
+        crop_group(LF_GROUP_DIM, gx, gy, 3, 1000, scratch)
     });
-    for glz in &dc_group_lz {
-        all_lz.extend_from_slice(glz);
-    }
 
     // AC groups carry the shallow large channels (min shift <= 2), in GROUP_DIM rects.
-    let ac_group_lz = crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+    let ac_group_lz = pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
         let gx = group_index % xsize_groups;
         let gy = group_index / xsize_groups;
-        crop_group(GROUP_DIM, gx, gy, 0, 2)
+        crop_group(GROUP_DIM, gx, gy, 0, 2, scratch)
     });
-    for glz in &ac_group_lz {
-        all_lz.extend_from_slice(glz);
-    }
 
-    let code = build_lz_pixel_code(&all_lz, nb, min_symbol, speed == crate::Speed::Slow);
+    let code = build_lz_pixel_code(
+        std::iter::once(global_lz.as_slice())
+            .chain(dc_group_lz.iter().map(Vec::as_slice))
+            .chain(ac_group_lz.iter().map(Vec::as_slice)),
+        nb,
+        min_symbol,
+        speed == crate::Speed::Slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
 
     write_frame_header_modular(alpha.is_some(), writer);
 
@@ -1539,12 +1610,18 @@ fn encode_squeeze_multigroup(
     // ----- Section 0: LfGlobal = global tree + global modular image -----
     sections[0].write(1, 1); // dc_quant all_default = 1
     sections[0].write(1, 1); // has_tree = 1
-    write_local_tree_lz77(&predictors, &code, min_symbol, &mut sections[0]);
+    write_local_tree_lz77(
+        &predictors,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut sections[0],
+    );
     sections[0].write(1, 1); // use_global_tree = 1
     sections[0].write(1, 1); // wp_default = 1
     write_modular_transforms_rct_squeeze(&steps, &mut sections[0]);
     for t in &global_lz {
-        write_lz_token(*t, &code, min_symbol, &mut sections[0]);
+        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut sections[0]);
     }
     sections[0].zero_pad_to_byte();
 
@@ -1555,7 +1632,7 @@ fn encode_squeeze_multigroup(
         section.write(1, 1); // wp_default
         section.write(2, 0); // 0 transforms (declared globally)
         for t in &dc_group_lz[i] {
-            write_lz_token(*t, &code, min_symbol, section);
+            write_lz_token(*t, distance_ctx, &code, min_symbol, section);
         }
         section.zero_pad_to_byte();
     }
@@ -1573,7 +1650,7 @@ fn encode_squeeze_multigroup(
         sections[idx].write(1, 1); // wp_default
         sections[idx].write(2, 0); // 0 transforms (declared globally)
         for t in &ac_group_lz[g] {
-            write_lz_token(*t, &code, min_symbol, &mut sections[idx]);
+            write_lz_token(*t, distance_ctx, &code, min_symbol, &mut sections[idx]);
         }
         sections[idx].zero_pad_to_byte();
     }
@@ -1631,6 +1708,7 @@ fn try_encode_palette_single_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
     use std::collections::HashMap;
@@ -1718,6 +1796,7 @@ fn try_encode_palette_single_group(
         num_c,
         preds[0],
         grad_pack_fn,
+        &mut scratch.gradient,
         &mut tokens,
     );
     tokenize_plane(
@@ -1727,20 +1806,29 @@ fn try_encode_palette_single_group(
         ysize,
         preds[1],
         grad_pack_fn,
+        &mut scratch.gradient,
         &mut tokens,
     );
 
     let distance_ctx = nb_chans as u32;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed);
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
-        &lz_tokens,
+        std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
         speed == crate::Speed::Slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
     );
-    write_local_tree_lz77(&preds, &code, min_symbol, &mut section);
+    write_local_tree_lz77(
+        &preds,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
     for t in &lz_tokens {
-        write_lz_token(*t, &code, min_symbol, &mut section);
+        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
     }
     section.zero_pad_to_byte();
 
@@ -1767,13 +1855,27 @@ fn estimated_local_stream_bits(
     num_contexts: usize,
     min_symbol: u32,
     speed: crate::Speed,
+    scratch: &mut CoderScratch,
 ) -> usize {
-    let lz = lz77_compress_runs(tokens, num_contexts as u32);
-    let code = build_lz_pixel_code(&lz, num_contexts, min_symbol, speed == crate::Speed::Slow);
+    let lz = lz77_compress_runs(tokens);
+    let code = build_lz_pixel_code(
+        std::iter::once(lz.as_slice()),
+        num_contexts,
+        min_symbol,
+        speed == crate::Speed::Slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
     let mut writer = BitWriter::new();
-    write_local_tree_lz77(predictors, &code, min_symbol, &mut writer);
+    write_local_tree_lz77(
+        predictors,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut writer,
+    );
     for token in &lz {
-        write_lz_token(*token, &code, min_symbol, &mut writer);
+        write_lz_token(*token, num_contexts as u32, &code, min_symbol, &mut writer);
     }
     writer.bits_written()
 }
@@ -1789,6 +1891,8 @@ fn local_palette_is_better(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
 ) -> bool {
     let nb_chans = 3 + usize::from(alpha.is_some());
     let palette_predictors = if speed == crate::Speed::Slow {
@@ -1816,6 +1920,7 @@ fn local_palette_is_better(
         nb_chans,
         palette_predictors[0],
         grad_pack_fn,
+        &mut scratch.gradient,
         &mut palette_tokens,
     );
     tokenize_plane(
@@ -1825,6 +1930,7 @@ fn local_palette_is_better(
         palette.h,
         palette_predictors[1],
         grad_pack_fn,
+        &mut scratch.gradient,
         &mut palette_tokens,
     );
     let mut palette_transform = BitWriter::new();
@@ -1833,9 +1939,14 @@ fn local_palette_is_better(
         palette.nb_colors as u32,
         &mut palette_transform,
     );
-    let palette_bits =
-        estimated_local_stream_bits(&palette_tokens, &palette_predictors, 2, min_symbol, speed)
-            + palette_transform.bits_written();
+    let palette_bits = estimated_local_stream_bits(
+        &palette_tokens,
+        &palette_predictors,
+        2,
+        min_symbol,
+        speed,
+        scratch,
+    ) + palette_transform.bits_written();
 
     let plain_predictors: Vec<u32> = if speed == crate::Speed::Slow {
         (0..nb_chans)
@@ -1872,7 +1983,8 @@ fn local_palette_is_better(
         3,
         &plain_predictors,
         grad_pack_fn,
-        1,
+        pool,
+        scratch,
     );
     let plain_bits = estimated_local_stream_bits(
         &plain_tokens,
@@ -1880,6 +1992,7 @@ fn local_palette_is_better(
         nb_chans,
         min_symbol,
         speed,
+        scratch,
     ) + 2; // zero-transform count
 
     palette_bits < plain_bits
@@ -1972,12 +2085,13 @@ fn try_encode_local_palette_multi_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + usize::from(alpha.is_some());
     let num_ac_groups = xsize_groups * ysize_groups;
-    let palettes = crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+    let palettes = pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
         let gx = group_index % xsize_groups;
         let gy = group_index / xsize_groups;
         let x0 = gx * GROUP_DIM;
@@ -1995,6 +2109,8 @@ fn try_encode_local_palette_multi_group(
             min_symbol,
             grad_pack_fn,
             speed,
+            pool,
+            scratch,
         )
         .then_some(palette)
     });
@@ -2005,7 +2121,7 @@ fn try_encode_local_palette_multi_group(
     // The global MA tree sees group-local channel slots. Pool predictor costs
     // for palette/index channels and ordinary YCoCg(A) channels by those slots.
     let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        crate::thread_pool::steal_map(nb_chans, num_threads, |slot| {
+        pool.steal_map(scratch, nb_chans, |slot, _scratch| {
             let mut cost = SqueezePredictorCost::default();
             for (group_index, palette) in palettes.iter().enumerate() {
                 if let Some(palette) = palette {
@@ -2047,7 +2163,7 @@ fn try_encode_local_palette_multi_group(
 
     let distance_ctx = nb_chans as u32;
     let group_lz_tokens: Vec<Vec<LzToken>> =
-        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+        pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
             let mut tokens = if let Some(palette) = &palettes[group_index] {
                 Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h)
             } else {
@@ -2061,6 +2177,7 @@ fn try_encode_local_palette_multi_group(
                     nb_chans,
                     predictors[0],
                     grad_pack_fn,
+                    &mut scratch.gradient,
                     &mut tokens,
                 );
                 tokenize_plane(
@@ -2070,6 +2187,7 @@ fn try_encode_local_palette_multi_group(
                     palette.h,
                     predictors[1],
                     grad_pack_fn,
+                    &mut scratch.gradient,
                     &mut tokens,
                 );
             } else {
@@ -2091,17 +2209,21 @@ fn try_encode_local_palette_multi_group(
                     3,
                     &predictors,
                     grad_pack_fn,
-                    1,
+                    pool,
+                    scratch,
                 );
             }
-            lz77_compress_for_speed(&tokens, distance_ctx, speed)
+            lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch)
         });
 
-    let mut all_lz = Vec::with_capacity(group_lz_tokens.iter().map(Vec::len).sum());
-    for tokens in &group_lz_tokens {
-        all_lz.extend_from_slice(tokens);
-    }
-    let code = build_lz_pixel_code(&all_lz, nb_chans, min_symbol, speed == crate::Speed::Slow);
+    let code = build_lz_pixel_code(
+        group_lz_tokens.iter().map(Vec::as_slice),
+        nb_chans,
+        min_symbol,
+        speed == crate::Speed::Slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
 
     write_frame_header_modular(alpha.is_some(), writer);
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
@@ -2109,7 +2231,13 @@ fn try_encode_local_palette_multi_group(
 
     sections[0].write(1, 1); // dc_quant all_default
     sections[0].write(1, 1); // has global tree
-    write_local_tree_lz77(&predictors, &code, min_symbol, &mut sections[0]);
+    write_local_tree_lz77(
+        &predictors,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut sections[0],
+    );
     sections[0].write(1, 1); // use_global_tree
     sections[0].write(1, 1); // wp_default
     write_modular_transforms(nb_chans, &mut sections[0]);
@@ -2141,7 +2269,13 @@ fn try_encode_local_palette_multi_group(
             sections[section_idx].write(2, 0); // no local transforms
         }
         for token in &group_lz_tokens[group_index] {
-            write_lz_token(*token, &code, min_symbol, &mut sections[section_idx]);
+            write_lz_token(
+                *token,
+                distance_ctx,
+                &code,
+                min_symbol,
+                &mut sections[section_idx],
+            );
         }
         sections[section_idx].zero_pad_to_byte();
     }
@@ -2222,7 +2356,8 @@ fn tokenize_all(
     num_color: usize,
     predictors: &[u32],
     grad_pack_fn: GradPackInteriorFn,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
 ) -> Vec<Token> {
     tokenize_all_with_wp(
         linear,
@@ -2236,7 +2371,8 @@ fn tokenize_all(
         num_color,
         predictors,
         grad_pack_fn,
-        num_threads,
+        pool,
+        scratch,
         WpParams::DEFAULT,
     )
 }
@@ -2253,11 +2389,12 @@ fn tokenize_all_with_wp(
     num_color: usize,
     predictors: &[u32],
     grad_pack_fn: GradPackInteriorFn,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     wp_params: WpParams,
 ) -> Vec<Token> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
-    let channel_tokens = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+    let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, scratch| {
         let mut out = Vec::with_capacity(gw * gh);
         let ctx = channel_to_context(chan, nb_chans);
         if chan < num_color {
@@ -2269,6 +2406,7 @@ fn tokenize_all_with_wp(
                 gh,
                 predictors[chan],
                 grad_pack_fn,
+                &mut scratch.gradient,
                 &mut out,
                 wp_params,
             );
@@ -2282,6 +2420,7 @@ fn tokenize_all_with_wp(
                 gh,
                 predictors[chan],
                 grad_pack_fn,
+                &mut scratch.gradient,
                 &mut out,
                 wp_params,
             );
@@ -2296,15 +2435,10 @@ fn tokenize_all_with_wp(
 }
 
 #[derive(Default)]
-struct GradientScratch {
-    cur: Vec<i32>,
-    prev: Vec<i32>,
-    buf: Vec<u32>,
-}
-
-thread_local! {
-    static GRADIENT_SCRATCH: RefCell<GradientScratch> =
-        RefCell::new(GradientScratch::default());
+pub(crate) struct GradientScratch {
+    pub(crate) cur: Vec<i32>,
+    pub(crate) prev: Vec<i32>,
+    pub(crate) buf: Vec<u32>,
 }
 
 /// Tokenize one channel's group-local rectangle with the chosen predictor
@@ -2320,6 +2454,7 @@ fn tokenize_plane(
     gh: usize,
     pred_id: u32,
     grad_pack_fn: GradPackInteriorFn,
+    scratch: &mut GradientScratch,
     out: &mut Vec<Token>,
 ) {
     tokenize_plane_with_wp(
@@ -2329,6 +2464,7 @@ fn tokenize_plane(
         gh,
         pred_id,
         grad_pack_fn,
+        scratch,
         out,
         WpParams::DEFAULT,
     );
@@ -2341,6 +2477,7 @@ fn tokenize_plane_with_wp(
     gh: usize,
     pred_id: u32,
     grad_pack_fn: GradPackInteriorFn,
+    scratch: &mut GradientScratch,
     out: &mut Vec<Token>,
     wp_params: WpParams,
 ) {
@@ -2377,39 +2514,37 @@ fn tokenize_plane_with_wp(
     } else if pred_id == PREDICTOR_GRADIENT {
         // Gradient (ClampedGradient): per-pixel independent, pure integer ->
         // vectorized over the interior of each row.
-        GRADIENT_SCRATCH.with_borrow_mut(|scratch| {
-            if scratch.buf.len() < gw {
-                scratch.buf.resize(gw, 0);
+        if scratch.buf.len() < gw {
+            scratch.buf.resize(gw, 0);
+        }
+        if scratch.cur.len() < gw {
+            scratch.cur.resize(gw, 0);
+        }
+        if scratch.prev.len() < gw {
+            scratch.prev.resize(gw, 0);
+        }
+        let mut cur = &mut scratch.cur[..gw];
+        let mut prev = &mut scratch.prev[..gw];
+        let buf = &mut scratch.buf[..gw];
+        for gy in 0..gh {
+            std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
+            for (gx, c) in cur.iter_mut().enumerate() {
+                *c = get(gx, gy);
             }
-            if scratch.cur.len() < gw {
-                scratch.cur.resize(gw, 0);
-            }
-            if scratch.prev.len() < gw {
-                scratch.prev.resize(gw, 0);
-            }
-            let mut cur = &mut scratch.cur[..gw];
-            let mut prev = &mut scratch.prev[..gw];
-            let buf = &mut scratch.buf[..gw];
-            for gy in 0..gh {
-                std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
-                for (gx, c) in cur.iter_mut().enumerate() {
-                    *c = get(gx, gy);
+            if gy == 0 {
+                buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
+                for gx in 1..gw {
+                    buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1]));
+                    // pred = W
                 }
-                if gy == 0 {
-                    buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
-                    for gx in 1..gw {
-                        buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1]));
-                        // pred = W
-                    }
-                } else {
-                    buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
-                    grad_pack_fn(cur, prev, buf, gw); // gx in 1..gw
-                }
-                for &b in buf.iter().take(gw) {
-                    out.push(Token::new(ctx, b));
-                }
+            } else {
+                buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
+                grad_pack_fn(cur, prev, buf, gw); // gx in 1..gw
             }
-        });
+            for &b in buf.iter().take(gw) {
+                out.push(Token::new(ctx, b));
+            }
+        }
     } else {
         debug_assert!(matches!(
             pred_id,
@@ -2551,12 +2686,13 @@ fn choose_predictors_with_wp(
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     wp_params: WpParams,
 ) -> [u32; 4] {
     let mut preds = [PREDICTOR_WEIGHTED; 4];
     let num_channels = 3 + usize::from(alpha.is_some());
-    let selected = crate::thread_pool::steal_map(num_channels, num_threads, |chan| {
+    let selected = pool.steal_map(scratch, num_channels, |chan, _scratch| {
         if chan < 3 {
             let pd = linear.plane_data(chan);
             choose_predictor_for_plane_with_wp(|x, y| pd[y * xsize + x], xsize, ysize, wp_params)
@@ -2675,36 +2811,30 @@ fn clamped_gradient(w: i64, n: i64, nw: i64) -> i64 {
     (w + n - nw).clamp(lo, hi)
 }
 
-thread_local! {
-    static ORDER0_ENTROPY_SCRATCH: RefCell<Vec<u64>> = const { RefCell::new(vec![]) };
-}
-
-fn order0_entropy(vals: &[u32]) -> f32 {
+fn order0_entropy(vals: &[u32], cell: &mut Vec<u64>) -> f32 {
     if vals.is_empty() {
         return 0.0;
     }
-    ORDER0_ENTROPY_SCRATCH.with_borrow_mut(|cell| {
-        // Direct-indexed frequency histogram (residual symbols are small-range), in
-        // place of a HashMap: no hashing, and a deterministic accumulation order.
-        let max = vals.iter().copied().max().unwrap_or(0) as usize;
-        if cell.len() < max + 1 {
-            cell.resize(max + 1, 0);
+    // Direct-indexed frequency histogram (residual symbols are small-range), in
+    // place of a HashMap: no hashing, and a deterministic accumulation order.
+    let max = vals.iter().copied().max().unwrap_or(0) as usize;
+    if cell.len() < max + 1 {
+        cell.resize(max + 1, 0);
+    }
+    let hist = &mut cell[..max + 1];
+    hist.fill(0);
+    for &v in vals {
+        hist[v as usize] += 1;
+    }
+    let total = vals.len() as f32;
+    let mut bits = 0.0;
+    for &c in hist.iter() {
+        if c != 0 {
+            let p = c as f32 / total;
+            bits -= c as f32 * dirty_log2f(p);
         }
-        let hist = &mut cell[..max + 1];
-        hist.fill(0);
-        for &v in vals {
-            hist[v as usize] += 1;
-        }
-        let total = vals.len() as f32;
-        let mut bits = 0.0;
-        for &c in hist.iter() {
-            if c != 0 {
-                let p = c as f32 / total;
-                bits -= c as f32 * dirty_log2f(p);
-            }
-        }
-        bits
-    })
+    }
+    bits
 }
 
 /// Run WP over one channel's group rectangle, returning per-pixel
@@ -2758,8 +2888,9 @@ fn entropy_of_hist(hist: &[u64], total: u64) -> f32 {
     bits
 }
 
-struct PickThresholdScratch {
-    hist_scratch: Vec<u64>,
+#[derive(Default)]
+pub(crate) struct PickThresholdScratch {
+    pub(crate) hist_scratch: Vec<u64>,
 }
 
 impl PickThresholdScratch {
@@ -2774,48 +2905,40 @@ impl PickThresholdScratch {
     }
 }
 
-thread_local! {
-    static THRESHOLD_SCRATCH: RefCell<PickThresholdScratch> = const { RefCell::new(PickThresholdScratch {
-        hist_scratch: Vec::new(),
-    }) }
-}
-
-fn pick_threshold(res: &[u32], prp: &[i64]) -> (i32, f32, f32) {
-    THRESHOLD_SCRATCH.with_borrow_mut(|cell| {
-        let flat = order0_entropy(res);
-        let max = res.iter().copied().max().unwrap_or(0) as usize;
-        let (h0, h1, h2) = cell.make_scratches(max + 1);
-        let mut best_t = 0i32;
-        let mut best_bits = f32::INFINITY;
-        for &t in &[8i64, 16, 24, 32, 48, 64, 96] {
-            h0.fill(0);
-            h1.fill(0);
-            h2.fill(0);
-            let (mut n0, mut n1, mut n2) = (0u64, 0u64, 0u64);
-            for (&r, &p) in res.iter().zip(prp.iter()) {
-                match bucket_of(p, t) {
-                    0 => {
-                        h0[r as usize] += 1;
-                        n0 += 1;
-                    }
-                    1 => {
-                        h1[r as usize] += 1;
-                        n1 += 1;
-                    }
-                    _ => {
-                        h2[r as usize] += 1;
-                        n2 += 1;
-                    }
+fn pick_threshold(res: &[u32], prp: &[i64], scratch: &mut CoderScratch) -> (i32, f32, f32) {
+    let flat = order0_entropy(res, &mut scratch.order0_entropy);
+    let max = res.iter().copied().max().unwrap_or(0) as usize;
+    let (h0, h1, h2) = scratch.threshold.make_scratches(max + 1);
+    let mut best_t = 0i32;
+    let mut best_bits = f32::INFINITY;
+    for &t in &[8i64, 16, 24, 32, 48, 64, 96] {
+        h0.fill(0);
+        h1.fill(0);
+        h2.fill(0);
+        let (mut n0, mut n1, mut n2) = (0u64, 0u64, 0u64);
+        for (&r, &p) in res.iter().zip(prp.iter()) {
+            match bucket_of(p, t) {
+                0 => {
+                    h0[r as usize] += 1;
+                    n0 += 1;
+                }
+                1 => {
+                    h1[r as usize] += 1;
+                    n1 += 1;
+                }
+                _ => {
+                    h2[r as usize] += 1;
+                    n2 += 1;
                 }
             }
-            let bits = entropy_of_hist(h0, n0) + entropy_of_hist(h1, n1) + entropy_of_hist(h2, n2);
-            if bits < best_bits {
-                best_bits = bits;
-                best_t = t as i32;
-            }
         }
-        (best_t, best_bits, flat)
-    })
+        let bits = entropy_of_hist(h0, n0) + entropy_of_hist(h1, n1) + entropy_of_hist(h2, n2);
+        if bits < best_bits {
+            best_bits = bits;
+            best_t = t as i32;
+        }
+    }
+    (best_t, best_bits, flat)
 }
 
 /// v1 context tree: single-group only. Returns true (and writes the full frame)
@@ -2828,14 +2951,15 @@ fn try_encode_context_tree_single_group(
     ysize: usize,
     predictors: &[u32],
     min_symbol: u32,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
 
     // Collect residuals + WP property per channel (WP runs for every channel).
-    let collected = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+    let collected = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
         if chan < 3 {
             let pd = linear.plane_data(chan);
             collect_channel(
@@ -2862,8 +2986,8 @@ fn try_encode_context_tree_single_group(
     let mut ts = [0i32; 4];
     let mut ctx_bits = 0.0;
     let mut flat_bits = 0.0;
-    let threshold_costs = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
-        pick_threshold(&chan_res[chan], &chan_prp[chan])
+    let threshold_costs = pool.steal_map(scratch, nb_chans, |chan, scratch| {
+        pick_threshold(&chan_res[chan], &chan_prp[chan], scratch)
     });
     for (chan, (t, cb, fb)) in threshold_costs.into_iter().enumerate() {
         ts[chan] = t;
@@ -2887,7 +3011,7 @@ fn try_encode_context_tree_single_group(
     let num_pixel_ctx = nb_chans * 3;
 
     // Tokenize: each pixel routed to context (channel,bucket).
-    let channel_tokens = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+    let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
         let mut tokens = Vec::with_capacity(xsize * ysize);
         let res = &chan_res[chan];
         let prp = &chan_prp[chan];
@@ -2914,11 +3038,24 @@ fn try_encode_context_tree_single_group(
     write_modular_transforms(nb_chans, &mut section);
 
     let distance_ctx = num_pixel_ctx as u32;
-    let lz_tokens = lz77_compress_runs(&tokens, distance_ctx);
-    let code = build_lz_pixel_code(&lz_tokens, num_pixel_ctx, min_symbol, true);
-    write_tree_lz77(&tree_tokens, &code, min_symbol, &mut section);
+    let lz_tokens = lz77_compress_runs(&tokens);
+    let code = build_lz_pixel_code(
+        std::iter::once(lz_tokens.as_slice()),
+        num_pixel_ctx,
+        min_symbol,
+        true,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    write_tree_lz77(
+        &tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
     for t in &lz_tokens {
-        write_lz_token(*t, &code, min_symbol, &mut section);
+        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
     }
     section.zero_pad_to_byte();
 
@@ -2944,7 +3081,8 @@ fn try_encode_context_tree_multi_group(
     ysize_groups: usize,
     num_dc_groups: usize,
     min_symbol: u32,
-    num_threads: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
     wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
@@ -2953,7 +3091,7 @@ fn try_encode_context_tree_multi_group(
 
     // 1) Collect (residual, WP property) per group per channel (group-local WP).
     let groups: Vec<Vec<(Vec<u32>, Vec<i64>)>> =
-        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+        pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
             let gx = group_index % xsize_groups;
             let gy = group_index / xsize_groups;
             let x0 = gx * GROUP_DIM;
@@ -2977,14 +3115,14 @@ fn try_encode_context_tree_multi_group(
     let mut ts = [0i32; 4];
     let mut ctx_bits = 0.0;
     let mut flat_bits = 0.0;
-    let threshold_costs = crate::thread_pool::steal_map(nb_chans, num_threads, |chan| {
+    let threshold_costs = pool.steal_map(scratch, nb_chans, |chan, scratch| {
         let mut res: Vec<u32> = Vec::new();
         let mut prp: Vec<i64> = Vec::new();
         for g in &groups {
             res.extend_from_slice(&g[chan].0);
             prp.extend_from_slice(&g[chan].1);
         }
-        pick_threshold(&res, &prp)
+        pick_threshold(&res, &prp, scratch)
     });
     for (chan, (t, cb, fb)) in threshold_costs.into_iter().enumerate() {
         ts[chan] = t;
@@ -3008,7 +3146,7 @@ fn try_encode_context_tree_multi_group(
 
     // 4) Per-group tokens (reusing collected res/prop) + per-group LZ77.
     let group_lz_tokens: Vec<Vec<LzToken>> =
-        crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+        pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
             let g = &groups[group_index];
             let mut toks: Vec<Token> = Vec::new();
             for chan in 0..nb_chans {
@@ -3020,13 +3158,16 @@ fn try_encode_context_tree_multi_group(
                     toks.push(Token::new(ctx, res));
                 }
             }
-            lz77_compress_runs(&toks, distance_ctx)
+            lz77_compress_runs(&toks)
         });
-    let mut all_lz: Vec<LzToken> = Vec::new();
-    for lz in &group_lz_tokens {
-        all_lz.extend_from_slice(lz);
-    }
-    let code = build_lz_pixel_code(&all_lz, num_pixel_ctx, min_symbol, true);
+    let code = build_lz_pixel_code(
+        group_lz_tokens.iter().map(Vec::as_slice),
+        num_pixel_ctx,
+        min_symbol,
+        true,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
 
     // 5) Sections (same layout as the flat multi-group path).
     write_frame_header_modular(alpha.is_some(), writer);
@@ -3035,7 +3176,13 @@ fn try_encode_context_tree_multi_group(
 
     sections[0].write(1, 1); // dc_quant all_default = 1
     sections[0].write(1, 1); // has_tree = 1
-    write_tree_lz77(&tree_tokens, &code, min_symbol, &mut sections[0]);
+    write_tree_lz77(
+        &tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut sections[0],
+    );
     sections[0].write(1, 1); // use_global_tree
     write_wp_header(wp_params, &mut sections[0]);
     write_modular_transforms(nb_chans, &mut sections[0]);
@@ -3059,7 +3206,13 @@ fn try_encode_context_tree_multi_group(
         write_wp_header(wp_params, &mut sections[section_idx]);
         sections[section_idx].write(2, 0);
         for t in &group_lz_tokens[group_index] {
-            write_lz_token(*t, &code, min_symbol, &mut sections[section_idx]);
+            write_lz_token(
+                *t,
+                distance_ctx,
+                &code,
+                min_symbol,
+                &mut sections[section_idx],
+            );
         }
         sections[section_idx].zero_pad_to_byte();
     }
@@ -3088,7 +3241,6 @@ use crate::patches::{
     ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
     find_lossless_patches,
 };
-use std::cell::RefCell;
 use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 // Tree writing (balanced N-leaf, Gradient predictor).
@@ -3174,18 +3326,20 @@ fn build_balanced_tree_tokens(predictors: &[u32]) -> Vec<Token> {
 fn write_tree_and_pixel_code_nolz(
     tree_tokens: &[Token],
     pixel_code: &OwnedEntropyCode,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    let tree_code = optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS);
+    let tree_code =
+        optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
     let tree_code_ref = tree_code.as_ref();
     w.write(1, 0); // tree entropy code: no LZ77
-    write_entropy_code(&tree_code_ref, w);
+    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
     for tok in tree_tokens {
         write_token(*tok, &tree_code_ref, w);
     }
     // Pixel entropy code: LZ77 DISABLED (1 bit = 0), then the code itself.
     w.write(1, 0);
-    write_entropy_code(&pixel_code.as_ref(), w);
+    write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w);
 }
 
 pub(crate) fn encode_frame_lossless_float(
@@ -3194,8 +3348,18 @@ pub(crate) fn encode_frame_lossless_float(
     num_threads: usize,
     writer: &mut BitWriter,
 ) {
-    let _scratch_guard = LosslessScratchGuard;
-    let num_threads = num_threads.max(1);
+    let pool = ThreadPool::new(num_threads);
+    let mut scratch = Box::<CoderScratch>::default();
+    encode_frame_lossless_float_with_pool(linear, alpha, &pool, &mut scratch, writer);
+}
+
+fn encode_frame_lossless_float_with_pool(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) {
     let xsize = linear.xsize();
     let ysize = linear.ysize();
     let nb_chans = 3usize + if alpha.is_some() { 1 } else { 0 };
@@ -3240,10 +3404,11 @@ pub(crate) fn encode_frame_lossless_float(
             3,
             &predictors,
             grad_pack_fn,
-            num_threads,
+            pool,
+            scratch,
         );
-        let code = optimize_entropy_code(&tokens, nb_chans);
-        write_tree_and_pixel_code_nolz(&tree_tokens, &code, &mut section);
+        let code = optimize_entropy_code(&tokens, nb_chans, &mut scratch.huffman_pool);
+        write_tree_and_pixel_code_nolz(&tree_tokens, &code, scratch, &mut section);
         for t in &tokens {
             write_token(*t, &code.as_ref(), &mut section);
         }
@@ -3261,7 +3426,7 @@ pub(crate) fn encode_frame_lossless_float(
 
         // Tokenize each AC group (group-local) and pool for one global code.
         let group_tokens: Vec<Vec<Token>> =
-            crate::thread_pool::steal_map(num_ac_groups, num_threads, |group_index| {
+            pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
                 let gx = group_index % xsize_groups;
                 let gy = group_index / xsize_groups;
                 let x0 = gx * GROUP_DIM;
@@ -3280,19 +3445,20 @@ pub(crate) fn encode_frame_lossless_float(
                     3,
                     &predictors,
                     grad_pack_fn,
-                    1,
+                    pool,
+                    scratch,
                 )
             });
         let mut all_tokens: Vec<Token> = Vec::new();
         for tokens in &group_tokens {
             all_tokens.extend_from_slice(tokens);
         }
-        let code = optimize_entropy_code(&all_tokens, nb_chans);
+        let code = optimize_entropy_code(&all_tokens, nb_chans, &mut scratch.huffman_pool);
 
         // Section 0: DC global (tree + pixel code, both no-LZ77) + GroupHeader.
         sections[0].write(1, 1); // dc_quant
         sections[0].write(1, 1); // has_tree = 1
-        write_tree_and_pixel_code_nolz(&tree_tokens, &code, &mut sections[0]);
+        write_tree_and_pixel_code_nolz(&tree_tokens, &code, scratch, &mut sections[0]);
         sections[0].write(1, 1); // use_global_tree
         sections[0].write(1, 1); // wp_default
         sections[0].write(2, 0b00); // 0 transforms
@@ -3500,10 +3666,6 @@ mod lz_reach_probe {
             .with_num_threads(1);
         let out = crate::encode_image(&rgb, w, h, &cfg).expect("encode failed");
         eprintln!("PROBE encoded {} bytes", out.len());
-        assert_eq!(
-            super::lossless_tls_scratch_capacity(),
-            0,
-            "lossless TLS allocations must be released after encoding"
-        );
+        assert!(!out.is_empty());
     }
 }

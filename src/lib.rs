@@ -39,6 +39,7 @@ mod adaptive_quant;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
+mod coder_scratch;
 mod color;
 mod color_encoding;
 mod dark_aq;

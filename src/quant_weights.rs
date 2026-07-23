@@ -30,6 +30,138 @@
 
 use crate::dct::fmla;
 
+/// IEEE 754 binary16 conversion (round-to-nearest-even), matching libjxl's
+/// F16Coder wire format for signaled dequant-matrix parameters.
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    let e16 = exp - 112; // rebias 127 -> 15
+    if e16 >= 31 {
+        return sign | 0x7BFF; // clamp to max finite; NaN/Inf unsupported on the wire
+    }
+    if e16 <= 0 {
+        if e16 < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - e16) as u32;
+        let rounded = (m + (1 << (shift - 1)) - 1 + ((m >> shift) & 1)) >> shift;
+        return sign | rounded as u16;
+    }
+    let m = mant + 0xFFF + ((mant >> 13) & 1);
+    let mut e16 = e16 as u32;
+    let mut m16 = m >> 13;
+    if m16 == 0x400 {
+        m16 = 0;
+        e16 += 1;
+        if e16 >= 31 {
+            return sign | 0x7BFF;
+        }
+    }
+    sign | ((e16 as u16) << 10) | (m16 as u16)
+}
+
+/// Mirror of libjxl `F16Coder::Read`: the value the decoder reconstructs from
+/// a binary16 bit pattern.
+pub(crate) fn f16_bits_to_f32(b: u16) -> f32 {
+    let sign = (b >> 15) as u32;
+    let biased_exp = ((b >> 10) & 0x1F) as u32;
+    let mantissa = (b & 0x3FF) as u32;
+    if biased_exp == 0 {
+        let v = (1.0f32 / 16384.0) * (mantissa as f32 * (1.0 / 1024.0));
+        return if sign != 0 { -v } else { v };
+    }
+    f32::from_bits((sign << 31) | ((biased_exp + 112) << 23) | (mantissa << 13))
+}
+
+/// A signaled distance-band override for one quant table.
+#[derive(Clone, Copy)]
+pub(crate) struct BandOverride {
+    pub(crate) num_bands: usize,
+    /// Only the first `num_bands` entries of each channel row are meaningful.
+    pub(crate) bands: [[f32; 16]; 3],
+}
+
+/// SS2 retune of the merge-tier quant tables. The libjxl defaults were tuned
+/// for butteraugli; at mid/low quality SSIMULACRA2 prefers the DCT16X16 and
+/// DCT32X32 tables ~10% coarser (Kodak −0.42% / train0 −0.74% BD-rate),
+/// while the d<2 high-quality band prefers the spec defaults (+0.58% if the
+/// coarser tables are applied there) — hence the per-frame distance gate.
+/// Scale sweeps found a clean optimum at 0.9 for both tables (0.8 and 1.11
+/// lose), while the DCT8 workhorse table is already SS2-optimal at spec
+/// scale and stays untouched.
+const QM_SS2_MIN_DISTANCE: f32 = 2.25;
+const QM_SS2_SCALE16: f32 = 0.9;
+const QM_SS2_SCALE32: f32 = 0.9;
+
+/// Default bands with the base (band 0) scaled, F16-round-tripped exactly like
+/// a parsed override so encoder and decoder agree bit-exactly.
+fn scaled_override<const N: usize>(defaults: &[[f32; N]; 3], scale: f32) -> BandOverride {
+    let mut out = BandOverride {
+        num_bands: N,
+        bands: [[0.0f32; 16]; 3],
+    };
+    for c in 0..3 {
+        for i in 0..N {
+            let v = if i == 0 {
+                defaults[c][0] * scale
+            } else {
+                defaults[c][i]
+            };
+            out.bands[c][i] = if i == 0 {
+                f16_bits_to_f32(f32_to_f16_bits(v / 64.0)) * 64.0
+            } else {
+                f16_bits_to_f32(f32_to_f16_bits(v))
+            };
+        }
+    }
+    out
+}
+
+fn parse_bands_env(name: &str, num_bands: usize) -> Option<BandOverride> {
+    let s = std::env::var(name).ok()?;
+    let mut out = BandOverride {
+        num_bands,
+        bands: [[0.0f32; 16]; 3],
+    };
+    let rows: Vec<&str> = s.split(';').collect();
+    if rows.len() != 3 {
+        return None;
+    }
+    for (c, row) in rows.iter().enumerate() {
+        let vals: Vec<f32> = row
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        if vals.len() != num_bands {
+            return None;
+        }
+        for (i, &v) in vals.iter().enumerate() {
+            out.bands[c][i] = if i == 0 {
+                f16_bits_to_f32(f32_to_f16_bits(v / 64.0)) * 64.0
+            } else {
+                f16_bits_to_f32(f32_to_f16_bits(v))
+            };
+        }
+    }
+    Some(out)
+}
+
+macro_rules! band_override {
+    ($fn_name:ident, $env:literal, $num_bands:expr) => {
+        pub(crate) fn $fn_name() -> Option<&'static BandOverride> {
+            static V: std::sync::OnceLock<Option<BandOverride>> = std::sync::OnceLock::new();
+            V.get_or_init(|| parse_bands_env($env, $num_bands)).as_ref()
+        }
+    };
+}
+
+band_override!(dct8_band_overrides, "JIXEL_DCT8_BANDS", 6);
+band_override!(dct16_band_overrides, "JIXEL_DCT16_BANDS", 7);
+band_override!(dct32_band_overrides, "JIXEL_DCT32_BANDS", 8);
+
 pub(crate) static INV_DC_QUANT: [f32; 3] = [4096.0, 512.0, 256.0];
 pub(crate) static DC_QUANT: [f32; 3] = [1.0 / 4096.0, 1.0 / 512.0, 1.0 / 256.0];
 
@@ -658,12 +790,10 @@ pub(crate) struct DequantMatrices {
     /// construction time from the libjxl DCT32X32 polynomial parameters.
     pub(crate) matrix_32x32: Box<[[f32; 1024]; 3]>,
     pub(crate) inv_matrix_32x32: Box<[[f32; 1024]; 3]>,
-    /// 64x64 dequant matrix, used only by the slow large-transform path.
-    pub(crate) matrix_64x64: Box<[[f32; 4096]; 3]>,
-    pub(crate) inv_matrix_64x64: Box<[[f32; 4096]; 3]>,
-    /// Shared normalized 32-row × 64-column table for DCT64X32/DCT32X64.
-    pub(crate) matrix_64x32: Box<[[f32; 2048]; 3]>,
-    pub(crate) inv_matrix_64x32: Box<[[f32; 2048]; 3]>,
+    /// Tables that differ from the spec defaults and must be signaled by
+    /// `write_dequant_matrices`, in the fixed order
+    /// [DCT8, DCT16X16, DCT32X32].
+    pub(crate) custom_tables: [Option<BandOverride>; 3],
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
@@ -756,74 +886,6 @@ static DCT32X32_BANDS: [[f32; 8]; 3] = [
         -0.4,
         -0.4,
         -0.3,
-    ],
-];
-
-/// JPEG XL default DCT64X64 quant-weight parameters.
-static DCT64X64_BANDS: [[f32; 8]; 3] = [
-    [
-        0.9 * 26629.073922049845,
-        -1.025,
-        -0.78,
-        -0.65012,
-        -0.19041574084286472,
-        -0.20819395464,
-        -0.421064,
-        -0.3273384553584867,
-    ],
-    [
-        0.9 * 9311.323871001005,
-        -0.3041958212306401,
-        -0.3633036457487539,
-        -0.35660379990111464,
-        -0.3443074455424403,
-        -0.33699592683512467,
-        -0.3018086652624211,
-        -0.27321683125358037,
-    ],
-    [
-        0.9 * 4992.248644553863,
-        -1.2,
-        -1.2,
-        -0.8,
-        -0.7,
-        -0.7,
-        -0.4,
-        -0.5,
-    ],
-];
-
-/// JPEG XL default `QuantTable::DCT32X64` parameters, shared by both orientations.
-static DCT32X64_BANDS: [[f32; 8]; 3] = [
-    [
-        0.65 * 23629.073922049845,
-        -1.025,
-        -0.78,
-        -0.65012,
-        -0.19041574084286472,
-        -0.20819395464,
-        -0.421064,
-        -0.3273384553584867,
-    ],
-    [
-        0.65 * 8611.323871001005,
-        -0.3041958212306401,
-        -0.3633036457487539,
-        -0.35660379990111464,
-        -0.3443074455424403,
-        -0.33699592683512467,
-        -0.3018086652624211,
-        -0.27321683125358037,
-    ],
-    [
-        0.65 * 4492.248644553863,
-        -1.2,
-        -1.2,
-        -0.8,
-        -0.7,
-        -0.7,
-        -0.4,
-        -0.5,
     ],
 ];
 
@@ -991,16 +1053,44 @@ fn compute_dct4x4_matrix() -> [[f32; 64]; 3] {
     out
 }
 
-/// Returns the inverse weights (so caller's matrix entry = 1/band-interp,
-/// matching the layout of `DEQUANT_MATRIX_8X8` etc).
-fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
+fn compute_dct8x8_matrix(override_: &BandOverride) -> [[f32; 64]; 3] {
+    const NUM_BANDS: usize = 6;
+    let mut out = [[0.0f32; 64]; 3];
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = override_.bands[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(override_.bands[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 7.0;
+        for y in 0..8 {
+            let dy = y as f32 * rcp;
+            let dy2 = dy * dy;
+            for x in 0..8 {
+                let dx = x as f32 * rcp;
+                let dist = fmla(dx, dx, dy2).sqrt();
+                out[c][y * 8 + x] = 1.0 / interpolate_vec_bands(dist, &bands);
+            }
+        }
+    }
+    out
+}
+
+fn compute_dct16x16_matrix(override_: Option<&BandOverride>) -> [[f32; 256]; 3] {
     const NUM_BANDS: usize = 7;
+    let mut src = DCT16X16_BANDS;
+    if let Some(o) = override_ {
+        for c in 0..3 {
+            src[c].copy_from_slice(&o.bands[c][..NUM_BANDS]);
+        }
+    }
     let mut out = [[0.0f32; 256]; 3];
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = DCT16X16_BANDS[c][0];
+        bands[0] = src[c][0];
         for i in 1..NUM_BANDS {
-            bands[i] = bands[i - 1] * band_mult(DCT16X16_BANDS[c][i]);
+            bands[i] = bands[i - 1] * band_mult(src[c][i]);
         }
         // libjxl: `scale = (num_bands - 1) / (sqrt(2) + 1e-6)` — the (15,15)
         // corner radial distance scales to (num_bands - 1).
@@ -1021,14 +1111,20 @@ fn compute_dct16x16_matrix() -> [[f32; 256]; 3] {
     out
 }
 
-fn compute_dct32x32_matrix() -> Box<[[f32; 1024]; 3]> {
+fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> Box<[[f32; 1024]; 3]> {
     const NUM_BANDS: usize = 8;
+    let mut src = DCT32X32_BANDS;
+    if let Some(o) = override_ {
+        for c in 0..3 {
+            src[c].copy_from_slice(&o.bands[c][..NUM_BANDS]);
+        }
+    }
     let mut out = Box::new([[0.0f32; 1024]; 3]);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = DCT32X32_BANDS[c][0];
+        bands[0] = src[c][0];
         for i in 1..NUM_BANDS {
-            bands[i] = bands[i - 1] * band_mult(DCT32X32_BANDS[c][i]);
+            bands[i] = bands[i - 1] * band_mult(src[c][i]);
         }
         let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
         let rcp = scale / 31.0;
@@ -1040,53 +1136,6 @@ fn compute_dct32x32_matrix() -> Box<[[f32; 1024]; 3]> {
                 let dist = fmla(dx, dx, dy2).sqrt();
                 let weight = interpolate_vec_bands(dist, &bands);
                 out[c][y * 32 + x] = 1.0 / weight;
-            }
-        }
-    }
-    out
-}
-
-fn compute_dct64x64_matrix() -> Box<[[f32; 4096]; 3]> {
-    const NUM_BANDS: usize = 8;
-    let mut out = Box::new([[0.0f32; 4096]; 3]);
-    for c in 0..3 {
-        let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = DCT64X64_BANDS[c][0];
-        for i in 1..NUM_BANDS {
-            bands[i] = bands[i - 1] * band_mult(DCT64X64_BANDS[c][i]);
-        }
-        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
-        let rcp = scale / 63.0;
-        for y in 0..64 {
-            let dy = y as f32 * rcp;
-            for x in 0..64 {
-                let dx = x as f32 * rcp;
-                out[c][y * 64 + x] =
-                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
-            }
-        }
-    }
-    out
-}
-
-fn compute_dct64x32_matrix() -> Box<[[f32; 2048]; 3]> {
-    const NUM_BANDS: usize = 8;
-    let mut out = Box::new([[0.0f32; 2048]; 3]);
-    for c in 0..3 {
-        let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = DCT32X64_BANDS[c][0];
-        for i in 1..NUM_BANDS {
-            bands[i] = bands[i - 1] * band_mult(DCT32X64_BANDS[c][i]);
-        }
-        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
-        let rcprow = scale / 31.0;
-        let rcpcol = scale / 63.0;
-        for y in 0..32 {
-            let dy = y as f32 * rcprow;
-            for x in 0..64 {
-                let dx = x as f32 * rcpcol;
-                out[c][y * 64 + x] =
-                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
             }
         }
     }
@@ -1119,25 +1168,115 @@ fn compute_dct32x16_matrix() -> Box<[[f32; 512]; 3]> {
     out
 }
 
-impl DequantMatrices {
-    pub(crate) fn new() -> Self {
-        let matrix = DEQUANT_MATRIX_8X8;
-        let mut inv = [[0.0f32; 64]; 3];
+/// Quant tables that do not depend on the SS2-retune distance gate, computed
+/// once per process and cloned into both `DequantMatrices` variants.
+struct SharedTables {
+    matrix: [[f32; 64]; 3],
+    inv_matrix: [[f32; 64]; 3],
+    matrix_16x8: [[f32; 128]; 3],
+    inv_matrix_16x8: [[f32; 128]; 3],
+    matrix_4x4: [[f32; 64]; 3],
+    inv_matrix_4x4: [[f32; 64]; 3],
+    matrix_4x8: [[f32; 64]; 3],
+    inv_matrix_4x8: [[f32; 64]; 3],
+    matrix_32x16: Box<[[f32; 512]; 3]>,
+    inv_matrix_32x16: Box<[[f32; 512]; 3]>,
+    o8: Option<BandOverride>,
+}
+
+fn shared_tables() -> &'static SharedTables {
+    static SHARED: std::sync::OnceLock<Box<SharedTables>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| {
+        let o8 = dct8_band_overrides().copied();
+
+        let matrix = match o8.as_ref() {
+            Some(o) => compute_dct8x8_matrix(o),
+            None => DEQUANT_MATRIX_8X8,
+        };
+        let mut inv_matrix = [[0.0f32; 64]; 3];
         for c in 0..3 {
             for k in 1..64 {
-                inv[c][k] = 1.0 / matrix[c][k];
+                inv_matrix[c][k] = 1.0 / matrix[c][k];
             }
         }
 
         let matrix_16x8 = DEQUANT_MATRIX_16X8;
-        let mut inv_16x8 = [[0.0f32; 128]; 3];
+        let mut inv_matrix_16x8 = [[0.0f32; 128]; 3];
         for c in 0..3 {
             for k in 1..128 {
-                inv_16x8[c][k] = 1.0 / matrix_16x8[c][k];
+                inv_matrix_16x8[c][k] = 1.0 / matrix_16x8[c][k];
             }
         }
 
-        let matrix_16x16 = compute_dct16x16_matrix();
+        let matrix_4x4 = compute_dct4x4_matrix();
+        let mut inv_matrix_4x4 = [[0.0f32; 64]; 3];
+        for c in 0..3 {
+            // DC slot (index 0) zeroed (handled by the DC plane). For DCT4X4 the
+            // only LLF position is the DC; [1], [8], [9] are regular AC.
+            for k in 1..64 {
+                inv_matrix_4x4[c][k] = 1.0 / matrix_4x4[c][k];
+            }
+        }
+
+        let matrix_4x8 = compute_dct4x8_matrix();
+        let mut inv_matrix_4x8 = [[0.0f32; 64]; 3];
+        for c in 0..3 {
+            // Only [0] is the DC (handled by the DC plane); [8] (the vertical
+            // half-difference after the Hadamard) and all others are regular AC.
+            for k in 1..64 {
+                inv_matrix_4x8[c][k] = 1.0 / matrix_4x8[c][k];
+            }
+        }
+
+        let matrix_32x16 = compute_dct32x16_matrix();
+        let mut inv_matrix_32x16 = Box::new([[0.0f32; 512]; 3]);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            for k in 1..512 {
+                inv_matrix_32x16[c][k] = 1.0 / matrix_32x16[c][k];
+            }
+        }
+
+        Box::new(SharedTables {
+            matrix,
+            inv_matrix,
+            matrix_16x8,
+            inv_matrix_16x8,
+            matrix_4x4,
+            inv_matrix_4x4,
+            matrix_4x8,
+            inv_matrix_4x8,
+            matrix_32x16,
+            inv_matrix_32x16,
+            o8,
+        })
+    })
+}
+
+impl DequantMatrices {
+    pub(crate) fn new(distance: f32) -> &'static Self {
+        static DEFAULT: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if distance >= QM_SS2_MIN_DISTANCE {
+            SS2.get_or_init(|| Self::compute(true))
+        } else {
+            DEFAULT.get_or_init(|| Self::compute(false))
+        }
+    }
+
+    fn compute(use_ss2: bool) -> Self {
+        // Only the DCT16X16/DCT32X32 tables depend on the SS2 gate; every
+        // other table is computed once per process and shared between the
+        // two variants (the clones below are plain memcpys).
+        let shared = shared_tables();
+        let o16 = dct16_band_overrides()
+            .copied()
+            .or_else(|| use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16)));
+        let o32 = dct32_band_overrides()
+            .copied()
+            .or_else(|| use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32)));
+        let matrix_16x16 = compute_dct16x16_matrix(o16.as_ref());
         let mut inv_16x16 = [[0.0f32; 256]; 3];
         for c in 0..3 {
             // Same convention as inv_matrix and inv_matrix_16x8: DC slot
@@ -1151,7 +1290,7 @@ impl DequantMatrices {
             }
         }
 
-        let matrix_32x32 = compute_dct32x32_matrix();
+        let matrix_32x32 = compute_dct32x32_matrix(o32.as_ref());
         let mut inv_32x32 = Box::new([[0.0f32; 1024]; 3]);
         for c in 0..3 {
             // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
@@ -1161,71 +1300,22 @@ impl DequantMatrices {
             }
         }
 
-        let matrix_64x64 = compute_dct64x64_matrix();
-        let mut inv_64x64 = Box::new([[0.0f32; 4096]; 3]);
-        for c in 0..3 {
-            for k in 1..4096 {
-                inv_64x64[c][k] = 1.0 / matrix_64x64[c][k];
-            }
-        }
-
-        let matrix_64x32 = compute_dct64x32_matrix();
-        let mut inv_64x32 = Box::new([[0.0f32; 2048]; 3]);
-        for c in 0..3 {
-            for k in 1..2048 {
-                inv_64x32[c][k] = 1.0 / matrix_64x32[c][k];
-            }
-        }
-
-        let matrix_4x4 = compute_dct4x4_matrix();
-        let mut inv_4x4 = [[0.0f32; 64]; 3];
-        for c in 0..3 {
-            // DC slot (index 0) zeroed (handled by the DC plane). For DCT4X4 the
-            // only LLF position is the DC; [1], [8], [9] are regular AC.
-            for k in 1..64 {
-                inv_4x4[c][k] = 1.0 / matrix_4x4[c][k];
-            }
-        }
-
-        let matrix_4x8 = compute_dct4x8_matrix();
-        let mut inv_4x8 = [[0.0f32; 64]; 3];
-        for c in 0..3 {
-            // Only [0] is the DC (handled by the DC plane); [8] (the vertical
-            // half-difference after the Hadamard) and all others are regular AC.
-            for k in 1..64 {
-                inv_4x8[c][k] = 1.0 / matrix_4x8[c][k];
-            }
-        }
-
-        let matrix_32x16 = compute_dct32x16_matrix();
-        let mut inv_32x16 = Box::new([[0.0f32; 512]; 3]);
-        for c in 0..3 {
-            // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
-            // since the decoder overwrites them via LowestFrequenciesFromDC.
-            for k in 1..512 {
-                inv_32x16[c][k] = 1.0 / matrix_32x16[c][k];
-            }
-        }
-
         Self {
-            matrix,
-            inv_matrix: inv,
-            matrix_16x8,
-            inv_matrix_16x8: inv_16x8,
+            matrix: shared.matrix,
+            inv_matrix: shared.inv_matrix,
+            matrix_16x8: shared.matrix_16x8,
+            inv_matrix_16x8: shared.inv_matrix_16x8,
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
             matrix_32x32,
             inv_matrix_32x32: inv_32x32,
-            matrix_64x64,
-            inv_matrix_64x64: inv_64x64,
-            matrix_64x32,
-            inv_matrix_64x32: inv_64x32,
-            matrix_4x4,
-            inv_matrix_4x4: inv_4x4,
-            matrix_4x8,
-            inv_matrix_4x8: inv_4x8,
-            matrix_32x16,
-            inv_matrix_32x16: inv_32x16,
+            custom_tables: [shared.o8, o16, o32],
+            matrix_4x4: shared.matrix_4x4,
+            inv_matrix_4x4: shared.inv_matrix_4x4,
+            matrix_4x8: shared.matrix_4x8,
+            inv_matrix_4x8: shared.inv_matrix_4x8,
+            matrix_32x16: shared.matrix_32x16.clone(),
+            inv_matrix_32x16: shared.inv_matrix_32x16.clone(),
         }
     }
 
@@ -1268,23 +1358,6 @@ impl DequantMatrices {
         &self.inv_matrix_32x32[c]
     }
 
-    #[inline]
-    pub(crate) fn matrix_64x64(&self, c: usize) -> &[f32; 4096] {
-        &self.matrix_64x64[c]
-    }
-    #[inline]
-    pub(crate) fn inv_matrix_64x64(&self, c: usize) -> &[f32; 4096] {
-        &self.inv_matrix_64x64[c]
-    }
-
-    pub(crate) fn matrix_64x32(&self, c: usize) -> &[f32; 2048] {
-        &self.matrix_64x32[c]
-    }
-
-    pub(crate) fn inv_matrix_64x32(&self, c: usize) -> &[f32; 2048] {
-        &self.inv_matrix_64x32[c]
-    }
-
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid).
     #[inline]
     pub(crate) fn matrix_4x4(&self, c: usize) -> &[f32; 64] {
@@ -1316,18 +1389,51 @@ impl DequantMatrices {
     }
 }
 
-impl Default for DequantMatrices {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
-mod test_16x16 {
+mod tests {
     use super::*;
+
+    /// JPEG XL default DCT8 (table 0) quant-weight parameters (libjxl
+    /// DequantMatricesLibraryDef::DCT, 6 distance bands). `DEQUANT_MATRIX_8X8`
+    /// is this table precomputed; the bands are needed to signal a scaled
+    /// variant.
+    static DCT8_BANDS: [[f32; 6]; 3] = [
+        [3150.0, 0.0, -0.4, -0.4, -0.4, -2.0],
+        [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
+        [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
+    ];
+
+    /// The band-computed DCT8 table must reproduce the precomputed spec
+    /// static, otherwise a signaled scaled variant would not extrapolate
+    /// from what the decoder's library table actually is.
+    #[test]
+    fn dct8_matrix_from_bands_matches_static() {
+        let identity = BandOverride {
+            num_bands: 6,
+            bands: {
+                let mut b = [[0.0f32; 16]; 3];
+                for c in 0..3 {
+                    b[c][..6].copy_from_slice(&DCT8_BANDS[c]);
+                }
+                b
+            },
+        };
+        let computed = compute_dct8x8_matrix(&identity);
+        for c in 0..3 {
+            for k in 0..64 {
+                let expected = DEQUANT_MATRIX_8X8[c][k];
+                let got = computed[c][k];
+                assert!(
+                    (got - expected).abs() <= 2e-6 * expected.abs(),
+                    "c={c} k={k}: computed {got}, static {expected}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn dct16x16_matrix_dc_matches_libjxl_polynomial() {
-        let m = DequantMatrices::new();
+        let m = DequantMatrices::new(1.0);
         // bands[0] = 8996.87 for X → 1/bands[0] ≈ 1.112e-4 at radial position 0
         let x_dc = m.matrix_16x16(0)[0];
         assert!(

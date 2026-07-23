@@ -247,7 +247,7 @@ pub(crate) fn y_to_x_ratio(cmap_x: i8) -> f32 {
 #[inline]
 pub(crate) fn y_to_b_ratio(cmap_b: i8) -> f32 {
     // base_correlation_b = 1
-    1.0 + cmap_b as f32 * K_INV_COLOR_FACTOR
+    fmla(cmap_b as f32, K_INV_COLOR_FACTOR, 1.0)
 }
 
 #[cfg(test)]

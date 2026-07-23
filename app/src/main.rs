@@ -4,6 +4,7 @@ use std::fs;
 use std::num::NonZero;
 // use image::imageops::FilterType;
 use image::imageops::FilterType;
+use image::metadata::CicpColorPrimaries;
 use jixel::{ColorEncoding, EncodeConfig, JpegTranscodeConfig, Speed};
 use std::path::Path;
 use std::thread::available_parallelism;
@@ -58,7 +59,6 @@ fn main() {
     )
     .unwrap();
     std::fs::write(&output, &bytes).expect("failed to write output");
-
     // let width = 2000;
     // let height = 1000;
     // let img10 = vec![0u8; width * height * 3];

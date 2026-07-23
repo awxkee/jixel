@@ -41,7 +41,7 @@ const NPX: usize = 320;
 static GROUP_SIZE_OFFSET: [usize; 4] = [0, 1024, 17408, 4211712];
 static TOC_BITS: [u32; 4] = [12, 16, 24, 32];
 
-/// Colour / display metadata for the fast-lossless encoders.
+/// Color / display metadata for the fast-lossless encoders.
 ///
 /// Bit depth is intentionally NOT here: [`encode_fast_lossless`] implies 8 bits,
 /// and [`encode_fast_lossless_u16`] takes `bits` explicitly. Endianness is also
@@ -719,9 +719,13 @@ fn write_bits_per_sample(o: &mut BitWriter, bits: u32) {
         }
     }
 }
-fn append_icc_stream(o: &mut BitWriter, icc: &[u8]) {
+fn append_icc_stream(
+    o: &mut BitWriter,
+    icc: &[u8],
+    scratch: &mut crate::coder_scratch::CoderScratch,
+) {
     let mut tmp = crate::bit_writer::BitWriter::new();
-    crate::icc_codec::write_icc_stream(icc, &mut tmp);
+    crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, &mut tmp);
     let nbits = tmp.bits_written(); // exact bit count, captured before padding
     tmp.zero_pad_to_byte(); // into_bytes() requires byte alignment
     let bytes = tmp.into_bytes(); // ceil(nbits/8) bytes; pad bits are in the high bits of the last byte
@@ -762,6 +766,7 @@ fn prepare_header(
     bits: u32,
     m: &FlMeta,
     gsizes: &[usize],
+    scratch: &mut crate::coder_scratch::CoderScratch,
 ) {
     let have_alpha = nb == 2 || nb == 4;
     let extra_fields = m.orientation != Orientation::Normal || m.intrinsic_size.is_some();
@@ -815,7 +820,7 @@ fn prepare_header(
     o.write(2, 0); // extensions = 0
     o.write(1, 1); // default_m = 1
     if let Some(icc) = &m.icc {
-        append_icc_stream(o, icc); // ICC stream after CustomTransformData, before pad
+        append_icc_stream(o, icc, scratch); // ICC stream after CustomTransformData, before pad
     }
     o.zero_pad_to_byte();
     // ---- frame header + TOC (bit-depth/color independent) ----
@@ -1077,6 +1082,7 @@ fn encode_planes(
     bits: u32,
     meta: &FlMeta,
 ) -> Vec<u8> {
+    let mut scratch = Box::<crate::coder_scratch::CoderScratch>::default();
     let ngx = w.div_ceil(256);
     let ngy = h.div_ceil(256);
     let onegroup = ngx == 1 && ngy == 1;
@@ -1103,7 +1109,7 @@ fn encode_planes(
         }
         let gsize = (lfg.bytes_written * 8 + lfg.bits_in_buffer).div_ceil(8);
         let mut hdr = BitWriter::allocate(4000);
-        prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &[gsize]);
+        prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &[gsize], &mut scratch);
         let mut out = Vec::new();
         out.extend_from_slice(&hdr.data[..hdr.bytes_written]);
         out.extend_from_slice(&lfg.data[..lfg.bytes_written]);
@@ -1140,7 +1146,7 @@ fn encode_planes(
         ac_sections.push(gw.data[..gw.bytes_written].to_vec());
     }
     let mut hdr = BitWriter::allocate(64 + num_groups * 40);
-    prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &gsizes);
+    prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &gsizes, &mut scratch);
     let mut out = Vec::new();
     out.extend_from_slice(&hdr.data[..hdr.bytes_written]);
     out.extend_from_slice(&lfg.data[..lfg.bytes_written]);
