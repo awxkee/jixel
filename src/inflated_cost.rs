@@ -459,13 +459,9 @@ pub(crate) type SsimDeficitFn = unsafe fn(&[f32], &[f32], usize, usize) -> f32;
 pub(crate) type PrepareReconstructionFn =
     unsafe fn(&Plane<f32>, usize, usize, usize, usize, &[f32], &mut [f32], &mut [f32]);
 
-thread_local! {
-    static RECON_SCRATCH: std::cell::RefCell<[[f32; 1024]; 8]> =
-        const { std::cell::RefCell::new([[0.0; 1024]; 8]) };
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate(
+    scratch: &mut [[f32; 1024]; 8],
     rate_log2_lut: &RateLog2Lut,
     coeffs: &[[f32; 1024]; 3],
     inv: [&[f32]; 3],
@@ -485,6 +481,7 @@ pub(crate) fn recon_dist_and_rate(
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return unsafe {
             crate::avx::recon_dist_and_rate_avx2(
+                scratch,
                 rate_log2_lut,
                 coeffs,
                 inv,
@@ -506,6 +503,7 @@ pub(crate) fn recon_dist_and_rate(
     {
         return unsafe {
             crate::neon::recon_dist_and_rate_neon(
+                scratch,
                 rate_log2_lut,
                 coeffs,
                 inv,
@@ -525,6 +523,7 @@ pub(crate) fn recon_dist_and_rate(
     }
     #[allow(unreachable_code)]
     recon_dist_and_rate_default(
+        scratch,
         rate_log2_lut,
         coeffs,
         inv,
@@ -544,6 +543,7 @@ pub(crate) fn recon_dist_and_rate(
 
 #[allow(clippy::too_many_arguments)]
 fn recon_dist_and_rate_default(
+    scratch: &mut [[f32; 1024]; 8],
     rate_log2_lut: &RateLog2Lut,
     coeffs: &[[f32; 1024]; 3],
     inv: [&[f32]; 3],
@@ -560,6 +560,7 @@ fn recon_dist_and_rate_default(
     py: usize,
 ) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
+        scratch,
         rate_log2_lut,
         coeffs,
         inv,
@@ -583,6 +584,7 @@ fn recon_dist_and_rate_default(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate_scalar(
+    scratch: &mut [[f32; 1024]; 8],
     rate_log2_lut: &RateLog2Lut,
     coeffs: &[[f32; 1024]; 3],
     inv: [&[f32]; 3],
@@ -599,6 +601,7 @@ pub(crate) fn recon_dist_and_rate_scalar(
     py: usize,
 ) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
+        scratch,
         rate_log2_lut,
         coeffs,
         inv,
@@ -621,6 +624,7 @@ pub(crate) fn recon_dist_and_rate_scalar(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate_with_kernels(
+    scratch: &mut [[f32; 1024]; 8],
     rate_log2_lut: &RateLog2Lut,
     coeffs: &[[f32; 1024]; 3],
     inv: [&[f32]; 3],
@@ -663,79 +667,77 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     ];
     let quant_scales = [qac * qm_mult_x, qac, qac];
 
-    RECON_SCRATCH.with_borrow_mut(|scratch| {
-        let (coeff_error, rest) = scratch.split_at_mut(3);
-        let [
-            spatial_error,
-            y_error,
-            combined_error,
-            reconstructed,
-            original,
-        ] = rest
-        else {
-            unreachable!()
+    let (coeff_error, rest) = scratch.split_at_mut(3);
+    let [
+        spatial_error,
+        y_error,
+        combined_error,
+        reconstructed,
+        original,
+    ] = rest
+    else {
+        unreachable!()
+    };
+    let mut rate = 0.0f32;
+    for c in 0..3 {
+        rate += unsafe {
+            quantize(
+                &coeffs[c][..n],
+                &inv[c][..n],
+                quant_scales[c],
+                &thresholds[c],
+                width,
+                height,
+                half,
+                cx,
+                cy,
+                &mut coeff_error[c][..n],
+                rate_log2_lut,
+            )
         };
-        let mut rate = 0.0f32;
-        for c in 0..3 {
-            rate += unsafe {
-                quantize(
-                    &coeffs[c][..n],
-                    &inv[c][..n],
-                    quant_scales[c],
-                    &thresholds[c],
-                    width,
-                    height,
-                    half,
-                    cx,
-                    cy,
-                    &mut coeff_error[c][..n],
-                    rate_log2_lut,
-                )
-            };
-        }
+    }
 
-        reconstruct_error(strategy, &coeff_error[1][..n], &mut y_error[..n]);
-        let mut distortion = 0.0f32;
-        for c in 0..3 {
-            let factor = if c == 0 { factor_x } else { factor_b };
-            let error: &[f32] = if c == 1 {
-                &y_error[..n]
-            } else {
-                reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
-                for ((combined, &spatial), &luma) in combined_error[..n]
-                    .iter_mut()
-                    .zip(spatial_error[..n].iter())
-                    .zip(y_error[..n].iter())
-                {
-                    *combined = spatial + factor * luma;
-                }
-                &combined_error[..n]
-            };
-            let plane = opsin.plane(c);
-            unsafe {
-                prepare_reconstruction(
-                    plane,
-                    px,
-                    py,
+    reconstruct_error(strategy, &coeff_error[1][..n], &mut y_error[..n]);
+    let mut distortion = 0.0f32;
+    for c in 0..3 {
+        let factor = if c == 0 { factor_x } else { factor_b };
+        let error: &[f32] = if c == 1 {
+            &y_error[..n]
+        } else {
+            reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
+            for ((combined, &spatial), &luma) in combined_error[..n]
+                .iter_mut()
+                .zip(spatial_error[..n].iter())
+                .zip(y_error[..n].iter())
+            {
+                *combined = spatial + factor * luma;
+            }
+            &combined_error[..n]
+        };
+        let plane = opsin.plane(c);
+        unsafe {
+            prepare_reconstruction(
+                plane,
+                px,
+                py,
+                pixel_width,
+                pixel_height,
+                error,
+                &mut original[..n],
+                &mut reconstructed[..n],
+            );
+        }
+        distortion += CHANNEL_WEIGHT[c]
+            * unsafe {
+                ssim(
+                    &original[..n],
+                    &reconstructed[..n],
                     pixel_width,
                     pixel_height,
-                    error,
-                    &mut original[..n],
-                    &mut reconstructed[..n],
-                );
-            }
-            distortion += CHANNEL_WEIGHT[c]
-                * unsafe {
-                    ssim(
-                        &original[..n],
-                        &reconstructed[..n],
-                        pixel_width,
-                        pixel_height,
-                    )
-                };
-        }
-        (distortion, rate)
-    })
+                )
+            };
+    }
+    (distortion, rate)
 }
 
 #[allow(clippy::too_many_arguments)]

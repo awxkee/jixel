@@ -26,9 +26,11 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::coder_scratch::CoderScratch;
 use crate::dct::fmla;
 use crate::image::Image3F;
-use std::sync::OnceLock;
+use crate::thread_pool::ThreadPool;
+use std::sync::{Mutex, OnceLock};
 
 pub(crate) const M00: f32 = 0.30;
 pub(crate) const M02: f32 = 0.078;
@@ -127,20 +129,27 @@ pub(crate) fn selected_to_xyb_band_fn() -> ToXybBandFn {
 
 /// Convert linear RGB (planes 0/1/2) to XYB in place, row-bands in parallel,
 /// using an already-resolved SIMD/scalar band function.
-pub(crate) fn to_xyb_with_fn(f: ToXybBandFn, image: &mut Image3F, num_threads: usize) {
+pub(crate) fn to_xyb_with_fn(
+    f: ToXybBandFn,
+    image: &mut Image3F,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) {
     let w = image.xsize();
     let run = |mut band: [&mut [f32]; 3]| {
         let [r, g, b] = &mut band;
         unsafe { f([r, g, b], w) };
     };
-    let bands = image.row_bands_mut(num_threads);
+    let bands = image.row_bands_mut(pool.num_threads());
     if bands.len() <= 1 {
         bands.into_iter().for_each(run);
     } else {
-        std::thread::scope(|s| {
-            bands.into_iter().for_each(|b| {
-                s.spawn(|| run(b));
-            });
+        let bands: Vec<_> = bands
+            .into_iter()
+            .map(|band| Mutex::new(Some(band)))
+            .collect();
+        pool.steal_map(scratch, bands.len(), |i, _scratch| {
+            run(bands[i].lock().unwrap().take().unwrap());
         });
     }
 }

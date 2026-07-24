@@ -31,11 +31,6 @@ use crate::adaptive_quant::fast_exp2;
 use crate::dct::{DctFn, fmla};
 use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
-use std::cell::RefCell;
-
-thread_local! {
-    static CORRECTIONS_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Features {
@@ -220,6 +215,7 @@ fn correction_score(f: Features, distance: f32) -> f32 {
 }
 
 pub(crate) fn apply(
+    corrections: &mut Vec<f32>,
     opsin: &Image3F,
     field: &mut ImageB,
     x0: usize,
@@ -231,71 +227,71 @@ pub(crate) fn apply(
     if amount == 0.0 || field.xsize() == 0 || field.ysize() == 0 {
         return;
     }
-    CORRECTIONS_SCRATCH.with_borrow_mut(|corrections| {
-        let field_width = field.xsize();
-        let field_height = field.ysize();
+    let field_width = field.xsize();
+    let field_height = field.ysize();
+    if corrections.len() < field_width * field_height {
         corrections.resize(field_width * field_height, 0.0);
-        let corrections = &mut corrections[..field_width * field_height];
-        let mut weighted_sum = 0.0f32;
-        let mut total_weight = 0.0f32;
-        for (by, correction_row) in corrections.chunks_exact_mut(field_width).enumerate() {
-            let py = y0 + by * 8;
-            let h = opsin.ysize().saturating_sub(py).min(8);
-            for (bx, correction_out) in correction_row.iter_mut().enumerate() {
-                let px = x0 + bx * 8;
-                let w = opsin.xsize().saturating_sub(px).min(8);
-                let mut block = [0.0f32; 64];
-                let block_rows = block.as_chunks_mut::<8>().0;
-                if w == 8 && h == 8 {
-                    for (dst, src_y) in block_rows.iter_mut().zip(py..py + 8) {
-                        let source = &opsin.plane_row(1, src_y)[px..];
-                        dst.copy_from_slice(&source.as_chunks::<8>().0[0]);
-                    }
-                } else {
-                    for (dy, dst) in block_rows.iter_mut().enumerate() {
-                        let row = opsin.plane_row(1, (py + dy).min(opsin.ysize() - 1));
-                        for (dx, out) in dst.iter_mut().enumerate() {
-                            *out = row[(px + dx).min(opsin.xsize() - 1)];
-                        }
+    }
+    let corrections = &mut corrections[..field_width * field_height];
+    let mut weighted_sum = 0.0f32;
+    let mut total_weight = 0.0f32;
+    for (by, correction_row) in corrections.chunks_exact_mut(field_width).enumerate() {
+        let py = y0 + by * 8;
+        let h = opsin.ysize().saturating_sub(py).min(8);
+        for (bx, correction_out) in correction_row.iter_mut().enumerate() {
+            let px = x0 + bx * 8;
+            let w = opsin.xsize().saturating_sub(px).min(8);
+            let mut block = [0.0f32; 64];
+            let block_rows = block.as_chunks_mut::<8>().0;
+            if w == 8 && h == 8 {
+                for (dst, src_y) in block_rows.iter_mut().zip(py..py + 8) {
+                    let source = &opsin.plane_row(1, src_y)[px..];
+                    dst.copy_from_slice(&source.as_chunks::<8>().0[0]);
+                }
+            } else {
+                for (dy, dst) in block_rows.iter_mut().enumerate() {
+                    let row = opsin.plane_row(1, (py + dy).min(opsin.ysize() - 1));
+                    for (dx, out) in dst.iter_mut().enumerate() {
+                        *out = row[(px + dx).min(opsin.xsize() - 1)];
                     }
                 }
-                let correction = correction_score(block_features(&block, dct8x8), distance);
-                *correction_out = correction;
-                let weight = (w * h) as f32;
-                weighted_sum = fmla(weight, correction, weighted_sum);
-                total_weight += weight;
             }
+            let correction = correction_score(block_features(&block, dct8x8), distance);
+            *correction_out = correction;
+            let weight = (w * h) as f32;
+            weighted_sum = fmla(weight, correction, weighted_sum);
+            total_weight += weight;
         }
-        let center = if total_weight == 0.0 {
-            0.0
-        } else {
-            weighted_sum / total_weight
-        };
-        let mut weighted_variance = 0.0f32;
-        for (by, correction_row) in corrections.chunks_exact(field_width).enumerate() {
-            let py = y0 + by * 8;
-            let h = opsin.ysize().saturating_sub(py).min(8);
-            for (bx, &correction) in correction_row.iter().enumerate() {
-                let px = x0 + bx * 8;
-                let w = opsin.xsize().saturating_sub(px).min(8);
-                let d = correction - center;
-                weighted_variance += (w * h) as f32 * d * d;
-            }
+    }
+    let center = if total_weight == 0.0 {
+        0.0
+    } else {
+        weighted_sum / total_weight
+    };
+    let mut weighted_variance = 0.0f32;
+    for (by, correction_row) in corrections.chunks_exact(field_width).enumerate() {
+        let py = y0 + by * 8;
+        let h = opsin.ysize().saturating_sub(py).min(8);
+        for (bx, &correction) in correction_row.iter().enumerate() {
+            let px = x0 + bx * 8;
+            let w = opsin.xsize().saturating_sub(px).min(8);
+            let d = correction - center;
+            weighted_variance += (w * h) as f32 * d * d;
         }
-        let inv_stddev = if weighted_variance == 0.0 {
-            0.0
-        } else {
-            (total_weight / weighted_variance).sqrt()
-        };
-        for (by, correction_row) in corrections.chunks_exact(field_width).enumerate() {
-            for (q, &correction) in field.row_mut(by).iter_mut().zip(correction_row) {
-                let delta = (-amount * (correction - center) * inv_stddev).clamp(-0.18, 0.22);
-                *q = (*q as f32 * fast_exp2(delta))
-                    .fast_round()
-                    .clamp(1.0, 255.0) as u8;
-            }
+    }
+    let inv_stddev = if weighted_variance == 0.0 {
+        0.0
+    } else {
+        (total_weight / weighted_variance).sqrt()
+    };
+    for (by, correction_row) in corrections.chunks_exact(field_width).enumerate() {
+        for (q, &correction) in field.row_mut(by).iter_mut().zip(correction_row) {
+            let delta = (-amount * (correction - center) * inv_stddev).clamp(-0.18, 0.22);
+            *q = (*q as f32 * fast_exp2(delta))
+                .fast_round()
+                .clamp(1.0, 255.0) as u8;
         }
-    });
+    }
 }
 
 #[cfg(test)]

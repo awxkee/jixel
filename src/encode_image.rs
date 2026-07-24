@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::CoderScratch;
 use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
@@ -1411,6 +1412,7 @@ fn encode_f32_lossless_rgba(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
+    let mut metadata_scratch = Box::<CoderScratch>::default();
     write_image_metadata(
         config.tone_mapping(),
         &config.color_encoding,
@@ -1420,6 +1422,7 @@ fn encode_f32_lossless_rgba(
         true,
         false,
         config.orientation,
+        &mut metadata_scratch,
         &mut w,
     );
     encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
@@ -1695,6 +1698,13 @@ pub(crate) fn encode_with_config(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(input.xsize(), input.ysize(), &mut w);
+    let ctx = EncodingContext::new(config.speed, config.dark_aq, distance, config.num_threads);
+    let coeff_shifts = progressive_schedule(
+        config.progressive,
+        config.progressive_passes,
+        config.progressive_shifts.as_deref(),
+    );
+    let mut scratch = Box::<CoderScratch>::default();
     write_image_metadata(
         config.tone_mapping(),
         &config.color_encoding,
@@ -1704,22 +1714,17 @@ pub(crate) fn encode_with_config(
         config.lossless,
         config.grayscale,
         config.orientation,
+        &mut scratch,
         &mut w,
     );
-    let coeff_shifts = progressive_schedule(
-        config.progressive,
-        config.progressive_passes,
-        config.progressive_shifts.as_deref(),
-    );
-    let ctx = EncodingContext::new(config.speed, config.dark_aq);
     encode_frame(
         &ctx,
+        &mut scratch,
         distance,
         input,
         config.alpha.as_ref(),
         &coeff_shifts,
         config.patches,
-        config.num_threads.max(1),
         &mut w,
     );
     let codestream = w.into_bytes();
@@ -1865,6 +1870,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
+    let mut metadata_scratch = Box::<CoderScratch>::default();
     write_image_metadata(
         config.tone_mapping(),
         &config.color_encoding,
@@ -1874,6 +1880,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.lossless,
         config.grayscale,
         config.orientation,
+        &mut metadata_scratch,
         &mut w,
     );
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
@@ -2036,6 +2043,7 @@ fn write_image_metadata(
     lossless: bool,
     grayscale: bool,
     orientation: Orientation,
+    scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
@@ -2117,7 +2125,7 @@ fn write_image_metadata(
     w.write(1, 1); // CustomTransformData.all_default = 1
     // ICC stream goes AFTER FileHeader, before the zero-pad to byte boundary.
     if let Some(icc) = icc_profile {
-        crate::icc_codec::write_icc_stream(icc, w);
+        crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, w);
     }
     w.zero_pad_to_byte();
 }
@@ -2315,7 +2323,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn rgb8_slow_dct64_lossy() {
+    fn rgb8_slow_low_quality_lossy() {
         const SIDE: usize = 64;
         let pixels: Vec<u8> = (0..SIDE * SIDE * 3).map(|i| (i % 251) as u8).collect();
         ok(encode_image(
@@ -2329,7 +2337,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn rgb8_slow_rectangular_dct64_lossy() {
+    fn rgb8_slow_low_quality_rect_merge_lossy() {
         let config = EncodeConfig::default()
             .with_distance(2.5)
             .with_speed(Speed::Slow);
@@ -2337,6 +2345,23 @@ mod encode_smoke_tests {
             let pixels = vec![128u8; width * height * 3];
             ok(encode_image(&pixels, width, height, &config));
         }
+    }
+
+    #[test]
+    fn lossy_output_is_independent_of_thread_count() {
+        const WIDTH: usize = 257;
+        const HEIGHT: usize = 65;
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
+            .collect();
+        let config = lossy().with_speed(Speed::Slow);
+
+        let single = encode_image(&input, WIDTH, HEIGHT, &config.clone().with_num_threads(1))
+            .expect("single-threaded lossy encode failed");
+        let threaded = encode_image(&input, WIDTH, HEIGHT, &config.with_num_threads(4))
+            .expect("multi-threaded lossy encode failed");
+
+        assert_eq!(single, threaded);
     }
 
     #[test]

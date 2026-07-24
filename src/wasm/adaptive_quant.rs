@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::adaptive_quant::{AQ_MAP_SCRATCH, K_AC_QUANT};
+use crate::adaptive_quant::K_AC_QUANT;
 use core::arch::wasm32::*;
 
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
@@ -959,6 +959,7 @@ fn fuzzy_erosion_row_to_aq<const SET_MODE: bool>(
 
 #[target_feature(enable = "simd128")]
 pub(crate) fn fill_quant_field(
+    scratch: &mut crate::adaptive_quant::AqMapScratch,
     opsin: &crate::image::Image3F,
     raw_quant_field: &mut crate::image::ImageB,
     x0: usize,
@@ -966,106 +967,95 @@ pub(crate) fn fill_quant_field(
     distance: f32,
     inv_scale: f32,
 ) {
-    AQ_MAP_SCRATCH.with_borrow_mut(|scratch| {
-        let xsize_blocks = raw_quant_field.xsize();
-        let ysize_blocks = raw_quant_field.ysize();
-        let img_xsize = opsin.xsize();
-        let img_ysize = opsin.ysize();
+    let xsize_blocks = raw_quant_field.xsize();
+    let ysize_blocks = raw_quant_field.ysize();
+    let img_xsize = opsin.xsize();
+    let img_ysize = opsin.ysize();
 
-        let scale = K_AC_QUANT / distance;
+    let scale = K_AC_QUANT / distance;
 
-        let region_px_w = xsize_blocks * 8;
-        let region_px_h = ysize_blocks * 8;
+    let region_px_w = xsize_blocks * 8;
+    let region_px_h = ysize_blocks * 8;
 
-        // ---- Stage 1: per-pixel masking pre-pass.
-        let pre_w = region_px_w / 4;
-        let pre_h = region_px_h / 4;
+    // ---- Stage 1: per-pixel masking pre-pass.
+    let pre_w = region_px_w / 4;
+    let pre_h = region_px_h / 4;
 
-        let total_secondary = pre_w * pre_h;
-        if scratch.secondary.len() < total_secondary {
-            scratch.secondary.resize(total_secondary, 0.);
-        }
-        let pre = &mut scratch.secondary[..total_secondary];
+    let total_secondary = pre_w * pre_h;
+    if scratch.secondary.len() < total_secondary {
+        scratch.secondary.resize(total_secondary, 0.);
+    }
+    let pre = &mut scratch.secondary[..total_secondary];
 
-        for out_y in 0..pre_h {
-            let ry = out_y * 4;
-            let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
-            stage1_fused_4rows_to_pre(opsin, x0, y0, ry, img_xsize, img_ysize, pre_w, prow);
-        }
+    for out_y in 0..pre_h {
+        let ry = out_y * 4;
+        let prow = &mut pre[out_y * pre_w..out_y * pre_w + pre_w];
+        stage1_fused_4rows_to_pre(opsin, x0, y0, ry, img_xsize, img_ysize, pre_w, prow);
+    }
 
-        // ---- Stage 2: FuzzyErosion, then 2x downsample into block-resolution aq_map.
-        let fe_mul = if distance < 2.0 {
-            (2.0 - distance) * 0.5
+    // ---- Stage 2: FuzzyErosion, then 2x downsample into block-resolution aq_map.
+    let fe_mul = if distance < 2.0 {
+        (2.0 - distance) * 0.5
+    } else {
+        0.0
+    };
+    let fe_base = [0.125f32, 0.1, 0.09, 0.06];
+    let fe_add = [0.0f32, -0.1, -0.09, -0.06];
+    let mut kmul = [0.0f32; 4];
+    let mut norm_sum = 0.0f32;
+    for i in 0..4 {
+        kmul[i] = fe_base[i] + fe_mul * fe_add[i];
+        norm_sum += kmul[i];
+    }
+    let k_total = 0.29959705784054957f32;
+    for w in &mut kmul {
+        *w *= k_total / norm_sum;
+    }
+    if scratch.aq_map.len() < xsize_blocks * ysize_blocks {
+        scratch.aq_map.resize(xsize_blocks * ysize_blocks, 0.);
+    }
+    let aq_map = &mut scratch.aq_map[..xsize_blocks * ysize_blocks];
+    for fy in 0..pre_h {
+        let ym1 = if fy >= 1 { fy - 1 } else { fy };
+        let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
+
+        let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
+        let row = &pre[fy * pre_w..fy * pre_w + pre_w];
+        let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
+
+        let out_y = fy >> 1;
+        let aq_row = &mut aq_map[out_y * xsize_blocks..out_y * xsize_blocks + xsize_blocks];
+
+        if (fy & 1) == 0 {
+            fuzzy_erosion_row_to_aq::<true>(rowt, row, rowb, pre_w, &kmul, aq_row);
         } else {
-            0.0
-        };
-        let fe_base = [0.125f32, 0.1, 0.09, 0.06];
-        let fe_add = [0.0f32, -0.1, -0.09, -0.06];
-        let mut kmul = [0.0f32; 4];
-        let mut norm_sum = 0.0f32;
-        for i in 0..4 {
-            kmul[i] = fe_base[i] + fe_mul * fe_add[i];
-            norm_sum += kmul[i];
+            fuzzy_erosion_row_to_aq::<false>(rowt, row, rowb, pre_w, &kmul, aq_row);
         }
-        let k_total = 0.29959705784054957f32;
-        for w in &mut kmul {
-            *w *= k_total / norm_sum;
-        }
-        if scratch.aq_map.len() < xsize_blocks * ysize_blocks {
-            scratch.aq_map.resize(xsize_blocks * ysize_blocks, 0.);
-        }
-        let aq_map = &mut scratch.aq_map[..xsize_blocks * ysize_blocks];
-        for fy in 0..pre_h {
-            let ym1 = if fy >= 1 { fy - 1 } else { fy };
-            let yp1 = if fy + 1 < pre_h { fy + 1 } else { fy };
+    }
 
-            let rowt = &pre[ym1 * pre_w..ym1 * pre_w + pre_w];
-            let row = &pre[fy * pre_w..fy * pre_w + pre_w];
-            let rowb = &pre[yp1 * pre_w..yp1 * pre_w + pre_w];
+    // ---- Stage 3: per-block modulations + integer quant field.
+    let base_level = 0.48 * scale;
+    let dampen = crate::adaptive_quant::aq_dampen(distance);
+    let mul = scale * dampen;
+    let add = (1.0 - dampen) * base_level;
+    let hf_strength = crate::adaptive_quant::hf_modulation_strength(distance);
 
-            let out_y = fy >> 1;
-            let aq_row = &mut aq_map[out_y * xsize_blocks..out_y * xsize_blocks + xsize_blocks];
-
-            if (fy & 1) == 0 {
-                fuzzy_erosion_row_to_aq::<true>(rowt, row, rowb, pre_w, &kmul, aq_row);
-            } else {
-                fuzzy_erosion_row_to_aq::<false>(rowt, row, rowb, pre_w, &kmul, aq_row);
-            }
-        }
-
-        // ---- Stage 3: per-block modulations + integer quant field.
-        let base_level = 0.48 * scale;
-        let k_dampen_ramp_start = 2.0f32;
-        let k_dampen_ramp_end = 8.0f32;
-        let mut dampen = 1.0f32;
-        if distance >= k_dampen_ramp_start {
-            dampen = 1.0
-                - ((distance - k_dampen_ramp_start) / (k_dampen_ramp_end - k_dampen_ramp_start));
-            if dampen < 0.0 {
-                dampen = 0.0;
-            }
-        }
-        let mul = scale * dampen;
-        let add = (1.0 - dampen) * base_level;
-        let hf_strength = crate::adaptive_quant::hf_modulation_strength(distance);
-
-        for by in 0..ysize_blocks {
-            let py = y0 + by * 8;
-            let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
-            let qf_row = raw_quant_field.row_mut(by);
-            write_quant_row_wasm(
-                opsin,
-                aq_row,
-                qf_row,
-                x0,
-                py,
-                img_xsize,
-                img_ysize,
-                mul,
-                add,
-                inv_scale,
-                hf_strength,
-            );
-        }
-    });
+    for by in 0..ysize_blocks {
+        let py = y0 + by * 8;
+        let aq_row = &aq_map[by * xsize_blocks..by * xsize_blocks + xsize_blocks];
+        let qf_row = raw_quant_field.row_mut(by);
+        write_quant_row_wasm(
+            opsin,
+            aq_row,
+            qf_row,
+            x0,
+            py,
+            img_xsize,
+            img_ysize,
+            mul,
+            add,
+            inv_scale,
+            hf_strength,
+        );
+    }
 }

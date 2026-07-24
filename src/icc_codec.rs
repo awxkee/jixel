@@ -279,7 +279,10 @@ fn single_symbol_patch(pc: &mut PrefixCode) {
 }
 
 /// Build a 41-context prefix code from the predicted ICC byte stream.
-fn build_icc_code(enc: &[u8]) -> OwnedEntropyCode {
+fn build_icc_code(
+    enc: &[u8],
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> OwnedEntropyCode {
     use crate::entropy::cluster_histograms;
 
     let num_contexts = K_NUM_ICC_CONTEXTS;
@@ -296,11 +299,11 @@ fn build_icc_code(enc: &[u8]) -> OwnedEntropyCode {
     }
 
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map);
+    cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
 
     let mut code = OwnedEntropyCode {
         context_map,
-        prefix_codes: build_huffman_codes(&histograms),
+        prefix_codes: build_huffman_codes(&histograms, huffman_pool),
         hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
@@ -316,7 +319,11 @@ fn build_icc_code(enc: &[u8]) -> OwnedEntropyCode {
 
 /// Emit the JXL ICC stream right after the color encoding bits.
 /// `icc` must be non-empty.
-pub(crate) fn write_icc_stream(icc: &[u8], w: &mut BitWriter) {
+pub(crate) fn write_icc_stream(
+    icc: &[u8],
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    w: &mut BitWriter,
+) {
     assert!(!icc.is_empty(), "ICC profile must be non-empty");
     let enc = predict_icc_minimal(icc);
 
@@ -324,10 +331,10 @@ pub(crate) fn write_icc_stream(icc: &[u8], w: &mut BitWriter) {
     write_u64(enc.len() as u64, w);
 
     // 2. Entropy-coded payload over 41 contexts.
-    let code = build_icc_code(&enc);
+    let code = build_icc_code(&enc, huffman_pool);
     // Header: `lz77.enabled = 0`, then context map + prefix codes.
     w.write(1, 0); // LZ77 disabled
-    write_entropy_code(&code.as_ref(), w);
+    write_entropy_code(&code.as_ref(), huffman_pool, w);
 
     // 3. Emit tokens.
     let code_ref = code.as_ref();
@@ -423,7 +430,8 @@ mod tests {
         icc[20..24].copy_from_slice(b"XYZ ");
         icc[36..40].copy_from_slice(b"acsp");
         let mut w = BitWriter::new();
-        write_icc_stream(&icc, &mut w);
+        let mut scratch = crate::coder_scratch::CoderScratch::default();
+        write_icc_stream(&icc, &mut scratch.huffman_pool, &mut w);
         w.zero_pad_to_byte();
         let bytes = w.into_bytes();
         assert!(!bytes.is_empty());

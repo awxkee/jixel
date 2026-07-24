@@ -547,7 +547,8 @@ fn bench_jixel(
     let cfg = jixel::EncodeConfig::default()
         .with_distance(d)
         .with_num_threads(nthreads)
-        .with_speed(Speed::Slow);
+        .with_speed(Speed::Slow)
+        .with_patches(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));

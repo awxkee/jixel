@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16, WC32, WC64};
+use crate::dct::{WC4, WC8, WC16, WC32};
 use core::arch::wasm32::*;
 
 #[derive(Clone, Copy)]
@@ -411,28 +411,6 @@ fn dct1d_32_s(c: &mut [v128; 32]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn dct1d_64_s(c: &mut [v128; 64]) {
-    let s2 = f32x4_splat(std::f32::consts::SQRT_2);
-    let mut e = [f32x4_splat(0.0); 32];
-    let mut o = [f32x4_splat(0.0); 32];
-    for i in 0..32 {
-        e[i] = f32x4_add(c[i], c[63 - i]);
-        o[i] = f32x4_mul(f32x4_sub(c[i], c[63 - i]), f32x4_splat(WC64[i]));
-    }
-    dct1d_32_s(&mut e);
-    dct1d_32_s(&mut o);
-    o[0] = f32x4_add(f32x4_mul(o[0], s2), o[1]);
-    for i in 1..31 {
-        o[i] = f32x4_add(o[i], o[i + 1]);
-    }
-    for i in 0..32 {
-        c[2 * i] = e[i];
-        c[2 * i + 1] = o[i];
-    }
-}
-
-#[inline]
-#[target_feature(enable = "simd128")]
 fn load_strip(ptr: *const f32) -> v128 {
     unsafe { v128_load(ptr as *const v128) }
 }
@@ -465,137 +443,6 @@ pub(crate) fn dct32x32_wasm(input: &[f32; 1024], output: &mut [f32; 1024]) {
         for u in 0..32 {
             let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
             unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
-        }
-    }
-}
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn dct64x64_wasm(input: &[f32; 4096], output: &mut [f32; 4096]) {
-    let mut colt = [0.0f32; 4096];
-    for s in 0..16 {
-        let mut c: [v128; 64] = std::array::from_fn(|r| {
-            load_strip(unsafe { input.get_unchecked(r * 64 + s * 4..) }.as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for t in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
-            for (j, v) in [a, b, cc, d].iter().enumerate() {
-                let p = unsafe { colt.get_unchecked_mut((s * 4 + j) * 64 + t * 4..) };
-                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
-            }
-        }
-    }
-    let scale = f32x4_splat(1.0 / 4096.0);
-    for q in 0..16 {
-        let mut c: [v128; 64] = std::array::from_fn(|col| {
-            load_strip(unsafe { colt.get_unchecked(col * 64 + q * 4..) }.as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for u in 0..64 {
-            let p = unsafe { output.get_unchecked_mut(u * 64 + q * 4..) };
-            unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
-        }
-    }
-}
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn dct64x32_wasm(input: &[f32; 2048], output: &mut [f32; 2048]) {
-    let mut scratch = [0.0f32; 2048];
-    for strip in 0..8 {
-        let mut c: [v128; 64] = std::array::from_fn(|row| {
-            load_strip(unsafe { input.get_unchecked(row * 32 + strip * 4..) }.as_ptr())
-        });
-        dct1d_64_s(&mut c);
-        for tile_idx in 0..16 {
-            let base = tile_idx * 4;
-            let (a, b, cc, d) = transpose_4x4(c[base], c[base + 1], c[base + 2], c[base + 3]);
-            for (lane, value) in [a, b, cc, d].iter().enumerate() {
-                let out =
-                    unsafe { scratch.get_unchecked_mut((strip * 4 + lane) * 64 + tile_idx * 4..) };
-                unsafe { v128_store(out.as_mut_ptr().cast(), *value) };
-            }
-        }
-    }
-
-    let scale = f32x4_splat(1.0 / 2048.0);
-    for strip in 0..16 {
-        let mut c: [v128; 32] = std::array::from_fn(|col| {
-            load_strip(unsafe { scratch.get_unchecked(col * 64 + strip * 4..) }.as_ptr())
-        });
-        dct1d_32_s(&mut c);
-        for u in 0..32 {
-            let out = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
-            unsafe { v128_store(out.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
-        }
-    }
-}
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn dct32x64_wasm(input: &[f32; 2048], output: &mut [f32; 2048]) {
-    let mut scratch = [0.0f32; 2048];
-    for row_strip in 0..8 {
-        let mut c = [f32x4_splat(0.0); 64];
-        for tile_idx in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(
-                load_strip(
-                    unsafe { input.get_unchecked((row_strip * 4) * 64 + tile_idx * 4..) }.as_ptr(),
-                ),
-                load_strip(
-                    unsafe { input.get_unchecked((row_strip * 4 + 1) * 64 + tile_idx * 4..) }
-                        .as_ptr(),
-                ),
-                load_strip(
-                    unsafe { input.get_unchecked((row_strip * 4 + 2) * 64 + tile_idx * 4..) }
-                        .as_ptr(),
-                ),
-                load_strip(
-                    unsafe { input.get_unchecked((row_strip * 4 + 3) * 64 + tile_idx * 4..) }
-                        .as_ptr(),
-                ),
-            );
-            c[tile_idx * 4] = a;
-            c[tile_idx * 4 + 1] = b;
-            c[tile_idx * 4 + 2] = cc;
-            c[tile_idx * 4 + 3] = d;
-        }
-        dct1d_64_s(&mut c);
-        for u in 0..64 {
-            let out = unsafe { scratch.get_unchecked_mut(u * 32 + row_strip * 4..) };
-            unsafe { v128_store(out.as_mut_ptr().cast(), c[u]) };
-        }
-    }
-
-    let scale = f32x4_splat(1.0 / 2048.0);
-    for freq_strip in 0..16 {
-        let mut c = [f32x4_splat(0.0); 32];
-        for row_tile in 0..8 {
-            let (a, b, cc, d) = transpose_4x4(
-                load_strip(
-                    unsafe { scratch.get_unchecked((freq_strip * 4) * 32 + row_tile * 4..) }
-                        .as_ptr(),
-                ),
-                load_strip(
-                    unsafe { scratch.get_unchecked((freq_strip * 4 + 1) * 32 + row_tile * 4..) }
-                        .as_ptr(),
-                ),
-                load_strip(
-                    unsafe { scratch.get_unchecked((freq_strip * 4 + 2) * 32 + row_tile * 4..) }
-                        .as_ptr(),
-                ),
-                load_strip(
-                    unsafe { scratch.get_unchecked((freq_strip * 4 + 3) * 32 + row_tile * 4..) }
-                        .as_ptr(),
-                ),
-            );
-            c[row_tile * 4] = a;
-            c[row_tile * 4 + 1] = b;
-            c[row_tile * 4 + 2] = cc;
-            c[row_tile * 4 + 3] = d;
-        }
-        dct1d_32_s(&mut c);
-        for v in 0..32 {
-            let out = unsafe { output.get_unchecked_mut(v * 64 + freq_strip * 4..) };
-            unsafe { v128_store(out.as_mut_ptr().cast(), f32x4_mul(c[v], scale)) };
         }
     }
 }
@@ -1222,47 +1069,6 @@ mod neon_dct_tests {
             unsafe { dct32x32_wasm(&input, &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
-        }
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    fn test_dct64x64_wasm_vs_scalar_random() {
-        use crate::dct::dct64x64_scalar;
-        use crate::wasm::dct64x64_wasm;
-        for seed in 0u64..8 {
-            let input: [f32; 4096] = fill(seed.wrapping_add(0x6464));
-            let mut got = [0.0f32; 4096];
-            let mut want = [0.0f32; 4096];
-            dct64x64_wasm(&input, &mut got);
-            dct64x64_scalar(&input, &mut want);
-            assert_close(&got, &want, &format!("dct64x64 seed={seed}"));
-        }
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    fn test_dct64x32_wasm_vs_scalar_random() {
-        for seed in 0u64..8 {
-            let input: [f32; 2048] = fill(seed.wrapping_add(0x6432));
-            let mut got = [0.0f32; 2048];
-            let mut want = [0.0f32; 2048];
-            crate::wasm::dct64x32_wasm(&input, &mut got);
-            crate::dct::dct64x32_scalar(&input, &mut want);
-            assert_close(&got, &want, &format!("dct64x32 seed={seed}"));
-        }
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
-    fn test_dct32x64_wasm_vs_scalar_random() {
-        for seed in 0u64..8 {
-            let input: [f32; 2048] = fill(seed.wrapping_add(0x3264));
-            let mut got = [0.0f32; 2048];
-            let mut want = [0.0f32; 2048];
-            crate::wasm::dct32x64_wasm(&input, &mut got);
-            crate::dct::dct32x64_scalar(&input, &mut want);
-            assert_close(&got, &want, &format!("dct32x64 seed={seed}"));
         }
     }
 

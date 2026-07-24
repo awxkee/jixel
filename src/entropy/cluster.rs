@@ -28,11 +28,39 @@
  */
 
 use super::histogram::Histogram;
-use super::huffman_tree::create_huffman_tree;
+use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
 
+pub(crate) const CLUSTERS_LIMIT: usize = 64;
+
+pub(crate) struct FixedClusterScratch<const MAX_CONTEXTS: usize> {
+    symbols: [u8; MAX_CONTEXTS],
+    in_costs: [f32; MAX_CONTEXTS],
+    dists: [f32; MAX_CONTEXTS],
+    clusters: [Histogram; CLUSTERS_LIMIT],
+    cluster_costs: [f32; CLUSTERS_LIMIT],
+    reordered: [Histogram; CLUSTERS_LIMIT],
+}
+
+impl<const MAX_CONTEXTS: usize> Default for FixedClusterScratch<MAX_CONTEXTS> {
+    fn default() -> Self {
+        Self {
+            symbols: [0; MAX_CONTEXTS],
+            in_costs: [0.0; MAX_CONTEXTS],
+            dists: [0.0; MAX_CONTEXTS],
+            clusters: std::array::from_fn(|_| Histogram::new()),
+            cluster_costs: [0.0; CLUSTERS_LIMIT],
+            reordered: std::array::from_fn(|_| Histogram::new()),
+        }
+    }
+}
+
 #[inline]
-fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
+fn counts_bit_cost(
+    counts: &[u32; ALPHABET_SIZE],
+    total_count: u32,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> f32 {
     if total_count == 0 {
         return 0.0;
     }
@@ -59,7 +87,7 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     }
 
     let mut depths = [0u8; ALPHABET_SIZE];
-    create_huffman_tree(counts, 15, &mut depths);
+    create_huffman_tree(counts, 15, &mut depths, huffman_pool);
 
     let mut cost = 0.0f32;
     for (&count, &depth) in counts.iter().zip(depths.iter()) {
@@ -69,8 +97,8 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
 }
 
 #[inline]
-fn histogram_bit_cost(h: &Histogram) -> f32 {
-    counts_bit_cost(&h.counts, h.total_count)
+fn histogram_bit_cost(h: &Histogram, huffman_pool: &mut Vec<HuffmanNode>) -> f32 {
+    counts_bit_cost(&h.counts, h.total_count, huffman_pool)
 }
 
 #[inline]
@@ -101,6 +129,7 @@ fn histogram_distance(
     a_cost: f32,
     b_cost: f32,
     scratch: &mut [u32; ALPHABET_SIZE],
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) -> f32 {
     if a.total_count == 0 || b.total_count == 0 {
         return 0.0;
@@ -108,7 +137,7 @@ fn histogram_distance(
 
     *scratch = a.counts;
     add_counts(scratch, &b.counts);
-    counts_bit_cost(scratch, a.total_count + b.total_count) - a_cost - b_cost
+    counts_bit_cost(scratch, a.total_count + b.total_count, huffman_pool) - a_cost - b_cost
 }
 
 #[inline]
@@ -117,29 +146,290 @@ fn histogram_merge_increment(
     cluster: &Histogram,
     cluster_cost: f32,
     scratch: &mut [u32; ALPHABET_SIZE],
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) -> f32 {
     *scratch = input.counts;
     add_counts(scratch, &cluster.counts);
-    counts_bit_cost(scratch, input.total_count + cluster.total_count) - cluster_cost
+    counts_bit_cost(
+        scratch,
+        input.total_count + cluster.total_count,
+        huffman_pool,
+    ) - cluster_cost
 }
 
 /// Cluster `histograms` in place down to at most 64 distinct ones; produce
 /// `context_map[i] = cluster index for histogram i`.
-pub(crate) fn cluster_histograms(histograms: &mut Vec<Histogram>, context_map: &mut Vec<u8>) {
-    cluster_histograms_inner(histograms, context_map, false);
-}
-
-pub(crate) fn cluster_histograms_refined(
+pub(crate) fn cluster_histograms(
     histograms: &mut Vec<Histogram>,
     context_map: &mut Vec<u8>,
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) {
-    cluster_histograms_inner(histograms, context_map, true);
+    cluster_histograms_inner(histograms, context_map, false, huffman_pool);
+}
+
+pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
+    histograms: &mut [Histogram],
+    context_map: &mut [u8],
+    refined: bool,
+    fixed: &mut FixedClusterScratch<MAX_CONTEXTS>,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> usize {
+    let n = histograms.len();
+    assert!(n <= MAX_CONTEXTS);
+    assert!(context_map.len() >= n);
+    if n <= 1 {
+        context_map[..n].fill(0);
+        return n;
+    }
+
+    const UNMAPPED: u8 = u8::MAX;
+    let max_histograms = CLUSTERS_LIMIT.min(n);
+    let unassigned = max_histograms as u8;
+    let symbols = &mut fixed.symbols[..n];
+    symbols.fill(unassigned);
+    let in_costs = &mut fixed.in_costs[..n];
+    let dists = &mut fixed.dists[..n];
+    dists.fill(f32::MAX);
+
+    let mut largest_idx = 0usize;
+    let mut largest_count = 0u32;
+    for (i, (((hist, symbol), dist), cost)) in histograms
+        .iter()
+        .zip(symbols.iter_mut())
+        .zip(dists.iter_mut())
+        .zip(in_costs.iter_mut())
+        .enumerate()
+    {
+        let total_count = hist.total_count;
+        if total_count == 0 {
+            *symbol = 0;
+            *dist = 0.0;
+            continue;
+        }
+        *cost = histogram_bit_cost(hist, huffman_pool);
+        if total_count > largest_count {
+            largest_count = total_count;
+            largest_idx = i;
+        }
+    }
+    if largest_count == 0 {
+        histograms[0] = Histogram::new();
+        context_map[..n].fill(0);
+        return 1;
+    }
+
+    let clusters = &mut fixed.clusters;
+    let cluster_costs = &mut fixed.cluster_costs;
+    let mut num_clusters = 0usize;
+    let mut counts_scratch = [0u32; ALPHABET_SIZE];
+
+    const MIN_DISTANCE_FOR_DISTINCT: f32 = 64.0;
+    while num_clusters < max_histograms {
+        let symbol = num_clusters as u8;
+        symbols[largest_idx] = symbol;
+        clusters[num_clusters] = histograms[largest_idx].clone();
+        cluster_costs[num_clusters] = in_costs[largest_idx];
+        dists[largest_idx] = 0.0;
+        num_clusters += 1;
+
+        let last_idx = num_clusters - 1;
+        let last_hist = &clusters[last_idx];
+        let last_cost = cluster_costs[last_idx];
+        let mut next_largest_idx = 0usize;
+        let mut next_largest_dist = dists[0];
+        for (i, ((hist, &in_cost), dist)) in histograms
+            .iter()
+            .zip(in_costs.iter())
+            .zip(dists.iter_mut())
+            .enumerate()
+        {
+            if *dist == 0.0 {
+                continue;
+            }
+            let distance = histogram_distance(
+                hist,
+                last_hist,
+                in_cost,
+                last_cost,
+                &mut counts_scratch,
+                huffman_pool,
+            );
+            if distance < *dist {
+                *dist = distance;
+            }
+            if *dist > next_largest_dist {
+                next_largest_dist = *dist;
+                next_largest_idx = i;
+            }
+        }
+        largest_idx = next_largest_idx;
+        if next_largest_dist < MIN_DISTANCE_FOR_DISTINCT {
+            break;
+        }
+    }
+
+    if !refined {
+        for ((hist, &in_cost), symbol) in histograms
+            .iter()
+            .zip(in_costs.iter())
+            .zip(symbols.iter_mut())
+        {
+            if *symbol != unassigned {
+                continue;
+            }
+            let mut best = 0usize;
+            let mut best_dist = histogram_distance(
+                hist,
+                &clusters[0],
+                in_cost,
+                cluster_costs[0],
+                &mut counts_scratch,
+                huffman_pool,
+            );
+            for candidate in 1..num_clusters {
+                let distance = histogram_distance(
+                    hist,
+                    &clusters[candidate],
+                    in_cost,
+                    cluster_costs[candidate],
+                    &mut counts_scratch,
+                    huffman_pool,
+                );
+                if distance < best_dist {
+                    best = candidate;
+                    best_dist = distance;
+                }
+            }
+            histogram_add(&mut clusters[best], hist);
+            cluster_costs[best] = histogram_bit_cost(&clusters[best], huffman_pool);
+            *symbol = best as u8;
+        }
+    } else {
+        for ((hist, &in_cost), symbol) in histograms
+            .iter()
+            .zip(in_costs.iter())
+            .zip(symbols.iter_mut())
+        {
+            if *symbol != unassigned {
+                continue;
+            }
+            let mut best = 0usize;
+            let mut best_dist = histogram_distance(
+                hist,
+                &clusters[0],
+                in_cost,
+                cluster_costs[0],
+                &mut counts_scratch,
+                huffman_pool,
+            );
+            for candidate in 1..num_clusters {
+                let distance = histogram_distance(
+                    hist,
+                    &clusters[candidate],
+                    in_cost,
+                    cluster_costs[candidate],
+                    &mut counts_scratch,
+                    huffman_pool,
+                );
+                if distance < best_dist {
+                    best = candidate;
+                    best_dist = distance;
+                }
+            }
+            *symbol = best as u8;
+        }
+
+        clusters[..num_clusters].fill(Histogram::new());
+        for (hist, &symbol) in histograms.iter().zip(symbols.iter()) {
+            histogram_add(&mut clusters[symbol as usize], hist);
+        }
+        for cluster in 0..num_clusters {
+            cluster_costs[cluster] = histogram_bit_cost(&clusters[cluster], huffman_pool);
+        }
+
+        for _ in 0..2 {
+            let mut changed = false;
+            for (hist, symbol) in histograms.iter().zip(symbols.iter_mut()) {
+                if hist.total_count == 0 {
+                    continue;
+                }
+                let old = *symbol as usize;
+                let mut old_without = clusters[old].clone();
+                histogram_sub(&mut old_without, hist);
+                let remove_delta =
+                    histogram_bit_cost(&old_without, huffman_pool) - cluster_costs[old];
+
+                let mut best = old;
+                let mut best_delta = 0.0f32;
+                for candidate in 0..num_clusters {
+                    if candidate == old || clusters[candidate].total_count == 0 {
+                        continue;
+                    }
+                    let add_delta = histogram_merge_increment(
+                        hist,
+                        &clusters[candidate],
+                        cluster_costs[candidate],
+                        &mut counts_scratch,
+                        huffman_pool,
+                    );
+                    let delta = remove_delta + add_delta;
+                    if delta < best_delta - 0.01 {
+                        best_delta = delta;
+                        best = candidate;
+                    }
+                }
+                if best != old {
+                    histogram_sub(&mut clusters[old], hist);
+                    histogram_add(&mut clusters[best], hist);
+                    cluster_costs[old] = histogram_bit_cost(&clusters[old], huffman_pool);
+                    cluster_costs[best] = histogram_bit_cost(&clusters[best], huffman_pool);
+                    *symbol = best as u8;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut compact = [UNMAPPED; CLUSTERS_LIMIT];
+        let mut compact_len = 0usize;
+        for (old, histogram) in clusters[..num_clusters].iter().enumerate() {
+            if histogram.total_count != 0 {
+                compact[old] = compact_len as u8;
+                fixed.reordered[compact_len] = histogram.clone();
+                compact_len += 1;
+            }
+        }
+        for symbol in symbols.iter_mut() {
+            *symbol = compact[*symbol as usize];
+        }
+        clusters[..compact_len].clone_from_slice(&fixed.reordered[..compact_len]);
+        num_clusters = compact_len;
+    }
+
+    let mut remap = [UNMAPPED; CLUSTERS_LIMIT];
+    let mut reordered_len = 0usize;
+    for (i, &symbol) in symbols.iter().enumerate() {
+        debug_assert_ne!(symbol, unassigned);
+        let old_index = symbol as usize;
+        debug_assert!(old_index < num_clusters);
+        if remap[old_index] == UNMAPPED {
+            remap[old_index] = reordered_len as u8;
+            fixed.reordered[reordered_len] = clusters[old_index].clone();
+            reordered_len += 1;
+        }
+        context_map[i] = remap[old_index];
+    }
+    histograms[..reordered_len].clone_from_slice(&fixed.reordered[..reordered_len]);
+    reordered_len
 }
 
 fn cluster_histograms_inner(
     histograms: &mut Vec<Histogram>,
     context_map: &mut Vec<u8>,
     refined: bool,
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) {
     if histograms.len() <= 1 {
         context_map.clear();
@@ -147,7 +437,6 @@ fn cluster_histograms_inner(
         return;
     }
 
-    const CLUSTERS_LIMIT: usize = 64;
     const UNMAPPED: u8 = u8::MAX;
 
     let max_histograms = CLUSTERS_LIMIT.min(histograms.len());
@@ -177,7 +466,7 @@ fn cluster_histograms_inner(
             continue;
         }
 
-        *cost = histogram_bit_cost(hist);
+        *cost = histogram_bit_cost(hist, huffman_pool);
         if total_count > largest_count {
             largest_count = total_count;
             largest_idx = i;
@@ -218,7 +507,14 @@ fn cluster_histograms_inner(
                 continue;
             }
 
-            let d = histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch);
+            let d = histogram_distance(
+                hist,
+                last_hist,
+                in_cost,
+                last_cost,
+                &mut scratch,
+                huffman_pool,
+            );
             if d < *dist {
                 *dist = d;
             }
@@ -243,19 +539,32 @@ fn cluster_histograms_inner(
                 continue;
             }
             let mut best = 0usize;
-            let mut best_dist =
-                histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+            let mut best_dist = histogram_distance(
+                hist,
+                &out[0],
+                in_cost,
+                out_costs[0],
+                &mut scratch,
+                huffman_pool,
+            );
             for (j, (candidate, &candidate_cost)) in
                 out.iter().zip(out_costs.iter()).enumerate().skip(1)
             {
-                let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
+                let d = histogram_distance(
+                    hist,
+                    candidate,
+                    in_cost,
+                    candidate_cost,
+                    &mut scratch,
+                    huffman_pool,
+                );
                 if d < best_dist {
                     best = j;
                     best_dist = d;
                 }
             }
             histogram_add(&mut out[best], hist);
-            out_costs[best] = histogram_bit_cost(&out[best]);
+            out_costs[best] = histogram_bit_cost(&out[best], huffman_pool);
             *symbol = best as u8;
         }
     } else {
@@ -269,12 +578,25 @@ fn cluster_histograms_inner(
             }
 
             let mut best = 0usize;
-            let mut best_dist =
-                histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+            let mut best_dist = histogram_distance(
+                hist,
+                &out[0],
+                in_cost,
+                out_costs[0],
+                &mut scratch,
+                huffman_pool,
+            );
             for (j, (candidate, &candidate_cost)) in
                 out.iter().zip(out_costs.iter()).enumerate().skip(1)
             {
-                let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
+                let d = histogram_distance(
+                    hist,
+                    candidate,
+                    in_cost,
+                    candidate_cost,
+                    &mut scratch,
+                    huffman_pool,
+                );
                 if d < best_dist {
                     best = j;
                     best_dist = d;
@@ -293,7 +615,7 @@ fn cluster_histograms_inner(
             histogram_add(&mut out[symbol as usize], hist);
         }
         for (cost, hist) in out_costs.iter_mut().zip(out.iter()) {
-            *cost = histogram_bit_cost(hist);
+            *cost = histogram_bit_cost(hist, huffman_pool);
         }
 
         for _ in 0..2 {
@@ -305,7 +627,7 @@ fn cluster_histograms_inner(
                 let old = *symbol as usize;
                 let mut old_without = out[old].clone();
                 histogram_sub(&mut old_without, hist);
-                let remove_delta = histogram_bit_cost(&old_without) - out_costs[old];
+                let remove_delta = histogram_bit_cost(&old_without, huffman_pool) - out_costs[old];
 
                 let mut best = old;
                 let mut best_delta = 0.0f32;
@@ -318,6 +640,7 @@ fn cluster_histograms_inner(
                         &out[candidate],
                         out_costs[candidate],
                         &mut scratch,
+                        huffman_pool,
                     );
                     let delta = remove_delta + add_delta;
                     if delta < best_delta - 0.01 {
@@ -328,8 +651,8 @@ fn cluster_histograms_inner(
                 if best != old {
                     histogram_sub(&mut out[old], hist);
                     histogram_add(&mut out[best], hist);
-                    out_costs[old] = histogram_bit_cost(&out[old]);
-                    out_costs[best] = histogram_bit_cost(&out[best]);
+                    out_costs[old] = histogram_bit_cost(&out[old], huffman_pool);
+                    out_costs[best] = histogram_bit_cost(&out[best], huffman_pool);
                     *symbol = best as u8;
                     changed = true;
                 }
@@ -382,4 +705,64 @@ fn cluster_histograms_inner(
     context_map.clear();
     context_map.reserve(symbols.len());
     context_map.extend(symbols.iter().map(|&symbol| remap[symbol as usize]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inputs(n: usize) -> Vec<Histogram> {
+        (0..n)
+            .map(|context| {
+                let mut histogram = Histogram::new();
+                if context % 11 != 0 {
+                    for symbol in 0..ALPHABET_SIZE {
+                        let count = ((context * 17 + symbol * 13 + context * symbol) % 19) as u32;
+                        histogram.counts[symbol] = count;
+                        histogram.total_count += count;
+                    }
+                }
+                histogram
+            })
+            .collect()
+    }
+
+    fn assert_fixed_matches_allocating(n: usize, refined: bool) {
+        let mut expected = inputs(n);
+        let mut expected_map = Vec::new();
+        let mut expected_pool = Vec::with_capacity(1024);
+        cluster_histograms_inner(
+            &mut expected,
+            &mut expected_map,
+            refined,
+            &mut expected_pool,
+        );
+
+        let mut actual = inputs(n);
+        let mut actual_map = vec![0; n];
+        let mut actual_pool = Vec::with_capacity(1024);
+        let mut scratch = FixedClusterScratch::<221>::default();
+        let actual_len = cluster_histograms_fixed(
+            &mut actual,
+            &mut actual_map,
+            refined,
+            &mut scratch,
+            &mut actual_pool,
+        );
+
+        assert_eq!(actual_len, expected.len());
+        assert_eq!(actual_map, expected_map);
+        for (actual, expected) in actual[..actual_len].iter().zip(expected.iter()) {
+            assert_eq!(actual.total_count, expected.total_count);
+            assert_eq!(actual.counts, expected.counts);
+        }
+    }
+
+    #[test]
+    fn fixed_clustering_matches_allocating_path() {
+        for n in [0, 1, 2, 7, 64, 65, 128, 221] {
+            assert_fixed_matches_allocating(n, false);
+            assert_fixed_matches_allocating(n, true);
+        }
+    }
 }

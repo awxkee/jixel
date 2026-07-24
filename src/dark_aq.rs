@@ -30,7 +30,6 @@ use crate::adaptive_quant::{dirty_log1pf, fast_exp2};
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
-use std::cell::RefCell;
 
 #[cfg(test)]
 pub(crate) trait AqLuma: Copy {
@@ -425,15 +424,12 @@ fn subblock_variances(tile: &[f32], pw: usize, w: usize, h: usize) -> [f32; 64] 
     subvars
 }
 
-thread_local! {
-    static DARK_OCTILE: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
-
 /// Apply the Variance-Boost + Dark-AQ superblock modulations to `raw_quant_field`
 /// in place. `x0`/`y0` are the DC group's pixel origin in `opsin`; the field is at
 /// 8x8-block resolution for this DC group. Only called when a boost config is set on
 /// the [`EncodeConfig`](crate::EncodeConfig).
 pub(crate) fn apply_boost(
+    cell: &mut Vec<f32>,
     cfg: &DarkAqConfig,
     opsin: &Image3F,
     raw_quant_field: &mut ImageB,
@@ -465,89 +461,87 @@ pub(crate) fn apply_boost(
     // First pass: octile variance per SB (+ its tile buffer reused in pass 2 via
     // recompute — SBs are cheap and this keeps memory flat). Also accumulate the
     // mean log-variance reference for the two-sided cut.
-    DARK_OCTILE.with_borrow_mut(|cell| {
-        if vb_on && cell.len() < sb_cols * sb_rows {
-            cell.resize_with(sb_cols * sb_rows, Default::default);
-        }
-        let mut ref_acc = 0f32;
-        let mut ref_n = 0u32;
-        let mut tile = [0f32; 64 * 64];
+    if vb_on && cell.len() < sb_cols * sb_rows {
+        cell.resize_with(sb_cols * sb_rows, Default::default);
+    }
+    let mut ref_acc = 0f32;
+    let mut ref_n = 0u32;
+    let mut tile = [0f32; 64 * 64];
 
-        let fill_tile = |tile: &mut [f32], sb_x0: usize, sb_y0: usize| -> (usize, usize) {
-            let w = img_w.saturating_sub(sb_x0).min(64);
-            let h = img_h.saturating_sub(sb_y0).min(64);
-            for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
-                let row = opsin.plane_row(1, sb_y0 + r);
-                for (d, &s) in dst.iter_mut().zip(row[sb_x0..sb_x0 + w].iter()) {
-                    *d = s * Y_TO_LUMA8;
-                }
-            }
-            (w, h)
-        };
-
-        if vb_on {
-            let picked = &mut cell[..sb_cols * sb_rows];
-            for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
-                for (sbx, dst) in row.iter_mut().enumerate() {
-                    let sb_x0 = x0 + sbx * 64;
-                    let sb_y0 = y0 + sby * 64;
-                    let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
-                    if w == 0 || h == 0 {
-                        *dst = 0.0;
-                        continue;
-                    }
-                    let mut subvars = subblock_variances(&tile, 64, w, h);
-                    let pv = sb_octile_variance(&mut subvars, cfg.octile);
-                    *dst = pv;
-                    ref_acc += dirty_log1pf(pv);
-                    ref_n += 1;
-                }
+    let fill_tile = |tile: &mut [f32], sb_x0: usize, sb_y0: usize| -> (usize, usize) {
+        let w = img_w.saturating_sub(sb_x0).min(64);
+        let h = img_h.saturating_sub(sb_y0).min(64);
+        for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
+            let row = opsin.plane_row(1, sb_y0 + r);
+            for (d, &s) in dst.iter_mut().zip(row[sb_x0..sb_x0 + w].iter()) {
+                *d = s * Y_TO_LUMA8;
             }
         }
-        let ref_log = if ref_n > 0 {
-            ref_acc / ref_n as f32
-        } else {
-            0.0
-        };
+        (w, h)
+    };
 
-        // Second pass: convert each SB's summed qindex delta into a field gain and apply.
-        for sby in 0..sb_rows {
-            for sbx in 0..sb_cols {
+    if vb_on {
+        let picked = &mut cell[..sb_cols * sb_rows];
+        for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
+            for (sbx, dst) in row.iter_mut().enumerate() {
                 let sb_x0 = x0 + sbx * 64;
                 let sb_y0 = y0 + sby * 64;
-
-                let mut delta = 0i32;
-                if vb_on {
-                    let src = cell[sby * sb_cols + sbx];
-                    delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
-                }
-                if dark_on {
-                    let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
-                    if w >= 3 && h >= 3 {
-                        // Tile already in 8-bit-luma units (scale=1.0 here).
-                        let rows = tile.as_chunks::<64>().0;
-                        let (mean, mid_energy) = dark_structure_stats_buf(rows, h, w);
-                        delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy);
-                    }
-                }
-                if delta == 0 {
+                let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
+                if w == 0 || h == 0 {
+                    *dst = 0.0;
                     continue;
                 }
-                // qindex delta (negative = finer) → multiplicative field gain.
-                let gain = fast_exp2(-(delta as f32) * cfg.qstep);
+                let mut subvars = subblock_variances(&tile, 64, w, h);
+                let pv = sb_octile_variance(&mut subvars, cfg.octile);
+                *dst = pv;
+                ref_acc += dirty_log1pf(pv);
+                ref_n += 1;
+            }
+        }
+    }
+    let ref_log = if ref_n > 0 {
+        ref_acc / ref_n as f32
+    } else {
+        0.0
+    };
 
-                let bx0 = sbx * 8;
-                let by0 = sby * 8;
-                for by in by0..(by0 + 8).min(yblocks) {
-                    let row = raw_quant_field.row_mut(by);
-                    for dst in row[bx0..(bx0 + 8).min(xblocks)].iter_mut() {
-                        let q = *dst as f32 * gain;
-                        *dst = q.fast_round().clamp(1.0, 255.0) as u8;
-                    }
+    // Second pass: convert each SB's summed qindex delta into a field gain and apply.
+    for sby in 0..sb_rows {
+        for sbx in 0..sb_cols {
+            let sb_x0 = x0 + sbx * 64;
+            let sb_y0 = y0 + sby * 64;
+
+            let mut delta = 0i32;
+            if vb_on {
+                let src = cell[sby * sb_cols + sbx];
+                delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
+            }
+            if dark_on {
+                let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
+                if w >= 3 && h >= 3 {
+                    // Tile already in 8-bit-luma units (scale=1.0 here).
+                    let rows = tile.as_chunks::<64>().0;
+                    let (mean, mid_energy) = dark_structure_stats_buf(rows, h, w);
+                    delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy);
+                }
+            }
+            if delta == 0 {
+                continue;
+            }
+            // qindex delta (negative = finer) → multiplicative field gain.
+            let gain = fast_exp2(-(delta as f32) * cfg.qstep);
+
+            let bx0 = sbx * 8;
+            let by0 = sby * 8;
+            for by in by0..(by0 + 8).min(yblocks) {
+                let row = raw_quant_field.row_mut(by);
+                for dst in row[bx0..(bx0 + 8).min(xblocks)].iter_mut() {
+                    let q = *dst as f32 * gain;
+                    *dst = q.fast_round().clamp(1.0, 255.0) as u8;
                 }
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]
