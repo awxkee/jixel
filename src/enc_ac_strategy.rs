@@ -447,7 +447,7 @@ fn strategy_cost_impl(
     let size = cx * cy * 64;
 
     // Apply the same per-tile CfL slopes used by final coefficient coding.
-    let [x, y, b] = coeffs;
+    let [x, y, b] = &mut **coeffs;
     apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
     let (d_total, r_total) = match distortion_model {
@@ -544,7 +544,7 @@ fn sub8_strategy_costs(
         for c in 0..3 {
             forward_sub8_transform(ctx, strategy, &pixels[c], &mut coeffs[c]);
         }
-        let [x, y, b] = &mut *coeffs;
+        let [x, y, b] = &mut **coeffs;
         apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
         let (distortion, rate) =
             coefficient_dist_and_rate(ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1);

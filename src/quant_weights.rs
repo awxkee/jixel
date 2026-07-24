@@ -29,6 +29,7 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::dct::fmla;
+use crate::util::{HeapMatrix, heap_array_from_fn};
 
 /// IEEE 754 binary16 conversion (round-to-nearest-even), matching libjxl's
 /// F16Coder wire format for signaled dequant-matrix parameters.
@@ -773,42 +774,42 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
 ];
 
 pub(crate) struct DequantMatrices {
-    pub(crate) matrix: [[f32; 64]; 3],
+    pub(crate) matrix: HeapMatrix<f32, 3, 64>,
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT.
-    pub(crate) inv_matrix: [[f32; 64]; 3],
+    pub(crate) inv_matrix: HeapMatrix<f32, 3, 64>,
     /// 16×8 / 8×16 dequant matrix. Both rectangular transforms share these
     /// 128 floats per channel (libjxl-tiny convention).
-    pub(crate) matrix_16x8: [[f32; 128]; 3],
-    pub(crate) inv_matrix_16x8: [[f32; 128]; 3],
+    pub(crate) matrix_16x8: HeapMatrix<f32, 3, 128>,
+    pub(crate) inv_matrix_16x8: HeapMatrix<f32, 3, 128>,
     /// 16×16 dequant matrix (256 floats per channel). Generated at
     /// construction time from the libjxl polynomial parameters since it isn't
     /// part of libjxl-tiny.
-    pub(crate) matrix_16x16: [[f32; 256]; 3],
-    pub(crate) inv_matrix_16x16: [[f32; 256]; 3],
+    pub(crate) matrix_16x16: HeapMatrix<f32, 3, 256>,
+    pub(crate) inv_matrix_16x16: HeapMatrix<f32, 3, 256>,
     /// 32×32 dequant matrix (1024 floats per channel). Generated at
     /// construction time from the libjxl DCT32X32 polynomial parameters.
-    pub(crate) matrix_32x32: Box<[[f32; 1024]; 3]>,
-    pub(crate) inv_matrix_32x32: Box<[[f32; 1024]; 3]>,
+    pub(crate) matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    pub(crate) inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
     /// Tables that differ from the spec defaults and must be signaled by
     /// `write_dequant_matrices`, in the fixed order
     /// [DCT8, DCT16X16, DCT32X32].
-    pub(crate) custom_tables: [Option<BandOverride>; 3],
+    pub(crate) custom_tables: Box<[Option<BandOverride>; 3]>,
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
-    pub(crate) matrix_4x4: [[f32; 64]; 3],
-    pub(crate) inv_matrix_4x4: [[f32; 64]; 3],
+    pub(crate) matrix_4x4: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
     /// DCT4X8 dequant matrix (64 floats per channel). 4×8 radial weights with
     /// each row replicated to 2 rows of the 8×8 grid. Used for DCT4X8.
-    pub(crate) matrix_4x8: [[f32; 64]; 3],
-    pub(crate) inv_matrix_4x8: [[f32; 64]; 3],
+    pub(crate) matrix_4x8: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
     /// DCT32X16 / DCT16X32 dequant matrix (512 floats per channel). Both
     /// rectangular large transforms share these weights (libjxl
     /// `QuantTable::DCT16X32`), computed at the normalized 16-row × 32-col
     /// resolution so the same table applies to both orientations.
-    pub(crate) matrix_32x16: Box<[[f32; 512]; 3]>,
-    pub(crate) inv_matrix_32x16: Box<[[f32; 512]; 3]>,
+    pub(crate) matrix_32x16: HeapMatrix<f32, 3, 512>,
+    pub(crate) inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -986,9 +987,9 @@ fn interpolate_vec_bands(scaled_pos: f32, bands: &[f32]) -> f32 {
 /// cols=8 → separate row/col scaling), then expand to the 8×8 block with
 /// `w8x8[y*8+x] = w4x8[(y/2)*8 + x]` (each of the 4 rows replicated to 2).
 /// Returns inverse weights (matrix entry = 1/weight = step size).
-fn compute_dct4x8_matrix() -> [[f32; 64]; 3] {
+fn compute_dct4x8_matrix() -> HeapMatrix<f32, 3, 64> {
     const NUM_BANDS: usize = 4;
-    let mut out = [[0.0f32; 64]; 3];
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = DCT4X8_BANDS[c][0];
@@ -1020,9 +1021,9 @@ fn compute_dct4x8_matrix() -> [[f32; 64]; 3] {
     out
 }
 
-fn compute_dct4x4_matrix() -> [[f32; 64]; 3] {
+fn compute_dct4x4_matrix() -> HeapMatrix<f32, 3, 64> {
     const NUM_BANDS: usize = 4;
-    let mut out = [[0.0f32; 64]; 3];
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = DCT4X4_BANDS[c][0];
@@ -1053,9 +1054,9 @@ fn compute_dct4x4_matrix() -> [[f32; 64]; 3] {
     out
 }
 
-fn compute_dct8x8_matrix(override_: &BandOverride) -> [[f32; 64]; 3] {
+fn compute_dct8x8_matrix(override_: &BandOverride) -> HeapMatrix<f32, 3, 64> {
     const NUM_BANDS: usize = 6;
-    let mut out = [[0.0f32; 64]; 3];
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = override_.bands[c][0];
@@ -1077,7 +1078,7 @@ fn compute_dct8x8_matrix(override_: &BandOverride) -> [[f32; 64]; 3] {
     out
 }
 
-fn compute_dct16x16_matrix(override_: Option<&BandOverride>) -> [[f32; 256]; 3] {
+fn compute_dct16x16_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 3, 256> {
     const NUM_BANDS: usize = 7;
     let mut src = DCT16X16_BANDS;
     if let Some(o) = override_ {
@@ -1085,7 +1086,7 @@ fn compute_dct16x16_matrix(override_: Option<&BandOverride>) -> [[f32; 256]; 3] 
             src[c].copy_from_slice(&o.bands[c][..NUM_BANDS]);
         }
     }
-    let mut out = [[0.0f32; 256]; 3];
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = src[c][0];
@@ -1111,7 +1112,7 @@ fn compute_dct16x16_matrix(override_: Option<&BandOverride>) -> [[f32; 256]; 3] 
     out
 }
 
-fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> Box<[[f32; 1024]; 3]> {
+fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 3, 1024> {
     const NUM_BANDS: usize = 8;
     let mut src = DCT32X32_BANDS;
     if let Some(o) = override_ {
@@ -1119,7 +1120,7 @@ fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> Box<[[f32; 1024]
             src[c].copy_from_slice(&o.bands[c][..NUM_BANDS]);
         }
     }
-    let mut out = Box::new([[0.0f32; 1024]; 3]);
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = src[c][0];
@@ -1142,9 +1143,9 @@ fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> Box<[[f32; 1024]
     out
 }
 
-fn compute_dct32x16_matrix() -> Box<[[f32; 512]; 3]> {
+fn compute_dct32x16_matrix() -> HeapMatrix<f32, 3, 512> {
     const NUM_BANDS: usize = 8;
-    let mut out = Box::new([[0.0f32; 512]; 3]);
+    let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = DCT16X32_BANDS[c][0];
@@ -1171,16 +1172,16 @@ fn compute_dct32x16_matrix() -> Box<[[f32; 512]; 3]> {
 /// Quant tables that do not depend on the SS2-retune distance gate, computed
 /// once per process and cloned into both `DequantMatrices` variants.
 struct SharedTables {
-    matrix: [[f32; 64]; 3],
-    inv_matrix: [[f32; 64]; 3],
-    matrix_16x8: [[f32; 128]; 3],
-    inv_matrix_16x8: [[f32; 128]; 3],
-    matrix_4x4: [[f32; 64]; 3],
-    inv_matrix_4x4: [[f32; 64]; 3],
-    matrix_4x8: [[f32; 64]; 3],
-    inv_matrix_4x8: [[f32; 64]; 3],
-    matrix_32x16: Box<[[f32; 512]; 3]>,
-    inv_matrix_32x16: Box<[[f32; 512]; 3]>,
+    matrix: HeapMatrix<f32, 3, 64>,
+    inv_matrix: HeapMatrix<f32, 3, 64>,
+    matrix_16x8: HeapMatrix<f32, 3, 128>,
+    inv_matrix_16x8: HeapMatrix<f32, 3, 128>,
+    matrix_4x4: HeapMatrix<f32, 3, 64>,
+    inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
+    matrix_4x8: HeapMatrix<f32, 3, 64>,
+    inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
+    matrix_32x16: HeapMatrix<f32, 3, 512>,
+    inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
     o8: Option<BandOverride>,
 }
 
@@ -1191,17 +1192,17 @@ fn shared_tables() -> &'static SharedTables {
 
         let matrix = match o8.as_ref() {
             Some(o) => compute_dct8x8_matrix(o),
-            None => DEQUANT_MATRIX_8X8,
+            None => HeapMatrix::from_rows(&DEQUANT_MATRIX_8X8),
         };
-        let mut inv_matrix = [[0.0f32; 64]; 3];
+        let mut inv_matrix = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             for k in 1..64 {
                 inv_matrix[c][k] = 1.0 / matrix[c][k];
             }
         }
 
-        let matrix_16x8 = DEQUANT_MATRIX_16X8;
-        let mut inv_matrix_16x8 = [[0.0f32; 128]; 3];
+        let matrix_16x8 = HeapMatrix::from_rows(&DEQUANT_MATRIX_16X8);
+        let mut inv_matrix_16x8 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             for k in 1..128 {
                 inv_matrix_16x8[c][k] = 1.0 / matrix_16x8[c][k];
@@ -1209,7 +1210,7 @@ fn shared_tables() -> &'static SharedTables {
         }
 
         let matrix_4x4 = compute_dct4x4_matrix();
-        let mut inv_matrix_4x4 = [[0.0f32; 64]; 3];
+        let mut inv_matrix_4x4 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             // DC slot (index 0) zeroed (handled by the DC plane). For DCT4X4 the
             // only LLF position is the DC; [1], [8], [9] are regular AC.
@@ -1219,7 +1220,7 @@ fn shared_tables() -> &'static SharedTables {
         }
 
         let matrix_4x8 = compute_dct4x8_matrix();
-        let mut inv_matrix_4x8 = [[0.0f32; 64]; 3];
+        let mut inv_matrix_4x8 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             // Only [0] is the DC (handled by the DC plane); [8] (the vertical
             // half-difference after the Hadamard) and all others are regular AC.
@@ -1229,7 +1230,7 @@ fn shared_tables() -> &'static SharedTables {
         }
 
         let matrix_32x16 = compute_dct32x16_matrix();
-        let mut inv_matrix_32x16 = Box::new([[0.0f32; 512]; 3]);
+        let mut inv_matrix_32x16 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
             // since the decoder overwrites them via LowestFrequenciesFromDC.
@@ -1277,7 +1278,7 @@ impl DequantMatrices {
             .copied()
             .or_else(|| use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32)));
         let matrix_16x16 = compute_dct16x16_matrix(o16.as_ref());
-        let mut inv_16x16 = [[0.0f32; 256]; 3];
+        let mut inv_16x16 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             // Same convention as inv_matrix and inv_matrix_16x8: DC slot
             // (index 0) is zeroed (handled by DC plane / LF-from-DC). For
@@ -1291,7 +1292,7 @@ impl DequantMatrices {
         }
 
         let matrix_32x32 = compute_dct32x32_matrix(o32.as_ref());
-        let mut inv_32x32 = Box::new([[0.0f32; 1024]; 3]);
+        let mut inv_32x32 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
             // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
             // since the decoder overwrites them via LowestFrequenciesFromDC.
@@ -1301,19 +1302,24 @@ impl DequantMatrices {
         }
 
         Self {
-            matrix: shared.matrix,
-            inv_matrix: shared.inv_matrix,
-            matrix_16x8: shared.matrix_16x8,
-            inv_matrix_16x8: shared.inv_matrix_16x8,
+            matrix: shared.matrix.clone(),
+            inv_matrix: shared.inv_matrix.clone(),
+            matrix_16x8: shared.matrix_16x8.clone(),
+            inv_matrix_16x8: shared.inv_matrix_16x8.clone(),
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
             matrix_32x32,
             inv_matrix_32x32: inv_32x32,
-            custom_tables: [shared.o8, o16, o32],
-            matrix_4x4: shared.matrix_4x4,
-            inv_matrix_4x4: shared.inv_matrix_4x4,
-            matrix_4x8: shared.matrix_4x8,
-            inv_matrix_4x8: shared.inv_matrix_4x8,
+            custom_tables: heap_array_from_fn(|i| match i {
+                0 => shared.o8,
+                1 => o16,
+                2 => o32,
+                _ => unreachable!(),
+            }),
+            matrix_4x4: shared.matrix_4x4.clone(),
+            inv_matrix_4x4: shared.inv_matrix_4x4.clone(),
+            matrix_4x8: shared.matrix_4x8.clone(),
+            inv_matrix_4x8: shared.inv_matrix_4x8.clone(),
             matrix_32x16: shared.matrix_32x16.clone(),
             inv_matrix_32x16: shared.inv_matrix_32x16.clone(),
         }
@@ -1392,6 +1398,22 @@ impl DequantMatrices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dequant_matrices_are_only_heap_handles() {
+        assert!(std::mem::size_of::<DequantMatrices>() <= 256);
+    }
+
+    #[test]
+    fn dequant_matrices_construct_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("small-stack-dequant-test".into())
+            .stack_size(64 * 1024)
+            .spawn(|| drop(DequantMatrices::compute(false)))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     /// JPEG XL default DCT8 (table 0) quant-weight parameters (libjxl
     /// DequantMatricesLibraryDef::DCT, 6 distance bands). `DEQUANT_MATRIX_8X8`

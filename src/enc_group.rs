@@ -46,7 +46,7 @@ use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
-use crate::util::FastRound;
+use crate::util::{FastRound, HeapMatrix, heap_array};
 use std::sync::OnceLock;
 
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
@@ -584,25 +584,25 @@ fn quantize_roundtrip_y_block(
 }
 
 pub(crate) struct AcGroupScratch {
-    coeffs: [[f32; 4096]; 3],
-    quantized: [[i32; 4096]; 3],
-    tmp: [f32; 4096],
-    source_y: [f32; 4096],
-    block: [i32; 4096],
-    rdoq_choices: [u8; RDOQ_MAX_CHOICES],
-    rdoq_costs: [[f32; RDOQ_MAX_STRIDE]; 2],
+    coeffs: HeapMatrix<f32, 3, 4096>,
+    quantized: HeapMatrix<i32, 3, 4096>,
+    tmp: Box<[f32; 4096]>,
+    source_y: Box<[f32; 4096]>,
+    block: Box<[i32; 4096]>,
+    rdoq_choices: Box<[u8; RDOQ_MAX_CHOICES]>,
+    rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
 }
 
 impl Default for AcGroupScratch {
     fn default() -> Self {
         Self {
-            coeffs: [[0.; 4096]; 3],
-            quantized: [[0; 4096]; 3],
-            tmp: [0.; 4096],
-            source_y: [0.; 4096],
-            block: [0; 4096],
-            rdoq_choices: [u8::MAX; RDOQ_MAX_CHOICES],
-            rdoq_costs: [[f32::INFINITY; RDOQ_MAX_STRIDE]; 2],
+            coeffs: HeapMatrix::new(0.0),
+            quantized: HeapMatrix::new(0),
+            tmp: heap_array(0.0),
+            source_y: heap_array(0.0),
+            block: heap_array(0),
+            rdoq_choices: heap_array(u8::MAX),
+            rdoq_costs: HeapMatrix::new(f32::INFINITY),
         }
     }
 }
@@ -969,7 +969,7 @@ pub(crate) fn write_ac_group(
                 }
             }
             {
-                let [c0, c1, c2] = &mut *coeffs;
+                let [c0, c1, c2] = &mut **coeffs;
                 (ctx.apply_cfl)(
                     &mut c0[..size],
                     &c1[..size],

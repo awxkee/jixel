@@ -30,27 +30,28 @@
 use super::histogram::Histogram;
 use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
+use crate::util::heap_array;
 
 pub(crate) const CLUSTERS_LIMIT: usize = 64;
 
 pub(crate) struct FixedClusterScratch<const MAX_CONTEXTS: usize> {
-    symbols: [u8; MAX_CONTEXTS],
-    in_costs: [f32; MAX_CONTEXTS],
-    dists: [f32; MAX_CONTEXTS],
-    clusters: [Histogram; CLUSTERS_LIMIT],
-    cluster_costs: [f32; CLUSTERS_LIMIT],
-    reordered: [Histogram; CLUSTERS_LIMIT],
+    symbols: Box<[u8; MAX_CONTEXTS]>,
+    in_costs: Box<[f32; MAX_CONTEXTS]>,
+    dists: Box<[f32; MAX_CONTEXTS]>,
+    clusters: Box<[Histogram; CLUSTERS_LIMIT]>,
+    cluster_costs: Box<[f32; CLUSTERS_LIMIT]>,
+    reordered: Box<[Histogram; CLUSTERS_LIMIT]>,
 }
 
 impl<const MAX_CONTEXTS: usize> Default for FixedClusterScratch<MAX_CONTEXTS> {
     fn default() -> Self {
         Self {
-            symbols: [0; MAX_CONTEXTS],
-            in_costs: [0.0; MAX_CONTEXTS],
-            dists: [0.0; MAX_CONTEXTS],
-            clusters: std::array::from_fn(|_| Histogram::new()),
-            cluster_costs: [0.0; CLUSTERS_LIMIT],
-            reordered: std::array::from_fn(|_| Histogram::new()),
+            symbols: heap_array(0),
+            in_costs: heap_array(0.0),
+            dists: heap_array(0.0),
+            clusters: heap_array(Histogram::new()),
+            cluster_costs: heap_array(0.0),
+            reordered: heap_array(Histogram::new()),
         }
     }
 }
