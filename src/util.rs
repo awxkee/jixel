@@ -38,6 +38,11 @@ pub(crate) fn heap_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
     boxed_slice_to_array(slice)
 }
 
+pub(crate) fn heap_array_from_fn<T, const N: usize>(make: impl FnMut(usize) -> T) -> Box<[T; N]> {
+    let slice = (0..N).map(make).collect::<Vec<_>>().into_boxed_slice();
+    boxed_slice_to_array(slice)
+}
+
 fn boxed_slice_to_array<T, const N: usize>(slice: Box<[T]>) -> Box<[T; N]> {
     match slice.try_into() {
         Ok(array) => array,
@@ -56,6 +61,17 @@ impl<T: Clone, const ROWS: usize, const COLS: usize> HeapMatrix<T, ROWS, COLS> {
     pub(crate) fn new(value: T) -> Self {
         Self {
             data: vec![value; ROWS * COLS].into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn from_rows(rows: &[[T; COLS]; ROWS]) -> Self {
+        Self {
+            data: rows
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 }

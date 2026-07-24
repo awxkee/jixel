@@ -1399,6 +1399,22 @@ impl DequantMatrices {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dequant_matrices_are_only_heap_handles() {
+        assert!(std::mem::size_of::<DequantMatrices>() <= 256);
+    }
+
+    #[test]
+    fn dequant_matrices_construct_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("small-stack-dequant-test".into())
+            .stack_size(64 * 1024)
+            .spawn(|| drop(DequantMatrices::compute(false)))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// JPEG XL default DCT8 (table 0) quant-weight parameters (libjxl
     /// DequantMatricesLibraryDef::DCT, 6 distance bands). `DEQUANT_MATRIX_8X8`
     /// is this table precomputed; the bands are needed to signal a scaled
