@@ -28,7 +28,6 @@
  */
 mod ac_strategy;
 mod adaptive_quant;
-mod dct;
 mod lossless_grad;
 mod quant;
 mod xyb;
