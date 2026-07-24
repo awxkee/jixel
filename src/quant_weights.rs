@@ -29,6 +29,7 @@
 #![allow(clippy::excessive_precision)]
 
 use crate::dct::fmla;
+use crate::util::{HeapMatrix, heap_array_from_fn};
 
 /// IEEE 754 binary16 conversion (round-to-nearest-even), matching libjxl's
 /// F16Coder wire format for signaled dequant-matrix parameters.
@@ -773,42 +774,42 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
 ];
 
 pub(crate) struct DequantMatrices {
-    pub(crate) matrix: [[f32; 64]; 3],
+    pub(crate) matrix: HeapMatrix<f32, 3, 64>,
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT.
-    pub(crate) inv_matrix: [[f32; 64]; 3],
+    pub(crate) inv_matrix: HeapMatrix<f32, 3, 64>,
     /// 16×8 / 8×16 dequant matrix. Both rectangular transforms share these
     /// 128 floats per channel (libjxl-tiny convention).
-    pub(crate) matrix_16x8: [[f32; 128]; 3],
-    pub(crate) inv_matrix_16x8: [[f32; 128]; 3],
+    pub(crate) matrix_16x8: HeapMatrix<f32, 3, 128>,
+    pub(crate) inv_matrix_16x8: HeapMatrix<f32, 3, 128>,
     /// 16×16 dequant matrix (256 floats per channel). Generated at
     /// construction time from the libjxl polynomial parameters since it isn't
     /// part of libjxl-tiny.
-    pub(crate) matrix_16x16: [[f32; 256]; 3],
-    pub(crate) inv_matrix_16x16: [[f32; 256]; 3],
+    pub(crate) matrix_16x16: HeapMatrix<f32, 3, 256>,
+    pub(crate) inv_matrix_16x16: HeapMatrix<f32, 3, 256>,
     /// 32×32 dequant matrix (1024 floats per channel). Generated at
     /// construction time from the libjxl DCT32X32 polynomial parameters.
-    pub(crate) matrix_32x32: Box<[[f32; 1024]; 3]>,
-    pub(crate) inv_matrix_32x32: Box<[[f32; 1024]; 3]>,
+    pub(crate) matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    pub(crate) inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
     /// Tables that differ from the spec defaults and must be signaled by
     /// `write_dequant_matrices`, in the fixed order
     /// [DCT8, DCT16X16, DCT32X32].
-    pub(crate) custom_tables: [Option<BandOverride>; 3],
+    pub(crate) custom_tables: Box<[Option<BandOverride>; 3]>,
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
-    pub(crate) matrix_4x4: [[f32; 64]; 3],
-    pub(crate) inv_matrix_4x4: [[f32; 64]; 3],
+    pub(crate) matrix_4x4: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
     /// DCT4X8 dequant matrix (64 floats per channel). 4×8 radial weights with
     /// each row replicated to 2 rows of the 8×8 grid. Used for DCT4X8.
-    pub(crate) matrix_4x8: [[f32; 64]; 3],
-    pub(crate) inv_matrix_4x8: [[f32; 64]; 3],
+    pub(crate) matrix_4x8: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
     /// DCT32X16 / DCT16X32 dequant matrix (512 floats per channel). Both
     /// rectangular large transforms share these weights (libjxl
     /// `QuantTable::DCT16X32`), computed at the normalized 16-row × 32-col
     /// resolution so the same table applies to both orientations.
-    pub(crate) matrix_32x16: Box<[[f32; 512]; 3]>,
-    pub(crate) inv_matrix_32x16: Box<[[f32; 512]; 3]>,
+    pub(crate) matrix_32x16: HeapMatrix<f32, 3, 512>,
+    pub(crate) inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance

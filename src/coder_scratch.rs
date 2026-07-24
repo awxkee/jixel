@@ -33,25 +33,26 @@ use crate::enc_lossless::{GradientScratch, LzToken, PickThresholdScratch};
 use crate::entropy::{
     CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig, PrefixCode,
 };
+use crate::util::{HeapMatrix, heap_array};
 
 const LZ77_CANDIDATE_CAPACITY: usize = 1 << 19;
 pub(crate) const LZ77_MAX_CONTEXTS: usize = 221;
 
 pub(crate) struct LzEntropyScratch {
-    pub(crate) histograms: [Histogram; LZ77_MAX_CONTEXTS],
-    pub(crate) prefix_codes: [PrefixCode; LZ77_MAX_CONTEXTS],
-    pub(crate) context_map: [u8; LZ77_MAX_CONTEXTS],
-    pub(crate) configs: [HybridUintConfig; CLUSTERS_LIMIT],
+    pub(crate) histograms: Box<[Histogram; LZ77_MAX_CONTEXTS]>,
+    pub(crate) prefix_codes: Box<[PrefixCode; LZ77_MAX_CONTEXTS]>,
+    pub(crate) context_map: Box<[u8; LZ77_MAX_CONTEXTS]>,
+    pub(crate) configs: Box<[HybridUintConfig; CLUSTERS_LIMIT]>,
     pub(crate) clustering: FixedClusterScratch<LZ77_MAX_CONTEXTS>,
 }
 
 impl Default for LzEntropyScratch {
     fn default() -> Self {
         Self {
-            histograms: std::array::from_fn(|_| Histogram::new()),
-            prefix_codes: [PrefixCode::zero(); LZ77_MAX_CONTEXTS],
-            context_map: [0; LZ77_MAX_CONTEXTS],
-            configs: [HybridUintConfig::DEFAULT; CLUSTERS_LIMIT],
+            histograms: heap_array(Histogram::new()),
+            prefix_codes: heap_array(PrefixCode::zero()),
+            context_map: heap_array(0),
+            configs: heap_array(HybridUintConfig::DEFAULT),
             clustering: FixedClusterScratch::default(),
         }
     }
@@ -69,12 +70,12 @@ pub(crate) struct CoderScratch {
     pub(crate) lz_depth: Vec<u32>,
     pub(crate) lz_candidate: Vec<LzToken>,
     pub(crate) lz_entropy: LzEntropyScratch,
-    pub(crate) recon: [[f32; 1024]; 8],
+    pub(crate) recon: HeapMatrix<f32, 8, 1024>,
     pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) ac_group: AcGroupScratch,
-    pub(crate) transform_gather: [f32; 1024],
-    pub(crate) strategy_coeffs: [[f32; 1024]; 3],
+    pub(crate) transform_gather: Box<[f32; 1024]>,
+    pub(crate) strategy_coeffs: HeapMatrix<f32, 3, 1024>,
     pub(crate) gradient: GradientScratch,
     pub(crate) order0_entropy: Vec<u64>,
     pub(crate) threshold: PickThresholdScratch,
@@ -92,12 +93,12 @@ impl Default for CoderScratch {
             lz_depth: vec![u32::MAX; 1 << 20],
             lz_candidate: Vec::with_capacity(LZ77_CANDIDATE_CAPACITY),
             lz_entropy: LzEntropyScratch::default(),
-            recon: [[0.0; 1024]; 8],
+            recon: HeapMatrix::new(0.0),
             dark_octile: vec![0.0; 32 * 32],
             huffman_pool: Vec::with_capacity(1024),
             ac_group: AcGroupScratch::default(),
-            transform_gather: [0.0; 1024],
-            strategy_coeffs: [[0.0; 1024]; 3],
+            transform_gather: heap_array(0.0),
+            strategy_coeffs: HeapMatrix::new(0.0),
             gradient: GradientScratch {
                 cur: vec![0; 256],
                 prev: vec![0; 256],
@@ -108,5 +109,30 @@ impl Default for CoderScratch {
                 hist_scratch: vec![0; 3 * 1025],
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoderScratch, LzEntropyScratch};
+    use crate::enc_group::AcGroupScratch;
+    use std::mem::size_of;
+
+    #[test]
+    fn scratch_structs_are_only_small_heap_handles() {
+        assert!(size_of::<CoderScratch>() <= 1024);
+        assert!(size_of::<LzEntropyScratch>() <= 128);
+        assert!(size_of::<AcGroupScratch>() <= 128);
+    }
+
+    #[test]
+    fn coder_scratch_constructs_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("small-stack-scratch-test".into())
+            .stack_size(64 * 1024)
+            .spawn(|| drop(CoderScratch::default()))
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

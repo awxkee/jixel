@@ -29,6 +29,56 @@
 use crate::ColorSpace;
 use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
+
+/// Allocate a fixed-size array through `Vec` so the full array is initialized
+/// in its final heap storage instead of as a temporary stack value.
+pub(crate) fn heap_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
+    let slice = vec![value; N].into_boxed_slice();
+    boxed_slice_to_array(slice)
+}
+
+fn boxed_slice_to_array<T, const N: usize>(slice: Box<[T]>) -> Box<[T; N]> {
+    match slice.try_into() {
+        Ok(array) => array,
+        Err(_) => unreachable!("boxed slice length is the requested array length"),
+    }
+}
+
+/// A fixed-size two-dimensional array whose elements are initialized directly
+/// in one flat heap allocation.
+#[derive(Clone)]
+pub(crate) struct HeapMatrix<T, const ROWS: usize, const COLS: usize> {
+    data: Box<[T]>,
+}
+
+impl<T: Clone, const ROWS: usize, const COLS: usize> HeapMatrix<T, ROWS, COLS> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            data: vec![value; ROWS * COLS].into_boxed_slice(),
+        }
+    }
+}
+
+impl<T, const ROWS: usize, const COLS: usize> Deref for HeapMatrix<T, ROWS, COLS> {
+    type Target = [[T; COLS]; ROWS];
+
+    fn deref(&self) -> &Self::Target {
+        let (rows, remainder) = self.data.as_chunks::<COLS>();
+        debug_assert!(remainder.is_empty());
+        rows.try_into()
+            .unwrap_or_else(|_| unreachable!("heap matrix has its declared dimensions"))
+    }
+}
+
+impl<T, const ROWS: usize, const COLS: usize> DerefMut for HeapMatrix<T, ROWS, COLS> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let (rows, remainder) = self.data.as_chunks_mut::<COLS>();
+        debug_assert!(remainder.is_empty());
+        rows.try_into()
+            .unwrap_or_else(|_| unreachable!("heap matrix has its declared dimensions"))
+    }
+}
 
 /// Errors that can occur during JXL encoding.
 #[derive(Debug, Clone, PartialEq)]
