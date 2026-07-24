@@ -34,7 +34,6 @@ use crate::dc_group_data::{
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
     STRATEGY_DCT32X32,
 };
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
 use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
