@@ -57,6 +57,11 @@ fn use_dct8_only(distance: f32) -> bool {
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 
+const RERANK_LAMBDA_LO: f32 = 0.25;
+const RERANK_LAMBDA_HI: f32 = 10.0;
+const RERANK_LAMBDA_D0: f32 = 1.0;
+const RERANK_LAMBDA_D1: f32 = 4.0;
+
 const BIAS_RECT: f32 = 1.0;
 const BIAS_16X16: f32 = 1.0;
 const BIAS_32X32: f32 = 1.0;
@@ -485,7 +490,9 @@ fn strategy_cost_impl(
     let lam = match distortion_model {
         DistortionModel::Coefficient => RD_LAMBDA,
         DistortionModel::Reconstruction => {
-            let multiplier = 0.1 + (distance - 1.0).clamp(0.0, 2.0) / 2.0 * (3.0 - 0.1);
+            const RECIP_RERANKING: f32 = 1. / (RERANK_LAMBDA_D1 - RERANK_LAMBDA_D0);
+            let ramp = ((distance - RERANK_LAMBDA_D0) * RECIP_RERANKING).clamp(0.0, 1.0);
+            let multiplier = fmla(ramp, RERANK_LAMBDA_HI - RERANK_LAMBDA_LO, RERANK_LAMBDA_LO);
             RD_LAMBDA * multiplier
         }
     };
