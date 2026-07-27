@@ -39,8 +39,8 @@ use crate::dc_group_data::{
     STRATEGY_DCT32X32,
 };
 use crate::dct::{
-    dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32, dc_from_dct32x16,
-    dc_from_dct32x32, fmla,
+    DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32,
+    dc_from_dct32x16, dc_from_dct32x32, fmla,
 };
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
@@ -586,7 +586,6 @@ fn quantize_roundtrip_y_block(
 pub(crate) struct AcGroupScratch {
     coeffs: HeapMatrix<f32, 3, 4096>,
     quantized: HeapMatrix<i32, 3, 4096>,
-    tmp: Box<[f32; 4096]>,
     source_y: Box<[f32; 4096]>,
     block: Box<[i32; 4096]>,
     rdoq_choices: Box<[u8; RDOQ_MAX_CHOICES]>,
@@ -598,7 +597,6 @@ impl Default for AcGroupScratch {
         Self {
             coeffs: HeapMatrix::new(0.0),
             quantized: HeapMatrix::new(0),
-            tmp: heap_array(0.0),
             source_y: heap_array(0.0),
             block: heap_array(0),
             rdoq_choices: heap_array(u8::MAX),
@@ -652,7 +650,6 @@ pub(crate) fn write_ac_group(
     let AcGroupScratch {
         coeffs,
         quantized,
-        tmp,
         source_y,
         block: pblock,
         rdoq_choices,
@@ -689,101 +686,48 @@ pub(crate) fn write_ac_group(
             let opsin_by = by * 8;
             for c in 0..3 {
                 let plane = opsin.plane(c);
+                let stride = plane.xsize();
+                let input = &opsin.plane_data(c)[opsin_by * stride + opsin_bx..];
                 match raw_strategy {
                     STRATEGY_DCT => {
-                        for yy in 0..8 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
-                        }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
-                        let tmp_64 = tmp.as_chunks::<64>().0;
-                        (ctx.dct8x8)(&tmp_64[0], dst);
+                        (ctx.dct8x8)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT16X8 => {
-                        for yy in 0..16 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
-                        }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
-                        let tmp_128 = tmp.as_chunks::<128>().0;
-                        (ctx.dct16x8)(&tmp_128[0], dst);
+                        (ctx.dct16x8)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT8X16 => {
-                        for yy in 0..8 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 16..yy * 16 + 16]
-                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
-                        }
                         let dst: &mut [f32; 128] = (&mut coeffs[c][..128]).try_into().unwrap();
-                        let tmp_128 = tmp.as_chunks::<128>().0;
-                        (ctx.dct8x16)(&tmp_128[0], dst);
+                        (ctx.dct8x16)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT16X16 => {
-                        for yy in 0..16 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 16..yy * 16 + 16]
-                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
-                        }
                         let dst: &mut [f32; 256] = (&mut coeffs[c][..256]).try_into().unwrap();
-                        let tmp_256 = tmp.as_chunks::<256>().0;
-                        (ctx.dct16x16)(&tmp_256[0], dst);
+                        (ctx.dct16x16)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT32X32 => {
-                        for yy in 0..32 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 32..yy * 32 + 32]
-                                .copy_from_slice(&row[opsin_bx..opsin_bx + 32]);
-                        }
                         let dst: &mut [f32; 1024] = (&mut coeffs[c][..1024]).try_into().unwrap();
-                        let tmp_1024 = tmp.as_chunks::<1024>().0;
-                        (ctx.dct32x32)(&tmp_1024[0], dst);
+                        (ctx.dct32x32)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT4X4 => {
-                        for yy in 0..8 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
-                        }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
-                        let tmp_64 = tmp.as_chunks::<64>().0;
-                        (ctx.dct4x4)(&tmp_64[0], dst);
+                        (ctx.dct4x4)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT4X8 => {
-                        for yy in 0..8 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
-                        }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
-                        let tmp_64 = tmp.as_chunks::<64>().0;
-                        (ctx.dct4x8)(&tmp_64[0], dst);
+                        (ctx.dct4x8)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT8X4 => {
-                        for yy in 0..8 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[opsin_bx..opsin_bx + 8]);
-                        }
                         let dst: &mut [f32; 64] = (&mut coeffs[c][..64]).try_into().unwrap();
-                        let tmp_64 = tmp.as_chunks::<64>().0;
-                        (ctx.dct8x4)(&tmp_64[0], dst);
+                        (ctx.dct8x4)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT32X16 => {
-                        for yy in 0..32 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 16..yy * 16 + 16]
-                                .copy_from_slice(&row[opsin_bx..opsin_bx + 16]);
-                        }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
-                        let tmp_512 = tmp.as_chunks::<512>().0;
-                        (ctx.dct32x16)(&tmp_512[0], dst);
+                        (ctx.dct32x16)(DctInput::new(input, stride), dst);
                     }
                     STRATEGY_DCT16X32 => {
-                        for yy in 0..16 {
-                            let row = plane.row(opsin_by + yy);
-                            tmp[yy * 32..yy * 32 + 32]
-                                .copy_from_slice(&row[opsin_bx..opsin_bx + 32]);
-                        }
                         let dst: &mut [f32; 512] = (&mut coeffs[c][..512]).try_into().unwrap();
-                        let tmp_512 = tmp.as_chunks::<512>().0;
-                        (ctx.dct16x32)(&tmp_512[0], dst);
+                        (ctx.dct16x32)(DctInput::new(input, stride), dst);
                     }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }

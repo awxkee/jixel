@@ -33,6 +33,7 @@ use crate::dc_group_data::{
     STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
 };
+use crate::dct::DctInput;
 use crate::image::{Image3F, Plane};
 use crate::util::FastRound;
 use std::sync::OnceLock;
@@ -344,9 +345,9 @@ pub(crate) fn forward_matrix(strategy: u8) -> &'static [f32] {
 }
 
 macro_rules! idct_simd_or_scalar {
-    ($name:ident, $n:literal, $avx:path, $neon:path, $scalar:path) => {
+    ($name:ident, $n:literal, $w:literal, $h:literal, $avx:path, $neon:path, $scalar:path) => {
         #[inline]
-        fn $name(c: &[f32; $n], o: &mut [f32; $n]) {
+        fn $name(c: DctInput<'_, $w, $h>, o: &mut [f32; $n]) {
             #[cfg(all(target_arch = "x86_64", feature = "avx"))]
             if std::is_x86_feature_detected!("avx2") {
                 unsafe { $avx(c, o) };
@@ -366,6 +367,8 @@ macro_rules! idct_simd_or_scalar {
 idct_simd_or_scalar!(
     idct8x8,
     64,
+    8,
+    8,
     crate::avx::inv_dct8x8_avx2,
     crate::neon::inv_dct8x8_neon,
     crate::dct::inv_dct8x8
@@ -373,6 +376,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct8x16,
     128,
+    16,
+    8,
     crate::avx::inv_dct8x16_avx2,
     crate::neon::inv_dct8x16_neon,
     crate::dct::inv_dct8x16
@@ -380,6 +385,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct16x8,
     128,
+    16,
+    8,
     crate::avx::inv_dct16x8_avx2,
     crate::neon::inv_dct16x8_neon,
     crate::dct::inv_dct16x8
@@ -387,6 +394,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct16x16,
     256,
+    16,
+    16,
     crate::avx::inv_dct16x16_avx2,
     crate::neon::inv_dct16x16_neon,
     crate::dct::inv_dct16x16
@@ -394,6 +403,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct16x32,
     512,
+    32,
+    16,
     crate::avx::inv_dct16x32_avx2,
     crate::neon::inv_dct16x32_neon,
     crate::dct::inv_dct16x32
@@ -401,6 +412,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct32x16,
     512,
+    32,
+    16,
     crate::avx::inv_dct32x16_avx2,
     crate::neon::inv_dct32x16_neon,
     crate::dct::inv_dct32x16
@@ -408,6 +421,8 @@ idct_simd_or_scalar!(
 idct_simd_or_scalar!(
     idct32x32,
     1024,
+    32,
+    32,
     crate::avx::inv_dct32x32_avx2,
     crate::neon::inv_dct32x32_neon,
     crate::dct::inv_dct32x32
@@ -415,21 +430,21 @@ idct_simd_or_scalar!(
 
 pub(crate) fn reconstruct_error(strategy: u8, coeff_err: &[f32], err_out: &mut [f32]) {
     macro_rules! inverse {
-        ($f:path, $n:literal) => {
+        ($f:path, $n:literal, $w:literal, $h:literal) => {
             $f(
-                coeff_err[..$n].try_into().unwrap(),
+                DctInput::<$w, $h>::new(coeff_err, $w),
                 (&mut err_out[..$n]).try_into().unwrap(),
             )
         };
     }
     match strategy {
-        STRATEGY_DCT => inverse!(idct8x8, 64),
-        STRATEGY_DCT8X16 => inverse!(idct8x16, 128),
-        STRATEGY_DCT16X8 => inverse!(idct16x8, 128),
-        STRATEGY_DCT16X16 => inverse!(idct16x16, 256),
-        STRATEGY_DCT16X32 => inverse!(idct16x32, 512),
-        STRATEGY_DCT32X16 => inverse!(idct32x16, 512),
-        STRATEGY_DCT32X32 => inverse!(idct32x32, 1024),
+        STRATEGY_DCT => inverse!(idct8x8, 64, 8, 8),
+        STRATEGY_DCT8X16 => inverse!(idct8x16, 128, 16, 8),
+        STRATEGY_DCT16X8 => inverse!(idct16x8, 128, 16, 8),
+        STRATEGY_DCT16X16 => inverse!(idct16x16, 256, 16, 16),
+        STRATEGY_DCT16X32 => inverse!(idct16x32, 512, 32, 16),
+        STRATEGY_DCT32X16 => inverse!(idct32x16, 512, 32, 16),
+        STRATEGY_DCT32X32 => inverse!(idct32x32, 1024, 32, 32),
         _ => {
             let n = strategy_pixel_count(strategy);
             let matrix = forward_matrix(strategy);

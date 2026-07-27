@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::fmla;
+use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageSB};
 use crate::util::FastRound;
@@ -141,7 +141,6 @@ fn compute_cmap_tile(
     let mut block_y = [0.0f32; 64];
     let mut block_x = [0.0f32; 64];
     let mut block_b = [0.0f32; 64];
-    let mut tmp = [0.0f32; 64];
 
     let mut ca_x = 0.0f32;
     let mut cb_x = 0.0f32;
@@ -156,24 +155,20 @@ fn compute_cmap_tile(
             if px + K_BLOCK_DIM > opsin.xsize() || py + K_BLOCK_DIM > opsin.ysize() {
                 continue;
             }
-            // DCT Y.
-            for yy in 0..8 {
-                let row = opsin.plane_row(1, py + yy);
-                tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
-            }
-            (ctx.dct8x8)(&tmp, &mut block_y);
-            // DCT X.
-            for yy in 0..8 {
-                let row = opsin.plane_row(0, py + yy);
-                tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
-            }
-            (ctx.dct8x8)(&tmp, &mut block_x);
-            // DCT B.
-            for yy in 0..8 {
-                let row = opsin.plane_row(2, py + yy);
-                tmp[yy * 8..yy * 8 + 8].copy_from_slice(&row[px..px + 8]);
-            }
-            (ctx.dct8x8)(&tmp, &mut block_b);
+            let stride = opsin.xsize();
+            let offset = py * stride + px;
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(1)[offset..], stride),
+                &mut block_y,
+            );
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(0)[offset..], stride),
+                &mut block_x,
+            );
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(2)[offset..], stride),
+                &mut block_b,
+            );
 
             // Zero DC (LF position) — libjxl-tiny zeros it so it doesn't affect
             // the regression; the per-tile AC factor controls AC only.

@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dct::{INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
+use crate::dct::{DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
 use std::arch::x86_64::*;
 
 #[inline]
@@ -87,8 +87,8 @@ fn transpose_8x8(c: &mut [__m256; 8]) {
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn load(input: &[f32; 64]) -> [__m256; 8] {
-    unsafe { std::array::from_fn(|i| _mm256_loadu_ps(input[i * 8..].as_ptr())) }
+fn load(input: DctInput<'_, 8, 8>) -> [__m256; 8] {
+    unsafe { std::array::from_fn(|i| _mm256_loadu_ps(input.row(i).as_ptr())) }
 }
 
 #[inline]
@@ -141,7 +141,7 @@ fn dct1d_8_flat(c: &mut [__m256; 8]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct8x8_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut rows = load(input);
 
     dct1d_8_flat(&mut rows);
@@ -211,11 +211,11 @@ fn dct1d_16_flat(c: &mut [__m256; 16]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct8x16_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
+pub(crate) fn dct8x16_avx2(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) {
     let mut rows_lo: [__m256; 8] =
-        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input[k * 16..].as_ptr()) });
+        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input.row(k).as_ptr()) });
     let mut rows_hi: [__m256; 8] =
-        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input[k * 16 + 8..].as_ptr()) });
+        std::array::from_fn(|k| unsafe { _mm256_loadu_ps(input.row(k)[8..].as_ptr()) });
 
     transpose_8x8(&mut rows_lo);
     transpose_8x8(&mut rows_hi);
@@ -243,9 +243,9 @@ pub(crate) fn dct8x16_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
+pub(crate) fn dct16x8_avx2(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) {
     let mut c: [__m256; 16] =
-        std::array::from_fn(|v| unsafe { _mm256_loadu_ps(input[v * 8..].as_ptr()) });
+        std::array::from_fn(|v| unsafe { _mm256_loadu_ps(input.row(v).as_ptr()) });
 
     dct1d_16_flat(&mut c);
 
@@ -267,13 +267,13 @@ pub(crate) fn dct16x8_avx2(input: &[f32; 128], output: &mut [f32; 128]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct16x16_avx2(input: &[f32; 256], output: &mut [f32; 256]) {
+pub(crate) fn dct16x16_avx2(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]) {
     // Two 8-col strips per pass through a column-major scratch keeps the live set
     // near 16 YMM instead of materializing all 32; row pass reloads contiguously.
     let mut scratch = [0.0f32; 256];
     for g in 0..2 {
         let mut c: [__m256; 16] =
-            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) });
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[g * 8..].as_ptr()) });
         dct1d_16_flat(&mut c);
         for t in 0..2 {
             let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
@@ -325,13 +325,13 @@ fn dct1d_32_flat(c: &mut [__m256; 32]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct32x32_avx2(input: &[f32; 1024], output: &mut [f32; 1024]) {
+pub(crate) fn dct32x32_avx2(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) {
     // Column pass writes a transposed scratch (`[col*32 + vfreq]`) so the row pass
     // reloads contiguously instead of gathering 8 scalars per vector.
     let mut colt = [0.0f32; 1024];
     for g in 0..4 {
         let mut c: [__m256; 32] =
-            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 32 + g * 8..].as_ptr()) });
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[g * 8..].as_ptr()) });
         dct1d_32_flat(&mut c);
         for t in 0..4 {
             let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
@@ -489,12 +489,12 @@ macro_rules! horizontal_idct_pass_avx2 {
 macro_rules! inv_dct_natural_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
         #[target_feature(enable = "avx2")]
-        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+        pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
             let mut tmp = [0.0f32; $n];
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
                 let mut c: [__m256; $h] = std::array::from_fn(|v| unsafe {
-                    _mm256_mul_ps(_mm256_loadu_ps(coeff.as_ptr().add(v * $w + u8)), scale)
+                    _mm256_mul_ps(_mm256_loadu_ps(coeff.row(v)[u8..].as_ptr()), scale)
                 });
                 $inv_v(&mut c);
                 for y in 0..$h {
@@ -509,14 +509,14 @@ macro_rules! inv_dct_natural_avx2 {
 macro_rules! inv_dct_transposed_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
         #[target_feature(enable = "avx2")]
-        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+        pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
             let mut tmp = [0.0f32; $n];
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
                 let mut c = [_mm256_undefined_ps(); $h];
                 for v8 in (0..$h).step_by(8) {
                     let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
-                        _mm256_loadu_ps(coeff.as_ptr().add((u8 + j) * $h + v8))
+                        _mm256_loadu_ps(coeff.row(u8 + j)[v8..].as_ptr())
                     });
                     transpose_8x8(&mut tile);
                     for (j, v) in tile.iter().enumerate() {
@@ -610,16 +610,16 @@ fn dct1d_4_m128(c: &mut [__m128; 4]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct4x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct4x4_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     // Gather q[r*4+c].lane[k] = input[(qy*4+r)*8 + (qx*4+c)], k = qy*2+qx.
     let mut q = [_mm_undefined_ps(); 16];
     for r in 0..4 {
         for col in 0..4 {
             q[r * 4 + col] = _mm_set_ps(
-                input[(4 + r) * 8 + (4 + col)], // k=3 (qy1,qx1)
-                input[(4 + r) * 8 + col],       // k=2 (qy1,qx0)
-                input[r * 8 + (4 + col)],       // k=1 (qy0,qx1)
-                input[r * 8 + col],             // k=0 (qy0,qx0)
+                input.row(4 + r)[4 + col], // k=3 (qy1,qx1)
+                input.row(4 + r)[col],     // k=2 (qy1,qx0)
+                input.row(r)[4 + col],     // k=1 (qy0,qx1)
+                input.row(r)[col],         // k=0 (qy0,qx0)
             );
         }
     }
@@ -686,7 +686,7 @@ fn dct1d_4_flat(c: &mut [__m256; 4]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct4x8_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct4x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let rows = load(input);
     let mut top: [__m256; 4] = [rows[0], rows[1], rows[2], rows[3]];
     let mut bot: [__m256; 4] = [rows[4], rows[5], rows[6], rows[7]];
@@ -721,7 +721,7 @@ pub(crate) fn dct4x8_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct8x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct8x4_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut rows = load(input);
     dct1d_8_flat(&mut rows);
     transpose_8x8(&mut rows); // rows[col].lane[vf]
@@ -752,13 +752,13 @@ pub(crate) fn dct8x4_avx2(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct32x16_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
+pub(crate) fn dct32x16_avx2(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     // Column pass, then transpose each vfreq tile so the row pass loads
     // contiguously instead of gathering 8 scalars per vector.
     let mut cols = [[_mm256_undefined_ps(); 16]; 4];
     for g in 0..2 {
         let mut c: [__m256; 32] =
-            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input[r * 16 + g * 8..].as_ptr()) });
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[g * 8..].as_ptr()) });
         dct1d_32_flat(&mut c);
         for t in 0..4 {
             let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
@@ -781,7 +781,7 @@ pub(crate) fn dct32x16_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn dct16x32_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
+pub(crate) fn dct16x32_avx2(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]) {
     // Row pass (32-pt) over 8-row strips into hfreq-major scratch, then column
     // pass (16-pt); both use transposed contiguous loads instead of scalar gathers.
     let mut scratch = [0.0f32; 512];
@@ -789,7 +789,7 @@ pub(crate) fn dct16x32_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
         let mut c = [_mm256_undefined_ps(); 32];
         for ct in 0..4 {
             let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
-                _mm256_loadu_ps(input[(g * 8 + j) * 32 + ct * 8..].as_ptr())
+                _mm256_loadu_ps(input.row(g * 8 + j)[ct * 8..].as_ptr())
             });
             transpose_8x8(&mut tile);
             c[ct * 8..ct * 8 + 8].copy_from_slice(&tile);
@@ -823,6 +823,8 @@ pub(crate) fn dct16x32_avx2(input: &[f32; 512], output: &mut [f32; 512]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::dct::DctInput;
+
     const ATOL: f32 = 1e-4;
 
     fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
@@ -864,9 +866,9 @@ mod tests {
         buf
     }
 
-    fn assert_inverse_matches_scalar<const N: usize>(
-        scalar: fn(&[f32; N], &mut [f32; N]),
-        avx2: unsafe fn(&[f32; N], &mut [f32; N]),
+    fn assert_inverse_matches_scalar<const N: usize, const W: usize, const H: usize>(
+        scalar: for<'a> fn(DctInput<'a, W, H>, &mut [f32; N]),
+        avx2: for<'a> unsafe fn(DctInput<'a, W, H>, &mut [f32; N]),
         label: &str,
     ) {
         if !is_x86_feature_detected!("avx2") {
@@ -892,8 +894,13 @@ mod tests {
         for (case, input) in cases.iter().enumerate() {
             let mut got = [0.0f32; N];
             let mut want = [0.0f32; N];
-            unsafe { avx2(input, &mut got) };
-            scalar(input, &mut want);
+            let stride = W + 3;
+            let mut strided = vec![f32::NAN; H * stride];
+            for y in 0..H {
+                strided[y * stride..y * stride + W].copy_from_slice(&input[y * W..y * W + W]);
+            }
+            unsafe { avx2(DctInput::new(&strided, stride), &mut got) };
+            scalar(DctInput::from_flat(input), &mut want);
             assert_close(&got, &want, &format!("{label} case={case}"));
         }
     }
@@ -909,7 +916,7 @@ mod tests {
             let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_avx2(&input, &mut got) };
+            unsafe { dct16x16_avx2(DctInput::from_flat(&input), &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
         }
@@ -926,7 +933,7 @@ mod tests {
             let input: [f32; 1024] = fill(seed.wrapping_add(0x3232));
             let mut got = [0.0f32; 1024];
             let mut want = [0.0f32; 1024];
-            unsafe { dct32x32_avx2(&input, &mut got) };
+            unsafe { dct32x32_avx2(DctInput::from_flat(&input), &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
         }
@@ -943,7 +950,7 @@ mod tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct32x16_avx2(&input, &mut got) };
+            unsafe { dct32x16_avx2(DctInput::from_flat(&input), &mut got) };
             dct32x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
         }
@@ -960,7 +967,7 @@ mod tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct16x32_avx2(&input, &mut got) };
+            unsafe { dct16x32_avx2(DctInput::from_flat(&input), &mut got) };
             dct16x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
@@ -977,7 +984,7 @@ mod tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x4_avx2(&input, &mut got) };
+            unsafe { dct4x4_avx2(DctInput::from_flat(&input), &mut got) };
             dct4x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
         }
@@ -994,7 +1001,7 @@ mod tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x8_avx2(&input, &mut got) };
+            unsafe { dct4x8_avx2(DctInput::from_flat(&input), &mut got) };
             dct4x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
         }
@@ -1011,7 +1018,7 @@ mod tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x4_avx2(&input, &mut got) };
+            unsafe { dct8x4_avx2(DctInput::from_flat(&input), &mut got) };
             dct8x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
@@ -1027,7 +1034,7 @@ mod tests {
         let input = [0.5f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_avx2(&input, &mut got) };
+        unsafe { dct16x16_avx2(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 dc-only");
     }
@@ -1042,7 +1049,7 @@ mod tests {
         let input = [0.0f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_avx2(&input, &mut got) };
+        unsafe { dct16x16_avx2(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 zero");
     }
@@ -1059,7 +1066,7 @@ mod tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_avx2(&input, &mut got) };
+            unsafe { dct16x16_avx2(DctInput::from_flat(&input), &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
         }
@@ -1081,9 +1088,9 @@ mod tests {
         let mut db = [0.0f32; 256];
         let mut dsum = [0.0f32; 256];
         unsafe {
-            dct16x16_avx2(&a, &mut da);
-            dct16x16_avx2(&b, &mut db);
-            dct16x16_avx2(&sum, &mut dsum);
+            dct16x16_avx2(DctInput::from_flat(&a), &mut da);
+            dct16x16_avx2(DctInput::from_flat(&b), &mut db);
+            dct16x16_avx2(DctInput::from_flat(&sum), &mut dsum);
         }
         let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x16 linearity");
@@ -1102,7 +1109,7 @@ mod tests {
         }
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_avx2(&input, &mut got) };
+        unsafe { dct16x16_avx2(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
     }

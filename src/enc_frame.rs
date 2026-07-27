@@ -32,6 +32,7 @@ use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, is_sub8_strategy};
+use crate::dct::fmla;
 use crate::enc_group::write_ac_group;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
@@ -104,6 +105,23 @@ struct DistanceParams {
     gab_enabled: bool,
 }
 
+const DC_REFINE_PEAK: f32 = 1.35;
+const DC_REFINE_HOLD: f32 = 3.0;
+const DC_REFINE_RELEASE: f32 = 5.0;
+
+#[inline]
+fn dc_refinement(distance: f32) -> f32 {
+    if distance <= DC_REFINE_HOLD {
+        DC_REFINE_PEAK
+    } else if distance >= DC_REFINE_RELEASE {
+        1.0
+    } else {
+        const RECIP_REFINE: f32 = 1.0 / (DC_REFINE_RELEASE - DC_REFINE_HOLD);
+        let t = (distance - DC_REFINE_HOLD) * RECIP_REFINE;
+        fmla(1.0 - DC_REFINE_PEAK, t, DC_REFINE_PEAK)
+    }
+}
+
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
@@ -112,13 +130,14 @@ fn quant_dc(distance: f32) -> f32 {
     // on photo/fractal/glow/portrait sets: on-or-above the RD curve, up to
     // +1.4 SSIMULACRA2 rate-equivalent, and the quality-vs-d cliff softens
     // by 4-6 SSIMULACRA2 at d=6. No effect at d <= 3.5.
+    let refine = dc_refinement(distance);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
     let effective = k_dc_mul * (distance / k_dc_mul).powf(k_dc_quant_pow);
     let effective = f32::clamp(effective, 0.5 * distance, distance);
-    (k_dc_quant / effective).min(50.0)
+    (k_dc_quant / effective).min(50.0) * refine
 }
 
 fn compute_distance_params(distance: f32) -> DistanceParams {
@@ -150,8 +169,9 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     if distance < 0.299 {
         x_qm_scale += 1;
     }
+    static EPF_THRESHOLDS: [f32; 2] = [0.7, 1.5];
     let mut epf_iters: u32 = 0;
-    for t in [0.7f32, 1.5, 4.0] {
+    for t in EPF_THRESHOLDS {
         if distance >= t {
             epf_iters += 1;
         }
@@ -1527,7 +1547,60 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_distance_params, quant_dc};
+    use super::{
+        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, compute_distance_params, dc_refinement,
+        quant_dc,
+    };
+
+    #[test]
+    fn dc_refinement_holds_then_ramps_out_monotonically() {
+        // Full refinement through the hold point, none past the release point.
+        for d in [0.1, 0.5, 1.0, 2.0, DC_REFINE_HOLD] {
+            assert_eq!(dc_refinement(d), DC_REFINE_PEAK);
+        }
+        for d in [DC_REFINE_RELEASE, 5.5, 8.0, 25.0] {
+            assert_eq!(dc_refinement(d), 1.0);
+        }
+        // Strictly decreasing across the ramp, and continuous at both ends.
+        let mid = 0.5 * (DC_REFINE_HOLD + DC_REFINE_RELEASE);
+        assert!((dc_refinement(mid) - 0.5 * (DC_REFINE_PEAK + 1.0)).abs() < 1e-6);
+        let mut prev = f32::INFINITY;
+        for i in 0..=40 {
+            let d = DC_REFINE_HOLD + (DC_REFINE_RELEASE - DC_REFINE_HOLD) * (i as f32 / 40.0);
+            let v = dc_refinement(d);
+            assert!(v <= prev, "refinement rose at d={d}");
+            assert!((1.0..=DC_REFINE_PEAK).contains(&v));
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn dc_refinement_makes_dc_finer_where_it_applies() {
+        // Refining means a *larger* DC scale (finer quantization step), and it
+        // must not disturb the AC quantizer, which is signaled independently.
+        for d in [0.5, 1.0, 3.0] {
+            let p = compute_distance_params(d);
+            assert!(p.scale_dc > 0.0);
+            assert!((p.scale_dc - quant_dc(d)).abs() <= 0.5 * p.scale + f32::EPSILON);
+        }
+        assert!(quant_dc(1.0) > quant_dc(1.0) / DC_REFINE_PEAK);
+    }
+
+    #[test]
+    fn epf_never_requests_the_third_iteration() {
+        // The third EPF pass erases texture rather than ringing, so the
+        // schedule tops out at two iterations no matter how coarse the
+        // distance gets. Guards against a threshold creeping back in.
+        for d in [0.0, 0.1, 0.5, 0.69] {
+            assert_eq!(compute_distance_params(d).epf_iters, 0, "d={d}");
+        }
+        for d in [0.7, 1.0, 1.49] {
+            assert_eq!(compute_distance_params(d).epf_iters, 1, "d={d}");
+        }
+        for d in [1.5, 2.0, 4.0, 6.0, 12.0, 25.0] {
+            assert_eq!(compute_distance_params(d).epf_iters, 2, "d={d}");
+        }
+    }
 
     #[test]
     fn ac_scale_keeps_changing_after_dc_distance_caps() {

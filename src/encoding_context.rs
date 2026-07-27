@@ -51,16 +51,16 @@ pub(crate) struct EncodingContext {
     pub(crate) apply_cfl: enc_ac_strategy::ApplyCflFn,
     pub(crate) cfl_regression: enc_color_correlation::CflRegressionFn,
 
-    pub(crate) dct8x8: &'static dct::DctFn<64>,
-    pub(crate) dct8x16: &'static dct::DctFn<128>,
-    pub(crate) dct16x8: &'static dct::DctFn<128>,
-    pub(crate) dct16x16: &'static dct::DctFn<256>,
-    pub(crate) dct4x4: &'static dct::DctFn<64>,
-    pub(crate) dct4x8: &'static dct::DctFn<64>,
-    pub(crate) dct8x4: &'static dct::DctFn<64>,
-    pub(crate) dct32x32: &'static dct::DctFn<1024>,
-    pub(crate) dct32x16: &'static dct::DctFn<512>,
-    pub(crate) dct16x32: &'static dct::DctFn<512>,
+    pub(crate) dct8x8: &'static dct::DctFn<8, 8, 64>,
+    pub(crate) dct8x16: &'static dct::DctFn<16, 8, 128>,
+    pub(crate) dct16x8: &'static dct::DctFn<8, 16, 128>,
+    pub(crate) dct16x16: &'static dct::DctFn<16, 16, 256>,
+    pub(crate) dct4x4: &'static dct::DctFn<8, 8, 64>,
+    pub(crate) dct4x8: &'static dct::DctFn<8, 8, 64>,
+    pub(crate) dct8x4: &'static dct::DctFn<8, 8, 64>,
+    pub(crate) dct32x32: &'static dct::DctFn<32, 32, 1024>,
+    pub(crate) dct32x16: &'static dct::DctFn<16, 32, 512>,
+    pub(crate) dct16x32: &'static dct::DctFn<32, 16, 512>,
 }
 
 impl EncodingContext {

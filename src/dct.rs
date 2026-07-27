@@ -108,11 +108,52 @@ fn dct1d_8(buf: &mut [f32]) {
     }
 }
 
-pub(crate) type DctFn<const N: usize> = dyn Fn(&[f32; N], &mut [f32; N]) + Send + Sync;
+/// Validated zero-copy view of a rectangular transform input.
+///
+/// Private fields guarantee that every row contains `W` readable values, so
+/// scalar and SIMD DCT/IDCT kernels can safely load through an arbitrary stride.
+#[derive(Clone, Copy)]
+pub(crate) struct DctInput<'a, const W: usize, const H: usize> {
+    data: &'a [f32],
+    stride: usize,
+}
 
-static DCT_METHOD: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+impl<'a, const W: usize, const H: usize> DctInput<'a, W, H> {
+    #[inline]
+    pub(crate) fn new(data: &'a [f32], stride: usize) -> Self {
+        assert!(W != 0 && H != 0);
+        assert!(stride >= W);
+        let required_len = (H - 1)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(W))
+            .expect("DCT input dimensions overflow");
+        assert!(data.len() >= required_len);
+        Self {
+            data: &data[..required_len],
+            stride,
+        }
+    }
 
-fn select_dct() -> Arc<DctFn<64>> {
+    #[inline]
+    pub(crate) fn from_flat<const N: usize>(data: &'a [f32; N]) -> Self {
+        assert_eq!(N, W * H);
+        Self::new(data, W)
+    }
+
+    #[inline]
+    pub(crate) fn row(&self, y: usize) -> &'a [f32; W] {
+        assert!(y < H);
+        let offset = y * self.stride;
+        (&self.data[offset..offset + W]).try_into().unwrap()
+    }
+}
+
+pub(crate) type DctFn<const W: usize, const H: usize, const N: usize> =
+    dyn for<'a> Fn(DctInput<'a, W, H>, &mut [f32; N]) + Send + Sync;
+
+static DCT_METHOD: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
+
+fn select_dct() -> Arc<DctFn<8, 8, 64>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -141,29 +182,29 @@ fn select_dct() -> Arc<DctFn<64>> {
     }
 
     Arc::new(|input, output| {
-        dct8x8_scalar(input, output);
+        dct8x8_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct8x8() -> &'static DctFn<64> {
+pub(crate) fn selected_dct8x8() -> &'static DctFn<8, 8, 64> {
     DCT_METHOD.get_or_init(select_dct).as_ref()
 }
 
 #[inline]
 pub(crate) fn dct8x8(input: &[f32; 64], output: &mut [f32; 64]) {
-    selected_dct8x8()(input, output);
+    selected_dct8x8()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct8x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    dct8x8_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct8x8_scalar_input(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut tmp = [0.0f32; 64];
 
-    for (src_row, tmp) in input
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(tmp.as_chunks_mut::<8>().0.iter_mut())
-    {
+    for (y, tmp) in tmp.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let src_row = input.row(y);
         let mut row = [0.0f32; 8];
         for (dst, src) in row.iter_mut().zip(src_row.iter()) {
             *dst = *src;
@@ -274,7 +315,7 @@ pub(crate) fn dct1d_16_oof(src: &[f32; 16], buf: &mut [f32; 16]) {
     }
 }
 
-fn select_dct_8x16() -> Arc<DctFn<128>> {
+fn select_dct_8x16() -> Arc<DctFn<16, 8, 128>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -304,31 +345,31 @@ fn select_dct_8x16() -> Arc<DctFn<128>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct8x16_scalar(input, output);
+        dct8x16_scalar_input(input, output);
     })
 }
 
-static DCT_METHOD_8X16: OnceLock<Arc<DctFn<128>>> = OnceLock::new();
-static DCT_METHOD_16X8: OnceLock<Arc<DctFn<128>>> = OnceLock::new();
+static DCT_METHOD_8X16: OnceLock<Arc<DctFn<16, 8, 128>>> = OnceLock::new();
+static DCT_METHOD_16X8: OnceLock<Arc<DctFn<8, 16, 128>>> = OnceLock::new();
 
 #[inline]
-pub(crate) fn selected_dct8x16() -> &'static DctFn<128> {
+pub(crate) fn selected_dct8x16() -> &'static DctFn<16, 8, 128> {
     DCT_METHOD_8X16.get_or_init(select_dct_8x16).as_ref()
 }
 
 pub(crate) fn dct8x16(input: &[f32; 128], output: &mut [f32; 128]) {
-    selected_dct8x16()(input, output);
+    selected_dct8x16()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct8x16_scalar(input: &[f32], output: &mut [f32; 128]) {
+    let input: &[f32; 128] = input.try_into().unwrap();
+    dct8x16_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct8x16_scalar_input(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) {
     let mut after_row_dct = [0.0f32; 128];
-    for (src, dst) in input
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .zip(after_row_dct.as_chunks_mut::<16>().0.iter_mut())
-    {
-        dct1d_16_oof(src, dst);
+    for (y, dst) in after_row_dct.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+        dct1d_16_oof(input.row(y), dst);
     }
 
     let mut col = [0.0f32; 8];
@@ -345,7 +386,7 @@ pub(crate) fn dct8x16_scalar(input: &[f32], output: &mut [f32; 128]) {
     }
 }
 
-fn select_dct_16x8() -> Arc<DctFn<128>> {
+fn select_dct_16x8() -> Arc<DctFn<8, 16, 128>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -375,25 +416,29 @@ fn select_dct_16x8() -> Arc<DctFn<128>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct16x8_scalar(input, output);
+        dct16x8_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct16x8() -> &'static DctFn<128> {
+pub(crate) fn selected_dct16x8() -> &'static DctFn<8, 16, 128> {
     DCT_METHOD_16X8.get_or_init(select_dct_16x8).as_ref()
 }
 
 pub(crate) fn dct16x8(input: &[f32; 128], output: &mut [f32; 128]) {
-    selected_dct16x8()(input, output);
+    selected_dct16x8()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct16x8_scalar(input: &[f32; 128], output: &mut [f32; 128]) {
+    dct16x8_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct16x8_scalar_input(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) {
     let mut after_col_dct = [0.0f32; 128];
     for u in 0..8 {
         let mut col = [0.0f32; 16];
         for i in 0..16 {
-            col[i] = input[i * 8 + u];
+            col[i] = input.row(i)[u];
         }
         dct1d_16(&mut col);
         for v in 0..16 {
@@ -428,9 +473,9 @@ pub(crate) fn dc_from_dct8x16(coeffs: &[f32; 128], dc: &mut [f32; 2]) {
     dc[1] = s0 - s1;
 }
 
-static DCT_METHOD_16X16: OnceLock<Arc<DctFn<256>>> = OnceLock::new();
+static DCT_METHOD_16X16: OnceLock<Arc<DctFn<16, 16, 256>>> = OnceLock::new();
 
-fn select_dct_16x16() -> Arc<DctFn<256>> {
+fn select_dct_16x16() -> Arc<DctFn<16, 16, 256>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -460,25 +505,29 @@ fn select_dct_16x16() -> Arc<DctFn<256>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct16x16_scalar(input, output);
+        dct16x16_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct16x16() -> &'static DctFn<256> {
+pub(crate) fn selected_dct16x16() -> &'static DctFn<16, 16, 256> {
     DCT_METHOD_16X16.get_or_init(select_dct_16x16).as_ref()
 }
 
 pub(crate) fn dct16x16(input: &[f32; 256], output: &mut [f32; 256]) {
-    selected_dct16x16()(input, output);
+    selected_dct16x16()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct16x16_scalar(input: &[f32; 256], output: &mut [f32; 256]) {
+    dct16x16_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct16x16_scalar_input(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]) {
     let mut after_col_dct = [0.0f32; 256];
     let mut col = [0.0f32; 16];
     for u in 0..16 {
         for i in 0..16 {
-            col[i] = input[i * 16 + u];
+            col[i] = input.row(i)[u];
         }
         dct1d_16(&mut col);
         for v in 0..16 {
@@ -560,9 +609,9 @@ fn idct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
     }
 }
 
-static DCT_METHOD_4X4: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+static DCT_METHOD_4X4: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
 
-fn select_dct_4x4() -> Arc<DctFn<64>> {
+fn select_dct_4x4() -> Arc<DctFn<8, 8, 64>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -592,26 +641,30 @@ fn select_dct_4x4() -> Arc<DctFn<64>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct4x4_scalar(input, output);
+        dct4x4_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct4x4() -> &'static DctFn<64> {
+pub(crate) fn selected_dct4x4() -> &'static DctFn<8, 8, 64> {
     DCT_METHOD_4X4.get_or_init(select_dct_4x4).as_ref()
 }
 
 pub(crate) fn dct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
-    selected_dct4x4()(input, output);
+    selected_dct4x4()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct4x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    dct4x4_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct4x4_scalar_input(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     for qy in 0..2 {
         for qx in 0..2 {
             let mut blk = [0.0f32; 16];
             for r in 0..4 {
                 for c in 0..4 {
-                    blk[r * 4 + c] = input[(qy * 4 + r) * 8 + (qx * 4 + c)];
+                    blk[r * 4 + c] = input.row(qy * 4 + r)[qx * 4 + c];
                 }
             }
             let mut d = [0.0f32; 16];
@@ -656,11 +709,15 @@ fn dct4x8_2d(input: &[f32; 32], output: &mut [f32; 32]) {
 }
 
 pub(crate) fn dct4x8_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    dct4x8_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct4x8_scalar_input(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     for y in 0..2 {
         let mut half = [0.0f32; 32];
         for r in 0..4 {
             for c in 0..8 {
-                half[r * 8 + c] = input[(y * 4 + r) * 8 + c];
+                half[r * 8 + c] = input.row(y * 4 + r)[c];
             }
         }
         let mut d = [0.0f32; 32];
@@ -713,11 +770,15 @@ fn dct8x4_2d(input: &[f32; 32], output: &mut [f32; 32]) {
 }
 
 pub(crate) fn dct8x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
+    dct8x4_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct8x4_scalar_input(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     for x in 0..2 {
         let mut half = [0.0f32; 32]; // 8 rows × 4 cols
         for r in 0..8 {
             for c in 0..4 {
-                half[r * 4 + c] = input[r * 8 + (x * 4 + c)];
+                half[r * 4 + c] = input.row(r)[x * 4 + c];
             }
         }
         let mut d = [0.0f32; 32];
@@ -734,9 +795,9 @@ pub(crate) fn dct8x4_scalar(input: &[f32; 64], output: &mut [f32; 64]) {
     output[8] = (block0 - block1) * 0.5;
 }
 
-static DCT_METHOD_4X8: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+static DCT_METHOD_4X8: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
 
-fn select_dct_4x8() -> Arc<DctFn<64>> {
+fn select_dct_4x8() -> Arc<DctFn<8, 8, 64>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -766,22 +827,22 @@ fn select_dct_4x8() -> Arc<DctFn<64>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct4x8_scalar(input, output);
+        dct4x8_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct4x8() -> &'static DctFn<64> {
+pub(crate) fn selected_dct4x8() -> &'static DctFn<8, 8, 64> {
     DCT_METHOD_4X8.get_or_init(select_dct_4x8).as_ref()
 }
 
 pub(crate) fn dct4x8(input: &[f32; 64], output: &mut [f32; 64]) {
-    selected_dct4x8()(input, output);
+    selected_dct4x8()(DctInput::from_flat(input), output);
 }
 
-static DCT_METHOD_8X4: OnceLock<Arc<DctFn<64>>> = OnceLock::new();
+static DCT_METHOD_8X4: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
 
-fn select_dct_8x4() -> Arc<DctFn<64>> {
+fn select_dct_8x4() -> Arc<DctFn<8, 8, 64>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -811,17 +872,17 @@ fn select_dct_8x4() -> Arc<DctFn<64>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct8x4_scalar(input, output);
+        dct8x4_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct8x4() -> &'static DctFn<64> {
+pub(crate) fn selected_dct8x4() -> &'static DctFn<8, 8, 64> {
     DCT_METHOD_8X4.get_or_init(select_dct_8x4).as_ref()
 }
 
 pub(crate) fn dct8x4(input: &[f32; 64], output: &mut [f32; 64]) {
-    selected_dct8x4()(input, output);
+    selected_dct8x4()(DctInput::from_flat(input), output);
 }
 
 pub(crate) const WC32: [f32; 16] = [
@@ -975,10 +1036,10 @@ fn inv_dct1d_32(buf: &mut [f32; 32]) {
 
 macro_rules! inv_dct_square {
     ($name:ident, $n:literal, $side:literal, $inv1d:path) => {
-        pub(crate) fn $name(coeff: &[f32; $n], out: &mut [f32; $n]) {
+        pub(crate) fn $name(coeff: DctInput<'_, $side, $side>, out: &mut [f32; $n]) {
             for a in 0..$side {
                 for b in 0..$side {
-                    out[b * $side + a] = coeff[a * $side + b] * ($n as f32);
+                    out[b * $side + a] = coeff.row(a)[b] * ($n as f32);
                 }
             }
             for u in 0..$side {
@@ -1008,9 +1069,11 @@ fn inv_dct1d_8_arr(buf: &mut [f32; 8]) {
     inv_dct1d_8(buf);
 }
 
-pub(crate) fn inv_dct8x16(coeff: &[f32; 128], out: &mut [f32; 128]) {
-    for (o, c) in out.iter_mut().zip(coeff.iter()) {
-        *o = *c * 128.0;
+pub(crate) fn inv_dct8x16(coeff: DctInput<'_, 16, 8>, out: &mut [f32; 128]) {
+    for v in 0..8 {
+        for u in 0..16 {
+            out[v * 16 + u] = coeff.row(v)[u] * 128.0;
+        }
     }
     for u in 0..16 {
         let mut col = [0.0f32; 8];
@@ -1029,12 +1092,12 @@ pub(crate) fn inv_dct8x16(coeff: &[f32; 128], out: &mut [f32; 128]) {
 
 /// Inverse of `dct16x8` (16 tall × 8 wide pixels; forward: col-DCT16 then
 /// row-DCT8, transposed store `[u*16+v]`).
-pub(crate) fn inv_dct16x8(coeff: &[f32; 128], out: &mut [f32; 128]) {
+pub(crate) fn inv_dct16x8(coeff: DctInput<'_, 16, 8>, out: &mut [f32; 128]) {
     let mut acd = [0.0f32; 128]; // after_col_dct[v*8+u]
     for v in 0..16 {
         let mut row = [0.0f32; 8];
         for u in 0..8 {
-            row[u] = coeff[u * 16 + v] * 128.0;
+            row[u] = coeff.row(u)[v] * 128.0;
         }
         inv_dct1d_8(&mut row);
         for u in 0..8 {
@@ -1053,9 +1116,11 @@ pub(crate) fn inv_dct16x8(coeff: &[f32; 128], out: &mut [f32; 128]) {
     }
 }
 
-pub(crate) fn inv_dct16x32(coeff: &[f32; 512], out: &mut [f32; 512]) {
-    for (o, c) in out.iter_mut().zip(coeff.iter()) {
-        *o = *c * 512.0;
+pub(crate) fn inv_dct16x32(coeff: DctInput<'_, 32, 16>, out: &mut [f32; 512]) {
+    for v in 0..16 {
+        for u in 0..32 {
+            out[v * 32 + u] = coeff.row(v)[u] * 512.0;
+        }
     }
     for u in 0..32 {
         let mut col = [0.0f32; 16];
@@ -1072,12 +1137,12 @@ pub(crate) fn inv_dct16x32(coeff: &[f32; 512], out: &mut [f32; 512]) {
     }
 }
 
-pub(crate) fn inv_dct32x16(coeff: &[f32; 512], out: &mut [f32; 512]) {
+pub(crate) fn inv_dct32x16(coeff: DctInput<'_, 32, 16>, out: &mut [f32; 512]) {
     let mut acd = [0.0f32; 512]; // after_col_dct[v*16+u]
     for v in 0..32 {
         let mut row = [0.0f32; 16];
         for u in 0..16 {
-            row[u] = coeff[u * 32 + v] * 512.0;
+            row[u] = coeff.row(u)[v] * 512.0;
         }
         inv_dct1d_16(&mut row);
         for u in 0..16 {
@@ -1096,9 +1161,9 @@ pub(crate) fn inv_dct32x16(coeff: &[f32; 512], out: &mut [f32; 512]) {
     }
 }
 
-static DCT_METHOD_32X32: OnceLock<Arc<DctFn<1024>>> = OnceLock::new();
+static DCT_METHOD_32X32: OnceLock<Arc<DctFn<32, 32, 1024>>> = OnceLock::new();
 
-fn select_dct_32x32() -> Arc<DctFn<1024>> {
+fn select_dct_32x32() -> Arc<DctFn<32, 32, 1024>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -1128,25 +1193,29 @@ fn select_dct_32x32() -> Arc<DctFn<1024>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct32x32_scalar(input, output);
+        dct32x32_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct32x32() -> &'static DctFn<1024> {
+pub(crate) fn selected_dct32x32() -> &'static DctFn<32, 32, 1024> {
     DCT_METHOD_32X32.get_or_init(select_dct_32x32).as_ref()
 }
 
 pub(crate) fn dct32x32(input: &[f32; 1024], output: &mut [f32; 1024]) {
-    selected_dct32x32()(input, output);
+    selected_dct32x32()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct32x32_scalar(input: &[f32; 1024], output: &mut [f32; 1024]) {
+    dct32x32_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct32x32_scalar_input(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) {
     let mut after_col_dct = [0.0f32; 1024];
     let mut col = [0.0f32; 32];
     for u in 0..32 {
         for i in 0..32 {
-            col[i] = input[i * 32 + u];
+            col[i] = input.row(i)[u];
         }
         dct1d_32(&mut col);
         for v in 0..32 {
@@ -1250,9 +1319,9 @@ pub(crate) fn dc_from_dct32x32(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
     }
 }
 
-static DCT_METHOD_32X16: OnceLock<Arc<DctFn<512>>> = OnceLock::new();
+static DCT_METHOD_32X16: OnceLock<Arc<DctFn<16, 32, 512>>> = OnceLock::new();
 
-fn select_dct_32x16() -> Arc<DctFn<512>> {
+fn select_dct_32x16() -> Arc<DctFn<16, 32, 512>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -1282,25 +1351,29 @@ fn select_dct_32x16() -> Arc<DctFn<512>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct32x16_scalar(input, output);
+        dct32x16_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct32x16() -> &'static DctFn<512> {
+pub(crate) fn selected_dct32x16() -> &'static DctFn<16, 32, 512> {
     DCT_METHOD_32X16.get_or_init(select_dct_32x16).as_ref()
 }
 
 pub(crate) fn dct32x16(input: &[f32; 512], output: &mut [f32; 512]) {
-    selected_dct32x16()(input, output);
+    selected_dct32x16()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct32x16_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
+    dct32x16_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct32x16_scalar_input(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     let mut after_col_dct = [0.0f32; 512];
     let mut col = [0.0f32; 32];
     for u in 0..16 {
         for i in 0..32 {
-            col[i] = input[i * 16 + u];
+            col[i] = input.row(i)[u];
         }
         dct1d_32(&mut col);
         for v in 0..32 {
@@ -1320,9 +1393,9 @@ pub(crate) fn dct32x16_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
     }
 }
 
-static DCT_METHOD_16X32: OnceLock<Arc<DctFn<512>>> = OnceLock::new();
+static DCT_METHOD_16X32: OnceLock<Arc<DctFn<32, 16, 512>>> = OnceLock::new();
 
-fn select_dct_16x32() -> Arc<DctFn<512>> {
+fn select_dct_16x32() -> Arc<DctFn<32, 16, 512>> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -1351,24 +1424,28 @@ fn select_dct_16x32() -> Arc<DctFn<512>> {
     }
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")))]
     Arc::new(|input, output| {
-        dct16x32_scalar(input, output);
+        dct16x32_scalar_input(input, output);
     })
 }
 
 #[inline]
-pub(crate) fn selected_dct16x32() -> &'static DctFn<512> {
+pub(crate) fn selected_dct16x32() -> &'static DctFn<32, 16, 512> {
     DCT_METHOD_16X32.get_or_init(select_dct_16x32).as_ref()
 }
 
 pub(crate) fn dct16x32(input: &[f32; 512], output: &mut [f32; 512]) {
-    selected_dct16x32()(input, output);
+    selected_dct16x32()(DctInput::from_flat(input), output);
 }
 
 pub(crate) fn dct16x32_scalar(input: &[f32; 512], output: &mut [f32; 512]) {
+    dct16x32_scalar_input(DctInput::from_flat(input), output);
+}
+
+fn dct16x32_scalar_input(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]) {
     let mut after_row_dct = [0.0f32; 512];
     let mut rowbuf = [0.0f32; 32];
     for i in 0..16 {
-        rowbuf.copy_from_slice(&input[i * 32..i * 32 + 32]);
+        rowbuf.copy_from_slice(input.row(i));
         dct1d_32(&mut rowbuf);
         after_row_dct[i * 32..i * 32 + 32].copy_from_slice(&rowbuf);
     }
@@ -1437,6 +1514,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strided_input_matches_flat_input() {
+        let mut flat = [0.0f32; 64];
+        for (i, value) in flat.iter_mut().enumerate() {
+            *value = (i as f32 * 0.37).sin();
+        }
+        let mut strided = [f32::NAN; 8 * 13];
+        for y in 0..8 {
+            strided[y * 13..y * 13 + 8].copy_from_slice(&flat[y * 8..y * 8 + 8]);
+        }
+
+        let mut expected = [0.0f32; 64];
+        let mut actual = [0.0f32; 64];
+        dct8x8(&flat, &mut expected);
+        selected_dct8x8()(DctInput::new(&strided, 13), &mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn strided_idct_input_matches_flat_input() {
+        let mut flat = [0.0f32; 64];
+        for (i, value) in flat.iter_mut().enumerate() {
+            *value = (i as f32 * 0.19).cos();
+        }
+        let mut strided = [f32::NAN; 8 * 13];
+        for y in 0..8 {
+            strided[y * 13..y * 13 + 8].copy_from_slice(&flat[y * 8..y * 8 + 8]);
+        }
+
+        let mut expected = [0.0f32; 64];
+        let mut actual = [0.0f32; 64];
+        inv_dct8x8(DctInput::from_flat(&flat), &mut expected);
+        inv_dct8x8(DctInput::new(&strided, 13), &mut actual);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[should_panic]
+    fn strided_input_rejects_short_last_row() {
+        let data = [0.0f32; (8 - 1) * 13 + 8 - 1];
+        let _ = DctInput::<8, 8>::new(&data, 13);
+    }
+
+    #[test]
+    #[should_panic]
+    fn strided_input_rejects_short_stride() {
+        let data = [0.0f32; 64];
+        let _ = DctInput::<8, 8>::new(&data, 7);
+    }
+
+    #[test]
     fn inverse_butterflies_round_trip() {
         let mut s = 987654321u32;
         let mut rnd = || {
@@ -1463,7 +1590,7 @@ mod tests {
                 let mut c = [0.0f32; $n];
                 $fwd(&x, &mut c);
                 let mut r = [0.0f32; $n];
-                $inv(&c, &mut r);
+                $inv(DctInput::from_flat(&c), &mut r);
                 let me = (0..$n)
                     .map(|i| (r[i] - orig[i]).abs())
                     .fold(0.0f32, f32::max);
@@ -1493,9 +1620,9 @@ mod tests {
                     let mut c = [0.0f32; $n];
                     c.iter_mut().for_each(|v| *v = rnd());
                     let mut rs = [0.0f32; $n];
-                    $sc(&c, &mut rs);
+                    $sc(DctInput::from_flat(&c), &mut rs);
                     let mut rn = [0.0f32; $n];
-                    unsafe { $ne(&c, &mut rn) };
+                    unsafe { $ne(DctInput::from_flat(&c), &mut rn) };
                     let me = (0..$n)
                         .map(|i| (rs[i] - rn[i]).abs())
                         .fold(0.0f32, f32::max);
