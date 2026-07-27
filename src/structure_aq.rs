@@ -28,7 +28,7 @@
  */
 
 use crate::adaptive_quant::fast_exp2;
-use crate::dct::{DctFn, fmla};
+use crate::dct::{DctFn, DctInput, fmla};
 use crate::image::{Image3F, ImageB};
 use crate::util::FastRound;
 
@@ -65,7 +65,7 @@ fn strength(distance: f32) -> f32 {
     POINTS[POINTS.len() - 1].1
 }
 
-fn block_features(block: &[f32; 64], dct8x8: &DctFn<64>) -> Features {
+fn block_features(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
     const EPS: f32 = 1.0e-10;
     let rows = block.as_chunks::<8>().0;
     let mean = block.iter().sum::<f32>() * (1.0 / 64.0);
@@ -174,7 +174,7 @@ fn block_features(block: &[f32; 64], dct8x8: &DctFn<64>) -> Features {
     let persistence = (persistence_ratio / (1.0 + persistence_ratio)).clamp(0.0, 1.0);
 
     let mut coeffs = [0.0f32; 64];
-    dct8x8(block, &mut coeffs);
+    dct8x8(DctInput::from_flat(block), &mut coeffs);
     let (mut mid, mut high) = (0.0f32, 0.0f32);
     for (y, row) in coeffs.as_chunks::<8>().0.iter().enumerate() {
         for (x, &coeff) in row.iter().enumerate() {
@@ -221,7 +221,7 @@ pub(crate) fn apply(
     x0: usize,
     y0: usize,
     distance: f32,
-    dct8x8: &DctFn<64>,
+    dct8x8: &DctFn<8, 8, 64>,
 ) {
     let amount = strength(distance);
     if amount == 0.0 || field.xsize() == 0 || field.ysize() == 0 {

@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{WC4, WC8, WC16, WC32};
+use crate::dct::{DctInput, WC4, WC8, WC16, WC32};
 use core::arch::wasm32::*;
 
 #[derive(Clone, Copy)]
@@ -159,10 +159,10 @@ fn transpose_8x8(c: &mut [WasmDoubledVector; 8]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load<const N: usize>(ptr: &[f32; N], stride: usize) -> [WasmDoubledVector; 8] {
+fn load(input: DctInput<'_, 8, 8>) -> [WasmDoubledVector; 8] {
     let row = |y: usize| -> WasmDoubledVector {
         unsafe {
-            let p = &ptr[y * stride..];
+            let p = input.row(y);
             WasmDoubledVector {
                 lo: v128_load(p.as_ptr().cast()),
                 hi: v128_load(p[4..].as_ptr().cast()),
@@ -199,25 +199,25 @@ fn scale_and_store(cols: &[WasmDoubledVector; 8], scale: f32, out: &mut [f32; 64
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct8x8_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
-    let mut cols = load(input, 8);
+pub(crate) fn dct8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut cols = load(input);
     dct1d_8_v(&mut cols);
     transpose_8x8(&mut cols);
     dct1d_8_v(&mut cols);
     scale_and_store(&cols, 1.0 / 64.0, output);
 }
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct8x16_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
+pub(crate) fn dct8x16_wasm(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) {
     // 16-pt row DCT then 8-pt col DCT, 4-wide strips; scratch is hfreq-major.
     let mut scratch = [0.0f32; 128];
     for s in 0..2 {
         let mut c = [f32x4_splat(0.0); 16];
         for ct in 0..4 {
             let (a, b, cc, d) = transpose_4x4(
-                load_strip(unsafe { input.get_unchecked((s * 4) * 16 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 1) * 16 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 2) * 16 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 3) * 16 + ct * 4..) }.as_ptr()),
+                load_strip(input.row(s * 4)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 1)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 2)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 3)[ct * 4..].as_ptr()),
             );
             c[ct * 4] = a;
             c[ct * 4 + 1] = b;
@@ -254,13 +254,11 @@ pub(crate) fn dct8x16_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct16x8_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
+pub(crate) fn dct16x8_wasm(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) {
     // 16-pt col DCT then 8-pt row DCT, 4-wide strips; scratch is column-major.
     let mut scratch = [0.0f32; 128];
     for s in 0..2 {
-        let mut c: [v128; 16] = std::array::from_fn(|r| {
-            load_strip(unsafe { input.get_unchecked(r * 8 + s * 4..) }.as_ptr())
-        });
+        let mut c: [v128; 16] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_16_s(&mut c);
         for t in 0..4 {
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
@@ -285,14 +283,12 @@ pub(crate) fn dct16x8_wasm(input: &[f32; 128], output: &mut [f32; 128]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct16x16_wasm(input: &[f32; 256], output: &mut [f32; 256]) {
+pub(crate) fn dct16x16_wasm(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]) {
     // 4-wide strips keep the live set at 16 v128 instead of 64; scratch is
     // column-major (`[col * 16 + vfreq]`) for gather-free reloads.
     let mut scratch = [0.0f32; 256];
     for s in 0..4 {
-        let mut c: [v128; 16] = std::array::from_fn(|r| {
-            load_strip(unsafe { input.get_unchecked(r * 16 + s * 4..) }.as_ptr())
-        });
+        let mut c: [v128; 16] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_16_s(&mut c);
         for t in 0..4 {
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
@@ -416,14 +412,12 @@ fn load_strip(ptr: *const f32) -> v128 {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct32x32_wasm(input: &[f32; 1024], output: &mut [f32; 1024]) {
+pub(crate) fn dct32x32_wasm(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) {
     // Both passes over 4-wide strips; the column pass writes a transposed scratch
     // (`[col * 32 + vfreq]`) so the row pass reloads contiguously.
     let mut colt = [0.0f32; 1024];
     for s in 0..8 {
-        let mut c: [v128; 32] = std::array::from_fn(|r| {
-            load_strip(unsafe { input.get_unchecked(r * 32 + s * 4..) }.as_ptr())
-        });
+        let mut c: [v128; 32] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_32_s(&mut c);
         for t in 0..8 {
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
@@ -465,16 +459,16 @@ fn dct1d_4_q(c: &mut [v128; 4]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct4x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
+pub(crate) fn dct4x4_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     // Gather q[r*4+c].lane[k] = input[(qy*4+r)*8 + (qx*4+c)], k = qy*2+qx.
     let mut q = [f32x4_splat(0.0); 16];
     for r in 0..4 {
         for col in 0..4 {
             let lanes = [
-                input[r * 8 + col],             // k=0 (qy0,qx0)
-                input[r * 8 + (4 + col)],       // k=1 (qy0,qx1)
-                input[(4 + r) * 8 + col],       // k=2 (qy1,qx0)
-                input[(4 + r) * 8 + (4 + col)], // k=3 (qy1,qx1)
+                input.row(r)[col],         // k=0 (qy0,qx0)
+                input.row(r)[4 + col],     // k=1 (qy0,qx1)
+                input.row(4 + r)[col],     // k=2 (qy1,qx0)
+                input.row(4 + r)[4 + col], // k=3 (qy1,qx1)
             ];
             q[r * 4 + col] = unsafe { v128_load(lanes.as_ptr().cast()) };
         }
@@ -524,8 +518,8 @@ pub(crate) fn dct4x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct4x8_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
-    let rows = load(input, 8);
+pub(crate) fn dct4x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let rows = load(input);
     let mut top: [WasmDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
     let mut bot: [WasmDoubledVector; 4] = [rows[4], rows[5], rows[6], rows[7]];
     dct1d_4_v(&mut top);
@@ -553,8 +547,8 @@ pub(crate) fn dct4x8_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct8x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
-    let mut rows = load(input, 8);
+pub(crate) fn dct8x4_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut rows = load(input);
     dct1d_8_v(&mut rows);
     transpose_8x8(&mut rows);
     let mut left: [WasmDoubledVector; 4] = [rows[0], rows[1], rows[2], rows[3]];
@@ -580,14 +574,12 @@ pub(crate) fn dct8x4_wasm(input: &[f32; 64], output: &mut [f32; 64]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct32x16_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
+pub(crate) fn dct32x16_wasm(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     // scratch is column-major (`[col * 32 + vfreq]`) so the row pass reloads
     // contiguously. Column pass runs over 4-wide strips (4 strips of 16 cols).
     let mut scratch = [0.0f32; 512];
     for s in 0..4 {
-        let mut c: [v128; 32] = std::array::from_fn(|r| {
-            load_strip(unsafe { input.get_unchecked(r * 16 + s * 4..) }.as_ptr())
-        });
+        let mut c: [v128; 32] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_32_s(&mut c);
         for t in 0..8 {
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
@@ -612,7 +604,7 @@ pub(crate) fn dct32x16_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
 }
 
 #[target_feature(enable = "simd128")]
-pub(crate) fn dct16x32_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
+pub(crate) fn dct16x32_wasm(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]) {
     // Tall 16x32: 32-pt row DCT then 16-pt column DCT, both over 4-wide strips.
     // scratch is hfreq-major (`[hfreq * 16 + row]`).
     let mut scratch = [0.0f32; 512];
@@ -620,10 +612,10 @@ pub(crate) fn dct16x32_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
         let mut c = [f32x4_splat(0.0); 32];
         for ct in 0..8 {
             let (a, b, cc, d) = transpose_4x4(
-                load_strip(unsafe { input.get_unchecked((s * 4) * 32 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 1) * 32 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 2) * 32 + ct * 4..) }.as_ptr()),
-                load_strip(unsafe { input.get_unchecked((s * 4 + 3) * 32 + ct * 4..) }.as_ptr()),
+                load_strip(input.row(s * 4)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 1)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 2)[ct * 4..].as_ptr()),
+                load_strip(input.row(s * 4 + 3)[ct * 4..].as_ptr()),
             );
             c[ct * 4] = a;
             c[ct * 4 + 1] = b;
@@ -662,7 +654,7 @@ pub(crate) fn dct16x32_wasm(input: &[f32; 512], output: &mut [f32; 512]) {
 #[cfg(target_feature = "simd128")]
 #[cfg(test)]
 mod neon_dct_tests {
-    use crate::dct::{dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
+    use crate::dct::{DctInput, dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
 
     const ATOL: f32 = 1e-4;
 
@@ -714,7 +706,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed);
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_wasm(&input, &mut got) };
+            unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 seed={seed}"));
         }
@@ -728,7 +720,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(&input, &mut got) };
+        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 dc-only");
     }
@@ -740,7 +732,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(&input, &mut got) };
+        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 zero");
     }
@@ -761,9 +753,9 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 64];
         let mut dsum = [0.0f32; 64];
         unsafe {
-            dct8x8_wasm(&a, &mut da);
-            dct8x8_wasm(&b, &mut db);
-            dct8x8_wasm(&sum, &mut dsum);
+            dct8x8_wasm(DctInput::from_flat(&a), &mut da);
+            dct8x8_wasm(DctInput::from_flat(&b), &mut db);
+            dct8x8_wasm(DctInput::from_flat(&sum), &mut dsum);
         }
         let expected: Vec<f32> = (0..64).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x8 linearity");
@@ -779,7 +771,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_wasm(&input, &mut got) };
+            unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 basis[{k}]"));
         }
@@ -795,7 +787,7 @@ mod neon_dct_tests {
             let input: [f32; 128] = fill(seed.wrapping_add(0xdead));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_wasm(&input, &mut got) };
+            unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 seed={seed}"));
         }
@@ -808,7 +800,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(&input, &mut got) };
+        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 dc-only");
     }
@@ -820,7 +812,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(&input, &mut got) };
+        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 zero");
     }
@@ -834,7 +826,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_wasm(&input, &mut got) };
+            unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 basis[{k}]"));
         }
@@ -854,9 +846,9 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
         unsafe {
-            dct8x16_wasm(&a, &mut da);
-            dct8x16_wasm(&b, &mut db);
-            dct8x16_wasm(&sum, &mut dsum);
+            dct8x16_wasm(DctInput::from_flat(&a), &mut da);
+            dct8x16_wasm(DctInput::from_flat(&b), &mut db);
+            dct8x16_wasm(DctInput::from_flat(&sum), &mut dsum);
         }
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x16 linearity");
@@ -870,7 +862,7 @@ mod neon_dct_tests {
             let input: [f32; 128] = fill(seed.wrapping_add(0xbeef));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_wasm(&input, &mut got) };
+            unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 seed={seed}"));
         }
@@ -885,7 +877,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x8_wasm(&input, &mut got) };
+            unsafe { dct4x8_wasm(DctInput::from_flat(&input), &mut got) };
             dct4x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
         }
@@ -900,7 +892,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x4_wasm(&input, &mut got) };
+            unsafe { dct8x4_wasm(DctInput::from_flat(&input), &mut got) };
             dct8x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
@@ -913,7 +905,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(&input, &mut got) };
+        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 dc-only");
     }
@@ -925,7 +917,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(&input, &mut got) };
+        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 zero");
     }
@@ -939,7 +931,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_wasm(&input, &mut got) };
+            unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 basis[{k}]"));
         }
@@ -959,9 +951,9 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
         unsafe {
-            dct16x8_wasm(&a, &mut da);
-            dct16x8_wasm(&b, &mut db);
-            dct16x8_wasm(&sum, &mut dsum);
+            dct16x8_wasm(DctInput::from_flat(&a), &mut da);
+            dct16x8_wasm(DctInput::from_flat(&b), &mut db);
+            dct16x8_wasm(DctInput::from_flat(&sum), &mut dsum);
         }
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x8 linearity");
@@ -982,8 +974,8 @@ mod neon_dct_tests {
         let mut out8x16 = [0.0f32; 128];
         let mut out16x8 = [0.0f32; 128];
         unsafe {
-            dct8x16_wasm(&input, &mut out8x16);
-            dct16x8_wasm(&input, &mut out16x8);
+            dct8x16_wasm(DctInput::from_flat(&input), &mut out8x16);
+            dct16x8_wasm(DctInput::from_flat(&input), &mut out16x8);
         }
         // DC is at index 0 in both output layouts.
         assert!(
@@ -1007,7 +999,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(&input, &mut got) };
+        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 alternating +-1");
     }
@@ -1022,7 +1014,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(&input, &mut got) };
+        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 alternating +-1");
     }
@@ -1037,7 +1029,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(&input, &mut got) };
+        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 alternating +-1");
     }
@@ -1051,7 +1043,7 @@ mod neon_dct_tests {
             let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_wasm(&input, &mut got) };
+            unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
         }
@@ -1066,7 +1058,7 @@ mod neon_dct_tests {
             let input: [f32; 1024] = fill(seed.wrapping_add(0x3232));
             let mut got = [0.0f32; 1024];
             let mut want = [0.0f32; 1024];
-            unsafe { dct32x32_wasm(&input, &mut got) };
+            unsafe { dct32x32_wasm(DctInput::from_flat(&input), &mut got) };
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
         }
@@ -1081,7 +1073,7 @@ mod neon_dct_tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct32x16_wasm(&input, &mut got) };
+            unsafe { dct32x16_wasm(DctInput::from_flat(&input), &mut got) };
             dct32x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
         }
@@ -1096,7 +1088,7 @@ mod neon_dct_tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct16x32_wasm(&input, &mut got) };
+            unsafe { dct16x32_wasm(DctInput::from_flat(&input), &mut got) };
             dct16x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
@@ -1111,7 +1103,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x4_wasm(&input, &mut got) };
+            unsafe { dct4x4_wasm(DctInput::from_flat(&input), &mut got) };
             dct4x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
         }
@@ -1125,7 +1117,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(&input, &mut got) };
+        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 dc-only");
     }
@@ -1138,7 +1130,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(&input, &mut got) };
+        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 zero");
     }
@@ -1153,7 +1145,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_wasm(&input, &mut got) };
+            unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
         }
@@ -1173,9 +1165,9 @@ mod neon_dct_tests {
         let mut db = [0.0f32; 256];
         let mut dsum = [0.0f32; 256];
         unsafe {
-            dct16x16_wasm(&a, &mut da);
-            dct16x16_wasm(&b, &mut db);
-            dct16x16_wasm(&sum, &mut dsum);
+            dct16x16_wasm(DctInput::from_flat(&a), &mut da);
+            dct16x16_wasm(DctInput::from_flat(&b), &mut db);
+            dct16x16_wasm(DctInput::from_flat(&sum), &mut dsum);
         }
         let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x16 linearity");
@@ -1192,7 +1184,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(&input, &mut got) };
+        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
     }

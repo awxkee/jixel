@@ -34,7 +34,7 @@ use crate::dc_group_data::{
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
     STRATEGY_DCT32X32,
 };
-use crate::dct::fmla;
+use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
@@ -164,6 +164,22 @@ fn gather_pixels(
     }
 }
 
+#[inline]
+fn dct_input<'a, const W: usize, const H: usize>(
+    plane: &'a crate::image::Plane<f32>,
+    tmp: &'a mut [f32; 1024],
+    px: usize,
+    py: usize,
+) -> DctInput<'a, W, H> {
+    if W <= plane.xsize().saturating_sub(px) && H <= plane.ysize().saturating_sub(py) {
+        let stride = plane.xsize();
+        DctInput::new(&plane.as_slice()[py * stride + px..], stride)
+    } else {
+        gather_pixels(plane, px, py, W, H, &mut tmp[..W * H]);
+        DctInput::new(&tmp[..W * H], W)
+    }
+}
+
 /// Forward-transform the `strategy`'s pixel footprint at absolute pixel
 /// `(px, py)` for one channel into `out` (natural coefficient storage matching
 /// `write_ac_group`). Returns `(cx, cy)` covered-block counts after the
@@ -177,80 +193,60 @@ fn forward_transform(
     py: usize,
     out: &mut [f32; 1024],
 ) -> (usize, usize) {
-    // Reused scratch: the gather fully overwrites the region each transform reads,
-    // so re-zeroing a fresh `[0.0; 1024]` on every call is pure waste (this is the
-    // hottest function in selection — thousands of calls per group).
+    // Interior blocks point directly into the image plane. Edge blocks retain
+    // the replicated-border gather because their logical footprint extends past
+    // the allocated plane.
     match strategy {
         STRATEGY_DCT => {
-            gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
-            let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
             let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-            (ctx.dct8x8)(src, dst);
+            (ctx.dct8x8)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT16X8 => {
-            gather_pixels(plane, px, py, 8, 16, &mut tmp[..128]);
-            let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
             let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
-            (ctx.dct16x8)(src, dst);
+            (ctx.dct16x8)(dct_input(plane, tmp, px, py), dst);
             (2, 1)
         }
         STRATEGY_DCT8X16 => {
-            gather_pixels(plane, px, py, 16, 8, &mut tmp[..128]);
-            let src: &[f32; 128] = (&tmp[..128]).try_into().unwrap();
             let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
-            (ctx.dct8x16)(src, dst);
+            (ctx.dct8x16)(dct_input(plane, tmp, px, py), dst);
             (2, 1)
         }
         STRATEGY_DCT16X16 => {
-            gather_pixels(plane, px, py, 16, 16, &mut tmp[..256]);
-            let src: &[f32; 256] = (&tmp[..256]).try_into().unwrap();
             let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
-            (ctx.dct16x16)(src, dst);
+            (ctx.dct16x16)(dct_input(plane, tmp, px, py), dst);
             (2, 2)
         }
         STRATEGY_DCT32X32 => {
-            gather_pixels(plane, px, py, 32, 32, &mut tmp[..1024]);
-            let src: &[f32; 1024] = (&tmp[..1024]).try_into().unwrap();
             let dst: &mut [f32; 1024] = (&mut out[..1024]).try_into().unwrap();
-            (ctx.dct32x32)(src, dst);
+            (ctx.dct32x32)(dct_input(plane, tmp, px, py), dst);
             (4, 4)
         }
         STRATEGY_DCT32X16 => {
             // 16 wide × 32 tall pixels (cov 2×4); normalized (cx,cy) = (4,2).
-            gather_pixels(plane, px, py, 16, 32, &mut tmp[..512]);
-            let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
             let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
-            (ctx.dct32x16)(src, dst);
+            (ctx.dct32x16)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
         }
         STRATEGY_DCT16X32 => {
             // 32 wide × 16 tall pixels (cov 4×2); normalized (cx,cy) = (4,2).
-            gather_pixels(plane, px, py, 32, 16, &mut tmp[..512]);
-            let src: &[f32; 512] = (&tmp[..512]).try_into().unwrap();
             let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
-            (ctx.dct16x32)(src, dst);
+            (ctx.dct16x32)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
         }
         STRATEGY_DCT4X4 => {
-            gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
-            let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
             let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-            (ctx.dct4x4)(src, dst);
+            (ctx.dct4x4)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT4X8 => {
-            gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
-            let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
             let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-            (ctx.dct4x8)(src, dst);
+            (ctx.dct4x8)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT8X4 => {
-            gather_pixels(plane, px, py, 8, 8, &mut tmp[..64]);
-            let src: &[f32; 64] = (&tmp[..64]).try_into().unwrap();
             let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
-            (ctx.dct8x4)(src, dst);
+            (ctx.dct8x4)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         _ => unreachable!("invalid strategy {strategy}"),
@@ -515,6 +511,7 @@ fn forward_sub8_transform(
     output: &mut [f32; 1024],
 ) {
     let dst: &mut [f32; 64] = (&mut output[..64]).try_into().unwrap();
+    let input = DctInput::from_flat(input);
     match strategy {
         STRATEGY_DCT => (ctx.dct8x8)(input, dst),
         STRATEGY_DCT4X4 => (ctx.dct4x4)(input, dst),
