@@ -330,11 +330,7 @@ fn hf_modulation_blocks4_direct_x4(
         );
     }
 
-    let mut out = vdupq_n_f32(0.0);
-    out = vsetq_lane_f32::<0>(vaddvq_f32(s0), out);
-    out = vsetq_lane_f32::<1>(vaddvq_f32(s1), out);
-    out = vsetq_lane_f32::<2>(vaddvq_f32(s2), out);
-    out = vsetq_lane_f32::<3>(vaddvq_f32(s3), out);
+    let out = vpaddq_f32(vpaddq_f32(s0, s1), vpaddq_f32(s2, s3));
 
     vmlaf(
         out,

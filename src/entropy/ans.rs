@@ -62,12 +62,15 @@ const LOG_ENTRY_SIZE: usize = ANS_LOG_TAB_SIZE as usize - LOG_ALPHA_SIZE; // 5
 const ENTRY_SIZE: u32 = 1 << LOG_ENTRY_SIZE; // 32
 const ENTRY_SIZE_M1: u32 = ENTRY_SIZE - 1;
 
-pub(crate) fn normalize_counts(counts: &[u32]) -> Vec<u16> {
+pub(crate) fn normalize_counts(counts: &[u32], freqs: &mut Vec<u16>) {
     let n = counts.len();
-    let mut freqs = vec![0u16; n];
+    if freqs.len() != n {
+        freqs.resize(n, 0);
+    }
+    freqs.fill(0);
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     if total == 0 {
-        return freqs;
+        return;
     }
     let table = ANS_TAB_SIZE as i64;
     let mut sum: i64 = 0;
@@ -101,7 +104,6 @@ pub(crate) fn normalize_counts(counts: &[u32]) -> Vec<u16> {
             break;
         }
     }
-    freqs
 }
 
 #[derive(Clone, Copy, Default)]
@@ -499,8 +501,9 @@ pub(crate) fn choose_use_prefix_code(
 ) -> bool {
     let mut ans_total = 0.0f64;
     let mut huff_total = 0.0f64;
+    let mut freqs = vec![0u16; 0];
     for (h, depths) in histograms.iter().zip(huffman_depths.iter()) {
-        let freqs = normalize_counts(&h.counts);
+        normalize_counts(&h.counts, &mut freqs);
         ans_total += ans_data_bits(&h.counts, &freqs) + ans_table_bits(&freqs);
         huff_total += huffman_data_bits(&h.counts, depths) + huffman_tree_bits_estimate(depths);
     }

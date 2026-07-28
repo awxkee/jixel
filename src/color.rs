@@ -38,7 +38,7 @@ fn srgb_to_linear_u8_ref(v: u8) -> f32 {
 
 use std::sync::OnceLock;
 
-fn lut() -> &'static [f32; 256] {
+pub(crate) fn srgb_lut() -> &'static [f32; 256] {
     static T: OnceLock<[f32; 256]> = OnceLock::new();
     T.get_or_init(|| {
         let mut tab = [0.0f32; 256];
@@ -47,11 +47,6 @@ fn lut() -> &'static [f32; 256] {
         }
         tab
     })
-}
-
-#[inline]
-pub(crate) fn srgb_to_linear_u8(v: u8) -> f32 {
-    lut()[v as usize]
 }
 
 pub(crate) struct LutHighBit {
@@ -114,7 +109,7 @@ mod tests {
     fn lut_matches_reference() {
         for i in 0..=255u8 {
             let r = srgb_to_linear_u8_ref(i);
-            let l = srgb_to_linear_u8(i);
+            let l = srgb_lut()[i as usize];
             assert_eq!(
                 r.to_bits(),
                 l.to_bits(),

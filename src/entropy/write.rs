@@ -323,10 +323,11 @@ where
         let depths: Vec<[u8; ALPHABET_SIZE]> = prefix_codes.iter().map(|c| c.depths).collect();
         use_prefix_code = choose_use_prefix_code(&histograms, &depths);
         if !use_prefix_code {
+            let mut freqs = vec![0u16; 0];
             for h in &histograms {
-                let f = normalize_counts(&h.counts);
-                ans_symbols.push(build_symbol_info(&f));
-                ans_freqs.push(f);
+                normalize_counts(&h.counts, &mut freqs);
+                ans_symbols.push(build_symbol_info(&freqs));
+                ans_freqs.push(freqs.clone());
             }
         }
     }

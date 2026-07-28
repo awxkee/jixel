@@ -14,7 +14,7 @@ fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
     let image = image::open(Path::new(
-        "./assets/PhotoTraces_Free_RAW_Photos_05_Spring_Tree.png",
+        "./assets/digital_art_portrait.jpg",
     ))
     .unwrap();
     let rgb_img = image.to_rgb8();
@@ -35,7 +35,7 @@ fn main() {
                 .with_quality(90.)
                 .with_progressive(false)
                 .with_patches(false)
-                .with_speed(Speed::Slow)
+                .with_speed(Speed::Fast)
                 .with_num_threads(
                     available_parallelism()
                         .unwrap_or(NonZero::new(1).unwrap())
@@ -53,7 +53,7 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(true)
+            .with_lossless(false)
             .with_quality(80.)
             .with_speed(Speed::Fast)
             .with_progressive(false)

@@ -126,10 +126,7 @@ fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content. Rebalances the d>=4 tail toward AC; measured
-    // on photo/fractal/glow/portrait sets: on-or-above the RD curve, up to
-    // +1.4 SSIMULACRA2 rate-equivalent, and the quality-vs-d cliff softens
-    // by 4-6 SSIMULACRA2 at d=6. No effect at d <= 3.5.
+    // loss on smooth content.
     let refine = dc_refinement(distance);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
@@ -1046,14 +1043,16 @@ fn encode_frame_core(
     }
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
-    let mut dc_tokens_per_group: Vec<Vec<Token>> = Vec::with_capacity(dim.num_dc_groups);
-    let mut meta_tokens_per_group: Vec<Vec<Token>> = Vec::with_capacity(dim.num_dc_groups);
-    for dc_data in &dc_datas {
-        let dc_t = collect_dc_tokens(dc_data);
-        let mt_t = collect_ac_metadata_tokens(dc_data);
-        dc_tokens_per_group.push(dc_t);
-        meta_tokens_per_group.push(mt_t);
-    }
+    let token_groups = ctx
+        .thread_pool
+        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
+            (
+                collect_dc_tokens(&dc_datas[i]),
+                collect_ac_metadata_tokens(&dc_datas[i]),
+            )
+        });
+    let (dc_tokens_per_group, meta_tokens_per_group): (Vec<Vec<Token>>, Vec<Vec<Token>>) =
+        token_groups.into_iter().unzip();
     // ANS-capable code for the DC+meta bundle (same gate as the plain-AC
     // bundle); write sites below branch on use_prefix_code.
     let dc_code_owned = crate::entropy::optimize_entropy_code_ac_streams(
@@ -1071,17 +1070,17 @@ fn encode_frame_core(
     // Per-pass aggregated tokens -> per-pass entropy code. Pass 0 (coarse) and
     // the residual pass(es) have very different token distributions, so a single
     // shared code is wasteful; each HfPass gets a code built from its own tokens.
-    let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> = (0..num_passes)
-        .map(|pass| {
-            crate::entropy::optimize_entropy_code_ac_streams(
-                all_pending
-                    .iter()
-                    .map(|pending| pending.tokens[pass].as_slice()),
-                K_NUM_AC_CONTEXTS,
-                &mut scratch.huffman_pool,
-            )
-        })
-        .collect();
+    let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> =
+        ctx.thread_pool
+            .steal_map(scratch, num_passes, |pass, scratch| {
+                crate::entropy::optimize_entropy_code_ac_streams(
+                    all_pending
+                        .iter()
+                        .map(|pending| pending.tokens[pass].as_slice()),
+                    K_NUM_AC_CONTEXTS,
+                    &mut scratch.huffman_pool,
+                )
+            });
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
     // group. Multi-pass uses the per-pass plain codes.
@@ -1089,10 +1088,11 @@ fn encode_frame_core(
     let ac_lz_code_owned;
     let use_lz77;
     if num_passes == 1 {
-        ac_lz_per_group = Vec::with_capacity(all_pending.len());
-        for pg in &all_pending {
-            ac_lz_per_group.push(crate::enc_lz77_ac::lz77_compress_ac(&pg.tokens[0]));
-        }
+        ac_lz_per_group = ctx
+            .thread_pool
+            .steal_map(scratch, all_pending.len(), |i, _scratch| {
+                crate::enc_lz77_ac::lz77_compress_ac(&all_pending[i].tokens[0])
+            });
         ac_lz_code_owned = crate::enc_lz77_ac::build_ac_lz_code(
             &ac_lz_per_group,
             ac_num_contexts,
@@ -1140,48 +1140,55 @@ fn encode_frame_core(
         &mut sections[0],
     );
 
-    // Phase 5: write each DC group section with adaptive DC code.
-    for (i, dc_data) in dc_datas.iter().enumerate() {
-        let dc_group_idx = 1 + i;
-        let w = &mut sections[dc_group_idx];
-        w.write(2, 0); // extra_dc_precision
-        w.write(4, 3); // use global tree, default wp, no transforms
-        if dc_code.use_prefix_code {
-            for t in &dc_tokens_per_group[i] {
-                write_token(*t, &dc_code, w);
+    // Phase 5: each DC group is an independent entropy stream. Encode the
+    // streams in parallel, then place their writers back in raster order.
+    let dc_sections = ctx
+        .thread_pool
+        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
+            let dc_data = &dc_datas[i];
+            let mut w = BitWriter::new();
+            w.write(2, 0); // extra_dc_precision
+            w.write(4, 3); // use global tree, default wp, no transforms
+            if dc_code.use_prefix_code {
+                for t in &dc_tokens_per_group[i] {
+                    write_token(*t, &dc_code, &mut w);
+                }
+            } else {
+                crate::entropy::write_ans_tokens(
+                    &dc_tokens_per_group[i],
+                    dc_code.context_map,
+                    dc_code.ans_symbols,
+                    &mut w,
+                );
             }
-        } else {
-            crate::entropy::write_ans_tokens(
-                &dc_tokens_per_group[i],
-                dc_code.context_map,
-                dc_code.ans_symbols,
-                w,
-            );
-        }
-        let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
-        let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
-        let nb_bits = if num_blocks <= 1 {
-            0
-        } else {
-            32 - (num_blocks as u32).leading_zeros() as usize
-                - if num_blocks.is_power_of_two() { 1 } else { 0 }
-        };
-        if nb_bits != 0 {
-            w.write(nb_bits, (num_ac_blocks - 1) as u64);
-        }
-        w.write(4, 3);
-        if dc_code.use_prefix_code {
-            for t in &meta_tokens_per_group[i] {
-                write_token(*t, &dc_code, w);
+            let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
+            let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
+            let nb_bits = if num_blocks <= 1 {
+                0
+            } else {
+                32 - (num_blocks as u32).leading_zeros() as usize
+                    - if num_blocks.is_power_of_two() { 1 } else { 0 }
+            };
+            if nb_bits != 0 {
+                w.write(nb_bits, (num_ac_blocks - 1) as u64);
             }
-        } else {
-            crate::entropy::write_ans_tokens(
-                &meta_tokens_per_group[i],
-                dc_code.context_map,
-                dc_code.ans_symbols,
-                w,
-            );
-        }
+            w.write(4, 3);
+            if dc_code.use_prefix_code {
+                for t in &meta_tokens_per_group[i] {
+                    write_token(*t, &dc_code, &mut w);
+                }
+            } else {
+                crate::entropy::write_ans_tokens(
+                    &meta_tokens_per_group[i],
+                    dc_code.context_map,
+                    dc_code.ans_symbols,
+                    &mut w,
+                );
+            }
+            w
+        });
+    for (i, section) in dc_sections.into_iter().enumerate() {
+        sections[1 + i] = section;
     }
 
     // Phase 6: AC global. One HfPass per pass (each with its own code), or a
@@ -1200,19 +1207,25 @@ fn encode_frame_core(
     // (pass, group) = 2 + num_dc_groups + pass*num_groups + group_idx
     // (jxl-frame toc.rs:196-200). With LZ77 (single-pass only) we emit the
     // compressed stream; otherwise raw tokens via the shared plain code.
-    for (i, pg) in all_pending.iter().enumerate() {
-        for (pass, pass_tokens) in pg.tokens.iter().enumerate() {
+    let num_ac_sections = all_pending.len() * num_passes;
+    let ac_sections = ctx
+        .thread_pool
+        .steal_map(scratch, num_ac_sections, |task, _scratch| {
+            let i = task / num_passes;
+            let pass = task % num_passes;
+            let pg = &all_pending[i];
+            let pass_tokens = &pg.tokens[pass];
+            let mut w = BitWriter::new();
             let section_idx = 2 + dim.num_dc_groups + pass * dim.num_groups + pg.group_idx;
-            let w = &mut sections[section_idx];
             if use_lz77 {
                 for t in &ac_lz_per_group[i] {
-                    crate::enc_lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, w);
+                    crate::enc_lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, &mut w);
                 }
             } else {
                 let code_ref = ac_code_per_pass[pass].as_ref();
                 if code_ref.use_prefix_code {
                     for t in pass_tokens {
-                        write_token(*t, &code_ref, w);
+                        write_token(*t, &code_ref, &mut w);
                     }
                 } else {
                     // rANS: the whole group's tokens are encoded as one LIFO unit.
@@ -1220,38 +1233,47 @@ fn encode_frame_core(
                         pass_tokens,
                         code_ref.context_map,
                         code_ref.ans_symbols,
-                        w,
+                        &mut w,
                     );
                 }
             }
-        }
+            (section_idx, w)
+        });
+    for (section_idx, section) in ac_sections {
+        sections[section_idx] = section;
     }
     // Modular alpha: extra-channel modular data is decoded in the last pass
     // (the only pass whose modular sub-image shift range is set when num_ds=0,
     // jxl-frame lib.rs:101-108 / pass_group.rs:93). Write it into that section.
     if let Some(alpha_plane) = alpha {
         let last_pass = num_passes - 1;
-        for image_gy in 0..dim.ysize_groups {
-            for image_gx in 0..dim.xsize_groups {
-                let group_x0 = image_gx * K_GROUP_DIM;
-                let group_y0 = image_gy * K_GROUP_DIM;
-                let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
-                let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
-                let abs_group_id = image_gy * dim.xsize_groups + image_gx;
-                let ac_group_idx =
-                    2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id;
-                crate::modular::write_ac_group_alpha(
-                    alpha_plane,
-                    dim.xsize,
-                    dim.ysize,
-                    group_x0,
-                    group_y0,
-                    group_xsize,
-                    group_ysize,
-                    scratch,
-                    &mut sections[ac_group_idx],
-                );
-            }
+        let alpha_sections =
+            ctx.thread_pool
+                .steal_map(scratch, dim.num_groups, |abs_group_id, scratch| {
+                    let image_gx = abs_group_id % dim.xsize_groups;
+                    let image_gy = abs_group_id / dim.xsize_groups;
+                    let group_x0 = image_gx * K_GROUP_DIM;
+                    let group_y0 = image_gy * K_GROUP_DIM;
+                    let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
+                    let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
+                    let ac_group_idx =
+                        2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id;
+                    let mut w = BitWriter::new();
+                    crate::modular::write_ac_group_alpha(
+                        alpha_plane,
+                        dim.xsize,
+                        dim.ysize,
+                        group_x0,
+                        group_y0,
+                        group_xsize,
+                        group_ysize,
+                        scratch,
+                        &mut w,
+                    );
+                    (ac_group_idx, w)
+                });
+        for (section_idx, alpha_section) in alpha_sections {
+            sections[section_idx].append(&alpha_section);
         }
     }
 

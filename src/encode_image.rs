@@ -28,7 +28,7 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::color::{lut_high_bit, srgb_to_linear_f32, srgb_to_linear_u8};
+use crate::color::{lut_high_bit, srgb_lut, srgb_to_linear_f32};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
 use crate::enc_frame::encode_frame;
@@ -617,6 +617,103 @@ pub fn distance_from_quality(quality: f32) -> f32 {
     d.min(25.0)
 }
 
+fn lossy_context(config: &EncodeConfig, distance: f32) -> EncodingContext {
+    EncodingContext::new(config.speed, config.boost, distance, config.num_threads)
+}
+
+fn for_each_linear_band<F>(
+    image: &mut Image3F,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    f: F,
+) where
+    F: Fn(usize, [&mut [f32]; 3]) + Sync,
+{
+    let mut pixel_start = 0;
+    let mut jobs: Vec<_> = image
+        .row_bands_mut(ctx.thread_pool.num_threads())
+        .into_iter()
+        .map(|band| {
+            let start = pixel_start;
+            pixel_start += band[0].len();
+            Some((start, band))
+        })
+        .collect();
+
+    if jobs.len() <= 1 {
+        for job in jobs {
+            let (start, band) = job.unwrap();
+            f(start, band);
+        }
+    } else {
+        ctx.thread_pool
+            .steal_for_each_mut(scratch, &mut jobs, |_i, job, _scratch| {
+                let (start, band) = job.take().unwrap();
+                f(start, band);
+            });
+    }
+}
+
+fn linearize_rgb<T, F, const CHANNELS: usize>(
+    input: &[T],
+    width: usize,
+    height: usize,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    convert: F,
+) -> Image3F
+where
+    T: Copy + Sync,
+    F: Fn(T) -> f32 + Sync,
+{
+    debug_assert!(CHANNELS >= 3);
+    let mut linear = Image3F::new(width, height);
+    for_each_linear_band(&mut linear, ctx, scratch, |pixel_start, [r, g, b]| {
+        let src = &input[pixel_start * CHANNELS..][..r.len() * CHANNELS];
+        for (((r, g), b), px) in r
+            .iter_mut()
+            .zip(g.iter_mut())
+            .zip(b.iter_mut())
+            .zip(src.as_chunks::<CHANNELS>().0.iter())
+        {
+            *r = convert(px[0]);
+            *g = convert(px[1]);
+            *b = convert(px[2]);
+        }
+    });
+    linear
+}
+
+fn linearize_gray<T, F>(
+    input: &[T],
+    width: usize,
+    height: usize,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    convert: F,
+) -> Image3F
+where
+    T: Copy + Sync,
+    F: Fn(T) -> f32 + Sync,
+{
+    let mut linear = Image3F::new(width, height);
+    for_each_linear_band(&mut linear, ctx, scratch, |pixel_start, [r, g, b]| {
+        let src = &input[pixel_start..][..r.len()];
+        for (((r, g), b), &v) in r
+            .iter_mut()
+            .zip(g.iter_mut())
+            .zip(b.iter_mut())
+            .zip(src.iter())
+        {
+            let linear = convert(v);
+            *r = linear;
+            *g = linear;
+            *b = linear;
+        }
+    });
+    linear
+}
+
 /// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
 /// using the default color encoding (sRGB primaries, linear transfer).
 ///
@@ -664,31 +761,21 @@ pub fn encode_image(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
-    for (y, row) in input.chunks_exact(width * 3).enumerate() {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for (((r, g), b), src) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.as_chunks::<3>().0.iter())
-        {
-            *r = srgb_to_linear_u8(src[0]);
-            *g = srgb_to_linear_u8(src[1]);
-            *b = srgb_to_linear_u8(src[2]);
-        }
-    }
-    encode_with_config(
-        &linear,
-        &EncodeConfigImpl::with_distance(distance)
-            .with_progressive_from(config)
-            .with_icc_profile(config.icc_profile.clone())
-            .with_exif(config.exif.clone())
-            .with_orientation(config.orientation)
-            .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target)
-            .with_num_threads(config.num_threads),
-    )
+    let lut = srgb_lut();
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
+    let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
+        lut[v as usize]
+    });
+    let cfg = EncodeConfigImpl::with_distance(distance)
+        .with_progressive_from(config)
+        .with_icc_profile(config.icc_profile.clone())
+        .with_exif(config.exif.clone())
+        .with_orientation(config.orientation)
+        .with_color_encoding(config.color_encoding)
+        .with_intensity_target(config.intensity_target)
+        .with_num_threads(config.num_threads);
+    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
 /// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
@@ -739,39 +826,23 @@ pub fn encode_image_with_alpha(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
-    let mut alpha_plane = vec![0u8; width * height];
-    for (y, (row, alpha_row)) in input
-        .chunks_exact(width * 4)
-        .zip(alpha_plane.chunks_exact_mut(width))
-        .enumerate()
-    {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for ((((r, g), b), src), alpha) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.as_chunks::<4>().0.iter())
-            .zip(alpha_row.iter_mut())
-        {
-            *r = srgb_to_linear_u8(src[0]);
-            *g = srgb_to_linear_u8(src[1]);
-            *b = srgb_to_linear_u8(src[2]);
-            *alpha = src[3];
-        }
-    }
-    encode_with_config(
-        &linear,
-        &EncodeConfigImpl::with_distance(distance)
-            .with_progressive_from(config)
-            .with_alpha(AlphaPlane::from_u8(alpha_plane))
-            .with_icc_profile(config.icc_profile.clone())
-            .with_exif(config.exif.clone())
-            .with_orientation(config.orientation)
-            .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target)
-            .with_num_threads(config.num_threads),
-    )
+    let lut = srgb_lut();
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
+    let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
+        lut[v as usize]
+    });
+    let alpha_plane = input.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
+    let cfg = EncodeConfigImpl::with_distance(distance)
+        .with_progressive_from(config)
+        .with_alpha(AlphaPlane::from_u8(alpha_plane))
+        .with_icc_profile(config.icc_profile.clone())
+        .with_exif(config.exif.clone())
+        .with_orientation(config.orientation)
+        .with_color_encoding(config.color_encoding)
+        .with_intensity_target(config.intensity_target)
+        .with_num_threads(config.num_threads);
+    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
 pub fn encode_image_with_alpha_10bit(
@@ -947,32 +1018,25 @@ fn encode_gray_impl(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
-    for (y, row) in luma.chunks_exact(width).enumerate() {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for (((r, g), b), &v) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.iter())
-        {
-            let lin = srgb_to_linear_u8(v);
-            *r = lin;
-            *g = lin;
-            *b = lin;
-        }
-    }
+    let srgb_lut = srgb_lut();
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| {
+        srgb_lut[v as usize]
+    });
     let mut cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
         .with_grayscale(true)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
         .with_orientation(config.orientation)
-        .with_color_encoding(config.color_encoding);
+        .with_color_encoding(config.color_encoding)
+        .with_intensity_target(config.intensity_target)
+        .with_num_threads(config.num_threads);
     if let Some(a) = alpha {
         cfg = cfg.with_alpha(AlphaPlane::from_u8(a));
     }
-    encode_with_config(&linear, &cfg)
+    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
 /// Encode a 10-bit grayscale image. `input` is `width * height` luma samples (0..=1023).
@@ -1188,22 +1252,9 @@ fn encode_gray_high_depth_impl(
 
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let mut linear = Image3F::new(width, height);
-
-    for (y, row) in luma.chunks_exact(width).enumerate() {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for (((r, g), b), &v) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.iter())
-        {
-            let lin = lut[v as usize];
-            *r = lin;
-            *g = lin;
-            *b = lin;
-        }
-    }
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| lut[v as usize]);
 
     let alpha_plane = alpha.map(|a| match bps {
         BitsPerSample::Ten => AlphaPlane::from_u16_10bit(a),
@@ -1222,11 +1273,13 @@ fn encode_gray_high_depth_impl(
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
         .with_orientation(config.orientation)
-        .with_color_encoding(config.color_encoding);
+        .with_color_encoding(config.color_encoding)
+        .with_intensity_target(config.intensity_target)
+        .with_num_threads(config.num_threads);
     if let Some(ap) = alpha_plane {
         cfg = cfg.with_alpha(ap);
     }
-    encode_with_config(&linear, &cfg)
+    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
@@ -1267,9 +1320,9 @@ fn encode_high_depth_rgba(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
-
     let lut = &lut_high_bit(bps.bits() as u8).table;
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
 
     // For 16-bit, (1 << 16) - 1 overflows u16's shift; compute in u32 and cap.
     let bp_max: u16 = if bps.bits() >= 16 {
@@ -1279,75 +1332,48 @@ fn encode_high_depth_rgba(
     };
 
     if has_alpha {
-        let mut alpha_plane = vec![0u16; width * height];
-        for (y, (row, alpha_row)) in input
-            .chunks_exact(width * 4)
-            .zip(alpha_plane.chunks_exact_mut(width))
-            .enumerate()
-        {
-            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-            for ((((r, g), b), src), alpha) in r_row
-                .iter_mut()
-                .zip(g_row.iter_mut())
-                .zip(b_row.iter_mut())
-                .zip(row.as_chunks::<4>().0.iter())
-                .zip(alpha_row.iter_mut())
-            {
-                *r = lut[src[0] as usize];
-                *g = lut[src[1] as usize];
-                *b = lut[src[2] as usize];
-                *alpha = src[3].min(bp_max);
-            }
-        }
-
-        encode_with_config(
-            &linear,
-            &EncodeConfigImpl::with_distance(distance)
-                .with_progressive_from(config)
-                .with_alpha(match bps {
-                    BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
-                    BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
-                    BitsPerSample::Sixteen => AlphaPlane::from_u16_16bit(alpha_plane),
-                    BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
-                    BitsPerSample::F16 | BitsPerSample::F32 => {
-                        unreachable!("float path does not use the integer alpha match")
-                    }
-                })
-                .with_bits_per_sample(bps)
-                .with_icc_profile(config.icc_profile.clone())
-                .with_exif(config.exif.clone())
-                .with_orientation(config.orientation)
-                .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target)
-                .with_num_threads(config.num_threads),
-        )
+        let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
+            lut[v as usize]
+        });
+        let alpha_plane = input
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| px[3].min(bp_max))
+            .collect();
+        let cfg = EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
+            .with_alpha(match bps {
+                BitsPerSample::Ten => AlphaPlane::from_u16_10bit(alpha_plane),
+                BitsPerSample::Twelve => AlphaPlane::from_u16_12bit(alpha_plane),
+                BitsPerSample::Sixteen => AlphaPlane::from_u16_16bit(alpha_plane),
+                BitsPerSample::Eight => unreachable!("high-depth path called with 8-bit bps"),
+                BitsPerSample::F16 | BitsPerSample::F32 => {
+                    unreachable!("float path does not use the integer alpha match")
+                }
+            })
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads);
+        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     } else {
-        for (y, row) in input.chunks_exact(width * 3).enumerate() {
-            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-            for (((r, g), b), src) in r_row
-                .iter_mut()
-                .zip(g_row.iter_mut())
-                .zip(b_row.iter_mut())
-                .zip(row.as_chunks::<3>().0.iter())
-            {
-                *r = lut[src[0] as usize];
-                *g = lut[src[1] as usize];
-                *b = lut[src[2] as usize];
-            }
-        }
-
-        encode_with_config(
-            &linear,
-            &EncodeConfigImpl::with_distance(distance)
-                .with_progressive_from(config)
-                .with_bits_per_sample(bps)
-                .with_icc_profile(config.icc_profile.clone())
-                .with_exif(config.exif.clone())
-                .with_orientation(config.orientation)
-                .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target)
-                .with_num_threads(config.num_threads),
-        )
+        let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
+            lut[v as usize]
+        });
+        let cfg = EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads);
+        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     }
 }
 
@@ -1454,68 +1480,42 @@ fn encode_float_rgba(
         return encode_f32_lossless_rgba(input, width, height, has_alpha, config);
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
 
     if has_alpha {
-        let mut alpha_plane = vec![0u16; width * height];
-        for (y, (row, alpha_row)) in input
-            .chunks_exact(width * 4)
-            .zip(alpha_plane.chunks_exact_mut(width))
-            .enumerate()
-        {
-            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-            for ((((r, g), b), src), a) in r_row
-                .iter_mut()
-                .zip(g_row.iter_mut())
-                .zip(b_row.iter_mut())
-                .zip(row.as_chunks::<4>().0.iter())
-                .zip(alpha_row.iter_mut())
-            {
-                *r = srgb_to_linear_f32(src[0]);
-                *g = srgb_to_linear_f32(src[1]);
-                *b = srgb_to_linear_f32(src[2]);
-                *a = (src[3].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-            }
-        }
-        encode_with_config(
-            &linear,
-            &EncodeConfigImpl::with_distance(distance)
-                .with_progressive_from(config)
-                .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
-                .with_bits_per_sample(bps)
-                .with_icc_profile(config.icc_profile.clone())
-                .with_exif(config.exif.clone())
-                .with_orientation(config.orientation)
-                .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target)
-                .with_num_threads(config.num_threads),
-        )
+        let linear =
+            linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let alpha_plane = input
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| (px[3].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16)
+            .collect();
+        let cfg = EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
+            .with_alpha(AlphaPlane::from_u16_16bit(alpha_plane))
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads);
+        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     } else {
-        for (y, row) in input.chunks_exact(width * 3).enumerate() {
-            let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-            for (((r, g), b), src) in r_row
-                .iter_mut()
-                .zip(g_row.iter_mut())
-                .zip(b_row.iter_mut())
-                .zip(row.as_chunks::<3>().0.iter())
-            {
-                *r = srgb_to_linear_f32(src[0]);
-                *g = srgb_to_linear_f32(src[1]);
-                *b = srgb_to_linear_f32(src[2]);
-            }
-        }
-        encode_with_config(
-            &linear,
-            &EncodeConfigImpl::with_distance(distance)
-                .with_progressive_from(config)
-                .with_bits_per_sample(bps)
-                .with_icc_profile(config.icc_profile.clone())
-                .with_exif(config.exif.clone())
-                .with_orientation(config.orientation)
-                .with_color_encoding(config.color_encoding)
-                .with_intensity_target(config.intensity_target)
-                .with_num_threads(config.num_threads),
-        )
+        let linear =
+            linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let cfg = EncodeConfigImpl::with_distance(distance)
+            .with_progressive_from(config)
+            .with_bits_per_sample(bps)
+            .with_icc_profile(config.icc_profile.clone())
+            .with_exif(config.exif.clone())
+            .with_orientation(config.orientation)
+            .with_color_encoding(config.color_encoding)
+            .with_intensity_target(config.intensity_target)
+            .with_num_threads(config.num_threads);
+        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     }
 }
 
@@ -1536,34 +1536,20 @@ fn encode_float_gray(
         });
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let mut linear = Image3F::new(width, height);
-    for (y, row) in luma.chunks_exact(width).enumerate() {
-        let [r_row, g_row, b_row] = linear.all_plane_rows_mut(y);
-        for (((r, g), b), &v) in r_row
-            .iter_mut()
-            .zip(g_row.iter_mut())
-            .zip(b_row.iter_mut())
-            .zip(row.iter())
-        {
-            let lin = srgb_to_linear_f32(v);
-            *r = lin;
-            *g = lin;
-            *b = lin;
-        }
-    }
-    encode_with_config(
-        &linear,
-        &EncodeConfigImpl::with_distance(distance)
-            .with_progressive_from(config)
-            .with_grayscale(true)
-            .with_bits_per_sample(bps)
-            .with_icc_profile(config.icc_profile.clone())
-            .with_exif(config.exif.clone())
-            .with_orientation(config.orientation)
-            .with_color_encoding(config.color_encoding)
-            .with_intensity_target(config.intensity_target)
-            .with_num_threads(config.num_threads),
-    )
+    let ctx = lossy_context(config, distance);
+    let mut scratch = Box::<CoderScratch>::default();
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+    let cfg = EncodeConfigImpl::with_distance(distance)
+        .with_progressive_from(config)
+        .with_grayscale(true)
+        .with_bits_per_sample(bps)
+        .with_icc_profile(config.icc_profile.clone())
+        .with_exif(config.exif.clone())
+        .with_orientation(config.orientation)
+        .with_color_encoding(config.color_encoding)
+        .with_intensity_target(config.intensity_target)
+        .with_num_threads(config.num_threads);
+    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
 /// Encode a 32-bit float RGB image (lossy). `input` is interleaved `[R, G, B]`,
@@ -1661,10 +1647,11 @@ fn progressive_schedule(
     (0..n).rev().map(|p| p as u32).collect()
 }
 
-/// Encode a linear-light RGB `Image3F` with the supplied configuration.
-pub(crate) fn encode_with_config(
+fn encode_with_context(
     input: &Image3F,
     config: &EncodeConfigImpl,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
 ) -> Result<Vec<u8>, EncodeError> {
     if input.xsize() == 0 || input.ysize() == 0 {
         return Err(EncodeError::EmptyImage);
@@ -1698,13 +1685,11 @@ pub(crate) fn encode_with_config(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(input.xsize(), input.ysize(), &mut w);
-    let ctx = EncodingContext::new(config.speed, config.dark_aq, distance, config.num_threads);
     let coeff_shifts = progressive_schedule(
         config.progressive,
         config.progressive_passes,
         config.progressive_shifts.as_deref(),
     );
-    let mut scratch = Box::<CoderScratch>::default();
     write_image_metadata(
         config.tone_mapping(),
         &config.color_encoding,
@@ -1714,12 +1699,12 @@ pub(crate) fn encode_with_config(
         config.lossless,
         config.grayscale,
         config.orientation,
-        &mut scratch,
+        scratch,
         &mut w,
     );
     encode_frame(
-        &ctx,
-        &mut scratch,
+        ctx,
+        scratch,
         distance,
         input,
         config.alpha.as_ref(),
@@ -2169,6 +2154,26 @@ mod tests {
     fn default_speed_is_fast() {
         assert_eq!(Speed::default(), Speed::Fast);
         assert_eq!(EncodeConfig::default().speed, Speed::Fast);
+    }
+
+    #[test]
+    fn srgb_linearization_uses_requested_threads() {
+        use std::collections::HashSet;
+        use std::sync::{Barrier, Mutex};
+
+        let config = EncodeConfig::default().with_num_threads(4);
+        let ctx = lossy_context(&config, 1.0);
+        let mut scratch = Box::<CoderScratch>::default();
+        let mut image = Image3F::new(8, 4);
+        let barrier = Barrier::new(4);
+        let threads = Mutex::new(HashSet::new());
+
+        for_each_linear_band(&mut image, &ctx, &mut scratch, |_start, _band| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            barrier.wait();
+        });
+
+        assert_eq!(threads.into_inner().unwrap().len(), 4);
     }
 
     #[test]
