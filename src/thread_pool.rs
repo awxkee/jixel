@@ -29,7 +29,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -238,6 +238,78 @@ impl ThreadPool {
         }
         slots.into_iter().map(Option::unwrap).collect()
     }
+
+    /// Apply `f` to every item, allowing workers to borrow distinct mutable
+    /// elements without wrapping each element in a lock.
+    pub(crate) fn steal_for_each_mut<T, F>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        items: &mut [T],
+        f: F,
+    ) where
+        T: Send,
+        F: Fn(usize, &mut T, &mut CoderScratch) + Sync,
+    {
+        let lanes = self.num_threads.min(items.len());
+        if lanes <= 1 {
+            for (i, item) in items.iter_mut().enumerate() {
+                f(i, item, caller_scratch);
+            }
+            return;
+        }
+
+        let cursor = AtomicUsize::new(0);
+        let items_ptr = AtomicPtr::new(items.as_mut_ptr());
+        let len = items.len();
+        let completion = Arc::new(Completion {
+            remaining: AtomicUsize::new(lanes),
+            panic: Mutex::new(None),
+        });
+
+        let lane = |scratch: &mut CoderScratch| {
+            let items_ptr = items_ptr.load(Ordering::Relaxed);
+            loop {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= len {
+                    break;
+                }
+                // Every index is returned exactly once by `cursor`, so
+                // concurrent lanes cannot create overlapping mutable
+                // references. All lanes complete before this function returns,
+                // keeping `items` alive.
+                let item = unsafe { &mut *items_ptr.add(i) };
+                f(i, item, scratch);
+            }
+        };
+
+        for _ in 1..lanes {
+            let run: Box<dyn FnOnce(&mut CoderScratch) + Send + '_> = Box::new(&lane);
+            // See `steal_map_with_threads`: completion scopes the borrowed
+            // closure and `items` to this call despite the persistent workers.
+            let run = unsafe {
+                std::mem::transmute::<
+                    Box<dyn FnOnce(&mut CoderScratch) + Send + '_>,
+                    Box<dyn FnOnce(&mut CoderScratch) + Send + 'static>,
+                >(run)
+            };
+            self.shared.push(Task {
+                run,
+                completion: Arc::clone(&completion),
+            });
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| lane(caller_scratch)));
+        completion.finish(result.err(), &self.shared);
+
+        while completion.remaining.load(Ordering::Acquire) != 0 {
+            if !self.shared.run_one(caller_scratch) {
+                self.shared.wait_for_activity(&completion.remaining);
+            }
+        }
+
+        if let Some(payload) = completion.panic.lock().unwrap().take() {
+            resume_unwind(payload);
+        }
+    }
 }
 
 impl Drop for ThreadPool {
@@ -309,6 +381,22 @@ mod tests {
                 (0..31).map(|i| offset + i).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn mutable_map_visits_each_item_once_without_locks() {
+        let pool = ThreadPool::new(4);
+        let mut scratch = Box::<CoderScratch>::default();
+        let mut values = vec![0usize; 257];
+        pool.steal_for_each_mut(&mut scratch, &mut values, |i, value, _scratch| {
+            *value = i.wrapping_mul(17);
+        });
+        assert_eq!(
+            values,
+            (0usize..257)
+                .map(|i| i.wrapping_mul(17))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

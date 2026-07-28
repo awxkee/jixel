@@ -126,10 +126,7 @@ fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content. Rebalances the d>=4 tail toward AC; measured
-    // on photo/fractal/glow/portrait sets: on-or-above the RD curve, up to
-    // +1.4 SSIMULACRA2 rate-equivalent, and the quality-vs-d cliff softens
-    // by 4-6 SSIMULACRA2 at d=6. No effect at d <= 3.5.
+    // loss on smooth content.
     let refine = dc_refinement(distance);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;

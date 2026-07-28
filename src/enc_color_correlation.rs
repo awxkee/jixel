@@ -123,6 +123,12 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) ->
     x.fast_round().clamp(-128.0, 127.0) as i32
 }
 
+struct CflScratch {
+    block_y: [f32; 64],
+    block_x: [f32; 64],
+    block_b: [f32; 64],
+}
+
 /// Compute (ytox, ytob) for one tile. `tile_brect_*` are block coordinates
 /// (top-left inclusive) into `opsin`, sizes capped at K_TILE_DIM_IN_BLOCKS.
 fn compute_cmap_tile(
@@ -133,14 +139,15 @@ fn compute_cmap_tile(
     bx_count: usize,
     by_count: usize,
     distance: f32,
+    scratch: &mut CflScratch,
 ) -> (i32, i32) {
     let matrices = &ctx.matrices;
-    let qm_x: &[f32; 64] = matrices.inv_matrix(0)[..64].try_into().unwrap();
-    let qm_b: &[f32; 64] = matrices.inv_matrix(2)[..64].try_into().unwrap();
+    let qm_x: &[f32; 64] = matrices.inv_matrix(0).first_chunk::<64>().unwrap();
+    let qm_b: &[f32; 64] = matrices.inv_matrix(2).first_chunk::<64>().unwrap();
 
-    let mut block_y = [0.0f32; 64];
-    let mut block_x = [0.0f32; 64];
-    let mut block_b = [0.0f32; 64];
+    let mut block_y = scratch.block_y;
+    let mut block_x = scratch.block_x;
+    let mut block_b = scratch.block_b;
 
     let mut ca_x = 0.0f32;
     let mut cb_x = 0.0f32;
@@ -207,6 +214,13 @@ pub(crate) fn fill_cmap(
 ) {
     let xtiles = ytox_map.xsize();
     let ytiles = ytox_map.ysize();
+
+    let mut scratch = CflScratch {
+        block_b: [0.; 64],
+        block_x: [0.; 64],
+        block_y: [0.; 64],
+    };
+
     for ty in 0..ytiles {
         let ytox_lane = ytox_map.row_mut(ty);
         let ytob_lane = ytob_map.row_mut(ty);
@@ -224,8 +238,16 @@ pub(crate) fn fill_cmap(
             if bx_count == 0 || by_count == 0 {
                 continue;
             }
-            let (ytox, ytob) =
-                compute_cmap_tile(ctx, opsin, bx0, by0, bx_count, by_count, distance);
+            let (ytox, ytob) = compute_cmap_tile(
+                ctx,
+                opsin,
+                bx0,
+                by0,
+                bx_count,
+                by_count,
+                distance,
+                &mut scratch,
+            );
             *v_ytox = ytox as i8;
             *v_ytob = ytob as i8;
         }
@@ -261,7 +283,12 @@ mod tests {
             }
         }
         let ctx = EncodingContext::default();
-        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0);
+        let mut scratch = CflScratch {
+            block_b: [0.; 64],
+            block_x: [0.; 64],
+            block_y: [0.; 64],
+        };
+        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
         // No variation → no useful correlation → slope == 0 (the regression
         // collapses to numerator=0, denominator>0 → 0).
         assert_eq!(ytox, 0);
@@ -282,7 +309,12 @@ mod tests {
             }
         }
         let ctx = EncodingContext::default();
-        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0);
+        let mut scratch = CflScratch {
+            block_b: [0.; 64],
+            block_x: [0.; 64],
+            block_y: [0.; 64],
+        };
+        let (ytox, ytob) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
         assert!((ytox - 25).abs() < 3, "ytox = {}, expected ~25", ytox);
         // B = Y → slope 1 = base; cmap should be near 0.
         assert!(ytob.abs() < 3, "ytob = {}, expected ~0", ytob);
@@ -341,8 +373,13 @@ mod tests {
             }
         }
         let ctx = EncodingContext::default();
-        let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5);
-        let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0);
+        let mut scratch = CflScratch {
+            block_b: [0.; 64],
+            block_x: [0.; 64],
+            block_y: [0.; 64],
+        };
+        let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5, &mut scratch);
+        let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
         assert!(
             ytox_hq < ytox_lq,
             "deadzone should shrink the HQ slope: hq={ytox_hq} lq={ytox_lq}"
