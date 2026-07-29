@@ -276,7 +276,7 @@ pub(crate) fn apply(
             let px = x0 + bx * 8;
             let w = opsin.xsize().saturating_sub(px).min(8);
             let d = correction - center;
-            weighted_variance += (w * h) as f32 * d * d;
+            weighted_variance = fmla((w * h) as f32, d * d, weighted_variance);
         }
     }
     let inv_stddev = if weighted_variance == 0.0 {

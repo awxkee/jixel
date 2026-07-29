@@ -29,7 +29,6 @@
 use crate::adaptive_quant::{dirty_log1pf, fast_exp2};
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
-use crate::util::FastRound;
 
 #[cfg(test)]
 pub(crate) trait AqLuma: Copy {
@@ -88,7 +87,7 @@ pub(crate) fn variance_boost_delta(
     if v_log < LOW_LOG {
         // Low contrast: boost (negative delta). Deeper below threshold => stronger.
         let d = ((LOW_LOG - v_log) * BOOST_SLOPE * strength).min(MAX_BOOST);
-        -(d.fast_round() as i32)
+        -(d.round() as i32)
     } else if boost_only {
         0
     } else {
@@ -96,7 +95,7 @@ pub(crate) fn variance_boost_delta(
         // reference (not the threshold) keeps well-textured frames near zero-mean.
         let over = (v_log - ref_log.max(LOW_LOG)).max(0.0);
         let d = (over * CUT_SLOPE * strength).min(MAX_CUT);
-        d.fast_round() as i32
+        d.round() as i32
     }
 }
 
@@ -253,7 +252,7 @@ fn dark_protection_from_stats(d: &DarkAq, base_q: i32, mean: f32, mid_energy: f3
     (dark_structure * d.scale)
         .min(d.max_qidx as f32)
         .max(0.0)
-        .fast_round() as i32
+        .round() as i32
 }
 
 /// Extra qindex reduction (>= 0) for a dark, structured SB. 0 when disabled, out of the
@@ -289,6 +288,10 @@ pub(crate) fn dark_protection<T: AqLuma>(
 /// - `boost_only`   never coarsen busy SBs (pure additive boost). Default `false`.
 /// - `dark`         Dark AQ sub-config (`enabled`, `scale`, …). Default on, scale `4.0`.
 /// - `dark_min_d`   Min butteraugli distance for Dark AQ to engage. Default `0.0` (all).
+/// - `vb_min_d`     Min butteraugli distance for Variance Boost to engage. Default `0.0`
+///   (all distances). VB reallocates within a fixed budget, which only pays once the
+///   fine-grained 8x8 masking AQ has faded out (d >~ 2).
+/// - `vb_edge_t`    Edge/text content threshold: an SB whose sub-block variance
 #[derive(Clone, Copy, Debug)]
 pub struct DarkAqConfig {
     pub vb_strength: f32,
@@ -297,6 +300,8 @@ pub struct DarkAqConfig {
     pub boost_only: bool,
     pub dark: DarkAq,
     pub dark_min_d: f32,
+    pub vb_min_d: f32,
+    pub vb_edge_t: f32,
 }
 
 const Y_TO_LUMA8: f32 = 300.0;
@@ -314,6 +319,8 @@ impl Default for DarkAqConfig {
                 ..DarkAq::on()
             },
             dark_min_d: 0.0,
+            vb_min_d: 0.0,
+            vb_edge_t: f32::INFINITY,
         }
     }
 }
@@ -363,6 +370,14 @@ impl DarkAqConfig {
         })?;
         field(&mut |f| {
             cfg.dark_min_d = f.parse().ok()?;
+            Some(())
+        })?;
+        field(&mut |f| {
+            cfg.vb_min_d = f.parse().ok()?;
+            Some(())
+        })?;
+        field(&mut |f| {
+            cfg.vb_edge_t = f.parse().ok()?;
             Some(())
         })?;
         Some(cfg)
@@ -449,7 +464,7 @@ pub(crate) fn apply_boost(
     let sb_cols = xblocks.div_ceil(8);
     let sb_rows = yblocks.div_ceil(8);
 
-    let vb_on = cfg.vb_strength > 0.0;
+    let vb_on = cfg.vb_strength > 0.0 && distance >= cfg.vb_min_d;
     let dark_on = cfg.dark.enabled && distance >= cfg.dark_min_d;
     if !vb_on && !dark_on {
         return;
@@ -460,9 +475,11 @@ pub(crate) fn apply_boost(
 
     // First pass: octile variance per SB (+ its tile buffer reused in pass 2 via
     // recompute — SBs are cheap and this keeps memory flat). Also accumulate the
-    // mean log-variance reference for the two-sided cut.
-    if vb_on && cell.len() < sb_cols * sb_rows {
-        cell.resize_with(sb_cols * sb_rows, Default::default);
+    // mean log-variance reference for the two-sided cut. `cell` holds the picked
+    // variance in [0, n) and the edge/text dispersion score in [n, 2n).
+    let n_sb = sb_cols * sb_rows;
+    if vb_on && cell.len() < 2 * n_sb {
+        cell.resize_with(2 * n_sb, Default::default);
     }
     let mut ref_acc = 0f32;
     let mut ref_n = 0u32;
@@ -481,19 +498,27 @@ pub(crate) fn apply_boost(
     };
 
     if vb_on {
-        let picked = &mut cell[..sb_cols * sb_rows];
-        for (sby, row) in picked.chunks_exact_mut(sb_cols).enumerate().take(sb_rows) {
-            for (sbx, dst) in row.iter_mut().enumerate() {
+        let (picked, edge) = cell[..2 * n_sb].split_at_mut(n_sb);
+        for sby in 0..sb_rows {
+            for sbx in 0..sb_cols {
+                let i = sby * sb_cols + sbx;
                 let sb_x0 = x0 + sbx * 64;
                 let sb_y0 = y0 + sby * 64;
                 let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
                 if w == 0 || h == 0 {
-                    *dst = 0.0;
+                    picked[i] = 0.0;
+                    edge[i] = 0.0;
                     continue;
                 }
                 let mut subvars = subblock_variances(&tile, 64, w, h);
+                // Edge/text score: dispersion between the busiest and the median
+                // sub-block. Flat background + a few extreme edge blocks (text,
+                // signs) scores high; uniform texture scores low.
+                let v_max = subvars.iter().copied().fold(0f32, f32::max);
+                let v_med = sb_octile_variance(&mut subvars.clone(), 4);
+                edge[i] = dirty_log1pf(v_max) - dirty_log1pf(v_med);
                 let pv = sb_octile_variance(&mut subvars, cfg.octile);
-                *dst = pv;
+                picked[i] = pv;
                 ref_acc += dirty_log1pf(pv);
                 ref_n += 1;
             }
@@ -505,16 +530,46 @@ pub(crate) fn apply_boost(
         0.0
     };
 
+    // Zero-mean the VB deltas across the DC group so VB is a pure spatial
+    // reallocation, never a global rate change. The boost side's low-variance
+    // threshold is absolute, so on majority-flat content (sky, signs) almost
+    // every SB qualifies and un-normalized VB turns into a blanket overspend
+    // (measured: -1.2 SS2 rate-matched on a flat-dominated holdout image).
+    // Skipped under `boost_only`, whose semantics are an intentional one-sided
+    // spend. Deltas are recomputed cheaply from `cell` in the apply loop.
+    // Edge/text content classifier at DC-group granularity: if the MAJORITY of
+    // SBs are edge-dominated (flat background + sharp strokes — text, signs,
+    // line art), variance is a wrong importance proxy for this content and VB
+    // is switched off for the whole group. Per-SB exclusion was measured worse
+    // than no gate at all (it concentrates the zero-mean reallocation into a
+    // small arbitrary residual pool); the classifier must act wholesale.
+    let vb_group_on = vb_on && {
+        let edge = &cell[n_sb..2 * n_sb];
+        let edgy = edge.iter().filter(|&&e| e > cfg.vb_edge_t).count();
+        2 * edgy <= n_sb
+    };
+
+    let mut vb_mean = 0f32;
+    if vb_group_on && !cfg.boost_only {
+        let picked = &cell[..n_sb];
+        for &pv in picked {
+            vb_mean += variance_boost_delta(pv, ref_log, cfg.vb_strength, false) as f32;
+        }
+        vb_mean /= n_sb as f32;
+    }
+
     // Second pass: convert each SB's summed qindex delta into a field gain and apply.
     for sby in 0..sb_rows {
         for sbx in 0..sb_cols {
             let sb_x0 = x0 + sbx * 64;
             let sb_y0 = y0 + sby * 64;
 
-            let mut delta = 0i32;
-            if vb_on {
+            let mut delta = 0f32;
+            if vb_group_on {
                 let src = cell[sby * sb_cols + sbx];
-                delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only);
+                delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only)
+                    as f32
+                    - vb_mean;
             }
             if dark_on {
                 let (w, h) = fill_tile(&mut tile, sb_x0, sb_y0);
@@ -522,14 +577,14 @@ pub(crate) fn apply_boost(
                     // Tile already in 8-bit-luma units (scale=1.0 here).
                     let rows = tile.as_chunks::<64>().0;
                     let (mean, mid_energy) = dark_structure_stats_buf(rows, h, w);
-                    delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy);
+                    delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy) as f32;
                 }
             }
-            if delta == 0 {
+            if delta == 0.0 {
                 continue;
             }
             // qindex delta (negative = finer) → multiplicative field gain.
-            let gain = fast_exp2(-(delta as f32) * cfg.qstep);
+            let gain = fast_exp2(-delta * cfg.qstep);
 
             let bx0 = sbx * 8;
             let by0 = sby * 8;
@@ -537,7 +592,7 @@ pub(crate) fn apply_boost(
                 let row = raw_quant_field.row_mut(by);
                 for dst in row[bx0..(bx0 + 8).min(xblocks)].iter_mut() {
                     let q = *dst as f32 * gain;
-                    *dst = q.fast_round().clamp(1.0, 255.0) as u8;
+                    *dst = q.round().clamp(1.0, 255.0) as u8;
                 }
             }
         }
@@ -563,12 +618,19 @@ mod tests {
         assert_eq!(c.octile, 6); // untouched
         assert!(!c.dark.enabled); // field 5 = 0
         // Full CSV: explicit variance-boost opt-in.
-        let c = DarkAqConfig::parse("1,4,0.03,1,1,6,2.0").unwrap();
+        let c = DarkAqConfig::parse("1,4,0.03,1,1,6,2.0,2.5").unwrap();
         assert_eq!(c.vb_strength, 1.0);
         assert_eq!(c.octile, 4);
         assert!(c.boost_only);
         assert_eq!(c.dark.scale, 6.0);
         assert_eq!(c.dark_min_d, 2.0);
+        assert_eq!(c.vb_min_d, 2.5);
+        // vb_min_d defaults to 0 (VB at all distances) when omitted.
+        assert_eq!(DarkAqConfig::parse("1.5").unwrap().vb_min_d, 0.0);
+        // vb_edge_t: 9th field; defaults to infinity (classifier off).
+        let c = DarkAqConfig::parse("1,4,0.03,1,1,6,2.0,2.5,3.0").unwrap();
+        assert_eq!(c.vb_edge_t, 3.0);
+        assert_eq!(DarkAqConfig::parse("1.5").unwrap().vb_edge_t, f32::INFINITY);
         // Garbage field ⇒ None (pass stays disabled rather than mis-encoding).
         assert!(DarkAqConfig::parse("1,notanumber").is_none());
     }

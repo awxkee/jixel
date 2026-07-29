@@ -28,19 +28,25 @@
  */
 
 use crate::Speed;
-use crate::ac_context::{K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_CONTEXTS};
+
+use crate::ac_context::compact_block_context_map;
 use crate::bit_writer::BitWriter;
-use crate::coder_scratch::CoderScratch;
-use crate::dc_group_data::{DcGroupData, STRATEGY_DCT, is_sub8_strategy};
+use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
+use crate::dc_group_data::{
+    DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
+    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    is_sub8_strategy,
+};
 use crate::dct::fmla;
+use crate::enc_color_correlation::choose_ytob_dc;
 use crate::enc_group::write_ac_group;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{
-    EntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
+    EntropyCode, Token, f_log2, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
 };
 use crate::image::{Image3B, Image3F, Image3S, Rect};
-use crate::patches::{PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
+use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
@@ -194,12 +200,110 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
     g.clamp(mn, mx)
 }
 
-/// Emit DC tokens for one DC group (in channel order Y, X, B).
-/// Same as write_dc_tokens, but returns the tokens instead of writing them.
-/// Use this to build adaptive entropy codes from the actual token distribution
-/// before committing the bit pattern.
-pub(crate) fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
-    let mut tokens = Vec::new();
+#[inline(always)]
+fn push_dc_wp_token(
+    tokens: &mut Vec<Token>,
+    wp: &mut crate::enc_lossless::WpState,
+    x: usize,
+    y: usize,
+    value: i64,
+    n: i64,
+    w: i64,
+    ne: i64,
+    nw: i64,
+    nn: i64,
+    dc_gradient: &DcPredictorChoice,
+    mchan: usize,
+    props: &mut Vec<crate::enc_dc_tree::DcProp>,
+) {
+    let wp_prediction = wp.predict(x, y, n, w, ne, nw, nn);
+    let prop = (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX) as usize;
+    props.push(crate::enc_dc_tree::dc_prop(mchan, prop));
+    wp.update(value, x, y);
+    // The context comes from the weighted predictor's error whichever predictor
+    // the leaf ends up using, so the tree is navigated identically either way
+    // and the per-leaf choice below costs nothing to signal.
+    let context = K_GRADIENT_CONTEXT_LUT[prop] as usize;
+    let prediction = if dc_gradient[context] {
+        (n + w - nw).clamp(n.min(w), n.max(w))
+    } else {
+        wp_prediction
+    };
+    tokens.push(Token::new(
+        context as u32,
+        pack_signed((value - prediction) as i32),
+    ));
+}
+
+/// Per-leaf predictor selection for the DC plane, indexed by DC context.
+pub(crate) type DcPredictorChoice = [bool; K_NUM_DC_CONTEXTS];
+
+pub(crate) const DC_PREDICTOR_WEIGHTED: DcPredictorChoice = [false; K_NUM_DC_CONTEXTS];
+
+/// Pick, for every DC leaf independently, whichever predictor codes its own
+/// tokens in fewer bits. Both candidate streams share a context assignment, so
+/// `wp[i]` and `grad[i]` differ only in value and the merged stream is a
+/// per-token pick — no third tokenization pass.
+fn choose_dc_predictors(
+    wp: &[Vec<Token>],
+    grad: &[Vec<Token>],
+    scratch: &mut DcPredictorScratch,
+) -> DcPredictorChoice {
+    // [candidate][context][symbol] counts, plus the raw extra bits per context.
+    let counts = &mut scratch.counts;
+    let extra = &mut scratch.extra;
+    counts.fill([0; crate::entropy::ALPHABET_SIZE]);
+    extra.fill(0);
+    for (cand, groups) in [wp, grad].into_iter().enumerate() {
+        for token in groups.iter().flatten() {
+            let (sym, nbits, _) = crate::entropy::uint_encode(token.value);
+            let slot = cand * K_NUM_DC_CONTEXTS + token.context as usize;
+            counts[slot][sym as usize] += 1;
+            extra[slot] += nbits as u64;
+        }
+    }
+    let cost = |slot: usize| -> f64 {
+        let total: u32 = counts[slot].iter().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let total = f64::from(total);
+        let entropy: f64 = counts[slot]
+            .iter()
+            .filter(|&&n| n != 0)
+            .map(|&n| f64::from(n) * f_log2(total / f64::from(n)))
+            .sum();
+        entropy + extra[slot] as f64
+    };
+    let mut choice = DC_PREDICTOR_WEIGHTED;
+    for (ctx, out) in choice.iter_mut().enumerate() {
+        // The per-context Shannon cost ignores the clustering the real code
+        // applies afterward, and leaves with few tokens are exactly the ones
+        // clustering folds into a neighbor. Require a population and a margin
+        // so a leaf only flips when the saving survives that noise.
+        let (wp_cost, grad_cost) = (cost(ctx), cost(K_NUM_DC_CONTEXTS + ctx));
+        let populated = counts[ctx].iter().sum::<u32>() >= MIN_TOKENS_PER_DC_LEAF;
+        *out = populated && grad_cost < wp_cost * DC_PREDICTOR_MARGIN;
+    }
+    choice
+}
+
+/// A DC leaf must own at least this many tokens before its predictor may flip.
+const MIN_TOKENS_PER_DC_LEAF: u32 = 256;
+
+/// Required saving before flipping a leaf away from the weighted predictor.
+const DC_PREDICTOR_MARGIN: f64 = 0.995;
+
+pub(crate) fn collect_dc_tokens(
+    dc_data: &DcGroupData,
+    dc_gradient: &DcPredictorChoice,
+    props: &mut Vec<crate::enc_dc_tree::DcProp>,
+) -> Vec<Token> {
+    let token_count = [1usize, 0, 2]
+        .into_iter()
+        .map(|c| dc_data.quant_dc.plane(c).as_slice().len())
+        .sum();
+    let mut tokens = Vec::with_capacity(token_count);
 
     // Weighted-predictor DC, mirroring libjxl's kWPFixedDC path (enc_modular.cc
     // AddVarDCTDC at speed tiers falcon..squirrel): the guess is the
@@ -209,53 +313,113 @@ pub(crate) fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
     // matching tree: identical structure, property 15, Weighted leaves). The WP
     // state machine and border conventions are the bit-faithful lossless-path
     // ones, so encoder residuals match the reference decoder exactly.
-    for c in [1usize, 0, 2] {
+    for (mchan, c) in [1usize, 0, 2].into_iter().enumerate() {
         let plane = dc_data.quant_dc.plane(c);
         let ysize = plane.ysize();
         let xsize = plane.xsize();
+        if xsize == 0 || ysize == 0 {
+            continue;
+        }
+
         let mut wp = crate::enc_lossless::WpState::new(xsize);
-        for y in 0..ysize {
-            let row_cur = plane.row(y);
-            let row_above = if y > 0 { Some(plane.row(y - 1)) } else { None };
-            let row_above2 = if y > 1 { Some(plane.row(y - 2)) } else { None };
-            for (x, &here) in row_cur[..xsize].iter().enumerate() {
-                let v = here as i64;
-                let w_ = if x > 0 {
-                    row_cur[x - 1] as i64
-                } else if let Some(a) = row_above {
-                    a[x] as i64
-                } else {
-                    0
-                };
-                let n_ = match row_above {
-                    Some(a) => a[x] as i64,
-                    None => w_,
-                };
-                let nw_ = if x > 0
-                    && let Some(row_above) = row_above
-                {
-                    row_above[x - 1] as i64
-                } else {
-                    w_
-                };
-                let ne_ = match row_above {
-                    Some(a) if x + 1 < xsize => a[x + 1] as i64,
-                    _ => n_,
-                };
-                let nn_ = match row_above2 {
-                    Some(a) => a[x] as i64,
-                    None => n_,
-                };
-                let p = wp.predict(x, y, n_, w_, ne_, nw_, nn_);
-                let prop = i64::clamp(
-                    K_GRAD_RANGE_MID + wp.wp_prop,
-                    K_GRAD_RANGE_MIN,
-                    K_GRAD_RANGE_MAX,
+        let mut rows = plane.as_slice().chunks_exact(xsize);
+
+        // On the top row every unavailable north-side neighbor collapses to
+        // the value on the left.
+        let first_row = rows.next().unwrap();
+        let mut left = 0i64;
+        for (x, &value) in first_row.iter().enumerate() {
+            let value = value as i64;
+            push_dc_wp_token(
+                &mut tokens,
+                &mut wp,
+                x,
+                0,
+                value,
+                left,
+                left,
+                left,
+                left,
+                left,
+                dc_gradient,
+                mchan,
+                props,
+            );
+            left = value;
+        }
+
+        let mut row_above = first_row;
+        let mut row_above2 = first_row;
+        for (y, row) in rows.enumerate() {
+            let y = y + 1;
+
+            // First column: W and NW replicate N.
+            let n = row_above[0] as i64;
+            let ne = row_above.get(1).copied().unwrap_or(row_above[0]) as i64;
+            push_dc_wp_token(
+                &mut tokens,
+                &mut wp,
+                0,
+                y,
+                row[0] as i64,
+                n,
+                n,
+                ne,
+                n,
+                row_above2[0] as i64,
+                dc_gradient,
+                mchan,
+                props,
+            );
+
+            // Interior columns have every neighbor available.
+            let current_pairs = row.array_windows::<2>();
+            let north_triplets = row_above.array_windows::<3>();
+            for (offset, ((current, north), &nn)) in current_pairs
+                .zip(north_triplets)
+                .zip(row_above2.iter().skip(1))
+                .enumerate()
+            {
+                push_dc_wp_token(
+                    &mut tokens,
+                    &mut wp,
+                    offset + 1,
+                    y,
+                    current[1] as i64,
+                    north[1] as i64,
+                    current[0] as i64,
+                    north[2] as i64,
+                    north[0] as i64,
+                    nn as i64,
+                    dc_gradient,
+                    mchan,
+                    props,
                 );
-                wp.update(v, x, y);
-                let ctx_id = K_GRADIENT_CONTEXT_LUT[prop as usize] as u32;
-                tokens.push(Token::new(ctx_id, pack_signed((v - p) as i32)));
             }
+
+            // Last column: NE replicates N. Width one was handled above.
+            if xsize > 1 {
+                let x = xsize - 1;
+                let n = row_above[x] as i64;
+                push_dc_wp_token(
+                    &mut tokens,
+                    &mut wp,
+                    x,
+                    y,
+                    row[x] as i64,
+                    n,
+                    row[x - 1] as i64,
+                    n,
+                    row_above[x - 1] as i64,
+                    row_above2[x] as i64,
+                    dc_gradient,
+                    mchan,
+                    props,
+                );
+            }
+
+            row_above2 = row_above;
+            row_above = row;
         }
     }
     tokens
@@ -267,101 +431,122 @@ pub(crate) fn collect_dc_tokens(dc_data: &DcGroupData) -> Vec<Token> {
 /// In libjxl-tiny ALL four sub-streams use the same shared dc_code.
 /// Same as write_ac_metadata_tokens, but returns the tokens. Mirror of
 /// collect_dc_tokens for the AC metadata (YtoX/B, ACS, QF, EPF).
-pub(crate) fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
-    let mut tokens = Vec::new();
+#[inline]
+fn ac_metadata_context(left: i32, base: u32) -> u32 {
+    base + if left > 11 {
+        0
+    } else if left > 5 {
+        1
+    } else if left > 3 {
+        2
+    } else {
+        3
+    }
+}
+
+pub(crate) fn collect_ac_metadata_tokens(
+    dc_data: &DcGroupData,
+    props: &mut Vec<crate::enc_dc_tree::DcProp>,
+) -> Vec<Token> {
+    #[inline]
+    fn wbin(w: i32) -> crate::enc_dc_tree::DcProp {
+        (512 + w).clamp(0, 1023) as crate::enc_dc_tree::DcProp
+    }
     let xsize_blocks = dc_data.ac_strategy.xsize();
     let ysize_blocks = dc_data.ac_strategy.ysize();
     let xtiles = dc_data.ytox_map.xsize();
     let ytiles = dc_data.ytox_map.ysize();
+    let nblocks = xsize_blocks * ysize_blocks;
+    let num_first_blocks = dc_data.ac_strategy.count_first_blocks();
+    let cfl_tokens = dc_data.ytox_map.as_slice().len() + dc_data.ytob_map.as_slice().len();
+    let mut tokens = Vec::with_capacity(cfl_tokens + 2 * num_first_blocks + nblocks);
 
     // (a) YtoX and YtoB tokens with gradient prediction.
-    for c in 0..2usize {
-        let cfl_map = if c == 0 {
-            &dc_data.ytox_map
-        } else {
-            &dc_data.ytob_map
-        };
-        for y in 0..ytiles {
-            let cfl_row = cfl_map.row(y);
-            for (x, &here) in cfl_row[..xtiles].iter().enumerate() {
-                let row_above = if y > 0 {
-                    Some(cfl_map.row(y - 1))
-                } else {
-                    None
-                };
-                let left: i64 = if x > 0 {
-                    cfl_map.row(y)[x - 1] as i64
-                } else if let Some(rt) = row_above {
-                    rt[x] as i64
-                } else {
-                    0
-                };
-                let top: i64 = match row_above {
-                    Some(rt) => rt[x] as i64,
-                    None => left,
-                };
-                let topleft: i64 = if x > 0 && y > 0 {
-                    row_above.unwrap()[x - 1] as i64
-                } else {
-                    left
-                };
-                let guess = clamped_gradient(top as i32, left as i32, topleft as i32);
-                let residual = here as i32 - guess;
-                let ctx_id = 2u32 - c as u32;
-                tokens.push(Token::new(ctx_id, pack_signed(residual)));
+    for (c, cfl_map) in [&dc_data.ytox_map, &dc_data.ytob_map]
+        .into_iter()
+        .enumerate()
+    {
+        debug_assert_eq!((cfl_map.xsize(), cfl_map.ysize()), (xtiles, ytiles));
+        if xtiles == 0 || ytiles == 0 {
+            continue;
+        }
+
+        let ctx_id = 2u32 - c as u32;
+        let mut rows = cfl_map.as_slice().chunks_exact(xtiles);
+
+        // The top row predicts from the value on the left.
+        let first_row = rows.next().unwrap();
+        let mut left = 0i32;
+        for &here in first_row {
+            let here = here as i32;
+            props.push(wbin(left));
+            tokens.push(Token::new(ctx_id, pack_signed(here - left)));
+            left = here;
+        }
+
+        let mut row_above = first_row;
+        for row in rows {
+            // First column replicates the value above for W and NW.
+            props.push(wbin(row_above[0] as i32));
+            tokens.push(Token::new(
+                ctx_id,
+                pack_signed(row[0] as i32 - row_above[0] as i32),
+            ));
+
+            for (current, above) in row.array_windows::<2>().zip(row_above.array_windows::<2>()) {
+                let prediction =
+                    clamped_gradient(above[1] as i32, current[0] as i32, above[0] as i32);
+                props.push(wbin(current[0] as i32));
+                tokens.push(Token::new(
+                    ctx_id,
+                    pack_signed(current[1] as i32 - prediction),
+                ));
             }
+            row_above = row;
         }
     }
 
-    // (b) AC strategy tokens.
-    let mut left: i32 = 0;
-    for y in 0..ysize_blocks {
-        for x in 0..xsize_blocks {
+    // (b) AC strategy and (c) QF residual tokens. Their substreams are
+    // contiguous, so reserve both ranges and fill them in one block scan.
+    let strategy_base = tokens.len();
+    let qf_base = strategy_base + num_first_blocks;
+    tokens.resize(strategy_base + 2 * num_first_blocks, Token::new(0, 0));
+    props.resize(strategy_base + 2 * num_first_blocks, 0);
+    let mut strategy_left = 0i32;
+    let mut qf_left = if nblocks == 0 {
+        0
+    } else {
+        dc_data.ac_strategy.strategy_code(0, 0) as i32
+    };
+    let mut first_idx = 0usize;
+    for (y, row_qf) in (0..ysize_blocks)
+        .map(|y| dc_data.raw_quant_field.row(y))
+        .enumerate()
+    {
+        for (x, &qf) in row_qf[..xsize_blocks].iter().enumerate() {
             if !dc_data.ac_strategy.is_first_block(x, y) {
                 continue;
             }
-            let cur = dc_data.ac_strategy.strategy_code(x, y) as i32;
-            let ctx_id = if left > 11 {
-                7
-            } else if left > 5 {
-                8
-            } else if left > 3 {
-                9
-            } else {
-                10
-            } as u32;
-            tokens.push(Token::new(ctx_id, pack_signed(cur)));
-            left = cur;
+
+            let strategy = dc_data.ac_strategy.strategy_code(x, y) as i32;
+            props[strategy_base + first_idx] = wbin(strategy_left);
+            tokens[strategy_base + first_idx] =
+                Token::new(ac_metadata_context(strategy_left, 7), pack_signed(strategy));
+            strategy_left = strategy;
+
+            let qf = qf as i32 - 1;
+            props[qf_base + first_idx] = wbin(qf_left);
+            tokens[qf_base + first_idx] =
+                Token::new(ac_metadata_context(qf_left, 3), pack_signed(qf - qf_left));
+            qf_left = qf;
+            first_idx += 1;
         }
     }
-    // (c) QF residuals.
-    let mut left: i32 = dc_data.ac_strategy.strategy_code(0, 0) as i32;
-    for y in 0..ysize_blocks {
-        let row_qf = dc_data.raw_quant_field.row(y);
-        for x in 0..xsize_blocks {
-            if !dc_data.ac_strategy.is_first_block(x, y) {
-                continue;
-            }
-            let cur: i32 = row_qf[x] as i32 - 1;
-            let residual: i32 = cur - left;
-            let ctx_id = if left > 11 {
-                3
-            } else if left > 5 {
-                4
-            } else if left > 3 {
-                5
-            } else {
-                6
-            } as u32;
-            tokens.push(Token::new(ctx_id, pack_signed(residual)));
-            left = cur;
-        }
-    }
-    // (d) EPF tokens.
-    let nblocks = xsize_blocks * ysize_blocks;
-    for _ in 0..nblocks {
-        tokens.push(Token::new(0, pack_signed(4)));
-    }
+    debug_assert_eq!(first_idx, num_first_blocks);
+
+    // (d) EPF tokens (constant stream; refinement can never split it).
+    props.resize(props.len() + nblocks, wbin(4));
+    tokens.resize(tokens.len() + nblocks, Token::new(0, pack_signed(4)));
     tokens
 }
 
@@ -369,7 +554,7 @@ pub(crate) fn collect_ac_metadata_tokens(dc_data: &DcGroupData) -> Vec<Token> {
 /// freshly optimized entropy code. Used by the sub-8x8 activation gate to weigh
 /// the exact selected set's meta-stream cost against its RD benefit.
 fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch) -> u64 {
-    let toks = collect_ac_metadata_tokens(dc_data);
+    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new());
     let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let code = code_owned.as_ref();
     let mut bits = 0u64;
@@ -388,6 +573,7 @@ fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch) -> u64 {
 /// Build and emit the context tree.
 pub(crate) fn write_context_tree(
     num_dc_groups: usize,
+    dc_gradient: &DcPredictorChoice,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     writer: &mut BitWriter,
 ) {
@@ -414,8 +600,7 @@ pub(crate) fn write_context_tree(
         while i < tokens.len() {
             debug_assert_eq!(tokens[i].context, 1);
             if tokens[i].value == 0 {
-                // Leaf: PROPERTY(0), PREDICTOR, OFFSET, MUL_LOG, MUL_BITS.
-                if leaf_idx >= 11 && tokens[i + 1].value == 5 {
+                if leaf_idx >= 11 && tokens[i + 1].value == 5 && !dc_gradient[leaf_idx] {
                     tokens[i + 1] = Token::new(2, 6); // Gradient -> Weighted
                 }
                 leaf_idx += 1;
@@ -428,16 +613,33 @@ pub(crate) fn write_context_tree(
             }
         }
     }
+    write_tree_tokens(&tokens, huffman_pool, writer);
+}
+
+/// Serialize a context tree's token stream (its own entropy code included).
+pub(crate) fn write_tree_tokens(
+    tokens: &[Token],
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    writer: &mut BitWriter,
+) {
     // OptimizeEntropyCode clusters the K_NUM_TREE_CONTEXTS=6 contexts.
-    let code = optimize_entropy_code(&tokens, K_NUM_TREE_CONTEXTS, huffman_pool);
+    let code = optimize_entropy_code(tokens, K_NUM_TREE_CONTEXTS, huffman_pool);
     let code_ref = code.as_ref();
 
     writer.write(1, 1); // not an empty tree
     writer.write(1, 0); // no lz77
     write_entropy_code(&code_ref, huffman_pool, writer);
-    for t in &tokens {
+    for t in tokens {
         write_token(*t, &code_ref, writer);
     }
+}
+
+/// Which context tree the DC bundle is written with.
+pub(crate) enum DcTreeChoice {
+    /// The static blob with per-leaf predictor flips.
+    Static(DcPredictorChoice),
+    /// A per-image learned tree, already serialized to tokens.
+    Learned(Vec<Token>),
 }
 
 fn write_frame_dimension(value: usize, w: &mut BitWriter) {
@@ -623,8 +825,8 @@ pub(crate) fn write_compact_block_context_map(
     let empty_freqs: [Vec<u16>; 0] = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
     let cm_entropy = EntropyCode {
-        context_map: &K_COMPACT_BLOCK_CONTEXT_MAP,
-        num_contexts: K_COMPACT_BLOCK_CONTEXT_MAP.len(),
+        context_map: compact_block_context_map(),
+        num_contexts: compact_block_context_map().len(),
         prefix_codes: &empty_codes,
         hybrid_uint_configs: &empty_configs,
         num_prefix_codes: 0,
@@ -665,51 +867,102 @@ pub(crate) fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWr
     }
 }
 
+/// Serialize the per-image BlockCtxMap: no dc thresholds, the optional
+/// quant-field threshold, and the ctx_map (qf inner dimension when present).
+fn write_block_ctx_map(
+    plan: &crate::ac_context::AcCtxPlan,
+    scratch: &mut CoderScratch,
+    w: &mut BitWriter,
+) {
+    w.write(1, 0); // non-default BlockCtxMap
+    w.write(4, 0); // dc thresholds, channel 0
+    w.write(4, 0); // dc thresholds, channel 1
+    w.write(4, 0); // dc thresholds, channel 2
+    match plan.qf_threshold {
+        None => w.write(4, 0),
+        Some(t) => {
+            w.write(4, 1);
+            // kQFThresholdDist: U32(Bits(2), BitsOffset(3,4), BitsOffset(5,12),
+            // BitsOffset(8,44)) over t - 1.
+            let v = t - 1;
+            if v < 4 {
+                w.write(2, 0);
+                w.write(2, u64::from(v));
+            } else if v < 12 {
+                w.write(2, 1);
+                w.write(3, u64::from(v - 4));
+            } else if v < 44 {
+                w.write(2, 2);
+                w.write(5, u64::from(v - 12));
+            } else {
+                w.write(2, 3);
+                w.write(8, u64::from(v - 44));
+            }
+        }
+    }
+    let entries = plan.ctx_map_entries();
+    let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+    let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
+    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let cm_entropy = EntropyCode {
+        context_map: &entries,
+        num_contexts: entries.len(),
+        prefix_codes: &empty_codes,
+        hybrid_uint_configs: &empty_configs,
+        num_prefix_codes: 0,
+        orig_context_map: None,
+        orig_num_contexts: 0,
+        use_prefix_code: true,
+        ans_freqs: &empty_freqs,
+        ans_symbols: &empty_syms,
+    };
+    crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
+}
+
 fn write_dc_global(
     distp: &DistanceParams,
     num_dc_groups: usize,
+    ac_plan: &crate::ac_context::AcCtxPlan,
+    dc_tree: &DcTreeChoice,
     dc_code: &EntropyCode,
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
+    ytob_dc: i32,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     w.write(1, 1); // default dequant DC
     write_quant_scales(distp.global_scale, distp.quant_dc, w);
-    w.write(1, 0); // non-default BlockCtxMap
-    w.write(16, 0); // no dc ctx, no qft
+    write_block_ctx_map(ac_plan, scratch, w);
 
-    // WriteContextMap with kCompactBlockContextMap (only context map, no prefix codes).
-    {
-        // Empty prefix-codes slice; WriteContextMap builds its own.
-        let empty_codes: [crate::entropy::PrefixCode; 0] = [];
-        let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-        let empty_freqs: [Vec<u16>; 0] = [];
-        let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
-        let block_context_map = &K_COMPACT_BLOCK_CONTEXT_MAP;
-        let cm_entropy = EntropyCode {
-            context_map: block_context_map,
-            num_contexts: block_context_map.len(),
-            prefix_codes: &empty_codes,
-            hybrid_uint_configs: &empty_configs,
-            num_prefix_codes: 0,
-            orig_context_map: None,
-            orig_num_contexts: 0,
-            use_prefix_code: true,
-            ans_freqs: &empty_freqs,
-            ans_symbols: &empty_syms,
-        };
-        crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
+    // ColorCorrelationParams. The all-default bundle pins the DC plane to the
+    // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
+    // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
+    if ytob_dc == 0 {
+        w.write(1, 1); // all_default
+    } else {
+        w.write(1, 0); // not all-default
+        w.write(2, 0); // color_factor = 84 (the direct branch)
+        w.write(16, 0); // base_correlation_x = 0.0
+        w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
+        w.write(8, 128); // ytox_dc = 0, offset by 128
+        w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
     }
-
-    w.write(1, 1); // default DC clamp (= ColorCorrelationParams.all_default = true)
 
     // Global tree.
     // write_context_tree emits "have_tree=1 + Histograms::decode (tree's own entropy code)
     // + tree tokens". The TREE'S PIXEL HISTOGRAMS are then written as the next two
     // bits + entropy code (DC entropy code, since it's the global tree used for DC).
-    write_context_tree(num_dc_groups, &mut scratch.huffman_pool, w);
+    match dc_tree {
+        DcTreeChoice::Static(grad) => {
+            write_context_tree(num_dc_groups, grad, &mut scratch.huffman_pool, w);
+        }
+        DcTreeChoice::Learned(tokens) => {
+            write_tree_tokens(tokens, &mut scratch.huffman_pool, w);
+        }
+    }
     w.write(1, 0); // no lz77 (for the global tree's pixel histograms = dc_code)
 
     // Then the static DC entropy code: this is the global tree's pixel histograms.
@@ -722,27 +975,81 @@ fn write_dc_global(
     }
 }
 
-fn write_dequant_matrices(matrices: &crate::quant_weights::DequantMatrices, w: &mut BitWriter) {
+/// Which `custom_tables` slot a strategy's quant table lives in, or `None` when
+/// its table is not one jixel can override (DCT4X4 uses table 3).
+#[inline]
+fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
+    Some(match raw_strategy {
+        STRATEGY_DCT => 0,
+        STRATEGY_DCT16X16 => 1,
+        STRATEGY_DCT32X32 => 2,
+        STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 3,
+        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
+        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
+        _ => return None,
+    })
+}
+
+/// Slots whose transform actually appears in the frame.
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 6] {
+    let mut used = [false; 6];
+    for dc in dc_datas {
+        for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
+            if let Some(slot) = quant_table_slot_of(strategy) {
+                used[slot] = true;
+            }
+        }
+    }
+    used
+}
+
+fn write_dequant_matrices(
+    matrices: &crate::quant_weights::DequantMatrices,
+    used: &[bool; 6],
+    w: &mut BitWriter,
+) {
     use crate::quant_weights::f32_to_f16_bits;
-    if matrices.custom_tables.iter().all(Option::is_none) {
+    // A table only earns its header if the frame actually uses the transform.
+    let table = |slot: usize| -> Option<&crate::quant_weights::BandOverride> {
+        used[slot]
+            .then(|| matrices.custom_tables[slot].as_ref())
+            .flatten()
+    };
+    if (0..6).all(|slot| table(slot).is_none()) {
         w.write(1, 1); // all_default
         return;
     }
     const K_NUM_QUANT_TABLES: usize = 17;
     const K_QUANT_MODE_LIBRARY: u64 = 0;
+    // `kQuantModeDCT4X8` carries three F16 `dct4x8multipliers` ahead of the
+    // shared DctQuantWeightParams payload; the library table uses 1.0 for all
+    // three, and jixel's 4x8 matrix is built without them, so identity is
+    // preserved by writing 1.0.
+    const K_QUANT_MODE_DCT4X8: u64 = 4;
     const K_QUANT_MODE_DCT: u64 = 6;
+    const TABLE_DCT4X8: usize = 9;
     w.write(1, 0); // all_default = false
     for idx in 0..K_NUM_QUANT_TABLES {
         let bands = match idx {
-            0 => matrices.custom_tables[0].as_ref(), // DCT8
-            4 => matrices.custom_tables[1].as_ref(), // DCT16X16
-            5 => matrices.custom_tables[2].as_ref(), // DCT32X32
+            0 => table(0),            // DCT8
+            4 => table(1),            // DCT16X16
+            5 => table(2),            // DCT32X32
+            6 => table(3),            // DCT8X16 (= DCT16X8)
+            8 => table(4),            // DCT16X32 (= DCT32X16)
+            TABLE_DCT4X8 => table(5), // DCT4X8 (= DCT8X4)
             _ => None,
         };
         match bands {
             None => w.write(3, K_QUANT_MODE_LIBRARY),
             Some(o) => {
-                w.write(3, K_QUANT_MODE_DCT);
+                if idx == TABLE_DCT4X8 {
+                    w.write(3, K_QUANT_MODE_DCT4X8);
+                    for _ in 0..3 {
+                        w.write(16, 0x3C00); // dct4x8multipliers[c] = 1.0
+                    }
+                } else {
+                    w.write(3, K_QUANT_MODE_DCT);
+                }
                 w.write(4, o.num_bands as u64 - 1);
                 for row in &o.bands {
                     for (i, &v) in row[..o.num_bands].iter().enumerate() {
@@ -757,6 +1064,8 @@ fn write_dequant_matrices(matrices: &crate::quant_weights::DequantMatrices, w: &
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
+    used_quant_tables: &[bool; 6],
+    coeff_orders: &crate::enc_coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
     lz_code: &crate::entropy::OwnedEntropyCode,
@@ -764,7 +1073,7 @@ fn write_ac_global(
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    write_dequant_matrices(matrices, w);
+    write_dequant_matrices(matrices, used_quant_tables, w);
     if num_groups > 1 {
         let bits = 32
             - (num_groups as u32).leading_zeros()
@@ -778,8 +1087,7 @@ fn write_ac_global(
     // code. Each pass gets its own code (ac_codes[p]); the single-pass LZ77 path
     // instead writes the LZ code in its one HfPass.
     for code in ac_codes {
-        w.write(2, 3);
-        w.write(13, 0);
+        crate::enc_coeff_order::write_coeff_orders(coeff_orders, &mut scratch.huffman_pool, w);
         if use_lz77 {
             crate::enc_lz77_ac::write_ac_lz_header_and_code(lz_code, &mut scratch.huffman_pool, w);
         } else {
@@ -851,43 +1159,140 @@ pub(crate) fn encode_frame(
     patches: bool,
     writer: &mut BitWriter,
 ) {
-    if patches && let Some(plan) = find_lossy_patches(linear) {
+    let distp = compute_distance_params(distance);
+    let mut xyb = to_xyb_image(ctx, scratch, linear);
+
+    if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
+        let mut regular = xyb.clone();
+        gaborize(&mut regular, &distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
             ctx,
             scratch,
             distance,
-            linear,
+            regular,
             alpha,
             coeff_shifts,
             VarDctFrameKind::Regular,
             &mut regular_writer,
         );
 
-        let atlas_alpha =
-            zero_alpha_for_lossy(alpha, plan.atlas.xsize().saturating_mul(plan.atlas.ysize()));
+        // Route each patch group to the atlas that codes it best: groups whose
+        // quantized tiles fit the running 256-color palette budget go to the
+        // modular atlas (measured strictly dominant when the palette hits),
+        // the rest to a VarDCT atlas at a finer distance. Groups arrive most
+        // frequent first, so high-value groups claim the palette budget first.
+        // Either atlas is emitted only when it has content, and every
+        // dictionary entry names its reference frame.
+        let mut palette: std::collections::HashSet<[i32; 3]> = std::collections::HashSet::new();
+        let groups = plan.groups;
+        let (mut modular_idx, mut vardct_idx): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        {
+            let tile_colors = scratch.patch_tile_colors.as_mut();
+            for (i, group) in groups.iter().enumerate() {
+                let (sx, sy) = group[0];
+                crate::enc_xyb::quantize_xyb_tile_colors(
+                    &xyb,
+                    sx,
+                    sy,
+                    MODULAR_ATLAS_LATTICE_SCALE,
+                    tile_colors,
+                );
+                tile_colors.sort_unstable();
+                let unique_colors = || {
+                    tile_colors.iter().enumerate().filter_map(|(i, &color)| {
+                        (i == 0 || tile_colors[i - 1] != color).then_some(color)
+                    })
+                };
+                let new_colors = unique_colors().filter(|c| !palette.contains(c)).count();
+                if palette.len() + new_colors <= 256 {
+                    palette.extend(unique_colors());
+                    modular_idx.push(i);
+                } else {
+                    vardct_idx.push(i);
+                }
+            }
+        }
+        let clone_groups = |idx: &[usize]| -> Vec<Vec<(usize, usize)>> {
+            idx.iter().map(|&i| groups[i].clone()).collect()
+        };
+
+        let atlas_distance = distance * ATLAS_DISTANCE_SCALE;
+        let atlas_distp = compute_distance_params(atlas_distance);
+        let encode_vardct_atlas =
+            |atlas: Image3F, scratch: &mut CoderScratch, out: &mut BitWriter| {
+                let atlas_alpha =
+                    zero_alpha_for_lossy(alpha, atlas.xsize().saturating_mul(atlas.ysize()));
+                let (atlas_w, atlas_h) = (atlas.xsize(), atlas.ysize());
+                let mut atlas = atlas;
+                gaborize(&mut atlas, &atlas_distp);
+                encode_frame_core(
+                    ctx,
+                    scratch,
+                    atlas_distance,
+                    atlas,
+                    atlas_alpha.as_ref(),
+                    &[0],
+                    VarDctFrameKind::ReferenceOnly {
+                        width: atlas_w,
+                        height: atlas_h,
+                    },
+                    out,
+                );
+            };
+
         let mut patched_writer = BitWriter::new();
+        let mut references: Vec<crate::patches::PatchReference> = Vec::new();
+
+        // Palette viability routed the modular set, but viable is not the same
+        // as compressible: a 256-pixel noise tile fits the palette budget and
+        // still codes terribly (256 incompressible indices). Price the subset
+        // both ways and keep the routing only when the modular frame is
+        // actually smaller; otherwise everything folds back into one VarDCT
+        // atlas in the original order.
+        if !modular_idx.is_empty() {
+            let (modular_atlas, modular_refs) = crate::patches::pack_lossy_atlas(
+                &xyb,
+                clone_groups(&modular_idx),
+                MODULAR_PATCH_REF_ID,
+            );
+            let mut modular_bits = BitWriter::new();
+            let modular_ok = crate::enc_lossless::encode_modular_xyb_atlas(
+                &modular_atlas,
+                alpha.is_some(),
+                MODULAR_ATLAS_LATTICE_SCALE,
+                ctx.speed,
+                scratch,
+                &mut modular_bits,
+            );
+            let mut vardct_bits = BitWriter::new();
+            encode_vardct_atlas(modular_atlas, scratch, &mut vardct_bits);
+            if modular_ok && modular_bits.bits_written() < vardct_bits.bits_written() {
+                patched_writer.append(&modular_bits);
+                references.extend(modular_refs);
+            } else {
+                vardct_idx.append(&mut modular_idx);
+                vardct_idx.sort_unstable();
+            }
+        }
+
+        if !vardct_idx.is_empty() {
+            let (vardct_atlas, vardct_refs) =
+                crate::patches::pack_lossy_atlas(&xyb, clone_groups(&vardct_idx), PATCH_REF_ID);
+            encode_vardct_atlas(vardct_atlas, scratch, &mut patched_writer);
+            references.extend(vardct_refs);
+        }
+
+        let mut base = plan.base;
+        gaborize(&mut base, &distp);
         encode_frame_core(
             ctx,
             scratch,
             distance,
-            &plan.atlas,
-            atlas_alpha.as_ref(),
-            &[0],
-            VarDctFrameKind::ReferenceOnly {
-                width: plan.atlas.xsize(),
-                height: plan.atlas.ysize(),
-            },
-            &mut patched_writer,
-        );
-        encode_frame_core(
-            ctx,
-            scratch,
-            distance,
-            &plan.base,
+            base,
             alpha,
             coeff_shifts,
-            VarDctFrameKind::Patched(&plan.references),
+            VarDctFrameKind::Patched(&references),
             &mut patched_writer,
         );
         if patched_writer.bits_written() < regular_writer.bits_written() {
@@ -897,11 +1302,13 @@ pub(crate) fn encode_frame(
         }
         return;
     }
+
+    gaborize(&mut xyb, &distp);
     encode_frame_core(
         ctx,
         scratch,
         distance,
-        linear,
+        xyb,
         alpha,
         coeff_shifts,
         VarDctFrameKind::Regular,
@@ -909,31 +1316,48 @@ pub(crate) fn encode_frame(
     );
 }
 
+/// Power-of-two refinement of the modular atlas quantization lattice.
+const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
+
+/// The VarDCT atlas is coded this much finer than the frame it serves.
+///
+/// Two Optuna studies agree: the SS2 cliff starts at ~0.5 on large screenshot
+/// content (every occurrence inherits the atlas error) and the plateau is
+/// [0.3, 0.5), so 0.45 sits at the rate-optimal edge with measured margin.
+const ATLAS_DISTANCE_SCALE: f32 = 0.45;
+
+fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, linear: &Image3F) -> Image3F {
+    let mut xyb = Image3F::new(linear.xsize(), linear.ysize());
+    crate::enc_xyb::to_xyb_with_fn(ctx.to_xyb_band, linear, &mut xyb, &ctx.thread_pool, scratch);
+    xyb
+}
+
+/// Pre-invert Gaborish so the decoder's forward pass reproduces `xyb`.
+fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
+    if distp.gab_enabled {
+        crate::gaborish::gaborish_inverse(xyb, 0.990_851_1);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_core(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
-    linear: &Image3F,
+    opsin: Image3F,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
     writer: &mut BitWriter,
 ) {
     let num_threads = ctx.thread_pool.num_threads();
-    let dim = ImageDim::new(linear.xsize(), linear.ysize());
+    let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
     let distp = compute_distance_params(distance);
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
     // C = sum_p (sent_p << shift_p) (jxl-vardct hf_coeff.rs:185,191).
     let num_passes = coeff_shifts.len();
-
-    let mut opsin = linear.clone();
-    crate::enc_xyb::to_xyb_with_fn(ctx.to_xyb_band, &mut opsin, &ctx.thread_pool, scratch);
-    if distp.gab_enabled {
-        crate::gaborish::gaborish_inverse(&mut opsin, 0.990_851_1);
-    }
 
     let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
@@ -975,13 +1399,27 @@ fn encode_frame_core(
         dc_datas.push(dc_data);
     }
 
+    // Per-image quant-field threshold for the fine AC block-context layout.
+    // The median splits the field into halves with genuinely different
+    // coefficient statistics; whether any split is *kept* is decided later
+    // from real token stats, so a useless threshold costs nothing.
+    let qf_threshold = ac_qf_threshold(&dc_datas);
+
     let dc_ref = &dc_datas;
+    let natural_orders = crate::enc_coeff_order::CoeffOrders::natural();
+    // Tally coefficient positions only when the refine pass will run to consume
+    // the derived orders: pass one alone can never adopt them (its tokens are
+    // already written on the natural scan), so the work would be wasted and its
+    // mere presence perturbs codegen enough to shift a few borderline
+    // quantizer roundings on paths that should be untouched.
+    let want_order_stats =
+        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast;
     let results = ctx
         .thread_pool
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local) = process_ac_group(
+            let (p, local, stats) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -994,21 +1432,49 @@ fn encode_frame_core(
                 dc_gy,
                 gx,
                 gy,
+                0,
                 None,
+                &natural_orders,
+                want_order_stats,
+                qf_threshold,
             );
-            (dc_idx, gx, gy, p, local)
+            (dc_idx, gx, gy, p, local, stats)
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
-    for (dc_idx, gx, gy, p, local) in results {
+    let mut order_stats = crate::enc_coeff_order::OrderStats::new();
+    for (dc_idx, gx, gy, p, local, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
         all_pending.push(p);
+        if let Some(s) = stats {
+            order_stats.merge(&s);
+        }
     }
 
+    // DC-level chroma-from-luma. The slope has to be folded into the DC
+    // quantizer's rounding rather than subtracted from the stored integers
+    // afterwards: `round(v) - round(s*y)` carries up to a full step of B DC
+    // error against `round(v - s*y)`'s half step, and that extra chroma noise
+    // costs far more quality than the slope saves in rate. So the search rides
+    // on the rerank pass, which re-quantizes every DC group regardless -- and
+    // is skipped entirely when that pass does not run.
+    // Custom coefficient orders, derived from the first pass's nonzero tallies.
+    let mut coeff_orders = crate::enc_coeff_order::CoeffOrders::natural();
+
+    let mut ytob_dc = 0i32;
     if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast {
+        coeff_orders = crate::enc_coeff_order::derive_orders(&order_stats);
+        ytob_dc = choose_ytob_dc(
+            &dc_datas,
+            ctx.fill_ytob_row,
+            ctx.accumulate_ytob_weights,
+            ctx.fill_ytob_residuals,
+            &mut scratch.dc_cfl_cur,
+            &mut scratch.dc_cfl_prev,
+        );
         let provisional_code = crate::entropy::optimize_entropy_code_ac_streams(
             all_pending.iter().map(|pg| pg.tokens[0].as_slice()),
-            K_NUM_AC_CONTEXTS,
+            crate::ac_context::K_NUM_FINE_AC_CONTEXTS,
             &mut scratch.huffman_pool,
         );
         let prices = crate::entropy::FrozenTokenPrices::new(&provisional_code);
@@ -1018,7 +1484,7 @@ fn encode_frame_core(
             .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local) = process_ac_group(
+                let (p, local, _) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -1031,7 +1497,11 @@ fn encode_frame_core(
                     dc_gy,
                     gx,
                     gy,
+                    ytob_dc,
                     Some(&prices),
+                    &coeff_orders,
+                    false,
+                    qf_threshold,
                 );
                 (dc_idx, gx, gy, p, local)
             });
@@ -1043,44 +1513,275 @@ fn encode_frame_core(
     }
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
+    // Per-leaf DC predictor selection.
     let token_groups = ctx
         .thread_pool
         .steal_map(scratch, dc_datas.len(), |i, _scratch| {
-            (
-                collect_dc_tokens(&dc_datas[i]),
-                collect_ac_metadata_tokens(&dc_datas[i]),
-            )
+            let mut props = Vec::new();
+            let wp = collect_dc_tokens(&dc_datas[i], &DC_PREDICTOR_WEIGHTED, &mut props);
+            // Both arms run identical WP state; properties are shared.
+            let mut discard = Vec::new();
+            let grad = collect_dc_tokens(&dc_datas[i], &[true; K_NUM_DC_CONTEXTS], &mut discard);
+            let mut meta_props = Vec::new();
+            let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props);
+            (wp, props, grad, meta, meta_props)
         });
-    let (dc_tokens_per_group, meta_tokens_per_group): (Vec<Vec<Token>>, Vec<Vec<Token>>) =
-        token_groups.into_iter().unzip();
-    // ANS-capable code for the DC+meta bundle (same gate as the plain-AC
-    // bundle); write sites below branch on use_prefix_code.
-    let dc_code_owned = crate::entropy::optimize_entropy_code_ac_streams(
-        dc_tokens_per_group
+    let mut wp_tokens_per_group = Vec::with_capacity(token_groups.len());
+    let mut props_per_group = Vec::with_capacity(token_groups.len());
+    let mut grad_tokens_per_group = Vec::with_capacity(token_groups.len());
+    let mut meta_tokens_per_group = Vec::with_capacity(token_groups.len());
+    let mut meta_props_per_group = Vec::with_capacity(token_groups.len());
+    for (wp, props, grad, meta, meta_props) in token_groups {
+        wp_tokens_per_group.push(wp);
+        props_per_group.push(props);
+        grad_tokens_per_group.push(grad);
+        meta_tokens_per_group.push(meta);
+        meta_props_per_group.push(meta_props);
+    }
+
+    let dc_gradient = choose_dc_predictors(
+        &wp_tokens_per_group,
+        &grad_tokens_per_group,
+        &mut scratch.dc_predictor,
+    );
+    // Arm A: the static tree with per-leaf predictor flips.
+    let dc_tokens_static: Vec<Vec<Token>> = wp_tokens_per_group
+        .iter()
+        .zip(&grad_tokens_per_group)
+        .map(|(wp, grad)| {
+            wp.iter()
+                .zip(grad)
+                .map(|(w, g)| {
+                    if dc_gradient[w.context as usize] {
+                        *g
+                    } else {
+                        *w
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let code_static = crate::entropy::optimize_entropy_code_ac_streams(
+        dc_tokens_static
             .iter()
             .map(Vec::as_slice)
             .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
     );
+
+    // Arm B: a per-image learned tree over WP error and channel, with its own
+    // per-leaf predictor choice. Leaf renumbering shifts the metadata contexts,
+    // so those tokens are remapped alongside.
+    let learned = crate::enc_dc_tree::learn_dc_tree(
+        dim.num_dc_groups,
+        &wp_tokens_per_group,
+        &grad_tokens_per_group,
+        &props_per_group,
+        &meta_tokens_per_group,
+        &meta_props_per_group,
+    );
+    let dc_tokens_learned: Vec<Vec<Token>> = wp_tokens_per_group
+        .iter()
+        .zip(&grad_tokens_per_group)
+        .zip(&props_per_group)
+        .map(|((wp, grad), props)| {
+            wp.iter()
+                .zip(grad)
+                .zip(props)
+                .map(|((w, g), &p)| {
+                    let ctx = learned.dc_context[p as usize];
+                    let value = if learned.leaf_gradient[ctx as usize] {
+                        g.value
+                    } else {
+                        w.value
+                    };
+                    Token::new(u32::from(ctx), value)
+                })
+                .collect()
+        })
+        .collect();
+    let meta_tokens_learned: Vec<Vec<Token>> = meta_tokens_per_group
+        .iter()
+        .zip(&meta_props_per_group)
+        .map(|(group, props)| {
+            group
+                .iter()
+                .zip(props)
+                .map(|(t, &p)| {
+                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                    Token::new(u32::from(learned.meta_context[slot]), t.value)
+                })
+                .collect()
+        })
+        .collect();
+    let code_learned = crate::entropy::optimize_entropy_code_ac_streams(
+        dc_tokens_learned
+            .iter()
+            .map(Vec::as_slice)
+            .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
+        learned.num_contexts,
+        &mut scratch.huffman_pool,
+    );
+
+    // Price both arms end to end: serialized tree + entropy-code header
+    // (measured by writing them) plus the payload estimate, and require the
+    // learned arm to win by a margin. The margin absorbs the small estimator
+    // noise so near-ties keep the battle-tested static tree.
+    let payload =
+        |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
+            crate::enc_lz77_ac::estimate_ac_plain_bits(
+                dc.iter()
+                    .map(Vec::as_slice)
+                    .chain(meta.iter().map(Vec::as_slice)),
+                code,
+            )
+        };
+    let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
+        let mut w = BitWriter::new();
+        match tree {
+            DcTreeChoice::Static(grad) => {
+                write_context_tree(dim.num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
+            }
+            DcTreeChoice::Learned(tokens) => {
+                write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut w);
+            }
+        }
+        write_entropy_code(code, &mut scratch.huffman_pool, &mut w);
+        w.bits_written() as u64
+    };
+    const LEARNED_TREE_MARGIN_BITS: u64 = 64;
+    let tree_static = DcTreeChoice::Static(dc_gradient);
+    let tree_learned = DcTreeChoice::Learned(learned.tokens);
+    let cost_static = header(&tree_static, &code_static.as_ref(), scratch)
+        + payload(&dc_tokens_static, &meta_tokens_per_group, &code_static);
+    let cost_learned = header(&tree_learned, &code_learned.as_ref(), scratch)
+        + payload(&dc_tokens_learned, &meta_tokens_learned, &code_learned);
+
+    let use_learned = cost_learned + LEARNED_TREE_MARGIN_BITS < cost_static;
+    let (dc_tokens_per_group, meta_tokens_per_group, dc_code_owned, dc_tree) = if use_learned {
+        (
+            dc_tokens_learned,
+            meta_tokens_learned,
+            code_learned,
+            tree_learned,
+        )
+    } else {
+        (
+            dc_tokens_static,
+            meta_tokens_per_group,
+            code_static,
+            tree_static,
+        )
+    };
     let dc_code = dc_code_owned.as_ref();
 
-    let ac_num_contexts = K_NUM_AC_CONTEXTS + 1;
+    // Per-image AC block-context plan: keep quant-field splits only where the
+    // real token statistics pay for them within the spec's 16-context budget.
+    // The greedy proposes; the arm gate below disposes, comparing real
+    // entropy-code headers plus payload estimates because the Shannon proxy
+    // reliably overestimates what clustering-aware coding realizes.
+    let proposed = crate::ac_context::plan_block_ctx_map(
+            all_pending
+                .iter()
+                .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
+            qf_threshold,
+        );
+    let baseline = crate::ac_context::AcCtxPlan::baseline();
 
-    // Per-pass aggregated tokens -> per-pass entropy code. Pass 0 (coarse) and
-    // the residual pass(es) have very different token distributions, so a single
-    // shared code is wasteful; each HfPass gets a code built from its own tokens.
-    let ac_code_per_pass: Vec<crate::entropy::OwnedEntropyCode> =
-        ctx.thread_pool
-            .steal_map(scratch, num_passes, |pass, scratch| {
+    let build_codes = |pending: &[PendingAcGroup],
+                       num_contexts: usize,
+                       scratch: &mut CoderScratch|
+     -> Vec<crate::entropy::OwnedEntropyCode> {
+        (0..num_passes)
+            .map(|pass| {
                 crate::entropy::optimize_entropy_code_ac_streams(
-                    all_pending
-                        .iter()
-                        .map(|pending| pending.tokens[pass].as_slice()),
-                    K_NUM_AC_CONTEXTS,
+                    pending.iter().map(|p| p.tokens[pass].as_slice()),
+                    num_contexts,
                     &mut scratch.huffman_pool,
                 )
+            })
+            .collect()
+    };
+    let arm_bits = |pending: &[PendingAcGroup],
+                    codes: &[crate::entropy::OwnedEntropyCode],
+                    plan: &crate::ac_context::AcCtxPlan,
+                    scratch: &mut CoderScratch|
+     -> u64 {
+        let mut header = BitWriter::new();
+        write_block_ctx_map(plan, scratch, &mut header);
+        for code in codes {
+            write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
+        }
+        let mut bits = header.bits_written() as u64;
+        for (pass, code) in codes.iter().enumerate() {
+            bits += crate::enc_lz77_ac::estimate_ac_plain_bits(
+                pending.iter().map(|p| p.tokens[pass].as_slice()),
+                code,
+            );
+        }
+        bits
+    };
+    let remap_tokens = |pending: &mut [PendingAcGroup],
+                        plan: &crate::ac_context::AcCtxPlan,
+                        scratch: &mut CoderScratch| {
+        ctx.thread_pool
+            .steal_for_each_mut(scratch, pending, |_i, p, _s| {
+                for pass_tokens in &mut p.tokens {
+                    for t in pass_tokens.iter_mut() {
+                        *t = Token::new(plan.remap(t.context), t.value);
+                    }
+                }
             });
+    };
+
+    let (ac_plan, ac_code_per_pass) = if proposed == baseline {
+        remap_tokens(&mut all_pending, &baseline, scratch);
+        let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
+        (baseline, codes)
+    } else {
+        // Materialize the proposed arm, remap the originals to baseline in
+        // place, and keep whichever arm's real bits win.
+        let plan_ref = &proposed;
+        let mut planned: Vec<Vec<Vec<Token>>> = all_pending
+            .iter()
+            .map(|p| {
+                p.tokens
+                    .iter()
+                    .map(|pass_tokens| {
+                        pass_tokens
+                            .iter()
+                            .map(|t| Token::new(plan_ref.remap(t.context), t.value))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        remap_tokens(&mut all_pending, &baseline, scratch);
+
+        let base_codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
+        let base_bits = arm_bits(&all_pending, &base_codes, &baseline, scratch);
+        // Swap in the proposed tokens to price them with the same helpers.
+        for (p, planned_tokens) in all_pending.iter_mut().zip(&mut planned) {
+            std::mem::swap(&mut p.tokens, planned_tokens);
+        }
+        let plan_codes = build_codes(&all_pending, proposed.num_ac_contexts(), scratch);
+        let plan_bits = arm_bits(&all_pending, &plan_codes, &proposed, scratch);
+
+        const AC_PLAN_MARGIN_BITS: u64 = 256;
+        if plan_bits + AC_PLAN_MARGIN_BITS < base_bits {
+            (proposed, plan_codes)
+        } else {
+            // Swap the baseline tokens back.
+            for (p, planned_tokens) in all_pending.iter_mut().zip(&mut planned) {
+                std::mem::swap(&mut p.tokens, planned_tokens);
+            }
+            (baseline, base_codes)
+        }
+    };
+
+    let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
+
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
     // group. Multi-pass uses the per-pass plain codes.
@@ -1132,10 +1833,13 @@ fn encode_frame_core(
     write_dc_global(
         &distp,
         dim.num_dc_groups,
+        &ac_plan,
+        &dc_tree,
         &dc_code,
         alpha,
         dim.xsize,
         dim.ysize,
+        ytob_dc,
         scratch,
         &mut sections[0],
     );
@@ -1158,6 +1862,7 @@ fn encode_frame_core(
                     &dc_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.hybrid_uint_configs,
                     &mut w,
                 );
             }
@@ -1182,6 +1887,7 @@ fn encode_frame_core(
                     &meta_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.hybrid_uint_configs,
                     &mut w,
                 );
             }
@@ -1191,10 +1897,10 @@ fn encode_frame_core(
         sections[1 + i] = section;
     }
 
-    // Phase 6: AC global. One HfPass per pass (each with its own code), or a
-    // single HfPass carrying the LZ77 code in the single-pass case.
     write_ac_global(
         ctx.matrices,
+        &used_quant_table_slots(&dc_datas),
+        &coeff_orders,
         dim.num_groups,
         &ac_code_per_pass,
         &ac_lz_code_owned,
@@ -1233,6 +1939,7 @@ fn encode_frame_core(
                         pass_tokens,
                         code_ref.context_map,
                         code_ref.ans_symbols,
+                        code_ref.hybrid_uint_configs,
                         &mut w,
                     );
                 }
@@ -1446,6 +2153,27 @@ fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
 /// and place its DC coefficients into a returned group-local `quant_dc`
 /// (origin-relative, merged by the caller). Reads `dc_data` read-only.
 #[allow(clippy::too_many_arguments)]
+/// Median raw quant-field value across the image (blocks weighted equally).
+fn ac_qf_threshold(dc_datas: &[DcGroupData]) -> u32 {
+    let mut histogram = [0u64; 257];
+    for dc_data in dc_datas {
+        for y in 0..dc_data.raw_quant_field.ysize() {
+            for &qf in dc_data.raw_quant_field.row(y) {
+                histogram[(qf as usize).min(256)] += 1;
+            }
+        }
+    }
+    let total: u64 = histogram.iter().sum();
+    let mut acc = 0u64;
+    for (value, &count) in histogram.iter().enumerate() {
+        acc += count;
+        if acc * 2 >= total {
+            return value as u32;
+        }
+    }
+    1
+}
+
 fn process_ac_group(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1459,8 +2187,16 @@ fn process_ac_group(
     dc_gy: usize,
     gx: usize,
     gy: usize,
+    ytob_dc: i32,
     rdoq_prices: Option<&crate::entropy::FrozenTokenPrices>,
-) -> (PendingAcGroup, Image3S) {
+    coeff_orders: &crate::enc_coeff_order::CoeffOrders,
+    collect_order_stats: bool,
+    qf_threshold: u32,
+) -> (
+    PendingAcGroup,
+    Image3S,
+    Option<crate::enc_coeff_order::OrderStats>,
+) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
     let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
     let group_x0 = image_gx * K_GROUP_DIM;
@@ -1480,6 +2216,7 @@ fn process_ac_group(
     let mut tokens: Vec<Vec<Token>> = (0..num_passes)
         .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
         .collect();
+    let mut order_stats = collect_order_stats.then(crate::enc_coeff_order::OrderStats::new);
 
     for ty in 0..group_ysize_tiles {
         let stripe_x0 = group_x0;
@@ -1516,13 +2253,17 @@ fn process_ac_group(
             distp.distance,
             distp.x_qm_scale,
             dc_data,
+            ytob_dc,
             &mut local_quant_dc,
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
             coeff_shifts,
             rdoq_prices,
+            coeff_orders,
+            order_stats.as_mut(),
             false,
+            qf_threshold,
             &mut tokens,
         );
     }
@@ -1533,6 +2274,7 @@ fn process_ac_group(
             tokens,
         },
         local_quant_dc,
+        order_stats,
     )
 }
 
@@ -1570,9 +2312,51 @@ fn build_stripe(
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, compute_distance_params, dc_refinement,
-        quant_dc,
+        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, MIN_TOKENS_PER_DC_LEAF,
+        choose_dc_predictors, compute_distance_params, dc_refinement, quant_dc,
     };
+    use crate::coder_scratch::DcPredictorScratch;
+    use crate::entropy::Token;
+
+    /// Build one group of `n` tokens in `context`, all carrying `value`.
+    fn leaf_tokens(context: u32, value: u32, n: usize) -> Vec<Vec<Token>> {
+        vec![(0..n).map(|_| Token::new(context, value)).collect()]
+    }
+
+    #[test]
+    fn dc_predictor_flips_only_on_a_decisive_populated_win() {
+        let n = MIN_TOKENS_PER_DC_LEAF as usize;
+        let ctx = 11;
+        let mut scratch = DcPredictorScratch::default();
+
+        // Gradient codes every residual as zero; the weighted predictor misses
+        // by a wide, multi-extra-bit margin.
+        let decisive = choose_dc_predictors(
+            &leaf_tokens(ctx, 4000, n),
+            &leaf_tokens(ctx, 0, n),
+            &mut scratch,
+        );
+        assert!(decisive[ctx as usize], "a decisive gradient win must flip");
+
+        // Identical streams: the margin must keep the weighted default.
+        let tied = choose_dc_predictors(
+            &leaf_tokens(ctx, 7, n),
+            &leaf_tokens(ctx, 7, n),
+            &mut scratch,
+        );
+        assert!(!tied[ctx as usize], "a tie must not flip");
+
+        // Same decisive win, but below the population floor.
+        let sparse = choose_dc_predictors(
+            &leaf_tokens(ctx, 4000, n - 1),
+            &leaf_tokens(ctx, 0, n - 1),
+            &mut scratch,
+        );
+        assert!(
+            !sparse[ctx as usize],
+            "an underpopulated leaf must not flip"
+        );
+    }
 
     #[test]
     fn dc_refinement_holds_then_ramps_out_monotonically() {

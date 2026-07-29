@@ -85,6 +85,12 @@ class Baseline:
         lb = np.log(max(bpp, 1e-6))
         return float(np.interp(lb, np.log(self._bpp), self._ss2))
 
+    def covers_rate(self, bpp: float) -> bool:
+        """Whether ``bpp`` is inside the measured range. Outside it ``np.interp``
+        clamps to the end point, which fabricates a large delta out of nothing —
+        every such case must be reported, never silently scored."""
+        return float(self._bpp.min()) <= bpp <= float(self._bpp.max())
+
     def time_at_distance(self, distance: float) -> float:
         """Baseline encode time (ms) at (nearest) distance."""
         idx = int(np.argmin(np.abs(self._dist - distance)))

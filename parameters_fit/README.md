@@ -6,13 +6,21 @@ parameters ──► encode corpus ──► size + SSIMULACRA2 + time ──►
 
 ## How the pieces fit
 
+> **The encoder currently has NO runtime tuning module.** Winning configs get
+> folded into constants and the override module is deleted, so `params.py` keys
+> are inert until someone re-adds a `JIXEL_TUNING_JSON` reader (see
+> `src/ac_tuning.rs` in the transform-merge study, git history). Always confirm
+> the encoder actually reads a key — run `probe --defaults` and check the deltas
+> are exactly 0, then flip one knob and check they are not.
+
 | Layer                          | What it does                                                                                                                                                                     |
 |--------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `src/tuning.rs` (jixel)        | Reads a flat JSON of tuning knobs from `JIXEL_TUNING_JSON` **once per process**. Unset ⇒ shipped defaults, byte-for-byte.                                                        |
+| tuning module (jixel)          | Reads a flat JSON of tuning knobs from `JIXEL_TUNING_JSON` **once per process**. Unset ⇒ shipped defaults, byte-for-byte. Removed once a study lands.                            |
 | `tuner/` crate (`jixel-tuner`) | Encode-only CLI: image → `.jxl`, prints `{bytes, encode_ms, bpp,…}`. Never recompiled between trials.                                                                            |
 | `encoder.py`                   | encode (`jixel-tuner`) → decode (`djxl`) → score (`ssimulacra2`) for one case.                                                                                                   |
 | `corpus.py`                    | One aligned 768² crop per source image (16 from `train0` + an evenly-spaced sample of `DIV2K_train_HR`); deterministic 75/25 train/holdout split **by image** (no crop leakage). |
-| `baseline.py`                  | Per-crop rate→quality curve at the shipped defaults, cached to JSON.                                                                                                             |
+| `baseline.py`                  | Per-crop rate→quality curve at the shipped defaults, cached to JSON. `covers_rate()` flags candidates outside the measured bitrate range — `np.interp` clamps there and fabricates huge fake deltas, so **BASELINE_DISTANCES must stay strictly wider than anything you probe**. |
+| `probe.py`                     | Per-distance unclamped deltas for one explicit config. Run this on a study winner's top knob before believing it — the clamped/median refine objective can hide a single image's collapse. |
 | `objective.py`                 | Rate-matched delta + robust aggregate score.                                                                                                                                     |
 | `optimize.py`                  | Optuna study driver + CLI.                                                                                                                                                       |
 

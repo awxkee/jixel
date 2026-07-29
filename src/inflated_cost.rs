@@ -33,7 +33,7 @@ use crate::dc_group_data::{
     STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
 };
-use crate::dct::DctInput;
+use crate::dct::{DctInput, fmla};
 use crate::image::{Image3F, Plane};
 use crate::util::FastRound;
 use std::sync::OnceLock;
@@ -41,7 +41,8 @@ use std::sync::OnceLock;
 const R_NZ_BASE: f32 = 1.6;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
-pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [1.0, 1.0, 1.0];
+// Per-channel distortion weights (X, Y, B)
+pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.25, 1.0, 0.5];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
 pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];
@@ -304,8 +305,8 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
     use crate::dct;
     macro_rules! fwd {
         ($f:path, $n:literal) => {{
-            let i: &[f32; $n] = input[..$n].try_into().unwrap();
-            let o: &mut [f32; $n] = (&mut out[..$n]).try_into().unwrap();
+            let i: &[f32; $n] = input.first_chunk::<$n>().unwrap();
+            let o: &mut [f32; $n] = out.first_chunk_mut::<$n>().unwrap();
             $f(i, o);
         }};
     }
@@ -433,7 +434,7 @@ pub(crate) fn reconstruct_error(strategy: u8, coeff_err: &[f32], err_out: &mut [
         ($f:path, $n:literal, $w:literal, $h:literal) => {
             $f(
                 DctInput::<$w, $h>::new(coeff_err, $w),
-                (&mut err_out[..$n]).try_into().unwrap(),
+                err_out.first_chunk_mut::<$n>().unwrap(),
             )
         };
     }
@@ -596,6 +597,7 @@ fn recon_dist_and_rate_default(
     )
 }
 
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate_scalar(
@@ -725,7 +727,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 .zip(spatial_error[..n].iter())
                 .zip(y_error[..n].iter())
             {
-                *combined = spatial + factor * luma;
+                *combined = fmla(factor, luma, spatial);
             }
             &combined_error[..n]
         };
@@ -839,7 +841,7 @@ unsafe fn recon_quantize_scalar(
             let denominator = inverse * quant_scale;
             let scaled = denominator * coefficient;
             let quantized = if scaled.abs() >= threshold {
-                scaled.round_ties_even()
+                scaled.round()
             } else {
                 0.0
             };
@@ -858,7 +860,7 @@ unsafe fn recon_quantize_scalar(
 pub(crate) fn ssim_deficit(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
     validate_ssim_inputs(orig, recon, width, height);
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return unsafe { crate::avx::ssim_deficit_avx2(orig, recon, width, height) };
     }
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -932,9 +934,9 @@ fn ssim_deficit_scalar_kernel(orig: &[f32], recon: &[f32], width: usize, height:
                 {
                     let centered_orig = orig_value - mean_orig;
                     let centered_recon = recon_value - mean_recon;
-                    var_orig += centered_orig * centered_orig;
-                    var_recon += centered_recon * centered_recon;
-                    covariance += centered_orig * centered_recon;
+                    var_orig = fmla(centered_orig, centered_orig, var_orig);
+                    var_recon = fmla(centered_recon, centered_recon, var_recon);
+                    covariance = fmla(centered_orig, centered_recon, covariance);
                 }
             }
             var_orig *= ONE_OVER_64;

@@ -31,8 +31,6 @@ use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-/// Allocate a fixed-size array through `Vec` so the full array is initialized
-/// in its final heap storage instead of as a temporary stack value.
 pub(crate) fn heap_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
     let slice = vec![value; N].into_boxed_slice();
     boxed_slice_to_array(slice)
@@ -197,29 +195,7 @@ pub(crate) trait FastRound {
 
 impl FastRound for f32 {
     fn fast_round(self) -> Self {
-        #[cfg(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse4.1"
-        ))]
-        {
-            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
-            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.round()
-        }
-        #[cfg(not(any(
-            target_arch = "aarch64",
-            all(
-                any(target_arch = "x86", target_arch = "x86_64"),
-                target_feature = "sse4.1"
-            )
-        )))]
-        {
-            const MAGIC: f32 = ((1u32 << 23) + (1u32 << 22)) as f32;
-            (f32::from_bits(self.to_bits() + 1) + MAGIC) - MAGIC
-        }
+        self.round()
     }
 }
 

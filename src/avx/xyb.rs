@@ -122,23 +122,33 @@ fn rgb_to_xyb_f32x8_avx2(r: __m256, g: __m256, b: __m256) -> (__m256, __m256, __
     (x, y, tm2)
 }
 
-/// Transform one row-band in place.
+/// Transform one row-band into separate output planes.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn to_xyb_avx2_band(band: [&mut [f32]; 3], w: usize) {
-    let [rp, gp, bp] = band;
-    for ((r_row, g_row), b_row) in rp
-        .chunks_exact_mut(w)
-        .zip(gp.chunks_exact_mut(w))
-        .zip(bp.chunks_exact_mut(w))
+pub(crate) fn to_xyb_avx2_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = input;
+    let [xp, yp, out_bp] = output;
+    for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
+        .chunks_exact(w)
+        .zip(gp.chunks_exact(w))
+        .zip(bp.chunks_exact(w))
+        .zip(xp.chunks_exact_mut(w))
+        .zip(yp.chunks_exact_mut(w))
+        .zip(out_bp.chunks_exact_mut(w))
     {
-        let (r_chunks, r_tail) = r_row.as_chunks_mut::<8>();
-        let (g_chunks, g_tail) = g_row.as_chunks_mut::<8>();
-        let (b_chunks, b_tail) = b_row.as_chunks_mut::<8>();
+        let (r_chunks, r_tail) = r_row.as_chunks::<8>();
+        let (g_chunks, g_tail) = g_row.as_chunks::<8>();
+        let (b_chunks, b_tail) = b_row.as_chunks::<8>();
+        let (x_chunks, x_tail) = x_row.as_chunks_mut::<8>();
+        let (y_chunks, y_tail) = y_row.as_chunks_mut::<8>();
+        let (out_b_chunks, out_b_tail) = out_b_row.as_chunks_mut::<8>();
 
-        for ((r8, g8), b8) in r_chunks
-            .iter_mut()
-            .zip(g_chunks.iter_mut())
-            .zip(b_chunks.iter_mut())
+        for (((((r8, g8), b8), x8), y8), out_b8) in r_chunks
+            .iter()
+            .zip(g_chunks.iter())
+            .zip(b_chunks.iter())
+            .zip(x_chunks.iter_mut())
+            .zip(y_chunks.iter_mut())
+            .zip(out_b_chunks.iter_mut())
         {
             let r = unsafe { _mm256_loadu_ps(r8.as_ptr()) };
             let g = unsafe { _mm256_loadu_ps(g8.as_ptr()) };
@@ -147,9 +157,9 @@ pub(crate) fn to_xyb_avx2_band(band: [&mut [f32]; 3], w: usize) {
             let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(r, g, b);
 
             unsafe {
-                _mm256_storeu_ps(r8.as_mut_ptr(), xv);
-                _mm256_storeu_ps(g8.as_mut_ptr(), yv);
-                _mm256_storeu_ps(b8.as_mut_ptr(), bv);
+                _mm256_storeu_ps(x8.as_mut_ptr(), xv);
+                _mm256_storeu_ps(y8.as_mut_ptr(), yv);
+                _mm256_storeu_ps(out_b8.as_mut_ptr(), bv);
             }
         }
 
@@ -172,9 +182,9 @@ pub(crate) fn to_xyb_avx2_band(band: [&mut [f32]; 3], w: usize) {
                 _mm256_storeu_ps(b8.as_mut_ptr(), bv);
             }
 
-            r_tail.copy_from_slice(&r8[..r_tail.len()]);
-            g_tail.copy_from_slice(&g8[..g_tail.len()]);
-            b_tail.copy_from_slice(&b8[..b_tail.len()]);
+            x_tail.copy_from_slice(&r8[..r_tail.len()]);
+            y_tail.copy_from_slice(&g8[..g_tail.len()]);
+            out_b_tail.copy_from_slice(&b8[..b_tail.len()]);
         }
     }
 }

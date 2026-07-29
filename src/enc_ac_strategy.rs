@@ -39,9 +39,7 @@ use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
 
-/// At visually lossless / near-lossless settings, transform metadata and the
-/// occasional wrong merge cost more than the large-DCT decorrelation saves.
-const DCT8_ONLY_MAX_DISTANCE: f32 = 0.5;
+const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
 /// Above this distance the [`SearchScope::Squares`] tier stops reranking; see
 /// [`SearchScope::rerank`].
@@ -52,48 +50,126 @@ fn use_dct8_only(distance: f32) -> bool {
     distance <= DCT8_ONLY_MAX_DISTANCE
 }
 
+/// Distances bounding the high-quality band: a [`Banded`] knob holds its
+/// high-quality value at or below `MERGE_BAND_D0`, its base value from
+/// `MERGE_BAND_D1` up, and interpolates in between.
+const MERGE_BAND_D0: f32 = 0.5;
+const MERGE_BAND_D1: f32 = 1.5;
+
+/// A merge-selection constant whose value differs between the high-quality and
+/// the mid/low band. Quantization error at high quality is small enough that the
+/// coefficient-domain model's merge estimate is mostly noise, so merges have to
+/// clear a far higher bar there than they do once quantization bites.
+#[derive(Clone, Copy)]
+struct Banded {
+    hq: f32,
+    base: f32,
+}
+
+impl Banded {
+    const fn new(hq: f32, base: f32) -> Self {
+        Self { hq, base }
+    }
+
+    #[inline]
+    fn at(self, distance: f32) -> f32 {
+        let t = ((distance - MERGE_BAND_D0) / (MERGE_BAND_D1 - MERGE_BAND_D0)).clamp(0.0, 1.0);
+        fmla(t, self.base - self.hq, self.hq)
+    }
+}
+
+/// Bits charged once per placed transform for the AC metadata the
+/// coefficient model cannot see: the ACS symbol, the quant-field symbol and the
+/// per-block bookkeeping around them. Flat, because a candidate pays for those
+/// tokens whatever the distance.
+const META_R: f32 = 4.0;
+
 /// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
 /// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
 /// bits, so `λ·R` is in quant-units² and adds cleanly to D.
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
+
+/// How much better the tiled DCT8 must look to [`rerank_large_transforms`]
+/// before a committed merge is downgraded: the test is `j_dct8 < j_big * m`.
+/// At high quality the reconstruction costs sit on the noise floor and a
+/// knife-edge (m = 1) comparison is as good as any; from d=1.5 up the merge is
+/// worth defending, and the tiled DCT8 has to be ~13% cheaper to win.
+const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.87);
 
 const RERANK_LAMBDA_LO: f32 = 0.25;
 const RERANK_LAMBDA_HI: f32 = 10.0;
 const RERANK_LAMBDA_D0: f32 = 1.0;
 const RERANK_LAMBDA_D1: f32 = 4.0;
 
-const BIAS_RECT: f32 = 1.0;
-const BIAS_16X16: f32 = 1.0;
-const BIAS_32X32: f32 = 1.0;
-const BIAS_RECT32: f32 = 1.10;
+const BIAS_RECT: Banded = Banded::new(1.026_200_7, 1.0);
+const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.0);
+const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.0);
+const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.10);
 
-const MERGE_MARGIN_PAIR_HQ: f32 = 0.04;
-const MERGE_MARGIN_16_HQ: f32 = 0.08;
-const MERGE_MARGIN_32_RECT_HQ: f32 = 0.11;
-const MERGE_MARGIN_32_HQ: f32 = 0.14;
+const MERGE_MARGIN_PAIR: Banded = Banded::new(0.036_252_015, 0.04);
+const MERGE_MARGIN_16: Banded = Banded::new(0.192_438_88, 0.08);
+const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.11);
+const MERGE_MARGIN_32: Banded = Banded::new(0.329_207_82, 0.14);
 
 const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.20;
 const MERGE_MARGIN_FADE_START: f32 = 1.0;
 const MERGE_MARGIN_FADE_END: f32 = 4.0;
-const BIAS_4X4: f32 = 1.0;
-const BIAS_4X8: f32 = 1.0;
+/// Sub-8x8 selection biases. Each candidate's RD cost is scaled by its bias
+/// before being compared with the 8x8 incumbent, so >1 makes that strategy
+/// harder to select.
+const BIAS_4X4: f32 = 1.33;
+const BIAS_4X8: f32 = 1.09;
 
+/// Sub-8 is skipped entirely above this distance.
+const SUB8_MAX_DISTANCE: f32 = 1.5;
 #[inline]
-fn merge_margin(distance: f32, high_quality_margin: f32) -> f32 {
+fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
         / (MERGE_MARGIN_FADE_END - MERGE_MARGIN_FADE_START))
         .clamp(0.0, 1.0);
-    high_quality_margin * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION))
+    margin.at(distance) * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION))
 }
 
 #[inline]
-fn merge_beats_dct8(
-    candidate_cost: f32,
-    dct8_cost: f32,
-    distance: f32,
-    high_quality_margin: f32,
-) -> bool {
-    candidate_cost < dct8_cost * (1.0 - merge_margin(distance, high_quality_margin))
+fn merge_beats_dct8(candidate_cost: f32, dct8_cost: f32, accept: f32) -> bool {
+    candidate_cost < dct8_cost * accept
+}
+
+/// The merge-selection knobs resolved at the encode's distance, so the band
+/// interpolation and the low-quality margin fade are paid once per encode
+/// instead of per candidate block. Lives in [`EncodingContext`].
+#[derive(Clone, Copy)]
+pub(crate) struct MergeTuning {
+    /// Per-transform-size cost biases.
+    pub(crate) bias_rect: f32,
+    pub(crate) bias_16x16: f32,
+    pub(crate) bias_32x32: f32,
+    pub(crate) bias_rect32: f32,
+    /// Fraction of the tiled-DCT8 cost a merge must come in under, i.e.
+    /// `1 - margin` with the fade already applied.
+    pub(crate) accept_pair: f32,
+    pub(crate) accept_16: f32,
+    pub(crate) accept_32_rect: f32,
+    pub(crate) accept_32: f32,
+    /// See [`RERANK_DOWNGRADE_MARGIN`].
+    pub(crate) rerank_margin: f32,
+}
+
+impl MergeTuning {
+    pub(crate) fn new(distance: f32) -> Self {
+        let accept = |margin: Banded| 1.0 - merge_margin(distance, margin);
+        Self {
+            bias_rect: BIAS_RECT.at(distance),
+            bias_16x16: BIAS_16X16.at(distance),
+            bias_32x32: BIAS_32X32.at(distance),
+            bias_rect32: BIAS_RECT32.at(distance),
+            accept_pair: accept(MERGE_MARGIN_PAIR),
+            accept_16: accept(MERGE_MARGIN_16),
+            accept_32_rect: accept(MERGE_MARGIN_32_RECT),
+            accept_32: accept(MERGE_MARGIN_32),
+            rerank_margin: RERANK_DOWNGRADE_MARGIN.at(distance),
+        }
+    }
 }
 
 /// How much of the transform space the chooser explores.
@@ -198,54 +274,54 @@ fn forward_transform(
     // the allocated plane.
     match strategy {
         STRATEGY_DCT => {
-            let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct8x8)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT16X8 => {
-            let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
+            let dst: &mut [f32; 128] = out.first_chunk_mut::<128>().unwrap();
             (ctx.dct16x8)(dct_input(plane, tmp, px, py), dst);
             (2, 1)
         }
         STRATEGY_DCT8X16 => {
-            let dst: &mut [f32; 128] = (&mut out[..128]).try_into().unwrap();
+            let dst: &mut [f32; 128] = out.first_chunk_mut::<128>().unwrap();
             (ctx.dct8x16)(dct_input(plane, tmp, px, py), dst);
             (2, 1)
         }
         STRATEGY_DCT16X16 => {
-            let dst: &mut [f32; 256] = (&mut out[..256]).try_into().unwrap();
+            let dst: &mut [f32; 256] = out.first_chunk_mut::<256>().unwrap();
             (ctx.dct16x16)(dct_input(plane, tmp, px, py), dst);
             (2, 2)
         }
         STRATEGY_DCT32X32 => {
-            let dst: &mut [f32; 1024] = (&mut out[..1024]).try_into().unwrap();
+            let dst: &mut [f32; 1024] = out.first_chunk_mut::<1024>().unwrap();
             (ctx.dct32x32)(dct_input(plane, tmp, px, py), dst);
             (4, 4)
         }
         STRATEGY_DCT32X16 => {
             // 16 wide × 32 tall pixels (cov 2×4); normalized (cx,cy) = (4,2).
-            let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
+            let dst: &mut [f32; 512] = out.first_chunk_mut::<512>().unwrap();
             (ctx.dct32x16)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
         }
         STRATEGY_DCT16X32 => {
             // 32 wide × 16 tall pixels (cov 4×2); normalized (cx,cy) = (4,2).
-            let dst: &mut [f32; 512] = (&mut out[..512]).try_into().unwrap();
+            let dst: &mut [f32; 512] = out.first_chunk_mut::<512>().unwrap();
             (ctx.dct16x32)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
         }
         STRATEGY_DCT4X4 => {
-            let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct4x4)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT4X8 => {
-            let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct4x8)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT8X4 => {
-            let dst: &mut [f32; 64] = (&mut out[..64]).try_into().unwrap();
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct8x4)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
@@ -492,7 +568,9 @@ fn strategy_cost_impl(
             RD_LAMBDA * multiplier
         }
     };
-    d_total + lam * (r_total + meta_r)
+    // fmla, matching `sub8_strategy_costs::evaluate` bit-for-bit — the sub8
+    // differential test compares the two paths' costs exactly.
+    fmla(lam, r_total + meta_r, d_total)
 }
 
 #[derive(Clone, Copy)]
@@ -510,7 +588,7 @@ fn forward_sub8_transform(
     input: &[f32; 64],
     output: &mut [f32; 1024],
 ) {
-    let dst: &mut [f32; 64] = (&mut output[..64]).try_into().unwrap();
+    let dst: &mut [f32; 64] = output.first_chunk_mut::<64>().unwrap();
     let input = DctInput::from_flat(input);
     match strategy {
         STRATEGY_DCT => (ctx.dct8x8)(input, dst),
@@ -596,7 +674,6 @@ fn select_super_block(
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
-    dct8_costs: &mut [f32],
     dct8_cost_y0: usize,
     dct8_cost_stride: usize,
     scope: SearchScope,
@@ -623,17 +700,19 @@ fn select_super_block(
                 distance,
                 cmap_factor,
             );
-            dct8_costs[(by0 + dy - dct8_cost_y0) * dct8_cost_stride + bx0 + dx] = c8[dy][dx];
+            scratch.dct8_costs[(by0 + dy - dct8_cost_y0) * dct8_cost_stride + bx0 + dx] =
+                c8[dy][dx];
         }
     }
 
     // Vertical pairs (DCT16X8): one per column. Skipped entirely under
     // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
+    let merge = ctx.merge;
     let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> f32 {
         if !scope.rectangles() {
             return f32::INFINITY;
         }
-        BIAS_RECT
+        merge.bias_rect
             * strategy_cost(
                 ctx,
                 scratch,
@@ -654,7 +733,7 @@ fn select_super_block(
     let h_bot = rect_cost(px0, py0 + 8, STRATEGY_DCT8X16, qac[1][0].max(qac[1][1]));
 
     // The single DCT16X16 over all four.
-    let c16 = BIAS_16X16
+    let c16 = merge.bias_16x16
         * strategy_cost(
             ctx,
             scratch,
@@ -676,13 +755,13 @@ fn select_super_block(
     let total_dct8 = dct8_left + dct8_right;
 
     let use_v_left = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
-        && merge_beats_dct8(v_left, dct8_left, distance, MERGE_MARGIN_PAIR_HQ);
+        && merge_beats_dct8(v_left, dct8_left, merge.accept_pair);
     let use_v_right = ac_strategy.can_place_strategy(bx0 + 1, by0, STRATEGY_DCT16X8)
-        && merge_beats_dct8(v_right, dct8_right, distance, MERGE_MARGIN_PAIR_HQ);
+        && merge_beats_dct8(v_right, dct8_right, merge.accept_pair);
     let use_h_top = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT8X16)
-        && merge_beats_dct8(h_top, dct8_top, distance, MERGE_MARGIN_PAIR_HQ);
+        && merge_beats_dct8(h_top, dct8_top, merge.accept_pair);
     let use_h_bottom = ac_strategy.can_place_strategy(bx0, by0 + 1, STRATEGY_DCT8X16)
-        && merge_beats_dct8(h_bot, dct8_bottom, distance, MERGE_MARGIN_PAIR_HQ);
+        && merge_beats_dct8(h_bot, dct8_bottom, merge.accept_pair);
 
     let cost_16x8 = if use_v_left { v_left } else { dct8_left }
         + if use_v_right { v_right } else { dct8_right };
@@ -692,7 +771,7 @@ fn select_super_block(
 
     let pick_16x16 = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
         && c16 < best_rect
-        && merge_beats_dct8(c16, total_dct8, distance, MERGE_MARGIN_16_HQ);
+        && merge_beats_dct8(c16, total_dct8, merge.accept_16);
 
     let chosen = if pick_16x16 {
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
@@ -825,13 +904,27 @@ fn refine_quant_field(
         };
         let mut best_q = current_q;
         let mut best_cost = cost(current_q);
-        let second_step = if steps == 2 {
-            current_q.saturating_sub(2)
+        // Bidirectional: q-1/q-2 can only save rate on over-spent blocks; q+1/q+2
+        // let the field *spend* a step where the reconstruction says it is cheap.
+        let candidates = if steps == 2 {
+            // Upward stays at +1: q+2 measurably over-spends (its metadata-rate
+            // cost is not priced here), while the -2 rate save still pays.
+            [
+                current_q.saturating_sub(1),
+                current_q.saturating_sub(2),
+                current_q.saturating_add(1),
+                current_q,
+            ]
         } else {
-            current_q.saturating_sub(1)
+            [
+                current_q.saturating_sub(1),
+                current_q.saturating_add(1),
+                current_q,
+                current_q,
+            ]
         };
-        for candidate in [current_q.saturating_sub(1), second_step] {
-            if candidate == 0 || candidate == best_q {
+        for candidate in candidates {
+            if candidate == 0 || candidate == best_q || candidate == current_q {
                 continue;
             }
             let candidate_cost = cost(candidate);
@@ -914,9 +1007,16 @@ fn select_band(
     y_end: usize,
     scope: SearchScope,
 ) -> f32 {
+    let merge = ctx.merge;
     // First-pass DCT8 incumbents are consumed again by the sub-8 refinement.
     // Keep only this worker's row band so parallel selection stays independent.
-    let mut dct8_costs = vec![f32::NAN; xsize * (y_end - y_begin)];
+    let costs_size = xsize * (y_end - y_begin);
+    if scratch.dct8_costs.len() != xsize * (y_end - y_begin) {
+        scratch.dct8_costs.clear();
+        scratch.dct8_costs.resize(costs_size, f32::NAN);
+    } else {
+        scratch.dct8_costs.fill(f32::NAN);
+    }
     let mut by = y_begin;
     while by + 1 < ysize && by < y_end {
         // A 4-block-tall band can host DCT32X32 only when 4-aligned and fitting.
@@ -948,7 +1048,6 @@ fn select_band(
                             ytox_map,
                             ytob_map,
                             ac_strategy,
-                            &mut dct8_costs,
                             y_begin,
                             xsize,
                             scope,
@@ -1006,35 +1105,34 @@ fn select_band(
                     && ac_strategy.can_place_strategy(bx, by + 2, STRATEGY_DCT16X32);
 
                 let cost_32x32 = if can_32x32 {
-                    BIAS_32X32 * cost32
+                    merge.bias_32x32 * cost32
                 } else {
                     f32::INFINITY
                 };
                 let cost_32x16 = if can_32x16 {
-                    BIAS_RECT32 * (cl + cr)
+                    merge.bias_rect32 * (cl + cr)
                 } else {
                     f32::INFINITY
                 };
                 let cost_16x32 = if can_16x32 {
-                    BIAS_RECT32 * (ct + cb)
+                    merge.bias_rect32 * (ct + cb)
                 } else {
                     f32::INFINITY
                 };
 
-                let (best_big, best_strategy, margin) =
+                let (best_big, best_strategy, accept) =
                     if cost_32x32 <= cost_32x16 && cost_32x32 <= cost_16x32 {
-                        (cost_32x32, STRATEGY_DCT32X32, MERGE_MARGIN_32_HQ)
+                        (cost_32x32, STRATEGY_DCT32X32, merge.accept_32)
                     } else if cost_32x16 <= cost_16x32 {
-                        (cost_32x16, STRATEGY_DCT32X16, MERGE_MARGIN_32_RECT_HQ)
+                        (cost_32x16, STRATEGY_DCT32X16, merge.accept_32_rect)
                     } else {
-                        (cost_16x32, STRATEGY_DCT16X32, MERGE_MARGIN_32_RECT_HQ)
+                        (cost_16x32, STRATEGY_DCT16X32, merge.accept_32_rect)
                     };
 
                 // Compare against both the already-selected subdivision and the
                 // pure DCT8 incumbent. The latter prevents a sequence of locally
                 // marginal merges from making a 32×32 merge look trustworthy.
-                if best_big < sub_total && merge_beats_dct8(best_big, dct8_total, distance, margin)
-                {
+                if best_big < sub_total && merge_beats_dct8(best_big, dct8_total, accept) {
                     match best_strategy {
                         STRATEGY_DCT32X32 => {
                             ac_strategy.set_first(bx, by, STRATEGY_DCT32X32);
@@ -1070,7 +1168,6 @@ fn select_band(
                         ytox_map,
                         ytob_map,
                         ac_strategy,
-                        &mut dct8_costs,
                         y_begin,
                         xsize,
                         scope,
@@ -1095,7 +1192,6 @@ fn select_band(
                     ytox_map,
                     ytob_map,
                     ac_strategy,
-                    &mut dct8_costs,
                     y_begin,
                     xsize,
                     scope,
@@ -1113,6 +1209,9 @@ fn select_band(
     if !scope.rectangles() {
         return benefit;
     }
+    if distance > SUB8_MAX_DISTANCE {
+        return benefit;
+    }
     for by in y_begin..y_end {
         for bx in 0..xsize {
             if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
@@ -1122,7 +1221,7 @@ fn select_band(
             let px = dc_group_px + bx * 8;
             let py = dc_group_py + by * 8;
             let cmap_factor = cmap_factors(ytox_map, ytob_map, bx, by);
-            let cached_dct8 = dct8_costs[(by - y_begin) * xsize + bx];
+            let cached_dct8 = scratch.dct8_costs[(by - y_begin) * xsize + bx];
             let costs = sub8_strategy_costs(
                 ctx,
                 scratch,
@@ -1208,7 +1307,7 @@ pub(crate) fn fill_ac_strategy(
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
     // Per-candidate-block metadata rate for the strategy chooser (bits),
     // faded in above d=1 (see strategy_cost).
-    let meta_r = 2.0f32 * (distance - 1.0).clamp(0.0, 1.0);
+    let meta_r = META_R;
 
     let bands = if num_threads > 1 && ysize >= 8 {
         selection_bands(ysize, num_threads)
@@ -1286,6 +1385,7 @@ pub(crate) fn fill_ac_strategy(
     // prefers it. Only large transforms are scored (a fraction of blocks), so the
     // expensive recon distortion runs on far fewer candidates than a full recon
     // selection while capturing the same structural win.
+
     // The SSIM reconstruction rerank runs in both scopes. Under
     // `SearchScope::Squares` the only merges present are DCT16X16 and
     // DCT32X32, so it scores exactly those.
@@ -1343,6 +1443,7 @@ fn rerank_large_transforms(
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
 ) {
+    let rerank_margin = ctx.merge.rerank_margin;
     let mut downgrades: Vec<(usize, usize, usize, usize)> = Vec::new();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
@@ -1384,7 +1485,7 @@ fn rerank_large_transforms(
                 );
             }
         }
-        if j_dct8 < j_big {
+        if j_dct8 < j_big * rerank_margin {
             downgrades.push((bx, by, cxb, cyb));
         }
     }
@@ -1400,10 +1501,11 @@ fn rerank_large_transforms(
 #[cfg(test)]
 mod tests {
     use super::{
-        DCT8_ONLY_MAX_DISTANCE, FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16_HQ, MERGE_MARGIN_32_HQ,
-        MERGE_MARGIN_PAIR_HQ, SearchScope, aggregate_qac_2x2, aggregate_quant, cmap_factors,
-        fill_ac_strategy, merge_beats_dct8, merge_margin, quant_refinement_steps, strategy_cost,
-        sub8_strategy_costs, use_dct8_only,
+        BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
+        FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MergeTuning,
+        RERANK_DOWNGRADE_MARGIN, SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2,
+        aggregate_quant, cmap_factors, fill_ac_strategy, merge_beats_dct8, merge_margin,
+        quant_refinement_steps, strategy_cost, sub8_strategy_costs, use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -1416,14 +1518,33 @@ mod tests {
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
 
+    /// Merges are searched at every usable distance; only the near-lossless
+    /// tail is DCT8-only. The high-quality band is held back by the banded
+    /// margins below, not by this gate.
     #[test]
-    fn high_quality_dct8_cutoff_is_half_distance() {
-        assert_eq!(DCT8_ONLY_MAX_DISTANCE, 0.5);
-        assert!(use_dct8_only(0.2));
-        assert!(use_dct8_only(0.3));
-        assert!(use_dct8_only(0.5));
-        assert!(!use_dct8_only(0.500_001));
+    fn dct8_only_covers_the_near_lossless_tail_only() {
+        assert_eq!(DCT8_ONLY_MAX_DISTANCE, 0.056_713_393);
+        assert!(use_dct8_only(0.01));
+        assert!(use_dct8_only(0.05));
+        assert!(!use_dct8_only(0.06));
+        assert!(!use_dct8_only(0.2));
         assert!(!use_dct8_only(1.0));
+    }
+
+    /// A banded knob holds each end flat outside the band and interpolates
+    /// inside it, so a value fitted in one band cannot move the other.
+    #[test]
+    fn banded_knobs_are_flat_outside_the_band() {
+        assert_eq!(MERGE_MARGIN_16.at(0.1), MERGE_MARGIN_16.at(0.5));
+        assert_eq!(MERGE_MARGIN_16.at(1.5), MERGE_MARGIN_16.at(6.0));
+        let mid = MERGE_MARGIN_16.at(1.0);
+        assert!((mid - 0.5 * (0.192_438_88 + 0.08)).abs() < 1e-6);
+        // High quality admits merges on much stiffer terms than mid/low.
+        assert!(MERGE_MARGIN_16.at(0.3) > MERGE_MARGIN_16.at(2.0));
+        assert!(BIAS_16X16.at(0.3) > BIAS_16X16.at(2.0));
+        // The rerank defends merges at mid/low quality, knife-edge at HQ.
+        assert_eq!(RERANK_DOWNGRADE_MARGIN.at(0.3), 1.0);
+        assert!(RERANK_DOWNGRADE_MARGIN.at(3.0) < 1.0);
     }
 
     #[test]
@@ -1479,6 +1600,30 @@ mod tests {
         assert!(SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE));
         assert!(!SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
         assert!(SearchScope::Full.rerank(6.0));
+    }
+
+    /// The sub-8 biases are a fitted pair, not incidental defaults: both are
+    /// above 1.0 (making sub-8 harder to select than the raw RD comparison
+    /// would), and the family is gated off past the mid band. Guards a silent
+    /// revert to the unfitted flat-1.0/no-gate behaviour, which measured
+    /// +0.238% BD-rate combined across Kodak and train0.
+    #[test]
+    fn sub8_selection_is_fitted_not_neutral() {
+        // Read through runtime bindings so the checks are not const-folded away.
+        let (b44, b48, gate) = (
+            std::hint::black_box(BIAS_4X4),
+            std::hint::black_box(BIAS_4X8),
+            std::hint::black_box(SUB8_MAX_DISTANCE),
+        );
+        assert!(b44 > 1.0, "BIAS_4X4 = {b44}");
+        assert!(b48 > 1.0, "BIAS_4X8 = {b48}");
+        assert!(b44 > b48, "4X4 carries the stiffer bar");
+        assert!(
+            (0.8..=2.5).contains(&gate),
+            "gate {gate} outside the band the corpora agree on"
+        );
+        // The gate must sit above the DCT8-only floor, or sub-8 would never run.
+        assert!(gate > std::hint::black_box(DCT8_ONLY_MAX_DISTANCE));
     }
 
     #[test]
@@ -1632,15 +1777,22 @@ mod tests {
 
     #[test]
     fn merge_guard_is_stricter_for_large_transforms_and_high_quality() {
-        assert!(merge_margin(0.3, MERGE_MARGIN_32_HQ) > merge_margin(0.3, MERGE_MARGIN_16_HQ));
-        assert!(merge_margin(0.3, MERGE_MARGIN_16_HQ) > merge_margin(0.3, MERGE_MARGIN_PAIR_HQ));
-        assert!(merge_margin(0.3, MERGE_MARGIN_16_HQ) > merge_margin(4.0, MERGE_MARGIN_16_HQ));
+        assert!(merge_margin(0.3, MERGE_MARGIN_32) > merge_margin(0.3, MERGE_MARGIN_16));
+        assert!(merge_margin(0.3, MERGE_MARGIN_16) > merge_margin(0.3, MERGE_MARGIN_PAIR));
+        assert!(merge_margin(0.3, MERGE_MARGIN_16) > merge_margin(4.0, MERGE_MARGIN_16));
 
-        // At high quality an 8% 16x16 margin rejects a 5% estimated win, but
-        // accepts a clear 10% win. At coarse quality the guard fades.
-        assert!(!merge_beats_dct8(95.0, 100.0, 0.3, MERGE_MARGIN_16_HQ));
-        assert!(merge_beats_dct8(89.0, 100.0, 0.3, MERGE_MARGIN_16_HQ));
-        assert!(merge_beats_dct8(95.0, 100.0, 4.0, MERGE_MARGIN_16_HQ));
+        // At high quality the 19% 16x16 margin rejects a 10% estimated win but
+        // accepts a clear 25% one. At coarse quality the guard fades.
+        let hq = MergeTuning::new(0.3);
+        let lowq = MergeTuning::new(4.0);
+        assert!(!merge_beats_dct8(90.0, 100.0, hq.accept_16));
+        assert!(merge_beats_dct8(75.0, 100.0, hq.accept_16));
+        assert!(merge_beats_dct8(95.0, 100.0, lowq.accept_16));
+
+        // The resolved table is exactly what the per-block path used to compute.
+        assert_eq!(hq.accept_16, 1.0 - merge_margin(0.3, MERGE_MARGIN_16));
+        assert_eq!(hq.bias_rect32, BIAS_RECT32.at(0.3));
+        assert_eq!(lowq.rerank_margin, RERANK_DOWNGRADE_MARGIN.at(4.0));
     }
 
     #[test]

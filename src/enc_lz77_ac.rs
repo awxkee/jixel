@@ -35,11 +35,10 @@ use crate::entropy::{
 
 pub(crate) const LZ77_MIN_SYMBOL: u32 = 64;
 pub(crate) const LZ77_MIN_LENGTH: u32 = 3;
-/// special_distance index 1 == (dx=1, dy=0) == "1 token back".
-const LZ77_DIST_VALUE: u32 = 1;
+pub(crate) const LZ77_DIST_VALUE: u32 = 0;
 
 #[inline]
-fn lz77_length_encode(length_value: u32) -> (u32, u32, u32) {
+pub(crate) fn lz77_length_encode(length_value: u32) -> (u32, u32, u32) {
     if length_value < 16 {
         (length_value, 0, 0)
     } else {
@@ -64,21 +63,6 @@ pub(crate) enum AcLz {
 /// Collapse runs of identical (context, value) AC tokens into back-references.
 pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
     // Collapse runs of identical AC tokens into a literal + distance-1 back-ref.
-    //
-    // Runs are grouped by BOTH context and value (not value alone). This is the
-    // conservative choice: a run never spans a point where the per-coefficient
-    // context changes, so the LZ77 length symbol — which the decoder reads at the
-    // position right after the run's literal head — is always read with the same
-    // context it was coded on, and a run never crosses a block boundary (the
-    // nonzero-count token carries a different context than the coefficients).
-    //
-    // Zero-valued runs are deliberately NOT collapsed. A dense 32x32 block emits
-    // long stretches of zero coefficients in the high-frequency tail (its
-    // context buckets are 16-wide, `k >> 4`, versus 4-wide for 16x16), and
-    // back-referencing those zero runs desynced the libjxl decoder. Coding the
-    // zeros as plain literals (still efficiently entropy-coded by the
-    // zero-density context model) avoids that without affecting the far more
-    // valuable nonzero runs.
     let n = tokens.len();
     let mut out: Vec<AcLz> = Vec::with_capacity(n);
     let mut i = 0;
@@ -424,5 +408,75 @@ mod tests {
             estimate < huffman_floor / 2,
             "ANS estimate {estimate} should be far below the {huffman_floor}-bit Huffman floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod lz77_distance_tests {
+    use super::{AcLz, LZ77_DIST_VALUE, LZ77_MIN_LENGTH, lz77_compress_ac, lz77_length_encode};
+    use crate::entropy::Token;
+
+    /// Model of the JXL reader: a back-reference copies `length` symbols from
+    /// `distance` back, where `distance = written_value + 1` because these
+    /// streams carry no special-distance table, and the reader clamps a distance
+    /// that reaches past the start of the stream.
+    fn decode(stream: &[AcLz]) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for item in stream {
+            match *item {
+                AcLz::Lit { context, value } => out.push((context, value)),
+                AcLz::Copy {
+                    context: _,
+                    length_value,
+                } => {
+                    let length = length_value + LZ77_MIN_LENGTH;
+                    let distance = (LZ77_DIST_VALUE + 1).min(out.len() as u32).max(1) as usize;
+                    for _ in 0..length {
+                        let src = out.len() - distance;
+                        out.push(out[src]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The compressor and the reader must agree on the distance convention. With
+    /// the historical value of 1 (i.e. distance 2) this fails for any run that
+    /// has history in front of it — which is why the bug survived: a run at the
+    /// very start of a stream decodes correctly thanks to the reader's clamp.
+    #[test]
+    fn lz77_round_trips_including_runs_with_history() {
+        let cases: Vec<Vec<Token>> = vec![
+            vec![Token::new(0, 5); 8],
+            {
+                let mut v = vec![Token::new(0, 9), Token::new(0, 3)];
+                v.extend(std::iter::repeat_n(Token::new(0, 7), 10));
+                v
+            },
+            {
+                let mut v = Vec::new();
+                for i in 0..6u32 {
+                    v.push(Token::new(0, i));
+                    v.extend(std::iter::repeat_n(Token::new(0, 100 + i), 5));
+                }
+                v
+            },
+        ];
+        for tokens in cases {
+            let expected: Vec<(u32, u32)> = tokens.iter().map(|t| (t.context, t.value)).collect();
+            let compressed = lz77_compress_ac(&tokens);
+            assert_eq!(decode(&compressed), expected);
+        }
+    }
+
+    /// A length symbol must stay inside the alphabet the prefix code covers.
+    #[test]
+    fn lz77_length_tokens_stay_in_alphabet() {
+        for length_value in [0u32, 1, 7, 63, 255, 4095] {
+            let (tok, nbits, _) = lz77_length_encode(length_value);
+            assert!(tok < 64, "length token {tok} escapes the alphabet");
+            assert!(nbits <= 32);
+        }
     }
 }

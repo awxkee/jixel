@@ -30,12 +30,18 @@ use anyhow::{Context, Result, bail};
 use jixel::Speed;
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
+use std::cell::Cell;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::available_parallelism;
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
+
+// --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3. ---
+const BUTTERAUGLI_BIN: &str = "butteraugli_main";
+/// p of the butteraugli p-norm reported alongside the max distance.
+const BUTTERAUGLI_PNORM: u32 = 3;
 
 // --- AV1 reference: SYSTEM libavif (aom) for both encode and decode (on PATH). ---
 const SYS_AVIFENC: &str = "avifenc";
@@ -58,14 +64,98 @@ fn register_fonts() {
     }
 }
 
+/// Quality scores of one decoded image against the reference.
+#[derive(Clone, Copy, Default)]
+struct Scores {
+    /// SSIMULACRA2, 0..100, higher = better.
+    ss2: f64,
+    /// butteraugli p-norm distance, lower = better. `None` when the
+    /// `butteraugli_main` tool is unavailable or disabled.
+    ba: Option<f64>,
+    /// butteraugli max distance (worst region), lower = better.
+    ba_max: Option<f64>,
+}
+
 /// One measured (rate, quality) point.
 #[derive(Clone)]
 struct Point {
     bpp: f64,
     bytes: u64,
-    ss2: f64,
+    scores: Scores,
     /// Per-point annotation drawn on the chart (e.g. "-d 1" or "q90").
     note: String,
+}
+
+impl Point {
+    /// Console tail: "SS2 96.123  BA3 0.842 (max 3.11)".
+    fn score_str(&self) -> String {
+        let mut s = format!("SS2 {:.3}", self.scores.ss2);
+        if let Some(ba) = self.scores.ba {
+            s.push_str(&format!("  BA{BUTTERAUGLI_PNORM} {ba:.3}"));
+            if let Some(m) = self.scores.ba_max {
+                s.push_str(&format!(" (max {m:.3})"));
+            }
+        }
+        s
+    }
+}
+
+/// Scores decoded images against one reference image. Holds the reference both
+/// as pixels (for the in-process SSIMULACRA2) and as a PNG on disk (for the
+/// out-of-process `butteraugli_main`), so both metrics see identical input.
+struct Scorer<'a> {
+    orig: &'a [u8],
+    w: usize,
+    h: usize,
+    /// `None` disables butteraugli scoring.
+    butteraugli: Option<String>,
+    ref_png: PathBuf,
+    tmp: PathBuf,
+    /// Serial number for the per-point distorted PNG (unique temp names).
+    seq: Cell<u64>,
+}
+
+impl<'a> Scorer<'a> {
+    fn new(
+        orig: &'a [u8],
+        w: usize,
+        h: usize,
+        tmp: &Path,
+        stem: &str,
+        butteraugli: Option<String>,
+    ) -> Result<Self> {
+        let ref_png = tmp.join(format!("{stem}_ref.png"));
+        if butteraugli.is_some() {
+            write_png(&ref_png, orig, w, h)?;
+        }
+        Ok(Self {
+            orig,
+            w,
+            h,
+            butteraugli,
+            ref_png,
+            tmp: tmp.to_path_buf(),
+            seq: Cell::new(0),
+        })
+    }
+
+    /// SSIMULACRA2 always; butteraugli too when the tool is configured.
+    fn score(&self, dist: &[u8]) -> Result<Scores> {
+        let ss2 = score_ss2(self.orig, dist, self.w, self.h)?;
+        let (ba, ba_max) = match &self.butteraugli {
+            None => (None, None),
+            Some(bin) => {
+                let n = self.seq.get();
+                self.seq.set(n + 1);
+                let png = self.tmp.join(format!("_ba_dist_{n}.png"));
+                write_png(&png, dist, self.w, self.h)?;
+                let (norm, max) = score_butteraugli(bin, &self.ref_png, &png)?;
+                let _ = std::fs::remove_file(&png);
+                (Some(norm), Some(max))
+            }
+        };
+        Ok(Scores { ss2, ba, ba_max })
+    }
 }
 
 /// A labeled series of points (one encoder, or one cjxl effort).
@@ -102,7 +192,7 @@ struct AvifTools {
 fn bench_maroontree_vvc(
     img: &Path,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     w: usize,
     h: usize,
     tmp: &Path,
@@ -162,11 +252,11 @@ fn bench_maroontree_vvc(
     if dw != w || dh != h {
         bail!("vvc decoded size {dw}x{dh} != {w}x{h}");
     }
-    let ss2 = score(orig, &dec_rgb, w, h)?;
+    let scores = sc.score(&dec_rgb)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: format!("q{q}"),
     })
 }
@@ -194,63 +284,84 @@ fn main() -> Result<()> {
     let mut with_vvc = true;
     let mut with_avm_enc = true;
     let mut with_image_avif = true;
+    let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
+    let mut with_butteraugli = true;
 
     let mut i = 0;
     while i < args.len() {
+        // Value of a "--flag VALUE" option; errors instead of running off the end.
+        macro_rules! value {
+            () => {
+                args.get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for {}", args[i]))?
+            };
+        }
         match args[i].as_str() {
             "--out" => {
-                out_dir = PathBuf::from(&args[i + 1]);
+                out_dir = PathBuf::from(value!());
                 i += 2;
             }
             "--distances" => {
-                distances = parse_f32_list(&args[i + 1])?;
+                distances = parse_f32_list(value!())?;
                 i += 2;
             }
             "--efforts" => {
-                efforts = parse_u32_list(&args[i + 1])?;
+                efforts = parse_u32_list(value!())?;
                 i += 2;
             }
             "--avifenc" => {
-                tools.aom_enc = args[i + 1].clone();
+                tools.aom_enc = value!().clone();
                 i += 2;
             }
             "--avifdec" => {
-                tools.aom_dec = args[i + 1].clone();
+                tools.aom_dec = value!().clone();
                 i += 2;
             }
             "--maroontree" => {
-                tools.mt_cli = args[i + 1].clone();
+                tools.mt_cli = value!().clone();
                 i += 2;
             }
             "--avm-avifdec" => {
-                tools.avm_dec = args[i + 1].clone();
+                tools.avm_dec = value!().clone();
                 i += 2;
             }
             "--avm-avifenc" => {
-                tools.avm_enc = args[i + 1].clone();
+                tools.avm_enc = value!().clone();
                 i += 2;
             }
             "--aom-speed" => {
-                tools.aom_speed = args[i + 1].clone();
+                tools.aom_speed = value!().clone();
                 i += 2;
             }
             "--av2-speed" => {
-                tools.av2_speed = args[i + 1].clone();
+                tools.av2_speed = value!().clone();
                 i += 2;
             }
             "--avm-enc-speed" => {
-                tools.avm_enc_speed = args[i + 1].clone();
+                tools.avm_enc_speed = value!().clone();
                 i += 2;
             }
             "--image-avif-speed" => {
-                tools.image_avif_speed = args[i + 1]
+                tools.image_avif_speed = value!()
                     .parse()
                     .context("bad --image-avif-speed (expected 1..=10)")?;
                 i += 2;
             }
             "--avif-yuv" => {
-                tools.yuv = args[i + 1].clone();
+                tools.yuv = value!().clone();
                 i += 2;
+            }
+            "--butteraugli" => {
+                with_butteraugli = true;
+                i += 1;
+            }
+            "--butteraugli-bin" => {
+                butteraugli_bin = value!().clone();
+                i += 2;
+            }
+            "--no-butteraugli" => {
+                with_butteraugli = false;
+                i += 1;
             }
             "--no-aom" => {
                 with_aom = false;
@@ -279,6 +390,7 @@ fn main() -> Result<()> {
                 with_image_avif = false;
                 i += 1;
             }
+            other if other.starts_with("--") => bail!("unknown option {other}"),
             other => {
                 images.push(PathBuf::from(other));
                 i += 1;
@@ -295,7 +407,9 @@ fn main() -> Result<()> {
              AVIF (avm avifenc AV2): [--avm-avifenc PATH] [--avm-avifdec PATH] \
              [--avm-enc-speed 9] [--no-avm-enc]\n  \
              AVIF (image crate, ravif/rav1e): [--image-avif-speed 6] [--no-image-avif]\n  \
-             shared: [--avif-yuv 444|420] [--no-avif]"
+             shared: [--avif-yuv 444|420] [--no-avif]\n  \
+             metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
+             [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]"
         );
     }
     register_fonts();
@@ -345,6 +459,15 @@ fn main() -> Result<()> {
         with_avm_enc = false;
     }
 
+    if with_butteraugli && !available(&butteraugli_bin) {
+        eprintln!(
+            "warning: butteraugli_main not found ({butteraugli_bin}); scoring SSIMULACRA2 only. \
+             Override with --butteraugli-bin or pass --no-butteraugli."
+        );
+        with_butteraugli = false;
+    }
+    let butteraugli = with_butteraugli.then_some(butteraugli_bin);
+
     let nthreads = available_parallelism()
         .unwrap_or(NonZero::new(1).unwrap())
         .get();
@@ -357,6 +480,7 @@ fn main() -> Result<()> {
         println!("\n=== {} ===", img.display());
         let (orig_rgb, w, h) = load_rgb(img)?;
         let npx = (w * h) as f64;
+        let sc = Scorer::new(&orig_rgb, w, h, &tmp, stem, butteraugli.clone())?;
 
         // jixel series.
         let mut jixel = Series {
@@ -365,10 +489,12 @@ fn main() -> Result<()> {
             points: vec![],
         };
         for &d in &distances {
-            let p = bench_jixel(&orig_rgb, w, h, d, &orig_rgb, &tmp, stem, npx, nthreads)?;
+            let p = bench_jixel(&orig_rgb, w, h, d, &sc, &tmp, stem, npx, nthreads)?;
             println!(
-                "  jixel            d={d:<4} {:>9} B  {:.3} bpp  SS2 {:.3}",
-                p.bytes, p.bpp, p.ss2
+                "  jixel            d={d:<4} {:>9} B  {:.3} bpp  {}",
+                p.bytes,
+                p.bpp,
+                p.score_str()
             );
             jixel.points.push(p);
         }
@@ -394,10 +520,12 @@ fn main() -> Result<()> {
                 points: vec![],
             };
             for &d in &distances {
-                let p = bench_cjxl(img, e, d, &orig_rgb, w, h, &tmp, stem, npx)?;
+                let p = bench_cjxl(img, e, d, &sc, w, h, &tmp, stem, npx)?;
                 println!(
-                    "  cjxl -e{e}         d={d:<4} {:>9} B  {:.3} bpp  SS2 {:.3}",
-                    p.bytes, p.bpp, p.ss2
+                    "  cjxl -e{e}         d={d:<4} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
                 );
                 s.points.push(p);
             }
@@ -416,10 +544,12 @@ fn main() -> Result<()> {
             };
             for &d in &distances {
                 let q = distance_to_quality(d);
-                let p = bench_avif_aom(img, d, &orig_rgb, w, h, &tmp, stem, npx, &tools)?;
+                let p = bench_avif_aom(img, d, &sc, w, h, &tmp, stem, npx, &tools)?;
                 println!(
-                    "  libavif aom      d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  SS2 {:.3}",
-                    p.bytes, p.bpp, p.ss2
+                    "  libavif aom      d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
                 );
                 s.points.push(p);
             }
@@ -435,11 +565,12 @@ fn main() -> Result<()> {
             };
             for &d in &distances {
                 let q = distance_to_quality(d);
-                let p =
-                    bench_maroontree(img, d, &orig_rgb, w, h, &tmp, stem, npx, &tools, nthreads)?;
+                let p = bench_maroontree(img, d, &sc, w, h, &tmp, stem, npx, &tools, nthreads)?;
                 println!(
-                    "  maroontree av2   d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  SS2 {:.3}",
-                    p.bytes, p.bpp, p.ss2
+                    "  maroontree av1   d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
                 );
                 s.points.push(p);
             }
@@ -456,11 +587,13 @@ fn main() -> Result<()> {
             for &d in &distances {
                 let q = distance_to_quality(d);
                 let p = bench_avif_image_crate(
-                    &orig_rgb, w, h, d, &orig_rgb, &tmp, stem, npx, &tools, nthreads,
+                    &orig_rgb, w, h, d, &sc, &tmp, stem, npx, &tools, nthreads,
                 )?;
                 println!(
-                    "  image ravif      d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  SS2 {:.3}",
-                    p.bytes, p.bpp, p.ss2
+                    "  image ravif      d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
                 );
                 s.points.push(p);
             }
@@ -507,8 +640,33 @@ fn main() -> Result<()> {
         // }
 
         let chart_path = out_dir.join(format!("{stem}_rd.png"));
-        draw_chart(&chart_path, &format!("{stem} — SSIMULACRA2 vs rate"), &all)?;
+        draw_chart(
+            &chart_path,
+            &format!("{stem} — SSIMULACRA2 vs rate"),
+            &all,
+            &ss2_axis(),
+        )?;
         println!("  chart -> {}", chart_path.display());
+
+        if butteraugli.is_some() {
+            let ba_path = out_dir.join(format!("{stem}_rd_butteraugli.png"));
+            draw_chart(
+                &ba_path,
+                &format!("{stem} — butteraugli {BUTTERAUGLI_PNORM}-norm vs rate"),
+                &all,
+                &ba_axis(),
+            )?;
+            println!("  chart -> {}", ba_path.display());
+
+            let ba_max_path = out_dir.join(format!("{stem}_rd_butteraugli_max.png"));
+            draw_chart(
+                &ba_max_path,
+                &format!("{stem} — butteraugli max distance vs rate"),
+                &all,
+                &ba_max_axis(),
+            )?;
+            println!("  chart -> {}", ba_max_path.display());
+        }
     }
     let _ = std::fs::remove_dir_all(&tmp);
     println!("\nDone. Charts in {}", out_dir.display());
@@ -538,7 +696,7 @@ fn bench_jixel(
     w: usize,
     h: usize,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     tmp: &Path,
     stem: &str,
     npx: f64,
@@ -555,11 +713,11 @@ fn bench_jixel(
     std::fs::write(&jxl, &data)?;
     let bytes = data.len() as u64;
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: dist_note(d),
     })
 }
@@ -569,7 +727,7 @@ fn bench_cjxl(
     img: &Path,
     effort: u32,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     w: usize,
     h: usize,
     tmp: &Path,
@@ -603,11 +761,11 @@ fn bench_cjxl(
     }
     let bytes = std::fs::metadata(&jxl)?.len();
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: dist_note(d),
     })
 }
@@ -618,7 +776,7 @@ fn bench_cjxl(
 fn bench_avif_aom(
     img: &Path,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     w: usize,
     h: usize,
     tmp: &Path,
@@ -655,11 +813,11 @@ fn bench_avif_aom(
     }
     let bytes = std::fs::metadata(&out)?.len();
     let dec = decode_avif(&out, tmp, w, h, &t.aom_dec)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: format!("q{q}"),
     })
 }
@@ -670,7 +828,7 @@ fn bench_avif_aom(
 fn bench_maroontree(
     img: &Path,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     w: usize,
     h: usize,
     tmp: &Path,
@@ -710,11 +868,11 @@ fn bench_maroontree(
     }
     let bytes = std::fs::metadata(&out)?.len();
     let dec = decode_avif(&out, tmp, w, h, &t.avm_dec)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: format!("q{q}"),
     })
 }
@@ -725,7 +883,7 @@ fn bench_maroontree(
 fn bench_avif_avm(
     img: &Path,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     w: usize,
     h: usize,
     tmp: &Path,
@@ -762,11 +920,11 @@ fn bench_avif_avm(
     }
     let bytes = std::fs::metadata(&out)?.len();
     let dec = decode_avif(&out, tmp, w, h, &t.avm_dec)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: format!("q{q}"),
     })
 }
@@ -781,7 +939,7 @@ fn bench_avif_image_crate(
     w: usize,
     h: usize,
     d: f32,
-    orig: &[u8],
+    sc: &Scorer,
     tmp: &Path,
     stem: &str,
     npx: f64,
@@ -804,11 +962,11 @@ fn bench_avif_image_crate(
 
     let bytes = buf.len() as u64;
     let dec = decode_avif(&out, tmp, w, h, &t.aom_dec)?;
-    let ss2 = score(orig, &dec, w, h)?;
+    let scores = sc.score(&dec)?;
     Ok(Point {
         bpp: bytes as f64 * 8.0 / npx,
         bytes,
-        ss2,
+        scores,
         note: format!("q{q}"),
     })
 }
@@ -868,8 +1026,56 @@ fn decode_avif(avif: &Path, tmp: &Path, w: usize, h: usize, avifdec: &str) -> Re
     Ok(rgb)
 }
 
+/// Write an interleaved RGB8 buffer as a PNG (input for `butteraugli_main`).
+fn write_png(path: &Path, rgb: &[u8], w: usize, h: usize) -> Result<()> {
+    image::save_buffer(
+        path,
+        rgb,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::Rgb8,
+    )
+    .with_context(|| format!("writing {}", path.display()))
+}
+
+/// butteraugli distance between two PNGs via libjxl's `butteraugli_main`.
+/// Returns `(p-norm, max)`; both lower = better. Output shape is the max
+/// distance on the first line, then "`<p>`-norm: `<value>`".
+fn score_butteraugli(bin: &str, reference: &Path, dist: &Path) -> Result<(f64, f64)> {
+    let output = Command::new(bin)
+        .arg(reference)
+        .arg(dist)
+        .arg("--pnorm")
+        .arg(BUTTERAUGLI_PNORM.to_string())
+        .output()
+        .with_context(|| format!("running butteraugli ({bin})"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "butteraugli ({bin}) failed for {}\nstdout: {stdout}\nstderr: {stderr}",
+            dist.display()
+        );
+    }
+    let tag = format!("{BUTTERAUGLI_PNORM}-norm:");
+    let mut max = None;
+    let mut norm = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&tag) {
+            norm = rest.trim().parse::<f64>().ok();
+        } else if max.is_none() {
+            max = line.parse::<f64>().ok();
+        }
+    }
+    match (norm, max) {
+        (Some(n), Some(m)) => Ok((n, m)),
+        _ => bail!("could not parse butteraugli output:\n{stdout}"),
+    }
+}
+
 /// SSIMULACRA2 between two interleaved RGB8 buffers.
-fn score(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
+fn score_ss2(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
     let to_rgb = |b: &[u8]| -> Result<Rgb> {
         let data: Vec<[f32; 3]> = b
             .chunks_exact(3)
@@ -902,10 +1108,52 @@ fn load_rgb(path: &Path) -> Result<(Vec<u8>, usize, usize)> {
     Ok((img.into_raw(), w, h))
 }
 
-fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
+/// One chartable metric: how to read it off a point, how to label the y axis,
+/// and the range the padded axis is clamped to.
+struct MetricAxis {
+    desc: String,
+    /// Extract the metric; points that lack it are skipped.
+    get: fn(&Point) -> Option<f64>,
+    clamp: (f64, f64),
+    /// Legend corner — kept away from where the curves run for this metric.
+    legend: SeriesLabelPosition,
+}
+
+fn ss2_axis() -> MetricAxis {
+    MetricAxis {
+        desc: "SSIMULACRA2 (higher = better)".into(),
+        get: |p| Some(p.scores.ss2),
+        clamp: (0.0, 100.0),
+        legend: SeriesLabelPosition::LowerRight,
+    }
+}
+
+fn ba_axis() -> MetricAxis {
+    MetricAxis {
+        desc: format!("butteraugli {BUTTERAUGLI_PNORM}-norm distance (lower = better)"),
+        get: |p| p.scores.ba,
+        clamp: (0.0, f64::INFINITY),
+        legend: SeriesLabelPosition::UpperRight,
+    }
+}
+
+fn ba_max_axis() -> MetricAxis {
+    MetricAxis {
+        desc: "butteraugli max distance (lower = better)".into(),
+        get: |p| p.scores.ba_max,
+        clamp: (0.0, f64::INFINITY),
+        legend: SeriesLabelPosition::UpperRight,
+    }
+}
+
+fn draw_chart(path: &Path, title: &str, series: &[Series], axis: &MetricAxis) -> Result<()> {
     let root = BitMapBackend::new(path, (1920, 1080)).into_drawing_area();
     root.fill(&WHITE)?;
-    let (xmin, xmax, ymin, ymax) = bounds(series);
+    let (xmin, xmax, ymin, ymax) = bounds(series, axis);
+    // Annotation offset: a small fraction of the axis range, so it works for
+    // 0..100 SSIMULACRA2 and for sub-unit butteraugli distances alike.
+    let note_dy = (ymax - ymin) * 0.012;
+    let note_dx = (xmax - xmin) * 0.005;
     let mut chart = ChartBuilder::on(&root)
         .caption(title, ("sans-serif", 26))
         .margin(16)
@@ -915,12 +1163,16 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
     chart
         .configure_mesh()
         .x_desc("rate (bits / pixel)")
-        .y_desc("SSIMULACRA2 (higher = better)")
+        .y_desc(&axis.desc)
         .axis_desc_style(("sans-serif", 18))
         .label_style(("sans-serif", 14))
         .draw()?;
     for s in series {
-        let mut pts: Vec<(f64, f64)> = s.points.iter().map(|p| (p.bpp, p.ss2)).collect();
+        let mut pts: Vec<(f64, f64)> = s
+            .points
+            .iter()
+            .filter_map(|p| (axis.get)(p).map(|y| (p.bpp, y)))
+            .collect();
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         chart
             .draw_series(LineSeries::new(pts.clone(), s.color.stroke_width(2)))?
@@ -936,14 +1188,19 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
         // "q90" for the quality-driven AVIF encoders), offset so it doesn't
         // overlap the circle.
         let series_color = s.color;
-        chart.draw_series(s.points.iter().map(|pt| {
+        chart.draw_series(s.points.iter().filter_map(|pt| {
+            let y = (axis.get)(pt)?;
             let style = ("sans-serif", 14).into_font().color(&series_color);
-            Text::new(pt.note.clone(), (pt.bpp + 0.01, pt.ss2 + 0.4), style)
+            Some(Text::new(
+                pt.note.clone(),
+                (pt.bpp + note_dx, y + note_dy),
+                style,
+            ))
         }))?;
     }
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::LowerRight)
+        .position(axis.legend.clone())
         .background_style(WHITE.mix(0.85))
         .border_style(BLACK.mix(0.3))
         .label_font(("sans-serif", 15))
@@ -952,14 +1209,15 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
     Ok(())
 }
 
-fn bounds(series: &[Series]) -> (f64, f64, f64, f64) {
+fn bounds(series: &[Series], axis: &MetricAxis) -> (f64, f64, f64, f64) {
     let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for s in series {
         for p in &s.points {
+            let Some(y) = (axis.get)(p) else { continue };
             xmn = xmn.min(p.bpp);
             xmx = xmx.max(p.bpp);
-            ymn = ymn.min(p.ss2);
-            ymx = ymx.max(p.ss2);
+            ymn = ymn.min(y);
+            ymx = ymx.max(y);
         }
     }
     let xpad = (xmx - xmn) * 0.05 + 1e-6;
@@ -967,8 +1225,8 @@ fn bounds(series: &[Series]) -> (f64, f64, f64, f64) {
     (
         xmn - xpad,
         xmx + xpad,
-        (ymn - ypad).max(0.0),
-        (ymx + ypad).min(100.0),
+        (ymn - ypad).max(axis.clamp.0),
+        (ymx + ypad).min(axis.clamp.1),
     )
 }
 

@@ -44,7 +44,7 @@ pub(crate) fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw:
         let px = unsafe { _mm_loadu_si128(cur.as_ptr().add(gx) as *const __m128i) };
 
         // fjxl PredictPixels: grad = (left-topleft) + top; clamp to the nearer of
-        // {left, top} via the XOR-sign of the neighbour differences.
+        // {left, top} via the XOR-sign of the neighbor differences.
         let ac = _mm_sub_epi32(left, topleft);
         let ab = _mm_sub_epi32(left, top);
         let bc = _mm_sub_epi32(top, topleft);

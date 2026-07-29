@@ -25,7 +25,8 @@ import optuna
 from . import baseline, config, params as P
 from .corpus import Case, holdout_cases, train_cases
 from .encoder import EncodeError, run_case
-from .objective import PRUNE_DELTA, refine_score, robust_score
+from . import objective as obj_cfg
+from .objective import refine_score, robust_score
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -67,7 +68,7 @@ def make_objective(cases: list[Case], active_keys: list[str] | None):
                  "ss2": round(m.ss2, 4), "delta": round(delta, 4)}
             )
 
-            if delta < PRUNE_DELTA:
+            if delta < obj_cfg.PRUNE_DELTA:
                 trial.set_user_attr("pruned_on", case.key())
                 raise optuna.TrialPruned()
 
@@ -118,7 +119,7 @@ def make_refine_objective(cases: list[Case], active_keys: list[str] | None):
         eval_cases(opt, candidate, trial, "opt", opt_d, tr)
         eval_cases(val, candidate, trial, "val", val_d, tr)
         # Hard reject configs that break any validation image.
-        if val_d and min(val_d) < -0.5:
+        if val_d and min(val_d) < obj_cfg.VAL_REJECT:
             trial.set_user_attr("val_worst", round(min(val_d), 3))
             raise optuna.TrialPruned()
         score = refine_score(opt_d, val_d, tr)
@@ -136,6 +137,8 @@ def cmd_baseline(args: argparse.Namespace) -> None:
 
 
 def cmd_search(args: argparse.Namespace) -> None:
+    obj_cfg.PRUNE_DELTA = args.prune_delta
+    obj_cfg.VAL_REJECT = args.val_reject
     active_keys = args.params.split(",") if args.params else None
     if active_keys:
         for k in active_keys:
@@ -197,7 +200,7 @@ def _report(study: optuna.Study, refine: bool = False) -> None:
     else:
         print(f"best score = {best.value:.4f}  (mean_delta="
               f"{best.user_attrs.get('mean_delta', float('nan')):.4f})")
-    merged = {**P.DEFAULTS, **best.params}
+    merged = P.normalize({**P.DEFAULTS, **best.params})
     print("best params:")
     print(json.dumps(merged, indent=2))
     out = config.STUDY_DIR / f"{study.study_name}.best.json"
@@ -263,6 +266,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--params", default="", help="comma-separated subset to tune")
     s.add_argument("--distances", default="",
                    help="comma-separated search distances (default: config.SEARCH_DISTANCES)")
+    s.add_argument("--prune-delta", type=float, default=obj_cfg.PRUNE_DELTA,
+                   help="prune a trial when any single case regresses past this")
+    s.add_argument("--val-reject", type=float, default=obj_cfg.VAL_REJECT,
+                   help="refine mode: reject when any internal-val case regresses past this")
     s.add_argument("--refine", action="store_true",
                    help="use the clamped/median objective with an internal train/val split")
     s.set_defaults(func=cmd_search)

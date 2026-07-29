@@ -462,8 +462,12 @@ fn encode_jpeg_codestream_with_pool(
     let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) = pool
         .steal_map(scratch, dc_datas.len(), |i, _scratch| {
             (
-                collect_dc_tokens(&dc_datas[i]),
-                collect_ac_metadata_tokens(&dc_datas[i]),
+                collect_dc_tokens(
+                    &dc_datas[i],
+                    &crate::enc_frame::DC_PREDICTOR_WEIGHTED,
+                    &mut Vec::new(),
+                ),
+                collect_ac_metadata_tokens(&dc_datas[i], &mut Vec::new()),
             )
         })
         .into_iter()
@@ -534,7 +538,12 @@ fn encode_jpeg_codestream_with_pool(
         w.write(16, 0); // no DC thresholds, no quant-field thresholds
         crate::enc_frame::write_compact_block_context_map(&mut scratch.huffman_pool, w);
         write_color_correlation(w);
-        write_context_tree(dim.num_dc_groups, &mut scratch.huffman_pool, w);
+        write_context_tree(
+            dim.num_dc_groups,
+            &crate::enc_frame::DC_PREDICTOR_WEIGHTED,
+            &mut scratch.huffman_pool,
+            w,
+        );
         w.write(1, 0); // no lz77 for the DC histograms
         write_entropy_code(&dc_code_ref, &mut scratch.huffman_pool, w);
     }
@@ -588,7 +597,13 @@ fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut
             write_token(*t, code, w);
         }
     } else {
-        write_ans_tokens(tokens, code.context_map, code.ans_symbols, w);
+        write_ans_tokens(
+            tokens,
+            code.context_map,
+            code.ans_symbols,
+            code.hybrid_uint_configs,
+            w,
+        );
     }
 }
 

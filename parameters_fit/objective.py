@@ -23,6 +23,12 @@ import numpy as np
 PRUNE_DELTA = -2.0
 VALIDATION_MAX_REGRESSION = -0.2
 
+# Refinement mode: a config is rejected outright if any internal-validation case
+# regresses past this. Steep-RD bands (high quality especially) swing by several
+# points per case, so studies restricted to those bands relax it via
+# ``optimize.py --val-reject``.
+VAL_REJECT = -0.5
+
 
 @dataclass
 class CaseResult:

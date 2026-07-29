@@ -1,8 +1,8 @@
 """Subprocess glue: encode (jixel-tuner) -> decode (djxl) -> score
 (ssimulacra2), returning a rate/quality/time measurement for one case.
 
-Tuning parameters reach the encoder through a temporary JSON file named by the
-``JIXEL_TUNING_JSON`` environment variable (read by the jixel crate). Passing
+Tuning parameters reach the encoder as environment overrides rendered by
+``params.to_env`` (read by the jixel crate at first use). Passing
 ``params=None`` runs the shipped defaults, which is how baselines are built.
 """
 
@@ -18,6 +18,8 @@ from pathlib import Path
 
 from . import config
 from .corpus import Case
+from .params import MANAGED_ENV
+from .params import to_env as params_to_env
 
 
 class EncodeError(RuntimeError):
@@ -50,29 +52,32 @@ def run_case(
     stem = f"{case.name}_{case.distance:g}_{token}"
     jxl = tmp_dir / f"{stem}.jxl"
     png = tmp_dir / f"{stem}.png"
-    tune = tmp_dir / f"{stem}.tune.json"
 
     env = dict(os.environ)
-    if params is not None:
-        tune.write_text(json.dumps(params), encoding="utf-8")
-        env["JIXEL_TUNING_JSON"] = str(tune)
-    else:
-        env.pop("JIXEL_TUNING_JSON", None)
+    for var in MANAGED_ENV:
+        env.pop(var, None)
+    env.update(params_to_env(params))
+
+    # A "boost" key is not an env knob: it is passed straight to the tuner's
+    # --boost CLI flag (DarkAqConfig CSV, e.g. "1.5" or "1.5,6,0.02,1").
+    boost = (params or {}).get("boost")
 
     try:
         # 1) Encode.
-        enc = _run(
-            [
-                str(config.ENCODER),
-                str(case.crop),
-                str(jxl),
-                "--distance",
-                str(case.distance),
-                "--threads",
-                str(config.ENCODE_THREADS),
-            ],
-            env=env,
-        )
+        cmd = [
+            str(config.ENCODER),
+            str(case.crop),
+            str(jxl),
+            "--distance",
+            str(case.distance),
+            "--threads",
+            str(config.ENCODE_THREADS),
+            "--speed",
+            config.SPEED,
+        ]
+        if boost is not None:
+            cmd += ["--boost", str(boost)]
+        enc = _run(cmd, env=env)
         if enc.returncode != 0 or not jxl.exists():
             raise EncodeError(f"encode failed ({case.key()}): {enc.stderr.strip()}")
         info = json.loads(enc.stdout.strip().splitlines()[-1])
@@ -93,7 +98,7 @@ def run_case(
 
         return Measurement(bpp=bpp, ss2=ss2, encode_ms=encode_ms, bytes=nbytes)
     finally:
-        for f in (jxl, png, tune):
+        for f in (jxl, png):
             try:
                 f.unlink()
             except FileNotFoundError:

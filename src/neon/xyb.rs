@@ -119,23 +119,33 @@ fn rgb_to_xyb_f32x4_neon(
     (x, y, tm2)
 }
 
-/// Transform one row-band in place.
+/// Transform one row-band into separate output planes.
 #[target_feature(enable = "neon")]
-pub(crate) fn to_xyb_neon_band(band: [&mut [f32]; 3], w: usize) {
-    let [rp, gp, bp] = band;
-    for ((r_row, g_row), b_row) in rp
-        .chunks_exact_mut(w)
-        .zip(gp.chunks_exact_mut(w))
-        .zip(bp.chunks_exact_mut(w))
+pub(crate) fn to_xyb_neon_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = input;
+    let [xp, yp, out_bp] = output;
+    for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
+        .chunks_exact(w)
+        .zip(gp.chunks_exact(w))
+        .zip(bp.chunks_exact(w))
+        .zip(xp.chunks_exact_mut(w))
+        .zip(yp.chunks_exact_mut(w))
+        .zip(out_bp.chunks_exact_mut(w))
     {
-        let (r_chunks, r_tail) = r_row.as_chunks_mut::<4>();
-        let (g_chunks, g_tail) = g_row.as_chunks_mut::<4>();
-        let (b_chunks, b_tail) = b_row.as_chunks_mut::<4>();
+        let (r_chunks, r_tail) = r_row.as_chunks::<4>();
+        let (g_chunks, g_tail) = g_row.as_chunks::<4>();
+        let (b_chunks, b_tail) = b_row.as_chunks::<4>();
+        let (x_chunks, x_tail) = x_row.as_chunks_mut::<4>();
+        let (y_chunks, y_tail) = y_row.as_chunks_mut::<4>();
+        let (out_b_chunks, out_b_tail) = out_b_row.as_chunks_mut::<4>();
 
-        for ((r4, g4), b4) in r_chunks
-            .iter_mut()
-            .zip(g_chunks.iter_mut())
-            .zip(b_chunks.iter_mut())
+        for (((((r4, g4), b4), x4), y4), out_b4) in r_chunks
+            .iter()
+            .zip(g_chunks.iter())
+            .zip(b_chunks.iter())
+            .zip(x_chunks.iter_mut())
+            .zip(y_chunks.iter_mut())
+            .zip(out_b_chunks.iter_mut())
         {
             let r = unsafe { vld1q_f32(r4.as_ptr()) };
             let g = unsafe { vld1q_f32(g4.as_ptr()) };
@@ -144,9 +154,9 @@ pub(crate) fn to_xyb_neon_band(band: [&mut [f32]; 3], w: usize) {
             let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(r, g, b);
 
             unsafe {
-                vst1q_f32(r4.as_mut_ptr(), xv);
-                vst1q_f32(g4.as_mut_ptr(), yv);
-                vst1q_f32(b4.as_mut_ptr(), bv);
+                vst1q_f32(x4.as_mut_ptr(), xv);
+                vst1q_f32(y4.as_mut_ptr(), yv);
+                vst1q_f32(out_b4.as_mut_ptr(), bv);
             }
         }
 
@@ -169,9 +179,64 @@ pub(crate) fn to_xyb_neon_band(band: [&mut [f32]; 3], w: usize) {
                 vst1q_f32(b4.as_mut_ptr(), bv);
             }
 
-            r_tail.copy_from_slice(&r4[..r_tail.len()]);
-            g_tail.copy_from_slice(&g4[..g_tail.len()]);
-            b_tail.copy_from_slice(&b4[..b_tail.len()]);
+            x_tail.copy_from_slice(&r4[..r_tail.len()]);
+            y_tail.copy_from_slice(&g4[..g_tail.len()]);
+            out_b_tail.copy_from_slice(&b4[..b_tail.len()]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_xyb_neon_band;
+    use crate::enc_xyb::rgb_to_xyb_pixel_f32;
+
+    fn rng(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Colour conversion feeds every later decision, and the NEON path uses a
+    /// Halley-iteration cube root where the scalar path calls `cbrtf`, so the two
+    /// can only be compared to a tolerance. Widths deliberately include a
+    /// non-multiple of 4 to exercise the scalar tail.
+    #[test]
+    fn to_xyb_neon_band_matches_scalar_pixels() {
+        let mut state = 0xc0ff_ee11_u64;
+        for &w in &[4usize, 7, 16, 19] {
+            for rows in 1..=3 {
+                let n = w * rows;
+                let src: Vec<[f32; 3]> = (0..n)
+                    .map(|i| {
+                        // Cover the dark end, mid-tones and clipping headroom,
+                        // plus exact zeros where the cube root is least stable.
+                        let s = if i % 11 == 0 { 0.0 } else { rng(&mut state) };
+                        [s, rng(&mut state), rng(&mut state) * 0.5]
+                    })
+                    .collect();
+                let r: Vec<f32> = src.iter().map(|p| p[0]).collect();
+                let g: Vec<f32> = src.iter().map(|p| p[1]).collect();
+                let b: Vec<f32> = src.iter().map(|p| p[2]).collect();
+                let mut x = vec![0.0; n];
+                let mut y = vec![0.0; n];
+                let mut out_b = vec![0.0; n];
+                unsafe { to_xyb_neon_band([&r, &g, &b], [&mut x, &mut y, &mut out_b], w) };
+                for (i, p) in src.iter().enumerate() {
+                    let (want_x, want_y, want_b) = rgb_to_xyb_pixel_f32(p[0], p[1], p[2]);
+                    for (got, want, name) in [
+                        (x[i], want_x, "X"),
+                        (y[i], want_y, "Y"),
+                        (out_b[i], want_b, "B"),
+                    ] {
+                        assert!(
+                            (got - want).abs() <= 2e-6,
+                            "{name} mismatch at w={w} i={i}: neon {got} vs scalar {want}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

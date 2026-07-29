@@ -42,6 +42,7 @@ pub(crate) use ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, write_ans_tokens};
 pub(crate) use cluster::{
     CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms, cluster_histograms_fixed,
 };
+pub(crate) use dlog2::f_log2;
 pub(crate) use entropy_code::{EntropyCode, FrozenTokenPrices, OwnedEntropyCode};
 pub(crate) use histogram::Histogram;
 pub(crate) use huffman_tree::HuffmanNode;

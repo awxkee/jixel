@@ -181,3 +181,54 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod regression_tests {
+    use super::cfl_regression_neon;
+    use crate::enc_color_correlation::cfl_regression_scalar;
+
+    fn rng(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((*state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    /// The regression sums drive the per-tile CfL slopes, i.e. how much luma is
+    /// subtracted from chroma in every block of the frame. NEON accumulates in a
+    /// different order than the scalar loop, so compare relative to magnitude.
+    #[test]
+    fn cfl_regression_neon_matches_scalar() {
+        let mut state = 0x1234_abcd_u64;
+        for case in 0..12 {
+            let mut y = [0.0f32; 64];
+            let mut x = [0.0f32; 64];
+            let mut b = [0.0f32; 64];
+            let mut qm_x = [0.0f32; 64];
+            let mut qm_b = [0.0f32; 64];
+            for i in 0..64 {
+                y[i] = rng(&mut state) * 30.0;
+                // A perfectly correlated case and a decorrelated one.
+                x[i] = if case % 3 == 0 {
+                    0.3 * y[i]
+                } else {
+                    rng(&mut state) * 10.0
+                };
+                b[i] = rng(&mut state) * 20.0;
+                qm_x[i] = 0.1 + rng(&mut state).abs() * 3.0;
+                qm_b[i] = 0.1 + rng(&mut state).abs() * 3.0;
+            }
+            let want = cfl_regression_scalar(&y, &x, &b, &qm_x, &qm_b);
+            let got = unsafe { cfl_regression_neon(&y, &x, &b, &qm_x, &qm_b) };
+            for k in 0..4 {
+                let scale = want[k].abs().max(1.0);
+                assert!(
+                    (want[k] - got[k]).abs() <= 1e-4 * scale,
+                    "case {case} sum {k}: neon {} vs scalar {}",
+                    got[k],
+                    want[k]
+                );
+            }
+        }
+    }
+}
