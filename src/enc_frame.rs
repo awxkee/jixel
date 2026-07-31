@@ -447,6 +447,7 @@ fn ac_metadata_context(left: i32, base: u32) -> u32 {
 pub(crate) fn collect_ac_metadata_tokens(
     dc_data: &DcGroupData,
     props: &mut Vec<crate::enc_dc_tree::DcProp>,
+    distance: f32,
 ) -> Vec<Token> {
     #[inline]
     fn wbin(w: i32) -> crate::enc_dc_tree::DcProp {
@@ -545,16 +546,30 @@ pub(crate) fn collect_ac_metadata_tokens(
     debug_assert_eq!(first_idx, num_first_blocks);
 
     // (d) EPF tokens (constant stream; refinement can never split it).
-    props.resize(props.len() + nblocks, wbin(4));
-    tokens.resize(tokens.len() + nblocks, Token::new(0, pack_signed(4)));
+    let sharp = epf_sharpness_id(distance);
+    props.resize(props.len() + nblocks, wbin(sharp));
+    tokens.resize(tokens.len() + nblocks, Token::new(0, pack_signed(sharp)));
     tokens
+}
+
+/// Distance-scheduled constant per-block EPF sharpness id
+fn epf_sharpness_id(distance: f32) -> i32 {
+    if distance < 1.75 {
+        7
+    } else if distance < 2.75 {
+        6
+    } else if distance < 5.0 {
+        5
+    } else {
+        4
+    }
 }
 
 /// Real prefix-code bit cost of a DC group's AC-metadata token stream under a
 /// freshly optimized entropy code. Used by the sub-8x8 activation gate to weigh
 /// the exact selected set's meta-stream cost against its RD benefit.
-fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch) -> u64 {
-    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new());
+fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch, distance: f32) -> u64 {
+    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new(), distance);
     let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let code = code_owned.as_ref();
     let mut bits = 0u64;
@@ -1523,7 +1538,7 @@ fn encode_frame_core(
             let mut discard = Vec::new();
             let grad = collect_dc_tokens(&dc_datas[i], &[true; K_NUM_DC_CONTEXTS], &mut discard);
             let mut meta_props = Vec::new();
-            let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props);
+            let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, distance);
             (wp, props, grad, meta, meta_props)
         });
     let mut wp_tokens_per_group = Vec::with_capacity(token_groups.len());
@@ -2116,11 +2131,11 @@ fn setup_dc_group(
             }
         }
         if !positions.is_empty() {
-            let cost_with = meta_entropy_cost(&dc_data, scratch);
+            let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
             for &(x, y, _) in &positions {
                 dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT);
             }
-            let cost_without = meta_entropy_cost(&dc_data, scratch);
+            let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
             let meta_delta = cost_with.saturating_sub(cost_without) as f32;
             if dc_data.sub8_benefit > crate::enc_ac_strategy::RD_LAMBDA * meta_delta {
                 // Worth it: restore each exact sub-8x8 selection.

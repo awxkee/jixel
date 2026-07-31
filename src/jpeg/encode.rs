@@ -467,7 +467,9 @@ fn encode_jpeg_codestream_with_pool(
                     &crate::enc_frame::DC_PREDICTOR_WEIGHTED,
                     &mut Vec::new(),
                 ),
-                collect_ac_metadata_tokens(&dc_datas[i], &mut Vec::new()),
+                // epf_iters = 0 here, so the sharpness id is decoder-ignored;
+                // any distance >= 5 keeps the stream at the historical constant 4.
+                collect_ac_metadata_tokens(&dc_datas[i], &mut Vec::new(), 100.0),
             )
         })
         .into_iter()

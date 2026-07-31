@@ -85,29 +85,6 @@ pub(crate) struct BandOverride {
     pub(crate) bands: [[f32; 16]; 3],
 }
 
-/// SS2 retune of the merge-tier quant tables. The libjxl defaults were tuned
-/// for butteraugli; at mid/low quality SSIMULACRA2 prefers the square DCT16X16
-/// and DCT32X32 tables coarser, while the high-quality band prefers the spec
-/// defaults (+0.58% if the coarser tables are applied there) — hence the
-/// per-frame distance gate.
-///
-/// Re-derived 2026-07-30 by a 4-knob Optuna study over the base magnitudes of
-/// {16X16, 32X32, 8X16, 16X32}, after merge selection, entropy coding and the
-/// DC path had all moved since the original fit. Kodak (24 full images,
-/// independent of the tuning corpus) −0.913% BD-rate over d=2.5..5, 23 win /
-/// 1 lose. Two findings:
-///
-/// * DCT16X16's old 0.9 was stale — it wants 0.78 now, and that single knob
-///   carries most of the win.
-/// * The *rect* tables want the opposite correction from the squares:
-///   DCT16X32 prefers 1.20, i.e. ~20% FINER than spec. DCT8X16 wants spec
-///   exactly and so is deliberately left unsignalled, which also saves the
-///   ~43 bytes its custom-table header would cost every frame.
-///
-/// The DCT8 workhorse table stays untouched: an 18-knob study over both its
-/// base and its radial shape could not beat the spec defaults, because
-/// scaling the dominant transform's base is nearly a global distance change
-/// (which rate-matching cancels) and its shape is already an SS2 optimum.
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
 const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
