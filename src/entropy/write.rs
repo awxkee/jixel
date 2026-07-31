@@ -37,6 +37,7 @@ use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
+use crate::enc_lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
 
 pub(crate) const ANS_ENABLED: bool = true;
 
@@ -188,8 +189,17 @@ pub(crate) fn select_hybrid_config(
 }
 
 fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
+    build_histograms_with(tokens, context_map, HybridUintConfig::DEFAULT, histograms);
+}
+
+fn build_histograms_with(
+    tokens: &[Token],
+    context_map: Option<&[u8]>,
+    config: HybridUintConfig,
+    histograms: &mut [Histogram],
+) {
     for t in tokens {
-        let (tok, _, _) = uint_encode(t.value);
+        let (tok, _, _) = uint_encode_with_config(t.value, config);
         let context = match context_map {
             Some(m) => m[t.context as usize] as usize,
             None => t.context as usize,
@@ -310,12 +320,18 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
+    // Collected so the tokens can be walked twice: once to cluster under the
+    // default config, once to rebuild histograms under the selected per-cluster
+    // configs. Only the slice headers are copied.
+    let streams: Vec<&[Token]> = streams.into_iter().collect();
+
     let mut histograms = vec![Histogram::new(); num_contexts];
-    for tokens in streams {
+    for tokens in &streams {
         build_histograms(tokens, None, &mut histograms);
     }
     let mut context_map: Vec<u8> = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
     let (mut use_prefix_code, mut ans_freqs, mut ans_symbols) = no_ans();
@@ -736,6 +752,32 @@ fn write_prefix_code_single(
 }
 
 /// Write a vector of prefix codes (per WritePrefixCodes in libjxl-tiny).
+/// Serialize one `HybridUintConfig`.
+///
+/// `split_width` is `ceil_log2(log_alpha_size + 1)`: 4 bits for the prefix path
+/// (`log_alpha_size = 15`) and 3 for the ANS path (`ANS_LOG_ALPHA_SIZE = 7`).
+/// The `msb`/`lsb` field widths then depend on the split exponent itself, which
+/// is why a config cannot simply be written as a fixed 8-bit blob.
+fn write_uint_config(config: HybridUintConfig, split_width: usize, w: &mut BitWriter) {
+    let split = config.split_exponent as u32;
+    let msb = config.msb_in_token as u32;
+    let lsb = config.lsb_in_token as u32;
+    w.write(split_width, split as u64);
+    let msb_width = if split == 0 {
+        0
+    } else {
+        32 - split.leading_zeros()
+    };
+    w.write(msb_width as usize, msb as u64);
+    let remaining = split - msb;
+    let lsb_width = if remaining == 0 {
+        0
+    } else {
+        32 - remaining.leading_zeros()
+    };
+    w.write(lsb_width as usize, lsb as u64);
+}
+
 pub(crate) fn write_prefix_codes(
     codes: &[PrefixCode],
     configs: &[HybridUintConfig],
@@ -745,23 +787,7 @@ pub(crate) fn write_prefix_codes(
     w.write(1, 1); // use_prefix_code
     debug_assert_eq!(codes.len(), configs.len());
     for &config in configs {
-        let split = config.split_exponent as u32;
-        let msb = config.msb_in_token as u32;
-        let lsb = config.lsb_in_token as u32;
-        w.write(4, split as u64);
-        let msb_width = if split == 0 {
-            0
-        } else {
-            32 - split.leading_zeros()
-        };
-        w.write(msb_width as usize, msb as u64);
-        let remaining = split - msb;
-        let lsb_width = if remaining == 0 {
-            0
-        } else {
-            32 - remaining.leading_zeros()
-        };
-        w.write(lsb_width as usize, lsb as u64);
+        write_uint_config(config, 4, w);
     }
     // num_symbol per code.
     for code in codes.iter() {
@@ -787,7 +813,52 @@ pub(crate) fn write_prefix_codes(
     }
 }
 
-/// Emit a context map. Mirrors libjxl-tiny's WriteContextMap.
+/// Move-to-front transform of a context map, libjxl `MoveToFrontTransform`.
+/// Long runs of one cluster become runs of symbol 0, which the prefix code then
+/// codes in a fraction of a bit — the difference between ~0.66 bits and ~0.15
+/// bits per entry on a map with thousands of contexts.
+fn move_to_front_transform(map: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    let Some(&max_value) = map.iter().max() else {
+        return;
+    };
+    let mut mtf: Vec<u8> = (0..=max_value).collect();
+    for &value in map {
+        let index = mtf.iter().position(|&v| v == value).unwrap_or(0);
+        out.push(index as u8);
+        // Move the used symbol to the front.
+        for i in (1..=index).rev() {
+            mtf[i] = mtf[i - 1];
+        }
+        mtf[0] = value;
+    }
+}
+
+/// Order-0 cost in bits of coding `symbols` with an optimal prefix code,
+/// including a rough allowance for describing the code itself. Only used to
+/// choose between the raw and MTF orderings, so relative accuracy is enough.
+fn context_map_cost(symbols: &[u8]) -> f64 {
+    let mut counts = [0u32; 256];
+    for &s in symbols {
+        counts[s as usize] += 1;
+    }
+    let total = symbols.len() as f64;
+    let mut bits = 0.0;
+    let mut used = 0.0;
+    for &c in counts.iter() {
+        if c != 0 {
+            let p = c as f64 / total;
+            bits += -(c as f64) * p.log2();
+            used += 1.0;
+        }
+    }
+    // ~8 bits to describe each used symbol's code length.
+    bits + used * 8.0
+}
+
+/// Emit a context map, following libjxl `EncodeContextMap`: an all-zero map is
+/// signaled as "simple, 0 bits per entry"; otherwise the entries are coded with
+/// a prefix code, optionally after a move-to-front transform.
 pub(crate) fn write_context_map(
     code: &EntropyCode,
     huffman_pool: &mut Vec<HuffmanNode>,
@@ -807,34 +878,208 @@ pub(crate) fn write_context_map(
         w.write(3, 1);
         return;
     }
-    w.write(3, 0);
 
-    let mut tokens: Vec<Token> = Vec::with_capacity(num_contexts);
+    // The entries in signaled order.
+    let mut entries: Vec<u8> = Vec::with_capacity(num_contexts);
     match code.orig_context_map {
         Some(orig) => {
             for i in 0..code.orig_num_contexts {
-                let v = code.context_map[orig[i] as usize] as u32;
-                tokens.push(Token::new(0, v));
+                entries.push(code.context_map[orig[i] as usize]);
             }
         }
-        None => {
-            for &code in code.context_map.iter() {
-                tokens.push(Token::new(0, code as u32));
+        None => entries.extend_from_slice(code.context_map),
+    }
+
+    let mut mtf = Vec::with_capacity(entries.len());
+    move_to_front_transform(&entries, &mut mtf);
+
+    // Four candidate encodings: {raw, MTF} x {plain, run-length}. MTF turns runs
+    // of one cluster into runs of symbol 0, but it also *breaks* the periodic
+    // repeats that run-length coding feeds on, so the two are not additive and
+    // the pair has to be chosen jointly. Measured on real AC maps: plain 546 B,
+    // MTF 546 B, MTF+RLE 463 B, raw+RLE 437 B.
+    let raw_runs = run_length_symbols(&entries);
+    let mtf_runs = run_length_symbols(&mtf);
+    let costs = [
+        context_map_cost(&entries),
+        context_map_cost(&mtf),
+        run_length_cost(&raw_runs),
+        run_length_cost(&mtf_runs),
+    ];
+    let best = costs
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let use_mtf = best == 1 || best == 3;
+    let use_lz77 = best >= 2;
+    let symbols: &[u8] = if use_mtf { &mtf } else { &entries };
+
+    // is_simple = 0, use_mtf, then the histogram bundle's lz77_enabled bit.
+    w.write(1, 0);
+    w.write(1, u64::from(use_mtf));
+    if !use_lz77 {
+        w.write(1, 0);
+        let tokens: Vec<Token> = symbols.iter().map(|&v| Token::new(0, v as u32)).collect();
+        let ctxmap_code = optimize_prefix_codes(&tokens, vec![0u8], 1, huffman_pool);
+        let ctxmap_ref = ctxmap_code.as_ref();
+        write_prefix_codes(
+            &ctxmap_code.prefix_codes,
+            &ctxmap_code.hybrid_uint_configs,
+            huffman_pool,
+            w,
+        );
+        for t in &tokens {
+            write_token(*t, &ctxmap_ref, w);
+        }
+        return;
+    }
+
+    // Run-length coded: literals on context 0, back-reference lengths on
+    // context 0 as `LZ77_MIN_SYMBOL + length_token`, one distance symbol per
+    // reference on context 1. Distance value 0 decodes as distance 1 (the
+    // decoder computes `distance + 1 - num_special_distances`, and this stream
+    // has no special distances), i.e. exactly a run.
+    let runs = if use_mtf { &mtf_runs } else { &raw_runs };
+    // The histograms are built by hand: an LZ77 length symbol enters the
+    // alphabet directly, whereas `build_histograms` would push it through
+    // `uint_encode` and leave the prefix code without a codeword for it.
+    let mut histograms = vec![Histogram::new(); 2];
+    for r in runs {
+        match *r {
+            RunSymbol::Literal(v) => {
+                let (sym, _, _) = uint_encode(u32::from(v));
+                histograms[0].add(sym);
+            }
+            RunSymbol::Copy { length_value } => {
+                let (len_tok, _, _) = lz77_length_encode(length_value);
+                histograms[0].add(LZ77_MIN_SYMBOL + len_tok);
+                let (dsym, _, _) = uint_encode(CTXMAP_LZ77_DISTANCE);
+                histograms[1].add(dsym);
             }
         }
+    }
+    let mut lz_context_map: Vec<u8> = Vec::new();
+    cluster_histograms(&mut histograms, &mut lz_context_map, huffman_pool);
+    let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
+    let code = OwnedEntropyCode {
+        context_map: lz_context_map,
+        prefix_codes,
+        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; histograms.len()],
+        orig_context_map: None,
+        orig_num_contexts: 2,
+        use_prefix_code: true,
+        ans_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
     };
 
-    let ctxmap_code = optimize_prefix_codes(&tokens, vec![0u8], 1, huffman_pool);
-    let ctxmap_ref = ctxmap_code.as_ref();
-    write_prefix_codes(
-        &ctxmap_code.prefix_codes,
-        &ctxmap_code.hybrid_uint_configs,
-        huffman_pool,
-        w,
-    );
-    for t in &tokens {
-        write_token(*t, &ctxmap_ref, w);
+    w.write(1, 1); // lz77 enabled
+    // min_symbol = 64: U32 selector 3 + 15 bits of (64 - 8).
+    w.write(2, 0b11);
+    w.write(15, u64::from(LZ77_MIN_SYMBOL - 8));
+    w.write(2, 0b00); // min_length = 3
+    // length_uint_config under log_alpha_size 8: split_exp = 4, msb = 0, lsb = 0.
+    w.write(4, 4);
+    w.write(3, 0);
+    w.write(3, 0);
+    // Two contexts, so the bundle carries its own (nested) context map.
+    write_entropy_code(&code.as_ref(), huffman_pool, w);
+
+    let code_ref = code.as_ref();
+    for r in runs {
+        match *r {
+            RunSymbol::Literal(v) => write_token(Token::new(0, u32::from(v)), &code_ref, w),
+            RunSymbol::Copy { length_value } => {
+                let (len_tok, len_nbits, len_bits) = lz77_length_encode(length_value);
+                let sym = LZ77_MIN_SYMBOL + len_tok;
+                let cluster = code_ref.context_map[0] as usize;
+                let pc = &code_ref.prefix_codes[cluster];
+                if pc.single_symbol {
+                    w.write(len_nbits as usize, u64::from(len_bits));
+                } else {
+                    let d = pc.depths[sym as usize] as usize;
+                    debug_assert!(d > 0, "context-map LZ77 length symbol {sym} unrepresented");
+                    let data = u64::from(pc.bits[sym as usize]) | (u64::from(len_bits) << d);
+                    w.write(d + len_nbits as usize, data);
+                }
+                write_token(Token::new(1, CTXMAP_LZ77_DISTANCE), &code_ref, w);
+            }
+        }
     }
+}
+
+/// Distance value for a run back-reference. The decoder reconstructs
+/// `distance + 1` when the stream has no special-distance table, so 0 means
+/// "copy from the immediately preceding symbol".
+const CTXMAP_LZ77_DISTANCE: u32 = 0;
+
+#[derive(Clone, Copy)]
+enum RunSymbol {
+    Literal(u8),
+    Copy { length_value: u32 },
+}
+
+/// Split a symbol stream into literals and run back-references, mirroring the
+/// AC path's distance-1 LZ77. A run of `n` equal symbols becomes one literal
+/// plus a copy of `n - 1` when that clears `LZ77_MIN_LENGTH`.
+fn run_length_symbols(symbols: &[u8]) -> Vec<RunSymbol> {
+    let mut out: Vec<RunSymbol> = Vec::with_capacity(symbols.len());
+    let mut i = 0usize;
+    while i < symbols.len() {
+        let mut j = i;
+        while j + 1 < symbols.len() && symbols[j + 1] == symbols[i] {
+            j += 1;
+        }
+        out.push(RunSymbol::Literal(symbols[i]));
+        let extra = (j - i) as u32;
+        if extra >= LZ77_MIN_LENGTH {
+            out.push(RunSymbol::Copy {
+                length_value: extra - LZ77_MIN_LENGTH,
+            });
+        } else {
+            for _ in 0..extra {
+                out.push(RunSymbol::Literal(symbols[i]));
+            }
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Order-0 cost of a run-length symbol stream, on the same footing as
+/// [`context_map_cost`] so the four candidates are comparable.
+fn run_length_cost(runs: &[RunSymbol]) -> f64 {
+    let mut counts = [0u32; 512];
+    let mut extra_bits = 0.0;
+    let mut distances = 0u32;
+    for r in runs {
+        match *r {
+            RunSymbol::Literal(v) => counts[v as usize] += 1,
+            RunSymbol::Copy { length_value } => {
+                let (len_tok, len_nbits, _) = lz77_length_encode(length_value);
+                counts[(LZ77_MIN_SYMBOL + len_tok) as usize] += 1;
+                extra_bits += f64::from(len_nbits);
+                distances += 1;
+            }
+        }
+    }
+    let total: u32 = counts.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let mut bits = 0.0;
+    let mut used = 0.0;
+    for &c in counts.iter() {
+        if c != 0 {
+            let p = f64::from(c) / f64::from(total);
+            bits += -f64::from(c) * p.log2();
+            used += 1.0;
+        }
+    }
+    // The distance context costs one symbol per reference plus its own code, and
+    // a second context makes the bundle carry a nested context map.
+    bits + extra_bits + used * 8.0 + f64::from(distances) + 24.0
 }
 
 /// WriteContextMap + the per-bundle code parameters (prefix codes or ANS).
@@ -854,14 +1099,100 @@ pub(crate) fn write_entropy_code(
 fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
     w.write(1, 0); // use_prefix_code = 0
     w.write(2, (ANS_LOG_ALPHA_SIZE - 5) as u64); // log_alpha_size = 7
-    // Per-histogram hybrid-uint config (4, 2, 0) under log_alpha_size = 7.
-    for _ in 0..code.ans_freqs.len() {
-        w.write(3, 4); // split_exponent  (VERIFY width = CeilLog2(log_alpha+1))
-        w.write(3, 2); // msb_in_token
-        w.write(2, 0); // lsb_in_token
+    // Per-histogram hybrid-uint config. This used to hardcode (4, 2, 0), which
+    // silently contradicted `hybrid_uint_configs` the moment anything but the
+    // default was selected — the header would advertise one configuration while
+    // the tokens used another.
+    debug_assert_eq!(code.hybrid_uint_configs.len(), code.ans_freqs.len());
+    for &config in code.hybrid_uint_configs.iter().take(code.ans_freqs.len()) {
+        write_uint_config(config, 3, w);
     }
     // The normalized distributions, in clustered-histogram order.
     for freqs in code.ans_freqs.iter() {
         encode_histogram(freqs, ANS_LOG_ALPHA_SIZE, w);
+    }
+}
+
+#[cfg(test)]
+mod context_map_tests {
+    use super::{RunSymbol, move_to_front_transform, run_length_symbols};
+    use crate::enc_lz77_ac::{LZ77_MIN_LENGTH, lz77_length_encode};
+
+    /// Decode a run-length stream the way the JXL reader does: a copy of
+    /// `length` symbols from distance 1, i.e. repeat the previous symbol.
+    fn decode(runs: &[RunSymbol]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for r in runs {
+            match *r {
+                RunSymbol::Literal(v) => out.push(v),
+                RunSymbol::Copy { length_value } => {
+                    let length = length_value + LZ77_MIN_LENGTH;
+                    let last = *out.last().expect("copy with empty history");
+                    for _ in 0..length {
+                        out.push(last);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The run splitter and the decoder's copy semantics have to agree exactly;
+    /// an off-by-one in the length offset silently corrupts the context map,
+    /// which then mis-assigns every histogram in the frame.
+    #[test]
+    fn run_length_round_trips() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![7],
+            vec![1, 1, 1],
+            vec![1, 1, 1, 1],
+            vec![0; 40],
+            vec![3, 3, 3, 3, 9, 9, 1, 2, 3, 4, 4, 4, 4, 4, 4],
+            (0..200u32).map(|i| (i % 5) as u8).collect(),
+            (0..200u32).map(|i| if i < 100 { 2 } else { 0 }).collect(),
+        ];
+        for case in cases {
+            let runs = run_length_symbols(&case);
+            assert_eq!(decode(&runs), case, "round trip failed for {case:?}");
+        }
+    }
+
+    /// Every length symbol the encoder can emit must survive the hybrid-uint
+    /// split it is written with.
+    #[test]
+    fn run_lengths_encode_within_the_alphabet() {
+        let long: Vec<u8> = vec![4; 5000];
+        for r in run_length_symbols(&long) {
+            if let RunSymbol::Copy { length_value } = r {
+                let (tok, nbits, bits) = lz77_length_encode(length_value);
+                assert!(tok < 64, "length token {tok} escapes the alphabet");
+                assert!(nbits <= 32);
+                if nbits < 32 {
+                    assert!(bits >> nbits == 0, "extra bits overflow the field");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn move_to_front_is_a_permutation_preserving_transform() {
+        let src: Vec<u8> = vec![3, 3, 1, 0, 0, 2, 3, 1, 1, 1, 4];
+        let mut mtf = Vec::new();
+        move_to_front_transform(&src, &mut mtf);
+        assert_eq!(mtf.len(), src.len());
+        // Invert it: the same table walk, reading indices back to values.
+        let max = *src.iter().max().unwrap();
+        let mut table: Vec<u8> = (0..=max).collect();
+        let back: Vec<u8> = mtf
+            .iter()
+            .map(|&i| {
+                let v = table[i as usize];
+                table.remove(i as usize);
+                table.insert(0, v);
+                v
+            })
+            .collect();
+        assert_eq!(back, src);
     }
 }

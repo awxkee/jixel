@@ -134,23 +134,33 @@ fn rgb_to_xyb_f32x4_wasm(r: v128, g: v128, b: v128) -> (v128, v128, v128) {
     (x, y, tm2)
 }
 
-/// Transform one row-band in place.
+/// Transform one row-band into separate output planes.
 #[target_feature(enable = "simd128")]
-pub(crate) fn to_xyb_wasm_band(band: [&mut [f32]; 3], w: usize) {
-    let [rp, gp, bp] = band;
-    for ((r_row, g_row), b_row) in rp
-        .chunks_exact_mut(w)
-        .zip(gp.chunks_exact_mut(w))
-        .zip(bp.chunks_exact_mut(w))
+pub(crate) fn to_xyb_wasm_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+    let [rp, gp, bp] = input;
+    let [xp, yp, out_bp] = output;
+    for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
+        .chunks_exact(w)
+        .zip(gp.chunks_exact(w))
+        .zip(bp.chunks_exact(w))
+        .zip(xp.chunks_exact_mut(w))
+        .zip(yp.chunks_exact_mut(w))
+        .zip(out_bp.chunks_exact_mut(w))
     {
-        let (r_chunks, r_tail) = r_row.as_chunks_mut::<4>();
-        let (g_chunks, g_tail) = g_row.as_chunks_mut::<4>();
-        let (b_chunks, b_tail) = b_row.as_chunks_mut::<4>();
+        let (r_chunks, r_tail) = r_row.as_chunks::<4>();
+        let (g_chunks, g_tail) = g_row.as_chunks::<4>();
+        let (b_chunks, b_tail) = b_row.as_chunks::<4>();
+        let (x_chunks, x_tail) = x_row.as_chunks_mut::<4>();
+        let (y_chunks, y_tail) = y_row.as_chunks_mut::<4>();
+        let (out_b_chunks, out_b_tail) = out_b_row.as_chunks_mut::<4>();
 
-        for ((r4, g4), b4) in r_chunks
-            .iter_mut()
-            .zip(g_chunks.iter_mut())
-            .zip(b_chunks.iter_mut())
+        for (((((r4, g4), b4), x4), y4), out_b4) in r_chunks
+            .iter()
+            .zip(g_chunks.iter())
+            .zip(b_chunks.iter())
+            .zip(x_chunks.iter_mut())
+            .zip(y_chunks.iter_mut())
+            .zip(out_b_chunks.iter_mut())
         {
             let r = unsafe { v128_load(r4.as_ptr().cast()) };
             let g = unsafe { v128_load(g4.as_ptr().cast()) };
@@ -159,9 +169,9 @@ pub(crate) fn to_xyb_wasm_band(band: [&mut [f32]; 3], w: usize) {
             let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(r, g, b);
 
             unsafe {
-                v128_store(r4.as_mut_ptr().cast(), xv);
-                v128_store(g4.as_mut_ptr().cast(), yv);
-                v128_store(b4.as_mut_ptr().cast(), bv);
+                v128_store(x4.as_mut_ptr().cast(), xv);
+                v128_store(y4.as_mut_ptr().cast(), yv);
+                v128_store(out_b4.as_mut_ptr().cast(), bv);
             }
         }
 
@@ -186,9 +196,9 @@ pub(crate) fn to_xyb_wasm_band(band: [&mut [f32]; 3], w: usize) {
                 v128_store(b4.as_mut_ptr().cast(), bv);
             }
 
-            r_tail.copy_from_slice(&r4[..r_tail.len()]);
-            g_tail.copy_from_slice(&g4[..g_tail.len()]);
-            b_tail.copy_from_slice(&b4[..b_tail.len()]);
+            x_tail.copy_from_slice(&r4[..r_tail.len()]);
+            y_tail.copy_from_slice(&g4[..g_tail.len()]);
+            out_b_tail.copy_from_slice(&b4[..b_tail.len()]);
         }
     }
 }

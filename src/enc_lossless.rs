@@ -508,7 +508,7 @@ fn encode_frame_lossless_with_pool(
 ) {
     if patches
         && num_color == 3
-        && let Some(plan) = find_lossless_patches(linear)
+        && let Some(plan) = find_lossless_patches(linear, pool, scratch)
     {
         // Patches change prediction, LZ77, entropy histograms, and add both a
         // reference-only frame and a dictionary. Their true cost cannot be
@@ -1035,6 +1035,247 @@ fn write_frame_header_modular_kind(has_alpha: bool, kind: ModularFrameKind<'_>, 
     }
 }
 
+/// Frame header for a modular reference-only frame inside the lossy
+/// (`xyb_encoded`) codestream. Identical to the lossless variant except that
+/// the container sets `xyb_encoded`, so the do_YCbCr bit is absent and the
+/// frame's color transform is implicitly XYB. Saved to the modular slot so a
+/// hybrid plan can also emit the VarDCT atlas in slot 3.
+fn write_frame_header_modular_xyb_reference(
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    w: &mut BitWriter,
+) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b10); // reference-only frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    // No do_YCbCr bit: with xyb_encoded set the color transform is XYB.
+    w.write(2, 0); // upsampling = 1
+    if has_alpha {
+        w.write(2, 0); // ec_upsampling[0] = 1
+    }
+    w.write(2, 1); // group_size_shift = 1 (256-pixel groups)
+    // Reference-only frames do not serialize Passes.
+    w.write(1, 1); // custom size
+    write_frame_dimension(width, w);
+    write_frame_dimension(height, w);
+    // No blending and no is_last for reference-only frames.
+    w.write(2, crate::patches::MODULAR_PATCH_REF_ID as u64); // save_as_reference = 2
+    w.write(1, 1); // save_before_color_transform = true
+    w.write(2, 0); // empty name
+    // Loop filter off: the atlas is stored exactly as coded; gaborish or EPF
+    // would smear the glyph edges patches exist to preserve.
+    w.write(1, 0); // loop filter not all-default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // no EPF
+    w.write(2, 0); // no loop-filter extensions
+    w.write(2, 0); // no frame-header extensions
+}
+
+/// Reference-only atlas frame for the lossy codestream, coded with the modular
+/// machinery on the fixed XYB integer lattice: near-lossless, ringing-free, and
+/// palette-compressed when the quantized atlas holds few distinct colors.
+///
+/// Returns false when the atlas cannot take this path (it must fit a single
+/// 256-pixel modular group); the caller then keeps the VarDCT atlas. Because
+/// this encoding is sharper than any lossy VarDCT atlas, selecting the smaller
+/// of the two by bits alone cannot regress quality.
+pub(crate) fn encode_modular_xyb_atlas(
+    atlas: &crate::image::Image3F,
+    has_alpha: bool,
+    lattice_scale: u32,
+    speed: crate::Speed,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    use std::collections::HashMap;
+    // The 13-bit residual bound behind LZ77_MIN_SYMBOL caps the refinement.
+    debug_assert!(lattice_scale.is_power_of_two() && lattice_scale <= 8);
+    let (xsize, ysize) = (atlas.xsize(), atlas.ysize());
+    if xsize == 0 || ysize == 0 || xsize > GROUP_DIM || ysize > GROUP_DIM {
+        return false;
+    }
+    let ch = quantize_xyb_channels(atlas, lattice_scale);
+    let npx = xsize * ysize;
+    let grad_pack_fn = selected_grad_pack_interior_fn();
+    let slow = speed == crate::Speed::Slow;
+
+    // Distinct quantized XYB triples, palette-capped like the lossless path.
+    let mut seen: HashMap<[i32; 3], ()> = HashMap::with_capacity(257);
+    for i in 0..npx {
+        seen.entry([ch[0][i], ch[1][i], ch[2][i]]).or_insert(());
+        if seen.len() > 256 {
+            break;
+        }
+    }
+    let use_palette = !seen.is_empty() && seen.len() <= 256;
+
+    write_frame_header_modular_xyb_reference(xsize, ysize, has_alpha, writer);
+
+    let mut section = BitWriter::new();
+    // LfChannelDequant: the decoder multiplies each channel by these steps.
+    // Custom F16 steps (each read as value/128) refine the lattice by
+    // `lattice_scale`; powers of two keep every step F16-exact.
+    if lattice_scale == 1 {
+        section.write(1, 1); // dc_quant all_default = 1
+    } else {
+        use crate::quant_weights::{INV_DC_QUANT, f32_to_f16_bits};
+        section.write(1, 0);
+        for c in 0..3 {
+            let step_x128 = 128.0 / (INV_DC_QUANT[c] * lattice_scale as f32);
+            section.write(16, f32_to_f16_bits(step_x128) as u64);
+        }
+    }
+    section.write(1, 0); // has_tree = 0
+    section.write(1, 0); // GroupHeader: use_global_tree = 0
+    section.write(1, 1); // wp_default = 1
+
+    // The atlas alpha is always the all-zero plane `zero_alpha_for_lossy`
+    // produces (patch entries blend alpha with None, so its content is never
+    // read); the palette absorbs it as a constant fourth component and the
+    // plain path codes it as one all-zero channel.
+    let num_c = 3 + usize::from(has_alpha);
+    let mut tokens: Vec<Token> = Vec::new();
+    let (preds, nb_chans): (Vec<u32>, usize) = if use_palette {
+        let mut colors: Vec<[i32; 3]> = seen.keys().copied().collect();
+        colors.sort_unstable();
+        let nb_colors = colors.len();
+        let mut idx_of: HashMap<[i32; 3], u32> = HashMap::with_capacity(nb_colors);
+        for (i, c) in colors.iter().enumerate() {
+            idx_of.insert(*c, i as u32);
+        }
+        // Component rows of the palette meta-channel; the alpha row (if any)
+        // stays zero.
+        let mut palette_ch = vec![0i32; num_c * nb_colors];
+        for (i, color) in colors.iter().enumerate() {
+            for c in 0..3 {
+                palette_ch[c * nb_colors + i] = color[c];
+            }
+        }
+        let index_img: Vec<i32> = (0..npx)
+            .map(|i| idx_of[&[ch[0][i], ch[1][i], ch[2][i]]] as i32)
+            .collect();
+
+        write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
+        let pget = |gx: usize, gy: usize| palette_ch[gy * nb_colors + gx];
+        let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
+        let preds = if slow {
+            vec![
+                choose_predictor_for_plane(pget, nb_colors, num_c),
+                choose_predictor_for_plane(iget, xsize, ysize),
+            ]
+        } else {
+            vec![PREDICTOR_WEIGHTED; 2]
+        };
+        tokenize_plane(
+            channel_to_context(0, 2),
+            pget,
+            nb_colors,
+            num_c,
+            preds[0],
+            grad_pack_fn,
+            &mut scratch.gradient,
+            &mut tokens,
+        );
+        tokenize_plane(
+            channel_to_context(1, 2),
+            iget,
+            xsize,
+            ysize,
+            preds[1],
+            grad_pack_fn,
+            &mut scratch.gradient,
+            &mut tokens,
+        );
+        (preds, 2)
+    } else {
+        section.write(2, 0b00); // 0 transforms: Y/X/B-Y are already decorrelated
+        let mut preds = Vec::with_capacity(num_c);
+        for (c, data) in ch.iter().enumerate() {
+            let get = |gx: usize, gy: usize| data[gy * xsize + gx];
+            let pred = if slow {
+                choose_predictor_for_plane(get, xsize, ysize)
+            } else {
+                PREDICTOR_WEIGHTED
+            };
+            tokenize_plane(
+                channel_to_context(c, num_c),
+                get,
+                xsize,
+                ysize,
+                pred,
+                grad_pack_fn,
+                &mut scratch.gradient,
+                &mut tokens,
+            );
+            preds.push(pred);
+        }
+        if has_alpha {
+            // Constant zero plane: every predictor is exact, tokens are free.
+            tokenize_plane(
+                channel_to_context(3, num_c),
+                |_, _| 0,
+                xsize,
+                ysize,
+                PREDICTOR_WEIGHTED,
+                grad_pack_fn,
+                &mut scratch.gradient,
+                &mut tokens,
+            );
+            preds.push(PREDICTOR_WEIGHTED);
+        }
+        (preds, num_c)
+    };
+
+    // Same guard as the lossless frame path: literals whose hybrid-uint token
+    // would reach the LZ77 symbol range must push that range up, or the decoder
+    // reads a large residual as a back-reference. The refined lattice makes the
+    // channel values up to 13 bits, and residuals can double that.
+    let max_abs = ch
+        .iter()
+        .flat_map(|plane| plane.iter())
+        .map(|v| v.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
+    let min_symbol = if value_bits <= 13 {
+        LZ77_MIN_SYMBOL
+    } else {
+        4 * value_bits + 24
+    };
+
+    let distance_ctx = nb_chans as u32;
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
+    let code = build_lz_pixel_code(
+        std::iter::once(lz_tokens.as_slice()),
+        nb_chans,
+        min_symbol,
+        slow,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    write_local_tree_lz77(
+        &preds,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
+    for t in &lz_tokens {
+        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
+    }
+    section.zero_pad_to_byte();
+
+    writer.write(1, 0); // TOC: no permutation
+    writer.zero_pad_to_byte();
+    write_toc_entry(section.bits_written() / 8, writer);
+    writer.zero_pad_to_byte();
+    writer.append(&section);
+    writer.zero_pad_to_byte();
+    true
+}
+
 fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
     write_frame_header_modular_flags(has_alpha, 0, w);
 }
@@ -1083,7 +1324,7 @@ pub(crate) fn write_patch_dictionary(
     let mut tokens = Vec::new();
     tokens.push(Token::new(NUM_REF, references.len() as u32));
     for reference in references {
-        tokens.push(Token::new(REFERENCE_FRAME, PATCH_REF_ID));
+        tokens.push(Token::new(REFERENCE_FRAME, reference.ref_frame));
         tokens.push(Token::new(REF_POSITION, reference.atlas_x as u32));
         tokens.push(Token::new(REF_POSITION, reference.atlas_y as u32));
         tokens.push(Token::new(PATCH_SIZE, (PATCH_TILE - 1) as u32));
@@ -1236,9 +1477,7 @@ fn encode_squeeze_single_group(
                     .chunks_exact_mut(xsize)
                     .zip(data.chunks_exact(xsize))
                 {
-                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
-                        *dst = src;
-                    }
+                    row[..xsize].copy_from_slice(&src_row[..xsize]);
                 }
             }
         }
@@ -3232,6 +3471,7 @@ fn try_encode_context_tree_multi_group(
 
 use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
+use crate::enc_xyb::quantize_xyb_channels;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
@@ -3646,6 +3886,11 @@ mod predictor_tests {
 
 #[cfg(test)]
 mod lz_reach_probe {
+
+    use super::quantize_xyb_channels;
+    use crate::image::Image3F;
+    use crate::quant_weights::INV_DC_QUANT;
+
     #[test]
     fn slow_lossless_encode_of_repetitive_image() {
         // Highly repetitive => lz_has_repetition() is true => deep path runs.
@@ -3667,5 +3912,32 @@ mod lz_reach_probe {
         let out = crate::encode_image(&rgb, w, h, &cfg).expect("encode failed");
         eprintln!("PROBE encoded {} bytes", out.len());
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn packed_quantization_matches_the_channel_formula() {
+        let mut atlas = Image3F::new(5, 3);
+        for i in 0..15 {
+            atlas.plane_row_mut(0, i / 5)[i % 5] = (i as f32 - 7.0) / 41.0;
+            atlas.plane_row_mut(1, i / 5)[i % 5] = i as f32 / 29.0;
+            atlas.plane_row_mut(2, i / 5)[i % 5] = (15 - i) as f32 / 31.0;
+        }
+
+        for lattice_scale in [1, 2, 8] {
+            let got = quantize_xyb_channels(&atlas, lattice_scale);
+            let m = lattice_scale as f32;
+            for i in 0..15 {
+                let yq = (atlas.plane_data(1)[i] * INV_DC_QUANT[1] * m).round() as i32;
+                assert_eq!(got[0][i], yq);
+                assert_eq!(
+                    got[1][i],
+                    (atlas.plane_data(0)[i] * INV_DC_QUANT[0] * m).round() as i32
+                );
+                assert_eq!(
+                    got[2][i],
+                    (atlas.plane_data(2)[i] * INV_DC_QUANT[2] * m).round() as i32 - yq
+                );
+            }
+        }
     }
 }

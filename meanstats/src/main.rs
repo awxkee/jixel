@@ -41,7 +41,7 @@
 //! ```text
 //! meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]
 //!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]
-//!                  [--no-aom] [--no-cjxl]
+//!                  [--no-aom] [--no-cjxl] [--patches]
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -125,6 +125,7 @@ fn main() -> Result<()> {
         speed: "6".to_string(),
         yuv: "444".to_string(),
     };
+    let mut patches = false;
     let mut with_cjxl = true;
     let mut with_aom = true;
 
@@ -162,6 +163,10 @@ fn main() -> Result<()> {
             "--avif-yuv" => {
                 tools.yuv = arg(&args, i + 1)?.to_string();
                 i += 2;
+            }
+            "--patches" => {
+                patches = true;
+                i += 1;
             }
             "--no-cjxl" => {
                 with_cjxl = false;
@@ -267,7 +272,7 @@ fn main() -> Result<()> {
 
             for (idx, kind) in kinds.iter().enumerate() {
                 let res = match kind {
-                    Kind::Jixel => bench_jixel(&rgb, w, h, d, &tmp, stem, npx, threads),
+                    Kind::Jixel => bench_jixel(&rgb, w, h, d, &tmp, stem, npx, threads, patches),
                     Kind::Cjxl(e) => bench_cjxl(img, *e, d, &rgb, w, h, &tmp, stem, npx),
                     Kind::Aom => bench_avif_aom(img, d, &rgb, w, h, &tmp, stem, npx, &tools),
                 };
@@ -364,11 +369,13 @@ fn bench_jixel(
     stem: &str,
     npx: f64,
     threads: usize,
+    patches: bool,
 ) -> Result<Sample> {
     let cfg = jixel::EncodeConfig::default()
         .with_lossless(false)
         .with_distance(d)
         .with_num_threads(threads)
+        .with_patches(patches)
         .with_speed(Speed::Slow);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

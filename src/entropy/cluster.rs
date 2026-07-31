@@ -34,6 +34,11 @@ use crate::util::heap_array;
 
 pub(crate) const CLUSTERS_LIMIT: usize = 64;
 
+/// A cluster must save at least this many bits, summed over every context that
+/// reassigns to it, to be worth the histogram it costs to describe. Matches
+/// libjxl's `kMinDistanceForDistinct`.
+const MIN_DISTANCE_FOR_DISTINCT: f32 = 64.0;
+
 pub(crate) struct FixedClusterScratch<const MAX_CONTEXTS: usize> {
     symbols: Box<[u8; MAX_CONTEXTS]>,
     in_costs: Box<[f32; MAX_CONTEXTS]>,
@@ -224,20 +229,36 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
     let mut num_clusters = 0usize;
     let mut counts_scratch = [0u32; ALPHABET_SIZE];
 
-    const MIN_DISTANCE_FOR_DISTINCT: f32 = 64.0;
+    // A cluster is worth its header only if the contexts that reassign to it save
+    // more, IN TOTAL, than describing one more histogram costs. Testing the
+    // single farthest context instead (as this used to) makes the bar effectively
+    // stricter the more finely contexts are split, because each histogram then
+    // holds fewer tokens — which collapsed the clustering exactly when more
+    // contexts should have helped. See docs/dct64-findings.md.
     while num_clusters < max_histograms {
-        let symbol = num_clusters as u8;
-        symbols[largest_idx] = symbol;
+        let candidate = largest_idx;
+        // Write the candidate speculatively so the distance loop can borrow it;
+        // `num_clusters` only advances if the candidate earns its header.
         clusters[num_clusters] = histograms[largest_idx].clone();
         cluster_costs[num_clusters] = in_costs[largest_idx];
+        // The candidate absorbs its own distance plus whatever the contexts that
+        // move to it save. The first cluster has no baseline and is never judged.
+        let mut saving = if dists[largest_idx] == f32::MAX {
+            f32::INFINITY
+        } else {
+            dists[largest_idx]
+        };
         dists[largest_idx] = 0.0;
-        num_clusters += 1;
 
-        let last_idx = num_clusters - 1;
-        let last_hist = &clusters[last_idx];
-        let last_cost = cluster_costs[last_idx];
-        let mut next_largest_idx = 0usize;
-        let mut next_largest_dist = dists[0];
+        let last_hist = &clusters[num_clusters];
+        let last_cost = cluster_costs[num_clusters];
+        // Track the farthest context over the *updated* distances. Seeding this
+        // from `dists[0]` (as this used to) reads a pre-update value that is
+        // still `f32::MAX` on the first pass, so the comparison below could never
+        // fire and the next seed was always context 0 rather than the farthest
+        // histogram — a silently degraded k-center.
+        let mut next_largest_idx = candidate;
+        let mut next_largest_dist = 0.0f32;
         for (i, ((hist, &in_cost), dist)) in histograms
             .iter()
             .zip(in_costs.iter())
@@ -256,6 +277,9 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
                 huffman_pool,
             );
             if distance < *dist {
+                if *dist != f32::MAX {
+                    saving += *dist - distance;
+                }
                 *dist = distance;
             }
             if *dist > next_largest_dist {
@@ -263,9 +287,18 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
                 next_largest_idx = i;
             }
         }
-        largest_idx = next_largest_idx;
-        if next_largest_dist < MIN_DISTANCE_FOR_DISTINCT {
+        // Judging the candidate rather than the previously committed cluster
+        // matters: k-center savings are not monotonic, so one lean cluster must
+        // not end the search. `dists` is not read after the loop, so leaving the
+        // rejected candidate's updates in place is harmless.
+        if num_clusters > 0 && saving < MIN_DISTANCE_FOR_DISTINCT {
             break;
+        }
+        symbols[candidate] = num_clusters as u8;
+        num_clusters += 1;
+        largest_idx = next_largest_idx;
+        if next_largest_dist == 0.0 {
+            break; // every context is already an exact match for a cluster
         }
     }
 
@@ -484,19 +517,27 @@ fn cluster_histograms_inner(
     let mut out_costs: Vec<f32> = Vec::with_capacity(max_histograms);
     let mut scratch = [0u32; ALPHABET_SIZE];
 
-    const MIN_DISTANCE_FOR_DISTINCT: f32 = 64.0;
+    // See the note in `cluster_histograms_fixed`: the stop test is on the total
+    // saving a cluster realizes, not on one context's distance.
     while out.len() < max_histograms {
-        let symbol = out.len() as u8;
-        symbols[largest_idx] = symbol;
-        out.push(inp[largest_idx].clone());
-        out_costs.push(in_costs[largest_idx]);
-        dists[largest_idx] = 0.0;
+        let candidate = largest_idx;
+        // Pushed speculatively; popped again if the candidate does not earn its
+        // header. See the note in `cluster_histograms_fixed`.
+        out.push(inp[candidate].clone());
+        out_costs.push(in_costs[candidate]);
+        let mut saving = if dists[candidate] == f32::MAX {
+            f32::INFINITY
+        } else {
+            dists[candidate]
+        };
+        dists[candidate] = 0.0;
 
         let last_idx = out.len() - 1;
         let last_hist = &out[last_idx];
         let last_cost = out_costs[last_idx];
-        let mut next_largest_idx = 0usize;
-        let mut next_largest_dist = dists[0];
+        // See the note in `cluster_histograms_fixed`.
+        let mut next_largest_idx = candidate;
+        let mut next_largest_dist = 0.0f32;
 
         for (i, ((hist, &in_cost), dist)) in inp
             .iter()
@@ -517,6 +558,9 @@ fn cluster_histograms_inner(
                 huffman_pool,
             );
             if d < *dist {
+                if *dist != f32::MAX {
+                    saving += *dist - d;
+                }
                 *dist = d;
             }
             if *dist > next_largest_dist {
@@ -525,8 +569,14 @@ fn cluster_histograms_inner(
             }
         }
 
+        if out.len() > 1 && saving < MIN_DISTANCE_FOR_DISTINCT {
+            out.pop();
+            out_costs.pop();
+            break;
+        }
+        symbols[candidate] = (out.len() - 1) as u8;
         largest_idx = next_largest_idx;
-        if next_largest_dist < MIN_DISTANCE_FOR_DISTINCT {
+        if next_largest_dist == 0.0 {
             break;
         }
     }

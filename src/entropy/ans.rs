@@ -46,7 +46,7 @@
 // Run validate_ans.sh (djxl pixel-identity oracle) before trusting end to end.
 
 use super::histogram::Histogram;
-use super::token::{Token, uint_encode};
+use super::token::Token;
 use crate::bit_writer::BitWriter;
 use crate::entropy::dlog2::{f_fmla, f_log2};
 use crate::entropy::fast_div_u16::FastDivU16;
@@ -288,12 +288,17 @@ pub(crate) fn write_ans_tokens(
     tokens: &[Token],
     context_map: &[u8],
     symbol_info: &[Vec<AnsEncSymbolInfo>],
+    hybrid_uint_configs: &[super::token::HybridUintConfig],
     w: &mut BitWriter,
 ) {
     let mut prepared = Vec::with_capacity(tokens.len());
     for t in tokens {
-        let (sym, nbits, bits) = uint_encode(t.value);
         let hist = context_map[t.context as usize];
+        // Must honor the per-cluster config, exactly as the prefix writer
+        // does. Using the default here silently desynchronizes the decoder for
+        // any code that selects a non-default configuration.
+        let (sym, nbits, bits) =
+            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist as usize]);
         debug_assert!(sym < TABLE_ENTRIES as u32);
         debug_assert!(nbits <= u8::MAX as u32);
         prepared.push(PreparedAnsToken {

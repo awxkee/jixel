@@ -35,7 +35,7 @@ use crate::entropy::{
 pub(crate) const K_ICC_HEADER_SIZE: usize = 128;
 pub(crate) const K_NUM_ICC_CONTEXTS: usize = 41;
 
-// Commands recognised by the decoder's UnpredictICC.
+// Commands recognized by the decoder's UnpredictICC.
 const K_COMMAND_INSERT: u8 = 1;
 
 /// 4-letter ICC tags used in the header prediction template.

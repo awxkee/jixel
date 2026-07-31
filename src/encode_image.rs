@@ -333,7 +333,7 @@ impl Default for EncodeConfig {
             orientation: Orientation::Normal,
             lossless: false,
             progressive: false,
-            patches: false,
+            patches: true,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -359,7 +359,7 @@ impl Default for EncodeConfigImpl {
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             progressive: false,
-            patches: false,
+            patches: true,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -2317,7 +2317,7 @@ mod encode_smoke_tests {
                 }
             }
         }
-        let plain = encode_image(&pixels, PW, PH, &lossy()).unwrap();
+        let plain = encode_image(&pixels, PW, PH, &lossy().with_patches(false)).unwrap();
         let patched = encode_image(&pixels, PW, PH, &lossy().with_patches(true)).unwrap();
         assert!(
             patched.len() < plain.len(),
@@ -2370,6 +2370,47 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn rgba_lossy_patches_reduce_repeated_regions() {
+        const PW: usize = 256;
+        const PH: usize = 256;
+        let mut pixels = vec![0u8; PW * PH * 4];
+        for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % PW, i / PW);
+            let (tx, ty) = (x % 16, y % 16);
+            // Glyph-like repeated tiles on 3/4 of the grid, noise elsewhere.
+            if (x / 16 + y / 16) % 4 != 0 {
+                // Few distinct colors, so the tile is palette-friendly and the
+                // routing sends it to the modular atlas.
+                px[0] = ((tx / 4) * 40 + (ty / 4) * 17) as u8;
+                px[1] = ((tx / 4) * 25 + (ty / 4) * 31) as u8;
+                px[2] = ((tx / 4) * 11 + (ty / 4) * 45) as u8;
+            } else {
+                let s = (i as u32)
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
+                px[0] = (s >> 24) as u8;
+                px[1] = (s >> 16) as u8;
+                px[2] = (s >> 8) as u8;
+            }
+            px[3] = 255;
+        }
+        let cfg = |patches: bool| {
+            EncodeConfig::default()
+                .with_lossless(false)
+                .with_distance(1.0)
+                .with_patches(patches)
+        };
+        let plain = encode_image_with_alpha(&pixels, PW, PH, &cfg(false)).unwrap();
+        let patched = encode_image_with_alpha(&pixels, PW, PH, &cfg(true)).unwrap();
+        assert!(
+            patched.len() < plain.len(),
+            "alpha image patches should win: {} >= {}",
+            patched.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
     fn rgb8_lossless() {
         ok(encode_image(&rgb8(), W, H, &lossless()));
     }
@@ -2389,7 +2430,7 @@ mod encode_smoke_tests {
                 pixels[p + 2] = (tx * 7 + ty * 9) as u8;
             }
         }
-        let plain = encode_image(&pixels, PW, PH, &lossless()).unwrap();
+        let plain = encode_image(&pixels, PW, PH, &lossless().with_patches(false)).unwrap();
         let patched = encode_image(&pixels, PW, PH, &lossless().with_patches(true)).unwrap();
         assert!(
             patched.len() < plain.len(),

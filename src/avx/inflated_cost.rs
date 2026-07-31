@@ -216,7 +216,7 @@ fn prepare_reconstruction_avx2(
 /// # Safety
 /// The caller must ensure AVX2 is available. Dimensions and slice lengths are
 /// checked before vector access.
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
     validate_ssim_inputs(orig, recon, width, height);
     const C1: f32 = 1e-4;
@@ -270,9 +270,9 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
                     unsafe { _mm256_loadu_ps(recon_row[x0..].as_ptr()) },
                     mean_rv,
                 );
-                var_o = _mm256_add_ps(var_o, _mm256_mul_ps(o, o));
-                var_r = _mm256_add_ps(var_r, _mm256_mul_ps(r, r));
-                cov = _mm256_add_ps(cov, _mm256_mul_ps(o, r));
+                var_o = _mm256_fmadd_ps(o, o, var_o);
+                var_r = _mm256_fmadd_ps(r, r, var_r);
+                cov = _mm256_fmadd_ps(o, r, cov);
             }
             let vo = hsum256(var_o) * INV_64;
             let vr = hsum256(var_r) * INV_64;

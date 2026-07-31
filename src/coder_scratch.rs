@@ -31,12 +31,30 @@ use crate::adaptive_quant::AqMapScratch;
 use crate::enc_group::AcGroupScratch;
 use crate::enc_lossless::{GradientScratch, LzToken, PickThresholdScratch};
 use crate::entropy::{
-    CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig, PrefixCode,
+    ALPHABET_SIZE, CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig,
+    PrefixCode,
 };
+use crate::patches::PATCH_TILE;
+use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::util::{HeapMatrix, heap_array};
 
 const LZ77_CANDIDATE_CAPACITY: usize = 1 << 19;
 pub(crate) const LZ77_MAX_CONTEXTS: usize = 221;
+const DC_PREDICTOR_SLOTS: usize = 2 * K_NUM_DC_CONTEXTS;
+
+pub(crate) struct DcPredictorScratch {
+    pub(crate) counts: Box<[[u32; ALPHABET_SIZE]; DC_PREDICTOR_SLOTS]>,
+    pub(crate) extra: Box<[u64; DC_PREDICTOR_SLOTS]>,
+}
+
+impl Default for DcPredictorScratch {
+    fn default() -> Self {
+        Self {
+            counts: heap_array([0; ALPHABET_SIZE]),
+            extra: heap_array(0),
+        }
+    }
+}
 
 pub(crate) struct LzEntropyScratch {
     pub(crate) histograms: Box<[Histogram; LZ77_MAX_CONTEXTS]>,
@@ -59,10 +77,6 @@ impl Default for LzEntropyScratch {
 }
 
 /// Fixed-layout reusable storage owned by one encoder worker.
-///
-/// The box containing this structure is created once with the worker. Hot paths
-/// then borrow a concrete field directly: there is no allocation, lookup, or
-/// type erasure involved in selecting a scratch slot.
 pub(crate) struct CoderScratch {
     pub(crate) aq_map: AqMapScratch,
     pub(crate) structure_corrections: Vec<f32>,
@@ -79,6 +93,11 @@ pub(crate) struct CoderScratch {
     pub(crate) gradient: GradientScratch,
     pub(crate) order0_entropy: Vec<u64>,
     pub(crate) threshold: PickThresholdScratch,
+    pub(crate) dct8_costs: Vec<f32>,
+    pub(crate) dc_cfl_cur: Vec<i32>,
+    pub(crate) dc_cfl_prev: Vec<i32>,
+    pub(crate) dc_predictor: DcPredictorScratch,
+    pub(crate) patch_tile_colors: Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>,
 }
 
 impl Default for CoderScratch {
@@ -108,19 +127,25 @@ impl Default for CoderScratch {
             threshold: PickThresholdScratch {
                 hist_scratch: vec![0; 3 * 1025],
             },
+            dct8_costs: Vec::new(),
+            dc_cfl_cur: Vec::new(),
+            dc_cfl_prev: Vec::new(),
+            dc_predictor: DcPredictorScratch::default(),
+            patch_tile_colors: heap_array([0; 3]),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoderScratch, LzEntropyScratch};
+    use super::{CoderScratch, DcPredictorScratch, LzEntropyScratch};
     use crate::enc_group::AcGroupScratch;
     use std::mem::size_of;
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
         assert!(size_of::<CoderScratch>() <= 1024);
+        assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<AcGroupScratch>() <= 128);
     }

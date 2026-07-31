@@ -26,8 +26,8 @@ SSIMULACRA2 = shutil.which("ssimulacra2") or "ssimulacra2"
 # sorted listing (deterministic — no RNG). DIV2K has 800 images, far more than a
 # search needs, so we take an evenly-spaced subset for content diversity.
 SOURCE_DIRS: list[tuple[Path, int | None]] = [
-    (REPO_ROOT / "assets" / "train0", None),            # all 16
-    (REPO_ROOT / "assets" / "DIV2K_train_HR", 24),      # 24 of 800
+    (REPO_ROOT / "assets" / "train0", 8),               # 8 of 16
+    (REPO_ROOT / "assets" / "DIV2K_train_HR", 6),       # 6 of 800
 ]
 
 # Back-compat alias (the first source dir).
@@ -53,18 +53,23 @@ HOLDOUT_EVERY = 4  # -> 25% holdout
 # Search across the three anchor bands from the Level-2 plan (HQ ~0.1-0.7,
 # mid ~1-3, low ~4-5) so a single global config is optimized not to regress
 # anywhere — the earlier HQ-only study overfit d<=0.7 and hurt d>=1.
-SEARCH_DISTANCES = [0.10, 0.30, 0.70, 1.50, 3.00, 5.00]
+SEARCH_DISTANCES = [0.35, 0.80, 1.50, 2.50, 4.00]
 
 # Denser sweep used to build the per-crop baseline rate/quality curve, so a
 # candidate encode at any rate can be compared against a matched baseline.
 # Must span (with margin) both the search and validation distances.
 BASELINE_DISTANCES = [
-    0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70,
-    1.00, 1.50, 2.00, 3.00, 4.00, 5.00, 6.00,
+    0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.42, 0.50, 0.60, 0.70, 0.80,
+    1.00, 1.20, 1.50, 2.00, 2.50, 3.00, 4.00, 5.00, 6.00, 8.00,
 ]
 
 # Final-validation sweep (run only on the best few configs).
-VALIDATION_DISTANCES = [0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 1.00, 1.50, 2.00, 3.00, 5.00]
+VALIDATION_DISTANCES = [0.15, 0.20, 0.30, 0.35, 0.50, 0.70, 0.80, 1.00, 1.50, 2.00, 3.00]
+
+# Encoder speed tier. The transform-merge search only runs its full space (rect
+# candidates + rerank at every distance) under Slow, which is also what
+# `meanstats` measures, so the study must match it.
+SPEED = "slow"
 
 # Encoder threads per encode. Each encode uses all cores; the study then runs
 # ONE trial at a time (n_jobs=1) so encodes never contend, which keeps the

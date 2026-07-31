@@ -33,7 +33,9 @@ mod dct;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
+mod quantize_xyb;
 mod xyb;
+mod ytob;
 
 pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
@@ -45,5 +47,7 @@ pub(crate) use dct::{
 };
 pub(crate) use inflated_cost::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::quantize_block_ac_avx2;
+pub(crate) use quant::{quantize_block_ac_avx2, quantize_dc_avx2, quantize_dc_cfl_avx2};
+pub(crate) use quantize_xyb::{quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2};
 pub(crate) use xyb::to_xyb_avx2_band;
+pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

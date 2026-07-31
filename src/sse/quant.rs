@@ -93,9 +93,160 @@ pub(crate) fn quantize_block_ac_sse41(
             let val = _mm_mul_ps(_mm_mul_ps(qmv, qs), inv);
             let abs = _mm_andnot_ps(sign, val);
             let keep = _mm_cmpge_ps(abs, _mm_set1_ps(threshold));
-            let q = _mm_cvtps_epi32(val);
+            let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(val);
+            let frac = _mm_sub_ps(val, truncated);
+            let abs_frac = _mm_andnot_ps(sign, frac);
+            let ge_half = _mm_cmpge_ps(abs_frac, _mm_set1_ps(0.5));
+            let signed_one = _mm_or_ps(_mm_set1_ps(1.0), _mm_and_ps(val, sign));
+            let q = _mm_cvttps_epi32(_mm_add_ps(truncated, _mm_and_ps(signed_one, ge_half)));
             let q = _mm_blendv_epi8(zero_i, q, _mm_castps_si128(keep));
             unsafe { _mm_storeu_si128(out4.as_mut_ptr().cast::<__m128i>(), q) };
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn round_ties_away_i32x4(value: __m128) -> __m128i {
+    let sign = _mm_set1_ps(-0.0);
+    let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(value);
+    let fraction = _mm_sub_ps(value, truncated);
+    let at_least_half = _mm_cmpge_ps(_mm_andnot_ps(sign, fraction), _mm_set1_ps(0.5));
+    let signed_one = _mm_or_ps(_mm_set1_ps(1.0), _mm_and_ps(value, sign));
+    let rounded = _mm_add_ps(truncated, _mm_and_ps(signed_one, at_least_half));
+    let quantized = _mm_cvttps_epi32(rounded);
+    let positive_overflow = _mm_cmpge_ps(rounded, _mm_set1_ps(2_147_483_648.0));
+    let quantized = _mm_blendv_epi8(
+        quantized,
+        _mm_set1_epi32(i32::MAX),
+        _mm_castps_si128(positive_overflow),
+    );
+    let nan = _mm_cmpunord_ps(value, value);
+    _mm_blendv_epi8(quantized, _mm_setzero_si128(), _mm_castps_si128(nan))
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn store_i16x4(output: &mut [i16; 4], value: __m128i) {
+    let packed = _mm_packs_epi32(value, value);
+    unsafe { _mm_storel_epi64(output.as_mut_ptr().cast(), packed) };
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn quantize_dc_cfl_value_x4(
+    input: __m128,
+    y_quant: __m128i,
+    scale: __m128,
+    negative_cfl: __m128,
+) -> __m128i {
+    let y = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(y_quant));
+    let correction = _mm_mul_ps(y, negative_cfl);
+    #[cfg(target_feature = "fma")]
+    let value = _mm_fmadd_ps(input, scale, correction);
+    #[cfg(not(target_feature = "fma"))]
+    let value = _mm_add_ps(_mm_mul_ps(input, scale), correction);
+    round_ties_away_i32x4(value)
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn quantize_dc_sse41(input: &[f32], scale: f32, output: &mut [i16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let (input4, input_tail) = input.as_chunks::<4>();
+    let (output4, output_tail) = output.as_chunks_mut::<4>();
+    let scale = _mm_set1_ps(scale);
+
+    for (source, target) in input4.iter().zip(output4) {
+        let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
+        store_i16x4(target, round_ties_away_i32x4(_mm_mul_ps(value, scale)));
+    }
+
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
+        let mut target = [0i16; 4];
+        store_i16x4(&mut target, round_ties_away_i32x4(_mm_mul_ps(value, scale)));
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn quantize_dc_cfl_sse41(
+    input: &[f32],
+    y_quant: &[i16],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i16],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    let (input4, input_tail) = input.as_chunks::<4>();
+    let (y4, y_tail) = y_quant.as_chunks::<4>();
+    let (output4, output_tail) = output.as_chunks_mut::<4>();
+    let scale = _mm_set1_ps(scale);
+    let negative_cfl = _mm_set1_ps(-cfl);
+
+    for ((source, y), target) in input4.iter().zip(y4).zip(output4) {
+        let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
+        let y = unsafe { _mm_loadl_epi64(y.as_ptr().cast()) };
+        store_i16x4(
+            target,
+            quantize_dc_cfl_value_x4(value, y, scale, negative_cfl),
+        );
+    }
+
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let mut y = [0i16; 4];
+        y[..y_tail.len()].copy_from_slice(y_tail);
+        let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
+        let y = unsafe { _mm_loadl_epi64(y.as_ptr().cast()) };
+        let mut target = [0i16; 4];
+        store_i16x4(
+            &mut target,
+            quantize_dc_cfl_value_x4(value, y, scale, negative_cfl),
+        );
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::enc_group::quantize_block_ac_scalar;
+
+    #[test]
+    fn quantize_block_ac_sse41_matches_scalar() {
+        static EDGES: [f32; 12] = [
+            0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5, 0.75, -0.75, 1.25, -1.25,
+        ];
+        for &(xsize, ysize) in &[(1usize, 1usize), (2, 2), (4, 4)] {
+            let n = xsize * 8 * ysize * 8;
+            for c in 0..3 {
+                for &distance in &[0.5f32, 2.5] {
+                    let qm: Vec<f32> = vec![0.5; n];
+                    let block: Vec<f32> = (0..n).map(|i| EDGES[i % EDGES.len()] / 0.5).collect();
+                    let mut want = vec![0i32; n];
+                    let mut got = vec![0i32; n];
+                    quantize_block_ac_scalar(
+                        &block, c, &qm, 1, 1.0, 1.0, distance, xsize, ysize, &mut want,
+                    );
+                    unsafe {
+                        super::quantize_block_ac_sse41(
+                            &block, c, &qm, 1, 1.0, 1.0, distance, xsize, ysize, &mut got,
+                        );
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            got[i], want[i],
+                            "mismatch at {i} ({xsize}x{ysize}, c={c}, d={distance}): \
+                             scalar {} sse {}, input {}",
+                            want[i], got[i], block[i]
+                        );
+                    }
+                }
+            }
         }
     }
 }

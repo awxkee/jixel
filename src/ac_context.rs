@@ -29,9 +29,9 @@
 
 pub(crate) const K_NON_ZERO_BUCKETS: usize = 37;
 pub(crate) const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
-pub(crate) const K_NUM_BLOCK_CTXS: usize = 4;
+pub(crate) const K_NUM_BLOCK_CTXS: usize = 15;
 pub(crate) const K_NUM_AC_CONTEXTS: usize =
-    K_NUM_BLOCK_CTXS * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT); // 1980
+    K_NUM_BLOCK_CTXS * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT); // 15 * 495
 
 pub(crate) const K_NUM_AC_STRATEGY_CODES: usize = 27;
 
@@ -50,46 +50,96 @@ pub(crate) static K_COEFF_NUM_NONZERO_CONTEXT: [u16; 64] = [
     206, 206, 206, 206, 206, 206,
 ];
 
-/// Static block context map signaled in WriteDCGlobal.
-pub(crate) static K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
-    0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, // Y
-    2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // X
-    2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, // B
-];
-
+/// Static block context map signaled in WriteDCGlobal, indexed by
+/// `channel_row * K_NUM_ORDERS + strategy_order`. This is libjxl's default map:
+/// transform *classes* get their own contexts rather than being collapsed into
+/// "small" and "large" buckets. jixel previously used a 4-context reduction
+/// inherited from libjxl-tiny, which lumped DCT32X32 with DCT8X8 and every
+/// larger shape together (see docs/dct64-findings.md).
 #[rustfmt::skip]
-pub(crate) static K_BLOCK_CONTEXT_MAP: [u8; 81] = [
-    // X row. Position 4 = DCT16X16 (decoder ctx 2). Position 5 = DCT32X32
-    // (ord 3, ctx 2). Position 3 = DCT4X4, positions 12,13 = DCT4X8/DCT8X4 (all ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
-    // Positions 10, 11 = DCT32X16/DCT16X32 (ord 6, ctx 3); position 18 = DCT64X64 (shape 7, ctx 3).
-    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 3, 3, 2, 2,
-    0, 0, 0, 0, 3, 3, 3, 0, 0, 0, 0, 0, 0,
-    // Y row. Position 4 = DCT16X16 (decoder ctx 0). Positions 6, 7 = DCT16X8/8X16 (ctx 1).
-    // Positions 10, 11 = DCT32X16/DCT16X32 (ord 6, ctx 1); position 18 = DCT64X64 (shape 7, ctx 1).
-    0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
-    0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0,
-    // B row. Position 4 = DCT16X16 (decoder ctx 2). Position 5 = DCT32X32
-    // (ord 3, ctx 2). Position 3 = DCT4X4, positions 12,13 = DCT4X8/DCT8X4 (all ord 1, ctx 2). Positions 6, 7 = DCT16X8/8X16 (ctx 3).
-    // Positions 10, 11 = DCT32X16/DCT16X32 (ord 6, ctx 3); position 18 = DCT64X64 (shape 7, ctx 3).
-    2, 0, 0, 2, 2, 2, 3, 3, 0, 0, 3, 3, 2, 2,
-    0, 0, 0, 0, 3, 3, 3, 0, 0, 0, 0, 0, 0,
+pub(crate) static K_COMPACT_BLOCK_CONTEXT_MAP: [u8; 39] = [
+    // Y
+    0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6,
+    // X
+    7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+    // B
+    7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
 ];
 
+/// Number of transform *orders* (shape classes) the block context map is keyed
+/// by; libjxl `kNumOrders`.
+pub(crate) const K_NUM_ORDERS: usize = 13;
+
+/// Strategy code -> transform order, libjxl `kStrategyOrder`. Codes are the
+/// wire values (0 = DCT8X8, 4 = DCT16X16, 5 = DCT32X32, 18..20 = the 64px
+/// family), so this covers the whole JPEG XL strategy space, not only the
+/// subset jixel emits.
+#[rustfmt::skip]
+pub(crate) static K_STRATEGY_ORDER: [u8; K_NUM_AC_STRATEGY_CODES] = [
+    0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1,
+    1, 1, 1, 1, 7, 8, 8, 9, 9, 9, 10, 10, 10,
+];
+
+/// Local channel order is X, Y, B; the block context map's row order is
+/// Y, X, B.
+static CHANNEL_ROW: [usize; 3] = [1, 0, 2];
+
+/// The block-context map actually signaled in DC global.
+#[inline]
+pub(crate) fn compact_block_context_map() -> &'static [u8; 39] {
+    &K_COMPACT_BLOCK_CONTEXT_MAP
+}
+
+/// Derived from the signaled map so the encoder and decoder cannot disagree —
+/// the previous code-indexed duplicate silently defaulted unsupported entries
+/// to context 0.
 #[inline]
 pub(crate) fn block_context(c: usize, ac_strategy_code: u8) -> u32 {
-    K_BLOCK_CONTEXT_MAP[c * K_NUM_AC_STRATEGY_CODES + ac_strategy_code as usize] as u32
+    let order = K_STRATEGY_ORDER[ac_strategy_code as usize] as usize;
+    K_COMPACT_BLOCK_CONTEXT_MAP[CHANNEL_ROW[c] * K_NUM_ORDERS + order] as u32
 }
 
 #[inline]
-pub(crate) fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
-    let bucket = if non_zeros < 8 {
+fn non_zero_bucket(non_zeros: u32) -> u32 {
+    if non_zeros < 8 {
         non_zeros
     } else if non_zeros >= 64 {
         36
     } else {
         4 + non_zeros / 2
-    };
-    bucket * K_NUM_BLOCK_CTXS as u32 + block_ctx
+    }
+}
+
+#[inline]
+pub(crate) fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
+    non_zero_bucket(non_zeros) * K_NUM_BLOCK_CTXS as u32 + block_ctx
+}
+
+/// Fine tokenization layout for the lossy path: every base block context is
+/// split by a per-image quant-field threshold into two classes. The final
+/// signaled map is decided *after* tokenization from real token statistics
+/// (splits kept only where they pay, within the spec's 16-context budget) and
+/// tokens are remapped; this layout only has to be a superset of every final
+/// map. The JPEG-recompression path stays on the legacy 15-context layout.
+pub(crate) const K_NUM_QF_CLASSES: usize = 2;
+pub(crate) const K_NUM_FINE_BLOCK_CTXS: usize = K_NUM_BLOCK_CTXS * K_NUM_QF_CLASSES;
+pub(crate) const K_NUM_FINE_AC_CONTEXTS: usize =
+    K_NUM_FINE_BLOCK_CTXS * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT);
+
+#[inline]
+pub(crate) fn fine_block_context(c: usize, ac_strategy_code: u8, qf_hi: bool) -> u32 {
+    block_context(c, ac_strategy_code) * K_NUM_QF_CLASSES as u32 + qf_hi as u32
+}
+
+#[inline]
+pub(crate) fn fine_non_zero_context(non_zeros: u32, fine_block_ctx: u32) -> u32 {
+    non_zero_bucket(non_zeros) * K_NUM_FINE_BLOCK_CTXS as u32 + fine_block_ctx
+}
+
+#[inline]
+pub(crate) const fn fine_zero_density_contexts_offset(fine_block_ctx: u32) -> u32 {
+    K_NUM_FINE_BLOCK_CTXS as u32 * K_NON_ZERO_BUCKETS as u32
+        + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * fine_block_ctx
 }
 
 /// 8x8 specialization: covered_blocks = 1, log2_covered_blocks = 0, so
@@ -279,3 +329,363 @@ pub(crate) static K_COEFF_ORDER_32X16: [u16; 512] = [
     351, 381, 411, 441, 471, 501, 502, 472, 442, 412, 382, 383, 413, 443, 473, 503, 504, 474, 444,
     414, 415, 445, 475, 505, 506, 476, 446, 447, 477, 507, 508, 478, 479, 509, 510, 511,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CHANNEL_ROW, K_COMPACT_BLOCK_CONTEXT_MAP, K_NUM_AC_STRATEGY_CODES, K_NUM_BLOCK_CTXS,
+        K_NUM_ORDERS, K_STRATEGY_ORDER, block_context,
+    };
+
+    /// The encoder must derive exactly the contexts the signaled map implies, or
+    /// the decoder reads different histograms. Channel order differs between the
+    /// two (local X,Y,B vs the map's Y,X,B), which is the easy thing to get wrong.
+    #[test]
+    fn derived_block_context_matches_the_signaled_map() {
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let order = K_STRATEGY_ORDER[code as usize] as usize;
+            for (c, row) in CHANNEL_ROW.iter().enumerate() {
+                assert_eq!(
+                    block_context(c, code),
+                    K_COMPACT_BLOCK_CONTEXT_MAP[row * K_NUM_ORDERS + order] as u32,
+                    "channel {c} code {code}"
+                );
+            }
+        }
+        // Y contexts live below the chroma ones and every context is in range.
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let luma_ctxs = K_NUM_BLOCK_CTXS as u32 / 2;
+            assert!(block_context(1, code) < luma_ctxs);
+            for c in [0usize, 2] {
+                assert!((luma_ctxs..K_NUM_BLOCK_CTXS as u32).contains(&block_context(c, code)));
+            }
+        }
+    }
+
+    /// Properties the block-context map must satisfy whatever grouping it uses,
+    /// so that changing `K_COMPACT_BLOCK_CONTEXT_MAP` cannot silently break the
+    /// invariants the AC context arithmetic relies on.
+    #[test]
+    fn block_context_map_invariants() {
+        // Luma and chroma never share a context, and chroma X and B always do.
+        for code in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            let (x, y, b) = (
+                block_context(0, code),
+                block_context(1, code),
+                block_context(2, code),
+            );
+            assert_eq!(x, b, "X and B differ for code {code}");
+            assert_ne!(x, y, "luma and chroma share a context for code {code}");
+            assert!(y < K_NUM_BLOCK_CTXS as u32 && x < K_NUM_BLOCK_CTXS as u32);
+        }
+        // Codes of the same transform order are indistinguishable by design.
+        for a in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+            for b in 0..K_NUM_AC_STRATEGY_CODES as u8 {
+                if K_STRATEGY_ORDER[a as usize] == K_STRATEGY_ORDER[b as usize] {
+                    for c in 0..3 {
+                        assert_eq!(block_context(c, a), block_context(c, b));
+                    }
+                }
+            }
+        }
+        // Every declared context is reachable, or the count is overstated and
+        // the AC context arithmetic reserves histograms that never get tokens.
+        let used: std::collections::BTreeSet<u32> = (0..K_NUM_AC_STRATEGY_CODES as u8)
+            .flat_map(|code| (0..3).map(move |c| block_context(c, code)))
+            .collect();
+        assert_eq!(
+            used.len(),
+            K_NUM_BLOCK_CTXS,
+            "unreachable block contexts: {used:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-image block-context planning
+// ---------------------------------------------------------------------------
+
+/// The signaled block-context layout decided per image after tokenization.
+///
+/// Tokens are produced on the fine layout (every base context split by the
+/// quant-field threshold); this plan says which splits are kept and which
+/// chroma contexts are merged to stay inside the spec's 16-id budget. A plan
+/// equal to [`AcCtxPlan::baseline`] signals byte-for-byte the legacy map.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AcCtxPlan {
+    pub(crate) nbc: u8,
+    pub(crate) fine_to_final: [u8; K_NUM_FINE_BLOCK_CTXS],
+    /// `Some(t)` when at least one kept split needs the threshold signaled.
+    pub(crate) qf_threshold: Option<u32>,
+}
+
+impl AcCtxPlan {
+    /// The legacy 15-context map: qf classes collapsed, nothing merged.
+    pub(crate) fn baseline() -> Self {
+        let mut fine_to_final = [0u8; K_NUM_FINE_BLOCK_CTXS];
+        for (fine, out) in fine_to_final.iter_mut().enumerate() {
+            *out = (fine / K_NUM_QF_CLASSES) as u8;
+        }
+        AcCtxPlan {
+            nbc: K_NUM_BLOCK_CTXS as u8,
+            fine_to_final,
+            qf_threshold: None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn num_ac_contexts(&self) -> usize {
+        self.nbc as usize * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT)
+    }
+
+    /// Remap a fine-layout token context into this plan's final layout.
+    #[inline]
+    pub(crate) fn remap(&self, ctx: u32) -> u32 {
+        const NZ_SPAN: u32 = (K_NUM_FINE_BLOCK_CTXS * K_NON_ZERO_BUCKETS) as u32;
+        let nbc = self.nbc as u32;
+        if ctx < NZ_SPAN {
+            let bucket = ctx / K_NUM_FINE_BLOCK_CTXS as u32;
+            let fine = ctx % K_NUM_FINE_BLOCK_CTXS as u32;
+            bucket * nbc + u32::from(self.fine_to_final[fine as usize])
+        } else {
+            let rel = ctx - NZ_SPAN;
+            let fine = rel / K_ZERO_DENSITY_CONTEXT_COUNT as u32;
+            let z = rel % K_ZERO_DENSITY_CONTEXT_COUNT as u32;
+            nbc * K_NON_ZERO_BUCKETS as u32
+                + u32::from(self.fine_to_final[fine as usize]) * K_ZERO_DENSITY_CONTEXT_COUNT as u32
+                + z
+        }
+    }
+
+    /// The signaled ctx_map entries: channel-row major, order next, qf inner.
+    pub(crate) fn ctx_map_entries(&self) -> Vec<u8> {
+        let qf_classes = if self.qf_threshold.is_some() {
+            K_NUM_QF_CLASSES
+        } else {
+            1
+        };
+        let mut out = Vec::with_capacity(3 * K_NUM_ORDERS * qf_classes);
+        for base in K_COMPACT_BLOCK_CONTEXT_MAP.iter() {
+            for qf_idx in 0..qf_classes {
+                out.push(self.fine_to_final[*base as usize * K_NUM_QF_CLASSES + qf_idx]);
+            }
+        }
+        out
+    }
+}
+
+/// Shannon cost model constants for plan decisions. A kept split grows the
+/// signaled AC context map by one block context's worth of entries (495) and
+/// typically one histogram cluster; a split paired with a chroma merge keeps
+/// the map size unchanged and only pays churn. Margins hedge the proxy, per
+/// the recurring clustering lesson.
+const SPLIT_OVERHEAD_BITS: f64 = 800.0;
+const PAIRED_OVERHEAD_BITS: f64 = 300.0;
+const PLAN_GAIN_MARGIN: f64 = 1.3;
+const MAX_BLOCK_CTXS: usize = 16;
+const PLAN_NUM_SYMBOLS: usize = 128;
+const PLAN_SAMPLE_STEP: usize = 4;
+
+/// The proposal must predict at least this many bits of net gain before the
+/// expensive dual-arm verification runs. Below it, marginal proposals were
+/// overwhelmingly rejected by the gate anyway — pure encode-time waste.
+const PROPOSE_MIN_NET_BITS: f64 = 4096.0;
+
+/// Chroma merge candidates, cheapest-first per the offline study; each frees
+/// one id for a split when the 16-id budget is exhausted.
+const CHROMA_MERGE_CANDIDATES: [(u8, u8); 4] = [(10, 11), (8, 9), (12, 13), (13, 14)];
+
+struct PlanStats {
+    /// [fine ac context][symbol] counts plus raw extra bits.
+    counts: Vec<u32>,
+    extra: Vec<u64>,
+}
+
+impl PlanStats {
+    fn new() -> Self {
+        PlanStats {
+            counts: vec![0u32; K_NUM_FINE_AC_CONTEXTS * PLAN_NUM_SYMBOLS],
+            extra: vec![0u64; K_NUM_FINE_AC_CONTEXTS],
+        }
+    }
+    fn add_stream(&mut self, tokens: &[crate::entropy::Token]) {
+        // Subsampled: the stats only feed a proposal that a real-bits gate
+        // verifies, and a 1-in-4 sample keeps this pass off the profile.
+        for t in tokens.iter().step_by(PLAN_SAMPLE_STEP) {
+            let (sym, nbits, _) = crate::entropy::uint_encode(t.value);
+            self.counts[t.context as usize * PLAN_NUM_SYMBOLS + sym as usize] += 1;
+            self.extra[t.context as usize] += u64::from(nbits);
+        }
+    }
+    /// Cost of coding one final context made of `members` fine block contexts,
+    /// summed over every sub-context slot (nonzero buckets + zero-density).
+    fn group_cost(&self, members: &[u8]) -> f64 {
+        let mut total = 0.0f64;
+        let mut merged = [0u64; PLAN_NUM_SYMBOLS];
+        let sub_slots = K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT;
+        for slot in 0..sub_slots {
+            let mut any = false;
+            for v in merged.iter_mut() {
+                *v = 0;
+            }
+            let mut extra = 0u64;
+            for &fine in members {
+                let ctx = if slot < K_NON_ZERO_BUCKETS {
+                    slot * K_NUM_FINE_BLOCK_CTXS + fine as usize
+                } else {
+                    K_NUM_FINE_BLOCK_CTXS * K_NON_ZERO_BUCKETS
+                        + fine as usize * K_ZERO_DENSITY_CONTEXT_COUNT
+                        + (slot - K_NON_ZERO_BUCKETS)
+                };
+                let row = &self.counts[ctx * PLAN_NUM_SYMBOLS..(ctx + 1) * PLAN_NUM_SYMBOLS];
+                for (dst, &src) in merged.iter_mut().zip(row) {
+                    *dst += u64::from(src);
+                    any |= src != 0;
+                }
+                // Extra bits accrue once per token regardless of grouping; they
+                // cancel in comparisons but keep costs absolute for clarity.
+                if slot == 0 {
+                    extra += self.extra[ctx];
+                }
+            }
+            if any {
+                let n: u64 = merged.iter().sum();
+                let nf = n as f64;
+                total += merged
+                    .iter()
+                    .filter(|&&c| c != 0)
+                    .map(|&c| c as f64 * (nf / c as f64).log2())
+                    .sum::<f64>();
+            }
+            total += extra as f64;
+        }
+        total
+    }
+}
+
+/// Decide the per-image block-context map from real token statistics.
+pub(crate) fn plan_block_ctx_map<'a, I>(streams: I, qf_threshold: u32) -> AcCtxPlan
+where
+    I: IntoIterator<Item = &'a [crate::entropy::Token]>,
+{
+    let mut stats = PlanStats::new();
+    for s in streams {
+        stats.add_stream(s);
+    }
+
+    // Groups of fine ids per final context; starts as the baseline pairing.
+    // A group is "splittable" while it is exactly one base context's pair.
+    let mut groups: Vec<Vec<u8>> = (0..K_NUM_BLOCK_CTXS as u8)
+        .map(|b| vec![b * 2, b * 2 + 1])
+        .collect();
+    let mut group_cost: Vec<f64> = groups.iter().map(|g| stats.group_cost(g)).collect();
+    let splittable = |g: &[u8]| g.len() == 2 && g[0].is_multiple_of(2) && g[1] == g[0] + 1;
+    // Merge candidates may only combine unsplit groups.
+    let unsplit = |g: &[u8]| {
+        g.len().is_multiple_of(2)
+            && g.chunks(2)
+                .all(|p| p[0].is_multiple_of(2) && p[1] == p[0] + 1)
+    };
+
+    let mut merges_used = [false; CHROMA_MERGE_CANDIDATES.len()];
+    let mut any_split = false;
+    let mut total_net = 0.0f64;
+    loop {
+        let mut best: Option<(f64, usize)> = None;
+        for (i, g) in groups.iter().enumerate() {
+            if !splittable(g) {
+                continue;
+            }
+            let gain = group_cost[i] - stats.group_cost(&[g[0]]) - stats.group_cost(&[g[1]]);
+            if gain > 0.0 && best.is_none_or(|(bg, _)| gain > bg) {
+                best = Some((gain, i));
+            }
+        }
+        let Some((gain, split_pos)) = best else { break };
+        let gain = gain * PLAN_SAMPLE_STEP as f64;
+        let split_fines = groups[split_pos].clone();
+
+        let merge_choice = if groups.len() < MAX_BLOCK_CTXS {
+            None
+        } else {
+            let mut cheapest: Option<(f64, usize, Vec<u8>, Vec<u8>)> = None;
+            for (mi, &(a, b)) in CHROMA_MERGE_CANDIDATES.iter().enumerate() {
+                if merges_used[mi] {
+                    continue;
+                }
+                let pa = groups.iter().position(|g| g.contains(&(a * 2)));
+                let pb = groups.iter().position(|g| g.contains(&(b * 2)));
+                let (Some(pa), Some(pb)) = (pa, pb) else {
+                    continue;
+                };
+                if pa == pb
+                    || !unsplit(&groups[pa])
+                    || !unsplit(&groups[pb])
+                    || pa == split_pos
+                    || pb == split_pos
+                {
+                    continue;
+                }
+                let mut union = groups[pa].clone();
+                union.extend_from_slice(&groups[pb]);
+                let cost = (stats.group_cost(&union) - group_cost[pa] - group_cost[pb])
+                    * PLAN_SAMPLE_STEP as f64;
+                if cheapest.as_ref().is_none_or(|(c, ..)| cost < *c) {
+                    cheapest = Some((cost, mi, groups[pa].clone(), groups[pb].clone()));
+                }
+            }
+            match cheapest {
+                Some(c) => Some(c),
+                None => break, // budget full, nothing mergeable
+            }
+        };
+
+        let net = match &merge_choice {
+            None => gain - SPLIT_OVERHEAD_BITS * PLAN_GAIN_MARGIN,
+            Some((cost, ..)) => gain - cost - PAIRED_OVERHEAD_BITS * PLAN_GAIN_MARGIN,
+        };
+        if net <= 0.0 {
+            break;
+        }
+        total_net += net;
+
+        if let Some((_, mi, ga, gb)) = merge_choice {
+            merges_used[mi] = true;
+            let pa = groups.iter().position(|g| *g == ga).unwrap();
+            groups.remove(pa);
+            group_cost.remove(pa);
+            let pb = groups.iter().position(|g| *g == gb).unwrap();
+            groups.remove(pb);
+            group_cost.remove(pb);
+            let mut union = ga;
+            union.extend(gb);
+            group_cost.push(stats.group_cost(&union));
+            groups.push(union);
+        }
+        let pos = groups.iter().position(|g| *g == split_fines).unwrap();
+        groups.remove(pos);
+        group_cost.remove(pos);
+        for fine in split_fines {
+            group_cost.push(stats.group_cost(&[fine]));
+            groups.push(vec![fine]);
+        }
+        any_split = true;
+    }
+    if total_net < PROPOSE_MIN_NET_BITS {
+        return AcCtxPlan::baseline();
+    }
+
+    // Final numbering: stable by smallest fine id.
+    groups.sort_by_key(|g| g.iter().copied().min().unwrap());
+    let mut fine_to_final = [0u8; K_NUM_FINE_BLOCK_CTXS];
+    for (id, g) in groups.iter().enumerate() {
+        for &fine in g {
+            fine_to_final[fine as usize] = id as u8;
+        }
+    }
+    AcCtxPlan {
+        nbc: groups.len() as u8,
+        fine_to_final,
+        qf_threshold: any_split.then_some(qf_threshold),
+    }
+}

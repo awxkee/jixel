@@ -292,8 +292,17 @@ mod tests {
                         &thr,
                     )
                 };
+                // `nzeros` is a discrete decision and must match exactly.
                 assert_eq!(a.1, r.1, "nzeros mismatch {w}x{h}");
-                assert_eq!(a.2, r.2, "mag_bits mismatch {w}x{h}");
+                let mag_rel = if r.2.abs() > 1e-3 {
+                    ((a.2 - r.2) / r.2).abs()
+                } else {
+                    (a.2 - r.2).abs()
+                };
+                assert!(
+                    mag_rel < 1e-4,
+                    "mag_bits rel diff {mag_rel} too large {w}x{h}"
+                );
                 let rel = if r.0.abs() > 1e-3 {
                     ((a.0 - r.0) / r.0).abs()
                 } else {

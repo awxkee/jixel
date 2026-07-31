@@ -87,9 +87,91 @@ pub(crate) fn quantize_block_ac_wasm(
             let inv = unsafe { v128_load(in4.as_ptr().cast()) };
             let val = f32x4_mul(f32x4_mul(qmv, qs), inv);
             let keep = f32x4_ge(f32x4_abs(val), f32x4_splat(threshold));
-            let q = i32x4_trunc_sat_f32x4(f32x4_nearest(val));
+            let truncated = f32x4_trunc(val);
+            let frac = f32x4_sub(val, truncated);
+            let ge_half = f32x4_ge(f32x4_abs(frac), f32x4_splat(0.5));
+            let signed_one = v128_or(f32x4_splat(1.0), v128_and(val, f32x4_splat(-0.0)));
+            let q = i32x4_trunc_sat_f32x4(f32x4_add(truncated, v128_and(signed_one, ge_half)));
             let q = v128_bitselect(q, zero_i, keep);
             unsafe { v128_store(out4.as_mut_ptr().cast(), q) };
         }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn round_ties_away_i32x4(value: v128) -> v128 {
+    let truncated = f32x4_trunc(value);
+    let fraction = f32x4_sub(value, truncated);
+    let at_least_half = f32x4_ge(f32x4_abs(fraction), f32x4_splat(0.5));
+    let signed_one = v128_or(f32x4_splat(1.0), v128_and(value, f32x4_splat(-0.0)));
+    i32x4_trunc_sat_f32x4(f32x4_add(truncated, v128_and(signed_one, at_least_half)))
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn store_i16x4(output: &mut [i16; 4], value: v128) {
+    let packed = i16x8_narrow_i32x4(value, value);
+    unsafe { v128_store64_lane::<0>(packed, output.as_mut_ptr().cast()) };
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn quantize_dc_wasm(input: &[f32], scale: f32, output: &mut [i16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let (input4, input_tail) = input.as_chunks::<4>();
+    let (output4, output_tail) = output.as_chunks_mut::<4>();
+    let scale = f32x4_splat(scale);
+
+    for (source, target) in input4.iter().zip(output4) {
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        store_i16x4(target, round_ties_away_i32x4(f32x4_mul(value, scale)));
+    }
+
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let mut target = [0i16; 4];
+        store_i16x4(&mut target, round_ties_away_i32x4(f32x4_mul(value, scale)));
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn quantize_dc_cfl_wasm(
+    input: &[f32],
+    y_quant: &[i16],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i16],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    let (input4, input_tail) = input.as_chunks::<4>();
+    let (y4, y_tail) = y_quant.as_chunks::<4>();
+    let (output4, output_tail) = output.as_chunks_mut::<4>();
+    let scale = f32x4_splat(scale);
+    let negative_cfl = f32x4_splat(-cfl);
+
+    for ((source, y), target) in input4.iter().zip(y4).zip(output4) {
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let y = unsafe { v128_load64_zero(y.as_ptr().cast()) };
+        let y = f32x4_convert_i32x4(i32x4_extend_low_i16x8(y));
+        let value = f32x4_add(f32x4_mul(value, scale), f32x4_mul(y, negative_cfl));
+        store_i16x4(target, round_ties_away_i32x4(value));
+    }
+
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let mut y = [0i16; 4];
+        y[..y_tail.len()].copy_from_slice(y_tail);
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let y = unsafe { v128_load64_zero(y.as_ptr().cast()) };
+        let y = f32x4_convert_i32x4(i32x4_extend_low_i16x8(y));
+        let value = f32x4_add(f32x4_mul(value, scale), f32x4_mul(y, negative_cfl));
+        let mut target = [0i16; 4];
+        store_i16x4(&mut target, round_ties_away_i32x4(value));
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
     }
 }

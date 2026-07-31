@@ -26,11 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
+use crate::entropy::{f_log2, pack_signed};
 use crate::image::{Image3F, ImageSB};
-use crate::util::FastRound;
+use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM_IN_BLOCKS: usize = 8;
@@ -120,7 +121,7 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) ->
     } else {
         x = 0.0;
     }
-    x.fast_round().clamp(-128.0, 127.0) as i32
+    x.round().clamp(-128.0, 127.0) as i32
 }
 
 struct CflScratch {
@@ -267,6 +268,326 @@ pub(crate) fn y_to_b_ratio(cmap_b: i8) -> f32 {
     fmla(cmap_b as f32, K_INV_COLOR_FACTOR, 1.0)
 }
 
+pub(crate) const K_COLOR_FACTOR: f32 = 84.0;
+const YTOB_DC_LIMIT: i32 = 127;
+const COLOR_CORRELATION_HEADER_BITS: f64 = 2.0 + 16.0 + 16.0 + 8.0 + 8.0;
+
+#[inline]
+fn grad_predict(n: i32, w: i32, nw: i32) -> i32 {
+    (n + w - nw).clamp(n.min(w), n.max(w))
+}
+
+#[inline]
+fn add_ytob_token(residual: i32, hist: &mut [u64; 64], extra_bits: &mut u64) {
+    let (tok, nbits, _) = crate::entropy::uint_encode(pack_signed(residual));
+    hist[(tok as usize).min(hist.len() - 1)] += 1;
+    *extra_bits += nbits as u64;
+}
+
+pub(crate) type FillYtobRowFn = fn(&mut [i32], &[i16], &[i16], f32);
+
+#[inline(always)]
+#[allow(dead_code)]
+pub(crate) fn fill_ytob_row_scalar(dst: &mut [i32], b: &[i16], y: &[i16], slope: f32) {
+    for ((dst, &b), &y) in dst.iter_mut().zip(b).zip(y) {
+        let adj = (slope * y as f32).round_ties_even() as i32;
+        *dst = b as i32 - adj;
+    }
+}
+
+pub(crate) fn selected_fill_ytob_row_fn() -> FillYtobRowFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |dst, b, y, slope| unsafe {
+            crate::neon::fill_ytob_row_neon(dst, b, y, slope);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |dst, b, y, slope| unsafe {
+            crate::avx::fill_ytob_row_avx2(dst, b, y, slope);
+        };
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::fill_ytob_row_wasm;
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    fill_ytob_row_scalar
+}
+
+fn ytob_dc_cost(
+    dc_datas: &[DcGroupData],
+    k: i32,
+    step: f32,
+    fill_ytob_row: FillYtobRowFn,
+    prev: &mut Vec<i32>,
+    cur: &mut Vec<i32>,
+) -> f64 {
+    let mut hist = [0u64; 64];
+    let mut total = 0u64;
+    let mut extra_bits = 0u64;
+    let slope = k as f32 * step;
+
+    for dc in dc_datas {
+        let b = dc.quant_dc.plane(2);
+        let y = dc.quant_dc.plane(1);
+        let (xsize, ysize) = (b.xsize(), b.ysize());
+        debug_assert_eq!((xsize, ysize), (y.xsize(), y.ysize()));
+        if xsize == 0 || ysize == 0 {
+            continue;
+        }
+
+        if prev.len() != xsize {
+            prev.resize(xsize, 0i32);
+        }
+        if cur.len() != xsize {
+            cur.resize(xsize, 0i32);
+        }
+
+        let mut rows = b
+            .as_slice()
+            .chunks_exact(xsize)
+            .zip(y.as_slice().chunks_exact(xsize));
+
+        // The top row predicts from its left neighbor only. Keeping it out of
+        // the main loop removes the row-boundary branches from every sample.
+        let (b_row, y_row) = rows.next().unwrap();
+        fill_ytob_row(cur, b_row, y_row, slope);
+        add_ytob_token(cur[0], &mut hist, &mut extra_bits);
+        for pair in cur.array_windows::<2>() {
+            add_ytob_token(pair[1] - pair[0], &mut hist, &mut extra_bits);
+        }
+        std::mem::swap(prev, cur);
+
+        for (b_row, y_row) in rows {
+            fill_ytob_row(cur, b_row, y_row, slope);
+            add_ytob_token(cur[0] - prev[0], &mut hist, &mut extra_bits);
+            for (current, above) in cur.array_windows::<2>().zip(prev.array_windows::<2>()) {
+                let prediction = grad_predict(above[1], current[0], above[0]);
+                add_ytob_token(current[1] - prediction, &mut hist, &mut extra_bits);
+            }
+            std::mem::swap(prev, cur);
+        }
+        total += (xsize * ysize) as u64;
+    }
+
+    if total == 0 {
+        return 0.0;
+    }
+
+    let inv = 1.0 / total as f64;
+    hist.iter()
+        .filter(|&&count| count != 0)
+        .fold(extra_bits as f64, |bits, &count| {
+            bits - count as f64 * f_log2(count as f64 * inv)
+        })
+}
+
+#[inline]
+fn add_ytob_weight(rb: i32, ry: i32, step: f32, weights: &mut [u64]) {
+    if ry == 0 {
+        return;
+    }
+
+    let k = (rb as f32 / (ry as f32 * step)).round_ties_even() as i32;
+    let idx = k.clamp(-YTOB_DC_LIMIT, YTOB_DC_LIMIT) + YTOB_DC_LIMIT;
+    weights[idx as usize] += ry.unsigned_abs() as u64;
+}
+
+pub(crate) type AccumulateYtobWeightsFn = fn(&[i32], &[i32], f32, &mut [u64]);
+
+#[allow(dead_code)]
+pub(crate) fn accumulate_ytob_weights_scalar(
+    rb: &[i32],
+    ry: &[i32],
+    step: f32,
+    weights: &mut [u64],
+) {
+    for (&rb, &ry) in rb.iter().zip(ry) {
+        add_ytob_weight(rb, ry, step, weights);
+    }
+}
+
+pub(crate) fn selected_accumulate_ytob_weights_fn() -> AccumulateYtobWeightsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |rb, ry, step, weights| unsafe {
+            crate::neon::accumulate_ytob_weights_neon(rb, ry, step, weights);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |rb, ry, step, weights| unsafe {
+            crate::avx::accumulate_ytob_weights_avx2(rb, ry, step, weights);
+        };
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    accumulate_ytob_weights_scalar
+}
+
+pub(crate) type FillYtobResidualsFn = fn(&mut [i32], &mut [i32], &[i16], &[i16], &[i16], &[i16]);
+
+#[inline]
+fn fill_ytob_residuals_plane_scalar(dst: &mut [i32], row: &[i16], up: &[i16]) {
+    let Some((dst_first, dst_rest)) = dst.split_first_mut() else {
+        return;
+    };
+    let (&row_first, _) = row.split_first().unwrap();
+    let (&up_first, _) = up.split_first().unwrap();
+    *dst_first = row_first as i32 - up_first as i32;
+
+    for ((dst, row), above) in dst_rest
+        .iter_mut()
+        .zip(row.array_windows::<2>())
+        .zip(up.array_windows::<2>())
+    {
+        *dst = row[1] as i32 - grad_predict(above[1] as i32, row[0] as i32, above[0] as i32);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn fill_ytob_residuals_scalar(
+    rb: &mut [i32],
+    ry: &mut [i32],
+    b_row: &[i16],
+    y_row: &[i16],
+    b_up: &[i16],
+    y_up: &[i16],
+) {
+    let len = rb
+        .len()
+        .min(ry.len())
+        .min(b_row.len())
+        .min(y_row.len())
+        .min(b_up.len())
+        .min(y_up.len());
+    if len == 0 {
+        return;
+    }
+
+    fill_ytob_residuals_plane_scalar(&mut rb[..len], &b_row[..len], &b_up[..len]);
+    fill_ytob_residuals_plane_scalar(&mut ry[..len], &y_row[..len], &y_up[..len]);
+}
+
+pub(crate) fn selected_fill_ytob_residuals_fn() -> FillYtobResidualsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |rb, ry, b_row, y_row, b_up, y_up| unsafe {
+            crate::neon::fill_ytob_residuals_neon(rb, ry, b_row, y_row, b_up, y_up);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |rb, ry, b_row, y_row, b_up, y_up| unsafe {
+            crate::avx::fill_ytob_residuals_avx2(rb, ry, b_row, y_row, b_up, y_up);
+        };
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::fill_ytob_residuals_wasm;
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    fill_ytob_residuals_scalar
+}
+
+pub(crate) fn choose_ytob_dc(
+    dc_datas: &[DcGroupData],
+    fill_ytob_row: FillYtobRowFn,
+    accumulate_weights: AccumulateYtobWeightsFn,
+    fill_residuals: FillYtobResidualsFn,
+    rb_scratch: &mut Vec<i32>,
+    ry_scratch: &mut Vec<i32>,
+) -> i32 {
+    // One signaled step moves the stored B DC by this much per stored Y unit:
+    // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
+    // stored in different units, hence the same `DC_QUANT[1] / DC_QUANT[2]`
+    // ratio `enc_group` applies for the `base_correlation_b` term.
+    let step = (INV_DC_QUANT[2] * DC_QUANT[1]) / K_COLOR_FACTOR;
+
+    // L1 fit: weighted median of the per-sample ratio, bucketed straight into
+    // signaled-slope units so no sort is needed.
+    let mut weights = [0u64; (2 * YTOB_DC_LIMIT + 1) as usize];
+    for dc in dc_datas {
+        let (b, y) = (dc.quant_dc.plane(2), dc.quant_dc.plane(1));
+        let (xsize, ysize) = (b.xsize(), b.ysize());
+        debug_assert_eq!((xsize, ysize), (y.xsize(), y.ysize()));
+        if xsize == 0 || ysize == 0 {
+            continue;
+        }
+        if rb_scratch.len() != xsize {
+            rb_scratch.resize(xsize, 0);
+        }
+        if ry_scratch.len() != xsize {
+            ry_scratch.resize(xsize, 0);
+        }
+        let rb = &mut rb_scratch[..xsize];
+        let ry = &mut ry_scratch[..xsize];
+
+        let mut rows = b
+            .as_slice()
+            .chunks_exact(xsize)
+            .zip(y.as_slice().chunks_exact(xsize));
+        let (mut b_up, mut y_up) = rows.next().unwrap();
+
+        // On the top row the clamped-gradient predictor is simply the value
+        // to the left. Track it directly instead of branching on every x.
+        rb[0] = b_up[0] as i32;
+        ry[0] = y_up[0] as i32;
+        for (((rb, ry), b), y) in rb[1..]
+            .iter_mut()
+            .zip(&mut ry[1..])
+            .zip(b_up.array_windows::<2>())
+            .zip(y_up.array_windows::<2>())
+        {
+            *rb = b[1] as i32 - b[0] as i32;
+            *ry = y[1] as i32 - y[0] as i32;
+        }
+        accumulate_weights(rb, ry, step, &mut weights);
+
+        for (b_row, y_row) in rows {
+            fill_residuals(rb, ry, b_row, y_row, b_up, y_up);
+            accumulate_weights(rb, ry, step, &mut weights);
+
+            (b_up, y_up) = (b_row, y_row);
+        }
+    }
+
+    let half = weights.iter().sum::<u64>() / 2;
+    let mut acc = 0u64;
+    let seed = weights
+        .iter()
+        .position(|&weight| {
+            acc += weight;
+            acc > half
+        })
+        .map_or(0, |idx| idx as i32 - YTOB_DC_LIMIT);
+
+    // Refine over a window around the fit; 0 is always a candidate so the
+    // search can decline.
+    const WINDOW: i32 = 6;
+    let base_cost = ytob_dc_cost(dc_datas, 0, step, fill_ytob_row, ry_scratch, rb_scratch);
+    let mut best = (base_cost - COLOR_CORRELATION_HEADER_BITS, 0i32);
+    let candidates = (seed - WINDOW).max(-YTOB_DC_LIMIT)..=(seed + WINDOW).min(YTOB_DC_LIMIT);
+    for k in candidates.filter(|&k| k != 0) {
+        let cost = ytob_dc_cost(dc_datas, k, step, fill_ytob_row, ry_scratch, rb_scratch);
+        if cost < best.0 {
+            best = (cost, k);
+        }
+    }
+    best.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +705,86 @@ mod tests {
             ytox_hq < ytox_lq,
             "deadzone should shrink the HQ slope: hq={ytox_hq} lq={ytox_lq}"
         );
+    }
+
+    fn dc_group_with_residual_correlation(slope: f32) -> DcGroupData {
+        let (w, h) = (48usize, 48usize);
+        let mut dc = DcGroupData::new(w, h);
+        let mut state = 12345u32;
+        for y in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let yv = ((state >> 16) as i32 % 2000) - 1000;
+                dc.quant_dc.plane_row_mut(1, y)[x] = yv as i16;
+                dc.quant_dc.plane_row_mut(2, y)[x] = (slope * yv as f32).round_ties_even() as i16;
+            }
+        }
+        dc
+    }
+
+    #[test]
+    fn ytob_dc_recovers_a_planted_dc_correlation() {
+        let step = (INV_DC_QUANT[2] * DC_QUANT[1]) / K_COLOR_FACTOR;
+        for k in [-9i32, -4, 5, 11] {
+            let groups = [dc_group_with_residual_correlation(k as f32 * step)];
+            // The planted slope is exactly representable, so the search must
+            // land on it rather than merely near it.
+            let mut s0 = Vec::new();
+            let mut s1 = Vec::new();
+            assert_eq!(
+                choose_ytob_dc(
+                    &groups,
+                    selected_fill_ytob_row_fn(),
+                    selected_accumulate_ytob_weights_fn(),
+                    selected_fill_ytob_residuals_fn(),
+                    &mut s0,
+                    &mut s1,
+                ),
+                k,
+                "planted ytob_dc {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn ytob_dc_declines_when_there_is_nothing_to_gain() {
+        // No residual correlation: the explicit ColorCorrelationParams bundle
+        // would cost header bits for nothing, so the search must return 0 and
+        // leave the frame on the all-default bit.
+        let groups = [dc_group_with_residual_correlation(0.0)];
+        let mut s0 = Vec::new();
+        let mut s1 = Vec::new();
+        assert_eq!(
+            choose_ytob_dc(
+                &groups,
+                selected_fill_ytob_row_fn(),
+                selected_accumulate_ytob_weights_fn(),
+                selected_fill_ytob_residuals_fn(),
+                &mut s0,
+                &mut s1,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn ytob_dc_stays_in_the_signalled_u8_range() {
+        // A correlation far steeper than the grid can express must still
+        // produce a value `write_dc_global` can bias into a u8.
+        for slope in [-4.0f32, 4.0] {
+            let groups = [dc_group_with_residual_correlation(slope)];
+            let mut s0 = Vec::new();
+            let mut s1 = Vec::new();
+            let k = choose_ytob_dc(
+                &groups,
+                selected_fill_ytob_row_fn(),
+                selected_accumulate_ytob_weights_fn(),
+                selected_fill_ytob_residuals_fn(),
+                &mut s0,
+                &mut s1,
+            );
+            assert!((-YTOB_DC_LIMIT..=YTOB_DC_LIMIT).contains(&k), "ytob_dc {k}");
+            assert!((0..=255).contains(&(k + 128)));
+        }
     }
 }

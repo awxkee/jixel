@@ -30,7 +30,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::dct::fmla;
 use crate::image::Image3F;
 use crate::thread_pool::ThreadPool;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 pub(crate) const M00: f32 = 0.30;
 pub(crate) const M02: f32 = 0.078;
@@ -73,7 +73,7 @@ fn cbrtf(x: f32) -> f32 {
 
 #[allow(unused)]
 #[inline(always)]
-fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub(crate) fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let mixed0 = fmla(M00, r, fmla(M01, g, fmla(M02, b, OPSIN_BIAS)));
     let mixed1 = fmla(M10, r, fmla(M11, g, fmla(M12, b, OPSIN_BIAS)));
     let mixed2 = fmla(M20, r, fmla(M21, g, fmla(M22, b, OPSIN_BIAS)));
@@ -85,7 +85,7 @@ fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
 }
 
-pub(crate) type ToXybBandFn = unsafe fn([&mut [f32]; 3], usize);
+pub(crate) type ToXybBandFn = unsafe fn([&[f32]; 3], [&mut [f32]; 3], usize);
 
 fn select_to_xyb_band_fn() -> ToXybBandFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -113,10 +113,18 @@ fn select_to_xyb_band_fn() -> ToXybBandFn {
     all(target_arch = "aarch64", feature = "neon"),
     all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
 )))]
-fn to_xyb_f32_band(band: [&mut [f32]; 3], _w: usize) {
-    let [rp, gp, bp] = band;
-    for ((r, g), b) in rp.iter_mut().zip(gp.iter_mut()).zip(bp.iter_mut()) {
-        (*r, *g, *b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
+fn to_xyb_f32_band(input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
+    let [rp, gp, bp] = input;
+    let [xp, yp, out_bp] = output;
+    for (((((r, g), b), x), y), out_b) in rp
+        .iter()
+        .zip(gp.iter())
+        .zip(bp.iter())
+        .zip(xp.iter_mut())
+        .zip(yp.iter_mut())
+        .zip(out_bp.iter_mut())
+    {
+        (*x, *y, *out_b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
     }
 }
 
@@ -127,29 +135,436 @@ pub(crate) fn selected_to_xyb_band_fn() -> ToXybBandFn {
     *TO_XYB_BAND_FN.get_or_init(select_to_xyb_band_fn)
 }
 
-/// Convert linear RGB (planes 0/1/2) to XYB in place, row-bands in parallel,
-/// using an already-resolved SIMD/scalar band function.
 pub(crate) fn to_xyb_with_fn(
     f: ToXybBandFn,
-    image: &mut Image3F,
+    linear: &Image3F,
+    xyb: &mut Image3F,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) {
-    let w = image.xsize();
-    let run = |mut band: [&mut [f32]; 3]| {
-        let [r, g, b] = &mut band;
-        unsafe { f([r, g, b], w) };
-    };
-    let bands = image.row_bands_mut(pool.num_threads());
-    if bands.len() <= 1 {
-        bands.into_iter().for_each(run);
-    } else {
-        let bands: Vec<_> = bands
-            .into_iter()
-            .map(|band| Mutex::new(Some(band)))
-            .collect();
-        pool.steal_map(scratch, bands.len(), |i, _scratch| {
-            run(bands[i].lock().unwrap().take().unwrap());
-        });
+    debug_assert_eq!(linear.xsize(), xyb.xsize());
+    debug_assert_eq!(linear.ysize(), xyb.ysize());
+
+    let w = linear.xsize();
+    let input = [
+        linear.plane_data(0),
+        linear.plane_data(1),
+        linear.plane_data(2),
+    ];
+    let mut offset = 0;
+    let mut jobs: Vec<_> = xyb
+        .row_bands_mut(pool.num_threads())
+        .into_iter()
+        .map(|output| {
+            let end = offset + output[0].len();
+            let input = [
+                &input[0][offset..end],
+                &input[1][offset..end],
+                &input[2][offset..end],
+            ];
+            offset = end;
+            Some((input, output))
+        })
+        .collect();
+
+    pool.steal_for_each_mut(scratch, &mut jobs, |_i, job, _scratch| {
+        let (input, output) = job.take().unwrap();
+        unsafe { f(input, output, w) };
+    });
+}
+
+pub(crate) type QuantizeXybChannelsFn = unsafe fn([&[f32]; 3], [&mut [i32]; 3], [f32; 3]);
+
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+)))]
+fn quantize_xyb_channels_scalar(input: [&[f32]; 3], output: [&mut [i32]; 3], scales: [f32; 3]) {
+    let [src_x, src_y, src_b] = input;
+    let [dst_y, dst_x, dst_b] = output;
+    let [scale_x, scale_y, scale_b] = scales;
+    let src = src_x.iter().zip(src_y).zip(src_b);
+    let dst = dst_y.iter_mut().zip(dst_x).zip(dst_b);
+    for (((x, y), b), ((out_y, out_x), out_b)) in src.zip(dst) {
+        let yq = (*y * scale_y).round() as i32;
+        *out_y = yq;
+        *out_x = (*x * scale_x).round() as i32;
+        *out_b = (*b * scale_b).round() as i32 - yq;
+    }
+}
+
+fn select_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") {
+        return crate::avx::quantize_xyb_channels_avx2;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::quantize_xyb_channels_sse41;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return crate::neon::quantize_xyb_channels_neon;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::quantize_xyb_channels_wasm;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    quantize_xyb_channels_scalar
+}
+
+static QUANTIZE_XYB_CHANNELS_FN: OnceLock<QuantizeXybChannelsFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
+    *QUANTIZE_XYB_CHANNELS_FN.get_or_init(select_quantize_xyb_channels_fn)
+}
+
+/// XYB samples quantized onto the fixed modular-XYB integer lattice.
+pub(crate) fn quantize_xyb_channels(atlas: &Image3F, lattice_scale: u32) -> [Vec<i32>; 3] {
+    use crate::quant_weights::INV_DC_QUANT;
+    let n = atlas.xsize() * atlas.ysize();
+    let input = [
+        &atlas.plane_data(0)[..n],
+        &atlas.plane_data(1)[..n],
+        &atlas.plane_data(2)[..n],
+    ];
+    let mut output = [vec![0; n], vec![0; n], vec![0; n]];
+    let [dst_y, dst_x, dst_b] = &mut output;
+    let m = lattice_scale as f32;
+    let scales = [
+        INV_DC_QUANT[0] * m,
+        INV_DC_QUANT[1] * m,
+        INV_DC_QUANT[2] * m,
+    ];
+    unsafe {
+        selected_quantize_xyb_channels_fn()(input, [dst_y, dst_x, dst_b], scales);
+    }
+    output
+}
+
+pub(crate) type QuantizeXybTileColorsFn = unsafe fn([&[f32]; 3], &mut [[i32; 3]], [f32; 3]);
+
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+)))]
+fn quantize_xyb_tile_colors_scalar(input: [&[f32]; 3], output: &mut [[i32; 3]], scales: [f32; 3]) {
+    let [src_x, src_y, src_b] = input;
+    let [scale_x, scale_y, scale_b] = scales;
+    let src = src_x.iter().zip(src_y).zip(src_b);
+    for (((x, y), b), out) in src.zip(output) {
+        *out = [
+            (*y * scale_y).round() as i32,
+            (*x * scale_x).round() as i32,
+            (*b * scale_b).round() as i32,
+        ];
+    }
+}
+
+fn select_quantize_xyb_tile_colors_fn() -> QuantizeXybTileColorsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") {
+        return crate::avx::quantize_xyb_tile_colors_avx2;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::quantize_xyb_tile_colors_sse41;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return crate::neon::quantize_xyb_tile_colors_neon;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::quantize_xyb_tile_colors_wasm;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    quantize_xyb_tile_colors_scalar
+}
+
+static QUANTIZE_XYB_TILE_COLORS_FN: OnceLock<QuantizeXybTileColorsFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_quantize_xyb_tile_colors_fn() -> QuantizeXybTileColorsFn {
+    *QUANTIZE_XYB_TILE_COLORS_FN.get_or_init(select_quantize_xyb_tile_colors_fn)
+}
+
+pub(crate) fn quantize_xyb_tile_colors(
+    xyb: &Image3F,
+    x0: usize,
+    y0: usize,
+    lattice_scale: u32,
+    output: &mut [[i32; 3]; crate::patches::PATCH_TILE * crate::patches::PATCH_TILE],
+) {
+    use crate::patches::PATCH_TILE;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    let m = lattice_scale as f32;
+    let scales = [
+        INV_DC_QUANT[0] * m,
+        INV_DC_QUANT[1] * m,
+        INV_DC_QUANT[2] * m,
+    ];
+    let quantize = selected_quantize_xyb_tile_colors_fn();
+    for (dy, out_row) in output
+        .as_chunks_mut::<PATCH_TILE>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let input = [
+            &xyb.plane_row(0, y0 + dy)[x0..x0 + PATCH_TILE],
+            &xyb.plane_row(1, y0 + dy)[x0..x0 + PATCH_TILE],
+            &xyb.plane_row(2, y0 + dy)[x0..x0 + PATCH_TILE],
+        ];
+        unsafe { quantize(input, out_row, scales) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe fn scalar_band(input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
+        let [r, g, b] = input;
+        let [x, y, out_b] = output;
+        for i in 0..r.len() {
+            (x[i], y[i], out_b[i]) = rgb_to_xyb_pixel_f32(r[i], g[i], b[i]);
+        }
+    }
+
+    #[test]
+    fn out_of_place_conversion_preserves_linear_input() {
+        let mut linear = Image3F::new(3, 2);
+        for i in 0..6 {
+            linear.plane_row_mut(0, i / 3)[i % 3] = i as f32 / 7.0;
+            linear.plane_row_mut(1, i / 3)[i % 3] = (i + 1) as f32 / 8.0;
+            linear.plane_row_mut(2, i / 3)[i % 3] = (i + 2) as f32 / 9.0;
+        }
+        let mut xyb = Image3F::new(3, 2);
+        let pool = ThreadPool::new(2);
+        let mut scratch = CoderScratch::default();
+
+        to_xyb_with_fn(scalar_band, &linear, &mut xyb, &pool, &mut scratch);
+
+        for i in 0..6 {
+            assert_eq!(linear.plane_data(0)[i], i as f32 / 7.0);
+            assert_eq!(linear.plane_data(1)[i], (i + 1) as f32 / 8.0);
+            assert_eq!(linear.plane_data(2)[i], (i + 2) as f32 / 9.0);
+            let (x, y, b) = rgb_to_xyb_pixel_f32(
+                linear.plane_data(0)[i],
+                linear.plane_data(1)[i],
+                linear.plane_data(2)[i],
+            );
+            assert_eq!(xyb.plane_data(0)[i], x);
+            assert_eq!(xyb.plane_data(1)[i], y);
+            assert_eq!(xyb.plane_data(2)[i], b);
+        }
+    }
+
+    fn check_xyb_quantizer(f: QuantizeXybChannelsFn) {
+        let values = [
+            -8_388_609.0,
+            -3.5,
+            -2.5,
+            -1.5,
+            -0.51,
+            -0.5,
+            -0.49,
+            -0.0,
+            0.0,
+            0.49,
+            0.5,
+            0.51,
+            1.5,
+            2.5,
+            3.5,
+            7.25,
+            8_388_609.0,
+        ];
+        let src_x = values;
+        let src_y = values.map(|v| v * 0.5);
+        let src_b = values.map(|v| v * -0.25);
+        let mut dst_y = [0; 17];
+        let mut dst_x = [0; 17];
+        let mut dst_b = [0; 17];
+
+        unsafe {
+            f(
+                [&src_x, &src_y, &src_b],
+                [&mut dst_y, &mut dst_x, &mut dst_b],
+                [1.0, 1.0, 1.0],
+            );
+        }
+
+        for i in 0..values.len() {
+            let yq = src_y[i].round() as i32;
+            assert_eq!(dst_y[i], yq, "Y lane {i}");
+            assert_eq!(dst_x[i], src_x[i].round() as i32, "X lane {i}");
+            assert_eq!(dst_b[i], src_b[i].round() as i32 - yq, "B-Y lane {i}");
+        }
+
+        let special_x = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2_147_483_648.0,
+            -2_147_483_904.0,
+            2_147_483_520.0,
+            -2_147_483_648.0,
+            123.5,
+        ];
+        let zero = [0.0; 8];
+        let mut special_yq = [1; 8];
+        let mut special_xq = [1; 8];
+        let mut special_bq = [1; 8];
+        unsafe {
+            f(
+                [&special_x, &zero, &zero],
+                [&mut special_yq, &mut special_xq, &mut special_bq],
+                [1.0, 1.0, 1.0],
+            );
+        }
+        for i in 0..special_x.len() {
+            assert_eq!(special_yq[i], 0, "special Y lane {i}");
+            assert_eq!(
+                special_xq[i],
+                special_x[i].round() as i32,
+                "special X lane {i}"
+            );
+            assert_eq!(special_bq[i], 0, "special B-Y lane {i}");
+        }
+
+        let tail_x = [10.5, 11.5, 12.5, 13.5, 14.5, 15.5, 16.5];
+        let tail_y = [20.5, 21.5, 22.5, 23.5, 24.5, 25.5, 26.5];
+        let tail_b = [30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5];
+        for len in 1..8 {
+            let mut tail_yq = [i32::MIN; 7];
+            let mut tail_xq = [i32::MIN; 7];
+            let mut tail_bq = [i32::MIN; 7];
+            unsafe {
+                f(
+                    [&tail_x[..len], &tail_y[..len], &tail_b[..len]],
+                    [
+                        &mut tail_yq[..len],
+                        &mut tail_xq[..len],
+                        &mut tail_bq[..len],
+                    ],
+                    [1.0; 3],
+                )
+            };
+            for i in 0..len {
+                let yq = tail_y[i].round() as i32;
+                assert_eq!(tail_yq[i], yq, "tail Y lane {i} of {len}");
+                assert_eq!(
+                    tail_xq[i],
+                    tail_x[i].round() as i32,
+                    "tail X lane {i} of {len}"
+                );
+                assert_eq!(
+                    tail_bq[i],
+                    tail_b[i].round() as i32 - yq,
+                    "tail B-Y lane {i} of {len}"
+                );
+            }
+            assert!(tail_yq[len..].iter().all(|&v| v == i32::MIN));
+            assert!(tail_xq[len..].iter().all(|&v| v == i32::MIN));
+            assert!(tail_bq[len..].iter().all(|&v| v == i32::MIN));
+        }
+    }
+
+    fn check_xyb_tile_color_quantizer(f: QuantizeXybTileColorsFn) {
+        let src_x = [
+            -3.5, -2.5, -1.5, -0.51, -0.5, -0.49, -0.0, 0.0, 0.49, 0.5, 0.51, 1.5, 2.5, 3.5, 7.25,
+            11.75, 19.5,
+        ];
+        let src_y = src_x.map(|v| v * 0.25);
+        let src_b = src_x.map(|v| v * -0.75);
+        let scales = [1.5, 2.0, 0.5];
+        let mut output = [[0; 3]; 17];
+
+        unsafe { f([&src_x, &src_y, &src_b], &mut output, scales) };
+
+        for i in 0..src_x.len() {
+            assert_eq!(
+                output[i],
+                [
+                    (src_y[i] * scales[1]).round() as i32,
+                    (src_x[i] * scales[0]).round() as i32,
+                    (src_b[i] * scales[2]).round() as i32,
+                ],
+                "tile-color lane {i}"
+            );
+        }
+
+        let tagged_x = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0];
+        let tagged_y = [200.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0];
+        let tagged_b = [300.0, 301.0, 302.0, 303.0, 304.0, 305.0, 306.0, 307.0];
+        let mut tagged_output = [[0; 3]; 8];
+        unsafe {
+            f(
+                [&tagged_x, &tagged_y, &tagged_b],
+                &mut tagged_output,
+                [1.0; 3],
+            )
+        };
+        for i in 0..tagged_output.len() {
+            assert_eq!(
+                tagged_output[i],
+                [tagged_y[i] as i32, tagged_x[i] as i32, tagged_b[i] as i32],
+                "tagged tile-color lane {i}"
+            );
+        }
+
+        for len in 1..8 {
+            let mut tail_output = [[i32::MIN; 3]; 7];
+            unsafe {
+                f(
+                    [&src_x[..len], &src_y[..len], &src_b[..len]],
+                    &mut tail_output[..len],
+                    scales,
+                )
+            };
+            for i in 0..len {
+                assert_eq!(
+                    tail_output[i],
+                    [
+                        (src_y[i] * scales[1]).round() as i32,
+                        (src_x[i] * scales[0]).round() as i32,
+                        (src_b[i] * scales[2]).round() as i32,
+                    ],
+                    "tail tile-color lane {i} of {len}"
+                );
+            }
+            assert!(
+                tail_output[len..]
+                    .iter()
+                    .all(|&pixel| pixel == [i32::MIN; 3])
+            );
+        }
+    }
+
+    #[test]
+    fn selected_xyb_quantizer_matches_round_ties_away() {
+        check_xyb_quantizer(selected_quantize_xyb_channels_fn());
+        check_xyb_tile_color_quantizer(selected_quantize_xyb_tile_colors_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_xyb_quantizer_matches_round_ties_away() {
+        if std::is_x86_feature_detected!("avx2") {
+            check_xyb_quantizer(crate::avx::quantize_xyb_channels_avx2);
+            check_xyb_tile_color_quantizer(crate::avx::quantize_xyb_tile_colors_avx2);
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_xyb_quantizer_matches_round_ties_away() {
+        if std::is_x86_feature_detected!("sse4.1") {
+            check_xyb_quantizer(crate::sse::quantize_xyb_channels_sse41);
+            check_xyb_tile_color_quantizer(crate::sse::quantize_xyb_tile_colors_sse41);
+        }
     }
 }

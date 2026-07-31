@@ -120,33 +120,6 @@ impl AcStrategyImage {
         LUT[strategy as usize] as usize
     }
 
-    /// Mark (x, y) as the first block of a multi-block transform with the
-    /// given `strategy`. Fills covered cells with non-first markers.
-    pub(crate) fn set_first(&mut self, x: usize, y: usize, strategy: u8) {
-        let cx = Self::covered_blocks_x_of(strategy);
-        let cy = Self::covered_blocks_y_of(strategy);
-        assert!(
-            x + cx <= self.xsize && y + cy <= self.ysize,
-            "transform out of bounds: ({x},{y}) +{cx}x{cy} on {}x{}",
-            self.xsize,
-            self.ysize
-        );
-        self.cells[y * self.xsize + x] = (strategy << 1) | FIRST_BLOCK_BIT;
-        let v = strategy << 1;
-
-        let mut rows = self.cells.chunks_exact_mut(self.xsize).skip(y).take(cy);
-
-        if let Some(row) = rows.next() {
-            row[x + 1..x + cx].fill(v);
-        }
-
-        for row in rows {
-            row[x..x + cx].fill(v);
-        }
-    }
-
-    /// True if a multi-block transform of `strategy` can be placed at (x, y).
-    /// Checks image bounds and 32-block AC-group boundaries.
     pub(crate) fn can_place_strategy(&self, x: usize, y: usize, strategy: u8) -> bool {
         let cx = Self::covered_blocks_x_of(strategy);
         let cy = Self::covered_blocks_y_of(strategy);
@@ -175,6 +148,32 @@ impl AcStrategyImage {
         true
     }
 
+    /// Mark (x, y) as the first block of a multi-block transform with the
+    /// given `strategy`. Fills covered cells with non-first markers.
+    pub(crate) fn set_first(&mut self, x: usize, y: usize, strategy: u8) {
+        let cx = Self::covered_blocks_x_of(strategy);
+        let cy = Self::covered_blocks_y_of(strategy);
+        assert!(
+            x + cx <= self.xsize && y + cy <= self.ysize,
+            "transform out of bounds: ({x},{y}) +{cx}x{cy} on {}x{}",
+            self.xsize,
+            self.ysize
+        );
+        self.cells[y * self.xsize + x] = (strategy << 1) | FIRST_BLOCK_BIT;
+        let v = strategy << 1;
+
+        let mut rows = self.cells.chunks_exact_mut(self.xsize).skip(y).take(cy);
+
+        if let Some(row) = rows.next() {
+            row[x + 1..x + cx].fill(v);
+        }
+
+        for row in rows {
+            row[x..x + cx].fill(v);
+        }
+    }
+
+    /// True if a multi-block transform of `strategy` can be placed at (x, y).
     /// Iterate first blocks in raster order, yielding (x, y, raw_strategy).
     pub(crate) fn iter_first_blocks(&self) -> impl Iterator<Item = (usize, usize, u8)> + '_ {
         let xs = self.xsize;

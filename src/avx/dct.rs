@@ -225,7 +225,7 @@ pub(crate) fn dct8x16_avx2(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) 
     c[8..16].copy_from_slice(&rows_hi);
 
     dct1d_16_flat(&mut c);
-    let mut cl: [__m256; 8] = c[0..8].try_into().unwrap();
+    let mut cl: [__m256; 8] = c[..8].try_into().unwrap();
     let mut cr: [__m256; 8] = c[8..16].try_into().unwrap();
     transpose_8x8(&mut cl);
     transpose_8x8(&mut cr);

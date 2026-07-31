@@ -128,8 +128,9 @@ fn recon_quantize_neon(
             let denominator = vmulq_f32(inv_v, scale);
             let scaled = vmulq_f32(denominator, coeff_v);
             let keep = vcgeq_f32(vabsq_f32(scaled), threshold);
+            // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
             let quantized =
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndnq_f32(scaled)), keep));
+                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
             let error = vdivq_f32(vsubq_f32(scaled, quantized), denominator);
             let active = if y < cy && x < cx {
                 vcgeq_u32(
@@ -258,9 +259,9 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
                 for x in [0usize, 4] {
                     let o = vsubq_f32(unsafe { vld1q_f32(orig_row[x0 + x..].as_ptr()) }, mean_ov);
                     let r = vsubq_f32(unsafe { vld1q_f32(recon_row[x0 + x..].as_ptr()) }, mean_rv);
-                    var_o = vaddq_f32(var_o, vmulq_f32(o, o));
-                    var_r = vaddq_f32(var_r, vmulq_f32(r, r));
-                    cov = vaddq_f32(cov, vmulq_f32(o, r));
+                    var_o = vfmaq_f32(var_o, o, o);
+                    var_r = vfmaq_f32(var_r, r, r);
+                    cov = vfmaq_f32(cov, o, r);
                 }
             }
             let vo = vaddvq_f32(var_o) * INV_64;

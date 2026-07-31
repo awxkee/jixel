@@ -88,7 +88,8 @@ pub(crate) fn sse_and_rate_neon(
             let absa = vabsq_f32(a);
 
             let keep = vcgeq_f32(absa, thrv);
-            let rounded = vrndnq_f32(a);
+            // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
+            let rounded = vrndaq_f32(a);
 
             let q = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rounded), keep));
 
@@ -126,6 +127,31 @@ pub(crate) fn sse_and_rate_neon(
         vaddvq_u32(nz_acc) as usize,
         vaddvq_f32(mag_acc),
     )
+}
+
+/// NEON counterpart of `enc_group::dequantized_level_f32`: the decoder's biased
+/// dequant of an integer-valued float level (0 -> 0, +-1 -> +-0.9299455,
+/// q -> q - 0.145/q). Dormant until the biased-distortion selection/rerank
+/// variants land with their margin re-fit (see `dequantized_level_f32`).
+#[allow(dead_code)]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn neon_dequantized_level_f32(q: float32x4_t) -> float32x4_t {
+    let absq = vabsq_f32(q);
+    // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
+    let big = vsubq_f32(
+        q,
+        vdivq_f32(vdupq_n_f32(crate::enc_group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let sign = vandq_u32(vreinterpretq_u32_f32(q), vdupq_n_u32(0x8000_0000));
+    let one = vreinterpretq_f32_u32(vorrq_u32(
+        sign,
+        vreinterpretq_u32_f32(vdupq_n_f32(crate::enc_group::DEFAULT_QUANT_BIAS_1)),
+    ));
+    let use_big = vcgeq_f32(absq, vdupq_n_f32(1.125));
+    let dq = vbslq_f32(use_big, big, one);
+    let nz = vcgtq_f32(absq, vdupq_n_f32(0.0));
+    vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(dq), nz))
 }
 
 #[inline]
@@ -198,11 +224,7 @@ mod tests {
                 let i = y * w + x;
                 let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
                 let a = inv[i] * qs * coeff[i];
-                let q = if a.abs() >= threshold {
-                    a.round_ties_even()
-                } else {
-                    0.0
-                };
+                let q = if a.abs() >= threshold { a.round() } else { 0.0 };
                 let d = a - q;
                 sse += d * d;
                 if q != 0.0 {
