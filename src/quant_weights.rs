@@ -113,7 +113,6 @@ const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
 const QM_SS2_SCALE16X32: f32 = 1.20;
 
-
 /// Default bands with the base (band 0) scaled, F16-round-tripped exactly like
 /// a parsed override so encoder and decoder agree bit-exactly.
 fn scaled_override<const N: usize>(defaults: &[[f32; N]; 3], scale: f32) -> BandOverride {
@@ -952,7 +951,6 @@ static DCT4X8_BANDS: [[f32; 4]; 3] = [
         -1.5843722511996204,
     ],
 ];
-
 
 /// libjxl interpolation between band weights. The two surrounding band values
 /// `a`, `b` are interpolated geometrically (exponential) using the fractional

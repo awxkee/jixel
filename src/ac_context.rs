@@ -401,7 +401,6 @@ mod tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Per-image block-context planning
 // ---------------------------------------------------------------------------
@@ -580,10 +579,13 @@ where
         .map(|b| vec![b * 2, b * 2 + 1])
         .collect();
     let mut group_cost: Vec<f64> = groups.iter().map(|g| stats.group_cost(g)).collect();
-    let splittable =
-        |g: &[u8]| g.len() == 2 && g[0].is_multiple_of(2) && g[1] == g[0] + 1;
+    let splittable = |g: &[u8]| g.len() == 2 && g[0].is_multiple_of(2) && g[1] == g[0] + 1;
     // Merge candidates may only combine unsplit groups.
-    let unsplit = |g: &[u8]| g.len().is_multiple_of(2) && g.chunks(2).all(|p| p[0].is_multiple_of(2) && p[1] == p[0] + 1);
+    let unsplit = |g: &[u8]| {
+        g.len().is_multiple_of(2)
+            && g.chunks(2)
+                .all(|p| p[0].is_multiple_of(2) && p[1] == p[0] + 1)
+    };
 
     let mut merges_used = [false; CHROMA_MERGE_CANDIDATES.len()];
     let mut any_split = false;
@@ -594,8 +596,7 @@ where
             if !splittable(g) {
                 continue;
             }
-            let gain =
-                group_cost[i] - stats.group_cost(&[g[0]]) - stats.group_cost(&[g[1]]);
+            let gain = group_cost[i] - stats.group_cost(&[g[0]]) - stats.group_cost(&[g[1]]);
             if gain > 0.0 && best.is_none_or(|(bg, _)| gain > bg) {
                 best = Some((gain, i));
             }
@@ -614,7 +615,9 @@ where
                 }
                 let pa = groups.iter().position(|g| g.contains(&(a * 2)));
                 let pb = groups.iter().position(|g| g.contains(&(b * 2)));
-                let (Some(pa), Some(pb)) = (pa, pb) else { continue };
+                let (Some(pa), Some(pb)) = (pa, pb) else {
+                    continue;
+                };
                 if pa == pb
                     || !unsplit(&groups[pa])
                     || !unsplit(&groups[pb])

@@ -156,7 +156,7 @@ fn quantize_dc_value_x8(input: __m256, scale: __m256) -> __m256i {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn quantize_dc_cfl_value_x8(
     input: __m256,
     y_quant: __m128i,
@@ -165,10 +165,7 @@ fn quantize_dc_cfl_value_x8(
 ) -> __m256i {
     let y = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(y_quant));
     let correction = _mm256_mul_ps(y, negative_cfl);
-    #[cfg(target_feature = "fma")]
     let value = _mm256_fmadd_ps(input, scale, correction);
-    #[cfg(not(target_feature = "fma"))]
-    let value = _mm256_add_ps(_mm256_mul_ps(input, scale), correction);
     round_ties_away_i32x8(value)
 }
 
@@ -194,7 +191,7 @@ pub(crate) fn quantize_dc_avx2(input: &[f32], scale: f32, output: &mut [i16]) {
     }
 }
 
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 pub(crate) fn quantize_dc_cfl_avx2(
     input: &[f32],
     y_quant: &[i16],

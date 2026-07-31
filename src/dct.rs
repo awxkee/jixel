@@ -127,7 +127,11 @@ impl<'a, const W: usize, const H: usize> DctInput<'a, W, H> {
             .checked_mul(stride)
             .and_then(|offset| offset.checked_add(W))
             .expect("DCT input dimensions overflow");
-        assert!(data.len() >= required_len, "DctInput {W}x{H} stride={stride} len={} need={required_len}", data.len());
+        assert!(
+            data.len() >= required_len,
+            "DctInput {W}x{H} stride={stride} len={} need={required_len}",
+            data.len()
+        );
         Self {
             data: &data[..required_len],
             stride,
@@ -1509,12 +1513,8 @@ pub(crate) fn dc_from_dct16x32(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
-
-
 
     use super::*;
 

@@ -37,8 +37,10 @@ use crate::dc_group_data::{
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
     STRATEGY_DCT32X32,
 };
-use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32,
-    dc_from_dct32x16, dc_from_dct32x32, fmla,};
+use crate::dct::{
+    DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32,
+    dc_from_dct32x16, dc_from_dct32x32, fmla,
+};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -393,7 +395,7 @@ fn select_quantize_dc_methods() -> QuantizeDcMethods {
 )))]
 fn select_quantize_dc_methods() -> QuantizeDcMethods {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") {
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         return QuantizeDcMethods {
             quantize: |input, scale, output| unsafe {
                 crate::avx::quantize_dc_avx2(input, scale, output)

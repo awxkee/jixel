@@ -567,8 +567,7 @@ pub(crate) fn apply_boost(
             let mut delta = 0f32;
             if vb_group_on {
                 let src = cell[sby * sb_cols + sbx];
-                delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only)
-                    as f32
+                delta += variance_boost_delta(src, ref_log, cfg.vb_strength, cfg.boost_only) as f32
                     - vb_mean;
             }
             if dark_on {

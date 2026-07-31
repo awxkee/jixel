@@ -597,7 +597,6 @@ fn recon_dist_and_rate_default(
     )
 }
 
-
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate_scalar(

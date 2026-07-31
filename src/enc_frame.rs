@@ -1682,11 +1682,11 @@ fn encode_frame_core(
     // entropy-code headers plus payload estimates because the Shannon proxy
     // reliably overestimates what clustering-aware coding realizes.
     let proposed = crate::ac_context::plan_block_ctx_map(
-            all_pending
-                .iter()
-                .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
-            qf_threshold,
-        );
+        all_pending
+            .iter()
+            .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
+        qf_threshold,
+    );
     let baseline = crate::ac_context::AcCtxPlan::baseline();
 
     let build_codes = |pending: &[PendingAcGroup],
@@ -1781,7 +1781,6 @@ fn encode_frame_core(
     };
 
     let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
-
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
     // group. Multi-pass uses the per-pass plain codes.
