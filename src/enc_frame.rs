@@ -1491,6 +1491,10 @@ fn encode_frame_core(
             all_pending.iter().map(|pg| pg.tokens[0].as_slice()),
             crate::ac_context::K_NUM_FINE_AC_CONTEXTS,
             &mut scratch.huffman_pool,
+            // No config selection here: these prices feed RDOQ, and even a
+            // one-token nudge can push the clustering off a knife-edge merge.
+            // Selection applies to the final codes only.
+            false,
         );
         let prices = crate::entropy::FrozenTokenPrices::new(&provisional_code);
         let dc_ref = &dc_datas;
@@ -1583,6 +1587,7 @@ fn encode_frame_core(
             .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
+        true,
     );
 
     // Arm B: a per-image learned tree over WP error and channel, with its own
@@ -1637,6 +1642,7 @@ fn encode_frame_core(
             .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
         learned.num_contexts,
         &mut scratch.huffman_pool,
+        true,
     );
 
     // Price both arms end to end: serialized tree + entropy-code header
@@ -1714,6 +1720,7 @@ fn encode_frame_core(
                     pending.iter().map(|p| p.tokens[pass].as_slice()),
                     num_contexts,
                     &mut scratch.huffman_pool,
+                    true,
                 )
             })
             .collect()
