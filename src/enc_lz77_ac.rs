@@ -282,8 +282,9 @@ where
         let mut bits = 0.0f64;
         for tokens in streams {
             for t in tokens {
-                let (sym, nbits, _) = uint_encode(t.value);
                 let cl = code.context_map[t.context as usize] as usize;
+                let (sym, nbits, _) =
+                    crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
                 bits += cost[cl][sym as usize] as f64 + nbits as f64;
             }
         }
@@ -292,8 +293,9 @@ where
     let mut bits: u64 = 0;
     for tokens in streams {
         for t in tokens {
-            let (sym, nbits, _) = uint_encode(t.value);
             let cl = code.context_map[t.context as usize] as usize;
+            let (sym, nbits, _) =
+                crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
             bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
         }
     }

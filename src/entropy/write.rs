@@ -188,6 +188,56 @@ pub(crate) fn select_hybrid_config(
     best
 }
 
+fn select_hybrid_config_ans(values: &[u32]) -> HybridUintConfig {
+    if values.is_empty() {
+        return HybridUintConfig::DEFAULT;
+    }
+    let stride = values.len().div_ceil(65_536).max(1);
+    let mut best = HybridUintConfig::DEFAULT;
+    let mut best_cost = f64::INFINITY;
+    let mut default_cost = f64::INFINITY;
+    for config in HYBRID_CANDIDATES {
+        let mut counts = [0u32; ALPHABET_SIZE];
+        let mut extra = 0u64;
+        let mut total = 0u64;
+        let mut valid = true;
+        for &value in values.iter().step_by(stride) {
+            let (sym, nbits, _) = uint_encode_with_config(value, config);
+            if sym as usize >= ALPHABET_SIZE {
+                valid = false;
+                break;
+            }
+            counts[sym as usize] += 1;
+            extra += nbits as u64;
+            total += 1;
+        }
+        if !valid || total == 0 {
+            continue;
+        }
+        let mut data = extra as f64;
+        let mut used = 0u32;
+        for &c in &counts {
+            if c > 0 {
+                used += 1;
+                data += c as f64 * (total as f64 / c as f64).log2();
+            }
+        }
+        let cost = data * stride as f64 + f64::from(8 * used + 15);
+        if config == HybridUintConfig::DEFAULT {
+            default_cost = cost;
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best = config;
+        }
+    }
+    if best_cost >= default_cost * 0.995 {
+        HybridUintConfig::DEFAULT
+    } else {
+        best
+    }
+}
+
 fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
     build_histograms_with(tokens, context_map, HybridUintConfig::DEFAULT, histograms);
 }
@@ -332,6 +382,40 @@ where
     let mut context_map: Vec<u8> = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
 
+    // Second walk: pick each final cluster's HybridUint config from its actual
+    // token values (DEFAULT is among the candidates, so this can only move
+    // where the selector's cost model says it pays), then rebuild the symbol
+    // histograms under the selected configs so the prefix/rANS tables match
+    // what the writer will emit.
+    let num_clusters = histograms.len();
+    let mut cluster_values: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
+    for tokens in &streams {
+        for t in *tokens {
+            cluster_values[context_map[t.context as usize] as usize].push(t.value);
+        }
+    }
+    let hybrid_uint_configs: Vec<HybridUintConfig> = cluster_values
+        .iter()
+        .map(|values| select_hybrid_config_ans(values))
+        .collect();
+    if hybrid_uint_configs
+        .iter()
+        .any(|&c| c != HybridUintConfig::DEFAULT)
+    {
+        for h in &mut histograms {
+            *h = Histogram::new();
+        }
+        for (values, (config, histogram)) in cluster_values
+            .iter()
+            .zip(hybrid_uint_configs.iter().zip(histograms.iter_mut()))
+        {
+            for &value in values {
+                let (tok, _, _) = uint_encode_with_config(value, *config);
+                histogram.add(tok);
+            }
+        }
+    }
+
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
     let (mut use_prefix_code, mut ans_freqs, mut ans_symbols) = no_ans();
@@ -351,7 +435,7 @@ where
     OwnedEntropyCode {
         context_map,
         prefix_codes,
-        hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; histograms.len()],
+        hybrid_uint_configs,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code,
