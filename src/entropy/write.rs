@@ -359,13 +359,21 @@ pub(crate) fn optimize_entropy_code_ac(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
-    optimize_entropy_code_ac_streams(std::iter::once(tokens), num_contexts, huffman_pool)
+    optimize_entropy_code_ac_streams(std::iter::once(tokens), num_contexts, huffman_pool, true)
 }
 
+/// `select_configs = false` keeps every cluster on `HybridUintConfig::DEFAULT`.
+/// The provisional price build MUST pass false: config-aware prices nudge RDOQ
+/// by single tokens, which can push the (prefix-model) clustering off a
+/// knife-edge merge worth hundreds of bytes (kodim20 d=7.5: +9.9%). With
+/// default prices the coefficient stream is identical to the pre-selection
+/// encoder, and selection then only recodes the final streams on the same
+/// clusters — which cannot lose.
 pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
     streams: I,
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
+    select_configs: bool,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -394,10 +402,14 @@ where
             cluster_values[context_map[t.context as usize] as usize].push(t.value);
         }
     }
-    let hybrid_uint_configs: Vec<HybridUintConfig> = cluster_values
-        .iter()
-        .map(|values| select_hybrid_config_ans(values))
-        .collect();
+    let hybrid_uint_configs: Vec<HybridUintConfig> = if select_configs {
+        cluster_values
+            .iter()
+            .map(|values| select_hybrid_config_ans(values))
+            .collect()
+    } else {
+        vec![HybridUintConfig::DEFAULT; num_clusters]
+    };
     if hybrid_uint_configs
         .iter()
         .any(|&c| c != HybridUintConfig::DEFAULT)
