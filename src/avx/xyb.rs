@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::enc_xyb::*;
+use crate::xyb::*;
 use std::arch::x86_64::*;
 
 #[inline]

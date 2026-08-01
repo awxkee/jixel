@@ -35,35 +35,34 @@
 )]
 #![deny(unreachable_pub)]
 mod ac_context;
+mod ac_strategy;
 mod adaptive_quant;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
 mod coder_scratch;
+mod coeff_order;
 mod color;
+mod color_correlation;
 mod color_encoding;
 mod dark_aq;
 mod dc_group_data;
+mod dc_smooth;
+mod dc_tree;
 mod dct;
-mod enc_ac_strategy;
-mod enc_coeff_order;
-mod enc_color_correlation;
-mod enc_dc_smooth;
-mod enc_dc_tree;
-mod enc_frame;
-mod enc_group;
-mod enc_lossless;
-mod enc_lz77_ac;
-mod enc_xyb;
 mod encode_image;
 mod encoding_context;
 mod entropy;
 mod fast_loseless;
+mod frame;
 mod gaborish;
+mod group;
 mod icc_codec;
 mod image;
 mod inflated_cost;
 mod jpeg;
+mod lossless;
+mod lz77_ac;
 mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
@@ -79,6 +78,7 @@ mod thread_pool;
 mod util;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm;
+mod xyb;
 
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,

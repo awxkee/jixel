@@ -55,8 +55,8 @@ pub(crate) fn quantize_block_ac_wasm(
     let block_in = &block_in[..n];
     let block_out = &mut block_out[..n];
 
-    let thr = crate::enc_group::quantize_ac_thresholds(c, xsize, ysize, distance);
-    let q_scaled = crate::enc_group::quantize_ac_q_scaled(quant, scale, qm_multiplier);
+    let thr = crate::group::quantize_ac_thresholds(c, xsize, ysize, distance);
+    let q_scaled = crate::group::quantize_ac_q_scaled(quant, scale, qm_multiplier);
 
     let half = width / 2;
     let qs = f32x4_splat(q_scaled);

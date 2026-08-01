@@ -31,10 +31,10 @@ use crate::coder_scratch::CoderScratch;
 use crate::color::{lut_high_bit, srgb_lut, srgb_to_linear_f32};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
-use crate::enc_frame::encode_frame;
-use crate::enc_lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::encoding_context::EncodingContext;
+use crate::frame::encode_frame;
 use crate::image::{Image3F, Image3Si};
+use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::orientation::Orientation;
 use crate::{ColorEncoding, EncodeError};
 
@@ -2136,7 +2136,7 @@ fn write_image_metadata(
         // all_default, [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
         w.write(1, 0); // CustomTransformData.all_default = 0
         w.write(1, 0); // OpsinInverseMatrix.all_default = 0
-        for v in crate::enc_xyb::OPSIN_INVERSE_MATRIX {
+        for v in crate::xyb::OPSIN_INVERSE_MATRIX {
             w.write(16, crate::util::f32_to_f16(v) as u64);
         }
         for _ in 0..3 {

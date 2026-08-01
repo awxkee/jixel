@@ -141,12 +141,12 @@ pub(crate) fn neon_dequantized_level_f32(q: float32x4_t) -> float32x4_t {
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
     let big = vsubq_f32(
         q,
-        vdivq_f32(vdupq_n_f32(crate::enc_group::DEFAULT_QUANT_BIAS_3), q),
+        vdivq_f32(vdupq_n_f32(crate::group::DEFAULT_QUANT_BIAS_3), q),
     );
     let sign = vandq_u32(vreinterpretq_u32_f32(q), vdupq_n_u32(0x8000_0000));
     let one = vreinterpretq_f32_u32(vorrq_u32(
         sign,
-        vreinterpretq_u32_f32(vdupq_n_f32(crate::enc_group::DEFAULT_QUANT_BIAS_1)),
+        vreinterpretq_u32_f32(vdupq_n_f32(crate::group::DEFAULT_QUANT_BIAS_1)),
     ));
     let use_big = vcgeq_f32(absq, vdupq_n_f32(1.125));
     let dq = vbslq_f32(use_big, big, one);

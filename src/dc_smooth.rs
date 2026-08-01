@@ -363,10 +363,11 @@ pub(crate) fn optimize_dc_rounding(
         .map(|i| (i * band_h, ((i + 1) * band_h).min(h)))
         .collect();
     if let [.., prev, last] = bounds.as_mut_slice()
-        && last.1 - last.0 < 2 {
-            prev.1 = last.1;
-            bounds.pop();
-        }
+        && last.1 - last.0 < 2
+    {
+        prev.1 = last.1;
+        bounds.pop();
+    }
     let mut phases: [Vec<Band>; 2] = [Vec::new(), Vec::new()];
     for (i, &(y0, y1)) in bounds.iter().enumerate() {
         phases[i % 2].push(Band {

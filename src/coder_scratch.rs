@@ -28,12 +28,12 @@
  */
 
 use crate::adaptive_quant::AqMapScratch;
-use crate::enc_group::AcGroupScratch;
-use crate::enc_lossless::{GradientScratch, LzToken, PickThresholdScratch};
 use crate::entropy::{
     ALPHABET_SIZE, CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig,
     PrefixCode,
 };
+use crate::group::AcGroupScratch;
+use crate::lossless::{GradientScratch, LzToken, PickThresholdScratch};
 use crate::patches::PATCH_TILE;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::util::{HeapMatrix, heap_array};
@@ -139,7 +139,7 @@ impl Default for CoderScratch {
 #[cfg(test)]
 mod tests {
     use super::{CoderScratch, DcPredictorScratch, LzEntropyScratch};
-    use crate::enc_group::AcGroupScratch;
+    use crate::group::AcGroupScratch;
     use std::mem::size_of;
 
     #[test]

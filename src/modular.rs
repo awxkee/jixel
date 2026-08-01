@@ -154,8 +154,8 @@ pub(crate) fn write_ac_group_alpha(
 /// length symbol is coded on the context of the first copied pixel (the pixel
 /// right after the literal), matching how the decoder reads it.
 #[allow(dead_code)]
-fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::enc_lz77_ac::AcLz> {
-    use crate::enc_lz77_ac::{AcLz, LZ77_MIN_LENGTH};
+fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::lz77_ac::AcLz> {
+    use crate::lz77_ac::{AcLz, LZ77_MIN_LENGTH};
     let mut out: Vec<AcLz> = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {

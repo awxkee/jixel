@@ -476,7 +476,7 @@ fn coefficient_dist_and_rate(
         let qm_mult = if c == 0 {
             qm_mult_x
         } else if c == 2 {
-            crate::enc_frame::b_qm_mul()
+            crate::frame::b_qm_mul()
         } else {
             1.0
         };
@@ -674,9 +674,9 @@ fn cmap_factors(ytox_map: &ImageSB, ytob_map: &ImageSB, bx: usize, by: usize) ->
     let tx = (bx / 8).min(ytox_map.xsize() - 1);
     let ty = (by / 8).min(ytox_map.ysize() - 1);
     [
-        crate::enc_color_correlation::y_to_x_ratio(ytox_map.row(ty)[tx]),
+        crate::color_correlation::y_to_x_ratio(ytox_map.row(ty)[tx]),
         0.0,
-        crate::enc_color_correlation::y_to_b_ratio(ytob_map.row(ty)[tx]),
+        crate::color_correlation::y_to_b_ratio(ytob_map.row(ty)[tx]),
     ]
 }
 

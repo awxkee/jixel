@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::enc_xyb::*;
+use crate::xyb::*;
 use std::arch::aarch64::*;
 
 #[inline]
@@ -189,7 +189,7 @@ pub(crate) fn to_xyb_neon_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
 #[cfg(test)]
 mod tests {
     use super::to_xyb_neon_band;
-    use crate::enc_xyb::rgb_to_xyb_pixel_f32;
+    use crate::xyb::rgb_to_xyb_pixel_f32;
 
     fn rng(state: &mut u64) -> f32 {
         *state = state

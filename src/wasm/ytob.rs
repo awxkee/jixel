@@ -253,7 +253,7 @@ pub(crate) fn fill_ytob_row_wasm(dst: &mut [i32], b: &[i16], y: &[i16], slope: f
 #[cfg(test)]
 mod tests {
     use super::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
-    use crate::enc_color_correlation::{fill_ytob_residuals_scalar, fill_ytob_row_scalar};
+    use crate::color_correlation::{fill_ytob_residuals_scalar, fill_ytob_row_scalar};
 
     #[test]
     fn fill_ytob_row_matches_scalar_ties_to_even() {

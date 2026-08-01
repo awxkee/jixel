@@ -36,13 +36,13 @@ use crate::ac_context::{
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
-use crate::enc_frame::{
-    collect_ac_metadata_tokens, collect_dc_tokens, combine_sections, write_context_tree,
-    write_quant_scales,
-};
 use crate::entropy::{
     Token, optimize_entropy_code, optimize_entropy_code_ac, pack_signed, write_ans_tokens,
     write_entropy_code, write_token,
+};
+use crate::frame::{
+    collect_ac_metadata_tokens, collect_dc_tokens, combine_sections, write_context_tree,
+    write_quant_scales,
 };
 use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
@@ -464,7 +464,7 @@ fn encode_jpeg_codestream_with_pool(
             (
                 collect_dc_tokens(
                     &dc_datas[i],
-                    &crate::enc_frame::DC_PREDICTOR_WEIGHTED,
+                    &crate::frame::DC_PREDICTOR_WEIGHTED,
                     &mut Vec::new(),
                 ),
                 // epf_iters = 0 here, so the sharpness id is decoder-ignored;
@@ -538,11 +538,11 @@ fn encode_jpeg_codestream_with_pool(
         // Written explicitly; the lossy path avoids the shortcut too.
         w.write(1, 0);
         w.write(16, 0); // no DC thresholds, no quant-field thresholds
-        crate::enc_frame::write_compact_block_context_map(&mut scratch.huffman_pool, w);
+        crate::frame::write_compact_block_context_map(&mut scratch.huffman_pool, w);
         write_color_correlation(w);
         write_context_tree(
             dim.num_dc_groups,
-            &crate::enc_frame::DC_PREDICTOR_WEIGHTED,
+            &crate::frame::DC_PREDICTOR_WEIGHTED,
             &mut scratch.huffman_pool,
             w,
         );
@@ -798,7 +798,7 @@ fn tokenize_ac_group(
                             Some(num_nzeros.plane_row(c, sy - 1))
                         };
                         let row = num_nzeros.plane_row(c, sy);
-                        let predicted = crate::enc_group::predict_from_top_and_left(
+                        let predicted = crate::group::predict_from_top_and_left(
                             row_top,
                             row,
                             sx,

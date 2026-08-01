@@ -185,7 +185,7 @@ mod tests {
 #[cfg(test)]
 mod regression_tests {
     use super::cfl_regression_neon;
-    use crate::enc_color_correlation::cfl_regression_scalar;
+    use crate::color_correlation::cfl_regression_scalar;
 
     fn rng(state: &mut u64) -> f32 {
         *state = state

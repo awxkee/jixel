@@ -272,7 +272,7 @@ pub(crate) fn fill_ytob_row_avx2(dst: &mut [i32], b: &[i16], y: &[i16], slope: f
 #[cfg(test)]
 mod tests {
     use super::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};
-    use crate::enc_color_correlation::{
+    use crate::color_correlation::{
         accumulate_ytob_weights_scalar, fill_ytob_residuals_scalar, fill_ytob_row_scalar,
     };
 

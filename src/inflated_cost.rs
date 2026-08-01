@@ -259,7 +259,7 @@ pub(crate) fn channel_rd(
     let width = cx * 8;
     let height = cy * 8;
     let half = width / 2;
-    let thr = crate::enc_group::quantize_ac_thresholds(channel, cx, cy, distance);
+    let thr = crate::group::quantize_ac_thresholds(channel, cx, cy, distance);
     let (sse, nzeros, mag_bits) = unsafe {
         sse_and_rate_fn(
             coeff,
@@ -733,11 +733,11 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let half = width / 2;
     let (pixel_width, pixel_height) = strategy_pixel_dims(strategy);
     let thresholds = [
-        crate::enc_group::quantize_ac_thresholds(0, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(1, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(2, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(0, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(1, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(2, cx, cy, distance),
     ];
-    let quant_scales = [qac * qm_mult_x, qac, qac * crate::enc_frame::b_qm_mul()];
+    let quant_scales = [qac * qm_mult_x, qac, qac * crate::frame::b_qm_mul()];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
     let [
