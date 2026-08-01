@@ -738,6 +738,7 @@ pub(crate) fn write_ac_group(
     dc_data: &DcGroupData,
     ytob_dc: i32,
     quant_dc: &mut Image3S,
+    dc_float: &mut Image3F,
     qorigin_x: usize,
     qorigin_y: usize,
     num_nzeros: &mut [Image3B],
@@ -948,6 +949,11 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_target.copy_from_slice(&y_dc_q[row_start..row_start + cov_x]);
+                if dc_float.xsize() != 0 {
+                    let float_target = &mut dc_float
+                        .plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    float_target.copy_from_slice(&dc_vals[1][row_start..row_start + cov_x]);
+                }
             }
             // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
             // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
@@ -1112,6 +1118,11 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
+                if dc_float.xsize() != 0 {
+                    let float_target = &mut dc_float
+                        .plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    float_target.copy_from_slice(&x_dc_post[row_start..row_start + cov_x]);
+                }
             }
             let inv_qm_x: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
@@ -1163,6 +1174,11 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
+                if dc_float.xsize() != 0 {
+                    let float_target = &mut dc_float
+                        .plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    float_target.copy_from_slice(&b_dc_post[row_start..row_start + cov_x]);
+                }
             }
             let inv_qm_b: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],

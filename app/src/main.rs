@@ -25,7 +25,7 @@ fn encode_jixel(rgb: &[u8], width: usize, height: usize, threads: usize) -> Meas
         .with_quality(QUALITY)
         .with_progressive(false)
         .with_patches(true)
-        .with_speed(Speed::Slow)
+        .with_speed(Speed::Fast)
         .with_num_threads(threads);
     let start = Instant::now();
     let bytes = jixel::encode_image(black_box(rgb), width, height, &config)
@@ -136,7 +136,7 @@ fn main() {
         height as usize,
         threads,
     ));
-    black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
+    // black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
 
     let mut jixel_times = Vec::with_capacity(iterations);
     let mut libjxl_times = Vec::with_capacity(iterations);

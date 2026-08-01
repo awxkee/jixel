@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::image::{Image3S, ImageB, ImageSB};
+use crate::image::{Image3F, Image3S, ImageB, ImageSB};
 
 pub(crate) const STRATEGY_DCT: u8 = 0;
 pub(crate) const STRATEGY_DCT16X8: u8 = 1;
@@ -201,6 +201,11 @@ impl AcStrategyImage {
 
 pub(crate) struct DcGroupData {
     pub(crate) quant_dc: Image3S,
+    /// Unquantized DC targets in XYB (X and B are true DC, pre-CfL-slope):
+    /// what the decoder's smoothed DC recon is compared against. Empty (0×0)
+    /// unless the DC-smoothing rounding pass is going to run — the VarDCT
+    /// path sizes it after construction; capture sites check for emptiness.
+    pub(crate) dc_float: Image3F,
     pub(crate) raw_quant_field: ImageB,
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
@@ -219,6 +224,7 @@ impl DcGroupData {
         let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         Self {
             quant_dc: Image3S::new(xsize_blocks, ysize_blocks),
+            dc_float: Image3F::new(0, 0),
             raw_quant_field: ImageB::new_fill(xsize_blocks, ysize_blocks, 1),
             ac_strategy: AcStrategyImage::new(xsize_blocks, ysize_blocks),
             ytox_map: ImageSB::new_fill(xtiles, ytiles, 0),

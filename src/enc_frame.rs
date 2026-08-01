@@ -115,6 +115,16 @@ const DC_REFINE_PEAK: f32 = 1.35;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
 
+/// Whether the closed-loop DC rounding pass (`enc_dc_smooth`) runs. Shared by
+/// the pass itself and the `dc_float` capture-plane allocations so no float
+/// DC is stored when the pass is off. Below d≈0.8 the DC steps are fine
+/// enough that the smoothing gate almost never opens and the pass only adds
+/// noise; it is a quality refinement, not worth Fast's time budget.
+#[inline]
+fn dc_smooth_enabled(distance: f32, speed: Speed) -> bool {
+    distance >= 0.8 && speed == Speed::Slow
+}
+
 #[inline]
 fn dc_refinement(distance: f32) -> f32 {
     if distance <= DC_REFINE_HOLD {
@@ -1453,7 +1463,7 @@ fn encode_frame_core(
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, stats) = process_ac_group(
+            let (p, local, local_float, stats) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -1472,13 +1482,14 @@ fn encode_frame_core(
                 want_order_stats,
                 qf_threshold,
             );
-            (dc_idx, gx, gy, p, local, stats)
+            (dc_idx, gx, gy, p, local, local_float, stats)
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     let mut order_stats = crate::enc_coeff_order::OrderStats::new();
-    for (dc_idx, gx, gy, p, local, stats) in results {
+    for (dc_idx, gx, gy, p, local, local_float, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
+        merge_dc_float(&mut dc_datas[dc_idx], gx, gy, &local_float);
         all_pending.push(p);
         if let Some(s) = stats {
             order_stats.merge(&s);
@@ -1522,7 +1533,7 @@ fn encode_frame_core(
             .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _) = process_ac_group(
+                let (p, local, _local_float, _) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -1547,6 +1558,68 @@ fn encode_frame_core(
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
+        }
+
+        // Closed-loop DC rounding against the decoder's adaptive DC
+        // smoothing: sub-quantstep DC precision on smooth content for
+        // near-zero rate. Above the curve across d≈1..6 on both corpora.
+        if dc_smooth_enabled(distance, ctx.speed) {
+            let steps = [
+                1.0 / (crate::quant_weights::INV_DC_QUANT[0] * distp.scale_dc),
+                1.0 / (crate::quant_weights::INV_DC_QUANT[1] * distp.scale_dc),
+                1.0 / (crate::quant_weights::INV_DC_QUANT[2] * distp.scale_dc),
+            ];
+            let r_b = 1.0 + ytob_dc as f32 / crate::enc_color_correlation::K_COLOR_FACTOR;
+            if dc_datas.len() == 1 {
+                let dc = &mut dc_datas[0];
+                crate::enc_dc_smooth::optimize_dc_rounding(
+                    &mut dc.quant_dc,
+                    &dc.dc_float,
+                    steps,
+                    r_b,
+                    Some((&ctx.thread_pool, scratch)),
+                );
+            } else {
+                // The smoothing filter spans the whole DC plane, so stitch
+                // the per-DC-group planes together, optimize once, and
+                // scatter the result back.
+                let (wb, hb) = (dim.xsize_blocks, dim.ysize_blocks);
+                let mut full_q = Image3S::new(wb, hb);
+                let mut full_f = Image3F::new(wb, hb);
+                const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
+                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
+                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
+                    let src_q = &dc_datas[i].quant_dc;
+                    let src_f = &dc_datas[i].dc_float;
+                    for c in 0..3 {
+                        for ly in 0..src_q.ysize() {
+                            let n = src_q.xsize();
+                            full_q.plane_row_mut(c, oy + ly)[ox..ox + n]
+                                .copy_from_slice(&src_q.plane_row(c, ly)[..n]);
+                            full_f.plane_row_mut(c, oy + ly)[ox..ox + n]
+                                .copy_from_slice(&src_f.plane_row(c, ly)[..n]);
+                        }
+                    }
+                }
+                crate::enc_dc_smooth::optimize_dc_rounding(
+                    &mut full_q,
+                    &full_f,
+                    steps,
+                    r_b,
+                    Some((&ctx.thread_pool, scratch)),
+                );
+                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
+                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
+                    let dst = &mut dc_datas[i].quant_dc;
+                    for c in 0..3 {
+                        for ly in 0..dst.ysize() {
+                            let n = dst.xsize();
+                            dst.plane_row_mut(c, ly)[..n]
+                                .copy_from_slice(&full_q.plane_row(c, oy + ly)[ox..ox + n]);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2191,6 +2264,28 @@ fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
     }
 }
 
+/// Merge a group-local unquantized DC plane (same geometry as
+/// [`merge_quant_dc`]) into the DC group's `dc_float`, sizing the
+/// destination on first use. A no-op when the capture is disabled (empty
+/// local image).
+fn merge_dc_float(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3F) {
+    if local.xsize() == 0 {
+        return;
+    }
+    if dc.dc_float.xsize() == 0 {
+        dc.dc_float = Image3F::new(dc.quant_dc.xsize(), dc.quant_dc.ysize());
+    }
+    let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+    let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+    let (gwb, ghb) = (local.xsize(), local.ysize());
+    for c in 0..3 {
+        for ly in 0..ghb {
+            let src = local.plane_row(c, ly);
+            dc.dc_float.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
+        }
+    }
+}
+
 /// Encode a single AC group: build its tile stripes, quantize and tokenize,
 /// and place its DC coefficients into a returned group-local `quant_dc`
 /// (origin-relative, merged by the caller). Reads `dc_data` read-only.
@@ -2237,6 +2332,7 @@ fn process_ac_group(
 ) -> (
     PendingAcGroup,
     Image3S,
+    Image3F,
     Option<crate::enc_coeff_order::OrderStats>,
 ) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
@@ -2252,6 +2348,13 @@ fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
+    // Float DC targets are only captured when the DC-smoothing rounding pass
+    // is going to consume them (`write_ac_group` skips the empty image).
+    let mut local_dc_float = if num_passes == 1 && dc_smooth_enabled(distp.distance, ctx.speed) {
+        Image3F::new(gwb, ghb)
+    } else {
+        Image3F::new(0, 0)
+    };
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
         .collect();
@@ -2297,6 +2400,7 @@ fn process_ac_group(
             dc_data,
             ytob_dc,
             &mut local_quant_dc,
+            &mut local_dc_float,
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
@@ -2316,6 +2420,7 @@ fn process_ac_group(
             tokens,
         },
         local_quant_dc,
+        local_dc_float,
         order_stats,
     )
 }
