@@ -32,6 +32,7 @@ class Measurement:
     ss2: float
     encode_ms: float
     bytes: int
+    ba: float = 0.0
 
 
 def _run(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -61,6 +62,7 @@ def run_case(
     # A "boost" key is not an env knob: it is passed straight to the tuner's
     # --boost CLI flag (DarkAqConfig CSV, e.g. "1.5" or "1.5,6,0.02,1").
     boost = (params or {}).get("boost")
+    banding = (params or {}).get("banding")
 
     try:
         # 1) Encode.
@@ -77,6 +79,8 @@ def run_case(
         ]
         if boost is not None:
             cmd += ["--boost", str(boost)]
+        if banding:
+            cmd += ["--banding"]
         enc = _run(cmd, env=env)
         if enc.returncode != 0 or not jxl.exists():
             raise EncodeError(f"encode failed ({case.key()}): {enc.stderr.strip()}")
@@ -96,7 +100,17 @@ def run_case(
             raise EncodeError(f"ssimulacra2 failed ({case.key()}): {met.stderr.strip()}")
         ss2 = float(met.stdout.strip().split()[0])
 
-        return Measurement(bpp=bpp, ss2=ss2, encode_ms=encode_ms, bytes=nbytes)
+        # 4) Butteraugli 3-norm (0.0 when the tool is unavailable).
+        ba = 0.0
+        if config.BUTTERAUGLI:
+            bam = _run([config.BUTTERAUGLI, str(case.crop), str(png), "--pnorm", "3"])
+            if bam.returncode == 0:
+                for line in (bam.stdout + bam.stderr).splitlines():
+                    if "3-norm" in line:
+                        ba = float(line.strip().split()[-1])
+                        break
+
+        return Measurement(bpp=bpp, ss2=ss2, encode_ms=encode_ms, bytes=nbytes, ba=ba)
     finally:
         for f in (jxl, png):
             try:

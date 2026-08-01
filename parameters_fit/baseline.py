@@ -43,7 +43,7 @@ def build_baseline_for(name: str, crop: Path, distances: list[float], *, force: 
     for d in sorted(distances):
         case = Case(name, crop, w, h, d, holdout=False)
         m = run_case(case, params=None)  # None => shipped defaults
-        rows.append((d, m.bpp, m.ss2, m.encode_ms))
+        rows.append((d, m.bpp, m.ss2, m.encode_ms, m.ba))
 
     curve = {
         "name": name,
@@ -51,6 +51,7 @@ def build_baseline_for(name: str, crop: Path, distances: list[float], *, force: 
         "bpp": [r[1] for r in rows],
         "ss2": [r[2] for r in rows],
         "encode_ms": [r[3] for r in rows],
+        "ba": [r[4] for r in rows],
     }
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(curve, indent=2))
@@ -78,12 +79,20 @@ class Baseline:
         self._ss2 = np.asarray(data["ss2"], dtype=np.float64)[order]
         self._dist = np.asarray(data["distance"], dtype=np.float64)
         self._time = np.asarray(data["encode_ms"], dtype=np.float64)
+        ba = data.get("ba")
+        self._ba = np.asarray(ba, dtype=np.float64)[order] if ba else None
 
     def ss2_at_rate(self, bpp: float) -> float:
         """Baseline SSIMULACRA2 at a given bitrate (log-bpp interpolation,
         clamped to the measured range)."""
         lb = np.log(max(bpp, 1e-6))
         return float(np.interp(lb, np.log(self._bpp), self._ss2))
+
+    def ba_at_rate(self, bpp: float) -> float:
+        """Baseline butteraugli 3-norm at a given bitrate (log-bpp interp)."""
+        assert self._ba is not None, f"baseline {self.name} has no butteraugli column"
+        lb = np.log(max(bpp, 1e-6))
+        return float(np.interp(lb, np.log(self._bpp), self._ba))
 
     def covers_rate(self, bpp: float) -> bool:
         """Whether ``bpp`` is inside the measured range. Outside it ``np.interp``

@@ -241,6 +241,8 @@ pub struct EncodeConfig {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
+    /// Banding protection
+    pub banding_protection: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -332,6 +334,7 @@ impl Default for EncodeConfig {
             exif: None,
             orientation: Orientation::Normal,
             lossless: false,
+            banding_protection: false,
             progressive: false,
             patches: true,
             progressive_passes: None,
@@ -574,6 +577,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Enable banding protection (see the field docs).
+    pub fn with_banding_protection(mut self) -> Self {
+        self.banding_protection = true;
+        self
+    }
+
     /// Enable progressive lossless. Only effective when `lossless`.
     pub fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
@@ -618,7 +627,13 @@ pub fn distance_from_quality(quality: f32) -> f32 {
 }
 
 fn lossy_context(config: &EncodeConfig, distance: f32) -> EncodingContext {
-    EncodingContext::new(config.speed, config.boost, distance, config.num_threads)
+    EncodingContext::new(
+        config.speed,
+        config.boost,
+        config.banding_protection,
+        distance,
+        config.num_threads,
+    )
 }
 
 fn for_each_linear_band<F>(

@@ -42,12 +42,15 @@ pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
     pub(crate) boost: Option<DarkAqConfig>,
+    pub(crate) banding_protection: bool,
     /// Transform-merge knobs resolved at this encode's distance.
     pub(crate) merge: enc_ac_strategy::MergeTuning,
     pub(crate) matrices: &'static DequantMatrices,
     pub(crate) to_xyb_band: enc_xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
+    pub(crate) recon_dist_and_rate: inflated_cost::ReconDistAndRateFn,
+    pub(crate) recon_error_kernels: inflated_cost::ReconErrorKernels,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
     pub(crate) quantize_block_ac: enc_group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: enc_group::QuantizeDcFn,
@@ -76,6 +79,7 @@ impl EncodingContext {
     pub(crate) fn new(
         speed: Speed,
         boost: Option<DarkAqConfig>,
+        banding_protection: bool,
         distance: f32,
         num_threads: usize,
     ) -> Self {
@@ -84,11 +88,17 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             boost,
+            banding_protection,
             merge: enc_ac_strategy::MergeTuning::new(distance),
             matrices: DequantMatrices::new(distance),
             to_xyb_band: enc_xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
+            recon_dist_and_rate: inflated_cost::select_recon_dist_and_rate_fn(),
+            recon_error_kernels: inflated_cost::ReconErrorKernels {
+                gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
+                combine: inflated_cost::select_combine_error_fn(),
+            },
             rate_log2_lut: inflated_cost::rate_log2_lut(),
             quantize_block_ac: enc_group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
@@ -118,6 +128,6 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None, 1.0, 1)
+        Self::new(Speed::Fast, None, false, 1.0, 1)
     }
 }

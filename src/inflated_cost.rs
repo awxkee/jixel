@@ -469,191 +469,252 @@ pub(crate) type ReconQuantizeFn = unsafe fn(
 pub(crate) type SsimDeficitFn = unsafe fn(&[f32], &[f32], usize, usize) -> f32;
 pub(crate) type PrepareReconstructionFn =
     unsafe fn(&Plane<f32>, usize, usize, usize, usize, &[f32], &mut [f32], &mut [f32]);
+pub(crate) type ErrorGradientEnergyFn = fn(&[f32], usize, usize) -> f32;
+pub(crate) type CombineErrorFn = fn(&[f32], &[f32], f32, &mut [f32]);
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recon_dist_and_rate(
-    scratch: &mut [[f32; 1024]; 8],
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
-) -> (f32, f32) {
+pub(crate) struct ReconQuantization<'a> {
+    pub(crate) rate_log2_lut: &'a RateLog2Lut,
+    pub(crate) coeffs: &'a [[f32; 1024]; 3],
+    pub(crate) inverse_matrices: [&'a [f32]; 3],
+    pub(crate) qac: f32,
+    pub(crate) qm_mult_x: f32,
+    pub(crate) distance: f32,
+}
+
+pub(crate) struct ReconTransform {
+    pub(crate) blocks_x: usize,
+    pub(crate) blocks_y: usize,
+    pub(crate) strategy: u8,
+}
+
+pub(crate) struct ReconSource<'a> {
+    pub(crate) opsin: &'a Image3F,
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+}
+
+pub(crate) struct ReconScoring {
+    pub(crate) factor_x: f32,
+    pub(crate) factor_b: f32,
+    pub(crate) banding: bool,
+}
+
+pub(crate) struct ReconDistInput<'a> {
+    pub(crate) quantization: ReconQuantization<'a>,
+    pub(crate) transform: ReconTransform,
+    pub(crate) source: ReconSource<'a>,
+    pub(crate) scoring: ReconScoring,
+}
+
+pub(crate) struct ReconErrorKernels {
+    pub(crate) gradient_energy: ErrorGradientEnergyFn,
+    pub(crate) combine: CombineErrorFn,
+}
+
+pub(crate) struct ReconKernels<'a> {
+    pub(crate) quantize: ReconQuantizeFn,
+    pub(crate) ssim: SsimDeficitFn,
+    pub(crate) prepare: PrepareReconstructionFn,
+    pub(crate) error: &'a ReconErrorKernels,
+}
+
+pub(crate) type ReconDistAndRateFn = for<'a, 'input, 'kernels> fn(
+    &mut [[f32; 1024]; 8],
+    &'input ReconDistInput<'a>,
+    &'kernels ReconErrorKernels,
+) -> (f32, f32);
+
+#[allow(dead_code)]
+pub(crate) fn combine_error_scalar(
+    spatial: &[f32],
+    luma: &[f32],
+    factor: f32,
+    combined: &mut [f32],
+) {
+    debug_assert_eq!(spatial.len(), luma.len());
+    debug_assert_eq!(spatial.len(), combined.len());
+    for ((combined, &spatial), &luma) in combined.iter_mut().zip(spatial).zip(luma) {
+        *combined = fmla(factor, luma, spatial);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_combine_error_fn() -> CombineErrorFn {
+    crate::wasm::combine_error_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_combine_error_fn() -> CombineErrorFn {
+    |spatial, luma, factor, combined| unsafe {
+        crate::neon::combine_error_neon(spatial, luma, factor, combined)
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_combine_error_fn() -> CombineErrorFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |spatial, luma, factor, combined| unsafe {
+            crate::avx::combine_error_avx2(spatial, luma, factor, combined)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |spatial, luma, factor, combined| unsafe {
+            crate::sse::combine_error_sse41(spatial, luma, factor, combined)
+        };
+    }
+    combine_error_scalar
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
+    crate::wasm::error_gradient_energy_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
+    |error, width, height| unsafe { crate::neon::error_gradient_energy_neon(error, width, height) }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |error, width, height| unsafe {
+            crate::avx::error_gradient_energy_avx2(error, width, height)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |error, width, height| unsafe {
+            crate::sse::error_gradient_energy_sse41(error, width, height)
+        };
+    }
+    error_gradient_energy_scalar
+}
+
+pub(crate) fn select_recon_dist_and_rate_fn() -> ReconDistAndRateFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return unsafe {
-            crate::avx::recon_dist_and_rate_avx2(
-                scratch,
-                rate_log2_lut,
-                coeffs,
-                inv,
-                qac,
-                qm_mult_x,
-                factor_x,
-                factor_b,
-                distance,
-                cx,
-                cy,
-                strategy,
-                opsin,
-                px,
-                py,
-            )
+        return |scratch, input, error_kernels| unsafe {
+            crate::avx::recon_dist_and_rate_avx2(scratch, input, error_kernels)
         };
     }
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        return unsafe {
-            crate::neon::recon_dist_and_rate_neon(
-                scratch,
-                rate_log2_lut,
-                coeffs,
-                inv,
-                qac,
-                qm_mult_x,
-                factor_x,
-                factor_b,
-                distance,
-                cx,
-                cy,
-                strategy,
-                opsin,
-                px,
-                py,
-            )
+        return |scratch, input, error_kernels| unsafe {
+            crate::neon::recon_dist_and_rate_neon(scratch, input, error_kernels)
         };
     }
     #[allow(unreachable_code)]
-    recon_dist_and_rate_default(
-        scratch,
-        rate_log2_lut,
-        coeffs,
-        inv,
-        qac,
-        qm_mult_x,
-        factor_x,
-        factor_b,
-        distance,
-        cx,
-        cy,
-        strategy,
-        opsin,
-        px,
-        py,
-    )
+    recon_dist_and_rate_default
 }
 
-#[allow(clippy::too_many_arguments)]
 fn recon_dist_and_rate_default(
     scratch: &mut [[f32; 1024]; 8],
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
 ) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
         scratch,
-        rate_log2_lut,
-        coeffs,
-        inv,
-        qac,
-        qm_mult_x,
-        factor_x,
-        factor_b,
-        distance,
-        cx,
-        cy,
-        strategy,
-        opsin,
-        px,
-        py,
-        recon_quantize_scalar,
-        ssim_deficit_dispatch_kernel,
-        prepare_reconstruction_scalar,
+        input,
+        &ReconKernels {
+            quantize: recon_quantize_scalar,
+            ssim: ssim_deficit_dispatch_kernel,
+            prepare: prepare_reconstruction_scalar,
+            error,
+        },
     )
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn recon_dist_and_rate_scalar(
     scratch: &mut [[f32; 1024]; 8],
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
+    input: &ReconDistInput<'_>,
 ) -> (f32, f32) {
+    let error = ReconErrorKernels {
+        gradient_energy: error_gradient_energy_scalar,
+        combine: combine_error_scalar,
+    };
     recon_dist_and_rate_with_kernels(
         scratch,
-        rate_log2_lut,
-        coeffs,
-        inv,
-        qac,
-        qm_mult_x,
-        factor_x,
-        factor_b,
-        distance,
-        cx,
-        cy,
-        strategy,
-        opsin,
-        px,
-        py,
-        recon_quantize_scalar,
-        ssim_deficit_scalar_kernel,
-        prepare_reconstruction_scalar,
+        input,
+        &ReconKernels {
+            quantize: recon_quantize_scalar,
+            ssim: ssim_deficit_scalar_kernel,
+            prepare: prepare_reconstruction_scalar,
+            error: &error,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Banding protection
+const BANDING_ALPHA: f32 = 46.5;
+const BANDING_MIN_D: f32 = 1.4;
+
+/// `sum((dx err)^2 + (dy err)^2)` over one channel's spatial error plane.
+#[allow(dead_code)]
+pub(crate) fn error_gradient_energy_scalar(error: &[f32], width: usize, height: usize) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let rows = error[..n].chunks_exact(width);
+    let mut grad = 0.0f32;
+    for row in rows.clone() {
+        for &[left, right] in row.array_windows::<2>() {
+            let d = right - left;
+            grad = fmla(d, d, grad);
+        }
+    }
+    for (top, bottom) in rows.clone().zip(rows.skip(1)) {
+        for (&top, &bottom) in top.iter().zip(bottom) {
+            let d = bottom - top;
+            grad = fmla(d, d, grad);
+        }
+    }
+    grad
+}
+
 pub(crate) fn recon_dist_and_rate_with_kernels(
     scratch: &mut [[f32; 1024]; 8],
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
-    quantize: ReconQuantizeFn,
-    ssim: SsimDeficitFn,
-    prepare_reconstruction: PrepareReconstructionFn,
+    input: &ReconDistInput<'_>,
+    kernels: &ReconKernels<'_>,
 ) -> (f32, f32) {
+    let quantization = &input.quantization;
+    let transform = &input.transform;
+    let source = &input.source;
+    let scoring = &input.scoring;
+    let rate_log2_lut = quantization.rate_log2_lut;
+    let coeffs = quantization.coeffs;
+    let inverse_matrices = &quantization.inverse_matrices;
+    let qac = quantization.qac;
+    let qm_mult_x = quantization.qm_mult_x;
+    let distance = quantization.distance;
+    let cx = transform.blocks_x;
+    let cy = transform.blocks_y;
+    let strategy = transform.strategy;
+    let opsin = source.opsin;
+    let px = source.x;
+    let py = source.y;
+    let factor_x = scoring.factor_x;
+    let factor_b = scoring.factor_b;
+    let banding = scoring.banding;
+    let quantize = kernels.quantize;
+    let ssim = kernels.ssim;
+    let prepare_reconstruction = kernels.prepare;
+    let error_gradient_energy = kernels.error.gradient_energy;
+    let combine_error = kernels.error.combine;
     let n = strategy_pixel_count(strategy);
     let width = cx.checked_mul(8).expect("coefficient width overflow");
     let height = cy.checked_mul(8).expect("coefficient height overflow");
@@ -664,7 +725,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         n,
         "strategy and coefficient dimensions disagree"
     );
-    assert!(inv.iter().all(|matrix| matrix.len() >= n));
+    assert!(inverse_matrices.iter().all(|matrix| matrix.len() >= n));
     assert!(qac.is_finite() && qac > 0.0);
     assert!(qm_mult_x.is_finite() && qm_mult_x > 0.0);
     assert!((0..3).all(|c| opsin.plane(c).xsize() != 0 && opsin.plane(c).ysize() != 0));
@@ -694,7 +755,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         rate += unsafe {
             quantize(
                 &coeffs[c][..n],
-                &inv[c][..n],
+                &inverse_matrices[c][..n],
                 quant_scales[c],
                 &thresholds[c],
                 width,
@@ -716,13 +777,12 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
             &y_error[..n]
         } else {
             reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
-            for ((combined, &spatial), &luma) in combined_error[..n]
-                .iter_mut()
-                .zip(spatial_error[..n].iter())
-                .zip(y_error[..n].iter())
-            {
-                *combined = fmla(factor, luma, spatial);
-            }
+            combine_error(
+                &spatial_error[..n],
+                &y_error[..n],
+                factor,
+                &mut combined_error[..n],
+            );
             &combined_error[..n]
         };
         let plane = opsin.plane(c);
@@ -747,6 +807,11 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     pixel_height,
                 )
             };
+        if banding && distance >= BANDING_MIN_D {
+            distortion += CHANNEL_WEIGHT[c]
+                * BANDING_ALPHA
+                * error_gradient_energy(&error[..n], pixel_width, pixel_height);
+        }
     }
     (distortion, rate)
 }
@@ -947,7 +1012,114 @@ fn ssim_deficit_scalar_kernel(orig: &[f32], recon: &[f32], width: usize, height:
 
 #[cfg(test)]
 mod tests {
-    use super::{ssim_deficit_scalar, validate_ssim_inputs};
+    use super::{
+        CombineErrorFn, ErrorGradientEnergyFn, combine_error_scalar, error_gradient_energy_scalar,
+        select_combine_error_fn, select_error_gradient_energy_fn, ssim_deficit_scalar,
+        validate_ssim_inputs,
+    };
+
+    fn check_combine_error(kernel: CombineErrorFn) {
+        for len in (0usize..=40).chain([65, 257, 1024]) {
+            let spatial: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03125)
+                .collect();
+            let luma: Vec<f32> = (0..len)
+                .map(|i| ((i * 53 % 113) as f32 - 56.0) * 0.015625)
+                .collect();
+            for factor in [-1.25, -0.1, 0.0, 0.3, 1.75] {
+                let mut expected = vec![f32::NAN; len];
+                let mut actual = vec![f32::NAN; len];
+                combine_error_scalar(&spatial, &luma, factor, &mut expected);
+                kernel(&spatial, &luma, factor, &mut actual);
+                for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    let tolerance = 2e-7f32.max(expected.abs() * 2e-7);
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "len={len}, index={index}, factor={factor}: actual={actual}, expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_combine_error_matches_scalar() {
+        check_combine_error(select_combine_error_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_combine_error_matches_scalar() {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            check_combine_error(|spatial, luma, factor, combined| unsafe {
+                crate::avx::combine_error_avx2(spatial, luma, factor, combined)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_combine_error_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_combine_error(|spatial, luma, factor, combined| unsafe {
+                crate::sse::combine_error_sse41(spatial, luma, factor, combined)
+            });
+        }
+    }
+
+    fn check_error_gradient_energy(kernel: ErrorGradientEnergyFn) {
+        for &(width, height) in &[
+            (0usize, 0usize),
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (3, 5),
+            (8, 8),
+            (16, 8),
+            (17, 11),
+            (32, 32),
+        ] {
+            let mut state = 0x9e37_79b9u32;
+            let values: Vec<f32> = (0..width * height)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 8.0
+                })
+                .collect();
+            let expected = error_gradient_energy_scalar(&values, width, height);
+            let actual = kernel(&values, width, height);
+            let tolerance = 2e-5f32.max(expected.abs() * 3e-6);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "shape {width}x{height}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_error_gradient_energy_matches_scalar() {
+        check_error_gradient_energy(select_error_gradient_energy_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_error_gradient_energy_matches_scalar() {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            check_error_gradient_energy(|error, width, height| unsafe {
+                crate::avx::error_gradient_energy_avx2(error, width, height)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_error_gradient_energy_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_error_gradient_energy(|error, width, height| unsafe {
+                crate::sse::error_gradient_energy_sse41(error, width, height)
+            });
+        }
+    }
 
     fn reference(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f64 {
         const C1: f64 = 1e-4;

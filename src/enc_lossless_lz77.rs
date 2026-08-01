@@ -414,8 +414,7 @@ fn lz77_compress_with_depth_into(
     epoch_word[0] = epoch;
     let mut i = 0usize;
     while i < tokens.len() {
-        let (match_len, distance) =
-            find_match_ring(tokens, i, entries, cursors, max_probes, epoch);
+        let (match_len, distance) = find_match_ring(tokens, i, entries, cursors, max_probes, epoch);
         let threshold = if distance <= 16 { 4 } else { 5 };
         if match_len >= threshold {
             let distance_value = if distance == 1 {

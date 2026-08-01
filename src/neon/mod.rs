@@ -45,7 +45,9 @@ pub(crate) use dct::{
     dct16x32_neon, dct32x16_neon, dct32x32_neon, inv_dct8x8_neon, inv_dct8x16_neon,
     inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon,
 };
-pub(crate) use inflated_cost::{recon_dist_and_rate_neon, ssim_deficit_neon};
+pub(crate) use inflated_cost::{
+    combine_error_neon, error_gradient_energy_neon, recon_dist_and_rate_neon, ssim_deficit_neon,
+};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{
     apply_quant_field_gain_neon, apply_structure_aq_neon, quantize_block_ac_neon,

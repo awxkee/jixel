@@ -45,7 +45,9 @@ pub(crate) use dct::{
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
     inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
 };
-pub(crate) use inflated_cost::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
+pub(crate) use inflated_cost::{
+    combine_error_avx2, error_gradient_energy_avx2, recon_dist_and_rate_avx2, ssim_deficit_avx2,
+};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{
     apply_quant_field_gain_avx2, apply_structure_aq_avx2, quantize_block_ac_avx2, quantize_dc_avx2,

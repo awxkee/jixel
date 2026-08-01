@@ -30,6 +30,7 @@ mod ac_strategy;
 mod adaptive_quant;
 mod cfl;
 mod dct;
+mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
@@ -40,6 +41,7 @@ pub(crate) use ac_strategy::sse_and_rate_wasm;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
 pub(crate) use dct::*;
+pub(crate) use inflated_cost::{combine_error_wasm, error_gradient_energy_wasm};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{
     apply_quant_field_gain_wasm, apply_structure_aq_wasm, quantize_block_ac_wasm,

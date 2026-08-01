@@ -20,6 +20,7 @@ ENCODER = REPO_ROOT / "target" / "release" / "jixel-tuner"
 # External measurement tools. Resolved on PATH (Homebrew installs both).
 DJXL = shutil.which("djxl") or "djxl"
 SSIMULACRA2 = shutil.which("ssimulacra2") or "ssimulacra2"
+BUTTERAUGLI = shutil.which("butteraugli_main")
 
 # Source corpus. Each entry is (directory, max_images). ``None`` uses every
 # image in the directory; an int samples that many, spread evenly across the
