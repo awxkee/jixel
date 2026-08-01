@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::enc_xyb::*;
+use crate::xyb::*;
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -93,23 +93,28 @@ fn vcbrt_fast3_positive_sse41(a0: __m128, a1: __m128, a2: __m128) -> (__m128, __
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn rgb_to_xyb_f32x4_sse41(r: __m128, g: __m128, b: __m128) -> (__m128, __m128, __m128) {
+fn rgb_to_xyb_f32x4_sse41(
+    m: &XybMatrix,
+    r: __m128,
+    g: __m128,
+    b: __m128,
+) -> (__m128, __m128, __m128) {
     let bias = _mm_set1_ps(OPSIN_BIAS);
 
-    // mixed0 = M00*r + M01*g + M02*b + OPSIN_BIAS
-    let mut mixed0 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(M02)));
-    mixed0 = _mm_add_ps(mixed0, _mm_mul_ps(g, _mm_set1_ps(M01)));
-    mixed0 = _mm_add_ps(mixed0, _mm_mul_ps(r, _mm_set1_ps(M00)));
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed0 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(m.fwd[2])));
+    mixed0 = _mm_add_ps(mixed0, _mm_mul_ps(g, _mm_set1_ps(m.fwd[1])));
+    mixed0 = _mm_add_ps(mixed0, _mm_mul_ps(r, _mm_set1_ps(m.fwd[0])));
 
-    // mixed1 = M10*r + M11*g + M12*b + OPSIN_BIAS
-    let mut mixed1 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(M12)));
-    mixed1 = _mm_add_ps(mixed1, _mm_mul_ps(g, _mm_set1_ps(M11)));
-    mixed1 = _mm_add_ps(mixed1, _mm_mul_ps(r, _mm_set1_ps(M10)));
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed1 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(m.fwd[5])));
+    mixed1 = _mm_add_ps(mixed1, _mm_mul_ps(g, _mm_set1_ps(m.fwd[4])));
+    mixed1 = _mm_add_ps(mixed1, _mm_mul_ps(r, _mm_set1_ps(m.fwd[3])));
 
-    // mixed2 = M20*r + M21*g + M22*b + OPSIN_BIAS
-    let mut mixed2 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(M22)));
-    mixed2 = _mm_add_ps(mixed2, _mm_mul_ps(g, _mm_set1_ps(M21)));
-    mixed2 = _mm_add_ps(mixed2, _mm_mul_ps(r, _mm_set1_ps(M20)));
+    // mixed2 = m20*r + m21*g + m22*b + OPSIN_BIAS (B row selected by RED)
+    let mut mixed2 = _mm_add_ps(bias, _mm_mul_ps(b, _mm_set1_ps(m.fwd[8])));
+    mixed2 = _mm_add_ps(mixed2, _mm_mul_ps(g, _mm_set1_ps(m.fwd[7])));
+    mixed2 = _mm_add_ps(mixed2, _mm_mul_ps(r, _mm_set1_ps(m.fwd[6])));
 
     let zero = _mm_setzero_ps();
 
@@ -135,7 +140,12 @@ fn rgb_to_xyb_f32x4_sse41(r: __m128, g: __m128, b: __m128) -> (__m128, __m128, _
 
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "sse4.1")]
-pub(crate) fn to_xyb_sse41_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+pub(crate) fn to_xyb_sse41_band(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+    w: usize,
+) {
     let [rp, gp, bp] = input;
     let [xp, yp, out_bp] = output;
     for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
@@ -165,7 +175,7 @@ pub(crate) fn to_xyb_sse41_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: 
             let g = unsafe { _mm_loadu_ps(g4.as_ptr()) };
             let b = unsafe { _mm_loadu_ps(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(m, r, g, b);
 
             unsafe {
                 _mm_storeu_ps(x4.as_mut_ptr(), xv);
@@ -187,7 +197,7 @@ pub(crate) fn to_xyb_sse41_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: 
             let g = unsafe { _mm_loadu_ps(g4.as_ptr()) };
             let b = unsafe { _mm_loadu_ps(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_sse41(m, r, g, b);
 
             unsafe {
                 _mm_storeu_ps(r4.as_mut_ptr(), xv);

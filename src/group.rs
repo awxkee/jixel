@@ -160,7 +160,7 @@ fn rdoq_block(
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    const RDOQ_LAMBDA: f32 = crate::enc_ac_strategy::RD_LAMBDA * 0.25;
+    const RDOQ_LAMBDA: f32 = crate::ac_strategy::RD_LAMBDA * 0.25;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -744,8 +744,8 @@ pub(crate) fn write_ac_group(
     num_nzeros: &mut [Image3B],
     coeff_shifts: &[u32],
     rdoq_prices: Option<&FrozenTokenPrices>,
-    coeff_orders: &crate::enc_coeff_order::CoeffOrders,
-    mut order_stats: Option<&mut crate::enc_coeff_order::OrderStats>,
+    coeff_orders: &crate::coeff_order::CoeffOrders,
+    mut order_stats: Option<&mut crate::coeff_order::OrderStats>,
     measure_chroma_distortion: bool,
     qf_threshold: u32,
     out: &mut [Vec<Token>],
@@ -764,7 +764,7 @@ pub(crate) fn write_ac_group(
     // quantizer below so the slope costs no extra rounding error.
     let cfl_factor_b = INV_DC_QUANT[2]
         * DC_QUANT[1]
-        * (1.0 + ytob_dc as f32 / crate::enc_color_correlation::K_COLOR_FACTOR);
+        * (1.0 + ytob_dc as f32 / crate::color_correlation::K_COLOR_FACTOR);
     let x_qm_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
@@ -1023,8 +1023,8 @@ pub(crate) fn write_ac_group(
             let cmap_x = dc_data.ytox_map.row(ty)[tx];
             let cmap_b = dc_data.ytob_map.row(ty)[tx];
             // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
-            let x_factor = crate::enc_color_correlation::y_to_x_ratio(cmap_x);
-            let b_factor = crate::enc_color_correlation::y_to_b_ratio(cmap_b);
+            let x_factor = crate::color_correlation::y_to_x_ratio(cmap_x);
+            let b_factor = crate::color_correlation::y_to_b_ratio(cmap_b);
 
             // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
             // The decoder reverses CfL in coefficient space (DequantLane) using the
@@ -1195,15 +1195,14 @@ pub(crate) fn write_ac_group(
                 inv_qm_b,
                 quant_ac,
                 scale,
-                crate::enc_frame::b_qm_mul(),
+                crate::frame::b_qm_mul(),
                 distance,
                 cx,
                 cy,
                 &mut quantized[2][..size],
             );
             if measure_chroma_distortion {
-                let q_scaled_b =
-                    quantize_ac_q_scaled(quant_ac, scale, crate::enc_frame::b_qm_mul());
+                let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, crate::frame::b_qm_mul());
                 for i in 0..size {
                     let v = i / row_stride;
                     let u = i % row_stride;
@@ -1301,7 +1300,7 @@ pub(crate) fn write_ac_group(
                     // so the tally does not depend on the current scan.
                     if pass == 0
                         && let Some(stats) = order_stats.as_deref_mut()
-                        && let Some(slot) = crate::enc_coeff_order::order_slot_of(strategy_code)
+                        && let Some(slot) = crate::coeff_order::order_slot_of(strategy_code)
                     {
                         // `c` iterates [1, 0, 2] with the pass loop nested
                         // inside, so pin the block tally to one (channel, pass).

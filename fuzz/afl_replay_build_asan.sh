@@ -28,6 +28,8 @@
 #
 
 cargo +nightly afl build
+RUSTFLAGS="-Z sanitizer=address" cargo +nightly afl build --release --target aarch64-apple-darwin
+
 
 find ./out/default/crashes -type f ! -name README.txt -print0 |
 while IFS= read -r -d '' crash; do

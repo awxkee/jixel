@@ -286,6 +286,8 @@ fn main() -> Result<()> {
     let mut with_image_avif = true;
     let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
     let mut with_butteraugli = true;
+    let mut with_jpeg = false;
+    let mut cjpegli = "cjpegli".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -390,6 +392,14 @@ fn main() -> Result<()> {
                 with_image_avif = false;
                 i += 1;
             }
+            "--jpeg" => {
+                with_jpeg = true;
+                i += 1;
+            }
+            "--cjpegli" => {
+                cjpegli = value!().to_string();
+                i += 2;
+            }
             other if other.starts_with("--") => bail!("unknown option {other}"),
             other => {
                 images.push(PathBuf::from(other));
@@ -408,6 +418,7 @@ fn main() -> Result<()> {
              [--avm-enc-speed 9] [--no-avm-enc]\n  \
              AVIF (image crate, ravif/rav1e): [--image-avif-speed 6] [--no-image-avif]\n  \
              shared: [--avif-yuv 444|420] [--no-avif]\n  \
+             JPEG reference: [--jpeg] [--cjpegli PATH]\n  \
              metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
              [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]"
         );
@@ -467,6 +478,16 @@ fn main() -> Result<()> {
         with_butteraugli = false;
     }
     let butteraugli = with_butteraugli.then_some(butteraugli_bin);
+
+    // JPEG reference: prefer cjpegli (distance-native), then libjpeg-turbo
+    // cjpeg, then the in-process image-crate encoder.
+    let jpeg_tool = if available(&cjpegli) {
+        JpegTool::Cjpegli(cjpegli.clone())
+    } else if available("cjpeg") {
+        JpegTool::Cjpeg
+    } else {
+        JpegTool::Builtin
+    };
 
     let nthreads = available_parallelism()
         .unwrap_or(NonZero::new(1).unwrap())
@@ -591,6 +612,31 @@ fn main() -> Result<()> {
                 )?;
                 println!(
                     "  image ravif      d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
+                );
+                s.points.push(p);
+            }
+            all.push(s);
+        }
+
+        // Classic JPEG reference (optional, --jpeg).
+        if with_jpeg {
+            let label = match &jpeg_tool {
+                JpegTool::Cjpegli(_) => "jpeg (cjpegli)",
+                JpegTool::Cjpeg => "jpeg (cjpeg -optimize)",
+                JpegTool::Builtin => "jpeg (image-rs)",
+            };
+            let mut s = Series {
+                label: label.into(),
+                color: RGBColor(0x60, 0x60, 0x60),
+                points: vec![],
+            };
+            for &d in &distances {
+                let p = bench_jpeg(img, d, &orig_rgb, w, h, &sc, &tmp, stem, npx, &jpeg_tool)?;
+                println!(
+                    "  jpeg             d={d:<4} {:>9} B  {:.3} bpp  {}",
                     p.bytes,
                     p.bpp,
                     p.score_str()
@@ -773,6 +819,126 @@ fn bench_cjxl(
 /// AV1 reference: encode with system `avifenc -c aom -q <quality>` (mapped from
 /// `d`), decode with system `avifdec`, score.
 #[allow(clippy::too_many_arguments)]
+/// How the optional JPEG reference series encodes (decode is always the
+/// in-process `image` crate).
+enum JpegTool {
+    /// `cjpegli` (libjxl tools): butteraugli-distance native via `-d`.
+    Cjpegli(String),
+    /// libjpeg-turbo `cjpeg -quality N -optimize` fed through a temp PPM.
+    Cjpeg,
+    /// In-process `image`-crate baseline encoder (last resort).
+    Builtin,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_jpeg(
+    img: &Path,
+    d: f32,
+    orig: &[u8],
+    w: usize,
+    h: usize,
+    sc: &Scorer,
+    tmp: &Path,
+    stem: &str,
+    npx: f64,
+    tool: &JpegTool,
+) -> Result<Point> {
+    let out = tmp.join(format!("{stem}_d{d}.jpg"));
+    let _ = std::fs::remove_file(&out);
+    let (jpg, note): (Vec<u8>, String) = match tool {
+        JpegTool::Cjpegli(bin) => {
+            let output = Command::new(bin)
+                .arg(img)
+                .arg(&out)
+                .arg("-d")
+                .arg(d.to_string())
+                .output()
+                .context("running cjpegli")?;
+            if !output.status.success() || !out.exists() {
+                bail!(
+                    "cjpegli failed for {} d={d}\nstderr: {}",
+                    img.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (std::fs::read(&out)?, format!("d{d}"))
+        }
+        JpegTool::Cjpeg => {
+            // cjpeg reads PPM, not PNG: hand it the raw RGB as P6.
+            let q = jpeg_quality_from_distance(d);
+            let ppm = tmp.join(format!("{stem}.ppm"));
+            let mut data = format!("P6\n{w} {h}\n255\n").into_bytes();
+            data.extend_from_slice(orig);
+            std::fs::write(&ppm, data)?;
+            let output = Command::new("cjpeg")
+                .arg("-quality")
+                .arg(q.to_string())
+                .arg("-optimize")
+                .arg("-outfile")
+                .arg(&out)
+                .arg(&ppm)
+                .output()
+                .context("running cjpeg")?;
+            let _ = std::fs::remove_file(&ppm);
+            if !output.status.success() || !out.exists() {
+                bail!(
+                    "cjpeg failed for {} q={q}\nstderr: {}",
+                    img.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            (std::fs::read(&out)?, format!("q{q}"))
+        }
+        JpegTool::Builtin => {
+            let q = jpeg_quality_from_distance(d);
+            let mut buf = Vec::new();
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                std::io::Cursor::new(&mut buf),
+                q,
+            );
+            image::ImageEncoder::write_image(
+                enc,
+                orig,
+                w as u32,
+                h as u32,
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("image-rs jpeg encode")?;
+            (buf, format!("q{q}"))
+        }
+    };
+    let dec = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)
+        .context("decoding jpeg")?
+        .to_rgb8();
+    if (dec.width() as usize, dec.height() as usize) != (w, h) {
+        bail!("jpeg decode size mismatch");
+    }
+    let scores = sc.score(dec.as_raw())?;
+    Ok(Point {
+        bpp: jpg.len() as f64 * 8.0 / npx,
+        bytes: jpg.len() as u64,
+        scores,
+        note,
+    })
+}
+
+/// Inverse of jixel's `distance_from_quality` (piecewise): the JPEG quality
+/// whose jixel-equivalent distance is `d`, for the quality-based encoders.
+fn jpeg_quality_from_distance(d: f32) -> u8 {
+    let q = if d <= 0.05 {
+        100.0
+    } else if d <= 0.1 {
+        100.0 - (d / 0.05).log2()
+    } else if d <= 1.0 {
+        99.0 - 9.0 * (1.0 + d.log10())
+    } else if d <= 6.4 {
+        100.0 - (d - 0.1) / 0.09
+    } else {
+        30.0 - 5.0 * ((d - 6.24) * 6.25).ln() / 2.5f32.ln()
+    };
+    q.round().clamp(1.0, 100.0) as u8
+}
+
 fn bench_avif_aom(
     img: &Path,
     d: f32,

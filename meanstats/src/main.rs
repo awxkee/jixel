@@ -30,8 +30,10 @@
 //! `meanstats` — aggregate encoder quality over a *folder* of images.
 //!
 //! Where `stats` produces an R/D chart per single image, `meanstats` runs the
-//! same encoders — jixel, `cjxl` at each effort, and (optionally) the libavif
-//! aom AV1 reference — over every image in a folder at each requested
+//! same encoders — jixel, `cjxl` at each effort, (optionally) the libavif
+//! aom AV1 reference, and (optionally, `--jpeg`) a classic JPEG reference
+//! (cjpegli when available, else cjpeg/libjpeg-turbo, else the image crate)
+//! — over every image in a folder at each requested
 //! butteraugli distance, decodes, scores SSIMULACRA2, and reports the **folder
 //! mean** rate (bits/pixel) and SSIMULACRA2 per series. It prints the per-series
 //! means and draws one aggregate R/D chart (mean SS2 vs mean bpp), one line per
@@ -41,7 +43,7 @@
 //! ```text
 //! meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]
 //!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]
-//!                  [--no-aom] [--no-cjxl] [--patches]
+//!                  [--no-aom] [--no-cjxl] [--patches] [--jpeg] [--cjpegli PATH]
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -88,6 +90,18 @@ enum Kind {
     Jixel,
     Cjxl(u32),
     Aom,
+    Jpeg,
+}
+
+/// How the optional JPEG reference series encodes (decode is always the
+/// in-process `image` crate).
+enum JpegTool {
+    /// `cjpegli` (libjxl tools): butteraugli-distance native via `-d`.
+    Cjpegli(String),
+    /// libjpeg-turbo `cjpeg -quality N -optimize` fed through a temp PPM.
+    Cjpeg,
+    /// In-process `image`-crate baseline encoder (last resort).
+    Builtin,
 }
 
 /// System libavif (aom / AV1) reference tool configuration.
@@ -128,6 +142,8 @@ fn main() -> Result<()> {
     let mut patches = false;
     let mut with_cjxl = true;
     let mut with_aom = true;
+    let mut with_jpeg = false;
+    let mut cjpegli = "cjpegli".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -176,6 +192,14 @@ fn main() -> Result<()> {
                 with_aom = false;
                 i += 1;
             }
+            "--jpeg" => {
+                with_jpeg = true;
+                i += 1;
+            }
+            "--cjpegli" => {
+                cjpegli = arg(&args, i + 1)?.to_string();
+                i += 2;
+            }
             "-h" | "--help" => usage(),
             other => {
                 if folder.is_some() {
@@ -206,6 +230,15 @@ fn main() -> Result<()> {
         );
         with_aom = false;
     }
+    // JPEG reference: prefer cjpegli (distance-native), then libjpeg-turbo
+    // cjpeg, then the in-process image-crate encoder.
+    let jpeg_tool = if available(&cjpegli) {
+        JpegTool::Cjpegli(cjpegli.clone())
+    } else if available("cjpeg") {
+        JpegTool::Cjpeg
+    } else {
+        JpegTool::Builtin
+    };
 
     let images = collect_images(&folder)?;
     if images.is_empty() {
@@ -253,6 +286,19 @@ fn main() -> Result<()> {
         });
         kinds.push(Kind::Aom);
     }
+    if with_jpeg {
+        let label = match &jpeg_tool {
+            JpegTool::Cjpegli(_) => "jpeg (cjpegli)",
+            JpegTool::Cjpeg => "jpeg (cjpeg -optimize)",
+            JpegTool::Builtin => "jpeg (image-rs)",
+        };
+        series.push(Series {
+            label: label.into(),
+            color: RGBColor(0x60, 0x60, 0x60),
+            points: vec![],
+        });
+        kinds.push(Kind::Jpeg);
+    }
 
     for &d in &distances {
         println!("=== distance d={d} ===");
@@ -275,6 +321,7 @@ fn main() -> Result<()> {
                     Kind::Jixel => bench_jixel(&rgb, w, h, d, &tmp, stem, npx, threads, patches),
                     Kind::Cjxl(e) => bench_cjxl(img, *e, d, &rgb, w, h, &tmp, stem, npx),
                     Kind::Aom => bench_avif_aom(img, d, &rgb, w, h, &tmp, stem, npx, &tools),
+                    Kind::Jpeg => bench_jpeg(img, d, &rgb, w, h, &tmp, stem, npx, &jpeg_tool),
                 };
                 match res {
                     Ok(s) => buckets[idx].push(s),
@@ -483,6 +530,112 @@ fn bench_avif_aom(
         bpp: bytes as f64 * 8.0 / npx,
         ss2,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_jpeg(
+    img: &Path,
+    d: f32,
+    orig: &[u8],
+    w: usize,
+    h: usize,
+    tmp: &Path,
+    stem: &str,
+    npx: f64,
+    tool: &JpegTool,
+) -> Result<Sample> {
+    let out = tmp.join(format!("{stem}_d{d}.jpg"));
+    let _ = std::fs::remove_file(&out);
+    let jpg: Vec<u8> = match tool {
+        JpegTool::Cjpegli(bin) => {
+            let output = Command::new(bin)
+                .arg(img)
+                .arg(&out)
+                .arg("-d")
+                .arg(d.to_string())
+                .output()
+                .context("running cjpegli")?;
+            if !output.status.success() || !out.exists() {
+                bail!(
+                    "cjpegli failed for {} d={d}\nstderr: {}",
+                    img.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::read(&out)?
+        }
+        JpegTool::Cjpeg => {
+            // cjpeg reads PPM, not PNG: hand it the raw RGB as P6.
+            let q = jpeg_quality_from_distance(d);
+            let ppm = tmp.join(format!("{stem}.ppm"));
+            let mut data = format!("P6\n{w} {h}\n255\n").into_bytes();
+            data.extend_from_slice(orig);
+            std::fs::write(&ppm, data)?;
+            let output = Command::new("cjpeg")
+                .arg("-quality")
+                .arg(q.to_string())
+                .arg("-optimize")
+                .arg("-outfile")
+                .arg(&out)
+                .arg(&ppm)
+                .output()
+                .context("running cjpeg")?;
+            let _ = std::fs::remove_file(&ppm);
+            if !output.status.success() || !out.exists() {
+                bail!(
+                    "cjpeg failed for {} q={q}\nstderr: {}",
+                    img.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::read(&out)?
+        }
+        JpegTool::Builtin => {
+            let q = jpeg_quality_from_distance(d);
+            let mut buf = Vec::new();
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                std::io::Cursor::new(&mut buf),
+                q,
+            );
+            image::ImageEncoder::write_image(
+                enc,
+                orig,
+                w as u32,
+                h as u32,
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("image-rs jpeg encode")?;
+            buf
+        }
+    };
+    let dec = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)
+        .context("decoding jpeg")?
+        .to_rgb8();
+    if (dec.width() as usize, dec.height() as usize) != (w, h) {
+        bail!("jpeg decode size mismatch");
+    }
+    let ss2 = score(orig, dec.as_raw(), w, h)?;
+    Ok(Sample {
+        bpp: jpg.len() as f64 * 8.0 / npx,
+        ss2,
+    })
+}
+
+/// Inverse of jixel's `distance_from_quality` (piecewise): the JPEG quality
+/// whose jixel-equivalent distance is `d`, for the quality-based encoders.
+fn jpeg_quality_from_distance(d: f32) -> u8 {
+    let q = if d <= 0.05 {
+        100.0
+    } else if d <= 0.1 {
+        100.0 - (d / 0.05).log2()
+    } else if d <= 1.0 {
+        99.0 - 9.0 * (1.0 + d.log10())
+    } else if d <= 6.4 {
+        100.0 - (d - 0.1) / 0.09
+    } else {
+        30.0 - 5.0 * ((d - 6.24) * 6.25).ln() / 2.5f32.ln()
+    };
+    q.round().clamp(1.0, 100.0) as u8
 }
 
 /// Map a JPEG XL butteraugli `distance` to an approximate AVIF quality (0–100,
@@ -740,7 +893,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]\n\
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
-         \x20                [--no-aom] [--no-cjxl]\n\
+         \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
          image in FOLDER at each distance, decodes, scores SSIMULACRA2, prints the folder\n  \
          mean bpp/SS2 per series, and writes an aggregate R/D chart to DIR."

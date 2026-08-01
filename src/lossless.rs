@@ -3471,7 +3471,6 @@ fn try_encode_context_tree_multi_group(
 
 use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
-use crate::enc_xyb::quantize_xyb_channels;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
     OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
@@ -3481,6 +3480,7 @@ use crate::patches::{
     ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
     find_lossless_patches,
 };
+use crate::xyb::quantize_xyb_channels;
 use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 // Tree writing (balanced N-leaf, Gradient predictor).

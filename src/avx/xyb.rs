@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::enc_xyb::*;
+use crate::xyb::*;
 use std::arch::x86_64::*;
 
 #[inline]
@@ -84,23 +84,28 @@ fn vcbrt_fast3_positive_avx2(a0: __m256, a1: __m256, a2: __m256) -> (__m256, __m
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn rgb_to_xyb_f32x8_avx2(r: __m256, g: __m256, b: __m256) -> (__m256, __m256, __m256) {
+fn rgb_to_xyb_f32x8_avx2(
+    m: &XybMatrix,
+    r: __m256,
+    g: __m256,
+    b: __m256,
+) -> (__m256, __m256, __m256) {
     let bias = _mm256_set1_ps(OPSIN_BIAS);
 
-    // mixed0 = M00*r + M01*g + M02*b + OPSIN_BIAS
-    let mut mixed0 = _mm256_fmadd_ps(b, _mm256_set1_ps(M02), bias);
-    mixed0 = _mm256_fmadd_ps(g, _mm256_set1_ps(M01), mixed0);
-    mixed0 = _mm256_fmadd_ps(r, _mm256_set1_ps(M00), mixed0);
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed0 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[2]), bias);
+    mixed0 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[1]), mixed0);
+    mixed0 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[0]), mixed0);
 
-    // mixed1 = M10*r + M11*g + M12*b + OPSIN_BIAS
-    let mut mixed1 = _mm256_fmadd_ps(b, _mm256_set1_ps(M12), bias);
-    mixed1 = _mm256_fmadd_ps(g, _mm256_set1_ps(M11), mixed1);
-    mixed1 = _mm256_fmadd_ps(r, _mm256_set1_ps(M10), mixed1);
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed1 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[5]), bias);
+    mixed1 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[4]), mixed1);
+    mixed1 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[3]), mixed1);
 
-    // mixed2 = M20*r + M21*g + M22*b + OPSIN_BIAS
-    let mut mixed2 = _mm256_fmadd_ps(b, _mm256_set1_ps(M22), bias);
-    mixed2 = _mm256_fmadd_ps(g, _mm256_set1_ps(M21), mixed2);
-    mixed2 = _mm256_fmadd_ps(r, _mm256_set1_ps(M20), mixed2);
+    // mixed2 = m20*r + m21*g + m22*b + OPSIN_BIAS (B row selected by RED)
+    let mut mixed2 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[8]), bias);
+    mixed2 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[7]), mixed2);
+    mixed2 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[6]), mixed2);
 
     let zero = _mm256_setzero_ps();
     mixed0 = _mm256_max_ps(mixed0, zero);
@@ -124,7 +129,12 @@ fn rgb_to_xyb_f32x8_avx2(r: __m256, g: __m256, b: __m256) -> (__m256, __m256, __
 
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn to_xyb_avx2_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+pub(crate) fn to_xyb_avx2_band(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+    w: usize,
+) {
     let [rp, gp, bp] = input;
     let [xp, yp, out_bp] = output;
     for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
@@ -154,7 +164,7 @@ pub(crate) fn to_xyb_avx2_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { _mm256_loadu_ps(g8.as_ptr()) };
             let b = unsafe { _mm256_loadu_ps(b8.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(m, r, g, b);
 
             unsafe {
                 _mm256_storeu_ps(x8.as_mut_ptr(), xv);
@@ -174,7 +184,7 @@ pub(crate) fn to_xyb_avx2_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { _mm256_loadu_ps(g8.as_ptr()) };
             let b = unsafe { _mm256_loadu_ps(b8.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(m, r, g, b);
 
             unsafe {
                 _mm256_storeu_ps(r8.as_mut_ptr(), xv);

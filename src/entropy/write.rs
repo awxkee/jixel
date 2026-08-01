@@ -37,8 +37,8 @@ use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
-use crate::enc_lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
 use crate::entropy::f_log2;
+use crate::lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
 
 pub(crate) const ANS_ENABLED: bool = true;
 
@@ -1213,7 +1213,7 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
 #[cfg(test)]
 mod context_map_tests {
     use super::{RunSymbol, move_to_front_transform, run_length_symbols};
-    use crate::enc_lz77_ac::{LZ77_MIN_LENGTH, lz77_length_encode};
+    use crate::lz77_ac::{LZ77_MIN_LENGTH, lz77_length_encode};
 
     /// Decode a run-length stream the way the JXL reader does: a copy of
     /// `length` symbols from distance 1, i.e. repeat the previous symbol.

@@ -476,7 +476,7 @@ fn coefficient_dist_and_rate(
         let qm_mult = if c == 0 {
             qm_mult_x
         } else if c == 2 {
-            crate::enc_frame::b_qm_mul()
+            crate::frame::b_qm_mul()
         } else {
             1.0
         };
@@ -674,9 +674,9 @@ fn cmap_factors(ytox_map: &ImageSB, ytob_map: &ImageSB, bx: usize, by: usize) ->
     let tx = (bx / 8).min(ytox_map.xsize() - 1);
     let ty = (by / 8).min(ytox_map.ysize() - 1);
     [
-        crate::enc_color_correlation::y_to_x_ratio(ytox_map.row(ty)[tx]),
+        crate::color_correlation::y_to_x_ratio(ytox_map.row(ty)[tx]),
         0.0,
-        crate::enc_color_correlation::y_to_b_ratio(ytob_map.row(ty)[tx]),
+        crate::color_correlation::y_to_b_ratio(ytob_map.row(ty)[tx]),
     ]
 }
 
@@ -1588,7 +1588,14 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new(crate::Speed::Fast, None, false, 1.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Fast,
+            None,
+            false,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);

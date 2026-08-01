@@ -41,7 +41,10 @@ const R_NZ_BASE: f32 = 1.6;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
 // Per-channel distortion weights (X, Y, B).
-pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.10, 1.0, 0.83];
+// Re-fitted 2026-08-01 for the spec opsin matrix (b_bias revert): breadth
+// study wants cw_b ~0.28 (the 0.83 was fitted for the blue-biased row whose
+// B channel carried 1.5x more energy); cw_x is a flat axis, 0.30 is mid-plateau.
+pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.30, 1.0, 0.28];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
 pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];
@@ -259,7 +262,7 @@ pub(crate) fn channel_rd(
     let width = cx * 8;
     let height = cy * 8;
     let half = width / 2;
-    let thr = crate::enc_group::quantize_ac_thresholds(channel, cx, cy, distance);
+    let thr = crate::group::quantize_ac_thresholds(channel, cx, cy, distance);
     let (sse, nzeros, mag_bits) = unsafe {
         sse_and_rate_fn(
             coeff,
@@ -733,11 +736,11 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let half = width / 2;
     let (pixel_width, pixel_height) = strategy_pixel_dims(strategy);
     let thresholds = [
-        crate::enc_group::quantize_ac_thresholds(0, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(1, cx, cy, distance),
-        crate::enc_group::quantize_ac_thresholds(2, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(0, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(1, cx, cy, distance),
+        crate::group::quantize_ac_thresholds(2, cx, cy, distance),
     ];
-    let quant_scales = [qac * qm_mult_x, qac, qac * crate::enc_frame::b_qm_mul()];
+    let quant_scales = [qac * qm_mult_x, qac, qac * crate::frame::b_qm_mul()];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
     let [
