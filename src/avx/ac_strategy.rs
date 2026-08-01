@@ -58,9 +58,10 @@ pub(crate) fn sse_and_rate_avx2(
     cy: usize,
     _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
     debug_assert!(width.is_multiple_of(8));
 
     let qs = _mm256_set1_ps(q_scaled);
@@ -70,6 +71,7 @@ pub(crate) fn sse_and_rate_avx2(
     let mut sse_acc = _mm256_setzero_ps();
     let mut mag_acc = _mm256_setzero_ps();
     let mut nzeros = 0usize;
+    let mut scan_acc = _mm256_setzero_si256();
 
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let izero = _mm256_setzero_si256();
@@ -150,11 +152,45 @@ pub(crate) fn sse_and_rate_avx2(
             if rate_bits != 0 {
                 let ratev = avx2_log2p1_f32(absq);
                 mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe {
+                    _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x) as *const __m256i)
+                };
+                scan_acc = _mm256_max_epu32(
+                    scan_acc,
+                    _mm256_and_si256(sv, _mm256_castps_si256(rate_mask)),
+                );
             }
         }
     }
 
-    (hsum256(sse_acc), nzeros, hsum256(mag_acc))
+    let v_max = _mm_max_epu32(
+        _mm256_castsi256_si128(scan_acc),
+        _mm256_extracti128_si256::<1>(scan_acc),
+    );
+    let max_scan = hmax_u32(v_max);
+
+    (hsum256(sse_acc), nzeros, hsum256(mag_acc), max_scan)
+}
+
+#[inline]
+pub(crate) const fn _mm_shuffle(z: u32, y: u32, x: u32, w: u32) -> i32 {
+    ((z << 6) | (y << 4) | (x << 2) | w) as i32
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(crate) fn hmax_u32(v: __m128i) -> u32 {
+    // swap the two 64-bit halves: [a,b,c,d] -> [c,d,a,b]
+    let t1 = _mm_shuffle_epi32::<{ _mm_shuffle(1, 0, 3, 2) }>(v);
+    let m1 = _mm_max_epu32(v, t1);
+
+    // swap adjacent 32-bit lanes: [x,y,x,y] -> [y,x,y,x]
+    let t2 = _mm_shuffle_epi32::<{ _mm_shuffle(2, 3, 0, 1) }>(m1);
+    let m2 = _mm_max_epu32(m1, t2);
+
+    _mm_cvtsi128_si32(m2) as u32
 }
 
 #[inline]

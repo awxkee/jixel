@@ -139,11 +139,20 @@ pub(crate) fn sse_and_rate_wasm(
             if rate_bits != 0 {
                 let ratev = wasm_log2p1_f32(absq);
                 mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x) as *const v128) };
+                scan_acc = u32x4_max(scan_acc, v128_and(sv, rate_mask));
             }
         }
     }
 
-    (hsum4(sse_acc), nzeros, hsum4(mag_acc))
+    let max_scan = u32x4_extract_lane::<0>(scan_acc)
+        .max(u32x4_extract_lane::<1>(scan_acc))
+        .max(u32x4_extract_lane::<2>(scan_acc))
+        .max(u32x4_extract_lane::<3>(scan_acc));
+
+    (hsum4(sse_acc), nzeros, hsum4(mag_acc), max_scan)
 }
 
 #[inline]

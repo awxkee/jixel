@@ -47,15 +47,17 @@ pub(crate) fn sse_and_rate_neon(
     cy: usize,
     _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = vdupq_n_f32(q_scaled);
     let mut sse_acc = vdupq_n_f32(0.0);
     let mut nz_acc = vdupq_n_u32(0);
     let mut mag_acc = vdupq_n_f32(0.0);
+    let mut scan_acc = vdupq_n_u32(0);
     let zero = vdupq_n_f32(0.0);
     let all_active = vdupq_n_u32(u32::MAX);
     let lane_ids = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
@@ -119,6 +121,10 @@ pub(crate) fn sse_and_rate_neon(
             if vmaxvq_u32(rate_mask) != 0 {
                 let ratev = neon_log2p1_f32(absq);
                 mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate_mask, ratev, zero));
+                // Scan position of the nonzeros (LLF slots are never nonzero
+                // here, so masked-to-zero lanes are neutral for the max).
+                let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
+                scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, rate_mask));
             }
         }
     }
@@ -126,6 +132,7 @@ pub(crate) fn sse_and_rate_neon(
         vaddvq_f32(sse_acc),
         vaddvq_u32(nz_acc) as usize,
         vaddvq_f32(mag_acc),
+        vmaxvq_u32(scan_acc),
     )
 }
 
@@ -213,8 +220,10 @@ mod tests {
         cx: usize,
         cy: usize,
         thr: &[f32; 4],
-    ) -> (f32, usize, f32) {
+        scan_pos: &[u32],
+    ) -> (f32, usize, f32, u32) {
         let (mut sse, mut nzeros, mut mag_bits) = (0.0f32, 0usize, 0.0f32);
+        let mut max_scan = 0u32;
         for y in 0..h {
             let yfix = if y >= h / 2 { 2 } else { 0 };
             for x in 0..w {
@@ -230,10 +239,11 @@ mod tests {
                 if q != 0.0 {
                     nzeros += 1;
                     mag_bits += (1.0 + q.abs()).log2();
+                    max_scan = max_scan.max(scan_pos[i]);
                 }
             }
         }
-        (sse, nzeros, mag_bits)
+        (sse, nzeros, mag_bits, max_scan)
     }
 
     #[test]
@@ -267,7 +277,8 @@ mod tests {
                     random() * 0.6,
                     random() * 0.6,
                 ];
-                let expected = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr);
+                let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
+                let expected = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos);
                 let actual = unsafe {
                     sse_and_rate_neon(
                         &coeff,
@@ -280,10 +291,12 @@ mod tests {
                         cy,
                         crate::inflated_cost::rate_log2_lut(),
                         &thr,
+                        scan_pos,
                     )
                 };
 
                 assert_eq!(actual.1, expected.1, "nzeros mismatch for {w}x{h}");
+                assert_eq!(actual.3, expected.3, "max-scan mismatch for {w}x{h}");
                 let sse_rel = (actual.0 - expected.0).abs() / expected.0.abs().max(1.0);
                 let mag_rel = (actual.2 - expected.2).abs() / expected.2.abs().max(1.0);
                 assert!(sse_rel < 1e-4, "SSE relative error {sse_rel} for {w}x{h}");

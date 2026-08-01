@@ -200,18 +200,20 @@ fn recon_quantize_neon(
     cy: usize,
     coeff_error: &mut [f32],
     _rate_log2_lut: &RateLog2Lut,
+    scan_pos: &[u32],
 ) -> f32 {
     let n = width
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n && scan_pos.len() >= n);
     let scale = vdupq_n_f32(quant_scale);
     let zero = vdupq_n_f32(0.0);
     let all = vdupq_n_u32(u32::MAX);
     let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
     let mut nonzero = 0usize;
     let mut magnitude_bits = vdupq_n_f32(0.0);
+    let mut scan_acc = vdupq_n_u32(0);
     for (y, ((coeff_row, inv_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
@@ -260,13 +262,19 @@ fn recon_quantize_neon(
                 magnitude_bits,
                 vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
             );
+            let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
+            scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
         }
     }
     let header = vgetq_lane_f32::<0>(neon_log2p1_f32(vsetq_lane_f32::<0>(
         nonzero as f32,
         vdupq_n_f32(0.0),
     )));
-    nonzero as f32 * 1.6 + vaddvq_f32(magnitude_bits) + 0.4 * header
+    nonzero as f32 * 1.6
+        + vaddvq_f32(magnitude_bits)
+        + 0.4 * header
+        + crate::inflated_cost::R_ZERO
+            * crate::inflated_cost::visited_zeros(nonzero, vmaxvq_u32(scan_acc), cx, cy)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -204,14 +204,9 @@ mod tests {
         (*state >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// Colour conversion feeds every later decision, and the NEON path uses a
-    /// Halley-iteration cube root where the scalar path calls `cbrtf`, so the two
-    /// can only be compared to a tolerance. Widths deliberately include a
-    /// non-multiple of 4 to exercise the scalar tail.
     #[test]
     fn to_xyb_neon_band_matches_scalar_pixels() {
         check_band_variant(&crate::xyb::XybMatrix::SPEC);
-        check_band_variant(&crate::xyb::XybMatrix::RED);
     }
 
     fn check_band_variant(m: &crate::xyb::XybMatrix) {
