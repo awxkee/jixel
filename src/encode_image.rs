@@ -633,14 +633,28 @@ pub fn distance_from_quality(quality: f32) -> f32 {
     d.min(25.0)
 }
 
-fn lossy_context(config: &EncodeConfig, distance: f32, xyb: XybMatrix) -> EncodingContext {
+fn lossy_context(
+    config: &EncodeConfig,
+    distance: f32,
+    xyb: XybMatrix,
+    pixels: usize,
+) -> EncodingContext {
+    // Fastest's work per pixel is deliberately small, so oversubscribing tiny
+    // images spends more time constructing and synchronizing workers than it
+    // saves. Keep the requested count as a maximum and give each active lane
+    // roughly 64K pixels; larger images still receive the full thread budget.
+    let num_threads = if config.speed == Speed::Fastest {
+        config.num_threads.min(pixels.div_ceil(64 * 1024).max(1))
+    } else {
+        config.num_threads
+    };
     EncodingContext::new(
         config.speed,
         config.boost,
         config.banding_protection,
         xyb,
         distance,
-        config.num_threads,
+        num_threads,
     )
 }
 
@@ -785,11 +799,7 @@ pub fn encode_image(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = srgb_lut();
-    let ctx = lossy_context(
-        config,
-        distance,
-        XybMatrix::SPEC,
-    );
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
@@ -854,11 +864,7 @@ pub fn encode_image_with_alpha(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = srgb_lut();
-    let ctx = lossy_context(
-        config,
-        distance,
-        XybMatrix::SPEC,
-    );
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
@@ -1050,7 +1056,7 @@ fn encode_gray_impl(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let srgb_lut = srgb_lut();
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| {
         srgb_lut[v as usize]
@@ -1283,7 +1289,7 @@ fn encode_gray_high_depth_impl(
 
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| lut[v as usize]);
 
@@ -1352,7 +1358,7 @@ fn encode_high_depth_rgba(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
 
     // For 16-bit, (1 << 16) - 1 overflows u16's shift; compute in u32 and cap.
@@ -1513,7 +1519,7 @@ fn encode_float_rgba(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     // Float input skips the red-dominance classifier (integer-domain sampling).
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
 
     if has_alpha {
@@ -1569,7 +1575,7 @@ fn encode_float_gray(
         });
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
     let cfg = EncodeConfigImpl::with_distance(distance)
@@ -2223,7 +2229,7 @@ mod tests {
         use std::sync::{Barrier, Mutex};
 
         let config = EncodeConfig::default().with_num_threads(4);
-        let ctx = lossy_context(&config, 1.0, XybMatrix::SPEC);
+        let ctx = lossy_context(&config, 1.0, XybMatrix::SPEC, 1);
         let mut scratch = Box::<CoderScratch>::default();
         let mut image = Image3F::new(8, 4);
         let barrier = Barrier::new(4);

@@ -154,9 +154,7 @@ pub(crate) fn sse_and_rate_avx2(
                 mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
                 // Scan position of the nonzeros (masked lanes drop to zero,
                 // which is neutral: LLF slots are never nonzero here).
-                let sv = unsafe {
-                    _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x) as *const __m256i)
-                };
+                let sv = unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
                 scan_acc = _mm256_max_epu32(
                     scan_acc,
                     _mm256_and_si256(sv, _mm256_castps_si256(rate_mask)),
@@ -256,8 +254,10 @@ mod tests {
         cx: usize,
         cy: usize,
         thr: &[f32; 4],
-    ) -> (f32, usize, f32) {
+        scan_pos: &[u32],
+    ) -> (f32, usize, f32, u32) {
         let (mut sse, mut nz, mut mb) = (0.0f32, 0usize, 0.0f32);
+        let mut max_scan = 0u32;
         for y in 0..h {
             let yfix = if y >= h / 2 { 2 } else { 0 };
             let (lo, hi) = (thr[yfix], thr[yfix + 1]);
@@ -281,10 +281,11 @@ mod tests {
                         crate::inflated_cost::rate_log2_lut(),
                         q.abs(),
                     );
+                    max_scan = max_scan.max(scan_pos[idx]);
                 }
             }
         }
-        (sse, nz, mb)
+        (sse, nz, mb, max_scan)
     }
 
     #[test]
@@ -313,7 +314,8 @@ mod tests {
                 let inv: Vec<f32> = (0..n).map(|_| 0.001 + rnd() * 0.5).collect();
                 let qs = 0.5 + rnd() * 3.0;
                 let thr = [rnd() * 0.6, rnd() * 0.6, rnd() * 0.6, rnd() * 0.6];
-                let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr);
+                let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
+                let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos);
                 let a = unsafe {
                     sse_and_rate_avx2(
                         &coeff,
@@ -326,10 +328,12 @@ mod tests {
                         cy,
                         crate::inflated_cost::rate_log2_lut(),
                         &thr,
+                        scan_pos,
                     )
                 };
                 // `nzeros` is a discrete decision and must match exactly.
                 assert_eq!(a.1, r.1, "nzeros mismatch {w}x{h}");
+                assert_eq!(a.3, r.3, "max-scan mismatch {w}x{h}");
                 let mag_rel = if r.2.abs() > 1e-3 {
                     ((a.2 - r.2) / r.2).abs()
                 } else {

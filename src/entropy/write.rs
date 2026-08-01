@@ -379,6 +379,36 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
+    optimize_entropy_code_ac_streams_impl(
+        streams,
+        num_contexts,
+        huffman_pool,
+        select_configs,
+        false,
+    )
+}
+
+pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
+    streams: I,
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
+    optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true)
+}
+
+fn optimize_entropy_code_ac_streams_impl<'a, I>(
+    streams: I,
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    select_configs: bool,
+    fast_cluster: bool,
+) -> OwnedEntropyCode
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
     // Collected so the tokens can be walked twice: once to cluster under the
     // default config, once to rebuild histograms under the selected per-cluster
     // configs. Only the slice headers are copied.
@@ -389,7 +419,45 @@ where
         build_histograms(tokens, None, &mut histograms);
     }
     let mut context_map: Vec<u8> = Vec::new();
-    cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+    if fast_cluster {
+        const COARSE_CLUSTERS: usize = 64;
+        const NZ_CONTEXTS: usize = crate::ac_context::K_NON_ZERO_BUCKETS;
+        let mut coarse = vec![Histogram::new(); COARSE_CLUSTERS];
+        let mut coarse_map = vec![0usize; num_contexts];
+        for (context, histogram) in histograms.iter().enumerate() {
+            let bucket = if context < NZ_CONTEXTS {
+                context * (COARSE_CLUSTERS / 2) / NZ_CONTEXTS
+            } else {
+                let z_contexts = num_contexts - NZ_CONTEXTS;
+                COARSE_CLUSTERS / 2
+                    + (context - NZ_CONTEXTS) * (COARSE_CLUSTERS / 2) / z_contexts.max(1)
+            };
+            coarse_map[context] = bucket.min(COARSE_CLUSTERS - 1);
+            let dst = &mut coarse[coarse_map[context]];
+            for (out, &count) in dst.counts.iter_mut().zip(histogram.counts.iter()) {
+                *out += count;
+            }
+            dst.total_count += histogram.total_count;
+        }
+        let mut dense = [u8::MAX; COARSE_CLUSTERS];
+        histograms.clear();
+        for (bucket, histogram) in coarse.into_iter().enumerate() {
+            if histogram.total_count != 0 {
+                dense[bucket] = histograms.len() as u8;
+                histograms.push(histogram);
+            }
+        }
+        if histograms.is_empty() {
+            histograms.push(Histogram::new());
+        }
+        context_map.extend(coarse_map.into_iter().map(|bucket| {
+            (dense[bucket] != u8::MAX)
+                .then_some(dense[bucket])
+                .unwrap_or(0)
+        }));
+    } else {
+        cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+    }
 
     // Second walk: pick each final cluster's HybridUint config from its actual
     // token values (DEFAULT is among the candidates, so this can only move

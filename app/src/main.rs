@@ -136,7 +136,7 @@ fn main() {
         height as usize,
         threads,
     ));
-    // black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
+    black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
 
     let mut jixel_times = Vec::with_capacity(iterations);
     let mut libjxl_times = Vec::with_capacity(iterations);
@@ -147,11 +147,11 @@ fn main() {
     for iteration in 0..iterations {
         let (jixel, libjxl) = if iteration % 2 == 0 {
             let jixel = encode_jixel(rgb.as_raw(), width as usize, height as usize, threads);
-            let libjxl = Measurement { elapsed: Duration::from_millis(270), bytes: vec![0; 2956271]}; //encode_libjxl(rgb.as_raw(), width, height, threads);
+            let libjxl = encode_libjxl(rgb.as_raw(), width, height, threads);
             (jixel, libjxl)
         } else {
             let libjxl = encode_libjxl(rgb.as_raw(), width, height, threads);
-            let jixel =  Measurement { elapsed: Duration::from_millis(270), bytes: vec![0; 2956271]};//encode_jixel(rgb.as_raw(), width as usize, height as usize, threads);
+            let jixel = encode_jixel(rgb.as_raw(), width as usize, height as usize, threads);
             (jixel, libjxl)
         };
         jixel_times.push(jixel.elapsed);
