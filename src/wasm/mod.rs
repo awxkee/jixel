@@ -29,19 +29,28 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod cfl;
+mod dark_aq;
 mod dct;
+mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 mod ytob;
 
 pub(crate) use ac_strategy::sse_and_rate_wasm;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
+pub(crate) use dark_aq::dark_structure_stats_wasm;
 pub(crate) use dct::*;
+pub(crate) use inflated_cost::{combine_error_wasm, error_gradient_energy_wasm};
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::{quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc_wasm};
+pub(crate) use quant::{
+    apply_quant_field_gain_wasm, apply_structure_aq_wasm, quantize_block_ac_wasm,
+    quantize_dc_cfl_wasm, quantize_dc_wasm,
+};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm};
+pub(crate) use structure_aq::block_features_wasm;
 pub(crate) use xyb::to_xyb_wasm_band;
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};

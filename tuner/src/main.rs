@@ -37,6 +37,8 @@ fn main() -> ExitCode {
     let mut threads: usize = 1;
     let mut boost: Option<jixel::DarkAqConfig> = None;
     let mut speed = jixel::Speed::Fast;
+    let mut lossless = false;
+    let mut banding = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -77,6 +79,14 @@ fn main() -> ExitCode {
                 };
                 i += 2;
             }
+            "--banding" => {
+                banding = true;
+                i += 1;
+            }
+            "--lossless" => {
+                lossless = true;
+                i += 1;
+            }
             "-h" | "--help" => usage(),
             other => {
                 positional.push(other.to_string());
@@ -90,7 +100,12 @@ fn main() -> ExitCode {
     }
     let input = &positional[0];
     let output = &positional[1];
-    let distance = distance.unwrap_or_else(|| usage());
+    let distance = if lossless {
+        // Ignored by the lossless path, but config validation wants it valid.
+        distance.unwrap_or(1.0)
+    } else {
+        distance.unwrap_or_else(|| usage())
+    };
 
     let image = match image::open(Path::new(input)) {
         Ok(img) => img,
@@ -104,12 +119,15 @@ fn main() -> ExitCode {
     let rgb = image.to_rgb8();
 
     let mut cfg = jixel::EncodeConfig::default()
-        .with_lossless(false)
+        .with_lossless(lossless)
         .with_distance(distance)
         .with_num_threads(threads.max(1))
         .with_speed(speed);
     if let Some(b) = boost {
         cfg = cfg.with_dark_aq_config(b);
+    }
+    if banding {
+        cfg = cfg.with_banding_protection();
     }
 
     let start = Instant::now();

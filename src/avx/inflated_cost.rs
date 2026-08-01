@@ -28,51 +28,159 @@
  */
 
 use crate::avx::ac_strategy::{avx2_log2p1_f32, hsum256};
-use crate::image::{Image3F, Plane};
-use crate::inflated_cost::{RateLog2Lut, recon_dist_and_rate_with_kernels, validate_ssim_inputs};
+use crate::image::Plane;
+use crate::inflated_cost::{
+    RateLog2Lut, ReconDistInput, ReconErrorKernels, ReconKernels, recon_dist_and_rate_with_kernels,
+    validate_ssim_inputs,
+};
 use std::arch::x86_64::*;
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn accumulate_gradient_vectors_x8(left: __m256, right: __m256, sum: __m256) -> __m256 {
+    let difference = _mm256_sub_ps(right, left);
+    _mm256_fmadd_ps(difference, difference, sum)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn accumulate_gradient_x8(left: &[f32; 8], right: &[f32; 8], sum: __m256) -> __m256 {
+    let left = unsafe { _mm256_loadu_ps(left.as_ptr()) };
+    let right = unsafe { _mm256_loadu_ps(right.as_ptr()) };
+    accumulate_gradient_vectors_x8(left, right, sum)
+}
+
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn error_gradient_energy_avx2(error: &[f32], width: usize, height: usize) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let rows = error[..n].chunks_exact(width);
+    let mut sum = _mm256_setzero_ps();
+
+    for row in rows.clone() {
+        let (row8, row_tail) = row.as_chunks::<8>();
+        if row_tail.is_empty() {
+            for (chunk, left) in row8.iter().enumerate() {
+                let left = unsafe { _mm256_loadu_ps(left.as_ptr()) };
+                let right = if chunk + 1 == row8.len() {
+                    _mm256_permutevar8x32_ps(left, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7))
+                } else {
+                    unsafe { _mm256_loadu_ps(row.as_ptr().add(chunk * 8 + 1)) }
+                };
+                sum = accumulate_gradient_vectors_x8(left, right, sum);
+            }
+            continue;
+        }
+        let (left8, tail) = row[..width - 1].as_chunks::<8>();
+        for (chunk, left) in left8.iter().enumerate() {
+            let right = row[chunk * 8 + 1..].first_chunk::<8>().unwrap();
+            sum = accumulate_gradient_x8(left, right, sum);
+        }
+        if !tail.is_empty() {
+            let offset = left8.len() * 8;
+            let mut left = [0.0; 8];
+            let mut right = [0.0; 8];
+            left[..tail.len()].copy_from_slice(tail);
+            right[..tail.len()].copy_from_slice(&row[offset + 1..width]);
+            sum = accumulate_gradient_x8(&left, &right, sum);
+        }
+    }
+
+    for (top, bottom) in rows.clone().zip(rows.skip(1)) {
+        let (top8, top_tail) = top.as_chunks::<8>();
+        let (bottom8, bottom_tail) = bottom.as_chunks::<8>();
+        for (top, bottom) in top8.iter().zip(bottom8) {
+            sum = accumulate_gradient_x8(top, bottom, sum);
+        }
+        if !top_tail.is_empty() {
+            let mut top = [0.0; 8];
+            let mut bottom = [0.0; 8];
+            top[..top_tail.len()].copy_from_slice(top_tail);
+            bottom[..bottom_tail.len()].copy_from_slice(bottom_tail);
+            sum = accumulate_gradient_x8(&top, &bottom, sum);
+        }
+    }
+    hsum256(sum)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn combine_error_x8(spatial: &[f32; 8], luma: &[f32; 8], factor: __m256, combined: &mut [f32; 8]) {
+    let spatial = unsafe { _mm256_loadu_ps(spatial.as_ptr()) };
+    let luma = unsafe { _mm256_loadu_ps(luma.as_ptr()) };
+    let value = _mm256_fmadd_ps(factor, luma, spatial);
+    unsafe { _mm256_storeu_ps(combined.as_mut_ptr(), value) };
+}
+
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn combine_error_avx2(spatial: &[f32], luma: &[f32], factor: f32, combined: &mut [f32]) {
+    debug_assert_eq!(spatial.len(), luma.len());
+    debug_assert_eq!(spatial.len(), combined.len());
+    let (spatial32, spatial_tail) = spatial.as_chunks::<32>();
+    let (luma32, luma_tail) = luma.as_chunks::<32>();
+    let (combined32, combined_tail) = combined.as_chunks_mut::<32>();
+    let factor = _mm256_set1_ps(factor);
+
+    for ((spatial, luma), combined) in spatial32.iter().zip(luma32).zip(combined32) {
+        let [s0, s1, s2, s3] = spatial.as_chunks::<8>().0 else {
+            unreachable!()
+        };
+        let [l0, l1, l2, l3] = luma.as_chunks::<8>().0 else {
+            unreachable!()
+        };
+        let [c0, c1, c2, c3] = combined.as_chunks_mut::<8>().0 else {
+            unreachable!()
+        };
+        combine_error_x8(s0, l0, factor, c0);
+        combine_error_x8(s1, l1, factor, c1);
+        combine_error_x8(s2, l2, factor, c2);
+        combine_error_x8(s3, l3, factor, c3);
+    }
+
+    let (spatial8, spatial_remainder) = spatial_tail.as_chunks::<8>();
+    let (luma8, luma_remainder) = luma_tail.as_chunks::<8>();
+    let (combined8, combined_remainder) = combined_tail.as_chunks_mut::<8>();
+    for ((spatial, luma), combined) in spatial8.iter().zip(luma8).zip(combined8) {
+        combine_error_x8(spatial, luma, factor, combined);
+    }
+    if !spatial_remainder.is_empty() {
+        let mut spatial = [0.0; 8];
+        let mut luma = [0.0; 8];
+        let mut combined = [0.0; 8];
+        spatial[..spatial_remainder.len()].copy_from_slice(spatial_remainder);
+        luma[..luma_remainder.len()].copy_from_slice(luma_remainder);
+        combine_error_x8(&spatial, &luma, factor, &mut combined);
+        combined_remainder.copy_from_slice(&combined[..combined_remainder.len()]);
+    }
+}
 
 /// # Safety
 /// The caller must ensure AVX2 is available. Slice bounds are validated before
 /// any vector load or store.
-#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn recon_dist_and_rate_avx2(
     scratch: &mut [[f32; 1024]; 8],
-    rate_log2_lut: &RateLog2Lut,
-    coeffs: &[[f32; 1024]; 3],
-    inv: [&[f32]; 3],
-    qac: f32,
-    qm_mult_x: f32,
-    factor_x: f32,
-    factor_b: f32,
-    distance: f32,
-    cx: usize,
-    cy: usize,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
 ) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
         scratch,
-        rate_log2_lut,
-        coeffs,
-        inv,
-        qac,
-        qm_mult_x,
-        factor_x,
-        factor_b,
-        distance,
-        cx,
-        cy,
-        strategy,
-        opsin,
-        px,
-        py,
-        recon_quantize_avx2,
-        ssim_deficit_avx2,
-        prepare_reconstruction_avx2,
+        input,
+        &ReconKernels {
+            quantize: recon_quantize_avx2,
+            ssim: ssim_deficit_avx2,
+            prepare: prepare_reconstruction_avx2,
+            error,
+        },
     )
 }
 
@@ -287,13 +395,18 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
 
 #[cfg(test)]
 mod tests {
-    use super::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
+    use super::{
+        combine_error_avx2, error_gradient_energy_avx2, recon_dist_and_rate_avx2, ssim_deficit_avx2,
+    };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
         STRATEGY_DCT32X16, STRATEGY_DCT32X32,
     };
     use crate::image::Image3F;
-    use crate::inflated_cost::{rate_log2_lut, recon_dist_and_rate_scalar, ssim_deficit_scalar};
+    use crate::inflated_cost::{
+        ReconDistInput, ReconErrorKernels, ReconQuantization, ReconScoring, ReconSource,
+        ReconTransform, rate_log2_lut, recon_dist_and_rate_scalar, ssim_deficit_scalar,
+    };
 
     fn available() -> bool {
         std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
@@ -361,42 +474,46 @@ mod tests {
                 &inv_storage[1][..],
                 &inv_storage[2][..],
             ];
+            let input = ReconDistInput {
+                quantization: ReconQuantization {
+                    rate_log2_lut: rate_log2_lut(),
+                    coeffs: &coeffs,
+                    inverse_matrices: inv,
+                    qac: 7.0,
+                    qm_mult_x: 1.2,
+                    distance: 1.5,
+                },
+                transform: ReconTransform {
+                    blocks_x: cx,
+                    blocks_y: cy,
+                    strategy,
+                },
+                source: ReconSource {
+                    opsin: &image,
+                    x: 3,
+                    y: 5,
+                },
+                scoring: ReconScoring {
+                    factor_x: 0.15,
+                    factor_b: -0.1,
+                    banding: true,
+                },
+            };
             let mut scalar_scratch = [[0.0f32; 1024]; 8];
-            let scalar = recon_dist_and_rate_scalar(
-                &mut scalar_scratch,
-                rate_log2_lut(),
-                &coeffs,
-                inv,
-                7.0,
-                1.2,
-                0.15,
-                -0.1,
-                1.5,
-                cx,
-                cy,
-                strategy,
-                &image,
-                3,
-                5,
-            );
+            let scalar = recon_dist_and_rate_scalar(&mut scalar_scratch, &input);
             let mut simd_scratch = [[0.0f32; 1024]; 8];
             let simd = unsafe {
                 recon_dist_and_rate_avx2(
                     &mut simd_scratch,
-                    rate_log2_lut(),
-                    &coeffs,
-                    inv,
-                    7.0,
-                    1.2,
-                    0.15,
-                    -0.1,
-                    1.5,
-                    cx,
-                    cy,
-                    strategy,
-                    &image,
-                    3,
-                    5,
+                    &input,
+                    &ReconErrorKernels {
+                        gradient_energy: |error, width, height| {
+                            error_gradient_energy_avx2(error, width, height)
+                        },
+                        combine: |spatial, luma, factor, combined| {
+                            combine_error_avx2(spatial, luma, factor, combined)
+                        },
+                    },
                 )
             };
             let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);

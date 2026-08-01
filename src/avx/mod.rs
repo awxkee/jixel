@@ -29,25 +29,34 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod cfl;
+mod dark_aq;
 mod dct;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 mod ytob;
 
 pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_avx2, cfl_regression_avx2};
+pub(crate) use dark_aq::dark_structure_stats_avx2;
 pub(crate) use dct::{
     dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2,
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
     inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
 };
-pub(crate) use inflated_cost::{recon_dist_and_rate_avx2, ssim_deficit_avx2};
+pub(crate) use inflated_cost::{
+    combine_error_avx2, error_gradient_energy_avx2, recon_dist_and_rate_avx2, ssim_deficit_avx2,
+};
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::{quantize_block_ac_avx2, quantize_dc_avx2, quantize_dc_cfl_avx2};
+pub(crate) use quant::{
+    apply_quant_field_gain_avx2, apply_structure_aq_avx2, quantize_block_ac_avx2, quantize_dc_avx2,
+    quantize_dc_cfl_avx2,
+};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2};
+pub(crate) use structure_aq::block_features_avx2;
 pub(crate) use xyb::to_xyb_avx2_band;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

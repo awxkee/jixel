@@ -28,14 +28,23 @@
  */
 mod ac_strategy;
 mod adaptive_quant;
+mod dark_aq;
+mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_sse;
 pub(crate) use adaptive_quant::fill_quant_field;
+pub(crate) use dark_aq::dark_structure_stats_sse41;
+pub(crate) use inflated_cost::{combine_error_sse41, error_gradient_energy_sse41};
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::{quantize_block_ac_sse41, quantize_dc_cfl_sse41, quantize_dc_sse41};
+pub(crate) use quant::{
+    apply_quant_field_gain_sse41, apply_structure_aq_sse41, quantize_block_ac_sse41,
+    quantize_dc_cfl_sse41, quantize_dc_sse41,
+};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41};
+pub(crate) use structure_aq::block_features_sse41;
 pub(crate) use xyb::to_xyb_sse41_band;

@@ -48,6 +48,7 @@ mod dct;
 mod enc_ac_strategy;
 mod enc_coeff_order;
 mod enc_color_correlation;
+mod enc_dc_smooth;
 mod enc_dc_tree;
 mod enc_frame;
 mod enc_group;

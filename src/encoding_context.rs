@@ -27,12 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dark_aq::DarkAqConfig;
+use crate::dark_aq::{self, DarkAqConfig};
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
 use crate::{
     Speed, adaptive_quant, dct, enc_ac_strategy, enc_color_correlation, enc_group, enc_xyb,
-    inflated_cost,
+    inflated_cost, structure_aq,
 };
 
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
@@ -42,16 +42,23 @@ pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
     pub(crate) boost: Option<DarkAqConfig>,
+    pub(crate) banding_protection: bool,
     /// Transform-merge knobs resolved at this encode's distance.
     pub(crate) merge: enc_ac_strategy::MergeTuning,
     pub(crate) matrices: &'static DequantMatrices,
     pub(crate) to_xyb_band: enc_xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
+    pub(crate) recon_dist_and_rate: inflated_cost::ReconDistAndRateFn,
+    pub(crate) recon_error_kernels: inflated_cost::ReconErrorKernels,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
     pub(crate) quantize_block_ac: enc_group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: enc_group::QuantizeDcFn,
     pub(crate) quantize_dc_cfl: enc_group::QuantizeDcCflFn,
+    pub(crate) apply_quant_field_gain: dark_aq::ApplyQuantFieldGainFn,
+    pub(crate) dark_structure_stats: dark_aq::DarkStructureStatsFn,
+    pub(crate) block_features: structure_aq::BlockFeaturesFn,
+    pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: enc_ac_strategy::ApplyCflFn,
     pub(crate) cfl_regression: enc_color_correlation::CflRegressionFn,
     pub(crate) fill_ytob_row: enc_color_correlation::FillYtobRowFn,
@@ -74,6 +81,7 @@ impl EncodingContext {
     pub(crate) fn new(
         speed: Speed,
         boost: Option<DarkAqConfig>,
+        banding_protection: bool,
         distance: f32,
         num_threads: usize,
     ) -> Self {
@@ -82,15 +90,25 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             boost,
+            banding_protection,
             merge: enc_ac_strategy::MergeTuning::new(distance),
             matrices: DequantMatrices::new(distance),
             to_xyb_band: enc_xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
+            recon_dist_and_rate: inflated_cost::select_recon_dist_and_rate_fn(),
+            recon_error_kernels: inflated_cost::ReconErrorKernels {
+                gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
+                combine: inflated_cost::select_combine_error_fn(),
+            },
             rate_log2_lut: inflated_cost::rate_log2_lut(),
             quantize_block_ac: enc_group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
             quantize_dc_cfl: quantize_dc.quantize_cfl,
+            apply_quant_field_gain: dark_aq::select_apply_quant_field_gain_fn(),
+            dark_structure_stats: dark_aq::select_dark_structure_stats_fn(),
+            block_features: structure_aq::select_block_features_fn(),
+            apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: enc_ac_strategy::selected_apply_cfl_fn(),
             cfl_regression: enc_color_correlation::selected_cfl_regression_fn(),
             fill_ytob_row: enc_color_correlation::selected_fill_ytob_row_fn(),
@@ -114,6 +132,6 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None, 1.0, 1)
+        Self::new(Speed::Fast, None, false, 1.0, 1)
     }
 }

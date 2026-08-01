@@ -100,6 +100,116 @@ fn store_i16x4(output: &mut [i16; 4], value: int32x4_t) {
     unsafe { vst1_s16(output.as_mut_ptr(), vqmovn_s32(value)) };
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_quant_field_gain_x4(input: uint32x4_t, gain: float32x4_t) -> int32x4_t {
+    let value = vmulq_f32(vcvtq_f32_u32(input), gain);
+    let rounded = vcvtaq_s32_f32(value);
+    let clamped = vminq_s32(vmaxq_s32(rounded, vdupq_n_s32(1)), vdupq_n_s32(255));
+    vbslq_s32(vceqq_f32(value, value), clamped, vdupq_n_s32(0))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_quant_field_gain_x8(dest: &mut [u8; 8], gain: float32x4_t) {
+    let bytes = unsafe { vld1_u8(dest.as_ptr()) };
+    let values16 = vmovl_u8(bytes);
+    let low = apply_quant_field_gain_x4(vmovl_u16(vget_low_u16(values16)), gain);
+    let high = apply_quant_field_gain_x4(vmovl_high_u16(values16), gain);
+    let packed16 = vcombine_u16(vqmovun_s32(low), vqmovun_s32(high));
+    let packed8 = vqmovn_u16(packed16);
+    unsafe { vst1_u8(dest.as_mut_ptr(), packed8) };
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn apply_quant_field_gain_neon(
+    image: &mut crate::image::ImageB,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    gain: f32,
+) {
+    let gain = vdupq_n_f32(gain);
+    for y in y0..y0 + height {
+        let values = &mut image.row_mut(y)[x0..x0 + width];
+        let (values8, tail) = values.as_chunks_mut::<8>();
+        for values in values8 {
+            apply_quant_field_gain_x8(values, gain);
+        }
+        if !tail.is_empty() {
+            let mut values = [0u8; 8];
+            values[..tail.len()].copy_from_slice(tail);
+            apply_quant_field_gain_x8(&mut values, gain);
+            tail.copy_from_slice(&values[..tail.len()]);
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_structure_aq_x4(
+    correction: float32x4_t,
+    input: uint32x4_t,
+    scale: float32x4_t,
+    center: float32x4_t,
+) -> int32x4_t {
+    let delta = vmulq_f32(vsubq_f32(correction, center), scale);
+    let clamped = vmaxq_f32(vminq_f32(delta, vdupq_n_f32(0.22)), vdupq_n_f32(-0.18));
+    let delta = vbslq_f32(vceqq_f32(delta, delta), clamped, delta);
+    apply_quant_field_gain_x4(input, super::adaptive_quant::fast_exp2_x4(delta))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn apply_structure_aq_x8(
+    corrections: &[f32; 8],
+    dest: &mut [u8; 8],
+    scale: float32x4_t,
+    center: float32x4_t,
+) {
+    let bytes = unsafe { vld1_u8(dest.as_ptr()) };
+    let values16 = vmovl_u8(bytes);
+    let correction_low = unsafe { vld1q_f32(corrections.as_ptr()) };
+    let correction_high = unsafe { vld1q_f32(corrections.as_ptr().add(4)) };
+    let low = apply_structure_aq_x4(
+        correction_low,
+        vmovl_u16(vget_low_u16(values16)),
+        scale,
+        center,
+    );
+    let high = apply_structure_aq_x4(correction_high, vmovl_high_u16(values16), scale, center);
+    let packed16 = vcombine_u16(vqmovun_s32(low), vqmovun_s32(high));
+    unsafe { vst1_u8(dest.as_mut_ptr(), vqmovn_u16(packed16)) };
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn apply_structure_aq_neon(
+    corrections: &[f32],
+    field: &mut crate::image::ImageB,
+    amount: f32,
+    center: f32,
+    inv_stddev: f32,
+) {
+    let values = field.as_mut_slice();
+    debug_assert_eq!(corrections.len(), values.len());
+    let (corrections8, correction_tail) = corrections.as_chunks::<8>();
+    let (values8, value_tail) = values.as_chunks_mut::<8>();
+    let scale = vdupq_n_f32(-amount * inv_stddev);
+    let center_vector = vdupq_n_f32(center);
+    for (corrections, values) in corrections8.iter().zip(values8) {
+        apply_structure_aq_x8(corrections, values, scale, center_vector);
+    }
+    if !correction_tail.is_empty() {
+        let mut corrections = [center; 8];
+        corrections[..correction_tail.len()].copy_from_slice(correction_tail);
+        let mut values = [0u8; 8];
+        values[..value_tail.len()].copy_from_slice(value_tail);
+        apply_structure_aq_x8(&corrections, &mut values, scale, center_vector);
+        value_tail.copy_from_slice(&values[..value_tail.len()]);
+    }
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn quantize_dc_neon(input: &[f32], scale: f32, output: &mut [i16]) {
     debug_assert_eq!(input.len(), output.len());

@@ -92,8 +92,6 @@ pub(crate) fn masking_sqrt(v: f32) -> f32 {
 
 /// HF modulation (current libjxl): per-difference clamp at `valmin_y`, summed
 /// over the 8x8 Y block, then `sum * kMul_y + kOffset` added to `out_val`.
-/// Experiment-only: `JIXEL_AQ_HFMAX` raises the strength ceiling (default 1.0,
-/// reached at d=2) so masking keeps scaling at higher distances.
 pub(crate) fn hf_modulation_strength(distance: f32) -> f32 {
     (0.5 * distance).clamp(0.1, 1.0)
 }

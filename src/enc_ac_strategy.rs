@@ -37,7 +37,10 @@ use crate::dc_group_data::{
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
-use crate::inflated_cost::{CHANNEL_WEIGHT, channel_rd, recon_dist_and_rate};
+use crate::inflated_cost::{
+    CHANNEL_WEIGHT, ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform,
+    channel_rd,
+};
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
@@ -183,7 +186,9 @@ impl SearchScope {
     #[inline]
     fn for_speed(speed: crate::Speed) -> Self {
         match speed {
-            crate::Speed::Fast => SearchScope::Squares,
+            // Fastest never reaches the chooser (`fill_ac_strategy` returns
+            // before scoping); Squares is the defensive mapping.
+            crate::Speed::Fastest | crate::Speed::Fast => SearchScope::Squares,
             crate::Speed::Slow => SearchScope::Full,
         }
     }
@@ -468,7 +473,13 @@ fn coefficient_dist_and_rate(
     let mut d_total = 0.0f32;
     let mut r_total = 0.0f32;
     for c in 0..3 {
-        let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
+        let qm_mult = if c == 0 {
+            qm_mult_x
+        } else if c == 2 {
+            crate::enc_frame::b_qm_mul()
+        } else {
+            1.0
+        };
         let (d, r) = channel_rd(
             ctx.sse_and_rate,
             ctx.rate_log2_lut,
@@ -528,26 +539,38 @@ fn strategy_cost_impl(
     apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
     let (d_total, r_total) = match distortion_model {
-        DistortionModel::Reconstruction => recon_dist_and_rate(
+        DistortionModel::Reconstruction => (ctx.recon_dist_and_rate)(
             recon,
-            ctx.rate_log2_lut,
-            coeffs,
-            [
-                inverse_matrix_for(ctx, strategy, 0),
-                inverse_matrix_for(ctx, strategy, 1),
-                inverse_matrix_for(ctx, strategy, 2),
-            ],
-            qac,
-            qm_mult_x,
-            cmap_factor[0],
-            cmap_factor[2],
-            distance,
-            cx,
-            cy,
-            strategy,
-            opsin,
-            px,
-            py,
+            &ReconDistInput {
+                quantization: ReconQuantization {
+                    rate_log2_lut: ctx.rate_log2_lut,
+                    coeffs,
+                    inverse_matrices: [
+                        inverse_matrix_for(ctx, strategy, 0),
+                        inverse_matrix_for(ctx, strategy, 1),
+                        inverse_matrix_for(ctx, strategy, 2),
+                    ],
+                    qac,
+                    qm_mult_x,
+                    distance,
+                },
+                transform: ReconTransform {
+                    blocks_x: cx,
+                    blocks_y: cy,
+                    strategy,
+                },
+                source: ReconSource {
+                    opsin,
+                    x: px,
+                    y: py,
+                },
+                scoring: ReconScoring {
+                    factor_x: cmap_factor[0],
+                    factor_b: cmap_factor[2],
+                    banding: ctx.banding_protection,
+                },
+            },
+            &ctx.recon_error_kernels,
         ),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
             ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
@@ -1299,8 +1322,10 @@ pub(crate) fn fill_ac_strategy(
     let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
-    // DCT8 wins the high-quality RD comparison outright.
-    if use_dct8_only(distance) {
+    // DCT8 wins the high-quality RD comparison outright; Fastest skips the
+    // search by contract. Either way the default strategy image (all DCT8
+    // first blocks) is already the answer.
+    if use_dct8_only(distance) || speed == crate::Speed::Fastest {
         return 0.0;
     }
     let scope = SearchScope::for_speed(speed);
@@ -1563,7 +1588,7 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new(crate::Speed::Fast, None, 1.0, 1);
+        let ctx = EncodingContext::new(crate::Speed::Fast, None, false, 1.0, 1);
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);

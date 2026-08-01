@@ -425,7 +425,7 @@ fn pow2if_s32(q: __m256i) -> __m256i {
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn fast_exp2_x8(v: __m256) -> __m256 {
+pub(crate) fn fast_exp2_x8(v: __m256) -> __m256 {
     // exp2(x) = 2^q * 2^r, q = round(x), r = x - q.
     let q = _mm256_cvtps_epi32(v);
     let qf = _mm256_cvtepi32_ps(q);

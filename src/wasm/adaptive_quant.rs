@@ -471,7 +471,7 @@ fn round_ties_away_f32x4(v: v128) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn fast_exp2_x4(v: v128) -> v128 {
+pub(crate) fn fast_exp2_x4(v: v128) -> v128 {
     // exp2(x) = 2^q * 2^r
     // q = round(x), r = x - q, so r is approximately in [-0.5, 0.5].
     let qf = round_ties_away_f32x4(v);

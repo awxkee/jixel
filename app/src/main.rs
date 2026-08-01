@@ -24,7 +24,7 @@ fn encode_jixel(rgb: &[u8], width: usize, height: usize, threads: usize) -> Meas
         .with_lossless(false)
         .with_quality(QUALITY)
         .with_progressive(false)
-        .with_patches(true)
+        .with_patches(false)
         .with_speed(Speed::Slow)
         .with_num_threads(threads);
     let start = Instant::now();
@@ -46,7 +46,7 @@ fn encode_libjxl(rgb: &[u8], width: u32, height: u32, threads: usize) -> Measure
         .lossless(false)
         .jpeg_quality(QUALITY)
         // libjxl effort 3: its fastest generally useful VarDCT preset.
-        .speed(EncoderSpeed::Falcon)
+        .speed(EncoderSpeed::Squirrel)
         .parallel_runner(&runner)
         .build()
         .expect("libjxl failed to create its encoder");

@@ -127,6 +127,100 @@ fn round_ties_away_i32x4(value: __m128) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn store_quant_field_x4(source: &mut [u8; 4], value: __m128) {
+    let rounded = round_ties_away_i32x4(value);
+    let clamped = _mm_min_epi32(
+        _mm_max_epi32(rounded, _mm_set1_epi32(1)),
+        _mm_set1_epi32(255),
+    );
+    let nan = _mm_cmpunord_ps(value, value);
+    let clamped = _mm_blendv_epi8(clamped, _mm_setzero_si128(), _mm_castps_si128(nan));
+    let packed16 = _mm_packus_epi32(clamped, clamped);
+    let packed8 = _mm_packus_epi16(packed16, packed16);
+    *source = (_mm_cvtsi128_si32(packed8) as u32).to_ne_bytes();
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn apply_quant_field_gain_x4(source: &mut [u8; 4], gain: __m128) {
+    let bytes = _mm_cvtsi32_si128(i32::from_ne_bytes(*source));
+    let value = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(bytes)), gain);
+    store_quant_field_x4(source, value);
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn apply_quant_field_gain_sse41(
+    image: &mut crate::image::ImageB,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    gain: f32,
+) {
+    let gain = _mm_set1_ps(gain);
+    for y in y0..y0 + height {
+        let values = &mut image.row_mut(y)[x0..x0 + width];
+        let (values4, tail) = values.as_chunks_mut::<4>();
+        for values in values4 {
+            apply_quant_field_gain_x4(values, gain);
+        }
+        if !tail.is_empty() {
+            let mut values = [0u8; 4];
+            values[..tail.len()].copy_from_slice(tail);
+            apply_quant_field_gain_x4(&mut values, gain);
+            tail.copy_from_slice(&values[..tail.len()]);
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn apply_structure_aq_x4(
+    corrections: &[f32; 4],
+    dest: &mut [u8; 4],
+    scale: __m128,
+    center: __m128,
+) {
+    let correction = unsafe { _mm_loadu_ps(corrections.as_ptr()) };
+    let delta = _mm_mul_ps(_mm_sub_ps(correction, center), scale);
+    let clamped = _mm_max_ps(_mm_min_ps(delta, _mm_set1_ps(0.22)), _mm_set1_ps(-0.18));
+    let valid = _mm_cmpord_ps(delta, delta);
+    let delta = _mm_blendv_ps(delta, clamped, valid);
+    let gain = super::adaptive_quant::fast_exp2_x4(delta);
+    let bytes = _mm_cvtsi32_si128(i32::from_ne_bytes(*dest));
+    let values = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(bytes));
+    store_quant_field_x4(dest, _mm_mul_ps(values, gain));
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn apply_structure_aq_sse41(
+    corrections: &[f32],
+    field: &mut crate::image::ImageB,
+    amount: f32,
+    center: f32,
+    inv_stddev: f32,
+) {
+    let values = field.as_mut_slice();
+    debug_assert_eq!(corrections.len(), values.len());
+    let (corrections4, correction_tail) = corrections.as_chunks::<4>();
+    let (values4, value_tail) = values.as_chunks_mut::<4>();
+    let scale = _mm_set1_ps(-amount * inv_stddev);
+    let center_vector = _mm_set1_ps(center);
+    for (corrections, values) in corrections4.iter().zip(values4) {
+        apply_structure_aq_x4(corrections, values, scale, center_vector);
+    }
+    if !correction_tail.is_empty() {
+        let mut corrections = [center; 4];
+        corrections[..correction_tail.len()].copy_from_slice(correction_tail);
+        let mut values = [0u8; 4];
+        values[..value_tail.len()].copy_from_slice(value_tail);
+        apply_structure_aq_x4(&corrections, &mut values, scale, center_vector);
+        value_tail.copy_from_slice(&values[..value_tail.len()]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn store_i16x4(output: &mut [i16; 4], value: __m128i) {
     let packed = _mm_packs_epi32(value, value);
     unsafe { _mm_storel_epi64(output.as_mut_ptr().cast(), packed) };

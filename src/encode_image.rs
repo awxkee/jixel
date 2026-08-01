@@ -222,6 +222,9 @@ impl ToneMappingParams {
 /// Encoder speed/transform-search tradeoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Speed {
+    /// No transform search at all: every block is coded as a plain 8×8 DCT.
+    /// Skips everything `Fast` skips, plus the square-merge selection.
+    Fastest,
     #[default]
     Fast,
     Slow,
@@ -241,6 +244,8 @@ pub struct EncodeConfig {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
+    /// Banding protection
+    pub banding_protection: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -332,8 +337,9 @@ impl Default for EncodeConfig {
             exif: None,
             orientation: Orientation::Normal,
             lossless: false,
+            banding_protection: false,
             progressive: false,
-            patches: true,
+            patches: false,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -359,7 +365,7 @@ impl Default for EncodeConfigImpl {
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             progressive: false,
-            patches: true,
+            patches: false,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -574,6 +580,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Enable banding protection (see the field docs).
+    pub fn with_banding_protection(mut self) -> Self {
+        self.banding_protection = true;
+        self
+    }
+
     /// Enable progressive lossless. Only effective when `lossless`.
     pub fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
@@ -595,6 +607,9 @@ impl EncodeConfig {
     /// Select the transform-search speed/effort tradeoff.
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        if speed == Speed::Slow {
+            self.patches = true;
+        }
         self
     }
 }
@@ -618,7 +633,13 @@ pub fn distance_from_quality(quality: f32) -> f32 {
 }
 
 fn lossy_context(config: &EncodeConfig, distance: f32) -> EncodingContext {
-    EncodingContext::new(config.speed, config.boost, distance, config.num_threads)
+    EncodingContext::new(
+        config.speed,
+        config.boost,
+        config.banding_protection,
+        distance,
+        config.num_threads,
+    )
 }
 
 fn for_each_linear_band<F>(
@@ -2107,7 +2128,32 @@ fn write_image_metadata(
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).
-    w.write(1, 1); // CustomTransformData.all_default = 1
+    if lossless {
+        w.write(1, 1); // CustomTransformData.all_default = 1
+    } else {
+        // The blue-biased forward opsin matrix (enc_xyb.rs) needs its matching
+        // inverse in the codestream, so the bundle is explicit. Layout:
+        // all_default, [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
+        w.write(1, 0); // CustomTransformData.all_default = 0
+        w.write(1, 0); // OpsinInverseMatrix.all_default = 0
+        for v in crate::enc_xyb::OPSIN_INVERSE_MATRIX {
+            w.write(16, crate::util::f32_to_f16(v) as u64);
+        }
+        for _ in 0..3 {
+            // Opsin biases (defaults; the forward bias is unchanged).
+            w.write(16, crate::util::f32_to_f16(-0.003_793_073_4) as u64);
+        }
+        // Per-channel quant biases + numerator (defaults).
+        for v in [
+            1.0 - 0.054_650_075,
+            1.0 - 0.070_054_5,
+            1.0 - 0.049_935_105,
+            0.145,
+        ] {
+            w.write(16, crate::util::f32_to_f16(v) as u64);
+        }
+        w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)
+    }
     // ICC stream goes AFTER FileHeader, before the zero-pad to byte boundary.
     if let Some(icc) = icc_profile {
         crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, w);
@@ -2475,6 +2521,37 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn fastest_speed_encodes_dct8_only() {
+        // A smooth gradient makes Fast/Slow merge into large transforms, so a
+        // Fastest stream (all 8x8) must differ; both must be valid encodes.
+        const WIDTH: usize = 128;
+        const HEIGHT: usize = 128;
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| (((i / 3) % WIDTH) / 2 + ((i / 3) / WIDTH) / 2) as u8)
+            .collect();
+        let config = lossy().with_distance(2.0);
+        let fastest = encode_image(
+            &input,
+            WIDTH,
+            HEIGHT,
+            &config.clone().with_speed(Speed::Fastest),
+        )
+        .expect("Fastest encode failed");
+        let fast = encode_image(
+            &input,
+            WIDTH,
+            HEIGHT,
+            &config.clone().with_speed(Speed::Fast),
+        )
+        .expect("Fast encode failed");
+        assert!(!fastest.is_empty());
+        assert_ne!(
+            fastest, fast,
+            "Fastest should skip the transform search Fast performs"
+        );
+    }
+
+    #[test]
     fn lossless_output_is_independent_of_thread_count() {
         const WIDTH: usize = 257;
         const HEIGHT: usize = 257;
@@ -2482,7 +2559,7 @@ mod encode_smoke_tests {
             .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
             .collect();
 
-        for speed in [Speed::Fast, Speed::Slow] {
+        for speed in [Speed::Fastest, Speed::Fast, Speed::Slow] {
             let single = encode_image(
                 &input,
                 WIDTH,

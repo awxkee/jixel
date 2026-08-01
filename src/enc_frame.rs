@@ -115,6 +115,16 @@ const DC_REFINE_PEAK: f32 = 1.35;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
 
+/// Whether the closed-loop DC rounding pass (`enc_dc_smooth`) runs. Shared by
+/// the pass itself and the `dc_float` capture-plane allocations so no float
+/// DC is stored when the pass is off. Below d≈0.8 the DC steps are fine
+/// enough that the smoothing gate almost never opens and the pass only adds
+/// noise; it is a quality refinement, not worth Fast's time budget.
+#[inline]
+fn dc_smooth_enabled(distance: f32, speed: Speed) -> bool {
+    distance >= 0.8 && speed == Speed::Slow
+}
+
 #[inline]
 fn dc_refinement(distance: f32) -> f32 {
     if distance <= DC_REFINE_HOLD {
@@ -553,6 +563,16 @@ pub(crate) fn collect_ac_metadata_tokens(
 }
 
 /// Distance-scheduled constant per-block EPF sharpness id
+pub(crate) const fn b_qm_scale() -> u32 {
+    2
+}
+
+/// Encoder-side B quantizer-scale multiplier matching [`b_qm_scale`]
+/// (mirrors `x_qm_mul = 1.25^(x_qm_scale - 2)`).
+pub(crate) fn b_qm_mul() -> f32 {
+    1.25f32.powf(b_qm_scale() as f32 - 2.0)
+}
+
 fn epf_sharpness_id(distance: f32) -> i32 {
     if distance < 1.75 {
         7
@@ -712,7 +732,7 @@ fn write_frame_header_kind(
                 w.write(2, 0); // extra-channel upsampling = 1
             }
             w.write(3, x_qm_scale as u64);
-            w.write(3, 2); // b_qm_scale
+            w.write(3, b_qm_scale() as u64); // b_qm_scale
             // Reference-only frames omit Passes and use the implicit one pass.
             w.write(1, 1); // custom size
             write_frame_dimension(width, w);
@@ -776,7 +796,7 @@ fn write_frame_header(
     }
 
     w.write(3, x_qm_scale as u64);
-    w.write(3, 2); // b_qm_scale
+    w.write(3, b_qm_scale() as u64); // b_qm_scale
     // Passes bundle (jxl-frame header.rs:127-132):
     //   num_passes: U32(1,2,3,4+u(3))   default 1
     //   if num_passes != 1:
@@ -955,15 +975,24 @@ fn write_dc_global(
     // ColorCorrelationParams. The all-default bundle pins the DC plane to the
     // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
     // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
-    if ytob_dc == 0 {
-        w.write(1, 1); // all_default
-    } else {
-        w.write(1, 0); // not all-default
-        w.write(2, 0); // color_factor = 84 (the direct branch)
-        w.write(16, 0); // base_correlation_x = 0.0
-        w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
-        w.write(8, 128); // ytox_dc = 0, offset by 128
-        w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
+    {
+        let factor = crate::enc_color_correlation::K_COLOR_FACTOR as u32;
+        if factor == 84 && ytob_dc == 0 {
+            w.write(1, 1); // all_default
+        } else {
+            w.write(1, 0); // not all-default
+            // color_factor: U32(Val(84), Val(256), BitsOffset(8, 2), BitsOffset(16, 258)).
+            if factor == 84 {
+                w.write(2, 0);
+            } else {
+                w.write(2, 2);
+                w.write(8, (factor - 2) as u64);
+            }
+            w.write(16, 0); // base_correlation_x = 0.0
+            w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
+            w.write(8, 128); // ytox_dc = 0, offset by 128
+            w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
+        }
     }
 
     // Global tree.
@@ -1428,13 +1457,13 @@ fn encode_frame_core(
     // mere presence perturbs codegen enough to shift a few borderline
     // quantizer roundings on paths that should be untouched.
     let want_order_stats =
-        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast;
+        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow;
     let results = ctx
         .thread_pool
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, stats) = process_ac_group(
+            let (p, local, local_float, stats) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -1453,13 +1482,14 @@ fn encode_frame_core(
                 want_order_stats,
                 qf_threshold,
             );
-            (dc_idx, gx, gy, p, local, stats)
+            (dc_idx, gx, gy, p, local, local_float, stats)
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     let mut order_stats = crate::enc_coeff_order::OrderStats::new();
-    for (dc_idx, gx, gy, p, local, stats) in results {
+    for (dc_idx, gx, gy, p, local, local_float, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
+        merge_dc_float(&mut dc_datas[dc_idx], gx, gy, &local_float);
         all_pending.push(p);
         if let Some(s) = stats {
             order_stats.merge(&s);
@@ -1477,7 +1507,7 @@ fn encode_frame_core(
     let mut coeff_orders = crate::enc_coeff_order::CoeffOrders::natural();
 
     let mut ytob_dc = 0i32;
-    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast {
+    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow {
         coeff_orders = crate::enc_coeff_order::derive_orders(&order_stats);
         ytob_dc = choose_ytob_dc(
             &dc_datas,
@@ -1503,7 +1533,7 @@ fn encode_frame_core(
             .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _) = process_ac_group(
+                let (p, local, _local_float, _) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -1528,6 +1558,68 @@ fn encode_frame_core(
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
+        }
+
+        // Closed-loop DC rounding against the decoder's adaptive DC
+        // smoothing: sub-quantstep DC precision on smooth content for
+        // near-zero rate. Above the curve across d≈1..6 on both corpora.
+        if dc_smooth_enabled(distance, ctx.speed) {
+            let steps = [
+                1.0 / (crate::quant_weights::INV_DC_QUANT[0] * distp.scale_dc),
+                1.0 / (crate::quant_weights::INV_DC_QUANT[1] * distp.scale_dc),
+                1.0 / (crate::quant_weights::INV_DC_QUANT[2] * distp.scale_dc),
+            ];
+            let r_b = 1.0 + ytob_dc as f32 / crate::enc_color_correlation::K_COLOR_FACTOR;
+            if dc_datas.len() == 1 {
+                let dc = &mut dc_datas[0];
+                crate::enc_dc_smooth::optimize_dc_rounding(
+                    &mut dc.quant_dc,
+                    &dc.dc_float,
+                    steps,
+                    r_b,
+                    Some((&ctx.thread_pool, scratch)),
+                );
+            } else {
+                // The smoothing filter spans the whole DC plane, so stitch
+                // the per-DC-group planes together, optimize once, and
+                // scatter the result back.
+                let (wb, hb) = (dim.xsize_blocks, dim.ysize_blocks);
+                let mut full_q = Image3S::new(wb, hb);
+                let mut full_f = Image3F::new(wb, hb);
+                const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
+                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
+                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
+                    let src_q = &dc_datas[i].quant_dc;
+                    let src_f = &dc_datas[i].dc_float;
+                    for c in 0..3 {
+                        for ly in 0..src_q.ysize() {
+                            let n = src_q.xsize();
+                            full_q.plane_row_mut(c, oy + ly)[ox..ox + n]
+                                .copy_from_slice(&src_q.plane_row(c, ly)[..n]);
+                            full_f.plane_row_mut(c, oy + ly)[ox..ox + n]
+                                .copy_from_slice(&src_f.plane_row(c, ly)[..n]);
+                        }
+                    }
+                }
+                crate::enc_dc_smooth::optimize_dc_rounding(
+                    &mut full_q,
+                    &full_f,
+                    steps,
+                    r_b,
+                    Some((&ctx.thread_pool, scratch)),
+                );
+                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
+                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
+                    let dst = &mut dc_datas[i].quant_dc;
+                    for c in 0..3 {
+                        for ly in 0..dst.ysize() {
+                            let n = dst.xsize();
+                            dst.plane_row_mut(c, ly)[..n]
+                                .copy_from_slice(&full_q.plane_row(c, oy + ly)[ox..ox + n]);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2075,10 +2167,12 @@ fn setup_dc_group(
             dc_group_x0,
             dc_group_y0,
             distp.distance,
+            ctx.apply_quant_field_gain,
+            ctx.dark_structure_stats,
         );
     }
 
-    if ctx.speed != Speed::Fast {
+    if ctx.speed == Speed::Slow {
         crate::structure_aq::apply(
             &mut scratch.structure_corrections,
             opsin,
@@ -2087,6 +2181,8 @@ fn setup_dc_group(
             dc_group_y0,
             distp.distance,
             ctx.dct8x8,
+            ctx.block_features,
+            ctx.apply_structure_corrections,
         );
     }
 
@@ -2170,6 +2266,28 @@ fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
     }
 }
 
+/// Merge a group-local unquantized DC plane (same geometry as
+/// [`merge_quant_dc`]) into the DC group's `dc_float`, sizing the
+/// destination on first use. A no-op when the capture is disabled (empty
+/// local image).
+fn merge_dc_float(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3F) {
+    if local.xsize() == 0 {
+        return;
+    }
+    if dc.dc_float.xsize() == 0 {
+        dc.dc_float = Image3F::new(dc.quant_dc.xsize(), dc.quant_dc.ysize());
+    }
+    let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+    let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+    let (gwb, ghb) = (local.xsize(), local.ysize());
+    for c in 0..3 {
+        for ly in 0..ghb {
+            let src = local.plane_row(c, ly);
+            dc.dc_float.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
+        }
+    }
+}
+
 /// Encode a single AC group: build its tile stripes, quantize and tokenize,
 /// and place its DC coefficients into a returned group-local `quant_dc`
 /// (origin-relative, merged by the caller). Reads `dc_data` read-only.
@@ -2216,6 +2334,7 @@ fn process_ac_group(
 ) -> (
     PendingAcGroup,
     Image3S,
+    Image3F,
     Option<crate::enc_coeff_order::OrderStats>,
 ) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
@@ -2231,6 +2350,13 @@ fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
+    // Float DC targets are only captured when the DC-smoothing rounding pass
+    // is going to consume them (`write_ac_group` skips the empty image).
+    let mut local_dc_float = if num_passes == 1 && dc_smooth_enabled(distp.distance, ctx.speed) {
+        Image3F::new(gwb, ghb)
+    } else {
+        Image3F::new(0, 0)
+    };
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
         .collect();
@@ -2276,6 +2402,7 @@ fn process_ac_group(
             dc_data,
             ytob_dc,
             &mut local_quant_dc,
+            &mut local_dc_float,
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
@@ -2295,6 +2422,7 @@ fn process_ac_group(
             tokens,
         },
         local_quant_dc,
+        local_dc_float,
         order_stats,
     )
 }
