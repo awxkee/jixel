@@ -72,6 +72,11 @@ impl<T: Copy + Default> Plane<T> {
     }
 
     #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+
+    #[inline]
     pub(crate) fn row_mut(&mut self, y: usize) -> &mut [T] {
         let w = self.xsize;
         &mut self.data[y * w..(y + 1) * w]

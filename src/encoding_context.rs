@@ -27,12 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dark_aq::DarkAqConfig;
+use crate::dark_aq::{self, DarkAqConfig};
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
 use crate::{
     Speed, adaptive_quant, dct, enc_ac_strategy, enc_color_correlation, enc_group, enc_xyb,
-    inflated_cost,
+    inflated_cost, structure_aq,
 };
 
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
@@ -52,6 +52,8 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_block_ac: enc_group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: enc_group::QuantizeDcFn,
     pub(crate) quantize_dc_cfl: enc_group::QuantizeDcCflFn,
+    pub(crate) apply_quant_field_gain: dark_aq::ApplyQuantFieldGainFn,
+    pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: enc_ac_strategy::ApplyCflFn,
     pub(crate) cfl_regression: enc_color_correlation::CflRegressionFn,
     pub(crate) fill_ytob_row: enc_color_correlation::FillYtobRowFn,
@@ -91,6 +93,8 @@ impl EncodingContext {
             quantize_block_ac: enc_group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
             quantize_dc_cfl: quantize_dc.quantize_cfl,
+            apply_quant_field_gain: dark_aq::select_apply_quant_field_gain_fn(),
+            apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: enc_ac_strategy::selected_apply_cfl_fn(),
             cfl_regression: enc_color_correlation::selected_cfl_regression_fn(),
             fill_ytob_row: enc_color_correlation::selected_fill_ytob_row_fn(),

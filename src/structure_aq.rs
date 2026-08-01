@@ -30,7 +30,57 @@
 use crate::adaptive_quant::fast_exp2;
 use crate::dct::{DctFn, DctInput, fmla};
 use crate::image::{Image3F, ImageB};
-use crate::util::FastRound;
+
+pub(crate) type ApplyCorrectionsFn = fn(&[f32], &mut ImageB, f32, f32, f32);
+
+#[allow(dead_code)]
+pub(crate) fn apply_corrections_scalar(
+    corrections: &[f32],
+    field: &mut ImageB,
+    amount: f32,
+    center: f32,
+    inv_stddev: f32,
+) {
+    debug_assert_eq!(corrections.len(), field.as_slice().len());
+    for (q, &correction) in field.as_mut_slice().iter_mut().zip(corrections) {
+        let delta = (-amount * (correction - center) * inv_stddev).clamp(-0.18, 0.22);
+        *q = (*q as f32 * fast_exp2(delta)).round().clamp(1.0, 255.0) as u8;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_apply_corrections_fn() -> ApplyCorrectionsFn {
+    crate::wasm::apply_structure_aq_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_apply_corrections_fn() -> ApplyCorrectionsFn {
+    |corrections, field, amount, center, inv_stddev| unsafe {
+        crate::neon::apply_structure_aq_neon(corrections, field, amount, center, inv_stddev)
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_apply_corrections_fn() -> ApplyCorrectionsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |corrections, field, amount, center, inv_stddev| unsafe {
+            crate::avx::apply_structure_aq_avx2(corrections, field, amount, center, inv_stddev)
+        };
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |corrections, field, amount, center, inv_stddev| unsafe {
+            crate::sse::apply_structure_aq_sse41(corrections, field, amount, center, inv_stddev)
+        };
+    }
+
+    apply_corrections_scalar
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Features {
@@ -222,6 +272,7 @@ pub(crate) fn apply(
     y0: usize,
     distance: f32,
     dct8x8: &DctFn<8, 8, 64>,
+    apply_corrections: ApplyCorrectionsFn,
 ) {
     let amount = strength(distance);
     if amount == 0.0 || field.xsize() == 0 || field.ysize() == 0 {
@@ -284,19 +335,67 @@ pub(crate) fn apply(
     } else {
         (total_weight / weighted_variance).sqrt()
     };
-    for (by, correction_row) in corrections.chunks_exact(field_width).enumerate() {
-        for (q, &correction) in field.row_mut(by).iter_mut().zip(correction_row) {
-            let delta = (-amount * (correction - center) * inv_stddev).clamp(-0.18, 0.22);
-            *q = (*q as f32 * fast_exp2(delta))
-                .fast_round()
-                .clamp(1.0, 255.0) as u8;
-        }
-    }
+    apply_corrections(corrections, field, amount, center, inv_stddev);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_apply_corrections(method: ApplyCorrectionsFn) {
+        let parameters = [
+            (0.0, 0.0, 0.0),
+            (0.08, 0.4, 0.5),
+            (0.13, -0.2, 1.75),
+            (0.12, 1.1, 8.0),
+        ];
+        for len in (0usize..=35).chain([257, 4099]) {
+            let corrections: Vec<f32> = (0..len)
+                .map(|i| {
+                    (i.wrapping_mul(4051).wrapping_add(17) % 8191) as f32 * (4.0 / 8190.0) - 2.0
+                })
+                .collect();
+            for &(amount, center, inv_stddev) in &parameters {
+                let mut expected = ImageB::new(len, 1);
+                for (i, value) in expected.as_mut_slice().iter_mut().enumerate() {
+                    *value = (i * 73 + 1) as u8;
+                }
+                let mut actual = expected.clone();
+                apply_corrections_scalar(&corrections, &mut expected, amount, center, inv_stddev);
+                method(&corrections, &mut actual, amount, center, inv_stddev);
+                assert_eq!(
+                    actual.as_slice(),
+                    expected.as_slice(),
+                    "length {len}, amount {amount}, center {center}, inv_stddev {inv_stddev}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_apply_corrections_matches_scalar() {
+        check_apply_corrections(select_apply_corrections_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_apply_corrections_matches_scalar() {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            check_apply_corrections(|corrections, field, amount, center, inv_stddev| unsafe {
+                crate::avx::apply_structure_aq_avx2(corrections, field, amount, center, inv_stddev)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_apply_corrections_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_apply_corrections(|corrections, field, amount, center, inv_stddev| unsafe {
+                crate::sse::apply_structure_aq_sse41(corrections, field, amount, center, inv_stddev)
+            });
+        }
+    }
 
     #[test]
     fn coherent_line_scores_above_checker_noise() {

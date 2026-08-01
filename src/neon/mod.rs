@@ -47,7 +47,10 @@ pub(crate) use dct::{
 };
 pub(crate) use inflated_cost::{recon_dist_and_rate_neon, ssim_deficit_neon};
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::{quantize_block_ac_neon, quantize_dc_cfl_neon, quantize_dc_neon};
+pub(crate) use quant::{
+    apply_quant_field_gain_neon, apply_structure_aq_neon, quantize_block_ac_neon,
+    quantize_dc_cfl_neon, quantize_dc_neon,
+};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_neon, quantize_xyb_tile_colors_neon};
 pub(crate) use xyb::to_xyb_neon_band;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};

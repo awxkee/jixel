@@ -141,6 +141,106 @@ fn round_ties_away_i32x8(value: __m256) -> __m256i {
 
 #[inline]
 #[target_feature(enable = "avx2")]
+fn store_quant_field_x8(dest: &mut [u8; 8], value: __m256) {
+    let rounded = round_ties_away_i32x8(value);
+    let clamped = _mm256_min_epi32(
+        _mm256_max_epi32(rounded, _mm256_set1_epi32(1)),
+        _mm256_set1_epi32(255),
+    );
+    let nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(value, value);
+    let clamped = _mm256_blendv_epi8(clamped, _mm256_setzero_si256(), _mm256_castps_si256(nan));
+    let packed16 = _mm_packus_epi32(
+        _mm256_castsi256_si128(clamped),
+        _mm256_extracti128_si256::<1>(clamped),
+    );
+    let packed8 = _mm_packus_epi16(packed16, packed16);
+    unsafe { _mm_storeu_si64(dest.as_mut_ptr().cast(), packed8) }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn apply_quant_field_gain_x8(dest: &mut [u8; 8], gain: __m256) {
+    let bytes = _mm_cvtsi64_si128(i64::from_ne_bytes(*dest));
+    let value = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)), gain);
+    store_quant_field_x8(dest, value);
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn apply_quant_field_gain_avx2(
+    image: &mut crate::image::ImageB,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    gain: f32,
+) {
+    let gain = _mm256_set1_ps(gain);
+    for y in y0..y0 + height {
+        let values = &mut image.row_mut(y)[x0..x0 + width];
+        let (values8, tail) = values.as_chunks_mut::<8>();
+        for values in values8 {
+            apply_quant_field_gain_x8(values, gain);
+        }
+        if !tail.is_empty() {
+            let mut values = [0u8; 8];
+            values[..tail.len()].copy_from_slice(tail);
+            apply_quant_field_gain_x8(&mut values, gain);
+            tail.copy_from_slice(&values[..tail.len()]);
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn apply_structure_aq_x8(
+    corrections: &[f32; 8],
+    dest: &mut [u8; 8],
+    scale: __m256,
+    center: __m256,
+) {
+    let correction = unsafe { _mm256_loadu_ps(corrections.as_ptr()) };
+    let delta = _mm256_mul_ps(_mm256_sub_ps(correction, center), scale);
+    let clamped = _mm256_max_ps(
+        _mm256_min_ps(delta, _mm256_set1_ps(0.22)),
+        _mm256_set1_ps(-0.18),
+    );
+    let valid = _mm256_cmp_ps::<_CMP_ORD_Q>(delta, delta);
+    let delta = _mm256_blendv_ps(delta, clamped, valid);
+    let gain = super::adaptive_quant::fast_exp2_x8(delta);
+    let bytes = _mm_cvtsi64_si128(i64::from_ne_bytes(*dest));
+    let values = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+    store_quant_field_x8(dest, _mm256_mul_ps(values, gain));
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn apply_structure_aq_avx2(
+    corrections: &[f32],
+    field: &mut crate::image::ImageB,
+    amount: f32,
+    center: f32,
+    inv_stddev: f32,
+) {
+    let values = field.as_mut_slice();
+    debug_assert_eq!(corrections.len(), values.len());
+    let (corrections8, correction_tail) = corrections.as_chunks::<8>();
+    let (values8, value_tail) = values.as_chunks_mut::<8>();
+    let scale = _mm256_set1_ps(-amount * inv_stddev);
+    let center_vector = _mm256_set1_ps(center);
+    for (corrections, values) in corrections8.iter().zip(values8) {
+        apply_structure_aq_x8(corrections, values, scale, center_vector);
+    }
+    if !correction_tail.is_empty() {
+        let mut corrections = [center; 8];
+        corrections[..correction_tail.len()].copy_from_slice(correction_tail);
+        let mut values = [0u8; 8];
+        values[..value_tail.len()].copy_from_slice(value_tail);
+        apply_structure_aq_x8(&corrections, &mut values, scale, center_vector);
+        value_tail.copy_from_slice(&values[..value_tail.len()]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
 fn store_i16x8(output: &mut [i16; 8], value: __m256i) {
     let packed = _mm_packs_epi32(
         _mm256_castsi256_si128(value),

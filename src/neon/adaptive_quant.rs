@@ -440,7 +440,7 @@ pub(crate) fn vpow2ifq_s32(q: int32x4_t) -> int32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn fast_exp2_x4(v: float32x4_t) -> float32x4_t {
+pub(crate) fn fast_exp2_x4(v: float32x4_t) -> float32x4_t {
     // exp2(x) = 2^q * 2^r
     // q = round(x), r = x - q, so r is approximately in [-0.5, 0.5].
     let q = vcvtaq_s32_f32(v);

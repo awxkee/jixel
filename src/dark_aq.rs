@@ -30,6 +30,59 @@ use crate::adaptive_quant::{dirty_log1pf, fast_exp2};
 use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 
+pub(crate) type ApplyQuantFieldGainFn = fn(&mut ImageB, usize, usize, usize, usize, f32);
+
+#[allow(dead_code)]
+pub(crate) fn apply_quant_field_gain_scalar(
+    image: &mut ImageB,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    gain: f32,
+) {
+    for y in y0..y0 + height {
+        for value in &mut image.row_mut(y)[x0..x0 + width] {
+            let q = *value as f32 * gain;
+            *value = q.round().clamp(1.0, 255.0) as u8;
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_apply_quant_field_gain_fn() -> ApplyQuantFieldGainFn {
+    crate::wasm::apply_quant_field_gain_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_apply_quant_field_gain_fn() -> ApplyQuantFieldGainFn {
+    |image, x0, y0, width, height, gain| unsafe {
+        crate::neon::apply_quant_field_gain_neon(image, x0, y0, width, height, gain)
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_apply_quant_field_gain_fn() -> ApplyQuantFieldGainFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |image, x0, y0, width, height, gain| unsafe {
+            crate::avx::apply_quant_field_gain_avx2(image, x0, y0, width, height, gain)
+        };
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |image, x0, y0, width, height, gain| unsafe {
+            crate::sse::apply_quant_field_gain_sse41(image, x0, y0, width, height, gain)
+        };
+    }
+
+    apply_quant_field_gain_scalar
+}
+
 #[cfg(test)]
 pub(crate) trait AqLuma: Copy {
     fn to_f32(self) -> f32;
@@ -451,6 +504,7 @@ pub(crate) fn apply_boost(
     x0: usize,
     y0: usize,
     distance: f32,
+    apply_quant_field_gain: ApplyQuantFieldGainFn,
 ) {
     let xblocks = raw_quant_field.xsize();
     let yblocks = raw_quant_field.ysize();
@@ -586,13 +640,14 @@ pub(crate) fn apply_boost(
 
             let bx0 = sbx * 8;
             let by0 = sby * 8;
-            for by in by0..(by0 + 8).min(yblocks) {
-                let row = raw_quant_field.row_mut(by);
-                for dst in row[bx0..(bx0 + 8).min(xblocks)].iter_mut() {
-                    let q = *dst as f32 * gain;
-                    *dst = q.round().clamp(1.0, 255.0) as u8;
-                }
-            }
+            apply_quant_field_gain(
+                raw_quant_field,
+                bx0,
+                by0,
+                (xblocks - bx0).min(8),
+                (yblocks - by0).min(8),
+                gain,
+            );
         }
     }
 }
@@ -600,6 +655,69 @@ pub(crate) fn apply_boost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_apply_quant_field_gain(method: ApplyQuantFieldGainFn) {
+        let source = [
+            0u8, 1, 2, 3, 7, 15, 31, 63, 127, 128, 254, 255, 17, 91, 149, 223, 5,
+        ];
+        let gains = [
+            -1.0,
+            0.0,
+            0.25,
+            0.5,
+            0.999,
+            1.0,
+            1.5,
+            2.0,
+            300.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for len in 0..=source.len() {
+            for &gain in &gains {
+                let mut expected = ImageB::new(source.len() + 2, 5);
+                for y in 0..5 {
+                    for (x, value) in expected.row_mut(y).iter_mut().enumerate() {
+                        *value = source[(y * (source.len() + 2) + x) % source.len()];
+                    }
+                }
+                let mut actual = expected.clone();
+                apply_quant_field_gain_scalar(&mut expected, 1, 1, len, 3, gain);
+                method(&mut actual, 1, 1, len, 3, gain);
+                assert_eq!(
+                    actual.as_slice(),
+                    expected.as_slice(),
+                    "length {len}, gain {gain}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_quant_field_gain_matches_scalar() {
+        check_apply_quant_field_gain(select_apply_quant_field_gain_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_quant_field_gain_matches_scalar() {
+        if is_x86_feature_detected!("avx2") {
+            check_apply_quant_field_gain(|image, x0, y0, width, height, gain| unsafe {
+                crate::avx::apply_quant_field_gain_avx2(image, x0, y0, width, height, gain)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_quant_field_gain_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_apply_quant_field_gain(|image, x0, y0, width, height, gain| unsafe {
+                crate::sse::apply_quant_field_gain_sse41(image, x0, y0, width, height, gain)
+            });
+        }
+    }
 
     #[test]
     fn parse_shortcut_and_fields() {

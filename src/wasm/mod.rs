@@ -41,7 +41,10 @@ pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
 pub(crate) use dct::*;
 pub(crate) use lossless_grad::grad_pack_interior;
-pub(crate) use quant::{quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc_wasm};
+pub(crate) use quant::{
+    apply_quant_field_gain_wasm, apply_structure_aq_wasm, quantize_block_ac_wasm,
+    quantize_dc_cfl_wasm, quantize_dc_wasm,
+};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm};
 pub(crate) use xyb::to_xyb_wasm_band;
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};

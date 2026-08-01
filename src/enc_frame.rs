@@ -2098,6 +2098,7 @@ fn setup_dc_group(
             dc_group_x0,
             dc_group_y0,
             distp.distance,
+            ctx.apply_quant_field_gain,
         );
     }
 
@@ -2110,6 +2111,7 @@ fn setup_dc_group(
             dc_group_y0,
             distp.distance,
             ctx.dct8x8,
+            ctx.apply_structure_corrections,
         );
     }
 

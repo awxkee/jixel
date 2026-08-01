@@ -401,7 +401,7 @@ fn pow2if_s32(q: __m128i) -> __m128i {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn fast_exp2_x4(v: __m128) -> __m128 {
+pub(crate) fn fast_exp2_x4(v: __m128) -> __m128 {
     // exp2(x) = 2^q * 2^r, q = round(x), r = x - q.
     let q = _mm_cvtps_epi32(v);
     let qf = _mm_cvtepi32_ps(q);
