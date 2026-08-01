@@ -35,6 +35,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 mod ytob;
 
@@ -56,5 +57,6 @@ pub(crate) use quant::{
     quantize_dc_cfl_avx2,
 };
 pub(crate) use quantize_xyb::{quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2};
+pub(crate) use structure_aq::block_features_avx2;
 pub(crate) use xyb::to_xyb_avx2_band;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

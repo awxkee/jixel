@@ -35,6 +35,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 mod ytob;
 
@@ -56,5 +57,6 @@ pub(crate) use quant::{
     quantize_dc_cfl_neon, quantize_dc_neon,
 };
 pub(crate) use quantize_xyb::{quantize_xyb_channels_neon, quantize_xyb_tile_colors_neon};
+pub(crate) use structure_aq::block_features_neon;
 pub(crate) use xyb::to_xyb_neon_band;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};

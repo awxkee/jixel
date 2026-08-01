@@ -2181,6 +2181,7 @@ fn setup_dc_group(
             dc_group_y0,
             distp.distance,
             ctx.dct8x8,
+            ctx.block_features,
             ctx.apply_structure_corrections,
         );
     }

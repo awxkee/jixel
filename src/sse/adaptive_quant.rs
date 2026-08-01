@@ -66,7 +66,7 @@ fn store2(v: __m128, s: &mut [f32], i: usize) {
 #[inline]
 #[target_feature(enable = "sse4.1")]
 #[allow(dead_code)]
-fn hsum(v: __m128) -> f32 {
+pub(crate) fn hsum(v: __m128) -> f32 {
     let h = _mm_hadd_ps(v, v);
     let h = _mm_hadd_ps(h, h);
     _mm_cvtss_f32(h)

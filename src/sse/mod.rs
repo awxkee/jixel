@@ -33,6 +33,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod quant;
 mod quantize_xyb;
+mod structure_aq;
 mod xyb;
 
 pub(crate) use ac_strategy::sse_and_rate_sse;
@@ -45,4 +46,5 @@ pub(crate) use quant::{
     quantize_dc_cfl_sse41, quantize_dc_sse41,
 };
 pub(crate) use quantize_xyb::{quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41};
+pub(crate) use structure_aq::block_features_sse41;
 pub(crate) use xyb::to_xyb_sse41_band;

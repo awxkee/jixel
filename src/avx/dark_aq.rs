@@ -1,15 +1,5 @@
+use crate::avx::ac_strategy::hsum256;
 use std::arch::x86_64::*;
-
-#[inline]
-#[target_feature(enable = "avx2")]
-fn horizontal_sum_x8(value: __m256) -> f32 {
-    let sum = _mm_add_ps(
-        _mm256_castps256_ps128(value),
-        _mm256_extractf128_ps::<1>(value),
-    );
-    let sum = _mm_hadd_ps(sum, sum);
-    _mm_cvtss_f32(_mm_hadd_ps(sum, sum))
-}
 
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -31,7 +21,7 @@ fn sum_rows(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
         _mm256_add_ps(sums[0], sums[1]),
         _mm256_add_ps(sums[2], sums[3]),
     );
-    horizontal_sum_x8(sum)
+    hsum256(sum)
 }
 
 #[inline]
@@ -86,7 +76,7 @@ fn laplacian_abs_sum(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
         _mm256_add_ps(sums[0], sums[1]),
         _mm256_add_ps(sums[2], sums[3]),
     );
-    horizontal_sum_x8(sum)
+    hsum256(sum)
 }
 
 #[inline]

@@ -1,14 +1,8 @@
+use crate::sse::adaptive_quant::hsum;
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn horizontal_sum_x4(value: __m128) -> f32 {
-    let value = _mm_hadd_ps(value, value);
-    _mm_cvtss_f32(_mm_hadd_ps(value, value))
-}
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
@@ -27,7 +21,7 @@ fn sum_rows(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
         }
     }
     let sum = _mm_add_ps(_mm_add_ps(sums[0], sums[1]), _mm_add_ps(sums[2], sums[3]));
-    horizontal_sum_x4(sum)
+    hsum(sum)
 }
 
 #[inline]
@@ -79,7 +73,7 @@ fn laplacian_abs_sum(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
         }
     }
     let sum = _mm_add_ps(_mm_add_ps(sums[0], sums[1]), _mm_add_ps(sums[2], sums[3]));
-    horizontal_sum_x4(sum)
+    hsum(sum)
 }
 
 #[inline]

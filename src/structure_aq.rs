@@ -32,6 +32,7 @@ use crate::dct::{DctFn, DctInput, fmla};
 use crate::image::{Image3F, ImageB};
 
 pub(crate) type ApplyCorrectionsFn = fn(&[f32], &mut ImageB, f32, f32, f32);
+pub(crate) type BlockFeaturesFn = fn(&[f32; 64], &DctFn<8, 8, 64>) -> Features;
 
 #[allow(dead_code)]
 pub(crate) fn apply_corrections_scalar(
@@ -51,6 +52,32 @@ pub(crate) fn apply_corrections_scalar(
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
 pub(crate) fn select_apply_corrections_fn() -> ApplyCorrectionsFn {
     crate::wasm::apply_structure_aq_wasm
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_block_features_fn() -> BlockFeaturesFn {
+    crate::wasm::block_features_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_block_features_fn() -> BlockFeaturesFn {
+    |block, dct| unsafe { crate::neon::block_features_neon(block, dct) }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_block_features_fn() -> BlockFeaturesFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |block, dct| unsafe { crate::avx::block_features_avx2(block, dct) };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |block, dct| unsafe { crate::sse::block_features_sse41(block, dct) };
+    }
+    block_features_scalar
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -83,13 +110,13 @@ pub(crate) fn select_apply_corrections_fn() -> ApplyCorrectionsFn {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct Features {
-    persistence: f32,
-    coherence: f32,
-    predictability: f32,
-    mid_share: f32,
-    high_share: f32,
-    gradient_presence: f32,
+pub(crate) struct Features {
+    pub(crate) persistence: f32,
+    pub(crate) coherence: f32,
+    pub(crate) predictability: f32,
+    pub(crate) mid_share: f32,
+    pub(crate) high_share: f32,
+    pub(crate) gradient_presence: f32,
 }
 
 #[inline]
@@ -115,9 +142,44 @@ fn strength(distance: f32) -> f32 {
     POINTS[POINTS.len() - 1].1
 }
 
-fn block_features(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
-    const EPS: f32 = 1.0e-10;
-    let rows = block.as_chunks::<8>().0;
+pub(crate) const FEATURE_EPS: f32 = 1.0e-10;
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn finish_block_features(
+    variance: f32,
+    tensor: [f32; 3],
+    errors: [f32; 5],
+    energy_1x: f32,
+    energy_2x: f32,
+    mid: f32,
+    high: f32,
+) -> Features {
+    let [jxx, jxy, jyy] = tensor;
+    let trace = jxx + jyy;
+    let coherence = (((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy).sqrt() / (trace + FEATURE_EPS))
+        .clamp(0.0, 1.0);
+    let gradient_presence = (trace / (36.0 * variance + FEATURE_EPS)).clamp(0.0, 1.0);
+    let min_error = errors.into_iter().fold(f32::INFINITY, f32::min) * (1.0 / 36.0);
+    let predictability = (1.0 - min_error / (variance + FEATURE_EPS)).clamp(0.0, 1.0);
+    let energy_1x = energy_1x * (1.0 / 112.0);
+    let energy_2x = energy_2x * (1.0 / 24.0);
+    let persistence_ratio = energy_2x / (energy_1x + FEATURE_EPS);
+    let persistence = (persistence_ratio / (1.0 + persistence_ratio)).clamp(0.0, 1.0);
+    let spectral = mid + high + FEATURE_EPS;
+    Features {
+        persistence,
+        coherence,
+        predictability,
+        mid_share: mid / spectral,
+        high_share: high / spectral,
+        gradient_presence,
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn moments_scalar(block: &[f32; 64]) -> (f32, f32) {
     let mean = block.iter().sum::<f32>() * (1.0 / 64.0);
     let variance = block
         .iter()
@@ -127,9 +189,13 @@ fn block_features(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
         })
         .sum::<f32>()
         * (1.0 / 64.0);
+    (mean, variance)
+}
 
+#[allow(dead_code)]
+fn tensor_features_scalar(block: &[f32; 64], variance: f32) -> (f32, f32) {
+    let rows = block.as_chunks::<8>().0;
     let (mut jxx, mut jxy, mut jyy) = (0.0f32, 0.0f32, 0.0f32);
-    let mut tensor_n = 0.0f32;
     for row_window in rows.array_windows::<3>() {
         let [top, middle, bottom] = row_window;
         for ((&left, &right), (&top, &bottom)) in middle[..6]
@@ -142,16 +208,19 @@ fn block_features(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
             jxx = fmla(gx, gx, jxx);
             jxy = fmla(gx, gy, jxy);
             jyy = fmla(gy, gy, jyy);
-            tensor_n += 1.0;
         }
     }
     let trace = jxx + jyy;
-    let coherence =
-        (((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy).sqrt() / (trace + EPS)).clamp(0.0, 1.0);
-    let gradient_presence = (trace / (tensor_n * variance + EPS)).clamp(0.0, 1.0);
+    let coherence = (((jxx - jyy) * (jxx - jyy) + 4.0 * jxy * jxy).sqrt() / (trace + FEATURE_EPS))
+        .clamp(0.0, 1.0);
+    let gradient_presence = (trace / (36.0 * variance + FEATURE_EPS)).clamp(0.0, 1.0);
+    (coherence, gradient_presence)
+}
 
+#[allow(dead_code)]
+fn predictability_scalar(block: &[f32; 64], variance: f32) -> f32 {
+    let rows = block.as_chunks::<8>().0;
     let mut errors = [0.0f32; 5];
-    let mut pred_n = 0.0f32;
     for row_window in rows.array_windows::<3>() {
         let [top_row, middle, bottom_row] = row_window;
         for ((((&left, &v), &top), &top_left), &bottom_left) in middle[..6]
@@ -168,85 +237,85 @@ fn block_features(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
                 let e = v - prediction;
                 errors[slot] = fmla(e, e, errors[slot]);
             }
-            pred_n += 1.0;
         }
     }
-    let min_error = errors.into_iter().fold(f32::INFINITY, f32::min) / pred_n;
-    let predictability = (1.0 - min_error / (variance + EPS)).clamp(0.0, 1.0);
+    let min_error = errors.into_iter().fold(f32::INFINITY, f32::min) * (1.0 / 36.0);
+    (1.0 - min_error / (variance + FEATURE_EPS)).clamp(0.0, 1.0)
+}
 
-    let mut energy_1x = 0.0f32;
-    for row in rows {
-        for pair in row.array_windows::<2>() {
+#[allow(dead_code)]
+fn gradient_energy_scalar(values: &[f32], stride: usize, width: usize, height: usize) -> f32 {
+    let mut energy = 0.0f32;
+    for row in values.chunks_exact(stride).take(height) {
+        for pair in row[..width].array_windows::<2>() {
             let d = pair[1] - pair[0];
-            energy_1x = fmla(d, d, energy_1x);
+            energy = fmla(d, d, energy);
         }
     }
-    for pair in rows.array_windows::<2>() {
-        for (&top, &bottom) in pair[0].iter().zip(&pair[1]) {
+    for y in 0..height - 1 {
+        let top = &values[y * stride..][..width];
+        let bottom = &values[(y + 1) * stride..][..width];
+        for (&top, &bottom) in top.iter().zip(bottom) {
             let d = bottom - top;
-            energy_1x = fmla(d, d, energy_1x);
+            energy = fmla(d, d, energy);
         }
     }
-    energy_1x *= 1.0 / 112.0;
-    let mut half = [0.0f32; 16];
-    for (src_rows, dst) in rows
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(half.as_chunks_mut::<4>().0.iter_mut())
-    {
-        for ((top, bottom), out) in src_rows[0]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(src_rows[1].as_chunks::<2>().0.iter())
-            .zip(dst.iter_mut())
-        {
-            *out = 0.25 * (top[0] + top[1] + bottom[0] + bottom[1]);
+    energy
+}
+
+#[inline]
+#[allow(dead_code)]
+fn downsample_8x8_scalar(block: &[f32; 64]) -> [f32; 16] {
+    let mut half = [0.0; 16];
+    for y in 0..4 {
+        for x in 0..4 {
+            let src = 2 * y * 8 + 2 * x;
+            half[y * 4 + x] =
+                0.25 * (block[src] + block[src + 1] + block[src + 8] + block[src + 9]);
         }
     }
-    let half_rows = half.as_chunks::<4>().0;
-    let mut energy_2x = 0.0f32;
-    for row in half_rows {
-        for pair in row.array_windows::<2>() {
-            let d = pair[1] - pair[0];
-            energy_2x = fmla(d, d, energy_2x);
+    half
+}
+
+#[inline]
+#[allow(dead_code)]
+fn spectral_shares_scalar(coeffs: &[f32; 64]) -> (f32, f32) {
+    let (mut mid, mut high) = (0.0, 0.0);
+    for (y, row) in coeffs.as_chunks::<8>().0.iter().enumerate() {
+        let mid_start = 2usize.saturating_sub(y);
+        let mid_end = (8 - y).min(8);
+        for &coeff in &row[mid_start..mid_end] {
+            mid = fmla(coeff, coeff, mid);
+        }
+        let high_start = 8usize.saturating_sub(y);
+        for &coeff in &row[high_start..] {
+            high = fmla(coeff, coeff, high);
         }
     }
-    for pair in half_rows.array_windows::<2>() {
-        for (&top, &bottom) in pair[0].iter().zip(&pair[1]) {
-            let d = bottom - top;
-            energy_2x = fmla(d, d, energy_2x);
-        }
-    }
-    energy_2x *= 1.0 / 24.0;
-    let persistence_ratio = energy_2x / (energy_1x + EPS);
+    let spectral = mid + high + FEATURE_EPS;
+    (mid / spectral, high / spectral)
+}
+
+#[allow(dead_code)]
+fn block_features_scalar(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Features {
+    let (_, variance) = moments_scalar(block);
+    let (coherence, gradient_presence) = tensor_features_scalar(block, variance);
+    let predictability = predictability_scalar(block, variance);
+    let energy_1x = gradient_energy_scalar(block, 8, 8, 8) * (1.0 / 112.0);
+    let half = downsample_8x8_scalar(block);
+    let energy_2x = gradient_energy_scalar(&half, 4, 4, 4) * (1.0 / 24.0);
+    let persistence_ratio = energy_2x / (energy_1x + FEATURE_EPS);
     let persistence = (persistence_ratio / (1.0 + persistence_ratio)).clamp(0.0, 1.0);
 
     let mut coeffs = [0.0f32; 64];
     dct8x8(DctInput::from_flat(block), &mut coeffs);
-    let (mut mid, mut high) = (0.0f32, 0.0f32);
-    for (y, row) in coeffs.as_chunks::<8>().0.iter().enumerate() {
-        for (x, &coeff) in row.iter().enumerate() {
-            if x == 0 && y == 0 {
-                continue;
-            }
-            let e = coeff * coeff;
-            let band = x + y;
-            if (2..=7).contains(&band) {
-                mid += e;
-            } else if band >= 8 {
-                high += e;
-            }
-        }
-    }
-    let spectral = mid + high + EPS;
+    let (mid_share, high_share) = spectral_shares_scalar(&coeffs);
     Features {
         persistence,
         coherence,
         predictability,
-        mid_share: mid / spectral,
-        high_share: high / spectral,
+        mid_share,
+        high_share,
         gradient_presence,
     }
 }
@@ -272,6 +341,7 @@ pub(crate) fn apply(
     y0: usize,
     distance: f32,
     dct8x8: &DctFn<8, 8, 64>,
+    block_features: BlockFeaturesFn,
     apply_corrections: ApplyCorrectionsFn,
 ) {
     let amount = strength(distance);
@@ -342,6 +412,81 @@ pub(crate) fn apply(
 mod tests {
     use super::*;
 
+    fn check_block_features(method: BlockFeaturesFn) {
+        let dct = crate::dct::selected_dct8x8();
+        let mut blocks = Vec::new();
+        blocks.push([0.0; 64]);
+        blocks.push([0.37; 64]);
+        let mut line = [0.0; 64];
+        let mut checker = [0.0; 64];
+        let mut random = [0.0; 64];
+        let mut replicated_edge = [0.0; 64];
+        let mut state = 0x9e37_79b9u32;
+        for y in 0..8 {
+            for x in 0..8 {
+                line[y * 8 + x] = if x < 4 { 0.2 } else { 0.8 };
+                checker[y * 8 + x] = if (x + y) & 1 == 0 { 0.2 } else { 0.8 };
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                random[y * 8 + x] = (state >> 8) as f32 / (1u32 << 24) as f32;
+                let edge_x = x.min(4);
+                let edge_y = y.min(2);
+                replicated_edge[y * 8 + x] = (edge_y * 5 + edge_x) as f32 * (1.0 / 16.0);
+            }
+        }
+        blocks.extend([line, checker, random, replicated_edge]);
+        for (index, block) in blocks.iter().enumerate() {
+            let expected = block_features_scalar(block, dct);
+            let actual = method(block, dct);
+            for (name, actual, expected) in [
+                ("persistence", actual.persistence, expected.persistence),
+                ("coherence", actual.coherence, expected.coherence),
+                (
+                    "predictability",
+                    actual.predictability,
+                    expected.predictability,
+                ),
+                ("mid_share", actual.mid_share, expected.mid_share),
+                ("high_share", actual.high_share, expected.high_share),
+                (
+                    "gradient_presence",
+                    actual.gradient_presence,
+                    expected.gradient_presence,
+                ),
+            ] {
+                let tolerance = 2e-6f32.max(expected.abs() * 2e-5);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "block {index} {name}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_block_features_matches_scalar() {
+        check_block_features(select_block_features_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_block_features_matches_scalar() {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            check_block_features(|block, dct| unsafe {
+                crate::avx::block_features_avx2(block, dct)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_block_features_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_block_features(|block, dct| unsafe {
+                crate::sse::block_features_sse41(block, dct)
+            });
+        }
+    }
+
     fn check_apply_corrections(method: ApplyCorrectionsFn) {
         let parameters = [
             (0.0, 0.0, 0.0),
@@ -408,8 +553,8 @@ mod tests {
             }
         }
         let dct = crate::dct::selected_dct8x8();
-        let line_f = block_features(&line, dct);
-        let noise_f = block_features(&checker, dct);
+        let line_f = block_features_scalar(&line, dct);
+        let noise_f = block_features_scalar(&checker, dct);
         assert!(line_f.coherence > noise_f.coherence);
         assert!(correction_score(line_f, 3.0) > correction_score(noise_f, 3.0));
     }
