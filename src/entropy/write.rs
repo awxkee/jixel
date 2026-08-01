@@ -451,9 +451,11 @@ where
             histograms.push(Histogram::new());
         }
         context_map.extend(coarse_map.into_iter().map(|bucket| {
-            (dense[bucket] != u8::MAX)
-                .then_some(dense[bucket])
-                .unwrap_or(0)
+            if dense[bucket] != u8::MAX {
+                dense[bucket]
+            } else {
+                0
+            }
         }));
     } else {
         cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
