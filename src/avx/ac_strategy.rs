@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_sse_and_rate_avx2_vs_reference() {
-        if !std::is_x86_feature_detected!("avx") {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let mut st: u64 = 0x5e5e_a11d_0f00_d00d;

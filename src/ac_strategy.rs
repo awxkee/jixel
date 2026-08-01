@@ -28,6 +28,7 @@
  */
 //! Adaptive transform (AC strategy) selection via rate-distortion optimization.
 
+use crate::adaptive_quant::fast_exp2;
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
@@ -156,6 +157,8 @@ pub(crate) struct MergeTuning {
     pub(crate) accept_32: f32,
     /// See [`RERANK_DOWNGRADE_MARGIN`].
     pub(crate) rerank_margin: f32,
+    /// Heterogeneity merge-risk gate strength (see [`MERGE_RISK_K`]).
+    pub(crate) risk_k: f32,
 }
 
 impl MergeTuning {
@@ -171,6 +174,11 @@ impl MergeTuning {
             accept_32_rect: accept(MERGE_MARGIN_32_RECT),
             accept_32: accept(MERGE_MARGIN_32),
             rerank_margin: RERANK_DOWNGRADE_MARGIN.at(distance),
+            risk_k: if crate::adaptive_quant::aq_dampen(distance) > 0.0 {
+                MERGE_RISK_K
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -680,6 +688,17 @@ fn cmap_factors(ytox_map: &ImageSB, ytob_map: &ImageSB, bx: usize, by: usize) ->
     ]
 }
 
+const MERGE_RISK_K: f32 = std::f32::consts::LOG2_E;
+
+#[inline]
+fn risk_gated(k: f32, accept: f32, q_min: f32, q_max: f32, area_scale: f32) -> f32 {
+    if q_min <= 0.0 || k <= 0.0 {
+        return accept;
+    }
+    let spread = q_max / q_min - 1.0;
+    accept * fast_exp2(-k * area_scale * spread)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_super_block(
     ctx: &EncodingContext,
@@ -792,9 +811,12 @@ fn select_super_block(
         if use_h_top { h_top } else { dct8_top } + if use_h_bottom { h_bot } else { dct8_bottom };
     let best_rect = cost_16x8.min(cost_8x16);
 
+    let (q_min, q_max) = qac.iter().flatten().fold((f32::INFINITY, 0.0f32), |(mn, mx), &q| {
+        (mn.min(q), mx.max(q))
+    });
     let pick_16x16 = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
         && c16 < best_rect
-        && merge_beats_dct8(c16, total_dct8, merge.accept_16);
+        && merge_beats_dct8(c16, total_dct8, risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0));
 
     let chosen = if pick_16x16 {
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
@@ -1143,13 +1165,23 @@ fn select_band(
                     f32::INFINITY
                 };
 
+                let (mut q_min, mut q_max) = (u8::MAX, 0u8);
+                for iy in 0..4 {
+                    for &q in &quant_field.row(by + iy)[bx..bx + 4] {
+                        q_min = q_min.min(q);
+                        q_max = q_max.max(q);
+                    }
+                }
+                let gate = |accept: f32| {
+                    risk_gated(merge.risk_k, accept, q_min as f32, q_max as f32, 2.0)
+                };
                 let (best_big, best_strategy, accept) =
                     if cost_32x32 <= cost_32x16 && cost_32x32 <= cost_16x32 {
-                        (cost_32x32, STRATEGY_DCT32X32, merge.accept_32)
+                        (cost_32x32, STRATEGY_DCT32X32, gate(merge.accept_32))
                     } else if cost_32x16 <= cost_16x32 {
-                        (cost_32x16, STRATEGY_DCT32X16, merge.accept_32_rect)
+                        (cost_32x16, STRATEGY_DCT32X16, gate(merge.accept_32_rect))
                     } else {
-                        (cost_16x32, STRATEGY_DCT16X32, merge.accept_32_rect)
+                        (cost_16x32, STRATEGY_DCT16X32, gate(merge.accept_32_rect))
                     };
 
                 // Compare against both the already-selected subdivision and the
