@@ -101,12 +101,6 @@ fn fingerprint(tokens: &[Token], pos: usize) -> u32 {
     hash
 }
 
-#[inline]
-fn hash(tokens: &[Token], pos: usize) -> usize {
-    const HASH_BITS: usize = 18;
-    fingerprint(tokens, pos) as usize & ((1 << HASH_BITS) - 1)
-}
-
 fn has_repetition(tokens: &[Token], scratch: &mut Vec<u32>) -> bool {
     const MAX_SAMPLES: usize = 8_192;
     const SAMPLE_TABLE_SIZE: usize = 1 << 14;
@@ -158,32 +152,75 @@ fn match_len(tokens: &[Token], a: usize, b: usize) -> usize {
     len
 }
 
-fn find_match(
+const RING_HASH_BITS: usize = 17;
+const RING_HASH_SIZE: usize = 1 << RING_HASH_BITS;
+const RING_BUCKET: usize = 8;
+
+#[inline]
+fn ring_hash(tokens: &[Token], pos: usize) -> usize {
+    fingerprint(tokens, pos) as usize & (RING_HASH_SIZE - 1)
+}
+
+/// Cursor word layout: bits 0..3 = ring write index, bit 3 = "ring wrapped"
+/// (all slots live), bits 16.. = epoch stamp. A bucket whose stamp differs
+/// from the current call's epoch is logically empty — no per-call memset of
+/// the (multi-MB) entry table.
+const RING_WRAPPED: u32 = 1 << 3;
+
+#[inline]
+fn ring_bucket_state(cursors: &mut [u32], h: usize, epoch: u32) -> u32 {
+    let word = cursors[h];
+    if word >> 16 != epoch {
+        let fresh = epoch << 16;
+        cursors[h] = fresh;
+        fresh
+    } else {
+        word
+    }
+}
+
+#[inline]
+fn ring_insert(entries: &mut [u32], cursors: &mut [u32], h: usize, pos: usize, epoch: u32) {
+    let word = ring_bucket_state(cursors, h, epoch);
+    let idx = (word as usize) & (RING_BUCKET - 1);
+    entries[h * RING_BUCKET + idx] = pos as u32;
+    let next = (idx + 1) & (RING_BUCKET - 1);
+    let wrapped = (word & RING_WRAPPED) | if next == 0 { RING_WRAPPED } else { 0 };
+    cursors[h] = (epoch << 16) | wrapped | next as u32;
+}
+
+fn find_match_ring(
     tokens: &[Token],
     pos: usize,
-    head: &[u32],
-    prev: &[u32],
+    entries: &[u32],
+    cursors: &mut [u32],
     max_probes: usize,
+    epoch: u32,
 ) -> (usize, usize) {
     if pos + LZ77_MIN_LENGTH as usize > tokens.len() {
         return (0, 0);
     }
-    let mut candidate = head[hash(tokens, pos)];
+    let h = ring_hash(tokens, pos);
+    let base = h * RING_BUCKET;
+    let word = ring_bucket_state(cursors, h, epoch);
+    let idx = (word as usize) & (RING_BUCKET - 1);
+    let live = if word & RING_WRAPPED != 0 {
+        RING_BUCKET
+    } else {
+        idx
+    };
     let mut best_len = 0usize;
     let mut best_dist = 0usize;
-    let mut probes = 0usize;
-    while candidate != u32::MAX && probes < max_probes {
-        let candidate_pos = candidate as usize;
-        let distance = pos - candidate_pos;
-        if distance <= u32::MAX as usize {
-            let len = match_len(tokens, candidate_pos, pos);
-            if len > best_len || (len == best_len && distance < best_dist) {
-                best_len = len;
-                best_dist = distance;
-            }
+    // Newest-first scan: on equal lengths the nearest (cheapest) distance wins
+    // for free.
+    for k in 1..=live.min(max_probes) {
+        let slot = (idx + RING_BUCKET - k) % RING_BUCKET;
+        let candidate_pos = entries[base + slot] as usize;
+        let len = match_len(tokens, candidate_pos, pos);
+        if len > best_len {
+            best_len = len;
+            best_dist = pos - candidate_pos;
         }
-        candidate = prev[candidate_pos];
-        probes += 1;
     }
     (best_len, best_dist)
 }
@@ -248,6 +285,10 @@ pub(super) fn lz77_compress_for_speed(
     speed: crate::Speed,
     scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
+    // Fast stays runs-only: enabling the ring matcher there was measured at
+    // -0.7% bytes for +8% time on the best case (fractal) and +32% time for
+    // byte-identical output on photos (sampling + speculative matching that
+    // the payload gates then discard).
     if speed == crate::Speed::Fast || !has_repetition(tokens, &mut scratch.lz_repetitions) {
         return lz77_compress_runs(tokens);
     }
@@ -357,36 +398,26 @@ fn lz77_compress_with_depth_into(
         out.capacity() >= tokens.len(),
         "LZ77 candidate scratch was not fully preallocated"
     );
-    const HEAD_LEN: usize = 1 << 18;
-    let total = HEAD_LEN + tokens.len();
+    const ENTRIES_LEN: usize = RING_HASH_SIZE * RING_BUCKET;
+    let total = ENTRIES_LEN + RING_HASH_SIZE + 1;
     if scratch.len() < total {
-        scratch.resize(total, u32::MAX);
+        scratch.clear();
+        scratch.resize(total, 0);
     }
-    scratch[..HEAD_LEN].fill(u32::MAX);
-    let (head, tail) = scratch.split_at_mut(HEAD_LEN);
-    let (prev, _) = tail.split_at_mut(tokens.len());
+    let (entries, rest) = scratch.split_at_mut(ENTRIES_LEN);
+    let (cursors, epoch_word) = rest.split_at_mut(RING_HASH_SIZE);
+    let mut epoch = (epoch_word[0] + 1) & 0xffff;
+    if epoch == 0 {
+        cursors.fill(0);
+        epoch = 1;
+    }
+    epoch_word[0] = epoch;
     let mut i = 0usize;
     while i < tokens.len() {
-        let (match_len, distance) = find_match(tokens, i, head, prev, max_probes);
+        let (match_len, distance) =
+            find_match_ring(tokens, i, entries, cursors, max_probes, epoch);
         let threshold = if distance <= 16 { 4 } else { 5 };
         if match_len >= threshold {
-            let token_hash = hash(tokens, i);
-            let old_head = head[token_hash];
-            prev[i] = old_head;
-            head[token_hash] = i as u32;
-            let (next_len, _) = if i + 1 < tokens.len() {
-                find_match(tokens, i + 1, head, prev, max_probes)
-            } else {
-                (0, 0)
-            };
-            if next_len > match_len + 1 {
-                let token = tokens[i];
-                out.push(LzToken::pixel(token.context, token.value));
-                i += 1;
-                continue;
-            }
-            head[token_hash] = old_head;
-            prev[i] = u32::MAX;
             let distance_value = if distance == 1 {
                 LZ77_DIST_VALUE
             } else {
@@ -398,17 +429,13 @@ fn lz77_compress_with_depth_into(
                 distance_value,
             ));
             for pos in i..i + match_len {
-                let token_hash = hash(tokens, pos);
-                prev[pos] = head[token_hash];
-                head[token_hash] = pos as u32;
+                ring_insert(entries, cursors, ring_hash(tokens, pos), pos, epoch);
             }
             i += match_len;
         } else {
             let token = tokens[i];
             out.push(LzToken::pixel(token.context, token.value));
-            let token_hash = hash(tokens, i);
-            prev[i] = head[token_hash];
-            head[token_hash] = i as u32;
+            ring_insert(entries, cursors, ring_hash(tokens, i), i, epoch);
             i += 1;
         }
     }

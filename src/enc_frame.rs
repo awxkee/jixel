@@ -553,27 +553,14 @@ pub(crate) fn collect_ac_metadata_tokens(
 }
 
 /// Distance-scheduled constant per-block EPF sharpness id
-/// STUDY SCAFFOLDING: `JIXEL_BQM` (0..=3, default 2 = neutral) sets the frame
-/// header's `b_qm_scale`. The decoder multiplies the B dequant matrices by
-/// `1.25^(2 - b_qm_scale)`... i.e. scale 1 quantizes B 1.25x coarser — the
-/// spec-clean lever to reclaim the blue-biased opsin's B byte inflation.
-/// Remove (bake the fitted value) when the b_bias study lands.
-pub(crate) fn b_qm_scale() -> u32 {
-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("JIXEL_BQM")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .map(|v| v.min(3))
-            .unwrap_or(2)
-    })
+pub(crate) const fn b_qm_scale() -> u32 {
+    2
 }
 
 /// Encoder-side B quantizer-scale multiplier matching [`b_qm_scale`]
 /// (mirrors `x_qm_mul = 1.25^(x_qm_scale - 2)`).
 pub(crate) fn b_qm_mul() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| 1.25f32.powf(b_qm_scale() as f32 - 2.0))
+    1.25f32.powf(b_qm_scale() as f32 - 2.0)
 }
 
 fn epf_sharpness_id(distance: f32) -> i32 {
