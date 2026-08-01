@@ -57,9 +57,10 @@ pub(crate) fn sse_and_rate_wasm(
     cy: usize,
     _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = f32x4_splat(q_scaled);
@@ -67,6 +68,7 @@ pub(crate) fn sse_and_rate_wasm(
     let mut sse_acc = f32x4_splat(0.0);
     let mut mag_acc = f32x4_splat(0.0);
     let mut nzeros = 0usize;
+    let mut scan_acc = u32x4_splat(0);
 
     let zero = f32x4_splat(0.0);
 
