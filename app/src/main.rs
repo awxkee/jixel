@@ -136,7 +136,7 @@ fn main() {
         height as usize,
         threads,
     ));
-    // black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
+    black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
 
     let mut jixel_times = Vec::with_capacity(iterations);
     let mut libjxl_times = Vec::with_capacity(iterations);

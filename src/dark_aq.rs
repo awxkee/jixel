@@ -272,7 +272,7 @@ pub(crate) fn dark_structure_stats_scalar(buf: &[[f32; 64]], h: usize, w: usize)
     }
     let flat = buf.as_flattened();
     let mut sum = 0.0f32;
-    for row in flat.chunks_exact(64).take(h) {
+    for row in flat.as_chunks::<64>().0.iter().take(h) {
         for &v in &row[..w] {
             sum += v;
         }
