@@ -787,10 +787,33 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     };
     let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
     let mut rate = 0.0f32;
-    for c in 0..3 {
+    rate += unsafe {
+        quantize(
+            &coeffs[1][..n],
+            &inverse_matrices[1][..n],
+            quant_scales[1],
+            &thresholds[1],
+            width,
+            height,
+            half,
+            cx,
+            cy,
+            &mut coeff_error[1][..n],
+            rate_log2_lut,
+            scan_pos,
+        )
+    };
+    for c in [0usize, 2] {
+        let factor = if c == 0 { factor_x } else { factor_b };
+        combine_error(
+            &coeffs[c][..n],
+            &coeff_error[1][..n],
+            factor,
+            &mut combined_error[..n],
+        );
         rate += unsafe {
             quantize(
-                &coeffs[c][..n],
+                &combined_error[..n],
                 &inverse_matrices[c][..n],
                 quant_scales[c],
                 &thresholds[c],
@@ -806,22 +829,11 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         };
     }
 
-    reconstruct_error(strategy, &coeff_error[1][..n], &mut y_error[..n]);
+    let _ = y_error;
     let mut distortion = 0.0f32;
     for c in 0..3 {
-        let factor = if c == 0 { factor_x } else { factor_b };
-        let error: &[f32] = if c == 1 {
-            &y_error[..n]
-        } else {
-            reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
-            combine_error(
-                &spatial_error[..n],
-                &y_error[..n],
-                factor,
-                &mut combined_error[..n],
-            );
-            &combined_error[..n]
-        };
+        reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
+        let error: &[f32] = &spatial_error[..n];
         let plane = opsin.plane(c);
         unsafe {
             prepare_reconstruction(
@@ -854,7 +866,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn prepare_reconstruction_scalar(
+fn prepare_reconstruction_scalar(
     plane: &Plane<f32>,
     px: usize,
     py: usize,
