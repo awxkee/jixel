@@ -37,7 +37,7 @@ const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM_IN_BLOCKS: usize = 8;
 
 /// libjxl default color factor: stored as 1/x in the encoder hot path.
-const K_INV_COLOR_FACTOR: f32 = 1.0 / 84.0;
+const K_INV_COLOR_FACTOR: f32 = 1.0 / K_COLOR_FACTOR;
 /// Regularisation toward base correlation. Matches libjxl-tiny.
 const K_DISTANCE_MULTIPLIER_AC: f32 = 1e-3;
 

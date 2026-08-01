@@ -965,15 +965,24 @@ fn write_dc_global(
     // ColorCorrelationParams. The all-default bundle pins the DC plane to the
     // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
     // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
-    if ytob_dc == 0 {
-        w.write(1, 1); // all_default
-    } else {
-        w.write(1, 0); // not all-default
-        w.write(2, 0); // color_factor = 84 (the direct branch)
-        w.write(16, 0); // base_correlation_x = 0.0
-        w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
-        w.write(8, 128); // ytox_dc = 0, offset by 128
-        w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
+    {
+        let factor = crate::enc_color_correlation::K_COLOR_FACTOR as u32;
+        if factor == 84 && ytob_dc == 0 {
+            w.write(1, 1); // all_default
+        } else {
+            w.write(1, 0); // not all-default
+            // color_factor: U32(Val(84), Val(256), BitsOffset(8, 2), BitsOffset(16, 258)).
+            if factor == 84 {
+                w.write(2, 0);
+            } else {
+                w.write(2, 2);
+                w.write(8, (factor - 2) as u64);
+            }
+            w.write(16, 0); // base_correlation_x = 0.0
+            w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
+            w.write(8, 128); // ytox_dc = 0, offset by 128
+            w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
+        }
     }
 
     // Global tree.
