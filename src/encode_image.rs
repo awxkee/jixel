@@ -222,6 +222,9 @@ impl ToneMappingParams {
 /// Encoder speed/transform-search tradeoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Speed {
+    /// No transform search at all: every block is coded as a plain 8×8 DCT.
+    /// Skips everything `Fast` skips, plus the square-merge selection.
+    Fastest,
     #[default]
     Fast,
     Slow,
@@ -336,7 +339,7 @@ impl Default for EncodeConfig {
             lossless: false,
             banding_protection: false,
             progressive: false,
-            patches: true,
+            patches: false,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -604,6 +607,9 @@ impl EncodeConfig {
     /// Select the transform-search speed/effort tradeoff.
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        if speed == Speed::Slow {
+            self.patches = true;
+        }
         self
     }
 }
@@ -2515,6 +2521,32 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn fastest_speed_encodes_dct8_only() {
+        // A smooth gradient makes Fast/Slow merge into large transforms, so a
+        // Fastest stream (all 8x8) must differ; both must be valid encodes.
+        const WIDTH: usize = 128;
+        const HEIGHT: usize = 128;
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| (((i / 3) % WIDTH) / 2 + ((i / 3) / WIDTH) / 2) as u8)
+            .collect();
+        let config = lossy().with_distance(2.0);
+        let fastest = encode_image(
+            &input,
+            WIDTH,
+            HEIGHT,
+            &config.clone().with_speed(Speed::Fastest),
+        )
+        .expect("Fastest encode failed");
+        let fast = encode_image(&input, WIDTH, HEIGHT, &config.clone().with_speed(Speed::Fast))
+            .expect("Fast encode failed");
+        assert!(!fastest.is_empty());
+        assert_ne!(
+            fastest, fast,
+            "Fastest should skip the transform search Fast performs"
+        );
+    }
+
+    #[test]
     fn lossless_output_is_independent_of_thread_count() {
         const WIDTH: usize = 257;
         const HEIGHT: usize = 257;
@@ -2522,7 +2554,7 @@ mod encode_smoke_tests {
             .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
             .collect();
 
-        for speed in [Speed::Fast, Speed::Slow] {
+        for speed in [Speed::Fastest, Speed::Fast, Speed::Slow] {
             let single = encode_image(
                 &input,
                 WIDTH,

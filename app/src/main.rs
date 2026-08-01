@@ -25,7 +25,7 @@ fn encode_jixel(rgb: &[u8], width: usize, height: usize, threads: usize) -> Meas
         .with_quality(QUALITY)
         .with_progressive(false)
         .with_patches(true)
-        .with_speed(Speed::Fast)
+        .with_speed(Speed::Fastest)
         .with_num_threads(threads);
     let start = Instant::now();
     let bytes = jixel::encode_image(black_box(rgb), width, height, &config)

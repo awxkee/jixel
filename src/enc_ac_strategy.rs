@@ -186,7 +186,9 @@ impl SearchScope {
     #[inline]
     fn for_speed(speed: crate::Speed) -> Self {
         match speed {
-            crate::Speed::Fast => SearchScope::Squares,
+            // Fastest never reaches the chooser (`fill_ac_strategy` returns
+            // before scoping); Squares is the defensive mapping.
+            crate::Speed::Fastest | crate::Speed::Fast => SearchScope::Squares,
             crate::Speed::Slow => SearchScope::Full,
         }
     }
@@ -1320,8 +1322,10 @@ pub(crate) fn fill_ac_strategy(
     let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
-    // DCT8 wins the high-quality RD comparison outright.
-    if use_dct8_only(distance) {
+    // DCT8 wins the high-quality RD comparison outright; Fastest skips the
+    // search by contract. Either way the default strategy image (all DCT8
+    // first blocks) is already the answer.
+    if use_dct8_only(distance) || speed == crate::Speed::Fastest {
         return 0.0;
     }
     let scope = SearchScope::for_speed(speed);

@@ -1457,7 +1457,7 @@ fn encode_frame_core(
     // mere presence perturbs codegen enough to shift a few borderline
     // quantizer roundings on paths that should be untouched.
     let want_order_stats =
-        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast;
+        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow;
     let results = ctx
         .thread_pool
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
@@ -1507,7 +1507,7 @@ fn encode_frame_core(
     let mut coeff_orders = crate::enc_coeff_order::CoeffOrders::natural();
 
     let mut ytob_dc = 0i32;
-    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed != Speed::Fast {
+    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow {
         coeff_orders = crate::enc_coeff_order::derive_orders(&order_stats);
         ytob_dc = choose_ytob_dc(
             &dc_datas,
@@ -2171,7 +2171,7 @@ fn setup_dc_group(
         );
     }
 
-    if ctx.speed != Speed::Fast {
+    if ctx.speed == Speed::Slow {
         crate::structure_aq::apply(
             &mut scratch.structure_corrections,
             opsin,

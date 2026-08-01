@@ -285,11 +285,8 @@ pub(super) fn lz77_compress_for_speed(
     speed: crate::Speed,
     scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
-    // Fast stays runs-only: enabling the ring matcher there was measured at
-    // -0.7% bytes for +8% time on the best case (fractal) and +32% time for
-    // byte-identical output on photos (sampling + speculative matching that
-    // the payload gates then discard).
-    if speed == crate::Speed::Fast || !has_repetition(tokens, &mut scratch.lz_repetitions) {
+    // Fast stays runs-only
+    if speed != crate::Speed::Slow || !has_repetition(tokens, &mut scratch.lz_repetitions) {
         return lz77_compress_runs(tokens);
     }
     lz77_compress_with_depth_into(tokens, 8, &mut scratch.lz_depth, &mut scratch.lz_candidate);
