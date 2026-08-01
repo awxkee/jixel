@@ -40,23 +40,108 @@ pub(crate) const M10: f32 = 0.23;
 pub(crate) const M12: f32 = 0.078;
 pub(crate) const M11: f32 = 1.0 - M12 - M10;
 
-pub(crate) const B_BIAS: f32 = 0.85;
+// Share of the B row on pure blue. 0.551_809_86 reproduces the spec opsin
+// matrix exactly (the 2026-08-01 breadth study: the spec row beats the
+// blue-biased 0.85 on both metrics everywhere except saturated-red content;
+// see the opsin-b-bias notes). Any other value flips `is_decoder_default()`
+// and the header then signals the matching custom inverse automatically.
+pub(crate) const B_BIAS: f32 = 0.551_809_86;
 const B_R_RATIO: f32 = 0.243_422_69 / (0.243_422_69 + 0.204_767_45);
 pub(crate) const M20: f32 = B_R_RATIO * (1.0 - B_BIAS);
 pub(crate) const M21: f32 = (1.0 - B_R_RATIO) * (1.0 - B_BIAS);
 pub(crate) const M22: f32 = 1.0 - M20 - M21;
 
 pub(crate) const OPSIN_INVERSE_MATRIX: [f32; 9] = [
-    10.785_613,
-    -9.684_577,
-    -0.101_036_27,
-    -3.500_100_9,
-    4.601_137_2,
-    -0.101_036_27,
-    -0.751_554_56,
-    0.557_254_05,
-    1.194_300_5,
+    11.031567,
+    -9.866944,
+    -0.16462299,
+    -3.2541473,
+    4.4187703,
+    -0.16462299,
+    -3.6588514,
+    2.712923,
+    1.9459282,
 ];
+
+// Red-variant B row: the blue-biased row (b_bias = 0.85), used only for
+// strongly red-dominant content at high quality.
+// pub(crate) const B_BIAS_RED: f32 = 0.85;
+// pub(crate) const M20R: f32 = B_R_RATIO * (1.0 - B_BIAS_RED);
+// pub(crate) const M21R: f32 = (1.0 - B_R_RATIO) * (1.0 - B_BIAS_RED);
+// pub(crate) const M22R: f32 = 1.0 - M20R - M21R;
+//
+// pub(crate) const OPSIN_INVERSE_MATRIX_RED: [f32; 9] = [
+//     10.785613059997559,
+//     -9.684576988220215,
+//     -0.10103627294301987,
+//     -3.50010085105896,
+//     4.601137161254883,
+//     -0.10103627294301987,
+//     -0.751554548740387,
+//     0.5572540163993835,
+//     1.1943005323410034,
+// ];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct XybMatrix {
+    pub(crate) fwd: [f32; 9],
+    pub(crate) inv: [f32; 9],
+}
+
+impl XybMatrix {
+    /// The default matrix (spec opsin as long as `B_BIAS` is unpatched).
+    pub(crate) const SPEC: XybMatrix = XybMatrix {
+        fwd: [M00, M01, M02, M10, M11, M12, M20, M21, M22],
+        inv: OPSIN_INVERSE_MATRIX,
+    };
+    // /// Red-variant matrix for strongly red-dominant high-quality content.
+    // pub(crate) const RED: XybMatrix = XybMatrix {
+    //     fwd: [M00, M01, M02, M10, M11, M12, M20R, M21R, M22R],
+    //     inv: OPSIN_INVERSE_MATRIX_RED,
+    // };
+
+    pub(crate) fn is_decoder_default(&self) -> bool {
+        static SPEC_FWD: [f32; 9] = [
+            0.30,
+            0.622,
+            0.078,
+            0.23,
+            0.692,
+            0.078,
+            0.243_422_69,
+            0.204_767_45,
+            0.551_809_86,
+        ];
+        self.fwd
+            .iter()
+            .zip(SPEC_FWD.iter())
+            .all(|(a, b)| (a - b).abs() < 1e-6)
+    }
+}
+
+// /// The red-variant row only wins below this distance.
+// pub(crate) const RED_OPSIN_MAX_DISTANCE: f32 = 1.5;
+//
+// /// Detect strongly red-dominant content.
+// pub(crate) fn is_red_dominant<T: Copy + Into<u64>, const N: usize>(input: &[T]) -> bool {
+//     let px = input.len() / N;
+//     if px == 0 {
+//         return false;
+//     }
+//     let step = (px / 65536).max(1);
+//     let (mut sr, mut sg, mut sb, mut red_px, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+//     for src in input.as_chunks::<N>().0.iter().step_by(step) {
+//         let r: u64 = src[0].into();
+//         let g: u64 = src[1].into();
+//         let b: u64 = src[2].into();
+//         sr += r;
+//         sg += g;
+//         sb += b;
+//         red_px += u64::from(r > 2 * (g + b));
+//         n += 1;
+//     }
+//     sr > 3 * (sg + sb) && red_px * 10 > n * 3
+// }
 
 pub(crate) const OPSIN_BIAS: f32 = 0.003_793_073_4;
 pub(crate) const NEG_BIAS_CBRT: f32 = -0.155_954_2;
@@ -87,10 +172,11 @@ fn cbrtf(x: f32) -> f32 {
 
 #[allow(unused)]
 #[inline(always)]
-pub(crate) fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
-    let mixed0 = fmla(M00, r, fmla(M01, g, fmla(M02, b, OPSIN_BIAS)));
-    let mixed1 = fmla(M10, r, fmla(M11, g, fmla(M12, b, OPSIN_BIAS)));
-    let mixed2 = fmla(M20, r, fmla(M21, g, fmla(M22, b, OPSIN_BIAS)));
+pub(crate) fn rgb_to_xyb_pixel_f32(m: &XybMatrix, r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let [m00, m01, m02, m10, m11, m12, m20, m21, m22] = m.fwd;
+    let mixed0 = fmla(m00, r, fmla(m01, g, fmla(m02, b, OPSIN_BIAS)));
+    let mixed1 = fmla(m10, r, fmla(m11, g, fmla(m12, b, OPSIN_BIAS)));
+    let mixed2 = fmla(m20, r, fmla(m21, g, fmla(m22, b, OPSIN_BIAS)));
 
     let tm0 = cbrtf(mixed0.max(0.0)) + NEG_BIAS_CBRT;
     let tm1 = cbrtf(mixed1.max(0.0)) + NEG_BIAS_CBRT;
@@ -99,7 +185,7 @@ pub(crate) fn rgb_to_xyb_pixel_f32(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
 }
 
-pub(crate) type ToXybBandFn = unsafe fn([&[f32]; 3], [&mut [f32]; 3], usize);
+pub(crate) type ToXybBandFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [f32]; 3], usize);
 
 fn select_to_xyb_band_fn() -> ToXybBandFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -127,7 +213,7 @@ fn select_to_xyb_band_fn() -> ToXybBandFn {
     all(target_arch = "aarch64", feature = "neon"),
     all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
 )))]
-fn to_xyb_f32_band(input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
+fn to_xyb_f32_band(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
     let [rp, gp, bp] = input;
     let [xp, yp, out_bp] = output;
     for (((((r, g), b), x), y), out_b) in rp
@@ -138,7 +224,7 @@ fn to_xyb_f32_band(input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
         .zip(yp.iter_mut())
         .zip(out_bp.iter_mut())
     {
-        (*x, *y, *out_b) = rgb_to_xyb_pixel_f32(*r, *g, *b);
+        (*x, *y, *out_b) = rgb_to_xyb_pixel_f32(m, *r, *g, *b);
     }
 }
 
@@ -151,6 +237,7 @@ pub(crate) fn selected_to_xyb_band_fn() -> ToXybBandFn {
 
 pub(crate) fn to_xyb_with_fn(
     f: ToXybBandFn,
+    m: &XybMatrix,
     linear: &Image3F,
     xyb: &mut Image3F,
     pool: &ThreadPool,
@@ -183,7 +270,7 @@ pub(crate) fn to_xyb_with_fn(
 
     pool.steal_for_each_mut(scratch, &mut jobs, |_i, job, _scratch| {
         let (input, output) = job.take().unwrap();
-        unsafe { f(input, output, w) };
+        unsafe { f(m, input, output, w) };
     });
 }
 
@@ -339,11 +426,11 @@ pub(crate) fn quantize_xyb_tile_colors(
 mod tests {
     use super::*;
 
-    unsafe fn scalar_band(input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
+    unsafe fn scalar_band(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
         let [r, g, b] = input;
         let [x, y, out_b] = output;
         for i in 0..r.len() {
-            (x[i], y[i], out_b[i]) = rgb_to_xyb_pixel_f32(r[i], g[i], b[i]);
+            (x[i], y[i], out_b[i]) = rgb_to_xyb_pixel_f32(m, r[i], g[i], b[i]);
         }
     }
 
@@ -359,13 +446,21 @@ mod tests {
         let pool = ThreadPool::new(2);
         let mut scratch = CoderScratch::default();
 
-        to_xyb_with_fn(scalar_band, &linear, &mut xyb, &pool, &mut scratch);
+        to_xyb_with_fn(
+            scalar_band,
+            &XybMatrix::SPEC,
+            &linear,
+            &mut xyb,
+            &pool,
+            &mut scratch,
+        );
 
         for i in 0..6 {
             assert_eq!(linear.plane_data(0)[i], i as f32 / 7.0);
             assert_eq!(linear.plane_data(1)[i], (i + 1) as f32 / 8.0);
             assert_eq!(linear.plane_data(2)[i], (i + 2) as f32 / 9.0);
             let (x, y, b) = rgb_to_xyb_pixel_f32(
+                &XybMatrix::SPEC,
                 linear.plane_data(0)[i],
                 linear.plane_data(1)[i],
                 linear.plane_data(2)[i],

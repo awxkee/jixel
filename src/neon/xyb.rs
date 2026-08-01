@@ -81,23 +81,24 @@ fn vcbrtq_fast3_positive_f32(
 #[inline]
 #[target_feature(enable = "neon")]
 fn rgb_to_xyb_f32x4_neon(
+    m: &XybMatrix,
     r: float32x4_t,
     g: float32x4_t,
     b: float32x4_t,
 ) -> (float32x4_t, float32x4_t, float32x4_t) {
     let bias = vdupq_n_f32(OPSIN_BIAS);
 
-    let mut mixed0 = vfmaq_n_f32(bias, b, M02);
-    mixed0 = vfmaq_n_f32(mixed0, g, M01);
-    mixed0 = vfmaq_n_f32(mixed0, r, M00);
+    let mut mixed0 = vfmaq_n_f32(bias, b, m.fwd[2]);
+    mixed0 = vfmaq_n_f32(mixed0, g, m.fwd[1]);
+    mixed0 = vfmaq_n_f32(mixed0, r, m.fwd[0]);
 
-    let mut mixed1 = vfmaq_n_f32(bias, b, M12);
-    mixed1 = vfmaq_n_f32(mixed1, g, M11);
-    mixed1 = vfmaq_n_f32(mixed1, r, M10);
+    let mut mixed1 = vfmaq_n_f32(bias, b, m.fwd[5]);
+    mixed1 = vfmaq_n_f32(mixed1, g, m.fwd[4]);
+    mixed1 = vfmaq_n_f32(mixed1, r, m.fwd[3]);
 
-    let mut mixed2 = vfmaq_n_f32(bias, b, M22);
-    mixed2 = vfmaq_n_f32(mixed2, g, M21);
-    mixed2 = vfmaq_n_f32(mixed2, r, M20);
+    let mut mixed2 = vfmaq_n_f32(bias, b, m.fwd[8]);
+    mixed2 = vfmaq_n_f32(mixed2, g, m.fwd[7]);
+    mixed2 = vfmaq_n_f32(mixed2, r, m.fwd[6]);
 
     let zero = vdupq_n_f32(0.0);
     mixed0 = vmaxq_f32(mixed0, zero);
@@ -121,7 +122,12 @@ fn rgb_to_xyb_f32x4_neon(
 
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "neon")]
-pub(crate) fn to_xyb_neon_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+pub(crate) fn to_xyb_neon_band(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+    w: usize,
+) {
     let [rp, gp, bp] = input;
     let [xp, yp, out_bp] = output;
     for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
@@ -151,7 +157,7 @@ pub(crate) fn to_xyb_neon_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { vld1q_f32(g4.as_ptr()) };
             let b = unsafe { vld1q_f32(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(m, r, g, b);
 
             unsafe {
                 vst1q_f32(x4.as_mut_ptr(), xv);
@@ -171,7 +177,7 @@ pub(crate) fn to_xyb_neon_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { vld1q_f32(g4.as_ptr()) };
             let b = unsafe { vld1q_f32(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(m, r, g, b);
 
             unsafe {
                 vst1q_f32(r4.as_mut_ptr(), xv);
@@ -204,6 +210,11 @@ mod tests {
     /// non-multiple of 4 to exercise the scalar tail.
     #[test]
     fn to_xyb_neon_band_matches_scalar_pixels() {
+        check_band_variant(&crate::xyb::XybMatrix::SPEC);
+        check_band_variant(&crate::xyb::XybMatrix::RED);
+    }
+
+    fn check_band_variant(m: &crate::xyb::XybMatrix) {
         let mut state = 0xc0ff_ee11_u64;
         for &w in &[4usize, 7, 16, 19] {
             for rows in 1..=3 {
@@ -222,9 +233,9 @@ mod tests {
                 let mut x = vec![0.0; n];
                 let mut y = vec![0.0; n];
                 let mut out_b = vec![0.0; n];
-                unsafe { to_xyb_neon_band([&r, &g, &b], [&mut x, &mut y, &mut out_b], w) };
+                unsafe { to_xyb_neon_band(m, [&r, &g, &b], [&mut x, &mut y, &mut out_b], w) };
                 for (i, p) in src.iter().enumerate() {
-                    let (want_x, want_y, want_b) = rgb_to_xyb_pixel_f32(p[0], p[1], p[2]);
+                    let (want_x, want_y, want_b) = rgb_to_xyb_pixel_f32(m, p[0], p[1], p[2]);
                     for (got, want, name) in [
                         (x[i], want_x, "X"),
                         (y[i], want_y, "Y"),

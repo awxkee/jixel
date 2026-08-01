@@ -95,23 +95,23 @@ fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, v128, v128)
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn rgb_to_xyb_f32x4_wasm(r: v128, g: v128, b: v128) -> (v128, v128, v128) {
+fn rgb_to_xyb_f32x4_wasm(m: &XybMatrix, r: v128, g: v128, b: v128) -> (v128, v128, v128) {
     let bias = f32x4_splat(OPSIN_BIAS);
 
-    // mixed0 = M00*r + M01*g + M02*b + OPSIN_BIAS
-    let mut mixed0 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(M02)));
-    mixed0 = f32x4_add(mixed0, f32x4_mul(g, f32x4_splat(M01)));
-    mixed0 = f32x4_add(mixed0, f32x4_mul(r, f32x4_splat(M00)));
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed0 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(m.fwd[2])));
+    mixed0 = f32x4_add(mixed0, f32x4_mul(g, f32x4_splat(m.fwd[1])));
+    mixed0 = f32x4_add(mixed0, f32x4_mul(r, f32x4_splat(m.fwd[0])));
 
-    // mixed1 = M10*r + M11*g + M12*b + OPSIN_BIAS
-    let mut mixed1 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(M12)));
-    mixed1 = f32x4_add(mixed1, f32x4_mul(g, f32x4_splat(M11)));
-    mixed1 = f32x4_add(mixed1, f32x4_mul(r, f32x4_splat(M10)));
+    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
+    let mut mixed1 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(m.fwd[5])));
+    mixed1 = f32x4_add(mixed1, f32x4_mul(g, f32x4_splat(m.fwd[4])));
+    mixed1 = f32x4_add(mixed1, f32x4_mul(r, f32x4_splat(m.fwd[3])));
 
-    // mixed2 = M20*r + M21*g + M22*b + OPSIN_BIAS
-    let mut mixed2 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(M22)));
-    mixed2 = f32x4_add(mixed2, f32x4_mul(g, f32x4_splat(M21)));
-    mixed2 = f32x4_add(mixed2, f32x4_mul(r, f32x4_splat(M20)));
+    // mixed2 = m20*r + m21*g + m22*b + OPSIN_BIAS (B row selected by RED)
+    let mut mixed2 = f32x4_add(bias, f32x4_mul(b, f32x4_splat(m.fwd[8])));
+    mixed2 = f32x4_add(mixed2, f32x4_mul(g, f32x4_splat(m.fwd[7])));
+    mixed2 = f32x4_add(mixed2, f32x4_mul(r, f32x4_splat(m.fwd[6])));
 
     let zero = f32x4_splat(0.0);
     mixed0 = f32x4_max(mixed0, zero);
@@ -136,7 +136,12 @@ fn rgb_to_xyb_f32x4_wasm(r: v128, g: v128, b: v128) -> (v128, v128, v128) {
 
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "simd128")]
-pub(crate) fn to_xyb_wasm_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: usize) {
+pub(crate) fn to_xyb_wasm_band(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+    w: usize,
+) {
     let [rp, gp, bp] = input;
     let [xp, yp, out_bp] = output;
     for (((((r_row, g_row), b_row), x_row), y_row), out_b_row) in rp
@@ -166,7 +171,7 @@ pub(crate) fn to_xyb_wasm_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { v128_load(g4.as_ptr().cast()) };
             let b = unsafe { v128_load(b4.as_ptr().cast()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(m, r, g, b);
 
             unsafe {
                 v128_store(x4.as_mut_ptr().cast(), xv);
@@ -188,7 +193,7 @@ pub(crate) fn to_xyb_wasm_band(input: [&[f32]; 3], output: [&mut [f32]; 3], w: u
             let g = unsafe { v128_load(g4.as_ptr().cast()) };
             let b = unsafe { v128_load(b4.as_ptr().cast()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(m, r, g, b);
 
             unsafe {
                 v128_store(r4.as_mut_ptr().cast(), xv);

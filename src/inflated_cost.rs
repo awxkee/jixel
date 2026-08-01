@@ -41,7 +41,10 @@ const R_NZ_BASE: f32 = 1.6;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
 // Per-channel distortion weights (X, Y, B).
-pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.10, 1.0, 0.83];
+// Re-fitted 2026-08-01 for the spec opsin matrix (b_bias revert): breadth
+// study wants cw_b ~0.28 (the 0.83 was fitted for the blue-biased row whose
+// B channel carried 1.5x more energy); cw_x is a flat axis, 0.30 is mid-plateau.
+pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.30, 1.0, 0.28];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
 pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];

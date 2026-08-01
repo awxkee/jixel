@@ -43,6 +43,7 @@ pub(crate) struct EncodingContext {
     pub(crate) speed: Speed,
     pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) banding_protection: bool,
+    pub(crate) xyb: xyb::XybMatrix,
     /// Transform-merge knobs resolved at this encode's distance.
     pub(crate) merge: ac_strategy::MergeTuning,
     pub(crate) matrices: &'static DequantMatrices,
@@ -82,6 +83,7 @@ impl EncodingContext {
         speed: Speed,
         boost: Option<DarkAqConfig>,
         banding_protection: bool,
+        xyb: xyb::XybMatrix,
         distance: f32,
         num_threads: usize,
     ) -> Self {
@@ -91,6 +93,7 @@ impl EncodingContext {
             speed,
             boost,
             banding_protection,
+            xyb,
             merge: ac_strategy::MergeTuning::new(distance),
             matrices: DequantMatrices::new(distance),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
@@ -132,6 +135,6 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None, false, 1.0, 1)
+        Self::new(Speed::Fast, None, false, xyb::XybMatrix::SPEC, 1.0, 1)
     }
 }

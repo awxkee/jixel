@@ -1588,7 +1588,14 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new(crate::Speed::Fast, None, false, 1.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Fast,
+            None,
+            false,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);

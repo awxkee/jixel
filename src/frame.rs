@@ -1372,7 +1372,14 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 
 fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, linear: &Image3F) -> Image3F {
     let mut xyb = Image3F::new(linear.xsize(), linear.ysize());
-    crate::xyb::to_xyb_with_fn(ctx.to_xyb_band, linear, &mut xyb, &ctx.thread_pool, scratch);
+    crate::xyb::to_xyb_with_fn(
+        ctx.to_xyb_band,
+        &ctx.xyb,
+        linear,
+        &mut xyb,
+        &ctx.thread_pool,
+        scratch,
+    );
     xyb
 }
 

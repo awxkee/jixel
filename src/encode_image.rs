@@ -36,6 +36,7 @@ use crate::frame::encode_frame;
 use crate::image::{Image3F, Image3Si};
 use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::orientation::Orientation;
+use crate::xyb::XybMatrix;
 use crate::{ColorEncoding, EncodeError};
 
 fn checked_buffer_size<T>(
@@ -632,14 +633,19 @@ pub fn distance_from_quality(quality: f32) -> f32 {
     d.min(25.0)
 }
 
-fn lossy_context(config: &EncodeConfig, distance: f32) -> EncodingContext {
+fn lossy_context(config: &EncodeConfig, distance: f32, xyb: XybMatrix) -> EncodingContext {
     EncodingContext::new(
         config.speed,
         config.boost,
         config.banding_protection,
+        xyb,
         distance,
         config.num_threads,
     )
+}
+
+fn xyb_matrix_choice<T: Copy + Into<u64>, const N: usize>(_: &[T], _: f32) -> XybMatrix {
+    XybMatrix::SPEC
 }
 
 fn for_each_linear_band<F>(
@@ -783,7 +789,11 @@ pub fn encode_image(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = srgb_lut();
-    let ctx = lossy_context(config, distance);
+    let ctx = lossy_context(
+        config,
+        distance,
+        xyb_matrix_choice::<u8, 3>(input, distance),
+    );
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
@@ -848,7 +858,11 @@ pub fn encode_image_with_alpha(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = srgb_lut();
-    let ctx = lossy_context(config, distance);
+    let ctx = lossy_context(
+        config,
+        distance,
+        xyb_matrix_choice::<u8, 4>(input, distance),
+    );
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
@@ -1040,7 +1054,7 @@ fn encode_gray_impl(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let srgb_lut = srgb_lut();
-    let ctx = lossy_context(config, distance);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| {
         srgb_lut[v as usize]
@@ -1273,7 +1287,7 @@ fn encode_gray_high_depth_impl(
 
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let ctx = lossy_context(config, distance);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| lut[v as usize]);
 
@@ -1342,7 +1356,12 @@ fn encode_high_depth_rgba(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let ctx = lossy_context(config, distance);
+    let xyb = if has_alpha {
+        xyb_matrix_choice::<u16, 4>(input, distance)
+    } else {
+        xyb_matrix_choice::<u16, 3>(input, distance)
+    };
+    let ctx = lossy_context(config, distance, xyb);
     let mut scratch = Box::<CoderScratch>::default();
 
     // For 16-bit, (1 << 16) - 1 overflows u16's shift; compute in u32 and cap.
@@ -1467,6 +1486,7 @@ fn encode_f32_lossless_rgba(
         config.icc_profile.as_deref(),
         BitsPerSample::F32,
         true,
+        &XybMatrix::SPEC,
         false,
         config.orientation,
         &mut metadata_scratch,
@@ -1501,7 +1521,8 @@ fn encode_float_rgba(
         return encode_f32_lossless_rgba(input, width, height, has_alpha, config);
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let ctx = lossy_context(config, distance);
+    // Float input skips the red-dominance classifier (integer-domain sampling).
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
     let mut scratch = Box::<CoderScratch>::default();
 
     if has_alpha {
@@ -1557,7 +1578,7 @@ fn encode_float_gray(
         });
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let ctx = lossy_context(config, distance);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
     let cfg = EncodeConfigImpl::with_distance(distance)
@@ -1718,6 +1739,7 @@ fn encode_with_context(
         config.icc_profile.as_deref(),
         config.bits_per_sample,
         config.lossless,
+        &ctx.xyb,
         config.grayscale,
         config.orientation,
         scratch,
@@ -1884,6 +1906,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.icc_profile.as_deref(),
         config.bits_per_sample,
         config.lossless,
+        &XybMatrix::SPEC,
         config.grayscale,
         config.orientation,
         &mut metadata_scratch,
@@ -2047,6 +2070,7 @@ fn write_image_metadata(
     icc_profile: Option<&[u8]>,
     bps: BitsPerSample,
     lossless: bool,
+    xyb: &XybMatrix,
     grayscale: bool,
     orientation: Orientation,
     scratch: &mut CoderScratch,
@@ -2128,15 +2152,15 @@ fn write_image_metadata(
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).
-    if lossless {
+    if lossless || xyb.is_decoder_default() {
         w.write(1, 1); // CustomTransformData.all_default = 1
     } else {
-        // The blue-biased forward opsin matrix (enc_xyb.rs) needs its matching
-        // inverse in the codestream, so the bundle is explicit. Layout:
-        // all_default, [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
+        // A non-spec forward opsin matrix needs its matching inverse in the
+        // codestream, so the bundle is explicit. Layout: all_default,
+        // [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
         w.write(1, 0); // CustomTransformData.all_default = 0
         w.write(1, 0); // OpsinInverseMatrix.all_default = 0
-        for v in crate::xyb::OPSIN_INVERSE_MATRIX {
+        for &v in &xyb.inv {
             w.write(16, crate::util::f32_to_f16(v) as u64);
         }
         for _ in 0..3 {
@@ -2208,7 +2232,7 @@ mod tests {
         use std::sync::{Barrier, Mutex};
 
         let config = EncodeConfig::default().with_num_threads(4);
-        let ctx = lossy_context(&config, 1.0);
+        let ctx = lossy_context(&config, 1.0, XybMatrix::SPEC);
         let mut scratch = Box::<CoderScratch>::default();
         let mut image = Image3F::new(8, 4);
         let barrier = Barrier::new(4);
