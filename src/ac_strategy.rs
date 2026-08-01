@@ -47,7 +47,7 @@ const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
 /// Above this distance the [`SearchScope::Squares`] tier stops reranking; see
 /// [`SearchScope::rerank`].
-const FAST_RERANK_MAX_DISTANCE: f32 = 2.0;
+const FAST_RERANK_MAX_DISTANCE: f32 = 1.7090991223128462;
 
 #[inline]
 fn use_dct8_only(distance: f32) -> bool {
@@ -98,24 +98,37 @@ pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 /// At high quality the reconstruction costs sit on the noise floor and a
 /// knife-edge (m = 1) comparison is as good as any; from d=1.5 up the merge is
 /// worth defending, and the tiled DCT8 has to be ~13% cheaper to win.
-const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.87);
+const RERANK_META_R: f32 = 2.6465739748323758;
+const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.9098454411056834);
 
 const RERANK_LAMBDA_LO: f32 = 0.25;
 const RERANK_LAMBDA_HI: f32 = 10.0;
 const RERANK_LAMBDA_D0: f32 = 1.0;
 const RERANK_LAMBDA_D1: f32 = 4.0;
 
-const BIAS_RECT: Banded = Banded::new(1.026_200_7, 1.0);
-const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.0);
-const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.0);
-const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.10);
+const BIAS_RECT: Banded = Banded::new(1.026_200_7, 0.915);
+const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.05);
+const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.06);
+const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.02);
 
-const MERGE_MARGIN_PAIR: Banded = Banded::new(0.036_252_015, 0.04);
-const MERGE_MARGIN_16: Banded = Banded::new(0.192_438_88, 0.08);
-const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.11);
-const MERGE_MARGIN_32: Banded = Banded::new(0.329_207_82, 0.14);
+// Low-band halves re-fitted 2026-08-01 (breadth+bs_dark, joint SS2+ba,
+// post rate-model fixes): 32-family bars ~2.5x stiffer, the high-distance
+// margin fade mostly abolished (LOWQ 0.20 -> 0.82 — the old floor let bars
+// drop to 20% by d=4, an SS2-only photo-era fit). Holdout +0.45 SS2 /
+// +0.84% ba mean; watch-item: buddhabrot -0.1/-2.
+const MERGE_MARGIN_PAIR: Banded = Banded::new(0.036_252_015, 0.072);
+const MERGE_MARGIN_16: Banded = Banded::new(0.192_438_88, 0.048);
+const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.29);
+const MERGE_MARGIN_32: Banded = Banded::new(0.329_207_82, 0.36);
 
-const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.20;
+const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.82;
+/// Third band: an extra margin scale for very low quality (d >= LOWQ3_D).
+/// Fitted 2026-08-01 (10-min study at d4/5 + holdout +0.04 SS2/+0.15 ba):
+/// mild extra stiffness below the fade floor. NOTE the study surface was
+/// bimodal — SS2 alone prefers scale~0.37 (looser, +0.25 SS2 / -0.2 ba);
+/// this is the ba-safe mode. The loose mode remains a policy option.
+const MERGE_MARGIN_LOWQ3_D: f32 = 3.85;
+const MERGE_MARGIN_LOWQ3_SCALE: f32 = 1.10;
 const MERGE_MARGIN_FADE_START: f32 = 1.0;
 const MERGE_MARGIN_FADE_END: f32 = 4.0;
 /// Sub-8x8 selection biases. Each candidate's RD cost is scaled by its bias
@@ -131,7 +144,12 @@ fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
         / (MERGE_MARGIN_FADE_END - MERGE_MARGIN_FADE_START))
         .clamp(0.0, 1.0);
-    margin.at(distance) * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION))
+    let lowq3 = if distance >= MERGE_MARGIN_LOWQ3_D {
+        MERGE_MARGIN_LOWQ3_SCALE
+    } else {
+        1.0
+    };
+    margin.at(distance) * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION)) * lowq3
 }
 
 #[inline]
@@ -1500,13 +1518,18 @@ fn rerank_large_transforms(
     distance: f32,
     scale: f32,
     qm_mult_x: f32,
-    meta_r: f32,
+    _meta_r: f32,
     quant_field: &ImageB,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
 ) {
     let rerank_margin = ctx.merge.rerank_margin;
+    // The rerank's own metadata charge. The selection pass keeps META_R, but
+    // here the tiled-DCT8 alternative pays it PER TILE (16x for a 32x32)
+    // while the merge pays once — a structural pro-merge credit this
+    // constant prices independently (review-3 §4).
+    let meta_r = RERANK_META_R;
     let mut downgrades: Vec<(usize, usize, usize, usize)> = Vec::new();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
@@ -1601,7 +1624,7 @@ mod tests {
         assert_eq!(MERGE_MARGIN_16.at(0.1), MERGE_MARGIN_16.at(0.5));
         assert_eq!(MERGE_MARGIN_16.at(1.5), MERGE_MARGIN_16.at(6.0));
         let mid = MERGE_MARGIN_16.at(1.0);
-        assert!((mid - 0.5 * (0.192_438_88 + 0.08)).abs() < 1e-6);
+        assert!((mid - 0.5 * (MERGE_MARGIN_16.hq + MERGE_MARGIN_16.base)).abs() < 1e-6);
         // High quality admits merges on much stiffer terms than mid/low.
         assert!(MERGE_MARGIN_16.at(0.3) > MERGE_MARGIN_16.at(2.0));
         assert!(BIAS_16X16.at(0.3) > BIAS_16X16.at(2.0));

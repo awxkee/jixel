@@ -644,10 +644,6 @@ fn lossy_context(config: &EncodeConfig, distance: f32, xyb: XybMatrix) -> Encodi
     )
 }
 
-fn xyb_matrix_choice<T: Copy + Into<u64>, const N: usize>(_: &[T], _: f32) -> XybMatrix {
-    XybMatrix::SPEC
-}
-
 fn for_each_linear_band<F>(
     image: &mut Image3F,
     ctx: &EncodingContext,
@@ -792,7 +788,7 @@ pub fn encode_image(
     let ctx = lossy_context(
         config,
         distance,
-        xyb_matrix_choice::<u8, 3>(input, distance),
+        XybMatrix::SPEC,
     );
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
@@ -861,7 +857,7 @@ pub fn encode_image_with_alpha(
     let ctx = lossy_context(
         config,
         distance,
-        xyb_matrix_choice::<u8, 4>(input, distance),
+        XybMatrix::SPEC,
     );
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
@@ -1356,12 +1352,7 @@ fn encode_high_depth_rgba(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let lut = &lut_high_bit(bps.bits() as u8).table;
-    let xyb = if has_alpha {
-        xyb_matrix_choice::<u16, 4>(input, distance)
-    } else {
-        xyb_matrix_choice::<u16, 3>(input, distance)
-    };
-    let ctx = lossy_context(config, distance, xyb);
+    let ctx = lossy_context(config, distance, XybMatrix::SPEC);
     let mut scratch = Box::<CoderScratch>::default();
 
     // For 16-bit, (1 << 16) - 1 overflows u16's shift; compute in u32 and cap.

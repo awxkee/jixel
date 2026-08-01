@@ -1686,7 +1686,7 @@ fn encode_frame_core(
             .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
-        true,
+        ctx.speed != Speed::Fastest,
     );
 
     // Arm B: a per-image learned tree over WP error and channel, with its own
@@ -1741,7 +1741,7 @@ fn encode_frame_core(
             .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
         learned.num_contexts,
         &mut scratch.huffman_pool,
-        true,
+        ctx.speed != Speed::Fastest,
     );
 
     // Price both arms end to end: serialized tree + entropy-code header
@@ -1819,7 +1819,7 @@ fn encode_frame_core(
                     pending.iter().map(|p| p.tokens[pass].as_slice()),
                     num_contexts,
                     &mut scratch.huffman_pool,
-                    true,
+                    ctx.speed != Speed::Fastest,
                 )
             })
             .collect()
