@@ -31,6 +31,7 @@ use crate::dct::fmla;
 use crate::image::{Image3F, ImageB};
 
 pub(crate) type ApplyQuantFieldGainFn = fn(&mut ImageB, usize, usize, usize, usize, f32);
+pub(crate) type DarkStructureStatsFn = fn(&[[f32; 64]], usize, usize) -> (f32, f32);
 
 #[allow(dead_code)]
 pub(crate) fn apply_quant_field_gain_scalar(
@@ -52,6 +53,32 @@ pub(crate) fn apply_quant_field_gain_scalar(
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
 pub(crate) fn select_apply_quant_field_gain_fn() -> ApplyQuantFieldGainFn {
     crate::wasm::apply_quant_field_gain_wasm
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_dark_structure_stats_fn() -> DarkStructureStatsFn {
+    crate::wasm::dark_structure_stats_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_dark_structure_stats_fn() -> DarkStructureStatsFn {
+    |buf, h, w| unsafe { crate::neon::dark_structure_stats_neon(buf, h, w) }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_dark_structure_stats_fn() -> DarkStructureStatsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |buf, h, w| unsafe { crate::avx::dark_structure_stats_avx2(buf, h, w) };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |buf, h, w| unsafe { crate::sse::dark_structure_stats_sse41(buf, h, w) };
+    }
+    dark_structure_stats_scalar
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -194,55 +221,58 @@ impl DarkAq {
 }
 
 #[inline]
-fn laplacian_abs_sum<const STRIDE: usize>(buf: &[[f32; STRIDE]], h: usize, w: usize) -> (f32, u32) {
+#[allow(dead_code)]
+fn laplacian_abs_sum_scalar(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
     let mut sum = 0.0f32;
-    let mut n = 0u32;
-    for rows in buf[..h].array_windows::<3>() {
-        let [top, middle, bottom] = rows;
-        for ((&up, &down), &[left, center, right]) in top[1..w - 1]
-            .iter()
-            .zip(bottom[1..w - 1].iter())
-            .zip(middle[..w].array_windows::<3>())
-        {
+    for y in 1..h - 1 {
+        let top = &buf[(y - 1) * stride..][..w];
+        let middle = &buf[y * stride..][..w];
+        let bottom = &buf[(y + 1) * stride..][..w];
+        for x in 1..w - 1 {
+            let up = top[x];
+            let down = bottom[x];
+            let [left, center, right] = middle[x - 1..=x + 1] else {
+                unreachable!()
+            };
             let l = 4.0 * center - up - down - left - right;
             sum += l.abs();
-            n += 1;
         }
     }
-    (sum, n)
+    sum
 }
 
 #[inline]
-fn box_downsample_2x<const SRC_STRIDE: usize, const DST_STRIDE: usize>(
-    src: &[[f32; SRC_STRIDE]],
+#[allow(dead_code)]
+fn box_downsample_2x_scalar(
+    src: &[f32],
+    src_stride: usize,
     h: usize,
     w: usize,
-    dst: &mut [[f32; DST_STRIDE]],
+    dst: &mut [f32],
+    dst_stride: usize,
 ) -> (usize, usize) {
     let (hh, ww) = (h / 2, w / 2);
-    for (dst_row, rows) in dst[..hh]
-        .iter_mut()
-        .zip(src[..h].array_windows::<2>().step_by(2))
-    {
-        let [top, bottom] = rows;
-        for (out, (&[top_left, top_right], &[bottom_left, bottom_right])) in
-            dst_row[..ww].iter_mut().zip(
-                top[..w]
-                    .array_windows::<2>()
-                    .step_by(2)
-                    .zip(bottom[..w].array_windows::<2>().step_by(2)),
-            )
-        {
-            *out = 0.25 * (top_left + top_right + bottom_left + bottom_right);
+    for y in 0..hh {
+        let top = &src[(2 * y) * src_stride..][..w];
+        let bottom = &src[(2 * y + 1) * src_stride..][..w];
+        let dst_row = &mut dst[y * dst_stride..][..ww];
+        for (x, out) in dst_row.iter_mut().enumerate() {
+            let sx = 2 * x;
+            *out = 0.25 * (top[sx] + top[sx + 1] + bottom[sx] + bottom[sx + 1]);
         }
     }
     (hh, ww)
 }
 
-#[inline]
-fn dark_structure_stats_buf(buf: &[[f32; 64]], h: usize, w: usize) -> (f32, f32) {
+#[allow(dead_code)]
+pub(crate) fn dark_structure_stats_scalar(buf: &[[f32; 64]], h: usize, w: usize) -> (f32, f32) {
+    assert!(h <= 64 && w <= 64 && buf.len() >= h);
+    if h == 0 || w == 0 {
+        return (0.0, 0.0);
+    }
+    let flat = buf.as_flattened();
     let mut sum = 0.0f32;
-    for row in buf[..h].iter() {
+    for row in flat.chunks_exact(64).take(h) {
         for &v in &row[..w] {
             sum += v;
         }
@@ -251,15 +281,15 @@ fn dark_structure_stats_buf(buf: &[[f32; 64]], h: usize, w: usize) -> (f32, f32)
     if h < 3 || w < 3 {
         return (mean, 0.0);
     }
-    let (lap_full, nf) = laplacian_abs_sum(buf, h, w);
-    let lap_full = lap_full / nf as f32;
+    let nf = (h - 2) * (w - 2);
+    let lap_full = laplacian_abs_sum_scalar(flat, 64, h, w) / nf as f32;
     let mut half = [[0f32; 32]; 32];
-    let (hh, ww) = box_downsample_2x(buf, h, w, &mut half);
+    let (hh, ww) = box_downsample_2x_scalar(flat, 64, h, w, half.as_flattened_mut(), 32);
     if hh < 3 || ww < 3 {
         return (mean, 0.0);
     }
-    let (lap_half, nh) = laplacian_abs_sum(&half, hh, ww);
-    let lap_half = lap_half / nh as f32;
+    let nh = (hh - 2) * (ww - 2);
+    let lap_half = laplacian_abs_sum_scalar(half.as_flattened(), 32, hh, ww) / nh as f32;
     (mean, (lap_full * lap_half).sqrt())
 }
 
@@ -286,7 +316,7 @@ pub(crate) fn dark_structure_stats<T: AqLuma>(
             *dst = v;
         }
     }
-    dark_structure_stats_buf(&buf, h, w)
+    dark_structure_stats_scalar(&buf, h, w)
 }
 
 #[inline]
@@ -505,6 +535,7 @@ pub(crate) fn apply_boost(
     y0: usize,
     distance: f32,
     apply_quant_field_gain: ApplyQuantFieldGainFn,
+    dark_structure_stats: DarkStructureStatsFn,
 ) {
     let xblocks = raw_quant_field.xsize();
     let yblocks = raw_quant_field.ysize();
@@ -628,7 +659,7 @@ pub(crate) fn apply_boost(
                 if w >= 3 && h >= 3 {
                     // Tile already in 8-bit-luma units (scale=1.0 here).
                     let rows = tile.as_chunks::<64>().0;
-                    let (mean, mid_energy) = dark_structure_stats_buf(rows, h, w);
+                    let (mean, mid_energy) = dark_structure_stats(rows, h, w);
                     delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy) as f32;
                 }
             }
@@ -655,6 +686,69 @@ pub(crate) fn apply_boost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_dark_structure_stats(method: DarkStructureStatsFn) {
+        let mut tile = [[0.0f32; 64]; 64];
+        let mut state = 0xa511_e9b3u32;
+        for row in &mut tile {
+            for value in row {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = (state >> 8) as f32 / (1u32 << 24) as f32 * Y_TO_LUMA8;
+            }
+        }
+        for (h, w) in [
+            (0, 0),
+            (1, 1),
+            (2, 17),
+            (3, 3),
+            (3, 7),
+            (7, 3),
+            (8, 8),
+            (11, 17),
+            (17, 31),
+            (63, 64),
+            (64, 63),
+            (64, 64),
+        ] {
+            let expected = dark_structure_stats_scalar(&tile, h, w);
+            let actual = method(&tile, h, w);
+            for (label, actual, expected) in [
+                ("mean", actual.0, expected.0),
+                ("energy", actual.1, expected.1),
+            ] {
+                let tolerance = 2e-4f32.max(expected.abs() * 8e-6);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "shape {w}x{h} {label}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_dark_structure_stats_matches_scalar() {
+        check_dark_structure_stats(select_dark_structure_stats_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_dark_structure_stats_matches_scalar() {
+        if is_x86_feature_detected!("avx2") {
+            check_dark_structure_stats(|buf, h, w| unsafe {
+                crate::avx::dark_structure_stats_avx2(buf, h, w)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_dark_structure_stats_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_dark_structure_stats(|buf, h, w| unsafe {
+                crate::sse::dark_structure_stats_sse41(buf, h, w)
+            });
+        }
+    }
 
     fn check_apply_quant_field_gain(method: ApplyQuantFieldGainFn) {
         let source = [
@@ -778,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn array_windows_laplacian_matches_indexed_reference() {
+    fn scalar_laplacian_matches_indexed_reference() {
         let mut buf = [[0.0f32; 64]; 64];
         let mut state = 0x1234_5678u32;
         for row in &mut buf {
@@ -790,7 +884,6 @@ mod tests {
 
         for (h, w) in [(3, 3), (3, 17), (11, 3), (17, 29), (64, 64)] {
             let mut expected = 0.0f32;
-            let mut expected_n = 0u32;
             for r in 1..h - 1 {
                 for c in 1..w - 1 {
                     let l = 4.0 * buf[r][c]
@@ -799,16 +892,15 @@ mod tests {
                         - buf[r][c - 1]
                         - buf[r][c + 1];
                     expected += l.abs();
-                    expected_n += 1;
                 }
             }
-            let actual = laplacian_abs_sum(&buf, h, w);
-            assert_eq!(actual, (expected, expected_n), "shape {w}x{h}");
+            let actual = laplacian_abs_sum_scalar(buf.as_flattened(), 64, h, w);
+            assert_eq!(actual, expected, "shape {w}x{h}");
         }
     }
 
     #[test]
-    fn array_windows_downsample_matches_indexed_reference() {
+    fn scalar_downsample_matches_indexed_reference() {
         let mut src = [[0.0f32; 64]; 64];
         for (r, row) in src.iter_mut().enumerate() {
             for (c, value) in row.iter_mut().enumerate() {
@@ -818,7 +910,14 @@ mod tests {
 
         for (h, w) in [(2, 2), (2, 17), (11, 2), (17, 29), (64, 64)] {
             let mut actual = [[f32::NAN; 32]; 32];
-            let shape = box_downsample_2x(&src, h, w, &mut actual);
+            let shape = box_downsample_2x_scalar(
+                src.as_flattened(),
+                64,
+                h,
+                w,
+                actual.as_flattened_mut(),
+                32,
+            );
             assert_eq!(shape, (h / 2, w / 2));
             for r in 0..h / 2 {
                 for c in 0..w / 2 {
@@ -908,7 +1007,7 @@ mod tests {
         let rows = tile.as_chunks::<64>().0;
         for (h, w) in [(1, 1), (3, 7), (11, 17), (63, 64), (64, 64)] {
             assert_eq!(
-                dark_structure_stats_buf(rows, h, w),
+                dark_structure_stats_scalar(rows, h, w),
                 dark_structure_stats(&tile, 64, 0, 0, w, h, 1.0),
                 "shape {w}x{h}"
             );

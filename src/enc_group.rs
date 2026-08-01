@@ -950,8 +950,8 @@ pub(crate) fn write_ac_group(
                 let row_start = iy * cov_x;
                 quant_target.copy_from_slice(&y_dc_q[row_start..row_start + cov_x]);
                 if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float
-                        .plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    let float_target = &mut dc_float.plane_row_mut(1, global_by - qorigin_y + iy)
+                        [lbx..lbx + cov_x];
                     float_target.copy_from_slice(&dc_vals[1][row_start..row_start + cov_x]);
                 }
             }
@@ -1119,8 +1119,8 @@ pub(crate) fn write_ac_group(
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
                 if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float
-                        .plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    let float_target = &mut dc_float.plane_row_mut(0, global_by - qorigin_y + iy)
+                        [lbx..lbx + cov_x];
                     float_target.copy_from_slice(&x_dc_post[row_start..row_start + cov_x]);
                 }
             }
@@ -1175,8 +1175,8 @@ pub(crate) fn write_ac_group(
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
                 if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float
-                        .plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
+                    let float_target = &mut dc_float.plane_row_mut(2, global_by - qorigin_y + iy)
+                        [lbx..lbx + cov_x];
                     float_target.copy_from_slice(&b_dc_post[row_start..row_start + cov_x]);
                 }
             }

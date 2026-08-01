@@ -29,6 +29,7 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod cfl;
+mod dark_aq;
 mod dct;
 mod inflated_cost;
 mod lossless_grad;
@@ -40,6 +41,7 @@ mod ytob;
 pub(crate) use ac_strategy::sse_and_rate_avx2;
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_avx2, cfl_regression_avx2};
+pub(crate) use dark_aq::dark_structure_stats_avx2;
 pub(crate) use dct::{
     dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2,
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,

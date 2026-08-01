@@ -2168,6 +2168,7 @@ fn setup_dc_group(
             dc_group_y0,
             distp.distance,
             ctx.apply_quant_field_gain,
+            ctx.dark_structure_stats,
         );
     }
 

@@ -365,7 +365,7 @@ impl Default for EncodeConfigImpl {
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             progressive: false,
-            patches: true,
+            patches: false,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -2537,8 +2537,13 @@ mod encode_smoke_tests {
             &config.clone().with_speed(Speed::Fastest),
         )
         .expect("Fastest encode failed");
-        let fast = encode_image(&input, WIDTH, HEIGHT, &config.clone().with_speed(Speed::Fast))
-            .expect("Fast encode failed");
+        let fast = encode_image(
+            &input,
+            WIDTH,
+            HEIGHT,
+            &config.clone().with_speed(Speed::Fast),
+        )
+        .expect("Fast encode failed");
         assert!(!fastest.is_empty());
         assert_ne!(
             fastest, fast,
