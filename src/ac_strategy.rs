@@ -811,12 +811,19 @@ fn select_super_block(
         if use_h_top { h_top } else { dct8_top } + if use_h_bottom { h_bot } else { dct8_bottom };
     let best_rect = cost_16x8.min(cost_8x16);
 
-    let (q_min, q_max) = qac.iter().flatten().fold((f32::INFINITY, 0.0f32), |(mn, mx), &q| {
-        (mn.min(q), mx.max(q))
-    });
+    let (q_min, q_max) = qac
+        .iter()
+        .flatten()
+        .fold((f32::INFINITY, 0.0f32), |(mn, mx), &q| {
+            (mn.min(q), mx.max(q))
+        });
     let pick_16x16 = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X16)
         && c16 < best_rect
-        && merge_beats_dct8(c16, total_dct8, risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0));
+        && merge_beats_dct8(
+            c16,
+            total_dct8,
+            risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0),
+        );
 
     let chosen = if pick_16x16 {
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
@@ -1172,9 +1179,8 @@ fn select_band(
                         q_max = q_max.max(q);
                     }
                 }
-                let gate = |accept: f32| {
-                    risk_gated(merge.risk_k, accept, q_min as f32, q_max as f32, 2.0)
-                };
+                let gate =
+                    |accept: f32| risk_gated(merge.risk_k, accept, q_min as f32, q_max as f32, 2.0);
                 let (best_big, best_strategy, accept) =
                     if cost_32x32 <= cost_32x16 && cost_32x32 <= cost_16x32 {
                         (cost_32x32, STRATEGY_DCT32X32, gate(merge.accept_32))
