@@ -35,14 +35,13 @@ use crate::dc_group_data::{
 };
 use crate::dct::{DctInput, fmla};
 use crate::image::{Image3F, Plane};
-use crate::util::FastRound;
 use std::sync::OnceLock;
 
 const R_NZ_BASE: f32 = 1.6;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
-// Per-channel distortion weights (X, Y, B)
-pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.25, 1.0, 0.5];
+// Per-channel distortion weights (X, Y, B).
+pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.10, 1.0, 0.83];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
 pub(crate) type RateLog2Lut = [f32; RATE_LOG2_LUT_N];
@@ -232,11 +231,7 @@ pub(crate) fn sse_and_rate_scalar(
             }
             let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
             let a = inverse * q_scaled * coefficient;
-            let q = if a.abs() >= threshold {
-                a.fast_round()
-            } else {
-                0.0
-            };
+            let q = if a.abs() >= threshold { a.round() } else { 0.0 };
             let d = a - q;
             sse += d * d;
             if q != 0.0 {
@@ -681,7 +676,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         crate::enc_group::quantize_ac_thresholds(1, cx, cy, distance),
         crate::enc_group::quantize_ac_thresholds(2, cx, cy, distance),
     ];
-    let quant_scales = [qac * qm_mult_x, qac, qac];
+    let quant_scales = [qac * qm_mult_x, qac, qac * crate::enc_frame::b_qm_mul()];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
     let [

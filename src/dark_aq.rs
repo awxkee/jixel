@@ -533,8 +533,7 @@ pub(crate) fn apply_boost(
     // Zero-mean the VB deltas across the DC group so VB is a pure spatial
     // reallocation, never a global rate change. The boost side's low-variance
     // threshold is absolute, so on majority-flat content (sky, signs) almost
-    // every SB qualifies and un-normalized VB turns into a blanket overspend
-    // (measured: -1.2 SS2 rate-matched on a flat-dominated holdout image).
+    // every SB qualifies and un-normalized VB turns into a blanket overspend.
     // Skipped under `boost_only`, whose semantics are an intentional one-sided
     // spend. Deltas are recomputed cheaply from `cell` in the apply loop.
     // Edge/text content classifier at DC-group granularity: if the MAJORITY of

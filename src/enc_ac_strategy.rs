@@ -468,7 +468,13 @@ fn coefficient_dist_and_rate(
     let mut d_total = 0.0f32;
     let mut r_total = 0.0f32;
     for c in 0..3 {
-        let qm_mult = if c == 0 { qm_mult_x } else { 1.0 };
+        let qm_mult = if c == 0 {
+            qm_mult_x
+        } else if c == 2 {
+            crate::enc_frame::b_qm_mul()
+        } else {
+            1.0
+        };
         let (d, r) = channel_rd(
             ctx.sse_and_rate,
             ctx.rate_log2_lut,

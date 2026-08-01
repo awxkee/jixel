@@ -29,7 +29,7 @@
 
 //! Learned per-image DC context tree.
 
-use crate::entropy::{Token, pack_signed, uint_encode};
+use crate::entropy::{Token, f_log2, pack_signed, uint_encode};
 use crate::static_entropy_codes::K_CONTEXT_TREE_TOKENS;
 
 const PRED_WEIGHTED: u32 = 6;
@@ -264,7 +264,7 @@ impl BoxHist {
             .counts
             .iter()
             .filter(|&&n| n != 0)
-            .map(|&n| n as f64 * (total / n as f64).log2())
+            .map(|&n| n as f64 * f_log2(total / n as f64))
             .sum();
         entropy + self.extra as f64
     }

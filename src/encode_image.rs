@@ -2107,7 +2107,32 @@ fn write_image_metadata(
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).
-    w.write(1, 1); // CustomTransformData.all_default = 1
+    if lossless {
+        w.write(1, 1); // CustomTransformData.all_default = 1
+    } else {
+        // The blue-biased forward opsin matrix (enc_xyb.rs) needs its matching
+        // inverse in the codestream, so the bundle is explicit. Layout:
+        // all_default, [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
+        w.write(1, 0); // CustomTransformData.all_default = 0
+        w.write(1, 0); // OpsinInverseMatrix.all_default = 0
+        for v in crate::enc_xyb::OPSIN_INVERSE_MATRIX {
+            w.write(16, crate::util::f32_to_f16(v) as u64);
+        }
+        for _ in 0..3 {
+            // Opsin biases (defaults; the forward bias is unchanged).
+            w.write(16, crate::util::f32_to_f16(-0.003_793_073_4) as u64);
+        }
+        // Per-channel quant biases + numerator (defaults).
+        for v in [
+            1.0 - 0.054_650_075,
+            1.0 - 0.070_054_5,
+            1.0 - 0.049_935_105,
+            0.145,
+        ] {
+            w.write(16, crate::util::f32_to_f16(v) as u64);
+        }
+        w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)
+    }
     // ICC stream goes AFTER FileHeader, before the zero-pad to byte boundary.
     if let Some(icc) = icc_profile {
         crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, w);

@@ -38,6 +38,7 @@ use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbol
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
 use crate::enc_lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
+use crate::entropy::f_log2;
 
 pub(crate) const ANS_ENABLED: bool = true;
 
@@ -219,7 +220,7 @@ fn select_hybrid_config_ans(values: &[u32]) -> HybridUintConfig {
         for &c in &counts {
             if c > 0 {
                 used += 1;
-                data += c as f64 * (total as f64 / c as f64).log2();
+                data += c as f64 * f_log2(total as f64 / c as f64);
             }
         }
         let cost = data * stride as f64 + f64::from(8 * used + 15);
@@ -944,7 +945,7 @@ fn context_map_cost(symbols: &[u8]) -> f64 {
     for &c in counts.iter() {
         if c != 0 {
             let p = c as f64 / total;
-            bits += -(c as f64) * p.log2();
+            bits += -(c as f64) * f_log2(p);
             used += 1.0;
         }
     }
@@ -1169,7 +1170,7 @@ fn run_length_cost(runs: &[RunSymbol]) -> f64 {
     for &c in counts.iter() {
         if c != 0 {
             let p = f64::from(c) / f64::from(total);
-            bits += -f64::from(c) * p.log2();
+            bits += -f64::from(c) * f_log2(p);
             used += 1.0;
         }
     }

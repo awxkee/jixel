@@ -40,9 +40,23 @@ pub(crate) const M10: f32 = 0.23;
 pub(crate) const M12: f32 = 0.078;
 pub(crate) const M11: f32 = 1.0 - M12 - M10;
 
-pub(crate) const M20: f32 = 0.243_422_69;
-pub(crate) const M21: f32 = 0.204_767_45;
+pub(crate) const B_BIAS: f32 = 0.85;
+const B_R_RATIO: f32 = 0.243_422_69 / (0.243_422_69 + 0.204_767_45);
+pub(crate) const M20: f32 = B_R_RATIO * (1.0 - B_BIAS);
+pub(crate) const M21: f32 = (1.0 - B_R_RATIO) * (1.0 - B_BIAS);
 pub(crate) const M22: f32 = 1.0 - M20 - M21;
+
+pub(crate) const OPSIN_INVERSE_MATRIX: [f32; 9] = [
+    10.785_613,
+    -9.684_577,
+    -0.101_036_27,
+    -3.500_100_9,
+    4.601_137_2,
+    -0.101_036_27,
+    -0.751_554_56,
+    0.557_254_05,
+    1.194_300_5,
+];
 
 pub(crate) const OPSIN_BIAS: f32 = 0.003_793_073_4;
 pub(crate) const NEG_BIAS_CBRT: f32 = -0.155_954_2;

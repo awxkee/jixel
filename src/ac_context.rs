@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::entropy::f_log2;
 
 pub(crate) const K_NON_ZERO_BUCKETS: usize = 37;
 pub(crate) const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
@@ -554,7 +555,7 @@ impl PlanStats {
                 total += merged
                     .iter()
                     .filter(|&&c| c != 0)
-                    .map(|&c| c as f64 * (nf / c as f64).log2())
+                    .map(|&c| c as f64 * f_log2(nf / c as f64))
                     .sum::<f64>();
             }
             total += extra as f64;

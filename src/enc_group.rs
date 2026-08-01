@@ -348,7 +348,7 @@ pub(crate) struct QuantizeDcMethods {
 pub(crate) fn quantize_dc_scalar(input: &[f32], scale: f32, output: &mut [i16]) {
     debug_assert_eq!(input.len(), output.len());
     for (&value, target) in input.iter().zip(output) {
-        *target = (value * scale).fast_round() as i16;
+        *target = (value * scale).round() as i16;
     }
 }
 
@@ -363,7 +363,7 @@ pub(crate) fn quantize_dc_cfl_scalar(
     debug_assert_eq!(input.len(), y_quant.len());
     debug_assert_eq!(input.len(), output.len());
     for ((&value, &yq), target) in input.iter().zip(y_quant).zip(output) {
-        *target = fmla(value, scale, -(yq as f32) * cfl).fast_round() as i16;
+        *target = fmla(value, scale, -(yq as f32) * cfl).round() as i16;
     }
 }
 
@@ -1179,14 +1179,15 @@ pub(crate) fn write_ac_group(
                 inv_qm_b,
                 quant_ac,
                 scale,
-                1.0,
+                crate::enc_frame::b_qm_mul(),
                 distance,
                 cx,
                 cy,
                 &mut quantized[2][..size],
             );
             if measure_chroma_distortion {
-                let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, 1.0);
+                let q_scaled_b =
+                    quantize_ac_q_scaled(quant_ac, scale, crate::enc_frame::b_qm_mul());
                 for i in 0..size {
                     let v = i / row_stride;
                     let u = i % row_stride;

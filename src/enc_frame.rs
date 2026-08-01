@@ -553,6 +553,29 @@ pub(crate) fn collect_ac_metadata_tokens(
 }
 
 /// Distance-scheduled constant per-block EPF sharpness id
+/// STUDY SCAFFOLDING: `JIXEL_BQM` (0..=3, default 2 = neutral) sets the frame
+/// header's `b_qm_scale`. The decoder multiplies the B dequant matrices by
+/// `1.25^(2 - b_qm_scale)`... i.e. scale 1 quantizes B 1.25x coarser — the
+/// spec-clean lever to reclaim the blue-biased opsin's B byte inflation.
+/// Remove (bake the fitted value) when the b_bias study lands.
+pub(crate) fn b_qm_scale() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("JIXEL_BQM")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| v.min(3))
+            .unwrap_or(2)
+    })
+}
+
+/// Encoder-side B quantizer-scale multiplier matching [`b_qm_scale`]
+/// (mirrors `x_qm_mul = 1.25^(x_qm_scale - 2)`).
+pub(crate) fn b_qm_mul() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| 1.25f32.powf(b_qm_scale() as f32 - 2.0))
+}
+
 fn epf_sharpness_id(distance: f32) -> i32 {
     if distance < 1.75 {
         7
@@ -712,7 +735,7 @@ fn write_frame_header_kind(
                 w.write(2, 0); // extra-channel upsampling = 1
             }
             w.write(3, x_qm_scale as u64);
-            w.write(3, 2); // b_qm_scale
+            w.write(3, b_qm_scale() as u64); // b_qm_scale
             // Reference-only frames omit Passes and use the implicit one pass.
             w.write(1, 1); // custom size
             write_frame_dimension(width, w);
@@ -776,7 +799,7 @@ fn write_frame_header(
     }
 
     w.write(3, x_qm_scale as u64);
-    w.write(3, 2); // b_qm_scale
+    w.write(3, b_qm_scale() as u64); // b_qm_scale
     // Passes bundle (jxl-frame header.rs:127-132):
     //   num_passes: U32(1,2,3,4+u(3))   default 1
     //   if num_passes != 1:
