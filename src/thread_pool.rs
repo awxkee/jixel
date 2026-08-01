@@ -117,25 +117,18 @@ pub(crate) struct ThreadPool {
 impl ThreadPool {
     pub(crate) fn new(num_threads: usize) -> Self {
         let num_threads = num_threads.max(1);
-        // Fully construct every background-worker slot before any worker can
-        // receive a job. The calling thread owns its box directly at the
-        // encoding entry point and passes it into each map.
-        let scratches: Vec<Box<CoderScratch>> = (1..num_threads)
-            .map(|_| Box::<CoderScratch>::default())
-            .collect();
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
             activity: Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
-        let workers = scratches
-            .into_iter()
-            .enumerate()
-            .map(|(i, mut scratch)| {
+        let workers = (1..num_threads)
+            .map(|i| {
                 let shared = Arc::clone(&shared);
                 std::thread::Builder::new()
-                    .name(format!("jixel-worker-{}", i + 1))
+                    .name(format!("jixel-worker-{i}"))
                     .spawn(move || {
+                        let mut scratch = Box::<CoderScratch>::default();
                         worker_loop(&shared, &mut scratch);
                     })
                     .expect("failed to start encoder worker")

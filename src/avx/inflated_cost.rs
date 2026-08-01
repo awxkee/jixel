@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::avx::ac_strategy::{avx2_log2p1_f32, hsum256};
+use crate::avx::ac_strategy::{avx2_log2p1_f32, hmax_u32, hsum256};
 use crate::image::Plane;
 use crate::inflated_cost::{
     RateLog2Lut, ReconDistInput, ReconErrorKernels, ReconKernels, recon_dist_and_rate_with_kernels,
@@ -198,12 +198,13 @@ fn recon_quantize_avx2(
     cy: usize,
     coeff_error: &mut [f32],
     _rate_log2_lut: &RateLog2Lut,
+    scan_pos: &[u32],
 ) -> f32 {
     let n = width
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(8));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n && scan_pos.len() >= n);
     let scale = _mm256_set1_ps(quant_scale);
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
@@ -211,6 +212,7 @@ fn recon_quantize_avx2(
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
     let mut nonzero = 0usize;
     let mut magnitude_bits = _mm256_setzero_ps();
+    let mut scan_acc = _mm256_setzero_si256();
 
     for (y, ((coeff_row, inv_row), error_row)) in coeff
         .chunks_exact(width)
@@ -269,11 +271,29 @@ fn recon_quantize_avx2(
                 magnitude_bits,
                 _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
             );
+            let sv = unsafe {
+                _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x) as *const __m256i)
+            };
+            scan_acc = _mm256_max_epu32(
+                scan_acc,
+                _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
+            );
         }
     }
+
+    let v_max = _mm_max_epu32(
+        _mm256_castsi256_si128(scan_acc),
+        _mm256_extracti128_si256::<1>(scan_acc),
+    );
+    let max_scan = hmax_u32(v_max);
+
     let header_input = _mm256_setr_ps(nonzero as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     let header = _mm_cvtss_f32(_mm256_castps256_ps128(avx2_log2p1_f32(header_input)));
-    nonzero as f32 * 1.6 + hsum256(magnitude_bits) + 0.4 * header
+    nonzero as f32 * 1.6
+        + hsum256(magnitude_bits)
+        + 0.4 * header
+        + crate::inflated_cost::R_ZERO
+            * crate::inflated_cost::visited_zeros(nonzero, max_scan, cx, cy)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -77,8 +77,8 @@ pub(crate) fn predict_from_top_and_left(
 #[inline]
 fn num_nonzero_except_dc(block: &[i32; 64]) -> i32 {
     let mut count: i32 = 0;
-    for k in 1..64 {
-        if block[k] != 0 {
+    for &z in block[1..64].iter() {
+        if z != 0 {
             count += 1;
         }
     }
@@ -164,7 +164,13 @@ fn rdoq_block(
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
-        STRATEGY_DCT | STRATEGY_DCT16X8 | STRATEGY_DCT8X16 | STRATEGY_DCT16X16
+        STRATEGY_DCT
+            | STRATEGY_DCT16X8
+            | STRATEGY_DCT8X16
+            | STRATEGY_DCT16X16
+            | STRATEGY_DCT32X32
+            | STRATEGY_DCT32X16
+            | STRATEGY_DCT16X32
     ) {
         return;
     }
@@ -212,10 +218,12 @@ fn rdoq_block(
     let max_nzeros = suffix_nzeros + window_len;
     let stride = (max_nzeros + 1) * 2;
     // The DP buffers are sized for the <=16x16 worst case. Denser suffixes
-    // (large transforms at very fine quantization) simply skip RDOQ: that is
-    // the regime where hard thresholding is closest to optimal anyway.
-    debug_assert!(stride <= RDOQ_MAX_STRIDE);
-    debug_assert!(window_len * stride <= RDOQ_MAX_CHOICES);
+    // (the 32-family at very fine quantization) skip RDOQ at runtime: that is
+    // the regime where hard thresholding is closest to optimal anyway, while
+    // the sparse 32s that dominate smooth content fit comfortably.
+    if stride > RDOQ_MAX_STRIDE || window_len * stride > RDOQ_MAX_CHOICES {
+        return;
+    }
     let [next_buf, current_buf] = costs;
     let mut next = &mut next_buf[..stride];
     let mut current_cost = &mut current_buf[..stride];

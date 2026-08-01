@@ -60,15 +60,17 @@ pub(crate) fn sse_and_rate_sse(
     cy: usize,
     _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = _mm_set1_ps(q_scaled);
     let mut sse_acc = _mm_setzero_ps();
     let mut mag_acc = _mm_setzero_ps();
     let mut nzeros = 0usize;
+    let mut scan_acc = _mm_setzero_si128();
 
     let zero = _mm_setzero_ps();
     let sign_mask = _mm_set1_ps(-0.0);
@@ -149,11 +151,36 @@ pub(crate) fn sse_and_rate_sse(
             if rate_bits != 0 {
                 let ratev = sse_log2p1_f32(absq);
                 mag_acc = _mm_add_ps(mag_acc, _mm_and_ps(ratev, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe {
+                    _mm_loadu_si128(scan_pos.as_ptr().add(y * width + x) as *const __m128i)
+                };
+                scan_acc = _mm_max_epu32(scan_acc, _mm_and_si128(sv, _mm_castps_si128(rate_mask)));
             }
         }
     }
 
-    (hsum(sse_acc), nzeros, hsum(mag_acc))
+    (hsum(sse_acc), nzeros, hsum(mag_acc), hmax_u32(scan_acc))
+}
+
+#[inline]
+pub(crate) const fn _mm_shuffle(z: u32, y: u32, x: u32, w: u32) -> i32 {
+    ((z << 6) | (y << 4) | (x << 2) | w) as i32
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn hmax_u32(v: __m128i) -> u32 {
+    // swap the two 64-bit halves: [a,b,c,d] -> [c,d,a,b]
+    let t1 = _mm_shuffle_epi32::<{ _mm_shuffle(1, 0, 3, 2) }>(v);
+    let m1 = _mm_max_epu32(v, t1);
+
+    // swap adjacent 32-bit lanes: [x,y,x,y] -> [y,x,y,x]
+    let t2 = _mm_shuffle_epi32::<{ _mm_shuffle(2, 3, 0, 1) }>(m1);
+    let m2 = _mm_max_epu32(m1, t2);
+
+    _mm_cvtsi128_si32(m2) as u32
 }
 
 #[inline]

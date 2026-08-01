@@ -156,6 +156,51 @@ pub(crate) fn natural_position_lut(size: usize) -> Vec<u32> {
     lut
 }
 
+/// Scan position (natural coding order) of every raw coefficient index for a
+/// `width x height` coefficient block; tall orientations are the transpose of
+/// the canonical wide table. Used by the rate estimators to price the token
+/// walk: the coder emits a token for every scan position up to the last
+/// nonzero, so late sparse coefficients drag `visited zeros` cost with them.
+pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
+    type ShapeLuts = Vec<((usize, usize), Vec<u32>)>;
+    static LUTS: std::sync::OnceLock<ShapeLuts> = std::sync::OnceLock::new();
+    let luts = LUTS.get_or_init(|| {
+        let shapes = [
+            (8, 8),
+            (16, 8),
+            (8, 16),
+            (16, 16),
+            (32, 16),
+            (16, 32),
+            (32, 32),
+        ];
+        shapes
+            .iter()
+            .map(|&(w, h)| {
+                let size = w * h;
+                let lut = if w >= h {
+                    natural_position_lut(size)
+                } else {
+                    let c = natural_position_lut(size);
+                    let mut t = vec![0u32; size];
+                    for y in 0..h {
+                        for x in 0..w {
+                            t[y * w + x] = c[x * h + y];
+                        }
+                    }
+                    t
+                };
+                ((w, h), lut)
+            })
+            .collect()
+    });
+    &luts
+        .iter()
+        .find(|(shape, _)| *shape == (width, height))
+        .expect("scan lut shape")
+        .1
+}
+
 /// Per-frame coefficient orders. `orders[i]` holds, for the group described by
 /// `ORDER_SPECS[i]`, three scan tables (one per channel) mapping scan position
 /// to raw coefficient index — the same convention as `K_COEFF_ORDER_*`.

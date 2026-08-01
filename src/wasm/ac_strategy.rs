@@ -57,9 +57,10 @@ pub(crate) fn sse_and_rate_wasm(
     cy: usize,
     _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = f32x4_splat(q_scaled);
@@ -67,6 +68,7 @@ pub(crate) fn sse_and_rate_wasm(
     let mut sse_acc = f32x4_splat(0.0);
     let mut mag_acc = f32x4_splat(0.0);
     let mut nzeros = 0usize;
+    let mut scan_acc = u32x4_splat(0);
 
     let zero = f32x4_splat(0.0);
 
@@ -139,11 +141,20 @@ pub(crate) fn sse_and_rate_wasm(
             if rate_bits != 0 {
                 let ratev = wasm_log2p1_f32(absq);
                 mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x) as *const v128) };
+                scan_acc = u32x4_max(scan_acc, v128_and(sv, rate_mask));
             }
         }
     }
 
-    (hsum4(sse_acc), nzeros, hsum4(mag_acc))
+    let max_scan = u32x4_extract_lane::<0>(scan_acc)
+        .max(u32x4_extract_lane::<1>(scan_acc))
+        .max(u32x4_extract_lane::<2>(scan_acc))
+        .max(u32x4_extract_lane::<3>(scan_acc));
+
+    (hsum4(sse_acc), nzeros, hsum4(mag_acc), max_scan)
 }
 
 #[inline]

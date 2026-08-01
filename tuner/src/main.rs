@@ -8,10 +8,8 @@
 //! {"bytes":12345,"encode_ms":18.3,"width":768,"height":768,"pixels":589824,"bpp":0.1675}
 //! ```
 //!
-//! Tuning parameters are supplied out-of-band via the `JIXEL_TUNING_JSON`
-//! environment variable (read by the jixel crate itself), so this binary stays
-//! trivial and never needs to know the parameter schema. Decoding and quality
-//! scoring (djxl + ssimulacra2) are done by the Python harness.
+//! Decoding and quality scoring (djxl + ssimulacra2) are done by the Python
+//! harness; this binary stays trivial.
 //!
 //! Usage:
 //! ```text

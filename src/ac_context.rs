@@ -402,10 +402,6 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-image block-context planning
-// ---------------------------------------------------------------------------
-
 /// The signaled block-context layout decided per image after tokenization.
 ///
 /// Tokens are produced on the fine layout (every base context split by the
@@ -429,6 +425,18 @@ impl AcCtxPlan {
         }
         AcCtxPlan {
             nbc: K_NUM_BLOCK_CTXS as u8,
+            fine_to_final,
+            qf_threshold: None,
+        }
+    }
+
+    /// One coarse block context for Fastest's all-DCT8 stream. This avoids
+    /// allocating and clustering thousands of unreachable transform contexts.
+    pub(crate) fn dct8_only() -> Self {
+        let mut fine_to_final = [0u8; K_NUM_FINE_BLOCK_CTXS];
+        fine_to_final.fill(0);
+        AcCtxPlan {
+            nbc: 1,
             fine_to_final,
             qf_threshold: None,
         }

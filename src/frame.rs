@@ -225,10 +225,13 @@ fn push_dc_wp_token(
     dc_gradient: &DcPredictorChoice,
     mchan: usize,
     props: &mut Vec<crate::dc_tree::DcProp>,
+    collect_props: bool,
 ) {
     let wp_prediction = wp.predict(x, y, n, w, ne, nw, nn);
     let prop = (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX) as usize;
-    props.push(crate::dc_tree::dc_prop(mchan, prop));
+    if collect_props {
+        props.push(crate::dc_tree::dc_prop(mchan, prop));
+    }
     wp.update(value, x, y);
     // The context comes from the weighted predictor's error whichever predictor
     // the leaf ends up using, so the tree is navigated identically either way
@@ -249,6 +252,7 @@ fn push_dc_wp_token(
 pub(crate) type DcPredictorChoice = [bool; K_NUM_DC_CONTEXTS];
 
 pub(crate) const DC_PREDICTOR_WEIGHTED: DcPredictorChoice = [false; K_NUM_DC_CONTEXTS];
+const DC_PREDICTOR_GRADIENT: DcPredictorChoice = [true; K_NUM_DC_CONTEXTS];
 
 /// Pick, for every DC leaf independently, whichever predictor codes its own
 /// tokens in fewer bits. Both candidate streams share a context assignment, so
@@ -308,6 +312,7 @@ pub(crate) fn collect_dc_tokens(
     dc_data: &DcGroupData,
     dc_gradient: &DcPredictorChoice,
     props: &mut Vec<crate::dc_tree::DcProp>,
+    collect_props: bool,
 ) -> Vec<Token> {
     let token_count = [1usize, 0, 2]
         .into_iter()
@@ -354,6 +359,7 @@ pub(crate) fn collect_dc_tokens(
                 dc_gradient,
                 mchan,
                 props,
+                collect_props,
             );
             left = value;
         }
@@ -380,6 +386,7 @@ pub(crate) fn collect_dc_tokens(
                 dc_gradient,
                 mchan,
                 props,
+                collect_props,
             );
 
             // Interior columns have every neighbor available.
@@ -404,6 +411,7 @@ pub(crate) fn collect_dc_tokens(
                     dc_gradient,
                     mchan,
                     props,
+                    collect_props,
                 );
             }
 
@@ -425,6 +433,7 @@ pub(crate) fn collect_dc_tokens(
                     dc_gradient,
                     mchan,
                     props,
+                    collect_props,
                 );
             }
 
@@ -458,6 +467,7 @@ pub(crate) fn collect_ac_metadata_tokens(
     dc_data: &DcGroupData,
     props: &mut Vec<crate::dc_tree::DcProp>,
     distance: f32,
+    collect_props: bool,
 ) -> Vec<Token> {
     #[inline]
     fn wbin(w: i32) -> crate::dc_tree::DcProp {
@@ -490,7 +500,9 @@ pub(crate) fn collect_ac_metadata_tokens(
         let mut left = 0i32;
         for &here in first_row {
             let here = here as i32;
-            props.push(wbin(left));
+            if collect_props {
+                props.push(wbin(left));
+            }
             tokens.push(Token::new(ctx_id, pack_signed(here - left)));
             left = here;
         }
@@ -498,7 +510,9 @@ pub(crate) fn collect_ac_metadata_tokens(
         let mut row_above = first_row;
         for row in rows {
             // First column replicates the value above for W and NW.
-            props.push(wbin(row_above[0] as i32));
+            if collect_props {
+                props.push(wbin(row_above[0] as i32));
+            }
             tokens.push(Token::new(
                 ctx_id,
                 pack_signed(row[0] as i32 - row_above[0] as i32),
@@ -507,7 +521,9 @@ pub(crate) fn collect_ac_metadata_tokens(
             for (current, above) in row.array_windows::<2>().zip(row_above.array_windows::<2>()) {
                 let prediction =
                     clamped_gradient(above[1] as i32, current[0] as i32, above[0] as i32);
-                props.push(wbin(current[0] as i32));
+                if collect_props {
+                    props.push(wbin(current[0] as i32));
+                }
                 tokens.push(Token::new(
                     ctx_id,
                     pack_signed(current[1] as i32 - prediction),
@@ -522,7 +538,9 @@ pub(crate) fn collect_ac_metadata_tokens(
     let strategy_base = tokens.len();
     let qf_base = strategy_base + num_first_blocks;
     tokens.resize(strategy_base + 2 * num_first_blocks, Token::new(0, 0));
-    props.resize(strategy_base + 2 * num_first_blocks, 0);
+    if collect_props {
+        props.resize(strategy_base + 2 * num_first_blocks, 0);
+    }
     let mut strategy_left = 0i32;
     let mut qf_left = if nblocks == 0 {
         0
@@ -540,13 +558,17 @@ pub(crate) fn collect_ac_metadata_tokens(
             }
 
             let strategy = dc_data.ac_strategy.strategy_code(x, y) as i32;
-            props[strategy_base + first_idx] = wbin(strategy_left);
+            if collect_props {
+                props[strategy_base + first_idx] = wbin(strategy_left);
+            }
             tokens[strategy_base + first_idx] =
                 Token::new(ac_metadata_context(strategy_left, 7), pack_signed(strategy));
             strategy_left = strategy;
 
             let qf = qf as i32 - 1;
-            props[qf_base + first_idx] = wbin(qf_left);
+            if collect_props {
+                props[qf_base + first_idx] = wbin(qf_left);
+            }
             tokens[qf_base + first_idx] =
                 Token::new(ac_metadata_context(qf_left, 3), pack_signed(qf - qf_left));
             qf_left = qf;
@@ -557,7 +579,9 @@ pub(crate) fn collect_ac_metadata_tokens(
 
     // (d) EPF tokens (constant stream; refinement can never split it).
     let sharp = epf_sharpness_id(distance);
-    props.resize(props.len() + nblocks, wbin(sharp));
+    if collect_props {
+        props.resize(props.len() + nblocks, wbin(sharp));
+    }
     tokens.resize(tokens.len() + nblocks, Token::new(0, pack_signed(sharp)));
     tokens
 }
@@ -589,7 +613,7 @@ fn epf_sharpness_id(distance: f32) -> i32 {
 /// freshly optimized entropy code. Used by the sub-8x8 activation gate to weigh
 /// the exact selected set's meta-stream cost against its RD benefit.
 fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch, distance: f32) -> u64 {
-    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new(), distance);
+    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new(), distance, false);
     let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let code = code_owned.as_ref();
     let mut bits = 0u64;
@@ -1636,12 +1660,23 @@ fn encode_frame_core(
         .thread_pool
         .steal_map(scratch, dc_datas.len(), |i, _scratch| {
             let mut props = Vec::new();
-            let wp = collect_dc_tokens(&dc_datas[i], &DC_PREDICTOR_WEIGHTED, &mut props);
+            let predictor = if ctx.speed == Speed::Fastest {
+                &DC_PREDICTOR_GRADIENT
+            } else {
+                &DC_PREDICTOR_WEIGHTED
+            };
+            let collect_props = ctx.speed != Speed::Fastest;
+            let wp = collect_dc_tokens(&dc_datas[i], predictor, &mut props, collect_props);
             // Both arms run identical WP state; properties are shared.
-            let mut discard = Vec::new();
-            let grad = collect_dc_tokens(&dc_datas[i], &[true; K_NUM_DC_CONTEXTS], &mut discard);
+            let grad = if ctx.speed == Speed::Fastest {
+                Vec::new()
+            } else {
+                let mut discard = Vec::new();
+                collect_dc_tokens(&dc_datas[i], &DC_PREDICTOR_GRADIENT, &mut discard, false)
+            };
             let mut meta_props = Vec::new();
-            let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, distance);
+            let meta =
+                collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, distance, collect_props);
             (wp, props, grad, meta, meta_props)
         });
     let mut wp_tokens_per_group = Vec::with_capacity(token_groups.len());
@@ -1657,28 +1692,36 @@ fn encode_frame_core(
         meta_props_per_group.push(meta_props);
     }
 
-    let dc_gradient = choose_dc_predictors(
-        &wp_tokens_per_group,
-        &grad_tokens_per_group,
-        &mut scratch.dc_predictor,
-    );
+    let dc_gradient = if ctx.speed == Speed::Fastest {
+        DC_PREDICTOR_GRADIENT
+    } else {
+        choose_dc_predictors(
+            &wp_tokens_per_group,
+            &grad_tokens_per_group,
+            &mut scratch.dc_predictor,
+        )
+    };
     // Arm A: the static tree with per-leaf predictor flips.
-    let dc_tokens_static: Vec<Vec<Token>> = wp_tokens_per_group
-        .iter()
-        .zip(&grad_tokens_per_group)
-        .map(|(wp, grad)| {
-            wp.iter()
-                .zip(grad)
-                .map(|(w, g)| {
-                    if dc_gradient[w.context as usize] {
-                        *g
-                    } else {
-                        *w
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let dc_tokens_static: Vec<Vec<Token>> = if ctx.speed == Speed::Fastest {
+        std::mem::take(&mut wp_tokens_per_group)
+    } else {
+        wp_tokens_per_group
+            .iter()
+            .zip(&grad_tokens_per_group)
+            .map(|(wp, grad)| {
+                wp.iter()
+                    .zip(grad)
+                    .map(|(w, g)| {
+                        if dc_gradient[w.context as usize] {
+                            *g
+                        } else {
+                            *w
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
     let code_static = crate::entropy::optimize_entropy_code_ac_streams(
         dc_tokens_static
             .iter()
@@ -1686,113 +1729,124 @@ fn encode_frame_core(
             .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
-        true,
+        ctx.speed != Speed::Fastest,
     );
-
-    // Arm B: a per-image learned tree over WP error and channel, with its own
-    // per-leaf predictor choice. Leaf renumbering shifts the metadata contexts,
-    // so those tokens are remapped alongside.
-    let learned = crate::dc_tree::learn_dc_tree(
-        dim.num_dc_groups,
-        &wp_tokens_per_group,
-        &grad_tokens_per_group,
-        &props_per_group,
-        &meta_tokens_per_group,
-        &meta_props_per_group,
-    );
-    let dc_tokens_learned: Vec<Vec<Token>> = wp_tokens_per_group
-        .iter()
-        .zip(&grad_tokens_per_group)
-        .zip(&props_per_group)
-        .map(|((wp, grad), props)| {
-            wp.iter()
-                .zip(grad)
-                .zip(props)
-                .map(|((w, g), &p)| {
-                    let ctx = learned.dc_context[p as usize];
-                    let value = if learned.leaf_gradient[ctx as usize] {
-                        g.value
-                    } else {
-                        w.value
-                    };
-                    Token::new(u32::from(ctx), value)
-                })
-                .collect()
-        })
-        .collect();
-    let meta_tokens_learned: Vec<Vec<Token>> = meta_tokens_per_group
-        .iter()
-        .zip(&meta_props_per_group)
-        .map(|(group, props)| {
-            group
-                .iter()
-                .zip(props)
-                .map(|(t, &p)| {
-                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
-                    Token::new(u32::from(learned.meta_context[slot]), t.value)
-                })
-                .collect()
-        })
-        .collect();
-    let code_learned = crate::entropy::optimize_entropy_code_ac_streams(
-        dc_tokens_learned
-            .iter()
-            .map(Vec::as_slice)
-            .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
-        learned.num_contexts,
-        &mut scratch.huffman_pool,
-        true,
-    );
-
-    // Price both arms end to end: serialized tree + entropy-code header
-    // (measured by writing them) plus the payload estimate, and require the
-    // learned arm to win by a margin. The margin absorbs the small estimator
-    // noise so near-ties keep the battle-tested static tree.
-    let payload =
-        |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
-            crate::lz77_ac::estimate_ac_plain_bits(
-                dc.iter()
-                    .map(Vec::as_slice)
-                    .chain(meta.iter().map(Vec::as_slice)),
-                code,
-            )
-        };
-    let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
-        let mut w = BitWriter::new();
-        match tree {
-            DcTreeChoice::Static(grad) => {
-                write_context_tree(dim.num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
-            }
-            DcTreeChoice::Learned(tokens) => {
-                write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut w);
-            }
-        }
-        write_entropy_code(code, &mut scratch.huffman_pool, &mut w);
-        w.bits_written() as u64
-    };
-    const LEARNED_TREE_MARGIN_BITS: u64 = 64;
     let tree_static = DcTreeChoice::Static(dc_gradient);
-    let tree_learned = DcTreeChoice::Learned(learned.tokens);
-    let cost_static = header(&tree_static, &code_static.as_ref(), scratch)
-        + payload(&dc_tokens_static, &meta_tokens_per_group, &code_static);
-    let cost_learned = header(&tree_learned, &code_learned.as_ref(), scratch)
-        + payload(&dc_tokens_learned, &meta_tokens_learned, &code_learned);
 
-    let use_learned = cost_learned + LEARNED_TREE_MARGIN_BITS < cost_static;
-    let (dc_tokens_per_group, meta_tokens_per_group, dc_code_owned, dc_tree) = if use_learned {
-        (
-            dc_tokens_learned,
-            meta_tokens_learned,
-            code_learned,
-            tree_learned,
-        )
-    } else {
+    let (dc_tokens_per_group, meta_tokens_per_group, dc_code_owned, dc_tree) = if ctx.speed
+        == Speed::Fastest
+    {
         (
             dc_tokens_static,
             meta_tokens_per_group,
             code_static,
             tree_static,
         )
+    } else {
+        // Arm B: a per-image learned tree over WP error and channel, with its own
+        // per-leaf predictor choice. Leaf renumbering shifts the metadata contexts,
+        // so those tokens are remapped alongside.
+        let learned = crate::dc_tree::learn_dc_tree(
+            dim.num_dc_groups,
+            &wp_tokens_per_group,
+            &grad_tokens_per_group,
+            &props_per_group,
+            &meta_tokens_per_group,
+            &meta_props_per_group,
+        );
+        let dc_tokens_learned: Vec<Vec<Token>> = wp_tokens_per_group
+            .iter()
+            .zip(&grad_tokens_per_group)
+            .zip(&props_per_group)
+            .map(|((wp, grad), props)| {
+                wp.iter()
+                    .zip(grad)
+                    .zip(props)
+                    .map(|((w, g), &p)| {
+                        let ctx = learned.dc_context[p as usize];
+                        let value = if learned.leaf_gradient[ctx as usize] {
+                            g.value
+                        } else {
+                            w.value
+                        };
+                        Token::new(u32::from(ctx), value)
+                    })
+                    .collect()
+            })
+            .collect();
+        let meta_tokens_learned: Vec<Vec<Token>> = meta_tokens_per_group
+            .iter()
+            .zip(&meta_props_per_group)
+            .map(|(group, props)| {
+                group
+                    .iter()
+                    .zip(props)
+                    .map(|(t, &p)| {
+                        let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                        Token::new(u32::from(learned.meta_context[slot]), t.value)
+                    })
+                    .collect()
+            })
+            .collect();
+        let code_learned = crate::entropy::optimize_entropy_code_ac_streams(
+            dc_tokens_learned
+                .iter()
+                .map(Vec::as_slice)
+                .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
+            learned.num_contexts,
+            &mut scratch.huffman_pool,
+            ctx.speed != Speed::Fastest,
+        );
+
+        // Price both arms end to end: serialized tree + entropy-code header
+        // (measured by writing them) plus the payload estimate, and require the
+        // learned arm to win by a margin. The margin absorbs the small estimator
+        // noise so near-ties keep the battle-tested static tree.
+        let payload =
+            |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
+                crate::lz77_ac::estimate_ac_plain_bits(
+                    dc.iter()
+                        .map(Vec::as_slice)
+                        .chain(meta.iter().map(Vec::as_slice)),
+                    code,
+                )
+            };
+        let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
+            let mut w = BitWriter::new();
+            match tree {
+                DcTreeChoice::Static(grad) => {
+                    write_context_tree(dim.num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
+                }
+                DcTreeChoice::Learned(tokens) => {
+                    write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut w);
+                }
+            }
+            write_entropy_code(code, &mut scratch.huffman_pool, &mut w);
+            w.bits_written() as u64
+        };
+        const LEARNED_TREE_MARGIN_BITS: u64 = 64;
+        let tree_learned = DcTreeChoice::Learned(learned.tokens);
+        let cost_static = header(&tree_static, &code_static.as_ref(), scratch)
+            + payload(&dc_tokens_static, &meta_tokens_per_group, &code_static);
+        let cost_learned = header(&tree_learned, &code_learned.as_ref(), scratch)
+            + payload(&dc_tokens_learned, &meta_tokens_learned, &code_learned);
+
+        let use_learned = cost_learned + LEARNED_TREE_MARGIN_BITS < cost_static;
+        if use_learned {
+            (
+                dc_tokens_learned,
+                meta_tokens_learned,
+                code_learned,
+                tree_learned,
+            )
+        } else {
+            (
+                dc_tokens_static,
+                meta_tokens_per_group,
+                code_static,
+                tree_static,
+            )
+        }
     };
     let dc_code = dc_code_owned.as_ref();
 
@@ -1801,13 +1855,11 @@ fn encode_frame_core(
     // The greedy proposes; the arm gate below disposes, comparing real
     // entropy-code headers plus payload estimates because the Shannon proxy
     // reliably overestimates what clustering-aware coding realizes.
-    let proposed = crate::ac_context::plan_block_ctx_map(
-        all_pending
-            .iter()
-            .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
-        qf_threshold,
-    );
-    let baseline = crate::ac_context::AcCtxPlan::baseline();
+    let baseline = if ctx.speed == Speed::Fastest {
+        crate::ac_context::AcCtxPlan::dct8_only()
+    } else {
+        crate::ac_context::AcCtxPlan::baseline()
+    };
 
     let build_codes = |pending: &[PendingAcGroup],
                        num_contexts: usize,
@@ -1815,12 +1867,20 @@ fn encode_frame_core(
      -> Vec<crate::entropy::OwnedEntropyCode> {
         (0..num_passes)
             .map(|pass| {
-                crate::entropy::optimize_entropy_code_ac_streams(
-                    pending.iter().map(|p| p.tokens[pass].as_slice()),
-                    num_contexts,
-                    &mut scratch.huffman_pool,
-                    true,
-                )
+                if ctx.speed == Speed::Fastest {
+                    crate::entropy::optimize_entropy_code_ac_streams_fast(
+                        pending.iter().map(|p| p.tokens[pass].as_slice()),
+                        num_contexts,
+                        &mut scratch.huffman_pool,
+                    )
+                } else {
+                    crate::entropy::optimize_entropy_code_ac_streams(
+                        pending.iter().map(|p| p.tokens[pass].as_slice()),
+                        num_contexts,
+                        &mut scratch.huffman_pool,
+                        true,
+                    )
+                }
             })
             .collect()
     };
@@ -1856,48 +1916,60 @@ fn encode_frame_core(
             });
     };
 
-    let (ac_plan, ac_code_per_pass) = if proposed == baseline {
+    let (ac_plan, ac_code_per_pass) = if ctx.speed != Speed::Slow {
         remap_tokens(&mut all_pending, &baseline, scratch);
         let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
         (baseline, codes)
     } else {
-        // Materialize the proposed arm, remap the originals to baseline in
-        // place, and keep whichever arm's real bits win.
-        let plan_ref = &proposed;
-        let mut planned: Vec<Vec<Vec<Token>>> = all_pending
-            .iter()
-            .map(|p| {
-                p.tokens
-                    .iter()
-                    .map(|pass_tokens| {
-                        pass_tokens
-                            .iter()
-                            .map(|t| Token::new(plan_ref.remap(t.context), t.value))
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        remap_tokens(&mut all_pending, &baseline, scratch);
-
-        let base_codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
-        let base_bits = arm_bits(&all_pending, &base_codes, &baseline, scratch);
-        // Swap in the proposed tokens to price them with the same helpers.
-        for (p, planned_tokens) in all_pending.iter_mut().zip(&mut planned) {
-            std::mem::swap(&mut p.tokens, planned_tokens);
-        }
-        let plan_codes = build_codes(&all_pending, proposed.num_ac_contexts(), scratch);
-        let plan_bits = arm_bits(&all_pending, &plan_codes, &proposed, scratch);
-
-        const AC_PLAN_MARGIN_BITS: u64 = 256;
-        if plan_bits + AC_PLAN_MARGIN_BITS < base_bits {
-            (proposed, plan_codes)
+        let proposed = crate::ac_context::plan_block_ctx_map(
+            all_pending
+                .iter()
+                .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
+            qf_threshold,
+        );
+        if proposed == baseline {
+            remap_tokens(&mut all_pending, &baseline, scratch);
+            let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
+            (baseline, codes)
         } else {
-            // Swap the baseline tokens back.
+            // Materialize the proposed arm, remap the originals to baseline in
+            // place, and keep whichever arm's real bits win.
+            let plan_ref = &proposed;
+            let mut planned: Vec<Vec<Vec<Token>>> = all_pending
+                .iter()
+                .map(|p| {
+                    p.tokens
+                        .iter()
+                        .map(|pass_tokens| {
+                            pass_tokens
+                                .iter()
+                                .map(|t| Token::new(plan_ref.remap(t.context), t.value))
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect();
+            remap_tokens(&mut all_pending, &baseline, scratch);
+
+            let base_codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
+            let base_bits = arm_bits(&all_pending, &base_codes, &baseline, scratch);
+            // Swap in the proposed tokens to price them with the same helpers.
             for (p, planned_tokens) in all_pending.iter_mut().zip(&mut planned) {
                 std::mem::swap(&mut p.tokens, planned_tokens);
             }
-            (baseline, base_codes)
+            let plan_codes = build_codes(&all_pending, proposed.num_ac_contexts(), scratch);
+            let plan_bits = arm_bits(&all_pending, &plan_codes, &proposed, scratch);
+
+            const AC_PLAN_MARGIN_BITS: u64 = 256;
+            if plan_bits + AC_PLAN_MARGIN_BITS < base_bits {
+                (proposed, plan_codes)
+            } else {
+                // Swap the baseline tokens back.
+                for (p, planned_tokens) in all_pending.iter_mut().zip(&mut planned) {
+                    std::mem::swap(&mut p.tokens, planned_tokens);
+                }
+                (baseline, base_codes)
+            }
         }
     };
 
@@ -1908,7 +1980,7 @@ fn encode_frame_core(
     let mut ac_lz_per_group: Vec<Vec<crate::lz77_ac::AcLz>> = Vec::new();
     let ac_lz_code_owned;
     let use_lz77;
-    if num_passes == 1 {
+    if num_passes == 1 && ctx.speed != Speed::Fastest {
         ac_lz_per_group = ctx
             .thread_pool
             .steal_map(scratch, all_pending.len(), |i, _scratch| {

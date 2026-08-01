@@ -38,6 +38,10 @@ use crate::image::{Image3F, Plane};
 use std::sync::OnceLock;
 
 const R_NZ_BASE: f32 = 1.6;
+/// Cost of each zero token the coder emits while walking the scan order up to
+/// the last nonzero (review-3 §1: the estimator previously priced only the
+/// nonzeros, under-pricing large transforms with sparse late coefficients).
+pub(crate) const R_ZERO: f32 = 0.5;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
 // Per-channel distortion weights (X, Y, B).
@@ -82,7 +86,8 @@ pub(crate) type SseAndRateFn = unsafe fn(
     usize,
     &RateLog2Lut,
     &[f32; 4],
-) -> (f32, usize, f32);
+    &[u32],
+) -> (f32, usize, f32, u32);
 
 fn select_sse_and_rate_fn() -> SseAndRateFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -148,6 +153,8 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
                 random() * 0.6,
             ];
 
+            let mut expected_max_scan = 0u32;
+            let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
             let (mut expected_sse, mut expected_nzeros, mut expected_mag) =
                 (0.0f32, 0usize, 0.0f32);
             for y in 0..height {
@@ -169,6 +176,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
                     if q != 0.0 {
                         expected_nzeros += 1;
                         expected_mag += (1.0 + q.abs()).log2();
+                        expected_max_scan = expected_max_scan.max(scan_pos[i]);
                     }
                 }
             }
@@ -185,11 +193,16 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
                     cy,
                     rate_log2_lut(),
                     &thr,
+                    scan_pos,
                 )
             };
             assert_eq!(
                 actual.1, expected_nzeros,
                 "nzeros mismatch {width}x{height}"
+            );
+            assert_eq!(
+                actual.3, expected_max_scan,
+                "max-scan mismatch {width}x{height}"
             );
             let sse_rel = (actual.0 - expected_sse).abs() / expected_sse.abs().max(1.0);
             let mag_rel = (actual.2 - expected_mag).abs() / expected_mag.abs().max(1.0);
@@ -217,10 +230,12 @@ pub(crate) fn sse_and_rate_scalar(
     cy: usize,
     rate_log2_lut: &RateLog2Lut,
     thr: &[f32; 4],
-) -> (f32, usize, f32) {
+    scan_pos: &[u32],
+) -> (f32, usize, f32, u32) {
     let mut sse = 0.0f32;
     let mut nzeros = 0usize;
     let mut mag_bits = 0.0f32;
+    let mut max_scan = 0u32;
     for (y, (coeff_row, inv_row)) in coeff
         .chunks_exact(width)
         .zip(inv_matrix.chunks_exact(width))
@@ -240,10 +255,21 @@ pub(crate) fn sse_and_rate_scalar(
             if q != 0.0 {
                 nzeros += 1;
                 mag_bits += rate_log2_with_lut(rate_log2_lut, q.abs());
+                max_scan = max_scan.max(scan_pos[y * width + x]);
             }
         }
     }
-    (sse, nzeros, mag_bits)
+    (sse, nzeros, mag_bits, max_scan)
+}
+
+/// Zero tokens the coder must emit before the last nonzero: scan span minus
+/// the LLF prefix (never coded) minus the nonzeros themselves.
+#[inline]
+pub(crate) fn visited_zeros(nzeros: usize, max_scan: u32, cx: usize, cy: usize) -> f32 {
+    if nzeros == 0 {
+        return 0.0;
+    }
+    (max_scan as usize + 1).saturating_sub(cx * cy + nzeros) as f32
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,7 +289,8 @@ pub(crate) fn channel_rd(
     let height = cy * 8;
     let half = width / 2;
     let thr = crate::group::quantize_ac_thresholds(channel, cx, cy, distance);
-    let (sse, nzeros, mag_bits) = unsafe {
+    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
+    let (sse, nzeros, mag_bits, max_scan) = unsafe {
         sse_and_rate_fn(
             coeff,
             inv_matrix,
@@ -275,10 +302,14 @@ pub(crate) fn channel_rd(
             cy,
             rate_log2_lut,
             &thr,
+            scan_pos,
         )
     };
     let header = R_HEADER * rate_log2_with_lut(rate_log2_lut, nzeros as f32);
-    let bits = nzeros as f32 * R_NZ_BASE + R_MAG * mag_bits + header;
+    let bits = nzeros as f32 * R_NZ_BASE
+        + R_MAG * mag_bits
+        + header
+        + R_ZERO * visited_zeros(nzeros, max_scan, cx, cy);
     (sse, bits)
 }
 
@@ -467,6 +498,7 @@ pub(crate) type ReconQuantizeFn = unsafe fn(
     usize,
     &mut [f32],
     &RateLog2Lut,
+    &[u32],
 ) -> f32;
 
 pub(crate) type SsimDeficitFn = unsafe fn(&[f32], &[f32], usize, usize) -> f32;
@@ -753,11 +785,35 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     else {
         unreachable!()
     };
+    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
     let mut rate = 0.0f32;
-    for c in 0..3 {
+    rate += unsafe {
+        quantize(
+            &coeffs[1][..n],
+            &inverse_matrices[1][..n],
+            quant_scales[1],
+            &thresholds[1],
+            width,
+            height,
+            half,
+            cx,
+            cy,
+            &mut coeff_error[1][..n],
+            rate_log2_lut,
+            scan_pos,
+        )
+    };
+    for c in [0usize, 2] {
+        let factor = if c == 0 { factor_x } else { factor_b };
+        combine_error(
+            &coeffs[c][..n],
+            &coeff_error[1][..n],
+            factor,
+            &mut combined_error[..n],
+        );
         rate += unsafe {
             quantize(
-                &coeffs[c][..n],
+                &combined_error[..n],
                 &inverse_matrices[c][..n],
                 quant_scales[c],
                 &thresholds[c],
@@ -768,26 +824,16 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 cy,
                 &mut coeff_error[c][..n],
                 rate_log2_lut,
+                scan_pos,
             )
         };
     }
 
-    reconstruct_error(strategy, &coeff_error[1][..n], &mut y_error[..n]);
+    let _ = y_error;
     let mut distortion = 0.0f32;
     for c in 0..3 {
-        let factor = if c == 0 { factor_x } else { factor_b };
-        let error: &[f32] = if c == 1 {
-            &y_error[..n]
-        } else {
-            reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
-            combine_error(
-                &spatial_error[..n],
-                &y_error[..n],
-                factor,
-                &mut combined_error[..n],
-            );
-            &combined_error[..n]
-        };
+        reconstruct_error(strategy, &coeff_error[c][..n], &mut spatial_error[..n]);
+        let error: &[f32] = &spatial_error[..n];
         let plane = opsin.plane(c);
         unsafe {
             prepare_reconstruction(
@@ -820,7 +866,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn prepare_reconstruction_scalar(
+fn prepare_reconstruction_scalar(
     plane: &Plane<f32>,
     px: usize,
     py: usize,
@@ -859,7 +905,7 @@ unsafe fn prepare_reconstruction_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn recon_quantize_scalar(
+fn recon_quantize_scalar(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -871,12 +917,14 @@ unsafe fn recon_quantize_scalar(
     cy: usize,
     coeff_error: &mut [f32],
     rate_log2_lut: &RateLog2Lut,
+    scan_pos: &[u32],
 ) -> f32 {
     let n = width
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
     let (mut nonzero, mut magnitude_bits) = (0usize, 0.0f32);
+    let mut max_scan = 0u32;
     for (y, ((coeff_row, inv_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
@@ -911,12 +959,14 @@ unsafe fn recon_quantize_scalar(
             if quantized != 0.0 {
                 nonzero += 1;
                 magnitude_bits += rate_log2_with_lut(rate_log2_lut, quantized.abs());
+                max_scan = max_scan.max(scan_pos[y * width + x]);
             }
         }
     }
     nonzero as f32 * R_NZ_BASE
         + R_MAG * magnitude_bits
         + R_HEADER * rate_log2_with_lut(rate_log2_lut, nonzero as f32)
+        + R_ZERO * visited_zeros(nonzero, max_scan, cx, cy)
 }
 
 pub(crate) fn ssim_deficit(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
