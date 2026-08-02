@@ -604,6 +604,7 @@ fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut
             tokens,
             code.context_map,
             code.ans_symbols,
+            code.ans_reverse_maps,
             code.hybrid_uint_configs,
             w,
         );

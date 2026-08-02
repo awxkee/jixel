@@ -1,81 +1,201 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 8/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 use crate::avx::ac_strategy::hsum256;
 use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx2")]
+fn first_lanes_mask(n: usize) -> __m256i {
+    _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(n as i32),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn add_x8(sum: __m256, row: &[f32], x: usize) -> __m256 {
+    _mm256_add_ps(sum, unsafe { _mm256_loadu_ps(row.as_ptr().add(x)) })
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn add_masked(sum: __m256, row: &[f32], x: usize, mask: __m256i) -> __m256 {
+    _mm256_add_ps(sum, unsafe {
+        _mm256_maskload_ps(row.as_ptr().add(x), mask)
+    })
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
 fn sum_rows(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let mut sum2 = _mm256_setzero_ps();
+    let mut sum3 = _mm256_setzero_ps();
+    let groups = w / 32;
+    let full_tail = w % 32 / 8;
+    let remainder = w % 8;
+    let tail_mask = first_lanes_mask(remainder);
     for row in buf.chunks_exact(stride).take(h) {
-        let (chunks, tail) = row[..w].as_chunks::<8>();
-        for (i, chunk) in chunks.iter().enumerate() {
-            sums[i & 3] = _mm256_add_ps(sums[i & 3], unsafe { _mm256_loadu_ps(chunk.as_ptr()) });
+        for group in 0..groups {
+            let x = group * 32;
+            sum0 = add_x8(sum0, row, x);
+            sum1 = add_x8(sum1, row, x + 8);
+            sum2 = add_x8(sum2, row, x + 16);
+            sum3 = add_x8(sum3, row, x + 24);
         }
-        if !tail.is_empty() {
-            let mut padded = [0.0; 8];
-            padded[..tail.len()].copy_from_slice(tail);
-            let lane = chunks.len() & 3;
-            sums[lane] = _mm256_add_ps(sums[lane], unsafe { _mm256_loadu_ps(padded.as_ptr()) });
+        let mut x = groups * 32;
+        if full_tail > 0 {
+            sum0 = add_x8(sum0, row, x);
+            x += 8;
+        }
+        if full_tail > 1 {
+            sum1 = add_x8(sum1, row, x);
+            x += 8;
+        }
+        if full_tail > 2 {
+            sum2 = add_x8(sum2, row, x);
+            x += 8;
+        }
+        if remainder != 0 {
+            match full_tail {
+                0 => sum0 = add_masked(sum0, row, x, tail_mask),
+                1 => sum1 = add_masked(sum1, row, x, tail_mask),
+                2 => sum2 = add_masked(sum2, row, x, tail_mask),
+                _ => sum3 = add_masked(sum3, row, x, tail_mask),
+            }
         }
     }
-    let sum = _mm256_add_ps(
-        _mm256_add_ps(sums[0], sums[1]),
-        _mm256_add_ps(sums[2], sums[3]),
-    );
+    let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     hsum256(sum)
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
+fn laplacian_abs_x8(
+    sum: __m256,
+    top: &[f32],
+    middle: &[f32],
+    bottom: &[f32],
+    x: usize,
+    four: __m256,
+    sign: __m256,
+) -> __m256 {
+    let up = unsafe { _mm256_loadu_ps(top.as_ptr().add(x)) };
+    let down = unsafe { _mm256_loadu_ps(bottom.as_ptr().add(x)) };
+    let left = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x - 1)) };
+    let center = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x)) };
+    let right = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x + 1)) };
+    let neighbors = _mm256_add_ps(_mm256_add_ps(up, down), _mm256_add_ps(left, right));
+    let lap = _mm256_sub_ps(_mm256_mul_ps(center, four), neighbors);
+    _mm256_add_ps(sum, _mm256_andnot_ps(sign, lap))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn laplacian_abs_masked(
+    sum: __m256,
+    top: &[f32],
+    middle: &[f32],
+    bottom: &[f32],
+    x: usize,
+    mask: __m256i,
+    four: __m256,
+    sign: __m256,
+) -> __m256 {
+    let up = unsafe { _mm256_maskload_ps(top.as_ptr().add(x), mask) };
+    let down = unsafe { _mm256_maskload_ps(bottom.as_ptr().add(x), mask) };
+    let left = unsafe { _mm256_maskload_ps(middle.as_ptr().add(x - 1), mask) };
+    let center = unsafe { _mm256_maskload_ps(middle.as_ptr().add(x), mask) };
+    let right = unsafe { _mm256_maskload_ps(middle.as_ptr().add(x + 1), mask) };
+    let neighbors = _mm256_add_ps(_mm256_add_ps(up, down), _mm256_add_ps(left, right));
+    let lap = _mm256_sub_ps(_mm256_mul_ps(center, four), neighbors);
+    _mm256_add_ps(sum, _mm256_andnot_ps(sign, lap))
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
 fn laplacian_abs_sum(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let mut sum2 = _mm256_setzero_ps();
+    let mut sum3 = _mm256_setzero_ps();
     let four = _mm256_set1_ps(4.0);
     let sign = _mm256_set1_ps(-0.0);
     let interior = w - 2;
+    let groups = interior / 32;
+    let full_tail = interior % 32 / 8;
+    let remainder = interior % 8;
+    let tail_mask = first_lanes_mask(remainder);
     for y in 1..h - 1 {
         let top = &buf[(y - 1) * stride..];
         let middle = &buf[y * stride..];
         let bottom = &buf[(y + 1) * stride..];
-        let full = interior / 8;
-        for chunk in 0..full {
-            let x = 1 + chunk * 8;
-            let up = unsafe { _mm256_loadu_ps(top.as_ptr().add(x)) };
-            let down = unsafe { _mm256_loadu_ps(bottom.as_ptr().add(x)) };
-            let left = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x - 1)) };
-            let center = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x)) };
-            let right = unsafe { _mm256_loadu_ps(middle.as_ptr().add(x + 1)) };
-            let neighbors = _mm256_add_ps(_mm256_add_ps(up, down), _mm256_add_ps(left, right));
-            let lap = _mm256_sub_ps(_mm256_mul_ps(center, four), neighbors);
-            let lane = chunk & 3;
-            sums[lane] = _mm256_add_ps(sums[lane], _mm256_andnot_ps(sign, lap));
+        for group in 0..groups {
+            let x = 1 + group * 32;
+            sum0 = laplacian_abs_x8(sum0, top, middle, bottom, x, four, sign);
+            sum1 = laplacian_abs_x8(sum1, top, middle, bottom, x + 8, four, sign);
+            sum2 = laplacian_abs_x8(sum2, top, middle, bottom, x + 16, four, sign);
+            sum3 = laplacian_abs_x8(sum3, top, middle, bottom, x + 24, four, sign);
         }
-        let remainder = interior % 8;
+        let mut x = 1 + groups * 32;
+        if full_tail > 0 {
+            sum0 = laplacian_abs_x8(sum0, top, middle, bottom, x, four, sign);
+            x += 8;
+        }
+        if full_tail > 1 {
+            sum1 = laplacian_abs_x8(sum1, top, middle, bottom, x, four, sign);
+            x += 8;
+        }
+        if full_tail > 2 {
+            sum2 = laplacian_abs_x8(sum2, top, middle, bottom, x, four, sign);
+            x += 8;
+        }
         if remainder != 0 {
-            let x = 1 + full * 8;
-            let mut up = [0.0; 8];
-            let mut down = [0.0; 8];
-            let mut left = [0.0; 8];
-            let mut center = [0.0; 8];
-            let mut right = [0.0; 8];
-            up[..remainder].copy_from_slice(&top[x..x + remainder]);
-            down[..remainder].copy_from_slice(&bottom[x..x + remainder]);
-            left[..remainder].copy_from_slice(&middle[x - 1..x - 1 + remainder]);
-            center[..remainder].copy_from_slice(&middle[x..x + remainder]);
-            right[..remainder].copy_from_slice(&middle[x + 1..x + 1 + remainder]);
-            let up = unsafe { _mm256_loadu_ps(up.as_ptr()) };
-            let down = unsafe { _mm256_loadu_ps(down.as_ptr()) };
-            let left = unsafe { _mm256_loadu_ps(left.as_ptr()) };
-            let center = unsafe { _mm256_loadu_ps(center.as_ptr()) };
-            let right = unsafe { _mm256_loadu_ps(right.as_ptr()) };
-            let neighbors = _mm256_add_ps(_mm256_add_ps(up, down), _mm256_add_ps(left, right));
-            let lap = _mm256_sub_ps(_mm256_mul_ps(center, four), neighbors);
-            let lane = full & 3;
-            sums[lane] = _mm256_add_ps(sums[lane], _mm256_andnot_ps(sign, lap));
+            match full_tail {
+                0 => {
+                    sum0 = laplacian_abs_masked(sum0, top, middle, bottom, x, tail_mask, four, sign)
+                }
+                1 => {
+                    sum1 = laplacian_abs_masked(sum1, top, middle, bottom, x, tail_mask, four, sign)
+                }
+                2 => {
+                    sum2 = laplacian_abs_masked(sum2, top, middle, bottom, x, tail_mask, four, sign)
+                }
+                _ => {
+                    sum3 = laplacian_abs_masked(sum3, top, middle, bottom, x, tail_mask, four, sign)
+                }
+            }
         }
     }
-    let sum = _mm256_add_ps(
-        _mm256_add_ps(sums[0], sums[1]),
-        _mm256_add_ps(sums[2], sums[3]),
-    );
+    let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     hsum256(sum)
 }
 

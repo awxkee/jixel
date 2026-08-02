@@ -601,8 +601,9 @@ where
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
-        ans_freqs: &[],
+        ans_histograms: &[],
         ans_symbols: &[],
+        ans_reverse_maps: &[],
     }
 }
 

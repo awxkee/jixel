@@ -31,6 +31,7 @@ mod adaptive_quant;
 mod cfl;
 mod dark_aq;
 mod dct;
+mod entropy;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
@@ -44,6 +45,7 @@ pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
 pub(crate) use dark_aq::dark_structure_stats_wasm;
 pub(crate) use dct::*;
+pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use inflated_cost::{combine_error_wasm, error_gradient_energy_wasm};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{

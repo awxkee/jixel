@@ -34,10 +34,12 @@ use crate::dark_aq::DarkAqConfig;
 use crate::encoding_context::EncodingContext;
 use crate::frame::encode_frame;
 use crate::image::{Image3F, Image3Si};
+use crate::jpeg::BrotliCompression;
 use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::orientation::Orientation;
 use crate::xyb::XybMatrix;
 use crate::{ColorEncoding, EncodeError};
+use std::sync::Arc;
 
 fn checked_buffer_size<T>(
     width: usize,
@@ -239,6 +241,14 @@ pub struct EncodeConfig {
     /// EXIF/TIFF metadata to embed via an `Exif` container box. Forces the
     /// output into the JXL container form. Raw TIFF bytes (no "Exif\0\0" prefix).
     pub exif: Option<Vec<u8>>,
+    /// XMP packet to embed via an `xml ` container box, or a `brob` box when a
+    /// Brotli implementation is supplied. Forces the output into container form.
+    pub xmp: Option<Vec<u8>>,
+    /// Optional Brotli encoder for EXIF and XMP metadata boxes.
+    ///
+    /// When set, metadata is emitted in `brob` boxes. When absent, it remains
+    /// in uncompressed `Exif` and `xml ` boxes.
+    pub brotli_compression: Option<Arc<dyn BrotliCompression>>,
     /// Image orientation: how the decoder should rotate/flip the stored pixels
     /// for display (default [`Orientation::Normal`]).
     pub orientation: Orientation,
@@ -299,6 +309,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) color_encoding: ColorEncoding,
     pub(crate) icc_profile: Option<Vec<u8>>,
     pub(crate) exif: Option<Vec<u8>>,
+    pub(crate) xmp: Option<Vec<u8>>,
+    pub(crate) brotli_compression: Option<Arc<dyn BrotliCompression>>,
     pub(crate) orientation: Orientation,
     pub(crate) alpha: Option<AlphaPlane>,
     /// Bit depth declared in the codestream (default: 8).
@@ -336,6 +348,8 @@ impl Default for EncodeConfig {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             exif: None,
+            xmp: None,
+            brotli_compression: None,
             orientation: Orientation::Normal,
             lossless: false,
             banding_protection: false,
@@ -361,6 +375,8 @@ impl Default for EncodeConfigImpl {
             color_encoding: ColorEncoding::default(),
             icc_profile: None,
             exif: None,
+            xmp: None,
+            brotli_compression: None,
             orientation: Orientation::Normal,
             alpha: None,
             bits_per_sample: BitsPerSample::Eight,
@@ -404,6 +420,17 @@ impl EncodeConfigImpl {
     }
     pub(crate) fn with_exif(mut self, exif: Option<Vec<u8>>) -> Self {
         self.exif = exif;
+        self
+    }
+    pub(crate) fn with_xmp(mut self, xmp: Option<Vec<u8>>) -> Self {
+        self.xmp = xmp;
+        self
+    }
+    pub(crate) fn with_brotli_compression(
+        mut self,
+        compressor: Option<Arc<dyn BrotliCompression>>,
+    ) -> Self {
+        self.brotli_compression = compressor;
         self
     }
     pub(crate) fn with_orientation(mut self, orientation: Orientation) -> Self {
@@ -569,6 +596,16 @@ impl EncodeConfig {
     /// Embed EXIF/TIFF metadata (raw TIFF bytes) via an `Exif` container box.
     pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
         self.exif = Some(exif);
+        self
+    }
+    /// Embed an XMP packet via an uncompressed `xml ` container box.
+    pub fn with_xmp(mut self, xmp: Vec<u8>) -> Self {
+        self.xmp = Some(xmp);
+        self
+    }
+    /// Compress EXIF and XMP metadata using a caller-provided Brotli encoder.
+    pub fn with_brotli_compression(mut self, compressor: Box<dyn BrotliCompression>) -> Self {
+        self.brotli_compression = Some(Arc::from(compressor));
         self
     }
     /// Set the image [`Orientation`].
@@ -790,6 +827,8 @@ pub fn encode_image(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_xmp(config.xmp.clone())
+                .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
@@ -808,6 +847,8 @@ pub fn encode_image(
         .with_progressive_from(config)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_xmp(config.xmp.clone())
+        .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
@@ -855,6 +896,8 @@ pub fn encode_image_with_alpha(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_xmp(config.xmp.clone())
+                .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
@@ -875,6 +918,8 @@ pub fn encode_image_with_alpha(
         .with_alpha(AlphaPlane::from_u8(alpha_plane))
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_xmp(config.xmp.clone())
+        .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
@@ -1047,6 +1092,8 @@ fn encode_gray_impl(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_xmp(config.xmp.clone())
+                .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
@@ -1066,6 +1113,8 @@ fn encode_gray_impl(
         .with_grayscale(true)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_xmp(config.xmp.clone())
+        .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
@@ -1279,6 +1328,8 @@ fn encode_gray_high_depth_impl(
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_xmp(config.xmp.clone())
+                .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
@@ -1309,6 +1360,8 @@ fn encode_gray_high_depth_impl(
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_xmp(config.xmp.clone())
+        .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
@@ -1349,6 +1402,8 @@ fn encode_high_depth_rgba(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_xmp(config.xmp.clone())
+                .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
@@ -1392,6 +1447,8 @@ fn encode_high_depth_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_xmp(config.xmp.clone())
+            .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
@@ -1406,6 +1463,8 @@ fn encode_high_depth_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_xmp(config.xmp.clone())
+            .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
@@ -1492,11 +1551,13 @@ fn encode_f32_lossless_rgba(
     encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
-    Ok(finalize_container(
+    finalize_container(
         codestream,
         config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
         needs_level_10(32, true, alpha_bits_md),
-    ))
+    )
 }
 
 fn encode_float_rgba(
@@ -1537,6 +1598,8 @@ fn encode_float_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_xmp(config.xmp.clone())
+            .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
@@ -1550,6 +1613,8 @@ fn encode_float_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_xmp(config.xmp.clone())
+            .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
@@ -1584,6 +1649,8 @@ fn encode_float_gray(
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_xmp(config.xmp.clone())
+        .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
@@ -1754,11 +1821,13 @@ fn encode_with_context(
     );
     let codestream = w.into_bytes();
     let alpha_bits = config.alpha.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
-    Ok(finalize_container(
+    finalize_container(
         codestream,
         config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
         needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits),
-    ))
+    )
 }
 
 pub(crate) trait AsSignedInt {
@@ -1925,11 +1994,13 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     );
     let codestream = w.into_bytes();
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
-    Ok(finalize_container(
+    finalize_container(
         codestream,
         config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
         needs_level_10(max_bp as u32, true, alpha_bits),
-    ))
+    )
 }
 
 /// Write a single dimension using JXL's 4-bucket variable-length encoding.
@@ -1967,16 +2038,57 @@ pub(crate) fn needs_level_10(bits: u32, lossless: bool, alpha_bits: u32) -> bool
     (lossless && bits >= 16) || alpha_bits >= 16
 }
 
+fn push_container_box(out: &mut Vec<u8>, kind: &[u8; 4], contents: &[u8]) {
+    let size = 8u64 + contents.len() as u64;
+    if size <= u32::MAX as u64 {
+        out.extend_from_slice(&(size as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+    } else {
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(&(size + 8).to_be_bytes());
+    }
+    out.extend_from_slice(contents);
+}
+
+fn push_metadata_box(
+    out: &mut Vec<u8>,
+    kind: &[u8; 4],
+    contents: &[u8],
+    compressor: Option<&dyn BrotliCompression>,
+) -> Result<(), EncodeError> {
+    if let Some(compressor) = compressor {
+        let compressed = compressor.compress(contents)?;
+        let mut brob = Vec::with_capacity(4 + compressed.len());
+        brob.extend_from_slice(kind);
+        brob.extend_from_slice(&compressed);
+        push_container_box(out, b"brob", &brob);
+    } else {
+        push_container_box(out, kind, contents);
+    }
+    Ok(())
+}
+
 /// Wrap a bare codestream in a minimal JXL (ISO BMFF) container that declares
-/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc, [Exif].
+/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc, then
+/// optional metadata boxes.
 ///
 /// When `exif` is `Some`, an `Exif` box is appended after the codestream. Its
 /// payload is a 4-byte big-endian TIFF-header offset (0) followed by the raw
 /// EXIF/TIFF byte stream (the bytes that begin with the "II"/"MM" byte-order
-/// mark — *not* the JPEG "Exif\0\0" APP1 prefix).
-pub(crate) fn wrap_jxl_container(codestream: Vec<u8>, level: u8, exif: Option<&[u8]>) -> Vec<u8> {
+/// mark — *not* the JPEG "Exif\0\0" APP1 prefix). `xmp`, when present, is
+/// written as the payload of an `xml ` box. If `compressor` is supplied, EXIF
+/// and XMP are instead wrapped in Brotli-compressed `brob` boxes.
+pub(crate) fn wrap_jxl_container(
+    codestream: Vec<u8>,
+    level: u8,
+    exif: Option<&[u8]>,
+    xmp: Option<&[u8]>,
+    compressor: Option<&dyn BrotliCompression>,
+) -> Result<Vec<u8>, EncodeError> {
     let exif_extra = exif.map(|e| e.len() + 12).unwrap_or(0);
-    let mut out = Vec::with_capacity(codestream.len() + 41 + exif_extra);
+    let xmp_extra = xmp.map(|x| x.len() + 8).unwrap_or(0);
+    let mut out = Vec::with_capacity(codestream.len() + 41 + exif_extra + xmp_extra);
     // JXL signature box.
     out.extend_from_slice(&[
         0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
@@ -1988,42 +2100,39 @@ pub(crate) fn wrap_jxl_container(codestream: Vec<u8>, level: u8, exif: Option<&[
     ]);
     // jxll level box.
     out.extend_from_slice(&[0, 0, 0, 0x09, b'j', b'x', b'l', b'l', level]);
-    // jxlc codestream box (64-bit largesize form if it would overflow u32).
-    let payload = 8u64 + codestream.len() as u64;
-    if payload <= u32::MAX as u64 {
-        out.extend_from_slice(&(payload as u32).to_be_bytes());
-        out.extend_from_slice(b"jxlc");
-    } else {
-        out.extend_from_slice(&1u32.to_be_bytes()); // size == 1 → largesize follows
-        out.extend_from_slice(b"jxlc");
-        out.extend_from_slice(&(payload + 8).to_be_bytes());
-    }
-    out.extend_from_slice(&codestream);
+    push_container_box(&mut out, b"jxlc", &codestream);
     // Exif metadata box (after the codestream; libjxl convention).
     if let Some(e) = exif {
-        let content = 4u64 + e.len() as u64; // 4-byte offset + EXIF/TIFF data
-        let payload = 8u64 + content;
-        if payload <= u32::MAX as u64 {
-            out.extend_from_slice(&(payload as u32).to_be_bytes());
-            out.extend_from_slice(b"Exif");
-        } else {
-            out.extend_from_slice(&1u32.to_be_bytes());
-            out.extend_from_slice(b"Exif");
-            out.extend_from_slice(&(payload + 8).to_be_bytes());
-        }
-        out.extend_from_slice(&0u32.to_be_bytes()); // TIFF-header offset = 0
-        out.extend_from_slice(e);
+        let mut contents = Vec::with_capacity(4 + e.len());
+        contents.extend_from_slice(&0u32.to_be_bytes()); // TIFF-header offset = 0
+        contents.extend_from_slice(e);
+        push_metadata_box(&mut out, b"Exif", &contents, compressor)?;
     }
-    out
+    if let Some(x) = xmp {
+        push_metadata_box(&mut out, b"xml ", x, compressor)?;
+    }
+    Ok(out)
 }
 
 /// Decide final output form: wrap in a container when level 10 is required or
-/// when an EXIF box must be carried (a bare codestream cannot hold metadata).
-fn finalize_container(codestream: Vec<u8>, exif: Option<&[u8]>, need_l10: bool) -> Vec<u8> {
-    if need_l10 || exif.is_some() {
-        wrap_jxl_container(codestream, if need_l10 { 10 } else { 5 }, exif)
+/// when an EXIF/XMP box must be carried (a bare codestream cannot hold it).
+fn finalize_container(
+    codestream: Vec<u8>,
+    exif: Option<&[u8]>,
+    xmp: Option<&[u8]>,
+    compressor: Option<&dyn BrotliCompression>,
+    need_l10: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    if need_l10 || exif.is_some() || xmp.is_some() {
+        wrap_jxl_container(
+            codestream,
+            if need_l10 { 10 } else { 5 },
+            exif,
+            xmp,
+            compressor,
+        )
     } else {
-        codestream
+        Ok(codestream)
     }
 }
 
@@ -2259,6 +2368,85 @@ mod encode_smoke_tests {
 
     fn rgb8() -> Vec<u8> {
         (0..W * H * 3).map(|i| (i % 256) as u8).collect()
+    }
+
+    fn box_payload<'a>(container: &'a [u8], wanted: &[u8; 4]) -> Option<&'a [u8]> {
+        let mut pos = 0usize;
+        while pos + 8 <= container.len() {
+            let small = u32::from_be_bytes(container[pos..pos + 4].try_into().unwrap()) as usize;
+            let kind: &[u8; 4] = container[pos + 4..pos + 8].try_into().unwrap();
+            let (header, size) = if small == 1 {
+                if pos + 16 > container.len() {
+                    return None;
+                }
+                (
+                    16,
+                    u64::from_be_bytes(container[pos + 8..pos + 16].try_into().unwrap()) as usize,
+                )
+            } else {
+                (8, small)
+            };
+            if size < header || pos.checked_add(size)? > container.len() {
+                return None;
+            }
+            if kind == wanted {
+                return Some(&container[pos + header..pos + size]);
+            }
+            pos += size;
+        }
+        None
+    }
+
+    #[test]
+    fn xmp_is_written_to_an_xml_box() {
+        let xmp = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+        let encoded = encode_image(&rgb8(), W, H, &lossy().with_xmp(xmp.to_vec())).unwrap();
+        assert_eq!(box_payload(&encoded, b"xml "), Some(xmp.as_slice()));
+    }
+
+    #[test]
+    fn custom_brotli_writes_brob_metadata() {
+        struct MarkerCompressor;
+        impl BrotliCompression for MarkerCompressor {
+            fn compress(&self, data: &[u8]) -> Result<Vec<u8>, EncodeError> {
+                assert_eq!(data, b"<x:xmpmeta/>");
+                Ok(vec![0xAA, 0xBB])
+            }
+        }
+
+        let encoded = encode_image(
+            &rgb8(),
+            W,
+            H,
+            &lossy()
+                .with_xmp(b"<x:xmpmeta/>".to_vec())
+                .with_brotli_compression(Box::new(MarkerCompressor)),
+        )
+        .unwrap();
+        assert_eq!(box_payload(&encoded, b"brob"), Some(&b"xml \xAA\xBB"[..]));
+        assert!(box_payload(&encoded, b"xml ").is_none());
+    }
+
+    #[test]
+    fn custom_brotli_error_is_returned() {
+        struct FailingCompressor;
+        impl BrotliCompression for FailingCompressor {
+            fn compress(&self, _data: &[u8]) -> Result<Vec<u8>, EncodeError> {
+                Err(EncodeError::Brotli("backend failed".into()))
+            }
+        }
+
+        assert_eq!(
+            encode_image(
+                &rgb8(),
+                W,
+                H,
+                &lossy()
+                    .with_xmp(b"<x:xmpmeta/>".to_vec())
+                    .with_brotli_compression(Box::new(FailingCompressor)),
+            ),
+            Err(EncodeError::Brotli("backend failed".into()))
+        );
     }
 
     fn rgba8() -> Vec<u8> {

@@ -881,8 +881,9 @@ pub(crate) fn write_compact_block_context_map(
 ) {
     let empty_codes: [crate::entropy::PrefixCode; 0] = [];
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_histograms = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
         context_map: compact_block_context_map(),
         num_contexts: compact_block_context_map().len(),
@@ -892,8 +893,9 @@ pub(crate) fn write_compact_block_context_map(
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code: true,
-        ans_freqs: &empty_freqs,
+        ans_histograms: &empty_histograms,
         ans_symbols: &empty_syms,
+        ans_reverse_maps: &empty_reverse_maps,
     };
     crate::entropy::write_context_map(&cm_entropy, huffman_pool, w);
 }
@@ -962,8 +964,9 @@ fn write_block_ctx_map(
     let entries = plan.ctx_map_entries();
     let empty_codes: [crate::entropy::PrefixCode; 0] = [];
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_histograms = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
         context_map: &entries,
         num_contexts: entries.len(),
@@ -973,8 +976,9 @@ fn write_block_ctx_map(
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code: true,
-        ans_freqs: &empty_freqs,
+        ans_histograms: &empty_histograms,
         ans_symbols: &empty_syms,
+        ans_reverse_maps: &empty_reverse_maps,
     };
     crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
 }
@@ -1733,7 +1737,7 @@ fn encode_frame_core(
     );
     let tree_static = DcTreeChoice::Static(dc_gradient);
 
-    let (dc_tokens_per_group, meta_tokens_per_group, dc_code_owned, dc_tree) = if ctx.speed
+    let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree) = if ctx.speed
         == Speed::Fastest
     {
         (
@@ -1848,6 +1852,17 @@ fn encode_frame_core(
             )
         }
     };
+    if ctx.speed == Speed::Slow {
+        crate::entropy::refine_ans_clusters(
+            &mut dc_code_owned,
+            dc_tokens_per_group
+                .iter()
+                .map(Vec::as_slice)
+                .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
+            &ctx.thread_pool,
+            scratch,
+        );
+    }
     let dc_code = dc_code_owned.as_ref();
 
     // Per-image AC block-context plan: keep quant-field splits only where the
@@ -1916,7 +1931,7 @@ fn encode_frame_core(
             });
     };
 
-    let (ac_plan, ac_code_per_pass) = if ctx.speed != Speed::Slow {
+    let (ac_plan, mut ac_code_per_pass) = if ctx.speed != Speed::Slow {
         remap_tokens(&mut all_pending, &baseline, scratch);
         let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
         (baseline, codes)
@@ -1972,6 +1987,19 @@ fn encode_frame_core(
             }
         }
     };
+
+    if ctx.speed == Speed::Slow {
+        for (pass, code) in ac_code_per_pass.iter_mut().enumerate() {
+            crate::entropy::refine_ans_clusters(
+                code,
+                all_pending
+                    .iter()
+                    .map(|pending| pending.tokens[pass].as_slice()),
+                &ctx.thread_pool,
+                scratch,
+            );
+        }
+    }
 
     let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
 
@@ -2054,6 +2082,7 @@ fn encode_frame_core(
                     &dc_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.ans_reverse_maps,
                     dc_code.hybrid_uint_configs,
                     &mut w,
                 );
@@ -2079,6 +2108,7 @@ fn encode_frame_core(
                     &meta_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.ans_reverse_maps,
                     dc_code.hybrid_uint_configs,
                     &mut w,
                 );
@@ -2131,6 +2161,7 @@ fn encode_frame_core(
                         pass_tokens,
                         code_ref.context_map,
                         code_ref.ans_symbols,
+                        code_ref.ans_reverse_maps,
                         code_ref.hybrid_uint_configs,
                         &mut w,
                     );

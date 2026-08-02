@@ -135,6 +135,8 @@ pub enum EncodeError {
     UnsupportedColorSpace(ColorSpace),
     /// The input JPEG could not be transcoded losslessly.
     Jpeg(String),
+    /// A caller-provided Brotli backend could not compress metadata.
+    Brotli(String),
 }
 
 impl fmt::Display for EncodeError {
@@ -180,6 +182,7 @@ impl fmt::Display for EncodeError {
                 write!(f, "input length {} != expected {}", got, expected)
             }
             Self::Jpeg(msg) => write!(f, "JPEG transcoding failed: {msg}"),
+            Self::Brotli(msg) => write!(f, "Brotli compression failed: {msg}"),
             EncodeError::UnsupportedColorSpace(colorspace) => {
                 f.write_fmt(format_args!("unsupported color space: {:?}", colorspace))
             }

@@ -28,6 +28,7 @@
  */
 
 use crate::adaptive_quant::AqMapScratch;
+use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
     ALPHABET_SIZE, CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig,
     PrefixCode,
@@ -76,6 +77,124 @@ impl Default for LzEntropyScratch {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct QuantRefinement {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cov_x: usize,
+    pub(crate) cov_y: usize,
+    pub(crate) q: u8,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CachedQuantCost {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cost: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RerankDowngrade {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cov_x: usize,
+    pub(crate) cov_y: usize,
+}
+
+pub(crate) struct AcStrategyBandScratch {
+    pub(crate) strategy: AcStrategyImage,
+    pub(crate) benefit: f32,
+    pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
+    pub(crate) current_costs: Vec<CachedQuantCost>,
+    pub(crate) quant_refinements: Vec<QuantRefinement>,
+}
+
+impl Default for AcStrategyBandScratch {
+    fn default() -> Self {
+        Self {
+            strategy: AcStrategyImage::new(0, 0),
+            benefit: 0.0,
+            rerank_downgrades: Vec::new(),
+            current_costs: Vec::new(),
+            quant_refinements: Vec::new(),
+        }
+    }
+}
+
+impl AcStrategyBandScratch {
+    fn prepare_selection(&mut self, xsize: usize, ysize: usize) {
+        if self.strategy.xsize() == xsize && self.strategy.ysize() == ysize {
+            self.strategy.reset();
+        } else {
+            self.strategy = AcStrategyImage::new(xsize, ysize);
+        }
+        self.benefit = 0.0;
+    }
+
+    fn clear(&mut self) {
+        self.benefit = 0.0;
+        self.rerank_downgrades.clear();
+        self.current_costs.clear();
+        self.quant_refinements.clear();
+    }
+
+    fn prepare_rerank(&mut self, max_blocks: usize) {
+        self.rerank_downgrades.clear();
+        self.current_costs.clear();
+        if self.rerank_downgrades.capacity() < max_blocks {
+            self.rerank_downgrades.reserve(max_blocks);
+        }
+        if self.current_costs.capacity() < max_blocks {
+            self.current_costs.reserve(max_blocks);
+        }
+    }
+
+    fn prepare_refinement(&mut self, max_blocks: usize) {
+        self.quant_refinements.clear();
+        if self.quant_refinements.capacity() < max_blocks {
+            self.quant_refinements.reserve(max_blocks);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AcStrategyPipelineScratch {
+    pub(crate) bands: Vec<(usize, usize)>,
+    pub(crate) band_scratch: Vec<AcStrategyBandScratch>,
+    pub(crate) current_costs: Vec<f32>,
+}
+
+impl AcStrategyPipelineScratch {
+    pub(crate) fn prepare_bands(&mut self, xsize: usize, ysize: usize, parallel_selection: bool) {
+        if self.band_scratch.len() < self.bands.len() {
+            self.band_scratch
+                .resize_with(self.bands.len(), AcStrategyBandScratch::default);
+        }
+        for band in &mut self.band_scratch[..self.bands.len()] {
+            band.clear();
+            if parallel_selection {
+                band.prepare_selection(xsize, ysize);
+            }
+        }
+    }
+
+    pub(crate) fn prepare_rerank(&mut self, xsize: usize, ysize: usize) {
+        for (band, &(y0, y1)) in self.band_scratch.iter_mut().zip(&self.bands) {
+            band.prepare_rerank(xsize * (y1 - y0));
+        }
+        let blocks = xsize * ysize;
+        if self.current_costs.len() != blocks {
+            self.current_costs.resize(blocks, f32::NAN);
+        }
+    }
+
+    pub(crate) fn prepare_refinement(&mut self, xsize: usize) {
+        for (band, &(y0, y1)) in self.band_scratch.iter_mut().zip(&self.bands) {
+            band.prepare_refinement(xsize * (y1 - y0));
+        }
+    }
+}
+
 /// Fixed-layout reusable storage owned by one encoder worker.
 pub(crate) struct CoderScratch {
     pub(crate) aq_map: AqMapScratch,
@@ -94,6 +213,7 @@ pub(crate) struct CoderScratch {
     pub(crate) order0_entropy: Vec<u64>,
     pub(crate) threshold: PickThresholdScratch,
     pub(crate) dct8_costs: Vec<f32>,
+    pub(crate) ac_strategy: AcStrategyPipelineScratch,
     pub(crate) dc_cfl_cur: Vec<i32>,
     pub(crate) dc_cfl_prev: Vec<i32>,
     pub(crate) dc_predictor: DcPredictorScratch,
@@ -128,6 +248,7 @@ impl Default for CoderScratch {
                 hist_scratch: vec![0; 3 * 1025],
             },
             dct8_costs: Vec::new(),
+            ac_strategy: AcStrategyPipelineScratch::default(),
             dc_cfl_cur: Vec::new(),
             dc_cfl_prev: Vec::new(),
             dc_predictor: DcPredictorScratch::default(),

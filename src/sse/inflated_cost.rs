@@ -70,28 +70,24 @@ pub(crate) fn error_gradient_energy_sse41(error: &[f32], width: usize, height: u
     for row in rows.clone() {
         let (row4, row_tail) = row.as_chunks::<4>();
         if row_tail.is_empty() {
-            for (chunk, left) in row4.iter().enumerate() {
-                let left = unsafe { _mm_loadu_ps(left.as_ptr()) };
-                let right = if chunk + 1 == row4.len() {
-                    _mm_shuffle_ps::<249>(left, left)
-                } else {
-                    unsafe { _mm_loadu_ps(row.as_ptr().add(chunk * 4 + 1)) }
-                };
-                sum = accumulate_gradient_vectors_x4(left, right, sum);
+            let (right4, _) = row[1..].as_chunks::<4>();
+            for (left, right) in row4.iter().zip(right4) {
+                sum = accumulate_gradient_x4(left, right, sum);
             }
+            let left = unsafe { _mm_loadu_ps(row4.last().unwrap().as_ptr()) };
+            sum = accumulate_gradient_vectors_x4(left, _mm_shuffle_ps::<249>(left, left), sum);
             continue;
         }
         let (left4, tail) = row[..width - 1].as_chunks::<4>();
-        for (chunk, left) in left4.iter().enumerate() {
-            let right = row[chunk * 4 + 1..].first_chunk::<4>().unwrap();
+        let (right4, right_tail) = row[1..].as_chunks::<4>();
+        for (left, right) in left4.iter().zip(right4) {
             sum = accumulate_gradient_x4(left, right, sum);
         }
         if !tail.is_empty() {
-            let offset = left4.len() * 4;
             let mut left = [0.0; 4];
             let mut right = [0.0; 4];
             left[..tail.len()].copy_from_slice(tail);
-            right[..tail.len()].copy_from_slice(&row[offset + 1..width]);
+            right[..right_tail.len()].copy_from_slice(right_tail);
             sum = accumulate_gradient_x4(&left, &right, sum);
         }
     }

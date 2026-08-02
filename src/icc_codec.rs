@@ -308,8 +308,10 @@ fn build_icc_code(
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
-        ans_freqs: Vec::new(),
+        ans_histograms: Vec::new(),
+        ans_pricing_freqs: Vec::new(),
         ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
     };
     for pc in &mut code.prefix_codes {
         single_symbol_patch(pc);

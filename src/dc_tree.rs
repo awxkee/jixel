@@ -202,15 +202,17 @@ const NUM_SYMBOLS: usize = crate::entropy::ALPHABET_SIZE;
 
 struct CellStats {
     /// Indexed [arm][channel][bin]: symbol counts plus raw extra bits.
-    counts: Vec<[u32; NUM_SYMBOLS]>,
+    counts: Vec<[u64; NUM_SYMBOLS]>,
     extra: Vec<u64>,
+    total: Vec<u64>,
 }
 
 impl CellStats {
     fn new() -> Self {
         CellStats {
-            counts: vec![[0u32; NUM_SYMBOLS]; 2 * NUM_CHANNELS * NUM_ERR_BINS],
+            counts: vec![[0u64; NUM_SYMBOLS]; 2 * NUM_CHANNELS * NUM_ERR_BINS],
             extra: vec![0u64; 2 * NUM_CHANNELS * NUM_ERR_BINS],
+            total: vec![0u64; 2 * NUM_CHANNELS * NUM_ERR_BINS],
         }
     }
     #[inline]
@@ -224,6 +226,46 @@ impl CellStats {
         let slot = Self::slot(arm, (prop >> 10) as usize, (prop & 1023) as usize);
         self.counts[slot][sym as usize] += 1;
         self.extra[slot] += u64::from(nbits);
+        self.total[slot] += 1;
+    }
+    fn make_prefix_sums(&mut self) {
+        for arm in 0..2 {
+            for ch in 0..NUM_CHANNELS {
+                let mut counts = [0u64; NUM_SYMBOLS];
+                let mut extra = 0u64;
+                let mut total = 0u64;
+                for bin in 0..NUM_ERR_BINS {
+                    let slot = Self::slot(arm, ch, bin);
+                    for (sum, value) in counts.iter_mut().zip(&mut self.counts[slot]) {
+                        *sum += *value;
+                        *value = *sum;
+                    }
+                    extra += self.extra[slot];
+                    self.extra[slot] = extra;
+                    total += self.total[slot];
+                    self.total[slot] = total;
+                }
+            }
+        }
+    }
+    #[inline]
+    fn range_total(&self, arm: usize, ch: usize, bins: &std::ops::Range<usize>) -> u64 {
+        debug_assert!(!bins.is_empty());
+        let high = self.total[Self::slot(arm, ch, bins.end - 1)];
+        if bins.start == 0 {
+            high
+        } else {
+            high - self.total[Self::slot(arm, ch, bins.start - 1)]
+        }
+    }
+    #[inline]
+    fn bin_total(&self, arm: usize, ch: usize, bin: usize) -> u64 {
+        let current = self.total[Self::slot(arm, ch, bin)];
+        if bin == 0 {
+            current
+        } else {
+            current - self.total[Self::slot(arm, ch, bin - 1)]
+        }
     }
 }
 
@@ -238,16 +280,27 @@ impl BoxHist {
     fn gather(stats: &CellStats, arm: usize, b: &LearnBox) -> Self {
         let mut counts = [0u64; NUM_SYMBOLS];
         let mut extra = 0u64;
+        let mut total = 0u64;
         for ch in b.ch.clone() {
-            for bin in b.bins.clone() {
-                let slot = CellStats::slot(arm, ch, bin);
-                for (dst, src) in counts.iter_mut().zip(&stats.counts[slot]) {
-                    *dst += u64::from(*src);
+            let high_slot = CellStats::slot(arm, ch, b.bins.end - 1);
+            if b.bins.start == 0 {
+                for (dst, &high) in counts.iter_mut().zip(&stats.counts[high_slot]) {
+                    *dst += high;
                 }
-                extra += stats.extra[slot];
+                extra += stats.extra[high_slot];
+            } else {
+                let low_slot = CellStats::slot(arm, ch, b.bins.start - 1);
+                for ((dst, &high), &low) in counts
+                    .iter_mut()
+                    .zip(&stats.counts[high_slot])
+                    .zip(&stats.counts[low_slot])
+                {
+                    *dst += high - low;
+                }
+                extra += stats.extra[high_slot] - stats.extra[low_slot];
             }
+            total += stats.range_total(arm, ch, &b.bins);
         }
-        let total = counts.iter().sum();
         BoxHist {
             counts,
             extra,
@@ -345,15 +398,7 @@ fn learn_subtree(stats: &CellStats, b: LearnBox, leaves_left: &mut usize) -> Nod
     // Boundary B means "> splitval" side = bins >= B, so splitval = B - 513.
     let mut cum = vec![0u64; b.bins.len() + 1];
     for (k, bin) in b.bins.clone().enumerate() {
-        let n: u64 =
-            b.ch.clone()
-                .map(|ch| {
-                    stats.counts[CellStats::slot(0, ch, bin)]
-                        .iter()
-                        .map(|&c| u64::from(c))
-                        .sum::<u64>()
-                })
-                .sum();
+        let n: u64 = b.ch.clone().map(|ch| stats.bin_total(0, ch, bin)).sum();
         cum[k + 1] = cum[k] + n;
     }
     let total = *cum.last().unwrap();
@@ -448,6 +493,7 @@ pub(crate) fn learn_dc_tree(
             stats.add(1, p, g.value);
         }
     }
+    stats.make_prefix_sums();
 
     let mut leaves_left = MAX_DC_LEAVES;
     let dc_root = learn_subtree(
@@ -824,6 +870,66 @@ fn refine_leaf(
 mod tests {
     use super::*;
     use crate::static_entropy_codes::K_GRADIENT_CONTEXT_LUT;
+
+    #[test]
+    fn prefix_histograms_match_direct_ranges() {
+        let mut stats = CellStats::new();
+        for arm in 0..2 {
+            for ch in 0..NUM_CHANNELS {
+                for bin in [0, 1, 17, 511, 512, 900, 1023] {
+                    for i in 0..=(arm + ch + bin % 3) {
+                        stats.add(arm, dc_prop(ch, bin), (bin + 31 * i + 7 * ch) as u32);
+                    }
+                }
+            }
+        }
+
+        let boxes = [
+            LearnBox {
+                ch: 0..NUM_CHANNELS,
+                bins: 0..NUM_ERR_BINS,
+            },
+            LearnBox {
+                ch: 1..3,
+                bins: 1..513,
+            },
+            LearnBox {
+                ch: 0..1,
+                bins: 512..1024,
+            },
+        ];
+        let stats_ref = &stats;
+        let expected: Vec<_> = (0..2)
+            .flat_map(|arm| {
+                boxes.iter().map(move |b| {
+                    let mut counts = [0u64; NUM_SYMBOLS];
+                    let mut extra = 0u64;
+                    for ch in b.ch.clone() {
+                        for bin in b.bins.clone() {
+                            let slot = CellStats::slot(arm, ch, bin);
+                            for (dst, &src) in counts.iter_mut().zip(&stats_ref.counts[slot]) {
+                                *dst += src;
+                            }
+                            extra += stats_ref.extra[slot];
+                        }
+                    }
+                    let total = counts.iter().sum();
+                    (counts, extra, total)
+                })
+            })
+            .collect();
+
+        stats.make_prefix_sums();
+        for ((arm, b), (counts, extra, total)) in (0..2)
+            .flat_map(|arm| boxes.iter().map(move |b| (arm, b)))
+            .zip(expected)
+        {
+            let actual = BoxHist::gather(&stats, arm, b);
+            assert_eq!(actual.counts, counts);
+            assert_eq!(actual.extra, extra);
+            assert_eq!(actual.total, total);
+        }
+    }
 
     /// Parser and serializer must reproduce the static blob token-exactly;
     /// this pins every convention (BFS order, child order, token grammar).

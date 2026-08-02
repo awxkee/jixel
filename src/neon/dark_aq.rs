@@ -1,76 +1,174 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 8/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 use std::arch::aarch64::*;
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn add_x4(sum: float32x4_t, row: &[f32], x: usize) -> float32x4_t {
+    vaddq_f32(sum, unsafe { vld1q_f32(row.as_ptr().add(x)) })
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_tail(row: &[f32], x: usize, n: usize) -> float32x4_t {
+    let value = vsetq_lane_f32::<0>(row[x], vdupq_n_f32(0.0));
+    let value = if n > 1 {
+        vsetq_lane_f32::<1>(row[x + 1], value)
+    } else {
+        value
+    };
+    if n > 2 {
+        vsetq_lane_f32::<2>(row[x + 2], value)
+    } else {
+        value
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn sum_rows(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+    let groups = w / 16;
+    let full_tail = w % 16 / 4;
+    let remainder = w % 4;
     for row in buf.chunks_exact(stride).take(h) {
-        let (chunks, tail) = row[..w].as_chunks::<4>();
-        for (i, chunk) in chunks.iter().enumerate() {
-            sums[i & 3] = vaddq_f32(sums[i & 3], unsafe { vld1q_f32(chunk.as_ptr()) });
+        for group in 0..groups {
+            let x = group * 16;
+            sum0 = add_x4(sum0, row, x);
+            sum1 = add_x4(sum1, row, x + 4);
+            sum2 = add_x4(sum2, row, x + 8);
+            sum3 = add_x4(sum3, row, x + 12);
         }
-        if !tail.is_empty() {
-            let mut padded = [0.0; 4];
-            padded[..tail.len()].copy_from_slice(tail);
-            let lane = chunks.len() & 3;
-            sums[lane] = vaddq_f32(sums[lane], unsafe { vld1q_f32(padded.as_ptr()) });
+        let mut x = groups * 16;
+        if full_tail > 0 {
+            sum0 = add_x4(sum0, row, x);
+            x += 4;
+        }
+        if full_tail > 1 {
+            sum1 = add_x4(sum1, row, x);
+            x += 4;
+        }
+        if full_tail > 2 {
+            sum2 = add_x4(sum2, row, x);
+            x += 4;
+        }
+        if remainder != 0 {
+            let tail = load_tail(row, x, remainder);
+            match full_tail {
+                0 => sum0 = vaddq_f32(sum0, tail),
+                1 => sum1 = vaddq_f32(sum1, tail),
+                2 => sum2 = vaddq_f32(sum2, tail),
+                _ => sum3 = vaddq_f32(sum3, tail),
+            }
         }
     }
-    let sum = vaddq_f32(vaddq_f32(sums[0], sums[1]), vaddq_f32(sums[2], sums[3]));
+    let sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     vaddvq_f32(sum)
 }
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn laplacian_abs_x4(
+    sum: float32x4_t,
+    top: &[f32],
+    middle: &[f32],
+    bottom: &[f32],
+    x: usize,
+) -> float32x4_t {
+    let up = unsafe { vld1q_f32(top.as_ptr().add(x)) };
+    let down = unsafe { vld1q_f32(bottom.as_ptr().add(x)) };
+    let left = unsafe { vld1q_f32(middle.as_ptr().add(x - 1)) };
+    let center = unsafe { vld1q_f32(middle.as_ptr().add(x)) };
+    let right = unsafe { vld1q_f32(middle.as_ptr().add(x + 1)) };
+    let neighbors = vaddq_f32(vaddq_f32(up, down), vaddq_f32(left, right));
+    vaddq_f32(
+        sum,
+        vabsq_f32(vsubq_f32(vmulq_n_f32(center, 4.0), neighbors)),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn laplacian_abs_sum(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
     let interior = w - 2;
+    let groups = interior / 16;
+    let full_tail = interior % 16 / 4;
+    let remainder = interior % 4;
     for y in 1..h - 1 {
         let top = &buf[(y - 1) * stride..];
         let middle = &buf[y * stride..];
         let bottom = &buf[(y + 1) * stride..];
-        let full = interior / 4;
-        for chunk in 0..full {
-            let x = 1 + chunk * 4;
-            let up = unsafe { vld1q_f32(top.as_ptr().add(x)) };
-            let down = unsafe { vld1q_f32(bottom.as_ptr().add(x)) };
-            let left = unsafe { vld1q_f32(middle.as_ptr().add(x - 1)) };
-            let center = unsafe { vld1q_f32(middle.as_ptr().add(x)) };
-            let right = unsafe { vld1q_f32(middle.as_ptr().add(x + 1)) };
-            let neighbors = vaddq_f32(vaddq_f32(up, down), vaddq_f32(left, right));
-            let lane = chunk & 3;
-            sums[lane] = vaddq_f32(
-                sums[lane],
-                vabsq_f32(vsubq_f32(vmulq_n_f32(center, 4.0), neighbors)),
-            );
+        for group in 0..groups {
+            let x = 1 + group * 16;
+            sum0 = laplacian_abs_x4(sum0, top, middle, bottom, x);
+            sum1 = laplacian_abs_x4(sum1, top, middle, bottom, x + 4);
+            sum2 = laplacian_abs_x4(sum2, top, middle, bottom, x + 8);
+            sum3 = laplacian_abs_x4(sum3, top, middle, bottom, x + 12);
         }
-        let remainder = interior % 4;
+        let mut x = 1 + groups * 16;
+        if full_tail > 0 {
+            sum0 = laplacian_abs_x4(sum0, top, middle, bottom, x);
+            x += 4;
+        }
+        if full_tail > 1 {
+            sum1 = laplacian_abs_x4(sum1, top, middle, bottom, x);
+            x += 4;
+        }
+        if full_tail > 2 {
+            sum2 = laplacian_abs_x4(sum2, top, middle, bottom, x);
+            x += 4;
+        }
         if remainder != 0 {
-            let x = 1 + full * 4;
-            let mut up = [0.0; 4];
-            let mut down = [0.0; 4];
-            let mut left = [0.0; 4];
-            let mut center = [0.0; 4];
-            let mut right = [0.0; 4];
-            up[..remainder].copy_from_slice(&top[x..x + remainder]);
-            down[..remainder].copy_from_slice(&bottom[x..x + remainder]);
-            left[..remainder].copy_from_slice(&middle[x - 1..x - 1 + remainder]);
-            center[..remainder].copy_from_slice(&middle[x..x + remainder]);
-            right[..remainder].copy_from_slice(&middle[x + 1..x + 1 + remainder]);
-            let up = unsafe { vld1q_f32(up.as_ptr()) };
-            let down = unsafe { vld1q_f32(down.as_ptr()) };
-            let left = unsafe { vld1q_f32(left.as_ptr()) };
-            let center = unsafe { vld1q_f32(center.as_ptr()) };
-            let right = unsafe { vld1q_f32(right.as_ptr()) };
-            let neighbors = vaddq_f32(vaddq_f32(up, down), vaddq_f32(left, right));
-            let lane = full & 3;
-            sums[lane] = vaddq_f32(
-                sums[lane],
-                vabsq_f32(vsubq_f32(vmulq_n_f32(center, 4.0), neighbors)),
+            let neighbors = vaddq_f32(
+                load_tail(top, x, remainder),
+                load_tail(bottom, x, remainder),
             );
+            let neighbors = vaddq_f32(neighbors, load_tail(middle, x - 1, remainder));
+            let neighbors = vaddq_f32(neighbors, load_tail(middle, x + 1, remainder));
+            let center = load_tail(middle, x, remainder);
+            let lap = vabsq_f32(vsubq_f32(vmulq_n_f32(center, 4.0), neighbors));
+            match full_tail {
+                0 => sum0 = vaddq_f32(sum0, lap),
+                1 => sum1 = vaddq_f32(sum1, lap),
+                2 => sum2 = vaddq_f32(sum2, lap),
+                _ => sum3 = vaddq_f32(sum3, lap),
+            }
         }
     }
-    let sum = vaddq_f32(vaddq_f32(sums[0], sums[1]), vaddq_f32(sums[2], sums[3]));
+    let sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     vaddvq_f32(sum)
 }
 
