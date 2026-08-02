@@ -38,6 +38,7 @@ pub(crate) use parse::{JpegError, parse_jpeg};
 use std::num::NonZeroUsize;
 
 use crate::util::EncodeError;
+pub use brotli::BrotliCompression;
 
 /// Appends an ISOBMFF box with the given type and payload.
 fn push_box(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
@@ -91,8 +92,24 @@ fn extract_icc(jpg: &JpegData) -> Option<Vec<u8>> {
     (!profile.is_empty()).then_some(profile)
 }
 
+/// Extracts the first standard XMP APP1 segment.
+///
+/// Returns both its index in `app_data` (for JPEG reconstruction tagging) and
+/// the XML packet without the JPEG XMP namespace prefix.
+fn extract_xmp(jpg: &JpegData) -> Option<(usize, Vec<u8>)> {
+    const TAG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    jpg.app_data.iter().enumerate().find_map(|(index, app)| {
+        if app.first() != Some(&0xE1) || app.len() < 3 + TAG.len() {
+            return None;
+        }
+        let payload = &app[3..];
+        payload
+            .starts_with(TAG)
+            .then(|| (index, payload[TAG.len()..].to_vec()))
+    })
+}
+
 /// Options for [`encode_jpeg_lossless_with_config`].
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JpegTranscodeConfig {
     /// Whether to embed the data needed to rebuild the original JPEG bytes.
     ///
@@ -102,6 +119,24 @@ pub struct JpegTranscodeConfig {
     ///
     /// See [`Self::with_num_threads`].
     pub num_threads: usize,
+    /// Optional Brotli implementation for JPEG reconstruction data.
+    ///
+    /// When absent, Jixel emits a conforming stored-block (uncompressed)
+    /// Brotli stream and does not require a Brotli dependency.
+    pub brotli_compression: Option<Box<dyn BrotliCompression>>,
+}
+
+impl std::fmt::Debug for JpegTranscodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JpegTranscodeConfig")
+            .field("jpeg_reconstruction", &self.jpeg_reconstruction)
+            .field("num_threads", &self.num_threads)
+            .field(
+                "brotli_compression",
+                &self.brotli_compression.as_ref().map(|_| "custom"),
+            )
+            .finish()
+    }
 }
 
 impl Default for JpegTranscodeConfig {
@@ -111,6 +146,7 @@ impl Default for JpegTranscodeConfig {
             num_threads: std::thread::available_parallelism()
                 .unwrap_or(NonZeroUsize::new(1).unwrap())
                 .get(),
+            brotli_compression: None,
         }
     }
 }
@@ -125,6 +161,12 @@ impl JpegTranscodeConfig {
     /// Sets the number of worker threads, which does not affect the output.
     pub fn with_num_threads(mut self, threads: usize) -> Self {
         self.num_threads = threads.max(1);
+        self
+    }
+
+    /// Uses a caller-provided Brotli encoder for JPEG reconstruction data.
+    pub fn with_brotli_compression(mut self, compressor: Box<dyn BrotliCompression>) -> Self {
+        self.brotli_compression = Some(compressor);
         self
     }
 }
@@ -144,16 +186,20 @@ pub fn encode_jpeg_lossless_with_config(
     // Embedded in the codestream either way: without it, dropping the `jbrd`
     // box would silently discard the profile and leave the image mislabeled.
     let icc = extract_icc(&parsed);
+    let xmp = extract_xmp(&parsed);
     let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref(), config.num_threads)
         .map_err(|e| EncodeError::Jpeg(e.to_string()))?;
 
     if !config.jpeg_reconstruction {
-        // Nothing needs a container, so emit the bare codestream.
+        // Dropping reconstruction also drops container-only JPEG metadata.
         return Ok(codestream);
     }
 
-    let reconstruction =
-        jbrd::encode_jbrd(&parsed).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    let reconstruction = jbrd::encode_jbrd(
+        &parsed,
+        xmp.as_ref().map(|(index, _)| *index),
+        config.brotli_compression.as_deref(),
+    )?;
     let mut out = Vec::with_capacity(codestream.len() + reconstruction.len() + 64);
     out.extend_from_slice(&[
         0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
@@ -166,6 +212,9 @@ pub fn encode_jpeg_lossless_with_config(
     // The reconstruction data has to precede the codestream box.
     push_box(&mut out, b"jbrd", &reconstruction);
     push_box(&mut out, b"jxlc", &codestream);
+    if let Some((_, xmp)) = xmp {
+        push_box(&mut out, b"xml ", &xmp);
+    }
     Ok(out)
 }
 
@@ -341,6 +390,15 @@ mod tests {
         seg
     }
 
+    fn xmp_app1(body: &[u8]) -> Vec<u8> {
+        let mut payload = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        payload.extend_from_slice(body);
+        let mut seg = vec![0xE1u8];
+        seg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        seg.extend_from_slice(&payload);
+        seg
+    }
+
     fn with_app(segments: Vec<Vec<u8>>) -> JpegData {
         JpegData {
             app_data: segments,
@@ -388,8 +446,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_the_first_standard_xmp_packet() {
+        let jpg = with_app(vec![
+            vec![0xE1, 0, 5, b'n', b'o', b'p'],
+            xmp_app1(b"<x:xmpmeta>first</x:xmpmeta>"),
+            xmp_app1(b"<x:xmpmeta>second</x:xmpmeta>"),
+        ]);
+        let (index, xmp) = extract_xmp(&jpg).expect("XMP packet");
+        assert_eq!(index, 1);
+        assert_eq!(xmp, b"<x:xmpmeta>first</x:xmpmeta>");
+    }
+
+    #[test]
     fn reconstruction_is_on_by_default() {
-        assert!(JpegTranscodeConfig::default().jpeg_reconstruction);
+        let default = JpegTranscodeConfig::default();
+        assert!(default.jpeg_reconstruction);
+        assert!(default.brotli_compression.is_none());
         assert!(
             !JpegTranscodeConfig::default()
                 .with_jpeg_reconstruction(false)

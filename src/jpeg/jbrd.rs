@@ -29,9 +29,10 @@
 
 //! Serialization of the `jbrd` (JPEG bitstream reconstruction data) box.
 
-use super::brotli::brotli_store;
+use super::brotli::{BrotliCompression, compress};
 use super::{HUFF_ALPHABET_SIZE, HUFF_MAX_BIT_LENGTH, JpegData, JpegError};
 use crate::bit_writer::BitWriter;
+use crate::util::EncodeError;
 
 /// One branch of a `U32Enc` distribution.
 #[derive(Clone, Copy)]
@@ -107,14 +108,22 @@ const TYPE_RGB: u64 = 2;
 const TYPE_CUSTOM: u64 = 3;
 
 /// Serializes `jpg` into a complete `jbrd` box payload.
-pub(crate) fn encode_jbrd(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
-    let mut out = encode_fields(jpg)?;
+pub(crate) fn encode_jbrd(
+    jpg: &JpegData,
+    xmp_app_index: Option<usize>,
+    compressor: Option<&dyn BrotliCompression>,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut out =
+        encode_fields(jpg, xmp_app_index).map_err(|error| EncodeError::Jpeg(error.to_string()))?;
 
     // Order is fixed: unknown-typed APP segments, then COM, then inter-marker
-    // chunks, then the tail. Since every APP segment is tagged kUnknown by
-    // `encode_fields`, all of them are included here.
+    // chunks, then the tail. The tagged XMP segment is supplied by the `xml `
+    // container box instead and is therefore omitted here.
     let mut payload = Vec::new();
-    for app in &jpg.app_data {
+    for (index, app) in jpg.app_data.iter().enumerate() {
+        if Some(index) == xmp_app_index {
+            continue;
+        }
         payload.extend_from_slice(app);
     }
     for com in &jpg.com_data {
@@ -125,13 +134,13 @@ pub(crate) fn encode_jbrd(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
     }
     payload.extend_from_slice(&jpg.tail_data);
 
-    out.extend_from_slice(&brotli_store(&payload));
+    out.extend_from_slice(&compress(&payload, compressor)?);
     Ok(out)
 }
 
 /// Emits the bit-packed field section, zero-padded to a byte boundary. Kept
 /// separate so it can be diffed against libjxl's, whose Brotli tail differs.
-fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
+fn encode_fields(jpg: &JpegData, xmp_app_index: Option<usize>) -> Result<Vec<u8>, JpegError> {
     let mut w = BitWriter::new();
 
     write_bool(&mut w, jpg.components.len() == 1);
@@ -151,14 +160,13 @@ fn encode_fields(jpg: &JpegData) -> Result<Vec<u8>, JpegError> {
         w.write(6, (m - 0xC0) as u64);
     }
 
-    // Every APP segment is tagged `kUnknown`, so its bytes go verbatim into the
-    // Brotli section. libjxl instead tags ICC/Exif/XMP and rebuilds them from
-    // the codestream; storing them is slightly larger but always correct.
-    for app in &jpg.app_data {
+    // A recognized XMP APP1 segment is rebuilt from the container's `xml ` box;
+    // all other APP segments remain byte-for-byte data in the Brotli section.
+    for (index, app) in jpg.app_data.iter().enumerate() {
         write_u32(
             &mut w,
             [Val(0), Val(1), BitsOffset(1, 2), BitsOffset(2, 4)],
-            0,
+            if Some(index) == xmp_app_index { 3 } else { 0 },
         )?;
         let len = checked_seg_len(app)?;
         w.write(16, len as u64);

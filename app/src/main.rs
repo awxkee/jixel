@@ -52,7 +52,7 @@ fn encode_libjxl(rgb: &[u8], width: u32, height: u32, threads: usize) -> Measure
         .lossless(false)
         .jpeg_quality(QUALITY)
         // libjxl effort 3: its fastest generally useful VarDCT preset.
-        .speed(EncoderSpeed::Falcon)
+        .speed(EncoderSpeed::Squirrel)
         .parallel_runner(&runner)
         .build()
         .expect("libjxl failed to create its encoder");
@@ -120,7 +120,8 @@ fn parse_args() -> (PathBuf, usize, Speed) {
 }
 
 fn main() {
-    let (image_path, iterations, speed) = parse_args();
+    let (image_path, iterations, mut speed) = parse_args();
+    speed = Speed::Slow;
     println!("image path: {:?}", image_path);
     let image = image::open(Path::new(&image_path)).expect("failed to open benchmark image");
     let rgb = image.to_rgb8();
@@ -139,7 +140,7 @@ fn main() {
         threads,
         iterations,
     );
-    println!("jixel: {speed:?}; libjxl: effort 3");
+    println!("jixel: {speed:?}; libjxl: effort 7");
 
     // Warm up dispatch, allocators, thread creation, and both codec libraries.
     black_box(encode_jixel(

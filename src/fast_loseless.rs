@@ -63,6 +63,8 @@ pub struct FlMeta {
     /// EXIF/TIFF metadata, embedded via an `Exif` container box. Setting this
     /// forces the output into the JXL container form. Raw TIFF bytes.
     pub exif: Option<Vec<u8>>,
+    /// XMP packet, embedded unchanged via an uncompressed `xml ` container box.
+    pub xmp: Option<Vec<u8>>,
 }
 impl Default for FlMeta {
     fn default() -> Self {
@@ -76,6 +78,7 @@ impl Default for FlMeta {
             intrinsic_size: None,
             icc: None,
             exif: None,
+            xmp: None,
         }
     }
 }
@@ -986,20 +989,26 @@ fn validate(w: usize, h: usize, nb: usize, _meta: &FlMeta) -> Result<usize, Enco
 }
 
 /// Encode an 8-bit image.
-/// Wrap the bare codestream in a JXL container when EXIF metadata must be
-/// carried; otherwise return it untouched (so the no-EXIF path is byte-exact).
-fn finalize_fl(codestream: Vec<u8>, bits: u32, alpha: bool, meta: &FlMeta) -> Vec<u8> {
-    match meta.exif.as_deref() {
-        Some(exif) => {
-            let alpha_bits = if alpha { bits } else { 0 };
-            let need_l10 = crate::encode_image::needs_level_10(bits, true, alpha_bits);
-            crate::encode_image::wrap_jxl_container(
-                codestream,
-                if need_l10 { 10 } else { 5 },
-                Some(exif),
-            )
-        }
-        None => codestream,
+/// Wrap the bare codestream in a JXL container when EXIF or XMP metadata must
+/// be carried; otherwise return it untouched.
+fn finalize_fl(
+    codestream: Vec<u8>,
+    bits: u32,
+    alpha: bool,
+    meta: &FlMeta,
+) -> Result<Vec<u8>, EncodeError> {
+    if meta.exif.is_some() || meta.xmp.is_some() {
+        let alpha_bits = if alpha { bits } else { 0 };
+        let need_l10 = crate::encode_image::needs_level_10(bits, true, alpha_bits);
+        crate::encode_image::wrap_jxl_container(
+            codestream,
+            if need_l10 { 10 } else { 5 },
+            meta.exif.as_deref(),
+            meta.xmp.as_deref(),
+            None,
+        )
+    } else {
+        Ok(codestream)
     }
 }
 
@@ -1019,7 +1028,7 @@ pub fn encode_fast_lossless(
             got: img.len(),
         });
     }
-    Ok(finalize_fl(
+    finalize_fl(
         encode_planes(
             &build_planes_u8(img, w, h, nb),
             w,
@@ -1032,7 +1041,7 @@ pub fn encode_fast_lossless(
         8,
         alpha,
         meta,
-    ))
+    )
 }
 
 /// Encode a high-bit-depth image (9..=16 bits).
@@ -1056,7 +1065,7 @@ pub fn encode_fast_lossless_u16(
             got: img.len(),
         });
     }
-    Ok(finalize_fl(
+    finalize_fl(
         encode_planes(
             &build_planes_u16(img, w, h, nb),
             w,
@@ -1069,7 +1078,7 @@ pub fn encode_fast_lossless_u16(
         bits,
         alpha,
         meta,
-    ))
+    )
 }
 
 /// Assemble the JXL codestream from pre-built i32 planes. Shared by both entries.
@@ -1212,6 +1221,20 @@ mod tests {
         // ICC-bearing stream must be larger than the equivalent no-ICC stream.
         let base = encode_fast_lossless(&img, 10, 10, Rgb, false, &FlMeta::srgb()).unwrap();
         assert!(out.len() > base.len());
+    }
+
+    #[test]
+    fn accepts_xmp() {
+        let img = ramp8(10, 10, 3);
+        let xmp = b"<x:xmpmeta/>".to_vec();
+        let mut meta = FlMeta::srgb();
+        meta.xmp = Some(xmp.clone());
+        let out = encode_fast_lossless(&img, 10, 10, Rgb, false, &meta).unwrap();
+        let at = out
+            .windows(4)
+            .position(|window| window == b"xml ")
+            .expect("xml box");
+        assert_eq!(&out[at + 4..], xmp.as_slice());
     }
     #[test]
     fn rejects_wrong_length() {

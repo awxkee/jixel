@@ -31,8 +31,20 @@
 //! meta-blocks.
 
 use crate::bit_writer::BitWriter;
+use crate::util::EncodeError;
 
 const MAX_META_BLOCK: usize = 1 << 24;
+
+/// Optional Brotli encoder used for metadata and JPEG reconstruction data.
+pub trait BrotliCompression: Send + Sync {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, EncodeError>;
+}
+
+impl std::fmt::Debug for dyn BrotliCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dyn BrotliCompression")
+    }
+}
 
 /// Wraps `data` in a Brotli stream built entirely from stored meta-blocks.
 pub(crate) fn brotli_store(data: &[u8]) -> Vec<u8> {
@@ -81,6 +93,16 @@ pub(crate) fn brotli_store(data: &[u8]) -> Vec<u8> {
     w.zero_pad_to_byte();
 
     w.into_bytes()
+}
+
+pub(crate) fn compress(
+    data: &[u8],
+    compressor: Option<&dyn BrotliCompression>,
+) -> Result<Vec<u8>, EncodeError> {
+    match compressor {
+        Some(compressor) => compressor.compress(data),
+        None => Ok(brotli_store(data)),
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +171,22 @@ mod tests {
         for len in [1usize, 0xFFFF, 0x1_0000, 0x1_0001] {
             roundtrip(&vec![0xABu8; len]);
         }
+    }
+
+    #[test]
+    fn uses_the_supplied_compressor() {
+        struct Prefix;
+        impl BrotliCompression for Prefix {
+            fn compress(&self, data: &[u8]) -> Result<Vec<u8>, EncodeError> {
+                let mut out = b"custom:".to_vec();
+                out.extend_from_slice(data);
+                Ok(out)
+            }
+        }
+
+        assert_eq!(
+            compress(b"payload", Some(&Prefix)).unwrap(),
+            b"custom:payload"
+        );
     }
 }
