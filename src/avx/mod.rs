@@ -31,6 +31,7 @@ mod adaptive_quant;
 mod cfl;
 mod dark_aq;
 mod dct;
+mod entropy;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
@@ -48,6 +49,7 @@ pub(crate) use dct::{
     dct16x32_avx2, dct32x16_avx2, dct32x32_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
     inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
 };
+pub(crate) use entropy::counts_bit_cost_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, recon_dist_and_rate_avx2, ssim_deficit_avx2,
 };

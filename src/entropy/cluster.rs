@@ -32,6 +32,7 @@ use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
 use crate::adaptive_quant::dirty_log2f;
 use crate::util::heap_array;
+use std::sync::OnceLock;
 
 pub(crate) const CLUSTERS_LIMIT: usize = 64;
 
@@ -60,6 +61,31 @@ impl<const MAX_CONTEXTS: usize> Default for FixedClusterScratch<MAX_CONTEXTS> {
             reordered: heap_array(Histogram::new()),
         }
     }
+}
+
+type CountsBitCostFn = fn(&[u32; ALPHABET_SIZE], u32) -> f32;
+
+#[inline]
+fn counts_bit_cost_scalar(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
+    debug_assert_ne!(total_count, 0);
+    let log_total = dirty_log2f(total_count as f32);
+    let mut cost = 0.0f32;
+    for &count in counts {
+        if count != 0 {
+            cost += count as f32 * (log_total - dirty_log2f(count as f32));
+        }
+    }
+    cost.max(0.0)
+}
+
+fn select_counts_bit_cost_fn() -> CountsBitCostFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return |counts, total_count| unsafe {
+            crate::avx::counts_bit_cost_avx2(counts, total_count)
+        };
+    }
+    counts_bit_cost_scalar
 }
 
 #[inline]
@@ -94,14 +120,8 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     // phase. Shannon population cost preserves the useful distance ordering at
     // a fraction of the cost; the small final cluster set is checked exactly
     // below before it is returned.
-    let log_total = dirty_log2f(total_count as f32);
-    let mut cost = 0.0f32;
-    for &count in counts {
-        if count != 0 {
-            cost += count as f32 * (log_total - dirty_log2f(count as f32));
-        }
-    }
-    cost.max(0.0)
+    static COUNTS_BIT_COST_FN: OnceLock<CountsBitCostFn> = OnceLock::new();
+    COUNTS_BIT_COST_FN.get_or_init(select_counts_bit_cost_fn)(counts, total_count)
 }
 
 #[inline]
@@ -846,6 +866,34 @@ mod tests {
             histogram.total_count += count;
         }
         histogram
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_counts_bit_cost_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let mut state = 0x1234_5678u32;
+        for case in 0..256 {
+            let mut counts = [0u32; ALPHABET_SIZE];
+            for count in &mut counts {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *count = if state & 7 == 0 {
+                    0
+                } else {
+                    (state >> (case % 17)) & 0x3fff
+                };
+            }
+            let total: u32 = counts.iter().sum();
+            let scalar = counts_bit_cost_scalar(&counts, total);
+            let simd = unsafe { crate::avx::counts_bit_cost_avx2(&counts, total) };
+            let tolerance = 0.05f32.max(scalar.abs() * 2e-6);
+            assert!(
+                (simd - scalar).abs() <= tolerance,
+                "case {case}: simd={simd} scalar={scalar}"
+            );
+        }
     }
 
     fn exact_model_cost(histograms: &[Histogram], huffman_pool: &mut Vec<HuffmanNode>) -> f32 {
