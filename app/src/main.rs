@@ -156,7 +156,6 @@ fn main() {
     let mut jixel_output = Vec::new();
     let mut libjxl_output = Vec::new();
 
-    // Alternate order to reduce systematic thermal/frequency bias.
     for iteration in 0..iterations {
         let (jixel, libjxl) = if iteration % 2 == 0 {
             let jixel = encode_jixel(

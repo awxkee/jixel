@@ -66,6 +66,13 @@ impl<const MAX_CONTEXTS: usize> Default for FixedClusterScratch<MAX_CONTEXTS> {
 type CountsBitCostFn = fn(&[u32; ALPHABET_SIZE], u32) -> f32;
 
 #[inline]
+#[cfg_attr(
+    any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    ),
+    allow(dead_code)
+)]
 fn counts_bit_cost_scalar(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     debug_assert_ne!(total_count, 0);
     let log_total = dirty_log2f(total_count as f32);
@@ -78,6 +85,7 @@ fn counts_bit_cost_scalar(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f3
     cost.max(0.0)
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 fn select_counts_bit_cost_fn() -> CountsBitCostFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -85,6 +93,32 @@ fn select_counts_bit_cost_fn() -> CountsBitCostFn {
             crate::avx::counts_bit_cost_avx2(counts, total_count)
         };
     }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return |counts, total_count| unsafe {
+            crate::sse::counts_bit_cost_sse41(counts, total_count)
+        };
+    }
+    counts_bit_cost_scalar
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn select_counts_bit_cost_fn() -> CountsBitCostFn {
+    |counts, total_count| unsafe { crate::neon::counts_bit_cost_neon(counts, total_count) }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+fn select_counts_bit_cost_fn() -> CountsBitCostFn {
+    crate::wasm::counts_bit_cost_wasm
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+)))]
+fn select_counts_bit_cost_fn() -> CountsBitCostFn {
     counts_bit_cost_scalar
 }
 
@@ -868,12 +902,22 @@ mod tests {
         histogram
     }
 
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    #[test]
-    fn avx2_counts_bit_cost_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
-            return;
-        }
+    fn assert_simd_counts_bit_cost_matches_scalar(
+        mut simd_cost: impl FnMut(&[u32; ALPHABET_SIZE], u32) -> f32,
+    ) {
+        let mut wide_counts = [0u32; ALPHABET_SIZE];
+        wide_counts[0] = 0x8000_0000;
+        wide_counts[1] = 0x4000_0000;
+        wide_counts[2] = 1;
+        let wide_total = 0xc000_0001;
+        let scalar = counts_bit_cost_scalar(&wide_counts, wide_total);
+        let simd = simd_cost(&wide_counts, wide_total);
+        let tolerance = 0.05f32.max(scalar.abs() * 2e-6);
+        assert!(
+            (simd - scalar).abs() <= tolerance,
+            "unsigned conversion: simd={simd} scalar={scalar}"
+        );
+
         let mut state = 0x1234_5678u32;
         for case in 0..256 {
             let mut counts = [0u32; ALPHABET_SIZE];
@@ -887,13 +931,49 @@ mod tests {
             }
             let total: u32 = counts.iter().sum();
             let scalar = counts_bit_cost_scalar(&counts, total);
-            let simd = unsafe { crate::avx::counts_bit_cost_avx2(&counts, total) };
+            let simd = simd_cost(&counts, total);
             let tolerance = 0.05f32.max(scalar.abs() * 2e-6);
             assert!(
                 (simd - scalar).abs() <= tolerance,
                 "case {case}: simd={simd} scalar={scalar}"
             );
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_counts_bit_cost_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        assert_simd_counts_bit_cost_matches_scalar(|counts, total| unsafe {
+            crate::avx::counts_bit_cost_avx2(counts, total)
+        });
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_counts_bit_cost_matches_scalar() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        assert_simd_counts_bit_cost_matches_scalar(|counts, total| unsafe {
+            crate::sse::counts_bit_cost_sse41(counts, total)
+        });
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_counts_bit_cost_matches_scalar() {
+        assert_simd_counts_bit_cost_matches_scalar(|counts, total| unsafe {
+            crate::neon::counts_bit_cost_neon(counts, total)
+        });
+    }
+
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    #[test]
+    fn wasm_counts_bit_cost_matches_scalar() {
+        assert_simd_counts_bit_cost_matches_scalar(crate::wasm::counts_bit_cost_wasm);
     }
 
     fn exact_model_cost(histograms: &[Histogram], huffman_pool: &mut Vec<HuffmanNode>) -> f32 {

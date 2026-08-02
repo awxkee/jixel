@@ -83,25 +83,19 @@ pub(crate) fn counts_bit_cost_avx2(counts: &[u32; ALPHABET_SIZE], total_count: u
     debug_assert_ne!(total_count, 0);
     let log_total = _mm256_set1_ps(crate::adaptive_quant::dirty_log2f(total_count as f32));
     let one = _mm256_set1_ps(1.0);
-    let mut cost0 = _mm256_setzero_ps();
-    let mut cost1 = _mm256_setzero_ps();
-    for counts16 in counts.as_chunks::<16>().0 {
-        let count0_i = unsafe { _mm256_loadu_si256(counts16.as_ptr().cast()) };
-        let count1_i = unsafe { _mm256_loadu_si256(counts16.as_ptr().add(8).cast()) };
-        let count0 = cvtepu32_ps(count0_i);
-        let count1 = cvtepu32_ps(count1_i);
-        let positive0 = _mm256_max_ps(count0, one);
-        let positive1 = _mm256_max_ps(count1, one);
-        cost0 = _mm256_fmadd_ps(
-            count0,
-            _mm256_sub_ps(log_total, dirty_log2f_x8(positive0)),
-            cost0,
-        );
-        cost1 = _mm256_fmadd_ps(
-            count1,
-            _mm256_sub_ps(log_total, dirty_log2f_x8(positive1)),
-            cost1,
+    // The log reduction consumes most of the 16-register YMM file. Keeping a
+    // second cost chain live forces LLVM to spill the polynomial constants and
+    // `log_total`, so use one full-width chain here.
+    let mut cost = _mm256_setzero_ps();
+    for counts8 in counts.as_chunks::<8>().0 {
+        let count_i = unsafe { _mm256_loadu_si256(counts8.as_ptr().cast()) };
+        let count = cvtepu32_ps(count_i);
+        let positive = _mm256_max_ps(count, one);
+        cost = _mm256_fmadd_ps(
+            count,
+            _mm256_sub_ps(log_total, dirty_log2f_x8(positive)),
+            cost,
         );
     }
-    super::ac_strategy::hsum256(_mm256_add_ps(cost0, cost1)).max(0.0)
+    super::ac_strategy::hsum256(cost).max(0.0)
 }

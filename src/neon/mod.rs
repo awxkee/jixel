@@ -31,6 +31,7 @@ mod adaptive_quant;
 mod cfl;
 mod dark_aq;
 mod dct;
+mod entropy;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
@@ -48,6 +49,7 @@ pub(crate) use dct::{
     dct16x32_neon, dct32x16_neon, dct32x32_neon, inv_dct8x8_neon, inv_dct8x16_neon,
     inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon,
 };
+pub(crate) use entropy::counts_bit_cost_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, recon_dist_and_rate_neon, ssim_deficit_neon,
 };
