@@ -1737,7 +1737,7 @@ fn encode_frame_core(
     );
     let tree_static = DcTreeChoice::Static(dc_gradient);
 
-    let (dc_tokens_per_group, meta_tokens_per_group, dc_code_owned, dc_tree) = if ctx.speed
+    let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree) = if ctx.speed
         == Speed::Fastest
     {
         (
@@ -1852,6 +1852,17 @@ fn encode_frame_core(
             )
         }
     };
+    if ctx.speed == Speed::Slow {
+        crate::entropy::refine_ans_clusters(
+            &mut dc_code_owned,
+            dc_tokens_per_group
+                .iter()
+                .map(Vec::as_slice)
+                .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
+            &ctx.thread_pool,
+            scratch,
+        );
+    }
     let dc_code = dc_code_owned.as_ref();
 
     // Per-image AC block-context plan: keep quant-field splits only where the
@@ -1920,7 +1931,7 @@ fn encode_frame_core(
             });
     };
 
-    let (ac_plan, ac_code_per_pass) = if ctx.speed != Speed::Slow {
+    let (ac_plan, mut ac_code_per_pass) = if ctx.speed != Speed::Slow {
         remap_tokens(&mut all_pending, &baseline, scratch);
         let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
         (baseline, codes)
@@ -1976,6 +1987,19 @@ fn encode_frame_core(
             }
         }
     };
+
+    if ctx.speed == Speed::Slow {
+        for (pass, code) in ac_code_per_pass.iter_mut().enumerate() {
+            crate::entropy::refine_ans_clusters(
+                code,
+                all_pending
+                    .iter()
+                    .map(|pending| pending.tokens[pass].as_slice()),
+                &ctx.thread_pool,
+                scratch,
+            );
+        }
+    }
 
     let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
 

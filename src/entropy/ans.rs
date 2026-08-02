@@ -585,9 +585,90 @@ pub(crate) fn write_ans_tokens(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Histogram selection and serialization (libjxl enc_ans.cc Encode).
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+pub(crate) fn ans_tokens_bits(
+    tokens: &[Token],
+    context_map: &[u8],
+    symbol_info: &[Vec<AnsEncSymbolInfo>],
+    reverse_maps: &[u16],
+    hybrid_uint_configs: &[super::token::HybridUintConfig],
+) -> usize {
+    let mut coder = AnsCoder::new();
+    let mut bits = 32usize;
+    for t in tokens.iter().rev() {
+        let hist = context_map[t.context as usize] as usize;
+        let (sym, nbits, _) =
+            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
+        let reverse_start = hist * ANS_TAB_SIZE as usize;
+        let reverse_map = &reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize];
+        if coder
+            .put_symbol(&symbol_info[hist][sym as usize], reverse_map)
+            .is_some()
+        {
+            bits += 16;
+        }
+        bits += nbits as usize;
+    }
+    bits
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnsTokenCodeRef<'a> {
+    pub(crate) context_map: &'a [u8],
+    pub(crate) symbol_info: &'a [Vec<AnsEncSymbolInfo>],
+    pub(crate) reverse_maps: &'a [u16],
+    pub(crate) hybrid_uint_configs: &'a [super::token::HybridUintConfig],
+}
+
+/// Count two representation-compatible ANS streams in one token traversal.
+/// The clustering candidate only moves populations between clusters with the
+/// same HybridUint configuration, so symbolization and extra-bit counts are
+/// shared while the two rANS states are still advanced independently.
+pub(crate) fn ans_tokens_bits_pair(
+    tokens: &[Token],
+    first: &AnsTokenCodeRef<'_>,
+    second: &AnsTokenCodeRef<'_>,
+) -> (usize, usize) {
+    let mut first_coder = AnsCoder::new();
+    let mut second_coder = AnsCoder::new();
+    let mut first_bits = 32usize;
+    let mut second_bits = 32usize;
+    for token in tokens.iter().rev() {
+        let context = token.context as usize;
+        let first_hist = first.context_map[context] as usize;
+        let second_hist = second.context_map[context] as usize;
+        let first_config = first.hybrid_uint_configs[first_hist];
+        debug_assert_eq!(first_config, second.hybrid_uint_configs[second_hist]);
+        let (symbol, nbits, _) = super::token::uint_encode_with_config(token.value, first_config);
+
+        let first_reverse_start = first_hist * ANS_TAB_SIZE as usize;
+        if first_coder
+            .put_symbol(
+                &first.symbol_info[first_hist][symbol as usize],
+                &first.reverse_maps
+                    [first_reverse_start..first_reverse_start + ANS_TAB_SIZE as usize],
+            )
+            .is_some()
+        {
+            first_bits += 16;
+        }
+        let second_reverse_start = second_hist * ANS_TAB_SIZE as usize;
+        if second_coder
+            .put_symbol(
+                &second.symbol_info[second_hist][symbol as usize],
+                &second.reverse_maps
+                    [second_reverse_start..second_reverse_start + ANS_TAB_SIZE as usize],
+            )
+            .is_some()
+        {
+            second_bits += 16;
+        }
+        first_bits += nbits as usize;
+        second_bits += nbits as usize;
+    }
+    (first_bits, second_bits)
+}
+
 #[inline]
 fn floor_log2(x: u32) -> u32 {
     31 - x.leading_zeros()
@@ -642,18 +723,21 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     w: &mut W,
 ) {
     let freqs = &histogram.freqs;
-    let counts: Vec<i32> = freqs.iter().map(|&f| f as i32).collect();
-    let mut alphabet_size = counts.len();
-    while alphabet_size > 0 && counts[alphabet_size - 1] == 0 {
+    let mut alphabet_size = freqs.len();
+    while alphabet_size > 0 && freqs[alphabet_size - 1] == 0 {
         alphabet_size -= 1;
     }
-    let mut symbols = Vec::new();
-    for (i, &count) in counts[..alphabet_size].iter().enumerate() {
-        if count > 0 {
-            symbols.push(i);
+    debug_assert!(alphabet_size <= TABLE_ENTRIES);
+    let mut symbols = [0usize; 2];
+    let mut num_symbols = 0usize;
+    for (i, &freq) in freqs[..alphabet_size].iter().enumerate() {
+        if freq != 0 {
+            if num_symbols < symbols.len() {
+                symbols[num_symbols] = i;
+            }
+            num_symbols += 1;
         }
     }
-    let num_symbols = symbols.len();
 
     if histogram.method == 0 {
         w.write(1, 0); // non-small
@@ -670,12 +754,12 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
             store_varlen_u8(0, w);
         } else {
             w.write(1, (num_symbols - 1) as u64);
-            for &s in &symbols {
+            for &s in &symbols[..num_symbols] {
                 store_varlen_u8(s as u32, w);
             }
         }
         if num_symbols == 2 {
-            w.write(ANS_LOG_TAB_SIZE as usize, counts[symbols[0]] as u64);
+            w.write(ANS_LOG_TAB_SIZE as usize, freqs[symbols[0]] as u64);
         }
         return;
     }
@@ -697,11 +781,11 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     let omit_pos = histogram.omit_pos as usize;
     debug_assert!(omit_pos < alphabet_size);
 
-    let mut bit_width = vec![0u8; alphabet_size];
+    let mut bit_width = [0u8; TABLE_ENTRIES];
     let mut omit_width: i32 = 10;
     for (i, (bit_width, &count)) in bit_width
         .iter_mut()
-        .zip(counts[..alphabet_size].iter())
+        .zip(freqs[..alphabet_size].iter())
         .enumerate()
     {
         if i != omit_pos && count > 0 {
@@ -718,10 +802,10 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
     // bit width. Only runs of five or more save space with the static code.
     const MIN_REPS: usize = 5;
     const RLE_SYMBOL: usize = ANS_LOG_TAB_SIZE as usize + 1;
-    let mut same = vec![0u8; alphabet_size];
+    let mut same = [0u8; TABLE_ENTRIES];
     let mut last = 0usize;
     for i in 1..=alphabet_size {
-        if i == alphabet_size || i == omit_pos || i == omit_pos + 1 || counts[i] != counts[last] {
+        if i == alphabet_size || i == omit_pos || i == omit_pos + 1 || freqs[i] != freqs[last] {
             same[last] = (i - last) as u8;
             last = i;
         }
@@ -753,7 +837,7 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
         let mut i = 0usize;
         while i < alphabet_size {
             let bit_width = bit_width[i];
-            let count = counts[i];
+            let count = freqs[i] as i32;
             if bit_width > 1 && i != omit_pos {
                 let code = bit_width as i32 - 1;
                 let bitcount = get_pop_count_precision(code, shift);
@@ -787,6 +871,36 @@ fn flat_histogram(len: usize, storage_len: usize) -> AnsHistogram {
 
 fn histogram_cost(counts: &[u32], histogram: &AnsHistogram) -> f64 {
     ans_data_bits(counts, &histogram.freqs) + ans_table_bits(histogram)
+}
+
+pub(crate) fn fast_ans_population_cost(counts: &[u32], data_scale: usize) -> f64 {
+    let mut alphabet_size = counts.len();
+    while alphabet_size > 0 && counts[alphabet_size - 1] == 0 {
+        alphabet_size -= 1;
+    }
+
+    let mut freqs = Vec::new();
+    normalize_counts(counts, &mut freqs);
+    let mut omit_pos = 0usize;
+    for i in 1..alphabet_size {
+        if freqs[i] > freqs[omit_pos] {
+            omit_pos = i;
+        }
+    }
+    let precise = AnsHistogram {
+        freqs,
+        method: 12,
+        omit_pos: omit_pos as u8,
+        cost: 0.0,
+    };
+    let scaled_cost = |histogram: &AnsHistogram| {
+        ans_data_bits(counts, &histogram.freqs) * data_scale as f64 + ans_table_bits(histogram)
+    };
+    let mut best = scaled_cost(&precise);
+    if alphabet_size != 0 {
+        best = best.min(scaled_cost(&flat_histogram(alphabet_size, counts.len())));
+    }
+    best
 }
 
 /// Select the flat, small, or count-precision representation minimizing the
@@ -1074,5 +1188,92 @@ mod tests {
         };
         // Without RLE, 127 identical width-5 counts alone need 508 bits.
         assert!(ans_table_bits(&histogram) < 100.0);
+    }
+
+    #[test]
+    fn token_bit_counter_matches_writer_exactly() {
+        use crate::entropy::token::{HybridUintConfig, uint_encode_with_config};
+
+        let tokens: Vec<Token> = (0..5000)
+            .map(|i| Token::new((i % 3 == 0) as u32, (i * 37 % 911) as u32))
+            .collect();
+        let context_map = [0u8, 1u8];
+        let configs = [HybridUintConfig::DEFAULT; 2];
+        let mut counts = [[0u32; TABLE_ENTRIES]; 2];
+        for token in &tokens {
+            let histogram = context_map[token.context as usize] as usize;
+            let (symbol, _, _) = uint_encode_with_config(token.value, configs[histogram]);
+            counts[histogram][symbol as usize] += 1;
+        }
+        let histograms: Vec<AnsHistogram> = counts
+            .iter()
+            .map(|counts| optimize_ans_histogram(counts))
+            .collect();
+        let mut reverse_maps = vec![0u16; histograms.len() * ANS_TAB_SIZE as usize];
+        let symbols: Vec<Vec<AnsEncSymbolInfo>> = histograms
+            .iter()
+            .enumerate()
+            .map(|(index, histogram)| {
+                let start = index * ANS_TAB_SIZE as usize;
+                build_symbol_info(
+                    &histogram.freqs,
+                    &mut reverse_maps[start..start + ANS_TAB_SIZE as usize],
+                )
+            })
+            .collect();
+
+        let mut writer = BitWriter::new();
+        write_ans_tokens(
+            &tokens,
+            &context_map,
+            &symbols,
+            &reverse_maps,
+            &configs,
+            &mut writer,
+        );
+        assert_eq!(
+            ans_tokens_bits(&tokens, &context_map, &symbols, &reverse_maps, &configs),
+            writer.bits_written()
+        );
+        let code = AnsTokenCodeRef {
+            context_map: &context_map,
+            symbol_info: &symbols,
+            reverse_maps: &reverse_maps,
+            hybrid_uint_configs: &configs,
+        };
+        assert_eq!(
+            ans_tokens_bits_pair(&tokens, &code, &code),
+            (writer.bits_written(), writer.bits_written())
+        );
+
+        let merged_counts: [u32; TABLE_ENTRIES] =
+            core::array::from_fn(|symbol| counts[0][symbol] + counts[1][symbol]);
+        let merged_histogram = optimize_ans_histogram(&merged_counts);
+        let mut merged_reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+        let merged_symbols = vec![build_symbol_info(
+            &merged_histogram.freqs,
+            &mut merged_reverse_map,
+        )];
+        let merged_context_map = [0u8, 0u8];
+        let merged_configs = [HybridUintConfig::DEFAULT];
+        let merged_code = AnsTokenCodeRef {
+            context_map: &merged_context_map,
+            symbol_info: &merged_symbols,
+            reverse_maps: &merged_reverse_map,
+            hybrid_uint_configs: &merged_configs,
+        };
+        let mut merged_writer = BitWriter::new();
+        write_ans_tokens(
+            &tokens,
+            &merged_context_map,
+            &merged_symbols,
+            &merged_reverse_map,
+            &merged_configs,
+            &mut merged_writer,
+        );
+        assert_eq!(
+            ans_tokens_bits_pair(&tokens, &code, &merged_code),
+            (writer.bits_written(), merged_writer.bits_written())
+        );
     }
 }

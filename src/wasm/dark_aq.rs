@@ -1,3 +1,32 @@
+/*
+ * // Copyright (c) Radzivon Bartoshyk 8/2026. All rights reserved.
+ * //
+ * // Redistribution and use in source and binary forms, with or without modification,
+ * // are permitted provided that the following conditions are met:
+ * //
+ * // 1.  Redistributions of source code must retain the above copyright notice, this
+ * // list of conditions and the following disclaimer.
+ * //
+ * // 2.  Redistributions in binary form must reproduce the above copyright notice,
+ * // this list of conditions and the following disclaimer in the documentation
+ * // and/or other materials provided with the distribution.
+ * //
+ * // 3.  Neither the name of the copyright holder nor the names of its
+ * // contributors may be used to endorse or promote products derived from
+ * // this software without specific prior written permission.
+ * //
+ * // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * // IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * // DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * // FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * // DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * // CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 use std::arch::wasm32::*;
 
 #[inline]
@@ -10,72 +39,147 @@ fn horizontal_sum_x4(value: v128) -> f32 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn add_x4(sum: v128, row: &[f32], x: usize) -> v128 {
+    f32x4_add(sum, unsafe { v128_load(row.as_ptr().add(x).cast()) })
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn load_tail(row: &[f32], x: usize, n: usize) -> v128 {
+    let value = f32x4_replace_lane::<0>(f32x4_splat(0.0), row[x]);
+    let value = if n > 1 {
+        f32x4_replace_lane::<1>(value, row[x + 1])
+    } else {
+        value
+    };
+    if n > 2 {
+        f32x4_replace_lane::<2>(value, row[x + 2])
+    } else {
+        value
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
 fn sum_rows(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [f32x4_splat(0.0); 4];
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
+    let groups = w / 16;
+    let full_tail = w % 16 / 4;
+    let remainder = w % 4;
     for row in buf.chunks_exact(stride).take(h) {
-        let (chunks, tail) = row[..w].as_chunks::<4>();
-        for (i, chunk) in chunks.iter().enumerate() {
-            sums[i & 3] = f32x4_add(sums[i & 3], unsafe { v128_load(chunk.as_ptr().cast()) });
+        for group in 0..groups {
+            let x = group * 16;
+            sum0 = add_x4(sum0, row, x);
+            sum1 = add_x4(sum1, row, x + 4);
+            sum2 = add_x4(sum2, row, x + 8);
+            sum3 = add_x4(sum3, row, x + 12);
         }
-        if !tail.is_empty() {
-            let mut padded = [0.0; 4];
-            padded[..tail.len()].copy_from_slice(tail);
-            let lane = chunks.len() & 3;
-            sums[lane] = f32x4_add(sums[lane], unsafe { v128_load(padded.as_ptr().cast()) });
+        let mut x = groups * 16;
+        if full_tail > 0 {
+            sum0 = add_x4(sum0, row, x);
+            x += 4;
+        }
+        if full_tail > 1 {
+            sum1 = add_x4(sum1, row, x);
+            x += 4;
+        }
+        if full_tail > 2 {
+            sum2 = add_x4(sum2, row, x);
+            x += 4;
+        }
+        if remainder != 0 {
+            let tail = load_tail(row, x, remainder);
+            match full_tail {
+                0 => sum0 = f32x4_add(sum0, tail),
+                1 => sum1 = f32x4_add(sum1, tail),
+                2 => sum2 = f32x4_add(sum2, tail),
+                _ => sum3 = f32x4_add(sum3, tail),
+            }
         }
     }
-    let sum = f32x4_add(f32x4_add(sums[0], sums[1]), f32x4_add(sums[2], sums[3]));
+    let sum = f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3));
     horizontal_sum_x4(sum)
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn laplacian_abs_x4(
+    sum: v128,
+    top: &[f32],
+    middle: &[f32],
+    bottom: &[f32],
+    x: usize,
+    four: v128,
+) -> v128 {
+    let up = unsafe { v128_load(top.as_ptr().add(x).cast()) };
+    let down = unsafe { v128_load(bottom.as_ptr().add(x).cast()) };
+    let left = unsafe { v128_load(middle.as_ptr().add(x - 1).cast()) };
+    let center = unsafe { v128_load(middle.as_ptr().add(x).cast()) };
+    let right = unsafe { v128_load(middle.as_ptr().add(x + 1).cast()) };
+    let neighbors = f32x4_add(f32x4_add(up, down), f32x4_add(left, right));
+    f32x4_add(
+        sum,
+        f32x4_abs(f32x4_sub(f32x4_mul(center, four), neighbors)),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
 fn laplacian_abs_sum(buf: &[f32], stride: usize, h: usize, w: usize) -> f32 {
-    let mut sums = [f32x4_splat(0.0); 4];
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
     let four = f32x4_splat(4.0);
     let interior = w - 2;
+    let groups = interior / 16;
+    let full_tail = interior % 16 / 4;
+    let remainder = interior % 4;
     for y in 1..h - 1 {
         let top = &buf[(y - 1) * stride..];
         let middle = &buf[y * stride..];
         let bottom = &buf[(y + 1) * stride..];
-        let full = interior / 4;
-        for chunk in 0..full {
-            let x = 1 + chunk * 4;
-            let up = unsafe { v128_load(top.as_ptr().add(x).cast()) };
-            let down = unsafe { v128_load(bottom.as_ptr().add(x).cast()) };
-            let left = unsafe { v128_load(middle.as_ptr().add(x - 1).cast()) };
-            let center = unsafe { v128_load(middle.as_ptr().add(x).cast()) };
-            let right = unsafe { v128_load(middle.as_ptr().add(x + 1).cast()) };
-            let neighbors = f32x4_add(f32x4_add(up, down), f32x4_add(left, right));
-            let lap = f32x4_sub(f32x4_mul(center, four), neighbors);
-            let lane = chunk & 3;
-            sums[lane] = f32x4_add(sums[lane], f32x4_abs(lap));
+        for group in 0..groups {
+            let x = 1 + group * 16;
+            sum0 = laplacian_abs_x4(sum0, top, middle, bottom, x, four);
+            sum1 = laplacian_abs_x4(sum1, top, middle, bottom, x + 4, four);
+            sum2 = laplacian_abs_x4(sum2, top, middle, bottom, x + 8, four);
+            sum3 = laplacian_abs_x4(sum3, top, middle, bottom, x + 12, four);
         }
-        let remainder = interior % 4;
+        let mut x = 1 + groups * 16;
+        if full_tail > 0 {
+            sum0 = laplacian_abs_x4(sum0, top, middle, bottom, x, four);
+            x += 4;
+        }
+        if full_tail > 1 {
+            sum1 = laplacian_abs_x4(sum1, top, middle, bottom, x, four);
+            x += 4;
+        }
+        if full_tail > 2 {
+            sum2 = laplacian_abs_x4(sum2, top, middle, bottom, x, four);
+            x += 4;
+        }
         if remainder != 0 {
-            let x = 1 + full * 4;
-            let mut up = [0.0; 4];
-            let mut down = [0.0; 4];
-            let mut left = [0.0; 4];
-            let mut center = [0.0; 4];
-            let mut right = [0.0; 4];
-            up[..remainder].copy_from_slice(&top[x..x + remainder]);
-            down[..remainder].copy_from_slice(&bottom[x..x + remainder]);
-            left[..remainder].copy_from_slice(&middle[x - 1..x - 1 + remainder]);
-            center[..remainder].copy_from_slice(&middle[x..x + remainder]);
-            right[..remainder].copy_from_slice(&middle[x + 1..x + 1 + remainder]);
-            let up = unsafe { v128_load(up.as_ptr().cast()) };
-            let down = unsafe { v128_load(down.as_ptr().cast()) };
-            let left = unsafe { v128_load(left.as_ptr().cast()) };
-            let center = unsafe { v128_load(center.as_ptr().cast()) };
-            let right = unsafe { v128_load(right.as_ptr().cast()) };
-            let neighbors = f32x4_add(f32x4_add(up, down), f32x4_add(left, right));
-            let lap = f32x4_sub(f32x4_mul(center, four), neighbors);
-            let lane = full & 3;
-            sums[lane] = f32x4_add(sums[lane], f32x4_abs(lap));
+            let neighbors = f32x4_add(
+                load_tail(top, x, remainder),
+                load_tail(bottom, x, remainder),
+            );
+            let neighbors = f32x4_add(neighbors, load_tail(middle, x - 1, remainder));
+            let neighbors = f32x4_add(neighbors, load_tail(middle, x + 1, remainder));
+            let center = load_tail(middle, x, remainder);
+            let lap = f32x4_abs(f32x4_sub(f32x4_mul(center, four), neighbors));
+            match full_tail {
+                0 => sum0 = f32x4_add(sum0, lap),
+                1 => sum1 = f32x4_add(sum1, lap),
+                2 => sum2 = f32x4_add(sum2, lap),
+                _ => sum3 = f32x4_add(sum3, lap),
+            }
         }
     }
-    let sum = f32x4_add(f32x4_add(sums[0], sums[1]), f32x4_add(sums[2], sums[3]));
+    let sum = f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3));
     horizontal_sum_x4(sum)
 }
 

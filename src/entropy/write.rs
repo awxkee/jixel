@@ -28,8 +28,9 @@
  */
 
 use super::ans::{
-    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, build_symbol_info, choose_use_prefix_code,
-    encode_histogram, normalize_counts_into, optimize_ans_histogram,
+    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, ans_tokens_bits_pair,
+    build_symbol_info, choose_use_prefix_code, encode_histogram, fast_ans_population_cost,
+    normalize_counts_into, optimize_ans_histogram,
 };
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
@@ -38,8 +39,10 @@ use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbols};
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::CoderScratch;
 use crate::entropy::f_log2;
 use crate::lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
+use crate::thread_pool::ThreadPool;
 
 pub(crate) const ANS_ENABLED: bool = true;
 
@@ -207,42 +210,111 @@ pub(crate) fn select_hybrid_config(
     best
 }
 
-fn select_hybrid_config_ans(values: &[u32]) -> HybridUintConfig {
+const NUM_HYBRID_CANDIDATES: usize = HYBRID_CANDIDATES.len();
+const DEFAULT_HYBRID_INDEX: usize = 6;
+
+struct HybridAnsSelectorScratch {
+    counts: Box<[[u32; ALPHABET_SIZE]]>,
+    extra_bits: [u64; NUM_HYBRID_CANDIDATES],
+    totals: [u64; NUM_HYBRID_CANDIDATES],
+    valid: [bool; NUM_HYBRID_CANDIDATES],
+    proxy_costs: [f64; NUM_HYBRID_CANDIDATES],
+}
+
+impl Default for HybridAnsSelectorScratch {
+    fn default() -> Self {
+        Self {
+            counts: vec![[0; ALPHABET_SIZE]; NUM_HYBRID_CANDIDATES].into_boxed_slice(),
+            extra_bits: [0; NUM_HYBRID_CANDIDATES],
+            totals: [0; NUM_HYBRID_CANDIDATES],
+            valid: [true; NUM_HYBRID_CANDIDATES],
+            proxy_costs: [f64::INFINITY; NUM_HYBRID_CANDIDATES],
+        }
+    }
+}
+
+impl HybridAnsSelectorScratch {
+    fn reset(&mut self) {
+        for counts in &mut self.counts {
+            counts.fill(0);
+        }
+        self.extra_bits.fill(0);
+        self.totals.fill(0);
+        self.valid.fill(true);
+        self.proxy_costs.fill(f64::INFINITY);
+    }
+}
+
+fn select_hybrid_config_ans(
+    values: &[u32],
+    scratch: &mut HybridAnsSelectorScratch,
+) -> HybridUintConfig {
     if values.is_empty() {
         return HybridUintConfig::DEFAULT;
     }
     let stride = values.len().div_ceil(65_536).max(1);
+    scratch.reset();
+    // Reuse one contiguous histogram allocation across every cluster. Keeping
+    // the configuration outside the value loop also lets uint encoding remain
+    // a small, predictable hot loop for each candidate.
+    for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
+        for &value in values.iter().step_by(stride) {
+            let (symbol, nbits, _) = uint_encode_with_config(value, config);
+            if symbol as usize >= ALPHABET_SIZE {
+                scratch.valid[candidate_index] = false;
+                break;
+            }
+            scratch.counts[candidate_index][symbol as usize] += 1;
+            scratch.extra_bits[candidate_index] += nbits as u64;
+            scratch.totals[candidate_index] += 1;
+        }
+    }
+
+    for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
+        if !scratch.valid[candidate_index] || scratch.totals[candidate_index] == 0 {
+            continue;
+        }
+        let total = scratch.totals[candidate_index];
+        let mut proxy_cost = scratch.extra_bits[candidate_index] as f64;
+        let mut used = 0usize;
+        for &count in &scratch.counts[candidate_index] {
+            if count != 0 {
+                used += 1;
+                proxy_cost += count as f64 * f_log2(total as f64 / count as f64);
+            }
+        }
+        scratch.proxy_costs[candidate_index] = proxy_cost * stride as f64
+            + (8 * used + 15) as f64
+            + hybrid_uint_config_bits(config, 3) as f64;
+    }
+
+    // Shannon cost only nominates the strongest non-default finalist. The
+    // winner and the existing 0.5% stability gate below use actual normalized
+    // ANS data and exact table bits for both finalist and default.
+    let proxy_best = (0..NUM_HYBRID_CANDIDATES)
+        .filter(|&i| i != DEFAULT_HYBRID_INDEX && scratch.valid[i])
+        .min_by(|&a, &b| {
+            scratch.proxy_costs[a]
+                .total_cmp(&scratch.proxy_costs[b])
+                .then_with(|| a.cmp(&b))
+        })
+        .unwrap_or(DEFAULT_HYBRID_INDEX);
+    if proxy_best == DEFAULT_HYBRID_INDEX {
+        return HybridUintConfig::DEFAULT;
+    }
+
     let mut best = HybridUintConfig::DEFAULT;
     let mut best_cost = f64::INFINITY;
     let mut default_cost = f64::INFINITY;
-    for config in HYBRID_CANDIDATES {
-        let mut counts = [0u32; ALPHABET_SIZE];
-        let mut extra = 0u64;
-        let mut total = 0u64;
-        let mut valid = true;
-        for &value in values.iter().step_by(stride) {
-            let (sym, nbits, _) = uint_encode_with_config(value, config);
-            if sym as usize >= ALPHABET_SIZE {
-                valid = false;
-                break;
-            }
-            counts[sym as usize] += 1;
-            extra += nbits as u64;
-            total += 1;
-        }
-        if !valid || total == 0 {
+    for candidate_index in [DEFAULT_HYBRID_INDEX, proxy_best] {
+        if !scratch.valid[candidate_index] {
             continue;
         }
-        let mut data = extra as f64;
-        let mut used = 0u32;
-        for &c in &counts {
-            if c > 0 {
-                used += 1;
-                data += c as f64 * f_log2(total as f64 / c as f64);
-            }
-        }
-        let cost = data * stride as f64 + f64::from(8 * used + 15);
-        if config == HybridUintConfig::DEFAULT {
+        let config = HYBRID_CANDIDATES[candidate_index];
+        let counts = &scratch.counts[candidate_index];
+        let cost =
+            hybrid_ans_candidate_cost(counts, scratch.extra_bits[candidate_index], stride, config);
+        if candidate_index == DEFAULT_HYBRID_INDEX {
             default_cost = cost;
         }
         if cost < best_cost {
@@ -255,6 +327,35 @@ fn select_hybrid_config_ans(values: &[u32]) -> HybridUintConfig {
     } else {
         best
     }
+}
+
+fn hybrid_ans_candidate_cost(
+    counts: &[u32],
+    extra_bits: u64,
+    stride: usize,
+    config: HybridUintConfig,
+) -> f64 {
+    extra_bits as f64 * stride as f64
+        + fast_ans_population_cost(counts, stride)
+        + hybrid_uint_config_bits(config, 3) as f64
+}
+
+#[inline]
+fn hybrid_uint_config_bits(config: HybridUintConfig, split_width: usize) -> usize {
+    let split = config.split_exponent as u32;
+    let msb = config.msb_in_token as u32;
+    let msb_width = if split == 0 {
+        0
+    } else {
+        32 - split.leading_zeros()
+    };
+    let remaining = split - msb;
+    let lsb_width = if remaining == 0 {
+        0
+    } else {
+        32 - remaining.leading_zeros()
+    };
+    split_width + msb_width as usize + lsb_width as usize
 }
 
 fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
@@ -421,6 +522,432 @@ where
     optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true)
 }
 
+const ANS_CLUSTER_PROXY_SYMBOL_BITS: f64 = 6.0;
+const ANS_CLUSTER_PROXY_BASE_BITS: f64 = 12.0;
+const MAX_ANS_RELOCATION_CONTEXTS: usize = 4096;
+
+#[inline]
+fn xlog2x(value: u32) -> f64 {
+    if value <= 1 {
+        0.0
+    } else {
+        value as f64 * f_log2(value as f64)
+    }
+}
+
+/// Cheap Shannon-domain delta used only to nominate an ANS cluster move. The
+/// final decision is made by serializing both complete candidates below.
+fn moved_population_proxy_delta(source: &Histogram, target: &Histogram, moved: &Histogram) -> f64 {
+    debug_assert!(moved.total_count <= source.total_count);
+    let source_after = source.total_count - moved.total_count;
+    let target_after = target.total_count + moved.total_count;
+    let mut delta = xlog2x(source_after) + xlog2x(target_after)
+        - xlog2x(source.total_count)
+        - xlog2x(target.total_count);
+    if source_after == 0 {
+        delta -= ANS_CLUSTER_PROXY_BASE_BITS;
+    }
+    if target.total_count == 0 && target_after != 0 {
+        delta += ANS_CLUSTER_PROXY_BASE_BITS;
+    }
+    for ((&source_count, &target_count), &moved_count) in source
+        .counts
+        .iter()
+        .zip(target.counts.iter())
+        .zip(moved.counts.iter())
+    {
+        if moved_count == 0 {
+            continue;
+        }
+        debug_assert!(moved_count <= source_count);
+        let source_count_after = source_count - moved_count;
+        let target_count_after = target_count + moved_count;
+        delta -= xlog2x(source_count_after) + xlog2x(target_count_after)
+            - xlog2x(source_count)
+            - xlog2x(target_count);
+        if source_count_after == 0 {
+            delta -= ANS_CLUSTER_PROXY_SYMBOL_BITS;
+        }
+        if target_count == 0 {
+            delta += ANS_CLUSTER_PROXY_SYMBOL_BITS;
+        }
+    }
+    delta
+}
+
+fn move_histogram(source: &mut Histogram, target: &mut Histogram, moved: &Histogram) {
+    for ((source_count, target_count), &moved_count) in source
+        .counts
+        .iter_mut()
+        .zip(target.counts.iter_mut())
+        .zip(moved.counts.iter())
+    {
+        debug_assert!(moved_count <= *source_count);
+        *source_count -= moved_count;
+        *target_count += moved_count;
+    }
+    source.total_count -= moved.total_count;
+    target.total_count += moved.total_count;
+}
+
+fn two_histograms_mut(
+    histograms: &mut [Histogram],
+    first: usize,
+    second: usize,
+) -> (&mut Histogram, &mut Histogram) {
+    debug_assert_ne!(first, second);
+    if first < second {
+        let (left, right) = histograms.split_at_mut(second);
+        (&mut left[first], &mut right[0])
+    } else {
+        let (left, right) = histograms.split_at_mut(first);
+        (&mut right[0], &mut left[second])
+    }
+}
+
+fn compact_ans_clusters(
+    histograms: &mut Vec<Histogram>,
+    context_map: &mut [u8],
+    configs: &mut Vec<HybridUintConfig>,
+) {
+    let mut remap = vec![u8::MAX; histograms.len()];
+    let mut compact_histograms = Vec::with_capacity(histograms.len());
+    let mut compact_configs = Vec::with_capacity(configs.len());
+    for (old, histogram) in histograms.iter().enumerate() {
+        if histogram.total_count != 0 {
+            remap[old] = compact_histograms.len() as u8;
+            compact_histograms.push(histogram.clone());
+            compact_configs.push(configs[old]);
+        }
+    }
+    debug_assert!(!compact_histograms.is_empty());
+    for cluster in context_map {
+        let mapped = remap[*cluster as usize];
+        debug_assert_ne!(mapped, u8::MAX);
+        *cluster = mapped;
+    }
+    *histograms = compact_histograms;
+    *configs = compact_configs;
+}
+
+/// Build one bounded ANS-aware candidate: at most one original-context
+/// relocation and one whole-cluster merge. Moves are restricted to equal
+/// HybridUint configurations, so histogram addition is exact and no candidate
+/// requires retokenizing all values under a different representation.
+fn propose_ans_cluster_refinement(
+    histograms: &[Histogram],
+    context_histograms: &[Histogram],
+    context_map: &[u8],
+    configs: &[HybridUintConfig],
+) -> Option<(Vec<Histogram>, Vec<u8>, Vec<HybridUintConfig>)> {
+    if histograms.len() <= 1 {
+        return None;
+    }
+
+    let mut populated_contexts: Vec<usize> = context_histograms
+        .iter()
+        .enumerate()
+        .filter_map(|(context, histogram)| (histogram.total_count != 0).then_some(context))
+        .collect();
+    if populated_contexts.len() > MAX_ANS_RELOCATION_CONTEXTS {
+        populated_contexts.sort_unstable_by_key(|&context| {
+            std::cmp::Reverse(context_histograms[context].total_count)
+        });
+        populated_contexts.truncate(MAX_ANS_RELOCATION_CONTEXTS);
+    }
+
+    let mut best_relocation = None;
+    let mut best_delta = -0.25f64;
+    for context in populated_contexts {
+        let source = context_map[context] as usize;
+        let moved = &context_histograms[context];
+        // Emptying a cluster also requires deciding where its tokenless
+        // contexts go. Whole-cluster merging handles that case cleanly.
+        if moved.total_count == histograms[source].total_count {
+            continue;
+        }
+        for target in 0..histograms.len() {
+            if target == source || configs[target] != configs[source] {
+                continue;
+            }
+            let delta =
+                moved_population_proxy_delta(&histograms[source], &histograms[target], moved);
+            if delta < best_delta {
+                best_delta = delta;
+                best_relocation = Some((context, source, target));
+            }
+        }
+    }
+
+    let mut candidate_histograms = histograms.to_vec();
+    let mut candidate_map = context_map.to_vec();
+    let mut candidate_configs = configs.to_vec();
+    let mut changed = false;
+    if let Some((context, source, target)) = best_relocation {
+        let moved = &context_histograms[context];
+        let (source_histogram, target_histogram) =
+            two_histograms_mut(&mut candidate_histograms, source, target);
+        move_histogram(source_histogram, target_histogram, moved);
+        candidate_map[context] = target as u8;
+        changed = true;
+    }
+
+    let mut best_merge = None;
+    let mut best_delta = -0.25f64;
+    for source in 0..candidate_histograms.len() {
+        for target in 0..source {
+            if candidate_configs[target] != candidate_configs[source] {
+                continue;
+            }
+            let delta = moved_population_proxy_delta(
+                &candidate_histograms[source],
+                &candidate_histograms[target],
+                &candidate_histograms[source],
+            );
+            if delta < best_delta {
+                best_delta = delta;
+                best_merge = Some((source, target));
+            }
+        }
+    }
+    if let Some((source, target)) = best_merge {
+        let moved = candidate_histograms[source].clone();
+        let (source_histogram, target_histogram) =
+            two_histograms_mut(&mut candidate_histograms, source, target);
+        move_histogram(source_histogram, target_histogram, &moved);
+        for cluster in &mut candidate_map {
+            if *cluster as usize == source {
+                *cluster = target as u8;
+            }
+        }
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+    compact_ans_clusters(
+        &mut candidate_histograms,
+        &mut candidate_map,
+        &mut candidate_configs,
+    );
+    Some((candidate_histograms, candidate_map, candidate_configs))
+}
+
+fn build_ans_storage_from_selected(
+    histograms: &[Histogram],
+    selected_histograms: Vec<AnsHistogram>,
+) -> AnsCodeStorage {
+    let mut ans = AnsCodeStorage {
+        use_prefix_code: false,
+        histograms: selected_histograms,
+        pricing_freqs: vec![0; histograms.len() * ALPHABET_SIZE],
+        symbols: Vec::with_capacity(histograms.len()),
+        reverse_maps: vec![0; histograms.len() * ANS_TAB_SIZE as usize],
+    };
+    let (pricing_tables, remainder) = ans.pricing_freqs.as_chunks_mut::<ALPHABET_SIZE>();
+    debug_assert!(remainder.is_empty());
+    for (source, pricing) in histograms.iter().zip(pricing_tables) {
+        normalize_counts_into(&source.counts, pricing);
+    }
+    for (histogram_index, histogram) in ans.histograms.iter().enumerate() {
+        let reverse_start = histogram_index * ANS_TAB_SIZE as usize;
+        ans.symbols.push(build_symbol_info(
+            &histogram.freqs,
+            &mut ans.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
+        ));
+    }
+    ans
+}
+
+fn build_ans_storage(histograms: &[Histogram]) -> AnsCodeStorage {
+    let selected_histograms = histograms
+        .iter()
+        .map(|histogram| optimize_ans_histogram(&histogram.counts))
+        .collect();
+    build_ans_storage_from_selected(histograms, selected_histograms)
+}
+
+struct AnsBundleRef<'a> {
+    context_map: &'a [u8],
+    configs: &'a [HybridUintConfig],
+    histograms: &'a [AnsHistogram],
+    symbols: &'a [Vec<AnsEncSymbolInfo>],
+    reverse_maps: &'a [u16],
+}
+
+impl AnsBundleRef<'_> {
+    fn entropy_code(&self, num_contexts: usize) -> EntropyCode<'_> {
+        EntropyCode {
+            context_map: self.context_map,
+            num_contexts,
+            prefix_codes: &[],
+            hybrid_uint_configs: self.configs,
+            num_prefix_codes: 0,
+            orig_context_map: None,
+            orig_num_contexts: num_contexts,
+            use_prefix_code: false,
+            ans_histograms: self.histograms,
+            ans_symbols: self.symbols,
+            ans_reverse_maps: self.reverse_maps,
+        }
+    }
+
+    fn token_code(&self) -> AnsTokenCodeRef<'_> {
+        AnsTokenCodeRef {
+            context_map: self.context_map,
+            symbol_info: self.symbols,
+            reverse_maps: self.reverse_maps,
+            hybrid_uint_configs: self.configs,
+        }
+    }
+}
+
+fn exact_ans_bundle_bits_pair(
+    streams: &[&[Token]],
+    num_contexts: usize,
+    first: &AnsBundleRef<'_>,
+    second: &AnsBundleRef<'_>,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> (usize, usize) {
+    let mut first_header = BitWriter::new();
+    write_entropy_code(
+        &first.entropy_code(num_contexts),
+        &mut scratch.huffman_pool,
+        &mut first_header,
+    );
+    let mut second_header = BitWriter::new();
+    write_entropy_code(
+        &second.entropy_code(num_contexts),
+        &mut scratch.huffman_pool,
+        &mut second_header,
+    );
+    let first_tokens = first.token_code();
+    let second_tokens = second.token_code();
+    let (first_data, second_data) =
+        exact_ans_stream_bits_pair(streams, first_tokens, second_tokens, thread_pool, scratch);
+    (
+        first_header.bits_written() + first_data,
+        second_header.bits_written() + second_data,
+    )
+}
+
+fn exact_ans_stream_bits_pair(
+    streams: &[&[Token]],
+    first: AnsTokenCodeRef<'_>,
+    second: AnsTokenCodeRef<'_>,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> (usize, usize) {
+    let sequential = |streams: &[&[Token]]| {
+        streams.iter().fold((0usize, 0usize), |acc, tokens| {
+            let bits = ans_tokens_bits_pair(tokens, &first, &second);
+            (acc.0 + bits.0, acc.1 + bits.1)
+        })
+    };
+
+    const MIN_PARALLEL_TOKENS: usize = 16_384;
+    const MAX_EXACT_LANES: usize = 8;
+    let total_tokens: usize = streams.iter().map(|stream| stream.len()).sum();
+    let num_lanes = thread_pool
+        .num_threads()
+        .min(MAX_EXACT_LANES)
+        .min(streams.len());
+    if num_lanes <= 1 || total_tokens < MIN_PARALLEL_TOKENS {
+        return sequential(streams);
+    }
+
+    let chunk_len = streams.len().div_ceil(num_lanes);
+    let num_chunks = streams.len().div_ceil(chunk_len);
+    thread_pool
+        .steal_map_with_threads(scratch, num_chunks, num_lanes, |lane, _scratch| {
+            let start = lane * chunk_len;
+            let end = (start + chunk_len).min(streams.len());
+            sequential(&streams[start..end])
+        })
+        .into_iter()
+        .fold((0usize, 0usize), |acc, bits| {
+            (acc.0 + bits.0, acc.1 + bits.1)
+        })
+}
+
+/// Final ANS-aware clustering pass for an already-selected bundle. Keeping it
+/// separate from initial code construction lets callers run it only after
+/// higher-level coding-arm decisions, rather than paying to refine candidates
+/// that are immediately discarded.
+pub(crate) fn refine_ans_clusters<'a, I>(
+    code: &mut OwnedEntropyCode,
+    streams: I,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
+    if code.use_prefix_code || code.hybrid_uint_configs.len() <= 1 {
+        return false;
+    }
+    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
+    let mut context_histograms = vec![Histogram::new(); code.context_map.len()];
+    for tokens in &streams {
+        for token in *tokens {
+            let context = token.context as usize;
+            let cluster = code.context_map[context] as usize;
+            let (symbol, _, _) =
+                uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
+            histograms[cluster].add(symbol);
+            context_histograms[context].add(symbol);
+        }
+    }
+    let Some((candidate_histograms, candidate_map, candidate_configs)) =
+        propose_ans_cluster_refinement(
+            &histograms,
+            &context_histograms,
+            &code.context_map,
+            &code.hybrid_uint_configs,
+        )
+    else {
+        return false;
+    };
+    let candidate_ans = build_ans_storage(&candidate_histograms);
+    let original = AnsBundleRef {
+        context_map: &code.context_map,
+        configs: &code.hybrid_uint_configs,
+        histograms: &code.ans_histograms,
+        symbols: &code.ans_symbols,
+        reverse_maps: &code.ans_reverse_maps,
+    };
+    let candidate = AnsBundleRef {
+        context_map: &candidate_map,
+        configs: &candidate_configs,
+        histograms: &candidate_ans.histograms,
+        symbols: &candidate_ans.symbols,
+        reverse_maps: &candidate_ans.reverse_maps,
+    };
+    let (original_bits, candidate_bits) = exact_ans_bundle_bits_pair(
+        &streams,
+        code.orig_num_contexts,
+        &original,
+        &candidate,
+        thread_pool,
+        scratch,
+    );
+    if candidate_bits >= original_bits {
+        return false;
+    }
+
+    code.context_map = candidate_map;
+    code.prefix_codes = build_huffman_codes(&candidate_histograms, &mut scratch.huffman_pool);
+    code.hybrid_uint_configs = candidate_configs;
+    code.ans_histograms = candidate_ans.histograms;
+    code.ans_pricing_freqs = candidate_ans.pricing_freqs;
+    code.ans_symbols = candidate_ans.symbols;
+    code.ans_reverse_maps = candidate_ans.reverse_maps;
+    true
+}
+
 fn optimize_entropy_code_ac_streams_impl<'a, I>(
     streams: I,
     num_contexts: usize,
@@ -496,9 +1023,10 @@ where
         }
     }
     let hybrid_uint_configs: Vec<HybridUintConfig> = if select_configs {
+        let mut hybrid_selector_scratch = HybridAnsSelectorScratch::default();
         cluster_values
             .iter()
-            .map(|values| select_hybrid_config_ans(values))
+            .map(|values| select_hybrid_config_ans(values, &mut hybrid_selector_scratch))
             .collect()
     } else {
         vec![HybridUintConfig::DEFAULT; num_clusters]
@@ -532,24 +1060,7 @@ where
             .collect();
         ans.use_prefix_code = choose_use_prefix_code(&histograms, &selected_histograms, &depths);
         if !ans.use_prefix_code {
-            ans.histograms = selected_histograms;
-            ans.pricing_freqs
-                .resize(histograms.len() * ALPHABET_SIZE, 0);
-            let (pricing_tables, remainder) = ans.pricing_freqs.as_chunks_mut::<ALPHABET_SIZE>();
-            debug_assert!(remainder.is_empty());
-            for (source, pricing) in histograms.iter().zip(pricing_tables) {
-                normalize_counts_into(&source.counts, pricing);
-            }
-            ans.symbols.reserve(histograms.len());
-            ans.reverse_maps
-                .resize(histograms.len() * ANS_TAB_SIZE as usize, 0);
-            for (histogram_index, histogram) in ans.histograms.iter().enumerate() {
-                let reverse_start = histogram_index * ANS_TAB_SIZE as usize;
-                ans.symbols.push(build_symbol_info(
-                    &histogram.freqs,
-                    &mut ans.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
-                ));
-            }
+            ans = build_ans_storage_from_selected(&histograms, selected_histograms);
         }
     }
 
@@ -597,11 +1108,11 @@ pub(crate) fn build_entropy_code_no_cluster(
 
 const NUM_CODE_LENGTH_CODES: usize = 18;
 
-const STORAGE_ORDER: [u8; NUM_CODE_LENGTH_CODES] =
+static STORAGE_ORDER: [u8; NUM_CODE_LENGTH_CODES] =
     [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
-const HUFFMAN_BIT_LENGTH_HUFFMAN_CODE_SYMBOLS: [u8; 6] = [0, 7, 3, 2, 1, 15];
-const HUFFMAN_BIT_LENGTH_HUFFMAN_CODE_BITLENS: [u8; 6] = [2, 4, 3, 2, 2, 4];
+static HUFFMAN_BIT_LENGTH_HUFFMAN_CODE_SYMBOLS: [u8; 6] = [0, 7, 3, 2, 1, 15];
+static HUFFMAN_BIT_LENGTH_HUFFMAN_CODE_BITLENS: [u8; 6] = [2, 4, 3, 2, 2, 4];
 
 fn store_huffman_tree_of_huffman_tree_to_bitmask(
     num_codes: i32,
@@ -1330,7 +1841,7 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
 
 #[cfg(test)]
 mod context_map_tests {
-    use super::{RunSymbol, move_to_front_transform, run_length_symbols};
+    use super::*;
     use crate::lz77_ac::{LZ77_MIN_LENGTH, lz77_length_encode};
 
     /// Decode a run-length stream the way the JXL reader does: a copy of
@@ -1409,5 +1920,89 @@ mod context_map_tests {
             })
             .collect();
         assert_eq!(back, src);
+    }
+
+    fn exhaustive_selector(values: &[u32]) -> HybridUintConfig {
+        if values.is_empty() {
+            return HybridUintConfig::DEFAULT;
+        }
+        let stride = values.len().div_ceil(65_536).max(1);
+        let mut best = HybridUintConfig::DEFAULT;
+        let mut best_cost = f64::INFINITY;
+        let mut default_cost = f64::INFINITY;
+        for config in HYBRID_CANDIDATES {
+            let mut counts = [0u32; ALPHABET_SIZE];
+            let mut extra_bits = 0u64;
+            let mut valid = true;
+            for &value in values.iter().step_by(stride) {
+                let (symbol, nbits, _) = uint_encode_with_config(value, config);
+                if symbol as usize >= ALPHABET_SIZE {
+                    valid = false;
+                    break;
+                }
+                counts[symbol as usize] += 1;
+                extra_bits += nbits as u64;
+            }
+            if !valid {
+                continue;
+            }
+            let cost = hybrid_ans_candidate_cost(&counts, extra_bits, stride, config);
+            if config == HybridUintConfig::DEFAULT {
+                default_cost = cost;
+            }
+            if cost < best_cost {
+                best_cost = cost;
+                best = config;
+            }
+        }
+        if best_cost >= default_cost * 0.995 {
+            HybridUintConfig::DEFAULT
+        } else {
+            best
+        }
+    }
+
+    #[test]
+    fn config_bit_cost_matches_serializer() {
+        for config in HYBRID_CANDIDATES {
+            for split_width in [3, 4] {
+                let mut writer = BitWriter::new();
+                write_uint_config(config, split_width, &mut writer);
+                assert_eq!(
+                    writer.bits_written(),
+                    hybrid_uint_config_bits(config, split_width)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shortlist_matches_exhaustive_exact_selection() {
+        let mut scratch = HybridAnsSelectorScratch::default();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for case in 0..48usize {
+            let len = 97 + case * 83;
+            let mut values = Vec::with_capacity(len);
+            for i in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let random = (state >> 32) as u32;
+                let value = match case % 6 {
+                    0 => random & 15,
+                    1 => random & 255,
+                    2 => random % 4096,
+                    3 => (random & 63) * (1 + (i % 11) as u32),
+                    4 => u32::from(i % 19 != 0) * (random & 7),
+                    _ => random % 65_536,
+                };
+                values.push(value);
+            }
+            assert_eq!(
+                select_hybrid_config_ans(&values, &mut scratch),
+                exhaustive_selector(&values),
+                "hybrid shortlist diverged on generated case {case}"
+            );
+        }
     }
 }

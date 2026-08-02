@@ -67,28 +67,25 @@ pub(crate) fn error_gradient_energy_avx2(error: &[f32], width: usize, height: us
     for row in rows.clone() {
         let (row8, row_tail) = row.as_chunks::<8>();
         if row_tail.is_empty() {
-            for (chunk, left) in row8.iter().enumerate() {
-                let left = unsafe { _mm256_loadu_ps(left.as_ptr()) };
-                let right = if chunk + 1 == row8.len() {
-                    _mm256_permutevar8x32_ps(left, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7))
-                } else {
-                    unsafe { _mm256_loadu_ps(row.as_ptr().add(chunk * 8 + 1)) }
-                };
-                sum = accumulate_gradient_vectors_x8(left, right, sum);
+            let (right8, _) = row[1..].as_chunks::<8>();
+            for (left, right) in row8.iter().zip(right8) {
+                sum = accumulate_gradient_x8(left, right, sum);
             }
+            let left = unsafe { _mm256_loadu_ps(row8.last().unwrap().as_ptr()) };
+            let right = _mm256_permutevar8x32_ps(left, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7));
+            sum = accumulate_gradient_vectors_x8(left, right, sum);
             continue;
         }
         let (left8, tail) = row[..width - 1].as_chunks::<8>();
-        for (chunk, left) in left8.iter().enumerate() {
-            let right = row[chunk * 8 + 1..].first_chunk::<8>().unwrap();
+        let (right8, right_tail) = row[1..].as_chunks::<8>();
+        for (left, right) in left8.iter().zip(right8) {
             sum = accumulate_gradient_x8(left, right, sum);
         }
         if !tail.is_empty() {
-            let offset = left8.len() * 8;
             let mut left = [0.0; 8];
             let mut right = [0.0; 8];
             left[..tail.len()].copy_from_slice(tail);
-            right[..tail.len()].copy_from_slice(&row[offset + 1..width]);
+            right[..right_tail.len()].copy_from_slice(right_tail);
             sum = accumulate_gradient_x8(&left, &right, sum);
         }
     }
@@ -153,13 +150,14 @@ pub(crate) fn combine_error_avx2(spatial: &[f32], luma: &[f32], factor: f32, com
         combine_error_x8(spatial, luma, factor, combined);
     }
     if !spatial_remainder.is_empty() {
-        let mut spatial = [0.0; 8];
-        let mut luma = [0.0; 8];
-        let mut combined = [0.0; 8];
-        spatial[..spatial_remainder.len()].copy_from_slice(spatial_remainder);
-        luma[..luma_remainder.len()].copy_from_slice(luma_remainder);
-        combine_error_x8(&spatial, &luma, factor, &mut combined);
-        combined_remainder.copy_from_slice(&combined[..combined_remainder.len()]);
+        let mask = _mm256_cmpgt_epi32(
+            _mm256_set1_epi32(spatial_remainder.len() as i32),
+            _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+        );
+        let spatial = unsafe { _mm256_maskload_ps(spatial_remainder.as_ptr(), mask) };
+        let luma = unsafe { _mm256_maskload_ps(luma_remainder.as_ptr(), mask) };
+        let value = _mm256_fmadd_ps(factor, luma, spatial);
+        unsafe { _mm256_maskstore_ps(combined_remainder.as_mut_ptr(), mask, value) };
     }
 }
 
@@ -214,20 +212,22 @@ fn recon_quantize_avx2(
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
 
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), error_row), scan_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
+        .zip(scan_pos.chunks_exact(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
+        for (chunk_x, (((coeff8, inv8), error8), scan8)) in coeff_row
             .as_chunks::<8>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<8>().0.iter())
             .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
+            .zip(scan_row.as_chunks::<8>().0.iter())
             .enumerate()
         {
             let x = chunk_x * 8;
@@ -271,9 +271,7 @@ fn recon_quantize_avx2(
                 magnitude_bits,
                 _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
             );
-            let sv = unsafe {
-                _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x) as *const __m256i)
-            };
+            let sv = unsafe { _mm256_loadu_si256(scan8.as_ptr().cast()) };
             scan_acc = _mm256_max_epu32(
                 scan_acc,
                 _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
@@ -366,20 +364,19 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
                 .skip(y0)
                 .take(8)
             {
+                let orig8 = &orig_row.as_chunks::<8>().0[wx];
+                let recon8 = &recon_row.as_chunks::<8>().0[wx];
                 sum_o = _mm256_add_ps(
                     sum_o,
-                    _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig_row[x0..].as_ptr()) }, base_ov),
+                    _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig8.as_ptr()) }, base_ov),
                 );
                 sum_r = _mm256_add_ps(
                     sum_r,
-                    _mm256_sub_ps(
-                        unsafe { _mm256_loadu_ps(recon_row[x0..].as_ptr()) },
-                        base_rv,
-                    ),
+                    _mm256_sub_ps(unsafe { _mm256_loadu_ps(recon8.as_ptr()) }, base_rv),
                 );
             }
-            let mean_o = base_o + hsum256(sum_o) * INV_64;
-            let mean_r = base_r + hsum256(sum_r) * INV_64;
+            let mean_o = f32::mul_add(hsum256(sum_o), INV_64, base_o);
+            let mean_r = f32::mul_add(hsum256(sum_r), INV_64, base_r);
             let mean_ov = _mm256_set1_ps(mean_o);
             let mean_rv = _mm256_set1_ps(mean_r);
             let (mut var_o, mut var_r, mut cov) = (
@@ -393,11 +390,10 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
                 .skip(y0)
                 .take(8)
             {
-                let o = _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig_row[x0..].as_ptr()) }, mean_ov);
-                let r = _mm256_sub_ps(
-                    unsafe { _mm256_loadu_ps(recon_row[x0..].as_ptr()) },
-                    mean_rv,
-                );
+                let orig8 = &orig_row.as_chunks::<8>().0[wx];
+                let recon8 = &recon_row.as_chunks::<8>().0[wx];
+                let o = _mm256_sub_ps(unsafe { _mm256_loadu_ps(orig8.as_ptr()) }, mean_ov);
+                let r = _mm256_sub_ps(unsafe { _mm256_loadu_ps(recon8.as_ptr()) }, mean_rv);
                 var_o = _mm256_fmadd_ps(o, o, var_o);
                 var_r = _mm256_fmadd_ps(r, r, var_r);
                 cov = _mm256_fmadd_ps(o, r, cov);

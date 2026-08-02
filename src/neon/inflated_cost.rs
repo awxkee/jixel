@@ -71,28 +71,25 @@ pub(crate) fn error_gradient_energy_neon(error: &[f32], width: usize, height: us
     for row in rows.clone() {
         let (row4, row_tail) = row.as_chunks::<4>();
         if row_tail.is_empty() {
-            for (chunk, left) in row4.iter().enumerate() {
-                let left = unsafe { vld1q_f32(left.as_ptr()) };
-                let right = if chunk + 1 == row4.len() {
-                    vsetq_lane_f32::<3>(vgetq_lane_f32::<3>(left), vextq_f32::<1>(left, left))
-                } else {
-                    unsafe { vld1q_f32(row.as_ptr().add(chunk * 4 + 1)) }
-                };
-                sum = accumulate_gradient_vectors_x4(left, right, sum);
+            let (right4, _) = row[1..].as_chunks::<4>();
+            for (left, right) in row4.iter().zip(right4) {
+                sum = accumulate_gradient_x4(left, right, sum);
             }
+            let left = unsafe { vld1q_f32(row4.last().unwrap().as_ptr()) };
+            let right = vsetq_lane_f32::<3>(vgetq_lane_f32::<3>(left), vextq_f32::<1>(left, left));
+            sum = accumulate_gradient_vectors_x4(left, right, sum);
             continue;
         }
         let (left4, tail) = row[..width - 1].as_chunks::<4>();
-        for (chunk, left) in left4.iter().enumerate() {
-            let right = row[chunk * 4 + 1..].first_chunk::<4>().unwrap();
+        let (right4, right_tail) = row[1..].as_chunks::<4>();
+        for (left, right) in left4.iter().zip(right4) {
             sum = accumulate_gradient_x4(left, right, sum);
         }
         if !tail.is_empty() {
-            let offset = left4.len() * 4;
             let mut left = [0.0; 4];
             let mut right = [0.0; 4];
             left[..tail.len()].copy_from_slice(tail);
-            right[..tail.len()].copy_from_slice(&row[offset + 1..width]);
+            right[..right_tail.len()].copy_from_slice(right_tail);
             sum = accumulate_gradient_x4(&left, &right, sum);
         }
     }
@@ -214,20 +211,22 @@ fn recon_quantize_neon(
     let mut nonzero = 0usize;
     let mut magnitude_bits = vdupq_n_f32(0.0);
     let mut scan_acc = vdupq_n_u32(0);
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), error_row), scan_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
+        .zip(scan_pos.chunks_exact(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
+        for (chunk_x, (((coeff4, inv4), error4), scan4)) in coeff_row
             .as_chunks::<4>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<4>().0.iter())
             .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+            .zip(scan_row.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let x = chunk_x * 4;
@@ -262,7 +261,7 @@ fn recon_quantize_neon(
                 magnitude_bits,
                 vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
             );
-            let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
+            let sv = unsafe { vld1q_u32(scan4.as_ptr()) };
             scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
         }
     }
@@ -346,25 +345,26 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
                 .skip(y0)
                 .take(8)
             {
-                sum_o = vaddq_f32(
-                    sum_o,
-                    vsubq_f32(unsafe { vld1q_f32(orig_row[x0..].as_ptr()) }, base_ov),
-                );
-                sum_o = vaddq_f32(
-                    sum_o,
-                    vsubq_f32(unsafe { vld1q_f32(orig_row[x0 + 4..].as_ptr()) }, base_ov),
-                );
-                sum_r = vaddq_f32(
-                    sum_r,
-                    vsubq_f32(unsafe { vld1q_f32(recon_row[x0..].as_ptr()) }, base_rv),
-                );
-                sum_r = vaddq_f32(
-                    sum_r,
-                    vsubq_f32(unsafe { vld1q_f32(recon_row[x0 + 4..].as_ptr()) }, base_rv),
-                );
+                let orig8 = &orig_row.as_chunks::<8>().0[wx];
+                let recon8 = &recon_row.as_chunks::<8>().0[wx];
+                for (orig4, recon4) in orig8
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(recon8.as_chunks::<4>().0)
+                {
+                    sum_o = vaddq_f32(
+                        sum_o,
+                        vsubq_f32(unsafe { vld1q_f32(orig4.as_ptr()) }, base_ov),
+                    );
+                    sum_r = vaddq_f32(
+                        sum_r,
+                        vsubq_f32(unsafe { vld1q_f32(recon4.as_ptr()) }, base_rv),
+                    );
+                }
             }
-            let mean_o = base_o + vaddvq_f32(sum_o) * INV_64;
-            let mean_r = base_r + vaddvq_f32(sum_r) * INV_64;
+            let mean_o = f32::mul_add(vaddvq_f32(sum_o), INV_64, base_o);
+            let mean_r = f32::mul_add(vaddvq_f32(sum_r), INV_64, base_r);
             let mean_ov = vdupq_n_f32(mean_o);
             let mean_rv = vdupq_n_f32(mean_r);
             let (mut var_o, mut var_r, mut cov) =
@@ -375,9 +375,16 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
                 .skip(y0)
                 .take(8)
             {
-                for x in [0usize, 4] {
-                    let o = vsubq_f32(unsafe { vld1q_f32(orig_row[x0 + x..].as_ptr()) }, mean_ov);
-                    let r = vsubq_f32(unsafe { vld1q_f32(recon_row[x0 + x..].as_ptr()) }, mean_rv);
+                let orig8 = &orig_row.as_chunks::<8>().0[wx];
+                let recon8 = &recon_row.as_chunks::<8>().0[wx];
+                for (orig4, recon4) in orig8
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(recon8.as_chunks::<4>().0)
+                {
+                    let o = vsubq_f32(unsafe { vld1q_f32(orig4.as_ptr()) }, mean_ov);
+                    let r = vsubq_f32(unsafe { vld1q_f32(recon4.as_ptr()) }, mean_rv);
                     var_o = vfmaq_f32(var_o, o, o);
                     var_r = vfmaq_f32(var_r, r, r);
                     cov = vfmaq_f32(cov, o, r);
