@@ -881,7 +881,7 @@ pub(crate) fn write_compact_block_context_map(
 ) {
     let empty_codes: [crate::entropy::PrefixCode; 0] = [];
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_histograms = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
     let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
@@ -893,7 +893,7 @@ pub(crate) fn write_compact_block_context_map(
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code: true,
-        ans_freqs: &empty_freqs,
+        ans_histograms: &empty_histograms,
         ans_symbols: &empty_syms,
         ans_reverse_maps: &empty_reverse_maps,
     };
@@ -964,7 +964,7 @@ fn write_block_ctx_map(
     let entries = plan.ctx_map_entries();
     let empty_codes: [crate::entropy::PrefixCode; 0] = [];
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-    let empty_freqs: [Vec<u16>; 0] = [];
+    let empty_histograms = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
     let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
@@ -976,7 +976,7 @@ fn write_block_ctx_map(
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code: true,
-        ans_freqs: &empty_freqs,
+        ans_histograms: &empty_histograms,
         ans_symbols: &empty_syms,
         ans_reverse_maps: &empty_reverse_maps,
     };

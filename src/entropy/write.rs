@@ -28,8 +28,8 @@
  */
 
 use super::ans::{
-    ANS_TAB_SIZE, AnsEncSymbolInfo, build_symbol_info, choose_use_prefix_code, encode_histogram,
-    normalize_counts,
+    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, build_symbol_info, choose_use_prefix_code,
+    encode_histogram, normalize_counts_into, optimize_ans_histogram,
 };
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
@@ -50,7 +50,8 @@ pub(crate) const ANS_LOG_ALPHA_SIZE: u32 = 7;
 /// default owns no table storage.
 struct AnsCodeStorage {
     use_prefix_code: bool,
-    freqs: Vec<Vec<u16>>,
+    histograms: Vec<AnsHistogram>,
+    pricing_freqs: Vec<u16>,
     symbols: Vec<Vec<AnsEncSymbolInfo>>,
     reverse_maps: Vec<u16>,
 }
@@ -59,7 +60,8 @@ impl Default for AnsCodeStorage {
     fn default() -> Self {
         Self {
             use_prefix_code: true,
-            freqs: Vec::new(),
+            histograms: Vec::new(),
+            pricing_freqs: Vec::new(),
             symbols: Vec::new(),
             reverse_maps: Vec::new(),
         }
@@ -338,7 +340,8 @@ pub(crate) fn optimize_prefix_codes(
         orig_context_map: None,
         orig_num_contexts: 0,
         use_prefix_code: ans.use_prefix_code,
-        ans_freqs: ans.freqs,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
         ans_symbols: ans.symbols,
         ans_reverse_maps: ans.reverse_maps,
     }
@@ -362,7 +365,8 @@ pub(crate) fn optimize_entropy_code(
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: ans.use_prefix_code,
-        ans_freqs: ans.freqs,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
         ans_symbols: ans.symbols,
         ans_reverse_maps: ans.reverse_maps,
     }
@@ -522,21 +526,29 @@ where
     let mut ans = AnsCodeStorage::default();
     if ANS_ENABLED {
         let depths: Vec<[u8; ALPHABET_SIZE]> = prefix_codes.iter().map(|c| c.depths).collect();
-        ans.use_prefix_code = choose_use_prefix_code(&histograms, &depths);
+        let selected_histograms: Vec<AnsHistogram> = histograms
+            .iter()
+            .map(|h| optimize_ans_histogram(&h.counts))
+            .collect();
+        ans.use_prefix_code = choose_use_prefix_code(&histograms, &selected_histograms, &depths);
         if !ans.use_prefix_code {
-            ans.freqs.reserve(histograms.len());
+            ans.histograms = selected_histograms;
+            ans.pricing_freqs
+                .resize(histograms.len() * ALPHABET_SIZE, 0);
+            let (pricing_tables, remainder) = ans.pricing_freqs.as_chunks_mut::<ALPHABET_SIZE>();
+            debug_assert!(remainder.is_empty());
+            for (source, pricing) in histograms.iter().zip(pricing_tables) {
+                normalize_counts_into(&source.counts, pricing);
+            }
             ans.symbols.reserve(histograms.len());
             ans.reverse_maps
                 .resize(histograms.len() * ANS_TAB_SIZE as usize, 0);
-            let mut freqs = vec![0u16; 0];
-            for (histogram_index, h) in histograms.iter().enumerate() {
-                normalize_counts(&h.counts, &mut freqs);
+            for (histogram_index, histogram) in ans.histograms.iter().enumerate() {
                 let reverse_start = histogram_index * ANS_TAB_SIZE as usize;
                 ans.symbols.push(build_symbol_info(
-                    &freqs,
+                    &histogram.freqs,
                     &mut ans.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
                 ));
-                ans.freqs.push(freqs.clone());
             }
         }
     }
@@ -548,7 +560,8 @@ where
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: ans.use_prefix_code,
-        ans_freqs: ans.freqs,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
         ans_symbols: ans.symbols,
         ans_reverse_maps: ans.reverse_maps,
     }
@@ -571,7 +584,8 @@ pub(crate) fn build_entropy_code_no_cluster(
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: ans.use_prefix_code,
-        ans_freqs: ans.freqs,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
         ans_symbols: ans.symbols,
         ans_reverse_maps: ans.reverse_maps,
     }
@@ -1165,7 +1179,8 @@ pub(crate) fn write_context_map(
         orig_context_map: None,
         orig_num_contexts: 2,
         use_prefix_code: true,
-        ans_freqs: Vec::new(),
+        ans_histograms: Vec::new(),
+        ans_pricing_freqs: Vec::new(),
         ans_symbols: Vec::new(),
         ans_reverse_maps: Vec::new(),
     };
@@ -1299,13 +1314,17 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
     // silently contradicted `hybrid_uint_configs` the moment anything but the
     // default was selected — the header would advertise one configuration while
     // the tokens used another.
-    debug_assert_eq!(code.hybrid_uint_configs.len(), code.ans_freqs.len());
-    for &config in code.hybrid_uint_configs.iter().take(code.ans_freqs.len()) {
+    debug_assert_eq!(code.hybrid_uint_configs.len(), code.ans_histograms.len());
+    for &config in code
+        .hybrid_uint_configs
+        .iter()
+        .take(code.ans_histograms.len())
+    {
         write_uint_config(config, 3, w);
     }
     // The normalized distributions, in clustered-histogram order.
-    for freqs in code.ans_freqs.iter() {
-        encode_histogram(freqs, ANS_LOG_ALPHA_SIZE, w);
+    for histogram in code.ans_histograms.iter() {
+        encode_histogram(histogram, ANS_LOG_ALPHA_SIZE, w);
     }
 }
 

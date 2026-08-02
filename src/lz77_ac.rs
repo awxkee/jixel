@@ -150,7 +150,8 @@ pub(crate) fn build_lz_code_no_cluster(
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
-        ans_freqs: Vec::new(),
+        ans_histograms: Vec::new(),
+        ans_pricing_freqs: Vec::new(),
         ans_symbols: Vec::new(),
         ans_reverse_maps: Vec::new(),
     }
@@ -198,7 +199,8 @@ pub(crate) fn build_ac_lz_code(
         orig_context_map: None,
         orig_num_contexts: num_contexts,
         use_prefix_code: true,
-        ans_freqs: Vec::new(),
+        ans_histograms: Vec::new(),
+        ans_pricing_freqs: Vec::new(),
         ans_symbols: Vec::new(),
         ans_reverse_maps: Vec::new(),
     }
@@ -266,10 +268,11 @@ where
         // rANS approaches the histogram entropy: a symbol with normalized
         // frequency `f` out of `ANS_TAB_SIZE` costs -log2(f / ANS_TAB_SIZE).
         let cost: Vec<Vec<f32>> = code
-            .ans_freqs
+            .ans_histograms
             .iter()
-            .map(|freqs| {
-                freqs
+            .map(|histogram| {
+                histogram
+                    .freqs
                     .iter()
                     .map(|&f| {
                         if f == 0 {
