@@ -38,174 +38,257 @@ fn horizontal_sum_x4(value: v128) -> f32 {
         + f32x4_extract_lane::<3>(value)
 }
 
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "simd128")]
 fn moments(block: &[f32; 64]) -> (f32, f32) {
     let chunks = block.as_chunks::<4>().0;
-    let mut sums = [f32x4_splat(0.0); 4];
-    for (i, chunk) in chunks.iter().enumerate() {
-        sums[i & 3] = f32x4_add(sums[i & 3], unsafe { v128_load(chunk.as_ptr().cast()) });
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
+    for group in 0..4 {
+        let chunk = group * 4;
+        sum0 = f32x4_add(sum0, unsafe { v128_load(chunks[chunk].as_ptr().cast()) });
+        sum1 = f32x4_add(sum1, unsafe {
+            v128_load(chunks[chunk + 1].as_ptr().cast())
+        });
+        sum2 = f32x4_add(sum2, unsafe {
+            v128_load(chunks[chunk + 2].as_ptr().cast())
+        });
+        sum3 = f32x4_add(sum3, unsafe {
+            v128_load(chunks[chunk + 3].as_ptr().cast())
+        });
     }
-    let mean = horizontal_sum_x4(f32x4_add(
-        f32x4_add(sums[0], sums[1]),
-        f32x4_add(sums[2], sums[3]),
-    )) * (1.0 / 64.0);
+    let mean =
+        horizontal_sum_x4(f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3))) * (1.0 / 64.0);
     let mean_v = f32x4_splat(mean);
-    let mut variances = [f32x4_splat(0.0); 4];
-    for (i, chunk) in chunks.iter().enumerate() {
-        let d = f32x4_sub(unsafe { v128_load(chunk.as_ptr().cast()) }, mean_v);
-        variances[i & 3] = f32x4_add(variances[i & 3], f32x4_mul(d, d));
+    let mut variance0 = f32x4_splat(0.0);
+    let mut variance1 = f32x4_splat(0.0);
+    let mut variance2 = f32x4_splat(0.0);
+    let mut variance3 = f32x4_splat(0.0);
+    for group in 0..4 {
+        let chunk = group * 4;
+        let d0 = f32x4_sub(unsafe { v128_load(chunks[chunk].as_ptr().cast()) }, mean_v);
+        let d1 = f32x4_sub(
+            unsafe { v128_load(chunks[chunk + 1].as_ptr().cast()) },
+            mean_v,
+        );
+        let d2 = f32x4_sub(
+            unsafe { v128_load(chunks[chunk + 2].as_ptr().cast()) },
+            mean_v,
+        );
+        let d3 = f32x4_sub(
+            unsafe { v128_load(chunks[chunk + 3].as_ptr().cast()) },
+            mean_v,
+        );
+        variance0 = f32x4_add(variance0, f32x4_mul(d0, d0));
+        variance1 = f32x4_add(variance1, f32x4_mul(d1, d1));
+        variance2 = f32x4_add(variance2, f32x4_mul(d2, d2));
+        variance3 = f32x4_add(variance3, f32x4_mul(d3, d3));
     }
     let variance = f32x4_add(
-        f32x4_add(variances[0], variances[1]),
-        f32x4_add(variances[2], variances[3]),
+        f32x4_add(variance0, variance1),
+        f32x4_add(variance2, variance3),
     );
     (mean, horizontal_sum_x4(variance) * (1.0 / 64.0))
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn tensor_chunk(left: v128, right: v128, top: v128, bottom: v128, sums: &mut [v128; 3]) {
-    let gx = f32x4_mul(f32x4_sub(right, left), f32x4_splat(0.5));
-    let gy = f32x4_mul(f32x4_sub(bottom, top), f32x4_splat(0.5));
-    sums[0] = f32x4_add(sums[0], f32x4_mul(gx, gx));
-    sums[1] = f32x4_add(sums[1], f32x4_mul(gx, gy));
-    sums[2] = f32x4_add(sums[2], f32x4_mul(gy, gy));
+fn load2(row: &[f32], x: usize) -> v128 {
+    unsafe { v128_load64_zero(row.as_ptr().add(x).cast()) }
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn tensor_gradients(left: v128, right: v128, top: v128, bottom: v128) -> (v128, v128) {
+    (
+        f32x4_mul(f32x4_sub(right, left), f32x4_splat(0.5)),
+        f32x4_mul(f32x4_sub(bottom, top), f32x4_splat(0.5)),
+    )
+}
+
+#[inline(never)]
+#[target_feature(enable = "simd128")]
 fn tensor(block: &[f32; 64]) -> [f32; 3] {
     let rows = block.as_chunks::<8>().0;
-    let mut sums = [f32x4_splat(0.0); 3];
+    let mut jxx = f32x4_splat(0.0);
+    let mut jxy = f32x4_splat(0.0);
+    let mut jyy = f32x4_splat(0.0);
     for y in 1..7 {
-        tensor_chunk(
+        let (gx, gy) = tensor_gradients(
             unsafe { v128_load(rows[y].as_ptr().cast()) },
             unsafe { v128_load(rows[y].as_ptr().add(2).cast()) },
             unsafe { v128_load(rows[y - 1].as_ptr().add(1).cast()) },
             unsafe { v128_load(rows[y + 1].as_ptr().add(1).cast()) },
-            &mut sums,
         );
-        let mut left = [0.0; 4];
-        let mut right = [0.0; 4];
-        let mut top = [0.0; 4];
-        let mut bottom = [0.0; 4];
-        left[..2].copy_from_slice(&rows[y][4..6]);
-        right[..2].copy_from_slice(&rows[y][6..8]);
-        top[..2].copy_from_slice(&rows[y - 1][5..7]);
-        bottom[..2].copy_from_slice(&rows[y + 1][5..7]);
-        tensor_chunk(
-            unsafe { v128_load(left.as_ptr().cast()) },
-            unsafe { v128_load(right.as_ptr().cast()) },
-            unsafe { v128_load(top.as_ptr().cast()) },
-            unsafe { v128_load(bottom.as_ptr().cast()) },
-            &mut sums,
+        jxx = f32x4_add(jxx, f32x4_mul(gx, gx));
+        jxy = f32x4_add(jxy, f32x4_mul(gx, gy));
+        jyy = f32x4_add(jyy, f32x4_mul(gy, gy));
+        let (gx, gy) = tensor_gradients(
+            load2(&rows[y], 4),
+            load2(&rows[y], 6),
+            load2(&rows[y - 1], 5),
+            load2(&rows[y + 1], 5),
         );
+        jxx = f32x4_add(jxx, f32x4_mul(gx, gx));
+        jxy = f32x4_add(jxy, f32x4_mul(gx, gy));
+        jyy = f32x4_add(jyy, f32x4_mul(gy, gy));
     }
-    sums.map(horizontal_sum_x4)
+    [
+        horizontal_sum_x4(jxx),
+        horizontal_sum_x4(jxy),
+        horizontal_sum_x4(jyy),
+    ]
 }
 
-#[inline]
-#[target_feature(enable = "simd128")]
-fn predictor_chunk(value: v128, predictions: [v128; 5], errors: &mut [v128; 5]) {
-    for (slot, prediction) in predictions.into_iter().enumerate() {
-        let e = f32x4_sub(value, prediction);
-        errors[slot] = f32x4_add(errors[slot], f32x4_mul(e, e));
-    }
-}
-
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "simd128")]
 fn predictor_errors(block: &[f32; 64]) -> [f32; 5] {
     let rows = block.as_chunks::<8>().0;
-    let mut errors = [f32x4_splat(0.0); 5];
+    let mut error0 = f32x4_splat(0.0);
+    let mut error1 = f32x4_splat(0.0);
+    let mut error2 = f32x4_splat(0.0);
+    let mut error3 = f32x4_splat(0.0);
+    let mut error4 = f32x4_splat(0.0);
     for y in 1..7 {
         let left = unsafe { v128_load(rows[y].as_ptr().cast()) };
         let value = unsafe { v128_load(rows[y].as_ptr().add(1).cast()) };
         let top = unsafe { v128_load(rows[y - 1].as_ptr().add(1).cast()) };
         let top_left = unsafe { v128_load(rows[y - 1].as_ptr().cast()) };
         let bottom_left = unsafe { v128_load(rows[y + 1].as_ptr().cast()) };
-        predictor_chunk(
-            value,
-            [
-                left,
-                top,
-                top_left,
-                bottom_left,
-                f32x4_sub(f32x4_add(left, top), top_left),
-            ],
-            &mut errors,
-        );
-        let mut left = [0.0; 4];
-        let mut value = [0.0; 4];
-        let mut top = [0.0; 4];
-        let mut top_left = [0.0; 4];
-        let mut bottom_left = [0.0; 4];
-        left[..2].copy_from_slice(&rows[y][4..6]);
-        value[..2].copy_from_slice(&rows[y][5..7]);
-        top[..2].copy_from_slice(&rows[y - 1][5..7]);
-        top_left[..2].copy_from_slice(&rows[y - 1][4..6]);
-        bottom_left[..2].copy_from_slice(&rows[y + 1][4..6]);
-        let left = unsafe { v128_load(left.as_ptr().cast()) };
-        let value = unsafe { v128_load(value.as_ptr().cast()) };
-        let top = unsafe { v128_load(top.as_ptr().cast()) };
-        let top_left = unsafe { v128_load(top_left.as_ptr().cast()) };
-        let bottom_left = unsafe { v128_load(bottom_left.as_ptr().cast()) };
-        predictor_chunk(
-            value,
-            [
-                left,
-                top,
-                top_left,
-                bottom_left,
-                f32x4_sub(f32x4_add(left, top), top_left),
-            ],
-            &mut errors,
-        );
+        let e0 = f32x4_sub(value, left);
+        error0 = f32x4_add(error0, f32x4_mul(e0, e0));
+        let e1 = f32x4_sub(value, top);
+        error1 = f32x4_add(error1, f32x4_mul(e1, e1));
+        let e2 = f32x4_sub(value, top_left);
+        error2 = f32x4_add(error2, f32x4_mul(e2, e2));
+        let e3 = f32x4_sub(value, bottom_left);
+        error3 = f32x4_add(error3, f32x4_mul(e3, e3));
+        let e4 = f32x4_sub(value, f32x4_sub(f32x4_add(left, top), top_left));
+        error4 = f32x4_add(error4, f32x4_mul(e4, e4));
+
+        let left = load2(&rows[y], 4);
+        let value = load2(&rows[y], 5);
+        let top = load2(&rows[y - 1], 5);
+        let top_left = load2(&rows[y - 1], 4);
+        let bottom_left = load2(&rows[y + 1], 4);
+        let e0 = f32x4_sub(value, left);
+        error0 = f32x4_add(error0, f32x4_mul(e0, e0));
+        let e1 = f32x4_sub(value, top);
+        error1 = f32x4_add(error1, f32x4_mul(e1, e1));
+        let e2 = f32x4_sub(value, top_left);
+        error2 = f32x4_add(error2, f32x4_mul(e2, e2));
+        let e3 = f32x4_sub(value, bottom_left);
+        error3 = f32x4_add(error3, f32x4_mul(e3, e3));
+        let e4 = f32x4_sub(value, f32x4_sub(f32x4_add(left, top), top_left));
+        error4 = f32x4_add(error4, f32x4_mul(e4, e4));
     }
-    errors.map(horizontal_sum_x4)
+    [
+        horizontal_sum_x4(error0),
+        horizontal_sum_x4(error1),
+        horizontal_sum_x4(error2),
+        horizontal_sum_x4(error3),
+        horizontal_sum_x4(error4),
+    ]
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn squared_difference_sum(left: &[f32], right: &[f32]) -> f32 {
-    let (left4, left_tail) = left.as_chunks::<4>();
-    let (right4, right_tail) = right.as_chunks::<4>();
-    let mut sum = f32x4_splat(0.0);
-    for (left, right) in left4.iter().zip(right4) {
-        let d = f32x4_sub(unsafe { v128_load(right.as_ptr().cast()) }, unsafe {
-            v128_load(left.as_ptr().cast())
+fn horizontal_energy(row: &[f32], width: usize) -> v128 {
+    let tail = f32x4_replace_lane::<2>(
+        f32x4_replace_lane::<1>(
+            f32x4_replace_lane::<0>(f32x4_splat(0.0), row[width - 3] - row[width - 4]),
+            row[width - 2] - row[width - 3],
+        ),
+        row[width - 1] - row[width - 2],
+    );
+    let mut energy = f32x4_mul(tail, tail);
+    if width == 8 {
+        let d = f32x4_sub(unsafe { v128_load(row.as_ptr().add(1).cast()) }, unsafe {
+            v128_load(row.as_ptr().cast())
         });
-        sum = f32x4_add(sum, f32x4_mul(d, d));
+        energy = f32x4_add(energy, f32x4_mul(d, d));
     }
-    if !left_tail.is_empty() {
-        let mut left = [0.0; 4];
-        let mut right = [0.0; 4];
-        left[..left_tail.len()].copy_from_slice(left_tail);
-        right[..right_tail.len()].copy_from_slice(right_tail);
-        let d = f32x4_sub(unsafe { v128_load(right.as_ptr().cast()) }, unsafe {
-            v128_load(left.as_ptr().cast())
-        });
-        sum = f32x4_add(sum, f32x4_mul(d, d));
+    energy
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn vertical_energy(top: &[f32], bottom: &[f32], width: usize) -> v128 {
+    let d0 = f32x4_sub(unsafe { v128_load(bottom.as_ptr().cast()) }, unsafe {
+        v128_load(top.as_ptr().cast())
+    });
+    let mut energy = f32x4_mul(d0, d0);
+    if width == 8 {
+        let d1 = f32x4_sub(
+            unsafe { v128_load(bottom.as_ptr().add(4).cast()) },
+            unsafe { v128_load(top.as_ptr().add(4).cast()) },
+        );
+        energy = f32x4_add(energy, f32x4_mul(d1, d1));
     }
-    horizontal_sum_x4(sum)
+    energy
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
 fn gradient_energy(values: &[f32], stride: usize, width: usize, height: usize) -> f32 {
-    let mut sums = [0.0; 4];
-    for y in 0..height {
-        let row = &values[y * stride..][..width];
-        sums[y & 3] += squared_difference_sum(&row[..width - 1], &row[1..]);
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
+    for base in (0..height).step_by(4) {
+        let row0 = &values[base * stride..][..width];
+        let row1 = &values[(base + 1) * stride..][..width];
+        let row2 = &values[(base + 2) * stride..][..width];
+        let row3 = &values[(base + 3) * stride..][..width];
+        sum0 = f32x4_add(sum0, horizontal_energy(row0, width));
+        sum1 = f32x4_add(sum1, horizontal_energy(row1, width));
+        sum2 = f32x4_add(sum2, horizontal_energy(row2, width));
+        sum3 = f32x4_add(sum3, horizontal_energy(row3, width));
     }
-    for y in 0..height - 1 {
-        sums[y & 3] += squared_difference_sum(
-            &values[y * stride..][..width],
-            &values[(y + 1) * stride..][..width],
+    let vertical_rows = height - 1;
+    for base in (0..vertical_rows).step_by(4) {
+        sum0 = f32x4_add(
+            sum0,
+            vertical_energy(
+                &values[base * stride..],
+                &values[(base + 1) * stride..],
+                width,
+            ),
         );
+        if base + 1 < vertical_rows {
+            sum1 = f32x4_add(
+                sum1,
+                vertical_energy(
+                    &values[(base + 1) * stride..],
+                    &values[(base + 2) * stride..],
+                    width,
+                ),
+            );
+        }
+        if base + 2 < vertical_rows {
+            sum2 = f32x4_add(
+                sum2,
+                vertical_energy(
+                    &values[(base + 2) * stride..],
+                    &values[(base + 3) * stride..],
+                    width,
+                ),
+            );
+        }
+        if base + 3 < vertical_rows {
+            sum3 = f32x4_add(
+                sum3,
+                vertical_energy(
+                    &values[(base + 3) * stride..],
+                    &values[(base + 4) * stride..],
+                    width,
+                ),
+            );
+        }
     }
-    sums.into_iter().sum()
+    horizontal_sum_x4(f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3)))
 }
 
 #[inline]

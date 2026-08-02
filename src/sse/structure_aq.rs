@@ -34,174 +34,380 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-#[inline]
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+fn block_mean(block: &[f32; 64]) -> f32 {
+    let chunks = block.as_chunks::<4>().0;
+    let mut sum0 = _mm_setzero_ps();
+    let mut sum1 = _mm_setzero_ps();
+    for group in 0..8 {
+        let chunk = group * 2;
+        sum0 = _mm_add_ps(sum0, unsafe { _mm_loadu_ps(chunks[chunk].as_ptr()) });
+        sum1 = _mm_add_ps(sum1, unsafe { _mm_loadu_ps(chunks[chunk + 1].as_ptr()) });
+    }
+    hsum(_mm_add_ps(sum0, sum1)) * (1.0 / 64.0)
+}
+
+#[inline(never)]
 #[target_feature(enable = "sse4.1")]
 fn moments(block: &[f32; 64]) -> (f32, f32) {
     let chunks = block.as_chunks::<4>().0;
-    let mut sums = [_mm_setzero_ps(); 4];
-    for (i, chunk) in chunks.iter().enumerate() {
-        sums[i & 3] = _mm_add_ps(sums[i & 3], unsafe { _mm_loadu_ps(chunk.as_ptr()) });
-    }
-    let mean = hsum(_mm_add_ps(
-        _mm_add_ps(sums[0], sums[1]),
-        _mm_add_ps(sums[2], sums[3]),
-    )) * (1.0 / 64.0);
+    let mean = block_mean(block);
     let mean_v = _mm_set1_ps(mean);
-    let mut variances = [_mm_setzero_ps(); 4];
-    for (i, chunk) in chunks.iter().enumerate() {
-        let d = _mm_sub_ps(unsafe { _mm_loadu_ps(chunk.as_ptr()) }, mean_v);
-        variances[i & 3] = _mm_add_ps(variances[i & 3], _mm_mul_ps(d, d));
+    let mut variance0 = _mm_setzero_ps();
+    let mut variance1 = _mm_setzero_ps();
+    for group in 0..8 {
+        let chunk = group * 2;
+        let d0 = _mm_sub_ps(unsafe { _mm_loadu_ps(chunks[chunk].as_ptr()) }, mean_v);
+        let d1 = _mm_sub_ps(unsafe { _mm_loadu_ps(chunks[chunk + 1].as_ptr()) }, mean_v);
+        variance0 = _mm_add_ps(variance0, _mm_mul_ps(d0, d0));
+        variance1 = _mm_add_ps(variance1, _mm_mul_ps(d1, d1));
     }
-    let variance = _mm_add_ps(
-        _mm_add_ps(variances[0], variances[1]),
-        _mm_add_ps(variances[2], variances[3]),
-    );
+    let variance = _mm_add_ps(variance0, variance1);
     (mean, hsum(variance) * (1.0 / 64.0))
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn tensor_chunk(left: __m128, right: __m128, top: __m128, bottom: __m128, sums: &mut [__m128; 3]) {
-    let gx = _mm_mul_ps(_mm_sub_ps(right, left), _mm_set1_ps(0.5));
-    let gy = _mm_mul_ps(_mm_sub_ps(bottom, top), _mm_set1_ps(0.5));
-    sums[0] = _mm_add_ps(sums[0], _mm_mul_ps(gx, gx));
-    sums[1] = _mm_add_ps(sums[1], _mm_mul_ps(gx, gy));
-    sums[2] = _mm_add_ps(sums[2], _mm_mul_ps(gy, gy));
+#[cfg(target_arch = "x86_64")]
+fn load2<const X: usize>(row: &[f32; 8]) -> __m128 {
+    _mm_setr_ps(row[X], row[X + 1], 0.0, 0.0)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86_64")]
+fn tensor_gradients(left: __m128, right: __m128, top: __m128, bottom: __m128) -> (__m128, __m128) {
+    (
+        _mm_mul_ps(_mm_sub_ps(right, left), _mm_set1_ps(0.5)),
+        _mm_mul_ps(_mm_sub_ps(bottom, top), _mm_set1_ps(0.5)),
+    )
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86_64")]
 fn tensor(block: &[f32; 64]) -> [f32; 3] {
     let rows = block.as_chunks::<8>().0;
-    let mut sums = [_mm_setzero_ps(); 3];
+    let mut jxx = _mm_setzero_ps();
+    let mut jxy = _mm_setzero_ps();
+    let mut jyy = _mm_setzero_ps();
     for y in 1..7 {
-        tensor_chunk(
+        let (gx, gy) = tensor_gradients(
             unsafe { _mm_loadu_ps(rows[y].as_ptr()) },
             unsafe { _mm_loadu_ps(rows[y].as_ptr().add(2)) },
             unsafe { _mm_loadu_ps(rows[y - 1].as_ptr().add(1)) },
             unsafe { _mm_loadu_ps(rows[y + 1].as_ptr().add(1)) },
-            &mut sums,
         );
-        let mut left = [0.0; 4];
-        let mut right = [0.0; 4];
-        let mut top = [0.0; 4];
-        let mut bottom = [0.0; 4];
-        left[..2].copy_from_slice(&rows[y][4..6]);
-        right[..2].copy_from_slice(&rows[y][6..8]);
-        top[..2].copy_from_slice(&rows[y - 1][5..7]);
-        bottom[..2].copy_from_slice(&rows[y + 1][5..7]);
-        tensor_chunk(
-            unsafe { _mm_loadu_ps(left.as_ptr()) },
-            unsafe { _mm_loadu_ps(right.as_ptr()) },
-            unsafe { _mm_loadu_ps(top.as_ptr()) },
-            unsafe { _mm_loadu_ps(bottom.as_ptr()) },
-            &mut sums,
-        );
+        jxx = _mm_add_ps(jxx, _mm_mul_ps(gx, gx));
+        jxy = _mm_add_ps(jxy, _mm_mul_ps(gx, gy));
+        jyy = _mm_add_ps(jyy, _mm_mul_ps(gy, gy));
     }
-    sums.map(|sum| hsum(sum))
+    for y in 1..7 {
+        let (gx, gy) = tensor_gradients(
+            load2::<4>(&rows[y]),
+            load2::<6>(&rows[y]),
+            load2::<5>(&rows[y - 1]),
+            load2::<5>(&rows[y + 1]),
+        );
+        jxx = _mm_add_ps(jxx, _mm_mul_ps(gx, gx));
+        jxy = _mm_add_ps(jxy, _mm_mul_ps(gx, gy));
+        jyy = _mm_add_ps(jyy, _mm_mul_ps(gy, gy));
+    }
+    [hsum(jxx), hsum(jxy), hsum(jyy)]
 }
 
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "sse4.1")]
-fn predictor_chunk(value: __m128, predictions: [__m128; 5], errors: &mut [__m128; 5]) {
-    for (slot, prediction) in predictions.into_iter().enumerate() {
-        let e = _mm_sub_ps(value, prediction);
-        errors[slot] = _mm_add_ps(errors[slot], _mm_mul_ps(e, e));
+#[cfg(target_arch = "x86")]
+fn tensor_metric_row(block: &[f32; 64], y: usize, metric: usize) -> f32 {
+    let rows = block.as_chunks::<8>().0;
+    let left = unsafe { _mm_loadu_ps(rows[y].as_ptr()) };
+    let right = unsafe { _mm_loadu_ps(rows[y].as_ptr().add(2)) };
+    let top = unsafe { _mm_loadu_ps(rows[y - 1].as_ptr().add(1)) };
+    let bottom = unsafe { _mm_loadu_ps(rows[y + 1].as_ptr().add(1)) };
+    let gx = _mm_mul_ps(_mm_sub_ps(right, left), _mm_set1_ps(0.5));
+    let gy = _mm_mul_ps(_mm_sub_ps(bottom, top), _mm_set1_ps(0.5));
+    let value = match metric {
+        0 => _mm_mul_ps(gx, gx),
+        1 => _mm_mul_ps(gx, gy),
+        _ => _mm_mul_ps(gy, gy),
+    };
+    let mut result = hsum(value);
+    for x in 5..7 {
+        let gx = (rows[y][x + 1] - rows[y][x - 1]) * 0.5;
+        let gy = (rows[y + 1][x] - rows[y - 1][x]) * 0.5;
+        result += match metric {
+            0 => gx * gx,
+            1 => gx * gy,
+            _ => gy * gy,
+        };
     }
+    result
 }
 
-#[inline]
+#[inline(never)]
 #[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn tensor_metric(block: &[f32; 64], metric: usize) -> f32 {
+    let mut sum = 0.0;
+    for y in 1..7 {
+        sum += tensor_metric_row(block, y, metric);
+    }
+    sum
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn tensor(block: &[f32; 64]) -> [f32; 3] {
+    [
+        tensor_metric(block, 0),
+        tensor_metric(block, 1),
+        tensor_metric(block, 2),
+    ]
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86_64")]
 fn predictor_errors(block: &[f32; 64]) -> [f32; 5] {
     let rows = block.as_chunks::<8>().0;
-    let mut errors = [_mm_setzero_ps(); 5];
+    let mut error0 = _mm_setzero_ps();
+    let mut error1 = _mm_setzero_ps();
+    let mut error2 = _mm_setzero_ps();
+    let mut error3 = _mm_setzero_ps();
+    let mut error4 = _mm_setzero_ps();
     for y in 1..7 {
         let left = unsafe { _mm_loadu_ps(rows[y].as_ptr()) };
         let value = unsafe { _mm_loadu_ps(rows[y].as_ptr().add(1)) };
         let top = unsafe { _mm_loadu_ps(rows[y - 1].as_ptr().add(1)) };
         let top_left = unsafe { _mm_loadu_ps(rows[y - 1].as_ptr()) };
         let bottom_left = unsafe { _mm_loadu_ps(rows[y + 1].as_ptr()) };
-        predictor_chunk(
-            value,
-            [
-                left,
-                top,
-                top_left,
-                bottom_left,
-                _mm_sub_ps(_mm_add_ps(left, top), top_left),
-            ],
-            &mut errors,
-        );
-        let mut left = [0.0; 4];
-        let mut value = [0.0; 4];
-        let mut top = [0.0; 4];
-        let mut top_left = [0.0; 4];
-        let mut bottom_left = [0.0; 4];
-        left[..2].copy_from_slice(&rows[y][4..6]);
-        value[..2].copy_from_slice(&rows[y][5..7]);
-        top[..2].copy_from_slice(&rows[y - 1][5..7]);
-        top_left[..2].copy_from_slice(&rows[y - 1][4..6]);
-        bottom_left[..2].copy_from_slice(&rows[y + 1][4..6]);
-        let left = unsafe { _mm_loadu_ps(left.as_ptr()) };
-        let value = unsafe { _mm_loadu_ps(value.as_ptr()) };
-        let top = unsafe { _mm_loadu_ps(top.as_ptr()) };
-        let top_left = unsafe { _mm_loadu_ps(top_left.as_ptr()) };
-        let bottom_left = unsafe { _mm_loadu_ps(bottom_left.as_ptr()) };
-        predictor_chunk(
-            value,
-            [
-                left,
-                top,
-                top_left,
-                bottom_left,
-                _mm_sub_ps(_mm_add_ps(left, top), top_left),
-            ],
-            &mut errors,
-        );
+        let e0 = _mm_sub_ps(value, left);
+        error0 = _mm_add_ps(error0, _mm_mul_ps(e0, e0));
+        let e1 = _mm_sub_ps(value, top);
+        error1 = _mm_add_ps(error1, _mm_mul_ps(e1, e1));
+        let e2 = _mm_sub_ps(value, top_left);
+        error2 = _mm_add_ps(error2, _mm_mul_ps(e2, e2));
+        let e3 = _mm_sub_ps(value, bottom_left);
+        error3 = _mm_add_ps(error3, _mm_mul_ps(e3, e3));
+        let e4 = _mm_sub_ps(value, _mm_sub_ps(_mm_add_ps(left, top), top_left));
+        error4 = _mm_add_ps(error4, _mm_mul_ps(e4, e4));
+
+        let left = load2::<4>(&rows[y]);
+        let value = load2::<5>(&rows[y]);
+        let top = load2::<5>(&rows[y - 1]);
+        let top_left = load2::<4>(&rows[y - 1]);
+        let bottom_left = load2::<4>(&rows[y + 1]);
+        let e0 = _mm_sub_ps(value, left);
+        error0 = _mm_add_ps(error0, _mm_mul_ps(e0, e0));
+        let e1 = _mm_sub_ps(value, top);
+        error1 = _mm_add_ps(error1, _mm_mul_ps(e1, e1));
+        let e2 = _mm_sub_ps(value, top_left);
+        error2 = _mm_add_ps(error2, _mm_mul_ps(e2, e2));
+        let e3 = _mm_sub_ps(value, bottom_left);
+        error3 = _mm_add_ps(error3, _mm_mul_ps(e3, e3));
+        let e4 = _mm_sub_ps(value, _mm_sub_ps(_mm_add_ps(left, top), top_left));
+        error4 = _mm_add_ps(error4, _mm_mul_ps(e4, e4));
     }
-    errors.map(|error| hsum(error))
+    [
+        hsum(error0),
+        hsum(error1),
+        hsum(error2),
+        hsum(error3),
+        hsum(error4),
+    ]
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn predictor_error_row(block: &[f32; 64], y: usize, predictor: usize) -> f32 {
+    let rows = block.as_chunks::<8>().0;
+    let left = unsafe { _mm_loadu_ps(rows[y].as_ptr()) };
+    let value = unsafe { _mm_loadu_ps(rows[y].as_ptr().add(1)) };
+    let top = unsafe { _mm_loadu_ps(rows[y - 1].as_ptr().add(1)) };
+    let top_left = unsafe { _mm_loadu_ps(rows[y - 1].as_ptr()) };
+    let prediction = match predictor {
+        0 => left,
+        1 => top,
+        2 => top_left,
+        3 => unsafe { _mm_loadu_ps(rows[y + 1].as_ptr()) },
+        _ => _mm_sub_ps(_mm_add_ps(left, top), top_left),
+    };
+    let error = _mm_sub_ps(value, prediction);
+    let mut result = hsum(_mm_mul_ps(error, error));
+    for x in 5..7 {
+        let left = rows[y][x - 1];
+        let value = rows[y][x];
+        let top = rows[y - 1][x];
+        let top_left = rows[y - 1][x - 1];
+        let prediction = match predictor {
+            0 => left,
+            1 => top,
+            2 => top_left,
+            3 => rows[y + 1][x - 1],
+            _ => left + top - top_left,
+        };
+        let error = value - prediction;
+        result += error * error;
+    }
+    result
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn predictor_error(block: &[f32; 64], predictor: usize) -> f32 {
+    let mut sum = 0.0;
+    for y in 1..7 {
+        sum += predictor_error_row(block, y, predictor);
+    }
+    sum
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn predictor_errors(block: &[f32; 64]) -> [f32; 5] {
+    [
+        predictor_error(block, 0),
+        predictor_error(block, 1),
+        predictor_error(block, 2),
+        predictor_error(block, 3),
+        predictor_error(block, 4),
+    ]
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn squared_difference_sum(left: &[f32], right: &[f32]) -> f32 {
-    let (left4, left_tail) = left.as_chunks::<4>();
-    let (right4, right_tail) = right.as_chunks::<4>();
-    let mut sum = _mm_setzero_ps();
-    for (left, right) in left4.iter().zip(right4) {
-        let d = _mm_sub_ps(unsafe { _mm_loadu_ps(right.as_ptr()) }, unsafe {
-            _mm_loadu_ps(left.as_ptr())
+fn horizontal_energy(row: &[f32], width: usize) -> __m128 {
+    if width == 8 {
+        let d0 = _mm_sub_ps(unsafe { _mm_loadu_ps(row.as_ptr().add(1)) }, unsafe {
+            _mm_loadu_ps(row.as_ptr())
         });
-        sum = _mm_add_ps(sum, _mm_mul_ps(d, d));
+        let d1 = _mm_setr_ps(row[5] - row[4], row[6] - row[5], row[7] - row[6], 0.0);
+        _mm_add_ps(_mm_mul_ps(d0, d0), _mm_mul_ps(d1, d1))
+    } else {
+        let d = _mm_setr_ps(row[1] - row[0], row[2] - row[1], row[3] - row[2], 0.0);
+        _mm_mul_ps(d, d)
     }
-    if !left_tail.is_empty() {
-        let mut left = [0.0; 4];
-        let mut right = [0.0; 4];
-        left[..left_tail.len()].copy_from_slice(left_tail);
-        right[..right_tail.len()].copy_from_slice(right_tail);
-        let d = _mm_sub_ps(unsafe { _mm_loadu_ps(right.as_ptr()) }, unsafe {
-            _mm_loadu_ps(left.as_ptr())
-        });
-        sum = _mm_add_ps(sum, _mm_mul_ps(d, d));
-    }
-    hsum(sum)
 }
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn vertical_energy(top: &[f32], bottom: &[f32], width: usize) -> __m128 {
+    let d0 = _mm_sub_ps(unsafe { _mm_loadu_ps(bottom.as_ptr()) }, unsafe {
+        _mm_loadu_ps(top.as_ptr())
+    });
+    let mut energy = _mm_mul_ps(d0, d0);
+    if width == 8 {
+        let d1 = _mm_sub_ps(unsafe { _mm_loadu_ps(bottom.as_ptr().add(4)) }, unsafe {
+            _mm_loadu_ps(top.as_ptr().add(4))
+        });
+        energy = _mm_add_ps(energy, _mm_mul_ps(d1, d1));
+    }
+    energy
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86_64")]
 fn gradient_energy(values: &[f32], stride: usize, width: usize, height: usize) -> f32 {
-    let mut sums = [0.0; 4];
-    for y in 0..height {
-        let row = &values[y * stride..][..width];
-        sums[y & 3] += squared_difference_sum(&row[..width - 1], &row[1..]);
+    let mut sum0 = _mm_setzero_ps();
+    let mut sum1 = _mm_setzero_ps();
+    let mut sum2 = _mm_setzero_ps();
+    let mut sum3 = _mm_setzero_ps();
+    for base in (0..height).step_by(4) {
+        let row0 = &values[base * stride..][..width];
+        let row1 = &values[(base + 1) * stride..][..width];
+        let row2 = &values[(base + 2) * stride..][..width];
+        let row3 = &values[(base + 3) * stride..][..width];
+        sum0 = _mm_add_ps(sum0, horizontal_energy(row0, width));
+        sum1 = _mm_add_ps(sum1, horizontal_energy(row1, width));
+        sum2 = _mm_add_ps(sum2, horizontal_energy(row2, width));
+        sum3 = _mm_add_ps(sum3, horizontal_energy(row3, width));
     }
-    for y in 0..height - 1 {
-        sums[y & 3] += squared_difference_sum(
-            &values[y * stride..][..width],
-            &values[(y + 1) * stride..][..width],
+    let vertical_rows = height - 1;
+    for base in (0..vertical_rows).step_by(4) {
+        sum0 = _mm_add_ps(
+            sum0,
+            vertical_energy(
+                &values[base * stride..],
+                &values[(base + 1) * stride..],
+                width,
+            ),
+        );
+        if base + 1 < vertical_rows {
+            sum1 = _mm_add_ps(
+                sum1,
+                vertical_energy(
+                    &values[(base + 1) * stride..],
+                    &values[(base + 2) * stride..],
+                    width,
+                ),
+            );
+        }
+        if base + 2 < vertical_rows {
+            sum2 = _mm_add_ps(
+                sum2,
+                vertical_energy(
+                    &values[(base + 2) * stride..],
+                    &values[(base + 3) * stride..],
+                    width,
+                ),
+            );
+        }
+        if base + 3 < vertical_rows {
+            sum3 = _mm_add_ps(
+                sum3,
+                vertical_energy(
+                    &values[(base + 3) * stride..],
+                    &values[(base + 4) * stride..],
+                    width,
+                ),
+            );
+        }
+    }
+    hsum(_mm_add_ps(_mm_add_ps(sum0, sum1), _mm_add_ps(sum2, sum3)))
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+#[cfg(target_arch = "x86")]
+fn gradient_energy(values: &[f32], stride: usize, width: usize, height: usize) -> f32 {
+    let mut sum0 = _mm_setzero_ps();
+    let mut sum1 = _mm_setzero_ps();
+    for base in (0..height).step_by(2) {
+        sum0 = _mm_add_ps(sum0, horizontal_energy(&values[base * stride..], width));
+        sum1 = _mm_add_ps(
+            sum1,
+            horizontal_energy(&values[(base + 1) * stride..], width),
         );
     }
-    sums.into_iter().sum()
+    let vertical_rows = height - 1;
+    for base in (0..vertical_rows).step_by(2) {
+        sum0 = _mm_add_ps(
+            sum0,
+            vertical_energy(
+                &values[base * stride..],
+                &values[(base + 1) * stride..],
+                width,
+            ),
+        );
+        if base + 1 < vertical_rows {
+            sum1 = _mm_add_ps(
+                sum1,
+                vertical_energy(
+                    &values[(base + 1) * stride..],
+                    &values[(base + 2) * stride..],
+                    width,
+                ),
+            );
+        }
+    }
+    hsum(_mm_add_ps(sum0, sum1))
 }
 
 #[inline]
