@@ -28,7 +28,8 @@
  */
 
 use super::ans::{
-    AnsEncSymbolInfo, build_symbol_info, choose_use_prefix_code, encode_histogram, normalize_counts,
+    ANS_TAB_SIZE, AnsEncSymbolInfo, build_symbol_info, choose_use_prefix_code, encode_histogram,
+    normalize_counts,
 };
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
@@ -45,9 +46,24 @@ pub(crate) const ANS_ENABLED: bool = true;
 #[allow(unused)]
 pub(crate) const ANS_LOG_ALPHA_SIZE: u32 = 7;
 
-/// Default (prefix-only) ANS fields for a freshly built code.
-fn no_ans() -> (bool, Vec<Vec<u16>>, Vec<Vec<AnsEncSymbolInfo>>) {
-    (true, Vec::new(), Vec::new())
+/// ANS fields accumulated while building an entropy code. The prefix-only
+/// default owns no table storage.
+struct AnsCodeStorage {
+    use_prefix_code: bool,
+    freqs: Vec<Vec<u16>>,
+    symbols: Vec<Vec<AnsEncSymbolInfo>>,
+    reverse_maps: Vec<u16>,
+}
+
+impl Default for AnsCodeStorage {
+    fn default() -> Self {
+        Self {
+            use_prefix_code: true,
+            freqs: Vec::new(),
+            symbols: Vec::new(),
+            reverse_maps: Vec::new(),
+        }
+    }
 }
 
 /// Hot-path token writer. Matches libjxl-tiny's inline WriteToken.
@@ -314,16 +330,17 @@ pub(crate) fn optimize_prefix_codes(
     let mut histograms = vec![Histogram::new(); num_contexts];
     build_histograms(tokens, Some(&context_map), &mut histograms);
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
-    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
+    let ans = AnsCodeStorage::default();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; num_contexts],
         orig_context_map: None,
         orig_num_contexts: 0,
-        use_prefix_code,
-        ans_freqs,
-        ans_symbols,
+        use_prefix_code: ans.use_prefix_code,
+        ans_freqs: ans.freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
     }
 }
 
@@ -337,16 +354,17 @@ pub(crate) fn optimize_entropy_code(
     let mut context_map: Vec<u8> = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
-    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
+    let ans = AnsCodeStorage::default();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; histograms.len()],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
-        use_prefix_code,
-        ans_freqs,
-        ans_symbols,
+        use_prefix_code: ans.use_prefix_code,
+        ans_freqs: ans.freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
     }
 }
 
@@ -501,16 +519,24 @@ where
 
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
 
-    let (mut use_prefix_code, mut ans_freqs, mut ans_symbols) = no_ans();
+    let mut ans = AnsCodeStorage::default();
     if ANS_ENABLED {
         let depths: Vec<[u8; ALPHABET_SIZE]> = prefix_codes.iter().map(|c| c.depths).collect();
-        use_prefix_code = choose_use_prefix_code(&histograms, &depths);
-        if !use_prefix_code {
+        ans.use_prefix_code = choose_use_prefix_code(&histograms, &depths);
+        if !ans.use_prefix_code {
+            ans.freqs.reserve(histograms.len());
+            ans.symbols.reserve(histograms.len());
+            ans.reverse_maps
+                .resize(histograms.len() * ANS_TAB_SIZE as usize, 0);
             let mut freqs = vec![0u16; 0];
-            for h in &histograms {
+            for (histogram_index, h) in histograms.iter().enumerate() {
                 normalize_counts(&h.counts, &mut freqs);
-                ans_symbols.push(build_symbol_info(&freqs));
-                ans_freqs.push(freqs.clone());
+                let reverse_start = histogram_index * ANS_TAB_SIZE as usize;
+                ans.symbols.push(build_symbol_info(
+                    &freqs,
+                    &mut ans.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
+                ));
+                ans.freqs.push(freqs.clone());
             }
         }
     }
@@ -521,9 +547,10 @@ where
         hybrid_uint_configs,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
-        use_prefix_code,
-        ans_freqs,
-        ans_symbols,
+        use_prefix_code: ans.use_prefix_code,
+        ans_freqs: ans.freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
     }
 }
 
@@ -536,16 +563,17 @@ pub(crate) fn build_entropy_code_no_cluster(
     build_histograms(tokens, None, &mut histograms);
     let context_map: Vec<u8> = (0..num_contexts as u8).collect();
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
-    let (use_prefix_code, ans_freqs, ans_symbols) = no_ans();
+    let ans = AnsCodeStorage::default();
     OwnedEntropyCode {
         context_map,
         prefix_codes,
         hybrid_uint_configs: vec![HybridUintConfig::DEFAULT; num_contexts],
         orig_context_map: None,
         orig_num_contexts: num_contexts,
-        use_prefix_code,
-        ans_freqs,
-        ans_symbols,
+        use_prefix_code: ans.use_prefix_code,
+        ans_freqs: ans.freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
     }
 }
 
@@ -1139,6 +1167,7 @@ pub(crate) fn write_context_map(
         use_prefix_code: true,
         ans_freqs: Vec::new(),
         ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
     };
 
     w.write(1, 1); // lz77 enabled

@@ -31,7 +31,7 @@ fn encode_jixel(
         .with_quality(QUALITY)
         .with_progressive(false)
         .with_patches(false)
-        .with_speed(speed)
+        .with_speed(Speed::Slow)
         .with_num_threads(threads);
     let start = Instant::now();
     let bytes = jixel::encode_image(black_box(rgb), width, height, &config)

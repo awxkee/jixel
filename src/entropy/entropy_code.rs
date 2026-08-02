@@ -45,6 +45,7 @@ pub(crate) struct EntropyCode<'a> {
     pub(crate) use_prefix_code: bool,
     pub(crate) ans_freqs: &'a [Vec<u16>],
     pub(crate) ans_symbols: &'a [Vec<AnsEncSymbolInfo>],
+    pub(crate) ans_reverse_maps: &'a [u16],
 }
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
@@ -60,6 +61,7 @@ pub(crate) struct OwnedEntropyCode {
     pub(crate) use_prefix_code: bool,
     pub(crate) ans_freqs: Vec<Vec<u16>>,
     pub(crate) ans_symbols: Vec<Vec<AnsEncSymbolInfo>>,
+    pub(crate) ans_reverse_maps: Vec<u16>,
 }
 
 impl OwnedEntropyCode {
@@ -75,6 +77,7 @@ impl OwnedEntropyCode {
             use_prefix_code: self.use_prefix_code,
             ans_freqs: &self.ans_freqs,
             ans_symbols: &self.ans_symbols,
+            ans_reverse_maps: &self.ans_reverse_maps,
         }
     }
 }

@@ -310,6 +310,7 @@ fn build_icc_code(
         use_prefix_code: true,
         ans_freqs: Vec::new(),
         ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
     };
     for pc in &mut code.prefix_codes {
         single_symbol_patch(pc);

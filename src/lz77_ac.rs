@@ -152,6 +152,7 @@ pub(crate) fn build_lz_code_no_cluster(
         use_prefix_code: true,
         ans_freqs: Vec::new(),
         ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
     }
 }
 
@@ -199,6 +200,7 @@ pub(crate) fn build_ac_lz_code(
         use_prefix_code: true,
         ans_freqs: Vec::new(),
         ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
     }
 }
 

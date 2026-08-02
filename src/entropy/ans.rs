@@ -210,34 +210,46 @@ fn alias_lookup(a: &[AliasEntry; TABLE_ENTRIES], value: u32) -> AliasSymbol {
     }
 }
 
-/// Per-symbol encoder info: frequency and the reverse map (inverse of the alias
-/// lookup) used by put_symbol.
-#[derive(Clone)]
+/// Per-symbol encoder info. `reverse_offset` selects this symbol's range in the
+/// histogram's flat reverse map (the inverse of the alias lookup).
+#[derive(Clone, Copy)]
 pub(crate) struct AnsEncSymbolInfo {
     pub(crate) freq: u16,
     divider: FastDivU16,
-    pub(crate) reverse_map: Vec<u16>,
+    reverse_offset: u16,
 }
 
 /// Build the alias table for `freqs` and derive per-symbol encoder info.
-/// `freqs` must sum to ANS_TAB_SIZE.
-pub(crate) fn build_symbol_info(freqs: &[u16]) -> Vec<AnsEncSymbolInfo> {
+/// `freqs` must sum to ANS_TAB_SIZE and `reverse_map` must have exactly that
+/// many entries. The caller owns the storage so tables for every histogram can
+/// share one allocation without placing an 8 KiB temporary on the stack.
+pub(crate) fn build_symbol_info(freqs: &[u16], reverse_map: &mut [u16]) -> Vec<AnsEncSymbolInfo> {
+    assert_eq!(reverse_map.len(), ANS_TAB_SIZE as usize);
+    reverse_map.fill(0);
     let alias = init_alias_table(freqs);
-    let mut info: Vec<AnsEncSymbolInfo> = freqs
+    let mut reverse_offset = 0u16;
+    let symbols: Vec<AnsEncSymbolInfo> = freqs
         .iter()
-        .map(|&f| AnsEncSymbolInfo {
-            freq: f,
-            divider: FastDivU16::new_or_one(f),
-            reverse_map: vec![0u16; f as usize],
+        .map(|&freq| {
+            let info = AnsEncSymbolInfo {
+                freq,
+                divider: FastDivU16::new_or_one(freq),
+                reverse_offset,
+            };
+            reverse_offset += freq;
+            info
         })
         .collect();
+    debug_assert_eq!(u32::from(reverse_offset), ANS_TAB_SIZE);
+
     for slot in 0..ANS_TAB_SIZE {
         let s = alias_lookup(&alias, slot);
-        if s.value < info.len() && s.offset < info[s.value].reverse_map.len() {
-            info[s.value].reverse_map[s.offset] = slot as u16;
+        if s.value < symbols.len() && s.offset < symbols[s.value].freq as usize {
+            let offset = symbols[s.value].reverse_offset as usize + s.offset;
+            reverse_map[offset] = slot as u16;
         }
     }
-    info
+    symbols
 }
 
 pub(crate) struct AnsCoder {
@@ -250,10 +262,15 @@ impl AnsCoder {
         }
     }
     #[inline]
-    pub(crate) fn put_symbol(&mut self, info: &AnsEncSymbolInfo) -> Option<u16> {
+    pub(crate) fn put_symbol(
+        &mut self,
+        info: &AnsEncSymbolInfo,
+        reverse_map: &[u16],
+    ) -> Option<u16> {
         let freq = info.freq as u32;
         debug_assert!(freq > 0, "ANS symbol with zero frequency");
-        debug_assert_eq!(info.reverse_map.len(), freq as usize);
+        let reverse_offset = info.reverse_offset as usize;
+        debug_assert!(reverse_offset + freq as usize <= reverse_map.len());
 
         let mut state = self.state;
         let mut emitted = None;
@@ -263,7 +280,7 @@ impl AnsCoder {
         }
 
         let (q, rem) = info.divider.div_rem_fast(state, freq);
-        let mapped = info.reverse_map[rem as usize] as u32;
+        let mapped = reverse_map[reverse_offset + rem as usize] as u32;
         self.state = (q << ANS_LOG_TAB_SIZE) + mapped;
         emitted
     }
@@ -288,6 +305,7 @@ pub(crate) fn write_ans_tokens(
     tokens: &[Token],
     context_map: &[u8],
     symbol_info: &[Vec<AnsEncSymbolInfo>],
+    reverse_maps: &[u16],
     hybrid_uint_configs: &[super::token::HybridUintConfig],
     w: &mut BitWriter,
 ) {
@@ -316,8 +334,10 @@ pub(crate) fn write_ans_tokens(
         let sym = slot.sym as usize;
         debug_assert!(hist < symbol_info.len());
         debug_assert!(sym < symbol_info[hist].len());
+        let reverse_start = hist * ANS_TAB_SIZE as usize;
+        let reverse_map = &reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize];
         let info = &symbol_info[hist][sym];
-        if let Some(word) = coder.put_symbol(info) {
+        if let Some(word) = coder.put_symbol(info, reverse_map) {
             slot.emitted = word as u32;
         }
     }
@@ -513,4 +533,79 @@ pub(crate) fn choose_use_prefix_code(
         huff_total += huffman_data_bits(&h.counts, depths) + huffman_tree_bits_estimate(depths);
     }
     huff_total <= ans_total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_flat_reverse_map(freqs: &[u16]) {
+        let alias = init_alias_table(freqs);
+        let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+        let info = build_symbol_info(freqs, &mut reverse_map);
+        let mut legacy: Vec<Vec<u16>> = freqs
+            .iter()
+            .map(|&freq| vec![0u16; freq as usize])
+            .collect();
+        for slot in 0..ANS_TAB_SIZE {
+            let decoded = alias_lookup(&alias, slot);
+            legacy[decoded.value][decoded.offset] = slot as u16;
+        }
+        assert_eq!(reverse_map.len(), ANS_TAB_SIZE as usize);
+        assert_eq!(info.len(), freqs.len());
+
+        let mut expected_offset = 0usize;
+        for (symbol, (&freq, symbol_info)) in freqs.iter().zip(&info).enumerate() {
+            assert_eq!(symbol_info.freq, freq);
+            assert_eq!(symbol_info.reverse_offset as usize, expected_offset);
+            assert_eq!(
+                &reverse_map[expected_offset..expected_offset + freq as usize],
+                legacy[symbol]
+            );
+            for remainder in 0..freq as usize {
+                let slot = reverse_map[expected_offset + remainder] as u32;
+                let decoded = alias_lookup(&alias, slot);
+                assert_eq!(decoded.value, symbol);
+                assert_eq!(decoded.offset, remainder);
+            }
+            expected_offset += freq as usize;
+        }
+        assert_eq!(expected_offset, ANS_TAB_SIZE as usize);
+    }
+
+    #[test]
+    fn flat_reverse_map_inverts_alias_lookup() {
+        // Keep symbol metadata small: the 4096-entry reverse table belongs to
+        // the shared flat storage, never in a per-symbol or stack-local object.
+        assert!(core::mem::size_of::<AnsEncSymbolInfo>() <= 16);
+
+        let mut single = [0u16; TABLE_ENTRIES];
+        single[37] = ANS_TAB_SIZE as u16;
+        assert_flat_reverse_map(&single);
+
+        let counts: [u32; TABLE_ENTRIES] =
+            core::array::from_fn(|symbol| ((symbol * 29 + symbol * symbol * 7 + 11) % 251) as u32);
+        let mut normalized = Vec::new();
+        normalize_counts(&counts, &mut normalized);
+        assert_flat_reverse_map(&normalized);
+    }
+
+    #[test]
+    fn symbol_info_builds_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("ans-small-stack".into())
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let counts: [u32; TABLE_ENTRIES] =
+                    core::array::from_fn(|symbol| (symbol * 37 % 257 + 1) as u32);
+                let mut freqs = Vec::new();
+                normalize_counts(&counts, &mut freqs);
+                let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+                let symbols = build_symbol_info(&freqs, &mut reverse_map);
+                assert_eq!(symbols.len(), TABLE_ENTRIES);
+            })
+            .expect("failed to spawn ANS stack test")
+            .join()
+            .expect("ANS table construction overflowed its test stack");
+    }
 }

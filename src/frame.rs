@@ -883,6 +883,7 @@ pub(crate) fn write_compact_block_context_map(
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
     let empty_freqs: [Vec<u16>; 0] = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
         context_map: compact_block_context_map(),
         num_contexts: compact_block_context_map().len(),
@@ -894,6 +895,7 @@ pub(crate) fn write_compact_block_context_map(
         use_prefix_code: true,
         ans_freqs: &empty_freqs,
         ans_symbols: &empty_syms,
+        ans_reverse_maps: &empty_reverse_maps,
     };
     crate::entropy::write_context_map(&cm_entropy, huffman_pool, w);
 }
@@ -964,6 +966,7 @@ fn write_block_ctx_map(
     let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
     let empty_freqs: [Vec<u16>; 0] = [];
     let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+    let empty_reverse_maps: [u16; 0] = [];
     let cm_entropy = EntropyCode {
         context_map: &entries,
         num_contexts: entries.len(),
@@ -975,6 +978,7 @@ fn write_block_ctx_map(
         use_prefix_code: true,
         ans_freqs: &empty_freqs,
         ans_symbols: &empty_syms,
+        ans_reverse_maps: &empty_reverse_maps,
     };
     crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
 }
@@ -2054,6 +2058,7 @@ fn encode_frame_core(
                     &dc_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.ans_reverse_maps,
                     dc_code.hybrid_uint_configs,
                     &mut w,
                 );
@@ -2079,6 +2084,7 @@ fn encode_frame_core(
                     &meta_tokens_per_group[i],
                     dc_code.context_map,
                     dc_code.ans_symbols,
+                    dc_code.ans_reverse_maps,
                     dc_code.hybrid_uint_configs,
                     &mut w,
                 );
@@ -2131,6 +2137,7 @@ fn encode_frame_core(
                         pass_tokens,
                         code_ref.context_map,
                         code_ref.ans_symbols,
+                        code_ref.ans_reverse_maps,
                         code_ref.hybrid_uint_configs,
                         &mut w,
                     );

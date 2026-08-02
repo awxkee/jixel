@@ -603,6 +603,7 @@ where
         use_prefix_code: true,
         ans_freqs: &[],
         ans_symbols: &[],
+        ans_reverse_maps: &[],
     }
 }
 
