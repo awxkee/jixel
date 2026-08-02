@@ -47,7 +47,14 @@ fn dirty_log2f_x8(d: __m256) -> __m256 {
     );
 
     let a = _mm256_castsi256_ps(ix);
-    let x = _mm256_div_ps(_mm256_sub_ps(a, one), _mm256_add_ps(a, one));
+    let numerator = _mm256_sub_ps(a, one);
+    let denominator = _mm256_add_ps(a, one);
+    let reciprocal0 = _mm256_rcp_ps(denominator);
+    let reciprocal = _mm256_mul_ps(
+        reciprocal0,
+        _mm256_fnmadd_ps(denominator, reciprocal0, _mm256_set1_ps(2.0)),
+    );
+    let x = _mm256_mul_ps(numerator, reciprocal);
     let x2 = _mm256_mul_ps(x, x);
     let mut u = _mm256_set1_ps(0.412_198_57);
     u = _mm256_fmadd_ps(u, x2, _mm256_set1_ps(0.577_078_04));

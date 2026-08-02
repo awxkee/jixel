@@ -89,9 +89,12 @@ pub(crate) struct FrozenTokenPrices {
     context_map: Vec<u8>,
     configs: Vec<HybridUintConfig>,
     symbol_bits: Vec<[f32; ALPHABET_SIZE]>,
+    small_value_bits: Vec<f32>,
 }
 
 impl FrozenTokenPrices {
+    const NUM_SMALL_VALUES: usize = 256;
+
     pub(crate) fn new(code: &OwnedEntropyCode) -> Self {
         const UNSEEN_SYMBOL_BITS: f32 = 15.0;
         let mut symbol_bits =
@@ -124,17 +127,48 @@ impl FrozenTokenPrices {
                 }
             }
         }
+        let mut small_value_bits = Vec::with_capacity(symbol_bits.len() * Self::NUM_SMALL_VALUES);
+        for (bits, &config) in symbol_bits.iter().zip(&code.hybrid_uint_configs) {
+            small_value_bits.extend((0..Self::NUM_SMALL_VALUES).map(|value| {
+                let (symbol, extra_bits, _) = uint_encode_with_config(value as u32, config);
+                bits[symbol as usize] + extra_bits as f32
+            }));
+        }
         Self {
             context_map: code.context_map.clone(),
             configs: code.hybrid_uint_configs.clone(),
             symbol_bits,
+            small_value_bits,
         }
     }
 
     #[inline]
     pub(crate) fn token_bits(&self, token: Token) -> f32 {
         let cluster = self.context_map[token.context as usize] as usize;
+        if token.value < Self::NUM_SMALL_VALUES as u32 {
+            return self.small_value_bits[cluster * Self::NUM_SMALL_VALUES + token.value as usize];
+        }
         let (symbol, extra_bits, _) = uint_encode_with_config(token.value, self.configs[cluster]);
         self.symbol_bits[cluster][symbol as usize] + extra_bits as f32
+    }
+
+    /// Prices the adjacent `prev = 0/1` coefficient contexts together.
+    #[inline]
+    pub(crate) fn token_bits_pair(&self, context: u32, value: u32) -> [f32; 2] {
+        let cluster0 = self.context_map[context as usize] as usize;
+        let cluster1 = self.context_map[context as usize + 1] as usize;
+        if value < Self::NUM_SMALL_VALUES as u32 {
+            let value = value as usize;
+            return [
+                self.small_value_bits[cluster0 * Self::NUM_SMALL_VALUES + value],
+                self.small_value_bits[cluster1 * Self::NUM_SMALL_VALUES + value],
+            ];
+        }
+        let (symbol0, extra0, _) = uint_encode_with_config(value, self.configs[cluster0]);
+        let (symbol1, extra1, _) = uint_encode_with_config(value, self.configs[cluster1]);
+        [
+            self.symbol_bits[cluster0][symbol0 as usize] + extra0 as f32,
+            self.symbol_bits[cluster1][symbol1 as usize] + extra1 as f32,
+        ]
     }
 }

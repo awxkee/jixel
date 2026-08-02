@@ -266,22 +266,22 @@ fn rdoq_block(
                     continue;
                 }
                 let distortion = candidate_distortion[candidate_index];
-                for prev in 0..=1 {
-                    let token_cost = if remaining == 0 {
-                        0.0
-                    } else {
-                        RDOQ_LAMBDA
-                            * prices.token_bits(Token::new(
-                                context(remaining, k, prev),
-                                pack_signed(level),
-                            ))
-                    };
-                    let cost = distortion + token_cost + tail;
-                    let state = remaining * 2 + prev;
-                    if cost < current_cost[state] {
-                        current_cost[state] = cost;
-                        choices[window_index * stride + state] = candidate_index as u8;
-                    }
+                let token_cost = if remaining == 0 {
+                    [0.0; 2]
+                } else {
+                    let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
+                    [RDOQ_LAMBDA * bits[0], RDOQ_LAMBDA * bits[1]]
+                };
+                let state = remaining * 2;
+                let cost0 = distortion + token_cost[0] + tail;
+                if cost0 < current_cost[state] {
+                    current_cost[state] = cost0;
+                    choices[window_index * stride + state] = candidate_index as u8;
+                }
+                let cost1 = distortion + token_cost[1] + tail;
+                if cost1 < current_cost[state + 1] {
+                    current_cost[state + 1] = cost1;
+                    choices[window_index * stride + state + 1] = candidate_index as u8;
                 }
             }
         }
