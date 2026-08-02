@@ -39,7 +39,9 @@ use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forwar
 use crate::orientation::Orientation;
 use crate::xyb::XybMatrix;
 use crate::{ColorEncoding, EncodeError};
+use std::num::NonZero;
 use std::sync::Arc;
+use std::thread::available_parallelism;
 
 fn checked_buffer_size<T>(
     width: usize,
@@ -361,7 +363,9 @@ impl Default for EncodeConfig {
             min_nits: 0.0,
             relative_to_max_display: false,
             linear_below: 0.0,
-            num_threads: 1,
+            num_threads: available_parallelism()
+                .unwrap_or(NonZero::new(1).unwrap())
+                .get(),
             speed: Speed::Fast,
             boost: Some(DarkAqConfig::default()),
         }
@@ -390,7 +394,9 @@ impl Default for EncodeConfigImpl {
             min_nits: 0.0,
             relative_to_max_display: false,
             linear_below: 0.0,
-            num_threads: 1,
+            num_threads: available_parallelism()
+                .unwrap_or(NonZero::new(1).unwrap())
+                .get(),
             speed: Speed::Fast,
             dark_aq: Some(DarkAqConfig::default()),
         }
