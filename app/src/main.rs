@@ -19,13 +19,19 @@ struct Measurement {
     bytes: Vec<u8>,
 }
 
-fn encode_jixel(rgb: &[u8], width: usize, height: usize, threads: usize) -> Measurement {
+fn encode_jixel(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    threads: usize,
+    speed: Speed,
+) -> Measurement {
     let config = EncodeConfig::default()
         .with_lossless(false)
         .with_quality(QUALITY)
         .with_progressive(false)
         .with_patches(false)
-        .with_speed(Speed::Fastest)
+        .with_speed(speed)
         .with_num_threads(threads);
     let start = Instant::now();
     let bytes = jixel::encode_image(black_box(rgb), width, height, &config)
@@ -86,7 +92,7 @@ fn print_summary(name: &str, samples: &[Duration], output_size: usize, pixels: u
     );
 }
 
-fn parse_args() -> (PathBuf, usize) {
+fn parse_args() -> (PathBuf, usize, Speed) {
     let mut args = std::env::args().skip(1);
     let image = args
         .next()
@@ -99,16 +105,22 @@ fn parse_args() -> (PathBuf, usize) {
                 .expect("iterations must be a positive integer")
         })
         .unwrap_or(DEFAULT_ITERATIONS);
+    let speed = match args.next().as_deref() {
+        None | Some("fastest") => Speed::Fastest,
+        Some("fast") => Speed::Fast,
+        Some("slow") => Speed::Slow,
+        Some(speed) => panic!("unknown jixel speed {speed:?}; expected fastest, fast, or slow"),
+    };
     assert!(iterations != 0, "iterations must be greater than zero");
     assert!(
         args.next().is_none(),
-        "usage: cargo run -p app --release -- [image] [iterations]"
+        "usage: cargo run -p app --release -- [image] [iterations] [fastest|fast|slow]"
     );
-    (image, iterations)
+    (image, iterations, speed)
 }
 
 fn main() {
-    let (image_path, iterations) = parse_args();
+    let (image_path, iterations, speed) = parse_args();
     println!("image path: {:?}", image_path);
     let image = image::open(Path::new(&image_path)).expect("failed to open benchmark image");
     let rgb = image.to_rgb8();
@@ -127,7 +139,7 @@ fn main() {
         threads,
         iterations,
     );
-    println!("jixel: Fastest; libjxl: effort 3");
+    println!("jixel: {speed:?}; libjxl: effort 3");
 
     // Warm up dispatch, allocators, thread creation, and both codec libraries.
     black_box(encode_jixel(
@@ -135,6 +147,7 @@ fn main() {
         width as usize,
         height as usize,
         threads,
+        speed,
     ));
     black_box(encode_libjxl(rgb.as_raw(), width, height, threads));
 
@@ -146,12 +159,24 @@ fn main() {
     // Alternate order to reduce systematic thermal/frequency bias.
     for iteration in 0..iterations {
         let (jixel, libjxl) = if iteration % 2 == 0 {
-            let jixel = encode_jixel(rgb.as_raw(), width as usize, height as usize, threads);
+            let jixel = encode_jixel(
+                rgb.as_raw(),
+                width as usize,
+                height as usize,
+                threads,
+                speed,
+            );
             let libjxl = encode_libjxl(rgb.as_raw(), width, height, threads);
             (jixel, libjxl)
         } else {
             let libjxl = encode_libjxl(rgb.as_raw(), width, height, threads);
-            let jixel = encode_jixel(rgb.as_raw(), width as usize, height as usize, threads);
+            let jixel = encode_jixel(
+                rgb.as_raw(),
+                width as usize,
+                height as usize,
+                threads,
+                speed,
+            );
             (jixel, libjxl)
         };
         jixel_times.push(jixel.elapsed);

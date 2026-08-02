@@ -243,7 +243,20 @@ impl ThreadPool {
         T: Send,
         F: Fn(usize, &mut T, &mut CoderScratch) + Sync,
     {
-        let lanes = self.num_threads.min(items.len());
+        self.steal_for_each_mut_with_threads(caller_scratch, items, self.num_threads, f)
+    }
+
+    pub(crate) fn steal_for_each_mut_with_threads<T, F>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        items: &mut [T],
+        max_threads: usize,
+        f: F,
+    ) where
+        T: Send,
+        F: Fn(usize, &mut T, &mut CoderScratch) + Sync,
+    {
+        let lanes = self.num_threads.min(max_threads.max(1)).min(items.len());
         if lanes <= 1 {
             for (i, item) in items.iter_mut().enumerate() {
                 f(i, item, caller_scratch);

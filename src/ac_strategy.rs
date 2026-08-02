@@ -29,7 +29,9 @@
 //! Adaptive transform (AC strategy) selection via rate-distortion optimization.
 
 use crate::adaptive_quant::fast_exp2;
-use crate::coder_scratch::CoderScratch;
+use crate::coder_scratch::{
+    AcStrategyBandScratch, CachedQuantCost, CoderScratch, QuantRefinement, RerankDowngrade,
+};
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
@@ -391,9 +393,10 @@ fn strategy_cost(
     )
 }
 
-/// Reconstruction-based RD cost used by the second-pass transform rerank.
+/// Returns the reconstruction RD cost both with the caller's metadata charge
+/// and without it. The latter can be reused as quant refinement's incumbent.
 #[allow(clippy::too_many_arguments)]
-fn reconstruction_strategy_cost(
+fn reconstruction_strategy_cost_and_base(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     strategy: u8,
@@ -405,20 +408,53 @@ fn reconstruction_strategy_cost(
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
-) -> f32 {
-    strategy_cost_impl(
+) -> (f32, f32) {
+    let CoderScratch {
+        strategy_coeffs: coeffs,
+        transform_gather,
+        recon,
+        ..
+    } = scratch;
+    let (cx, cy, _) = prepare_strategy_coeffs(
         ctx,
-        scratch,
+        coeffs,
+        transform_gather,
+        strategy,
+        opsin,
+        px,
+        py,
+        cmap_factor,
+    );
+    let (distortion, rate) = reconstruction_dist_and_rate(
+        ctx,
+        recon,
+        coeffs,
         strategy,
         opsin,
         px,
         py,
         qac,
         qm_mult_x,
-        meta_r,
         distance,
         cmap_factor,
-        DistortionModel::Reconstruction,
+        cx,
+        cy,
+    );
+    (
+        rd_cost(
+            DistortionModel::Reconstruction,
+            distance,
+            meta_r,
+            distortion,
+            rate,
+        ),
+        rd_cost(
+            DistortionModel::Reconstruction,
+            distance,
+            0.0,
+            distortion,
+            rate,
+        ),
     )
 }
 
@@ -539,13 +575,58 @@ fn strategy_cost_impl(
     cmap_factor: [f32; 3],
     distortion_model: DistortionModel,
 ) -> f32 {
-    let mut cxy = (1usize, 1usize);
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather,
         recon,
         ..
     } = scratch;
+    let (cx, cy, size) = prepare_strategy_coeffs(
+        ctx,
+        coeffs,
+        transform_gather,
+        strategy,
+        opsin,
+        px,
+        py,
+        cmap_factor,
+    );
+
+    let (d_total, r_total) = match distortion_model {
+        DistortionModel::Reconstruction => reconstruction_dist_and_rate(
+            ctx,
+            recon,
+            coeffs,
+            strategy,
+            opsin,
+            px,
+            py,
+            qac,
+            qm_mult_x,
+            distance,
+            cmap_factor,
+            cx,
+            cy,
+        ),
+        DistortionModel::Coefficient => coefficient_dist_and_rate(
+            ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
+        ),
+    };
+    rd_cost(distortion_model, distance, meta_r, d_total, r_total)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_strategy_coeffs(
+    ctx: &EncodingContext,
+    coeffs: &mut [[f32; 1024]; 3],
+    transform_gather: &mut [f32; 1024],
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    cmap_factor: [f32; 3],
+) -> (usize, usize, usize) {
+    let mut cxy = (1usize, 1usize);
     for c in 0..3 {
         cxy = forward_transform(
             ctx,
@@ -561,53 +642,70 @@ fn strategy_cost_impl(
     let size = cx * cy * 64;
 
     // Apply the same per-tile CfL slopes used by final coefficient coding.
-    let [x, y, b] = &mut **coeffs;
+    let [x, y, b] = coeffs;
     apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
+    (cx, cy, size)
+}
 
-    let (d_total, r_total) = match distortion_model {
-        DistortionModel::Reconstruction => (ctx.recon_dist_and_rate)(
-            recon,
-            &ReconDistInput {
-                quantization: ReconQuantization {
-                    rate_log2_lut: ctx.rate_log2_lut,
-                    coeffs,
-                    inverse_matrices: [
-                        inverse_matrix_for(ctx, strategy, 0),
-                        inverse_matrix_for(ctx, strategy, 1),
-                        inverse_matrix_for(ctx, strategy, 2),
-                    ],
-                    qac,
-                    qm_mult_x,
-                    distance,
-                },
-                transform: ReconTransform {
-                    blocks_x: cx,
-                    blocks_y: cy,
-                    strategy,
-                },
-                source: ReconSource {
-                    opsin,
-                    x: px,
-                    y: py,
-                },
-                scoring: ReconScoring {
-                    factor_x: cmap_factor[0],
-                    factor_b: cmap_factor[2],
-                    banding: ctx.banding_protection,
-                },
+#[allow(clippy::too_many_arguments)]
+fn reconstruction_dist_and_rate(
+    ctx: &EncodingContext,
+    recon: &mut [[f32; 1024]; 8],
+    coeffs: &[[f32; 1024]; 3],
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    cx: usize,
+    cy: usize,
+) -> (f32, f32) {
+    (ctx.recon_dist_and_rate)(
+        recon,
+        &ReconDistInput {
+            quantization: ReconQuantization {
+                rate_log2_lut: ctx.rate_log2_lut,
+                coeffs,
+                inverse_matrices: [
+                    inverse_matrix_for(ctx, strategy, 0),
+                    inverse_matrix_for(ctx, strategy, 1),
+                    inverse_matrix_for(ctx, strategy, 2),
+                ],
+                qac,
+                qm_mult_x,
+                distance,
             },
-            &ctx.recon_error_kernels,
-        ),
-        DistortionModel::Coefficient => coefficient_dist_and_rate(
-            ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
-        ),
-    };
-    // `meta_r` prices the per-first-block AC-metadata rate (ACS + QF
-    // tokens, ~2-4 bits each) the per-coefficient model can't see; charged
-    // once per candidate block so merged tilings are credited for the
-    // blocks they remove. Faded in above d=1 (detail-dense content prefers
-    // the unbiased model at low distance); measured never below the RD
-    // curve on photo/fractal/abstract sets, up to -7% bytes at d>=3.
+            transform: ReconTransform {
+                blocks_x: cx,
+                blocks_y: cy,
+                strategy,
+            },
+            source: ReconSource {
+                opsin,
+                x: px,
+                y: py,
+            },
+            scoring: ReconScoring {
+                factor_x: cmap_factor[0],
+                factor_b: cmap_factor[2],
+                banding: ctx.banding_protection,
+            },
+        },
+        &ctx.recon_error_kernels,
+    )
+}
+
+#[inline]
+fn rd_cost(
+    distortion_model: DistortionModel,
+    distance: f32,
+    meta_r: f32,
+    d_total: f32,
+    r_total: f32,
+) -> f32 {
     let lam = match distortion_model {
         DistortionModel::Coefficient => RD_LAMBDA,
         DistortionModel::Reconstruction => {
@@ -717,28 +815,45 @@ fn risk_gated(k: f32, accept: f32, q_min: f32, q_max: f32, area_scale: f32) -> f
     accept * fast_exp2(-k * area_scale * spread)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn select_super_block(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    meta_r: f32,
+#[derive(Clone, Copy)]
+struct AcStrategyParams<'a> {
+    ctx: &'a EncodingContext,
+    opsin: &'a Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
     distance: f32,
-    opsin: &Image3F,
-    bx0: usize,
-    by0: usize,
-    px0: usize,
-    py0: usize,
-    qac: [[f32; 2]; 2],
-    qac_scale: f32,
+    scale: f32,
     qm_mult_x: f32,
-    ytox_map: &ImageSB,
-    ytob_map: &ImageSB,
-    ac_strategy: &mut AcStrategyImage,
+    ytox_map: &'a ImageSB,
+    ytob_map: &'a ImageSB,
+}
+
+struct SuperBlockContext<'a> {
+    params: AcStrategyParams<'a>,
+    meta_r: f32,
+    scope: SearchScope,
     dct8_cost_y0: usize,
     dct8_cost_stride: usize,
-    scope: SearchScope,
+}
+
+struct SuperBlockInput {
+    bx: usize,
+    by: usize,
+    qac: [[f32; 2]; 2],
+}
+
+fn select_super_block(
+    context: &SuperBlockContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &mut AcStrategyImage,
+    input: SuperBlockInput,
 ) -> SuperBlockCost {
-    let cmap_factor = cmap_factors(ytox_map, ytob_map, bx0, by0);
+    let params = context.params;
+    let ctx = params.ctx;
+    let (bx0, by0) = (input.bx, input.by);
+    let (px0, py0) = (params.dc_group_px + bx0 * 8, params.dc_group_py + by0 * 8);
+    let qac = input.qac;
+    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx0, by0);
 
     // Cost of the four individual DCT8 blocks: cost[dy][dx]. DCT8 is the
     // incumbent; every merge below must beat the corresponding tiled cost by a
@@ -751,16 +866,17 @@ fn select_super_block(
                 ctx,
                 scratch,
                 STRATEGY_DCT,
-                opsin,
+                params.opsin,
                 px0 + dx * 8,
                 py0 + dy * 8,
                 qac[dy][dx],
-                qm_mult_x,
-                meta_r,
-                distance,
+                params.qm_mult_x,
+                context.meta_r,
+                params.distance,
                 cmap_factor,
             );
-            scratch.dct8_costs[(by0 + dy - dct8_cost_y0) * dct8_cost_stride + bx0 + dx] =
+            scratch.dct8_costs
+                [(by0 + dy - context.dct8_cost_y0) * context.dct8_cost_stride + bx0 + dx] =
                 c8[dy][dx];
         }
     }
@@ -769,7 +885,7 @@ fn select_super_block(
     // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
     let merge = ctx.merge;
     let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> f32 {
-        if !scope.rectangles() {
+        if !context.scope.rectangles() {
             return f32::INFINITY;
         }
         merge.bias_rect
@@ -777,13 +893,13 @@ fn select_super_block(
                 ctx,
                 scratch,
                 strategy,
-                opsin,
+                params.opsin,
                 px,
                 py,
                 qac,
-                qm_mult_x,
-                meta_r,
-                distance,
+                params.qm_mult_x,
+                context.meta_r,
+                params.distance,
                 cmap_factor,
             )
     };
@@ -798,13 +914,13 @@ fn select_super_block(
             ctx,
             scratch,
             STRATEGY_DCT16X16,
-            opsin,
+            params.opsin,
             px0,
             py0,
-            aggregate_qac_2x2(qac, qac_scale, distance),
-            qm_mult_x,
-            meta_r,
-            distance,
+            aggregate_qac_2x2(qac, params.scale, params.distance),
+            params.qm_mult_x,
+            context.meta_r,
+            params.distance,
             cmap_factor,
         );
 
@@ -937,43 +1053,101 @@ fn quant_refinement_steps(distance: f32) -> usize {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn refine_quant_field(
-    ctx: &EncodingContext,
+struct QuantRefinementContext<'a> {
+    params: AcStrategyParams<'a>,
+    ac_strategy: &'a AcStrategyImage,
+    current_costs: &'a [f32],
+    bands: &'a [(usize, usize)],
+    num_threads: usize,
+}
+
+struct QuantRefinementSearch<'a> {
+    context: &'a QuantRefinementContext<'a>,
+    quant_field: &'a ImageB,
+}
+
+fn find_quant_refinements(
+    search: &QuantRefinementSearch<'_>,
     scratch: &mut CoderScratch,
-    opsin: &Image3F,
-    dc_group_px: usize,
-    dc_group_py: usize,
-    distance: f32,
-    scale: f32,
-    qm_mult_x: f32,
-    quant_field: &mut ImageB,
-    ytox_map: &ImageSB,
-    ytob_map: &ImageSB,
-    ac_strategy: &AcStrategyImage,
+    band: (usize, usize),
+    refinements: &mut Vec<QuantRefinement>,
 ) {
+    let context = search.context;
+    let params = context.params;
+    let quant_field = search.quant_field;
+    let ac_strategy = context.ac_strategy;
+    let (y0, y1) = band;
+    let ctx = params.ctx;
+    let distance = params.distance;
     let steps = quant_refinement_steps(distance);
     if steps == 0 {
         return;
     }
     for (bx, by, strategy) in ac_strategy.iter_first_blocks() {
+        if by < y0 || by >= y1 {
+            continue;
+        }
         let cov_x = AcStrategyImage::covered_blocks_x_of(strategy);
         let cov_y = AcStrategyImage::covered_blocks_y_of(strategy);
         let current_q = quant_field.row(by)[bx];
         if current_q <= 1 {
             continue;
         }
-        let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
-        let px = dc_group_px + bx * 8;
-        let py = dc_group_py + by * 8;
+        let cmap = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+        let px = params.dc_group_px + bx * 8;
+        let py = params.dc_group_py + by * 8;
+        let CoderScratch {
+            strategy_coeffs: coeffs,
+            transform_gather,
+            recon,
+            ..
+        } = scratch;
+        let (cx, cy, _) = prepare_strategy_coeffs(
+            ctx,
+            coeffs,
+            transform_gather,
+            strategy,
+            params.opsin,
+            px,
+            py,
+            cmap,
+        );
         let mut cost = |q: u8| {
-            let qac = scale * q as f32;
-            reconstruction_strategy_cost(
-                ctx, scratch, strategy, opsin, px, py, qac, qm_mult_x, 0.0, distance, cmap,
+            let qac = params.scale * q as f32;
+            let (distortion, rate) = reconstruction_dist_and_rate(
+                ctx,
+                recon,
+                coeffs,
+                strategy,
+                params.opsin,
+                px,
+                py,
+                qac,
+                params.qm_mult_x,
+                distance,
+                cmap,
+                cx,
+                cy,
+            );
+            rd_cost(
+                DistortionModel::Reconstruction,
+                distance,
+                0.0,
+                distortion,
+                rate,
             )
         };
         let mut best_q = current_q;
-        let mut best_cost = cost(current_q);
+        let cached_cost = context
+            .current_costs
+            .get(by * ac_strategy.xsize() + bx)
+            .copied()
+            .unwrap_or(f32::NAN);
+        let mut best_cost = if cached_cost.is_finite() {
+            cached_cost
+        } else {
+            cost(current_q)
+        };
         // Bidirectional: q-1/q-2 can only save rate on over-spent blocks; q+1/q+2
         // let the field *spend* a step where the reconstruction says it is cheap.
         let candidates = if steps == 2 {
@@ -1004,8 +1178,56 @@ fn refine_quant_field(
             }
         }
         if best_q != current_q {
-            for iy in 0..cov_y {
-                quant_field.row_mut(by + iy)[bx..bx + cov_x].fill(best_q);
+            refinements.push(QuantRefinement {
+                bx,
+                by,
+                cov_x,
+                cov_y,
+                q: best_q,
+            });
+        }
+    }
+}
+
+fn refine_quant_field(
+    context: &QuantRefinementContext<'_>,
+    scratch: &mut CoderScratch,
+    quant_field: &mut ImageB,
+    band_scratch: &mut [AcStrategyBandScratch],
+) {
+    if quant_refinement_steps(context.params.distance) == 0 {
+        return;
+    }
+    {
+        let search = QuantRefinementSearch {
+            context,
+            quant_field,
+        };
+        context
+            .params
+            .ctx
+            .thread_pool
+            .steal_for_each_mut_with_threads(
+                scratch,
+                &mut band_scratch[..context.bands.len()],
+                context.num_threads,
+                |i, band_scratch, scratch| {
+                    band_scratch.quant_refinements.clear();
+                    find_quant_refinements(
+                        &search,
+                        scratch,
+                        context.bands[i],
+                        &mut band_scratch.quant_refinements,
+                    );
+                },
+            );
+    }
+    for band in &band_scratch[..context.bands.len()] {
+        for refinement in &band.quant_refinements {
+            for iy in 0..refinement.cov_y {
+                quant_field.row_mut(refinement.by + iy)
+                    [refinement.bx..refinement.bx + refinement.cov_x]
+                    .fill(refinement.q);
             }
         }
     }
@@ -1056,27 +1278,40 @@ fn block_qac_2x2(quant_field: &ImageB, bx: usize, by: usize, scale: f32) -> [[f3
 /// loop bounds) use the global size, exactly as the serial loop would, so a
 /// 4-aligned `[y_begin, y_end)` partition reproduces the single-threaded
 /// decision sequence bit-for-bit. Reads `quant_field`/`opsin` only.
-#[allow(clippy::too_many_arguments)]
-fn select_band(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
+struct SelectionContext<'a> {
+    params: AcStrategyParams<'a>,
+    quant_field: &'a ImageB,
     meta_r: f32,
-    distance: f32,
-    opsin: &Image3F,
-    dc_group_px: usize,
-    dc_group_py: usize,
-    scale: f32,
-    qm_mult_x: f32,
-    quant_field: &ImageB,
-    ytox_map: &ImageSB,
-    ytob_map: &ImageSB,
-    ac_strategy: &mut AcStrategyImage,
-    xsize: usize,
-    ysize: usize,
-    y_begin: usize,
-    y_end: usize,
     scope: SearchScope,
+}
+
+fn select_band(
+    selection: &SelectionContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &mut AcStrategyImage,
+    band: (usize, usize),
 ) -> f32 {
+    let params = selection.params;
+    let ctx = params.ctx;
+    let opsin = params.opsin;
+    let distance = params.distance;
+    let scale = params.scale;
+    let qm_mult_x = params.qm_mult_x;
+    let quant_field = selection.quant_field;
+    let ytox_map = params.ytox_map;
+    let ytob_map = params.ytob_map;
+    let meta_r = selection.meta_r;
+    let scope = selection.scope;
+    let (y_begin, y_end) = band;
+    let xsize = ac_strategy.xsize();
+    let ysize = ac_strategy.ysize();
+    let super_block = SuperBlockContext {
+        params,
+        meta_r,
+        scope,
+        dct8_cost_y0: y_begin,
+        dct8_cost_stride: xsize,
+    };
     let merge = ctx.merge;
     // First-pass DCT8 incumbents are consumed again by the sub-8 refinement.
     // Keep only this worker's row band so parallel selection stays independent.
@@ -1103,24 +1338,14 @@ fn select_band(
                         let sby = by + sy * 2;
                         let qac = block_qac_2x2(quant_field, sbx, sby, scale);
                         let costs = select_super_block(
-                            ctx,
+                            &super_block,
                             scratch,
-                            meta_r,
-                            distance,
-                            opsin,
-                            sbx,
-                            sby,
-                            dc_group_px + sbx * 8,
-                            dc_group_py + sby * 8,
-                            qac,
-                            scale,
-                            qm_mult_x,
-                            ytox_map,
-                            ytob_map,
                             ac_strategy,
-                            y_begin,
-                            xsize,
-                            scope,
+                            SuperBlockInput {
+                                bx: sbx,
+                                by: sby,
+                                qac,
+                            },
                         );
                         sub_total += costs.chosen;
                         dct8_total += costs.dct8;
@@ -1133,8 +1358,8 @@ fn select_band(
                     scratch,
                     STRATEGY_DCT32X32,
                     opsin,
-                    dc_group_px + bx * 8,
-                    dc_group_py + by * 8,
+                    params.dc_group_px + bx * 8,
+                    params.dc_group_py + by * 8,
                     qac32,
                     qm_mult_x,
                     meta_r,
@@ -1154,8 +1379,8 @@ fn select_band(
                             scratch,
                             strategy,
                             opsin,
-                            dc_group_px + bx * 8,
-                            dc_group_py + by * 8,
+                            params.dc_group_px + bx * 8,
+                            params.dc_group_py + by * 8,
                             region_qac(quant_field, bx, by, cw, ch, scale, distance),
                             qm_mult_x,
                             meta_r,
@@ -1232,48 +1457,20 @@ fn select_band(
                 for sby in [by, by + 2] {
                     let qac = block_qac_2x2(quant_field, bx, sby, scale);
                     let _ = select_super_block(
-                        ctx,
+                        &super_block,
                         scratch,
-                        meta_r,
-                        distance,
-                        opsin,
-                        bx,
-                        sby,
-                        dc_group_px + bx * 8,
-                        dc_group_py + sby * 8,
-                        qac,
-                        scale,
-                        qm_mult_x,
-                        ytox_map,
-                        ytob_map,
                         ac_strategy,
-                        y_begin,
-                        xsize,
-                        scope,
+                        SuperBlockInput { bx, by: sby, qac },
                     );
                 }
                 bx += 2;
             } else {
                 let qac = block_qac_2x2(quant_field, bx, by, scale);
                 let _ = select_super_block(
-                    ctx,
+                    &super_block,
                     scratch,
-                    meta_r,
-                    distance,
-                    opsin,
-                    bx,
-                    by,
-                    dc_group_px + bx * 8,
-                    dc_group_py + by * 8,
-                    qac,
-                    scale,
-                    qm_mult_x,
-                    ytox_map,
-                    ytob_map,
                     ac_strategy,
-                    y_begin,
-                    xsize,
-                    scope,
+                    SuperBlockInput { bx, by, qac },
                 );
                 bx += 2;
             }
@@ -1297,8 +1494,8 @@ fn select_band(
                 continue;
             }
             let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-            let px = dc_group_px + bx * 8;
-            let py = dc_group_py + by * 8;
+            let px = params.dc_group_px + bx * 8;
+            let py = params.dc_group_py + by * 8;
             let cmap_factor = cmap_factors(ytox_map, ytob_map, bx, by);
             let cached_dct8 = scratch.dct8_costs[(by - y_begin) * xsize + bx];
             let costs = sub8_strategy_costs(
@@ -1348,16 +1545,21 @@ fn select_band(
 /// boundary). The serial loop only ever takes non-4 (`+2`) steps at the image
 /// bottom, which lands wholly inside the final band — hence the partition
 /// reproduces the single-threaded `by` sequence exactly.
-fn selection_bands(ysize: usize, n: usize) -> Vec<(usize, usize)> {
-    let mut bounds = vec![0usize];
+fn fill_selection_bands(bands: &mut Vec<(usize, usize)>, ysize: usize, n: usize) {
+    bands.clear();
+    if n <= 1 || ysize < 8 {
+        bands.push((0, ysize));
+        return;
+    }
+    let mut previous = 0;
     for k in 1..n {
         let b = (ysize * k / n) / 4 * 4;
-        if b > *bounds.last().unwrap() && b < ysize {
-            bounds.push(b);
+        if b > previous && b < ysize {
+            bands.push((previous, b));
+            previous = b;
         }
     }
-    bounds.push(ysize);
-    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+    bands.push((previous, ysize));
 }
 
 pub(crate) fn fill_ac_strategy(
@@ -1389,73 +1591,51 @@ pub(crate) fn fill_ac_strategy(
     // Per-candidate-block metadata rate for the strategy chooser (bits),
     // faded in above d=1 (see strategy_cost).
     let meta_r = META_R;
-
-    let bands = if num_threads > 1 && ysize >= 8 {
-        selection_bands(ysize, num_threads)
-    } else {
-        vec![(0, ysize)]
+    let params = AcStrategyParams {
+        ctx,
+        opsin,
+        dc_group_px,
+        dc_group_py,
+        distance,
+        scale,
+        qm_mult_x,
+        ytox_map,
+        ytob_map,
     };
 
-    let benefit = if bands.len() <= 1 {
-        select_band(
-            ctx,
-            scratch,
-            meta_r,
-            distance,
-            opsin,
-            dc_group_px,
-            dc_group_py,
-            scale,
-            qm_mult_x,
-            quant_field,
-            ytox_map,
-            ytob_map,
-            ac_strategy,
-            xsize,
-            ysize,
-            0,
-            ysize,
-            scope,
-        )
+    // Keep all pipeline storage on the worker scratch. Taking ownership lets
+    // its fields remain borrowed while `scratch` is handed to nested work.
+    let mut pipeline = std::mem::take(&mut scratch.ac_strategy);
+    fill_selection_bands(&mut pipeline.bands, ysize, num_threads);
+    let parallel_selection = pipeline.bands.len() > 1;
+    pipeline.prepare_bands(xsize, ysize, parallel_selection);
+
+    let selection = SelectionContext {
+        params,
+        quant_field,
+        meta_r,
+        scope,
+    };
+    let benefit = if !parallel_selection {
+        select_band(&selection, scratch, ac_strategy, (0, ysize))
     } else {
-        // Each band selects into its own fresh (default) strategy image, reading
-        // the shared opsin/quant_field; results merge deterministically by row.
-        let qf: &ImageB = quant_field;
-        let bands_ref = &bands;
-        let results = ctx.thread_pool.steal_map_with_threads(
+        // Each band selects into its reusable strategy image, reading the shared
+        // opsin/quant field; results merge deterministically by row.
+        let bands = &pipeline.bands;
+        let band_scratch = &mut pipeline.band_scratch[..bands.len()];
+        ctx.thread_pool.steal_for_each_mut_with_threads(
             scratch,
-            bands.len(),
+            band_scratch,
             num_threads,
-            |i, scratch| {
-                let (y0, y1) = bands_ref[i];
-                let mut local = AcStrategyImage::new(xsize, ysize);
-                let b = select_band(
-                    ctx,
-                    scratch,
-                    meta_r,
-                    distance,
-                    opsin,
-                    dc_group_px,
-                    dc_group_py,
-                    scale,
-                    qm_mult_x,
-                    qf,
-                    ytox_map,
-                    ytob_map,
-                    &mut local,
-                    xsize,
-                    ysize,
-                    y0,
-                    y1,
-                    scope,
-                );
-                (local, b)
+            |i, output, scratch| {
+                let (y0, y1) = bands[i];
+                output.benefit = select_band(&selection, scratch, &mut output.strategy, (y0, y1));
             },
         );
         let mut benefit = 0.0f32;
-        for (&(y0, y1), (local, b)) in bands.iter().zip(results.iter()) {
-            ac_strategy.copy_rows_from(local, y0, y1);
-            benefit += b;
+        for (&(y0, y1), output) in bands.iter().zip(band_scratch) {
+            ac_strategy.copy_rows_from(&output.strategy, y0, y1);
+            benefit += output.benefit;
         }
         benefit
     };
@@ -1470,115 +1650,195 @@ pub(crate) fn fill_ac_strategy(
     // The SSIM reconstruction rerank runs in both scopes. Under
     // `SearchScope::Squares` the only merges present are DCT16X16 and
     // DCT32X32, so it scores exactly those.
-    if scope.rerank(distance) {
-        rerank_large_transforms(
-            ctx,
-            scratch,
-            opsin,
-            dc_group_px,
-            dc_group_py,
-            distance,
-            scale,
-            qm_mult_x,
-            meta_r,
+    let reranked = scope.rerank(distance);
+    if reranked {
+        pipeline.prepare_rerank(xsize, ysize);
+        let rerank = RerankContext {
+            params,
             quant_field,
-            ytox_map,
-            ytob_map,
+            bands: &pipeline.bands,
+            num_threads,
+        };
+        let band_count = pipeline.bands.len();
+        rerank_large_transforms(
+            &rerank,
+            scratch,
             ac_strategy,
+            &mut pipeline.band_scratch[..band_count],
+            &mut pipeline.current_costs,
         );
     }
 
     adjust_quant_field(ac_strategy, distance, quant_field);
-    refine_quant_field(
-        ctx,
-        scratch,
-        opsin,
-        dc_group_px,
-        dc_group_py,
-        distance,
-        scale,
-        qm_mult_x,
-        quant_field,
-        ytox_map,
-        ytob_map,
+    if quant_refinement_steps(distance) != 0 {
+        pipeline.prepare_refinement(xsize);
+    }
+    let current_costs = if reranked {
+        pipeline.current_costs.as_slice()
+    } else {
+        &[]
+    };
+    let refinement = QuantRefinementContext {
+        params,
         ac_strategy,
+        current_costs,
+        bands: &pipeline.bands,
+        num_threads,
+    };
+    let band_count = pipeline.bands.len();
+    refine_quant_field(
+        &refinement,
+        scratch,
+        quant_field,
+        &mut pipeline.band_scratch[..band_count],
     );
+    scratch.ac_strategy = pipeline;
     benefit
 }
 
 /// Reconstruction-based rerank pass: for each selected merge, compare its
 /// SSIM-reconstruction cost against the tiled DCT8 and downgrade if DCT8 wins.
-#[allow(clippy::too_many_arguments)]
-fn rerank_large_transforms(
-    ctx: &EncodingContext,
+struct RerankContext<'a> {
+    params: AcStrategyParams<'a>,
+    quant_field: &'a ImageB,
+    bands: &'a [(usize, usize)],
+    num_threads: usize,
+}
+
+fn find_rerank_downgrades(
+    rerank: &RerankContext<'_>,
     scratch: &mut CoderScratch,
-    opsin: &Image3F,
-    dc_group_px: usize,
-    dc_group_py: usize,
-    distance: f32,
-    scale: f32,
-    qm_mult_x: f32,
-    _meta_r: f32,
-    quant_field: &ImageB,
-    ytox_map: &ImageSB,
-    ytob_map: &ImageSB,
-    ac_strategy: &mut AcStrategyImage,
+    ac_strategy: &AcStrategyImage,
+    band: (usize, usize),
+    output: &mut AcStrategyBandScratch,
 ) {
+    let params = rerank.params;
+    let ctx = params.ctx;
+    let (y0, y1) = band;
     let rerank_margin = ctx.merge.rerank_margin;
     // The rerank's own metadata charge. The selection pass keeps META_R, but
     // here the tiled-DCT8 alternative pays it PER TILE (16x for a 32x32)
     // while the merge pays once — a structural pro-merge credit this
     // constant prices independently (review-3 §4).
     let meta_r = RERANK_META_R;
-    let mut downgrades: Vec<(usize, usize, usize, usize)> = Vec::new();
+    output.rerank_downgrades.clear();
+    output.current_costs.clear();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
+        if by < y0 || by >= y1 {
+            continue;
+        }
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
         let cyb = AcStrategyImage::covered_blocks_y_of(strat);
         if cxb * cyb <= 1 {
             continue; // only merges
         }
-        let (px, py) = (dc_group_px + bx * 8, dc_group_py + by * 8);
-        let qac_big = region_qac(quant_field, bx, by, cxb, cyb, scale, distance);
-        let j_big = reconstruction_strategy_cost(
+        let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
+        let qac_big = region_qac(
+            rerank.quant_field,
+            bx,
+            by,
+            cxb,
+            cyb,
+            params.scale,
+            params.distance,
+        );
+        let (j_big, big_current_cost) = reconstruction_strategy_cost_and_base(
             ctx,
             scratch,
             strat,
-            opsin,
+            params.opsin,
             px,
             py,
             qac_big,
-            qm_mult_x,
+            params.qm_mult_x,
             meta_r,
-            distance,
-            cmap_factors(ytox_map, ytob_map, bx, by),
+            params.distance,
+            cmap_factors(params.ytox_map, params.ytob_map, bx, by),
         );
         let mut j_dct8 = 0.0f32;
+        let tiled_costs_start = output.current_costs.len();
         for iy in 0..cyb {
             for ix in 0..cxb {
-                let q = region_qac(quant_field, bx + ix, by + iy, 1, 1, scale, distance);
-                j_dct8 += reconstruction_strategy_cost(
+                let q = region_qac(
+                    rerank.quant_field,
+                    bx + ix,
+                    by + iy,
+                    1,
+                    1,
+                    params.scale,
+                    params.distance,
+                );
+                let (cost, current_cost) = reconstruction_strategy_cost_and_base(
                     ctx,
                     scratch,
                     STRATEGY_DCT,
-                    opsin,
+                    params.opsin,
                     px + ix * 8,
                     py + iy * 8,
                     q,
-                    qm_mult_x,
+                    params.qm_mult_x,
                     meta_r,
-                    distance,
-                    cmap_factors(ytox_map, ytob_map, bx + ix, by + iy),
+                    params.distance,
+                    cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
                 );
+                j_dct8 += cost;
+                output.current_costs.push(CachedQuantCost {
+                    bx: bx + ix,
+                    by: by + iy,
+                    cost: current_cost,
+                });
             }
         }
         if j_dct8 < j_big * rerank_margin {
-            downgrades.push((bx, by, cxb, cyb));
+            output.rerank_downgrades.push(RerankDowngrade {
+                bx,
+                by,
+                cov_x: cxb,
+                cov_y: cyb,
+            });
+        } else {
+            output.current_costs.truncate(tiled_costs_start);
+            output.current_costs.push(CachedQuantCost {
+                bx,
+                by,
+                cost: big_current_cost,
+            });
         }
     }
-    for (bx, by, cxb, cyb) in downgrades {
-        for iy in 0..cyb {
-            for ix in 0..cxb {
-                ac_strategy.set_first(bx + ix, by + iy, STRATEGY_DCT);
+}
+
+fn rerank_large_transforms(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &mut AcStrategyImage,
+    band_scratch: &mut [AcStrategyBandScratch],
+    current_costs: &mut [f32],
+) {
+    let ysize = ac_strategy.ysize();
+    let ac_strategy_ref: &AcStrategyImage = ac_strategy;
+    rerank
+        .params
+        .ctx
+        .thread_pool
+        .steal_for_each_mut_with_threads(
+            scratch,
+            &mut band_scratch[..rerank.bands.len()],
+            rerank.num_threads,
+            |i, output, scratch| {
+                find_rerank_downgrades(rerank, scratch, ac_strategy_ref, rerank.bands[i], output);
+            },
+        );
+    debug_assert_eq!(current_costs.len(), ac_strategy.xsize() * ysize);
+    current_costs.fill(f32::NAN);
+    for result in &band_scratch[..rerank.bands.len()] {
+        for cached in &result.current_costs {
+            current_costs[cached.by * ac_strategy.xsize() + cached.bx] = cached.cost;
+        }
+        for downgrade in &result.rerank_downgrades {
+            for iy in 0..downgrade.cov_y {
+                for ix in 0..downgrade.cov_x {
+                    ac_strategy.set_first(downgrade.bx + ix, downgrade.by + iy, STRATEGY_DCT);
+                }
             }
         }
     }
@@ -1590,8 +1850,8 @@ mod tests {
         BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
         FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MergeTuning,
         RERANK_DOWNGRADE_MARGIN, SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2,
-        aggregate_quant, cmap_factors, fill_ac_strategy, merge_beats_dct8, merge_margin,
-        quant_refinement_steps, strategy_cost, sub8_strategy_costs, use_dct8_only,
+        aggregate_quant, cmap_factors, fill_ac_strategy, fill_selection_bands, merge_beats_dct8,
+        merge_margin, quant_refinement_steps, strategy_cost, sub8_strategy_costs, use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -1615,6 +1875,29 @@ mod tests {
         assert!(!use_dct8_only(0.06));
         assert!(!use_dct8_only(0.2));
         assert!(!use_dct8_only(1.0));
+    }
+
+    #[test]
+    fn selection_band_storage_is_reused_for_smaller_jobs() {
+        let mut bands = Vec::new();
+        fill_selection_bands(&mut bands, 32, 12);
+        assert_eq!(
+            bands,
+            [
+                (0, 4),
+                (4, 8),
+                (8, 12),
+                (12, 16),
+                (16, 20),
+                (20, 24),
+                (24, 28),
+                (28, 32),
+            ]
+        );
+        let capacity = bands.capacity();
+        fill_selection_bands(&mut bands, 4, 12);
+        assert_eq!(bands, [(0, 4)]);
+        assert_eq!(bands.capacity(), capacity);
     }
 
     /// A banded knob holds each end flat outside the band and interpolates

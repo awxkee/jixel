@@ -81,6 +81,11 @@ impl AcStrategyImage {
         self.ysize
     }
 
+    /// Restore the default all-DCT8 layout while retaining the cell allocation.
+    pub(crate) fn reset(&mut self) {
+        self.cells.fill((STRATEGY_DCT << 1) | FIRST_BLOCK_BIT);
+    }
+
     /// Copy block rows `y0..y1` from `src` into `self` (both must share
     /// dimensions). Used to merge per-band selection results computed on
     /// independent worker threads back into the group's strategy image.
