@@ -53,7 +53,7 @@ fn accumulate_gradient_x8(left: &[f32; 8], right: &[f32; 8], sum: __m256) -> __m
 /// # Safety
 /// The caller must ensure AVX2 and FMA are available.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn error_gradient_energy_avx2(error: &[f32], width: usize, height: usize) -> f32 {
+pub(crate) fn error_gradient_energy_avx2(error: &[f32], width: usize, height: usize) -> f32 {
     let n = width
         .checked_mul(height)
         .expect("gradient plane size overflow");
