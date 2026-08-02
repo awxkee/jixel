@@ -236,9 +236,6 @@ fn quantize_dc_cfl_value_x4(
 ) -> __m128i {
     let y = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(y_quant));
     let correction = _mm_mul_ps(y, negative_cfl);
-    #[cfg(target_feature = "fma")]
-    let value = _mm_fmadd_ps(input, scale, correction);
-    #[cfg(not(target_feature = "fma"))]
     let value = _mm_add_ps(_mm_mul_ps(input, scale), correction);
     round_ties_away_i32x4(value)
 }
