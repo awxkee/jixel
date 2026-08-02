@@ -62,7 +62,7 @@ struct Shared<'a> {
     target: [&'a [f32]; 3],
     recon: [*mut f32; 3],
     quant: [*mut i16; 3],
-    cache: *mut f64,
+    cache: *mut f32,
     active: *mut bool,
 }
 
@@ -75,16 +75,16 @@ unsafe impl Sync for Shared<'_> {}
 /// # Safety
 /// (x, y) must be in bounds and the [`Shared`] access discipline upheld.
 #[inline]
-unsafe fn output_err(sh: &Shared, x: usize, y: usize) -> f64 {
+unsafe fn output_err(sh: &Shared, x: usize, y: usize) -> f32 {
     // SAFETY: contract stated on the function.
     unsafe {
         let w = sh.w;
         let i = y * w + x;
         if x == 0 || y == 0 || x + 1 >= w || y + 1 >= sh.h {
-            let mut sum = 0.0f64;
+            let mut sum = 0.0f32;
             for c in 0..3 {
                 let e = *sh.recon[c].add(i) - sh.target[c][i];
-                sum += (e * e * sh.inv_step2[c]) as f64;
+                sum += e * e * sh.inv_step2[c];
             }
             return sum;
         }
@@ -103,11 +103,11 @@ unsafe fn output_err(sh: &Shared, x: usize, y: usize) -> f64 {
             gap = gap.max((m - s).abs() / sh.steps[c]);
         }
         let factor = (3.0 - 4.0 * gap).max(0.0);
-        let mut sum = 0.0f64;
+        let mut sum = 0.0f32;
         for c in 0..3 {
             let out = mc[c] + (sm[c] - mc[c]) * factor;
             let e = out - sh.target[c][i];
-            sum += (e * e * sh.inv_step2[c]) as f64;
+            sum += e * e * sh.inv_step2[c];
         }
         sum
     }
@@ -118,10 +118,10 @@ unsafe fn output_err(sh: &Shared, x: usize, y: usize) -> f64 {
 ///
 /// # Safety
 /// See [`output_err`].
-unsafe fn window_err(sh: &Shared, x: usize, y: usize) -> f64 {
+unsafe fn window_err(sh: &Shared, x: usize, y: usize) -> f32 {
     // SAFETY: contract stated on the function.
     unsafe {
-        let mut sum = 0.0f64;
+        let mut sum = 0.0f32;
         for ny in y.saturating_sub(1)..(y + 2).min(sh.h) {
             for nx in x.saturating_sub(1)..(x + 2).min(sh.w) {
                 sum += output_err(sh, nx, ny);
@@ -135,10 +135,10 @@ unsafe fn window_err(sh: &Shared, x: usize, y: usize) -> f64 {
 ///
 /// # Safety
 /// See [`output_err`]; the cache must be current for the window.
-unsafe fn window_cache_sum(sh: &Shared, x: usize, y: usize) -> f64 {
+unsafe fn window_cache_sum(sh: &Shared, x: usize, y: usize) -> f32 {
     // SAFETY: contract stated on the function.
     unsafe {
-        let mut sum = 0.0f64;
+        let mut sum = 0.0f32;
         for ny in y.saturating_sub(1)..(y + 2).min(sh.h) {
             for nx in x.saturating_sub(1)..(x + 2).min(sh.w) {
                 sum += *sh.cache.add(ny * sh.w + nx);
@@ -302,7 +302,7 @@ pub(crate) fn optimize_dc_rounding(
             recon[2][i] = qb[x] as f32 * steps[2] + r_b * yv;
         }
     }
-    let mut cache = vec![0.0f64; w * h];
+    let mut cache = vec![0.0f32; w * h];
     let mut active = vec![false; w * h];
 
     let sh = Shared {
@@ -439,7 +439,7 @@ pub(crate) fn optimize_dc_rounding(
 mod tests {
     use super::*;
 
-    fn total_err(quant: &Image3S, target: &Image3F, steps: [f32; 3], r_b: f32) -> f64 {
+    fn total_err(quant: &Image3S, target: &Image3F, steps: [f32; 3], r_b: f32) -> f32 {
         let (w, h) = (quant.xsize(), quant.ysize());
         let mut recon: [Vec<f32>; 3] = [vec![0.0; w * h], vec![0.0; w * h], vec![0.0; w * h]];
         for y in 0..h {
@@ -475,7 +475,7 @@ mod tests {
             cache: std::ptr::null_mut(),
             active: std::ptr::null_mut(),
         };
-        let mut sum = 0.0f64;
+        let mut sum = 0.0f32;
         for y in 0..h {
             for x in 0..w {
                 // SAFETY: recon/target pointers are live; quant/cache/active

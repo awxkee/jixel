@@ -182,7 +182,13 @@ def cmd_search(args: argparse.Namespace) -> None:
     print(f"study '{args.study}': {len(cases)} cases/trial, {args.trials} trials, "
           f"n_jobs={args.jobs}, objective={mode}")
     obj = (make_refine_objective if args.refine else make_objective)(cases, active_keys)
-    study.optimize(obj, n_trials=args.trials, n_jobs=args.jobs, show_progress_bar=False)
+    study.optimize(
+        obj,
+        n_trials=args.trials,
+        n_jobs=args.jobs,
+        timeout=args.timeout,
+        show_progress_bar=False,
+    )
     _report(study, refine=args.refine)
 
 
@@ -263,6 +269,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--jobs", type=int, default=1)
     s.add_argument("--seed", type=int, default=7)
     s.add_argument("--startup", type=int, default=16)
+    s.add_argument("--timeout", type=float, default=None,
+                   help="stop optimization after this many seconds")
     s.add_argument("--params", default="", help="comma-separated subset to tune")
     s.add_argument("--distances", default="",
                    help="comma-separated search distances (default: config.SEARCH_DISTANCES)")

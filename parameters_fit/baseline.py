@@ -77,6 +77,9 @@ class Baseline:
         order = np.argsort(np.asarray(data["bpp"], dtype=np.float64))
         self._bpp = np.asarray(data["bpp"], dtype=np.float64)[order]
         self._ss2 = np.asarray(data["ss2"], dtype=np.float64)[order]
+        quality_order = np.argsort(self._ss2)
+        self._ss2_for_rate = self._ss2[quality_order]
+        self._bpp_for_ss2 = self._bpp[quality_order]
         self._dist = np.asarray(data["distance"], dtype=np.float64)
         self._time = np.asarray(data["encode_ms"], dtype=np.float64)
         ba = data.get("ba")
@@ -93,6 +96,15 @@ class Baseline:
         assert self._ba is not None, f"baseline {self.name} has no butteraugli column"
         lb = np.log(max(bpp, 1e-6))
         return float(np.interp(lb, np.log(self._bpp), self._ba))
+
+    def rate_at_ss2(self, ss2: float) -> float:
+        """Baseline bitrate at a given SSIMULACRA2 score.
+
+        This is the inverse of :meth:`ss2_at_rate` and is used to express a
+        candidate point as an equivalent rate saving (a sampled BD-rate).
+        """
+        log_bpp = np.interp(ss2, self._ss2_for_rate, np.log(self._bpp_for_ss2))
+        return float(np.exp(log_bpp))
 
     def covers_rate(self, bpp: float) -> bool:
         """Whether ``bpp`` is inside the measured range. Outside it ``np.interp``

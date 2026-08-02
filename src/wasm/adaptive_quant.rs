@@ -157,7 +157,7 @@ fn uzp2_f32x4(a: v128, b: v128) -> v128 {
 /// Vectorised `ratio_cubic_to_simple_gamma`.
 #[inline]
 #[target_feature(enable = "simd128")]
-fn ratio_cubic_x4(v: v128, invert: bool) -> v128 {
+fn ratio_cubic_x4<const INVERT: bool>(v: v128) -> v128 {
     const K_SG_MUL: f32 = 226.77216153508914;
     const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
     const K_LOG2: f32 = 0.693147181;
@@ -176,7 +176,7 @@ fn ratio_cubic_x4(v: v128, invert: bool) -> v128 {
         v2,
         f32x4_splat(k_v_offset),
     );
-    if invert {
+    if INVERT {
         f32x4_div(num, den)
     } else {
         f32x4_div(den, num)
@@ -258,7 +258,7 @@ fn gamma_row_sum_x4(row_x: &[f32], row_y: &[f32], base: usize) -> v128 {
     let g0 = f32x4_add(y0, x0);
     let sum0 = f32x4_mul(
         half,
-        f32x4_add(ratio_cubic_x4(r0, true), ratio_cubic_x4(g0, true)),
+        f32x4_add(ratio_cubic_x4::<true>(r0), ratio_cubic_x4::<true>(g0)),
     );
 
     let x1 = load4s(row_x, base + 4);
@@ -267,7 +267,7 @@ fn gamma_row_sum_x4(row_x: &[f32], row_y: &[f32], base: usize) -> v128 {
     let g1 = f32x4_add(y1, x1);
     let sum1 = f32x4_mul(
         half,
-        f32x4_add(ratio_cubic_x4(r1, true), ratio_cubic_x4(g1, true)),
+        f32x4_add(ratio_cubic_x4::<true>(r1), ratio_cubic_x4::<true>(g1)),
     );
 
     f32x4_add(sum0, sum1)
@@ -633,7 +633,7 @@ fn stage1_diff_x4(
     let uy = load4s(row_y1, gx);
     let dy = load4s(row_y2, gx);
     let base_y = f32x4_mul(quarter, f32x4_add(f32x4_add(f32x4_add(dy, uy), ly), ry));
-    let gammac = ratio_cubic_x4(f32x4_add(cy, offset), false);
+    let gammac = ratio_cubic_x4::<false>(f32x4_add(cy, offset));
     let dyv = f32x4_mul(gammac, f32x4_sub(cy, base_y));
     let diff = f32x4_min(f32x4_mul(dyv, dyv), limit);
     masking_sqrt_x4(diff)
@@ -658,7 +658,7 @@ fn scalar_stage1_diff_pixel(
     let in_y = row_y[gx_c];
     let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
     let gammac =
-        crate::adaptive_quant::ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
+        crate::adaptive_quant::ratio_cubic_to_simple_gamma::<false>(in_y + MATCH_GAMMA_OFFSET);
 
     let mut diff = gammac * (in_y - base);
     diff *= diff;

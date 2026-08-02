@@ -760,6 +760,15 @@ fn build_ans_storage_from_selected(
     ans
 }
 
+/// ANS tables for externally managed (already clustered) histograms:
+/// (normalized histograms, per-cluster symbol info, packed reverse maps).
+pub(crate) fn build_ans_code_parts(
+    histograms: &[Histogram],
+) -> (Vec<AnsHistogram>, Vec<Vec<AnsEncSymbolInfo>>, Vec<u16>) {
+    let storage = build_ans_storage(histograms);
+    (storage.histograms, storage.symbols, storage.reverse_maps)
+}
+
 fn build_ans_storage(histograms: &[Histogram]) -> AnsCodeStorage {
     let selected_histograms = histograms
         .iter()

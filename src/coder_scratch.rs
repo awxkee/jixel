@@ -31,7 +31,7 @@ use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
     ALPHABET_SIZE, CLUSTERS_LIMIT, FixedClusterScratch, Histogram, HuffmanNode, HybridUintConfig,
-    PrefixCode,
+    PrefixCode, Token,
 };
 use crate::group::AcGroupScratch;
 use crate::lossless::{GradientScratch, LzToken, PickThresholdScratch};
@@ -40,7 +40,7 @@ use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::util::{HeapMatrix, heap_array};
 
 const LZ77_CANDIDATE_CAPACITY: usize = 1 << 19;
-pub(crate) const LZ77_MAX_CONTEXTS: usize = 221;
+pub(crate) const LZ77_MAX_CONTEXTS: usize = 1024;
 const DC_PREDICTOR_SLOTS: usize = 2 * K_NUM_DC_CONTEXTS;
 
 pub(crate) struct DcPredictorScratch {
@@ -63,6 +63,15 @@ pub(crate) struct LzEntropyScratch {
     pub(crate) context_map: Box<[u8; LZ77_MAX_CONTEXTS]>,
     pub(crate) configs: Box<[HybridUintConfig; CLUSTERS_LIMIT]>,
     pub(crate) clustering: FixedClusterScratch<LZ77_MAX_CONTEXTS>,
+    /// rANS tables for the pixel code (Slow lossless); empty on the prefix path.
+    pub(crate) ans: Box<LzAnsScratch>,
+}
+
+#[derive(Default)]
+pub(crate) struct LzAnsScratch {
+    pub(crate) histograms: Vec<crate::entropy::AnsHistogram>,
+    pub(crate) symbols: Vec<Vec<crate::entropy::AnsEncSymbolInfo>>,
+    pub(crate) reverse_maps: Vec<u16>,
 }
 
 impl Default for LzEntropyScratch {
@@ -73,6 +82,7 @@ impl Default for LzEntropyScratch {
             context_map: heap_array(0),
             configs: heap_array(HybridUintConfig::DEFAULT),
             clustering: FixedClusterScratch::default(),
+            ans: Box::default(),
         }
     }
 }
@@ -206,6 +216,7 @@ pub(crate) struct CoderScratch {
     pub(crate) recon: HeapMatrix<f32, 8, 1024>,
     pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
+    pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: AcGroupScratch,
     pub(crate) transform_gather: Box<[f32; 1024]>,
     pub(crate) strategy_coeffs: HeapMatrix<f32, 3, 1024>,
@@ -235,6 +246,7 @@ impl Default for CoderScratch {
             recon: HeapMatrix::new(0.0),
             dark_octile: vec![0.0; 32 * 32],
             huffman_pool: Vec::with_capacity(1024),
+            alpha_tokens: Vec::new(),
             ac_group: AcGroupScratch::default(),
             transform_gather: heap_array(0.0),
             strategy_coeffs: HeapMatrix::new(0.0),

@@ -160,7 +160,7 @@ fn store_quant_field_x8(dest: &mut [u8; 8], value: __m256) {
 #[inline]
 #[target_feature(enable = "avx2")]
 fn apply_quant_field_gain_x8(dest: &mut [u8; 8], gain: __m256) {
-    let bytes = _mm_cvtsi64_si128(i64::from_ne_bytes(*dest));
+    let bytes = unsafe { _mm_loadu_si64(dest.as_ptr().cast()) };
     let value = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)), gain);
     store_quant_field_x8(dest, value);
 }

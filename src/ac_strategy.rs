@@ -33,9 +33,10 @@ use crate::coder_scratch::{
     AcStrategyBandScratch, CachedQuantCost, CoderScratch, QuantRefinement, RerankDowngrade,
 };
 use crate::dc_group_data::{
-    AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32,
+    AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
+    STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
+    STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
+    STRATEGY_DCT64X32, STRATEGY_DCT64X64,
 };
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -90,16 +91,8 @@ impl Banded {
 /// tokens whatever the distance.
 const META_R: f32 = 4.0;
 
-/// High-rate-optimal Lagrange multiplier for unit-step (Δ = 1) scalar
-/// quantization: `λ* = Δ²·ln2 / 6`. Distortion is in quant-units², rate in
-/// bits, so `λ·R` is in quant-units² and adds cleanly to D.
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 
-/// How much better the tiled DCT8 must look to [`rerank_large_transforms`]
-/// before a committed merge is downgraded: the test is `j_dct8 < j_big * m`.
-/// At high quality the reconstruction costs sit on the noise floor and a
-/// knife-edge (m = 1) comparison is as good as any; from d=1.5 up the merge is
-/// worth defending, and the tiled DCT8 has to be ~13% cheaper to win.
 const RERANK_META_R: f32 = 2.6465739748323758;
 const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.9098454411056834);
 
@@ -124,23 +117,20 @@ const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.29);
 const MERGE_MARGIN_32: Banded = Banded::new(0.329_207_82, 0.36);
 
 const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.82;
-/// Third band: an extra margin scale for very low quality (d >= LOWQ3_D).
-/// Fitted 2026-08-01 (10-min study at d4/5 + holdout +0.04 SS2/+0.15 ba):
-/// mild extra stiffness below the fade floor. NOTE the study surface was
-/// bimodal — SS2 alone prefers scale~0.37 (looser, +0.25 SS2 / -0.2 ba);
-/// this is the ba-safe mode. The loose mode remains a policy option.
 const MERGE_MARGIN_LOWQ3_D: f32 = 3.85;
 const MERGE_MARGIN_LOWQ3_SCALE: f32 = 1.10;
 const MERGE_MARGIN_FADE_START: f32 = 1.0;
 const MERGE_MARGIN_FADE_END: f32 = 4.0;
-/// Sub-8x8 selection biases. Each candidate's RD cost is scaled by its bias
-/// before being compared with the 8x8 incumbent, so >1 makes that strategy
-/// harder to select.
 const BIAS_4X4: f32 = 1.33;
 const BIAS_4X8: f32 = 1.09;
+const BIAS_AFV: Banded = Banded::new(1.15, 1.25);
 
 /// Sub-8 is skipped entirely above this distance.
 const SUB8_MAX_DISTANCE: f32 = 1.5;
+/// AFV keeps competing (alone — the DCT4 family stays gated at
+/// [`SUB8_MAX_DISTANCE`]) up to this distance. At the default the extension
+/// band is empty and AFV shares the sub-8 gate exactly.
+const AFV_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
 #[inline]
 fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
@@ -358,8 +348,128 @@ fn forward_transform(
             (ctx.dct8x4)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
+        STRATEGY_AFV0 => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.afv0)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
+        STRATEGY_AFV1 => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.afv1)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
+        STRATEGY_AFV2 => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.afv2)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
+        STRATEGY_AFV3 => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.afv3)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
         _ => unreachable!("invalid strategy {strategy}"),
     }
+}
+
+const DCT64_MIN_DISTANCE: f32 = 3.0;
+const BIAS_64X64: f32 = 1.0;
+const BIAS_64_RECT: f32 = 1.0;
+const ACCEPT_64: f32 = 0.945;
+const ACCEPT_64_RECT: f32 = 0.642;
+
+const fn dct64_accept() -> f32 {
+    ACCEPT_64
+}
+
+const fn dct64_rect_accept() -> f32 {
+    ACCEPT_64_RECT
+}
+
+#[inline]
+fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
+    speed == crate::Speed::Slow && distance >= DCT64_MIN_DISTANCE
+}
+
+/// DCT64 is evaluated outside the standard chooser because its 4096-entry
+/// scratch would otherwise inflate every transform-selection worker.
+#[allow(clippy::too_many_arguments)]
+fn strategy_cost64(
+    ctx: &EncodingContext,
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    meta_r: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+) -> f32 {
+    let mut coeffs: [Box<[f32; 4096]>; 3] = std::array::from_fn(|_| Box::new([0.0; 4096]));
+    let mut input = Box::new([0.0f32; 4096]);
+    let (width, height, size, cx, cy) = match strategy {
+        STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
+        STRATEGY_DCT64X32 => (32, 64, 2048, 8, 4),
+        STRATEGY_DCT32X64 => (64, 32, 2048, 8, 4),
+        _ => unreachable!("not a DCT64-family strategy: {strategy}"),
+    };
+    for (c, coeff) in coeffs.iter_mut().enumerate() {
+        gather_pixels(opsin.plane(c), px, py, width, height, &mut input[..size]);
+        match strategy {
+            STRATEGY_DCT64X64 => (ctx.dct64x64)(DctInput::from_flat(&input), coeff),
+            STRATEGY_DCT64X32 => (ctx.dct64x32)(
+                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
+                coeff.first_chunk_mut::<2048>().unwrap(),
+            ),
+            STRATEGY_DCT32X64 => (ctx.dct32x64)(
+                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
+                coeff.first_chunk_mut::<2048>().unwrap(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+    let [x, y, b] = &mut coeffs;
+    for ((xv, bv), &yv) in x[..size]
+        .iter_mut()
+        .zip(b[..size].iter_mut())
+        .zip(y[..size].iter())
+    {
+        *xv -= cmap_factor[0] * yv;
+        *bv -= cmap_factor[2] * yv;
+    }
+
+    let mut distortion = 0.0f32;
+    let mut rate = 0.0f32;
+    for (c, coeff) in coeffs.iter().enumerate() {
+        let qm_mult = if c == 0 {
+            qm_mult_x
+        } else if c == 2 {
+            crate::frame::b_qm_mul()
+        } else {
+            1.0
+        };
+        let matrix: &[f32] = match strategy {
+            STRATEGY_DCT64X64 => &ctx.matrices.inv_matrix_64x64(c)[..],
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &ctx.matrices.inv_matrix_64x32(c)[..],
+            _ => unreachable!(),
+        };
+        let (d, r) = channel_rd(
+            ctx.sse_and_rate,
+            ctx.rate_log2_lut,
+            &coeff[..size],
+            matrix,
+            c,
+            qac,
+            qm_mult,
+            distance,
+            cx,
+            cy,
+        );
+        distortion += CHANNEL_WEIGHT[c] * d;
+        rate += r;
+    }
+    distortion + RD_LAMBDA * (rate + meta_r)
 }
 
 /// Full RD cost `J = D + λR` of coding `strategy` at absolute pixel `(px, py)`.
@@ -472,7 +582,10 @@ struct CflXyb<'a> {
 
 pub(crate) type ApplyCflFn = fn(&mut [f32], &[f32], &mut [f32], [f32; 3]);
 
-#[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+#[cfg(not(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+)))]
 fn apply_cfl_scalar(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());
     assert_eq!(x.len(), b.len());
@@ -486,8 +599,8 @@ fn apply_cfl_scalar(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 
 
 pub(crate) fn selected_apply_cfl_fn() -> ApplyCflFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    if std::arch::is_aarch64_feature_detected!("neon") {
-        return |x, y, b, cmap_factor| unsafe { crate::neon::apply_cfl_neon(x, y, b, cmap_factor) };
+    {
+        |x, y, b, cmap_factor| unsafe { crate::neon::apply_cfl_neon(x, y, b, cmap_factor) }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -495,7 +608,10 @@ pub(crate) fn selected_apply_cfl_fn() -> ApplyCflFn {
     }
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
     return |x, y, b, cmap_factor| crate::wasm::apply_cfl_wasm(x, y, b, cmap_factor);
-    #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     apply_cfl_scalar
 }
 
@@ -512,6 +628,7 @@ fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[
         STRATEGY_DCT => &matrices.inv_matrix(channel)[..],
         STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(channel)[..],
         STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(channel)[..],
+        STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(channel)[..],
         STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(channel)[..],
         STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(channel)[..],
         STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(channel)[..],
@@ -726,6 +843,7 @@ struct Sub8Costs {
     dct4x4: f32,
     dct4x8: f32,
     dct8x4: f32,
+    afv: [f32; 4],
 }
 
 #[inline]
@@ -742,6 +860,10 @@ fn forward_sub8_transform(
         STRATEGY_DCT4X4 => (ctx.dct4x4)(input, dst),
         STRATEGY_DCT4X8 => (ctx.dct4x8)(input, dst),
         STRATEGY_DCT8X4 => (ctx.dct8x4)(input, dst),
+        STRATEGY_AFV0 => (ctx.afv0)(input, dst),
+        STRATEGY_AFV1 => (ctx.afv1)(input, dst),
+        STRATEGY_AFV2 => (ctx.afv2)(input, dst),
+        STRATEGY_AFV3 => (ctx.afv3)(input, dst),
         _ => unreachable!("non-sub8 strategy {strategy}"),
     }
 }
@@ -762,6 +884,7 @@ fn sub8_strategy_costs(
     distance: f32,
     cmap_factor: [f32; 3],
     cached_dct8: Option<f32>,
+    with_dct4: bool,
 ) -> Sub8Costs {
     let mut pixels = [[0.0f32; 64]; 3];
     for (c, input) in pixels.iter_mut().enumerate() {
@@ -785,11 +908,21 @@ fn sub8_strategy_costs(
     } else {
         evaluate(STRATEGY_DCT)
     };
+    // In the AFV-only extension band the DCT4 family is out of contention;
+    // infinite costs flow through the biased comparison and never win.
+    let mut evaluate_dct4 = |strategy| {
+        if with_dct4 {
+            evaluate(strategy)
+        } else {
+            f32::INFINITY
+        }
+    };
     Sub8Costs {
         dct8,
-        dct4x4: evaluate(STRATEGY_DCT4X4),
-        dct4x8: evaluate(STRATEGY_DCT4X8),
-        dct8x4: evaluate(STRATEGY_DCT8X4),
+        dct4x4: evaluate_dct4(STRATEGY_DCT4X4),
+        dct4x8: evaluate_dct4(STRATEGY_DCT4X8),
+        dct8x4: evaluate_dct4(STRATEGY_DCT8X4),
+        afv: std::array::from_fn(|kind| evaluate(STRATEGY_AFV0 + kind as u8)),
     }
 }
 
@@ -1044,9 +1177,9 @@ pub(crate) fn adjust_quant_field(
 
 #[inline]
 fn quant_refinement_steps(distance: f32) -> usize {
-    if !(1.5..5.0).contains(&distance) {
+    if distance < 1.5 {
         0
-    } else if (2.0..3.5).contains(&distance) {
+    } else if distance >= 2.0 {
         2
     } else {
         1
@@ -1085,6 +1218,12 @@ fn find_quant_refinements(
     }
     for (bx, by, strategy) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
+            continue;
+        }
+        if matches!(
+            strategy,
+            STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ) {
             continue;
         }
         let cov_x = AcStrategyImage::covered_blocks_x_of(strategy);
@@ -1485,9 +1624,11 @@ fn select_band(
     if !scope.rectangles() {
         return benefit;
     }
-    if distance > SUB8_MAX_DISTANCE {
+    let with_dct4 = distance <= SUB8_MAX_DISTANCE;
+    if !with_dct4 && distance > AFV_MAX_DISTANCE {
         return benefit;
     }
+    let bias_afv = BIAS_AFV.at(distance);
     for by in y_begin..y_end {
         for bx in 0..xsize {
             if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
@@ -1510,6 +1651,7 @@ fn select_band(
                 distance,
                 cmap_factor,
                 cached_dct8.is_finite().then_some(cached_dct8),
+                with_dct4,
             );
             let cost8 = costs.dct8;
             let cost4 = BIAS_4X4 * costs.dct4x4;
@@ -1517,7 +1659,8 @@ fn select_band(
             let cost84 = BIAS_4X8 * costs.dct8x4;
             // Choose the cheapest sub-8×8 candidate, and take it only if it beats
             // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
-            // horizontal res) are transposes that suit opposite edge orientations.
+            // horizontal res) are transposes that suit opposite edge orientations;
+            // the four AFV variants suit a diagonal edge through one corner.
             let (cand, cand_cost) = {
                 let mut best = STRATEGY_DCT4X4;
                 let mut bc = cost4;
@@ -1528,6 +1671,13 @@ fn select_band(
                 if cost84 < bc {
                     best = STRATEGY_DCT8X4;
                     bc = cost84;
+                }
+                for (kind, &afv_cost) in costs.afv.iter().enumerate() {
+                    let biased = bias_afv * afv_cost;
+                    if biased < bc {
+                        best = STRATEGY_AFV0 + kind as u8;
+                        bc = biased;
+                    }
                 }
                 (best, bc)
             };
@@ -1640,6 +1790,134 @@ pub(crate) fn fill_ac_strategy(
         benefit
     };
 
+    // Whole-tile third opinion over the selected <=32px layout. Square and
+    // rectangular 64px layouts compete against the same four-DCT32 baseline;
+    // a rectangular half may win independently while the other half keeps the
+    // already-selected <=32px layout.
+    if use_dct64(speed, distance) {
+        for by in (0..ysize.saturating_sub(7)).step_by(8) {
+            for bx in (0..xsize.saturating_sub(7)).step_by(8) {
+                if !ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT64X64) {
+                    continue;
+                }
+                let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
+                let cost64 = BIAS_64X64
+                    * strategy_cost64(
+                        ctx,
+                        STRATEGY_DCT64X64,
+                        opsin,
+                        dc_group_px + bx * 8,
+                        dc_group_py + by * 8,
+                        region_qac(quant_field, bx, by, 8, 8, scale, distance),
+                        qm_mult_x,
+                        meta_r,
+                        distance,
+                        cmap,
+                    );
+                let mut cost32 = [[0.0f32; 2]; 2];
+                for (iy, sy) in [0usize, 4].into_iter().enumerate() {
+                    for (ix, sx) in [0usize, 4].into_iter().enumerate() {
+                        cost32[iy][ix] = strategy_cost(
+                            ctx,
+                            scratch,
+                            STRATEGY_DCT32X32,
+                            opsin,
+                            dc_group_px + (bx + sx) * 8,
+                            dc_group_py + (by + sy) * 8,
+                            region_qac(quant_field, bx + sx, by + sy, 4, 4, scale, distance),
+                            qm_mult_x,
+                            meta_r,
+                            distance,
+                            cmap,
+                        );
+                    }
+                }
+
+                let tall = [0usize, 4].map(|sx| {
+                    BIAS_64_RECT
+                        * strategy_cost64(
+                            ctx,
+                            STRATEGY_DCT64X32,
+                            opsin,
+                            dc_group_px + (bx + sx) * 8,
+                            dc_group_py + by * 8,
+                            region_qac(quant_field, bx + sx, by, 4, 8, scale, distance),
+                            qm_mult_x,
+                            meta_r,
+                            distance,
+                            cmap,
+                        )
+                });
+                let wide = [0usize, 4].map(|sy| {
+                    BIAS_64_RECT
+                        * strategy_cost64(
+                            ctx,
+                            STRATEGY_DCT32X64,
+                            opsin,
+                            dc_group_px + bx * 8,
+                            dc_group_py + (by + sy) * 8,
+                            region_qac(quant_field, bx, by + sy, 8, 4, scale, distance),
+                            qm_mult_x,
+                            meta_r,
+                            distance,
+                            cmap,
+                        )
+                });
+
+                let accept_rect = dct64_rect_accept();
+                let tall_use = [
+                    merge_beats_dct8(tall[0], cost32[0][0] + cost32[1][0], accept_rect),
+                    merge_beats_dct8(tall[1], cost32[0][1] + cost32[1][1], accept_rect),
+                ];
+                let wide_use = [
+                    merge_beats_dct8(wide[0], cost32[0][0] + cost32[0][1], accept_rect),
+                    merge_beats_dct8(wide[1], cost32[1][0] + cost32[1][1], accept_rect),
+                ];
+                let base_cost: f32 = cost32.iter().flatten().sum();
+                let tall_score = (if tall_use[0] {
+                    tall[0] / accept_rect
+                } else {
+                    cost32[0][0] + cost32[1][0]
+                }) + if tall_use[1] {
+                    tall[1] / accept_rect
+                } else {
+                    cost32[0][1] + cost32[1][1]
+                };
+                let wide_score = (if wide_use[0] {
+                    wide[0] / accept_rect
+                } else {
+                    cost32[0][0] + cost32[0][1]
+                }) + if wide_use[1] {
+                    wide[1] / accept_rect
+                } else {
+                    cost32[1][0] + cost32[1][1]
+                };
+                let square_score = cost64 / dct64_accept();
+
+                if square_score < base_cost
+                    && square_score <= tall_score
+                    && square_score <= wide_score
+                {
+                    ac_strategy.set_first(bx, by, STRATEGY_DCT64X64);
+                } else if tall_score < base_cost && tall_score <= wide_score {
+                    if tall_use[0] {
+                        ac_strategy.set_first(bx, by, STRATEGY_DCT64X32);
+                    }
+                    if tall_use[1] {
+                        ac_strategy.set_first(bx + 4, by, STRATEGY_DCT64X32);
+                    }
+                } else if wide_score < base_cost {
+                    if wide_use[0] {
+                        ac_strategy.set_first(bx, by, STRATEGY_DCT32X64);
+                    }
+                    if wide_use[1] {
+                        ac_strategy.set_first(bx, by + 4, STRATEGY_DCT32X64);
+                    }
+                }
+            }
+        }
+    }
+
     // Second pass — reconstruction-based rerank. The fast selector over-merges at
     // high quality; here we revisit only the *selected* large transforms and
     // downgrade a merge to its tiled DCT8 when the SSIM-reconstruction RD cost
@@ -1725,6 +2003,12 @@ fn find_rerank_downgrades(
     output.current_costs.clear();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
+            continue;
+        }
+        if matches!(
+            strat,
+            STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
+        ) {
             continue;
         }
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
@@ -1847,7 +2131,7 @@ fn rerank_large_transforms(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
+        BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
         FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MergeTuning,
         RERANK_DOWNGRADE_MARGIN, SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2,
         aggregate_quant, cmap_factors, fill_ac_strategy, fill_selection_bands, merge_beats_dct8,
@@ -1917,14 +2201,15 @@ mod tests {
     }
 
     #[test]
-    fn quant_refinement_is_gated_and_conservative_at_boundaries() {
+    fn quant_refinement_does_not_release_at_coarse_distances() {
         assert_eq!(quant_refinement_steps(1.0), 0);
         assert_eq!(quant_refinement_steps(1.5), 1);
+        assert_eq!(quant_refinement_steps(1.99), 1);
         assert_eq!(quant_refinement_steps(2.0), 2);
         assert_eq!(quant_refinement_steps(3.49), 2);
-        assert_eq!(quant_refinement_steps(3.5), 1);
-        assert_eq!(quant_refinement_steps(4.99), 1);
-        assert_eq!(quant_refinement_steps(5.0), 0);
+        assert_eq!(quant_refinement_steps(3.5), 2);
+        assert_eq!(quant_refinement_steps(5.0), 2);
+        assert_eq!(quant_refinement_steps(25.0), 2);
     }
 
     /// The Fast tier runs the same RD model but offers only square merges.
@@ -2000,6 +2285,34 @@ mod tests {
         );
         // The gate must sit above the DCT8-only floor, or sub-8 would never run.
         assert!(gate > std::hint::black_box(DCT8_ONLY_MAX_DISTANCE));
+        // AFV carries a stiffer-than-neutral bar in both bands too: at 1.0 it
+        // over-selects (+0.107% BD flat; butteraugli pays below ~1.1 banded).
+        let afv = std::hint::black_box(BIAS_AFV);
+        assert!(
+            afv.hq > 1.0 && afv.base > 1.0,
+            "AFV bias reverted to neutral"
+        );
+    }
+
+    /// AFV (with the rest of sub-8) is a Slow-only feature: the sub-8 pass
+    /// runs only under `SearchScope::Full`, and only Slow maps to it.
+    #[test]
+    fn sub8_and_afv_are_slow_only() {
+        assert_eq!(
+            SearchScope::for_speed(crate::Speed::Fastest),
+            SearchScope::Squares
+        );
+        assert_eq!(
+            SearchScope::for_speed(crate::Speed::Fast),
+            SearchScope::Squares
+        );
+        assert_eq!(
+            SearchScope::for_speed(crate::Speed::Slow),
+            SearchScope::Full
+        );
+        // The sub-8 refinement is gated on `scope.rectangles()`.
+        assert!(!SearchScope::Squares.rectangles());
+        assert!(SearchScope::Full.rectangles());
     }
 
     #[test]
@@ -2091,6 +2404,7 @@ mod tests {
                 distance,
                 cmap,
                 cached,
+                true,
             );
             let actual = [bundled.dct8, bundled.dct4x4, bundled.dct4x8, bundled.dct8x4];
             for (a, b) in actual.into_iter().zip(independent) {

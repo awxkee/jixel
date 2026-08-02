@@ -30,7 +30,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
-    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
+    HuffmanNode, OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
     write_prefix_codes, write_token,
 };
 
@@ -109,42 +109,131 @@ pub(crate) fn write_ac_group_alpha(
         return;
     }
 
-    let mut tokens: Vec<Token> = Vec::with_capacity(gw * gh);
-    for gy in 0..gh {
-        let img_y = y0 + gy;
-        for gx in 0..gw {
-            let img_x = x0 + gx;
-            let v = alpha.get_i32(img_y * full_xsize + img_x);
-            let w_ = if gx > 0 {
-                alpha.get_i32(img_y * full_xsize + img_x - 1)
-            } else {
-                0
-            };
-            let n_ = if gy > 0 {
-                alpha.get_i32((img_y - 1) * full_xsize + img_x)
-            } else {
-                0
-            };
-            let nw_ = if gx > 0 && gy > 0 {
-                alpha.get_i32((img_y - 1) * full_xsize + img_x - 1)
-            } else {
-                0
-            };
-            let pred = gradient(w_, n_, nw_);
-            let ctx = if w_ + n_ - nw_ > 0 { 0u32 } else { 1u32 };
-            tokens.push(Token::new(ctx, pack_signed(v - pred)));
+    let full_size = full_xsize
+        .checked_mul(full_ysize)
+        .expect("alpha dimensions overflow usize");
+    assert_eq!(alpha.len(), full_size);
+    assert!(x0 <= full_xsize && gw <= full_xsize - x0);
+    assert!(y0 <= full_ysize && gh <= full_ysize - y0);
+
+    let token_count = gw
+        .checked_mul(gh)
+        .expect("alpha group size overflows usize");
+    scratch.alpha_tokens.resize(token_count, Token::new(0, 0));
+    if token_count != 0 {
+        match alpha {
+            AlphaPlane::U8(data) => {
+                tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
+            }
+            AlphaPlane::U16 { data, .. } => {
+                tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
+            }
+            AlphaPlane::F32(data) => {
+                tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
+            }
         }
     }
 
     const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
-    let pixel_code = build_pixel_code_n(&tokens, NUM_CTX, scratch);
+    let pixel_code = build_pixel_code_n(&scratch.alpha_tokens, NUM_CTX, &mut scratch.huffman_pool);
     write_group_header_local_tree(w); // use_global_tree=0, wp default, 0 transforms
     write_split_tree(scratch, w); // 2-leaf Gradient tree, split on property 9 at 0
     w.write(1, 0); // no LZ77 for the pixel entropy code
     write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w); // context map + 2 prefix codes
     let code_ref = pixel_code.as_ref();
-    for tok in &tokens {
+    for tok in &scratch.alpha_tokens {
         write_token(*tok, &code_ref, w);
+    }
+}
+
+trait AlphaSample: Copy {
+    const ZERO: Self;
+
+    fn to_i32(self) -> i32;
+}
+
+impl AlphaSample for u8 {
+    const ZERO: Self = 0;
+
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl AlphaSample for u16 {
+    const ZERO: Self = 0;
+
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+impl AlphaSample for i32 {
+    const ZERO: Self = 0;
+
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self
+    }
+}
+
+#[inline]
+fn alpha_token<T: AlphaSample>(v: T, w: T, n: T, nw: T) -> Token {
+    let v = v.to_i32();
+    let w = w.to_i32();
+    let n = n.to_i32();
+    let nw = nw.to_i32();
+    let grad = w + n - nw;
+    let pred = grad.clamp(w.min(n), w.max(n));
+    let context = if grad > 0 { 0 } else { 1 };
+    Token::new(context, pack_signed(v - pred))
+}
+
+#[inline]
+fn tokenize_ac_group_alpha<T: AlphaSample>(
+    samples: &[T],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    dst: &mut [Token],
+) {
+    debug_assert_ne!(gw, 0);
+    debug_assert_ne!(gh, 0);
+    debug_assert_eq!(dst.len(), gw * gh);
+
+    let mut src_rows = samples.chunks_exact(stride).skip(y0).take(gh);
+    let mut dst_rows = dst.chunks_exact_mut(gw);
+    let first = &src_rows.next().unwrap()[x0..x0 + gw];
+    let first_dst = dst_rows.next().unwrap();
+
+    first_dst[0] = alpha_token(first[0], T::ZERO, T::ZERO, T::ZERO);
+    for ((&v, &w), out) in first[1..]
+        .iter()
+        .zip(first[..gw - 1].iter())
+        .zip(first_dst[1..].iter_mut())
+    {
+        *out = alpha_token(v, w, T::ZERO, T::ZERO);
+    }
+
+    let mut north = first;
+    for (row, out) in src_rows.zip(dst_rows) {
+        let row = &row[x0..x0 + gw];
+        out[0] = alpha_token(row[0], T::ZERO, north[0], T::ZERO);
+
+        for ((((&v, &w), &n), &nw), out) in row[1..]
+            .iter()
+            .zip(row[..gw - 1].iter())
+            .zip(north[1..].iter())
+            .zip(north[..gw - 1].iter())
+            .zip(out[1..].iter_mut())
+        {
+            *out = alpha_token(v, w, n, nw);
+        }
+        north = row;
     }
 }
 
@@ -298,25 +387,21 @@ fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
 }
 
 pub(crate) fn build_pixel_code(tokens: &[Token], scratch: &mut CoderScratch) -> OwnedEntropyCode {
-    build_pixel_code_n(tokens, 1, scratch)
+    build_pixel_code_n(tokens, 1, &mut scratch.huffman_pool)
 }
 
 fn build_pixel_code_n(
     tokens: &[Token],
     num_contexts: usize,
-    scratch: &mut CoderScratch,
+    huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
     let mut code = if num_contexts > 1 {
         // Keep contexts separate — the whole point of the multi-leaf alpha tree
         // is that the bulk-zero leaf must not be merged with the rare-corner
         // leaf, or it loses its single-symbol (zero-bit) property.
-        crate::entropy::build_entropy_code_no_cluster(
-            tokens,
-            num_contexts,
-            &mut scratch.huffman_pool,
-        )
+        crate::entropy::build_entropy_code_no_cluster(tokens, num_contexts, huffman_pool)
     } else {
-        optimize_entropy_code(tokens, num_contexts, &mut scratch.huffman_pool)
+        optimize_entropy_code(tokens, num_contexts, huffman_pool)
     };
     for pc in &mut code.prefix_codes {
         // Count non-zero depths and remember the position of the only one (if any).
@@ -421,6 +506,38 @@ mod tests {
     use super::*;
     use crate::encode_image::AlphaPlane;
 
+    fn check_ac_group_tokenization<T: AlphaSample>(
+        samples: &[T],
+        stride: usize,
+        x0: usize,
+        y0: usize,
+        gw: usize,
+        gh: usize,
+    ) {
+        let mut actual = vec![Token::new(0, 0); gw * gh];
+        tokenize_ac_group_alpha(samples, stride, x0, y0, gw, gh, &mut actual);
+
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let at = |x: usize, y: usize| samples[(y0 + y) * stride + x0 + x].to_i32();
+                let v = at(gx, gy);
+                let w = if gx == 0 { 0 } else { at(gx - 1, gy) };
+                let n = if gy == 0 { 0 } else { at(gx, gy - 1) };
+                let nw = if gx == 0 || gy == 0 {
+                    0
+                } else {
+                    at(gx - 1, gy - 1)
+                };
+                let pred = gradient(w, n, nw);
+                let expected =
+                    Token::new(if w + n - nw > 0 { 0 } else { 1 }, pack_signed(v - pred));
+                let actual = &actual[gy * gw + gx];
+                assert_eq!(actual.context, expected.context);
+                assert_eq!(actual.value, expected.value);
+            }
+        }
+    }
+
     #[test]
     fn gradient_basic() {
         assert_eq!(gradient(50, 50, 0), 50);
@@ -438,6 +555,19 @@ mod tests {
         for t in &toks {
             assert_eq!(t.value, 0);
         }
+    }
+
+    #[test]
+    fn tokenize_ac_group_matches_scalar_for_all_sample_types() {
+        let u8_samples: Vec<u8> = (0..64).map(|v| ((v * 37 + 11) % 251) as u8).collect();
+        check_ac_group_tokenization(&u8_samples, 8, 2, 1, 5, 6);
+        check_ac_group_tokenization(&u8_samples, 8, 4, 3, 1, 1);
+
+        let u16_samples: Vec<u16> = (0..64).map(|v| ((v * 977 + 31) % 4096) as u16).collect();
+        check_ac_group_tokenization(&u16_samples, 8, 1, 2, 6, 5);
+
+        let i32_samples: Vec<i32> = (0..64).map(|v| (v * 43 + 17) % 257 - 128).collect();
+        check_ac_group_tokenization(&i32_samples, 8, 3, 1, 4, 7);
     }
 
     #[test]

@@ -27,8 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{DctInput, WC4, WC8, WC16, WC32};
+use crate::dct::{DctInput, WC4, WC8, WC16, WC32, WC64};
 use core::arch::wasm32::*;
+use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy)]
 struct WasmDoubledVector {
@@ -127,7 +128,7 @@ fn dct1d_8_v(c: &mut [WasmDoubledVector; 8]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn transpose_4x4(r0: v128, r1: v128, r2: v128, r3: v128) -> (v128, v128, v128, v128) {
+pub(super) fn transpose_4x4(r0: v128, r1: v128, r2: v128, r3: v128) -> (v128, v128, v128, v128) {
     let v0 = i32x4_shuffle::<0, 4, 2, 6>(r0, r1);
     let v1 = i32x4_shuffle::<1, 5, 3, 7>(r0, r1);
     let v2 = i32x4_shuffle::<0, 4, 2, 6>(r2, r3);
@@ -209,7 +210,8 @@ pub(crate) fn dct8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct8x16_wasm(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) {
     // 16-pt row DCT then 8-pt col DCT, 4-wide strips; scratch is hfreq-major.
-    let mut scratch = [0.0f32; 128];
+    let mut scratch_uninit = MaybeUninit::<[f32; 128]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..2 {
         let mut c = [f32x4_splat(0.0); 16];
         for ct in 0..4 {
@@ -226,10 +228,10 @@ pub(crate) fn dct8x16_wasm(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) 
         }
         dct1d_16_s(&mut c);
         for u in 0..16 {
-            let p = unsafe { scratch.get_unchecked_mut(u * 8 + s * 4..) };
-            unsafe { v128_store(p.as_mut_ptr() as *mut v128, c[u]) };
+            unsafe { v128_store(dst.add(u * 8 + s * 4).cast(), c[u]) };
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 128.0);
     for q in 0..4 {
         let mut c = [f32x4_splat(0.0); 8];
@@ -256,7 +258,8 @@ pub(crate) fn dct8x16_wasm(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) 
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct16x8_wasm(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) {
     // 16-pt col DCT then 8-pt row DCT, 4-wide strips; scratch is column-major.
-    let mut scratch = [0.0f32; 128];
+    let mut scratch_uninit = MaybeUninit::<[f32; 128]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..2 {
         let mut c: [v128; 16] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_16_s(&mut c);
@@ -264,11 +267,12 @@ pub(crate) fn dct16x8_wasm(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) 
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
             let tile = [a, b, cc, d];
             for (j, v) in tile.iter().enumerate() {
-                let p = unsafe { scratch.get_unchecked_mut((s * 4 + j) * 16 + t * 4..) };
-                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
+                let p = unsafe { dst.add((s * 4 + j) * 16 + t * 4) };
+                unsafe { v128_store(p.cast(), *v) };
             }
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 128.0);
     for q in 0..4 {
         let mut c: [v128; 8] = std::array::from_fn(|col| {
@@ -277,7 +281,7 @@ pub(crate) fn dct16x8_wasm(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) 
         dct1d_8_s(&mut c);
         for u in 0..8 {
             let p = unsafe { output.get_unchecked_mut(u * 16 + q * 4..) };
-            unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
+            unsafe { v128_store(p.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
         }
     }
 }
@@ -286,7 +290,8 @@ pub(crate) fn dct16x8_wasm(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) 
 pub(crate) fn dct16x16_wasm(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]) {
     // 4-wide strips keep the live set at 16 v128 instead of 64; scratch is
     // column-major (`[col * 16 + vfreq]`) for gather-free reloads.
-    let mut scratch = [0.0f32; 256];
+    let mut scratch_uninit = MaybeUninit::<[f32; 256]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..4 {
         let mut c: [v128; 16] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_16_s(&mut c);
@@ -294,11 +299,12 @@ pub(crate) fn dct16x16_wasm(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
             let tile = [a, b, cc, d];
             for (j, v) in tile.iter().enumerate() {
-                let p = unsafe { scratch.get_unchecked_mut((s * 4 + j) * 16 + t * 4..) };
-                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
+                let p = unsafe { dst.add((s * 4 + j) * 16 + t * 4) };
+                unsafe { v128_store(p.cast(), *v) };
             }
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 256.0);
     for q in 0..4 {
         let mut c: [v128; 16] = std::array::from_fn(|col| {
@@ -316,7 +322,7 @@ pub(crate) fn dct16x16_wasm(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]
 // a 4-wide strip halves the live set vs. the doubled vector, then goes to scratch.
 #[inline]
 #[target_feature(enable = "simd128")]
-fn dct1d_4_s(c: &mut [v128; 4]) {
+pub(super) fn dct1d_4_s(c: &mut [v128; 4]) {
     let t0 = f32x4_add(c[0], c[3]);
     let t1 = f32x4_add(c[1], c[2]);
     let s2 = f32x4_splat(std::f32::consts::SQRT_2);
@@ -332,7 +338,7 @@ fn dct1d_4_s(c: &mut [v128; 4]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn dct1d_8_s(c: &mut [v128; 8]) {
+pub(super) fn dct1d_8_s(c: &mut [v128; 8]) {
     let s2 = f32x4_splat(std::f32::consts::SQRT_2);
     let mut e = [
         f32x4_add(c[0], c[7]),
@@ -415,7 +421,8 @@ fn load_strip(ptr: *const f32) -> v128 {
 pub(crate) fn dct32x32_wasm(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) {
     // Both passes over 4-wide strips; the column pass writes a transposed scratch
     // (`[col * 32 + vfreq]`) so the row pass reloads contiguously.
-    let mut colt = [0.0f32; 1024];
+    let mut scratch_uninit = MaybeUninit::<[f32; 1024]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..8 {
         let mut c: [v128; 32] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_32_s(&mut c);
@@ -423,20 +430,175 @@ pub(crate) fn dct32x32_wasm(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
             let tile = [a, b, cc, d];
             for (j, v) in tile.iter().enumerate() {
-                let p = unsafe { colt.get_unchecked_mut((s * 4 + j) * 32 + t * 4..) };
-                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
+                let p = unsafe { dst.add((s * 4 + j) * 32 + t * 4) };
+                unsafe { v128_store(p.cast(), *v) };
             }
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 1024.0);
     for q in 0..8 {
         let mut c: [v128; 32] = std::array::from_fn(|col| {
-            load_strip(unsafe { colt.get_unchecked(col * 32 + q * 4..) }.as_ptr())
+            load_strip(unsafe { scratch.get_unchecked(col * 32 + q * 4..) }.as_ptr())
         });
         dct1d_32_s(&mut c);
         for u in 0..32 {
             let p = unsafe { output.get_unchecked_mut(u * 32 + q * 4..) };
             unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[u], scale)) };
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct1d_64_s(c: &mut [v128; 64]) {
+    let mut evens = [f32x4_splat(0.0); 32];
+    let mut odds = [f32x4_splat(0.0); 32];
+    for i in 0..32 {
+        evens[i] = f32x4_add(c[i], c[63 - i]);
+        odds[i] = f32x4_mul(f32x4_sub(c[i], c[63 - i]), f32x4_splat(WC64[i]));
+    }
+    dct1d_32_s(&mut evens);
+    dct1d_32_s(&mut odds);
+    odds[0] = f32x4_add(
+        f32x4_mul(odds[0], f32x4_splat(std::f32::consts::SQRT_2)),
+        odds[1],
+    );
+    for i in 1..31 {
+        odds[i] = f32x4_add(odds[i], odds[i + 1]);
+    }
+    for i in 0..32 {
+        c[2 * i] = evens[i];
+        c[2 * i + 1] = odds[i];
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct64x64_wasm(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096]) {
+    let mut scratch_uninit = MaybeUninit::<[f32; 4096]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for strip in 0..16 {
+        let mut c: [v128; 64] =
+            std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
+        dct1d_64_s(&mut c);
+        for tile_index in 0..16 {
+            let (a, b, cc, d) = transpose_4x4(
+                c[tile_index * 4],
+                c[tile_index * 4 + 1],
+                c[tile_index * 4 + 2],
+                c[tile_index * 4 + 3],
+            );
+            for (lane, value) in [a, b, cc, d].iter().enumerate() {
+                let p = unsafe { dst.add((strip * 4 + lane) * 64 + tile_index * 4) };
+                unsafe { v128_store(p.cast(), *value) };
+            }
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = f32x4_splat(1.0 / 4096.0);
+    for strip in 0..16 {
+        let mut c: [v128; 64] = std::array::from_fn(|column| {
+            load_strip(unsafe { scratch.get_unchecked(column * 64 + strip * 4..) }.as_ptr())
+        });
+        dct1d_64_s(&mut c);
+        for u in 0..64 {
+            let p = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
+            unsafe { v128_store(p.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct64x32_wasm(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048]) {
+    let mut scratch_uninit = MaybeUninit::<[f32; 2048]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for strip in 0..8 {
+        let mut c: [v128; 64] =
+            std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
+        dct1d_64_s(&mut c);
+        for tile_index in 0..16 {
+            let (a, b, cc, d) = transpose_4x4(
+                c[tile_index * 4],
+                c[tile_index * 4 + 1],
+                c[tile_index * 4 + 2],
+                c[tile_index * 4 + 3],
+            );
+            for (lane, value) in [a, b, cc, d].iter().enumerate() {
+                let p = unsafe { dst.add((strip * 4 + lane) * 64 + tile_index * 4) };
+                unsafe { v128_store(p.cast(), *value) };
+            }
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = f32x4_splat(1.0 / 2048.0);
+    for strip in 0..16 {
+        let mut c: [v128; 32] = std::array::from_fn(|column| {
+            load_strip(unsafe { scratch.get_unchecked(column * 64 + strip * 4..) }.as_ptr())
+        });
+        dct1d_32_s(&mut c);
+        for u in 0..32 {
+            let p = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
+            unsafe { v128_store(p.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct32x64_wasm(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048]) {
+    let mut scratch_uninit = MaybeUninit::<[f32; 2048]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for row_strip in 0..8 {
+        let mut c = [f32x4_splat(0.0); 64];
+        for column_tile in 0..16 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(input.row(row_strip * 4)[column_tile * 4..].as_ptr()),
+                load_strip(input.row(row_strip * 4 + 1)[column_tile * 4..].as_ptr()),
+                load_strip(input.row(row_strip * 4 + 2)[column_tile * 4..].as_ptr()),
+                load_strip(input.row(row_strip * 4 + 3)[column_tile * 4..].as_ptr()),
+            );
+            c[column_tile * 4] = a;
+            c[column_tile * 4 + 1] = b;
+            c[column_tile * 4 + 2] = cc;
+            c[column_tile * 4 + 3] = d;
+        }
+        dct1d_64_s(&mut c);
+        for u in 0..64 {
+            let p = unsafe { dst.add(u * 32 + row_strip * 4) };
+            unsafe { v128_store(p.cast(), c[u]) };
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = f32x4_splat(1.0 / 2048.0);
+    for column_strip in 0..16 {
+        let mut c = [f32x4_splat(0.0); 32];
+        for row_tile in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(
+                    unsafe { scratch.get_unchecked((column_strip * 4) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((column_strip * 4 + 1) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((column_strip * 4 + 2) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+                load_strip(
+                    unsafe { scratch.get_unchecked((column_strip * 4 + 3) * 32 + row_tile * 4..) }
+                        .as_ptr(),
+                ),
+            );
+            c[row_tile * 4] = a;
+            c[row_tile * 4 + 1] = b;
+            c[row_tile * 4 + 2] = cc;
+            c[row_tile * 4 + 3] = d;
+        }
+        dct1d_32_s(&mut c);
+        for v in 0..32 {
+            let p = unsafe { output.get_unchecked_mut(v * 64 + column_strip * 4..) };
+            unsafe { v128_store(p.as_mut_ptr().cast(), f32x4_mul(c[v], scale)) };
         }
     }
 }
@@ -575,9 +737,8 @@ pub(crate) fn dct8x4_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
 
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct32x16_wasm(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
-    // scratch is column-major (`[col * 32 + vfreq]`) so the row pass reloads
-    // contiguously. Column pass runs over 4-wide strips (4 strips of 16 cols).
-    let mut scratch = [0.0f32; 512];
+    let mut scratch_uninit = MaybeUninit::<[f32; 512]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..4 {
         let mut c: [v128; 32] = std::array::from_fn(|r| load_strip(input.row(r)[s * 4..].as_ptr()));
         dct1d_32_s(&mut c);
@@ -585,11 +746,12 @@ pub(crate) fn dct32x16_wasm(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]
             let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
             let tile = [a, b, cc, d];
             for (j, v) in tile.iter().enumerate() {
-                let p = unsafe { scratch.get_unchecked_mut((s * 4 + j) * 32 + t * 4..) };
-                unsafe { v128_store(p.as_mut_ptr() as *mut v128, *v) };
+                let p = unsafe { dst.add((s * 4 + j) * 32 + t * 4) };
+                unsafe { v128_store(p.cast(), *v) };
             }
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 512.0);
     for q in 0..8 {
         let mut c: [v128; 16] = std::array::from_fn(|col| {
@@ -605,9 +767,8 @@ pub(crate) fn dct32x16_wasm(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]
 
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct16x32_wasm(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]) {
-    // Tall 16x32: 32-pt row DCT then 16-pt column DCT, both over 4-wide strips.
-    // scratch is hfreq-major (`[hfreq * 16 + row]`).
-    let mut scratch = [0.0f32; 512];
+    let mut scratch_uninit = MaybeUninit::<[f32; 512]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for s in 0..4 {
         let mut c = [f32x4_splat(0.0); 32];
         for ct in 0..8 {
@@ -624,10 +785,11 @@ pub(crate) fn dct16x32_wasm(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]
         }
         dct1d_32_s(&mut c);
         for u in 0..32 {
-            let p = unsafe { scratch.get_unchecked_mut(u * 16 + s * 4..) };
-            unsafe { v128_store(p.as_mut_ptr() as *mut v128, c[u]) };
+            let p = unsafe { dst.add(u * 16 + s * 4) };
+            unsafe { v128_store(p.cast(), c[u]) };
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 512.0);
     for q in 0..8 {
         let mut c = [f32x4_splat(0.0); 16];

@@ -434,7 +434,6 @@ pub(crate) fn selected_accumulate_ytob_weights_fn() -> AccumulateYtobWeightsFn {
 
 pub(crate) type FillYtobResidualsFn = fn(&mut [i32], &mut [i32], &[i16], &[i16], &[i16], &[i16]);
 
-#[inline]
 fn fill_ytob_residuals_plane_scalar(dst: &mut [i32], row: &[i16], up: &[i16]) {
     let Some((dst_first, dst_rest)) = dst.split_first_mut() else {
         return;

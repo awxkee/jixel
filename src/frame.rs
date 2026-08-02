@@ -36,7 +36,7 @@ use crate::color_correlation::choose_ytob_dc;
 use crate::dc_group_data::{
     DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    is_sub8_strategy,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, is_sub8_strategy,
 };
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
@@ -602,7 +602,7 @@ fn epf_sharpness_id(distance: f32) -> i32 {
         7
     } else if distance < 2.75 {
         6
-    } else if distance < 5.0 {
+    } else if distance < 3.5 {
         5
     } else {
         4
@@ -1058,13 +1058,14 @@ fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
         STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 3,
         STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
         STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
+        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
         _ => return None,
     })
 }
 
 /// Slots whose transform actually appears in the frame.
-fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 6] {
-    let mut used = [false; 6];
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 7] {
+    let mut used = [false; 7];
     for dc in dc_datas {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
@@ -1077,7 +1078,7 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 6] {
 
 fn write_dequant_matrices(
     matrices: &crate::quant_weights::DequantMatrices,
-    used: &[bool; 6],
+    used: &[bool; 7],
     w: &mut BitWriter,
 ) {
     use crate::quant_weights::f32_to_f16_bits;
@@ -1087,7 +1088,7 @@ fn write_dequant_matrices(
             .then(|| matrices.custom_tables[slot].as_ref())
             .flatten()
     };
-    if (0..6).all(|slot| table(slot).is_none()) {
+    if (0..7).all(|slot| table(slot).is_none()) {
         w.write(1, 1); // all_default
         return;
     }
@@ -1109,6 +1110,7 @@ fn write_dequant_matrices(
             6 => table(3),            // DCT8X16 (= DCT16X8)
             8 => table(4),            // DCT16X32 (= DCT32X16)
             TABLE_DCT4X8 => table(5), // DCT4X8 (= DCT8X4)
+            12 => table(6),           // DCT32X64 (= DCT64X32)
             _ => None,
         };
         match bands {
@@ -1136,7 +1138,7 @@ fn write_dequant_matrices(
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
-    used_quant_tables: &[bool; 6],
+    used_quant_tables: &[bool; 7],
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
@@ -2572,7 +2574,7 @@ fn build_stripe(
 mod tests {
     use super::{
         DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, MIN_TOKENS_PER_DC_LEAF,
-        choose_dc_predictors, compute_distance_params, dc_refinement, quant_dc,
+        choose_dc_predictors, compute_distance_params, dc_refinement, epf_sharpness_id, quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -2665,6 +2667,16 @@ mod tests {
         for d in [1.5, 2.0, 4.0, 6.0, 12.0, 25.0] {
             assert_eq!(compute_distance_params(d).epf_iters, 2, "d={d}");
         }
+    }
+
+    #[test]
+    fn epf_sharpness_strengthens_in_the_coarse_band() {
+        assert_eq!(epf_sharpness_id(1.74), 7);
+        assert_eq!(epf_sharpness_id(1.75), 6);
+        assert_eq!(epf_sharpness_id(2.75), 5);
+        assert_eq!(epf_sharpness_id(3.49), 5);
+        assert_eq!(epf_sharpness_id(3.5), 4);
+        assert_eq!(epf_sharpness_id(25.0), 4);
     }
 
     #[test]

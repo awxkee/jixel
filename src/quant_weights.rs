@@ -86,9 +86,50 @@ pub(crate) struct BandOverride {
 }
 
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
+const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
 const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
 const QM_SS2_SCALE16X32: f32 = 1.20;
+const QM_DCT8_Y_HF_SCALE: f32 = 1.25;
+
+static DCT8_BANDS: [[f32; 6]; 3] = [
+    [3150.0, 0.0, -0.4, -0.4, -0.4, -2.0],
+    [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
+    [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
+];
+
+/// Retain 25% more luma precision in the outer radial band, spread
+/// geometrically across the five band transitions. F16-round-trip every
+/// parameter so the encoder matrix exactly matches the signaled decoder table.
+fn coarse_dct8_override() -> BandOverride {
+    let hf_step = QM_DCT8_Y_HF_SCALE.powf(1.0 / 5.0);
+    let mut out = BandOverride {
+        num_bands: 6,
+        bands: [[0.0; 16]; 3],
+    };
+    for c in 0..3 {
+        out.bands[c][..6].copy_from_slice(&DCT8_BANDS[c]);
+    }
+    for i in 1..6 {
+        let ratio = band_mult(DCT8_BANDS[1][i]) * hf_step;
+        out.bands[1][i] = if ratio > 1.0 {
+            ratio - 1.0
+        } else {
+            1.0 - 1.0 / ratio
+        };
+    }
+    for c in 0..3 {
+        for i in 0..6 {
+            let v = out.bands[c][i];
+            out.bands[c][i] = if i == 0 {
+                f16_bits_to_f32(f32_to_f16_bits(v / 64.0)) * 64.0
+            } else {
+                f16_bits_to_f32(f32_to_f16_bits(v))
+            };
+        }
+    }
+    out
+}
 
 /// Default bands with the base (band 0) scaled, F16-round-tripped exactly like
 /// a parsed override so encoder and decoder agree bit-exactly.
@@ -742,9 +783,15 @@ pub(crate) struct DequantMatrices {
     /// construction time from the libjxl DCT32X32 polynomial parameters.
     pub(crate) matrix_32x32: HeapMatrix<f32, 3, 1024>,
     pub(crate) inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    /// Spec-default DCT64X64 table used by the slow large-transform path.
+    pub(crate) matrix_64x64: HeapMatrix<f32, 3, 4096>,
+    pub(crate) inv_matrix_64x64: HeapMatrix<f32, 3, 4096>,
+    /// Shared normalized 32-row x 64-column table for DCT64X32/DCT32X64.
+    pub(crate) matrix_64x32: HeapMatrix<f32, 3, 2048>,
+    pub(crate) inv_matrix_64x32: HeapMatrix<f32, 3, 2048>,
     /// Tables that differ from the spec defaults and must be signaled by
     /// `write_dequant_matrices`, in the fixed order
-    pub(crate) custom_tables: Box<[Option<BandOverride>; 6]>,
+    pub(crate) custom_tables: Box<[Option<BandOverride>; 7]>,
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
@@ -760,6 +807,10 @@ pub(crate) struct DequantMatrices {
     /// resolution so the same table applies to both orientations.
     pub(crate) matrix_32x16: HeapMatrix<f32, 3, 512>,
     pub(crate) inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
+    /// AFV dequant matrix (64 floats per channel, 8×8 grid), shared by all
+    /// four AFV variants (libjxl `QuantTable::AFV0`).
+    pub(crate) matrix_afv: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_afv: HeapMatrix<f32, 3, 64>,
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -929,6 +980,148 @@ static DCT4X8_BANDS: [[f32; 4]; 3] = [
     ],
 ];
 
+static DCT64X64_BANDS: [[f32; 8]; 3] = [
+    [
+        0.9 * 26629.073922049845,
+        -1.025,
+        -0.78,
+        -0.65012,
+        -0.19041574084286472,
+        -0.20819395464,
+        -0.421064,
+        -0.3273384553584867,
+    ],
+    [
+        0.9 * 9311.323871001005,
+        -0.3041958212306401,
+        -0.3633036457487539,
+        -0.35660379990111464,
+        -0.3443074455424403,
+        -0.33699592683512467,
+        -0.3018086652624211,
+        -0.27321683125358037,
+    ],
+    [
+        0.9 * 4992.248644553863,
+        -1.2,
+        -1.2,
+        -0.8,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
+
+/// JPEG XL DCT32X64 parameters, shared by both orientations.
+static DCT32X64_BANDS: [[f32; 8]; 3] = [
+    [
+        0.65 * 23629.073922049845,
+        -1.025,
+        -0.78,
+        -0.65012,
+        -0.19041574084286472,
+        -0.20819395464,
+        -0.421064,
+        -0.3273384553584867,
+    ],
+    [
+        0.65 * 8611.323871001005,
+        -0.3041958212306401,
+        -0.3633036457487539,
+        -0.35660379990111464,
+        -0.3443074455424403,
+        -0.33699592683512467,
+        -0.3018086652624211,
+        -0.27321683125358037,
+    ],
+    [
+        0.65 * 4492.248644553863,
+        -1.2,
+        -1.2,
+        -0.8,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
+
+fn compute_dct64x64_matrix() -> HeapMatrix<f32, 3, 4096> {
+    const NUM_BANDS: usize = 8;
+    let mut out = HeapMatrix::new(0.0f32);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT64X64_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT64X64_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcp = scale / 63.0;
+        for y in 0..64 {
+            let dy = y as f32 * rcp;
+            for x in 0..64 {
+                let dx = x as f32 * rcp;
+                out[c][y * 64 + x] =
+                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+            }
+        }
+    }
+    out
+}
+
+fn compute_dct64x32_matrix() -> HeapMatrix<f32, 3, 2048> {
+    const NUM_BANDS: usize = 8;
+    let mut out = HeapMatrix::new(0.0f32);
+    for c in 0..3 {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = DCT32X64_BANDS[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(DCT32X64_BANDS[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcprow = scale / 31.0;
+        let rcpcol = scale / 63.0;
+        for y in 0..32 {
+            let dy = y as f32 * rcprow;
+            for x in 0..64 {
+                let dx = x as f32 * rcpcol;
+                out[c][y * 64 + x] =
+                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+            }
+        }
+    }
+    out
+}
+
+/// libjxl `DequantMatricesLibraryDef::AFV0()` parameters: 9 `afv_weights` per
+/// channel (X, Y, B), shared by all four AFV variants. Layout per channel:
+/// [0..2) the 4x8/4x4 sub-part DC tendencies (coefficients 8 and 1), [2..5)
+/// the fixed 3-pixel-corner weights (coefficients 16, 2 and 18), [5..9) the
+/// 4 distance bands for the remaining AFV positions (same first-value +
+/// multiplicative-delta format as the DCT band tables). Source: libjxl
+/// `lib/jxl/quant_weights.cc`.
+static AFV_BANDS: [[f32; 9]; 3] = [
+    [3072.0, 3072.0, 256.0, 256.0, 256.0, 414.0, 0.0, 0.0, 0.0],
+    [1024.0, 1024.0, 50.0, 50.0, 50.0, 58.0, 0.0, 0.0, 0.0],
+    [384.0, 384.0, 12.0, 12.0, 12.0, 22.0, -0.25, -0.25, -0.25],
+];
+
+/// libjxl `kFreqs`: the radial frequency assigned to each AFV basis function,
+/// used to place the non-corner AFV weights on the 4-band curve. Positions
+/// with fixed weights (the 2x2 low corner) are never read; libjxl fills them
+/// with the 0xBAD sentinel, kept here verbatim.
+#[rustfmt::skip]
+static AFV_FREQS: [f32; 16] = [
+    0xBAD as f32, 0xBAD as f32, 0.8517778890324296, 5.37778436506804,
+    0xBAD as f32, 0xBAD as f32, 4.734747904497923, 5.449245381693219,
+    1.6598270267479331, 4.0, 7.275749096817861, 10.423227632456525,
+    2.662932286148962, 7.630657783650829, 8.962388608184032, 12.97166202570235,
+];
+
+const AFV_FREQ_LO: f32 = 0.8517778890324296;
+const AFV_FREQ_HI: f32 = 12.97166202570235 - AFV_FREQ_LO + 1e-6;
+
 /// libjxl interpolation between band weights. The two surrounding band values
 /// `a`, `b` are interpolated geometrically (exponential) using the fractional
 /// scaled distance.
@@ -1020,7 +1213,99 @@ fn compute_dct4x4_matrix() -> HeapMatrix<f32, 3, 64> {
     out
 }
 
-#[cfg(test)]
+/// Reproduce libjxl's AFV quant table (`kQuantModeAFV`), shared by all four
+/// AFV variants. The 8×8 block mixes three weight sources, mirroring the
+/// coefficient layout of the transform: odd rows carry the 4×8 radial weights
+/// (from the DCT4X8 library params), even rows / odd columns the 4×4 radial
+/// weights (from the DCT4X4 library params), and the (even, even) AFV
+/// positions get either fixed corner weights or a 4-band interpolation over
+/// the basis-function frequencies. Returns step sizes (1/weight).
+fn compute_afv_matrix() -> HeapMatrix<f32, 3, 64> {
+    let mut out = HeapMatrix::new(0.0f32);
+    for c in 0..3 {
+        // 4×8 radial weights, exactly as compute_dct4x8_matrix builds them.
+        let mut bands = [0.0f32; 4];
+        bands[0] = DCT4X8_BANDS[c][0];
+        for i in 1..4 {
+            bands[i] = bands[i - 1] * band_mult(DCT4X8_BANDS[c][i]);
+        }
+        let scale = 3.0 / (std::f32::consts::SQRT_2 + 1e-6);
+        let mut w4x8 = [0.0f32; 32];
+        for y in 0..4 {
+            let dy = y as f32 * (scale / 3.0);
+            let dy2 = dy * dy;
+            for x in 0..8 {
+                let dx = x as f32 * (scale / 7.0);
+                let dist = fmla(dx, dx, dy2).sqrt();
+                w4x8[y * 8 + x] = interpolate_vec_bands(dist, &bands);
+            }
+        }
+        // 4×4 radial weights, exactly as compute_dct4x4_matrix builds them.
+        bands[0] = DCT4X4_BANDS[c][0];
+        for i in 1..4 {
+            bands[i] = bands[i - 1] * band_mult(DCT4X4_BANDS[c][i]);
+        }
+        let mut w4x4 = [0.0f32; 16];
+        for y in 0..4 {
+            let dy = y as f32 * (scale / 3.0);
+            let dy2 = dy * dy;
+            for x in 0..4 {
+                let dx = x as f32 * (scale / 3.0);
+                let dist = fmla(dx, dx, dy2).sqrt();
+                w4x4[y * 4 + x] = interpolate_vec_bands(dist, &bands);
+            }
+        }
+        // AFV bands for the non-corner (even, even) positions.
+        bands[0] = AFV_BANDS[c][5];
+        for i in 1..4 {
+            bands[i] = bands[i - 1] * band_mult(AFV_BANDS[c][i + 5]);
+        }
+        let mut weights = [0.0f32; 64];
+        // Coefficient 0 is the block mean, quantized via the DC plane; libjxl
+        // stores weight 1 in the unused slot.
+        weights[0] = 1.0;
+        // Sub-part DC tendencies: coefficient 8 (4x8 half) and 1 (4x4 quad).
+        weights[8] = AFV_BANDS[c][0];
+        weights[1] = AFV_BANDS[c][1];
+        // Fixed weights for the 3-pixel AFV corner.
+        weights[16] = AFV_BANDS[c][2];
+        weights[2] = AFV_BANDS[c][3];
+        weights[18] = AFV_BANDS[c][4];
+        // Remaining AFV positions from the frequency interpolation.
+        for y in 0..4 {
+            for x in 0..4 {
+                if x < 2 && y < 2 {
+                    continue;
+                }
+                let pos = (AFV_FREQS[y * 4 + x] - AFV_FREQ_LO) * 3.0 / AFV_FREQ_HI;
+                weights[(2 * y) * 8 + 2 * x] = interpolate_vec_bands(pos, &bands);
+            }
+        }
+        // 4×8 weights in the odd rows, except position 8 (kept above).
+        for y in 0..4 {
+            for x in 0..8 {
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                weights[(2 * y + 1) * 8 + x] = w4x8[y * 8 + x];
+            }
+        }
+        // 4×4 weights in even rows / odd columns, except position 1.
+        for y in 0..4 {
+            for x in 0..4 {
+                if x == 0 && y == 0 {
+                    continue;
+                }
+                weights[(2 * y) * 8 + 2 * x + 1] = w4x4[y * 4 + x];
+            }
+        }
+        for (o, &w) in out[c].iter_mut().zip(weights.iter()) {
+            *o = 1.0 / w;
+        }
+    }
+    out
+}
+
 fn compute_dct8x8_matrix(override_: &BandOverride) -> HeapMatrix<f32, 3, 64> {
     const NUM_BANDS: usize = 6;
     let mut out = HeapMatrix::new(0.0f32);
@@ -1186,6 +1471,12 @@ struct SharedTables {
     inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
     matrix_4x8: HeapMatrix<f32, 3, 64>,
     inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
+    matrix_afv: HeapMatrix<f32, 3, 64>,
+    inv_matrix_afv: HeapMatrix<f32, 3, 64>,
+    matrix_64x64: HeapMatrix<f32, 3, 4096>,
+    inv_matrix_64x64: HeapMatrix<f32, 3, 4096>,
+    matrix_64x32: HeapMatrix<f32, 3, 2048>,
+    inv_matrix_64x32: HeapMatrix<f32, 3, 2048>,
 }
 
 fn shared_tables() -> &'static SharedTables {
@@ -1230,6 +1521,32 @@ fn shared_tables() -> &'static SharedTables {
             }
         }
 
+        let matrix_afv = compute_afv_matrix();
+        let mut inv_matrix_afv = HeapMatrix::new(0.);
+        for c in 0..3 {
+            // Only [0] (the block mean) lives in the DC plane; [1] and [8]
+            // (the sub-part DC differences) are regular AC coefficients.
+            for k in 1..64 {
+                inv_matrix_afv[c][k] = 1.0 / matrix_afv[c][k];
+            }
+        }
+
+        let matrix_64x64 = compute_dct64x64_matrix();
+        let mut inv_matrix_64x64 = HeapMatrix::new(0.0f32);
+        for c in 0..3 {
+            for k in 1..4096 {
+                inv_matrix_64x64[c][k] = 1.0 / matrix_64x64[c][k];
+            }
+        }
+
+        let matrix_64x32 = compute_dct64x32_matrix();
+        let mut inv_matrix_64x32 = HeapMatrix::new(0.0f32);
+        for c in 0..3 {
+            for k in 1..2048 {
+                inv_matrix_64x32[c][k] = 1.0 / matrix_64x32[c][k];
+            }
+        }
+
         Box::new(SharedTables {
             matrix,
             inv_matrix,
@@ -1239,6 +1556,12 @@ fn shared_tables() -> &'static SharedTables {
             inv_matrix_4x4,
             matrix_4x8,
             inv_matrix_4x8,
+            matrix_afv,
+            inv_matrix_afv,
+            matrix_64x64,
+            inv_matrix_64x64,
+            matrix_64x32,
+            inv_matrix_64x32,
         })
     })
 }
@@ -1247,18 +1570,21 @@ impl DequantMatrices {
     pub(crate) fn new(distance: f32) -> &'static Self {
         static DEFAULT: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        if distance >= QM_SS2_MIN_DISTANCE {
-            SS2.get_or_init(|| Self::compute(true))
+        static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if distance >= QM_DCT8_MIN_DISTANCE {
+            COARSE.get_or_init(|| Self::compute(true, true))
+        } else if distance >= QM_SS2_MIN_DISTANCE {
+            SS2.get_or_init(|| Self::compute(true, false))
         } else {
-            DEFAULT.get_or_init(|| Self::compute(false))
+            DEFAULT.get_or_init(|| Self::compute(false, false))
         }
     }
 
-    fn compute(use_ss2: bool) -> Self {
-        // Only the DCT16X16/DCT32X32 tables depend on the SS2 gate; every
-        // other table is computed once per process and shared between the
-        // two variants (the clones below are plain memcpys).
+    fn compute(use_ss2: bool, use_coarse_dct8: bool) -> Self {
+        // The large-transform tables depend on the SS2 gate, and DCT8 gets a
+        // separate coarser-quality variant. All other tables are shared.
         let shared = shared_tables();
+        let o8 = use_coarse_dct8.then(coarse_dct8_override);
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
         let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
@@ -1296,20 +1622,37 @@ impl DequantMatrices {
             }
         }
 
+        let (matrix, inv_matrix) = if let Some(o8) = o8.as_ref() {
+            let matrix = compute_dct8x8_matrix(o8);
+            let mut inv_matrix = HeapMatrix::new(0.);
+            for c in 0..3 {
+                for k in 1..64 {
+                    inv_matrix[c][k] = 1.0 / matrix[c][k];
+                }
+            }
+            (matrix, inv_matrix)
+        } else {
+            (shared.matrix.clone(), shared.inv_matrix.clone())
+        };
+
         Self {
-            matrix: shared.matrix.clone(),
-            inv_matrix: shared.inv_matrix.clone(),
+            matrix,
+            inv_matrix,
             matrix_16x8: shared.matrix_16x8.clone(),
             inv_matrix_16x8: shared.inv_matrix_16x8.clone(),
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
             matrix_32x32,
             inv_matrix_32x32: inv_32x32,
+            matrix_64x64: shared.matrix_64x64.clone(),
+            inv_matrix_64x64: shared.inv_matrix_64x64.clone(),
+            matrix_64x32: shared.matrix_64x32.clone(),
+            inv_matrix_64x32: shared.inv_matrix_64x32.clone(),
             custom_tables: heap_array_from_fn(|i| match i {
-                // DCT8, DCT8X16 and DCT4X8 all measured best at the spec
-                // defaults, so they are left unsignalled — which also saves
-                // their custom-table headers every frame.
-                0 | 3 | 5 => None,
+                0 => o8,
+                // DCT8X16 and DCT4X8 measured best at the spec defaults, so
+                // they remain unsignalled.
+                3 | 5 | 6 => None,
                 1 => o16,
                 2 => o32,
                 4 => o32x16,
@@ -1321,6 +1664,8 @@ impl DequantMatrices {
             inv_matrix_4x8: shared.inv_matrix_4x8.clone(),
             matrix_32x16,
             inv_matrix_32x16,
+            matrix_afv: shared.matrix_afv.clone(),
+            inv_matrix_afv: shared.inv_matrix_afv.clone(),
         }
     }
 
@@ -1363,6 +1708,26 @@ impl DequantMatrices {
         &self.inv_matrix_32x32[c]
     }
 
+    #[inline]
+    pub(crate) fn matrix_64x64(&self, c: usize) -> &[f32; 4096] {
+        &self.matrix_64x64[c]
+    }
+
+    #[inline]
+    pub(crate) fn inv_matrix_64x64(&self, c: usize) -> &[f32; 4096] {
+        &self.inv_matrix_64x64[c]
+    }
+
+    #[inline]
+    pub(crate) fn matrix_64x32(&self, c: usize) -> &[f32; 2048] {
+        &self.matrix_64x32[c]
+    }
+
+    #[inline]
+    pub(crate) fn inv_matrix_64x32(&self, c: usize) -> &[f32; 2048] {
+        &self.inv_matrix_64x32[c]
+    }
+
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid).
     #[inline]
     pub(crate) fn matrix_4x4(&self, c: usize) -> &[f32; 64] {
@@ -1392,6 +1757,16 @@ impl DequantMatrices {
     pub(crate) fn inv_matrix_32x16(&self, c: usize) -> &[f32; 512] {
         &self.inv_matrix_32x16[c]
     }
+    /// AFV dequant matrix (64 floats per channel, shared by AFV0..AFV3).
+    #[inline]
+    pub(crate) fn matrix_afv(&self, c: usize) -> &[f32; 64] {
+        &self.matrix_afv[c]
+    }
+    /// AFV inverse dequant matrix (used during quantization).
+    #[inline]
+    pub(crate) fn inv_matrix_afv(&self, c: usize) -> &[f32; 64] {
+        &self.inv_matrix_afv[c]
+    }
 }
 
 #[cfg(test)]
@@ -1403,7 +1778,9 @@ mod tests {
         // One handle (plus the custom-table box) per table, nothing inline: the
         // struct must stay small enough to live on a 64 KiB stack.
         let size = std::mem::size_of::<DequantMatrices>();
-        assert!(size <= 256, "DequantMatrices grew to {size} bytes");
+        // The DCT64 rectangle family adds one matrix/inverse pair (two Box
+        // handles), taking the expected footprint from 312 to 328 bytes.
+        assert!(size <= 328, "DequantMatrices grew to {size} bytes");
     }
 
     #[test]
@@ -1411,17 +1788,27 @@ mod tests {
         std::thread::Builder::new()
             .name("small-stack-dequant-test".into())
             .stack_size(64 * 1024)
-            .spawn(|| drop(DequantMatrices::compute(false)))
+            .spawn(|| drop(DequantMatrices::compute(false, false)))
             .unwrap()
             .join()
             .unwrap();
     }
 
-    static DCT8_BANDS: [[f32; 6]; 3] = [
-        [3150.0, 0.0, -0.4, -0.4, -0.4, -2.0],
-        [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
-        [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
-    ];
+    #[test]
+    fn coarse_dct8_preserves_more_luma_high_frequency() {
+        assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01).custom_tables[0].is_none());
+        assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE).custom_tables[0].is_some());
+
+        let normal = DequantMatrices::compute(true, false);
+        let coarse = DequantMatrices::compute(true, true);
+        assert!(normal.custom_tables[0].is_none());
+        assert!(coarse.custom_tables[0].is_some());
+
+        let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
+        assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
+        let lf_ratio = coarse.inv_matrix(1)[1] / normal.inv_matrix(1)[1];
+        assert!((1.0..1.03).contains(&lf_ratio), "{lf_ratio}");
+    }
 
     #[test]
     fn dct8_matrix_from_bands_matches_static() {
@@ -1500,6 +1887,34 @@ mod tests {
             for k in 0..512 {
                 assert_eq!(computed[c][k], m.matrix_32x16(c)[k], "32x16 c={c} k={k}");
             }
+        }
+    }
+
+    #[test]
+    fn afv_matrix_fixed_positions_match_library_weights() {
+        let m = DequantMatrices::new(1.0);
+        for c in 0..3 {
+            let mc = m.matrix_afv(c);
+            // Sub-part DC tendencies and the fixed 3-pixel-corner weights are
+            // stored verbatim in the library table.
+            assert_eq!(mc[8], 1.0 / AFV_BANDS[c][0], "c={c} [8]");
+            assert_eq!(mc[1], 1.0 / AFV_BANDS[c][1], "c={c} [1]");
+            assert_eq!(mc[16], 1.0 / AFV_BANDS[c][2], "c={c} [16]");
+            assert_eq!(mc[2], 1.0 / AFV_BANDS[c][3], "c={c} [2]");
+            assert_eq!(mc[18], 1.0 / AFV_BANDS[c][4], "c={c} [18]");
+            // Odd rows replicate the DCT4X8 weights, even rows / odd columns
+            // the DCT4X4 weights.
+            for x in 1..8 {
+                assert_eq!(mc[8 + x], m.matrix_4x8(c)[x], "c={c} 4x8 col {x}");
+            }
+            for x in 1..4 {
+                assert_eq!(mc[2 * x + 1], m.matrix_4x4(c)[2 * x], "c={c} 4x4 col {x}");
+            }
+            for (k, &v) in mc.iter().enumerate() {
+                assert!(v > 0.0 && v.is_finite(), "c={c} k={k}: {v}");
+            }
+            // DC slot must not leak into AC quantization.
+            assert_eq!(m.inv_matrix_afv(c)[0], 0.0);
         }
     }
 

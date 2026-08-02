@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::afv;
 use crate::dark_aq::{self, DarkAqConfig};
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
@@ -74,8 +75,18 @@ pub(crate) struct EncodingContext {
     pub(crate) dct4x8: &'static dct::DctFn<8, 8, 64>,
     pub(crate) dct8x4: &'static dct::DctFn<8, 8, 64>,
     pub(crate) dct32x32: &'static dct::DctFn<32, 32, 1024>,
+    pub(crate) dct64x64: &'static dct::DctFn<64, 64, 4096>,
+    pub(crate) dct64x32: &'static dct::DctFn<32, 64, 2048>,
+    pub(crate) dct32x64: &'static dct::DctFn<64, 32, 2048>,
     pub(crate) dct32x16: &'static dct::DctFn<16, 32, 512>,
     pub(crate) dct16x32: &'static dct::DctFn<32, 16, 512>,
+    pub(crate) dc_from_dct32x32: dct::DcFromDct32x32Fn,
+    pub(crate) dc_from_dct32x16: dct::DcFromDct32x16Fn,
+    pub(crate) dc_from_dct16x32: dct::DcFromDct16x32Fn,
+    pub(crate) afv0: afv::AfvFn,
+    pub(crate) afv1: afv::AfvFn,
+    pub(crate) afv2: afv::AfvFn,
+    pub(crate) afv3: afv::AfvFn,
 }
 
 impl EncodingContext {
@@ -88,6 +99,8 @@ impl EncodingContext {
         num_threads: usize,
     ) -> Self {
         let quantize_dc = group::selected_quantize_dc_methods();
+        let dc_from_dct = dct::selected_dc_from_dct_methods();
+        let afv = afv::selected_afv_methods();
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
@@ -126,8 +139,18 @@ impl EncodingContext {
             dct4x8: dct::selected_dct4x8(),
             dct8x4: dct::selected_dct8x4(),
             dct32x32: dct::selected_dct32x32(),
+            dct64x64: dct::selected_dct64x64(),
+            dct64x32: dct::selected_dct64x32(),
+            dct32x64: dct::selected_dct32x64(),
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
+            dc_from_dct32x32: dc_from_dct.dct32x32,
+            dc_from_dct32x16: dc_from_dct.dct32x16,
+            dc_from_dct16x32: dc_from_dct.dct16x32,
+            afv0: afv.afv0,
+            afv1: afv.afv1,
+            afv2: afv.afv2,
+            afv3: afv.afv3,
         }
     }
 }
