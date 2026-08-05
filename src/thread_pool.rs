@@ -116,6 +116,14 @@ pub(crate) struct ThreadPool {
 
 impl ThreadPool {
     pub(crate) fn new(num_threads: usize) -> Self {
+        Self::new_with_scratch(num_threads, CoderScratch::default)
+    }
+
+    pub(crate) fn new_lossless(num_threads: usize) -> Self {
+        Self::new_with_scratch(num_threads, CoderScratch::lossless)
+    }
+
+    fn new_with_scratch(num_threads: usize, make_scratch: fn() -> CoderScratch) -> Self {
         let num_threads = num_threads.max(1);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
@@ -128,7 +136,7 @@ impl ThreadPool {
                 std::thread::Builder::new()
                     .name(format!("jixel-worker-{i}"))
                     .spawn(move || {
-                        let mut scratch = Box::<CoderScratch>::default();
+                        let mut scratch = Box::new(make_scratch());
                         worker_loop(&shared, &mut scratch);
                     })
                     .expect("failed to start encoder worker")

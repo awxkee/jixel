@@ -35,11 +35,12 @@ use crate::entropy::{
 };
 use crate::group::AcGroupScratch;
 use crate::lossless::{GradientScratch, LzToken, PickThresholdScratch};
+use crate::ma_tree::MaPropertyScratch;
 use crate::patches::PATCH_TILE;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::util::{HeapMatrix, heap_array};
+use std::ops::{Deref, DerefMut};
 
-const LZ77_CANDIDATE_CAPACITY: usize = 1 << 19;
 pub(crate) const LZ77_MAX_CONTEXTS: usize = 1024;
 const DC_PREDICTOR_SLOTS: usize = 2 * K_NUM_DC_CONTEXTS;
 
@@ -84,6 +85,40 @@ impl Default for LzEntropyScratch {
             clustering: FixedClusterScratch::default(),
             ans: Box::default(),
         }
+    }
+}
+
+/// Defers fixed-size worker storage until a pipeline actually uses it.
+pub(crate) struct LazyScratch<T> {
+    value: Option<T>,
+    init: fn() -> T,
+}
+
+impl<T> LazyScratch<T> {
+    fn new(init: fn() -> T) -> Self {
+        Self { value: None, init }
+    }
+}
+
+impl<T: Default> Default for LazyScratch<T> {
+    fn default() -> Self {
+        Self::new(T::default)
+    }
+}
+
+impl<T> Deref for LazyScratch<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .as_ref()
+            .expect("lazy scratch must be initialized through mutable access")
+    }
+}
+
+impl<T> DerefMut for LazyScratch<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.get_or_insert_with(self.init)
     }
 }
 
@@ -212,66 +247,103 @@ pub(crate) struct CoderScratch {
     pub(crate) lz_repetitions: Vec<u32>,
     pub(crate) lz_depth: Vec<u32>,
     pub(crate) lz_candidate: Vec<LzToken>,
-    pub(crate) lz_entropy: LzEntropyScratch,
-    pub(crate) recon: HeapMatrix<f32, 8, 1024>,
+    /// Roughly 1 MiB of fixed entropy tables; Fast group workers never use it.
+    pub(crate) lz_entropy: LazyScratch<LzEntropyScratch>,
+    pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 1024>>,
     pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
-    pub(crate) ac_group: AcGroupScratch,
-    pub(crate) transform_gather: Box<[f32; 1024]>,
-    pub(crate) strategy_coeffs: HeapMatrix<f32, 3, 1024>,
+    pub(crate) ac_group: LazyScratch<AcGroupScratch>,
+    pub(crate) transform_gather: LazyScratch<Box<[f32; 1024]>>,
+    pub(crate) strategy_coeffs: LazyScratch<HeapMatrix<f32, 3, 1024>>,
     pub(crate) gradient: GradientScratch,
     pub(crate) order0_entropy: Vec<u64>,
     pub(crate) threshold: PickThresholdScratch,
+    pub(crate) ma_property: MaPropertyScratch,
     pub(crate) dct8_costs: Vec<f32>,
     pub(crate) ac_strategy: AcStrategyPipelineScratch,
     pub(crate) dc_cfl_cur: Vec<i32>,
     pub(crate) dc_cfl_prev: Vec<i32>,
-    pub(crate) dc_predictor: DcPredictorScratch,
-    pub(crate) patch_tile_colors: Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>,
+    pub(crate) dc_predictor: LazyScratch<DcPredictorScratch>,
+    pub(crate) patch_tile_colors: LazyScratch<Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>>,
 }
 
-impl Default for CoderScratch {
-    fn default() -> Self {
+impl CoderScratch {
+    fn new(reserve_lossy_buffers: bool) -> Self {
+        let (aq_map, structure_corrections, dark_octile, gradient, order0_entropy, threshold) =
+            if reserve_lossy_buffers {
+                (
+                    AqMapScratch {
+                        aq_map: vec![0.0; 256 * 256],
+                        secondary: vec![0.0; 2048 + 512 * 512],
+                    },
+                    vec![0.0; 256 * 256],
+                    vec![0.0; 32 * 32],
+                    GradientScratch {
+                        cur: vec![0; 256],
+                        prev: vec![0; 256],
+                        prev_prev: vec![0; 256],
+                        buf: vec![0; 256],
+                    },
+                    vec![0; 1024],
+                    PickThresholdScratch {
+                        hist_scratch: vec![0; 3 * 1025],
+                    },
+                )
+            } else {
+                (
+                    AqMapScratch::default(),
+                    Vec::new(),
+                    Vec::new(),
+                    GradientScratch::default(),
+                    Vec::new(),
+                    PickThresholdScratch::default(),
+                )
+            };
+
         Self {
-            aq_map: AqMapScratch {
-                aq_map: vec![0.0; 256 * 256],
-                secondary: vec![0.0; 2048 + 512 * 512],
-            },
-            structure_corrections: vec![0.0; 256 * 256],
-            lz_repetitions: vec![0; 1 << 14],
-            lz_depth: vec![u32::MAX; 1 << 20],
-            lz_candidate: Vec::with_capacity(LZ77_CANDIDATE_CAPACITY),
-            lz_entropy: LzEntropyScratch::default(),
-            recon: HeapMatrix::new(0.0),
-            dark_octile: vec![0.0; 32 * 32],
+            aq_map,
+            structure_corrections,
+            // Fast never enters the deep LZ path. Slow grows these buffers on
+            // first use, and subsequent groups reuse the allocation.
+            lz_repetitions: Vec::new(),
+            lz_depth: Vec::new(),
+            lz_candidate: Vec::new(),
+            lz_entropy: LazyScratch::default(),
+            recon: LazyScratch::new(|| HeapMatrix::new(0.0)),
+            dark_octile,
             huffman_pool: Vec::with_capacity(1024),
             alpha_tokens: Vec::new(),
-            ac_group: AcGroupScratch::default(),
-            transform_gather: heap_array(0.0),
-            strategy_coeffs: HeapMatrix::new(0.0),
-            gradient: GradientScratch {
-                cur: vec![0; 256],
-                prev: vec![0; 256],
-                buf: vec![0; 256],
-            },
-            order0_entropy: vec![0; 1024],
-            threshold: PickThresholdScratch {
-                hist_scratch: vec![0; 3 * 1025],
-            },
+            ac_group: LazyScratch::default(),
+            transform_gather: LazyScratch::new(|| heap_array(0.0)),
+            strategy_coeffs: LazyScratch::new(|| HeapMatrix::new(0.0)),
+            gradient,
+            order0_entropy,
+            threshold,
+            ma_property: MaPropertyScratch::default(),
             dct8_costs: Vec::new(),
             ac_strategy: AcStrategyPipelineScratch::default(),
             dc_cfl_cur: Vec::new(),
             dc_cfl_prev: Vec::new(),
-            dc_predictor: DcPredictorScratch::default(),
-            patch_tile_colors: heap_array([0; 3]),
+            dc_predictor: LazyScratch::default(),
+            patch_tile_colors: LazyScratch::new(|| heap_array([0; 3])),
         }
+    }
+
+    pub(crate) fn lossless() -> Self {
+        Self::new(false)
+    }
+}
+
+impl Default for CoderScratch {
+    fn default() -> Self {
+        Self::new(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoderScratch, DcPredictorScratch, LzEntropyScratch};
+    use super::{CoderScratch, DcPredictorScratch, LazyScratch, LzEntropyScratch};
     use crate::group::AcGroupScratch;
     use std::mem::size_of;
 
@@ -280,7 +352,38 @@ mod tests {
         assert!(size_of::<CoderScratch>() <= 1024);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
+        assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);
         assert!(size_of::<AcGroupScratch>() <= 128);
+    }
+
+    #[test]
+    fn slow_lz_buffers_are_not_reserved_by_default() {
+        let scratch = CoderScratch::default();
+        assert_eq!(scratch.lz_repetitions.capacity(), 0);
+        assert_eq!(scratch.lz_depth.capacity(), 0);
+        assert_eq!(scratch.lz_candidate.capacity(), 0);
+    }
+
+    #[test]
+    fn lossless_scratch_does_not_reserve_lossy_buffers() {
+        let scratch = CoderScratch::lossless();
+        assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
+        assert_eq!(scratch.aq_map.secondary.capacity(), 0);
+        assert_eq!(scratch.structure_corrections.capacity(), 0);
+        assert_eq!(scratch.dark_octile.capacity(), 0);
+        assert_eq!(scratch.gradient.cur.capacity(), 0);
+        assert_eq!(scratch.gradient.prev.capacity(), 0);
+        assert_eq!(scratch.gradient.prev_prev.capacity(), 0);
+        assert_eq!(scratch.gradient.buf.capacity(), 0);
+        assert_eq!(scratch.order0_entropy.capacity(), 0);
+        assert_eq!(scratch.threshold.hist_scratch.capacity(), 0);
+        assert!(scratch.lz_entropy.value.is_none());
+        assert!(scratch.recon.value.is_none());
+        assert!(scratch.ac_group.value.is_none());
+        assert!(scratch.transform_gather.value.is_none());
+        assert!(scratch.strategy_coeffs.value.is_none());
+        assert!(scratch.dc_predictor.value.is_none());
+        assert!(scratch.patch_tile_colors.value.is_none());
     }
 
     #[test]

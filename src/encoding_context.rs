@@ -67,6 +67,7 @@ pub(crate) struct EncodingContext {
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
 
+    pub(crate) idct: &'static dct::IdctMethods,
     pub(crate) dct8x8: &'static dct::DctFn<8, 8, 64>,
     pub(crate) dct8x16: &'static dct::DctFn<16, 8, 128>,
     pub(crate) dct16x8: &'static dct::DctFn<8, 16, 128>,
@@ -131,6 +132,7 @@ impl EncodingContext {
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),
 
+            idct: dct::selected_idct_methods(),
             dct8x8: dct::selected_dct8x8(),
             dct8x16: dct::selected_dct8x16(),
             dct16x8: dct::selected_dct16x8(),

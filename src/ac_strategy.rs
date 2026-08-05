@@ -783,6 +783,7 @@ fn reconstruction_dist_and_rate(
     (ctx.recon_dist_and_rate)(
         recon,
         &ReconDistInput {
+            idct: ctx.idct,
             quantization: ReconQuantization {
                 rate_log2_lut: ctx.rate_log2_lut,
                 coeffs,
@@ -896,7 +897,7 @@ fn sub8_strategy_costs(
         for c in 0..3 {
             forward_sub8_transform(ctx, strategy, &pixels[c], &mut coeffs[c]);
         }
-        let [x, y, b] = &mut **coeffs;
+        let [x, y, b] = &mut ***coeffs;
         apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
         let (distortion, rate) =
             coefficient_dist_and_rate(ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1);
@@ -2140,7 +2141,8 @@ mod tests {
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
         AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32,
+        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
+        STRATEGY_DCT64X32, STRATEGY_DCT64X64,
     };
     use crate::encoding_context::EncodingContext;
     use crate::image::{Image3F, ImageB, ImageSB};
@@ -2418,24 +2420,28 @@ mod tests {
         // x = N·Fᵀ·(F·x) must return the original block (exact inverse).
         // DCT4X4/4X8/8X4 use a sub-DC Hadamard (non-orthogonal), so the
         // `x=N·Fᵀc` inverse doesn't apply — but they are not merge candidates.
+        let idct = crate::dct::IdctMethods::scalar();
         for strategy in [
             STRATEGY_DCT,
             STRATEGY_DCT16X8,
             STRATEGY_DCT16X16,
             STRATEGY_DCT32X32,
+            STRATEGY_DCT64X64,
+            STRATEGY_DCT64X32,
+            STRATEGY_DCT32X64,
         ] {
             let n = strategy_pixel_count(strategy);
             // deterministic pseudo-random input
-            let mut x = [0.0f32; 1024];
+            let mut x = vec![0.0f32; n];
             let mut s = 12345u32;
-            for v in x[..n].iter_mut() {
+            for v in &mut x {
                 s = s.wrapping_mul(1664525).wrapping_add(1013904223);
                 *v = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
             }
-            let mut c = [0.0f32; 1024];
+            let mut c = vec![0.0f32; n];
             forward_for(strategy, &x, &mut c);
-            let mut recon = [0.0f32; 1024];
-            reconstruct_error(strategy, &c[..n], &mut recon[..n]);
+            let mut recon = vec![0.0f32; n];
+            reconstruct_error(&idct, strategy, &c, &mut recon);
             let max_err = (0..n).map(|i| (recon[i] - x[i]).abs()).fold(0.0, f32::max);
             assert!(
                 max_err < 1e-3,

@@ -145,6 +145,28 @@ fn strength(distance: f32) -> f32 {
 pub(crate) const FEATURE_EPS: f32 = 1.0e-10;
 
 #[inline]
+fn gradient_sparsity(block: &[f32; 64]) -> f32 {
+    let rows = block.as_chunks::<8>().0;
+    let mut sum = 0.0f32;
+    let mut sum_squared = 0.0f32;
+    for row_window in rows.array_windows::<3>() {
+        let [top, middle, bottom] = row_window;
+        for ((&left, &right), (&top, &bottom)) in middle[..6]
+            .iter()
+            .zip(&middle[2..])
+            .zip(top[1..7].iter().zip(&bottom[1..7]))
+        {
+            let gx = 0.5 * (right - left);
+            let gy = 0.5 * (bottom - top);
+            let energy = fmla(gx, gx, gy * gy);
+            sum += energy;
+            sum_squared = fmla(energy, energy, sum_squared);
+        }
+    }
+    ((36.0 * sum_squared / (sum * sum + FEATURE_EPS) - 1.0) * 0.5).clamp(0.0, 1.0)
+}
+
+#[inline]
 #[allow(dead_code)]
 pub(crate) fn finish_block_features(
     variance: f32,
@@ -321,15 +343,29 @@ fn block_features_scalar(block: &[f32; 64], dct8x8: &DctFn<8, 8, 64>) -> Feature
 }
 
 #[inline]
-fn correction_score(f: Features, distance: f32) -> f32 {
+fn ringing_mix(distance: f32) -> f32 {
+    (if distance <= 4.0 {
+        1.0 - 2.0 * (4.0 - distance)
+    } else {
+        1.0 - 3.0 * (distance - 4.0)
+    })
+    .clamp(0.0, 1.0)
+}
+
+#[inline]
+fn correction_score(f: Features, distance: f32, ringing_mix: f32, gradient_sparsity: f32) -> f32 {
     let structure =
         0.30 * f.persistence + 0.25 * f.coherence + 0.25 * f.predictability + 0.20 * f.mid_share;
     let noise =
         f.high_share * (1.0 - f.coherence) * (1.0 - f.predictability) * (1.0 - f.persistence);
     let weak_edge = f.coherence * f.predictability * f.gradient_presence;
     let banding = weak_edge * f.mid_share * (1.0 - f.high_share);
+    let ringing = banding * gradient_sparsity;
     let low_quality_mix = ((distance - 3.5) / 2.5).clamp(0.0, 1.0);
+    // A lower-than-center score receives a finer quantizer. Protect sparse
+    // edges here; the centered correction funds them from more maskable blocks.
     structure + (0.20 + 0.35 * low_quality_mix) * weak_edge + 0.35 * low_quality_mix * banding
+        - 0.50 * ringing_mix * ringing
         - (0.90 - 0.15 * low_quality_mix) * noise
 }
 
@@ -354,6 +390,7 @@ pub(crate) fn apply(
         corrections.resize(field_width * field_height, 0.0);
     }
     let corrections = &mut corrections[..field_width * field_height];
+    let ringing_mix = ringing_mix(distance);
     let mut weighted_sum = 0.0f32;
     let mut total_weight = 0.0f32;
     for (by, correction_row) in corrections.chunks_exact_mut(field_width).enumerate() {
@@ -377,7 +414,17 @@ pub(crate) fn apply(
                     }
                 }
             }
-            let correction = correction_score(block_features(&block, dct8x8), distance);
+            let sparsity = if ringing_mix == 0.0 {
+                0.0
+            } else {
+                gradient_sparsity(&block)
+            };
+            let correction = correction_score(
+                block_features(&block, dct8x8),
+                distance,
+                ringing_mix,
+                sparsity,
+            );
             *correction_out = correction;
             let weight = (w * h) as f32;
             weighted_sum = fmla(weight, correction, weighted_sum);
@@ -465,6 +512,31 @@ mod tests {
     #[test]
     fn selected_block_features_matches_scalar() {
         check_block_features(select_block_features_fn());
+    }
+
+    #[test]
+    fn gradient_sparsity_separates_isolated_edges_from_distributed_activity() {
+        let mut edge = [0.0f32; 64];
+        let mut ramp = [0.0f32; 64];
+        let mut checker = [0.0f32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                edge[y * 8 + x] = if x < 4 { 0.0 } else { 0.5 };
+                ramp[y * 8 + x] = x as f32 / 7.0;
+                checker[y * 8 + x] = ((x + y) & 1) as f32;
+            }
+        }
+        assert!(gradient_sparsity(&edge) > 0.9);
+        assert!(gradient_sparsity(&ramp) < 1.0e-5);
+        assert!(gradient_sparsity(&checker) < 1.0e-5);
+    }
+
+    #[test]
+    fn ringing_protection_is_confined_to_the_low_quality_window() {
+        assert_eq!(ringing_mix(3.5), 0.0);
+        assert_eq!(ringing_mix(4.0), 1.0);
+        assert_eq!(ringing_mix(4.25), 0.25);
+        assert_eq!(ringing_mix(4.5), 0.0);
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
@@ -556,6 +628,7 @@ mod tests {
         let line_f = block_features_scalar(&line, dct);
         let noise_f = block_features_scalar(&checker, dct);
         assert!(line_f.coherence > noise_f.coherence);
-        assert!(correction_score(line_f, 3.0) > correction_score(noise_f, 3.0));
+        assert!(correction_score(line_f, 3.0, 0.0, 0.0) > correction_score(noise_f, 3.0, 0.0, 0.0));
+        assert!(correction_score(line_f, 4.0, 1.0, 1.0) < correction_score(line_f, 4.0, 1.0, 0.0));
     }
 }

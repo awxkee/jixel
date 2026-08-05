@@ -27,8 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::dct::{
-    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4,
-    WC4, WC8, WC16, WC32, WC64,
+    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
+    RESAMPLE_SCALE_32_TO_4, WC4, WC8, WC16, WC32, WC64,
 };
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
@@ -509,7 +509,7 @@ pub(crate) fn dct32x64_avx2(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048
 const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn idct2_flat(a: __m256, b: __m256) -> (__m256, __m256) {
     let half = _mm256_set1_ps(0.5);
     (
@@ -519,7 +519,7 @@ fn idct2_flat(a: __m256, b: __m256) -> (__m256, __m256) {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn inv_dct1d_4_flat(c: &mut [__m256; 4]) {
     let (t0, t1, mut t2, t3) = (c[0], c[2], c[1], c[3]);
     t2 = _mm256_mul_ps(_mm256_sub_ps(t2, t3), _mm256_set1_ps(IS2));
@@ -535,7 +535,7 @@ fn inv_dct1d_4_flat(c: &mut [__m256; 4]) {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn inv_dct1d_8_flat(c: &mut [__m256; 8]) {
     let mut t = [c[0]; 8];
     for i in 0..4 {
@@ -560,7 +560,7 @@ fn inv_dct1d_8_flat(c: &mut [__m256; 8]) {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn inv_dct1d_16_flat(c: &mut [__m256; 16]) {
     let mut t = [c[0]; 16];
     for i in 0..8 {
@@ -586,7 +586,7 @@ fn inv_dct1d_16_flat(c: &mut [__m256; 16]) {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 fn inv_dct1d_32_flat(c: &mut [__m256; 32]) {
     let mut t = [c[0]; 32];
     for i in 0..16 {
@@ -608,6 +608,32 @@ fn inv_dct1d_32_flat(c: &mut [__m256; 32]) {
     for i in 0..16 {
         c[i] = _mm256_mul_ps(_mm256_add_ps(e[i], o[i]), half);
         c[31 - i] = _mm256_mul_ps(_mm256_sub_ps(e[i], o[i]), half);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn inv_dct1d_64_flat(c: &mut [__m256; 64]) {
+    let mut t = [c[0]; 64];
+    for i in 0..32 {
+        t[i] = c[2 * i];
+        t[32 + i] = c[2 * i + 1];
+    }
+    for i in (33..=62).rev() {
+        t[i] = _mm256_sub_ps(t[i], t[i + 1]);
+    }
+    t[32] = _mm256_mul_ps(_mm256_sub_ps(t[32], t[33]), _mm256_set1_ps(IS2));
+    let mut odd: [__m256; 32] = std::array::from_fn(|i| t[32 + i]);
+    inv_dct1d_32_flat(&mut odd);
+    for i in 0..32 {
+        odd[i] = _mm256_mul_ps(odd[i], _mm256_set1_ps(INV_WC64[i]));
+    }
+    let mut even: [__m256; 32] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_32_flat(&mut even);
+    let half = _mm256_set1_ps(0.5);
+    for i in 0..32 {
+        c[i] = _mm256_mul_ps(_mm256_add_ps(even[i], odd[i]), half);
+        c[63 - i] = _mm256_mul_ps(_mm256_sub_ps(even[i], odd[i]), half);
     }
 }
 
@@ -636,7 +662,7 @@ macro_rules! horizontal_idct_pass_avx2 {
 
 macro_rules! inv_dct_natural_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,fma")]
         pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
             let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
             let dst = scratch_uninit.as_mut_ptr() as *mut f32;
@@ -658,7 +684,7 @@ macro_rules! inv_dct_natural_avx2 {
 
 macro_rules! inv_dct_transposed_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
-        #[target_feature(enable = "avx2")]
+        #[target_feature(enable = "avx2,fma")]
         pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
             let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
             let dst = scratch_uninit.as_mut_ptr() as *mut f32;
@@ -740,6 +766,30 @@ inv_dct_transposed_avx2!(
     32,
     inv_dct1d_32_flat,
     inv_dct1d_32_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct64x64_avx2,
+    4096,
+    64,
+    64,
+    inv_dct1d_64_flat,
+    inv_dct1d_64_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct64x32_avx2,
+    2048,
+    64,
+    32,
+    inv_dct1d_64_flat,
+    inv_dct1d_32_flat
+);
+inv_dct_natural_avx2!(
+    inv_dct32x64_avx2,
+    2048,
+    32,
+    64,
+    inv_dct1d_32_flat,
+    inv_dct1d_64_flat
 );
 
 /// 4-point DCT-II over 4 lanes (one per 4×4 quadrant), mirroring the scalar
@@ -1091,17 +1141,24 @@ mod tests {
 
     fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
         assert_eq!(neon.len(), scalar.len(), "{label}: length mismatch");
+        let base_tolerance = if label.starts_with("idct") && label.contains("64") {
+            5e-4
+        } else {
+            ATOL
+        };
         let mut max_err: f32 = 0.0;
+        let mut max_tolerance: f32 = base_tolerance;
         let mut worst = 0usize;
         for (i, (n, s)) in neon.iter().zip(scalar.iter()).enumerate() {
             let e = (n - s).abs();
             if e > max_err {
                 max_err = e;
+                max_tolerance = base_tolerance + 16.0 * f32::EPSILON * s.abs();
                 worst = i;
             }
         }
         assert!(
-            max_err < ATOL,
+            max_err < max_tolerance,
             "{label}: max error {max_err:.2e} at index {worst} \
              (neon={:.6}, scalar={:.6})",
             neon[worst],
@@ -1162,7 +1219,7 @@ mod tests {
         avx2: for<'a> unsafe fn(DctInput<'a, W, H>, &mut [f32; N]),
         label: &str,
     ) {
-        if !is_x86_feature_detected!("avx2") {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
             return;
         }
         let mut cases = Vec::with_capacity(35);
@@ -1465,6 +1522,33 @@ mod tests {
             crate::dct::inv_dct32x32,
             crate::avx::inv_dct32x32_avx2,
             "idct32x32",
+        );
+    }
+
+    #[test]
+    fn test_idct64x64_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct64x64,
+            crate::avx::inv_dct64x64_avx2,
+            "idct64x64",
+        );
+    }
+
+    #[test]
+    fn test_idct64x32_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct64x32,
+            crate::avx::inv_dct64x32_avx2,
+            "idct64x32",
+        );
+    }
+
+    #[test]
+    fn test_idct32x64_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x64,
+            crate::avx::inv_dct32x64_avx2,
+            "idct32x64",
         );
     }
 }

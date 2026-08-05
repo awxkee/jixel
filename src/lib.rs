@@ -80,6 +80,7 @@ mod thread_pool;
 mod util;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm;
+mod weighted_predictor;
 mod xyb;
 
 pub use color_encoding::{
