@@ -50,7 +50,7 @@ const MATCH_GAMMA_OFFSET: f32 = 0.019;
 /// Ratio of derivatives of cubic-root to simple-gamma; moves quantization from
 /// jxl's opsin (cube-root-of-photons) space to butteraugli's log-gamma space.
 #[inline]
-pub(crate) fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
+pub(crate) fn ratio_cubic_to_simple_gamma<const INVERT: bool>(v: f32) -> f32 {
     let k_epsilon = 1e-2f32;
     let v = if v < 0.0 { 0.0 } else { v };
     let k_num_mul = K_SG_RET_MUL * 3.0 * K_SG_MUL;
@@ -59,7 +59,7 @@ pub(crate) fn ratio_cubic_to_simple_gamma(v: f32, invert: bool) -> f32 {
     let v2 = v * v;
     let num = k_num_mul * v2 + k_epsilon;
     let den = (k_den_mul * v) * v2 + k_v_offset;
-    if invert { num / den } else { den / num }
+    if INVERT { num / den } else { den / num }
 }
 
 /// Visual-masking transform applied to the accumulated per-block difference.
@@ -194,8 +194,8 @@ pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) 
             let inx = row_x[cx];
             let r = iny - inx;
             let g = iny + inx;
-            let ratio_r = ratio_cubic_to_simple_gamma(r, true);
-            let ratio_g = ratio_cubic_to_simple_gamma(g, true);
+            let ratio_r = ratio_cubic_to_simple_gamma::<true>(r);
+            let ratio_g = ratio_cubic_to_simple_gamma::<true>(g);
             overall_ratio = fmla(0.5, ratio_r + ratio_g, overall_ratio);
         }
     }
@@ -374,7 +374,7 @@ fn fill_quant_field_scalar(
 
             let in_y = row_y[gx_c];
             let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
-            let gammac = ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
+            let gammac = ratio_cubic_to_simple_gamma::<false>(in_y + MATCH_GAMMA_OFFSET);
             let mut diff = gammac * (in_y - base);
             diff *= diff;
             // current libjxl: clamp the squared luma diff before masking.

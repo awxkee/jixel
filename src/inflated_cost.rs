@@ -30,8 +30,9 @@
 //! Coefficient-SSE and reconstructed-SSIM costs used by AC strategy selection.
 
 use crate::dc_group_data::{
-    STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    NUM_STRATEGIES, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
+    STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
+    STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
 };
 use crate::dct::{DctInput, fmla};
 use crate::image::{Image3F, Plane};
@@ -343,6 +344,10 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         STRATEGY_DCT4X4 => fwd!(dct::dct4x4, 64),
         STRATEGY_DCT4X8 => fwd!(dct::dct4x8, 64),
         STRATEGY_DCT8X4 => fwd!(dct::dct8x4, 64),
+        STRATEGY_AFV0 => fwd!(crate::afv::afv0, 64),
+        STRATEGY_AFV1 => fwd!(crate::afv::afv1, 64),
+        STRATEGY_AFV2 => fwd!(crate::afv::afv2, 64),
+        STRATEGY_AFV3 => fwd!(crate::afv::afv3, 64),
         STRATEGY_DCT16X8 => fwd!(dct::dct16x8, 128),
         STRATEGY_DCT8X16 => fwd!(dct::dct8x16, 128),
         STRATEGY_DCT16X16 => fwd!(dct::dct16x16, 256),
@@ -356,7 +361,7 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
 pub(crate) fn forward_matrix(strategy: u8) -> &'static [f32] {
     static MATRICES: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
     &MATRICES.get_or_init(|| {
-        (0u8..10)
+        (0u8..NUM_STRATEGIES as u8)
             .map(|s| {
                 let n = strategy_pixel_count(s);
                 let mut matrix = vec![0.0f32; n * n];

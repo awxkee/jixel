@@ -30,8 +30,8 @@ use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
-    EntropyCode, Histogram, Token, build_huffman_codes_into, cluster_histograms_fixed,
-    optimize_entropy_code, write_entropy_code, write_token,
+    ALPHABET_SIZE, EntropyCode, Histogram, Token, build_huffman_codes_into,
+    cluster_histograms_fixed, optimize_entropy_code, write_entropy_code, write_token,
 };
 
 pub(super) const LZ77_MIN_SYMBOL: u32 = 64;
@@ -326,12 +326,9 @@ where
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
     let histograms = &mut scratch.histograms[..num_contexts];
     histograms.fill(Histogram::new());
-    for (context, slot) in scratch.context_map[..num_contexts].iter_mut().enumerate() {
-        *slot = context as u8;
-    }
     lz_add_histograms(
         tokens.clone(),
-        &scratch.context_map[..num_contexts],
+        None,
         histograms,
         LZ77_MIN_SYMBOL,
         distance_context,
@@ -437,28 +434,33 @@ fn lz77_compress_with_depth_into(
     }
 }
 
+/// `context_map: None` accumulates per raw context (identity), which supports
+/// context counts beyond the u8 map range used after clustering.
 fn lz_add_histograms<I>(
     toks: I,
-    context_map: &[u8],
+    context_map: Option<&[u8]>,
     histograms: &mut [Histogram],
     min_symbol: u32,
     distance_context: u32,
 ) where
     I: IntoIterator<Item = LzToken>,
 {
+    let slot = |context: u32| -> usize {
+        match context_map {
+            Some(map) => map[context as usize] as usize,
+            None => context as usize,
+        }
+    };
     for t in toks {
         if t.is_lz77() {
             let (len_tok, _, _) = lz77_length_encode(t.value);
-            let pixel_cluster = context_map[t.context as usize] as usize;
-            histograms[pixel_cluster].add(min_symbol + len_tok);
+            histograms[slot(t.context)].add(min_symbol + len_tok);
 
-            let dist_cluster = context_map[distance_context as usize] as usize;
             let (symbol, _, _) = crate::entropy::uint_encode(t.distance);
-            histograms[dist_cluster].add(symbol);
+            histograms[slot(distance_context)].add(symbol);
         } else {
             let (sym, _, _) = crate::entropy::uint_encode(t.value);
-            let cluster = context_map[t.context as usize] as usize;
-            histograms[cluster].add(sym);
+            histograms[slot(t.context)].add(sym);
         }
     }
 }
@@ -479,6 +481,9 @@ where
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
+    // The incoming flag marks Slow mode; Slow also switches the pixel streams
+    // from prefix codes to rANS (denser, worth ~1-2%).
+    let use_ans = refined;
     let refined = refined
         && streams.clone().any(|toks| {
             toks.iter()
@@ -490,16 +495,14 @@ where
         context_map,
         configs,
         clustering,
+        ans,
     } = scratch;
     let histograms = &mut histograms[..num_contexts];
     histograms.fill(Histogram::new());
-    for (context, slot) in context_map[..num_contexts].iter_mut().enumerate() {
-        *slot = context as u8;
-    }
     for toks in streams.clone() {
         lz_add_histograms(
             toks.iter().copied(),
-            &context_map[..num_contexts],
+            None,
             histograms,
             min_symbol,
             distance_context,
@@ -592,6 +595,16 @@ where
             }
         }
     }
+    if use_ans {
+        let (hists, symbols, reverse_maps) = crate::entropy::build_ans_code_parts(histograms);
+        ans.histograms = hists;
+        ans.symbols = symbols;
+        ans.reverse_maps = reverse_maps;
+    } else {
+        ans.histograms.clear();
+        ans.symbols.clear();
+        ans.reverse_maps.clear();
+    }
     EntropyCode {
         context_map: &context_map[..num_contexts],
         num_contexts,
@@ -600,10 +613,96 @@ where
         num_prefix_codes: num_clusters,
         orig_context_map: None,
         orig_num_contexts: num_contexts,
-        use_prefix_code: true,
-        ans_histograms: &[],
-        ans_symbols: &[],
-        ans_reverse_maps: &[],
+        use_prefix_code: !use_ans,
+        ans_histograms: &ans.histograms,
+        ans_symbols: &ans.symbols,
+        ans_reverse_maps: &ans.reverse_maps,
+    }
+}
+
+/// Emit a full section's `LzToken` stream: prefix codes stream token-by-token;
+/// rANS buffers the section (one ANS state per section, symbols pushed in
+/// reverse) exactly like `write_ans_tokens`, with the LZ77 symbol mapping of
+/// `write_lz_token` (length = direct symbol `min_symbol + len_tok`; literals
+/// and distances honor the per-cluster hybrid-uint config).
+pub(super) fn write_lz_section(
+    tokens: &[LzToken],
+    distance_context: u32,
+    code: &EntropyCode<'_>,
+    min_symbol: u32,
+    w: &mut BitWriter,
+) {
+    if code.use_prefix_code {
+        for t in tokens {
+            write_lz_token(*t, distance_context, code, min_symbol, w);
+        }
+        return;
+    }
+
+    const NO_EMIT: u32 = u32::MAX;
+    struct Slot {
+        sym: u8,
+        nbits: u8,
+        hist: u8,
+        bits: u32,
+        emitted: u32,
+    }
+    let mut prepared: Vec<Slot> = Vec::with_capacity(tokens.len());
+    let push = |prepared: &mut Vec<Slot>, hist: u8, sym: u32, nbits: u32, bits: u32| {
+        debug_assert!(sym < ALPHABET_SIZE as u32);
+        debug_assert!(nbits <= u8::MAX as u32);
+        prepared.push(Slot {
+            sym: sym as u8,
+            nbits: nbits as u8,
+            hist,
+            bits,
+            emitted: NO_EMIT,
+        });
+    };
+    for t in tokens {
+        if t.is_lz77() {
+            let (len_tok, len_nbits, len_bits) = lz77_length_encode(t.value);
+            let hist = code.context_map[t.context as usize];
+            push(
+                &mut prepared,
+                hist,
+                min_symbol + len_tok,
+                len_nbits,
+                len_bits,
+            );
+            let dhist = code.context_map[distance_context as usize];
+            let (sym, nbits, bits) = crate::entropy::uint_encode_with_config(
+                t.distance,
+                code.hybrid_uint_configs[dhist as usize],
+            );
+            push(&mut prepared, dhist, sym, nbits, bits);
+        } else {
+            let hist = code.context_map[t.context as usize];
+            let (sym, nbits, bits) = crate::entropy::uint_encode_with_config(
+                t.value,
+                code.hybrid_uint_configs[hist as usize],
+            );
+            push(&mut prepared, hist, sym, nbits, bits);
+        }
+    }
+
+    let mut coder = crate::entropy::AnsCoder::new();
+    for slot in prepared.iter_mut().rev() {
+        let hist = slot.hist as usize;
+        let reverse_start = hist * crate::entropy::ANS_TAB_SIZE as usize;
+        let reverse_map = &code.ans_reverse_maps
+            [reverse_start..reverse_start + crate::entropy::ANS_TAB_SIZE as usize];
+        let info = &code.ans_symbols[hist][slot.sym as usize];
+        if let Some(word) = coder.put_symbol(info, reverse_map) {
+            slot.emitted = word as u32;
+        }
+    }
+    w.write(32, coder.state() as u64);
+    for slot in prepared.iter() {
+        if slot.emitted != NO_EMIT {
+            w.write(16, slot.emitted as u64);
+        }
+        w.write(slot.nbits as usize, slot.bits as u64);
     }
 }
 
@@ -787,7 +886,7 @@ mod tests {
         );
         let contexts = 4 * (steps.len() + 1) + 1;
         assert_eq!(steps.len(), 54);
-        assert_eq!(contexts, LZ77_MAX_CONTEXTS);
+        assert!(contexts <= LZ77_MAX_CONTEXTS);
     }
 
     #[test]

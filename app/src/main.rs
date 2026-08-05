@@ -52,7 +52,7 @@ fn encode_libjxl(rgb: &[u8], width: u32, height: u32, threads: usize) -> Measure
         .lossless(false)
         .jpeg_quality(QUALITY)
         // libjxl effort 3: its fastest generally useful VarDCT preset.
-        .speed(EncoderSpeed::Squirrel)
+        .speed(EncoderSpeed::Falcon)
         .parallel_runner(&runner)
         .build()
         .expect("libjxl failed to create its encoder");

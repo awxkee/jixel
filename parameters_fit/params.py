@@ -33,6 +33,10 @@ DEFAULTS: dict[str, float | int] = {
     "sub8_bias_4x4": 1.0,
     "sub8_bias_4x8": 1.0,
     "sub8_max_distance": 100.0,   # effectively "never gated"
+    "dct64_accept": 0.945,
+    "dct64_rect_accept": 0.642,
+    "dct64_rect_qm_scale": 1.0,
+    "dct64_rect_y_hf": 1.0,
 }
 
 SPACE: dict[str, Any] = {
@@ -40,12 +44,23 @@ SPACE: dict[str, Any] = {
     "sub8_bias_4x8": (0.95, 1.40),
     # Below ~0.5 sub-8 would be off almost everywhere; 100 leaves it always on.
     "sub8_max_distance": (0.5, 100.0),
+    # Higher values admit progressively more 64x64 merges. The old selector
+    # used 0.84; values above ~1.1 are intentionally included to reveal the
+    # point where rate/quality starts to collapse rather than hiding it.
+    "dct64_accept": (0.70, 1.20),
+    "dct64_rect_accept": (0.70, 1.10),
+    "dct64_rect_qm_scale": (0.75, 1.30),
+    "dct64_rect_y_hf": (0.75, 1.60),
 }
 
 _ENV = {
     "sub8_bias_4x4": "JIXEL_SUB8_BIAS4X4",
     "sub8_bias_4x8": "JIXEL_SUB8_BIAS4X8",
     "sub8_max_distance": "JIXEL_SUB8_MAXD",
+    "dct64_accept": "JIXEL_DCT64_ACCEPT",
+    "dct64_rect_accept": "JIXEL_DCT64_RECT_ACCEPT",
+    "dct64_rect_qm_scale": "JIXEL_DCT64_RECT_QM_SCALE",
+    "dct64_rect_y_hf": "JIXEL_DCT64_RECT_Y_HF",
 }
 
 
@@ -81,4 +96,13 @@ def to_env(params: dict[str, float | int] | None) -> dict[str, str]:
     """
     if params is None:
         return {}
-    return {var: repr(float(params[key])) for key, var in _ENV.items() if key in params}
+    out = {}
+    for key, var in _ENV.items():
+        if key not in params:
+            continue
+        # A 1.0 matrix knob is the unsignalled library default. Skipping the
+        # environment variable preserves that state and its zero header cost.
+        if key in {"dct64_rect_qm_scale", "dct64_rect_y_hf"} and float(params[key]) == 1.0:
+            continue
+        out[var] = repr(float(params[key]))
+    return out

@@ -254,7 +254,7 @@ fn gradient_energy(values: &[f32], stride: usize, width: usize, height: usize) -
 fn downsample_8x8(block: &[f32; 64]) -> [f32; 16] {
     let rows = block.as_chunks::<8>().0;
     let mut half = [0.0; 16];
-    for y in 0..4 {
+    for (y, dst) in half.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let top = unsafe { _mm256_loadu_ps(rows[2 * y].as_ptr()) };
         let bottom = unsafe { _mm256_loadu_ps(rows[2 * y + 1].as_ptr()) };
         let pairs = _mm256_hadd_ps(top, bottom);
@@ -262,7 +262,7 @@ fn downsample_8x8(block: &[f32; 64]) -> [f32; 16] {
         let bottom_pairs =
             _mm256_permutevar8x32_ps(pairs, _mm256_setr_epi32(2, 3, 6, 7, 0, 0, 0, 0));
         let value = _mm256_mul_ps(_mm256_add_ps(top_pairs, bottom_pairs), _mm256_set1_ps(0.25));
-        unsafe { _mm_storeu_ps(half[y * 4..].as_mut_ptr(), _mm256_castps256_ps128(value)) };
+        unsafe { _mm_storeu_ps(dst.as_mut_ptr(), _mm256_castps256_ps128(value)) };
     }
     half
 }

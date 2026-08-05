@@ -30,12 +30,12 @@
 #[path = "enc_lossless_lz77.rs"]
 mod lz77;
 
-use crate::coder_scratch::CoderScratch;
+use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS};
 use crate::thread_pool::ThreadPool;
 pub(crate) use lz77::LzToken;
 use lz77::{
     LZ77_MIN_SYMBOL, build_lz_pixel_code, lz77_compress_for_speed, lz77_compress_runs,
-    write_local_tree_lz77, write_lz_token, write_tree_lz77,
+    write_local_tree_lz77, write_lz_section, write_tree_lz77,
 };
 
 const TREE_CTX_SPLIT_VAL: u32 = 0;
@@ -45,11 +45,19 @@ const TREE_CTX_OFFSET: u32 = 3;
 const TREE_CTX_MULTIPLIER_LOG: u32 = 4;
 const TREE_CTX_MULTIPLIER_BITS: u32 = 5;
 const NUM_TREE_CONTEXTS: usize = 6;
+const PREDICTOR_ZERO: u32 = 0;
 const PREDICTOR_LEFT: u32 = 1;
 const PREDICTOR_TOP: u32 = 2;
+const PREDICTOR_AVERAGE0: u32 = 3;
 const PREDICTOR_SELECT: u32 = 4;
 const PREDICTOR_GRADIENT: u32 = 5;
 const PREDICTOR_WEIGHTED: u32 = 6;
+const PREDICTOR_TOP_RIGHT: u32 = 7;
+const PREDICTOR_TOP_LEFT: u32 = 8;
+const PREDICTOR_LEFT_LEFT: u32 = 9;
+const PREDICTOR_AVERAGE1: u32 = 10;
+const PREDICTOR_AVERAGE2: u32 = 11;
+const PREDICTOR_AVERAGE3: u32 = 12;
 const PREDICTOR_AVERAGE4: u32 = 13;
 static SLOW_PREDICTORS: [u32; 6] = [
     PREDICTOR_WEIGHTED,
@@ -114,8 +122,10 @@ fn predictor_neighbors<F: Fn(usize, usize) -> i32 + ?Sized>(
 #[inline]
 fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
     match pred_id {
+        PREDICTOR_ZERO => 0,
         PREDICTOR_LEFT => n.left,
         PREDICTOR_TOP => n.top,
+        PREDICTOR_AVERAGE0 => (n.left + n.top) / 2,
         PREDICTOR_SELECT => {
             let projected = n.left + n.top - n.top_left;
             if (projected - n.left).abs() < (projected - n.top).abs() {
@@ -126,6 +136,12 @@ fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
         }
         PREDICTOR_GRADIENT => clamped_gradient(n.left, n.top, n.top_left),
         PREDICTOR_WEIGHTED => weighted,
+        PREDICTOR_TOP_RIGHT => n.top_right,
+        PREDICTOR_TOP_LEFT => n.top_left,
+        PREDICTOR_LEFT_LEFT => n.left_left,
+        PREDICTOR_AVERAGE1 => (n.left + n.top_left) / 2,
+        PREDICTOR_AVERAGE2 => (n.top_left + n.top) / 2,
+        PREDICTOR_AVERAGE3 => (n.top + n.top_right) / 2,
         PREDICTOR_AVERAGE4 => {
             (6 * n.top - 2 * n.top_top
                 + 7 * n.left
@@ -714,6 +730,22 @@ fn encode_frame_lossless_core(
     // searches the supported Slow predictor set per channel by estimated cost
     // (one global choice, used for the tree and every group).
     let adaptive_search = speed == crate::Speed::Slow;
+
+    // RCT re-selection (Slow, regular RGB frames): estimated over the same
+    // fixed-context gradient cost libjxl uses. When a non-YCoCg transform
+    // wins, the color planes are rebuilt and the frame headers signal it.
+    let mut rct_type = 6u32;
+    let mut rct_planes: Option<Image3Si> = None;
+    if frame_kind.is_regular()
+        && adaptive_search
+        && num_color == 3
+        && let Some((t, planes)) = select_rct(linear, xsize, ysize, pool, scratch)
+    {
+        rct_type = t;
+        rct_planes = Some(planes);
+    }
+    let linear = rct_planes.as_ref().unwrap_or(linear);
+
     let wp_header_count = if single_group {
         1
     } else {
@@ -740,6 +772,35 @@ fn encode_frame_lossless_core(
         v
     };
 
+    // Learned MA context tree (v2): greedy learned tree over the standard
+    // property vector with per-leaf predictors. Falls through to the fixed
+    // v1 tree (then the flat path) when it isn't estimated to help.
+    if frame_kind.is_regular() && adaptive_search && num_color == 3 {
+        if single_group {
+            if try_encode_learned_tree_single_group(
+                linear, alpha, xsize, ysize, min_symbol, rct_type, pool, scratch, wp_params, writer,
+            ) {
+                return;
+            }
+        } else if try_encode_learned_tree_multi_group(
+            linear,
+            alpha,
+            xsize,
+            ysize,
+            xsize_groups,
+            ysize_groups,
+            num_dc_groups,
+            min_symbol,
+            rct_type,
+            pool,
+            scratch,
+            wp_params,
+            writer,
+        ) {
+            return;
+        }
+    }
+
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
@@ -752,6 +813,7 @@ fn encode_frame_lossless_core(
                 ysize,
                 &predictors,
                 min_symbol,
+                rct_type,
                 pool,
                 scratch,
                 wp_params,
@@ -769,6 +831,7 @@ fn encode_frame_lossless_core(
             ysize_groups,
             num_dc_groups,
             min_symbol,
+            rct_type,
             pool,
             scratch,
             wp_params,
@@ -797,7 +860,7 @@ fn encode_frame_lossless_core(
         // GroupHeader: use_global_tree=0, wp_default=1, RCT transform on R/G/B.
         section.write(1, 0);
         write_wp_header(wp_params, &mut section);
-        write_modular_transforms(nb_chans, &mut section);
+        write_modular_transforms(nb_chans, rct_type, &mut section);
 
         // Tokenize all channels (post-YCoCg, per-channel contexts).
         let tokens = tokenize_all_with_wp(
@@ -841,9 +904,7 @@ fn encode_frame_lossless_core(
         );
 
         // Emit the LZ77'd token stream.
-        for t in &lz_tokens {
-            write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
-        }
+        write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
         section.zero_pad_to_byte();
 
         // TOC.
@@ -915,7 +976,7 @@ fn encode_frame_lossless_core(
         // GroupHeader for the global modular image: use_global_tree=1, wp=1, RCT transform.
         sections[0].write(1, 1);
         write_wp_header(wp_params, &mut sections[0]);
-        write_modular_transforms(nb_chans, &mut sections[0]);
+        write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
         sections[0].zero_pad_to_byte();
 
         // ----- DC groups: empty GroupHeader only -----
@@ -944,15 +1005,13 @@ fn encode_frame_lossless_core(
                 write_wp_header(wp_params, &mut sections[section_idx]);
                 sections[section_idx].write(2, 0);
 
-                for t in &group_lz_tokens[group_index] {
-                    write_lz_token(
-                        *t,
-                        distance_ctx,
-                        &code,
-                        min_symbol,
-                        &mut sections[section_idx],
-                    );
-                }
+                write_lz_section(
+                    &group_lz_tokens[group_index],
+                    distance_ctx,
+                    &code,
+                    min_symbol,
+                    &mut sections[section_idx],
+                );
                 sections[section_idx].zero_pad_to_byte();
             }
         }
@@ -1262,9 +1321,7 @@ pub(crate) fn encode_modular_xyb_atlas(
         &mut scratch.huffman_pool,
         &mut section,
     );
-    for t in &lz_tokens {
-        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
-    }
+    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
     section.zero_pad_to_byte();
 
     writer.write(1, 0); // TOC: no permutation
@@ -1354,18 +1411,34 @@ pub(crate) fn write_patch_dictionary(
     }
 }
 
-fn write_modular_transforms(nb_chans: usize, w: &mut BitWriter) {
+/// rct_type: U32(Val(6), Bits(2), BitsOffset(4,2), BitsOffset(6,10)), 0..41.
+fn write_rct_type(rct_type: u32, w: &mut BitWriter) {
+    debug_assert!(rct_type < 42);
+    if rct_type == 6 {
+        w.write(2, 0b00);
+    } else if rct_type < 4 {
+        w.write(2, 0b01);
+        w.write(2, rct_type as u64);
+    } else if rct_type < 18 {
+        w.write(2, 0b10);
+        w.write(4, (rct_type - 2) as u64);
+    } else {
+        w.write(2, 0b11);
+        w.write(6, (rct_type - 10) as u64);
+    }
+}
+
+fn write_modular_transforms(nb_chans: usize, rct_type: u32, w: &mut BitWriter) {
     if nb_chans >= 3 {
         // transforms count u2S(0, 1, Bits(4)+2, Bits(8)+18): selector 1 = Val(1) → 1 transform.
         w.write(2, 0b01);
         // Transform[0]:
         //   id Bits(2)            = 0 (RCT)
         //   begin_channel u2S(Bits(3), ...): selector 0 = Bits(3) → value 0 = 5 bits "00000"
-        //   rct_type u2S(6, ...):  selector 0 = Val(6) → 2 bits "00"
         w.write(2, 0b00); // id = RCT (Bits(2))
         w.write(2, 0b00); // begin_channel selector 0
         w.write(3, 0); // begin_channel value (Bits(3)) = 0
-        w.write(2, 0b00); // rct_type selector 0 = Val(6) = YCoCg
+        write_rct_type(rct_type, w);
     } else {
         w.write(2, 0b00); // 0 transforms
     }
@@ -1548,9 +1621,7 @@ fn encode_squeeze_single_group(
         &mut scratch.huffman_pool,
         &mut section,
     );
-    for t in &lz_tokens {
-        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
-    }
+    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
     section.zero_pad_to_byte();
 
     writer.write(1, 0); // no permutation
@@ -1859,9 +1930,13 @@ fn encode_squeeze_multigroup(
     sections[0].write(1, 1); // use_global_tree = 1
     sections[0].write(1, 1); // wp_default = 1
     write_modular_transforms_rct_squeeze(&steps, &mut sections[0]);
-    for t in &global_lz {
-        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut sections[0]);
-    }
+    write_lz_section(
+        &global_lz,
+        distance_ctx,
+        &code,
+        min_symbol,
+        &mut sections[0],
+    );
     sections[0].zero_pad_to_byte();
 
     // ----- DC groups: GroupHeader + any min-shift>=3 large-channel crops -----
@@ -1870,9 +1945,7 @@ fn encode_squeeze_multigroup(
         section.write(1, 1); // use_global_tree
         section.write(1, 1); // wp_default
         section.write(2, 0); // 0 transforms (declared globally)
-        for t in &dc_group_lz[i] {
-            write_lz_token(*t, distance_ctx, &code, min_symbol, section);
-        }
+        write_lz_section(&dc_group_lz[i], distance_ctx, &code, min_symbol, section);
         section.zero_pad_to_byte();
     }
 
@@ -1888,9 +1961,13 @@ fn encode_squeeze_multigroup(
         sections[idx].write(1, 1); // use_global_tree
         sections[idx].write(1, 1); // wp_default
         sections[idx].write(2, 0); // 0 transforms (declared globally)
-        for t in &ac_group_lz[g] {
-            write_lz_token(*t, distance_ctx, &code, min_symbol, &mut sections[idx]);
-        }
+        write_lz_section(
+            &ac_group_lz[g],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut sections[idx],
+        );
         sections[idx].zero_pad_to_byte();
     }
 
@@ -2066,9 +2143,7 @@ fn try_encode_palette_single_group(
         &mut scratch.huffman_pool,
         &mut section,
     );
-    for t in &lz_tokens {
-        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
-    }
+    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
     section.zero_pad_to_byte();
 
     writer.write(1, 0); // no permutation
@@ -2113,9 +2188,7 @@ fn estimated_local_stream_bits(
         &mut scratch.huffman_pool,
         &mut writer,
     );
-    for token in &lz {
-        write_lz_token(*token, num_contexts as u32, &code, min_symbol, &mut writer);
-    }
+    write_lz_section(&lz, num_contexts as u32, &code, min_symbol, &mut writer);
     writer.bits_written()
 }
 
@@ -2479,7 +2552,7 @@ fn try_encode_local_palette_multi_group(
     );
     sections[0].write(1, 1); // use_global_tree
     sections[0].write(1, 1); // wp_default
-    write_modular_transforms(nb_chans, &mut sections[0]);
+    write_modular_transforms(nb_chans, 6, &mut sections[0]);
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {
@@ -2507,15 +2580,13 @@ fn try_encode_local_palette_multi_group(
         } else {
             sections[section_idx].write(2, 0); // no local transforms
         }
-        for token in &group_lz_tokens[group_index] {
-            write_lz_token(
-                *token,
-                distance_ctx,
-                &code,
-                min_symbol,
-                &mut sections[section_idx],
-            );
-        }
+        write_lz_section(
+            &group_lz_tokens[group_index],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut sections[section_idx],
+        );
         sections[section_idx].zero_pad_to_byte();
     }
 
@@ -3180,6 +3251,633 @@ fn pick_threshold(res: &[u32], prp: &[i64], scratch: &mut CoderScratch) -> (i32,
     (best_t, best_bits, flat)
 }
 
+// ---------------------------------------------------------------------------
+// Learned MA context tree (v2): greedy learned tree over the standard modular
+// property vector (libjxl ids 0..=15) with per-leaf predictors. The learner
+// lives in ma_tree.rs; this section computes the property vectors (bit-exact
+// with libjxl's PredictImpl, which the decoder re-runs), samples the image,
+// and routes every pixel through the learned tree.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// RCT selection: YCoCg (type 6) is a strong default, but content with weak or
+// atypical channel correlation prefers one of the other reversible transforms
+// (subtract-green and half-average families). Candidates and cost model follow
+// libjxl: fixed 18-context gradient-residual token entropy per channel.
+// ---------------------------------------------------------------------------
+
+/// Candidate rct_types in libjxl's try order (first 7 = cjxl -e7's set):
+/// none, YCoCg, G-half-avg, subtract-green, and half-average variants.
+const RCT_CANDIDATES: [u32; 7] = [0, 6, 5, 10, 26, 40, 12];
+
+/// Channel order fed to the elementary transform for permutation `perm`
+/// (0=RGB, 1=GBR, 2=BRG, 3=RBG, 4=GRB, 5=BGR).
+#[inline]
+fn rct_perm(perm: usize) -> [usize; 3] {
+    [
+        perm % 3,
+        (perm + 1 + perm / 3) % 3,
+        (perm + 2 - perm / 3) % 3,
+    ]
+}
+
+/// Forward elementary RCT `t` (rct_type % 7) on already-permuted values.
+#[inline]
+fn rct_forward_pixel(t: u32, first: i32, second: i32, third: i32) -> (i32, i32, i32) {
+    if t == 6 {
+        let o1 = first - third;
+        let tmp = third + (o1 >> 1);
+        let o2 = second - tmp;
+        (tmp + (o2 >> 1), o1, o2)
+    } else {
+        let s = match t >> 1 {
+            1 => second - first,
+            2 => second - ((first + third) >> 1),
+            _ => second,
+        };
+        let th = if t & 1 == 1 { third - first } else { third };
+        (first, s, th)
+    }
+}
+
+/// Port of libjxl's EstimateCost: gradient-predictor residual token entropy
+/// over 18 local-activity contexts per channel, plus raw bits.
+fn estimate_rct_cost(rgb: &Image3Si, xsize: usize, ysize: usize, rct: u32) -> f32 {
+    const CUTOFFS: [u32; 17] = [
+        0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500,
+    ];
+    const NCTX: usize = 18;
+    const ALPHA: usize = 64;
+    let perm = rct_perm((rct / 7) as usize);
+    let t = rct % 7;
+    let p0 = rgb.plane_data(perm[0]);
+    let p1 = rgb.plane_data(perm[1]);
+    let p2 = rgb.plane_data(perm[2]);
+    let mut hist = vec![0u64; 3 * NCTX * ALPHA];
+    let mut extra_bits: u64 = 0;
+    let mut prev = vec![0i32; 3 * xsize];
+    let mut cur = vec![0i32; 3 * xsize];
+    for y in 0..ysize {
+        let r0 = &p0[y * xsize..][..xsize];
+        let r1 = &p1[y * xsize..][..xsize];
+        let r2 = &p2[y * xsize..][..xsize];
+        for x in 0..xsize {
+            let (a, b, c) = rct_forward_pixel(t, r0[x], r1[x], r2[x]);
+            cur[x] = a;
+            cur[xsize + x] = b;
+            cur[2 * xsize + x] = c;
+        }
+        for ch in 0..3usize {
+            let crow = &cur[ch * xsize..][..xsize];
+            let prow = &prev[ch * xsize..][..xsize];
+            let chist = &mut hist[ch * NCTX * ALPHA..][..NCTX * ALPHA];
+            for x in 0..xsize {
+                let left = if x > 0 {
+                    crow[x - 1]
+                } else if y > 0 {
+                    prow[x]
+                } else {
+                    0
+                };
+                let top = if y > 0 { prow[x] } else { left };
+                let topleft = if x > 0 && y > 0 { prow[x - 1] } else { left };
+                let mx = left.max(top).max(topleft);
+                let mn = left.min(top).min(topleft);
+                let max_diff = (mx - mn) as u32;
+                let mut ctx = 0usize;
+                for c in CUTOFFS {
+                    if max_diff < c {
+                        ctx += 1;
+                    }
+                }
+                let res =
+                    crow[x] as i64 - clamped_gradient(left as i64, top as i64, topleft as i64);
+                let (tok, nb, _) = uint_encode(pack_signed(res as i32));
+                chist[ctx * ALPHA + (tok as usize).min(ALPHA - 1)] += 1;
+                extra_bits += nb as u64;
+            }
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let mut cost = extra_bits as f32;
+    for h in hist.as_chunks::<ALPHA>().0 {
+        let total: u64 = h.iter().sum();
+        cost += entropy_of_hist(h, total);
+    }
+    cost
+}
+
+/// Reconstruct RGB planes from the YCoCg input planes.
+fn reconstruct_rgb_from_ycocg(linear: &Image3Si, xsize: usize, ysize: usize) -> Image3Si {
+    let mut rgb = Image3Si::new(xsize, ysize);
+    for y in 0..ysize {
+        let [r_row, g_row, b_row] = rgb.all_plane_rows_mut(y);
+        let yy = &linear.plane_data(0)[y * xsize..][..xsize];
+        let co = &linear.plane_data(1)[y * xsize..][..xsize];
+        let cg = &linear.plane_data(2)[y * xsize..][..xsize];
+        for x in 0..xsize {
+            let (r, g, b) = inverse_ycocg(yy[x], co[x], cg[x]);
+            r_row[x] = r;
+            g_row[x] = g;
+            b_row[x] = b;
+        }
+    }
+    rgb
+}
+
+/// Estimate every candidate RCT and return the winner's planes when it is not
+/// YCoCg (in which case the caller keeps the input planes unchanged).
+fn select_rct(
+    linear: &Image3Si,
+    xsize: usize,
+    ysize: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<(u32, Image3Si)> {
+    let rgb = reconstruct_rgb_from_ycocg(linear, xsize, ysize);
+    let costs = pool.steal_map(scratch, RCT_CANDIDATES.len(), |i, _scratch| {
+        estimate_rct_cost(&rgb, xsize, ysize, RCT_CANDIDATES[i])
+    });
+    let mut best = 0usize;
+    for (i, &c) in costs.iter().enumerate() {
+        if c < costs[best] {
+            best = i;
+        }
+    }
+    let rct = RCT_CANDIDATES[best];
+    if rct == 6 {
+        return None;
+    }
+    let perm = rct_perm((rct / 7) as usize);
+    let t = rct % 7;
+    let mut out = Image3Si::new(xsize, ysize);
+    for y in 0..ysize {
+        let [o0, o1, o2] = out.all_plane_rows_mut(y);
+        let r0 = &rgb.plane_data(perm[0])[y * xsize..][..xsize];
+        let r1 = &rgb.plane_data(perm[1])[y * xsize..][..xsize];
+        let r2 = &rgb.plane_data(perm[2])[y * xsize..][..xsize];
+        for x in 0..xsize {
+            let (a, b, c) = rct_forward_pixel(t, r0[x], r1[x], r2[x]);
+            o0[x] = a;
+            o1[x] = b;
+            o2[x] = c;
+        }
+    }
+    Some((rct, out))
+}
+
+/// Target sample count for tree learning (across all channels/groups).
+const MA_TARGET_SAMPLES: usize = 1 << 19;
+/// Bits a split must save (image domain) before it's kept. Growth is
+/// best-first, so this mostly prunes the tail once the leaf budget is spent.
+const MA_SPLIT_COST_BITS: f32 = 100.0;
+/// Leaf cap: pixel contexts + the LZ77 distance context must fit the
+/// LZ77_MAX_CONTEXTS scratch; clustering reduces them to <= 64 histograms.
+/// Best-first growth adds exactly one leaf per split, so the cap is hard.
+const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
+/// Minimum samples in a node before it must become a leaf.
+const MA_MIN_NODE_SAMPLES: usize = 128;
+
+/// Walk one channel rectangle in scan order, feeding the visitor the property
+/// vector (libjxl ids 0..=15), the neighborhood, and the WP prediction of
+/// every pixel.
+fn walk_channel_ma<F: Fn(usize, usize) -> i32>(
+    get: &F,
+    gw: usize,
+    gh: usize,
+    chan: u32,
+    wp_params: WpParams,
+    mut visit: impl FnMut(usize, usize, &[i32; NUM_MA_PROPS], PredictorNeighbors, i64),
+) {
+    let mut wp = WpState::with_params(gw, wp_params);
+    let mut p = [0i32; NUM_MA_PROPS];
+    p[0] = chan as i32;
+    for y in 0..gh {
+        p[2] = y as i32;
+        p[9] = 0; // "local gradient" carry, reset per row (InitPropsRow)
+        for x in 0..gw {
+            let n = predictor_neighbors(get, x, y, gw);
+            p[3] = x as i32;
+            p[4] = n.top.abs() as i32;
+            p[5] = n.left.abs() as i32;
+            p[6] = n.top as i32;
+            p[7] = n.left as i32;
+            // p[8] reads the previous pixel's p[9] (0 at row start).
+            p[8] = (n.left - p[9] as i64) as i32;
+            p[9] = (n.left + n.top - n.top_left) as i32;
+            p[10] = (n.left - n.top_left) as i32;
+            p[11] = (n.top_left - n.top) as i32;
+            p[12] = (n.top - n.top_right) as i32;
+            p[13] = (n.top - n.top_top) as i32;
+            p[14] = (n.left - n.left_left) as i32;
+            let wp_pred = wp.predict(x, y, n.top, n.left, n.top_right, n.top_left, n.top_top);
+            p[15] = wp.wp_prop as i32;
+            visit(x, y, &p, n, wp_pred);
+            wp.update(get(x, y) as i64, x, y);
+        }
+    }
+}
+
+/// Append every `stride`-th pixel of the channel rectangle to `samples`,
+/// with the residual token under every decoder predictor.
+fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
+    get: &F,
+    gw: usize,
+    gh: usize,
+    chan: u32,
+    wp_params: WpParams,
+    stride: usize,
+    samples: &mut MaSamples,
+) {
+    let mut counter = 0usize;
+    walk_channel_ma(get, gw, gh, chan, wp_params, |x, y, p, n, wp_pred| {
+        counter += 1;
+        if !counter.is_multiple_of(stride) {
+            return;
+        }
+        let v = get(x, y) as i64;
+        let mut tok = [0u8; NUM_MA_PREDS];
+        let mut nbits = [0u8; NUM_MA_PREDS];
+        for pred in 0..NUM_MA_PREDS as u32 {
+            let pv = predictor_value(pred, n, wp_pred);
+            let (t, nb, _) = uint_encode(pack_signed((v - pv) as i32));
+            tok[pred as usize] = t.min(u8::MAX as u32) as u8;
+            nbits[pred as usize] = nb.min(u8::MAX as u32) as u8;
+        }
+        samples.push(*p, tok, nbits);
+    });
+}
+
+/// Tokenize the channel rectangle through the learned tree: every pixel is
+/// routed to its leaf's context and coded with its leaf's predictor.
+fn tokenize_channel_ma<F: Fn(usize, usize) -> i32>(
+    get: &F,
+    gw: usize,
+    gh: usize,
+    chan: u32,
+    wp_params: WpParams,
+    tree: &LearnedTree,
+    leaf_ctx: &[u32],
+    out: &mut Vec<Token>,
+) {
+    walk_channel_ma(get, gw, gh, chan, wp_params, |x, y, p, n, wp_pred| {
+        let (node, pred) = tree.lookup(p);
+        let v = get(x, y) as i64;
+        let pv = predictor_value(pred, n, wp_pred);
+        out.push(Token::new(
+            leaf_ctx[node as usize],
+            pack_signed((v - pv) as i32),
+        ));
+    });
+}
+
+/// BFS-emit a learned tree (matches libjxl's FIFO tree decode). Returns
+/// (tree tokens, context id per node index — leaves only, context count).
+fn emit_learned_tree(tree: &LearnedTree) -> (Vec<Token>, Vec<u32>, u32) {
+    use std::collections::VecDeque;
+    let mut tokens = Vec::new();
+    let mut leaf_ctx = vec![u32::MAX; tree.nodes.len()];
+    let mut q: VecDeque<u32> = VecDeque::new();
+    q.push_back(0);
+    let mut ctx = 0u32;
+    while let Some(i) = q.pop_front() {
+        match tree.nodes[i as usize] {
+            MaNode::Split { prop, val, gt, le } => {
+                push_split(&mut tokens, prop as u32, val);
+                q.push_back(gt);
+                q.push_back(le);
+            }
+            MaNode::Leaf { pred } => {
+                push_leaf(&mut tokens, pred);
+                leaf_ctx[i as usize] = ctx;
+                ctx += 1;
+            }
+        }
+    }
+    (tokens, leaf_ctx, ctx)
+}
+
+/// Sampling stride for tree learning; odd to avoid column aliasing.
+fn ma_sample_stride(total_px: usize) -> usize {
+    let mut stride = total_px.div_ceil(MA_TARGET_SAMPLES).max(1);
+    if stride > 1 && stride.is_multiple_of(2) {
+        stride += 1;
+    }
+    stride
+}
+
+/// Learn the tree from merged samples and decide whether it beats the flat
+/// path estimate. Returns the tree with its BFS emission on success.
+#[allow(clippy::type_complexity)]
+fn learn_and_gate_ma_tree(
+    samples: &MaSamples,
+    stride: usize,
+    min_symbol: u32,
+) -> Option<(LearnedTree, Vec<Token>, Vec<u32>, u32)> {
+    if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
+        return None;
+    }
+    let tree = learn_ma_tree(
+        samples,
+        MaLearnParams {
+            alphabet: min_symbol as usize,
+            max_leaves: MA_MAX_LEAVES,
+            split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
+            min_node: MA_MIN_NODE_SAMPLES,
+        },
+    );
+    let (tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
+    // Header overhead: tree tokens plus the extra per-context histogram /
+    // context-map cost (conservative estimate; clustering merges most of it).
+    let overhead_bits = tree_tokens.len() as f64 * 10.0 + num_ctx as f64 * 200.0;
+    let est_real = tree.est_bits * stride as f64 + overhead_bits;
+    let flat_real = tree.flat_bits * stride as f64;
+    if est_real >= flat_real {
+        return None;
+    }
+    Some((tree, tree_tokens, leaf_ctx, num_ctx))
+}
+
+/// Learned-tree lossless path, single group. Returns true (frame fully
+/// written) when the learned tree is estimated to beat the flat path.
+#[allow(clippy::too_many_arguments)]
+fn try_encode_learned_tree_single_group(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    min_symbol: u32,
+    rct_type: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    wp_params: WpParams,
+    writer: &mut BitWriter,
+) -> bool {
+    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let stride = ma_sample_stride(xsize * ysize * nb_chans);
+
+    let mut per_chan = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
+        let mut samples = MaSamples::new();
+        if chan < 3 {
+            let pd = linear.plane_data(chan);
+            sample_channel_ma(
+                &|x, y| pd[y * xsize + x],
+                xsize,
+                ysize,
+                chan as u32,
+                wp_params,
+                stride,
+                &mut samples,
+            );
+        } else {
+            let a = alpha.expect("alpha channel must exist");
+            sample_channel_ma(
+                &|x, y| a.get_i32(y * xsize + x),
+                xsize,
+                ysize,
+                chan as u32,
+                wp_params,
+                stride,
+                &mut samples,
+            );
+        }
+        samples
+    });
+    let mut samples = MaSamples::new();
+    for s in per_chan.iter_mut() {
+        samples.append(s);
+    }
+
+    let Some((tree, tree_tokens, leaf_ctx, num_ctx)) =
+        learn_and_gate_ma_tree(&samples, stride, min_symbol)
+    else {
+        return false;
+    };
+    drop(samples);
+
+    let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
+        let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize);
+        if chan < 3 {
+            let pd = linear.plane_data(chan);
+            tokenize_channel_ma(
+                &|x, y| pd[y * xsize + x],
+                xsize,
+                ysize,
+                chan as u32,
+                wp_params,
+                &tree,
+                &leaf_ctx,
+                &mut tokens,
+            );
+        } else {
+            let a = alpha.expect("alpha channel must exist");
+            tokenize_channel_ma(
+                &|x, y| a.get_i32(y * xsize + x),
+                xsize,
+                ysize,
+                chan as u32,
+                wp_params,
+                &tree,
+                &leaf_ctx,
+                &mut tokens,
+            );
+        }
+        tokens
+    });
+    let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize * nb_chans);
+    for channel in channel_tokens {
+        tokens.extend(channel);
+    }
+
+    write_frame_header_modular(alpha.is_some(), writer);
+    let mut section = BitWriter::new();
+    section.write(1, 1); // dc_quant all_default = 1
+    section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
+    section.write(1, 0); // use_global_tree = 0
+    write_wp_header(wp_params, &mut section);
+    write_modular_transforms(nb_chans, rct_type, &mut section);
+
+    let distance_ctx = num_ctx;
+    let lz_tokens = lz77_compress_runs(&tokens);
+    let code = build_lz_pixel_code(
+        std::iter::once(lz_tokens.as_slice()),
+        num_ctx as usize,
+        min_symbol,
+        true,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    write_tree_lz77(
+        &tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
+    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
+    section.zero_pad_to_byte();
+
+    writer.write(1, 0);
+    writer.zero_pad_to_byte();
+    write_toc_entry(section.bits_written() / 8, writer);
+    writer.zero_pad_to_byte();
+    writer.append(&section);
+    writer.zero_pad_to_byte();
+    true
+}
+
+/// Learned-tree lossless path, multi-group: one global tree learned from
+/// group-local samples; every AC group routes its pixels through it (fresh
+/// WP and group-local coordinates per group, matching the decoder).
+#[allow(clippy::too_many_arguments)]
+fn try_encode_learned_tree_multi_group(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    xsize_groups: usize,
+    ysize_groups: usize,
+    num_dc_groups: usize,
+    min_symbol: u32,
+    rct_type: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    wp_params: WpParams,
+    writer: &mut BitWriter,
+) -> bool {
+    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let num_ac_groups = xsize_groups * ysize_groups;
+    let stride = ma_sample_stride(xsize * ysize * nb_chans);
+
+    let mut group_samples = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
+        let gx = group_index % xsize_groups;
+        let gy = group_index / xsize_groups;
+        let x0 = gx * GROUP_DIM;
+        let y0 = gy * GROUP_DIM;
+        let gw = GROUP_DIM.min(xsize - x0);
+        let gh = GROUP_DIM.min(ysize - y0);
+        let mut samples = MaSamples::new();
+        for chan in 0..3usize {
+            let pd = linear.plane_data(chan);
+            let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
+            sample_channel_ma(&get, gw, gh, chan as u32, wp_params, stride, &mut samples);
+        }
+        if let Some(a) = alpha {
+            let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
+            sample_channel_ma(&get, gw, gh, 3, wp_params, stride, &mut samples);
+        }
+        samples
+    });
+    let mut samples = MaSamples::new();
+    for s in group_samples.iter_mut() {
+        samples.append(s);
+    }
+    drop(group_samples);
+
+    let Some((tree, tree_tokens, leaf_ctx, num_ctx)) =
+        learn_and_gate_ma_tree(&samples, stride, min_symbol)
+    else {
+        return false;
+    };
+    drop(samples);
+
+    let distance_ctx = num_ctx;
+    let group_lz_tokens: Vec<Vec<LzToken>> =
+        pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
+            let gx = group_index % xsize_groups;
+            let gy = group_index / xsize_groups;
+            let x0 = gx * GROUP_DIM;
+            let y0 = gy * GROUP_DIM;
+            let gw = GROUP_DIM.min(xsize - x0);
+            let gh = GROUP_DIM.min(ysize - y0);
+            let mut toks: Vec<Token> = Vec::with_capacity(gw * gh * nb_chans);
+            for chan in 0..3usize {
+                let pd = linear.plane_data(chan);
+                let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
+                tokenize_channel_ma(
+                    &get,
+                    gw,
+                    gh,
+                    chan as u32,
+                    wp_params,
+                    &tree,
+                    &leaf_ctx,
+                    &mut toks,
+                );
+            }
+            if let Some(a) = alpha {
+                let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
+                tokenize_channel_ma(&get, gw, gh, 3, wp_params, &tree, &leaf_ctx, &mut toks);
+            }
+            lz77_compress_runs(&toks)
+        });
+    let code = build_lz_pixel_code(
+        group_lz_tokens.iter().map(Vec::as_slice),
+        num_ctx as usize,
+        min_symbol,
+        true,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+
+    write_frame_header_modular(alpha.is_some(), writer);
+    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
+    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
+
+    sections[0].write(1, 1); // dc_quant all_default = 1
+    sections[0].write(1, 1); // has_tree = 1
+    write_tree_lz77(
+        &tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut sections[0],
+    );
+    sections[0].write(1, 1); // use_global_tree
+    write_wp_header(wp_params, &mut sections[0]);
+    write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
+    sections[0].zero_pad_to_byte();
+
+    for section in sections[1..num_dc_groups + 1].iter_mut() {
+        section.write(1, 1);
+        write_wp_header(wp_params, section);
+        section.write(2, 0);
+        section.zero_pad_to_byte();
+    }
+
+    let ac_global_idx = 1 + num_dc_groups;
+    sections[ac_global_idx].write(1, 1);
+    write_wp_header(wp_params, &mut sections[ac_global_idx]);
+    sections[ac_global_idx].zero_pad_to_byte();
+
+    for group_index in 0..num_ac_groups {
+        let section_idx = 2 + num_dc_groups + group_index;
+        sections[section_idx].write(1, 1);
+        write_wp_header(wp_params, &mut sections[section_idx]);
+        sections[section_idx].write(2, 0);
+        write_lz_section(
+            &group_lz_tokens[group_index],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut sections[section_idx],
+        );
+        sections[section_idx].zero_pad_to_byte();
+    }
+
+    writer.write(1, 0);
+    writer.zero_pad_to_byte();
+    for s in &sections {
+        write_toc_entry(s.bits_written() / 8, writer);
+    }
+    writer.zero_pad_to_byte();
+    for s in &sections {
+        writer.append(s);
+        writer.zero_pad_to_byte();
+    }
+    true
+}
+
 /// v1 context tree: single-group only. Returns true (and writes the full frame)
 /// if the context tree is estimated to help; false otherwise (caller falls
 /// through to the flat path, having written nothing).
@@ -3190,6 +3888,7 @@ fn try_encode_context_tree_single_group(
     ysize: usize,
     predictors: &[u32],
     min_symbol: u32,
+    rct_type: u32,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
@@ -3274,7 +3973,7 @@ fn try_encode_context_tree_single_group(
     section.write(1, 0); // has_tree = 0
     section.write(1, 0); // use_global_tree = 0
     write_wp_header(wp_params, &mut section);
-    write_modular_transforms(nb_chans, &mut section);
+    write_modular_transforms(nb_chans, rct_type, &mut section);
 
     let distance_ctx = num_pixel_ctx as u32;
     let lz_tokens = lz77_compress_runs(&tokens);
@@ -3293,9 +3992,7 @@ fn try_encode_context_tree_single_group(
         &mut scratch.huffman_pool,
         &mut section,
     );
-    for t in &lz_tokens {
-        write_lz_token(*t, distance_ctx, &code, min_symbol, &mut section);
-    }
+    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
     section.zero_pad_to_byte();
 
     writer.write(1, 0);
@@ -3320,6 +4017,7 @@ fn try_encode_context_tree_multi_group(
     ysize_groups: usize,
     num_dc_groups: usize,
     min_symbol: u32,
+    rct_type: u32,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
@@ -3424,7 +4122,7 @@ fn try_encode_context_tree_multi_group(
     );
     sections[0].write(1, 1); // use_global_tree
     write_wp_header(wp_params, &mut sections[0]);
-    write_modular_transforms(nb_chans, &mut sections[0]);
+    write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {
@@ -3444,15 +4142,13 @@ fn try_encode_context_tree_multi_group(
         sections[section_idx].write(1, 1);
         write_wp_header(wp_params, &mut sections[section_idx]);
         sections[section_idx].write(2, 0);
-        for t in &group_lz_tokens[group_index] {
-            write_lz_token(
-                *t,
-                distance_ctx,
-                &code,
-                min_symbol,
-                &mut sections[section_idx],
-            );
-        }
+        write_lz_section(
+            &group_lz_tokens[group_index],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut sections[section_idx],
+        );
         sections[section_idx].zero_pad_to_byte();
     }
 
@@ -3473,9 +4169,13 @@ use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{
-    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
+    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, uint_encode, write_entropy_code,
+    write_token,
 };
 use crate::image::Image3Si;
+use crate::ma_tree::{
+    LearnedTree, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, learn_ma_tree,
+};
 use crate::patches::{
     ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
     find_lossless_patches,

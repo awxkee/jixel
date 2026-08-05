@@ -40,11 +40,6 @@ pub(crate) const M10: f32 = 0.23;
 pub(crate) const M12: f32 = 0.078;
 pub(crate) const M11: f32 = 1.0 - M12 - M10;
 
-// Share of the B row on pure blue. 0.551_809_86 reproduces the spec opsin
-// matrix exactly (the 2026-08-01 breadth study: the spec row beats the
-// blue-biased 0.85 on both metrics everywhere except saturated-red content;
-// see the opsin-b-bias notes). Any other value flips `is_decoder_default()`
-// and the header then signals the matching custom inverse automatically.
 pub(crate) const B_BIAS: f32 = 0.551_809_86;
 const B_R_RATIO: f32 = 0.243_422_69 / (0.243_422_69 + 0.204_767_45);
 pub(crate) const M20: f32 = B_R_RATIO * (1.0 - B_BIAS);

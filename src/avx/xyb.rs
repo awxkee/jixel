@@ -127,6 +127,16 @@ fn rgb_to_xyb_f32x8_avx2(
     (x, y, tm2)
 }
 
+#[inline]
+#[target_feature(enable = "avx2")]
+fn tail_mask_avx2(len: usize) -> __m256i {
+    debug_assert!(len < 8);
+    _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(len as i32),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+    )
+}
+
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn to_xyb_avx2_band(
@@ -174,27 +184,68 @@ pub(crate) fn to_xyb_avx2_band(
         }
 
         if !r_tail.is_empty() {
-            let mut r8: [f32; 8] = [0.; 8];
-            let mut g8: [f32; 8] = [0.; 8];
-            let mut b8: [f32; 8] = [0.; 8];
-            r8[..r_tail.len()].copy_from_slice(r_tail);
-            g8[..g_tail.len()].copy_from_slice(g_tail);
-            b8[..b_tail.len()].copy_from_slice(b_tail);
-            let r = unsafe { _mm256_loadu_ps(r8.as_ptr()) };
-            let g = unsafe { _mm256_loadu_ps(g8.as_ptr()) };
-            let b = unsafe { _mm256_loadu_ps(b8.as_ptr()) };
+            let mask = tail_mask_avx2(r_tail.len());
+            let r = unsafe { _mm256_maskload_ps(r_tail.as_ptr(), mask) };
+            let g = unsafe { _mm256_maskload_ps(g_tail.as_ptr(), mask) };
+            let b = unsafe { _mm256_maskload_ps(b_tail.as_ptr(), mask) };
 
             let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(m, r, g, b);
 
             unsafe {
-                _mm256_storeu_ps(r8.as_mut_ptr(), xv);
-                _mm256_storeu_ps(g8.as_mut_ptr(), yv);
-                _mm256_storeu_ps(b8.as_mut_ptr(), bv);
+                _mm256_maskstore_ps(x_tail.as_mut_ptr(), mask, xv);
+                _mm256_maskstore_ps(y_tail.as_mut_ptr(), mask, yv);
+                _mm256_maskstore_ps(out_b_tail.as_mut_ptr(), mask, bv);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_xyb_avx2_band;
+    use crate::xyb::{XybMatrix, rgb_to_xyb_pixel_f32};
+
+    #[test]
+    fn masked_tail_matches_scalar_and_preserves_canaries() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        const CANARY: f32 = -12_345.0;
+        let m = &XybMatrix::SPEC;
+        for w in 1..16 {
+            let r: Vec<_> = (0..w).map(|i| (i as f32 + 1.0) / 17.0).collect();
+            let g: Vec<_> = (0..w).map(|i| (2 * i + 3) as f32 / 37.0).collect();
+            let b: Vec<_> = (0..w).map(|i| (3 * i + 2) as f32 / 53.0).collect();
+            let mut x = vec![CANARY; w + 8];
+            let mut y = vec![CANARY; w + 8];
+            let mut out_b = vec![CANARY; w + 8];
+
+            unsafe {
+                to_xyb_avx2_band(
+                    m,
+                    [&r, &g, &b],
+                    [&mut x[..w], &mut y[..w], &mut out_b[..w]],
+                    w,
+                );
             }
 
-            x_tail.copy_from_slice(&r8[..r_tail.len()]);
-            y_tail.copy_from_slice(&g8[..g_tail.len()]);
-            out_b_tail.copy_from_slice(&b8[..b_tail.len()]);
+            for i in 0..w {
+                let want = rgb_to_xyb_pixel_f32(m, r[i], g[i], b[i]);
+                for (got, want, channel) in [
+                    (x[i], want.0, "X"),
+                    (y[i], want.1, "Y"),
+                    (out_b[i], want.2, "B"),
+                ] {
+                    assert!(
+                        (got - want).abs() <= 2e-6,
+                        "{channel} mismatch at width {w}, lane {i}: AVX {got}, scalar {want}"
+                    );
+                }
+            }
+            assert!(x[w..].iter().all(|&v| v == CANARY));
+            assert!(y[w..].iter().all(|&v| v == CANARY));
+            assert!(out_b[w..].iter().all(|&v| v == CANARY));
         }
     }
 }

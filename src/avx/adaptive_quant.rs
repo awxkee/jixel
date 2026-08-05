@@ -77,7 +77,7 @@ fn mlaf(a: __m256, b: __m256, c: __m256) -> __m256 {
 /// Vectorised `ratio_cubic_to_simple_gamma`.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn ratio_cubic_x8(v: __m256, invert: bool) -> __m256 {
+fn ratio_cubic_x8<const INVERT: bool>(v: __m256) -> __m256 {
     const K_SG_MUL: f32 = 226.77216153508914;
     const K_SG_MUL2: f32 = 1.0 / 73.377132366608819;
     const K_LOG2: f32 = 0.693147181;
@@ -96,7 +96,7 @@ fn ratio_cubic_x8(v: __m256, invert: bool) -> __m256 {
         v2,
         _mm256_set1_ps(k_v_offset),
     );
-    if invert {
+    if INVERT {
         _mm256_div_ps(num, den)
     } else {
         _mm256_div_ps(den, num)
@@ -183,7 +183,7 @@ fn gamma_row_sum_x8(row_x: &[f32], row_y: &[f32], base: usize) -> __m256 {
     let g = _mm256_add_ps(y, x);
     _mm256_mul_ps(
         half,
-        _mm256_add_ps(ratio_cubic_x8(r, true), ratio_cubic_x8(g, true)),
+        _mm256_add_ps(ratio_cubic_x8::<true>(r), ratio_cubic_x8::<true>(g)),
     )
 }
 
@@ -600,7 +600,7 @@ fn stage1_diff_x8(
         quarter,
         _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(dy, uy), ly), ry),
     );
-    let gammac = ratio_cubic_x8(_mm256_add_ps(cy, offset), false);
+    let gammac = ratio_cubic_x8::<false>(_mm256_add_ps(cy, offset));
     let dyv = _mm256_mul_ps(gammac, _mm256_sub_ps(cy, base_y));
     let diff = _mm256_min_ps(_mm256_mul_ps(dyv, dyv), limit);
     masking_sqrt_x8(diff)
@@ -625,7 +625,7 @@ fn scalar_stage1_diff_pixel(
     let in_y = row_y[gx_c];
     let base = 0.25 * (row_y2[gx_c] + row_y1[gx_c] + row_y[gx1] + row_y[gx2]);
     let gammac =
-        crate::adaptive_quant::ratio_cubic_to_simple_gamma(in_y + MATCH_GAMMA_OFFSET, false);
+        crate::adaptive_quant::ratio_cubic_to_simple_gamma::<false>(in_y + MATCH_GAMMA_OFFSET);
 
     let mut diff = gammac * (in_y - base);
     diff *= diff;

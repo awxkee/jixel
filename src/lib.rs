@@ -37,6 +37,7 @@
 mod ac_context;
 mod ac_strategy;
 mod adaptive_quant;
+mod afv;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
@@ -63,6 +64,7 @@ mod inflated_cost;
 mod jpeg;
 mod lossless;
 mod lz77_ac;
+mod ma_tree;
 mod modular;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;

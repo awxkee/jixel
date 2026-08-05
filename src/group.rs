@@ -33,13 +33,14 @@ use crate::ac_context::{
     zero_density_context, zero_density_context_8x8,
 };
 use crate::dc_group_data::{
-    AcStrategyImage, DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32,
+    AcStrategyImage, DcGroupData, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3,
+    STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
+    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
 };
 use crate::dct::{
-    DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct16x32,
-    dc_from_dct32x16, dc_from_dct32x32, fmla,
+    DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x64,
+    dc_from_dct64x32, dc_from_dct64x64, fmla,
 };
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
@@ -844,6 +845,18 @@ pub(crate) fn write_ac_group(
                         let dst: &mut [f32; 1024] = coeffs[c].first_chunk_mut::<1024>().unwrap();
                         (ctx.dct32x32)(DctInput::new(input, stride), dst);
                     }
+                    STRATEGY_DCT64X64 => {
+                        let dst: &mut [f32; 4096] = coeffs[c].first_chunk_mut::<4096>().unwrap();
+                        (ctx.dct64x64)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_DCT64X32 => {
+                        let dst: &mut [f32; 2048] = coeffs[c].first_chunk_mut::<2048>().unwrap();
+                        (ctx.dct64x32)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_DCT32X64 => {
+                        let dst: &mut [f32; 2048] = coeffs[c].first_chunk_mut::<2048>().unwrap();
+                        (ctx.dct32x64)(DctInput::new(input, stride), dst);
+                    }
                     STRATEGY_DCT4X4 => {
                         let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                         (ctx.dct4x4)(DctInput::new(input, stride), dst);
@@ -864,6 +877,22 @@ pub(crate) fn write_ac_group(
                         let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
                         (ctx.dct16x32)(DctInput::new(input, stride), dst);
                     }
+                    STRATEGY_AFV0 => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.afv0)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_AFV1 => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.afv1)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_AFV2 => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.afv2)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_AFV3 => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.afv3)(DctInput::new(input, stride), dst);
+                    }
                     _ => unreachable!("invalid raw strategy {}", raw_strategy),
                 }
             }
@@ -873,7 +902,11 @@ pub(crate) fn write_ac_group(
             // indexing is didx = iy * cov_x + ix.
             let mut dc_vals = [[0.0f32; 64]; 3];
             match raw_strategy {
-                STRATEGY_DCT | STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                STRATEGY_DCT
+                | STRATEGY_DCT4X4
+                | STRATEGY_DCT4X8
+                | STRATEGY_DCT8X4
+                | STRATEGY_AFV0..=STRATEGY_AFV3 => {
                     for c in 0..3 {
                         dc_vals[c][0] = coeffs[c][0];
                     }
@@ -881,19 +914,13 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT16X8 => {
                     for c in 0..3 {
                         let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                        let mut dc2 = [0.0f32; 2];
-                        dc_from_dct16x8(cb, &mut dc2);
-                        dc_vals[c][0] = dc2[0]; // top covered block
-                        dc_vals[c][1] = dc2[1]; // bottom covered block
+                        dc_from_dct16x8(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
                     }
                 }
                 STRATEGY_DCT8X16 => {
                     for c in 0..3 {
                         let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                        let mut dc2 = [0.0f32; 2];
-                        dc_from_dct8x16(cb, &mut dc2);
-                        dc_vals[c][0] = dc2[0]; // left covered block
-                        dc_vals[c][1] = dc2[1]; // right covered block
+                        dc_from_dct8x16(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
                     }
                 }
                 STRATEGY_DCT16X16 => {
@@ -902,12 +929,7 @@ pub(crate) fn write_ac_group(
                     // (didx = iy * 2 + ix).
                     for c in 0..3 {
                         let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
-                        let mut dc4 = [0.0f32; 4];
-                        dc_from_dct16x16(cb, &mut dc4);
-                        dc_vals[c][0] = dc4[0];
-                        dc_vals[c][1] = dc4[1];
-                        dc_vals[c][2] = dc4[2];
-                        dc_vals[c][3] = dc4[3];
+                        dc_from_dct16x16(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
                     }
                 }
                 STRATEGY_DCT32X32 => {
@@ -915,9 +937,25 @@ pub(crate) fn write_ac_group(
                     // caller uses (didx = iy * 4 + ix).
                     for c in 0..3 {
                         let cb: &[f32; 1024] = coeffs[c].first_chunk::<1024>().unwrap();
-                        let mut dc16 = [0.0f32; 16];
-                        dc_from_dct32x32(cb, &mut dc16);
-                        dc_vals[c][..16].copy_from_slice(&dc16);
+                        (ctx.dc_from_dct32x32)(cb, dc_vals[c].first_chunk_mut::<16>().unwrap());
+                    }
+                }
+                STRATEGY_DCT64X64 => {
+                    for c in 0..3 {
+                        let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
+                        dc_from_dct64x64(cb, &mut dc_vals[c]);
+                    }
+                }
+                STRATEGY_DCT64X32 => {
+                    for c in 0..3 {
+                        let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
+                        dc_from_dct64x32(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
+                    }
+                }
+                STRATEGY_DCT32X64 => {
+                    for c in 0..3 {
+                        let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
+                        dc_from_dct32x64(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
                     }
                 }
                 STRATEGY_DCT32X16 => {
@@ -925,9 +963,7 @@ pub(crate) fn write_ac_group(
                     // matching cov_x=2, cov_y=4.
                     for c in 0..3 {
                         let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                        let mut dc8 = [0.0f32; 8];
-                        dc_from_dct32x16(cb, &mut dc8);
-                        dc_vals[c][..8].copy_from_slice(&dc8);
+                        (ctx.dc_from_dct32x16)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
                     }
                 }
                 STRATEGY_DCT16X32 => {
@@ -935,9 +971,7 @@ pub(crate) fn write_ac_group(
                     // matching cov_x=4, cov_y=2.
                     for c in 0..3 {
                         let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                        let mut dc8 = [0.0f32; 8];
-                        dc_from_dct16x32(cb, &mut dc8);
-                        dc_vals[c][..8].copy_from_slice(&dc8);
+                        (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
                     }
                 }
                 _ => unreachable!(),
@@ -945,7 +979,7 @@ pub(crate) fn write_ac_group(
 
             // DC for storage (per covered block, using pre-swap cov_x/cov_y).
             let covered_dc = cov_x * cov_y;
-            let mut y_dc_q = [0i16; 16];
+            let mut y_dc_q = [0i16; 64];
             (ctx.quantize_dc)(
                 &dc_vals[1][..covered_dc],
                 inv_factor[1],
@@ -972,8 +1006,15 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
                         (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
                     }
+                    STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                        (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
+                    }
                     STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                     STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
+                    STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                    STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
+                        (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
+                    }
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
                         (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
                     }
@@ -1062,29 +1103,25 @@ pub(crate) fn write_ac_group(
             let mut x_dc_post = [0.0f32; 64];
             let mut b_dc_post = [0.0f32; 64];
             match raw_strategy {
-                STRATEGY_DCT | STRATEGY_DCT4X4 | STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                STRATEGY_DCT
+                | STRATEGY_DCT4X4
+                | STRATEGY_DCT4X8
+                | STRATEGY_DCT8X4
+                | STRATEGY_AFV0..=STRATEGY_AFV3 => {
                     x_dc_post[0] = coeffs[0][0];
                     b_dc_post[0] = coeffs[2][0];
                 }
                 STRATEGY_DCT16X8 => {
                     let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
                     let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
-                    let mut xd = [0.0f32; 2];
-                    let mut bd = [0.0f32; 2];
-                    dc_from_dct16x8(xb, &mut xd);
-                    dc_from_dct16x8(bb, &mut bd);
-                    x_dc_post[..2].copy_from_slice(&xd);
-                    b_dc_post[..2].copy_from_slice(&bd);
+                    dc_from_dct16x8(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
+                    dc_from_dct16x8(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
                 }
                 STRATEGY_DCT8X16 => {
                     let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
                     let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
-                    let mut xd = [0.0f32; 2];
-                    let mut bd = [0.0f32; 2];
-                    dc_from_dct8x16(xb, &mut xd);
-                    dc_from_dct8x16(bb, &mut bd);
-                    x_dc_post[..2].copy_from_slice(&xd);
-                    b_dc_post[..2].copy_from_slice(&bd);
+                    dc_from_dct8x16(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
+                    dc_from_dct8x16(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
                 }
                 STRATEGY_DCT16X16 => {
                     let xb: &[f32; 256] = coeffs[0].first_chunk::<256>().unwrap();
@@ -1095,26 +1132,44 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT32X32 => {
                     let xb: &[f32; 1024] = coeffs[0].first_chunk::<1024>().unwrap();
                     let bb: &[f32; 1024] = coeffs[2].first_chunk::<1024>().unwrap();
-                    dc_from_dct32x32(xb, x_dc_post.first_chunk_mut::<16>().unwrap());
-                    dc_from_dct32x32(bb, b_dc_post.first_chunk_mut::<16>().unwrap());
+                    (ctx.dc_from_dct32x32)(xb, x_dc_post.first_chunk_mut::<16>().unwrap());
+                    (ctx.dc_from_dct32x32)(bb, b_dc_post.first_chunk_mut::<16>().unwrap());
+                }
+                STRATEGY_DCT64X64 => {
+                    let xb: &[f32; 4096] = coeffs[0].first_chunk::<4096>().unwrap();
+                    let bb: &[f32; 4096] = coeffs[2].first_chunk::<4096>().unwrap();
+                    dc_from_dct64x64(xb, &mut x_dc_post);
+                    dc_from_dct64x64(bb, &mut b_dc_post);
+                }
+                STRATEGY_DCT64X32 => {
+                    let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
+                    let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
+                    dc_from_dct64x32(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                    dc_from_dct64x32(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
+                }
+                STRATEGY_DCT32X64 => {
+                    let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
+                    let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
+                    dc_from_dct32x64(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                    dc_from_dct32x64(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
                 }
                 STRATEGY_DCT32X16 => {
                     let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
                     let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
-                    dc_from_dct32x16(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
-                    dc_from_dct32x16(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
+                    (ctx.dc_from_dct32x16)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
+                    (ctx.dc_from_dct32x16)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
                 }
                 STRATEGY_DCT16X32 => {
                     let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
                     let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
-                    dc_from_dct16x32(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
-                    dc_from_dct16x32(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
+                    (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
+                    (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
                 }
                 _ => unreachable!(),
             }
 
             // ---- X channel: write post-CfL DC, quantize AC ----
-            let mut chroma_dc_q = [0i16; 16];
+            let mut chroma_dc_q = [0i16; 64];
             (ctx.quantize_dc)(
                 &x_dc_post[..covered_dc],
                 inv_factor[0],
@@ -1136,8 +1191,11 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
+                STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(0)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
+                STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(0)[..],
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
                 _ => &matrices.inv_matrix_16x8(0)[..],
             };
@@ -1192,8 +1250,11 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
+                STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(2)[..],
                 STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
                 STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
+                STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(2)[..],
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
                 _ => &matrices.inv_matrix_16x8(2)[..],
             };
@@ -1237,6 +1298,8 @@ pub(crate) fn write_ac_group(
                 4 => 2,
                 8 => 3,
                 16 => 4,
+                32 => 5,
+                64 => 6,
                 _ => unreachable!("invalid covered_blocks {}", covered_blocks),
             };
 

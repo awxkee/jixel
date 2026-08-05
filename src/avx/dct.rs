@@ -26,8 +26,12 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dct::{DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, WC4, WC8, WC16, WC32};
+use crate::dct::{
+    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4,
+    WC4, WC8, WC16, WC32, WC64,
+};
 use std::arch::x86_64::*;
+use std::mem::MaybeUninit;
 
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -75,14 +79,14 @@ fn transpose_8x8(c: &mut [__m256; 8]) {
     ));
 
     // permute 128-bit lanes
-    c[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
-    c[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
-    c[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
-    c[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
-    c[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
-    c[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
-    c[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
-    c[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
+    c[0] = _mm256_permute2f128_ps::<0x20>(s0, s4);
+    c[1] = _mm256_permute2f128_ps::<0x20>(s1, s5);
+    c[2] = _mm256_permute2f128_ps::<0x20>(s2, s6);
+    c[3] = _mm256_permute2f128_ps::<0x20>(s3, s7);
+    c[4] = _mm256_permute2f128_ps::<0x31>(s0, s4);
+    c[5] = _mm256_permute2f128_ps::<0x31>(s1, s5);
+    c[6] = _mm256_permute2f128_ps::<0x31>(s2, s6);
+    c[7] = _mm256_permute2f128_ps::<0x31>(s3, s7);
 }
 
 #[inline]
@@ -191,7 +195,6 @@ fn dct1d_16_flat(c: &mut [__m256; 16]) {
     odds[5] = _mm256_add_ps(odds[5], odds[6]);
     odds[6] = _mm256_add_ps(odds[6], odds[7]);
 
-    // ── Interleave even/odd into output ───────────────────────────────────────
     c[0] = evens[0];
     c[1] = odds[0];
     c[2] = evens[1];
@@ -270,7 +273,8 @@ pub(crate) fn dct16x8_avx2(input: DctInput<'_, 8, 16>, output: &mut [f32; 128]) 
 pub(crate) fn dct16x16_avx2(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]) {
     // Two 8-col strips per pass through a column-major scratch keeps the live set
     // near 16 YMM instead of materializing all 32; row pass reloads contiguously.
-    let mut scratch = [0.0f32; 256];
+    let mut scratch_uninit = MaybeUninit::<[f32; 256]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for g in 0..2 {
         let mut c: [__m256; 16] =
             std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[g * 8..].as_ptr()) });
@@ -279,11 +283,12 @@ pub(crate) fn dct16x16_avx2(input: DctInput<'_, 16, 16>, output: &mut [f32; 256]
             let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
             transpose_8x8(&mut tile);
             for (j, v) in tile.iter().enumerate() {
-                unsafe { _mm256_storeu_ps(scratch[(g * 8 + j) * 16 + t * 8..].as_mut_ptr(), *v) };
+                unsafe { _mm256_storeu_ps(dst.add((g * 8 + j) * 16 + t * 8), *v) };
             }
         }
     }
     let scale = _mm256_set1_ps(1.0 / 256.0);
+    let scratch = unsafe { scratch_uninit.assume_init() };
     for g in 0..2 {
         let mut c: [__m256; 16] = std::array::from_fn(|col| unsafe {
             _mm256_loadu_ps(scratch[col * 16 + g * 8..].as_ptr())
@@ -328,7 +333,8 @@ fn dct1d_32_flat(c: &mut [__m256; 32]) {
 pub(crate) fn dct32x32_avx2(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) {
     // Column pass writes a transposed scratch (`[col*32 + vfreq]`) so the row pass
     // reloads contiguously instead of gathering 8 scalars per vector.
-    let mut colt = [0.0f32; 1024];
+    let mut scratch_uninit = MaybeUninit::<[f32; 1024]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for g in 0..4 {
         let mut c: [__m256; 32] =
             std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[g * 8..].as_ptr()) });
@@ -337,10 +343,11 @@ pub(crate) fn dct32x32_avx2(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
             let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
             transpose_8x8(&mut tile);
             for (j, v) in tile.iter().enumerate() {
-                unsafe { _mm256_storeu_ps(colt[(g * 8 + j) * 32 + t * 8..].as_mut_ptr(), *v) };
+                unsafe { _mm256_storeu_ps(dst.add((g * 8 + j) * 32 + t * 8), *v) };
             }
         }
     }
+    let colt = unsafe { scratch_uninit.assume_init() };
     let scale = _mm256_set1_ps(1.0 / 1024.0);
     for g in 0..4 {
         let mut c: [__m256; 32] = std::array::from_fn(|col| unsafe {
@@ -354,6 +361,147 @@ pub(crate) fn dct32x32_avx2(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
                     _mm256_mul_ps(c[u], scale),
                 );
             }
+        }
+    }
+}
+
+/// Vectorized 64-point DCT-II over eight independent columns.
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_64_flat(c: &mut [__m256; 64]) {
+    let mut evens = [_mm256_undefined_ps(); 32];
+    let mut odds = [_mm256_undefined_ps(); 32];
+    for i in 0..32 {
+        evens[i] = _mm256_add_ps(c[i], c[63 - i]);
+        odds[i] = _mm256_mul_ps(_mm256_sub_ps(c[i], c[63 - i]), _mm256_set1_ps(WC64[i]));
+    }
+    dct1d_32_flat(&mut evens);
+    dct1d_32_flat(&mut odds);
+    odds[0] = _mm256_fmadd_ps(odds[0], _mm256_set1_ps(std::f32::consts::SQRT_2), odds[1]);
+    for i in 1..31 {
+        odds[i] = _mm256_add_ps(odds[i], odds[i + 1]);
+    }
+    for i in 0..32 {
+        c[2 * i] = evens[i];
+        c[2 * i + 1] = odds[i];
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct64x64_avx2(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096]) {
+    // Column pass writes [column * 64 + vertical_frequency]. Both passes then
+    // operate on contiguous eight-lane strips, avoiding gathers entirely.
+    let mut scratch_uninit = MaybeUninit::<[f32; 4096]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for strip in 0..8 {
+        let mut c: [__m256; 64] = std::array::from_fn(|row| unsafe {
+            _mm256_loadu_ps(input.row(row)[strip * 8..].as_ptr())
+        });
+        dct1d_64_flat(&mut c);
+        for tile_index in 0..8 {
+            let mut tile: [__m256; 8] = c[tile_index * 8..tile_index * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (lane, value) in tile.iter().enumerate() {
+                unsafe {
+                    _mm256_storeu_ps(dst.add((strip * 8 + lane) * 64 + tile_index * 8), *value)
+                };
+            }
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = _mm256_set1_ps(1.0 / 4096.0);
+    for strip in 0..8 {
+        let mut c: [__m256; 64] = std::array::from_fn(|column| unsafe {
+            _mm256_loadu_ps(scratch[column * 64 + strip * 8..].as_ptr())
+        });
+        dct1d_64_flat(&mut c);
+        for u in 0..64 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 64 + strip * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                )
+            };
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct64x32_avx2(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048]) {
+    let mut scratch_uninit = MaybeUninit::<[f32; 2048]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for strip in 0..4 {
+        let mut c: [__m256; 64] = std::array::from_fn(|row| unsafe {
+            _mm256_loadu_ps(input.row(row)[strip * 8..].as_ptr())
+        });
+        dct1d_64_flat(&mut c);
+        for tile_index in 0..8 {
+            let mut tile: [__m256; 8] = c[tile_index * 8..tile_index * 8 + 8].try_into().unwrap();
+            transpose_8x8(&mut tile);
+            for (lane, value) in tile.iter().enumerate() {
+                unsafe {
+                    _mm256_storeu_ps(dst.add((strip * 8 + lane) * 64 + tile_index * 8), *value)
+                };
+            }
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = _mm256_set1_ps(1.0 / 2048.0);
+    for strip in 0..8 {
+        let mut c: [__m256; 32] = std::array::from_fn(|column| unsafe {
+            _mm256_loadu_ps(scratch[column * 64 + strip * 8..].as_ptr())
+        });
+        dct1d_32_flat(&mut c);
+        for u in 0..32 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 64 + strip * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[u], scale),
+                )
+            };
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct32x64_avx2(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048]) {
+    // Row DCT into [horizontal_frequency * 32 + row], then a 32-point
+    // vertical DCT. Output is the natural [vertical_frequency][horizontal]
+    // layout required by the shared rectangular quant matrix.
+    let mut scratch_uninit = MaybeUninit::<[f32; 2048]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
+    for row_strip in 0..4 {
+        let mut c = [_mm256_undefined_ps(); 64];
+        for column_tile in 0..8 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|lane| unsafe {
+                _mm256_loadu_ps(input.row(row_strip * 8 + lane)[column_tile * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[column_tile * 8..column_tile * 8 + 8].copy_from_slice(&tile);
+        }
+        dct1d_64_flat(&mut c);
+        for u in 0..64 {
+            unsafe { _mm256_storeu_ps(dst.add(u * 32 + row_strip * 8), c[u]) };
+        }
+    }
+    let scratch = unsafe { scratch_uninit.assume_init() };
+    let scale = _mm256_set1_ps(1.0 / 2048.0);
+    for column_strip in 0..8 {
+        let mut c = [_mm256_undefined_ps(); 32];
+        for row_tile in 0..4 {
+            let mut tile: [__m256; 8] = std::array::from_fn(|lane| unsafe {
+                _mm256_loadu_ps(scratch[(column_strip * 8 + lane) * 32 + row_tile * 8..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            c[row_tile * 8..row_tile * 8 + 8].copy_from_slice(&tile);
+        }
+        dct1d_32_flat(&mut c);
+        for v in 0..32 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[v * 64 + column_strip * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(c[v], scale),
+                )
+            };
         }
     }
 }
@@ -490,7 +638,8 @@ macro_rules! inv_dct_natural_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
         #[target_feature(enable = "avx2")]
         pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
-            let mut tmp = [0.0f32; $n];
+            let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
+            let dst = scratch_uninit.as_mut_ptr() as *mut f32;
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
                 let mut c: [__m256; $h] = std::array::from_fn(|v| unsafe {
@@ -498,9 +647,10 @@ macro_rules! inv_dct_natural_avx2 {
                 });
                 $inv_v(&mut c);
                 for y in 0..$h {
-                    unsafe { _mm256_storeu_ps(tmp.as_mut_ptr().add(y * $w + u8), c[y]) };
+                    unsafe { _mm256_storeu_ps(dst.add(y * $w + u8), c[y]) };
                 }
             }
+            let tmp = unsafe { scratch_uninit.assume_init() };
             horizontal_idct_pass_avx2!(tmp, out, $h, $w, $inv_h);
         }
     };
@@ -510,7 +660,8 @@ macro_rules! inv_dct_transposed_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
         #[target_feature(enable = "avx2")]
         pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
-            let mut tmp = [0.0f32; $n];
+            let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
+            let dst = scratch_uninit.as_mut_ptr() as *mut f32;
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
                 let mut c = [_mm256_undefined_ps(); $h];
@@ -525,9 +676,10 @@ macro_rules! inv_dct_transposed_avx2 {
                 }
                 $inv_v(&mut c);
                 for y in 0..$h {
-                    unsafe { _mm256_storeu_ps(tmp.as_mut_ptr().add(y * $w + u8), c[y]) };
+                    unsafe { _mm256_storeu_ps(dst.add(y * $w + u8), c[y]) };
                 }
             }
+            let tmp = unsafe { scratch_uninit.assume_init() };
             horizontal_idct_pass_avx2!(tmp, out, $h, $w, $inv_h);
         }
     };
@@ -593,7 +745,7 @@ inv_dct_transposed_avx2!(
 /// 4-point DCT-II over 4 lanes (one per 4×4 quadrant), mirroring the scalar
 /// [`crate::dct::dct1d_4`].
 #[target_feature(enable = "avx2,fma")]
-fn dct1d_4_m128(c: &mut [__m128; 4]) {
+pub(super) fn dct1d_4_m128(c: &mut [__m128; 4]) {
     let t0 = _mm_add_ps(c[0], c[3]);
     let t1 = _mm_add_ps(c[1], c[2]);
     let e0 = _mm_add_ps(t0, t1);
@@ -607,6 +759,32 @@ fn dct1d_4_m128(c: &mut [__m128; 4]) {
     c[2] = e1;
     c[1] = m;
     c[3] = o1;
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+pub(super) fn dct1d_8_m128(c: &mut [__m128; 8]) {
+    let mut even = [
+        _mm_add_ps(c[0], c[7]),
+        _mm_add_ps(c[1], c[6]),
+        _mm_add_ps(c[2], c[5]),
+        _mm_add_ps(c[3], c[4]),
+    ];
+    let mut odd = [
+        _mm_mul_ps(_mm_sub_ps(c[0], c[7]), _mm_set1_ps(WC8[0])),
+        _mm_mul_ps(_mm_sub_ps(c[1], c[6]), _mm_set1_ps(WC8[1])),
+        _mm_mul_ps(_mm_sub_ps(c[2], c[5]), _mm_set1_ps(WC8[2])),
+        _mm_mul_ps(_mm_sub_ps(c[3], c[4]), _mm_set1_ps(WC8[3])),
+    ];
+    dct1d_4_m128(&mut even);
+    dct1d_4_m128(&mut odd);
+    odd[0] = _mm_fmadd_ps(odd[0], _mm_set1_ps(std::f32::consts::SQRT_2), odd[1]);
+    odd[1] = _mm_add_ps(odd[1], odd[2]);
+    odd[2] = _mm_add_ps(odd[2], odd[3]);
+    for i in 0..4 {
+        c[2 * i] = even[i];
+        c[2 * i + 1] = odd[i];
+    }
 }
 
 #[target_feature(enable = "avx2,fma")]
@@ -784,7 +962,8 @@ pub(crate) fn dct32x16_avx2(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]
 pub(crate) fn dct16x32_avx2(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]) {
     // Row pass (32-pt) over 8-row strips into hfreq-major scratch, then column
     // pass (16-pt); both use transposed contiguous loads instead of scalar gathers.
-    let mut scratch = [0.0f32; 512];
+    let mut scratch_uninit = MaybeUninit::<[f32; 512]>::uninit();
+    let dst = scratch_uninit.as_mut_ptr() as *mut f32;
     for g in 0..2 {
         let mut c = [_mm256_undefined_ps(); 32];
         for ct in 0..4 {
@@ -796,9 +975,10 @@ pub(crate) fn dct16x32_avx2(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]
         }
         dct1d_32_flat(&mut c);
         for u in 0..32 {
-            unsafe { _mm256_storeu_ps(scratch[u * 16 + g * 8..].as_mut_ptr(), c[u]) };
+            unsafe { _mm256_storeu_ps(dst.add(u * 16 + g * 8), c[u]) };
         }
     }
+    let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = _mm256_set1_ps(1.0 / 512.0);
     for g in 0..4 {
         let mut c = [_mm256_undefined_ps(); 16];
@@ -818,6 +998,88 @@ pub(crate) fn dct16x32_avx2(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]
                 );
             }
         }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dc_idct4_avx2(v: __m128) -> __m128 {
+    let v0 = _mm_shuffle_ps::<0x00>(v, v);
+    let v1 = _mm_shuffle_ps::<0x55>(v, v);
+    let v2 = _mm_shuffle_ps::<0xaa>(v, v);
+    let v3 = _mm_shuffle_ps::<0xff>(v, v);
+
+    let e0 = _mm_add_ps(v0, v2);
+    let e1 = _mm_sub_ps(v0, v2);
+    let t2 = _mm_mul_ps(v1, _mm_set1_ps(std::f32::consts::SQRT_2));
+    let t3 = _mm_add_ps(v3, v1);
+    let o0 = _mm_add_ps(t2, t3);
+    let o1 = _mm_sub_ps(t2, t3);
+
+    let even01 = _mm_unpacklo_ps(e0, e1);
+    let odd01 = _mm_unpacklo_ps(o0, o1);
+    let even = _mm_shuffle_ps::<0xb4>(even01, even01);
+    let odd = _mm_shuffle_ps::<0xb4>(odd01, odd01);
+    let weights = _mm_setr_ps(WC4[0], WC4[1], -WC4[1], -WC4[0]);
+    _mm_fmadd_ps(odd, weights, even)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) fn transpose_4x4_avx2(rows: &mut [__m128; 4]) {
+    let t0 = _mm_unpacklo_ps(rows[0], rows[1]);
+    let t1 = _mm_unpackhi_ps(rows[0], rows[1]);
+    let t2 = _mm_unpacklo_ps(rows[2], rows[3]);
+    let t3 = _mm_unpackhi_ps(rows[2], rows[3]);
+    rows[0] = _mm_movelh_ps(t0, t2);
+    rows[1] = _mm_movehl_ps(t2, t0);
+    rows[2] = _mm_movelh_ps(t1, t3);
+    rows[3] = _mm_movehl_ps(t3, t1);
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct32x32_avx2(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
+    let resample = unsafe { _mm_loadu_ps(RESAMPLE_SCALE_32_TO_4.as_ptr()) };
+    let mut rows: [__m128; 4] = std::array::from_fn(|a| {
+        let coeff = unsafe { _mm_loadu_ps(coeffs[a * 32..].as_ptr()) };
+        let scaled_a = _mm_mul_ps(coeff, _mm_set1_ps(RESAMPLE_SCALE_32_TO_4[a]));
+        dc_idct4_avx2(_mm_mul_ps(scaled_a, resample))
+    });
+    transpose_4x4_avx2(&mut rows);
+    for (bb, row) in rows.iter().enumerate() {
+        unsafe { _mm_storeu_ps(dc[bb * 4..].as_mut_ptr(), dc_idct4_avx2(*row)) };
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dc_from_dct_rect_avx2(coeffs: &[f32; 512]) -> (__m128, __m128) {
+    let resample = unsafe { _mm_loadu_ps(RESAMPLE_SCALE_32_TO_4.as_ptr()) };
+    let row0 = unsafe { _mm_loadu_ps(coeffs.as_ptr()) };
+    let row1 = unsafe { _mm_loadu_ps(coeffs[32..].as_ptr()) };
+    let row0 = dc_idct4_avx2(_mm_mul_ps(row0, resample));
+    let row1 = dc_idct4_avx2(_mm_mul_ps(
+        _mm_mul_ps(row1, _mm_set1_ps(RESAMPLE_SCALE_16_TO_2[1])),
+        resample,
+    ));
+    (_mm_add_ps(row0, row1), _mm_sub_ps(row0, row1))
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct32x16_avx2(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
+    let (sum, diff) = dc_from_dct_rect_avx2(coeffs);
+    unsafe {
+        _mm_storeu_ps(dc.as_mut_ptr(), _mm_unpacklo_ps(sum, diff));
+        _mm_storeu_ps(dc[4..].as_mut_ptr(), _mm_unpackhi_ps(sum, diff));
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct16x32_avx2(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
+    let (sum, diff) = dc_from_dct_rect_avx2(coeffs);
+    unsafe {
+        _mm_storeu_ps(dc.as_mut_ptr(), sum);
+        _mm_storeu_ps(dc[4..].as_mut_ptr(), diff);
     }
 }
 
@@ -864,6 +1126,35 @@ mod tests {
             *v = rng_f32(seed.wrapping_add((i as u64).wrapping_mul(6364136223846793005)));
         }
         buf
+    }
+
+    #[test]
+    fn test_dc_from_dct_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use crate::avx::{dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2};
+        use crate::dct::{dc_from_dct16x32, dc_from_dct32x16, dc_from_dct32x32};
+
+        for seed in 0u64..32 {
+            let coeffs = fill::<1024>(seed.wrapping_add(0xdc32_0032));
+            let mut got = [0.0f32; 16];
+            let mut want = [0.0f32; 16];
+            unsafe { dc_from_dct32x32_avx2(&coeffs, &mut got) };
+            dc_from_dct32x32(&coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct32x32 seed={seed}"));
+
+            let coeffs: &[f32; 512] = coeffs.first_chunk::<512>().unwrap();
+            let mut got = [0.0f32; 8];
+            let mut want = [0.0f32; 8];
+            unsafe { dc_from_dct32x16_avx2(coeffs, &mut got) };
+            dc_from_dct32x16(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct32x16 seed={seed}"));
+
+            unsafe { dc_from_dct16x32_avx2(coeffs, &mut got) };
+            dc_from_dct16x32(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct16x32 seed={seed}"));
+        }
     }
 
     fn assert_inverse_matches_scalar<const N: usize, const W: usize, const H: usize>(

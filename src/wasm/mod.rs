@@ -28,6 +28,7 @@
  */
 mod ac_strategy;
 mod adaptive_quant;
+mod afv;
 mod cfl;
 mod dark_aq;
 mod dct;
@@ -42,6 +43,7 @@ mod ytob;
 
 pub(crate) use ac_strategy::sse_and_rate_wasm;
 pub(crate) use adaptive_quant::fill_quant_field;
+pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
 pub(crate) use cfl::{apply_cfl_wasm, cfl_regression_wasm};
 pub(crate) use dark_aq::dark_structure_stats_wasm;
 pub(crate) use dct::*;

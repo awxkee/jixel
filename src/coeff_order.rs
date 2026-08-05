@@ -109,8 +109,8 @@ pub(crate) fn tokenize_permutation(zigzag: &[u32], skip: usize, tokens: &mut Vec
 ///
 /// Indices come from `K_STRATEGY_ORDER`: 0 = DCT8, 1 = the 8x8-sized family
 /// (DCT4X4/4X8/8X4), 2 = DCT16X16, 3 = DCT32X32, 4 = DCT16X8/8X16,
-/// 6 = DCT32X16/16X32. Groups 5 and 7..=10 belong to DCT32X8 and the 64px+
-/// families, which jixel does not emit, so they can never be signaled.
+/// 6 = DCT32X16/16X32. DCT64X64 uses group 7 but intentionally stays on its
+/// natural order, so it has no entry here and is never signaled.
 pub(crate) static ORDER_SPECS: [(usize, usize, usize); 6] = [
     (0, 1, 64),
     (1, 1, 64),
@@ -119,6 +119,88 @@ pub(crate) static ORDER_SPECS: [(usize, usize, usize); 6] = [
     (4, 2, 128),
     (6, 8, 512),
 ];
+
+/// JPEG XL natural DCT64X64 order: the 8x8 LLF block first in raster order,
+/// then diagonal zig-zag over the remaining coefficients.
+fn natural_scan_64() -> &'static [u32] {
+    static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| {
+        const SIDE: usize = 64;
+        const LLF: usize = 8;
+        let mut out = Vec::with_capacity(SIDE * SIDE);
+        for y in 0..LLF {
+            for x in 0..LLF {
+                out.push((y * SIDE + x) as u32);
+            }
+        }
+        for sum in 0..=(2 * (SIDE - 1)) {
+            let lo = sum.saturating_sub(SIDE - 1);
+            let hi = sum.min(SIDE - 1);
+            if sum % 2 == 0 {
+                for x in lo..=hi {
+                    let y = sum - x;
+                    if x >= LLF || y >= LLF {
+                        out.push((y * SIDE + x) as u32);
+                    }
+                }
+            } else {
+                for x in (lo..=hi).rev() {
+                    let y = sum - x;
+                    if x >= LLF || y >= LLF {
+                        out.push((y * SIDE + x) as u32);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(out.len(), SIDE * SIDE);
+        out
+    })
+}
+
+/// JPEG XL natural order for DCT64X32/DCT32X64 in their shared normalized
+/// 32-row x 64-column coefficient layout. The first 4x8 entries are LLF.
+fn natural_scan_64x32() -> &'static [u32] {
+    static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| {
+        let mut out = vec![0u32; 2048];
+        let mut cur = 32usize;
+        for diagonal in 0..64usize {
+            for j in 0..=diagonal {
+                let (mut x, mut y) = (j, diagonal - j);
+                if diagonal & 1 != 0 {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                if y & 1 == 0 {
+                    y >>= 1;
+                    let position = if x < 8 && y < 4 {
+                        y * 8 + x
+                    } else {
+                        let position = cur;
+                        cur += 1;
+                        position
+                    };
+                    out[position] = (y * 64 + x) as u32;
+                }
+            }
+        }
+        for ip in (1..64usize).rev() {
+            let diagonal = ip - 1;
+            for j in 0..=diagonal {
+                let (mut x, mut y) = (63 - (diagonal - j), 63 - j);
+                if diagonal & 1 != 0 {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                if y & 1 == 0 {
+                    y >>= 1;
+                    out[cur] = (y * 64 + x) as u32;
+                    cur += 1;
+                }
+            }
+        }
+        debug_assert_eq!(cur, 2048);
+        out
+    })
+}
 
 /// Natural scan position of every raw coefficient index, for one order group —
 /// the inverse of jixel's `K_COEFF_ORDER_*` tables (which map scan position to
@@ -151,6 +233,14 @@ pub(crate) fn natural_position_lut(size: usize) -> Vec<u32> {
             .iter()
             .enumerate()
             .for_each(|(k, &r)| set(k, r as usize)),
+        2048 => natural_scan_64x32()
+            .iter()
+            .enumerate()
+            .for_each(|(k, &r)| set(k, r as usize)),
+        4096 => natural_scan_64()
+            .iter()
+            .enumerate()
+            .for_each(|(k, &r)| set(k, r as usize)),
         _ => unreachable!("no natural order table for size {size}"),
     }
     lut
@@ -173,6 +263,9 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
             (32, 16),
             (16, 32),
             (32, 32),
+            (64, 32),
+            (32, 64),
+            (64, 64),
         ];
         shapes
             .iter()
@@ -441,15 +534,34 @@ impl CoeffOrders {
     /// replaces.
     #[inline]
     pub(crate) fn scan_for(&self, strategy_code: u8, channel: usize) -> &[u32] {
-        let slot = order_slot_of(strategy_code)
-            .expect("every strategy jixel emits maps to a signalled order group");
-        &self.orders[slot][channel]
+        match order_slot_of(strategy_code) {
+            Some(slot) => &self.orders[slot][channel],
+            None => match crate::ac_context::K_STRATEGY_ORDER[strategy_code as usize] {
+                7 => natural_scan_64(),
+                8 => natural_scan_64x32(),
+                order => unreachable!("unsupported natural-only order {order}"),
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dct64x32_natural_scan_is_a_permutation_with_llf_first() {
+        let scan = natural_scan_64x32();
+        assert_eq!(scan.len(), 2048);
+        let mut sorted = scan.to_vec();
+        sorted.sort_unstable();
+        assert!(sorted.iter().enumerate().all(|(i, &v)| i as u32 == v));
+        for y in 0..4 {
+            for x in 0..8 {
+                assert_eq!(scan[y * 8 + x], (y * 64 + x) as u32);
+            }
+        }
+    }
 
     #[test]
     fn identity_permutation_lehmer_is_all_zeros() {
@@ -479,7 +591,7 @@ mod tests {
         }
     }
 
-    /// The natural order must cost a single token: that is what makes signalling
+    /// The natural order must cost a single token: that is what makes signaling
     /// an order group free when its statistics say the default is already best.
     #[test]
     fn natural_order_tokenizes_to_one_token() {
