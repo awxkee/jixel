@@ -47,11 +47,12 @@ pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{apply_cfl_neon, cfl_regression_neon};
 pub(crate) use dark_aq::dark_structure_stats_neon;
 pub(crate) use dct::{
-    dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dct4x4_neon, dct4x8_neon,
-    dct8x4_neon, dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon, dct16x32_neon,
-    dct32x16_neon, dct32x32_neon, dct32x64_neon, dct64x32_neon, dct64x64_neon, inv_dct8x8_neon,
-    inv_dct8x16_neon, inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon,
-    inv_dct32x32_neon, inv_dct32x64_neon, inv_dct64x32_neon, inv_dct64x64_neon,
+    dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
+    dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct4x4_neon, dct4x8_neon, dct8x4_neon,
+    dct8x8_neon, dct8x16_neon, dct16x8_neon, dct16x16_neon, dct16x32_neon, dct32x16_neon,
+    dct32x32_neon, dct32x64_neon, dct64x32_neon, dct64x64_neon, inv_dct8x8_neon, inv_dct8x16_neon,
+    inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon,
+    inv_dct32x64_neon, inv_dct64x32_neon, inv_dct64x64_neon,
 };
 pub(crate) use entropy::counts_bit_cost_neon;
 pub(crate) use inflated_cost::{

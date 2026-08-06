@@ -31,7 +31,7 @@ fn main() {
             // false,
             // &FlMeta::srgb(),
             &EncodeConfig::default()
-                .with_lossless(true)
+                .with_lossless(false)
                 .with_quality(90.)
                 .with_progressive(false)
                 .with_patches(false)
@@ -53,7 +53,7 @@ fn main() {
         width,
         height,
         &EncodeConfig::default()
-            .with_lossless(true)
+            .with_lossless(false)
             .with_quality(80.)
             .with_speed(Speed::Slow)
             .with_progressive(false)

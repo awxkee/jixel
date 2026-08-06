@@ -47,11 +47,12 @@ pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{apply_cfl_avx2, cfl_regression_avx2};
 pub(crate) use dark_aq::dark_structure_stats_avx2;
 pub(crate) use dct::{
-    dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dct4x4_avx2, dct4x8_avx2,
-    dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2,
-    dct32x16_avx2, dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, inv_dct8x8_avx2,
-    inv_dct8x16_avx2, inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2,
-    inv_dct32x32_avx2, inv_dct32x64_avx2, inv_dct64x32_avx2, inv_dct64x64_avx2,
+    dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
+    dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct4x4_avx2, dct4x8_avx2, dct8x4_avx2,
+    dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2, dct32x16_avx2,
+    dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
+    inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
+    inv_dct32x64_avx2, inv_dct64x32_avx2, inv_dct64x64_avx2,
 };
 pub(crate) use entropy::counts_bit_cost_avx2;
 pub(crate) use inflated_cost::{
