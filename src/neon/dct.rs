@@ -29,7 +29,7 @@
 
 use crate::dct::{
     DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
-    RESAMPLE_SCALE_32_TO_4, WC4, WC8, WC16, WC32, WC64,
+    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32, WC64,
 };
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
@@ -1179,6 +1179,87 @@ pub(crate) fn dc_from_dct16x32_neon(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
     }
 }
 
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_from_dct64x64_neon(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
+    let resample_lo = load_strip(RESAMPLE_SCALE_64_TO_8.as_ptr());
+    let resample_hi = load_strip(RESAMPLE_SCALE_64_TO_8[4..].as_ptr());
+    let mut lo: [float32x4_t; 8] = std::array::from_fn(|y| {
+        vmulq_n_f32(
+            vmulq_f32(load_strip(coeffs[y * 64..].as_ptr()), resample_lo),
+            64.0 * RESAMPLE_SCALE_64_TO_8[y],
+        )
+    });
+    let mut hi: [float32x4_t; 8] = std::array::from_fn(|y| {
+        vmulq_n_f32(
+            vmulq_f32(load_strip(coeffs[y * 64 + 4..].as_ptr()), resample_hi),
+            64.0 * RESAMPLE_SCALE_64_TO_8[y],
+        )
+    });
+    inv_dct1d_8_s(&mut lo);
+    inv_dct1d_8_s(&mut hi);
+
+    for y4 in (0..8).step_by(4) {
+        let (x0, x1, x2, x3) = transpose_4x4(lo[y4], lo[y4 + 1], lo[y4 + 2], lo[y4 + 3]);
+        let (x4, x5, x6, x7) = transpose_4x4(hi[y4], hi[y4 + 1], hi[y4 + 2], hi[y4 + 3]);
+        let mut horizontal = [x0, x1, x2, x3, x4, x5, x6, x7];
+        inv_dct1d_8_s(&mut horizontal);
+        for (x, row) in horizontal.iter().enumerate() {
+            unsafe { vst1q_f32(dc[x * 8 + y4..].as_mut_ptr(), *row) };
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dc_from_dct64x32_normalized_neon(coeffs: &[f32; 2048]) -> [float32x4_t; 8] {
+    let resample_lo = load_strip(RESAMPLE_SCALE_64_TO_8.as_ptr());
+    let resample_hi = load_strip(RESAMPLE_SCALE_64_TO_8[4..].as_ptr());
+    let mut lo: [float32x4_t; 4] = std::array::from_fn(|y| {
+        vmulq_n_f32(
+            vmulq_f32(load_strip(coeffs[y * 64..].as_ptr()), resample_lo),
+            32.0 * RESAMPLE_SCALE_32_TO_4[y],
+        )
+    });
+    let mut hi: [float32x4_t; 4] = std::array::from_fn(|y| {
+        vmulq_n_f32(
+            vmulq_f32(load_strip(coeffs[y * 64 + 4..].as_ptr()), resample_hi),
+            32.0 * RESAMPLE_SCALE_32_TO_4[y],
+        )
+    });
+    inv_dct1d_4_s(&mut lo);
+    inv_dct1d_4_s(&mut hi);
+    let (x0, x1, x2, x3) = transpose_4x4(lo[0], lo[1], lo[2], lo[3]);
+    let (x4, x5, x6, x7) = transpose_4x4(hi[0], hi[1], hi[2], hi[3]);
+    let mut horizontal = [x0, x1, x2, x3, x4, x5, x6, x7];
+    inv_dct1d_8_s(&mut horizontal);
+    horizontal
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_from_dct64x32_neon(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let rows = dc_from_dct64x32_normalized_neon(coeffs);
+    for (y, row) in rows.iter().enumerate() {
+        unsafe { vst1q_f32(dc[y * 4..].as_mut_ptr(), *row) };
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_from_dct32x64_neon(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let rows = dc_from_dct64x32_normalized_neon(coeffs);
+    let (lo0, lo1, lo2, lo3) = transpose_4x4(rows[0], rows[1], rows[2], rows[3]);
+    let (hi0, hi1, hi2, hi3) = transpose_4x4(rows[4], rows[5], rows[6], rows[7]);
+    unsafe {
+        vst1q_f32(dc.as_mut_ptr(), lo0);
+        vst1q_f32(dc[4..].as_mut_ptr(), hi0);
+        vst1q_f32(dc[8..].as_mut_ptr(), lo1);
+        vst1q_f32(dc[12..].as_mut_ptr(), hi1);
+        vst1q_f32(dc[16..].as_mut_ptr(), lo2);
+        vst1q_f32(dc[20..].as_mut_ptr(), hi2);
+        vst1q_f32(dc[24..].as_mut_ptr(), lo3);
+        vst1q_f32(dc[28..].as_mut_ptr(), hi3);
+    }
+}
+
 #[cfg(test)]
 mod neon_dct_tests {
     use crate::dct::{DctInput, dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
@@ -1234,8 +1315,14 @@ mod neon_dct_tests {
     #[test]
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     fn test_dc_from_dct_neon_matches_scalar() {
-        use crate::dct::{dc_from_dct16x32, dc_from_dct32x16, dc_from_dct32x32};
-        use crate::neon::{dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon};
+        use crate::dct::{
+            dc_from_dct16x32, dc_from_dct32x16, dc_from_dct32x32, dc_from_dct32x64,
+            dc_from_dct64x32, dc_from_dct64x64,
+        };
+        use crate::neon::{
+            dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon,
+            dc_from_dct32x64_neon, dc_from_dct64x32_neon, dc_from_dct64x64_neon,
+        };
 
         for seed in 0u64..32 {
             let coeffs = fill::<1024>(seed.wrapping_add(0xdc32_0032));
@@ -1255,6 +1342,24 @@ mod neon_dct_tests {
             unsafe { dc_from_dct16x32_neon(coeffs, &mut got) };
             dc_from_dct16x32(coeffs, &mut want);
             assert_close(&got, &want, &format!("dc_from_dct16x32 seed={seed}"));
+
+            let coeffs = fill::<4096>(seed.wrapping_add(0xdc64_0064));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dc_from_dct64x64_neon(&coeffs, &mut got) };
+            dc_from_dct64x64(&coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct64x64 seed={seed}"));
+
+            let coeffs = coeffs.first_chunk::<2048>().unwrap();
+            let mut got = [0.0f32; 32];
+            let mut want = [0.0f32; 32];
+            unsafe { dc_from_dct64x32_neon(coeffs, &mut got) };
+            dc_from_dct64x32(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct64x32 seed={seed}"));
+
+            unsafe { dc_from_dct32x64_neon(coeffs, &mut got) };
+            dc_from_dct32x64(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct32x64 seed={seed}"));
         }
     }
 

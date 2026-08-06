@@ -1311,7 +1311,7 @@ fn dct32x32_scalar_input(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024]) 
     }
 }
 
-const RESAMPLE_SCALE_64_TO_8: [f32; 8] = [
+pub(crate) const RESAMPLE_SCALE_64_TO_8: [f32; 8] = [
     1.0,
     0.993_686_6,
     0.974_886_83,
@@ -1338,12 +1338,18 @@ pub(crate) const RESAMPLE_SCALE_32_TO_4: [f32; 4] = [1.0, 0.974_886_8, 0.901_764
 pub(crate) type DcFromDct32x32Fn = fn(&[f32; 1024], &mut [f32; 16]);
 pub(crate) type DcFromDct32x16Fn = fn(&[f32; 512], &mut [f32; 8]);
 pub(crate) type DcFromDct16x32Fn = fn(&[f32; 512], &mut [f32; 8]);
+pub(crate) type DcFromDct64x64Fn = fn(&[f32; 4096], &mut [f32; 64]);
+pub(crate) type DcFromDct64x32Fn = fn(&[f32; 2048], &mut [f32; 32]);
+pub(crate) type DcFromDct32x64Fn = fn(&[f32; 2048], &mut [f32; 32]);
 
 #[derive(Clone, Copy)]
 pub(crate) struct DcFromDctMethods {
     pub(crate) dct32x32: DcFromDct32x32Fn,
     pub(crate) dct32x16: DcFromDct32x16Fn,
     pub(crate) dct16x32: DcFromDct16x32Fn,
+    pub(crate) dct64x64: DcFromDct64x64Fn,
+    pub(crate) dct64x32: DcFromDct64x32Fn,
+    pub(crate) dct32x64: DcFromDct32x64Fn,
 }
 
 static DC_FROM_DCT_METHODS: OnceLock<DcFromDctMethods> = OnceLock::new();
@@ -1355,6 +1361,9 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
             dct32x32: |coeffs, dc| unsafe { crate::neon::dc_from_dct32x32_neon(coeffs, dc) },
             dct32x16: |coeffs, dc| unsafe { crate::neon::dc_from_dct32x16_neon(coeffs, dc) },
             dct16x32: |coeffs, dc| unsafe { crate::neon::dc_from_dct16x32_neon(coeffs, dc) },
+            dct64x64: |coeffs, dc| unsafe { crate::neon::dc_from_dct64x64_neon(coeffs, dc) },
+            dct64x32: |coeffs, dc| unsafe { crate::neon::dc_from_dct64x32_neon(coeffs, dc) },
+            dct32x64: |coeffs, dc| unsafe { crate::neon::dc_from_dct32x64_neon(coeffs, dc) },
         }
     }
 
@@ -1365,6 +1374,9 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
                 dct32x32: |coeffs, dc| unsafe { crate::avx::dc_from_dct32x32_avx2(coeffs, dc) },
                 dct32x16: |coeffs, dc| unsafe { crate::avx::dc_from_dct32x16_avx2(coeffs, dc) },
                 dct16x32: |coeffs, dc| unsafe { crate::avx::dc_from_dct16x32_avx2(coeffs, dc) },
+                dct64x64: |coeffs, dc| unsafe { crate::avx::dc_from_dct64x64_avx2(coeffs, dc) },
+                dct64x32: |coeffs, dc| unsafe { crate::avx::dc_from_dct64x32_avx2(coeffs, dc) },
+                dct32x64: |coeffs, dc| unsafe { crate::avx::dc_from_dct32x64_avx2(coeffs, dc) },
             };
         }
     }
@@ -1373,6 +1385,9 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
         dct32x32: dc_from_dct32x32,
         dct32x16: dc_from_dct32x16,
         dct16x32: dc_from_dct16x32,
+        dct64x64: dc_from_dct64x64,
+        dct64x32: dc_from_dct64x32,
+        dct32x64: dc_from_dct32x64,
     }
 }
 
@@ -1763,20 +1778,11 @@ pub(crate) fn dct64x64_scalar_input(input: DctInput<'_, 64, 64>, output: &mut [f
 }
 
 pub(crate) fn dc_from_dct64x64(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
-    const RESAMPLE: [f32; 8] = [
-        1.0,
-        0.993_686_6,
-        0.974_886_83,
-        0.944_018_07,
-        0.901_764_2,
-        0.849_057_5,
-        0.787_054_9,
-        0.717_108_13,
-    ];
     let mut low = [0.0f32; 64];
     for y in 0..8 {
         for x in 0..8 {
-            low[y * 8 + x] = coeffs[y * 64 + x] * RESAMPLE[x] * RESAMPLE[y];
+            low[y * 8 + x] =
+                coeffs[y * 64 + x] * (RESAMPLE_SCALE_64_TO_8[x] * RESAMPLE_SCALE_64_TO_8[y]);
         }
     }
     inv_dct8x8(DctInput::from_flat(&low), dc);
@@ -1923,7 +1929,7 @@ fn dc_from_dct64x32_normalized(coeffs: &[f32; 2048]) -> [[f32; 8]; 4] {
         let mut frequencies = [0.0f32; 8];
         for b in 0..8 {
             frequencies[b] =
-                coeffs[a * 64 + b] * RESAMPLE_SCALE_32_TO_4[a] * RESAMPLE_SCALE_64_TO_8[b];
+                coeffs[a * 64 + b] * (RESAMPLE_SCALE_32_TO_4[a] * RESAMPLE_SCALE_64_TO_8[b]);
         }
         rows[a] = idct1d_8_unnormalized(frequencies);
     }
@@ -2754,6 +2760,18 @@ mod tests {
             ctx.dc_from_dct16x32 as usize, selected.dct16x32 as usize,
             "16x32 context dispatch is not the selected kernel"
         );
+        assert_eq!(
+            ctx.dc_from_dct64x64 as usize, selected.dct64x64 as usize,
+            "64x64 context dispatch is not the selected kernel"
+        );
+        assert_eq!(
+            ctx.dc_from_dct64x32 as usize, selected.dct64x32 as usize,
+            "64x32 context dispatch is not the selected kernel"
+        );
+        assert_eq!(
+            ctx.dc_from_dct32x64 as usize, selected.dct32x64 as usize,
+            "32x64 context dispatch is not the selected kernel"
+        );
 
         let coeffs: [f32; 1024] = std::array::from_fn(|i| ((i * 73 % 251) as f32 - 125.0) / 19.0);
         let mut got16 = [0.0f32; 16];
@@ -2777,6 +2795,30 @@ mod tests {
         dc_from_dct16x32(coeffs, &mut want8);
         for (got, want) in got8.iter().zip(want8) {
             assert!((got - want).abs() < 1e-4, "16x32: {got} != {want}");
+        }
+
+        let coeffs: [f32; 4096] = std::array::from_fn(|i| ((i * 73 % 251) as f32 - 125.0) / 19.0);
+        let mut got64 = [0.0f32; 64];
+        let mut want64 = [0.0f32; 64];
+        (ctx.dc_from_dct64x64)(&coeffs, &mut got64);
+        dc_from_dct64x64(&coeffs, &mut want64);
+        for (got, want) in got64.iter().zip(want64) {
+            assert!((got - want).abs() < 1e-4, "64x64: {got} != {want}");
+        }
+
+        let coeffs = coeffs.first_chunk::<2048>().unwrap();
+        let mut got32 = [0.0f32; 32];
+        let mut want32 = [0.0f32; 32];
+        (ctx.dc_from_dct64x32)(coeffs, &mut got32);
+        dc_from_dct64x32(coeffs, &mut want32);
+        for (got, want) in got32.iter().zip(want32) {
+            assert!((got - want).abs() < 1e-4, "64x32: {got} != {want}");
+        }
+
+        (ctx.dc_from_dct32x64)(coeffs, &mut got32);
+        dc_from_dct32x64(coeffs, &mut want32);
+        for (got, want) in got32.iter().zip(want32) {
+            assert!((got - want).abs() < 1e-4, "32x64: {got} != {want}");
         }
     }
 

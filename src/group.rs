@@ -38,10 +38,7 @@ use crate::dc_group_data::{
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
     STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
 };
-use crate::dct::{
-    DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, dc_from_dct32x64,
-    dc_from_dct64x32, dc_from_dct64x64, fmla,
-};
+use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -943,19 +940,19 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT64X64 => {
                     for c in 0..3 {
                         let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
-                        dc_from_dct64x64(cb, &mut dc_vals[c]);
+                        (ctx.dc_from_dct64x64)(cb, &mut dc_vals[c]);
                     }
                 }
                 STRATEGY_DCT64X32 => {
                     for c in 0..3 {
                         let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                        dc_from_dct64x32(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
+                        (ctx.dc_from_dct64x32)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
                     }
                 }
                 STRATEGY_DCT32X64 => {
                     for c in 0..3 {
                         let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                        dc_from_dct32x64(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
+                        (ctx.dc_from_dct32x64)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
                     }
                 }
                 STRATEGY_DCT32X16 => {
@@ -1138,20 +1135,20 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT64X64 => {
                     let xb: &[f32; 4096] = coeffs[0].first_chunk::<4096>().unwrap();
                     let bb: &[f32; 4096] = coeffs[2].first_chunk::<4096>().unwrap();
-                    dc_from_dct64x64(xb, &mut x_dc_post);
-                    dc_from_dct64x64(bb, &mut b_dc_post);
+                    (ctx.dc_from_dct64x64)(xb, &mut x_dc_post);
+                    (ctx.dc_from_dct64x64)(bb, &mut b_dc_post);
                 }
                 STRATEGY_DCT64X32 => {
                     let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
                     let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
-                    dc_from_dct64x32(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
-                    dc_from_dct64x32(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
+                    (ctx.dc_from_dct64x32)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                    (ctx.dc_from_dct64x32)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
                 }
                 STRATEGY_DCT32X64 => {
                     let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
                     let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
-                    dc_from_dct32x64(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
-                    dc_from_dct32x64(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
+                    (ctx.dc_from_dct32x64)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                    (ctx.dc_from_dct32x64)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
                 }
                 STRATEGY_DCT32X16 => {
                     let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();

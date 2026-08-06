@@ -28,7 +28,7 @@
  */
 use crate::dct::{
     DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
-    RESAMPLE_SCALE_32_TO_4, WC4, WC8, WC16, WC32, WC64,
+    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32, WC64,
 };
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
@@ -1133,6 +1133,61 @@ pub(crate) fn dc_from_dct16x32_avx2(coeffs: &[f32; 512], dc: &mut [f32; 8]) {
     }
 }
 
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct64x64_avx2(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
+    let resample = unsafe { _mm256_loadu_ps(RESAMPLE_SCALE_64_TO_8.as_ptr()) };
+    let mut rows: [__m256; 8] = std::array::from_fn(|y| {
+        let coeff = unsafe { _mm256_loadu_ps(coeffs[y * 64..].as_ptr()) };
+        _mm256_mul_ps(
+            _mm256_mul_ps(coeff, resample),
+            _mm256_set1_ps(64.0 * RESAMPLE_SCALE_64_TO_8[y]),
+        )
+    });
+    inv_dct1d_8_flat(&mut rows);
+    transpose_8x8(&mut rows);
+    inv_dct1d_8_flat(&mut rows);
+    for (y, row) in rows.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(dc[y * 8..].as_mut_ptr(), *row) };
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dc_from_dct64x32_normalized_avx2(coeffs: &[f32; 2048]) -> [__m256; 8] {
+    let resample = unsafe { _mm256_loadu_ps(RESAMPLE_SCALE_64_TO_8.as_ptr()) };
+    let mut vertical: [__m256; 4] = std::array::from_fn(|y| {
+        let coeff = unsafe { _mm256_loadu_ps(coeffs[y * 64..].as_ptr()) };
+        _mm256_mul_ps(
+            _mm256_mul_ps(coeff, resample),
+            _mm256_set1_ps(32.0 * RESAMPLE_SCALE_32_TO_4[y]),
+        )
+    });
+    inv_dct1d_4_flat(&mut vertical);
+
+    let mut rows = [_mm256_setzero_ps(); 8];
+    rows[..4].copy_from_slice(&vertical);
+    transpose_8x8(&mut rows);
+    inv_dct1d_8_flat(&mut rows);
+    rows
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct64x32_avx2(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let rows = dc_from_dct64x32_normalized_avx2(coeffs);
+    for (y, row) in rows.iter().enumerate() {
+        unsafe { _mm_storeu_ps(dc[y * 4..].as_mut_ptr(), _mm256_castps256_ps128(*row)) };
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct32x64_avx2(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
+    let mut rows = dc_from_dct64x32_normalized_avx2(coeffs);
+    transpose_8x8(&mut rows);
+    for (y, row) in rows[..4].iter().enumerate() {
+        unsafe { _mm256_storeu_ps(dc[y * 8..].as_mut_ptr(), *row) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::dct::DctInput;
@@ -1190,8 +1245,14 @@ mod tests {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
             return;
         }
-        use crate::avx::{dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2};
-        use crate::dct::{dc_from_dct16x32, dc_from_dct32x16, dc_from_dct32x32};
+        use crate::avx::{
+            dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2,
+            dc_from_dct32x64_avx2, dc_from_dct64x32_avx2, dc_from_dct64x64_avx2,
+        };
+        use crate::dct::{
+            dc_from_dct16x32, dc_from_dct32x16, dc_from_dct32x32, dc_from_dct32x64,
+            dc_from_dct64x32, dc_from_dct64x64,
+        };
 
         for seed in 0u64..32 {
             let coeffs = fill::<1024>(seed.wrapping_add(0xdc32_0032));
@@ -1211,6 +1272,24 @@ mod tests {
             unsafe { dc_from_dct16x32_avx2(coeffs, &mut got) };
             dc_from_dct16x32(coeffs, &mut want);
             assert_close(&got, &want, &format!("dc_from_dct16x32 seed={seed}"));
+
+            let coeffs = fill::<4096>(seed.wrapping_add(0xdc64_0064));
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { dc_from_dct64x64_avx2(&coeffs, &mut got) };
+            dc_from_dct64x64(&coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct64x64 seed={seed}"));
+
+            let coeffs = coeffs.first_chunk::<2048>().unwrap();
+            let mut got = [0.0f32; 32];
+            let mut want = [0.0f32; 32];
+            unsafe { dc_from_dct64x32_avx2(coeffs, &mut got) };
+            dc_from_dct64x32(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct64x32 seed={seed}"));
+
+            unsafe { dc_from_dct32x64_avx2(coeffs, &mut got) };
+            dc_from_dct32x64(coeffs, &mut want);
+            assert_close(&got, &want, &format!("dc_from_dct32x64 seed={seed}"));
         }
     }
 
