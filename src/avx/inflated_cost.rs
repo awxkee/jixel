@@ -476,6 +476,7 @@ mod tests {
             }
         }
         let inv_storage = [vec![1.0f32; 1024], vec![0.9f32; 1024], vec![1.1f32; 1024]];
+        let idct = crate::dct::IdctMethods::scalar();
         for (strategy, cx, cy) in [
             (STRATEGY_DCT, 1, 1),
             (STRATEGY_DCT8X16, 2, 1),
@@ -491,6 +492,7 @@ mod tests {
                 &inv_storage[2][..],
             ];
             let input = ReconDistInput {
+                idct: &idct,
                 quantization: ReconQuantization {
                     rate_log2_lut: rate_log2_lut(),
                     coeffs: &coeffs,

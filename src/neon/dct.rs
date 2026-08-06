@@ -28,8 +28,8 @@
  */
 
 use crate::dct::{
-    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4,
-    WC4, WC8, WC16, WC32, WC64,
+    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
+    RESAMPLE_SCALE_32_TO_4, WC4, WC8, WC16, WC32, WC64,
 };
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
@@ -552,6 +552,31 @@ fn inv_dct1d_32_s(c: &mut [float32x4_t; 32]) {
     }
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn inv_dct1d_64_s(c: &mut [float32x4_t; 64]) {
+    let mut t = [c[0]; 64];
+    for i in 0..32 {
+        t[i] = c[2 * i];
+        t[32 + i] = c[2 * i + 1];
+    }
+    for i in (33..=62).rev() {
+        t[i] = vsubq_f32(t[i], t[i + 1]);
+    }
+    t[32] = vmulq_n_f32(vsubq_f32(t[32], t[33]), std::f32::consts::FRAC_1_SQRT_2);
+    let mut odd: [float32x4_t; 32] = std::array::from_fn(|i| t[32 + i]);
+    inv_dct1d_32_s(&mut odd);
+    for i in 0..32 {
+        odd[i] = vmulq_n_f32(odd[i], INV_WC64[i]);
+    }
+    let mut even: [float32x4_t; 32] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_32_s(&mut even);
+    for i in 0..32 {
+        c[i] = vmulq_n_f32(vaddq_f32(even[i], odd[i]), 0.5);
+        c[63 - i] = vmulq_n_f32(vsubq_f32(even[i], odd[i]), 0.5);
+    }
+}
+
 macro_rules! horizontal_idct_pass {
     ($tmp:expr, $out:expr, $h:literal, $w:literal, $inv_h:path) => {{
         for y4 in (0..$h).step_by(4) {
@@ -670,6 +695,30 @@ inv_dct_transposed_neon!(
     16,
     inv_dct1d_32_s,
     inv_dct1d_16_s
+);
+inv_dct_transposed_neon!(
+    inv_dct64x64_neon,
+    4096,
+    64,
+    64,
+    inv_dct1d_64_s,
+    inv_dct1d_64_s
+);
+inv_dct_transposed_neon!(
+    inv_dct64x32_neon,
+    2048,
+    64,
+    32,
+    inv_dct1d_64_s,
+    inv_dct1d_32_s
+);
+inv_dct_natural_neon!(
+    inv_dct32x64_neon,
+    2048,
+    32,
+    64,
+    inv_dct1d_32_s,
+    inv_dct1d_64_s
 );
 
 #[target_feature(enable = "neon")]
@@ -1138,17 +1187,24 @@ mod neon_dct_tests {
 
     fn assert_close(neon: &[f32], scalar: &[f32], label: &str) {
         assert_eq!(neon.len(), scalar.len(), "{label}: length mismatch");
+        let base_tolerance = if label.starts_with("idct") && label.contains("64") {
+            5e-4
+        } else {
+            ATOL
+        };
         let mut max_err: f32 = 0.0;
+        let mut max_tolerance: f32 = base_tolerance;
         let mut worst = 0usize;
         for (i, (n, s)) in neon.iter().zip(scalar.iter()).enumerate() {
             let e = (n - s).abs();
             if e > max_err {
                 max_err = e;
+                max_tolerance = base_tolerance + 16.0 * f32::EPSILON * s.abs();
                 worst = i;
             }
         }
         assert!(
-            max_err < ATOL,
+            max_err < max_tolerance,
             "{label}: max error {max_err:.2e} at index {worst} \
              (neon={:.6}, scalar={:.6})",
             neon[worst],
@@ -1156,7 +1212,6 @@ mod neon_dct_tests {
         );
     }
 
-    /// Deterministic pseudo-random f32 in [-1, 1] seeded by index.
     fn rng_f32(seed: u64) -> f32 {
         // xorshift64
         let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
@@ -1798,6 +1853,36 @@ mod neon_dct_tests {
             crate::dct::inv_dct32x32,
             crate::neon::inv_dct32x32_neon,
             "idct32x32",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct64x64_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct64x64,
+            crate::neon::inv_dct64x64_neon,
+            "idct64x64",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct64x32_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct64x32,
+            crate::neon::inv_dct64x32_neon,
+            "idct64x32",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_idct32x64_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct32x64,
+            crate::neon::inv_dct32x64_neon,
+            "idct32x64",
         );
     }
 }

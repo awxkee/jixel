@@ -213,7 +213,7 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
 #[inline(always)]
 fn push_dc_wp_token(
     tokens: &mut Vec<Token>,
-    wp: &mut crate::lossless::WpState,
+    wp: &mut crate::weighted_predictor::WpState,
     x: usize,
     y: usize,
     value: i64,
@@ -336,7 +336,7 @@ pub(crate) fn collect_dc_tokens(
             continue;
         }
 
-        let mut wp = crate::lossless::WpState::new(xsize);
+        let mut wp = crate::weighted_predictor::WpState::new(xsize);
         let mut rows = plane.as_slice().chunks_exact(xsize);
 
         // On the top row every unavailable north-side neighbor collapses to

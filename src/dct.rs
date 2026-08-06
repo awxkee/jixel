@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 #![allow(unused)]
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 #[cfg(any(
     all(
@@ -153,32 +153,108 @@ impl<'a, const W: usize, const H: usize> DctInput<'a, W, H> {
 }
 
 pub(crate) type DctFn<const W: usize, const H: usize, const N: usize> =
-    dyn for<'a> Fn(DctInput<'a, W, H>, &mut [f32; N]) + Send + Sync;
+    for<'a> fn(DctInput<'a, W, H>, &mut [f32; N]);
 
-static DCT_METHOD: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
+/// Inverse-transform dispatch table resolved once and retained by the encoding
+/// context. Rectangular transforms use their normalized coefficient layout in
+/// the function type, hence both orientations share the same input dimensions.
+pub(crate) struct IdctMethods {
+    pub(crate) idct8x8: DctFn<8, 8, 64>,
+    pub(crate) idct8x16: DctFn<16, 8, 128>,
+    pub(crate) idct16x8: DctFn<16, 8, 128>,
+    pub(crate) idct16x16: DctFn<16, 16, 256>,
+    pub(crate) idct16x32: DctFn<32, 16, 512>,
+    pub(crate) idct32x16: DctFn<32, 16, 512>,
+    pub(crate) idct32x32: DctFn<32, 32, 1024>,
+    pub(crate) idct64x64: DctFn<64, 64, 4096>,
+    pub(crate) idct64x32: DctFn<64, 32, 2048>,
+    pub(crate) idct32x64: DctFn<64, 32, 2048>,
+}
 
-fn select_dct() -> Arc<DctFn<8, 8, 64>> {
+impl IdctMethods {
+    pub(crate) const fn scalar() -> Self {
+        Self {
+            idct8x8: inv_dct8x8,
+            idct8x16: inv_dct8x16,
+            idct16x8: inv_dct16x8,
+            idct16x16: inv_dct16x16,
+            idct16x32: inv_dct16x32,
+            idct32x16: inv_dct32x16,
+            idct32x32: inv_dct32x32,
+            idct64x64: inv_dct64x64,
+            idct64x32: inv_dct64x32,
+            idct32x64: inv_dct32x64,
+        }
+    }
+}
+
+static IDCT_METHODS: OnceLock<IdctMethods> = OnceLock::new();
+
+fn select_idct_methods() -> IdctMethods {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return IdctMethods {
+            idct8x8: |input, output| unsafe { crate::avx::inv_dct8x8_avx2(input, output) },
+            idct8x16: |input, output| unsafe { crate::avx::inv_dct8x16_avx2(input, output) },
+            idct16x8: |input, output| unsafe { crate::avx::inv_dct16x8_avx2(input, output) },
+            idct16x16: |input, output| unsafe { crate::avx::inv_dct16x16_avx2(input, output) },
+            idct16x32: |input, output| unsafe { crate::avx::inv_dct16x32_avx2(input, output) },
+            idct32x16: |input, output| unsafe { crate::avx::inv_dct32x16_avx2(input, output) },
+            idct32x32: |input, output| unsafe { crate::avx::inv_dct32x32_avx2(input, output) },
+            idct64x64: |input, output| unsafe { crate::avx::inv_dct64x64_avx2(input, output) },
+            idct64x32: |input, output| unsafe { crate::avx::inv_dct64x32_avx2(input, output) },
+            idct32x64: |input, output| unsafe { crate::avx::inv_dct32x64_avx2(input, output) },
+        };
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return IdctMethods {
+            idct8x8: |input, output| unsafe { crate::neon::inv_dct8x8_neon(input, output) },
+            idct8x16: |input, output| unsafe { crate::neon::inv_dct8x16_neon(input, output) },
+            idct16x8: |input, output| unsafe { crate::neon::inv_dct16x8_neon(input, output) },
+            idct16x16: |input, output| unsafe { crate::neon::inv_dct16x16_neon(input, output) },
+            idct16x32: |input, output| unsafe { crate::neon::inv_dct16x32_neon(input, output) },
+            idct32x16: |input, output| unsafe { crate::neon::inv_dct32x16_neon(input, output) },
+            idct32x32: |input, output| unsafe { crate::neon::inv_dct32x32_neon(input, output) },
+            idct64x64: |input, output| unsafe { crate::neon::inv_dct64x64_neon(input, output) },
+            idct64x32: |input, output| unsafe { crate::neon::inv_dct64x32_neon(input, output) },
+            idct32x64: |input, output| unsafe { crate::neon::inv_dct32x64_neon(input, output) },
+        };
+    }
+
+    #[allow(unreachable_code)]
+    IdctMethods::scalar()
+}
+
+pub(crate) fn selected_idct_methods() -> &'static IdctMethods {
+    IDCT_METHODS.get_or_init(select_idct_methods)
+}
+
+static DCT_METHOD: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
+
+fn select_dct() -> DctFn<8, 8, 64> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct8x8_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct8x8_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct8x8_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct8x8_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct8x8_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -186,14 +262,14 @@ fn select_dct() -> Arc<DctFn<8, 8, 64>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct8x8_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct8x8() -> &'static DctFn<8, 8, 64> {
-    DCT_METHOD.get_or_init(select_dct).as_ref()
+    DCT_METHOD.get_or_init(select_dct)
 }
 
 #[inline]
@@ -320,28 +396,28 @@ pub(crate) fn dct1d_16_oof(src: &[f32; 16], buf: &mut [f32; 16]) {
     }
 }
 
-fn select_dct_8x16() -> Arc<DctFn<16, 8, 128>> {
+fn select_dct_8x16() -> DctFn<16, 8, 128> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct8x16_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct8x16_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct8x16_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct8x16_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct8x16_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -349,17 +425,17 @@ fn select_dct_8x16() -> Arc<DctFn<16, 8, 128>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct8x16_scalar_input(input, output);
-    })
+    }
 }
 
-static DCT_METHOD_8X16: OnceLock<Arc<DctFn<16, 8, 128>>> = OnceLock::new();
-static DCT_METHOD_16X8: OnceLock<Arc<DctFn<8, 16, 128>>> = OnceLock::new();
+static DCT_METHOD_8X16: OnceLock<DctFn<16, 8, 128>> = OnceLock::new();
+static DCT_METHOD_16X8: OnceLock<DctFn<8, 16, 128>> = OnceLock::new();
 
 #[inline]
 pub(crate) fn selected_dct8x16() -> &'static DctFn<16, 8, 128> {
-    DCT_METHOD_8X16.get_or_init(select_dct_8x16).as_ref()
+    DCT_METHOD_8X16.get_or_init(select_dct_8x16)
 }
 
 pub(crate) fn dct8x16(input: &[f32; 128], output: &mut [f32; 128]) {
@@ -391,28 +467,28 @@ fn dct8x16_scalar_input(input: DctInput<'_, 16, 8>, output: &mut [f32; 128]) {
     }
 }
 
-fn select_dct_16x8() -> Arc<DctFn<8, 16, 128>> {
+fn select_dct_16x8() -> DctFn<8, 16, 128> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct16x8_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct16x8_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct16x8_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct16x8_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct16x8_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -420,14 +496,14 @@ fn select_dct_16x8() -> Arc<DctFn<8, 16, 128>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct16x8_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct16x8() -> &'static DctFn<8, 16, 128> {
-    DCT_METHOD_16X8.get_or_init(select_dct_16x8).as_ref()
+    DCT_METHOD_16X8.get_or_init(select_dct_16x8)
 }
 
 pub(crate) fn dct16x8(input: &[f32; 128], output: &mut [f32; 128]) {
@@ -480,30 +556,30 @@ pub(crate) fn dc_from_dct8x16(coeffs: &[f32; 128], dc: &mut [f32; 2]) {
     dc[1] = s0 - s1;
 }
 
-static DCT_METHOD_16X16: OnceLock<Arc<DctFn<16, 16, 256>>> = OnceLock::new();
+static DCT_METHOD_16X16: OnceLock<DctFn<16, 16, 256>> = OnceLock::new();
 
-fn select_dct_16x16() -> Arc<DctFn<16, 16, 256>> {
+fn select_dct_16x16() -> DctFn<16, 16, 256> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct16x16_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct16x16_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct16x16_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct16x16_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct16x16_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -511,14 +587,14 @@ fn select_dct_16x16() -> Arc<DctFn<16, 16, 256>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct16x16_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct16x16() -> &'static DctFn<16, 16, 256> {
-    DCT_METHOD_16X16.get_or_init(select_dct_16x16).as_ref()
+    DCT_METHOD_16X16.get_or_init(select_dct_16x16)
 }
 
 pub(crate) fn dct16x16(input: &[f32; 256], output: &mut [f32; 256]) {
@@ -611,30 +687,30 @@ fn idct4x4_2d(input: &[f32; 16], output: &mut [f32; 16]) {
     }
 }
 
-static DCT_METHOD_4X4: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
+static DCT_METHOD_4X4: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
 
-fn select_dct_4x4() -> Arc<DctFn<8, 8, 64>> {
+fn select_dct_4x4() -> DctFn<8, 8, 64> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct4x4_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct4x4_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct4x4_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct4x4_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct4x4_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -642,14 +718,14 @@ fn select_dct_4x4() -> Arc<DctFn<8, 8, 64>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct4x4_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct4x4() -> &'static DctFn<8, 8, 64> {
-    DCT_METHOD_4X4.get_or_init(select_dct_4x4).as_ref()
+    DCT_METHOD_4X4.get_or_init(select_dct_4x4)
 }
 
 pub(crate) fn dct4x4(input: &[f32; 64], output: &mut [f32; 64]) {
@@ -795,30 +871,30 @@ fn dct8x4_scalar_input(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     output[8] = (block0 - block1) * 0.5;
 }
 
-static DCT_METHOD_4X8: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
+static DCT_METHOD_4X8: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
 
-fn select_dct_4x8() -> Arc<DctFn<8, 8, 64>> {
+fn select_dct_4x8() -> DctFn<8, 8, 64> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct4x8_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct4x8_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct4x8_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct4x8_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct4x8_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -826,44 +902,44 @@ fn select_dct_4x8() -> Arc<DctFn<8, 8, 64>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct4x8_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct4x8() -> &'static DctFn<8, 8, 64> {
-    DCT_METHOD_4X8.get_or_init(select_dct_4x8).as_ref()
+    DCT_METHOD_4X8.get_or_init(select_dct_4x8)
 }
 
 pub(crate) fn dct4x8(input: &[f32; 64], output: &mut [f32; 64]) {
     selected_dct4x8()(DctInput::from_flat(input), output);
 }
 
-static DCT_METHOD_8X4: OnceLock<Arc<DctFn<8, 8, 64>>> = OnceLock::new();
+static DCT_METHOD_8X4: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
 
-fn select_dct_8x4() -> Arc<DctFn<8, 8, 64>> {
+fn select_dct_8x4() -> DctFn<8, 8, 64> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct8x4_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct8x4_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct8x4_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct8x4_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct8x4_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -871,14 +947,14 @@ fn select_dct_8x4() -> Arc<DctFn<8, 8, 64>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct8x4_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct8x4() -> &'static DctFn<8, 8, 64> {
-    DCT_METHOD_8X4.get_or_init(select_dct_8x4).as_ref()
+    DCT_METHOD_8X4.get_or_init(select_dct_8x4)
 }
 
 pub(crate) fn dct8x4(input: &[f32; 64], output: &mut [f32; 64]) {
@@ -1161,30 +1237,30 @@ pub(crate) fn inv_dct32x16(coeff: DctInput<'_, 32, 16>, out: &mut [f32; 512]) {
     }
 }
 
-static DCT_METHOD_32X32: OnceLock<Arc<DctFn<32, 32, 1024>>> = OnceLock::new();
+static DCT_METHOD_32X32: OnceLock<DctFn<32, 32, 1024>> = OnceLock::new();
 
-fn select_dct_32x32() -> Arc<DctFn<32, 32, 1024>> {
+fn select_dct_32x32() -> DctFn<32, 32, 1024> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct32x32_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct32x32_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct32x32_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct32x32_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct32x32_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -1192,14 +1268,14 @@ fn select_dct_32x32() -> Arc<DctFn<32, 32, 1024>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct32x32_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct32x32() -> &'static DctFn<32, 32, 1024> {
-    DCT_METHOD_32X32.get_or_init(select_dct_32x32).as_ref()
+    DCT_METHOD_32X32.get_or_init(select_dct_32x32)
 }
 
 pub(crate) fn dct32x32(input: &[f32; 1024], output: &mut [f32; 1024]) {
@@ -1359,30 +1435,30 @@ pub(crate) fn dc_from_dct32x32(coeffs: &[f32; 1024], dc: &mut [f32; 16]) {
     }
 }
 
-static DCT_METHOD_32X16: OnceLock<Arc<DctFn<16, 32, 512>>> = OnceLock::new();
+static DCT_METHOD_32X16: OnceLock<DctFn<16, 32, 512>> = OnceLock::new();
 
-fn select_dct_32x16() -> Arc<DctFn<16, 32, 512>> {
+fn select_dct_32x16() -> DctFn<16, 32, 512> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct32x16_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct32x16_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct32x16_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct32x16_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct32x16_avx2(input, output);
-            });
+            };
         }
     }
 
@@ -1390,14 +1466,14 @@ fn select_dct_32x16() -> Arc<DctFn<16, 32, 512>> {
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct32x16_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct32x16() -> &'static DctFn<16, 32, 512> {
-    DCT_METHOD_32X16.get_or_init(select_dct_32x16).as_ref()
+    DCT_METHOD_32X16.get_or_init(select_dct_32x16)
 }
 
 pub(crate) fn dct32x16(input: &[f32; 512], output: &mut [f32; 512]) {
@@ -1433,44 +1509,44 @@ fn dct32x16_scalar_input(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     }
 }
 
-static DCT_METHOD_16X32: OnceLock<Arc<DctFn<32, 16, 512>>> = OnceLock::new();
+static DCT_METHOD_16X32: OnceLock<DctFn<32, 16, 512>> = OnceLock::new();
 
-fn select_dct_16x32() -> Arc<DctFn<32, 16, 512>> {
+fn select_dct_16x32() -> DctFn<32, 16, 512> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         use crate::neon::dct16x32_neon;
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             dct16x32_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
         use crate::wasm::dct16x32_wasm;
-        Arc::new(|input, output| {
+        |input, output| {
             dct16x32_wasm(input, output);
-        })
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct16x32_avx2(input, output);
-            });
+            };
         }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(|input, output| {
+    |input, output| {
         dct16x32_scalar_input(input, output);
-    })
+    }
 }
 
 #[inline]
 pub(crate) fn selected_dct16x32() -> &'static DctFn<32, 16, 512> {
-    DCT_METHOD_16X32.get_or_init(select_dct_16x32).as_ref()
+    DCT_METHOD_16X32.get_or_init(select_dct_16x32)
 }
 
 pub(crate) fn dct16x32(input: &[f32; 512], output: &mut [f32; 512]) {
@@ -1587,7 +1663,7 @@ pub(crate) const WC64: [f32; 32] = [
     20.373_878,
 ];
 
-const INV_WC64: [f32; 32] = [
+pub(crate) const INV_WC64: [f32; 32] = [
     1.0 / WC64[0],
     1.0 / WC64[1],
     1.0 / WC64[2],
@@ -1708,38 +1784,38 @@ pub(crate) fn dc_from_dct64x64(coeffs: &[f32; 4096], dc: &mut [f32; 64]) {
 
 inv_dct_square!(inv_dct64x64, 4096, 64, inv_dct1d_64);
 
-static DCT_METHOD_64X64: OnceLock<Arc<DctFn<64, 64, 4096>>> = OnceLock::new();
+static DCT_METHOD_64X64: OnceLock<DctFn<64, 64, 4096>> = OnceLock::new();
 
-fn select_dct_64x64() -> Arc<DctFn<64, 64, 4096>> {
+fn select_dct_64x64() -> DctFn<64, 64, 4096> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             crate::neon::dct64x64_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        Arc::new(|input, output| {
+        |input, output| {
             crate::wasm::dct64x64_wasm(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct64x64_avx2(input, output);
-            });
+            };
         }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(dct64x64_scalar_input)
+    dct64x64_scalar_input
 }
 
 pub(crate) fn selected_dct64x64() -> &'static DctFn<64, 64, 4096> {
-    DCT_METHOD_64X64.get_or_init(select_dct_64x64).as_ref()
+    DCT_METHOD_64X64.get_or_init(select_dct_64x64)
 }
 
 /// 64 rows x 32 columns. Coefficients are normalized to the shared 32-row x
@@ -1879,71 +1955,71 @@ pub(crate) fn dc_from_dct32x64(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
     }
 }
 
-static DCT_METHOD_64X32: OnceLock<Arc<DctFn<32, 64, 2048>>> = OnceLock::new();
-static DCT_METHOD_32X64: OnceLock<Arc<DctFn<64, 32, 2048>>> = OnceLock::new();
+static DCT_METHOD_64X32: OnceLock<DctFn<32, 64, 2048>> = OnceLock::new();
+static DCT_METHOD_32X64: OnceLock<DctFn<64, 32, 2048>> = OnceLock::new();
 
-fn select_dct_64x32() -> Arc<DctFn<32, 64, 2048>> {
+fn select_dct_64x32() -> DctFn<32, 64, 2048> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             crate::neon::dct64x32_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        Arc::new(|input, output| {
+        |input, output| {
             crate::wasm::dct64x32_wasm(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct64x32_avx2(input, output);
-            });
+            };
         }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(dct64x32_scalar_input)
+    dct64x32_scalar_input
 }
 
-fn select_dct_32x64() -> Arc<DctFn<64, 32, 2048>> {
+fn select_dct_32x64() -> DctFn<64, 32, 2048> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        Arc::new(|input, output| unsafe {
+        |input, output| unsafe {
             crate::neon::dct32x64_neon(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        Arc::new(|input, output| {
+        |input, output| {
             crate::wasm::dct32x64_wasm(input, output);
-        })
+        }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return Arc::new(|input, output| unsafe {
+            return |input, output| unsafe {
                 crate::avx::dct32x64_avx2(input, output);
-            });
+            };
         }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
-    Arc::new(dct32x64_scalar_input)
+    dct32x64_scalar_input
 }
 
 pub(crate) fn selected_dct64x32() -> &'static DctFn<32, 64, 2048> {
-    DCT_METHOD_64X32.get_or_init(select_dct_64x32).as_ref()
+    DCT_METHOD_64X32.get_or_init(select_dct_64x32)
 }
 
 pub(crate) fn selected_dct32x64() -> &'static DctFn<64, 32, 2048> {
-    DCT_METHOD_32X64.get_or_init(select_dct_32x64).as_ref()
+    DCT_METHOD_32X64.get_or_init(select_dct_32x64)
 }
 
 #[cfg(test)]
@@ -2702,6 +2778,16 @@ mod tests {
         for (got, want) in got8.iter().zip(want8) {
             assert!((got - want).abs() < 1e-4, "16x32: {got} != {want}");
         }
+    }
+
+    #[test]
+    fn idct_context_reuses_the_resolved_dispatch_table() {
+        use crate::encoding_context::EncodingContext;
+
+        let first = EncodingContext::default();
+        let second = EncodingContext::default();
+        assert!(std::ptr::eq(first.idct, selected_idct_methods()));
+        assert!(std::ptr::eq(first.idct, second.idct));
     }
 
     #[test]

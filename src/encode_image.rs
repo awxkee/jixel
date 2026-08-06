@@ -2786,7 +2786,7 @@ mod encode_smoke_tests {
                 &input,
                 WIDTH,
                 HEIGHT,
-                &lossless().with_speed(speed).with_num_threads(4),
+                &lossless().with_speed(speed).with_num_threads(8),
             )
             .expect("multi-threaded lossless encode failed");
 

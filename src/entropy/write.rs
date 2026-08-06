@@ -148,68 +148,6 @@ const HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
     },
 ];
 
-pub(crate) fn select_hybrid_config(
-    values: &[u32],
-    huffman_pool: &mut Vec<HuffmanNode>,
-) -> HybridUintConfig {
-    const MAX_SEARCH_SAMPLES: usize = 65_536;
-    let stride = values.len().div_ceil(MAX_SEARCH_SAMPLES).max(1);
-    let mut best = HybridUintConfig::DEFAULT;
-    let mut best_cost = u64::MAX;
-    for config in HYBRID_CANDIDATES {
-        let mut histogram = Histogram::new();
-        let mut extra = 0u64;
-        let mut valid = true;
-        for &value in values.iter().step_by(stride) {
-            let (symbol, nbits, _) = uint_encode_with_config(value, config);
-            if symbol as usize >= ALPHABET_SIZE {
-                valid = false;
-                break;
-            }
-            histogram.add(symbol);
-            extra += nbits as u64;
-        }
-        if !valid {
-            continue;
-        }
-        let used = histogram.counts.iter().filter(|&&count| count != 0).count();
-        let prefix = if used <= 1 {
-            0
-        } else {
-            let mut depths = [0u8; ALPHABET_SIZE];
-            create_huffman_tree(&histogram.counts, 15, &mut depths, huffman_pool);
-            histogram
-                .counts
-                .iter()
-                .zip(depths.iter())
-                .map(|(&count, &depth)| count as u64 * depth as u64)
-                .sum::<u64>()
-        };
-        // UintConfig storage is variable-width after split_exponent, so small
-        // histograms should not pick a theoretically cheaper configuration
-        // whose header costs more than it saves.
-        let split = config.split_exponent as u32;
-        let msb = config.msb_in_token as u32;
-        let msb_width = if split == 0 {
-            0
-        } else {
-            32 - split.leading_zeros()
-        };
-        let remaining = split - msb;
-        let lsb_width = if remaining == 0 {
-            0
-        } else {
-            32 - remaining.leading_zeros()
-        };
-        let cost = prefix + extra + 4 + msb_width as u64 + lsb_width as u64;
-        if cost < best_cost {
-            best_cost = cost;
-            best = config;
-        }
-    }
-    best
-}
-
 const NUM_HYBRID_CANDIDATES: usize = HYBRID_CANDIDATES.len();
 const DEFAULT_HYBRID_INDEX: usize = 6;
 
@@ -327,6 +265,16 @@ fn select_hybrid_config_ans(
     } else {
         best
     }
+}
+
+/// Select one ANS-priced HybridUint configuration per final cluster while
+/// reusing the relatively large selector scratch across clusters.
+pub(crate) fn select_hybrid_configs_ans(values: &[Vec<u32>]) -> Vec<HybridUintConfig> {
+    let mut scratch = HybridAnsSelectorScratch::default();
+    values
+        .iter()
+        .map(|cluster| select_hybrid_config_ans(cluster, &mut scratch))
+        .collect()
 }
 
 fn hybrid_ans_candidate_cost(

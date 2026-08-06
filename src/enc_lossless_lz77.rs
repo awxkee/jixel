@@ -122,7 +122,7 @@ fn has_repetition(tokens: &[Token], scratch: &mut Vec<u32>) -> bool {
         table[slot] = fingerprint;
         samples += 1;
     }
-    repeats * 5 >= samples
+    repeats * 20 >= samples
 }
 
 fn match_len(tokens: &[Token], a: usize, b: usize) -> usize {
@@ -155,6 +155,8 @@ fn match_len(tokens: &[Token], a: usize, b: usize) -> usize {
 const RING_HASH_BITS: usize = 17;
 const RING_HASH_SIZE: usize = 1 << RING_HASH_BITS;
 const RING_BUCKET: usize = 8;
+const RING_ENTRIES_LEN: usize = RING_HASH_SIZE * RING_BUCKET;
+const DEEP_LZ_SCRATCH_WORDS: usize = RING_ENTRIES_LEN + RING_HASH_SIZE + 1;
 
 #[inline]
 fn ring_hash(tokens: &[Token], pos: usize) -> usize {
@@ -278,6 +280,70 @@ impl Iterator for RunLzTokens<'_> {
     }
 }
 
+/// Streaming equivalent of `RunLzTokens`. It retains only the current equal
+/// token run, allowing prediction/tokenization to emit directly into the final
+/// LZ stream without staging a raw-token plane.
+pub(super) struct RunLzWriter {
+    out: Vec<LzToken>,
+    token: Option<Token>,
+    count: usize,
+}
+
+impl RunLzWriter {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(capacity),
+            token: None,
+            count: 0,
+        }
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, token: Token) {
+        if self
+            .token
+            .is_some_and(|current| current.context == token.context && current.value == token.value)
+        {
+            self.count += 1;
+        } else {
+            self.flush_run();
+            self.token = Some(token);
+            self.count = 1;
+        }
+    }
+
+    /// Explicitly ends a channel so streaming behavior stays identical to
+    /// independently applying run compression to each channel.
+    pub(super) fn finish_channel(&mut self) {
+        self.flush_run();
+    }
+
+    pub(super) fn finish(mut self) -> Vec<LzToken> {
+        self.flush_run();
+        self.out
+    }
+
+    fn flush_run(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let copied = self.count - 1;
+        self.out.push(LzToken::pixel(token.context, token.value));
+        if copied >= LZ77_MIN_LENGTH as usize {
+            self.out.push(LzToken::lz77(
+                token.context,
+                copied as u32 - LZ77_MIN_LENGTH,
+                LZ77_DIST_VALUE,
+            ));
+        } else {
+            for _ in 0..copied {
+                self.out.push(LzToken::pixel(token.context, token.value));
+            }
+        }
+        self.count = 0;
+    }
+}
+
 #[inline]
 pub(super) fn lz77_compress_for_speed(
     tokens: &[Token],
@@ -285,31 +351,90 @@ pub(super) fn lz77_compress_for_speed(
     speed: crate::Speed,
     scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
+    let CoderScratch {
+        lz_repetitions,
+        lz_depth,
+        lz_candidate,
+        lz_entropy,
+        huffman_pool,
+        ..
+    } = scratch;
+    lz77_compress_for_speed_with_parts(
+        tokens,
+        distance_context,
+        speed,
+        lz_repetitions,
+        lz_depth,
+        lz_candidate,
+        lz_entropy,
+        huffman_pool,
+    )
+}
+
+pub(super) fn lz77_compress_for_speed_with_depth(
+    tokens: &[Token],
+    distance_context: u32,
+    speed: crate::Speed,
+    depth: &mut Vec<u32>,
+    scratch: &mut CoderScratch,
+) -> Vec<LzToken> {
+    let CoderScratch {
+        lz_repetitions,
+        lz_candidate,
+        lz_entropy,
+        huffman_pool,
+        ..
+    } = scratch;
+    lz77_compress_for_speed_with_parts(
+        tokens,
+        distance_context,
+        speed,
+        lz_repetitions,
+        depth,
+        lz_candidate,
+        lz_entropy,
+        huffman_pool,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lz77_compress_for_speed_with_parts(
+    tokens: &[Token],
+    distance_context: u32,
+    speed: crate::Speed,
+    lz_repetitions: &mut Vec<u32>,
+    lz_depth: &mut Vec<u32>,
+    lz_candidate: &mut Vec<LzToken>,
+    lz_entropy: &mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> Vec<LzToken> {
     // Fast stays runs-only
-    if speed != crate::Speed::Slow || !has_repetition(tokens, &mut scratch.lz_repetitions) {
+    if speed != crate::Speed::Slow || !has_repetition(tokens, lz_repetitions) {
         return lz77_compress_runs(tokens);
     }
-    lz77_compress_with_depth_into(tokens, 8, &mut scratch.lz_depth, &mut scratch.lz_candidate);
-    let run_token_count = run_token_count(tokens);
-    if scratch.lz_candidate.len() * 100 > run_token_count * 90 {
-        return lz77_compress_runs(tokens);
+    let run_tokens = lz77_compress_runs(tokens);
+    // Slow mode's broader candidate selection protects the major Modular
+    // alternatives, so do not discard useful 2..10% LZ wins at this local gate.
+    let max_candidate_len = run_tokens.len().saturating_mul(98) / 100;
+    if !lz77_compress_with_depth_into_limit(tokens, 8, lz_depth, lz_candidate, max_candidate_len) {
+        return run_tokens;
     }
     let deep_bits = estimate_payload_bits(
-        scratch.lz_candidate.iter().copied(),
+        lz_candidate.iter().copied(),
         distance_context,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
+        lz_entropy,
+        huffman_pool,
     );
     let run_bits = estimate_payload_bits(
-        RunLzTokens::new(tokens),
+        run_tokens.iter().copied(),
         distance_context,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
+        lz_entropy,
+        huffman_pool,
     );
-    if deep_bits * 100 <= run_bits * 90 {
-        scratch.lz_candidate.clone()
+    if deep_bits * 100 <= run_bits * 98 {
+        lz_candidate.clone()
     } else {
-        lz77_compress_runs(tokens)
+        run_tokens
     }
 }
 
@@ -352,53 +477,111 @@ where
     bits
 }
 
-fn run_token_count(tokens: &[Token]) -> usize {
-    let mut count = 0usize;
-    let mut i = 0usize;
-    while i < tokens.len() {
-        count += 1;
-        let token = tokens[i];
-        let mut end = i + 1;
-        while end < tokens.len()
-            && tokens[end].context == token.context
-            && tokens[end].value == token.value
-        {
-            end += 1;
-        }
-        if end - i > LZ77_MIN_LENGTH as usize {
-            count += 1;
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    count
-}
-
 pub(super) fn lz77_compress_runs(tokens: &[Token]) -> Vec<LzToken> {
-    let mut out = Vec::with_capacity(run_token_count(tokens));
-    out.extend(RunLzTokens::new(tokens));
+    let mut out = Vec::with_capacity(tokens.len());
+    lz77_extend_runs(tokens, &mut out);
     out
 }
 
+pub(super) fn lz77_extend_runs(tokens: &[Token], out: &mut Vec<LzToken>) {
+    out.extend(RunLzTokens::new(tokens));
+}
+
+pub(super) fn lz77_compress_runs_channels(channels: Vec<Vec<Token>>) -> Vec<LzToken> {
+    let total_len: usize = channels.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total_len);
+    for channel in channels {
+        lz77_extend_runs(&channel, &mut out);
+    }
+    out
+}
+
+pub(super) fn lz77_compress_channels_for_speed(
+    channels: Vec<Vec<Token>>,
+    distance_context: u32,
+    speed: crate::Speed,
+    scratch: &mut CoderScratch,
+) -> Vec<LzToken> {
+    let total_len: usize = channels.iter().map(Vec::len).sum();
+    if speed != crate::Speed::Slow {
+        return lz77_compress_runs_channels(channels);
+    }
+
+    // Deep matching needs random access to one contiguous stream. Reuse the
+    // first channel's allocation and append the others instead of allocating
+    // and copying a second full-sized token vector from scratch.
+    let mut channels = channels.into_iter();
+    let mut tokens = channels.next().unwrap_or_default();
+    tokens.reserve(total_len.saturating_sub(tokens.len()));
+    for mut channel in channels {
+        tokens.append(&mut channel);
+    }
+    lz77_compress_for_speed(&tokens, distance_context, speed, scratch)
+}
+
+pub(super) fn lz77_compress_channels_for_speed_with_depth(
+    channels: Vec<Vec<Token>>,
+    distance_context: u32,
+    speed: crate::Speed,
+    depth: &mut Vec<u32>,
+    scratch: &mut CoderScratch,
+) -> Vec<LzToken> {
+    let total_len: usize = channels.iter().map(Vec::len).sum();
+    if speed != crate::Speed::Slow {
+        return lz77_compress_runs_channels(channels);
+    }
+
+    let mut channels = channels.into_iter();
+    let mut tokens = channels.next().unwrap_or_default();
+    tokens.reserve(total_len.saturating_sub(tokens.len()));
+    for mut channel in channels {
+        tokens.append(&mut channel);
+    }
+    lz77_compress_for_speed_with_depth(&tokens, distance_context, speed, depth, scratch)
+}
+
+#[cfg(test)]
 fn lz77_compress_with_depth_into(
     tokens: &[Token],
     max_probes: usize,
     scratch: &mut Vec<u32>,
     out: &mut Vec<LzToken>,
 ) {
+    assert!(lz77_compress_with_depth_into_limit(
+        tokens,
+        max_probes,
+        scratch,
+        out,
+        usize::MAX,
+    ));
+}
+
+/// Returns false once the monotonically growing output exceeds `max_output`.
+/// The caller can then select an already-built alternative without completing
+/// a candidate that can no longer pass its size gate.
+fn lz77_compress_with_depth_into_limit(
+    tokens: &[Token],
+    max_probes: usize,
+    scratch: &mut Vec<u32>,
+    out: &mut Vec<LzToken>,
+    max_output: usize,
+) -> bool {
     out.clear();
-    debug_assert!(
-        out.capacity() >= tokens.len(),
-        "LZ77 candidate scratch was not fully preallocated"
-    );
-    const ENTRIES_LEN: usize = RING_HASH_SIZE * RING_BUCKET;
-    let total = ENTRIES_LEN + RING_HASH_SIZE + 1;
-    if scratch.len() < total {
-        scratch.clear();
-        scratch.resize(total, 0);
+    // Highly compressible groups need only a tiny fraction of the raw token
+    // bound. Start modestly; persistent worker scratch retains any growth that
+    // less-compressible groups actually require.
+    let initial_capacity = tokens
+        .len()
+        .min(max_output.saturating_add(1))
+        .min(16 * 1024);
+    if out.capacity() < initial_capacity {
+        out.reserve(initial_capacity);
     }
-    let (entries, rest) = scratch.split_at_mut(ENTRIES_LEN);
+    if scratch.len() < DEEP_LZ_SCRATCH_WORDS {
+        scratch.clear();
+        scratch.resize(DEEP_LZ_SCRATCH_WORDS, 0);
+    }
+    let (entries, rest) = scratch.split_at_mut(RING_ENTRIES_LEN);
     let (cursors, epoch_word) = rest.split_at_mut(RING_HASH_SIZE);
     let mut epoch = (epoch_word[0] + 1) & 0xffff;
     if epoch == 0 {
@@ -421,6 +604,9 @@ fn lz77_compress_with_depth_into(
                 match_len as u32 - LZ77_MIN_LENGTH,
                 distance_value,
             ));
+            if out.len() > max_output {
+                return false;
+            }
             for pos in i..i + match_len {
                 ring_insert(entries, cursors, ring_hash(tokens, pos), pos, epoch);
             }
@@ -428,10 +614,14 @@ fn lz77_compress_with_depth_into(
         } else {
             let token = tokens[i];
             out.push(LzToken::pixel(token.context, token.value));
+            if out.len() > max_output {
+                return false;
+            }
             ring_insert(entries, cursors, ring_hash(tokens, i), i, epoch);
             i += 1;
         }
     }
+    true
 }
 
 /// `context_map: None` accumulates per raw context (identity), which supports
@@ -481,14 +671,7 @@ where
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
-    // The incoming flag marks Slow mode; Slow also switches the pixel streams
-    // from prefix codes to rANS (denser, worth ~1-2%).
     let use_ans = refined;
-    let refined = refined
-        && streams.clone().any(|toks| {
-            toks.iter()
-                .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
-        });
     let LzEntropyScratch {
         histograms,
         prefix_codes,
@@ -533,8 +716,8 @@ where
                 }
             }
         }
-        for (cluster, values) in raw_values.iter().enumerate() {
-            let selected = crate::entropy::select_hybrid_config(values, huffman_pool);
+        let selected_configs = crate::entropy::select_hybrid_configs_ans(&raw_values);
+        for (cluster, selected) in selected_configs.into_iter().enumerate() {
             configs[cluster] = if literal_values[cluster].iter().all(|&value| {
                 crate::entropy::uint_encode_with_config(value, selected).0 < min_symbol
             }) {
@@ -647,7 +830,8 @@ pub(super) fn write_lz_section(
         bits: u32,
         emitted: u32,
     }
-    let mut prepared: Vec<Slot> = Vec::with_capacity(tokens.len());
+    let expanded_len = tokens.len() + tokens.iter().filter(|token| token.is_lz77()).count();
+    let mut prepared: Vec<Slot> = Vec::with_capacity(expanded_len);
     let push = |prepared: &mut Vec<Slot>, hist: u8, sym: u32, nbits: u32, bits: u32| {
         debug_assert!(sym < ALPHABET_SIZE as u32);
         debug_assert!(nbits <= u8::MAX as u32);
@@ -698,7 +882,7 @@ pub(super) fn write_lz_section(
         }
     }
     w.write(32, coder.state() as u64);
-    for slot in prepared.iter() {
+    for slot in prepared {
         if slot.emitted != NO_EMIT {
             w.write(16, slot.emitted as u64);
         }
@@ -878,6 +1062,51 @@ mod tests {
     }
 
     #[test]
+    fn channel_run_compression_matches_concatenated_stream() {
+        let channels = vec![
+            vec![Token::new(2, 7); 19],
+            (0..37).map(|i| Token::new(1, i % 5)).collect(),
+            vec![Token::new(0, 4); 11],
+        ];
+        let concatenated: Vec<Token> = channels.iter().flatten().copied().collect();
+        let expected = lz77_compress_runs(&concatenated);
+        let actual = lz77_compress_channels_for_speed(
+            channels,
+            3,
+            crate::Speed::Fast,
+            &mut CoderScratch::default(),
+        );
+        assert_eq!(expected.len(), actual.len());
+        assert!(expected.iter().zip(&actual).all(|(a, b)| {
+            a.context == b.context && a.value == b.value && a.distance == b.distance
+        }));
+        assert!(same_tokens(&expand(&actual), &concatenated));
+    }
+
+    #[test]
+    fn streaming_run_writer_matches_buffered_channels() {
+        let channels = vec![
+            vec![Token::new(2, 7); 19],
+            vec![Token::new(1, 5); 3],
+            (0..37).map(|i| Token::new(0, i % 5)).collect(),
+        ];
+        let expected = lz77_compress_runs_channels(channels.clone());
+        let mut writer = RunLzWriter::with_capacity(channels.iter().map(Vec::len).sum());
+        for channel in channels {
+            for token in channel {
+                writer.push(token);
+            }
+            writer.finish_channel();
+        }
+        let actual = writer.finish();
+
+        assert_eq!(expected.len(), actual.len());
+        assert!(expected.iter().zip(&actual).all(|(a, b)| {
+            a.context == b.context && a.value == b.value && a.distance == b.distance
+        }));
+    }
+
+    #[test]
     fn fixed_context_storage_covers_the_largest_squeeze_tree() {
         let steps = crate::squeeze::default_squeeze_steps(
             crate::encode_image::MAX_DIMENSION,
@@ -896,18 +1125,71 @@ mod tests {
             .collect();
         let input: Vec<Token> = pattern.iter().copied().cycle().take(512).collect();
         let mut scratch = CoderScratch::default();
+        assert_eq!(scratch.lz_repetitions.capacity(), 0);
+        assert_eq!(scratch.lz_depth.capacity(), 0);
+        assert_eq!(scratch.lz_candidate.capacity(), 0);
         let fast = lz77_compress_for_speed(&input, 3, crate::Speed::Fast, &mut scratch);
         assert!(
             !fast
                 .iter()
                 .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
         );
+        assert_eq!(scratch.lz_repetitions.capacity(), 0);
+        assert_eq!(scratch.lz_depth.capacity(), 0);
+        assert_eq!(scratch.lz_candidate.capacity(), 0);
         let slow = lz77_compress_for_speed(&input, 3, crate::Speed::Slow, &mut scratch);
         assert!(
             slow.iter()
                 .any(|token| token.is_lz77() && token.distance != LZ77_DIST_VALUE)
         );
         assert!(same_tokens(&expand(&slow), &input));
+        assert_eq!(scratch.lz_depth.len(), DEEP_LZ_SCRATCH_WORDS);
+        assert!(scratch.lz_repetitions.capacity() >= 1 << 14);
+        assert!(scratch.lz_candidate.capacity() >= scratch.lz_candidate.len());
+        assert!(scratch.lz_candidate.capacity() <= input.len());
+
+        let mut pooled_depth = Vec::new();
+        let pooled = lz77_compress_for_speed_with_depth(
+            &input,
+            3,
+            crate::Speed::Slow,
+            &mut pooled_depth,
+            &mut CoderScratch::default(),
+        );
+        assert_eq!(pooled_depth.len(), DEEP_LZ_SCRATCH_WORDS);
+        assert_eq!(slow.len(), pooled.len());
+        assert!(slow.iter().zip(&pooled).all(|(a, b)| {
+            a.context == b.context && a.value == b.value && a.distance == b.distance
+        }));
+
+        let allocations = (
+            scratch.lz_repetitions.as_ptr(),
+            scratch.lz_depth.as_ptr(),
+            scratch.lz_candidate.as_ptr(),
+        );
+        let capacities = (
+            scratch.lz_repetitions.capacity(),
+            scratch.lz_depth.capacity(),
+            scratch.lz_candidate.capacity(),
+        );
+        let slow_again = lz77_compress_for_speed(&input, 3, crate::Speed::Slow, &mut scratch);
+        assert!(same_tokens(&expand(&slow), &expand(&slow_again)));
+        assert_eq!(
+            allocations,
+            (
+                scratch.lz_repetitions.as_ptr(),
+                scratch.lz_depth.as_ptr(),
+                scratch.lz_candidate.as_ptr(),
+            )
+        );
+        assert_eq!(
+            capacities,
+            (
+                scratch.lz_repetitions.capacity(),
+                scratch.lz_depth.capacity(),
+                scratch.lz_candidate.capacity(),
+            )
+        );
     }
 
     fn tokens(n: usize, period: usize) -> Vec<Token> {
