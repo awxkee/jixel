@@ -458,11 +458,18 @@ impl OrderStats {
     /// the result is deterministic and stays close to natural).
     fn derive(&self, slot: usize, channel: usize, natural: &[u32], llf: usize) -> Vec<u32> {
         let counts = &self.counts[slot][channel];
+        // Rank of each coefficient in the natural scan, so equal-frequency
+        // ties genuinely fall back to natural order (raw index order is not
+        // the zigzag natural order).
+        let mut natural_rank = vec![0u32; natural.len()];
+        for (i, &c) in natural.iter().enumerate() {
+            natural_rank[c as usize] = i as u32;
+        }
         let mut rest: Vec<u32> = natural[llf..].to_vec();
         rest.sort_by(|&a, &b| {
             counts[b as usize]
                 .cmp(&counts[a as usize])
-                .then_with(|| a.cmp(&b))
+                .then_with(|| natural_rank[a as usize].cmp(&natural_rank[b as usize]))
         });
         let mut out = Vec::with_capacity(natural.len());
         out.extend_from_slice(&natural[..llf]);
