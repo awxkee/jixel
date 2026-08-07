@@ -87,6 +87,8 @@ pub(crate) struct BandOverride {
 
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
 const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
+const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
+const QM_FLAT_B8_MID_MIN_DISTANCE: f32 = 1.25;
 const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
 const QM_SS2_SCALE16X32: f32 = 1.20;
@@ -97,6 +99,36 @@ static DCT8_BANDS: [[f32; 6]; 3] = [
     [560.0, 0.0, -0.3, -0.3, -0.3, -0.3],
     [512.0, -2.0, -1.0, 0.0, -1.0, -2.0],
 ];
+
+static FLAT_B8_BANDS_HQ: [f32; 6] = [512.0, -0.5, -0.25, 0.0, -0.25, -0.5];
+static FLAT_B8_BANDS_MID: [f32; 6] = [512.0, -0.13, -0.235, -0.276, -0.609, -0.339];
+
+fn default_dct8_override(use_coarse: bool, flat_b8: &[f32; 6]) -> BandOverride {
+    let mut out = if use_coarse {
+        coarse_dct8_override()
+    } else {
+        let mut base = BandOverride {
+            num_bands: 6,
+            bands: [[0.0; 16]; 3],
+        };
+        for c in 0..3 {
+            base.bands[c][..6].copy_from_slice(&DCT8_BANDS[c]);
+        }
+        base
+    };
+    out.bands[2][..6].copy_from_slice(flat_b8);
+    for c in 0..3 {
+        for i in 0..6 {
+            let v = out.bands[c][i];
+            out.bands[c][i] = if i == 0 {
+                f16_bits_to_f32(f32_to_f16_bits(v / 64.0)) * 64.0
+            } else {
+                f16_bits_to_f32(f32_to_f16_bits(v))
+            };
+        }
+    }
+    out
+}
 
 /// Retain 25% more luma precision in the outer radial band, spread
 /// geometrically across the five band transitions. F16-round-trip every
@@ -1568,23 +1600,31 @@ fn shared_tables() -> &'static SharedTables {
 
 impl DequantMatrices {
     pub(crate) fn new(distance: f32) -> &'static Self {
-        static DEFAULT: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static DEFAULT_HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static DEFAULT_MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance >= QM_DCT8_MIN_DISTANCE {
-            COARSE.get_or_init(|| Self::compute(true, true))
+            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID)))
         } else if distance >= QM_SS2_MIN_DISTANCE {
-            SS2.get_or_init(|| Self::compute(true, false))
+            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID)))
+        } else if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
+            DEFAULT_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID)))
+        } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
+            DEFAULT_HQ.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ)))
         } else {
-            DEFAULT.get_or_init(|| Self::compute(false, false))
+            HQ.get_or_init(|| Self::compute(false, false, None))
         }
     }
 
-    fn compute(use_ss2: bool, use_coarse_dct8: bool) -> Self {
+    fn compute(use_ss2: bool, use_coarse_dct8: bool, flat_b8: Option<&[f32; 6]>) -> Self {
         // The large-transform tables depend on the SS2 gate, and DCT8 gets a
         // separate coarser-quality variant. All other tables are shared.
         let shared = shared_tables();
-        let o8 = use_coarse_dct8.then(coarse_dct8_override);
+        // The coarse DCT8 variant only exists above the flat-B gate, so the
+        // no-flat (near-lossless) tier always carries the spec table.
+        let o8 = flat_b8.map(|bands| default_dct8_override(use_coarse_dct8, bands));
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
         let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
@@ -1788,7 +1828,7 @@ mod tests {
         std::thread::Builder::new()
             .name("small-stack-dequant-test".into())
             .stack_size(64 * 1024)
-            .spawn(|| drop(DequantMatrices::compute(false, false)))
+            .spawn(|| drop(DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID))))
             .unwrap()
             .join()
             .unwrap();
@@ -1796,18 +1836,67 @@ mod tests {
 
     #[test]
     fn coarse_dct8_preserves_more_luma_high_frequency() {
-        assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01).custom_tables[0].is_none());
+        // The DCT8 table is signaled (flat B bands) at every tier above the
+        // flat-B quality gate.
+        assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01).custom_tables[0].is_some());
         assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE).custom_tables[0].is_some());
 
-        let normal = DequantMatrices::compute(true, false);
-        let coarse = DequantMatrices::compute(true, true);
-        assert!(normal.custom_tables[0].is_none());
-        assert!(coarse.custom_tables[0].is_some());
+        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID));
+        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID));
 
         let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
         assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
         let lf_ratio = coarse.inv_matrix(1)[1] / normal.inv_matrix(1)[1];
         assert!((1.0..1.03).contains(&lf_ratio), "{lf_ratio}");
+    }
+
+    #[test]
+    fn flat_b8_gated_off_at_very_high_quality() {
+        // Near-lossless tier keeps the spec DCT8 table (nothing signaled);
+        // the flat-B override kicks in at the gate.
+        assert!(
+            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01).custom_tables[0].is_none()
+        );
+        assert!(DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE).custom_tables[0].is_some());
+    }
+
+    #[test]
+    fn flat_b8_shape_splits_at_mid_distance() {
+        // HQ knee below the split, Optuna mid shape at and above it.
+        let below = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE - 0.01).custom_tables[0]
+            .expect("hq flat table");
+        let at = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE).custom_tables[0]
+            .expect("mid flat table");
+        assert_eq!(below.bands[2][1], f16_bits_to_f32(f32_to_f16_bits(FLAT_B8_BANDS_HQ[1])));
+        assert_eq!(at.bands[2][1], f16_bits_to_f32(f32_to_f16_bits(FLAT_B8_BANDS_MID[1])));
+        // X/Y rows identical across the split (only the B row changes).
+        for c in [0usize, 1] {
+            assert_eq!(below.bands[c][..6], at.bands[c][..6]);
+        }
+    }
+
+    #[test]
+    fn default_dct8_flattens_blue_high_frequency_only() {
+        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ));
+        // X and Y stay at the spec table within F16 signaling round-off.
+        for c in [0usize, 1] {
+            for k in 1..64 {
+                let spec = DEQUANT_MATRIX_8X8[c][k];
+                let got = m.matrix(c)[k];
+                assert!(
+                    (got - spec).abs() <= 2e-3 * spec.abs(),
+                    "c={c} k={k}: {got} vs spec {spec}"
+                );
+            }
+        }
+        // B dequant steps never coarser than spec, and several times finer at
+        // HF (flat bands raise the outer-band weights, shrinking the step).
+        for k in 1..64 {
+            let ratio = m.matrix(2)[k] / DEQUANT_MATRIX_8X8[2][k];
+            assert!(ratio <= 1.001, "k={k}: B step ratio {ratio} > 1");
+        }
+        let b_hf = m.matrix(2)[63] / DEQUANT_MATRIX_8X8[2][63];
+        assert!(b_hf < 0.35, "B HF step ratio {b_hf}, expected < 0.35");
     }
 
     #[test]
