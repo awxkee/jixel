@@ -2256,10 +2256,10 @@ fn write_image_metadata(
         // ToneMapping bundle, all fields explicit (all_default = false).
         w.write(1, 0);
         let it = tm.intensity_target.unwrap_or(255.0);
-        w.write(16, crate::util::f32_to_f16(it) as u64); // intensity_target
-        w.write(16, crate::util::f32_to_f16(tm.min_nits) as u64); // min_nits
+        w.write(16, crate::util::f32_to_f16_bits(it) as u64); // intensity_target
+        w.write(16, crate::util::f32_to_f16_bits(tm.min_nits) as u64); // min_nits
         w.write(1, if tm.relative_to_max_display { 1 } else { 0 }); // relative_to_max_display
-        w.write(16, crate::util::f32_to_f16(tm.linear_below) as u64); // linear_below
+        w.write(16, crate::util::f32_to_f16_bits(tm.linear_below) as u64); // linear_below
     }
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
@@ -2273,11 +2273,11 @@ fn write_image_metadata(
         w.write(1, 0); // CustomTransformData.all_default = 0
         w.write(1, 0); // OpsinInverseMatrix.all_default = 0
         for &v in &xyb.inv {
-            w.write(16, crate::util::f32_to_f16(v) as u64);
+            w.write(16, crate::util::f32_to_f16_bits(v) as u64);
         }
         for _ in 0..3 {
             // Opsin biases (defaults; the forward bias is unchanged).
-            w.write(16, crate::util::f32_to_f16(-0.003_793_073_4) as u64);
+            w.write(16, crate::util::f32_to_f16_bits(-0.003_793_073_4) as u64);
         }
         // Per-channel quant biases + numerator (defaults).
         for v in [
@@ -2286,7 +2286,7 @@ fn write_image_metadata(
             1.0 - 0.049_935_105,
             0.145,
         ] {
-            w.write(16, crate::util::f32_to_f16(v) as u64);
+            w.write(16, crate::util::f32_to_f16_bits(v) as u64);
         }
         w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)
     }

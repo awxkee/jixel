@@ -202,58 +202,166 @@ impl FastRound for f32 {
     }
 }
 
-/// Convert an `f32` to IEEE-754 binary16 (half-float) bits, matching JXL's F16
-/// coder (sign | 5-bit biased exponent | 10-bit mantissa, round-to-nearest-even).
-/// Used for HDR tone-mapping metadata (`intensity_target`, `min_nits`, ...).
-/// Values out of the finite half range are clamped to the max finite half;
-/// inf/NaN are not expected here (JXL rejects them in F16 fields).
-pub(crate) fn f32_to_f16(value: f32) -> u16 {
-    let bits = value.to_bits();
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+#[inline]
+fn f32_to_f16_bits_impl(v: f32) -> u16 {
+    let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127; // unbiased
-    let mant = bits & 0x7F_FFFF; // 23-bit mantissa
-    if value == 0.0 {
-        return sign;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    let e16 = exp - 112; // rebias 127 -> 15
+    if e16 >= 31 {
+        return sign | 0x7BFF; // clamp to max finite; NaN/Inf unsupported on the wire
     }
-    if exp > 15 {
-        return sign | 0x7BFF; // clamp to max finite half (65504)
+    if e16 <= 0 {
+        if e16 < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - e16) as u32;
+        let rounded = (m + (1 << (shift - 1)) - 1 + ((m >> shift) & 1)) >> shift;
+        return sign | rounded as u16;
     }
-    if exp < -24 {
-        return sign; // underflow to zero
+    let m = mant + 0xFFF + ((mant >> 13) & 1);
+    let mut e16 = e16 as u32;
+    let mut m16 = m >> 13;
+    if m16 == 0x400 {
+        m16 = 0;
+        e16 += 1;
+        if e16 >= 31 {
+            return sign | 0x7BFF;
+        }
     }
-    if exp < -14 {
-        // Subnormal half: shift the implicit-1 mantissa down.
-        let shift = (14 - exp) as u32; // 0..=10 extra
-        let full = mant | 0x80_0000;
-        let half_mant = full >> (shift + 13);
-        let round = (full >> (shift + 12)) & 1;
-        return sign | ((half_mant as u16) + round as u16);
+    sign | ((e16 as u16) << 10) | (m16 as u16)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "f16c")]
+fn f32_to_f16_bits_f16c(v: f32) -> u16 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{_MM_FROUND_TO_NEAREST_INT, _mm_cvtps_ph, _mm_cvtsi128_si32, _mm_set_ss};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _MM_FROUND_TO_NEAREST_INT, _mm_cvtps_ph, _mm_cvtsi128_si32, _mm_set_ss,
+    };
+
+    _mm_cvtsi128_si32(_mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm_set_ss(v))) as u16
+}
+
+#[inline]
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::aarch64::{vcvt_f16_f32, vdupq_n_f32, vget_lane_u16, vreinterpret_u16_f16};
+        unsafe { vget_lane_u16::<0>(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(v)))) }
     }
-    // Normalized: pack and round-to-nearest-even; a mantissa carry naturally
-    // increments the exponent via the addition.
-    let e16 = (exp + 15) as u16;
-    let mant16 = (mant >> 13) as u16;
-    let remainder = mant & 0x1FFF; // dropped low 13 bits
-    let half = 0x1000u32;
-    let mut out = (e16 << 10) | mant16;
-    if remainder > half || (remainder == half && (mant16 & 1) == 1) {
-        out += 1; // round up (carry into exponent if mantissa overflows)
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let converter = F16_CONVERTERS.get_or_init(select_f16_converters);
+        unsafe { (converter.f32_to_f16_bits)(v) }
     }
-    if out >= 0x7C00 {
-        out = 0x7BFF; // never emit inf from rounding
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        target_arch = "x86",
+        target_arch = "x86_64"
+    )))]
+    {
+        f32_to_f16_bits_impl(v)
     }
-    sign | out
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+#[inline]
+fn f16_bits_to_f32_impl(b: u16) -> f32 {
+    let sign = (b >> 15) as u32;
+    let biased_exp = ((b >> 10) & 0x1F) as u32;
+    let mantissa = (b & 0x3FF) as u32;
+    if biased_exp == 0 {
+        let v = (1.0f32 / 16384.0) * (mantissa as f32 * (1.0 / 1024.0));
+        return if sign != 0 { -v } else { v };
+    }
+    f32::from_bits((sign << 31) | ((biased_exp + 112) << 23) | (mantissa << 13))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "f16c")]
+fn f16_bits_to_f32_f16c(b: u16) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{_mm_cvtph_ps, _mm_cvtsi32_si128, _mm_cvtss_f32};
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{_mm_cvtph_ps, _mm_cvtsi32_si128, _mm_cvtss_f32};
+
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(b as i32)))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct F16Converters {
+    f32_to_f16_bits: unsafe fn(f32) -> u16,
+    f16_bits_to_f32: unsafe fn(u16) -> f32,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn select_f16_converters() -> F16Converters {
+    if std::is_x86_feature_detected!("f16c") {
+        return F16Converters {
+            f32_to_f16_bits: f32_to_f16_bits_f16c,
+            f16_bits_to_f32: f16_bits_to_f32_f16c,
+        };
+    }
+    F16Converters {
+        f32_to_f16_bits: f32_to_f16_bits_impl,
+        f16_bits_to_f32: f16_bits_to_f32_impl,
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+static F16_CONVERTERS: std::sync::OnceLock<F16Converters> = std::sync::OnceLock::new();
+
+/// Mirror of libjxl `F16Coder::Read`: the value the decoder reconstructs from
+/// a binary16 bit pattern.
+#[inline]
+pub(crate) fn f16_bits_to_f32(b: u16) -> f32 {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        use std::arch::aarch64::{vcvt_f32_f16, vdup_n_u16, vgetq_lane_f32, vreinterpret_f16_u16};
+        unsafe { vgetq_lane_f32::<0>(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(b)))) }
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let converter = F16_CONVERTERS.get_or_init(select_f16_converters);
+        unsafe { (converter.f16_bits_to_f32)(b) }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        target_arch = "x86",
+        target_arch = "x86_64"
+    )))]
+    {
+        f16_bits_to_f32_impl(b)
+    }
 }
 
 #[cfg(test)]
 mod f16_tests {
-    use super::f32_to_f16;
+    use super::{f16_bits_to_f32, f32_to_f16_bits};
+
     #[test]
     fn known_hdr_luminances() {
-        assert_eq!(f32_to_f16(0.0), 0x0000);
-        assert_eq!(f32_to_f16(255.0), 0x5BF8);
-        assert_eq!(f32_to_f16(1000.0), 0x63D0);
-        assert_eq!(f32_to_f16(4000.0), 0x6BD0);
-        assert_eq!(f32_to_f16(10000.0), 0x70E2);
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(255.0), 0x5BF8);
+        assert_eq!(f32_to_f16_bits(1000.0), 0x63D0);
+        assert_eq!(f32_to_f16_bits(4000.0), 0x6BD0);
+        assert_eq!(f32_to_f16_bits(10000.0), 0x70E2);
+    }
+
+    #[test]
+    fn known_binary16_values() {
+        assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(f16_bits_to_f32(0x0001), 2.0f32.powi(-24));
+        assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_bits_to_f32(0x5BF8), 255.0);
+        assert_eq!(f16_bits_to_f32(0xFBFF), -65504.0);
     }
 }
