@@ -177,9 +177,6 @@ fn rdoq_block(
         .len()
         .min(covered_blocks + (24 * covered_blocks).min(64));
     let window_len = search_end - covered_blocks;
-    if window_len == 0 {
-        return;
-    }
 
     let block_ctx = fine_block_context(c, strategy_code, qf_hi);
     let histo_offset = fine_zero_density_contexts_offset(block_ctx);
