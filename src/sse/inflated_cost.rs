@@ -111,6 +111,105 @@ pub(crate) fn error_gradient_energy_sse41(error: &[f32], width: usize, height: u
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn peak_excess_x4(
+    a: __m128,
+    b: __m128,
+    source_a: __m128,
+    source_b: __m128,
+    floor: __m128,
+) -> __m128 {
+    let sign = _mm_set1_ps(-0.0);
+    let error_gradient = _mm_andnot_ps(sign, _mm_sub_ps(b, a));
+    let source_gradient = _mm_andnot_ps(sign, _mm_sub_ps(source_b, source_a));
+    let excess = _mm_max_ps(
+        _mm_setzero_ps(),
+        _mm_sub_ps(
+            _mm_sub_ps(
+                error_gradient,
+                _mm_mul_ps(source_gradient, _mm_set1_ps(0.5)),
+            ),
+            floor,
+        ),
+    );
+    _mm_mul_ps(excess, excess)
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn horizontal_max_x4(value: __m128) -> f32 {
+    let pair_max = _mm_max_ps(value, _mm_shuffle_ps::<0x4e>(value, value));
+    _mm_cvtss_f32(_mm_max_ps(
+        pair_max,
+        _mm_shuffle_ps::<0xb1>(pair_max, pair_max),
+    ))
+}
+
+/// # Safety
+/// The caller must ensure SSE4.1 is available.
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn error_gradient_peak_energy_sse41(
+    error: &[f32],
+    original: &[f32],
+    width: usize,
+    height: usize,
+    floor: f32,
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n && original.len() >= n);
+    assert!(floor.is_finite() && floor >= 0.0);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    if !width.is_multiple_of(4) {
+        return crate::inflated_cost::error_gradient_peak_energy_scalar(
+            error, original, width, height, floor,
+        );
+    }
+
+    let floor = _mm_set1_ps(floor);
+    let zero = _mm_setzero_ps();
+    let mut total = 0.0f32;
+    for cell_y in (0..height).step_by(4) {
+        for cell_x in (0..width).step_by(4) {
+            let mut max_x = zero;
+            let mut max_y = zero;
+            for y in cell_y..(cell_y + 4).min(height) {
+                let p = y * width + cell_x;
+                let current = unsafe { _mm_loadu_ps(error.as_ptr().add(p)) };
+                let source = unsafe { _mm_loadu_ps(original.as_ptr().add(p)) };
+                let (right, source_right) = if cell_x + 4 < width {
+                    (unsafe { _mm_loadu_ps(error.as_ptr().add(p + 1)) }, unsafe {
+                        _mm_loadu_ps(original.as_ptr().add(p + 1))
+                    })
+                } else {
+                    (
+                        _mm_shuffle_ps::<249>(current, current),
+                        _mm_shuffle_ps::<249>(source, source),
+                    )
+                };
+                max_x = _mm_max_ps(
+                    max_x,
+                    peak_excess_x4(current, right, source, source_right, floor),
+                );
+                if y + 1 < height {
+                    let below = unsafe { _mm_loadu_ps(error.as_ptr().add(p + width)) };
+                    let source_below = unsafe { _mm_loadu_ps(original.as_ptr().add(p + width)) };
+                    max_y = _mm_max_ps(
+                        max_y,
+                        peak_excess_x4(current, below, source, source_below, floor),
+                    );
+                }
+            }
+            total += horizontal_max_x4(max_x) + horizontal_max_x4(max_y);
+        }
+    }
+    total
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn combine_error_x4(spatial: &[f32; 4], luma: &[f32; 4], factor: __m128, combined: &mut [f32; 4]) {
     let spatial = unsafe { _mm_loadu_ps(spatial.as_ptr()) };
     let luma = unsafe { _mm_loadu_ps(luma.as_ptr()) };

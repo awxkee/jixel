@@ -369,6 +369,18 @@ fn correction_score(f: Features, distance: f32, ringing_mix: f32, gradient_spars
         - (0.90 - 0.15 * low_quality_mix) * noise
 }
 
+const TWIG_K: f32 = 5.412;
+const TWIG_LUM_LO: f32 = 0.582;
+const TWIG_LUM_HI: f32 = 1.016;
+const TEXTURE_K: f32 = 0.402;
+
+#[inline]
+fn coherent_texture_score(features: Features, bright: f32) -> f32 {
+    // Complement the bright-background twig term without extending it to
+    // incoherent grain or texture that disappears after 2x downsampling.
+    (1.0 - bright) * features.coherence * features.persistence * features.gradient_presence
+}
+
 pub(crate) fn apply(
     corrections: &mut Vec<f32>,
     opsin: &Image3F,
@@ -419,12 +431,12 @@ pub(crate) fn apply(
             } else {
                 gradient_sparsity(&block)
             };
-            let correction = correction_score(
-                block_features(&block, dct8x8),
-                distance,
-                ringing_mix,
-                sparsity,
-            );
+            let features = block_features(&block, dct8x8);
+            let mut correction = correction_score(features, distance, ringing_mix, sparsity);
+            let mean = block.iter().sum::<f32>() * (1.0 / 64.0);
+            let bright = ((mean - TWIG_LUM_LO) / (TWIG_LUM_HI - TWIG_LUM_LO)).clamp(0.0, 1.0);
+            correction -= TWIG_K * bright * features.gradient_presence;
+            correction -= TEXTURE_K * coherent_texture_score(features, bright);
             *correction_out = correction;
             let weight = (w * h) as f32;
             weighted_sum = fmla(weight, correction, weighted_sum);
@@ -630,5 +642,24 @@ mod tests {
         assert!(line_f.coherence > noise_f.coherence);
         assert!(correction_score(line_f, 3.0, 0.0, 0.0) > correction_score(noise_f, 3.0, 0.0, 0.0));
         assert!(correction_score(line_f, 4.0, 1.0, 1.0) < correction_score(line_f, 4.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn coherent_texture_targets_persistent_nonbright_structure() {
+        let coherent = Features {
+            persistence: 0.8,
+            coherence: 0.9,
+            gradient_presence: 0.7,
+            ..Features::default()
+        };
+        let noise = Features {
+            persistence: 0.05,
+            coherence: 0.1,
+            gradient_presence: 0.7,
+            ..Features::default()
+        };
+        assert!(coherent_texture_score(coherent, 0.0) > 0.5);
+        assert!(coherent_texture_score(coherent, 0.0) > coherent_texture_score(noise, 0.0));
+        assert_eq!(coherent_texture_score(coherent, 1.0), 0.0);
     }
 }

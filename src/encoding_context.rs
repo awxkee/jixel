@@ -43,9 +43,8 @@ pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
     pub(crate) boost: Option<DarkAqConfig>,
-    pub(crate) banding_protection: bool,
     pub(crate) xyb: xyb::XybMatrix,
-    /// Transform-merge knobs resolved at this encode's distance.
+    /// Transform-merge knobs resolved at this encodes distance.
     pub(crate) merge: ac_strategy::MergeTuning,
     pub(crate) matrices: &'static DequantMatrices,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
@@ -62,6 +61,8 @@ pub(crate) struct EncodingContext {
     pub(crate) block_features: structure_aq::BlockFeaturesFn,
     pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
+    pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
+    pub(crate) gradient_region_stats_with_chroma: ac_strategy::GradientRegionStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
@@ -97,7 +98,6 @@ impl EncodingContext {
     pub(crate) fn new(
         speed: Speed,
         boost: Option<DarkAqConfig>,
-        banding_protection: bool,
         xyb: xyb::XybMatrix,
         distance: f32,
         num_threads: usize,
@@ -109,7 +109,6 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             boost,
-            banding_protection,
             xyb,
             merge: ac_strategy::MergeTuning::new(distance),
             matrices: DequantMatrices::new(distance),
@@ -119,6 +118,7 @@ impl EncodingContext {
             recon_dist_and_rate: inflated_cost::select_recon_dist_and_rate_fn(),
             recon_error_kernels: inflated_cost::ReconErrorKernels {
                 gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
+                gradient_peak_energy: inflated_cost::select_error_gradient_peak_energy_fn(),
                 combine: inflated_cost::select_combine_error_fn(),
             },
             rate_log2_lut: inflated_cost::rate_log2_lut(),
@@ -130,6 +130,9 @@ impl EncodingContext {
             block_features: structure_aq::select_block_features_fn(),
             apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
+            gradient_region_stats: ac_strategy::select_gradient_region_stats_fn(),
+            gradient_region_stats_with_chroma:
+                ac_strategy::select_gradient_region_stats_with_chroma_fn(),
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
@@ -166,6 +169,6 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None, false, xyb::XybMatrix::SPEC, 1.0, 1)
+        Self::new(Speed::Fast, None, xyb::XybMatrix::SPEC, 1.0, 1)
     }
 }

@@ -104,6 +104,94 @@ pub(crate) fn error_gradient_energy_wasm(error: &[f32], width: usize, height: us
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn peak_excess_x4(a: v128, b: v128, source_a: v128, source_b: v128, floor: v128) -> v128 {
+    let error_gradient = f32x4_abs(f32x4_sub(b, a));
+    let source_gradient = f32x4_abs(f32x4_sub(source_b, source_a));
+    let excess = f32x4_max(
+        f32x4_splat(0.0),
+        f32x4_sub(
+            f32x4_sub(error_gradient, f32x4_mul(source_gradient, f32x4_splat(0.5))),
+            floor,
+        ),
+    );
+    f32x4_mul(excess, excess)
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn horizontal_max_x4(value: v128) -> f32 {
+    f32x4_extract_lane::<0>(value)
+        .max(f32x4_extract_lane::<1>(value))
+        .max(f32x4_extract_lane::<2>(value))
+        .max(f32x4_extract_lane::<3>(value))
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn error_gradient_peak_energy_wasm(
+    error: &[f32],
+    original: &[f32],
+    width: usize,
+    height: usize,
+    floor: f32,
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n && original.len() >= n);
+    assert!(floor.is_finite() && floor >= 0.0);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    if !width.is_multiple_of(4) {
+        return crate::inflated_cost::error_gradient_peak_energy_scalar(
+            error, original, width, height, floor,
+        );
+    }
+
+    let floor = f32x4_splat(floor);
+    let zero = f32x4_splat(0.0);
+    let mut total = 0.0f32;
+    for cell_y in (0..height).step_by(4) {
+        for cell_x in (0..width).step_by(4) {
+            let mut max_x = zero;
+            let mut max_y = zero;
+            for y in cell_y..(cell_y + 4).min(height) {
+                let p = y * width + cell_x;
+                let current = unsafe { v128_load(error.as_ptr().add(p).cast()) };
+                let source = unsafe { v128_load(original.as_ptr().add(p).cast()) };
+                let (right, source_right) = if cell_x + 4 < width {
+                    (
+                        unsafe { v128_load(error.as_ptr().add(p + 1).cast()) },
+                        unsafe { v128_load(original.as_ptr().add(p + 1).cast()) },
+                    )
+                } else {
+                    (
+                        i32x4_shuffle::<1, 2, 3, 3>(current, current),
+                        i32x4_shuffle::<1, 2, 3, 3>(source, source),
+                    )
+                };
+                max_x = f32x4_max(
+                    max_x,
+                    peak_excess_x4(current, right, source, source_right, floor),
+                );
+                if y + 1 < height {
+                    let below = unsafe { v128_load(error.as_ptr().add(p + width).cast()) };
+                    let source_below =
+                        unsafe { v128_load(original.as_ptr().add(p + width).cast()) };
+                    max_y = f32x4_max(
+                        max_y,
+                        peak_excess_x4(current, below, source, source_below, floor),
+                    );
+                }
+            }
+            total += horizontal_max_x4(max_x) + horizontal_max_x4(max_y);
+        }
+    }
+    total
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
 fn combine_error_x4(spatial: &[f32; 4], luma: &[f32; 4], factor: v128, combined: &mut [f32; 4]) {
     let spatial = unsafe { v128_load(spatial.as_ptr().cast()) };
     let luma = unsafe { v128_load(luma.as_ptr().cast()) };

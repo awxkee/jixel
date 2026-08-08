@@ -62,7 +62,6 @@ def run_case(
     # A "boost" key is not an env knob: it is passed straight to the tuner's
     # --boost CLI flag (DarkAqConfig CSV, e.g. "1.5" or "1.5,6,0.02,1").
     boost = (params or {}).get("boost")
-    banding = (params or {}).get("banding")
 
     try:
         # 1) Encode.
@@ -79,8 +78,6 @@ def run_case(
         ]
         if boost is not None:
             cmd += ["--boost", str(boost)]
-        if banding:
-            cmd += ["--banding"]
         enc = _run(cmd, env=env)
         if enc.returncode != 0 or not jxl.exists():
             raise EncodeError(f"encode failed ({case.key()}): {enc.stderr.strip()}")

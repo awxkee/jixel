@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{DctInput, WC4, WC8, WC16, WC32, WC64};
+use crate::dct::{DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, WC4, WC8, WC16, WC32};
 use core::arch::wasm32::*;
 use std::mem::MaybeUninit;
 
@@ -452,24 +452,64 @@ pub(crate) fn dct32x32_wasm(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
 #[inline]
 #[target_feature(enable = "simd128")]
 fn dct1d_64_s(c: &mut [v128; 64]) {
-    let mut evens = [f32x4_splat(0.0); 32];
-    let mut odds = [f32x4_splat(0.0); 32];
-    for i in 0..32 {
-        evens[i] = f32x4_add(c[i], c[63 - i]);
-        odds[i] = f32x4_mul(f32x4_sub(c[i], c[63 - i]), f32x4_splat(WC64[i]));
+    for i in 0..16 {
+        let bottom = c[i];
+        let top = c[63 - i];
+        let half_bottom = c[31 - i];
+        let half_top = c[32 + i];
+        let lower = f32x4_sub(bottom, top);
+        let upper = f32x4_sub(half_bottom, half_top);
+        let cos = f32x4_splat(DCT64_SPLIT_COS[i]);
+        let sin = f32x4_splat(DCT64_SPLIT_SIN[i]);
+
+        c[i] = f32x4_add(bottom, top);
+        c[31 - i] = f32x4_add(half_bottom, half_top);
+        c[32 + i] = f32x4_add(f32x4_mul(lower, cos), f32x4_mul(upper, sin));
+        let sin_input = f32x4_sub(f32x4_mul(upper, cos), f32x4_mul(lower, sin));
+        c[63 - i] = if i & 1 == 0 {
+            sin_input
+        } else {
+            f32x4_neg(sin_input)
+        };
     }
-    dct1d_32_s(&mut evens);
-    dct1d_32_s(&mut odds);
-    odds[0] = f32x4_add(
-        f32x4_mul(odds[0], f32x4_splat(std::f32::consts::SQRT_2)),
-        odds[1],
-    );
-    for i in 1..31 {
-        odds[i] = f32x4_add(odds[i], odds[i + 1]);
+
+    dct1d_32_s(<&mut [v128; 32]>::try_from(&mut c[..32]).unwrap());
+    dct1d_16_s(<&mut [v128; 16]>::try_from(&mut c[32..48]).unwrap());
+    dct1d_16_s(<&mut [v128; 16]>::try_from(&mut c[48..]).unwrap());
+
+    for i in 1..16 {
+        let cos = c[32 + i];
+        let sin = if i & 1 == 0 {
+            f32x4_neg(c[64 - i])
+        } else {
+            c[64 - i]
+        };
+        c[32 + i] = f32x4_add(cos, sin);
+        c[64 - i] = f32x4_sub(cos, sin);
     }
-    for i in 0..32 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
+    c[32] = f32x4_mul(c[32], f32x4_splat(std::f32::consts::SQRT_2));
+    c[48] = f32x4_mul(c[48], f32x4_splat(-std::f32::consts::SQRT_2));
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct64_store_transposed4(dst: *mut f32, column: usize, frequency: usize, values: [v128; 4]) {
+    let (a, b, c, d) = transpose_4x4(values[0], values[1], values[2], values[3]);
+    for (lane, value) in [a, b, c, d].iter().enumerate() {
+        unsafe { v128_store(dst.add((column + lane) * 64 + frequency).cast(), *value) };
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct64_store4(dst: *mut f32, stride: usize, frequency: usize, values: [v128; 4], scale: v128) {
+    for (offset, value) in values.iter().enumerate() {
+        unsafe {
+            v128_store(
+                dst.add((frequency + offset) * stride).cast(),
+                f32x4_mul(*value, scale),
+            )
+        };
     }
 }
 
@@ -481,18 +521,18 @@ pub(crate) fn dct64x64_wasm(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
         let mut c: [v128; 64] =
             std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
         dct1d_64_s(&mut c);
-        for tile_index in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(
-                c[tile_index * 4],
-                c[tile_index * 4 + 1],
-                c[tile_index * 4 + 2],
-                c[tile_index * 4 + 3],
-            );
-            for (lane, value) in [a, b, cc, d].iter().enumerate() {
-                let p = unsafe { dst.add((strip * 4 + lane) * 64 + tile_index * 4) };
-                unsafe { v128_store(p.cast(), *value) };
-            }
+        dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
+        for group in 1..15 {
+            unsafe {
+                dct64_store_transposed4(
+                    dst,
+                    strip * 4,
+                    group * 4,
+                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                )
+            };
         }
+        dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 4096.0);
@@ -501,10 +541,20 @@ pub(crate) fn dct64x64_wasm(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
             load_strip(unsafe { scratch.get_unchecked(column * 64 + strip * 4..) }.as_ptr())
         });
         dct1d_64_s(&mut c);
-        for u in 0..64 {
-            let p = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
-            unsafe { v128_store(p.as_mut_ptr().cast(), f32x4_mul(c[u], scale)) };
+        let dst = unsafe { output.as_mut_ptr().add(strip * 4) };
+        dct64_store4(dst, 64, 0, [c[0], c[32], c[1], c[33]], scale);
+        for group in 1..15 {
+            unsafe {
+                dct64_store4(
+                    dst,
+                    64,
+                    group * 4,
+                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                    scale,
+                )
+            };
         }
+        dct64_store4(dst, 64, 60, [c[30], c[49], c[31], c[48]], scale);
     }
 }
 
@@ -516,18 +566,18 @@ pub(crate) fn dct64x32_wasm(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048
         let mut c: [v128; 64] =
             std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
         dct1d_64_s(&mut c);
-        for tile_index in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(
-                c[tile_index * 4],
-                c[tile_index * 4 + 1],
-                c[tile_index * 4 + 2],
-                c[tile_index * 4 + 3],
-            );
-            for (lane, value) in [a, b, cc, d].iter().enumerate() {
-                let p = unsafe { dst.add((strip * 4 + lane) * 64 + tile_index * 4) };
-                unsafe { v128_store(p.cast(), *value) };
-            }
+        dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
+        for group in 1..15 {
+            unsafe {
+                dct64_store_transposed4(
+                    dst,
+                    strip * 4,
+                    group * 4,
+                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                )
+            };
         }
+        dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 2048.0);
@@ -562,10 +612,36 @@ pub(crate) fn dct32x64_wasm(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048
             c[column_tile * 4 + 3] = d;
         }
         dct1d_64_s(&mut c);
-        for u in 0..64 {
-            let p = unsafe { dst.add(u * 32 + row_strip * 4) };
-            unsafe { v128_store(p.cast(), c[u]) };
+        let one = f32x4_splat(1.0);
+        unsafe {
+            dct64_store4(
+                dst.add(row_strip * 4),
+                32,
+                0,
+                [c[0], c[32], c[1], c[33]],
+                one,
+            )
+        };
+        for group in 1..15 {
+            unsafe {
+                dct64_store4(
+                    dst.add(row_strip * 4),
+                    32,
+                    group * 4,
+                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                    one,
+                )
+            };
         }
+        unsafe {
+            dct64_store4(
+                dst.add(row_strip * 4),
+                32,
+                60,
+                [c[30], c[49], c[31], c[48]],
+                one,
+            )
+        };
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = f32x4_splat(1.0 / 2048.0);

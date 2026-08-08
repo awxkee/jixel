@@ -36,7 +36,6 @@ fn main() -> ExitCode {
     let mut boost: Option<jixel::DarkAqConfig> = None;
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
-    let mut banding = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -76,10 +75,6 @@ fn main() -> ExitCode {
                     }
                 };
                 i += 2;
-            }
-            "--banding" => {
-                banding = true;
-                i += 1;
             }
             "--lossless" => {
                 lossless = true;
@@ -124,10 +119,6 @@ fn main() -> ExitCode {
     if let Some(b) = boost {
         cfg = cfg.with_dark_aq_config(b);
     }
-    if banding {
-        cfg = cfg.with_banding_protection();
-    }
-
     let start = Instant::now();
     let data = match jixel::encode_image(rgb.as_raw(), width, height, &cfg) {
         Ok(d) => d,

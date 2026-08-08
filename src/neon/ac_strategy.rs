@@ -28,6 +28,112 @@
  */
 use std::arch::aarch64::*;
 
+#[target_feature(enable = "neon")]
+fn gradient_region_stats_impl<const CHROMA: bool>(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    if !w.is_multiple_of(4)
+        || !h.is_multiple_of(4)
+        || px0 > opsin.xsize().saturating_sub(w)
+        || py0 > opsin.ysize().saturating_sub(h)
+    {
+        return if CHROMA {
+            crate::ac_strategy::gradient_region_stats_with_chroma_scalar(opsin, px0, py0, w, h, eps)
+        } else {
+            crate::ac_strategy::gradient_region_stats_scalar(opsin, px0, py0, w, h, eps)
+        };
+    }
+
+    let xs = opsin.xsize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256];
+    let mut within = 0.0f32;
+    let mut chroma = vdupq_n_f32(0.0);
+    const ONE_OVER_16: f32 = 1.0 / 16.0;
+
+    let row_start = py0 * xs;
+    let row_end = (py0 + h) * xs;
+    let x_rows = &opsin.plane_data(0)[row_start..row_end];
+    let y_rows = &opsin.plane_data(1)[row_start..row_end];
+    let b_rows = &opsin.plane_data(2)[row_start..row_end];
+    for (mean_row, ((y_rows4, x_rows4), b_rows4)) in means[..cw * ch].chunks_exact_mut(cw).zip(
+        y_rows
+            .chunks_exact(xs * 4)
+            .zip(x_rows.chunks_exact(xs * 4))
+            .zip(b_rows.chunks_exact(xs * 4)),
+    ) {
+        for (cx, mean) in mean_row.iter_mut().enumerate() {
+            let mut sum = vdupq_n_f32(0.0);
+            let mut sum2 = vdupq_n_f32(0.0);
+            if CHROMA {
+                for ((y_row, x_row), b_row) in y_rows4
+                    .chunks_exact(xs)
+                    .zip(x_rows4.chunks_exact(xs))
+                    .zip(b_rows4.chunks_exact(xs))
+                {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let x4 = &x_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let b4 = &b_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { vld1q_f32(y4.as_ptr()) };
+                    let xv = unsafe { vld1q_f32(x4.as_ptr()) };
+                    let bv = unsafe { vld1q_f32(b4.as_ptr()) };
+                    sum = vaddq_f32(sum, yv);
+                    sum2 = vfmaq_f32(sum2, yv, yv);
+                    chroma = vaddq_f32(chroma, vaddq_f32(vabsq_f32(xv), vabdq_f32(bv, yv)));
+                }
+            } else {
+                for y_row in y_rows4.chunks_exact(xs) {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { vld1q_f32(y4.as_ptr()) };
+                    sum = vaddq_f32(sum, yv);
+                    sum2 = vfmaq_f32(sum2, yv, yv);
+                }
+            }
+            let m = vaddvq_f32(sum) * ONE_OVER_16;
+            *mean = m;
+            within += (vaddvq_f32(sum2) * ONE_OVER_16 - m * m).max(0.0);
+        }
+    }
+
+    crate::ac_strategy::finish_gradient_region_stats(
+        &means[..cw * ch],
+        within,
+        if CHROMA { vaddvq_f32(chroma) } else { 0.0 },
+        w * h,
+        eps,
+    )
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn gradient_region_stats_neon(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<false>(opsin, px0, py0, w, h, eps)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn gradient_region_stats_with_chroma_neon(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<true>(opsin, px0, py0, w, h, eps)
+}
+
 /// NEON implementation of `sse_and_rate_scalar`.
 ///
 /// # Safety
@@ -199,9 +305,7 @@ pub(crate) fn neon_log2p1_f32(x: float32x4_t) -> float32x4_t {
     p = vfmaq_f32(c1, t, p);
     p = vfmaq_f32(c0, t, p);
 
-    let log2_m = vmulq_f32(t, p);
-
-    vaddq_f32(e, log2_m)
+    vfmaq_f32(e, t, p)
 }
 
 #[cfg(test)]

@@ -39,6 +39,115 @@ fn hsum4(v: v128) -> f32 {
         + f32x4_extract_lane::<3>(v)
 }
 
+#[target_feature(enable = "simd128")]
+fn gradient_region_stats_impl<const CHROMA: bool>(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    if !w.is_multiple_of(4)
+        || !h.is_multiple_of(4)
+        || px0 > opsin.xsize().saturating_sub(w)
+        || py0 > opsin.ysize().saturating_sub(h)
+    {
+        return if CHROMA {
+            crate::ac_strategy::gradient_region_stats_with_chroma_scalar(opsin, px0, py0, w, h, eps)
+        } else {
+            crate::ac_strategy::gradient_region_stats_scalar(opsin, px0, py0, w, h, eps)
+        };
+    }
+
+    let xs = opsin.xsize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256];
+    let mut within = 0.0f32;
+    let mut chroma = f32x4_splat(0.0);
+    const ONE_OVER_16: f32 = 1.0 / 16.0;
+
+    let row_start = py0 * xs;
+    let row_end = (py0 + h) * xs;
+    let x_rows = &opsin.plane_data(0)[row_start..row_end];
+    let y_rows = &opsin.plane_data(1)[row_start..row_end];
+    let b_rows = &opsin.plane_data(2)[row_start..row_end];
+    for (mean_row, ((y_rows4, x_rows4), b_rows4)) in means[..cw * ch].chunks_exact_mut(cw).zip(
+        y_rows
+            .chunks_exact(xs * 4)
+            .zip(x_rows.chunks_exact(xs * 4))
+            .zip(b_rows.chunks_exact(xs * 4)),
+    ) {
+        for (cx, mean) in mean_row.iter_mut().enumerate() {
+            let mut sum = f32x4_splat(0.0);
+            let mut sum2 = f32x4_splat(0.0);
+            if CHROMA {
+                for ((y_row, x_row), b_row) in y_rows4
+                    .chunks_exact(xs)
+                    .zip(x_rows4.chunks_exact(xs))
+                    .zip(b_rows4.chunks_exact(xs))
+                {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let x4 = &x_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let b4 = &b_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { v128_load(y4.as_ptr().cast()) };
+                    let xv = unsafe { v128_load(x4.as_ptr().cast()) };
+                    let bv = unsafe { v128_load(b4.as_ptr().cast()) };
+                    sum = f32x4_add(sum, yv);
+                    sum2 = f32x4_add(sum2, f32x4_mul(yv, yv));
+                    chroma = f32x4_add(
+                        chroma,
+                        f32x4_add(f32x4_abs(xv), f32x4_abs(f32x4_sub(bv, yv))),
+                    );
+                }
+            } else {
+                for y_row in y_rows4.chunks_exact(xs) {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { v128_load(y4.as_ptr().cast()) };
+                    sum = f32x4_add(sum, yv);
+                    sum2 = f32x4_add(sum2, f32x4_mul(yv, yv));
+                }
+            }
+            let m = hsum4(sum) * ONE_OVER_16;
+            *mean = m;
+            within += (hsum4(sum2) * ONE_OVER_16 - m * m).max(0.0);
+        }
+    }
+
+    crate::ac_strategy::finish_gradient_region_stats(
+        &means[..cw * ch],
+        within,
+        if CHROMA { hsum4(chroma) } else { 0.0 },
+        w * h,
+        eps,
+    )
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn gradient_region_stats_wasm(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<false>(opsin, px0, py0, w, h, eps)
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn gradient_region_stats_with_chroma_wasm(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<true>(opsin, px0, py0, w, h, eps)
+}
+
 /// WASM SIMD128 implementation of `sse_and_rate_scalar`.
 ///
 /// # Safety

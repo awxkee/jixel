@@ -42,6 +42,115 @@ fn hsum(v: __m128) -> f32 {
     _mm_cvtss_f32(sums)
 }
 
+#[target_feature(enable = "sse4.1")]
+fn gradient_region_stats_impl<const CHROMA: bool>(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    if !w.is_multiple_of(4)
+        || !h.is_multiple_of(4)
+        || px0 > opsin.xsize().saturating_sub(w)
+        || py0 > opsin.ysize().saturating_sub(h)
+    {
+        return if CHROMA {
+            crate::ac_strategy::gradient_region_stats_with_chroma_scalar(opsin, px0, py0, w, h, eps)
+        } else {
+            crate::ac_strategy::gradient_region_stats_scalar(opsin, px0, py0, w, h, eps)
+        };
+    }
+
+    let xs = opsin.xsize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256];
+    let mut within = 0.0f32;
+    let mut chroma = _mm_setzero_ps();
+    let sign = _mm_set1_ps(-0.0);
+    const ONE_OVER_16: f32 = 1.0 / 16.0;
+
+    let row_start = py0 * xs;
+    let row_end = (py0 + h) * xs;
+    let x_rows = &opsin.plane_data(0)[row_start..row_end];
+    let y_rows = &opsin.plane_data(1)[row_start..row_end];
+    let b_rows = &opsin.plane_data(2)[row_start..row_end];
+    for (mean_row, ((y_rows4, x_rows4), b_rows4)) in means[..cw * ch].chunks_exact_mut(cw).zip(
+        y_rows
+            .chunks_exact(xs * 4)
+            .zip(x_rows.chunks_exact(xs * 4))
+            .zip(b_rows.chunks_exact(xs * 4)),
+    ) {
+        for (cx, mean) in mean_row.iter_mut().enumerate() {
+            let mut sum = _mm_setzero_ps();
+            let mut sum2 = _mm_setzero_ps();
+            if CHROMA {
+                for ((y_row, x_row), b_row) in y_rows4
+                    .chunks_exact(xs)
+                    .zip(x_rows4.chunks_exact(xs))
+                    .zip(b_rows4.chunks_exact(xs))
+                {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let x4 = &x_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let b4 = &b_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { _mm_loadu_ps(y4.as_ptr()) };
+                    let xv = unsafe { _mm_loadu_ps(x4.as_ptr()) };
+                    let bv = unsafe { _mm_loadu_ps(b4.as_ptr()) };
+                    sum = _mm_add_ps(sum, yv);
+                    sum2 = _mm_add_ps(sum2, _mm_mul_ps(yv, yv));
+                    let xa = _mm_andnot_ps(sign, xv);
+                    let bya = _mm_andnot_ps(sign, _mm_sub_ps(bv, yv));
+                    chroma = _mm_add_ps(chroma, _mm_add_ps(xa, bya));
+                }
+            } else {
+                for y_row in y_rows4.chunks_exact(xs) {
+                    let y4 = &y_row[px0..px0 + w].as_chunks::<4>().0[cx];
+                    let yv = unsafe { _mm_loadu_ps(y4.as_ptr()) };
+                    sum = _mm_add_ps(sum, yv);
+                    sum2 = _mm_add_ps(sum2, _mm_mul_ps(yv, yv));
+                }
+            }
+            let m = hsum(sum) * ONE_OVER_16;
+            *mean = m;
+            within += (hsum(sum2) * ONE_OVER_16 - m * m).max(0.0);
+        }
+    }
+
+    crate::ac_strategy::finish_gradient_region_stats(
+        &means[..cw * ch],
+        within,
+        if CHROMA { hsum(chroma) } else { 0.0 },
+        w * h,
+        eps,
+    )
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn gradient_region_stats_sse41(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<false>(opsin, px0, py0, w, h, eps)
+}
+
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn gradient_region_stats_with_chroma_sse41(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<true>(opsin, px0, py0, w, h, eps)
+}
+
 /// SSE4.1 implementation of `sse_and_rate_scalar`.
 ///
 /// # Safety

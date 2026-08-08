@@ -41,8 +41,132 @@ pub(crate) fn hsum256(v: __m256) -> f32 {
     _mm_cvtss_f32(sums)
 }
 
-/// AVX2+FMA implementation matching the updated NEON approximation path.
-///
+#[inline]
+#[target_feature(enable = "avx")]
+fn hsum128(v: __m128) -> f32 {
+    let shuf = _mm_movehdup_ps(v);
+    let sums = _mm_add_ps(v, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+#[target_feature(enable = "avx2,fma")]
+fn gradient_region_stats_impl<const CHROMA: bool>(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    if !w.is_multiple_of(8)
+        || !h.is_multiple_of(4)
+        || px0 > opsin.xsize().saturating_sub(w)
+        || py0 > opsin.ysize().saturating_sub(h)
+    {
+        return if CHROMA {
+            crate::ac_strategy::gradient_region_stats_with_chroma_scalar(opsin, px0, py0, w, h, eps)
+        } else {
+            crate::ac_strategy::gradient_region_stats_scalar(opsin, px0, py0, w, h, eps)
+        };
+    }
+
+    let xs = opsin.xsize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256];
+    let mut within = 0.0f32;
+    let mut chroma = _mm256_setzero_ps();
+    const ONE_OVER_16: f32 = 1.0 / 16.0;
+    let sign = _mm256_set1_ps(-0.0);
+
+    let row_start = py0 * xs;
+    let row_end = (py0 + h) * xs;
+    let x_rows = &opsin.plane_data(0)[row_start..row_end];
+    let y_rows = &opsin.plane_data(1)[row_start..row_end];
+    let b_rows = &opsin.plane_data(2)[row_start..row_end];
+    for (mean_row, ((y_rows4, x_rows4), b_rows4)) in means[..cw * ch].chunks_exact_mut(cw).zip(
+        y_rows
+            .chunks_exact(xs * 4)
+            .zip(x_rows.chunks_exact(xs * 4))
+            .zip(b_rows.chunks_exact(xs * 4)),
+    ) {
+        for (cx, mean_pair) in mean_row.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let mut sum = _mm256_setzero_ps();
+            let mut sum2 = _mm256_setzero_ps();
+            if CHROMA {
+                for ((y_row, x_row), b_row) in y_rows4
+                    .chunks_exact(xs)
+                    .zip(x_rows4.chunks_exact(xs))
+                    .zip(b_rows4.chunks_exact(xs))
+                {
+                    let y8 = &y_row[px0..px0 + w].as_chunks::<8>().0[cx];
+                    let x8 = &x_row[px0..px0 + w].as_chunks::<8>().0[cx];
+                    let b8 = &b_row[px0..px0 + w].as_chunks::<8>().0[cx];
+                    let yv = unsafe { _mm256_loadu_ps(y8.as_ptr()) };
+                    let xv = unsafe { _mm256_loadu_ps(x8.as_ptr()) };
+                    let bv = unsafe { _mm256_loadu_ps(b8.as_ptr()) };
+                    sum = _mm256_add_ps(sum, yv);
+                    sum2 = _mm256_fmadd_ps(yv, yv, sum2);
+                    let xa = _mm256_andnot_ps(sign, xv);
+                    let bya = _mm256_andnot_ps(sign, _mm256_sub_ps(bv, yv));
+                    chroma = _mm256_add_ps(chroma, _mm256_add_ps(xa, bya));
+                }
+            } else {
+                for y_row in y_rows4.chunks_exact(xs) {
+                    let y8 = &y_row[px0..px0 + w].as_chunks::<8>().0[cx];
+                    let yv = unsafe { _mm256_loadu_ps(y8.as_ptr()) };
+                    sum = _mm256_add_ps(sum, yv);
+                    sum2 = _mm256_fmadd_ps(yv, yv, sum2);
+                }
+            }
+            let sum_lo = _mm256_castps256_ps128(sum);
+            let sum_hi = _mm256_extractf128_ps::<1>(sum);
+            let sum2_lo = _mm256_castps256_ps128(sum2);
+            let sum2_hi = _mm256_extractf128_ps::<1>(sum2);
+            let m0 = hsum128(sum_lo) * ONE_OVER_16;
+            let m1 = hsum128(sum_hi) * ONE_OVER_16;
+            *mean_pair = [m0, m1];
+            within += (hsum128(sum2_lo) * ONE_OVER_16 - m0 * m0).max(0.0);
+            within += (hsum128(sum2_hi) * ONE_OVER_16 - m1 * m1).max(0.0);
+        }
+    }
+
+    crate::ac_strategy::finish_gradient_region_stats(
+        &means[..cw * ch],
+        within,
+        if CHROMA { hsum256(chroma) } else { 0.0 },
+        w * h,
+        eps,
+    )
+}
+
+/// AVX2+FMA region statistics for the luma-only merge-risk path.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn gradient_region_stats_avx2(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<false>(opsin, px0, py0, w, h, eps)
+}
+
+/// AVX2+FMA region statistics including XYB chroma activity.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn gradient_region_stats_with_chroma_avx2(
+    opsin: &crate::image::Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> crate::ac_strategy::GradientRegionStats {
+    gradient_region_stats_impl::<true>(opsin, px0, py0, w, h, eps)
+}
+
 /// # Safety
 /// Caller must ensure `avx2` and `fma` are available.
 #[allow(clippy::too_many_arguments)]
@@ -231,9 +355,7 @@ pub(crate) fn avx2_log2p1_f32(x: __m256) -> __m256 {
     p = _mm256_fmadd_ps(t, p, c1);
     p = _mm256_fmadd_ps(t, p, c0);
 
-    let log2_m = _mm256_mul_ps(t, p);
-
-    _mm256_add_ps(e, log2_m)
+    _mm256_fmadd_ps(t, p, e)
 }
 
 #[cfg(test)]
