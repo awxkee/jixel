@@ -36,7 +36,7 @@ use crate::color_correlation::choose_ytob_dc;
 use crate::dc_group_data::{
     DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, is_sub8_strategy,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, is_sub8_strategy,
 };
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
@@ -1059,13 +1059,14 @@ fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
         STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
         STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
         STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
+        STRATEGY_DCT64X64 => 7,
         _ => return None,
     })
 }
 
 /// Slots whose transform actually appears in the frame.
-fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 7] {
-    let mut used = [false; 7];
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 8] {
+    let mut used = [false; 8];
     for dc in dc_datas {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
@@ -1078,17 +1079,17 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 7] {
 
 fn write_dequant_matrices(
     matrices: &crate::quant_weights::DequantMatrices,
-    used: &[bool; 7],
+    used: &[bool; 8],
     w: &mut BitWriter,
 ) {
-    use crate::quant_weights::f32_to_f16_bits;
+    use crate::util::f32_to_f16_bits;
     // A table only earns its header if the frame actually uses the transform.
     let table = |slot: usize| -> Option<&crate::quant_weights::BandOverride> {
         used[slot]
             .then(|| matrices.custom_tables[slot].as_ref())
             .flatten()
     };
-    if (0..7).all(|slot| table(slot).is_none()) {
+    if (0..8).all(|slot| table(slot).is_none()) {
         w.write(1, 1); // all_default
         return;
     }
@@ -1110,6 +1111,7 @@ fn write_dequant_matrices(
             6 => table(3),            // DCT8X16 (= DCT16X8)
             8 => table(4),            // DCT16X32 (= DCT32X16)
             TABLE_DCT4X8 => table(5), // DCT4X8 (= DCT8X4)
+            11 => table(7),           // DCT64X64
             12 => table(6),           // DCT32X64 (= DCT64X32)
             _ => None,
         };
@@ -1138,7 +1140,7 @@ fn write_dequant_matrices(
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
-    used_quant_tables: &[bool; 7],
+    used_quant_tables: &[bool; 8],
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
@@ -1228,6 +1230,7 @@ pub(crate) fn encode_frame(
     scratch: &mut CoderScratch,
     distance: f32,
     linear: &Image3F,
+    is_achromatic: bool,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
@@ -1235,6 +1238,9 @@ pub(crate) fn encode_frame(
 ) {
     let distp = compute_distance_params(distance);
     let mut xyb = to_xyb_image(ctx, scratch, linear);
+    if is_achromatic {
+        snap_achromatic_xyb(&mut xyb);
+    }
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
@@ -1399,6 +1405,18 @@ const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
 /// content (every occurrence inherits the atlas error) and the plateau is
 /// [0.3, 0.5), so 0.45 sits at the rate-optimal edge with measured margin.
 const ATLAS_DISTANCE_SCALE: f32 = 0.45;
+
+/// Every opsin row sums to 1, so achromatic input gives L = M = S and hence
+/// X = 0, B = Y — but only up to f32 rounding, since the three mixes are
+/// evaluated with different constants. Snap the planes exact so chroma
+/// quantizes to pure zeros and the CfL fit sees slope 0/1 instead of noise.
+fn snap_achromatic_xyb(xyb: &mut Image3F) {
+    for y in 0..xyb.ysize() {
+        let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
+        x_row.fill(0.0);
+        b_row.copy_from_slice(y_row);
+    }
+}
 
 fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, linear: &Image3F) -> Image3F {
     let mut xyb = Image3F::new(linear.xsize(), linear.ysize());

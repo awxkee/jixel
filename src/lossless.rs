@@ -1202,7 +1202,8 @@ pub(crate) fn encode_modular_xyb_atlas(
     if lattice_scale == 1 {
         section.write(1, 1); // dc_quant all_default = 1
     } else {
-        use crate::quant_weights::{INV_DC_QUANT, f32_to_f16_bits};
+        use crate::quant_weights::INV_DC_QUANT;
+        use crate::util::f32_to_f16_bits;
         section.write(1, 0);
         for c in 0..3 {
             let step_x128 = 128.0 / (INV_DC_QUANT[c] * lattice_scale as f32);

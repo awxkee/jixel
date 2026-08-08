@@ -177,9 +177,6 @@ fn rdoq_block(
         .len()
         .min(covered_blocks + (24 * covered_blocks).min(64));
     let window_len = search_end - covered_blocks;
-    if window_len == 0 {
-        return;
-    }
 
     let block_ctx = fine_block_context(c, strategy_code, qf_hi);
     let histo_offset = fine_zero_density_contexts_offset(block_ctx);
@@ -237,7 +234,8 @@ fn rdoq_block(
         let k = covered_blocks + window_index;
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
-        let distortion_weight = rdoq_distortion_weight(window_index, window_len, distance);
+        let distortion_weight = crate::inflated_cost::CHANNEL_WEIGHT[c]
+            * rdoq_distortion_weight(window_index, window_len, distance);
         let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
         // Distortion against what the decoder actually reconstructs (the biased
         // dequant: +-1 -> +-0.9299, q -> q - 0.145/q), not the raw integer level.
@@ -636,6 +634,11 @@ pub(crate) fn quantize_block_ac_scalar(
         }
     }
 }
+
+/// Chroma (X/B) RDOQ opens at the SS2 quant tier: below it the trellis
+/// regresses Kodak HQ BD at every lambda tried (+0.27% unweighted, +0.39%
+/// channel-weighted), above it the channel-weighted form wins −0.137%.
+pub(crate) const CHROMA_RDOQ_MIN_DISTANCE: f32 = 2.25;
 
 pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
 pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
@@ -1208,6 +1211,40 @@ pub(crate) fn write_ac_group(
                 cy,
                 &mut quantized[0][..size],
             );
+            // Chroma RDOQ (review §8): the trellis is channel-generic — the
+            // CfL residuals are the source, contexts/prices/orders are
+            // channel-specific, and unlike Y the input coefficients are not
+            // overwritten afterwards. Mid-band only: with CHANNEL_WEIGHT'd
+            // distortion it reads −0.137% Kodak BD at d≥2.5 but +0.39% at
+            // d=1-2.2 (HQ chroma coefficients are precious — same story as
+            // the deadzone/flat-B studies), so it opens at the SS2 tier.
+            if distance >= CHROMA_RDOQ_MIN_DISTANCE
+                && let Some(prices) = rdoq_prices
+            {
+                let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                let nzero_map = &num_nzeros[0];
+                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
+                let predicted =
+                    predict_from_top_and_left(row_top, nzero_map.plane_row(0, nz_by), bx, 32);
+                rdoq_block(
+                    prices,
+                    coeff_orders.scan_for(strategy_code, 0),
+                    &coeffs[0][..size],
+                    inv_qm_x,
+                    quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                    &mut quantized[0][..size],
+                    raw_strategy,
+                    strategy_code,
+                    0,
+                    predicted,
+                    cx,
+                    cy,
+                    distance,
+                    quant_ac as u32 > qf_threshold,
+                    rdoq_choices,
+                    rdoq_costs,
+                );
+            }
             let row_stride = cx * 8;
             if measure_chroma_distortion {
                 let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
@@ -1267,6 +1304,33 @@ pub(crate) fn write_ac_group(
                 cy,
                 &mut quantized[2][..size],
             );
+            if distance >= CHROMA_RDOQ_MIN_DISTANCE
+                && let Some(prices) = rdoq_prices
+            {
+                let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                let nzero_map = &num_nzeros[0];
+                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
+                let predicted =
+                    predict_from_top_and_left(row_top, nzero_map.plane_row(2, nz_by), bx, 32);
+                rdoq_block(
+                    prices,
+                    coeff_orders.scan_for(strategy_code, 2),
+                    &coeffs[2][..size],
+                    inv_qm_b,
+                    quantize_ac_q_scaled(quant_ac, scale, crate::frame::b_qm_mul()),
+                    &mut quantized[2][..size],
+                    raw_strategy,
+                    strategy_code,
+                    2,
+                    predicted,
+                    cx,
+                    cy,
+                    distance,
+                    quant_ac as u32 > qf_threshold,
+                    rdoq_choices,
+                    rdoq_costs,
+                );
+            }
             if measure_chroma_distortion {
                 let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, crate::frame::b_qm_mul());
                 for i in 0..size {

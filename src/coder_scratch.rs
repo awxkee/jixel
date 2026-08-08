@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::ac_strategy::{Chosen32Cost, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -144,11 +145,17 @@ pub(crate) struct RerankDowngrade {
     pub(crate) by: usize,
     pub(crate) cov_x: usize,
     pub(crate) cov_y: usize,
+    /// Layout to install over the footprint: strategy per (iy*4 + ix) offset,
+    /// 0xFF = covered by a preceding first block. The all-DCT8 fallback is a
+    /// grid of STRATEGY_DCT at every offset.
+    pub(crate) restore: [u8; 16],
 }
 
 pub(crate) struct AcStrategyBandScratch {
     pub(crate) strategy: AcStrategyImage,
     pub(crate) benefit: f32,
+    pub(crate) chosen32: Vec<Chosen32Cost>,
+    pub(crate) saved_children: Vec<SavedChild>,
     pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
@@ -159,6 +166,8 @@ impl Default for AcStrategyBandScratch {
         Self {
             strategy: AcStrategyImage::new(0, 0),
             benefit: 0.0,
+            chosen32: Vec::new(),
+            saved_children: Vec::new(),
             rerank_downgrades: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
@@ -178,6 +187,8 @@ impl AcStrategyBandScratch {
 
     fn clear(&mut self) {
         self.benefit = 0.0;
+        self.chosen32.clear();
+        self.saved_children.clear();
         self.rerank_downgrades.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
@@ -207,6 +218,10 @@ pub(crate) struct AcStrategyPipelineScratch {
     pub(crate) bands: Vec<(usize, usize)>,
     pub(crate) band_scratch: Vec<AcStrategyBandScratch>,
     pub(crate) current_costs: Vec<f32>,
+    /// Full-image grid of committed 32x32-quadrant selection costs (indexed
+    /// `(by/4)*qx + bx/4`), NaN where the quadrant never went through the
+    /// 32-level selection path.
+    pub(crate) chosen32_grid: Vec<f32>,
 }
 
 impl AcStrategyPipelineScratch {
@@ -349,7 +364,7 @@ mod tests {
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
-        assert!(size_of::<CoderScratch>() <= 1024);
+        assert!(size_of::<CoderScratch>() <= 1056);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);

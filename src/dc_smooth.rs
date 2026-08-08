@@ -64,6 +64,7 @@ struct Shared<'a> {
     quant: [*mut i16; 3],
     cache: *mut f32,
     active: *mut bool,
+    movable: [bool; 3],
 }
 
 unsafe impl Sync for Shared<'_> {}
@@ -212,6 +213,9 @@ unsafe fn sweep_band(sh: &Shared, y0: usize, y1: usize, touched: &mut Vec<u32>) 
                 }
                 let mut before = window_cache_sum(sh, x, y);
                 for c in 0..3 {
+                    if !sh.movable[c] {
+                        continue;
+                    }
                     let qp = sh.quant[c].add(y * w + x);
                     // Try both directions; keep the better if it improves.
                     let mut best_delta = 0i16;
@@ -304,6 +308,11 @@ pub(crate) fn optimize_dc_rounding(
     }
     let mut cache = vec![0.0f32; w * h];
     let mut active = vec![false; w * h];
+    let movable = [
+        quant[0].iter().any(|&v| v != 0),
+        true,
+        quant[2].iter().any(|&v| v != 0),
+    ];
 
     let sh = Shared {
         w,
@@ -328,6 +337,7 @@ pub(crate) fn optimize_dc_rounding(
         ],
         cache: cache.as_mut_ptr(),
         active: active.as_mut_ptr(),
+        movable,
     };
 
     // SAFETY: single-threaded initialization through the freshly created
@@ -474,6 +484,7 @@ mod tests {
             quant: [std::ptr::null_mut(); 3],
             cache: std::ptr::null_mut(),
             active: std::ptr::null_mut(),
+            movable: [true; 3],
         };
         let mut sum = 0.0f32;
         for y in 0..h {
