@@ -1820,6 +1820,7 @@ fn encode_with_context(
         scratch,
         distance,
         input,
+        config.grayscale,
         config.alpha.as_ref(),
         &coeff_shifts,
         config.patches,

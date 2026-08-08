@@ -1230,6 +1230,7 @@ pub(crate) fn encode_frame(
     scratch: &mut CoderScratch,
     distance: f32,
     linear: &Image3F,
+    is_achromatic: bool,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
@@ -1237,6 +1238,9 @@ pub(crate) fn encode_frame(
 ) {
     let distp = compute_distance_params(distance);
     let mut xyb = to_xyb_image(ctx, scratch, linear);
+    if is_achromatic {
+        snap_achromatic_xyb(&mut xyb);
+    }
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
@@ -1401,6 +1405,18 @@ const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
 /// content (every occurrence inherits the atlas error) and the plateau is
 /// [0.3, 0.5), so 0.45 sits at the rate-optimal edge with measured margin.
 const ATLAS_DISTANCE_SCALE: f32 = 0.45;
+
+/// Every opsin row sums to 1, so achromatic input gives L = M = S and hence
+/// X = 0, B = Y — but only up to f32 rounding, since the three mixes are
+/// evaluated with different constants. Snap the planes exact so chroma
+/// quantizes to pure zeros and the CfL fit sees slope 0/1 instead of noise.
+fn snap_achromatic_xyb(xyb: &mut Image3F) {
+    for y in 0..xyb.ysize() {
+        let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
+        x_row.fill(0.0);
+        b_row.copy_from_slice(y_row);
+    }
+}
 
 fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, linear: &Image3F) -> Image3F {
     let mut xyb = Image3F::new(linear.xsize(), linear.ysize());

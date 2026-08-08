@@ -298,7 +298,7 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
 /// `ORDER_SPECS[i]`, three scan tables (one per channel) mapping scan position
 /// to raw coefficient index — the same convention as `K_COEFF_ORDER_*`.
 pub(crate) struct CoeffOrders {
-    /// Bit `order_index` set means that group is signalled and must be used.
+    /// Bit `order_index` set means that group is signaled and must be used.
     pub(crate) used_mask: u16,
     pub(crate) orders: [[Vec<u32>; 3]; ORDER_SPECS.len()],
 }
@@ -339,7 +339,7 @@ impl CoeffOrders {
     }
 }
 
-/// Write the `used_orders` field and, when any group is signalled, the shared
+/// Write the `used_orders` field and, when any group is signaled, the shared
 /// entropy code plus every group's permutation tokens.
 pub(crate) fn write_coeff_orders(
     orders: &CoeffOrders,
