@@ -28,8 +28,8 @@
  */
 
 use crate::dct::{
-    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
-    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32, WC64,
+    DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
+    RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
@@ -756,21 +756,81 @@ pub(crate) fn dct32x32_neon(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
 #[inline]
 #[target_feature(enable = "neon")]
 fn dct1d_64_s(c: &mut [float32x4_t; 64]) {
-    let mut evens = [c[0]; 32];
-    let mut odds = [c[0]; 32];
-    for i in 0..32 {
-        evens[i] = vaddq_f32(c[i], c[63 - i]);
-        odds[i] = vmulq_n_f32(vsubq_f32(c[i], c[63 - i]), WC64[i]);
+    // Split-radix decomposition from pxdct. Each four-value symmetry group is
+    // overwritten in place, so this needs no 32-vector even/odd temporaries.
+    for i in 0..16 {
+        let bottom = c[i];
+        let top = c[63 - i];
+        let half_bottom = c[31 - i];
+        let half_top = c[32 + i];
+        let lower = vsubq_f32(bottom, top);
+        let upper = vsubq_f32(half_bottom, half_top);
+
+        c[i] = vaddq_f32(bottom, top);
+        c[31 - i] = vaddq_f32(half_bottom, half_top);
+        c[32 + i] = vfmaq_n_f32(
+            vmulq_n_f32(lower, DCT64_SPLIT_COS[i]),
+            upper,
+            DCT64_SPLIT_SIN[i],
+        );
+        let sin = vfmsq_n_f32(
+            vmulq_n_f32(upper, DCT64_SPLIT_COS[i]),
+            lower,
+            DCT64_SPLIT_SIN[i],
+        );
+        c[63 - i] = if i & 1 == 0 { sin } else { vnegq_f32(sin) };
     }
-    dct1d_32_s(&mut evens);
-    dct1d_32_s(&mut odds);
-    odds[0] = vfmaq_n_f32(odds[1], odds[0], std::f32::consts::SQRT_2);
-    for i in 1..31 {
-        odds[i] = vaddq_f32(odds[i], odds[i + 1]);
+
+    dct1d_32_s(<&mut [float32x4_t; 32]>::try_from(&mut c[..32]).unwrap());
+    dct1d_16_s(<&mut [float32x4_t; 16]>::try_from(&mut c[32..48]).unwrap());
+    dct1d_16_s(<&mut [float32x4_t; 16]>::try_from(&mut c[48..]).unwrap());
+
+    for i in 1..16 {
+        let cos = c[32 + i];
+        let sin = if i & 1 == 0 {
+            vnegq_f32(c[64 - i])
+        } else {
+            c[64 - i]
+        };
+        c[32 + i] = vaddq_f32(cos, sin);
+        c[64 - i] = vsubq_f32(cos, sin);
     }
-    for i in 0..32 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
+    // jixel's DCT convention scales every AC coefficient by sqrt(2), while
+    // pxdct's split-radix butterflies leave the DC of each inner DCT unscaled.
+    c[32] = vmulq_n_f32(c[32], std::f32::consts::SQRT_2);
+    c[48] = vmulq_n_f32(c[48], -std::f32::consts::SQRT_2);
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct64_store_transposed4(
+    dst: *mut f32,
+    column: usize,
+    frequency: usize,
+    values: [float32x4_t; 4],
+) {
+    let (a, b, c, d) = transpose_4x4(values[0], values[1], values[2], values[3]);
+    for (lane, value) in [a, b, c, d].iter().enumerate() {
+        unsafe { vst1q_f32(dst.add((column + lane) * 64 + frequency), *value) };
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct64_store4(
+    dst: *mut f32,
+    stride: usize,
+    frequency: usize,
+    values: [float32x4_t; 4],
+    scale: f32,
+) {
+    for (offset, value) in values.iter().enumerate() {
+        unsafe {
+            vst1q_f32(
+                dst.add((frequency + offset) * stride),
+                vmulq_n_f32(*value, scale),
+            )
+        };
     }
 }
 
@@ -782,17 +842,16 @@ pub(crate) fn dct64x64_neon(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
         let mut c: [float32x4_t; 64] =
             std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
         dct1d_64_s(&mut c);
-        for tile_index in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(
-                c[tile_index * 4],
-                c[tile_index * 4 + 1],
-                c[tile_index * 4 + 2],
-                c[tile_index * 4 + 3],
-            );
-            for (lane, value) in [a, b, cc, d].iter().enumerate() {
-                unsafe { vst1q_f32(dst.add((strip * 4 + lane) * 64 + tile_index * 4), *value) };
-            }
+        dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
+        for group in 1..15 {
+            dct64_store_transposed4(
+                dst,
+                strip * 4,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+            )
         }
+        dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = 1.0 / 4096.0;
@@ -801,10 +860,18 @@ pub(crate) fn dct64x64_neon(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
             load_strip(unsafe { scratch.get_unchecked(column * 64 + strip * 4..) }.as_ptr())
         });
         dct1d_64_s(&mut c);
-        for u in 0..64 {
-            let p = unsafe { output.get_unchecked_mut(u * 64 + strip * 4..) };
-            unsafe { vst1q_f32(p.as_mut_ptr(), vmulq_n_f32(c[u], scale)) };
+        let dst = unsafe { output.as_mut_ptr().add(strip * 4) };
+        dct64_store4(dst, 64, 0, [c[0], c[32], c[1], c[33]], scale);
+        for group in 1..15 {
+            dct64_store4(
+                dst,
+                64,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                scale,
+            )
         }
+        dct64_store4(dst, 64, 60, [c[30], c[49], c[31], c[48]], scale);
     }
 }
 
@@ -816,17 +883,16 @@ pub(crate) fn dct64x32_neon(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048
         let mut c: [float32x4_t; 64] =
             std::array::from_fn(|row| load_strip(input.row(row)[strip * 4..].as_ptr()));
         dct1d_64_s(&mut c);
-        for tile_index in 0..16 {
-            let (a, b, cc, d) = transpose_4x4(
-                c[tile_index * 4],
-                c[tile_index * 4 + 1],
-                c[tile_index * 4 + 2],
-                c[tile_index * 4 + 3],
-            );
-            for (lane, value) in [a, b, cc, d].iter().enumerate() {
-                unsafe { vst1q_f32(dst.add((strip * 4 + lane) * 64 + tile_index * 4), *value) };
-            }
+        dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
+        for group in 1..15 {
+            dct64_store_transposed4(
+                dst,
+                strip * 4,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+            )
         }
+        dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = 1.0 / 2048.0;
@@ -861,9 +927,35 @@ pub(crate) fn dct32x64_neon(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048
             c[column_tile * 4 + 3] = d;
         }
         dct1d_64_s(&mut c);
-        for u in 0..64 {
-            unsafe { vst1q_f32(dst.add(u * 32 + row_strip * 4), c[u]) };
+        unsafe {
+            dct64_store4(
+                dst.add(row_strip * 4),
+                32,
+                0,
+                [c[0], c[32], c[1], c[33]],
+                1.0,
+            )
+        };
+        for group in 1..15 {
+            unsafe {
+                dct64_store4(
+                    dst.add(row_strip * 4),
+                    32,
+                    group * 4,
+                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                    1.0,
+                )
+            };
         }
+        unsafe {
+            dct64_store4(
+                dst.add(row_strip * 4),
+                32,
+                60,
+                [c[30], c[49], c[31], c[48]],
+                1.0,
+            )
+        };
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = 1.0 / 2048.0;

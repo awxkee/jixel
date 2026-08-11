@@ -39,12 +39,16 @@ mod quantize_xyb;
 mod structure_aq;
 mod xyb;
 
-pub(crate) use ac_strategy::sse_and_rate_sse;
+pub(crate) use ac_strategy::{
+    gradient_region_stats_sse41, gradient_region_stats_with_chroma_sse41, sse_and_rate_sse,
+};
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
 pub(crate) use dark_aq::dark_structure_stats_sse41;
 pub(crate) use entropy::counts_bit_cost_sse41;
-pub(crate) use inflated_cost::{combine_error_sse41, error_gradient_energy_sse41};
+pub(crate) use inflated_cost::{
+    combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
+};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{
     apply_quant_field_gain_sse41, apply_structure_aq_sse41, quantize_block_ac_sse41,

@@ -269,8 +269,8 @@ pub(crate) struct CoderScratch {
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: LazyScratch<AcGroupScratch>,
-    pub(crate) transform_gather: LazyScratch<Box<[f32; 1024]>>,
-    pub(crate) strategy_coeffs: LazyScratch<HeapMatrix<f32, 3, 1024>>,
+    pub(crate) transform_gather: LazyScratch<Box<[f32; 4096]>>,
+    pub(crate) strategy_coeffs: LazyScratch<HeapMatrix<f32, 3, 4096>>,
     pub(crate) gradient: GradientScratch,
     pub(crate) order0_entropy: Vec<u64>,
     pub(crate) threshold: PickThresholdScratch,
@@ -399,6 +399,17 @@ mod tests {
         assert!(scratch.strategy_coeffs.value.is_none());
         assert!(scratch.dc_predictor.value.is_none());
         assert!(scratch.patch_tile_colors.value.is_none());
+    }
+
+    #[test]
+    fn strategy_scratch_covers_dct64_and_reuses_allocations() {
+        let mut scratch = CoderScratch::default();
+        let gather = scratch.transform_gather.as_mut_ptr();
+        let coeffs = scratch.strategy_coeffs[0].as_mut_ptr();
+        assert_eq!(scratch.transform_gather.len(), 4096);
+        assert_eq!(scratch.strategy_coeffs[0].len(), 4096);
+        assert_eq!(scratch.transform_gather.as_ptr(), gather);
+        assert_eq!(scratch.strategy_coeffs[0].as_ptr(), coeffs);
     }
 
     #[test]

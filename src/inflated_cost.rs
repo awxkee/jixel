@@ -445,11 +445,12 @@ pub(crate) type SsimDeficitFn = unsafe fn(&[f32], &[f32], usize, usize) -> f32;
 pub(crate) type PrepareReconstructionFn =
     unsafe fn(&Plane<f32>, usize, usize, usize, usize, &[f32], &mut [f32], &mut [f32]);
 pub(crate) type ErrorGradientEnergyFn = fn(&[f32], usize, usize) -> f32;
+pub(crate) type ErrorGradientPeakEnergyFn = fn(&[f32], &[f32], usize, usize, f32) -> f32;
 pub(crate) type CombineErrorFn = fn(&[f32], &[f32], f32, &mut [f32]);
 
 pub(crate) struct ReconQuantization<'a> {
     pub(crate) rate_log2_lut: &'a RateLog2Lut,
-    pub(crate) coeffs: &'a [[f32; 1024]; 3],
+    pub(crate) coeffs: [&'a [f32]; 3],
     pub(crate) inverse_matrices: [&'a [f32]; 3],
     pub(crate) qac: f32,
     pub(crate) qm_mult_x: f32,
@@ -471,7 +472,10 @@ pub(crate) struct ReconSource<'a> {
 pub(crate) struct ReconScoring {
     pub(crate) factor_x: f32,
     pub(crate) factor_b: f32,
-    pub(crate) banding: bool,
+    /// Spatial-error gradient weight used by transform reranking.
+    pub(crate) gradient_alpha: f32,
+    /// Peak-pooled spatial-error gradient weight used by transform reranking.
+    pub(crate) gradient_peak_alpha: f32,
 }
 
 pub(crate) struct ReconDistInput<'a> {
@@ -484,6 +488,7 @@ pub(crate) struct ReconDistInput<'a> {
 
 pub(crate) struct ReconErrorKernels {
     pub(crate) gradient_energy: ErrorGradientEnergyFn,
+    pub(crate) gradient_peak_energy: ErrorGradientPeakEnergyFn,
     pub(crate) combine: CombineErrorFn,
 }
 
@@ -576,6 +581,38 @@ pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
     error_gradient_energy_scalar
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
+    crate::wasm::error_gradient_peak_energy_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
+    |error, original, width, height, floor| unsafe {
+        crate::neon::error_gradient_peak_energy_neon(error, original, width, height, floor)
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |error, original, width, height, floor| unsafe {
+            crate::avx::error_gradient_peak_energy_avx2(error, original, width, height, floor)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |error, original, width, height, floor| unsafe {
+            crate::sse::error_gradient_peak_energy_sse41(error, original, width, height, floor)
+        };
+    }
+    error_gradient_peak_energy_scalar
+}
+
 pub(crate) fn select_recon_dist_and_rate_fn() -> ReconDistAndRateFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -617,6 +654,7 @@ pub(crate) fn recon_dist_and_rate_scalar(
 ) -> (f32, f32) {
     let error = ReconErrorKernels {
         gradient_energy: error_gradient_energy_scalar,
+        gradient_peak_energy: error_gradient_peak_energy_scalar,
         combine: combine_error_scalar,
     };
     recon_dist_and_rate_with_kernels(
@@ -630,10 +668,6 @@ pub(crate) fn recon_dist_and_rate_scalar(
         },
     )
 }
-
-/// Banding protection
-const BANDING_ALPHA: f32 = 46.5;
-const BANDING_MIN_D: f32 = 1.4;
 
 /// `sum((dx err)^2 + (dy err)^2)` over one channel's spatial error plane.
 #[allow(dead_code)]
@@ -662,6 +696,57 @@ pub(crate) fn error_gradient_energy_scalar(error: &[f32], width: usize, height: 
     grad
 }
 
+pub(crate) fn error_gradient_peak_energy_scalar(
+    error: &[f32],
+    original: &[f32],
+    width: usize,
+    height: usize,
+    floor: f32,
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n && original.len() >= n);
+    assert!(floor.is_finite() && floor >= 0.0);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    for cell_y in (0..height).step_by(4) {
+        for cell_x in (0..width).step_by(4) {
+            let mut max_x = 0.0f32;
+            let mut max_y = 0.0f32;
+            for y in cell_y..(cell_y + 4).min(height) {
+                for x in cell_x..(cell_x + 4).min(width) {
+                    let p = y * width + x;
+                    if x + 1 < width {
+                        let error_gradient = (error[p + 1] - error[p]).abs();
+                        let source_gradient = (original[p + 1] - original[p]).abs();
+                        let excess = (error_gradient - 0.5 * source_gradient - floor).max(0.0);
+                        max_x = max_x.max(excess * excess);
+                    }
+                    if y + 1 < height {
+                        let error_gradient = (error[p + width] - error[p]).abs();
+                        let source_gradient = (original[p + width] - original[p]).abs();
+                        let excess = (error_gradient - 0.5 * source_gradient - floor).max(0.0);
+                        max_y = max_y.max(excess * excess);
+                    }
+                }
+            }
+            total += max_x + max_y;
+        }
+    }
+    total
+}
+
+#[inline]
+fn gradient_peak_floor(distance: f32) -> f32 {
+    // Preserve the validated high-quality metric, then reject ordinary coarse
+    // quantization error more aggressively once the long tail engages.
+    let coarse_mix = ((distance - 1.9) / 0.1).clamp(0.0, 1.0);
+    distance * fmla(coarse_mix, 0.0045 - 0.0015, 0.0015)
+}
+
 pub(crate) fn recon_dist_and_rate_with_kernels(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
@@ -685,11 +770,18 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let py = source.y;
     let factor_x = scoring.factor_x;
     let factor_b = scoring.factor_b;
-    let banding = scoring.banding;
+    let gradient_alpha = scoring.gradient_alpha;
+    let gradient_peak_alpha = scoring.gradient_peak_alpha;
+    let gradient_peak_floor = if gradient_peak_alpha > 0.0 {
+        gradient_peak_floor(distance)
+    } else {
+        0.0
+    };
     let quantize = kernels.quantize;
     let ssim = kernels.ssim;
     let prepare_reconstruction = kernels.prepare;
     let error_gradient_energy = kernels.error.gradient_energy;
+    let error_gradient_peak_energy = kernels.error.gradient_peak_energy;
     let combine_error = kernels.error.combine;
     let n = strategy_pixel_count(strategy);
     let width = cx.checked_mul(8).expect("coefficient width overflow");
@@ -802,10 +894,21 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     pixel_height,
                 )
             };
-        if banding && distance >= BANDING_MIN_D {
+        if gradient_alpha > 0.0 {
             distortion += CHANNEL_WEIGHT[c]
-                * BANDING_ALPHA
+                * gradient_alpha
                 * error_gradient_energy(&error[..n], pixel_width, pixel_height);
+        }
+        if gradient_peak_alpha > 0.0 {
+            distortion += CHANNEL_WEIGHT[c]
+                * gradient_peak_alpha
+                * error_gradient_peak_energy(
+                    &error[..n],
+                    &original[..n],
+                    pixel_width,
+                    pixel_height,
+                    gradient_peak_floor,
+                );
         }
     }
     (distortion, rate)
@@ -1012,10 +1115,55 @@ fn ssim_deficit_scalar_kernel(orig: &[f32], recon: &[f32], width: usize, height:
 #[cfg(test)]
 mod tests {
     use super::{
-        CombineErrorFn, ErrorGradientEnergyFn, combine_error_scalar, error_gradient_energy_scalar,
-        select_combine_error_fn, select_error_gradient_energy_fn, ssim_deficit_scalar,
-        validate_ssim_inputs,
+        CombineErrorFn, ErrorGradientEnergyFn, ErrorGradientPeakEnergyFn, combine_error_scalar,
+        error_gradient_energy_scalar, error_gradient_peak_energy_scalar, gradient_peak_floor,
+        select_combine_error_fn, select_error_gradient_energy_fn,
+        select_error_gradient_peak_energy_fn, ssim_deficit_scalar, validate_ssim_inputs,
     };
+
+    #[test]
+    fn peak_gradient_energy_favors_localized_errors() {
+        let mut diffuse = [0.0f32; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                diffuse[y * 8 + x] = x as f32;
+            }
+        }
+        let mut localized = [0.0f32; 64];
+        for y in 0..8 {
+            localized[y * 8 + 4..y * 8 + 8].fill(1.0);
+        }
+        let diffuse_raw = error_gradient_energy_scalar(&diffuse, 8, 8);
+        let localized_raw = error_gradient_energy_scalar(&localized, 8, 8);
+        let original = [0.0f32; 64];
+        let diffuse_peak = error_gradient_peak_energy_scalar(&diffuse, &original, 8, 8, 0.0);
+        let localized_peak = error_gradient_peak_energy_scalar(&localized, &original, 8, 8, 0.0);
+        assert!(diffuse_raw > localized_raw);
+        assert!(diffuse_raw / localized_raw > diffuse_peak / localized_peak);
+    }
+
+    #[test]
+    fn peak_gradient_energy_exposes_edge_displacement() {
+        let mut original = [0.0f32; 64];
+        let mut aligned_error = [0.0f32; 64];
+        let mut displaced_error = [0.0f32; 64];
+        for y in 0..8 {
+            original[y * 8 + 4..y * 8 + 8].fill(1.0);
+            aligned_error[y * 8 + 4..y * 8 + 8].fill(0.5);
+            displaced_error[y * 8 + 4] = 1.0;
+        }
+        let aligned = error_gradient_peak_energy_scalar(&aligned_error, &original, 8, 8, 0.0);
+        let displaced = error_gradient_peak_energy_scalar(&displaced_error, &original, 8, 8, 0.0);
+        assert_eq!(aligned, 0.0);
+        assert!(displaced > 0.0);
+    }
+
+    #[test]
+    fn peak_gradient_floor_rises_for_the_coarse_tail() {
+        assert!((gradient_peak_floor(1.9) - 0.0015 * 1.9).abs() < 1e-7);
+        assert!((gradient_peak_floor(2.0) - 0.0045 * 2.0).abs() < 1e-7);
+        assert!((gradient_peak_floor(3.0) - 0.0045 * 3.0).abs() < 1e-7);
+    }
 
     fn check_combine_error(kernel: CombineErrorFn) {
         for len in (0usize..=40).chain([65, 257, 1024]) {
@@ -1100,6 +1248,47 @@ mod tests {
         check_error_gradient_energy(select_error_gradient_energy_fn());
     }
 
+    fn check_error_gradient_peak_energy(kernel: ErrorGradientPeakEnergyFn) {
+        for &(width, height) in &[
+            (0usize, 0usize),
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (3, 5),
+            (4, 4),
+            (8, 8),
+            (16, 8),
+            (8, 16),
+            (17, 11),
+            (32, 32),
+        ] {
+            let mut state = 0x243f_6a88u32;
+            let mut random = || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32
+            };
+            let error: Vec<f32> = (0..width * height)
+                .map(|_| (random() - 0.5) * 0.2)
+                .collect();
+            let original: Vec<f32> = (0..width * height).map(|_| random()).collect();
+            for floor in [0.0, 0.0015, 0.009, 0.05] {
+                let expected =
+                    error_gradient_peak_energy_scalar(&error, &original, width, height, floor);
+                let actual = kernel(&error, &original, width, height, floor);
+                let tolerance = 2e-7f32.max(expected.abs() * 2e-6);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "shape {width}x{height}, floor={floor}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_error_gradient_peak_energy_matches_scalar() {
+        check_error_gradient_peak_energy(select_error_gradient_peak_energy_fn());
+    }
+
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn avx2_error_gradient_energy_matches_scalar() {
@@ -1110,12 +1299,32 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_error_gradient_peak_energy_matches_scalar() {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            check_error_gradient_peak_energy(|error, original, width, height, floor| unsafe {
+                crate::avx::error_gradient_peak_energy_avx2(error, original, width, height, floor)
+            });
+        }
+    }
+
     #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
     #[test]
     fn sse41_error_gradient_energy_matches_scalar() {
         if is_x86_feature_detected!("sse4.1") {
             check_error_gradient_energy(|error, width, height| unsafe {
                 crate::sse::error_gradient_energy_sse41(error, width, height)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_error_gradient_peak_energy_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_error_gradient_peak_energy(|error, original, width, height, floor| unsafe {
+                crate::sse::error_gradient_peak_energy_sse41(error, original, width, height, floor)
             });
         }
     }

@@ -27,8 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::dct::{
-    DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64, RESAMPLE_SCALE_16_TO_2,
-    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32, WC64,
+    DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
+    RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
@@ -368,21 +368,75 @@ pub(crate) fn dct32x32_avx2(input: DctInput<'_, 32, 32>, output: &mut [f32; 1024
 /// Vectorized 64-point DCT-II over eight independent columns.
 #[target_feature(enable = "avx2,fma")]
 fn dct1d_64_flat(c: &mut [__m256; 64]) {
-    let mut evens = [_mm256_undefined_ps(); 32];
-    let mut odds = [_mm256_undefined_ps(); 32];
-    for i in 0..32 {
-        evens[i] = _mm256_add_ps(c[i], c[63 - i]);
-        odds[i] = _mm256_mul_ps(_mm256_sub_ps(c[i], c[63 - i]), _mm256_set1_ps(WC64[i]));
+    for i in 0..16 {
+        let bottom = c[i];
+        let top = c[63 - i];
+        let half_bottom = c[31 - i];
+        let half_top = c[32 + i];
+        let lower = _mm256_sub_ps(bottom, top);
+        let upper = _mm256_sub_ps(half_bottom, half_top);
+        let cos = _mm256_set1_ps(DCT64_SPLIT_COS[i]);
+        let sin = _mm256_set1_ps(DCT64_SPLIT_SIN[i]);
+
+        c[i] = _mm256_add_ps(bottom, top);
+        c[31 - i] = _mm256_add_ps(half_bottom, half_top);
+        c[32 + i] = _mm256_fmadd_ps(upper, sin, _mm256_mul_ps(lower, cos));
+        let sin_input = _mm256_fnmadd_ps(lower, sin, _mm256_mul_ps(upper, cos));
+        c[63 - i] = if i & 1 == 0 {
+            sin_input
+        } else {
+            _mm256_sub_ps(_mm256_setzero_ps(), sin_input)
+        };
     }
-    dct1d_32_flat(&mut evens);
-    dct1d_32_flat(&mut odds);
-    odds[0] = _mm256_fmadd_ps(odds[0], _mm256_set1_ps(std::f32::consts::SQRT_2), odds[1]);
-    for i in 1..31 {
-        odds[i] = _mm256_add_ps(odds[i], odds[i + 1]);
+
+    dct1d_32_flat(<&mut [__m256; 32]>::try_from(&mut c[..32]).unwrap());
+    dct1d_16_flat(<&mut [__m256; 16]>::try_from(&mut c[32..48]).unwrap());
+    dct1d_16_flat(<&mut [__m256; 16]>::try_from(&mut c[48..]).unwrap());
+
+    for i in 1..16 {
+        let cos = c[32 + i];
+        let sin = if i & 1 == 0 {
+            _mm256_sub_ps(_mm256_setzero_ps(), c[64 - i])
+        } else {
+            c[64 - i]
+        };
+        c[32 + i] = _mm256_add_ps(cos, sin);
+        c[64 - i] = _mm256_sub_ps(cos, sin);
     }
-    for i in 0..32 {
-        c[2 * i] = evens[i];
-        c[2 * i + 1] = odds[i];
+    c[32] = _mm256_mul_ps(c[32], _mm256_set1_ps(std::f32::consts::SQRT_2));
+    c[48] = _mm256_mul_ps(c[48], _mm256_set1_ps(-std::f32::consts::SQRT_2));
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dct64_store_transposed8(
+    dst: *mut f32,
+    column: usize,
+    frequency: usize,
+    mut values: [__m256; 8],
+) {
+    transpose_8x8(&mut values);
+    for (lane, value) in values.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(dst.add((column + lane) * 64 + frequency), *value) };
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dct64_store8(
+    dst: *mut f32,
+    stride: usize,
+    frequency: usize,
+    values: [__m256; 8],
+    scale: __m256,
+) {
+    for (offset, value) in values.iter().enumerate() {
+        unsafe {
+            _mm256_storeu_ps(
+                dst.add((frequency + offset) * stride),
+                _mm256_mul_ps(*value, scale),
+            )
+        };
     }
 }
 
@@ -397,15 +451,36 @@ pub(crate) fn dct64x64_avx2(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
             _mm256_loadu_ps(input.row(row)[strip * 8..].as_ptr())
         });
         dct1d_64_flat(&mut c);
-        for tile_index in 0..8 {
-            let mut tile: [__m256; 8] = c[tile_index * 8..tile_index * 8 + 8].try_into().unwrap();
-            transpose_8x8(&mut tile);
-            for (lane, value) in tile.iter().enumerate() {
-                unsafe {
-                    _mm256_storeu_ps(dst.add((strip * 8 + lane) * 64 + tile_index * 8), *value)
-                };
-            }
+        dct64_store_transposed8(
+            dst,
+            strip * 8,
+            0,
+            [c[0], c[32], c[1], c[33], c[2], c[63], c[3], c[34]],
+        );
+        for group in 1..7 {
+            let i = group * 2;
+            dct64_store_transposed8(
+                dst,
+                strip * 8,
+                group * 8,
+                [
+                    c[i * 2],
+                    c[64 - i],
+                    c[i * 2 + 1],
+                    c[33 + i],
+                    c[i * 2 + 2],
+                    c[63 - i],
+                    c[i * 2 + 3],
+                    c[34 + i],
+                ],
+            )
         }
+        dct64_store_transposed8(
+            dst,
+            strip * 8,
+            56,
+            [c[28], c[50], c[29], c[47], c[30], c[49], c[31], c[48]],
+        );
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = _mm256_set1_ps(1.0 / 4096.0);
@@ -414,14 +489,40 @@ pub(crate) fn dct64x64_avx2(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
             _mm256_loadu_ps(scratch[column * 64 + strip * 8..].as_ptr())
         });
         dct1d_64_flat(&mut c);
-        for u in 0..64 {
-            unsafe {
-                _mm256_storeu_ps(
-                    output[u * 64 + strip * 8..].as_mut_ptr(),
-                    _mm256_mul_ps(c[u], scale),
-                )
-            };
+        let dst = unsafe { output.as_mut_ptr().add(strip * 8) };
+        dct64_store8(
+            dst,
+            64,
+            0,
+            [c[0], c[32], c[1], c[33], c[2], c[63], c[3], c[34]],
+            scale,
+        );
+        for group in 1..7 {
+            let i = group * 2;
+            dct64_store8(
+                dst,
+                64,
+                group * 8,
+                [
+                    c[i * 2],
+                    c[64 - i],
+                    c[i * 2 + 1],
+                    c[33 + i],
+                    c[i * 2 + 2],
+                    c[63 - i],
+                    c[i * 2 + 3],
+                    c[34 + i],
+                ],
+                scale,
+            );
         }
+        dct64_store8(
+            dst,
+            64,
+            56,
+            [c[28], c[50], c[29], c[47], c[30], c[49], c[31], c[48]],
+            scale,
+        );
     }
 }
 
@@ -434,15 +535,36 @@ pub(crate) fn dct64x32_avx2(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048
             _mm256_loadu_ps(input.row(row)[strip * 8..].as_ptr())
         });
         dct1d_64_flat(&mut c);
-        for tile_index in 0..8 {
-            let mut tile: [__m256; 8] = c[tile_index * 8..tile_index * 8 + 8].try_into().unwrap();
-            transpose_8x8(&mut tile);
-            for (lane, value) in tile.iter().enumerate() {
-                unsafe {
-                    _mm256_storeu_ps(dst.add((strip * 8 + lane) * 64 + tile_index * 8), *value)
-                };
-            }
+        dct64_store_transposed8(
+            dst,
+            strip * 8,
+            0,
+            [c[0], c[32], c[1], c[33], c[2], c[63], c[3], c[34]],
+        );
+        for group in 1..7 {
+            let i = group * 2;
+            dct64_store_transposed8(
+                dst,
+                strip * 8,
+                group * 8,
+                [
+                    c[i * 2],
+                    c[64 - i],
+                    c[i * 2 + 1],
+                    c[33 + i],
+                    c[i * 2 + 2],
+                    c[63 - i],
+                    c[i * 2 + 3],
+                    c[34 + i],
+                ],
+            );
         }
+        dct64_store_transposed8(
+            dst,
+            strip * 8,
+            56,
+            [c[28], c[50], c[29], c[47], c[30], c[49], c[31], c[48]],
+        );
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = _mm256_set1_ps(1.0 / 2048.0);
@@ -479,9 +601,46 @@ pub(crate) fn dct32x64_avx2(input: DctInput<'_, 64, 32>, output: &mut [f32; 2048
             c[column_tile * 8..column_tile * 8 + 8].copy_from_slice(&tile);
         }
         dct1d_64_flat(&mut c);
-        for u in 0..64 {
-            unsafe { _mm256_storeu_ps(dst.add(u * 32 + row_strip * 8), c[u]) };
+        let one = _mm256_set1_ps(1.0);
+        unsafe {
+            dct64_store8(
+                dst.add(row_strip * 8),
+                32,
+                0,
+                [c[0], c[32], c[1], c[33], c[2], c[63], c[3], c[34]],
+                one,
+            )
+        };
+        for group in 1..7 {
+            let i = group * 2;
+            unsafe {
+                dct64_store8(
+                    dst.add(row_strip * 8),
+                    32,
+                    group * 8,
+                    [
+                        c[i * 2],
+                        c[64 - i],
+                        c[i * 2 + 1],
+                        c[33 + i],
+                        c[i * 2 + 2],
+                        c[63 - i],
+                        c[i * 2 + 3],
+                        c[34 + i],
+                    ],
+                    one,
+                )
+            };
         }
+        unsafe {
+            dct64_store8(
+                dst.add(row_strip * 8),
+                32,
+                56,
+                [c[28], c[50], c[29], c[47], c[30], c[49], c[31], c[48]],
+                one,
+            )
+        };
     }
     let scratch = unsafe { scratch_uninit.assume_init() };
     let scale = _mm256_set1_ps(1.0 / 2048.0);

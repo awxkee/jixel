@@ -266,7 +266,7 @@ fn gather_pixels(
 #[inline]
 fn dct_input<'a, const W: usize, const H: usize>(
     plane: &'a crate::image::Plane<f32>,
-    tmp: &'a mut [f32; 1024],
+    tmp: &'a mut [f32],
     px: usize,
     py: usize,
 ) -> DctInput<'a, W, H> {
@@ -285,12 +285,12 @@ fn dct_input<'a, const W: usize, const H: usize>(
 /// libjxl-tiny `cx ≥ cy` normalisation, i.e. the storage shape in 8-blocks.
 fn forward_transform(
     ctx: &EncodingContext,
-    tmp: &mut [f32; 1024],
+    tmp: &mut [f32],
     strategy: u8,
     plane: &crate::image::Plane<f32>,
     px: usize,
     py: usize,
-    out: &mut [f32; 1024],
+    out: &mut [f32],
 ) -> (usize, usize) {
     // Interior blocks point directly into the image plane. Edge blocks retain
     // the replicated-border gather because their logical footprint extends past
@@ -395,11 +395,12 @@ fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
             || (DCT64_WINDOW_LO..DCT64_WINDOW_HI).contains(&distance))
 }
 
-/// DCT64 is evaluated outside the standard chooser because its 4096-entry
-/// scratch would otherwise inflate every transform-selection worker.
+/// DCT64 is evaluated outside the standard chooser, reusing the chooser's
+/// lazily allocated coefficient and gather buffers at their maximum footprint.
 #[allow(clippy::too_many_arguments)]
 fn strategy_cost64(
     ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
     strategy: u8,
     opsin: &Image3F,
     px: usize,
@@ -410,8 +411,13 @@ fn strategy_cost64(
     distance: f32,
     cmap_factor: [f32; 3],
 ) -> f32 {
-    let mut coeffs: [Box<[f32; 4096]>; 3] = std::array::from_fn(|_| Box::new([0.0; 4096]));
-    let mut input = Box::new([0.0f32; 4096]);
+    let CoderScratch {
+        strategy_coeffs: coeffs,
+        transform_gather: input,
+        ..
+    } = scratch;
+    let coeffs: &mut [[f32; 4096]; 3] = coeffs;
+    let input: &mut [f32; 4096] = input;
     let (width, height, size, cx, cy) = match strategy {
         STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
         STRATEGY_DCT64X32 => (32, 64, 2048, 8, 4),
@@ -421,7 +427,7 @@ fn strategy_cost64(
     for (c, coeff) in coeffs.iter_mut().enumerate() {
         gather_pixels(opsin.plane(c), px, py, width, height, &mut input[..size]);
         match strategy {
-            STRATEGY_DCT64X64 => (ctx.dct64x64)(DctInput::from_flat(&input), coeff),
+            STRATEGY_DCT64X64 => (ctx.dct64x64)(DctInput::from_flat(input), coeff),
             STRATEGY_DCT64X32 => (ctx.dct64x32)(
                 DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
                 coeff.first_chunk_mut::<2048>().unwrap(),
@@ -433,15 +439,8 @@ fn strategy_cost64(
             _ => unreachable!(),
         }
     }
-    let [x, y, b] = &mut coeffs;
-    for ((xv, bv), &yv) in x[..size]
-        .iter_mut()
-        .zip(b[..size].iter_mut())
-        .zip(y[..size].iter())
-    {
-        *xv -= cmap_factor[0] * yv;
-        *bv -= cmap_factor[2] * yv;
-    }
+    let [x, y, b] = coeffs;
+    apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
     let mut distortion = 0.0f32;
     let mut rate = 0.0f32;
@@ -522,6 +521,8 @@ fn reconstruction_strategy_cost_and_base(
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
+    gradient_alpha: f32,
+    gradient_peak_alpha: f32,
 ) -> (f32, f32) {
     let CoderScratch {
         strategy_coeffs: coeffs,
@@ -553,6 +554,8 @@ fn reconstruction_strategy_cost_and_base(
         cmap_factor,
         cx,
         cy,
+        gradient_alpha,
+        gradient_peak_alpha,
     );
     (
         rd_cost(
@@ -645,7 +648,7 @@ fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[
 fn coefficient_dist_and_rate(
     ctx: &EncodingContext,
     strategy: u8,
-    coeffs: &[[f32; 1024]; 3],
+    coeffs: &[[f32; 4096]; 3],
     size: usize,
     qac: f32,
     qm_mult_x: f32,
@@ -728,6 +731,8 @@ fn strategy_cost_impl(
             cmap_factor,
             cx,
             cy,
+            0.0,
+            0.0,
         ),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
             ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
@@ -739,8 +744,8 @@ fn strategy_cost_impl(
 #[allow(clippy::too_many_arguments)]
 fn prepare_strategy_coeffs(
     ctx: &EncodingContext,
-    coeffs: &mut [[f32; 1024]; 3],
-    transform_gather: &mut [f32; 1024],
+    coeffs: &mut [[f32; 4096]; 3],
+    transform_gather: &mut [f32; 4096],
     strategy: u8,
     opsin: &Image3F,
     px: usize,
@@ -772,7 +777,7 @@ fn prepare_strategy_coeffs(
 fn reconstruction_dist_and_rate(
     ctx: &EncodingContext,
     recon: &mut [[f32; 1024]; 8],
-    coeffs: &[[f32; 1024]; 3],
+    coeffs: &[[f32; 4096]; 3],
     strategy: u8,
     opsin: &Image3F,
     px: usize,
@@ -783,6 +788,8 @@ fn reconstruction_dist_and_rate(
     cmap_factor: [f32; 3],
     cx: usize,
     cy: usize,
+    gradient_alpha: f32,
+    gradient_peak_alpha: f32,
 ) -> (f32, f32) {
     (ctx.recon_dist_and_rate)(
         recon,
@@ -790,7 +797,7 @@ fn reconstruction_dist_and_rate(
             idct: ctx.idct,
             quantization: ReconQuantization {
                 rate_log2_lut: ctx.rate_log2_lut,
-                coeffs,
+                coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                 inverse_matrices: [
                     inverse_matrix_for(ctx, strategy, 0),
                     inverse_matrix_for(ctx, strategy, 1),
@@ -813,11 +820,118 @@ fn reconstruction_dist_and_rate(
             scoring: ReconScoring {
                 factor_x: cmap_factor[0],
                 factor_b: cmap_factor[2],
-                banding: ctx.banding_protection,
+                gradient_alpha,
+                gradient_peak_alpha,
             },
         },
         &ctx.recon_error_kernels,
     )
+}
+
+/// Pair-transform gradient protection used only by the reconstruction rerank.
+/// The raw energy term handles small high-quality errors; the source-masked,
+/// peak-pooled term takes over as quantization grows. Its coarse tail is limited
+/// to bright, nearly neutral gradients, where blocking remains visible without
+/// texture or chroma masking.
+// Fitted on the sun-beam set, then checked on the general 768px corpus and Kodak.
+const RERANK_PAIR_GRADIENT_FADE_IN_START: f32 = 0.5;
+const RERANK_PAIR_GRADIENT_FADE_IN_END: f32 = 0.8;
+const RERANK_PAIR_GRADIENT_FADE_OUT_START: f32 = 1.0;
+const RERANK_PAIR_GRADIENT_FADE_OUT_END: f32 = 1.5;
+const RERANK_PAIR_GRADIENT_ALPHA: f32 = 8.0;
+const RERANK_PAIR_GRADIENT_MIN_DOMINANCE: f32 = 0.4;
+const RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START: f32 = 1.2;
+const RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END: f32 = 1.8;
+const RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START: f32 = 3.0;
+const RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END: f32 = 3.5;
+const RERANK_PAIR_GRADIENT_PEAK_COARSE_START: f32 = 1.9;
+const RERANK_PAIR_GRADIENT_PEAK_COARSE_END: f32 = 2.0;
+const RERANK_PAIR_GRADIENT_PEAK_ALPHA: f32 = 192.0;
+const RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA: f32 = 96.0;
+const RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE: f32 = 0.4;
+const RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA: f32 = 0.45;
+const RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA: f32 = 0.01;
+
+#[inline]
+fn rerank_pair_gradient_scale(distance: f32) -> f32 {
+    let fade_in = ((distance - RERANK_PAIR_GRADIENT_FADE_IN_START)
+        / (RERANK_PAIR_GRADIENT_FADE_IN_END - RERANK_PAIR_GRADIENT_FADE_IN_START))
+        .clamp(0.0, 1.0);
+    let fade_out = 1.0
+        - ((distance - RERANK_PAIR_GRADIENT_FADE_OUT_START)
+            / (RERANK_PAIR_GRADIENT_FADE_OUT_END - RERANK_PAIR_GRADIENT_FADE_OUT_START))
+            .clamp(0.0, 1.0);
+    fade_in * fade_out
+}
+
+fn rerank_pair_gradient_alpha(distance: f32) -> f32 {
+    RERANK_PAIR_GRADIENT_ALPHA * rerank_pair_gradient_scale(distance)
+}
+
+#[inline]
+fn rerank_pair_gradient_peak_alpha(distance: f32) -> f32 {
+    let fade_in = ((distance - RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START)
+        / (RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END - RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START))
+        .clamp(0.0, 1.0);
+    let fade_out = 1.0
+        - ((distance - RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START)
+            / (RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END - RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START))
+            .clamp(0.0, 1.0);
+    let coarse_mix = ((distance - RERANK_PAIR_GRADIENT_PEAK_COARSE_START)
+        / (RERANK_PAIR_GRADIENT_PEAK_COARSE_END - RERANK_PAIR_GRADIENT_PEAK_COARSE_START))
+        .clamp(0.0, 1.0);
+    let fit = pair_grad_fit();
+    let alpha = fmla(
+        coarse_mix,
+        fit.peak_coarse_alpha - fit.peak_alpha,
+        fit.peak_alpha,
+    );
+    alpha * fade_in * fade_out
+}
+
+/// Temporary fitting override for the pair-gradient peak term:
+/// JIXEL_PGRAD="peak_alpha:coarse_alpha:min_luma:chroma_cap". Unset = the
+/// shipped constants (bit-identical behavior).
+struct PairGradFit {
+    peak_alpha: f32,
+    peak_coarse_alpha: f32,
+    min_luma: f32,
+    chroma_cap: f32,
+    peak_min_dominance: f32,
+}
+
+fn pair_grad_fit() -> &'static PairGradFit {
+    static FIT: std::sync::OnceLock<PairGradFit> = std::sync::OnceLock::new();
+    FIT.get_or_init(|| {
+        let default = PairGradFit {
+            peak_alpha: RERANK_PAIR_GRADIENT_PEAK_ALPHA,
+            peak_coarse_alpha: RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
+            min_luma: RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA,
+            chroma_cap: RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA,
+            peak_min_dominance: RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE,
+        };
+        let Ok(v) = std::env::var("JIXEL_PGRAD") else {
+            return default;
+        };
+        let parts: Vec<f32> = v.split(':').filter_map(|p| p.trim().parse().ok()).collect();
+        match parts[..] {
+            [a, c, l, ch] => PairGradFit {
+                peak_alpha: a,
+                peak_coarse_alpha: c,
+                min_luma: l,
+                chroma_cap: ch,
+                ..default
+            },
+            [a, c, l, ch, dm] => PairGradFit {
+                peak_alpha: a,
+                peak_coarse_alpha: c,
+                min_luma: l,
+                chroma_cap: ch,
+                peak_min_dominance: dm,
+            },
+            _ => default,
+        }
+    })
 }
 
 #[inline]
@@ -856,7 +970,7 @@ fn forward_sub8_transform(
     ctx: &EncodingContext,
     strategy: u8,
     input: &[f32; 64],
-    output: &mut [f32; 1024],
+    output: &mut [f32],
 ) {
     let dst: &mut [f32; 64] = output.first_chunk_mut::<64>().unwrap();
     let input = DctInput::from_flat(input);
@@ -943,6 +1057,164 @@ fn cmap_factors(ytox_map: &ImageSB, ytob_map: &ImageSB, bx: usize, by: usize) ->
 }
 
 const MERGE_RISK_K: f32 = std::f32::consts::LOG2_E;
+
+/// Fraction of the region's Y variance carried by the smooth >=4px-scale
+/// component. Luminance ramps (sun beams, vignettes) score high; flat sky and
+/// texture-dominated regions score low.
+/// `w`/`h` must be multiples of 4 (transform sizes always are).
+#[derive(Clone, Copy)]
+pub(crate) struct GradientRegionStats {
+    pub(crate) dominance: f32,
+    pub(crate) mean: f32,
+    pub(crate) chroma: f32,
+}
+
+pub(crate) type GradientRegionStatsFn =
+    fn(&Image3F, usize, usize, usize, usize, f32) -> GradientRegionStats;
+
+#[inline]
+pub(crate) fn finish_gradient_region_stats(
+    means: &[f32],
+    within_sum: f32,
+    chroma_sum: f32,
+    pixel_count: usize,
+    eps: f32,
+) -> GradientRegionStats {
+    let n_cells = means.len() as f32;
+    let within = within_sum / n_cells;
+    let grand = means.iter().sum::<f32>() / n_cells;
+    let lf = means.iter().map(|m| (m - grand) * (m - grand)).sum::<f32>() / n_cells;
+    GradientRegionStats {
+        dominance: lf / (lf + within + eps),
+        mean: grand,
+        chroma: chroma_sum / pixel_count as f32,
+    }
+}
+
+pub(crate) fn gradient_region_stats_scalar(
+    opsin: &Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> GradientRegionStats {
+    let xs = opsin.xsize();
+    let ys = opsin.ysize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256]; // 64x64 region -> 16x16 cells max
+    let mut within = 0.0f32;
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let mut s = 0.0f32;
+            let mut s2 = 0.0f32;
+            for dy in 0..4 {
+                let row = opsin.plane_row(1, (py0 + cy * 4 + dy).min(ys - 1));
+                for dx in 0..4 {
+                    let sx = (px0 + cx * 4 + dx).min(xs - 1);
+                    let v = row[sx];
+                    s += v;
+                    s2 = fmla(v, v, s2);
+                }
+            }
+            let m = s * (1.0 / 16.0);
+            means[cy * cw + cx] = m;
+            within += (s2 * (1.0 / 16.0) - m * m).max(0.0);
+        }
+    }
+    finish_gradient_region_stats(&means[..cw * ch], within, 0.0, w * h, eps)
+}
+
+pub(crate) fn gradient_region_stats_with_chroma_scalar(
+    opsin: &Image3F,
+    px0: usize,
+    py0: usize,
+    w: usize,
+    h: usize,
+    eps: f32,
+) -> GradientRegionStats {
+    let xs = opsin.xsize();
+    let ys = opsin.ysize();
+    let cw = w / 4;
+    let ch = h / 4;
+    let mut means = [0.0f32; 256];
+    let mut within = 0.0f32;
+    let mut chroma = 0.0f32;
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let mut s = 0.0f32;
+            let mut s2 = 0.0f32;
+            for dy in 0..4 {
+                let y = (py0 + cy * 4 + dy).min(ys - 1);
+                let row = opsin.plane_row(1, y);
+                let xrow = opsin.plane_row(0, y);
+                let brow = opsin.plane_row(2, y);
+                for dx in 0..4 {
+                    let sx = (px0 + cx * 4 + dx).min(xs - 1);
+                    let v = row[sx];
+                    s += v;
+                    s2 = fmla(v, v, s2);
+                    chroma += xrow[sx].abs() + (brow[sx] - v).abs();
+                }
+            }
+            let m = s * (1.0 / 16.0);
+            means[cy * cw + cx] = m;
+            within += (s2 * (1.0 / 16.0) - m * m).max(0.0);
+        }
+    }
+    finish_gradient_region_stats(&means[..cw * ch], within, chroma, w * h, eps)
+}
+
+pub(crate) fn select_gradient_region_stats_fn() -> GradientRegionStatsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::neon::gradient_region_stats_neon(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::avx::gradient_region_stats_avx2(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::sse::gradient_region_stats_sse41(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::gradient_region_stats_wasm;
+    #[allow(unreachable_code)]
+    gradient_region_stats_scalar
+}
+
+pub(crate) fn select_gradient_region_stats_with_chroma_fn() -> GradientRegionStatsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::neon::gradient_region_stats_with_chroma_neon(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::avx::gradient_region_stats_with_chroma_avx2(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |opsin, px, py, w, h, eps| unsafe {
+            crate::sse::gradient_region_stats_with_chroma_sse41(opsin, px, py, w, h, eps)
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::gradient_region_stats_with_chroma_wasm;
+    #[allow(unreachable_code)]
+    gradient_region_stats_with_chroma_scalar
+}
 
 #[inline]
 fn risk_gated(k: f32, accept: f32, q_min: f32, q_max: f32, area_scale: f32) -> f32 {
@@ -1330,6 +1602,8 @@ fn find_quant_refinements(
                 cmap,
                 cx,
                 cy,
+                0.0,
+                0.0,
             );
             rd_cost(
                 DistortionModel::Reconstruction,
@@ -1984,6 +2258,7 @@ pub(crate) fn fill_ac_strategy(
                 let cost64 = BIAS_64X64
                     * strategy_cost64(
                         ctx,
+                        scratch,
                         STRATEGY_DCT64X64,
                         opsin,
                         dc_group_px + bx * 8,
@@ -1999,6 +2274,7 @@ pub(crate) fn fill_ac_strategy(
                     BIAS_64_RECT
                         * strategy_cost64(
                             ctx,
+                            scratch,
                             STRATEGY_DCT64X32,
                             opsin,
                             dc_group_px + (bx + sx) * 8,
@@ -2014,6 +2290,7 @@ pub(crate) fn fill_ac_strategy(
                     BIAS_64_RECT
                         * strategy_cost64(
                             ctx,
+                            scratch,
                             STRATEGY_DCT32X64,
                             opsin,
                             dc_group_px + bx * 8,
@@ -2188,6 +2465,9 @@ fn find_rerank_downgrades(
     let ctx = params.ctx;
     let (y0, y1) = band;
     let rerank_margin = ctx.merge.rerank_margin;
+    let pair_gradient_alpha = rerank_pair_gradient_alpha(params.distance);
+    let pair_gradient_peak_alpha = rerank_pair_gradient_peak_alpha(params.distance);
+    let pair_gradient_fit = pair_grad_fit();
     // The rerank's own metadata charge. The selection pass keeps META_R, but
     // here the tiled-DCT8 alternative pays it PER TILE (16x for a 32x32)
     // while the merge pays once — a structural pro-merge credit this
@@ -2217,6 +2497,53 @@ fn find_rerank_downgrades(
             continue; // only merges
         }
         let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
+        // The gradient term targets the measured sun-beam failure: rectangular
+        // pairs whose rate advantage hides a localized directional error. Keep
+        // square/larger reranks byte-identical while the pair weight is fitted.
+        let (gradient_alpha, gradient_peak_alpha) = match strat {
+            STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => {
+                let alpha = pair_gradient_alpha;
+                let peak_alpha = pair_gradient_peak_alpha;
+                if alpha == 0.0 && peak_alpha == 0.0 {
+                    (0.0, 0.0)
+                } else {
+                    let (width, height) = if strat == STRATEGY_DCT16X8 {
+                        (8, 16)
+                    } else {
+                        (16, 8)
+                    };
+                    let stats = if params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END {
+                        (ctx.gradient_region_stats)(params.opsin, px, py, width, height, 1e-5)
+                    } else {
+                        (ctx.gradient_region_stats_with_chroma)(
+                            params.opsin,
+                            px,
+                            py,
+                            width,
+                            height,
+                            1e-5,
+                        )
+                    };
+                    (
+                        if stats.dominance >= RERANK_PAIR_GRADIENT_MIN_DOMINANCE {
+                            alpha
+                        } else {
+                            0.0
+                        },
+                        if stats.dominance >= pair_gradient_fit.peak_min_dominance
+                            && stats.mean >= pair_gradient_fit.min_luma
+                            && (params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END
+                                || stats.chroma <= pair_gradient_fit.chroma_cap)
+                        {
+                            peak_alpha
+                        } else {
+                            0.0
+                        },
+                    )
+                }
+            }
+            _ => (0.0, 0.0),
+        };
         let qac_big = region_qac(
             rerank.quant_field,
             bx,
@@ -2238,6 +2565,8 @@ fn find_rerank_downgrades(
             meta_r,
             params.distance,
             cmap_factors(params.ytox_map, params.ytob_map, bx, by),
+            gradient_alpha,
+            gradient_peak_alpha,
         );
         let mut j_dct8 = 0.0f32;
         let tiled_costs_start = output.current_costs.len();
@@ -2264,6 +2593,8 @@ fn find_rerank_downgrades(
                     meta_r,
                     params.distance,
                     cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
+                    gradient_alpha,
+                    gradient_peak_alpha,
                 );
                 j_dct8 += cost;
                 output.current_costs.push(CachedQuantCost {
@@ -2308,6 +2639,8 @@ fn find_rerank_downgrades(
                         meta_r,
                         params.distance,
                         cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
+                        gradient_alpha,
+                        gradient_peak_alpha,
                     );
                     sum += cost;
                     output.current_costs.push(CachedQuantCost {
@@ -2403,9 +2736,19 @@ mod tests {
     use super::{
         BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
         FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MergeTuning,
-        RERANK_DOWNGRADE_MARGIN, SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2,
-        aggregate_quant, cmap_factors, fill_ac_strategy, fill_selection_bands, merge_beats_dct8,
-        merge_margin, quant_refinement_steps, strategy_cost, sub8_strategy_costs, use_dct8_only,
+        RERANK_DOWNGRADE_MARGIN, RERANK_PAIR_GRADIENT_ALPHA, RERANK_PAIR_GRADIENT_FADE_IN_END,
+        RERANK_PAIR_GRADIENT_FADE_IN_START, RERANK_PAIR_GRADIENT_FADE_OUT_END,
+        RERANK_PAIR_GRADIENT_FADE_OUT_START, RERANK_PAIR_GRADIENT_MIN_DOMINANCE,
+        RERANK_PAIR_GRADIENT_PEAK_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_END, RERANK_PAIR_GRADIENT_PEAK_COARSE_START,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
+        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant, cmap_factors,
+        fill_ac_strategy, fill_selection_bands, gradient_region_stats_scalar,
+        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
+        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
+        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
+        strategy_cost, sub8_strategy_costs, use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -2472,6 +2815,62 @@ mod tests {
     }
 
     #[test]
+    fn pair_gradient_weights_are_banded() {
+        assert!(RERANK_PAIR_GRADIENT_ALPHA > 0.0);
+        assert!((0.0..1.0).contains(&RERANK_PAIR_GRADIENT_MIN_DOMINANCE));
+        assert_eq!(rerank_pair_gradient_scale(0.35), 0.0);
+        assert_eq!(
+            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_IN_START),
+            0.0
+        );
+        assert_eq!(
+            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_IN_END),
+            1.0
+        );
+        assert_eq!(
+            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_OUT_START),
+            1.0
+        );
+        assert_eq!(
+            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_OUT_END),
+            0.0
+        );
+        assert_eq!(rerank_pair_gradient_scale(3.0), 0.0);
+        let fade_in_mid =
+            0.5 * (RERANK_PAIR_GRADIENT_FADE_IN_START + RERANK_PAIR_GRADIENT_FADE_IN_END);
+        assert!((rerank_pair_gradient_scale(fade_in_mid) - 0.5).abs() < 1e-6);
+        let fade_out_mid =
+            0.5 * (RERANK_PAIR_GRADIENT_FADE_OUT_START + RERANK_PAIR_GRADIENT_FADE_OUT_END);
+        assert!((rerank_pair_gradient_scale(fade_out_mid) - 0.5).abs() < 1e-6);
+
+        assert!(RERANK_PAIR_GRADIENT_PEAK_ALPHA > 0.0);
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START),
+            0.0
+        );
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END),
+            RERANK_PAIR_GRADIENT_PEAK_ALPHA
+        );
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START),
+            RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA
+        );
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_COARSE_START),
+            RERANK_PAIR_GRADIENT_PEAK_ALPHA
+        );
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_COARSE_END),
+            RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA
+        );
+        assert_eq!(
+            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END),
+            0.0
+        );
+    }
+
+    #[test]
     fn quant_refinement_does_not_release_at_coarse_distances() {
         assert_eq!(quant_refinement_steps(1.0), 0);
         assert_eq!(quant_refinement_steps(1.5), 1);
@@ -2491,7 +2890,6 @@ mod tests {
         let ctx = EncodingContext::new(
             crate::Speed::Fast,
             None,
-            false,
             crate::xyb::XybMatrix::SPEC,
             1.0,
             1,
@@ -2778,5 +3176,56 @@ mod tests {
         let ytox = ImageSB::new_fill(1, 1, 42);
         let ytob = ImageSB::new_fill(1, 1, -42);
         assert_eq!(cmap_factors(&ytox, &ytob, 0, 0), [0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn luma_only_gradient_stats_match_full_stats() {
+        let mut opsin = Image3F::new(16, 16);
+        for c in 0..3 {
+            for y in 0..16 {
+                for x in 0..16 {
+                    opsin.plane_mut(c).row_mut(y)[x] =
+                        0.01 * x as f32 + 0.02 * y as f32 + 0.1 * c as f32;
+                }
+            }
+        }
+        let luma = gradient_region_stats_scalar(&opsin, 0, 0, 16, 8, 1e-5);
+        let full = gradient_region_stats_with_chroma_scalar(&opsin, 0, 0, 16, 8, 1e-5);
+        assert_eq!(luma.dominance, full.dominance);
+        assert_eq!(luma.mean, full.mean);
+        assert!(full.chroma > 0.0);
+    }
+
+    #[test]
+    fn dispatched_gradient_stats_match_scalar() {
+        let mut opsin = Image3F::new(24, 24);
+        for c in 0..3 {
+            for y in 0..24 {
+                for x in 0..24 {
+                    let hash = (x * 37 + y * 61 + c * 17 + x * y * 3) % 101;
+                    opsin.plane_mut(c).row_mut(y)[x] = hash as f32 * 0.007 - 0.2 + c as f32 * 0.03;
+                }
+            }
+        }
+
+        let kernels = [
+            (
+                select_gradient_region_stats_fn(),
+                gradient_region_stats_scalar as super::GradientRegionStatsFn,
+            ),
+            (
+                select_gradient_region_stats_with_chroma_fn(),
+                gradient_region_stats_with_chroma_scalar as super::GradientRegionStatsFn,
+            ),
+        ];
+        for &(simd, scalar) in &kernels {
+            for &(px, py, w, h) in &[(1, 2, 8, 16), (3, 4, 16, 8), (20, 21, 8, 16)] {
+                let got = simd(&opsin, px, py, w, h, 1e-5);
+                let expected = scalar(&opsin, px, py, w, h, 1e-5);
+                assert!((got.dominance - expected.dominance).abs() < 2e-5);
+                assert!((got.mean - expected.mean).abs() < 2e-6);
+                assert!((got.chroma - expected.chroma).abs() < 2e-6);
+            }
+        }
     }
 }

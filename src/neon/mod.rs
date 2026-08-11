@@ -41,7 +41,9 @@ mod structure_aq;
 mod xyb;
 mod ytob;
 
-pub(crate) use ac_strategy::sse_and_rate_neon;
+pub(crate) use ac_strategy::{
+    gradient_region_stats_neon, gradient_region_stats_with_chroma_neon, sse_and_rate_neon,
+};
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{apply_cfl_neon, cfl_regression_neon};
@@ -56,7 +58,8 @@ pub(crate) use dct::{
 };
 pub(crate) use entropy::counts_bit_cost_neon;
 pub(crate) use inflated_cost::{
-    combine_error_neon, error_gradient_energy_neon, recon_dist_and_rate_neon, ssim_deficit_neon,
+    combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
+    recon_dist_and_rate_neon, ssim_deficit_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{

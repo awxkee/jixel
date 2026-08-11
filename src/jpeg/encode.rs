@@ -223,7 +223,7 @@ fn write_size(w: &mut BitWriter, size: usize) {
 
 /// Aspect ratios the size header can encode instead of a literal width,
 /// as (numerator, denominator) pairs for ratio codes 1..=7.
-const ASPECT_RATIOS: [(usize, usize); 7] =
+static ASPECT_RATIOS: [(usize, usize); 7] =
     [(1, 1), (12, 10), (4, 3), (3, 2), (16, 9), (5, 4), (2, 1)];
 
 fn write_size_header(w: &mut BitWriter, xsize: usize, ysize: usize) {

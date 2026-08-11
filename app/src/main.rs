@@ -13,10 +13,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new(
-        "./assets/PhotoTraces_Free_RAW_Photos_05_Spring_Tree.png",
-    ))
-    .unwrap();
+    let image = image::open(Path::new("./assets/sun/pexels-anatoleos-35404883.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
