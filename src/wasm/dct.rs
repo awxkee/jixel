@@ -523,14 +523,12 @@ pub(crate) fn dct64x64_wasm(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
         dct1d_64_s(&mut c);
         dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
         for group in 1..15 {
-            unsafe {
-                dct64_store_transposed4(
-                    dst,
-                    strip * 4,
-                    group * 4,
-                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
-                )
-            };
+            dct64_store_transposed4(
+                dst,
+                strip * 4,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+            )
         }
         dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
@@ -544,15 +542,13 @@ pub(crate) fn dct64x64_wasm(input: DctInput<'_, 64, 64>, output: &mut [f32; 4096
         let dst = unsafe { output.as_mut_ptr().add(strip * 4) };
         dct64_store4(dst, 64, 0, [c[0], c[32], c[1], c[33]], scale);
         for group in 1..15 {
-            unsafe {
-                dct64_store4(
-                    dst,
-                    64,
-                    group * 4,
-                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
-                    scale,
-                )
-            };
+            dct64_store4(
+                dst,
+                64,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+                scale,
+            )
         }
         dct64_store4(dst, 64, 60, [c[30], c[49], c[31], c[48]], scale);
     }
@@ -568,14 +564,12 @@ pub(crate) fn dct64x32_wasm(input: DctInput<'_, 32, 64>, output: &mut [f32; 2048
         dct1d_64_s(&mut c);
         dct64_store_transposed4(dst, strip * 4, 0, [c[0], c[32], c[1], c[33]]);
         for group in 1..15 {
-            unsafe {
-                dct64_store_transposed4(
-                    dst,
-                    strip * 4,
-                    group * 4,
-                    [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
-                )
-            };
+            dct64_store_transposed4(
+                dst,
+                strip * 4,
+                group * 4,
+                [c[group * 2], c[64 - group], c[group * 2 + 1], c[33 + group]],
+            )
         }
         dct64_store_transposed4(dst, strip * 4, 60, [c[30], c[49], c[31], c[48]]);
     }
