@@ -1342,6 +1342,7 @@ pub(crate) fn encode_frame(
                 alpha.is_some(),
                 MODULAR_ATLAS_LATTICE_SCALE,
                 ctx.speed,
+                true,
                 scratch,
                 &mut modular_bits,
             );

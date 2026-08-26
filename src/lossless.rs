@@ -71,6 +71,17 @@ static SLOW_PREDICTORS: [u32; 6] = [
     PREDICTOR_TOP,
 ];
 
+/// Fixed-predictor fallback used wherever Fast mode hardcodes Weighted;
+/// Gradient when the decoding-speed setting excludes the Weighted Predictor.
+#[inline]
+fn fixed_predictor(use_wp: bool) -> u32 {
+    if use_wp {
+        PREDICTOR_WEIGHTED
+    } else {
+        PREDICTOR_GRADIENT
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PredictorNeighbors {
     left: i64,
@@ -365,6 +376,7 @@ pub(crate) fn encode_frame_lossless(
     patches: bool,
     num_color: usize,
     speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
     num_threads: usize,
     writer: &mut BitWriter,
 ) {
@@ -378,6 +390,7 @@ pub(crate) fn encode_frame_lossless(
         patches,
         num_color,
         speed,
+        decoding_speed,
         &pool,
         &mut scratch,
         writer,
@@ -393,6 +406,7 @@ fn encode_frame_lossless_with_pool(
     patches: bool,
     num_color: usize,
     speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -413,6 +427,7 @@ fn encode_frame_lossless_with_pool(
             progressive,
             num_color,
             speed,
+            decoding_speed,
             pool,
             scratch,
             ModularFrameKind::Regular,
@@ -429,6 +444,7 @@ fn encode_frame_lossless_with_pool(
             false,
             num_color,
             speed,
+            decoding_speed,
             pool,
             scratch,
             ModularFrameKind::ReferenceOnly {
@@ -444,6 +460,7 @@ fn encode_frame_lossless_with_pool(
             false,
             num_color,
             speed,
+            decoding_speed,
             pool,
             scratch,
             ModularFrameKind::Patched(&plan.references),
@@ -464,6 +481,7 @@ fn encode_frame_lossless_with_pool(
         progressive,
         num_color,
         speed,
+        decoding_speed,
         pool,
         scratch,
         ModularFrameKind::Regular,
@@ -479,6 +497,7 @@ fn encode_frame_lossless_core(
     progressive: bool,
     num_color: usize,
     speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
@@ -491,6 +510,7 @@ fn encode_frame_lossless_core(
         progressive,
         num_color,
         speed,
+        decoding_speed,
         pool,
         scratch,
         frame_kind,
@@ -507,12 +527,14 @@ fn encode_frame_lossless_core_impl(
     progressive: bool,
     num_color: usize,
     speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
     allow_palette_candidates: bool,
     writer: &mut BitWriter,
 ) {
+    let use_wp = decoding_speed.use_weighted_predictor();
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
     // bit depths raise LZ77_MIN_SYMBOL above the max literal token so the decoder
@@ -551,6 +573,7 @@ fn encode_frame_lossless_core_impl(
             min_symbol,
             grad_pack_fn,
             speed,
+            use_wp,
             scratch,
             &mut palette_writer,
         ) {
@@ -563,6 +586,7 @@ fn encode_frame_lossless_core_impl(
                     progressive,
                     num_color,
                     speed,
+                    decoding_speed,
                     pool,
                     scratch,
                     frame_kind,
@@ -597,6 +621,7 @@ fn encode_frame_lossless_core_impl(
             min_symbol,
             grad_pack_fn,
             speed,
+            use_wp,
             pool,
             scratch,
             &mut palette_writer,
@@ -610,6 +635,7 @@ fn encode_frame_lossless_core_impl(
                     progressive,
                     num_color,
                     speed,
+                    decoding_speed,
                     pool,
                     scratch,
                     frame_kind,
@@ -638,6 +664,7 @@ fn encode_frame_lossless_core_impl(
             min_symbol,
             grad_pack_fn,
             speed,
+            use_wp,
             pool,
             scratch,
             writer,
@@ -666,6 +693,7 @@ fn encode_frame_lossless_core_impl(
             num_ac_groups,
             grad_pack_fn,
             speed,
+            use_wp,
             pool,
             scratch,
             writer,
@@ -699,15 +727,17 @@ fn encode_frame_lossless_core_impl(
     } else {
         2 + num_dc_groups + num_ac_groups
     };
-    let mut wp_params = if adaptive_search {
+    let mut wp_params = if adaptive_search && use_wp {
         choose_wp_params(linear, alpha, num_color, wp_header_count, pool, scratch)
     } else {
         WpParams::DEFAULT
     };
     let predictors = if adaptive_search {
-        choose_predictors_with_wp(linear, alpha, xsize, ysize, pool, scratch, wp_params)
+        choose_predictors_with_wp(
+            linear, alpha, xsize, ysize, pool, scratch, wp_params, use_wp,
+        )
     } else {
-        [PREDICTOR_WEIGHTED; 4]
+        [fixed_predictor(use_wp); 4]
     };
     // Contiguous per-modular-channel predictors: the `num_color` color channels
     // (Y for gray; Y/Co/Cg for color) followed by alpha. For 3-color this is just
@@ -724,7 +754,10 @@ fn encode_frame_lossless_core_impl(
     // viable finalist and compares its complete byte-aligned frame against the
     // v1 and flat alternatives. Tree headers, clustering, hybrid uint choices,
     // and LZ77 can otherwise reverse the order predicted from residual entropy.
-    let compare_tree_candidates = frame_kind.is_regular() && adaptive_search && num_color == 3;
+    let compare_tree_candidates = frame_kind.is_regular()
+        && adaptive_search
+        && num_color == 3
+        && decoding_speed.use_ma_trees();
     let mut best_tree_writer: Option<BitWriter> = None;
     let mut learned_estimated_savings: Option<f64> = None;
 
@@ -743,6 +776,7 @@ fn encode_frame_lossless_core_impl(
                 pool,
                 scratch,
                 wp_params,
+                use_wp,
                 &mut candidate,
             ) {
                 learned_estimated_savings = Some(estimated_savings);
@@ -761,6 +795,7 @@ fn encode_frame_lossless_core_impl(
             pool,
             scratch,
             wp_params,
+            use_wp,
             &mut candidate,
         ) {
             learned_estimated_savings = Some(estimated_savings);
@@ -780,7 +815,7 @@ fn encode_frame_lossless_core_impl(
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
-    if compare_tree_candidates {
+    if compare_tree_candidates && use_wp {
         let mut candidate = BitWriter::new();
         if single_group {
             if try_encode_context_tree_single_group(
@@ -1168,6 +1203,7 @@ pub(crate) fn encode_modular_xyb_atlas(
     has_alpha: bool,
     lattice_scale: u32,
     speed: crate::Speed,
+    use_wp: bool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
@@ -1245,11 +1281,11 @@ pub(crate) fn encode_modular_xyb_atlas(
         let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
         let preds = if slow {
             vec![
-                choose_predictor_for_plane(pget, nb_colors, num_c),
-                choose_predictor_for_plane(iget, xsize, ysize),
+                choose_predictor_for_plane(pget, nb_colors, num_c, use_wp),
+                choose_predictor_for_plane(iget, xsize, ysize, use_wp),
             ]
         } else {
-            vec![PREDICTOR_WEIGHTED; 2]
+            vec![fixed_predictor(use_wp); 2]
         };
         tokenize_plane(
             channel_to_context(0, 2),
@@ -1278,9 +1314,9 @@ pub(crate) fn encode_modular_xyb_atlas(
         for (c, data) in ch.iter().enumerate() {
             let get = |gx: usize, gy: usize| data[gy * xsize + gx];
             let pred = if slow {
-                choose_predictor_for_plane(get, xsize, ysize)
+                choose_predictor_for_plane(get, xsize, ysize, use_wp)
             } else {
-                PREDICTOR_WEIGHTED
+                fixed_predictor(use_wp)
             };
             tokenize_plane(
                 channel_to_context(c, num_c),
@@ -1301,12 +1337,12 @@ pub(crate) fn encode_modular_xyb_atlas(
                 |_, _| 0,
                 xsize,
                 ysize,
-                PREDICTOR_WEIGHTED,
+                fixed_predictor(use_wp),
                 grad_pack_fn,
                 &mut scratch.gradient,
                 &mut tokens,
             );
-            preds.push(PREDICTOR_WEIGHTED);
+            preds.push(fixed_predictor(use_wp));
         }
         (preds, num_c)
     };
@@ -1527,6 +1563,7 @@ fn encode_squeeze_single_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    use_wp: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -1595,10 +1632,10 @@ fn encode_squeeze_single_group(
             let data = &ch.data;
             let w = ch.w;
             let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            choose_predictor_for_plane(get, ch.w, ch.h)
+            choose_predictor_for_plane(get, ch.w, ch.h, use_wp)
         })
     } else {
-        vec![PREDICTOR_WEIGHTED; nb]
+        vec![fixed_predictor(use_wp); nb]
     };
     let channel_tokens = pool.steal_map(scratch, nb, |c, scratch| {
         let ch = &channels[c];
@@ -1672,32 +1709,39 @@ struct SqueezePredictorCost {
 impl SqueezePredictorCost {
     /// Add one independently predicted modular crop. Weighted prediction state
     /// resets here because the decoder resets it for every modular sub-image.
-    fn add_crop(&mut self, get: impl Fn(usize, usize) -> i32, w: usize, h: usize) {
+    fn add_crop(&mut self, get: impl Fn(usize, usize) -> i32, w: usize, h: usize, use_wp: bool) {
         if w == 0 || h == 0 {
             return;
         }
+        let disabled = !use_wp;
         let mut wp = WpState::new(w);
         for y in 0..h {
             for x in 0..w {
                 let value = get(x, y) as i64;
                 let neighbors = predictor_neighbors(&get, x, y, w);
-                let weighted = wp.predict(
-                    x,
-                    y,
-                    neighbors.top,
-                    neighbors.left,
-                    neighbors.top_right,
-                    neighbors.top_left,
-                    neighbors.top_top,
-                );
+                let weighted = if disabled {
+                    0
+                } else {
+                    wp.predict(
+                        x,
+                        y,
+                        neighbors.top,
+                        neighbors.left,
+                        neighbors.top_right,
+                        neighbors.top_left,
+                        neighbors.top_top,
+                    )
+                };
                 self.costs.add(value, neighbors, weighted);
-                wp.update(value, x, y);
+                if !disabled {
+                    wp.update(value, x, y);
+                }
             }
         }
     }
 
-    fn predictor(&self) -> u32 {
-        self.costs.best_predictor()
+    fn predictor(&self, use_wp: bool) -> u32 {
+        self.costs.best_predictor(use_wp)
     }
 }
 
@@ -1751,6 +1795,7 @@ fn encode_squeeze_multigroup(
     num_ac_groups: usize,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    use_wp: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -1796,7 +1841,7 @@ fn encode_squeeze_multigroup(
             (0..nb).map(|_| SqueezePredictorCost::default()).collect();
         for c in 0..split {
             let ch = &channels[c];
-            costs[c].add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h);
+            costs[c].add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h, use_wp);
         }
         for gy in 0..ysize_dc_groups {
             for gx in 0..xsize_dc_groups {
@@ -1810,7 +1855,12 @@ fn encode_squeeze_multigroup(
                     1000,
                     |within, c, x0, y0, w, h| {
                         let ch = &channels[c];
-                        costs[within].add_crop(|x, y| ch.data[(y0 + y) * ch.w + x0 + x], w, h);
+                        costs[within].add_crop(
+                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
+                            w,
+                            h,
+                            use_wp,
+                        );
                     },
                 );
             }
@@ -1827,14 +1877,19 @@ fn encode_squeeze_multigroup(
                     2,
                     |within, c, x0, y0, w, h| {
                         let ch = &channels[c];
-                        costs[within].add_crop(|x, y| ch.data[(y0 + y) * ch.w + x0 + x], w, h);
+                        costs[within].add_crop(
+                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
+                            w,
+                            h,
+                            use_wp,
+                        );
                     },
                 );
             }
         }
-        costs.iter().map(SqueezePredictorCost::predictor).collect()
+        costs.iter().map(|c| c.predictor(use_wp)).collect()
     } else {
-        vec![PREDICTOR_WEIGHTED; nb]
+        vec![fixed_predictor(use_wp); nb]
     };
 
     let distance_ctx = nb as u32;
@@ -2065,6 +2120,7 @@ fn try_encode_palette_single_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    use_wp: bool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
@@ -2127,11 +2183,11 @@ fn try_encode_palette_single_group(
     // 5) Slow searches predictors per channel; Fast stays fixed Weighted.
     let preds = if speed == crate::Speed::Slow {
         [
-            choose_predictor_for_plane(pget, nb_colors, num_c),
-            choose_predictor_for_plane(iget, xsize, ysize),
+            choose_predictor_for_plane(pget, nb_colors, num_c, use_wp),
+            choose_predictor_for_plane(iget, xsize, ysize, use_wp),
         ]
     } else {
-        [PREDICTOR_WEIGHTED; 2]
+        [fixed_predictor(use_wp); 2]
     };
 
     // 6) Frame header + single section (mirrors the RGB single-group layout).
@@ -2255,6 +2311,7 @@ fn local_palette_is_better(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    use_wp: bool,
     scratch: &mut CoderScratch,
 ) -> bool {
     let nb_chans = 3 + usize::from(alpha.is_some());
@@ -2264,15 +2321,17 @@ fn local_palette_is_better(
                 |x, y| palette.palette[y * palette.nb_colors + x],
                 palette.nb_colors,
                 nb_chans,
+                use_wp,
             ),
             choose_predictor_for_plane(
                 |x, y| palette.indices[y * palette.w + x],
                 palette.w,
                 palette.h,
+                use_wp,
             ),
         ]
     } else {
-        [PREDICTOR_WEIGHTED; 2]
+        [fixed_predictor(use_wp); 2]
     };
     let mut palette_tokens =
         Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h);
@@ -2320,6 +2379,7 @@ fn local_palette_is_better(
                         |x, y| plane[(y0 + y) * xsize + x0 + x],
                         palette.w,
                         palette.h,
+                        use_wp,
                     )
                 } else {
                     let alpha = alpha.expect("alpha channel must exist");
@@ -2327,12 +2387,13 @@ fn local_palette_is_better(
                         |x, y| alpha.get_i32((y0 + y) * xsize + x0 + x),
                         palette.w,
                         palette.h,
+                        use_wp,
                     )
                 }
             })
             .collect()
     } else {
-        vec![PREDICTOR_WEIGHTED; nb_chans]
+        vec![fixed_predictor(use_wp); nb_chans]
     };
     let plain_lz = tokenize_runs_with_wp(
         linear,
@@ -2447,6 +2508,7 @@ fn try_encode_local_palette_multi_group(
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
+    use_wp: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -2488,6 +2550,7 @@ fn try_encode_local_palette_multi_group(
                 min_symbol,
                 grad_pack_fn,
                 speed,
+                use_wp,
                 scratch,
             )
         });
@@ -2516,6 +2579,7 @@ fn try_encode_local_palette_multi_group(
                 min_symbol,
                 grad_pack_fn,
                 speed,
+                use_wp,
                 scratch,
             )
             .then_some(palette)
@@ -2537,12 +2601,14 @@ fn try_encode_local_palette_multi_group(
                             |x, y| palette.palette[y * palette.nb_colors + x],
                             palette.nb_colors,
                             nb_chans,
+                            use_wp,
                         );
                     } else if slot == 1 {
                         cost.add_crop(
                             |x, y| palette.indices[y * palette.w + x],
                             palette.w,
                             palette.h,
+                            use_wp,
                         );
                     }
                     continue;
@@ -2556,16 +2622,21 @@ fn try_encode_local_palette_multi_group(
                 let h = GROUP_DIM.min(ysize - y0);
                 if slot < 3 {
                     let plane = linear.plane_data(slot);
-                    cost.add_crop(|x, y| plane[(y0 + y) * xsize + x0 + x], w, h);
+                    cost.add_crop(|x, y| plane[(y0 + y) * xsize + x0 + x], w, h, use_wp);
                 } else {
                     let alpha = alpha.expect("alpha slot requires alpha channel");
-                    cost.add_crop(|x, y| alpha.get_i32((y0 + y) * xsize + x0 + x), w, h);
+                    cost.add_crop(
+                        |x, y| alpha.get_i32((y0 + y) * xsize + x0 + x),
+                        w,
+                        h,
+                        use_wp,
+                    );
                 }
             }
-            cost.predictor()
+            cost.predictor(use_wp)
         })
     } else {
-        vec![PREDICTOR_WEIGHTED; nb_chans]
+        vec![fixed_predictor(use_wp); nb_chans]
     };
 
     let distance_ctx = nb_chans as u32;
@@ -3407,10 +3478,12 @@ impl PredictorCosts {
         self.total += 1;
     }
 
-    fn best_predictor(&self) -> u32 {
-        let mut best_id = SLOW_PREDICTORS[0];
-        let mut best_bits = entropy_of_hist(&self.histograms[0], self.total);
-        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate().skip(1) {
+    fn best_predictor(&self, use_wp: bool) -> u32 {
+        // Without WP the Weighted candidate (index 0) is skipped.
+        let first = usize::from(!use_wp);
+        let mut best_id = SLOW_PREDICTORS[first];
+        let mut best_bits = entropy_of_hist(&self.histograms[first], self.total);
+        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate().skip(first + 1) {
             let bits = entropy_of_hist(&self.histograms[candidate], self.total);
             if bits < best_bits {
                 best_bits = bits;
@@ -3423,8 +3496,13 @@ impl PredictorCosts {
 
 /// Evaluate all Slow-mode predictors in one traversal and choose the lowest
 /// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
-fn choose_predictor_for_plane(get: impl Fn(usize, usize) -> i32, w: usize, h: usize) -> u32 {
-    choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT)
+fn choose_predictor_for_plane(
+    get: impl Fn(usize, usize) -> i32,
+    w: usize,
+    h: usize,
+    use_wp: bool,
+) -> u32 {
+    choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT, use_wp)
 }
 
 fn choose_predictor_for_plane_with_wp(
@@ -3432,30 +3510,38 @@ fn choose_predictor_for_plane_with_wp(
     w: usize,
     h: usize,
     wp_params: WpParams,
+    use_wp: bool,
 ) -> u32 {
     if w == 0 || h == 0 {
-        return PREDICTOR_WEIGHTED;
+        return fixed_predictor(use_wp);
     }
+    let disabled = !use_wp;
     let mut wp = WpState::with_params(w, wp_params);
     let mut costs = PredictorCosts::default();
     for gy in 0..h {
         for gx in 0..w {
             let value = get(gx, gy) as i64;
             let neighbors = predictor_neighbors(&get, gx, gy, w);
-            let weighted = wp.predict(
-                gx,
-                gy,
-                neighbors.top,
-                neighbors.left,
-                neighbors.top_right,
-                neighbors.top_left,
-                neighbors.top_top,
-            );
+            let weighted = if disabled {
+                0
+            } else {
+                wp.predict(
+                    gx,
+                    gy,
+                    neighbors.top,
+                    neighbors.left,
+                    neighbors.top_right,
+                    neighbors.top_left,
+                    neighbors.top_top,
+                )
+            };
             costs.add(value, neighbors, weighted);
-            wp.update(value, gx, gy);
+            if !disabled {
+                wp.update(value, gx, gy);
+            }
         }
     }
-    costs.best_predictor()
+    costs.best_predictor(use_wp)
 }
 
 fn choose_predictors_with_wp(
@@ -3466,13 +3552,20 @@ fn choose_predictors_with_wp(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
+    use_wp: bool,
 ) -> [u32; 4] {
-    let mut preds = [PREDICTOR_WEIGHTED; 4];
+    let mut preds = [fixed_predictor(use_wp); 4];
     let num_channels = 3 + usize::from(alpha.is_some());
     let selected = pool.steal_map(scratch, num_channels, |chan, _scratch| {
         if chan < 3 {
             let pd = linear.plane_data(chan);
-            choose_predictor_for_plane_with_wp(|x, y| pd[y * xsize + x], xsize, ysize, wp_params)
+            choose_predictor_for_plane_with_wp(
+                |x, y| pd[y * xsize + x],
+                xsize,
+                ysize,
+                wp_params,
+                use_wp,
+            )
         } else {
             let a = alpha.expect("alpha channel must exist");
             choose_predictor_for_plane_with_wp(
@@ -3480,12 +3573,13 @@ fn choose_predictors_with_wp(
                 xsize,
                 ysize,
                 wp_params,
+                use_wp,
             )
         }
     });
     preds[..num_channels].copy_from_slice(&selected);
     if alpha.is_none() {
-        preds[3] = PREDICTOR_WEIGHTED;
+        preds[3] = fixed_predictor(use_wp);
     }
     preds
 }
@@ -4022,8 +4116,10 @@ fn walk_channel_ma<F: Fn(usize, usize) -> i32>(
     gh: usize,
     chan: u32,
     wp_params: WpParams,
+    use_wp: bool,
     mut visit: impl FnMut(usize, usize, i64, &[i32; NUM_MA_PROPS], PredictorNeighbors, i64),
 ) {
+    let disabled = !use_wp;
     let mut wp = WpState::with_params(gw, wp_params);
     let mut p = [0i32; NUM_MA_PROPS];
     p[0] = chan as i32;
@@ -4074,19 +4170,23 @@ fn walk_channel_ma<F: Fn(usize, usize) -> i32>(
             p[12] = (n.top - n.top_right) as i32;
             p[13] = (n.top - n.top_top) as i32;
             p[14] = (n.left - n.left_left) as i32;
-            let wp_pred = wp.predict_and_update(
-                value,
-                x,
-                row,
-                WpNeighbors {
-                    north: n.top,
-                    west: n.left,
-                    north_east: n.top_right,
-                    north_west: n.top_left,
-                    north_north: n.top_top,
-                },
-            );
-            p[15] = wp.wp_prop as i32;
+            let wp_pred = if disabled {
+                0
+            } else {
+                wp.predict_and_update(
+                    value,
+                    x,
+                    row,
+                    WpNeighbors {
+                        north: n.top,
+                        west: n.left,
+                        north_east: n.top_right,
+                        north_west: n.top_left,
+                        north_north: n.top_top,
+                    },
+                )
+            };
+            p[15] = if disabled { 0 } else { wp.wp_prop as i32 };
             visit(x, y, value, &p, n, wp_pred);
             west_west = west;
             west = value;
@@ -4102,10 +4202,12 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
     gh: usize,
     chan: u32,
     wp_params: WpParams,
+    use_wp: bool,
     stride: usize,
     samples: &mut MaSamples,
 ) {
     debug_assert!(stride != 0);
+    let disabled = !use_wp;
     let mut wp = WpState::with_params(gw, wp_params);
     let mut until_sample = stride;
     for y in 0..gh {
@@ -4128,14 +4230,18 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
                 north
             };
             let top_top = if y > 1 { get(x, y - 2) as i64 } else { north };
-            let wp_neighbors = WpNeighbors {
-                north,
-                west: left,
-                north_east: top_right,
-                north_west: top_left,
-                north_north: top_top,
+            let wp_pred = if disabled {
+                0
+            } else {
+                let wp_neighbors = WpNeighbors {
+                    north,
+                    west: left,
+                    north_east: top_right,
+                    north_west: top_left,
+                    north_north: top_top,
+                };
+                wp.predict_and_update(value, x, row, wp_neighbors)
             };
-            let wp_pred = wp.predict_and_update(value, x, row, wp_neighbors);
             let local_gradient = (left + north - top_left) as i32;
 
             until_sample -= 1;
@@ -4169,7 +4275,7 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
                 props[12] = (north - top_right) as i32;
                 props[13] = (north - top_top) as i32;
                 props[14] = (left - neighbors.left_left) as i32;
-                props[15] = wp.wp_prop as i32;
+                props[15] = if disabled { 0 } else { wp.wp_prop as i32 };
 
                 let mut tok = [0u8; NUM_MA_PREDS];
                 let mut nbits = [0u8; NUM_MA_PREDS];
@@ -4196,18 +4302,27 @@ fn tokenize_channel_ma<F: Fn(usize, usize) -> i32>(
     gh: usize,
     chan: u32,
     wp_params: WpParams,
+    use_wp: bool,
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     out: &mut Vec<Token>,
 ) {
-    walk_channel_ma(get, gw, gh, chan, wp_params, |_x, _y, v, p, n, wp_pred| {
-        let (node, pred) = tree.lookup(p);
-        let pv = predictor_value(pred, n, wp_pred);
-        out.push(Token::new(
-            leaf_ctx[node as usize],
-            pack_signed((v - pv) as i32),
-        ));
-    });
+    walk_channel_ma(
+        get,
+        gw,
+        gh,
+        chan,
+        wp_params,
+        use_wp,
+        |_x, _y, v, p, n, wp_pred| {
+            let (node, pred) = tree.lookup(p);
+            let pv = predictor_value(pred, n, wp_pred);
+            out.push(Token::new(
+                leaf_ctx[node as usize],
+                pack_signed((v - pv) as i32),
+            ));
+        },
+    );
 }
 
 /// BFS-emit a learned tree (matches libjxl's FIFO tree decode). Returns
@@ -4255,6 +4370,7 @@ fn learn_and_gate_ma_tree(
     samples: &MaSamples,
     stride: usize,
     min_symbol: u32,
+    use_wp: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<(LearnedTree, Vec<Token>, Vec<u32>, u32)> {
@@ -4296,6 +4412,7 @@ fn learn_and_gate_ma_tree(
                 max_leaves: MA_MAX_LEAVES,
                 split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
                 min_node: MA_MIN_NODE_SAMPLES,
+                allow_wp: use_wp,
             },
             pool,
             scratch,
@@ -4320,6 +4437,7 @@ fn learn_and_gate_ma_tree(
             max_leaves: MA_COARSE_MAX_LEAVES,
             split_cost_bits: MA_SPLIT_COST_BITS / coarse_scale as f32,
             min_node: MA_MIN_NODE_SAMPLES,
+            allow_wp: use_wp,
         },
         pool,
         scratch,
@@ -4339,6 +4457,7 @@ fn learn_and_gate_ma_tree(
                 max_leaves: MA_MAX_LEAVES,
                 split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
                 min_node: MA_MIN_NODE_SAMPLES,
+                allow_wp: use_wp,
             },
             coarse.tree.clone(),
             pool,
@@ -4372,6 +4491,7 @@ fn try_encode_learned_tree_single_group(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
+    use_wp: bool,
     writer: &mut BitWriter,
 ) -> Option<f64> {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
@@ -4387,6 +4507,7 @@ fn try_encode_learned_tree_single_group(
                 ysize,
                 chan as u32,
                 wp_params,
+                use_wp,
                 stride,
                 &mut samples,
             );
@@ -4398,6 +4519,7 @@ fn try_encode_learned_tree_single_group(
                 ysize,
                 chan as u32,
                 wp_params,
+                use_wp,
                 stride,
                 &mut samples,
             );
@@ -4411,7 +4533,7 @@ fn try_encode_learned_tree_single_group(
     }
 
     let (tree, tree_tokens, leaf_ctx, num_ctx) =
-        learn_and_gate_ma_tree(&samples, stride, min_symbol, pool, scratch)?;
+        learn_and_gate_ma_tree(&samples, stride, min_symbol, use_wp, pool, scratch)?;
     let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
     drop(samples);
 
@@ -4425,6 +4547,7 @@ fn try_encode_learned_tree_single_group(
                 ysize,
                 chan as u32,
                 wp_params,
+                use_wp,
                 &tree,
                 &leaf_ctx,
                 &mut tokens,
@@ -4437,6 +4560,7 @@ fn try_encode_learned_tree_single_group(
                 ysize,
                 chan as u32,
                 wp_params,
+                use_wp,
                 &tree,
                 &leaf_ctx,
                 &mut tokens,
@@ -4503,6 +4627,7 @@ fn try_encode_learned_tree_multi_group(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
+    use_wp: bool,
     writer: &mut BitWriter,
 ) -> Option<f64> {
     let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
@@ -4520,11 +4645,20 @@ fn try_encode_learned_tree_multi_group(
         for chan in 0..3usize {
             let pd = linear.plane_data(chan);
             let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-            sample_channel_ma(&get, gw, gh, chan as u32, wp_params, stride, &mut samples);
+            sample_channel_ma(
+                &get,
+                gw,
+                gh,
+                chan as u32,
+                wp_params,
+                use_wp,
+                stride,
+                &mut samples,
+            );
         }
         if let Some(a) = alpha {
             let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-            sample_channel_ma(&get, gw, gh, 3, wp_params, stride, &mut samples);
+            sample_channel_ma(&get, gw, gh, 3, wp_params, use_wp, stride, &mut samples);
         }
         samples
     });
@@ -4536,7 +4670,7 @@ fn try_encode_learned_tree_multi_group(
     drop(group_samples);
 
     let (tree, tree_tokens, leaf_ctx, num_ctx) =
-        learn_and_gate_ma_tree(&samples, stride, min_symbol, pool, scratch)?;
+        learn_and_gate_ma_tree(&samples, stride, min_symbol, use_wp, pool, scratch)?;
     let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
     drop(samples);
 
@@ -4563,6 +4697,7 @@ fn try_encode_learned_tree_multi_group(
                     gh,
                     chan as u32,
                     wp_params,
+                    use_wp,
                     &tree,
                     &leaf_ctx,
                     &mut toks,
@@ -4570,7 +4705,9 @@ fn try_encode_learned_tree_multi_group(
             }
             if let Some(a) = alpha {
                 let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                tokenize_channel_ma(&get, gw, gh, 3, wp_params, &tree, &leaf_ctx, &mut toks);
+                tokenize_channel_ma(
+                    &get, gw, gh, 3, wp_params, use_wp, &tree, &leaf_ctx, &mut toks,
+                );
             }
             deep_lz.with_depth(|depth| {
                 lz77_compress_for_speed_with_depth(
@@ -5262,6 +5399,7 @@ mod rate_selection_tests {
             false,
             3,
             crate::Speed::Slow,
+            crate::DecodingSpeed::Slow,
             &pool,
             &mut scratch,
             ModularFrameKind::Regular,
@@ -5325,6 +5463,7 @@ mod ma_sampling_tests {
             height,
             2,
             params,
+            true,
             |_x, _y, value, p, n, wp_pred| {
                 counter += 1;
                 if !counter.is_multiple_of(stride) {
@@ -5360,7 +5499,7 @@ mod ma_sampling_tests {
                 for &params in &WpParams::PRESETS {
                     let expected = reference_samples(&plane, width, height, stride, params);
                     let mut actual = MaSamples::new();
-                    sample_channel_ma(&get, width, height, 2, params, stride, &mut actual);
+                    sample_channel_ma(&get, width, height, 2, params, true, stride, &mut actual);
                     assert_eq!(
                         actual.props, expected.props,
                         "properties: {width}x{height}, stride={stride}, params={params:?}"
@@ -5487,11 +5626,11 @@ mod predictor_tests {
         }
 
         assert_eq!(
-            choose_predictor_for_plane(|x, y| horizontal[y * W + x], W, H),
+            choose_predictor_for_plane(|x, y| horizontal[y * W + x], W, H, true),
             PREDICTOR_SELECT
         );
         assert_eq!(
-            choose_predictor_for_plane(|x, y| vertical[y * W + x], W, H),
+            choose_predictor_for_plane(|x, y| vertical[y * W + x], W, H, true),
             PREDICTOR_SELECT
         );
     }
@@ -5529,7 +5668,7 @@ mod predictor_tests {
         }
 
         assert_eq!(
-            choose_predictor_for_plane(|x, y| plane[y * W + x], W, H),
+            choose_predictor_for_plane(|x, y| plane[y * W + x], W, H, true),
             PREDICTOR_AVERAGE4
         );
     }
