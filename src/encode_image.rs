@@ -235,6 +235,35 @@ pub enum Speed {
     Slow,
 }
 
+/// Decode-speed/density tradeoff for **lossless** encoding. Ignored for lossy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodingSpeed {
+    /// No Weighted Predictor and no meta-adaptive context trees: the decoder
+    /// takes its fixed-predictor fast path. Roughly 8-10x faster decode than
+    /// `Slow` for `Speed::Slow` encodes, at ~+15..30% size.
+    Fastest,
+    /// No Weighted Predictor. Roughly 1.15-1.2x faster decode for
+    /// `Speed::Slow` encodes (~+1..3% size), ~3.5x for `Speed::Fast` encodes
+    /// (~+4% size).
+    Fast,
+    /// All coding tools; densest output, slowest to decode.
+    #[default]
+    Slow,
+}
+
+impl DecodingSpeed {
+    /// Whether the emitted stream may use the Weighted Predictor (and the
+    /// WP-error tree property, which also forces decoder-side WP state).
+    pub(crate) fn use_weighted_predictor(self) -> bool {
+        matches!(self, DecodingSpeed::Slow)
+    }
+
+    /// Whether the encoder may signal per-pixel meta-adaptive context trees.
+    pub(crate) fn use_ma_trees(self) -> bool {
+        !matches!(self, DecodingSpeed::Fastest)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     pub distance: f32,
@@ -297,6 +326,9 @@ pub struct EncodeConfig {
     pub linear_below: f32,
     pub num_threads: usize,
     pub speed: Speed,
+    /// Decode-speed/density tradeoff for lossless encoding (see
+    /// [`DecodingSpeed`]). Ignored for lossy.
+    pub decoding_speed: DecodingSpeed,
     /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
     /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
     /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
@@ -337,6 +369,8 @@ pub(crate) struct EncodeConfigImpl {
     /// Worker-thread count for VarDCT encoding (see `EncodeConfig::num_threads`).
     pub(crate) num_threads: usize,
     pub(crate) speed: Speed,
+    /// Decode-speed/density tradeoff for lossless (see `EncodeConfig::decoding_speed`).
+    pub(crate) decoding_speed: DecodingSpeed,
     /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
     pub(crate) dark_aq: Option<DarkAqConfig>,
 }
@@ -364,6 +398,7 @@ impl Default for EncodeConfig {
                 .unwrap_or(NonZero::new(1).unwrap())
                 .get(),
             speed: Speed::Fast,
+            decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
         }
     }
@@ -395,6 +430,7 @@ impl Default for EncodeConfigImpl {
                 .unwrap_or(NonZero::new(1).unwrap())
                 .get(),
             speed: Speed::Fast,
+            decoding_speed: DecodingSpeed::Slow,
             dark_aq: Some(DarkAqConfig::default()),
         }
     }
@@ -485,6 +521,7 @@ impl EncodeConfigImpl {
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
+            .with_decoding_speed(config.decoding_speed)
             .with_boost(config.boost)
     }
 
@@ -495,6 +532,11 @@ impl EncodeConfigImpl {
 
     pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
+        self
+    }
+
+    pub(crate) fn with_decoding_speed(mut self, decoding_speed: DecodingSpeed) -> Self {
+        self.decoding_speed = decoding_speed;
         self
     }
 
@@ -640,6 +682,11 @@ impl EncodeConfig {
     }
 
     /// Select the transform-search speed/effort tradeoff.
+    pub fn with_decoding_speed(mut self, decoding_speed: DecodingSpeed) -> Self {
+        self.decoding_speed = decoding_speed;
+        self
+    }
+
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         if speed == Speed::Slow {
@@ -823,6 +870,7 @@ pub fn encode_image(
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
+                .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -892,6 +940,7 @@ pub fn encode_image_with_alpha(
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
+                .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1088,6 +1137,7 @@ fn encode_gray_impl(
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
+                .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1324,6 +1374,7 @@ fn encode_gray_high_depth_impl(
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
+                .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1398,6 +1449,7 @@ fn encode_high_depth_rgba(
                 .with_color_encoding(config.color_encoding)
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
+                .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1980,6 +2032,7 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         config.patches,
         num_color,
         config.speed,
+        config.decoding_speed,
         config.num_threads,
         &mut w,
     );
@@ -2776,6 +2829,61 @@ mod encode_smoke_tests {
             .expect("multi-threaded lossless encode failed");
 
             assert_eq!(single, threaded, "output changed for {speed:?}");
+        }
+    }
+
+    #[test]
+    fn decoding_speed_tiers_encode_and_restrict_tools() {
+        const WIDTH: usize = 96;
+        const HEIGHT: usize = 96;
+        // Smooth per-channel gradients with edges and mild texture; enough
+        // distinct colors to keep the palette path out, so WP and the learned
+        // tree both normally engage.
+        let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| {
+                let (px, c) = (i / 3, i % 3);
+                let (x, y) = (px % WIDTH, px / WIDTH);
+                let (x, y, c) = (x as i64, y as i64, c as i64);
+                let base = if (x / 24 + y / 24) % 2 == 0 {
+                    x + 2 * y + 31 * c
+                } else {
+                    255 - (2 * x + y + 17 * c)
+                };
+                (base as u8).wrapping_add(((x * y) % 5) as u8)
+            })
+            .collect();
+
+        for speed in [Speed::Fast, Speed::Slow] {
+            let encode = |ds: DecodingSpeed| {
+                encode_image(
+                    &input,
+                    WIDTH,
+                    HEIGHT,
+                    &lossless()
+                        .with_speed(speed)
+                        .with_decoding_speed(ds)
+                        .with_num_threads(1),
+                )
+                .expect("lossless encode failed")
+            };
+            let slow_tier = encode(DecodingSpeed::Slow);
+            let fast_tier = encode(DecodingSpeed::Fast);
+            let fastest_tier = encode(DecodingSpeed::Fastest);
+
+            // Unset == Slow (the default: all tools).
+            let unset = encode_image(
+                &input,
+                WIDTH,
+                HEIGHT,
+                &lossless().with_speed(speed).with_num_threads(1),
+            )
+            .expect("lossless encode failed");
+            assert_eq!(slow_tier, unset, "{speed:?}: Slow must equal unset");
+
+            // Dropping WP must change the stream on this content.
+            assert_ne!(slow_tier, fast_tier, "{speed:?}: Fast tier inert");
+            // Fastest differs from Slow too (no WP, no trees).
+            assert_ne!(slow_tier, fastest_tier, "{speed:?}: Fastest tier inert");
         }
     }
 

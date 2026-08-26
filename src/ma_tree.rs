@@ -40,6 +40,18 @@ pub(crate) const NUM_MA_PREDS: usize = 14;
 /// Properties the learner may split on (skips the constant stream id).
 const SPLIT_PROPS: [u8; 15] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
+/// Split candidates, minus the WP-error property (last) when WP is excluded.
+fn split_props(allow_wp: bool) -> &'static [u8] {
+    if !allow_wp {
+        &SPLIT_PROPS[..SPLIT_PROPS.len() - 1]
+    } else {
+        &SPLIT_PROPS
+    }
+}
+
+/// Weighted predictor id in the decoder predictor enumeration.
+const PRED_WEIGHTED: usize = 6;
+
 /// Split candidates examined per property per node. Sixteen quantiles retain
 /// nearly all the useful threshold resolution while bounding the repeated
 /// histogram work performed for every property of every grown leaf.
@@ -154,6 +166,9 @@ pub(crate) struct MaLearnParams {
     pub(crate) max_leaves: usize,
     pub(crate) split_cost_bits: f32,
     pub(crate) min_node: usize,
+    /// Whether leaves may use the Weighted Predictor and splits the WP-error
+    /// property. Both force per-pixel WP state in the decoder.
+    pub(crate) allow_wp: bool,
 }
 
 /// Reusable scratch for scoring one property of one MA-tree node. One lives in
@@ -338,9 +353,13 @@ impl<'a> Learner<'a> {
             }
         }
         let total = idx.len() as u32;
+        let skip_wp = !self.p.allow_wp;
         let mut best = f32::INFINITY;
         let mut best_pred = 0usize;
         for p in 0..NUM_MA_PREDS {
+            if skip_wp && p == PRED_WEIGHTED {
+                continue;
+            }
             let bits = hist_entropy_bits(&self.all_hist[p * alpha..(p + 1) * alpha], total)
                 + self.all_nbits[p] as f32;
             if bits < best {
@@ -374,9 +393,10 @@ impl<'a> Learner<'a> {
             let total_hist =
                 self.all_hist[base_pred * alphabet..(base_pred + 1) * alphabet].to_vec();
             let samples = self.s;
+            let props = split_props(self.p.allow_wp);
             let scores = if range.len() >= PARALLEL_PROPERTY_MIN_SAMPLES && pool.num_threads() > 1 {
-                pool.steal_map(scratch, SPLIT_PROPS.len(), |job, worker_scratch| {
-                    let prop = SPLIT_PROPS[job] as usize;
+                pool.steal_map(scratch, props.len(), |job, worker_scratch| {
+                    let prop = props[job] as usize;
                     best_split_on_prop(
                         samples,
                         range,
@@ -388,7 +408,7 @@ impl<'a> Learner<'a> {
                     )
                 })
             } else {
-                SPLIT_PROPS
+                props
                     .iter()
                     .map(|&prop| {
                         best_split_on_prop(
@@ -403,7 +423,7 @@ impl<'a> Learner<'a> {
                     })
                     .collect()
             };
-            for (&prop, score) in SPLIT_PROPS.iter().zip(scores) {
+            for (&prop, score) in props.iter().zip(scores) {
                 if let Some((t, bits)) = score
                     && (best.is_none() || bits < best.unwrap().2)
                 {
@@ -691,6 +711,7 @@ mod tests {
                 max_leaves: 8,
                 split_cost_bits: 10.0,
                 min_node: 64,
+                allow_wp: true,
             },
             &serial_pool,
             &mut serial_scratch,
@@ -704,6 +725,7 @@ mod tests {
                 max_leaves: 8,
                 split_cost_bits: 10.0,
                 min_node: 64,
+                allow_wp: true,
             },
             &parallel_pool,
             &mut parallel_scratch,
@@ -741,6 +763,7 @@ mod tests {
                 max_leaves: 8,
                 split_cost_bits: 10.0,
                 min_node: 64,
+                allow_wp: true,
             },
             &ThreadPool::new(1),
             &mut CoderScratch::default(),
@@ -783,6 +806,7 @@ mod tests {
             max_leaves: 16,
             split_cost_bits: 10.0,
             min_node: 64,
+            allow_wp: true,
         };
         let pool = ThreadPool::new(1);
         let indexed = learn_ma_tree_indexed(
