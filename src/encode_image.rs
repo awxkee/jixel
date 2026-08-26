@@ -235,12 +235,19 @@ pub enum Speed {
     Slow,
 }
 
-/// Decode-speed/density tradeoff for **lossless** encoding.
+/// Decode-speed/density tradeoff for **lossless** encoding. Ignored for lossy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodingSpeed {
-    #[default]
+    /// No Weighted Predictor and no meta-adaptive context trees: the decoder
+    /// takes its fixed-predictor fast path. Roughly 8-10x faster decode than
+    /// `Slow` for `Speed::Slow` encodes, at ~+15..30% size.
     Fastest,
+    /// No Weighted Predictor. Roughly 1.15-1.2x faster decode for
+    /// `Speed::Slow` encodes (~+1..3% size), ~3.5x for `Speed::Fast` encodes
+    /// (~+4% size).
     Fast,
+    /// All coding tools; densest output, slowest to decode.
+    #[default]
     Slow,
 }
 
@@ -391,7 +398,7 @@ impl Default for EncodeConfig {
                 .unwrap_or(NonZero::new(1).unwrap())
                 .get(),
             speed: Speed::Fast,
-            decoding_speed: DecodingSpeed::Fastest,
+            decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
         }
     }
@@ -2836,6 +2843,7 @@ mod encode_smoke_tests {
             .map(|i| {
                 let (px, c) = (i / 3, i % 3);
                 let (x, y) = (px % WIDTH, px / WIDTH);
+                let (x, y, c) = (x as i64, y as i64, c as i64);
                 let base = if (x / 24 + y / 24) % 2 == 0 {
                     x + 2 * y + 31 * c
                 } else {
@@ -2858,11 +2866,11 @@ mod encode_smoke_tests {
                 )
                 .expect("lossless encode failed")
             };
-            let default_tier = encode(DecodingSpeed::Slow);
+            let slow_tier = encode(DecodingSpeed::Slow);
             let fast_tier = encode(DecodingSpeed::Fast);
             let fastest_tier = encode(DecodingSpeed::Fastest);
 
-            // Unset == Default.
+            // Unset == Slow (the default: all tools).
             let unset = encode_image(
                 &input,
                 WIDTH,
@@ -2870,12 +2878,12 @@ mod encode_smoke_tests {
                 &lossless().with_speed(speed).with_num_threads(1),
             )
             .expect("lossless encode failed");
-            assert_eq!(default_tier, unset, "{speed:?}: Default must equal unset");
+            assert_eq!(slow_tier, unset, "{speed:?}: Slow must equal unset");
 
             // Dropping WP must change the stream on this content.
-            assert_ne!(default_tier, fast_tier, "{speed:?}: Fast tier inert");
-            // Fastest differs from Default too (no WP, no trees).
-            assert_ne!(default_tier, fastest_tier, "{speed:?}: Fastest tier inert");
+            assert_ne!(slow_tier, fast_tier, "{speed:?}: Fast tier inert");
+            // Fastest differs from Slow too (no WP, no trees).
+            assert_ne!(slow_tier, fastest_tier, "{speed:?}: Fastest tier inert");
         }
     }
 
