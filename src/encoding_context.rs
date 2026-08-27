@@ -46,7 +46,11 @@ pub(crate) struct EncodingContext {
     pub(crate) xyb: xyb::XybMatrix,
     /// Transform-merge knobs resolved at this encodes distance.
     pub(crate) merge: ac_strategy::MergeTuning,
-    pub(crate) matrices: &'static DequantMatrices,
+    base_matrices: &'static DequantMatrices,
+    sat_matrices: &'static DequantMatrices,
+    /// Set once per frame (post-XYB, before any table use) by the
+    /// chroma-saturation gate in `frame::encode_frame`.
+    chroma_heavy: std::sync::atomic::AtomicBool,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -95,6 +99,22 @@ pub(crate) struct EncodingContext {
 }
 
 impl EncodingContext {
+    /// The dequant tables for the current frame: the distance-tier default,
+    /// or the saturated-content variant when the chroma gate fired.
+    #[inline]
+    pub(crate) fn matrices(&self) -> &'static DequantMatrices {
+        if self.chroma_heavy.load(std::sync::atomic::Ordering::Relaxed) {
+            self.sat_matrices
+        } else {
+            self.base_matrices
+        }
+    }
+
+    pub(crate) fn set_chroma_heavy(&self, heavy: bool) {
+        self.chroma_heavy
+            .store(heavy, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn new(
         speed: Speed,
         boost: Option<DarkAqConfig>,
@@ -111,7 +131,9 @@ impl EncodingContext {
             boost,
             xyb,
             merge: ac_strategy::MergeTuning::new(distance),
-            matrices: DequantMatrices::new(distance),
+            base_matrices: DequantMatrices::new(distance),
+            sat_matrices: DequantMatrices::new_saturated(distance),
+            chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),

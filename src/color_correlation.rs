@@ -142,7 +142,7 @@ fn compute_cmap_tile(
     distance: f32,
     scratch: &mut CflScratch,
 ) -> (i32, i32) {
-    let matrices = &ctx.matrices;
+    let matrices = ctx.matrices();
     let qm_x: &[f32; 64] = matrices.inv_matrix(0).first_chunk::<64>().unwrap();
     let qm_b: &[f32; 64] = matrices.inv_matrix(2).first_chunk::<64>().unwrap();
 

@@ -1241,6 +1241,13 @@ pub(crate) fn encode_frame(
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
     }
+    // Saturated-content tables are validated under Slow only: at Fast the
+    // same swap buys chroma with a d=1 rate premium instead of saving bytes.
+    ctx.set_chroma_heavy(
+        ctx.speed == crate::Speed::Slow
+            && !is_achromatic
+            && chroma_saturation_stat(&xyb) >= SAT_QM_THRESHOLD,
+    );
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
@@ -1411,6 +1418,26 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 /// X = 0, B = Y — but only up to f32 rounding, since the three mixes are
 /// evaluated with different constants. Snap the planes exact so chroma
 /// quantizes to pure zeros and the CfL fit sees slope 0/1 instead of noise.
+const SAT_QM_THRESHOLD: f32 = 0.055;
+
+fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
+    let mut sum = 0.0;
+    let mut n = 0u64;
+    let mut y = 0;
+    while y < xyb.ysize() {
+        let x_size = xyb.xsize();
+        let xr = &xyb.plane_row(0, y)[..x_size];
+        let yr = &xyb.plane_row(1, y)[..x_size];
+        let br = &xyb.plane_row(2, y)[..x_size];
+        for ((&x, &y), &b) in xr.iter().zip(yr).zip(br).step_by(4) {
+            sum += x.abs() + (b - y).abs();
+            n += 1;
+        }
+        y += 4;
+    }
+    if n == 0 { 0.0 } else { sum / n as f32 }
+}
+
 fn snap_achromatic_xyb(xyb: &mut Image3F) {
     for y in 0..xyb.ysize() {
         let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
@@ -2141,7 +2168,7 @@ fn encode_frame_core(
     }
 
     write_ac_global(
-        ctx.matrices,
+        ctx.matrices(),
         &used_quant_table_slots(&dc_datas),
         &coeff_orders,
         dim.num_groups,
@@ -2601,6 +2628,29 @@ mod tests {
     /// Build one group of `n` tokens in `context`, all carrying `value`.
     fn leaf_tokens(context: u32, value: u32, n: usize) -> Vec<Vec<Token>> {
         vec![(0..n).map(|_| Token::new(context, value)).collect()]
+    }
+
+    #[test]
+    fn chroma_saturation_stat_measures_xyb_deviation() {
+        let mut xyb = crate::image::Image3F::new(16, 16);
+        for y in 0..16 {
+            let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
+            x_row.fill(0.0);
+            y_row.fill(0.5);
+            b_row.fill(0.5);
+        }
+        // Achromatic frames (X = 0, B = Y) read exactly zero.
+        assert_eq!(super::chroma_saturation_stat(&xyb), 0.0);
+
+        for y in 0..16 {
+            let [x_row, _, b_row] = xyb.all_plane_rows_mut(y);
+            x_row.fill(0.02);
+            b_row.fill(0.55);
+        }
+        // |X| + |B - Y| = 0.02 + 0.05 on every sampled pixel.
+        let stat = super::chroma_saturation_stat(&xyb);
+        assert!((stat - 0.07).abs() < 1e-5, "{stat}");
+        assert!(stat >= super::SAT_QM_THRESHOLD);
     }
 
     #[test]

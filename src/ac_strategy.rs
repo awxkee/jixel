@@ -453,8 +453,8 @@ fn strategy_cost64(
             1.0
         };
         let matrix: &[f32] = match strategy {
-            STRATEGY_DCT64X64 => &ctx.matrices.inv_matrix_64x64(c)[..],
-            STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &ctx.matrices.inv_matrix_64x32(c)[..],
+            STRATEGY_DCT64X64 => &ctx.matrices().inv_matrix_64x64(c)[..],
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &ctx.matrices().inv_matrix_64x32(c)[..],
             _ => unreachable!(),
         };
         let (d, r) = channel_rd(
@@ -630,7 +630,7 @@ fn apply_cfl(ctx: &EncodingContext, coeffs: CflXyb<'_>, size: usize, cmap_factor
 
 #[inline]
 fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[f32] {
-    let matrices = &ctx.matrices;
+    let matrices = ctx.matrices();
     match strategy {
         STRATEGY_DCT => &matrices.inv_matrix(channel)[..],
         STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(channel)[..],
