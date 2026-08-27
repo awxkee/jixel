@@ -56,6 +56,7 @@ static DCT8_BANDS: [[f32; 6]; 3] = [
 
 static FLAT_B8_BANDS_HQ: [f32; 6] = [512.0, -0.5, -0.25, 0.0, -0.25, -0.5];
 static FLAT_B8_BANDS_MID: [f32; 6] = [512.0, -0.13, -0.235, -0.276, -0.609, -0.339];
+static SAT_B8_BANDS: [f32; 6] = [512.0, 0.024, -0.517, -0.011, -0.357, -0.674];
 
 fn default_dct8_override(use_coarse: bool, flat_b8: &[f32; 6]) -> BandOverride {
     let mut out = if use_coarse {
@@ -1584,6 +1585,21 @@ impl DequantMatrices {
         }
     }
 
+    pub(crate) fn new_saturated(distance: f32) -> &'static Self {
+        static SAT_DEFAULT: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static SAT_SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static SAT_COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if distance >= QM_DCT8_MIN_DISTANCE {
+            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS)))
+        } else if distance >= QM_SS2_MIN_DISTANCE {
+            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS)))
+        } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
+            SAT_DEFAULT.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS)))
+        } else {
+            Self::new(distance)
+        }
+    }
+
     fn compute(use_ss2: bool, use_coarse_dct8: bool, flat_b8: Option<&[f32; 6]>) -> Self {
         // The large-transform tables depend on the SS2 gate, and DCT8 gets a
         // separate coarser-quality variant. All other tables are shared.
@@ -1850,6 +1866,28 @@ mod tests {
         assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
         let lf_ratio = coarse.inv_matrix(1)[1] / normal.inv_matrix(1)[1];
         assert!((1.0..1.03).contains(&lf_ratio), "{lf_ratio}");
+    }
+
+    #[test]
+    fn saturated_tables_swap_only_above_the_flat_b_gate() {
+        // Near-lossless tier ignores the content gate entirely (the tail pays
+        // for any finer B coding, saturated or not).
+        assert!(std::ptr::eq(
+            DequantMatrices::new_saturated(QM_FLAT_B8_MIN_DISTANCE - 0.01),
+            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01),
+        ));
+        // Every flat-B tier gets a distinct table set with the saturated B row.
+        for d in [0.5, 1.5, 2.5, 4.0] {
+            let sat = DequantMatrices::new_saturated(d);
+            let base = DequantMatrices::new(d);
+            assert!(!std::ptr::eq(sat, base), "d={d}");
+            let table = sat.custom_tables[0].expect("saturated flat table");
+            assert_eq!(
+                table.bands[2][1],
+                f16_bits_to_f32(f32_to_f16_bits(SAT_B8_BANDS[1])),
+                "d={d}"
+            );
+        }
     }
 
     #[test]

@@ -759,7 +759,7 @@ pub(crate) fn write_ac_group(
     qf_threshold: u32,
     out: &mut [Vec<Token>],
 ) -> f32 {
-    let matrices = &ctx.matrices;
+    let matrices = ctx.matrices();
     let xsize_blocks = group_brect.xsize;
     let ysize_blocks = group_brect.ysize;
 
