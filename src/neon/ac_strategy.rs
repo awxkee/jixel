@@ -142,7 +142,7 @@ pub(crate) fn gradient_region_stats_with_chroma_neon(
 /// bounds-validated against `width*height`.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
-pub(crate) fn sse_and_rate_neon(
+pub(crate) fn sse_and_rate_neon<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
@@ -201,7 +201,11 @@ pub(crate) fn sse_and_rate_neon(
 
             let q = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rounded), keep));
 
-            let d = vsubq_f32(a, q);
+            let d = if BIASED {
+                vsubq_f32(a, neon_dequantized_level_f32(q))
+            } else {
+                vsubq_f32(a, q)
+            };
             let d2 = vmulq_f32(d, d);
 
             let active = if y < cy && x < cx {
@@ -244,9 +248,7 @@ pub(crate) fn sse_and_rate_neon(
 
 /// NEON counterpart of `enc_group::dequantized_level_f32`: the decoder's biased
 /// dequant of an integer-valued float level (0 -> 0, +-1 -> +-0.9299455,
-/// q -> q - 0.145/q). Dormant until the biased-distortion selection/rerank
-/// variants land with their margin re-fit (see `dequantized_level_f32`).
-#[allow(dead_code)]
+/// q -> q - 0.145/q)
 #[inline]
 #[target_feature(enable = "neon")]
 pub(crate) fn neon_dequantized_level_f32(q: float32x4_t) -> float32x4_t {
@@ -325,6 +327,7 @@ mod tests {
         cy: usize,
         thr: &[f32; 4],
         scan_pos: &[u32],
+        biased: bool,
     ) -> (f32, usize, f32, u32) {
         let (mut sse, mut nzeros, mut mag_bits) = (0.0f32, 0usize, 0.0f32);
         let mut max_scan = 0u32;
@@ -338,7 +341,11 @@ mod tests {
                 let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
                 let a = inv[i] * qs * coeff[i];
                 let q = if a.abs() >= threshold { a.round() } else { 0.0 };
-                let d = a - q;
+                let d = if biased {
+                    a - crate::group::dequantized_level_f32(q)
+                } else {
+                    a - q
+                };
                 sse += d * d;
                 if q != 0.0 {
                     nzeros += 1;
@@ -382,32 +389,43 @@ mod tests {
                     random() * 0.6,
                 ];
                 let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
-                let expected = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos);
-                let actual = unsafe {
-                    sse_and_rate_neon(
-                        &coeff,
-                        &inv,
-                        qs,
-                        w,
-                        h,
-                        half,
-                        cx,
-                        cy,
-                        crate::inflated_cost::rate_log2_lut(),
-                        &thr,
-                        scan_pos,
-                    )
-                };
+                for biased in [false, true] {
+                    let expected =
+                        reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos, biased);
+                    let kernel = if biased {
+                        sse_and_rate_neon::<true>
+                    } else {
+                        sse_and_rate_neon::<false>
+                    };
+                    let actual = unsafe {
+                        kernel(
+                            &coeff,
+                            &inv,
+                            qs,
+                            w,
+                            h,
+                            half,
+                            cx,
+                            cy,
+                            crate::inflated_cost::rate_log2_lut(),
+                            &thr,
+                            scan_pos,
+                        )
+                    };
 
-                assert_eq!(actual.1, expected.1, "nzeros mismatch for {w}x{h}");
-                assert_eq!(actual.3, expected.3, "max-scan mismatch for {w}x{h}");
-                let sse_rel = (actual.0 - expected.0).abs() / expected.0.abs().max(1.0);
-                let mag_rel = (actual.2 - expected.2).abs() / expected.2.abs().max(1.0);
-                assert!(sse_rel < 1e-4, "SSE relative error {sse_rel} for {w}x{h}");
-                assert!(
-                    mag_rel < 1e-5,
-                    "magnitude-rate relative error {mag_rel} for {w}x{h}"
-                );
+                    assert_eq!(actual.1, expected.1, "nzeros mismatch for {w}x{h}");
+                    assert_eq!(actual.3, expected.3, "max-scan mismatch for {w}x{h}");
+                    let sse_rel = (actual.0 - expected.0).abs() / expected.0.abs().max(1.0);
+                    let mag_rel = (actual.2 - expected.2).abs() / expected.2.abs().max(1.0);
+                    assert!(
+                        sse_rel < 1e-4,
+                        "SSE relative error {sse_rel} for {w}x{h} biased={biased}"
+                    );
+                    assert!(
+                        mag_rel < 1e-5,
+                        "magnitude-rate relative error {mag_rel} for {w}x{h} biased={biased}"
+                    );
+                }
             }
         }
     }

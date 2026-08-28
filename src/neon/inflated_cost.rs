@@ -262,11 +262,20 @@ pub(crate) fn recon_dist_and_rate_neon(
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> (f32, f32) {
+    recon_dist_and_rate_neon_impl::<true>(scratch, input, error)
+}
+
+#[target_feature(enable = "neon")]
+fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
+    scratch: &mut [[f32; 1024]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+) -> (f32, f32) {
     recon_dist_and_rate_with_kernels(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_neon,
+            quantize: recon_quantize_neon::<BIASED>,
             ssim: ssim_deficit_neon,
             prepare: prepare_reconstruction_neon,
             error,
@@ -276,7 +285,7 @@ pub(crate) fn recon_dist_and_rate_neon(
 
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
-fn recon_quantize_neon(
+fn recon_quantize_neon<const BIASED: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -334,7 +343,12 @@ fn recon_quantize_neon(
             // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
             let quantized =
                 vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
-            let error = vdivq_f32(vsubq_f32(scaled, quantized), denominator);
+            let dequantized = if BIASED {
+                super::ac_strategy::neon_dequantized_level_f32(quantized)
+            } else {
+                quantized
+            };
+            let error = vdivq_f32(vsubq_f32(scaled, dequantized), denominator);
             let active = if y < cy && x < cx {
                 vcgeq_u32(
                     vaddq_u32(vdupq_n_u32(x as u32), lanes),
@@ -496,7 +510,7 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
 mod tests {
     use super::{
         combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-        recon_dist_and_rate_neon, ssim_deficit_neon,
+        recon_dist_and_rate_neon_impl, ssim_deficit_neon,
     };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
@@ -592,38 +606,53 @@ mod tests {
                     gradient_peak_alpha: 3.0,
                 },
             };
-            let mut scalar_scratch = [[0.0f32; 1024]; 8];
-            let scalar = recon_dist_and_rate_scalar(&mut scalar_scratch, &input);
-            let mut simd_scratch = [[0.0f32; 1024]; 8];
-            let simd = unsafe {
-                recon_dist_and_rate_neon(
-                    &mut simd_scratch,
-                    &input,
-                    &ReconErrorKernels {
-                        gradient_energy: |error, width, height| {
-                            error_gradient_energy_neon(error, width, height)
-                        },
-                        gradient_peak_energy: |error, original, width, height, floor| {
-                            error_gradient_peak_energy_neon(error, original, width, height, floor)
-                        },
-                        combine: |spatial, luma, factor, combined| {
-                            combine_error_neon(spatial, luma, factor, combined)
-                        },
+            for biased in [false, true] {
+                let mut scalar_scratch = [[0.0f32; 1024]; 8];
+                let scalar = if biased {
+                    recon_dist_and_rate_scalar::<true>(&mut scalar_scratch, &input)
+                } else {
+                    recon_dist_and_rate_scalar::<false>(&mut scalar_scratch, &input)
+                };
+                let error_kernels = ReconErrorKernels {
+                    gradient_energy: |error, width, height| unsafe {
+                        error_gradient_energy_neon(error, width, height)
                     },
-                )
-            };
-            let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);
-            assert!(
-                (simd.1 - scalar.1).abs() <= rate_tolerance,
-                "strategy {strategy} rate: simd={} scalar={}",
-                simd.1,
-                scalar.1
-            );
-            let tolerance = 5e-4f32.max(scalar.0.abs() * 3e-5);
-            assert!(
-                (simd.0 - scalar.0).abs() <= tolerance,
-                "strategy {strategy}: simd={simd:?} scalar={scalar:?}"
-            );
+                    gradient_peak_energy: |error, original, width, height, floor| unsafe {
+                        error_gradient_peak_energy_neon(error, original, width, height, floor)
+                    },
+                    combine: |spatial, luma, factor, combined| unsafe {
+                        combine_error_neon(spatial, luma, factor, combined)
+                    },
+                };
+                let mut simd_scratch = [[0.0f32; 1024]; 8];
+                let simd = unsafe {
+                    if biased {
+                        recon_dist_and_rate_neon_impl::<true>(
+                            &mut simd_scratch,
+                            &input,
+                            &error_kernels,
+                        )
+                    } else {
+                        recon_dist_and_rate_neon_impl::<false>(
+                            &mut simd_scratch,
+                            &input,
+                            &error_kernels,
+                        )
+                    }
+                };
+                let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);
+                assert!(
+                    (simd.1 - scalar.1).abs() <= rate_tolerance,
+                    "strategy {strategy} biased={biased} rate: simd={} scalar={}",
+                    simd.1,
+                    scalar.1
+                );
+                let tolerance = 5e-4f32.max(scalar.0.abs() * 3e-5);
+                assert!(
+                    (simd.0 - scalar.0).abs() <= tolerance,
+                    "strategy {strategy} biased={biased}: simd={simd:?} scalar={scalar:?}"
+                );
+            }
         }
     }
 

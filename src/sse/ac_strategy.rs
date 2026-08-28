@@ -156,9 +156,27 @@ pub(crate) fn gradient_region_stats_with_chroma_sse41(
 /// # Safety
 /// Caller must ensure `sse4.1` is available. All slice accesses are
 /// bounds-validated against `width*height`.
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn sse_dequantized_level_f32(q: __m128) -> __m128 {
+    let sign_mask = _mm_set1_ps(-0.0);
+    let absq = _mm_andnot_ps(sign_mask, q);
+    // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
+    let big = _mm_sub_ps(
+        q,
+        _mm_div_ps(_mm_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let sign = _mm_and_ps(sign_mask, q);
+    let one = _mm_or_ps(sign, _mm_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1));
+    let use_big = _mm_cmpge_ps(absq, _mm_set1_ps(1.125));
+    let dq = _mm_blendv_ps(one, big, use_big);
+    let nz = _mm_cmpgt_ps(absq, _mm_setzero_ps());
+    _mm_and_ps(dq, nz)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "sse4.1")]
-pub(crate) fn sse_and_rate_sse(
+pub(crate) fn sse_and_rate_sse<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
@@ -226,7 +244,11 @@ pub(crate) fn sse_and_rate_sse(
             let rounded = _mm_round_ps::<RND>(a);
             let q = _mm_and_ps(rounded, keep);
 
-            let d = _mm_sub_ps(a, q);
+            let d = if BIASED {
+                _mm_sub_ps(a, sse_dequantized_level_f32(q))
+            } else {
+                _mm_sub_ps(a, q)
+            };
             let d2 = _mm_mul_ps(d, d);
 
             // Active mask: keep lanes where !(y < cy && x + lane < cx).
@@ -344,7 +366,11 @@ mod tests {
         if !std::is_x86_feature_detected!("sse4.1") {
             return;
         }
-        crate::inflated_cost::assert_sse_and_rate_matches_reference(sse_and_rate_sse);
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(
+            sse_and_rate_sse::<false>,
+            false,
+        );
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(sse_and_rate_sse::<true>, true);
     }
 
     #[test]

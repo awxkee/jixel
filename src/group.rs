@@ -645,12 +645,6 @@ pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
 
 /// [`dequantized_level`] for a float-valued (but integer) level, as produced by
 /// the encoder-side quantizers before conversion to `i32`.
-///
-/// Currently only exercised by the (measured, deferred) biased-distortion
-/// variants of `sse_and_rate_scalar` / `recon_quantize_scalar`: plugging the
-/// true dequant into those paths shifts strategy selection, so it has to land
-/// together with a merge-margin / rerank-lambda re-fit.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn dequantized_level_f32(quant: f32) -> f32 {
     let aq = quant.abs();
