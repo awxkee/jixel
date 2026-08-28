@@ -187,8 +187,7 @@ pub fn encode_jpeg_lossless_with_config(
     // box would silently discard the profile and leave the image mislabeled.
     let icc = extract_icc(&parsed);
     let xmp = extract_xmp(&parsed);
-    let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref(), config.num_threads)
-        .map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref(), config.num_threads)?;
 
     if !config.jpeg_reconstruction {
         // Dropping reconstruction also drops container-only JPEG metadata.

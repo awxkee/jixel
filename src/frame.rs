@@ -50,6 +50,7 @@ use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind, find_l
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
+use crate::util::EncodeError;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
@@ -1235,7 +1236,7 @@ pub(crate) fn encode_frame(
     coeff_shifts: &[u32],
     patches: bool,
     writer: &mut BitWriter,
-) {
+) -> Result<(), EncodeError> {
     let distp = compute_distance_params(distance);
     let mut xyb = to_xyb_image(ctx, scratch, linear);
     if is_achromatic {
@@ -1262,7 +1263,7 @@ pub(crate) fn encode_frame(
             coeff_shifts,
             VarDctFrameKind::Regular,
             &mut regular_writer,
-        );
+        )?;
 
         // Route each patch group to the atlas that codes it best: groups whose
         // quantized tiles fit the running 256-color palette budget go to the
@@ -1325,7 +1326,7 @@ pub(crate) fn encode_frame(
                         height: atlas_h,
                     },
                     out,
-                );
+                )
             };
 
         let mut patched_writer = BitWriter::new();
@@ -1354,7 +1355,7 @@ pub(crate) fn encode_frame(
                 &mut modular_bits,
             );
             let mut vardct_bits = BitWriter::new();
-            encode_vardct_atlas(modular_atlas, scratch, &mut vardct_bits);
+            encode_vardct_atlas(modular_atlas, scratch, &mut vardct_bits)?;
             if modular_ok && modular_bits.bits_written() < vardct_bits.bits_written() {
                 patched_writer.append(&modular_bits);
                 references.extend(modular_refs);
@@ -1367,7 +1368,7 @@ pub(crate) fn encode_frame(
         if !vardct_idx.is_empty() {
             let (vardct_atlas, vardct_refs) =
                 crate::patches::pack_lossy_atlas(&xyb, clone_groups(&vardct_idx), PATCH_REF_ID);
-            encode_vardct_atlas(vardct_atlas, scratch, &mut patched_writer);
+            encode_vardct_atlas(vardct_atlas, scratch, &mut patched_writer)?;
             references.extend(vardct_refs);
         }
 
@@ -1382,13 +1383,13 @@ pub(crate) fn encode_frame(
             coeff_shifts,
             VarDctFrameKind::Patched(&references),
             &mut patched_writer,
-        );
+        )?;
         if patched_writer.bits_written() < regular_writer.bits_written() {
             writer.append(&patched_writer);
         } else {
             writer.append(&regular_writer);
         }
-        return;
+        return Ok(());
     }
 
     gaborize(&mut xyb, &distp);
@@ -1401,7 +1402,7 @@ pub(crate) fn encode_frame(
         coeff_shifts,
         VarDctFrameKind::Regular,
         writer,
-    );
+    )
 }
 
 /// Power-of-two refinement of the modular atlas quantization lattice.
@@ -1476,7 +1477,7 @@ fn encode_frame_core(
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
     writer: &mut BitWriter,
-) {
+) -> Result<(), EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
     let distp = compute_distance_params(distance);
@@ -1503,21 +1504,22 @@ fn encode_frame_core(
     // the setup phase saturates all cores even with few (large) DC groups.
     let outer = group_coords.len().min(num_threads.max(1));
     let setup_budget = num_threads.max(1).div_ceil(outer);
-    let setups = ctx
-        .thread_pool
-        .steal_map(scratch, group_coords.len(), |i, scratch| {
-            let (dc_gx, dc_gy) = group_coords[i];
-            setup_dc_group(
-                ctx,
-                scratch,
-                opsin,
-                &dim,
-                &distp,
-                dc_gx,
-                dc_gy,
-                setup_budget,
-            )
-        });
+    let setups: Vec<Result<(DcGroupData, usize, usize), EncodeError>> =
+        ctx.thread_pool
+            .steal_map(scratch, group_coords.len(), |i, scratch| {
+                let (dc_gx, dc_gy) = group_coords[i];
+                setup_dc_group(
+                    ctx,
+                    scratch,
+                    opsin,
+                    &dim,
+                    &distp,
+                    dc_gx,
+                    dc_gy,
+                    setup_budget,
+                )
+            });
+    let setups: Vec<(DcGroupData, usize, usize)> = setups.into_iter().collect::<Result<_, _>>()?;
 
     let mut dc_datas: Vec<DcGroupData> = Vec::with_capacity(setups.len());
     let mut ac_tasks: Vec<(usize, usize, usize)> = Vec::new();
@@ -2265,6 +2267,7 @@ fn encode_frame_core(
         writer,
     );
     combine_sections(&mut sections, writer);
+    Ok(())
 }
 
 /// Per-AC-group buffered tokens. For progressive (multi-pass) encoding the
@@ -2289,7 +2292,7 @@ fn setup_dc_group(
     dc_gx: usize,
     dc_gy: usize,
     num_threads: usize,
-) -> (DcGroupData, usize, usize) {
+) -> Result<(DcGroupData, usize, usize), EncodeError> {
     // DC group rect in pixels (clamped to image bounds).
     let dc_group_x0 = dc_gx * K_DC_GROUP_DIM;
     let dc_group_y0 = dc_gy * K_DC_GROUP_DIM;
@@ -2300,7 +2303,7 @@ fn setup_dc_group(
     let dc_group_xsize_groups = dc_group_xsize.div_ceil(K_GROUP_DIM);
     let dc_group_ysize_groups = dc_group_ysize.div_ceil(K_GROUP_DIM);
 
-    let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks);
+    let mut dc_data = DcGroupData::new(dc_group_xsize_blocks, dc_group_ysize_blocks)?;
 
     (ctx.fill_quant_field)(
         &mut scratch.aq_map,
@@ -2408,7 +2411,7 @@ fn setup_dc_group(
         }
     }
 
-    (dc_data, dc_group_xsize_groups, dc_group_ysize_groups)
+    Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
 }
 
 /// Merge an AC group's origin-relative `quant_dc` into its parent DC group.

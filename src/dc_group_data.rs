@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::image::{Image3F, Image3S, ImageB, ImageSB};
+use crate::util::{EncodeError, try_vec};
 
 pub(crate) const STRATEGY_DCT: u8 = 0;
 pub(crate) const STRATEGY_DCT16X8: u8 = 1;
@@ -84,6 +85,17 @@ impl AcStrategyImage {
             ysize,
             cells: vec![(STRATEGY_DCT << 1) | FIRST_BLOCK_BIT; xsize * ysize],
         }
+    }
+
+    pub(crate) fn try_new(xsize: usize, ysize: usize) -> Result<Self, EncodeError> {
+        let len = xsize
+            .checked_mul(ysize)
+            .ok_or(EncodeError::AllocationFailed { size: usize::MAX })?;
+        Ok(Self {
+            xsize,
+            ysize,
+            cells: try_vec![(STRATEGY_DCT << 1) | FIRST_BLOCK_BIT; len]?,
+        })
     }
 
     #[inline]
@@ -238,24 +250,32 @@ pub(crate) struct DcGroupData {
 const TILE_DIM_IN_BLOCKS: usize = 8;
 
 impl DcGroupData {
-    pub(crate) fn new(xsize_blocks: usize, ysize_blocks: usize) -> Self {
+    pub(crate) fn new(xsize_blocks: usize, ysize_blocks: usize) -> Result<Self, EncodeError> {
         let xtiles = xsize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
-        Self {
-            quant_dc: Image3S::new(xsize_blocks, ysize_blocks),
+        Ok(Self {
+            quant_dc: Image3S::try_new(xsize_blocks, ysize_blocks)?,
             dc_float: Image3F::new(0, 0),
-            raw_quant_field: ImageB::new_fill(xsize_blocks, ysize_blocks, 1),
-            ac_strategy: AcStrategyImage::new(xsize_blocks, ysize_blocks),
-            ytox_map: ImageSB::new_fill(xtiles, ytiles, 0),
-            ytob_map: ImageSB::new_fill(xtiles, ytiles, 0),
+            raw_quant_field: ImageB::try_new_fill(xsize_blocks, ysize_blocks, 1)?,
+            ac_strategy: AcStrategyImage::try_new(xsize_blocks, ysize_blocks)?,
+            ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,
+            ytob_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,
             sub8_benefit: 0.0,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dc_group_allocation_failure_is_reported() {
+        assert!(matches!(
+            DcGroupData::new(usize::MAX, 1),
+            Err(EncodeError::AllocationFailed { size: usize::MAX })
+        ));
+    }
 
     #[test]
     fn sub8_strategy_set_is_complete() {

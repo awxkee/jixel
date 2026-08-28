@@ -47,6 +47,7 @@ use crate::frame::{
 use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::thread_pool::ThreadPool;
+use crate::util::EncodeError;
 
 const BLOCK_DIM: usize = 8;
 const GROUP_DIM: usize = 256;
@@ -399,8 +400,8 @@ pub(crate) fn encode_jpeg_codestream(
     jpg: &JpegData,
     icc: Option<&[u8]>,
     num_threads: usize,
-) -> Result<Vec<u8>, JpegError> {
-    let ss = check_supported(jpg)?;
+) -> Result<Vec<u8>, EncodeError> {
+    let ss = check_supported(jpg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
     let dim = Dim::new(jpg.width, jpg.height, &ss);
     let pool = ThreadPool::new(num_threads);
     let mut scratch = Box::<CoderScratch>::default();
@@ -414,7 +415,7 @@ fn encode_jpeg_codestream_with_pool(
     dim: &Dim,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> Result<Vec<u8>, JpegError> {
+) -> Result<Vec<u8>, EncodeError> {
     // Quantization tables, transposed into JXL's orientation
     let mut qtable = [0i32; 3 * DCT_BLOCK_SIZE];
     let mut dc_quant = [0f32; 3];
@@ -431,17 +432,17 @@ fn encode_jpeg_codestream_with_pool(
     }
 
     // DC planes. Each DC group reads a disjoint slab of coefficients.
-    let dc_datas: Vec<DcGroupData> = pool.steal_map(scratch, dim.num_dc_groups, |g, _scratch| {
+    let dc_datas = pool.steal_map(scratch, dim.num_dc_groups, |g, _scratch| {
         let gx = g % dim.xsize_dc_groups;
         let gy = g / dim.xsize_dc_groups;
         let bx0 = gx * DC_GROUP_DIM_IN_BLOCKS;
         let by0 = gy * DC_GROUP_DIM_IN_BLOCKS;
         let bw = DC_GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
         let bh = DC_GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
-        let mut data = DcGroupData::new(bw, bh);
+        let mut data = DcGroupData::new(bw, bh)?;
         // Each DC plane is the luma grid scaled by its own shift.
         let sizes = [0usize, 1, 2].map(|c| (bw >> ss.hshift[c], bh >> ss.vshift[c]));
-        data.quant_dc = crate::image::Image3S::new_per_plane(sizes);
+        data.quant_dc = crate::image::Image3S::try_new_per_plane(sizes)?;
         for c in 0..3usize {
             let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
             let (cw, ch) = sizes[c];
@@ -455,8 +456,9 @@ fn encode_jpeg_codestream_with_pool(
                 }
             }
         }
-        data
+        Ok::<_, EncodeError>(data)
     });
+    let dc_datas: Vec<DcGroupData> = dc_datas.into_iter().collect::<Result<_, _>>()?;
 
     // Tokens
     let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) = pool
@@ -534,7 +536,7 @@ fn encode_jpeg_codestream_with_pool(
     let mut dc_global = BitWriter::new();
     {
         let w = &mut dc_global;
-        write_dc_quant(w, dc_quant)?;
+        write_dc_quant(w, dc_quant).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
         write_quant_scales(65536, 1, w);
         // Written explicitly; the lossy path avoids the shortcut too.
         w.write(1, 0);

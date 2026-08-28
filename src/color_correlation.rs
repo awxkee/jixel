@@ -708,7 +708,7 @@ mod tests {
 
     fn dc_group_with_residual_correlation(slope: f32) -> DcGroupData {
         let (w, h) = (48usize, 48usize);
-        let mut dc = DcGroupData::new(w, h);
+        let mut dc = DcGroupData::new(w, h).unwrap();
         let mut state = 12345u32;
         for y in 0..h {
             for x in 0..w {

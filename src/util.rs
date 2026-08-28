@@ -31,6 +31,27 @@ use crate::encode_image::MAX_DIMENSION;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
+pub(crate) fn try_vec_fill<T: Clone>(value: T, len: usize) -> Result<Vec<T>, EncodeError> {
+    let size = len
+        .checked_mul(size_of::<T>())
+        .ok_or(EncodeError::AllocationFailed { size: usize::MAX })?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| EncodeError::AllocationFailed { size })?;
+    // `try_reserve_exact` has already made this resize non-allocating.
+    values.resize(len, value);
+    Ok(values)
+}
+
+macro_rules! try_vec {
+    ($value:expr; $len:expr) => {
+        $crate::util::try_vec_fill($value, $len)
+    };
+}
+
+pub(crate) use try_vec;
+
 pub(crate) fn heap_array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
     let slice = vec![value; N].into_boxed_slice();
     boxed_slice_to_array(slice)
@@ -119,6 +140,10 @@ pub enum EncodeError {
         width: usize,
         height: usize,
     },
+    /// An internal image plane or other encoding buffer could not be allocated.
+    AllocationFailed {
+        size: usize,
+    },
     /// An alpha bit depth other than 8, 10, or 12 was supplied.
     UnsupportedAlphaBitDepth(u8),
     /// ICC profile injection is not yet implemented.
@@ -161,6 +186,9 @@ impl fmt::Display for EncodeError {
                 "image dimensions {width}×{height} exceed the maximum ({})",
                 MAX_DIMENSION
             ),
+            Self::AllocationFailed { size } => {
+                write!(f, "failed to allocate an encoding buffer of {size} bytes")
+            }
             Self::UnsupportedAlphaBitDepth(bits) => {
                 write!(
                     f,
@@ -339,6 +367,20 @@ pub(crate) fn f16_bits_to_f32(b: u16) -> f32 {
     )))]
     {
         f16_bits_to_f32_impl(b)
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn try_vec_reports_requested_byte_size() {
+        let size = isize::MAX as usize + 1;
+        assert_eq!(
+            try_vec![0u8; size].unwrap_err(),
+            EncodeError::AllocationFailed { size }
+        );
     }
 }
 
