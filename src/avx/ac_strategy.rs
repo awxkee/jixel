@@ -167,11 +167,29 @@ pub(crate) fn gradient_region_stats_with_chroma_avx2(
     gradient_region_stats_impl::<true>(opsin, px0, py0, w, h, eps)
 }
 
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn avx_dequantized_level_f32(q: __m256) -> __m256 {
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let absq = _mm256_andnot_ps(sign_mask, q);
+    // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
+    let big = _mm256_sub_ps(
+        q,
+        _mm256_div_ps(_mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let sign = _mm256_and_ps(sign_mask, q);
+    let one = _mm256_or_ps(sign, _mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1));
+    let use_big = _mm256_cmp_ps::<_CMP_GE_OQ>(absq, _mm256_set1_ps(1.125));
+    let dq = _mm256_blendv_ps(one, big, use_big);
+    let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, _mm256_setzero_ps());
+    _mm256_and_ps(dq, nz)
+}
+
 /// # Safety
 /// Caller must ensure `avx2` and `fma` are available.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn sse_and_rate_avx2(
+pub(crate) fn sse_and_rate_avx2<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
@@ -245,7 +263,11 @@ pub(crate) fn sse_and_rate_avx2(
             let rounded = _mm256_round_ps::<RND>(a);
             let q = _mm256_and_ps(rounded, keep);
 
-            let d = _mm256_sub_ps(a, q);
+            let d = if BIASED {
+                _mm256_sub_ps(a, avx_dequantized_level_f32(q))
+            } else {
+                _mm256_sub_ps(a, q)
+            };
             let d2 = _mm256_mul_ps(d, d);
 
             let active_i = if y < cy && x < cx {
@@ -377,6 +399,7 @@ mod tests {
         cy: usize,
         thr: &[f32; 4],
         scan_pos: &[u32],
+        biased: bool,
     ) -> (f32, usize, f32, u32) {
         let (mut sse, mut nz, mut mb) = (0.0f32, 0usize, 0.0f32);
         let mut max_scan = 0u32;
@@ -395,7 +418,11 @@ mod tests {
                 } else {
                     0.0
                 };
-                let d = a - q;
+                let d = if biased {
+                    a - crate::group::dequantized_level_f32(q)
+                } else {
+                    a - q
+                };
                 sse += d * d;
                 if q != 0.0 {
                     nz += 1;
@@ -437,40 +464,50 @@ mod tests {
                 let qs = 0.5 + rnd() * 3.0;
                 let thr = [rnd() * 0.6, rnd() * 0.6, rnd() * 0.6, rnd() * 0.6];
                 let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
-                let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos);
-                let a = unsafe {
-                    sse_and_rate_avx2(
-                        &coeff,
-                        &inv,
-                        qs,
-                        w,
-                        h,
-                        half,
-                        cx,
-                        cy,
-                        crate::inflated_cost::rate_log2_lut(),
-                        &thr,
-                        scan_pos,
-                    )
-                };
-                // `nzeros` is a discrete decision and must match exactly.
-                assert_eq!(a.1, r.1, "nzeros mismatch {w}x{h}");
-                assert_eq!(a.3, r.3, "max-scan mismatch {w}x{h}");
-                let mag_rel = if r.2.abs() > 1e-3 {
-                    ((a.2 - r.2) / r.2).abs()
-                } else {
-                    (a.2 - r.2).abs()
-                };
-                assert!(
-                    mag_rel < 1e-4,
-                    "mag_bits rel diff {mag_rel} too large {w}x{h}"
-                );
-                let rel = if r.0.abs() > 1e-3 {
-                    ((a.0 - r.0) / r.0).abs()
-                } else {
-                    (a.0 - r.0).abs()
-                };
-                assert!(rel < 1e-4, "sse rel diff {rel} too large {w}x{h}");
+                for biased in [false, true] {
+                    let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos, biased);
+                    let kernel = if biased {
+                        sse_and_rate_avx2::<true>
+                    } else {
+                        sse_and_rate_avx2::<false>
+                    };
+                    let a = unsafe {
+                        kernel(
+                            &coeff,
+                            &inv,
+                            qs,
+                            w,
+                            h,
+                            half,
+                            cx,
+                            cy,
+                            crate::inflated_cost::rate_log2_lut(),
+                            &thr,
+                            scan_pos,
+                        )
+                    };
+                    // `nzeros` is a discrete decision and must match exactly.
+                    assert_eq!(a.1, r.1, "nzeros mismatch {w}x{h}");
+                    assert_eq!(a.3, r.3, "max-scan mismatch {w}x{h}");
+                    let mag_rel = if r.2.abs() > 1e-3 {
+                        ((a.2 - r.2) / r.2).abs()
+                    } else {
+                        (a.2 - r.2).abs()
+                    };
+                    assert!(
+                        mag_rel < 1e-4,
+                        "mag_bits rel diff {mag_rel} too large {w}x{h} biased={biased}"
+                    );
+                    let rel = if r.0.abs() > 1e-3 {
+                        ((a.0 - r.0) / r.0).abs()
+                    } else {
+                        (a.0 - r.0).abs()
+                    };
+                    assert!(
+                        rel < 1e-4,
+                        "sse rel diff {rel} too large {w}x{h} biased={biased}"
+                    );
+                }
             }
         }
     }

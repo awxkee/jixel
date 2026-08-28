@@ -94,26 +94,26 @@ pub(crate) type SseAndRateFn = unsafe fn(
 fn select_sse_and_rate_fn() -> SseAndRateFn {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-        return crate::avx::sse_and_rate_avx2;
+        return crate::avx::sse_and_rate_avx2::<true>;
     }
     #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
     if std::is_x86_feature_detected!("sse4.1") {
-        return crate::sse::sse_and_rate_sse;
+        return crate::sse::sse_and_rate_sse::<true>;
     }
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        crate::neon::sse_and_rate_neon
+        crate::neon::sse_and_rate_neon::<true>
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        crate::wasm::sse_and_rate_wasm
+        crate::wasm::sse_and_rate_wasm::<true>
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", feature = "neon"),
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     )))]
     {
-        sse_and_rate_scalar
+        sse_and_rate_scalar::<true>
     }
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn selected_sse_and_rate_fn() -> SseAndRateFn {
 
 #[cfg(test)]
 #[allow(dead_code)] // Used by target-specific SSE/WASM test modules.
-pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
+pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased: bool) {
     let mut state = 0x5e5e_a11d_0f00_d00du64;
     let mut random = || {
         state = state
@@ -173,7 +173,11 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
                     } else {
                         0.0
                     };
-                    let d = a - q;
+                    let d = if biased {
+                        a - crate::group::dequantized_level_f32(q)
+                    } else {
+                        a - q
+                    };
                     expected_sse += d * d;
                     if q != 0.0 {
                         expected_nzeros += 1;
@@ -221,7 +225,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn) {
 }
 
 #[allow(unused, clippy::too_many_arguments)]
-pub(crate) fn sse_and_rate_scalar(
+pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
@@ -252,7 +256,11 @@ pub(crate) fn sse_and_rate_scalar(
             let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
             let a = inverse * q_scaled * coefficient;
             let q = if a.abs() >= threshold { a.round() } else { 0.0 };
-            let d = a - q;
+            let d = if BIASED {
+                a - crate::group::dequantized_level_f32(q)
+            } else {
+                a - q
+            };
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
@@ -639,7 +647,7 @@ fn recon_dist_and_rate_default(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_scalar,
+            quantize: recon_quantize_scalar::<true>,
             ssim: ssim_deficit_dispatch_kernel,
             prepare: prepare_reconstruction_scalar,
             error,
@@ -648,7 +656,7 @@ fn recon_dist_and_rate_default(
 }
 
 #[cfg(test)]
-pub(crate) fn recon_dist_and_rate_scalar(
+pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
 ) -> (f32, f32) {
@@ -661,7 +669,7 @@ pub(crate) fn recon_dist_and_rate_scalar(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_scalar,
+            quantize: recon_quantize_scalar::<BIASED>,
             ssim: ssim_deficit_scalar_kernel,
             prepare: prepare_reconstruction_scalar,
             error: &error,
@@ -954,7 +962,7 @@ fn prepare_reconstruction_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn recon_quantize_scalar(
+fn recon_quantize_scalar<const BIASED: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -1004,7 +1012,11 @@ fn recon_quantize_scalar(
             } else {
                 0.0
             };
-            *error = (scaled - quantized) / denominator;
+            *error = if BIASED {
+                (scaled - crate::group::dequantized_level_f32(quantized)) / denominator
+            } else {
+                (scaled - quantized) / denominator
+            };
             if quantized != 0.0 {
                 nonzero += 1;
                 magnitude_bits += rate_log2_with_lut(rate_log2_lut, quantized.abs());

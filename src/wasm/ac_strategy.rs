@@ -153,9 +153,26 @@ pub(crate) fn gradient_region_stats_with_chroma_wasm(
 /// # Safety
 /// Caller must ensure `simd128` is available. All slice accesses are
 /// bounds-validated against `width*height`.
+#[inline]
+#[target_feature(enable = "simd128")]
+fn wasm_dequantized_level_f32(q: v128) -> v128 {
+    let absq = f32x4_abs(q);
+    // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
+    let big = f32x4_sub(
+        q,
+        f32x4_div(f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let sign = v128_and(q, f32x4_splat(-0.0));
+    let one = v128_or(sign, f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_1));
+    let use_big = f32x4_ge(absq, f32x4_splat(1.125));
+    let dq = v128_bitselect(big, one, use_big);
+    let nz = f32x4_gt(absq, f32x4_splat(0.0));
+    v128_and(dq, nz)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "simd128")]
-pub(crate) fn sse_and_rate_wasm(
+pub(crate) fn sse_and_rate_wasm<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
@@ -222,7 +239,11 @@ pub(crate) fn sse_and_rate_wasm(
             // zero rounded where not kept
             let q = v128_and(rounded, keep);
 
-            let d = f32x4_sub(a, q);
+            let d = if BIASED {
+                f32x4_sub(a, wasm_dequantized_level_f32(q))
+            } else {
+                f32x4_sub(a, q)
+            };
             let d2 = f32x4_mul(d, d);
 
             // Active mask: keep lanes where !(y < cy && x + lane < cx).
@@ -317,6 +338,13 @@ mod tests {
 
     #[test]
     fn test_sse_and_rate_wasm_vs_reference() {
-        crate::inflated_cost::assert_sse_and_rate_matches_reference(sse_and_rate_wasm);
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(
+            sse_and_rate_wasm::<false>,
+            false,
+        );
+        crate::inflated_cost::assert_sse_and_rate_matches_reference(
+            sse_and_rate_wasm::<true>,
+            true,
+        );
     }
 }
