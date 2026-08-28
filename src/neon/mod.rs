@@ -35,6 +35,7 @@ mod dct;
 mod entropy;
 mod inflated_cost;
 mod lossless_grad;
+mod modular;
 mod quant;
 mod quantize_xyb;
 mod structure_aq;
@@ -62,6 +63,10 @@ pub(crate) use inflated_cost::{
     recon_dist_and_rate_neon, ssim_deficit_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use modular::{
+    tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
+    tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,
+};
 pub(crate) use quant::{
     apply_quant_field_gain_neon, apply_structure_aq_neon, quantize_block_ac_neon,
     quantize_dc_cfl_neon, quantize_dc_neon,

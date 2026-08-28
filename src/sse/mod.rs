@@ -34,6 +34,7 @@ mod dct;
 mod entropy;
 mod inflated_cost;
 mod lossless_grad;
+mod modular;
 mod quant;
 mod quantize_xyb;
 mod structure_aq;
@@ -50,6 +51,10 @@ pub(crate) use inflated_cost::{
     combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use modular::{
+    tokenize_alpha_u8_first_row_sse41, tokenize_alpha_u8_interior_sse41,
+    tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
+};
 pub(crate) use quant::{
     apply_quant_field_gain_sse41, apply_structure_aq_sse41, quantize_block_ac_sse41,
     quantize_dc_cfl_sse41, quantize_dc_sse41,
