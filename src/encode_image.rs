@@ -1861,7 +1861,7 @@ fn encode_with_context(
         &coeff_shifts,
         config.patches,
         &mut w,
-    );
+    )?;
     let codestream = w.into_bytes();
     let alpha_bits = config.alpha.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     finalize_container(

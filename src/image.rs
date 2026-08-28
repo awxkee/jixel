@@ -27,6 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::util::{EncodeError, try_vec};
+
 #[derive(Clone)]
 pub(crate) struct Plane<T> {
     data: Vec<T>,
@@ -43,12 +45,28 @@ impl<T: Copy + Default> Plane<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_fill(xsize: usize, ysize: usize, val: T) -> Self {
         Self {
             data: vec![val; xsize * ysize],
             xsize,
             ysize,
         }
+    }
+
+    pub(crate) fn try_new(xsize: usize, ysize: usize) -> Result<Self, EncodeError> {
+        Self::try_new_fill(xsize, ysize, T::default())
+    }
+
+    pub(crate) fn try_new_fill(xsize: usize, ysize: usize, val: T) -> Result<Self, EncodeError> {
+        let len = xsize
+            .checked_mul(ysize)
+            .ok_or(EncodeError::AllocationFailed { size: usize::MAX })?;
+        Ok(Self {
+            data: try_vec![val; len]?,
+            xsize,
+            ysize,
+        })
     }
 
     #[inline]
@@ -109,14 +127,14 @@ pub(crate) struct Image3<T> {
 impl<T: Copy + Default> Image3<T> {
     /// Builds an image whose planes have independent dimensions, as chroma
     /// subsampling requires.
-    pub(crate) fn new_per_plane(sizes: [(usize, usize); 3]) -> Self {
-        Self {
+    pub(crate) fn try_new_per_plane(sizes: [(usize, usize); 3]) -> Result<Self, EncodeError> {
+        Ok(Self {
             planes: [
-                Plane::new(sizes[0].0, sizes[0].1),
-                Plane::new(sizes[1].0, sizes[1].1),
-                Plane::new(sizes[2].0, sizes[2].1),
+                Plane::try_new(sizes[0].0, sizes[0].1)?,
+                Plane::try_new(sizes[1].0, sizes[1].1)?,
+                Plane::try_new(sizes[2].0, sizes[2].1)?,
             ],
-        }
+        })
     }
 
     pub(crate) fn new(xsize: usize, ysize: usize) -> Self {
@@ -127,6 +145,16 @@ impl<T: Copy + Default> Image3<T> {
                 Plane::new(xsize, ysize),
             ],
         }
+    }
+
+    pub(crate) fn try_new(xsize: usize, ysize: usize) -> Result<Self, EncodeError> {
+        Ok(Self {
+            planes: [
+                Plane::try_new(xsize, ysize)?,
+                Plane::try_new(xsize, ysize)?,
+                Plane::try_new(xsize, ysize)?,
+            ],
+        })
     }
 
     #[inline]
