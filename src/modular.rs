@@ -33,6 +33,7 @@ use crate::entropy::{
     HuffmanNode, OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code,
     write_prefix_codes, write_token,
 };
+use std::sync::OnceLock;
 
 const TREE_CTX_SPLITVAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;
@@ -122,12 +123,24 @@ pub(crate) fn write_ac_group_alpha(
     scratch.alpha_tokens.resize(token_count, Token::new(0, 0));
     if token_count != 0 {
         match alpha {
-            AlphaPlane::U8(data) => {
-                tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
-            }
-            AlphaPlane::U16 { data, .. } => {
-                tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
-            }
+            AlphaPlane::U8(data) => tokenize_ac_group_alpha_u8(
+                data,
+                full_xsize,
+                x0,
+                y0,
+                gw,
+                gh,
+                &mut scratch.alpha_tokens,
+            ),
+            AlphaPlane::U16 { data, .. } => tokenize_ac_group_alpha_u16(
+                data,
+                full_xsize,
+                x0,
+                y0,
+                gw,
+                gh,
+                &mut scratch.alpha_tokens,
+            ),
             AlphaPlane::F32(data) => {
                 tokenize_ac_group_alpha(data, full_xsize, x0, y0, gw, gh, &mut scratch.alpha_tokens)
             }
@@ -189,6 +202,220 @@ fn alpha_token<T: AlphaSample>(v: T, w: T, n: T, nw: T) -> Token {
     let pred = grad.clamp(w.min(n), w.max(n));
     let context = if grad > 0 { 0 } else { 1 };
     Token::new(context, pack_signed(v - pred))
+}
+
+#[inline]
+pub(crate) fn alpha_token_u8(v: u8, w: u8, n: u8, nw: u8) -> Token {
+    alpha_token(v, w, n, nw)
+}
+
+#[inline]
+pub(crate) fn alpha_token_u16(v: u16, w: u16, n: u16, nw: u16) -> Token {
+    alpha_token(v, w, n, nw)
+}
+
+type TokenizeAlphaFirstRowFn<T> = fn(&[T], &mut [Token]);
+type TokenizeAlphaInteriorFn<T> = fn(&[T], &[T], &mut [Token]);
+type TokenizeAlphaFns<T> = (TokenizeAlphaFirstRowFn<T>, TokenizeAlphaInteriorFn<T>);
+type TokenizeAlphaU8Fns = TokenizeAlphaFns<u8>;
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn tokenize_alpha_u8_first_row_scalar(row: &[u8], out: &mut [Token]) {
+    debug_assert_eq!(row.len(), out.len());
+    for ((&value, &west), out) in row[1..].iter().zip(row.iter()).zip(out[1..].iter_mut()) {
+        *out = alpha_token_u8(value, west, 0, 0);
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn tokenize_alpha_u8_interior_scalar(row: &[u8], north: &[u8], out: &mut [Token]) {
+    debug_assert_eq!(row.len(), north.len());
+    debug_assert_eq!(row.len(), out.len());
+    for ((((&value, &west), &north), &northwest), out) in row[1..]
+        .iter()
+        .zip(row.iter())
+        .zip(north[1..].iter())
+        .zip(north.iter())
+        .zip(out[1..].iter_mut())
+    {
+        *out = alpha_token_u8(value, west, north, northwest);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn select_tokenize_alpha_u8() -> TokenizeAlphaU8Fns {
+    (
+        |row, out| unsafe { crate::neon::tokenize_alpha_u8_first_row_neon(row, out) },
+        |row, north, out| unsafe { crate::neon::tokenize_alpha_u8_interior_neon(row, north, out) },
+    )
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn select_tokenize_alpha_u8() -> TokenizeAlphaU8Fns {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") {
+        return (
+            |row, out| unsafe { crate::avx::tokenize_alpha_u8_first_row_avx2(row, out) },
+            |row, north, out| unsafe {
+                crate::avx::tokenize_alpha_u8_interior_avx2(row, north, out)
+            },
+        );
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return (
+            |row, out| unsafe { crate::sse::tokenize_alpha_u8_first_row_sse41(row, out) },
+            |row, north, out| unsafe {
+                crate::sse::tokenize_alpha_u8_interior_sse41(row, north, out)
+            },
+        );
+    }
+
+    (
+        tokenize_alpha_u8_first_row_scalar,
+        tokenize_alpha_u8_interior_scalar,
+    )
+}
+
+static TOKENIZE_ALPHA_U8: OnceLock<TokenizeAlphaU8Fns> = OnceLock::new();
+
+#[inline]
+fn selected_tokenize_alpha_u8() -> TokenizeAlphaU8Fns {
+    *TOKENIZE_ALPHA_U8.get_or_init(select_tokenize_alpha_u8)
+}
+
+fn tokenize_ac_group_alpha_with<T: AlphaSample>(
+    first_row: TokenizeAlphaFirstRowFn<T>,
+    interior: TokenizeAlphaInteriorFn<T>,
+    samples: &[T],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    dst: &mut [Token],
+) {
+    debug_assert_ne!(gw, 0);
+    debug_assert_ne!(gh, 0);
+    debug_assert_eq!(dst.len(), gw * gh);
+
+    let mut src_rows = samples.chunks_exact(stride).skip(y0).take(gh);
+    let mut dst_rows = dst.chunks_exact_mut(gw);
+    let first = &src_rows.next().unwrap()[x0..x0 + gw];
+    let first_dst = dst_rows.next().unwrap();
+
+    let (&first_value, _) = first.split_first().unwrap();
+    let (first_out, _) = first_dst.split_first_mut().unwrap();
+    *first_out = alpha_token(first_value, T::ZERO, T::ZERO, T::ZERO);
+    first_row(first, first_dst);
+
+    let mut north = first;
+    for (row, out) in src_rows.zip(dst_rows) {
+        let row = &row[x0..x0 + gw];
+        let (&value, _) = row.split_first().unwrap();
+        let (&north_value, _) = north.split_first().unwrap();
+        let (first_out, _) = out.split_first_mut().unwrap();
+        *first_out = alpha_token(value, T::ZERO, north_value, T::ZERO);
+        interior(row, north, out);
+        north = row;
+    }
+}
+
+#[inline]
+fn tokenize_ac_group_alpha_u8(
+    samples: &[u8],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    dst: &mut [Token],
+) {
+    let (first_row, interior) = selected_tokenize_alpha_u8();
+    tokenize_ac_group_alpha_with(first_row, interior, samples, stride, x0, y0, gw, gh, dst);
+}
+
+type TokenizeAlphaU16Fns = TokenizeAlphaFns<u16>;
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn tokenize_alpha_u16_first_row_scalar(row: &[u16], out: &mut [Token]) {
+    debug_assert_eq!(row.len(), out.len());
+    for ((&value, &west), out) in row[1..].iter().zip(row.iter()).zip(out[1..].iter_mut()) {
+        *out = alpha_token_u16(value, west, 0, 0);
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn tokenize_alpha_u16_interior_scalar(row: &[u16], north: &[u16], out: &mut [Token]) {
+    debug_assert_eq!(row.len(), north.len());
+    debug_assert_eq!(row.len(), out.len());
+    for ((((&value, &west), &north), &northwest), out) in row[1..]
+        .iter()
+        .zip(row.iter())
+        .zip(north[1..].iter())
+        .zip(north.iter())
+        .zip(out[1..].iter_mut())
+    {
+        *out = alpha_token_u16(value, west, north, northwest);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+fn select_tokenize_alpha_u16() -> TokenizeAlphaU16Fns {
+    (
+        |row, out| unsafe { crate::neon::tokenize_alpha_u16_first_row_neon(row, out) },
+        |row, north, out| unsafe { crate::neon::tokenize_alpha_u16_interior_neon(row, north, out) },
+    )
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+fn select_tokenize_alpha_u16() -> TokenizeAlphaU16Fns {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") {
+        return (
+            |row, out| unsafe { crate::avx::tokenize_alpha_u16_first_row_avx2(row, out) },
+            |row, north, out| unsafe {
+                crate::avx::tokenize_alpha_u16_interior_avx2(row, north, out)
+            },
+        );
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return (
+            |row, out| unsafe { crate::sse::tokenize_alpha_u16_first_row_sse41(row, out) },
+            |row, north, out| unsafe {
+                crate::sse::tokenize_alpha_u16_interior_sse41(row, north, out)
+            },
+        );
+    }
+
+    (
+        tokenize_alpha_u16_first_row_scalar,
+        tokenize_alpha_u16_interior_scalar,
+    )
+}
+
+static TOKENIZE_ALPHA_U16: OnceLock<TokenizeAlphaU16Fns> = OnceLock::new();
+
+#[inline]
+fn selected_tokenize_alpha_u16() -> TokenizeAlphaU16Fns {
+    *TOKENIZE_ALPHA_U16.get_or_init(select_tokenize_alpha_u16)
+}
+
+#[inline]
+fn tokenize_ac_group_alpha_u16(
+    samples: &[u16],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    dst: &mut [Token],
+) {
+    let (first_row, interior) = selected_tokenize_alpha_u16();
+    tokenize_ac_group_alpha_with(first_row, interior, samples, stride, x0, y0, gw, gh, dst);
 }
 
 #[inline]
@@ -538,6 +765,98 @@ mod tests {
         }
     }
 
+    fn check_u8_tokenizer((first_row, interior): TokenizeAlphaU8Fns) {
+        for &gw in &[1usize, 2, 7, 8, 9, 15, 16, 17, 31, 32, 255, 256] {
+            for &gh in &[1usize, 2, 3, 7] {
+                let x0 = 3;
+                let y0 = 2;
+                let stride = x0 + gw + 5;
+                let height = y0 + gh + 1;
+                let mut state = 0x1234_5678u32 ^ (gw as u32) ^ ((gh as u32) << 16);
+                let samples: Vec<u8> = (0..stride * height)
+                    .map(|i| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        match i & 7 {
+                            0 => 0,
+                            1 => 255,
+                            _ => (state >> 24) as u8,
+                        }
+                    })
+                    .collect();
+
+                let sentinel = Token::new(u32::MAX, u32::MAX);
+                let mut expected = vec![sentinel; gw * gh];
+                let mut actual = vec![sentinel; gw * gh];
+                tokenize_ac_group_alpha(&samples, stride, x0, y0, gw, gh, &mut expected);
+                tokenize_ac_group_alpha_with(
+                    first_row,
+                    interior,
+                    &samples,
+                    stride,
+                    x0,
+                    y0,
+                    gw,
+                    gh,
+                    &mut actual,
+                );
+
+                for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        (actual.context, actual.value),
+                        (expected.context, expected.value),
+                        "u8 alpha token mismatch at index {i} for {gw}x{gh}",
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_u16_tokenizer((first_row, interior): TokenizeAlphaU16Fns) {
+        for gw in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 255, 256] {
+            for gh in [1usize, 2, 3, 7] {
+                let x0 = 3;
+                let y0 = 2;
+                let stride = x0 + gw + 5;
+                let height = y0 + gh + 1;
+                let mut state = 0x89ab_cdefu32 ^ (gw as u32) ^ ((gh as u32) << 16);
+                let samples: Vec<u16> = (0..stride * height)
+                    .map(|i| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        match i & 7 {
+                            0 => 0,
+                            1 => u16::MAX,
+                            _ => (state >> 16) as u16,
+                        }
+                    })
+                    .collect();
+
+                let sentinel = Token::new(u32::MAX, u32::MAX);
+                let mut expected = vec![sentinel; gw * gh];
+                let mut actual = vec![sentinel; gw * gh];
+                tokenize_ac_group_alpha(&samples, stride, x0, y0, gw, gh, &mut expected);
+                tokenize_ac_group_alpha_with(
+                    first_row,
+                    interior,
+                    &samples,
+                    stride,
+                    x0,
+                    y0,
+                    gw,
+                    gh,
+                    &mut actual,
+                );
+
+                for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        (actual.context, actual.value),
+                        (expected.context, expected.value),
+                        "u16 alpha token mismatch at index {i} for {gw}x{gh}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn gradient_basic() {
         assert_eq!(gradient(50, 50, 0), 50);
@@ -568,6 +887,90 @@ mod tests {
 
         let i32_samples: Vec<i32> = (0..64).map(|v| (v * 43 + 17) % 257 - 128).collect();
         check_ac_group_tokenization(&i32_samples, 8, 3, 1, 4, 7);
+    }
+
+    #[test]
+    fn selected_u8_ac_group_tokenizer_matches_scalar() {
+        check_u8_tokenizer(selected_tokenize_alpha_u8());
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_u8_ac_group_tokenizer_matches_scalar() {
+        check_u8_tokenizer((
+            |row, out| unsafe { crate::neon::tokenize_alpha_u8_first_row_neon(row, out) },
+            |row, north, out| unsafe {
+                crate::neon::tokenize_alpha_u8_interior_neon(row, north, out)
+            },
+        ));
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_u8_ac_group_tokenizer_matches_scalar() {
+        if std::is_x86_feature_detected!("avx2") {
+            check_u8_tokenizer((
+                |row, out| unsafe { crate::avx::tokenize_alpha_u8_first_row_avx2(row, out) },
+                |row, north, out| unsafe {
+                    crate::avx::tokenize_alpha_u8_interior_avx2(row, north, out)
+                },
+            ));
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_u8_ac_group_tokenizer_matches_scalar() {
+        if std::is_x86_feature_detected!("sse4.1") {
+            check_u8_tokenizer((
+                |row, out| unsafe { crate::sse::tokenize_alpha_u8_first_row_sse41(row, out) },
+                |row, north, out| unsafe {
+                    crate::sse::tokenize_alpha_u8_interior_sse41(row, north, out)
+                },
+            ));
+        }
+    }
+
+    #[test]
+    fn selected_u16_ac_group_tokenizer_matches_scalar() {
+        check_u16_tokenizer(selected_tokenize_alpha_u16());
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    #[test]
+    fn neon_u16_ac_group_tokenizer_matches_scalar() {
+        check_u16_tokenizer((
+            |row, out| unsafe { crate::neon::tokenize_alpha_u16_first_row_neon(row, out) },
+            |row, north, out| unsafe {
+                crate::neon::tokenize_alpha_u16_interior_neon(row, north, out)
+            },
+        ));
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_u16_ac_group_tokenizer_matches_scalar() {
+        if std::is_x86_feature_detected!("avx2") {
+            check_u16_tokenizer((
+                |row, out| unsafe { crate::avx::tokenize_alpha_u16_first_row_avx2(row, out) },
+                |row, north, out| unsafe {
+                    crate::avx::tokenize_alpha_u16_interior_avx2(row, north, out)
+                },
+            ));
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_u16_ac_group_tokenizer_matches_scalar() {
+        if std::is_x86_feature_detected!("sse4.1") {
+            check_u16_tokenizer((
+                |row, out| unsafe { crate::sse::tokenize_alpha_u16_first_row_sse41(row, out) },
+                |row, north, out| unsafe {
+                    crate::sse::tokenize_alpha_u16_interior_sse41(row, north, out)
+                },
+            ));
+        }
     }
 
     #[test]
