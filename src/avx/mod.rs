@@ -33,6 +33,7 @@ mod cfl;
 mod dark_aq;
 mod dct;
 mod entropy;
+mod frame;
 mod inflated_cost;
 mod lossless_grad;
 mod modular;
@@ -58,6 +59,7 @@ pub(crate) use dct::{
     inv_dct32x64_avx2, inv_dct64x32_avx2, inv_dct64x64_avx2,
 };
 pub(crate) use entropy::counts_bit_cost_avx2;
+pub(crate) use frame::x_gradient_sums_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
     recon_dist_and_rate_avx2, ssim_deficit_avx2,

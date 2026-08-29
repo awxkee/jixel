@@ -33,6 +33,7 @@ mod cfl;
 mod dark_aq;
 mod dct;
 mod entropy;
+mod frame;
 mod inflated_cost;
 mod lossless_grad;
 mod quant;
@@ -50,6 +51,7 @@ pub(crate) use cfl::{apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm, cfl
 pub(crate) use dark_aq::dark_structure_stats_wasm;
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
+pub(crate) use frame::x_gradient_sums_wasm;
 pub(crate) use inflated_cost::{
     combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
 };

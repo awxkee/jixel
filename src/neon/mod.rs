@@ -33,6 +33,7 @@ mod cfl;
 mod dark_aq;
 mod dct;
 mod entropy;
+mod frame;
 mod inflated_cost;
 mod lossless_grad;
 mod modular;
@@ -58,6 +59,7 @@ pub(crate) use dct::{
     inv_dct32x64_neon, inv_dct64x32_neon, inv_dct64x64_neon,
 };
 pub(crate) use entropy::counts_bit_cost_neon;
+pub(crate) use frame::x_gradient_sums_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
     recon_dist_and_rate_neon, ssim_deficit_neon,
