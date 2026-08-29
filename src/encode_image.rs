@@ -722,9 +722,14 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     if ctx.speed != Speed::Slow {
         return;
     }
-    if let Some(m) = crate::yellow_opsin::select_yellow_matrix(linear, distance) {
+    let selection = crate::yellow_opsin::select_yellow(linear, distance);
+    if let Some(m) = selection.matrix {
         ctx.xyb = m;
     }
+    // Band-class frames (thin-HF chroma structure) also get the fine B
+    // quantizer: the tier-1 strong-bias fire and the X-gradient gate identify
+    // the same content class the b_qm bump was measured on.
+    ctx.set_b_fine(ctx.x_heavy() || selection.strong_bias);
 }
 
 fn lossy_context(

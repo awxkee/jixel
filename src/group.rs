@@ -1292,7 +1292,7 @@ pub(crate) fn write_ac_group(
                 inv_qm_b,
                 quant_ac,
                 scale,
-                crate::frame::b_qm_mul(),
+                ctx.b_qm_mul(),
                 distance,
                 cx,
                 cy,
@@ -1311,7 +1311,7 @@ pub(crate) fn write_ac_group(
                     coeff_orders.scan_for(strategy_code, 2),
                     &coeffs[2][..size],
                     inv_qm_b,
-                    quantize_ac_q_scaled(quant_ac, scale, crate::frame::b_qm_mul()),
+                    quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
                     &mut quantized[2][..size],
                     raw_strategy,
                     strategy_code,
@@ -1326,7 +1326,7 @@ pub(crate) fn write_ac_group(
                 );
             }
             if measure_chroma_distortion {
-                let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, crate::frame::b_qm_mul());
+                let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
                 for i in 0..size {
                     let v = i / row_stride;
                     let u = i % row_stride;

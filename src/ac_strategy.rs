@@ -448,7 +448,7 @@ fn strategy_cost64(
         let qm_mult = if c == 0 {
             qm_mult_x
         } else if c == 2 {
-            crate::frame::b_qm_mul()
+            ctx.b_qm_mul()
         } else {
             1.0
         };
@@ -662,7 +662,7 @@ fn coefficient_dist_and_rate(
         let qm_mult = if c == 0 {
             qm_mult_x
         } else if c == 2 {
-            crate::frame::b_qm_mul()
+            ctx.b_qm_mul()
         } else {
             1.0
         };
@@ -805,6 +805,7 @@ fn reconstruction_dist_and_rate(
                 ],
                 qac,
                 qm_mult_x,
+                qm_mult_b: ctx.b_qm_mul(),
                 distance,
             },
             transform: ReconTransform {
