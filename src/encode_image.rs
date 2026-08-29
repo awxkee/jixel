@@ -714,6 +714,19 @@ pub fn distance_from_quality(quality: f32) -> f32 {
     d.min(25.0)
 }
 
+/// Adaptive B-bias opsin swap for yellow content that quantization would
+/// desaturate (two tiers, `Speed::Slow` only — see `yellow_opsin`). Must run
+/// after linearization and before any XYB conversion; the non-spec matrix is
+/// signaled via the explicit CustomTransformData bundle in `write_headers`.
+fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32) {
+    if ctx.speed != Speed::Slow {
+        return;
+    }
+    if let Some(m) = crate::yellow_opsin::select_yellow_matrix(linear, distance) {
+        ctx.xyb = m;
+    }
+}
+
 fn lossy_context(
     config: &EncodeConfig,
     distance: f32,
@@ -881,6 +894,8 @@ pub fn encode_image(
     let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
     });
+    let mut ctx = ctx;
+    apply_yellow_opsin(&mut ctx, &linear, distance);
     let cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
         .with_icc_profile(config.icc_profile.clone())
@@ -951,6 +966,8 @@ pub fn encode_image_with_alpha(
     let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
         lut[v as usize]
     });
+    let mut ctx = ctx;
+    apply_yellow_opsin(&mut ctx, &linear, distance);
     let alpha_plane = input.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
     let cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
@@ -1469,6 +1486,8 @@ fn encode_high_depth_rgba(
         let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
             lut[v as usize]
         });
+        let mut ctx = ctx;
+        apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
             .as_chunks::<4>()
             .0
@@ -1500,6 +1519,8 @@ fn encode_high_depth_rgba(
         let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
             lut[v as usize]
         });
+        let mut ctx = ctx;
+        apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
             .with_bits_per_sample(bps)
@@ -1628,6 +1649,8 @@ fn encode_float_rgba(
     if has_alpha {
         let linear =
             linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let mut ctx = ctx;
+        apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
             .as_chunks::<4>()
             .0
@@ -1650,6 +1673,8 @@ fn encode_float_rgba(
     } else {
         let linear =
             linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let mut ctx = ctx;
+        apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
             .with_bits_per_sample(bps)
