@@ -104,6 +104,92 @@ pub(crate) fn cfl_regression_avx2(
     reduce_transposed_4x8(ca_x, cb_x, ca_b, cb_b)
 }
 
+#[target_feature(enable = "avx2")]
+pub(crate) fn cfl_rdo_block_avx2(
+    m_x: &mut [f32; 63],
+    s_x: &mut [f32; 63],
+    m_b: &mut [f32; 63],
+    s_b: &mut [f32; 63],
+    block_y: &[f32; 64],
+    block_x: &[f32; 64],
+    block_b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+    q_block: f32,
+) {
+    let q_block_v = _mm256_set1_ps(q_block);
+    for i in (0..56).step_by(8) {
+        let coeff = i + 1;
+        let y = unsafe { _mm256_loadu_ps(block_y.as_ptr().add(coeff)) };
+        let x = unsafe { _mm256_loadu_ps(block_x.as_ptr().add(coeff)) };
+        let b = unsafe { _mm256_loadu_ps(block_b.as_ptr().add(coeff)) };
+        let qx = unsafe { _mm256_loadu_ps(qm_x.as_ptr().add(coeff)) };
+        let qb = unsafe { _mm256_loadu_ps(qm_b.as_ptr().add(coeff)) };
+        let qx = _mm256_mul_ps(qx, q_block_v);
+        let qb = _mm256_mul_ps(qb, q_block_v);
+        unsafe {
+            _mm256_storeu_ps(m_x.as_mut_ptr().add(i), _mm256_mul_ps(y, qx));
+            _mm256_storeu_ps(s_x.as_mut_ptr().add(i), _mm256_mul_ps(x, qx));
+            _mm256_storeu_ps(m_b.as_mut_ptr().add(i), _mm256_mul_ps(y, qb));
+            _mm256_storeu_ps(s_b.as_mut_ptr().add(i), _mm256_mul_ps(b, qb));
+        }
+    }
+
+    // Seven AC coefficients remain. Mask off lane 7 so neither the loads nor
+    // stores cross the fixed-size input/output arrays.
+    let i = 56;
+    let coeff = i + 1;
+    let mask = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, -1, 0);
+    let y = unsafe { _mm256_maskload_ps(block_y.as_ptr().add(coeff), mask) };
+    let x = unsafe { _mm256_maskload_ps(block_x.as_ptr().add(coeff), mask) };
+    let b = unsafe { _mm256_maskload_ps(block_b.as_ptr().add(coeff), mask) };
+    let qx = unsafe { _mm256_maskload_ps(qm_x.as_ptr().add(coeff), mask) };
+    let qb = unsafe { _mm256_maskload_ps(qm_b.as_ptr().add(coeff), mask) };
+    let qx = _mm256_mul_ps(qx, q_block_v);
+    let qb = _mm256_mul_ps(qb, q_block_v);
+    unsafe {
+        _mm256_maskstore_ps(m_x.as_mut_ptr().add(i), mask, _mm256_mul_ps(y, qx));
+        _mm256_maskstore_ps(s_x.as_mut_ptr().add(i), mask, _mm256_mul_ps(x, qx));
+        _mm256_maskstore_ps(m_b.as_mut_ptr().add(i), mask, _mm256_mul_ps(y, qb));
+        _mm256_maskstore_ps(s_b.as_mut_ptr().add(i), mask, _mm256_mul_ps(b, qb));
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn cfl_rdo_stats_avx2(m: &[f32], s: &[f32]) -> [f32; 4] {
+    let len = m.len().min(s.len());
+    let (m_chunks, m_tail) = m[..len].as_chunks::<8>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<8>();
+    let mut dot_ms = _mm256_setzero_ps();
+    let mut dot_mm = _mm256_setzero_ps();
+    let mut dot_ss = _mm256_setzero_ps();
+    let mut sum_abs_s = _mm256_setzero_ps();
+    let sign = _mm256_set1_ps(-0.0);
+
+    for (m, s) in m_chunks.iter().zip(s_chunks) {
+        let mv = unsafe { _mm256_loadu_ps(m.as_ptr()) };
+        let sv = unsafe { _mm256_loadu_ps(s.as_ptr()) };
+        dot_ms = _mm256_fmadd_ps(mv, sv, dot_ms);
+        dot_mm = _mm256_fmadd_ps(mv, mv, dot_mm);
+        dot_ss = _mm256_fmadd_ps(sv, sv, dot_ss);
+        sum_abs_s = _mm256_add_ps(sum_abs_s, _mm256_andnot_ps(sign, sv));
+    }
+
+    let tail_len = m_tail.len();
+    if tail_len != 0 {
+        let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(tail_len as i32), lanes);
+        let mv = unsafe { _mm256_maskload_ps(m_tail.as_ptr(), mask) };
+        let sv = unsafe { _mm256_maskload_ps(s_tail.as_ptr(), mask) };
+        dot_ms = _mm256_fmadd_ps(mv, sv, dot_ms);
+        dot_mm = _mm256_fmadd_ps(mv, mv, dot_mm);
+        dot_ss = _mm256_fmadd_ps(sv, sv, dot_ss);
+        sum_abs_s = _mm256_add_ps(sum_abs_s, _mm256_andnot_ps(sign, sv));
+    }
+
+    reduce_transposed_4x8(dot_ms, dot_mm, dot_ss, sum_abs_s)
+}
+
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn apply_cfl_avx2(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());

@@ -281,6 +281,8 @@ pub(crate) struct CoderScratch {
     pub(crate) dc_cfl_prev: Vec<i32>,
     pub(crate) dc_predictor: LazyScratch<DcPredictorScratch>,
     pub(crate) patch_tile_colors: LazyScratch<Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>>,
+    /// ~63KB of CfL RDO coefficient staging; only Slow lossy workers use it.
+    pub(crate) cfl_rdo: LazyScratch<crate::color_correlation::CflRdoScratch>,
 }
 
 impl CoderScratch {
@@ -342,6 +344,7 @@ impl CoderScratch {
             dc_cfl_prev: Vec::new(),
             dc_predictor: LazyScratch::default(),
             patch_tile_colors: LazyScratch::new(|| heap_array([0; 3])),
+            cfl_rdo: LazyScratch::default(),
         }
     }
 
@@ -364,7 +367,7 @@ mod tests {
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
-        assert!(size_of::<CoderScratch>() <= 1056);
+        assert!(size_of::<CoderScratch>() <= 1104);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);
