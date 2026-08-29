@@ -1249,6 +1249,15 @@ pub(crate) fn encode_frame(
             && !is_achromatic
             && chroma_saturation_stat(&xyb) >= SAT_QM_THRESHOLD,
     );
+    // Band-limited to where it is validated: below the MID-table boundary the
+    // gate keeps the fine X quantizer AND the plain (unflattened-B) tables;
+    // at 1.25 the regular distance schedule takes over.
+    ctx.set_x_heavy(
+        ctx.speed == crate::Speed::Slow
+            && !is_achromatic
+            && distance < crate::quant_weights::QM_FLAT_B8_MID_MIN_DISTANCE
+            && x_gradient_stat(ctx, &xyb) >= X_QM_GRAD_THRESHOLD,
+    );
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
@@ -1421,6 +1430,12 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 /// quantizes to pure zeros and the CfL fit sees slope 0/1 instead of noise.
 const SAT_QM_THRESHOLD: f32 = 0.055;
 
+/// `x_gradient_stat` gate for keeping the fine X quantizer through the
+/// x_qm_scale=2 distance band (0.299..=1.25). Calibration 2026-08-29:
+/// Burning_Ship reads 0.053 (its yellow-band crop 0.072); the highest
+/// natural image measured (Kodak + assets, 30 images) reads 0.027.
+const X_QM_GRAD_THRESHOLD: f32 = 0.04;
+
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
     let mut sum = 0.0;
     let mut n = 0u64;
@@ -1437,6 +1452,61 @@ fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
         y += 4;
     }
     if n == 0 { 0.0 } else { sum / n as f32 }
+}
+
+/// Share of high-frequency signal carried by the X (red-green) channel:
+/// mean |horizontal ∇X| over mean |horizontal ∇Y| on a 1-in-4 row subsample.
+/// Achromatic content reads ~0; ordinary photos stay well below saturated
+/// red/green-structured content, where X carries the detail that the
+/// distance-laddered `x_qm_scale` drop at d=0.3 would destroy.
+pub(crate) type XGradientSumsFn = fn(&[f32], &[f32], usize) -> [f32; 2];
+
+#[allow(dead_code)]
+pub(crate) fn x_gradient_sums_scalar(x_plane: &[f32], y_plane: &[f32], width: usize) -> [f32; 2] {
+    if width < 2 {
+        return [0.0; 2];
+    }
+
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    let rows = x_plane
+        .chunks_exact(width)
+        .zip(y_plane.chunks_exact(width))
+        .step_by(4);
+    for (xr, yr) in rows {
+        for (x, l) in xr.array_windows::<2>().zip(yr.array_windows::<2>()) {
+            sum_x += (x[1] - x[0]).abs();
+            sum_y += (l[1] - l[0]).abs();
+        }
+    }
+    [sum_x, sum_y]
+}
+
+pub(crate) fn selected_x_gradient_sums_fn() -> XGradientSumsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |x, y, width| unsafe { crate::neon::x_gradient_sums_neon(x, y, width) }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |x, y, width| unsafe { crate::avx::x_gradient_sums_avx2(x, y, width) };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::x_gradient_sums_wasm;
+    #[cfg(not(any(
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+        all(target_arch = "aarch64", feature = "neon")
+    )))]
+    x_gradient_sums_scalar
+}
+
+fn x_gradient_stat(ctx: &EncodingContext, xyb: &Image3F) -> f32 {
+    let [sum_x, sum_y] = (ctx.x_gradient_sums)(xyb.plane_data(0), xyb.plane_data(1), xyb.xsize());
+    if sum_y > f32::EPSILON {
+        sum_x / sum_y
+    } else {
+        0.0
+    }
 }
 
 fn snap_achromatic_xyb(xyb: &mut Image3F) {
@@ -1480,7 +1550,10 @@ fn encode_frame_core(
 ) -> Result<(), EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
-    let distp = compute_distance_params(distance);
+    let mut distp = compute_distance_params(distance);
+    if ctx.x_heavy() && distp.x_qm_scale == 2 {
+        distp.x_qm_scale = 3;
+    }
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
@@ -2657,6 +2730,60 @@ mod tests {
         let stat = super::chroma_saturation_stat(&xyb);
         assert!((stat - 0.07).abs() < 1e-5, "{stat}");
         assert!(stat >= super::SAT_QM_THRESHOLD);
+    }
+
+    #[test]
+    fn x_gradient_stat_separates_red_structure_from_achromatic() {
+        let ctx = crate::encoding_context::EncodingContext::default();
+        // Achromatic: X flat at 0 → stat 0, far below the gate.
+        let mut xyb = crate::image::Image3F::new(32, 32);
+        for y in 0..32 {
+            let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
+            x_row.fill(0.0);
+            for (x, v) in y_row.iter_mut().enumerate() {
+                *v = (x % 7) as f32 * 0.1;
+            }
+            b_row.fill(0.5);
+        }
+        assert_eq!(super::x_gradient_stat(&ctx, &xyb), 0.0);
+
+        // X carrying half of Y's gradient amplitude → stat 0.5, over the gate.
+        for y in 0..32 {
+            let [x_row, y_row, _] = xyb.all_plane_rows_mut(y);
+            for (x, v) in x_row.iter_mut().enumerate() {
+                *v = y_row[x] * 0.5;
+            }
+        }
+        let stat = super::x_gradient_stat(&ctx, &xyb);
+        assert!((stat - 0.5).abs() < 1e-5, "{stat}");
+        assert!(stat >= super::X_QM_GRAD_THRESHOLD);
+    }
+
+    #[test]
+    fn selected_x_gradient_sums_match_scalar() {
+        let selected = super::selected_x_gradient_sums_fn();
+        for width in [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
+            for height in [0, 1, 4, 5, 9] {
+                let len = width * height;
+                let x: Vec<f32> = (0..len)
+                    .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03125)
+                    .collect();
+                let y: Vec<f32> = (0..len)
+                    .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.0234375)
+                    .collect();
+                let expected = super::x_gradient_sums_scalar(&x, &y, width);
+                let actual = selected(&x, &y, width);
+                for channel in 0..2 {
+                    let tolerance = 1e-5 * expected[channel].abs().max(1.0);
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() <= tolerance,
+                        "channel {channel}, {width}x{height}: SIMD={}, scalar={}, tolerance={tolerance}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -82,6 +82,7 @@ mod util;
 mod wasm;
 mod weighted_predictor;
 mod xyb;
+mod yellow_opsin;
 
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,

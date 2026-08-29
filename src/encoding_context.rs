@@ -32,8 +32,8 @@ use crate::dark_aq::{self, DarkAqConfig};
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
 use crate::{
-    Speed, ac_strategy, adaptive_quant, color_correlation, dct, group, inflated_cost, structure_aq,
-    xyb,
+    Speed, ac_strategy, adaptive_quant, color_correlation, dct, frame, group, inflated_cost,
+    structure_aq, xyb,
 };
 
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
@@ -48,9 +48,11 @@ pub(crate) struct EncodingContext {
     pub(crate) merge: ac_strategy::MergeTuning,
     base_matrices: &'static DequantMatrices,
     sat_matrices: &'static DequantMatrices,
+    plain_hq_matrices: &'static DequantMatrices,
     /// Set once per frame (post-XYB, before any table use) by the
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
+    x_heavy: std::sync::atomic::AtomicBool,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -70,6 +72,7 @@ pub(crate) struct EncodingContext {
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
     pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
+    pub(crate) x_gradient_sums: frame::XGradientSumsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
@@ -102,10 +105,15 @@ pub(crate) struct EncodingContext {
 
 impl EncodingContext {
     /// The dequant tables for the current frame: the distance-tier default,
-    /// or the saturated-content variant when the chroma gate fired.
+    /// the saturated-content variant when the chroma gate fired, or the plain
+    /// sub-d=0.3 set when the X-gradient gate fired (it outranks the chroma
+    /// gate: both fire on saturated red content, where flattened B bands are
+    /// a strict RD loss).
     #[inline]
     pub(crate) fn matrices(&self) -> &'static DequantMatrices {
-        if self.chroma_heavy.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.x_heavy.load(std::sync::atomic::Ordering::Relaxed) {
+            self.plain_hq_matrices
+        } else if self.chroma_heavy.load(std::sync::atomic::Ordering::Relaxed) {
             self.sat_matrices
         } else {
             self.base_matrices
@@ -114,6 +122,15 @@ impl EncodingContext {
 
     pub(crate) fn set_chroma_heavy(&self, heavy: bool) {
         self.chroma_heavy
+            .store(heavy, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn x_heavy(&self) -> bool {
+        self.x_heavy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_x_heavy(&self, heavy: bool) {
+        self.x_heavy
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -135,7 +152,9 @@ impl EncodingContext {
             merge: ac_strategy::MergeTuning::new(distance),
             base_matrices: DequantMatrices::new(distance),
             sat_matrices: DequantMatrices::new_saturated(distance),
+            plain_hq_matrices: DequantMatrices::new(0.0),
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
+            x_heavy: std::sync::atomic::AtomicBool::new(false),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
@@ -160,6 +179,7 @@ impl EncodingContext {
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
             cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
+            x_gradient_sums: frame::selected_x_gradient_sums_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),
