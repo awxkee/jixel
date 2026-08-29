@@ -68,6 +68,8 @@ pub(crate) struct EncodingContext {
     pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
     pub(crate) gradient_region_stats_with_chroma: ac_strategy::GradientRegionStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
+    pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
+    pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
@@ -156,6 +158,8 @@ impl EncodingContext {
             gradient_region_stats_with_chroma:
                 ac_strategy::select_gradient_region_stats_with_chroma_fn(),
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
+            cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
+            cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),

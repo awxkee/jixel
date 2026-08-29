@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::adaptive_quant::dirty_log2f;
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -43,6 +44,97 @@ const K_DISTANCE_MULTIPLIER_AC: f32 = 1e-3;
 
 pub(crate) type CflRegressionFn =
     fn(&[f32; 64], &[f32; 64], &[f32; 64], &[f32; 64], &[f32; 64]) -> [f32; 4];
+
+pub(crate) type CflRdoBlockFn = fn(
+    &mut [f32; 63],
+    &mut [f32; 63],
+    &mut [f32; 63],
+    &mut [f32; 63],
+    &[f32; 64],
+    &[f32; 64],
+    &[f32; 64],
+    &[f32; 64],
+    &[f32; 64],
+    f32,
+);
+
+pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
+
+#[allow(dead_code)]
+pub(crate) fn cfl_rdo_stats_scalar(m: &[f32], s: &[f32]) -> [f32; 4] {
+    let mut stats = [0.0f32; 4];
+    for (&mv, &sv) in m.iter().zip(s) {
+        stats[0] = fmla(mv, sv, stats[0]);
+        stats[1] = fmla(mv, mv, stats[1]);
+        stats[2] = fmla(sv, sv, stats[2]);
+        stats[3] += sv.abs();
+    }
+    stats
+}
+
+pub(crate) fn selected_cfl_rdo_stats_fn() -> CflRdoStatsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |m, s| unsafe { crate::neon::cfl_rdo_stats_neon(m, s) }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |m, s| unsafe { crate::avx::cfl_rdo_stats_avx2(m, s) };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::cfl_rdo_stats_wasm;
+    #[cfg(not(any(
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+        all(target_arch = "aarch64", feature = "neon")
+    )))]
+    cfl_rdo_stats_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn cfl_rdo_block_scalar(
+    m_x: &mut [f32; 63],
+    s_x: &mut [f32; 63],
+    m_b: &mut [f32; 63],
+    s_b: &mut [f32; 63],
+    block_y: &[f32; 64],
+    block_x: &[f32; 64],
+    block_b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+    q_block: f32,
+) {
+    for i in 0..63 {
+        let coeff = i + 1;
+        let qx = qm_x[coeff] * q_block;
+        let qb = qm_b[coeff] * q_block;
+        m_x[i] = block_y[coeff] * qx;
+        s_x[i] = block_x[coeff] * qx;
+        m_b[i] = block_y[coeff] * qb;
+        s_b[i] = block_b[coeff] * qb;
+    }
+}
+
+pub(crate) fn selected_cfl_rdo_block_fn() -> CflRdoBlockFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, q_block| unsafe {
+            crate::neon::cfl_rdo_block_neon(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, q_block);
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, q_block| unsafe {
+            crate::avx::cfl_rdo_block_avx2(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, q_block);
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::cfl_rdo_block_wasm;
+    #[cfg(not(any(
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+        all(target_arch = "aarch64", feature = "neon")
+    )))]
+    cfl_rdo_block_scalar
+}
 
 #[allow(dead_code)]
 pub(crate) fn cfl_regression_scalar(
@@ -94,6 +186,41 @@ pub(crate) fn selected_cfl_regression_fn() -> CflRegressionFn {
 const CFL_DEADZONE_AMOUNT: f32 = 1.5;
 const CFL_DEADZONE_LO: f32 = 1.0;
 const CFL_DEADZONE_HI: f32 = 2.0;
+
+struct CflRdoFit {
+    /// Rate weight for the (cand - pred) token estimate, scaled by tile_q.
+    lambda_bits: f32,
+    /// Per-unit multiplier magnitude cost, scaled by tile_q.
+    mag_cost: f32,
+    /// Magnitude-cost amplification on strongly/mildly neutral tiles.
+    dz_strong: f32,
+    dz_mild: f32,
+    corr_strong: f32,
+    corr_mild: f32,
+    energy_strong: f32,
+    energy_mild: f32,
+    /// Mean |chroma DC| gates, raw opsin scale (X is tiny; B tracks luma).
+    dc_thr_x: f32,
+    dc_thr_b: f32,
+    /// Fall back to the L2 path at and above this distance: the L1
+    /// objective drifts off-metric at high d (Kodak: win < 3, loss at 3 —
+    /// the stress-corpus fit wanted 3.5, the holdout overrules).
+    max_d: f32,
+}
+
+static CFL_RDO: CflRdoFit = CflRdoFit {
+    lambda_bits: 0.045,
+    mag_cost: 0.09,
+    dz_strong: 3.4,
+    dz_mild: 2.45,
+    corr_strong: 0.20,
+    corr_mild: 0.35,
+    energy_strong: 0.09,
+    energy_mild: 0.073,
+    dc_thr_x: 0.10,
+    dc_thr_b: 0.55,
+    max_d: 3.0,
+};
 
 #[inline]
 fn cfl_deadzone(distance: f32) -> f32 {
@@ -199,6 +326,293 @@ fn compute_cmap_tile(
     (ytox, ytob)
 }
 
+/// Worst-case per-tile coefficient count: a full 8×8-block tile keeps 63 AC
+/// coefficients per block. The L1 candidate cost needs every coefficient (it
+/// has no closed-form sufficient statistics, unlike the default L2 path), so
+/// the tile's worth of them is staged here.
+const CFL_RDO_TILE_AC: usize = K_TILE_DIM_IN_BLOCKS * K_TILE_DIM_IN_BLOCKS * 63;
+
+pub(crate) struct CflRdoScratch {
+    m_x: Box<[f32; CFL_RDO_TILE_AC]>,
+    s_x: Box<[f32; CFL_RDO_TILE_AC]>,
+    m_b: Box<[f32; CFL_RDO_TILE_AC]>,
+    s_b: Box<[f32; CFL_RDO_TILE_AC]>,
+    len: usize,
+}
+
+impl CflRdoScratch {
+    fn new() -> Self {
+        let alloc = || {
+            vec![0.0f32; CFL_RDO_TILE_AC]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap()
+        };
+        CflRdoScratch {
+            m_x: alloc(),
+            s_x: alloc(),
+            m_b: alloc(),
+            s_b: alloc(),
+            len: 0,
+        }
+    }
+}
+
+impl Default for CflRdoScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Clamped-gradient prediction of a tile's multiplier from its causal
+/// neighbors — the same predictor `tokenize_dc_global` charges the map with,
+/// so rate-to-pred here is rate-to-pred in the bitstream. Safe because
+/// `fill_cmap` walks tiles serially in raster order (the upstream fork races
+/// here; jixel does not).
+fn cmap_tile_pred(map: &ImageSB, tx: usize, ty: usize) -> i32 {
+    if tx == 0 && ty == 0 {
+        return 0;
+    }
+    if tx == 0 {
+        return map.row(ty - 1)[tx] as i32;
+    }
+    if ty == 0 {
+        return map.row(ty)[tx - 1] as i32;
+    }
+    grad_predict(
+        map.row(ty - 1)[tx] as i32,
+        map.row(ty)[tx - 1] as i32,
+        map.row(ty - 1)[tx - 1] as i32,
+    )
+}
+
+/// Approximate hybrid-uint token cost in bits for a map residual.
+fn cmap_residual_bits(res: i32) -> f32 {
+    let res = res.unsigned_abs();
+    match res {
+        0 => 0.8,
+        1 => 2.0,
+        _ => 2.5 + dirty_log2f(res as f32),
+    }
+}
+
+/// Pick one channel's multiplier by candidate search: L1 distortion + rate
+/// to the spatial predictor + a neutral-gated magnitude cost. `m`/`s` are
+/// luma/chroma coefficients in quant-step units; `base` is the base
+/// correlation the signaled value offsets.
+#[allow(clippy::too_many_arguments)]
+fn optimize_channel_rdo(
+    stats_fn: CflRdoStatsFn,
+    m: &[f32],
+    s: &[f32],
+    pred: i32,
+    base: f32,
+    dc_avg: f32,
+    dc_thr: f32,
+    tile_q: f32,
+) -> i32 {
+    if m.is_empty() {
+        return if pred.abs() <= 4 { pred } else { 0 };
+    }
+
+    let [dot_ms, dot_mm, dot_ss, sum_abs_s] = stats_fn(m, s);
+    let energy = sum_abs_s / m.len() as f32;
+    let corr = if dot_mm > 1e-6 && dot_ss > 1e-6 {
+        dot_ms.abs() / (dot_mm * dot_ss).sqrt()
+    } else {
+        0.0
+    };
+
+    // Analytical least-squares seed: argmin_f sum (s - f*m)^2.
+    let target_factor = if dot_mm > 1e-6 { dot_ms / dot_mm } else { base };
+    let target_cand = ((target_factor - base) * K_COLOR_FACTOR)
+        .round()
+        .clamp(-128.0, 127.0) as i32;
+
+    // Neutral-tile gate: only amplify the magnitude cost where chroma is
+    // uncorrelated, low-energy, and near-neutral, so the deadzone suppresses
+    // color noise without desaturating regions with a real slope.
+    let dz_penalty =
+        if corr < CFL_RDO.corr_strong && energy < CFL_RDO.energy_strong && dc_avg < dc_thr {
+            CFL_RDO.dz_strong
+        } else if corr < CFL_RDO.corr_mild && energy < CFL_RDO.energy_mild && dc_avg < dc_thr * 1.5
+        {
+            CFL_RDO.dz_mild
+        } else {
+            1.0
+        };
+
+    let mut cands = [0i32; 19];
+    let mut num_cands = 0usize;
+    let mut add_cand = |cand: i32| {
+        let cand = cand.clamp(-128, 127);
+        if !cands[..num_cands].contains(&cand) {
+            cands[num_cands] = cand;
+            num_cands += 1;
+        }
+    };
+    add_cand(0);
+    add_cand(pred);
+    add_cand(target_cand);
+    for d in 1..=4 {
+        add_cand(target_cand - d);
+        add_cand(target_cand + d);
+        add_cand(pred - d);
+        add_cand(pred + d);
+    }
+
+    let lambda = CFL_RDO.lambda_bits * tile_q;
+    let mag_cost = CFL_RDO.mag_cost * tile_q * dz_penalty;
+    let mut best = (f32::MAX, 0i32);
+    for &cand in &cands[..num_cands] {
+        let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
+        let mut distortion = 0.0f32;
+        for (&mv, &sv) in m.iter().zip(s) {
+            distortion += (sv - factor * mv).abs();
+        }
+        let cost =
+            distortion + lambda * cmap_residual_bits(cand - pred) + cand.abs() as f32 * mag_cost;
+        if cost < best.0 {
+            best = (cost, cand);
+        }
+    }
+    best.1
+}
+
+struct CflBlockRegion {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+struct CflRdoQuantization<'a> {
+    field: &'a crate::image::ImageB,
+    scale: f32,
+    block_x: usize,
+    block_y: usize,
+}
+
+struct CflTilePrediction {
+    ytox: i32,
+    ytob: i32,
+}
+
+struct CflRdoTile<'a> {
+    opsin: &'a Image3F,
+    blocks: CflBlockRegion,
+    quant: CflRdoQuantization<'a>,
+    prediction: CflTilePrediction,
+}
+
+struct CflRdoTileScratch<'a> {
+    dct: &'a mut CflScratch,
+    rdo: &'a mut CflRdoScratch,
+}
+
+/// RDO variant of `compute_cmap_tile`. `tile.quant.block_x/block_y` index the
+/// tile into the DC-group-local quant field; its scale converts entries to
+/// quantizer step scale (`quantize_ac_q_scaled` without the qm multiplier).
+fn compute_cmap_tile_rdo(
+    ctx: &EncodingContext,
+    tile: CflRdoTile<'_>,
+    scratch: CflRdoTileScratch<'_>,
+) -> (i32, i32) {
+    let CflRdoTile {
+        opsin,
+        blocks,
+        quant,
+        prediction,
+    } = tile;
+    let CflRdoTileScratch { dct: scratch, rdo } = scratch;
+    let matrices = ctx.matrices();
+    let qm_x: &[f32; 64] = matrices.inv_matrix(0).first_chunk::<64>().unwrap();
+    let qm_b: &[f32; 64] = matrices.inv_matrix(2).first_chunk::<64>().unwrap();
+
+    let mut block_y = scratch.block_y;
+    let mut block_x = scratch.block_x;
+    let mut block_b = scratch.block_b;
+
+    rdo.len = 0;
+
+    let mut dc_abs_x = 0.0f32;
+    let mut dc_abs_b = 0.0f32;
+    let mut tile_q_sum = 0.0f32;
+    let mut num_blocks = 0usize;
+    for by in 0..blocks.height {
+        for bx in 0..blocks.width {
+            let px = (blocks.x + bx) * K_BLOCK_DIM;
+            let py = (blocks.y + by) * K_BLOCK_DIM;
+            if px + K_BLOCK_DIM > opsin.xsize() || py + K_BLOCK_DIM > opsin.ysize() {
+                continue;
+            }
+            let stride = opsin.xsize();
+            let offset = py * stride + px;
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(1)[offset..], stride),
+                &mut block_y,
+            );
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(0)[offset..], stride),
+                &mut block_x,
+            );
+            (ctx.dct8x8)(
+                DctInput::new(&opsin.plane_data(2)[offset..], stride),
+                &mut block_b,
+            );
+
+            dc_abs_x += block_x[0].abs();
+            dc_abs_b += block_b[0].abs();
+
+            let q_block =
+                quant.scale * quant.field.row(quant.block_y + by)[quant.block_x + bx] as f32;
+            tile_q_sum += q_block;
+            num_blocks += 1;
+
+            // Skip the DC (index 0): the per-tile factor controls AC only.
+            let n = rdo.len;
+
+            let mx = rdo.m_x[n..].first_chunk_mut::<63>().unwrap();
+            let sx = rdo.s_x[n..].first_chunk_mut::<63>().unwrap();
+            let mb = rdo.m_b[n..].first_chunk_mut::<63>().unwrap();
+            let sb = rdo.s_b[n..].first_chunk_mut::<63>().unwrap();
+            (ctx.cfl_rdo_block)(
+                mx, sx, mb, sb, &block_y, &block_x, &block_b, qm_x, qm_b, q_block,
+            );
+            rdo.len = n + 63;
+        }
+    }
+
+    let (dc_avg_x, dc_avg_b, tile_q) = if num_blocks > 0 {
+        let inv = 1.0 / num_blocks as f32;
+        (dc_abs_x * inv, dc_abs_b * inv, tile_q_sum * inv)
+    } else {
+        (0.0, 0.0, 1.0)
+    };
+
+    let ytox = optimize_channel_rdo(
+        ctx.cfl_rdo_stats,
+        &rdo.m_x[..rdo.len],
+        &rdo.s_x[..rdo.len],
+        prediction.ytox,
+        0.0,
+        dc_avg_x,
+        CFL_RDO.dc_thr_x,
+        tile_q,
+    );
+    let ytob = optimize_channel_rdo(
+        ctx.cfl_rdo_stats,
+        &rdo.m_b[..rdo.len],
+        &rdo.s_b[..rdo.len],
+        prediction.ytob,
+        1.0,
+        dc_avg_b,
+        CFL_RDO.dc_thr_b,
+        tile_q,
+    );
+    (ytox, ytob)
+}
+
 /// Fill `ytox_map` / `ytob_map` (sized `(xtiles, ytiles)`) by running the
 /// per-tile regression on `opsin`. `(dc_group_x0_blocks, dc_group_y0_blocks)`
 /// is the block offset of this DC group's (0, 0) tile into `opsin`.
@@ -209,6 +623,9 @@ pub(crate) fn fill_cmap(
     dc_group_y0_blocks: usize,
     dc_group_xsize_blocks: usize,
     dc_group_ysize_blocks: usize,
+    raw_quant_field: &crate::image::ImageB,
+    scale: f32,
+    rdo_scratch: &mut crate::coder_scratch::LazyScratch<CflRdoScratch>,
     ytox_map: &mut ImageSB,
     ytob_map: &mut ImageSB,
     distance: f32,
@@ -222,14 +639,10 @@ pub(crate) fn fill_cmap(
         block_y: [0.; 64],
     };
 
+    let use_rdo = distance < CFL_RDO.max_d && ctx.speed == crate::encode_image::Speed::Slow;
+
     for ty in 0..ytiles {
-        let ytox_lane = ytox_map.row_mut(ty);
-        let ytob_lane = ytob_map.row_mut(ty);
-        for (tx, (v_ytox, v_ytob)) in ytox_lane[..xtiles]
-            .iter_mut()
-            .zip(ytob_lane[..xtiles].iter_mut())
-            .enumerate()
-        {
+        for tx in 0..xtiles {
             let bx0 = dc_group_x0_blocks + tx * K_TILE_DIM_IN_BLOCKS;
             let by0 = dc_group_y0_blocks + ty * K_TILE_DIM_IN_BLOCKS;
             let bx_count = K_TILE_DIM_IN_BLOCKS
@@ -239,18 +652,51 @@ pub(crate) fn fill_cmap(
             if bx_count == 0 || by_count == 0 {
                 continue;
             }
-            let (ytox, ytob) = compute_cmap_tile(
-                ctx,
-                opsin,
-                bx0,
-                by0,
-                bx_count,
-                by_count,
-                distance,
-                &mut scratch,
-            );
-            *v_ytox = ytox as i8;
-            *v_ytob = ytob as i8;
+            let (ytox, ytob) = if use_rdo {
+                // The predictor reads only already-written tiles: this loop
+                // is serial raster order, matching the token predictor.
+                let pred_x = cmap_tile_pred(ytox_map, tx, ty);
+                let pred_b = cmap_tile_pred(ytob_map, tx, ty);
+                compute_cmap_tile_rdo(
+                    ctx,
+                    CflRdoTile {
+                        opsin,
+                        blocks: CflBlockRegion {
+                            x: bx0,
+                            y: by0,
+                            width: bx_count,
+                            height: by_count,
+                        },
+                        quant: CflRdoQuantization {
+                            field: raw_quant_field,
+                            scale,
+                            block_x: tx * K_TILE_DIM_IN_BLOCKS,
+                            block_y: ty * K_TILE_DIM_IN_BLOCKS,
+                        },
+                        prediction: CflTilePrediction {
+                            ytox: pred_x,
+                            ytob: pred_b,
+                        },
+                    },
+                    CflRdoTileScratch {
+                        dct: &mut scratch,
+                        rdo: rdo_scratch,
+                    },
+                )
+            } else {
+                compute_cmap_tile(
+                    ctx,
+                    opsin,
+                    bx0,
+                    by0,
+                    bx_count,
+                    by_count,
+                    distance,
+                    &mut scratch,
+                )
+            };
+            ytox_map.row_mut(ty)[tx] = ytox as i8;
+            ytob_map.row_mut(ty)[tx] = ytob as i8;
         }
     }
 }
@@ -669,6 +1115,65 @@ mod tests {
     }
 
     #[test]
+    fn selected_rdo_block_matches_scalar() {
+        let mut y = [0.0f32; 64];
+        let mut x = [0.0f32; 64];
+        let mut b = [0.0f32; 64];
+        let mut qm_x = [0.0f32; 64];
+        let mut qm_b = [0.0f32; 64];
+        for i in 0..64 {
+            y[i] = ((i * 37 % 97) as f32 - 48.0) * 0.03125;
+            x[i] = ((i * 19 % 89) as f32 - 44.0) * 0.046875;
+            b[i] = ((i * 53 % 101) as f32 - 50.0) * 0.0234375;
+            qm_x[i] = 0.5 + (i % 11) as f32 * 0.0625;
+            qm_b[i] = 0.75 + (i % 7) as f32 * 0.09375;
+        }
+
+        // DC is intentionally invalid: the RDO kernel must consume only the
+        // 63 AC coefficients.
+        y[0] = f32::NAN;
+        x[0] = f32::NAN;
+        b[0] = f32::NAN;
+        qm_x[0] = f32::NAN;
+        qm_b[0] = f32::NAN;
+
+        let mut expected = [[0.0f32; 63]; 4];
+        let [m_x, s_x, m_b, s_b] = &mut expected;
+        cfl_rdo_block_scalar(m_x, s_x, m_b, s_b, &y, &x, &b, &qm_x, &qm_b, 1.375);
+
+        let mut actual = [[0.0f32; 63]; 4];
+        let [m_x, s_x, m_b, s_b] = &mut actual;
+        selected_cfl_rdo_block_fn()(m_x, s_x, m_b, s_b, &y, &x, &b, &qm_x, &qm_b, 1.375);
+
+        assert_eq!(actual, expected);
+        assert!(actual.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn selected_rdo_stats_match_scalar() {
+        let stats_fn = selected_cfl_rdo_stats_fn();
+        for len in [0, 1, 3, 4, 7, 8, 15, 63, 64, CFL_RDO_TILE_AC] {
+            let m: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03125)
+                .collect();
+            let s: Vec<f32> = (0..len)
+                .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.0234375)
+                .collect();
+            let expected = cfl_rdo_stats_scalar(&m, &s);
+            let actual = stats_fn(&m, &s);
+            for i in 0..4 {
+                let tolerance = 1e-4 * expected[i].abs().max(1.0);
+                assert!(
+                    (actual[i] - expected[i]).abs() <= tolerance,
+                    "stat {i} at len {len}: SIMD={}, scalar={}, tolerance={tolerance}",
+                    actual[i],
+                    expected[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn deadzone_schedule_ramps_from_full_to_zero() {
         // Full amount at/below LO, zero at/above HI, linear in between, and off
         // (byte-identical) at low quality.
@@ -703,6 +1208,91 @@ mod tests {
         assert!(
             ytox_hq < ytox_lq,
             "deadzone should shrink the HQ slope: hq={ytox_hq} lq={ytox_lq}"
+        );
+    }
+
+    fn rdo_tile(opsin: &Image3F, pred_x: i32, pred_b: i32) -> (i32, i32) {
+        let ctx = EncodingContext::default();
+        let mut scratch = CflScratch {
+            block_b: [0.; 64],
+            block_x: [0.; 64],
+            block_y: [0.; 64],
+        };
+        let mut rdo = CflRdoScratch::new();
+        let qf = crate::image::ImageB::try_new_fill(8, 8, 32).unwrap();
+        compute_cmap_tile_rdo(
+            &ctx,
+            CflRdoTile {
+                opsin,
+                blocks: CflBlockRegion {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+                quant: CflRdoQuantization {
+                    field: &qf,
+                    scale: 1.0 / 32.0,
+                    block_x: 0,
+                    block_y: 0,
+                },
+                prediction: CflTilePrediction {
+                    ytox: pred_x,
+                    ytob: pred_b,
+                },
+            },
+            CflRdoTileScratch {
+                dct: &mut scratch,
+                rdo: &mut rdo,
+            },
+        )
+    }
+
+    #[test]
+    fn rdo_keeps_full_slope_on_correlated_tiles() {
+        // X = 0.3*Y: the RDO path must land on the least-squares slope (~25)
+        // with no high-quality shrinkage — the anti-desaturation property the
+        // default path's distance-scheduled deadzone gives up below d=2.
+        let mut opsin = Image3F::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = ((x ^ y) as f32) / 64.0;
+                opsin.plane_row_mut(1, y)[x] = v;
+                opsin.plane_row_mut(0, y)[x] = 0.3 * v;
+                opsin.plane_row_mut(2, y)[x] = v;
+            }
+        }
+        let (ytox, ytob) = rdo_tile(&opsin, 0, 0);
+        assert!((ytox - 25).abs() < 3, "ytox = {ytox}, expected ~25");
+        assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
+    }
+
+    #[test]
+    fn rdo_returns_zero_on_neutral_tiles() {
+        // Achromatic content (X = 0, B = Y): both multipliers must stay 0.
+        let mut opsin = Image3F::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = ((x * 7 + y * 13) % 31) as f32 / 62.0;
+                opsin.plane_row_mut(1, y)[x] = v;
+                opsin.plane_row_mut(0, y)[x] = 0.0;
+                opsin.plane_row_mut(2, y)[x] = v;
+            }
+        }
+        let (ytox, ytob) = rdo_tile(&opsin, 0, 0);
+        assert_eq!(ytox, 0);
+        assert_eq!(ytob, 0);
+    }
+
+    #[test]
+    fn rdo_empty_tile_falls_back_to_small_predictions() {
+        assert_eq!(
+            optimize_channel_rdo(cfl_rdo_stats_scalar, &[], &[], 3, 0.0, 0.0, 0.1, 1.0),
+            3
+        );
+        assert_eq!(
+            optimize_channel_rdo(cfl_rdo_stats_scalar, &[], &[], 100, 0.0, 0.0, 0.1, 1.0),
+            0
         );
     }
 

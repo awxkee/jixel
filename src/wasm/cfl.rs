@@ -79,6 +79,85 @@ pub(crate) fn cfl_regression_wasm(
 }
 
 #[target_feature(enable = "simd128")]
+pub(crate) fn cfl_rdo_block_wasm(
+    m_x: &mut [f32; 63],
+    s_x: &mut [f32; 63],
+    m_b: &mut [f32; 63],
+    s_b: &mut [f32; 63],
+    block_y: &[f32; 64],
+    block_x: &[f32; 64],
+    block_b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+    q_block: f32,
+) {
+    let q_block_v = f32x4_splat(q_block);
+    for i in (0..60).step_by(4) {
+        let coeff = i + 1;
+        let y = unsafe { v128_load(block_y.as_ptr().add(coeff).cast()) };
+        let x = unsafe { v128_load(block_x.as_ptr().add(coeff).cast()) };
+        let b = unsafe { v128_load(block_b.as_ptr().add(coeff).cast()) };
+        let qx = unsafe { v128_load(qm_x.as_ptr().add(coeff).cast()) };
+        let qb = unsafe { v128_load(qm_b.as_ptr().add(coeff).cast()) };
+        let qx = f32x4_mul(qx, q_block_v);
+        let qb = f32x4_mul(qb, q_block_v);
+        unsafe {
+            v128_store(m_x.as_mut_ptr().add(i).cast(), f32x4_mul(y, qx));
+            v128_store(s_x.as_mut_ptr().add(i).cast(), f32x4_mul(x, qx));
+            v128_store(m_b.as_mut_ptr().add(i).cast(), f32x4_mul(y, qb));
+            v128_store(s_b.as_mut_ptr().add(i).cast(), f32x4_mul(b, qb));
+        }
+    }
+
+    // SIMD128 has no masked load/store. Recompute output 59 and use the other
+    // three lanes for the tail, keeping every access within the arrays.
+    let i = 59;
+    let coeff = i + 1;
+    let y = unsafe { v128_load(block_y.as_ptr().add(coeff).cast()) };
+    let x = unsafe { v128_load(block_x.as_ptr().add(coeff).cast()) };
+    let b = unsafe { v128_load(block_b.as_ptr().add(coeff).cast()) };
+    let qx = unsafe { v128_load(qm_x.as_ptr().add(coeff).cast()) };
+    let qb = unsafe { v128_load(qm_b.as_ptr().add(coeff).cast()) };
+    let qx = f32x4_mul(qx, q_block_v);
+    let qb = f32x4_mul(qb, q_block_v);
+    unsafe {
+        v128_store(m_x.as_mut_ptr().add(i).cast(), f32x4_mul(y, qx));
+        v128_store(s_x.as_mut_ptr().add(i).cast(), f32x4_mul(x, qx));
+        v128_store(m_b.as_mut_ptr().add(i).cast(), f32x4_mul(y, qb));
+        v128_store(s_b.as_mut_ptr().add(i).cast(), f32x4_mul(b, qb));
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn cfl_rdo_stats_wasm(m: &[f32], s: &[f32]) -> [f32; 4] {
+    let len = m.len().min(s.len());
+    let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
+    let mut dot_ms = f32x4_splat(0.0);
+    let mut dot_mm = f32x4_splat(0.0);
+    let mut dot_ss = f32x4_splat(0.0);
+    let mut sum_abs_s = f32x4_splat(0.0);
+
+    for (m, s) in m_chunks.iter().zip(s_chunks) {
+        let mv = unsafe { v128_load(m.as_ptr().cast()) };
+        let sv = unsafe { v128_load(s.as_ptr().cast()) };
+        dot_ms = f32x4_add(dot_ms, f32x4_mul(mv, sv));
+        dot_mm = f32x4_add(dot_mm, f32x4_mul(mv, mv));
+        dot_ss = f32x4_add(dot_ss, f32x4_mul(sv, sv));
+        sum_abs_s = f32x4_add(sum_abs_s, f32x4_abs(sv));
+    }
+
+    let mut stats = reduce_transposed_4x4(dot_ms, dot_mm, dot_ss, sum_abs_s);
+    for (&mv, &sv) in m_tail.iter().zip(s_tail) {
+        stats[0] += mv * sv;
+        stats[1] += mv * mv;
+        stats[2] += sv * sv;
+        stats[3] += sv.abs();
+    }
+    stats
+}
+
+#[target_feature(enable = "simd128")]
 pub(crate) fn apply_cfl_wasm(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());
     assert_eq!(x.len(), b.len());

@@ -84,6 +84,90 @@ pub(crate) fn cfl_regression_neon(
 }
 
 #[target_feature(enable = "neon")]
+pub(crate) fn cfl_rdo_block_neon(
+    m_x: &mut [f32; 63],
+    s_x: &mut [f32; 63],
+    m_b: &mut [f32; 63],
+    s_b: &mut [f32; 63],
+    block_y: &[f32; 64],
+    block_x: &[f32; 64],
+    block_b: &[f32; 64],
+    qm_x: &[f32; 64],
+    qm_b: &[f32; 64],
+    q_block: f32,
+) {
+    let q_block_v = vdupq_n_f32(q_block);
+    for i in (0..60).step_by(4) {
+        let coeff = i + 1;
+        let y = unsafe { vld1q_f32(block_y.as_ptr().add(coeff)) };
+        let x = unsafe { vld1q_f32(block_x.as_ptr().add(coeff)) };
+        let b = unsafe { vld1q_f32(block_b.as_ptr().add(coeff)) };
+        let qx = unsafe { vld1q_f32(qm_x.as_ptr().add(coeff)) };
+        let qb = unsafe { vld1q_f32(qm_b.as_ptr().add(coeff)) };
+        let qx = vmulq_f32(qx, q_block_v);
+        let qb = vmulq_f32(qb, q_block_v);
+        unsafe {
+            vst1q_f32(m_x.as_mut_ptr().add(i), vmulq_f32(y, qx));
+            vst1q_f32(s_x.as_mut_ptr().add(i), vmulq_f32(x, qx));
+            vst1q_f32(m_b.as_mut_ptr().add(i), vmulq_f32(y, qb));
+            vst1q_f32(s_b.as_mut_ptr().add(i), vmulq_f32(b, qb));
+        }
+    }
+
+    // NEON has no masked load/store. Recompute output 59 and use the other
+    // three lanes for the tail, keeping every access within the arrays.
+    let i = 59;
+    let coeff = i + 1;
+    let y = unsafe { vld1q_f32(block_y.as_ptr().add(coeff)) };
+    let x = unsafe { vld1q_f32(block_x.as_ptr().add(coeff)) };
+    let b = unsafe { vld1q_f32(block_b.as_ptr().add(coeff)) };
+    let qx = unsafe { vld1q_f32(qm_x.as_ptr().add(coeff)) };
+    let qb = unsafe { vld1q_f32(qm_b.as_ptr().add(coeff)) };
+    let qx = vmulq_f32(qx, q_block_v);
+    let qb = vmulq_f32(qb, q_block_v);
+    unsafe {
+        vst1q_f32(m_x.as_mut_ptr().add(i), vmulq_f32(y, qx));
+        vst1q_f32(s_x.as_mut_ptr().add(i), vmulq_f32(x, qx));
+        vst1q_f32(m_b.as_mut_ptr().add(i), vmulq_f32(y, qb));
+        vst1q_f32(s_b.as_mut_ptr().add(i), vmulq_f32(b, qb));
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn cfl_rdo_stats_neon(m: &[f32], s: &[f32]) -> [f32; 4] {
+    let len = m.len().min(s.len());
+    let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
+    let mut dot_ms = vdupq_n_f32(0.0);
+    let mut dot_mm = vdupq_n_f32(0.0);
+    let mut dot_ss = vdupq_n_f32(0.0);
+    let mut sum_abs_s = vdupq_n_f32(0.0);
+
+    for (m, s) in m_chunks.iter().zip(s_chunks) {
+        let mv = unsafe { vld1q_f32(m.as_ptr()) };
+        let sv = unsafe { vld1q_f32(s.as_ptr()) };
+        dot_ms = vfmaq_f32(dot_ms, mv, sv);
+        dot_mm = vfmaq_f32(dot_mm, mv, mv);
+        dot_ss = vfmaq_f32(dot_ss, sv, sv);
+        sum_abs_s = vaddq_f32(sum_abs_s, vabsq_f32(sv));
+    }
+
+    let mut stats = [
+        vaddvq_f32(dot_ms),
+        vaddvq_f32(dot_mm),
+        vaddvq_f32(dot_ss),
+        vaddvq_f32(sum_abs_s),
+    ];
+    for (&mv, &sv) in m_tail.iter().zip(s_tail) {
+        stats[0] = mv.mul_add(sv, stats[0]);
+        stats[1] = mv.mul_add(mv, stats[1]);
+        stats[2] = sv.mul_add(sv, stats[2]);
+        stats[3] += sv.abs();
+    }
+    stats
+}
+
+#[target_feature(enable = "neon")]
 pub(crate) fn apply_cfl_neon(x: &mut [f32], y: &[f32], b: &mut [f32], cmap_factor: [f32; 3]) {
     assert_eq!(x.len(), y.len());
     assert_eq!(x.len(), b.len());
