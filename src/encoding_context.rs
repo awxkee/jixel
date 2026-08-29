@@ -53,6 +53,7 @@ pub(crate) struct EncodingContext {
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
+    b_fine: std::sync::atomic::AtomicBool,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -134,6 +135,24 @@ impl EncodingContext {
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn set_b_fine(&self, fine: bool) {
+        self.b_fine
+            .store(fine, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn b_qm_scale(&self) -> u32 {
+        if self.b_fine.load(std::sync::atomic::Ordering::Relaxed) {
+            5
+        } else {
+            2
+        }
+    }
+
+    #[inline]
+    pub(crate) fn b_qm_mul(&self) -> f32 {
+        1.25f32.powf(self.b_qm_scale() as f32 - 2.0)
+    }
+
     pub(crate) fn new(
         speed: Speed,
         boost: Option<DarkAqConfig>,
@@ -155,6 +174,7 @@ impl EncodingContext {
             plain_hq_matrices: DequantMatrices::new(0.0),
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
+            b_fine: std::sync::atomic::AtomicBool::new(false),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),

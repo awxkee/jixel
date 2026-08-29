@@ -462,6 +462,7 @@ pub(crate) struct ReconQuantization<'a> {
     pub(crate) inverse_matrices: [&'a [f32]; 3],
     pub(crate) qac: f32,
     pub(crate) qm_mult_x: f32,
+    pub(crate) qm_mult_b: f32,
     pub(crate) distance: f32,
 }
 
@@ -813,7 +814,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         crate::group::quantize_ac_thresholds(1, cx, cy, distance),
         crate::group::quantize_ac_thresholds(2, cx, cy, distance),
     ];
-    let quant_scales = [qac * qm_mult_x, qac, qac * crate::frame::b_qm_mul()];
+    let quant_scales = [qac * qm_mult_x, qac, qac * quantization.qm_mult_b];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
     let [

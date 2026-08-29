@@ -638,6 +638,7 @@ mod tests {
                     inverse_matrices: inv,
                     qac: 7.0,
                     qm_mult_x: 1.2,
+                    qm_mult_b: 1.6,
                     distance: 1.5,
                 },
                 transform: ReconTransform {

@@ -587,17 +587,6 @@ pub(crate) fn collect_ac_metadata_tokens(
     tokens
 }
 
-/// Distance-scheduled constant per-block EPF sharpness id
-pub(crate) const fn b_qm_scale() -> u32 {
-    2
-}
-
-/// Encoder-side B quantizer-scale multiplier matching [`b_qm_scale`]
-/// (mirrors `x_qm_mul = 1.25^(x_qm_scale - 2)`).
-pub(crate) fn b_qm_mul() -> f32 {
-    1.25f32.powf(b_qm_scale() as f32 - 2.0)
-}
-
 fn epf_sharpness_id(distance: f32) -> i32 {
     if distance < 1.75 {
         7
@@ -721,6 +710,7 @@ fn write_frame_dimension(value: usize, w: &mut BitWriter) {
 
 fn write_frame_header_kind(
     x_qm_scale: u32,
+    b_qm_scale: u32,
     epf_iters: u32,
     gab_enabled: bool,
     has_alpha: bool,
@@ -731,6 +721,7 @@ fn write_frame_header_kind(
     match kind {
         VarDctFrameKind::Regular => write_frame_header(
             x_qm_scale,
+            b_qm_scale,
             epf_iters,
             gab_enabled,
             has_alpha,
@@ -740,6 +731,7 @@ fn write_frame_header_kind(
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
             x_qm_scale,
+            b_qm_scale,
             epf_iters,
             gab_enabled,
             has_alpha,
@@ -757,7 +749,7 @@ fn write_frame_header_kind(
                 w.write(2, 0); // extra-channel upsampling = 1
             }
             w.write(3, x_qm_scale as u64);
-            w.write(3, b_qm_scale() as u64); // b_qm_scale
+            w.write(3, b_qm_scale as u64); // b_qm_scale
             // Reference-only frames omit Passes and use the implicit one pass.
             w.write(1, 1); // custom size
             write_frame_dimension(width, w);
@@ -794,6 +786,7 @@ fn write_loop_filter(epf_iters: u32, gab_enabled: bool, w: &mut BitWriter) {
 
 fn write_frame_header(
     x_qm_scale: u32,
+    b_qm_scale: u32,
     epf_iters: u32,
     gab_enabled: bool,
     has_alpha: bool,
@@ -821,7 +814,7 @@ fn write_frame_header(
     }
 
     w.write(3, x_qm_scale as u64);
-    w.write(3, b_qm_scale() as u64); // b_qm_scale
+    w.write(3, b_qm_scale as u64); // b_qm_scale
     // Passes bundle (jxl-frame header.rs:127-132):
     //   num_passes: U32(1,2,3,4+u(3))   default 1
     //   if num_passes != 1:
@@ -2332,6 +2325,7 @@ fn encode_frame_core(
 
     write_frame_header_kind(
         distp.x_qm_scale,
+        ctx.b_qm_scale(),
         distp.epf_iters,
         distp.gab_enabled,
         alpha.is_some(),

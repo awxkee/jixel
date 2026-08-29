@@ -476,14 +476,23 @@ pub(crate) fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
     best_bias
 }
 
-/// Entry point used by the encoder: `None` = keep the spec matrix (nothing
-/// signaled), `Some(m)` = use and signal the biased matrix.
-pub(crate) fn select_yellow_matrix(linear: &Image3F, distance: f32) -> Option<XybMatrix> {
+pub(crate) struct YellowSelection {
+    /// `None` = keep the spec matrix (nothing signaled), `Some` = use and
+    /// signal the biased matrix.
+    pub(crate) matrix: Option<XybMatrix>,
+    /// The tier-1 strong bias fired: the frame is band-class (thin-HF bright
+    /// chroma structure), which also gates the fine B quantizer.
+    pub(crate) strong_bias: bool,
+}
+
+/// Entry point used by the encoder: one detector + proxy pass yielding both
+/// the opsin decision and the band-class signal.
+pub(crate) fn select_yellow(linear: &Image3F, distance: f32) -> YellowSelection {
     let bias = choose_b_bias(linear, distance);
-    if (bias - SPEC_BIAS).abs() < 1e-6 {
-        return None;
+    YellowSelection {
+        strong_bias: bias >= 0.75,
+        matrix: ((bias - SPEC_BIAS).abs() >= 1e-6).then(|| matrix_for_bias(bias)),
     }
-    Some(matrix_for_bias(bias))
 }
 
 #[cfg(test)]
