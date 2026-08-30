@@ -28,12 +28,214 @@
  */
 
 use super::ac_strategy::neon_log2p1_f32;
-use crate::image::Plane;
+use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
     RateLog2Lut, ReconDistInput, ReconErrorKernels, ReconKernels, recon_dist_and_rate_with_kernels,
     validate_ssim_inputs,
 };
 use std::arch::aarch64::*;
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn clamp01_f32x4(value: float32x4_t) -> float32x4_t {
+    vminq_f32(vmaxq_f32(value, vdupq_n_f32(0.0)), vdupq_n_f32(1.0))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn xyb_to_oklab_f32x4(
+    matrix: &crate::xyb::XybMatrix,
+    x: float32x4_t,
+    y: float32x4_t,
+    b: float32x4_t,
+) -> (float32x4_t, float32x4_t, float32x4_t) {
+    let cube = |value: float32x4_t| {
+        let value = vsubq_f32(value, vdupq_n_f32(crate::xyb::NEG_BIAS_CBRT));
+        vsubq_f32(
+            vmulq_f32(vmulq_f32(value, value), value),
+            vdupq_n_f32(crate::xyb::OPSIN_BIAS),
+        )
+    };
+    let mixed0 = cube(vaddq_f32(y, x));
+    let mixed1 = cube(vsubq_f32(y, x));
+    let mixed2 = cube(b);
+    let inverse_row = |offset: usize| {
+        let mut value = vmulq_n_f32(mixed2, matrix.inv[offset + 2]);
+        value = vfmaq_n_f32(value, mixed1, matrix.inv[offset + 1]);
+        vfmaq_n_f32(value, mixed0, matrix.inv[offset])
+    };
+    let r = inverse_row(0);
+    let g = inverse_row(3);
+    let b = inverse_row(6);
+    let zero = vdupq_n_f32(0.0);
+    let rgb_row = |cr: f32, cg: f32, cb: f32| {
+        let mut value = vmulq_n_f32(b, cb);
+        value = vfmaq_n_f32(value, g, cg);
+        vmaxq_f32(vfmaq_n_f32(value, r, cr), zero)
+    };
+    let l = rgb_row(0.412_221_46, 0.536_332_55, 0.051_445_995);
+    let m = rgb_row(0.211_903_5, 0.680_699_5, 0.107_396_96);
+    let s = rgb_row(0.088_302_46, 0.281_718_85, 0.629_978_7);
+    let (l, m, s) = super::xyb::vcbrtq_fast3_positive_f32(l, m, s);
+    let lab_row = |cl: f32, cm: f32, cs: f32| {
+        let mut value = vmulq_n_f32(s, cs);
+        value = vfmaq_n_f32(value, m, cm);
+        vfmaq_n_f32(value, l, cl)
+    };
+    (
+        lab_row(0.210_454_26, 0.793_617_8, -0.004_072_047),
+        lab_row(1.977_998_5, -2.428_592_2, 0.450_593_7),
+        lab_row(0.025_904_037, 0.782_771_77, -0.808_675_77),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn shifted_right_f32x4(value: float32x4_t) -> float32x4_t {
+    let shifted = vextq_f32::<1>(value, value);
+    vsetq_lane_f32::<3>(vgetq_lane_f32::<3>(value), shifted)
+}
+
+/// # Safety
+/// The caller must ensure NEON is available and the input slices cover the block.
+#[target_feature(enable = "neon")]
+pub(crate) fn rgb_hue_chroma_edge_loss_neon(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let Some(end_x) = px.checked_add(width) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    let Some(end_y) = py.checked_add(height) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    if end_x > opsin.xsize() || end_y > opsin.ysize() || !width.is_multiple_of(4) {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    }
+
+    let zero = vdupq_n_f32(0.0);
+    let mut sum = zero;
+    for y in 0..height {
+        let rows = [
+            opsin.plane_row(0, py + y),
+            opsin.plane_row(1, py + y),
+            opsin.plane_row(2, py + y),
+        ];
+        let below = if y + 1 < height {
+            [
+                opsin.plane_row(0, py + y + 1),
+                opsin.plane_row(1, py + y + 1),
+                opsin.plane_row(2, py + y + 1),
+            ]
+        } else {
+            rows
+        };
+        let error_offset = y * width;
+        for x in (0..width).step_by(4) {
+            let p = px + x;
+            let sx = unsafe { vld1q_f32(rows[0].as_ptr().add(p)) };
+            let sy = unsafe { vld1q_f32(rows[1].as_ptr().add(p)) };
+            let sb = unsafe { vld1q_f32(rows[2].as_ptr().add(p)) };
+            let (rx, ry, rb) = if x + 4 < width {
+                (
+                    unsafe { vld1q_f32(rows[0].as_ptr().add(p + 1)) },
+                    unsafe { vld1q_f32(rows[1].as_ptr().add(p + 1)) },
+                    unsafe { vld1q_f32(rows[2].as_ptr().add(p + 1)) },
+                )
+            } else {
+                (
+                    shifted_right_f32x4(sx),
+                    shifted_right_f32x4(sy),
+                    shifted_right_f32x4(sb),
+                )
+            };
+            let bx = unsafe { vld1q_f32(below[0].as_ptr().add(p)) };
+            let by = unsafe { vld1q_f32(below[1].as_ptr().add(p)) };
+            let bb = unsafe { vld1q_f32(below[2].as_ptr().add(p)) };
+            let cb = vsubq_f32(sb, sy);
+            let horizontal = vaddq_f32(
+                vabsq_f32(vsubq_f32(rx, sx)),
+                vabsq_f32(vsubq_f32(vsubq_f32(rb, ry), cb)),
+            );
+            let vertical = vaddq_f32(
+                vabsq_f32(vsubq_f32(bx, sx)),
+                vabsq_f32(vsubq_f32(vsubq_f32(bb, by), cb)),
+            );
+            let edge_risk = clamp01_f32x4(vmulq_n_f32(
+                vsubq_f32(vmaxq_f32(horizontal, vertical), vdupq_n_f32(0.006)),
+                1.0 / 0.030,
+            ));
+            let e = error_offset + x;
+            let ex = unsafe { vld1q_f32(spatial_error[0].as_ptr().add(e)) };
+            let ey = unsafe { vld1q_f32(spatial_error[1].as_ptr().add(e)) };
+            let eb = unsafe { vld1q_f32(spatial_error[2].as_ptr().add(e)) };
+            let (source_l, source_a, source_b) = xyb_to_oklab_f32x4(matrix, sx, sy, sb);
+            let (recon_l, recon_a, recon_b) = xyb_to_oklab_f32x4(
+                matrix,
+                vsubq_f32(sx, ex),
+                vsubq_f32(sy, ey),
+                vsubq_f32(sb, eb),
+            );
+            let _ = recon_l;
+            let source_chroma =
+                vsqrtq_f32(vfmaq_f32(vmulq_f32(source_b, source_b), source_a, source_a));
+            let recon_chroma = vsqrtq_f32(vfmaq_f32(vmulq_f32(recon_b, recon_b), recon_a, recon_a));
+            let brightness_risk = clamp01_f32x4(vmulq_n_f32(
+                vsubq_f32(source_l, vdupq_n_f32(0.35)),
+                1.0 / 0.40,
+            ));
+            let chroma_risk = clamp01_f32x4(vmulq_n_f32(
+                vsubq_f32(source_chroma, vdupq_n_f32(0.03)),
+                1.0 / 0.12,
+            ));
+            let risk = vmulq_f32(vmulq_f32(edge_risk, brightness_risk), chroma_risk);
+            let desaturation = vmaxq_f32(vsubq_f32(source_chroma, recon_chroma), zero);
+            let perpendicular = vdivq_f32(
+                vsubq_f32(vmulq_f32(source_a, recon_b), vmulq_f32(source_b, recon_a)),
+                vaddq_f32(source_chroma, vdupq_n_f32(1e-4)),
+            );
+            let penalty = vfmaq_n_f32(
+                vmulq_f32(desaturation, desaturation),
+                vmulq_f32(perpendicular, perpendicular),
+                0.75,
+            );
+            sum = vfmaq_f32(sum, risk, penalty);
+        }
+    }
+    vaddvq_f32(sum)
+}
 
 #[inline]
 #[target_feature(enable = "neon")]
@@ -510,7 +712,7 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
 mod tests {
     use super::{
         combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-        recon_dist_and_rate_neon_impl, ssim_deficit_neon,
+        recon_dist_and_rate_neon_impl, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
     };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
@@ -603,6 +805,9 @@ mod tests {
                 scoring: ReconScoring {
                     factor_x: 0.15,
                     factor_b: -0.1,
+                    channel_weights: crate::inflated_cost::CHANNEL_WEIGHT,
+                    xyb_matrix: crate::xyb::XybMatrix::SPEC,
+                    rgb_hue_alpha: 0.0,
                     gradient_alpha: 0.0,
                     gradient_peak_alpha: 3.0,
                 },
@@ -624,6 +829,7 @@ mod tests {
                     combine: |spatial, luma, factor, combined| unsafe {
                         combine_error_neon(spatial, luma, factor, combined)
                     },
+                    rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_neon,
                 };
                 let mut simd_scratch = [[0.0f32; 1024]; 8];
                 let simd = unsafe {

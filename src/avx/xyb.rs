@@ -66,7 +66,11 @@ fn cbrt_seed_positive_avx2(x: __m256) -> __m256 {
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn vcbrt_fast3_positive_avx2(a0: __m256, a1: __m256, a2: __m256) -> (__m256, __m256, __m256) {
+pub(crate) fn vcbrt_fast3_positive_avx2(
+    a0: __m256,
+    a1: __m256,
+    a2: __m256,
+) -> (__m256, __m256, __m256) {
     let mut x0 = cbrt_seed_positive_avx2(a0);
     let mut x1 = cbrt_seed_positive_avx2(a1);
     let mut x2 = cbrt_seed_positive_avx2(a2);
@@ -78,6 +82,11 @@ fn vcbrt_fast3_positive_avx2(a0: __m256, a1: __m256, a2: __m256) -> (__m256, __m
     x0 = halley_cbrt_avx2(x0, a0);
     x1 = halley_cbrt_avx2(x1, a1);
     x2 = halley_cbrt_avx2(x2, a2);
+
+    let zero = _mm256_setzero_ps();
+    x0 = _mm256_blendv_ps(x0, zero, _mm256_cmp_ps::<_CMP_EQ_OQ>(a0, zero));
+    x1 = _mm256_blendv_ps(x1, zero, _mm256_cmp_ps::<_CMP_EQ_OQ>(a1, zero));
+    x2 = _mm256_blendv_ps(x2, zero, _mm256_cmp_ps::<_CMP_EQ_OQ>(a2, zero));
 
     (x0, x1, x2)
 }

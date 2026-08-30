@@ -54,6 +54,7 @@ pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::x_gradient_sums_wasm;
 pub(crate) use inflated_cost::{
     combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
+    rgb_hue_chroma_edge_loss_wasm,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use quant::{

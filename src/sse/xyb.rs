@@ -75,7 +75,11 @@ fn cbrt_seed_positive_sse41(x: __m128) -> __m128 {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn vcbrt_fast3_positive_sse41(a0: __m128, a1: __m128, a2: __m128) -> (__m128, __m128, __m128) {
+pub(crate) fn vcbrt_fast3_positive_sse41(
+    a0: __m128,
+    a1: __m128,
+    a2: __m128,
+) -> (__m128, __m128, __m128) {
     let mut x0 = cbrt_seed_positive_sse41(a0);
     let mut x1 = cbrt_seed_positive_sse41(a1);
     let mut x2 = cbrt_seed_positive_sse41(a2);
@@ -87,6 +91,11 @@ fn vcbrt_fast3_positive_sse41(a0: __m128, a1: __m128, a2: __m128) -> (__m128, __
     x0 = halley_cbrt_sse41(x0, a0);
     x1 = halley_cbrt_sse41(x1, a1);
     x2 = halley_cbrt_sse41(x2, a2);
+
+    let zero = _mm_setzero_ps();
+    x0 = _mm_blendv_ps(x0, zero, _mm_cmpeq_ps(a0, zero));
+    x1 = _mm_blendv_ps(x1, zero, _mm_cmpeq_ps(a1, zero));
+    x2 = _mm_blendv_ps(x2, zero, _mm_cmpeq_ps(a2, zero));
 
     (x0, x1, x2)
 }

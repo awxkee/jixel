@@ -481,6 +481,10 @@ pub(crate) struct ReconSource<'a> {
 pub(crate) struct ReconScoring {
     pub(crate) factor_x: f32,
     pub(crate) factor_b: f32,
+    pub(crate) channel_weights: [f32; 3],
+    pub(crate) xyb_matrix: crate::xyb::XybMatrix,
+    /// Linear-RGB/OKLab hue and desaturation penalty on risky chroma edges.
+    pub(crate) rgb_hue_alpha: f32,
     /// Spatial-error gradient weight used by transform reranking.
     pub(crate) gradient_alpha: f32,
     /// Peak-pooled spatial-error gradient weight used by transform reranking.
@@ -499,6 +503,7 @@ pub(crate) struct ReconErrorKernels {
     pub(crate) gradient_energy: ErrorGradientEnergyFn,
     pub(crate) gradient_peak_energy: ErrorGradientPeakEnergyFn,
     pub(crate) combine: CombineErrorFn,
+    pub(crate) rgb_hue_chroma_edge_loss: RgbHueChromaEdgeLossFn,
 }
 
 pub(crate) struct ReconKernels<'a> {
@@ -665,6 +670,7 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
         gradient_energy: error_gradient_energy_scalar,
         gradient_peak_energy: error_gradient_peak_energy_scalar,
         combine: combine_error_scalar,
+        rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_scalar,
     };
     recon_dist_and_rate_with_kernels(
         scratch,
@@ -781,6 +787,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let factor_b = scoring.factor_b;
     let gradient_alpha = scoring.gradient_alpha;
     let gradient_peak_alpha = scoring.gradient_peak_alpha;
+    let rgb_hue_alpha = scoring.rgb_hue_alpha;
     let gradient_peak_floor = if gradient_peak_alpha > 0.0 {
         gradient_peak_floor(distance)
     } else {
@@ -792,6 +799,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let error_gradient_energy = kernels.error.gradient_energy;
     let error_gradient_peak_energy = kernels.error.gradient_peak_energy;
     let combine_error = kernels.error.combine;
+    let rgb_hue_chroma_edge_loss = kernels.error.rgb_hue_chroma_edge_loss;
     let n = strategy_pixel_count(strategy);
     let width = cx.checked_mul(8).expect("coefficient width overflow");
     let height = cy.checked_mul(8).expect("coefficient height overflow");
@@ -894,7 +902,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 &mut reconstructed[..n],
             );
         }
-        distortion += CHANNEL_WEIGHT[c]
+        distortion += input.scoring.channel_weights[c]
             * unsafe {
                 ssim(
                     &original[..n],
@@ -904,12 +912,12 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 )
             };
         if gradient_alpha > 0.0 {
-            distortion += CHANNEL_WEIGHT[c]
+            distortion += input.scoring.channel_weights[c]
                 * gradient_alpha
                 * error_gradient_energy(&error[..n], pixel_width, pixel_height);
         }
         if gradient_peak_alpha > 0.0 {
-            distortion += CHANNEL_WEIGHT[c]
+            distortion += input.scoring.channel_weights[c]
                 * gradient_peak_alpha
                 * error_gradient_peak_energy(
                     &error[..n],
@@ -919,8 +927,177 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     gradient_peak_floor,
                 );
         }
+        if rgb_hue_alpha > 0.0 {
+            coeff_error[c][..n].copy_from_slice(error);
+        }
+    }
+    if rgb_hue_alpha > 0.0 {
+        distortion += rgb_hue_alpha
+            * unsafe {
+                rgb_hue_chroma_edge_loss(
+                    opsin,
+                    px,
+                    py,
+                    pixel_width,
+                    pixel_height,
+                    [
+                        &coeff_error[0][..n],
+                        &coeff_error[1][..n],
+                        &coeff_error[2][..n],
+                    ],
+                    &scoring.xyb_matrix,
+                )
+            };
     }
     (distortion, rate)
+}
+
+#[inline]
+fn linear_rgb_to_oklab(rgb: [f32; 3]) -> [f32; 3] {
+    let [r, g, b] = rgb;
+    let l =
+        crate::xyb::cbrtf(fmla(0.412_221_46, r, fmla(0.536_332_55, g, 0.051_445_995 * b)).max(0.0));
+    let m =
+        crate::xyb::cbrtf(fmla(0.211_903_5, r, fmla(0.680_699_5, g, 0.107_396_96 * b)).max(0.0));
+    let s =
+        crate::xyb::cbrtf(fmla(0.088_302_46, r, fmla(0.281_718_85, g, 0.629_978_7 * b)).max(0.0));
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+pub(crate) type RgbHueChromaEdgeLossFn =
+    unsafe fn(&Image3F, usize, usize, usize, usize, [&[f32]; 3], &crate::xyb::XybMatrix) -> f32;
+
+pub(crate) fn select_rgb_hue_chroma_edge_loss_fn() -> RgbHueChromaEdgeLossFn {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return crate::wasm::rgb_hue_chroma_edge_loss_wasm;
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return crate::avx::rgb_hue_chroma_edge_loss_avx2;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::rgb_hue_chroma_edge_loss_sse41;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return crate::neon::rgb_hue_chroma_edge_loss_neon;
+    }
+    #[allow(unreachable_code)]
+    rgb_hue_chroma_edge_loss_scalar
+}
+
+#[inline]
+fn rgb_hue_chroma_pixel_loss(
+    source: [f32; 3],
+    reconstructed: [f32; 3],
+    edge: f32,
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    let edge_risk = ((edge - 0.006) * (1.0 / 0.030)).clamp(0.0, 1.0);
+    if edge_risk == 0.0 {
+        return 0.0;
+    }
+    let source_rgb = crate::xyb::xyb_to_rgb_pixel_f32(matrix, source[0], source[1], source[2]);
+    let recon_rgb = crate::xyb::xyb_to_rgb_pixel_f32(
+        matrix,
+        reconstructed[0],
+        reconstructed[1],
+        reconstructed[2],
+    );
+    let source_lab = linear_rgb_to_oklab(source_rgb);
+    let recon_lab = linear_rgb_to_oklab(recon_rgb);
+    let source_chroma = fmla(source_lab[1], source_lab[1], source_lab[2] * source_lab[2]).sqrt();
+    let recon_chroma = fmla(recon_lab[1], recon_lab[1], recon_lab[2] * recon_lab[2]).sqrt();
+    let brightness_risk = ((source_lab[0] - 0.35) * (1.0 / 0.40)).clamp(0.0, 1.0);
+    let chroma_risk = ((source_chroma - 0.03) * (1.0 / 0.12)).clamp(0.0, 1.0);
+    let risk = edge_risk * brightness_risk * chroma_risk;
+    let desaturation = (source_chroma - recon_chroma).max(0.0);
+    let perpendicular =
+        (source_lab[1] * recon_lab[2] - source_lab[2] * recon_lab[1]) / (source_chroma + 1e-4);
+    risk * fmla(
+        desaturation,
+        desaturation,
+        0.75 * perpendicular * perpendicular,
+    )
+}
+
+/// Penalize decoder-domain hue rotation and chroma collapse only on bright,
+/// saturated source pixels that sit on an opponent-color edge. The radial
+/// component is one-sided (desaturation only); the perpendicular component
+/// measures hue rotation without an angle singularity near neutral colors.
+pub(crate) fn rgb_hue_chroma_edge_loss_scalar(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    let image_width = opsin.xsize();
+    let image_height = opsin.ysize();
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let mut loss = 0.0f32;
+    for y in 0..height {
+        let sy = py.saturating_add(y).min(image_height - 1);
+        let rows = [
+            opsin.plane_row(0, sy),
+            opsin.plane_row(1, sy),
+            opsin.plane_row(2, sy),
+        ];
+        let below = (sy + 1 < image_height).then(|| {
+            [
+                opsin.plane_row(0, sy + 1),
+                opsin.plane_row(1, sy + 1),
+                opsin.plane_row(2, sy + 1),
+            ]
+        });
+        let error_rows = [
+            &spatial_error[0][y * width..(y + 1) * width],
+            &spatial_error[1][y * width..(y + 1) * width],
+            &spatial_error[2][y * width..(y + 1) * width],
+        ];
+        for (x, ((&error_x, &error_y), &error_b)) in error_rows[0]
+            .iter()
+            .zip(error_rows[1])
+            .zip(error_rows[2])
+            .enumerate()
+        {
+            let sx = px.saturating_add(x).min(image_width - 1);
+            let source = [rows[0][sx], rows[1][sx], rows[2][sx]];
+            let cb = source[2] - source[1];
+            let mut edge = 0.0f32;
+            if x + 1 < width && sx + 1 < image_width {
+                let nx = rows[0][sx + 1];
+                let ny = rows[1][sx + 1];
+                let nb = rows[2][sx + 1];
+                edge = edge.max((nx - source[0]).abs() + ((nb - ny) - cb).abs());
+            }
+            if y + 1 < height
+                && let Some(below) = below
+            {
+                let nx = below[0][sx];
+                let ny = below[1][sx];
+                let nb = below[2][sx];
+                edge = edge.max((nx - source[0]).abs() + ((nb - ny) - cb).abs());
+            }
+            let reconstructed = [
+                source[0] - error_x,
+                source[1] - error_y,
+                source[2] - error_b,
+            ];
+            loss += rgb_hue_chroma_pixel_loss(source, reconstructed, edge, matrix);
+        }
+    }
+    loss
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1130,9 +1307,105 @@ mod tests {
     use super::{
         CombineErrorFn, ErrorGradientEnergyFn, ErrorGradientPeakEnergyFn, combine_error_scalar,
         error_gradient_energy_scalar, error_gradient_peak_energy_scalar, gradient_peak_floor,
-        select_combine_error_fn, select_error_gradient_energy_fn,
-        select_error_gradient_peak_energy_fn, ssim_deficit_scalar, validate_ssim_inputs,
+        rgb_hue_chroma_edge_loss_scalar, select_combine_error_fn, select_error_gradient_energy_fn,
+        select_error_gradient_peak_energy_fn, select_rgb_hue_chroma_edge_loss_fn,
+        ssim_deficit_scalar, validate_ssim_inputs,
     };
+
+    #[test]
+    fn rgb_hue_loss_simd_matches_scalar() {
+        let matrix = crate::xyb::XybMatrix::SPEC;
+        let mut opsin = crate::image::Image3F::new(24, 16);
+        let mut state = 0x91e1_0da5_c79e_7b1du64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32 as f32 / u32::MAX as f32
+        };
+        for y in 0..16 {
+            for x in 0..24 {
+                let rgb = [random(), random(), random()];
+                let value = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, rgb[0], rgb[1], rgb[2]);
+                opsin.plane_row_mut(0, y)[x] = value.0;
+                opsin.plane_row_mut(1, y)[x] = value.1;
+                opsin.plane_row_mut(2, y)[x] = value.2;
+            }
+        }
+        let mut errors = [[0.0f32; 128]; 3];
+        for error in &mut errors {
+            for value in error {
+                *value = (random() - 0.5) * 0.08;
+            }
+        }
+        let spatial_error = [&errors[0][..], &errors[1][..], &errors[2][..]];
+        let expected = rgb_hue_chroma_edge_loss_scalar(&opsin, 4, 3, 16, 8, spatial_error, &matrix);
+        let actual = unsafe {
+            select_rgb_hue_chroma_edge_loss_fn()(&opsin, 4, 3, 16, 8, spatial_error, &matrix)
+        };
+        let relative_error = (actual - expected).abs() / expected.abs().max(1e-9);
+        assert!(
+            relative_error < 2e-4,
+            "SIMD RGB hue loss {actual} differs from scalar {expected} by {relative_error}"
+        );
+    }
+
+    #[test]
+    fn rgb_hue_loss_is_zero_for_identity_and_positive_for_edge_desaturation() {
+        let matrix = crate::xyb::XybMatrix::SPEC;
+        let mut opsin = crate::image::Image3F::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let rgb = if x < 4 {
+                    [1.0, 0.9, 0.03]
+                } else {
+                    [0.03, 0.25, 1.0]
+                };
+                let value = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, rgb[0], rgb[1], rgb[2]);
+                opsin.plane_row_mut(0, y)[x] = value.0;
+                opsin.plane_row_mut(1, y)[x] = value.1;
+                opsin.plane_row_mut(2, y)[x] = value.2;
+            }
+        }
+        let zero = [0.0f32; 64];
+        assert_eq!(
+            unsafe {
+                select_rgb_hue_chroma_edge_loss_fn()(
+                    &opsin,
+                    0,
+                    0,
+                    8,
+                    8,
+                    [&zero, &zero, &zero],
+                    &matrix,
+                )
+            },
+            0.0
+        );
+
+        let gray = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, 0.5, 0.5, 0.5);
+        let mut errors = [[0.0f32; 64]; 3];
+        for y in 0..8 {
+            for x in 0..8 {
+                let i = y * 8 + x;
+                errors[0][i] = opsin.plane_row(0, y)[x] - gray.0;
+                errors[1][i] = opsin.plane_row(1, y)[x] - gray.1;
+                errors[2][i] = opsin.plane_row(2, y)[x] - gray.2;
+            }
+        }
+        let loss = unsafe {
+            select_rgb_hue_chroma_edge_loss_fn()(
+                &opsin,
+                0,
+                0,
+                8,
+                8,
+                [&errors[0], &errors[1], &errors[2]],
+                &matrix,
+            )
+        };
+        assert!(loss.is_finite() && loss > 0.0);
+    }
 
     #[test]
     fn peak_gradient_energy_favors_localized_errors() {

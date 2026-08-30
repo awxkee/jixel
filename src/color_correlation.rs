@@ -405,6 +405,9 @@ fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
     m: &[f32],
     s: &[f32],
+    channel: usize,
+    distance: f32,
+    closed_loop: bool,
     pred: i32,
     base: f32,
     dc_avg: f32,
@@ -463,15 +466,39 @@ fn optimize_channel_rdo(
 
     let lambda = CFL_RDO.lambda_bits * tile_q;
     let mag_cost = CFL_RDO.mag_cost * tile_q * dz_penalty;
+    let thresholds = crate::group::quantize_ac_thresholds(channel, 1, 1, distance);
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
         let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
         let mut distortion = 0.0f32;
-        for (&mv, &sv) in m.iter().zip(s) {
-            distortion += (sv - factor * mv).abs();
+        let mut coeff_bits = 0.0f32;
+        for (i, (&mv, &sv)) in m.iter().zip(s).enumerate() {
+            let residual = sv - factor * mv;
+            if closed_loop {
+                let coeff = i % 63 + 1;
+                let quadrant = usize::from(coeff / 8 >= 4) * 2 + usize::from(coeff % 8 >= 4);
+                let level = if residual.abs() >= thresholds[quadrant] {
+                    residual.round()
+                } else {
+                    0.0
+                };
+                let reconstructed = crate::group::dequantized_level_f32(level);
+                let quant_error = residual - reconstructed;
+                // Closed-loop error is the primary term. A small residual-energy
+                // term and coefficient-rate proxy retain CfL's compression goal
+                // instead of choosing an expensive phase-aligned residual.
+                distortion += quant_error.abs() + 0.15 * residual.abs();
+                if level != 0.0 {
+                    coeff_bits += 1.0 + dirty_log2f(1.0 + level.abs());
+                }
+            } else {
+                distortion += residual.abs();
+            }
         }
-        let cost =
-            distortion + lambda * cmap_residual_bits(cand - pred) + cand.abs() as f32 * mag_cost;
+        let cost = distortion
+            + 0.15 * lambda * coeff_bits
+            + lambda * cmap_residual_bits(cand - pred)
+            + cand.abs() as f32 * mag_cost;
         if cost < best.0 {
             best = (cost, cand);
         }
@@ -489,6 +516,8 @@ struct CflBlockRegion {
 struct CflRdoQuantization<'a> {
     field: &'a crate::image::ImageB,
     scale: f32,
+    distance: f32,
+    closed_loop: bool,
     block_x: usize,
     block_y: usize,
 }
@@ -579,6 +608,23 @@ fn compute_cmap_tile_rdo(
             (ctx.cfl_rdo_block)(
                 mx, sx, mb, sb, &block_y, &block_x, &block_b, qm_x, qm_b, q_block,
             );
+            // The SIMD staging kernel produces base quant-step units. CfL is
+            // selected before coefficient coding but must see the same frame
+            // X/B precision multipliers that coding will use.
+            if quant.closed_loop {
+                let x_mul = if ctx.x_heavy() || quant.distance >= 1.25 {
+                    1.25
+                } else {
+                    1.0
+                };
+                let b_mul = ctx.b_qm_mul();
+                for value in mx.iter_mut().chain(sx.iter_mut()) {
+                    *value *= x_mul;
+                }
+                for value in mb.iter_mut().chain(sb.iter_mut()) {
+                    *value *= b_mul;
+                }
+            }
             rdo.len = n + 63;
         }
     }
@@ -594,6 +640,9 @@ fn compute_cmap_tile_rdo(
         ctx.cfl_rdo_stats,
         &rdo.m_x[..rdo.len],
         &rdo.s_x[..rdo.len],
+        0,
+        quant.distance,
+        quant.closed_loop,
         prediction.ytox,
         0.0,
         dc_avg_x,
@@ -604,6 +653,9 @@ fn compute_cmap_tile_rdo(
         ctx.cfl_rdo_stats,
         &rdo.m_b[..rdo.len],
         &rdo.s_b[..rdo.len],
+        2,
+        quant.distance,
+        quant.closed_loop,
         prediction.ytob,
         1.0,
         dc_avg_b,
@@ -670,6 +722,8 @@ pub(crate) fn fill_cmap(
                         quant: CflRdoQuantization {
                             field: raw_quant_field,
                             scale,
+                            distance,
+                            closed_loop: ctx.x_heavy() && distance < 1.75,
                             block_x: tx * K_TILE_DIM_IN_BLOCKS,
                             block_y: ty * K_TILE_DIM_IN_BLOCKS,
                         },
@@ -1233,6 +1287,8 @@ mod tests {
                 quant: CflRdoQuantization {
                     field: &qf,
                     scale: 1.0 / 32.0,
+                    distance: 1.0,
+                    closed_loop: true,
                     block_x: 0,
                     block_y: 0,
                 },
@@ -1287,11 +1343,35 @@ mod tests {
     #[test]
     fn rdo_empty_tile_falls_back_to_small_predictions() {
         assert_eq!(
-            optimize_channel_rdo(cfl_rdo_stats_scalar, &[], &[], 3, 0.0, 0.0, 0.1, 1.0),
+            optimize_channel_rdo(
+                cfl_rdo_stats_scalar,
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                3,
+                0.0,
+                0.0,
+                0.1,
+                1.0,
+            ),
             3
         );
         assert_eq!(
-            optimize_channel_rdo(cfl_rdo_stats_scalar, &[], &[], 100, 0.0, 0.0, 0.1, 1.0),
+            optimize_channel_rdo(
+                cfl_rdo_stats_scalar,
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                100,
+                0.0,
+                0.0,
+                0.1,
+                1.0,
+            ),
             0
         );
     }

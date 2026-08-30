@@ -42,8 +42,7 @@ use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{
-    CHANNEL_WEIGHT, ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform,
-    channel_rd,
+    ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform, channel_rd,
 };
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
@@ -469,7 +468,7 @@ fn strategy_cost64(
             cx,
             cy,
         );
-        distortion += CHANNEL_WEIGHT[c] * d;
+        distortion += ctx.channel_weight(c) * d;
         rate += r;
     }
     distortion + RD_LAMBDA * (rate + meta_r)
@@ -678,7 +677,7 @@ fn coefficient_dist_and_rate(
             cx,
             cy,
         );
-        d_total += CHANNEL_WEIGHT[c] * d;
+        d_total += ctx.channel_weight(c) * d;
         r_total += r;
     }
     (d_total, r_total)
@@ -821,6 +820,9 @@ fn reconstruction_dist_and_rate(
             scoring: ReconScoring {
                 factor_x: cmap_factor[0],
                 factor_b: cmap_factor[2],
+                channel_weights: ctx.channel_weights(),
+                xyb_matrix: ctx.xyb,
+                rgb_hue_alpha: rerank_rgb_hue_alpha(ctx, distance),
                 gradient_alpha,
                 gradient_peak_alpha,
             },
@@ -852,6 +854,18 @@ const RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA: f32 = 96.0;
 const RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE: f32 = 0.4;
 const RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA: f32 = 0.45;
 const RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA: f32 = 0.01;
+// Fitted on Burning_Ship at d=0.5/1/1.25/1.5. The frame-level X-gradient
+// gate keeps this entirely off the yellow-photo and Kodak guards.
+const RERANK_RGB_HUE_ALPHA: f32 = 800.0;
+
+fn rerank_rgb_hue_alpha(ctx: &EncodingContext, distance: f32) -> f32 {
+    if !ctx.x_heavy() {
+        return 0.0;
+    }
+    let fade_in = ((distance - 0.35) / 0.40).clamp(0.0, 1.0);
+    let fade_out = 1.0 - ((distance - 1.25) / 0.50).clamp(0.0, 1.0);
+    RERANK_RGB_HUE_ALPHA * fade_in * fade_out
+}
 
 #[inline]
 fn rerank_pair_gradient_scale(distance: f32) -> f32 {

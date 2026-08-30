@@ -1250,7 +1250,7 @@ pub(crate) fn write_ac_group(
                     }
                     let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
                     let error = ideal - dequantized_level(quantized[0][i]);
-                    chroma_distortion += crate::inflated_cost::CHANNEL_WEIGHT[0] * error * error;
+                    chroma_distortion += ctx.channel_weight(0) * error * error;
                 }
             }
 
@@ -1335,11 +1335,8 @@ pub(crate) fn write_ac_group(
                     }
                     let ideal = coeffs[2][i] * inv_qm_b[i] * q_scaled_b;
                     let error = ideal - dequantized_level(quantized[2][i]);
-                    chroma_distortion = fmla(
-                        crate::inflated_cost::CHANNEL_WEIGHT[2],
-                        error * error,
-                        chroma_distortion,
-                    );
+                    chroma_distortion =
+                        fmla(ctx.channel_weight(2), error * error, chroma_distortion);
                 }
             }
 

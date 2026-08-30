@@ -28,12 +28,226 @@
  */
 
 use crate::avx::ac_strategy::{avx2_log2p1_f32, hmax_u32, hsum256};
-use crate::image::Plane;
+use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
     RateLog2Lut, ReconDistInput, ReconErrorKernels, ReconKernels, recon_dist_and_rate_with_kernels,
     validate_ssim_inputs,
 };
 use std::arch::x86_64::*;
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn clamp01_f32x8(value: __m256) -> __m256 {
+    _mm256_min_ps(
+        _mm256_max_ps(value, _mm256_setzero_ps()),
+        _mm256_set1_ps(1.0),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn xyb_to_oklab_f32x8(
+    matrix: &crate::xyb::XybMatrix,
+    x: __m256,
+    y: __m256,
+    b: __m256,
+) -> (__m256, __m256, __m256) {
+    let cube = |value: __m256| {
+        let value = _mm256_sub_ps(value, _mm256_set1_ps(crate::xyb::NEG_BIAS_CBRT));
+        _mm256_sub_ps(
+            _mm256_mul_ps(_mm256_mul_ps(value, value), value),
+            _mm256_set1_ps(crate::xyb::OPSIN_BIAS),
+        )
+    };
+    let mixed0 = cube(_mm256_add_ps(y, x));
+    let mixed1 = cube(_mm256_sub_ps(y, x));
+    let mixed2 = cube(b);
+    let inverse_row = |offset: usize| {
+        let value = _mm256_mul_ps(mixed2, _mm256_set1_ps(matrix.inv[offset + 2]));
+        let value = _mm256_fmadd_ps(mixed1, _mm256_set1_ps(matrix.inv[offset + 1]), value);
+        _mm256_fmadd_ps(mixed0, _mm256_set1_ps(matrix.inv[offset]), value)
+    };
+    let r = inverse_row(0);
+    let g = inverse_row(3);
+    let b = inverse_row(6);
+    let zero = _mm256_setzero_ps();
+    let rgb_row = |cr: f32, cg: f32, cb: f32| {
+        let value = _mm256_mul_ps(b, _mm256_set1_ps(cb));
+        let value = _mm256_fmadd_ps(g, _mm256_set1_ps(cg), value);
+        _mm256_max_ps(_mm256_fmadd_ps(r, _mm256_set1_ps(cr), value), zero)
+    };
+    let l = rgb_row(0.412_221_46, 0.536_332_55, 0.051_445_995);
+    let m = rgb_row(0.211_903_5, 0.680_699_5, 0.107_396_96);
+    let s = rgb_row(0.088_302_46, 0.281_718_85, 0.629_978_7);
+    let (l, m, s) = super::xyb::vcbrt_fast3_positive_avx2(l, m, s);
+    let lab_row = |cl: f32, cm: f32, cs: f32| {
+        let value = _mm256_mul_ps(s, _mm256_set1_ps(cs));
+        let value = _mm256_fmadd_ps(m, _mm256_set1_ps(cm), value);
+        _mm256_fmadd_ps(l, _mm256_set1_ps(cl), value)
+    };
+    (
+        lab_row(0.210_454_26, 0.793_617_8, -0.004_072_047),
+        lab_row(1.977_998_5, -2.428_592_2, 0.450_593_7),
+        lab_row(0.025_904_037, 0.782_771_77, -0.808_675_77),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn shifted_right_f32x8(value: __m256) -> __m256 {
+    _mm256_permutevar8x32_ps(value, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7))
+}
+
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available and the input slices cover the block.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn rgb_hue_chroma_edge_loss_avx2(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let Some(end_x) = px.checked_add(width) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    let Some(end_y) = py.checked_add(height) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    if end_x > opsin.xsize() || end_y > opsin.ysize() || !width.is_multiple_of(8) {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    }
+
+    let zero = _mm256_setzero_ps();
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    let mut sum = zero;
+    for y in 0..height {
+        let rows = [
+            opsin.plane_row(0, py + y),
+            opsin.plane_row(1, py + y),
+            opsin.plane_row(2, py + y),
+        ];
+        let below = if y + 1 < height {
+            [
+                opsin.plane_row(0, py + y + 1),
+                opsin.plane_row(1, py + y + 1),
+                opsin.plane_row(2, py + y + 1),
+            ]
+        } else {
+            rows
+        };
+        let error_offset = y * width;
+        for x in (0..width).step_by(8) {
+            let p = px + x;
+            let sx = unsafe { _mm256_loadu_ps(rows[0].as_ptr().add(p)) };
+            let sy = unsafe { _mm256_loadu_ps(rows[1].as_ptr().add(p)) };
+            let sb = unsafe { _mm256_loadu_ps(rows[2].as_ptr().add(p)) };
+            let (rx, ry, rb) = if x + 8 < width {
+                (
+                    unsafe { _mm256_loadu_ps(rows[0].as_ptr().add(p + 1)) },
+                    unsafe { _mm256_loadu_ps(rows[1].as_ptr().add(p + 1)) },
+                    unsafe { _mm256_loadu_ps(rows[2].as_ptr().add(p + 1)) },
+                )
+            } else {
+                (
+                    shifted_right_f32x8(sx),
+                    shifted_right_f32x8(sy),
+                    shifted_right_f32x8(sb),
+                )
+            };
+            let bx = unsafe { _mm256_loadu_ps(below[0].as_ptr().add(p)) };
+            let by = unsafe { _mm256_loadu_ps(below[1].as_ptr().add(p)) };
+            let bb = unsafe { _mm256_loadu_ps(below[2].as_ptr().add(p)) };
+            let cb = _mm256_sub_ps(sb, sy);
+            let horizontal = _mm256_add_ps(
+                _mm256_and_ps(abs_mask, _mm256_sub_ps(rx, sx)),
+                _mm256_and_ps(abs_mask, _mm256_sub_ps(_mm256_sub_ps(rb, ry), cb)),
+            );
+            let vertical = _mm256_add_ps(
+                _mm256_and_ps(abs_mask, _mm256_sub_ps(bx, sx)),
+                _mm256_and_ps(abs_mask, _mm256_sub_ps(_mm256_sub_ps(bb, by), cb)),
+            );
+            let edge_risk = clamp01_f32x8(_mm256_mul_ps(
+                _mm256_sub_ps(_mm256_max_ps(horizontal, vertical), _mm256_set1_ps(0.006)),
+                _mm256_set1_ps(1.0 / 0.030),
+            ));
+            let e = error_offset + x;
+            let ex = unsafe { _mm256_loadu_ps(spatial_error[0].as_ptr().add(e)) };
+            let ey = unsafe { _mm256_loadu_ps(spatial_error[1].as_ptr().add(e)) };
+            let eb = unsafe { _mm256_loadu_ps(spatial_error[2].as_ptr().add(e)) };
+            let (source_l, source_a, source_b) = xyb_to_oklab_f32x8(matrix, sx, sy, sb);
+            let (_, recon_a, recon_b) = xyb_to_oklab_f32x8(
+                matrix,
+                _mm256_sub_ps(sx, ex),
+                _mm256_sub_ps(sy, ey),
+                _mm256_sub_ps(sb, eb),
+            );
+            let source_chroma = _mm256_sqrt_ps(_mm256_fmadd_ps(
+                source_a,
+                source_a,
+                _mm256_mul_ps(source_b, source_b),
+            ));
+            let recon_chroma = _mm256_sqrt_ps(_mm256_fmadd_ps(
+                recon_a,
+                recon_a,
+                _mm256_mul_ps(recon_b, recon_b),
+            ));
+            let brightness_risk = clamp01_f32x8(_mm256_mul_ps(
+                _mm256_sub_ps(source_l, _mm256_set1_ps(0.35)),
+                _mm256_set1_ps(1.0 / 0.40),
+            ));
+            let chroma_risk = clamp01_f32x8(_mm256_mul_ps(
+                _mm256_sub_ps(source_chroma, _mm256_set1_ps(0.03)),
+                _mm256_set1_ps(1.0 / 0.12),
+            ));
+            let risk = _mm256_mul_ps(_mm256_mul_ps(edge_risk, brightness_risk), chroma_risk);
+            let desaturation = _mm256_max_ps(_mm256_sub_ps(source_chroma, recon_chroma), zero);
+            let perpendicular = _mm256_div_ps(
+                _mm256_sub_ps(
+                    _mm256_mul_ps(source_a, recon_b),
+                    _mm256_mul_ps(source_b, recon_a),
+                ),
+                _mm256_add_ps(source_chroma, _mm256_set1_ps(1e-4)),
+            );
+            let penalty = _mm256_fmadd_ps(
+                perpendicular,
+                _mm256_mul_ps(perpendicular, _mm256_set1_ps(0.75)),
+                _mm256_mul_ps(desaturation, desaturation),
+            );
+            sum = _mm256_fmadd_ps(risk, penalty, sum);
+        }
+    }
+    hsum256(sum)
+}
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -551,7 +765,7 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
 mod tests {
     use super::{
         combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-        recon_dist_and_rate_avx2_impl, ssim_deficit_avx2,
+        recon_dist_and_rate_avx2_impl, rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
     };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
@@ -654,6 +868,9 @@ mod tests {
                 scoring: ReconScoring {
                     factor_x: 0.15,
                     factor_b: -0.1,
+                    channel_weights: crate::inflated_cost::CHANNEL_WEIGHT,
+                    xyb_matrix: crate::xyb::XybMatrix::SPEC,
+                    rgb_hue_alpha: 0.0,
                     gradient_alpha: 0.0,
                     gradient_peak_alpha: 3.0,
                 },
@@ -675,6 +892,7 @@ mod tests {
                     combine: |spatial, luma, factor, combined| unsafe {
                         combine_error_avx2(spatial, luma, factor, combined)
                     },
+                    rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_avx2,
                 };
                 let mut simd_scratch = [[0.0f32; 1024]; 8];
                 let simd = unsafe {

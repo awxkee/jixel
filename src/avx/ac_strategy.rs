@@ -43,7 +43,7 @@ pub(crate) fn hsum256(v: __m256) -> f32 {
 
 #[inline]
 #[target_feature(enable = "avx")]
-fn hsum128(v: __m128) -> f32 {
+pub(crate) fn hsum128(v: __m128) -> f32 {
     let shuf = _mm_movehdup_ps(v);
     let sums = _mm_add_ps(v, shuf);
     let shuf2 = _mm_movehl_ps(shuf, sums);

@@ -174,7 +174,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     let scale_dc = qd as f32 * scale_f;
 
     let mut x_qm_scale: u32 = 2;
-    if distance > 1.25 {
+    if distance >= 1.25 {
         x_qm_scale += 1;
     }
     if distance > 9.0 {
@@ -1235,22 +1235,31 @@ pub(crate) fn encode_frame(
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
     }
+    let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
+    let saturation_stat = if slow_chromatic {
+        chroma_saturation_stat(&xyb)
+    } else {
+        0.0
+    };
+    let x_grad_stat = if slow_chromatic {
+        x_gradient_stat(ctx, &xyb)
+    } else {
+        0.0
+    };
     // Saturated-content tables are validated under Slow only: at Fast the
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
-    ctx.set_chroma_heavy(
-        ctx.speed == crate::Speed::Slow
-            && !is_achromatic
-            && chroma_saturation_stat(&xyb) >= SAT_QM_THRESHOLD,
-    );
-    // Band-limited to where it is validated: below the MID-table boundary the
-    // gate keeps the fine X quantizer AND the plain (unflattened-B) tables;
-    // at 1.25 the regular distance schedule takes over.
-    ctx.set_x_heavy(
-        ctx.speed == crate::Speed::Slow
-            && !is_achromatic
-            && distance < crate::quant_weights::QM_FLAT_B8_MID_MIN_DISTANCE
-            && x_gradient_stat(ctx, &xyb) >= X_QM_GRAD_THRESHOLD,
-    );
+    ctx.set_chroma_heavy(slow_chromatic && saturation_stat >= SAT_QM_THRESHOLD);
+    // This is a content class, not a distance tier. Keeping its decision
+    // independent of the 1.25 table boundary prevents saturated HF images
+    // from switching plain B weights, custom opsin and both chroma scales at
+    // the same point. Ordinary photos measured far below this gate.
+    ctx.set_x_heavy(slow_chromatic && x_grad_stat >= X_QM_GRAD_THRESHOLD);
+    // `x_heavy` is first knowable after conversion to XYB. This used to be
+    // queried by `apply_yellow_opsin` before it was computed, leaving the
+    // advertised blue/green fine-B path permanently disabled.
+    if ctx.x_heavy() {
+        ctx.raise_b_qm_scale(x_heavy_b_qm_scale());
+    }
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
@@ -1428,6 +1437,19 @@ const SAT_QM_THRESHOLD: f32 = 0.055;
 /// Burning_Ship reads 0.053 (its yellow-band crop 0.072); the highest
 /// natural image measured (Kodak + assets, 30 images) reads 0.027.
 const X_QM_GRAD_THRESHOLD: f32 = 0.04;
+
+/// Fine-B precision for the synthetic high-frequency opponent-color class.
+/// Scale 7 is the strongest representable multiplier and remained efficient
+/// at matched rate on the fitted d=0.5/1/1.25/1.5 points. Keep an override for
+/// regression studies without perturbing the yellow-only selector.
+#[inline]
+fn x_heavy_b_qm_scale() -> u32 {
+    std::env::var("JIXEL_XHEAVY_B_QM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v: &u32| (2..=7).contains(&v))
+        .unwrap_or(7)
+}
 
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
     let mut sum = 0.0;
@@ -2412,6 +2434,15 @@ fn setup_dc_group(
             ctx.block_features,
             ctx.apply_structure_corrections,
         );
+        if ctx.x_heavy() {
+            crate::adaptive_quant::apply_chroma_hf_protection(
+                opsin,
+                &mut dc_data.raw_quant_field,
+                dc_group_x0,
+                dc_group_y0,
+                distp.distance,
+            );
+        }
     }
 
     // Compute the per-tile CfL slopes before strategy selection so candidate

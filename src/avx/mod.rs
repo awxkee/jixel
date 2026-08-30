@@ -46,7 +46,7 @@ mod ytob;
 pub(crate) use ac_strategy::{
     gradient_region_stats_avx2, gradient_region_stats_with_chroma_avx2, sse_and_rate_avx2,
 };
-pub(crate) use adaptive_quant::fill_quant_field;
+pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{apply_cfl_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2};
 pub(crate) use dark_aq::dark_structure_stats_avx2;
@@ -62,7 +62,7 @@ pub(crate) use entropy::counts_bit_cost_avx2;
 pub(crate) use frame::x_gradient_sums_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-    recon_dist_and_rate_avx2, ssim_deficit_avx2,
+    recon_dist_and_rate_avx2, rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use modular::{
