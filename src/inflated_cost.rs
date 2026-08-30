@@ -298,7 +298,7 @@ pub(crate) fn channel_rd(
     let width = cx * 8;
     let height = cy * 8;
     let half = width / 2;
-    let thr = crate::group::quantize_ac_thresholds(channel, cx, cy, distance);
+    let thr = crate::group::quantize_ac_thresholds_scaled(channel, cx, cy, distance, qm_mult);
     let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
     let (sse, nzeros, mag_bits, max_scan) = unsafe {
         sse_and_rate_fn(
@@ -818,9 +818,9 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let half = width / 2;
     let (pixel_width, pixel_height) = strategy_pixel_dims(strategy);
     let thresholds = [
-        crate::group::quantize_ac_thresholds(0, cx, cy, distance),
+        crate::group::quantize_ac_thresholds_scaled(0, cx, cy, distance, qm_mult_x),
         crate::group::quantize_ac_thresholds(1, cx, cy, distance),
-        crate::group::quantize_ac_thresholds(2, cx, cy, distance),
+        crate::group::quantize_ac_thresholds_scaled(2, cx, cy, distance, quantization.qm_mult_b),
     ];
     let quant_scales = [qac * qm_mult_x, qac, qac * quantization.qm_mult_b];
 

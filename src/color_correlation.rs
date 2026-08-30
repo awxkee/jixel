@@ -408,6 +408,7 @@ fn optimize_channel_rdo(
     channel: usize,
     distance: f32,
     closed_loop: bool,
+    qm_multiplier: f32,
     pred: i32,
     base: f32,
     dc_avg: f32,
@@ -466,7 +467,8 @@ fn optimize_channel_rdo(
 
     let lambda = CFL_RDO.lambda_bits * tile_q;
     let mag_cost = CFL_RDO.mag_cost * tile_q * dz_penalty;
-    let thresholds = crate::group::quantize_ac_thresholds(channel, 1, 1, distance);
+    let thresholds =
+        crate::group::quantize_ac_thresholds_scaled(channel, 1, 1, distance, qm_multiplier);
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
         let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
@@ -568,6 +570,16 @@ fn compute_cmap_tile_rdo(
     let mut dc_abs_b = 0.0f32;
     let mut tile_q_sum = 0.0f32;
     let mut num_blocks = 0usize;
+    let x_mul = if quant.closed_loop && (ctx.x_heavy() || quant.distance >= 1.25) {
+        1.25
+    } else {
+        1.0
+    };
+    let b_mul = if quant.closed_loop {
+        ctx.b_qm_mul()
+    } else {
+        1.0
+    };
     for by in 0..blocks.height {
         for bx in 0..blocks.width {
             let px = (blocks.x + bx) * K_BLOCK_DIM;
@@ -612,12 +624,6 @@ fn compute_cmap_tile_rdo(
             // selected before coefficient coding but must see the same frame
             // X/B precision multipliers that coding will use.
             if quant.closed_loop {
-                let x_mul = if ctx.x_heavy() || quant.distance >= 1.25 {
-                    1.25
-                } else {
-                    1.0
-                };
-                let b_mul = ctx.b_qm_mul();
                 for value in mx.iter_mut().chain(sx.iter_mut()) {
                     *value *= x_mul;
                 }
@@ -643,6 +649,7 @@ fn compute_cmap_tile_rdo(
         0,
         quant.distance,
         quant.closed_loop,
+        x_mul,
         prediction.ytox,
         0.0,
         dc_avg_x,
@@ -656,6 +663,7 @@ fn compute_cmap_tile_rdo(
         2,
         quant.distance,
         quant.closed_loop,
+        b_mul,
         prediction.ytob,
         1.0,
         dc_avg_b,
@@ -1350,6 +1358,7 @@ mod tests {
                 0,
                 1.0,
                 true,
+                1.0,
                 3,
                 0.0,
                 0.0,
@@ -1366,6 +1375,7 @@ mod tests {
                 0,
                 1.0,
                 true,
+                1.0,
                 100,
                 0.0,
                 0.0,

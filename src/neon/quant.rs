@@ -55,7 +55,7 @@ pub(crate) fn quantize_block_ac_neon(
     let block_in = &block_in[..n];
     let block_out = &mut block_out[..n];
 
-    let thr = crate::group::quantize_ac_thresholds(c, xsize, ysize, distance);
+    let thr = crate::group::quantize_ac_thresholds_scaled(c, xsize, ysize, distance, qm_multiplier);
     let q_scaled = crate::group::quantize_ac_q_scaled(quant, scale, qm_multiplier);
 
     let half = width / 2;

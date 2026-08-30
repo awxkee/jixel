@@ -441,6 +441,21 @@ pub(crate) fn quantize_ac_thresholds(
     ysize: usize,
     distance: f32,
 ) -> [f32; 4] {
+    quantize_ac_thresholds_scaled(c, xsize, ysize, distance, 1.0)
+}
+
+/// Quantization zero thresholds for the effective per-channel precision.
+/// Frames which already spend bits on finer B precision preserve near-one
+/// high-frequency B levels instead of applying the ordinary 0.75 deadzone.
+/// This only changes the constants loaded by the existing scalar/SIMD loop.
+#[inline]
+pub(crate) fn quantize_ac_thresholds_scaled(
+    c: usize,
+    xsize: usize,
+    ysize: usize,
+    distance: f32,
+    qm_multiplier: f32,
+) -> [f32; 4] {
     let mut normal = [0.58f32, 0.635, 0.66, 0.7];
     if c == 0 {
         for t in &mut normal[1..] {
@@ -448,8 +463,9 @@ pub(crate) fn quantize_ac_thresholds(
         }
     }
     if c == 2 {
+        let b_hf_threshold = if qm_multiplier > 1.0 { 0.65 } else { 0.75 };
         for t in &mut normal[1..] {
-            *t = 0.75;
+            *t = b_hf_threshold;
         }
     }
     if xsize > 1 || ysize > 1 {
@@ -583,7 +599,7 @@ pub(crate) fn quantize_block_ac_scalar(
     ysize: usize,
     block_out: &mut [i32],
 ) {
-    let thr = quantize_ac_thresholds(c, xsize, ysize, distance);
+    let thr = quantize_ac_thresholds_scaled(c, xsize, ysize, distance, qm_multiplier);
     let q_scaled = quantize_ac_q_scaled(quant, scale, qm_multiplier);
     let width = xsize * 8;
     let height = ysize * 8;
@@ -1480,8 +1496,8 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuantizeDcMethods, quantize_ac_thresholds, quantize_dc_cfl_scalar, quantize_dc_scalar,
-        selected_quantize_dc_methods,
+        QuantizeDcMethods, quantize_ac_thresholds, quantize_ac_thresholds_scaled,
+        quantize_dc_cfl_scalar, quantize_dc_scalar, selected_quantize_dc_methods,
     };
 
     fn check_dc_quantizers(methods: QuantizeDcMethods) {
@@ -1577,6 +1593,14 @@ mod tests {
         assert_eq!(
             quantize_ac_thresholds(2, 1, 1, 1.0),
             [0.58, 0.75, 0.75, 0.75]
+        );
+        assert_eq!(
+            quantize_ac_thresholds_scaled(2, 1, 1, 1.0, 1.25),
+            [0.58, 0.65, 0.65, 0.65]
+        );
+        assert_eq!(
+            quantize_ac_thresholds_scaled(1, 1, 1, 1.0, 1.25),
+            quantize_ac_thresholds(1, 1, 1, 1.0)
         );
     }
 }

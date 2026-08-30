@@ -51,7 +51,7 @@ fn main() {
         height,
         &EncodeConfig::default()
             .with_lossless(false)
-            .with_distance(0.55)
+            .with_distance(0.76)
             .with_speed(Speed::Slow)
             .with_progressive(false)
             .with_decoding_speed(DecodingSpeed::Slow)
