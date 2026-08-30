@@ -1254,6 +1254,12 @@ pub(crate) fn encode_frame(
     // from switching plain B weights, custom opsin and both chroma scales at
     // the same point. Ordinary photos measured far below this gate.
     ctx.set_x_heavy(slow_chromatic && x_grad_stat >= X_QM_GRAD_THRESHOLD);
+    let b_grad_stat = if slow_chromatic {
+        b_gradient_stat(&xyb)
+    } else {
+        0.0
+    };
+    ctx.set_b_heavy(slow_chromatic && b_grad_stat >= B_GRAD_THRESHOLD);
     // `x_heavy` is first knowable after conversion to XYB. This used to be
     // queried by `apply_yellow_opsin` before it was computed, leaving the
     // advertised blue/green fine-B path permanently disabled.
@@ -1438,6 +1444,13 @@ const SAT_QM_THRESHOLD: f32 = 0.055;
 /// natural image measured (Kodak + assets, 30 images) reads 0.027.
 const X_QM_GRAD_THRESHOLD: f32 = 0.04;
 
+/// `b_gradient_stat` gate for blue-axis-dominant structure (the B twin of
+/// `x_heavy`). Opsin-plane calibration 2026-08-29: blue-rotated fractal
+/// victim 0.97, buddhabrot glow class 0.52-0.72, highest photo 0.33 (Oahu
+/// ocean), Kodak max 0.19 — 0.45 keeps every photo out with margin while
+/// admitting the blue-structure class.
+const B_GRAD_THRESHOLD: f32 = 0.45;
+
 /// Fine-B precision for the synthetic high-frequency opponent-color class.
 /// Scale 7 is the strongest representable multiplier and remained efficient
 /// at matched rate on the fitted d=0.5/1/1.25/1.5 points. Keep an override for
@@ -1519,6 +1532,31 @@ fn x_gradient_stat(ctx: &EncodingContext, xyb: &Image3F) -> f32 {
     let [sum_x, sum_y] = (ctx.x_gradient_sums)(xyb.plane_data(0), xyb.plane_data(1), xyb.xsize());
     if sum_y > f32::EPSILON {
         sum_x / sum_y
+    } else {
+        0.0
+    }
+}
+
+/// Share of high-frequency signal on the blue-yellow axis: mean |∇(B−Y)|
+/// over mean |∇Y| on a 1-in-4 row subsample. Content whose structure lives
+/// in the B channel (saturated blue detail) is nearly invisible to the
+/// luma-driven masking field, exactly like the X case `x_gradient_stat`
+/// covers on the red-green axis.
+fn b_gradient_stat(xyb: &Image3F) -> f32 {
+    let mut sum_by = 0.0f32;
+    let mut sum_y = 0.0f32;
+    let mut y = 0;
+    while y < xyb.ysize() {
+        let yr = xyb.plane_row(1, y);
+        let br = xyb.plane_row(2, y);
+        for (b, l) in br.array_windows::<2>().zip(yr.array_windows::<2>()) {
+            sum_by += ((b[1] - l[1]) - (b[0] - l[0])).abs();
+            sum_y += (l[1] - l[0]).abs();
+        }
+        y += 4;
+    }
+    if sum_y > f32::EPSILON {
+        sum_by / sum_y
     } else {
         0.0
     }
@@ -2434,7 +2472,7 @@ fn setup_dc_group(
             ctx.block_features,
             ctx.apply_structure_corrections,
         );
-        if ctx.x_heavy() {
+        if ctx.x_heavy() || ctx.b_heavy() {
             crate::adaptive_quant::apply_chroma_hf_protection(
                 opsin,
                 &mut dc_data.raw_quant_field,

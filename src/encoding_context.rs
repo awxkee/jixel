@@ -63,6 +63,9 @@ pub(crate) struct EncodingContext {
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
+    /// Blue-axis twin of `x_heavy`: structure lives in B−Y where luma-driven
+    /// masking cannot see it (saturated blue detail on low-luma ground).
+    b_heavy: std::sync::atomic::AtomicBool,
     b_qm_scale: std::sync::atomic::AtomicU32,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
@@ -145,6 +148,15 @@ impl EncodingContext {
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn b_heavy(&self) -> bool {
+        self.b_heavy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_b_heavy(&self, heavy: bool) {
+        self.b_heavy
+            .store(heavy, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn raise_b_qm_scale(&self, scale: u32) {
         self.b_qm_scale
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
@@ -194,6 +206,7 @@ impl EncodingContext {
             plain_hq_matrices: DequantMatrices::new(0.0),
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
+            b_heavy: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),

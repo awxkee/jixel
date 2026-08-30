@@ -2347,11 +2347,19 @@ fn write_image_metadata(
             // Opsin biases (defaults; the forward bias is unchanged).
             w.write(16, crate::util::f32_to_f16_bits(-0.003_793_073_4) as u64);
         }
-        // Per-channel quant biases + numerator (defaults).
+        // Per-channel quant biases + numerator. X/Y keep the libjxl defaults;
+        // B's ±1 reconstruction is raised to a full step: the explicit bundle
+        // is only written for the chroma-gated content classes, where the
+        // dying ±1 B residuals are exactly the desaturating ones. Measured
+        // free (+0.03..0.05 SS2 at byte-identical streams) on every class
+        // probed — fractal, blue-rotated victim, smooth-yellow photos;
+        // overshoot past 1.0 was noise. The RDOQ dequant model keeps the
+        // shared Y bias (its mismatch grows 0.05→0.07, same scale as the
+        // pre-existing X mismatch).
         for v in [
             1.0 - 0.054_650_075,
             1.0 - 0.070_054_5,
-            1.0 - 0.049_935_105,
+            1.0,
             0.145,
         ] {
             w.write(16, crate::util::f32_to_f16_bits(v) as u64);

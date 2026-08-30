@@ -301,6 +301,50 @@ pub(crate) fn apply_chroma_hf_protection(
     );
 }
 
+/// Temporary fitting override for the chroma-HF protection term:
+/// JIXEL_CHROMA_FIT="fade_in_start:fade_in_width:fade_out_start:fade_out_width:strength:ceil_base:ceil_share".
+/// Unset = the shipped constants (bit-identical behavior).
+struct ChromaHfFit {
+    fade_in_start: f32,
+    fade_in_width: f32,
+    fade_out_start: f32,
+    fade_out_width: f32,
+    strength: f32,
+    ceil_base: f32,
+    ceil_share: f32,
+}
+
+fn chroma_hf_fit() -> &'static ChromaHfFit {
+    static FIT: OnceLock<ChromaHfFit> = OnceLock::new();
+    FIT.get_or_init(|| {
+        let default = ChromaHfFit {
+            fade_in_start: 0.35,
+            fade_in_width: 0.40,
+            fade_out_start: 1.0,
+            fade_out_width: 1.0,
+            strength: 0.40,
+            ceil_base: 0.35,
+            ceil_share: 1.4,
+        };
+        let Ok(v) = std::env::var("JIXEL_CHROMA_FIT") else {
+            return default;
+        };
+        let parts: Vec<f32> = v.split(':').filter_map(|p| p.trim().parse().ok()).collect();
+        match parts[..] {
+            [fis, fiw, fos, fow, st, cb, cs] => ChromaHfFit {
+                fade_in_start: fis,
+                fade_in_width: fiw,
+                fade_out_start: fos,
+                fade_out_width: fow,
+                strength: st,
+                ceil_base: cb,
+                ceil_share: cs,
+            },
+            _ => default,
+        }
+    })
+}
+
 fn apply_chroma_hf_protection_with_stats(
     opsin: &Image3F,
     field: &mut ImageB,
@@ -309,17 +353,20 @@ fn apply_chroma_hf_protection_with_stats(
     distance: f32,
     stats_fn: ChromaHfStatsFn,
 ) {
-    if field.xsize() == 0 || field.ysize() == 0 || distance < 0.35 {
+    let fit = chroma_hf_fit();
+    if field.xsize() == 0 || field.ysize() == 0 || distance < fit.fade_in_start {
         return;
     }
     let xs = opsin.xsize();
     let ys = opsin.ysize();
     // The local boost wins in the HQ band where single chroma coefficients
     // disappear; at lower quality a shared-QF boost spends mostly Y bits.
-    // Peak gently around d=0.75..1 and release completely by d=2.
-    let fade_in = ((distance - 0.35) / 0.40).clamp(0.0, 1.0);
-    let fade_out = 1.0 - ((distance - 1.0) / 1.0).clamp(0.0, 1.0);
-    let distance_strength = 0.40 * fade_in * fade_out;
+    let fade_in = ((distance - fit.fade_in_start) / fit.fade_in_width).clamp(0.0, 1.0);
+    let fade_out = 1.0 - ((distance - fit.fade_out_start) / fit.fade_out_width).clamp(0.0, 1.0);
+    let distance_strength = fit.strength * fade_in * fade_out;
+    if distance_strength <= 0.0 {
+        return;
+    }
     for by in 0..field.ysize() {
         let py = y0 + by * 8;
         if py >= ys {
@@ -349,7 +396,13 @@ fn apply_chroma_hf_protection_with_stats(
             let share_w = ((chroma_share - 0.25) / 0.55).clamp(0.0, 1.0);
             let risk = chroma_w * gradient_w * share_w;
             if risk > 0.0 {
-                let gain = 1.0 + 0.35 * distance_strength * risk;
+                // When nearly all edge energy is chromatic (share → 1) the
+                // luma masking priced this block as flat and the deficit is
+                // not a nudge but the full masking error; scale the ceiling
+                // up with the squared share so mixed blocks keep the gentle
+                // boost while luma-invisible structure can reach ~1.7x.
+                let ceiling = fmla(fit.ceil_share, share_w * share_w, fit.ceil_base);
+                let gain = fmla(ceiling * distance_strength, risk, 1.0);
                 let q = field.row(by)[bx] as f32;
                 field.row_mut(by)[bx] = (q * gain).round().clamp(1.0, 255.0) as u8;
             }
