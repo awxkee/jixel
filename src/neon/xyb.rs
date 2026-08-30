@@ -58,7 +58,7 @@ fn cbrt_seed_positive_f32(x: float32x4_t) -> float32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn vcbrtq_fast3_positive_f32(
+pub(crate) fn vcbrtq_fast3_positive_f32(
     a0: float32x4_t,
     a1: float32x4_t,
     a2: float32x4_t,
@@ -74,6 +74,11 @@ fn vcbrtq_fast3_positive_f32(
     x0 = halley_cbrt(x0, a0);
     x1 = halley_cbrt(x1, a1);
     x2 = halley_cbrt(x2, a2);
+
+    let zero = vdupq_n_f32(0.0);
+    x0 = vbslq_f32(vceqq_f32(a0, zero), zero, x0);
+    x1 = vbslq_f32(vceqq_f32(a1, zero), zero, x1);
+    x2 = vbslq_f32(vceqq_f32(a2, zero), zero, x2);
 
     (x0, x1, x2)
 }

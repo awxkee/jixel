@@ -29,7 +29,11 @@
 
 cargo run --package stats --release -- ./assets/train0/00004_TE_1808x1352.png --no-image-avif --distances 0.03,0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --efforts 3,6 --out charts
 
-cargo run --package stats --release -- ./assets/Kodak/20.png --distances 0.03,0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6,6.5,7,7.5,8 --efforts 3,6 --out charts --butteraugli
+cargo run --package stats --release -- ./assets/Kodak/20.png --distances 0.03,0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6,6.5,7,7.5,8,8.5,9 --efforts 3,6 --out charts --butteraugli
+
+cargo run --package stats --release -- ./assets/Burning_Ship_Fractal.png --no-av2 --no-image-avif --distances 0.03,0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --efforts 3,6 --out charts --butteraugli
+
+cargo run --package stats --release -- ./assets/small_carrot.png --no-aom --no-image-avif --distances 0.03,0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3 --efforts 3,7 --out charts --butteraugli
 
 cargo run -p meanstats --release -- ./assets/train0 --distances 0.15,0.25,0.295,0.3,0.5,1,1.5,2,2.5,3,3.5,4,4.5,5,5.5,6 --threads 12
 

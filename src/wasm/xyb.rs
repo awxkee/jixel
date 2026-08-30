@@ -76,7 +76,7 @@ fn cbrt_seed_positive_wasm(x: v128) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, v128, v128) {
+pub(crate) fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, v128, v128) {
     let mut x0 = cbrt_seed_positive_wasm(a0);
     let mut x1 = cbrt_seed_positive_wasm(a1);
     let mut x2 = cbrt_seed_positive_wasm(a2);
@@ -89,6 +89,11 @@ fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, v128, v128)
     x0 = halley_cbrt_wasm(x0, a0);
     x1 = halley_cbrt_wasm(x1, a1);
     x2 = halley_cbrt_wasm(x2, a2);
+
+    let zero = f32x4_splat(0.0);
+    x0 = v128_bitselect(zero, x0, f32x4_eq(a0, zero));
+    x1 = v128_bitselect(zero, x1, f32x4_eq(a1, zero));
+    x2 = v128_bitselect(zero, x2, f32x4_eq(a2, zero));
 
     (x0, x1, x2)
 }

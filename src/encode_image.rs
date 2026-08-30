@@ -726,10 +726,10 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     if let Some(m) = selection.matrix {
         ctx.xyb = m;
     }
-    // Band-class frames (thin-HF chroma structure) also get the fine B
-    // quantizer: the tier-1 strong-bias fire and the X-gradient gate identify
-    // the same content class the b_qm bump was measured on.
-    ctx.set_b_fine(ctx.x_heavy() || selection.strong_bias);
+    // The yellow selector runs before XYB conversion, so the post-XYB
+    // `x_heavy` flag is not available yet. Apply only its own staged B scale
+    // here; `frame::encode_frame` ORs in the X-gradient decision later.
+    ctx.raise_b_qm_scale(selection.b_qm_scale);
 }
 
 fn lossy_context(

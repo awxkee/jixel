@@ -28,6 +28,7 @@
  */
 
 use crate::adaptive_quant::K_AC_QUANT;
+use crate::avx::ac_strategy::hsum256;
 use std::arch::x86_64::*;
 
 const MATCH_GAMMA_OFFSET: f32 = 0.019;
@@ -930,6 +931,115 @@ fn fuzzy_erosion_row_to_aq<const SET_MODE: bool>(
 
     debug_assert_eq!(fx, pre_w);
     debug_assert_eq!(out_x, aq_row.len());
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn prefix_mask8(len: usize) -> __m256i {
+    debug_assert!(len <= 8);
+    _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(len as i32),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn maskload8(s: &[f32], i: usize, mask: __m256i) -> __m256 {
+    debug_assert!(i <= s.len());
+    unsafe { _mm256_maskload_ps(s.as_ptr().add(i), mask) }
+}
+
+/// AVX2 implementation of the chroma-HF reductions. Each pass keeps vector
+/// accumulators live across the complete block and reduces only once. Prefix
+/// masks keep every 1..=8-wide partial block on the vector path without
+/// reading past a row.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn chroma_hf_stats_avx2(
+    opsin: &crate::image::Image3F,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+) -> crate::adaptive_quant::ChromaHfStats {
+    let mut out = crate::adaptive_quant::ChromaHfStats::default();
+
+    // Pass 1: opponent magnitude.
+    let mask = prefix_mask8(w);
+    let mut magnitude = _mm256_setzero_ps();
+    for y in py..py + h {
+        let xr = opsin.plane_row(0, y);
+        let yr = opsin.plane_row(1, y);
+        let br = opsin.plane_row(2, y);
+        let xv = maskload8(xr, px, mask);
+        let cb = _mm256_sub_ps(maskload8(br, px, mask), maskload8(yr, px, mask));
+        magnitude = _mm256_add_ps(magnitude, _mm256_add_ps(abs_ps(xv), abs_ps(cb)));
+    }
+    out.chroma_sum = hsum256(magnitude);
+
+    // Pass 2: horizontal edges.
+    if w > 1 {
+        let width = w - 1;
+        let mask = prefix_mask8(width);
+        let mut chroma = _mm256_setzero_ps();
+        let mut luma = _mm256_setzero_ps();
+        for y in py..py + h {
+            let xr = opsin.plane_row(0, y);
+            let yr = opsin.plane_row(1, y);
+            let br = opsin.plane_row(2, y);
+            let x0 = maskload8(xr, px, mask);
+            let x1 = maskload8(xr, px + 1, mask);
+            let y0 = maskload8(yr, px, mask);
+            let y1 = maskload8(yr, px + 1, mask);
+            let cb0 = _mm256_sub_ps(maskload8(br, px, mask), y0);
+            let cb1 = _mm256_sub_ps(maskload8(br, px + 1, mask), y1);
+            chroma = _mm256_add_ps(
+                chroma,
+                _mm256_add_ps(
+                    abs_ps(_mm256_sub_ps(x1, x0)),
+                    abs_ps(_mm256_sub_ps(cb1, cb0)),
+                ),
+            );
+            luma = _mm256_add_ps(luma, abs_ps(_mm256_sub_ps(y1, y0)));
+        }
+        out.chroma_grad += hsum256(chroma);
+        out.luma_grad += hsum256(luma);
+        out.edges += width * h;
+    }
+
+    // Pass 3: vertical edges.
+    if h > 1 {
+        let mask = prefix_mask8(w);
+        let mut chroma = _mm256_setzero_ps();
+        let mut luma = _mm256_setzero_ps();
+        for y in py..py + h - 1 {
+            let xr = opsin.plane_row(0, y);
+            let yr = opsin.plane_row(1, y);
+            let br = opsin.plane_row(2, y);
+            let nxr = opsin.plane_row(0, y + 1);
+            let nyr = opsin.plane_row(1, y + 1);
+            let nbr = opsin.plane_row(2, y + 1);
+            let x0 = maskload8(xr, px, mask);
+            let x1 = maskload8(nxr, px, mask);
+            let y0 = maskload8(yr, px, mask);
+            let y1 = maskload8(nyr, px, mask);
+            let cb0 = _mm256_sub_ps(maskload8(br, px, mask), y0);
+            let cb1 = _mm256_sub_ps(maskload8(nbr, px, mask), y1);
+            chroma = _mm256_add_ps(
+                chroma,
+                _mm256_add_ps(
+                    abs_ps(_mm256_sub_ps(x1, x0)),
+                    abs_ps(_mm256_sub_ps(cb1, cb0)),
+                ),
+            );
+            luma = _mm256_add_ps(luma, abs_ps(_mm256_sub_ps(y1, y0)));
+        }
+        out.chroma_grad += hsum256(chroma);
+        out.luma_grad += hsum256(luma);
+        out.edges += w * (h - 1);
+    }
+
+    out
 }
 
 #[target_feature(enable = "avx2,fma")]

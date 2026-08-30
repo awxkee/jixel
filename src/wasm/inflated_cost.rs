@@ -26,7 +26,224 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::image::Image3F;
 use core::arch::wasm32::*;
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn clamp01_f32x4(value: v128) -> v128 {
+    f32x4_min(f32x4_max(value, f32x4_splat(0.0)), f32x4_splat(1.0))
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn xyb_to_oklab_f32x4(
+    matrix: &crate::xyb::XybMatrix,
+    x: v128,
+    y: v128,
+    b: v128,
+) -> (v128, v128, v128) {
+    let cube = |value: v128| {
+        let value = f32x4_sub(value, f32x4_splat(crate::xyb::NEG_BIAS_CBRT));
+        f32x4_sub(
+            f32x4_mul(f32x4_mul(value, value), value),
+            f32x4_splat(crate::xyb::OPSIN_BIAS),
+        )
+    };
+    let mixed0 = cube(f32x4_add(y, x));
+    let mixed1 = cube(f32x4_sub(y, x));
+    let mixed2 = cube(b);
+    let inverse_row = |offset: usize| {
+        f32x4_add(
+            f32x4_mul(mixed0, f32x4_splat(matrix.inv[offset])),
+            f32x4_add(
+                f32x4_mul(mixed1, f32x4_splat(matrix.inv[offset + 1])),
+                f32x4_mul(mixed2, f32x4_splat(matrix.inv[offset + 2])),
+            ),
+        )
+    };
+    let r = inverse_row(0);
+    let g = inverse_row(3);
+    let b = inverse_row(6);
+    let zero = f32x4_splat(0.0);
+    let rgb_row = |cr: f32, cg: f32, cb: f32| {
+        f32x4_max(
+            f32x4_add(
+                f32x4_mul(r, f32x4_splat(cr)),
+                f32x4_add(f32x4_mul(g, f32x4_splat(cg)), f32x4_mul(b, f32x4_splat(cb))),
+            ),
+            zero,
+        )
+    };
+    let l = rgb_row(0.412_221_46, 0.536_332_55, 0.051_445_995);
+    let m = rgb_row(0.211_903_5, 0.680_699_5, 0.107_396_96);
+    let s = rgb_row(0.088_302_46, 0.281_718_85, 0.629_978_7);
+    let (l, m, s) = super::xyb::vcbrt_fast3_positive_wasm(l, m, s);
+    let lab_row = |cl: f32, cm: f32, cs: f32| {
+        f32x4_add(
+            f32x4_mul(l, f32x4_splat(cl)),
+            f32x4_add(f32x4_mul(m, f32x4_splat(cm)), f32x4_mul(s, f32x4_splat(cs))),
+        )
+    };
+    (
+        lab_row(0.210_454_26, 0.793_617_8, -0.004_072_047),
+        lab_row(1.977_998_5, -2.428_592_2, 0.450_593_7),
+        lab_row(0.025_904_037, 0.782_771_77, -0.808_675_77),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn shifted_right_f32x4(value: v128) -> v128 {
+    i8x16_shuffle::<4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 12, 13, 14, 15>(value, value)
+}
+
+/// # Safety
+/// The input slices must cover the requested block.
+#[target_feature(enable = "simd128")]
+pub(crate) fn rgb_hue_chroma_edge_loss_wasm(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let Some(end_x) = px.checked_add(width) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    let Some(end_y) = py.checked_add(height) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    if end_x > opsin.xsize() || end_y > opsin.ysize() || !width.is_multiple_of(4) {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    }
+
+    let zero = f32x4_splat(0.0);
+    let mut sum = zero;
+    for y in 0..height {
+        let rows = [
+            opsin.plane_row(0, py + y),
+            opsin.plane_row(1, py + y),
+            opsin.plane_row(2, py + y),
+        ];
+        let below = if y + 1 < height {
+            [
+                opsin.plane_row(0, py + y + 1),
+                opsin.plane_row(1, py + y + 1),
+                opsin.plane_row(2, py + y + 1),
+            ]
+        } else {
+            rows
+        };
+        let error_offset = y * width;
+        for x in (0..width).step_by(4) {
+            let p = px + x;
+            let sx = unsafe { v128_load(rows[0].as_ptr().add(p).cast()) };
+            let sy = unsafe { v128_load(rows[1].as_ptr().add(p).cast()) };
+            let sb = unsafe { v128_load(rows[2].as_ptr().add(p).cast()) };
+            let (rx, ry, rb) = if x + 4 < width {
+                (
+                    unsafe { v128_load(rows[0].as_ptr().add(p + 1).cast()) },
+                    unsafe { v128_load(rows[1].as_ptr().add(p + 1).cast()) },
+                    unsafe { v128_load(rows[2].as_ptr().add(p + 1).cast()) },
+                )
+            } else {
+                (
+                    shifted_right_f32x4(sx),
+                    shifted_right_f32x4(sy),
+                    shifted_right_f32x4(sb),
+                )
+            };
+            let bx = unsafe { v128_load(below[0].as_ptr().add(p).cast()) };
+            let by = unsafe { v128_load(below[1].as_ptr().add(p).cast()) };
+            let bb = unsafe { v128_load(below[2].as_ptr().add(p).cast()) };
+            let cb = f32x4_sub(sb, sy);
+            let horizontal = f32x4_add(
+                f32x4_abs(f32x4_sub(rx, sx)),
+                f32x4_abs(f32x4_sub(f32x4_sub(rb, ry), cb)),
+            );
+            let vertical = f32x4_add(
+                f32x4_abs(f32x4_sub(bx, sx)),
+                f32x4_abs(f32x4_sub(f32x4_sub(bb, by), cb)),
+            );
+            let edge_risk = clamp01_f32x4(f32x4_mul(
+                f32x4_sub(f32x4_max(horizontal, vertical), f32x4_splat(0.006)),
+                f32x4_splat(1.0 / 0.030),
+            ));
+            let e = error_offset + x;
+            let ex = unsafe { v128_load(spatial_error[0].as_ptr().add(e).cast()) };
+            let ey = unsafe { v128_load(spatial_error[1].as_ptr().add(e).cast()) };
+            let eb = unsafe { v128_load(spatial_error[2].as_ptr().add(e).cast()) };
+            let (source_l, source_a, source_b) = xyb_to_oklab_f32x4(matrix, sx, sy, sb);
+            let (_, recon_a, recon_b) = xyb_to_oklab_f32x4(
+                matrix,
+                f32x4_sub(sx, ex),
+                f32x4_sub(sy, ey),
+                f32x4_sub(sb, eb),
+            );
+            let source_chroma = f32x4_sqrt(f32x4_add(
+                f32x4_mul(source_a, source_a),
+                f32x4_mul(source_b, source_b),
+            ));
+            let recon_chroma = f32x4_sqrt(f32x4_add(
+                f32x4_mul(recon_a, recon_a),
+                f32x4_mul(recon_b, recon_b),
+            ));
+            let brightness_risk = clamp01_f32x4(f32x4_mul(
+                f32x4_sub(source_l, f32x4_splat(0.35)),
+                f32x4_splat(1.0 / 0.40),
+            ));
+            let chroma_risk = clamp01_f32x4(f32x4_mul(
+                f32x4_sub(source_chroma, f32x4_splat(0.03)),
+                f32x4_splat(1.0 / 0.12),
+            ));
+            let risk = f32x4_mul(f32x4_mul(edge_risk, brightness_risk), chroma_risk);
+            let desaturation = f32x4_max(f32x4_sub(source_chroma, recon_chroma), zero);
+            let perpendicular = f32x4_div(
+                f32x4_sub(f32x4_mul(source_a, recon_b), f32x4_mul(source_b, recon_a)),
+                f32x4_add(source_chroma, f32x4_splat(1e-4)),
+            );
+            let penalty = f32x4_add(
+                f32x4_mul(desaturation, desaturation),
+                f32x4_mul(f32x4_splat(0.75), f32x4_mul(perpendicular, perpendicular)),
+            );
+            sum = f32x4_add(sum, f32x4_mul(risk, penalty));
+        }
+    }
+    f32x4_extract_lane::<0>(sum)
+        + f32x4_extract_lane::<1>(sum)
+        + f32x4_extract_lane::<2>(sum)
+        + f32x4_extract_lane::<3>(sum)
+}
 
 #[inline]
 #[target_feature(enable = "simd128")]

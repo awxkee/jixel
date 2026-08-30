@@ -31,7 +31,7 @@
 
 use crate::image::Image3F;
 use crate::quant_weights::DequantMatrices;
-use crate::xyb::{NEG_BIAS_CBRT, OPSIN_BIAS, XybMatrix, rgb_to_xyb_pixel_f32};
+use crate::xyb::{XybMatrix, rgb_to_xyb_pixel_f32, xyb_to_rgb_pixel_f32};
 
 /// Spec forward-matrix row constants (duplicated from `xyb.rs` consts so a
 /// patched-const experiment build changes them in one place only).
@@ -72,12 +72,12 @@ const MIN_SPEC_COST: f32 = 0.0005;
 /// cannot see this, which is why proxy cost alone never separated).
 const YELLOW_EDGE_MIN: f32 = 0.24;
 
-/// The biased row loses above this distance: the recovered chroma stops
-/// buying quality while the ytob/CfL efficiency tax persists. Fractal-class
-/// flips between d=1.1 and 1.5 (matched-rate −0.8..−2.4 at 1.5); the proxy
-/// prefers the bias MORE as d grows, so this cannot come from proxy guards.
-/// Mirrors the original red-row ≤1.5 gate.
-const MAX_DISTANCE: f32 = 1.25;
+/// Tier-1 used to switch the matrix and b_qm_scale=5 off together at 1.25.
+/// On Burning_Ship that boundary dropped 6.35 SS2 for only 3.4% rate. Keep
+/// full strength through the validated band, then fade the matrix while the
+/// integer B scale is released in smaller stages.
+const STRONG_FADE_START: f32 = 1.25;
+const MAX_DISTANCE: f32 = 1.55;
 
 /// Tier-2 (smooth yellow, below the edge gate): the mild bias fires when
 /// yellow is a *subject*, not an accent — at least this fraction of sampled
@@ -219,28 +219,6 @@ pub(crate) fn matrix_for_bias(bias: f32) -> XybMatrix {
     }
 }
 
-/// Inverse of `rgb_to_xyb_pixel_f32` (matches the decoder's opsin inverse up
-/// to f16 rounding of the signaled matrix).
-#[inline]
-fn xyb_to_rgb_pixel(m: &XybMatrix, x: f32, y: f32, b: f32) -> [f32; 3] {
-    let tm0 = y + x;
-    let tm1 = y - x;
-    let tm2 = b;
-    let cube = |t: f32| {
-        let c = t - NEG_BIAS_CBRT;
-        c * c * c - OPSIN_BIAS
-    };
-    let m0 = cube(tm0);
-    let m1 = cube(tm1);
-    let m2 = cube(tm2);
-    let [i00, i01, i02, i10, i11, i12, i20, i21, i22] = m.inv;
-    [
-        i00 * m0 + i01 * m1 + i02 * m2,
-        i10 * m0 + i11 * m1 + i12 * m2,
-        i20 * m0 + i21 * m1 + i22 * m2,
-    ]
-}
-
 #[inline(always)]
 fn yellow_chroma(rgb: [f32; 3]) -> f32 {
     (rgb[0].min(rgb[1]) - rgb[2]).max(0.0)
@@ -331,7 +309,7 @@ fn evaluate_bias(samples: &[SamplePixel], m: &XybMatrix, steps: [f32; 3]) -> Bia
         let yq = quant(y, step_y);
         let xq = quant(x, step_x);
         let bq = quant(bx - YTOB_BASE * y, step_b) + YTOB_BASE * yq;
-        let rec = xyb_to_rgb_pixel(m, xq, yq, bq);
+        let rec = xyb_to_rgb_pixel_f32(m, xq, yq, bq);
 
         general_sum += rgb_error(s.rgb, rec);
 
@@ -425,11 +403,11 @@ fn choose_tier2_bias(samples: &[SamplePixel], distance: f32) -> f32 {
 /// Pick the B bias for this image at this distance. Returns the spec value
 /// unless the biased matrix demonstrably reduces yellow-chroma damage more
 /// than it costs on ordinary content.
-pub(crate) fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
+fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
     // Each tier enforces its own distance band; the shared upper bound here
     // only skips work past both.
     if distance >= MAX_DISTANCE.max(TIER2_MAX_DISTANCE) || !has_yellow_risk(linear) {
-        return SPEC_BIAS;
+        return (SPEC_BIAS, false);
     }
 
     let (samples, yellow_edge) = collect_samples(linear);
@@ -438,11 +416,11 @@ pub(crate) fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
     // perceptual trade: rate for visible chroma survival that SS2 barely
     // credits — validated per-pixel on assets/yellow).
     if yellow_edge < YELLOW_EDGE_MIN {
-        return choose_tier2_bias(&samples, distance);
+        return (choose_tier2_bias(&samples, distance), false);
     }
     // Tier-1 (thin-HF yellow, strong bias) has its own, tighter cap.
     if distance >= MAX_DISTANCE {
-        return SPEC_BIAS;
+        return (SPEC_BIAS, false);
     }
     let steps = proxy_steps(distance);
     let candidates = [SPEC_BIAS, BIAS_MID, BIAS_HI];
@@ -471,27 +449,55 @@ pub(crate) fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
         }
     }
     if spec_cost < MIN_SPEC_COST || best_cost > REL_COST_RATIO * spec_cost {
-        return SPEC_BIAS;
+        return (SPEC_BIAS, false);
     }
-    best_bias
+    let strength = 1.0 - ramp(distance, STRONG_FADE_START, MAX_DISTANCE);
+    (SPEC_BIAS + (best_bias - SPEC_BIAS) * strength, true)
+}
+
+#[cfg(test)]
+fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
+    choose_b_bias_and_tier(linear, distance).0
 }
 
 pub(crate) struct YellowSelection {
     /// `None` = keep the spec matrix (nothing signaled), `Some` = use and
     /// signal the biased matrix.
     pub(crate) matrix: Option<XybMatrix>,
-    /// The tier-1 strong bias fired: the frame is band-class (thin-HF bright
-    /// chroma structure), which also gates the fine B quantizer.
-    pub(crate) strong_bias: bool,
+    /// Staged frame B precision for tier-1. The JXL header stores an integer,
+    /// so 5→4→3→2 avoids the former all-at-once 5→2 cliff.
+    pub(crate) b_qm_scale: u32,
+}
+
+#[inline]
+fn selected_b_qm_scale(custom: bool, strong: bool, distance: f32) -> u32 {
+    if !custom || !strong {
+        2
+    } else if distance < 1.30 {
+        5
+    } else if distance < 1.40 {
+        4
+    } else if distance < 1.50 {
+        3
+    } else {
+        2
+    }
 }
 
 /// Entry point used by the encoder: one detector + proxy pass yielding both
 /// the opsin decision and the band-class signal.
 pub(crate) fn select_yellow(linear: &Image3F, distance: f32) -> YellowSelection {
-    let bias = choose_b_bias(linear, distance);
+    let (bias, tier1) = choose_b_bias_and_tier(linear, distance);
+    let custom = (bias - SPEC_BIAS).abs() >= 1e-6;
+    // A custom row can come from either tier. Only thin/high-frequency tier-1
+    // content validated the fine B multiplier; smooth tier-2 yellow uses the
+    // matrix alone. Treating every custom row as tier-1 spent 6–17% on several
+    // yellow photos without improving their chroma error.
+    let strong = custom && tier1;
+    let b_qm_scale = selected_b_qm_scale(custom, strong, distance);
     YellowSelection {
-        strong_bias: bias >= 0.75,
-        matrix: ((bias - SPEC_BIAS).abs() >= 1e-6).then(|| matrix_for_bias(bias)),
+        b_qm_scale,
+        matrix: custom.then(|| matrix_for_bias(bias)),
     }
 }
 
@@ -583,7 +589,7 @@ mod tests {
                 [0.02, 0.9, 0.3],
             ] {
                 let (x, y, b) = rgb_to_xyb_pixel_f32(&m, rgb[0], rgb[1], rgb[2]);
-                let rec = xyb_to_rgb_pixel(&m, x, y, b);
+                let rec = xyb_to_rgb_pixel_f32(&m, x, y, b);
                 for c in 0..3 {
                     assert!(
                         (rec[c] - rgb[c]).abs() < 1e-4,
@@ -635,5 +641,27 @@ mod tests {
     fn choose_bias_prefers_spec_on_neutral_content() {
         let img = filled(64, 64, [0.4, 0.5, 0.6]);
         assert_eq!(choose_b_bias(&img, 2.0), SPEC_BIAS);
+    }
+
+    #[test]
+    fn fine_b_is_reserved_for_the_high_frequency_tier() {
+        let smooth = filled(64, 64, [0.9, 0.85, 0.05]);
+        let smooth_selection = select_yellow(&smooth, 1.0);
+        assert!(smooth_selection.matrix.is_some());
+        assert_eq!(smooth_selection.b_qm_scale, 2);
+
+        let mut edged = smooth;
+        for y in (0..64).step_by(SAMPLE_STRIDE) {
+            for x in (0..64).step_by(SAMPLE_STRIDE) {
+                if x + 1 < 64 {
+                    for c in 0..3 {
+                        edged.plane_row_mut(c, y)[x + 1] = 0.0;
+                    }
+                }
+            }
+        }
+        assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
+        assert_eq!(selected_b_qm_scale(true, true, 1.0), 5);
+        assert_eq!(selected_b_qm_scale(true, false, 1.0), 2);
     }
 }

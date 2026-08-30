@@ -148,9 +148,11 @@ fn halley_refine(x: f32, a: f32) -> f32 {
     x * fmla(2f32, a, tx) / fmla(2f32, tx, a)
 }
 
-#[allow(unused)]
 #[inline]
-fn cbrtf(x: f32) -> f32 {
+pub(crate) fn cbrtf(x: f32) -> f32 {
+    if x == 0.0 {
+        return x;
+    }
     const B1: u32 = 709958130;
     let mut t: f32;
     let mut ui: u32 = x.to_bits();
@@ -178,6 +180,28 @@ pub(crate) fn rgb_to_xyb_pixel_f32(m: &XybMatrix, r: f32, g: f32, b: f32) -> (f3
     let tm2 = cbrtf(mixed2.max(0.0)) + NEG_BIAS_CBRT;
 
     (0.5 * (tm0 - tm1), 0.5 * (tm0 + tm1), tm2)
+}
+
+/// Inverse of [`rgb_to_xyb_pixel_f32`], using the active signalled matrix.
+/// This matches the decoder's opsin inverse apart from its f16 matrix storage.
+#[inline]
+pub(crate) fn xyb_to_rgb_pixel_f32(m: &XybMatrix, x: f32, y: f32, b: f32) -> [f32; 3] {
+    let tm0 = y + x;
+    let tm1 = y - x;
+    let tm2 = b;
+    let cube = |t: f32| {
+        let c = t - NEG_BIAS_CBRT;
+        c * c * c - OPSIN_BIAS
+    };
+    let m0 = cube(tm0);
+    let m1 = cube(tm1);
+    let m2 = cube(tm2);
+    let [i00, i01, i02, i10, i11, i12, i20, i21, i22] = m.inv;
+    [
+        fmla(i00, m0, fmla(i01, m1, i02 * m2)),
+        fmla(i10, m0, fmla(i11, m1, i12 * m2)),
+        fmla(i20, m0, fmla(i21, m1, i22 * m2)),
+    ]
 }
 
 pub(crate) type ToXybBandFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [f32]; 3], usize);

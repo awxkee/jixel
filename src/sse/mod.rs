@@ -49,6 +49,7 @@ pub(crate) use dark_aq::dark_structure_stats_sse41;
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use inflated_cost::{
     combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
+    rgb_hue_chroma_edge_loss_sse41,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use modular::{

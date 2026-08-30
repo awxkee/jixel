@@ -26,10 +26,225 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::image::Image3F;
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn clamp01_f32x4(value: __m128) -> __m128 {
+    _mm_min_ps(_mm_max_ps(value, _mm_setzero_ps()), _mm_set1_ps(1.0))
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn xyb_to_oklab_f32x4(
+    matrix: &crate::xyb::XybMatrix,
+    x: __m128,
+    y: __m128,
+    b: __m128,
+) -> (__m128, __m128, __m128) {
+    let cube = |value: __m128| {
+        let value = _mm_sub_ps(value, _mm_set1_ps(crate::xyb::NEG_BIAS_CBRT));
+        _mm_sub_ps(
+            _mm_mul_ps(_mm_mul_ps(value, value), value),
+            _mm_set1_ps(crate::xyb::OPSIN_BIAS),
+        )
+    };
+    let mixed0 = cube(_mm_add_ps(y, x));
+    let mixed1 = cube(_mm_sub_ps(y, x));
+    let mixed2 = cube(b);
+    let inverse_row = |offset: usize| {
+        _mm_add_ps(
+            _mm_mul_ps(mixed0, _mm_set1_ps(matrix.inv[offset])),
+            _mm_add_ps(
+                _mm_mul_ps(mixed1, _mm_set1_ps(matrix.inv[offset + 1])),
+                _mm_mul_ps(mixed2, _mm_set1_ps(matrix.inv[offset + 2])),
+            ),
+        )
+    };
+    let r = inverse_row(0);
+    let g = inverse_row(3);
+    let b = inverse_row(6);
+    let zero = _mm_setzero_ps();
+    let rgb_row = |cr: f32, cg: f32, cb: f32| {
+        _mm_max_ps(
+            _mm_add_ps(
+                _mm_mul_ps(r, _mm_set1_ps(cr)),
+                _mm_add_ps(
+                    _mm_mul_ps(g, _mm_set1_ps(cg)),
+                    _mm_mul_ps(b, _mm_set1_ps(cb)),
+                ),
+            ),
+            zero,
+        )
+    };
+    let l = rgb_row(0.412_221_46, 0.536_332_55, 0.051_445_995);
+    let m = rgb_row(0.211_903_5, 0.680_699_5, 0.107_396_96);
+    let s = rgb_row(0.088_302_46, 0.281_718_85, 0.629_978_7);
+    let (l, m, s) = super::xyb::vcbrt_fast3_positive_sse41(l, m, s);
+    let lab_row = |cl: f32, cm: f32, cs: f32| {
+        _mm_add_ps(
+            _mm_mul_ps(l, _mm_set1_ps(cl)),
+            _mm_add_ps(
+                _mm_mul_ps(m, _mm_set1_ps(cm)),
+                _mm_mul_ps(s, _mm_set1_ps(cs)),
+            ),
+        )
+    };
+    (
+        lab_row(0.210_454_26, 0.793_617_8, -0.004_072_047),
+        lab_row(1.977_998_5, -2.428_592_2, 0.450_593_7),
+        lab_row(0.025_904_037, 0.782_771_77, -0.808_675_77),
+    )
+}
+
+/// # Safety
+/// The caller must ensure SSE4.1 is available and the input slices cover the block.
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn rgb_hue_chroma_edge_loss_sse41(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let Some(end_x) = px.checked_add(width) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    let Some(end_y) = py.checked_add(height) else {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    };
+    if end_x > opsin.xsize() || end_y > opsin.ysize() || !width.is_multiple_of(4) {
+        return crate::inflated_cost::rgb_hue_chroma_edge_loss_scalar(
+            opsin,
+            px,
+            py,
+            width,
+            height,
+            spatial_error,
+            matrix,
+        );
+    }
+
+    let zero = _mm_setzero_ps();
+    let abs_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7fff_ffff));
+    let mut sum = zero;
+    for y in 0..height {
+        let rows = [
+            opsin.plane_row(0, py + y),
+            opsin.plane_row(1, py + y),
+            opsin.plane_row(2, py + y),
+        ];
+        let below = if y + 1 < height {
+            [
+                opsin.plane_row(0, py + y + 1),
+                opsin.plane_row(1, py + y + 1),
+                opsin.plane_row(2, py + y + 1),
+            ]
+        } else {
+            rows
+        };
+        let error_offset = y * width;
+        for x in (0..width).step_by(4) {
+            let p = px + x;
+            let sx = unsafe { _mm_loadu_ps(rows[0].as_ptr().add(p)) };
+            let sy = unsafe { _mm_loadu_ps(rows[1].as_ptr().add(p)) };
+            let sb = unsafe { _mm_loadu_ps(rows[2].as_ptr().add(p)) };
+            let (rx, ry, rb) = if x + 4 < width {
+                (
+                    unsafe { _mm_loadu_ps(rows[0].as_ptr().add(p + 1)) },
+                    unsafe { _mm_loadu_ps(rows[1].as_ptr().add(p + 1)) },
+                    unsafe { _mm_loadu_ps(rows[2].as_ptr().add(p + 1)) },
+                )
+            } else {
+                (
+                    _mm_shuffle_ps::<0xf9>(sx, sx),
+                    _mm_shuffle_ps::<0xf9>(sy, sy),
+                    _mm_shuffle_ps::<0xf9>(sb, sb),
+                )
+            };
+            let bx = unsafe { _mm_loadu_ps(below[0].as_ptr().add(p)) };
+            let by = unsafe { _mm_loadu_ps(below[1].as_ptr().add(p)) };
+            let bb = unsafe { _mm_loadu_ps(below[2].as_ptr().add(p)) };
+            let cb = _mm_sub_ps(sb, sy);
+            let horizontal = _mm_add_ps(
+                _mm_and_ps(abs_mask, _mm_sub_ps(rx, sx)),
+                _mm_and_ps(abs_mask, _mm_sub_ps(_mm_sub_ps(rb, ry), cb)),
+            );
+            let vertical = _mm_add_ps(
+                _mm_and_ps(abs_mask, _mm_sub_ps(bx, sx)),
+                _mm_and_ps(abs_mask, _mm_sub_ps(_mm_sub_ps(bb, by), cb)),
+            );
+            let edge_risk = clamp01_f32x4(_mm_mul_ps(
+                _mm_sub_ps(_mm_max_ps(horizontal, vertical), _mm_set1_ps(0.006)),
+                _mm_set1_ps(1.0 / 0.030),
+            ));
+            let e = error_offset + x;
+            let ex = unsafe { _mm_loadu_ps(spatial_error[0].as_ptr().add(e)) };
+            let ey = unsafe { _mm_loadu_ps(spatial_error[1].as_ptr().add(e)) };
+            let eb = unsafe { _mm_loadu_ps(spatial_error[2].as_ptr().add(e)) };
+            let (source_l, source_a, source_b) = xyb_to_oklab_f32x4(matrix, sx, sy, sb);
+            let (_, recon_a, recon_b) = xyb_to_oklab_f32x4(
+                matrix,
+                _mm_sub_ps(sx, ex),
+                _mm_sub_ps(sy, ey),
+                _mm_sub_ps(sb, eb),
+            );
+            let source_chroma = _mm_sqrt_ps(_mm_add_ps(
+                _mm_mul_ps(source_a, source_a),
+                _mm_mul_ps(source_b, source_b),
+            ));
+            let recon_chroma = _mm_sqrt_ps(_mm_add_ps(
+                _mm_mul_ps(recon_a, recon_a),
+                _mm_mul_ps(recon_b, recon_b),
+            ));
+            let brightness_risk = clamp01_f32x4(_mm_mul_ps(
+                _mm_sub_ps(source_l, _mm_set1_ps(0.35)),
+                _mm_set1_ps(1.0 / 0.40),
+            ));
+            let chroma_risk = clamp01_f32x4(_mm_mul_ps(
+                _mm_sub_ps(source_chroma, _mm_set1_ps(0.03)),
+                _mm_set1_ps(1.0 / 0.12),
+            ));
+            let risk = _mm_mul_ps(_mm_mul_ps(edge_risk, brightness_risk), chroma_risk);
+            let desaturation = _mm_max_ps(_mm_sub_ps(source_chroma, recon_chroma), zero);
+            let perpendicular = _mm_div_ps(
+                _mm_sub_ps(_mm_mul_ps(source_a, recon_b), _mm_mul_ps(source_b, recon_a)),
+                _mm_add_ps(source_chroma, _mm_set1_ps(1e-4)),
+            );
+            let penalty = _mm_add_ps(
+                _mm_mul_ps(desaturation, desaturation),
+                _mm_mul_ps(_mm_set1_ps(0.75), _mm_mul_ps(perpendicular, perpendicular)),
+            );
+            sum = _mm_add_ps(sum, _mm_mul_ps(risk, penalty));
+        }
+    }
+    horizontal_sum_x4(sum)
+}
 
 #[inline]
 #[target_feature(enable = "sse4.1")]

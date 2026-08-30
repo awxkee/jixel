@@ -944,6 +944,126 @@ fn fuzzy_erosion_row_to_aq<const SET_MODE: bool>(
     debug_assert_eq!(out_x, aq_row.len());
 }
 
+/// SIMD implementation of the three reductions used by
+/// `apply_chroma_hf_protection`. Each pass keeps its vector accumulators live
+/// across the complete block and reduces only once. Partial right/bottom
+/// blocks use scalar tails.
+#[target_feature(enable = "neon")]
+pub(crate) fn chroma_hf_stats_neon(
+    opsin: &crate::image::Image3F,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+) -> crate::adaptive_quant::ChromaHfStats {
+    let mut out = crate::adaptive_quant::ChromaHfStats::default();
+
+    // Pass 1: opponent magnitude.
+    let mut magnitude = vdupq_n_f32(0.0);
+    for y in py..py + h {
+        let xr = opsin.plane_row(0, y);
+        let yr = opsin.plane_row(1, y);
+        let br = opsin.plane_row(2, y);
+        let mut dx = 0;
+        while dx + 4 <= w {
+            let x = px + dx;
+            let xv = load4s(xr, x);
+            let cb = vsubq_f32(load4s(br, x), load4s(yr, x));
+            magnitude = vaddq_f32(magnitude, vaddq_f32(vabsq_f32(xv), vabsq_f32(cb)));
+            dx += 4;
+        }
+        let xr = &xr[px + dx..px + w];
+        let yr = &yr[px + dx..px + w];
+        let br = &br[px + dx..px + w];
+        for ((&x, &y), &b) in xr.iter().zip(yr).zip(br) {
+            out.chroma_sum += x.abs() + (b - y).abs();
+        }
+    }
+    out.chroma_sum += hsum(magnitude);
+
+    // Pass 2: horizontal edges.
+    if w > 1 {
+        let width = w - 1;
+        let mut chroma4 = vdupq_n_f32(0.0);
+        let mut luma4 = vdupq_n_f32(0.0);
+        for y in py..py + h {
+            let xr = opsin.plane_row(0, y);
+            let yr = opsin.plane_row(1, y);
+            let br = opsin.plane_row(2, y);
+            let mut dx = 0;
+            while dx + 4 <= width {
+                let x = px + dx;
+                let x0 = load4s(xr, x);
+                let x1 = load4s(xr, x + 1);
+                let y0 = load4s(yr, x);
+                let y1 = load4s(yr, x + 1);
+                let cb0 = vsubq_f32(load4s(br, x), y0);
+                let cb1 = vsubq_f32(load4s(br, x + 1), y1);
+                let chroma =
+                    vaddq_f32(vabsq_f32(vsubq_f32(x1, x0)), vabsq_f32(vsubq_f32(cb1, cb0)));
+                chroma4 = vaddq_f32(chroma4, chroma);
+                luma4 = vaddq_f32(luma4, vabsq_f32(vsubq_f32(y1, y0)));
+                dx += 4;
+            }
+            let start = px + dx;
+            let end = px + width;
+            let x_pairs = xr[start..end].iter().zip(&xr[start + 1..end + 1]);
+            let y_pairs = yr[start..end].iter().zip(&yr[start + 1..end + 1]);
+            let b_pairs = br[start..end].iter().zip(&br[start + 1..end + 1]);
+            for (((&x0, &x1), (&y0, &y1)), (&b0, &b1)) in x_pairs.zip(y_pairs).zip(b_pairs) {
+                out.chroma_grad += (x1 - x0).abs() + ((b1 - y1) - (b0 - y0)).abs();
+                out.luma_grad += (y1 - y0).abs();
+            }
+        }
+        out.chroma_grad += hsum(chroma4);
+        out.luma_grad += hsum(luma4);
+        out.edges += width * h;
+    }
+
+    // Pass 3: vertical edges.
+    if h > 1 {
+        let mut chroma4 = vdupq_n_f32(0.0);
+        let mut luma4 = vdupq_n_f32(0.0);
+        for y in py..py + h - 1 {
+            let xr = opsin.plane_row(0, y);
+            let yr = opsin.plane_row(1, y);
+            let br = opsin.plane_row(2, y);
+            let nxr = opsin.plane_row(0, y + 1);
+            let nyr = opsin.plane_row(1, y + 1);
+            let nbr = opsin.plane_row(2, y + 1);
+            let mut dx = 0;
+            while dx + 4 <= w {
+                let x = px + dx;
+                let x0 = load4s(xr, x);
+                let x1 = load4s(nxr, x);
+                let y0 = load4s(yr, x);
+                let y1 = load4s(nyr, x);
+                let cb0 = vsubq_f32(load4s(br, x), y0);
+                let cb1 = vsubq_f32(load4s(nbr, x), y1);
+                let chroma =
+                    vaddq_f32(vabsq_f32(vsubq_f32(x1, x0)), vabsq_f32(vsubq_f32(cb1, cb0)));
+                chroma4 = vaddq_f32(chroma4, chroma);
+                luma4 = vaddq_f32(luma4, vabsq_f32(vsubq_f32(y1, y0)));
+                dx += 4;
+            }
+            let start = px + dx;
+            let end = px + w;
+            let x_pairs = xr[start..end].iter().zip(&nxr[start..end]);
+            let y_pairs = yr[start..end].iter().zip(&nyr[start..end]);
+            let b_pairs = br[start..end].iter().zip(&nbr[start..end]);
+            for (((&x0, &x1), (&y0, &y1)), (&b0, &b1)) in x_pairs.zip(y_pairs).zip(b_pairs) {
+                out.chroma_grad += (x1 - x0).abs() + ((b1 - y1) - (b0 - y0)).abs();
+                out.luma_grad += (y1 - y0).abs();
+            }
+        }
+        out.chroma_grad += hsum(chroma4);
+        out.luma_grad += hsum(luma4);
+        out.edges += w * (h - 1);
+    }
+
+    out
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn fill_quant_field(
     scratch: &mut crate::adaptive_quant::AqMapScratch,

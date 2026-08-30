@@ -178,6 +178,185 @@ pub(crate) fn blue_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -
     scalar_sum *= k_mul;
     scalar_sum + out_val
 }
+
+/// Refine the shared quant field only where high-frequency chroma carries
+/// structure that luma masking cannot see. This complements `blue_modulation`:
+/// the latter recognizes blue area, while this recognizes hue edges in both
+/// opponent axes (`X` and `B-Y`) and therefore covers yellow/green/cyan too.
+///
+/// The detector is deliberately multiplicative and bounded. A block must be
+/// chromatic, have real chroma gradients, and carry a meaningful fraction of
+/// its edge energy outside Y. Smooth paint/sky and neutral texture therefore
+/// remain unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ChromaHfStats {
+    pub(crate) chroma_sum: f32,
+    pub(crate) chroma_grad: f32,
+    pub(crate) luma_grad: f32,
+    pub(crate) edges: usize,
+}
+
+pub(crate) type ChromaHfStatsFn = fn(&Image3F, usize, usize, usize, usize) -> ChromaHfStats;
+
+/// Three independent reductions make the hot arithmetic vectorizable while
+/// retaining a compact scalar reference for tails and dispatch tests. Sliced
+/// zip iterators give LLVM equal-length ranges, avoiding bounds checks in the
+/// scalar loops.
+#[allow(dead_code)]
+pub(crate) fn chroma_hf_stats_scalar(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    w: usize,
+    h: usize,
+) -> ChromaHfStats {
+    let mut out = ChromaHfStats::default();
+
+    // Pass 1: opponent magnitude.
+    for y in py..py + h {
+        let xr = &opsin.plane_row(0, y)[px..px + w];
+        let yr = &opsin.plane_row(1, y)[px..px + w];
+        let br = &opsin.plane_row(2, y)[px..px + w];
+        for ((&x, &y), &b) in xr.iter().zip(yr).zip(br) {
+            out.chroma_sum += x.abs() + (b - y).abs();
+        }
+    }
+
+    // Pass 2: horizontal edges.
+    if w > 1 {
+        for y in py..py + h {
+            let xr = &opsin.plane_row(0, y)[px..px + w];
+            let yr = &opsin.plane_row(1, y)[px..px + w];
+            let br = &opsin.plane_row(2, y)[px..px + w];
+            let x_pairs = xr.iter().zip(&xr[1..]);
+            let y_pairs = yr.iter().zip(&yr[1..]);
+            let b_pairs = br.iter().zip(&br[1..]);
+            for (((&x0, &x1), (&y0, &y1)), (&b0, &b1)) in x_pairs.zip(y_pairs).zip(b_pairs) {
+                out.chroma_grad += (x1 - x0).abs() + ((b1 - y1) - (b0 - y0)).abs();
+                out.luma_grad += (y1 - y0).abs();
+            }
+        }
+        out.edges += (w - 1) * h;
+    }
+
+    // Pass 3: vertical edges.
+    if h > 1 {
+        for y in py..py + h - 1 {
+            let xr = &opsin.plane_row(0, y)[px..px + w];
+            let yr = &opsin.plane_row(1, y)[px..px + w];
+            let br = &opsin.plane_row(2, y)[px..px + w];
+            let nxr = &opsin.plane_row(0, y + 1)[px..px + w];
+            let nyr = &opsin.plane_row(1, y + 1)[px..px + w];
+            let nbr = &opsin.plane_row(2, y + 1)[px..px + w];
+            let x_pairs = xr.iter().zip(nxr);
+            let y_pairs = yr.iter().zip(nyr);
+            let b_pairs = br.iter().zip(nbr);
+            for (((&x0, &x1), (&y0, &y1)), (&b0, &b1)) in x_pairs.zip(y_pairs).zip(b_pairs) {
+                out.chroma_grad += (x1 - x0).abs() + ((b1 - y1) - (b0 - y0)).abs();
+                out.luma_grad += (y1 - y0).abs();
+            }
+        }
+        out.edges += w * (h - 1);
+    }
+
+    out
+}
+
+fn select_chroma_hf_stats_fn() -> ChromaHfStatsFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |opsin, px, py, w, h| unsafe {
+            crate::avx::chroma_hf_stats_avx2(opsin, px, py, w, h)
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |opsin, px, py, w, h| unsafe { crate::neon::chroma_hf_stats_neon(opsin, px, py, w, h) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        chroma_hf_stats_scalar
+    }
+}
+
+pub(crate) fn selected_chroma_hf_stats_fn() -> ChromaHfStatsFn {
+    static METHOD: OnceLock<ChromaHfStatsFn> = OnceLock::new();
+    *METHOD.get_or_init(select_chroma_hf_stats_fn)
+}
+
+pub(crate) fn apply_chroma_hf_protection(
+    opsin: &Image3F,
+    field: &mut ImageB,
+    x0: usize,
+    y0: usize,
+    distance: f32,
+) {
+    apply_chroma_hf_protection_with_stats(
+        opsin,
+        field,
+        x0,
+        y0,
+        distance,
+        selected_chroma_hf_stats_fn(),
+    );
+}
+
+fn apply_chroma_hf_protection_with_stats(
+    opsin: &Image3F,
+    field: &mut ImageB,
+    x0: usize,
+    y0: usize,
+    distance: f32,
+    stats_fn: ChromaHfStatsFn,
+) {
+    if field.xsize() == 0 || field.ysize() == 0 || distance < 0.35 {
+        return;
+    }
+    let xs = opsin.xsize();
+    let ys = opsin.ysize();
+    // The local boost wins in the HQ band where single chroma coefficients
+    // disappear; at lower quality a shared-QF boost spends mostly Y bits.
+    // Peak gently around d=0.75..1 and release completely by d=2.
+    let fade_in = ((distance - 0.35) / 0.40).clamp(0.0, 1.0);
+    let fade_out = 1.0 - ((distance - 1.0) / 1.0).clamp(0.0, 1.0);
+    let distance_strength = 0.40 * fade_in * fade_out;
+    for by in 0..field.ysize() {
+        let py = y0 + by * 8;
+        if py >= ys {
+            continue;
+        }
+        for bx in 0..field.xsize() {
+            let px = x0 + bx * 8;
+            if px >= xs {
+                continue;
+            }
+            let w = (xs - px).min(8);
+            let h = (ys - py).min(8);
+            let ChromaHfStats {
+                chroma_sum,
+                chroma_grad,
+                luma_grad,
+                edges,
+            } = stats_fn(opsin, px, py, w, h);
+            if edges == 0 {
+                continue;
+            }
+            let mean_chroma = chroma_sum / (w * h) as f32;
+            let mean_gradient = chroma_grad / edges as f32;
+            let chroma_share = chroma_grad / (chroma_grad + luma_grad + 1e-4);
+            let chroma_w = ((mean_chroma - 0.025) / 0.075).clamp(0.0, 1.0);
+            let gradient_w = ((mean_gradient - 0.006) / 0.030).clamp(0.0, 1.0);
+            let share_w = ((chroma_share - 0.25) / 0.55).clamp(0.0, 1.0);
+            let risk = chroma_w * gradient_w * share_w;
+            if risk > 0.0 {
+                let gain = 1.0 + 0.35 * distance_strength * risk;
+                let q = field.row(by)[bx] as f32;
+                field.row_mut(by)[bx] = (q * gain).round().clamp(1.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 /// Gamma modulation: accounts for the local gamma of the 8x8 block.
 pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -> f32 {
     let k_bias = 0.16f32;
@@ -580,10 +759,123 @@ pub(crate) fn dirty_log1pf(d: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AQ_FADE_END, AQ_FADE_START, AQ_PEAK, AqMapScratch, Image3F, ImageB, aq_dampen,
-        dirty_log1pf, dirty_log2f, fill_quant_field_scalar, hf_modulation_strength,
-        selected_fill_quant_field_fn,
+        AQ_FADE_END, AQ_FADE_START, AQ_PEAK, AqMapScratch, Image3F, ImageB,
+        apply_chroma_hf_protection, apply_chroma_hf_protection_with_stats, aq_dampen,
+        chroma_hf_stats_scalar, dirty_log1pf, dirty_log2f, fill_quant_field_scalar,
+        hf_modulation_strength, selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
     };
+
+    #[test]
+    fn selected_chroma_hf_stats_match_scalar() {
+        let mut opsin = Image3F::new(19, 17);
+        for c in 0..3 {
+            for y in 0..opsin.ysize() {
+                for x in 0..opsin.xsize() {
+                    let bits = (x * 37 + y * 53 + c * 97 + x * y * 3) % 257;
+                    opsin.plane_row_mut(c, y)[x] = (bits as f32 - 128.0) / 211.0;
+                }
+            }
+        }
+
+        let selected = selected_chroma_hf_stats_fn();
+        for &py in &[0usize, 3, 9, 16] {
+            for &px in &[0usize, 2, 7, 14, 18] {
+                let max_w = (opsin.xsize() - px).min(8);
+                let max_h = (opsin.ysize() - py).min(8);
+                for h in 1..=max_h {
+                    for w in 1..=max_w {
+                        let want = chroma_hf_stats_scalar(&opsin, px, py, w, h);
+                        let got = selected(&opsin, px, py, w, h);
+                        assert_eq!(got.edges, want.edges);
+                        for (label, got, want) in [
+                            ("magnitude", got.chroma_sum, want.chroma_sum),
+                            ("chroma gradient", got.chroma_grad, want.chroma_grad),
+                            ("luma gradient", got.luma_grad, want.luma_grad),
+                        ] {
+                            let tolerance = 2e-5 * want.abs().max(1.0);
+                            assert!(
+                                (got - want).abs() <= tolerance,
+                                "{label} mismatch at ({px},{py}) {w}x{h}: {got} vs {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_chroma_hf_stats_preserve_integer_field() {
+        let mut opsin = Image3F::new(19, 17);
+        for c in 0..3 {
+            for y in 0..opsin.ysize() {
+                for x in 0..opsin.xsize() {
+                    let t = (x * 17 + y * 43 + c * 71 + x * y * 5) as f32;
+                    opsin.plane_row_mut(c, y)[x] = (t * 0.031).sin() * 0.45;
+                }
+            }
+        }
+        let mut scalar = ImageB::new(3, 3);
+        for y in 0..scalar.ysize() {
+            for x in 0..scalar.xsize() {
+                scalar.row_mut(y)[x] = 72 + (x + 3 * y) as u8 * 11;
+            }
+        }
+        let mut selected = scalar.clone();
+        apply_chroma_hf_protection_with_stats(
+            &opsin,
+            &mut scalar,
+            0,
+            0,
+            1.0,
+            chroma_hf_stats_scalar,
+        );
+        apply_chroma_hf_protection_with_stats(
+            &opsin,
+            &mut selected,
+            0,
+            0,
+            1.0,
+            selected_chroma_hf_stats_fn(),
+        );
+        for y in 0..scalar.ysize() {
+            assert_eq!(selected.row(y), scalar.row(y), "field mismatch on row {y}");
+        }
+    }
+
+    #[test]
+    fn chroma_hf_protection_targets_hue_edges_and_releases_by_d2() {
+        let mut chroma_edge = Image3F::new(8, 8);
+        for y in 0..8 {
+            chroma_edge.plane_row_mut(1, y).fill(0.5);
+            for x in 0..8 {
+                chroma_edge.plane_row_mut(0, y)[x] = if x < 4 { -0.20 } else { 0.20 };
+                chroma_edge.plane_row_mut(2, y)[x] = if x < 4 { 0.30 } else { 0.70 };
+            }
+        }
+        let mut field = ImageB::new(1, 1);
+        field.row_mut(0)[0] = 100;
+        apply_chroma_hf_protection(&chroma_edge, &mut field, 0, 0, 1.0);
+        assert!(field.row(0)[0] > 100);
+
+        let mut coarse = ImageB::new(1, 1);
+        coarse.row_mut(0)[0] = 100;
+        apply_chroma_hf_protection(&chroma_edge, &mut coarse, 0, 0, 2.0);
+        assert_eq!(coarse.row(0)[0], 100);
+
+        let mut neutral_edge = Image3F::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let luma = if x < 4 { 0.2 } else { 0.8 };
+                neutral_edge.plane_row_mut(1, y)[x] = luma;
+                neutral_edge.plane_row_mut(2, y)[x] = luma;
+            }
+        }
+        let mut neutral_field = ImageB::new(1, 1);
+        neutral_field.row_mut(0)[0] = 100;
+        apply_chroma_hf_protection(&neutral_edge, &mut neutral_field, 0, 0, 1.0);
+        assert_eq!(neutral_field.row(0)[0], 100);
+    }
 
     #[test]
     fn aq_dampen_holds_then_fades_to_a_flat_field() {

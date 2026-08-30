@@ -36,6 +36,16 @@ use crate::{
     structure_aq, xyb,
 };
 
+#[inline]
+fn channel_weights_for_bias(bias: f32) -> [f32; 3] {
+    let matrix_mix = ((bias - xyb::B_BIAS) / (0.85 - xyb::B_BIAS)).clamp(0.0, 1.0);
+    [
+        0.30 + (0.10 - 0.30) * matrix_mix,
+        1.0,
+        0.28 + (0.83 - 0.28) * matrix_mix,
+    ]
+}
+
 /// Per-encode dispatch table.  The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
@@ -53,7 +63,7 @@ pub(crate) struct EncodingContext {
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
-    b_fine: std::sync::atomic::AtomicBool,
+    b_qm_scale: std::sync::atomic::AtomicU32,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -135,22 +145,32 @@ impl EncodingContext {
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn set_b_fine(&self, fine: bool) {
-        self.b_fine
-            .store(fine, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn raise_b_qm_scale(&self, scale: u32) {
+        self.b_qm_scale
+            .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn b_qm_scale(&self) -> u32 {
-        if self.b_fine.load(std::sync::atomic::Ordering::Relaxed) {
-            5
-        } else {
-            2
-        }
+        self.b_qm_scale.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[inline]
     pub(crate) fn b_qm_mul(&self) -> f32 {
         1.25f32.powf(self.b_qm_scale() as f32 - 2.0)
+    }
+
+    /// Distortion weights fitted at the two validated opsin endpoints and
+    /// interpolated for the signalled B row. Keeping the spec weights while
+    /// using the blue-biased row under-prices the channel whose energy that
+    /// row deliberately increases.
+    #[inline]
+    pub(crate) fn channel_weights(&self) -> [f32; 3] {
+        channel_weights_for_bias(self.xyb.fwd[8])
+    }
+
+    #[inline]
+    pub(crate) fn channel_weight(&self, channel: usize) -> f32 {
+        self.channel_weights()[channel]
     }
 
     pub(crate) fn new(
@@ -174,7 +194,7 @@ impl EncodingContext {
             plain_hq_matrices: DequantMatrices::new(0.0),
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
-            b_fine: std::sync::atomic::AtomicBool::new(false),
+            b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
@@ -183,6 +203,7 @@ impl EncodingContext {
                 gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
                 gradient_peak_energy: inflated_cost::select_error_gradient_peak_energy_fn(),
                 combine: inflated_cost::select_combine_error_fn(),
+                rgb_hue_chroma_edge_loss: inflated_cost::select_rgb_hue_chroma_edge_loss_fn(),
             },
             rate_log2_lut: inflated_cost::rate_log2_lut(),
             quantize_block_ac: group::selected_quantize_block_ac_fn(),
@@ -236,5 +257,26 @@ impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
         Self::new(Speed::Fast, None, xyb::XybMatrix::SPEC, 1.0, 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_weights_for_bias;
+
+    #[test]
+    fn channel_weights_follow_the_opsin_b_row() {
+        assert_eq!(
+            channel_weights_for_bias(crate::xyb::B_BIAS),
+            [0.30, 1.0, 0.28]
+        );
+        let strong = channel_weights_for_bias(0.85);
+        assert!((strong[0] - 0.10).abs() < 1e-6);
+        assert_eq!(strong[1], 1.0);
+        assert!((strong[2] - 0.83).abs() < 1e-6);
+
+        let mid = channel_weights_for_bias((crate::xyb::B_BIAS + 0.85) * 0.5);
+        assert!((mid[0] - 0.20).abs() < 1e-6);
+        assert!((mid[2] - 0.555).abs() < 1e-6);
     }
 }
