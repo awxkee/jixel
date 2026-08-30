@@ -66,10 +66,11 @@ const REL_COST_RATIO: f32 = 0.90;
 /// d≈0.25, recreating the boundary step this replaced).
 const MIN_SPEC_COST: f32 = 0.0005;
 
-/// Mean linear-luma horizontal gradient over strong yellow samples must
-/// exceed this. Thin, high-frequency yellow structure is what the AC
-/// deadzone + CfL residual-death annihilate (per-pixel proxy quantization
-/// cannot see this, which is why proxy cost alone never separated).
+/// Mean immediate horizontal/vertical linear-luma gradient over strong
+/// yellow samples must exceed this. Thin, high-frequency yellow structure is
+/// what the AC deadzone + CfL residual-death annihilate (per-pixel proxy
+/// quantization cannot see this, which is why proxy cost alone never
+/// separated).
 const YELLOW_EDGE_MIN: f32 = 0.24;
 
 /// Tier-1 used to switch the matrix and b_qm_scale=5 off together at 1.25.
@@ -81,10 +82,28 @@ const MAX_DISTANCE: f32 = 1.55;
 
 /// Tier-2 (smooth yellow, below the edge gate): the mild bias fires when
 /// yellow is a *subject*, not an accent — at least this fraction of sampled
-/// pixels must be strong yellow-risk. No cheaper statistic predicts where
-/// the visible tail damage lands (proxy tail, edges, chroma, brightness all
-/// tested uncorrelated
+/// pixels must be strong yellow-risk. The edge statistic below then scales
+/// the strength so a smooth yellow subject does not pay the same rate as
+/// fine yellow structure.
 const TIER2_AREA_MIN: f32 = 0.10;
+
+/// Smooth yellow fields do not need the same matrix displacement as fine
+/// yellow structure. Start the tier-2 bias only once neighboring luma starts
+/// to vary, and reach the normal tier-2 target at the edge level that
+/// separates the visibly desaturating photo cases in the yellow corpus.
+const TIER2_EDGE_START: f32 = 0.010;
+const TIER2_EDGE_FULL: f32 = 0.038;
+
+/// Tier-2 targets are separate from the tier-1 proxy candidates. Moderate
+/// yellow texture uses the lower target; only dense, highly textured yellow
+/// approaches the old 0.70 target.
+const TIER2_BIAS: f32 = 0.65;
+const TIER2_PATHOLOGICAL_BIAS: f32 = 0.70;
+const TIER2_PATHOLOGICAL_EDGE_START: f32 = 0.055;
+const TIER2_PATHOLOGICAL_EDGE_FULL: f32 = 0.080;
+const TIER2_PATHOLOGICAL_RISK_START: f32 = 0.10;
+const TIER2_PATHOLOGICAL_RISK_FULL: f32 = 0.22;
+const TIER2_BIAS_GRID_SCALE: f32 = 40.0;
 
 /// Tier-2 distance cap: measured chroma rescue at d=1..2; beyond 2.5
 /// untested. (No explicit low-d cutoff: at high quality the bias is cheap
@@ -342,8 +361,10 @@ fn evaluate_bias(samples: &[SamplePixel], m: &XybMatrix, steps: [f32; 3]) -> Bia
     }
 }
 
-/// Sampled pixels plus the mean linear-luma horizontal gradient over the
-/// strong yellow samples (the `YELLOW_EDGE_MIN` gate statistic).
+/// Sampled pixels plus the mean immediate horizontal/vertical linear-luma
+/// gradient over the strong yellow samples (the `YELLOW_EDGE_MIN` gate
+/// statistic). Both directions avoid making the selector orientation
+/// dependent.
 fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
     let (w, h) = (linear.xsize(), linear.ysize());
     let rp = linear.plane_data(0);
@@ -359,9 +380,15 @@ fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
             let i = row + x;
             let rgb = [rp[i], gp[i], bp[i]];
             let risk = yellow_pixel_risk(rgb[0], rgb[1], rgb[2]);
-            if risk > STRONG_SCORE && x + 1 < w {
-                edge_sum += (luma(i + 1) - luma(i)).abs();
-                edge_n += 1;
+            if risk > STRONG_SCORE {
+                if x + 1 < w {
+                    edge_sum += (luma(i + 1) - luma(i)).abs();
+                    edge_n += 1;
+                }
+                if y + 1 < h {
+                    edge_sum += (luma(i + w) - luma(i)).abs();
+                    edge_n += 1;
+                }
             }
             samples.push(SamplePixel { rgb, risk });
         }
@@ -376,7 +403,7 @@ fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
 
 /// Tier-2: smooth-yellow content (below the edge gate). Fires the mild bias
 /// on yellow-subject images (see `TIER2_AREA_MIN`).
-fn choose_tier2_bias(samples: &[SamplePixel], distance: f32) -> f32 {
+fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -> f32 {
     if samples.is_empty() {
         return SPEC_BIAS;
     }
@@ -393,11 +420,34 @@ fn choose_tier2_bias(samples: &[SamplePixel], distance: f32) -> f32 {
     }
     let strong = samples.iter().filter(|s| s.risk > STRONG_SCORE).count();
     let strong_frac = strong as f32 / samples.len() as f32;
-    if strong_frac >= TIER2_AREA_MIN {
-        SPEC_BIAS + (BIAS_MID - SPEC_BIAS) * strength
-    } else {
-        SPEC_BIAS
+    if strong_frac < TIER2_AREA_MIN {
+        return SPEC_BIAS;
     }
+
+    let edge_strength = ramp(yellow_edge, TIER2_EDGE_START, TIER2_EDGE_FULL);
+    if edge_strength <= 0.0 {
+        return SPEC_BIAS;
+    }
+    let mean_risk = samples.iter().map(|sample| sample.risk).sum::<f32>() / samples.len() as f32;
+    let pathological_strength = ramp(
+        yellow_edge,
+        TIER2_PATHOLOGICAL_EDGE_START,
+        TIER2_PATHOLOGICAL_EDGE_FULL,
+    ) * ramp(
+        mean_risk,
+        TIER2_PATHOLOGICAL_RISK_START,
+        TIER2_PATHOLOGICAL_RISK_FULL,
+    );
+    let target_bias = SPEC_BIAS
+        + (TIER2_BIAS - SPEC_BIAS) * edge_strength
+        + (TIER2_PATHOLOGICAL_BIAS - TIER2_BIAS) * pathological_strength;
+    // A tiny bias change can cross many B-residual quantization thresholds at
+    // once. Snap the content target to the measured 0.025 grid so images near
+    // a selector boundary get one of the validated operating points; the
+    // distance strength below remains continuous and prevents RD steps.
+    let target_bias =
+        ((target_bias * TIER2_BIAS_GRID_SCALE).round() / TIER2_BIAS_GRID_SCALE).max(SPEC_BIAS);
+    SPEC_BIAS + (target_bias - SPEC_BIAS) * strength
 }
 
 /// Pick the B bias for this image at this distance. Returns the spec value
@@ -416,7 +466,7 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
     // perceptual trade: rate for visible chroma survival that SS2 barely
     // credits — validated per-pixel on assets/yellow).
     if yellow_edge < YELLOW_EDGE_MIN {
-        return (choose_tier2_bias(&samples, distance), false);
+        return (choose_tier2_bias(&samples, yellow_edge, distance), false);
     }
     // Tier-1 (thin-HF yellow, strong bias) has its own, tighter cap.
     if distance >= MAX_DISTANCE {
@@ -647,10 +697,26 @@ mod tests {
     fn fine_b_is_reserved_for_the_high_frequency_tier() {
         let smooth = filled(64, 64, [0.9, 0.85, 0.05]);
         let smooth_selection = select_yellow(&smooth, 1.0);
-        assert!(smooth_selection.matrix.is_some());
+        assert!(smooth_selection.matrix.is_none());
         assert_eq!(smooth_selection.b_qm_scale, 2);
 
-        let mut edged = smooth;
+        let mut tier2 = filled(64, 64, [0.9, 0.85, 0.05]);
+        for y in (0..64).step_by(SAMPLE_STRIDE) {
+            for x in (0..64).step_by(SAMPLE_STRIDE) {
+                if x + 1 < 64 {
+                    for c in 0..3 {
+                        tier2.plane_row_mut(c, y)[x + 1] = 0.6;
+                    }
+                }
+            }
+        }
+        assert!(collect_samples(&tier2).1 >= TIER2_EDGE_FULL);
+        assert!(collect_samples(&tier2).1 < YELLOW_EDGE_MIN);
+        let tier2_selection = select_yellow(&tier2, 1.0);
+        assert!(tier2_selection.matrix.is_some());
+        assert_eq!(tier2_selection.b_qm_scale, 2);
+
+        let mut edged = filled(64, 64, [0.9, 0.85, 0.05]);
         for y in (0..64).step_by(SAMPLE_STRIDE) {
             for x in (0..64).step_by(SAMPLE_STRIDE) {
                 if x + 1 < 64 {
