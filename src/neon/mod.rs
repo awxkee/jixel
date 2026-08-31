@@ -30,6 +30,7 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+mod color;
 mod dark_aq;
 mod dct;
 mod entropy;
@@ -52,6 +53,7 @@ pub(crate) use cfl::{
     apply_cfl_neon, cfl_closed_loop_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon,
     cfl_regression_neon,
 };
+pub(crate) use color::color_matrix_shaper_neon;
 pub(crate) use dark_aq::{dark_structure_stats_neon, fill_blue_tile_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,

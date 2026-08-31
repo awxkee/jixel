@@ -29,6 +29,7 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod color;
 mod dark_aq;
 mod dct;
 mod entropy;
@@ -45,6 +46,7 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
+pub(crate) use color::color_matrix_shaper_sse41;
 pub(crate) use dark_aq::{dark_structure_stats_sse41, fill_blue_tile_sse41};
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use inflated_cost::{

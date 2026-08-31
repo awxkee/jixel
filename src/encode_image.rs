@@ -28,7 +28,9 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::color::{lut_high_bit, srgb_lut, srgb_to_linear_f32};
+use crate::color::{
+    ColorTransform, FloatTransferDecoder, RgbBlockTransform, TransferDecoder, TransferLut,
+};
 use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
 use crate::encoding_context::EncodingContext;
@@ -438,7 +440,7 @@ impl Default for EncodeConfigImpl {
 
 impl EncodeConfigImpl {
     /// Convenience builder with the given butteraugli distance and otherwise
-    /// default settings (sRGB primaries, linear transfer).
+    /// default settings (sRGB primaries and transfer).
     pub(crate) fn with_distance(distance: f32) -> Self {
         Self {
             distance,
@@ -783,47 +785,38 @@ fn for_each_linear_band<F>(
     }
 }
 
-fn linearize_rgb<T, F, const CHANNELS: usize>(
+fn linearize_rgb<T, X, const CHANNELS: usize>(
     input: &[T],
     width: usize,
     height: usize,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
-    convert: F,
+    transform: &X,
 ) -> Image3F
 where
     T: Copy + Sync,
-    F: Fn(T) -> f32 + Sync,
+    X: RgbBlockTransform<T>,
 {
     debug_assert!(CHANNELS >= 3);
     let mut linear = Image3F::new(width, height);
     for_each_linear_band(&mut linear, ctx, scratch, |pixel_start, [r, g, b]| {
         let src = &input[pixel_start * CHANNELS..][..r.len() * CHANNELS];
-        for (((r, g), b), px) in r
-            .iter_mut()
-            .zip(g.iter_mut())
-            .zip(b.iter_mut())
-            .zip(src.as_chunks::<CHANNELS>().0.iter())
-        {
-            *r = convert(px[0]);
-            *g = convert(px[1]);
-            *b = convert(px[2]);
-        }
+        transform.transform_block(src.as_chunks::<CHANNELS>().0, [r, g, b]);
     });
     linear
 }
 
-fn linearize_gray<T, F>(
+fn linearize_gray<T, D>(
     input: &[T],
     width: usize,
     height: usize,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
-    convert: F,
+    decoder: &D,
 ) -> Image3F
 where
     T: Copy + Sync,
-    F: Fn(T) -> f32 + Sync,
+    D: TransferDecoder<T>,
 {
     let mut linear = Image3F::new(width, height);
     for_each_linear_band(&mut linear, ctx, scratch, |pixel_start, [r, g, b]| {
@@ -834,7 +827,7 @@ where
             .zip(b.iter_mut())
             .zip(src.iter())
         {
-            let linear = convert(v);
+            let linear = decoder.decode(v);
             *r = linear;
             *g = linear;
             *b = linear;
@@ -843,10 +836,8 @@ where
     linear
 }
 
-/// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
-/// using the default color encoding (sRGB primaries, linear transfer).
-///
-/// Shorthand for [`encode_with_config`] with default settings.
+/// Encode interleaved 8-bit RGB samples. Lossy encoding interprets the samples
+/// using `config.color_encoding`; the default is sRGB.
 pub fn encode_image(
     input: &[u8],
     width: usize,
@@ -893,12 +884,14 @@ pub fn encode_image(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let lut = srgb_lut();
+    let transform = ColorTransform::for_integer(
+        8,
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
-    let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
-        lut[v as usize]
-    });
+    let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
     let mut ctx = ctx;
     apply_yellow_opsin(&mut ctx, &linear, distance);
     let cfg = EncodeConfigImpl::with_distance(distance)
@@ -914,10 +907,8 @@ pub fn encode_image(
     encode_with_context(&linear, &cfg, &ctx, &mut scratch)
 }
 
-/// Encode a linear-light RGB `Image3F` at the given butteraugli distance,
-/// using the default color encoding (sRGB primaries, linear transfer).
-///
-/// Shorthand for [`encode_with_config`] with default settings.
+/// Encode interleaved 8-bit RGBA samples. Lossy RGB samples use
+/// `config.color_encoding`; alpha is linear opacity.
 pub fn encode_image_with_alpha(
     input: &[u8],
     width: usize,
@@ -965,12 +956,14 @@ pub fn encode_image_with_alpha(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let lut = srgb_lut();
+    let transform = ColorTransform::for_integer(
+        8,
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
-    let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
-        lut[v as usize]
-    });
+    let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
     let mut ctx = ctx;
     apply_yellow_opsin(&mut ctx, &linear, distance);
     let alpha_plane = input.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
@@ -1164,12 +1157,10 @@ fn encode_gray_impl(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let srgb_lut = srgb_lut();
+    let decoder = TransferLut::new(8, config.color_encoding.transfer);
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
-    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| {
-        srgb_lut[v as usize]
-    });
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
     let mut cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
         .with_grayscale(true)
@@ -1402,10 +1393,10 @@ fn encode_gray_high_depth_impl(
     }
 
     let distance = config.distance.max(MIN_DISTANCE);
-    let lut = &lut_high_bit(bps.bits() as u8).table;
+    let decoder = TransferLut::new(bps.bits(), config.color_encoding.transfer);
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
-    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, |v| lut[v as usize]);
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
 
     let alpha_plane = alpha.map(|a| match bps {
         BitsPerSample::Ten => AlphaPlane::from_u16_10bit(a),
@@ -1476,7 +1467,11 @@ fn encode_high_depth_rgba(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let lut = &lut_high_bit(bps.bits() as u8).table;
+    let transform = ColorTransform::for_integer(
+        bps.bits(),
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
 
@@ -1488,9 +1483,7 @@ fn encode_high_depth_rgba(
     };
 
     if has_alpha {
-        let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, |v| {
-            lut[v as usize]
-        });
+        let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
@@ -1521,9 +1514,7 @@ fn encode_high_depth_rgba(
             .with_num_threads(config.num_threads);
         encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     } else {
-        let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, |v| {
-            lut[v as usize]
-        });
+        let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
@@ -1542,7 +1533,8 @@ fn encode_high_depth_rgba(
 }
 
 /// Shared float (f16/f32) RGB(A) **lossy** encode path. `input` is interleaved
-/// f32 samples (sRGB-encoded, normalized to [0, 1]), 3 or 4 per pixel. Alpha,
+/// f32 samples (encoded per `config.color_encoding`, normalized to [0, 1]), 3
+/// or 4 per pixel. Alpha,
 /// if present, is linear opacity quantized to a 16-bit integer extra channel
 /// (alpha rarely needs float precision, and this reuses the 16-bit alpha path).
 /// Lossless float is not supported here; `config.lossless` is ignored.
@@ -1650,10 +1642,13 @@ fn encode_float_rgba(
     // Float input skips the red-dominance classifier (integer-domain sampling).
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
+    let transform = ColorTransform::for_float(
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
 
     if has_alpha {
-        let linear =
-            linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
@@ -1676,8 +1671,7 @@ fn encode_float_rgba(
             .with_num_threads(config.num_threads);
         encode_with_context(&linear, &cfg, &ctx, &mut scratch)
     } else {
-        let linear =
-            linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+        let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
@@ -1696,7 +1690,7 @@ fn encode_float_rgba(
 }
 
 /// Float (f16/f32) grayscale **lossy** encode path. `luma` is `width * height`
-/// f32 samples (sRGB-encoded, [0, 1]).
+/// f32 samples (encoded per `config.color_encoding`, [0, 1]).
 fn encode_float_gray(
     luma: &[f32],
     width: usize,
@@ -1714,7 +1708,8 @@ fn encode_float_gray(
     let distance = config.distance.max(MIN_DISTANCE);
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
-    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, srgb_to_linear_f32);
+    let decoder = FloatTransferDecoder::new(config.color_encoding.transfer);
+    let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
     let cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
         .with_grayscale(true)
@@ -1731,7 +1726,7 @@ fn encode_float_gray(
 }
 
 /// Encode a 32-bit float RGB image (lossy). `input` is interleaved `[R, G, B]`,
-/// `width * height * 3` samples, each sRGB-encoded in [0, 1].
+/// `width * height * 3` samples encoded per `config.color_encoding` in [0, 1].
 pub fn encode_image_f32(
     input: &[f32],
     width: usize,
@@ -1753,7 +1748,7 @@ pub fn encode_image_f16(
 }
 
 /// Encode a 32-bit float RGBA image (lossy). `input` is interleaved
-/// `[R, G, B, A]`; RGB sRGB-encoded in [0, 1], A linear opacity in [0, 1]
+/// `[R, G, B, A]`; RGB uses `config.color_encoding` in [0, 1], A is linear opacity in [0, 1]
 /// (quantized to a 16-bit alpha channel).
 pub fn encode_image_with_alpha_f32(
     input: &[f32],
@@ -1775,7 +1770,7 @@ pub fn encode_image_with_alpha_f16(
 }
 
 /// Encode a 32-bit float grayscale image (lossy). `input` is `width * height`
-/// luma samples, sRGB-encoded in [0, 1].
+/// luma samples encoded per `config.color_encoding` in [0, 1].
 pub fn encode_image_gray_f32(
     input: &[f32],
     width: usize,
