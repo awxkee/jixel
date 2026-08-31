@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::adaptive_quant::dirty_log2f;
+use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -59,6 +59,60 @@ pub(crate) type CflRdoBlockFn = fn(
 );
 
 pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
+pub(crate) type CflClosedLoopCostFn = fn(&[f32], &[f32], f32, &[f32; 63]) -> [f32; 2];
+
+#[allow(dead_code)]
+pub(crate) fn cfl_closed_loop_cost_scalar(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    thresholds: &[f32; 63],
+) -> [f32; 2] {
+    let mut distortion = 0.0f32;
+    let mut coeff_bits = 0.0f32;
+    let mut coeff = 1usize;
+    for (&mv, &sv) in m.iter().zip(s) {
+        let residual = sv - factor * mv;
+        let level = if residual.abs() >= thresholds[coeff - 1] {
+            residual.round()
+        } else {
+            0.0
+        };
+        let reconstructed = crate::group::dequantized_level_f32(level);
+        let quant_error = residual - reconstructed;
+        distortion += quant_error.abs() + 0.15 * residual.abs();
+        if level != 0.0 {
+            coeff_bits += 1.0 + dirty_log2p1f(level.abs());
+        }
+        coeff += 1;
+        if coeff == 64 {
+            coeff = 1;
+        }
+    }
+    [distortion, coeff_bits]
+}
+
+pub(crate) fn selected_cfl_closed_loop_cost_fn() -> CflClosedLoopCostFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |m, s, factor, thresholds| unsafe {
+            crate::neon::cfl_closed_loop_cost_neon(m, s, factor, thresholds)
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |m, s, factor, thresholds| unsafe {
+            crate::avx::cfl_closed_loop_cost_avx2(m, s, factor, thresholds)
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::cfl_closed_loop_cost_wasm;
+    #[cfg(not(any(
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+        all(target_arch = "aarch64", feature = "neon")
+    )))]
+    cfl_closed_loop_cost_scalar
+}
 
 #[allow(dead_code)]
 pub(crate) fn cfl_rdo_stats_scalar(m: &[f32], s: &[f32]) -> [f32; 4] {
@@ -403,6 +457,7 @@ fn cmap_residual_bits(res: i32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
+    closed_loop_cost_fn: CflClosedLoopCostFn,
     m: &[f32],
     s: &[f32],
     channel: usize,
@@ -467,46 +522,29 @@ fn optimize_channel_rdo(
 
     let lambda = CFL_RDO.lambda_bits * tile_q;
     let mag_cost = CFL_RDO.mag_cost * tile_q * dz_penalty;
-    let thresholds =
+    let quadrant_thresholds =
         crate::group::quantize_ac_thresholds_scaled(channel, 1, 1, distance, qm_multiplier);
+    let thresholds: [f32; 63] = std::array::from_fn(|i| {
+        let coeff = i + 1;
+        quadrant_thresholds[usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4)]
+    });
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
         let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
-        let mut distortion = 0.0f32;
-        let mut coeff_bits = 0.0f32;
-        if closed_loop {
-            // Coefficients are staged as consecutive 63-AC blocks. Advance
-            // that phase explicitly: `% 63` was otherwise paid for every
-            // coefficient of every RDO candidate.
-            let mut coeff = 1usize;
-            for (&mv, &sv) in m.iter().zip(s) {
-                let residual = sv - factor * mv;
-                let quadrant = usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4);
-                let level = if residual.abs() >= thresholds[quadrant] {
-                    residual.round()
-                } else {
-                    0.0
-                };
-                let reconstructed = crate::group::dequantized_level_f32(level);
-                let quant_error = residual - reconstructed;
-                // Closed-loop error is the primary term. A small residual-energy
-                // term and coefficient-rate proxy retain CfL's compression goal
-                // instead of choosing an expensive phase-aligned residual.
-                distortion += quant_error.abs() + 0.15 * residual.abs();
-                if level != 0.0 {
-                    coeff_bits += 1.0 + dirty_log2f(1.0 + level.abs());
-                }
-                coeff += 1;
-                if coeff == 64 {
-                    coeff = 1;
-                }
-            }
+        let (distortion, coeff_bits) = if closed_loop {
+            // Closed-loop error is the primary term. A small residual-energy
+            // term and coefficient-rate proxy retain CfL's compression goal
+            // instead of choosing an expensive phase-aligned residual.
+            let [distortion, coeff_bits] = closed_loop_cost_fn(m, s, factor, &thresholds);
+            (distortion, coeff_bits)
         } else {
+            let mut distortion = 0.0f32;
             for (&mv, &sv) in m.iter().zip(s) {
                 let residual = sv - factor * mv;
                 distortion += residual.abs();
             }
-        }
+            (distortion, 0.0)
+        };
         let cost = distortion
             + 0.15 * lambda * coeff_bits
             + lambda * cmap_residual_bits(cand - pred)
@@ -654,6 +692,7 @@ fn compute_cmap_tile_rdo(
 
     let ytox = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
+        ctx.cfl_closed_loop_cost,
         &rdo.m_x[..rdo.len],
         &rdo.s_x[..rdo.len],
         0,
@@ -668,6 +707,7 @@ fn compute_cmap_tile_rdo(
     );
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
+        ctx.cfl_closed_loop_cost,
         &rdo.m_b[..rdo.len],
         &rdo.s_b[..rdo.len],
         2,
@@ -1246,6 +1286,37 @@ mod tests {
     }
 
     #[test]
+    fn selected_closed_loop_cost_matches_scalar() {
+        let cost_fn = selected_cfl_closed_loop_cost_fn();
+        let quadrant_thresholds = [0.42, 0.57, 0.73, 0.91];
+        let thresholds: [f32; 63] = std::array::from_fn(|i| {
+            let coeff = i + 1;
+            quadrant_thresholds[usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4)]
+        });
+        for len in [0, 1, 3, 4, 7, 8, 15, 62, 63, 64, 127, CFL_RDO_TILE_AC] {
+            let m: Vec<f32> = (0..len)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.07125)
+                .collect();
+            let s: Vec<f32> = (0..len)
+                .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.05375)
+                .collect();
+            for factor in [-1.25, -0.1875, 0.0, 0.3125, 1.75] {
+                let expected = cfl_closed_loop_cost_scalar(&m, &s, factor, &thresholds);
+                let actual = cost_fn(&m, &s, factor, &thresholds);
+                for i in 0..2 {
+                    let tolerance = 2e-5 * expected[i].abs().max(1.0);
+                    assert!(
+                        (actual[i] - expected[i]).abs() <= tolerance,
+                        "cost {i} at len {len}, factor {factor}: SIMD={}, scalar={}, tolerance={tolerance}",
+                        actual[i],
+                        expected[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deadzone_schedule_ramps_from_full_to_zero() {
         // Full amount at/below LO, zero at/above HI, linear in between, and off
         // (byte-identical) at low quality.
@@ -1363,6 +1434,7 @@ mod tests {
         assert_eq!(
             optimize_channel_rdo(
                 cfl_rdo_stats_scalar,
+                cfl_closed_loop_cost_scalar,
                 &[],
                 &[],
                 0,
@@ -1380,6 +1452,7 @@ mod tests {
         assert_eq!(
             optimize_channel_rdo(
                 cfl_rdo_stats_scalar,
+                cfl_closed_loop_cost_scalar,
                 &[],
                 &[],
                 0,

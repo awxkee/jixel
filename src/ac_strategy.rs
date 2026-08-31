@@ -2831,7 +2831,7 @@ mod tests {
 
     #[test]
     fn pair_gradient_weights_are_banded() {
-        assert!(RERANK_PAIR_GRADIENT_ALPHA > 0.0);
+        const { assert!(RERANK_PAIR_GRADIENT_ALPHA > 0.0) };
         assert!((0.0..1.0).contains(&RERANK_PAIR_GRADIENT_MIN_DOMINANCE));
         assert_eq!(rerank_pair_gradient_scale(0.35), 0.0);
         assert_eq!(
@@ -2858,7 +2858,7 @@ mod tests {
             0.5 * (RERANK_PAIR_GRADIENT_FADE_OUT_START + RERANK_PAIR_GRADIENT_FADE_OUT_END);
         assert!((rerank_pair_gradient_scale(fade_out_mid) - 0.5).abs() < 1e-6);
 
-        assert!(RERANK_PAIR_GRADIENT_PEAK_ALPHA > 0.0);
+        const { assert!(RERANK_PAIR_GRADIENT_PEAK_ALPHA > 0.0) };
         assert_eq!(
             rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START),
             0.0

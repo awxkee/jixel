@@ -30,6 +30,79 @@
 use std::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
+pub(crate) fn cfl_closed_loop_cost_neon(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    thresholds: &[f32; 63],
+) -> [f32; 2] {
+    let len = m.len().min(s.len());
+    let scalar_factor = factor;
+    let factor = vdupq_n_f32(factor);
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let weight = vdupq_n_f32(0.15);
+    let mut distortion = 0.0f32;
+    let mut coeff_bits = 0.0f32;
+    let mut dist_acc = zero;
+    let mut bits_acc = zero;
+    let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
+
+    for (chunk_index, (m, s)) in m_chunks.iter().zip(s_chunks).enumerate() {
+        let mv = unsafe { vld1q_f32(m.as_ptr()) };
+        let sv = unsafe { vld1q_f32(s.as_ptr()) };
+        let residual = vsubq_f32(sv, vmulq_f32(factor, mv));
+        let abs_residual = vabsq_f32(residual);
+        let phase = (chunk_index * 4) % 63;
+        let threshold = if phase + 4 <= 63 {
+            unsafe { vld1q_f32(thresholds.as_ptr().add(phase)) }
+        } else {
+            let wrapped = [
+                thresholds[phase],
+                thresholds[(phase + 1) % 63],
+                thresholds[(phase + 2) % 63],
+                thresholds[(phase + 3) % 63],
+            ];
+            unsafe { vld1q_f32(wrapped.as_ptr()) }
+        };
+        let active = vcgeq_f32(abs_residual, threshold);
+        let level = vbslq_f32(active, vrndaq_f32(residual), zero);
+        let reconstructed = super::ac_strategy::neon_dequantized_level_f32(level);
+        let quant_error = vabsq_f32(vsubq_f32(residual, reconstructed));
+        let dist = vaddq_f32(quant_error, vmulq_f32(weight, abs_residual));
+        let abs_level = vabsq_f32(level);
+        let nonzero = vcgtq_f32(abs_level, zero);
+        let bits = vbslq_f32(
+            nonzero,
+            vaddq_f32(one, super::ac_strategy::neon_log2p1_f32(abs_level)),
+            zero,
+        );
+        dist_acc = vaddq_f32(dist_acc, dist);
+        bits_acc = vaddq_f32(bits_acc, bits);
+    }
+
+    distortion += vaddvq_f32(dist_acc);
+    coeff_bits += vaddvq_f32(bits_acc);
+
+    let tail_start = m_chunks.len() * 4;
+    for (offset, (&mv, &sv)) in m_tail.iter().zip(s_tail).enumerate() {
+        let residual = sv - scalar_factor * mv;
+        let level = if residual.abs() >= thresholds[(tail_start + offset) % 63] {
+            residual.round()
+        } else {
+            0.0
+        };
+        let quant_error = residual - crate::group::dequantized_level_f32(level);
+        distortion += quant_error.abs() + 0.15 * residual.abs();
+        if level != 0.0 {
+            coeff_bits += 1.0 + crate::adaptive_quant::dirty_log2p1f(level.abs());
+        }
+    }
+    [distortion, coeff_bits]
+}
+
+#[target_feature(enable = "neon")]
 pub(crate) fn cfl_regression_neon(
     y: &[f32; 64],
     x: &[f32; 64],

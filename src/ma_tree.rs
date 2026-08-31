@@ -777,9 +777,9 @@ mod tests {
         let mut samples = MaSamples::new();
         for i in 0..4096 {
             let mut props = [0i32; NUM_MA_PROPS];
-            props[0] = (i % 4) as i32;
-            props[4] = (i % 97) as i32;
-            props[7] = ((i * 13) % 211) as i32 - 105;
+            props[0] = i % 4;
+            props[4] = i % 97;
+            props[7] = (i * 13) % 211 - 105;
             let mut tok = [0u8; NUM_MA_PREDS];
             let mut nbits = [0u8; NUM_MA_PREDS];
             for pred in 0..NUM_MA_PREDS {

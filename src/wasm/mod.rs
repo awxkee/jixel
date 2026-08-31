@@ -47,7 +47,10 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
-pub(crate) use cfl::{apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm, cfl_regression_wasm};
+pub(crate) use cfl::{
+    apply_cfl_wasm, cfl_closed_loop_cost_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm,
+    cfl_regression_wasm,
+};
 pub(crate) use dark_aq::{dark_structure_stats_wasm, fill_blue_tile_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;

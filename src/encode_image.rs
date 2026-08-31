@@ -2933,7 +2933,9 @@ mod encode_smoke_tests {
             })
             .collect();
         let rgba: Vec<u8> = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255 - pixel[0]])
             .collect();
         let one = lossless().with_speed(Speed::Slow).with_num_threads(1);

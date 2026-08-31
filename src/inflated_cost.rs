@@ -662,6 +662,7 @@ fn recon_dist_and_rate_default(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,

@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::dark_aq::{BLUE_FULL, BLUE_OFFSET, Y_TO_LUMA8};
+use crate::dark_aq::{BLUE_OFFSET, INV_BLUE_FULL, Y_TO_LUMA8};
 use crate::image::Image3F;
 use crate::sse::adaptive_quant::hsum;
 #[cfg(target_arch = "x86")]
@@ -52,7 +52,7 @@ pub(crate) fn fill_blue_tile_sse41(
     let zero = _mm_setzero_ps();
     let one = _mm_set1_ps(1.0);
     let offset = _mm_set1_ps(BLUE_OFFSET);
-    let inv_full = _mm_set1_ps(1.0 / BLUE_FULL);
+    let inv_full = _mm_set1_ps(INV_BLUE_FULL);
     let scale = _mm_set1_ps(Y_TO_LUMA8);
     let sign = _mm_set1_ps(-0.0);
     let mut sum0 = zero;
@@ -79,7 +79,7 @@ pub(crate) fn fill_blue_tile_sse41(
             unsafe { _mm_storeu_ps($dst.as_mut_ptr().add(x), _mm_mul_ps(by, scale)) };
         }};
     }
-    for (r, dst) in tile.chunks_exact_mut(64).take(h).enumerate() {
+    for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
         let xr = opsin.plane_row(0, y0 + r);
         let yr = opsin.plane_row(1, y0 + r);
         let br = opsin.plane_row(2, y0 + r);
@@ -104,7 +104,7 @@ pub(crate) fn fill_blue_tile_sse41(
         let br = &br[x0 + tail..x0 + w];
         for (((d, &x), &y), &b) in dst[tail..w].iter_mut().zip(xr).zip(yr).zip(br) {
             let by = b - y;
-            scalar_sum += ((by - x.abs() - BLUE_OFFSET).max(0.0) / BLUE_FULL).min(1.0);
+            scalar_sum += ((by - x.abs() - BLUE_OFFSET).max(0.0) * INV_BLUE_FULL).min(1.0);
             *d = by * Y_TO_LUMA8;
         }
     }

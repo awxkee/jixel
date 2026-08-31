@@ -1475,7 +1475,7 @@ mod neon_dct_tests {
         cases.push(alternating);
 
         for seed in 0..32 {
-            cases.push(fill(0x1d_c7_0000 + seed));
+            cases.push(fill(0x1dc7_0000 + seed));
         }
 
         for (case, input) in cases.iter().enumerate() {

@@ -1,11 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
 use std::num::NonZero;
 // use image::imageops::FilterType;
-use image::imageops::FilterType;
-use image::metadata::CicpColorPrimaries;
-use jixel::{ColorEncoding, DecodingSpeed, EncodeConfig, JpegTranscodeConfig, Speed};
+use jixel::{ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
 use std::path::Path;
 use std::thread::available_parallelism;
 use std::time::Instant;
@@ -18,9 +15,9 @@ fn main() {
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    for i in 0..2 {
+    for _ in 0..2 {
         let instant = Instant::now();
-        let d_bytes = jixel::encode_image(
+        let _d_bytes = jixel::encode_image(
             &rgb_img,
             image.width() as usize,
             image.height() as usize,
@@ -59,7 +56,7 @@ fn main() {
             .with_color_encoding(ColorEncoding::srgb()),
     )
     .unwrap();
-    std::fs::write(&output, &bytes).expect("failed to write output");
+    std::fs::write(output, &bytes).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;
     // let img10 = vec![0u8; width * height * 3];

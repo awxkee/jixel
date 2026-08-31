@@ -31,7 +31,7 @@ use core::arch::wasm32::*;
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn reduce_f32x4(v: v128) -> f32 {
+pub(crate) fn reduce_f32x4(v: v128) -> f32 {
     let pair = f32x4_add(v, i32x4_shuffle::<2, 3, 0, 1>(v, v));
     f32x4_extract_lane::<0>(f32x4_add(pair, i32x4_shuffle::<1, 0, 3, 2>(pair, pair)))
 }

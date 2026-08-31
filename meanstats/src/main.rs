@@ -704,7 +704,9 @@ fn decode_avif(avif: &Path, tmp: &Path, w: usize, h: usize, avifdec: &str) -> Re
 fn score(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
     let to_rgb = |b: &[u8]| -> Result<Rgb> {
         let data: Vec<[f32; 3]> = b
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 [
                     c[0] as f32 / 255.0,

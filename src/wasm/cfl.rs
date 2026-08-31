@@ -2,6 +2,104 @@ use core::arch::wasm32::*;
 
 #[inline]
 #[target_feature(enable = "simd128")]
+fn round_ties_away_x4(v: v128) -> v128 {
+    let half = f32x4_splat(0.5);
+    let positive = f32x4_ge(v, f32x4_splat(0.0));
+    let qp = f32x4_floor(f32x4_add(v, half));
+    let qn = f32x4_ceil(f32x4_sub(v, half));
+    v128_bitselect(qp, qn, positive)
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dequantized_level_x4(q: v128) -> v128 {
+    let absq = f32x4_abs(q);
+    let big = f32x4_sub(
+        q,
+        f32x4_div(f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let sign = v128_and(q, i32x4_splat(i32::MIN));
+    let one = v128_or(sign, f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_1));
+    let dq = v128_bitselect(big, one, f32x4_ge(absq, f32x4_splat(1.125)));
+    v128_and(dq, f32x4_gt(absq, f32x4_splat(0.0)))
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn cfl_closed_loop_cost_wasm(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    thresholds: &[f32; 63],
+) -> [f32; 2] {
+    let len = m.len().min(s.len());
+    let scalar_factor = factor;
+    let factor = f32x4_splat(factor);
+    let zero = f32x4_splat(0.0);
+    let one = f32x4_splat(1.0);
+    let mut distortion = 0.0f32;
+    let mut coeff_bits = 0.0f32;
+    let mut dist_acc = zero;
+    let mut bits_acc = zero;
+    let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
+
+    for (chunk_index, (m, s)) in m_chunks.iter().zip(s_chunks).enumerate() {
+        let mv = unsafe { v128_load(m.as_ptr().cast()) };
+        let sv = unsafe { v128_load(s.as_ptr().cast()) };
+        let residual = f32x4_sub(sv, f32x4_mul(factor, mv));
+        let abs_residual = f32x4_abs(residual);
+        let phase = (chunk_index * 4) % 63;
+        let threshold = if phase + 4 <= 63 {
+            unsafe { v128_load(thresholds.as_ptr().add(phase).cast()) }
+        } else {
+            let wrapped = [
+                thresholds[phase],
+                thresholds[(phase + 1) % 63],
+                thresholds[(phase + 2) % 63],
+                thresholds[(phase + 3) % 63],
+            ];
+            unsafe { v128_load(wrapped.as_ptr().cast()) }
+        };
+        let level = v128_bitselect(
+            round_ties_away_x4(residual),
+            zero,
+            f32x4_ge(abs_residual, threshold),
+        );
+        let reconstructed = dequantized_level_x4(level);
+        let quant_error = f32x4_abs(f32x4_sub(residual, reconstructed));
+        let dist = f32x4_add(quant_error, f32x4_mul(f32x4_splat(0.15), abs_residual));
+        let abs_level = f32x4_abs(level);
+        let bits = v128_bitselect(
+            f32x4_add(one, super::ac_strategy::wasm_log2p1_f32(abs_level)),
+            zero,
+            f32x4_gt(abs_level, zero),
+        );
+        dist_acc = f32x4_add(dist_acc, dist);
+        bits_acc = f32x4_add(bits_acc, bits);
+    }
+
+    distortion += super::frame::reduce_f32x4(dist_acc);
+    coeff_bits += super::frame::reduce_f32x4(bits_acc);
+
+    let tail_start = m_chunks.len() * 4;
+    for (offset, (&mv, &sv)) in m_tail.iter().zip(s_tail).enumerate() {
+        let residual = sv - scalar_factor * mv;
+        let level = if residual.abs() >= thresholds[(tail_start + offset) % 63] {
+            residual.round()
+        } else {
+            0.0
+        };
+        let quant_error = residual - crate::group::dequantized_level_f32(level);
+        distortion += quant_error.abs() + 0.15 * residual.abs();
+        if level != 0.0 {
+            coeff_bits += 1.0 + crate::adaptive_quant::dirty_log2p1f(level.abs());
+        }
+    }
+    [distortion, coeff_bits]
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
 fn load(values: &[f32; 4]) -> v128 {
     unsafe { v128_load(values.as_ptr().cast()) }
 }
@@ -234,8 +332,8 @@ mod tests {
             let mut want_b = b.clone();
             let factors: [f32; 3] = [0.3125, 0.0, -0.1875];
             for i in 0..size {
-                want_x[i] = -factors[0] * y[i] + want_x[i];
-                want_b[i] = -factors[2] * y[i] + want_b[i];
+                want_x[i] += -factors[0] * y[i];
+                want_b[i] += -factors[2] * y[i];
             }
             super::apply_cfl_wasm(&mut x, &y, &mut b, factors);
             assert_eq!(x, want_x, "X mismatch at size {size}");

@@ -902,6 +902,7 @@ mod tests {
         histogram
     }
 
+    #[allow(dead_code)]
     fn assert_simd_counts_bit_cost_matches_scalar(
         mut simd_cost: impl FnMut(&[u32; ALPHABET_SIZE], u32) -> f32,
     ) {
@@ -973,7 +974,9 @@ mod tests {
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
     #[test]
     fn wasm_counts_bit_cost_matches_scalar() {
-        assert_simd_counts_bit_cost_matches_scalar(crate::wasm::counts_bit_cost_wasm);
+        assert_simd_counts_bit_cost_matches_scalar(|counts, total| {
+            crate::wasm::counts_bit_cost_wasm(counts, total)
+        });
     }
 
     fn exact_model_cost(histograms: &[Histogram], huffman_pool: &mut Vec<HuffmanNode>) -> f32 {

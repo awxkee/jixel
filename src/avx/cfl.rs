@@ -31,6 +31,124 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx2")]
+fn round_ties_away_x8(v: __m256) -> __m256 {
+    let sign = _mm256_set1_ps(-0.0);
+    let abs = _mm256_andnot_ps(sign, v);
+    let rounded_abs = _mm256_floor_ps(_mm256_add_ps(abs, _mm256_set1_ps(0.5)));
+    _mm256_or_ps(_mm256_and_ps(sign, v), rounded_abs)
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dequantized_level_x8(q: __m256) -> __m256 {
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let absq = _mm256_andnot_ps(sign_mask, q);
+    let big = _mm256_sub_ps(
+        q,
+        _mm256_div_ps(_mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
+    );
+    let one = _mm256_or_ps(
+        _mm256_and_ps(sign_mask, q),
+        _mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1),
+    );
+    let use_big = _mm256_cmp_ps::<_CMP_GE_OQ>(absq, _mm256_set1_ps(1.125));
+    let dq = _mm256_blendv_ps(one, big, use_big);
+    let nonzero = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, _mm256_setzero_ps());
+    _mm256_and_ps(dq, nonzero)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn closed_loop_cost_x8(
+    mv: __m256,
+    sv: __m256,
+    factor: __m256,
+    threshold: __m256,
+) -> (__m256, __m256) {
+    let zero = _mm256_setzero_ps();
+    let one = _mm256_set1_ps(1.0);
+    let sign = _mm256_set1_ps(-0.0);
+    let residual = _mm256_sub_ps(sv, _mm256_mul_ps(factor, mv));
+    let abs_residual = _mm256_andnot_ps(sign, residual);
+    let active = _mm256_cmp_ps::<_CMP_GE_OQ>(abs_residual, threshold);
+    let level = _mm256_and_ps(active, round_ties_away_x8(residual));
+    let reconstructed = dequantized_level_x8(level);
+    let quant_error = _mm256_andnot_ps(sign, _mm256_sub_ps(residual, reconstructed));
+    let dist = _mm256_add_ps(
+        quant_error,
+        _mm256_mul_ps(_mm256_set1_ps(0.15), abs_residual),
+    );
+    let abs_level = _mm256_andnot_ps(sign, level);
+    let nonzero = _mm256_cmp_ps::<_CMP_GT_OQ>(abs_level, zero);
+    let bits = _mm256_and_ps(
+        nonzero,
+        _mm256_add_ps(one, super::ac_strategy::avx2_log2p1_f32(abs_level)),
+    );
+    (dist, bits)
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn cfl_closed_loop_cost_avx2(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    thresholds: &[f32; 63],
+) -> [f32; 2] {
+    let len = m.len().min(s.len());
+    let factor = _mm256_set1_ps(factor);
+    let mut distortion = 0.0f32;
+    let mut coeff_bits = 0.0f32;
+    let mut dist_acc = _mm256_setzero_ps();
+    let mut bits_acc = _mm256_setzero_ps();
+    let (m_chunks, m_tail) = m[..len].as_chunks::<8>();
+    let (s_chunks, s_tail) = s[..len].as_chunks::<8>();
+
+    for (chunk_index, (m, s)) in m_chunks.iter().zip(s_chunks).enumerate() {
+        let mv = unsafe { _mm256_loadu_ps(m.as_ptr()) };
+        let sv = unsafe { _mm256_loadu_ps(s.as_ptr()) };
+        let phase = (chunk_index * 8) % 63;
+        let threshold = if phase + 8 <= 63 {
+            unsafe { _mm256_loadu_ps(thresholds.as_ptr().add(phase)) }
+        } else {
+            let wrapped = [
+                thresholds[phase],
+                thresholds[(phase + 1) % 63],
+                thresholds[(phase + 2) % 63],
+                thresholds[(phase + 3) % 63],
+                thresholds[(phase + 4) % 63],
+                thresholds[(phase + 5) % 63],
+                thresholds[(phase + 6) % 63],
+                thresholds[(phase + 7) % 63],
+            ];
+            unsafe { _mm256_loadu_ps(wrapped.as_ptr()) }
+        };
+        let (dist, bits) = closed_loop_cost_x8(mv, sv, factor, threshold);
+        dist_acc = _mm256_add_ps(dist_acc, dist);
+        bits_acc = _mm256_add_ps(bits_acc, bits);
+    }
+
+    if !m_tail.is_empty() {
+        let tail_len = m_tail.len() as i32;
+        let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(tail_len), lanes);
+        let mv = unsafe { _mm256_maskload_ps(m_tail.as_ptr(), mask) };
+        let sv = unsafe { _mm256_maskload_ps(s_tail.as_ptr(), mask) };
+        let tail_start = m_chunks.len() * 8;
+        let tail_thresholds: [f32; 8] =
+            std::array::from_fn(|lane| thresholds[(tail_start + lane) % 63]);
+        let threshold = unsafe { _mm256_loadu_ps(tail_thresholds.as_ptr()) };
+        let (dist, bits) = closed_loop_cost_x8(mv, sv, factor, threshold);
+        dist_acc = _mm256_add_ps(dist_acc, dist);
+        bits_acc = _mm256_add_ps(bits_acc, bits);
+    }
+
+    distortion += super::ac_strategy::hsum256(dist_acc);
+    coeff_bits += super::ac_strategy::hsum256(bits_acc);
+    [distortion, coeff_bits]
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
 fn reduce_transposed_4x8(a: __m256, b: __m256, c: __m256, d: __m256) -> [f32; 4] {
     // Transpose the accumulators so each four-lane group contains
     // [ca_x, cb_x, ca_b, cb_b] for one input lane.

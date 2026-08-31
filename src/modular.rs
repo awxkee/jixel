@@ -982,7 +982,7 @@ mod tests {
         write_global_alpha_modular(&alpha, 8, 8, &mut scratch, &mut w);
         let bits = w.bits_written();
         w.zero_pad_to_byte();
-        assert!(w.into_bytes().len() > 0);
+        assert!(!w.into_bytes().is_empty());
         assert!(bits > 0);
     }
 

@@ -36,6 +36,7 @@ pub(crate) type FillBlueTileFn = fn(&Image3F, &mut [f32], usize, usize, usize, u
 
 pub(crate) const BLUE_OFFSET: f32 = 0.003_199_477;
 pub(crate) const BLUE_FULL: f32 = 0.010_474_085;
+pub(crate) const INV_BLUE_FULL: f32 = 1.0 / BLUE_FULL;
 pub(crate) const Y_TO_LUMA8: f32 = 300.0;
 
 #[allow(dead_code)]
@@ -52,14 +53,14 @@ pub(crate) fn fill_blue_tile_scalar(
         return 0.0;
     }
     let mut blue_sum = 0.0f32;
-    for (r, dst) in tile.chunks_exact_mut(64).take(h).enumerate() {
+    for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
         let xr = &opsin.plane_row(0, y0 + r)[x0..x0 + w];
         let yr = &opsin.plane_row(1, y0 + r)[x0..x0 + w];
         let br = &opsin.plane_row(2, y0 + r)[x0..x0 + w];
         for (((d, &x), &y), &b) in dst[..w].iter_mut().zip(xr).zip(yr).zip(br) {
             let by = b - y;
             let excess = (by - x.abs() - BLUE_OFFSET).max(0.0);
-            blue_sum += (excess / BLUE_FULL).min(1.0);
+            blue_sum += (excess * INV_BLUE_FULL).min(1.0);
             *d = by * Y_TO_LUMA8;
         }
     }
