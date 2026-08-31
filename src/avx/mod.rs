@@ -49,7 +49,7 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{apply_cfl_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2};
-pub(crate) use dark_aq::dark_structure_stats_avx2;
+pub(crate) use dark_aq::{dark_structure_stats_avx2, fill_blue_tile_avx2};
 pub(crate) use dct::{
     dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
     dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct4x4_avx2, dct4x8_avx2, dct8x4_avx2,

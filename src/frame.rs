@@ -2455,8 +2455,10 @@ fn setup_dc_group(
             dc_group_x0,
             dc_group_y0,
             distp.distance,
+            ctx.b_heavy(),
             ctx.apply_quant_field_gain,
             ctx.dark_structure_stats,
+            ctx.fill_blue_tile,
         );
     }
 

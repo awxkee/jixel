@@ -49,7 +49,7 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{apply_cfl_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon, cfl_regression_neon};
-pub(crate) use dark_aq::dark_structure_stats_neon;
+pub(crate) use dark_aq::{dark_structure_stats_neon, fill_blue_tile_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
     dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct4x4_neon, dct4x8_neon, dct8x4_neon,

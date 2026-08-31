@@ -27,7 +27,100 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::avx::ac_strategy::hsum256;
+use crate::dark_aq::{BLUE_FULL, BLUE_OFFSET, Y_TO_LUMA8};
+use crate::image::Image3F;
 use std::arch::x86_64::*;
+
+/// # Safety
+/// The caller must ensure AVX2 is available.
+#[target_feature(enable = "avx2")]
+pub(crate) fn fill_blue_tile_avx2(
+    opsin: &Image3F,
+    tile: &mut [f32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    assert!(w <= 64 && tile.len() >= 64 * h);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let zero = _mm256_setzero_ps();
+    let one = _mm256_set1_ps(1.0);
+    let offset = _mm256_set1_ps(BLUE_OFFSET);
+    let inv_full = _mm256_set1_ps(1.0 / BLUE_FULL);
+    let scale = _mm256_set1_ps(Y_TO_LUMA8);
+    let sign = _mm256_set1_ps(-0.0);
+    let mut sum0 = zero;
+    let mut sum1 = zero;
+    let mut sum2 = zero;
+    let mut sum3 = zero;
+    let groups = w / 32;
+    let vector_tail = groups * 32;
+    let full_tail = w % 32 / 8;
+    let tail = vector_tail + full_tail * 8;
+    let remainder = w - tail;
+    macro_rules! accumulate_blue_x8 {
+        ($sum:ident, $x:expr, $xr:ident, $yr:ident, $br:ident, $dst:ident) => {{
+            let x = $x;
+            let px = x0 + x;
+            let xv = unsafe { _mm256_loadu_ps($xr.as_ptr().add(px)) };
+            let yv = unsafe { _mm256_loadu_ps($yr.as_ptr().add(px)) };
+            let bv = unsafe { _mm256_loadu_ps($br.as_ptr().add(px)) };
+            let by = _mm256_sub_ps(bv, yv);
+            let abs_x = _mm256_andnot_ps(sign, xv);
+            let excess = _mm256_sub_ps(by, _mm256_add_ps(abs_x, offset));
+            let risk = _mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(excess, inv_full), zero), one);
+            $sum = _mm256_add_ps($sum, risk);
+            unsafe { _mm256_storeu_ps($dst.as_mut_ptr().add(x), _mm256_mul_ps(by, scale)) };
+        }};
+    }
+    for (r, dst) in tile.chunks_exact_mut(64).take(h).enumerate() {
+        let xr = opsin.plane_row(0, y0 + r);
+        let yr = opsin.plane_row(1, y0 + r);
+        let br = opsin.plane_row(2, y0 + r);
+        for group in 0..groups {
+            let x = group * 32;
+            accumulate_blue_x8!(sum0, x, xr, yr, br, dst);
+            accumulate_blue_x8!(sum1, x + 8, xr, yr, br, dst);
+            accumulate_blue_x8!(sum2, x + 16, xr, yr, br, dst);
+            accumulate_blue_x8!(sum3, x + 24, xr, yr, br, dst);
+        }
+        if full_tail > 0 {
+            accumulate_blue_x8!(sum0, vector_tail, xr, yr, br, dst);
+        }
+        if full_tail > 1 {
+            accumulate_blue_x8!(sum1, vector_tail + 8, xr, yr, br, dst);
+        }
+        if full_tail > 2 {
+            accumulate_blue_x8!(sum2, vector_tail + 16, xr, yr, br, dst);
+        }
+        if remainder != 0 {
+            let px = x0 + tail;
+            let mask = first_lanes_mask(remainder);
+            let xv = unsafe { _mm256_maskload_ps(xr.as_ptr().add(px), mask) };
+            let yv = unsafe { _mm256_maskload_ps(yr.as_ptr().add(px), mask) };
+            let bv = unsafe { _mm256_maskload_ps(br.as_ptr().add(px), mask) };
+            let by = _mm256_sub_ps(bv, yv);
+            let abs_x = _mm256_andnot_ps(sign, xv);
+            let excess = _mm256_sub_ps(by, _mm256_add_ps(abs_x, offset));
+            let risk = _mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(excess, inv_full), zero), one);
+            match full_tail {
+                0 => sum0 = _mm256_add_ps(sum0, risk),
+                1 => sum1 = _mm256_add_ps(sum1, risk),
+                2 => sum2 = _mm256_add_ps(sum2, risk),
+                3 => sum3 = _mm256_add_ps(sum3, risk),
+                _ => unreachable!(),
+            }
+            unsafe {
+                _mm256_maskstore_ps(dst.as_mut_ptr().add(tail), mask, _mm256_mul_ps(by, scale))
+            };
+        }
+    }
+    let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+    hsum256(sum) / (w * h) as f32
+}
 
 #[inline]
 #[target_feature(enable = "avx2")]

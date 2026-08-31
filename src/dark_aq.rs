@@ -32,6 +32,39 @@ use crate::image::{Image3F, ImageB};
 
 pub(crate) type ApplyQuantFieldGainFn = fn(&mut ImageB, usize, usize, usize, usize, f32);
 pub(crate) type DarkStructureStatsFn = fn(&[[f32; 64]], usize, usize) -> (f32, f32);
+pub(crate) type FillBlueTileFn = fn(&Image3F, &mut [f32], usize, usize, usize, usize) -> f32;
+
+pub(crate) const BLUE_OFFSET: f32 = 0.003_199_477;
+pub(crate) const BLUE_FULL: f32 = 0.010_474_085;
+pub(crate) const Y_TO_LUMA8: f32 = 300.0;
+
+#[allow(dead_code)]
+pub(crate) fn fill_blue_tile_scalar(
+    opsin: &Image3F,
+    tile: &mut [f32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    assert!(w <= 64 && tile.len() >= 64 * h);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let mut blue_sum = 0.0f32;
+    for (r, dst) in tile.chunks_exact_mut(64).take(h).enumerate() {
+        let xr = &opsin.plane_row(0, y0 + r)[x0..x0 + w];
+        let yr = &opsin.plane_row(1, y0 + r)[x0..x0 + w];
+        let br = &opsin.plane_row(2, y0 + r)[x0..x0 + w];
+        for (((d, &x), &y), &b) in dst[..w].iter_mut().zip(xr).zip(yr).zip(br) {
+            let by = b - y;
+            let excess = (by - x.abs() - BLUE_OFFSET).max(0.0);
+            blue_sum += (excess / BLUE_FULL).min(1.0);
+            *d = by * Y_TO_LUMA8;
+        }
+    }
+    blue_sum / (w * h) as f32
+}
 
 #[allow(dead_code)]
 pub(crate) fn apply_quant_field_gain_scalar(
@@ -58,6 +91,38 @@ pub(crate) fn select_apply_quant_field_gain_fn() -> ApplyQuantFieldGainFn {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
 pub(crate) fn select_dark_structure_stats_fn() -> DarkStructureStatsFn {
     crate::wasm::dark_structure_stats_wasm
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+pub(crate) fn select_fill_blue_tile_fn() -> FillBlueTileFn {
+    crate::wasm::fill_blue_tile_wasm
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "neon"))]
+pub(crate) fn select_fill_blue_tile_fn() -> FillBlueTileFn {
+    |opsin, tile, x0, y0, w, h| unsafe {
+        crate::neon::fill_blue_tile_neon(opsin, tile, x0, y0, w, h)
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
+    all(target_arch = "aarch64", feature = "neon")
+)))]
+pub(crate) fn select_fill_blue_tile_fn() -> FillBlueTileFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |opsin, tile, x0, y0, w, h| unsafe {
+            crate::avx::fill_blue_tile_avx2(opsin, tile, x0, y0, w, h)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        return |opsin, tile, x0, y0, w, h| unsafe {
+            crate::sse::fill_blue_tile_sse41(opsin, tile, x0, y0, w, h)
+        };
+    }
+    fill_blue_tile_scalar
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -387,7 +452,20 @@ pub struct DarkAqConfig {
     pub vb_edge_t: f32,
 }
 
-const Y_TO_LUMA8: f32 = 300.0;
+/// Blue-axis structure contribution to Dark AQ. Dark AQ's
+/// luminance-only Laplacian misses detail whose contrast lives mostly in B-Y;
+/// this lets the existing darkness gate see that structure without changing
+/// the behavior of smooth blue fields.
+fn blue_dark_aq_strength(distance: f32) -> f32 {
+    // The shared field stops being an efficient way to buy B-Y precision once
+    // the fine AQ has mostly faded: the d=1.5 point spends primarily on Y.
+    // Below d=0.4 the integer field is already fine enough that this either
+    // rounds away or perturbs transform choice without a chroma payoff.
+    if !(0.4..1.4).contains(&distance) {
+        return 0.0;
+    }
+    1.0
+}
 
 impl Default for DarkAqConfig {
     /// The validated defaults: Dark AQ on at all distances (scale 4), Variance Boost off.
@@ -534,8 +612,10 @@ pub(crate) fn apply_boost(
     x0: usize,
     y0: usize,
     distance: f32,
+    blue_heavy: bool,
     apply_quant_field_gain: ApplyQuantFieldGainFn,
     dark_structure_stats: DarkStructureStatsFn,
+    fill_blue_tile: FillBlueTileFn,
 ) {
     let xblocks = raw_quant_field.xsize();
     let yblocks = raw_quant_field.ysize();
@@ -569,6 +649,11 @@ pub(crate) fn apply_boost(
     let mut ref_acc = 0f32;
     let mut ref_n = 0u32;
     let mut tile = [0f32; 64 * 64];
+    let blue_dark_strength = if blue_heavy {
+        blue_dark_aq_strength(distance)
+    } else {
+        0.0
+    };
 
     let fill_tile = |tile: &mut [f32], sb_x0: usize, sb_y0: usize| -> (usize, usize) {
         let w = img_w.saturating_sub(sb_x0).min(64);
@@ -659,7 +744,18 @@ pub(crate) fn apply_boost(
                 if w >= 3 && h >= 3 {
                     // Tile already in 8-bit-luma units (scale=1.0 here).
                     let rows = tile.as_chunks::<64>().0;
-                    let (mean, mid_energy) = dark_structure_stats(rows, h, w);
+                    let (mean, mut mid_energy) = dark_structure_stats(rows, h, w);
+                    if blue_dark_strength > 0.0 {
+                        let blue_area = fill_blue_tile(opsin, &mut tile, sb_x0, sb_y0, w, h);
+                        if blue_area > 0.0 {
+                            let rows = tile.as_chunks::<64>().0;
+                            let (_, blue_energy) = dark_structure_stats(rows, h, w);
+                            // Max rather than addition avoids charging the same
+                            // edge twice when it is already visible in Y.
+                            mid_energy =
+                                mid_energy.max(blue_energy * blue_area * blue_dark_strength);
+                        }
+                    }
                     delta -= dark_protection_from_stats(&cfg.dark, base_q, mean, mid_energy) as f32;
                 }
             }
@@ -686,6 +782,80 @@ pub(crate) fn apply_boost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blue_dark_aq_is_confined_to_the_rd_winning_band() {
+        for distance in [0.0, 0.399_999, 1.4, 2.0, 10.0] {
+            assert_eq!(blue_dark_aq_strength(distance), 0.0);
+        }
+        for distance in [0.4, 0.5, 1.0, 1.25, 1.399_999] {
+            assert_eq!(blue_dark_aq_strength(distance), 1.0);
+        }
+    }
+
+    fn check_fill_blue_tile(method: FillBlueTileFn) {
+        let mut opsin = Image3F::new(83, 79);
+        for y in 0..opsin.ysize() {
+            for x in 0..opsin.xsize() {
+                let t = (x * 37 + y * 53 + x * y * 3) as f32;
+                opsin.plane_row_mut(0, y)[x] = (t * 0.017).sin() * 0.08;
+                opsin.plane_row_mut(1, y)[x] = 0.03 + (t * 0.011).cos().abs() * 0.35;
+                opsin.plane_row_mut(2, y)[x] =
+                    opsin.plane_row(1, y)[x] + (t * 0.023).sin() * 0.12 + 0.025;
+            }
+        }
+        for &(x0, y0, w, h) in &[
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (3, 5, 3, 7),
+            (7, 9, 8, 8),
+            (11, 13, 15, 17),
+            (19, 7, 31, 63),
+            (18, 15, 64, 64),
+        ] {
+            let mut expected = [f32::NAN; 64 * 64];
+            let mut actual = expected;
+            let expected_area = fill_blue_tile_scalar(&opsin, &mut expected, x0, y0, w, h);
+            let actual_area = method(&opsin, &mut actual, x0, y0, w, h);
+            let tolerance = 2e-6 * expected_area.abs().max(1.0);
+            assert!(
+                (actual_area - expected_area).abs() <= tolerance,
+                "shape {w}x{h} at ({x0},{y0}): area {actual_area} vs {expected_area}"
+            );
+            for y in 0..h {
+                assert_eq!(
+                    &actual[y * 64..y * 64 + w],
+                    &expected[y * 64..y * 64 + w],
+                    "shape {w}x{h}, row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_fill_blue_tile_matches_scalar() {
+        check_fill_blue_tile(select_fill_blue_tile_fn());
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    #[test]
+    fn avx2_fill_blue_tile_matches_scalar() {
+        if is_x86_feature_detected!("avx2") {
+            check_fill_blue_tile(|opsin, tile, x0, y0, w, h| unsafe {
+                crate::avx::fill_blue_tile_avx2(opsin, tile, x0, y0, w, h)
+            });
+        }
+    }
+
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    #[test]
+    fn sse41_fill_blue_tile_matches_scalar() {
+        if is_x86_feature_detected!("sse4.1") {
+            check_fill_blue_tile(|opsin, tile, x0, y0, w, h| unsafe {
+                crate::sse::fill_blue_tile_sse41(opsin, tile, x0, y0, w, h)
+            });
+        }
+    }
 
     fn check_dark_structure_stats(method: DarkStructureStatsFn) {
         let mut tile = [[0.0f32; 64]; 64];
