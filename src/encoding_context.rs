@@ -87,7 +87,7 @@ pub(crate) struct EncodingContext {
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
     pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
-    pub(crate) x_gradient_sums: frame::XGradientSumsFn,
+    pub(crate) chroma_gradient_sums: frame::ChromaGradientSumsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
@@ -169,7 +169,11 @@ impl EncodingContext {
 
     #[inline]
     pub(crate) fn b_qm_mul(&self) -> f32 {
-        1.25f32.powf(self.b_qm_scale() as f32 - 2.0)
+        // The signaled scale is an integer in 2..=7. All powers below are
+        // exact binary fractions, so a lookup avoids a libm `powf` in the
+        // block-level RDO paths without changing the quantizer value.
+        static MULTIPLIERS: [f32; 6] = [1.0, 1.25, 1.5625, 1.953125, 2.441_406_2, 3.051_757_8];
+        MULTIPLIERS[(self.b_qm_scale().clamp(2, 7) - 2) as usize]
     }
 
     /// Distortion weights fitted at the two validated opsin endpoints and
@@ -235,7 +239,7 @@ impl EncodingContext {
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
             cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
-            x_gradient_sums: frame::selected_x_gradient_sums_fn(),
+            chroma_gradient_sums: frame::selected_chroma_gradient_sums_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),

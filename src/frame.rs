@@ -1241,10 +1241,10 @@ pub(crate) fn encode_frame(
     } else {
         0.0
     };
-    let x_grad_stat = if slow_chromatic {
-        x_gradient_stat(ctx, &xyb)
+    let [x_grad_stat, b_grad_stat] = if slow_chromatic {
+        chroma_gradient_stats(ctx, &xyb)
     } else {
-        0.0
+        [0.0; 2]
     };
     // Saturated-content tables are validated under Slow only: at Fast the
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
@@ -1254,11 +1254,6 @@ pub(crate) fn encode_frame(
     // from switching plain B weights, custom opsin and both chroma scales at
     // the same point. Ordinary photos measured far below this gate.
     ctx.set_x_heavy(slow_chromatic && x_grad_stat >= X_QM_GRAD_THRESHOLD);
-    let b_grad_stat = if slow_chromatic {
-        b_gradient_stat(&xyb)
-    } else {
-        0.0
-    };
     ctx.set_b_heavy(slow_chromatic && b_grad_stat >= B_GRAD_THRESHOLD);
     // `x_heavy` is first knowable after conversion to XYB. This used to be
     // queried by `apply_yellow_opsin` before it was computed, leaving the
@@ -1482,84 +1477,91 @@ fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
     if n == 0 { 0.0 } else { sum / n as f32 }
 }
 
-/// Share of high-frequency signal carried by the X (red-green) channel:
-/// mean |horizontal ∇X| over mean |horizontal ∇Y| on a 1-in-4 row subsample.
-/// Achromatic content reads ~0; ordinary photos stay well below saturated
-/// red/green-structured content, where X carries the detail that the
-/// distance-laddered `x_qm_scale` drop at d=0.3 would destroy.
-pub(crate) type XGradientSumsFn = fn(&[f32], &[f32], usize) -> [f32; 2];
+/// Horizontal opponent-gradient sums on a 1-in-4 row subsample. X and B−Y
+/// share one traversal and one set of Y loads. The result is
+/// `[sum_x, sum_y_for_x, sum_b_minus_y, sum_y_for_b]`; keeping the two Y
+/// reductions explicit makes both classifier ratios independently testable.
+/// Achromatic content reads ~0 in both opponent numerators.
+pub(crate) type ChromaGradientSumsFn = fn(&[f32], &[f32], &[f32], usize) -> [f32; 4];
 
 #[allow(dead_code)]
-pub(crate) fn x_gradient_sums_scalar(x_plane: &[f32], y_plane: &[f32], width: usize) -> [f32; 2] {
+pub(crate) fn chroma_gradient_sums_scalar(
+    x_plane: &[f32],
+    y_plane: &[f32],
+    b_plane: &[f32],
+    width: usize,
+) -> [f32; 4] {
     if width < 2 {
-        return [0.0; 2];
+        return [0.0; 4];
     }
 
     let mut sum_x = 0.0f32;
-    let mut sum_y = 0.0f32;
+    let mut sum_y_x = 0.0f32;
+    let mut sum_by = 0.0f32;
+    let mut sum_y_b = 0.0f32;
     let rows = x_plane
         .chunks_exact(width)
         .zip(y_plane.chunks_exact(width))
+        .zip(b_plane.chunks_exact(width))
         .step_by(4);
-    for (xr, yr) in rows {
-        for (x, l) in xr.array_windows::<2>().zip(yr.array_windows::<2>()) {
+    for ((xr, yr), br) in rows {
+        for ((x, l), b) in xr
+            .array_windows::<2>()
+            .zip(yr.array_windows::<2>())
+            .zip(br.array_windows::<2>())
+        {
+            let dy = (l[1] - l[0]).abs();
             sum_x += (x[1] - x[0]).abs();
-            sum_y += (l[1] - l[0]).abs();
+            sum_y_x += dy;
+            sum_by += ((b[1] - l[1]) - (b[0] - l[0])).abs();
+            sum_y_b += dy;
         }
     }
-    [sum_x, sum_y]
+    [sum_x, sum_y_x, sum_by, sum_y_b]
 }
 
-pub(crate) fn selected_x_gradient_sums_fn() -> XGradientSumsFn {
+pub(crate) fn selected_chroma_gradient_sums_fn() -> ChromaGradientSumsFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        |x, y, width| unsafe { crate::neon::x_gradient_sums_neon(x, y, width) }
+        |x, y, b, width| unsafe { crate::neon::chroma_gradient_sums_neon(x, y, b, width) }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::arch::is_x86_feature_detected!("avx2") {
-        return |x, y, width| unsafe { crate::avx::x_gradient_sums_avx2(x, y, width) };
+        return |x, y, b, width| unsafe { crate::avx::chroma_gradient_sums_avx2(x, y, b, width) };
     }
     #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::x_gradient_sums_wasm;
+    return crate::wasm::chroma_gradient_sums_wasm;
     #[cfg(not(any(
         all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
         all(target_arch = "aarch64", feature = "neon")
     )))]
-    x_gradient_sums_scalar
-}
-
-fn x_gradient_stat(ctx: &EncodingContext, xyb: &Image3F) -> f32 {
-    let [sum_x, sum_y] = (ctx.x_gradient_sums)(xyb.plane_data(0), xyb.plane_data(1), xyb.xsize());
-    if sum_y > f32::EPSILON {
-        sum_x / sum_y
-    } else {
-        0.0
-    }
+    chroma_gradient_sums_scalar
 }
 
 /// Share of high-frequency signal on the blue-yellow axis: mean |∇(B−Y)|
 /// over mean |∇Y| on a 1-in-4 row subsample. Content whose structure lives
 /// in the B channel (saturated blue detail) is nearly invisible to the
-/// luma-driven masking field, exactly like the X case `x_gradient_stat`
+/// luma-driven masking field, exactly like the X statistic
 /// covers on the red-green axis.
-fn b_gradient_stat(xyb: &Image3F) -> f32 {
-    let mut sum_by = 0.0f32;
-    let mut sum_y = 0.0f32;
-    let mut y = 0;
-    while y < xyb.ysize() {
-        let yr = xyb.plane_row(1, y);
-        let br = xyb.plane_row(2, y);
-        for (b, l) in br.array_windows::<2>().zip(yr.array_windows::<2>()) {
-            sum_by += ((b[1] - l[1]) - (b[0] - l[0])).abs();
-            sum_y += (l[1] - l[0]).abs();
-        }
-        y += 4;
-    }
-    if sum_y > f32::EPSILON {
-        sum_by / sum_y
-    } else {
-        0.0
-    }
+fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F) -> [f32; 2] {
+    let [sum_x, sum_y_x, sum_by, sum_y_b] = (ctx.chroma_gradient_sums)(
+        xyb.plane_data(0),
+        xyb.plane_data(1),
+        xyb.plane_data(2),
+        xyb.xsize(),
+    );
+    [
+        if sum_y_x > f32::EPSILON {
+            sum_x / sum_y_x
+        } else {
+            0.0
+        },
+        if sum_y_b > f32::EPSILON {
+            sum_by / sum_y_b
+        } else {
+            0.0
+        },
+    ]
 }
 
 fn snap_achromatic_xyb(xyb: &mut Image3F) {
@@ -2810,7 +2812,7 @@ mod tests {
             }
             b_row.fill(0.5);
         }
-        assert_eq!(super::x_gradient_stat(&ctx, &xyb), 0.0);
+        assert_eq!(super::chroma_gradient_stats(&ctx, &xyb)[0], 0.0);
 
         // X carrying half of Y's gradient amplitude → stat 0.5, over the gate.
         for y in 0..32 {
@@ -2819,14 +2821,14 @@ mod tests {
                 *v = y_row[x] * 0.5;
             }
         }
-        let stat = super::x_gradient_stat(&ctx, &xyb);
+        let stat = super::chroma_gradient_stats(&ctx, &xyb)[0];
         assert!((stat - 0.5).abs() < 1e-5, "{stat}");
         assert!(stat >= super::X_QM_GRAD_THRESHOLD);
     }
 
     #[test]
-    fn selected_x_gradient_sums_match_scalar() {
-        let selected = super::selected_x_gradient_sums_fn();
+    fn selected_chroma_gradient_sums_match_scalar() {
+        let selected = super::selected_chroma_gradient_sums_fn();
         for width in [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33] {
             for height in [0, 1, 4, 5, 9] {
                 let len = width * height;
@@ -2836,9 +2838,12 @@ mod tests {
                 let y: Vec<f32> = (0..len)
                     .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.0234375)
                     .collect();
-                let expected = super::x_gradient_sums_scalar(&x, &y, width);
-                let actual = selected(&x, &y, width);
-                for channel in 0..2 {
+                let b: Vec<f32> = (0..len)
+                    .map(|i| ((i * 71 % 89) as f32 - 44.0) * 0.01953125)
+                    .collect();
+                let expected = super::chroma_gradient_sums_scalar(&x, &y, &b, width);
+                let actual = selected(&x, &y, &b, width);
+                for channel in 0..4 {
                     let tolerance = 1e-5 * expected[channel].abs().max(1.0);
                     assert!(
                         (actual[channel] - expected[channel]).abs() <= tolerance,

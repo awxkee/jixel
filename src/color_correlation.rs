@@ -474,11 +474,14 @@ fn optimize_channel_rdo(
         let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
         let mut distortion = 0.0f32;
         let mut coeff_bits = 0.0f32;
-        for (i, (&mv, &sv)) in m.iter().zip(s).enumerate() {
-            let residual = sv - factor * mv;
-            if closed_loop {
-                let coeff = i % 63 + 1;
-                let quadrant = usize::from(coeff / 8 >= 4) * 2 + usize::from(coeff % 8 >= 4);
+        if closed_loop {
+            // Coefficients are staged as consecutive 63-AC blocks. Advance
+            // that phase explicitly: `% 63` was otherwise paid for every
+            // coefficient of every RDO candidate.
+            let mut coeff = 1usize;
+            for (&mv, &sv) in m.iter().zip(s) {
+                let residual = sv - factor * mv;
+                let quadrant = usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4);
                 let level = if residual.abs() >= thresholds[quadrant] {
                     residual.round()
                 } else {
@@ -493,7 +496,14 @@ fn optimize_channel_rdo(
                 if level != 0.0 {
                     coeff_bits += 1.0 + dirty_log2f(1.0 + level.abs());
                 }
-            } else {
+                coeff += 1;
+                if coeff == 64 {
+                    coeff = 1;
+                }
+            }
+        } else {
+            for (&mv, &sv) in m.iter().zip(s) {
+                let residual = sv - factor * mv;
                 distortion += residual.abs();
             }
         }

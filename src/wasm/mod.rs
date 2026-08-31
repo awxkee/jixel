@@ -51,7 +51,7 @@ pub(crate) use cfl::{apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm, cfl
 pub(crate) use dark_aq::{dark_structure_stats_wasm, fill_blue_tile_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
-pub(crate) use frame::x_gradient_sums_wasm;
+pub(crate) use frame::chroma_gradient_sums_wasm;
 pub(crate) use inflated_cost::{
     combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
     rgb_hue_chroma_edge_loss_wasm,

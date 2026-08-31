@@ -30,13 +30,20 @@ use crate::avx::ac_strategy::hsum256;
 use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx2")]
-pub(crate) fn x_gradient_sums_avx2(x_plane: &[f32], y_plane: &[f32], width: usize) -> [f32; 2] {
+pub(crate) fn chroma_gradient_sums_avx2(
+    x_plane: &[f32],
+    y_plane: &[f32],
+    b_plane: &[f32],
+    width: usize,
+) -> [f32; 4] {
     if width < 2 {
-        return [0.0; 2];
+        return [0.0; 4];
     }
 
     let mut sum_x = _mm256_setzero_ps();
-    let mut sum_y = _mm256_setzero_ps();
+    let mut sum_y_x = _mm256_setzero_ps();
+    let mut sum_by = _mm256_setzero_ps();
+    let mut sum_y_b = _mm256_setzero_ps();
     let sign = _mm256_set1_ps(-0.0);
     let diff_count = width - 1;
     let tail_len = diff_count % 8;
@@ -45,25 +52,41 @@ pub(crate) fn x_gradient_sums_avx2(x_plane: &[f32], y_plane: &[f32], width: usiz
     let rows = x_plane
         .chunks_exact(width)
         .zip(y_plane.chunks_exact(width))
+        .zip(b_plane.chunks_exact(width))
         .step_by(4);
 
-    for (x, y) in rows {
+    for ((x, y), b) in rows {
         let (x0_chunks, x0_tail) = x[..diff_count].as_chunks::<8>();
         let (x1_chunks, x1_tail) = x[1..].as_chunks::<8>();
         let (y0_chunks, y0_tail) = y[..diff_count].as_chunks::<8>();
         let (y1_chunks, y1_tail) = y[1..].as_chunks::<8>();
-        for (((x0, x1), y0), y1) in x0_chunks
+        let (b0_chunks, b0_tail) = b[..diff_count].as_chunks::<8>();
+        let (b1_chunks, b1_tail) = b[1..].as_chunks::<8>();
+        for (((((x0, x1), y0), y1), b0), b1) in x0_chunks
             .iter()
             .zip(x1_chunks)
             .zip(y0_chunks)
             .zip(y1_chunks)
+            .zip(b0_chunks)
+            .zip(b1_chunks)
         {
             let x0 = unsafe { _mm256_loadu_ps(x0.as_ptr()) };
             let x1 = unsafe { _mm256_loadu_ps(x1.as_ptr()) };
             let y0 = unsafe { _mm256_loadu_ps(y0.as_ptr()) };
             let y1 = unsafe { _mm256_loadu_ps(y1.as_ptr()) };
+            let b0 = unsafe { _mm256_loadu_ps(b0.as_ptr()) };
+            let b1 = unsafe { _mm256_loadu_ps(b1.as_ptr()) };
+            let dy = _mm256_andnot_ps(sign, _mm256_sub_ps(y1, y0));
             sum_x = _mm256_add_ps(sum_x, _mm256_andnot_ps(sign, _mm256_sub_ps(x1, x0)));
-            sum_y = _mm256_add_ps(sum_y, _mm256_andnot_ps(sign, _mm256_sub_ps(y1, y0)));
+            sum_y_x = _mm256_add_ps(sum_y_x, dy);
+            sum_by = _mm256_add_ps(
+                sum_by,
+                _mm256_andnot_ps(
+                    sign,
+                    _mm256_sub_ps(_mm256_sub_ps(b1, y1), _mm256_sub_ps(b0, y0)),
+                ),
+            );
+            sum_y_b = _mm256_add_ps(sum_y_b, dy);
         }
 
         if tail_len != 0 {
@@ -71,10 +94,26 @@ pub(crate) fn x_gradient_sums_avx2(x_plane: &[f32], y_plane: &[f32], width: usiz
             let x1 = unsafe { _mm256_maskload_ps(x1_tail.as_ptr(), tail_mask) };
             let y0 = unsafe { _mm256_maskload_ps(y0_tail.as_ptr(), tail_mask) };
             let y1 = unsafe { _mm256_maskload_ps(y1_tail.as_ptr(), tail_mask) };
+            let b0 = unsafe { _mm256_maskload_ps(b0_tail.as_ptr(), tail_mask) };
+            let b1 = unsafe { _mm256_maskload_ps(b1_tail.as_ptr(), tail_mask) };
+            let dy = _mm256_andnot_ps(sign, _mm256_sub_ps(y1, y0));
             sum_x = _mm256_add_ps(sum_x, _mm256_andnot_ps(sign, _mm256_sub_ps(x1, x0)));
-            sum_y = _mm256_add_ps(sum_y, _mm256_andnot_ps(sign, _mm256_sub_ps(y1, y0)));
+            sum_y_x = _mm256_add_ps(sum_y_x, dy);
+            sum_by = _mm256_add_ps(
+                sum_by,
+                _mm256_andnot_ps(
+                    sign,
+                    _mm256_sub_ps(_mm256_sub_ps(b1, y1), _mm256_sub_ps(b0, y0)),
+                ),
+            );
+            sum_y_b = _mm256_add_ps(sum_y_b, dy);
         }
     }
 
-    [hsum256(sum_x), hsum256(sum_y)]
+    [
+        hsum256(sum_x),
+        hsum256(sum_y_x),
+        hsum256(sum_by),
+        hsum256(sum_y_b),
+    ]
 }
