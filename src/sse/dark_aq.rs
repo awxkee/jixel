@@ -26,11 +26,91 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::dark_aq::{BLUE_OFFSET, INV_BLUE_FULL, Y_TO_LUMA8};
+use crate::image::Image3F;
 use crate::sse::adaptive_quant::hsum;
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+/// # Safety
+/// The caller must ensure SSE4.1 is available.
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn fill_blue_tile_sse41(
+    opsin: &Image3F,
+    tile: &mut [f32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    assert!(w <= 64 && tile.len() >= 64 * h);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let zero = _mm_setzero_ps();
+    let one = _mm_set1_ps(1.0);
+    let offset = _mm_set1_ps(BLUE_OFFSET);
+    let inv_full = _mm_set1_ps(INV_BLUE_FULL);
+    let scale = _mm_set1_ps(Y_TO_LUMA8);
+    let sign = _mm_set1_ps(-0.0);
+    let mut sum0 = zero;
+    let mut sum1 = zero;
+    let mut sum2 = zero;
+    let mut sum3 = zero;
+    let mut scalar_sum = 0.0f32;
+    let groups = w / 16;
+    let vector_tail = groups * 16;
+    let full_tail = w % 16 / 4;
+    let tail = vector_tail + full_tail * 4;
+    macro_rules! accumulate_blue_x4 {
+        ($sum:ident, $x:expr, $xr:ident, $yr:ident, $br:ident, $dst:ident) => {{
+            let x = $x;
+            let px = x0 + x;
+            let xv = unsafe { _mm_loadu_ps($xr.as_ptr().add(px)) };
+            let yv = unsafe { _mm_loadu_ps($yr.as_ptr().add(px)) };
+            let bv = unsafe { _mm_loadu_ps($br.as_ptr().add(px)) };
+            let by = _mm_sub_ps(bv, yv);
+            let abs_x = _mm_andnot_ps(sign, xv);
+            let excess = _mm_sub_ps(by, _mm_add_ps(abs_x, offset));
+            let risk = _mm_min_ps(_mm_max_ps(_mm_mul_ps(excess, inv_full), zero), one);
+            $sum = _mm_add_ps($sum, risk);
+            unsafe { _mm_storeu_ps($dst.as_mut_ptr().add(x), _mm_mul_ps(by, scale)) };
+        }};
+    }
+    for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
+        let xr = opsin.plane_row(0, y0 + r);
+        let yr = opsin.plane_row(1, y0 + r);
+        let br = opsin.plane_row(2, y0 + r);
+        for group in 0..groups {
+            let x = group * 16;
+            accumulate_blue_x4!(sum0, x, xr, yr, br, dst);
+            accumulate_blue_x4!(sum1, x + 4, xr, yr, br, dst);
+            accumulate_blue_x4!(sum2, x + 8, xr, yr, br, dst);
+            accumulate_blue_x4!(sum3, x + 12, xr, yr, br, dst);
+        }
+        if full_tail > 0 {
+            accumulate_blue_x4!(sum0, vector_tail, xr, yr, br, dst);
+        }
+        if full_tail > 1 {
+            accumulate_blue_x4!(sum1, vector_tail + 4, xr, yr, br, dst);
+        }
+        if full_tail > 2 {
+            accumulate_blue_x4!(sum2, vector_tail + 8, xr, yr, br, dst);
+        }
+        let xr = &xr[x0 + tail..x0 + w];
+        let yr = &yr[x0 + tail..x0 + w];
+        let br = &br[x0 + tail..x0 + w];
+        for (((d, &x), &y), &b) in dst[tail..w].iter_mut().zip(xr).zip(yr).zip(br) {
+            let by = b - y;
+            scalar_sum += ((by - x.abs() - BLUE_OFFSET).max(0.0) * INV_BLUE_FULL).min(1.0);
+            *d = by * Y_TO_LUMA8;
+        }
+    }
+    let sum = _mm_add_ps(_mm_add_ps(sum0, sum1), _mm_add_ps(sum2, sum3));
+    (hsum(sum) + scalar_sum) / (w * h) as f32
+}
 
 #[inline]
 #[target_feature(enable = "sse4.1")]

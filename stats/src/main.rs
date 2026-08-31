@@ -189,6 +189,7 @@ struct AvifTools {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn bench_maroontree_vvc(
     img: &Path,
     d: f32,
@@ -451,7 +452,6 @@ fn main() -> Result<()> {
          Override with --maroontree or pass --no-vvc.",
             tools.mt_cli
         );
-        with_vvc = false;
     }
     if with_image_avif && !available(&tools.aom_dec) {
         eprintln!(
@@ -467,7 +467,6 @@ fn main() -> Result<()> {
              Override with --avm-avifenc/--avm-avifdec or pass --no-avm-enc.",
             tools.avm_enc, tools.avm_dec
         );
-        with_avm_enc = false;
     }
 
     if with_butteraugli && !available(&butteraugli_bin) {
@@ -768,6 +767,7 @@ fn bench_jixel(
 }
 
 /// Encode with cjxl at (effort, distance), decode with djxl, score.
+#[allow(clippy::too_many_arguments)]
 fn bench_cjxl(
     img: &Path,
     effort: u32,
@@ -938,6 +938,7 @@ fn jpeg_quality_from_distance(d: f32) -> u8 {
     q.round().clamp(1.0, 100.0) as u8
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_avif_aom(
     img: &Path,
     d: f32,
@@ -1045,6 +1046,7 @@ fn bench_maroontree(
 /// AV2 via libavif avm backend: encode with `avifenc -c avm -q <quality>` at
 /// speed 9, decode with the avm-capable `avifdec`, score.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn bench_avif_avm(
     img: &Path,
     d: f32,
@@ -1243,7 +1245,9 @@ fn score_butteraugli(bin: &str, reference: &Path, dist: &Path) -> Result<(f64, f
 fn score_ss2(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
     let to_rgb = |b: &[u8]| -> Result<Rgb> {
         let data: Vec<[f32; 3]> = b
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| {
                 [
                     c[0] as f32 / 255.0,

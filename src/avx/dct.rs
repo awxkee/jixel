@@ -1474,7 +1474,7 @@ mod tests {
         cases.push(alternating);
 
         for seed in 0..32 {
-            cases.push(fill(0xa7_c2_0000 + seed));
+            cases.push(fill(0xa7c2_0000 + seed));
         }
 
         for (case, input) in cases.iter().enumerate() {

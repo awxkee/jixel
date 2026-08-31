@@ -63,6 +63,9 @@ pub(crate) struct EncodingContext {
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
+    /// Blue-axis twin of `x_heavy`: structure lives in B−Y where luma-driven
+    /// masking cannot see it (saturated blue detail on low-luma ground).
+    b_heavy: std::sync::atomic::AtomicBool,
     b_qm_scale: std::sync::atomic::AtomicU32,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
@@ -75,6 +78,7 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_dc_cfl: group::QuantizeDcCflFn,
     pub(crate) apply_quant_field_gain: dark_aq::ApplyQuantFieldGainFn,
     pub(crate) dark_structure_stats: dark_aq::DarkStructureStatsFn,
+    pub(crate) fill_blue_tile: dark_aq::FillBlueTileFn,
     pub(crate) block_features: structure_aq::BlockFeaturesFn,
     pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
@@ -83,7 +87,8 @@ pub(crate) struct EncodingContext {
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
     pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
-    pub(crate) x_gradient_sums: frame::XGradientSumsFn,
+    pub(crate) cfl_closed_loop_cost: color_correlation::CflClosedLoopCostFn,
+    pub(crate) chroma_gradient_sums: frame::ChromaGradientSumsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
@@ -145,6 +150,15 @@ impl EncodingContext {
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn b_heavy(&self) -> bool {
+        self.b_heavy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_b_heavy(&self, heavy: bool) {
+        self.b_heavy
+            .store(heavy, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn raise_b_qm_scale(&self, scale: u32) {
         self.b_qm_scale
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
@@ -156,7 +170,11 @@ impl EncodingContext {
 
     #[inline]
     pub(crate) fn b_qm_mul(&self) -> f32 {
-        1.25f32.powf(self.b_qm_scale() as f32 - 2.0)
+        // The signaled scale is an integer in 2..=7. All powers below are
+        // exact binary fractions, so a lookup avoids a libm `powf` in the
+        // block-level RDO paths without changing the quantizer value.
+        static MULTIPLIERS: [f32; 6] = [1.0, 1.25, 1.5625, 1.953125, 2.441_406_2, 3.051_757_8];
+        MULTIPLIERS[(self.b_qm_scale().clamp(2, 7) - 2) as usize]
     }
 
     /// Distortion weights fitted at the two validated opsin endpoints and
@@ -194,6 +212,7 @@ impl EncodingContext {
             plain_hq_matrices: DequantMatrices::new(0.0),
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
+            b_heavy: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
@@ -211,6 +230,7 @@ impl EncodingContext {
             quantize_dc_cfl: quantize_dc.quantize_cfl,
             apply_quant_field_gain: dark_aq::select_apply_quant_field_gain_fn(),
             dark_structure_stats: dark_aq::select_dark_structure_stats_fn(),
+            fill_blue_tile: dark_aq::select_fill_blue_tile_fn(),
             block_features: structure_aq::select_block_features_fn(),
             apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
@@ -220,7 +240,8 @@ impl EncodingContext {
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
             cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
-            x_gradient_sums: frame::selected_x_gradient_sums_fn(),
+            cfl_closed_loop_cost: color_correlation::selected_cfl_closed_loop_cost_fn(),
+            chroma_gradient_sums: frame::selected_chroma_gradient_sums_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),

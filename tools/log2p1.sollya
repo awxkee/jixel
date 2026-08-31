@@ -20,7 +20,7 @@ print(p);
 
 print("");
 print("Rust coefficients for:");
-print("log2(1+t) ~= t * (c0 + c1*t + c2*t^2 + c3*t^3 + c4*t^4 + c5*t^5)");
+print("log2(1+t) ~= t * (c0 + c1*t + c2*t^2 + c3*t^3 + c4*t^4 + c5*t^5 + c6*t^6)");
 
 print("");
 print("c0 = ", coeff(p, 0));
@@ -40,3 +40,5 @@ print("");
 print("Relative-ish weighted error estimate, excluding tiny center:");
 err_rel = dirtyinfnorm((x * p - log2(1 + x)) / log2(1 + x), [2^-20; 1]);
 print(err_rel);
+
+quit;

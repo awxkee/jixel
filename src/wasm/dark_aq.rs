@@ -27,7 +27,83 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use crate::dark_aq::{BLUE_OFFSET, INV_BLUE_FULL, Y_TO_LUMA8};
+use crate::image::Image3F;
 use std::arch::wasm32::*;
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn fill_blue_tile_wasm(
+    opsin: &Image3F,
+    tile: &mut [f32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    assert!(w <= 64 && tile.len() >= 64 * h);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let zero = f32x4_splat(0.0);
+    let one = f32x4_splat(1.0);
+    let offset = f32x4_splat(BLUE_OFFSET);
+    let inv_full = f32x4_splat(INV_BLUE_FULL);
+    let scale = f32x4_splat(Y_TO_LUMA8);
+    let mut sum0 = zero;
+    let mut sum1 = zero;
+    let mut sum2 = zero;
+    let mut sum3 = zero;
+    let mut scalar_sum = 0.0f32;
+    let groups = w / 16;
+    let vector_tail = groups * 16;
+    let full_tail = w % 16 / 4;
+    let tail = vector_tail + full_tail * 4;
+    macro_rules! accumulate_blue_x4 {
+        ($sum:ident, $x:expr, $xr:ident, $yr:ident, $br:ident, $dst:ident) => {{
+            let x = $x;
+            let px = x0 + x;
+            let xv = unsafe { v128_load($xr.as_ptr().add(px).cast()) };
+            let yv = unsafe { v128_load($yr.as_ptr().add(px).cast()) };
+            let bv = unsafe { v128_load($br.as_ptr().add(px).cast()) };
+            let by = f32x4_sub(bv, yv);
+            let excess = f32x4_sub(by, f32x4_add(f32x4_abs(xv), offset));
+            let risk = f32x4_min(f32x4_max(f32x4_mul(excess, inv_full), zero), one);
+            $sum = f32x4_add($sum, risk);
+            unsafe { v128_store($dst.as_mut_ptr().add(x).cast(), f32x4_mul(by, scale)) };
+        }};
+    }
+    for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
+        let xr = opsin.plane_row(0, y0 + r);
+        let yr = opsin.plane_row(1, y0 + r);
+        let br = opsin.plane_row(2, y0 + r);
+        for group in 0..groups {
+            let x = group * 16;
+            accumulate_blue_x4!(sum0, x, xr, yr, br, dst);
+            accumulate_blue_x4!(sum1, x + 4, xr, yr, br, dst);
+            accumulate_blue_x4!(sum2, x + 8, xr, yr, br, dst);
+            accumulate_blue_x4!(sum3, x + 12, xr, yr, br, dst);
+        }
+        if full_tail > 0 {
+            accumulate_blue_x4!(sum0, vector_tail, xr, yr, br, dst);
+        }
+        if full_tail > 1 {
+            accumulate_blue_x4!(sum1, vector_tail + 4, xr, yr, br, dst);
+        }
+        if full_tail > 2 {
+            accumulate_blue_x4!(sum2, vector_tail + 8, xr, yr, br, dst);
+        }
+        let xr = &xr[x0 + tail..x0 + w];
+        let yr = &yr[x0 + tail..x0 + w];
+        let br = &br[x0 + tail..x0 + w];
+        for (((d, &x), &y), &b) in dst[tail..w].iter_mut().zip(xr).zip(yr).zip(br) {
+            let by = b - y;
+            scalar_sum += ((by - x.abs() - BLUE_OFFSET).max(0.0) * INV_BLUE_FULL).min(1.0);
+            *d = by * Y_TO_LUMA8;
+        }
+    }
+    let sum = f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3));
+    (horizontal_sum_x4(sum) + scalar_sum) / (w * h) as f32
+}
 
 #[inline]
 fn horizontal_sum_x4(value: v128) -> f32 {

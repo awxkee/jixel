@@ -938,7 +938,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed);
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
+            dct8x8_wasm(DctInput::from_flat(&input), &mut got);
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 seed={seed}"));
         }
@@ -952,7 +952,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x8_wasm(DctInput::from_flat(&input), &mut got);
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 dc-only");
     }
@@ -964,7 +964,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 64];
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x8_wasm(DctInput::from_flat(&input), &mut got);
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 zero");
     }
@@ -984,11 +984,9 @@ mod neon_dct_tests {
         let mut da = [0.0f32; 64];
         let mut db = [0.0f32; 64];
         let mut dsum = [0.0f32; 64];
-        unsafe {
-            dct8x8_wasm(DctInput::from_flat(&a), &mut da);
-            dct8x8_wasm(DctInput::from_flat(&b), &mut db);
-            dct8x8_wasm(DctInput::from_flat(&sum), &mut dsum);
-        }
+        dct8x8_wasm(DctInput::from_flat(&a), &mut da);
+        dct8x8_wasm(DctInput::from_flat(&b), &mut db);
+        dct8x8_wasm(DctInput::from_flat(&sum), &mut dsum);
         let expected: Vec<f32> = (0..64).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x8 linearity");
     }
@@ -1003,7 +1001,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
+            dct8x8_wasm(DctInput::from_flat(&input), &mut got);
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 basis[{k}]"));
         }
@@ -1019,7 +1017,7 @@ mod neon_dct_tests {
             let input: [f32; 128] = fill(seed.wrapping_add(0xdead));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
+            dct8x16_wasm(DctInput::from_flat(&input), &mut got);
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 seed={seed}"));
         }
@@ -1032,7 +1030,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x16_wasm(DctInput::from_flat(&input), &mut got);
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 dc-only");
     }
@@ -1044,7 +1042,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x16_wasm(DctInput::from_flat(&input), &mut got);
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 zero");
     }
@@ -1058,7 +1056,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
+            dct8x16_wasm(DctInput::from_flat(&input), &mut got);
             dct8x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x16 basis[{k}]"));
         }
@@ -1077,11 +1075,9 @@ mod neon_dct_tests {
         let mut da = [0.0f32; 128];
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
-        unsafe {
-            dct8x16_wasm(DctInput::from_flat(&a), &mut da);
-            dct8x16_wasm(DctInput::from_flat(&b), &mut db);
-            dct8x16_wasm(DctInput::from_flat(&sum), &mut dsum);
-        }
+        dct8x16_wasm(DctInput::from_flat(&a), &mut da);
+        dct8x16_wasm(DctInput::from_flat(&b), &mut db);
+        dct8x16_wasm(DctInput::from_flat(&sum), &mut dsum);
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct8x16 linearity");
     }
@@ -1094,7 +1090,7 @@ mod neon_dct_tests {
             let input: [f32; 128] = fill(seed.wrapping_add(0xbeef));
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
+            dct16x8_wasm(DctInput::from_flat(&input), &mut got);
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 seed={seed}"));
         }
@@ -1109,7 +1105,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a8));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x8_wasm(DctInput::from_flat(&input), &mut got) };
+            dct4x8_wasm(DctInput::from_flat(&input), &mut got);
             dct4x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x8 seed={seed}"));
         }
@@ -1124,7 +1120,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x8a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct8x4_wasm(DctInput::from_flat(&input), &mut got) };
+            dct8x4_wasm(DctInput::from_flat(&input), &mut got);
             dct8x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x4 seed={seed}"));
         }
@@ -1137,7 +1133,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x8_wasm(DctInput::from_flat(&input), &mut got);
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 dc-only");
     }
@@ -1149,7 +1145,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 128];
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x8_wasm(DctInput::from_flat(&input), &mut got);
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 zero");
     }
@@ -1163,7 +1159,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 128];
             let mut want = [0.0f32; 128];
-            unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
+            dct16x8_wasm(DctInput::from_flat(&input), &mut got);
             dct16x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x8 basis[{k}]"));
         }
@@ -1182,11 +1178,9 @@ mod neon_dct_tests {
         let mut da = [0.0f32; 128];
         let mut db = [0.0f32; 128];
         let mut dsum = [0.0f32; 128];
-        unsafe {
-            dct16x8_wasm(DctInput::from_flat(&a), &mut da);
-            dct16x8_wasm(DctInput::from_flat(&b), &mut db);
-            dct16x8_wasm(DctInput::from_flat(&sum), &mut dsum);
-        }
+        dct16x8_wasm(DctInput::from_flat(&a), &mut da);
+        dct16x8_wasm(DctInput::from_flat(&b), &mut db);
+        dct16x8_wasm(DctInput::from_flat(&sum), &mut dsum);
         let expected: Vec<f32> = (0..128).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x8 linearity");
     }
@@ -1205,10 +1199,8 @@ mod neon_dct_tests {
 
         let mut out8x16 = [0.0f32; 128];
         let mut out16x8 = [0.0f32; 128];
-        unsafe {
-            dct8x16_wasm(DctInput::from_flat(&input), &mut out8x16);
-            dct16x8_wasm(DctInput::from_flat(&input), &mut out16x8);
-        }
+        dct8x16_wasm(DctInput::from_flat(&input), &mut out8x16);
+        dct16x8_wasm(DctInput::from_flat(&input), &mut out16x8);
         // DC is at index 0 in both output layouts.
         assert!(
             (out8x16[0] - out16x8[0]).abs() < ATOL,
@@ -1231,7 +1223,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 64];
         let mut want = [0.0f32; 64];
-        unsafe { dct8x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x8_wasm(DctInput::from_flat(&input), &mut got);
         dct8x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x8 alternating +-1");
     }
@@ -1246,7 +1238,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct16x8_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x8_wasm(DctInput::from_flat(&input), &mut got);
         dct16x8_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x8 alternating +-1");
     }
@@ -1261,7 +1253,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 128];
         let mut want = [0.0f32; 128];
-        unsafe { dct8x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct8x16_wasm(DctInput::from_flat(&input), &mut got);
         dct8x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct8x16 alternating +-1");
     }
@@ -1275,7 +1267,7 @@ mod neon_dct_tests {
             let input: [f32; 256] = fill(seed.wrapping_add(0xf00d));
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
+            dct16x16_wasm(DctInput::from_flat(&input), &mut got);
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 seed={seed}"));
         }
@@ -1290,7 +1282,7 @@ mod neon_dct_tests {
             let input: [f32; 1024] = fill(seed.wrapping_add(0x3232));
             let mut got = [0.0f32; 1024];
             let mut want = [0.0f32; 1024];
-            unsafe { dct32x32_wasm(DctInput::from_flat(&input), &mut got) };
+            dct32x32_wasm(DctInput::from_flat(&input), &mut got);
             dct32x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x32 seed={seed}"));
         }
@@ -1305,7 +1297,7 @@ mod neon_dct_tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x3216));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct32x16_wasm(DctInput::from_flat(&input), &mut got) };
+            dct32x16_wasm(DctInput::from_flat(&input), &mut got);
             dct32x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct32x16 seed={seed}"));
         }
@@ -1320,7 +1312,7 @@ mod neon_dct_tests {
             let input: [f32; 512] = fill(seed.wrapping_add(0x1632));
             let mut got = [0.0f32; 512];
             let mut want = [0.0f32; 512];
-            unsafe { dct16x32_wasm(DctInput::from_flat(&input), &mut got) };
+            dct16x32_wasm(DctInput::from_flat(&input), &mut got);
             dct16x32_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x32 seed={seed}"));
         }
@@ -1335,7 +1327,7 @@ mod neon_dct_tests {
             let input: [f32; 64] = fill(seed.wrapping_add(0x4a4));
             let mut got = [0.0f32; 64];
             let mut want = [0.0f32; 64];
-            unsafe { dct4x4_wasm(DctInput::from_flat(&input), &mut got) };
+            dct4x4_wasm(DctInput::from_flat(&input), &mut got);
             dct4x4_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct4x4 seed={seed}"));
         }
@@ -1349,7 +1341,7 @@ mod neon_dct_tests {
         let input = [0.5f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x16_wasm(DctInput::from_flat(&input), &mut got);
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 dc-only");
     }
@@ -1362,7 +1354,7 @@ mod neon_dct_tests {
         let input = [0.0f32; 256];
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x16_wasm(DctInput::from_flat(&input), &mut got);
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 zero");
     }
@@ -1377,7 +1369,7 @@ mod neon_dct_tests {
             input[k] = 1.0;
             let mut got = [0.0f32; 256];
             let mut want = [0.0f32; 256];
-            unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
+            dct16x16_wasm(DctInput::from_flat(&input), &mut got);
             dct16x16_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct16x16 basis[{k}]"));
         }
@@ -1396,11 +1388,9 @@ mod neon_dct_tests {
         let mut da = [0.0f32; 256];
         let mut db = [0.0f32; 256];
         let mut dsum = [0.0f32; 256];
-        unsafe {
-            dct16x16_wasm(DctInput::from_flat(&a), &mut da);
-            dct16x16_wasm(DctInput::from_flat(&b), &mut db);
-            dct16x16_wasm(DctInput::from_flat(&sum), &mut dsum);
-        }
+        dct16x16_wasm(DctInput::from_flat(&a), &mut da);
+        dct16x16_wasm(DctInput::from_flat(&b), &mut db);
+        dct16x16_wasm(DctInput::from_flat(&sum), &mut dsum);
         let expected: Vec<f32> = (0..256).map(|i| da[i] + db[i]).collect();
         assert_close(&dsum, &expected, "dct16x16 linearity");
     }
@@ -1416,7 +1406,7 @@ mod neon_dct_tests {
         }
         let mut got = [0.0f32; 256];
         let mut want = [0.0f32; 256];
-        unsafe { dct16x16_wasm(DctInput::from_flat(&input), &mut got) };
+        dct16x16_wasm(DctInput::from_flat(&input), &mut got);
         dct16x16_scalar(&input, &mut want);
         assert_close(&got, &want, "dct16x16 alternating +-1");
     }

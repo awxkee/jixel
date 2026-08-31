@@ -48,8 +48,11 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
-pub(crate) use cfl::{apply_cfl_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon, cfl_regression_neon};
-pub(crate) use dark_aq::dark_structure_stats_neon;
+pub(crate) use cfl::{
+    apply_cfl_neon, cfl_closed_loop_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon,
+    cfl_regression_neon,
+};
+pub(crate) use dark_aq::{dark_structure_stats_neon, fill_blue_tile_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
     dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct4x4_neon, dct4x8_neon, dct8x4_neon,
@@ -59,7 +62,7 @@ pub(crate) use dct::{
     inv_dct32x64_neon, inv_dct64x32_neon, inv_dct64x64_neon,
 };
 pub(crate) use entropy::counts_bit_cost_neon;
-pub(crate) use frame::x_gradient_sums_neon;
+pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
     recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,

@@ -26,7 +26,85 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::dark_aq::{BLUE_OFFSET, INV_BLUE_FULL, Y_TO_LUMA8};
+use crate::image::Image3F;
 use std::arch::aarch64::*;
+
+/// # Safety
+/// AArch64 NEON must be available.
+#[target_feature(enable = "neon")]
+pub(crate) fn fill_blue_tile_neon(
+    opsin: &Image3F,
+    tile: &mut [f32],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    assert!(w <= 64 && tile.len() >= 64 * h);
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let offset = vdupq_n_f32(BLUE_OFFSET);
+    let inv_full = vdupq_n_f32(INV_BLUE_FULL);
+    let scale = vdupq_n_f32(Y_TO_LUMA8);
+    let mut sum0 = zero;
+    let mut sum1 = zero;
+    let mut sum2 = zero;
+    let mut sum3 = zero;
+    let mut scalar_sum = 0.0f32;
+    let groups = w / 16;
+    let vector_tail = groups * 16;
+    let full_tail = w % 16 / 4;
+    let tail = vector_tail + full_tail * 4;
+    macro_rules! accumulate_blue_x4 {
+        ($sum:ident, $x:expr, $xr:ident, $yr:ident, $br:ident, $dst:ident) => {{
+            let x = $x;
+            let px = x0 + x;
+            let xv = unsafe { vld1q_f32($xr.as_ptr().add(px)) };
+            let yv = unsafe { vld1q_f32($yr.as_ptr().add(px)) };
+            let bv = unsafe { vld1q_f32($br.as_ptr().add(px)) };
+            let by = vsubq_f32(bv, yv);
+            let excess = vsubq_f32(by, vaddq_f32(vabsq_f32(xv), offset));
+            let risk = vminq_f32(vmaxq_f32(vmulq_f32(excess, inv_full), zero), one);
+            $sum = vaddq_f32($sum, risk);
+            unsafe { vst1q_f32($dst.as_mut_ptr().add(x), vmulq_f32(by, scale)) };
+        }};
+    }
+    for (r, dst) in tile.as_chunks_mut::<64>().0.iter_mut().take(h).enumerate() {
+        let xr = opsin.plane_row(0, y0 + r);
+        let yr = opsin.plane_row(1, y0 + r);
+        let br = opsin.plane_row(2, y0 + r);
+        for group in 0..groups {
+            let x = group * 16;
+            accumulate_blue_x4!(sum0, x, xr, yr, br, dst);
+            accumulate_blue_x4!(sum1, x + 4, xr, yr, br, dst);
+            accumulate_blue_x4!(sum2, x + 8, xr, yr, br, dst);
+            accumulate_blue_x4!(sum3, x + 12, xr, yr, br, dst);
+        }
+        if full_tail > 0 {
+            accumulate_blue_x4!(sum0, vector_tail, xr, yr, br, dst);
+        }
+        if full_tail > 1 {
+            accumulate_blue_x4!(sum1, vector_tail + 4, xr, yr, br, dst);
+        }
+        if full_tail > 2 {
+            accumulate_blue_x4!(sum2, vector_tail + 8, xr, yr, br, dst);
+        }
+        let xr = &xr[x0 + tail..x0 + w];
+        let yr = &yr[x0 + tail..x0 + w];
+        let br = &br[x0 + tail..x0 + w];
+        for (((d, &x), &y), &b) in dst[tail..w].iter_mut().zip(xr).zip(yr).zip(br) {
+            let by = b - y;
+            scalar_sum += ((by - x.abs() - BLUE_OFFSET).max(0.0) * INV_BLUE_FULL).min(1.0);
+            *d = by * Y_TO_LUMA8;
+        }
+    }
+    let sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+    (vaddvq_f32(sum) + scalar_sum) / (w * h) as f32
+}
 
 #[inline]
 #[target_feature(enable = "neon")]
