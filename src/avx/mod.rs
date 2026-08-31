@@ -30,6 +30,7 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+mod color;
 mod dark_aq;
 mod dct;
 mod entropy;
@@ -52,6 +53,7 @@ pub(crate) use cfl::{
     apply_cfl_avx2, cfl_closed_loop_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2,
     cfl_regression_avx2,
 };
+pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dark_aq::{dark_structure_stats_avx2, fill_blue_tile_avx2};
 pub(crate) use dct::{
     dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
