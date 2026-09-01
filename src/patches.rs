@@ -83,11 +83,6 @@ fn tile_energy(img: &Image3F, x0: usize, y0: usize) -> f32 {
 }
 
 /// Minimum per-tile energy worth spending a patch on.
-///
-/// Tuned together with `ATLAS_DISTANCE_SCALE` and `MIN_PATCH_OCCURRENCES` by a
-/// 30-trial Optuna study (screenshot + fractal-crop + alpha tune set, SS2
-/// floor-guarded): energy sits on a wide plateau [0.006, 0.017]; above 0.03
-/// the rate cost is steep.
 const MIN_PATCH_ENERGY: f32 = 0.017;
 
 /// Minimum occurrences before a tile group becomes a patch. The study

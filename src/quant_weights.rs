@@ -1467,17 +1467,14 @@ fn compute_dct32x16_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 
 /// Quant tables that do not depend on the SS2-retune distance gate, computed
 /// once per process and cloned into both `DequantMatrices` variants.
 /// Spec (JPEG XL library) IDENTITY / Hornuss table: per channel
-/// `[base, edge, corner]` weights. A 2026-09 Optuna refit of these tables
-/// (via signalled custom kQuantModeID/DCT2 headers) was refuted on a mixed
-/// holdout: fitted tables win screen content but damage photos, and no
-/// global table beats the spec values.
-const IDENTITY_WEIGHTS: [[f32; 3]; 3] = [
+/// `[base, edge, corner]` weights.
+static IDENTITY_WEIGHTS: [[f32; 3]; 3] = [
     [280.0, 3160.0, 3160.0],
     [60.0, 864.0, 864.0],
     [18.0, 200.0, 200.0],
 ];
 /// Spec recursive DCT2X2 table: per channel six band weights.
-const DCT2_WEIGHTS: [[f32; 6]; 3] = [
+static DCT2_WEIGHTS: [[f32; 6]; 3] = [
     [3840.0, 2560.0, 1280.0, 640.0, 480.0, 300.0],
     [960.0, 640.0, 320.0, 180.0, 140.0, 120.0],
     [640.0, 320.0, 128.0, 64.0, 32.0, 16.0],
