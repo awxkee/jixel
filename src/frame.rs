@@ -1423,10 +1423,6 @@ pub(crate) fn encode_frame(
 const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
 
 /// The VarDCT atlas is coded this much finer than the frame it serves.
-///
-/// Two Optuna studies agree: the SS2 cliff starts at ~0.5 on large screenshot
-/// content (every occurrence inherits the atlas error) and the plateau is
-/// [0.3, 0.5), so 0.45 sits at the rate-optimal edge with measured margin.
 const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 
 /// Every opsin row sums to 1, so achromatic input gives L = M = S and hence
@@ -1436,16 +1432,11 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 const SAT_QM_THRESHOLD: f32 = 0.055;
 
 /// `x_gradient_stat` gate for keeping the fine X quantizer through the
-/// x_qm_scale=2 distance band (0.299..=1.25). Calibration 2026-08-29:
-/// Burning_Ship reads 0.053 (its yellow-band crop 0.072); the highest
-/// natural image measured (Kodak + assets, 30 images) reads 0.027.
+/// x_qm_scale=2 distance band (0.299..=1.25)
 const X_QM_GRAD_THRESHOLD: f32 = 0.04;
 
 /// `b_gradient_stat` gate for blue-axis-dominant structure (the B twin of
-/// `x_heavy`). Opsin-plane calibration 2026-08-29: blue-rotated fractal
-/// victim 0.97, buddhabrot glow class 0.52-0.72, highest photo 0.33 (Oahu
-/// ocean), Kodak max 0.19 — 0.45 keeps every photo out with margin while
-/// admitting the blue-structure class.
+/// `x_heavy`)
 const B_GRAD_THRESHOLD: f32 = 0.45;
 
 /// Fine-B precision for the synthetic high-frequency opponent-color class.
