@@ -230,6 +230,227 @@ fn scale_and_store_uninit(
 }
 
 #[target_feature(enable = "neon")]
+pub(crate) fn identity8x8_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut means = [0.0f32; 4];
+    for qy in 0..2 {
+        let anchor_row = input.row(qy * 4 + 1);
+        let anchor_lo = vdupq_n_f32(anchor_row[1]);
+        let anchor_hi = vdupq_n_f32(anchor_row[5]);
+        let mut sum_lo = vdupq_n_f32(0.0);
+        let mut sum_hi = vdupq_n_f32(0.0);
+        for iy in 0..4 {
+            let row = input.row(qy * 4 + iy);
+            let pixels_lo = unsafe { vld1q_f32(row.as_ptr()) };
+            let pixels_hi = unsafe { vld1q_f32(row[4..].as_ptr()) };
+            sum_lo = vaddq_f32(sum_lo, pixels_lo);
+            sum_hi = vaddq_f32(sum_hi, pixels_hi);
+
+            let residual_lo = vsubq_f32(pixels_lo, anchor_lo);
+            let residual_hi = vsubq_f32(pixels_hi, anchor_hi);
+            let packed_lo = vzip1q_f32(residual_lo, residual_hi);
+            let packed_hi = vzip2q_f32(residual_lo, residual_hi);
+            let dst = &mut output[(qy + iy * 2) * 8..];
+            unsafe {
+                vst1q_f32(dst.as_mut_ptr(), packed_lo);
+                vst1q_f32(dst[4..].as_mut_ptr(), packed_hi);
+            }
+        }
+        means[qy * 2] = vaddvq_f32(sum_lo) * (1.0 / 16.0);
+        means[qy * 2 + 1] = vaddvq_f32(sum_hi) * (1.0 / 16.0);
+    }
+
+    for qy in 0..2 {
+        for qx in 0..2 {
+            output[(qy + 2) * 8 + qx + 2] = output[qy * 8 + qx];
+        }
+    }
+    let [b00, b01, b10, b11] = means;
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn inv_identity8x8_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let c00 = input.row(0)[0];
+    let c01 = input.row(0)[1];
+    let c10 = input.row(1)[0];
+    let c11 = input.row(1)[1];
+    let means = [
+        c00 + c01 + c10 + c11,
+        c00 + c01 - c10 - c11,
+        c00 - c01 + c10 - c11,
+        c00 - c01 - c10 + c11,
+    ];
+
+    for qy in 0..2 {
+        let mut left = [vdupq_n_f32(0.0); 4];
+        let mut right = [vdupq_n_f32(0.0); 4];
+        for iy in 0..4 {
+            let row = input.row(qy + iy * 2);
+            let packed_lo = unsafe { vld1q_f32(row.as_ptr()) };
+            let packed_hi = unsafe { vld1q_f32(row[4..].as_ptr()) };
+            left[iy] = vuzp1q_f32(packed_lo, packed_hi);
+            right[iy] = vuzp2q_f32(packed_lo, packed_hi);
+        }
+        left[0] = vsetq_lane_f32::<0>(input.row(qy + 2)[2], left[0]);
+        right[0] = vsetq_lane_f32::<0>(input.row(qy + 2)[3], right[0]);
+        left[1] = vsetq_lane_f32::<1>(0.0, left[1]);
+        right[1] = vsetq_lane_f32::<1>(0.0, right[1]);
+
+        let left_sum = vaddq_f32(vaddq_f32(left[0], left[1]), vaddq_f32(left[2], left[3]));
+        let right_sum = vaddq_f32(vaddq_f32(right[0], right[1]), vaddq_f32(right[2], right[3]));
+        let anchor_lo = vdupq_n_f32(means[qy * 2] - vaddvq_f32(left_sum) * (1.0 / 16.0));
+        let anchor_hi = vdupq_n_f32(means[qy * 2 + 1] - vaddvq_f32(right_sum) * (1.0 / 16.0));
+        for iy in 0..4 {
+            let dst = &mut output[(qy * 4 + iy) * 8..];
+            unsafe {
+                vst1q_f32(dst.as_mut_ptr(), vaddq_f32(left[iy], anchor_lo));
+                vst1q_f32(dst[4..].as_mut_ptr(), vaddq_f32(right[iy], anchor_hi));
+            }
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct2x2_forward(
+    a: float32x4_t,
+    b: float32x4_t,
+    c: float32x4_t,
+    d: float32x4_t,
+) -> [float32x4_t; 4] {
+    let scale = vdupq_n_f32(0.25);
+    let ab = vaddq_f32(a, b);
+    let amb = vsubq_f32(a, b);
+    [
+        vmulq_f32(vaddq_f32(vaddq_f32(ab, c), d), scale),
+        vmulq_f32(vsubq_f32(vsubq_f32(ab, c), d), scale),
+        vmulq_f32(vsubq_f32(vaddq_f32(amb, c), d), scale),
+        vmulq_f32(vaddq_f32(vsubq_f32(amb, c), d), scale),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct2x2_inverse(
+    a: float32x4_t,
+    b: float32x4_t,
+    c: float32x4_t,
+    d: float32x4_t,
+) -> [float32x4_t; 4] {
+    let ab = vaddq_f32(a, b);
+    let amb = vsubq_f32(a, b);
+    [
+        vaddq_f32(vaddq_f32(ab, c), d),
+        vsubq_f32(vsubq_f32(ab, c), d),
+        vsubq_f32(vaddq_f32(amb, c), d),
+        vaddq_f32(vsubq_f32(amb, c), d),
+    ]
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct2x2_8x8_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    for y in 0..4 {
+        let row0 = input.row(y * 2);
+        let row1 = input.row(y * 2 + 1);
+        let r0lo = unsafe { vld1q_f32(row0.as_ptr()) };
+        let r0hi = unsafe { vld1q_f32(row0[4..].as_ptr()) };
+        let r1lo = unsafe { vld1q_f32(row1.as_ptr()) };
+        let r1hi = unsafe { vld1q_f32(row1[4..].as_ptr()) };
+        let q = dct2x2_forward(
+            vuzp1q_f32(r0lo, r0hi),
+            vuzp2q_f32(r0lo, r0hi),
+            vuzp1q_f32(r1lo, r1hi),
+            vuzp2q_f32(r1lo, r1hi),
+        );
+        unsafe {
+            vst1q_f32(output[y * 8..].as_mut_ptr(), q[0]);
+            vst1q_f32(output[y * 8 + 4..].as_mut_ptr(), q[1]);
+            vst1q_f32(output[(y + 4) * 8..].as_mut_ptr(), q[2]);
+            vst1q_f32(output[(y + 4) * 8 + 4..].as_mut_ptr(), q[3]);
+        }
+    }
+    let mut stage4 = [[vdupq_n_f32(0.0); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        let r0 = unsafe { vld1q_f32(output[(y * 2) * 8..].as_ptr()) };
+        let r1 = unsafe { vld1q_f32(output[(y * 2 + 1) * 8..].as_ptr()) };
+        *q = dct2x2_forward(
+            vuzp1q_f32(r0, r0),
+            vuzp2q_f32(r0, r0),
+            vuzp1q_f32(r1, r1),
+            vuzp2q_f32(r1, r1),
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        unsafe {
+            vst1_f32(output[y * 8..].as_mut_ptr(), vget_low_f32(q[0]));
+            vst1_f32(output[y * 8 + 2..].as_mut_ptr(), vget_low_f32(q[1]));
+            vst1_f32(output[(y + 2) * 8..].as_mut_ptr(), vget_low_f32(q[2]));
+            vst1_f32(output[(y + 2) * 8 + 2..].as_mut_ptr(), vget_low_f32(q[3]));
+        }
+    }
+    let a = output[0];
+    let b = output[1];
+    let c = output[8];
+    let d = output[9];
+    output[0] = (a + b + c + d) * 0.25;
+    output[1] = (a + b - c - d) * 0.25;
+    output[8] = (a - b + c - d) * 0.25;
+    output[9] = (a - b - c + d) * 0.25;
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn inv_dct2x2_8x8_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut a = std::array::from_fn::<_, 64, _>(|i| input.row(i / 8)[i % 8]);
+    let c00 = a[0];
+    let c01 = a[1];
+    let c10 = a[8];
+    let c11 = a[9];
+    a[0] = c00 + c01 + c10 + c11;
+    a[1] = c00 + c01 - c10 - c11;
+    a[8] = c00 - c01 + c10 - c11;
+    a[9] = c00 - c01 - c10 + c11;
+
+    let mut stage4 = [[vdupq_n_f32(0.0); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        *q = dct2x2_inverse(
+            unsafe { vld1q_f32(a[y * 8..].as_ptr()) },
+            unsafe { vld1q_f32(a[y * 8 + 2..].as_ptr()) },
+            unsafe { vld1q_f32(a[(y + 2) * 8..].as_ptr()) },
+            unsafe { vld1q_f32(a[(y + 2) * 8 + 2..].as_ptr()) },
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        let row0 = vzip1q_f32(q[0], q[1]);
+        let row1 = vzip1q_f32(q[2], q[3]);
+        unsafe {
+            vst1q_f32(a[(y * 2) * 8..].as_mut_ptr(), row0);
+            vst1q_f32(a[(y * 2 + 1) * 8..].as_mut_ptr(), row1);
+        }
+    }
+    for y in 0..4 {
+        let q = dct2x2_inverse(
+            unsafe { vld1q_f32(a[y * 8..].as_ptr()) },
+            unsafe { vld1q_f32(a[y * 8 + 4..].as_ptr()) },
+            unsafe { vld1q_f32(a[(y + 4) * 8..].as_ptr()) },
+            unsafe { vld1q_f32(a[(y + 4) * 8 + 4..].as_ptr()) },
+        );
+        let row0lo = vzip1q_f32(q[0], q[1]);
+        let row0hi = vzip2q_f32(q[0], q[1]);
+        let row1lo = vzip1q_f32(q[2], q[3]);
+        let row1hi = vzip2q_f32(q[2], q[3]);
+        unsafe {
+            vst1q_f32(output[(y * 2) * 8..].as_mut_ptr(), row0lo);
+            vst1q_f32(output[(y * 2) * 8 + 4..].as_mut_ptr(), row0hi);
+            vst1q_f32(output[(y * 2 + 1) * 8..].as_mut_ptr(), row1lo);
+            vst1q_f32(output[(y * 2 + 1) * 8 + 4..].as_mut_ptr(), row1hi);
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
 pub(crate) fn dct8x8_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut cols = load(input);
     dct1d_8_v(&mut cols);
@@ -1504,6 +1725,60 @@ mod neon_dct_tests {
             dct8x8_scalar(&input, &mut want);
             assert_close(&got, &want, &format!("dct8x8 seed={seed}"));
         }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_identity8x8_neon_matches_scalar() {
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(0x1de0_0000 + seed);
+            let mut strided = [f32::NAN; 88];
+            for y in 0..8 {
+                strided[y * 11..y * 11 + 8].copy_from_slice(&input[y * 8..y * 8 + 8]);
+            }
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { crate::neon::identity8x8_neon(DctInput::new(&strided, 11), &mut got) };
+            crate::dct::identity8x8(DctInput::from_flat(&input), &mut want);
+            assert_close(&got, &want, &format!("identity8x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_inverse_identity8x8_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_identity8x8,
+            crate::neon::inv_identity8x8_neon,
+            "inverse_identity8x8",
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_dct2x2_8x8_neon_matches_scalar() {
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(0xd2d2_0000 + seed);
+            let mut strided = [f32::NAN; 88];
+            for y in 0..8 {
+                strided[y * 11..y * 11 + 8].copy_from_slice(&input[y * 8..y * 8 + 8]);
+            }
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { crate::neon::dct2x2_8x8_neon(DctInput::new(&strided, 11), &mut got) };
+            crate::dct::dct2x2_8x8(DctInput::from_flat(&input), &mut want);
+            assert_close(&got, &want, &format!("dct2x2_8x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    fn test_inverse_dct2x2_8x8_neon_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct2x2_8x8,
+            crate::neon::inv_dct2x2_8x8_neon,
+            "inverse_dct2x2_8x8",
+        );
     }
 
     #[test]

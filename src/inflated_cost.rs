@@ -31,9 +31,9 @@
 
 use crate::dc_group_data::{
     NUM_STRATEGIES, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
-    STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
-    STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
-    STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+    STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
+    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, IdctMethods, fmla};
 use crate::image::{Image3F, Plane};
@@ -360,6 +360,16 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         }};
     }
     match strategy {
+        STRATEGY_IDENTITY => {
+            let i: &[f32; 64] = input.first_chunk::<64>().unwrap();
+            let o: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            dct::identity8x8(DctInput::from_flat(i), o);
+        }
+        STRATEGY_DCT2X2 => {
+            let i: &[f32; 64] = input.first_chunk::<64>().unwrap();
+            let o: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            dct::dct2x2_8x8(DctInput::from_flat(i), o);
+        }
         STRATEGY_DCT4X4 => fwd!(dct::dct4x4, 64),
         STRATEGY_DCT4X8 => fwd!(dct::dct4x8, 64),
         STRATEGY_DCT8X4 => fwd!(dct::dct8x4, 64),
@@ -414,6 +424,8 @@ pub(crate) fn reconstruct_error(
     }
     match strategy {
         STRATEGY_DCT => inverse!(idct.idct8x8, 64, 8, 8),
+        STRATEGY_IDENTITY => inverse!(idct.inv_identity8x8, 64, 8, 8),
+        STRATEGY_DCT2X2 => inverse!(idct.inv_dct2x2_8x8, 64, 8, 8),
         STRATEGY_DCT8X16 => inverse!(idct.idct8x16, 128, 16, 8),
         STRATEGY_DCT16X8 => inverse!(idct.idct16x8, 128, 16, 8),
         STRATEGY_DCT16X16 => inverse!(idct.idct16x16, 256, 16, 16),

@@ -34,9 +34,9 @@ use crate::coder_scratch::{
 };
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
-    STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16, STRATEGY_DCT16X8,
-    STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
-    STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+    STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
+    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -130,6 +130,30 @@ const SUB8_MAX_DISTANCE: f32 = 1.5;
 /// [`SUB8_MAX_DISTANCE`]) up to this distance. At the default the extension
 /// band is empty and AFV shares the sub-8 gate exactly.
 const AFV_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
+/// IDENTITY and DCT2X2 remain useful much farther into the lossy range: unlike
+/// the DCT4/AFV family they avoid spreading a thin one-pixel chroma feature
+/// over an entire basis function. This mirrors libjxl's search range.
+const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
+/// Reconstruction-domain admission margin: a fine candidate must beat the
+/// DCT8 incumbent's reconstruction cost by this factor. A 2026-09 Optuna
+/// cycle over the biases, this margin, the gate and the quant tables found
+/// no config beating these libjxl constants on a mixed holdout (fitted
+/// screen-content tables won that class but hurt photos; see the
+/// fine-transform study notes in parameters_fit/).
+const FINE_RECON_MARGIN: f32 = 0.98;
+
+#[inline]
+fn fine_transform_bias(base: f32, distance: f32) -> f32 {
+    // libjxl normalizes the small-transform entropy multipliers by DCT8's 0.8
+    // and explicitly favors IDENTITY/DCT2X2 below distance 5.
+    let favor = if distance < 5.0 {
+        let t = (5.0 - distance) * 0.2;
+        0.4 * t * t
+    } else {
+        0.0
+    };
+    base / 0.8 - favor
+}
 #[inline]
 fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
@@ -298,6 +322,16 @@ fn forward_transform(
         STRATEGY_DCT => {
             let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct8x8)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
+        STRATEGY_IDENTITY => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.identity8x8)(dct_input(plane, tmp, px, py), dst);
+            (1, 1)
+        }
+        STRATEGY_DCT2X2 => {
+            let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
+            (ctx.dct2x2_8x8)(dct_input(plane, tmp, px, py), dst);
             (1, 1)
         }
         STRATEGY_DCT16X8 => {
@@ -632,6 +666,8 @@ fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[
     let matrices = ctx.matrices();
     match strategy {
         STRATEGY_DCT => &matrices.inv_matrix(channel)[..],
+        STRATEGY_IDENTITY => &matrices.inv_matrix_identity(channel)[..],
+        STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(channel)[..],
         STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(channel)[..],
         STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(channel)[..],
         STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(channel)[..],
@@ -974,6 +1010,8 @@ fn rd_cost(
 #[derive(Clone, Copy)]
 struct Sub8Costs {
     dct8: f32,
+    identity: f32,
+    dct2x2: f32,
     dct4x4: f32,
     dct4x8: f32,
     dct8x4: f32,
@@ -991,6 +1029,8 @@ fn forward_sub8_transform(
     let input = DctInput::from_flat(input);
     match strategy {
         STRATEGY_DCT => (ctx.dct8x8)(input, dst),
+        STRATEGY_IDENTITY => (ctx.identity8x8)(input, dst),
+        STRATEGY_DCT2X2 => (ctx.dct2x2_8x8)(input, dst),
         STRATEGY_DCT4X4 => (ctx.dct4x4)(input, dst),
         STRATEGY_DCT4X8 => (ctx.dct4x8)(input, dst),
         STRATEGY_DCT8X4 => (ctx.dct8x4)(input, dst),
@@ -1019,6 +1059,7 @@ fn sub8_strategy_costs(
     cmap_factor: [f32; 3],
     cached_dct8: Option<f32>,
     with_dct4: bool,
+    with_fine: bool,
 ) -> Sub8Costs {
     let mut pixels = [[0.0f32; 64]; 3];
     for (c, input) in pixels.iter_mut().enumerate() {
@@ -1042,6 +1083,16 @@ fn sub8_strategy_costs(
     } else {
         evaluate(STRATEGY_DCT)
     };
+    let identity = if with_fine {
+        evaluate(STRATEGY_IDENTITY)
+    } else {
+        f32::INFINITY
+    };
+    let dct2x2 = if with_fine {
+        evaluate(STRATEGY_DCT2X2)
+    } else {
+        f32::INFINITY
+    };
     // In the AFV-only extension band the DCT4 family is out of contention;
     // infinite costs flow through the biased comparison and never win.
     let mut evaluate_dct4 = |strategy| {
@@ -1053,6 +1104,8 @@ fn sub8_strategy_costs(
     };
     Sub8Costs {
         dct8,
+        identity,
+        dct2x2,
         dct4x4: evaluate_dct4(STRATEGY_DCT4X4),
         dct4x8: evaluate_dct4(STRATEGY_DCT4X8),
         dct8x4: evaluate_dct4(STRATEGY_DCT8X4),
@@ -2037,7 +2090,8 @@ fn select_band(
         return benefit;
     }
     let with_dct4 = distance <= SUB8_MAX_DISTANCE;
-    if !with_dct4 && distance > AFV_MAX_DISTANCE {
+    let with_fine = distance <= FINE_TRANSFORM_MAX_DISTANCE;
+    if !with_dct4 && distance > AFV_MAX_DISTANCE && !with_fine {
         return benefit;
     }
     let bias_afv = BIAS_AFV.at(distance);
@@ -2056,6 +2110,7 @@ fn select_band(
                 meta_r,
                 cached_dct8.is_finite().then_some(cached_dct8),
                 with_dct4,
+                with_fine,
                 bias_afv,
             ) {
                 ac_strategy.set_first(bx, by, cand);
@@ -2076,6 +2131,7 @@ fn evaluate_sub8_candidate(
     meta_r: f32,
     cached_dct8: Option<f32>,
     with_dct4: bool,
+    with_fine: bool,
     bias_afv: f32,
 ) -> Option<(u8, f32)> {
     let ctx = params.ctx;
@@ -2095,15 +2151,17 @@ fn evaluate_sub8_candidate(
         cmap_factor,
         cached_dct8,
         with_dct4,
+        with_fine,
     );
     let cost8 = costs.dct8;
+    let cost_identity = fine_transform_bias(1.042_754_3, params.distance) * costs.identity;
+    let cost_dct2x2 = fine_transform_bias(0.95, params.distance) * costs.dct2x2;
     let cost4 = BIAS_4X4 * costs.dct4x4;
     let cost48 = BIAS_4X8 * costs.dct4x8;
     let cost84 = BIAS_4X8 * costs.dct8x4;
-    // Choose the cheapest sub-8×8 candidate, and take it only if it beats
-    // the 8×8 incumbent. DCT4X8 (fine vertical res) and DCT8X4 (fine
-    // horizontal res) are transposes that suit opposite edge orientations;
-    // the four AFV variants suit a diagonal edge through one corner.
+    // Keep the already-fitted DCT4/AFV chooser intact. IDENTITY/DCT2X2 have
+    // non-orthogonal coefficient scales, so their coefficient-domain costs are
+    // suitable only as a shortlist; final admission is reconstruction-domain.
     let (cand, cand_cost) = {
         let mut best = STRATEGY_DCT4X4;
         let mut bc = cost4;
@@ -2124,6 +2182,37 @@ fn evaluate_sub8_candidate(
         }
         (best, bc)
     };
+
+    let (fine, fine_coeff_cost) = if cost_identity < cost_dct2x2 {
+        (STRATEGY_IDENTITY, cost_identity)
+    } else {
+        (STRATEGY_DCT2X2, cost_dct2x2)
+    };
+    if fine_coeff_cost < cost8 && fine_coeff_cost < cand_cost {
+        let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
+            strategy_cost_impl(
+                ctx,
+                scratch,
+                strategy,
+                params.opsin,
+                px,
+                py,
+                qac,
+                params.qm_mult_x,
+                meta_r,
+                params.distance,
+                cmap_factor,
+                DistortionModel::Reconstruction,
+            )
+        };
+        let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
+        let recon_fine = reconstruction_cost(scratch, fine);
+        // A small safety margin absorbs the remaining mismatch between the
+        // local reconstruction metric and the final post-filtered image.
+        if recon_fine < recon8 * FINE_RECON_MARGIN {
+            return Some((fine, recon8 - recon_fine));
+        }
+    }
     (cand_cost < cost8).then_some((cand, cost8 - cand_cost))
 }
 
@@ -2400,8 +2489,9 @@ pub(crate) fn fill_ac_strategy(
             &mut pipeline.current_costs,
         );
 
-        if scope.rectangles() && distance <= AFV_MAX_DISTANCE {
+        if scope.rectangles() && distance <= AFV_MAX_DISTANCE.max(FINE_TRANSFORM_MAX_DISTANCE) {
             let with_dct4 = distance <= SUB8_MAX_DISTANCE;
+            let with_fine = distance <= FINE_TRANSFORM_MAX_DISTANCE;
             let bias_afv = BIAS_AFV.at(distance);
             for band_idx in 0..band_count {
                 for di in 0..pipeline.band_scratch[band_idx].rerank_downgrades.len() {
@@ -2421,6 +2511,7 @@ pub(crate) fn fill_ac_strategy(
                                 META_R,
                                 None,
                                 with_dct4,
+                                with_fine,
                                 bias_afv,
                             ) {
                                 ac_strategy.set_first(bx, by, cand);
@@ -2767,9 +2858,9 @@ mod tests {
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
-        AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-        STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
-        STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+        AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8,
+        STRATEGY_DCT8X4, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
+        STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
     };
     use crate::encoding_context::EncodingContext;
     use crate::image::{Image3F, ImageB, ImageSB};
@@ -3037,6 +3128,32 @@ mod tests {
             strategy_cost(
                 &ctx,
                 &mut scratch,
+                STRATEGY_IDENTITY,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                meta_r,
+                distance,
+                cmap,
+            ),
+            strategy_cost(
+                &ctx,
+                &mut scratch,
+                STRATEGY_DCT2X2,
+                &opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                meta_r,
+                distance,
+                cmap,
+            ),
+            strategy_cost(
+                &ctx,
+                &mut scratch,
                 STRATEGY_DCT4X4,
                 &opsin,
                 px,
@@ -3089,8 +3206,16 @@ mod tests {
                 cmap,
                 cached,
                 true,
+                true,
             );
-            let actual = [bundled.dct8, bundled.dct4x4, bundled.dct4x8, bundled.dct8x4];
+            let actual = [
+                bundled.dct8,
+                bundled.identity,
+                bundled.dct2x2,
+                bundled.dct4x4,
+                bundled.dct4x8,
+                bundled.dct8x4,
+            ];
             for (a, b) in actual.into_iter().zip(independent) {
                 assert_eq!(a.to_bits(), b.to_bits());
             }

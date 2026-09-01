@@ -46,13 +46,17 @@ pub(crate) const STRATEGY_AFV3: u8 = 13;
 pub(crate) const STRATEGY_DCT64X64: u8 = 14;
 pub(crate) const STRATEGY_DCT64X32: u8 = 15;
 pub(crate) const STRATEGY_DCT32X64: u8 = 16;
-pub(crate) const NUM_STRATEGIES: usize = 17;
+pub(crate) const STRATEGY_IDENTITY: u8 = 17;
+pub(crate) const STRATEGY_DCT2X2: u8 = 18;
+pub(crate) const NUM_STRATEGIES: usize = 19;
 
 #[inline]
 pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
     matches!(
         strategy,
-        STRATEGY_DCT4X4
+        STRATEGY_IDENTITY
+            | STRATEGY_DCT2X2
+            | STRATEGY_DCT4X4
             | STRATEGY_DCT4X8
             | STRATEGY_DCT8X4
             | STRATEGY_AFV0
@@ -64,9 +68,11 @@ pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
 
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
 /// DCT8=0, DCT16X16=4, DCT32X32=5, DCT16X8=6, DCT8X16=7, DCT4X4=3, DCT4X8=12, DCT8X4=13,
-/// DCT32X16=10, DCT16X32=11, AFV0..3=14..17, DCT64 family=18..20.
-pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] =
-    [0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20];
+/// DCT32X16=10, DCT16X32=11, AFV0..3=14..17, DCT64 family=18..20,
+/// IDENTITY=1, DCT2X2=2.
+pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [
+    0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20, 1, 2,
+];
 
 const FIRST_BLOCK_BIT: u8 = 1;
 
@@ -140,14 +146,16 @@ impl AcStrategyImage {
     pub(crate) fn covered_blocks_x_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 2, DCT16X32: 4, AFV0..3: 1}
-        static LUT: [u8; NUM_STRATEGIES] = [1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8];
+        static LUT: [u8; NUM_STRATEGIES] =
+            [1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1];
         LUT[strategy as usize] as usize
     }
     #[inline]
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 4, DCT16X32: 2, AFV0..3: 1}
-        static LUT: [u8; NUM_STRATEGIES] = [1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4];
+        static LUT: [u8; NUM_STRATEGIES] =
+            [1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4, 1, 1];
         LUT[strategy as usize] as usize
     }
 
@@ -284,7 +292,9 @@ mod tests {
                 is_sub8_strategy(strategy),
                 matches!(
                     strategy,
-                    STRATEGY_DCT4X4
+                    STRATEGY_IDENTITY
+                        | STRATEGY_DCT2X2
+                        | STRATEGY_DCT4X4
                         | STRATEGY_DCT4X8
                         | STRATEGY_DCT8X4
                         | STRATEGY_AFV0
@@ -294,6 +304,16 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn fine_strategies_use_the_spec_wire_codes() {
+        assert_eq!(STRATEGY_CODE_LUT[STRATEGY_IDENTITY as usize], 1);
+        assert_eq!(STRATEGY_CODE_LUT[STRATEGY_DCT2X2 as usize], 2);
+        assert_eq!(AcStrategyImage::covered_blocks_x_of(STRATEGY_IDENTITY), 1);
+        assert_eq!(AcStrategyImage::covered_blocks_y_of(STRATEGY_IDENTITY), 1);
+        assert_eq!(AcStrategyImage::covered_blocks_x_of(STRATEGY_DCT2X2), 1);
+        assert_eq!(AcStrategyImage::covered_blocks_y_of(STRATEGY_DCT2X2), 1);
     }
 
     #[test]
