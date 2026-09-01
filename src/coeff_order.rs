@@ -108,7 +108,7 @@ pub(crate) fn tokenize_permutation(zigzag: &[u32], skip: usize, tokens: &mut Vec
 /// `(order index, llf blocks, coefficient count)`.
 ///
 /// Indices come from `K_STRATEGY_ORDER`: 0 = DCT8, 1 = the 8x8-sized family
-/// (DCT4X4/4X8/8X4), 2 = DCT16X16, 3 = DCT32X32, 4 = DCT16X8/8X16,
+/// (IDENTITY/DCT2X2/DCT4X4/4X8/8X4/AFV), 2 = DCT16X16, 3 = DCT32X32, 4 = DCT16X8/8X16,
 /// 6 = DCT32X16/16X32. DCT64X64 uses group 7 but intentionally stays on its
 /// natural order, so it has no entry here and is never signaled.
 pub(crate) static ORDER_SPECS: [(usize, usize, usize); 6] = [

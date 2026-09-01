@@ -1042,7 +1042,9 @@ fn write_dc_global(
 }
 
 /// Which `custom_tables` slot a strategy's quant table lives in, or `None` when
-/// its table is not one jixel can override (DCT4X4 uses table 3).
+/// its table is not one jixel can override (DCT4X4, IDENTITY and DCT2X2 stay
+/// on their spec library tables — a 2026-09 fitted-table experiment for the
+/// fine transforms was refuted on photos).
 #[inline]
 fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
     Some(match raw_strategy {
@@ -2410,7 +2412,7 @@ pub(crate) struct PendingAcGroup {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Set up one DC group (quant field, AC strategy, CfL, DCT4X4 gate); its AC
+/// Set up one DC group (quant field, AC strategy, CfL, sub-8 gate); its AC
 /// groups are encoded separately. Returns the data and its group-grid dims.
 fn setup_dc_group(
     ctx: &EncodingContext,
@@ -2519,7 +2521,7 @@ fn setup_dc_group(
         num_threads,
     );
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
-    // where DCT4X4, DCT4X8, or DCT8X4 wins the per-block RD comparison, but a
+    // where a fine 8x8-family strategy wins the per-block RD comparison, but a
     // sparse set can disrupt prefix-code clustering of the (otherwise nearly
     // free) AC-strategy meta stream. Measure the *real* meta-token cost with the
     // exact selected set vs with all of it reverted to DCT8, and retain the set
@@ -2553,7 +2555,6 @@ fn setup_dc_group(
             // else: leave reverted to DCT8.
         }
     }
-
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
 }
 

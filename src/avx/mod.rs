@@ -57,11 +57,12 @@ pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dark_aq::{dark_structure_stats_avx2, fill_blue_tile_avx2};
 pub(crate) use dct::{
     dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
-    dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct4x4_avx2, dct4x8_avx2, dct8x4_avx2,
-    dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2, dct32x16_avx2,
-    dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2,
-    inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
-    inv_dct32x64_avx2, inv_dct64x32_avx2, inv_dct64x64_avx2,
+    dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct2x2_8x8_avx2, dct4x4_avx2, dct4x8_avx2,
+    dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2,
+    dct32x16_avx2, dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, identity8x8_avx2,
+    inv_dct2x2_8x8_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2, inv_dct16x8_avx2, inv_dct16x16_avx2,
+    inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2, inv_dct32x64_avx2, inv_dct64x32_avx2,
+    inv_dct64x64_avx2, inv_identity8x8_avx2,
 };
 pub(crate) use entropy::counts_bit_cost_avx2;
 pub(crate) use frame::chroma_gradient_sums_avx2;

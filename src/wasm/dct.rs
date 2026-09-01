@@ -199,6 +199,238 @@ fn scale_and_store(cols: &[WasmDoubledVector; 8], scale: f32, out: &mut [f32; 64
     }
 }
 
+#[inline]
+#[target_feature(enable = "simd128")]
+fn hsum(v: v128) -> f32 {
+    f32x4_extract_lane::<0>(v)
+        + f32x4_extract_lane::<1>(v)
+        + f32x4_extract_lane::<2>(v)
+        + f32x4_extract_lane::<3>(v)
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn identity8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut means = [0.0f32; 4];
+    for qy in 0..2 {
+        let anchor_row = input.row(qy * 4 + 1);
+        let anchor_lo = f32x4_splat(anchor_row[1]);
+        let anchor_hi = f32x4_splat(anchor_row[5]);
+        let mut sum_lo = f32x4_splat(0.0);
+        let mut sum_hi = f32x4_splat(0.0);
+        for iy in 0..4 {
+            let row = input.row(qy * 4 + iy);
+            let pixels_lo = unsafe { v128_load(row.as_ptr().cast()) };
+            let pixels_hi = unsafe { v128_load(row[4..].as_ptr().cast()) };
+            sum_lo = f32x4_add(sum_lo, pixels_lo);
+            sum_hi = f32x4_add(sum_hi, pixels_hi);
+            let residual_lo = f32x4_sub(pixels_lo, anchor_lo);
+            let residual_hi = f32x4_sub(pixels_hi, anchor_hi);
+            let packed_lo = i32x4_shuffle::<0, 4, 1, 5>(residual_lo, residual_hi);
+            let packed_hi = i32x4_shuffle::<2, 6, 3, 7>(residual_lo, residual_hi);
+            let dst = &mut output[(qy + iy * 2) * 8..];
+            unsafe {
+                v128_store(dst.as_mut_ptr().cast(), packed_lo);
+                v128_store(dst[4..].as_mut_ptr().cast(), packed_hi);
+            }
+        }
+        means[qy * 2] = hsum(sum_lo) * (1.0 / 16.0);
+        means[qy * 2 + 1] = hsum(sum_hi) * (1.0 / 16.0);
+    }
+    for qy in 0..2 {
+        for qx in 0..2 {
+            output[(qy + 2) * 8 + qx + 2] = output[qy * 8 + qx];
+        }
+    }
+    let [b00, b01, b10, b11] = means;
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn inv_identity8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let c00 = input.row(0)[0];
+    let c01 = input.row(0)[1];
+    let c10 = input.row(1)[0];
+    let c11 = input.row(1)[1];
+    let means = [
+        c00 + c01 + c10 + c11,
+        c00 + c01 - c10 - c11,
+        c00 - c01 + c10 - c11,
+        c00 - c01 - c10 + c11,
+    ];
+    for qy in 0..2 {
+        let mut left = [f32x4_splat(0.0); 4];
+        let mut right = [f32x4_splat(0.0); 4];
+        for iy in 0..4 {
+            let row = input.row(qy + iy * 2);
+            let packed_lo = unsafe { v128_load(row.as_ptr().cast()) };
+            let packed_hi = unsafe { v128_load(row[4..].as_ptr().cast()) };
+            left[iy] = i32x4_shuffle::<0, 2, 4, 6>(packed_lo, packed_hi);
+            right[iy] = i32x4_shuffle::<1, 3, 5, 7>(packed_lo, packed_hi);
+        }
+        left[0] = f32x4_replace_lane::<0>(left[0], input.row(qy + 2)[2]);
+        right[0] = f32x4_replace_lane::<0>(right[0], input.row(qy + 2)[3]);
+        left[1] = f32x4_replace_lane::<1>(left[1], 0.0);
+        right[1] = f32x4_replace_lane::<1>(right[1], 0.0);
+        let left_sum = f32x4_add(f32x4_add(left[0], left[1]), f32x4_add(left[2], left[3]));
+        let right_sum = f32x4_add(f32x4_add(right[0], right[1]), f32x4_add(right[2], right[3]));
+        let anchor_lo = f32x4_splat(means[qy * 2] - hsum(left_sum) * (1.0 / 16.0));
+        let anchor_hi = f32x4_splat(means[qy * 2 + 1] - hsum(right_sum) * (1.0 / 16.0));
+        for iy in 0..4 {
+            let dst = &mut output[(qy * 4 + iy) * 8..];
+            unsafe {
+                v128_store(dst.as_mut_ptr().cast(), f32x4_add(left[iy], anchor_lo));
+                v128_store(
+                    dst[4..].as_mut_ptr().cast(),
+                    f32x4_add(right[iy], anchor_hi),
+                );
+            }
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct2x2_forward(a: v128, b: v128, c: v128, d: v128) -> [v128; 4] {
+    let scale = f32x4_splat(0.25);
+    let ab = f32x4_add(a, b);
+    let amb = f32x4_sub(a, b);
+    [
+        f32x4_mul(f32x4_add(f32x4_add(ab, c), d), scale),
+        f32x4_mul(f32x4_sub(f32x4_sub(ab, c), d), scale),
+        f32x4_mul(f32x4_sub(f32x4_add(amb, c), d), scale),
+        f32x4_mul(f32x4_add(f32x4_sub(amb, c), d), scale),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct2x2_inverse(a: v128, b: v128, c: v128, d: v128) -> [v128; 4] {
+    let ab = f32x4_add(a, b);
+    let amb = f32x4_sub(a, b);
+    [
+        f32x4_add(f32x4_add(ab, c), d),
+        f32x4_sub(f32x4_sub(ab, c), d),
+        f32x4_sub(f32x4_add(amb, c), d),
+        f32x4_add(f32x4_sub(amb, c), d),
+    ]
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct2x2_8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    for y in 0..4 {
+        let row0 = input.row(y * 2);
+        let row1 = input.row(y * 2 + 1);
+        let r0lo = unsafe { v128_load(row0.as_ptr().cast()) };
+        let r0hi = unsafe { v128_load(row0[4..].as_ptr().cast()) };
+        let r1lo = unsafe { v128_load(row1.as_ptr().cast()) };
+        let r1hi = unsafe { v128_load(row1[4..].as_ptr().cast()) };
+        let q = dct2x2_forward(
+            i32x4_shuffle::<0, 2, 4, 6>(r0lo, r0hi),
+            i32x4_shuffle::<1, 3, 5, 7>(r0lo, r0hi),
+            i32x4_shuffle::<0, 2, 4, 6>(r1lo, r1hi),
+            i32x4_shuffle::<1, 3, 5, 7>(r1lo, r1hi),
+        );
+        unsafe {
+            v128_store(output[y * 8..].as_mut_ptr().cast(), q[0]);
+            v128_store(output[y * 8 + 4..].as_mut_ptr().cast(), q[1]);
+            v128_store(output[(y + 4) * 8..].as_mut_ptr().cast(), q[2]);
+            v128_store(output[(y + 4) * 8 + 4..].as_mut_ptr().cast(), q[3]);
+        }
+    }
+    let mut stage4 = [[f32x4_splat(0.0); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        let r0 = unsafe { v128_load(output[(y * 2) * 8..].as_ptr().cast()) };
+        let r1 = unsafe { v128_load(output[(y * 2 + 1) * 8..].as_ptr().cast()) };
+        *q = dct2x2_forward(
+            i32x4_shuffle::<0, 2, 0, 2>(r0, r0),
+            i32x4_shuffle::<1, 3, 1, 3>(r0, r0),
+            i32x4_shuffle::<0, 2, 0, 2>(r1, r1),
+            i32x4_shuffle::<1, 3, 1, 3>(r1, r1),
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        output[y * 8] = f32x4_extract_lane::<0>(q[0]);
+        output[y * 8 + 1] = f32x4_extract_lane::<1>(q[0]);
+        output[y * 8 + 2] = f32x4_extract_lane::<0>(q[1]);
+        output[y * 8 + 3] = f32x4_extract_lane::<1>(q[1]);
+        output[(y + 2) * 8] = f32x4_extract_lane::<0>(q[2]);
+        output[(y + 2) * 8 + 1] = f32x4_extract_lane::<1>(q[2]);
+        output[(y + 2) * 8 + 2] = f32x4_extract_lane::<0>(q[3]);
+        output[(y + 2) * 8 + 3] = f32x4_extract_lane::<1>(q[3]);
+    }
+    let a = output[0];
+    let b = output[1];
+    let c = output[8];
+    let d = output[9];
+    output[0] = (a + b + c + d) * 0.25;
+    output[1] = (a + b - c - d) * 0.25;
+    output[8] = (a - b + c - d) * 0.25;
+    output[9] = (a - b - c + d) * 0.25;
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn inv_dct2x2_8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut a = std::array::from_fn::<_, 64, _>(|i| input.row(i / 8)[i % 8]);
+    let c00 = a[0];
+    let c01 = a[1];
+    let c10 = a[8];
+    let c11 = a[9];
+    a[0] = c00 + c01 + c10 + c11;
+    a[1] = c00 + c01 - c10 - c11;
+    a[8] = c00 - c01 + c10 - c11;
+    a[9] = c00 - c01 - c10 + c11;
+    let mut stage4 = [[f32x4_splat(0.0); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        *q = dct2x2_inverse(
+            unsafe { v128_load(a[y * 8..].as_ptr().cast()) },
+            unsafe { v128_load(a[y * 8 + 2..].as_ptr().cast()) },
+            unsafe { v128_load(a[(y + 2) * 8..].as_ptr().cast()) },
+            unsafe { v128_load(a[(y + 2) * 8 + 2..].as_ptr().cast()) },
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        unsafe {
+            v128_store(
+                a[(y * 2) * 8..].as_mut_ptr().cast(),
+                i32x4_shuffle::<0, 4, 1, 5>(q[0], q[1]),
+            );
+            v128_store(
+                a[(y * 2 + 1) * 8..].as_mut_ptr().cast(),
+                i32x4_shuffle::<0, 4, 1, 5>(q[2], q[3]),
+            );
+        }
+    }
+    for y in 0..4 {
+        let q = dct2x2_inverse(
+            unsafe { v128_load(a[y * 8..].as_ptr().cast()) },
+            unsafe { v128_load(a[y * 8 + 4..].as_ptr().cast()) },
+            unsafe { v128_load(a[(y + 4) * 8..].as_ptr().cast()) },
+            unsafe { v128_load(a[(y + 4) * 8 + 4..].as_ptr().cast()) },
+        );
+        unsafe {
+            v128_store(
+                output[(y * 2) * 8..].as_mut_ptr().cast(),
+                i32x4_shuffle::<0, 4, 1, 5>(q[0], q[1]),
+            );
+            v128_store(
+                output[(y * 2) * 8 + 4..].as_mut_ptr().cast(),
+                i32x4_shuffle::<2, 6, 3, 7>(q[0], q[1]),
+            );
+            v128_store(
+                output[(y * 2 + 1) * 8..].as_mut_ptr().cast(),
+                i32x4_shuffle::<0, 4, 1, 5>(q[2], q[3]),
+            );
+            v128_store(
+                output[(y * 2 + 1) * 8 + 4..].as_mut_ptr().cast(),
+                i32x4_shuffle::<2, 6, 3, 7>(q[2], q[3]),
+            );
+        }
+    }
+}
+
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct8x8_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut cols = load(input);

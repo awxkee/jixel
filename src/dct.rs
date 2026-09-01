@@ -155,10 +155,150 @@ impl<'a, const W: usize, const H: usize> DctInput<'a, W, H> {
 pub(crate) type DctFn<const W: usize, const H: usize, const N: usize> =
     for<'a> fn(DctInput<'a, W, H>, &mut [f32; N]);
 
+/// JPEG XL's IDENTITY (historically "Hornuss") transform. Each 4x4 quadrant
+/// stores pixel residuals from its (1,1) anchor; the four quadrant means are
+/// combined by a 2x2 Hadamard in coefficients {0, 1, 8, 9}.
+pub(crate) fn identity8x8(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    for qy in 0..2 {
+        for qx in 0..2 {
+            let anchor = input.row(qy * 4 + 1)[qx * 4 + 1];
+            let mut mean = 0.0f32;
+            for iy in 0..4 {
+                let row = input.row(qy * 4 + iy);
+                for ix in 0..4 {
+                    mean += row[qx * 4 + ix];
+                    if ix == 1 && iy == 1 {
+                        continue;
+                    }
+                    output[(qy + iy * 2) * 8 + qx + ix * 2] = row[qx * 4 + ix] - anchor;
+                }
+            }
+            // Coefficient (qy, qx) is needed for the quadrant mean. Preserve
+            // the displaced top-left residual in the otherwise unused anchor
+            // slot before overwriting it.
+            output[(qy + 2) * 8 + qx + 2] = output[qy * 8 + qx];
+            output[qy * 8 + qx] = mean * (1.0 / 16.0);
+        }
+    }
+    let b00 = output[0];
+    let b01 = output[1];
+    let b10 = output[8];
+    let b11 = output[9];
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
+/// Inverse of [`identity8x8`], used by reconstruction-domain strategy scoring.
+pub(crate) fn inv_identity8x8(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let get = |i: usize| input.row(i / 8)[i % 8];
+    let means = [
+        get(0) + get(1) + get(8) + get(9),
+        get(0) + get(1) - get(8) - get(9),
+        get(0) - get(1) + get(8) - get(9),
+        get(0) - get(1) - get(8) + get(9),
+    ];
+    for qy in 0..2 {
+        for qx in 0..2 {
+            let mut residual_sum = 0.0f32;
+            for iy in 0..4 {
+                for ix in 0..4 {
+                    if ix == 1 && iy == 1 {
+                        continue;
+                    }
+                    let residual = if ix == 0 && iy == 0 {
+                        get((qy + 2) * 8 + qx + 2)
+                    } else {
+                        get((qy + iy * 2) * 8 + qx + ix * 2)
+                    };
+                    residual_sum += residual;
+                }
+            }
+            let anchor = means[qy * 2 + qx] - residual_sum * (1.0 / 16.0);
+            for iy in 0..4 {
+                for ix in 0..4 {
+                    let residual = if ix == 1 && iy == 1 {
+                        0.0
+                    } else if ix == 0 && iy == 0 {
+                        get((qy + 2) * 8 + qx + 2)
+                    } else {
+                        get((qy + iy * 2) * 8 + qx + ix * 2)
+                    };
+                    output[(qy * 4 + iy) * 8 + qx * 4 + ix] = anchor + residual;
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn dct2_top_block<const S: usize>(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut temp = [0.0f32; 64];
+    let half = S / 2;
+    for y in 0..half {
+        let row0 = input.row(y * 2);
+        let row1 = input.row(y * 2 + 1);
+        for x in 0..half {
+            let c00 = row0[x * 2];
+            let c01 = row0[x * 2 + 1];
+            let c10 = row1[x * 2];
+            let c11 = row1[x * 2 + 1];
+            temp[y * 8 + x] = (c00 + c01 + c10 + c11) * 0.25;
+            temp[y * 8 + half + x] = (c00 + c01 - c10 - c11) * 0.25;
+            temp[(y + half) * 8 + x] = (c00 - c01 + c10 - c11) * 0.25;
+            temp[(y + half) * 8 + half + x] = (c00 - c01 - c10 + c11) * 0.25;
+        }
+    }
+    for y in 0..S {
+        output[y * 8..y * 8 + S].copy_from_slice(&temp[y * 8..y * 8 + S]);
+    }
+}
+
+/// Recursive 2x2-Hadamard transform from JPEG XL. The first stage retains
+/// 2-pixel spatial locality, unlike an 8x8 DCT, then the upper-left DC pyramid
+/// is transformed at 4x4 and 2x2 scales.
+pub(crate) fn dct2x2_8x8(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    dct2_top_block::<8>(input, output);
+    let snapshot = *output;
+    dct2_top_block::<4>(DctInput::from_flat(&snapshot), output);
+    let snapshot = *output;
+    dct2_top_block::<2>(DctInput::from_flat(&snapshot), output);
+}
+
+#[inline]
+fn inv_dct2_top_block<const S: usize>(input: &[f32; 64], output: &mut [f32; 64]) {
+    let half = S / 2;
+    for y in 0..half {
+        for x in 0..half {
+            let r00 = input[y * 8 + x];
+            let r01 = input[y * 8 + half + x];
+            let r10 = input[(y + half) * 8 + x];
+            let r11 = input[(y + half) * 8 + half + x];
+            output[(y * 2) * 8 + x * 2] = r00 + r01 + r10 + r11;
+            output[(y * 2) * 8 + x * 2 + 1] = r00 + r01 - r10 - r11;
+            output[(y * 2 + 1) * 8 + x * 2] = r00 - r01 + r10 - r11;
+            output[(y * 2 + 1) * 8 + x * 2 + 1] = r00 - r01 - r10 + r11;
+        }
+    }
+}
+
+pub(crate) fn inv_dct2x2_8x8(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut a = std::array::from_fn::<_, 64, _>(|i| input.row(i / 8)[i % 8]);
+    let snapshot = a;
+    inv_dct2_top_block::<2>(&snapshot, &mut a);
+    let snapshot = a;
+    inv_dct2_top_block::<4>(&snapshot, &mut a);
+    let snapshot = a;
+    inv_dct2_top_block::<8>(&snapshot, output);
+}
+
 /// Inverse-transform dispatch table resolved once and retained by the encoding
 /// context. Rectangular transforms use their normalized coefficient layout in
 /// the function type, hence both orientations share the same input dimensions.
 pub(crate) struct IdctMethods {
+    pub(crate) inv_identity8x8: DctFn<8, 8, 64>,
+    pub(crate) inv_dct2x2_8x8: DctFn<8, 8, 64>,
     pub(crate) idct8x8: DctFn<8, 8, 64>,
     pub(crate) idct8x16: DctFn<16, 8, 128>,
     pub(crate) idct16x8: DctFn<16, 8, 128>,
@@ -174,6 +314,8 @@ pub(crate) struct IdctMethods {
 impl IdctMethods {
     pub(crate) const fn scalar() -> Self {
         Self {
+            inv_identity8x8,
+            inv_dct2x2_8x8,
             idct8x8: inv_dct8x8,
             idct8x16: inv_dct8x16,
             idct16x8: inv_dct16x8,
@@ -194,6 +336,12 @@ fn select_idct_methods() -> IdctMethods {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         return IdctMethods {
+            inv_identity8x8: |input, output| unsafe {
+                crate::avx::inv_identity8x8_avx2(input, output)
+            },
+            inv_dct2x2_8x8: |input, output| unsafe {
+                crate::avx::inv_dct2x2_8x8_avx2(input, output)
+            },
             idct8x8: |input, output| unsafe { crate::avx::inv_dct8x8_avx2(input, output) },
             idct8x16: |input, output| unsafe { crate::avx::inv_dct8x16_avx2(input, output) },
             idct16x8: |input, output| unsafe { crate::avx::inv_dct16x8_avx2(input, output) },
@@ -210,6 +358,12 @@ fn select_idct_methods() -> IdctMethods {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
         return IdctMethods {
+            inv_identity8x8: |input, output| unsafe {
+                crate::neon::inv_identity8x8_neon(input, output)
+            },
+            inv_dct2x2_8x8: |input, output| unsafe {
+                crate::neon::inv_dct2x2_8x8_neon(input, output)
+            },
             idct8x8: |input, output| unsafe { crate::neon::inv_dct8x8_neon(input, output) },
             idct8x16: |input, output| unsafe { crate::neon::inv_dct8x16_neon(input, output) },
             idct16x8: |input, output| unsafe { crate::neon::inv_dct16x8_neon(input, output) },
@@ -223,12 +377,71 @@ fn select_idct_methods() -> IdctMethods {
         };
     }
 
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return IdctMethods {
+            inv_identity8x8: |input, output| unsafe {
+                crate::wasm::inv_identity8x8_wasm(input, output)
+            },
+            inv_dct2x2_8x8: |input, output| unsafe {
+                crate::wasm::inv_dct2x2_8x8_wasm(input, output)
+            },
+            ..IdctMethods::scalar()
+        };
+    }
+
     #[allow(unreachable_code)]
     IdctMethods::scalar()
 }
 
 pub(crate) fn selected_idct_methods() -> &'static IdctMethods {
     IDCT_METHODS.get_or_init(select_idct_methods)
+}
+
+static IDENTITY_METHOD: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
+
+fn select_identity() -> DctFn<8, 8, 64> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |input, output| unsafe { crate::neon::identity8x8_neon(input, output) };
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return |input, output| unsafe { crate::wasm::identity8x8_wasm(input, output) };
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |input, output| unsafe { crate::avx::identity8x8_avx2(input, output) };
+    }
+    #[allow(unreachable_code)]
+    identity8x8
+}
+
+pub(crate) fn selected_identity8x8() -> &'static DctFn<8, 8, 64> {
+    IDENTITY_METHOD.get_or_init(select_identity)
+}
+
+static DCT2X2_METHOD: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
+
+fn select_dct2x2() -> DctFn<8, 8, 64> {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |input, output| unsafe { crate::neon::dct2x2_8x8_neon(input, output) };
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        return |input, output| unsafe { crate::wasm::dct2x2_8x8_wasm(input, output) };
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        return |input, output| unsafe { crate::avx::dct2x2_8x8_avx2(input, output) };
+    }
+    #[allow(unreachable_code)]
+    dct2x2_8x8
+}
+
+pub(crate) fn selected_dct2x2_8x8() -> &'static DctFn<8, 8, 64> {
+    DCT2X2_METHOD.get_or_init(select_dct2x2)
 }
 
 static DCT_METHOD: OnceLock<DctFn<8, 8, 64>> = OnceLock::new();
@@ -2868,6 +3081,44 @@ mod tests {
         let second = EncodingContext::default();
         assert!(std::ptr::eq(first.idct, selected_idct_methods()));
         assert!(std::ptr::eq(first.idct, second.idct));
+    }
+
+    #[test]
+    fn identity8x8_round_trips_and_preserves_dc_scale() {
+        let input = std::array::from_fn::<_, 64, _>(|i| {
+            let x = (i % 8) as f32;
+            let y = (i / 8) as f32;
+            0.31 * x - 0.17 * y + (x * y * 0.23).sin()
+        });
+        let mut coeffs = [0.0f32; 64];
+        identity8x8(DctInput::from_flat(&input), &mut coeffs);
+        let expected_dc = input.iter().sum::<f32>() * (1.0 / 64.0);
+        assert!((coeffs[0] - expected_dc).abs() < 1e-6);
+
+        let mut recon = [0.0f32; 64];
+        inv_identity8x8(DctInput::from_flat(&coeffs), &mut recon);
+        for (want, got) in input.iter().zip(recon) {
+            assert!((want - got).abs() < 2e-6, "{want} != {got}");
+        }
+    }
+
+    #[test]
+    fn dct2x2_8x8_round_trips_and_preserves_dc_scale() {
+        let input = std::array::from_fn::<_, 64, _>(|i| {
+            let x = (i % 8) as f32;
+            let y = (i / 8) as f32;
+            (0.37 * x + 0.61 * y).sin() + 0.07 * x * y
+        });
+        let mut coeffs = [0.0f32; 64];
+        dct2x2_8x8(DctInput::from_flat(&input), &mut coeffs);
+        let expected_dc = input.iter().sum::<f32>() * (1.0 / 64.0);
+        assert!((coeffs[0] - expected_dc).abs() < 1e-6);
+
+        let mut recon = [0.0f32; 64];
+        inv_dct2x2_8x8(DctInput::from_flat(&coeffs), &mut recon);
+        for (want, got) in input.iter().zip(recon) {
+            assert!((want - got).abs() < 2e-6, "{want} != {got}");
+        }
     }
 
     #[test]

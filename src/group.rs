@@ -34,9 +34,9 @@ use crate::ac_context::{
 };
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3,
-    STRATEGY_DCT, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+    STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
+    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
+    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
@@ -839,6 +839,14 @@ pub(crate) fn write_ac_group(
                         let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                         (ctx.dct8x8)(DctInput::new(input, stride), dst);
                     }
+                    STRATEGY_IDENTITY => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.identity8x8)(DctInput::new(input, stride), dst);
+                    }
+                    STRATEGY_DCT2X2 => {
+                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                        (ctx.dct2x2_8x8)(DctInput::new(input, stride), dst);
+                    }
                     STRATEGY_DCT16X8 => {
                         let dst: &mut [f32; 128] = coeffs[c].first_chunk_mut::<128>().unwrap();
                         (ctx.dct16x8)(DctInput::new(input, stride), dst);
@@ -913,6 +921,8 @@ pub(crate) fn write_ac_group(
             let mut dc_vals = [[0.0f32; 64]; 3];
             match raw_strategy {
                 STRATEGY_DCT
+                | STRATEGY_IDENTITY
+                | STRATEGY_DCT2X2
                 | STRATEGY_DCT4X4
                 | STRATEGY_DCT4X8
                 | STRATEGY_DCT8X4
@@ -1012,6 +1022,14 @@ pub(crate) fn write_ac_group(
             // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
                     STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
+                    STRATEGY_IDENTITY => (
+                        &matrices.inv_matrix_identity(1)[..],
+                        &matrices.matrix_identity(1)[..],
+                    ),
+                    STRATEGY_DCT2X2 => (
+                        &matrices.inv_matrix_dct2x2(1)[..],
+                        &matrices.matrix_dct2x2(1)[..],
+                    ),
                     STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
                     STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
                         (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
@@ -1114,6 +1132,8 @@ pub(crate) fn write_ac_group(
             let mut b_dc_post = [0.0f32; 64];
             match raw_strategy {
                 STRATEGY_DCT
+                | STRATEGY_IDENTITY
+                | STRATEGY_DCT2X2
                 | STRATEGY_DCT4X4
                 | STRATEGY_DCT4X8
                 | STRATEGY_DCT8X4
@@ -1199,6 +1219,8 @@ pub(crate) fn write_ac_group(
             }
             let inv_qm_x: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
+                STRATEGY_IDENTITY => &matrices.inv_matrix_identity(0)[..],
+                STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(0)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
                 STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(0)[..],
@@ -1292,6 +1314,8 @@ pub(crate) fn write_ac_group(
             }
             let inv_qm_b: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],
+                STRATEGY_IDENTITY => &matrices.inv_matrix_identity(2)[..],
+                STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(2)[..],
                 STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
                 STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
                 STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(2)[..],

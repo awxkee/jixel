@@ -757,6 +757,11 @@ pub(crate) struct DequantMatrices {
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT.
     pub(crate) inv_matrix: HeapMatrix<f32, 3, 64>,
+    /// Spec-default IDENTITY/Hornuss table.
+    pub(crate) matrix_identity: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_identity: HeapMatrix<f32, 3, 64>,
+    pub(crate) matrix_dct2x2: HeapMatrix<f32, 3, 64>,
+    pub(crate) inv_matrix_dct2x2: HeapMatrix<f32, 3, 64>,
     /// 16×8 / 8×16 dequant matrix. Both rectangular transforms share these
     /// 128 floats per channel (libjxl-tiny convention).
     pub(crate) matrix_16x8: HeapMatrix<f32, 3, 128>,
@@ -1461,9 +1466,84 @@ fn compute_dct32x16_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 
 
 /// Quant tables that do not depend on the SS2-retune distance gate, computed
 /// once per process and cloned into both `DequantMatrices` variants.
+/// Spec (JPEG XL library) IDENTITY / Hornuss table: per channel
+/// `[base, edge, corner]` weights. A 2026-09 Optuna refit of these tables
+/// (via signalled custom kQuantModeID/DCT2 headers) was refuted on a mixed
+/// holdout: fitted tables win screen content but damage photos, and no
+/// global table beats the spec values.
+const IDENTITY_WEIGHTS: [[f32; 3]; 3] = [
+    [280.0, 3160.0, 3160.0],
+    [60.0, 864.0, 864.0],
+    [18.0, 200.0, 200.0],
+];
+/// Spec recursive DCT2X2 table: per channel six band weights.
+const DCT2_WEIGHTS: [[f32; 6]; 3] = [
+    [3840.0, 2560.0, 1280.0, 640.0, 480.0, 300.0],
+    [960.0, 640.0, 320.0, 180.0, 140.0, 120.0],
+    [640.0, 320.0, 128.0, 64.0, 32.0, 16.0],
+];
+
+/// Builds the `(matrix, inv_matrix)` pairs for IDENTITY and DCT2X2.
+type FineMatrixPair = (HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>);
+
+fn build_fine_matrices() -> (FineMatrixPair, FineMatrixPair) {
+    let mut matrix_identity = HeapMatrix::new(0.0);
+    let mut inv_matrix_identity = HeapMatrix::new(0.0);
+    for c in 0..3 {
+        let mut weights = [IDENTITY_WEIGHTS[c][0]; 64];
+        weights[1] = IDENTITY_WEIGHTS[c][1];
+        weights[8] = IDENTITY_WEIGHTS[c][1];
+        weights[9] = IDENTITY_WEIGHTS[c][2];
+        for (k, weight) in weights.into_iter().enumerate() {
+            matrix_identity[c][k] = 1.0 / weight;
+            if k != 0 {
+                inv_matrix_identity[c][k] = weight;
+            }
+        }
+    }
+
+    let mut matrix_dct2x2 = HeapMatrix::new(0.0);
+    let mut inv_matrix_dct2x2 = HeapMatrix::new(0.0);
+    for c in 0..3 {
+        let w = DCT2_WEIGHTS[c];
+        let mut weights = [0xBAD as f32; 64];
+        weights[1] = w[0];
+        weights[8] = w[0];
+        weights[9] = w[1];
+        for y in 0..2 {
+            for x in 0..2 {
+                weights[y * 8 + x + 2] = w[2];
+                weights[(y + 2) * 8 + x] = w[2];
+                weights[(y + 2) * 8 + x + 2] = w[3];
+            }
+        }
+        for y in 0..4 {
+            for x in 0..4 {
+                weights[y * 8 + x + 4] = w[4];
+                weights[(y + 4) * 8 + x] = w[4];
+                weights[(y + 4) * 8 + x + 4] = w[5];
+            }
+        }
+        for (k, weight) in weights.into_iter().enumerate() {
+            matrix_dct2x2[c][k] = 1.0 / weight;
+            if k != 0 {
+                inv_matrix_dct2x2[c][k] = weight;
+            }
+        }
+    }
+    (
+        (matrix_identity, inv_matrix_identity),
+        (matrix_dct2x2, inv_matrix_dct2x2),
+    )
+}
+
 struct SharedTables {
     matrix: HeapMatrix<f32, 3, 64>,
     inv_matrix: HeapMatrix<f32, 3, 64>,
+    matrix_identity: HeapMatrix<f32, 3, 64>,
+    inv_matrix_identity: HeapMatrix<f32, 3, 64>,
+    matrix_dct2x2: HeapMatrix<f32, 3, 64>,
+    inv_matrix_dct2x2: HeapMatrix<f32, 3, 64>,
     matrix_16x8: HeapMatrix<f32, 3, 128>,
     inv_matrix_16x8: HeapMatrix<f32, 3, 128>,
     matrix_4x4: HeapMatrix<f32, 3, 64>,
@@ -1546,9 +1626,16 @@ fn shared_tables() -> &'static SharedTables {
             }
         }
 
+        let ((matrix_identity, inv_matrix_identity), (matrix_dct2x2, inv_matrix_dct2x2)) =
+            build_fine_matrices();
+
         Box::new(SharedTables {
             matrix,
             inv_matrix,
+            matrix_identity,
+            inv_matrix_identity,
+            matrix_dct2x2,
+            inv_matrix_dct2x2,
             matrix_16x8,
             inv_matrix_16x8,
             matrix_4x4,
@@ -1688,6 +1775,10 @@ impl DequantMatrices {
         Self {
             matrix,
             inv_matrix,
+            matrix_identity: shared.matrix_identity.clone(),
+            inv_matrix_identity: shared.inv_matrix_identity.clone(),
+            matrix_dct2x2: shared.matrix_dct2x2.clone(),
+            inv_matrix_dct2x2: shared.inv_matrix_dct2x2.clone(),
             matrix_16x8: shared.matrix_16x8.clone(),
             inv_matrix_16x8: shared.inv_matrix_16x8.clone(),
             matrix_16x16,
@@ -1728,6 +1819,23 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix(&self, c: usize) -> &[f32; 64] {
         &self.inv_matrix[c]
+    }
+
+    #[inline]
+    pub(crate) fn matrix_identity(&self, c: usize) -> &[f32; 64] {
+        &self.matrix_identity[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_identity(&self, c: usize) -> &[f32; 64] {
+        &self.inv_matrix_identity[c]
+    }
+    #[inline]
+    pub(crate) fn matrix_dct2x2(&self, c: usize) -> &[f32; 64] {
+        &self.matrix_dct2x2[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_dct2x2(&self, c: usize) -> &[f32; 64] {
+        &self.inv_matrix_dct2x2[c]
     }
 
     /// 16×8 dequant matrix (also used for 8×16 with reinterpreted indexing).
@@ -1826,13 +1934,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_and_dct2_tables_match_the_jpeg_xl_library() {
+        let m = DequantMatrices::new(0.0);
+        let identity = m.inv_matrix_identity(0);
+        assert_eq!(identity[0], 0.0);
+        assert_eq!(identity[1], 3160.0);
+        assert_eq!(identity[8], 3160.0);
+        assert_eq!(identity[9], 3160.0);
+        assert_eq!(identity[2], 280.0);
+        assert_eq!(m.matrix_identity(0)[2], 1.0 / 280.0);
+
+        let dct2 = m.inv_matrix_dct2x2(2);
+        assert_eq!(dct2[0], 0.0);
+        assert_eq!(dct2[1], 640.0);
+        assert_eq!(dct2[9], 320.0);
+        assert_eq!(dct2[2], 128.0);
+        assert_eq!(dct2[18], 64.0);
+        assert_eq!(dct2[4], 32.0);
+        assert_eq!(dct2[36], 16.0);
+        assert_eq!(m.matrix_dct2x2(2)[36], 1.0 / 16.0);
+    }
+
+    #[test]
     fn dequant_matrices_are_only_heap_handles() {
         // One handle (plus the custom-table box) per table, nothing inline: the
         // struct must stay small enough to live on a 64 KiB stack.
         let size = std::mem::size_of::<DequantMatrices>();
-        // The DCT64 rectangle family adds one matrix/inverse pair (two Box
-        // handles), taking the expected footprint from 312 to 328 bytes.
-        assert!(size <= 328, "DequantMatrices grew to {size} bytes");
+        // The DCT64 rectangle family and the IDENTITY/DCT2X2 tables add three
+        // matrix/inverse pairs (six Box handles), taking the expected footprint
+        // from 296 to 392 bytes.
+        assert!(size <= 392, "DequantMatrices grew to {size} bytes");
     }
 
     #[test]

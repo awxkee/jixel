@@ -144,6 +144,244 @@ fn dct1d_8_flat(c: &mut [__m256; 8]) {
     c[7] = odds[3];
 }
 
+#[inline]
+#[target_feature(enable = "avx2")]
+fn hsum128(v: __m128) -> f32 {
+    let pair = _mm_hadd_ps(v, v);
+    _mm_cvtss_f32(_mm_hadd_ps(pair, pair))
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn identity8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut means = [0.0f32; 4];
+    for qy in 0..2 {
+        let anchor_row = input.row(qy * 4 + 1);
+        let anchors = _mm256_setr_ps(
+            anchor_row[1],
+            anchor_row[1],
+            anchor_row[1],
+            anchor_row[1],
+            anchor_row[5],
+            anchor_row[5],
+            anchor_row[5],
+            anchor_row[5],
+        );
+        let mut sum = _mm256_setzero_ps();
+        for iy in 0..4 {
+            let pixels = unsafe { _mm256_loadu_ps(input.row(qy * 4 + iy).as_ptr()) };
+            sum = _mm256_add_ps(sum, pixels);
+            let residual = _mm256_sub_ps(pixels, anchors);
+            let lo = _mm256_castps256_ps128(residual);
+            let hi = _mm256_extractf128_ps::<1>(residual);
+            let dst = &mut output[(qy + iy * 2) * 8..];
+            unsafe {
+                _mm_storeu_ps(dst.as_mut_ptr(), _mm_unpacklo_ps(lo, hi));
+                _mm_storeu_ps(dst[4..].as_mut_ptr(), _mm_unpackhi_ps(lo, hi));
+            }
+        }
+        means[qy * 2] = hsum128(_mm256_castps256_ps128(sum)) * (1.0 / 16.0);
+        means[qy * 2 + 1] = hsum128(_mm256_extractf128_ps::<1>(sum)) * (1.0 / 16.0);
+    }
+
+    for qy in 0..2 {
+        for qx in 0..2 {
+            output[(qy + 2) * 8 + qx + 2] = output[qy * 8 + qx];
+        }
+    }
+    let [b00, b01, b10, b11] = means;
+    output[0] = (b00 + b01 + b10 + b11) * 0.25;
+    output[1] = (b00 + b01 - b10 - b11) * 0.25;
+    output[8] = (b00 - b01 + b10 - b11) * 0.25;
+    output[9] = (b00 - b01 - b10 + b11) * 0.25;
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn inv_identity8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let c00 = input.row(0)[0];
+    let c01 = input.row(0)[1];
+    let c10 = input.row(1)[0];
+    let c11 = input.row(1)[1];
+    let means = [
+        c00 + c01 + c10 + c11,
+        c00 + c01 - c10 - c11,
+        c00 - c01 + c10 - c11,
+        c00 - c01 - c10 + c11,
+    ];
+
+    for qy in 0..2 {
+        let mut left = [_mm_setzero_ps(); 4];
+        let mut right = [_mm_setzero_ps(); 4];
+        for iy in 0..4 {
+            let row = input.row(qy + iy * 2);
+            let packed_lo = unsafe { _mm_loadu_ps(row.as_ptr()) };
+            let packed_hi = unsafe { _mm_loadu_ps(row[4..].as_ptr()) };
+            left[iy] = _mm_shuffle_ps::<0x88>(packed_lo, packed_hi);
+            right[iy] = _mm_shuffle_ps::<0xdd>(packed_lo, packed_hi);
+        }
+        left[0] = _mm_blend_ps::<0x1>(left[0], _mm_set_ss(input.row(qy + 2)[2]));
+        right[0] = _mm_blend_ps::<0x1>(right[0], _mm_set_ss(input.row(qy + 2)[3]));
+        left[1] = _mm_blend_ps::<0x2>(left[1], _mm_setzero_ps());
+        right[1] = _mm_blend_ps::<0x2>(right[1], _mm_setzero_ps());
+
+        let left_sum = _mm_add_ps(_mm_add_ps(left[0], left[1]), _mm_add_ps(left[2], left[3]));
+        let right_sum = _mm_add_ps(
+            _mm_add_ps(right[0], right[1]),
+            _mm_add_ps(right[2], right[3]),
+        );
+        let anchor_lo = _mm_set1_ps(means[qy * 2] - hsum128(left_sum) * (1.0 / 16.0));
+        let anchor_hi = _mm_set1_ps(means[qy * 2 + 1] - hsum128(right_sum) * (1.0 / 16.0));
+        for iy in 0..4 {
+            let dst = &mut output[(qy * 4 + iy) * 8..];
+            unsafe {
+                _mm_storeu_ps(dst.as_mut_ptr(), _mm_add_ps(left[iy], anchor_lo));
+                _mm_storeu_ps(dst[4..].as_mut_ptr(), _mm_add_ps(right[iy], anchor_hi));
+            }
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dct2x2_forward(a: __m128, b: __m128, c: __m128, d: __m128) -> [__m128; 4] {
+    let scale = _mm_set1_ps(0.25);
+    let ab = _mm_add_ps(a, b);
+    let amb = _mm_sub_ps(a, b);
+    [
+        _mm_mul_ps(_mm_add_ps(_mm_add_ps(ab, c), d), scale),
+        _mm_mul_ps(_mm_sub_ps(_mm_sub_ps(ab, c), d), scale),
+        _mm_mul_ps(_mm_sub_ps(_mm_add_ps(amb, c), d), scale),
+        _mm_mul_ps(_mm_add_ps(_mm_sub_ps(amb, c), d), scale),
+    ]
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dct2x2_inverse(a: __m128, b: __m128, c: __m128, d: __m128) -> [__m128; 4] {
+    let ab = _mm_add_ps(a, b);
+    let amb = _mm_sub_ps(a, b);
+    [
+        _mm_add_ps(_mm_add_ps(ab, c), d),
+        _mm_sub_ps(_mm_sub_ps(ab, c), d),
+        _mm_sub_ps(_mm_add_ps(amb, c), d),
+        _mm_add_ps(_mm_sub_ps(amb, c), d),
+    ]
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dct2x2_8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    for y in 0..4 {
+        let r0 = unsafe { _mm256_loadu_ps(input.row(y * 2).as_ptr()) };
+        let r1 = unsafe { _mm256_loadu_ps(input.row(y * 2 + 1).as_ptr()) };
+        let r0lo = _mm256_castps256_ps128(r0);
+        let r0hi = _mm256_extractf128_ps::<1>(r0);
+        let r1lo = _mm256_castps256_ps128(r1);
+        let r1hi = _mm256_extractf128_ps::<1>(r1);
+        let q = dct2x2_forward(
+            _mm_shuffle_ps::<0x88>(r0lo, r0hi),
+            _mm_shuffle_ps::<0xdd>(r0lo, r0hi),
+            _mm_shuffle_ps::<0x88>(r1lo, r1hi),
+            _mm_shuffle_ps::<0xdd>(r1lo, r1hi),
+        );
+        unsafe {
+            _mm_storeu_ps(output[y * 8..].as_mut_ptr(), q[0]);
+            _mm_storeu_ps(output[y * 8 + 4..].as_mut_ptr(), q[1]);
+            _mm_storeu_ps(output[(y + 4) * 8..].as_mut_ptr(), q[2]);
+            _mm_storeu_ps(output[(y + 4) * 8 + 4..].as_mut_ptr(), q[3]);
+        }
+    }
+    let mut stage4 = [[_mm_setzero_ps(); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        let r0 = unsafe { _mm_loadu_ps(output[(y * 2) * 8..].as_ptr()) };
+        let r1 = unsafe { _mm_loadu_ps(output[(y * 2 + 1) * 8..].as_ptr()) };
+        *q = dct2x2_forward(
+            _mm_shuffle_ps::<0x88>(r0, r0),
+            _mm_shuffle_ps::<0xdd>(r0, r0),
+            _mm_shuffle_ps::<0x88>(r1, r1),
+            _mm_shuffle_ps::<0xdd>(r1, r1),
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        unsafe {
+            _mm_store_sd(output[y * 8..].as_mut_ptr().cast(), _mm_castps_pd(q[0]));
+            _mm_store_sd(output[y * 8 + 2..].as_mut_ptr().cast(), _mm_castps_pd(q[1]));
+            _mm_store_sd(
+                output[(y + 2) * 8..].as_mut_ptr().cast(),
+                _mm_castps_pd(q[2]),
+            );
+            _mm_store_sd(
+                output[(y + 2) * 8 + 2..].as_mut_ptr().cast(),
+                _mm_castps_pd(q[3]),
+            );
+        }
+    }
+    let a = output[0];
+    let b = output[1];
+    let c = output[8];
+    let d = output[9];
+    output[0] = (a + b + c + d) * 0.25;
+    output[1] = (a + b - c - d) * 0.25;
+    output[8] = (a - b + c - d) * 0.25;
+    output[9] = (a - b - c + d) * 0.25;
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn inv_dct2x2_8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
+    let mut a = std::array::from_fn::<_, 64, _>(|i| input.row(i / 8)[i % 8]);
+    let c00 = a[0];
+    let c01 = a[1];
+    let c10 = a[8];
+    let c11 = a[9];
+    a[0] = c00 + c01 + c10 + c11;
+    a[1] = c00 + c01 - c10 - c11;
+    a[8] = c00 - c01 + c10 - c11;
+    a[9] = c00 - c01 - c10 + c11;
+
+    let mut stage4 = [[_mm_setzero_ps(); 4]; 2];
+    for (y, q) in stage4.iter_mut().enumerate() {
+        *q = dct2x2_inverse(
+            unsafe { _mm_loadu_ps(a[y * 8..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[y * 8 + 2..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[(y + 2) * 8..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[(y + 2) * 8 + 2..].as_ptr()) },
+        );
+    }
+    for (y, q) in stage4.into_iter().enumerate() {
+        unsafe {
+            _mm_storeu_ps(a[(y * 2) * 8..].as_mut_ptr(), _mm_unpacklo_ps(q[0], q[1]));
+            _mm_storeu_ps(
+                a[(y * 2 + 1) * 8..].as_mut_ptr(),
+                _mm_unpacklo_ps(q[2], q[3]),
+            );
+        }
+    }
+    for y in 0..4 {
+        let q = dct2x2_inverse(
+            unsafe { _mm_loadu_ps(a[y * 8..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[y * 8 + 4..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[(y + 4) * 8..].as_ptr()) },
+            unsafe { _mm_loadu_ps(a[(y + 4) * 8 + 4..].as_ptr()) },
+        );
+        unsafe {
+            _mm_storeu_ps(
+                output[(y * 2) * 8..].as_mut_ptr(),
+                _mm_unpacklo_ps(q[0], q[1]),
+            );
+            _mm_storeu_ps(
+                output[(y * 2) * 8 + 4..].as_mut_ptr(),
+                _mm_unpackhi_ps(q[0], q[1]),
+            );
+            _mm_storeu_ps(
+                output[(y * 2 + 1) * 8..].as_mut_ptr(),
+                _mm_unpacklo_ps(q[2], q[3]),
+            );
+            _mm_storeu_ps(
+                output[(y * 2 + 1) * 8 + 4..].as_mut_ptr(),
+                _mm_unpackhi_ps(q[2], q[3]),
+            );
+        }
+    }
+}
+
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct8x8_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     let mut rows = load(input);
@@ -1489,6 +1727,62 @@ mod tests {
             scalar(DctInput::from_flat(input), &mut want);
             assert_close(&got, &want, &format!("{label} case={case}"));
         }
+    }
+
+    #[test]
+    fn test_identity8x8_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(0x1de0_0000 + seed);
+            let mut strided = [f32::NAN; 88];
+            for y in 0..8 {
+                strided[y * 11..y * 11 + 8].copy_from_slice(&input[y * 8..y * 8 + 8]);
+            }
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { crate::avx::identity8x8_avx2(DctInput::new(&strided, 11), &mut got) };
+            crate::dct::identity8x8(DctInput::from_flat(&input), &mut want);
+            assert_close(&got, &want, &format!("identity8x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_inverse_identity8x8_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_identity8x8,
+            crate::avx::inv_identity8x8_avx2,
+            "inverse_identity8x8",
+        );
+    }
+
+    #[test]
+    fn test_dct2x2_8x8_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for seed in 0u64..32 {
+            let input: [f32; 64] = fill(0xd2d2_0000 + seed);
+            let mut strided = [f32::NAN; 88];
+            for y in 0..8 {
+                strided[y * 11..y * 11 + 8].copy_from_slice(&input[y * 8..y * 8 + 8]);
+            }
+            let mut got = [0.0f32; 64];
+            let mut want = [0.0f32; 64];
+            unsafe { crate::avx::dct2x2_8x8_avx2(DctInput::new(&strided, 11), &mut got) };
+            crate::dct::dct2x2_8x8(DctInput::from_flat(&input), &mut want);
+            assert_close(&got, &want, &format!("dct2x2_8x8 seed={seed}"));
+        }
+    }
+
+    #[test]
+    fn test_inverse_dct2x2_8x8_avx2_matches_scalar() {
+        assert_inverse_matches_scalar(
+            crate::dct::inv_dct2x2_8x8,
+            crate::avx::inv_dct2x2_8x8_avx2,
+            "inverse_dct2x2_8x8",
+        );
     }
 
     #[test]

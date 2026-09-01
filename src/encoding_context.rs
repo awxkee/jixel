@@ -94,6 +94,8 @@ pub(crate) struct EncodingContext {
     pub(crate) fill_ytob_residuals: color_correlation::FillYtobResidualsFn,
 
     pub(crate) idct: &'static dct::IdctMethods,
+    pub(crate) identity8x8: &'static dct::DctFn<8, 8, 64>,
+    pub(crate) dct2x2_8x8: &'static dct::DctFn<8, 8, 64>,
     pub(crate) dct8x8: &'static dct::DctFn<8, 8, 64>,
     pub(crate) dct8x16: &'static dct::DctFn<16, 8, 128>,
     pub(crate) dct16x8: &'static dct::DctFn<8, 16, 128>,
@@ -247,6 +249,8 @@ impl EncodingContext {
             fill_ytob_residuals: color_correlation::selected_fill_ytob_residuals_fn(),
 
             idct: dct::selected_idct_methods(),
+            identity8x8: dct::selected_identity8x8(),
+            dct2x2_8x8: dct::selected_dct2x2_8x8(),
             dct8x8: dct::selected_dct8x8(),
             dct8x16: dct::selected_dct8x16(),
             dct16x8: dct::selected_dct16x8(),
