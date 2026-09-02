@@ -169,6 +169,10 @@ pub(crate) struct MaLearnParams {
     /// Whether leaves may use the Weighted Predictor and splits the WP-error
     /// property. Both force per-pixel WP state in the decoder.
     pub(crate) allow_wp: bool,
+    /// Bitmask of decoder predictor ids leaves may use (bit p = predictor p).
+    /// The lossy-modular path restricts leaves to scale-equivariant
+    /// predictors; everywhere else this is `u16::MAX`.
+    pub(crate) allowed_preds: u16,
 }
 
 /// Reusable scratch for scoring one property of one MA-tree node. One lives in
@@ -176,7 +180,7 @@ pub(crate) struct MaLearnParams {
 /// evaluated concurrently without per-node allocation.
 pub(crate) struct MaPropertyScratch {
     bin_hist: Vec<u32>,
-    bin_nbits: [u64; MAX_CANDIDATES + 1],
+    bin_nbits: Vec<u64>,
     left_hist: Vec<u32>,
     probe: Vec<i32>,
     cands: Vec<i32>,
@@ -186,7 +190,7 @@ impl Default for MaPropertyScratch {
     fn default() -> Self {
         Self {
             bin_hist: Vec::new(),
-            bin_nbits: [0; MAX_CANDIDATES + 1],
+            bin_nbits: vec![0; MAX_CANDIDATES + 1],
             left_hist: Vec::new(),
             probe: Vec::with_capacity(MAX_QUANTILE_PROBE + 1),
             cands: Vec::with_capacity(MAX_CANDIDATES),
@@ -358,6 +362,9 @@ impl<'a> Learner<'a> {
         let mut best_pred = 0usize;
         for p in 0..NUM_MA_PREDS {
             if skip_wp && p == PRED_WEIGHTED {
+                continue;
+            }
+            if self.p.allowed_preds & (1 << p) == 0 {
                 continue;
             }
             let bits = hist_entropy_bits(&self.all_hist[p * alpha..(p + 1) * alpha], total)
@@ -712,6 +719,7 @@ mod tests {
                 split_cost_bits: 10.0,
                 min_node: 64,
                 allow_wp: true,
+                allowed_preds: u16::MAX,
             },
             &serial_pool,
             &mut serial_scratch,
@@ -726,6 +734,7 @@ mod tests {
                 split_cost_bits: 10.0,
                 min_node: 64,
                 allow_wp: true,
+                allowed_preds: u16::MAX,
             },
             &parallel_pool,
             &mut parallel_scratch,
@@ -764,6 +773,7 @@ mod tests {
                 split_cost_bits: 10.0,
                 min_node: 64,
                 allow_wp: true,
+                allowed_preds: u16::MAX,
             },
             &ThreadPool::new(1),
             &mut CoderScratch::default(),
@@ -807,6 +817,7 @@ mod tests {
             split_cost_bits: 10.0,
             min_node: 64,
             allow_wp: true,
+            allowed_preds: u16::MAX,
         };
         let pool = ThreadPool::new(1);
         let indexed = learn_ma_tree_indexed(

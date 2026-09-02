@@ -187,12 +187,30 @@ pub(crate) struct MergeTuning {
     pub(crate) rerank_margin: f32,
     /// Heterogeneity merge-risk gate strength (see [`MERGE_RISK_K`]).
     pub(crate) risk_k: f32,
+    /// DCT64-family acceptance factors (see [`ACCEPT_64`]/[`ACCEPT_64_RECT`]).
+    pub(crate) accept_64: f32,
+    pub(crate) accept_64_rect: f32,
 }
+
+/// Very-low-quality band
+const VLQ_D0: f32 = 4.0;
+const VLQ_D1: f32 = 7.5;
+const VLQ_MARGIN_PAIR: f32 = -0.005;
+const VLQ_MARGIN_16: f32 = 0.067;
+const VLQ_MARGIN_32_RECT: f32 = 0.363;
+const VLQ_MARGIN_32: f32 = 0.045;
+const VLQ_BIAS_RECT: f32 = 1.073;
+const VLQ_BIAS_16X16: f32 = 0.880;
+const VLQ_BIAS_32X32: f32 = 0.867;
+const VLQ_BIAS_RECT32: f32 = 1.180;
+const VLQ_RERANK_MARGIN: f32 = 0.782;
+const VLQ_ACCEPT_64: f32 = 0.973;
+const VLQ_ACCEPT_64_RECT: f32 = 0.736;
 
 impl MergeTuning {
     pub(crate) fn new(distance: f32) -> Self {
         let accept = |margin: Banded| 1.0 - merge_margin(distance, margin);
-        Self {
+        let mut tuning = Self {
             bias_rect: BIAS_RECT.at(distance),
             bias_16x16: BIAS_16X16.at(distance),
             bias_32x32: BIAS_32X32.at(distance),
@@ -207,7 +225,25 @@ impl MergeTuning {
             } else {
                 0.0
             },
+            accept_64: dct64_accept(),
+            accept_64_rect: dct64_rect_accept(),
+        };
+        let vlq_t = ((distance - VLQ_D0) / (VLQ_D1 - VLQ_D0)).clamp(0.0, 1.0);
+        if vlq_t > 0.0 {
+            let lerp = |cur: f32, vlq: f32| fmla(vlq_t, vlq - cur, cur);
+            tuning.bias_rect = lerp(tuning.bias_rect, VLQ_BIAS_RECT);
+            tuning.bias_16x16 = lerp(tuning.bias_16x16, VLQ_BIAS_16X16);
+            tuning.bias_32x32 = lerp(tuning.bias_32x32, VLQ_BIAS_32X32);
+            tuning.bias_rect32 = lerp(tuning.bias_rect32, VLQ_BIAS_RECT32);
+            tuning.accept_pair = lerp(tuning.accept_pair, 1.0 - VLQ_MARGIN_PAIR);
+            tuning.accept_16 = lerp(tuning.accept_16, 1.0 - VLQ_MARGIN_16);
+            tuning.accept_32_rect = lerp(tuning.accept_32_rect, 1.0 - VLQ_MARGIN_32_RECT);
+            tuning.accept_32 = lerp(tuning.accept_32, 1.0 - VLQ_MARGIN_32);
+            tuning.rerank_margin = lerp(tuning.rerank_margin, VLQ_RERANK_MARGIN);
+            tuning.accept_64 = lerp(tuning.accept_64, VLQ_ACCEPT_64);
+            tuning.accept_64_rect = lerp(tuning.accept_64_rect, VLQ_ACCEPT_64_RECT);
         }
+        tuning
     }
 }
 

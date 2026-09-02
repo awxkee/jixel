@@ -335,6 +335,22 @@ pub(crate) fn apply_step_inverse(channels: &mut Vec<Channel>, s: &SqueezeStep) {
 /// Build a simple alternating H/V pyramid over channels [0,num_c), squeezing
 /// until both dimensions are <= 8 (kMaxFirstPreviewSize). Valid, explicit
 /// (signaled) sequence — need not match libjxl's chroma-first default.
+pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+    let mut steps = Vec::new();
+    if num_c >= 3 {
+        for horizontal in [true, false] {
+            steps.push(SqueezeStep {
+                horizontal,
+                in_place: false,
+                begin_c: 1,
+                num_c: 2,
+            });
+        }
+    }
+    steps.extend(default_squeeze_steps(w, h, num_c));
+    steps
+}
+
 pub(crate) fn default_squeeze_steps(mut w: usize, mut h: usize, num_c: usize) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     const MAX_PREVIEW: usize = 8;

@@ -889,6 +889,207 @@ fn cluster_histograms_inner(
     context_map.extend(symbols.iter().map(|&symbol| remap[symbol as usize]));
 }
 
+/// rANS-aware clustering for context sets whose distributions are too skewed
+/// for the prefix-cost model above: with sub-bit symbols an integer-depth
+/// Huffman cost cannot see the difference between contexts, so the greedy
+/// search collapses exactly when finely split contexts help most (per-pixel
+/// MA-tree contexts in the lossy-modular path). Costs here are the exact ANS
+/// model — payload plus the serialized frequency table — so a merge delta
+/// automatically prices both the entropy loss and the saved table header.
+pub(crate) fn cluster_histograms_ans(
+    histograms: &mut [Histogram],
+    context_map: &mut [u8],
+) -> usize {
+    use super::ans::fast_ans_population_cost;
+    let n = histograms.len();
+    assert!(context_map.len() >= n);
+    if n <= 1 {
+        context_map[..n].fill(0);
+        return n;
+    }
+    let cost_of = |h: &Histogram| -> f64 {
+        if h.total_count == 0 {
+            0.0
+        } else {
+            fast_ans_population_cost(&h.counts, 1)
+        }
+    };
+    let merge_cost = |a: &Histogram, b: &Histogram| -> f64 {
+        let mut counts = a.counts;
+        add_counts(&mut counts, &b.counts);
+        fast_ans_population_cost(&counts, 1)
+    };
+
+    let in_costs: Vec<f64> = histograms.iter().map(&cost_of).collect();
+
+    // Greedy k-center: seed with the heaviest context, keep adding the context
+    // farthest (most expensive to fold into any existing cluster) while
+    // keeping it separate still pays for its own table.
+    let mut clusters: Vec<Histogram> = Vec::new();
+    let mut cluster_costs: Vec<f64> = Vec::new();
+    let mut dists = vec![f64::MAX; n];
+    let mut seed = 0usize;
+    let mut seed_count = 0u32;
+    for (i, h) in histograms.iter().enumerate() {
+        if h.total_count > seed_count {
+            seed_count = h.total_count;
+            seed = i;
+        }
+    }
+    if seed_count == 0 {
+        histograms[0] = Histogram::new();
+        context_map[..n].fill(0);
+        return 1;
+    }
+    while clusters.len() < CLUSTERS_LIMIT {
+        clusters.push(histograms[seed].clone());
+        cluster_costs.push(in_costs[seed]);
+        dists[seed] = 0.0;
+        let last = clusters.len() - 1;
+        let mut next_seed = seed;
+        let mut next_dist = 0.0f64;
+        for (i, h) in histograms.iter().enumerate() {
+            if dists[i] == 0.0 || h.total_count == 0 {
+                if h.total_count == 0 {
+                    dists[i] = 0.0;
+                }
+                continue;
+            }
+            let d = merge_cost(h, &clusters[last]) - in_costs[i] - cluster_costs[last];
+            if d < dists[i] {
+                dists[i] = d;
+            }
+            if dists[i] > next_dist {
+                next_dist = dists[i];
+                next_seed = i;
+            }
+        }
+        if next_dist <= 0.0 {
+            break;
+        }
+        seed = next_seed;
+    }
+    let num_seeds = clusters.len();
+
+    // Assign every context to its cheapest cluster, rebuild, then refine with
+    // move passes under the same cost.
+    let mut assignment = vec![0u8; n];
+    for (i, h) in histograms.iter().enumerate() {
+        if h.total_count == 0 {
+            continue;
+        }
+        let mut best = 0usize;
+        let mut best_d = f64::MAX;
+        for c in 0..num_seeds {
+            let d = merge_cost(h, &clusters[c]) - cluster_costs[c];
+            if d < best_d {
+                best_d = d;
+                best = c;
+            }
+        }
+        assignment[i] = best as u8;
+    }
+    let rebuild =
+        |clusters: &mut Vec<Histogram>, cluster_costs: &mut Vec<f64>, assignment: &[u8]| {
+            for c in clusters.iter_mut() {
+                *c = Histogram::new();
+            }
+            for (h, &a) in histograms.iter().zip(assignment) {
+                histogram_add(&mut clusters[a as usize], h);
+            }
+            for (c, cost) in clusters.iter().zip(cluster_costs.iter_mut()) {
+                *cost = cost_of(c);
+            }
+        };
+    rebuild(&mut clusters, &mut cluster_costs, &assignment);
+
+    for _ in 0..2 {
+        let mut changed = false;
+        for i in 0..n {
+            if histograms[i].total_count == 0 {
+                continue;
+            }
+            let old = assignment[i] as usize;
+            let mut without = clusters[old].clone();
+            histogram_sub(&mut without, &histograms[i]);
+            let remove_delta = cost_of(&without) - cluster_costs[old];
+            let mut best = old;
+            let mut best_delta = 0.0f64;
+            for c in 0..num_seeds {
+                if c == old {
+                    continue;
+                }
+                let add_delta = merge_cost(&histograms[i], &clusters[c]) - cluster_costs[c];
+                let delta = remove_delta + add_delta;
+                if delta < best_delta - 0.01 {
+                    best_delta = delta;
+                    best = c;
+                }
+            }
+            if best != old {
+                histogram_sub(&mut clusters[old], &histograms[i]);
+                histogram_add(&mut clusters[best], &histograms[i]);
+                cluster_costs[old] = cost_of(&clusters[old]);
+                cluster_costs[best] = cost_of(&clusters[best]);
+                assignment[i] = best as u8;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Final agglomerative pass: merge any cluster pair whose combined table +
+    // payload beats keeping them apart.
+    let mut active: Vec<bool> = clusters.iter().map(|c| c.total_count != 0).collect();
+    loop {
+        let mut best_pair = None;
+        let mut best_delta = -1e-6f64;
+        for a in 0..num_seeds {
+            if !active[a] {
+                continue;
+            }
+            for b in a + 1..num_seeds {
+                if !active[b] {
+                    continue;
+                }
+                let delta =
+                    merge_cost(&clusters[a], &clusters[b]) - cluster_costs[a] - cluster_costs[b];
+                if delta < best_delta {
+                    best_delta = delta;
+                    best_pair = Some((a, b));
+                }
+            }
+        }
+        let Some((a, b)) = best_pair else { break };
+        let bh = clusters[b].clone();
+        histogram_add(&mut clusters[a], &bh);
+        cluster_costs[a] = cost_of(&clusters[a]);
+        active[b] = false;
+        for m in assignment.iter_mut() {
+            if *m == b as u8 {
+                *m = a as u8;
+            }
+        }
+    }
+
+    // Compact in first-use order (the context map convention downstream).
+    let mut remap = vec![u8::MAX; num_seeds];
+    let mut ordered: Vec<Histogram> = Vec::new();
+    for (i, &a) in assignment.iter().enumerate() {
+        let a = a as usize;
+        if remap[a] == u8::MAX {
+            remap[a] = ordered.len() as u8;
+            ordered.push(clusters[a].clone());
+        }
+        context_map[i] = remap[a];
+    }
+    let num = ordered.len();
+    histograms[..num].clone_from_slice(&ordered);
+    num
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

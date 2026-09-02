@@ -65,14 +65,26 @@ pub(crate) fn write_lfglobal_alpha_section(
 ) {
     assert_eq!(alpha.len(), xsize * ysize);
     if xsize <= GROUP_DIM && ysize <= GROUP_DIM {
-        // Small path: everything in the LfGlobal section.
-        write_group_header_local_tree(w);
+        // Small path: everything in the LfGlobal section. Same two candidates
+        // as `write_ac_group_alpha`: plain single-context prefix coding vs the
+        // lossless path's LZ77+rANS section; exact bit comparison picks.
         let tokens = tokenize_channel(alpha, xsize, ysize, 0, 0, xsize, ysize, xsize);
-        let pixel_code = build_pixel_code(&tokens, scratch);
-        write_tree_and_pixel_histograms(&pixel_code, scratch, w);
-        let code_ref = pixel_code.as_ref();
-        for tok in &tokens {
-            write_token(*tok, &code_ref, w);
+        let mut plain = BitWriter::new();
+        {
+            write_group_header_local_tree(&mut plain);
+            let pixel_code = build_pixel_code(&tokens, scratch);
+            write_tree_and_pixel_histograms(&pixel_code, scratch, &mut plain);
+            let code_ref = pixel_code.as_ref();
+            for tok in &tokens {
+                write_token(*tok, &code_ref, &mut plain);
+            }
+        }
+        let mut lz = BitWriter::new();
+        let lz_ok = crate::lossless::write_single_channel_lz77_section(&tokens, scratch, &mut lz);
+        if lz_ok && lz.bits_written() < plain.bits_written() {
+            w.append(&lz);
+        } else {
+            w.append(&plain);
         }
     } else {
         // Large path: just the GroupHeader; pixels come per AC group.
@@ -147,15 +159,34 @@ pub(crate) fn write_ac_group_alpha(
         }
     }
 
-    const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
-    let pixel_code = build_pixel_code_n(&scratch.alpha_tokens, NUM_CTX, &mut scratch.huffman_pool);
-    write_group_header_local_tree(w); // use_global_tree=0, wp default, 0 transforms
-    write_split_tree(scratch, w); // 2-leaf Gradient tree, split on property 9 at 0
-    w.write(1, 0); // no LZ77 for the pixel entropy code
-    write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w); // context map + 2 prefix codes
-    let code_ref = pixel_code.as_ref();
-    for tok in &scratch.alpha_tokens {
-        write_token(*tok, &code_ref, w);
+    // Candidate A (plain): 2-leaf grad-sign tree + per-leaf prefix codes.
+    // Optimal for exactly-constant planes, where the bulk leaf degenerates to a
+    // zero-bit single-symbol code. Candidate B (LZ77): single-leaf Gradient
+    // tree + run collapse + rANS, shared with the lossless path; rescues
+    // near-constant planes, where a few impure pixels otherwise force the
+    // 1 bit/pixel prefix floor onto every pixel of the group. Exact bit
+    // comparison picks per group.
+    let tokens = std::mem::take(&mut scratch.alpha_tokens);
+    let mut plain = BitWriter::new();
+    {
+        const NUM_CTX: usize = 2; // leaf 0 (grad > 0), leaf 1 (grad <= 0)
+        let pixel_code = build_pixel_code_n(&tokens, NUM_CTX, &mut scratch.huffman_pool);
+        write_group_header_local_tree(&mut plain); // use_global_tree=0, wp default, 0 transforms
+        write_split_tree(scratch, &mut plain); // 2-leaf Gradient tree, split on property 9 at 0
+        plain.write(1, 0); // no LZ77 for the pixel entropy code
+        write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, &mut plain);
+        let code_ref = pixel_code.as_ref();
+        for tok in &tokens {
+            write_token(*tok, &code_ref, &mut plain);
+        }
+    }
+    let mut lz = BitWriter::new();
+    let lz_ok = crate::lossless::write_single_channel_lz77_section(&tokens, scratch, &mut lz);
+    scratch.alpha_tokens = tokens;
+    if lz_ok && lz.bits_written() < plain.bits_written() {
+        w.append(&lz);
+    } else {
+        w.append(&plain);
     }
 }
 
@@ -464,45 +495,6 @@ fn tokenize_ac_group_alpha<T: AlphaSample>(
     }
 }
 
-/// Collapse runs of identical packed residuals in RASTER order into LZ77 copies.
-/// A run of L identical values is emitted as one literal (first pixel) followed,
-/// when `L-1 >= LZ77_MIN_LENGTH`, by a copy of `L-1` covering the rest. The copy
-/// length symbol is coded on the context of the first copied pixel (the pixel
-/// right after the literal), matching how the decoder reads it.
-#[allow(dead_code)]
-fn lz77_compress_alpha(tokens: &[Token]) -> Vec<crate::lz77_ac::AcLz> {
-    use crate::lz77_ac::{AcLz, LZ77_MIN_LENGTH};
-    let mut out: Vec<AcLz> = Vec::with_capacity(tokens.len());
-    let mut i = 0;
-    while i < tokens.len() {
-        let v = tokens[i].value;
-        // Always emit the first element of the run as a literal (on its context).
-        out.push(AcLz::Lit {
-            context: tokens[i].context,
-            value: v,
-        });
-        // Extend the run over identical *values* (context is irrelevant during a
-        // copy — the decoder ignores it while replaying window values).
-        let mut j = i + 1;
-        while j < tokens.len() && tokens[j].value == v {
-            j += 1;
-        }
-        let run_extra = (j - i - 1) as u32; // copied pixels after the literal
-        if run_extra >= LZ77_MIN_LENGTH {
-            // Copy covers pixels [i+1, j); length symbol coded on pixel (i+1)'s
-            // context, distance 1 (repeat previous value).
-            out.push(AcLz::Copy {
-                context: tokens[i + 1].context,
-                length_value: run_extra - LZ77_MIN_LENGTH,
-            });
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
 /// GroupHeader: use_global_tree=0, wp_header.all_default=1, 0 transforms.
 /// (4 bits)  Used for the LfGlobal local-tree path.
 pub(crate) fn write_group_header_local_tree(w: &mut BitWriter) {
@@ -591,26 +583,6 @@ fn write_split_tree(scratch: &mut CoderScratch, w: &mut BitWriter) {
     for tok in &tree_tokens {
         write_token(*tok, &tree_code_ref, w);
     }
-}
-
-/// Estimate the encoded size in bits of the plain (non-LZ) pixel token stream.
-#[allow(dead_code)]
-fn estimate_plain_bits(tokens: &[Token], code: &OwnedEntropyCode) -> u64 {
-    let code_ref = code.as_ref();
-    let mut bits: u64 = 0;
-    for t in tokens {
-        let (sym, nbits, _) = crate::entropy::uint_encode(t.value);
-        let cl = code_ref.context_map[t.context as usize] as usize;
-        let pc = &code_ref.prefix_codes[cl];
-        // Single-symbol contexts cost 0 code bits (only extra bits).
-        let d = if pc.single_symbol {
-            0
-        } else {
-            pc.depths[sym as usize] as u64
-        };
-        bits += d + nbits as u64;
-    }
-    bits
 }
 
 pub(crate) fn build_pixel_code(tokens: &[Token], scratch: &mut CoderScratch) -> OwnedEntropyCode {

@@ -139,19 +139,38 @@ fn dc_refinement(distance: f32) -> f32 {
     }
 }
 
+/// Very-low-quality DC/EPF re-fit (SS2 ~4-45; Optuna study dcepf_vlq
+/// 2026-09-02): a linear ramp from the shipped constants at `DCEPF_VLQ_D0` to
+/// much coarser DC (x0.45) plus stronger EPF (sharpness 1, 3 iterations) at
+/// `DCEPF_VLQ_D1`. Kodak d7-26 at full strength: −6.5% BD-rate at matched SS2
+/// AND −10.4% at matched butteraugli-3-norm, 24/24 images on both. The win is
+/// earned at d>=14 (segment BD: d7-10 neutral, d14+ −8..−16%), and the shipped
+/// values are correct through d≈6.5, hence the late, steep ramp. Gaborish was
+/// probed and stays off.
+const DCEPF_VLQ_D0: f32 = 8.0;
+const DCEPF_VLQ_D1: f32 = 15.0;
+const VLQ_DC_MUL: f32 = 0.45;
+
+#[inline]
+fn dcepf_vlq_t(distance: f32) -> f32 {
+    ((distance - DCEPF_VLQ_D0) / (DCEPF_VLQ_D1 - DCEPF_VLQ_D0)).clamp(0.0, 1.0)
+}
+
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content.
+    // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
+    // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
     let refine = dc_refinement(distance);
+    let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
     let effective = k_dc_mul * (distance / k_dc_mul).powf(k_dc_quant_pow);
     let effective = f32::clamp(effective, 0.5 * distance, distance);
-    (k_dc_quant / effective).min(50.0) * refine
+    (k_dc_quant / effective).min(50.0) * refine * vlq
 }
 
 fn compute_distance_params(distance: f32) -> DistanceParams {
@@ -190,6 +209,10 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
             epf_iters += 1;
         }
     }
+    if dcepf_vlq_t(distance) >= 0.5 {
+        epf_iters = 3;
+    }
+    let gab_enabled = false; // measured net-negative for rate-matched SSIMU2
 
     DistanceParams {
         distance,
@@ -199,7 +222,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
-        gab_enabled: false, // measured net-negative for rate-matched SSIMU2
+        gab_enabled,
     }
 }
 
@@ -588,6 +611,14 @@ pub(crate) fn collect_ac_metadata_tokens(
 }
 
 fn epf_sharpness_id(distance: f32) -> i32 {
+    let t = dcepf_vlq_t(distance);
+    if t >= 0.75 {
+        return 1;
+    } else if t >= 0.5 {
+        return 2;
+    } else if t >= 0.25 {
+        return 3;
+    }
     if distance < 1.75 {
         7
     } else if distance < 2.75 {
@@ -1237,6 +1268,92 @@ pub(crate) fn encode_frame(
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
     }
+    // Lossy-modular arm (quantized Squeeze): whole-frame modular encoding of
+    // the XYB image at a distance calibrated to match the VarDCT arm's
+    // quality. Force always takes the arm when the frame supports it; Auto
+    // (Slow only) dual-encodes and keeps the smaller frame.
+    if alpha.is_none() && ctx.lossy_modular == crate::LossyModular::Force {
+        let mut modular_writer = BitWriter::new();
+        if crate::lossless::encode_frame_lossy_modular_squeeze(
+            &xyb,
+            crate::lossless::lm_calibrated_distance(distance),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut modular_writer,
+        ) {
+            writer.append(&modular_writer);
+            return Ok(());
+        }
+    }
+    if alpha.is_none()
+        && ctx.lossy_modular == crate::LossyModular::Auto
+        && ctx.speed == crate::Speed::Slow
+    {
+        // Byte cushion for the calibration's per-image quality noise
+        // (two-corpus + Optuna joint fit, study lossy_modular_v3 2026-09-02).
+        const LM_GATE_MARGIN: f64 = 1.066;
+        let mut vardct_writer = BitWriter::new();
+        let xyb_for_modular = xyb.clone();
+        encode_frame_vardct(
+            ctx,
+            scratch,
+            distance,
+            &distp,
+            xyb,
+            is_achromatic,
+            alpha,
+            coeff_shifts,
+            patches,
+            &mut vardct_writer,
+        )?;
+        let mut modular_writer = BitWriter::new();
+        if crate::lossless::encode_frame_lossy_modular_squeeze(
+            &xyb_for_modular,
+            crate::lossless::lm_calibrated_distance(distance),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut modular_writer,
+        ) && (modular_writer.bits_written() as f64) * LM_GATE_MARGIN
+            < vardct_writer.bits_written() as f64
+        {
+            writer.append(&modular_writer);
+        } else {
+            writer.append(&vardct_writer);
+        }
+        return Ok(());
+    }
+    encode_frame_vardct(
+        ctx,
+        scratch,
+        distance,
+        &distp,
+        xyb,
+        is_achromatic,
+        alpha,
+        coeff_shifts,
+        patches,
+        writer,
+    )
+}
+
+/// The VarDCT arm of lossy encoding (regular or patched), from a prepared XYB
+/// image.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_vardct(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    distp: &DistanceParams,
+    xyb: Image3F,
+    is_achromatic: bool,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    patches: bool,
+    writer: &mut BitWriter,
+) -> Result<(), EncodeError> {
+    let mut xyb = xyb;
     let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
     let saturation_stat = if slow_chromatic {
         chroma_saturation_stat(&xyb)
@@ -1441,15 +1558,10 @@ const B_GRAD_THRESHOLD: f32 = 0.45;
 
 /// Fine-B precision for the synthetic high-frequency opponent-color class.
 /// Scale 7 is the strongest representable multiplier and remained efficient
-/// at matched rate on the fitted d=0.5/1/1.25/1.5 points. Keep an override for
-/// regression studies without perturbing the yellow-only selector.
+/// at matched rate on the fitted d=0.5/1/1.25/1.5 points.
 #[inline]
 fn x_heavy_b_qm_scale() -> u32 {
-    std::env::var("JIXEL_XHEAVY_B_QM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v: &u32| (2..=7).contains(&v))
-        .unwrap_or(7)
+    7
 }
 
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
@@ -1585,6 +1697,7 @@ fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_core(
     ctx: &EncodingContext,
@@ -2918,18 +3031,22 @@ mod tests {
     }
 
     #[test]
-    fn epf_never_requests_the_third_iteration() {
-        // The third EPF pass erases texture rather than ringing, so the
-        // schedule tops out at two iterations no matter how coarse the
-        // distance gets. Guards against a threshold creeping back in.
+    fn epf_third_iteration_only_in_the_vlq_ramp() {
+        // The third EPF pass erases texture rather than ringing in the normal
+        // bands, so the schedule tops out at two iterations — until the VLQ
+        // ramp (see DCEPF_VLQ_D0), where the fitted schedule restores it at
+        // half-ramp. Guards both the cap and the restoration point.
         for d in [0.0, 0.1, 0.5, 0.69] {
             assert_eq!(compute_distance_params(d).epf_iters, 0, "d={d}");
         }
         for d in [0.7, 1.0, 1.49] {
             assert_eq!(compute_distance_params(d).epf_iters, 1, "d={d}");
         }
-        for d in [1.5, 2.0, 4.0, 6.0, 12.0, 25.0] {
+        for d in [1.5, 2.0, 4.0, 6.0, 8.0, 11.0] {
             assert_eq!(compute_distance_params(d).epf_iters, 2, "d={d}");
+        }
+        for d in [11.5, 15.0, 25.0] {
+            assert_eq!(compute_distance_params(d).epf_iters, 3, "d={d}");
         }
     }
 
@@ -2940,7 +3057,12 @@ mod tests {
         assert_eq!(epf_sharpness_id(2.75), 5);
         assert_eq!(epf_sharpness_id(3.49), 5);
         assert_eq!(epf_sharpness_id(3.5), 4);
-        assert_eq!(epf_sharpness_id(25.0), 4);
+        // VLQ ramp steps (quarter-points of DCEPF_VLQ_D0..D1 = 8..15).
+        assert_eq!(epf_sharpness_id(9.74), 4);
+        assert_eq!(epf_sharpness_id(9.75), 3);
+        assert_eq!(epf_sharpness_id(11.5), 2);
+        assert_eq!(epf_sharpness_id(13.25), 1);
+        assert_eq!(epf_sharpness_id(25.0), 1);
     }
 
     #[test]

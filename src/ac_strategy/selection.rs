@@ -1145,7 +1145,7 @@ pub(crate) fn fill_ac_strategy(
                         )
                 });
 
-                let accept_rect = dct64_rect_accept();
+                let accept_rect = ctx.merge.accept_64_rect;
                 let tall_use = [
                     merge_beats_dct8(tall[0], cost32[0][0] + cost32[1][0], accept_rect),
                     merge_beats_dct8(tall[1], cost32[0][1] + cost32[1][1], accept_rect),
@@ -1173,7 +1173,7 @@ pub(crate) fn fill_ac_strategy(
                 } else {
                     cost32[1][0] + cost32[1][1]
                 };
-                let square_score = cost64 / dct64_accept();
+                let square_score = cost64 / ctx.merge.accept_64;
 
                 if square_score < base_cost
                     && square_score <= tall_score

@@ -46,12 +46,14 @@ fn channel_weights_for_bias(bias: f32) -> [f32; 3] {
     ]
 }
 
-/// Per-encode dispatch table.  The individual modules still own their `OnceLock`
+/// Per-encode dispatch table. The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
 pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
+    /// Lossy arm selection from the public config
+    pub(crate) lossy_modular: crate::LossyModular,
     pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) xyb: xyb::XybMatrix,
     /// Transform-merge knobs resolved at this encodes distance.
@@ -206,6 +208,7 @@ impl EncodingContext {
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
+            lossy_modular: crate::LossyModular::Off,
             boost,
             xyb,
             merge: ac_strategy::MergeTuning::new(distance),
