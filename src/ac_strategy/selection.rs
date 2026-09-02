@@ -989,8 +989,10 @@ pub(crate) fn fill_ac_strategy(
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
+    fine_rollbacks: &mut Vec<FineMergeRollback>,
     num_threads: usize,
 ) -> f32 {
+    fine_rollbacks.clear();
     let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
@@ -1234,6 +1236,13 @@ pub(crate) fn fill_ac_strategy(
             for band_idx in 0..band_count {
                 for di in 0..pipeline.band_scratch[band_idx].rerank_downgrades.len() {
                     let downgrade = pipeline.band_scratch[band_idx].rerank_downgrades[di];
+                    if pipeline.band_scratch[band_idx]
+                        .fine_rollbacks
+                        .iter()
+                        .any(|r| r.bx == downgrade.bx && r.by == downgrade.by)
+                    {
+                        continue;
+                    }
                     for iy in 0..downgrade.cov_y {
                         for ix in 0..downgrade.cov_x {
                             if downgrade.restore[iy * 4 + ix] != STRATEGY_DCT {
@@ -1259,6 +1268,15 @@ pub(crate) fn fill_ac_strategy(
                     }
                 }
             }
+        }
+    }
+
+    // Preserve enough information for the frame-level exact metadata gate to
+    // put back the original merged transforms. A simple sub-8 -> DCT8 revert
+    // would otherwise leave a fine mosaic split into many DCT8 blocks.
+    if reranked {
+        for band in &pipeline.band_scratch[..pipeline.bands.len()] {
+            fine_rollbacks.extend_from_slice(&band.fine_rollbacks);
         }
     }
 
@@ -1298,6 +1316,171 @@ struct RerankContext<'a> {
     num_threads: usize,
 }
 
+const FINE_MOSAIC_BOUNDARY_ALPHA: f32 = 32.0;
+const FINE_MOSAIC_RECON_MARGIN: f32 = 0.85;
+const FINE_MOSAIC_BOUNDARY_RATIO: f32 = 1.0;
+const FINE_MOSAIC_PEAK_RATIO: f32 = 1.0;
+
+#[cfg(test)]
+fn block_boundary_error_energy(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    errors: &[[f32; 1024]; 3],
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    distance: f32,
+) -> f32 {
+    block_boundary_error_stats(ctx, opsin, errors, px, py, width, height, distance).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_boundary_error_stats(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    errors: &[[f32; 1024]; 3],
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+    distance: f32,
+) -> (f32, f32) {
+    let coarse_mix = ((distance - 1.9) / 0.1).clamp(0.0, 1.0);
+    let floor = distance * fmla(coarse_mix, 0.0045 - 0.0015, 0.0015);
+    let mut energy = 0.0f32;
+    let mut peak = 0.0f32;
+    for (c, error) in errors.iter().enumerate() {
+        let plane = opsin.plane(c);
+        let mut channel = 0.0f32;
+        let weight = ctx.channel_weight(c);
+        for x in (8..width).step_by(8) {
+            for y in 0..height {
+                let i = y * width + x;
+                let sy = (py + y).min(plane.ysize() - 1);
+                let left_x = (px + x - 1).min(plane.xsize() - 1);
+                let right_x = (px + x).min(plane.xsize() - 1);
+                let source_gradient = (plane.row(sy)[right_x] - plane.row(sy)[left_x]).abs();
+                let excess =
+                    ((error[i] - error[i - 1]).abs() - 0.5 * source_gradient - floor).max(0.0);
+                channel = fmla(excess, excess, channel);
+                peak = peak.max(weight * excess * excess);
+            }
+        }
+        for y in (8..height).step_by(8) {
+            for x in 0..width {
+                let i = y * width + x;
+                let sx = (px + x).min(plane.xsize() - 1);
+                let top_y = (py + y - 1).min(plane.ysize() - 1);
+                let bottom_y = (py + y).min(plane.ysize() - 1);
+                let source_gradient = (plane.row(bottom_y)[sx] - plane.row(top_y)[sx]).abs();
+                let excess =
+                    ((error[i] - error[i - width]).abs() - 0.5 * source_gradient - floor).max(0.0);
+                channel = fmla(excess, excess, channel);
+                peak = peak.max(weight * excess * excess);
+            }
+        }
+        energy += weight * channel;
+    }
+    (energy, peak)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fine_mosaic_boundary_energies(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    big_strategy: u8,
+    bx: usize,
+    by: usize,
+    cov_x: usize,
+    cov_y: usize,
+    big_qac: f32,
+    fine_grid: &[u8; 16],
+) -> (f32, f32, f32, f32) {
+    let params = rerank.params;
+    let ctx = params.ctx;
+    let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
+    let width = cov_x * 8;
+    let height = cov_y * 8;
+    let mut strategy_error = [[0.0f32; 1024]; 3];
+    reconstruction_strategy_spatial_errors(
+        ctx,
+        scratch,
+        big_strategy,
+        params.opsin,
+        px,
+        py,
+        big_qac,
+        params.qm_mult_x,
+        params.distance,
+        cmap_factors(params.ytox_map, params.ytob_map, bx, by),
+        &mut strategy_error,
+    );
+    let (big_energy, big_peak) = block_boundary_error_stats(
+        ctx,
+        params.opsin,
+        &strategy_error,
+        px,
+        py,
+        width,
+        height,
+        params.distance,
+    );
+
+    let mut mosaic_error = [[0.0f32; 1024]; 3];
+    for iy in 0..cov_y {
+        for ix in 0..cov_x {
+            let strategy = fine_grid[iy * 4 + ix];
+            debug_assert!(matches!(
+                strategy,
+                STRATEGY_DCT | STRATEGY_IDENTITY | STRATEGY_DCT2X2
+            ));
+            let child_bx = bx + ix;
+            let child_by = by + iy;
+            let qac = region_qac(
+                rerank.quant_field,
+                child_bx,
+                child_by,
+                1,
+                1,
+                params.scale,
+                params.distance,
+            );
+            reconstruction_strategy_spatial_errors(
+                ctx,
+                scratch,
+                strategy,
+                params.opsin,
+                px + ix * 8,
+                py + iy * 8,
+                qac,
+                params.qm_mult_x,
+                params.distance,
+                cmap_factors(params.ytox_map, params.ytob_map, child_bx, child_by),
+                &mut strategy_error,
+            );
+            for c in 0..3 {
+                for dy in 0..8 {
+                    let dst = (iy * 8 + dy) * width + ix * 8;
+                    mosaic_error[c][dst..dst + 8]
+                        .copy_from_slice(&strategy_error[c][dy * 8..dy * 8 + 8]);
+                }
+            }
+        }
+    }
+    let (fine_energy, fine_peak) = block_boundary_error_stats(
+        ctx,
+        params.opsin,
+        &mosaic_error,
+        px,
+        py,
+        width,
+        height,
+        params.distance,
+    );
+    (big_energy, fine_energy, big_peak, fine_peak)
+}
+
 fn find_rerank_downgrades(
     rerank: &RerankContext<'_>,
     scratch: &mut CoderScratch,
@@ -1324,6 +1507,7 @@ fn find_rerank_downgrades(
         .map(|s| ((s.bx, s.by), s.grid))
         .collect();
     output.rerank_downgrades.clear();
+    output.fine_rollbacks.clear();
     output.current_costs.clear();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
@@ -1413,6 +1597,13 @@ fn find_rerank_downgrades(
             gradient_peak_alpha,
         );
         let mut j_dct8 = 0.0f32;
+        let with_fine_mosaic = ctx.speed == crate::Speed::Slow
+            && params.distance <= FINE_TRANSFORM_MAX_DISTANCE
+            && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
+        let mut j_fine = 0.0f32;
+        let mut fine_grid = [STRATEGY_DCT; 16];
+        let mut fine_current_costs = [f32::NAN; 16];
+        let mut any_fine = false;
         let tiled_costs_start = output.current_costs.len();
         for iy in 0..cyb {
             for ix in 0..cxb {
@@ -1441,6 +1632,41 @@ fn find_rerank_downgrades(
                     gradient_peak_alpha,
                 );
                 j_dct8 += cost;
+                let mut fine_strategy = STRATEGY_DCT;
+                let mut fine_cost = cost;
+                let mut fine_current_cost = current_cost;
+                if with_fine_mosaic {
+                    let mut candidate = (f32::INFINITY, f32::INFINITY, STRATEGY_DCT);
+                    for strategy in [STRATEGY_IDENTITY, STRATEGY_DCT2X2] {
+                        let (candidate_cost, candidate_current_cost) =
+                            reconstruction_strategy_cost_and_base(
+                                ctx,
+                                scratch,
+                                strategy,
+                                params.opsin,
+                                px + ix * 8,
+                                py + iy * 8,
+                                q,
+                                params.qm_mult_x,
+                                meta_r,
+                                params.distance,
+                                cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
+                                gradient_alpha,
+                                gradient_peak_alpha,
+                            );
+                        if candidate_cost < candidate.0 {
+                            candidate = (candidate_cost, candidate_current_cost, strategy);
+                        }
+                    }
+                    if candidate.0 < cost * FINE_MOSAIC_RECON_MARGIN {
+                        (fine_cost, fine_current_cost, fine_strategy) = candidate;
+                        any_fine = true;
+                    }
+                }
+                let fine_index = iy * 4 + ix;
+                j_fine += fine_cost;
+                fine_grid[fine_index] = fine_strategy;
+                fine_current_costs[fine_index] = fine_current_cost;
                 output.current_costs.push(CachedQuantCost {
                     bx: bx + ix,
                     by: by + iy,
@@ -1500,8 +1726,45 @@ fn find_rerank_downgrades(
 
         let child_wins = j_child < j_dct8;
         let j_alt = if child_wins { j_child } else { j_dct8 };
-        if j_alt < j_big * rerank_margin {
-            let restore = if child_wins {
+        let ordinary_wins = j_alt < j_big * rerank_margin;
+        let mut fine_benefit = 0.0f32;
+        let fine_wins = if !ordinary_wins && any_fine {
+            let (big_boundary, fine_boundary, big_peak, fine_peak) = fine_mosaic_boundary_energies(
+                rerank, scratch, strat, bx, by, cxb, cyb, qac_big, &fine_grid,
+            );
+            let big_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, big_boundary, j_big);
+            let fine_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, fine_boundary, j_fine);
+            let wins = fine_boundary < big_boundary * FINE_MOSAIC_BOUNDARY_RATIO
+                && fine_peak < big_peak * FINE_MOSAIC_PEAK_RATIO
+                && fine_joint < big_joint * rerank_margin
+                && fine_joint < j_child;
+            if wins {
+                fine_benefit = big_joint - fine_joint;
+            }
+            wins
+        } else {
+            false
+        };
+        if ordinary_wins || fine_wins {
+            let restore = if fine_wins {
+                output.current_costs.truncate(child_costs_start);
+                for iy in 0..cyb {
+                    for ix in 0..cxb {
+                        output.current_costs[tiled_costs_start + iy * cxb + ix].cost =
+                            fine_current_costs[iy * 4 + ix];
+                    }
+                }
+                output.fine_rollbacks.push(FineMergeRollback {
+                    bx,
+                    by,
+                    cov_x: cxb,
+                    cov_y: cyb,
+                    strategy: strat,
+                    fine_grid,
+                    benefit: fine_benefit,
+                });
+                fine_grid
+            } else if child_wins {
                 // Drop the DCT8 arm's cached costs, keep the child's.
                 output
                     .current_costs
@@ -1587,12 +1850,13 @@ mod tests {
         RERANK_PAIR_GRADIENT_PEAK_COARSE_END, RERANK_PAIR_GRADIENT_PEAK_COARSE_START,
         RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
         RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
-        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant, cmap_factors,
-        fill_ac_strategy, fill_selection_bands, gradient_region_stats_scalar,
-        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
-        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
-        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
-        strategy_cost, sub8_strategy_costs, use_dct8_only,
+        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant,
+        block_boundary_error_energy, cmap_factors, fill_ac_strategy, fill_selection_bands,
+        gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar, merge_beats_dct8,
+        merge_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
+        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
+        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
+        use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -1605,6 +1869,38 @@ mod tests {
     use crate::inflated_cost::{
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
+
+    #[test]
+    fn boundary_error_energy_detects_artificial_block_seams() {
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            None,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
+        let mut opsin = Image3F::new(16, 8);
+        let smooth = [[0.0f32; 1024]; 3];
+        assert_eq!(
+            block_boundary_error_energy(&ctx, &opsin, &smooth, 0, 0, 16, 8, 1.0),
+            0.0
+        );
+
+        let mut seam = smooth;
+        for y in 0..8 {
+            seam[1][y * 16 + 8..y * 16 + 16].fill(0.1);
+        }
+        let artificial = block_boundary_error_energy(&ctx, &opsin, &seam, 0, 0, 16, 8, 1.0);
+        assert!(artificial > 0.0);
+
+        // A matching edge in the source masks the error jump: genuine image
+        // structure should not be mistaken for transform blockiness.
+        for y in 0..8 {
+            opsin.plane_row_mut(1, y)[8..].fill(0.2);
+        }
+        let source_aligned = block_boundary_error_energy(&ctx, &opsin, &seam, 0, 0, 16, 8, 1.0);
+        assert!(source_aligned < artificial);
+    }
 
     /// Merges are searched at every usable distance; only the near-lossless
     /// tail is DCT8-only. The high-quality band is held back by the banded
@@ -1743,6 +2039,7 @@ mod tests {
         let mut qf = ImageB::new_fill(4, 4, 8);
         let mut strategies = AcStrategyImage::new(4, 4);
         let mut scratch = CoderScratch::default();
+        let mut fine_rollbacks = Vec::new();
         fill_ac_strategy(
             &ctx,
             &mut scratch,
@@ -1756,6 +2053,7 @@ mod tests {
             &maps,
             &maps,
             &mut strategies,
+            &mut fine_rollbacks,
             1,
         );
         assert_eq!(strategies.raw_strategy(0, 0), STRATEGY_DCT32X32);

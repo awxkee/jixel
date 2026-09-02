@@ -151,12 +151,28 @@ pub(crate) struct RerankDowngrade {
     pub(crate) restore: [u8; 16],
 }
 
+/// A large transform that was split only because an Identity/DCT2x2 mosaic
+/// won the joint boundary-aware rerank. The frame-level metadata gate can
+/// restore `strategy` exactly when the full fine-transform map does not repay
+/// its measured entropy cost.
+#[derive(Clone, Copy)]
+pub(crate) struct FineMergeRollback {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cov_x: usize,
+    pub(crate) cov_y: usize,
+    pub(crate) strategy: u8,
+    pub(crate) fine_grid: [u8; 16],
+    pub(crate) benefit: f32,
+}
+
 pub(crate) struct AcStrategyBandScratch {
     pub(crate) strategy: AcStrategyImage,
     pub(crate) benefit: f32,
     pub(crate) chosen32: Vec<Chosen32Cost>,
     pub(crate) saved_children: Vec<SavedChild>,
     pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
+    pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
 }
@@ -169,6 +185,7 @@ impl Default for AcStrategyBandScratch {
             chosen32: Vec::new(),
             saved_children: Vec::new(),
             rerank_downgrades: Vec::new(),
+            fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
         }
@@ -190,12 +207,14 @@ impl AcStrategyBandScratch {
         self.chosen32.clear();
         self.saved_children.clear();
         self.rerank_downgrades.clear();
+        self.fine_rollbacks.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
     }
 
     fn prepare_rerank(&mut self, max_blocks: usize) {
         self.rerank_downgrades.clear();
+        self.fine_rollbacks.clear();
         self.current_costs.clear();
         if self.rerank_downgrades.capacity() < max_blocks {
             self.rerank_downgrades.reserve(max_blocks);

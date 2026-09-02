@@ -15,7 +15,7 @@ fn main() {
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    for _ in 0..0 {
+    for _ in 0..4 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,

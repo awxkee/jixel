@@ -2609,6 +2609,7 @@ fn setup_dc_group(
         &mut dc_data.ytob_map,
         distp.distance,
     );
+    let mut fine_rollbacks = Vec::new();
     dc_data.sub8_benefit = crate::ac_strategy::fill_ac_strategy(
         ctx,
         scratch,
@@ -2622,8 +2623,42 @@ fn setup_dc_group(
         &dc_data.ytox_map,
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
+        &mut fine_rollbacks,
         num_threads,
     );
+    // A fine mosaic that split an otherwise-retained merge must repay its own
+    // exact metadata delta. Keep this separate from the legacy sub-8 gate so
+    // unrelated fine-block gains cannot subsidize a weak mosaic decision.
+    let fine_accepted = if fine_rollbacks.is_empty() {
+        false
+    } else {
+        let fine_benefit: f32 = fine_rollbacks.iter().map(|r| r.benefit).sum();
+        let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        for rollback in &fine_rollbacks {
+            dc_data
+                .ac_strategy
+                .set_first(rollback.bx, rollback.by, rollback.strategy);
+        }
+        let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        let meta_delta = cost_with.saturating_sub(cost_without) as f32;
+        if fine_benefit > crate::ac_strategy::RD_LAMBDA * meta_delta {
+            for rollback in &fine_rollbacks {
+                for iy in 0..rollback.cov_y {
+                    for ix in 0..rollback.cov_x {
+                        dc_data.ac_strategy.set_first(
+                            rollback.bx + ix,
+                            rollback.by + iy,
+                            rollback.fine_grid[iy * 4 + ix],
+                        );
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    };
+
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
     // where a fine 8x8-family strategy wins the per-block RD comparison, but a
     // sparse set can disrupt prefix-code clustering of the (otherwise nearly
@@ -2637,7 +2672,14 @@ fn setup_dc_group(
             for x in 0..dc_data.ac_strategy.xsize() {
                 if dc_data.ac_strategy.is_first_block(x, y) {
                     let strategy = dc_data.ac_strategy.raw_strategy(x, y);
-                    if is_sub8_strategy(strategy) {
+                    let in_accepted_mosaic = fine_accepted
+                        && fine_rollbacks.iter().any(|rollback| {
+                            x >= rollback.bx
+                                && x < rollback.bx + rollback.cov_x
+                                && y >= rollback.by
+                                && y < rollback.by + rollback.cov_y
+                        });
+                    if is_sub8_strategy(strategy) && !in_accepted_mosaic {
                         positions.push((x, y, strategy));
                     }
                 }
@@ -2656,7 +2698,7 @@ fn setup_dc_group(
                     dc_data.ac_strategy.set_first(x, y, strategy);
                 }
             }
-            // else: leave reverted to DCT8.
+            // Else leave ordinary fine blocks as DCT8.
         }
     }
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))

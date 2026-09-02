@@ -30,7 +30,8 @@
 
 use crate::adaptive_quant::fast_exp2;
 use crate::coder_scratch::{
-    AcStrategyBandScratch, CachedQuantCost, CoderScratch, QuantRefinement, RerankDowngrade,
+    AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, QuantRefinement,
+    RerankDowngrade,
 };
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
@@ -43,6 +44,7 @@ use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{
     ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform, channel_rd,
+    reconstruct_spatial_errors,
 };
 
 mod selection;
@@ -637,6 +639,78 @@ fn reconstruction_strategy_cost_and_base(
             rate,
         ),
     )
+}
+
+/// Reconstruct the quantization-error planes for one strategy without scoring
+/// them. Joint child-layout reranking copies these planes into a larger mosaic
+/// so discontinuities between independently transformed blocks remain visible.
+#[allow(clippy::too_many_arguments)]
+fn reconstruction_strategy_spatial_errors(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    output: &mut [[f32; 1024]; 3],
+) -> f32 {
+    let CoderScratch {
+        strategy_coeffs: coeffs,
+        transform_gather,
+        recon,
+        ..
+    } = scratch;
+    let (cx, cy, _) = prepare_strategy_coeffs(
+        ctx,
+        coeffs,
+        transform_gather,
+        strategy,
+        opsin,
+        px,
+        py,
+        cmap_factor,
+    );
+    let input = ReconDistInput {
+        idct: ctx.idct,
+        quantization: ReconQuantization {
+            rate_log2_lut: ctx.rate_log2_lut,
+            coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
+            inverse_matrices: [
+                inverse_matrix_for(ctx, strategy, 0),
+                inverse_matrix_for(ctx, strategy, 1),
+                inverse_matrix_for(ctx, strategy, 2),
+            ],
+            qac,
+            qm_mult_x,
+            qm_mult_b: ctx.b_qm_mul(),
+            distance,
+        },
+        transform: ReconTransform {
+            blocks_x: cx,
+            blocks_y: cy,
+            strategy,
+        },
+        source: ReconSource {
+            opsin,
+            x: px,
+            y: py,
+        },
+        scoring: ReconScoring {
+            factor_x: cmap_factor[0],
+            factor_b: cmap_factor[2],
+            channel_weights: ctx.channel_weights(),
+            xyb_matrix: ctx.xyb,
+            rgb_hue_alpha: 0.0,
+            gradient_alpha: 0.0,
+            gradient_peak_alpha: 0.0,
+        },
+    };
+    let work: &mut [[f32; 1024]; 4] = (&mut recon[..4]).try_into().unwrap();
+    reconstruct_spatial_errors(work, &input, output)
 }
 
 #[derive(Clone, Copy)]
