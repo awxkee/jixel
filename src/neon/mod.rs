@@ -38,7 +38,6 @@ mod frame;
 mod inflated_cost;
 mod lossless_grad;
 mod modular;
-mod mosaic_seam;
 mod quant;
 mod quantize_xyb;
 mod structure_aq;
@@ -76,7 +75,6 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
     tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,
 };
-pub(crate) use mosaic_seam::mosaic_seam_stats_neon;
 pub(crate) use quant::{
     apply_quant_field_gain_neon, apply_structure_aq_neon, quantize_block_ac_neon,
     quantize_dc_cfl_neon, quantize_dc_neon,
