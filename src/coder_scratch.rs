@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, SavedChild};
+use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -167,6 +167,7 @@ pub(crate) struct FineMergeRollback {
 }
 
 pub(crate) struct AcStrategyBandScratch {
+    pub(crate) fine_mosaic: LazyScratch<FineMosaicScratch>,
     pub(crate) strategy: AcStrategyImage,
     pub(crate) benefit: f32,
     pub(crate) chosen32: Vec<Chosen32Cost>,
@@ -180,6 +181,7 @@ pub(crate) struct AcStrategyBandScratch {
 impl Default for AcStrategyBandScratch {
     fn default() -> Self {
         Self {
+            fine_mosaic: LazyScratch::default(),
             strategy: AcStrategyImage::new(0, 0),
             benefit: 0.0,
             chosen32: Vec::new(),
@@ -381,12 +383,14 @@ impl Default for CoderScratch {
 #[cfg(test)]
 mod tests {
     use super::{CoderScratch, DcPredictorScratch, LazyScratch, LzEntropyScratch};
+    use crate::ac_strategy::FineMosaicScratch;
     use crate::group::AcGroupScratch;
     use std::mem::size_of;
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
         assert!(size_of::<CoderScratch>() <= 1104);
+        assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);

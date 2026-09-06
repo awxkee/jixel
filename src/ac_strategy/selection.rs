@@ -410,6 +410,7 @@ fn find_quant_refinements(
                 cy,
                 0.0,
                 0.0,
+                false,
             );
             rd_cost(
                 DistortionModel::Reconstruction,
@@ -1317,9 +1318,24 @@ struct RerankContext<'a> {
 }
 
 const FINE_MOSAIC_BOUNDARY_ALPHA: f32 = 32.0;
-const FINE_MOSAIC_RECON_MARGIN: f32 = 0.85;
 const FINE_MOSAIC_BOUNDARY_RATIO: f32 = 1.0;
 const FINE_MOSAIC_PEAK_RATIO: f32 = 1.0;
+/// How decisively the best mosaic assignment must beat every incumbent (the
+/// merge, plain tiling, and the child layout) on the joint score.
+const FINE_MOSAIC_MARGIN: f32 = 1.0;
+/// Extra bits charged per IDENTITY/DCT2x2 child on top of the rate model's
+/// estimate.
+const FINE_MOSAIC_RATE_CORRECTION_BITS: f32 = 8.0;
+/// Cap on how much pure-RD deficit the seam bonus may purchase
+const FINE_MOSAIC_SEAM_SUBSIDY_BITS: f32 = 8.0;
+/// The mosaic arm's own distance ceiling, tighter than the sub-8 selection's
+/// FINE_TRANSFORM_MAX_DISTANCE.
+const FINE_MOSAIC_MAX_DISTANCE: f32 = 3.0;
+
+const FINE_MOSAIC_CANDIDATES: [u8; 3] = [STRATEGY_DCT, STRATEGY_IDENTITY, STRATEGY_DCT2X2];
+/// Most children a joint mosaic can cover (sized for a 2x2-block 16x16; the
+/// pair strategies searched today use two).
+const FINE_MOSAIC_MAX_CHILDREN: usize = 4;
 
 #[cfg(test)]
 fn block_boundary_error_energy(
@@ -1385,100 +1401,27 @@ fn block_boundary_error_stats(
     (energy, peak)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn fine_mosaic_boundary_energies(
-    rerank: &RerankContext<'_>,
-    scratch: &mut CoderScratch,
-    big_strategy: u8,
-    bx: usize,
-    by: usize,
-    cov_x: usize,
-    cov_y: usize,
-    big_qac: f32,
-    fine_grid: &[u8; 16],
-) -> (f32, f32, f32, f32) {
-    let params = rerank.params;
-    let ctx = params.ctx;
-    let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
-    let width = cov_x * 8;
-    let height = cov_y * 8;
-    let mut strategy_error = [[0.0f32; 1024]; 3];
-    reconstruction_strategy_spatial_errors(
-        ctx,
-        scratch,
-        big_strategy,
-        params.opsin,
-        px,
-        py,
-        big_qac,
-        params.qm_mult_x,
-        params.distance,
-        cmap_factors(params.ytox_map, params.ytob_map, bx, by),
-        &mut strategy_error,
-    );
-    let (big_energy, big_peak) = block_boundary_error_stats(
-        ctx,
-        params.opsin,
-        &strategy_error,
-        px,
-        py,
-        width,
-        height,
-        params.distance,
-    );
+/// Reused by one selection band; allocate the planes only for mosaic reranking.
+pub(crate) struct FineMosaicScratch {
+    big_error: Box<[[f32; 1024]; 3]>,
+    cand_costs: Box<[[ReconStrategyCost; FINE_MOSAIC_CANDIDATES.len()]; FINE_MOSAIC_MAX_CHILDREN]>,
+    cand_planes: Box<[[[[f32; 64]; 3]; FINE_MOSAIC_CANDIDATES.len()]; FINE_MOSAIC_MAX_CHILDREN]>,
+}
 
-    let mut mosaic_error = [[0.0f32; 1024]; 3];
-    for iy in 0..cov_y {
-        for ix in 0..cov_x {
-            let strategy = fine_grid[iy * 4 + ix];
-            debug_assert!(matches!(
-                strategy,
-                STRATEGY_DCT | STRATEGY_IDENTITY | STRATEGY_DCT2X2
-            ));
-            let child_bx = bx + ix;
-            let child_by = by + iy;
-            let qac = region_qac(
-                rerank.quant_field,
-                child_bx,
-                child_by,
-                1,
-                1,
-                params.scale,
-                params.distance,
-            );
-            reconstruction_strategy_spatial_errors(
-                ctx,
-                scratch,
-                strategy,
-                params.opsin,
-                px + ix * 8,
-                py + iy * 8,
-                qac,
-                params.qm_mult_x,
-                params.distance,
-                cmap_factors(params.ytox_map, params.ytob_map, child_bx, child_by),
-                &mut strategy_error,
-            );
-            for c in 0..3 {
-                for dy in 0..8 {
-                    let dst = (iy * 8 + dy) * width + ix * 8;
-                    mosaic_error[c][dst..dst + 8]
-                        .copy_from_slice(&strategy_error[c][dy * 8..dy * 8 + 8]);
-                }
-            }
+impl Default for FineMosaicScratch {
+    fn default() -> Self {
+        let nan_cost = ReconStrategyCost {
+            cost: f32::NAN,
+            base: f32::NAN,
+            distortion: f32::NAN,
+            rate: f32::NAN,
+        };
+        Self {
+            big_error: crate::util::heap_array([0.0; 1024]),
+            cand_costs: crate::util::heap_array([nan_cost; FINE_MOSAIC_CANDIDATES.len()]),
+            cand_planes: crate::util::heap_array([[[0.0; 64]; 3]; FINE_MOSAIC_CANDIDATES.len()]),
         }
     }
-    let (fine_energy, fine_peak) = block_boundary_error_stats(
-        ctx,
-        params.opsin,
-        &mosaic_error,
-        px,
-        py,
-        width,
-        height,
-        params.distance,
-    );
-    (big_energy, fine_energy, big_peak, fine_peak)
 }
 
 fn find_rerank_downgrades(
@@ -1509,6 +1452,10 @@ fn find_rerank_downgrades(
     output.rerank_downgrades.clear();
     output.fine_rollbacks.clear();
     output.current_costs.clear();
+    // Mutable access initializes these lazily. Every slot read is overwritten
+    // by this region's cost pass, so subsequent passes need no clearing.
+    let mosaic = &mut output.fine_mosaic;
+    let fine_lambda = fine_mosaic_lambda(params.distance);
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
             continue;
@@ -1581,7 +1528,12 @@ fn find_rerank_downgrades(
             params.scale,
             params.distance,
         );
-        let (j_big, big_current_cost) = reconstruction_strategy_cost_and_base(
+        let with_fine_mosaic = ctx.speed == crate::Speed::Slow
+            && params.distance <= FINE_MOSAIC_MAX_DISTANCE
+            && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
+        debug_assert!(!with_fine_mosaic || cxb * cyb <= FINE_MOSAIC_MAX_CHILDREN);
+        let region_pixels = cxb * cyb * 64;
+        let big = reconstruction_strategy_cost_and_base(
             ctx,
             scratch,
             strat,
@@ -1595,15 +1547,40 @@ fn find_rerank_downgrades(
             cmap_factors(params.ytox_map, params.ytob_map, bx, by),
             gradient_alpha,
             gradient_peak_alpha,
+            if with_fine_mosaic {
+                let [e0, e1, e2] = &mut *mosaic.big_error;
+                Some([
+                    &mut e0[..region_pixels],
+                    &mut e1[..region_pixels],
+                    &mut e2[..region_pixels],
+                ])
+            } else {
+                None
+            },
         );
+        let (j_big, big_current_cost) = (big.cost, big.base);
+        let (big_boundary, big_peak) = if with_fine_mosaic {
+            block_boundary_error_stats(
+                ctx,
+                params.opsin,
+                &mosaic.big_error,
+                px,
+                py,
+                cxb * 8,
+                cyb * 8,
+                params.distance,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        // A mosaic must strictly improve both nonnegative seam statistics.
+        // If either is already zero, avoid reconstructing fine candidates.
+        let with_fine_mosaic = with_fine_mosaic && big_boundary > 0.0 && big_peak > 0.0;
         let mut j_dct8 = 0.0f32;
-        let with_fine_mosaic = ctx.speed == crate::Speed::Slow
-            && params.distance <= FINE_TRANSFORM_MAX_DISTANCE
-            && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
-        let mut j_fine = 0.0f32;
-        let mut fine_grid = [STRATEGY_DCT; 16];
-        let mut fine_current_costs = [f32::NAN; 16];
-        let mut any_fine = false;
+        // Per-child candidate cache: (cost, base cost) plus the reconstructed
+        // spatial error planes each candidate leaves behind. The joint search
+        // below scores whole assignments from these planes; no candidate is
+        // reconstructed twice.
         let tiled_costs_start = output.current_costs.len();
         for iy in 0..cyb {
             for ix in 0..cxb {
@@ -1616,70 +1593,56 @@ fn find_rerank_downgrades(
                     params.scale,
                     params.distance,
                 );
-                let (cost, current_cost) = reconstruction_strategy_cost_and_base(
-                    ctx,
-                    scratch,
-                    STRATEGY_DCT,
-                    params.opsin,
-                    px + ix * 8,
-                    py + iy * 8,
-                    q,
-                    params.qm_mult_x,
-                    meta_r,
-                    params.distance,
-                    cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
-                    gradient_alpha,
-                    gradient_peak_alpha,
-                );
-                j_dct8 += cost;
-                let mut fine_strategy = STRATEGY_DCT;
-                let mut fine_cost = cost;
-                let mut fine_current_cost = current_cost;
-                if with_fine_mosaic {
-                    let mut candidate = (f32::INFINITY, f32::INFINITY, STRATEGY_DCT);
-                    for strategy in [STRATEGY_IDENTITY, STRATEGY_DCT2X2] {
-                        let (candidate_cost, candidate_current_cost) =
-                            reconstruction_strategy_cost_and_base(
-                                ctx,
-                                scratch,
-                                strategy,
-                                params.opsin,
-                                px + ix * 8,
-                                py + iy * 8,
-                                q,
-                                params.qm_mult_x,
-                                meta_r,
-                                params.distance,
-                                cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
-                                gradient_alpha,
-                                gradient_peak_alpha,
-                            );
-                        if candidate_cost < candidate.0 {
-                            candidate = (candidate_cost, candidate_current_cost, strategy);
-                        }
+                let child = iy * cxb + ix;
+                let cmap = cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy);
+                for (ci, &strategy) in FINE_MOSAIC_CANDIDATES.iter().enumerate() {
+                    if ci > 0 && !with_fine_mosaic {
+                        break;
                     }
-                    if candidate.0 < cost * FINE_MOSAIC_RECON_MARGIN {
-                        (fine_cost, fine_current_cost, fine_strategy) = candidate;
-                        any_fine = true;
+                    let sink = if with_fine_mosaic {
+                        let [e0, e1, e2] = &mut mosaic.cand_planes[child][ci];
+                        Some([&mut e0[..], &mut e1[..], &mut e2[..]])
+                    } else {
+                        None
+                    };
+                    let cand = reconstruction_strategy_cost_and_base(
+                        ctx,
+                        scratch,
+                        strategy,
+                        params.opsin,
+                        px + ix * 8,
+                        py + iy * 8,
+                        q,
+                        params.qm_mult_x,
+                        meta_r,
+                        params.distance,
+                        cmap,
+                        gradient_alpha,
+                        gradient_peak_alpha,
+                        sink,
+                    );
+                    if with_fine_mosaic {
+                        mosaic.cand_costs[child][ci] = cand;
+                    }
+                    if ci == 0 {
+                        j_dct8 += cand.cost;
+                        output.current_costs.push(CachedQuantCost {
+                            bx: bx + ix,
+                            by: by + iy,
+                            cost: cand.base,
+                        });
                     }
                 }
-                let fine_index = iy * 4 + ix;
-                j_fine += fine_cost;
-                fine_grid[fine_index] = fine_strategy;
-                fine_current_costs[fine_index] = fine_current_cost;
-                output.current_costs.push(CachedQuantCost {
-                    bx: bx + ix,
-                    by: by + iy,
-                    cost: current_cost,
-                });
             }
         }
         // Third arm: the child layout this merge displaced at selection time.
         let child_costs_start = output.current_costs.len();
         let mut j_child = f32::INFINITY;
+        let mut j_child_fine = f32::INFINITY;
         let mut child_grid = [NO_CHILD_BLOCK; 16];
         if let Some(grid) = saved_map.get(&(bx as u16, by as u16)) {
             let mut sum = 0.0f32;
+            let (mut d_sum, mut r_sum, mut n_blocks) = (0.0f32, 0.0f32, 0.0f32);
             for iy in 0..cyb {
                 for ix in 0..cxb {
                     let s = grid[iy * 4 + ix];
@@ -1697,7 +1660,7 @@ fn find_rerank_downgrades(
                         params.scale,
                         params.distance,
                     );
-                    let (cost, current_cost) = reconstruction_strategy_cost_and_base(
+                    let child_cost = reconstruction_strategy_cost_and_base(
                         ctx,
                         scratch,
                         s,
@@ -1711,16 +1674,21 @@ fn find_rerank_downgrades(
                         cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
                         gradient_alpha,
                         gradient_peak_alpha,
+                        None,
                     );
-                    sum += cost;
+                    sum += child_cost.cost;
+                    d_sum += child_cost.distortion;
+                    r_sum += child_cost.rate;
+                    n_blocks += 1.0;
                     output.current_costs.push(CachedQuantCost {
                         bx: bx + ix,
                         by: by + iy,
-                        cost: current_cost,
+                        cost: child_cost.base,
                     });
                 }
             }
             j_child = sum;
+            j_child_fine = fmla(fine_lambda, fmla(n_blocks, meta_r, r_sum), d_sum);
             child_grid = *grid;
         }
 
@@ -1728,30 +1696,117 @@ fn find_rerank_downgrades(
         let j_alt = if child_wins { j_child } else { j_dct8 };
         let ordinary_wins = j_alt < j_big * rerank_margin;
         let mut fine_benefit = 0.0f32;
-        let fine_wins = if !ordinary_wins && any_fine {
-            let (big_boundary, fine_boundary, big_peak, fine_peak) = fine_mosaic_boundary_energies(
-                rerank, scratch, strat, bx, by, cxb, cyb, qac_big, &fine_grid,
-            );
-            let big_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, big_boundary, j_big);
-            let fine_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, fine_boundary, j_fine);
-            let wins = fine_boundary < big_boundary * FINE_MOSAIC_BOUNDARY_RATIO
-                && fine_peak < big_peak * FINE_MOSAIC_PEAK_RATIO
-                && fine_joint < big_joint * rerank_margin
-                && fine_joint < j_child;
-            if wins {
-                fine_benefit = big_joint - fine_joint;
+        let mut fine_grid = [STRATEGY_DCT; 16];
+        let mut fine_sel = [0usize; FINE_MOSAIC_MAX_CHILDREN];
+        let mut fine_wins = false;
+        if with_fine_mosaic {
+            let children = cxb * cyb;
+            // The mosaic comparison rescores EVERY arm — merge, tiled DCT8,
+            // child layout, each assignment — at the floored lambda, so the
+            // reranking ramp's quarter-price rate below d≈1.23 cannot leak
+            // into this decision. The rate-correction bits ride the same
+            // lambda instead of the discounted one.
+            let mut rd_fine = [[0.0f32; FINE_MOSAIC_CANDIDATES.len()]; FINE_MOSAIC_MAX_CHILDREN];
+            for (k, child_rd) in rd_fine[..children].iter_mut().enumerate() {
+                for (ci, rd) in child_rd.iter_mut().enumerate() {
+                    let extra = if ci == 0 {
+                        0.0
+                    } else {
+                        FINE_MOSAIC_RATE_CORRECTION_BITS
+                    };
+                    let c = &mosaic.cand_costs[k][ci];
+                    *rd = fmla(fine_lambda, c.rate + meta_r + extra, c.distortion);
+                }
             }
-            wins
-        } else {
-            false
-        };
+            let tiled_rd: f32 = rd_fine[..children].iter().map(|c| c[0]).sum();
+            let big_rd = fmla(fine_lambda, big.rate + meta_r, big.distortion);
+            let big_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, big_boundary, big_rd);
+            // Exhaustive assignment search over the cached planes. Every grid
+            // is scored jointly (child costs plus seam energy), so a child
+            // whose fine transform loses the independent comparison can still
+            // be picked when it removes a seam the score can see — but only
+            // within the bounded seam subsidy below.
+            let mut tiled_joint = f32::INFINITY;
+            let mut best_joint = f32::INFINITY;
+            let mut best_sel = None;
+            for code in 0..FINE_MOSAIC_CANDIDATES.len().pow(children as u32) {
+                let mut sel = [0usize; FINE_MOSAIC_MAX_CHILDREN];
+                let mut rest = code;
+                let mut rd_sum = 0.0f32;
+                let mut n_fine = 0usize;
+                for (k, s) in sel[..children].iter_mut().enumerate() {
+                    *s = rest % FINE_MOSAIC_CANDIDATES.len();
+                    rest /= FINE_MOSAIC_CANDIDATES.len();
+                    rd_sum += rd_fine[k][*s];
+                    n_fine += usize::from(*s != 0);
+                }
+                // Bounded seam subsidy: the seam term may buy a pure-RD
+                // deficit of at most this many bits per fine child.
+                let subsidy_cap = fmla(
+                    fine_lambda * FINE_MOSAIC_SEAM_SUBSIDY_BITS,
+                    n_fine as f32,
+                    tiled_rd,
+                );
+                let within_subsidy = rd_sum <= subsidy_cap;
+                if code != 0 && !within_subsidy {
+                    continue;
+                }
+                let mut selected = [&mosaic.cand_planes[0][0]; FINE_MOSAIC_MAX_CHILDREN];
+                for (k, s) in selected[..children].iter_mut().enumerate() {
+                    *s = &mosaic.cand_planes[k][sel[k]];
+                }
+                let (boundary, peak) = (ctx.mosaic_seam_stats)(
+                    ctx,
+                    params.opsin,
+                    px,
+                    py,
+                    cxb,
+                    cyb,
+                    params.distance,
+                    &selected[..children],
+                );
+                let joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, boundary, rd_sum);
+                if code == 0 {
+                    // All-DCT8 duplicates the tiled arm, with its seams priced.
+                    // A mosaic must beat this too, or plain tiling (gated by
+                    // the ordinary margin) is the honest pick.
+                    tiled_joint = joint;
+                    continue;
+                }
+                if joint < best_joint
+                    // Strict < on purpose: when a merge's seams are already
+                    // below the visibility floor (both stats zero) the arm
+                    // closes, restricting it to seam repair.
+                    && boundary < big_boundary * FINE_MOSAIC_BOUNDARY_RATIO
+                    && peak < big_peak * FINE_MOSAIC_PEAK_RATIO
+                {
+                    best_joint = joint;
+                    best_sel = Some(sel);
+                }
+            }
+            if let Some(sel) = best_sel
+                && best_joint < tiled_joint * FINE_MOSAIC_MARGIN
+                && best_joint < big_joint * rerank_margin * FINE_MOSAIC_MARGIN
+                && best_joint < j_child_fine * FINE_MOSAIC_MARGIN
+            {
+                fine_wins = true;
+                fine_benefit = big_joint - best_joint;
+                fine_sel = sel;
+                for iy in 0..cyb {
+                    for ix in 0..cxb {
+                        fine_grid[iy * 4 + ix] = FINE_MOSAIC_CANDIDATES[sel[iy * cxb + ix]];
+                    }
+                }
+            }
+        }
         if ordinary_wins || fine_wins {
             let restore = if fine_wins {
                 output.current_costs.truncate(child_costs_start);
                 for iy in 0..cyb {
                     for ix in 0..cxb {
-                        output.current_costs[tiled_costs_start + iy * cxb + ix].cost =
-                            fine_current_costs[iy * 4 + ix];
+                        let child = iy * cxb + ix;
+                        output.current_costs[tiled_costs_start + child].cost =
+                            mosaic.cand_costs[child][fine_sel[child]].base;
                     }
                 }
                 output.fine_rollbacks.push(FineMergeRollback {
@@ -1851,12 +1906,12 @@ mod tests {
         RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
         RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
         SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant,
-        block_boundary_error_energy, cmap_factors, fill_ac_strategy, fill_selection_bands,
-        gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar, merge_beats_dct8,
-        merge_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
-        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
-        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
-        use_dct8_only,
+        block_boundary_error_energy, block_boundary_error_stats, cmap_factors, fill_ac_strategy,
+        fill_selection_bands, gradient_region_stats_scalar,
+        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
+        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
+        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
+        strategy_cost, sub8_strategy_costs, use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -1869,6 +1924,58 @@ mod tests {
     use crate::inflated_cost::{
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
+
+    #[test]
+    fn mosaic_seam_stats_matches_assembled_boundary_stats() {
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            None,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
+        let mut opsin = Image3F::new(32, 32);
+        for c in 0..3 {
+            for y in 0..32 {
+                for (x, v) in opsin.plane_row_mut(c, y).iter_mut().enumerate() {
+                    *v = ((x * 7 + y * 13 + c * 29) % 23) as f32 * 0.013;
+                }
+            }
+        }
+        for (cxb, cyb) in [(2usize, 1usize), (1, 2), (2, 2)] {
+            let children = cxb * cyb;
+            let mut planes = vec![[[0.0f32; 64]; 3]; children];
+            for (k, child) in planes.iter_mut().enumerate() {
+                for (c, plane) in child.iter_mut().enumerate() {
+                    for (i, v) in plane.iter_mut().enumerate() {
+                        *v = ((k * 131 + c * 37 + i * 17) % 101) as f32 * 0.002 - 0.1;
+                    }
+                }
+            }
+            let width = cxb * 8;
+            let height = cyb * 8;
+            let mut assembled = [[0.0f32; 1024]; 3];
+            for ky in 0..cyb {
+                for kx in 0..cxb {
+                    for c in 0..3 {
+                        for y in 0..8 {
+                            let dst = (ky * 8 + y) * width + kx * 8;
+                            assembled[c][dst..dst + 8]
+                                .copy_from_slice(&planes[ky * cxb + kx][c][y * 8..y * 8 + 8]);
+                        }
+                    }
+                }
+            }
+            let (px, py, distance) = (8, 8, 1.3);
+            let expected = block_boundary_error_stats(
+                &ctx, &opsin, &assembled, px, py, width, height, distance,
+            );
+            let selected: Vec<&[[f32; 64]; 3]> = planes.iter().collect();
+            let got = (ctx.mosaic_seam_stats)(&ctx, &opsin, px, py, cxb, cyb, distance, &selected);
+            assert!(expected.0 > 0.0);
+            assert_eq!(expected, got);
+        }
+    }
 
     #[test]
     fn boundary_error_energy_detects_artificial_block_seams() {

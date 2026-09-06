@@ -66,6 +66,7 @@ mod lossless;
 mod lz77_ac;
 mod ma_tree;
 mod modular;
+mod mosaic_seam;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
 mod orientation;

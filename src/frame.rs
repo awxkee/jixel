@@ -1383,7 +1383,7 @@ fn encode_frame_vardct(
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
-        gaborize(&mut regular, &distp);
+        gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
             ctx,
@@ -1504,7 +1504,7 @@ fn encode_frame_vardct(
         }
 
         let mut base = plan.base;
-        gaborize(&mut base, &distp);
+        gaborize(&mut base, distp);
         encode_frame_core(
             ctx,
             scratch,
@@ -1523,7 +1523,7 @@ fn encode_frame_vardct(
         return Ok(());
     }
 
-    gaborize(&mut xyb, &distp);
+    gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
         scratch,
@@ -1697,7 +1697,6 @@ fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_core(
     ctx: &EncodingContext,
@@ -2641,7 +2640,9 @@ fn setup_dc_group(
         }
         let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
         let meta_delta = cost_with.saturating_sub(cost_without) as f32;
-        if fine_benefit > crate::ac_strategy::RD_LAMBDA * meta_delta {
+        let fine_lambda = crate::ac_strategy::fine_mosaic_lambda(distp.distance);
+        let accepted = fine_benefit > fine_lambda * meta_delta;
+        if accepted {
             for rollback in &fine_rollbacks {
                 for iy in 0..rollback.cov_y {
                     for ix in 0..rollback.cov_x {

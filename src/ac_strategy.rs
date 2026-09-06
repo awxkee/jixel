@@ -44,12 +44,11 @@ use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{
     ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform, channel_rd,
-    reconstruct_spatial_errors,
 };
 
 mod selection;
 
-pub(crate) use selection::{Chosen32Cost, SavedChild, fill_ac_strategy};
+pub(crate) use selection::{Chosen32Cost, FineMosaicScratch, SavedChild, fill_ac_strategy};
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
@@ -572,8 +571,22 @@ fn strategy_cost(
     )
 }
 
-/// Returns the reconstruction RD cost both with the caller's metadata charge
-/// and without it. The latter can be reused as quant refinement's incumbent.
+/// One rerank arm's reconstruction-model scores: the legacy ramped-lambda RD
+/// costs plus the raw (distortion, rate) split so the joint mosaic comparison
+/// can rescore every arm under its own floored lambda.
+#[derive(Clone, Copy)]
+struct ReconStrategyCost {
+    /// Ramped-lambda RD cost including the caller's metadata charge.
+    cost: f32,
+    /// Ramped-lambda RD cost without the metadata charge; quant refinement's
+    /// incumbent.
+    base: f32,
+    distortion: f32,
+    rate: f32,
+}
+
+/// Returns the reconstruction RD cost with and without the caller's metadata
+/// charge, plus the raw distortion/rate split.
 #[allow(clippy::too_many_arguments)]
 fn reconstruction_strategy_cost_and_base(
     ctx: &EncodingContext,
@@ -589,7 +602,8 @@ fn reconstruction_strategy_cost_and_base(
     cmap_factor: [f32; 3],
     gradient_alpha: f32,
     gradient_peak_alpha: f32,
-) -> (f32, f32) {
+    spatial_errors: Option<[&mut [f32]; 3]>,
+) -> ReconStrategyCost {
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather,
@@ -606,6 +620,7 @@ fn reconstruction_strategy_cost_and_base(
         py,
         cmap_factor,
     );
+    let keep_spatial_errors = spatial_errors.is_some();
     let (distortion, rate) = reconstruction_dist_and_rate(
         ctx,
         recon,
@@ -622,95 +637,32 @@ fn reconstruction_strategy_cost_and_base(
         cy,
         gradient_alpha,
         gradient_peak_alpha,
+        keep_spatial_errors,
     );
-    (
-        rd_cost(
+    if let Some(output) = spatial_errors {
+        let n = cx * cy * 64;
+        for (c, plane) in output.into_iter().enumerate() {
+            plane.copy_from_slice(&recon[c][..n]);
+        }
+    }
+    ReconStrategyCost {
+        cost: rd_cost(
             DistortionModel::Reconstruction,
             distance,
             meta_r,
             distortion,
             rate,
         ),
-        rd_cost(
+        base: rd_cost(
             DistortionModel::Reconstruction,
             distance,
             0.0,
             distortion,
             rate,
         ),
-    )
-}
-
-/// Reconstruct the quantization-error planes for one strategy without scoring
-/// them. Joint child-layout reranking copies these planes into a larger mosaic
-/// so discontinuities between independently transformed blocks remain visible.
-#[allow(clippy::too_many_arguments)]
-fn reconstruction_strategy_spatial_errors(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    strategy: u8,
-    opsin: &Image3F,
-    px: usize,
-    py: usize,
-    qac: f32,
-    qm_mult_x: f32,
-    distance: f32,
-    cmap_factor: [f32; 3],
-    output: &mut [[f32; 1024]; 3],
-) -> f32 {
-    let CoderScratch {
-        strategy_coeffs: coeffs,
-        transform_gather,
-        recon,
-        ..
-    } = scratch;
-    let (cx, cy, _) = prepare_strategy_coeffs(
-        ctx,
-        coeffs,
-        transform_gather,
-        strategy,
-        opsin,
-        px,
-        py,
-        cmap_factor,
-    );
-    let input = ReconDistInput {
-        idct: ctx.idct,
-        quantization: ReconQuantization {
-            rate_log2_lut: ctx.rate_log2_lut,
-            coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
-            inverse_matrices: [
-                inverse_matrix_for(ctx, strategy, 0),
-                inverse_matrix_for(ctx, strategy, 1),
-                inverse_matrix_for(ctx, strategy, 2),
-            ],
-            qac,
-            qm_mult_x,
-            qm_mult_b: ctx.b_qm_mul(),
-            distance,
-        },
-        transform: ReconTransform {
-            blocks_x: cx,
-            blocks_y: cy,
-            strategy,
-        },
-        source: ReconSource {
-            opsin,
-            x: px,
-            y: py,
-        },
-        scoring: ReconScoring {
-            factor_x: cmap_factor[0],
-            factor_b: cmap_factor[2],
-            channel_weights: ctx.channel_weights(),
-            xyb_matrix: ctx.xyb,
-            rgb_hue_alpha: 0.0,
-            gradient_alpha: 0.0,
-            gradient_peak_alpha: 0.0,
-        },
-    };
-    let work: &mut [[f32; 1024]; 4] = (&mut recon[..4]).try_into().unwrap();
-    reconstruct_spatial_errors(work, &input, output)
+        distortion,
+        rate,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -873,6 +825,7 @@ fn strategy_cost_impl(
             cy,
             0.0,
             0.0,
+            false,
         ),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
             ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
@@ -930,6 +883,7 @@ fn reconstruction_dist_and_rate(
     cy: usize,
     gradient_alpha: f32,
     gradient_peak_alpha: f32,
+    keep_spatial_errors: bool,
 ) -> (f32, f32) {
     (ctx.recon_dist_and_rate)(
         recon,
@@ -966,6 +920,7 @@ fn reconstruction_dist_and_rate(
                 rgb_hue_alpha: rerank_rgb_hue_alpha(ctx, distance),
                 gradient_alpha,
                 gradient_peak_alpha,
+                keep_spatial_errors,
             },
         },
         &ctx.recon_error_kernels,
@@ -1062,6 +1017,19 @@ static PAIR_GRAD_FIT: PairGradFit = PairGradFit {
 };
 
 #[inline]
+fn reconstruction_lambda(distance: f32) -> f32 {
+    const RECIP_RERANKING: f32 = 1. / (RERANK_LAMBDA_D1 - RERANK_LAMBDA_D0);
+    let ramp = ((distance - RERANK_LAMBDA_D0) * RECIP_RERANKING).clamp(0.0, 1.0);
+    let multiplier = fmla(ramp, RERANK_LAMBDA_HI - RERANK_LAMBDA_LO, RERANK_LAMBDA_LO);
+    RD_LAMBDA * multiplier
+}
+
+#[inline]
+pub(crate) fn fine_mosaic_lambda(distance: f32) -> f32 {
+    reconstruction_lambda(distance).max(RD_LAMBDA)
+}
+
+#[inline]
 fn rd_cost(
     distortion_model: DistortionModel,
     distance: f32,
@@ -1071,12 +1039,7 @@ fn rd_cost(
 ) -> f32 {
     let lam = match distortion_model {
         DistortionModel::Coefficient => RD_LAMBDA,
-        DistortionModel::Reconstruction => {
-            const RECIP_RERANKING: f32 = 1. / (RERANK_LAMBDA_D1 - RERANK_LAMBDA_D0);
-            let ramp = ((distance - RERANK_LAMBDA_D0) * RECIP_RERANKING).clamp(0.0, 1.0);
-            let multiplier = fmla(ramp, RERANK_LAMBDA_HI - RERANK_LAMBDA_LO, RERANK_LAMBDA_LO);
-            RD_LAMBDA * multiplier
-        }
+        DistortionModel::Reconstruction => reconstruction_lambda(distance),
     };
     // fmla, matching `sub8_strategy_costs::evaluate` bit-for-bit — the sub8
     // differential test compares the two paths' costs exactly.

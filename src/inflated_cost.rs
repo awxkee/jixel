@@ -501,6 +501,10 @@ pub(crate) struct ReconScoring {
     pub(crate) gradient_alpha: f32,
     /// Peak-pooled spatial-error gradient weight used by transform reranking.
     pub(crate) gradient_peak_alpha: f32,
+    /// Leave each channel's spatial error plane in `scratch[0..3]` after the
+    /// call. The joint mosaic rerank reads them back to measure error jumps
+    /// across child-block seams without reconstructing a second time.
+    pub(crate) keep_spatial_errors: bool,
 }
 
 pub(crate) struct ReconDistInput<'a> {
@@ -695,114 +699,6 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
             error: &error,
         },
     )
-}
-
-/// Quantize one prepared transform and reconstruct its spatial error planes.
-///
-/// This is the reconstruction half of [`recon_dist_and_rate_with_kernels`]
-/// without scoring. The strategy reranker uses it to assemble several 8x8
-/// children into one spatial mosaic, where error jumps across child boundaries
-/// can be measured jointly instead of disappearing into independent block
-/// scores. `input.quantization.coeffs` must already have the encoder's CfL
-/// subtraction applied, as in the strategy-cost reconstruction path.
-pub(crate) fn reconstruct_spatial_errors(
-    scratch: &mut [[f32; 1024]; 4],
-    input: &ReconDistInput<'_>,
-    output: &mut [[f32; 1024]; 3],
-) -> f32 {
-    let quantization = &input.quantization;
-    let transform = &input.transform;
-    let n = strategy_pixel_count(transform.strategy);
-    let width = transform.blocks_x * 8;
-    let height = transform.blocks_y * 8;
-    assert_eq!(width * height, n);
-    assert!(
-        n <= 1024,
-        "joint rerank only supports transforms up to 32x32"
-    );
-
-    let thresholds = [
-        crate::group::quantize_ac_thresholds_scaled(
-            0,
-            transform.blocks_x,
-            transform.blocks_y,
-            quantization.distance,
-            quantization.qm_mult_x,
-        ),
-        crate::group::quantize_ac_thresholds(
-            1,
-            transform.blocks_x,
-            transform.blocks_y,
-            quantization.distance,
-        ),
-        crate::group::quantize_ac_thresholds_scaled(
-            2,
-            transform.blocks_x,
-            transform.blocks_y,
-            quantization.distance,
-            quantization.qm_mult_b,
-        ),
-    ];
-    let quant_scales = [
-        quantization.qac * quantization.qm_mult_x,
-        quantization.qac,
-        quantization.qac * quantization.qm_mult_b,
-    ];
-    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
-    let half = width / 2;
-    let (coeff_error, combined) = scratch.split_at_mut(3);
-    let combined = &mut combined[0];
-
-    let mut rate = recon_quantize_scalar::<true>(
-        &quantization.coeffs[1][..n],
-        &quantization.inverse_matrices[1][..n],
-        quant_scales[1],
-        &thresholds[1],
-        width,
-        height,
-        half,
-        transform.blocks_x,
-        transform.blocks_y,
-        &mut coeff_error[1][..n],
-        quantization.rate_log2_lut,
-        scan_pos,
-    );
-    for c in [0usize, 2] {
-        let factor = if c == 0 {
-            input.scoring.factor_x
-        } else {
-            input.scoring.factor_b
-        };
-        combine_error_scalar(
-            &quantization.coeffs[c][..n],
-            &coeff_error[1][..n],
-            factor,
-            &mut combined[..n],
-        );
-        rate += recon_quantize_scalar::<true>(
-            &combined[..n],
-            &quantization.inverse_matrices[c][..n],
-            quant_scales[c],
-            &thresholds[c],
-            width,
-            height,
-            half,
-            transform.blocks_x,
-            transform.blocks_y,
-            &mut coeff_error[c][..n],
-            quantization.rate_log2_lut,
-            scan_pos,
-        );
-    }
-    for c in 0..3 {
-        reconstruct_error(
-            input.idct,
-            transform.strategy,
-            &coeff_error[c][..n],
-            &mut output[c][..n],
-        );
-    }
-    rate
 }
 
 /// `sum((dx err)^2 + (dy err)^2)` over one channel's spatial error plane.
@@ -1048,7 +944,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     gradient_peak_floor,
                 );
         }
-        if rgb_hue_alpha > 0.0 {
+        if rgb_hue_alpha > 0.0 || scoring.keep_spatial_errors {
             coeff_error[c][..n].copy_from_slice(error);
         }
     }
