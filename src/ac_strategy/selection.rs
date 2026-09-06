@@ -1927,53 +1927,85 @@ mod tests {
 
     #[test]
     fn mosaic_seam_stats_matches_assembled_boundary_stats() {
-        let ctx = EncodingContext::new(
-            crate::Speed::Slow,
-            None,
-            crate::xyb::XybMatrix::SPEC,
-            1.0,
-            1,
-        );
-        let mut opsin = Image3F::new(32, 32);
-        for c in 0..3 {
-            for y in 0..32 {
-                for (x, v) in opsin.plane_row_mut(c, y).iter_mut().enumerate() {
-                    *v = ((x * 7 + y * 13 + c * 29) % 23) as f32 * 0.013;
-                }
-            }
-        }
-        for (cxb, cyb) in [(2usize, 1usize), (1, 2), (2, 2)] {
-            let children = cxb * cyb;
-            let mut planes = vec![[[0.0f32; 64]; 3]; children];
-            for (k, child) in planes.iter_mut().enumerate() {
-                for (c, plane) in child.iter_mut().enumerate() {
-                    for (i, v) in plane.iter_mut().enumerate() {
-                        *v = ((k * 131 + c * 37 + i * 17) % 101) as f32 * 0.002 - 0.1;
+        let mut seed = 127u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.25
+        };
+        for bias in [crate::xyb::B_BIAS, 0.85] {
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                None,
+                crate::yellow_opsin::matrix_for_bias(bias),
+                1.0,
+                1,
+            );
+            for (width, height) in [(1, 1), (7, 9), (16, 16), (29, 31)] {
+                let mut opsin = Image3F::new(width, height);
+                for c in 0..3 {
+                    for y in 0..height {
+                        for v in opsin.plane_row_mut(c, y) {
+                            *v = random();
+                        }
                     }
                 }
-            }
-            let width = cxb * 8;
-            let height = cyb * 8;
-            let mut assembled = [[0.0f32; 1024]; 3];
-            for ky in 0..cyb {
-                for kx in 0..cxb {
-                    for c in 0..3 {
-                        for y in 0..8 {
-                            let dst = (ky * 8 + y) * width + kx * 8;
-                            assembled[c][dst..dst + 8]
-                                .copy_from_slice(&planes[ky * cxb + kx][c][y * 8..y * 8 + 8]);
+                let mut planes = [[[[0.0f32; 64]; 3]; 3]; 4];
+                for child in &mut planes {
+                    for candidate in child {
+                        for channel in candidate {
+                            for v in channel {
+                                *v = random();
+                            }
+                        }
+                    }
+                }
+                for (cxb, cyb) in [(1usize, 1usize), (2, 1), (1, 2), (2, 2)] {
+                    for (px, py) in [(0, 0), (width - 1, height - 1)] {
+                        for distance in [0.0, 0.5, 1.9, 1.95, 2.0, 3.0] {
+                            for code in 0..3usize.pow((cxb * cyb) as u32) {
+                                let mut rest = code;
+                                let selected: Vec<_> = planes[..cxb * cyb]
+                                    .iter()
+                                    .map(|child| {
+                                        let i = rest % 3;
+                                        rest /= 3;
+                                        &child[i]
+                                    })
+                                    .collect();
+                                let mut assembled = [[0.0f32; 1024]; 3];
+                                for (k, child) in selected.iter().enumerate() {
+                                    let (kx, ky) = (k % cxb, k / cxb);
+                                    for (dest, source) in assembled.iter_mut().zip(child.iter()) {
+                                        for (y, row) in source.as_chunks::<8>().0.iter().enumerate()
+                                        {
+                                            let offset = (ky * 8 + y) * cxb * 8 + kx * 8;
+                                            dest[offset..offset + 8].copy_from_slice(row);
+                                        }
+                                    }
+                                }
+                                let expected = block_boundary_error_stats(
+                                    &ctx,
+                                    &opsin,
+                                    &assembled,
+                                    px,
+                                    py,
+                                    cxb * 8,
+                                    cyb * 8,
+                                    distance,
+                                );
+                                let got = (ctx.mosaic_seam_stats)(
+                                    &ctx, &opsin, px, py, cxb, cyb, distance, &selected,
+                                );
+                                assert_eq!(
+                                    (got.0.to_bits(), got.1.to_bits()),
+                                    (expected.0.to_bits(), expected.1.to_bits()),
+                                    "{width}x{height}, origin={px},{py}, grid={cxb}x{cyb}, d={distance}, code={code}"
+                                );
+                            }
                         }
                     }
                 }
             }
-            let (px, py, distance) = (8, 8, 1.3);
-            let expected = block_boundary_error_stats(
-                &ctx, &opsin, &assembled, px, py, width, height, distance,
-            );
-            let selected: Vec<&[[f32; 64]; 3]> = planes.iter().collect();
-            let got = (ctx.mosaic_seam_stats)(&ctx, &opsin, px, py, cxb, cyb, distance, &selected);
-            assert!(expected.0 > 0.0);
-            assert_eq!(expected, got);
         }
     }
 
