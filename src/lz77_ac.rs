@@ -89,7 +89,8 @@ pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
     }
     out
 }
-#[allow(dead_code)] // kept for a future (correct) LZ77 alpha path; see modular::write_ac_group_alpha
+
+#[allow(dead_code)] // unused: the alpha path reuses the lossless LZ77+rANS section (lossless::write_single_channel_lz77_section)
 pub(crate) fn build_lz_code_no_cluster(
     streams: &[Vec<AcLz>],
     num_contexts: usize,

@@ -657,11 +657,49 @@ fn lz_add_histograms<I>(
 
 /// Build per-cluster prefix codes from an `LzToken` stream.
 /// `nb_chans + 1` contexts: `nb_chans` channel leaves + 1 distance context.
+/// Literal-only conversion: the LZ77 layer stays declared in the header but no
+/// matches are emitted. Used where per-pixel tree contexts make match-finding
+/// counterproductive.
+pub(super) fn lz77_literals(tokens: &[Token]) -> Vec<LzToken> {
+    tokens
+        .iter()
+        .map(|t| LzToken::pixel(t.context, t.value))
+        .collect()
+}
+
 pub(super) fn build_lz_pixel_code<'tokens, 'scratch, I>(
     streams: I,
     nb_chans: usize,
     min_symbol: u32,
     refined: bool,
+    scratch: &'scratch mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> EntropyCode<'scratch>
+where
+    I: Iterator<Item = &'tokens [LzToken]> + Clone,
+{
+    build_lz_pixel_code_opts(
+        streams,
+        nb_chans,
+        min_symbol,
+        refined,
+        false,
+        scratch,
+        huffman_pool,
+    )
+}
+
+/// `ans_cluster` switches context clustering to the exact-ANS cost model —
+/// required when contexts are finely split per-pixel (MA-tree contexts), where
+/// the prefix-depth cost model cannot tell sub-bit histograms apart and
+/// collapses the clustering.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_lz_pixel_code_opts<'tokens, 'scratch, I>(
+    streams: I,
+    nb_chans: usize,
+    min_symbol: u32,
+    refined: bool,
+    ans_cluster: bool,
     scratch: &'scratch mut LzEntropyScratch,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
 ) -> EntropyCode<'scratch>
@@ -692,13 +730,17 @@ where
         );
     }
 
-    let num_clusters = cluster_histograms_fixed(
-        histograms,
-        &mut context_map[..num_contexts],
-        refined,
-        clustering,
-        huffman_pool,
-    );
+    let num_clusters = if ans_cluster {
+        crate::entropy::cluster_histograms_ans(histograms, &mut context_map[..num_contexts])
+    } else {
+        cluster_histograms_fixed(
+            histograms,
+            &mut context_map[..num_contexts],
+            refined,
+            clustering,
+            huffman_pool,
+        )
+    };
     let histograms = &mut histograms[..num_clusters];
     let configs = &mut configs[..num_clusters];
 

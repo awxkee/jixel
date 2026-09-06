@@ -240,13 +240,9 @@ pub enum Speed {
 /// Decode-speed/density tradeoff for **lossless** encoding. Ignored for lossy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodingSpeed {
-    /// No Weighted Predictor and no meta-adaptive context trees: the decoder
-    /// takes its fixed-predictor fast path. Roughly 8-10x faster decode than
-    /// `Slow` for `Speed::Slow` encodes, at ~+15..30% size.
+    /// No Weighted Predictor and no meta-adaptive context trees
     Fastest,
-    /// No Weighted Predictor. Roughly 1.15-1.2x faster decode for
-    /// `Speed::Slow` encodes (~+1..3% size), ~3.5x for `Speed::Fast` encodes
-    /// (~+4% size).
+    /// No Weighted Predictor.
     Fast,
     /// All coding tools; densest output, slowest to decode.
     #[default]
@@ -335,6 +331,26 @@ pub struct EncodeConfig {
     /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
     /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
     pub boost: Option<DarkAqConfig>,
+    /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
+    pub lossy_modular: LossyModular,
+}
+
+/// Which arm the **lossy** encoder uses. Besides VarDCT, jixel carries a lossy
+/// modular arm (quantized Squeeze pyramid): multi-resolution residual coding
+/// that outperforms block DCT on smooth/gradient-heavy content, most clearly
+/// from medium quality down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LossyModular {
+    /// VarDCT only (the default).
+    #[default]
+    Off,
+    /// Encode BOTH arms per frame — the modular arm at a distance calibrated
+    /// to match the VarDCT arm's quality — and keep the smaller frame.
+    /// [`Speed::Slow`] only (falls back to VarDCT otherwise).
+    Auto,
+    /// Always use the modular arm when the frame supports it (RGB without
+    /// alpha, above tiny sizes); other frames fall back to VarDCT.
+    Force,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +418,7 @@ impl Default for EncodeConfig {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
+            lossy_modular: LossyModular::Off,
         }
     }
 }
@@ -677,6 +694,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Select the lossy encoding arm (see [`LossyModular`]).
+    pub fn with_lossy_modular(mut self, mode: LossyModular) -> Self {
+        self.lossy_modular = mode;
+        self
+    }
+
     /// Set the worker-thread count (see `EncodeConfig::num_threads`).
     pub fn with_num_threads(mut self, n: usize) -> Self {
         self.num_threads = n;
@@ -749,7 +772,9 @@ fn lossy_context(
     } else {
         config.num_threads
     };
-    EncodingContext::new(config.speed, config.boost, xyb, distance, num_threads)
+    let mut ctx = EncodingContext::new(config.speed, config.boost, xyb, distance, num_threads);
+    ctx.lossy_modular = config.lossy_modular;
+    ctx
 }
 
 fn for_each_linear_band<F>(

@@ -501,6 +501,10 @@ pub(crate) struct ReconScoring {
     pub(crate) gradient_alpha: f32,
     /// Peak-pooled spatial-error gradient weight used by transform reranking.
     pub(crate) gradient_peak_alpha: f32,
+    /// Leave each channel's spatial error plane in `scratch[0..3]` after the
+    /// call. The joint mosaic rerank reads them back to measure error jumps
+    /// across child-block seams without reconstructing a second time.
+    pub(crate) keep_spatial_errors: bool,
 }
 
 pub(crate) struct ReconDistInput<'a> {
@@ -940,7 +944,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     gradient_peak_floor,
                 );
         }
-        if rgb_hue_alpha > 0.0 {
+        if rgb_hue_alpha > 0.0 || scoring.keep_spatial_errors {
             coeff_error[c][..n].copy_from_slice(error);
         }
     }

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::num::NonZero;
 // use image::imageops::FilterType;
 use jixel::{ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
+use std::num::NonZero;
 use std::path::Path;
 use std::thread::available_parallelism;
 use std::time::Instant;
@@ -10,12 +10,12 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Burning_Ship_Fractal.png")).unwrap();
+    let image = image::open(Path::new("./assets/sun/pexels-anatoleos-35404883.jpg")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    for _ in 0..2 {
+    for _ in 0..4 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,
@@ -48,10 +48,10 @@ fn main() {
         height,
         &EncodeConfig::default()
             .with_lossless(false)
-            .with_distance(0.76)
+            .with_distance(1.0)
             .with_speed(Speed::Slow)
             .with_progressive(false)
-            .with_decoding_speed(DecodingSpeed::Slow)
+            .with_decoding_speed(DecodingSpeed::Fast)
             .with_patches(false)
             .with_color_encoding(ColorEncoding::srgb()),
     )

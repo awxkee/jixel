@@ -139,19 +139,38 @@ fn dc_refinement(distance: f32) -> f32 {
     }
 }
 
+/// Very-low-quality DC/EPF re-fit (SS2 ~4-45; Optuna study dcepf_vlq
+/// 2026-09-02): a linear ramp from the shipped constants at `DCEPF_VLQ_D0` to
+/// much coarser DC (x0.45) plus stronger EPF (sharpness 1, 3 iterations) at
+/// `DCEPF_VLQ_D1`. Kodak d7-26 at full strength: −6.5% BD-rate at matched SS2
+/// AND −10.4% at matched butteraugli-3-norm, 24/24 images on both. The win is
+/// earned at d>=14 (segment BD: d7-10 neutral, d14+ −8..−16%), and the shipped
+/// values are correct through d≈6.5, hence the late, steep ramp. Gaborish was
+/// probed and stays off.
+const DCEPF_VLQ_D0: f32 = 8.0;
+const DCEPF_VLQ_D1: f32 = 15.0;
+const VLQ_DC_MUL: f32 = 0.45;
+
+#[inline]
+fn dcepf_vlq_t(distance: f32) -> f32 {
+    ((distance - DCEPF_VLQ_D0) / (DCEPF_VLQ_D1 - DCEPF_VLQ_D0)).clamp(0.0, 1.0)
+}
+
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content.
+    // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
+    // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
     let refine = dc_refinement(distance);
+    let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
     let effective = k_dc_mul * (distance / k_dc_mul).powf(k_dc_quant_pow);
     let effective = f32::clamp(effective, 0.5 * distance, distance);
-    (k_dc_quant / effective).min(50.0) * refine
+    (k_dc_quant / effective).min(50.0) * refine * vlq
 }
 
 fn compute_distance_params(distance: f32) -> DistanceParams {
@@ -190,6 +209,10 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
             epf_iters += 1;
         }
     }
+    if dcepf_vlq_t(distance) >= 0.5 {
+        epf_iters = 3;
+    }
+    let gab_enabled = false; // measured net-negative for rate-matched SSIMU2
 
     DistanceParams {
         distance,
@@ -199,7 +222,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
-        gab_enabled: false, // measured net-negative for rate-matched SSIMU2
+        gab_enabled,
     }
 }
 
@@ -588,6 +611,14 @@ pub(crate) fn collect_ac_metadata_tokens(
 }
 
 fn epf_sharpness_id(distance: f32) -> i32 {
+    let t = dcepf_vlq_t(distance);
+    if t >= 0.75 {
+        return 1;
+    } else if t >= 0.5 {
+        return 2;
+    } else if t >= 0.25 {
+        return 3;
+    }
     if distance < 1.75 {
         7
     } else if distance < 2.75 {
@@ -1237,6 +1268,92 @@ pub(crate) fn encode_frame(
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
     }
+    // Lossy-modular arm (quantized Squeeze): whole-frame modular encoding of
+    // the XYB image at a distance calibrated to match the VarDCT arm's
+    // quality. Force always takes the arm when the frame supports it; Auto
+    // (Slow only) dual-encodes and keeps the smaller frame.
+    if alpha.is_none() && ctx.lossy_modular == crate::LossyModular::Force {
+        let mut modular_writer = BitWriter::new();
+        if crate::lossless::encode_frame_lossy_modular_squeeze(
+            &xyb,
+            crate::lossless::lm_calibrated_distance(distance),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut modular_writer,
+        ) {
+            writer.append(&modular_writer);
+            return Ok(());
+        }
+    }
+    if alpha.is_none()
+        && ctx.lossy_modular == crate::LossyModular::Auto
+        && ctx.speed == crate::Speed::Slow
+    {
+        // Byte cushion for the calibration's per-image quality noise
+        // (two-corpus + Optuna joint fit, study lossy_modular_v3 2026-09-02).
+        const LM_GATE_MARGIN: f64 = 1.066;
+        let mut vardct_writer = BitWriter::new();
+        let xyb_for_modular = xyb.clone();
+        encode_frame_vardct(
+            ctx,
+            scratch,
+            distance,
+            &distp,
+            xyb,
+            is_achromatic,
+            alpha,
+            coeff_shifts,
+            patches,
+            &mut vardct_writer,
+        )?;
+        let mut modular_writer = BitWriter::new();
+        if crate::lossless::encode_frame_lossy_modular_squeeze(
+            &xyb_for_modular,
+            crate::lossless::lm_calibrated_distance(distance),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut modular_writer,
+        ) && (modular_writer.bits_written() as f64) * LM_GATE_MARGIN
+            < vardct_writer.bits_written() as f64
+        {
+            writer.append(&modular_writer);
+        } else {
+            writer.append(&vardct_writer);
+        }
+        return Ok(());
+    }
+    encode_frame_vardct(
+        ctx,
+        scratch,
+        distance,
+        &distp,
+        xyb,
+        is_achromatic,
+        alpha,
+        coeff_shifts,
+        patches,
+        writer,
+    )
+}
+
+/// The VarDCT arm of lossy encoding (regular or patched), from a prepared XYB
+/// image.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_vardct(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    distp: &DistanceParams,
+    xyb: Image3F,
+    is_achromatic: bool,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    patches: bool,
+    writer: &mut BitWriter,
+) -> Result<(), EncodeError> {
+    let mut xyb = xyb;
     let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
     let saturation_stat = if slow_chromatic {
         chroma_saturation_stat(&xyb)
@@ -1266,7 +1383,7 @@ pub(crate) fn encode_frame(
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
-        gaborize(&mut regular, &distp);
+        gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
             ctx,
@@ -1387,7 +1504,7 @@ pub(crate) fn encode_frame(
         }
 
         let mut base = plan.base;
-        gaborize(&mut base, &distp);
+        gaborize(&mut base, distp);
         encode_frame_core(
             ctx,
             scratch,
@@ -1406,7 +1523,7 @@ pub(crate) fn encode_frame(
         return Ok(());
     }
 
-    gaborize(&mut xyb, &distp);
+    gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
         scratch,
@@ -1423,10 +1540,6 @@ pub(crate) fn encode_frame(
 const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
 
 /// The VarDCT atlas is coded this much finer than the frame it serves.
-///
-/// Two Optuna studies agree: the SS2 cliff starts at ~0.5 on large screenshot
-/// content (every occurrence inherits the atlas error) and the plateau is
-/// [0.3, 0.5), so 0.45 sits at the rate-optimal edge with measured margin.
 const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 
 /// Every opsin row sums to 1, so achromatic input gives L = M = S and hence
@@ -1436,29 +1549,19 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 const SAT_QM_THRESHOLD: f32 = 0.055;
 
 /// `x_gradient_stat` gate for keeping the fine X quantizer through the
-/// x_qm_scale=2 distance band (0.299..=1.25). Calibration 2026-08-29:
-/// Burning_Ship reads 0.053 (its yellow-band crop 0.072); the highest
-/// natural image measured (Kodak + assets, 30 images) reads 0.027.
+/// x_qm_scale=2 distance band (0.299..=1.25)
 const X_QM_GRAD_THRESHOLD: f32 = 0.04;
 
 /// `b_gradient_stat` gate for blue-axis-dominant structure (the B twin of
-/// `x_heavy`). Opsin-plane calibration 2026-08-29: blue-rotated fractal
-/// victim 0.97, buddhabrot glow class 0.52-0.72, highest photo 0.33 (Oahu
-/// ocean), Kodak max 0.19 — 0.45 keeps every photo out with margin while
-/// admitting the blue-structure class.
+/// `x_heavy`)
 const B_GRAD_THRESHOLD: f32 = 0.45;
 
 /// Fine-B precision for the synthetic high-frequency opponent-color class.
 /// Scale 7 is the strongest representable multiplier and remained efficient
-/// at matched rate on the fitted d=0.5/1/1.25/1.5 points. Keep an override for
-/// regression studies without perturbing the yellow-only selector.
+/// at matched rate on the fitted d=0.5/1/1.25/1.5 points.
 #[inline]
 fn x_heavy_b_qm_scale() -> u32 {
-    std::env::var("JIXEL_XHEAVY_B_QM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v: &u32| (2..=7).contains(&v))
-        .unwrap_or(7)
+    7
 }
 
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
@@ -2505,6 +2608,7 @@ fn setup_dc_group(
         &mut dc_data.ytob_map,
         distp.distance,
     );
+    let mut fine_rollbacks = Vec::new();
     dc_data.sub8_benefit = crate::ac_strategy::fill_ac_strategy(
         ctx,
         scratch,
@@ -2518,8 +2622,44 @@ fn setup_dc_group(
         &dc_data.ytox_map,
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
+        &mut fine_rollbacks,
         num_threads,
     );
+    // A fine mosaic that split an otherwise-retained merge must repay its own
+    // exact metadata delta. Keep this separate from the legacy sub-8 gate so
+    // unrelated fine-block gains cannot subsidize a weak mosaic decision.
+    let fine_accepted = if fine_rollbacks.is_empty() {
+        false
+    } else {
+        let fine_benefit: f32 = fine_rollbacks.iter().map(|r| r.benefit).sum();
+        let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        for rollback in &fine_rollbacks {
+            dc_data
+                .ac_strategy
+                .set_first(rollback.bx, rollback.by, rollback.strategy);
+        }
+        let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        let meta_delta = cost_with.saturating_sub(cost_without) as f32;
+        let fine_lambda = crate::ac_strategy::fine_mosaic_lambda(distp.distance);
+        let accepted = fine_benefit > fine_lambda * meta_delta;
+        if accepted {
+            for rollback in &fine_rollbacks {
+                for iy in 0..rollback.cov_y {
+                    for ix in 0..rollback.cov_x {
+                        dc_data.ac_strategy.set_first(
+                            rollback.bx + ix,
+                            rollback.by + iy,
+                            rollback.fine_grid[iy * 4 + ix],
+                        );
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    };
+
     // Sub-8x8 activation gate. `fill_ac_strategy` greedily commits every block
     // where a fine 8x8-family strategy wins the per-block RD comparison, but a
     // sparse set can disrupt prefix-code clustering of the (otherwise nearly
@@ -2533,7 +2673,14 @@ fn setup_dc_group(
             for x in 0..dc_data.ac_strategy.xsize() {
                 if dc_data.ac_strategy.is_first_block(x, y) {
                     let strategy = dc_data.ac_strategy.raw_strategy(x, y);
-                    if is_sub8_strategy(strategy) {
+                    let in_accepted_mosaic = fine_accepted
+                        && fine_rollbacks.iter().any(|rollback| {
+                            x >= rollback.bx
+                                && x < rollback.bx + rollback.cov_x
+                                && y >= rollback.by
+                                && y < rollback.by + rollback.cov_y
+                        });
+                    if is_sub8_strategy(strategy) && !in_accepted_mosaic {
                         positions.push((x, y, strategy));
                     }
                 }
@@ -2552,7 +2699,7 @@ fn setup_dc_group(
                     dc_data.ac_strategy.set_first(x, y, strategy);
                 }
             }
-            // else: leave reverted to DCT8.
+            // Else leave ordinary fine blocks as DCT8.
         }
     }
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
@@ -2927,18 +3074,22 @@ mod tests {
     }
 
     #[test]
-    fn epf_never_requests_the_third_iteration() {
-        // The third EPF pass erases texture rather than ringing, so the
-        // schedule tops out at two iterations no matter how coarse the
-        // distance gets. Guards against a threshold creeping back in.
+    fn epf_third_iteration_only_in_the_vlq_ramp() {
+        // The third EPF pass erases texture rather than ringing in the normal
+        // bands, so the schedule tops out at two iterations — until the VLQ
+        // ramp (see DCEPF_VLQ_D0), where the fitted schedule restores it at
+        // half-ramp. Guards both the cap and the restoration point.
         for d in [0.0, 0.1, 0.5, 0.69] {
             assert_eq!(compute_distance_params(d).epf_iters, 0, "d={d}");
         }
         for d in [0.7, 1.0, 1.49] {
             assert_eq!(compute_distance_params(d).epf_iters, 1, "d={d}");
         }
-        for d in [1.5, 2.0, 4.0, 6.0, 12.0, 25.0] {
+        for d in [1.5, 2.0, 4.0, 6.0, 8.0, 11.0] {
             assert_eq!(compute_distance_params(d).epf_iters, 2, "d={d}");
+        }
+        for d in [11.5, 15.0, 25.0] {
+            assert_eq!(compute_distance_params(d).epf_iters, 3, "d={d}");
         }
     }
 
@@ -2949,7 +3100,12 @@ mod tests {
         assert_eq!(epf_sharpness_id(2.75), 5);
         assert_eq!(epf_sharpness_id(3.49), 5);
         assert_eq!(epf_sharpness_id(3.5), 4);
-        assert_eq!(epf_sharpness_id(25.0), 4);
+        // VLQ ramp steps (quarter-points of DCEPF_VLQ_D0..D1 = 8..15).
+        assert_eq!(epf_sharpness_id(9.74), 4);
+        assert_eq!(epf_sharpness_id(9.75), 3);
+        assert_eq!(epf_sharpness_id(11.5), 2);
+        assert_eq!(epf_sharpness_id(13.25), 1);
+        assert_eq!(epf_sharpness_id(25.0), 1);
     }
 
     #[test]

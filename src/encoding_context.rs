@@ -46,12 +46,14 @@ fn channel_weights_for_bias(bias: f32) -> [f32; 3] {
     ]
 }
 
-/// Per-encode dispatch table.  The individual modules still own their `OnceLock`
+/// Per-encode dispatch table. The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
 pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
+    /// Lossy arm selection from the public config
+    pub(crate) lossy_modular: crate::LossyModular,
     pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) xyb: xyb::XybMatrix,
     /// Transform-merge knobs resolved at this encodes distance.
@@ -82,6 +84,7 @@ pub(crate) struct EncodingContext {
     pub(crate) block_features: structure_aq::BlockFeaturesFn,
     pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
+    pub(crate) mosaic_seam_stats: crate::mosaic_seam::MosaicSeamStatsFn,
     pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
     pub(crate) gradient_region_stats_with_chroma: ac_strategy::GradientRegionStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
@@ -206,6 +209,7 @@ impl EncodingContext {
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
+            lossy_modular: crate::LossyModular::Off,
             boost,
             xyb,
             merge: ac_strategy::MergeTuning::new(distance),
@@ -236,6 +240,7 @@ impl EncodingContext {
             block_features: structure_aq::select_block_features_fn(),
             apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
+            mosaic_seam_stats: crate::mosaic_seam::select_mosaic_seam_stats_fn(),
             gradient_region_stats: ac_strategy::select_gradient_region_stats_fn(),
             gradient_region_stats_with_chroma:
                 ac_strategy::select_gradient_region_stats_with_chroma_fn(),

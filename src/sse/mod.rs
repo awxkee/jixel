@@ -36,6 +36,7 @@ mod entropy;
 mod inflated_cost;
 mod lossless_grad;
 mod modular;
+mod mosaic_seam;
 mod quant;
 mod quantize_xyb;
 mod structure_aq;
@@ -58,6 +59,7 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_sse41, tokenize_alpha_u8_interior_sse41,
     tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
 };
+pub(crate) use mosaic_seam::mosaic_seam_stats_sse41;
 pub(crate) use quant::{
     apply_quant_field_gain_sse41, apply_structure_aq_sse41, quantize_block_ac_sse41,
     quantize_dc_cfl_sse41, quantize_dc_sse41,

@@ -301,9 +301,7 @@ pub(crate) fn apply_chroma_hf_protection(
     );
 }
 
-/// Temporary fitting override for the chroma-HF protection term:
-/// JIXEL_CHROMA_FIT="fade_in_start:fade_in_width:fade_out_start:fade_out_width:strength:ceil_base:ceil_share".
-/// Unset = the shipped constants (bit-identical behavior).
+/// Fitted constants of the chroma-HF protection term.
 struct ChromaHfFit {
     fade_in_start: f32,
     fade_in_width: f32,
@@ -315,34 +313,16 @@ struct ChromaHfFit {
 }
 
 fn chroma_hf_fit() -> &'static ChromaHfFit {
-    static FIT: OnceLock<ChromaHfFit> = OnceLock::new();
-    FIT.get_or_init(|| {
-        let default = ChromaHfFit {
-            fade_in_start: 0.35,
-            fade_in_width: 0.40,
-            fade_out_start: 1.0,
-            fade_out_width: 1.0,
-            strength: 0.40,
-            ceil_base: 0.35,
-            ceil_share: 1.4,
-        };
-        let Ok(v) = std::env::var("JIXEL_CHROMA_FIT") else {
-            return default;
-        };
-        let parts: Vec<f32> = v.split(':').filter_map(|p| p.trim().parse().ok()).collect();
-        match parts[..] {
-            [fis, fiw, fos, fow, st, cb, cs] => ChromaHfFit {
-                fade_in_start: fis,
-                fade_in_width: fiw,
-                fade_out_start: fos,
-                fade_out_width: fow,
-                strength: st,
-                ceil_base: cb,
-                ceil_share: cs,
-            },
-            _ => default,
-        }
-    })
+    const FIT: ChromaHfFit = ChromaHfFit {
+        fade_in_start: 0.35,
+        fade_in_width: 0.40,
+        fade_out_start: 1.0,
+        fade_out_width: 1.0,
+        strength: 0.40,
+        ceil_base: 0.35,
+        ceil_share: 1.4,
+    };
+    &FIT
 }
 
 fn apply_chroma_hf_protection_with_stats(

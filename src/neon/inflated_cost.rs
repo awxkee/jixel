@@ -810,6 +810,7 @@ mod tests {
                     rgb_hue_alpha: 0.0,
                     gradient_alpha: 0.0,
                     gradient_peak_alpha: 3.0,
+                    keep_spatial_errors: false,
                 },
             };
             for biased in [false, true] {

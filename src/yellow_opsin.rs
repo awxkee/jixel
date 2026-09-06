@@ -300,6 +300,7 @@ fn quant(v: f32, step: f32) -> f32 {
     (v / step).round() * step
 }
 
+#[derive(Clone, Copy, Default)]
 struct SamplePixel {
     rgb: [f32; 3],
     risk: f32,
@@ -367,30 +368,47 @@ fn evaluate_bias(samples: &[SamplePixel], m: &XybMatrix, steps: [f32; 3]) -> Bia
 /// dependent.
 fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
     let (w, h) = (linear.xsize(), linear.ysize());
+    if w == 0 || h == 0 {
+        return (Vec::new(), 0.0);
+    }
+
     let rp = linear.plane_data(0);
     let gp = linear.plane_data(1);
     let bp = linear.plane_data(2);
-    let mut samples = Vec::with_capacity(h.div_ceil(SAMPLE_STRIDE) * w.div_ceil(SAMPLE_STRIDE));
+    let sample_count = h.div_ceil(SAMPLE_STRIDE) * w.div_ceil(SAMPLE_STRIDE);
+    let mut samples = vec![SamplePixel::default(); sample_count];
+    let mut samples_iter = samples.iter_mut();
     let mut edge_sum = 0.0f32;
     let mut edge_n = 0usize;
-    let luma = |i: usize| 0.3 * rp[i] + 0.6 * gp[i] + 0.1 * bp[i];
-    for y in (0..h).step_by(SAMPLE_STRIDE) {
+    let luma = |r: f32, g: f32, b: f32| 0.3 * r + 0.6 * g + 0.1 * b;
+    for (sample_y, r_row) in rp.chunks_exact(w).step_by(SAMPLE_STRIDE).enumerate() {
+        let y = sample_y * SAMPLE_STRIDE;
         let row = y * w;
-        for x in (0..w).step_by(SAMPLE_STRIDE) {
+        let g_row = &gp[row..row + w];
+        let b_row = &bp[row..row + w];
+        for ((sample_x, &r), sample) in r_row
+            .iter()
+            .step_by(SAMPLE_STRIDE)
+            .enumerate()
+            .zip(samples_iter.by_ref())
+        {
+            let x = sample_x * SAMPLE_STRIDE;
             let i = row + x;
-            let rgb = [rp[i], gp[i], bp[i]];
+            let rgb = [r, g_row[x], b_row[x]];
             let risk = yellow_pixel_risk(rgb[0], rgb[1], rgb[2]);
             if risk > STRONG_SCORE {
+                let center_luma = luma(rgb[0], rgb[1], rgb[2]);
                 if x + 1 < w {
-                    edge_sum += (luma(i + 1) - luma(i)).abs();
+                    edge_sum +=
+                        (luma(r_row[x + 1], g_row[x + 1], b_row[x + 1]) - center_luma).abs();
                     edge_n += 1;
                 }
                 if y + 1 < h {
-                    edge_sum += (luma(i + w) - luma(i)).abs();
+                    edge_sum += (luma(rp[i + w], gp[i + w], bp[i + w]) - center_luma).abs();
                     edge_n += 1;
                 }
             }
-            samples.push(SamplePixel { rgb, risk });
+            *sample = SamplePixel { rgb, risk };
         }
     }
     let yellow_edge = if edge_n > 0 {
@@ -407,11 +425,6 @@ fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -
     if samples.is_empty() {
         return SPEC_BIAS;
     }
-    // Continuous ramp instead of a hard band: a hard floor stacked a +3..5%
-    // rate step on top of the FLAT/SAT table switch at d=0.3 (measured on
-    // david-underland: 0.29→0.30 was +9% bytes combined), and a hard cap
-    // would put the mirror step at 2.5. Full strength covers d=0.8..2.0,
-    // where the tail rescue was measured.
     let fade_in = ramp(distance, TIER2_MIN_DISTANCE, TIER2_FULL_DISTANCE);
     let fade_out = 1.0 - ramp(distance, TIER2_FADE_OUT_START, TIER2_MAX_DISTANCE);
     let strength = fade_in * fade_out;

@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, SavedChild};
+use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -151,12 +151,29 @@ pub(crate) struct RerankDowngrade {
     pub(crate) restore: [u8; 16],
 }
 
+/// A large transform that was split only because an Identity/DCT2x2 mosaic
+/// won the joint boundary-aware rerank. The frame-level metadata gate can
+/// restore `strategy` exactly when the full fine-transform map does not repay
+/// its measured entropy cost.
+#[derive(Clone, Copy)]
+pub(crate) struct FineMergeRollback {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cov_x: usize,
+    pub(crate) cov_y: usize,
+    pub(crate) strategy: u8,
+    pub(crate) fine_grid: [u8; 16],
+    pub(crate) benefit: f32,
+}
+
 pub(crate) struct AcStrategyBandScratch {
+    pub(crate) fine_mosaic: LazyScratch<FineMosaicScratch>,
     pub(crate) strategy: AcStrategyImage,
     pub(crate) benefit: f32,
     pub(crate) chosen32: Vec<Chosen32Cost>,
     pub(crate) saved_children: Vec<SavedChild>,
     pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
+    pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
 }
@@ -164,11 +181,13 @@ pub(crate) struct AcStrategyBandScratch {
 impl Default for AcStrategyBandScratch {
     fn default() -> Self {
         Self {
+            fine_mosaic: LazyScratch::default(),
             strategy: AcStrategyImage::new(0, 0),
             benefit: 0.0,
             chosen32: Vec::new(),
             saved_children: Vec::new(),
             rerank_downgrades: Vec::new(),
+            fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
         }
@@ -190,12 +209,14 @@ impl AcStrategyBandScratch {
         self.chosen32.clear();
         self.saved_children.clear();
         self.rerank_downgrades.clear();
+        self.fine_rollbacks.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
     }
 
     fn prepare_rerank(&mut self, max_blocks: usize) {
         self.rerank_downgrades.clear();
+        self.fine_rollbacks.clear();
         self.current_costs.clear();
         if self.rerank_downgrades.capacity() < max_blocks {
             self.rerank_downgrades.reserve(max_blocks);
@@ -362,12 +383,14 @@ impl Default for CoderScratch {
 #[cfg(test)]
 mod tests {
     use super::{CoderScratch, DcPredictorScratch, LazyScratch, LzEntropyScratch};
+    use crate::ac_strategy::FineMosaicScratch;
     use crate::group::AcGroupScratch;
     use std::mem::size_of;
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
         assert!(size_of::<CoderScratch>() <= 1104);
+        assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);
