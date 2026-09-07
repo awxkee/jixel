@@ -109,6 +109,7 @@ struct DistanceParams {
     scale_dc: f32,
     x_qm_scale: u32,
     epf_iters: u32,
+    epf_pass0_scale: Option<f32>,
     gab_enabled: bool,
 }
 
@@ -209,7 +210,8 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
             epf_iters += 1;
         }
     }
-    if dcepf_vlq_t(distance) >= 0.5 {
+    let epf_pass0_scale = epf_pass0_scale(distance);
+    if epf_pass0_scale.is_some() || dcepf_vlq_t(distance) >= 0.5 {
         epf_iters = 3;
     }
     let gab_enabled = false; // measured net-negative for rate-matched SSIMU2
@@ -222,8 +224,41 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         scale_dc,
         x_qm_scale,
         epf_iters,
+        epf_pass0_scale,
         gab_enabled,
     }
+}
+
+/// The third EPF pass (libjxl stage 0: the 5x5 filter, only run at
+/// `epf_iters == 3`) at spec sigma scale 0.9 blurs too hard for the mid band
+/// (SS2 −1.5..−2.3 on Kodak d3-8 at zero rate), which is why the schedule
+/// stopped at two passes. Widening its scale (larger = weaker pass) turns it
+/// into a both-metrics win: rate-free Kodak grid 2026-09-07, s=3.6 at d3/4/6
+/// /8/10 = SS2 +0.04/+0.08/+0.12/+0.13/+0.21 (18-23/24, worst −0.06) with
+/// butteraugli-3 −0.19/−0.20/−0.33/−0.54/−0.48% (24/24); holdout crops agree
+/// (d4 +0.08/−0.22%, d8 +0.13/−0.58%, 14/14 BA). d=2 is neutral, so the pass
+/// starts at `EPF_PASS0_START_D`; inside the VLQ ramp the scale eases toward
+/// the fitted spec-strength band (`DCEPF_VLQ_D0`.., 3 passes at 0.9 from
+/// half-ramp), where the default header is written unchanged. Costs the
+/// 8-byte custom-sigma header. An Optuna re-fit of (start, scale, VLQ scale)
+/// confirmed these values as the optimum on a flat surface.
+const EPF_PASS0_START_D: f32 = 2.5;
+const EPF_PASS0_SCALE: f32 = 3.6;
+const EPF_PASS0_SPEC_SCALE: f32 = 0.9;
+
+fn epf_pass0_scale(distance: f32) -> Option<f32> {
+    if distance < EPF_PASS0_START_D {
+        return None;
+    }
+    let t = dcepf_vlq_t(distance);
+    if t >= 0.5 {
+        return None;
+    }
+    Some(fmla(
+        2.0 * t,
+        EPF_PASS0_SPEC_SCALE - EPF_PASS0_SCALE,
+        EPF_PASS0_SCALE,
+    ))
 }
 
 #[inline]
@@ -743,6 +778,7 @@ fn write_frame_header_kind(
     x_qm_scale: u32,
     b_qm_scale: u32,
     epf_iters: u32,
+    epf_pass0_scale: Option<f32>,
     gab_enabled: bool,
     has_alpha: bool,
     coeff_shifts: &[u32],
@@ -754,6 +790,7 @@ fn write_frame_header_kind(
             x_qm_scale,
             b_qm_scale,
             epf_iters,
+            epf_pass0_scale,
             gab_enabled,
             has_alpha,
             coeff_shifts,
@@ -764,6 +801,7 @@ fn write_frame_header_kind(
             x_qm_scale,
             b_qm_scale,
             epf_iters,
+            epf_pass0_scale,
             gab_enabled,
             has_alpha,
             coeff_shifts,
@@ -788,13 +826,18 @@ fn write_frame_header_kind(
             w.write(2, PATCH_REF_ID as u64);
             w.write(1, 1); // save_before_color_transform
             w.write(2, 0); // empty name
-            write_loop_filter(epf_iters, gab_enabled, w);
+            write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, w);
             w.write(2, 0); // no frame-header extensions
         }
     }
 }
 
-fn write_loop_filter(epf_iters: u32, gab_enabled: bool, w: &mut BitWriter) {
+fn write_loop_filter(
+    epf_iters: u32,
+    epf_pass0_scale: Option<f32>,
+    gab_enabled: bool,
+    w: &mut BitWriter,
+) {
     if epf_iters == 2 && gab_enabled {
         w.write(1, 1); // default loop filter (gab=1, epf=2)
     } else {
@@ -809,7 +852,18 @@ fn write_loop_filter(epf_iters: u32, gab_enabled: bool, w: &mut BitWriter) {
         if epf_iters > 0 {
             w.write(1, 0); // default epf sharpness
             w.write(1, 0); // default epf weights
-            w.write(1, 0); // default epf sigma
+            // epf_sigma_custom: [quant_mul, pass0_scale, pass2_scale,
+            // border_sad_mul], spec defaults 0.46, 0.9, 6.5, 2/3. Only the
+            // pass-0 scale is scheduled; the rest stay at spec.
+            if let Some(s) = epf_pass0_scale {
+                let c = [0.46, s, 6.5, 2.0 / 3.0];
+                w.write(1, 1); // custom epf sigma
+                for x in c {
+                    w.write(16, crate::util::f32_to_f16_bits(x) as u64);
+                }
+            } else {
+                w.write(1, 0); // default epf sigma
+            }
         }
         w.write(2, 0); // no loop filter extensions
     }
@@ -819,6 +873,7 @@ fn write_frame_header(
     x_qm_scale: u32,
     b_qm_scale: u32,
     epf_iters: u32,
+    epf_pass0_scale: Option<f32>,
     gab_enabled: bool,
     has_alpha: bool,
     coeff_shifts: &[u32],
@@ -894,7 +949,7 @@ fn write_frame_header(
 
     w.write(1, 1); // last frame
     w.write(2, 0); // no name
-    write_loop_filter(epf_iters, gab_enabled, w);
+    write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, w);
     w.write(2, 0); // no frame header extensions
 }
 
@@ -2494,6 +2549,7 @@ fn encode_frame_core(
         distp.x_qm_scale,
         ctx.b_qm_scale(),
         distp.epf_iters,
+        distp.epf_pass0_scale,
         distp.gab_enabled,
         alpha.is_some(),
         coeff_shifts,
@@ -2913,8 +2969,9 @@ fn build_stripe(
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, MIN_TOKENS_PER_DC_LEAF,
-        choose_dc_predictors, compute_distance_params, dc_refinement, epf_sharpness_id, quant_dc,
+        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE,
+        MIN_TOKENS_PER_DC_LEAF, choose_dc_predictors, compute_distance_params, dc_refinement,
+        epf_sharpness_id, quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -3074,22 +3131,34 @@ mod tests {
     }
 
     #[test]
-    fn epf_third_iteration_only_in_the_vlq_ramp() {
-        // The third EPF pass erases texture rather than ringing in the normal
-        // bands, so the schedule tops out at two iterations — until the VLQ
-        // ramp (see DCEPF_VLQ_D0), where the fitted schedule restores it at
-        // half-ramp. Guards both the cap and the restoration point.
+    fn epf_third_pass_schedule() {
+        // The third EPF pass at spec strength erases texture in the normal
+        // bands, so it only enters weakened (custom pass-0 sigma scale) from
+        // EPF_PASS0_START_D, eases toward spec strength across the first half
+        // of the VLQ ramp, and hands over to the fitted spec-strength band
+        // (default sigma header) at half-ramp. Guards every edge.
         for d in [0.0, 0.1, 0.5, 0.69] {
             assert_eq!(compute_distance_params(d).epf_iters, 0, "d={d}");
         }
         for d in [0.7, 1.0, 1.49] {
             assert_eq!(compute_distance_params(d).epf_iters, 1, "d={d}");
         }
-        for d in [1.5, 2.0, 4.0, 6.0, 8.0, 11.0] {
-            assert_eq!(compute_distance_params(d).epf_iters, 2, "d={d}");
+        for d in [1.5, 2.0, 2.49] {
+            let p = compute_distance_params(d);
+            assert_eq!(p.epf_iters, 2, "d={d}");
+            assert_eq!(p.epf_pass0_scale, None, "d={d}");
         }
+        for d in [2.5, 4.0, 6.0, 8.0] {
+            let p = compute_distance_params(d);
+            assert_eq!(p.epf_iters, 3, "d={d}");
+            assert_eq!(p.epf_pass0_scale, Some(EPF_PASS0_SCALE), "d={d}");
+        }
+        let mid = compute_distance_params(9.75).epf_pass0_scale.unwrap();
+        assert!((mid - 0.5 * (EPF_PASS0_SCALE + EPF_PASS0_SPEC_SCALE)).abs() < 1e-5);
         for d in [11.5, 15.0, 25.0] {
-            assert_eq!(compute_distance_params(d).epf_iters, 3, "d={d}");
+            let p = compute_distance_params(d);
+            assert_eq!(p.epf_iters, 3, "d={d}");
+            assert_eq!(p.epf_pass0_scale, None, "d={d}");
         }
     }
 
