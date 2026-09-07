@@ -950,8 +950,6 @@ const RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA: f32 = 96.0;
 const RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE: f32 = 0.4;
 const RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA: f32 = 0.45;
 const RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA: f32 = 0.01;
-// Fitted on Burning_Ship at d=0.5/1/1.25/1.5. The frame-level X-gradient
-// gate keeps this entirely off the yellow-photo and Kodak guards.
 const RERANK_RGB_HUE_ALPHA: f32 = 800.0;
 
 fn rerank_rgb_hue_alpha(ctx: &EncodingContext, distance: f32) -> f32 {
@@ -959,8 +957,7 @@ fn rerank_rgb_hue_alpha(ctx: &EncodingContext, distance: f32) -> f32 {
         return 0.0;
     }
     let fade_in = ((distance - 0.35) / 0.40).clamp(0.0, 1.0);
-    let fade_out = 1.0 - ((distance - 1.25) / 0.50).clamp(0.0, 1.0);
-    RERANK_RGB_HUE_ALPHA * fade_in * fade_out
+    RERANK_RGB_HUE_ALPHA * fade_in
 }
 
 #[inline]

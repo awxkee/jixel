@@ -1926,6 +1926,27 @@ mod tests {
     };
 
     #[test]
+    fn hue_protection_survives_coarse_quantization_only_for_chroma_structure() {
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            None,
+            crate::xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
+        let alpha = |distance| super::rerank_rgb_hue_alpha(&ctx, distance);
+        for distance in [1.0, 2.0, 3.0, 4.0, 10.0] {
+            assert_eq!(alpha(distance), 0.0);
+        }
+        ctx.set_x_heavy(true);
+        assert_eq!(alpha(0.35), 0.0);
+        assert!(alpha(0.5) > 0.0 && alpha(0.5) < alpha(1.0));
+        for distance in [2.0, 2.5, 3.0, 3.25, 4.0, 10.0] {
+            assert_eq!(alpha(distance), alpha(1.0));
+        }
+    }
+
+    #[test]
     fn mosaic_seam_stats_matches_assembled_boundary_stats() {
         let mut seed = 127u32;
         let mut random = || {

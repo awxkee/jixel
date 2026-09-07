@@ -211,7 +211,14 @@ pub(crate) fn rgb_hue_chroma_edge_loss_neon(
             let _ = recon_l;
             let source_chroma =
                 vsqrtq_f32(vfmaq_f32(vmulq_f32(source_b, source_b), source_a, source_a));
-            let recon_chroma = vsqrtq_f32(vfmaq_f32(vmulq_f32(recon_b, recon_b), recon_a, recon_a));
+            let radial_error = vdivq_f32(
+                vfmaq_f32(
+                    vmulq_f32(source_b, vsubq_f32(source_b, recon_b)),
+                    source_a,
+                    vsubq_f32(source_a, recon_a),
+                ),
+                vmaxq_f32(source_chroma, vdupq_n_f32(1e-4)),
+            );
             let brightness_risk = clamp01_f32x4(vmulq_n_f32(
                 vsubq_f32(source_l, vdupq_n_f32(0.35)),
                 1.0 / 0.40,
@@ -221,7 +228,7 @@ pub(crate) fn rgb_hue_chroma_edge_loss_neon(
                 1.0 / 0.12,
             ));
             let risk = vmulq_f32(vmulq_f32(edge_risk, brightness_risk), chroma_risk);
-            let desaturation = vmaxq_f32(vsubq_f32(source_chroma, recon_chroma), zero);
+            let desaturation = vmaxq_f32(radial_error, zero);
             let perpendicular = vdivq_f32(
                 vsubq_f32(vmulq_f32(source_a, recon_b), vmulq_f32(source_b, recon_a)),
                 vaddq_f32(source_chroma, vdupq_n_f32(1e-4)),

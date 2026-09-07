@@ -216,11 +216,14 @@ pub(crate) fn rgb_hue_chroma_edge_loss_avx2(
                 source_a,
                 _mm256_mul_ps(source_b, source_b),
             ));
-            let recon_chroma = _mm256_sqrt_ps(_mm256_fmadd_ps(
-                recon_a,
-                recon_a,
-                _mm256_mul_ps(recon_b, recon_b),
-            ));
+            let radial_error = _mm256_div_ps(
+                _mm256_fmadd_ps(
+                    source_a,
+                    _mm256_sub_ps(source_a, recon_a),
+                    _mm256_mul_ps(source_b, _mm256_sub_ps(source_b, recon_b)),
+                ),
+                _mm256_max_ps(source_chroma, _mm256_set1_ps(1e-4)),
+            );
             let brightness_risk = clamp01_f32x8(_mm256_mul_ps(
                 _mm256_sub_ps(source_l, _mm256_set1_ps(0.35)),
                 _mm256_set1_ps(1.0 / 0.40),
@@ -230,7 +233,7 @@ pub(crate) fn rgb_hue_chroma_edge_loss_avx2(
                 _mm256_set1_ps(1.0 / 0.12),
             ));
             let risk = _mm256_mul_ps(_mm256_mul_ps(edge_risk, brightness_risk), chroma_risk);
-            let desaturation = _mm256_max_ps(_mm256_sub_ps(source_chroma, recon_chroma), zero);
+            let desaturation = _mm256_max_ps(radial_error, zero);
             let perpendicular = _mm256_div_ps(
                 _mm256_sub_ps(
                     _mm256_mul_ps(source_a, recon_b),
