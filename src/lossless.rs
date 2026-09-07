@@ -2202,7 +2202,7 @@ fn lossy_modular_q(color: usize, hshift: i32, vshift: i32, distance: f32) -> i32
 pub(crate) fn lm_calibrated_distance(d: f32) -> f32 {
     // Jointly re-fitted with LM_ROW_MUL (study lossy_modular_v3): the finer
     // chroma shifts the arm's SS2-per-distance, so the knots moved with it.
-    const KNOTS: [(f32, f32); 4] = [(1.0, 1.255), (1.5, 1.532), (2.0, 1.888), (3.0, 2.238)];
+    static KNOTS: [(f32, f32); 4] = [(1.0, 1.255), (1.5, 1.532), (2.0, 1.888), (3.0, 2.238)];
     let knots = KNOTS;
     let k = if d <= knots[0].0 {
         knots[0].1
@@ -2210,7 +2210,7 @@ pub(crate) fn lm_calibrated_distance(d: f32) -> f32 {
         knots[knots.len() - 1].1
     } else {
         let mut k = knots[0].1;
-        for w in knots.windows(2) {
+        for w in knots.array_windows::<2>() {
             let [(d0, k0), (d1, k1)] = [w[0], w[1]];
             if d >= d0 && d <= d1 {
                 k = k0 + (k1 - k0) * (d - d0) / (d1 - d0);
