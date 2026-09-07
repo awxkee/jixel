@@ -214,10 +214,13 @@ pub(crate) fn rgb_hue_chroma_edge_loss_wasm(
                 f32x4_mul(source_a, source_a),
                 f32x4_mul(source_b, source_b),
             ));
-            let recon_chroma = f32x4_sqrt(f32x4_add(
-                f32x4_mul(recon_a, recon_a),
-                f32x4_mul(recon_b, recon_b),
-            ));
+            let radial_error = f32x4_div(
+                f32x4_add(
+                    f32x4_mul(source_a, f32x4_sub(source_a, recon_a)),
+                    f32x4_mul(source_b, f32x4_sub(source_b, recon_b)),
+                ),
+                f32x4_max(source_chroma, f32x4_splat(1e-4)),
+            );
             let brightness_risk = clamp01_f32x4(f32x4_mul(
                 f32x4_sub(source_l, f32x4_splat(0.35)),
                 f32x4_splat(1.0 / 0.40),
@@ -227,7 +230,7 @@ pub(crate) fn rgb_hue_chroma_edge_loss_wasm(
                 f32x4_splat(1.0 / 0.12),
             ));
             let risk = f32x4_mul(f32x4_mul(edge_risk, brightness_risk), chroma_risk);
-            let desaturation = f32x4_max(f32x4_sub(source_chroma, recon_chroma), zero);
+            let desaturation = f32x4_max(radial_error, zero);
             let perpendicular = f32x4_div(
                 f32x4_sub(f32x4_mul(source_a, recon_b), f32x4_mul(source_b, recon_a)),
                 f32x4_add(source_chroma, f32x4_splat(1e-4)),

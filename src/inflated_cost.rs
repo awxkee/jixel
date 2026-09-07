@@ -1009,6 +1009,26 @@ pub(crate) fn select_rgb_hue_chroma_edge_loss_fn() -> RgbHueChromaEdgeLossFn {
     rgb_hue_chroma_edge_loss_scalar
 }
 
+/// Resolve color error along and across the source hue. Using reconstructed
+/// chroma magnitude for the radial term would miss an equal-chroma hue reversal:
+/// its magnitude is unchanged and its perpendicular projection is zero.
+#[inline]
+fn hue_chroma_error(source: [f32; 2], reconstructed: [f32; 2], source_chroma: f32) -> f32 {
+    let radial_error = fmla(
+        source[0],
+        source[0] - reconstructed[0],
+        source[1] * (source[1] - reconstructed[1]),
+    ) / source_chroma.max(1e-4);
+    let desaturation = radial_error.max(0.0);
+    let perpendicular =
+        (source[0] * reconstructed[1] - source[1] * reconstructed[0]) / (source_chroma + 1e-4);
+    fmla(
+        desaturation,
+        desaturation,
+        0.75 * perpendicular * perpendicular,
+    )
+}
+
 #[inline]
 fn rgb_hue_chroma_pixel_loss(
     source: [f32; 3],
@@ -1030,24 +1050,21 @@ fn rgb_hue_chroma_pixel_loss(
     let source_lab = linear_rgb_to_oklab(source_rgb);
     let recon_lab = linear_rgb_to_oklab(recon_rgb);
     let source_chroma = fmla(source_lab[1], source_lab[1], source_lab[2] * source_lab[2]).sqrt();
-    let recon_chroma = fmla(recon_lab[1], recon_lab[1], recon_lab[2] * recon_lab[2]).sqrt();
     let brightness_risk = ((source_lab[0] - 0.35) * (1.0 / 0.40)).clamp(0.0, 1.0);
     let chroma_risk = ((source_chroma - 0.03) * (1.0 / 0.12)).clamp(0.0, 1.0);
     let risk = edge_risk * brightness_risk * chroma_risk;
-    let desaturation = (source_chroma - recon_chroma).max(0.0);
-    let perpendicular =
-        (source_lab[1] * recon_lab[2] - source_lab[2] * recon_lab[1]) / (source_chroma + 1e-4);
-    risk * fmla(
-        desaturation,
-        desaturation,
-        0.75 * perpendicular * perpendicular,
+    risk * hue_chroma_error(
+        [source_lab[1], source_lab[2]],
+        [recon_lab[1], recon_lab[2]],
+        source_chroma,
     )
 }
 
 /// Penalize decoder-domain hue rotation and chroma collapse only on bright,
 /// saturated source pixels that sit on an opponent-color edge. The radial
-/// component is one-sided (desaturation only); the perpendicular component
-/// measures hue rotation without an angle singularity near neutral colors.
+/// component penalizes loss along the original hue, including hue reversal;
+/// the perpendicular component measures rotation without an angle singularity
+/// near neutral colors. Same-hue oversaturation remains unpenalized.
 pub(crate) fn rgb_hue_chroma_edge_loss_scalar(
     opsin: &Image3F,
     px: usize,
@@ -1328,6 +1345,18 @@ mod tests {
         select_error_gradient_peak_energy_fn, select_rgb_hue_chroma_edge_loss_fn,
         ssim_deficit_scalar, validate_ssim_inputs,
     };
+
+    #[test]
+    fn hue_reversal_costs_more_than_losing_chroma() {
+        let source = [0.2, 0.0];
+        let loss = |reconstructed| super::hue_chroma_error(source, reconstructed, 0.2);
+        assert_eq!(loss(source), 0.0);
+        assert_eq!(loss([0.3, 0.0]), 0.0); // Same-hue oversaturation is not the target.
+        assert!(loss([0.0, 0.2]) > loss([0.0, 0.0]));
+        assert!(loss([-0.2, 0.0]) > loss([0.0, 0.2]));
+        assert!((loss([-0.2, 0.0]) - 4.0 * loss([0.0, 0.0])).abs() < 1e-6);
+        assert_eq!(super::hue_chroma_error([0.0; 2], [0.0; 2], 0.0), 0.0);
+    }
 
     #[test]
     fn rgb_hue_loss_simd_matches_scalar() {

@@ -749,7 +749,11 @@ pub(crate) fn fill_cmap(
         block_y: [0.; 64],
     };
 
-    let use_rdo = distance < CFL_RDO.max_d && ctx.speed == crate::encode_image::Speed::Slow;
+    // Coarse chroma structure still benefits from searching the
+    // quantized residual cost. Dropping to regression at d=3 erases yellow detail
+    // on the very frames for which we retain extra X/B precision.
+    let use_rdo = (distance < CFL_RDO.max_d || ctx.x_heavy())
+        && ctx.speed == crate::encode_image::Speed::Slow;
 
     for ty in 0..ytiles {
         for tx in 0..xtiles {
@@ -781,7 +785,7 @@ pub(crate) fn fill_cmap(
                             field: raw_quant_field,
                             scale,
                             distance,
-                            closed_loop: ctx.x_heavy() && distance < 1.75,
+                            closed_loop: ctx.x_heavy(),
                             block_x: tx * K_TILE_DIM_IN_BLOCKS,
                             block_y: ty * K_TILE_DIM_IN_BLOCKS,
                         },
