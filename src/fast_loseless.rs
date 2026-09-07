@@ -187,7 +187,7 @@ const KMAXSYM: usize = if K_NUM_RAW_SYMBOLS + 1 < K_NUM_LZ77 {
     K_NUM_RAW_SYMBOLS + 1
 };
 fn bit_reverse(nb: usize, bits: u16) -> u16 {
-    const N: [u16; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+    static N: [u16; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
     let r = (N[(bits & 0xF) as usize] << 12)
         | (N[((bits >> 4) & 0xF) as usize] << 8)
         | (N[((bits >> 8) & 0xF) as usize] << 4)

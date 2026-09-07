@@ -38,7 +38,7 @@ pub(crate) const NUM_MA_PROPS: usize = 16;
 /// Decoder predictors 0..=13 (libjxl `Predictor` enum order).
 pub(crate) const NUM_MA_PREDS: usize = 14;
 /// Properties the learner may split on (skips the constant stream id).
-const SPLIT_PROPS: [u8; 15] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+static SPLIT_PROPS: [u8; 15] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Split candidates, minus the WP-error property (last) when WP is excluded.
 fn split_props(allow_wp: bool) -> &'static [u8] {

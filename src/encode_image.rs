@@ -1834,7 +1834,7 @@ fn progressive_schedule(
             && s.len() <= 11
             && *s.last().unwrap() == 0
             && s.iter().all(|&v| v <= 3)
-            && s.windows(2).all(|w| w[0] >= w[1]);
+            && s.array_windows::<2>().all(|w| w[0] >= w[1]);
         if valid {
             return s.to_vec();
         }
