@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 9/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -26,36 +26,44 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::entropy::{CompactToken, Token};
+use crate::lz_match::{match_len_compact_scalar, match_len_scalar};
+use std::arch::aarch64::*;
 
-mod ans;
-mod cluster;
-mod dlog2;
-mod entropy_code;
-mod fast_div_u16;
-mod histogram;
-mod huffman_tree;
-mod prefix_code;
-mod token;
-mod write;
+// Token is repr(C), two u32 fields, without padding. Every vector load below
+// stays within both source slices. The sources may overlap: they are read-only.
+#[target_feature(enable = "neon")]
+pub(crate) fn match_len_neon(a: &[Token], b: &[Token]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    unsafe {
+        while i + 2 <= n {
+            let x = vld1q_u32(a.as_ptr().add(i).cast());
+            let y = vld1q_u32(b.as_ptr().add(i).cast());
+            if vminvq_u32(vceqq_u32(x, y)) != u32::MAX {
+                break;
+            }
+            i += 2;
+        }
+    }
+    i + match_len_scalar(&a[i..n], &b[i..n])
+}
 
-pub(crate) use ans::{
-    ANS_LOG_TAB_SIZE, ANS_TAB_SIZE, AnsCoder, AnsEncSymbolInfo, AnsHistogram, write_ans_tokens,
-};
-pub(crate) use cluster::{
-    CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms, cluster_histograms_ans,
-    cluster_histograms_fixed,
-};
-pub(crate) use dlog2::f_log2;
-pub(crate) use entropy_code::{EntropyCode, FrozenTokenPrices, OwnedEntropyCode};
-pub(crate) use histogram::Histogram;
-pub(crate) use huffman_tree::HuffmanNode;
-pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
-pub(crate) use token::{
-    CompactToken, HybridUintConfig, Token, pack_signed, uint_encode, uint_encode_with_config,
-};
-pub(crate) use write::{
-    HybridUintSamples, build_ans_code_parts, build_entropy_code_no_cluster, build_huffman_codes,
-    build_huffman_codes_into, optimize_entropy_code, optimize_entropy_code_ac,
-    optimize_entropy_code_ac_streams, optimize_entropy_code_ac_streams_fast, refine_ans_clusters,
-    write_context_map, write_entropy_code, write_prefix_codes, write_token,
-};
+// CompactToken is one u32 without padding. Every vector load below
+// stays within both source slices. The sources may overlap: they are read-only.
+#[target_feature(enable = "neon")]
+pub(crate) fn match_len_compact_neon(a: &[CompactToken], b: &[CompactToken]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    unsafe {
+        while i + 4 <= n {
+            let x = vld1q_u32(a.as_ptr().add(i).cast());
+            let y = vld1q_u32(b.as_ptr().add(i).cast());
+            if vminvq_u32(vceqq_u32(x, y)) != u32::MAX {
+                break;
+            }
+            i += 4;
+        }
+    }
+    i + match_len_compact_scalar(&a[i..n], &b[i..n])
+}

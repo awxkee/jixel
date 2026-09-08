@@ -36,6 +36,7 @@ mod entropy;
 mod frame;
 mod inflated_cost;
 mod lossless_grad;
+mod lz_match;
 mod quant;
 mod quantize_xyb;
 mod structure_aq;
@@ -60,6 +61,7 @@ pub(crate) use inflated_cost::{
     rgb_hue_chroma_edge_loss_wasm,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
 pub(crate) use quant::{
     apply_quant_field_gain_wasm, apply_structure_aq_wasm, quantize_block_ac_wasm,
     quantize_dc_cfl_wasm, quantize_dc_wasm,

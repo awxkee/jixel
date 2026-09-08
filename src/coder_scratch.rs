@@ -42,7 +42,7 @@ use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::util::{HeapMatrix, heap_array};
 use std::ops::{Deref, DerefMut};
 
-pub(crate) const LZ77_MAX_CONTEXTS: usize = 1024;
+pub(crate) const LZ77_MAX_CONTEXTS: usize = 4096;
 const DC_PREDICTOR_SLOTS: usize = 2 * K_NUM_DC_CONTEXTS;
 
 pub(crate) struct DcPredictorScratch {
@@ -60,8 +60,9 @@ impl Default for DcPredictorScratch {
 }
 
 pub(crate) struct LzEntropyScratch {
-    pub(crate) histograms: Box<[Histogram; LZ77_MAX_CONTEXTS]>,
-    pub(crate) prefix_codes: Box<[PrefixCode; LZ77_MAX_CONTEXTS]>,
+    // Grow to the largest context set this worker actually encounters.
+    pub(crate) histograms: Vec<Histogram>,
+    pub(crate) prefix_codes: Vec<PrefixCode>,
     pub(crate) context_map: Box<[u8; LZ77_MAX_CONTEXTS]>,
     pub(crate) configs: Box<[HybridUintConfig; CLUSTERS_LIMIT]>,
     pub(crate) clustering: FixedClusterScratch<LZ77_MAX_CONTEXTS>,
@@ -79,8 +80,8 @@ pub(crate) struct LzAnsScratch {
 impl Default for LzEntropyScratch {
     fn default() -> Self {
         Self {
-            histograms: heap_array(Histogram::new()),
-            prefix_codes: heap_array(PrefixCode::zero()),
+            histograms: Vec::new(),
+            prefix_codes: Vec::new(),
             context_map: heap_array(0),
             configs: heap_array(HybridUintConfig::DEFAULT),
             clustering: FixedClusterScratch::default(),
@@ -283,13 +284,14 @@ pub(crate) struct CoderScratch {
     pub(crate) lz_repetitions: Vec<u32>,
     pub(crate) lz_depth: Vec<u32>,
     pub(crate) lz_candidate: Vec<LzToken>,
-    /// Roughly 1 MiB of fixed entropy tables; Fast group workers never use it.
-    pub(crate) lz_entropy: LazyScratch<LzEntropyScratch>,
+    /// Entropy tables allocated on demand; Fast group workers never use them.
+    pub(crate) lz_entropy: LazyScratch<Box<LzEntropyScratch>>,
     pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 1024>>,
     pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: LazyScratch<AcGroupScratch>,
+    pub(crate) ac_stripe: LazyScratch<Box<crate::image::Image3F>>,
     pub(crate) transform_gather: LazyScratch<Box<[f32; 4096]>>,
     pub(crate) strategy_coeffs: LazyScratch<HeapMatrix<f32, 3, 4096>>,
     pub(crate) gradient: GradientScratch,
@@ -322,6 +324,7 @@ impl CoderScratch {
                         prev: vec![0; 256],
                         prev_prev: vec![0; 256],
                         buf: vec![0; 256],
+                        wp: None,
                     },
                     vec![0; 1024],
                     PickThresholdScratch {
@@ -353,6 +356,7 @@ impl CoderScratch {
             huffman_pool: Vec::with_capacity(1024),
             alpha_tokens: Vec::new(),
             ac_group: LazyScratch::default(),
+            ac_stripe: LazyScratch::new(|| Box::new(crate::image::Image3F::new(0, 0))),
             transform_gather: LazyScratch::new(|| heap_array(0.0)),
             strategy_coeffs: LazyScratch::new(|| HeapMatrix::new(0.0)),
             gradient,
@@ -393,7 +397,7 @@ mod tests {
         assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
-        assert!(size_of::<LazyScratch<LzEntropyScratch>>() <= 128);
+        assert!(size_of::<LazyScratch<Box<LzEntropyScratch>>>() <= 32);
         assert!(size_of::<AcGroupScratch>() <= 128);
     }
 
@@ -403,6 +407,9 @@ mod tests {
         assert_eq!(scratch.lz_repetitions.capacity(), 0);
         assert_eq!(scratch.lz_depth.capacity(), 0);
         assert_eq!(scratch.lz_candidate.capacity(), 0);
+        let entropy = LzEntropyScratch::default();
+        assert_eq!(entropy.histograms.capacity(), 0);
+        assert_eq!(entropy.prefix_codes.capacity(), 0);
     }
 
     #[test]
@@ -443,7 +450,9 @@ mod tests {
         std::thread::Builder::new()
             .name("small-stack-scratch-test".into())
             .stack_size(64 * 1024)
-            .spawn(|| drop(CoderScratch::default()))
+            .spawn(|| {
+                let _scratch = CoderScratch::default();
+            })
             .unwrap()
             .join()
             .unwrap();

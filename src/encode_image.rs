@@ -1126,44 +1126,14 @@ fn encode_gray_impl(
         return Err(EncodeError::InvalidDistance(config.distance));
     }
     if config.lossless {
-        // Lossless grayscale: route through the modular path as an RGB triplet
-        // (R=G=B). The Gray color space still makes the decoder emit L/LA.
-        let nchan = if alpha.is_some() { 4 } else { 3 };
-        let mut interleaved = vec![0u8; width * height * nchan];
-        match alpha.as_ref() {
-            None => {
-                // 3-channel: interleaved = [R, G, B] = [v, v, v]
-                for (out, &v) in interleaved
-                    .as_chunks_mut::<3>()
-                    .0
-                    .iter_mut()
-                    .zip(luma.iter())
-                {
-                    out[0] = v;
-                    out[1] = v;
-                    out[2] = v;
-                }
-            }
-            Some(a) => {
-                // 4-channel: interleaved = [R, G, B, A] = [v, v, v, a]
-                for (out, (&v, &av)) in interleaved
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(luma.iter().zip(a.iter()))
-                {
-                    out[0] = v;
-                    out[1] = v;
-                    out[2] = v;
-                    out[3] = av;
-                }
-            }
+        let mut image = Image3Si::try_new_per_plane([(width, height), (0, 0), (0, 0)])?;
+        for (out, &value) in image.plane_mut(0).as_mut_slice().iter_mut().zip(luma) {
+            *out = value.to_signed_int(8);
         }
-        return encode_with_config_loseless(
-            &interleaved,
-            width,
-            height,
-            alpha.is_some(),
+        let alpha_plane = alpha.map(AlphaPlane::U8);
+        return encode_lossless_planes(
+            &image,
+            &alpha_plane,
             8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
@@ -1362,42 +1332,20 @@ fn encode_gray_high_depth_impl(
     }
 
     if config.lossless {
-        // Re-interleave as [L, L, L] or [L, L, L, A] so the existing
-        // lossless RGB path can handle it.
-        let nchan = if alpha.is_some() { 4 } else { 3 };
-        let mut interleaved = vec![0u16; width * height * nchan];
-        match alpha.as_ref() {
-            None => {
-                for (out, &v) in interleaved
-                    .as_chunks_mut::<3>()
-                    .0
-                    .iter_mut()
-                    .zip(luma.iter())
-                {
-                    out[0] = v;
-                    out[1] = v;
-                    out[2] = v;
-                }
-            }
-            Some(a) => {
-                for (out, (&v, &av)) in interleaved
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(luma.iter().zip(a.iter()))
-                {
-                    out[0] = v;
-                    out[1] = v;
-                    out[2] = v;
-                    out[3] = av;
-                }
-            }
+        let mut image = Image3Si::try_new_per_plane([(width, height), (0, 0), (0, 0)])?;
+        for (out, &value) in image.plane_mut(0).as_mut_slice().iter_mut().zip(luma) {
+            *out = value.to_signed_int(bps.bits() as u8);
         }
-        return encode_with_config_loseless(
-            &interleaved,
-            width,
-            height,
-            alpha.is_some(),
+        let alpha_plane = alpha.map(|mut data| {
+            let bits = bps.bits() as u8;
+            for value in &mut data {
+                *value = (*value).to_signed_int(bits) as u16;
+            }
+            AlphaPlane::U16 { data, bits }
+        });
+        return encode_lossless_planes(
+            &image,
+            &alpha_plane,
             bps.bits() as u8,
             &EncodeConfigImpl::with_distance(config.distance)
                 .with_lossless(true)
@@ -1619,20 +1567,22 @@ fn encode_f32_lossless_rgba(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
-    let mut metadata_scratch = Box::<CoderScratch>::default();
-    write_image_metadata(
-        config.tone_mapping(),
-        &config.color_encoding,
-        alpha.as_ref(),
-        config.icc_profile.as_deref(),
-        BitsPerSample::F32,
-        true,
-        &XybMatrix::SPEC,
-        false,
-        config.orientation,
-        &mut metadata_scratch,
-        &mut w,
-    );
+    {
+        let mut metadata_scratch = Box::new(CoderScratch::lossless());
+        write_image_metadata(
+            config.tone_mapping(),
+            &config.color_encoding,
+            alpha.as_ref(),
+            config.icc_profile.as_deref(),
+            BitsPerSample::F32,
+            true,
+            &XybMatrix::SPEC,
+            false,
+            config.orientation,
+            &mut metadata_scratch,
+            &mut w,
+        );
+    }
     encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
@@ -2053,29 +2003,41 @@ fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         }
     }
 
+    encode_lossless_planes(&image3s, &alpha_plane, max_bp, config)
+}
+
+fn encode_lossless_planes(
+    image3s: &Image3Si,
+    alpha_plane: &Option<AlphaPlane>,
+    max_bp: u8,
+    config: &EncodeConfigImpl,
+) -> Result<Vec<u8>, EncodeError> {
+    let (width, height) = (image3s.xsize(), image3s.ysize());
     let mut w = BitWriter::new();
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
-    let mut metadata_scratch = Box::<CoderScratch>::default();
-    write_image_metadata(
-        config.tone_mapping(),
-        &config.color_encoding,
-        alpha_plane.as_ref(),
-        config.icc_profile.as_deref(),
-        config.bits_per_sample,
-        config.lossless,
-        &XybMatrix::SPEC,
-        config.grayscale,
-        config.orientation,
-        &mut metadata_scratch,
-        &mut w,
-    );
+    {
+        let mut metadata_scratch = Box::new(CoderScratch::lossless());
+        write_image_metadata(
+            config.tone_mapping(),
+            &config.color_encoding,
+            alpha_plane.as_ref(),
+            config.icc_profile.as_deref(),
+            config.bits_per_sample,
+            config.lossless,
+            &XybMatrix::SPEC,
+            config.grayscale,
+            config.orientation,
+            &mut metadata_scratch,
+            &mut w,
+        );
+    }
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     let eff_bits = (max_bp as u32).max(alpha_bits);
     let num_color = if config.grayscale { 1 } else { 3 };
     encode_frame_lossless(
-        &image3s,
+        image3s,
         alpha_plane.as_ref(),
         eff_bits,
         config.progressive,
@@ -2889,19 +2851,16 @@ mod encode_smoke_tests {
     fn decoding_speed_tiers_encode_and_restrict_tools() {
         const WIDTH: usize = 96;
         const HEIGHT: usize = 96;
-        // Smooth per-channel gradients with edges and mild texture; enough
-        // distinct colors to keep the palette path out, so WP and the learned
-        // tree both normally engage.
+        // Smoothly curved per-channel surfaces with mild texture: the Weighted
+        // Predictor tracks curvature that the fixed predictors cannot, so a
+        // tier without it must change the stream, and enough distinct colors
+        // keep the palette path out.
         let input: Vec<u8> = (0..WIDTH * HEIGHT * 3)
             .map(|i| {
                 let (px, c) = (i / 3, i % 3);
                 let (x, y) = (px % WIDTH, px / WIDTH);
                 let (x, y, c) = (x as i64, y as i64, c as i64);
-                let base = if (x / 24 + y / 24) % 2 == 0 {
-                    x + 2 * y + 31 * c
-                } else {
-                    255 - (2 * x + y + 17 * c)
-                };
+                let base = (x * x) / 40 + (y * y) / 50 + (x * y) / 60 + 31 * c;
                 (base as u8).wrapping_add(((x * y) % 5) as u8)
             })
             .collect();

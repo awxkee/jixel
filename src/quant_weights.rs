@@ -1969,11 +1969,7 @@ mod tests {
             .name("small-stack-dequant-test".into())
             .stack_size(64 * 1024)
             .spawn(|| {
-                drop(DequantMatrices::compute(
-                    false,
-                    false,
-                    Some(&FLAT_B8_BANDS_MID),
-                ))
+                let _matrices = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID));
             })
             .unwrap()
             .join()

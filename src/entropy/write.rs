@@ -89,7 +89,7 @@ pub(crate) fn write_token(t: Token, code: &EntropyCode, w: &mut BitWriter) {
     w.write(d + nbits as usize, data);
 }
 
-const HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
+static HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
     HybridUintConfig {
         split_exponent: 0,
         msb_in_token: 0,
@@ -183,20 +183,21 @@ impl HybridAnsSelectorScratch {
     }
 }
 
-fn select_hybrid_config_ans(
+fn select_hybrid_config_ans_sampled(
     values: &[u32],
+    sample_stride: usize,
+    stride: usize,
     scratch: &mut HybridAnsSelectorScratch,
 ) -> HybridUintConfig {
     if values.is_empty() {
         return HybridUintConfig::DEFAULT;
     }
-    let stride = values.len().div_ceil(65_536).max(1);
     scratch.reset();
     // Reuse one contiguous histogram allocation across every cluster. Keeping
     // the configuration outside the value loop also lets uint encoding remain
     // a small, predictable hot loop for each candidate.
     for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
-        for &value in values.iter().step_by(stride) {
+        for &value in values.iter().step_by(sample_stride) {
             let (symbol, nbits, _) = uint_encode_with_config(value, config);
             if symbol as usize >= ALPHABET_SIZE {
                 scratch.valid[candidate_index] = false;
@@ -267,14 +268,107 @@ fn select_hybrid_config_ans(
     }
 }
 
-/// Select one ANS-priced HybridUint configuration per final cluster while
-/// reusing the relatively large selector scratch across clusters.
-pub(crate) fn select_hybrid_configs_ans(values: &[Vec<u32>]) -> Vec<HybridUintConfig> {
-    let mut scratch = HybridAnsSelectorScratch::default();
-    values
-        .iter()
-        .map(|cluster| select_hybrid_config_ans(cluster, &mut scratch))
-        .collect()
+/// Retains exactly the old per-cluster sampling ordinals, bounded to 65536
+/// values per cluster. The original stride still scales the estimated cost.
+pub(crate) struct HybridUintSamples {
+    values: Vec<Vec<u32>>,
+    strides: Vec<usize>,
+    remaining: Vec<usize>,
+}
+
+impl HybridUintSamples {
+    pub(crate) fn new(counts: &[usize]) -> Self {
+        let strides: Vec<_> = counts.iter().map(|&n| n.div_ceil(65_536).max(1)).collect();
+        let values = counts
+            .iter()
+            .zip(&strides)
+            .map(|(&n, &stride)| Vec::with_capacity(n.div_ceil(stride)))
+            .collect();
+        Self {
+            values,
+            strides,
+            remaining: vec![0; counts.len()],
+        }
+    }
+
+    /// Samples gathered elsewhere with the same per-cluster ordinal rule
+    /// (`ordinal % stride == 0`), e.g. by several streams in parallel.
+    pub(crate) fn from_parts(values: Vec<Vec<u32>>, strides: Vec<usize>) -> Self {
+        let remaining = vec![0; values.len()];
+        Self {
+            values,
+            strides,
+            remaining,
+        }
+    }
+
+    pub(crate) fn strides_for(counts: &[usize]) -> Vec<usize> {
+        counts.iter().map(|&n| n.div_ceil(65_536).max(1)).collect()
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, cluster: usize, value: u32) {
+        if self.remaining[cluster] == 0 {
+            self.values[cluster].push(value);
+            self.remaining[cluster] = self.strides[cluster] - 1;
+        } else {
+            self.remaining[cluster] -= 1;
+        }
+    }
+
+    pub(crate) fn select(&self) -> Vec<HybridUintConfig> {
+        // Every cluster is selected independently; spread them over scoped
+        // threads with one selector scratch each (identical results).
+        let n = self.values.len();
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |t| t.get())
+            .min(n.max(1));
+        if threads <= 1 || n < 4 {
+            let mut scratch = HybridAnsSelectorScratch::default();
+            return self
+                .values
+                .iter()
+                .zip(&self.strides)
+                .map(|(values, &stride)| {
+                    select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                })
+                .collect();
+        }
+        let chunk = n.div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .step_by(chunk)
+                .map(|start| {
+                    let end = (start + chunk).min(n);
+                    let values = &self.values[start..end];
+                    let strides = &self.strides[start..end];
+                    scope.spawn(move || {
+                        let mut scratch = HybridAnsSelectorScratch::default();
+                        values
+                            .iter()
+                            .zip(strides)
+                            .map(|(values, &stride)| {
+                                select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("hybrid config selector"))
+                .collect()
+        })
+    }
+}
+
+#[cfg(test)]
+fn select_hybrid_config_ans(
+    values: &[u32],
+    scratch: &mut HybridAnsSelectorScratch,
+) -> HybridUintConfig {
+    let stride = values.len().div_ceil(65_536).max(1);
+    select_hybrid_config_ans_sampled(values, stride, stride, scratch)
 }
 
 fn hybrid_ans_candidate_cost(
@@ -973,18 +1067,16 @@ where
     // histograms under the selected configs so the prefix/rANS tables match
     // what the writer will emit.
     let num_clusters = histograms.len();
-    let mut cluster_values: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
-    for tokens in &streams {
-        for t in *tokens {
-            cluster_values[context_map[t.context as usize] as usize].push(t.value);
+    let hybrid_uint_configs = if select_configs {
+        // Every AC token contributes one symbol to these clustered counts.
+        let counts: Vec<_> = histograms.iter().map(|h| h.total_count as usize).collect();
+        let mut samples = HybridUintSamples::new(&counts);
+        for tokens in &streams {
+            for t in *tokens {
+                samples.push(context_map[t.context as usize] as usize, t.value);
+            }
         }
-    }
-    let hybrid_uint_configs: Vec<HybridUintConfig> = if select_configs {
-        let mut hybrid_selector_scratch = HybridAnsSelectorScratch::default();
-        cluster_values
-            .iter()
-            .map(|values| select_hybrid_config_ans(values, &mut hybrid_selector_scratch))
-            .collect()
+        samples.select()
     } else {
         vec![HybridUintConfig::DEFAULT; num_clusters]
     };
@@ -992,16 +1084,12 @@ where
         .iter()
         .any(|&c| c != HybridUintConfig::DEFAULT)
     {
-        for h in &mut histograms {
-            *h = Histogram::new();
-        }
-        for (values, (config, histogram)) in cluster_values
-            .iter()
-            .zip(hybrid_uint_configs.iter().zip(histograms.iter_mut()))
-        {
-            for &value in values {
-                let (tok, _, _) = uint_encode_with_config(value, *config);
-                histogram.add(tok);
+        histograms.fill(Histogram::new());
+        for tokens in &streams {
+            for t in *tokens {
+                let cluster = context_map[t.context as usize] as usize;
+                let (symbol, _, _) = uint_encode_with_config(t.value, hybrid_uint_configs[cluster]);
+                histograms[cluster].add(symbol);
             }
         }
     }
@@ -1960,6 +2048,44 @@ mod context_map_tests {
                 exhaustive_selector(&values),
                 "hybrid shortlist diverged on generated case {case}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampled_hybrid_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_samples_keep_original_cluster_ordinals_and_configs() {
+        for n in [0, 1, 65535, 65536, 65537, 131072, 131073] {
+            let a: Vec<u32> = (0..n).map(|i| (i as u32 * 731) % 4097).collect();
+            let b: Vec<u32> = (0..n / 3).map(|i| (i % 19) as u32).collect();
+            let mut sampled = HybridUintSamples::new(&[a.len(), b.len()]);
+            for i in 0..n {
+                sampled.push(0, a[i]);
+                if i < b.len() {
+                    sampled.push(1, b[i]);
+                }
+            }
+            let expected: Vec<_> = [&a, &b]
+                .iter()
+                .map(|values| {
+                    select_hybrid_config_ans(values, &mut HybridAnsSelectorScratch::default())
+                })
+                .collect();
+            assert_eq!(sampled.select(), expected);
+            for (cluster, values) in [&a, &b].iter().enumerate() {
+                assert_eq!(
+                    sampled.values[cluster],
+                    values
+                        .iter()
+                        .step_by(values.len().div_ceil(65536).max(1))
+                        .copied()
+                        .collect::<Vec<_>>()
+                );
+                assert!(sampled.values[cluster].len() <= 65536);
+            }
         }
     }
 }

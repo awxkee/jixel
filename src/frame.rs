@@ -1348,8 +1348,16 @@ pub(crate) fn encode_frame(
         // Byte cushion for the calibration's per-image quality noise
         // (two-corpus + Optuna joint fit, study lossy_modular_v3 2026-09-02).
         const LM_GATE_MARGIN: f64 = 1.066;
+        let mut modular_writer = BitWriter::new();
+        let have_modular = crate::lossless::encode_frame_lossy_modular_squeeze(
+            &xyb,
+            crate::lossless::lm_calibrated_distance(distance),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut modular_writer,
+        );
         let mut vardct_writer = BitWriter::new();
-        let xyb_for_modular = xyb.clone();
         encode_frame_vardct(
             ctx,
             scratch,
@@ -1362,16 +1370,9 @@ pub(crate) fn encode_frame(
             patches,
             &mut vardct_writer,
         )?;
-        let mut modular_writer = BitWriter::new();
-        if crate::lossless::encode_frame_lossy_modular_squeeze(
-            &xyb_for_modular,
-            crate::lossless::lm_calibrated_distance(distance),
-            ctx.speed,
-            &ctx.thread_pool,
-            scratch,
-            &mut modular_writer,
-        ) && (modular_writer.bits_written() as f64) * LM_GATE_MARGIN
-            < vardct_writer.bits_written() as f64
+        if have_modular
+            && (modular_writer.bits_written() as f64) * LM_GATE_MARGIN
+                < vardct_writer.bits_written() as f64
         {
             writer.append(&modular_writer);
         } else {
@@ -1890,16 +1891,19 @@ fn encode_frame_core(
             &mut scratch.dc_cfl_cur,
             &mut scratch.dc_cfl_prev,
         );
-        let provisional_code = crate::entropy::optimize_entropy_code_ac_streams(
-            all_pending.iter().map(|pg| pg.tokens[0].as_slice()),
-            crate::ac_context::K_NUM_FINE_AC_CONTEXTS,
-            &mut scratch.huffman_pool,
-            // No config selection here: these prices feed RDOQ, and even a
-            // one-token nudge can push the clustering off a knife-edge merge.
-            // Selection applies to the final codes only.
-            false,
-        );
-        let prices = crate::entropy::FrozenTokenPrices::new(&provisional_code);
+        let prices = {
+            let provisional_code = crate::entropy::optimize_entropy_code_ac_streams(
+                all_pending.iter().map(|pg| pg.tokens[0].as_slice()),
+                crate::ac_context::K_NUM_FINE_AC_CONTEXTS,
+                &mut scratch.huffman_pool,
+                // No config selection here: these prices feed RDOQ, and even a
+                // one-token nudge can push the clustering off a knife-edge merge.
+                // Selection applies to the final codes only.
+                false,
+            );
+            crate::entropy::FrozenTokenPrices::new(&provisional_code)
+        };
+        all_pending.clear();
         let dc_ref = &dc_datas;
         let refined = ctx
             .thread_pool
@@ -1927,7 +1931,6 @@ fn encode_frame_core(
                 );
                 (dc_idx, gx, gy, p, local)
             });
-        all_pending.clear();
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
@@ -2343,39 +2346,30 @@ fn encode_frame_core(
 
     // LZ77 path is single-pass only for now: it compresses one token stream per
     // group. Multi-pass uses the per-pass plain codes.
-    let mut ac_lz_per_group: Vec<Vec<crate::lz77_ac::AcLz>> = Vec::new();
     let ac_lz_code_owned;
     let use_lz77;
     if num_passes == 1 && ctx.speed != Speed::Fastest {
-        ac_lz_per_group = ctx
-            .thread_pool
-            .steal_map(scratch, all_pending.len(), |i, _scratch| {
-                crate::lz77_ac::lz77_compress_ac(&all_pending[i].tokens[0])
-            });
-        ac_lz_code_owned = crate::lz77_ac::build_ac_lz_code(
-            &ac_lz_per_group,
+        let (code, lz_bits) = crate::lz77_ac::build_ac_lz_code(
+            all_pending.iter().map(|p| p.tokens[0].as_slice()),
             ac_num_contexts,
             &mut scratch.huffman_pool,
         );
-        let lz_bits = crate::lz77_ac::estimate_ac_lz_bits(
-            &ac_lz_per_group,
-            &ac_lz_code_owned,
-            ac_num_contexts,
-        );
+        ac_lz_code_owned = code;
         let plain_bits = crate::lz77_ac::estimate_ac_plain_bits(
             all_pending
                 .iter()
                 .map(|pending| pending.tokens[0].as_slice()),
             &ac_code_per_pass[0],
         );
-        // Require a real margin to cover the LZ77 header + distance-context cost.
+        // Require the same margin for the LZ77 header and distance context.
         use_lz77 = lz_bits + 512 < plain_bits;
     } else {
         ac_lz_code_owned = crate::lz77_ac::build_ac_lz_code(
-            &ac_lz_per_group,
+            std::iter::empty(),
             ac_num_contexts,
             &mut scratch.huffman_pool,
-        );
+        )
+        .0;
         use_lz77 = false;
     }
 
@@ -2484,8 +2478,8 @@ fn encode_frame_core(
             let mut w = BitWriter::new();
             let section_idx = 2 + dim.num_dc_groups + pass * dim.num_groups + pg.group_idx;
             if use_lz77 {
-                for t in &ac_lz_per_group[i] {
-                    crate::lz77_ac::write_ac_lz(*t, &ac_lz_code_owned, ac_num_contexts, &mut w);
+                for t in crate::lz77_ac::lz77_ac_tokens(pass_tokens) {
+                    crate::lz77_ac::write_ac_lz(t, &ac_lz_code_owned, ac_num_contexts, &mut w);
                 }
             } else {
                 let code_ref = ac_code_per_pass[pass].as_ref();
@@ -2881,7 +2875,9 @@ fn process_ac_group(
         let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
         let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
 
-        let stripe = build_stripe(
+        let stripe = scratch.ac_stripe.as_mut();
+        build_stripe(
+            stripe,
             opsin,
             stripe_x0,
             stripe_y0,
@@ -2901,7 +2897,7 @@ fn process_ac_group(
         write_ac_group(
             ctx,
             &mut scratch.ac_group,
-            &stripe,
+            stripe,
             stripe_brect,
             distp.scale,
             distp.scale_dc,
@@ -2938,6 +2934,7 @@ fn process_ac_group(
 /// Carve a stripe out of the (already-XYB-converted, gaborized) opsin image,
 /// padding to whole blocks by edge-replication.
 fn build_stripe(
+    stripe: &mut Image3F,
     opsin: &Image3F,
     x0: usize,
     y0: usize,
@@ -2945,8 +2942,8 @@ fn build_stripe(
     ysize: usize,
     xsize_padded: usize,
     ysize_padded: usize,
-) -> Image3F {
-    let mut stripe = Image3F::new(xsize_padded, ysize_padded);
+) {
+    stripe.resize(xsize_padded, ysize_padded);
     for c in 0..3 {
         // Copy actual content.
         for y in 0..ysize {
@@ -2963,7 +2960,6 @@ fn build_stripe(
             dst.copy_from_slice(src);
         }
     }
-    stripe
 }
 
 #[cfg(test)]

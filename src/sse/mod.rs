@@ -35,6 +35,8 @@ mod dct;
 mod entropy;
 mod inflated_cost;
 mod lossless_grad;
+#[cfg(target_arch = "x86_64")]
+mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
@@ -54,6 +56,8 @@ pub(crate) use inflated_cost::{
     rgb_hue_chroma_edge_loss_sse41,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use lz_match::{match_len_compact_sse2, match_len_sse2};
 pub(crate) use modular::{
     tokenize_alpha_u8_first_row_sse41, tokenize_alpha_u8_interior_sse41,
     tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
