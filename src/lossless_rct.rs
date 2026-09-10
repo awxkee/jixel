@@ -114,7 +114,7 @@ const RCT_NUM_CONTEXTS: usize = 18;
 const RCT_ALPHABET: usize = 64;
 const RCT_CONTEXT_MAX_DIFF: u32 = 500;
 
-const RCT_CONTEXT_LUT: [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] = {
+static RCT_CONTEXT_LUT: [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] = {
     assert!(RCT_CONTEXT_CUTOFFS.len() < RCT_NUM_CONTEXTS);
     let mut lut = [0u8; RCT_CONTEXT_MAX_DIFF as usize + 1];
     let mut diff = 0usize;

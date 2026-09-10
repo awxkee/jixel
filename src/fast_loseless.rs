@@ -219,17 +219,17 @@ fn canon(c1n: &[u8], c1b: &mut [u16], c2n: &[u8], c2b: &mut [u16]) {
         code = (code + cnt[i - 1]) << 1;
         next[i] = code;
     }
-    for i in 0..c1n.len() {
-        let n = c1n[i] as usize;
+    for (&n, bits) in c1n.iter().zip(&mut c1b[..c1n.len()]) {
+        let n = n as usize;
         if n > 0 {
-            c1b[i] = bit_reverse(n, next[n] as u16);
+            *bits = bit_reverse(n, next[n] as u16);
             next[n] += 1;
         }
     }
-    for i in 0..c2n.len() {
-        let n = c2n[i] as usize;
+    for (&n, bits) in c2n.iter().zip(&mut c2b[..c2n.len()]) {
+        let n = n as usize;
         if n > 0 {
-            c2b[i] = bit_reverse(n, next[n] as u16);
+            *bits = bit_reverse(n, next[n] as u16);
             next[n] += 1;
         }
     }
@@ -271,12 +271,12 @@ fn ccl_nz_impl(f: &[u64], n: usize, prec: usize, mn: &[u8], mx: &[u8], nb: &mut 
 fn ccl_nz(f: &[u64], n: usize, mn: &mut [u8], mx: &[u8], nb: &mut [u8]) {
     let mut prec = 0usize;
     let mut sh = 255usize;
-    for i in 0..n {
-        if mn[i] < 1 {
-            mn[i] = 1;
+    for (min, &max) in mn[..n].iter_mut().zip(&mx[..n]) {
+        if *min < 1 {
+            *min = 1;
         }
-        prec = prec.max(mx[i] as usize);
-        sh = sh.min(mn[i] as usize);
+        prec = prec.max(max as usize);
+        sh = sh.min(*min as usize);
     }
     prec -= sh - 1;
     ccl_nz_impl(f, n, prec, mn, mx, nb);
@@ -297,10 +297,10 @@ fn ccl(f: &[u64], n: usize, mni: &[u8], mxi: &[u8], nb: &mut [u8]) {
     let mut numbits = [0u8; KMAXSYM];
     ccl_nz(&cf, ni, &mut mn, &mx, &mut numbits);
     ni = 0;
-    for i in 0..n {
-        nb[i] = 0;
-        if f[i] != 0 {
-            nb[i] = numbits[ni];
+    for (bits, &freq) in nb[..n].iter_mut().zip(&f[..n]) {
+        *bits = 0;
+        if freq != 0 {
+            *bits = numbits[ni];
             ni += 1;
         }
     }
@@ -430,33 +430,27 @@ fn ycocg(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
 fn build_planes_from<F: Fn(usize) -> i32>(w: usize, h: usize, nb: usize, get: F) -> Vec<Vec<i32>> {
     let n = w * h;
     let mut p = vec![vec![0i32; n]; nb];
-    match nb {
-        1 => {
-            for i in 0..n {
-                p[0][i] = get(i);
+    match p.as_mut_slice() {
+        [gray] => {
+            for (i, value) in gray.iter_mut().enumerate() {
+                *value = get(i);
             }
         }
-        2 => {
-            for i in 0..n {
-                p[0][i] = get(2 * i);
-                p[1][i] = get(2 * i + 1);
+        [gray, alpha] => {
+            for (i, (value, a)) in gray.iter_mut().zip(alpha).enumerate() {
+                *value = get(2 * i);
+                *a = get(2 * i + 1);
             }
         }
-        3 => {
-            for i in 0..n {
-                let (y, co, cg) = ycocg(get(3 * i), get(3 * i + 1), get(3 * i + 2));
-                p[0][i] = y;
-                p[1][i] = co;
-                p[2][i] = cg;
+        [y, co, cg] => {
+            for (i, ((y, co), cg)) in y.iter_mut().zip(co).zip(cg).enumerate() {
+                (*y, *co, *cg) = ycocg(get(3 * i), get(3 * i + 1), get(3 * i + 2));
             }
         }
-        4 => {
-            for i in 0..n {
-                let (y, co, cg) = ycocg(get(4 * i), get(4 * i + 1), get(4 * i + 2));
-                p[0][i] = y;
-                p[1][i] = co;
-                p[2][i] = cg;
-                p[3][i] = get(4 * i + 3);
+        [y, co, cg, alpha] => {
+            for (i, (((y, co), cg), a)) in y.iter_mut().zip(co).zip(cg).zip(alpha).enumerate() {
+                (*y, *co, *cg) = ycocg(get(4 * i), get(4 * i + 1), get(4 * i + 2));
+                *a = get(4 * i + 3);
             }
         }
         _ => unreachable!(),

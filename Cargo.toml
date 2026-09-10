@@ -3,7 +3,7 @@ members = ["app", "stats", "tuner", "meanstats"]
 
 [package]
 name = "jixel"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2024"
 description = "JPEG XL encoder"
 readme = "README.md"
@@ -26,5 +26,3 @@ wasm = []
 
 [profile.release]
 debug = true
-[dev-dependencies]
-image = "0.25"

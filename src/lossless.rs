@@ -1232,11 +1232,11 @@ fn encode_frame_lossless_core_impl(
             sections[0].zero_pad_to_byte();
 
             // ----- DC groups: empty GroupHeader only -----
-            for i in 0..num_dc_groups {
-                sections[1 + i].write(1, 1); // use_global_tree
-                write_wp_header(wp_params, &mut sections[1 + i]);
-                sections[1 + i].write(2, 0); // 0 transforms
-                sections[1 + i].zero_pad_to_byte();
+            for section in &mut sections[1..1 + num_dc_groups] {
+                section.write(1, 1); // use_global_tree
+                write_wp_header(wp_params, section);
+                section.write(2, 0); // 0 transforms
+                section.zero_pad_to_byte();
             }
 
             // ----- AC global: trivial (all_default flags) -----
@@ -1412,8 +1412,10 @@ pub(crate) fn encode_modular_xyb_atlas(
 
     // Distinct quantized XYB triples, palette-capped like the lossless path.
     let mut seen: HashMap<[i32; 3], ()> = HashMap::with_capacity(257);
-    for i in 0..npx {
-        seen.entry([ch[0][i], ch[1][i], ch[2][i]]).or_insert(());
+    let [y, x, b] = &ch;
+    let pixel_colors = || y[..npx].iter().zip(&x[..npx]).zip(&b[..npx]);
+    for ((&y, &x), &b) in pixel_colors() {
+        seen.entry([y, x, b]).or_insert(());
         if seen.len() > 256 {
             break;
         }
@@ -1458,13 +1460,16 @@ pub(crate) fn encode_modular_xyb_atlas(
         // Component rows of the palette meta-channel; the alpha row (if any)
         // stays zero.
         let mut palette_ch = vec![0i32; num_c * nb_colors];
-        for (i, color) in colors.iter().enumerate() {
-            for c in 0..3 {
-                palette_ch[c * nb_colors + i] = color[c];
+        for (c, row) in palette_ch[..3 * nb_colors]
+            .chunks_exact_mut(nb_colors)
+            .enumerate()
+        {
+            for (value, color) in row.iter_mut().zip(&colors) {
+                *value = color[c];
             }
         }
-        let index_img: Vec<i32> = (0..npx)
-            .map(|i| idx_of[&[ch[0][i], ch[1][i], ch[2][i]]] as i32)
+        let index_img: Vec<i32> = pixel_colors()
+            .map(|((&y, &x), &b)| idx_of[&[y, x, b]] as i32)
             .collect();
 
         write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
@@ -2016,7 +2021,7 @@ const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 /// Minimum samples in a node before it must become a leaf.
 const MA_MIN_NODE_SAMPLES: usize = 128;
 /// Predictors each side of a candidate split may choose from (the node's
-/// cheapest ones). Kodak: 4..14 all land within 0.02%; 3 loses 0.24%.
+/// cheapest ones).
 const MA_SIDE_PREDS: usize = 4;
 
 /// Walk one channel rectangle in scan order, feeding the visitor the property
@@ -4026,12 +4031,15 @@ fn try_encode_context_tree_multi_group(
                 let g = &groups[group_index];
                 let token_count = g.iter().map(|(res, _)| res.len()).sum();
                 let mut toks: Vec<Token> = Vec::with_capacity(token_count);
-                for chan in 0..nb_chans {
-                    let (res, prp) = &g[chan];
-                    let t = ts[chan] as i64;
+                for (((res, prp), &threshold), contexts) in g[..nb_chans]
+                    .iter()
+                    .zip(&ts[..nb_chans])
+                    .zip(ctx_lut.as_chunks::<3>().0)
+                {
+                    let t = threshold as i64;
                     for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
                         let bucket = bucket_of(prp, t);
-                        let ctx = ctx_lut[chan * 3 + bucket as usize];
+                        let ctx = contexts[bucket as usize];
                         toks.push(Token::new(ctx, res));
                     }
                 }
@@ -4367,11 +4375,11 @@ fn encode_frame_lossless_float_with_pool(
         sections[0].write(2, 0b00); // 0 transforms
         sections[0].zero_pad_to_byte();
 
-        for i in 0..num_dc_groups {
-            sections[1 + i].write(1, 1);
-            sections[1 + i].write(1, 1);
-            sections[1 + i].write(2, 0);
-            sections[1 + i].zero_pad_to_byte();
+        for section in &mut sections[1..1 + num_dc_groups] {
+            section.write(1, 1);
+            section.write(1, 1);
+            section.write(2, 0);
+            section.zero_pad_to_byte();
         }
 
         let ac_global_idx = 1 + num_dc_groups;
@@ -4379,15 +4387,17 @@ fn encode_frame_lossless_float_with_pool(
         sections[ac_global_idx].write(1, 1);
         sections[ac_global_idx].zero_pad_to_byte();
 
-        for group_index in 0..num_ac_groups {
-            let section_idx = 2 + num_dc_groups + group_index;
-            sections[section_idx].write(1, 1);
-            sections[section_idx].write(1, 1);
-            sections[section_idx].write(2, 0);
-            for t in &group_tokens[group_index] {
-                write_token(*t, &code.as_ref(), &mut sections[section_idx]);
+        for (section, tokens) in sections[2 + num_dc_groups..][..num_ac_groups]
+            .iter_mut()
+            .zip(&group_tokens[..num_ac_groups])
+        {
+            section.write(1, 1);
+            section.write(1, 1);
+            section.write(2, 0);
+            for t in tokens {
+                write_token(*t, &code.as_ref(), section);
             }
-            sections[section_idx].zero_pad_to_byte();
+            section.zero_pad_to_byte();
         }
 
         writer.write(1, 0);
