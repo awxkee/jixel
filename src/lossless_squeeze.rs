@@ -268,8 +268,7 @@ fn for_each_squeeze_group_crop(
     mut visit: impl FnMut(usize, usize, usize, usize, usize, usize),
 ) {
     let mut within = 0usize;
-    for c in split..channels.len() {
-        let ch = &channels[c];
+    for (c, ch) in channels.iter().enumerate().skip(split) {
         let msh = ch.hshift.min(ch.vshift);
         if msh < minsh || msh > maxsh {
             continue;
@@ -332,10 +331,8 @@ pub(super) fn encode_squeeze_multigroup(
     }
     if let Some(a) = alpha {
         let mut ch = Channel::new(xsize, ysize);
-        for y in 0..ysize {
-            for x in 0..xsize {
-                ch.data[y * xsize + x] = a.get_i32(y * xsize + x);
-            }
+        for (i, value) in ch.data.iter_mut().enumerate() {
+            *value = a.get_i32(i);
         }
         channels.push(ch);
     }
@@ -358,9 +355,8 @@ pub(super) fn encode_squeeze_multigroup(
         // not its index in `channels`. Pool costs by that decoder-visible slot.
         let mut costs: Vec<SqueezePredictorCost> =
             (0..nb).map(|_| SqueezePredictorCost::default()).collect();
-        for c in 0..split {
-            let ch = &channels[c];
-            costs[c].add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h, use_wp);
+        for (cost, ch) in costs[..split].iter_mut().zip(&channels[..split]) {
+            cost.add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h, use_wp);
         }
         for gy in 0..ysize_dc_groups {
             for gx in 0..xsize_dc_groups {

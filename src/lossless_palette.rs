@@ -207,9 +207,9 @@ pub(super) fn try_encode_palette_single_group(
 
         // 3) Palette meta-channel (row c = component c of each color) + index channel.
         let mut palette_ch = vec![0i32; num_c * nb_colors];
-        for (i, color) in colors.iter().enumerate() {
-            for c in 0..num_c {
-                palette_ch[c * nb_colors + i] = color[c];
+        for (c, row) in palette_ch.chunks_exact_mut(nb_colors).enumerate() {
+            for (value, color) in row.iter_mut().zip(&colors) {
+                *value = color[c];
             }
         }
         let mut index_img = Vec::with_capacity(npx);
@@ -552,8 +552,10 @@ fn build_local_palette_group(
     let mut palette = vec![0i32; num_c * nb_colors];
     for (index, color) in colors.iter().enumerate() {
         index_of.insert(*color, index as i32);
-        for c in 0..num_c {
-            palette[c * nb_colors + index] = color[c];
+    }
+    for (c, row) in palette.chunks_exact_mut(nb_colors).enumerate() {
+        for (value, color) in row.iter_mut().zip(&colors) {
+            *value = color[c];
         }
     }
     let mut indices = Vec::with_capacity(num_pixels);
@@ -1036,11 +1038,11 @@ fn palette_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>> 
         let cur = colors[current];
         let mut best = usize::MAX;
         let mut best_d = i64::MAX;
-        for (k, &u) in used.iter().enumerate() {
+        for (k, (&u, color)) in used.iter().zip(colors).enumerate() {
             if u {
                 continue;
             }
-            let d: i64 = colors[k]
+            let d: i64 = color
                 .iter()
                 .zip(cur)
                 .map(|(&v, c)| {
@@ -1228,9 +1230,15 @@ impl std::hash::Hasher for ColorHasher {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for &chunk in chunks {
+            self.0 = (self.0 ^ u64::from_le_bytes(chunk))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(29);
+        }
+        if !remainder.is_empty() {
             let mut v = [0u8; 8];
-            v[..chunk.len()].copy_from_slice(chunk);
+            v[..remainder.len()].copy_from_slice(remainder);
             self.0 = (self.0 ^ u64::from_le_bytes(v))
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 .rotate_left(29);

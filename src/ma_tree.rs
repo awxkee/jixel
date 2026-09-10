@@ -402,12 +402,12 @@ fn best_split_on_prop(
         scratch.lut.clear();
         scratch.lut.resize(span + 1, 0);
         let mut k = 0usize;
-        for off in 0..=span {
+        for (off, bin) in scratch.lut.iter_mut().enumerate() {
             let v = lo_v + off as i32;
             while k < ncand && scratch.cands[k] < v {
                 k += 1;
             }
-            scratch.lut[off] = k as u8;
+            *bin = k as u8;
         }
     }
     let bin_for = |v: i32| {
@@ -458,10 +458,12 @@ fn best_split_on_prop(
         }
     }
     for &p in preds {
-        for bin in 0..bins {
-            scratch.bin_nbits[p * bins + bin] = raw_bits_from_hist(
-                &scratch.bin_hist[(p * bins + bin) * alphabet..(p * bins + bin + 1) * alphabet],
-            );
+        let hist = &scratch.bin_hist[p * bins * alphabet..(p + 1) * bins * alphabet];
+        for (nbits, bin) in scratch.bin_nbits[p * bins..(p + 1) * bins]
+            .iter_mut()
+            .zip(hist.chunks_exact(alphabet))
+        {
+            *nbits = raw_bits_from_hist(bin);
         }
     }
     let total_count = properties.len() as u32;
@@ -472,8 +474,8 @@ fn best_split_on_prop(
     scratch.left_nbits.fill(0);
     let mut left_count = 0u32;
     let mut best: Option<(i32, f32)> = None;
-    for j in 0..ncand {
-        left_count += bin_count[j];
+    for (j, (&candidate, &count)) in scratch.cands.iter().zip(&bin_count[..ncand]).enumerate() {
+        left_count += count;
         let mut best_l = f32::INFINITY;
         let mut best_r = f32::INFINITY;
         for &p in preds {
@@ -515,7 +517,7 @@ fn best_split_on_prop(
         }
         let cost = best_l + best_r;
         if best.is_none() || cost < best.unwrap().1 {
-            best = Some((scratch.cands[j], cost));
+            best = Some((candidate, cost));
         }
     }
     best
@@ -555,26 +557,30 @@ fn node_cost_all<'a>(
     node_costs.fill(f32::INFINITY);
     let total = tokens.len() as u32;
     for toks in tokens {
-        for p in 0..NUM_MA_PREDS {
-            hist[p * alpha + toks[p] as usize] += 1;
+        for (pred_hist, &token) in hist.chunks_exact_mut(alpha).zip(toks) {
+            pred_hist[token as usize] += 1;
         }
     }
-    for p in 0..NUM_MA_PREDS {
-        node_nbits[p] = raw_bits_from_hist(&hist[p * alpha..(p + 1) * alpha]);
+    for (nbits, pred_hist) in node_nbits.iter_mut().zip(hist.chunks_exact(alpha)) {
+        *nbits = raw_bits_from_hist(pred_hist);
     }
     let skip_wp = !params.allow_wp;
     let mut best = f32::INFINITY;
     let mut best_pred = 0usize;
-    for p in 0..NUM_MA_PREDS {
+    for (p, ((cost, &nbits), pred_hist)) in node_costs
+        .iter_mut()
+        .zip(node_nbits.iter())
+        .zip(hist.chunks_exact(alpha))
+        .enumerate()
+    {
         if skip_wp && p == PRED_WEIGHTED {
             continue;
         }
         if params.allowed_preds & (1 << p) == 0 {
             continue;
         }
-        let bits =
-            hist_entropy_bits(&hist[p * alpha..(p + 1) * alpha], total) + node_nbits[p] as f32;
-        node_costs[p] = bits;
+        let bits = hist_entropy_bits(pred_hist, total) + nbits as f32;
+        *cost = bits;
         if bits < best {
             best = bits;
             best_pred = p;
@@ -892,8 +898,10 @@ pub(crate) fn deepen_ma_tree(
             counts[leaf as usize] += 1;
         }
         let mut offsets = vec![0usize; seed.nodes.len() + 1];
-        for node in 0..seed.nodes.len() {
-            offsets[node + 1] = offsets[node] + counts[node];
+        let mut total = 0;
+        for (offset, &count) in offsets.iter_mut().skip(1).zip(&counts) {
+            total += count;
+            *offset = total;
         }
         let mut cursors = offsets[..seed.nodes.len()].to_vec();
         let mut idx = vec![0u32; samples.len()];
