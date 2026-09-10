@@ -64,6 +64,7 @@ mod inflated_cost;
 mod jpeg;
 mod lossless;
 mod lz77_ac;
+mod lz_match;
 mod ma_tree;
 mod modular;
 mod mosaic_seam;

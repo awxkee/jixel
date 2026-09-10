@@ -148,6 +148,16 @@ impl BitWriter {
             buffer: 0,
         }
     }
+    fn reset(&mut self, max_bits: usize) {
+        let bytes = max_bits / 8 + 64;
+        if self.data.len() < bytes {
+            self.data.resize(bytes, 0);
+        }
+        self.bytes_written = 0;
+        self.bits_in_buffer = 0;
+        self.buffer = 0;
+    }
+
     #[inline]
     fn write(&mut self, c: u32, b: u64) {
         let bw = self.bytes_written;
@@ -534,58 +544,40 @@ impl<'a> Sink for Encoder<'a> {
         self.rle(run);
     }
 }
-fn process_chunk(
-    sink: &mut dyn Sink,
-    run: &mut usize,
-    cur: &[i32],
-    prev: &[i32],
-    first: bool,
-    x: usize,
-    n: usize,
-) {
-    let mut res = [0u32; 8];
-    let mut ps = 0usize;
-    let mut req = 0usize;
-    for ix in 0..8 {
-        let bi = KPAD + x + ix;
-        let px = cur[bi];
-        let left = cur[bi - 1];
-        let (top, topleft) = if first {
-            (cur[bi - 1], cur[bi - 1])
-        } else {
-            (prev[bi], prev[bi - 1])
-        };
-        let ac = left.wrapping_sub(topleft);
-        let bc = top.wrapping_sub(topleft);
-        let grad = ac.wrapping_add(top);
-        let clamp = if (left.wrapping_sub(top) ^ bc) < 0 {
-            top
-        } else {
-            left
-        };
-        let pred = if (ac ^ bc) < 0 { grad } else { clamp };
-        let p = pack_signed(px.wrapping_sub(pred));
-        res[ix] = p;
-        ps = if ps == req {
-            ps + (p == 0) as usize
-        } else {
-            ps
-        };
-        req += 1;
+struct PlaneScratch {
+    cur: [i32; NPX],
+    prev: [i32; NPX],
+    residuals: [u32; NPX],
+    gradient: crate::lossless::GradPackInteriorFn,
+}
+
+impl PlaneScratch {
+    fn new() -> Self {
+        Self {
+            cur: [0; NPX],
+            prev: [0; NPX],
+            residuals: [0; NPX],
+            gradient: crate::lossless::selected_grad_pack_interior_fn(),
+        }
     }
-    ps = n.min(ps);
+}
+
+#[inline]
+fn process_chunk(sink: &mut impl Sink, run: &mut usize, res: &[u32; 8], n: usize) {
+    let ps = res[..n].iter().take_while(|&&p| p == 0).count();
     let km = K_LZ77_MIN_LENGTH;
     if ps == n && (*run > 0 || ps > km) {
         *run += ps;
     } else if ps + *run > km {
-        sink.chunk(*run + ps, &res, ps, n);
+        sink.chunk(*run + ps, res, ps, n);
         *run = 0;
     } else {
-        sink.chunk(0, &res, 0, n);
+        sink.chunk(0, res, 0, n);
     }
 }
+
 fn process_plane(
-    sink: &mut dyn Sink,
+    sink: &mut impl Sink,
     plane: &[i32],
     pstride: usize,
     x0: usize,
@@ -593,15 +585,22 @@ fn process_plane(
     xs: usize,
     yskip: usize,
     ys: usize,
+    scratch: &mut PlaneScratch,
 ) {
-    let mut cur = vec![0i32; NPX];
-    let mut prev = vec![0i32; NPX];
+    scratch.cur.fill(0);
+    scratch.prev.fill(0);
+    let PlaneScratch {
+        cur,
+        prev,
+        residuals,
+        gradient,
+    } = scratch;
+    let (mut cur, mut prev) = (cur, prev);
     let mut run = 0usize;
     for y in 0..ys {
         std::mem::swap(&mut cur, &mut prev);
-        for x in 0..xs {
-            cur[KPAD + x] = plane[(y0 + y) * pstride + x0 + x];
-        }
+        let start = (y0 + y) * pstride + x0;
+        cur[KPAD..KPAD + xs].copy_from_slice(&plane[start..start + xs]);
         cur[KPAD - 1] = if y > 0 { prev[KPAD] } else { 0 };
         if y > 0 {
             prev[KPAD - 1] = prev[KPAD];
@@ -609,12 +608,23 @@ fn process_plane(
         if y < yskip {
             continue;
         }
-        let first = y == 0;
-        let mut x = 0;
-        while x < xs {
-            let n = KCHUNK.min(xs - x);
-            process_chunk(sink, &mut run, &cur, &prev, first, x, n);
-            x += KCHUNK;
+        if y == 0 {
+            for x in 0..xs {
+                residuals[1 + x] = pack_signed(cur[KPAD + x].wrapping_sub(cur[KPAD + x - 1]));
+            }
+        } else {
+            // The shared SIMD kernel starts at index 1. Include the padded
+            // west sample so index 1 represents this group's first pixel.
+            gradient(
+                &cur[KPAD - 1..KPAD + xs],
+                &prev[KPAD - 1..KPAD + xs],
+                &mut residuals[..xs + 1],
+                xs + 1,
+            );
+        }
+        for x in (0..xs).step_by(KCHUNK) {
+            let res = residuals[1 + x..1 + x + KCHUNK].try_into().unwrap();
+            process_chunk(sink, &mut run, res, KCHUNK.min(xs - x));
         }
     }
     sink.finalize(run);
@@ -901,6 +911,7 @@ fn build_codes(
     bits: u32,
 ) -> Vec<PrefixCode> {
     let effort = 2;
+    let mut row_scratch = PlaneScratch::new();
     let (num_symbols, mn, mx) = bd_limits(bits, nb > 2);
     let mut rc = [[0u64; 19]; 4];
     let mut lc = [[0u64; 33]; 4];
@@ -930,6 +941,7 @@ fn build_codes(
                     x_max,
                     1,
                     1 + y_count,
+                    &mut row_scratch,
                 );
             }
         }
@@ -1091,13 +1103,14 @@ fn encode_planes(
     bits: u32,
     meta: &FlMeta,
 ) -> Vec<u8> {
-    let mut scratch = Box::<crate::coder_scratch::CoderScratch>::default();
+    let mut scratch = Box::new(crate::coder_scratch::CoderScratch::lossless());
     let ngx = w.div_ceil(256);
     let ngy = h.div_ceil(256);
     let onegroup = ngx == 1 && ngy == 1;
     let ndg = w.div_ceil(2048) * h.div_ceil(2048);
     let num_ac = ngx * ngy;
     let hcode = build_codes(planes, w, h, nb, ngx, ngy, bits);
+    let mut row_scratch = PlaneScratch::new();
     let mut lfg = BitWriter::allocate(100000 + if onegroup { w * h * 32 * nb } else { 0 });
     dc_global_common(onegroup, w, h, &hcode, &mut lfg);
     if nb > 2 {
@@ -1114,12 +1127,12 @@ fn encode_planes(
                 code: &hcode[c],
                 out: &mut lfg,
             };
-            process_plane(&mut enc, &planes[c], w, 0, 0, w, 0, h);
+            process_plane(&mut enc, &planes[c], w, 0, 0, w, 0, h, &mut row_scratch);
         }
         let gsize = (lfg.bytes_written * 8 + lfg.bits_in_buffer).div_ceil(8);
         let mut hdr = BitWriter::allocate(4000);
         prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &[gsize], &mut scratch);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(hdr.bytes_written + gsize);
         out.extend_from_slice(&hdr.data[..hdr.bytes_written]);
         out.extend_from_slice(&lfg.data[..lfg.bytes_written]);
         if lfg.bits_in_buffer > 0 {
@@ -1131,32 +1144,36 @@ fn encode_planes(
     let num_groups = 2 + ndg + num_ac;
     let mut gsizes = vec![0usize; num_groups];
     gsizes[0] = lfg.bytes_written;
-    let mut ac_sections: Vec<Vec<u8>> = Vec::with_capacity(num_ac);
-    for g in 0..num_ac {
-        let xg = g % ngx;
-        let yg = g / ngx;
-        let x0 = xg * 256;
-        let y0 = yg * 256;
-        let xs = (w - x0).min(256);
-        let ys = (h - y0).min(256);
-        let mut gw = BitWriter::allocate(xs * ys * nb * 40 + 100000);
-        gw.write(1, 1);
-        gw.write(1, 1);
-        gw.write(2, 0b00);
-        for c in 0..nb {
-            let mut enc = Encoder {
-                code: &hcode[c],
-                out: &mut gw,
-            };
-            process_plane(&mut enc, &planes[c], w, x0, y0, xs, 0, ys);
+    let ac_sections = {
+        let mut ac_sections: Vec<Vec<u8>> = Vec::with_capacity(num_ac);
+        let mut gw = BitWriter::allocate(0);
+        for g in 0..num_ac {
+            let xg = g % ngx;
+            let yg = g / ngx;
+            let x0 = xg * 256;
+            let y0 = yg * 256;
+            let xs = (w - x0).min(256);
+            let ys = (h - y0).min(256);
+            gw.reset(xs * ys * nb * 40 + 100000);
+            gw.write(1, 1);
+            gw.write(1, 1);
+            gw.write(2, 0b00);
+            for c in 0..nb {
+                let mut enc = Encoder {
+                    code: &hcode[c],
+                    out: &mut gw,
+                };
+                process_plane(&mut enc, &planes[c], w, x0, y0, xs, 0, ys, &mut row_scratch);
+            }
+            gw.zero_pad_to_byte();
+            gsizes[2 + ndg + g] = gw.bytes_written;
+            ac_sections.push(gw.data[..gw.bytes_written].to_vec());
         }
-        gw.zero_pad_to_byte();
-        gsizes[2 + ndg + g] = gw.bytes_written;
-        ac_sections.push(gw.data[..gw.bytes_written].to_vec());
-    }
+        ac_sections
+    };
     let mut hdr = BitWriter::allocate(64 + num_groups * 40);
     prepare_header(&mut hdr, w, h, nb, cs, bits, meta, &gsizes, &mut scratch);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(hdr.bytes_written + gsizes.iter().sum::<usize>());
     out.extend_from_slice(&hdr.data[..hdr.bytes_written]);
     out.extend_from_slice(&lfg.data[..lfg.bytes_written]);
     for sec in &ac_sections {

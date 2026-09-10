@@ -34,7 +34,7 @@ use crate::adaptive_quant::dirty_log2f;
 use crate::util::heap_array;
 use std::sync::OnceLock;
 
-pub(crate) const CLUSTERS_LIMIT: usize = 64;
+pub(crate) const CLUSTERS_LIMIT: usize = 128;
 
 /// A cluster must save at least this many bits, summed over every context that
 /// reassigns to it, to be worth the histogram it costs to describe. Matches
@@ -893,34 +893,72 @@ fn cluster_histograms_inner(
 /// for the prefix-cost model above: with sub-bit symbols an integer-depth
 /// Huffman cost cannot see the difference between contexts, so the greedy
 /// search collapses exactly when finely split contexts help most (per-pixel
-/// MA-tree contexts in the lossy-modular path). Costs here are the exact ANS
-/// model — payload plus the serialized frequency table — so a merge delta
-/// automatically prices both the entropy loss and the saved table header.
+/// MA-tree contexts: the lossy-modular path, and lossless learned-tree
+/// frames — a bilevel scan's 756 contexts collapsed to 2 histograms, +33%).
+/// Costs here are the exact ANS model — payload plus the serialized frequency
+/// table — so a merge delta automatically prices both the entropy loss and
+/// the saved table header.
+///
+/// The result is independent of `threads`: the per-context loops are
+/// parallel maps with the sequential tie-breaks, and the refinement passes
+/// precompute every move delta against a snapshot and recompute only the
+/// entries whose cluster changed since (exactly the sequential algorithm).
 pub(crate) fn cluster_histograms_ans(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
+    pool: Option<&crate::thread_pool::ThreadPool>,
 ) -> usize {
-    use super::ans::fast_ans_population_cost;
+    use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
+    use crate::coder_scratch::CoderScratch;
+    use crate::thread_pool::ThreadPool;
     let n = histograms.len();
     assert!(context_map.len() >= n);
     if n <= 1 {
         context_map[..n].fill(0);
         return n;
     }
-    let cost_of = |h: &Histogram| -> f64 {
+    fn cost_of(h: &Histogram, s: &mut AnsCostScratch) -> f64 {
         if h.total_count == 0 {
             0.0
         } else {
-            fast_ans_population_cost(&h.counts, 1)
+            fast_ans_population_cost_scratch(&h.counts, 1, s)
         }
-    };
-    let merge_cost = |a: &Histogram, b: &Histogram| -> f64 {
-        let mut counts = a.counts;
-        add_counts(&mut counts, &b.counts);
-        fast_ans_population_cost(&counts, 1)
-    };
+    }
+    fn merge_cost(a: &Histogram, b: &Histogram, s: &mut AnsCostScratch) -> f64 {
+        s.merged = a.counts;
+        add_counts(&mut s.merged, &b.counts);
+        let merged = s.merged;
+        fast_ans_population_cost_scratch(&merged, 1, s)
+    }
+    /// `(0..n).map(f)` in index order, using the same workers across passes.
+    fn par_map<R: Send>(
+        n: usize,
+        workers: &mut Option<(&ThreadPool, CoderScratch)>,
+        f: impl Fn(usize, &mut AnsCostScratch) -> R + Sync,
+    ) -> Vec<R> {
+        let Some((pool, caller_scratch)) = workers else {
+            let mut s = AnsCostScratch::new();
+            return (0..n).map(|i| f(i, &mut s)).collect();
+        };
+        let threads = pool.num_threads().min(n);
+        let chunk = n.div_ceil(threads);
+        let parts = pool.steal_map(caller_scratch, n.div_ceil(chunk), |part, _| {
+            let begin = part * chunk;
+            let end = (begin + chunk).min(n);
+            let mut s = AnsCostScratch::new();
+            (begin..end).map(|i| f(i, &mut s)).collect::<Vec<R>>()
+        });
+        parts.into_iter().flatten().collect()
+    }
 
-    let in_costs: Vec<f64> = histograms.iter().map(&cost_of).collect();
+    // Small or serial clustering keeps its lightweight scratch. The parallel
+    // path borrows the encoder's workers for all cost passes. Its caller needs
+    // separate scratch while the original entropy buffers remain borrowed.
+    let mut workers = pool
+        .filter(|pool| n >= 64 && pool.num_threads() > 1)
+        .map(|pool| (pool, CoderScratch::lossless()));
+    let mut scratch = AnsCostScratch::new();
+    let in_costs: Vec<f64> = par_map(n, &mut workers, |i, s| cost_of(&histograms[i], s));
 
     // Greedy k-center: seed with the heaviest context, keep adding the context
     // farthest (most expensive to fold into any existing cluster) while
@@ -945,22 +983,28 @@ pub(crate) fn cluster_histograms_ans(
         clusters.push(histograms[seed].clone());
         cluster_costs.push(in_costs[seed]);
         dists[seed] = 0.0;
-        let last = clusters.len() - 1;
+        let last = &clusters[clusters.len() - 1];
+        let last_cost = cluster_costs[clusters.len() - 1];
+        let updated: Vec<f64> = {
+            let dists = &dists;
+            par_map(n, &mut workers, |i, s| {
+                let h = &histograms[i];
+                if h.total_count == 0 {
+                    return 0.0;
+                }
+                if dists[i] == 0.0 {
+                    return 0.0;
+                }
+                let d = merge_cost(h, last, s) - in_costs[i] - last_cost;
+                dists[i].min(d)
+            })
+        };
+        dists = updated;
         let mut next_seed = seed;
         let mut next_dist = 0.0f64;
-        for (i, h) in histograms.iter().enumerate() {
-            if dists[i] == 0.0 || h.total_count == 0 {
-                if h.total_count == 0 {
-                    dists[i] = 0.0;
-                }
-                continue;
-            }
-            let d = merge_cost(h, &clusters[last]) - in_costs[i] - cluster_costs[last];
-            if d < dists[i] {
-                dists[i] = d;
-            }
-            if dists[i] > next_dist {
-                next_dist = dists[i];
+        for (i, &d) in dists.iter().enumerate() {
+            if d > next_dist {
+                next_dist = d;
                 next_seed = i;
             }
         }
@@ -973,64 +1017,91 @@ pub(crate) fn cluster_histograms_ans(
 
     // Assign every context to its cheapest cluster, rebuild, then refine with
     // move passes under the same cost.
-    let mut assignment = vec![0u8; n];
-    for (i, h) in histograms.iter().enumerate() {
-        if h.total_count == 0 {
-            continue;
-        }
-        let mut best = 0usize;
-        let mut best_d = f64::MAX;
-        for c in 0..num_seeds {
-            let d = merge_cost(h, &clusters[c]) - cluster_costs[c];
-            if d < best_d {
-                best_d = d;
-                best = c;
+    let mut assignment: Vec<u8> = {
+        let clusters = &clusters;
+        let cluster_costs = &cluster_costs;
+        par_map(n, &mut workers, |i, s| {
+            let h = &histograms[i];
+            if h.total_count == 0 {
+                return 0u8;
             }
-        }
-        assignment[i] = best as u8;
-    }
-    let rebuild =
-        |clusters: &mut Vec<Histogram>, cluster_costs: &mut Vec<f64>, assignment: &[u8]| {
-            for c in clusters.iter_mut() {
-                *c = Histogram::new();
-            }
-            for (h, &a) in histograms.iter().zip(assignment) {
-                histogram_add(&mut clusters[a as usize], h);
-            }
-            for (c, cost) in clusters.iter().zip(cluster_costs.iter_mut()) {
-                *cost = cost_of(c);
-            }
-        };
-    rebuild(&mut clusters, &mut cluster_costs, &assignment);
-
-    for _ in 0..2 {
-        let mut changed = false;
-        for i in 0..n {
-            if histograms[i].total_count == 0 {
-                continue;
-            }
-            let old = assignment[i] as usize;
-            let mut without = clusters[old].clone();
-            histogram_sub(&mut without, &histograms[i]);
-            let remove_delta = cost_of(&without) - cluster_costs[old];
-            let mut best = old;
-            let mut best_delta = 0.0f64;
+            let mut best = 0usize;
+            let mut best_d = f64::MAX;
             for c in 0..num_seeds {
-                if c == old {
-                    continue;
-                }
-                let add_delta = merge_cost(&histograms[i], &clusters[c]) - cluster_costs[c];
-                let delta = remove_delta + add_delta;
-                if delta < best_delta - 0.01 {
-                    best_delta = delta;
+                let d = merge_cost(h, &clusters[c], s) - cluster_costs[c];
+                if d < best_d {
+                    best_d = d;
                     best = c;
                 }
             }
-            if best != old {
-                histogram_sub(&mut clusters[old], &histograms[i]);
-                histogram_add(&mut clusters[best], &histograms[i]);
-                cluster_costs[old] = cost_of(&clusters[old]);
-                cluster_costs[best] = cost_of(&clusters[best]);
+            best as u8
+        })
+    };
+    let rebuild = |clusters: &mut Vec<Histogram>,
+                   cluster_costs: &mut Vec<f64>,
+                   assignment: &[u8],
+                   s: &mut AnsCostScratch| {
+        for c in clusters.iter_mut() {
+            *c = Histogram::new();
+        }
+        for (h, &a) in histograms.iter().zip(assignment) {
+            histogram_add(&mut clusters[a as usize], h);
+        }
+        for (c, cost) in clusters.iter().zip(cluster_costs.iter_mut()) {
+            *cost = cost_of(c, s);
+        }
+    };
+    rebuild(&mut clusters, &mut cluster_costs, &assignment, &mut scratch);
+
+    for _ in 0..2 {
+        // Propose every context's best move against a snapshot of the
+        // clusters, in parallel; then apply proposals in index order, each
+        // re-priced against the current clusters (two cost evaluations per
+        // proposer). Deterministic and independent of `threads`; the second
+        // pass picks up moves the first pass's snapshot could not see.
+        let proposals: Vec<Option<u8>> = {
+            let clusters = &clusters;
+            let cluster_costs = &cluster_costs;
+            let assignment = &assignment;
+            par_map(n, &mut workers, |i, s| {
+                let h = &histograms[i];
+                if h.total_count == 0 {
+                    return None;
+                }
+                let old = assignment[i] as usize;
+                let mut without = clusters[old].clone();
+                histogram_sub(&mut without, h);
+                let remove_delta = cost_of(&without, s) - cluster_costs[old];
+                let mut best = old;
+                let mut best_delta = 0.0f64;
+                for c in 0..num_seeds {
+                    if c == old {
+                        continue;
+                    }
+                    let delta = remove_delta + merge_cost(h, &clusters[c], s) - cluster_costs[c];
+                    if delta < best_delta - 0.01 {
+                        best_delta = delta;
+                        best = c;
+                    }
+                }
+                (best != old).then_some(best as u8)
+            })
+        };
+        let mut changed = false;
+        for (i, proposal) in proposals.iter().enumerate() {
+            let Some(best) = *proposal else { continue };
+            let best = best as usize;
+            let old = assignment[i] as usize;
+            let h = &histograms[i];
+            let mut without = clusters[old].clone();
+            histogram_sub(&mut without, h);
+            let remove_delta = cost_of(&without, &mut scratch) - cluster_costs[old];
+            let add_delta = merge_cost(h, &clusters[best], &mut scratch) - cluster_costs[best];
+            if remove_delta + add_delta < -0.01 {
+                histogram_sub(&mut clusters[old], h);
+                histogram_add(&mut clusters[best], h);
+                cluster_costs[old] = cost_of(&clusters[old], &mut scratch);
+                cluster_costs[best] = cost_of(&clusters[best], &mut scratch);
                 assignment[i] = best as u8;
                 changed = true;
             }
@@ -1054,8 +1125,9 @@ pub(crate) fn cluster_histograms_ans(
                 if !active[b] {
                     continue;
                 }
-                let delta =
-                    merge_cost(&clusters[a], &clusters[b]) - cluster_costs[a] - cluster_costs[b];
+                let delta = merge_cost(&clusters[a], &clusters[b], &mut scratch)
+                    - cluster_costs[a]
+                    - cluster_costs[b];
                 if delta < best_delta {
                     best_delta = delta;
                     best_pair = Some((a, b));
@@ -1065,7 +1137,7 @@ pub(crate) fn cluster_histograms_ans(
         let Some((a, b)) = best_pair else { break };
         let bh = clusters[b].clone();
         histogram_add(&mut clusters[a], &bh);
-        cluster_costs[a] = cost_of(&clusters[a]);
+        cluster_costs[a] = cost_of(&clusters[a], &mut scratch);
         active[b] = false;
         for m in assignment.iter_mut() {
             if *m == b as u8 {
@@ -1093,6 +1165,65 @@ pub(crate) fn cluster_histograms_ans(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ans_clustering_is_independent_of_thread_count() {
+        // Skewed, finely split contexts (a bilevel image's MA-tree leaves):
+        // the parallel maps and the propose-then-verify refinement must give
+        // the same clustering on one thread as on many.
+        let n = 300usize;
+        let mut state = 0x9E37_79B9u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let base: Vec<Histogram> = (0..n)
+            .map(|i| {
+                let mut h = Histogram::new();
+                let total = 50 + next() % 5000;
+                let p_one = (i as u32 * 7 + next() % 40) % 1000;
+                let ones = (total as u64 * p_one as u64 / 1000) as u32;
+                for _ in 0..(total - ones) {
+                    h.add(0);
+                }
+                for _ in 0..ones {
+                    h.add(1 + next() % 3);
+                }
+                h
+            })
+            .collect();
+        // Include the serial/parallel boundary and uneven worker chunks.
+        for len in [0, 1, 63, 64, 65, n] {
+            let run = |threads: usize| {
+                let mut histograms = base[..len].to_vec();
+                let mut map = vec![0u8; len];
+                let pool = crate::thread_pool::ThreadPool::new_lossless(threads);
+                let num = cluster_histograms_ans(&mut histograms, &mut map, Some(&pool));
+                (num, map, histograms[..num].to_vec())
+            };
+            let (num1, map1, hist1) = run(1);
+            if len == n {
+                assert!(num1 > 2, "expected several clusters, got {num1}");
+            }
+            for threads in [0, 2, 3, 8] {
+                let (num, map, hist) = run(threads);
+                assert_eq!(
+                    num, num1,
+                    "cluster count differs: len={len}, threads={threads}"
+                );
+                assert_eq!(
+                    map, map1,
+                    "context map differs: len={len}, threads={threads}"
+                );
+                assert!(
+                    hist.iter().zip(&hist1).all(|(a, b)| a.counts == b.counts),
+                    "cluster histograms differ: len={len}, threads={threads}"
+                );
+            }
+        }
+    }
 
     fn histogram(entries: &[(usize, u32)]) -> Histogram {
         let mut histogram = Histogram::new();

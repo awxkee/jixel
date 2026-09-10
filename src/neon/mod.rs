@@ -37,6 +37,7 @@ mod entropy;
 mod frame;
 mod inflated_cost;
 mod lossless_grad;
+mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
@@ -71,6 +72,7 @@ pub(crate) use inflated_cost::{
     recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lz_match::{match_len_compact_neon, match_len_neon};
 pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
     tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,

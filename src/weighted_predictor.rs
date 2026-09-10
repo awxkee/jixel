@@ -135,6 +135,21 @@ impl WpState {
         }
     }
 
+    pub(crate) fn reset(&mut self, xsize: usize, params: WpParams) {
+        let n = (xsize + 2) * 2;
+        for errors in &mut self.pred_errors {
+            errors.resize(n, 0);
+            errors.fill(0);
+        }
+        self.error.resize(n, 0);
+        self.error.fill(0);
+        self.xsize = xsize;
+        self.params = params;
+        self.prediction = [0; 4];
+        self.pred = 0;
+        self.wp_prop = 0;
+    }
+
     #[inline]
     fn add_bits(x: i64) -> i64 {
         x << WP_EXTRA_BITS
@@ -189,10 +204,38 @@ impl WpState {
     }
 
     #[inline(always)]
-    fn predict_with_row(&mut self, x: usize, row: WpRowOffsets, n: WpNeighbors) -> i64 {
+    fn predict_with_row<const FLAT_SHORTCUT: bool>(
+        &mut self,
+        x: usize,
+        row: WpRowOffsets,
+        n: WpNeighbors,
+    ) -> (i64, bool) {
         let pos_n = row.previous + x;
         let pos_ne = if x < self.xsize - 1 { pos_n + 1 } else { pos_n };
         let pos_nw = if x > 0 { pos_n - 1 } else { pos_n };
+        // Equal neighbors and zero WP errors make every subprediction equal.
+        // Normalized weights total 13..=31; within +/-65536 fixed-point units
+        // the reciprocal's truncation error stays below its rounding bias, so
+        // the weighted average and clamped prediction equal `common` exactly.
+        // Use this shortcut for MA and palette traversals: checking it in general
+        // prediction loops costs more than it saves on photographic inputs.
+        if FLAT_SHORTCUT
+            && n.north == n.west
+            && n.north == n.north_east
+            && n.north == n.north_west
+            && n.north == n.north_north
+            && (-8192..=8192).contains(&n.north)
+            && (x == 0 || self.error[row.current + x - 1] == 0)
+            && self.error[pos_n] == 0
+            && self.error[pos_nw] == 0
+            && self.error[pos_ne] == 0
+        {
+            let common = Self::add_bits(n.north);
+            self.prediction = [common; 4];
+            self.pred = common;
+            self.wp_prop = 0;
+            return (n.north, true);
+        }
         let mut weights = [0u32; 4];
         for i in 0..4 {
             let s = self.pred_errors[i][pos_n] as u64
@@ -238,13 +281,13 @@ impl WpState {
         let pred = Self::weighted_average(&self.prediction, &weights);
         if ((te_n ^ te_w) | (te_n ^ te_nw)) > 0 {
             self.pred = pred;
-            (pred + WP_PRED_ROUND) >> WP_EXTRA_BITS
+            ((pred + WP_PRED_ROUND) >> WP_EXTRA_BITS, false)
         } else {
             let mx = aw.max(ane).max(an);
             let mn = aw.min(ane).min(an);
             let predc = pred.max(mn).min(mx);
             self.pred = predc;
-            (predc + WP_PRED_ROUND) >> WP_EXTRA_BITS
+            ((predc + WP_PRED_ROUND) >> WP_EXTRA_BITS, false)
         }
     }
 
@@ -255,7 +298,8 @@ impl WpState {
         for i in 0..4 {
             let e = ((self.prediction[i] - valb).abs() + WP_PRED_ROUND) >> WP_EXTRA_BITS;
             self.pred_errors[i][row.current + x] = e as u32;
-            self.pred_errors[i][row.previous + x + 1] += e as u32;
+            let slot = &mut self.pred_errors[i][row.previous + x + 1];
+            *slot = slot.wrapping_add(e as u32);
         }
     }
 
@@ -269,8 +313,32 @@ impl WpState {
         row: WpRowOffsets,
         neighbors: WpNeighbors,
     ) -> i64 {
-        let prediction = self.predict_with_row(x, row, neighbors);
+        let (prediction, _) = self.predict_with_row::<false>(x, row, neighbors);
         self.update_with_row(val, x, row);
+        prediction
+    }
+
+    /// MA and palette traversals benefit from the exact flat-span shortcut.
+    #[inline(always)]
+    pub(crate) fn predict_and_update_flat(
+        &mut self,
+        val: i64,
+        x: usize,
+        row: WpRowOffsets,
+        neighbors: WpNeighbors,
+    ) -> i64 {
+        let (prediction, flat) = self.predict_with_row::<true>(x, row, neighbors);
+        if flat && prediction == val {
+            // The shortcut makes all four predictions exactly val << 3.
+            // Clear the current errors; adding zero to the north-east
+            // subpredictor errors would leave that state unchanged.
+            self.error[row.current + x] = 0;
+            for errors in &mut self.pred_errors {
+                errors[row.current + x] = 0;
+            }
+        } else {
+            self.update_with_row(val, x, row);
+        }
         prediction
     }
 
@@ -287,7 +355,7 @@ impl WpState {
         north_west: i64,
         north_north: i64,
     ) -> i64 {
-        self.predict_with_row(
+        self.predict_with_row::<false>(
             x,
             self.row_offsets(y),
             WpNeighbors {
@@ -298,6 +366,7 @@ impl WpState {
                 north_north,
             },
         )
+        .0
     }
 
     #[inline]
@@ -309,6 +378,116 @@ impl WpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_predictions_keep_the_exact_fixed_point_average() {
+        for total in 13i64..=31 {
+            let reciprocal = WP_DIV[total as usize - 1] as i64;
+            for prediction in -65_536i64..=65_536 {
+                let sum = prediction * total + (total >> 1) - 1;
+                assert_eq!((sum * reciprocal) >> 24, prediction);
+            }
+        }
+        let mut seed = 17u32;
+        for _ in 0..10_000 {
+            let weights: [u32; 4] = std::array::from_fn(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                4 + seed % (15 << 24)
+            });
+            let sum: u32 = weights.iter().sum();
+            let shift = WpState::floor_log2(sum as u64) - 4;
+            let normalized: u32 = weights.iter().map(|w| w >> shift).sum();
+            assert!((13..=31).contains(&normalized));
+            for prediction in [-65_536, -1, 0, 1, 65_536] {
+                assert_eq!(
+                    WpState::weighted_average(&[prediction; 4], &weights),
+                    prediction
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flat_shortcut_preserves_prediction_and_error_state() {
+        for params in WpParams::PRESETS {
+            for width in [1, 17] {
+                for value in [-8193, -8192, -1, 0, 1, 8192, 8193, 65535] {
+                    let mut general = WpState::with_params(width, params);
+                    let mut ma = WpState::with_params(width, params);
+                    for (i, errors) in general.pred_errors.iter_mut().enumerate() {
+                        for (j, error) in errors.iter_mut().enumerate() {
+                            *error = (i * 191 + j * 73) as u32;
+                        }
+                    }
+                    ma.pred_errors.clone_from(&general.pred_errors);
+                    for y in 0..8 {
+                        for x in 0..width {
+                            let delta = if (2..5).contains(&y) {
+                                x as i64 * 31 + y as i64 * 17
+                            } else {
+                                0
+                            };
+                            let neighbors = WpNeighbors {
+                                north: value,
+                                west: value + delta,
+                                north_east: value - delta,
+                                north_west: value + delta * 2,
+                                north_north: value - delta * 3,
+                            };
+                            assert_eq!(
+                                ma.predict_and_update_flat(
+                                    value + delta,
+                                    x,
+                                    ma.row_offsets(y),
+                                    neighbors,
+                                ),
+                                general.predict_and_update(
+                                    value + delta,
+                                    x,
+                                    general.row_offsets(y),
+                                    neighbors,
+                                )
+                            );
+                            assert_eq!(ma.pred, general.pred);
+                            assert_eq!(ma.prediction, general.prediction);
+                            assert_eq!(ma.wp_prop, general.wp_prop);
+                            assert_eq!(ma.error, general.error);
+                            assert_eq!(ma.pred_errors, general.pred_errors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_matches_fresh_state_after_width_and_parameter_changes() {
+        let mut reused = WpState::new(0);
+        for (round, width) in [17, 3, 257, 1, 17].into_iter().enumerate() {
+            let params = WpParams::PRESETS[round % WpParams::PRESETS.len()];
+            reused.reset(width, params);
+            let mut fresh = WpState::with_params(width, params);
+            for y in 0..5 {
+                for x in 0..width {
+                    let value = (x * 37 + y * 101 + round * 17) as i64;
+                    let neighbors = WpNeighbors {
+                        north: value - 13,
+                        west: value + 7,
+                        north_east: value - 29,
+                        north_west: value + 3,
+                        north_north: value - 19,
+                    };
+                    assert_eq!(
+                        reused.predict_and_update(value, x, reused.row_offsets(y), neighbors),
+                        fresh.predict_and_update(value, x, fresh.row_offsets(y), neighbors)
+                    );
+                    assert_eq!(reused.wp_prop, fresh.wp_prop);
+                }
+            }
+        }
+    }
 
     #[test]
     fn wp_headers_have_expected_sizes() {

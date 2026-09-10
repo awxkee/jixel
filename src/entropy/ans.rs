@@ -78,9 +78,17 @@ pub(crate) fn normalize_counts(counts: &[u32], freqs: &mut Vec<u16>) {
     normalize_counts_into(counts, freqs);
 }
 
+/// Keep the first maximum on ties. Separating the value reduction from the
+/// position search avoids vectorizing a wide index alongside every count.
+#[inline]
+fn first_maximum(freqs: &[u16]) -> (usize, u16) {
+    let maximum = freqs.iter().copied().max().unwrap_or(0);
+    let position = freqs.iter().position(|&freq| freq == maximum).unwrap_or(0);
+    (position, maximum)
+}
+
 pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
     debug_assert_eq!(counts.len(), freqs.len());
-    let n = counts.len();
     freqs.fill(0);
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     if total == 0 {
@@ -100,18 +108,13 @@ pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
         sum += f;
     }
     while sum != table {
-        let mut mi = 0usize;
-        let mut mf = 0u16;
-        for i in 0..n {
-            if freqs[i] > mf {
-                mf = freqs[i];
-                mi = i;
-            }
-        }
+        let (mi, mf) = first_maximum(freqs);
         if sum < table {
-            freqs[mi] += 1;
-            sum += 1;
-        } else if freqs[mi] > 1 {
+            // Incrementing the first maximum keeps it the first maximum,
+            // so the entire deficit belongs to this same symbol.
+            freqs[mi] += (table - sum) as u16;
+            break;
+        } else if mf > 1 {
             freqs[mi] -= 1;
             sum -= 1;
         } else {
@@ -474,7 +477,12 @@ pub(crate) fn build_symbol_info(freqs: &[u16], reverse_map: &mut [u16]) -> Vec<A
             info
         })
         .collect();
-    debug_assert_eq!(u32::from(reverse_offset), ANS_TAB_SIZE);
+    // A cluster that received no tokens has an all-zero table; its symbols
+    // are never coded, so the empty table is harmless.
+    debug_assert!(
+        u32::from(reverse_offset) == ANS_TAB_SIZE || freqs.iter().all(|&f| f == 0),
+        "frequencies sum to {reverse_offset}, expected {ANS_TAB_SIZE}"
+    );
 
     for slot in 0..ANS_TAB_SIZE {
         let s = alias_lookup(&alias, slot);
@@ -503,6 +511,12 @@ impl AnsCoder {
     ) -> Option<u16> {
         let freq = info.freq as u32;
         debug_assert!(freq > 0, "ANS symbol with zero frequency");
+        // A single-symbol table has an identity reverse map. Its frequency
+        // is too large to renormalize a u32 state, and q * 4096 + rem is
+        // exactly the input state, so neither the state nor the stream moves.
+        if freq == ANS_TAB_SIZE {
+            return None;
+        }
         let reverse_offset = info.reverse_offset as usize;
         debug_assert!(reverse_offset + freq as usize <= reverse_map.len());
 
@@ -526,15 +540,6 @@ impl AnsCoder {
 
 const ANS_NO_EMIT: u32 = u32::MAX;
 
-#[derive(Clone, Copy)]
-struct PreparedAnsToken {
-    sym: u8,
-    nbits: u8,
-    hist: u8,
-    bits: u32,
-    emitted: u32,
-}
-
 pub(crate) fn write_ans_tokens(
     tokens: &[Token],
     context_map: &[u8],
@@ -543,45 +548,29 @@ pub(crate) fn write_ans_tokens(
     hybrid_uint_configs: &[super::token::HybridUintConfig],
     w: &mut BitWriter,
 ) {
-    let mut prepared = Vec::with_capacity(tokens.len());
-    for t in tokens {
-        let hist = context_map[t.context as usize];
-        // Must honor the per-cluster config, exactly as the prefix writer
-        // does. Using the default here silently desynchronizes the decoder for
-        // any code that selects a non-default configuration.
-        let (sym, nbits, bits) =
-            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist as usize]);
-        debug_assert!(sym < TABLE_ENTRIES as u32);
-        debug_assert!(nbits <= u8::MAX as u32);
-        prepared.push(PreparedAnsToken {
-            sym: sym as u8,
-            nbits: nbits as u8,
-            hist,
-            bits,
-            emitted: ANS_NO_EMIT,
-        });
-    }
-
+    // Only the renormalization word must survive the reverse ANS traversal.
+    // Extra bits can be regenerated from the immutable source tokens.
+    let mut emitted = Vec::with_capacity(tokens.len());
     let mut coder = AnsCoder::new();
-    for slot in prepared.iter_mut().rev() {
-        let hist = slot.hist as usize;
-        let sym = slot.sym as usize;
-        debug_assert!(hist < symbol_info.len());
-        debug_assert!(sym < symbol_info[hist].len());
-        let reverse_start = hist * ANS_TAB_SIZE as usize;
-        let reverse_map = &reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize];
-        let info = &symbol_info[hist][sym];
-        if let Some(word) = coder.put_symbol(info, reverse_map) {
-            slot.emitted = word as u32;
-        }
+    for t in tokens.iter().rev() {
+        let hist = context_map[t.context as usize] as usize;
+        let (sym, _, _) = super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
+        let start = hist * ANS_TAB_SIZE as usize;
+        let word = coder.put_symbol(
+            &symbol_info[hist][sym as usize],
+            &reverse_maps[start..start + ANS_TAB_SIZE as usize],
+        );
+        emitted.push(word.map_or(ANS_NO_EMIT, u32::from));
     }
-
     w.write(32, coder.state() as u64);
-    for slot in prepared.iter() {
-        if slot.emitted != ANS_NO_EMIT {
-            w.write(16, slot.emitted as u64);
+    for (t, word) in tokens.iter().zip(emitted.into_iter().rev()) {
+        if word != ANS_NO_EMIT {
+            w.write(16, word as u64);
         }
-        w.write(slot.nbits as usize, slot.bits as u64);
+        let hist = context_map[t.context as usize] as usize;
+        let (_, nbits, bits) =
+            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
+        w.write(nbits as usize, bits as u64);
     }
 }
 
@@ -728,6 +717,13 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
         alphabet_size -= 1;
     }
     debug_assert!(alphabet_size <= TABLE_ENTRIES);
+    if histogram.method == 0 {
+        w.write(1, 0); // non-small
+        w.write(1, 1); // uniform
+        debug_assert!(alphabet_size > 0);
+        store_varlen_u8((alphabet_size - 1) as u32, w);
+        return;
+    }
     let mut symbols = [0usize; 2];
     let mut num_symbols = 0usize;
     for (i, &freq) in freqs[..alphabet_size].iter().enumerate() {
@@ -737,14 +733,6 @@ pub(crate) fn encode_histogram<W: HistogramWriter>(
             }
             num_symbols += 1;
         }
-    }
-
-    if histogram.method == 0 {
-        w.write(1, 0); // non-small
-        w.write(1, 1); // uniform
-        debug_assert!(alphabet_size > 0);
-        store_varlen_u8((alphabet_size - 1) as u32, w);
-        return;
     }
 
     if num_symbols <= 2 {
@@ -873,6 +861,68 @@ fn histogram_cost(counts: &[u32], histogram: &AnsHistogram) -> f64 {
     ans_data_bits(counts, &histogram.freqs) + ans_table_bits(histogram)
 }
 
+/// Reusable buffers for `fast_ans_population_cost_scratch`: the clusterers
+/// evaluate hundreds of thousands of candidate merges per frame, and the
+/// per-call `Vec` allocations of the plain version dominated their time.
+pub(crate) struct AnsCostScratch {
+    precise: AnsHistogram,
+    flat: AnsHistogram,
+    pub(crate) merged: [u32; TABLE_ENTRIES],
+}
+
+impl AnsCostScratch {
+    pub(crate) fn new() -> Self {
+        let blank = || AnsHistogram {
+            freqs: vec![0u16; TABLE_ENTRIES],
+            method: 12,
+            omit_pos: 0,
+            cost: 0.0,
+        };
+        Self {
+            precise: blank(),
+            flat: blank(),
+            merged: [0; TABLE_ENTRIES],
+        }
+    }
+}
+
+/// `fast_ans_population_cost` without allocation; identical result.
+pub(crate) fn fast_ans_population_cost_scratch(
+    counts: &[u32],
+    data_scale: usize,
+    scratch: &mut AnsCostScratch,
+) -> f64 {
+    debug_assert_eq!(counts.len(), TABLE_ENTRIES);
+    let mut alphabet_size = counts.len();
+    while alphabet_size > 0 && counts[alphabet_size - 1] == 0 {
+        alphabet_size -= 1;
+    }
+    let precise = &mut scratch.precise;
+    // Normalization preserves zero counts. Keep the reusable buffers at the
+    // active alphabet length so cost/table scans do not revisit zero tails.
+    let counts = &counts[..alphabet_size];
+    precise.freqs.resize(alphabet_size, 0);
+    normalize_counts_into(counts, &mut precise.freqs);
+    let (omit_pos, _) = first_maximum(&precise.freqs);
+    precise.method = 12;
+    precise.omit_pos = omit_pos as u8;
+    let mut best =
+        ans_data_bits(counts, &precise.freqs) * data_scale as f64 + ans_table_bits(precise);
+    if let Some(base) = (ANS_TAB_SIZE as usize).checked_div(alphabet_size) {
+        let flat = &mut scratch.flat;
+        let remainder = ANS_TAB_SIZE as usize % alphabet_size;
+        flat.freqs.resize(alphabet_size, 0);
+        for (i, freq) in flat.freqs.iter_mut().enumerate() {
+            *freq = (base + usize::from(i < remainder)) as u16;
+        }
+        flat.method = 0;
+        flat.omit_pos = 0;
+        best =
+            best.min(ans_data_bits(counts, &flat.freqs) * data_scale as f64 + ans_table_bits(flat));
+    }
+    best
+}
+
 pub(crate) fn fast_ans_population_cost(counts: &[u32], data_scale: usize) -> f64 {
     let mut alphabet_size = counts.len();
     while alphabet_size > 0 && counts[alphabet_size - 1] == 0 {
@@ -881,12 +931,7 @@ pub(crate) fn fast_ans_population_cost(counts: &[u32], data_scale: usize) -> f64
 
     let mut freqs = Vec::new();
     normalize_counts(counts, &mut freqs);
-    let mut omit_pos = 0usize;
-    for i in 1..alphabet_size {
-        if freqs[i] > freqs[omit_pos] {
-            omit_pos = i;
-        }
-    }
+    let (omit_pos, _) = first_maximum(&freqs[..alphabet_size]);
     let precise = AnsHistogram {
         freqs,
         method: 12,
@@ -969,12 +1014,7 @@ pub(crate) fn optimize_ans_histogram(counts: &[u32]) -> AnsHistogram {
     // normalization and additionally test libjxl's minimum/midpoint probes.
     let mut precise_freqs = Vec::new();
     normalize_counts(counts, &mut precise_freqs);
-    let mut precise_omit = 0usize;
-    for i in 1..alphabet_size {
-        if precise_freqs[i] > precise_freqs[precise_omit] {
-            precise_omit = i;
-        }
-    }
+    let (precise_omit, _) = first_maximum(&precise_freqs[..alphabet_size]);
     let precise = AnsHistogram {
         freqs: precise_freqs,
         method: 12,
@@ -1025,9 +1065,76 @@ pub(crate) fn huffman_data_bits(counts: &[u32], depths: &[u8]) -> f64 {
     bits
 }
 
-/// Exact table-overhead measurement: serialize the real histogram into a
-/// throwaway writer and count the bits.
+/// Count the full-precision header used by the clustering cost model. Its
+/// mantissas need exactly `bit_width - 1` bits, so count them alongside the
+/// width codes without building the serializer's width and run arrays.
+fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
+    fn varlen_bits(n: usize) -> usize {
+        if n == 0 {
+            1
+        } else {
+            4 + floor_log2(n as u32) as usize
+        }
+    }
+
+    let alphabet_size = histogram
+        .freqs
+        .iter()
+        .rposition(|&f| f != 0)
+        .map_or(0, |i| i + 1);
+    let freqs = &histogram.freqs[..alphabet_size];
+    let omit_pos = histogram.omit_pos as usize;
+    let mut symbols = [0usize; 2];
+    let mut num_symbols = 0usize;
+    let mut omit_width = 10;
+    for (i, &freq) in freqs.iter().enumerate() {
+        if freq == 0 {
+            continue;
+        }
+        if num_symbols < symbols.len() {
+            symbols[num_symbols] = i;
+        }
+        num_symbols += 1;
+        if i != omit_pos {
+            let width = (u16::BITS - freq.leading_zeros()) as usize;
+            omit_width = omit_width.max(width + usize::from(i < omit_pos));
+        }
+    }
+    if num_symbols <= 2 {
+        return match num_symbols {
+            0 => 3,
+            1 => 2 + varlen_bits(symbols[0]),
+            _ => 2 + varlen_bits(symbols[0]) + varlen_bits(symbols[1]) + ANS_LOG_TAB_SIZE as usize,
+        };
+    }
+
+    // Non-small, non-flat, method 12, alphabet size, and the omitted width.
+    let mut bits = 8 + varlen_bits(alphabet_size - 3) + K_BIT_WIDTH_LENGTHS[omit_width] as usize;
+    // Runs cannot cross the omitted count, whose width may be artificial.
+    for mut remaining in [&freqs[..omit_pos], &freqs[omit_pos + 1..]] {
+        while let Some((&freq, rest)) = remaining.split_first() {
+            let run = 1 + rest.iter().take_while(|&&f| f == freq).count();
+            let width = (u16::BITS - freq.leading_zeros()) as usize;
+            let entry_bits = K_BIT_WIDTH_LENGTHS[width] as usize + width.saturating_sub(1);
+            if run >= 5 {
+                bits += entry_bits
+                    + K_BIT_WIDTH_LENGTHS[ANS_LOG_TAB_SIZE as usize + 1] as usize
+                    + varlen_bits(run - 5);
+            } else {
+                bits += run * entry_bits;
+            }
+            remaining = &remaining[run..];
+        }
+    }
+    bits
+}
+
+/// Exact table-overhead measurement. Full-precision cost probes can count
+/// width codes and mantissas together; other forms use the actual serializer.
 pub(crate) fn ans_table_bits(histogram: &AnsHistogram) -> f64 {
+    if histogram.method == 12 {
+        return precise_ans_table_bits(histogram) as f64;
+    }
     let mut w = HistogramBitCounter::default();
     encode_histogram(histogram, LOG_ALPHA_SIZE as u32, &mut w);
     w.0 as f64
@@ -1061,6 +1168,170 @@ pub(crate) fn choose_use_prefix_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precise_table_cost_matches_serialized_bits() {
+        let mut state = 0xc39e_729bu32;
+        let check = |freqs: Vec<u16>, omit_pos: usize| {
+            let histogram = AnsHistogram {
+                freqs,
+                method: 12,
+                omit_pos: omit_pos as u8,
+                cost: 0.0,
+            };
+            let mut writer = BitWriter::new();
+            encode_histogram(&histogram, LOG_ALPHA_SIZE as u32, &mut writer);
+            assert_eq!(
+                ans_table_bits(&histogram) as usize,
+                writer.bits_written(),
+                "freqs={:?}, omit_pos={omit_pos}",
+                histogram.freqs
+            );
+        };
+        for case in 0..2_000 {
+            let len = (case * 73) % (TABLE_ENTRIES + 1);
+            let mut counts = [0; TABLE_ENTRIES];
+            for (i, count) in counts[..len].iter_mut().enumerate() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *count = match case % 4 {
+                    0 => 1,
+                    1 => u32::from(i % 7 == 0) * (state % 10_000),
+                    2 => u32::from(i == 0 || i + 1 == len),
+                    _ => state % 10_000,
+                };
+            }
+            let mut freqs = Vec::new();
+            normalize_counts(&counts, &mut freqs);
+            let (omit, _) = first_maximum(&freqs);
+            check(freqs.clone(), omit);
+            freqs.truncate(len);
+            check(freqs, omit);
+        }
+        // Exercise the four/five-count RLE boundary, long zero/equal runs,
+        // and runs split by the omitted population at either end or inside.
+        for run in [4, 5, 6, 63, 126] {
+            for repeated in [0, 1, 16] {
+                let mut freqs = vec![repeated; run];
+                freqs.extend([2, ANS_TAB_SIZE as u16 - repeated * run as u16 - 2]);
+                for omit in [0, run / 2, freqs.len() - 1] {
+                    check(freqs.clone(), omit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_population_cost_matches_full_alphabet_after_reuse() {
+        let mut scratch = AnsCostScratch::new();
+        let mut state = 0x392dda71u32;
+        // Alternate alphabet sizes so a shorter histogram follows a longer
+        // one, including empty, singleton, sparse and full alphabets.
+        for case in 0..1024 {
+            let len = (case * 73) % (TABLE_ENTRIES + 1);
+            let mut counts = [0; TABLE_ENTRIES];
+            for (i, count) in counts[..len].iter_mut().enumerate() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *count = match case % 4 {
+                    0 => 1,
+                    1 => {
+                        if i % 3 == 0 {
+                            state % 10_000
+                        } else {
+                            0
+                        }
+                    }
+                    2 => {
+                        if i + 1 == len {
+                            u32::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    _ => state % 10_000,
+                };
+            }
+            for scale in [0, 1, 3, 17] {
+                assert_eq!(
+                    fast_ans_population_cost_scratch(&counts, scale, &mut scratch).to_bits(),
+                    fast_ans_population_cost(&counts, scale).to_bits(),
+                    "case={case}, scale={scale}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalization_matches_one_count_at_a_time() {
+        fn reference(counts: &[u32]) -> Vec<u16> {
+            let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
+            if total == 0 {
+                return vec![0; counts.len()];
+            }
+            let mut freqs: Vec<u16> = counts
+                .iter()
+                .map(|&c| {
+                    if c == 0 {
+                        0
+                    } else {
+                        (u64::from(c) * u64::from(ANS_TAB_SIZE) / total).max(1) as u16
+                    }
+                })
+                .collect();
+            let mut sum: u32 = freqs.iter().map(|&f| u32::from(f)).sum();
+            while sum != ANS_TAB_SIZE {
+                let maximum = *freqs.iter().max().unwrap();
+                let first = freqs.iter().position(|&f| f == maximum).unwrap();
+                if sum < ANS_TAB_SIZE {
+                    freqs[first] += 1;
+                    sum += 1;
+                } else if maximum > 1 {
+                    freqs[first] -= 1;
+                    sum -= 1;
+                } else {
+                    break;
+                }
+            }
+            freqs
+        }
+        let mut state = 0x235da23eu32;
+        for case in 0..2048 {
+            let len = case % (TABLE_ENTRIES + 1);
+            let counts: Vec<u32> = (0..len)
+                .map(|i| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    match case % 6 {
+                        0 => 0,
+                        1 => 1, // Equal maxima: the first symbol must retain the deficit.
+                        2 => {
+                            if i == len / 2 {
+                                u32::MAX
+                            } else {
+                                1
+                            }
+                        } // Excess counts.
+                        3 => state % 11,
+                        4 => {
+                            if i % 3 == 0 {
+                                0
+                            } else {
+                                state
+                            }
+                        }
+                        _ => state,
+                    }
+                })
+                .collect();
+            let mut freqs = vec![u16::MAX; len];
+            normalize_counts_into(&counts, &mut freqs);
+            assert_eq!(freqs, reference(&counts), "case={case}");
+        }
+    }
 
     fn assert_flat_reverse_map(freqs: &[u16]) {
         let alias = init_alias_table(freqs);
@@ -1111,6 +1382,27 @@ mod tests {
         let mut normalized = Vec::new();
         normalize_counts(&counts, &mut normalized);
         assert_flat_reverse_map(&normalized);
+    }
+
+    #[test]
+    fn single_symbol_leaves_every_state_unchanged() {
+        for symbol in [0, 37, TABLE_ENTRIES - 1] {
+            let mut freqs = [0u16; TABLE_ENTRIES];
+            freqs[symbol] = ANS_TAB_SIZE as u16;
+            let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+            let info = build_symbol_info(&freqs, &mut reverse_map);
+            assert!(
+                reverse_map
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &v)| i == v as usize)
+            );
+            for state in [0, 1, 65_535, 65_536, 0x13ab_0000, u32::MAX] {
+                let mut coder = AnsCoder { state };
+                assert_eq!(coder.put_symbol(&info[symbol], &reverse_map), None);
+                assert_eq!(coder.state(), state);
+            }
+        }
     }
 
     #[test]

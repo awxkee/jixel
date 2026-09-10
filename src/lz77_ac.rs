@@ -50,7 +50,7 @@ pub(crate) fn lz77_length_encode(length_value: u32) -> (u32, u32, u32) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum AcLz {
     /// A literal AC token, emitted via the normal uint_encode path.
     Lit { context: u32, value: u32 },
@@ -60,6 +60,46 @@ pub(crate) enum AcLz {
     Copy { context: u32, length_value: u32 },
 }
 
+/// Replay the existing run transform without retaining a second token stream.
+pub(crate) fn lz77_ac_tokens(tokens: &[Token]) -> impl Iterator<Item = AcLz> + '_ {
+    struct Runs<'a> {
+        tokens: &'a [Token],
+        copy: Option<AcLz>,
+    }
+    impl Iterator for Runs<'_> {
+        type Item = AcLz;
+
+        fn next(&mut self) -> Option<AcLz> {
+            if let Some(copy) = self.copy.take() {
+                return Some(copy);
+            }
+            let (token, rest) = self.tokens.split_first()?;
+            self.tokens = rest;
+            // Zero runs are always literals, so scanning their suffix would
+            // only add quadratic work without changing the emitted stream.
+            if token.value != 0 {
+                let extra = rest
+                    .iter()
+                    .take_while(|t| t.context == token.context && t.value == token.value)
+                    .count();
+                if extra >= LZ77_MIN_LENGTH as usize {
+                    self.copy = Some(AcLz::Copy {
+                        context: token.context,
+                        length_value: extra as u32 - LZ77_MIN_LENGTH,
+                    });
+                    self.tokens = &rest[extra..];
+                }
+            }
+            Some(AcLz::Lit {
+                context: token.context,
+                value: token.value,
+            })
+        }
+    }
+    Runs { tokens, copy: None }
+}
+
+#[cfg(test)]
 /// Collapse runs of identical (context, value) AC tokens into back-references.
 pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
     // Collapse runs of identical AC tokens into a literal + distance-1 back-ref.
@@ -72,12 +112,18 @@ pub(crate) fn lz77_compress_ac(tokens: &[Token]) -> Vec<AcLz> {
             context: t.context,
             value: t.value,
         });
+        // Zero runs always remain literals. Do not rescan their suffix for
+        // every token in the run.
+        if t.value == 0 {
+            i += 1;
+            continue;
+        }
         let mut j = i + 1;
         while j < n && tokens[j].context == t.context && tokens[j].value == t.value {
             j += 1;
         }
         let run_extra = (j - i - 1) as u32; // copies after the first literal
-        if run_extra >= LZ77_MIN_LENGTH && t.value != 0 {
+        if run_extra >= LZ77_MIN_LENGTH {
             out.push(AcLz::Copy {
                 context: t.context,
                 length_value: run_extra - LZ77_MIN_LENGTH,
@@ -163,53 +209,67 @@ pub(crate) fn build_lz_code_no_cluster(
 /// trailing distance context. Returns an `OwnedEntropyCode` whose
 /// `orig_context_map` has `num_contexts` entries (the distance context is the
 /// last), so `write_entropy_code` signals it correctly.
-pub(crate) fn build_ac_lz_code(
-    streams: &[Vec<AcLz>],
+pub(crate) fn build_ac_lz_code<'a>(
+    streams: impl IntoIterator<Item = &'a [Token]>,
     num_contexts: usize,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
-) -> OwnedEntropyCode {
-    let distance_context = (num_contexts - 1) as u32;
+) -> (OwnedEntropyCode, u64) {
+    let distance_context = num_contexts - 1;
     let mut histograms = vec![Histogram::new(); num_contexts];
+    let mut bits = 0u64;
     for stream in streams {
-        for t in stream {
-            match *t {
+        for t in lz77_ac_tokens(stream) {
+            match t {
                 AcLz::Lit { context, value } => {
-                    let (sym, _, _) = uint_encode(value);
+                    let (sym, nbits, _) = uint_encode(value);
                     histograms[context as usize].add(sym);
+                    bits += nbits as u64;
                 }
                 AcLz::Copy {
                     context,
                     length_value,
                 } => {
-                    let (len_tok, _, _) = lz77_length_encode(length_value);
-                    histograms[context as usize].add(LZ77_MIN_SYMBOL + len_tok);
-                    histograms[distance_context as usize].add(LZ77_DIST_VALUE);
+                    let (sym, nbits, _) = lz77_length_encode(length_value);
+                    histograms[context as usize].add(LZ77_MIN_SYMBOL + sym);
+                    histograms[distance_context].add(LZ77_DIST_VALUE);
+                    bits += nbits as u64;
                 }
             }
         }
     }
-
-    let mut context_map: Vec<u8> = Vec::new();
+    let mut context_map = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
-
-    OwnedEntropyCode {
-        context_map,
-        prefix_codes,
-        hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()],
-        orig_context_map: None,
-        orig_num_contexts: num_contexts,
-        use_prefix_code: true,
-        ans_histograms: Vec::new(),
-        ans_pricing_freqs: Vec::new(),
-        ans_symbols: Vec::new(),
-        ans_reverse_maps: Vec::new(),
+    // Clustering only redistributes integer counts. Price the same symbols
+    // from those counts instead of walking a materialized candidate again.
+    for (histogram, code) in histograms.iter().zip(&prefix_codes) {
+        if !code.single_symbol {
+            for (&count, &depth) in histogram.counts.iter().zip(&code.depths) {
+                bits += count as u64 * depth as u64;
+            }
+        }
     }
+    (
+        OwnedEntropyCode {
+            context_map,
+            prefix_codes,
+            hybrid_uint_configs: vec![crate::entropy::HybridUintConfig::DEFAULT; histograms.len()],
+            orig_context_map: None,
+            orig_num_contexts: num_contexts,
+            use_prefix_code: true,
+            ans_histograms: Vec::new(),
+            ans_pricing_freqs: Vec::new(),
+            ans_symbols: Vec::new(),
+            ans_reverse_maps: Vec::new(),
+        },
+        bits,
+    )
 }
 
 /// Estimate the encoded size in bits of an LZ stream under `code`, including
 /// the literal/length prefix-code bits and the hybrid-uint extra bits and the
 /// distance symbols. Used to decide whether LZ77 is worth enabling.
+#[cfg(test)]
 pub(crate) fn estimate_ac_lz_bits(
     streams: &[Vec<AcLz>],
     code: &OwnedEntropyCode,
@@ -485,6 +545,35 @@ mod lz77_distance_tests {
             let (tok, nbits, _) = lz77_length_encode(length_value);
             assert!(tok < 64, "length token {tok} escapes the alphabet");
             assert!(nbits <= 32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_runs_and_histogram_price_match_materialized_reference() {
+        let mut seed = 71u32;
+        for n in [0, 1, 2, 3, 4, 5, 17, 255, 4096] {
+            for value in [0, 1, 16, 257] {
+                let mut tokens = Vec::new();
+                for i in 0..n {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    tokens.push(Token::new(
+                        (i / 71 % 7) as u32,
+                        if i % 97 < 80 { value } else { seed % 1000 },
+                    ));
+                }
+                let expected = lz77_compress_ac(&tokens);
+                assert_eq!(lz77_ac_tokens(&tokens).collect::<Vec<_>>(), expected);
+                let (code, bits) =
+                    build_ac_lz_code(std::iter::once(tokens.as_slice()), 8, &mut Vec::new());
+                assert_eq!(bits, estimate_ac_lz_bits(&[expected], &code, 8));
+            }
         }
     }
 }

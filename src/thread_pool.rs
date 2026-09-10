@@ -97,7 +97,7 @@ impl Shared {
             && remaining.load(Ordering::Acquire) != 0
             && !self.shutdown.load(Ordering::Acquire)
         {
-            drop(self.activity.wait(queue).unwrap());
+            let _queue = self.activity.wait(queue).unwrap();
         }
     }
 }
@@ -328,10 +328,11 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        let queue = self.shared.queue.lock().unwrap();
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.activity.notify_all();
-        drop(queue);
+        {
+            let _queue = self.shared.queue.lock().unwrap();
+            self.shared.shutdown.store(true, Ordering::Release);
+            self.shared.activity.notify_all();
+        }
         for worker in self.workers.drain(..) {
             worker.join().unwrap();
         }

@@ -27,18 +27,66 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#[path = "enc_lossless_lz77.rs"]
+#[path = "lossless_lz77.rs"]
 mod lz77;
+#[path = "lossless_ma_lookup.rs"]
+mod ma_lookup;
+#[path = "lossless_palette.rs"]
+mod palette;
+#[path = "lossless_predictor.rs"]
+mod predictor;
+#[path = "lossless_rct.rs"]
+mod rct;
+#[path = "lossless_squeeze.rs"]
+mod squeeze;
+#[path = "lossless_tokens.rs"]
+mod tokens;
+use ma_lookup::MaLookup;
+use tokens::{RawTokenStreams, RawTokens};
 
+use crate::adaptive_quant::dirty_log2f;
+use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS};
+use crate::encode_image::AlphaPlane;
+use crate::entropy::{
+    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, uint_encode, write_entropy_code,
+    write_token,
+};
+use crate::image::Image3Si;
+use crate::ma_tree::{
+    LearnedTree, MA_REF_CHANNELS, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS,
+    deepen_ma_tree, learn_ma_tree, learn_ma_tree_indexed,
+};
+use crate::patches::{
+    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
+    find_lossless_patches,
+};
 use crate::thread_pool::ThreadPool;
+use crate::weighted_predictor::{WpNeighbors, WpParams, WpState, write_wp_header};
+use crate::xyb::quantize_xyb_channels;
 pub(crate) use lz77::LzToken;
 use lz77::{
-    LZ77_MIN_SYMBOL, RunLzWriter, build_lz_pixel_code, build_lz_pixel_code_opts,
+    LZ77_MIN_SYMBOL, RunLzWriter, build_lz_pixel_code, build_lz_pixel_code_threads,
+    estimate_coded_bits, estimate_literal_and_run_bits, estimate_streams_bits,
     lz77_compress_channels_for_speed, lz77_compress_channels_for_speed_with_depth,
-    lz77_compress_for_speed, lz77_compress_for_speed_with_depth, lz77_compress_runs, lz77_literals,
+    lz77_compress_for_speed, lz77_compress_for_speed_with_depth, lz77_run_count,
     write_local_tree_lz77, write_lz_section, write_tree_lz77,
 };
+use palette::{
+    PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
+    try_encode_local_palette_multi_group, try_encode_palette_single_group, write_palette_transform,
+};
+pub(crate) use predictor::{GradPackInteriorFn, GradientScratch, selected_grad_pack_interior_fn};
+use predictor::{
+    PREDICTOR_GRADIENT, PREDICTOR_WEIGHTED, PredictorNeighbors, channel_to_context,
+    choose_predictor_for_plane, choose_predictors_with_wp, choose_wp_params, fixed_predictor,
+    predictor_neighbors, predictor_value, tokenize_all, tokenize_channels_with_wp, tokenize_plane,
+    tokenize_plane_rows, tokenize_runs_with_wp,
+};
+pub(crate) use rct::forward_ycocg;
+use rct::{rank_rcts, rct_planes as rct_planes_fn, write_rct_transform};
+pub(crate) use squeeze::{encode_frame_lossy_modular_squeeze, lm_calibrated_distance};
+use squeeze::{encode_squeeze_multigroup, encode_squeeze_single_group};
 use std::sync::{Condvar, Mutex};
 
 const TREE_CTX_SPLIT_VAL: u32 = 0;
@@ -48,245 +96,41 @@ const TREE_CTX_OFFSET: u32 = 3;
 const TREE_CTX_MULTIPLIER_LOG: u32 = 4;
 const TREE_CTX_MULTIPLIER_BITS: u32 = 5;
 const NUM_TREE_CONTEXTS: usize = 6;
-const PREDICTOR_ZERO: u32 = 0;
-const PREDICTOR_LEFT: u32 = 1;
-const PREDICTOR_TOP: u32 = 2;
-const PREDICTOR_AVERAGE0: u32 = 3;
-const PREDICTOR_SELECT: u32 = 4;
-const PREDICTOR_GRADIENT: u32 = 5;
-const PREDICTOR_WEIGHTED: u32 = 6;
-const PREDICTOR_TOP_RIGHT: u32 = 7;
-const PREDICTOR_TOP_LEFT: u32 = 8;
-const PREDICTOR_LEFT_LEFT: u32 = 9;
-const PREDICTOR_AVERAGE1: u32 = 10;
-const PREDICTOR_AVERAGE2: u32 = 11;
-const PREDICTOR_AVERAGE3: u32 = 12;
-const PREDICTOR_AVERAGE4: u32 = 13;
-static SLOW_PREDICTORS: [u32; 6] = [
-    PREDICTOR_WEIGHTED,
-    PREDICTOR_GRADIENT,
-    PREDICTOR_AVERAGE4,
-    PREDICTOR_SELECT,
-    PREDICTOR_LEFT,
-    PREDICTOR_TOP,
-];
 
-/// Fixed-predictor fallback used wherever Fast mode hardcodes Weighted;
-/// Gradient when the decoding-speed setting excludes the Weighted Predictor.
-#[inline]
-fn fixed_predictor(use_wp: bool) -> u32 {
-    if use_wp {
-        PREDICTOR_WEIGHTED
-    } else {
-        PREDICTOR_GRADIENT
+/// Modular group layout: the frame header's `group_size_shift`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GroupLayout {
+    shift: u32,
+}
+
+impl GroupLayout {
+    /// 256-pixel groups: the codestream default and libjxl's lossless choice.
+    pub(crate) const DEFAULT: Self = Self { shift: 1 };
+    /// 1024-pixel groups. Every group edge costs its first row and column
+    /// their north/west context and restarts the WP state, so Slow lossless
+    /// prefers the largest groups whenever the learner's estimate agrees.
+    pub(crate) const LARGE: Self = Self { shift: 3 };
+
+    pub(crate) const fn dim(self) -> usize {
+        128 << self.shift
+    }
+
+    pub(crate) const fn lf_dim(self) -> usize {
+        self.dim() * 8
     }
 }
 
-#[derive(Clone, Copy)]
-struct PredictorNeighbors {
-    left: i64,
-    top: i64,
-    top_left: i64,
-    top_right: i64,
-    left_left: i64,
-    top_top: i64,
-    top_right_right: i64,
-}
-
-#[inline]
-fn predictor_neighbors<F: Fn(usize, usize) -> i32 + ?Sized>(
-    get: &F,
-    x: usize,
-    y: usize,
-    width: usize,
-) -> PredictorNeighbors {
-    let left = if x > 0 {
-        get(x - 1, y) as i64
-    } else if y > 0 {
-        get(x, y - 1) as i64
-    } else {
-        0
-    };
-    let top = if y > 0 { get(x, y - 1) as i64 } else { left };
-    let top_left = if x > 0 && y > 0 {
-        get(x - 1, y - 1) as i64
-    } else {
-        left
-    };
-    let top_right = if x + 1 < width && y > 0 {
-        get(x + 1, y - 1) as i64
-    } else {
-        top
-    };
-    PredictorNeighbors {
-        left,
-        top,
-        top_left,
-        top_right,
-        left_left: if x > 1 { get(x - 2, y) as i64 } else { left },
-        top_top: if y > 1 { get(x, y - 2) as i64 } else { top },
-        top_right_right: if x + 2 < width && y > 0 {
-            get(x + 2, y - 1) as i64
-        } else {
-            top_right
-        },
-    }
-}
-
-#[inline]
-fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
-    match pred_id {
-        PREDICTOR_ZERO => 0,
-        PREDICTOR_LEFT => n.left,
-        PREDICTOR_TOP => n.top,
-        PREDICTOR_AVERAGE0 => (n.left + n.top) / 2,
-        PREDICTOR_SELECT => {
-            let projected = n.left + n.top - n.top_left;
-            if (projected - n.left).abs() < (projected - n.top).abs() {
-                n.left
-            } else {
-                n.top
-            }
-        }
-        PREDICTOR_GRADIENT => clamped_gradient(n.left, n.top, n.top_left),
-        PREDICTOR_WEIGHTED => weighted,
-        PREDICTOR_TOP_RIGHT => n.top_right,
-        PREDICTOR_TOP_LEFT => n.top_left,
-        PREDICTOR_LEFT_LEFT => n.left_left,
-        PREDICTOR_AVERAGE1 => (n.left + n.top_left) / 2,
-        PREDICTOR_AVERAGE2 => (n.top_left + n.top) / 2,
-        PREDICTOR_AVERAGE3 => (n.top + n.top_right) / 2,
-        PREDICTOR_AVERAGE4 => {
-            (6 * n.top - 2 * n.top_top
-                + 7 * n.left
-                + n.left_left
-                + n.top_right_right
-                + 3 * n.top_right
-                + 8)
-                / 16
-        }
-        _ => unreachable!("unsupported modular predictor {pred_id}"),
-    }
-}
-
-fn wp_sample_cost(
-    get: impl Fn(usize, usize) -> i32,
-    width: usize,
-    height: usize,
-    params: WpParams,
-) -> (u64, usize) {
-    let cw = width.min(128);
-    let ch = height.min(128);
-    let xs = if width > cw { [0, width - cw] } else { [0, 0] };
-    let ys = if height > ch {
-        [0, height - ch]
-    } else {
-        [0, 0]
-    };
-    let nx = 1 + usize::from(xs[1] != xs[0]);
-    let ny = 1 + usize::from(ys[1] != ys[0]);
-    let mut cost = 0u64;
-    let mut count = 0usize;
-    for &y0 in &ys[..ny] {
-        for &x0 in &xs[..nx] {
-            let local_get = |x: usize, y: usize| get(x0 + x, y0 + y);
-            let mut wp = WpState::with_params(cw, params);
-            for y in 0..ch {
-                for x in 0..cw {
-                    let neighbors = predictor_neighbors(&local_get, x, y, cw);
-                    let value = local_get(x, y);
-                    let prediction = wp.predict(
-                        x,
-                        y,
-                        neighbors.top,
-                        neighbors.left,
-                        neighbors.top_right,
-                        neighbors.top_left,
-                        neighbors.top_top,
-                    );
-                    let packed = pack_signed(value.wrapping_sub(prediction as i32));
-                    let (_, extra_bits, _) = crate::entropy::uint_encode(packed);
-                    let magnitude_bits = packed
-                        .checked_add(1)
-                        .map_or(32, |value| 32 - value.leading_zeros());
-                    cost += extra_bits as u64 + u64::from(magnitude_bits);
-                    count += 1;
-                    wp.update(value as i64, x, y);
-                }
-            }
-        }
-    }
-    (cost, count)
-}
-
-fn choose_wp_params(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    num_color: usize,
-    header_count: usize,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-) -> WpParams {
-    let width = linear.xsize();
-    let height = linear.ysize();
-    let nb_chans = num_color + usize::from(alpha.is_some());
-    let total_values = width.saturating_mul(height).saturating_mul(nb_chans);
-    let scores = pool.steal_map(scratch, WpParams::PRESETS.len(), |preset, _scratch| {
-        let params = WpParams::PRESETS[preset];
-        let mut sample_cost = 0u64;
-        let mut samples = 0usize;
-        for channel in 0..num_color {
-            let plane = linear.plane_data(channel);
-            let (cost, count) = wp_sample_cost(|x, y| plane[y * width + x], width, height, params);
-            sample_cost += cost;
-            samples += count;
-        }
-        if let Some(alpha) = alpha {
-            let (cost, count) =
-                wp_sample_cost(|x, y| alpha.get_i32(y * width + x), width, height, params);
-            sample_cost += cost;
-            samples += count;
-        }
-        let scaled = sample_cost as f64 * total_values as f64 / samples.max(1) as f64;
-        // A non-default header costs 51 additional bits per modular group.
-        scaled
-            + if preset == 0 {
-                0.0
-            } else {
-                (51 * header_count) as f64
-            }
-    });
-    let best = scores
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(b.1))
-        .map_or(0, |(index, _)| index);
-    WpParams::PRESETS[best]
-}
-
-const GROUP_DIM: usize = 256;
-const LF_GROUP_DIM: usize = 2048;
+const GROUP_DIM: usize = GroupLayout::DEFAULT.dim();
+const LF_GROUP_DIM: usize = GroupLayout::DEFAULT.lf_dim();
 /// Each active deep-LZ lane owns about 4.7 MiB of hash lookup storage. Eight
 /// lanes retain useful parallelism without allowing a many-core encoder to
 /// multiply that fixed working set across every worker.
 const SLOW_DEEP_LZ_MAX_THREADS: usize = 8;
 
-/// A sparse set of local-palette groups forces Slow mode to build a complete
-/// alternate frame while most groups lose the learned-tree model. Require a
-/// useful frame footprint before paying for that exact candidate.
-const LOCAL_PALETTE_MIN_COVERAGE_NUM: usize = 1;
-const LOCAL_PALETTE_MIN_COVERAGE_DEN: usize = 4;
-
 /// The learned-tree entropy proxy must beat its flat alternative decisively
 /// before Slow mode trusts it enough to omit the context/flat final encodes.
 /// Near decisions retain the exact byte-level tournament.
 const MA_DECISIVE_MIN_SAVINGS: f64 = 0.18;
-
-#[inline]
-fn local_palette_coverage_is_sufficient(palette_pixels: usize, total_pixels: usize) -> bool {
-    palette_pixels.saturating_mul(LOCAL_PALETTE_MIN_COVERAGE_DEN)
-        >= total_pixels.saturating_mul(LOCAL_PALETTE_MIN_COVERAGE_NUM)
-}
 
 #[inline]
 fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
@@ -319,12 +163,13 @@ impl DeepLzScratchPool {
     }
 
     fn with_depth<T>(&self, f: impl FnOnce(&mut Vec<u32>) -> T) -> T {
-        let mut available = self.available.lock().unwrap();
-        while available.is_empty() {
-            available = self.activity.wait(available).unwrap();
-        }
-        let depth = available.pop().unwrap();
-        drop(available);
+        let depth = {
+            let mut available = self.available.lock().unwrap();
+            while available.is_empty() {
+                available = self.activity.wait(available).unwrap();
+            }
+            available.pop().unwrap()
+        };
 
         let mut guard = DeepLzScratchGuard {
             owner: self,
@@ -406,6 +251,76 @@ pub(crate) fn write_single_channel_lz77_section(
     true
 }
 
+/// Independent streams share frozen entropy tables but retain their own ANS
+/// state. Bound simultaneous staging memory as well as the worker count.
+fn write_lz_groups(
+    groups: &[Vec<LzToken>],
+    code: &crate::entropy::EntropyCode<'_>,
+    distance_context: u32,
+    min_symbol: u32,
+    wp_params: WpParams,
+    pool: &ThreadPool,
+    sections: &mut [BitWriter],
+) {
+    write_lz_groups_with_header(
+        groups,
+        code,
+        distance_context,
+        min_symbol,
+        pool,
+        sections,
+        |_, section| {
+            section.write(1, 1);
+            write_wp_header(wp_params, section);
+            section.write(2, 0);
+        },
+    );
+}
+
+fn write_lz_groups_with_header(
+    groups: &[Vec<LzToken>],
+    code: &crate::entropy::EntropyCode<'_>,
+    distance_context: u32,
+    min_symbol: u32,
+    pool: &ThreadPool,
+    sections: &mut [BitWriter],
+    write_header: impl Fn(usize, &mut BitWriter) + Sync,
+) {
+    debug_assert_eq!(groups.len(), sections.len());
+    let max_staging = if code.use_prefix_code {
+        0
+    } else {
+        groups
+            .iter()
+            .map(|g| g.len().saturating_mul(8))
+            .max()
+            .unwrap_or(0)
+    };
+    #[allow(clippy::manual_clamp)]
+    let lanes = (32 * 1024 * 1024 / max_staging.max(1))
+        .max(1)
+        .min(SLOW_DEEP_LZ_MAX_THREADS)
+        .min(pool.num_threads())
+        .min(sections.len());
+    let write_group = |i: usize, section: &mut BitWriter| {
+        write_header(i, section);
+        write_lz_section(&groups[i], distance_context, code, min_symbol, section);
+        section.zero_pad_to_byte();
+    };
+    if lanes <= 1 {
+        for (i, section) in sections.iter_mut().enumerate() {
+            write_group(i, section);
+        }
+        return;
+    }
+    // The caller's entropy scratch is borrowed by `code`. This lightweight
+    // scratch supplies the caller lane; section writers need no worker tables.
+    let mut writer_scratch = CoderScratch::lossless();
+    pool.steal_for_each_mut_with_threads(&mut writer_scratch, sections, lanes, |i, section, _| {
+        write_group(i, section);
+    });
+}
+
 fn keep_smaller_writer(best: &mut Option<BitWriter>, candidate: BitWriter) {
     if best
         .as_ref()
@@ -467,7 +382,7 @@ fn encode_frame_lossless_with_pool(
         // inferred reliably from covered pixel area, so encode both complete
         // alternatives and select by their final byte-aligned bit count.
         let mut regular_writer = BitWriter::new();
-        encode_frame_lossless_core(
+        let decisive_tree = encode_frame_lossless_core(
             linear,
             alpha,
             max_bits,
@@ -480,6 +395,21 @@ fn encode_frame_lossless_with_pool(
             ModularFrameKind::Regular,
             &mut regular_writer,
         );
+        // Patched frames are coded by the flat path only, so they cannot beat
+        // a decisive learned tree, and a plan covering little of the image
+        // cannot pay for its dictionary and reference frame.
+        let covered: usize = plan
+            .references
+            .iter()
+            .map(|r| r.positions.len())
+            .sum::<usize>()
+            * crate::patches::PATCH_TILE
+            * crate::patches::PATCH_TILE;
+        let coverage = covered as f64 / (linear.xsize() * linear.ysize()) as f64;
+        if decisive_tree || coverage < PATCH_MIN_COVERAGE {
+            writer.append(&regular_writer);
+            return;
+        }
 
         let mut patched_writer = BitWriter::new();
         let atlas_alpha =
@@ -549,7 +479,7 @@ fn encode_frame_lossless_core(
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
     writer: &mut BitWriter,
-) {
+) -> bool {
     encode_frame_lossless_core_impl(
         linear,
         alpha,
@@ -563,7 +493,7 @@ fn encode_frame_lossless_core(
         frame_kind,
         true,
         writer,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,7 +510,7 @@ fn encode_frame_lossless_core_impl(
     frame_kind: ModularFrameKind<'_>,
     allow_palette_candidates: bool,
     writer: &mut BitWriter,
-) {
+) -> bool {
     let use_wp = decoding_speed.use_weighted_predictor();
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
@@ -626,7 +556,7 @@ fn encode_frame_lossless_core_impl(
         ) {
             if speed == crate::Speed::Slow {
                 let mut normal_writer = BitWriter::new();
-                encode_frame_lossless_core_impl(
+                let normal_decisive = encode_frame_lossless_core_impl(
                     linear,
                     alpha,
                     max_bits,
@@ -642,13 +572,13 @@ fn encode_frame_lossless_core_impl(
                 );
                 if normal_writer.bits_written() < palette_writer.bits_written() {
                     writer.append(&normal_writer);
-                } else {
-                    writer.append(&palette_writer);
+                    return normal_decisive;
                 }
+                writer.append(&palette_writer);
             } else {
                 writer.append(&palette_writer);
             }
-            return;
+            return false;
         }
     }
 
@@ -675,7 +605,7 @@ fn encode_frame_lossless_core_impl(
         ) {
             if speed == crate::Speed::Slow {
                 let mut normal_writer = BitWriter::new();
-                encode_frame_lossless_core_impl(
+                let normal_decisive = encode_frame_lossless_core_impl(
                     linear,
                     alpha,
                     max_bits,
@@ -691,13 +621,13 @@ fn encode_frame_lossless_core_impl(
                 );
                 if normal_writer.bits_written() < palette_writer.bits_written() {
                     writer.append(&normal_writer);
-                } else {
-                    writer.append(&palette_writer);
+                    return normal_decisive;
                 }
+                writer.append(&palette_writer);
             } else {
                 writer.append(&palette_writer);
             }
-            return;
+            return false;
         }
     }
 
@@ -716,7 +646,7 @@ fn encode_frame_lossless_core_impl(
             scratch,
             writer,
         );
-        return;
+        return false;
     }
 
     // Progressive multi-group (Stage A: all squeezed channels fit the global
@@ -746,7 +676,7 @@ fn encode_frame_lossless_core_impl(
             writer,
         )
     {
-        return;
+        return false;
     }
 
     // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
@@ -759,14 +689,20 @@ fn encode_frame_lossless_core_impl(
     // wins, the color planes are rebuilt and the frame headers signal it.
     let mut rct_type = 6u32;
     let mut rct_planes: Option<Image3Si> = None;
-    if frame_kind.is_regular()
-        && adaptive_search
-        && num_color == 3
-        && let Some((t, planes)) = select_rct(linear, xsize, ysize, pool, scratch)
+    let rct_ranked: Vec<(u32, f32)> =
+        if frame_kind.is_regular() && adaptive_search && num_color == 3 {
+            rank_rcts(linear, xsize, ysize, pool, scratch)
+        } else {
+            Vec::new()
+        };
+    if let Some(&(t, _)) = rct_ranked.first()
+        && t != 6
     {
         rct_type = t;
-        rct_planes = Some(planes);
+        rct_planes = Some(rct_planes_fn(linear, xsize, ysize, t));
     }
+    // The palette candidate below needs the untransformed YCoCg planes.
+    let ycocg = linear;
     let linear = rct_planes.as_ref().unwrap_or(linear);
 
     let wp_header_count = if single_group {
@@ -779,9 +715,283 @@ fn encode_frame_lossless_core_impl(
     } else {
         WpParams::DEFAULT
     };
+    // The estimates below remain useful prefilters, but Slow mode keeps every
+    // viable finalist and compares its complete byte-aligned frame against the
+    // v1 and flat alternatives. Tree headers, clustering, hybrid uint choices,
+    // and LZ77 can otherwise reverse the order predicted from residual entropy.
+    let compare_tree_candidates = frame_kind.is_regular()
+        && adaptive_search
+        && num_color == 3
+        && decoding_speed.use_ma_trees();
+    let mut best_tree_writer: Option<BitWriter> = None;
+
+    // Sources: the RGB(A) planes under the best transform and, for frames
+    // with <= 1024 colors, a global palette index image. The corner-sampled
+    // WP proxy and the gradient RCT estimator both mis-rank on a third of
+    // Kodak (up to 0.7% of the file), so a reduced-leaf learner ranks every
+    // WP preset per source (and the transform runner-up for RGB). First the
+    // two sources are compared by one first-stage learn each under the proxy
+    // preset: a source trailing the leader by more than
+    // PALETTE_COARSE_MARGIN is dropped entirely (on palette graphics the RGB
+    // tree is ~25% behind and was paying the whole ranking for nothing).
+    // Each ranking winner seeds its final learn.
+    let (layout, learned_tree_decisive) = {
+        let palette = if compare_tree_candidates {
+            build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
+        } else {
+            None
+        };
+        let header_bits = |params: WpParams| {
+            if params == WpParams::DEFAULT {
+                0.0
+            } else {
+                (51 * wp_header_count) as f64
+            }
+        };
+        let mut rank_rgb = compare_tree_candidates;
+        // Final learned estimate of the RGB frame; gates the palette write.
+        let rgb_final_est: f64;
+        let mut rank_pal = compare_tree_candidates && palette.is_some();
+        let mut rgb_seed: Option<RankedLearn> = None;
+        let mut pal_seed: Option<RankedLearn> = None;
+        let mut pal_wp = wp_params;
+        if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
+            let rgb_stage = {
+                let source = rgb_ma_source(linear, alpha, xsize, rct_type);
+                rank_coarse(
+                    &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
+                )
+            };
+            let pal_stage = palette.as_ref().and_then(|p| {
+                let source = p.source(xsize, ysize);
+                rank_coarse(
+                    &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
+                )
+            });
+            let coarse_of = |stage: &Option<CoarseLearn>| {
+                stage.as_ref().map_or(f64::INFINITY, |s| {
+                    s.candidate.est_real + header_bits(wp_params)
+                })
+            };
+            let (rgb_coarse, pal_coarse) = (coarse_of(&rgb_stage), coarse_of(&pal_stage));
+            rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
+            rank_pal = pal_stage.is_some() && pal_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
+
+            if rank_rgb {
+                let (mut best_bits, mut best_coarse, params, seed) = {
+                    let source = rgb_ma_source(linear, alpha, xsize, rct_type);
+                    rank_presets(
+                        &source,
+                        xsize,
+                        ysize,
+                        min_symbol,
+                        use_wp,
+                        rgb_stage,
+                        wp_params,
+                        &header_bits,
+                        pool,
+                        scratch,
+                    )
+                };
+                wp_params = params;
+                rgb_seed = seed;
+                // Transform runner-up with the chosen preset, same coarse prune.
+                if let Some(&(runner_up, cost)) = rct_ranked.get(1)
+                    && cost <= rct_ranked[0].1 * RCT_RANK_MARGIN
+                {
+                    let planes =
+                        (runner_up != 6).then(|| rct_planes_fn(ycocg, xsize, ysize, runner_up));
+                    let source =
+                        rgb_ma_source(planes.as_ref().unwrap_or(ycocg), alpha, xsize, runner_up);
+                    if let Some(stage) = rank_coarse(
+                        &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
+                    ) && stage.candidate.est_real + header_bits(wp_params)
+                        <= best_coarse * RANK_COARSE_PRUNE
+                    {
+                        best_coarse =
+                            best_coarse.min(stage.candidate.est_real + header_bits(wp_params));
+                        let (bits, ranked) = rank_finish(stage, min_symbol, use_wp, pool, scratch);
+                        if bits + header_bits(wp_params) < best_bits {
+                            best_bits = bits + header_bits(wp_params);
+                            rct_type = runner_up;
+                            rct_planes = planes;
+                            rgb_seed = Some(ranked);
+                        }
+                    }
+                }
+                let _ = (best_bits, best_coarse);
+            }
+            if rank_pal && let Some(p) = &palette {
+                let source = p.source(xsize, ysize);
+                let (_, _, params, seed) = rank_presets(
+                    &source,
+                    xsize,
+                    ysize,
+                    min_symbol,
+                    use_wp,
+                    pal_stage,
+                    wp_params,
+                    &header_bits,
+                    pool,
+                    scratch,
+                );
+                pal_wp = params;
+                pal_seed = seed;
+            }
+        }
+        let linear = rct_planes.as_ref().unwrap_or(ycocg);
+
+        // Group layout. With every decoding tool available, Slow lossless runs
+        // the first learning stage (sampling plus a 32-leaf tree) under both
+        // 1024- and 256-pixel groups. The 1024 layout wins on 22/24 Kodak images
+        // and is always deepened; the 256 layout is deepened only when its first
+        // stage already estimates smaller, and the full estimates then decide
+        // (23/24 correct there, where the first stage alone is right 18/24).
+        // Layouts are processed one at a time so a single sample set is alive.
+        // Everything else keeps the codestream default.
+        let layouts: &[GroupLayout] =
+            if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
+                &[GroupLayout::LARGE, GroupLayout::DEFAULT]
+            } else {
+                &[GroupLayout::DEFAULT]
+            };
+        let (layout, rgb_coarse_est, mut learned_tree_decisive) = {
+            let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type);
+            let mut learned_estimated_savings: Option<f64> = None;
+            let learned = if rank_rgb {
+                learn_best_layout(
+                    &rgb_source,
+                    xsize,
+                    ysize,
+                    layouts,
+                    min_symbol,
+                    wp_params,
+                    use_wp,
+                    f64::INFINITY,
+                    false,
+                    rgb_seed,
+                    pool,
+                    scratch,
+                )
+            } else {
+                None
+            };
+            let rgb_coarse_est = learned.as_ref().map_or(f64::INFINITY, |(_, _, e)| *e);
+            rgb_final_est = learned
+                .as_ref()
+                .map_or(f64::INFINITY, |(_, c, _)| c.est_real);
+            let layout = learned.as_ref().map_or(layouts[0], |(l, _, _)| *l);
+
+            // Learned MA context tree (v2): greedy learned tree over the standard
+            // property vector with per-leaf predictors.
+            if let Some((_, cand, _)) = &learned {
+                let mut candidate = BitWriter::new();
+                let estimated_savings = write_learned_tree_frame(
+                    &rgb_source,
+                    alpha.is_some(),
+                    xsize,
+                    ysize,
+                    layout,
+                    min_symbol,
+                    pool,
+                    scratch,
+                    wp_params,
+                    use_wp,
+                    cand,
+                    &mut candidate,
+                );
+                learned_estimated_savings = Some(estimated_savings);
+                keep_smaller_writer(&mut best_tree_writer, candidate);
+            }
+            (
+                layout,
+                rgb_coarse_est,
+                learned_estimated_savings.is_some_and(learned_tree_is_decisive),
+            )
+        };
+        if learned_tree_decisive {
+            // Only the original YCoCg planes are needed for the remaining palette
+            // candidate. A decisive learned tree never returns to the RCT-based
+            // v1/flat paths, so release those full-image planes before palette work.
+            rct_planes = None;
+        }
+
+        // Global palette (<= 1024 colors) with its own learned tree, WP preset,
+        // layout and literal/LZ77 choice over the index image. libjxl's e7
+        // lossless gains ~10% from it on palette graphics; the complete frame
+        // competes on size, and a decisive palette tree ends the search like a
+        // decisive RGB tree does.
+        if rank_pal && let Some(palette) = &palette {
+            let palette_source = palette.source(xsize, ysize);
+            let coarse_limit = rgb_coarse_est * PALETTE_COARSE_MARGIN;
+            if let Some((palette_layout, cand, _)) = learn_best_layout(
+                &palette_source,
+                xsize,
+                ysize,
+                layouts,
+                min_symbol,
+                pal_wp,
+                use_wp,
+                coarse_limit,
+                true,
+                pal_seed,
+                pool,
+                scratch,
+            ) {
+                let palette_can_win = cand.est_real <= rgb_final_est * PALETTE_FINAL_MARGIN;
+                // The frame write (tokenize, code, sections) is the palette candidate's
+                // most expensive step after the learn; a final estimate clearly behind
+                // the RGB frame's cannot win the size comparison (a 3,195-color
+                // screenshot: ratio 1.24, frame +19%; a gray-image tie at 1.000 still writes).
+                if palette_can_win {
+                    let mut candidate = BitWriter::new();
+                    let estimated_savings = write_learned_tree_frame(
+                        &palette_source,
+                        alpha.is_some(),
+                        xsize,
+                        ysize,
+                        palette_layout,
+                        min_symbol,
+                        pool,
+                        scratch,
+                        pal_wp,
+                        use_wp,
+                        &cand,
+                        &mut candidate,
+                    );
+                    if learned_tree_is_decisive(estimated_savings) {
+                        learned_tree_decisive = true;
+                        rct_planes = None;
+                    }
+                    keep_smaller_writer(&mut best_tree_writer, candidate);
+                }
+            }
+        }
+        (layout, learned_tree_decisive)
+    };
+
+    if learned_tree_decisive {
+        writer.append(
+            best_tree_writer
+                .as_ref()
+                .expect("decisive learned-tree candidate"),
+        );
+        return true;
+    }
+
+    let gdim = layout.dim();
+    let xsize_groups = xsize.div_ceil(gdim);
+    let ysize_groups = ysize.div_ceil(gdim);
+    let num_ac_groups = xsize_groups * ysize_groups;
+    let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
+    let single_group = num_ac_groups == 1;
+
+    let linear = rct_planes.as_ref().unwrap_or(ycocg);
+    // Per-channel predictor search for the v1 context tree and flat paths
+    // (deferred: a decisive learned tree never needs it).
     let predictors = if adaptive_search {
         choose_predictors_with_wp(
-            linear, alpha, xsize, ysize, pool, scratch, wp_params, use_wp,
+            linear, alpha, xsize, ysize, num_color, pool, scratch, wp_params, use_wp,
         )
     } else {
         [fixed_predictor(use_wp); 4]
@@ -797,68 +1007,6 @@ fn encode_frame_lossless_core_impl(
         v
     };
 
-    // The estimates below remain useful prefilters, but Slow mode keeps every
-    // viable finalist and compares its complete byte-aligned frame against the
-    // v1 and flat alternatives. Tree headers, clustering, hybrid uint choices,
-    // and LZ77 can otherwise reverse the order predicted from residual entropy.
-    let compare_tree_candidates = frame_kind.is_regular()
-        && adaptive_search
-        && num_color == 3
-        && decoding_speed.use_ma_trees();
-    let mut best_tree_writer: Option<BitWriter> = None;
-    let mut learned_estimated_savings: Option<f64> = None;
-
-    // Learned MA context tree (v2): greedy learned tree over the standard
-    // property vector with per-leaf predictors.
-    if compare_tree_candidates {
-        let mut candidate = BitWriter::new();
-        if single_group {
-            if let Some(estimated_savings) = try_encode_learned_tree_single_group(
-                linear,
-                alpha,
-                xsize,
-                ysize,
-                min_symbol,
-                rct_type,
-                pool,
-                scratch,
-                wp_params,
-                use_wp,
-                &mut candidate,
-            ) {
-                learned_estimated_savings = Some(estimated_savings);
-                keep_smaller_writer(&mut best_tree_writer, candidate);
-            }
-        } else if let Some(estimated_savings) = try_encode_learned_tree_multi_group(
-            linear,
-            alpha,
-            xsize,
-            ysize,
-            xsize_groups,
-            ysize_groups,
-            num_dc_groups,
-            min_symbol,
-            rct_type,
-            pool,
-            scratch,
-            wp_params,
-            use_wp,
-            &mut candidate,
-        ) {
-            learned_estimated_savings = Some(estimated_savings);
-            keep_smaller_writer(&mut best_tree_writer, candidate);
-        }
-    }
-
-    if learned_estimated_savings.is_some_and(learned_tree_is_decisive) {
-        writer.append(
-            best_tree_writer
-                .as_ref()
-                .expect("decisive learned-tree candidate"),
-        );
-        return;
-    }
-
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
@@ -870,6 +1018,7 @@ fn encode_frame_lossless_core_impl(
                 alpha,
                 xsize,
                 ysize,
+                layout,
                 &predictors,
                 min_symbol,
                 rct_type,
@@ -885,6 +1034,7 @@ fn encode_frame_lossless_core_impl(
             alpha,
             xsize,
             ysize,
+            layout,
             &predictors,
             xsize_groups,
             ysize_groups,
@@ -912,7 +1062,7 @@ fn encode_frame_lossless_core_impl(
             &mut *writer
         };
 
-        write_frame_header_modular_kind(alpha.is_some(), frame_kind, writer);
+        write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
 
         if single_group {
             // Single section: GroupHeader + local tree + pixel histograms + pixels.
@@ -995,64 +1145,65 @@ fn encode_frame_lossless_core_impl(
             // resulting LzToken streams to build a single global prefix code so
             // every per-group emission is guaranteed to be representable.
             let distance_ctx = nb_chans as u32;
-            let deep_lz = (speed == crate::Speed::Slow)
-                .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
-            let group_lz_tokens: Vec<Vec<LzToken>> = pool.steal_map_with_threads(
-                scratch,
-                num_ac_groups,
-                group_lz_threads(speed, pool),
-                |group_index, scratch| {
-                    let gx = group_index % xsize_groups;
-                    let gy = group_index / xsize_groups;
-                    let x0 = gx * GROUP_DIM;
-                    let y0 = gy * GROUP_DIM;
-                    let gw = GROUP_DIM.min(xsize - x0);
-                    let gh = GROUP_DIM.min(ysize - y0);
-                    if speed == crate::Speed::Slow {
-                        let channel_tokens = tokenize_channels_with_wp(
-                            linear,
-                            alpha,
-                            xsize,
-                            ysize,
-                            x0,
-                            y0,
-                            gw,
-                            gh,
-                            num_color,
-                            &chan_preds,
-                            grad_pack_fn,
-                            pool,
-                            scratch,
-                            wp_params,
-                        );
-                        deep_lz.as_ref().unwrap().with_depth(|depth| {
-                            lz77_compress_channels_for_speed_with_depth(
-                                channel_tokens,
-                                distance_ctx,
-                                speed,
-                                depth,
+            let group_lz_tokens: Vec<Vec<LzToken>> = {
+                let deep_lz = (speed == crate::Speed::Slow)
+                    .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
+                pool.steal_map_with_threads(
+                    scratch,
+                    num_ac_groups,
+                    group_lz_threads(speed, pool),
+                    |group_index, scratch| {
+                        let gx = group_index % xsize_groups;
+                        let gy = group_index / xsize_groups;
+                        let x0 = gx * gdim;
+                        let y0 = gy * gdim;
+                        let gw = gdim.min(xsize - x0);
+                        let gh = gdim.min(ysize - y0);
+                        if speed == crate::Speed::Slow {
+                            let channel_tokens = tokenize_channels_with_wp(
+                                linear,
+                                alpha,
+                                xsize,
+                                ysize,
+                                x0,
+                                y0,
+                                gw,
+                                gh,
+                                num_color,
+                                &chan_preds,
+                                grad_pack_fn,
+                                pool,
                                 scratch,
+                                wp_params,
+                            );
+                            deep_lz.as_ref().unwrap().with_depth(|depth| {
+                                lz77_compress_channels_for_speed_with_depth(
+                                    channel_tokens,
+                                    distance_ctx,
+                                    speed,
+                                    depth,
+                                    scratch,
+                                )
+                            })
+                        } else {
+                            tokenize_runs_with_wp(
+                                linear,
+                                alpha,
+                                xsize,
+                                x0,
+                                y0,
+                                gw,
+                                gh,
+                                num_color,
+                                &chan_preds,
+                                grad_pack_fn,
+                                scratch,
+                                wp_params,
                             )
-                        })
-                    } else {
-                        tokenize_runs_with_wp(
-                            linear,
-                            alpha,
-                            xsize,
-                            x0,
-                            y0,
-                            gw,
-                            gh,
-                            num_color,
-                            &chan_preds,
-                            grad_pack_fn,
-                            scratch,
-                            wp_params,
-                        )
-                    }
-                },
-            );
-            drop(deep_lz);
+                        }
+                    },
+                )
+            };
             // ----- Section 0: DC global -----
             if let ModularFrameKind::Patched(references) = frame_kind {
                 write_patch_dictionary(references, alpha.is_some(), scratch, &mut sections[0]);
@@ -1094,28 +1245,15 @@ fn encode_frame_lossless_core_impl(
             write_wp_header(wp_params, &mut sections[ac_global_idx]);
             sections[ac_global_idx].zero_pad_to_byte();
 
-            // ----- AC groups: pixel data per group -----
-            for gy in 0..ysize_groups {
-                for gx in 0..xsize_groups {
-                    let group_index = gy * xsize_groups + gx;
-                    let section_idx = 2 + num_dc_groups + group_index;
-
-                    // GroupHeader: use_global_tree=1, wp=1, 0 transforms (the global
-                    // header already declared the RCT for the whole image).
-                    sections[section_idx].write(1, 1);
-                    write_wp_header(wp_params, &mut sections[section_idx]);
-                    sections[section_idx].write(2, 0);
-
-                    write_lz_section(
-                        &group_lz_tokens[group_index],
-                        distance_ctx,
-                        &code,
-                        min_symbol,
-                        &mut sections[section_idx],
-                    );
-                    sections[section_idx].zero_pad_to_byte();
-                }
-            }
+            write_lz_groups(
+                &group_lz_tokens,
+                &code,
+                distance_ctx,
+                min_symbol,
+                wp_params,
+                pool,
+                &mut sections[2 + num_dc_groups..],
+            );
 
             // TOC.
             writer.write(1, 0);
@@ -1133,6 +1271,7 @@ fn encode_frame_lossless_core_impl(
         keep_smaller_writer(&mut best_tree_writer, flat_writer);
         writer.append(best_tree_writer.as_ref().expect("flat lossless candidate"));
     }
+    false
 }
 
 fn write_u64(value: u64, w: &mut BitWriter) {
@@ -1167,10 +1306,15 @@ fn write_frame_dimension(value: usize, w: &mut BitWriter) {
     }
 }
 
-fn write_frame_header_modular_kind(has_alpha: bool, kind: ModularFrameKind<'_>, w: &mut BitWriter) {
+fn write_frame_header_modular_kind(
+    has_alpha: bool,
+    kind: ModularFrameKind<'_>,
+    layout: GroupLayout,
+    w: &mut BitWriter,
+) {
     match kind {
-        ModularFrameKind::Regular => write_frame_header_modular(has_alpha, w),
-        ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, w),
+        ModularFrameKind::Regular => write_frame_header_modular(has_alpha, layout, w),
+        ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, layout, w),
         ModularFrameKind::ReferenceOnly { width, height } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
@@ -1181,7 +1325,7 @@ fn write_frame_header_modular_kind(has_alpha: bool, kind: ModularFrameKind<'_>, 
             if has_alpha {
                 w.write(2, 0); // extra-channel upsampling = 1
             }
-            w.write(2, 1); // group_size_shift = 1
+            w.write(2, layout.shift as u64);
             // Reference-only frames do not serialize Passes.
             w.write(1, 1); // custom size
             write_frame_dimension(width, w);
@@ -1219,7 +1363,7 @@ fn write_frame_header_modular_xyb_reference(
     if has_alpha {
         w.write(2, 0); // ec_upsampling[0] = 1
     }
-    w.write(2, 1); // group_size_shift = 1 (256-pixel groups)
+    w.write(2, GroupLayout::DEFAULT.shift as u64);
     // Reference-only frames do not serialize Passes.
     w.write(1, 1); // custom size
     write_frame_dimension(width, w);
@@ -1334,9 +1478,9 @@ pub(crate) fn encode_modular_xyb_atlas(
         } else {
             vec![fixed_predictor(use_wp); 2]
         };
-        tokenize_plane(
+        tokenize_plane_rows(
             channel_to_context(0, 2),
-            pget,
+            |y| &palette_ch[y * nb_colors..][..nb_colors],
             nb_colors,
             num_c,
             preds[0],
@@ -1344,9 +1488,9 @@ pub(crate) fn encode_modular_xyb_atlas(
             &mut scratch.gradient,
             &mut tokens,
         );
-        tokenize_plane(
+        tokenize_plane_rows(
             channel_to_context(1, 2),
-            iget,
+            |y| &index_img[y * xsize..][..xsize],
             xsize,
             ysize,
             preds[1],
@@ -1365,9 +1509,9 @@ pub(crate) fn encode_modular_xyb_atlas(
             } else {
                 fixed_predictor(use_wp)
             };
-            tokenize_plane(
+            tokenize_plane_rows(
                 channel_to_context(c, num_c),
-                get,
+                |y| &data[y * xsize..][..xsize],
                 xsize,
                 ysize,
                 pred,
@@ -1440,11 +1584,16 @@ pub(crate) fn encode_modular_xyb_atlas(
     true
 }
 
-fn write_frame_header_modular(has_alpha: bool, w: &mut BitWriter) {
-    write_frame_header_modular_flags(has_alpha, 0, w);
+fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
+    write_frame_header_modular_flags(has_alpha, 0, layout, w);
 }
 
-fn write_frame_header_modular_flags(has_alpha: bool, flags: u64, w: &mut BitWriter) {
+fn write_frame_header_modular_flags(
+    has_alpha: bool,
+    flags: u64,
+    layout: GroupLayout,
+    w: &mut BitWriter,
+) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
@@ -1454,7 +1603,7 @@ fn write_frame_header_modular_flags(has_alpha: bool, flags: u64, w: &mut BitWrit
     if has_alpha {
         w.write(2, 0b00);
     }
-    w.write(2, 0b01); // group_size_shift = 1 (256-pixel groups)
+    w.write(2, layout.shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false
     w.write(2, 0b00); // blending = Replace
@@ -1518,2220 +1667,14 @@ pub(crate) fn write_patch_dictionary(
     }
 }
 
-/// rct_type: U32(Val(6), Bits(2), BitsOffset(4,2), BitsOffset(6,10)), 0..41.
-fn write_rct_type(rct_type: u32, w: &mut BitWriter) {
-    debug_assert!(rct_type < 42);
-    if rct_type == 6 {
-        w.write(2, 0b00);
-    } else if rct_type < 4 {
-        w.write(2, 0b01);
-        w.write(2, rct_type as u64);
-    } else if rct_type < 18 {
-        w.write(2, 0b10);
-        w.write(4, (rct_type - 2) as u64);
-    } else {
-        w.write(2, 0b11);
-        w.write(6, (rct_type - 10) as u64);
-    }
-}
-
 fn write_modular_transforms(nb_chans: usize, rct_type: u32, w: &mut BitWriter) {
     if nb_chans >= 3 {
         // transforms count u2S(0, 1, Bits(4)+2, Bits(8)+18): selector 1 = Val(1) → 1 transform.
         w.write(2, 0b01);
-        // Transform[0]:
-        //   id Bits(2)            = 0 (RCT)
-        //   begin_channel u2S(Bits(3), ...): selector 0 = Bits(3) → value 0 = 5 bits "00000"
-        w.write(2, 0b00); // id = RCT (Bits(2))
-        w.write(2, 0b00); // begin_channel selector 0
-        w.write(3, 0); // begin_channel value (Bits(3)) = 0
-        write_rct_type(rct_type, w);
+        write_rct_transform(rct_type, w);
     } else {
         w.write(2, 0b00); // 0 transforms
     }
-}
-
-/// Transform list for RCT + a Squeeze with the given step sequence.
-/// Byte-exact to libjxl Transform/SqueezeParams field encoding.
-fn write_modular_transforms_rct_squeeze(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
-    // transforms count = 2 -> selector 2 + Bits(4)=0.
-    w.write(2, 0b10);
-    w.write(4, 0);
-    // Transform[0] = RCT (YCoCg), begin_c=0.
-    w.write(2, 0b00);
-    w.write(2, 0b00);
-    w.write(3, 0);
-    w.write(2, 0b00);
-    write_squeeze_transform_entry(steps, w);
-}
-
-/// Transform list holding a single Squeeze (XYB channels are already
-/// decorrelated, so no RCT precedes it).
-fn write_modular_transforms_squeeze_only(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
-    w.write(2, 0b01); // transforms count = 1 (Val(1))
-    write_squeeze_transform_entry(steps, w);
-}
-
-/// One Squeeze transform entry with an explicit step sequence.
-fn write_squeeze_transform_entry(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
-    w.write(2, 0b10); // id = kSqueeze
-    // num_squeezes: U32(Val0, BitsOffset(4,1), BitsOffset(6,9), BitsOffset(8,41)).
-    let n = steps.len() as u32;
-    if n == 0 {
-        w.write(2, 0b00);
-    } else if n <= 16 {
-        w.write(2, 0b01);
-        w.write(4, (n - 1) as u64);
-    } else if n <= 72 {
-        w.write(2, 0b10);
-        w.write(6, (n - 9) as u64);
-    } else {
-        w.write(2, 0b11);
-        w.write(8, (n - 41) as u64);
-    }
-    for s in steps {
-        w.write(1, if s.horizontal { 1 } else { 0 });
-        w.write(1, if s.in_place { 1 } else { 0 });
-        // begin_c: U32(Bits3, ...): for small values use selector 0 = Bits(3).
-        debug_assert!(s.begin_c < 8);
-        w.write(2, 0b00);
-        w.write(3, s.begin_c as u64);
-        // num_c: U32(Val1,Val2,Val3,BitsOffset(4,4)).
-        match s.num_c {
-            1 => w.write(2, 0b00),
-            2 => w.write(2, 0b01),
-            3 => w.write(2, 0b10),
-            n => {
-                w.write(2, 0b11);
-                w.write(4, (n - 4) as u64);
-            }
-        }
-    }
-}
-
-/// Progressive-lossless single-group path. Applies the alternating Squeeze
-/// pyramid to the RCT'd channels, then tokenizes the resulting channels with
-/// fixed Weighted prediction in Fast mode or adaptive prediction in Slow mode.
-/// The decoder reconstructs the input exactly through inverse-Squeeze + inverse-RCT.
-fn encode_squeeze_single_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    min_symbol: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    speed: crate::Speed,
-    use_wp: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) {
-    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
-    // Lift the 3 RCT'd planes (and alpha, if present) into channels.
-    let num_c = if alpha.is_some() { 4 } else { 3 };
-    let mut channels: Vec<Channel> = Vec::with_capacity(num_c);
-    for c in 0..3usize {
-        let mut ch = Channel::new(xsize, ysize);
-        for y in 0..ysize {
-            let row = linear.plane_row(c, y);
-            ch.data[y * xsize..y * xsize + xsize].copy_from_slice(&row[..xsize]);
-        }
-        channels.push(ch);
-    }
-    if let Some(a) = alpha {
-        let mut ch = Channel::new(xsize, ysize);
-        match a {
-            AlphaPlane::U8(data) => {
-                for (row, src_row) in ch
-                    .data
-                    .chunks_exact_mut(xsize)
-                    .zip(data.chunks_exact(xsize))
-                {
-                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
-                        *dst = src as i32;
-                    }
-                }
-            }
-            AlphaPlane::U16 { data, bits: _ } => {
-                for (row, src_row) in ch
-                    .data
-                    .chunks_exact_mut(xsize)
-                    .zip(data.chunks_exact(xsize))
-                {
-                    for (dst, &src) in row[..xsize].iter_mut().zip(src_row.iter()) {
-                        *dst = src as i32;
-                    }
-                }
-            }
-            AlphaPlane::F32(data) => {
-                for (row, src_row) in ch
-                    .data
-                    .chunks_exact_mut(xsize)
-                    .zip(data.chunks_exact(xsize))
-                {
-                    row[..xsize].copy_from_slice(&src_row[..xsize]);
-                }
-            }
-        }
-        channels.push(ch);
-    }
-    // Apply the alternating H/V pyramid over all channels (explicit sequence).
-    let steps = default_squeeze_steps(xsize, ysize, num_c);
-    for s in &steps {
-        apply_step_forward(&mut channels, s);
-    }
-    let nb = channels.len();
-
-    // Slow searches the useful general and directional predictors per channel;
-    // Fast avoids the analysis pass and uses fixed Weighted prediction.
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        pool.steal_map(scratch, channels.len(), |c, _scratch| {
-            let ch = &channels[c];
-            let data = &ch.data;
-            let w = ch.w;
-            let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            choose_predictor_for_plane(get, ch.w, ch.h, use_wp)
-        })
-    } else {
-        vec![fixed_predictor(use_wp); nb]
-    };
-    let channel_tokens = pool.steal_map(scratch, nb, |c, scratch| {
-        let ch = &channels[c];
-        let mut tokens = Vec::with_capacity(ch.w * ch.h);
-        tokenize_plane(
-            channel_to_context(c, nb),
-            |x, y| ch.data[y * ch.w + x],
-            ch.w,
-            ch.h,
-            predictors[c],
-            grad_pack_fn,
-            &mut scratch.gradient,
-            &mut tokens,
-        );
-        tokens
-    });
-    let mut tokens: Vec<Token> = Vec::new();
-    for channel in channel_tokens {
-        tokens.extend(channel);
-    }
-
-    write_frame_header_modular(alpha.is_some(), writer);
-    let mut section = BitWriter::new();
-    section.write(1, 1); // dc_quant all_default = 1
-    section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
-    section.write(1, 0); // use_global_tree = 0
-    section.write(1, 1); // wp_default = 1
-    write_modular_transforms_rct_squeeze(&steps, &mut section);
-
-    let distance_ctx = nb as u32;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
-    let code = build_lz_pixel_code(
-        std::iter::once(lz_tokens.as_slice()),
-        nb,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-    write_local_tree_lz77(
-        &predictors,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut section,
-    );
-    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
-    section.zero_pad_to_byte();
-
-    writer.write(1, 0); // no permutation
-    writer.zero_pad_to_byte();
-    write_toc_entry(section.bits_written() / 8, writer);
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(std::slice::from_mut(&mut section));
-    writer.zero_pad_to_byte();
-}
-
-/// Stage-2 progressive lossless, multi-group (image > one AC group).
-///
-/// Applies the Squeeze pyramid to the whole frame, then splits channels per the
-/// JXL rule: channels that fit a group form the global modular image (LfGlobal /
-/// section 0); larger channels are partitioned into AC groups, each carrying the
-/// `frame_rect >> shift` crop of every large channel. A single global tree (chain
-/// on the channel property) serves all streams; the within-group channel index is
-/// what the tree sees, so group crops share contexts with the leading globals.
-#[derive(Default)]
-struct SqueezePredictorCost {
-    costs: PredictorCosts,
-}
-
-impl SqueezePredictorCost {
-    fn with_zero() -> Self {
-        let mut c = Self::default();
-        c.costs.collect_zero = true;
-        c
-    }
-
-    fn safe_predictor(&self) -> u32 {
-        self.costs.best_safe_predictor()
-    }
-
-    /// Add one independently predicted modular crop. Weighted prediction state
-    /// resets here because the decoder resets it for every modular sub-image.
-    fn add_crop(&mut self, get: impl Fn(usize, usize) -> i32, w: usize, h: usize, use_wp: bool) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        let disabled = !use_wp;
-        let mut wp = WpState::new(w);
-        for y in 0..h {
-            for x in 0..w {
-                let value = get(x, y) as i64;
-                let neighbors = predictor_neighbors(&get, x, y, w);
-                let weighted = if disabled {
-                    0
-                } else {
-                    wp.predict(
-                        x,
-                        y,
-                        neighbors.top,
-                        neighbors.left,
-                        neighbors.top_right,
-                        neighbors.top_left,
-                        neighbors.top_top,
-                    )
-                };
-                self.costs.add(value, neighbors, weighted);
-                if !disabled {
-                    wp.update(value, x, y);
-                }
-            }
-        }
-    }
-
-    fn predictor(&self, use_wp: bool) -> u32 {
-        self.costs.best_predictor(use_wp)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn for_each_squeeze_group_crop(
-    channels: &[crate::squeeze::Channel],
-    split: usize,
-    gdim: usize,
-    gx: usize,
-    gy: usize,
-    minsh: i32,
-    maxsh: i32,
-    mut visit: impl FnMut(usize, usize, usize, usize, usize, usize),
-) {
-    let mut within = 0usize;
-    for c in split..channels.len() {
-        let ch = &channels[c];
-        let msh = ch.hshift.min(ch.vshift);
-        if msh < minsh || msh > maxsh {
-            continue;
-        }
-        let hs = ch.hshift as usize;
-        let vs = ch.vshift as usize;
-        let rx0 = (gx * gdim) >> hs;
-        let ry0 = (gy * gdim) >> vs;
-        if rx0 >= ch.w || ry0 >= ch.h {
-            continue;
-        }
-        let rw = (gdim >> hs).min(ch.w - rx0);
-        let rh = (gdim >> vs).min(ch.h - ry0);
-        if rw == 0 || rh == 0 {
-            continue;
-        }
-        visit(within, c, rx0, ry0, rw, rh);
-        within += 1;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn encode_squeeze_multigroup(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    min_symbol: u32,
-    xsize_groups: usize,
-    ysize_groups: usize,
-    xsize_dc_groups: usize,
-    ysize_dc_groups: usize,
-    num_dc_groups: usize,
-    num_ac_groups: usize,
-    grad_pack_fn: GradPackInteriorFn,
-    speed: crate::Speed,
-    use_wp: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) -> bool {
-    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
-    let num_c = if alpha.is_some() { 4 } else { 3 };
-    let mut channels: Vec<Channel> = Vec::with_capacity(num_c);
-    for c in 0..3usize {
-        let mut ch = Channel::new(xsize, ysize);
-        for y in 0..ysize {
-            let row = linear.plane_row(c, y);
-            ch.data[y * xsize..y * xsize + xsize].copy_from_slice(&row[..xsize]);
-        }
-        channels.push(ch);
-    }
-    if let Some(a) = alpha {
-        let mut ch = Channel::new(xsize, ysize);
-        for y in 0..ysize {
-            for x in 0..xsize {
-                ch.data[y * xsize + x] = a.get_i32(y * xsize + x);
-            }
-        }
-        channels.push(ch);
-    }
-    let steps = default_squeeze_steps(xsize, ysize, num_c);
-    for s in &steps {
-        apply_step_forward(&mut channels, s);
-    }
-    let nb = channels.len();
-
-    // Channel -> stream split (JXL rule): the leading run of channels that fit a
-    // group is the global modular image; the first channel still larger than a
-    // group starts the suffix that is partitioned into AC groups.
-    let split = channels
-        .iter()
-        .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
-        .unwrap_or(nb);
-
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        // The MA tree sees a channel's position inside each modular sub-image,
-        // not its index in `channels`. Pool costs by that decoder-visible slot.
-        let mut costs: Vec<SqueezePredictorCost> =
-            (0..nb).map(|_| SqueezePredictorCost::default()).collect();
-        for c in 0..split {
-            let ch = &channels[c];
-            costs[c].add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h, use_wp);
-        }
-        for gy in 0..ysize_dc_groups {
-            for gx in 0..xsize_dc_groups {
-                for_each_squeeze_group_crop(
-                    &channels,
-                    split,
-                    LF_GROUP_DIM,
-                    gx,
-                    gy,
-                    3,
-                    1000,
-                    |within, c, x0, y0, w, h| {
-                        let ch = &channels[c];
-                        costs[within].add_crop(
-                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
-                            w,
-                            h,
-                            use_wp,
-                        );
-                    },
-                );
-            }
-        }
-        for gy in 0..ysize_groups {
-            for gx in 0..xsize_groups {
-                for_each_squeeze_group_crop(
-                    &channels,
-                    split,
-                    GROUP_DIM,
-                    gx,
-                    gy,
-                    0,
-                    2,
-                    |within, c, x0, y0, w, h| {
-                        let ch = &channels[c];
-                        costs[within].add_crop(
-                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
-                            w,
-                            h,
-                            use_wp,
-                        );
-                    },
-                );
-            }
-        }
-        costs.iter().map(|c| c.predictor(use_wp)).collect()
-    } else {
-        vec![fixed_predictor(use_wp); nb]
-    };
-
-    let distance_ctx = nb as u32;
-
-    // Global stream: the small channels [0, split), whole.
-    let global_channel_tokens = pool.steal_map(scratch, split, |c, scratch| {
-        let ch = &channels[c];
-        let ctx = channel_to_context(c, nb);
-        let data = &ch.data;
-        let w = ch.w;
-        let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        let mut tokens = Vec::with_capacity(ch.w * ch.h);
-        tokenize_plane(
-            ctx,
-            get,
-            ch.w,
-            ch.h,
-            predictors[c],
-            grad_pack_fn,
-            &mut scratch.gradient,
-            &mut tokens,
-        );
-        tokens
-    });
-    let mut global_tokens: Vec<Token> = Vec::new();
-    for channel in global_channel_tokens {
-        global_tokens.extend(channel);
-    }
-    let global_lz = lz77_compress_for_speed(&global_tokens, distance_ctx, speed, scratch);
-
-    // One group's worth of cropped large-channel tokens. `gdim` is the group's
-    // frame-space size (GROUP_DIM for AC, LF_GROUP_DIM for DC); a channel is
-    // included when min(hshift,vshift) is inside [minsh,maxsh], and contributes
-    // its `(group_rect >> shift)` crop. The decoder rebuilds the same scan, so
-    // the within-group index (sequential over non-empty crops) is exactly the
-    // `chan` property the global tree keys on.
-    let deep_lz = (speed == crate::Speed::Slow)
-        .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
-    let crop_group = |gdim: usize,
-                      gx: usize,
-                      gy: usize,
-                      minsh: i32,
-                      maxsh: i32,
-                      scratch: &mut CoderScratch|
-     -> Vec<LzToken> {
-        let mut gtok: Vec<Token> = Vec::new();
-        for_each_squeeze_group_crop(
-            &channels,
-            split,
-            gdim,
-            gx,
-            gy,
-            minsh,
-            maxsh,
-            |within, c, rx0, ry0, rw, rh| {
-                let ch = &channels[c];
-                let ctx = channel_to_context(within, nb);
-                let pred = predictors[within];
-                let data = &ch.data;
-                let w = ch.w;
-                let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-                tokenize_plane(
-                    ctx,
-                    get,
-                    rw,
-                    rh,
-                    pred,
-                    grad_pack_fn,
-                    &mut scratch.gradient,
-                    &mut gtok,
-                );
-            },
-        );
-        if let Some(deep_lz) = &deep_lz {
-            deep_lz.with_depth(|depth| {
-                lz77_compress_for_speed_with_depth(&gtok, distance_ctx, speed, depth, scratch)
-            })
-        } else {
-            lz77_compress_for_speed(&gtok, distance_ctx, speed, scratch)
-        }
-    };
-
-    // DC (LF) groups carry the deeply-squeezed large channels (min shift >= 3),
-    // partitioned into LF_GROUP_DIM rects. Empty unless the image is large enough
-    // that a >=3x-squeezed channel still exceeds a group (dimension > ~2048).
-    let dc_group_lz = pool.steal_map_with_threads(
-        scratch,
-        num_dc_groups,
-        group_lz_threads(speed, pool),
-        |group_index, scratch| {
-            let gx = group_index % xsize_dc_groups;
-            let gy = group_index / xsize_dc_groups;
-            crop_group(LF_GROUP_DIM, gx, gy, 3, 1000, scratch)
-        },
-    );
-
-    // AC groups carry the shallow large channels (min shift <= 2), in GROUP_DIM rects.
-    let ac_group_lz = pool.steal_map_with_threads(
-        scratch,
-        num_ac_groups,
-        group_lz_threads(speed, pool),
-        |group_index, scratch| {
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            crop_group(GROUP_DIM, gx, gy, 0, 2, scratch)
-        },
-    );
-    drop(deep_lz);
-
-    let code = build_lz_pixel_code(
-        std::iter::once(global_lz.as_slice())
-            .chain(dc_group_lz.iter().map(Vec::as_slice))
-            .chain(ac_group_lz.iter().map(Vec::as_slice)),
-        nb,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-
-    write_frame_header_modular(alpha.is_some(), writer);
-
-    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
-    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
-
-    // ----- Section 0: LfGlobal = global tree + global modular image -----
-    sections[0].write(1, 1); // dc_quant all_default = 1
-    sections[0].write(1, 1); // has_tree = 1
-    write_local_tree_lz77(
-        &predictors,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut sections[0],
-    );
-    sections[0].write(1, 1); // use_global_tree = 1
-    sections[0].write(1, 1); // wp_default = 1
-    write_modular_transforms_rct_squeeze(&steps, &mut sections[0]);
-    write_lz_section(
-        &global_lz,
-        distance_ctx,
-        &code,
-        min_symbol,
-        &mut sections[0],
-    );
-    sections[0].zero_pad_to_byte();
-
-    // ----- DC groups: GroupHeader + any min-shift>=3 large-channel crops -----
-    for (k, section) in sections[1..num_dc_groups + 1].iter_mut().enumerate() {
-        section.write(1, 1); // use_global_tree
-        section.write(1, 1); // wp_default
-        section.write(2, 0); // 0 transforms (declared globally)
-        write_lz_section(&dc_group_lz[k], distance_ctx, &code, min_symbol, section);
-        section.zero_pad_to_byte();
-    }
-
-    // ----- AC global: trivial -----
-    let ac_global_idx = 1 + num_dc_groups;
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].zero_pad_to_byte();
-
-    // ----- AC groups: GroupHeader + the cropped large-channel tokens -----
-    for g in 0..num_ac_groups {
-        let idx = 2 + num_dc_groups + g;
-        sections[idx].write(1, 1); // use_global_tree
-        sections[idx].write(1, 1); // wp_default
-        sections[idx].write(2, 0); // 0 transforms (declared globally)
-        write_lz_section(
-            &ac_group_lz[g],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[idx],
-        );
-        sections[idx].zero_pad_to_byte();
-    }
-
-    // TOC + sections.
-    writer.write(1, 0); // no permutation
-    writer.zero_pad_to_byte();
-    for s in &sections {
-        write_toc_entry(s.bits_written() / 8, writer);
-    }
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(&mut sections);
-    writer.zero_pad_to_byte();
-    true
-}
-
-// ===================== Lossy modular (quantized Squeeze) =====================
-
-/// cjxl's per-squeeze-level quantization steps for XYB modular, indexed by the
-/// stored-channel color [Y, X, B-Y] and the (capped) squeeze depth. Values are
-/// integer lattice steps relative to the `LOSSY_MODULAR_XYB_SCALE` scaling.
-static SQUEEZE_XYB_QTABLE: [[f32; 16]; 3] = [
-    [
-        163.84, 81.92, 40.96, 20.48, 10.24, 5.12, 2.56, 1.28, 0.64, 0.32, 0.16, 0.08, 0.04, 0.02,
-        0.01, 0.005,
-    ], // Y
-    [
-        1024.0, 512.0, 256.0, 128.0, 64.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5,
-    ], // X
-    [
-        2048.0, 1024.0, 512.0, 256.0, 128.0, 64.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.5, 0.5,
-        0.5,
-    ], // B-Y
-];
-static SQUEEZE_QUALITY_FACTOR_XYB: f32 = 4.8;
-/// Per-color multipliers on the cjxl base rows (stored order [Y, X, B-Y]),
-/// Optuna study lossy_modular_v3 2026-09-02 (129 trials, crops+Kodak,
-/// holdout-validated): B-Y much finer — coarse B-Y measurably desaturates
-/// yellows (mean +2/255 blue shift) and SS2 punishes it; X detail is cheap to
-/// discard; Y slightly coarser pays for the chroma.
-static LM_ROW_MUL: [f32; 3] = [1.265, 1.704, 0.546];
-/// XYB float -> integer scale factors in X, Y, B order. Signaled to the decoder
-/// as custom dc_quant steps (their reciprocals); powers of two stay F16-exact.
-static LOSSY_MODULAR_XYB_SCALE: [f32; 3] = [65536.0, 4096.0, 4096.0];
-
-/// Quantization step for one squeezed channel (cjxl's schedule, including the
-/// float->int truncation).
-fn lossy_modular_q(color: usize, hshift: i32, vshift: i32, distance: f32) -> i32 {
-    let mut shift = (hshift + vshift).min(16);
-    if shift > 0 {
-        shift -= 1;
-    }
-    let quantizer = 0.25f32 * distance;
-    let q = quantizer
-        * SQUEEZE_QUALITY_FACTOR_XYB
-        * SQUEEZE_XYB_QTABLE[color][shift as usize]
-        * LM_ROW_MUL[color];
-    (q as i32).max(1)
-}
-
-/// Decoder predictors that are exactly scale-equivariant over an exact
-/// division (safe under a leaf multiplier): Zero, Left, Top, Select, Gradient
-/// and the plain neighbor predictors. Weighted and the averages are not.
-/// Map the caller's distance to the modular arm's quantizer distance so both
-/// arms land on comparable SS2 at the same `d` (fitted on the 8-image Kodak
-/// pilot; the byte-only auto gate depends on this). Piecewise linear through
-/// the measured knots, flat past the last one.
-pub(crate) fn lm_calibrated_distance(d: f32) -> f32 {
-    // Jointly re-fitted with LM_ROW_MUL (study lossy_modular_v3): the finer
-    // chroma shifts the arm's SS2-per-distance, so the knots moved with it.
-    static KNOTS: [(f32, f32); 4] = [(1.0, 1.255), (1.5, 1.532), (2.0, 1.888), (3.0, 2.238)];
-    let knots = KNOTS;
-    let k = if d <= knots[0].0 {
-        knots[0].1
-    } else if d >= knots[knots.len() - 1].0 {
-        knots[knots.len() - 1].1
-    } else {
-        let mut k = knots[0].1;
-        for w in knots.array_windows::<2>() {
-            let [(d0, k0), (d1, k1)] = [w[0], w[1]];
-            if d >= d0 && d <= d1 {
-                k = k0 + (k1 - k0) * (d - d0) / (d1 - d0);
-                break;
-            }
-        }
-        k
-    };
-    d * k
-}
-
-/// Per-tag MA sample budget; more samples plateaued (<=0.6%) in the 2026-09
-/// knob sweeps, as did larger leaf budgets and split-candidate counts.
-const LM_SAMPLE_TARGET: usize = 1 << 16;
-/// Learned-subtree leaf budget: pixels/div, clamped.
-const LM_BUDGET_DIV: usize = 1024;
-const LM_BUDGET_CAP: usize = 256;
-
-const LM_SAFE_PRED_MASK: u16 =
-    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 9);
-
-/// Rescale the value-derived MA properties (libjxl ids 4..=14) by `q`:
-/// sampling ran on the divided channel, but the decoder computes properties on
-/// the full-scale reconstruction.
-fn scale_ma_value_props(samples: &mut MaSamples, q: i32) {
-    if q <= 1 {
-        return;
-    }
-    for p in samples.props.iter_mut() {
-        for v in &mut p[4..=14] {
-            *v *= q;
-        }
-    }
-}
-
-/// Tokenize a (divided) channel rectangle through a learned tree whose splits
-/// live in the full-scale property domain. `base` is the tag's node offset in
-/// the merged forest arena; `leaf_ctx` is arena-indexed.
-#[allow(clippy::too_many_arguments)]
-fn tokenize_channel_ma_mult<F: Fn(usize, usize) -> i32>(
-    get: &F,
-    gw: usize,
-    gh: usize,
-    chan: u32,
-    q: i32,
-    tree: &LearnedTree,
-    leaf_ctx: &[u32],
-    base: u32,
-    out: &mut Vec<Token>,
-) {
-    walk_channel_ma(
-        get,
-        gw,
-        gh,
-        chan,
-        WpParams::DEFAULT,
-        false,
-        |_x, _y, v, p, n, _wp_pred| {
-            let (node, pred) = if q > 1 {
-                let mut sp = *p;
-                for s in &mut sp[4..=14] {
-                    *s *= q;
-                }
-                tree.lookup(&sp)
-            } else {
-                tree.lookup(p)
-            };
-            let pv = predictor_value(pred, n, 0);
-            out.push(Token::new(
-                leaf_ctx[(base + node) as usize],
-                pack_signed((v - pv) as i32),
-            ));
-        },
-    );
-}
-
-/// Merge the per-tag learned subtrees under the stream/channel routing
-/// skeleton and BFS-emit the whole forest, stamping every leaf with its tag's
-/// residual multiplier. The skeleton splits on the static stream-id property:
-/// 0 = LfGlobal stream, [1+ndc, 2ndc] = DC-group streams, and AC-group
-/// streams above both; each side hangs a channel / slot chain. Tags are
-/// ordered [global channels][DC slots][AC slots]. Returns the tree tokens,
-/// the arena-indexed leaf context table, each tag's arena base, and the
-/// context count.
-fn emit_lm_forest(
-    trees: &[LearnedTree],
-    tag_mults: &[u32],
-    split: usize,
-    n_dc_slots: usize,
-    num_dc_groups: usize,
-) -> (Vec<Token>, Vec<u32>, Vec<u32>, u32) {
-    use std::collections::VecDeque;
-    let n_tags = trees.len();
-    let n_ac_slots = n_tags - split - n_dc_slots;
-    debug_assert!(split > 0 && n_ac_slots > 0);
-    let mut nodes: Vec<MaNode> = Vec::new();
-    let mut mult_of: Vec<u32> = Vec::new();
-    let mut tag_base = vec![0u32; n_tags];
-
-    let append_tree = |nodes: &mut Vec<MaNode>, mult_of: &mut Vec<u32>, t: usize| -> u32 {
-        let base = nodes.len() as u32;
-        for n in &trees[t].nodes {
-            nodes.push(match *n {
-                MaNode::Split { prop, val, gt, le } => MaNode::Split {
-                    prop,
-                    val,
-                    gt: gt + base,
-                    le: le + base,
-                },
-                MaNode::Leaf { pred } => MaNode::Leaf { pred },
-            });
-            mult_of.push(tag_mults[t]);
-        }
-        base
-    };
-    // Per-side chains over property 0 (the decoder-visible channel value:
-    // channel index in the global stream, within-group slot in group streams).
-    let build_chain = |nodes: &mut Vec<MaNode>,
-                       mult_of: &mut Vec<u32>,
-                       tag_base: &mut [u32],
-                       lo: usize,
-                       n: usize|
-     -> u32 {
-        let base0 = append_tree(nodes, mult_of, lo);
-        tag_base[lo] = base0;
-        let mut acc = base0;
-        for k in 1..n {
-            let sub = append_tree(nodes, mult_of, lo + k);
-            tag_base[lo + k] = sub;
-            nodes.push(MaNode::Split {
-                prop: 0,
-                val: (k - 1) as i32,
-                gt: sub,
-                le: acc,
-            });
-            mult_of.push(1);
-            acc = (nodes.len() - 1) as u32;
-        }
-        acc
-    };
-    let global_root = build_chain(&mut nodes, &mut mult_of, &mut tag_base, 0, split);
-    let ac_root = build_chain(
-        &mut nodes,
-        &mut mult_of,
-        &mut tag_base,
-        split + n_dc_slots,
-        n_ac_slots,
-    );
-    let low_root = if n_dc_slots > 0 {
-        // DC streams exist: separate them from the global stream below the
-        // AC threshold.
-        let dc_root = build_chain(&mut nodes, &mut mult_of, &mut tag_base, split, n_dc_slots);
-        nodes.push(MaNode::Split {
-            prop: 1,
-            val: 0,
-            gt: dc_root,
-            le: global_root,
-        });
-        mult_of.push(1);
-        (nodes.len() - 1) as u32
-    } else {
-        global_root
-    };
-    // AC stream ids start at 1 + 3*ndc + kNumQuantTables, always above
-    // 2*ndc; global (0) and DC ([1+ndc, 2ndc]) stay at or below it.
-    nodes.push(MaNode::Split {
-        prop: 1,
-        val: (2 * num_dc_groups) as i32,
-        gt: ac_root,
-        le: low_root,
-    });
-    mult_of.push(1);
-    let root = (nodes.len() - 1) as u32;
-
-    // BFS emission (matches libjxl's FIFO tree decode).
-    let mut tokens = Vec::new();
-    let mut leaf_ctx = vec![u32::MAX; nodes.len()];
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    queue.push_back(root);
-    let mut ctx = 0u32;
-    while let Some(i) = queue.pop_front() {
-        match nodes[i as usize] {
-            MaNode::Split { prop, val, gt, le } => {
-                push_split(&mut tokens, prop as u32, val);
-                queue.push_back(gt);
-                queue.push_back(le);
-            }
-            MaNode::Leaf { pred } => {
-                push_leaf_mul(&mut tokens, pred, mult_of[i as usize]);
-                leaf_ctx[i as usize] = ctx;
-                ctx += 1;
-            }
-        }
-    }
-    (tokens, leaf_ctx, tag_base, ctx)
-}
-
-/// Quantize every sample to its nearest multiple of `q` (ties away from zero)
-/// and store the DIVIDED value. The channel is then coded at 1/q scale and the
-/// signaled tree-leaf multiplier `q` restores the scale in the decoder.
-fn quantize_channel_divide(ch: &mut crate::squeeze::Channel, q: i32) {
-    if q <= 1 {
-        return;
-    }
-    for v in ch.data.iter_mut() {
-        let a = *v;
-        *v = if a < 0 {
-            -((-a + q / 2) / q)
-        } else {
-            (a + q / 2) / q
-        };
-    }
-}
-
-/// Regular is_last modular frame inside the lossy (`xyb_encoded`) codestream.
-/// Identical to `write_frame_header_modular_flags` except the do_YCbCr bit is
-/// absent: with xyb_encoded set the color transform is implicitly XYB.
-fn write_frame_header_modular_xyb_regular(w: &mut BitWriter) {
-    w.write(1, 0); // all_default = false
-    w.write(2, 0b00); // regular frame
-    w.write(1, 1); // encoding = Modular
-    write_u64(0, w); // flags
-    w.write(2, 0b00); // upsampling = 1
-    w.write(2, 0b01); // group_size_shift = 1 (256-pixel groups)
-    w.write(2, 0b00); // num_passes = 1
-    w.write(1, 0); // have_crop = false
-    w.write(2, 0b00); // blending = Replace
-    w.write(1, 1); // is_last
-    w.write(2, 0b00); // name length = 0
-    w.write(1, 0); // loop_filter not all_default
-    w.write(1, 0); // no gaborish
-    w.write(2, 0); // 0 EPF iters
-    w.write(2, 0b00); // no LF extensions
-    w.write(2, 0b00); // no FH extensions
-}
-
-/// Custom dc_quant field: the decoder multiplies stored X/Y/B channels by these
-/// steps to recover XYB floats.
-fn write_lossy_modular_dc_quant(w: &mut BitWriter) {
-    use crate::util::f32_to_f16_bits;
-    w.write(1, 0); // dc_quant not all_default
-    for scale in LOSSY_MODULAR_XYB_SCALE {
-        let step_x128 = 128.0 / scale;
-        w.write(16, f32_to_f16_bits(step_x128) as u64);
-    }
-}
-
-/// The lossy-modular arm's quantized state: divided channels, per-channel
-/// steps, and the squeeze script that produced them.
-pub(crate) struct LmQuantized {
-    channels: Vec<crate::squeeze::Channel>,
-    quants: Vec<u32>,
-    steps: Vec<crate::squeeze::SqueezeStep>,
-}
-
-/// Build and quantize the arm's channel pyramid at `effective_distance`
-/// (already calibrated by the caller). None when the image is too small.
-pub(crate) fn lm_quantize(
-    xyb: &crate::image::Image3F,
-    effective_distance: f32,
-) -> Option<LmQuantized> {
-    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps};
-    let xsize = xyb.xsize();
-    let ysize = xyb.ysize();
-    let num_c = 3usize;
-    if default_squeeze_steps(xsize, ysize, num_c).is_empty() {
-        // Tiny image: no squeeze means "lossy" would be plain color
-        // quantization at the wrong scale. Not this arm's job.
-        return None;
-    }
-    let steps = lossy_squeeze_steps(xsize, ysize, num_c);
-    // With the chroma pre-squeeze, the last four channels are its residuals
-    // (mapped to the chroma quantization row, like cjxl); everything before
-    // them stays aligned to `num_c` blocks.
-    let chroma_pre = steps.len() >= 2 && !steps[0].in_place;
-
-    // XYB floats onto the integer lattice, stored as [Y, X, B-Y].
-    let n = xsize * ysize;
-    let input = [
-        &xyb.plane_data(0)[..n],
-        &xyb.plane_data(1)[..n],
-        &xyb.plane_data(2)[..n],
-    ];
-    let mut planes = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
-    {
-        let [dst_y, dst_x, dst_b] = &mut planes;
-        let scales = [
-            LOSSY_MODULAR_XYB_SCALE[0],
-            LOSSY_MODULAR_XYB_SCALE[1],
-            LOSSY_MODULAR_XYB_SCALE[2],
-        ];
-        unsafe {
-            crate::xyb::selected_quantize_xyb_channels_fn()(input, [dst_y, dst_x, dst_b], scales);
-        }
-    }
-    let mut channels: Vec<Channel> = planes
-        .into_iter()
-        .map(|data| Channel {
-            data,
-            w: xsize,
-            h: ysize,
-            hshift: 0,
-            vshift: 0,
-        })
-        .collect();
-    for s in &steps {
-        apply_step_forward(&mut channels, s);
-    }
-    // Quantize every channel on its (color, depth) schedule. Channels are
-    // stored divided by their step; the tree leaf multiplier restores the
-    // scale. The decoder's full-scale predictions stay consistent because
-    // every predictor used on a q>1 channel is exactly scale-equivariant over
-    // the divided values.
-    let nb = channels.len();
-    let color_of = |i: usize| {
-        if chroma_pre && i >= nb - 4 {
-            1 // trailing chroma pre-squeeze residuals -> chroma row
-        } else {
-            i % num_c
-        }
-    };
-    let mut quants: Vec<u32> = Vec::with_capacity(nb);
-    for (i, ch) in channels.iter_mut().enumerate() {
-        let q = lossy_modular_q(color_of(i), ch.hshift, ch.vshift, effective_distance);
-        quantize_channel_divide(ch, q);
-        quants.push(q as u32);
-    }
-    Some(LmQuantized {
-        channels,
-        quants,
-        steps,
-    })
-}
-
-/// Lossy modular frame: the XYB image on the fixed integer lattice, squeezed,
-/// with each pyramid level's residuals rounded to distance-scaled multiples,
-/// then coded through the lossless squeeze machinery. `effective_distance` is
-/// the arm's already-calibrated quantizer distance (see
-/// `lm_calibrated_distance` and the auto gate). Returns false when the frame
-/// cannot take this path (caller keeps the VarDCT arm).
-pub(crate) fn encode_frame_lossy_modular_squeeze(
-    xyb: &crate::image::Image3F,
-    effective_distance: f32,
-    speed: crate::Speed,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) -> bool {
-    let xsize = xyb.xsize();
-    let ysize = xyb.ysize();
-    let Some(LmQuantized {
-        channels,
-        quants,
-        steps,
-    }) = lm_quantize(xyb, effective_distance)
-    else {
-        return false;
-    };
-    let nb = channels.len();
-
-    // Same literal-vs-LZ77 guard as the atlas path, from the actual quantized
-    // channel range.
-    let max_abs = channels
-        .iter()
-        .flat_map(|ch| ch.data.iter())
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
-    let min_symbol = if value_bits <= 13 {
-        LZ77_MIN_SYMBOL
-    } else {
-        4 * value_bits + 24
-    };
-
-    let use_wp = true;
-    let grad_pack_fn = selected_grad_pack_interior_fn();
-    let xsize_groups = xsize.div_ceil(GROUP_DIM);
-    let ysize_groups = ysize.div_ceil(GROUP_DIM);
-    let num_ac_groups = xsize_groups * ysize_groups;
-    let xsize_dc_groups = xsize.div_ceil(LF_GROUP_DIM);
-    let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
-    let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
-
-    if num_ac_groups == 1 {
-        // Single-group frame: one section carrying everything.
-        let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-            let quants_ref = &quants;
-            pool.steal_map(scratch, nb, |c, _scratch| {
-                let ch = &channels[c];
-                let data = &ch.data;
-                let w = ch.w;
-                let get = move |gx: usize, gy: usize| data[gy * w + gx];
-                if quants_ref[c] > 1 {
-                    let mut costs = SqueezePredictorCost::with_zero();
-                    costs.add_crop(get, ch.w, ch.h, use_wp);
-                    costs.safe_predictor()
-                } else {
-                    choose_predictor_for_plane(get, ch.w, ch.h, use_wp)
-                }
-            })
-        } else {
-            (0..nb)
-                .map(|i| {
-                    if quants[i] > 1 {
-                        PREDICTOR_GRADIENT
-                    } else {
-                        fixed_predictor(use_wp)
-                    }
-                })
-                .collect()
-        };
-        let channel_tokens = pool.steal_map(scratch, nb, |c, scratch| {
-            let ch = &channels[c];
-            let mut tokens = Vec::with_capacity(ch.w * ch.h);
-            tokenize_plane(
-                channel_to_context(c, nb),
-                |x, y| ch.data[y * ch.w + x],
-                ch.w,
-                ch.h,
-                predictors[c],
-                grad_pack_fn,
-                &mut scratch.gradient,
-                &mut tokens,
-            );
-            tokens
-        });
-        let mut tokens: Vec<Token> = Vec::new();
-        for channel in channel_tokens {
-            tokens.extend(channel);
-        }
-
-        write_frame_header_modular_xyb_regular(writer);
-        let mut section = BitWriter::new();
-        write_lossy_modular_dc_quant(&mut section);
-        section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
-        section.write(1, 0); // use_global_tree = 0
-        section.write(1, 1); // wp_default = 1
-        write_modular_transforms_squeeze_only(&steps, &mut section);
-
-        let distance_ctx = nb as u32;
-        let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
-        let code = build_lz_pixel_code(
-            std::iter::once(lz_tokens.as_slice()),
-            nb,
-            min_symbol,
-            speed == crate::Speed::Slow,
-            &mut scratch.lz_entropy,
-            &mut scratch.huffman_pool,
-        );
-        let leaves: Vec<(u32, u32)> = predictors.iter().copied().zip(quants).collect();
-        write_tree_lz77(
-            &build_balanced_tree_tokens_mul(&leaves),
-            &code,
-            min_symbol,
-            &mut scratch.huffman_pool,
-            &mut section,
-        );
-        write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
-        section.zero_pad_to_byte();
-
-        writer.write(1, 0); // no permutation
-        writer.zero_pad_to_byte();
-        write_toc_entry(section.bits_written() / 8, writer);
-        writer.zero_pad_to_byte();
-        writer.append_byte_aligned(std::slice::from_mut(&mut section));
-        writer.zero_pad_to_byte();
-        return true;
-    }
-
-    // Multi-group. Group streams key the tree on the WITHIN-group channel
-    // slot while the global stream keys on the real channel index, and the
-    // slot->channel map differs between them; with per-channel multipliers the
-    // two sides can no longer share leaves the way the lossless path does. The
-    // global tree therefore splits first on the static stream-id property
-    // (property 1: 0 = LfGlobal, >0 = any group stream) and hangs a separate
-    // channel chain off each side.
-    let split = channels
-        .iter()
-        .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
-        .unwrap_or(nb);
-    // Group slots: the DC-group-eligible (min shift >= 3, above ~2048px) and
-    // AC-group-eligible channels, each in the group scan order. A channel's
-    // within-group slot is its rank in its list (full-frame channels never
-    // produce an empty crop, so ranks are group-invariant).
-    let dc_slot_channels: Vec<usize> = (split..nb)
-        .filter(|&c| channels[c].hshift.min(channels[c].vshift) >= 3)
-        .collect();
-    let ac_slot_channels: Vec<usize> = (split..nb)
-        .filter(|&c| {
-            let msh = channels[c].hshift.min(channels[c].vshift);
-            (0..=2).contains(&msh)
-        })
-        .collect();
-    let n_dc_slots = dc_slot_channels.len();
-    let n_ac_slots = ac_slot_channels.len();
-    let _ = n_ac_slots;
-    let n_tags = split + n_dc_slots + n_ac_slots;
-    let dc_tag_base = split;
-    let ac_tag_base = split + n_dc_slots;
-
-    // Tags: [0, split) global-stream channels, then DC slots, then AC slots.
-    let tag_channel: Vec<usize> = (0..split)
-        .chain(dc_slot_channels.iter().copied())
-        .chain(ac_slot_channels.iter().copied())
-        .collect();
-    let tag_quants: Vec<u32> = tag_channel.iter().map(|&c| quants[c]).collect();
-
-    // Per-tag MA samples: divided values, decoder-visible channel value as the
-    // chan property, properties rescaled to the full-scale domain afterwards.
-    let tag_samples: Vec<MaSamples> = pool.steal_map(scratch, n_tags, |t, _scratch| {
-        let ch = &channels[tag_channel[t]];
-        let px = ch.w * ch.h;
-        let mut stride = px.div_ceil(LM_SAMPLE_TARGET).max(1);
-        if stride > 1 && stride.is_multiple_of(2) {
-            stride += 1;
-        }
-        let chan = if t < split {
-            t
-        } else if t < ac_tag_base {
-            t - dc_tag_base
-        } else {
-            t - ac_tag_base
-        } as u32;
-        let mut samples = MaSamples::with_capacity(px / stride + 1);
-        let data = &ch.data;
-        let w = ch.w;
-        sample_channel_ma(
-            &move |x, y| data[y * w + x],
-            ch.w,
-            ch.h,
-            chan,
-            WpParams::DEFAULT,
-            false,
-            stride,
-            &mut samples,
-        );
-        scale_ma_value_props(&mut samples, tag_quants[t] as i32);
-        samples
-    });
-
-    // Learn one subtree per tag (sequential: the learner parallelizes
-    // internally). Leaf budget follows the tag's pixel share; a learned tree
-    // must beat its own flat estimate plus serialization/context overhead or
-    // it collapses to a single leaf. Budgets are jointly rescaled so the
-    // total leaf count can never exceed the LZ77 context bound (large images
-    // at low distance otherwise overflow it).
-    let budgets: Vec<usize> = (0..n_tags)
-        .map(|t| {
-            let ch = &channels[tag_channel[t]];
-            ((ch.w * ch.h) / LM_BUDGET_DIV).clamp(1, LM_BUDGET_CAP)
-        })
-        .collect();
-    // Large images at low distance can push the SUM of actual leaves past the
-    // LZ77 context bound; only then scale the budgets down and re-learn the
-    // offenders (budgets are upper bounds — most trees collapse well below
-    // them, so up-front rescaling would perturb every ordinary encode).
-    let budget_cap = LZ77_MAX_CONTEXTS - 64;
-    let mut learned: Vec<LearnedTree> = Vec::with_capacity(n_tags);
-    for t in 0..n_tags {
-        let ch = &channels[tag_channel[t]];
-        let px = ch.w * ch.h;
-        let mut stride = px.div_ceil(LM_SAMPLE_TARGET).max(1);
-        if stride > 1 && stride.is_multiple_of(2) {
-            stride += 1;
-        }
-        let params = |max_leaves: usize| MaLearnParams {
-            alphabet: min_symbol as usize,
-            max_leaves,
-            split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
-            min_node: MA_MIN_NODE_SAMPLES,
-            allow_wp: false,
-            allowed_preds: LM_SAFE_PRED_MASK,
-        };
-        let samples = &tag_samples[t];
-        if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
-            learned.push(learn_ma_tree(samples, params(1), pool, scratch));
-            continue;
-        }
-        let budget = budgets[t];
-        let tree = learn_ma_tree(samples, params(budget), pool, scratch);
-        let n_leaves = tree.nodes.len().div_ceil(2);
-        let overhead_bits = tree.nodes.len() as f64 * 10.0 + n_leaves as f64 * 200.0;
-        let est_real = tree.est_bits * stride as f64 + overhead_bits;
-        let flat_real = tree.flat_bits * stride as f64;
-        if est_real < flat_real {
-            learned.push(tree);
-        } else {
-            learned.push(learn_ma_tree(samples, params(1), pool, scratch));
-        }
-    }
-    let leaves_of = |t: &LearnedTree| t.nodes.len().div_ceil(2);
-    let mut total_leaves: usize = learned.iter().map(leaves_of).sum();
-    while total_leaves > budget_cap {
-        let (worst, _) = learned
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, t)| leaves_of(t))
-            .unwrap();
-        let target = (leaves_of(&learned[worst]) / 2).max(1);
-        let ch = &channels[tag_channel[worst]];
-        let px = ch.w * ch.h;
-        let mut stride = px.div_ceil(LM_SAMPLE_TARGET).max(1);
-        if stride > 1 && stride.is_multiple_of(2) {
-            stride += 1;
-        }
-        let params = MaLearnParams {
-            alphabet: min_symbol as usize,
-            max_leaves: target,
-            split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
-            min_node: MA_MIN_NODE_SAMPLES,
-            allow_wp: false,
-            allowed_preds: LM_SAFE_PRED_MASK,
-        };
-        learned[worst] = learn_ma_tree(&tag_samples[worst], params, pool, scratch);
-        total_leaves = learned.iter().map(leaves_of).sum();
-    }
-    drop(tag_samples);
-
-    let (tree_tokens, leaf_ctx, tag_base, num_ctx) =
-        emit_lm_forest(&learned, &tag_quants, split, n_dc_slots, num_dc_groups);
-    let num_ctx = num_ctx as usize;
-    let distance_ctx = num_ctx as u32;
-
-    let global_channel_tokens = pool.steal_map(scratch, split, |c, _scratch| {
-        let ch = &channels[c];
-        let data = &ch.data;
-        let w = ch.w;
-        let get = move |gx: usize, gy: usize| data[gy * w + gx];
-        let mut tokens = Vec::with_capacity(ch.w * ch.h);
-        tokenize_channel_ma_mult(
-            &get,
-            ch.w,
-            ch.h,
-            c as u32,
-            tag_quants[c] as i32,
-            &learned[c],
-            &leaf_ctx,
-            tag_base[c],
-            &mut tokens,
-        );
-        tokens
-    });
-    let mut global_tokens: Vec<Token> = Vec::new();
-    for channel in global_channel_tokens {
-        global_tokens.extend(channel);
-    }
-    // Literal-only: with per-pixel tree contexts and ANS-clustered histograms,
-    // zero literals are near-free and LZ77 matches cannot pay for their
-    // length+distance symbols (context-equal matching measured +10%,
-    // value-only matching +4..12%). The LZ77 layer stays declared in the
-    // header; no matches are ever emitted.
-    let global_lz = lz77_literals(&global_tokens);
-    let crop_group = |gdim: usize,
-                      gx: usize,
-                      gy: usize,
-                      minsh: i32,
-                      maxsh: i32,
-                      slot_tag_base: usize,
-                      _scratch: &mut CoderScratch|
-     -> Vec<LzToken> {
-        let mut gtok: Vec<Token> = Vec::new();
-        for_each_squeeze_group_crop(
-            &channels,
-            split,
-            gdim,
-            gx,
-            gy,
-            minsh,
-            maxsh,
-            |within, c, rx0, ry0, rw, rh| {
-                let ch = &channels[c];
-                let tag = slot_tag_base + within;
-                let data = &ch.data;
-                let w = ch.w;
-                let get = move |lx: usize, ly: usize| data[(ry0 + ly) * w + (rx0 + lx)];
-                tokenize_channel_ma_mult(
-                    &get,
-                    rw,
-                    rh,
-                    within as u32,
-                    tag_quants[tag] as i32,
-                    &learned[tag],
-                    &leaf_ctx,
-                    tag_base[tag],
-                    &mut gtok,
-                );
-            },
-        );
-        lz77_literals(&gtok)
-    };
-
-    let dc_group_lz = pool.steal_map_with_threads(
-        scratch,
-        num_dc_groups,
-        group_lz_threads(speed, pool),
-        |group_index, scratch| {
-            let gx = group_index % xsize_dc_groups;
-            let gy = group_index / xsize_dc_groups;
-            crop_group(LF_GROUP_DIM, gx, gy, 3, 1000, dc_tag_base, scratch)
-        },
-    );
-    let ac_group_lz = pool.steal_map_with_threads(
-        scratch,
-        num_ac_groups,
-        group_lz_threads(speed, pool),
-        |group_index, scratch| {
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            crop_group(GROUP_DIM, gx, gy, 0, 2, ac_tag_base, scratch)
-        },
-    );
-
-    let code = build_lz_pixel_code_opts(
-        std::iter::once(global_lz.as_slice())
-            .chain(dc_group_lz.iter().map(Vec::as_slice))
-            .chain(ac_group_lz.iter().map(Vec::as_slice)),
-        num_ctx,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        true,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-
-    write_frame_header_modular_xyb_regular(writer);
-
-    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
-    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
-
-    // ----- Section 0: LfGlobal = global tree + global modular image -----
-    write_lossy_modular_dc_quant(&mut sections[0]);
-    sections[0].write(1, 1); // has_tree = 1
-    write_tree_lz77(
-        &tree_tokens,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut sections[0],
-    );
-    sections[0].write(1, 1); // use_global_tree = 1
-    sections[0].write(1, 1); // wp_default = 1
-    write_modular_transforms_squeeze_only(&steps, &mut sections[0]);
-    write_lz_section(
-        &global_lz,
-        distance_ctx,
-        &code,
-        min_symbol,
-        &mut sections[0],
-    );
-    sections[0].zero_pad_to_byte();
-
-    // ----- DC groups -----
-    for (k, section) in sections[1..num_dc_groups + 1].iter_mut().enumerate() {
-        section.write(1, 1); // use_global_tree
-        section.write(1, 1); // wp_default
-        section.write(2, 0); // 0 transforms (declared globally)
-        write_lz_section(&dc_group_lz[k], distance_ctx, &code, min_symbol, section);
-        section.zero_pad_to_byte();
-    }
-
-    // ----- AC global: trivial -----
-    let ac_global_idx = 1 + num_dc_groups;
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].zero_pad_to_byte();
-
-    // ----- AC groups -----
-    for g in 0..num_ac_groups {
-        let idx = 2 + num_dc_groups + g;
-        sections[idx].write(1, 1); // use_global_tree
-        sections[idx].write(1, 1); // wp_default
-        sections[idx].write(2, 0); // 0 transforms (declared globally)
-        write_lz_section(
-            &ac_group_lz[g],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[idx],
-        );
-        sections[idx].zero_pad_to_byte();
-    }
-
-    writer.write(1, 0); // no permutation
-    writer.zero_pad_to_byte();
-    for s in &sections {
-        write_toc_entry(s.bits_written() / 8, writer);
-    }
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(&mut sections);
-    writer.zero_pad_to_byte();
-    true
-}
-
-/// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
-/// `TransformId::kPalette`). v1: begin_c=0, num_c=3, nb_deltas=0, predictor=Zero.
-fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
-    debug_assert!(matches!(num_c, 3 | 4));
-    // transforms count U32(Val(0),Val(1),...): selector 1 = Val(1) = 1 transform.
-    w.write(2, 0b01);
-    // id U32(Val(RCT=0),Val(Palette=1),...): selector 1 = Palette.
-    w.write(2, 0b01);
-    // begin_c U32(Bits(3),...): selector 0 = Bits(3), value 0.
-    w.write(2, 0b00);
-    w.write(3, 0);
-    // num_c U32(Val(1),Val(3),Val(4),BitsOffset(13,1)).
-    w.write(2, if num_c == 3 { 0b01 } else { 0b10 });
-    // nb_colors U32(BitsOffset(8,0),BitsOffset(10,256),...).
-    if nb_colors <= 255 {
-        w.write(2, 0b00); // selector 0 = BitsOffset(8, 0)
-        w.write(8, nb_colors as u64);
-    } else {
-        // nb_colors == 256 (our cap): selector 1 = BitsOffset(10, 256).
-        w.write(2, 0b01);
-        w.write(10, (nb_colors - 256) as u64);
-    }
-    // nb_deltas U32(Val(0),...): selector 0 = Val(0) = 0.
-    w.write(2, 0b00);
-    // predictor Bits(4): Predictor::Zero = 0.
-    w.write(4, 0);
-}
-
-/// Single-group RGB/RGBA exact palette path. Encodes a palette meta-channel plus
-/// an index channel, declaring a Palette transform so `InvPalette` reconstructs
-/// the original channels directly (no RCT).
-fn try_encode_palette_single_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    min_symbol: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    speed: crate::Speed,
-    use_wp: bool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) -> bool {
-    use std::collections::HashMap;
-    let npx = xsize * ysize;
-    let num_c = 3 + usize::from(alpha.is_some());
-
-    // 1) Reconstruct RGB from YCoCg, collect distinct tuples (bail past 256).
-    let plane0 = linear.plane_data(0);
-    let plane1 = linear.plane_data(1);
-    let plane2 = linear.plane_data(2);
-    let color_at = |gx: usize, gy: usize| {
-        let (r, g, b) = inverse_ycocg(
-            plane0[gy * xsize + gx],
-            plane1[gy * xsize + gx],
-            plane2[gy * xsize + gx],
-        );
-        [r, g, b, alpha.map_or(0, |a| a.get_i32(gy * xsize + gx))]
-    };
-    let mut seen: HashMap<[i32; 4], ()> = HashMap::with_capacity(257);
-    for gy in 0..ysize {
-        for gx in 0..xsize {
-            seen.entry(color_at(gx, gy)).or_insert(());
-            if seen.len() > 256 {
-                return false;
-            }
-        }
-    }
-    let nb_colors = seen.len();
-    if nb_colors == 0 {
-        return false;
-    }
-
-    // 2) Sorted palette + color->index map.
-    let mut colors: Vec<[i32; 4]> = seen.keys().copied().collect();
-    colors.sort_unstable();
-    let mut idx_of: HashMap<[i32; 4], u32> = HashMap::with_capacity(nb_colors);
-    for (i, c) in colors.iter().enumerate() {
-        idx_of.insert(*c, i as u32);
-    }
-
-    // 3) Palette meta-channel (row c = component c of each color) + index channel.
-    let mut palette_ch = vec![0i32; num_c * nb_colors];
-    for (i, color) in colors.iter().enumerate() {
-        for c in 0..num_c {
-            palette_ch[c * nb_colors + i] = color[c];
-        }
-    }
-    let mut index_img = Vec::with_capacity(npx);
-    for gy in 0..ysize {
-        for gx in 0..xsize {
-            index_img.push(idx_of[&color_at(gx, gy)] as i32);
-        }
-    }
-
-    // 4) Channel accessors (channel 0 = palette, channel 1 = index).
-    let pget = |gx: usize, gy: usize| palette_ch[gy * nb_colors + gx];
-    let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
-
-    // 5) Slow searches predictors per channel; Fast stays fixed Weighted.
-    let preds = if speed == crate::Speed::Slow {
-        [
-            choose_predictor_for_plane(pget, nb_colors, num_c, use_wp),
-            choose_predictor_for_plane(iget, xsize, ysize, use_wp),
-        ]
-    } else {
-        [fixed_predictor(use_wp); 2]
-    };
-
-    // 6) Frame header + single section (mirrors the RGB single-group layout).
-    write_frame_header_modular(alpha.is_some(), writer);
-
-    let nb_chans = 2usize;
-    let mut section = BitWriter::new();
-    section.write(1, 1); // dc_quant all_default = 1
-    section.write(1, 0); // has_tree = 0
-    section.write(1, 0); // use_global_tree = 0
-    section.write(1, 1); // wp_default = 1
-    write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
-
-    let mut tokens: Vec<Token> = Vec::with_capacity(num_c * nb_colors + npx);
-    tokenize_plane(
-        channel_to_context(0, nb_chans),
-        pget,
-        nb_colors,
-        num_c,
-        preds[0],
-        grad_pack_fn,
-        &mut scratch.gradient,
-        &mut tokens,
-    );
-    tokenize_plane(
-        channel_to_context(1, nb_chans),
-        iget,
-        xsize,
-        ysize,
-        preds[1],
-        grad_pack_fn,
-        &mut scratch.gradient,
-        &mut tokens,
-    );
-
-    let distance_ctx = nb_chans as u32;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
-    let code = build_lz_pixel_code(
-        std::iter::once(lz_tokens.as_slice()),
-        nb_chans,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-    write_local_tree_lz77(
-        &preds,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut section,
-    );
-    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
-    section.zero_pad_to_byte();
-
-    writer.write(1, 0); // no permutation
-    writer.zero_pad_to_byte();
-    write_toc_entry(section.bits_written() / 8, writer);
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(std::slice::from_mut(&mut section));
-    writer.zero_pad_to_byte();
-    true
-}
-
-struct LocalPaletteGroup {
-    palette: Vec<i32>,
-    indices: Vec<i32>,
-    nb_colors: usize,
-    w: usize,
-    h: usize,
-}
-
-fn estimated_local_stream_bits(
-    tokens: &[Token],
-    predictors: &[u32],
-    num_contexts: usize,
-    min_symbol: u32,
-    speed: crate::Speed,
-    scratch: &mut CoderScratch,
-) -> usize {
-    let lz = lz77_compress_runs(tokens);
-    estimated_local_lz_stream_bits(&lz, predictors, num_contexts, min_symbol, speed, scratch)
-}
-
-fn estimated_local_lz_stream_bits(
-    lz: &[LzToken],
-    predictors: &[u32],
-    num_contexts: usize,
-    min_symbol: u32,
-    speed: crate::Speed,
-    scratch: &mut CoderScratch,
-) -> usize {
-    let code = build_lz_pixel_code(
-        std::iter::once(lz),
-        num_contexts,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-    let mut writer = BitWriter::new();
-    write_local_tree_lz77(
-        predictors,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut writer,
-    );
-    write_lz_section(lz, num_contexts as u32, &code, min_symbol, &mut writer);
-    writer.bits_written()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn local_palette_is_better(
-    palette: &LocalPaletteGroup,
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    x0: usize,
-    y0: usize,
-    min_symbol: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    speed: crate::Speed,
-    use_wp: bool,
-    scratch: &mut CoderScratch,
-) -> bool {
-    let nb_chans = 3 + usize::from(alpha.is_some());
-    let palette_predictors = if speed == crate::Speed::Slow {
-        [
-            choose_predictor_for_plane(
-                |x, y| palette.palette[y * palette.nb_colors + x],
-                palette.nb_colors,
-                nb_chans,
-                use_wp,
-            ),
-            choose_predictor_for_plane(
-                |x, y| palette.indices[y * palette.w + x],
-                palette.w,
-                palette.h,
-                use_wp,
-            ),
-        ]
-    } else {
-        [fixed_predictor(use_wp); 2]
-    };
-    let mut palette_tokens =
-        Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h);
-    tokenize_plane(
-        channel_to_context(0, 2),
-        |x, y| palette.palette[y * palette.nb_colors + x],
-        palette.nb_colors,
-        nb_chans,
-        palette_predictors[0],
-        grad_pack_fn,
-        &mut scratch.gradient,
-        &mut palette_tokens,
-    );
-    tokenize_plane(
-        channel_to_context(1, 2),
-        |x, y| palette.indices[y * palette.w + x],
-        palette.w,
-        palette.h,
-        palette_predictors[1],
-        grad_pack_fn,
-        &mut scratch.gradient,
-        &mut palette_tokens,
-    );
-    let mut palette_transform = BitWriter::new();
-    write_palette_transform(
-        nb_chans as u32,
-        palette.nb_colors as u32,
-        &mut palette_transform,
-    );
-    let palette_bits = estimated_local_stream_bits(
-        &palette_tokens,
-        &palette_predictors,
-        2,
-        min_symbol,
-        speed,
-        scratch,
-    ) + palette_transform.bits_written();
-
-    let plain_predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        (0..nb_chans)
-            .map(|chan| {
-                if chan < 3 {
-                    let plane = linear.plane_data(chan);
-                    choose_predictor_for_plane(
-                        |x, y| plane[(y0 + y) * xsize + x0 + x],
-                        palette.w,
-                        palette.h,
-                        use_wp,
-                    )
-                } else {
-                    let alpha = alpha.expect("alpha channel must exist");
-                    choose_predictor_for_plane(
-                        |x, y| alpha.get_i32((y0 + y) * xsize + x0 + x),
-                        palette.w,
-                        palette.h,
-                        use_wp,
-                    )
-                }
-            })
-            .collect()
-    } else {
-        vec![fixed_predictor(use_wp); nb_chans]
-    };
-    let plain_lz = tokenize_runs_with_wp(
-        linear,
-        alpha,
-        xsize,
-        x0,
-        y0,
-        palette.w,
-        palette.h,
-        3,
-        &plain_predictors,
-        grad_pack_fn,
-        scratch,
-        WpParams::DEFAULT,
-    );
-    let plain_bits = estimated_local_lz_stream_bits(
-        &plain_lz,
-        &plain_predictors,
-        nb_chans,
-        min_symbol,
-        speed,
-        scratch,
-    ) + 2; // zero-transform count
-
-    palette_bits < plain_bits
-}
-
-fn build_local_palette_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    x0: usize,
-    y0: usize,
-    w: usize,
-    h: usize,
-) -> Option<LocalPaletteGroup> {
-    use std::collections::HashMap;
-
-    let num_c = 3 + usize::from(alpha.is_some());
-    let num_pixels = w * h;
-    let plane0 = linear.plane_data(0);
-    let plane1 = linear.plane_data(1);
-    let plane2 = linear.plane_data(2);
-    let tuple_at = |gx: usize, gy: usize| {
-        [
-            plane0[gy * xsize + gx],
-            plane1[gy * xsize + gx],
-            plane2[gy * xsize + gx],
-            alpha.map_or(0, |a| a.get_i32(gy * xsize + gx)),
-        ]
-    };
-
-    // Most photographic groups exceed the palette limit almost immediately.
-    // Probe only the distinct set first, avoiding a full-group tuple allocation
-    // on that overwhelmingly common rejection path.
-    let mut seen = HashMap::<[i32; 4], ()>::with_capacity(257);
-    for y in 0..h {
-        for x in 0..w {
-            let gx = x0 + x;
-            let gy = y0 + y;
-            seen.entry(tuple_at(gx, gy)).or_insert(());
-            if seen.len() > 256 {
-                return None;
-            }
-        }
-    }
-
-    let nb_colors = seen.len();
-    // Palette coding replaces `num_c * num_pixels` samples with one index per
-    // pixel plus `num_c * nb_colors` palette samples. Leave a small margin for
-    // the transform header and altered entropy statistics.
-    let palette_samples = num_pixels + num_c * nb_colors + 16;
-    if nb_colors == 0 || palette_samples >= num_c * num_pixels {
-        return None;
-    }
-
-    let mut colors: Vec<[i32; 4]> = seen.keys().copied().collect();
-    colors.sort_unstable();
-    let mut index_of = HashMap::<[i32; 4], i32>::with_capacity(nb_colors);
-    let mut palette = vec![0i32; num_c * nb_colors];
-    for (index, color) in colors.iter().enumerate() {
-        index_of.insert(*color, index as i32);
-        for c in 0..num_c {
-            palette[c * nb_colors + index] = color[c];
-        }
-    }
-    let mut indices = Vec::with_capacity(num_pixels);
-    for y in 0..h {
-        for x in 0..w {
-            indices.push(index_of[&tuple_at(x0 + x, y0 + y)]);
-        }
-    }
-
-    Some(LocalPaletteGroup {
-        palette,
-        indices,
-        nb_colors,
-        w,
-        h,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn try_encode_local_palette_multi_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    xsize_groups: usize,
-    ysize_groups: usize,
-    num_dc_groups: usize,
-    min_symbol: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    speed: crate::Speed,
-    use_wp: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) -> bool {
-    let nb_chans = 3 + usize::from(alpha.is_some());
-    let num_ac_groups = xsize_groups * ysize_groups;
-    let palettes = if speed == crate::Speed::Slow {
-        let mut palettes = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            let x0 = gx * GROUP_DIM;
-            let y0 = gy * GROUP_DIM;
-            let w = GROUP_DIM.min(xsize - x0);
-            let h = GROUP_DIM.min(ysize - y0);
-            build_local_palette_group(linear, alpha, xsize, x0, y0, w, h)
-        });
-        let palette_pixels: usize = palettes
-            .iter()
-            .flatten()
-            .map(|palette| palette.w * palette.h)
-            .sum();
-        if !local_palette_coverage_is_sufficient(palette_pixels, xsize * ysize) {
-            return false;
-        }
-
-        let palette_is_better = pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
-            let Some(palette) = &palettes[group_index] else {
-                return false;
-            };
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            local_palette_is_better(
-                palette,
-                linear,
-                alpha,
-                xsize,
-                gx * GROUP_DIM,
-                gy * GROUP_DIM,
-                min_symbol,
-                grad_pack_fn,
-                speed,
-                use_wp,
-                scratch,
-            )
-        });
-        for (palette, keep) in palettes.iter_mut().zip(palette_is_better) {
-            if !keep {
-                *palette = None;
-            }
-        }
-        palettes
-    } else {
-        pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            let x0 = gx * GROUP_DIM;
-            let y0 = gy * GROUP_DIM;
-            let w = GROUP_DIM.min(xsize - x0);
-            let h = GROUP_DIM.min(ysize - y0);
-            let palette = build_local_palette_group(linear, alpha, xsize, x0, y0, w, h)?;
-            local_palette_is_better(
-                &palette,
-                linear,
-                alpha,
-                xsize,
-                x0,
-                y0,
-                min_symbol,
-                grad_pack_fn,
-                speed,
-                use_wp,
-                scratch,
-            )
-            .then_some(palette)
-        })
-    };
-    if !palettes.iter().any(Option::is_some) {
-        return false;
-    }
-
-    // The global MA tree sees group-local channel slots. Pool predictor costs
-    // for palette/index channels and ordinary YCoCg(A) channels by those slots.
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
-        pool.steal_map(scratch, nb_chans, |slot, _scratch| {
-            let mut cost = SqueezePredictorCost::default();
-            for (group_index, palette) in palettes.iter().enumerate() {
-                if let Some(palette) = palette {
-                    if slot == 0 {
-                        cost.add_crop(
-                            |x, y| palette.palette[y * palette.nb_colors + x],
-                            palette.nb_colors,
-                            nb_chans,
-                            use_wp,
-                        );
-                    } else if slot == 1 {
-                        cost.add_crop(
-                            |x, y| palette.indices[y * palette.w + x],
-                            palette.w,
-                            palette.h,
-                            use_wp,
-                        );
-                    }
-                    continue;
-                }
-
-                let gx = group_index % xsize_groups;
-                let gy = group_index / xsize_groups;
-                let x0 = gx * GROUP_DIM;
-                let y0 = gy * GROUP_DIM;
-                let w = GROUP_DIM.min(xsize - x0);
-                let h = GROUP_DIM.min(ysize - y0);
-                if slot < 3 {
-                    let plane = linear.plane_data(slot);
-                    cost.add_crop(|x, y| plane[(y0 + y) * xsize + x0 + x], w, h, use_wp);
-                } else {
-                    let alpha = alpha.expect("alpha slot requires alpha channel");
-                    cost.add_crop(
-                        |x, y| alpha.get_i32((y0 + y) * xsize + x0 + x),
-                        w,
-                        h,
-                        use_wp,
-                    );
-                }
-            }
-            cost.predictor(use_wp)
-        })
-    } else {
-        vec![fixed_predictor(use_wp); nb_chans]
-    };
-
-    let distance_ctx = nb_chans as u32;
-    let deep_lz = (speed == crate::Speed::Slow)
-        .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
-    let group_lz_tokens: Vec<Vec<LzToken>> = pool.steal_map_with_threads(
-        scratch,
-        num_ac_groups,
-        group_lz_threads(speed, pool),
-        |group_index, scratch| {
-            if let Some(palette) = &palettes[group_index] {
-                let mut tokens =
-                    Vec::with_capacity(nb_chans * palette.nb_colors + palette.w * palette.h);
-                tokenize_plane(
-                    channel_to_context(0, nb_chans),
-                    |x, y| palette.palette[y * palette.nb_colors + x],
-                    palette.nb_colors,
-                    nb_chans,
-                    predictors[0],
-                    grad_pack_fn,
-                    &mut scratch.gradient,
-                    &mut tokens,
-                );
-                tokenize_plane(
-                    channel_to_context(1, nb_chans),
-                    |x, y| palette.indices[y * palette.w + x],
-                    palette.w,
-                    palette.h,
-                    predictors[1],
-                    grad_pack_fn,
-                    &mut scratch.gradient,
-                    &mut tokens,
-                );
-                if let Some(deep_lz) = &deep_lz {
-                    deep_lz.with_depth(|depth| {
-                        lz77_compress_for_speed_with_depth(
-                            &tokens,
-                            distance_ctx,
-                            speed,
-                            depth,
-                            scratch,
-                        )
-                    })
-                } else {
-                    lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch)
-                }
-            } else {
-                let gx = group_index % xsize_groups;
-                let gy = group_index / xsize_groups;
-                let x0 = gx * GROUP_DIM;
-                let y0 = gy * GROUP_DIM;
-                let w = GROUP_DIM.min(xsize - x0);
-                let h = GROUP_DIM.min(ysize - y0);
-                if speed == crate::Speed::Slow {
-                    let channel_tokens = tokenize_channels_with_wp(
-                        linear,
-                        alpha,
-                        xsize,
-                        ysize,
-                        x0,
-                        y0,
-                        w,
-                        h,
-                        3,
-                        &predictors,
-                        grad_pack_fn,
-                        pool,
-                        scratch,
-                        WpParams::DEFAULT,
-                    );
-                    deep_lz.as_ref().unwrap().with_depth(|depth| {
-                        lz77_compress_channels_for_speed_with_depth(
-                            channel_tokens,
-                            distance_ctx,
-                            speed,
-                            depth,
-                            scratch,
-                        )
-                    })
-                } else {
-                    tokenize_runs_with_wp(
-                        linear,
-                        alpha,
-                        xsize,
-                        x0,
-                        y0,
-                        w,
-                        h,
-                        3,
-                        &predictors,
-                        grad_pack_fn,
-                        scratch,
-                        WpParams::DEFAULT,
-                    )
-                }
-            }
-        },
-    );
-    drop(deep_lz);
-
-    let code = build_lz_pixel_code(
-        group_lz_tokens.iter().map(Vec::as_slice),
-        nb_chans,
-        min_symbol,
-        speed == crate::Speed::Slow,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-
-    write_frame_header_modular(alpha.is_some(), writer);
-    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
-    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
-
-    sections[0].write(1, 1); // dc_quant all_default
-    sections[0].write(1, 1); // has global tree
-    write_local_tree_lz77(
-        &predictors,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut sections[0],
-    );
-    sections[0].write(1, 1); // use_global_tree
-    sections[0].write(1, 1); // wp_default
-    write_modular_transforms(nb_chans, 6, &mut sections[0]);
-    sections[0].zero_pad_to_byte();
-
-    for section in sections[1..num_dc_groups + 1].iter_mut() {
-        section.write(1, 1);
-        section.write(1, 1);
-        section.write(2, 0);
-        section.zero_pad_to_byte();
-    }
-
-    let ac_global_idx = 1 + num_dc_groups;
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].write(1, 1);
-    sections[ac_global_idx].zero_pad_to_byte();
-
-    for group_index in 0..num_ac_groups {
-        let section_idx = 2 + num_dc_groups + group_index;
-        sections[section_idx].write(1, 1); // use_global_tree
-        sections[section_idx].write(1, 1); // wp_default
-        if let Some(palette) = &palettes[group_index] {
-            write_palette_transform(
-                nb_chans as u32,
-                palette.nb_colors as u32,
-                &mut sections[section_idx],
-            );
-        } else {
-            sections[section_idx].write(2, 0); // no local transforms
-        }
-        write_lz_section(
-            &group_lz_tokens[group_index],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[section_idx],
-        );
-        sections[section_idx].zero_pad_to_byte();
-    }
-
-    writer.write(1, 0); // no TOC permutation
-    writer.zero_pad_to_byte();
-    for section in &sections {
-        write_toc_entry(section.bits_written() / 8, writer);
-    }
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(&mut sections);
-    writer.zero_pad_to_byte();
-    true
 }
 
 fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
@@ -3743,803 +1686,6 @@ fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
     }
     w.write(2, bucket as u64);
     w.write(BITS[bucket], (byte_len - OFFSETS[bucket]) as u64);
-}
-
-// ---------------------------------------------------------------------------
-// Forward reversible YCoCg (RCT type 6, matches libjxl's InvRCTRow<6>).
-//
-// Encoder:
-//   co  = r - b
-//   tmp = b + (co >> 1)
-//   cg  = g - tmp
-//   y   = tmp + (cg >> 1)
-//
-// Decoder undoes this with the exact same shift sequence:
-//   tmp = y - (cg >> 1);  g = cg + tmp;
-//   y'  = tmp - (co >> 1); r = y' + co;  b = y'
-//
-// Reversible because every operation is invertible without rounding.
-// ---------------------------------------------------------------------------
-
-#[inline]
-pub(crate) fn forward_ycocg(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
-    let co = r - b;
-    let tmp = b + (co >> 1);
-    let cg = g - tmp;
-    let y = tmp + (cg >> 1);
-    (y, co, cg)
-}
-
-/// Exact integer inverse of `forward_ycocg` (undoes the steps in reverse).
-#[inline]
-pub(crate) fn inverse_ycocg(y: i32, co: i32, cg: i32) -> (i32, i32, i32) {
-    let tmp = y - (cg >> 1);
-    let g = cg + tmp;
-    let b = tmp - (co >> 1);
-    let r = b + co;
-    (r, g, b)
-}
-
-#[inline]
-fn channel_to_context(chan: usize, nb_chans: usize) -> u32 {
-    (nb_chans - 1 - chan) as u32
-}
-
-fn tokenize_all(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    _ysize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    num_color: usize,
-    predictors: &[u32],
-    grad_pack_fn: GradPackInteriorFn,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-) -> Vec<Token> {
-    tokenize_all_with_wp(
-        linear,
-        alpha,
-        xsize,
-        _ysize,
-        x0,
-        y0,
-        gw,
-        gh,
-        num_color,
-        predictors,
-        grad_pack_fn,
-        pool,
-        scratch,
-        WpParams::DEFAULT,
-    )
-}
-
-fn tokenize_all_with_wp(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    _ysize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    num_color: usize,
-    predictors: &[u32],
-    grad_pack_fn: GradPackInteriorFn,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    wp_params: WpParams,
-) -> Vec<Token> {
-    let channel_tokens = tokenize_channels_with_wp(
-        linear,
-        alpha,
-        xsize,
-        _ysize,
-        x0,
-        y0,
-        gw,
-        gh,
-        num_color,
-        predictors,
-        grad_pack_fn,
-        pool,
-        scratch,
-        wp_params,
-    );
-    let total_len = channel_tokens.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total_len);
-    for channel in channel_tokens {
-        out.extend(channel);
-    }
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn tokenize_channels_with_wp(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    _ysize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    num_color: usize,
-    predictors: &[u32],
-    grad_pack_fn: GradPackInteriorFn,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    wp_params: WpParams,
-) -> Vec<Vec<Token>> {
-    let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
-    pool.steal_map(scratch, nb_chans, |chan, scratch| {
-        let mut out = Vec::with_capacity(gw * gh);
-        tokenize_channel_with_wp(
-            linear,
-            alpha,
-            xsize,
-            x0,
-            y0,
-            gw,
-            gh,
-            num_color,
-            predictors,
-            chan,
-            grad_pack_fn,
-            &mut scratch.gradient,
-            &mut out,
-            wp_params,
-        );
-        out
-    })
-}
-
-/// Tokenizes and run-compresses one channel at a time. This preserves channel
-/// boundaries (and therefore the bitstream) while retaining only one raw-token
-/// plane per worker. Multi-group encoding already supplies group-level
-/// parallelism, so nested channel tasks would only increase live storage.
-#[allow(clippy::too_many_arguments)]
-fn tokenize_runs_with_wp(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    num_color: usize,
-    predictors: &[u32],
-    grad_pack_fn: GradPackInteriorFn,
-    scratch: &mut CoderScratch,
-    wp_params: WpParams,
-) -> Vec<LzToken> {
-    let nb_chans = num_color + usize::from(alpha.is_some());
-    let mut out = RunLzWriter::with_capacity(gw * gh * nb_chans);
-    for chan in 0..nb_chans {
-        tokenize_channel_with_wp(
-            linear,
-            alpha,
-            xsize,
-            x0,
-            y0,
-            gw,
-            gh,
-            num_color,
-            predictors,
-            chan,
-            grad_pack_fn,
-            &mut scratch.gradient,
-            &mut out,
-            wp_params,
-        );
-        out.finish_channel();
-    }
-    out.finish()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn tokenize_channel_with_wp(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    num_color: usize,
-    predictors: &[u32],
-    chan: usize,
-    grad_pack_fn: GradPackInteriorFn,
-    gradient: &mut GradientScratch,
-    out: &mut impl TokenSink,
-    wp_params: WpParams,
-) {
-    let nb_chans = num_color + usize::from(alpha.is_some());
-    let ctx = channel_to_context(chan, nb_chans);
-    if chan < num_color {
-        if predictors[chan] == PREDICTOR_WEIGHTED {
-            tokenize_wp_row_slices(
-                ctx,
-                |gy| &linear.plane_row(chan, y0 + gy)[x0..x0 + gw],
-                gw,
-                gh,
-                out,
-                wp_params,
-            );
-        } else {
-            let get = |gx: usize, gy: usize| linear.plane_row(chan, y0 + gy)[x0 + gx];
-            tokenize_plane_with_wp(
-                ctx,
-                get,
-                gw,
-                gh,
-                predictors[chan],
-                grad_pack_fn,
-                gradient,
-                out,
-                wp_params,
-            );
-        }
-        return;
-    }
-
-    let alpha = alpha.expect("alpha channel must exist");
-    if predictors[chan] == PREDICTOR_WEIGHTED {
-        match alpha {
-            AlphaPlane::U8(data) => tokenize_wp_row_slices(
-                ctx,
-                |gy| {
-                    let start = (y0 + gy) * xsize + x0;
-                    &data[start..start + gw]
-                },
-                gw,
-                gh,
-                out,
-                wp_params,
-            ),
-            AlphaPlane::U16 { data, .. } => tokenize_wp_row_slices(
-                ctx,
-                |gy| {
-                    let start = (y0 + gy) * xsize + x0;
-                    &data[start..start + gw]
-                },
-                gw,
-                gh,
-                out,
-                wp_params,
-            ),
-            AlphaPlane::F32(data) => tokenize_wp_row_slices(
-                ctx,
-                |gy| {
-                    let start = (y0 + gy) * xsize + x0;
-                    &data[start..start + gw]
-                },
-                gw,
-                gh,
-                out,
-                wp_params,
-            ),
-        }
-    } else {
-        let get = |gx: usize, gy: usize| alpha.get_i32((y0 + gy) * xsize + (x0 + gx));
-        tokenize_plane_with_wp(
-            ctx,
-            get,
-            gw,
-            gh,
-            predictors[chan],
-            grad_pack_fn,
-            gradient,
-            out,
-            wp_params,
-        );
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct GradientScratch {
-    pub(crate) cur: Vec<i32>,
-    pub(crate) prev: Vec<i32>,
-    pub(crate) prev_prev: Vec<i32>,
-    pub(crate) buf: Vec<u32>,
-}
-
-/// Tokenize one channel's group-local rectangle with the chosen predictor
-/// (`PREDICTOR_GRADIENT` or `PREDICTOR_WEIGHTED`). Neighbors use libjxl's exact
-/// border conventions (see weighted::State / Predict()):
-///   left = x>0 ? W : (y>0 ? N : 0); top = y>0 ? N : left;
-///   topleft = (x&&y) ? NW : left; topright = (x+1<w && y) ? NE : top;
-///   toptop  = y>1 ? NN : top.
-fn tokenize_plane(
-    ctx: u32,
-    get: impl Fn(usize, usize) -> i32,
-    gw: usize,
-    gh: usize,
-    pred_id: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    scratch: &mut GradientScratch,
-    out: &mut Vec<Token>,
-) {
-    tokenize_plane_with_wp(
-        ctx,
-        get,
-        gw,
-        gh,
-        pred_id,
-        grad_pack_fn,
-        scratch,
-        out,
-        WpParams::DEFAULT,
-    );
-}
-
-trait TokenSink {
-    fn push_token(&mut self, token: Token);
-}
-
-impl TokenSink for Vec<Token> {
-    #[inline(always)]
-    fn push_token(&mut self, token: Token) {
-        self.push(token);
-    }
-}
-
-impl TokenSink for RunLzWriter {
-    #[inline(always)]
-    fn push_token(&mut self, token: Token) {
-        self.push(token);
-    }
-}
-
-#[inline(always)]
-fn push_wp_token(ctx: u32, value: i64, prediction: i64, out: &mut impl TokenSink) {
-    out.push_token(Token::new(ctx, pack_signed((value - prediction) as i32)));
-}
-
-/// The first, second, and interior row kernels deliberately have separate
-/// border handling. Besides keeping branches out of the interior loop, this is
-/// the dispatch seam for a future vector implementation of the row arithmetic.
-fn tokenize_wp_first_row<T: Copy>(
-    ctx: u32,
-    current: &[T],
-    wp: &mut WpState,
-    out: &mut impl TokenSink,
-) where
-    i64: From<T>,
-{
-    let row = wp.row_offsets(0);
-    let mut left = 0i64;
-    for (x, &value) in current.iter().enumerate() {
-        let value = i64::from(value);
-        let prediction = wp.predict_and_update(
-            value,
-            x,
-            row,
-            WpNeighbors {
-                north: left,
-                west: left,
-                north_east: left,
-                north_west: left,
-                north_north: left,
-            },
-        );
-        push_wp_token(ctx, value, prediction, out);
-        left = value;
-    }
-}
-
-fn tokenize_wp_second_row<T: Copy>(
-    ctx: u32,
-    current: &[T],
-    north: &[T],
-    wp: &mut WpState,
-    out: &mut impl TokenSink,
-) where
-    i64: From<T>,
-{
-    let row = wp.row_offsets(1);
-    for (x, &value) in current.iter().enumerate() {
-        let value = i64::from(value);
-        let n = i64::from(north[x]);
-        let w = if x == 0 { n } else { i64::from(current[x - 1]) };
-        let prediction = wp.predict_and_update(
-            value,
-            x,
-            row,
-            WpNeighbors {
-                north: n,
-                west: w,
-                north_east: north.get(x + 1).map_or(n, |&v| i64::from(v)),
-                north_west: if x == 0 { w } else { i64::from(north[x - 1]) },
-                north_north: n,
-            },
-        );
-        push_wp_token(ctx, value, prediction, out);
-    }
-}
-
-fn tokenize_wp_interior_row<T: Copy>(
-    ctx: u32,
-    y: usize,
-    current: &[T],
-    north: &[T],
-    north_north: &[T],
-    wp: &mut WpState,
-    out: &mut impl TokenSink,
-) where
-    i64: From<T>,
-{
-    let row = wp.row_offsets(y);
-    for (x, &value) in current.iter().enumerate() {
-        let value = i64::from(value);
-        let n = i64::from(north[x]);
-        let w = if x == 0 { n } else { i64::from(current[x - 1]) };
-        let prediction = wp.predict_and_update(
-            value,
-            x,
-            row,
-            WpNeighbors {
-                north: n,
-                west: w,
-                north_east: north.get(x + 1).map_or(n, |&v| i64::from(v)),
-                north_west: if x == 0 { w } else { i64::from(north[x - 1]) },
-                north_north: i64::from(north_north[x]),
-            },
-        );
-        push_wp_token(ctx, value, prediction, out);
-    }
-}
-
-fn tokenize_wp_row_slices<'a, T: Copy + 'a>(
-    ctx: u32,
-    get_row: impl Fn(usize) -> &'a [T],
-    gw: usize,
-    gh: usize,
-    out: &mut impl TokenSink,
-    wp_params: WpParams,
-) where
-    i64: From<T>,
-{
-    if gw == 0 || gh == 0 {
-        return;
-    }
-    let mut wp = WpState::with_params(gw, wp_params);
-    let first = get_row(0);
-    debug_assert_eq!(first.len(), gw);
-    tokenize_wp_first_row(ctx, first, &mut wp, out);
-    if gh == 1 {
-        return;
-    }
-    let second = get_row(1);
-    debug_assert_eq!(second.len(), gw);
-    tokenize_wp_second_row(ctx, second, first, &mut wp, out);
-    let mut north_north = first;
-    let mut north = second;
-    for y in 2..gh {
-        let current = get_row(y);
-        debug_assert_eq!(current.len(), gw);
-        tokenize_wp_interior_row(ctx, y, current, north, north_north, &mut wp, out);
-        north_north = north;
-        north = current;
-    }
-}
-
-fn tokenize_wp_rows_from_get(
-    ctx: u32,
-    get: &impl Fn(usize, usize) -> i32,
-    gw: usize,
-    gh: usize,
-    scratch: &mut GradientScratch,
-    out: &mut impl TokenSink,
-    wp_params: WpParams,
-) {
-    if gw == 0 || gh == 0 {
-        return;
-    }
-    if scratch.cur.len() < gw {
-        scratch.cur.resize(gw, 0);
-    }
-    if scratch.prev.len() < gw {
-        scratch.prev.resize(gw, 0);
-    }
-    if scratch.prev_prev.len() < gw {
-        scratch.prev_prev.resize(gw, 0);
-    }
-
-    let mut current = &mut scratch.cur[..gw];
-    let mut north = &mut scratch.prev[..gw];
-    let mut north_north = &mut scratch.prev_prev[..gw];
-    let mut wp = WpState::with_params(gw, wp_params);
-    for y in 0..gh {
-        if y != 0 {
-            std::mem::swap(&mut north_north, &mut north);
-            std::mem::swap(&mut north, &mut current);
-        }
-        for (x, value) in current.iter_mut().enumerate() {
-            *value = get(x, y);
-        }
-        match y {
-            0 => tokenize_wp_first_row(ctx, current, &mut wp, out),
-            1 => tokenize_wp_second_row(ctx, current, north, &mut wp, out),
-            _ => tokenize_wp_interior_row(ctx, y, current, north, north_north, &mut wp, out),
-        }
-    }
-}
-
-fn tokenize_plane_with_wp(
-    ctx: u32,
-    get: impl Fn(usize, usize) -> i32,
-    gw: usize,
-    gh: usize,
-    pred_id: u32,
-    grad_pack_fn: GradPackInteriorFn,
-    scratch: &mut GradientScratch,
-    out: &mut impl TokenSink,
-    wp_params: WpParams,
-) {
-    if pred_id == PREDICTOR_WEIGHTED {
-        tokenize_wp_rows_from_get(ctx, &get, gw, gh, scratch, out, wp_params);
-    } else if pred_id == PREDICTOR_GRADIENT {
-        // Gradient (ClampedGradient): per-pixel independent, pure integer ->
-        // vectorized over the interior of each row.
-        if scratch.buf.len() < gw {
-            scratch.buf.resize(gw, 0);
-        }
-        if scratch.cur.len() < gw {
-            scratch.cur.resize(gw, 0);
-        }
-        if scratch.prev.len() < gw {
-            scratch.prev.resize(gw, 0);
-        }
-        let mut cur = &mut scratch.cur[..gw];
-        let mut prev = &mut scratch.prev[..gw];
-        let buf = &mut scratch.buf[..gw];
-        for gy in 0..gh {
-            std::mem::swap(&mut cur, &mut prev); // prev = last row's cur
-            for (gx, c) in cur.iter_mut().enumerate() {
-                *c = get(gx, gy);
-            }
-            if gy == 0 {
-                buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
-                for gx in 1..gw {
-                    buf[gx] = pack_signed(cur[gx].wrapping_sub(cur[gx - 1]));
-                    // pred = W
-                }
-            } else {
-                buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
-                grad_pack_fn(cur, prev, buf, gw); // gx in 1..gw
-            }
-            for &b in buf.iter().take(gw) {
-                out.push_token(Token::new(ctx, b));
-            }
-        }
-    } else {
-        debug_assert!(matches!(
-            pred_id,
-            PREDICTOR_AVERAGE4 | PREDICTOR_SELECT | PREDICTOR_LEFT | PREDICTOR_TOP
-        ));
-        for gy in 0..gh {
-            for gx in 0..gw {
-                let value = get(gx, gy) as i64;
-                let neighbors = predictor_neighbors(&get, gx, gy, gw);
-                let pred = predictor_value(pred_id, neighbors, 0);
-                out.push_token(Token::new(ctx, pack_signed((value - pred) as i32)));
-            }
-        }
-    }
-}
-type GradPackInteriorFn = fn(&[i32], &[i32], &mut [u32], usize);
-fn select_grad_pack_interior_fn() -> GradPackInteriorFn {
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") {
-        return |c, p, o, g| unsafe { crate::avx::grad_pack_interior(c, p, o, g) };
-    }
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    if is_x86_feature_detected!("sse4.1") {
-        return |c, p, o, g| unsafe { crate::sse::grad_pack_interior(c, p, o, g) };
-    }
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        |c, p, o, g| unsafe { crate::neon::grad_pack_interior(c, p, o, g) }
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-    {
-        crate::wasm::grad_pack_interior
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", feature = "neon"),
-        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
-    )))]
-    {
-        grad_pack_interior_scalar
-    }
-}
-
-static GRAD_PACK_INTERIOR_FN: OnceLock<GradPackInteriorFn> = OnceLock::new();
-
-#[inline]
-fn selected_grad_pack_interior_fn() -> GradPackInteriorFn {
-    *GRAD_PACK_INTERIOR_FN.get_or_init(select_grad_pack_interior_fn)
-}
-
-#[allow(unused)]
-fn grad_pack_interior_scalar(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
-    for gx in 1..gw {
-        let w = cur[gx - 1];
-        let n = prev[gx];
-        let nw = prev[gx - 1];
-        let ac = w.wrapping_sub(nw);
-        let bc = n.wrapping_sub(nw);
-        let grad = ac.wrapping_add(n);
-        let clamp = if (w.wrapping_sub(n) ^ bc) < 0 { n } else { w };
-        let pred = if (ac ^ bc) < 0 { grad } else { clamp };
-        out[gx] = pack_signed(cur[gx].wrapping_sub(pred));
-    }
-}
-
-#[derive(Default)]
-struct PredictorCosts {
-    histograms: [Vec<u64>; SLOW_PREDICTORS.len()],
-    /// Residual histogram for the Zero predictor (the raw values). Collected
-    /// only when `collect_zero` is set (the lossy-modular path); the lossless
-    /// callers skip the extra bump.
-    zero_hist: Vec<u64>,
-    collect_zero: bool,
-    total: u64,
-}
-
-impl PredictorCosts {
-    #[inline]
-    fn add(&mut self, value: i64, neighbors: PredictorNeighbors, weighted: i64) {
-        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate() {
-            let pred = predictor_value(pred_id, neighbors, weighted);
-            let symbol = pack_signed((value - pred) as i32) as usize;
-            let hist = &mut self.histograms[candidate];
-            if hist.len() <= symbol {
-                hist.resize(symbol + 1, 0);
-            }
-            hist[symbol] += 1;
-        }
-        if self.collect_zero {
-            let symbol = pack_signed(value as i32) as usize;
-            if self.zero_hist.len() <= symbol {
-                self.zero_hist.resize(symbol + 1, 0);
-            }
-            self.zero_hist[symbol] += 1;
-        }
-        self.total += 1;
-    }
-
-    /// Best predictor among Zero and the scale-equivariant subset — the only
-    /// predictors a channel coded at 1/q scale with a leaf multiplier can use.
-    fn best_safe_predictor(&self) -> u32 {
-        debug_assert!(self.collect_zero);
-        let mut best_id = PREDICTOR_ZERO;
-        let mut best_bits = entropy_of_hist(&self.zero_hist, self.total);
-        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate() {
-            if !matches!(
-                pred_id,
-                PREDICTOR_GRADIENT | PREDICTOR_SELECT | PREDICTOR_LEFT | PREDICTOR_TOP
-            ) {
-                continue;
-            }
-            let bits = entropy_of_hist(&self.histograms[candidate], self.total);
-            if bits < best_bits {
-                best_bits = bits;
-                best_id = pred_id;
-            }
-        }
-        best_id
-    }
-
-    fn best_predictor(&self, use_wp: bool) -> u32 {
-        // Without WP the Weighted candidate (index 0) is skipped.
-        let first = usize::from(!use_wp);
-        let mut best_id = SLOW_PREDICTORS[first];
-        let mut best_bits = entropy_of_hist(&self.histograms[first], self.total);
-        for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate().skip(first + 1) {
-            let bits = entropy_of_hist(&self.histograms[candidate], self.total);
-            if bits < best_bits {
-                best_bits = bits;
-                best_id = pred_id;
-            }
-        }
-        best_id
-    }
-}
-
-/// Evaluate all Slow-mode predictors in one traversal and choose the lowest
-/// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
-fn choose_predictor_for_plane(
-    get: impl Fn(usize, usize) -> i32,
-    w: usize,
-    h: usize,
-    use_wp: bool,
-) -> u32 {
-    choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT, use_wp)
-}
-
-fn choose_predictor_for_plane_with_wp(
-    get: impl Fn(usize, usize) -> i32,
-    w: usize,
-    h: usize,
-    wp_params: WpParams,
-    use_wp: bool,
-) -> u32 {
-    if w == 0 || h == 0 {
-        return fixed_predictor(use_wp);
-    }
-    let disabled = !use_wp;
-    let mut wp = WpState::with_params(w, wp_params);
-    let mut costs = PredictorCosts::default();
-    for gy in 0..h {
-        for gx in 0..w {
-            let value = get(gx, gy) as i64;
-            let neighbors = predictor_neighbors(&get, gx, gy, w);
-            let weighted = if disabled {
-                0
-            } else {
-                wp.predict(
-                    gx,
-                    gy,
-                    neighbors.top,
-                    neighbors.left,
-                    neighbors.top_right,
-                    neighbors.top_left,
-                    neighbors.top_top,
-                )
-            };
-            costs.add(value, neighbors, weighted);
-            if !disabled {
-                wp.update(value, gx, gy);
-            }
-        }
-    }
-    costs.best_predictor(use_wp)
-}
-
-fn choose_predictors_with_wp(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    wp_params: WpParams,
-    use_wp: bool,
-) -> [u32; 4] {
-    let mut preds = [fixed_predictor(use_wp); 4];
-    let num_channels = 3 + usize::from(alpha.is_some());
-    let selected = pool.steal_map(scratch, num_channels, |chan, _scratch| {
-        if chan < 3 {
-            let pd = linear.plane_data(chan);
-            choose_predictor_for_plane_with_wp(
-                |x, y| pd[y * xsize + x],
-                xsize,
-                ysize,
-                wp_params,
-                use_wp,
-            )
-        } else {
-            let a = alpha.expect("alpha channel must exist");
-            choose_predictor_for_plane_with_wp(
-                |x, y| a.get_i32(y * xsize + x),
-                xsize,
-                ysize,
-                wp_params,
-                use_wp,
-            )
-        }
-    });
-    preds[..num_channels].copy_from_slice(&selected);
-    if alpha.is_none() {
-        preds[3] = fixed_predictor(use_wp);
-    }
-    preds
 }
 
 // ---------------------------------------------------------------------------
@@ -4631,13 +1777,6 @@ fn build_context_tree(nb_chans: usize, preds: &[u32], t: &[i32]) -> CtTree {
         ),
         _ => unreachable!("context tree supports 1..=4 channels"),
     }
-}
-
-#[inline]
-fn clamped_gradient(w: i64, n: i64, nw: i64) -> i64 {
-    let lo = w.min(n);
-    let hi = w.max(n);
-    (w + n - nw).clamp(lo, hi)
 }
 
 fn order0_entropy(vals: &[u32], cell: &mut Vec<u64>) -> f32 {
@@ -4851,205 +1990,16 @@ fn pick_threshold_grouped(
 // and routes every pixel through the learned tree.
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// RCT selection: YCoCg (type 6) is a strong default, but content with weak or
-// atypical channel correlation prefers one of the other reversible transforms
-// (subtract-green and half-average families). Candidates and cost model follow
-// libjxl: fixed 18-context gradient-residual token entropy per channel.
-// ---------------------------------------------------------------------------
-
-/// Candidate rct_types in libjxl's try order (first 7 = cjxl -e7's set):
-/// none, YCoCg, G-half-avg, subtract-green, and half-average variants.
-const RCT_CANDIDATES: [u32; 7] = [0, 6, 5, 10, 26, 40, 12];
-const RCT_CONTEXT_CUTOFFS: [u32; 17] = [
-    0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500,
-];
-const RCT_CONTEXT_MAX_DIFF: u32 = 500;
-const RCT_CONTEXT_LUT: [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] = {
-    let mut lut = [0u8; RCT_CONTEXT_MAX_DIFF as usize + 1];
-    let mut diff = 0usize;
-    while diff < lut.len() {
-        let mut cutoff = 0usize;
-        let mut context = 0u8;
-        while cutoff < RCT_CONTEXT_CUTOFFS.len() {
-            if (diff as u32) < RCT_CONTEXT_CUTOFFS[cutoff] {
-                context += 1;
-            }
-            cutoff += 1;
-        }
-        lut[diff] = context;
-        diff += 1;
-    }
-    lut
-};
-
-#[inline(always)]
-fn rct_context(max_diff: u32) -> usize {
-    RCT_CONTEXT_LUT[max_diff.min(RCT_CONTEXT_MAX_DIFF) as usize] as usize
-}
-
-/// Channel order fed to the elementary transform for permutation `perm`
-/// (0=RGB, 1=GBR, 2=BRG, 3=RBG, 4=GRB, 5=BGR).
-#[inline]
-fn rct_perm(perm: usize) -> [usize; 3] {
-    [
-        perm % 3,
-        (perm + 1 + perm / 3) % 3,
-        (perm + 2 - perm / 3) % 3,
-    ]
-}
-
-/// Forward elementary RCT `t` (rct_type % 7) on already-permuted values.
-#[inline]
-fn rct_forward_pixel(t: u32, first: i32, second: i32, third: i32) -> (i32, i32, i32) {
-    if t == 6 {
-        let o1 = first - third;
-        let tmp = third + (o1 >> 1);
-        let o2 = second - tmp;
-        (tmp + (o2 >> 1), o1, o2)
-    } else {
-        let s = match t >> 1 {
-            1 => second - first,
-            2 => second - ((first + third) >> 1),
-            _ => second,
-        };
-        let th = if t & 1 == 1 { third - first } else { third };
-        (first, s, th)
-    }
-}
-
-#[inline]
-fn rct_from_ycocg_pixel(y: i32, co: i32, cg: i32, rct: u32) -> (i32, i32, i32) {
-    if rct == 6 {
-        return (y, co, cg);
-    }
-    let rgb = inverse_ycocg(y, co, cg);
-    let rgb = [rgb.0, rgb.1, rgb.2];
-    let perm = rct_perm((rct / 7) as usize);
-    rct_forward_pixel(rct % 7, rgb[perm[0]], rgb[perm[1]], rgb[perm[2]])
-}
-
-/// Port of libjxl's EstimateCost: gradient-predictor residual token entropy
-/// over 18 local-activity contexts per channel, plus raw bits. Candidate pixels
-/// are derived directly from the input YCoCg planes, avoiding a temporary RGB
-/// image shared by the seven scoring passes.
-fn estimate_rct_cost(
-    linear: &Image3Si,
-    xsize: usize,
-    ysize: usize,
-    rct: u32,
-    row_scratch: &mut GradientScratch,
-) -> f32 {
-    const NCTX: usize = 18;
-    const ALPHA: usize = 64;
-    let y_plane = linear.plane_data(0);
-    let co_plane = linear.plane_data(1);
-    let cg_plane = linear.plane_data(2);
-    let mut hist = [0u64; 3 * NCTX * ALPHA];
-    let mut extra_bits: u64 = 0;
-    row_scratch.prev.resize(3 * xsize, 0);
-    row_scratch.cur.resize(3 * xsize, 0);
-    row_scratch.prev.fill(0);
-    let GradientScratch { prev, cur, .. } = row_scratch;
-    let (mut prev, mut cur) = (prev, cur);
-    for y in 0..ysize {
-        let yy = &y_plane[y * xsize..][..xsize];
-        let co = &co_plane[y * xsize..][..xsize];
-        let cg = &cg_plane[y * xsize..][..xsize];
-        for x in 0..xsize {
-            let (a, b, c) = rct_from_ycocg_pixel(yy[x], co[x], cg[x], rct);
-            cur[x] = a;
-            cur[xsize + x] = b;
-            cur[2 * xsize + x] = c;
-        }
-        for ch in 0..3usize {
-            let crow = &cur[ch * xsize..][..xsize];
-            let prow = &prev[ch * xsize..][..xsize];
-            let chist = &mut hist[ch * NCTX * ALPHA..][..NCTX * ALPHA];
-            for x in 0..xsize {
-                let left = if x > 0 {
-                    crow[x - 1]
-                } else if y > 0 {
-                    prow[x]
-                } else {
-                    0
-                };
-                let top = if y > 0 { prow[x] } else { left };
-                let topleft = if x > 0 && y > 0 { prow[x - 1] } else { left };
-                let mx = left.max(top).max(topleft);
-                let mn = left.min(top).min(topleft);
-                let max_diff = (mx - mn) as u32;
-                let ctx = rct_context(max_diff);
-                let res =
-                    crow[x] as i64 - clamped_gradient(left as i64, top as i64, topleft as i64);
-                let (tok, nb, _) = uint_encode(pack_signed(res as i32));
-                chist[ctx * ALPHA + (tok as usize).min(ALPHA - 1)] += 1;
-                extra_bits += nb as u64;
-            }
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    let mut cost = extra_bits as f32;
-    for h in hist.as_chunks::<ALPHA>().0 {
-        let total: u64 = h.iter().sum();
-        cost += entropy_of_hist(h, total);
-    }
-    cost
-}
-
-/// Estimate every candidate RCT and return the winner's planes when it is not
-/// YCoCg (in which case the caller keeps the input planes unchanged).
-fn select_rct(
-    linear: &Image3Si,
-    xsize: usize,
-    ysize: usize,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-) -> Option<(u32, Image3Si)> {
-    let costs = pool.steal_map(scratch, RCT_CANDIDATES.len(), |i, scratch| {
-        estimate_rct_cost(
-            linear,
-            xsize,
-            ysize,
-            RCT_CANDIDATES[i],
-            &mut scratch.gradient,
-        )
-    });
-    let mut best = 0usize;
-    for (i, &c) in costs.iter().enumerate() {
-        if c < costs[best] {
-            best = i;
-        }
-    }
-    let rct = RCT_CANDIDATES[best];
-    if rct == 6 {
-        return None;
-    }
-    let mut out = Image3Si::new(xsize, ysize);
-    for y in 0..ysize {
-        let [o0, o1, o2] = out.all_plane_rows_mut(y);
-        let yy = &linear.plane_data(0)[y * xsize..][..xsize];
-        let co = &linear.plane_data(1)[y * xsize..][..xsize];
-        let cg = &linear.plane_data(2)[y * xsize..][..xsize];
-        for x in 0..xsize {
-            let (a, b, c) = rct_from_ycocg_pixel(yy[x], co[x], cg[x], rct);
-            o0[x] = a;
-            o1[x] = b;
-            o2[x] = c;
-        }
-    }
-    Some((rct, out))
-}
-
-/// Target sample count for tree learning (across all channels/groups). Above
-/// this size the learner's best-first search dominates Slow encoding;
-/// 256K samples preserve a dense image-wide probe without letting its cost
-/// scale with the full pixel count.
-const MA_TARGET_SAMPLES: usize = 1 << 19;
+/// Target sample count for tree learning (across all channels/groups). Photos
+/// stop gaining well below this (Kodak: stride 1 is not better than 3), but
+/// graphics with many near-deterministic contexts keep gaining: the 17 MP
+/// Burning Ship fractal is −3.4% at 2M samples over 512K. Only one layout's
+/// sample set is alive at a time (110 B per sample with two reference channels).
+const MA_TARGET_SAMPLES: usize = 1 << 21;
 /// Preserve full sampling for genuinely small images. Above the former 256K
 /// target, a stride of three is both cheaper and less prone to fitting local
 /// pixel-phase noise than switching abruptly to a full-image sample.
-const MA_FULL_SAMPLE_LIMIT: usize = 1 << 18;
+const MA_FULL_SAMPLE_LIMIT: usize = 1 << 22;
 /// First-stage learner budget. Most unhelpful or simple trees terminate here;
 /// only a saturated tree with a clear rate win is retrained on the full probe.
 const MA_COARSE_TARGET_SAMPLES: usize = 1 << 16;
@@ -5059,135 +2009,302 @@ const MA_DEEPEN_MIN_SAVINGS: f64 = 0.02;
 /// best-first, so this mostly prunes the tail once the leaf budget is spent.
 const MA_SPLIT_COST_BITS: f32 = 100.0;
 /// Leaf cap: pixel contexts + the LZ77 distance context must fit the
-/// LZ77_MAX_CONTEXTS scratch; clustering reduces them to <= 64 histograms.
-/// Best-first growth adds exactly one leaf per split, so the cap is hard.
+/// LZ77_MAX_CONTEXTS scratch; ANS clustering reduces them to <= 128
+/// histograms. Best-first growth adds exactly one leaf per split, so the cap
+/// is hard.
 const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 /// Minimum samples in a node before it must become a leaf.
 const MA_MIN_NODE_SAMPLES: usize = 128;
+/// Predictors each side of a candidate split may choose from (the node's
+/// cheapest ones). Kodak: 4..14 all land within 0.02%; 3 loses 0.24%.
+const MA_SIDE_PREDS: usize = 4;
 
 /// Walk one channel rectangle in scan order, feeding the visitor the property
 /// vector (libjxl ids 0..=15), the neighborhood, and the WP prediction of
 /// every pixel.
-fn walk_channel_ma<F: Fn(usize, usize) -> i32>(
-    get: &F,
+/// A previously coded channel of the same size as the one being walked,
+/// cropped like it: the source of the decoder's reference properties.
+#[derive(Clone, Copy)]
+struct MaRefPlane<'a> {
+    pixels: &'a [i32],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+}
+
+/// libjxl `PrecomputeReferences`: per reference channel |v|, v, |v − g|,
+/// v − g, with left = 0 at the crop's left edge, top = left on its first row
+/// and top-left = left on either edge, g the clamped gradient.
+#[inline]
+fn ref_props(refs: &[MaRefPlane<'_>], x: usize, y: usize, p: &mut [i32; NUM_MA_PROPS]) {
+    for (k, r) in refs.iter().take(MA_REF_CHANNELS).enumerate() {
+        let row = &r.pixels[(r.y0 + y) * r.stride + r.x0..];
+        let v = row[x] as i64;
+        let left = if x > 0 { row[x - 1] as i64 } else { 0 };
+        let (top, top_left) = if y > 0 {
+            let above = &r.pixels[(r.y0 + y - 1) * r.stride + r.x0..];
+            (
+                above[x] as i64,
+                if x > 0 { above[x - 1] as i64 } else { left },
+            )
+        } else {
+            (left, left)
+        };
+        let g = (left + top - top_left).clamp(left.min(top), left.max(top));
+        let base = 16 + 4 * k;
+        p[base] = v.abs() as i32;
+        p[base + 1] = v as i32;
+        p[base + 2] = (v - g).abs() as i32;
+        p[base + 3] = (v - g) as i32;
+    }
+}
+
+fn walk_channel_ma<'a, T: Copy + 'a>(
+    get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
     chan: u32,
+    stream: i32,
+    refs: &[MaRefPlane<'a>],
     wp_params: WpParams,
     use_wp: bool,
     mut visit: impl FnMut(usize, usize, i64, &[i32; NUM_MA_PROPS], PredictorNeighbors, i64),
-) {
+) where
+    i64: From<T>,
+{
     let disabled = !use_wp;
     let mut wp = WpState::with_params(gw, wp_params);
     let mut p = [0i32; NUM_MA_PROPS];
     p[0] = chan as i32;
+    p[1] = stream;
+    let mut north_row: &[T] = &[];
+    let mut north_north_row: &[T] = &[];
     for y in 0..gh {
+        let current_row = get_row(y);
+        assert_eq!(current_row.len(), gw);
+        // Bind valid rows even at the top border, so all three lengths are
+        // established before entering the pixel loop.
+        if y == 0 {
+            north_row = current_row;
+        }
+        if y < 2 {
+            north_north_row = north_row;
+        }
+        assert_eq!(north_row.len(), gw);
+        assert_eq!(north_north_row.len(), gw);
         let row = wp.row_offsets(y);
-        let mut west = 0i64;
-        let mut west_west = 0i64;
         p[2] = y as i32;
         p[9] = 0; // "local gradient" carry, reset per row (InitPropsRow)
-        for x in 0..gw {
-            let value = get(x, y) as i64;
-            let top = if y > 0 { get(x, y - 1) as i64 } else { west };
-            let left = if x > 0 { west } else { top };
-            let top_left = if x > 0 && y > 0 {
-                get(x - 1, y - 1) as i64
-            } else {
-                left
-            };
-            let top_right = if x + 1 < gw && y > 0 {
-                get(x + 1, y - 1) as i64
-            } else {
-                top
-            };
-            let top_top = if y > 1 { get(x, y - 2) as i64 } else { top };
-            let n = PredictorNeighbors {
-                left,
-                top,
-                top_left,
-                top_right,
-                left_left: if x > 1 { west_west } else { left },
-                top_top,
-                top_right_right: if x + 2 < gw && y > 0 {
-                    get(x + 2, y - 1) as i64
+        // Keep the visitor in each loop body. Passing this large WP/property
+        // update through a row callback can outline a call for every pixel.
+        macro_rules! visit_pixel {
+            ($x:expr, $value:expr, $neighbors:expr) => {{
+                let x = $x;
+                let value = $value;
+                let n = $neighbors;
+                p[3] = x as i32;
+                p[4] = n.top.abs() as i32;
+                p[5] = n.left.abs() as i32;
+                p[6] = n.top as i32;
+                p[7] = n.left as i32;
+                // p[8] reads the previous pixel's p[9] (0 at row start).
+                p[8] = (n.left - p[9] as i64) as i32;
+                p[9] = (n.left + n.top - n.top_left) as i32;
+                p[10] = (n.left - n.top_left) as i32;
+                p[11] = (n.top_left - n.top) as i32;
+                p[12] = (n.top - n.top_right) as i32;
+                p[13] = (n.top - n.top_top) as i32;
+                p[14] = (n.left - n.left_left) as i32;
+                let wp_pred = if disabled {
+                    0
                 } else {
-                    top_right
-                },
-            };
-            p[3] = x as i32;
-            p[4] = n.top.abs() as i32;
-            p[5] = n.left.abs() as i32;
-            p[6] = n.top as i32;
-            p[7] = n.left as i32;
-            // p[8] reads the previous pixel's p[9] (0 at row start).
-            p[8] = (n.left - p[9] as i64) as i32;
-            p[9] = (n.left + n.top - n.top_left) as i32;
-            p[10] = (n.left - n.top_left) as i32;
-            p[11] = (n.top_left - n.top) as i32;
-            p[12] = (n.top - n.top_right) as i32;
-            p[13] = (n.top - n.top_top) as i32;
-            p[14] = (n.left - n.left_left) as i32;
-            let wp_pred = if disabled {
-                0
-            } else {
-                wp.predict_and_update(
-                    value,
-                    x,
-                    row,
-                    WpNeighbors {
-                        north: n.top,
-                        west: n.left,
-                        north_east: n.top_right,
-                        north_west: n.top_left,
-                        north_north: n.top_top,
-                    },
-                )
-            };
-            p[15] = if disabled { 0 } else { wp.wp_prop as i32 };
-            visit(x, y, value, &p, n, wp_pred);
-            west_west = west;
-            west = value;
+                    wp.predict_and_update_flat(
+                        value,
+                        x,
+                        row,
+                        WpNeighbors {
+                            north: n.top,
+                            west: n.left,
+                            north_east: n.top_right,
+                            north_west: n.top_left,
+                            north_north: n.top_top,
+                        },
+                    )
+                };
+                p[15] = if disabled { 0 } else { wp.wp_prop as i32 };
+                ref_props(refs, x, y, &mut p);
+                visit(x, y, value, &p, n, wp_pred);
+            }};
         }
+        if y == 0 {
+            if let Some((&first, tail)) = current_row.split_first() {
+                let first = i64::from(first);
+                visit_pixel!(
+                    0,
+                    first,
+                    PredictorNeighbors {
+                        left: 0,
+                        top: 0,
+                        top_left: 0,
+                        top_right: 0,
+                        left_left: 0,
+                        top_top: 0,
+                        top_right_right: 0,
+                    }
+                );
+                let mut left = first;
+                let mut left_left = first;
+                for (x, &value) in tail.iter().enumerate() {
+                    let value = i64::from(value);
+                    visit_pixel!(
+                        x + 1,
+                        value,
+                        PredictorNeighbors {
+                            left,
+                            top: left,
+                            top_left: left,
+                            top_right: left,
+                            left_left,
+                            top_top: left,
+                            top_right_right: left,
+                        }
+                    );
+                    left_left = left;
+                    left = value;
+                }
+            }
+        } else {
+            let edge = |x: usize| {
+                let top = i64::from(north_row[x]);
+                let left = if x > 0 {
+                    i64::from(current_row[x - 1])
+                } else {
+                    top
+                };
+                let top_right = north_row.get(x + 1).map_or(top, |&v| i64::from(v));
+                PredictorNeighbors {
+                    left,
+                    top,
+                    top_left: if x > 0 {
+                        i64::from(north_row[x - 1])
+                    } else {
+                        left
+                    },
+                    top_right,
+                    left_left: if x > 1 {
+                        i64::from(current_row[x - 2])
+                    } else {
+                        left
+                    },
+                    top_top: i64::from(north_north_row[x]),
+                    top_right_right: north_row.get(x + 2).map_or(top_right, |&v| i64::from(v)),
+                }
+            };
+            for (x, &value) in current_row.iter().take(2).enumerate() {
+                visit_pixel!(x, i64::from(value), edge(x));
+            }
+            if gw > 4 {
+                let mut left = i64::from(current_row[1]);
+                let mut left_left = i64::from(current_row[0]);
+                let pixels = current_row[2..gw - 2]
+                    .iter()
+                    .zip(north_row[1..].array_windows::<4>())
+                    .zip(&north_north_row[2..]);
+                for (x, ((&value, &[nw, n, ne, nee]), &nn)) in pixels.enumerate() {
+                    let value = i64::from(value);
+                    visit_pixel!(
+                        x + 2,
+                        value,
+                        PredictorNeighbors {
+                            left,
+                            top: i64::from(n),
+                            top_left: i64::from(nw),
+                            top_right: i64::from(ne),
+                            left_left,
+                            top_top: i64::from(nn),
+                            top_right_right: i64::from(nee),
+                        }
+                    );
+                    left_left = left;
+                    left = value;
+                }
+            }
+            for x in gw.saturating_sub(2).max(2)..gw {
+                visit_pixel!(x, i64::from(current_row[x]), edge(x));
+            }
+        }
+        north_north_row = north_row;
+        north_row = current_row;
     }
 }
 
-/// Append every `stride`-th pixel of the channel rectangle to `samples`,
-/// with the residual token under every decoder predictor.
-fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
-    get: &F,
+/// Exact sample count for the rotating row phase.
+fn ma_channel_sample_count(w: usize, h: usize, stride: usize) -> usize {
+    // A complete cycle of row phases selects exactly w samples. In the
+    // remaining rows, the first w % stride phases select one extra sample.
+    (h / stride) * w + (h % stride) * (w / stride) + (h % stride).min(w % stride)
+}
+
+/// Visit the selected pixels with residual tokens under every decoder predictor.
+fn sample_channel_ma<'a, T: Copy + 'a>(
+    get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
     chan: u32,
+    stream: i32,
+    refs: &[MaRefPlane<'a>],
     wp_params: WpParams,
     use_wp: bool,
     stride: usize,
-    samples: &mut MaSamples,
-) {
+    mut push: impl FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS]),
+) where
+    i64: From<T>,
+{
     debug_assert!(stride != 0);
     let disabled = !use_wp;
     let mut wp = WpState::with_params(gw, wp_params);
-    let mut until_sample = stride;
+    let mut north_row: &[T] = &[];
+    let mut north_north_row: &[T] = &[];
     for y in 0..gh {
+        let current_row = get_row(y);
+        assert_eq!(current_row.len(), gw);
+        // Bind valid rows even at the top border, so all three lengths are
+        // established before entering the pixel loop.
+        if y == 0 {
+            north_row = current_row;
+        }
+        if y < 2 {
+            north_north_row = north_row;
+        }
+        assert_eq!(north_row.len(), gw);
+        assert_eq!(north_north_row.len(), gw);
         let row = wp.row_offsets(y);
         let mut west = 0i64;
         let mut west_west = 0i64;
         let mut previous_local_gradient = 0i32;
+        // Rotate the sampling phase every row so the probe never locks onto
+        // one column residue (a row width divisible by the stride would
+        // otherwise sample a single x phase for the whole channel).
+        let mut until_sample = 1 + y % stride;
         for x in 0..gw {
-            let value = get(x, y) as i64;
-            let north = if y > 0 { get(x, y - 1) as i64 } else { west };
+            let value = i64::from(current_row[x]);
+            let north = if y > 0 { i64::from(north_row[x]) } else { west };
             let left = if x > 0 { west } else { north };
             let top_left = if x > 0 && y > 0 {
-                get(x - 1, y - 1) as i64
+                i64::from(north_row[x - 1])
             } else {
                 left
             };
             let top_right = if x + 1 < gw && y > 0 {
-                get(x + 1, y - 1) as i64
+                i64::from(north_row[x + 1])
             } else {
                 north
             };
-            let top_top = if y > 1 { get(x, y - 2) as i64 } else { north };
+            let top_top = if y > 1 {
+                i64::from(north_north_row[x])
+            } else {
+                north
+            };
             let wp_pred = if disabled {
                 0
             } else {
@@ -5198,7 +2315,7 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
                     north_west: top_left,
                     north_north: top_top,
                 };
-                wp.predict_and_update(value, x, row, wp_neighbors)
+                wp.predict_and_update_flat(value, x, row, wp_neighbors)
             };
             let local_gradient = (left + north - top_left) as i32;
 
@@ -5213,13 +2330,14 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
                     left_left: if x > 1 { west_west } else { left },
                     top_top,
                     top_right_right: if x + 2 < gw && y > 0 {
-                        get(x + 2, y - 1) as i64
+                        i64::from(north_row[x + 2])
                     } else {
                         top_right
                     },
                 };
                 let mut props = [0i32; NUM_MA_PROPS];
                 props[0] = chan as i32;
+                props[1] = stream;
                 props[2] = y as i32;
                 props[3] = x as i32;
                 props[4] = north.abs() as i32;
@@ -5234,51 +2352,65 @@ fn sample_channel_ma<F: Fn(usize, usize) -> i32>(
                 props[13] = (north - top_top) as i32;
                 props[14] = (left - neighbors.left_left) as i32;
                 props[15] = if disabled { 0 } else { wp.wp_prop as i32 };
+                ref_props(refs, x, y, &mut props);
 
                 let mut tok = [0u8; NUM_MA_PREDS];
-                let mut nbits = [0u8; NUM_MA_PREDS];
                 for pred in 0..NUM_MA_PREDS as u32 {
                     let pv = predictor_value(pred, neighbors, wp_pred);
-                    let (t, nb, _) = uint_encode(pack_signed((value - pv) as i32));
+                    let (t, _, _) = uint_encode(pack_signed((value - pv) as i32));
                     tok[pred as usize] = t.min(u8::MAX as u32) as u8;
-                    nbits[pred as usize] = nb.min(u8::MAX as u32) as u8;
                 }
-                samples.push(props, tok, nbits);
+                push(props, tok);
             }
             previous_local_gradient = local_gradient;
             west_west = west;
             west = value;
         }
+        north_north_row = north_row;
+        north_row = current_row;
     }
 }
 
 /// Tokenize the channel rectangle through the learned tree: every pixel is
 /// routed to its leaf's context and coded with its leaf's predictor.
-fn tokenize_channel_ma<F: Fn(usize, usize) -> i32>(
-    get: &F,
+fn tokenize_channel_ma<'a, T: Copy + 'a>(
+    get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
     chan: u32,
+    stream: i32,
+    refs: &[MaRefPlane<'a>],
     wp_params: WpParams,
     use_wp: bool,
-    tree: &LearnedTree,
-    leaf_ctx: &[u32],
-    out: &mut Vec<Token>,
-) {
+    lookup: &MaLookup,
+    offsets: &[i32],
+    out: &mut RawTokens,
+) where
+    i64: From<T>,
+{
+    // Keep the traversal's stores simple, then validate and pack one row at
+    // a time. The temporary row fits in cache and is reused for the channel.
+    let mut row = Vec::with_capacity(gw);
     walk_channel_ma(
-        get,
+        get_row,
         gw,
         gh,
         chan,
+        stream,
+        refs,
         wp_params,
-        use_wp,
-        |_x, _y, v, p, n, wp_pred| {
-            let (node, pred) = tree.lookup(p);
+        use_wp && lookup.needs_wp(),
+        |x, _y, v, p, n, wp_pred| {
+            let (context, pred) = lookup.lookup(p);
             let pv = predictor_value(pred, n, wp_pred);
-            out.push(Token::new(
-                leaf_ctx[node as usize],
-                pack_signed((v - pv) as i32),
+            row.push(Token::new(
+                context,
+                pack_signed((v - pv) as i32 - offsets[context as usize]),
             ));
+            if x + 1 == gw {
+                out.extend(&row);
+                row.clear();
+            }
         },
     );
 }
@@ -5309,10 +2441,82 @@ fn emit_learned_tree(tree: &LearnedTree) -> (Vec<Token>, Vec<u32>, u32) {
     (tokens, leaf_ctx, ctx)
 }
 
+/// Largest |offset| a leaf may carry. The learner keeps hybrid-uint symbols,
+/// which are exact packed residuals only below the split (symbols < 16 =
+/// residuals −8..=7); larger symbols carry their sign in raw bits the sample
+/// does not keep, so they only count towards the zero fraction.
+const MA_LEAF_OFFSET_LIMIT: i32 = 8;
+const MA_LEAF_EXACT_SYMBOLS: u32 = 16;
+/// Leaves with fewer routed samples keep offset 0.
+const MA_LEAF_OFFSET_MIN_SAMPLES: u32 = 16;
+/// No offsets at all when more than this share of residuals is exactly zero:
+/// such content (screenshots, fractals, flat graphics) has no predictor bias
+/// to cancel.
+const MA_LEAF_OFFSET_MAX_ZERO_FRACTION: f64 = 0.9;
+
+fn unpack_signed(token: u32) -> i32 {
+    if token & 1 == 1 {
+        -(((token + 1) >> 1) as i32)
+    } else {
+        (token >> 1) as i32
+    }
+}
+
+/// Per-context predictor offsets: the median residual of each leaf's chosen
+/// predictor over the samples the finished tree routes to it. Shifting a
+/// leaf's residuals does not change its own entropy, but it centres the
+/// distribution, which lets ANS clustering merge leaves by shape rather than
+/// by bias and keeps small residuals inside the hybrid-uint's exact symbols.
+fn leaf_offsets(
+    tree: &LearnedTree,
+    leaf_ctx: &[u32],
+    num_ctx: u32,
+    samples: &MaSamples,
+) -> Vec<i32> {
+    const BINS: usize = 2 * MA_LEAF_OFFSET_LIMIT as usize + 1;
+    let mut hist = vec![[0u32; BINS]; num_ctx as usize];
+    // Every fourth sample: leaves keep >100 samples on average and the
+    // routing pass drops below the noise of the encode time.
+    let mut routed = 0u64;
+    for (props, tok) in samples.props.iter().zip(&samples.tok).step_by(4) {
+        let (node, pred) = tree.lookup(props);
+        routed += 1;
+        let symbol = tok[pred as usize] as u32;
+        if symbol < MA_LEAF_EXACT_SYMBOLS {
+            let r = unpack_signed(symbol);
+            hist[leaf_ctx[node as usize] as usize][(r + MA_LEAF_OFFSET_LIMIT) as usize] += 1;
+        }
+    }
+    let zeros: u64 = hist
+        .iter()
+        .map(|h| h[MA_LEAF_OFFSET_LIMIT as usize] as u64)
+        .sum();
+    if zeros as f64 > MA_LEAF_OFFSET_MAX_ZERO_FRACTION * routed as f64 {
+        return vec![0; num_ctx as usize];
+    }
+    hist.iter()
+        .map(|h| {
+            let total: u32 = h.iter().sum();
+            if total < MA_LEAF_OFFSET_MIN_SAMPLES {
+                return 0;
+            }
+            let half = total.div_ceil(2);
+            let mut acc = 0u32;
+            for (bin, &c) in h.iter().enumerate() {
+                acc += c;
+                if acc >= half {
+                    return bin as i32 - MA_LEAF_OFFSET_LIMIT;
+                }
+            }
+            0
+        })
+        .collect()
+}
+
 /// Sampling stride for tree learning; odd to avoid column aliasing.
-fn ma_sample_stride(total_px: usize) -> usize {
+fn ma_sample_stride(total_px: usize, full_sample_limit: usize) -> usize {
     let mut stride = total_px.div_ceil(MA_TARGET_SAMPLES).max(1);
-    if stride == 1 && total_px > MA_FULL_SAMPLE_LIMIT {
+    if stride == 1 && total_px > full_sample_limit {
         stride = 3;
     }
     if stride > 1 && stride.is_multiple_of(2) {
@@ -5321,384 +2525,1139 @@ fn ma_sample_stride(total_px: usize) -> usize {
     stride
 }
 
-/// Learn the tree from merged samples and decide whether it beats the flat
-/// path estimate. Returns the tree with its BFS emission on success.
-#[allow(clippy::type_complexity)]
-fn learn_and_gate_ma_tree(
-    samples: &MaSamples,
+/// Header overhead model for a learned tree: tree tokens plus the extra
+/// per-context histogram / context-map cost (conservative; clustering merges
+/// most of it). Returns the candidate only when it beats the flat estimate.
+/// `samples` is `Some` only for candidates that may be written: routing every
+/// sample through the tree for the offsets is not worth doing for the
+/// ranking stage's throwaway candidates.
+fn gate_ma_tree(
+    tree: LearnedTree,
+    sample_scale: f64,
+    samples: Option<&MaSamples>,
+) -> Option<LearnedCandidate> {
+    let (mut tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
+    let overhead_bits = tree_tokens.len() as f64 * 10.0 + num_ctx as f64 * 200.0;
+    let est_real = tree.est_bits * sample_scale + overhead_bits;
+    let flat_real = tree.flat_bits * sample_scale;
+    if est_real.partial_cmp(&flat_real) != Some(std::cmp::Ordering::Less) {
+        return None;
+    }
+    // Offsets do not affect the token-count gate. Route only accepted trees,
+    // then fill their existing offset tokens in BFS context order.
+    let leaf_offset = match samples {
+        Some(samples) => leaf_offsets(&tree, &leaf_ctx, num_ctx, samples),
+        None => vec![0; num_ctx as usize],
+    };
+    for (token, &offset) in tree_tokens
+        .iter_mut()
+        .filter(|token| token.context == TREE_CTX_OFFSET)
+        .zip(&leaf_offset)
+    {
+        token.value = pack_signed(offset);
+    }
+    let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
+    Some(LearnedCandidate {
+        tree,
+        tree_tokens,
+        leaf_ctx,
+        leaf_offset,
+        num_ctx,
+        est_real,
+        flat_real,
+        estimated_savings,
+    })
+}
+
+fn ma_learn_params(
+    min_symbol: u32,
+    max_leaves: usize,
+    max_candidates: usize,
+    split_scale: f64,
+    use_wp: bool,
+) -> MaLearnParams {
+    MaLearnParams {
+        alphabet: min_symbol as usize,
+        max_leaves,
+        split_cost_bits: MA_SPLIT_COST_BITS / split_scale as f32,
+        min_node: MA_MIN_NODE_SAMPLES,
+        allow_wp: use_wp,
+        allowed_preds: u16::MAX,
+        side_preds: MA_SIDE_PREDS,
+        max_candidates,
+    }
+}
+
+/// First learning stage: the merged samples with a gated coarse tree (or the
+/// complete tree for small sample sets). Cheap enough to run once per group
+/// layout; only the winning layout is deepened.
+struct CoarseLearn {
+    samples: MaSamples,
+    stride: usize,
+    max_candidates: usize,
+    /// Leaf predictor offsets apply (RCT sources; palette indices lose).
+    leaf_offsets: bool,
+    candidate: LearnedCandidate,
+    /// The coarse tree saturated its leaf budget with a clear win, so the
+    /// full-probe second stage is worth its cost.
+    deepen: bool,
+}
+
+fn learn_ma_coarse(
+    samples: MaSamples,
     stride: usize,
     min_symbol: u32,
     use_wp: bool,
+    max_leaves: usize,
+    max_candidates: usize,
+    leaf_offsets: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> Option<(LearnedTree, Vec<Token>, Vec<u32>, u32)> {
+) -> Option<CoarseLearn> {
     if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
         return None;
     }
-
-    struct GatedTree {
-        tree: LearnedTree,
-        tree_tokens: Vec<Token>,
-        leaf_ctx: Vec<u32>,
-        num_ctx: u32,
-        est_real: f64,
-        flat_real: f64,
-    }
-
-    let gate = |tree: LearnedTree, sample_scale: f64| {
-        let (tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
-        // Header overhead: tree tokens plus the extra per-context histogram /
-        // context-map cost (conservative estimate; clustering merges most of it).
-        let overhead_bits = tree_tokens.len() as f64 * 10.0 + num_ctx as f64 * 200.0;
-        let est_real = tree.est_bits * sample_scale + overhead_bits;
-        let flat_real = tree.flat_bits * sample_scale;
-        (est_real < flat_real).then_some(GatedTree {
-            tree,
-            tree_tokens,
-            leaf_ctx,
-            num_ctx,
-            est_real,
-            flat_real,
-        })
-    };
-
     if samples.len() <= MA_COARSE_TARGET_SAMPLES {
         let tree = learn_ma_tree(
-            samples,
-            MaLearnParams {
-                alphabet: min_symbol as usize,
-                max_leaves: MA_MAX_LEAVES,
-                split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
-                min_node: MA_MIN_NODE_SAMPLES,
-                allow_wp: use_wp,
-                allowed_preds: u16::MAX,
-            },
+            &samples,
+            ma_learn_params(
+                min_symbol,
+                max_leaves,
+                max_candidates,
+                stride as f64,
+                use_wp,
+            ),
             pool,
             scratch,
         );
-        let selected = gate(tree, stride as f64)?;
-        return Some((
-            selected.tree,
-            selected.tree_tokens,
-            selected.leaf_ctx,
-            selected.num_ctx,
-        ));
+        let candidate = gate_ma_tree(tree, stride as f64, leaf_offsets.then_some(&samples))?;
+        return Some(CoarseLearn {
+            samples,
+            stride,
+            max_candidates,
+            leaf_offsets,
+            candidate,
+            deepen: false,
+        });
     }
-
     let coarse_indices = samples.evenly_sampled_indices(MA_COARSE_TARGET_SAMPLES);
-    let coarse_len = coarse_indices.len();
-    let coarse_scale = stride as f64 * samples.len() as f64 / coarse_len as f64;
+    let coarse_scale = stride as f64 * samples.len() as f64 / coarse_indices.len() as f64;
     let coarse_tree = learn_ma_tree_indexed(
-        samples,
+        &samples,
         coarse_indices,
-        MaLearnParams {
-            alphabet: min_symbol as usize,
-            max_leaves: MA_COARSE_MAX_LEAVES,
-            split_cost_bits: MA_SPLIT_COST_BITS / coarse_scale as f32,
-            min_node: MA_MIN_NODE_SAMPLES,
-            allow_wp: use_wp,
-            allowed_preds: u16::MAX,
-        },
+        ma_learn_params(
+            min_symbol,
+            MA_COARSE_MAX_LEAVES,
+            max_candidates,
+            coarse_scale,
+            use_wp,
+        ),
         pool,
         scratch,
     );
-    let coarse = gate(coarse_tree, coarse_scale)?;
-    let coarse_leaves = coarse.tree.nodes.len().div_ceil(2);
-    let coarse_savings = 1.0 - coarse.est_real / coarse.flat_real;
-    let should_deepen = samples.len() > MA_COARSE_TARGET_SAMPLES
-        && coarse_leaves == MA_COARSE_MAX_LEAVES
-        && coarse_savings >= MA_DEEPEN_MIN_SAVINGS;
+    let candidate = gate_ma_tree(coarse_tree, coarse_scale, None)?;
+    let coarse_leaves = candidate.tree.nodes.len().div_ceil(2);
+    let coarse_savings = 1.0 - candidate.est_real / candidate.flat_real;
+    let deepen = coarse_leaves == MA_COARSE_MAX_LEAVES && coarse_savings >= MA_DEEPEN_MIN_SAVINGS;
+    Some(CoarseLearn {
+        samples,
+        stride,
+        max_candidates,
+        leaf_offsets,
+        candidate,
+        deepen,
+    })
+}
 
-    let selected = if should_deepen {
-        let deep_tree = deepen_ma_tree(
-            samples,
-            MaLearnParams {
-                alphabet: min_symbol as usize,
-                max_leaves: MA_MAX_LEAVES,
-                split_cost_bits: MA_SPLIT_COST_BITS / stride as f32,
-                min_node: MA_MIN_NODE_SAMPLES,
-                allow_wp: use_wp,
-                allowed_preds: u16::MAX,
-            },
-            coarse.tree.clone(),
+/// Second stage: re-score the coarse tree on the full probe and keep growing
+/// it, falling back to the coarse tree when the deep one fails its gate.
+fn finish_ma_learn(
+    coarse: CoarseLearn,
+    min_symbol: u32,
+    use_wp: bool,
+    max_leaves: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> LearnedCandidate {
+    if !coarse.deepen {
+        return coarse.candidate;
+    }
+    let (deep_tree, samples) = deepen_ma_tree(
+        coarse.samples,
+        ma_learn_params(
+            min_symbol,
+            max_leaves,
+            coarse.max_candidates,
+            coarse.stride as f64,
+            use_wp,
+        ),
+        coarse.candidate.tree.clone(),
+        pool,
+        scratch,
+    );
+    gate_ma_tree(
+        deep_tree,
+        coarse.stride as f64,
+        coarse.leaf_offsets.then_some(&samples),
+    )
+    .unwrap_or(coarse.candidate)
+}
+
+/// Rank the WP presets of `source` by the reduced-leaf learner, starting
+/// from `first` (already learned under `first_params`), the rest in order
+/// of how often they win, each deepened only when its first stage is within
+/// `RANK_COARSE_PRUNE` of the best seen. Returns (best bits, best coarse
+/// bits, preset, the winner's learn as a seed).
+#[allow(clippy::too_many_arguments)]
+fn rank_presets(
+    source: &MaSource<'_>,
+    xsize: usize,
+    ysize: usize,
+    min_symbol: u32,
+    use_wp: bool,
+    first: Option<CoarseLearn>,
+    first_params: WpParams,
+    header_bits: &dyn Fn(WpParams) -> f64,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> (f64, f64, WpParams, Option<RankedLearn>) {
+    let mut best_bits = f64::INFINITY;
+    let mut best_coarse = f64::INFINITY;
+    let mut best_params = first_params;
+    let mut seed = None;
+    let mut order: Vec<WpParams> = vec![first_params];
+    if use_wp {
+        for &preset in [1usize, 2, 3, 0].iter().map(|&i| &WpParams::PRESETS[i]) {
+            if preset != first_params {
+                order.push(preset);
+            }
+        }
+    }
+    let mut first = first;
+    for preset in order {
+        let stage = match first.take() {
+            Some(stage) => Some(stage),
+            None => rank_coarse(
+                source, xsize, ysize, min_symbol, preset, use_wp, pool, scratch,
+            ),
+        };
+        let Some(stage) = stage else {
+            continue;
+        };
+        let coarse = stage.candidate.est_real + header_bits(preset);
+        if coarse > best_coarse * RANK_COARSE_PRUNE {
+            continue;
+        }
+        best_coarse = best_coarse.min(coarse);
+        let (bits, ranked) = rank_finish(stage, min_symbol, use_wp, pool, scratch);
+        let bits = bits + header_bits(preset);
+        if bits < best_bits {
+            best_bits = bits;
+            best_params = preset;
+            seed = Some(ranked);
+        }
+    }
+    (best_bits, best_coarse, best_params, seed)
+}
+
+/// A ranking learn kept alive for the winner: its reduced-leaf tree seeds the
+/// final learn, which then only grows from `MA_RANK_LEAVES` to the full
+/// budget on the same (already compacted) sample set.
+struct RankedLearn {
+    candidate: LearnedCandidate,
+    samples: MaSamples,
+    stride: usize,
+    max_candidates: usize,
+    leaf_offsets: bool,
+    coarse_est: f64,
+}
+
+impl RankedLearn {
+    /// Continue best-first growth to the full leaf budget.
+    fn finish(
+        self,
+        min_symbol: u32,
+        use_wp: bool,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> LearnedCandidate {
+        let (tree, samples) = deepen_ma_tree(
+            self.samples,
+            ma_learn_params(
+                min_symbol,
+                MA_MAX_LEAVES,
+                self.max_candidates,
+                self.stride as f64,
+                use_wp,
+            ),
+            self.candidate.tree.clone(),
             pool,
             scratch,
         );
-        match gate(deep_tree, stride as f64) {
-            Some(deep) => deep,
-            _ => coarse,
+        gate_ma_tree(
+            tree,
+            self.stride as f64,
+            self.leaf_offsets.then_some(&samples),
+        )
+        .unwrap_or(self.candidate)
+    }
+}
+
+/// A gated learned tree with its BFS emission and rate estimate.
+struct LearnedCandidate {
+    tree: LearnedTree,
+    tree_tokens: Vec<Token>,
+    leaf_ctx: Vec<u32>,
+    /// Predictor offset per context (see `leaf_offsets`).
+    leaf_offset: Vec<i32>,
+    num_ctx: u32,
+    /// Estimated image-domain bits of the tree-coded frame, headers included.
+    est_real: f64,
+    /// Estimated image-domain bits of the flat alternative.
+    flat_real: f64,
+    /// Estimated fractional saving over the flat path.
+    estimated_savings: f64,
+}
+
+/// One modular channel as the learner and tokenizer see it.
+struct MaChannel<'a> {
+    w: usize,
+    h: usize,
+    /// Meta channels (palette) always live in the global stream, whatever
+    /// their size.
+    meta: bool,
+    pixels: MaPixels<'a>,
+}
+
+/// Borrow the original sample representation, including palette indices and
+/// alpha, without expanding or copying rows for MA traversal.
+enum MaPixels<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+    I32(&'a [i32]),
+}
+
+// Resolve the sample type once per rectangle so the row kernels remain
+// monomorphized. All variants provide the same cropped, borrowed row interface.
+macro_rules! with_ma_pixels {
+    ($channel:expr, |$pixels:ident| $body:expr) => {
+        match &$channel.pixels {
+            MaPixels::U8($pixels) => $body,
+            MaPixels::U16($pixels) => $body,
+            MaPixels::I32($pixels) => $body,
         }
-    } else {
-        coarse
     };
-    Some((
-        selected.tree,
-        selected.tree_tokens,
-        selected.leaf_ctx,
-        selected.num_ctx,
-    ))
 }
 
-/// Learned-tree lossless path, single group. Returns its estimated fractional
-/// saving over the flat path after writing the complete candidate.
+/// Split candidates for a photographic (RGB/RCT) source; palette index
+/// images overfit above `MA_PALETTE_CANDIDATES`.
+pub(super) const MA_PHOTO_CANDIDATES: usize = 32;
+/// Split candidates for a palette index image: more than this overfits the
+/// near-deterministic index.
+pub(super) const MA_PALETTE_CANDIDATES: usize = 16;
+
+/// The single global transform a learned-tree frame declares.
+#[derive(Clone, Copy)]
+enum MaTransform {
+    /// RCT on the first three channels (`6` = YCoCg).
+    Rct(u32),
+    /// Global palette over `num_c` components: channel 0 is the palette
+    /// meta-channel (`nb_colors` x `num_c`), channel 1 the index image.
+    Palette { num_c: u32, nb_colors: u32 },
+}
+
+/// The modular channels of a frame plus their transform.
+struct MaSource<'a> {
+    channels: Vec<MaChannel<'a>>,
+    transform: MaTransform,
+}
+
+/// Quant tables reserved in the decoder's modular stream numbering
+/// (`kNumQuantTables`); AC group streams are numbered after them.
+const MODULAR_NUM_QUANT_TABLES: usize = 17;
+
+/// The decoder's stream id (MA property 1) of AC group `group_index`:
+/// `ModularStreamId::ModularAC(group, pass 0)` = 1 + 3 * DC groups + quant
+/// tables + group. The global stream is id 0.
+fn ac_stream_id(num_dc_groups: usize, group_index: usize) -> i32 {
+    (1 + 3 * num_dc_groups + MODULAR_NUM_QUANT_TABLES + group_index) as i32
+}
+
+/// Where a channel is coded under a layout: in the single section / the
+/// DC-global stream, or per AC group. Channel ids restart per stream, as the
+/// decoder's channel property does.
+struct MaPlacement {
+    channel: usize,
+    chan_id: u32,
+    global: bool,
+}
+
+impl MaSource<'_> {
+    /// Split candidates the learner should evaluate for this source.
+    fn max_candidates(&self) -> usize {
+        match self.transform {
+            MaTransform::Palette { .. } => MA_PALETTE_CANDIDATES,
+            MaTransform::Rct(_) => MA_PHOTO_CANDIDATES,
+        }
+    }
+
+    fn write_transforms(&self, w: &mut BitWriter) {
+        match self.transform {
+            MaTransform::Rct(rct_type) => {
+                write_modular_transforms(self.channels.len(), rct_type, w)
+            }
+            MaTransform::Palette { num_c, nb_colors } => {
+                write_palette_transform(num_c, nb_colors, w)
+            }
+        }
+    }
+
+    /// Channels no larger than a group are coded in the global stream (the
+    /// decoder stops the global decode at the first bigger channel); in a
+    /// single-group frame everything shares one stream.
+    fn placement(&self, layout: GroupLayout, single_group: bool) -> Vec<MaPlacement> {
+        let gdim = layout.dim();
+        let mut global_id = 0u32;
+        let mut group_id = 0u32;
+        self.channels
+            .iter()
+            .enumerate()
+            .map(|(channel, ch)| {
+                let global = single_group || ch.meta || (ch.w <= gdim && ch.h <= gdim);
+                let chan_id = if single_group {
+                    channel as u32
+                } else if global {
+                    let id = global_id;
+                    global_id += 1;
+                    id
+                } else {
+                    let id = group_id;
+                    group_id += 1;
+                    id
+                };
+                MaPlacement {
+                    channel,
+                    chan_id,
+                    global,
+                }
+            })
+            .collect()
+    }
+
+    fn total_values(&self) -> usize {
+        self.channels.iter().map(|c| c.w * c.h).sum()
+    }
+
+    /// The reference planes of placement `p`'s channel: earlier channels of
+    /// the same stream and size, most recent first, cropped at (x0, y0).
+    fn ref_planes(
+        &self,
+        placement: &[MaPlacement],
+        p: &MaPlacement,
+        x0: usize,
+        y0: usize,
+    ) -> Vec<MaRefPlane<'_>> {
+        let ch = &self.channels[p.channel];
+        placement[..p.channel]
+            .iter()
+            .rev()
+            .filter(|q| q.global == p.global)
+            .filter_map(|q| {
+                let other = &self.channels[q.channel];
+                match other.pixels {
+                    MaPixels::I32(pixels) if other.w == ch.w && other.h == ch.h => {
+                        Some(MaRefPlane {
+                            pixels,
+                            stride: other.w,
+                            x0,
+                            y0,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .take(MA_REF_CHANNELS)
+            .collect()
+    }
+}
+
+/// The YCoCg(A) planes as a learned-tree source.
+fn rgb_ma_source<'a>(
+    linear: &'a Image3Si,
+    alpha: Option<&'a AlphaPlane>,
+    xsize: usize,
+    rct_type: u32,
+) -> MaSource<'a> {
+    let ysize = linear.ysize();
+    let mut channels: Vec<MaChannel<'a>> = (0..3)
+        .map(|c| {
+            let pd = linear.plane_data(c);
+            MaChannel {
+                w: xsize,
+                h: ysize,
+                meta: false,
+                pixels: MaPixels::I32(pd),
+            }
+        })
+        .collect();
+    if let Some(a) = alpha {
+        channels.push(MaChannel {
+            w: xsize,
+            h: ysize,
+            meta: false,
+            pixels: match a {
+                AlphaPlane::U8(pixels) => MaPixels::U8(pixels),
+                AlphaPlane::U16 { data, .. } => MaPixels::U16(data),
+                AlphaPlane::F32(pixels) => MaPixels::I32(pixels),
+            },
+        });
+    }
+    MaSource {
+        channels,
+        transform: MaTransform::Rct(rct_type),
+    }
+}
+
+/// Below this covered-area fraction the patched alternative is not encoded.
+const PATCH_MIN_COVERAGE: f64 = 0.05;
+
+/// Sample every stream of `source` under `layout` (group-local coordinates
+/// and a fresh WP state per group, exactly as the decoder will see them) and
+/// run the first learning stage. `None` when no tree is estimated to beat
+/// the flat path.
 #[allow(clippy::too_many_arguments)]
-fn try_encode_learned_tree_single_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
+fn learn_ma_candidate(
+    source: &MaSource<'_>,
+    xsize: usize,
+    ysize: usize,
+    layout: GroupLayout,
+    min_symbol: u32,
+    wp_params: WpParams,
+    use_wp: bool,
+    max_leaves: usize,
+    full_sample_limit: usize,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<CoarseLearn> {
+    let gdim = layout.dim();
+    let xsize_groups = xsize.div_ceil(gdim);
+    let num_groups = xsize_groups * ysize.div_ceil(gdim);
+    let placement = source.placement(layout, num_groups == 1);
+    let max_candidates = source.max_candidates();
+    let stride = ma_sample_stride(source.total_values(), full_sample_limit);
+
+    // Sampling jobs: global streams first, then group-major / channel-minor.
+    struct Job<'a> {
+        channel: usize,
+        chan_id: u32,
+        stream: i32,
+        refs: Vec<MaRefPlane<'a>>,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+    }
+    let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
+    let mut jobs: Vec<Job> = Vec::new();
+    for p in placement.iter().filter(|p| p.global) {
+        let ch = &source.channels[p.channel];
+        jobs.push(Job {
+            channel: p.channel,
+            chan_id: p.chan_id,
+            stream: 0,
+            refs: source.ref_planes(&placement, p, 0, 0),
+            x0: 0,
+            y0: 0,
+            w: ch.w,
+            h: ch.h,
+        });
+    }
+    if num_groups > 1 {
+        for group_index in 0..num_groups {
+            let x0 = (group_index % xsize_groups) * gdim;
+            let y0 = (group_index / xsize_groups) * gdim;
+            for p in placement.iter().filter(|p| !p.global) {
+                let ch = &source.channels[p.channel];
+                jobs.push(Job {
+                    channel: p.channel,
+                    chan_id: p.chan_id,
+                    stream: ac_stream_id(num_dc_groups, group_index),
+                    refs: source.ref_planes(&placement, p, x0, y0),
+                    x0,
+                    y0,
+                    w: gdim.min(ch.w - x0),
+                    h: gdim.min(ch.h - y0),
+                });
+            }
+        }
+    }
+
+    // Each job owns a disjoint range in the final sample arrays. The rotating
+    // row phase gives this exact count, including narrow and partial groups.
+    let counts: Vec<usize> = jobs
+        .iter()
+        .map(|job| ma_channel_sample_count(job.w, job.h, stride))
+        .collect();
+    let total_samples = counts.iter().sum();
+    let mut samples = MaSamples {
+        props: vec![[0; NUM_MA_PROPS]; total_samples],
+        tok: vec![[0; NUM_MA_PREDS]; total_samples],
+    };
+    let mut props = samples.props.as_mut_slice();
+    let mut tok = samples.tok.as_mut_slice();
+    let mut ranges = Vec::with_capacity(jobs.len());
+    for count in counts {
+        let (p, rest_p) = props.split_at_mut(count);
+        let (t, rest_t) = tok.split_at_mut(count);
+        ranges.push((p, t));
+        (props, tok) = (rest_p, rest_t);
+    }
+    pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
+        let job = &jobs[i];
+        let ch = &source.channels[job.channel];
+        let mut rows = range.0.iter_mut().zip(range.1.iter_mut());
+        with_ma_pixels!(ch, |pixels| sample_channel_ma(
+            |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
+            job.w,
+            job.h,
+            job.chan_id,
+            job.stream,
+            &job.refs,
+            wp_params,
+            use_wp,
+            stride,
+            |p, t| {
+                let (props, tok) = rows.next().expect("sample count");
+                *props = p;
+                *tok = t;
+            },
+        ));
+        debug_assert!(rows.next().is_none());
+    });
+    learn_ma_coarse(
+        samples,
+        stride,
+        min_symbol,
+        use_wp,
+        max_leaves,
+        max_candidates,
+        matches!(source.transform, MaTransform::Rct(_)),
+        pool,
+        scratch,
+    )
+}
+
+/// Leaf budget of the ranking learner that scores WP presets and the RCT
+/// runner-up: 96 leaves rank exactly like 128 on Kodak.
+const MA_RANK_LEAVES: usize = 96;
+/// The estimator's RCT runner-up is scored by the ranking learner when its
+/// estimated cost is within this factor of the best.
+const RCT_RANK_MARGIN: f32 = 1.02;
+
+/// Sampling budget of the ranking learners. It must match the final learn's:
+/// the best preset for a stride-3 learner is not the best for a stride-1
+/// learner.
+const MA_RANK_SAMPLE_LIMIT: usize = MA_FULL_SAMPLE_LIMIT;
+/// A ranking candidate whose 32-leaf coarse estimate trails the best coarse
+/// estimate seen so far by more than this is not deepened.
+const RANK_COARSE_PRUNE: f64 = 1.005;
+
+/// First ranking stage of `source`: its coarse learn under the 1024-px
+/// layout at the ranking sample budget.
+#[allow(clippy::too_many_arguments)]
+fn rank_coarse(
+    source: &MaSource<'_>,
     xsize: usize,
     ysize: usize,
     min_symbol: u32,
-    rct_type: u32,
+    wp_params: WpParams,
+    use_wp: bool,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<CoarseLearn> {
+    learn_ma_candidate(
+        source,
+        xsize,
+        ysize,
+        GroupLayout::LARGE,
+        min_symbol,
+        wp_params,
+        use_wp,
+        MA_RANK_LEAVES,
+        MA_RANK_SAMPLE_LIMIT,
+        pool,
+        scratch,
+    )
+}
+
+/// Second ranking stage: deepen to the ranking leaf budget and return the
+/// estimated bits (the flat alternatives when the tree does not qualify)
+/// with to learn itself, so the winner can seed the final learn.
+fn rank_finish(
+    stage: CoarseLearn,
+    min_symbol: u32,
+    use_wp: bool,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> (f64, RankedLearn) {
+    let coarse_est = stage.candidate.est_real;
+    let flat = stage.candidate.flat_real;
+    let stride = stage.stride;
+    let max_candidates = stage.max_candidates;
+    let leaf_offsets = stage.leaf_offsets;
+    let (candidate, samples) = if stage.deepen {
+        let (tree, samples) = deepen_ma_tree(
+            stage.samples,
+            ma_learn_params(
+                min_symbol,
+                MA_RANK_LEAVES,
+                max_candidates,
+                stride as f64,
+                use_wp,
+            ),
+            stage.candidate.tree.clone(),
+            pool,
+            scratch,
+        );
+        (
+            gate_ma_tree(tree, stride as f64, None).unwrap_or(stage.candidate),
+            samples,
+        )
+    } else {
+        (stage.candidate, stage.samples)
+    };
+    let bits = candidate.est_real.min(flat);
+    (
+        bits,
+        RankedLearn {
+            candidate,
+            samples,
+            stride,
+            max_candidates,
+            leaf_offsets,
+            coarse_est,
+        },
+    )
+}
+
+/// First learning stage under every layout, second stage for the preferred
+/// (first) layout and for any later layout whose first stage already
+/// estimates smaller; the full estimates pick the winner. Layouts are
+/// processed one at a time so a single sample set is alive.
+#[allow(clippy::too_many_arguments)]
+fn learn_best_layout(
+    source: &MaSource<'_>,
+    xsize: usize,
+    ysize: usize,
+    layouts: &[GroupLayout],
+    min_symbol: u32,
+    wp_params: WpParams,
+    use_wp: bool,
+    coarse_limit: f64,
+    deepen_all: bool,
+    seed: Option<RankedLearn>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<(GroupLayout, LearnedCandidate, f64)> {
+    let mut best_coarse_est = f64::INFINITY;
+    let mut learned: Option<(GroupLayout, LearnedCandidate)> = None;
+    let mut seed = seed;
+    for (index, &layout) in layouts.iter().enumerate() {
+        // The ranking winner already sampled and partly grew the first layout.
+        if index == 0
+            && let Some(ranked) = seed.take()
+        {
+            best_coarse_est = ranked.coarse_est;
+            let cand = ranked.finish(min_symbol, use_wp, pool, scratch);
+            learned = Some((layout, cand));
+            continue;
+        }
+        let Some(stage) = learn_ma_candidate(
+            source,
+            xsize,
+            ysize,
+            layout,
+            min_symbol,
+            wp_params,
+            use_wp,
+            MA_MAX_LEAVES,
+            MA_FULL_SAMPLE_LIMIT,
+            pool,
+            scratch,
+        ) else {
+            continue;
+        };
+        let coarse_est = stage.candidate.est_real;
+        // A source whose first stage already trails `coarse_limit` is not
+        // deepened (the palette candidate against the RGB one). Between this
+        // source's own layouts the coarse estimate mis-ranks palette index
+        // images (it prefers 1024 where the accurate estimate prefers 256, a
+        // ~4% loss), so `deepen_all` sources deepen every layout and pick by
+        // the final estimate; photos keep the cheap coarse prune.
+        let layout_pruned = index > 0 && !deepen_all && coarse_est > best_coarse_est;
+        if coarse_est > coarse_limit || layout_pruned {
+            best_coarse_est = best_coarse_est.min(coarse_est);
+            continue;
+        }
+        best_coarse_est = best_coarse_est.min(coarse_est);
+        let cand = finish_ma_learn(stage, min_symbol, use_wp, MA_MAX_LEAVES, pool, scratch);
+        if learned
+            .as_ref()
+            .is_none_or(|(_, best)| cand.est_real < best.est_real)
+        {
+            learned = Some((layout, cand));
+        }
+    }
+    learned.map(|(layout, cand)| (layout, cand, best_coarse_est))
+}
+
+// Compile both representations once; use the compact path only when every
+// stream fits. The wide fallback retains the same stream order and values.
+macro_rules! with_raw_streams {
+    ($raw:expr, |$streams:ident| $body:block) => {
+        match RawTokenStreams::new($raw) {
+            RawTokenStreams::Compact($streams) => $body,
+            RawTokenStreams::Wide($streams) => $body,
+        }
+    };
+}
+
+/// Write the complete learned-tree frame under `layout`: a local tree in the
+/// single section when the frame is one group, otherwise a global tree in the
+/// DC-global section (followed by any global-stream channels) with every AC
+/// group routed through it (fresh WP state and group-local coordinates per
+/// group, matching the decoder). Returns the candidate's estimated fractional
+/// saving over the flat path.
+#[allow(clippy::too_many_arguments)]
+fn write_learned_tree_frame(
+    source: &MaSource<'_>,
+    has_alpha: bool,
+    xsize: usize,
+    ysize: usize,
+    layout: GroupLayout,
+    min_symbol: u32,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
     use_wp: bool,
+    cand: &LearnedCandidate,
     writer: &mut BitWriter,
-) -> Option<f64> {
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
-    let stride = ma_sample_stride(xsize * ysize * nb_chans);
-
-    let mut per_chan = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
-        let mut samples = MaSamples::with_capacity(xsize * ysize / stride);
-        if chan < 3 {
-            let pd = linear.plane_data(chan);
-            sample_channel_ma(
-                &|x, y| pd[y * xsize + x],
-                xsize,
-                ysize,
-                chan as u32,
-                wp_params,
-                use_wp,
-                stride,
-                &mut samples,
-            );
-        } else {
-            let a = alpha.expect("alpha channel must exist");
-            sample_channel_ma(
-                &|x, y| a.get_i32(y * xsize + x),
-                xsize,
-                ysize,
-                chan as u32,
-                wp_params,
-                use_wp,
-                stride,
-                &mut samples,
-            );
-        }
-        samples
-    });
-    let total_samples = per_chan.iter().map(MaSamples::len).sum();
-    let mut samples = MaSamples::with_capacity(total_samples);
-    for s in per_chan.iter_mut() {
-        samples.append(s);
-    }
-
-    let (tree, tree_tokens, leaf_ctx, num_ctx) =
-        learn_and_gate_ma_tree(&samples, stride, min_symbol, use_wp, pool, scratch)?;
-    let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
-    drop(samples);
-
-    let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
-        let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize);
-        if chan < 3 {
-            let pd = linear.plane_data(chan);
-            tokenize_channel_ma(
-                &|x, y| pd[y * xsize + x],
-                xsize,
-                ysize,
-                chan as u32,
-                wp_params,
-                use_wp,
-                &tree,
-                &leaf_ctx,
-                &mut tokens,
-            );
-        } else {
-            let a = alpha.expect("alpha channel must exist");
-            tokenize_channel_ma(
-                &|x, y| a.get_i32(y * xsize + x),
-                xsize,
-                ysize,
-                chan as u32,
-                wp_params,
-                use_wp,
-                &tree,
-                &leaf_ctx,
-                &mut tokens,
-            );
-        }
-        tokens
-    });
-    let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize * nb_chans);
-    for channel in channel_tokens {
-        tokens.extend(channel);
-    }
-
-    write_frame_header_modular(alpha.is_some(), writer);
-    let mut section = BitWriter::new();
-    section.write(1, 1); // dc_quant all_default = 1
-    section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
-    section.write(1, 0); // use_global_tree = 0
-    write_wp_header(wp_params, &mut section);
-    write_modular_transforms(nb_chans, rct_type, &mut section);
-
-    let distance_ctx = num_ctx;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, crate::Speed::Slow, scratch);
-    let code = build_lz_pixel_code(
-        std::iter::once(lz_tokens.as_slice()),
-        num_ctx as usize,
-        min_symbol,
-        true,
-        &mut scratch.lz_entropy,
-        &mut scratch.huffman_pool,
-    );
-    write_tree_lz77(
-        &tree_tokens,
-        &code,
-        min_symbol,
-        &mut scratch.huffman_pool,
-        &mut section,
-    );
-    write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
-    section.zero_pad_to_byte();
-
-    writer.write(1, 0);
-    writer.zero_pad_to_byte();
-    write_toc_entry(section.bits_written() / 8, writer);
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(std::slice::from_mut(&mut section));
-    writer.zero_pad_to_byte();
-    Some(estimated_savings)
-}
-
-/// Learned-tree lossless path, multi-group: one global tree learned from
-/// group-local samples; every AC group routes its pixels through it (fresh
-/// WP and group-local coordinates per group, matching the decoder).
-#[allow(clippy::too_many_arguments)]
-fn try_encode_learned_tree_multi_group(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
-    xsize_groups: usize,
-    ysize_groups: usize,
-    num_dc_groups: usize,
-    min_symbol: u32,
-    rct_type: u32,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    wp_params: WpParams,
-    use_wp: bool,
-    writer: &mut BitWriter,
-) -> Option<f64> {
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+) -> f64 {
+    let gdim = layout.dim();
+    let xsize_groups = xsize.div_ceil(gdim);
+    let ysize_groups = ysize.div_ceil(gdim);
     let num_ac_groups = xsize_groups * ysize_groups;
-    let stride = ma_sample_stride(xsize * ysize * nb_chans);
-
-    let mut group_samples = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
-        let gx = group_index % xsize_groups;
-        let gy = group_index / xsize_groups;
-        let x0 = gx * GROUP_DIM;
-        let y0 = gy * GROUP_DIM;
-        let gw = GROUP_DIM.min(xsize - x0);
-        let gh = GROUP_DIM.min(ysize - y0);
-        let mut samples = MaSamples::with_capacity(nb_chans * (gw * gh / stride));
-        for chan in 0..3usize {
-            let pd = linear.plane_data(chan);
-            let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-            sample_channel_ma(
-                &get,
-                gw,
-                gh,
-                chan as u32,
-                wp_params,
-                use_wp,
-                stride,
-                &mut samples,
-            );
-        }
-        if let Some(a) = alpha {
-            let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-            sample_channel_ma(&get, gw, gh, 3, wp_params, use_wp, stride, &mut samples);
-        }
-        samples
-    });
-    let total_samples = group_samples.iter().map(MaSamples::len).sum();
-    let mut samples = MaSamples::with_capacity(total_samples);
-    for s in group_samples.iter_mut() {
-        samples.append(s);
-    }
-    drop(group_samples);
-
-    let (tree, tree_tokens, leaf_ctx, num_ctx) =
-        learn_and_gate_ma_tree(&samples, stride, min_symbol, use_wp, pool, scratch)?;
-    let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
-    drop(samples);
-
+    let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
+    let single_group = num_ac_groups == 1;
+    let placement = source.placement(layout, single_group);
+    let tree = &cand.tree;
+    let leaf_ctx = &cand.leaf_ctx;
+    let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
-    let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
-    let group_lz_tokens: Vec<Vec<LzToken>> = pool.steal_map_with_threads(
+    // Placement is in source-channel order; its channel ids already account
+    // for the independent global and group streams (including palettes).
+    // The compiled lookup folds the channel and stream ids, so it is built
+    // per (channel, stream): cheap next to tokenizing the stream itself.
+    let tokenize = |p: &MaPlacement,
+                    stream: i32,
+                    x0: usize,
+                    y0: usize,
+                    w: usize,
+                    h: usize,
+                    out: &mut RawTokens| {
+        let ch = &source.channels[p.channel];
+        let lookup = MaLookup::new(tree, leaf_ctx, p.chan_id, stream);
+        let refs = source.ref_planes(&placement, p, x0, y0);
+        with_ma_pixels!(ch, |pixels| tokenize_channel_ma(
+            |y| &pixels[(y0 + y) * ch.w + x0..][..w],
+            w,
+            h,
+            p.chan_id,
+            stream,
+            &refs,
+            wp_params,
+            use_wp,
+            &lookup,
+            &cand.leaf_offset,
+            out,
+        ));
+    };
+
+    write_frame_header_modular(has_alpha, layout, writer);
+
+    if single_group {
+        let channel_tokens = pool.steal_map(scratch, placement.len(), |i, _scratch| {
+            let p = &placement[i];
+            let ch = &source.channels[p.channel];
+            let mut tokens = RawTokens::with_capacity(ch.w * ch.h);
+            tokenize(p, 0, 0, 0, ch.w, ch.h, &mut tokens);
+            tokens
+        });
+        let mut section = with_raw_streams!(channel_tokens, |channel_tokens| {
+            let mut tokens = Vec::with_capacity(source.total_values());
+            for channel in channel_tokens {
+                tokens.extend(channel);
+            }
+
+            let variants = choose_tree_streams(
+                vec![tokens],
+                distance_ctx,
+                num_ctx as usize + 1,
+                min_symbol,
+                pool,
+                scratch,
+            );
+            let mut best: Option<BitWriter> = None;
+            let mut best_estimate = f64::INFINITY;
+            for variant in variants {
+                match variant {
+                    TreeStreams::Literals(streams) => {
+                        let stream = streams.into_iter().next().expect("one stream");
+                        write_learned_single_variant(
+                            &stream,
+                            source,
+                            cand,
+                            min_symbol,
+                            wp_params,
+                            pool,
+                            scratch,
+                            &mut best,
+                            &mut best_estimate,
+                        );
+                    }
+                    TreeStreams::Lz(streams) => {
+                        let stream = streams.into_iter().next().expect("one stream");
+                        write_learned_single_variant(
+                            &stream,
+                            source,
+                            cand,
+                            min_symbol,
+                            wp_params,
+                            pool,
+                            scratch,
+                            &mut best,
+                            &mut best_estimate,
+                        );
+                    }
+                }
+            }
+            best.expect("learned-tree section")
+        });
+
+        writer.write(1, 0);
+        writer.zero_pad_to_byte();
+        write_toc_entry(section.bits_written() / 8, writer);
+        writer.zero_pad_to_byte();
+        writer.append_byte_aligned(std::slice::from_mut(&mut section));
+        writer.zero_pad_to_byte();
+        return cand.estimated_savings;
+    }
+
+    // Global stream: channels that fit a group, coded in the DC-global section.
+    let mut global_tokens = RawTokens::with_capacity(0);
+    for p in placement.iter().filter(|p| p.global) {
+        let ch = &source.channels[p.channel];
+        tokenize(p, 0, 0, 0, ch.w, ch.h, &mut global_tokens);
+    }
+    let has_global_stream = !global_tokens.is_empty();
+
+    let group_placement: Vec<&MaPlacement> = placement.iter().filter(|p| !p.global).collect();
+    let group_tokens: Vec<RawTokens> = pool.steal_map_with_threads(
         scratch,
         num_ac_groups,
         group_lz_threads(crate::Speed::Slow, pool),
-        |group_index, scratch| {
-            let gx = group_index % xsize_groups;
-            let gy = group_index / xsize_groups;
-            let x0 = gx * GROUP_DIM;
-            let y0 = gy * GROUP_DIM;
-            let gw = GROUP_DIM.min(xsize - x0);
-            let gh = GROUP_DIM.min(ysize - y0);
-            let mut toks: Vec<Token> = Vec::with_capacity(gw * gh * nb_chans);
-            for chan in 0..3usize {
-                let pd = linear.plane_data(chan);
-                let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-                tokenize_channel_ma(
-                    &get,
+        |group_index, _scratch| {
+            let x0 = (group_index % xsize_groups) * gdim;
+            let y0 = (group_index / xsize_groups) * gdim;
+            let num_values = group_placement
+                .iter()
+                .map(|p| {
+                    let ch = &source.channels[p.channel];
+                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                })
+                .sum();
+            let mut toks = RawTokens::with_capacity(num_values);
+            for p in &group_placement {
+                let ch = &source.channels[p.channel];
+                let gw = gdim.min(ch.w - x0);
+                let gh = gdim.min(ch.h - y0);
+                tokenize(
+                    p,
+                    ac_stream_id(num_dc_groups, group_index),
+                    x0,
+                    y0,
                     gw,
                     gh,
-                    chan as u32,
-                    wp_params,
-                    use_wp,
-                    &tree,
-                    &leaf_ctx,
                     &mut toks,
                 );
             }
-            if let Some(a) = alpha {
-                let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                tokenize_channel_ma(
-                    &get, gw, gh, 3, wp_params, use_wp, &tree, &leaf_ctx, &mut toks,
-                );
-            }
-            deep_lz.with_depth(|depth| {
-                lz77_compress_for_speed_with_depth(
-                    &toks,
-                    distance_ctx,
-                    crate::Speed::Slow,
-                    depth,
-                    scratch,
-                )
-            })
+            toks
         },
     );
-    drop(deep_lz);
-    let code = build_lz_pixel_code(
-        group_lz_tokens.iter().map(Vec::as_slice),
+    // Stream 0 is the global stream (possibly empty), then one per AC group.
+    let mut all_tokens: Vec<RawTokens> = Vec::with_capacity(1 + num_ac_groups);
+    all_tokens.push(global_tokens);
+    all_tokens.extend(group_tokens);
+    let mut sections = with_raw_streams!(all_tokens, |all_tokens| {
+        let variants = choose_tree_streams(
+            all_tokens,
+            distance_ctx,
+            num_ctx as usize + 1,
+            min_symbol,
+            pool,
+            scratch,
+        );
+        let mut best: Option<Vec<BitWriter>> = None;
+        let mut best_bits = usize::MAX;
+        let mut best_estimate = f64::INFINITY;
+        for variant in variants {
+            match variant {
+                TreeStreams::Literals(streams) => {
+                    write_learned_grouped_variant(
+                        &streams,
+                        source,
+                        cand,
+                        min_symbol,
+                        wp_params,
+                        pool,
+                        scratch,
+                        num_ac_groups,
+                        num_dc_groups,
+                        has_global_stream,
+                        &mut best,
+                        &mut best_bits,
+                        &mut best_estimate,
+                    );
+                }
+                TreeStreams::Lz(streams) => {
+                    write_learned_grouped_variant(
+                        &streams,
+                        source,
+                        cand,
+                        min_symbol,
+                        wp_params,
+                        pool,
+                        scratch,
+                        num_ac_groups,
+                        num_dc_groups,
+                        has_global_stream,
+                        &mut best,
+                        &mut best_bits,
+                        &mut best_estimate,
+                    );
+                }
+            }
+        }
+        best.expect("learned-tree sections")
+    });
+
+    writer.write(1, 0);
+    writer.zero_pad_to_byte();
+    for s in &sections {
+        write_toc_entry(s.bits_written() / 8, writer);
+    }
+    writer.zero_pad_to_byte();
+    writer.append_byte_aligned(&mut sections);
+    writer.zero_pad_to_byte();
+    cand.estimated_savings
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_learned_single_variant<T: lz77::LzTokenSource>(
+    stream: &[T],
+    source: &MaSource<'_>,
+    cand: &LearnedCandidate,
+    min_symbol: u32,
+    wp_params: WpParams,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    best: &mut Option<BitWriter>,
+    best_estimate: &mut f64,
+) {
+    let num_ctx = cand.num_ctx;
+    let distance_ctx = num_ctx;
+    let code = build_lz_pixel_code_threads(
+        std::iter::once(stream),
         num_ctx as usize,
         min_symbol,
         true,
+        true,
+        Some(pool),
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
+    let estimate = estimate_coded_bits(
+        &[stream],
+        distance_ctx,
+        &code,
+        min_symbol,
+        pool.num_threads(),
+    );
+    if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
+        return;
+    }
+    *best_estimate = (*best_estimate).min(estimate);
+    let mut body = BitWriter::new();
+    body.write(1, 1); // dc_quant all_default = 1
+    body.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
+    body.write(1, 0); // use_global_tree = 0
+    write_wp_header(wp_params, &mut body);
+    source.write_transforms(&mut body);
+    write_tree_lz77(
+        &cand.tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut body,
+    );
+    write_lz_section(stream, distance_ctx, &code, min_symbol, &mut body);
+    body.zero_pad_to_byte();
+    keep_smaller_writer(best, body);
+}
 
-    write_frame_header_modular(alpha.is_some(), writer);
+#[allow(clippy::too_many_arguments)]
+fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
+    streams: &[Vec<T>],
+    source: &MaSource<'_>,
+    cand: &LearnedCandidate,
+    min_symbol: u32,
+    wp_params: WpParams,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    num_ac_groups: usize,
+    num_dc_groups: usize,
+    has_global_stream: bool,
+    best: &mut Option<Vec<BitWriter>>,
+    best_bits: &mut usize,
+    best_estimate: &mut f64,
+) {
+    let num_ctx = cand.num_ctx;
+    let distance_ctx = num_ctx;
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
+    let code = build_lz_pixel_code_threads(
+        streams.iter().map(Vec::as_slice),
+        num_ctx as usize,
+        min_symbol,
+        true,
+        true,
+        Some(pool),
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    let estimate = {
+        let slices: Vec<&[T]> = streams.iter().map(Vec::as_slice).collect();
+        estimate_coded_bits(&slices, distance_ctx, &code, min_symbol, pool.num_threads())
+    };
+    if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
+        return;
+    }
+    *best_estimate = (*best_estimate).min(estimate);
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
     sections[0].write(1, 1); // dc_quant all_default = 1
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
-        &tree_tokens,
+        &cand.tree_tokens,
         &code,
         min_symbol,
         &mut scratch.huffman_pool,
@@ -5706,7 +3665,16 @@ fn try_encode_learned_tree_multi_group(
     );
     sections[0].write(1, 1); // use_global_tree
     write_wp_header(wp_params, &mut sections[0]);
-    write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
+    source.write_transforms(&mut sections[0]);
+    if has_global_stream {
+        write_lz_section(
+            &streams[0],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut sections[0],
+        );
+    }
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {
@@ -5721,30 +3689,131 @@ fn try_encode_learned_tree_multi_group(
     write_wp_header(wp_params, &mut sections[ac_global_idx]);
     sections[ac_global_idx].zero_pad_to_byte();
 
-    for group_index in 0..num_ac_groups {
-        let section_idx = 2 + num_dc_groups + group_index;
-        sections[section_idx].write(1, 1);
-        write_wp_header(wp_params, &mut sections[section_idx]);
-        sections[section_idx].write(2, 0);
-        write_lz_section(
-            &group_lz_tokens[group_index],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[section_idx],
-        );
-        sections[section_idx].zero_pad_to_byte();
+    // Every AC group section is independent given the code (scoped
+    // threads: the code borrows the worker scratch the pool would need).
+    let code_ref = &code;
+    let group_streams = &streams[1..];
+    let threads = pool.num_threads().clamp(1, num_ac_groups.max(1));
+    let chunk = num_ac_groups.div_ceil(threads).max(1);
+    let group_sections: Vec<BitWriter> = std::thread::scope(|scope| {
+        let handles: Vec<_> = group_streams
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|stream| {
+                            let mut section = BitWriter::new();
+                            section.write(1, 1);
+                            write_wp_header(wp_params, &mut section);
+                            section.write(2, 0);
+                            write_lz_section(
+                                stream,
+                                distance_ctx,
+                                code_ref,
+                                min_symbol,
+                                &mut section,
+                            );
+                            section.zero_pad_to_byte();
+                            section
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("group section writer"))
+            .collect()
+    });
+    for (group_index, section) in group_sections.into_iter().enumerate() {
+        sections[2 + num_dc_groups + group_index] = section;
     }
+    let bits: usize = sections.iter().map(BitWriter::bits_written).sum();
+    if bits < *best_bits {
+        *best_bits = bits;
+        *best = Some(sections);
+    }
+}
 
-    writer.write(1, 0);
-    writer.zero_pad_to_byte();
-    for s in &sections {
-        write_toc_entry(s.bits_written() / 8, writer);
+enum TreeStreams<T> {
+    /// Retain the original tokens without expanding them to LzToken records.
+    Literals(Vec<Vec<T>>),
+    Lz(Vec<Vec<LzToken>>),
+}
+
+/// Runs and matches collapse a token stream, but a learned tree routes flat
+/// content into near-deterministic contexts where a literal costs almost
+/// nothing under ANS while every run token still pays for its length and
+/// distance (the Burning Ship fractal codes 24% smaller as literals) — yet
+/// a palette index image can prefer long matches. Streams that barely
+/// collapse keep the LZ77 layer outright; otherwise the order-0 estimates
+/// order the literal and LZ77 variants (the deep matcher is skipped when
+/// runs alone trail literals by `LZ_DEEP_MATCHER_MAX_RATIO`), and the
+/// writer only codes a later variant when its code-based estimate beats
+/// the one already written.
+const LZ_LITERAL_ALTERNATIVE_MAX_RATIO: f64 = 0.98;
+/// Order-0 estimates are optimistic for literal streams whose contexts get
+/// merged by clustering (up to ~30% on palette indices), so the matcher is
+/// only skipped on a wide margin.
+const LZ_DEEP_MATCHER_MAX_RATIO: f64 = 1.6;
+/// A later variant is written when its code-based estimate is within this
+/// factor of the best written one (the estimate itself is ~0.5% accurate).
+const VARIANT_WRITE_TOLERANCE: f64 = 1.005;
+
+/// Stream variants to try for one learned-tree frame, most promising first:
+/// literal variants reuse the input, and LZ variants own their match streams.
+fn choose_tree_streams<T: lz77::LiteralToken>(
+    tokens: Vec<Vec<T>>,
+    distance_ctx: u32,
+    num_contexts: usize,
+    min_symbol: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Vec<TreeStreams<T>> {
+    let raw: usize = tokens.iter().map(Vec::len).sum();
+    // Keep the per-stream counts from the existing gate pass so the run
+    // candidates can allocate exactly once, without retaining growth slack.
+    let run_counts = pool.steal_map(scratch, tokens.len(), |k, _scratch| {
+        lz77_run_count(&tokens[k])
+    });
+    let run_len: usize = run_counts.iter().sum();
+    let deep = |scratch: &mut CoderScratch| -> Vec<Vec<LzToken>> {
+        let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+        pool.steal_map_with_threads(
+            scratch,
+            tokens.len(),
+            group_lz_threads(crate::Speed::Slow, pool),
+            |k, scratch| {
+                deep_lz.with_depth(|depth| {
+                    lz77_compress_for_speed_with_depth(
+                        &tokens[k],
+                        distance_ctx,
+                        crate::Speed::Slow,
+                        depth,
+                        Some(run_counts[k]),
+                        scratch,
+                    )
+                })
+            },
+        )
+    };
+    if (run_len as f64) >= LZ_LITERAL_ALTERNATIVE_MAX_RATIO * raw as f64 {
+        return vec![TreeStreams::Lz(deep(scratch))];
     }
-    writer.zero_pad_to_byte();
-    writer.append_byte_aligned(&mut sections);
-    writer.zero_pad_to_byte();
-    Some(estimated_savings)
+    let raw_slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
+    let (e_lit, e_run) =
+        estimate_literal_and_run_bits(&raw_slices, num_contexts, min_symbol, pool, scratch);
+    if e_run > e_lit * LZ_DEEP_MATCHER_MAX_RATIO {
+        return vec![TreeStreams::Literals(tokens)];
+    }
+    let lz = deep(scratch);
+    let slices: Vec<&[LzToken]> = lz.iter().map(Vec::as_slice).collect();
+    let e_lz = estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch);
+    if e_lz < e_lit {
+        vec![TreeStreams::Lz(lz), TreeStreams::Literals(tokens)]
+    } else {
+        vec![TreeStreams::Literals(tokens), TreeStreams::Lz(lz)]
+    }
 }
 
 /// v1 context tree: single-group only. Returns true (and writes the full frame)
@@ -5755,6 +3824,7 @@ fn try_encode_context_tree_single_group(
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
+    layout: GroupLayout,
     predictors: &[u32],
     min_symbol: u32,
     rct_type: u32,
@@ -5836,7 +3906,7 @@ fn try_encode_context_tree_single_group(
     }
 
     // Frame header + single section.
-    write_frame_header_modular(alpha.is_some(), writer);
+    write_frame_header_modular(alpha.is_some(), layout, writer);
     let mut section = BitWriter::new();
     section.write(1, 1); // dc_quant all_default = 1
     section.write(1, 0); // has_tree = 0
@@ -5881,6 +3951,7 @@ fn try_encode_context_tree_multi_group(
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
+    layout: GroupLayout,
     predictors: &[u32],
     xsize_groups: usize,
     ysize_groups: usize,
@@ -5900,10 +3971,10 @@ fn try_encode_context_tree_multi_group(
         pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
             let gx = group_index % xsize_groups;
             let gy = group_index / xsize_groups;
-            let x0 = gx * GROUP_DIM;
-            let y0 = gy * GROUP_DIM;
-            let gw = GROUP_DIM.min(xsize - x0);
-            let gh = GROUP_DIM.min(ysize - y0);
+            let x0 = gx * layout.dim();
+            let y0 = gy * layout.dim();
+            let gw = layout.dim().min(xsize - x0);
+            let gh = layout.dim().min(ysize - y0);
             let mut chans: Vec<(Vec<u32>, Vec<i64>)> = Vec::with_capacity(nb_chans);
             for chan in 0..3usize {
                 let pd = linear.plane_data(chan);
@@ -5945,36 +4016,38 @@ fn try_encode_context_tree_multi_group(
     let distance_ctx = num_pixel_ctx as u32;
 
     // 4) Per-group tokens (reusing collected res/prop) + per-group LZ77.
-    let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
-    let group_lz_tokens: Vec<Vec<LzToken>> = pool.steal_map_with_threads(
-        scratch,
-        num_ac_groups,
-        group_lz_threads(crate::Speed::Slow, pool),
-        |group_index, scratch| {
-            let g = &groups[group_index];
-            let token_count = g.iter().map(|(res, _)| res.len()).sum();
-            let mut toks: Vec<Token> = Vec::with_capacity(token_count);
-            for chan in 0..nb_chans {
-                let (res, prp) = &g[chan];
-                let t = ts[chan] as i64;
-                for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
-                    let bucket = bucket_of(prp, t);
-                    let ctx = ctx_lut[chan * 3 + bucket as usize];
-                    toks.push(Token::new(ctx, res));
+    let group_lz_tokens: Vec<Vec<LzToken>> = {
+        let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+        pool.steal_map_with_threads(
+            scratch,
+            num_ac_groups,
+            group_lz_threads(crate::Speed::Slow, pool),
+            |group_index, scratch| {
+                let g = &groups[group_index];
+                let token_count = g.iter().map(|(res, _)| res.len()).sum();
+                let mut toks: Vec<Token> = Vec::with_capacity(token_count);
+                for chan in 0..nb_chans {
+                    let (res, prp) = &g[chan];
+                    let t = ts[chan] as i64;
+                    for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
+                        let bucket = bucket_of(prp, t);
+                        let ctx = ctx_lut[chan * 3 + bucket as usize];
+                        toks.push(Token::new(ctx, res));
+                    }
                 }
-            }
-            deep_lz.with_depth(|depth| {
-                lz77_compress_for_speed_with_depth(
-                    &toks,
-                    distance_ctx,
-                    crate::Speed::Slow,
-                    depth,
-                    scratch,
-                )
-            })
-        },
-    );
-    drop(deep_lz);
+                deep_lz.with_depth(|depth| {
+                    lz77_compress_for_speed_with_depth(
+                        &toks,
+                        distance_ctx,
+                        crate::Speed::Slow,
+                        depth,
+                        None,
+                        scratch,
+                    )
+                })
+            },
+        )
+    };
     let code = build_lz_pixel_code(
         group_lz_tokens.iter().map(Vec::as_slice),
         num_pixel_ctx,
@@ -5985,7 +4058,7 @@ fn try_encode_context_tree_multi_group(
     );
 
     // 5) Sections (same layout as the flat multi-group path).
-    write_frame_header_modular(alpha.is_some(), writer);
+    write_frame_header_modular(alpha.is_some(), layout, writer);
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
@@ -6015,20 +4088,15 @@ fn try_encode_context_tree_multi_group(
     write_wp_header(wp_params, &mut sections[ac_global_idx]);
     sections[ac_global_idx].zero_pad_to_byte();
 
-    for group_index in 0..num_ac_groups {
-        let section_idx = 2 + num_dc_groups + group_index;
-        sections[section_idx].write(1, 1);
-        write_wp_header(wp_params, &mut sections[section_idx]);
-        sections[section_idx].write(2, 0);
-        write_lz_section(
-            &group_lz_tokens[group_index],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[section_idx],
-        );
-        sections[section_idx].zero_pad_to_byte();
-    }
+    write_lz_groups(
+        &group_lz_tokens,
+        &code,
+        distance_ctx,
+        min_symbol,
+        wp_params,
+        pool,
+        &mut sections[2 + num_dc_groups..],
+    );
 
     writer.write(1, 0);
     writer.zero_pad_to_byte();
@@ -6041,25 +4109,6 @@ fn try_encode_context_tree_multi_group(
     true
 }
 
-use crate::adaptive_quant::dirty_log2f;
-use crate::bit_writer::BitWriter;
-use crate::encode_image::AlphaPlane;
-use crate::entropy::{
-    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, uint_encode, write_entropy_code,
-    write_token,
-};
-use crate::image::Image3Si;
-use crate::ma_tree::{
-    LearnedTree, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, deepen_ma_tree,
-    learn_ma_tree, learn_ma_tree_indexed,
-};
-use crate::patches::{
-    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
-    find_lossless_patches,
-};
-use crate::weighted_predictor::{WpNeighbors, WpParams, WpState, write_wp_header};
-use crate::xyb::quantize_xyb_channels;
-use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 // Tree writing (balanced N-leaf, Gradient predictor).
 //
@@ -6236,7 +4285,7 @@ fn encode_frame_lossless_float_with_pool(
     let predictors = [GRADIENT_PRED; 4];
     let tree_tokens = build_balanced_tree_tokens(&predictors[..nb_chans]);
 
-    write_frame_header_modular(alpha.is_some(), writer);
+    write_frame_header_modular(alpha.is_some(), GroupLayout::DEFAULT, writer);
 
     if single_group {
         let mut section = BitWriter::new();
@@ -6354,6 +4403,7 @@ fn encode_frame_lossless_float_with_pool(
 
 #[cfg(test)]
 mod rate_selection_tests {
+    use super::palette::local_palette_coverage_is_sufficient;
     use super::*;
 
     #[test]
@@ -6444,6 +4494,102 @@ mod rate_selection_tests {
 mod ma_sampling_tests {
     use super::*;
 
+    #[test]
+    fn row_walk_matches_point_fetched_properties_and_predictions() {
+        for width in [0usize, 1, 2, 3, 4, 5, 17, 257] {
+            for height in [0usize, 1, 2, 7] {
+                for flat in [false, true] {
+                    let plane: Vec<i32> = (0..width * height)
+                        .map(|i| {
+                            if flat {
+                                8192
+                            } else {
+                                [i32::MIN, i32::MAX, -65536, 65535, -8192, 0, 8192]
+                                    [(i * 17 + i / width) % 7]
+                            }
+                        })
+                        .collect();
+                    let get = |x: usize, y: usize| plane[y * width + x];
+                    for &params in &WpParams::PRESETS {
+                        for use_wp in [false, true] {
+                            let mut wp = WpState::with_params(width, params);
+                            let mut previous_gradient = 0i32;
+                            let mut count = 0;
+                            walk_channel_ma(
+                                |y| &plane[y * width..][..width],
+                                width,
+                                height,
+                                2,
+                                0,
+                                &[],
+                                params,
+                                use_wp,
+                                |x, y, value, props, neighbors, weighted| {
+                                    assert_eq!(count, y * width + x);
+                                    assert_eq!(value, get(x, y) as i64);
+                                    count += 1;
+                                    if x == 0 {
+                                        previous_gradient = 0;
+                                    }
+                                    let n = predictor_neighbors(&get, x, y, width);
+                                    let expected_wp = if use_wp {
+                                        wp.predict(
+                                            x,
+                                            y,
+                                            n.top,
+                                            n.left,
+                                            n.top_right,
+                                            n.top_left,
+                                            n.top_top,
+                                        )
+                                    } else {
+                                        0
+                                    };
+                                    let gradient = (n.left + n.top - n.top_left) as i32;
+                                    // No reference planes: the extra properties stay 0.
+                                    assert!(props[16..].iter().all(|&v| v == 0));
+                                    assert_eq!(
+                                        props[..16],
+                                        [
+                                            2,
+                                            0,
+                                            y as i32,
+                                            x as i32,
+                                            n.top.abs() as i32,
+                                            n.left.abs() as i32,
+                                            n.top as i32,
+                                            n.left as i32,
+                                            (n.left - previous_gradient as i64) as i32,
+                                            gradient,
+                                            (n.left - n.top_left) as i32,
+                                            (n.top_left - n.top) as i32,
+                                            (n.top - n.top_right) as i32,
+                                            (n.top - n.top_top) as i32,
+                                            (n.left - n.left_left) as i32,
+                                            if use_wp { wp.wp_prop as i32 } else { 0 },
+                                        ]
+                                    );
+                                    assert_eq!(weighted, expected_wp);
+                                    for pred in 0..NUM_MA_PREDS as u32 {
+                                        assert_eq!(
+                                            predictor_value(pred, neighbors, weighted),
+                                            predictor_value(pred, n, expected_wp),
+                                        );
+                                    }
+                                    previous_gradient = gradient;
+                                    if use_wp {
+                                        wp.update(value, x, y);
+                                    }
+                                },
+                            );
+                            assert_eq!(count, width * height);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn reference_samples(
         plane: &[i32],
         width: usize,
@@ -6451,31 +4597,28 @@ mod ma_sampling_tests {
         stride: usize,
         params: WpParams,
     ) -> MaSamples {
-        let get = |x: usize, y: usize| plane[y * width + x];
         let mut samples = MaSamples::new();
-        let mut counter = 0usize;
         walk_channel_ma(
-            &get,
+            |y| &plane[y * width..][..width],
             width,
             height,
             2,
+            0,
+            &[],
             params,
             true,
-            |_x, _y, value, p, n, wp_pred| {
-                counter += 1;
-                if !counter.is_multiple_of(stride) {
+            |x, y, value, p, n, wp_pred| {
+                // Row-rotated phase: row y samples x == y (mod stride).
+                if x % stride != y % stride {
                     return;
                 }
                 let mut tok = [0u8; NUM_MA_PREDS];
-                let mut nbits = [0u8; NUM_MA_PREDS];
                 for pred in 0..NUM_MA_PREDS as u32 {
                     let prediction = predictor_value(pred, n, wp_pred);
-                    let (token, extra_bits, _) =
-                        uint_encode(pack_signed((value - prediction) as i32));
+                    let (token, _, _) = uint_encode(pack_signed((value - prediction) as i32));
                     tok[pred as usize] = token.min(u8::MAX as u32) as u8;
-                    nbits[pred as usize] = extra_bits.min(u8::MAX as u32) as u8;
                 }
-                samples.push(*p, tok, nbits);
+                samples.push(*p, tok);
             },
         );
         samples
@@ -6491,12 +4634,24 @@ mod ma_sampling_tests {
                     (((x * 977 + y * 619) ^ (x * y * 37)) as i32 & 0xffff) - 0x7fff
                 })
                 .collect();
-            let get = |x: usize, y: usize| plane[y * width + x];
+            let get_row = |y: usize| &plane[y * width..][..width];
             for &stride in &[1, 2, 3, 5, 11, width * height + 1] {
                 for &params in &WpParams::PRESETS {
                     let expected = reference_samples(&plane, width, height, stride, params);
                     let mut actual = MaSamples::new();
-                    sample_channel_ma(&get, width, height, 2, params, true, stride, &mut actual);
+                    sample_channel_ma(
+                        get_row,
+                        width,
+                        height,
+                        2,
+                        0,
+                        &[],
+                        params,
+                        true,
+                        stride,
+                        |p, t| actual.push(p, t),
+                    );
+                    assert_eq!(actual.len(), ma_channel_sample_count(width, height, stride));
                     assert_eq!(
                         actual.props, expected.props,
                         "properties: {width}x{height}, stride={stride}, params={params:?}"
@@ -6505,244 +4660,7 @@ mod ma_sampling_tests {
                         actual.tok, expected.tok,
                         "tokens: {width}x{height}, stride={stride}, params={params:?}"
                     );
-                    assert_eq!(
-                        actual.nbits, expected.nbits,
-                        "extra bits: {width}x{height}, stride={stride}, params={params:?}"
-                    );
                 }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod rct_tests {
-    use super::*;
-
-    #[test]
-    fn context_lookup_matches_linear_cutoff_classification() {
-        let reference = |max_diff: u32| {
-            RCT_CONTEXT_CUTOFFS
-                .iter()
-                .filter(|&&cutoff| max_diff < cutoff)
-                .count()
-        };
-        for max_diff in 0..=u16::MAX as u32 {
-            assert_eq!(rct_context(max_diff), reference(max_diff), "{max_diff}");
-        }
-        assert_eq!(rct_context(u32::MAX), reference(u32::MAX));
-    }
-
-    #[test]
-    fn direct_ycocg_candidate_conversion_matches_rgb_round_trip() {
-        for &(y, co, cg) in &[(0, 0, 0), (127, -91, 53), (-400, 723, -255)] {
-            let rgb = inverse_ycocg(y, co, cg);
-            let rgb = [rgb.0, rgb.1, rgb.2];
-            for &rct in &RCT_CANDIDATES {
-                let expected = if rct == 6 {
-                    (y, co, cg)
-                } else {
-                    let perm = rct_perm((rct / 7) as usize);
-                    rct_forward_pixel(rct % 7, rgb[perm[0]], rgb[perm[1]], rgb[perm[2]])
-                };
-                assert_eq!(rct_from_ycocg_pixel(y, co, cg, rct), expected);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod predictor_tests {
-    use super::*;
-
-    #[test]
-    fn grouped_threshold_scoring_matches_concatenated_reference() {
-        let groups = vec![
-            vec![(vec![0, 3, 7, 3], vec![-20, -4, 12, 80])],
-            vec![(vec![7, 1, 1, 9, 2], vec![-100, -9, 0, 17, 110])],
-        ];
-        let residuals: Vec<u32> = groups
-            .iter()
-            .flat_map(|group| group[0].0.iter().copied())
-            .collect();
-        let properties: Vec<i64> = groups
-            .iter()
-            .flat_map(|group| group[0].1.iter().copied())
-            .collect();
-        let expected = pick_threshold(&residuals, &properties, &mut CoderScratch::default());
-        let actual = pick_threshold_grouped(&groups, 0, &mut CoderScratch::default());
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn added_predictors_match_jxl_formulas() {
-        let n = PredictorNeighbors {
-            left: 11,
-            top: 7,
-            top_left: 5,
-            top_right: 13,
-            left_left: 3,
-            top_top: 2,
-            top_right_right: 17,
-        };
-        assert_eq!(predictor_value(PREDICTOR_LEFT, n, 99), 11);
-        assert_eq!(predictor_value(PREDICTOR_TOP, n, 99), 7);
-        assert_eq!(predictor_value(PREDICTOR_SELECT, n, 99), 11);
-        assert_eq!(predictor_value(PREDICTOR_AVERAGE4, n, 99), 11);
-
-        // Select resolves equal distances toward Top, matching libjxl's
-        // `pa < pb ? left : top`.
-        let tie = PredictorNeighbors {
-            left: 9,
-            top: 3,
-            top_left: 6,
-            ..n
-        };
-        assert_eq!(predictor_value(PREDICTOR_SELECT, tie, 99), 3);
-    }
-
-    #[test]
-    fn slow_search_selects_directional_predictors() {
-        const W: usize = 64;
-        const H: usize = 64;
-        let mut horizontal = vec![0i32; W * H];
-        for y in 0..H {
-            horizontal[y * W] = ((y * 73) & 255) as i32;
-            for x in 1..W {
-                let delta = (((x * 17 + y * 31) ^ (x * y * 3)) % 7) as i32 - 3;
-                horizontal[y * W + x] = horizontal[y * W + x - 1] + delta;
-            }
-        }
-        let mut vertical = vec![0i32; W * H];
-        for x in 0..W {
-            vertical[x] = ((x * 73) & 255) as i32;
-            for y in 1..H {
-                let delta = (((y * 17 + x * 31) ^ (x * y * 3)) % 7) as i32 - 3;
-                vertical[y * W + x] = vertical[(y - 1) * W + x] + delta;
-            }
-        }
-
-        assert_eq!(
-            choose_predictor_for_plane(|x, y| horizontal[y * W + x], W, H, true),
-            PREDICTOR_SELECT
-        );
-        assert_eq!(
-            choose_predictor_for_plane(|x, y| vertical[y * W + x], W, H, true),
-            PREDICTOR_SELECT
-        );
-    }
-
-    #[test]
-    fn slow_search_selects_average4_for_its_recurrence() {
-        const W: usize = 64;
-        const H: usize = 64;
-        let mut plane = vec![0i32; W * H];
-        for y in 0..H {
-            for x in 0..W {
-                let i = y * W + x;
-                if y < 2 || x < 2 {
-                    plane[i] = (((x * 97 + y * 53) ^ (x * y * 11)) & 1023) as i32 - 512;
-                    continue;
-                }
-                let top_right = if x + 1 < W {
-                    plane[(y - 1) * W + x + 1]
-                } else {
-                    plane[(y - 1) * W + x]
-                };
-                let top_right_right = if x + 2 < W {
-                    plane[(y - 1) * W + x + 2]
-                } else {
-                    top_right
-                };
-                plane[i] = (6 * plane[(y - 1) * W + x] - 2 * plane[(y - 2) * W + x]
-                    + 7 * plane[i - 1]
-                    + plane[i - 2]
-                    + top_right_right
-                    + 3 * top_right
-                    + 8)
-                    / 16;
-            }
-        }
-
-        assert_eq!(
-            choose_predictor_for_plane(|x, y| plane[y * W + x], W, H, true),
-            PREDICTOR_AVERAGE4
-        );
-    }
-
-    #[test]
-    fn directional_wp_presets_are_distinct() {
-        const W: usize = 128;
-        const H: usize = 128;
-        let mut west = vec![0i32; W * H];
-        let mut north = vec![0i32; W * H];
-        for y in 0..H {
-            west[y * W] = ((y * 977) & 65535) as i32;
-            for x in 1..W {
-                west[y * W + x] = west[y * W + x - 1] + ((x * 13 + y * 7) % 5) as i32 - 2;
-            }
-        }
-        for x in 0..W {
-            north[x] = ((x * 977) & 65535) as i32;
-            for y in 1..H {
-                north[y * W + x] = north[(y - 1) * W + x] + ((y * 13 + x * 7) % 5) as i32 - 2;
-            }
-        }
-        let west_costs: Vec<_> = WpParams::PRESETS
-            .iter()
-            .map(|&params| wp_sample_cost(|x, y| west[y * W + x], W, H, params).0)
-            .collect();
-        let north_costs: Vec<_> = WpParams::PRESETS
-            .iter()
-            .map(|&params| wp_sample_cost(|x, y| north[y * W + x], W, H, params).0)
-            .collect();
-        assert_ne!(west_costs[2], west_costs[3]);
-        assert_ne!(north_costs[2], north_costs[3]);
-    }
-
-    #[test]
-    fn fused_wp_row_kernels_match_point_fetched_reference() {
-        for &(width, height) in &[(0, 3), (1, 1), (1, 4), (2, 2), (7, 5), (17, 4)] {
-            let plane: Vec<i32> = (0..width * height)
-                .map(|i| {
-                    let x = i % width.max(1);
-                    let y = i / width.max(1);
-                    (((x * 977 + y * 619) ^ (x * y * 37)) as i32 & 0x7fff) - 0x3fff
-                })
-                .collect();
-            for &params in &WpParams::PRESETS {
-                let get = |x: usize, y: usize| plane[y * width + x];
-                let mut reference = Vec::with_capacity(width * height);
-                let mut wp = WpState::with_params(width, params);
-                for y in 0..height {
-                    for x in 0..width {
-                        let value = get(x, y) as i64;
-                        let n = predictor_neighbors(&get, x, y, width);
-                        let prediction =
-                            wp.predict(x, y, n.top, n.left, n.top_right, n.top_left, n.top_top);
-                        wp.update(value, x, y);
-                        reference.push((11, pack_signed((value - prediction) as i32)));
-                    }
-                }
-
-                let mut scratch = GradientScratch::default();
-                let mut fused = Vec::with_capacity(width * height);
-                tokenize_plane_with_wp(
-                    11,
-                    get,
-                    width,
-                    height,
-                    PREDICTOR_WEIGHTED,
-                    grad_pack_interior_scalar,
-                    &mut scratch,
-                    &mut fused,
-                    params,
-                );
-                let fused: Vec<_> = fused
-                    .iter()
-                    .map(|token| (token.context, token.value))
-                    .collect();
-                assert_eq!(fused, reference, "{width}x{height}, params={params:?}");
             }
         }
     }
@@ -6801,6 +4719,203 @@ mod lz_reach_probe {
                     got[2][i],
                     (atlas.plane_data(2)[i] * INV_DC_QUANT[2] * m).round() as i32 - yq
                 );
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod context_tree_tests {
+    use super::*;
+
+    #[test]
+    fn gated_tree_keeps_bfs_tokens_with_leaf_offsets() {
+        let tree = LearnedTree {
+            nodes: vec![
+                MaNode::Split {
+                    prop: 0,
+                    val: 0,
+                    gt: 1,
+                    le: 2,
+                },
+                MaNode::Leaf { pred: 1 },
+                MaNode::Split {
+                    prop: 3,
+                    val: 3,
+                    gt: 3,
+                    le: 4,
+                },
+                MaNode::Leaf { pred: 6 },
+                MaNode::Leaf { pred: 0 },
+            ],
+            est_bits: 100.,
+            flat_bits: 10000.,
+        };
+        let mut samples = MaSamples::new();
+        for (channel, x, residual) in [(1, 0, -3), (0, 4, 5), (0, 3, 0)] {
+            let mut props = [0; NUM_MA_PROPS];
+            props[0] = channel;
+            props[3] = x;
+            for _ in 0..64 {
+                samples.push(props, [pack_signed(residual) as u8; NUM_MA_PREDS]);
+            }
+        }
+        for with_offsets in [false, true] {
+            let candidate =
+                gate_ma_tree(tree.clone(), 1., with_offsets.then_some(&samples)).unwrap();
+            let offsets = if with_offsets { [-3, 5, 0] } else { [0; 3] };
+            assert_eq!(candidate.leaf_offset, offsets);
+            assert_eq!(candidate.leaf_ctx, [u32::MAX, 0, u32::MAX, 1, 2]);
+            assert_eq!(candidate.num_ctx, 3);
+            let leaf = |pred, offset| {
+                [
+                    (TREE_CTX_PROPERTY, 0),
+                    (TREE_CTX_PREDICTOR, pred),
+                    (TREE_CTX_OFFSET, pack_signed(offset)),
+                    (TREE_CTX_MULTIPLIER_LOG, 0),
+                    (TREE_CTX_MULTIPLIER_BITS, 0),
+                ]
+            };
+            let mut expected = vec![(TREE_CTX_PROPERTY, 1), (TREE_CTX_SPLIT_VAL, 0)];
+            expected.extend(leaf(1, offsets[0]));
+            expected.extend([(TREE_CTX_PROPERTY, 4), (TREE_CTX_SPLIT_VAL, 6)]);
+            expected.extend(leaf(6, offsets[1]));
+            expected.extend(leaf(0, offsets[2]));
+            let actual: Vec<_> = candidate
+                .tree_tokens
+                .iter()
+                .map(|token| (token.context, token.value))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(candidate.est_real, 890.);
+        }
+        // Admission uses only the unchanged token-count estimate.
+        for est_bits in [10000., f64::NAN] {
+            assert!(
+                gate_ma_tree(
+                    LearnedTree {
+                        est_bits,
+                        ..tree.clone()
+                    },
+                    1.,
+                    Some(&samples)
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_threshold_scoring_matches_concatenated_reference() {
+        let groups = vec![
+            vec![(vec![0, 3, 7, 3], vec![-20, -4, 12, 80])],
+            vec![(vec![7, 1, 1, 9, 2], vec![-100, -9, 0, 17, 110])],
+        ];
+        let residuals: Vec<u32> = groups
+            .iter()
+            .flat_map(|group| group[0].0.iter().copied())
+            .collect();
+        let properties: Vec<i64> = groups
+            .iter()
+            .flat_map(|group| group[0].1.iter().copied())
+            .collect();
+        let expected = pick_threshold(&residuals, &properties, &mut CoderScratch::default());
+        let actual = pick_threshold_grouped(&groups, 0, &mut CoderScratch::default());
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn compiled_ma_tokenization_matches_full_tree_with_and_without_wp() {
+        let tree = LearnedTree {
+            nodes: vec![
+                MaNode::Split {
+                    prop: 0,
+                    val: 0,
+                    gt: 1,
+                    le: 4,
+                },
+                MaNode::Split {
+                    prop: 15,
+                    val: 0,
+                    gt: 2,
+                    le: 3,
+                },
+                MaNode::Leaf { pred: 6 },
+                MaNode::Leaf { pred: 1 },
+                MaNode::Split {
+                    prop: 3,
+                    val: 3,
+                    gt: 5,
+                    le: 6,
+                },
+                MaNode::Leaf { pred: 5 },
+                MaNode::Leaf { pred: 1 },
+            ],
+            est_bits: 0.,
+            flat_bits: 0.,
+        };
+        let (_, contexts, _) = emit_learned_tree(&tree);
+        for channel in [0, 1, 7, u32::MAX] {
+            let lookup = MaLookup::new(&tree, &contexts, channel, 0);
+            assert_eq!(lookup.needs_wp(), (channel as i32) > 0);
+            for width in [0, 1, 2, 3, 4, 5, 9, 257] {
+                for height in [0, 1, 2, 3, 17] {
+                    let values: Vec<i32> = (0..width * height)
+                        .map(|i| ((i * 7919 ^ (i / 7 * 1237)) % 65536) as i32 - 32768)
+                        .collect();
+                    let get_row = |y| &values[y * width..][..width];
+                    for use_wp in [false, true] {
+                        let mut expected = Vec::new();
+                        walk_channel_ma(
+                            get_row,
+                            width,
+                            height,
+                            channel,
+                            0,
+                            &[],
+                            WpParams::DEFAULT,
+                            use_wp,
+                            |_x, _y, value, props, n, wp| {
+                                let (node, pred) = tree.lookup(props);
+                                expected.push((
+                                    contexts[node as usize],
+                                    pack_signed((value - predictor_value(pred, n, wp)) as i32),
+                                ));
+                            },
+                        );
+                        let mut actual = RawTokens::with_capacity(values.len());
+                        tokenize_channel_ma(
+                            get_row,
+                            width,
+                            height,
+                            channel,
+                            0,
+                            &[],
+                            WpParams::DEFAULT,
+                            use_wp,
+                            &lookup,
+                            &vec![0; contexts.len()],
+                            &mut actual,
+                        );
+                        let actual: Vec<_> = match RawTokenStreams::new(vec![actual]) {
+                            RawTokenStreams::Compact(streams) => streams
+                                .into_iter()
+                                .flatten()
+                                .map(|t| {
+                                    let t = t.unpack();
+                                    (t.context, t.value)
+                                })
+                                .collect(),
+                            RawTokenStreams::Wide(streams) => streams
+                                .into_iter()
+                                .flatten()
+                                .map(|t| (t.context, t.value))
+                                .collect(),
+                        };
+                        assert_eq!(
+                            actual, expected,
+                            "channel={channel}, width={width}, height={height}, wp={use_wp}"
+                        );
+                    }
+                }
             }
         }
     }

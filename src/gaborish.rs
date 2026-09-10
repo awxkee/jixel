@@ -67,8 +67,9 @@ pub(crate) fn gaborish_inverse(image: &mut Image3F, mul: f32) {
     let n_l = norm * w_l;
     let n_d2 = norm * w_d2;
 
+    let mut out = vec![0.0; image.xsize() * image.ysize()];
     for c in 0..3 {
-        symmetric5_plane(image, c, n_c, n_r, n_d, n_r2, n_l, n_d2);
+        symmetric5_plane(image, c, n_c, n_r, n_d, n_r2, n_l, n_d2, &mut out);
     }
 }
 
@@ -97,13 +98,10 @@ fn symmetric5_plane(
     n_r2: f32,
     n_l: f32,
     n_d2: f32,
+    out: &mut Vec<f32>,
 ) {
     let xsize = image.xsize();
     let ysize = image.ysize();
-
-    // Allocate full output buffer. We read from `image` and write into `out`,
-    // then swap.
-    let mut out: Vec<f32> = vec![0.0; xsize * ysize];
 
     let plane = image.plane(c);
 
@@ -242,11 +240,8 @@ fn symmetric5_plane(
         }
     }
 
-    // Copy back into image.
-    for y in 0..ysize {
-        let dst_row = image.plane_row_mut(c, y);
-        dst_row.copy_from_slice(&out[y * xsize..(y + 1) * xsize]);
-    }
+    // The displaced plane becomes the next channel's output buffer.
+    image.plane_mut(c).swap_data(out);
 }
 
 #[cfg(test)]

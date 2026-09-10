@@ -33,6 +33,46 @@ pub(crate) struct Token {
     pub(crate) value: u32,
 }
 
+/// Lossless storage for the common learned-tree token range. All 32 bits
+/// participate in equality; values outside either field's range stay wide.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompactToken(u32);
+
+impl CompactToken {
+    pub(crate) const VALUE_BITS: u32 = 22;
+    pub(crate) const MAX_VALUE: u32 = (1 << Self::VALUE_BITS) - 1;
+    pub(crate) const MAX_CONTEXT: u32 = (1 << (32 - Self::VALUE_BITS)) - 1;
+
+    #[inline]
+    pub(crate) fn try_new(context: u32, value: u32) -> Option<Self> {
+        (context <= Self::MAX_CONTEXT && value <= Self::MAX_VALUE)
+            .then_some(Self((context << Self::VALUE_BITS) | value))
+    }
+
+    /// Check a whole row before appending it. Both the field reduction and
+    /// conversion can vectorize without a conditional in each token's store.
+    pub(crate) fn extend_from_tokens(out: &mut Vec<Self>, tokens: &[Token]) -> bool {
+        let (contexts, values) = tokens.iter().fold((0, 0), |(contexts, values), token| {
+            (contexts | token.context, values | token.value)
+        });
+        if Self::try_new(contexts, values).is_none() {
+            return false;
+        }
+        out.extend(
+            tokens
+                .iter()
+                .map(|token| Self((token.context << Self::VALUE_BITS) | token.value)),
+        );
+        true
+    }
+
+    #[inline]
+    pub(crate) fn unpack(self) -> Token {
+        Token::new(self.0 >> Self::VALUE_BITS, self.0 & Self::MAX_VALUE)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HybridUintConfig {
     pub(crate) split_exponent: u8,

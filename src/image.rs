@@ -69,6 +69,17 @@ impl<T: Copy + Default> Plane<T> {
         })
     }
 
+    pub(crate) fn swap_data(&mut self, data: &mut Vec<T>) {
+        assert_eq!(data.len(), self.data.len());
+        std::mem::swap(&mut self.data, data);
+    }
+
+    fn resize(&mut self, xsize: usize, ysize: usize) {
+        self.data.resize(xsize * ysize, T::default());
+        self.xsize = xsize;
+        self.ysize = ysize;
+    }
+
     #[inline]
     pub(crate) fn xsize(&self) -> usize {
         self.xsize
@@ -155,6 +166,13 @@ impl<T: Copy + Default> Image3<T> {
                 Plane::try_new(xsize, ysize)?,
             ],
         })
+    }
+
+    /// Reuse pixel storage for a new image that the caller will overwrite.
+    pub(crate) fn resize(&mut self, xsize: usize, ysize: usize) {
+        for plane in &mut self.planes {
+            plane.resize(xsize, ysize);
+        }
     }
 
     #[inline]
