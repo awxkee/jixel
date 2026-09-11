@@ -65,7 +65,7 @@ pub(crate) use dct::{
     inv_dct16x32_neon, inv_dct32x16_neon, inv_dct32x32_neon, inv_dct32x64_neon, inv_dct64x32_neon,
     inv_dct64x64_neon, inv_identity8x8_neon,
 };
-pub(crate) use entropy::counts_bit_cost_neon;
+pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,

@@ -65,7 +65,7 @@ pub(crate) use dct::{
     inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2, inv_dct32x64_avx2, inv_dct64x32_avx2,
     inv_dct64x64_avx2, inv_identity8x8_avx2,
 };
-pub(crate) use entropy::counts_bit_cost_avx2;
+pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,

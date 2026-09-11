@@ -55,6 +55,56 @@ fn dirty_log2f_x4(d: float32x4_t) -> float32x4_t {
     vfmaq_f32(base, vmulq_f32(x2, x), u)
 }
 
+/// Order-0 entropy of a lossless residual histogram, with the scalar
+/// division, logarithm approximation, and accumulation order preserved.
+///
+/// # Safety
+/// The caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+pub(crate) fn entropy_of_hist_neon(hist: &[u64], total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    let total_f = total as f32;
+    let t = vdupq_n_f32(total_f);
+    let mut bits = 0.0f32;
+    // Residual histograms often have long empty regions. Pack only occupied
+    // bins into SIMD lanes instead of evaluating logarithms of zero bins.
+    let mut counts = hist.iter().copied().filter(|&c| c != 0);
+    while let Some(c0) = counts.next() {
+        let Some(c1) = counts.next() else {
+            bits -= c0 as f32 * crate::adaptive_quant::dirty_log2f(c0 as f32 / total_f);
+            break;
+        };
+        let Some(c2) = counts.next() else {
+            for c in [c0, c1] {
+                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 / total_f);
+            }
+            break;
+        };
+        let Some(c3) = counts.next() else {
+            for c in [c0, c1, c2] {
+                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 / total_f);
+            }
+            break;
+        };
+        // Convert directly to f32: an intermediate f64 could round large
+        // u64 counts twice and disagree with the scalar calculation.
+        let floats = [c0 as f32, c1 as f32, c2 as f32, c3 as f32];
+        let c = unsafe { vld1q_f32(floats.as_ptr()) };
+        let p = vdivq_f32(c, t);
+        let terms = vmulq_f32(c, dirty_log2f_x4(p));
+        let mut lanes = [0.0f32; 4];
+        unsafe { vst1q_f32(lanes.as_mut_ptr(), terms) };
+        // Reassociating the sum or fusing these subtractions can change the
+        // selected predictor or threshold, even with identical bin costs.
+        for value in lanes {
+            bits -= value;
+        }
+    }
+    bits
+}
+
 /// Shannon population cost used by entropy histogram clustering.
 ///
 /// # Safety

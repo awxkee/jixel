@@ -40,7 +40,8 @@ pub(crate) fn match_len_sse2(a: &[Token], b: &[Token]) -> usize {
         while i + 2 <= n {
             let x = _mm_loadu_si128(a.as_ptr().add(i).cast());
             let y = _mm_loadu_si128(b.as_ptr().add(i).cast());
-            let mask = _mm_movemask_epi8(_mm_cmpeq_epi32(x, y)) as u32;
+            const VALUE_LANES: u32 = 0xF0F0;
+            let mask = (_mm_movemask_epi8(_mm_cmpeq_epi32(x, y)) as u32 | !VALUE_LANES) & 0xffff;
             if mask != 0xffff {
                 return i + ((!mask).trailing_zeros() as usize / 8);
             }
@@ -60,7 +61,9 @@ pub(crate) fn match_len_compact_sse2(a: &[CompactToken], b: &[CompactToken]) -> 
         while i + 4 <= n {
             let x = _mm_loadu_si128(a.as_ptr().add(i).cast());
             let y = _mm_loadu_si128(b.as_ptr().add(i).cast());
-            let mask = _mm_movemask_epi8(_mm_cmpeq_epi32(x, y)) as u32;
+            let value_mask = _mm_set1_epi32(CompactToken::MAX_VALUE as i32);
+            let diff = _mm_and_si128(_mm_xor_si128(x, y), value_mask);
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi32(diff, _mm_setzero_si128())) as u32;
             if mask != 0xffff {
                 return i + ((!mask).trailing_zeros() as usize / 4);
             }

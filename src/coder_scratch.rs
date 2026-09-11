@@ -35,7 +35,9 @@ use crate::entropy::{
     PrefixCode, Token,
 };
 use crate::group::AcGroupScratch;
-use crate::lossless::{GradientScratch, LzToken, PickThresholdScratch};
+use crate::lossless::{
+    EntropyOfHistFn, GradientScratch, LzToken, PickThresholdScratch, selected_entropy_of_hist_fn,
+};
 use crate::ma_tree::MaPropertyScratch;
 use crate::patches::PATCH_TILE;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
@@ -279,6 +281,7 @@ impl AcStrategyPipelineScratch {
 
 /// Fixed-layout reusable storage owned by one encoder worker.
 pub(crate) struct CoderScratch {
+    pub(crate) entropy_of_hist: EntropyOfHistFn,
     pub(crate) aq_map: AqMapScratch,
     pub(crate) structure_corrections: Vec<f32>,
     pub(crate) lz_repetitions: Vec<u32>,
@@ -343,6 +346,7 @@ impl CoderScratch {
             };
 
         Self {
+            entropy_of_hist: selected_entropy_of_hist_fn(),
             aq_map,
             structure_corrections,
             // Fast never enters the deep LZ path. Slow grows these buffers on
@@ -393,7 +397,8 @@ mod tests {
 
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
-        assert!(size_of::<CoderScratch>() <= 1104);
+        // MA split scoring keeps four buffers (plans, LUTs, histogram, counts).
+        assert!(size_of::<CoderScratch>() <= 1152);
         assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);

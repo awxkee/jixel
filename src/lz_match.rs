@@ -64,7 +64,7 @@ pub(crate) fn selected_compact() -> MatchKernel<CompactToken> {
 pub(crate) fn match_len_scalar(a: &[Token], b: &[Token]) -> usize {
     a.iter()
         .zip(b)
-        .position(|(x, y)| x.context != y.context || x.value != y.value)
+        .position(|(x, y)| x.value != y.value)
         .unwrap_or(a.len().min(b.len()))
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn match_len_scalar(a: &[Token], b: &[Token]) -> usize {
 pub(crate) fn match_len_compact_scalar(a: &[CompactToken], b: &[CompactToken]) -> usize {
     a.iter()
         .zip(b)
-        .position(|(x, y)| x != y)
+        .position(|(x, y)| !x.same_value(*y))
         .unwrap_or(a.len().min(b.len()))
 }
 
@@ -97,7 +97,14 @@ mod tests {
                         } else {
                             b[mismatch].value ^= 1;
                         }
-                        assert_eq!(kernel(&a[offset..], &b[offset..]), mismatch - offset);
+                        // Contexts are ignored (an LZ77 copy reproduces
+                        // values only); a value change ends the match.
+                        let expected = if field == 0 {
+                            n - offset
+                        } else {
+                            mismatch - offset
+                        };
+                        assert_eq!(kernel(&a[offset..], &b[offset..]), expected);
                     }
                 }
             }
@@ -136,7 +143,12 @@ mod tests {
                                 t.value ^ u32::from(field == 1),
                             )
                             .unwrap();
-                            assert_eq!(kernel(&a[offset..], &b[offset..]), mismatch - offset);
+                            let expected = if field == 0 {
+                                n - offset
+                            } else {
+                                mismatch - offset
+                            };
+                            assert_eq!(kernel(&a[offset..], &b[offset..]), expected);
                         }
                     }
                 }
@@ -153,5 +165,72 @@ mod tests {
     #[test]
     fn selected_matches_scalar_at_every_lane_and_tail() {
         check(selected());
+    }
+}
+
+#[cfg(test)]
+mod value_only_tests {
+    use super::*;
+
+    /// The SIMD kernels must agree with the scalar ones and compare values
+    /// only: runs of equal contexts with differing values must stop, runs of
+    /// equal values with differing contexts must continue.
+    #[test]
+    fn kernels_match_values_only() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for trial in 0..200 {
+            let n = 1 + (next() % 70) as usize;
+            let a: Vec<Token> = (0..n)
+                .map(|i| {
+                    Token::new(
+                        next() % 3,
+                        if trial % 2 == 0 {
+                            i as u32 % 4
+                        } else {
+                            next() % 2
+                        },
+                    )
+                })
+                .collect();
+            let mut b = a.clone();
+            for t in b.iter_mut() {
+                t.context = next() % 3;
+            }
+            let cut = (next() % (n as u32 + 1)) as usize;
+            if cut < n {
+                b[cut].value ^= 1;
+            }
+            let expected = a
+                .iter()
+                .zip(&b)
+                .position(|(x, y)| x.value != y.value)
+                .unwrap_or(n);
+            assert_eq!(match_len_scalar(&a, &b), expected, "scalar trial {trial}");
+            assert_eq!(selected()(&a, &b), expected, "simd trial {trial}");
+            let ca: Vec<CompactToken> = a
+                .iter()
+                .map(|t| CompactToken::try_new(t.context, t.value).unwrap())
+                .collect();
+            let cb: Vec<CompactToken> = b
+                .iter()
+                .map(|t| CompactToken::try_new(t.context, t.value).unwrap())
+                .collect();
+            assert_eq!(
+                match_len_compact_scalar(&ca, &cb),
+                expected,
+                "compact scalar trial {trial}"
+            );
+            assert_eq!(
+                selected_compact()(&ca, &cb),
+                expected,
+                "compact simd trial {trial}"
+            );
+        }
     }
 }

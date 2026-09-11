@@ -33,7 +33,7 @@ use crate::entropy::ALPHABET_SIZE;
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn dirty_log2f_x8(d: __m256) -> __m256 {
+fn dirty_log2f_x8<const EXACT_DIV: bool>(d: __m256) -> __m256 {
     let one = _mm256_set1_ps(1.0);
     let mut ix = _mm256_castps_si256(d);
     ix = _mm256_add_epi32(
@@ -49,12 +49,16 @@ fn dirty_log2f_x8(d: __m256) -> __m256 {
     let a = _mm256_castsi256_ps(ix);
     let numerator = _mm256_sub_ps(a, one);
     let denominator = _mm256_add_ps(a, one);
-    let reciprocal0 = _mm256_rcp_ps(denominator);
-    let reciprocal = _mm256_mul_ps(
-        reciprocal0,
-        _mm256_fnmadd_ps(denominator, reciprocal0, _mm256_set1_ps(2.0)),
-    );
-    let x = _mm256_mul_ps(numerator, reciprocal);
+    let x = if EXACT_DIV {
+        _mm256_div_ps(numerator, denominator)
+    } else {
+        let reciprocal0 = _mm256_rcp_ps(denominator);
+        let reciprocal = _mm256_mul_ps(
+            reciprocal0,
+            _mm256_fnmadd_ps(denominator, reciprocal0, _mm256_set1_ps(2.0)),
+        );
+        _mm256_mul_ps(numerator, reciprocal)
+    };
     let x2 = _mm256_mul_ps(x, x);
     let mut u = _mm256_set1_ps(0.412_198_57);
     u = _mm256_fmadd_ps(u, x2, _mm256_set1_ps(0.577_078_04));
@@ -72,6 +76,49 @@ fn cvtepu32_ps(v: __m256i) -> __m256 {
         signed,
         _mm256_and_ps(_mm256_castsi256_ps(high), _mm256_set1_ps(4_294_967_296.0)),
     )
+}
+
+/// Order-0 entropy using FMA logarithms, with scalar conversion and summation order.
+///
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn entropy_of_hist_avx2(hist: &[u64], total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    let total_f = total as f32;
+    let t = _mm256_set1_ps(total_f);
+    let mut bits = 0.0f32;
+    let mut counts = hist.iter().copied().filter(|&c| c != 0);
+    loop {
+        // Skip empty bins and convert directly from u64 to f32, avoiding
+        // both truncation to u32 and double rounding through f64.
+        let mut floats = [1.0f32; 8];
+        let mut used = 0;
+        for value in &mut floats {
+            let Some(c) = counts.next() else {
+                break;
+            };
+            *value = c as f32;
+            used += 1;
+        }
+        if used == 0 {
+            return bits;
+        }
+        let c = unsafe { _mm256_loadu_ps(floats.as_ptr()) };
+        let p = _mm256_div_ps(c, t);
+        let terms = _mm256_mul_ps(c, dirty_log2f_x8::<true>(p));
+        let mut lanes = [0.0f32; 8];
+        unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), terms) };
+        // Keep the scalar order; a horizontal sum can change decisions.
+        for &value in &lanes[..used] {
+            bits -= value;
+        }
+        if used < floats.len() {
+            return bits;
+        }
+    }
 }
 
 /// Shannon population cost used by entropy histogram clustering.
@@ -93,7 +140,7 @@ pub(crate) fn counts_bit_cost_avx2(counts: &[u32; ALPHABET_SIZE], total_count: u
         let positive = _mm256_max_ps(count, one);
         cost = _mm256_fmadd_ps(
             count,
-            _mm256_sub_ps(log_total, dirty_log2f_x8(positive)),
+            _mm256_sub_ps(log_total, dirty_log2f_x8::<false>(positive)),
             cost,
         );
     }
