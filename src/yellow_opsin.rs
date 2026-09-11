@@ -482,8 +482,9 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
         return (choose_tier2_bias(&samples, yellow_edge, distance), false);
     }
     // Tier-1 (thin-HF yellow, strong bias) has its own, tighter cap.
+    let tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance);
     if distance >= MAX_DISTANCE {
-        return (SPEC_BIAS, false);
+        return (tier2_bias, false);
     }
     let steps = proxy_steps(distance);
     let candidates = [SPEC_BIAS, BIAS_MID, BIAS_HI];
@@ -512,10 +513,10 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
         }
     }
     if spec_cost < MIN_SPEC_COST || best_cost > REL_COST_RATIO * spec_cost {
-        return (SPEC_BIAS, false);
+        return (tier2_bias, false);
     }
     let strength = 1.0 - ramp(distance, STRONG_FADE_START, MAX_DISTANCE);
-    (SPEC_BIAS + (best_bias - SPEC_BIAS) * strength, true)
+    (tier2_bias + (best_bias - tier2_bias) * strength, true)
 }
 
 #[cfg(test)]
@@ -742,5 +743,31 @@ mod tests {
         assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
         assert_eq!(selected_b_qm_scale(true, true, 1.0), 5);
         assert_eq!(selected_b_qm_scale(true, false, 1.0), 2);
+    }
+
+    #[test]
+    fn strong_tier_hands_off_to_the_mild_tier_past_its_cap() {
+        // High-edge yellow that also fills the frame: passes the tier-1 edge
+        // gate AND tier-2's area gate. Past the tier-1 cap it must keep the
+        // mild bias instead of dropping to spec, without an upward step.
+        let mut edged = filled(64, 64, [0.9, 0.85, 0.05]);
+        for y in (0..64).step_by(SAMPLE_STRIDE) {
+            for x in (0..64).step_by(SAMPLE_STRIDE) {
+                if x + 1 < 64 {
+                    for c in 0..3 {
+                        edged.plane_row_mut(c, y)[x + 1] = 0.0;
+                    }
+                }
+            }
+        }
+        assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
+        let past_cap = select_yellow(&edged, MAX_DISTANCE + 0.2);
+        assert!(past_cap.matrix.is_some());
+        assert_eq!(past_cap.b_qm_scale, 2);
+        let before = choose_b_bias(&edged, MAX_DISTANCE - 0.001);
+        let after = choose_b_bias(&edged, MAX_DISTANCE + 0.001);
+        assert!((before - after).abs() < 0.01, "{before} vs {after}");
+        // Tier-2's own distance cap still ends the protection.
+        assert_eq!(choose_b_bias(&edged, TIER2_MAX_DISTANCE), SPEC_BIAS);
     }
 }
