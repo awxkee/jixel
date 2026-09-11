@@ -43,7 +43,8 @@ use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{
-    ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform, channel_rd,
+    ReconCost, ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform,
+    channel_rd,
 };
 
 mod selection;
@@ -583,6 +584,7 @@ struct ReconStrategyCost {
     base: f32,
     distortion: f32,
     rate: f32,
+    hue_distortion: f32,
 }
 
 /// Returns the reconstruction RD cost with and without the caller's metadata
@@ -621,7 +623,11 @@ fn reconstruction_strategy_cost_and_base(
         cmap_factor,
     );
     let keep_spatial_errors = spatial_errors.is_some();
-    let (distortion, rate) = reconstruction_dist_and_rate(
+    let ReconCost {
+        distortion,
+        rate,
+        hue_distortion,
+    } = reconstruction_dist_and_rate(
         ctx,
         recon,
         coeffs,
@@ -662,6 +668,7 @@ fn reconstruction_strategy_cost_and_base(
         ),
         distortion,
         rate,
+        hue_distortion,
     }
 }
 
@@ -826,7 +833,8 @@ fn strategy_cost_impl(
             0.0,
             0.0,
             false,
-        ),
+        )
+        .dist_and_rate(),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
             ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
         ),
@@ -884,7 +892,7 @@ fn reconstruction_dist_and_rate(
     gradient_alpha: f32,
     gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
-) -> (f32, f32) {
+) -> ReconCost {
     (ctx.recon_dist_and_rate)(
         recon,
         &ReconDistInput {

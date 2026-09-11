@@ -222,7 +222,10 @@ pub(crate) fn rgb_hue_chroma_edge_loss_wasm(
                 f32x4_max(source_chroma, f32x4_splat(1e-4)),
             );
             let brightness_risk = clamp01_f32x4(f32x4_mul(
-                f32x4_sub(source_l, f32x4_splat(0.35)),
+                f32x4_sub(
+                    f32x4_sub(source_l, f32x4_splat(0.35)),
+                    f32x4_min(source_b, zero),
+                ),
                 f32x4_splat(1.0 / 0.40),
             ));
             let chroma_risk = clamp01_f32x4(f32x4_mul(
