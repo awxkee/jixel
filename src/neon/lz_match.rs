@@ -37,10 +37,12 @@ pub(crate) fn match_len_neon(a: &[Token], b: &[Token]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     unsafe {
+        // Lanes 0/2 are contexts, 1/3 values: only values must match.
+        let ignore_contexts = vld1q_u32([u32::MAX, 0, u32::MAX, 0].as_ptr());
         while i + 2 <= n {
             let x = vld1q_u32(a.as_ptr().add(i).cast());
             let y = vld1q_u32(b.as_ptr().add(i).cast());
-            if vminvq_u32(vceqq_u32(x, y)) != u32::MAX {
+            if vminvq_u32(vorrq_u32(vceqq_u32(x, y), ignore_contexts)) != u32::MAX {
                 break;
             }
             i += 2;
@@ -56,10 +58,11 @@ pub(crate) fn match_len_compact_neon(a: &[CompactToken], b: &[CompactToken]) -> 
     let n = a.len().min(b.len());
     let mut i = 0;
     unsafe {
+        let value_mask = vdupq_n_u32(CompactToken::MAX_VALUE);
         while i + 4 <= n {
             let x = vld1q_u32(a.as_ptr().add(i).cast());
             let y = vld1q_u32(b.as_ptr().add(i).cast());
-            if vminvq_u32(vceqq_u32(x, y)) != u32::MAX {
+            if vmaxvq_u32(vandq_u32(veorq_u32(x, y), value_mask)) != 0 {
                 break;
             }
             i += 4;

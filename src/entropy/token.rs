@@ -45,6 +45,12 @@ impl CompactToken {
     pub(crate) const MAX_CONTEXT: u32 = (1 << (32 - Self::VALUE_BITS)) - 1;
 
     #[inline]
+    /// Equal values, whatever the contexts (LZ77 matching).
+    pub(crate) fn same_value(self, other: Self) -> bool {
+        (self.0 ^ other.0) & Self::MAX_VALUE == 0
+    }
+
+    #[inline]
     pub(crate) fn try_new(context: u32, value: u32) -> Option<Self> {
         (context <= Self::MAX_CONTEXT && value <= Self::MAX_VALUE)
             .then_some(Self((context << Self::VALUE_BITS) | value))

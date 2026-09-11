@@ -49,8 +49,13 @@ impl Completion {
             }
         }
         let _queue = shared.queue.lock().unwrap();
-        self.remaining.fetch_sub(1, Ordering::Release);
-        shared.activity.notify_all();
+        // Only the last lane changes what a waiter can observe (the queue is
+        // untouched here), so the earlier lanes wake nobody: the learner's
+        // deep tail dispatches thousands of small maps, and a wake-all per
+        // lane had every idle worker thrashing through the mutex.
+        if self.remaining.fetch_sub(1, Ordering::Release) == 1 {
+            shared.activity.notify_all();
+        }
     }
 }
 

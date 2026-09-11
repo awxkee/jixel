@@ -40,7 +40,10 @@ pub(crate) fn match_len_avx2(a: &[Token], b: &[Token]) -> usize {
         while i + 4 <= n {
             let x = _mm256_loadu_si256(a.as_ptr().add(i).cast());
             let y = _mm256_loadu_si256(b.as_ptr().add(i).cast());
-            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi32(x, y)) as u32;
+            // Odd 32-bit lanes hold the values; contexts (even lanes) are
+            // ignored, as an LZ77 copy reproduces values only.
+            const VALUE_LANES: u32 = 0xF0F0_F0F0;
+            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi32(x, y)) as u32 | !VALUE_LANES;
             if mask != u32::MAX {
                 return i + ((!mask).trailing_zeros() as usize / 8);
             }
@@ -60,7 +63,10 @@ pub(crate) fn match_len_compact_avx2(a: &[CompactToken], b: &[CompactToken]) -> 
         while i + 8 <= n {
             let x = _mm256_loadu_si256(a.as_ptr().add(i).cast());
             let y = _mm256_loadu_si256(b.as_ptr().add(i).cast());
-            let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi32(x, y)) as u32;
+            let value_mask = _mm256_set1_epi32(CompactToken::MAX_VALUE as i32);
+            let diff = _mm256_and_si256(_mm256_xor_si256(x, y), value_mask);
+            let mask =
+                _mm256_movemask_epi8(_mm256_cmpeq_epi32(diff, _mm256_setzero_si256())) as u32;
             if mask != u32::MAX {
                 return i + ((!mask).trailing_zeros() as usize / 4);
             }

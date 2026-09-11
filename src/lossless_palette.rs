@@ -42,7 +42,7 @@ use super::predictor::{
 use super::rct::{inverse_ycocg, rct_gradient_row};
 use super::{
     DeepLzScratchPool, GROUP_DIM, GroupLayout, MaChannel, MaPixels, MaSource, MaTransform,
-    SLOW_DEEP_LZ_MAX_THREADS, entropy_of_hist, group_lz_threads, write_frame_header_modular,
+    SLOW_DEEP_LZ_MAX_THREADS, group_lz_threads, write_frame_header_modular,
     write_lz_groups_with_header, write_modular_transforms, write_toc_entry,
 };
 use crate::bit_writer::BitWriter;
@@ -55,6 +55,14 @@ use crate::weighted_predictor::WpParams;
 /// A sparse set of local-palette groups forces Slow mode to build a complete
 /// alternate frame while most groups lose the learned-tree model. Require a
 /// useful frame footprint before paying for that exact candidate.
+/// color cap of a per-group palette. libjxl's own per-group cap is about
+/// 640 for a 256x256 group, and screen content lives there: a 1280x720 UI
+/// screen has 9 of its 15 groups between 221 and 870 colors.
+pub(super) const LOCAL_PALETTE_MAX_COLORS: usize = 1024;
+/// The flat local-palette frame keeps the original 256-color cap: it codes
+/// every group without the learned tree, so wider palettes only buy it a
+/// losing candidate (a 1000-color synthetic: +21% encode, no bytes).
+const FLAT_LOCAL_PALETTE_MAX_COLORS: usize = 256;
 const LOCAL_PALETTE_MIN_COVERAGE_NUM: usize = 1;
 const LOCAL_PALETTE_MIN_COVERAGE_DEN: usize = 4;
 
@@ -181,14 +189,17 @@ pub(super) fn try_encode_palette_single_group(
     let distance_ctx = nb_chans as u32;
     let (preds, mut section, lz_tokens) = {
         // 1) Reconstruct RGB from YCoCg, collect distinct tuples (bail past 256).
-        let mut seen = ColorMap::<()>::with_capacity_and_hasher(257, Default::default());
+        let mut seen = ColorMap::<()>::with_capacity_and_hasher(
+            LOCAL_PALETTE_MAX_COLORS + 1,
+            Default::default(),
+        );
         let mut previous = None;
         if !visit_palette_colors::<true>(linear, alpha, xsize, 0, 0, xsize, ysize, |color| {
             if previous != Some(color) {
                 seen.entry(color).or_insert(());
                 previous = Some(color);
             }
-            seen.len() <= 256
+            seen.len() <= LOCAL_PALETTE_MAX_COLORS
         }) {
             return false;
         }
@@ -218,7 +229,7 @@ pub(super) fn try_encode_palette_single_group(
             if previous.1 < 0 || previous.0 != color {
                 previous = (color, idx_of[&color]);
             }
-            index_img.push(previous.1 as u8);
+            index_img.push(previous.1 as u16);
             true
         });
 
@@ -303,12 +314,12 @@ pub(super) fn try_encode_palette_single_group(
     true
 }
 
-struct LocalPaletteGroup {
-    palette: Vec<i32>,
-    indices: Vec<u8>,
-    nb_colors: usize,
-    w: usize,
-    h: usize,
+pub(super) struct LocalPaletteGroup {
+    pub(super) palette: Vec<i32>,
+    pub(super) indices: Vec<u16>,
+    pub(super) nb_colors: usize,
+    pub(super) w: usize,
+    pub(super) h: usize,
 }
 
 impl LocalPaletteGroup {
@@ -509,6 +520,7 @@ fn local_palette_is_better(
     (palette_bits < plain_bits, index_cost)
 }
 
+/// The flat path's builder: the original 256-color cap.
 fn build_local_palette_group(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -518,6 +530,28 @@ fn build_local_palette_group(
     w: usize,
     h: usize,
 ) -> Option<LocalPaletteGroup> {
+    build_local_palette_group_limited(
+        linear,
+        alpha,
+        xsize,
+        x0,
+        y0,
+        w,
+        h,
+        FLAT_LOCAL_PALETTE_MAX_COLORS,
+    )
+}
+
+pub(super) fn build_local_palette_group_limited(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    max_colors: usize,
+) -> Option<LocalPaletteGroup> {
     let num_c = 3 + usize::from(alpha.is_some());
     let num_pixels = w * h;
     // Most photographic groups exceed the palette limit almost immediately.
@@ -525,14 +559,14 @@ fn build_local_palette_group(
     // on that overwhelmingly common rejection path.
     // Palette indices come from the sorted colors below, independently of
     // hash-table iteration order. Reuse the global palette's cheap hasher.
-    let mut seen = ColorMap::<()>::with_capacity_and_hasher(257, Default::default());
+    let mut seen = ColorMap::<()>::with_capacity_and_hasher(max_colors + 1, Default::default());
     let mut previous = None;
     if !visit_palette_colors::<false>(linear, alpha, xsize, x0, y0, w, h, |color| {
         if previous != Some(color) {
             seen.entry(color).or_insert(());
             previous = Some(color);
         }
-        seen.len() <= 256
+        seen.len() <= max_colors
     }) {
         return None;
     }
@@ -564,7 +598,7 @@ fn build_local_palette_group(
         if previous.1 < 0 || previous.0 != color {
             previous = (color, index_of[&color]);
         }
-        indices.push(previous.1 as u8);
+        indices.push(previous.1 as u16);
         true
     });
 
@@ -962,6 +996,7 @@ impl GlobalPalette {
                 num_c: self.num_c as u32,
                 nb_colors: nb_colors as u32,
             },
+            group_channels: Vec::new(),
         }
     }
 }
@@ -1152,6 +1187,7 @@ fn estimate_index_plane_cost(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> f32 {
+    let entropy_of_hist = scratch.entropy_of_hist;
     const NCTX: usize = 18;
     const ALPHA: usize = 64;
     let threads = pool.num_threads().min(ysize.max(1));
@@ -1443,6 +1479,7 @@ mod tests {
 
     #[test]
     fn pooled_index_cost_matches_serial_histograms() {
+        let entropy_of_hist = super::super::selected_entropy_of_hist_fn();
         const COLORS: usize = 17;
         for (w, h) in [(0, 0), (0, 5), (1, 1), (1, 17), (3, 5), (257, 259)] {
             let indices: Vec<u16> = (0..w * h)

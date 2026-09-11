@@ -31,7 +31,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
     CompactToken, EntropyCode, Histogram, PrefixCode, Token, build_huffman_codes_into,
-    cluster_histograms_fixed, optimize_entropy_code, write_entropy_code, write_token,
+    cluster_histograms_fixed, f_log2, optimize_entropy_code, write_entropy_code, write_token,
 };
 use crate::thread_pool::ThreadPool;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,7 +132,10 @@ impl LiteralToken for Token {
     }
     #[inline]
     fn same(self, other: Self) -> bool {
-        self.context == other.context && self.value == other.value
+        // An LZ77 copy reproduces past VALUES; the copied pixels' contexts
+        // play no part (the decoder reads no symbols for them), so matches
+        // may span leaf changes. libjxl's hash chain matches values only.
+        self.value == other.value
     }
     fn match_kernel() -> crate::lz_match::MatchKernel<Self> {
         crate::lz_match::selected()
@@ -145,7 +148,7 @@ impl LiteralToken for CompactToken {
     }
     #[inline]
     fn same(self, other: Self) -> bool {
-        self == other
+        self.same_value(other)
     }
     fn match_kernel() -> crate::lz_match::MatchKernel<Self> {
         crate::lz_match::selected_compact()
@@ -165,7 +168,7 @@ fn fingerprint<T: LiteralToken>(tokens: &[T], pos: usize) -> u32 {
     for token in &tokens[pos..tokens.len().min(pos + 3)] {
         let token = token.as_token();
         hash ^= token.value.wrapping_mul(0x85eb_ca6b).rotate_left(13);
-        hash = hash.wrapping_mul(0xc2b2_ae35) ^ token.context;
+        hash = hash.wrapping_mul(0xc2b2_ae35);
     }
     hash
 }
@@ -330,8 +333,11 @@ impl<T: LiteralToken> Iterator for RunLzTokens<'_, T> {
         let copied = end - self.pos - 1;
         self.pos += 1;
         if copied >= LZ77_MIN_LENGTH as usize {
+            // Runs are value-equal, not context-equal: the copy's length
+            // symbol is coded in the context of its first copied position.
+            let copy_context = self.tokens[self.pos].as_token().context;
             self.pending = Some(LzToken::lz77(
-                token.context,
+                copy_context,
                 copied as u32 - LZ77_MIN_LENGTH,
                 LZ77_DIST_VALUE,
             ));
@@ -378,6 +384,10 @@ pub(super) struct RunLzWriter {
     out: Vec<LzToken>,
     token: Option<Token>,
     count: usize,
+    /// Contexts of the run's second and third tokens: a copy's length symbol
+    /// is coded in the first copied position's context, and a run too short
+    /// to copy emits its tokens as literals in their own contexts.
+    next_contexts: [u32; LZ77_MIN_LENGTH as usize],
 }
 
 impl RunLzWriter {
@@ -386,15 +396,21 @@ impl RunLzWriter {
             out: Vec::with_capacity(capacity),
             token: None,
             count: 0,
+            next_contexts: [0; LZ77_MIN_LENGTH as usize],
         }
     }
 
     #[inline]
     pub(super) fn push(&mut self, token: Token) {
+        // Runs are value-equal (an LZ77 copy reproduces values whatever the
+        // contexts), matching `RunLzTokens`.
         if self
             .token
-            .is_some_and(|current| current.context == token.context && current.value == token.value)
+            .is_some_and(|current| current.value == token.value)
         {
+            if self.count <= LZ77_MIN_LENGTH as usize {
+                self.next_contexts[self.count - 1] = token.context;
+            }
             self.count += 1;
         } else {
             self.flush_run();
@@ -422,13 +438,13 @@ impl RunLzWriter {
         self.out.push(LzToken::pixel(token.context, token.value));
         if copied >= LZ77_MIN_LENGTH as usize {
             self.out.push(LzToken::lz77(
-                token.context,
+                self.next_contexts[0],
                 copied as u32 - LZ77_MIN_LENGTH,
                 LZ77_DIST_VALUE,
             ));
         } else {
-            for _ in 0..copied {
-                self.out.push(LzToken::pixel(token.context, token.value));
+            for &context in &self.next_contexts[..copied] {
+                self.out.push(LzToken::pixel(context, token.value));
             }
         }
         self.count = 0;
@@ -926,6 +942,61 @@ fn pooled_streams<R: Send, T: Sync>(
     acc
 }
 
+/// `estimate_literal_and_run_bits` for one stream on the calling thread.
+pub(super) fn estimate_literal_and_run_bits_single<T: LiteralToken>(
+    tokens: &[T],
+    num_contexts: usize,
+    min_symbol: u32,
+) -> (f64, f64) {
+    let distance_context = num_contexts - 1;
+    let mut literal = vec![Histogram::new(); num_contexts];
+    let mut runs = vec![Histogram::new(); num_contexts];
+    let (mut literal_bits, mut run_bits) = (0u64, 0u64);
+    accumulate_literal_and_run_bits(
+        tokens,
+        distance_context,
+        min_symbol,
+        &mut literal,
+        &mut runs,
+        &mut literal_bits,
+        &mut run_bits,
+    );
+    (
+        histogram_bits(&literal, literal_bits),
+        histogram_bits(&runs, run_bits),
+    )
+}
+
+fn accumulate_literal_and_run_bits<T: LiteralToken>(
+    tokens: &[T],
+    distance_context: usize,
+    min_symbol: u32,
+    literal: &mut [Histogram],
+    runs: &mut [Histogram],
+    literal_bits: &mut u64,
+    run_bits: &mut u64,
+) {
+    for (token, count) in TokenRuns(tokens) {
+        let (symbol, nbits, _) = crate::entropy::uint_encode(token.value);
+        let context = token.context as usize;
+        literal[context].counts[symbol as usize] += count as u32;
+        literal[context].total_count += count as u32;
+        *literal_bits += nbits as u64 * count as u64;
+        if count > LZ77_MIN_LENGTH as usize {
+            runs[context].add(symbol);
+            let (length, length_bits, _) = lz77_length_encode((count - 1) as u32 - LZ77_MIN_LENGTH);
+            runs[context].add(min_symbol + length);
+            let (distance, distance_bits, _) = crate::entropy::uint_encode(LZ77_DIST_VALUE);
+            runs[distance_context].add(distance);
+            *run_bits += nbits as u64 + length_bits as u64 + distance_bits as u64;
+        } else {
+            runs[context].counts[symbol as usize] += count as u32;
+            runs[context].total_count += count as u32;
+            *run_bits += nbits as u64 * count as u64;
+        }
+    }
+}
+
 /// Exact order-0 estimates for both variants without storing the run stream.
 /// Repeated literal symbols contribute their counts and extra bits in bulk;
 /// floating-point entropy is evaluated only after integer histogram merging.
@@ -950,26 +1021,15 @@ pub(super) fn estimate_literal_and_run_bits<T: LiteralToken>(
             )
         },
         |(literal, runs, literal_bits, run_bits), tokens| {
-            for (token, count) in TokenRuns(tokens) {
-                let (symbol, nbits, _) = crate::entropy::uint_encode(token.value);
-                let context = token.context as usize;
-                literal[context].counts[symbol as usize] += count as u32;
-                literal[context].total_count += count as u32;
-                *literal_bits += nbits as u64 * count as u64;
-                if count > LZ77_MIN_LENGTH as usize {
-                    runs[context].add(symbol);
-                    let (length, length_bits, _) =
-                        lz77_length_encode((count - 1) as u32 - LZ77_MIN_LENGTH);
-                    runs[context].add(min_symbol + length);
-                    let (distance, distance_bits, _) = crate::entropy::uint_encode(LZ77_DIST_VALUE);
-                    runs[distance_context].add(distance);
-                    *run_bits += nbits as u64 + length_bits as u64 + distance_bits as u64;
-                } else {
-                    runs[context].counts[symbol as usize] += count as u32;
-                    runs[context].total_count += count as u32;
-                    *run_bits += nbits as u64 * count as u64;
-                }
-            }
+            accumulate_literal_and_run_bits(
+                tokens,
+                distance_context,
+                min_symbol,
+                literal,
+                runs,
+                literal_bits,
+                run_bits,
+            );
         },
         |acc, part| {
             merge_histograms(&mut acc.0, &part.0);
@@ -1032,7 +1092,7 @@ fn histogram_bits(hists: &[Histogram], raw_bits: u64) -> f64 {
         }
         for &c in &h.counts {
             if c != 0 {
-                bits += c as f64 * (total / c as f64).log2();
+                bits += c as f64 * f_log2(total / c as f64);
             }
         }
     }
@@ -1698,7 +1758,7 @@ mod tests {
                 if total != 0.0 {
                     for count in h.counts {
                         if count != 0 {
-                            bits += count as f64 * (total / count as f64).log2();
+                            bits += count as f64 * f_log2(total / count as f64);
                         }
                     }
                 }
@@ -1938,9 +1998,7 @@ mod tests {
                                         .iter()
                                         .zip(&tokens[pos..])
                                         .take(1 << 20)
-                                        .take_while(|(a, b)| {
-                                            a.context == b.context && a.value == b.value
-                                        })
+                                        .take_while(|(a, b)| a.value == b.value)
                                         .count();
                                     if length > expected.0 {
                                         expected = (length, pos - candidate);

@@ -29,7 +29,7 @@
 
 //! Reversible color transforms, their modular headers, and transform selection.
 
-use super::entropy_of_hist;
+use super::EntropyOfHistFn;
 use super::predictor::{GradientScratch, clamped_gradient};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -232,6 +232,7 @@ fn estimate_rct_cost(
     ysize: usize,
     rct: u32,
     row_scratch: &mut GradientScratch,
+    entropy_of_hist: EntropyOfHistFn,
 ) -> f32 {
     let y_plane = linear.plane_data(0);
     let co_plane = linear.plane_data(1);
@@ -286,6 +287,7 @@ pub(super) fn rank_rcts(
             ysize,
             RCT_CANDIDATES[i],
             &mut scratch.gradient,
+            scratch.entropy_of_hist,
         )
     });
     let mut ranked: Vec<(u32, f32)> = RCT_CANDIDATES.iter().copied().zip(costs).collect();

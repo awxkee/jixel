@@ -32,6 +32,7 @@
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::CoderScratch;
 use crate::thread_pool::ThreadPool;
+use crate::util::heap_array;
 use std::sync::OnceLock;
 
 /// Property vector length (libjxl ids 0..=15). Index 1 is the decoder's
@@ -73,7 +74,7 @@ fn split_props(allow_wp: bool) -> &'static [u8] {
 }
 
 /// Weighted predictor id in the decoder predictor enumeration.
-const PRED_WEIGHTED: usize = 6;
+pub(crate) const PRED_WEIGHTED: usize = 6;
 
 /// Split candidates examined per property per node. Sixteen quantiles retain
 /// nearly all the useful threshold resolution while bounding the repeated
@@ -81,11 +82,20 @@ const PRED_WEIGHTED: usize = 6;
 const MAX_CANDIDATES: usize = 32;
 /// Strided value subset used to derive candidate thresholds.
 const MAX_QUANTILE_PROBE: usize = 1024;
+/// Narrow probe ranges use one presence bit per value instead of sorting.
+const PROBE_BITMAP_BITS: usize = 4096;
 /// Hard depth guard (decoder-side property lookups stay cheap).
 const MAX_DEPTH: usize = 26;
-/// Medium nodes also benefit from parallel property scans. Keep only tiny
-/// nodes serial so late-stage learning can still use the encoder workers.
-const PARALLEL_PROPERTY_MIN_SAMPLES: usize = 256;
+/// Nodes with at least this many rows no longer sit in cache: they bin every
+/// property in one pass over the rows, in concurrent row chunks of at least
+/// `PARALLEL_SCAN_CHUNK_SAMPLES` (one multi-property histogram per chunk,
+/// summed afterwards), instead of streaming the rows once per property.
+const PARALLEL_SCAN_MIN_SAMPLES: usize = 1 << 17;
+const PARALLEL_SCAN_CHUNK_SAMPLES: usize = 8192;
+/// Smaller nodes score their properties concurrently, one task per
+/// property, from this many rows on; below it the tasks cost more than the
+/// scans.
+const PARALLEL_PLAN_MIN_SAMPLES: usize = 1024;
 /// Both children of a split are scored concurrently when the smaller one has
 /// at least this many samples (deep, small nodes are the serial tail).
 const PARALLEL_CHILD_MIN_SAMPLES: usize = 64;
@@ -172,21 +182,32 @@ impl MaSamples {
         }
     }
 
-    /// The deep learner owns its input. Release each old field immediately
-    /// after gathering its replacement instead of retaining two full sets.
-    fn into_selected(self, indices: &[u32]) -> Self {
-        fn gather<T: Copy>(rows: Vec<T>, indices: &[u32]) -> Vec<T> {
-            select_rows(&rows, indices)
+    /// Apply a full permutation in place. The deep learner's stable grouping
+    /// supplies each source row exactly once; cycle rotation preserves that
+    /// exact order without allocating another full property array.
+    fn into_permuted(mut self, mut indices: Vec<u32>) -> Self {
+        assert_eq!(indices.len(), self.len());
+        for start in 0..indices.len() {
+            if indices[start] as usize == start {
+                continue;
+            }
+            let props = self.props[start];
+            let tok = self.tok[start];
+            let mut dst = start;
+            loop {
+                let src = indices[dst] as usize;
+                indices[dst] = dst as u32;
+                if src == start {
+                    self.props[dst] = props;
+                    self.tok[dst] = tok;
+                    break;
+                }
+                self.props[dst] = self.props[src];
+                self.tok[dst] = self.tok[src];
+                dst = src;
+            }
         }
-        Self {
-            props: gather(self.props, indices),
-            tok: gather(self.tok, indices),
-        }
-    }
-
-    fn swap(&mut self, a: usize, b: usize) {
-        self.props.swap(a, b);
-        self.tok.swap(a, b);
+        self
     }
 
     /// Deterministic evenly spaced selection for the coarse learning stage.
@@ -229,10 +250,17 @@ pub(crate) struct MaLearnParams {
 /// evaluated concurrently without per-node allocation.
 pub(crate) struct MaPropertyScratch {
     probe: Vec<i32>,
+    probe_bitmap: Box<[u64; PROBE_BITMAP_BITS / 64]>,
     cands: Vec<i32>,
-    /// Per predictor: token histogram of every candidate bin.
-    bin_hist: Vec<u32>,
-    /// Per predictor: raw bits of every candidate bin.
+    /// Candidate thresholds of every property of the node being scored.
+    plans: Vec<SplitPlan>,
+    /// Value -> bin tables of the plans with a narrow candidate span.
+    luts: Vec<u8>,
+    /// Every plan's `[side pred][bin][symbol]` histogram, back to back.
+    multi_hist: Vec<u32>,
+    /// Every plan's rows per bin.
+    multi_bin_count: Vec<u32>,
+    /// Per side predictor: raw bits of every candidate bin.
     bin_nbits: Vec<u64>,
     /// Per predictor: running histogram and raw bits of the `le` side.
     left_hist: Vec<u32>,
@@ -242,33 +270,30 @@ pub(crate) struct MaPropertyScratch {
     node_nbits: Vec<u64>,
     /// Costs already computed when choosing the node's best predictor.
     node_costs: [f32; NUM_MA_PREDS],
-    /// Direct value -> bin lookup over the candidate span.
-    lut: Vec<u8>,
 }
 
 impl Default for MaPropertyScratch {
     fn default() -> Self {
         Self {
             probe: Vec::with_capacity(MAX_QUANTILE_PROBE + 1),
+            probe_bitmap: heap_array(0),
             cands: Vec::with_capacity(MAX_CANDIDATES),
-            bin_hist: Vec::new(),
+            plans: Vec::with_capacity(NUM_MA_PROPS),
+            luts: Vec::new(),
+            multi_hist: Vec::new(),
+            multi_bin_count: Vec::new(),
             bin_nbits: vec![0; NUM_MA_PREDS * (MAX_CANDIDATES + 1)],
             left_hist: Vec::new(),
             left_nbits: vec![0; NUM_MA_PREDS],
             node_hist: Vec::new(),
             node_nbits: vec![0; NUM_MA_PREDS],
             node_costs: [f32::INFINITY; NUM_MA_PREDS],
-            lut: Vec::new(),
         }
     }
 }
 
 impl MaPropertyScratch {
     fn prepare(&mut self, alphabet: usize) {
-        let bins = NUM_MA_PREDS * (MAX_CANDIDATES + 1) * alphabet;
-        if self.bin_hist.len() < bins {
-            self.bin_hist.resize(bins, 0);
-        }
         if self.left_hist.len() < NUM_MA_PREDS * alphabet {
             self.left_hist.resize(NUM_MA_PREDS * alphabet, 0);
         }
@@ -316,6 +341,48 @@ fn count_log2(count: u32, logs: &[f32; 4096]) -> f32 {
         .unwrap_or_else(|| dirty_log2f(count as f32))
 }
 
+fn sort_unique_probe(probe: &mut Vec<i32>, bitmap: &mut [u64; PROBE_BITMAP_BITS / 64]) {
+    if probe.len() < 32 {
+        probe.sort_unstable();
+        probe.dedup();
+        return;
+    }
+    let (min, max) = probe.iter().fold((i32::MAX, i32::MIN), |(min, max), &v| {
+        (min.min(v), max.max(v))
+    });
+    if min == max {
+        probe.truncate(1);
+        return;
+    }
+    // Widen before subtracting: properties can span the entire i32 range.
+    let span = max as i64 - min as i64;
+    if span >= PROBE_BITMAP_BITS as i64 {
+        probe.sort_unstable();
+        probe.dedup();
+        return;
+    }
+    let words = span as usize / 64 + 1;
+    bitmap[..words].fill(0);
+    for &v in probe.iter() {
+        let bit = (v - min) as usize;
+        bitmap[bit / 64] |= 1 << (bit % 64);
+    }
+    // Enumerating presence bits preserves quantiles over distinct values.
+    // There are at most probe.len() set bits, so the existing buffer suffices.
+    let mut output = probe.iter_mut();
+    let mut len = 0;
+    for (word, &bits) in bitmap[..words].iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            let offset = word * 64 + bits.trailing_zeros() as usize;
+            *output.next().unwrap() = min + offset as i32;
+            len += 1;
+            bits &= bits - 1;
+        }
+    }
+    probe.truncate(len);
+}
+
 fn pick_candidates(
     properties: &[[i32; NUM_MA_PROPS]],
     prop: usize,
@@ -330,8 +397,7 @@ fn pick_candidates(
     for props in properties.iter().step_by(stride) {
         scratch.probe.push(props[prop]);
     }
-    scratch.probe.sort_unstable();
-    scratch.probe.dedup();
+    sort_unique_probe(&mut scratch.probe, &mut scratch.probe_bitmap);
     if scratch.probe.len() < 2 {
         return 0;
     }
@@ -350,17 +416,311 @@ fn pick_candidates(
     scratch.cands.len()
 }
 
-/// Best split of contiguous rows on `prop`. Each side independently picks
-/// its cheapest predictor among `preds` (libjxl FindBestSplit semantics). The
-/// children are re-scored with every predictor afterwards, so this only
-/// decides *where* to split, but that is exactly what a node-locked
-/// predictor gets wrong on mixed content. `all_hist` is the node's
-/// per-predictor token histogram (NUM_MA_PREDS x alphabet) and `all_nbits`
-/// the per-predictor raw-bit totals.
+/// Best split of contiguous rows on one property: candidate thresholds at
+/// value quantiles, every planned property binned in one pass over the rows,
+/// then each side independently picks its cheapest predictor among `preds`
+/// (libjxl FindBestSplit semantics). The children are re-scored with every
+/// predictor afterwards, so this only decides *where* to split, but that is
+/// exactly what a node-locked predictor gets wrong on mixed content.
 /// Candidate spans up to this wide get a direct value -> bin table instead
 /// of a per-sample binary search.
 const LUT_MAX_SPAN: usize = 4096;
 
+/// Candidate thresholds of one property for one node, with the location of
+/// its bins in the node's shared multi-property histogram.
+#[derive(Clone, Copy)]
+struct SplitPlan {
+    prop: u8,
+    ncand: u8,
+    use_lut: bool,
+    lo_v: i32,
+    hi_v: i32,
+    /// Start of this property's value -> bin table in the shared LUT buffer.
+    lut_start: u32,
+    /// Start of this property's `[side pred][bin][symbol - lo]` block.
+    hist_start: u32,
+    /// `bins * width`: one side predictor's span inside the block.
+    pred_stride: u32,
+    cands: [i32; MAX_CANDIDATES],
+}
+
+impl SplitPlan {
+    /// bin = number of candidates < v; v <= cands[j] iff bin <= j.
+    #[inline]
+    fn bin_for(&self, v: i32, luts: &[u8]) -> usize {
+        if self.use_lut {
+            if v <= self.lo_v {
+                0
+            } else if v > self.hi_v {
+                self.ncand as usize
+            } else {
+                luts[self.lut_start as usize + (v - self.lo_v) as usize] as usize
+            }
+        } else {
+            self.cands[..self.ncand as usize].partition_point(|&c| c < v)
+        }
+    }
+}
+
+/// Symbol window of a node: the side predictors' tokens all fall in
+/// `lo..lo + width`; symbols outside it are zero on both sides of every
+/// split and contribute nothing to either cost, so the binned histograms
+/// only store the window. `syms[i]` lists the symbols predictor `preds[i]`
+/// actually uses in the node, ascending.
+struct SymbolWindow {
+    lo: usize,
+    width: usize,
+    syms: Vec<Vec<u16>>,
+}
+
+impl SymbolWindow {
+    fn new(preds: &[usize], alphabet: usize, all_hist: &[u32]) -> Self {
+        let mut lo = alphabet;
+        let mut hi = 0usize;
+        let syms: Vec<Vec<u16>> = preds
+            .iter()
+            .map(|&p| {
+                let h = &all_hist[p * alphabet..(p + 1) * alphabet];
+                let used: Vec<u16> = (0..alphabet)
+                    .filter(|&s| h[s] != 0)
+                    .map(|s| s as u16)
+                    .collect();
+                if let (Some(&first), Some(&last)) = (used.first(), used.last()) {
+                    lo = lo.min(first as usize);
+                    hi = hi.max(last as usize + 1);
+                }
+                used
+            })
+            .collect();
+        if hi <= lo {
+            (lo, hi) = (0, 1);
+        }
+        Self {
+            lo,
+            width: hi - lo,
+            syms,
+        }
+    }
+}
+
+/// Candidate thresholds of `prop` over the node, or `None` when the property
+/// has fewer than two distinct probed values. A narrow span gets its
+/// value -> bin table appended to `luts`; `hist_start` is where the
+/// property's block will live and `width` the node's symbol window.
+#[allow(clippy::too_many_arguments)]
+fn plan_split(
+    properties: &[[i32; NUM_MA_PROPS]],
+    prop: usize,
+    max_candidates: usize,
+    width: usize,
+    hist_start: u32,
+    luts: &mut Vec<u8>,
+    scratch: &mut MaPropertyScratch,
+) -> Option<SplitPlan> {
+    let ncand = pick_candidates(properties, prop, max_candidates, scratch);
+    if ncand == 0 {
+        return None;
+    }
+    let cands_src = &scratch.cands;
+    let lo_v = cands_src[0];
+    let hi_v = cands_src[ncand - 1];
+    let span = (hi_v as i64 - lo_v as i64) as usize;
+    let use_lut = span <= LUT_MAX_SPAN && span <= 4 * properties.len() + 64;
+    let lut_start = luts.len() as u32;
+    if use_lut {
+        let mut k = 0usize;
+        luts.extend((0..=span).map(|off| {
+            let v = lo_v + off as i32;
+            while k < ncand && cands_src[k] < v {
+                k += 1;
+            }
+            k as u8
+        }));
+    }
+    let mut cands = [0i32; MAX_CANDIDATES];
+    cands[..ncand].copy_from_slice(cands_src);
+    Some(SplitPlan {
+        prop: prop as u8,
+        ncand: ncand as u8,
+        use_lut,
+        lo_v,
+        hi_v,
+        lut_start,
+        hist_start,
+        pred_stride: ((ncand + 1) * width) as u32,
+        cands,
+    })
+}
+
+/// One pass over the node's rows, binning every planned property at once.
+/// Per plan the block is `[side pred i][bin][symbol - lo]` (i indexing
+/// `preds`) and `bin_count[k * (MAX_CANDIDATES + 1) + bin]` counts the rows
+/// of plan `k`. Pure integer counting, so chunks of rows may be scanned
+/// separately and summed.
+#[allow(clippy::too_many_arguments)]
+fn scan_split_plans(
+    properties: &[[i32; NUM_MA_PROPS]],
+    tokens: &[[u8; NUM_MA_PREDS]],
+    plans: &[SplitPlan],
+    luts: &[u8],
+    preds: &[usize],
+    window: (usize, usize),
+    hist: &mut [u32],
+    bin_count: &mut [u32],
+) {
+    debug_assert_eq!(properties.len(), tokens.len());
+    let (lo, width) = window;
+    if let &[p0, p1, p2, p3] = preds {
+        // The encoder normally scores four side predictors: bind their
+        // tokens once per row and keep the predictor loop out of the plan
+        // loop.
+        for (props, toks) in properties.iter().zip(tokens) {
+            let t0 = toks[p0] as usize - lo;
+            let t1 = toks[p1] as usize - lo;
+            let t2 = toks[p2] as usize - lo;
+            let t3 = toks[p3] as usize - lo;
+            for (counts, plan) in bin_count
+                .as_chunks_mut::<{ MAX_CANDIDATES + 1 }>()
+                .0
+                .iter_mut()
+                .zip(plans)
+            {
+                let bin = plan.bin_for(props[plan.prop as usize], luts);
+                counts[bin] += 1;
+                let stride = plan.pred_stride as usize;
+                let base = plan.hist_start as usize + bin * width;
+                hist[base + t0] += 1;
+                hist[base + stride + t1] += 1;
+                hist[base + 2 * stride + t2] += 1;
+                hist[base + 3 * stride + t3] += 1;
+            }
+        }
+    } else {
+        for (props, toks) in properties.iter().zip(tokens) {
+            for (counts, plan) in bin_count
+                .as_chunks_mut::<{ MAX_CANDIDATES + 1 }>()
+                .0
+                .iter_mut()
+                .zip(plans)
+            {
+                let bin = plan.bin_for(props[plan.prop as usize], luts);
+                counts[bin] += 1;
+                let stride = plan.pred_stride as usize;
+                let base = plan.hist_start as usize + bin * width;
+                for (i, &p) in preds.iter().enumerate() {
+                    hist[base + i * stride + toks[p] as usize - lo] += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Samples use uint_encode's fixed (4, 2, 0) config, so a symbol determines
+/// its raw-bit count: zero below 16, otherwise (symbol / 4) - 2. Summing
+/// over the symbols a predictor uses in the node avoids storing and
+/// accumulating it for every sample.
+#[inline]
+fn raw_bits_windowed(bin: &[u32], lo: usize, syms: &[u16]) -> u64 {
+    syms.iter()
+        .map(|&s| s as usize)
+        .filter(|&s| s >= 16)
+        .map(|s| bin[s - lo] as u64 * ((s >> 2) - 2) as u64)
+        .sum()
+}
+
+/// Best threshold of one planned property from its binned block. `hist` is
+/// the plan's `[side pred][bin][symbol - lo]` block and `bin_count` its row
+/// counts per bin; `all_hist` / `all_nbits` are the node's per-predictor
+/// token histograms and raw-bit totals.
+#[allow(clippy::too_many_arguments)]
+fn score_split_plan(
+    plan: &SplitPlan,
+    preds: &[usize],
+    alphabet: usize,
+    window: &SymbolWindow,
+    hist: &[u32],
+    bin_count: &[u32],
+    all_hist: &[u32],
+    all_nbits: &[u64; NUM_MA_PREDS],
+    total_count: u32,
+    scratch: &mut MaPropertyScratch,
+) -> Option<(i32, f32)> {
+    let ncand = plan.ncand as usize;
+    let bins = ncand + 1;
+    let (lo, width) = (window.lo, window.width);
+    let stride = plan.pred_stride as usize;
+    for (i, syms) in window.syms.iter().enumerate() {
+        let pred_hist = &hist[i * stride..(i + 1) * stride];
+        for (nbits, bin) in scratch.bin_nbits[i * bins..(i + 1) * bins]
+            .iter_mut()
+            .zip(pred_hist.chunks_exact(width))
+        {
+            *nbits = raw_bits_windowed(bin, lo, syms);
+        }
+    }
+    let logs = count_log2_table();
+    for i in 0..preds.len() {
+        scratch.left_hist[i * alphabet..(i + 1) * alphabet].fill(0);
+    }
+    scratch.left_nbits[..preds.len()].fill(0);
+    let mut left_count = 0u32;
+    let mut best: Option<(i32, f32)> = None;
+    for (j, (&candidate, &count)) in plan.cands[..ncand]
+        .iter()
+        .zip(&bin_count[..ncand])
+        .enumerate()
+    {
+        left_count += count;
+        let mut best_l = f32::INFINITY;
+        let mut best_r = f32::INFINITY;
+        for (i, (&p, syms)) in preds.iter().zip(&window.syms).enumerate() {
+            let left = &mut scratch.left_hist[i * alphabet..(i + 1) * alphabet];
+            let bin = &hist[i * stride + j * width..i * stride + (j + 1) * width];
+            for &s in syms {
+                left[s as usize] += bin[s as usize - lo];
+            }
+            scratch.left_nbits[i] += scratch.bin_nbits[i * bins + j];
+            if left_count == 0 || left_count == total_count {
+                continue;
+            }
+            let right_count = total_count - left_count;
+            let log_left = count_log2(left_count, logs);
+            let log_right = count_log2(right_count, logs);
+            let mut cost_l = 0.0f32;
+            let mut cost_r = 0.0f32;
+            let node = &all_hist[p * alphabet..(p + 1) * alphabet];
+            for &s in syms {
+                let s = s as usize;
+                let l = left[s];
+                if l != 0 {
+                    cost_l += l as f32 * (log_left - count_log2(l, logs));
+                }
+                let c = node[s] - l;
+                if c != 0 {
+                    cost_r += c as f32 * (log_right - count_log2(c, logs));
+                }
+            }
+            cost_l += scratch.left_nbits[i] as f32;
+            cost_r += (all_nbits[p] - scratch.left_nbits[i]) as f32;
+            best_l = best_l.min(cost_l);
+            best_r = best_r.min(cost_r);
+        }
+        if left_count == 0 || left_count == total_count {
+            continue;
+        }
+        let cost = best_l + best_r;
+        if best.is_none() || cost < best.unwrap().1 {
+            best = Some((candidate, cost));
+        }
+    }
+    best
+}
+
+/// Best split of contiguous rows on a single property (the multi-property
+/// scan restricted to one plan); `all_hist` is the node's per-predictor
+/// token histogram (NUM_MA_PREDS x alphabet) and `all_nbits` the
+/// per-predictor raw-bit totals.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn best_split_on_prop(
     properties: &[[i32; NUM_MA_PROPS]],
@@ -375,152 +735,41 @@ fn best_split_on_prop(
 ) -> Option<(i32, f32)> {
     assert_eq!(properties.len(), tokens.len());
     scratch.prepare(alphabet);
-    let ncand = pick_candidates(properties, prop, max_candidates, scratch);
-    if ncand == 0 {
-        return None;
-    }
-    let bins = ncand + 1;
-    for &p in preds {
-        scratch.bin_hist[p * bins * alphabet..(p + 1) * bins * alphabet].fill(0);
-        scratch.bin_nbits[p * bins..(p + 1) * bins].fill(0);
-    }
-    // Symbol range of every side predictor over this node: entries outside
-    // it are zero on both sides and contribute nothing.
-    let mut sym_range = [(0usize, 0usize); NUM_MA_PREDS];
-    for &p in preds {
-        let h = &all_hist[p * alphabet..(p + 1) * alphabet];
-        let lo = h.iter().position(|&c| c != 0).unwrap_or(0);
-        let hi = h.iter().rposition(|&c| c != 0).unwrap_or(0);
-        sym_range[p] = (lo, hi + 1);
-    }
-    // bin = number of candidates < v; v <= cands[j] iff bin <= j.
-    let lo_v = scratch.cands[0];
-    let hi_v = scratch.cands[ncand - 1];
-    let span = (hi_v as i64 - lo_v as i64) as usize;
-    let use_lut = span <= LUT_MAX_SPAN && span <= 4 * properties.len() + 64;
-    if use_lut {
-        scratch.lut.clear();
-        scratch.lut.resize(span + 1, 0);
-        let mut k = 0usize;
-        for (off, bin) in scratch.lut.iter_mut().enumerate() {
-            let v = lo_v + off as i32;
-            while k < ncand && scratch.cands[k] < v {
-                k += 1;
-            }
-            *bin = k as u8;
-        }
-    }
-    let bin_for = |v: i32| {
-        if use_lut {
-            if v <= lo_v {
-                0
-            } else if v > hi_v {
-                ncand
-            } else {
-                scratch.lut[(v - lo_v) as usize] as usize
-            }
-        } else {
-            scratch.cands.partition_point(|&c| c < v)
-        }
-    };
-    let mut bin_count = [0u32; MAX_CANDIDATES + 1];
-    if let &[p0, p1, p2, p3] = preds {
-        // The encoder normally scores four side predictors. Bind their
-        // disjoint histograms once, keeping predictor checks, histogram
-        // bases and the predictor loop outside the per-sample work.
-        assert!(p0 < NUM_MA_PREDS && p1 < NUM_MA_PREDS && p2 < NUM_MA_PREDS && p3 < NUM_MA_PREDS);
-        let stride = bins * alphabet;
-        let [h0, h1, h2, h3] = scratch
-            .bin_hist
-            .get_disjoint_mut([
-                p0 * stride..(p0 + 1) * stride,
-                p1 * stride..(p1 + 1) * stride,
-                p2 * stride..(p2 + 1) * stride,
-                p3 * stride..(p3 + 1) * stride,
-            ])
-            .expect("distinct side predictors");
-        for (props, toks) in properties.iter().zip(tokens) {
-            let bin = bin_for(props[prop]);
-            bin_count[bin] += 1;
-            let offset = bin * alphabet;
-            h0[offset + toks[p0] as usize] += 1;
-            h1[offset + toks[p1] as usize] += 1;
-            h2[offset + toks[p2] as usize] += 1;
-            h3[offset + toks[p3] as usize] += 1;
-        }
-    } else {
-        for (props, toks) in properties.iter().zip(tokens) {
-            let bin = bin_for(props[prop]);
-            bin_count[bin] += 1;
-            for &p in preds {
-                scratch.bin_hist[(p * bins + bin) * alphabet + toks[p] as usize] += 1;
-            }
-        }
-    }
-    for &p in preds {
-        let hist = &scratch.bin_hist[p * bins * alphabet..(p + 1) * bins * alphabet];
-        for (nbits, bin) in scratch.bin_nbits[p * bins..(p + 1) * bins]
-            .iter_mut()
-            .zip(hist.chunks_exact(alphabet))
-        {
-            *nbits = raw_bits_from_hist(bin);
-        }
-    }
-    let total_count = properties.len() as u32;
-    let logs = count_log2_table();
-    for &p in preds {
-        scratch.left_hist[p * alphabet..(p + 1) * alphabet].fill(0);
-    }
-    scratch.left_nbits.fill(0);
-    let mut left_count = 0u32;
-    let mut best: Option<(i32, f32)> = None;
-    for (j, (&candidate, &count)) in scratch.cands.iter().zip(&bin_count[..ncand]).enumerate() {
-        left_count += count;
-        let mut best_l = f32::INFINITY;
-        let mut best_r = f32::INFINITY;
-        for &p in preds {
-            let (lo, hi) = sym_range[p];
-            let left = &mut scratch.left_hist[p * alphabet + lo..p * alphabet + hi];
-            for (l, &b) in left.iter_mut().zip(
-                &scratch.bin_hist[(p * bins + j) * alphabet + lo..(p * bins + j) * alphabet + hi],
-            ) {
-                *l += b;
-            }
-            scratch.left_nbits[p] += scratch.bin_nbits[p * bins + j];
-            if left_count == 0 || left_count == total_count {
-                continue;
-            }
-            let right_count = total_count - left_count;
-            let log_left = count_log2(left_count, logs);
-            let log_right = count_log2(right_count, logs);
-            let mut cost_l = 0.0f32;
-            let mut cost_r = 0.0f32;
-            for (&total, &l) in all_hist[p * alphabet + lo..p * alphabet + hi]
-                .iter()
-                .zip(left.iter())
-            {
-                if l != 0 {
-                    cost_l += l as f32 * (log_left - count_log2(l, logs));
-                }
-                let c = total - l;
-                if c != 0 {
-                    cost_r += c as f32 * (log_right - count_log2(c, logs));
-                }
-            }
-            cost_l += scratch.left_nbits[p] as f32;
-            cost_r += (all_nbits[p] - scratch.left_nbits[p]) as f32;
-            best_l = best_l.min(cost_l);
-            best_r = best_r.min(cost_r);
-        }
-        if left_count == 0 || left_count == total_count {
-            continue;
-        }
-        let cost = best_l + best_r;
-        if best.is_none() || cost < best.unwrap().1 {
-            best = Some((candidate, cost));
-        }
-    }
-    best
+    let window = SymbolWindow::new(preds, alphabet, all_hist);
+    let mut luts = Vec::new();
+    let plan = plan_split(
+        properties,
+        prop,
+        max_candidates,
+        window.width,
+        0,
+        &mut luts,
+        scratch,
+    )?;
+    let mut hist = vec![0u32; preds.len() * plan.pred_stride as usize];
+    let mut bin_count = vec![0u32; MAX_CANDIDATES + 1];
+    scan_split_plans(
+        properties,
+        tokens,
+        std::slice::from_ref(&plan),
+        &luts,
+        preds,
+        (window.lo, window.width),
+        &mut hist,
+        &mut bin_count,
+    );
+    score_split_plan(
+        &plan,
+        preds,
+        alphabet,
+        &window,
+        &hist,
+        &bin_count,
+        all_hist,
+        all_nbits,
+        properties.len() as u32,
+        scratch,
+    )
 }
 
 /// Samples use uint_encode's fixed (4, 2, 0) config, so a symbol determines
@@ -602,13 +851,46 @@ impl Learner<'_> {
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
-        let properties = &self.s.props[start..end];
-        let tokens = &self.s.tok[start..end];
+        self.evaluate_rows(
+            node_id,
+            start,
+            end,
+            &self.s.props[start..end],
+            &self.s.tok[start..end],
+            depth,
+            pool,
+            scratch,
+        )
+    }
+
+    /// `evaluate` over rows supplied by the caller: the same rows (in the same
+    /// order) that `start..end` will hold, possibly a copy made before the
+    /// learner's own array was partitioned.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_rows(
+        &self,
+        node_id: u32,
+        start: usize,
+        end: usize,
+        properties: &[[i32; NUM_MA_PROPS]],
+        tokens: &[[u8; NUM_MA_PREDS]],
+        depth: u16,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Pending {
+        debug_assert_eq!(properties.len(), end - start);
         let (base_bits, base_pred) =
             node_cost_all(tokens.iter(), &self.p, &mut scratch.ma_property);
         let mut split = None;
         let mut gain = 0.0f32;
-        if properties.len() >= self.p.min_node && (depth as usize) < MAX_DEPTH {
+        // A split gains at most `base_bits - split_cost_bits`: a node that is
+        // already (near-)deterministic cannot be worth splitting, so its
+        // properties are not scored at all. Exact, and the bulk of the work
+        // on flat graphics and text once the tree has isolated their zeros.
+        if properties.len() >= self.p.min_node
+            && (depth as usize) < MAX_DEPTH
+            && base_bits > self.p.split_cost_bits
+        {
             let mut best: Option<(usize, i32, f32)> = None; // (prop, threshold, bits)
             let alphabet = self.p.alphabet;
             let all_hist = scratch.ma_property.node_hist[..NUM_MA_PREDS * alphabet].to_vec();
@@ -626,39 +908,157 @@ impl Learner<'_> {
                 scratch.ma_property.node_costs[a].total_cmp(&scratch.ma_property.node_costs[b])
             });
             preds.truncate(self.p.side_preds.max(1));
+            let window = SymbolWindow::new(&preds, alphabet, &all_hist);
             let props = split_props(self.p.allow_wp);
             let max_candidates = self.p.max_candidates;
-            let score_one = |prop: usize, sc: &mut MaPropertyScratch| {
-                best_split_on_prop(
+            let n = properties.len();
+
+            // Candidate thresholds of every property, each with its own block
+            // of the node's multi-property histogram.
+            let MaPropertyScratch {
+                plans,
+                luts,
+                multi_hist: hist,
+                multi_bin_count: bin_count,
+                ..
+            } = &mut scratch.ma_property;
+            let mut plans = std::mem::take(plans);
+            let mut luts = std::mem::take(luts);
+            let mut hist = std::mem::take(hist);
+            let mut bin_count = std::mem::take(bin_count);
+            plans.clear();
+            luts.clear();
+            let mut hist_len = 0usize;
+            for &prop in props {
+                if let Some(plan) = plan_split(
                     properties,
-                    tokens,
-                    prop,
-                    &preds,
-                    alphabet,
+                    prop as usize,
                     max_candidates,
-                    &all_hist,
-                    &all_nbits,
-                    sc,
-                )
-            };
-            let scores =
-                if properties.len() >= PARALLEL_PROPERTY_MIN_SAMPLES && pool.num_threads() > 1 {
-                    pool.steal_map(scratch, props.len(), |job, worker_scratch| {
-                        score_one(props[job] as usize, &mut worker_scratch.ma_property)
-                    })
-                } else {
-                    props
-                        .iter()
-                        .map(|&prop| score_one(prop as usize, &mut scratch.ma_property))
-                        .collect()
-                };
-            for (&prop, score) in props.iter().zip(scores) {
-                if let Some((t, bits)) = score
-                    && (best.is_none() || bits < best.unwrap().2)
-                {
-                    best = Some((prop as usize, t, bits));
+                    window.width,
+                    hist_len as u32,
+                    &mut luts,
+                    &mut scratch.ma_property,
+                ) {
+                    hist_len += preds.len() * plan.pred_stride as usize;
+                    plans.push(plan);
                 }
             }
+            let bc_len = plans.len() * (MAX_CANDIDATES + 1);
+
+            let win = (window.lo, window.width);
+            if n >= PARALLEL_SCAN_MIN_SAMPLES && pool.num_threads() > 1 {
+                // Large node: its rows no longer sit in cache, so one pass
+                // bins every property at once, in concurrent row chunks
+                // whose histograms are summed afterwards.
+                hist.clear();
+                hist.resize(hist_len, 0);
+                bin_count.clear();
+                bin_count.resize(bc_len, 0);
+                let chunks = (n / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
+                let (plans_ref, luts_ref, preds_ref) = (&plans, &luts, &preds);
+                let parts = pool.steal_map(scratch, chunks, |c, _worker_scratch| {
+                    let start = c * n / chunks;
+                    let end = (c + 1) * n / chunks;
+                    let mut hist = vec![0u32; hist_len];
+                    let mut bin_count = vec![0u32; bc_len];
+                    scan_split_plans(
+                        &properties[start..end],
+                        &tokens[start..end],
+                        plans_ref,
+                        luts_ref,
+                        preds_ref,
+                        win,
+                        &mut hist,
+                        &mut bin_count,
+                    );
+                    (hist, bin_count)
+                });
+                for (part_hist, part_counts) in &parts {
+                    for (a, &b) in hist.iter_mut().zip(part_hist) {
+                        *a += b;
+                    }
+                    for (a, &b) in bin_count.iter_mut().zip(part_counts) {
+                        *a += b;
+                    }
+                }
+                for (k, plan) in plans.iter().enumerate() {
+                    let start = plan.hist_start as usize;
+                    let end = start + preds.len() * plan.pred_stride as usize;
+                    let score = score_split_plan(
+                        plan,
+                        &preds,
+                        alphabet,
+                        &window,
+                        &hist[start..end],
+                        &bin_count[k * (MAX_CANDIDATES + 1)..(k + 1) * (MAX_CANDIDATES + 1)],
+                        &all_hist,
+                        &all_nbits,
+                        n as u32,
+                        &mut scratch.ma_property,
+                    );
+                    if let Some((t, bits)) = score
+                        && (best.is_none() || bits < best.unwrap().2)
+                    {
+                        best = Some((plan.prop as usize, t, bits));
+                    }
+                }
+            } else {
+                // Cache-resident node: each property is binned and scored on
+                // its own (concurrently for medium nodes); a small
+                // single-property histogram stays in L1 and beats summing
+                // per-chunk multi-property ones.
+                let one_plan = |plan: &SplitPlan, sc: &mut MaPropertyScratch| {
+                    sc.prepare(alphabet);
+                    let mut local = *plan;
+                    local.hist_start = 0;
+                    let mut hist = std::mem::take(&mut sc.multi_hist);
+                    let mut bin_count = std::mem::take(&mut sc.multi_bin_count);
+                    hist.clear();
+                    hist.resize(preds.len() * plan.pred_stride as usize, 0);
+                    bin_count.clear();
+                    bin_count.resize(MAX_CANDIDATES + 1, 0);
+                    scan_split_plans(
+                        properties,
+                        tokens,
+                        std::slice::from_ref(&local),
+                        &luts,
+                        &preds,
+                        win,
+                        &mut hist,
+                        &mut bin_count,
+                    );
+                    let score = score_split_plan(
+                        &local, &preds, alphabet, &window, &hist, &bin_count, &all_hist,
+                        &all_nbits, n as u32, sc,
+                    );
+                    sc.multi_hist = hist;
+                    sc.multi_bin_count = bin_count;
+                    score
+                };
+                let scores: Vec<Option<(i32, f32)>> =
+                    if n >= PARALLEL_PLAN_MIN_SAMPLES && pool.num_threads() > 1 {
+                        let plans_ref = &plans;
+                        pool.steal_map(scratch, plans.len(), |k, worker_scratch| {
+                            one_plan(&plans_ref[k], &mut worker_scratch.ma_property)
+                        })
+                    } else {
+                        plans
+                            .iter()
+                            .map(|plan| one_plan(plan, &mut scratch.ma_property))
+                            .collect()
+                    };
+                for (plan, score) in plans.iter().zip(scores) {
+                    if let Some((t, bits)) = score
+                        && (best.is_none() || bits < best.unwrap().2)
+                    {
+                        best = Some((plan.prop as usize, t, bits));
+                    }
+                }
+            }
+            scratch.ma_property.plans = plans;
+            scratch.ma_property.luts = luts;
+            scratch.ma_property.multi_hist = hist;
+            scratch.ma_property.multi_bin_count = bin_count;
             if let Some((prop, threshold, bits)) = best {
                 let g = base_bits - bits - self.p.split_cost_bits;
                 if g > 0.0 {
@@ -743,6 +1143,51 @@ fn flat_cost(learner: &Learner<'_>, scratch: &mut CoderScratch) -> f64 {
     flat_bits
 }
 
+/// A pending split whose children are already scored, ahead of its turn.
+struct Ahead {
+    /// First row of the `le` child once the node's rows are partitioned
+    /// (`start..lo` is `gt`), with both children's scores; `None` when the
+    /// quantile candidate straddles no actual sample boundary.
+    children: Option<(usize, Pending, Pending)>,
+}
+
+/// Pending splits scored ahead of their turn, on top of the one being
+/// committed: the heap's best-first commit order is untouched (so the tree,
+/// leaf cap included, is identical), only the child evaluations run in
+/// batches of up to `2 * splits` concurrent tasks instead of two at a time.
+/// This is what keeps the deep tail of small nodes, where a node's own scan
+/// is too small to parallelize, off a single thread.
+fn speculative_splits(pool: &ThreadPool) -> usize {
+    (pool.num_threads() / 2).clamp(1, 8)
+}
+
+/// Rows of a node scored ahead of its turn are partitioned on a copy, so the
+/// learner's own row order (which leaf-offset sampling later reads) changes
+/// only when a split is committed; the copy bounds the speculated node size.
+const SPECULATE_MAX_ROWS: usize = 1 << 16;
+
+/// The learner's two-ended partition: `gt` rows move to the front in their
+/// original relative order, the rest to the back. Returns the first `le` row.
+fn partition_rows(
+    props: &mut [[i32; NUM_MA_PROPS]],
+    tok: &mut [[u8; NUM_MA_PREDS]],
+    prop: u8,
+    threshold: i32,
+) -> usize {
+    let mut lo = 0;
+    let mut hi = props.len();
+    while lo < hi {
+        if props[lo][prop as usize] > threshold {
+            lo += 1;
+        } else {
+            hi -= 1;
+            props.swap(lo, hi);
+            tok.swap(lo, hi);
+        }
+    }
+    lo
+}
+
 fn grow_tree(
     mut learner: Learner<'_>,
     mut heap: std::collections::BinaryHeap<Pending>,
@@ -750,31 +1195,142 @@ fn grow_tree(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> LearnedTree {
+    let window = speculative_splits(pool);
+    let mut ahead: std::collections::HashMap<u32, Ahead> = std::collections::HashMap::new();
+    // Rows to score: the committed node's children in place, plus the
+    // speculated nodes' children on their partitioned copies.
+    struct Job {
+        node_id: u32,
+        start: usize,
+        lo: usize,
+        end: usize,
+        depth: u16,
+        copy: Option<MaSamples>,
+    }
     while learner.leaves < learner.p.max_leaves as u32 {
         let Some(p) = heap.pop() else { break };
         let (prop, threshold) = p.split.expect("only splittable nodes are queued");
-        // Use the original two-ended partition order, but move complete rows
-        // instead of indices. Each child is a contiguous view of the local rows;
-        // every child and quantile probe sees exactly the original sequence.
-        let mut lo = p.start;
-        let mut hi = p.end;
-        while lo < hi {
-            if learner.s.props[lo][prop as usize] > threshold {
-                lo += 1;
-            } else {
-                hi -= 1;
-                learner.s.swap(lo, hi);
+        if !ahead.contains_key(&p.node_id) {
+            let mut jobs: Vec<Job> = Vec::with_capacity(window);
+            // Use the original two-ended partition order, but move complete
+            // rows instead of indices. Each child is a contiguous view of the
+            // local rows; every child and quantile probe sees exactly the
+            // original sequence.
+            let lo = p.start
+                + partition_rows(
+                    &mut learner.s.props[p.start..p.end],
+                    &mut learner.s.tok[p.start..p.end],
+                    prop,
+                    threshold,
+                );
+            jobs.push(Job {
+                node_id: p.node_id,
+                start: p.start,
+                lo,
+                end: p.end,
+                depth: p.depth + 1,
+                copy: None,
+            });
+            if window > 1 {
+                // The next best pending splits by gain (ties may pick either,
+                // which only decides what is computed early, never what is
+                // committed). Their rows are untouched until they commit, so
+                // a copy partitioned the same way holds exactly the rows the
+                // children will then own.
+                let mut next: Vec<&Pending> = heap
+                    .iter()
+                    .filter(|q| {
+                        !ahead.contains_key(&q.node_id) && q.end - q.start <= SPECULATE_MAX_ROWS
+                    })
+                    .collect();
+                next.sort_by(|a, b| b.gain.total_cmp(&a.gain));
+                for q in next.into_iter().take(window - 1) {
+                    let (prop, threshold) = q.split.expect("only splittable nodes are queued");
+                    let mut copy = MaSamples {
+                        props: learner.s.props[q.start..q.end].to_vec(),
+                        tok: learner.s.tok[q.start..q.end].to_vec(),
+                    };
+                    let lo =
+                        q.start + partition_rows(&mut copy.props, &mut copy.tok, prop, threshold);
+                    jobs.push(Job {
+                        node_id: q.node_id,
+                        start: q.start,
+                        lo,
+                        end: q.end,
+                        depth: q.depth + 1,
+                        copy: Some(copy),
+                    });
+                }
             }
+            let live: Vec<&Job> = jobs
+                .iter()
+                .filter(|job| job.lo != job.start && job.lo != job.end)
+                .collect();
+            let learner_ref = &learner;
+            let score = |k: usize, worker_scratch: &mut CoderScratch| {
+                let job = live[k / 2];
+                let (start, end) = if k.is_multiple_of(2) {
+                    (job.start, job.lo)
+                } else {
+                    (job.lo, job.end)
+                };
+                match &job.copy {
+                    None => learner_ref.evaluate(0, start, end, job.depth, pool, worker_scratch),
+                    Some(copy) => {
+                        let rows = start - job.start..end - job.start;
+                        learner_ref.evaluate_rows(
+                            0,
+                            start,
+                            end,
+                            &copy.props[rows.clone()],
+                            &copy.tok[rows],
+                            job.depth,
+                            pool,
+                            worker_scratch,
+                        )
+                    }
+                }
+            };
+            let smallest = live
+                .iter()
+                .map(|job| (job.lo - job.start).min(job.end - job.lo))
+                .min()
+                .unwrap_or(0);
+            let scored: Vec<Pending> = if pool.num_threads() > 1
+                && (live.len() > 1 || smallest >= PARALLEL_CHILD_MIN_SAMPLES)
+            {
+                pool.steal_map(scratch, live.len() * 2, score)
+            } else {
+                (0..live.len() * 2).map(|k| score(k, scratch)).collect()
+            };
+            let mut scored = scored.into_iter();
+            for job in &jobs {
+                let children = (job.lo != job.start && job.lo != job.end).then(|| {
+                    let gt = scored.next().expect("gt child");
+                    let le = scored.next().expect("le child");
+                    (job.lo, gt, le)
+                });
+                ahead.insert(job.node_id, Ahead { children });
+            }
+        } else {
+            // Scored ahead on a copy: partition the learner's rows now.
+            partition_rows(
+                &mut learner.s.props[p.start..p.end],
+                &mut learner.s.tok[p.start..p.end],
+                prop,
+                threshold,
+            );
         }
-        if lo == p.start || lo == p.end {
+        let Some((_, mut gt, mut le)) = ahead.remove(&p.node_id).expect("scored ahead").children
+        else {
             // Quantile candidate straddled no actual sample boundary.
             continue;
-        }
+        };
 
         let gt_id = learner.nodes.len() as u32;
-        learner.nodes.push(MaNode::Leaf { pred: 0 });
+        learner.nodes.push(MaNode::Leaf { pred: gt.pred });
         let le_id = learner.nodes.len() as u32;
-        learner.nodes.push(MaNode::Leaf { pred: 0 });
+        learner.nodes.push(MaNode::Leaf { pred: le.pred });
         learner.nodes[p.node_id as usize] = MaNode::Split {
             prop,
             val: threshold,
@@ -782,32 +1338,8 @@ fn grow_tree(
             le: le_id,
         };
         learner.leaves += 1;
-
-        let (gt, le) = {
-            let learner_ref = &learner;
-            let depth = p.depth + 1;
-            let (start, end) = (p.start, p.end);
-            let smallest = (lo - start).min(end - lo);
-            if smallest < PARALLEL_CHILD_MIN_SAMPLES || pool.num_threads() < 2 {
-                (
-                    learner_ref.evaluate(gt_id, start, lo, depth, pool, scratch),
-                    learner_ref.evaluate(le_id, lo, end, depth, pool, scratch),
-                )
-            } else {
-                let mut both = pool.steal_map(scratch, 2, |k, worker_scratch| {
-                    if k == 0 {
-                        learner_ref.evaluate(gt_id, start, lo, depth, pool, worker_scratch)
-                    } else {
-                        learner_ref.evaluate(le_id, lo, end, depth, pool, worker_scratch)
-                    }
-                });
-                let le = both.pop().expect("le child");
-                let gt = both.pop().expect("gt child");
-                (gt, le)
-            }
-        };
-        learner.nodes[gt_id as usize] = MaNode::Leaf { pred: gt.pred };
-        learner.nodes[le_id as usize] = MaNode::Leaf { pred: le.pred };
+        gt.node_id = gt_id;
+        le.node_id = le_id;
         learner.est_bits += (gt.base_bits + le.base_bits - p.base_bits) as f64;
         if gt.split.is_some() {
             heap.push(gt);
@@ -850,8 +1382,19 @@ pub(crate) fn learn_ma_tree_indexed(
         let selection = idx;
         samples.select(&selection)
     };
-    let n = compact.len();
-    let mut learner = new_learner(&mut compact, params, vec![MaNode::Leaf { pred: 0 }]);
+    learn_ma_tree_in_place(&mut compact, params, pool, scratch)
+}
+
+/// Learn without copying samples whose original order is no longer needed.
+/// Partitions rows in place, using the same initial order as indexed learning.
+pub(crate) fn learn_ma_tree_in_place(
+    samples: &mut MaSamples,
+    params: MaLearnParams,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> LearnedTree {
+    let n = samples.len();
+    let mut learner = new_learner(samples, params, vec![MaNode::Leaf { pred: 0 }]);
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
     let root = learner.evaluate(0, 0, n, 0, pool, scratch);
@@ -913,10 +1456,7 @@ pub(crate) fn deepen_ma_tree(
 
         (counts, offsets, idx)
     };
-    let mut compact = {
-        let selection = idx;
-        samples.into_selected(&selection)
-    };
+    let mut compact = samples.into_permuted(idx);
     let mut learner = new_learner(&mut compact, params, seed.nodes);
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
@@ -951,6 +1491,83 @@ pub(crate) fn deepen_ma_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_permutation_matches_gather() {
+        let mut state = 0x739feb12u32;
+        for len in [0, 1, 2, 3, 31, 64, 257, 4096] {
+            for kind in 0..4 {
+                let mut samples = MaSamples::new();
+                for i in 0..len {
+                    samples.push(
+                        core::array::from_fn(|p| (i * 101 + p) as i32),
+                        core::array::from_fn(|p| (i * 13 + p) as u8),
+                    );
+                }
+                let mut indices: Vec<u32> = (0..len as u32).collect();
+                match kind {
+                    1 => indices.reverse(),
+                    2 if len > 0 => indices.rotate_left(1),
+                    3 => {
+                        for i in (1..len).rev() {
+                            state ^= state << 13;
+                            state ^= state >> 17;
+                            state ^= state << 5;
+                            indices.swap(i, state as usize % (i + 1));
+                        }
+                    }
+                    _ => {}
+                }
+                let expected = samples.select(&indices);
+                let props_ptr = samples.props.as_ptr();
+                let tok_ptr = samples.tok.as_ptr();
+                let actual = samples.into_permuted(indices);
+                assert_eq!(actual.props, expected.props);
+                assert_eq!(actual.tok, expected.tok);
+                assert_eq!(actual.props.as_ptr(), props_ptr);
+                assert_eq!(actual.tok.as_ptr(), tok_ptr);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_bitmap_matches_sort_dedup() {
+        let mut state = 0x83d2eaf1u32;
+        let mut bitmap = [u64::MAX; PROBE_BITMAP_BITS / 64];
+        for len in [0, 1, 2, 31, 32, 33, 63, 64, 65, 1024, 2047] {
+            for range in [1i64, 2, 63, 64, 65, 256, 4095, 4096, 4097, 65536, 1 << 32] {
+                for min in [i32::MIN as i64, -(range / 2), i32::MAX as i64 - range + 1] {
+                    let mut input = Vec::with_capacity(len);
+                    for i in 0..len {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        let offset = match i {
+                            0 => 0,
+                            1 => range - 1,
+                            _ => state as i64 % range,
+                        };
+                        input.push((min + offset) as i32);
+                    }
+                    let mut expected = input.clone();
+                    expected.sort_unstable();
+                    expected.dedup();
+                    // Reuse the bitmap across different ranges, orders and
+                    // fallback paths to catch stale presence bits as well.
+                    for order in 0..3 {
+                        if order == 1 {
+                            input.sort_unstable();
+                        } else if order == 2 {
+                            input.reverse();
+                        }
+                        let mut actual = input.clone();
+                        sort_unique_probe(&mut actual, &mut bitmap);
+                        assert_eq!(actual, expected, "len={len}, range={range}, min={min}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cached_count_logs_match_direct_approximation() {
@@ -1077,14 +1694,12 @@ mod tests {
             );
         }
         let mut selected = samples.select(&[31, 4, 17, 4]);
-        selected.swap(0, 2);
+        selected.props.swap(0, 2);
+        selected.tok.swap(0, 2);
         for (row, source) in [17, 4, 31, 4].into_iter().enumerate() {
             assert_eq!(selected.props[row], samples.props[source]);
             assert_eq!(selected.tok[row], samples.tok[source]);
         }
-        let owned = samples.into_selected(&[17, 4, 31, 4]);
-        assert_eq!(owned.props, selected.props);
-        assert_eq!(owned.tok, selected.tok);
     }
 
     #[test]
@@ -1255,5 +1870,13 @@ mod tests {
         assert_eq!(indexed.nodes, materialized.nodes);
         assert_eq!(indexed.est_bits, materialized.est_bits);
         assert_eq!(indexed.flat_bits, materialized.flat_bits);
+        let in_place =
+            learn_ma_tree_in_place(&mut copied, params(), &pool, &mut CoderScratch::default());
+        assert_eq!(in_place.nodes, materialized.nodes);
+        assert_eq!(in_place.est_bits.to_bits(), materialized.est_bits.to_bits());
+        assert_eq!(
+            in_place.flat_bits.to_bits(),
+            materialized.flat_bits.to_bits()
+        );
     }
 }

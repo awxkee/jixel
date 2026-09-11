@@ -44,7 +44,6 @@ mod tokens;
 use ma_lookup::MaLookup;
 use tokens::{RawTokenStreams, RawTokens};
 
-use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS};
 use crate::encode_image::AlphaPlane;
@@ -55,11 +54,10 @@ use crate::entropy::{
 use crate::image::Image3Si;
 use crate::ma_tree::{
     LearnedTree, MA_REF_CHANNELS, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS,
-    deepen_ma_tree, learn_ma_tree, learn_ma_tree_indexed,
+    deepen_ma_tree, learn_ma_tree, learn_ma_tree_in_place, learn_ma_tree_indexed,
 };
 use crate::patches::{
-    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PATCH_TILE, PatchReference,
-    find_lossless_patches,
+    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference, find_lossless_patches,
 };
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::{WpNeighbors, WpParams, WpState, write_wp_header};
@@ -67,10 +65,11 @@ use crate::xyb::quantize_xyb_channels;
 pub(crate) use lz77::LzToken;
 use lz77::{
     LZ77_MIN_SYMBOL, RunLzWriter, build_lz_pixel_code, build_lz_pixel_code_threads,
-    estimate_coded_bits, estimate_literal_and_run_bits, estimate_streams_bits,
-    lz77_compress_channels_for_speed, lz77_compress_channels_for_speed_with_depth,
-    lz77_compress_for_speed, lz77_compress_for_speed_with_depth, lz77_run_count,
-    write_local_tree_lz77, write_lz_section, write_tree_lz77,
+    estimate_coded_bits, estimate_literal_and_run_bits, estimate_literal_and_run_bits_single,
+    estimate_streams_bits, lz77_compress_channels_for_speed,
+    lz77_compress_channels_for_speed_with_depth, lz77_compress_for_speed,
+    lz77_compress_for_speed_with_depth, lz77_run_count, write_local_tree_lz77, write_lz_section,
+    write_tree_lz77,
 };
 use palette::{
     PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
@@ -87,7 +86,7 @@ pub(crate) use rct::forward_ycocg;
 use rct::{rank_rcts, rct_planes as rct_planes_fn, write_rct_transform};
 pub(crate) use squeeze::{encode_frame_lossy_modular_squeeze, lm_calibrated_distance};
 use squeeze::{encode_squeeze_multigroup, encode_squeeze_single_group};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 const TREE_CTX_SPLIT_VAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;
@@ -122,15 +121,15 @@ impl GroupLayout {
 
 const GROUP_DIM: usize = GroupLayout::DEFAULT.dim();
 const LF_GROUP_DIM: usize = GroupLayout::DEFAULT.lf_dim();
-/// Each active deep-LZ lane owns about 4.7 MiB of hash lookup storage. Eight
-/// lanes retain useful parallelism without allowing a many-core encoder to
-/// multiply that fixed working set across every worker.
 const SLOW_DEEP_LZ_MAX_THREADS: usize = 8;
 
 /// The learned-tree entropy proxy must beat its flat alternative decisively
 /// before Slow mode trusts it enough to omit the context/flat final encodes.
 /// Near decisions retain the exact byte-level tournament.
 const MA_DECISIVE_MIN_SAVINGS: f64 = 0.18;
+/// A learned tree estimated to save at least this fraction over the flat
+/// coder also skips the v1 context-tree and flat frame candidates.
+const MA_ALTERNATIVES_MIN_SAVINGS: f64 = 0.05;
 
 #[inline]
 fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
@@ -373,42 +372,53 @@ fn encode_frame_lossless_with_pool(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) {
+    // Glyph plans (arbitrary-position repeated shapes: text, UI) come first
+    // and always compete on complete frame size; tile plans keep the old
+    // decisive-tree skip, having never beaten one.
+    let glyph_plan = if patches && num_color == 3 {
+        crate::patches::find_lossless_glyph_patches(linear)
+    } else {
+        None
+    };
+    let is_glyph_plan = glyph_plan.is_some();
     if patches
         && num_color == 3
-        && let Some(plan) = find_lossless_patches(linear, pool, scratch)
+        && let Some(plan) = glyph_plan.or_else(|| find_lossless_patches(linear, pool, scratch))
     {
         // Patches change prediction, LZ77, entropy histograms, and add both a
         // reference-only frame and a dictionary. Their true cost cannot be
-        // inferred reliably from covered pixel area, so encode both complete
-        // alternatives and select by their final byte-aligned bit count.
+        // inferred reliably from covered pixel area, so both complete
+        // alternatives are compared by their final byte-aligned bit count.
         let mut regular_writer = BitWriter::new();
-        let decisive_tree = encode_frame_lossless_core(
-            linear,
-            alpha,
-            max_bits,
-            progressive,
-            num_color,
-            speed,
-            decoding_speed,
-            pool,
-            scratch,
-            ModularFrameKind::Regular,
-            &mut regular_writer,
-        );
-        // Patched frames are coded by the flat path only, so they cannot beat
-        // a decisive learned tree, and a plan covering little of the image
-        // cannot pay for its dictionary and reference frame.
-        let covered: usize = plan
-            .references
-            .iter()
-            .map(|r| r.positions.len())
-            .sum::<usize>()
-            * crate::patches::PATCH_TILE
-            * crate::patches::PATCH_TILE;
-        let coverage = covered as f64 / (linear.xsize() * linear.ysize()) as f64;
-        if decisive_tree || coverage < PATCH_MIN_COVERAGE {
-            writer.append(&regular_writer);
-            return;
+        if !is_glyph_plan {
+            // Tile plans: the regular frame first; a decisive learned tree
+            // (never beaten by a tile plan) or a plan covering little of the
+            // image (cannot pay for its dictionary and reference frame)
+            // skips the patched encode.
+            let decisive_tree = encode_frame_lossless_core(
+                linear,
+                alpha,
+                max_bits,
+                progressive,
+                num_color,
+                speed,
+                decoding_speed,
+                pool,
+                scratch,
+                ModularFrameKind::Regular,
+                true,
+                &mut regular_writer,
+            );
+            let covered: usize = plan
+                .references
+                .iter()
+                .map(|r| r.positions.len() * r.width * r.height)
+                .sum::<usize>();
+            let coverage = covered as f64 / (linear.xsize() * linear.ysize()) as f64;
+            if decisive_tree || coverage < PATCH_MIN_COVERAGE {
+                writer.append(&regular_writer);
+                return;
+            }
         }
 
         let mut patched_writer = BitWriter::new();
@@ -428,8 +438,10 @@ fn encode_frame_lossless_with_pool(
                 width: plan.atlas.xsize(),
                 height: plan.atlas.ysize(),
             },
+            true,
             &mut patched_writer,
         );
+        let atlas_bits = patched_writer.bits_written();
         encode_frame_lossless_core(
             &plan.base,
             alpha,
@@ -441,13 +453,57 @@ fn encode_frame_lossless_with_pool(
             pool,
             scratch,
             ModularFrameKind::Patched(&plan.references),
+            true,
             &mut patched_writer,
         );
 
-        if patched_writer.bits_written() < regular_writer.bits_written() {
-            writer.append(&patched_writer);
-        } else {
+        if is_glyph_plan {
+            // Glyph plans win whenever the plan is any good, so the regular
+            // frame (a complete second encode) is written only when the
+            // first-stage estimates leave it a chance; the dense local-tree
+            // learn is spent on the patched frame only.
+            let min_symbol = lossless_min_symbol(max_bits);
+            let use_wp = decoding_speed.use_weighted_predictor();
+            let regular_est = coarse_frame_bits(linear, alpha, min_symbol, use_wp, pool, scratch);
+            let base_est = coarse_frame_bits(&plan.base, alpha, min_symbol, use_wp, pool, scratch);
+            let competitive = match (regular_est, base_est) {
+                (Some(regular), Some(base)) => {
+                    let mut dictionary = BitWriter::new();
+                    write_patch_dictionary(
+                        &plan.references,
+                        alpha.is_some(),
+                        scratch,
+                        &mut dictionary,
+                    );
+                    let patched = base + (atlas_bits + dictionary.bits_written()) as f64;
+                    regular <= patched * GLYPH_REGULAR_COARSE_MARGIN
+                }
+                _ => true,
+            };
+            if competitive {
+                encode_frame_lossless_core(
+                    linear,
+                    alpha,
+                    max_bits,
+                    progressive,
+                    num_color,
+                    speed,
+                    decoding_speed,
+                    pool,
+                    scratch,
+                    ModularFrameKind::Regular,
+                    false,
+                    &mut regular_writer,
+                );
+            }
+        }
+
+        if regular_writer.bits_written() > 0
+            && regular_writer.bits_written() < patched_writer.bits_written()
+        {
             writer.append(&regular_writer);
+        } else {
+            writer.append(&patched_writer);
         }
         return;
     }
@@ -462,11 +518,57 @@ fn encode_frame_lossless_with_pool(
         pool,
         scratch,
         ModularFrameKind::Regular,
+        true,
         writer,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lossless_min_symbol(max_bits: u32) -> u32 {
+    if max_bits <= 13 {
+        LZ77_MIN_SYMBOL
+    } else {
+        4 * max_bits + 24
+    }
+}
+
+/// First-stage learned-tree estimate of a frame's pixel bits: the ranking
+/// stage's coarse learn (32 leaves, YCoCg planes, default WP preset, 1024-px
+/// layout), or `None` when no tree beats the flat coder there. Frames of one
+/// image relate to their complete encodes by nearly the same factor (a UI
+/// screenshot and its glyph-patched base: 0.77 and 0.80), so it can rank two
+/// competing frames before either is fully encoded.
+fn coarse_frame_bits(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    min_symbol: u32,
+    use_wp: bool,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<f64> {
+    let (xsize, ysize) = (linear.xsize(), linear.ysize());
+    let source = rgb_ma_source(linear, alpha, xsize, 6);
+    let stage = rank_coarse(
+        &source,
+        xsize,
+        ysize,
+        min_symbol,
+        WpParams::DEFAULT,
+        use_wp,
+        pool,
+        scratch,
+    )?;
+    Some(stage.candidate.est_real.min(stage.candidate.flat_real))
+}
+
+/// A glyph plan's regular frame is encoded only when its first-stage
+/// estimate is within this factor of the patched frame's (base estimate plus
+/// the atlas frame and dictionary): the coarse ratio between the two frames
+/// tracks the final one within a few percent (1.25 coarse vs 1.19 final on a
+/// UI screenshot), and a clear loser's complete encode was a third of the
+/// total time.
+const GLYPH_REGULAR_COARSE_MARGIN: f64 = 1.10;
+
 fn encode_frame_lossless_core(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -478,6 +580,7 @@ fn encode_frame_lossless_core(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
+    local_trees: bool,
     writer: &mut BitWriter,
 ) -> bool {
     encode_frame_lossless_core_impl(
@@ -492,6 +595,7 @@ fn encode_frame_lossless_core(
         scratch,
         frame_kind,
         true,
+        local_trees,
         writer,
     )
 }
@@ -509,6 +613,7 @@ fn encode_frame_lossless_core_impl(
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
     allow_palette_candidates: bool,
+    local_trees: bool,
     writer: &mut BitWriter,
 ) -> bool {
     let use_wp = decoding_speed.use_weighted_predictor();
@@ -518,11 +623,7 @@ fn encode_frame_lossless_core_impl(
     // never mistakes a large residual for an LZ77 back-reference (the cause of
     // the old ~12-bit lossless ceiling). Stays under the 128-symbol prefix-code
     // alphabet through ~18-bit.
-    let min_symbol: u32 = if max_bits <= 13 {
-        LZ77_MIN_SYMBOL
-    } else {
-        4 * max_bits + 24
-    };
+    let min_symbol = lossless_min_symbol(max_bits);
     let xsize = linear.xsize();
     let ysize = linear.ysize();
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
@@ -568,6 +669,7 @@ fn encode_frame_lossless_core_impl(
                     scratch,
                     frame_kind,
                     false,
+                    local_trees,
                     &mut normal_writer,
                 );
                 if normal_writer.bits_written() < palette_writer.bits_written() {
@@ -617,6 +719,7 @@ fn encode_frame_lossless_core_impl(
                     scratch,
                     frame_kind,
                     false,
+                    local_trees,
                     &mut normal_writer,
                 );
                 if normal_writer.bits_written() < palette_writer.bits_written() {
@@ -690,7 +793,7 @@ fn encode_frame_lossless_core_impl(
     let mut rct_type = 6u32;
     let mut rct_planes: Option<Image3Si> = None;
     let rct_ranked: Vec<(u32, f32)> =
-        if frame_kind.is_regular() && adaptive_search && num_color == 3 {
+        if frame_kind.allows_learned_tree() && adaptive_search && num_color == 3 {
             rank_rcts(linear, xsize, ysize, pool, scratch)
         } else {
             Vec::new()
@@ -719,7 +822,7 @@ fn encode_frame_lossless_core_impl(
     // viable finalist and compares its complete byte-aligned frame against the
     // v1 and flat alternatives. Tree headers, clustering, hybrid uint choices,
     // and LZ77 can otherwise reverse the order predicted from residual entropy.
-    let compare_tree_candidates = frame_kind.is_regular()
+    let compare_tree_candidates = frame_kind.allows_learned_tree()
         && adaptive_search
         && num_color == 3
         && decoding_speed.use_ma_trees();
@@ -735,7 +838,7 @@ fn encode_frame_lossless_core_impl(
     // PALETTE_COARSE_MARGIN is dropped entirely (on palette graphics the RGB
     // tree is ~25% behind and was paying the whole ranking for nothing).
     // Each ranking winner seeds its final learn.
-    let (layout, learned_tree_decisive) = {
+    let (layout, learned_tree_decisive, skip_alternatives) = {
         let palette = if compare_tree_candidates {
             build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
         } else {
@@ -751,9 +854,11 @@ fn encode_frame_lossless_core_impl(
         let mut rank_rgb = compare_tree_candidates;
         // Final learned estimate of the RGB frame; gates the palette write.
         let rgb_final_est: f64;
+        // Coarse estimate of the best source so far: the bar a further
+        // candidate must clear before it is grown into a complete frame.
+        let mut best_source_coarse;
         let mut rank_pal = compare_tree_candidates && palette.is_some();
-        let mut rgb_seed: Option<RankedLearn> = None;
-        let mut pal_seed: Option<RankedLearn> = None;
+        let mut final_sampling = (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT);
         let mut pal_wp = wp_params;
         if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
             let rgb_stage = {
@@ -774,11 +879,19 @@ fn encode_frame_lossless_core_impl(
                 })
             };
             let (rgb_coarse, pal_coarse) = (coarse_of(&rgb_stage), coarse_of(&pal_stage));
+            if rgb_stage.as_ref().is_some_and(|stage| {
+                stage.candidate.est_real
+                    >= DENSE_FINAL_MIN_BITS_PER_VALUE
+                        * source_values_of(xsize, ysize, nb_chans) as f64
+            }) {
+                final_sampling = (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
+            }
             rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
             rank_pal = pal_stage.is_some() && pal_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
 
-            if rank_rgb {
-                let (mut best_bits, mut best_coarse, params, seed) = {
+            let rank_more = source_values_of(xsize, ysize, nb_chans) >= RANK_MIN_VALUES;
+            if rank_rgb && rank_more {
+                let (mut best_bits, mut best_coarse, params) = {
                     let source = rgb_ma_source(linear, alpha, xsize, rct_type);
                     rank_presets(
                         &source,
@@ -794,7 +907,6 @@ fn encode_frame_lossless_core_impl(
                     )
                 };
                 wp_params = params;
-                rgb_seed = seed;
                 // Transform runner-up with the chosen preset, same coarse prune.
                 if let Some(&(runner_up, cost)) = rct_ranked.get(1)
                     && cost <= rct_ranked[0].1 * RCT_RANK_MARGIN
@@ -810,20 +922,22 @@ fn encode_frame_lossless_core_impl(
                     {
                         best_coarse =
                             best_coarse.min(stage.candidate.est_real + header_bits(wp_params));
-                        let (bits, ranked) = rank_finish(stage, min_symbol, use_wp, pool, scratch);
-                        if bits + header_bits(wp_params) < best_bits {
-                            best_bits = bits + header_bits(wp_params);
+                        let bits = rank_bits(&stage) + header_bits(wp_params);
+                        if bits < best_bits {
+                            best_bits = bits;
                             rct_type = runner_up;
                             rct_planes = planes;
-                            rgb_seed = Some(ranked);
                         }
                     }
                 }
                 let _ = (best_bits, best_coarse);
             }
-            if rank_pal && let Some(p) = &palette {
+            if rank_pal
+                && rank_more
+                && let Some(p) = &palette
+            {
                 let source = p.source(xsize, ysize);
-                let (_, _, params, seed) = rank_presets(
+                let (_, _, params) = rank_presets(
                     &source,
                     xsize,
                     ysize,
@@ -836,7 +950,6 @@ fn encode_frame_lossless_core_impl(
                     scratch,
                 );
                 pal_wp = params;
-                pal_seed = seed;
             }
         }
         let linear = rct_planes.as_ref().unwrap_or(ycocg);
@@ -849,13 +962,30 @@ fn encode_frame_lossless_core_impl(
         // (23/24 correct there, where the first stage alone is right 18/24).
         // Layouts are processed one at a time so a single sample set is alive.
         // Everything else keeps the codestream default.
-        let layouts: &[GroupLayout] =
-            if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
-                &[GroupLayout::LARGE, GroupLayout::DEFAULT]
-            } else {
-                &[GroupLayout::DEFAULT]
-            };
-        let (layout, rgb_coarse_est, mut learned_tree_decisive) = {
+        let slow_layouts = compare_tree_candidates
+            && matches!(decoding_speed, crate::DecodingSpeed::Slow)
+            // An image inside one 256-px group learns the same thing under
+            // both layouts.
+            && (xsize > GroupLayout::DEFAULT.dim() || ysize > GroupLayout::DEFAULT.dim());
+        let layouts: &[GroupLayout] = if slow_layouts {
+            &[GroupLayout::LARGE, GroupLayout::DEFAULT]
+        } else {
+            &[GroupLayout::DEFAULT]
+        };
+        // RGB sources of more than a megapixel-channel learn the 1024-px
+        // layout only: the 256 layout's first stage costs a sampling pass and
+        // its full learn doubles the frame's learning time, for a final win
+        // on 2 of the 7 Kodak/city images where it was deepened, by 0.03%
+        // and 0.04%. Palette index images keep both (their accurate estimate
+        // prefers 256 by ~4% where the first stage does not).
+        let rgb_layouts: &[GroupLayout] = if slow_layouts
+            && source_values_of(xsize, ysize, nb_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
+        {
+            &[GroupLayout::LARGE]
+        } else {
+            layouts
+        };
+        let (layout, rgb_coarse_est, mut learned_tree_decisive, skip_alternatives) = {
             let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type);
             let mut learned_estimated_savings: Option<f64> = None;
             let learned = if rank_rgb {
@@ -863,13 +993,14 @@ fn encode_frame_lossless_core_impl(
                     &rgb_source,
                     xsize,
                     ysize,
-                    layouts,
+                    rgb_layouts,
                     min_symbol,
                     wp_params,
                     use_wp,
                     f64::INFINITY,
+                    f64::INFINITY,
                     false,
-                    rgb_seed,
+                    final_sampling,
                     pool,
                     scratch,
                 )
@@ -877,6 +1008,7 @@ fn encode_frame_lossless_core_impl(
                 None
             };
             let rgb_coarse_est = learned.as_ref().map_or(f64::INFINITY, |(_, _, e)| *e);
+            best_source_coarse = rgb_coarse_est;
             rgb_final_est = learned
                 .as_ref()
                 .map_or(f64::INFINITY, |(_, c, _)| c.est_real);
@@ -889,6 +1021,7 @@ fn encode_frame_lossless_core_impl(
                 let estimated_savings = write_learned_tree_frame(
                     &rgb_source,
                     alpha.is_some(),
+                    frame_kind,
                     xsize,
                     ysize,
                     layout,
@@ -898,6 +1031,7 @@ fn encode_frame_lossless_core_impl(
                     wp_params,
                     use_wp,
                     cand,
+                    local_trees,
                     &mut candidate,
                 );
                 learned_estimated_savings = Some(estimated_savings);
@@ -907,6 +1041,7 @@ fn encode_frame_lossless_core_impl(
                 layout,
                 rgb_coarse_est,
                 learned_estimated_savings.is_some_and(learned_tree_is_decisive),
+                learned_estimated_savings.is_some_and(|s| s >= MA_ALTERNATIVES_MIN_SAVINGS),
             )
         };
         if learned_tree_decisive {
@@ -921,10 +1056,11 @@ fn encode_frame_lossless_core_impl(
         // lossless gains ~10% from it on palette graphics; the complete frame
         // competes on size, and a decisive palette tree ends the search like a
         // decisive RGB tree does.
+        let bytes_before_palette = best_tree_writer.as_ref().map(BitWriter::bits_written);
         if rank_pal && let Some(palette) = &palette {
             let palette_source = palette.source(xsize, ysize);
             let coarse_limit = rgb_coarse_est * PALETTE_COARSE_MARGIN;
-            if let Some((palette_layout, cand, _)) = learn_best_layout(
+            if let Some((palette_layout, cand, palette_coarse)) = learn_best_layout(
                 &palette_source,
                 xsize,
                 ysize,
@@ -933,8 +1069,10 @@ fn encode_frame_lossless_core_impl(
                 pal_wp,
                 use_wp,
                 coarse_limit,
+                // Room for the 256 layout's ~4% on palette graphics.
+                rgb_final_est * PALETTE_FINAL_MARGIN * PALETTE_LAYOUT_MARGIN,
                 true,
-                pal_seed,
+                final_sampling,
                 pool,
                 scratch,
             ) {
@@ -948,6 +1086,7 @@ fn encode_frame_lossless_core_impl(
                     let estimated_savings = write_learned_tree_frame(
                         &palette_source,
                         alpha.is_some(),
+                        frame_kind,
                         xsize,
                         ysize,
                         palette_layout,
@@ -957,6 +1096,7 @@ fn encode_frame_lossless_core_impl(
                         pal_wp,
                         use_wp,
                         &cand,
+                        local_trees,
                         &mut candidate,
                     );
                     if learned_tree_is_decisive(estimated_savings) {
@@ -965,18 +1105,119 @@ fn encode_frame_lossless_core_impl(
                     }
                     keep_smaller_writer(&mut best_tree_writer, candidate);
                 }
+                best_source_coarse = best_source_coarse.min(palette_coarse);
             }
         }
-        (layout, learned_tree_decisive)
+        // Per-group palettes: screen content is a mosaic of low-color
+        // regions (a UI screen: 9 of 15 groups hold 221 to 870 colors) that
+        // no global palette can capture. Each qualifying group declares its
+        // own Palette transform while one learned tree still codes the whole
+        // frame, telling the regimes apart through the stream-id property.
+        // A global palette that already won leaves nothing for per-group
+        // ones, and building them would scan the image for nothing.
+        let global_palette_won =
+            best_tree_writer.as_ref().map(BitWriter::bits_written) != bytes_before_palette;
+        if compare_tree_candidates && num_color == 3 && !global_palette_won {
+            let gdim = GroupLayout::DEFAULT.dim();
+            let groups_x = xsize.div_ceil(gdim);
+            let groups_y = ysize.div_ceil(gdim);
+            let groups = groups_x * groups_y;
+            if groups > 1 {
+                let palettes: Vec<Option<palette::LocalPaletteGroup>> =
+                    pool.steal_map(scratch, groups, |group_index, _scratch| {
+                        let x0 = (group_index % groups_x) * gdim;
+                        let y0 = (group_index / groups_x) * gdim;
+                        palette::build_local_palette_group_limited(
+                            ycocg,
+                            alpha,
+                            xsize,
+                            x0,
+                            y0,
+                            gdim.min(xsize - x0),
+                            gdim.min(ysize - y0),
+                            palette::LOCAL_PALETTE_MAX_COLORS,
+                        )
+                    });
+                let covered: usize = palettes
+                    .iter()
+                    .flatten()
+                    .map(|palette| palette.w * palette.h)
+                    .sum();
+                // The groups that keep their colour planes cost the same
+                // either way, so the candidate is only worth its sampling
+                // and first-stage learn when most of the frame palettises
+                // (a UI screen: 60%; a screen-content photo mosaic: 44%,
+                // where the complete frame then loses anyway).
+                if covered * 2 >= xsize * ysize {
+                    let mixed = mixed_ma_source(ycocg, alpha, xsize, &palettes);
+                    let stage = learn_ma_candidate(
+                        &mixed,
+                        xsize,
+                        ysize,
+                        GroupLayout::DEFAULT,
+                        min_symbol,
+                        wp_params,
+                        use_wp,
+                        MA_MAX_LEAVES,
+                        final_sampling.0,
+                        final_sampling.1,
+                        pool,
+                        scratch,
+                    );
+                    // Only a first stage that already beats the best source
+                    // earns the deepening and the complete frame: a global
+                    // palette usually leaves nothing for per-group ones.
+                    // The first stage is grown into a frame only when it is
+                    // close to the best source's own first stage (a winning
+                    // per-group plan lands at 0.75, the losers at 1.08 and
+                    // above; the margin covers a screen-content tie).
+                    if let Some(stage) = stage
+                        .filter(|s| s.candidate.est_real < best_source_coarse * PER_GROUP_MARGIN)
+                    {
+                        let cand = finish_ma_learn(
+                            stage,
+                            min_symbol,
+                            use_wp,
+                            MA_MAX_LEAVES,
+                            pool,
+                            scratch,
+                        );
+                        let mut candidate = BitWriter::new();
+                        let estimated_savings = write_learned_tree_frame(
+                            &mixed,
+                            alpha.is_some(),
+                            frame_kind,
+                            xsize,
+                            ysize,
+                            GroupLayout::DEFAULT,
+                            min_symbol,
+                            pool,
+                            scratch,
+                            wp_params,
+                            use_wp,
+                            &cand,
+                            local_trees,
+                            &mut candidate,
+                        );
+                        if learned_tree_is_decisive(estimated_savings) {
+                            learned_tree_decisive = true;
+                            rct_planes = None;
+                        }
+                        keep_smaller_writer(&mut best_tree_writer, candidate);
+                    }
+                }
+            }
+        }
+        (layout, learned_tree_decisive, skip_alternatives)
     };
 
-    if learned_tree_decisive {
+    if learned_tree_decisive || skip_alternatives {
         writer.append(
             best_tree_writer
                 .as_ref()
                 .expect("decisive learned-tree candidate"),
         );
-        return true;
+        return learned_tree_decisive;
     }
 
     let gdim = layout.dim();
@@ -1645,8 +1886,8 @@ pub(crate) fn write_patch_dictionary(
         tokens.push(Token::new(REFERENCE_FRAME, reference.ref_frame));
         tokens.push(Token::new(REF_POSITION, reference.atlas_x as u32));
         tokens.push(Token::new(REF_POSITION, reference.atlas_y as u32));
-        tokens.push(Token::new(PATCH_SIZE, (PATCH_TILE - 1) as u32));
-        tokens.push(Token::new(PATCH_SIZE, (PATCH_TILE - 1) as u32));
+        tokens.push(Token::new(PATCH_SIZE, (reference.width - 1) as u32));
+        tokens.push(Token::new(PATCH_SIZE, (reference.height - 1) as u32));
         tokens.push(Token::new(COUNT, (reference.positions.len() - 1) as u32));
         for (i, &(x, y)) in reference.positions.iter().enumerate() {
             if i == 0 {
@@ -1784,7 +2025,7 @@ fn build_context_tree(nb_chans: usize, preds: &[u32], t: &[i32]) -> CtTree {
     }
 }
 
-fn order0_entropy(vals: &[u32], cell: &mut Vec<u64>) -> f32 {
+fn order0_entropy(vals: &[u32], cell: &mut Vec<u64>, entropy_of_hist: EntropyOfHistFn) -> f32 {
     if vals.is_empty() {
         return 0.0;
     }
@@ -1799,15 +2040,7 @@ fn order0_entropy(vals: &[u32], cell: &mut Vec<u64>) -> f32 {
     for &v in vals {
         hist[v as usize] += 1;
     }
-    let total = vals.len() as f32;
-    let mut bits = 0.0;
-    for &c in hist.iter() {
-        if c != 0 {
-            let p = c as f32 / total;
-            bits -= c as f32 * dirty_log2f(p);
-        }
-    }
-    bits
+    entropy_of_hist(hist, vals.len() as u64)
 }
 
 /// Run WP over one channel's group rectangle, returning per-pixel
@@ -1820,33 +2053,63 @@ fn collect_channel(
     wp_params: WpParams,
 ) -> (Vec<u32>, Vec<i64>) {
     let mut wp = WpState::with_params(gw, wp_params);
-    let mut res: Vec<u32> = Vec::with_capacity(gw * gh);
-    let mut prp = Vec::with_capacity(gw * gh);
-    for gy in 0..gh {
-        for gx in 0..gw {
-            let v = get(gx, gy) as i64;
-            let neighbors = predictor_neighbors(&get, gx, gy, gw);
-            let wp_pred = wp.predict(
-                gx,
-                gy,
-                neighbors.top,
-                neighbors.left,
-                neighbors.top_right,
-                neighbors.top_left,
-                neighbors.top_top,
-            );
-            prp.push(wp.wp_prop);
-            let pred = predictor_value(pred_id, neighbors, wp_pred);
-            res.push(pack_signed((v - pred) as i32));
-            wp.update(v, gx, gy);
+    let mut res = vec![0; gw * gh];
+    let mut prp = vec![0; gw * gh];
+    let (mut gx, mut gy) = (0, 0);
+    for (res, prp) in res.iter_mut().zip(&mut prp) {
+        let v = get(gx, gy) as i64;
+        let neighbors = predictor_neighbors(&get, gx, gy, gw);
+        let wp_pred = wp.predict(
+            gx,
+            gy,
+            neighbors.top,
+            neighbors.left,
+            neighbors.top_right,
+            neighbors.top_left,
+            neighbors.top_top,
+        );
+        *prp = wp.wp_prop;
+        let pred = predictor_value(pred_id, neighbors, wp_pred);
+        *res = pack_signed((v - pred) as i32);
+        wp.update(v, gx, gy);
+        // Advance row coordinates without dividing the linear index.
+        gx += 1;
+        if gx == gw {
+            gx = 0;
+            gy += 1;
         }
     }
     (res, prp)
 }
 
-/// Pick the best activity threshold for a channel among candidates, returning
-/// (best_t, best_bucketed_bits, flat_bits).
-fn entropy_of_hist(hist: &[u64], total: u64) -> f32 {
+pub(crate) type EntropyOfHistFn = fn(&[u64], u64) -> f32;
+
+fn select_entropy_of_hist_fn() -> EntropyOfHistFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return |hist, total| unsafe { crate::avx::entropy_of_hist_avx2(hist, total) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |hist, total| unsafe { crate::neon::entropy_of_hist_neon(hist, total) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    {
+        entropy_of_hist_scalar
+    }
+}
+
+/// Resolve CPU dispatch once, then retain the pointer in worker scratch or
+/// predictor-cost storage so histogram loops never check the static guard.
+pub(crate) fn selected_entropy_of_hist_fn() -> EntropyOfHistFn {
+    static ENTROPY_OF_HIST: OnceLock<EntropyOfHistFn> = OnceLock::new();
+    *ENTROPY_OF_HIST.get_or_init(select_entropy_of_hist_fn)
+}
+
+#[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
+fn entropy_of_hist_scalar(hist: &[u64], total: u64) -> f32 {
+    use crate::adaptive_quant::dirty_log2f;
+
     if total == 0 {
         return 0.0;
     }
@@ -1855,7 +2118,7 @@ fn entropy_of_hist(hist: &[u64], total: u64) -> f32 {
     for &c in hist.iter() {
         if c != 0 {
             let p = c as f32 / t;
-            bits -= c as f32 * p.log2();
+            bits -= c as f32 * dirty_log2f(p);
         }
     }
     bits
@@ -1879,7 +2142,8 @@ impl PickThresholdScratch {
 }
 
 fn pick_threshold(res: &[u32], prp: &[i64], scratch: &mut CoderScratch) -> (i32, f32, f32) {
-    let flat = order0_entropy(res, &mut scratch.order0_entropy);
+    let entropy_of_hist = scratch.entropy_of_hist;
+    let flat = order0_entropy(res, &mut scratch.order0_entropy, entropy_of_hist);
     let max = res.iter().copied().max().unwrap_or(0) as usize;
     let (h0, h1, h2) = scratch.threshold.make_scratches(max + 1);
     let mut best_t = 0i32;
@@ -1922,6 +2186,7 @@ fn pick_threshold_grouped(
     channel: usize,
     scratch: &mut CoderScratch,
 ) -> (i32, f32, f32) {
+    let entropy_of_hist = scratch.entropy_of_hist;
     let total: usize = groups.iter().map(|group| group[channel].0.len()).sum();
     if total == 0 {
         return (0, 0.0, 0.0);
@@ -1942,14 +2207,7 @@ fn pick_threshold_grouped(
             flat_hist[residual as usize] += 1;
         }
     }
-    let total_f = total as f32;
-    let mut flat = 0.0;
-    for &count in flat_hist.iter() {
-        if count != 0 {
-            let p = count as f32 / total_f;
-            flat -= count as f32 * dirty_log2f(p);
-        }
-    }
+    let flat = entropy_of_hist(flat_hist, total as u64);
 
     let (h0, h1, h2) = scratch.threshold.make_scratches(max + 1);
     let mut best_t = 0i32;
@@ -2005,6 +2263,14 @@ const MA_TARGET_SAMPLES: usize = 1 << 21;
 /// target, a stride of three is both cheaper and less prone to fitting local
 /// pixel-phase noise than switching abruptly to a full-image sample.
 const MA_FULL_SAMPLE_LIMIT: usize = 1 << 22;
+const MA_FINAL_TARGET_SAMPLES: usize = 1 << 23;
+const MA_FINAL_FULL_SAMPLE_LIMIT: usize = 1 << 24;
+/// The dense final budget applies to sources whose first-stage estimate
+/// costs at least this many bits per value: photos and paintings (2-3 b/v).
+/// Screen and text content (0.3 b/v and below) gets nothing from it — its
+/// gains come from local trees and patches — while a 7.7 MP UI screenshot
+/// would spend 2.5x the CPU and 2.5 GB, and a web render came out 7% larger.
+const DENSE_FINAL_MIN_BITS_PER_VALUE: f64 = 1.0;
 /// First-stage learner budget. Most unhelpful or simple trees terminate here;
 /// only a saturated tree with a clear rate win is retrained on the full probe.
 const MA_COARSE_TARGET_SAMPLES: usize = 1 << 16;
@@ -2013,6 +2279,13 @@ const MA_DEEPEN_MIN_SAVINGS: f64 = 0.02;
 /// Bits a split must save (image domain) before it's kept. Growth is
 /// best-first, so this mostly prunes the tail once the leaf budget is spent.
 const MA_SPLIT_COST_BITS: f32 = 100.0;
+/// Split cost of the final learns. Half the first-stage cost grows trees
+/// that code 0.4-2.2% smaller on nearly every photo, painting and UI screen
+/// (Kodak 24/24, -0.72% in total) for 15-25% more encode time there. Ranking
+/// and coarse learns keep the full cost: their estimates gate candidate
+/// sources and frames, and a text render lost 33% when a lower cost flipped
+/// one of those gates. Below 50 the trees overfit (25: Kodak +9%).
+const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
 /// Leaf cap: pixel contexts + the LZ77 distance context must fit the
 /// LZ77_MAX_CONTEXTS scratch; ANS clustering reduces them to <= 128
 /// histograms. Best-first growth adds exactly one leaf per split, so the cap
@@ -2042,7 +2315,7 @@ struct MaRefPlane<'a> {
 /// and top-left = left on either edge, g the clamped gradient.
 #[inline]
 fn ref_props(refs: &[MaRefPlane<'_>], x: usize, y: usize, p: &mut [i32; NUM_MA_PROPS]) {
-    for (k, r) in refs.iter().take(MA_REF_CHANNELS).enumerate() {
+    for (r, props) in refs.iter().zip(p[16..].as_chunks_mut::<4>().0) {
         let row = &r.pixels[(r.y0 + y) * r.stride + r.x0..];
         let v = row[x] as i64;
         let left = if x > 0 { row[x - 1] as i64 } else { 0 };
@@ -2056,11 +2329,13 @@ fn ref_props(refs: &[MaRefPlane<'_>], x: usize, y: usize, p: &mut [i32; NUM_MA_P
             (left, left)
         };
         let g = (left + top - top_left).clamp(left.min(top), left.max(top));
-        let base = 16 + 4 * k;
-        p[base] = v.abs() as i32;
-        p[base + 1] = v as i32;
-        p[base + 2] = (v - g).abs() as i32;
-        p[base + 3] = (v - g) as i32;
+        let residual = v - g;
+        *props = [
+            v.abs() as i32,
+            v as i32,
+            residual.abs() as i32,
+            residual as i32,
+        ];
     }
 }
 
@@ -2472,18 +2747,16 @@ fn unpack_signed(token: u32) -> i32 {
 /// leaf's residuals does not change its own entropy, but it centres the
 /// distribution, which lets ANS clustering merge leaves by shape rather than
 /// by bias and keeps small residuals inside the hybrid-uint's exact symbols.
-fn leaf_offsets(
+fn leaf_offsets<'a>(
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     num_ctx: u32,
-    samples: &MaSamples,
+    samples: impl Iterator<Item = (&'a [i32; NUM_MA_PROPS], &'a [u8; NUM_MA_PREDS])>,
 ) -> Vec<i32> {
     const BINS: usize = 2 * MA_LEAF_OFFSET_LIMIT as usize + 1;
     let mut hist = vec![[0u32; BINS]; num_ctx as usize];
-    // Every fourth sample: leaves keep >100 samples on average and the
-    // routing pass drops below the noise of the encode time.
     let mut routed = 0u64;
-    for (props, tok) in samples.props.iter().zip(&samples.tok).step_by(4) {
+    for (props, tok) in samples {
         let (node, pred) = tree.lookup(props);
         routed += 1;
         let symbol = tok[pred as usize] as u32;
@@ -2519,8 +2792,8 @@ fn leaf_offsets(
 }
 
 /// Sampling stride for tree learning; odd to avoid column aliasing.
-fn ma_sample_stride(total_px: usize, full_sample_limit: usize) -> usize {
-    let mut stride = total_px.div_ceil(MA_TARGET_SAMPLES).max(1);
+fn ma_sample_stride(total_px: usize, target_samples: usize, full_sample_limit: usize) -> usize {
+    let mut stride = total_px.div_ceil(target_samples).max(1);
     if stride == 1 && total_px > full_sample_limit {
         stride = 3;
     }
@@ -2541,28 +2814,33 @@ fn gate_ma_tree(
     sample_scale: f64,
     samples: Option<&MaSamples>,
 ) -> Option<LearnedCandidate> {
-    let (mut tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
-    let overhead_bits = tree_tokens.len() as f64 * 10.0 + num_ctx as f64 * 200.0;
-    let est_real = tree.est_bits * sample_scale + overhead_bits;
-    let flat_real = tree.flat_bits * sample_scale;
-    if est_real.partial_cmp(&flat_real) != Some(std::cmp::Ordering::Less) {
+    let mut cand = finish_ma_candidate(tree, sample_scale);
+    if cand.est_real.partial_cmp(&cand.flat_real) != Some(std::cmp::Ordering::Less) {
         return None;
     }
-    // Offsets do not affect the token-count gate. Route only accepted trees,
-    // then fill their existing offset tokens in BFS context order.
-    let leaf_offset = match samples {
-        Some(samples) => leaf_offsets(&tree, &leaf_ctx, num_ctx, samples),
-        None => vec![0; num_ctx as usize],
-    };
-    for (token, &offset) in tree_tokens
-        .iter_mut()
-        .filter(|token| token.context == TREE_CTX_OFFSET)
-        .zip(&leaf_offset)
-    {
-        token.value = pack_signed(offset);
+    // Rejected trees do not need the sample-routing pass.
+    if let Some(samples) = samples {
+        cand.set_leaf_offsets(samples.props.iter().zip(&samples.tok).step_by(4));
     }
+    Some(cand)
+}
+
+/// The writable candidate of a learned tree, whatever its estimate: tree
+/// tokens, context ids and leaf offsets.
+fn finish_ma_candidate(tree: LearnedTree, sample_scale: f64) -> LearnedCandidate {
+    let (tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
+    // Contexts are clustered into at most 128 histograms before coding, so
+    // the header grows with the context map (a few bits per context) and
+    // the cluster count, not with every context. Charging 200 bits per
+    // context had a 4095-leaf tree fail its gate on a grainy photo and hand
+    // the frame to the 32-leaf coarse tree (+6%).
+    let overhead_bits =
+        tree_tokens.len() as f64 * 10.0 + (num_ctx.min(128) as f64) * 200.0 + num_ctx as f64 * 8.0;
+    let est_real = tree.est_bits * sample_scale + overhead_bits;
+    let flat_real = tree.flat_bits * sample_scale;
+    let leaf_offset = vec![0; num_ctx as usize];
     let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
-    Some(LearnedCandidate {
+    LearnedCandidate {
         tree,
         tree_tokens,
         leaf_ctx,
@@ -2571,7 +2849,20 @@ fn gate_ma_tree(
         est_real,
         flat_real,
         estimated_savings,
-    })
+    }
+}
+
+/// Parameters of a final learn: `MA_FINAL_SPLIT_COST_BITS`.
+fn ma_learn_params_final(
+    min_symbol: u32,
+    max_leaves: usize,
+    max_candidates: usize,
+    split_scale: f64,
+    use_wp: bool,
+) -> MaLearnParams {
+    let mut params = ma_learn_params(min_symbol, max_leaves, max_candidates, split_scale, use_wp);
+    params.split_cost_bits = MA_FINAL_SPLIT_COST_BITS / split_scale as f32;
+    params
 }
 
 fn ma_learn_params(
@@ -2689,7 +2980,7 @@ fn finish_ma_learn(
     }
     let (deep_tree, samples) = deepen_ma_tree(
         coarse.samples,
-        ma_learn_params(
+        ma_learn_params_final(
             min_symbol,
             max_leaves,
             coarse.max_candidates,
@@ -2708,11 +2999,47 @@ fn finish_ma_learn(
     .unwrap_or(coarse.candidate)
 }
 
-/// Rank the WP presets of `source` by the reduced-leaf learner, starting
+/// Presets are ranked only when the weighted predictor matters to the
+/// first-stage tree: at least this share of its rows reach a WP leaf, or at
+/// least `WP_RANK_MIN_SPLIT_SHARE` of its splits test the WP-error property
+/// (the preset shapes that property too: a line-art image splitting on it in
+/// 20% of nodes lost 0.4% without the ranking). Text and UI trees do neither
+/// (0-4% of rows, no such splits; photos route 27-75% of rows), and there the
+/// other presets never changed the frame beyond a few bytes while their
+/// sampling walks were a quarter to a third of the encode.
+const WP_RANK_MIN_ROW_SHARE: f64 = 0.02;
+const WP_RANK_MIN_SPLIT_SHARE: f64 = 0.15;
+
+/// Whether the WP preset can matter to `stage`'s tree (see the gate above;
+/// every 16th row is routed, so the row share is a gate, not a rate).
+fn wp_matters(stage: &CoarseLearn) -> bool {
+    let tree = &stage.candidate.tree;
+    let (mut splits, mut wp_splits) = (0usize, 0usize);
+    for node in &tree.nodes {
+        if let crate::ma_tree::MaNode::Split { prop, .. } = node {
+            splits += 1;
+            wp_splits += usize::from(*prop as usize == PROP_WP as usize);
+        }
+    }
+    if wp_splits as f64 >= WP_RANK_MIN_SPLIT_SHARE * splits as f64 && wp_splits > 0 {
+        return true;
+    }
+    let mut rows = 0usize;
+    let mut wp_rows = 0usize;
+    for props in stage.samples.props.iter().step_by(16) {
+        rows += 1;
+        if tree.lookup(props).1 as usize == crate::ma_tree::PRED_WEIGHTED {
+            wp_rows += 1;
+        }
+    }
+    wp_rows as f64 >= WP_RANK_MIN_ROW_SHARE * rows as f64
+}
+
+/// Rank the WP presets of `source` by their first-stage learns, starting
 /// from `first` (already learned under `first_params`), the rest in order
-/// of how often they win, each deepened only when its first stage is within
-/// `RANK_COARSE_PRUNE` of the best seen. Returns (best bits, best coarse
-/// bits, preset, the winner's learn as a seed).
+/// of how often they win; a preset trailing the best first stage seen by
+/// more than `RANK_COARSE_PRUNE` is dropped. Returns (best bits, best coarse
+/// bits, preset).
 #[allow(clippy::too_many_arguments)]
 fn rank_presets(
     source: &MaSource<'_>,
@@ -2725,13 +3052,12 @@ fn rank_presets(
     header_bits: &dyn Fn(WpParams) -> f64,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> (f64, f64, WpParams, Option<RankedLearn>) {
+) -> (f64, f64, WpParams) {
     let mut best_bits = f64::INFINITY;
     let mut best_coarse = f64::INFINITY;
     let mut best_params = first_params;
-    let mut seed = None;
     let mut order: Vec<WpParams> = vec![first_params];
-    if use_wp {
+    if use_wp && first.as_ref().is_none_or(wp_matters) {
         for &preset in [1usize, 2, 3, 0].iter().map(|&i| &WpParams::PRESETS[i]) {
             if preset != first_params {
                 order.push(preset);
@@ -2754,58 +3080,13 @@ fn rank_presets(
             continue;
         }
         best_coarse = best_coarse.min(coarse);
-        let (bits, ranked) = rank_finish(stage, min_symbol, use_wp, pool, scratch);
-        let bits = bits + header_bits(preset);
+        let bits = rank_bits(&stage) + header_bits(preset);
         if bits < best_bits {
             best_bits = bits;
             best_params = preset;
-            seed = Some(ranked);
         }
     }
-    (best_bits, best_coarse, best_params, seed)
-}
-
-/// A ranking learn kept alive for the winner: its reduced-leaf tree seeds the
-/// final learn, which then only grows from `MA_RANK_LEAVES` to the full
-/// budget on the same (already compacted) sample set.
-struct RankedLearn {
-    candidate: LearnedCandidate,
-    samples: MaSamples,
-    stride: usize,
-    max_candidates: usize,
-    leaf_offsets: bool,
-    coarse_est: f64,
-}
-
-impl RankedLearn {
-    /// Continue best-first growth to the full leaf budget.
-    fn finish(
-        self,
-        min_symbol: u32,
-        use_wp: bool,
-        pool: &ThreadPool,
-        scratch: &mut CoderScratch,
-    ) -> LearnedCandidate {
-        let (tree, samples) = deepen_ma_tree(
-            self.samples,
-            ma_learn_params(
-                min_symbol,
-                MA_MAX_LEAVES,
-                self.max_candidates,
-                self.stride as f64,
-                use_wp,
-            ),
-            self.candidate.tree.clone(),
-            pool,
-            scratch,
-        );
-        gate_ma_tree(
-            tree,
-            self.stride as f64,
-            self.leaf_offsets.then_some(&samples),
-        )
-        .unwrap_or(self.candidate)
-    }
+    (best_bits, best_coarse, best_params)
 }
 
 /// A gated learned tree with its BFS emission and rate estimate.
@@ -2822,6 +3103,24 @@ struct LearnedCandidate {
     flat_real: f64,
     /// Estimated fractional saving over the flat path.
     estimated_savings: f64,
+}
+
+impl LearnedCandidate {
+    /// Fill offset tokens in BFS context order from the retained offset sample.
+    fn set_leaf_offsets<'a>(
+        &mut self,
+        samples: impl Iterator<Item = (&'a [i32; NUM_MA_PROPS], &'a [u8; NUM_MA_PREDS])>,
+    ) {
+        self.leaf_offset = leaf_offsets(&self.tree, &self.leaf_ctx, self.num_ctx, samples);
+        for (token, &offset) in self
+            .tree_tokens
+            .iter_mut()
+            .filter(|token| token.context == TREE_CTX_OFFSET)
+            .zip(&self.leaf_offset)
+        {
+            token.value = pack_signed(offset);
+        }
+    }
 }
 
 /// One modular channel as the learner and tokenizer see it.
@@ -2875,6 +3174,18 @@ enum MaTransform {
 struct MaSource<'a> {
     channels: Vec<MaChannel<'a>>,
     transform: MaTransform,
+    /// Per-AC-group channel overrides: a group whose entry is `Some` codes
+    /// those channels (a group-local Palette transform declared in its own
+    /// GroupHeader) instead of crops of `channels`. Empty means none.
+    group_channels: Vec<Option<MaGroupChannels<'a>>>,
+}
+
+/// One AC group's own channels: the palette meta-channel followed by the
+/// index channel, as the decoder reads them after that group's transform.
+struct MaGroupChannels<'a> {
+    channels: Vec<MaChannel<'a>>,
+    nb_colors: u32,
+    num_c: u32,
 }
 
 /// Quant tables reserved in the decoder's modular stream numbering
@@ -2903,6 +3214,18 @@ impl MaSource<'_> {
         match self.transform {
             MaTransform::Palette { .. } => MA_PALETTE_CANDIDATES,
             MaTransform::Rct(_) => MA_PHOTO_CANDIDATES,
+        }
+    }
+
+    /// How far the run-token estimate may trail literals before the deep
+    /// LZ77 matcher is skipped (see `LZ_DEEP_MATCHER_MAX_RATIO_RCT`); any
+    /// palette index stream, global or per group, keeps the wide margin.
+    fn deep_lz_max_ratio(&self) -> f64 {
+        match self.transform {
+            MaTransform::Rct(_) if self.group_channels.iter().all(Option::is_none) => {
+                LZ_DEEP_MATCHER_MAX_RATIO_RCT
+            }
+            _ => LZ_DEEP_MATCHER_MAX_RATIO_PALETTE,
         }
     }
 
@@ -2953,6 +3276,27 @@ impl MaSource<'_> {
         self.channels.iter().map(|c| c.w * c.h).sum()
     }
 
+    /// The override of AC group `group_index`, if it has one.
+    fn group_override(&self, group_index: usize) -> Option<&MaGroupChannels<'_>> {
+        self.group_channels
+            .get(group_index)
+            .and_then(Option::as_ref)
+    }
+
+    /// The channel a job or placement refers to: an override's own channel
+    /// when `group_override` is set, else one of the source's channels.
+    fn channel_at(&self, group_override: Option<usize>, channel: usize) -> &MaChannel<'_> {
+        match group_override {
+            Some(group_index) => {
+                &self
+                    .group_override(group_index)
+                    .expect("override group")
+                    .channels[channel]
+            }
+            None => &self.channels[channel],
+        }
+    }
+
     /// The reference planes of placement `p`'s channel: earlier channels of
     /// the same stream and size, most recent first, cropped at (x0, y0).
     fn ref_planes(
@@ -2984,6 +3328,44 @@ impl MaSource<'_> {
             .take(MA_REF_CHANNELS)
             .collect()
     }
+}
+
+/// The YCoCg(A) planes with per-group Palette transforms where a group's
+/// color count allows one. Groups without a palette code the planes
+/// directly, so the frame keeps its RCT and one learned tree serves both.
+fn mixed_ma_source<'a>(
+    ycocg: &'a Image3Si,
+    alpha: Option<&'a AlphaPlane>,
+    xsize: usize,
+    palettes: &'a [Option<palette::LocalPaletteGroup>],
+) -> MaSource<'a> {
+    let mut source = rgb_ma_source(ycocg, alpha, xsize, 6);
+    source.group_channels = palettes
+        .iter()
+        .map(|palette| {
+            let palette = palette.as_ref()?;
+            let num_c = palette.palette.len() / palette.nb_colors;
+            Some(MaGroupChannels {
+                channels: vec![
+                    MaChannel {
+                        w: palette.nb_colors,
+                        h: num_c,
+                        meta: true,
+                        pixels: MaPixels::I32(&palette.palette),
+                    },
+                    MaChannel {
+                        w: palette.w,
+                        h: palette.h,
+                        meta: false,
+                        pixels: MaPixels::U16(&palette.indices),
+                    },
+                ],
+                nb_colors: palette.nb_colors as u32,
+                num_c: num_c as u32,
+            })
+        })
+        .collect();
+    source
 }
 
 /// The YCoCg(A) planes as a learned-tree source.
@@ -3020,11 +3402,36 @@ fn rgb_ma_source<'a>(
     MaSource {
         channels,
         transform: MaTransform::Rct(rct_type),
+        group_channels: Vec::new(),
     }
 }
 
 /// Below this covered-area fraction the patched alternative is not encoded.
 const PATCH_MIN_COVERAGE: f64 = 0.05;
+/// A palette candidate whose first complete layout trails the RGB frame's
+/// final estimate by more than `PALETTE_FINAL_MARGIN` times this does not
+/// learn its 256-px layout (worth ~4% on palette graphics, nothing on the
+/// UI screens where the palette loses anyway).
+const PALETTE_LAYOUT_MARGIN: f64 = 1.04;
+/// Below this many values (pixels x channels) the WP-preset and RCT
+/// runner-up rankings are skipped: each is a complete learn of the image
+/// (20-35 ms single-threaded for a 128x128 icon coded in under a kilobyte),
+/// six to eight of them were most of a small icon's encode time, and their
+/// absolute gain on such files is a few bytes.
+const RANK_MIN_VALUES: usize = 1 << 19;
+/// RGB sources above this many values (pixels x channels) learn only the
+/// 1024-px group layout; see the layout selection.
+const RGB_SINGLE_LAYOUT_MIN_VALUES: usize = 1 << 20;
+
+fn source_values_of(xsize: usize, ysize: usize, nb_chans: usize) -> usize {
+    xsize * ysize * nb_chans
+}
+/// A per-group-palette first stage is grown into a complete frame only when
+/// it already beats the best source's own first stage. The bottom of the
+/// range separates cleanly (a winning plan lands at 0.75); the top does not
+/// (losers at 1.019 and 1.022 with a 1.65% winner between them at 1.023), so
+/// the strict bar gives up that small win to spare the losers a full encode.
+const PER_GROUP_MARGIN: f64 = 1.0;
 
 /// Sample every stream of `source` under `layout` (group-local coordinates
 /// and a fresh WP state per group, exactly as the decoder will see them) and
@@ -3040,6 +3447,7 @@ fn learn_ma_candidate(
     wp_params: WpParams,
     use_wp: bool,
     max_leaves: usize,
+    target_samples: usize,
     full_sample_limit: usize,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -3049,7 +3457,7 @@ fn learn_ma_candidate(
     let num_groups = xsize_groups * ysize.div_ceil(gdim);
     let placement = source.placement(layout, num_groups == 1);
     let max_candidates = source.max_candidates();
-    let stride = ma_sample_stride(source.total_values(), full_sample_limit);
+    let stride = ma_sample_stride(source.total_values(), target_samples, full_sample_limit);
 
     // Sampling jobs: global streams first, then group-major / channel-minor.
     struct Job<'a> {
@@ -3057,6 +3465,7 @@ fn learn_ma_candidate(
         chan_id: u32,
         stream: i32,
         refs: Vec<MaRefPlane<'a>>,
+        group_override: Option<usize>,
         x0: usize,
         y0: usize,
         w: usize,
@@ -3071,6 +3480,7 @@ fn learn_ma_candidate(
             chan_id: p.chan_id,
             stream: 0,
             refs: source.ref_planes(&placement, p, 0, 0),
+            group_override: None,
             x0: 0,
             y0: 0,
             w: ch.w,
@@ -3081,6 +3491,25 @@ fn learn_ma_candidate(
         for group_index in 0..num_groups {
             let x0 = (group_index % xsize_groups) * gdim;
             let y0 = (group_index / xsize_groups) * gdim;
+            if let Some(over) = source.group_override(group_index) {
+                // A palettised group codes its own channels whole; reference
+                // properties would compare a color table with an index
+                // plane, so it has none.
+                for (channel, ch) in over.channels.iter().enumerate() {
+                    jobs.push(Job {
+                        channel,
+                        chan_id: channel as u32,
+                        stream: ac_stream_id(num_dc_groups, group_index),
+                        refs: Vec::new(),
+                        group_override: Some(group_index),
+                        x0: 0,
+                        y0: 0,
+                        w: ch.w,
+                        h: ch.h,
+                    });
+                }
+                continue;
+            }
             for p in placement.iter().filter(|p| !p.global) {
                 let ch = &source.channels[p.channel];
                 jobs.push(Job {
@@ -3088,6 +3517,7 @@ fn learn_ma_candidate(
                     chan_id: p.chan_id,
                     stream: ac_stream_id(num_dc_groups, group_index),
                     refs: source.ref_planes(&placement, p, x0, y0),
+                    group_override: None,
                     x0,
                     y0,
                     w: gdim.min(ch.w - x0),
@@ -3119,7 +3549,7 @@ fn learn_ma_candidate(
     }
     pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
         let job = &jobs[i];
-        let ch = &source.channels[job.channel];
+        let ch = source.channel_at(job.group_override, job.channel);
         let mut rows = range.0.iter_mut().zip(range.1.iter_mut());
         with_ma_pixels!(ch, |pixels| sample_channel_ma(
             |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
@@ -3152,19 +3582,24 @@ fn learn_ma_candidate(
     )
 }
 
-/// Leaf budget of the ranking learner that scores WP presets and the RCT
-/// runner-up: 96 leaves rank exactly like 128 on Kodak.
-const MA_RANK_LEAVES: usize = 96;
+/// Leaf budget of the ranking learns: the first-stage budget, also for
+/// sample sets small enough to be learned directly (at most
+/// `MA_COARSE_TARGET_SAMPLES` rows, i.e. images under ~20k pixels), where a
+/// 96-leaf learn per preset and candidate was most of a small icon's encode
+/// time (a 128x128 icon: 0.21 s single-threaded, 0.14 s of it ranking).
+const MA_RANK_LEAVES: usize = MA_COARSE_MAX_LEAVES;
 /// The estimator's RCT runner-up is scored by the ranking learner when its
 /// estimated cost is within this factor of the best.
 const RCT_RANK_MARGIN: f32 = 1.02;
 
-/// Sampling budget of the ranking learners. It must match the final learn's:
-/// the best preset for a stride-3 learner is not the best for a stride-1
-/// learner.
+/// Sampling budget of the ranking learns: the final learn's. Their 32-leaf
+/// first stage only sees `MA_COARSE_TARGET_SAMPLES` evenly spaced rows of
+/// the set, yet sampling just twice that many rows at a wider stride
+/// mis-ranked presets on a third of Kodak (+0.22% overall, k01 +1.3%): the
+/// preset margins are 0.3-0.6% and need the denser set's row phases.
 const MA_RANK_SAMPLE_LIMIT: usize = MA_FULL_SAMPLE_LIMIT;
 /// A ranking candidate whose 32-leaf coarse estimate trails the best coarse
-/// estimate seen so far by more than this is not deepened.
+/// estimate seen so far by more than this is not scored further.
 const RANK_COARSE_PRUNE: f64 = 1.005;
 
 /// First ranking stage of `source`: its coarse learn under the 1024-px
@@ -3189,66 +3624,27 @@ fn rank_coarse(
         wp_params,
         use_wp,
         MA_RANK_LEAVES,
+        MA_TARGET_SAMPLES,
         MA_RANK_SAMPLE_LIMIT,
         pool,
         scratch,
     )
 }
 
-/// Second ranking stage: deepen to the ranking leaf budget and return the
-/// estimated bits (the flat alternatives when the tree does not qualify)
-/// with to learn itself, so the winner can seed the final learn.
-fn rank_finish(
-    stage: CoarseLearn,
-    min_symbol: u32,
-    use_wp: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-) -> (f64, RankedLearn) {
-    let coarse_est = stage.candidate.est_real;
-    let flat = stage.candidate.flat_real;
-    let stride = stage.stride;
-    let max_candidates = stage.max_candidates;
-    let leaf_offsets = stage.leaf_offsets;
-    let (candidate, samples) = if stage.deepen {
-        let (tree, samples) = deepen_ma_tree(
-            stage.samples,
-            ma_learn_params(
-                min_symbol,
-                MA_RANK_LEAVES,
-                max_candidates,
-                stride as f64,
-                use_wp,
-            ),
-            stage.candidate.tree.clone(),
-            pool,
-            scratch,
-        );
-        (
-            gate_ma_tree(tree, stride as f64, None).unwrap_or(stage.candidate),
-            samples,
-        )
-    } else {
-        (stage.candidate, stage.samples)
-    };
-    let bits = candidate.est_real.min(flat);
-    (
-        bits,
-        RankedLearn {
-            candidate,
-            samples,
-            stride,
-            max_candidates,
-            leaf_offsets,
-            coarse_est,
-        },
-    )
+/// Estimated bits of a ranking learn: its first stage, or the flat
+/// alternative when the tree does not qualify. Deepening the ranking learns
+/// to 96 leaves first ranked no better than the 32-leaf stage (Kodak
+/// +0.003%, a UI screenshot −2.0%) and cost a quarter of the encode.
+fn rank_bits(stage: &CoarseLearn) -> f64 {
+    stage.candidate.est_real.min(stage.candidate.flat_real)
 }
 
 /// First learning stage under every layout, second stage for the preferred
 /// (first) layout and for any later layout whose first stage already
 /// estimates smaller; the full estimates pick the winner. Layouts are
-/// processed one at a time so a single sample set is alive.
+/// processed one at a time so a single sample set is alive. `coarse_limit`
+/// prunes a source by its first stage, `final_limit` by its first complete
+/// layout.
 #[allow(clippy::too_many_arguments)]
 fn learn_best_layout(
     source: &MaSource<'_>,
@@ -3259,23 +3655,23 @@ fn learn_best_layout(
     wp_params: WpParams,
     use_wp: bool,
     coarse_limit: f64,
+    final_limit: f64,
     deepen_all: bool,
-    seed: Option<RankedLearn>,
+    sampling: (usize, usize),
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<(GroupLayout, LearnedCandidate, f64)> {
     let mut best_coarse_est = f64::INFINITY;
     let mut learned: Option<(GroupLayout, LearnedCandidate)> = None;
-    let mut seed = seed;
     for (index, &layout) in layouts.iter().enumerate() {
-        // The ranking winner already sampled and partly grew the first layout.
-        if index == 0
-            && let Some(ranked) = seed.take()
+        // A source whose complete first layout already trails `final_limit`
+        // cannot be written (the palette candidate against the RGB frame's
+        // final estimate); its other layouts are not learned.
+        if index > 0
+            && let Some((_, best)) = &learned
+            && best.est_real > final_limit
         {
-            best_coarse_est = ranked.coarse_est;
-            let cand = ranked.finish(min_symbol, use_wp, pool, scratch);
-            learned = Some((layout, cand));
-            continue;
+            break;
         }
         let Some(stage) = learn_ma_candidate(
             source,
@@ -3286,7 +3682,8 @@ fn learn_best_layout(
             wp_params,
             use_wp,
             MA_MAX_LEAVES,
-            MA_FULL_SAMPLE_LIMIT,
+            sampling.0,
+            sampling.1,
             pool,
             scratch,
         ) else {
@@ -3337,6 +3734,7 @@ macro_rules! with_raw_streams {
 fn write_learned_tree_frame(
     source: &MaSource<'_>,
     has_alpha: bool,
+    frame_kind: ModularFrameKind<'_>,
     xsize: usize,
     ysize: usize,
     layout: GroupLayout,
@@ -3346,6 +3744,7 @@ fn write_learned_tree_frame(
     wp_params: WpParams,
     use_wp: bool,
     cand: &LearnedCandidate,
+    local_trees: bool,
     writer: &mut BitWriter,
 ) -> f64 {
     let gdim = layout.dim();
@@ -3355,14 +3754,8 @@ fn write_learned_tree_frame(
     let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
     let single_group = num_ac_groups == 1;
     let placement = source.placement(layout, single_group);
-    let tree = &cand.tree;
-    let leaf_ctx = &cand.leaf_ctx;
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
-    // Placement is in source-channel order; its channel ids already account
-    // for the independent global and group streams (including palettes).
-    // The compiled lookup folds the channel and stream ids, so it is built
-    // per (channel, stream): cheap next to tokenizing the stream itself.
     let tokenize = |p: &MaPlacement,
                     stream: i32,
                     x0: usize,
@@ -3370,25 +3763,23 @@ fn write_learned_tree_frame(
                     w: usize,
                     h: usize,
                     out: &mut RawTokens| {
-        let ch = &source.channels[p.channel];
-        let lookup = MaLookup::new(tree, leaf_ctx, p.chan_id, stream);
-        let refs = source.ref_planes(&placement, p, x0, y0);
-        with_ma_pixels!(ch, |pixels| tokenize_channel_ma(
-            |y| &pixels[(y0 + y) * ch.w + x0..][..w],
-            w,
-            h,
-            p.chan_id,
-            stream,
-            &refs,
-            wp_params,
-            use_wp,
-            &lookup,
-            &cand.leaf_offset,
-            out,
-        ));
+        tokenize_ma_rect(
+            source, &placement, p, stream, x0, y0, w, h, cand, wp_params, use_wp, out,
+        );
     };
 
-    write_frame_header_modular(has_alpha, layout, writer);
+    write_frame_header_modular_kind(has_alpha, frame_kind, layout, writer);
+    // A patched frame's dictionary opens its first section, before the
+    // dequant/tree bits, exactly as on the flat path.
+    let dictionary: Option<BitWriter> = match frame_kind {
+        ModularFrameKind::Patched(references) => {
+            let mut w = BitWriter::new();
+            write_patch_dictionary(references, has_alpha, scratch, &mut w);
+            Some(w)
+        }
+        _ => None,
+    };
+    let dictionary = dictionary.as_ref();
 
     if single_group {
         let channel_tokens = pool.steal_map(scratch, placement.len(), |i, _scratch| {
@@ -3409,6 +3800,7 @@ fn write_learned_tree_frame(
                 distance_ctx,
                 num_ctx as usize + 1,
                 min_symbol,
+                source.deep_lz_max_ratio(),
                 pool,
                 scratch,
             );
@@ -3424,6 +3816,7 @@ fn write_learned_tree_frame(
                             cand,
                             min_symbol,
                             wp_params,
+                            dictionary,
                             pool,
                             scratch,
                             &mut best,
@@ -3438,6 +3831,7 @@ fn write_learned_tree_frame(
                             cand,
                             min_symbol,
                             wp_params,
+                            dictionary,
                             pool,
                             scratch,
                             &mut best,
@@ -3474,6 +3868,22 @@ fn write_learned_tree_frame(
         |group_index, _scratch| {
             let x0 = (group_index % xsize_groups) * gdim;
             let y0 = (group_index / xsize_groups) * gdim;
+            if let Some(over) = source.group_override(group_index) {
+                let num_values = over.channels.iter().map(|ch| ch.w * ch.h).sum();
+                let mut toks = RawTokens::with_capacity(num_values);
+                for (chan_id, ch) in over.channels.iter().enumerate() {
+                    tokenize_ma_group_channel(
+                        ch,
+                        chan_id as u32,
+                        ac_stream_id(num_dc_groups, group_index),
+                        cand,
+                        wp_params,
+                        use_wp,
+                        &mut toks,
+                    );
+                }
+                return toks;
+            }
             let num_values = group_placement
                 .iter()
                 .map(|p| {
@@ -3509,6 +3919,7 @@ fn write_learned_tree_frame(
             distance_ctx,
             num_ctx as usize + 1,
             min_symbol,
+            source.deep_lz_max_ratio(),
             pool,
             scratch,
         );
@@ -3529,6 +3940,7 @@ fn write_learned_tree_frame(
                         num_ac_groups,
                         num_dc_groups,
                         has_global_stream,
+                        dictionary,
                         &mut best,
                         &mut best_bits,
                         &mut best_estimate,
@@ -3546,6 +3958,7 @@ fn write_learned_tree_frame(
                         num_ac_groups,
                         num_dc_groups,
                         has_global_stream,
+                        dictionary,
                         &mut best,
                         &mut best_bits,
                         &mut best_estimate,
@@ -3555,6 +3968,34 @@ fn write_learned_tree_frame(
         }
         best.expect("learned-tree sections")
     });
+
+    // Local per-group trees (libjxl's streaming layout) compete on size.
+    let local_gate = local_trees
+        && cand.num_ctx as usize >= LOCAL_TREE_MIN_GLOBAL_LEAVES
+        && cand.est_real <= LOCAL_TREE_MAX_BITS_PER_VALUE * source.total_values() as f64;
+    if !has_global_stream
+        && local_gate
+        && let Some(local) = write_local_tree_sections(
+            source,
+            &placement,
+            xsize,
+            ysize,
+            layout,
+            num_dc_groups,
+            min_symbol,
+            wp_params,
+            use_wp,
+            dictionary,
+            pool,
+            scratch,
+        )
+    {
+        let global_bits: usize = sections.iter().map(BitWriter::bits_written).sum();
+        let local_bits: usize = local.iter().map(BitWriter::bits_written).sum();
+        if local_bits < global_bits {
+            sections = local;
+        }
+    }
 
     writer.write(1, 0);
     writer.zero_pad_to_byte();
@@ -3567,6 +4008,444 @@ fn write_learned_tree_frame(
     cand.estimated_savings
 }
 
+/// Tokenize the `w` x `h` rectangle at (`x0`, `y0`) of placement `p`'s
+/// channel through `cand`'s tree. Placement is in source-channel order; its
+/// channel ids already account for the independent global and group streams
+/// (including palettes). The compiled lookup folds the channel and stream
+/// ids, so it is built per (channel, stream): cheap next to tokenizing the
+/// stream itself.
+/// Tokenize one palettised group's own channel (whole channel, no reference
+/// properties, channel ids numbered inside that group's stream).
+#[allow(clippy::too_many_arguments)]
+fn tokenize_ma_group_channel(
+    ch: &MaChannel<'_>,
+    chan_id: u32,
+    stream: i32,
+    cand: &LearnedCandidate,
+    wp_params: WpParams,
+    use_wp: bool,
+    out: &mut RawTokens,
+) {
+    let lookup = MaLookup::new(&cand.tree, &cand.leaf_ctx, chan_id, stream);
+    with_ma_pixels!(ch, |pixels| tokenize_channel_ma(
+        |y| &pixels[y * ch.w..][..ch.w],
+        ch.w,
+        ch.h,
+        chan_id,
+        stream,
+        &[],
+        wp_params,
+        use_wp,
+        &lookup,
+        &cand.leaf_offset,
+        out,
+    ));
+}
+
+fn tokenize_ma_rect(
+    source: &MaSource<'_>,
+    placement: &[MaPlacement],
+    p: &MaPlacement,
+    stream: i32,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    cand: &LearnedCandidate,
+    wp_params: WpParams,
+    use_wp: bool,
+    out: &mut RawTokens,
+) {
+    let ch = &source.channels[p.channel];
+    let lookup = MaLookup::new(&cand.tree, &cand.leaf_ctx, p.chan_id, stream);
+    let refs = source.ref_planes(placement, p, x0, y0);
+    with_ma_pixels!(ch, |pixels| tokenize_channel_ma(
+        |y| &pixels[(y0 + y) * ch.w + x0..][..w],
+        w,
+        h,
+        p.chan_id,
+        stream,
+        &refs,
+        wp_params,
+        use_wp,
+        &lookup,
+        &cand.leaf_offset,
+        out,
+    ));
+}
+
+/// Samples the local learner draws per group (a full 1024-px RGB group is
+/// sampled at stride 3, a 256-px one fully). Denser than the global learn:
+/// the payoff of local trees is finding more of the near-deterministic
+/// contexts of text and graphics, which the global stride starves (the IDE
+/// screenshot: local trees at the global stride are neutral, at stride 7
+/// −4%, at stride 3 −8%; the deterministic-node shortcut in the learner
+/// keeps the dense learn affordable).
+const LOCAL_TREE_TARGET_SAMPLES: usize = 1 << 20;
+/// Groups learned concurrently; each lane holds one group's samples
+/// (~110 B per sample, ~115 MiB at the sample target). Beyond four lanes the
+/// learners' own row-chunk and per-property parallelism already occupy the
+/// workers.
+const LOCAL_TREE_LEARN_LANES: usize = 4;
+/// Local trees are tried when the global tree grew to at least half its
+/// leaf budget and still codes the frame under `LOCAL_TREE_MAX_BITS_PER_VALUE`
+/// bits per value: many contexts, most of them near-deterministic, is the
+/// profile that keeps gaining from denser sampling (IDE screenshot 0.30 b/v
+/// at 4095 leaves: −8%, its patched frame 0.27 b/v at 3773 leaves; a
+/// Buddhabrot render 0.74: −1%; photos 2.2–2.8: −1..0%; a mostly flat
+/// screenshot at 743 leaves: +0.6%; every attempt costs ~2× encode time).
+const LOCAL_TREE_MIN_GLOBAL_LEAVES: usize = MA_MAX_LEAVES / 2;
+const LOCAL_TREE_MAX_BITS_PER_VALUE: f64 = 0.5;
+
+/// Local per-group learned trees: every AC group section carries its own
+/// tree, histograms and context map (`use_global_tree = 0`), learned from
+/// that group's pixels alone, and the DC-global section declares no tree.
+/// This is libjxl's streaming layout for large images. Groups with distinct
+/// content (code text next to UI chrome) each get a full leaf budget and
+/// their own cluster budget without spending splits on the stream id, and
+/// each is learned from a denser sample of its own pixels
+/// (`LOCAL_TREE_TARGET_SAMPLES`), which is where the gain comes from: at the
+/// global learn's stride local trees are neutral. Every group picks literal
+/// or LZ77 tokens on its own code. Returns the sections in codestream
+/// order, or `None` when the source has a global stream.
+#[allow(clippy::too_many_arguments)]
+fn write_local_tree_sections(
+    source: &MaSource<'_>,
+    placement: &[MaPlacement],
+    xsize: usize,
+    ysize: usize,
+    layout: GroupLayout,
+    num_dc_groups: usize,
+    min_symbol: u32,
+    wp_params: WpParams,
+    use_wp: bool,
+    dictionary: Option<&BitWriter>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<Vec<BitWriter>> {
+    let gdim = layout.dim();
+    let xsize_groups = xsize.div_ceil(gdim);
+    let ysize_groups = ysize.div_ceil(gdim);
+    let num_ac_groups = xsize_groups * ysize_groups;
+    if num_ac_groups < 2 || placement.iter().any(|p| p.global) {
+        return None;
+    }
+    let target = LOCAL_TREE_TARGET_SAMPLES;
+    let max_candidates = source.max_candidates();
+    let leaf_offsets = matches!(source.transform, MaTransform::Rct(_));
+    let group_rect = |group_index: usize| {
+        let x0 = (group_index % xsize_groups) * gdim;
+        let y0 = (group_index / xsize_groups) * gdim;
+        (x0, y0)
+    };
+
+    // Sample and learn each group in its own lane (the learner also
+    // parallelizes inside); a lane holds one group's sample set at a time.
+    let cands: Vec<LearnedCandidate> = pool.steal_map_with_threads(
+        scratch,
+        num_ac_groups,
+        LOCAL_TREE_LEARN_LANES,
+        |group_index, scratch| {
+            let (x0, y0) = group_rect(group_index);
+            let stream = ac_stream_id(num_dc_groups, group_index);
+            let group_values: usize = placement
+                .iter()
+                .map(|p| {
+                    let ch = &source.channels[p.channel];
+                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                })
+                .sum();
+            let mut stride = group_values.div_ceil(target).max(1);
+            if stride > 1 && stride.is_multiple_of(2) {
+                stride += 1;
+            }
+            let capacity = placement
+                .iter()
+                .map(|p| {
+                    let ch = &source.channels[p.channel];
+                    ma_channel_sample_count(gdim.min(ch.w - x0), gdim.min(ch.h - y0), stride)
+                })
+                .sum();
+            let mut samples = MaSamples::with_capacity(capacity);
+            for p in placement {
+                let ch = &source.channels[p.channel];
+                let gw = gdim.min(ch.w - x0);
+                let gh = gdim.min(ch.h - y0);
+                let refs = source.ref_planes(placement, p, x0, y0);
+                with_ma_pixels!(ch, |pixels| sample_channel_ma(
+                    |y| &pixels[(y0 + y) * ch.w + x0..][..gw],
+                    gw,
+                    gh,
+                    p.chan_id,
+                    stream,
+                    &refs,
+                    wp_params,
+                    use_wp,
+                    stride,
+                    |props, tok| {
+                        samples.props.push(props);
+                        samples.tok.push(tok);
+                    },
+                ));
+            }
+            // Too few samples to learn from: the root alone (one predictor).
+            let max_leaves = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
+                1
+            } else {
+                MA_MAX_LEAVES
+            };
+            // Offsets inspect every fourth row in the original order. Keep
+            // only those rows; the dense learner can partition the full set
+            // in place instead of allocating a second full set and indices.
+            let offsets = (leaf_offsets && max_leaves > 1).then(|| MaSamples {
+                props: samples.props.iter().step_by(4).copied().collect(),
+                tok: samples.tok.iter().step_by(4).copied().collect(),
+            });
+            let tree = learn_ma_tree_in_place(
+                &mut samples,
+                ma_learn_params(
+                    min_symbol,
+                    max_leaves,
+                    max_candidates,
+                    stride as f64,
+                    use_wp,
+                ),
+                pool,
+                scratch,
+            );
+            drop(samples);
+            let mut cand = finish_ma_candidate(tree, stride as f64);
+            if let Some(offsets) = offsets {
+                cand.set_leaf_offsets(offsets.props.iter().zip(&offsets.tok));
+            }
+            cand
+        },
+    );
+
+    // Tokenize every group through its own tree, then code each group on
+    // its own histograms. Retain raw tokens only for active coding lanes.
+    let cands_ref = &cands;
+    let deep_lz_max_ratio = source.deep_lz_max_ratio();
+    let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+    let group_sections: Vec<BitWriter> = pool.steal_map_with_threads(
+        scratch,
+        num_ac_groups,
+        group_lz_threads(crate::Speed::Slow, pool),
+        |group_index, scratch| {
+            let (x0, y0) = group_rect(group_index);
+            let num_values = placement
+                .iter()
+                .map(|p| {
+                    let ch = &source.channels[p.channel];
+                    gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
+                })
+                .sum();
+            let mut toks = RawTokens::with_capacity(num_values);
+            for p in placement {
+                let ch = &source.channels[p.channel];
+                tokenize_ma_rect(
+                    source,
+                    placement,
+                    p,
+                    ac_stream_id(num_dc_groups, group_index),
+                    x0,
+                    y0,
+                    gdim.min(ch.w - x0),
+                    gdim.min(ch.h - y0),
+                    &cands_ref[group_index],
+                    wp_params,
+                    use_wp,
+                    &mut toks,
+                );
+            }
+            let cand = &cands_ref[group_index];
+            match &toks {
+                RawTokens::Compact(tokens) => write_local_tree_group(
+                    tokens,
+                    cand,
+                    min_symbol,
+                    wp_params,
+                    deep_lz_max_ratio,
+                    &deep_lz,
+                    scratch,
+                ),
+                RawTokens::Wide(tokens) => write_local_tree_group(
+                    tokens,
+                    cand,
+                    min_symbol,
+                    wp_params,
+                    deep_lz_max_ratio,
+                    &deep_lz,
+                    scratch,
+                ),
+            }
+        },
+    );
+
+    let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
+    let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
+    if let Some(dictionary) = dictionary {
+        sections[0].append(dictionary);
+    }
+    sections[0].write(1, 1); // dc_quant all_default = 1
+    sections[0].write(1, 0); // has_tree = 0
+    sections[0].write(1, 0); // use_global_tree = 0 (no channel is coded here)
+    write_wp_header(wp_params, &mut sections[0]);
+    source.write_transforms(&mut sections[0]);
+    sections[0].zero_pad_to_byte();
+    for section in sections[1..num_dc_groups + 2].iter_mut() {
+        section.write(1, 0); // use_global_tree = 0
+        write_wp_header(wp_params, section);
+        section.write(2, 0); // no transforms
+        section.zero_pad_to_byte();
+    }
+    for (group_index, section) in group_sections.into_iter().enumerate() {
+        sections[2 + num_dc_groups + group_index] = section;
+    }
+    Some(sections)
+}
+
+/// One AC group section under its local tree: GroupHeader, tree,
+/// histograms and tokens. The literal and LZ77 variants are ordered by their
+/// order-0 estimates and a later one is written only when its code-based
+/// estimate is within `VARIANT_WRITE_TOLERANCE`, as on the global path.
+fn write_local_tree_group<T: lz77::LiteralToken>(
+    tokens: &[T],
+    cand: &LearnedCandidate,
+    min_symbol: u32,
+    wp_params: WpParams,
+    deep_lz_max_ratio: f64,
+    deep_lz: &DeepLzScratchPool,
+    scratch: &mut CoderScratch,
+) -> BitWriter {
+    let num_ctx = cand.num_ctx;
+    let distance_ctx = num_ctx;
+    let run_count = lz77_run_count(tokens);
+    let mut best: Option<BitWriter> = None;
+    let mut best_estimate = f64::INFINITY;
+    let deep = |scratch: &mut CoderScratch| -> Vec<LzToken> {
+        deep_lz.with_depth(|depth| {
+            lz77_compress_for_speed_with_depth(
+                tokens,
+                distance_ctx,
+                crate::Speed::Slow,
+                depth,
+                Some(run_count),
+                scratch,
+            )
+        })
+    };
+    if (run_count as f64) >= LZ_LITERAL_ALTERNATIVE_MAX_RATIO * tokens.len() as f64 {
+        let lz = deep(scratch);
+        write_local_tree_variant(
+            &lz,
+            cand,
+            min_symbol,
+            wp_params,
+            scratch,
+            &mut best,
+            &mut best_estimate,
+        );
+    } else {
+        let (e_lit, e_run) =
+            estimate_literal_and_run_bits_single(tokens, num_ctx as usize + 1, min_symbol);
+        if e_run > e_lit * deep_lz_max_ratio {
+            write_local_tree_variant(
+                tokens,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+        } else if e_run < e_lit {
+            let lz = deep(scratch);
+            write_local_tree_variant(
+                &lz,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+            write_local_tree_variant(
+                tokens,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+        } else {
+            write_local_tree_variant(
+                tokens,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+            let lz = deep(scratch);
+            write_local_tree_variant(
+                &lz,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+        }
+    }
+    best.expect("local-tree group section")
+}
+
+fn write_local_tree_variant<T: lz77::LzTokenSource>(
+    stream: &[T],
+    cand: &LearnedCandidate,
+    min_symbol: u32,
+    wp_params: WpParams,
+    scratch: &mut CoderScratch,
+    best: &mut Option<BitWriter>,
+    best_estimate: &mut f64,
+) {
+    let num_ctx = cand.num_ctx;
+    let distance_ctx = num_ctx;
+    let code = build_lz_pixel_code_threads(
+        std::iter::once(stream),
+        num_ctx as usize,
+        min_symbol,
+        true,
+        true,
+        None,
+        &mut scratch.lz_entropy,
+        &mut scratch.huffman_pool,
+    );
+    let estimate = estimate_coded_bits(&[stream], distance_ctx, &code, min_symbol, 1);
+    if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
+        return;
+    }
+    *best_estimate = best_estimate.min(estimate);
+    let mut section = BitWriter::new();
+    section.write(1, 0); // use_global_tree = 0
+    write_wp_header(wp_params, &mut section);
+    section.write(2, 0); // no transforms
+    write_tree_lz77(
+        &cand.tree_tokens,
+        &code,
+        min_symbol,
+        &mut scratch.huffman_pool,
+        &mut section,
+    );
+    write_lz_section(stream, distance_ctx, &code, min_symbol, &mut section);
+    section.zero_pad_to_byte();
+    keep_smaller_writer(best, section);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_learned_single_variant<T: lz77::LzTokenSource>(
     stream: &[T],
@@ -3574,6 +4453,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
     cand: &LearnedCandidate,
     min_symbol: u32,
     wp_params: WpParams,
+    dictionary: Option<&BitWriter>,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     best: &mut Option<BitWriter>,
@@ -3603,6 +4483,9 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
     }
     *best_estimate = (*best_estimate).min(estimate);
     let mut body = BitWriter::new();
+    if let Some(dictionary) = dictionary {
+        body.append(dictionary);
+    }
     body.write(1, 1); // dc_quant all_default = 1
     body.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
     body.write(1, 0); // use_global_tree = 0
@@ -3632,6 +4515,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     num_ac_groups: usize,
     num_dc_groups: usize,
     has_global_stream: bool,
+    dictionary: Option<&BitWriter>,
     best: &mut Option<Vec<BitWriter>>,
     best_bits: &mut usize,
     best_estimate: &mut f64,
@@ -3659,6 +4543,9 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     *best_estimate = (*best_estimate).min(estimate);
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
+    if let Some(dictionary) = dictionary {
+        sections[0].append(dictionary);
+    }
     sections[0].write(1, 1); // dc_quant all_default = 1
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
@@ -3703,14 +4590,28 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     let group_sections: Vec<BitWriter> = std::thread::scope(|scope| {
         let handles: Vec<_> = group_streams
             .chunks(chunk)
-            .map(|part| {
+            .enumerate()
+            .map(|(part_index, part)| {
+                let first = part_index * chunk;
                 scope.spawn(move || {
                     part.iter()
-                        .map(|stream| {
+                        .enumerate()
+                        .map(|(offset, stream)| {
                             let mut section = BitWriter::new();
                             section.write(1, 1);
                             write_wp_header(wp_params, &mut section);
-                            section.write(2, 0);
+                            // A palettised group declares its own Palette
+                            // transform here; every other group has none.
+                            match source.group_override(first + offset) {
+                                Some(over) => {
+                                    write_palette_transform(
+                                        over.num_c,
+                                        over.nb_colors,
+                                        &mut section,
+                                    );
+                                }
+                                None => section.write(2, 0),
+                            }
                             write_lz_section(
                                 stream,
                                 distance_ctx,
@@ -3749,18 +4650,15 @@ enum TreeStreams<T> {
 /// Runs and matches collapse a token stream, but a learned tree routes flat
 /// content into near-deterministic contexts where a literal costs almost
 /// nothing under ANS while every run token still pays for its length and
-/// distance (the Burning Ship fractal codes 24% smaller as literals) — yet
-/// a palette index image can prefer long matches. Streams that barely
+/// distance — yet a palette index image can prefer long matches. Streams that barely
 /// collapse keep the LZ77 layer outright; otherwise the order-0 estimates
 /// order the literal and LZ77 variants (the deep matcher is skipped when
 /// runs alone trail literals by `LZ_DEEP_MATCHER_MAX_RATIO`), and the
 /// writer only codes a later variant when its code-based estimate beats
 /// the one already written.
 const LZ_LITERAL_ALTERNATIVE_MAX_RATIO: f64 = 0.98;
-/// Order-0 estimates are optimistic for literal streams whose contexts get
-/// merged by clustering (up to ~30% on palette indices), so the matcher is
-/// only skipped on a wide margin.
-const LZ_DEEP_MATCHER_MAX_RATIO: f64 = 1.6;
+const LZ_DEEP_MATCHER_MAX_RATIO_PALETTE: f64 = 1.6;
+const LZ_DEEP_MATCHER_MAX_RATIO_RCT: f64 = 1.01;
 /// A later variant is written when its code-based estimate is within this
 /// factor of the best written one (the estimate itself is ~0.5% accurate).
 const VARIANT_WRITE_TOLERANCE: f64 = 1.005;
@@ -3772,6 +4670,7 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
     distance_ctx: u32,
     num_contexts: usize,
     min_symbol: u32,
+    deep_lz_max_ratio: f64,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<TreeStreams<T>> {
@@ -3808,7 +4707,7 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
     let raw_slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
     let (e_lit, e_run) =
         estimate_literal_and_run_bits(&raw_slices, num_contexts, min_symbol, pool, scratch);
-    if e_run > e_lit * LZ_DEEP_MATCHER_MAX_RATIO {
+    if e_run > e_lit * deep_lz_max_ratio {
         return vec![TreeStreams::Literals(tokens)];
     }
     let lz = deep(scratch);
@@ -4416,6 +5315,83 @@ mod rate_selection_tests {
     use super::palette::local_palette_coverage_is_sufficient;
     use super::*;
 
+    /// AVX2 always uses the fused polynomial, even when the rest of an x86
+    /// build uses the portable non-FMA scalar logarithm.
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    fn hist_entropy_fma_reference(hist: &[u64], total: u64) -> f32 {
+        if total == 0 {
+            return 0.0;
+        }
+        let mut bits = 0.0;
+        for &count in hist.iter().filter(|&&c| c != 0) {
+            let p = count as f32 / total as f32;
+            let ix = p.to_bits().wrapping_add(0x3f80_0000 - 0x3f35_04f3);
+            let exponent = (ix >> 23) as i32 - 127;
+            let a = f32::from_bits((ix & 0x007f_ffff) + 0x3f35_04f3);
+            let x = (a - 1.0) / (a + 1.0);
+            let x2 = x * x;
+            let u = 0.412_198_57f32
+                .mul_add(x2, 0.577_078_04)
+                .mul_add(x2, 0.961_796_7);
+            let log = (x2 * x).mul_add(u, x.mul_add(2.885_390_1, exponent as f32));
+            bits -= count as f32 * log;
+        }
+        bits
+    }
+
+    #[test]
+    fn selected_hist_entropy_matches_scalar_model_exactly() {
+        let entropy_of_hist = selected_entropy_of_hist_fn();
+        #[allow(unused_mut)]
+        let mut reference: EntropyOfHistFn = entropy_of_hist_scalar;
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            reference = hist_entropy_fma_reference;
+        }
+        let check = |hist: &[u64]| {
+            let total = hist.iter().sum();
+            assert_eq!(
+                entropy_of_hist(hist, total).to_bits(),
+                reference(hist, total).to_bits(),
+                "histogram length {}, total {total}",
+                hist.len(),
+            );
+        };
+        check(&[]);
+        check(&[0; 65]);
+        check(&[u64::MAX]);
+        check(&[u64::MAX - 6, 1, 2, 3]);
+        assert_eq!(entropy_of_hist(&[1, 2, 3], 0), 0.0);
+        assert_eq!(entropy_of_hist(&[1, 1], 2), 2.0);
+        // Exercise direct u64-to-f32 rounding around half-way values,
+        // including counts too large to convert to f64 without rounding.
+        for exponent in 24..64 {
+            let midpoint = (1u64 << exponent) + (1u64 << (exponent - 24));
+            for value in [midpoint - 1, midpoint, midpoint + 1] {
+                check(&[value, 1, 3, 7, 0]);
+                check(&[value, 1, 3, 7, 0, 11, 13, 17, 19]);
+            }
+        }
+        for len in 0..129 {
+            for stride in [1, 2, 3, 5, 16, 64] {
+                for range in [1, 100, 1 << 24, 1 << 32, 1 << 54] {
+                    let mut state = (len + stride) as u64;
+                    let hist: Vec<_> = (0..len)
+                        .map(|i| {
+                            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            if i % stride == 0 {
+                                1 + (state >> 10) % range
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    check(&hist);
+                }
+            }
+        }
+    }
+
     #[test]
     fn shortlist_thresholds_keep_ambiguous_candidates() {
         assert!(!local_palette_coverage_is_sufficient(24, 100));
@@ -4461,6 +5437,7 @@ mod rate_selection_tests {
             &mut scratch,
             ModularFrameKind::Regular,
             allow_palettes,
+            true,
             &mut writer,
         );
         writer
@@ -4796,8 +5773,21 @@ mod context_tree_tests {
                 .map(|token| (token.context, token.value))
                 .collect();
             assert_eq!(actual, expected);
-            assert_eq!(candidate.est_real, 890.);
+            // 100 sample bits + 19 tree tokens x 10 + 3 clusters x 200 + 3 contexts x 8.
+            assert_eq!(candidate.est_real, 914.);
         }
+        // Keeping only the original fourth rows must preserve the offsets,
+        // even if the full sample set is subsequently partitioned in place.
+        let retained = MaSamples {
+            props: samples.props.iter().step_by(4).copied().collect(),
+            tok: samples.tok.iter().step_by(4).copied().collect(),
+        };
+        samples.props.reverse();
+        samples.tok.reverse();
+        let mut retained_candidate = finish_ma_candidate(tree.clone(), 1.);
+        retained_candidate.set_leaf_offsets(retained.props.iter().zip(&retained.tok));
+        assert_eq!(retained_candidate.leaf_offset, [-3, 5, 0]);
+
         // Admission uses only the unchanged token-count estimate.
         for est_bits in [10000., f64::NAN] {
             assert!(

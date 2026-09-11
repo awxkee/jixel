@@ -1084,29 +1084,24 @@ fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
         .map_or(0, |i| i + 1);
     let freqs = &histogram.freqs[..alphabet_size];
     let omit_pos = histogram.omit_pos as usize;
-    let mut symbols = [0usize; 2];
-    let mut num_symbols = 0usize;
-    let mut omit_width = 10;
-    for (i, &freq) in freqs.iter().enumerate() {
-        if freq == 0 {
-            continue;
-        }
-        if num_symbols < symbols.len() {
-            symbols[num_symbols] = i;
-        }
-        num_symbols += 1;
-        if i != omit_pos {
-            let width = (u16::BITS - freq.leading_zeros()) as usize;
-            omit_width = omit_width.max(width + usize::from(i < omit_pos));
-        }
+    // Only the first three occupied positions are needed to detect small
+    // tables. For larger ones, maximum reductions find the omitted width
+    // without a branch and bit-width calculation for every population.
+    let mut symbols = freqs.iter().enumerate().filter(|&(_, &freq)| freq != 0);
+    let Some((first, _)) = symbols.next() else {
+        return 3;
+    };
+    let Some((second, _)) = symbols.next() else {
+        return 2 + varlen_bits(first);
+    };
+    if symbols.next().is_none() {
+        return 2 + varlen_bits(first) + varlen_bits(second) + ANS_LOG_TAB_SIZE as usize;
     }
-    if num_symbols <= 2 {
-        return match num_symbols {
-            0 => 3,
-            1 => 2 + varlen_bits(symbols[0]),
-            _ => 2 + varlen_bits(symbols[0]) + varlen_bits(symbols[1]) + ANS_LOG_TAB_SIZE as usize,
-        };
-    }
+    let before = freqs[..omit_pos].iter().copied().max().unwrap_or(0);
+    let after = freqs[omit_pos + 1..].iter().copied().max().unwrap_or(0);
+    let omit_width = 10
+        .max((u16::BITS - before.leading_zeros()) as usize + 1)
+        .max((u16::BITS - after.leading_zeros()) as usize);
 
     // Non-small, non-flat, method 12, alphabet size, and the omitted width.
     let mut bits = 8 + varlen_bits(alphabet_size - 3) + K_BIT_WIDTH_LENGTHS[omit_width] as usize;

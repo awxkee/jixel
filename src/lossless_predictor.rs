@@ -29,8 +29,8 @@
 
 //! Modular predictors, cost estimation, and channel tokenization.
 
-use super::entropy_of_hist;
 use super::lz77::{LzToken, RunLzWriter};
+use super::{EntropyOfHistFn, selected_entropy_of_hist_fn};
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{Token, pack_signed};
@@ -1268,8 +1268,8 @@ fn grad_pack_interior_scalar(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usi
     }
 }
 
-#[derive(Default)]
 pub(super) struct PredictorCosts {
+    entropy_of_hist: EntropyOfHistFn,
     histograms: [Vec<u64>; SLOW_PREDICTORS.len()],
     /// Residual histogram for the Zero predictor (the raw values). Collected
     /// only when `collect_zero` is set (the lossy-modular path); the lossless
@@ -1279,9 +1279,21 @@ pub(super) struct PredictorCosts {
     total: u64,
 }
 
+impl Default for PredictorCosts {
+    fn default() -> Self {
+        Self {
+            entropy_of_hist: selected_entropy_of_hist_fn(),
+            histograms: Default::default(),
+            zero_hist: Vec::new(),
+            collect_zero: false,
+            total: 0,
+        }
+    }
+}
+
 impl PredictorCosts {
     /// Merge independently predicted crops before evaluating entropy costs.
-    pub(super) fn merge(&mut self, other: &Self) {
+    pub(crate) fn merge(&mut self, other: &Self) {
         debug_assert_eq!(self.collect_zero, other.collect_zero);
         for (dest, src) in self.histograms.iter_mut().zip(&other.histograms) {
             if dest.len() < src.len() {
@@ -1323,6 +1335,7 @@ impl PredictorCosts {
     /// Best predictor among Zero and the scale-equivariant subset — the only
     /// predictors a channel coded at 1/q scale with a leaf multiplier can use.
     fn best_safe_predictor(&self) -> u32 {
+        let entropy_of_hist = self.entropy_of_hist;
         debug_assert!(self.collect_zero);
         let mut best_id = PREDICTOR_ZERO;
         let mut best_bits = entropy_of_hist(&self.zero_hist, self.total);
@@ -1343,6 +1356,7 @@ impl PredictorCosts {
     }
 
     fn best_predictor(&self, use_wp: bool) -> u32 {
+        let entropy_of_hist = self.entropy_of_hist;
         // Without WP the Weighted candidate (index 0) is skipped.
         let first = usize::from(!use_wp);
         let mut best_id = SLOW_PREDICTORS[first];
