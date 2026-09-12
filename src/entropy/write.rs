@@ -30,7 +30,7 @@
 use super::ans::{
     ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, ans_tokens_bits_pair,
     build_symbol_info, choose_use_prefix_code, encode_histogram, fast_ans_population_cost,
-    normalize_counts_into, optimize_ans_histogram,
+    normalize_counts_into, optimize_ans_histogram, refine_ans_histogram_precision,
 };
 use super::cluster::cluster_histograms;
 use super::entropy_code::{EntropyCode, OwnedEntropyCode};
@@ -360,6 +360,36 @@ impl HybridUintSamples {
                 .collect()
         })
     }
+
+    fn select_with_pool(
+        &self,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Vec<HybridUintConfig> {
+        let n = self.values.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let chunk = n.div_ceil(pool.num_threads());
+        pool.steal_map(scratch, n.div_ceil(chunk), |part, _| {
+            let begin = part * chunk;
+            let end = (begin + chunk).min(n);
+            let mut selector = HybridAnsSelectorScratch::default();
+            (begin..end)
+                .map(|i| {
+                    select_hybrid_config_ans_sampled(
+                        &self.values[i],
+                        1,
+                        self.strides[i],
+                        &mut selector,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -681,7 +711,7 @@ fn propose_ans_cluster_refinement(
     context_histograms: &[Histogram],
     context_map: &[u8],
     configs: &[HybridUintConfig],
-) -> Option<(Vec<Histogram>, Vec<u8>, Vec<HybridUintConfig>)> {
+) -> Option<AnsClusterProposal> {
     if histograms.len() <= 1 {
         return None;
     }
@@ -923,26 +953,18 @@ fn exact_ans_stream_bits_pair(
         })
 }
 
-/// Final ANS-aware clustering pass for an already-selected bundle. Keeping it
-/// separate from initial code construction lets callers run it only after
-/// higher-level coding-arm decisions, rather than paying to refine candidates
-/// that are immediately discarded.
-pub(crate) fn refine_ans_clusters<'a, I>(
+fn refine_ans_clusters_once(
     code: &mut OwnedEntropyCode,
-    streams: I,
+    streams: &[&[Token]],
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> bool
-where
-    I: IntoIterator<Item = &'a [Token]>,
-{
+) -> bool {
     if code.use_prefix_code || code.hybrid_uint_configs.len() <= 1 {
         return false;
     }
-    let streams: Vec<&[Token]> = streams.into_iter().collect();
     let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
     let mut context_histograms = vec![Histogram::new(); code.context_map.len()];
-    for tokens in &streams {
+    for tokens in streams {
         for token in *tokens {
             let context = token.context as usize;
             let cluster = code.context_map[context] as usize;
@@ -962,6 +984,24 @@ where
     else {
         return false;
     };
+    accept_ans_cluster_proposal(
+        code,
+        streams,
+        (candidate_histograms, candidate_map, candidate_configs),
+        thread_pool,
+        scratch,
+    )
+}
+
+type AnsClusterProposal = (Vec<Histogram>, Vec<u8>, Vec<HybridUintConfig>);
+
+fn accept_ans_cluster_proposal(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    (candidate_histograms, candidate_map, candidate_configs): AnsClusterProposal,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool {
     let candidate_ans = build_ans_storage(&candidate_histograms);
     let original = AnsBundleRef {
         context_map: &code.context_map,
@@ -978,7 +1018,7 @@ where
         reverse_maps: &candidate_ans.reverse_maps,
     };
     let (original_bits, candidate_bits) = exact_ans_bundle_bits_pair(
-        &streams,
+        streams,
         code.orig_num_contexts,
         &original,
         &candidate,
@@ -997,6 +1037,283 @@ where
     code.ans_symbols = candidate_ans.symbols;
     code.ans_reverse_maps = candidate_ans.reverse_maps;
     true
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AnsRefinement {
+    Slow,
+    Fast { recluster: bool },
+}
+
+/// Refine only the final entropy bundle, after the caller has frozen RDO
+/// prices and tokens. Higher-level frame selection can still compare the
+/// resulting sizes. Retain the existing Slow refinement as an
+/// incumbent, then test either independent ANS clustering (which can split
+/// collapsed clusters) or a bounded batch of same-configuration moves.
+pub(crate) fn refine_ans_clusters<'a, I>(
+    code: &mut OwnedEntropyCode,
+    streams: I,
+    refinement: AnsRefinement,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
+    if code.use_prefix_code {
+        return false;
+    }
+    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    // Slow already had this refinement. Preserve it as the incumbent; Fast
+    // did not, so it can go straight to the stronger candidate.
+    let mut changed = matches!(refinement, AnsRefinement::Slow)
+        && refine_ans_clusters_once(code, &streams, thread_pool, scratch);
+    let recluster = !matches!(refinement, AnsRefinement::Fast { recluster: false });
+    let proposal = if recluster {
+        propose_ans_reclustering(&streams, code.context_map.len(), thread_pool, scratch)
+    } else {
+        propose_ans_cluster_batch(code, &streams)
+    };
+    if let Some(proposal) = proposal {
+        changed |= accept_ans_cluster_proposal(code, &streams, proposal, thread_pool, scratch);
+    }
+    // Precision changes do not feed back into clustering or provisional RDO
+    // prices. Fast retains its existing table search at every distance.
+    if matches!(refinement, AnsRefinement::Slow) {
+        changed |= refine_ans_precisions(code, &streams, thread_pool, scratch);
+    }
+    changed
+}
+
+fn refine_ans_precisions(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool {
+    if code.use_prefix_code || code.ans_histograms.is_empty() {
+        return false;
+    }
+    let mut histograms = vec![Histogram::new(); code.ans_histograms.len()];
+    for tokens in streams {
+        for token in *tokens {
+            let cluster = code.context_map[token.context as usize] as usize;
+            let symbol = uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]).0;
+            histograms[cluster].add(symbol);
+        }
+    }
+    let proposals = thread_pool.steal_map(scratch, histograms.len(), |i, _| {
+        refine_ans_histogram_precision(&histograms[i].counts, &code.ans_histograms[i])
+    });
+    if proposals.iter().all(Option::is_none) {
+        return false;
+    }
+    let selected = proposals
+        .into_iter()
+        .zip(&code.ans_histograms)
+        .map(|(proposal, incumbent)| proposal.unwrap_or_else(|| incumbent.clone()))
+        .collect();
+    let candidate_ans = build_ans_storage_from_selected(&histograms, selected);
+    let original = AnsBundleRef {
+        context_map: &code.context_map,
+        configs: &code.hybrid_uint_configs,
+        histograms: &code.ans_histograms,
+        symbols: &code.ans_symbols,
+        reverse_maps: &code.ans_reverse_maps,
+    };
+    let candidate = AnsBundleRef {
+        context_map: &code.context_map,
+        configs: &code.hybrid_uint_configs,
+        histograms: &candidate_ans.histograms,
+        symbols: &candidate_ans.symbols,
+        reverse_maps: &candidate_ans.reverse_maps,
+    };
+    // The histogram model nominates tables; actual ANS states decide whether
+    // the complete entropy bundle improves on the already reclustered code.
+    let (original_bits, candidate_bits) = exact_ans_bundle_bits_pair(
+        streams,
+        code.orig_num_contexts,
+        &original,
+        &candidate,
+        thread_pool,
+        scratch,
+    );
+    if candidate_bits >= original_bits {
+        return false;
+    }
+    code.ans_histograms = candidate_ans.histograms;
+    code.ans_symbols = candidate_ans.symbols;
+    code.ans_reverse_maps = candidate_ans.reverse_maps;
+    true
+}
+
+/// Empty contexts must remain in the signaled map, but need not participate
+/// in the cluster search. Build dense populations without allocating a full
+/// 128-bin histogram for every unused AC context.
+fn propose_ans_reclustering(
+    streams: &[&[Token]],
+    num_contexts: usize,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<AnsClusterProposal> {
+    let mut dense = vec![usize::MAX; num_contexts];
+    for tokens in streams {
+        for token in *tokens {
+            dense[token.context as usize] = 0;
+        }
+    }
+    let mut histograms = Vec::new();
+    for index in &mut dense {
+        if *index != usize::MAX {
+            *index = histograms.len();
+            histograms.push(Histogram::new());
+        }
+    }
+    if histograms.len() <= 1 {
+        return None;
+    }
+    for tokens in streams {
+        for token in *tokens {
+            histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
+        }
+    }
+    let mut assignment = vec![0u8; histograms.len()];
+    let n =
+        super::cluster::cluster_histograms_ans(&mut histograms, &mut assignment, Some(thread_pool));
+    histograms.truncate(n);
+    let context_map: Vec<u8> = dense
+        .iter()
+        .map(|&index| {
+            if index == usize::MAX {
+                0
+            } else {
+                assignment[index]
+            }
+        })
+        .collect();
+    let counts: Vec<usize> = histograms.iter().map(|h| h.total_count as usize).collect();
+    let mut samples = HybridUintSamples::new(&counts);
+    let mut max_values = vec![0u32; n];
+    for tokens in streams {
+        for token in *tokens {
+            let cluster = context_map[token.context as usize] as usize;
+            samples.push(cluster, token.value);
+            max_values[cluster] = max_values[cluster].max(token.value);
+        }
+    }
+    let mut configs = samples.select_with_pool(thread_pool, scratch);
+    // Sampling may miss a rare large value. Check a conservative upper bound
+    // for every selected configuration before rebuilding fixed-size tables.
+    for (config, &max_value) in configs.iter_mut().zip(&max_values) {
+        let max_symbol =
+            uint_encode_with_config(max_value, *config).0 | ((1u32 << config.lsb_in_token) - 1);
+        if max_symbol as usize >= ALPHABET_SIZE {
+            *config = HybridUintConfig::DEFAULT;
+        }
+    }
+    if configs.iter().any(|&c| c != HybridUintConfig::DEFAULT) {
+        histograms.fill(Histogram::new());
+        for tokens in streams {
+            for token in *tokens {
+                let cluster = context_map[token.context as usize] as usize;
+                histograms[cluster].add(uint_encode_with_config(token.value, configs[cluster]).0);
+            }
+        }
+    }
+    Some((histograms, context_map, configs))
+}
+
+fn propose_ans_cluster_batch(
+    code: &OwnedEntropyCode,
+    streams: &[&[Token]],
+) -> Option<AnsClusterProposal> {
+    if code.hybrid_uint_configs.len() <= 1 {
+        return None;
+    }
+    let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
+    let mut contexts = vec![Histogram::new(); code.context_map.len()];
+    let mut map = code.context_map.clone();
+    let mut configs = code.hybrid_uint_configs.clone();
+    for tokens in streams {
+        for token in *tokens {
+            let context = token.context as usize;
+            let cluster = map[context] as usize;
+            let symbol = uint_encode_with_config(token.value, configs[cluster]).0;
+            contexts[context].add(symbol);
+            histograms[cluster].add(symbol);
+        }
+    }
+    let mut order: Vec<usize> = (0..contexts.len())
+        .filter(|&i| contexts[i].total_count != 0)
+        .collect();
+    order.sort_unstable_by_key(|&i| (std::cmp::Reverse(contexts[i].total_count), i));
+    order.truncate(MAX_ANS_RELOCATION_CONTEXTS);
+    let mut changed = false;
+    for context in order {
+        let source = map[context] as usize;
+        let moved = &contexts[context];
+        // Whole-cluster merging below also remaps tokenless contexts.
+        if moved.total_count == histograms[source].total_count {
+            continue;
+        }
+        let mut best = source;
+        let mut best_delta = -0.25;
+        for target in 0..histograms.len() {
+            if target == source || configs[target] != configs[source] {
+                continue;
+            }
+            let delta =
+                moved_population_proxy_delta(&histograms[source], &histograms[target], moved);
+            if delta < best_delta {
+                best_delta = delta;
+                best = target;
+            }
+        }
+        if best != source {
+            let (a, b) = two_histograms_mut(&mut histograms, source, best);
+            move_histogram(a, b, moved);
+            map[context] = best as u8;
+            changed = true;
+        }
+    }
+    for _ in 0..4 {
+        let mut best = None;
+        let mut best_delta = -0.25;
+        for source in 0..histograms.len() {
+            for target in 0..source {
+                if configs[source] != configs[target]
+                    || histograms[source].total_count == 0
+                    || histograms[target].total_count == 0
+                {
+                    continue;
+                }
+                let delta = moved_population_proxy_delta(
+                    &histograms[source],
+                    &histograms[target],
+                    &histograms[source],
+                );
+                if delta < best_delta {
+                    best_delta = delta;
+                    best = Some((source, target));
+                }
+            }
+        }
+        let Some((source, target)) = best else { break };
+        let moved = histograms[source].clone();
+        let (a, b) = two_histograms_mut(&mut histograms, source, target);
+        move_histogram(a, b, &moved);
+        for cluster in &mut map {
+            if *cluster as usize == source {
+                *cluster = target as u8;
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    compact_ans_clusters(&mut histograms, &mut map, &mut configs);
+    Some((histograms, map, configs))
 }
 
 fn optimize_entropy_code_ac_streams_impl<'a, I>(
@@ -1881,6 +2198,253 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
     // The normalized distributions, in clustered-histogram order.
     for histogram in code.ans_histograms.iter() {
         encode_histogram(histogram, ANS_LOG_ALPHA_SIZE, w);
+    }
+}
+
+#[cfg(test)]
+mod ans_refinement_tests {
+    use super::*;
+
+    fn code_for(
+        tokens: &[Token],
+        map: Vec<u8>,
+        configs: Vec<HybridUintConfig>,
+    ) -> OwnedEntropyCode {
+        let mut histograms = vec![Histogram::new(); configs.len()];
+        for token in tokens {
+            let h = map[token.context as usize] as usize;
+            histograms[h].add(uint_encode_with_config(token.value, configs[h]).0);
+        }
+        let ans = build_ans_storage(&histograms);
+        OwnedEntropyCode {
+            orig_num_contexts: map.len(),
+            context_map: map,
+            prefix_codes: build_huffman_codes(&histograms, &mut Vec::new()),
+            hybrid_uint_configs: configs,
+            orig_context_map: None,
+            use_prefix_code: false,
+            ans_histograms: ans.histograms,
+            ans_pricing_freqs: ans.pricing_freqs,
+            ans_symbols: ans.symbols,
+            ans_reverse_maps: ans.reverse_maps,
+        }
+    }
+
+    fn bundle(code: &OwnedEntropyCode) -> AnsBundleRef<'_> {
+        AnsBundleRef {
+            context_map: &code.context_map,
+            configs: &code.hybrid_uint_configs,
+            histograms: &code.ans_histograms,
+            symbols: &code.ans_symbols,
+            reverse_maps: &code.ans_reverse_maps,
+        }
+    }
+
+    fn serialized(code: &OwnedEntropyCode, streams: &[&[Token]]) -> (usize, Vec<u8>) {
+        let mut writer = BitWriter::new();
+        write_entropy_code(&code.as_ref(), &mut Vec::new(), &mut writer);
+        for tokens in streams {
+            super::super::ans::write_ans_tokens(
+                tokens,
+                &code.context_map,
+                &code.ans_symbols,
+                &code.ans_reverse_maps,
+                &code.hybrid_uint_configs,
+                &mut writer,
+            );
+        }
+        let bits = writer.bits_written();
+        writer.zero_pad_to_byte();
+        (bits, writer.into_bytes())
+    }
+
+    #[test]
+    fn exact_comparison_handles_different_integer_configs_and_maps() {
+        let tokens: Vec<_> = (0..20_000)
+            .map(|i| Token::new(i % 3, (i * 73 + i / 11) % 4096))
+            .collect();
+        let first = code_for(&tokens, vec![0, 1, 0], vec![HybridUintConfig::DEFAULT; 2]);
+        let second = code_for(
+            &tokens,
+            vec![1, 0, 2],
+            vec![
+                HYBRID_CANDIDATES[0],
+                HYBRID_CANDIDATES[7],
+                HYBRID_CANDIDATES[11],
+            ],
+        );
+        let mut streams: Vec<&[Token]> = tokens.chunks(997).collect();
+        streams.push(&[]);
+        let expected = (
+            serialized(&first, &streams).0,
+            serialized(&second, &streams).0,
+        );
+        for threads in [1, 4] {
+            assert_eq!(
+                exact_ans_bundle_bits_pair(
+                    &streams,
+                    3,
+                    &bundle(&first),
+                    &bundle(&second),
+                    &ThreadPool::new_lossless(threads),
+                    &mut CoderScratch::lossless(),
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn reclustering_splits_a_collapsed_histogram_and_is_deterministic() {
+        let mut tokens = Vec::new();
+        for context in 0..96 {
+            for i in 0..1028 {
+                tokens.push(Token::new(
+                    context * 73 + 2,
+                    u32::from((i * 37) % 257 < context * 2 + 3),
+                ));
+            }
+        }
+        let streams: Vec<&[Token]> = tokens.chunks(1001).collect();
+        let mut expected = None;
+        for threads in [1, 4] {
+            let mut code = code_for(&tokens, vec![0; 7425], vec![HybridUintConfig::DEFAULT]);
+            let before = serialized(&code, &streams).0;
+            assert!(refine_ans_clusters(
+                &mut code,
+                streams.iter().copied(),
+                AnsRefinement::Slow,
+                &ThreadPool::new_lossless(threads),
+                &mut CoderScratch::lossless(),
+            ));
+            assert_eq!(code.context_map.len(), 7425);
+            assert!(code.ans_histograms.len() > 1);
+            let encoded = serialized(&code, &streams);
+            assert!(encoded.0 < before);
+            if let Some(expected) = &expected {
+                assert_eq!(&encoded, expected);
+            } else {
+                expected = Some(encoded);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_reclustering_keeps_the_incumbent_code() {
+        // The incumbent already shares the same distribution and uses the
+        // shorter config header. The sampled selector's stability margin
+        // nominates DEFAULT, which cannot beat it on the actual wire cost.
+        let tokens: Vec<_> = (0..20_000)
+            .map(|i| Token::new((i / 2) % 2, i % 2))
+            .collect();
+        let streams = [tokens.as_slice()];
+        let mut code = code_for(&tokens, vec![0; 2], vec![HYBRID_CANDIDATES[0]]);
+        let before = serialized(&code, &streams);
+        assert!(!refine_ans_clusters(
+            &mut code,
+            streams,
+            AnsRefinement::Slow,
+            &ThreadPool::new_lossless(1),
+            &mut CoderScratch::lossless(),
+        ));
+        assert_eq!(serialized(&code, &streams), before);
+    }
+
+    #[test]
+    fn empty_and_single_context_bundles_remain_unchanged() {
+        let pool = ThreadPool::new_lossless(1);
+        let mut scratch = CoderScratch::lossless();
+        for tokens in [vec![], vec![Token::new(2, 3); 1000]] {
+            let streams = [tokens.as_slice()];
+            let mut code = code_for(&tokens, vec![0; 7], vec![HybridUintConfig::DEFAULT]);
+            let before = serialized(&code, &streams);
+            for refinement in [
+                AnsRefinement::Fast { recluster: false },
+                AnsRefinement::Slow,
+            ] {
+                assert!(!refine_ans_clusters(
+                    &mut code,
+                    streams,
+                    refinement,
+                    &pool,
+                    &mut scratch
+                ));
+                assert_eq!(serialized(&code, &streams), before);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_refinement_preserves_population_and_accepts_only_smaller_bundles() {
+        let tokens: Vec<_> = (0..30_000)
+            .map(|i| Token::new(i % 12, (i / 12) % (2 + i % 12)))
+            .collect();
+        let streams: Vec<&[Token]> = tokens.chunks(3001).collect();
+        let map: Vec<_> = (0..12).map(|i| (i % 3) as u8).collect();
+        let mut code = code_for(&tokens, map, vec![HybridUintConfig::DEFAULT; 3]);
+        let before = serialized(&code, &streams).0;
+        assert!(refine_ans_clusters(
+            &mut code,
+            streams.iter().copied(),
+            AnsRefinement::Fast { recluster: false },
+            &ThreadPool::new_lossless(4),
+            &mut CoderScratch::lossless(),
+        ));
+        assert!(serialized(&code, &streams).0 < before);
+        let proposal = propose_ans_cluster_batch(&code, &streams);
+        if let Some((histograms, map, configs)) = proposal {
+            let mut actual = vec![Histogram::new(); histograms.len()];
+            for token in tokens {
+                let cluster = map[token.context as usize] as usize;
+                actual[cluster].add(uint_encode_with_config(token.value, configs[cluster]).0);
+            }
+            for (a, b) in histograms.iter().zip(&actual) {
+                assert_eq!(a.counts, b.counts);
+                assert_eq!(a.total_count, b.total_count);
+            }
+        }
+    }
+
+    #[test]
+    fn precision_refinement_reduces_wire_cost_without_changing_token_mapping() {
+        let mut accepted = 0;
+        for scale in [100, 1000, 10_000] {
+            let mut tokens = Vec::new();
+            for value in 0..64 {
+                for _ in 0..(scale / (value + 1)) {
+                    tokens.push(Token::new(value % 3, value));
+                }
+            }
+            let streams: Vec<&[Token]> = tokens.chunks(997).collect();
+            let initial = code_for(&tokens, vec![0, 1, 2], vec![HybridUintConfig::DEFAULT; 3]);
+            let before = serialized(&initial, &streams);
+            let mut expected = None;
+            for threads in [1, 4] {
+                let mut code = code_for(&tokens, vec![0, 1, 2], vec![HybridUintConfig::DEFAULT; 3]);
+                let changed = refine_ans_precisions(
+                    &mut code,
+                    &streams,
+                    &ThreadPool::new_lossless(threads),
+                    &mut CoderScratch::lossless(),
+                );
+                let after = serialized(&code, &streams);
+                if changed {
+                    assert!(after.0 < before.0);
+                    accepted += 1;
+                } else {
+                    assert_eq!(after, before);
+                }
+                assert_eq!(code.context_map, initial.context_map);
+                assert_eq!(code.hybrid_uint_configs, initial.hybrid_uint_configs);
+                assert_eq!(code.ans_pricing_freqs, initial.ans_pricing_freqs);
+                if let Some(expected) = &expected {
+                    assert_eq!(&after, expected);
+                } else {
+                    expected = Some(after);
+                }
+            }
+        }
+        assert!(accepted > 0);
     }
 }
 

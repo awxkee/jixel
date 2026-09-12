@@ -609,10 +609,9 @@ pub(crate) struct AnsTokenCodeRef<'a> {
     pub(crate) hybrid_uint_configs: &'a [super::token::HybridUintConfig],
 }
 
-/// Count two representation-compatible ANS streams in one token traversal.
-/// The clustering candidate only moves populations between clusters with the
-/// same HybridUint configuration, so symbolization and extra-bit counts are
-/// shared while the two rANS states are still advanced independently.
+/// Count two ANS streams in one traversal, sharing symbolization when their
+/// configurations agree. Reclustering may choose different configurations,
+/// so each state must use its own symbol and extra-bit count in that case.
 pub(crate) fn ans_tokens_bits_pair(
     tokens: &[Token],
     first: &AnsTokenCodeRef<'_>,
@@ -627,8 +626,13 @@ pub(crate) fn ans_tokens_bits_pair(
         let first_hist = first.context_map[context] as usize;
         let second_hist = second.context_map[context] as usize;
         let first_config = first.hybrid_uint_configs[first_hist];
-        debug_assert_eq!(first_config, second.hybrid_uint_configs[second_hist]);
         let (symbol, nbits, _) = super::token::uint_encode_with_config(token.value, first_config);
+        let second_config = second.hybrid_uint_configs[second_hist];
+        let (second_symbol, second_nbits, _) = if first_config == second_config {
+            (symbol, nbits, 0)
+        } else {
+            super::token::uint_encode_with_config(token.value, second_config)
+        };
 
         let first_reverse_start = first_hist * ANS_TAB_SIZE as usize;
         if first_coder
@@ -644,7 +648,7 @@ pub(crate) fn ans_tokens_bits_pair(
         let second_reverse_start = second_hist * ANS_TAB_SIZE as usize;
         if second_coder
             .put_symbol(
-                &second.symbol_info[second_hist][symbol as usize],
+                &second.symbol_info[second_hist][second_symbol as usize],
                 &second.reverse_maps
                     [second_reverse_start..second_reverse_start + ANS_TAB_SIZE as usize],
             )
@@ -653,7 +657,7 @@ pub(crate) fn ans_tokens_bits_pair(
             second_bits += 16;
         }
         first_bits += nbits as usize;
-        second_bits += nbits as usize;
+        second_bits += second_nbits as usize;
     }
     (first_bits, second_bits)
 }
@@ -1038,6 +1042,33 @@ pub(crate) fn optimize_ans_histogram(counts: &[u32]) -> AnsHistogram {
                 best = candidate;
                 best_cost = cost;
                 best.cost = best_cost;
+            }
+        }
+    }
+    best
+}
+
+/// Extend the normal optimizer's precision search on a final histogram.
+/// Its flat/small forms and shifts 0 and 6 are already in the incumbent.
+/// Shift 11 also tests constrained full-precision normalization, which can
+/// improve on the normal optimizer's faster full-precision normalization.
+pub(crate) fn refine_ans_histogram_precision(
+    counts: &[u32],
+    incumbent: &AnsHistogram,
+) -> Option<AnsHistogram> {
+    let alphabet_size = counts.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+    if counts[..alphabet_size].iter().filter(|&&c| c != 0).count() < 3 {
+        return None;
+    }
+    let mut best = None;
+    let mut best_cost = histogram_cost(counts, incumbent);
+    for shift in [1, 2, 3, 4, 5, 7, 8, 9, 10, 11] {
+        if let Some(mut candidate) = rebalance_counts(counts, alphabet_size, shift) {
+            let cost = histogram_cost(counts, &candidate);
+            if cost < best_cost {
+                candidate.cost = cost;
+                best = Some(candidate);
+                best_cost = cost;
             }
         }
     }
@@ -1435,28 +1466,42 @@ mod tests {
             // exercising sparse and long equal-count runs.
             counts[case % len] = counts[case % len].max(1);
             let histogram = optimize_ans_histogram(&counts);
-            assert_eq!(
-                histogram.freqs.iter().map(|&v| v as u32).sum::<u32>(),
-                ANS_TAB_SIZE
-            );
-            assert!(histogram.method <= 12);
-            if histogram.method == 0 {
-                let expected = flat_histogram(len, counts.len());
-                assert_eq!(histogram.freqs, expected.freqs);
-                continue;
+            let refined = refine_ans_histogram_precision(&counts, &histogram);
+            if let Some(refined) = &refined {
+                assert!(histogram_cost(&counts, refined) < histogram_cost(&counts, &histogram));
             }
-            for (i, (&source, &freq)) in counts.iter().zip(&histogram.freqs).enumerate() {
-                assert_eq!(source == 0, freq == 0);
-                if freq != 0 && i != histogram.omit_pos as usize {
-                    let log = floor_log2(freq as u32) as i32;
-                    let precision = get_pop_count_precision(log, histogram.method as i32 - 1);
-                    let dropped = log - precision;
-                    assert_eq!(freq & ((1u16 << dropped) - 1), 0);
+            for histogram in std::iter::once(histogram).chain(refined) {
+                assert_eq!(
+                    histogram.freqs.iter().map(|&v| v as u32).sum::<u32>(),
+                    ANS_TAB_SIZE
+                );
+                assert!(histogram.method <= 12);
+                if histogram.method == 0 {
+                    let expected = flat_histogram(len, counts.len());
+                    assert_eq!(histogram.freqs, expected.freqs);
+                    continue;
                 }
+                for (i, (&source, &freq)) in counts.iter().zip(&histogram.freqs).enumerate() {
+                    assert_eq!(source == 0, freq == 0);
+                    if freq != 0 && i != histogram.omit_pos as usize {
+                        let log = floor_log2(freq as u32) as i32;
+                        let precision = get_pop_count_precision(log, histogram.method as i32 - 1);
+                        let dropped = log - precision;
+                        assert_eq!(freq & ((1u16 << dropped) - 1), 0);
+                    }
+                }
+                let mut writer = BitWriter::new();
+                encode_histogram(&histogram, LOG_ALPHA_SIZE as u32, &mut writer);
+                assert!(writer.bits_written() != 0);
             }
-            let mut writer = BitWriter::new();
-            encode_histogram(&histogram, LOG_ALPHA_SIZE as u32, &mut writer);
-            assert!(writer.bits_written() != 0);
+        }
+    }
+
+    #[test]
+    fn precision_refinement_skips_empty_and_small_histograms() {
+        for counts in [vec![0; 128], vec![0, 23, 0], vec![7, 0, 11]] {
+            let incumbent = optimize_ans_histogram(&counts);
+            assert!(refine_ans_histogram_precision(&counts, &incumbent).is_none());
         }
     }
 
