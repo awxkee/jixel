@@ -1416,14 +1416,22 @@ fn encode_frame_vardct(
     } else {
         0.0
     };
-    let [x_grad_stat, b_grad_stat] = if slow_chromatic {
-        chroma_gradient_stats(ctx, &xyb)
+    let [x_grad_stat, b_grad_stat, chroma_texture_stat] = if slow_chromatic {
+        chroma_gradient_stats(ctx, &xyb, saturation_stat)
     } else {
-        [0.0; 2]
+        [0.0; 3]
     };
     // Saturated-content tables are validated under Slow only: at Fast the
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
     ctx.set_chroma_heavy(slow_chromatic && saturation_stat >= SAT_QM_THRESHOLD);
+    // Chroma-texture class: thin chromatic detail whose B energy the pair
+    // transforms' coarse first band zeroes. Only the mid band pays off.
+    let pair_b_fine = slow_chromatic
+        && (crate::quant_weights::PAIR_B_FINE_MIN_DISTANCE
+            ..crate::quant_weights::PAIR_B_FINE_MAX_DISTANCE)
+            .contains(&distance)
+        && chroma_texture_stat >= PAIR_B_TEXTURE_THRESHOLD;
+    ctx.set_pair_b_fine(pair_b_fine);
     // This is a content class, not a distance tier. Keeping its decision
     // independent of the 1.25 table boundary prevents saturated HF images
     // from switching plain B weights, custom opsin and both chroma scales at
@@ -1603,6 +1611,7 @@ const ATLAS_DISTANCE_SCALE: f32 = 0.45;
 /// evaluated with different constants. Snap the planes exact so chroma
 /// quantizes to pure zeros and the CfL fit sees slope 0/1 instead of noise.
 const SAT_QM_THRESHOLD: f32 = 0.055;
+const PAIR_B_TEXTURE_THRESHOLD: f32 = 0.12;
 
 /// `x_gradient_stat` gate for keeping the fine X quantizer through the
 /// x_qm_scale=2 distance band (0.299..=1.25)
@@ -1704,13 +1713,29 @@ pub(crate) fn selected_chroma_gradient_sums_fn() -> ChromaGradientSumsFn {
 /// in the B channel (saturated blue detail) is nearly invisible to the
 /// luma-driven masking field, exactly like the X statistic
 /// covers on the red-green axis.
-fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F) -> [f32; 2] {
-    let [sum_x, sum_y_x, sum_by, sum_y_b] = (ctx.chroma_gradient_sums)(
+/// `[x_gradient_stat, b_gradient_stat, chroma_texture_stat]` from one
+/// gradient pass. The third is the relative chroma texture: mean of
+/// |∇X| + |∇(B−Y)| per sampled pixel pair over the frame's mean |X| + |B−Y|
+/// (`saturation_stat`). High on thin chromatic detail over low-chroma
+/// ground, low on saturated smooth subjects however colorful.
+fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F, saturation_stat: f32) -> [f32; 3] {
+    let sums = (ctx.chroma_gradient_sums)(
         xyb.plane_data(0),
         xyb.plane_data(1),
         xyb.plane_data(2),
         xyb.xsize(),
     );
+    chroma_stats_from_sums(sums, xyb.xsize(), xyb.ysize(), saturation_stat)
+}
+
+fn chroma_stats_from_sums(
+    [sum_x, sum_y_x, sum_by, sum_y_b]: [f32; 4],
+    width: usize,
+    height: usize,
+    saturation_stat: f32,
+) -> [f32; 3] {
+    // The kernel visits rows 0, 4, 8, ... and `width - 1` pairs per row.
+    let pairs = (height.div_ceil(4) * width.saturating_sub(1)) as f32;
     [
         if sum_y_x > f32::EPSILON {
             sum_x / sum_y_x
@@ -1719,6 +1744,11 @@ fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F) -> [f32; 2] {
         },
         if sum_y_b > f32::EPSILON {
             sum_by / sum_y_b
+        } else {
+            0.0
+        },
+        if saturation_stat > 1e-9 && pairs > 0.0 {
+            (sum_x + sum_by) / pairs / saturation_stat
         } else {
             0.0
         },
@@ -2978,6 +3008,42 @@ mod tests {
     }
 
     #[test]
+    fn chroma_texture_stat_separates_thin_chroma_from_smooth_saturation() {
+        fn texture(xyb: &crate::image::Image3F) -> f32 {
+            let sums = super::chroma_gradient_sums_scalar(
+                xyb.plane_data(0),
+                xyb.plane_data(1),
+                xyb.plane_data(2),
+                xyb.xsize(),
+            );
+            let sat = super::chroma_saturation_stat(xyb);
+            super::chroma_stats_from_sums(sums, xyb.xsize(), xyb.ysize(), sat)[2]
+        }
+        let mut xyb = crate::image::Image3F::new(32, 32);
+        for y in 0..32 {
+            let [x_row, y_row, b_row] = xyb.all_plane_rows_mut(y);
+            x_row.fill(0.0);
+            y_row.fill(0.5);
+            b_row.fill(0.5);
+        }
+        assert_eq!(texture(&xyb), 0.0);
+        // Smooth, strongly saturated: high chroma, zero texture.
+        for y in 0..32 {
+            xyb.all_plane_rows_mut(y)[2].fill(0.8);
+        }
+        assert_eq!(texture(&xyb), 0.0);
+        // Thin chromatic lines on neutral ground: the pair-B class. Period 3
+        // so the saturation stat's 4x4 subsample does not alias to zero.
+        for y in 0..32 {
+            let [_, _, b_row] = xyb.all_plane_rows_mut(y);
+            for (x, b) in b_row.iter_mut().enumerate() {
+                *b = if x % 3 == 0 { 0.6 } else { 0.5 };
+            }
+        }
+        assert!(texture(&xyb) > super::PAIR_B_TEXTURE_THRESHOLD);
+    }
+
+    #[test]
     fn chroma_saturation_stat_measures_xyb_deviation() {
         let mut xyb = crate::image::Image3F::new(16, 16);
         for y in 0..16 {
@@ -3013,7 +3079,7 @@ mod tests {
             }
             b_row.fill(0.5);
         }
-        assert_eq!(super::chroma_gradient_stats(&ctx, &xyb)[0], 0.0);
+        assert_eq!(super::chroma_gradient_stats(&ctx, &xyb, 0.0)[0], 0.0);
 
         // X carrying half of Y's gradient amplitude → stat 0.5, over the gate.
         for y in 0..32 {
@@ -3022,7 +3088,7 @@ mod tests {
                 *v = y_row[x] * 0.5;
             }
         }
-        let stat = super::chroma_gradient_stats(&ctx, &xyb)[0];
+        let stat = super::chroma_gradient_stats(&ctx, &xyb, 0.0)[0];
         assert!((stat - 0.5).abs() < 1e-5, "{stat}");
         assert!(stat >= super::X_QM_GRAD_THRESHOLD);
     }

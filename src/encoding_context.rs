@@ -37,12 +37,17 @@ use crate::{
 };
 
 #[inline]
-fn channel_weights_for_bias(bias: f32) -> [f32; 3] {
+fn channel_weights_for_bias(bias: f32, distance: f32) -> [f32; 3] {
     let matrix_mix = ((bias - xyb::B_BIAS) / (0.85 - xyb::B_BIAS)).clamp(0.0, 1.0);
+    // The coarse yellow transform protects chroma by itself. Carrying the
+    // fine-quality B error boost along with it mostly buys extra coefficients.
+    // Mild yellow matrices (bias <= 0.70) retain their existing weights.
+    let coarse = crate::yellow_opsin::coarse_weight_strength(distance)
+        * ((bias - 0.70) / 0.15).clamp(0.0, 1.0);
     [
         0.30 + (0.10 - 0.30) * matrix_mix,
         1.0,
-        0.28 + (0.83 - 0.28) * matrix_mix,
+        0.28 + (0.83 - 0.28) * matrix_mix * (1.0 - coarse),
     ]
 }
 
@@ -56,15 +61,20 @@ pub(crate) struct EncodingContext {
     pub(crate) lossy_modular: crate::LossyModular,
     pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) xyb: xyb::XybMatrix,
+    /// Cached with the matrix, including a later adaptive yellow selection.
+    channel_weights: [f32; 3],
     /// Transform-merge knobs resolved at this encodes distance.
     pub(crate) merge: ac_strategy::MergeTuning,
     base_matrices: &'static DequantMatrices,
     sat_matrices: &'static DequantMatrices,
-    plain_hq_matrices: &'static DequantMatrices,
+    pair_b_matrices: &'static DequantMatrices,
+    sat_pair_b_matrices: &'static DequantMatrices,
+    x_heavy_matrices: &'static DequantMatrices,
     /// Set once per frame (post-XYB, before any table use) by the
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
+    pair_b_fine: std::sync::atomic::AtomicBool,
     /// Blue-axis twin of `x_heavy`: structure lives in B−Y where luma-driven
     /// masking cannot see it (saturated blue detail on low-luma ground).
     b_heavy: std::sync::atomic::AtomicBool,
@@ -126,19 +136,30 @@ pub(crate) struct EncodingContext {
 
 impl EncodingContext {
     /// The dequant tables for the current frame: the distance-tier default,
-    /// the saturated-content variant when the chroma gate fired, or the plain
-    /// sub-d=0.3 set when the X-gradient gate fired (it outranks the chroma
-    /// gate: both fire on saturated red content, where flattened B bands are
-    /// a strict RD loss).
+    /// the saturated-content variant when the chroma gate fired, or the
+    /// X-gradient variant (it outranks the chroma gate: both fire on saturated
+    /// red content, where flattened B bands are a strict RD loss).
     #[inline]
     pub(crate) fn matrices(&self) -> &'static DequantMatrices {
-        if self.x_heavy.load(std::sync::atomic::Ordering::Relaxed) {
-            self.plain_hq_matrices
-        } else if self.chroma_heavy.load(std::sync::atomic::Ordering::Relaxed) {
-            self.sat_matrices
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.x_heavy.load(Relaxed) {
+            self.x_heavy_matrices
         } else {
-            self.base_matrices
+            match (
+                self.chroma_heavy.load(Relaxed),
+                self.pair_b_fine.load(Relaxed),
+            ) {
+                (true, true) => self.sat_pair_b_matrices,
+                (true, false) => self.sat_matrices,
+                (false, true) => self.pair_b_matrices,
+                (false, false) => self.base_matrices,
+            }
         }
+    }
+
+    pub(crate) fn set_pair_b_fine(&self, fine: bool) {
+        self.pair_b_fine
+            .store(fine, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn set_chroma_heavy(&self, heavy: bool) {
@@ -182,13 +203,16 @@ impl EncodingContext {
         MULTIPLIERS[(self.b_qm_scale().clamp(2, 7) - 2) as usize]
     }
 
-    /// Distortion weights fitted at the two validated opsin endpoints and
-    /// interpolated for the signalled B row. Keeping the spec weights while
-    /// using the blue-biased row under-prices the channel whose energy that
-    /// row deliberately increases.
+    /// Update the adaptive matrix and its cached reconstruction weights together.
+    #[inline]
+    pub(crate) fn set_xyb_matrix(&mut self, matrix: xyb::XybMatrix, distance: f32) {
+        self.xyb = matrix;
+        self.channel_weights = channel_weights_for_bias(matrix.fwd[8], distance);
+    }
+
     #[inline]
     pub(crate) fn channel_weights(&self) -> [f32; 3] {
-        channel_weights_for_bias(self.xyb.fwd[8])
+        self.channel_weights
     }
 
     #[inline]
@@ -212,12 +236,20 @@ impl EncodingContext {
             lossy_modular: crate::LossyModular::Off,
             boost,
             xyb,
+            channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
             base_matrices: DequantMatrices::new(distance),
             sat_matrices: DequantMatrices::new_saturated(distance),
-            plain_hq_matrices: DequantMatrices::new(0.0),
+            pair_b_matrices: DequantMatrices::new_pair_b(distance),
+            sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance),
+            x_heavy_matrices: if speed == Speed::Slow {
+                DequantMatrices::new_x_heavy(distance)
+            } else {
+                DequantMatrices::new(0.0)
+            },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
+            pair_b_fine: std::sync::atomic::AtomicBool::new(false),
             b_heavy: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
@@ -295,18 +327,61 @@ mod tests {
     use super::channel_weights_for_bias;
 
     #[test]
+    fn hue_tables_require_the_frame_content_gate() {
+        use super::{DequantMatrices, EncodingContext, Speed, xyb};
+        let ctx = EncodingContext::new(Speed::Slow, None, xyb::XybMatrix::SPEC, 1.0, 1);
+        assert!(std::ptr::eq(ctx.matrices(), DequantMatrices::new(1.0)));
+        ctx.set_chroma_heavy(true);
+        assert!(std::ptr::eq(
+            ctx.matrices(),
+            DequantMatrices::new_saturated(1.0)
+        ));
+        ctx.set_x_heavy(true);
+        assert!(std::ptr::eq(
+            ctx.matrices(),
+            DequantMatrices::new_x_heavy(1.0)
+        ));
+        ctx.set_x_heavy(false);
+        assert!(std::ptr::eq(
+            ctx.matrices(),
+            DequantMatrices::new_saturated(1.0)
+        ));
+    }
+
+    #[test]
     fn channel_weights_follow_the_opsin_b_row() {
         assert_eq!(
-            channel_weights_for_bias(crate::xyb::B_BIAS),
+            channel_weights_for_bias(crate::xyb::B_BIAS, 1.0),
             [0.30, 1.0, 0.28]
         );
-        let strong = channel_weights_for_bias(0.85);
+        let strong = channel_weights_for_bias(0.85, 1.0);
         assert!((strong[0] - 0.10).abs() < 1e-6);
         assert_eq!(strong[1], 1.0);
         assert!((strong[2] - 0.83).abs() < 1e-6);
 
-        let mid = channel_weights_for_bias((crate::xyb::B_BIAS + 0.85) * 0.5);
+        let mid = channel_weights_for_bias((crate::xyb::B_BIAS + 0.85) * 0.5, 1.0);
         assert!((mid[0] - 0.20).abs() < 1e-6);
         assert!((mid[2] - 0.555).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adaptive_matrix_updates_cached_coarse_weights() {
+        use super::{EncodingContext, Speed, xyb};
+        let mut ctx = EncodingContext::new(Speed::Slow, None, xyb::XybMatrix::SPEC, 2.0, 1);
+        assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
+        let matrix = crate::yellow_opsin::matrix_for_bias(0.90);
+        ctx.set_xyb_matrix(matrix, 2.0);
+        assert_eq!(ctx.xyb, matrix);
+        let coarse = ctx.channel_weights();
+        assert!((coarse[0] - 0.10).abs() < 1e-6);
+        assert_eq!(coarse[1], 1.0);
+        assert_eq!(coarse[2], 0.28);
+        // The smooth-yellow tier and the successful d1 path keep their boost.
+        assert_eq!(
+            channel_weights_for_bias(0.70, 2.0),
+            channel_weights_for_bias(0.70, 1.0)
+        );
+        ctx.set_xyb_matrix(crate::yellow_opsin::matrix_for_bias(0.85), 1.0);
+        assert_eq!(ctx.channel_weights(), channel_weights_for_bias(0.85, 1.0));
     }
 }

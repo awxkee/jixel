@@ -47,9 +47,6 @@ pub(crate) const R_ZERO: f32 = 0.5;
 const R_MAG: f32 = 1.0;
 const R_HEADER: f32 = 0.4;
 // Per-channel distortion weights (X, Y, B).
-// Re-fitted 2026-08-01 for the spec opsin matrix (b_bias revert): breadth
-// study wants cw_b ~0.28 (the 0.83 was fitted for the blue-biased row whose
-// B channel carried 1.5x more energy); cw_x is a flat axis, 0.30 is mid-plateau.
 pub(crate) static CHANNEL_WEIGHT: [f32; 3] = [0.30, 1.0, 0.28];
 
 pub(crate) const RATE_LOG2_LUT_N: usize = 1024;
@@ -529,11 +526,26 @@ pub(crate) struct ReconKernels<'a> {
     pub(crate) error: &'a ReconErrorKernels,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReconCost {
+    pub(crate) distortion: f32,
+    pub(crate) rate: f32,
+    /// Weighted hue/desaturation contribution already included in distortion.
+    pub(crate) hue_distortion: f32,
+}
+
+impl ReconCost {
+    #[inline]
+    pub(crate) fn dist_and_rate(self) -> (f32, f32) {
+        (self.distortion, self.rate)
+    }
+}
+
 pub(crate) type ReconDistAndRateFn = for<'a, 'input, 'kernels> fn(
     &mut [[f32; 1024]; 8],
     &'input ReconDistInput<'a>,
     &'kernels ReconErrorKernels,
-) -> (f32, f32);
+) -> ReconCost;
 
 #[allow(dead_code)]
 pub(crate) fn combine_error_scalar(
@@ -664,7 +676,7 @@ fn recon_dist_and_rate_default(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
-) -> (f32, f32) {
+) -> ReconCost {
     recon_dist_and_rate_with_kernels(
         scratch,
         input,
@@ -682,7 +694,7 @@ fn recon_dist_and_rate_default(
 pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
-) -> (f32, f32) {
+) -> ReconCost {
     let error = ReconErrorKernels {
         gradient_energy: error_gradient_energy_scalar,
         gradient_peak_energy: error_gradient_peak_energy_scalar,
@@ -783,7 +795,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
     kernels: &ReconKernels<'_>,
-) -> (f32, f32) {
+) -> ReconCost {
     let quantization = &input.quantization;
     let transform = &input.transform;
     let source = &input.source;
@@ -948,8 +960,9 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
             coeff_error[c][..n].copy_from_slice(error);
         }
     }
+    let mut hue_distortion = 0.0;
     if rgb_hue_alpha > 0.0 {
-        distortion += rgb_hue_alpha
+        hue_distortion = rgb_hue_alpha
             * unsafe {
                 rgb_hue_chroma_edge_loss(
                     opsin,
@@ -965,8 +978,13 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                     &scoring.xyb_matrix,
                 )
             };
+        distortion += hue_distortion;
     }
-    (distortion, rate)
+    ReconCost {
+        distortion,
+        rate,
+        hue_distortion,
+    }
 }
 
 #[inline]
@@ -1050,7 +1068,11 @@ fn rgb_hue_chroma_pixel_loss(
     let source_lab = linear_rgb_to_oklab(source_rgb);
     let recon_lab = linear_rgb_to_oklab(recon_rgb);
     let source_chroma = fmla(source_lab[1], source_lab[1], source_lab[2] * source_lab[2]).sqrt();
-    let brightness_risk = ((source_lab[0] - 0.35) * (1.0 / 0.40)).clamp(0.0, 1.0);
+    // Blue has low perceptual lightness even when visibly saturated. Its
+    // negative OKLab b supplies a local lift; warm hues retain the original
+    // brightness gate, avoiding a frame-wide increase in the chroma budget.
+    let brightness_risk =
+        ((source_lab[0] - 0.35 - source_lab[2].min(0.0)) * (1.0 / 0.40)).clamp(0.0, 1.0);
     let chroma_risk = ((source_chroma - 0.03) * (1.0 / 0.12)).clamp(0.0, 1.0);
     let risk = edge_risk * brightness_risk * chroma_risk;
     risk * hue_chroma_error(
@@ -1060,7 +1082,7 @@ fn rgb_hue_chroma_pixel_loss(
     )
 }
 
-/// Penalize decoder-domain hue rotation and chroma collapse only on bright,
+/// Penalize decoder-domain hue rotation and chroma collapse only on visible,
 /// saturated source pixels that sit on an opponent-color edge. The radial
 /// component penalizes loss along the original hue, including hue reversal;
 /// the perpendicular component measures rotation without an angle singularity
@@ -1347,6 +1369,91 @@ mod tests {
     };
 
     #[test]
+    fn reported_hue_cost_matches_the_reused_reconstruction_errors() {
+        use super::*;
+        let matrix = crate::xyb::XybMatrix::SPEC;
+        let mut opsin = Image3F::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let rgb = if (x + y) % 3 == 0 {
+                    [0.9, 0.85, 0.05]
+                } else {
+                    [0.02, 0.03, 0.8]
+                };
+                let (a, b, c) = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, rgb[0], rgb[1], rgb[2]);
+                for (channel, value) in [a, b, c].into_iter().enumerate() {
+                    opsin.plane_row_mut(channel, y)[x] = value;
+                }
+            }
+        }
+        let coeffs: [[f32; 64]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.013 - 0.18)
+        });
+        let inverse = [1.0; 64];
+        let idct = IdctMethods::scalar();
+        let mut input = ReconDistInput {
+            idct: &idct,
+            quantization: ReconQuantization {
+                rate_log2_lut: rate_log2_lut(),
+                coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
+                inverse_matrices: [&inverse; 3],
+                qac: 7.0,
+                qm_mult_x: 1.2,
+                qm_mult_b: 1.6,
+                distance: 4.0,
+            },
+            transform: ReconTransform {
+                blocks_x: 1,
+                blocks_y: 1,
+                strategy: crate::dc_group_data::STRATEGY_DCT,
+            },
+            source: ReconSource {
+                opsin: &opsin,
+                x: 0,
+                y: 0,
+            },
+            scoring: ReconScoring {
+                factor_x: 0.15,
+                factor_b: -0.1,
+                channel_weights: CHANNEL_WEIGHT,
+                xyb_matrix: matrix,
+                rgb_hue_alpha: 0.0,
+                gradient_alpha: 0.0,
+                gradient_peak_alpha: 0.0,
+                keep_spatial_errors: true,
+            },
+        };
+        let error = ReconErrorKernels {
+            gradient_energy: select_error_gradient_energy_fn(),
+            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
+            combine: select_combine_error_fn(),
+            rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
+        };
+        let reconstruct = select_recon_dist_and_rate_fn();
+        let mut scratch = [[0.0; 1024]; 8];
+        let base = reconstruct(&mut scratch, &input, &error);
+        assert_eq!(base.hue_distortion, 0.0);
+        input.scoring.rgb_hue_alpha = 800.0;
+        let scored = reconstruct(&mut scratch, &input, &error);
+        let expected = 800.0
+            * unsafe {
+                (error.rgb_hue_chroma_edge_loss)(
+                    &opsin,
+                    0,
+                    0,
+                    8,
+                    8,
+                    [&scratch[0][..64], &scratch[1][..64], &scratch[2][..64]],
+                    &matrix,
+                )
+            };
+        assert!(expected > 0.0);
+        assert_eq!(scored.hue_distortion, expected);
+        assert_eq!(scored.rate, base.rate);
+        assert_eq!(scored.distortion, base.distortion + expected);
+    }
+
+    #[test]
     fn hue_reversal_costs_more_than_losing_chroma() {
         let source = [0.2, 0.0];
         let loss = |reconstructed| super::hue_chroma_error(source, reconstructed, 0.2);
@@ -1356,6 +1463,41 @@ mod tests {
         assert!(loss([-0.2, 0.0]) > loss([0.0, 0.2]));
         assert!((loss([-0.2, 0.0]) - 4.0 * loss([0.0, 0.0])).abs() < 1e-6);
         assert_eq!(super::hue_chroma_error([0.0; 2], [0.0; 2], 0.0), 0.0);
+    }
+
+    #[test]
+    fn dark_blue_edges_keep_a_hue_penalty_below_the_old_lightness_cutoff() {
+        let matrix = crate::xyb::XybMatrix::SPEC;
+        let blue_rgb = [0.0, 0.0, 0.2];
+        assert!(super::linear_rgb_to_oklab(blue_rgb)[0] < 0.35);
+        let blue = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, 0.0, 0.0, 0.2);
+        let gray = crate::xyb::rgb_to_xyb_pixel_f32(&matrix, 0.02, 0.02, 0.02);
+        let mut opsin = crate::image::Image3F::new(8, 8);
+        let mut error = [[0.0; 64]; 3];
+        for y in 0..8 {
+            for x in 0..4 {
+                for (c, value) in [blue.0, blue.1, blue.2].into_iter().enumerate() {
+                    opsin.plane_row_mut(c, y)[x] = value;
+                    error[c][y * 8 + x] = value - [gray.0, gray.1, gray.2][c];
+                }
+            }
+        }
+        let errors = [&error[0][..], &error[1][..], &error[2][..]];
+        let expected = rgb_hue_chroma_edge_loss_scalar(&opsin, 0, 0, 8, 8, errors, &matrix);
+        assert!(
+            expected > 1e-4,
+            "dark blue desaturation was unpenalized: {expected}"
+        );
+        let actual =
+            unsafe { select_rgb_hue_chroma_edge_loss_fn()(&opsin, 0, 0, 8, 8, errors, &matrix) };
+        assert!((actual / expected - 1.0).abs() < 2e-4);
+        let zero = [0.0; 64];
+        assert_eq!(
+            unsafe {
+                select_rgb_hue_chroma_edge_loss_fn()(&opsin, 0, 0, 8, 8, [&zero; 3], &matrix)
+            },
+            0.0
+        );
     }
 
     #[test]

@@ -394,7 +394,9 @@ fn find_quant_refinements(
         );
         let mut cost = |q: u8| {
             let qac = params.scale * q as f32;
-            let (distortion, rate) = reconstruction_dist_and_rate(
+            let ReconCost {
+                distortion, rate, ..
+            } = reconstruction_dist_and_rate(
                 ctx,
                 recon,
                 coeffs,
@@ -1328,9 +1330,16 @@ const FINE_MOSAIC_MARGIN: f32 = 1.0;
 const FINE_MOSAIC_RATE_CORRECTION_BITS: f32 = 8.0;
 /// Cap on how much pure-RD deficit the seam bonus may purchase
 const FINE_MOSAIC_SEAM_SUBSIDY_BITS: f32 = 8.0;
-/// The mosaic arm's own distance ceiling, tighter than the sub-8 selection's
-/// FINE_TRANSFORM_MAX_DISTANCE.
+/// Preserve the existing mosaic search through this distance. Above it,
+/// chromatic frames must also pass the reconstruction hue-error gate.
 const FINE_MOSAIC_MAX_DISTANCE: f32 = 3.0;
+
+/// A pair's hue loss alone must exceed the extra rate charge for two fine
+/// children before we spend work reconstructing them. The full joint score
+/// still decides whether any finer assignment is actually worth encoding.
+fn coarse_mosaic_hue_is_costly(hue_distortion: f32, lambda: f32) -> bool {
+    hue_distortion > lambda * (2.0 * FINE_MOSAIC_RATE_CORRECTION_BITS)
+}
 
 const FINE_MOSAIC_CANDIDATES: [u8; 3] = [STRATEGY_DCT, STRATEGY_IDENTITY, STRATEGY_DCT2X2];
 /// Most children a joint mosaic can cover (sized for a 2x2-block 16x16; the
@@ -1415,6 +1424,7 @@ impl Default for FineMosaicScratch {
             base: f32::NAN,
             distortion: f32::NAN,
             rate: f32::NAN,
+            hue_distortion: f32::NAN,
         };
         Self {
             big_error: crate::util::heap_array([0.0; 1024]),
@@ -1456,6 +1466,7 @@ fn find_rerank_downgrades(
     // by this region's cost pass, so subsequent passes need no clearing.
     let mosaic = &mut output.fine_mosaic;
     let fine_lambda = fine_mosaic_lambda(params.distance);
+    let coarse_chromatic = ctx.x_heavy();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
             continue;
@@ -1529,7 +1540,7 @@ fn find_rerank_downgrades(
             params.distance,
         );
         let with_fine_mosaic = ctx.speed == crate::Speed::Slow
-            && params.distance <= FINE_MOSAIC_MAX_DISTANCE
+            && (params.distance <= FINE_MOSAIC_MAX_DISTANCE || coarse_chromatic)
             && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
         debug_assert!(!with_fine_mosaic || cxb * cyb <= FINE_MOSAIC_MAX_CHILDREN);
         let region_pixels = cxb * cyb * 64;
@@ -1559,6 +1570,11 @@ fn find_rerank_downgrades(
             },
         );
         let (j_big, big_current_cost) = (big.cost, big.base);
+        // Reuse the hue contribution already computed for the merged arm;
+        // no extra color conversion or reconstruction is needed for this gate.
+        let with_fine_mosaic = with_fine_mosaic
+            && (params.distance <= FINE_MOSAIC_MAX_DISTANCE
+                || coarse_mosaic_hue_is_costly(big.hue_distortion, fine_lambda));
         let (big_boundary, big_peak) = if with_fine_mosaic {
             block_boundary_error_stats(
                 ctx,

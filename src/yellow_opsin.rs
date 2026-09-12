@@ -73,12 +73,16 @@ const MIN_SPEC_COST: f32 = 0.0005;
 /// separated).
 const YELLOW_EDGE_MIN: f32 = 0.24;
 
-/// Tier-1 used to switch the matrix and b_qm_scale=5 off together at 1.25.
-/// On Burning_Ship that boundary dropped 6.35 SS2 for only 3.4% rate. Keep
-/// full strength through the validated band, then fade the matrix while the
-/// integer B scale is released in smaller stages.
-const STRONG_FADE_START: f32 = 1.25;
-const MAX_DISTANCE: f32 = 1.55;
+/// Ordinary content releases the strong matrix in this band. Only red-green
+/// chromatic structure retains it, together with the coarse mosaic search.
+const STRONG_FADE_START: f32 = 2.5;
+const MAX_DISTANCE: f32 = 3.0;
+/// Same opponent-gradient ratio as the frame's X-heavy classifier. This
+/// pre-conversion estimate uses immediate neighbors on a 1/64 pixel grid.
+const COARSE_X_GRADIENT_MIN: f32 = 0.04;
+const STRONG_REFERENCE_DISTANCE: f32 = 1.25;
+const STRONG_COARSE_DISTANCE: f32 = 2.0;
+const STRONG_COARSE_BIAS: f32 = 0.90;
 
 /// Tier-2 (smooth yellow, below the edge gate): the mild bias fires when
 /// yellow is a *subject*, not an accent — at least this fraction of sampled
@@ -141,6 +145,46 @@ const BIAS_HI: f32 = CANDIDATE_BIASES[2];
 #[inline(always)]
 fn ramp(x: f32, lo: f32, hi: f32) -> f32 {
     ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+fn coarse_distance_strength(distance: f32) -> f32 {
+    ramp(distance, STRONG_REFERENCE_DISTANCE, STRONG_COARSE_DISTANCE)
+}
+
+/// The matrix and the coarse fine-transform search need to serve the same
+/// content class. Keeping the matrix alone costs rate on blue-axis structure
+/// and ordinary photos. X/Y are independent of the candidate B row, so this
+/// source estimate does not depend on which matrix the proxy selects.
+fn has_coarse_x_structure(linear: &Image3F) -> bool {
+    let (w, h) = (linear.xsize(), linear.ysize());
+    let [rp, gp, bp] = std::array::from_fn(|c| linear.plane_data(c));
+    let xy = |i| {
+        let (x, y, _) = rgb_to_xyb_pixel_f32(&XybMatrix::SPEC, rp[i], gp[i], bp[i]);
+        (x, y)
+    };
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    for y in (0..h).step_by(SAMPLE_STRIDE) {
+        for x in (0..w).step_by(SAMPLE_STRIDE) {
+            let i = y * w + x;
+            let (cx, cy) = xy(i);
+            for neighbor in [(x + 1 < w).then_some(i + 1), (y + 1 < h).then_some(i + w)]
+                .into_iter()
+                .flatten()
+            {
+                let (nx, ny) = xy(neighbor);
+                sum_x += (nx - cx).abs();
+                sum_y += (ny - cy).abs();
+            }
+        }
+    }
+    sum_y > f32::EPSILON && sum_x >= COARSE_X_GRADIENT_MIN * sum_y
+}
+
+/// Release the fine-quality error boost before the matrix reaches its coarse
+/// target. Keeping that boost until d=2 overspends in the d=1.5 transition.
+pub(crate) fn coarse_weight_strength(distance: f32) -> f32 {
+    ramp(distance, STRONG_REFERENCE_DISTANCE, 1.5)
 }
 
 /// Per-pixel score for the bright-yellow risk region, on linear RGB in [0,1].
@@ -467,9 +511,7 @@ fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -
 /// unless the biased matrix demonstrably reduces yellow-chroma damage more
 /// than it costs on ordinary content.
 fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
-    // Each tier enforces its own distance band; the shared upper bound here
-    // only skips work past both.
-    if distance >= MAX_DISTANCE.max(TIER2_MAX_DISTANCE) || !has_yellow_risk(linear) {
+    if !has_yellow_risk(linear) {
         return (SPEC_BIAS, false);
     }
 
@@ -481,12 +523,20 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
     if yellow_edge < YELLOW_EDGE_MIN {
         return (choose_tier2_bias(&samples, yellow_edge, distance), false);
     }
-    // Tier-1 (thin-HF yellow, strong bias) has its own, tighter cap.
     let tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance);
-    if distance >= MAX_DISTANCE {
+    let strength = if distance > STRONG_FADE_START && !has_coarse_x_structure(linear) {
+        1.0 - ramp(distance, STRONG_FADE_START, MAX_DISTANCE)
+    } else {
+        1.0
+    };
+    if strength == 0.0 {
         return (tier2_bias, false);
     }
-    let steps = proxy_steps(distance);
+    // Past the validated fine-quality band, keep the proxy's selection
+    // stable. Its per-pixel quantization otherwise alternates between the
+    // mild and strong rows as distance crosses individual sample thresholds;
+    // that is not a measurement of the high-frequency AC loss we are fixing.
+    let steps = proxy_steps(distance.min(STRONG_REFERENCE_DISTANCE));
     let candidates = [SPEC_BIAS, BIAS_MID, BIAS_HI];
 
     let mut best_bias = SPEC_BIAS;
@@ -515,7 +565,9 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
     if spec_cost < MIN_SPEC_COST || best_cost > REL_COST_RATIO * spec_cost {
         return (tier2_bias, false);
     }
-    let strength = 1.0 - ramp(distance, STRONG_FADE_START, MAX_DISTANCE);
+    if best_bias == BIAS_HI {
+        best_bias += (STRONG_COARSE_BIAS - BIAS_HI) * coarse_distance_strength(distance);
+    }
     (tier2_bias + (best_bias - tier2_bias) * strength, true)
 }
 
@@ -592,7 +644,7 @@ mod tests {
 
     #[test]
     fn derived_inverse_matches_forward() {
-        for bias in [0.60, 0.70, 0.85] {
+        for bias in [0.60, 0.70, 0.85, STRONG_COARSE_BIAS] {
             let m = matrix_for_bias(bias);
             let prod = matmul3(&m.fwd, &m.inv);
             for i in 0..3 {
@@ -643,7 +695,7 @@ mod tests {
 
     #[test]
     fn xyb_round_trip_through_derived_matrices() {
-        for bias in [SPEC_BIAS, 0.70, 0.85] {
+        for bias in [SPEC_BIAS, 0.70, 0.85, STRONG_COARSE_BIAS] {
             let m = matrix_for_bias(bias);
             for rgb in [
                 [0.9, 0.85, 0.1],
@@ -746,28 +798,60 @@ mod tests {
     }
 
     #[test]
-    fn strong_tier_hands_off_to_the_mild_tier_past_its_cap() {
-        // High-edge yellow that also fills the frame: passes the tier-1 edge
-        // gate AND tier-2's area gate. Past the tier-1 cap it must keep the
-        // mild bias instead of dropping to spec, without an upward step.
-        let mut edged = filled(64, 64, [0.9, 0.85, 0.05]);
+    fn coarse_structure_gate_distinguishes_opponent_axes_in_both_directions() {
+        for vertical in [false, true] {
+            for (other, expected) in [([1.0, 0.0, 0.0], true), ([0.0, 0.0, 1.0], false)] {
+                let mut edged = filled(32, 32, [1.0, 1.0, 0.0]);
+                for y in 0..32 {
+                    for x in 0..32 {
+                        if (if vertical { y } else { x }) % 2 == 1 {
+                            for (c, value) in other.into_iter().enumerate() {
+                                edged.plane_row_mut(c, y)[x] = value;
+                            }
+                        }
+                    }
+                }
+                assert_eq!(has_coarse_x_structure(&edged), expected);
+                if !expected {
+                    assert_eq!(choose_b_bias(&edged, 6.0), SPEC_BIAS);
+                }
+            }
+        }
+        assert!(!has_coarse_x_structure(&filled(1, 1, [1.0, 1.0, 0.0])));
+    }
+
+    #[test]
+    fn strong_tier_keeps_protection_at_coarse_distances() {
+        // Sparse yellow edges pass the strong proxy; nearby red/green edges
+        // also pass the coarse structure gate. Both protections must survive
+        // the old d3 and d5 search boundaries.
+        let mut edged = filled(64, 64, [0.0, 0.0, 0.0]);
         for y in (0..64).step_by(SAMPLE_STRIDE) {
             for x in (0..64).step_by(SAMPLE_STRIDE) {
-                if x + 1 < 64 {
+                let rgb = if (x / SAMPLE_STRIDE + y / SAMPLE_STRIDE) % 4 == 0 {
+                    [0.9, 0.85, 0.05]
+                } else {
+                    [0.5, 0.0, 0.0]
+                };
+                for c in 0..3 {
+                    edged.plane_row_mut(c, y)[x] = rgb[c];
+                }
+                if rgb[1] == 0.0 {
+                    let green = [0.0, 0.25, 0.0];
                     for c in 0..3 {
-                        edged.plane_row_mut(c, y)[x + 1] = 0.0;
+                        edged.plane_row_mut(c, y)[x + 1] = green[c];
+                        edged.plane_row_mut(c, y + 1)[x] = green[c];
                     }
                 }
             }
         }
         assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
-        let past_cap = select_yellow(&edged, MAX_DISTANCE + 0.2);
-        assert!(past_cap.matrix.is_some());
-        assert_eq!(past_cap.b_qm_scale, 2);
-        let before = choose_b_bias(&edged, MAX_DISTANCE - 0.001);
-        let after = choose_b_bias(&edged, MAX_DISTANCE + 0.001);
-        assert!((before - after).abs() < 0.01, "{before} vs {after}");
-        // Tier-2's own distance cap still ends the protection.
-        assert_eq!(choose_b_bias(&edged, TIER2_MAX_DISTANCE), SPEC_BIAS);
+        assert!(has_coarse_x_structure(&edged));
+        let bias = choose_b_bias(&edged, 2.0);
+        assert!(bias > SPEC_BIAS);
+        for distance in [2.5, 2.999, 3.0, 3.001, 4.0, 5.0, 6.0, 25.0] {
+            assert_eq!(choose_b_bias(&edged, distance), bias);
+            assert_eq!(select_yellow(&edged, distance).b_qm_scale, 2);
+        }
     }
 }

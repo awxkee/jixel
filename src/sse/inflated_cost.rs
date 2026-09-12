@@ -226,7 +226,10 @@ pub(crate) fn rgb_hue_chroma_edge_loss_sse41(
                 _mm_max_ps(source_chroma, _mm_set1_ps(1e-4)),
             );
             let brightness_risk = clamp01_f32x4(_mm_mul_ps(
-                _mm_sub_ps(source_l, _mm_set1_ps(0.35)),
+                _mm_sub_ps(
+                    _mm_sub_ps(source_l, _mm_set1_ps(0.35)),
+                    _mm_min_ps(source_b, zero),
+                ),
                 _mm_set1_ps(1.0 / 0.40),
             ));
             let chroma_risk = clamp01_f32x4(_mm_mul_ps(

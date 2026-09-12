@@ -30,8 +30,8 @@
 use super::ac_strategy::neon_log2p1_f32;
 use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
-    RateLog2Lut, ReconDistInput, ReconErrorKernels, ReconKernels, recon_dist_and_rate_with_kernels,
-    validate_ssim_inputs,
+    RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
+    recon_dist_and_rate_with_kernels, validate_ssim_inputs,
 };
 use std::arch::aarch64::*;
 
@@ -220,7 +220,10 @@ pub(crate) fn rgb_hue_chroma_edge_loss_neon(
                 vmaxq_f32(source_chroma, vdupq_n_f32(1e-4)),
             );
             let brightness_risk = clamp01_f32x4(vmulq_n_f32(
-                vsubq_f32(source_l, vdupq_n_f32(0.35)),
+                vsubq_f32(
+                    vsubq_f32(source_l, vdupq_n_f32(0.35)),
+                    vminq_f32(source_b, zero),
+                ),
                 1.0 / 0.40,
             ));
             let chroma_risk = clamp01_f32x4(vmulq_n_f32(
@@ -470,7 +473,7 @@ pub(crate) fn recon_dist_and_rate_neon(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
-) -> (f32, f32) {
+) -> ReconCost {
     recon_dist_and_rate_neon_impl::<true>(scratch, input, error)
 }
 
@@ -479,7 +482,7 @@ fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
     scratch: &mut [[f32; 1024]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
-) -> (f32, f32) {
+) -> ReconCost {
     recon_dist_and_rate_with_kernels(
         scratch,
         input,
@@ -855,16 +858,16 @@ mod tests {
                         )
                     }
                 };
-                let rate_tolerance = 2e-4f32.max(scalar.1.abs() * 3e-6);
+                let rate_tolerance = 2e-4f32.max(scalar.rate.abs() * 3e-6);
                 assert!(
-                    (simd.1 - scalar.1).abs() <= rate_tolerance,
+                    (simd.rate - scalar.rate).abs() <= rate_tolerance,
                     "strategy {strategy} biased={biased} rate: simd={} scalar={}",
-                    simd.1,
-                    scalar.1
+                    simd.rate,
+                    scalar.rate
                 );
-                let tolerance = 5e-4f32.max(scalar.0.abs() * 3e-5);
+                let tolerance = 5e-4f32.max(scalar.distortion.abs() * 3e-5);
                 assert!(
-                    (simd.0 - scalar.0).abs() <= tolerance,
+                    (simd.distortion - scalar.distortion).abs() <= tolerance,
                     "strategy {strategy} biased={biased}: simd={simd:?} scalar={scalar:?}"
                 );
             }

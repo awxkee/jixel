@@ -43,6 +43,9 @@ const QM_SS2_MIN_DISTANCE: f32 = 2.25;
 const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
 const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
 pub(crate) const QM_FLAT_B8_MID_MIN_DISTANCE: f32 = 1.25;
+pub(crate) const PAIR_B_FINE_BAND1: f32 = -0.35;
+pub(crate) const PAIR_B_FINE_MIN_DISTANCE: f32 = QM_FLAT_B8_MID_MIN_DISTANCE;
+pub(crate) const PAIR_B_FINE_MAX_DISTANCE: f32 = QM_SS2_MIN_DISTANCE;
 const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
 const QM_SS2_SCALE16X32: f32 = 1.20;
@@ -57,6 +60,13 @@ static DCT8_BANDS: [[f32; 6]; 3] = [
 static FLAT_B8_BANDS_HQ: [f32; 6] = [512.0, -0.5, -0.25, 0.0, -0.25, -0.5];
 static FLAT_B8_BANDS_MID: [f32; 6] = [512.0, -0.13, -0.235, -0.276, -0.609, -0.339];
 static SAT_B8_BANDS: [f32; 6] = [512.0, 0.024, -0.517, -0.011, -0.357, -0.674];
+
+// A modest first-band refinement for the X-gradient-heavy content class.
+// Flattening the whole B row spends too much at matched rate on this class;
+// retain the spec's remaining band transitions. The benefit is confined to
+// the band where the hue rerank is fully active and coarse RDOQ has not begun.
+const HUE_B8_MIN_DISTANCE: f32 = 0.75;
+static HUE_B8_BANDS: [f32; 6] = [512.0, -1.5, -1.0, 0.0, -1.0, -2.0];
 
 fn default_dct8_override(use_coarse: bool, flat_b8: &[f32; 6]) -> BandOverride {
     let mut out = if use_coarse {
@@ -890,7 +900,6 @@ fn band_mult(v: f32) -> f32 {
     if v > 0.0 { 1.0 + v } else { 1.0 / (1.0 - v) }
 }
 
-#[cfg(test)]
 static DCT16X8_BANDS: [[f32; 7]; 3] = [
     // X
     [7240.7734393502, -0.7, -0.7, -0.2, -0.2, -0.2, -0.5],
@@ -1399,7 +1408,6 @@ fn compute_dct32x32_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 
     out
 }
 
-#[cfg(test)]
 fn compute_dct16x8_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 3, 128> {
     const NUM_BANDS: usize = 7;
     let mut src = DCT16X8_BANDS;
@@ -1650,6 +1658,18 @@ fn shared_tables() -> &'static SharedTables {
 }
 
 impl DequantMatrices {
+    /// Tables selected after the X-gradient classifier runs. Keep this
+    /// separate from `new`: the yellow opsin proxy must retain its original
+    /// quantization model when choosing the color matrix.
+    pub(crate) fn new_x_heavy(distance: f32) -> &'static Self {
+        static HUE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if (HUE_B8_MIN_DISTANCE..QM_SS2_MIN_DISTANCE).contains(&distance) {
+            HUE.get_or_init(|| Self::compute(false, false, Some(&HUE_B8_BANDS), false))
+        } else {
+            Self::new(0.0)
+        }
+    }
+
     pub(crate) fn new(distance: f32) -> &'static Self {
         static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static DEFAULT_HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
@@ -1657,15 +1677,35 @@ impl DequantMatrices {
         static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance >= QM_DCT8_MIN_DISTANCE {
-            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID)))
+            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID), false))
         } else if distance >= QM_SS2_MIN_DISTANCE {
-            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID)))
+            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID), false))
         } else if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
-            DEFAULT_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID)))
+            DEFAULT_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), false))
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            DEFAULT_HQ.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ)))
+            DEFAULT_HQ.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false))
         } else {
-            HQ.get_or_init(|| Self::compute(false, false, None))
+            HQ.get_or_init(|| Self::compute(false, false, None, false))
+        }
+    }
+
+    /// Tier set with the finer pair-B row; outside its distance band this is
+    /// exactly [`Self::new`], so the gate is inert there by construction.
+    pub(crate) fn new_pair_b(distance: f32) -> &'static Self {
+        static PAIR_MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
+            PAIR_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), true))
+        } else {
+            Self::new(distance)
+        }
+    }
+
+    pub(crate) fn new_saturated_pair_b(distance: f32) -> &'static Self {
+        static SAT_PAIR: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
+            SAT_PAIR.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), true))
+        } else {
+            Self::new_saturated(distance)
         }
     }
 
@@ -1674,17 +1714,22 @@ impl DequantMatrices {
         static SAT_SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static SAT_COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance >= QM_DCT8_MIN_DISTANCE {
-            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS)))
+            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS), false))
         } else if distance >= QM_SS2_MIN_DISTANCE {
-            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS)))
+            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS), false))
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            SAT_DEFAULT.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS)))
+            SAT_DEFAULT.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), false))
         } else {
             Self::new(distance)
         }
     }
 
-    fn compute(use_ss2: bool, use_coarse_dct8: bool, flat_b8: Option<&[f32; 6]>) -> Self {
+    fn compute(
+        use_ss2: bool,
+        use_coarse_dct8: bool,
+        flat_b8: Option<&[f32; 6]>,
+        pair_b: bool,
+    ) -> Self {
         // The large-transform tables depend on the SS2 gate, and DCT8 gets a
         // separate coarser-quality variant. All other tables are shared.
         let shared = shared_tables();
@@ -1715,6 +1760,33 @@ impl DequantMatrices {
                 let mut inv = HeapMatrix::new(0.0f32);
                 for c in 0..3 {
                     for k in 1..2048 {
+                        inv[c][k] = 1.0 / m[c][k];
+                    }
+                }
+                (m, inv)
+            }
+        };
+        // Pair-transform (16x8/8x16) B row with a finer first AC band for the
+        // chroma-texture class (see `PAIR_B_FINE_BAND1`); signalled via slot 3.
+        // `JIXEL_PAIR_B_ROW="base,d1..d6"` overrides the whole row for re-fits.
+        let o3: Option<BandOverride> = pair_b.then(|| {
+            let mut bands = DCT16X8_BANDS;
+            match std::env::var("JIXEL_PAIR_B_ROW") {
+                Ok(v) => {
+                    let p: Vec<f32> = v.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                    bands[2][..7].copy_from_slice(&p[..7]);
+                }
+                Err(_) => bands[2][1] = PAIR_B_FINE_BAND1,
+            }
+            scaled_override(&bands, 1.0)
+        });
+        let (matrix_16x8, inv_matrix_16x8) = match o3.as_ref() {
+            None => (shared.matrix_16x8.clone(), shared.inv_matrix_16x8.clone()),
+            Some(ov) => {
+                let m = compute_dct16x8_matrix(Some(ov));
+                let mut inv = HeapMatrix::new(0.0f32);
+                for c in 0..3 {
+                    for k in 1..128 {
                         inv[c][k] = 1.0 / m[c][k];
                     }
                 }
@@ -1776,8 +1848,8 @@ impl DequantMatrices {
             inv_matrix_identity: shared.inv_matrix_identity.clone(),
             matrix_dct2x2: shared.matrix_dct2x2.clone(),
             inv_matrix_dct2x2: shared.inv_matrix_dct2x2.clone(),
-            matrix_16x8: shared.matrix_16x8.clone(),
-            inv_matrix_16x8: shared.inv_matrix_16x8.clone(),
+            matrix_16x8,
+            inv_matrix_16x8,
             matrix_16x16,
             inv_matrix_16x16: inv_16x16,
             matrix_32x32,
@@ -1790,7 +1862,8 @@ impl DequantMatrices {
                 0 => o8,
                 // DCT8X16 and DCT4X8 measured best at the spec defaults, so
                 // they remain unsignalled.
-                3 | 5 => None,
+                5 => None,
+                3 => o3,
                 1 => o16,
                 2 => o32,
                 4 => o32x16,
@@ -1931,6 +2004,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn x_heavy_b_table_matches_its_signaled_bands() {
+        let spec = DequantMatrices::new(0.0);
+        for d in [0.0, 0.5, 0.749, QM_SS2_MIN_DISTANCE, 3.0, 4.0] {
+            assert!(std::ptr::eq(DequantMatrices::new_x_heavy(d), spec));
+        }
+        let hue = DequantMatrices::new_x_heavy(1.0);
+        for d in [HUE_B8_MIN_DISTANCE, 1.25, 2.0, 2.249] {
+            assert!(std::ptr::eq(DequantMatrices::new_x_heavy(d), hue));
+        }
+        let bands = hue.custom_tables[0].unwrap();
+        let decoded = compute_dct8x8_matrix(&bands);
+        for c in 0..3 {
+            for k in 1..64 {
+                assert_eq!(hue.matrix(c)[k], decoded[c][k]);
+                assert_eq!(hue.inv_matrix(c)[k], 1.0 / decoded[c][k]);
+            }
+            if c != 2 {
+                assert_eq!(
+                    bands.bands[c],
+                    default_dct8_override(false, &DCT8_BANDS[2]).bands[c]
+                );
+            }
+        }
+        // Refine the B tail by 20%, retaining its original shape after band 1.
+        assert!((hue.inv_matrix(2)[63] / spec.inv_matrix(2)[63] - 1.2).abs() < 1e-5);
+        assert!(hue.custom_tables[1..].iter().all(Option::is_none));
+        // Ordinary and opsin-proxy tables remain independently selected.
+        assert!(!std::ptr::eq(hue, DequantMatrices::new(1.0)));
+    }
+
+    #[test]
     fn identity_and_dct2_tables_match_the_jpeg_xl_library() {
         let m = DequantMatrices::new(0.0);
         let identity = m.inv_matrix_identity(0);
@@ -1969,7 +2073,8 @@ mod tests {
             .name("small-stack-dequant-test".into())
             .stack_size(64 * 1024)
             .spawn(|| {
-                let _matrices = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID));
+                let _matrices =
+                    DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID), false);
             })
             .unwrap()
             .join()
@@ -1983,8 +2088,8 @@ mod tests {
         assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01).custom_tables[0].is_some());
         assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE).custom_tables[0].is_some());
 
-        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID));
-        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID));
+        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false);
+        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false);
 
         let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
         assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
@@ -2045,7 +2150,7 @@ mod tests {
 
     #[test]
     fn default_dct8_flattens_blue_high_frequency_only() {
-        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ));
+        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false);
         // X and Y stay at the spec table within F16 signaling round-off.
         for c in [0usize, 1] {
             for k in 1..64 {
@@ -2088,6 +2193,47 @@ mod tests {
                     (got - expected).abs() <= 2e-6 * expected.abs(),
                     "c={c} k={k}: computed {got}, static {expected}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn pair_b_tier_exists_only_inside_its_band() {
+        for d in [0.5, 1.0, 1.24, PAIR_B_FINE_MAX_DISTANCE, 3.0] {
+            assert!(std::ptr::eq(
+                DequantMatrices::new_pair_b(d),
+                DequantMatrices::new(d)
+            ));
+            assert!(std::ptr::eq(
+                DequantMatrices::new_saturated_pair_b(d),
+                DequantMatrices::new_saturated(d)
+            ));
+        }
+        for d in [PAIR_B_FINE_MIN_DISTANCE, 1.5, 2.0] {
+            assert!(DequantMatrices::new(d).custom_tables[3].is_none());
+            for m in [
+                DequantMatrices::new_pair_b(d),
+                DequantMatrices::new_saturated_pair_b(d),
+            ] {
+                let t = m.custom_tables[3].expect("finer pair-B table");
+                assert_eq!(t.num_bands, 7);
+                assert_eq!(
+                    t.bands[2][1],
+                    f16_bits_to_f32(f32_to_f16_bits(PAIR_B_FINE_BAND1))
+                );
+                // Only band 1 of B moves; X and Y rows stay the spec bands.
+                assert_eq!(
+                    t.bands[2][2],
+                    f16_bits_to_f32(f32_to_f16_bits(DCT16X8_BANDS[2][2]))
+                );
+                assert_eq!(
+                    t.bands[1][1],
+                    f16_bits_to_f32(f32_to_f16_bits(DCT16X8_BANDS[1][1]))
+                );
+                // The signalled table is what the encoder quantizes with: a
+                // finer band-1 means a smaller step at the first AC position
+                // outside the 2x1 LLF block.
+                assert!(m.matrix_16x8(2)[2] < DequantMatrices::new(d).matrix_16x8(2)[2]);
             }
         }
     }
