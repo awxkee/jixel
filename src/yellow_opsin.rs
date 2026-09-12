@@ -84,12 +84,17 @@ const STRONG_REFERENCE_DISTANCE: f32 = 1.25;
 const STRONG_COARSE_DISTANCE: f32 = 2.0;
 const STRONG_COARSE_BIAS: f32 = 0.90;
 
-/// Tier-2 (smooth yellow, below the edge gate): the mild bias fires when
-/// yellow is a *subject*, not an accent — at least this fraction of sampled
-/// pixels must be strong yellow-risk. The edge statistic below then scales
-/// the strength so a smooth yellow subject does not pay the same rate as
-/// fine yellow structure.
+/// Ordinary tier-2 coverage for the matrix plus reconstruction-weight boost.
+/// Smaller bright-yellow detections need the texture fallback below. The
+/// edge statistic scales the matrix strength for both paths.
 const TIER2_AREA_MIN: f32 = 0.10;
+// Textured yellow can occupy a much larger visible area than this bright-only
+// detector counts. Below the ordinary area gate, require opponent structure
+// and use the matrix without a frame-wide reconstruction-weight boost.
+const TIER2_TEXTURE_AREA_MIN: f32 = 0.01;
+const TIER2_TEXTURE_B_GRAD_MIN: f32 = 0.18;
+// B-heavy content has its own quantization path; the mild fallback regressed it.
+const TIER2_TEXTURE_B_GRAD_MAX: f32 = 0.45;
 
 /// Smooth yellow fields do not need the same matrix displacement as fine
 /// yellow structure. Start the tier-2 bias only once neighboring luma starts
@@ -179,6 +184,51 @@ fn has_coarse_x_structure(linear: &Image3F) -> bool {
         }
     }
     sum_y > f32::EPSILON && sum_x >= COARSE_X_GRADIENT_MIN * sum_y
+}
+
+/// Source-only estimate of blue-yellow structure, independent of the selected
+/// B row. Both directions are sampled on the existing 1/64 pixel grid.
+fn sampled_b_gradient_ratio(linear: &Image3F) -> f32 {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return unsafe { crate::avx::sampled_b_gradient_ratio_avx2(linear, SAMPLE_STRIDE) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        unsafe { crate::neon::sampled_b_gradient_ratio_neon(linear, SAMPLE_STRIDE) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    sampled_b_gradient_ratio_scalar(linear)
+}
+
+#[cfg(any(test, not(all(target_arch = "aarch64", feature = "neon"))))]
+fn sampled_b_gradient_ratio_scalar(linear: &Image3F) -> f32 {
+    let (w, h) = (linear.xsize(), linear.ysize());
+    let [rp, gp, bp] = std::array::from_fn(|c| linear.plane_data(c));
+    let yb = |i| {
+        let (_, y, b) = rgb_to_xyb_pixel_f32(&XybMatrix::SPEC, rp[i], gp[i], bp[i]);
+        (y, b - y)
+    };
+    let (mut sum_y, mut sum_b) = (0.0, 0.0);
+    for y in (0..h).step_by(SAMPLE_STRIDE) {
+        for x in (0..w).step_by(SAMPLE_STRIDE) {
+            let i = y * w + x;
+            let (cy, cb) = yb(i);
+            for neighbor in [(x + 1 < w).then_some(i + 1), (y + 1 < h).then_some(i + w)]
+                .into_iter()
+                .flatten()
+            {
+                let (ny, nb) = yb(neighbor);
+                sum_y += (ny - cy).abs();
+                sum_b += (nb - cb).abs();
+            }
+        }
+    }
+    if sum_y > f32::EPSILON {
+        sum_b / sum_y
+    } else {
+        0.0
+    }
 }
 
 /// Release the fine-quality error boost before the matrix reaches its coarse
@@ -463,9 +513,14 @@ fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
     (samples, yellow_edge)
 }
 
-/// Tier-2: smooth-yellow content (below the edge gate). Fires the mild bias
-/// on yellow-subject images (see `TIER2_AREA_MIN`).
-fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -> f32 {
+/// Tier-2: mild yellow matrix. Low-area detections additionally need the
+/// source-structure check in `choose_b_bias_and_tier`.
+fn choose_tier2_bias(
+    samples: &[SamplePixel],
+    yellow_edge: f32,
+    distance: f32,
+    strong_frac: f32,
+) -> f32 {
     if samples.is_empty() {
         return SPEC_BIAS;
     }
@@ -475,9 +530,7 @@ fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -
     if strength <= 0.0 {
         return SPEC_BIAS;
     }
-    let strong = samples.iter().filter(|s| s.risk > STRONG_SCORE).count();
-    let strong_frac = strong as f32 / samples.len() as f32;
-    if strong_frac < TIER2_AREA_MIN {
+    if strong_frac < TIER2_TEXTURE_AREA_MIN {
         return SPEC_BIAS;
     }
 
@@ -509,28 +562,39 @@ fn choose_tier2_bias(samples: &[SamplePixel], yellow_edge: f32, distance: f32) -
 
 /// Pick the B bias for this image at this distance. Returns the spec value
 /// unless the biased matrix demonstrably reduces yellow-chroma damage more
-/// than it costs on ordinary content.
-fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
+/// than it costs on ordinary content. The last flag keeps default reconstruction
+/// weights for the low-area, textured-yellow fallback.
+fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool, bool) {
     if !has_yellow_risk(linear) {
-        return (SPEC_BIAS, false);
+        return (SPEC_BIAS, false, false);
     }
 
     let (samples, yellow_edge) = collect_samples(linear);
+    let strong = samples.iter().filter(|s| s.risk > STRONG_SCORE).count();
+    let strong_frac = strong as f32 / samples.len().max(1) as f32;
+    let mut tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance, strong_frac);
+    let default_weights = strong_frac < TIER2_AREA_MIN && tier2_bias > SPEC_BIAS;
+    if default_weights
+        && !(TIER2_TEXTURE_B_GRAD_MIN..TIER2_TEXTURE_B_GRAD_MAX)
+            .contains(&sampled_b_gradient_ratio(linear))
+    {
+        tier2_bias = SPEC_BIAS;
+    }
+    let tier2 = (tier2_bias, false, default_weights && tier2_bias > SPEC_BIAS);
     // Only thin/high-frequency yellow structure profits from the strong bias;
     // smooth-yellow content goes to the mild tier-2 path instead (a paid
     // perceptual trade: rate for visible chroma survival that SS2 barely
     // credits — validated per-pixel on assets/yellow).
     if yellow_edge < YELLOW_EDGE_MIN {
-        return (choose_tier2_bias(&samples, yellow_edge, distance), false);
+        return tier2;
     }
-    let tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance);
     let strength = if distance > STRONG_FADE_START && !has_coarse_x_structure(linear) {
         1.0 - ramp(distance, STRONG_FADE_START, MAX_DISTANCE)
     } else {
         1.0
     };
     if strength == 0.0 {
-        return (tier2_bias, false);
+        return tier2;
     }
     // Past the validated fine-quality band, keep the proxy's selection
     // stable. Its per-pixel quantization otherwise alternates between the
@@ -563,12 +627,16 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool) {
         }
     }
     if spec_cost < MIN_SPEC_COST || best_cost > REL_COST_RATIO * spec_cost {
-        return (tier2_bias, false);
+        return tier2;
     }
     if best_bias == BIAS_HI {
         best_bias += (STRONG_COARSE_BIAS - BIAS_HI) * coarse_distance_strength(distance);
     }
-    (tier2_bias + (best_bias - tier2_bias) * strength, true)
+    (
+        tier2_bias + (best_bias - tier2_bias) * strength,
+        true,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -583,6 +651,9 @@ pub(crate) struct YellowSelection {
     /// Staged frame B precision for tier-1. The JXL header stores an integer,
     /// so 5→4→3→2 avoids the former all-at-once 5→2 cliff.
     pub(crate) b_qm_scale: u32,
+    /// Sparse bright-yellow detections receive the matrix alone, without
+    /// increasing the reconstruction weight across the rest of the frame.
+    pub(crate) default_channel_weights: bool,
 }
 
 #[inline]
@@ -603,7 +674,7 @@ fn selected_b_qm_scale(custom: bool, strong: bool, distance: f32) -> u32 {
 /// Entry point used by the encoder: one detector + proxy pass yielding both
 /// the opsin decision and the band-class signal.
 pub(crate) fn select_yellow(linear: &Image3F, distance: f32) -> YellowSelection {
-    let (bias, tier1) = choose_b_bias_and_tier(linear, distance);
+    let (bias, tier1, default_channel_weights) = choose_b_bias_and_tier(linear, distance);
     let custom = (bias - SPEC_BIAS).abs() >= 1e-6;
     // A custom row can come from either tier. Only thin/high-frequency tier-1
     // content validated the fine B multiplier; smooth tier-2 yellow uses the
@@ -614,12 +685,85 @@ pub(crate) fn select_yellow(linear: &Image3F, distance: f32) -> YellowSelection 
     YellowSelection {
         b_qm_scale,
         matrix: custom.then(|| matrix_for_bias(bias)),
+        default_channel_weights,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "x86_64", feature = "avx")
+    ))]
+    #[test]
+    fn sampled_b_simd_matches_scalar_at_sample_boundaries() {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        let mut state = 0x716e_23b9u32;
+        // Include every tail length, absent neighbors, and non-sRGB values
+        // from color conversion that exercise the nonnegative opsin clamp.
+        for h in [1, 2, 7, 8, 9, 15, 16, 17, 65] {
+            for w in 1..=35 {
+                for (offset, scale) in [(0.0, 1.0), (-0.5, 8.0)] {
+                    let mut image = Image3F::new(w, h);
+                    for c in 0..3 {
+                        for y in 0..h {
+                            for v in image.plane_row_mut(c, y) {
+                                state ^= state << 13;
+                                state ^= state >> 17;
+                                state ^= state << 5;
+                                *v = offset + scale * ((state >> 8) as f32 / 16777216.0);
+                            }
+                        }
+                    }
+                    let actual = sampled_b_gradient_ratio(&image);
+                    let expected = sampled_b_gradient_ratio_scalar(&image);
+                    if cfg!(all(target_arch = "x86_64", not(target_feature = "fma"))) {
+                        // AVX always fuses; generic x86 scalar builds do not.
+                        assert!(
+                            (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                            "{w}x{h}: {actual} vs {expected}"
+                        );
+                    } else {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{w}x{h}, offset={offset}, scale={scale}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_b_structure_tracks_both_directions_and_rejects_flat_fields() {
+        assert_eq!(sampled_b_gradient_ratio(&filled(16, 16, [0.2; 3])), 0.0);
+        for vertical in [false, true] {
+            for ratio in [0.0, 0.25, 0.65] {
+                let mut image = filled(16, 16, [0.0; 3]);
+                for y in 0..16 {
+                    for x in 0..16 {
+                        let step = ((if vertical { y } else { x }) % 2) as f32 * 0.02;
+                        let rgb = xyb_to_rgb_pixel_f32(
+                            &XybMatrix::SPEC,
+                            0.0,
+                            0.3 + step,
+                            0.3 + step + ratio * step,
+                        );
+                        for (c, value) in rgb.into_iter().enumerate() {
+                            image.plane_row_mut(c, y)[x] = value;
+                        }
+                    }
+                }
+                assert!((sampled_b_gradient_ratio(&image) - ratio).abs() < 1e-4);
+            }
+        }
+    }
 
     fn matmul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
         let mut out = [0.0f32; 9];

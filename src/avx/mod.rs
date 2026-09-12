@@ -43,6 +43,7 @@ mod quant;
 mod quantize_xyb;
 mod structure_aq;
 mod xyb;
+mod yellow_opsin;
 mod ytob;
 
 pub(crate) use ac_strategy::{
@@ -84,4 +85,5 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2};
 pub(crate) use structure_aq::block_features_avx2;
 pub(crate) use xyb::to_xyb_avx2_band;
+pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

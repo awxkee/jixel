@@ -32,11 +32,15 @@ use std::arch::aarch64::*;
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn halley_cbrt(x: float32x4_t, a: float32x4_t) -> float32x4_t {
+fn halley_cbrt<const SCALAR_ORDER: bool>(x: float32x4_t, a: float32x4_t) -> float32x4_t {
     let tx = vmulq_f32(vmulq_f32(x, x), x);
     let num = vfmaq_n_f32(tx, a, 2.0);
     let den = vfmaq_n_f32(a, tx, 2.0);
-    vmulq_f32(x, vdivq_f32(num, den))
+    if SCALAR_ORDER {
+        vdivq_f32(vmulq_f32(x, num), den)
+    } else {
+        vmulq_f32(x, vdivq_f32(num, den))
+    }
 }
 
 #[inline]
@@ -50,9 +54,18 @@ fn integer_pow_1_3(hx: uint32x4_t) -> uint32x4_t {
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn cbrt_seed_positive_f32(x: float32x4_t) -> float32x4_t {
+fn cbrt_seed_positive_f32<const SCALAR_ORDER: bool>(x: float32x4_t) -> float32x4_t {
     let hx = vreinterpretq_u32_f32(x);
-    let hx = vaddq_u32(integer_pow_1_3(hx), vdupq_n_u32(709958130));
+    let third = if SCALAR_ORDER {
+        // Exact unsigned /3, matching `xyb::cbrtf`'s seed.
+        let magic = vdup_n_u32(0xaaaa_aaab);
+        let lo = vmovn_u64(vshrq_n_u64::<33>(vmull_u32(vget_low_u32(hx), magic)));
+        let hi = vmovn_u64(vshrq_n_u64::<33>(vmull_u32(vget_high_u32(hx), magic)));
+        vcombine_u32(lo, hi)
+    } else {
+        integer_pow_1_3(hx)
+    };
+    let hx = vaddq_u32(third, vdupq_n_u32(709958130));
     vreinterpretq_f32_u32(hx)
 }
 
@@ -63,17 +76,27 @@ pub(crate) fn vcbrtq_fast3_positive_f32(
     a1: float32x4_t,
     a2: float32x4_t,
 ) -> (float32x4_t, float32x4_t, float32x4_t) {
-    let mut x0 = cbrt_seed_positive_f32(a0);
-    let mut x1 = cbrt_seed_positive_f32(a1);
-    let mut x2 = cbrt_seed_positive_f32(a2);
+    cbrt3_positive_f32::<false>(a0, a1, a2)
+}
 
-    x0 = halley_cbrt(x0, a0);
-    x1 = halley_cbrt(x1, a1);
-    x2 = halley_cbrt(x2, a2);
+#[inline]
+#[target_feature(enable = "neon")]
+fn cbrt3_positive_f32<const SCALAR_ORDER: bool>(
+    a0: float32x4_t,
+    a1: float32x4_t,
+    a2: float32x4_t,
+) -> (float32x4_t, float32x4_t, float32x4_t) {
+    let mut x0 = cbrt_seed_positive_f32::<SCALAR_ORDER>(a0);
+    let mut x1 = cbrt_seed_positive_f32::<SCALAR_ORDER>(a1);
+    let mut x2 = cbrt_seed_positive_f32::<SCALAR_ORDER>(a2);
 
-    x0 = halley_cbrt(x0, a0);
-    x1 = halley_cbrt(x1, a1);
-    x2 = halley_cbrt(x2, a2);
+    x0 = halley_cbrt::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt::<SCALAR_ORDER>(x2, a2);
+
+    x0 = halley_cbrt::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt::<SCALAR_ORDER>(x2, a2);
 
     let zero = vdupq_n_f32(0.0);
     x0 = vbslq_f32(vceqq_f32(a0, zero), zero, x0);
@@ -83,9 +106,12 @@ pub(crate) fn vcbrtq_fast3_positive_f32(
     (x0, x1, x2)
 }
 
+/// `SCALAR_ORDER` preserves scalar seed/rounding for threshold classifiers;
+/// full-frame conversion retains its existing fast arithmetic. The choice is
+/// compile-time, so neither path pays for a runtime mode check.
 #[inline]
 #[target_feature(enable = "neon")]
-fn rgb_to_xyb_f32x4_neon(
+pub(super) fn rgb_to_xyb_f32x4_neon<const SCALAR_ORDER: bool>(
     m: &XybMatrix,
     r: float32x4_t,
     g: float32x4_t,
@@ -106,11 +132,17 @@ fn rgb_to_xyb_f32x4_neon(
     mixed2 = vfmaq_n_f32(mixed2, r, m.fwd[6]);
 
     let zero = vdupq_n_f32(0.0);
-    mixed0 = vmaxq_f32(mixed0, zero);
-    mixed1 = vmaxq_f32(mixed1, zero);
-    mixed2 = vmaxq_f32(mixed2, zero);
+    if SCALAR_ORDER {
+        mixed0 = vmaxnmq_f32(mixed0, zero);
+        mixed1 = vmaxnmq_f32(mixed1, zero);
+        mixed2 = vmaxnmq_f32(mixed2, zero);
+    } else {
+        mixed0 = vmaxq_f32(mixed0, zero);
+        mixed1 = vmaxq_f32(mixed1, zero);
+        mixed2 = vmaxq_f32(mixed2, zero);
+    }
 
-    let (tm0, tm1, tm2) = vcbrtq_fast3_positive_f32(mixed0, mixed1, mixed2);
+    let (tm0, tm1, tm2) = cbrt3_positive_f32::<SCALAR_ORDER>(mixed0, mixed1, mixed2);
 
     let neg_bias = vdupq_n_f32(NEG_BIAS_CBRT);
     let tm0 = vaddq_f32(tm0, neg_bias);
@@ -162,7 +194,7 @@ pub(crate) fn to_xyb_neon_band(
             let g = unsafe { vld1q_f32(g4.as_ptr()) };
             let b = unsafe { vld1q_f32(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon::<false>(m, r, g, b);
 
             unsafe {
                 vst1q_f32(x4.as_mut_ptr(), xv);
@@ -182,7 +214,7 @@ pub(crate) fn to_xyb_neon_band(
             let g = unsafe { vld1q_f32(g4.as_ptr()) };
             let b = unsafe { vld1q_f32(b4.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_neon::<false>(m, r, g, b);
 
             unsafe {
                 vst1q_f32(r4.as_mut_ptr(), xv);
@@ -207,6 +239,43 @@ mod tests {
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         (*state >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    #[test]
+    fn scalar_order_conversion_is_bit_exact() {
+        use super::rgb_to_xyb_f32x4_neon;
+        use std::arch::aarch64::{vld1q_f32, vst1q_f32};
+
+        let mut state = 0x8476_12b9;
+        let m = crate::xyb::XybMatrix::SPEC;
+        for scale in [0.0, 1.0, 16.0] {
+            for _ in 0..1024 {
+                let rgb: [[f32; 4]; 3] = std::array::from_fn(|_| {
+                    std::array::from_fn(|_| (rng(&mut state) - 0.1) * scale)
+                });
+                let mut actual = [[0.0; 4]; 3];
+                unsafe {
+                    let (x, y, b) = rgb_to_xyb_f32x4_neon::<true>(
+                        &m,
+                        vld1q_f32(rgb[0].as_ptr()),
+                        vld1q_f32(rgb[1].as_ptr()),
+                        vld1q_f32(rgb[2].as_ptr()),
+                    );
+                    for (dst, v) in actual.iter_mut().zip([x, y, b]) {
+                        vst1q_f32(dst.as_mut_ptr(), v);
+                    }
+                }
+                for i in 0..4 {
+                    let (x, y, b) = rgb_to_xyb_pixel_f32(&m, rgb[0][i], rgb[1][i], rgb[2][i]);
+                    assert_eq!(
+                        actual.map(|c| c[i].to_bits()),
+                        [x, y, b].map(f32::to_bits),
+                        "RGB {:?}",
+                        rgb.map(|c| c[i])
+                    );
+                }
+            }
+        }
     }
 
     #[test]

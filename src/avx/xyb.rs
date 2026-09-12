@@ -32,34 +32,55 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn halley_cbrt_avx2(x: __m256, a: __m256) -> __m256 {
+fn halley_cbrt_avx2<const SCALAR_ORDER: bool>(x: __m256, a: __m256) -> __m256 {
     let tx = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
     let two = _mm256_set1_ps(2.0);
     let num = _mm256_fmadd_ps(a, two, tx);
     let den = _mm256_fmadd_ps(tx, two, a);
 
-    _mm256_mul_ps(x, _mm256_div_ps(num, den))
+    if SCALAR_ORDER {
+        _mm256_div_ps(_mm256_mul_ps(x, num), den)
+    } else {
+        _mm256_mul_ps(x, _mm256_div_ps(num, den))
+    }
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn integer_pow_1_3_avx2(hx: __m256i) -> __m256i {
-    let scale = _mm256_set1_epi32(341);
+fn integer_pow_1_3_avx2<const SCALAR_ORDER: bool>(hx: __m256i) -> __m256i {
+    // Exact unsigned /3 for the scalar seed; retain the fast seed otherwise.
+    let scale = _mm256_set1_epi32(if SCALAR_ORDER {
+        0xaaaa_aaabu32 as i32
+    } else {
+        341
+    });
     let even64 = _mm256_mul_epu32(hx, scale);
-    let even = _mm256_srli_epi64::<10>(even64);
+    let even = if SCALAR_ORDER {
+        _mm256_srli_epi64::<33>(even64)
+    } else {
+        _mm256_srli_epi64::<10>(even64)
+    };
     let odd_src = _mm256_srli_epi64::<32>(hx);
     let odd64 = _mm256_mul_epu32(odd_src, scale);
-    let odd = _mm256_slli_epi64::<32>(_mm256_srli_epi64::<10>(odd64));
+    let odd = if SCALAR_ORDER {
+        _mm256_srli_epi64::<33>(odd64)
+    } else {
+        _mm256_srli_epi64::<10>(odd64)
+    };
+    let odd = _mm256_slli_epi64::<32>(odd);
     _mm256_or_si256(even, odd)
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn cbrt_seed_positive_avx2(x: __m256) -> __m256 {
+fn cbrt_seed_positive_avx2<const SCALAR_ORDER: bool>(x: __m256) -> __m256 {
     let ui = _mm256_castps_si256(x);
     let hx = _mm256_and_si256(ui, _mm256_set1_epi32(0x7fff_ffff));
 
-    let hx = _mm256_add_epi32(integer_pow_1_3_avx2(hx), _mm256_set1_epi32(709958130));
+    let hx = _mm256_add_epi32(
+        integer_pow_1_3_avx2::<SCALAR_ORDER>(hx),
+        _mm256_set1_epi32(709958130),
+    );
 
     _mm256_castsi256_ps(hx)
 }
@@ -71,17 +92,27 @@ pub(crate) fn vcbrt_fast3_positive_avx2(
     a1: __m256,
     a2: __m256,
 ) -> (__m256, __m256, __m256) {
-    let mut x0 = cbrt_seed_positive_avx2(a0);
-    let mut x1 = cbrt_seed_positive_avx2(a1);
-    let mut x2 = cbrt_seed_positive_avx2(a2);
+    cbrt3_positive_avx2::<false>(a0, a1, a2)
+}
 
-    x0 = halley_cbrt_avx2(x0, a0);
-    x1 = halley_cbrt_avx2(x1, a1);
-    x2 = halley_cbrt_avx2(x2, a2);
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn cbrt3_positive_avx2<const SCALAR_ORDER: bool>(
+    a0: __m256,
+    a1: __m256,
+    a2: __m256,
+) -> (__m256, __m256, __m256) {
+    let mut x0 = cbrt_seed_positive_avx2::<SCALAR_ORDER>(a0);
+    let mut x1 = cbrt_seed_positive_avx2::<SCALAR_ORDER>(a1);
+    let mut x2 = cbrt_seed_positive_avx2::<SCALAR_ORDER>(a2);
 
-    x0 = halley_cbrt_avx2(x0, a0);
-    x1 = halley_cbrt_avx2(x1, a1);
-    x2 = halley_cbrt_avx2(x2, a2);
+    x0 = halley_cbrt_avx2::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_avx2::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_avx2::<SCALAR_ORDER>(x2, a2);
+
+    x0 = halley_cbrt_avx2::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_avx2::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_avx2::<SCALAR_ORDER>(x2, a2);
 
     let zero = _mm256_setzero_ps();
     x0 = _mm256_blendv_ps(x0, zero, _mm256_cmp_ps::<_CMP_EQ_OQ>(a0, zero));
@@ -91,9 +122,11 @@ pub(crate) fn vcbrt_fast3_positive_avx2(
     (x0, x1, x2)
 }
 
+/// Scalar-order mode preserves the classifier's seed and operation order.
+/// Both modes always use FMA, including in generic x86 builds.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn rgb_to_xyb_f32x8_avx2(
+pub(super) fn rgb_to_xyb_f32x8_avx2<const SCALAR_ORDER: bool>(
     m: &XybMatrix,
     r: __m256,
     g: __m256,
@@ -121,7 +154,7 @@ fn rgb_to_xyb_f32x8_avx2(
     mixed1 = _mm256_max_ps(mixed1, zero);
     mixed2 = _mm256_max_ps(mixed2, zero);
 
-    let (tm0, tm1, tm2) = vcbrt_fast3_positive_avx2(mixed0, mixed1, mixed2);
+    let (tm0, tm1, tm2) = cbrt3_positive_avx2::<SCALAR_ORDER>(mixed0, mixed1, mixed2);
 
     let neg_bias = _mm256_set1_ps(NEG_BIAS_CBRT);
     let tm0 = _mm256_add_ps(tm0, neg_bias);
@@ -183,7 +216,7 @@ pub(crate) fn to_xyb_avx2_band(
             let g = unsafe { _mm256_loadu_ps(g8.as_ptr()) };
             let b = unsafe { _mm256_loadu_ps(b8.as_ptr()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2::<false>(m, r, g, b);
 
             unsafe {
                 _mm256_storeu_ps(x8.as_mut_ptr(), xv);
@@ -198,7 +231,7 @@ pub(crate) fn to_xyb_avx2_band(
             let g = unsafe { _mm256_maskload_ps(g_tail.as_ptr(), mask) };
             let b = unsafe { _mm256_maskload_ps(b_tail.as_ptr(), mask) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x8_avx2::<false>(m, r, g, b);
 
             unsafe {
                 _mm256_maskstore_ps(x_tail.as_mut_ptr(), mask, xv);
@@ -213,6 +246,53 @@ pub(crate) fn to_xyb_avx2_band(
 mod tests {
     use super::to_xyb_avx2_band;
     use crate::xyb::{XybMatrix, rgb_to_xyb_pixel_f32};
+
+    #[test]
+    fn scalar_order_conversion_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        use super::rgb_to_xyb_f32x8_avx2;
+        use std::arch::x86_64::{_mm256_loadu_ps, _mm256_storeu_ps};
+
+        let mut state = 0x8476_12b9u32;
+        let m = XybMatrix::SPEC;
+        for scale in [0.0, 1.0, 16.0] {
+            for _ in 0..1024 {
+                let rgb: [[f32; 8]; 3] = std::array::from_fn(|_| {
+                    std::array::from_fn(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        ((state >> 8) as f32 / 16777216.0 - 0.1) * scale
+                    })
+                });
+                let mut actual = [[0.0; 8]; 3];
+                unsafe {
+                    let (x, y, b) = rgb_to_xyb_f32x8_avx2::<true>(
+                        &m,
+                        _mm256_loadu_ps(rgb[0].as_ptr()),
+                        _mm256_loadu_ps(rgb[1].as_ptr()),
+                        _mm256_loadu_ps(rgb[2].as_ptr()),
+                    );
+                    for (dst, v) in actual.iter_mut().zip([x, y, b]) {
+                        _mm256_storeu_ps(dst.as_mut_ptr(), v);
+                    }
+                }
+                for i in 0..8 {
+                    let (x, y, b) = rgb_to_xyb_pixel_f32(&m, rgb[0][i], rgb[1][i], rgb[2][i]);
+                    if cfg!(target_feature = "fma") {
+                        assert_eq!(actual.map(|c| c[i].to_bits()), [x, y, b].map(f32::to_bits));
+                    } else {
+                        // The generic scalar reference is unfused; AVX always uses FMA.
+                        for (got, expected) in actual.map(|c| c[i]).into_iter().zip([x, y, b]) {
+                            assert!((got - expected).abs() <= 2e-6, "{got} vs {expected}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn masked_tail_matches_scalar_and_preserves_canaries() {
