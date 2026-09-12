@@ -205,9 +205,19 @@ impl EncodingContext {
 
     /// Update the adaptive matrix and its cached reconstruction weights together.
     #[inline]
-    pub(crate) fn set_xyb_matrix(&mut self, matrix: xyb::XybMatrix, distance: f32) {
+    pub(crate) fn set_xyb_matrix(
+        &mut self,
+        matrix: xyb::XybMatrix,
+        distance: f32,
+        default_weights: bool,
+    ) {
         self.xyb = matrix;
-        self.channel_weights = channel_weights_for_bias(matrix.fwd[8], distance);
+        let weight_bias = if default_weights {
+            xyb::B_BIAS
+        } else {
+            matrix.fwd[8]
+        };
+        self.channel_weights = channel_weights_for_bias(weight_bias, distance);
     }
 
     #[inline]
@@ -370,7 +380,7 @@ mod tests {
         let mut ctx = EncodingContext::new(Speed::Slow, None, xyb::XybMatrix::SPEC, 2.0, 1);
         assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
         let matrix = crate::yellow_opsin::matrix_for_bias(0.90);
-        ctx.set_xyb_matrix(matrix, 2.0);
+        ctx.set_xyb_matrix(matrix, 2.0, false);
         assert_eq!(ctx.xyb, matrix);
         let coarse = ctx.channel_weights();
         assert!((coarse[0] - 0.10).abs() < 1e-6);
@@ -381,7 +391,13 @@ mod tests {
             channel_weights_for_bias(0.70, 2.0),
             channel_weights_for_bias(0.70, 1.0)
         );
-        ctx.set_xyb_matrix(crate::yellow_opsin::matrix_for_bias(0.85), 1.0);
+        ctx.set_xyb_matrix(crate::yellow_opsin::matrix_for_bias(0.85), 1.0, false);
         assert_eq!(ctx.channel_weights(), channel_weights_for_bias(0.85, 1.0));
+        // The sparse-yellow fallback signals its matrix but uses the default
+        // error budget, even after a previous matrix had stronger weights.
+        let mild = crate::yellow_opsin::matrix_for_bias(0.65);
+        ctx.set_xyb_matrix(mild, 2.0, true);
+        assert_eq!(ctx.xyb, mild);
+        assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
     }
 }

@@ -1341,6 +1341,22 @@ fn coarse_mosaic_hue_is_costly(hue_distortion: f32, lambda: f32) -> bool {
     hue_distortion > lambda * (2.0 * FINE_MOSAIC_RATE_CORRECTION_BITS)
 }
 
+/// Permit a color repair to trade some seam quality only when its hue gain
+/// is meaningful, pays for the seam regression, and leaves a clear pure-RD
+/// win. The margin absorbs error in the local rate estimate.
+fn fine_mosaic_hue_repair_is_safe(
+    reference_hue: f32,
+    candidate_hue: f32,
+    candidate_rd: f32,
+    incumbent_rd: f32,
+    seam_regression: f32,
+) -> bool {
+    let hue_gain = reference_hue - candidate_hue;
+    hue_gain > 0.05 * reference_hue
+        && candidate_rd <= 0.95 * incumbent_rd
+        && seam_regression <= hue_gain
+}
+
 const FINE_MOSAIC_CANDIDATES: [u8; 3] = [STRATEGY_DCT, STRATEGY_IDENTITY, STRATEGY_DCT2X2];
 /// Most children a joint mosaic can cover (sized for a 2x2-block 16x16; the
 /// pair strategies searched today use two).
@@ -1467,6 +1483,9 @@ fn find_rerank_downgrades(
     let mosaic = &mut output.fine_mosaic;
     let fine_lambda = fine_mosaic_lambda(params.distance);
     let coarse_chromatic = ctx.x_heavy();
+    // The strong yellow rows use B biases 0.85/0.90. Keep the mild/default
+    // rows on seam-only acceptance: the hue relaxation overspends there.
+    let hue_repair_enabled = coarse_chromatic && ctx.xyb.fwd[8] >= 0.8;
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
             continue;
@@ -1589,8 +1608,8 @@ fn find_rerank_downgrades(
         } else {
             (0.0, 0.0)
         };
-        // A mosaic must strictly improve both nonnegative seam statistics.
-        // If either is already zero, avoid reconstructing fine candidates.
+        // Keep candidate generation restricted to the existing seam search.
+        // Hue repairs reuse this cache; they do not open zero-seam regions.
         let with_fine_mosaic = with_fine_mosaic && big_boundary > 0.0 && big_peak > 0.0;
         let mut j_dct8 = 0.0f32;
         // Per-child candidate cache: (cost, base cost) plus the reconstructed
@@ -1737,6 +1756,18 @@ fn find_rerank_downgrades(
             let tiled_rd: f32 = rd_fine[..children].iter().map(|c| c[0]).sum();
             let big_rd = fmla(fine_lambda, big.rate + meta_r, big.distortion);
             let big_joint = fmla(FINE_MOSAIC_BOUNDARY_ALPHA, big_boundary, big_rd);
+            // Comparing against tiled DCT8 as well as the merge avoids
+            // crediting a fine transform just for changing the footprint of
+            // the hue scorer's source-edge mask. All children share that mask.
+            let hue_reference = if hue_repair_enabled {
+                let tiled_hue: f32 = mosaic.cand_costs[..children]
+                    .iter()
+                    .map(|c| c[0].hue_distortion)
+                    .sum();
+                big.hue_distortion.min(tiled_hue)
+            } else {
+                0.0
+            };
             // Exhaustive assignment search over the cached planes. Every grid
             // is scored jointly (child costs plus seam energy), so a child
             // whose fine transform loses the independent comparison can still
@@ -1789,15 +1820,31 @@ fn find_rerank_downgrades(
                     tiled_joint = joint;
                     continue;
                 }
-                if joint < best_joint
-                    // Strict < on purpose: when a merge's seams are already
-                    // below the visibility floor (both stats zero) the arm
-                    // closes, restricting it to seam repair.
-                    && boundary < big_boundary * FINE_MOSAIC_BOUNDARY_RATIO
-                    && peak < big_peak * FINE_MOSAIC_PEAK_RATIO
-                {
-                    best_joint = joint;
-                    best_sel = Some(sel);
+                if joint < best_joint {
+                    let improves_seams = boundary < big_boundary * FINE_MOSAIC_BOUNDARY_RATIO
+                        && peak < big_peak * FINE_MOSAIC_PEAK_RATIO;
+                    // Reuse only candidates already reconstructed by the
+                    // seam search.
+                    let repairs_hue = hue_repair_enabled && !improves_seams && {
+                        let hue_sum: f32 = sel[..children]
+                            .iter()
+                            .enumerate()
+                            .map(|(k, &ci)| mosaic.cand_costs[k][ci].hue_distortion)
+                            .sum();
+                        let seam_regression = FINE_MOSAIC_BOUNDARY_ALPHA
+                            * ((boundary - big_boundary).max(0.0) + (peak - big_peak).max(0.0));
+                        fine_mosaic_hue_repair_is_safe(
+                            hue_reference,
+                            hue_sum,
+                            rd_sum,
+                            tiled_rd.min(big_rd).min(j_child_fine),
+                            seam_regression,
+                        )
+                    };
+                    if improves_seams || repairs_hue {
+                        best_joint = joint;
+                        best_sel = Some(sel);
+                    }
                 }
             }
             if let Some(sel) = best_sel
@@ -1940,6 +1987,21 @@ mod tests {
     use crate::inflated_cost::{
         forward_for, forward_matrix, reconstruct_error, strategy_pixel_count,
     };
+
+    #[test]
+    fn hue_repair_can_pay_for_seams_but_requires_a_clear_rd_win() {
+        let accepts = super::fine_mosaic_hue_repair_is_safe;
+        // A 20% hue improvement can pay for a bounded seam regression while
+        // preserving the full RD win, including the fine-child rate charge.
+        assert!(accepts(10.0, 8.0, 95.0, 100.0, 1.5));
+        assert!(!accepts(10.0, 9.6, 95.0, 100.0, 0.0));
+        assert!(!accepts(10.0, 8.0, 98.0, 100.0, 0.0));
+        assert!(!accepts(10.0, 8.0, 100.1, 100.0, 0.0));
+        assert!(!accepts(10.0, 8.0, 95.0, 100.0, 2.1));
+        assert!(!accepts(0.0, 0.0, 95.0, 100.0, 0.0));
+        assert!(!accepts(f32::NAN, 8.0, 95.0, 100.0, 0.0));
+        assert!(!accepts(10.0, f32::NAN, 95.0, 100.0, 0.0));
+    }
 
     #[test]
     fn hue_protection_survives_coarse_quantization_only_for_chroma_structure() {

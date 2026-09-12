@@ -749,7 +749,7 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     }
     let selection = crate::yellow_opsin::select_yellow(linear, distance);
     if let Some(m) = selection.matrix {
-        ctx.set_xyb_matrix(m, distance);
+        ctx.set_xyb_matrix(m, distance, selection.default_channel_weights);
     }
     // The yellow selector runs before XYB conversion, so the post-XYB
     // `x_heavy` flag is not available yet. Apply only its own staged B scale
