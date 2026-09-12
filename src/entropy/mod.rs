@@ -54,8 +54,8 @@ pub(crate) use token::{
     CompactToken, HybridUintConfig, Token, pack_signed, uint_encode, uint_encode_with_config,
 };
 pub(crate) use write::{
-    HybridUintSamples, build_ans_code_parts, build_entropy_code_no_cluster, build_huffman_codes,
-    build_huffman_codes_into, optimize_entropy_code, optimize_entropy_code_ac,
+    AnsRefinement, HybridUintSamples, build_ans_code_parts, build_entropy_code_no_cluster,
+    build_huffman_codes, build_huffman_codes_into, optimize_entropy_code, optimize_entropy_code_ac,
     optimize_entropy_code_ac_streams, optimize_entropy_code_ac_streams_fast, refine_ans_clusters,
     write_context_map, write_entropy_code, write_prefix_codes, write_token,
 };

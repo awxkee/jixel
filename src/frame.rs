@@ -2223,13 +2223,21 @@ fn encode_frame_core(
             )
         }
     };
-    if ctx.speed == Speed::Slow {
+    let ans_refinement = match ctx.speed {
+        Speed::Slow => Some(crate::entropy::AnsRefinement::Slow),
+        Speed::Fast => Some(crate::entropy::AnsRefinement::Fast {
+            recluster: distance >= 3.0,
+        }),
+        Speed::Fastest => None,
+    };
+    if let Some(refinement) = ans_refinement {
         crate::entropy::refine_ans_clusters(
             &mut dc_code_owned,
             dc_tokens_per_group
                 .iter()
                 .map(Vec::as_slice)
                 .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
+            refinement,
             &ctx.thread_pool,
             scratch,
         );
@@ -2359,13 +2367,16 @@ fn encode_frame_core(
         }
     };
 
-    if ctx.speed == Speed::Slow {
+    // Slow always considers splitting clusters collapsed by the prefix-cost
+    // search. Fast uses the cheaper batch of moves at high quality.
+    if let Some(refinement) = ans_refinement {
         for (pass, code) in ac_code_per_pass.iter_mut().enumerate() {
             crate::entropy::refine_ans_clusters(
                 code,
                 all_pending
                     .iter()
                     .map(|pending| pending.tokens[pass].as_slice()),
+                refinement,
                 &ctx.thread_pool,
                 scratch,
             );
