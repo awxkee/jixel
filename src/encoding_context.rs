@@ -240,6 +240,11 @@ impl EncodingContext {
         let quantize_dc = group::selected_quantize_dc_methods();
         let dc_from_dct = dct::selected_dc_from_dct_methods();
         let afv = afv::selected_afv_methods();
+        let base_matrices = if speed == Speed::Slow {
+            DequantMatrices::new(distance)
+        } else {
+            DequantMatrices::new_fast(distance)
+        };
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
@@ -248,9 +253,13 @@ impl EncodingContext {
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
-            base_matrices: DequantMatrices::new(distance),
+            base_matrices,
             sat_matrices: DequantMatrices::new_saturated(distance),
-            pair_b_matrices: DequantMatrices::new_pair_b(distance),
+            pair_b_matrices: if speed == Speed::Slow {
+                DequantMatrices::new_pair_b(distance)
+            } else {
+                base_matrices
+            },
             sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance),
             x_heavy_matrices: if speed == Speed::Slow {
                 DequantMatrices::new_x_heavy(distance)
