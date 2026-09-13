@@ -57,10 +57,12 @@ mod entropy;
 mod fast_loseless;
 mod frame;
 mod gaborish;
+mod gain_map;
 mod group;
 mod icc_codec;
 mod image;
 mod inflated_cost;
+mod iso_gain_map;
 mod jpeg;
 mod lossless;
 mod lz77_ac;
@@ -100,6 +102,8 @@ pub use encode_image::{
     encode_image_with_alpha_16bit, encode_image_with_alpha_f16, encode_image_with_alpha_f32,
 };
 pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
+pub use gain_map::{GainMap, GainMapPixels};
+pub use iso_gain_map::{GainMapFloats, IsoGainMap};
 pub use jpeg::{
     BrotliCompression, JpegTranscodeConfig, encode_jpeg_lossless, encode_jpeg_lossless_with_config,
 };
