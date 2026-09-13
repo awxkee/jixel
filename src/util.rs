@@ -162,6 +162,16 @@ pub enum EncodeError {
     Jpeg(String),
     /// A caller-provided Brotli backend could not compress metadata.
     Brotli(String),
+    /// The gain map sample buffer length does not match
+    /// `width * height * channels`.
+    GainMapSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    /// ISO 21496-1 gain map metadata is malformed or unrepresentable.
+    InvalidGainMapMetadata(&'static str),
+    /// The attached gain map could not be encoded or bundled.
+    GainMap(&'static str),
 }
 
 impl fmt::Display for EncodeError {
@@ -211,6 +221,14 @@ impl fmt::Display for EncodeError {
             }
             Self::Jpeg(msg) => write!(f, "JPEG transcoding failed: {msg}"),
             Self::Brotli(msg) => write!(f, "Brotli compression failed: {msg}"),
+            Self::GainMapSizeMismatch { expected, actual } => write!(
+                f,
+                "gain map buffer size mismatch: expected {expected} samples, got {actual}"
+            ),
+            Self::InvalidGainMapMetadata(msg) => {
+                write!(f, "invalid gain map metadata: {msg}")
+            }
+            Self::GainMap(msg) => write!(f, "gain map: {msg}"),
             EncodeError::UnsupportedColorSpace(colorspace) => {
                 f.write_fmt(format_args!("unsupported color space: {:?}", colorspace))
             }

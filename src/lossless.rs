@@ -831,13 +831,9 @@ fn encode_frame_lossless_core_impl(
     // Sources: the RGB(A) planes under the best transform and, for frames
     // with <= 1024 colors, a global palette index image. The corner-sampled
     // WP proxy and the gradient RCT estimator both mis-rank on a third of
-    // Kodak (up to 0.7% of the file), so a reduced-leaf learner ranks every
-    // WP preset per source (and the transform runner-up for RGB). First the
-    // two sources are compared by one first-stage learn each under the proxy
-    // preset: a source trailing the leader by more than
-    // PALETTE_COARSE_MARGIN is dropped entirely (on palette graphics the RGB
-    // tree is ~25% behind and was paying the whole ranking for nothing).
-    // Each ranking winner seeds its final learn.
+    // so a reduced-leaf learner ranks every WP preset per source (and the transform runner-up for RGB).
+    // First the two sources are compared by one first-stage learn each under the proxy
+    // preset.
     let (layout, learned_tree_decisive, skip_alternatives) = {
         let palette = if compare_tree_candidates {
             build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
@@ -956,10 +952,7 @@ fn encode_frame_lossless_core_impl(
 
         // Group layout. With every decoding tool available, Slow lossless runs
         // the first learning stage (sampling plus a 32-leaf tree) under both
-        // 1024- and 256-pixel groups. The 1024 layout wins on 22/24 Kodak images
-        // and is always deepened; the 256 layout is deepened only when its first
-        // stage already estimates smaller, and the full estimates then decide
-        // (23/24 correct there, where the first stage alone is right 18/24).
+        // 1024- and 256-pixel groups.
         // Layouts are processed one at a time so a single sample set is alive.
         // Everything else keeps the codestream default.
         let slow_layouts = compare_tree_candidates
@@ -974,10 +967,7 @@ fn encode_frame_lossless_core_impl(
         };
         // RGB sources of more than a megapixel-channel learn the 1024-px
         // layout only: the 256 layout's first stage costs a sampling pass and
-        // its full learn doubles the frame's learning time, for a final win
-        // on 2 of the 7 Kodak/city images where it was deepened, by 0.03%
-        // and 0.04%. Palette index images keep both (their accurate estimate
-        // prefers 256 by ~4% where the first stage does not).
+        // its full learn doubles the frame's learning time.
         let rgb_layouts: &[GroupLayout] = if slow_layouts
             && source_values_of(xsize, ysize, nb_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
         {
@@ -1079,8 +1069,7 @@ fn encode_frame_lossless_core_impl(
                 let palette_can_win = cand.est_real <= rgb_final_est * PALETTE_FINAL_MARGIN;
                 // The frame write (tokenize, code, sections) is the palette candidate's
                 // most expensive step after the learn; a final estimate clearly behind
-                // the RGB frame's cannot win the size comparison (a 3,195-color
-                // screenshot: ratio 1.24, frame +19%; a gray-image tie at 1.000 still writes).
+                // the RGB frame's cannot win the size comparison.
                 if palette_can_win {
                     let mut candidate = BitWriter::new();
                     let estimated_savings = write_learned_tree_frame(
@@ -1143,7 +1132,7 @@ fn encode_frame_lossless_core_impl(
                     .flatten()
                     .map(|palette| palette.w * palette.h)
                     .sum();
-                // The groups that keep their colour planes cost the same
+                // The groups that keep their color planes cost the same
                 // either way, so the candidate is only worth its sampling
                 // and first-stage learn when most of the frame palettises
                 // (a UI screen: 60%; a screen-content photo mosaic: 44%,

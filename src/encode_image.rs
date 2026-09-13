@@ -35,6 +35,7 @@ use crate::color_encoding::write_color_encoding_with_icc;
 use crate::dark_aq::DarkAqConfig;
 use crate::encoding_context::EncodingContext;
 use crate::frame::encode_frame;
+use crate::gain_map::{EncodedGainMap, GainMap, encode_gain_map};
 use crate::image::{Image3F, Image3Si};
 use crate::jpeg::BrotliCompression;
 use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
@@ -333,6 +334,11 @@ pub struct EncodeConfig {
     pub boost: Option<DarkAqConfig>,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
+    /// encoded as a second JPEG XL codestream and shipped in a `jhgm`
+    /// container box together with its ISO 21496-1 metadata. Forces the
+    /// output into the JXL container form.
+    pub gain_map: Option<GainMap>,
 }
 
 /// Which arm the **lossy** encoder uses. Besides VarDCT, jixel carries a lossy
@@ -391,6 +397,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) decoding_speed: DecodingSpeed,
     /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
     pub(crate) dark_aq: Option<DarkAqConfig>,
+    /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
+    pub(crate) gain_map: Option<EncodedGainMap>,
 }
 
 impl Default for EncodeConfig {
@@ -419,6 +427,7 @@ impl Default for EncodeConfig {
             decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
             lossy_modular: LossyModular::Off,
+            gain_map: None,
         }
     }
 }
@@ -451,6 +460,7 @@ impl Default for EncodeConfigImpl {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             dark_aq: Some(DarkAqConfig::default()),
+            gain_map: None,
         }
     }
 }
@@ -584,6 +594,12 @@ impl EncodeConfigImpl {
         self.intensity_target = nits;
         self
     }
+
+    /// Attach an already-encoded gain map bundle to be written as a `jhgm` box.
+    pub(crate) fn with_gain_map(mut self, gain_map: Option<EncodedGainMap>) -> Self {
+        self.gain_map = gain_map;
+        self
+    }
 }
 
 impl EncodeConfig {
@@ -697,6 +713,13 @@ impl EncodeConfig {
     /// Select the lossy encoding arm (see [`LossyModular`]).
     pub fn with_lossy_modular(mut self, mode: LossyModular) -> Self {
         self.lossy_modular = mode;
+        self
+    }
+
+    /// Attach an HDR gain map (see [`GainMap`]). It is encoded as its own
+    /// JPEG XL codestream and written into a `jhgm` container box.
+    pub fn with_gain_map(mut self, gain_map: GainMap) -> Self {
+        self.gain_map = Some(gain_map);
         self
     }
 
@@ -898,6 +921,7 @@ pub fn encode_image(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_gain_map(encode_gain_map(config)?)
                 .with_xmp(config.xmp.clone())
                 .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
@@ -923,6 +947,7 @@ pub fn encode_image(
         .with_progressive_from(config)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_gain_map(encode_gain_map(config)?)
         .with_xmp(config.xmp.clone())
         .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
@@ -970,6 +995,7 @@ pub fn encode_image_with_alpha(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_gain_map(encode_gain_map(config)?)
                 .with_xmp(config.xmp.clone())
                 .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
@@ -997,6 +1023,7 @@ pub fn encode_image_with_alpha(
         .with_alpha(AlphaPlane::from_u8(alpha_plane))
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_gain_map(encode_gain_map(config)?)
         .with_xmp(config.xmp.clone())
         .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
@@ -1141,6 +1168,7 @@ fn encode_gray_impl(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_gain_map(encode_gain_map(config)?)
                 .with_xmp(config.xmp.clone())
                 .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
@@ -1161,6 +1189,7 @@ fn encode_gray_impl(
         .with_grayscale(true)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_gain_map(encode_gain_map(config)?)
         .with_xmp(config.xmp.clone())
         .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
@@ -1354,6 +1383,7 @@ fn encode_gray_high_depth_impl(
                 .with_bits_per_sample(bps)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_gain_map(encode_gain_map(config)?)
                 .with_xmp(config.xmp.clone())
                 .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
@@ -1387,6 +1417,7 @@ fn encode_gray_high_depth_impl(
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_gain_map(encode_gain_map(config)?)
         .with_xmp(config.xmp.clone())
         .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
@@ -1429,6 +1460,7 @@ fn encode_high_depth_rgba(
                 .with_patches(config.patches)
                 .with_icc_profile(config.icc_profile.clone())
                 .with_exif(config.exif.clone())
+                .with_gain_map(encode_gain_map(config)?)
                 .with_xmp(config.xmp.clone())
                 .with_brotli_compression(config.brotli_compression.clone())
                 .with_orientation(config.orientation)
@@ -1479,6 +1511,7 @@ fn encode_high_depth_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_gain_map(encode_gain_map(config)?)
             .with_xmp(config.xmp.clone())
             .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
@@ -1495,6 +1528,7 @@ fn encode_high_depth_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_gain_map(encode_gain_map(config)?)
             .with_xmp(config.xmp.clone())
             .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
@@ -1586,12 +1620,14 @@ fn encode_f32_lossless_rgba(
     encode_frame_lossless_float(&image3s, alpha.as_ref(), config.num_threads, &mut w);
     let codestream = w.into_bytes();
     let alpha_bits_md = if has_alpha { 32 } else { 0 };
+    let gain_map = encode_gain_map(config)?;
     finalize_container(
         codestream,
         config.exif.as_deref(),
         config.xmp.as_deref(),
         config.brotli_compression.as_deref(),
         needs_level_10(32, true, alpha_bits_md),
+        gain_map.as_ref(),
     )
 }
 
@@ -1638,6 +1674,7 @@ fn encode_float_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_gain_map(encode_gain_map(config)?)
             .with_xmp(config.xmp.clone())
             .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
@@ -1654,6 +1691,7 @@ fn encode_float_rgba(
             .with_bits_per_sample(bps)
             .with_icc_profile(config.icc_profile.clone())
             .with_exif(config.exif.clone())
+            .with_gain_map(encode_gain_map(config)?)
             .with_xmp(config.xmp.clone())
             .with_brotli_compression(config.brotli_compression.clone())
             .with_orientation(config.orientation)
@@ -1691,6 +1729,7 @@ fn encode_float_gray(
         .with_bits_per_sample(bps)
         .with_icc_profile(config.icc_profile.clone())
         .with_exif(config.exif.clone())
+        .with_gain_map(encode_gain_map(config)?)
         .with_xmp(config.xmp.clone())
         .with_brotli_compression(config.brotli_compression.clone())
         .with_orientation(config.orientation)
@@ -1870,6 +1909,7 @@ fn encode_with_context(
         config.xmp.as_deref(),
         config.brotli_compression.as_deref(),
         needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits),
+        config.gain_map.as_ref(),
     )
 }
 
@@ -2056,6 +2096,7 @@ fn encode_lossless_planes(
         config.xmp.as_deref(),
         config.brotli_compression.as_deref(),
         needs_level_10(max_bp as u32, true, alpha_bits),
+        config.gain_map.as_ref(),
     )
 }
 
@@ -2126,8 +2167,8 @@ fn push_metadata_box(
 }
 
 /// Wrap a bare codestream in a minimal JXL (ISO BMFF) container that declares
-/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc, then
-/// optional metadata boxes.
+/// `level` via a `jxll` box. Box order: signature, ftyp, jxll, jxlc, then the
+/// optional `jhgm` gain map bundle and metadata boxes.
 ///
 /// When `exif` is `Some`, an `Exif` box is appended after the codestream. Its
 /// payload is a 4-byte big-endian TIFF-header offset (0) followed by the raw
@@ -2141,10 +2182,13 @@ pub(crate) fn wrap_jxl_container(
     exif: Option<&[u8]>,
     xmp: Option<&[u8]>,
     compressor: Option<&dyn BrotliCompression>,
+    gain_map: Option<&[u8]>,
 ) -> Result<Vec<u8>, EncodeError> {
     let exif_extra = exif.map(|e| e.len() + 12).unwrap_or(0);
     let xmp_extra = xmp.map(|x| x.len() + 8).unwrap_or(0);
-    let mut out = Vec::with_capacity(codestream.len() + 41 + exif_extra + xmp_extra);
+    let gain_map_extra = gain_map.map(|g| g.len() + 8).unwrap_or(0);
+    let mut out =
+        Vec::with_capacity(codestream.len() + 41 + exif_extra + xmp_extra + gain_map_extra);
     // JXL signature box.
     out.extend_from_slice(&[
         0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
@@ -2157,6 +2201,10 @@ pub(crate) fn wrap_jxl_container(
     // jxll level box.
     out.extend_from_slice(&[0, 0, 0, 0x09, b'j', b'x', b'l', b'l', level]);
     push_container_box(&mut out, b"jxlc", &codestream);
+    // Gain map bundle (`jhgm`), right after the codestream it belongs to.
+    if let Some(g) = gain_map {
+        push_container_box(&mut out, b"jhgm", g);
+    }
     // Exif metadata box (after the codestream; libjxl convention).
     if let Some(e) = exif {
         let mut contents = Vec::with_capacity(4 + e.len());
@@ -2171,21 +2219,26 @@ pub(crate) fn wrap_jxl_container(
 }
 
 /// Decide final output form: wrap in a container when level 10 is required or
-/// when an EXIF/XMP box must be carried (a bare codestream cannot hold it).
+/// when an EXIF/XMP/gain-map box must be carried (a bare codestream cannot
+/// hold them).
 fn finalize_container(
     codestream: Vec<u8>,
     exif: Option<&[u8]>,
     xmp: Option<&[u8]>,
     compressor: Option<&dyn BrotliCompression>,
     need_l10: bool,
+    gain_map: Option<&EncodedGainMap>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if need_l10 || exif.is_some() || xmp.is_some() {
+    // A level-10 gain map codestream raises the whole file's level.
+    let need_l10 = need_l10 || gain_map.is_some_and(|g| g.needs_level_10);
+    if need_l10 || exif.is_some() || xmp.is_some() || gain_map.is_some() {
         wrap_jxl_container(
             codestream,
             if need_l10 { 10 } else { 5 },
             exif,
             xmp,
             compressor,
+            gain_map.map(|g| g.bundle.as_slice()),
         )
     } else {
         Ok(codestream)
@@ -2454,6 +2507,140 @@ mod encode_smoke_tests {
             pos += size;
         }
         None
+    }
+
+    fn box_kinds(container: &[u8]) -> Vec<[u8; 4]> {
+        let mut kinds = Vec::new();
+        let mut pos = 0usize;
+        while pos + 8 <= container.len() {
+            let size = u32::from_be_bytes(container[pos..pos + 4].try_into().unwrap()) as usize;
+            kinds.push(container[pos + 4..pos + 8].try_into().unwrap());
+            assert!(size >= 8, "large boxes not expected in these tests");
+            pos += size;
+        }
+        assert_eq!(pos, container.len());
+        kinds
+    }
+
+    fn gain_map_metadata() -> crate::IsoGainMap {
+        crate::IsoGainMap::from_floats(&crate::GainMapFloats {
+            max: [2.0; 3],
+            alternate_hdr_headroom: 2.0,
+            ..crate::GainMapFloats::default()
+        })
+        .unwrap()
+    }
+
+    fn gray_gain_map(w: usize, h: usize) -> crate::GainMap {
+        let gain: Vec<u8> = (0..w * h).map(|i| (i * 4) as u8).collect();
+        crate::GainMap::gray8(gain, w, h, gain_map_metadata())
+    }
+
+    #[test]
+    fn gain_map_is_written_to_a_jhgm_box_after_the_codestream() {
+        let md = gain_map_metadata();
+        let gm = gray_gain_map(8, 8)
+            .with_lossless(true)
+            .with_alternate_color_encoding(ColorEncoding::bt2020_pq());
+        let encoded = encode_image(&rgb8(), W, H, &lossy().with_gain_map(gm)).unwrap();
+
+        assert_eq!(
+            box_kinds(&encoded),
+            [*b"JXL ", *b"ftyp", *b"jxll", *b"jxlc", *b"jhgm"]
+        );
+        assert_eq!(box_payload(&encoded, b"jxll"), Some(&[5u8][..]));
+        let jhgm = box_payload(&encoded, b"jhgm").expect("jhgm box");
+        let p = crate::gain_map::parse_jhgm_bundle(jhgm).unwrap();
+        assert_eq!(p.version, 0);
+        assert_eq!(crate::IsoGainMap::from_metadata(p.metadata).unwrap(), md);
+        assert!(!p.color_encoding.is_empty());
+        assert!(p.alt_icc.is_empty());
+        assert_eq!(&p.codestream[..2], &[0xFF, 0x0A]);
+        // A naked codestream: no container signature inside the bundle.
+        assert_ne!(&p.codestream[..4], &[0, 0, 0, 0x0C]);
+    }
+
+    #[test]
+    fn gain_map_box_precedes_metadata_boxes() {
+        let exif = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
+        let encoded = encode_image(
+            &rgb8(),
+            W,
+            H,
+            &lossy()
+                .with_exif(exif.clone())
+                .with_xmp(b"<x/>".to_vec())
+                .with_gain_map(gray_gain_map(4, 4)),
+        )
+        .unwrap();
+        assert_eq!(
+            box_kinds(&encoded),
+            [
+                *b"JXL ", *b"ftyp", *b"jxll", *b"jxlc", *b"jhgm", *b"Exif", *b"xml "
+            ]
+        );
+        assert_eq!(box_payload(&encoded, b"xml "), Some(&b"<x/>"[..]));
+    }
+
+    #[test]
+    fn level_10_gain_map_raises_the_file_level() {
+        let gain: Vec<u16> = (0..4 * 4).map(|i| (i * 4000) as u16).collect();
+        let gm = crate::GainMap::gray16(gain, 16, 4, 4, gain_map_metadata()).with_lossless(true);
+        let encoded = encode_image(&rgb8(), W, H, &lossy().with_gain_map(gm)).unwrap();
+        assert_eq!(box_payload(&encoded, b"jxll"), Some(&[10u8][..]));
+        let jhgm = box_payload(&encoded, b"jhgm").unwrap();
+        let p = crate::gain_map::parse_jhgm_bundle(jhgm).unwrap();
+        assert_eq!(&p.codestream[..2], &[0xFF, 0x0A]);
+    }
+
+    #[test]
+    fn gain_map_rides_along_every_primary_encoder_path() {
+        let cfg = lossy().with_gain_map(
+            crate::GainMap::rgb8(
+                (0..4 * 4 * 3).map(|i| i as u8).collect(),
+                4,
+                4,
+                gain_map_metadata(),
+            )
+            .with_distance(3.0),
+        );
+        let rgba: Vec<u8> = (0..W * H * 4).map(|i| i as u8).collect();
+        let gray: Vec<u8> = (0..W * H).map(|i| i as u8).collect();
+        let rgb16: Vec<u16> = (0..W * H * 3).map(|i| (i * 7) as u16).collect();
+        let f32s: Vec<f32> = (0..W * H * 3).map(|i| (i % 255) as f32 / 255.0).collect();
+        let outputs = [
+            encode_image_with_alpha(&rgba, W, H, &cfg).unwrap(),
+            encode_image_gray(&gray, W, H, &cfg).unwrap(),
+            encode_image_16bit(&rgb16, W, H, &cfg).unwrap(),
+            encode_image_f32(&f32s, W, H, &cfg).unwrap(),
+            encode_image(
+                &rgb8(),
+                W,
+                H,
+                &lossless().with_gain_map(gray_gain_map(4, 4)),
+            )
+            .unwrap(),
+            encode_image_16bit(&rgb16, W, H, &lossless().with_gain_map(gray_gain_map(4, 4)))
+                .unwrap(),
+            encode_image_f32(&f32s, W, H, &lossless().with_gain_map(gray_gain_map(4, 4))).unwrap(),
+        ];
+        for out in &outputs {
+            let jhgm = box_payload(out, b"jhgm").expect("every path writes the jhgm box");
+            let p = crate::gain_map::parse_jhgm_bundle(jhgm).unwrap();
+            assert_eq!(&p.codestream[..2], &[0xFF, 0x0A]);
+        }
+    }
+
+    #[test]
+    fn invalid_gain_map_fails_the_encode() {
+        let gm = crate::GainMap::gray8(vec![0; 15], 4, 4, gain_map_metadata());
+        assert!(matches!(
+            encode_image(&rgb8(), W, H, &lossy().with_gain_map(gm)),
+            Err(EncodeError::GainMapSizeMismatch {
+                expected: 16,
+                actual: 15
+            })
+        ));
     }
 
     #[test]

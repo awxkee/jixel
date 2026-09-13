@@ -1012,6 +1012,7 @@ fn finalize_fl(
             meta.exif.as_deref(),
             meta.xmp.as_deref(),
             None,
+            None,
         )
     } else {
         Ok(codestream)
