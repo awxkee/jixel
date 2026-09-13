@@ -1935,13 +1935,19 @@ fn encode_frame_core(
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
-    let mut order_stats = crate::coeff_order::OrderStats::new();
+    // Adopt the first group's buffers instead of allocating an empty tally.
+    // Fast and progressive frames never allocate aggregate order statistics.
+    let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
     for (dc_idx, gx, gy, p, local, local_float, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
         merge_dc_float(&mut dc_datas[dc_idx], gx, gy, &local_float);
         all_pending.push(p);
         if let Some(s) = stats {
-            order_stats.merge(&s);
+            if let Some(total) = &mut order_stats {
+                total.merge(&s);
+            } else {
+                order_stats = Some(s);
+            }
         }
     }
 
@@ -1953,11 +1959,13 @@ fn encode_frame_core(
     // on the rerank pass, which re-quantizes every DC group regardless -- and
     // is skipped entirely when that pass does not run.
     // Custom coefficient orders, derived from the first pass's nonzero tallies.
-    let mut coeff_orders = crate::coeff_order::CoeffOrders::natural();
+    let mut coeff_orders = natural_orders;
 
     let mut ytob_dc = 0i32;
-    if num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow {
-        coeff_orders = crate::coeff_order::derive_orders(&order_stats);
+    if want_order_stats {
+        if let Some(stats) = &order_stats {
+            crate::coeff_order::derive_orders(stats, &mut coeff_orders);
+        }
         ytob_dc = choose_ytob_dc(
             &dc_datas,
             ctx.fill_ytob_row,
