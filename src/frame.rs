@@ -1147,12 +1147,15 @@ fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
 }
 
 /// Slots whose transform actually appears in the frame.
-fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 8] {
-    let mut used = [false; 8];
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
+    let mut used = [false; 9];
     for dc in dc_datas {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
                 used[slot] = true;
+            }
+            if strategy == crate::dc_group_data::STRATEGY_IDENTITY {
+                used[8] = true;
             }
         }
     }
@@ -1161,7 +1164,7 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 8] {
 
 fn write_dequant_matrices(
     matrices: &crate::quant_weights::DequantMatrices,
-    used: &[bool; 8],
+    used: &[bool; 9],
     w: &mut BitWriter,
 ) {
     use crate::util::f32_to_f16_bits;
@@ -1171,10 +1174,12 @@ fn write_dequant_matrices(
             .then(|| matrices.custom_tables[slot].as_ref())
             .flatten()
     };
-    if (0..8).all(|slot| table(slot).is_none()) {
+    let identity = used[8].then_some(matrices.identity_weights).flatten();
+    if (0..8).all(|slot| table(slot).is_none()) && identity.is_none() {
         w.write(1, 1); // all_default
         return;
     }
+    const K_QUANT_MODE_ID: u64 = 1;
     const K_NUM_QUANT_TABLES: usize = 17;
     const K_QUANT_MODE_LIBRARY: u64 = 0;
     // `kQuantModeDCT4X8` carries three F16 `dct4x8multipliers` ahead of the
@@ -1197,6 +1202,17 @@ fn write_dequant_matrices(
             12 => table(6),           // DCT32X64 (= DCT64X32)
             _ => None,
         };
+        if idx == 1
+            && let Some(id) = identity
+        {
+            w.write(3, K_QUANT_MODE_ID);
+            for row in &id {
+                for &v in row {
+                    w.write(16, u64::from(f32_to_f16_bits(v / 64.0)));
+                }
+            }
+            continue;
+        }
         match bands {
             None => w.write(3, K_QUANT_MODE_LIBRARY),
             Some(o) => {
@@ -1222,7 +1238,7 @@ fn write_dequant_matrices(
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
-    used_quant_tables: &[bool; 8],
+    used_quant_tables: &[bool; 9],
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
