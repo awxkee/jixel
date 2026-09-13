@@ -361,7 +361,7 @@ fn rgb_error(src: [f32; 3], rec: [f32; 3]) -> f32 {
 }
 
 /// Effective per-channel pixel-domain quantization steps at `distance`,
-/// derived from the real DCT8 dequant tables (mean AC step over the low/mid
+/// derived from the calibrated DCT8 dequant tables (mean AC step over the low/mid
 /// band where saturated texture lives) at the effective AC quantizer
 /// `K_AC_QUANT / distance`. Order: [X, Y, B].
 fn proxy_steps(distance: f32) -> [f32; 3] {
@@ -369,10 +369,9 @@ fn proxy_steps(distance: f32) -> [f32; 3] {
     // cancels, leaving q_eff ≈ K_AC_QUANT / distance.
     const K_AC_QUANT: f32 = 0.8;
     const RECIP_K_AC_QUANT: f32 = 1.0 / K_AC_QUANT;
-    let matrices = DequantMatrices::new(distance);
     let mut steps = [0.0f32; 3];
     for (c, step) in steps.iter_mut().enumerate() {
-        let table = matrices.matrix(c);
+        let table = DequantMatrices::color_proxy_matrix(distance, c);
         let mut sum = 0.0f32;
         let mut n = 0u32;
         for ky in 0..8usize {

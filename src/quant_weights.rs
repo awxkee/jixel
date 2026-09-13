@@ -1519,6 +1519,11 @@ static IDENTITY_CHROMA_FINE: [f32; 2] = [1.25, 1.25];
 /// with large Ship color loss and was not adopted. Base sets are untouched.
 static CHROMATIC_DCT8_ROWS: [f32; 3] = [1.56, 1.07, 0.52];
 
+// Ordinary fine-quality Slow frames already signal a flat-B DCT8 table. Its B
+// row spends more rate than both perceptual metrics justify; retain the
+// fitted frequency shape and reduce only its base weight.
+const ORDINARY_DCT8_B_SCALE: f32 = 0.65;
+
 fn scale_dct8_base_weights(o: &mut BandOverride, mul: [f32; 3]) {
     for c in 0..3 {
         o.bands[c][0] = f16_bits_to_f32(f32_to_f16_bits(o.bands[c][0] * mul[c] / 64.0)) * 64.0;
@@ -1713,6 +1718,34 @@ fn shared_tables() -> &'static SharedTables {
 }
 
 impl DequantMatrices {
+    /// Keep the yellow-color proxy calibrated to its original DCT8 tables.
+    /// It evaluates a capped reference distance even for coarse frames, so
+    /// using the rate-fitted final table here would move its color decisions
+    /// outside the fit's distance band. These are constant tables, cached
+    /// once; the existing source analysis and proxy evaluation are unchanged.
+    pub(crate) fn color_proxy_matrix(distance: f32, c: usize) -> &'static [f32; 64] {
+        static HQ: std::sync::OnceLock<HeapMatrix<f32, 3, 64>> = std::sync::OnceLock::new();
+        static MID: std::sync::OnceLock<HeapMatrix<f32, 3, 64>> = std::sync::OnceLock::new();
+        static COARSE: std::sync::OnceLock<HeapMatrix<f32, 3, 64>> = std::sync::OnceLock::new();
+        if distance < QM_FLAT_B8_MIN_DISTANCE {
+            return &DEQUANT_MATRIX_8X8[c];
+        }
+        let table = if distance >= QM_DCT8_MIN_DISTANCE {
+            COARSE.get_or_init(|| {
+                compute_dct8x8_matrix(&default_dct8_override(true, &FLAT_B8_BANDS_MID))
+            })
+        } else if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
+            MID.get_or_init(|| {
+                compute_dct8x8_matrix(&default_dct8_override(false, &FLAT_B8_BANDS_MID))
+            })
+        } else {
+            HQ.get_or_init(|| {
+                compute_dct8x8_matrix(&default_dct8_override(false, &FLAT_B8_BANDS_HQ))
+            })
+        };
+        &table[c]
+    }
+
     /// Tables selected after the X-gradient classifier runs. Keep this
     /// separate from `new`: the yellow opsin proxy must retain its original
     /// quantization model when choosing the color matrix.
@@ -1744,6 +1777,25 @@ impl DequantMatrices {
         } else {
             HQ.get_or_init(|| Self::compute(false, false, None, false, false))
         }
+    }
+
+    /// The fit uses Slow's transform search. Fast keeps its original DCT8
+    /// row: the coarser B weight trades away SS2 on some screen content when
+    /// the finer transform choices are unavailable.
+    pub(crate) fn new_fast(distance: f32) -> &'static Self {
+        static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if !(QM_FLAT_B8_MIN_DISTANCE..QM_SS2_MIN_DISTANCE).contains(&distance) {
+            return Self::new(distance);
+        }
+        let (cache, bands) = if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
+            (&MID, &FLAT_B8_BANDS_MID)
+        } else {
+            (&HQ, &FLAT_B8_BANDS_HQ)
+        };
+        cache.get_or_init(|| {
+            Self::compute_with_ordinary_fit(false, false, Some(bands), false, false, false)
+        })
     }
 
     /// Tier set with the finer pair-B row; outside its distance band this is
@@ -1790,6 +1842,17 @@ impl DequantMatrices {
         pair_b: bool,
         chromatic: bool,
     ) -> Self {
+        Self::compute_with_ordinary_fit(use_ss2, use_coarse_dct8, flat_b8, pair_b, chromatic, true)
+    }
+
+    fn compute_with_ordinary_fit(
+        use_ss2: bool,
+        use_coarse_dct8: bool,
+        flat_b8: Option<&[f32; 6]>,
+        pair_b: bool,
+        chromatic: bool,
+        ordinary_fit: bool,
+    ) -> Self {
         let identity_weights = chromatic.then(|| scaled_identity_weights(IDENTITY_CHROMA_FINE));
         let (matrix_identity, inv_matrix_identity) = match identity_weights.as_ref() {
             Some(id) => identity_pair(id),
@@ -1806,6 +1869,11 @@ impl DequantMatrices {
         let mut o8 = flat_b8.map(|bands| default_dct8_override(use_coarse_dct8, bands));
         if chromatic && let Some(o) = o8.as_mut() {
             scale_dct8_base_weights(o, CHROMATIC_DCT8_ROWS);
+        } else if ordinary_fit
+            && !use_ss2
+            && let Some(o) = o8.as_mut()
+        {
+            scale_dct8_base_weights(o, [1.0, 1.0, ORDINARY_DCT8_B_SCALE]);
         }
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
@@ -1839,16 +1907,9 @@ impl DequantMatrices {
         };
         // Pair-transform (16x8/8x16) B row with a finer first AC band for the
         // chroma-texture class (see `PAIR_B_FINE_BAND1`); signaled via slot 3.
-        // `JIXEL_PAIR_B_ROW="base,d1..d6"` overrides the whole row for re-fits.
         let o3: Option<BandOverride> = pair_b.then(|| {
             let mut bands = DCT16X8_BANDS;
-            match std::env::var("JIXEL_PAIR_B_ROW") {
-                Ok(v) => {
-                    let p: Vec<f32> = v.split(',').map(|x| x.trim().parse().unwrap()).collect();
-                    bands[2][..7].copy_from_slice(&p[..7]);
-                }
-                Err(_) => bands[2][1] = PAIR_B_FINE_BAND1,
-            }
+            bands[2][1] = PAIR_B_FINE_BAND1;
             scaled_override(&bands, 1.0)
         });
         let (matrix_16x8, inv_matrix_16x8) = match o3.as_ref() {
@@ -2309,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn default_dct8_flattens_blue_high_frequency_only() {
+    fn default_dct8_preserves_flat_blue_shape_with_fitted_rate() {
         let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false);
         // X and Y stay at the spec table within F16 signaling round-off.
         for c in [0usize, 1] {
@@ -2322,14 +2383,71 @@ mod tests {
                 );
             }
         }
-        // B dequant steps never coarser than spec, and several times finer at
-        // HF (flat bands raise the outer-band weights, shrinking the step).
+        // The base scale spends less on B while the flat shape still keeps
+        // substantially more precision at HF than the spec table.
         for k in 1..64 {
             let ratio = m.matrix(2)[k] / DEQUANT_MATRIX_8X8[2][k];
-            assert!(ratio <= 1.001, "k={k}: B step ratio {ratio} > 1");
+            assert!(ratio <= 1.001 / ORDINARY_DCT8_B_SCALE, "k={k}: {ratio}");
         }
         let b_hf = m.matrix(2)[63] / DEQUANT_MATRIX_8X8[2][63];
-        assert!(b_hf < 0.35, "B HF step ratio {b_hf}, expected < 0.35");
+        assert!(
+            b_hf < 0.35 / ORDINARY_DCT8_B_SCALE,
+            "B HF step ratio {b_hf}"
+        );
+    }
+
+    #[test]
+    fn ordinary_dct8_fit_matches_wire_weights_and_existing_gates() {
+        for d in [0.3, 0.75, 1.0, 1.25, 2.0, 2.249] {
+            for m in [DequantMatrices::new(d), DequantMatrices::new_pair_b(d)] {
+                let table = m.custom_tables[0].expect("existing flat DCT8 table");
+                assert_eq!(table.num_bands, 6);
+                assert_eq!(table.bands[2][0], 332.75); // F16(512 * 0.65 / 64) * 64
+                let decoded = compute_dct8x8_matrix(&table);
+                for c in 0..3 {
+                    for k in 1..64 {
+                        assert_eq!(m.matrix(c)[k], decoded[c][k]);
+                        assert_eq!(m.inv_matrix(c)[k], 1.0 / decoded[c][k]);
+                    }
+                }
+            }
+        }
+        assert!(DequantMatrices::new(0.299).custom_tables[0].is_none());
+        for d in [2.25, 3.0, 3.5, 5.0] {
+            assert_eq!(
+                DequantMatrices::new(d).custom_tables[0].unwrap().bands[2][0],
+                512.0
+            );
+        }
+    }
+
+    #[test]
+    fn color_proxy_retains_its_original_matrix_calibration() {
+        for d in [0.29, 0.3, 0.75, 1.249, 1.25, 2.25, 3.5] {
+            let expected = if d < QM_FLAT_B8_MIN_DISTANCE {
+                HeapMatrix::from_rows(&DEQUANT_MATRIX_8X8)
+            } else {
+                let b = if d < QM_FLAT_B8_MID_MIN_DISTANCE {
+                    &FLAT_B8_BANDS_HQ
+                } else {
+                    &FLAT_B8_BANDS_MID
+                };
+                compute_dct8x8_matrix(&default_dct8_override(d >= QM_DCT8_MIN_DISTANCE, b))
+            };
+            for c in 0..3 {
+                assert_eq!(DequantMatrices::color_proxy_matrix(d, c), &expected[c]);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_keeps_original_dct8_weights() {
+        for d in [0.29, 0.3, 0.75, 1.25, 2.0, 2.249, 2.25, 3.5] {
+            let fast = DequantMatrices::new_fast(d);
+            for c in 0..3 {
+                assert_eq!(fast.matrix(c), DequantMatrices::color_proxy_matrix(d, c));
+            }
+        }
     }
 
     #[test]
