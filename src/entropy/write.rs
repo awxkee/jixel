@@ -2023,8 +2023,9 @@ fn context_map_cost(symbols: &[u8]) -> f64 {
             used += 1.0;
         }
     }
-    // ~8 bits to describe each used symbol's code length.
-    bits + used * 8.0
+    // A prefix code spends at least one bit per symbol; ~8 bits describe each
+    // used symbol's code length.
+    bits.max(total) + used * 8.0
 }
 
 /// Emit a context map, following libjxl `EncodeContextMap`: an all-zero map is
@@ -2071,21 +2072,84 @@ pub(crate) fn write_context_map(
     // MTF 546 B, MTF+RLE 463 B, raw+RLE 437 B.
     let raw_runs = run_length_symbols(&entries);
     let mtf_runs = run_length_symbols(&mtf);
-    let costs = [
+
+    // The order-0 estimates only rank the candidates; the pick is by exact
+    // serialized size. Both estimates carry the prefix-code floor of one bit
+    // per coded symbol, which a Shannon sum ignores: a 7425-entry map with two
+    // clusters estimated ~145 bits for the plain coding and actually cost
+    // 7449, where run-length coding takes ~240.
+    static VARIANTS: [(bool, bool); 4] =
+        [(false, false), (true, false), (false, true), (true, true)];
+    let estimates = [
         context_map_cost(&entries),
         context_map_cost(&mtf),
         run_length_cost(&raw_runs),
         run_length_cost(&mtf_runs),
     ];
-    let best = costs
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let use_mtf = best == 1 || best == 3;
-    let use_lz77 = best >= 2;
-    let symbols: &[u8] = if use_mtf { &mtf } else { &entries };
+    // Without a single run the run-length codings only add the LZ77 header
+    // (and would recurse into this function for their two-context map).
+    let has_runs = raw_runs.len() < entries.len() || mtf_runs.len() < entries.len();
+    let mut order: Vec<usize> = if has_runs {
+        vec![0, 1, 2, 3]
+    } else {
+        vec![0, 1]
+    };
+    order.sort_by(|&a, &b| estimates[a].total_cmp(&estimates[b]).then(a.cmp(&b)));
+    // Small maps are cheap enough to serialize every way; large ones try the
+    // runner-up only when the estimates are close.
+    let small = entries.len() <= 256;
+    let mut best: Option<BitWriter> = None;
+    for (rank, &i) in order.iter().enumerate() {
+        if !small && (rank >= 2 || (rank == 1 && estimates[i] > 1.2 * estimates[order[0]])) {
+            break;
+        }
+        let (use_mtf, use_lz77) = VARIANTS[i];
+        let mut probe = BitWriter::new();
+        write_context_map_body(
+            &entries,
+            &mtf,
+            &raw_runs,
+            &mtf_runs,
+            use_mtf,
+            use_lz77,
+            huffman_pool,
+            &mut probe,
+        );
+        if best
+            .as_ref()
+            .is_none_or(|b| probe.bits_written() < b.bits_written())
+        {
+            best = Some(probe);
+        }
+    }
+    let best = best.expect("at least one context-map candidate");
+    // Fixed-width "simple" map: is_simple=1, bits_per_entry (2 bits), entries.
+    if max <= 7 {
+        let bits_per_entry = (32 - u32::from(max).leading_zeros()) as usize;
+        if 3 + entries.len() * bits_per_entry < best.bits_written() {
+            w.write(1, 1);
+            w.write(2, bits_per_entry as u64);
+            for &e in &entries {
+                w.write(bits_per_entry, u64::from(e));
+            }
+            return;
+        }
+    }
+    w.append_bits(&best);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_context_map_body(
+    entries: &[u8],
+    mtf: &[u8],
+    raw_runs: &[RunSymbol],
+    mtf_runs: &[RunSymbol],
+    use_mtf: bool,
+    use_lz77: bool,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    let symbols: &[u8] = if use_mtf { mtf } else { entries };
 
     // is_simple = 0, use_mtf, then the histogram bundle's lz77_enabled bit.
     w.write(1, 0);
@@ -2112,7 +2176,7 @@ pub(crate) fn write_context_map(
     // reference on context 1. Distance value 0 decodes as distance 1 (the
     // decoder computes `distance + 1 - num_special_distances`, and this stream
     // has no special distances), i.e. exactly a run.
-    let runs = if use_mtf { &mtf_runs } else { &raw_runs };
+    let runs = if use_mtf { mtf_runs } else { raw_runs };
     // The histograms are built by hand: an LZ77 length symbol enters the
     // alphabet directly, whereas `build_histograms` would push it through
     // `uint_encode` and leave the prefix code without a codeword for it.
@@ -2251,8 +2315,9 @@ fn run_length_cost(runs: &[RunSymbol]) -> f64 {
         }
     }
     // The distance context costs one symbol per reference plus its own code, and
-    // a second context makes the bundle carry a nested context map.
-    bits + extra_bits + used * 8.0 + f64::from(distances) + 24.0
+    // a second context makes the bundle carry a nested context map. The literal
+    // and length symbols share one prefix code: at least one bit each.
+    bits.max(f64::from(total)) + extra_bits + used * 8.0 + f64::from(distances) + 24.0
 }
 
 /// WriteContextMap + the per-bundle code parameters (prefix codes or ANS).
@@ -2385,13 +2450,16 @@ mod ans_refinement_tests {
 
     #[test]
     fn unused_contexts_repeat_the_preceding_map_entry_only_when_the_map_shrinks() {
-        // Populate every third context of the first half, alternating two
-        // clusters, so the unused entries at cluster 0 break the map's runs.
+        // Populate every third context of the first half: the first quarter
+        // at cluster 1, the second at cluster 0. The unused entries at cluster
+        // 0 chop the cluster-1 stretch into 1,0,0,1,0,0,... which has no run
+        // long enough for the map's run-length coder; repeating the previous
+        // entry turns it into one run.
         const CONTEXTS: usize = 600;
         let mut map = vec![0u8; CONTEXTS];
         let mut tokens = Vec::new();
         for context in (0..CONTEXTS / 2).step_by(3) {
-            map[context] = ((context / 3) % 2) as u8;
+            map[context] = u8::from(context < CONTEXTS / 4);
             for i in 0..40u32 {
                 tokens.push(Token::new(context as u32, (i * 7 + context as u32) % 9));
             }
