@@ -151,7 +151,7 @@ pub(crate) fn find_lossy_patches(
     }
 
     groups.retain(|g| tile_energy(linear, g[0].0, g[0].1) >= MIN_PATCH_ENERGY);
-    groups.sort_by_key(|g| (std::cmp::Reverse(g.len()), g[0]));
+    sort_patch_groups(&mut groups);
     groups.truncate(256);
     if groups.is_empty() {
         return None;
@@ -327,7 +327,7 @@ pub(crate) fn find_lossless_patches(
         }
         groups.extend(exact_groups.into_iter().filter(|g| g.len() >= 3));
     }
-    groups.sort_by_key(|g| (std::cmp::Reverse(g.len()), g[0]));
+    sort_patch_groups(&mut groups);
     groups.truncate(256);
     if groups.is_empty() {
         return None;
@@ -679,6 +679,11 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
         base,
         references,
     })
+}
+
+// Both patch searches use this ordering; share the comparator's sort code.
+fn sort_patch_groups(groups: &mut [Vec<(usize, usize)>]) {
+    groups.sort_by_key(|g| (std::cmp::Reverse(g.len()), g[0]));
 }
 
 #[cfg(test)]

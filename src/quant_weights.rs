@@ -762,6 +762,7 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
     ],
 ];
 
+// Invariant tables borrow from SharedTables; preset-dependent tables stay owned.
 pub(crate) struct DequantMatrices {
     /// Signaled IDENTITY weights (kQuantModeID) when they differ from spec.
     pub(crate) identity_weights: Option<[[f32; 3]; 3]>,
@@ -772,8 +773,8 @@ pub(crate) struct DequantMatrices {
     /// Spec-default IDENTITY/Hornuss table.
     pub(crate) matrix_identity: HeapMatrix<f32, 3, 64>,
     pub(crate) inv_matrix_identity: HeapMatrix<f32, 3, 64>,
-    pub(crate) matrix_dct2x2: HeapMatrix<f32, 3, 64>,
-    pub(crate) inv_matrix_dct2x2: HeapMatrix<f32, 3, 64>,
+    pub(crate) matrix_dct2x2: &'static [[f32; 64]; 3],
+    pub(crate) inv_matrix_dct2x2: &'static [[f32; 64]; 3],
     /// 16×8 / 8×16 dequant matrix. Both rectangular transforms share these
     /// 128 floats per channel (libjxl-tiny convention).
     pub(crate) matrix_16x8: HeapMatrix<f32, 3, 128>,
@@ -788,23 +789,23 @@ pub(crate) struct DequantMatrices {
     pub(crate) matrix_32x32: HeapMatrix<f32, 3, 1024>,
     pub(crate) inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
     /// Spec-default DCT64X64 table used by the slow large-transform path.
-    pub(crate) matrix_64x64: HeapMatrix<f32, 3, 4096>,
-    pub(crate) inv_matrix_64x64: HeapMatrix<f32, 3, 4096>,
+    pub(crate) matrix_64x64: &'static [[f32; 4096]; 3],
+    pub(crate) inv_matrix_64x64: &'static [[f32; 4096]; 3],
     /// Shared normalized 32-row x 64-column table for DCT64X32/DCT32X64.
-    pub(crate) matrix_64x32: HeapMatrix<f32, 3, 2048>,
-    pub(crate) inv_matrix_64x32: HeapMatrix<f32, 3, 2048>,
+    pub(crate) matrix_64x32: &'static [[f32; 2048]; 3],
+    pub(crate) inv_matrix_64x32: &'static [[f32; 2048]; 3],
     /// Tables that differ from the spec defaults and must be signaled by
     /// `write_dequant_matrices`, in the fixed order
     pub(crate) custom_tables: Box<[Option<BandOverride>; 8]>,
     /// DCT4X4 dequant matrix (64 floats per channel, 8×8 grid). Generated from
     /// the libjxl DCT4X4 4-band parameters: 4×4 radial weights replicated to
     /// 2×2 cells. Used for the sub-8×8 DCT4X4 transform.
-    pub(crate) matrix_4x4: HeapMatrix<f32, 3, 64>,
-    pub(crate) inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
+    pub(crate) matrix_4x4: &'static [[f32; 64]; 3],
+    pub(crate) inv_matrix_4x4: &'static [[f32; 64]; 3],
     /// DCT4X8 dequant matrix (64 floats per channel). 4×8 radial weights with
     /// each row replicated to 2 rows of the 8×8 grid. Used for DCT4X8.
-    pub(crate) matrix_4x8: HeapMatrix<f32, 3, 64>,
-    pub(crate) inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
+    pub(crate) matrix_4x8: &'static [[f32; 64]; 3],
+    pub(crate) inv_matrix_4x8: &'static [[f32; 64]; 3],
     /// DCT32X16 / DCT16X32 dequant matrix (512 floats per channel). Both
     /// rectangular large transforms share these weights (libjxl
     /// `QuantTable::DCT16X32`), computed at the normalized 16-row × 32-col
@@ -813,8 +814,8 @@ pub(crate) struct DequantMatrices {
     pub(crate) inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
     /// AFV dequant matrix (64 floats per channel, 8×8 grid), shared by all
     /// four AFV variants (libjxl `QuantTable::AFV0`).
-    pub(crate) matrix_afv: HeapMatrix<f32, 3, 64>,
-    pub(crate) inv_matrix_afv: HeapMatrix<f32, 3, 64>,
+    pub(crate) matrix_afv: &'static [[f32; 64]; 3],
+    pub(crate) inv_matrix_afv: &'static [[f32; 64]; 3],
 }
 
 /// libjxl `DequantMatricesLibraryDef::DCT16X16()` parameters: 7 distance
@@ -1629,9 +1630,7 @@ fn shared_tables() -> &'static SharedTables {
         let matrix = HeapMatrix::from_rows(&DEQUANT_MATRIX_8X8);
         let mut inv_matrix = HeapMatrix::new(0.);
         for c in 0..3 {
-            for k in 1..64 {
-                inv_matrix[c][k] = 1.0 / matrix[c][k];
-            }
+            fill_ac_reciprocals(&matrix[c], &mut inv_matrix[c]);
         }
 
         // Use the precomputed static rather than recomputing from bands: the
@@ -1640,9 +1639,7 @@ fn shared_tables() -> &'static SharedTables {
         let matrix_16x8 = HeapMatrix::from_rows(&DEQUANT_MATRIX_16X8);
         let mut inv_matrix_16x8 = HeapMatrix::new(0.);
         for c in 0..3 {
-            for k in 1..128 {
-                inv_matrix_16x8[c][k] = 1.0 / matrix_16x8[c][k];
-            }
+            fill_ac_reciprocals(&matrix_16x8[c], &mut inv_matrix_16x8[c]);
         }
 
         let matrix_4x4 = compute_dct4x4_matrix();
@@ -1650,9 +1647,7 @@ fn shared_tables() -> &'static SharedTables {
         for c in 0..3 {
             // DC slot (index 0) zeroed (handled by the DC plane). For DCT4X4 the
             // only LLF position is the DC; [1], [8], [9] are regular AC.
-            for k in 1..64 {
-                inv_matrix_4x4[c][k] = 1.0 / matrix_4x4[c][k];
-            }
+            fill_ac_reciprocals(&matrix_4x4[c], &mut inv_matrix_4x4[c]);
         }
 
         let matrix_4x8 = compute_dct4x8_matrix(None);
@@ -1660,9 +1655,7 @@ fn shared_tables() -> &'static SharedTables {
         for c in 0..3 {
             // Only [0] is the DC (handled by the DC plane); [8] (the vertical
             // half-difference after the Hadamard) and all others are regular AC.
-            for k in 1..64 {
-                inv_matrix_4x8[c][k] = 1.0 / matrix_4x8[c][k];
-            }
+            fill_ac_reciprocals(&matrix_4x8[c], &mut inv_matrix_4x8[c]);
         }
 
         let matrix_afv = compute_afv_matrix();
@@ -1670,25 +1663,19 @@ fn shared_tables() -> &'static SharedTables {
         for c in 0..3 {
             // Only [0] (the block mean) lives in the DC plane; [1] and [8]
             // (the sub-part DC differences) are regular AC coefficients.
-            for k in 1..64 {
-                inv_matrix_afv[c][k] = 1.0 / matrix_afv[c][k];
-            }
+            fill_ac_reciprocals(&matrix_afv[c], &mut inv_matrix_afv[c]);
         }
 
         let matrix_64x64 = compute_dct64x64_matrix(None);
         let mut inv_matrix_64x64 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
-            for k in 1..4096 {
-                inv_matrix_64x64[c][k] = 1.0 / matrix_64x64[c][k];
-            }
+            fill_ac_reciprocals(&matrix_64x64[c], &mut inv_matrix_64x64[c]);
         }
 
         let matrix_64x32 = compute_dct64x32_matrix(None);
         let mut inv_matrix_64x32 = HeapMatrix::new(0.0f32);
         for c in 0..3 {
-            for k in 1..2048 {
-                inv_matrix_64x32[c][k] = 1.0 / matrix_64x32[c][k];
-            }
+            fill_ac_reciprocals(&matrix_64x32[c], &mut inv_matrix_64x32[c]);
         }
 
         let ((matrix_identity, inv_matrix_identity), (matrix_dct2x2, inv_matrix_dct2x2)) =
@@ -1879,32 +1866,11 @@ impl DequantMatrices {
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
         let o64: Option<BandOverride> = None;
         let o64r: Option<BandOverride> = None;
-        let (matrix_64x64, inv_matrix_64x64) = match o64.as_ref() {
-            None => (shared.matrix_64x64.clone(), shared.inv_matrix_64x64.clone()),
-            Some(ov) => {
-                let m = compute_dct64x64_matrix(Some(ov));
-                let mut inv = HeapMatrix::new(0.0f32);
-                for c in 0..3 {
-                    for k in 1..4096 {
-                        inv[c][k] = 1.0 / m[c][k];
-                    }
-                }
-                (m, inv)
-            }
-        };
-        let (matrix_64x32, inv_matrix_64x32) = match o64r.as_ref() {
-            None => (shared.matrix_64x32.clone(), shared.inv_matrix_64x32.clone()),
-            Some(ov) => {
-                let m = compute_dct64x32_matrix(Some(ov));
-                let mut inv = HeapMatrix::new(0.0f32);
-                for c in 0..3 {
-                    for k in 1..2048 {
-                        inv[c][k] = 1.0 / m[c][k];
-                    }
-                }
-                (m, inv)
-            }
-        };
+        // These tables never vary across distance or content presets.
+        let matrix_64x64: &'static [[f32; 4096]; 3] = &shared.matrix_64x64;
+        let inv_matrix_64x64: &'static [[f32; 4096]; 3] = &shared.inv_matrix_64x64;
+        let matrix_64x32: &'static [[f32; 2048]; 3] = &shared.matrix_64x32;
+        let inv_matrix_64x32: &'static [[f32; 2048]; 3] = &shared.inv_matrix_64x32;
         // Pair-transform (16x8/8x16) B row with a finer first AC band for the
         // chroma-texture class (see `PAIR_B_FINE_BAND1`); signaled via slot 3.
         let o3: Option<BandOverride> = pair_b.then(|| {
@@ -1918,9 +1884,7 @@ impl DequantMatrices {
                 let m = compute_dct16x8_matrix(Some(ov));
                 let mut inv = HeapMatrix::new(0.0f32);
                 for c in 0..3 {
-                    for k in 1..128 {
-                        inv[c][k] = 1.0 / m[c][k];
-                    }
+                    fill_ac_reciprocals(&m[c], &mut inv[c]);
                 }
                 (m, inv)
             }
@@ -1931,9 +1895,7 @@ impl DequantMatrices {
         for c in 0..3 {
             // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
             // since the decoder overwrites them via LowestFrequenciesFromDC.
-            for k in 1..512 {
-                inv_matrix_32x16[c][k] = 1.0 / matrix_32x16[c][k];
-            }
+            fill_ac_reciprocals(&matrix_32x16[c], &mut inv_matrix_32x16[c]);
         }
 
         let matrix_16x16 = compute_dct16x16_matrix(o16.as_ref());
@@ -1945,9 +1907,7 @@ impl DequantMatrices {
             // leave non-DC LF positions populated because the decoder
             // will overwrite them via LowestFrequenciesFromDC anyway, just
             // like for 16×8 / 8×16.
-            for k in 1..256 {
-                inv_16x16[c][k] = 1.0 / matrix_16x16[c][k];
-            }
+            fill_ac_reciprocals(&matrix_16x16[c], &mut inv_16x16[c]);
         }
 
         let matrix_32x32 = compute_dct32x32_matrix(o32.as_ref());
@@ -1955,18 +1915,14 @@ impl DequantMatrices {
         for c in 0..3 {
             // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
             // since the decoder overwrites them via LowestFrequenciesFromDC.
-            for k in 1..1024 {
-                inv_32x32[c][k] = 1.0 / matrix_32x32[c][k];
-            }
+            fill_ac_reciprocals(&matrix_32x32[c], &mut inv_32x32[c]);
         }
 
         let (matrix, inv_matrix) = if let Some(o8) = o8.as_ref() {
             let matrix = compute_dct8x8_matrix(o8);
             let mut inv_matrix = HeapMatrix::new(0.);
             for c in 0..3 {
-                for k in 1..64 {
-                    inv_matrix[c][k] = 1.0 / matrix[c][k];
-                }
+                fill_ac_reciprocals(&matrix[c], &mut inv_matrix[c]);
             }
             (matrix, inv_matrix)
         } else {
@@ -1979,8 +1935,8 @@ impl DequantMatrices {
             inv_matrix,
             matrix_identity,
             inv_matrix_identity,
-            matrix_dct2x2: shared.matrix_dct2x2.clone(),
-            inv_matrix_dct2x2: shared.inv_matrix_dct2x2.clone(),
+            matrix_dct2x2: &shared.matrix_dct2x2,
+            inv_matrix_dct2x2: &shared.inv_matrix_dct2x2,
             matrix_16x8,
             inv_matrix_16x8,
             matrix_16x16,
@@ -2004,14 +1960,14 @@ impl DequantMatrices {
                 7 => o64,
                 _ => unreachable!(),
             }),
-            matrix_4x4: shared.matrix_4x4.clone(),
-            inv_matrix_4x4: shared.inv_matrix_4x4.clone(),
-            matrix_4x8: shared.matrix_4x8.clone(),
-            inv_matrix_4x8: shared.inv_matrix_4x8.clone(),
+            matrix_4x4: &shared.matrix_4x4,
+            inv_matrix_4x4: &shared.inv_matrix_4x4,
+            matrix_4x8: &shared.matrix_4x8,
+            inv_matrix_4x8: &shared.inv_matrix_4x8,
             matrix_32x16,
             inv_matrix_32x16,
-            matrix_afv: shared.matrix_afv.clone(),
-            inv_matrix_afv: shared.inv_matrix_afv.clone(),
+            matrix_afv: &shared.matrix_afv,
+            inv_matrix_afv: &shared.inv_matrix_afv,
         }
     }
 
@@ -2129,6 +2085,16 @@ impl DequantMatrices {
     #[inline]
     pub(crate) fn inv_matrix_afv(&self, c: usize) -> &[f32; 64] {
         &self.inv_matrix_afv[c]
+    }
+}
+
+// Keep setup shared across matrix sizes, leaving the separately quantized DC
+// entry at zero. Inlining would expand the same divisions at each call site.
+#[inline(never)]
+fn fill_ac_reciprocals(matrix: &[f32], inv: &mut [f32]) {
+    debug_assert_eq!(matrix.len(), inv.len());
+    for (&value, out) in matrix[1..].iter().zip(&mut inv[1..]) {
+        *out = 1.0 / value;
     }
 }
 
@@ -2648,6 +2614,74 @@ mod tests {
                 m_c[255],
                 m_c[0]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_storage_tests {
+    use super::*;
+    #[test]
+    fn invariant_tables_share_storage_across_all_preset_families() {
+        let shared = shared_tables();
+        for distance in [0.0, 0.1, 0.3, 0.75, 1.0, 1.5, 2.0, 2.25, 3.0, 4.0, 8.0] {
+            for set in [
+                DequantMatrices::new(distance),
+                DequantMatrices::new_fast(distance),
+                DequantMatrices::new_x_heavy(distance),
+                DequantMatrices::new_pair_b(distance),
+                DequantMatrices::new_saturated(distance),
+                DequantMatrices::new_saturated_pair_b(distance),
+            ] {
+                assert!(std::ptr::eq(
+                    set.matrix_dct2x2.as_ptr(),
+                    shared.matrix_dct2x2.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_dct2x2.as_ptr(),
+                    shared.inv_matrix_dct2x2.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.matrix_4x4.as_ptr(),
+                    shared.matrix_4x4.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_4x4.as_ptr(),
+                    shared.inv_matrix_4x4.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.matrix_4x8.as_ptr(),
+                    shared.matrix_4x8.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_4x8.as_ptr(),
+                    shared.inv_matrix_4x8.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.matrix_afv.as_ptr(),
+                    shared.matrix_afv.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_afv.as_ptr(),
+                    shared.inv_matrix_afv.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.matrix_64x64.as_ptr(),
+                    shared.matrix_64x64.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_64x64.as_ptr(),
+                    shared.inv_matrix_64x64.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.matrix_64x32.as_ptr(),
+                    shared.matrix_64x32.as_ptr()
+                ));
+                assert!(std::ptr::eq(
+                    set.inv_matrix_64x32.as_ptr(),
+                    shared.inv_matrix_64x32.as_ptr()
+                ));
+            }
         }
     }
 }

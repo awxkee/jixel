@@ -305,7 +305,8 @@ impl WpState {
 
     /// Complete one sequential WP state transition using row offsets already
     /// selected by the caller's row kernel.
-    #[inline(always)]
+    /// Share the full transition across typed row kernels and border handlers;
+    /// the private helpers stay fused within this operation.
     pub(crate) fn predict_and_update(
         &mut self,
         val: i64,
@@ -319,8 +320,18 @@ impl WpState {
     }
 
     /// MA and palette traversals benefit from the exact flat-span shortcut.
-    #[inline(always)]
     pub(crate) fn predict_and_update_flat(
+        &mut self,
+        val: i64,
+        x: usize,
+        row: WpRowOffsets,
+        neighbors: WpNeighbors,
+    ) -> i64 {
+        self.predict_and_update_flat_inlined(val, x, row, neighbors)
+    }
+
+    #[inline(always)]
+    pub(crate) fn predict_and_update_flat_inlined(
         &mut self,
         val: i64,
         x: usize,
@@ -344,7 +355,6 @@ impl WpState {
 
     /// Compatibility API for callers that perform work between prediction and
     /// error-state update.
-    #[inline]
     pub(crate) fn predict(
         &mut self,
         x: usize,

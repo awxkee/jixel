@@ -183,6 +183,21 @@ impl ThreadPool {
         T: Send,
         F: Fn(usize, &mut CoderScratch) -> T + Sync,
     {
+        self.steal_map_with_threads_shared(caller_scratch, len, max_threads, &f)
+    }
+
+    // Share collection and cleanup across callback types. Dispatch once per
+    // work item; each callback retains its concrete pixel/stream loops.
+    fn steal_map_with_threads_shared<T>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        len: usize,
+        max_threads: usize,
+        f: &(dyn Fn(usize, &mut CoderScratch) -> T + Sync),
+    ) -> Vec<T>
+    where
+        T: Send,
+    {
         let lanes = self.num_threads.min(max_threads.max(1)).min(len);
         if lanes <= 1 {
             return (0..len).map(|i| f(i, caller_scratch)).collect();
@@ -190,10 +205,6 @@ impl ThreadPool {
 
         let cursor = AtomicUsize::new(0);
         let chunks = Mutex::new(Vec::<Vec<(usize, T)>>::with_capacity(lanes));
-        let completion = Arc::new(Completion {
-            remaining: AtomicUsize::new(lanes),
-            panic: Mutex::new(None),
-        });
 
         let lane = |scratch: &mut CoderScratch| {
             let mut out = Vec::new();
@@ -207,36 +218,7 @@ impl ThreadPool {
             chunks.lock().unwrap().push(out);
         };
 
-        for _ in 1..lanes {
-            let run: Box<dyn FnOnce(&mut CoderScratch) + Send + '_> = Box::new(&lane);
-            // `steal_map_with_threads` does not return until every queued lane
-            // has completed, so the borrowed closure and its
-            // captures outlive each task. This is the same scoped-lifetime
-            // guarantee provided by `std::thread::scope`, applied to persistent
-            // workers instead of newly spawned threads.
-            let run = unsafe {
-                std::mem::transmute::<
-                    Box<dyn FnOnce(&mut CoderScratch) + Send + '_>,
-                    Box<dyn FnOnce(&mut CoderScratch) + Send + 'static>,
-                >(run)
-            };
-            self.shared.push(Task {
-                run,
-                completion: Arc::clone(&completion),
-            });
-        }
-        let result = catch_unwind(AssertUnwindSafe(|| lane(caller_scratch)));
-        completion.finish(result.err(), &self.shared);
-
-        while completion.remaining.load(Ordering::Acquire) != 0 {
-            if !self.shared.run_one(caller_scratch) {
-                self.shared.wait_for_activity(&completion.remaining);
-            }
-        }
-
-        if let Some(payload) = completion.panic.lock().unwrap().take() {
-            resume_unwind(payload);
-        }
+        self.run_lanes(caller_scratch, lanes, &lane);
 
         let mut slots: Vec<Option<T>> = (0..len).map(|_| None).collect();
         for (i, value) in chunks.into_inner().unwrap().into_iter().flatten() {
@@ -269,6 +251,19 @@ impl ThreadPool {
         T: Send,
         F: Fn(usize, &mut T, &mut CoderScratch) + Sync,
     {
+        self.steal_for_each_mut_with_threads_shared(caller_scratch, items, max_threads, &f)
+    }
+
+    // As with maps, erase only the outer work-item callback.
+    fn steal_for_each_mut_with_threads_shared<T>(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        items: &mut [T],
+        max_threads: usize,
+        f: &(dyn Fn(usize, &mut T, &mut CoderScratch) + Sync),
+    ) where
+        T: Send,
+    {
         let lanes = self.num_threads.min(max_threads.max(1)).min(items.len());
         if lanes <= 1 {
             for (i, item) in items.iter_mut().enumerate() {
@@ -280,10 +275,6 @@ impl ThreadPool {
         let cursor = AtomicUsize::new(0);
         let items_ptr = AtomicPtr::new(items.as_mut_ptr());
         let len = items.len();
-        let completion = Arc::new(Completion {
-            remaining: AtomicUsize::new(lanes),
-            panic: Mutex::new(None),
-        });
 
         let lane = |scratch: &mut CoderScratch| {
             let items_ptr = items_ptr.load(Ordering::Relaxed);
@@ -301,10 +292,26 @@ impl ThreadPool {
             }
         };
 
+        self.run_lanes(caller_scratch, lanes, &lane);
+    }
+
+    /// Share scheduling and completion across callback/result types. Dispatch
+    /// once per lane; each callback keeps its specialized per-item loop.
+    fn run_lanes(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        lanes: usize,
+        lane: &(dyn Fn(&mut CoderScratch) + Sync),
+    ) {
+        let completion = Arc::new(Completion {
+            remaining: AtomicUsize::new(lanes),
+            panic: Mutex::new(None),
+        });
         for _ in 1..lanes {
-            let run: Box<dyn FnOnce(&mut CoderScratch) + Send + '_> = Box::new(&lane);
-            // See `steal_map_with_threads`: completion scopes the borrowed
-            // closure and `items` to this call despite the persistent workers.
+            let run: Box<dyn FnOnce(&mut CoderScratch) + Send + '_> = Box::new(lane);
+            // SAFETY: this method waits for every lane before returning or
+            // propagating a worker panic. The borrowed callback and its captures
+            // therefore outlive all queued tasks, including nested pool work.
             let run = unsafe {
                 std::mem::transmute::<
                     Box<dyn FnOnce(&mut CoderScratch) + Send + '_>,
@@ -434,5 +441,23 @@ mod tests {
             pool.steal_map(&mut scratch, 4, |i, _scratch| i),
             vec![0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn mutable_worker_panic_releases_borrows_before_reusing_the_pool() {
+        let pool = ThreadPool::new(4);
+        let mut scratch = Box::<CoderScratch>::default();
+        let mut values = vec![0usize; 257];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.steal_for_each_mut(&mut scratch, &mut values, |i, value, _scratch| {
+                assert_ne!(i, 17, "mutable worker failure");
+                *value = i;
+            });
+        }));
+        assert!(panic.is_err());
+        pool.steal_for_each_mut(&mut scratch, &mut values, |i, value, _scratch| {
+            *value = i * 3;
+        });
+        assert_eq!(values, (0..257).map(|i| i * 3).collect::<Vec<_>>());
     }
 }

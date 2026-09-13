@@ -685,7 +685,9 @@ where
     }
 
     // Final numbering: stable by smallest fine id.
-    groups.sort_by_key(|g| g.iter().copied().min().unwrap());
+    crate::util::sort_small_by(&mut groups, |a, b| {
+        a.iter().min().unwrap().cmp(b.iter().min().unwrap())
+    });
     let mut fine_to_final = [0u8; K_NUM_FINE_BLOCK_CTXS];
     for (id, g) in groups.iter().enumerate() {
         for &fine in g {

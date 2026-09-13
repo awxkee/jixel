@@ -272,6 +272,8 @@ fn clamped_gradient(n: i32, w: i32, l: i32) -> i32 {
 #[inline(always)]
 fn push_dc_wp_token(
     tokens: &mut Vec<Token>,
+    gradient_tokens: &mut Vec<Token>,
+    collect_gradient: bool,
     wp: &mut crate::weighted_predictor::WpState,
     x: usize,
     y: usize,
@@ -305,6 +307,13 @@ fn push_dc_wp_token(
         context as u32,
         pack_signed((value - prediction) as i32),
     ));
+    if collect_gradient {
+        let gradient = (n + w - nw).clamp(n.min(w), n.max(w));
+        gradient_tokens.push(Token::new(
+            context as u32,
+            pack_signed((value - gradient) as i32),
+        ));
+    }
 }
 
 /// Per-leaf predictor selection for the DC plane, indexed by DC context.
@@ -325,7 +334,8 @@ fn choose_dc_predictors(
     // [candidate][context][symbol] counts, plus the raw extra bits per context.
     let counts = &mut scratch.counts;
     let extra = &mut scratch.extra;
-    counts.fill([0; crate::entropy::ALPHABET_SIZE]);
+    // A flat integer fill avoids expanding the reset into row-sized stores.
+    counts.as_flattened_mut().fill(0);
     extra.fill(0);
     for (cand, groups) in [wp, grad].into_iter().enumerate() {
         for token in groups.iter().flatten() {
@@ -373,11 +383,22 @@ pub(crate) fn collect_dc_tokens(
     props: &mut Vec<crate::dc_tree::DcProp>,
     collect_props: bool,
 ) -> Vec<Token> {
+    collect_dc_tokens_with_gradient(dc_data, dc_gradient, props, collect_props, false).0
+}
+
+fn collect_dc_tokens_with_gradient(
+    dc_data: &DcGroupData,
+    dc_gradient: &DcPredictorChoice,
+    props: &mut Vec<crate::dc_tree::DcProp>,
+    collect_props: bool,
+    collect_gradient: bool,
+) -> (Vec<Token>, Vec<Token>) {
     let token_count = [1usize, 0, 2]
         .into_iter()
         .map(|c| dc_data.quant_dc.plane(c).as_slice().len())
         .sum();
     let mut tokens = Vec::with_capacity(token_count);
+    let mut gradient_tokens = Vec::with_capacity(if collect_gradient { token_count } else { 0 });
 
     // Weighted-predictor DC, mirroring libjxl's kWPFixedDC path (enc_modular.cc
     // AddVarDCTDC at speed tiers falcon..squirrel): the guess is the
@@ -406,6 +427,8 @@ pub(crate) fn collect_dc_tokens(
             let value = value as i64;
             push_dc_wp_token(
                 &mut tokens,
+                &mut gradient_tokens,
+                collect_gradient,
                 &mut wp,
                 x,
                 0,
@@ -433,6 +456,8 @@ pub(crate) fn collect_dc_tokens(
             let ne = row_above.get(1).copied().unwrap_or(row_above[0]) as i64;
             push_dc_wp_token(
                 &mut tokens,
+                &mut gradient_tokens,
+                collect_gradient,
                 &mut wp,
                 0,
                 y,
@@ -458,6 +483,8 @@ pub(crate) fn collect_dc_tokens(
             {
                 push_dc_wp_token(
                     &mut tokens,
+                    &mut gradient_tokens,
+                    collect_gradient,
                     &mut wp,
                     offset + 1,
                     y,
@@ -480,6 +507,8 @@ pub(crate) fn collect_dc_tokens(
                 let n = row_above[x] as i64;
                 push_dc_wp_token(
                     &mut tokens,
+                    &mut gradient_tokens,
+                    collect_gradient,
                     &mut wp,
                     x,
                     y,
@@ -500,7 +529,7 @@ pub(crate) fn collect_dc_tokens(
             row_above = row;
         }
     }
-    tokens
+    (tokens, gradient_tokens)
 }
 
 /// AC metadata: ytox/ytob CfL maps (all 0), AC strategy (all 0 = DCT-8x8),
@@ -2057,14 +2086,14 @@ fn encode_frame_core(
                 &DC_PREDICTOR_WEIGHTED
             };
             let collect_props = ctx.speed != Speed::Fastest;
-            let wp = collect_dc_tokens(&dc_datas[i], predictor, &mut props, collect_props);
-            // Both arms run identical WP state; properties are shared.
-            let grad = if ctx.speed == Speed::Fastest {
-                Vec::new()
-            } else {
-                let mut discard = Vec::new();
-                collect_dc_tokens(&dc_datas[i], &DC_PREDICTOR_GRADIENT, &mut discard, false)
-            };
+            // Both residual candidates use the same WP state and context.
+            let (wp, grad) = collect_dc_tokens_with_gradient(
+                &dc_datas[i],
+                predictor,
+                &mut props,
+                collect_props,
+                collect_props,
+            );
             let mut meta_props = Vec::new();
             let meta =
                 collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, distance, collect_props);
@@ -3281,6 +3310,57 @@ mod tests {
             let params = compute_distance_params(distance);
             let rounding_error = 0.5 * params.scale;
             assert!((params.scale_dc - quant_dc(distance)).abs() <= rounding_error + f32::EPSILON);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fused_dc_tests {
+    use super::*;
+    #[test]
+    fn fused_dc_candidates_match_separate_predictor_traversals() {
+        for w in [1, 2, 3, 9, 32] {
+            for h in [1, 2, 3, 17] {
+                let mut dc = DcGroupData::new(w, h).unwrap();
+                for c in 0..3 {
+                    for y in 0..h {
+                        for x in 0..w {
+                            let i = (y * w + x + 1) * (c + 7);
+                            dc.quant_dc.plane_row_mut(c, y)[x] =
+                                ((i * 7919 ^ (i / 7 * 1237)) % 65536) as i16;
+                        }
+                    }
+                }
+                for collect_props in [false, true] {
+                    for choice in [
+                        DC_PREDICTOR_WEIGHTED,
+                        DC_PREDICTOR_GRADIENT,
+                        std::array::from_fn(|i| i % 2 == 0),
+                    ] {
+                        let mut expected_props = Vec::new();
+                        let expected =
+                            collect_dc_tokens(&dc, &choice, &mut expected_props, collect_props);
+                        let grad =
+                            collect_dc_tokens(&dc, &DC_PREDICTOR_GRADIENT, &mut Vec::new(), false);
+                        let mut props = Vec::new();
+                        let (fused, fused_grad) = collect_dc_tokens_with_gradient(
+                            &dc,
+                            &choice,
+                            &mut props,
+                            collect_props,
+                            true,
+                        );
+                        let values = |ts: Vec<Token>| {
+                            ts.into_iter()
+                                .map(|t| (t.context, t.value))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(values(fused), values(expected));
+                        assert_eq!(values(fused_grad), values(grad));
+                        assert_eq!(props, expected_props);
+                    }
+                }
+            }
         }
     }
 }

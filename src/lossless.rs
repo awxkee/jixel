@@ -162,6 +162,12 @@ impl DeepLzScratchPool {
     }
 
     fn with_depth<T>(&self, f: impl FnOnce(&mut Vec<u32>) -> T) -> T {
+        let mut guard = self.acquire();
+        f(guard.depth.as_mut().unwrap())
+    }
+
+    // Keep lock/wait setup independent of each callback and return type.
+    fn acquire(&self) -> DeepLzScratchGuard<'_> {
         let depth = {
             let mut available = self.available.lock().unwrap();
             while available.is_empty() {
@@ -170,11 +176,10 @@ impl DeepLzScratchPool {
             available.pop().unwrap()
         };
 
-        let mut guard = DeepLzScratchGuard {
+        DeepLzScratchGuard {
             owner: self,
             depth: Some(depth),
-        };
-        f(guard.depth.as_mut().unwrap())
+        }
     }
 }
 
@@ -2364,10 +2369,10 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
         let row = wp.row_offsets(y);
         p[2] = y as i32;
         p[9] = 0; // "local gradient" carry, reset per row (InitPropsRow)
-        // Keep the visitor in each loop body. Passing this large WP/property
-        // update through a row callback can outline a call for every pixel.
+        // Keep property updates in each loop, but fuse WP only in the hot
+        // interior. First-row, border, and tail visits share the WP operation.
         macro_rules! visit_pixel {
-            ($x:expr, $value:expr, $neighbors:expr) => {{
+            ($predict:ident, $x:expr, $value:expr, $neighbors:expr) => {{
                 let x = $x;
                 let value = $value;
                 let n = $neighbors;
@@ -2387,7 +2392,7 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
                 let wp_pred = if disabled {
                     0
                 } else {
-                    wp.predict_and_update_flat(
+                    wp.$predict(
                         value,
                         x,
                         row,
@@ -2409,6 +2414,7 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
             if let Some((&first, tail)) = current_row.split_first() {
                 let first = i64::from(first);
                 visit_pixel!(
+                    predict_and_update_flat,
                     0,
                     first,
                     PredictorNeighbors {
@@ -2426,6 +2432,7 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
                 for (x, &value) in tail.iter().enumerate() {
                     let value = i64::from(value);
                     visit_pixel!(
+                        predict_and_update_flat,
                         x + 1,
                         value,
                         PredictorNeighbors {
@@ -2470,7 +2477,7 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
                 }
             };
             for (x, &value) in current_row.iter().take(2).enumerate() {
-                visit_pixel!(x, i64::from(value), edge(x));
+                visit_pixel!(predict_and_update_flat, x, i64::from(value), edge(x));
             }
             if gw > 4 {
                 let mut left = i64::from(current_row[1]);
@@ -2482,6 +2489,7 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
                 for (x, ((&value, &[nw, n, ne, nee]), &nn)) in pixels.enumerate() {
                     let value = i64::from(value);
                     visit_pixel!(
+                        predict_and_update_flat_inlined,
                         x + 2,
                         value,
                         PredictorNeighbors {
@@ -2499,7 +2507,12 @@ fn walk_channel_ma<'a, T: Copy + 'a>(
                 }
             }
             for x in gw.saturating_sub(2).max(2)..gw {
-                visit_pixel!(x, i64::from(current_row[x]), edge(x));
+                visit_pixel!(
+                    predict_and_update_flat,
+                    x,
+                    i64::from(current_row[x]),
+                    edge(x)
+                );
             }
         }
         north_north_row = north_row;
@@ -2529,8 +2542,35 @@ fn sample_channel_ma<'a, T: Copy + 'a>(
 ) where
     i64: From<T>,
 {
+    if use_wp {
+        sample_channel_ma_shared::<T, true>(
+            &get_row, gw, gh, chan, stream, refs, wp_params, stride, &mut push,
+        );
+    } else {
+        sample_channel_ma_shared::<T, false>(
+            &get_row, gw, gh, chan, stream, refs, wp_params, stride, &mut push,
+        );
+    }
+}
+
+// Share the loop across callback types: one getter call per row and one output
+// call per selected sample. Keep WP-on/off specializations so disabled WP work
+// is removed, especially for lossy modular sampling.
+fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
+    get_row: &dyn Fn(usize) -> &'a [T],
+    gw: usize,
+    gh: usize,
+    chan: u32,
+    stream: i32,
+    refs: &[MaRefPlane<'a>],
+    wp_params: WpParams,
+    stride: usize,
+    push: &mut dyn FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS]),
+) where
+    i64: From<T>,
+{
     debug_assert!(stride != 0);
-    let disabled = !use_wp;
+    let disabled = !USE_WP;
     let mut wp = WpState::with_params(gw, wp_params);
     let mut north_row: &[T] = &[];
     let mut north_north_row: &[T] = &[];
@@ -2584,7 +2624,9 @@ fn sample_channel_ma<'a, T: Copy + 'a>(
                     north_west: top_left,
                     north_north: top_top,
                 };
-                wp.predict_and_update_flat(value, x, row, wp_neighbors)
+                // Sampling still advances WP on every pixel; this loop benefits
+                // from fusion even when only a fraction of properties are kept.
+                wp.predict_and_update_flat_inlined(value, x, row, wp_neighbors)
             };
             let local_gradient = (left + north - top_left) as i32;
 

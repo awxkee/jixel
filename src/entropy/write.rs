@@ -1309,13 +1309,20 @@ fn propose_ans_cluster_batch(
             histograms[cluster].add(symbol);
         }
     }
-    let mut order: Vec<usize> = (0..contexts.len())
-        .filter(|&i| contexts[i].total_count != 0)
+    // Pack descending frequency and ascending context ID so integer sorting
+    // preserves the existing order without a separate histogram comparator.
+    // Only u32 token context IDs can populate these nonempty histograms.
+    let mut order: Vec<u64> = contexts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.total_count != 0)
+        .map(|(i, h)| (u64::from(u32::MAX - h.total_count) << 32) | i as u64)
         .collect();
-    order.sort_unstable_by_key(|&i| (std::cmp::Reverse(contexts[i].total_count), i));
+    order.sort_unstable();
     order.truncate(MAX_ANS_RELOCATION_CONTEXTS);
     let mut changed = false;
-    for context in order {
+    for key in order {
+        let context = (key as u32) as usize;
         let source = map[context] as usize;
         let moved = &contexts[context];
         // Whole-cluster merging below also remaps tokenless contexts.
@@ -1396,9 +1403,25 @@ where
     // default config, once to rebuild histograms under the selected per-cluster
     // configs. Only the slice headers are copied.
     let streams: Vec<&[Token]> = streams.into_iter().collect();
+    optimize_entropy_code_ac_slices(
+        &streams,
+        num_contexts,
+        huffman_pool,
+        select_configs,
+        fast_cluster,
+    )
+}
 
+// Iterator adapters only collect slice references; share the entropy setup.
+fn optimize_entropy_code_ac_slices(
+    streams: &[&[Token]],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    select_configs: bool,
+    fast_cluster: bool,
+) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
-    for tokens in &streams {
+    for tokens in streams {
         build_histograms(tokens, None, &mut histograms);
     }
     let mut context_map: Vec<u8> = Vec::new();
@@ -1454,7 +1477,7 @@ where
         // Every AC token contributes one symbol to these clustered counts.
         let counts: Vec<_> = histograms.iter().map(|h| h.total_count as usize).collect();
         let mut samples = HybridUintSamples::new(&counts);
-        for tokens in &streams {
+        for tokens in streams {
             for t in *tokens {
                 samples.push(context_map[t.context as usize] as usize, t.value);
             }
@@ -1468,7 +1491,7 @@ where
         .any(|&c| c != HybridUintConfig::DEFAULT)
     {
         histograms.fill(Histogram::new());
-        for tokens in &streams {
+        for tokens in streams {
             for t in *tokens {
                 let cluster = context_map[t.context as usize] as usize;
                 let (symbol, _, _) = uint_encode_with_config(t.value, hybrid_uint_configs[cluster]);
