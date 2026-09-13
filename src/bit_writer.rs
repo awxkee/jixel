@@ -106,6 +106,24 @@ impl BitWriter {
         debug_assert_eq!(self.accumulator_bits, 0);
     }
 
+    /// Append every bit of `other` at the current bit position, without any
+    /// byte padding on either side.
+    pub(crate) fn append_bits(&mut self, other: &BitWriter) {
+        for chunk in other.storage.chunks(7) {
+            let mut bytes = [0u8; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            self.write(chunk.len() * 8, u64::from_le_bytes(bytes));
+        }
+        let mut bits = other.accumulator;
+        let mut remaining = other.accumulator_bits;
+        while remaining > 0 {
+            let take = remaining.min(Self::MAX_BITS_PER_CALL);
+            self.write(take, bits & ((1u64 << take) - 1));
+            bits >>= take;
+            remaining -= take;
+        }
+    }
+
     /// Append the contents of each writer in `others` onto self, after first
     /// padding both self and each `other` to byte boundaries.
     pub(crate) fn append_byte_aligned(&mut self, others: &mut [BitWriter]) {
