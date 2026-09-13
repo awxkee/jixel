@@ -464,6 +464,19 @@ impl SqueezePredictorCost {
     ) where
         i64: From<T>,
     {
+        self.add_rows_shared(&get_row, w, h, use_wp);
+    }
+
+    // Getter dispatch is once per row, outside the specialized pixel loops.
+    fn add_rows_shared<'a, T: Copy + 'a>(
+        &mut self,
+        get_row: &dyn Fn(usize) -> &'a [T],
+        w: usize,
+        h: usize,
+        use_wp: bool,
+    ) where
+        i64: From<T>,
+    {
         if use_wp {
             // Row-backed costs are used for palette candidates, where flat
             // spans are common. Keep every WP state update and histogram bump.
@@ -653,8 +666,6 @@ pub(super) fn tokenize_runs_with_wp(
 }
 
 #[allow(clippy::too_many_arguments)]
-// Preserve specialization at the group caller after adding the typed row paths.
-#[inline(always)]
 fn tokenize_channel_with_wp(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -860,6 +871,20 @@ pub(super) fn tokenize_plane_rows<'a>(
     scratch: &mut GradientScratch,
     out: &mut impl TokenSink,
 ) {
+    tokenize_plane_rows_shared(ctx, &get_row, w, h, pred_id, grad_pack_fn, scratch, out);
+}
+
+// Keep the gradient kernel shared across row getter closure types too.
+fn tokenize_plane_rows_shared<'a>(
+    ctx: u32,
+    get_row: &dyn Fn(usize) -> &'a [i32],
+    w: usize,
+    h: usize,
+    pred_id: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    scratch: &mut GradientScratch,
+    out: &mut impl TokenSink,
+) {
     if w == 0 || h == 0 {
         return;
     }
@@ -890,6 +915,22 @@ pub(super) fn tokenize_plane_rows<'a>(
 pub(super) fn tokenize_sample_rows<'a, T: Copy + 'a>(
     ctx: u32,
     get_row: impl Fn(usize) -> &'a [T],
+    w: usize,
+    h: usize,
+    pred_id: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    scratch: &mut GradientScratch,
+    out: &mut impl TokenSink,
+) where
+    i32: From<T>,
+    i64: From<T>,
+{
+    tokenize_sample_rows_shared(ctx, &get_row, w, h, pred_id, grad_pack_fn, scratch, out);
+}
+
+fn tokenize_sample_rows_shared<'a, T: Copy + 'a>(
+    ctx: u32,
+    get_row: &dyn Fn(usize) -> &'a [T],
     w: usize,
     h: usize,
     pred_id: u32,
@@ -940,7 +981,8 @@ pub(super) fn tokenize_sample_rows<'a, T: Copy + 'a>(
 
 fn tokenize_predictor_rows<'a, T: Copy + 'a>(
     ctx: u32,
-    get_row: impl Fn(usize) -> &'a [T],
+    // Dispatch once per row so getter closures share the large pixel kernels.
+    get_row: &dyn Fn(usize) -> &'a [T],
     w: usize,
     h: usize,
     pred_id: u32,

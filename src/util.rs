@@ -85,12 +85,7 @@ impl<T: Clone, const ROWS: usize, const COLS: usize> HeapMatrix<T, ROWS, COLS> {
 
     pub(crate) fn from_rows(rows: &[[T; COLS]; ROWS]) -> Self {
         Self {
-            data: rows
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            data: rows.as_flattened().to_vec().into_boxed_slice(),
         }
     }
 }
@@ -388,6 +383,21 @@ pub(crate) fn f16_bits_to_f32(b: u16) -> f32 {
     }
 }
 
+/// Stable insertion sort for caller-bounded lists of at most 16 candidates.
+/// Keep general sorting machinery out of these small candidate-selection paths.
+pub(crate) fn sort_small_by<T>(
+    items: &mut [T],
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 && compare(&items[j], &items[j - 1]).is_lt() {
+            items.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
@@ -423,5 +433,27 @@ mod f16_tests {
         assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
         assert_eq!(f16_bits_to_f32(0x5BF8), 255.0);
         assert_eq!(f16_bits_to_f32(0xFBFF), -65504.0);
+    }
+}
+
+#[cfg(test)]
+mod small_sort_tests {
+    #[test]
+    fn small_sort_preserves_stable_order_for_bounded_candidates() {
+        let mut state = 0x1234_5678u32;
+        for len in 0..=16 {
+            for _ in 0..128 {
+                let mut input: Vec<_> = (0..len)
+                    .map(|ordinal| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((state >> 29) as u8, ordinal)
+                    })
+                    .collect();
+                let mut expected = input.clone();
+                expected.sort_by_key(|&(key, _)| key);
+                super::sort_small_by(&mut input, |a, b| a.0.cmp(&b.0));
+                assert_eq!(input, expected);
+            }
+        }
     }
 }

@@ -458,22 +458,19 @@ impl OrderStats {
     /// the result is deterministic and stays close to natural).
     fn derive(&self, slot: usize, channel: usize, natural: &[u32], llf: usize) -> Vec<u32> {
         let counts = &self.counts[slot][channel];
-        // Rank of each coefficient in the natural scan, so equal-frequency
-        // ties genuinely fall back to natural order (raw index order is not
-        // the zigzag natural order).
-        let mut natural_rank = vec![0u32; natural.len()];
-        for (i, &c) in natural.iter().enumerate() {
-            natural_rank[c as usize] = i as u32;
-        }
-        let mut rest: Vec<u32> = natural[llf..].to_vec();
-        rest.sort_by(|&a, &b| {
-            counts[b as usize]
-                .cmp(&counts[a as usize])
-                .then_with(|| natural_rank[a as usize].cmp(&natural_rank[b as usize]))
-        });
+        // Sort integers to reuse the existing sorter. Counts descend, and the
+        // unique natural rank preserves ties (raw index is not scan order).
+        // Transform scans have at most 4096 entries, so ranks fit in 32 bits.
+        let mut ranked: Vec<u64> = natural
+            .iter()
+            .enumerate()
+            .skip(llf)
+            .map(|(rank, &raw)| (u64::from(u32::MAX - counts[raw as usize]) << 32) | rank as u64)
+            .collect();
+        ranked.sort_unstable();
         let mut out = Vec::with_capacity(natural.len());
         out.extend_from_slice(&natural[..llf]);
-        out.extend_from_slice(&rest);
+        out.extend(ranked.into_iter().map(|key| natural[(key as u32) as usize]));
         out
     }
 }
@@ -637,5 +634,43 @@ mod tests {
             code.iter().enumerate().all(|(i, &c)| i == 3 || c == 0),
             "{code:?}"
         );
+    }
+
+    #[test]
+    fn packed_coefficient_order_matches_stable_frequency_order() {
+        let mut rng = 0x93ab2017u32;
+        for n in [1, 2, 7, 64, 128, 4096] {
+            let mut natural: Vec<u32> = (0..n as u32).collect();
+            for i in (1..n).rev() {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                natural.swap(i, rng as usize % (i + 1));
+            }
+            for pattern in 0..4 {
+                let counts: Vec<u32> = (0..n)
+                    .map(|i| match pattern {
+                        0 => 0,
+                        1 => u32::MAX,
+                        2 => (i % 7) as u32,
+                        _ => {
+                            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                            rng
+                        }
+                    })
+                    .collect();
+                let stats = OrderStats {
+                    counts: vec![std::array::from_fn(|_| counts.clone())],
+                    blocks: vec![1],
+                };
+                for llf in [0, 1, n / 3, n] {
+                    let mut expected = natural.clone();
+                    expected[llf..].sort_by_key(|&raw| std::cmp::Reverse(counts[raw as usize]));
+                    assert_eq!(
+                        stats.derive(0, 0, &natural, llf),
+                        expected,
+                        "n={n} llf={llf} pattern={pattern}"
+                    );
+                }
+            }
+        }
     }
 }

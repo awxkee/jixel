@@ -237,6 +237,16 @@ pub(crate) fn build_ac_lz_code<'a>(
             }
         }
     }
+    finish_ac_lz_code(histograms, bits, num_contexts, huffman_pool)
+}
+
+// Share clustering and code construction across stream iterator types.
+fn finish_ac_lz_code(
+    mut histograms: Vec<Histogram>,
+    mut bits: u64,
+    num_contexts: usize,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> (OwnedEntropyCode, u64) {
     let mut context_map = Vec::new();
     cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
@@ -325,6 +335,14 @@ pub(crate) fn estimate_ac_plain_bits<'a, I>(streams: I, code: &OwnedEntropyCode)
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
+    estimate_ac_plain_bits_shared(&mut streams.into_iter(), code)
+}
+
+// Dispatch once per stream; keep the cost table and token loops shared.
+fn estimate_ac_plain_bits_shared(
+    streams: &mut dyn Iterator<Item = &[Token]>,
+    code: &OwnedEntropyCode,
+) -> u64 {
     if !code.use_prefix_code {
         // rANS approaches the histogram entropy: a symbol with normalized
         // frequency `f` out of `ANS_TAB_SIZE` costs -log2(f / ANS_TAB_SIZE).

@@ -55,7 +55,12 @@ pub(crate) struct DcPredictorScratch {
 impl Default for DcPredictorScratch {
     fn default() -> Self {
         Self {
-            counts: heap_array([0; ALPHABET_SIZE]),
+            // Allocate zeroed storage directly instead of expanding row copies.
+            // SAFETY: zero initializes every u32 in the allocated array.
+            // The Box itself is constructed normally and remains non-null.
+            counts: unsafe {
+                Box::<[[u32; ALPHABET_SIZE]; DC_PREDICTOR_SLOTS]>::new_zeroed().assume_init()
+            },
             extra: heap_array(0),
         }
     }
@@ -404,6 +409,20 @@ mod tests {
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<Box<LzEntropyScratch>>>() <= 32);
         assert!(size_of::<AcGroupScratch>() <= 128);
+    }
+
+    #[test]
+    fn dc_predictor_counts_start_initialized_and_support_updates() {
+        let mut scratch = DcPredictorScratch::default();
+        for row in scratch.counts.iter() {
+            assert!(row.iter().all(|&count| count == 0));
+        }
+        assert!(scratch.extra.iter().all(|&bits| bits == 0));
+        scratch.counts[0][0] += 1;
+        let last = scratch.counts.last_mut().unwrap().last_mut().unwrap();
+        *last = u32::MAX;
+        assert_eq!(scratch.counts[0][0], 1);
+        assert_eq!(*scratch.counts.last().unwrap().last().unwrap(), u32::MAX);
     }
 
     #[test]

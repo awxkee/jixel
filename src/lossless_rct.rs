@@ -291,7 +291,7 @@ pub(super) fn rank_rcts(
         )
     });
     let mut ranked: Vec<(u32, f32)> = RCT_CANDIDATES.iter().copied().zip(costs).collect();
-    ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    crate::util::sort_small_by(&mut ranked, |a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     ranked
 }
 

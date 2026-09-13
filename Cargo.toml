@@ -23,6 +23,3 @@ avx = []
 neon = []
 sse = []
 wasm = []
-
-[profile.release]
-debug = true

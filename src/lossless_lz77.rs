@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens};
+use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
@@ -878,25 +879,14 @@ fn parallel_streams<R: Send, T: LzTokenSource>(
         return acc;
     }
     let chunk = streams.len().div_ceil(threads);
-    let parts: Vec<R> = std::thread::scope(|scope| {
-        let handles: Vec<_> = streams
-            .chunks(chunk)
-            .map(|part| {
-                let init = &init;
-                let accumulate = &accumulate;
-                scope.spawn(move || {
-                    let mut acc = init();
-                    for toks in part {
-                        accumulate(&mut acc, toks);
-                    }
-                    acc
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("stream worker"))
-            .collect()
+    let parts = scoped_chunks(streams.len().div_ceil(chunk), "stream worker", &|ci| {
+        let begin = ci * chunk;
+        let part = &streams[begin..(begin + chunk).min(streams.len())];
+        let mut acc = init();
+        for toks in part {
+            accumulate(&mut acc, toks);
+        }
+        acc
     });
     let mut parts = parts.into_iter();
     let mut acc = parts.next().expect("at least one chunk");
@@ -1130,7 +1120,7 @@ pub(super) fn estimate_coded_bits<T: LzTokenSource>(
                         if f == 0 {
                             crate::entropy::ANS_LOG_TAB_SIZE as f32
                         } else {
-                            crate::entropy::ANS_LOG_TAB_SIZE as f32 - (f as f32).log2()
+                            crate::entropy::ANS_LOG_TAB_SIZE as f32 - dirty_log2f(f as f32)
                         }
                     })
                     .collect(),
@@ -1187,23 +1177,30 @@ fn map_streams_indexed<R: Send, T: LzTokenSource>(
         return streams.iter().enumerate().map(|(i, t)| f(i, t)).collect();
     }
     let chunk = streams.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = streams
-            .chunks(chunk)
+    scoped_chunks(streams.len().div_ceil(chunk), "stream mapper", &|ci| {
+        let begin = ci * chunk;
+        let part = &streams[begin..(begin + chunk).min(streams.len())];
+        part.iter()
             .enumerate()
-            .map(|(ci, part)| {
-                let f = &f;
-                scope.spawn(move || {
-                    part.iter()
-                        .enumerate()
-                        .map(|(k, t)| f(ci * chunk + k, t))
-                        .collect::<Vec<R>>()
-                })
-            })
-            .collect();
+            .map(|(k, t)| f(begin + k, t))
+            .collect::<Vec<R>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+// Callback dispatch is once per thread, outside token and stream loops.
+fn scoped_chunks<R: Send>(
+    count: usize,
+    panic_message: &'static str,
+    run: &(dyn Fn(usize) -> R + Sync),
+) -> Vec<R> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..count).map(|i| scope.spawn(move || run(i))).collect();
         handles
             .into_iter()
-            .flat_map(|h| h.join().expect("stream mapper"))
+            .map(|h| h.join().expect(panic_message))
             .collect()
     })
 }
@@ -1234,8 +1231,33 @@ pub(super) fn build_lz_pixel_code_threads<'tokens, 'scratch, I, T: LzTokenSource
 where
     I: Iterator<Item = &'tokens [T]> + Clone,
 {
-    let threads = pool.map_or(1, ThreadPool::num_threads);
     let streams: Vec<&'tokens [T]> = streams.collect();
+    build_lz_pixel_code_slices(
+        &streams,
+        nb_chans,
+        min_symbol,
+        refined,
+        ans_cluster,
+        pool,
+        scratch,
+        huffman_pool,
+    )
+}
+
+// Share entropy setup across iterator adapters while retaining specialized
+// token passes for each token representation.
+#[allow(clippy::too_many_arguments)]
+fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
+    streams: &[&[T]],
+    nb_chans: usize,
+    min_symbol: u32,
+    refined: bool,
+    ans_cluster: bool,
+    pool: Option<&ThreadPool>,
+    scratch: &'scratch mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> EntropyCode<'scratch> {
+    let threads = pool.map_or(1, ThreadPool::num_threads);
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
@@ -1253,7 +1275,7 @@ where
     histograms.fill(Histogram::new());
     {
         let summed = parallel_streams(
-            &streams,
+            streams,
             threads,
             || vec![Histogram::new(); num_contexts],
             |acc, toks| lz_add_histograms(lz_tokens(toks), None, acc, min_symbol, distance_context),
@@ -1285,7 +1307,7 @@ where
         let distance_cluster = context_map[distance_context as usize] as usize;
         let context_map_ref: &[u8] = &context_map[..num_contexts];
         {
-            let per_stream_counts: Vec<Vec<usize>> = map_streams(&streams, threads, |toks| {
+            let per_stream_counts: Vec<Vec<usize>> = map_streams(streams, threads, |toks| {
                 let mut c = vec![0usize; num_clusters];
                 for tok in lz_tokens(toks) {
                     let cluster = if tok.is_lz77() {
@@ -1311,7 +1333,7 @@ where
             let offsets = &offsets;
             let strides_ref = &strides;
             let per_stream_values: Vec<Vec<Vec<u32>>> =
-                map_streams_indexed(&streams, threads, |s, toks| {
+                map_streams_indexed(streams, threads, |s, toks| {
                     let mut ordinal = offsets[s].clone();
                     let mut local: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
                     for tok in lz_tokens(toks) {
@@ -1340,7 +1362,7 @@ where
         // outside the sampled ordinals. No duplicate literal vector is needed.
         let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
         let valid = parallel_streams(
-            &streams,
+            streams,
             threads,
             || vec![true; num_clusters],
             |acc, toks| {
@@ -1372,7 +1394,7 @@ where
         }
         let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
         let summed = parallel_streams(
-            &streams,
+            streams,
             threads,
             || vec![Histogram::new(); num_clusters],
             |acc, toks| {
@@ -1404,6 +1426,29 @@ where
         configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
     }
 
+    finish_lz_entropy(
+        histograms,
+        prefix_codes,
+        &context_map[..num_contexts],
+        configs,
+        ans,
+        huffman_pool,
+        use_ans,
+    )
+}
+
+// Code construction no longer depends on the input token representation.
+fn finish_lz_entropy<'a>(
+    histograms: &[Histogram],
+    prefix_codes: &'a mut Vec<PrefixCode>,
+    context_map: &'a [u8],
+    configs: &'a [crate::entropy::HybridUintConfig],
+    ans: &'a mut crate::coder_scratch::LzAnsScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    use_ans: bool,
+) -> EntropyCode<'a> {
+    let num_contexts = context_map.len();
+    let num_clusters = histograms.len();
     grow_entropy_scratch(prefix_codes, num_clusters, PrefixCode::zero());
     let prefix_codes = &mut prefix_codes[..num_clusters];
     build_huffman_codes_into(histograms, prefix_codes, huffman_pool);

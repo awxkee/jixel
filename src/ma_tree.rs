@@ -904,7 +904,7 @@ impl Learner<'_> {
                 .collect();
             // Keep the stable sort's predictor-id tie order without evaluating
             // the same histogram entropy again for every comparison.
-            preds.sort_by(|&a, &b| {
+            crate::util::sort_small_by(&mut preds, |&a, &b| {
                 scratch.ma_property.node_costs[a].total_cmp(&scratch.ma_property.node_costs[b])
             });
             preds.truncate(self.p.side_preds.max(1));
