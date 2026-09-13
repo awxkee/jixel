@@ -1517,7 +1517,7 @@ pub(crate) fn write_ac_group(
                     let out = &mut out[pass];
 
                     let nzeros = if covered_blocks == 1 {
-                        num_nonzero_except_dc(<&[i32; 64]>::try_from(block).unwrap())
+                        num_nonzero_except_dc(block.first_chunk::<64>().unwrap())
                     } else {
                         num_nonzero_except_llf(block, cx, cy)
                     };

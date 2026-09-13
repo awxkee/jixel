@@ -763,6 +763,8 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
 ];
 
 pub(crate) struct DequantMatrices {
+    /// Signaled IDENTITY weights (kQuantModeID) when they differ from spec.
+    pub(crate) identity_weights: Option<[[f32; 3]; 3]>,
     pub(crate) matrix: HeapMatrix<f32, 3, 64>,
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT.
@@ -1491,14 +1493,57 @@ static DCT2_WEIGHTS: [[f32; 6]; 3] = [
 /// Builds the `(matrix, inv_matrix)` pairs for IDENTITY and DCT2X2.
 type FineMatrixPair = (HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>);
 
-fn build_fine_matrices() -> (FineMatrixPair, FineMatrixPair) {
+/// Finer IDENTITY X/B rows for the chromatic table sets (x-heavy and
+/// saturated frames). On saturated synthetic content the IDENTITY transform
+/// carries most of the chromatic pixels (Burning Ship d2: 74% of yellow, 83%
+/// of blue mask pixels) and its spec table starved them. Both rows must move
+/// together: X alone fixes hue error but raises the collapse tail, B alone
+/// does the reverse. Measured 2026-09-13 (parameters_fit/chroma_dz_followup.md):
+/// x1.25 gives Ship d1..d2 yellow/blue OKLab a/b error -5..-13% and >20%
+/// chroma-loss tails -1..-3pp for +0.9..1.4% bytes, at BD-rate +0.3% SS2 /
+/// +0.8% butteraugli (x1.5 cost three times that for a third more color); a
+/// nine-weight Optuna fit found no row set that improves color at BD <= 0.
+/// Accepted as a color-vs-metric policy trade. Ordinary photos are
+/// byte-identical; Kodak 13 (x-heavy) moves by 0.01%.
+static IDENTITY_CHROMA_FINE: [f32; 2] = [1.25, 1.25];
+
+/// DCT8 base-weight multipliers (X, Y, B; larger = finer) for the chromatic
+/// table sets, fitted for rate 2026-09-13 (parameters_fit/chroma_dz_followup.md):
+/// Optuna on seven chromatic-set images at d1/1.5/2 (BD-rate of SS2 and
+/// butteraugli 3-norm together), validated on 20 unseen chromatic-set images
+/// at d1..2.5 (mean −0.69% SS2 / −0.71% butteraugli BD-rate, 18/20 improve,
+/// worst +0.86%) and on unseen distances of the fit set (−0.35% / −0.71%).
+/// The color-tuned B rows of these sets are finer than rate wants; the fitted
+/// point halves the B base weight and refines X, and is color-neutral on Ship
+/// (a/b −1%). A stronger point (B ×0.31) is a butteraugli-vs-SS2 conflict axis
+/// with large Ship color loss and was not adopted. Base sets are untouched.
+static CHROMATIC_DCT8_ROWS: [f32; 3] = [1.56, 1.07, 0.52];
+
+fn scale_dct8_base_weights(o: &mut BandOverride, mul: [f32; 3]) {
+    for c in 0..3 {
+        o.bands[c][0] = f16_bits_to_f32(f32_to_f16_bits(o.bands[c][0] * mul[c] / 64.0)) * 64.0;
+    }
+}
+
+/// Scaled IDENTITY weights rounded through the wire format (F16 of w/64) so
+/// the encoder tables match what the decoder reconstructs.
+fn scaled_identity_weights(mul: [f32; 2]) -> [[f32; 3]; 3] {
+    let mut w = IDENTITY_WEIGHTS;
+    for i in 0..3 {
+        w[0][i] = f16_bits_to_f32(f32_to_f16_bits(w[0][i] * mul[0] / 64.0)) * 64.0;
+        w[2][i] = f16_bits_to_f32(f32_to_f16_bits(w[2][i] * mul[1] / 64.0)) * 64.0;
+    }
+    w
+}
+
+fn identity_pair(id: &[[f32; 3]; 3]) -> FineMatrixPair {
     let mut matrix_identity = HeapMatrix::new(0.0);
     let mut inv_matrix_identity = HeapMatrix::new(0.0);
     for c in 0..3 {
-        let mut weights = [IDENTITY_WEIGHTS[c][0]; 64];
-        weights[1] = IDENTITY_WEIGHTS[c][1];
-        weights[8] = IDENTITY_WEIGHTS[c][1];
-        weights[9] = IDENTITY_WEIGHTS[c][2];
+        let mut weights = [id[c][0]; 64];
+        weights[1] = id[c][1];
+        weights[8] = id[c][1];
+        weights[9] = id[c][2];
         for (k, weight) in weights.into_iter().enumerate() {
             matrix_identity[c][k] = 1.0 / weight;
             if k != 0 {
@@ -1506,11 +1551,14 @@ fn build_fine_matrices() -> (FineMatrixPair, FineMatrixPair) {
             }
         }
     }
+    (matrix_identity, inv_matrix_identity)
+}
 
+fn dct2_pair(dw: &[[f32; 6]; 3]) -> FineMatrixPair {
     let mut matrix_dct2x2 = HeapMatrix::new(0.0);
     let mut inv_matrix_dct2x2 = HeapMatrix::new(0.0);
     for c in 0..3 {
-        let w = DCT2_WEIGHTS[c];
+        let w = dw[c];
         let mut weights = [0xBAD as f32; 64];
         weights[1] = w[0];
         weights[8] = w[0];
@@ -1536,6 +1584,13 @@ fn build_fine_matrices() -> (FineMatrixPair, FineMatrixPair) {
             }
         }
     }
+    (matrix_dct2x2, inv_matrix_dct2x2)
+}
+
+fn build_fine_matrices() -> (FineMatrixPair, FineMatrixPair) {
+    let (matrix_identity, inv_matrix_identity) = identity_pair(&IDENTITY_WEIGHTS);
+
+    let (matrix_dct2x2, inv_matrix_dct2x2) = dct2_pair(&DCT2_WEIGHTS);
     (
         (matrix_identity, inv_matrix_identity),
         (matrix_dct2x2, inv_matrix_dct2x2),
@@ -1664,7 +1719,7 @@ impl DequantMatrices {
     pub(crate) fn new_x_heavy(distance: f32) -> &'static Self {
         static HUE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (HUE_B8_MIN_DISTANCE..QM_SS2_MIN_DISTANCE).contains(&distance) {
-            HUE.get_or_init(|| Self::compute(false, false, Some(&HUE_B8_BANDS), false))
+            HUE.get_or_init(|| Self::compute(false, false, Some(&HUE_B8_BANDS), false, true))
         } else {
             Self::new(0.0)
         }
@@ -1677,15 +1732,17 @@ impl DequantMatrices {
         static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance >= QM_DCT8_MIN_DISTANCE {
-            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID), false))
+            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false))
         } else if distance >= QM_SS2_MIN_DISTANCE {
-            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID), false))
+            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false))
         } else if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
-            DEFAULT_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), false))
+            DEFAULT_MID
+                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), false, false))
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            DEFAULT_HQ.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false))
+            DEFAULT_HQ
+                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false))
         } else {
-            HQ.get_or_init(|| Self::compute(false, false, None, false))
+            HQ.get_or_init(|| Self::compute(false, false, None, false, false))
         }
     }
 
@@ -1694,7 +1751,8 @@ impl DequantMatrices {
     pub(crate) fn new_pair_b(distance: f32) -> &'static Self {
         static PAIR_MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
-            PAIR_MID.get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), true))
+            PAIR_MID
+                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), true, false))
         } else {
             Self::new(distance)
         }
@@ -1703,7 +1761,7 @@ impl DequantMatrices {
     pub(crate) fn new_saturated_pair_b(distance: f32) -> &'static Self {
         static SAT_PAIR: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
-            SAT_PAIR.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), true))
+            SAT_PAIR.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), true, true))
         } else {
             Self::new_saturated(distance)
         }
@@ -1714,11 +1772,12 @@ impl DequantMatrices {
         static SAT_SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static SAT_COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance >= QM_DCT8_MIN_DISTANCE {
-            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS), false))
+            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS), false, true))
         } else if distance >= QM_SS2_MIN_DISTANCE {
-            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS), false))
+            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS), false, true))
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            SAT_DEFAULT.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), false))
+            SAT_DEFAULT
+                .get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), false, true))
         } else {
             Self::new(distance)
         }
@@ -1729,13 +1788,25 @@ impl DequantMatrices {
         use_coarse_dct8: bool,
         flat_b8: Option<&[f32; 6]>,
         pair_b: bool,
+        chromatic: bool,
     ) -> Self {
+        let identity_weights = chromatic.then(|| scaled_identity_weights(IDENTITY_CHROMA_FINE));
+        let (matrix_identity, inv_matrix_identity) = match identity_weights.as_ref() {
+            Some(id) => identity_pair(id),
+            None => (
+                shared_tables().matrix_identity.clone(),
+                shared_tables().inv_matrix_identity.clone(),
+            ),
+        };
         // The large-transform tables depend on the SS2 gate, and DCT8 gets a
         // separate coarser-quality variant. All other tables are shared.
         let shared = shared_tables();
         // The coarse DCT8 variant only exists above the flat-B gate, so the
         // no-flat (near-lossless) tier always carries the spec table.
-        let o8 = flat_b8.map(|bands| default_dct8_override(use_coarse_dct8, bands));
+        let mut o8 = flat_b8.map(|bands| default_dct8_override(use_coarse_dct8, bands));
+        if chromatic && let Some(o) = o8.as_mut() {
+            scale_dct8_base_weights(o, CHROMATIC_DCT8_ROWS);
+        }
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
         let o64: Option<BandOverride> = None;
@@ -1767,7 +1838,7 @@ impl DequantMatrices {
             }
         };
         // Pair-transform (16x8/8x16) B row with a finer first AC band for the
-        // chroma-texture class (see `PAIR_B_FINE_BAND1`); signalled via slot 3.
+        // chroma-texture class (see `PAIR_B_FINE_BAND1`); signaled via slot 3.
         // `JIXEL_PAIR_B_ROW="base,d1..d6"` overrides the whole row for re-fits.
         let o3: Option<BandOverride> = pair_b.then(|| {
             let mut bands = DCT16X8_BANDS;
@@ -1842,10 +1913,11 @@ impl DequantMatrices {
         };
 
         Self {
+            identity_weights,
             matrix,
             inv_matrix,
-            matrix_identity: shared.matrix_identity.clone(),
-            inv_matrix_identity: shared.inv_matrix_identity.clone(),
+            matrix_identity,
+            inv_matrix_identity,
             matrix_dct2x2: shared.matrix_dct2x2.clone(),
             inv_matrix_dct2x2: shared.inv_matrix_dct2x2.clone(),
             matrix_16x8,
@@ -2004,6 +2076,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chromatic_sets_scale_the_dct8_base_weights() {
+        for d in [1.0, 1.5, 2.0] {
+            let base = DequantMatrices::new(d).custom_tables[0].expect("flat DCT8 table");
+            for set in [
+                DequantMatrices::new_saturated(d),
+                DequantMatrices::new_saturated_pair_b(d),
+                DequantMatrices::new_x_heavy(d),
+            ] {
+                let t = set.custom_tables[0].expect("chromatic DCT8 table");
+                for c in 0..3 {
+                    // Band multipliers are shared with the unscaled variant; the
+                    // base weight carries the fitted per-channel scale, F16-exact.
+                    let spec = if c == 2 {
+                        t.bands[2][0]
+                    } else {
+                        base.bands[c][0] * CHROMATIC_DCT8_ROWS[c]
+                    };
+                    if c != 2 {
+                        assert!((t.bands[c][0] / spec - 1.0).abs() < 2e-3, "d={d} c={c}");
+                    }
+                    assert_eq!(
+                        f16_bits_to_f32(f32_to_f16_bits(t.bands[c][0] / 64.0)) * 64.0,
+                        t.bands[c][0]
+                    );
+                }
+                let b_spec = f16_bits_to_f32(f32_to_f16_bits(512.0 / 64.0)) * 64.0;
+                assert!(
+                    (t.bands[2][0] / (b_spec * CHROMATIC_DCT8_ROWS[2]) - 1.0).abs() < 2e-3,
+                    "d={d}"
+                );
+            }
+            assert!(std::ptr::eq(
+                DequantMatrices::new_pair_b(d).custom_tables[0]
+                    .as_ref()
+                    .map(|o| &o.bands[1][0])
+                    .unwrap(),
+                DequantMatrices::new_pair_b(d).custom_tables[0]
+                    .as_ref()
+                    .map(|o| &o.bands[1][0])
+                    .unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn identity_rows_are_signalled_only_on_chromatic_sets() {
+        for d in [1.0, 1.5, 2.0] {
+            assert!(DequantMatrices::new(d).identity_weights.is_none());
+            assert!(DequantMatrices::new_pair_b(d).identity_weights.is_none());
+            for set in [
+                DequantMatrices::new_saturated(d),
+                DequantMatrices::new_saturated_pair_b(d),
+                DequantMatrices::new_x_heavy(d),
+            ] {
+                let id = set.identity_weights.expect("chromatic identity table");
+                // Y row untouched, X/B rows finer, every value F16-exact on the
+                // wire (w/64) so the decoder rebuilds the same table.
+                assert_eq!(id[1], IDENTITY_WEIGHTS[1]);
+                for c in [0, 2] {
+                    for i in 0..3 {
+                        let expected = IDENTITY_WEIGHTS[c][i] * IDENTITY_CHROMA_FINE[c / 2];
+                        assert!(
+                            (id[c][i] / expected - 1.0).abs() < 2e-3,
+                            "{c} {i} {}",
+                            id[c][i]
+                        );
+                        assert_eq!(
+                            f16_bits_to_f32(f32_to_f16_bits(id[c][i] / 64.0)) * 64.0,
+                            id[c][i]
+                        );
+                    }
+                }
+                // The encoder-side matrices follow the signaled weights.
+                assert_eq!(set.inv_matrix_identity(0)[2], id[0][0]);
+                assert_eq!(set.inv_matrix_identity(2)[9], id[2][2]);
+                assert_eq!(set.matrix_identity(0)[1], 1.0 / id[0][1]);
+            }
+        }
+    }
+
+    #[test]
     fn x_heavy_b_table_matches_its_signaled_bands() {
         let spec = DequantMatrices::new(0.0);
         for d in [0.0, 0.5, 0.749, QM_SS2_MIN_DISTANCE, 3.0, 4.0] {
@@ -2021,14 +2174,20 @@ mod tests {
                 assert_eq!(hue.inv_matrix(c)[k], 1.0 / decoded[c][k]);
             }
             if c != 2 {
-                assert_eq!(
-                    bands.bands[c],
-                    default_dct8_override(false, &DCT8_BANDS[2]).bands[c]
-                );
+                // Same band shape as the flat-B default; only the base weight
+                // carries the fitted chromatic-set scale.
+                let mut expected = default_dct8_override(false, &DCT8_BANDS[2]);
+                scale_dct8_base_weights(&mut expected, CHROMATIC_DCT8_ROWS);
+                assert_eq!(bands.bands[c], expected.bands[c]);
             }
         }
-        // Refine the B tail by 20%, retaining its original shape after band 1.
-        assert!((hue.inv_matrix(2)[63] / spec.inv_matrix(2)[63] - 1.2).abs() < 1e-5);
+        // Refine the B tail by 20% (original shape after band 1), then apply
+        // the fitted chromatic-set base scale.
+        let tail = hue.inv_matrix(2)[63] / spec.inv_matrix(2)[63];
+        assert!(
+            (tail / (1.2 * CHROMATIC_DCT8_ROWS[2]) - 1.0).abs() < 3e-3,
+            "{tail}"
+        );
         assert!(hue.custom_tables[1..].iter().all(Option::is_none));
         // Ordinary and opsin-proxy tables remain independently selected.
         assert!(!std::ptr::eq(hue, DequantMatrices::new(1.0)));
@@ -2063,8 +2222,9 @@ mod tests {
         let size = std::mem::size_of::<DequantMatrices>();
         // The DCT64 rectangle family and the IDENTITY/DCT2X2 tables add three
         // matrix/inverse pairs (six Box handles), taking the expected footprint
-        // from 296 to 392 bytes.
-        assert!(size <= 392, "DequantMatrices grew to {size} bytes");
+        // from 296 to 392 bytes; the signalled IDENTITY weights (nine inline
+        // floats in an Option, not a matrix) take it to 432.
+        assert!(size <= 432, "DequantMatrices grew to {size} bytes");
     }
 
     #[test]
@@ -2074,7 +2234,7 @@ mod tests {
             .stack_size(64 * 1024)
             .spawn(|| {
                 let _matrices =
-                    DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID), false);
+                    DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID), false, false);
             })
             .unwrap()
             .join()
@@ -2088,8 +2248,8 @@ mod tests {
         assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01).custom_tables[0].is_some());
         assert!(DequantMatrices::new(QM_DCT8_MIN_DISTANCE).custom_tables[0].is_some());
 
-        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false);
-        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false);
+        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false);
+        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false);
 
         let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
         assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
@@ -2150,7 +2310,7 @@ mod tests {
 
     #[test]
     fn default_dct8_flattens_blue_high_frequency_only() {
-        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false);
+        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false);
         // X and Y stay at the spec table within F16 signaling round-off.
         for c in [0usize, 1] {
             for k in 1..64 {
