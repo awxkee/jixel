@@ -289,23 +289,16 @@ pub(crate) fn optimize_dc_rounding(
 
     // Contiguous working copies; the Vecs are never reallocated, so the raw
     // pointers in `Shared` stay valid until write-back.
-    let mut quant: [Vec<i16>; 3] = [vec![0; w * h], vec![0; w * h], vec![0; w * h]];
-    let mut recon: [Vec<f32>; 3] = [vec![0.0; w * h], vec![0.0; w * h], vec![0.0; w * h]];
-    for y in 0..h {
-        let qx = quant_img.plane_row(0, y);
-        let qy = quant_img.plane_row(1, y);
-        let qb = quant_img.plane_row(2, y);
-        for x in 0..w {
-            let i = y * w + x;
-            quant[0][i] = qx[x];
-            quant[1][i] = qy[x];
-            quant[2][i] = qb[x];
-            let yv = qy[x] as f32 * steps[1];
-            recon[0][i] = qx[x] as f32 * steps[0];
-            recon[1][i] = yv;
-            recon[2][i] = qb[x] as f32 * steps[2] + r_b * yv;
-        }
-    }
+    let mut quant: [Vec<i16>; 3] = std::array::from_fn(|c| quant_img.plane_data(c).to_vec());
+    let [qx, qy, qb] = &quant;
+    let recon_x = qx.iter().map(|&q| q as f32 * steps[0]).collect();
+    let recon_y: Vec<f32> = qy.iter().map(|&q| q as f32 * steps[1]).collect();
+    let recon_b = qb
+        .iter()
+        .zip(&recon_y)
+        .map(|(&q, &yv)| q as f32 * steps[2] + r_b * yv)
+        .collect();
+    let mut recon: [Vec<f32>; 3] = [recon_x, recon_y, recon_b];
     let mut cache = vec![0.0f32; w * h];
     let mut active = vec![false; w * h];
     let movable = [
