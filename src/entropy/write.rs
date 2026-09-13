@@ -834,10 +834,27 @@ fn build_ans_storage_from_selected(
 
 /// ANS tables for externally managed (already clustered) histograms:
 /// (normalized histograms, per-cluster symbol info, packed reverse maps).
+/// Final tables for a bundle whose histograms are already settled. With
+/// `refine_precision` every table also gets the broader shift search that the
+/// lossy path runs in `refine_ans_precisions`; the lossless path has no later
+/// refinement stage and no RDO prices that the table choice could feed back
+/// into, so it takes the searched tables directly.
 pub(crate) fn build_ans_code_parts(
     histograms: &[Histogram],
+    refine_precision: bool,
 ) -> (Vec<AnsHistogram>, Vec<Vec<AnsEncSymbolInfo>>, Vec<u16>) {
-    let storage = build_ans_storage(histograms);
+    let selected_histograms = histograms
+        .iter()
+        .map(|histogram| {
+            let base = optimize_ans_histogram(&histogram.counts);
+            if refine_precision {
+                refine_ans_histogram_precision(&histogram.counts, &base).unwrap_or(base)
+            } else {
+                base
+            }
+        })
+        .collect();
+    let storage = build_ans_storage_from_selected(histograms, selected_histograms);
     (storage.histograms, storage.symbols, storage.reverse_maps)
 }
 
@@ -1082,7 +1099,52 @@ where
     if matches!(refinement, AnsRefinement::Slow) {
         changed |= refine_ans_precisions(code, &streams, thread_pool, scratch);
     }
+    changed |= fill_unused_contexts(code, &streams, scratch);
     changed
+}
+
+/// Contexts without tokens still occupy signaled context-map entries. The
+/// clusterers leave them at cluster 0, which interrupts the runs the map's
+/// run-length coder feeds on; repeating the preceding entry instead costs no
+/// payload bits. Adopted only when the serialized map actually shrinks.
+fn fill_unused_contexts(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    scratch: &mut CoderScratch,
+) -> bool {
+    if code.orig_context_map.is_some() || code.context_map.len() <= 1 {
+        return false;
+    }
+    let mut used = vec![false; code.context_map.len()];
+    for tokens in streams {
+        for token in *tokens {
+            used[token.context as usize] = true;
+        }
+    }
+    if used.iter().all(|&u| u) {
+        return false;
+    }
+    let mut filled = code.context_map.clone();
+    let mut previous = 0u8;
+    for (entry, &used) in filled.iter_mut().zip(&used) {
+        if used {
+            previous = *entry;
+        } else {
+            *entry = previous;
+        }
+    }
+    let map_bits = |map: &[u8], scratch: &mut CoderScratch| {
+        let mut probe = code.as_ref();
+        probe.context_map = map;
+        let mut w = BitWriter::new();
+        write_context_map(&probe, &mut scratch.huffman_pool, &mut w);
+        w.bits_written()
+    };
+    if map_bits(&filled, scratch) >= map_bits(&code.context_map, scratch) {
+        return false;
+    }
+    code.context_map = filled;
+    true
 }
 
 fn refine_ans_precisions(
@@ -1178,8 +1240,12 @@ fn propose_ans_reclustering(
         }
     }
     let mut assignment = vec![0u8; histograms.len()];
-    let n =
-        super::cluster::cluster_histograms_ans(&mut histograms, &mut assignment, Some(thread_pool));
+    let n = super::cluster::cluster_histograms_ans(
+        &mut histograms,
+        &mut assignment,
+        Some(thread_pool),
+        true,
+    );
     histograms.truncate(n);
     let context_map: Vec<u8> = dense
         .iter()
@@ -2292,6 +2358,60 @@ mod ans_refinement_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn unused_contexts_repeat_the_preceding_map_entry_only_when_the_map_shrinks() {
+        // Populate every third context of the first half, alternating two
+        // clusters, so the unused entries at cluster 0 break the map's runs.
+        const CONTEXTS: usize = 600;
+        let mut map = vec![0u8; CONTEXTS];
+        let mut tokens = Vec::new();
+        for context in (0..CONTEXTS / 2).step_by(3) {
+            map[context] = ((context / 3) % 2) as u8;
+            for i in 0..40u32 {
+                tokens.push(Token::new(context as u32, (i * 7 + context as u32) % 9));
+            }
+        }
+        let mut code = code_for(&tokens, map.clone(), vec![HybridUintConfig::DEFAULT; 2]);
+        let streams: Vec<&[Token]> = tokens.chunks(1000).collect();
+        let (before_bits, before_bytes) = serialized(&code, &streams);
+        let header_bits = |code: &OwnedEntropyCode| {
+            let mut writer = BitWriter::new();
+            write_entropy_code(&code.as_ref(), &mut Vec::new(), &mut writer);
+            writer.bits_written()
+        };
+        let before_header = header_bits(&code);
+
+        assert!(fill_unused_contexts(
+            &mut code,
+            &streams,
+            &mut CoderScratch::lossless()
+        ));
+        let mut previous = 0u8;
+        for context in 0..CONTEXTS {
+            let used = context < CONTEXTS / 2 && context % 3 == 0;
+            if used {
+                assert_eq!(code.context_map[context], map[context]);
+                previous = map[context];
+            } else {
+                assert_eq!(code.context_map[context], previous);
+            }
+        }
+        let after_header = header_bits(&code);
+        assert!(
+            after_header < before_header,
+            "{after_header} >= {before_header}"
+        );
+        let (after_bits, after_bytes) = serialized(&code, &streams);
+        assert_eq!(before_bits - before_header, after_bits - after_header);
+        assert!(after_bytes.len() <= before_bytes.len());
+        // A second pass has nothing left to improve.
+        assert!(!fill_unused_contexts(
+            &mut code,
+            &streams,
+            &mut CoderScratch::lossless()
+        ));
     }
 
     #[test]

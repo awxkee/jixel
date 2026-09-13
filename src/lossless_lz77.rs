@@ -1263,7 +1263,12 @@ where
     }
 
     let num_clusters = if ans_cluster {
-        crate::entropy::cluster_histograms_ans(histograms, &mut context_map[..num_contexts], pool)
+        crate::entropy::cluster_histograms_ans(
+            histograms,
+            &mut context_map[..num_contexts],
+            pool,
+            false,
+        )
     } else {
         cluster_histograms_fixed(
             histograms,
@@ -1430,7 +1435,7 @@ where
         }
     }
     if use_ans {
-        let (hists, symbols, reverse_maps) = crate::entropy::build_ans_code_parts(histograms);
+        let (hists, symbols, reverse_maps) = crate::entropy::build_ans_code_parts(histograms, true);
         ans.histograms = hists;
         ans.symbols = symbols;
         ans.reverse_maps = reverse_maps;

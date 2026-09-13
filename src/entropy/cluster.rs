@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::dlog2::f_log2;
 use super::histogram::Histogram;
 use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
@@ -889,6 +890,18 @@ fn cluster_histograms_inner(
     context_map.extend(symbols.iter().map(|&symbol| remap[symbol as usize]));
 }
 
+/// Order-0 bits the signaled context map saves when clusters holding `a` and
+/// `b` populated contexts become one symbol: each entry's ideal code length
+/// shrinks from `-log2(n_i / N)` to `-log2((a + b) / N)`.
+fn context_map_merge_saving(a: usize, b: usize) -> f64 {
+    if a == 0 || b == 0 {
+        return 0.0;
+    }
+    let (a, b) = (a as f64, b as f64);
+    let merged = a + b;
+    a * f_log2(merged / a) + b * f_log2(merged / b)
+}
+
 /// rANS-aware clustering for context sets whose distributions are too skewed
 /// for the prefix-cost model above: with sub-bit symbols an integer-depth
 /// Huffman cost cannot see the difference between contexts, so the greedy
@@ -907,6 +920,7 @@ pub(crate) fn cluster_histograms_ans(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     pool: Option<&crate::thread_pool::ThreadPool>,
+    charge_context_map: bool,
 ) -> usize {
     use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
     use crate::coder_scratch::CoderScratch;
@@ -1112,8 +1126,17 @@ pub(crate) fn cluster_histograms_ans(
     }
 
     // Final agglomerative pass: merge any cluster pair whose combined table +
-    // payload beats keeping them apart.
+    // payload beats keeping them apart. Every populated context is also a
+    // signaled context-map entry, so merging two clusters shrinks the map by
+    // roughly the order-0 saving of folding their two symbols into one; charge
+    // it, or the pass keeps clusters whose payload gain the map eats.
     let mut active: Vec<bool> = clusters.iter().map(|c| c.total_count != 0).collect();
+    let mut members = vec![0usize; num_seeds];
+    for (h, &a) in histograms.iter().zip(&assignment) {
+        if h.total_count != 0 {
+            members[a as usize] += 1;
+        }
+    }
     loop {
         let mut best_pair = None;
         let mut best_delta = -1e-6f64;
@@ -1127,7 +1150,12 @@ pub(crate) fn cluster_histograms_ans(
                 }
                 let delta = merge_cost(&clusters[a], &clusters[b], &mut scratch)
                     - cluster_costs[a]
-                    - cluster_costs[b];
+                    - cluster_costs[b]
+                    - if charge_context_map {
+                        context_map_merge_saving(members[a], members[b])
+                    } else {
+                        0.0
+                    };
                 if delta < best_delta {
                     best_delta = delta;
                     best_pair = Some((a, b));
@@ -1138,6 +1166,7 @@ pub(crate) fn cluster_histograms_ans(
         let bh = clusters[b].clone();
         histogram_add(&mut clusters[a], &bh);
         cluster_costs[a] = cost_of(&clusters[a], &mut scratch);
+        members[a] += members[b];
         active[b] = false;
         for m in assignment.iter_mut() {
             if *m == b as u8 {
@@ -1200,7 +1229,7 @@ mod tests {
                 let mut histograms = base[..len].to_vec();
                 let mut map = vec![0u8; len];
                 let pool = crate::thread_pool::ThreadPool::new_lossless(threads);
-                let num = cluster_histograms_ans(&mut histograms, &mut map, Some(&pool));
+                let num = cluster_histograms_ans(&mut histograms, &mut map, Some(&pool), true);
                 (num, map, histograms[..num].to_vec())
             };
             let (num1, map1, hist1) = run(1);
