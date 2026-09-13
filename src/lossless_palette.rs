@@ -1256,8 +1256,6 @@ fn index_plane_cost_rows(
     (hist, extra_bits)
 }
 
-/// Multiplicative hasher for packed color keys (the default SipHash costs
-/// more than the rest of the palette scan).
 #[derive(Default)]
 struct ColorHasher(u64);
 
@@ -1265,20 +1263,22 @@ impl std::hash::Hasher for ColorHasher {
     fn finish(&self) -> u64 {
         self.0
     }
+
     fn write(&mut self, bytes: &[u8]) {
-        let (chunks, remainder) = bytes.as_chunks::<8>();
-        for &chunk in chunks {
-            self.0 = (self.0 ^ u64::from_le_bytes(chunk))
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left(29);
-        }
-        if !remainder.is_empty() {
-            let mut v = [0u8; 8];
-            v[..remainder.len()].copy_from_slice(remainder);
-            self.0 = (self.0 ^ u64::from_le_bytes(v))
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left(29);
-        }
+        let bytes: &[u8; 16] = bytes.first_chunk::<16>().unwrap();
+        let chunks = bytes.as_chunks::<8>().0;
+        assert_eq!(chunks.len(), 2);
+        let a = u64::from_le_bytes(chunks[0]);
+        let b = u64::from_le_bytes(chunks[1]);
+        const MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+        self.0 = (a.wrapping_mul(MUL).rotate_left(29) ^ b)
+            .wrapping_mul(MUL)
+            .rotate_left(29);
+    }
+
+    fn write_usize(&mut self, length: usize) {
+        // Every ColorMap key has the same length, so omit its prefix.
+        debug_assert_eq!(length, 4);
     }
 }
 
@@ -1387,6 +1387,31 @@ mod tests {
     use super::super::rct::rct_context;
     use super::*;
     use crate::entropy::{pack_signed, uint_encode};
+
+    #[test]
+    fn color_hasher_accepts_array_hashing_and_uses_every_channel() {
+        use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+
+        let builder = BuildHasherDefault::<ColorHasher>::default();
+        let mut hashes = std::collections::HashSet::new();
+        for channel in 0..4 {
+            for value in [i32::MIN, -65535, -1, 1, 255, 65535, i32::MAX] {
+                let mut color = [0i32; 4];
+                color[channel] = value;
+                let mut bytes = [0; 16];
+                for (part, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(color) {
+                    *part = value.to_ne_bytes();
+                }
+                let mut raw = ColorHasher::default();
+                raw.write(&bytes);
+                let hash = builder.hash_one(color);
+                // Exercise the standard library's actual array Hash protocol,
+                // including its constant length prefix, against a raw payload.
+                assert_eq!(hash, raw.finish());
+                assert!(hashes.insert(hash), "channel={channel}, value={value}");
+            }
+        }
+    }
 
     #[test]
     fn global_palette_reconstructs_rgb_and_alpha_from_input_tuple_ids() {
