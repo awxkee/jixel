@@ -28,6 +28,7 @@
  */
 
 use crate::entropy::{HybridUintConfig, Token, uint_encode_with_config};
+use std::borrow::Cow;
 
 /// libjxl `kPermutationContexts`.
 pub(crate) const PERMUTATION_CONTEXTS: usize = 8;
@@ -300,40 +301,52 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
 pub(crate) struct CoeffOrders {
     /// Bit `order_index` set means that group is signaled and must be used.
     pub(crate) used_mask: u16,
-    pub(crate) orders: [[Vec<u32>; 3]; ORDER_SPECS.len()],
+    pub(crate) orders: [[Cow<'static, [u32]>; 3]; ORDER_SPECS.len()],
 }
 
 impl CoeffOrders {
-    /// All groups on their natural order, nothing signalled.
+    /// All groups on their natural order, nothing signaled.
     pub(crate) fn natural() -> Self {
+        // Widen the spec tables once. Frames and channels borrow the same
+        // natural scans; only accepted learned scans need owned buffers.
+        static NATURAL: std::sync::OnceLock<[Vec<u32>; 5]> = std::sync::OnceLock::new();
+        let natural = NATURAL.get_or_init(|| {
+            std::array::from_fn(|i| match [64, 128, 256, 512, 1024][i] {
+                64 => crate::ac_context::K_COEFF_ORDER_8X8
+                    .iter()
+                    .map(|&r| r as u32)
+                    .collect(),
+                128 => crate::ac_context::K_COEFF_ORDER_16X8
+                    .iter()
+                    .map(|&r| r as u32)
+                    .collect(),
+                256 => crate::ac_context::K_COEFF_ORDER_16X16
+                    .iter()
+                    .map(|&r| r as u32)
+                    .collect(),
+                512 => crate::ac_context::K_COEFF_ORDER_32X16
+                    .iter()
+                    .map(|&r| r as u32)
+                    .collect(),
+                1024 => crate::ac_context::K_COEFF_ORDER_32X32
+                    .iter()
+                    .map(|&r| r as u32)
+                    .collect(),
+                _ => unreachable!(),
+            })
+        });
         Self {
             used_mask: 0,
             orders: std::array::from_fn(|i| {
-                let (_, _, size) = ORDER_SPECS[i];
-                let natural: Vec<u32> = match size {
-                    64 => crate::ac_context::K_COEFF_ORDER_8X8
-                        .iter()
-                        .map(|&r| r as u32)
-                        .collect(),
-                    128 => crate::ac_context::K_COEFF_ORDER_16X8
-                        .iter()
-                        .map(|&r| r as u32)
-                        .collect(),
-                    256 => crate::ac_context::K_COEFF_ORDER_16X16
-                        .iter()
-                        .map(|&r| r as u32)
-                        .collect(),
-                    512 => crate::ac_context::K_COEFF_ORDER_32X16
-                        .iter()
-                        .map(|&r| r as u32)
-                        .collect(),
-                    1024 => crate::ac_context::K_COEFF_ORDER_32X32
-                        .iter()
-                        .map(|&r| r as u32)
-                        .collect(),
+                let slot = match ORDER_SPECS[i].2 {
+                    64 => 0,
+                    128 => 1,
+                    256 => 2,
+                    512 => 3,
+                    1024 => 4,
                     _ => unreachable!(),
                 };
-                [natural.clone(), natural.clone(), natural]
+                std::array::from_fn(|_| Cow::Borrowed(natural[slot].as_slice()))
             }),
         }
     }
@@ -488,15 +501,15 @@ const GATE_MARGIN: f64 = 1.5;
 /// direction for a gate that has to protect small low-rate images.
 const BITS_PER_PERMUTATION_TOKEN: f64 = 5.0;
 
-/// Build the frame's coefficient orders from first-pass statistics.
-pub(crate) fn derive_orders(stats: &OrderStats) -> CoeffOrders {
-    let mut out = CoeffOrders::natural();
+/// Refine the frame's natural coefficient orders from first-pass statistics.
+pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) {
+    debug_assert_eq!(out.used_mask, 0);
     for (slot, &(order_index, llf, _size)) in ORDER_SPECS.iter().enumerate() {
         let blocks = stats.blocks_in(slot);
         if blocks < MIN_BLOCKS_FOR_ORDER {
             continue;
         }
-        let mut derived: [Vec<u32>; 3] = std::array::from_fn(|_| Vec::new());
+        let mut derived: [Cow<'static, [u32]>; 3] = std::array::from_fn(|_| Cow::Borrowed(&[][..]));
         let mut saved_bits = 0.0f64;
         let mut cost_bits = 0.0f64;
         let mut any = false;
@@ -518,7 +531,7 @@ pub(crate) fn derive_orders(stats: &OrderStats) -> CoeffOrders {
                 any = true;
                 saved_bits += channel_saved;
                 cost_bits += channel_cost;
-                derived[channel] = candidate;
+                derived[channel] = Cow::Owned(candidate);
             } else {
                 derived[channel] = natural;
             }
@@ -528,7 +541,6 @@ pub(crate) fn derive_orders(stats: &OrderStats) -> CoeffOrders {
             out.orders[slot] = derived;
         }
     }
-    out
 }
 
 impl CoeffOrders {
@@ -552,6 +564,37 @@ impl CoeffOrders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn natural_scans_are_shared_and_learned_scans_stay_local() {
+        let natural = CoeffOrders::natural();
+        let mut learned = CoeffOrders::natural();
+        let mut stats = OrderStats::new();
+        for slot in 0..ORDER_SPECS.len() {
+            for c in 0..3 {
+                assert!(matches!(learned.orders[slot][c], Cow::Borrowed(_)));
+                assert!(std::ptr::eq(
+                    natural.orders[slot][0].as_ptr(),
+                    learned.orders[slot][c].as_ptr()
+                ));
+            }
+            stats.blocks[slot] = 10_000;
+            let raw = *natural.orders[slot][0].last().unwrap() as usize;
+            stats.counts[slot][0][raw] = 10_000;
+        }
+        derive_orders(&stats, &mut learned);
+        assert_ne!(learned.used_mask, 0);
+        assert_eq!(natural.used_mask, 0);
+        for (slot, &(order, _, _)) in ORDER_SPECS.iter().enumerate() {
+            assert_ne!(learned.used_mask & (1 << order), 0);
+            assert!(matches!(learned.orders[slot][0], Cow::Owned(_)));
+            assert_ne!(learned.orders[slot][0], natural.orders[slot][0]);
+            for c in 1..3 {
+                assert!(matches!(learned.orders[slot][c], Cow::Borrowed(_)));
+                assert_eq!(learned.orders[slot][c], natural.orders[slot][c]);
+            }
+        }
+    }
 
     #[test]
     fn dct64x32_natural_scan_is_a_permutation_with_llf_first() {

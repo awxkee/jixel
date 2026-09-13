@@ -596,6 +596,13 @@ where
                 .all(|p| p[0].is_multiple_of(2) && p[1] == p[0] + 1)
     };
 
+    // Singleton costs never change as groups split or merge. Preserve the
+    // original subtraction order when reusing them below.
+    let singleton_cost: [f64; K_NUM_FINE_BLOCK_CTXS] =
+        std::array::from_fn(|fine| stats.group_cost(&[fine as u8]));
+    let mut merge_cost_cache = [None; CHROMA_MERGE_CANDIDATES.len()];
+    let membership = |group: &[u8]| group.iter().fold(0u32, |mask, &fine| mask | (1 << fine));
+    let mut union = Vec::with_capacity(K_NUM_FINE_BLOCK_CTXS);
     let mut merges_used = [false; CHROMA_MERGE_CANDIDATES.len()];
     let mut any_split = false;
     let mut total_net = 0.0f64;
@@ -605,19 +612,20 @@ where
             if !splittable(g) {
                 continue;
             }
-            let gain = group_cost[i] - stats.group_cost(&[g[0]]) - stats.group_cost(&[g[1]]);
+            let gain =
+                group_cost[i] - singleton_cost[g[0] as usize] - singleton_cost[g[1] as usize];
             if gain > 0.0 && best.is_none_or(|(bg, _)| gain > bg) {
                 best = Some((gain, i));
             }
         }
         let Some((gain, split_pos)) = best else { break };
         let gain = gain * PLAN_SAMPLE_STEP as f64;
-        let split_fines = groups[split_pos].clone();
+        let split_fines = [groups[split_pos][0], groups[split_pos][1]];
 
         let merge_choice = if groups.len() < MAX_BLOCK_CTXS {
             None
         } else {
-            let mut cheapest: Option<(f64, usize, Vec<u8>, Vec<u8>)> = None;
+            let mut cheapest: Option<(f64, usize, usize, usize, f64)> = None;
             for (mi, &(a, b)) in CHROMA_MERGE_CANDIDATES.iter().enumerate() {
                 if merges_used[mi] {
                     continue;
@@ -635,12 +643,22 @@ where
                 {
                     continue;
                 }
-                let mut union = groups[pa].clone();
-                union.extend_from_slice(&groups[pb]);
-                let cost = (stats.group_cost(&union) - group_cost[pa] - group_cost[pb])
-                    * PLAN_SAMPLE_STEP as f64;
+                let key = [membership(&groups[pa]), membership(&groups[pb])];
+                let merged_cost = match merge_cost_cache[mi] {
+                    Some((cached_key, cost)) if cached_key == key => cost,
+                    _ => {
+                        union.clear();
+                        union.extend_from_slice(&groups[pa]);
+                        union.extend_from_slice(&groups[pb]);
+                        let cost = stats.group_cost(&union);
+                        merge_cost_cache[mi] = Some((key, cost));
+                        cost
+                    }
+                };
+                let cost =
+                    (merged_cost - group_cost[pa] - group_cost[pb]) * PLAN_SAMPLE_STEP as f64;
                 if cheapest.as_ref().is_none_or(|(c, ..)| cost < *c) {
-                    cheapest = Some((cost, mi, groups[pa].clone(), groups[pb].clone()));
+                    cheapest = Some((cost, mi, pa, pb, merged_cost));
                 }
             }
             match cheapest {
@@ -658,24 +676,27 @@ where
         }
         total_net += net;
 
-        if let Some((_, mi, ga, gb)) = merge_choice {
+        if let Some((_, mi, pa, pb, merged_cost)) = merge_choice {
             merges_used[mi] = true;
-            let pa = groups.iter().position(|g| *g == ga).unwrap();
-            groups.remove(pa);
-            group_cost.remove(pa);
-            let pb = groups.iter().position(|g| *g == gb).unwrap();
-            groups.remove(pb);
+            // Move the selected groups and preserve their concatenation order.
+            // Removing the second group first only shifts pa when pb < pa.
+            let gb = groups.remove(pb);
             group_cost.remove(pb);
-            let mut union = ga;
-            union.extend(gb);
-            group_cost.push(stats.group_cost(&union));
-            groups.push(union);
+            let pa = pa - usize::from(pb < pa);
+            let mut ga = groups.remove(pa);
+            group_cost.remove(pa);
+            ga.extend(gb);
+            group_cost.push(merged_cost);
+            groups.push(ga);
         }
-        let pos = groups.iter().position(|g| *g == split_fines).unwrap();
+        let pos = groups
+            .iter()
+            .position(|g| g.as_slice() == split_fines)
+            .unwrap();
         groups.remove(pos);
         group_cost.remove(pos);
         for fine in split_fines {
-            group_cost.push(stats.group_cost(&[fine]));
+            group_cost.push(singleton_cost[fine as usize]);
             groups.push(vec![fine]);
         }
         any_split = true;
@@ -698,5 +719,70 @@ where
         nbc: groups.len() as u8,
         fine_to_final,
         qf_threshold: any_split.then_some(qf_threshold),
+    }
+}
+
+#[cfg(test)]
+mod planner_cache_tests {
+    use super::*;
+
+    fn planner_tokens(pattern: usize, repeats: usize) -> Vec<crate::entropy::Token> {
+        let mut tokens = Vec::new();
+        for fine in 0..K_NUM_FINE_BLOCK_CTXS {
+            for i in 0..repeats {
+                let value = match pattern {
+                    0 => 0,
+                    1 => (fine % 2) as u32 * 511,
+                    2 => (fine % 2) as u32 * 511 + (i / 4 % 3) as u32,
+                    3 => {
+                        if fine < 20 {
+                            (fine % 2) as u32 * 511
+                        } else {
+                            (i / 4 % 3) as u32
+                        }
+                    }
+                    4 => ((fine * 17 + i / 4 * 7) % 5) as u32,
+                    _ => ((fine % 2 * (fine / 2 + 1) * 37 + i / 4 % 7) % 1024) as u32,
+                };
+                tokens.push(crate::entropy::Token::new(fine as u32, value));
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn cached_plans_preserve_split_merge_choices_and_ties() {
+        // Recorded from the planner before caching. These cover rejected
+        // proposals, tied gains and chained merges through groups 12/13/14.
+        let split_map = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14,
+            15, 15, 15, 15, 15, 15,
+        ];
+        let mixed_map = [
+            0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 9, 10, 10, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14,
+            14, 15, 15, 15, 15,
+        ];
+        for pattern in 0..6 {
+            for repeats in [0, 128, 8192] {
+                let tokens = planner_tokens(pattern, repeats);
+                let changed = repeats == 8192 && !matches!(pattern, 0 | 4);
+                for chunk_size in [4096, tokens.len().max(1)] {
+                    let plan = plan_block_ctx_map(tokens.chunks(chunk_size), 123);
+                    let expected = if !changed {
+                        AcCtxPlan::baseline().fine_to_final
+                    } else if pattern == 5 {
+                        mixed_map
+                    } else {
+                        split_map
+                    };
+                    assert_eq!(
+                        plan.fine_to_final, expected,
+                        "pattern={pattern}, repeats={repeats}"
+                    );
+                    assert_eq!(plan.nbc, if changed { 16 } else { 15 });
+                    assert_eq!(plan.qf_threshold, changed.then_some(123));
+                }
+            }
+        }
     }
 }

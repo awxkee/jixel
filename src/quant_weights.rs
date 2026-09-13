@@ -762,7 +762,8 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
     ],
 ];
 
-// Invariant tables borrow from SharedTables; preset-dependent tables stay owned.
+// Array references below borrow heap buffers owned by SharedTables/LargeTables.
+// The caches retain HeapMatrix's Box<[f32]> allocations for the process lifetime.
 pub(crate) struct DequantMatrices {
     /// Signaled IDENTITY weights (kQuantModeID) when they differ from spec.
     pub(crate) identity_weights: Option<[[f32; 3]; 3]>,
@@ -782,12 +783,12 @@ pub(crate) struct DequantMatrices {
     /// 16×16 dequant matrix (256 floats per channel). Generated at
     /// construction time from the libjxl polynomial parameters since it isn't
     /// part of libjxl-tiny.
-    pub(crate) matrix_16x16: HeapMatrix<f32, 3, 256>,
-    pub(crate) inv_matrix_16x16: HeapMatrix<f32, 3, 256>,
+    pub(crate) matrix_16x16: &'static [[f32; 256]; 3],
+    pub(crate) inv_matrix_16x16: &'static [[f32; 256]; 3],
     /// 32×32 dequant matrix (1024 floats per channel). Generated at
     /// construction time from the libjxl DCT32X32 polynomial parameters.
-    pub(crate) matrix_32x32: HeapMatrix<f32, 3, 1024>,
-    pub(crate) inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    pub(crate) matrix_32x32: &'static [[f32; 1024]; 3],
+    pub(crate) inv_matrix_32x32: &'static [[f32; 1024]; 3],
     /// Spec-default DCT64X64 table used by the slow large-transform path.
     pub(crate) matrix_64x64: &'static [[f32; 4096]; 3],
     pub(crate) inv_matrix_64x64: &'static [[f32; 4096]; 3],
@@ -810,8 +811,8 @@ pub(crate) struct DequantMatrices {
     /// rectangular large transforms share these weights (libjxl
     /// `QuantTable::DCT16X32`), computed at the normalized 16-row × 32-col
     /// resolution so the same table applies to both orientations.
-    pub(crate) matrix_32x16: HeapMatrix<f32, 3, 512>,
-    pub(crate) inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
+    pub(crate) matrix_32x16: &'static [[f32; 512]; 3],
+    pub(crate) inv_matrix_32x16: &'static [[f32; 512]; 3],
     /// AFV dequant matrix (64 floats per channel, 8×8 grid), shared by all
     /// four AFV variants (libjxl `QuantTable::AFV0`).
     pub(crate) matrix_afv: &'static [[f32; 64]; 3],
@@ -1704,6 +1705,62 @@ fn shared_tables() -> &'static SharedTables {
     })
 }
 
+struct LargeTables {
+    matrix_16x16: HeapMatrix<f32, 3, 256>,
+    inv_matrix_16x16: HeapMatrix<f32, 3, 256>,
+    matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    inv_matrix_32x32: HeapMatrix<f32, 3, 1024>,
+    matrix_32x16: HeapMatrix<f32, 3, 512>,
+    inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
+}
+
+fn large_tables(use_ss2: bool) -> &'static LargeTables {
+    static DEFAULT: std::sync::OnceLock<LargeTables> = std::sync::OnceLock::new();
+    static SS2: std::sync::OnceLock<LargeTables> = std::sync::OnceLock::new();
+    let cache = if use_ss2 { &SS2 } else { &DEFAULT };
+    cache.get_or_init(|| {
+        let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
+        let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
+        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
+        let matrix_32x16 = compute_dct32x16_matrix(o32x16.as_ref());
+        let mut inv_matrix_32x16 = HeapMatrix::new(0.);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            fill_ac_reciprocals(&matrix_32x16[c], &mut inv_matrix_32x16[c]);
+        }
+
+        let matrix_16x16 = compute_dct16x16_matrix(o16.as_ref());
+        let mut inv_matrix_16x16 = HeapMatrix::new(0.);
+        for c in 0..3 {
+            // Same convention as inv_matrix and inv_matrix_16x8: DC slot
+            // (index 0) is zeroed (handled by DC plane / LF-from-DC). For
+            // 16×16 the LLF region is 2×2: positions {0, 1, 16, 17}. We
+            // leave non-DC LF positions populated because the decoder
+            // will overwrite them via LowestFrequenciesFromDC anyway, just
+            // like for 16×8 / 8×16.
+            fill_ac_reciprocals(&matrix_16x16[c], &mut inv_matrix_16x16[c]);
+        }
+
+        let matrix_32x32 = compute_dct32x32_matrix(o32.as_ref());
+        let mut inv_matrix_32x32 = HeapMatrix::new(0.);
+        for c in 0..3 {
+            // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
+            // since the decoder overwrites them via LowestFrequenciesFromDC.
+            fill_ac_reciprocals(&matrix_32x32[c], &mut inv_matrix_32x32[c]);
+        }
+
+        LargeTables {
+            matrix_16x16,
+            inv_matrix_16x16,
+            matrix_32x32,
+            inv_matrix_32x32,
+            matrix_32x16,
+            inv_matrix_32x16,
+        }
+    })
+}
+
 impl DequantMatrices {
     /// Keep the yellow-color proxy calibrated to its original DCT8 tables.
     /// It evaluates a capped reference distance even for coarse frames, so
@@ -1890,33 +1947,7 @@ impl DequantMatrices {
             }
         };
         let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
-        let matrix_32x16 = compute_dct32x16_matrix(o32x16.as_ref());
-        let mut inv_matrix_32x16 = HeapMatrix::new(0.);
-        for c in 0..3 {
-            // DC slot zeroed; non-DC LF positions (the 4×2 LLF) left populated
-            // since the decoder overwrites them via LowestFrequenciesFromDC.
-            fill_ac_reciprocals(&matrix_32x16[c], &mut inv_matrix_32x16[c]);
-        }
-
-        let matrix_16x16 = compute_dct16x16_matrix(o16.as_ref());
-        let mut inv_16x16 = HeapMatrix::new(0.);
-        for c in 0..3 {
-            // Same convention as inv_matrix and inv_matrix_16x8: DC slot
-            // (index 0) is zeroed (handled by DC plane / LF-from-DC). For
-            // 16×16 the LLF region is 2×2: positions {0, 1, 16, 17}. We
-            // leave non-DC LF positions populated because the decoder
-            // will overwrite them via LowestFrequenciesFromDC anyway, just
-            // like for 16×8 / 8×16.
-            fill_ac_reciprocals(&matrix_16x16[c], &mut inv_16x16[c]);
-        }
-
-        let matrix_32x32 = compute_dct32x32_matrix(o32.as_ref());
-        let mut inv_32x32 = HeapMatrix::new(0.);
-        for c in 0..3 {
-            // DC slot zeroed; non-DC LF positions (the 4×4 LLF) left populated
-            // since the decoder overwrites them via LowestFrequenciesFromDC.
-            fill_ac_reciprocals(&matrix_32x32[c], &mut inv_32x32[c]);
-        }
+        let large = large_tables(use_ss2);
 
         let (matrix, inv_matrix) = if let Some(o8) = o8.as_ref() {
             let matrix = compute_dct8x8_matrix(o8);
@@ -1939,10 +1970,10 @@ impl DequantMatrices {
             inv_matrix_dct2x2: &shared.inv_matrix_dct2x2,
             matrix_16x8,
             inv_matrix_16x8,
-            matrix_16x16,
-            inv_matrix_16x16: inv_16x16,
-            matrix_32x32,
-            inv_matrix_32x32: inv_32x32,
+            matrix_16x16: &large.matrix_16x16,
+            inv_matrix_16x16: &large.inv_matrix_16x16,
+            matrix_32x32: &large.matrix_32x32,
+            inv_matrix_32x32: &large.inv_matrix_32x32,
             matrix_64x64,
             inv_matrix_64x64,
             matrix_64x32,
@@ -1964,8 +1995,8 @@ impl DequantMatrices {
             inv_matrix_4x4: &shared.inv_matrix_4x4,
             matrix_4x8: &shared.matrix_4x8,
             inv_matrix_4x8: &shared.inv_matrix_4x8,
-            matrix_32x16,
-            inv_matrix_32x16,
+            matrix_32x16: &large.matrix_32x16,
+            inv_matrix_32x16: &large.inv_matrix_32x16,
             matrix_afv: &shared.matrix_afv,
             inv_matrix_afv: &shared.inv_matrix_afv,
         }
@@ -2633,6 +2664,13 @@ mod shared_storage_tests {
                 DequantMatrices::new_saturated(distance),
                 DequantMatrices::new_saturated_pair_b(distance),
             ] {
+                let large = large_tables(set.custom_tables[1].is_some());
+                assert!(std::ptr::eq(set.matrix_16x16, &*large.matrix_16x16));
+                assert!(std::ptr::eq(set.inv_matrix_16x16, &*large.inv_matrix_16x16));
+                assert!(std::ptr::eq(set.matrix_32x32, &*large.matrix_32x32));
+                assert!(std::ptr::eq(set.inv_matrix_32x32, &*large.inv_matrix_32x32));
+                assert!(std::ptr::eq(set.matrix_32x16, &*large.matrix_32x16));
+                assert!(std::ptr::eq(set.inv_matrix_32x16, &*large.inv_matrix_32x16));
                 assert!(std::ptr::eq(
                     set.matrix_dct2x2.as_ptr(),
                     shared.matrix_dct2x2.as_ptr()
