@@ -47,6 +47,71 @@ use crate::util::{FastRound, HeapMatrix, heap_array};
 use std::sync::OnceLock;
 
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
+
+/// Chroma deadzone narrowing for chromatic 8x8 blocks.
+const CHROMA_DZ_SAT_START: f32 = 0.3;
+const CHROMA_DZ_SAT_WIDTH: f32 = 0.3;
+const CHROMA_DZ_TARGET: f32 = 0.5;
+const CHROMA_DZ_MIN_RELATIVE_ENERGY: f32 = 0.2;
+
+/// Saturation proxy and chroma magnitude of the block mean in XYB, where gray
+/// has X = 0 and B = Y. No RGB conversion is needed.
+#[inline]
+fn chroma_block_saturation(dc: [f32; 3]) -> (f32, f32) {
+    let by = dc[2] - dc[1];
+    let chroma = (dc[0] * dc[0] + by * by).sqrt();
+    ((chroma / dc[1].max(0.02)).min(1.0), chroma)
+}
+
+/// Re-apply the hard-threshold quantizer on an 8x8 chroma block with the
+/// zero thresholds pulled toward [`CHROMA_DZ_TARGET`] by `f` in [0, 1].
+/// Only the single strongest deleted coefficient can change (to +-1), and
+/// only when the deleted AC energy (Parseval: the sum of squared AC
+/// coefficients is the pixel variance for the mean-normalised DCT) is at
+/// least [`CHROMA_DZ_MIN_RELATIVE_ENERGY`] of the block's DC chroma.
+#[allow(clippy::too_many_arguments)]
+fn chroma_deadzone_fixup(
+    c: usize,
+    coeffs: &[f32],
+    inv_qm: &[f32],
+    q_scaled: f32,
+    distance: f32,
+    qm_mul: f32,
+    f: f32,
+    dc_chroma: f32,
+    quantized: &mut [i32],
+) {
+    if f <= 0.0 {
+        return;
+    }
+    // Validate the 8x8 extent once, so the scan needs no per-element bounds checks.
+    let coeffs = &coeffs[..64];
+    let inv_qm = &inv_qm[..64];
+    let quantized = &mut quantized[..64];
+    let thr = quantize_ac_thresholds_scaled(c, 1, 1, distance, qm_mul);
+    let eff: [f32; 4] =
+        std::array::from_fn(|i| (thr[i] - f * (thr[i] - CHROMA_DZ_TARGET)).max(0.5));
+    let mut best = (0.0f32, usize::MAX);
+    let mut deleted = 0.0f32;
+    for i in 1..64 {
+        if quantized[i] != 0 {
+            continue;
+        }
+        let coeff = coeffs[i];
+        deleted += coeff * coeff;
+        let magnitude = (coeff * inv_qm[i] * q_scaled).abs();
+        // Only look up the quadrant threshold when this could become the best.
+        if magnitude > best.0
+            && magnitude >= eff[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)]
+        {
+            best = (magnitude, i);
+        }
+    }
+    if best.1 == usize::MAX || deleted.sqrt() < CHROMA_DZ_MIN_RELATIVE_ENERGY * dc_chroma {
+        return;
+    }
+    quantized[best.1] = if coeffs[best.1] < 0.0 { -1 } else { 1 };
+}
 const RDOQ_MAX_CHOICES: usize = 64 * RDOQ_MAX_STRIDE;
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
@@ -788,6 +853,7 @@ pub(crate) fn write_ac_group(
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
     let mut chroma_distortion = 0.0f32;
+    let chroma_deadzone = ctx.speed == crate::Speed::Slow;
 
     // All the big per-block buffers live in the worker scratch: re-creating them
     // per group cost ~130 KB of zeroing, and `pblock` was being zeroed once per
@@ -1199,6 +1265,16 @@ pub(crate) fn write_ac_group(
             }
 
             // ---- X channel: write post-CfL DC, quantize AC ----
+            let (dz_f, dz_dc_chroma) = if chroma_deadzone && covered_dc == 1 {
+                let (sat, chroma) =
+                    chroma_block_saturation([dc_vals[0][0], dc_vals[1][0], dc_vals[2][0]]);
+                (
+                    ((sat - CHROMA_DZ_SAT_START) / CHROMA_DZ_SAT_WIDTH).clamp(0.0, 1.0),
+                    chroma,
+                )
+            } else {
+                (0.0, 0.0)
+            };
             let mut chroma_dc_q = [0i16; 64];
             (ctx.quantize_dc)(
                 &x_dc_post[..covered_dc],
@@ -1243,6 +1319,17 @@ pub(crate) fn write_ac_group(
                 cy,
                 &mut quantized[0][..size],
             );
+            chroma_deadzone_fixup(
+                0,
+                &coeffs[0][..size],
+                inv_qm_x,
+                quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                distance,
+                x_qm_mul,
+                dz_f,
+                dz_dc_chroma,
+                &mut quantized[0][..size],
+            );
             // Chroma RDOQ (review §8): the trellis is channel-generic — the
             // CfL residuals are the source, contexts/prices/orders are
             // channel-specific, and unlike Y the input coefficients are not
@@ -1278,19 +1365,6 @@ pub(crate) fn write_ac_group(
                 );
             }
             let row_stride = cx * 8;
-            if measure_chroma_distortion {
-                let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
-                for i in 0..size {
-                    let v = i / row_stride;
-                    let u = i % row_stride;
-                    if v < cy && u < cx {
-                        continue;
-                    }
-                    let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
-                    let error = ideal - dequantized_level(quantized[0][i]);
-                    chroma_distortion += ctx.channel_weight(0) * error * error;
-                }
-            }
 
             // ---- B channel: write CfL'd DC, quantize AC ----
             (ctx.quantize_dc_cfl)(
@@ -1338,6 +1412,17 @@ pub(crate) fn write_ac_group(
                 cy,
                 &mut quantized[2][..size],
             );
+            chroma_deadzone_fixup(
+                2,
+                &coeffs[2][..size],
+                inv_qm_b,
+                quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
+                distance,
+                ctx.b_qm_mul(),
+                dz_f,
+                dz_dc_chroma,
+                &mut quantized[2][..size],
+            );
             if distance >= CHROMA_RDOQ_MIN_DISTANCE
                 && let Some(prices) = rdoq_prices
             {
@@ -1364,6 +1449,20 @@ pub(crate) fn write_ac_group(
                     rdoq_choices,
                     rdoq_costs,
                 );
+            }
+
+            if measure_chroma_distortion {
+                let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
+                for i in 0..size {
+                    let v = i / row_stride;
+                    let u = i % row_stride;
+                    if v < cy && u < cx {
+                        continue;
+                    }
+                    let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
+                    let error = ideal - dequantized_level(quantized[0][i]);
+                    chroma_distortion += ctx.channel_weight(0) * error * error;
+                }
             }
             if measure_chroma_distortion {
                 let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
@@ -1520,8 +1619,9 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuantizeDcMethods, quantize_ac_thresholds, quantize_ac_thresholds_scaled,
-        quantize_dc_cfl_scalar, quantize_dc_scalar, selected_quantize_dc_methods,
+        QuantizeDcMethods, chroma_block_saturation, chroma_deadzone_fixup, quantize_ac_thresholds,
+        quantize_ac_thresholds_scaled, quantize_dc_cfl_scalar, quantize_dc_scalar,
+        selected_quantize_dc_methods,
     };
 
     fn check_dc_quantizers(methods: QuantizeDcMethods) {
@@ -1562,6 +1662,196 @@ mod tests {
             quantize_dc_cfl_scalar(&input[..len], &y_quant[..len], 1.0, 0.5, &mut want[..len]);
             (methods.quantize_cfl)(&input[..len], &y_quant[..len], 1.0, 0.5, &mut got[..len]);
             assert_eq!(got, want, "CfL DC length {len}");
+        }
+    }
+
+    #[test]
+    fn chroma_block_saturation_is_zero_for_gray() {
+        assert_eq!(chroma_block_saturation([0.0, 0.5, 0.5]), (0.0, 0.0));
+        let (sat, chroma) = chroma_block_saturation([0.03, 0.5, 0.3]);
+        assert!((chroma - (0.0009f32 + 0.04).sqrt()).abs() < 1e-6);
+        assert!((sat - chroma / 0.5).abs() < 1e-6);
+        assert_eq!(chroma_block_saturation([0.5, 0.01, 0.9]).0, 1.0);
+    }
+
+    #[test]
+    fn chroma_deadzone_restores_one_strongest_deleted_coefficient() {
+        let inv_qm = [1.0f32; 64];
+        let mut coeffs = [0.0f32; 64];
+        coeffs[0] = 0.9; // DC is never touched
+        coeffs[3] = 0.6;
+        coeffs[10] = -0.7;
+        coeffs[20] = 0.3;
+        // X thresholds at d2: [0.58, 0.715, 0.74, 0.78]; every candidate is
+        // below its threshold, so the plain quantizer deletes all of them.
+        let thr = quantize_ac_thresholds_scaled(0, 1, 1, 2.0, 1.0);
+        assert!(thr[0] > 0.5 && thr[1] > 0.715 - 1e-6);
+        let run = |coeffs: &[f32; 64], f: f32, dc_chroma: f32| {
+            let mut q = [0i32; 64];
+            chroma_deadzone_fixup(0, coeffs, &inv_qm, 1.0, 2.0, 1.0, f, dc_chroma, &mut q);
+            q
+        };
+        assert_eq!(run(&coeffs, 0.0, 1.0), [0; 64]);
+        let q = run(&coeffs, 1.0, 1.0);
+        assert_eq!(q[10], -1);
+        assert_eq!(q.iter().filter(|&&v| v != 0).count(), 1);
+        // Deleted energy sqrt(0.36 + 0.49 + 0.09) = 0.97 < 0.2 * 10.
+        assert_eq!(run(&coeffs, 1.0, 10.0), [0; 64]);
+        // Partial pull: eff = 0.58 - 0.5 * 0.08 = 0.54, so 0.7 still qualifies.
+        assert_eq!(run(&coeffs, 0.5, 1.0)[10], -1);
+        // Below plain rounding nothing is restored even at full pull.
+        coeffs[10] = -0.45;
+        coeffs[3] = 0.45;
+        assert_eq!(run(&coeffs, 1.0, 1.0), [0; 64]);
+    }
+
+    #[test]
+    fn chroma_deadzone_preserves_threshold_boundaries_and_ties() {
+        // Disabled fixup must return before accessing the slices.
+        chroma_deadzone_fixup(0, &[], &[], 1.0, 2.0, 1.0, 0.0, 0.0, &mut []);
+
+        let inv_qm = [1.0f32; 65];
+        let thr = quantize_ac_thresholds_scaled(0, 1, 1, 2.0, 1.0);
+        for i in 1..64 {
+            let t = thr[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)];
+            let t = (t - 0.5 * (t - super::CHROMA_DZ_TARGET)).max(0.5);
+            for magnitude in [t.next_down(), t] {
+                let mut coeffs = [0.0; 65];
+                coeffs[i] = -magnitude;
+                coeffs[0] = 10.0;
+                coeffs[64] = 10.0;
+                let mut quantized = [0; 65];
+                chroma_deadzone_fixup(0, &coeffs, &inv_qm, 1.0, 2.0, 1.0, 0.5, 0.0, &mut quantized);
+                let mut expected = [0; 65];
+                if magnitude == t {
+                    expected[i] = -1;
+                }
+                assert_eq!(quantized, expected, "threshold at AC index {i}");
+            }
+        }
+
+        let mut coeffs = [0.0; 65];
+        coeffs[1] = -0.75;
+        coeffs[63] = 0.75;
+        let mut quantized = [0; 65];
+        chroma_deadzone_fixup(0, &coeffs, &inv_qm, 1.0, 2.0, 1.0, 1.0, 0.0, &mut quantized);
+        assert_eq!(quantized[1], -1);
+        assert_eq!(quantized[63], 0);
+        // Existing nonzero coefficients must neither change nor add deleted energy.
+        coeffs[1] = 100.0;
+        chroma_deadzone_fixup(
+            0,
+            &coeffs,
+            &inv_qm,
+            1.0,
+            2.0,
+            1.0,
+            1.0,
+            10.0,
+            &mut quantized,
+        );
+        assert_eq!(quantized[1], -1);
+        assert_eq!(quantized[63], 0);
+    }
+
+    #[test]
+    fn chroma_deadzone_matches_original_scan() {
+        // Keep the original scan as a reference for operation order, NaNs,
+        // ties, and rounding near the relative-energy cutoff.
+        let reference = |c,
+                         coeffs: &[f32],
+                         inv_qm: &[f32],
+                         q_scaled: f32,
+                         distance: f32,
+                         qm_mul: f32,
+                         f: f32,
+                         dc_chroma: f32,
+                         quantized: &mut [i32]| {
+            if f <= 0.0 {
+                return;
+            }
+            let thr = quantize_ac_thresholds_scaled(c, 1, 1, distance, qm_mul);
+            let eff: [f32; 4] =
+                std::array::from_fn(|i| (thr[i] - f * (thr[i] - super::CHROMA_DZ_TARGET)).max(0.5));
+            let mut best = (0.0f32, usize::MAX);
+            let mut deleted = 0.0f32;
+            for i in 1..64 {
+                if quantized[i] != 0 {
+                    continue;
+                }
+                deleted += coeffs[i] * coeffs[i];
+                let t = eff[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)];
+                let ideal = coeffs[i] * inv_qm[i] * q_scaled;
+                if ideal.abs() >= t && ideal.abs() > best.0 {
+                    best = (ideal.abs(), i);
+                }
+            }
+            if best.1 == usize::MAX
+                || deleted.sqrt() < super::CHROMA_DZ_MIN_RELATIVE_ENERGY * dc_chroma
+            {
+                return;
+            }
+            quantized[best.1] = if coeffs[best.1] < 0.0 { -1 } else { 1 };
+        };
+
+        let mut seed = 73u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for case in 0..8192 {
+            let c = case % 3;
+            let mut coeffs: [f32; 64] = std::array::from_fn(|_| 4.0 * random() - 2.0);
+            let inv_qm: [f32; 64] = std::array::from_fn(|_| 0.125 + 3.0 * random());
+            let zero_fraction = [0.0, 0.1, 0.5, 0.9, 1.0][case % 5];
+            let mut actual: [i32; 64] =
+                std::array::from_fn(|_| if random() < zero_fraction { 0 } else { -2 });
+            if case % 8 == 0 {
+                coeffs[1 + case % 63] =
+                    [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN][case / 8 % 5];
+            }
+            let mut expected = actual;
+            let q_scaled = [0.0, 0.125, 0.5, 1.0, 4.0, f32::NAN][case % 6];
+            let distance = 0.1 + 3.0 * random();
+            let qm_mul = [0.8, 1.0, 1.25][case / 3 % 3];
+            let f = [0.0, 0.25, 0.5, 1.0, f32::NAN][case / 5 % 5];
+            let deleted = (1..64)
+                .filter(|&i| actual[i] == 0)
+                .fold(0.0f32, |sum, i| sum + coeffs[i] * coeffs[i]);
+            let cutoff = deleted.sqrt() / super::CHROMA_DZ_MIN_RELATIVE_ENERGY;
+            let dc_chroma = [
+                0.0,
+                cutoff.next_down(),
+                cutoff,
+                cutoff.next_up(),
+                f32::NAN,
+                100.0 * random(),
+            ][case / 6 % 6];
+            reference(
+                c,
+                &coeffs,
+                &inv_qm,
+                q_scaled,
+                distance,
+                qm_mul,
+                f,
+                dc_chroma,
+                &mut expected,
+            );
+            chroma_deadzone_fixup(
+                c,
+                &coeffs,
+                &inv_qm,
+                q_scaled,
+                distance,
+                qm_mul,
+                f,
+                dc_chroma,
+                &mut actual,
+            );
+            assert_eq!(actual, expected, "case {case}");
         }
     }
 
