@@ -99,7 +99,7 @@ const META_R: f32 = 4.0;
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 
 const RERANK_META_R: f32 = 2.6465739748323758;
-const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.9098454411056834);
+const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.891_814_53);
 
 const RERANK_LAMBDA_LO: f32 = 0.25;
 const RERANK_LAMBDA_HI: f32 = 10.0;
@@ -111,10 +111,10 @@ const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.05);
 const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.06);
 const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.02);
 
-const MERGE_MARGIN_PAIR: Banded = Banded::new(0.036_252_015, 0.072);
+const MERGE_MARGIN_PAIR: Banded = Banded::new(0.014_500_806, 0.0288);
 const MERGE_MARGIN_16: Banded = Banded::new(0.192_438_88, 0.048);
 const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.29);
-const MERGE_MARGIN_32: Banded = Banded::new(0.329_207_82, 0.36);
+const MERGE_MARGIN_32: Banded = Banded::new(0.213_985_08, 0.234);
 
 const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.82;
 const MERGE_MARGIN_LOWQ3_D: f32 = 3.85;
@@ -151,6 +151,7 @@ fn fine_transform_bias(base: f32, distance: f32) -> f32 {
     };
     base / 0.8 - favor
 }
+
 #[inline]
 fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
@@ -197,15 +198,15 @@ pub(crate) struct MergeTuning {
 /// Very-low-quality band
 const VLQ_D0: f32 = 4.0;
 const VLQ_D1: f32 = 7.5;
-const VLQ_MARGIN_PAIR: f32 = -0.005;
+const VLQ_MARGIN_PAIR: f32 = -0.002;
 const VLQ_MARGIN_16: f32 = 0.067;
 const VLQ_MARGIN_32_RECT: f32 = 0.363;
-const VLQ_MARGIN_32: f32 = 0.045;
+const VLQ_MARGIN_32: f32 = 0.029_25;
 const VLQ_BIAS_RECT: f32 = 1.073;
 const VLQ_BIAS_16X16: f32 = 0.880;
 const VLQ_BIAS_32X32: f32 = 0.867;
 const VLQ_BIAS_RECT32: f32 = 1.180;
-const VLQ_RERANK_MARGIN: f32 = 0.782;
+const VLQ_RERANK_MARGIN: f32 = 0.7384;
 const VLQ_ACCEPT_64: f32 = 0.973;
 const VLQ_ACCEPT_64_RECT: f32 = 0.736;
 
