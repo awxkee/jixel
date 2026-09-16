@@ -334,6 +334,8 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         speed: base.speed,
         decoding_speed: base.decoding_speed,
         boost: base.boost,
+        // Gain-map channels describe multiplicative gains, not displayed color.
+        color_recovery: false,
         lossy_modular: base.lossy_modular,
         gain_map: None,
     };

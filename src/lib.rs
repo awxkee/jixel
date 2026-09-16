@@ -46,6 +46,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
+mod color_recovery;
 mod dark_aq;
 mod dc_group_data;
 mod dc_smooth;
