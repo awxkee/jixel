@@ -785,35 +785,12 @@ pub(crate) fn dirty_log2p1f(x: f32) -> f32 {
     fmla(t, p, e)
 }
 
-#[inline]
-pub(crate) fn dirty_log1pf(d: f32) -> f32 {
-    const LN_2: f32 = 0.6931471805599453;
-    let ix = (1.0 + d).to_bits();
-    let exponent = ix & 0x7f80_0000;
-    let n = (exponent >> 23) as i32 - 0x7f;
-
-    // Replacing the exponent with 127 normalizes 1+d to 1+t without division.
-    // For n=0 use d itself so tiny inputs do not lose precision in (1+d)-1.
-    let mantissa = f32::from_bits((ix & 0x007f_ffff) | 0x3f80_0000);
-    let t = if n == 0 { d } else { mantissa - 1.0 };
-
-    // Direct minimax ln(1+t) ~= t*P(t), t in [0, 1]. See tools/log1p.sollya.
-    let mut p = 0.014539075084030628;
-    p = fmla(p, t, -0.0675969123840332);
-    p = fmla(p, t, 0.15056970715522766);
-    p = fmla(p, t, -0.23573730885982513);
-    p = fmla(p, t, 0.33125850558280945);
-    p = fmla(p, t, -0.4998837411403656);
-    p = fmla(p, t, 0.999998927116394);
-    fmla(n as f32, LN_2, t * p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         AQ_FADE_END, AQ_FADE_START, AQ_PEAK, AqMapScratch, Image3F, ImageB,
         apply_chroma_hf_protection, apply_chroma_hf_protection_with_stats, aq_dampen,
-        chroma_hf_stats_scalar, dirty_log1pf, dirty_log2f, dirty_log2p1f, fill_quant_field_scalar,
+        chroma_hf_stats_scalar, dirty_log2f, dirty_log2p1f, fill_quant_field_scalar,
         hf_modulation_strength, selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
     };
 
@@ -1049,30 +1026,6 @@ mod tests {
             max_abs < 3.0e-6,
             "max absolute error {max_abs} at x={worst_x}"
         );
-    }
-
-    #[test]
-    fn dirty_log1pf_matches_ln_1p() {
-        assert_eq!(dirty_log1pf(0.0), 0.0);
-        let mut max_abs = 0f32;
-        let mut max_rel = 0f32; // measured only for d >= 0.1
-        let mut x = 1e-5f32;
-        while x <= 5.0e6 {
-            let got = dirty_log1pf(x);
-            let want = x.ln_1p();
-            max_abs = max_abs.max((got - want).abs());
-            if x >= 0.1 {
-                max_rel = max_rel.max((got - want).abs() / want.abs());
-            }
-            x *= 1.05;
-        }
-        assert!(max_abs < 1e-5, "max absolute error {max_abs} too large");
-        assert!(max_rel < 1e-5, "max relative error {max_rel} too large");
-        // A few spot checks against std ln_1p.
-        for &v in &[0.5f32, 1.0, 42.0, 256.0, 1.0e6] {
-            let rel = (dirty_log1pf(v) - v.ln_1p()).abs() / v.ln_1p();
-            assert!(rel < 1e-5, "ln_1p({v}) rel err {rel}");
-        }
     }
 
     #[test]

@@ -111,43 +111,6 @@ fn apply_quant_field_gain_x4(input: uint32x4_t, gain: float32x4_t) -> int32x4_t 
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn apply_quant_field_gain_x8(dest: &mut [u8; 8], gain: float32x4_t) {
-    let bytes = unsafe { vld1_u8(dest.as_ptr()) };
-    let values16 = vmovl_u8(bytes);
-    let low = apply_quant_field_gain_x4(vmovl_u16(vget_low_u16(values16)), gain);
-    let high = apply_quant_field_gain_x4(vmovl_high_u16(values16), gain);
-    let packed16 = vcombine_u16(vqmovun_s32(low), vqmovun_s32(high));
-    let packed8 = vqmovn_u16(packed16);
-    unsafe { vst1_u8(dest.as_mut_ptr(), packed8) };
-}
-
-#[target_feature(enable = "neon")]
-pub(crate) fn apply_quant_field_gain_neon(
-    image: &mut crate::image::ImageB,
-    x0: usize,
-    y0: usize,
-    width: usize,
-    height: usize,
-    gain: f32,
-) {
-    let gain = vdupq_n_f32(gain);
-    for y in y0..y0 + height {
-        let values = &mut image.row_mut(y)[x0..x0 + width];
-        let (values8, tail) = values.as_chunks_mut::<8>();
-        for values in values8 {
-            apply_quant_field_gain_x8(values, gain);
-        }
-        if !tail.is_empty() {
-            let mut values = [0u8; 8];
-            values[..tail.len()].copy_from_slice(tail);
-            apply_quant_field_gain_x8(&mut values, gain);
-            tail.copy_from_slice(&values[..tail.len()]);
-        }
-    }
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn apply_structure_aq_x4(
     correction: float32x4_t,
     input: uint32x4_t,

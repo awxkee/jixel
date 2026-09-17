@@ -119,43 +119,6 @@ fn apply_quant_field_gain_x4(input: v128, gain: v128) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn apply_quant_field_gain_x8(source: &mut [u8; 8], gain: v128) {
-    let bytes = unsafe { v128_load64_zero(source.as_ptr().cast()) };
-    let values16 = i16x8_extend_low_u8x16(bytes);
-    let low = apply_quant_field_gain_x4(i32x4_extend_low_u16x8(values16), gain);
-    let high = apply_quant_field_gain_x4(i32x4_extend_high_u16x8(values16), gain);
-    let packed16 = i16x8_narrow_i32x4(low, high);
-    let packed8 = u8x16_narrow_i16x8(packed16, packed16);
-    unsafe { v128_store64_lane::<0>(packed8, source.as_mut_ptr().cast()) };
-}
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn apply_quant_field_gain_wasm(
-    image: &mut crate::image::ImageB,
-    x0: usize,
-    y0: usize,
-    width: usize,
-    height: usize,
-    gain: f32,
-) {
-    let gain = f32x4_splat(gain);
-    for y in y0..y0 + height {
-        let values = &mut image.row_mut(y)[x0..x0 + width];
-        let (values8, tail) = values.as_chunks_mut::<8>();
-        for values in values8 {
-            apply_quant_field_gain_x8(values, gain);
-        }
-        if !tail.is_empty() {
-            let mut values = [0u8; 8];
-            values[..tail.len()].copy_from_slice(tail);
-            apply_quant_field_gain_x8(&mut values, gain);
-            tail.copy_from_slice(&values[..tail.len()]);
-        }
-    }
-}
-
-#[inline]
-#[target_feature(enable = "simd128")]
 fn apply_structure_aq_x4(correction: v128, input: v128, scale: v128, center: v128) -> v128 {
     let delta = f32x4_mul(f32x4_sub(correction, center), scale);
     let clamped = f32x4_max(f32x4_min(delta, f32x4_splat(0.22)), f32x4_splat(-0.18));

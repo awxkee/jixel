@@ -158,39 +158,6 @@ fn store_quant_field_x8(dest: &mut [u8; 8], value: __m256) {
 }
 
 #[inline]
-#[target_feature(enable = "avx2")]
-fn apply_quant_field_gain_x8(dest: &mut [u8; 8], gain: __m256) {
-    let bytes = unsafe { _mm_loadu_si64(dest.as_ptr().cast()) };
-    let value = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)), gain);
-    store_quant_field_x8(dest, value);
-}
-
-#[target_feature(enable = "avx2")]
-pub(crate) fn apply_quant_field_gain_avx2(
-    image: &mut crate::image::ImageB,
-    x0: usize,
-    y0: usize,
-    width: usize,
-    height: usize,
-    gain: f32,
-) {
-    let gain = _mm256_set1_ps(gain);
-    for y in y0..y0 + height {
-        let values = &mut image.row_mut(y)[x0..x0 + width];
-        let (values8, tail) = values.as_chunks_mut::<8>();
-        for values in values8 {
-            apply_quant_field_gain_x8(values, gain);
-        }
-        if !tail.is_empty() {
-            let mut values = [0u8; 8];
-            values[..tail.len()].copy_from_slice(tail);
-            apply_quant_field_gain_x8(&mut values, gain);
-            tail.copy_from_slice(&values[..tail.len()]);
-        }
-    }
-}
-
-#[inline]
 #[target_feature(enable = "avx2,fma")]
 fn apply_structure_aq_x8(
     corrections: &[f32; 8],

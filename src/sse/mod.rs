@@ -30,7 +30,6 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod color;
-mod dark_aq;
 mod dct;
 mod entropy;
 mod inflated_cost;
@@ -49,7 +48,6 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
 pub(crate) use color::color_matrix_shaper_sse41;
-pub(crate) use dark_aq::{dark_structure_stats_sse41, fill_blue_tile_sse41};
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use inflated_cost::{
     combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
@@ -63,8 +61,7 @@ pub(crate) use modular::{
     tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
 };
 pub(crate) use quant::{
-    apply_quant_field_gain_sse41, apply_structure_aq_sse41, quantize_block_ac_sse41,
-    quantize_dc_cfl_sse41, quantize_dc_sse41,
+    apply_structure_aq_sse41, quantize_block_ac_sse41, quantize_dc_cfl_sse41, quantize_dc_sse41,
 };
 pub(crate) use quantize_xyb::{quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41};
 pub(crate) use structure_aq::block_features_sse41;

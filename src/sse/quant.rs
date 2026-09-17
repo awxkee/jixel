@@ -142,39 +142,6 @@ fn store_quant_field_x4(source: &mut [u8; 4], value: __m128) {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn apply_quant_field_gain_x4(source: &mut [u8; 4], gain: __m128) {
-    let bytes = _mm_cvtsi32_si128(i32::from_ne_bytes(*source));
-    let value = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepu8_epi32(bytes)), gain);
-    store_quant_field_x4(source, value);
-}
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn apply_quant_field_gain_sse41(
-    image: &mut crate::image::ImageB,
-    x0: usize,
-    y0: usize,
-    width: usize,
-    height: usize,
-    gain: f32,
-) {
-    let gain = _mm_set1_ps(gain);
-    for y in y0..y0 + height {
-        let values = &mut image.row_mut(y)[x0..x0 + width];
-        let (values4, tail) = values.as_chunks_mut::<4>();
-        for values in values4 {
-            apply_quant_field_gain_x4(values, gain);
-        }
-        if !tail.is_empty() {
-            let mut values = [0u8; 4];
-            values[..tail.len()].copy_from_slice(tail);
-            apply_quant_field_gain_x4(&mut values, gain);
-            tail.copy_from_slice(&values[..tail.len()]);
-        }
-    }
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
 fn apply_structure_aq_x4(
     corrections: &[f32; 4],
     dest: &mut [u8; 4],

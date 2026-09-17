@@ -295,7 +295,6 @@ pub(crate) struct CoderScratch {
     /// Entropy tables allocated on demand; Fast group workers never use them.
     pub(crate) lz_entropy: LazyScratch<Box<LzEntropyScratch>>,
     pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 1024>>,
-    pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: LazyScratch<AcGroupScratch>,
@@ -318,7 +317,7 @@ pub(crate) struct CoderScratch {
 
 impl CoderScratch {
     fn new(reserve_lossy_buffers: bool) -> Self {
-        let (aq_map, structure_corrections, dark_octile, gradient, order0_entropy, threshold) =
+        let (aq_map, structure_corrections, gradient, order0_entropy, threshold) =
             if reserve_lossy_buffers {
                 (
                     AqMapScratch {
@@ -326,7 +325,6 @@ impl CoderScratch {
                         secondary: vec![0.0; 2048 + 512 * 512],
                     },
                     vec![0.0; 256 * 256],
-                    vec![0.0; 32 * 32],
                     GradientScratch {
                         cur: vec![0; 256],
                         prev: vec![0; 256],
@@ -342,7 +340,6 @@ impl CoderScratch {
             } else {
                 (
                     AqMapScratch::default(),
-                    Vec::new(),
                     Vec::new(),
                     GradientScratch::default(),
                     Vec::new(),
@@ -361,7 +358,6 @@ impl CoderScratch {
             lz_candidate: Vec::new(),
             lz_entropy: LazyScratch::default(),
             recon: LazyScratch::new(|| HeapMatrix::new(0.0)),
-            dark_octile,
             huffman_pool: Vec::with_capacity(1024),
             alpha_tokens: Vec::new(),
             ac_group: LazyScratch::default(),
@@ -442,7 +438,6 @@ mod tests {
         assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
         assert_eq!(scratch.aq_map.secondary.capacity(), 0);
         assert_eq!(scratch.structure_corrections.capacity(), 0);
-        assert_eq!(scratch.dark_octile.capacity(), 0);
         assert_eq!(scratch.gradient.cur.capacity(), 0);
         assert_eq!(scratch.gradient.prev.capacity(), 0);
         assert_eq!(scratch.gradient.prev_prev.capacity(), 0);

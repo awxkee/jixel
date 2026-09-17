@@ -333,7 +333,6 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         num_threads: base.num_threads,
         speed: base.speed,
         decoding_speed: base.decoding_speed,
-        boost: base.boost,
         lossy_modular: base.lossy_modular,
         gain_map: None,
     };

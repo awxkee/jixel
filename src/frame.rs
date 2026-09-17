@@ -2693,26 +2693,6 @@ fn setup_dc_group(
         1.0 / distp.scale,
     );
 
-    // Apply perceptual AQ before transform selection. Candidate costs and the
-    // reconstruction rerank must see the same content-adaptive quant field that
-    // will ultimately be used for coefficient coding. `fill_ac_strategy` applies
-    // the transform-size adjustment to this field after selection.
-    if let Some(boost) = ctx.boost.as_ref() {
-        crate::dark_aq::apply_boost(
-            &mut scratch.dark_octile,
-            boost,
-            opsin,
-            &mut dc_data.raw_quant_field,
-            dc_group_x0,
-            dc_group_y0,
-            distp.distance,
-            ctx.b_heavy(),
-            ctx.apply_quant_field_gain,
-            ctx.dark_structure_stats,
-            ctx.fill_blue_tile,
-        );
-    }
-
     if ctx.speed == Speed::Slow {
         crate::structure_aq::apply(
             &mut scratch.structure_corrections,

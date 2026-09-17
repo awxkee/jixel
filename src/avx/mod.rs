@@ -31,7 +31,6 @@ mod adaptive_quant;
 mod afv;
 mod cfl;
 mod color;
-mod dark_aq;
 mod dct;
 mod entropy;
 mod frame;
@@ -56,7 +55,6 @@ pub(crate) use cfl::{
     cfl_regression_avx2,
 };
 pub(crate) use color::color_matrix_shaper_avx2;
-pub(crate) use dark_aq::{dark_structure_stats_avx2, fill_blue_tile_avx2};
 pub(crate) use dct::{
     dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
     dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct2x2_8x8_avx2, dct4x4_avx2, dct4x8_avx2,
@@ -79,8 +77,7 @@ pub(crate) use modular::{
     tokenize_alpha_u16_first_row_avx2, tokenize_alpha_u16_interior_avx2,
 };
 pub(crate) use quant::{
-    apply_quant_field_gain_avx2, apply_structure_aq_avx2, quantize_block_ac_avx2, quantize_dc_avx2,
-    quantize_dc_cfl_avx2,
+    apply_structure_aq_avx2, quantize_block_ac_avx2, quantize_dc_avx2, quantize_dc_cfl_avx2,
 };
 pub(crate) use quantize_xyb::{quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2};
 pub(crate) use structure_aq::block_features_avx2;

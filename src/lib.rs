@@ -46,7 +46,6 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
-mod dark_aq;
 mod dc_group_data;
 mod dc_smooth;
 mod dc_tree;
@@ -91,7 +90,6 @@ mod yellow_opsin;
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
-pub use dark_aq::{DarkAq, DarkAqConfig};
 pub use encode_image::{
     DecodingSpeed, EncodeConfig, LossyModular, Speed, distance_from_quality, encode_image,
     encode_image_10bit, encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32,

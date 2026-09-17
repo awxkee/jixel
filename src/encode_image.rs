@@ -32,7 +32,6 @@ use crate::color::{
     ColorTransform, FloatTransferDecoder, RgbBlockTransform, TransferDecoder, TransferLut,
 };
 use crate::color_encoding::write_color_encoding_with_icc;
-use crate::dark_aq::DarkAqConfig;
 use crate::encoding_context::EncodingContext;
 use crate::frame::encode_frame;
 use crate::gain_map::{EncodedGainMap, GainMap, encode_gain_map};
@@ -328,10 +327,6 @@ pub struct EncodeConfig {
     /// Decode-speed/density tradeoff for lossless encoding (see
     /// [`DecodingSpeed`]). Ignored for lossy.
     pub decoding_speed: DecodingSpeed,
-    /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
-    /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
-    /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
-    pub boost: Option<DarkAqConfig>,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
     /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
@@ -395,8 +390,6 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) speed: Speed,
     /// Decode-speed/density tradeoff for lossless (see `EncodeConfig::decoding_speed`).
     pub(crate) decoding_speed: DecodingSpeed,
-    /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
-    pub(crate) dark_aq: Option<DarkAqConfig>,
     /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
     pub(crate) gain_map: Option<EncodedGainMap>,
 }
@@ -425,7 +418,6 @@ impl Default for EncodeConfig {
                 .get(),
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
-            boost: Some(DarkAqConfig::default()),
             lossy_modular: LossyModular::Off,
             gain_map: None,
         }
@@ -459,7 +451,6 @@ impl Default for EncodeConfigImpl {
                 .get(),
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
-            dark_aq: Some(DarkAqConfig::default()),
             gain_map: None,
         }
     }
@@ -551,12 +542,6 @@ impl EncodeConfigImpl {
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
             .with_decoding_speed(config.decoding_speed)
-            .with_boost(config.boost)
-    }
-
-    pub(crate) fn with_boost(mut self, boost: Option<DarkAqConfig>) -> Self {
-        self.dark_aq = boost;
-        self
     }
 
     pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
@@ -614,19 +599,6 @@ impl EncodeConfig {
     /// See [`distance_from_quality`] for the mapping.
     pub fn with_quality(self, quality: f32) -> Self {
         self.with_distance(distance_from_quality(quality))
-    }
-
-    /// Enable superblock Variance-Boost / Dark-AQ quant-field modulation (lossy only).
-    /// [`DarkAqConfig::default`] is the validated Dark-AQ preset. See [`DarkAqConfig`].
-    pub fn with_dark_aq_config(mut self, boost: DarkAqConfig) -> Self {
-        self.boost = Some(boost);
-        self
-    }
-
-    /// Enable Dark-AQ with the validated defaults (equivalent to
-    /// `with_boost(BoostCfg::default())`).
-    pub fn with_dark_aq(self) -> Self {
-        self.with_dark_aq_config(DarkAqConfig::default())
     }
 
     /// Replace the color encoding (white point / primaries / transfer / intent).
@@ -795,7 +767,7 @@ fn lossy_context(
     } else {
         config.num_threads
     };
-    let mut ctx = EncodingContext::new(config.speed, config.boost, xyb, distance, num_threads);
+    let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
     ctx
 }

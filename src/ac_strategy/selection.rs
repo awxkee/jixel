@@ -2005,13 +2005,7 @@ mod tests {
 
     #[test]
     fn hue_protection_survives_coarse_quantization_only_for_chroma_structure() {
-        let ctx = EncodingContext::new(
-            crate::Speed::Slow,
-            None,
-            crate::xyb::XybMatrix::SPEC,
-            2.0,
-            1,
-        );
+        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 2.0, 1);
         let alpha = |distance| super::rerank_rgb_hue_alpha(&ctx, distance);
         for distance in [1.0, 2.0, 3.0, 4.0, 10.0] {
             assert_eq!(alpha(distance), 0.0);
@@ -2034,7 +2028,6 @@ mod tests {
         for bias in [crate::xyb::B_BIAS, 0.85] {
             let ctx = EncodingContext::new(
                 crate::Speed::Slow,
-                None,
                 crate::yellow_opsin::matrix_for_bias(bias),
                 1.0,
                 1,
@@ -2110,13 +2103,7 @@ mod tests {
 
     #[test]
     fn boundary_error_energy_detects_artificial_block_seams() {
-        let ctx = EncodingContext::new(
-            crate::Speed::Slow,
-            None,
-            crate::xyb::XybMatrix::SPEC,
-            1.0,
-            1,
-        );
+        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 1.0, 1);
         let mut opsin = Image3F::new(16, 8);
         let smooth = [[0.0f32; 1024]; 3];
         assert_eq!(
@@ -2265,13 +2252,7 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new(
-            crate::Speed::Fast,
-            None,
-            crate::xyb::XybMatrix::SPEC,
-            1.0,
-            1,
-        );
+        let ctx = EncodingContext::new(crate::Speed::Fast, crate::xyb::XybMatrix::SPEC, 1.0, 1);
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);

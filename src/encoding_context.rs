@@ -28,7 +28,6 @@
  */
 
 use crate::afv;
-use crate::dark_aq::{self, DarkAqConfig};
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
 use crate::{
@@ -59,7 +58,6 @@ pub(crate) struct EncodingContext {
     pub(crate) speed: Speed,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
-    pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) xyb: xyb::XybMatrix,
     /// Cached with the matrix, including a later adaptive yellow selection.
     channel_weights: [f32; 3],
@@ -88,9 +86,6 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_block_ac: group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: group::QuantizeDcFn,
     pub(crate) quantize_dc_cfl: group::QuantizeDcCflFn,
-    pub(crate) apply_quant_field_gain: dark_aq::ApplyQuantFieldGainFn,
-    pub(crate) dark_structure_stats: dark_aq::DarkStructureStatsFn,
-    pub(crate) fill_blue_tile: dark_aq::FillBlueTileFn,
     pub(crate) block_features: structure_aq::BlockFeaturesFn,
     pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
@@ -232,7 +227,6 @@ impl EncodingContext {
 
     pub(crate) fn new(
         speed: Speed,
-        boost: Option<DarkAqConfig>,
         xyb: xyb::XybMatrix,
         distance: f32,
         num_threads: usize,
@@ -249,7 +243,6 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             lossy_modular: crate::LossyModular::Off,
-            boost,
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
@@ -285,9 +278,6 @@ impl EncodingContext {
             quantize_block_ac: group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
             quantize_dc_cfl: quantize_dc.quantize_cfl,
-            apply_quant_field_gain: dark_aq::select_apply_quant_field_gain_fn(),
-            dark_structure_stats: dark_aq::select_dark_structure_stats_fn(),
-            fill_blue_tile: dark_aq::select_fill_blue_tile_fn(),
             block_features: structure_aq::select_block_features_fn(),
             apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
@@ -337,7 +327,7 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, None, xyb::XybMatrix::SPEC, 1.0, 1)
+        Self::new(Speed::Fast, xyb::XybMatrix::SPEC, 1.0, 1)
     }
 }
 
@@ -348,7 +338,7 @@ mod tests {
     #[test]
     fn hue_tables_require_the_frame_content_gate() {
         use super::{DequantMatrices, EncodingContext, Speed, xyb};
-        let ctx = EncodingContext::new(Speed::Slow, None, xyb::XybMatrix::SPEC, 1.0, 1);
+        let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, 1.0, 1);
         assert!(std::ptr::eq(ctx.matrices(), DequantMatrices::new(1.0)));
         ctx.set_chroma_heavy(true);
         assert!(std::ptr::eq(
@@ -386,7 +376,7 @@ mod tests {
     #[test]
     fn adaptive_matrix_updates_cached_coarse_weights() {
         use super::{EncodingContext, Speed, xyb};
-        let mut ctx = EncodingContext::new(Speed::Slow, None, xyb::XybMatrix::SPEC, 2.0, 1);
+        let mut ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, 2.0, 1);
         assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
         let matrix = crate::yellow_opsin::matrix_for_bias(0.90);
         ctx.set_xyb_matrix(matrix, 2.0, false);
