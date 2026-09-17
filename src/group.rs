@@ -204,6 +204,12 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
     1.0 + strength * (1.0 - scan_position).powi(2)
 }
 
+#[inline]
+fn rdoq_lambda(qf_ratio: f32) -> f32 {
+    const BASE: f32 = 1.25;
+    crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
     prices: &FrozenTokenPrices,
@@ -220,10 +226,11 @@ fn rdoq_block(
     cy: usize,
     distance: f32,
     qf_hi: bool,
+    qf_ratio: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    const RDOQ_LAMBDA: f32 = crate::ac_strategy::RD_LAMBDA * 0.25;
+    let lambda = rdoq_lambda(qf_ratio);
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -267,7 +274,7 @@ fn rdoq_block(
         let mut k = search_end;
         while k < block.len() && remaining != 0 {
             let coef = block[scan[k] as usize];
-            *target += RDOQ_LAMBDA
+            *target += lambda
                 * prices.token_bits(Token::new(context(remaining, k, prev), pack_signed(coef)));
             prev = usize::from(coef != 0);
             remaining -= usize::from(coef != 0);
@@ -339,7 +346,7 @@ fn rdoq_block(
                     [0.0; 2]
                 } else {
                     let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
-                    [RDOQ_LAMBDA * bits[0], RDOQ_LAMBDA * bits[1]]
+                    [lambda * bits[0], lambda * bits[1]]
                 };
                 let state = remaining * 2;
                 let cost0 = distortion + token_cost[0] + tail;
@@ -369,7 +376,7 @@ fn rdoq_block(
         if !tail.is_finite() {
             continue;
         }
-        let cost = tail + RDOQ_LAMBDA * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
+        let cost = tail + lambda * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
         if cost < best_cost {
             best_cost = cost;
             best_remaining = remaining;
@@ -1157,6 +1164,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1369,6 +1377,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1455,6 +1464,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1706,6 +1716,7 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
+                    [0.5, 1.0, 1.2, 2.0][case % 4],
                     choices,
                     costs,
                 );
