@@ -332,14 +332,6 @@ pub struct EncodeConfig {
     /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
     /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
     pub boost: Option<DarkAqConfig>,
-    /// Experimental recovery of color detail with joint Y/X/B coefficient changes.
-    /// Defaults to false. Applies to chromatic DCT8 blocks in single-pass lossy
-    /// VarDCT with [`Speed::Slow`] and distance 1.5..=24, using sRGB/D65 primaries
-    /// and sRGB or linear transfer, without an explicit `intensity_target`.
-    /// Other configurations ignore this setting. The objective assumes SDR
-    /// samples and may increase encode time, file size, and perceptual scores
-    /// such as Butteraugli even when it restores lost saturation.
-    pub color_recovery: bool,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
     /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
@@ -434,7 +426,6 @@ impl Default for EncodeConfig {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
-            color_recovery: false,
             lossy_modular: LossyModular::Off,
             gain_map: None,
         }
@@ -638,13 +629,6 @@ impl EncodeConfig {
         self.with_dark_aq_config(DarkAqConfig::default())
     }
 
-    /// Enable or disable experimental color recovery (default off).
-    /// See [`EncodeConfig::color_recovery`] for supported inputs and tradeoffs.
-    pub fn with_color_recovery(mut self, enabled: bool) -> Self {
-        self.color_recovery = enabled;
-        self
-    }
-
     /// Replace the color encoding (white point / primaries / transfer / intent).
     pub fn with_color_encoding(mut self, enc: ColorEncoding) -> Self {
         self.color_encoding = enc;
@@ -813,16 +797,6 @@ fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, config.boost, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
-    // The recovery objective is clipped SDR sRGB, not an HDR or wide-gamut
-    // display model. Linear sRGB samples use the same display objective.
-    ctx.color_recovery = config.color_recovery
-        && config.color_encoding.primaries == crate::Primaries::Bt709
-        && config.color_encoding.white_point == crate::WhitePoint::D65
-        && matches!(
-            config.color_encoding.transfer,
-            crate::TransferFunction::Srgb | crate::TransferFunction::Linear
-        )
-        && config.intensity_target.is_none();
     ctx
 }
 
@@ -2866,69 +2840,6 @@ mod encode_smoke_tests {
                 .with_distance(3.0)
                 .with_speed(Speed::Slow),
         ));
-    }
-
-    #[test]
-    fn color_recovery_changes_output_deterministically() {
-        // Cross an AC-group boundary so the threaded encode also exercises
-        // independent groups sharing the cached inverse-DCT basis. Saturated
-        // yellow-orange noise that stays inside 0..255: the search ranks moves
-        // by a displayed-RGB gradient, which vanishes on clipped channels.
-        const WIDTH: usize = 257;
-        const HEIGHT: usize = 17;
-        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                pixels.push((180 + (x * 7 + y * 13) % 40) as u8);
-                pixels.push((140 + (x * 11 + y * 3) % 50) as u8);
-                pixels.push((30 + (x * 5 + y * 17) % 40) as u8);
-            }
-        }
-        let config = EncodeConfig::default()
-            .with_distance(3.0)
-            .with_speed(Speed::Slow)
-            .with_num_threads(1)
-            .with_color_recovery(false);
-        let baseline = encode_image(&pixels, WIDTH, HEIGHT, &config).unwrap();
-        let config = config.with_color_recovery(true);
-        let recovered = encode_image(&pixels, WIDTH, HEIGHT, &config).unwrap();
-        assert_ne!(baseline, recovered, "the opt-in must reach AC refinement");
-        assert_eq!(
-            recovered,
-            encode_image(&pixels, WIDTH, HEIGHT, &config.with_num_threads(4)).unwrap()
-        );
-    }
-
-    #[test]
-    fn color_recovery_ignores_unsupported_configurations() {
-        let config = EncodeConfig::default()
-            .with_distance(3.0)
-            .with_speed(Speed::Slow)
-            .with_num_threads(1)
-            .with_color_recovery(false);
-        let pixels = rgb8();
-        for config in [
-            config.clone().with_speed(Speed::Fast),
-            config.clone().with_speed(Speed::Fastest),
-            config.clone().with_distance(1.0),
-            config.clone().with_distance(25.0),
-            config.clone().with_progressive(true),
-            config.clone().with_lossless(true),
-            config
-                .clone()
-                .with_color_encoding(ColorEncoding::display_p3()),
-            config
-                .clone()
-                .with_color_encoding(ColorEncoding::bt2020_pq()),
-            config
-                .clone()
-                .with_color_encoding(ColorEncoding::bt2020_hlg()),
-            config.with_intensity_target(1000.0),
-        ] {
-            let baseline = encode_image(&pixels, W, H, &config).unwrap();
-            let recovered = encode_image(&pixels, W, H, &config.with_color_recovery(true)).unwrap();
-            assert_eq!(baseline, recovered);
-        }
     }
 
     #[test]

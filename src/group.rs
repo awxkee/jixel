@@ -197,36 +197,6 @@ fn rdoq_candidates(ideal: f32, current: i32) -> ([i32; 5], usize) {
     (candidates, len)
 }
 
-/// Token cost in bits of one channel of an 8x8 block under frozen prices,
-/// following the tokenizer exactly: nonzero-count token, then per-coefficient
-/// tokens in scan order with the zero-density contexts.
-pub(crate) fn block_bits_8x8(
-    prices: &FrozenTokenPrices,
-    scan: &[u32],
-    block: &[i32],
-    block_ctx: u32,
-    predicted: u8,
-) -> f32 {
-    let nzeros = num_nonzero_except_dc(block.first_chunk::<64>().unwrap());
-    let mut bits = prices.token_bits(Token::new(
-        fine_non_zero_context(predicted as u32, block_ctx),
-        nzeros as u32,
-    ));
-    let histo_offset = fine_zero_density_contexts_offset(block_ctx) as usize;
-    let mut prev: usize = if nzeros as usize > 64 / 16 { 0 } else { 1 };
-    let mut remaining = nzeros as usize;
-    let mut k = 1;
-    while k < 64 && remaining != 0 {
-        let coef = block[scan[k] as usize];
-        let ctx = histo_offset + zero_density_context_8x8(remaining, k, prev);
-        bits += prices.token_bits(Token::new(ctx as u32, pack_signed(coef)));
-        prev = usize::from(coef != 0);
-        remaining -= prev;
-        k += 1;
-    }
-    bits
-}
-
 #[inline]
 fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32) -> f32 {
     let scan_position = window_index as f32 / window_len.max(1) as f32;
@@ -1527,63 +1497,6 @@ pub(crate) fn write_ac_group(
                     chroma_distortion =
                         fmla(ctx.channel_weight(2), error * error, chroma_distortion);
                 }
-            }
-
-            // Recover displayed color after RDOQ. Y changes propagate through
-            // both CfL predictors; tokenize the resulting Y/X/B levels below.
-            if ctx.color_recovery
-                && distance >= crate::color_recovery::MIN_DISTANCE
-                && raw_strategy == STRATEGY_DCT
-                && coeff_shifts == [0]
-                && let Some(prices) = rdoq_prices
-            {
-                let strategy = dc_data.ac_strategy.strategy_code(global_bx, global_by);
-                // Frozen-price cost of the block's three channels, so moves
-                // are charged the bits the trellis would charge them.
-                let qf_hi = quant_ac as u32 > qf_threshold;
-                let nzero_map = &num_nzeros[0];
-                let channel: [(&[u32], u32, u8); 3] = std::array::from_fn(|c| {
-                    let row_top = (nz_by != 0).then(|| nzero_map.plane_row(c, nz_by - 1));
-                    (
-                        coeff_orders.scan_for(strategy, c),
-                        fine_block_context(c, strategy, qf_hi),
-                        predict_from_top_and_left(row_top, nzero_map.plane_row(c, nz_by), bx, 32),
-                    )
-                });
-                let bits = |q: &[[i32; 4096]; 3]| -> f32 {
-                    (0..3)
-                        .map(|c| block_bits_8x8(prices, channel[c].0, &q[c][..64], channel[c].1, channel[c].2))
-                        .sum()
-                };
-                let ydc = y_dc_q[0] as f32 / inv_factor[1];
-                let xdc = quant_dc.plane_row(0, global_by - qorigin_y)[global_bx - qorigin_x]
-                    as f32
-                    / inv_factor[0];
-                let bdc = chroma_dc_q[0] as f32 / inv_factor[2]
-                    + ydc * (1. + ytob_dc as f32 / crate::color_correlation::K_COLOR_FACTOR);
-                crate::color_recovery::refine(
-                    ctx,
-                    opsin,
-                    opsin_bx,
-                    opsin_by,
-                    coeffs,
-                    source_y,
-                    quantized,
-                    [inv_qm_x, inv_qm_y, inv_qm_b],
-                    [
-                        quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
-                        scale * quant_ac as f32,
-                        quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
-                    ],
-                    [x_factor, b_factor],
-                    [
-                        dc_vals[0][0] - xdc,
-                        dc_vals[1][0] - ydc,
-                        dc_vals[2][0] - bdc,
-                    ],
-                    coeff_orders.scan_for(strategy, 2),
-                    &bits,
-                );
             }
 
             // ---- Tokenize in order Y, X, B ----

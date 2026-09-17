@@ -59,7 +59,6 @@ pub(crate) struct EncodingContext {
     pub(crate) speed: Speed,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
-    pub(crate) color_recovery: bool,
     pub(crate) boost: Option<DarkAqConfig>,
     pub(crate) xyb: xyb::XybMatrix,
     /// Cached with the matrix, including a later adaptive yellow selection.
@@ -250,7 +249,6 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             lossy_modular: crate::LossyModular::Off,
-            color_recovery: false,
             boost,
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
