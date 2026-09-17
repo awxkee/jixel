@@ -64,12 +64,12 @@ use crate::weighted_predictor::{WpNeighbors, WpParams, WpState, write_wp_header}
 use crate::xyb::quantize_xyb_channels;
 pub(crate) use lz77::LzToken;
 use lz77::{
-    LZ77_MIN_SYMBOL, RunLzWriter, build_lz_pixel_code, build_lz_pixel_code_threads,
+    ConstantTail, LZ77_MIN_SYMBOL, RunLzWriter, build_lz_pixel_code, build_lz_pixel_code_tails,
     estimate_coded_bits, estimate_literal_and_run_bits, estimate_literal_and_run_bits_single,
     estimate_streams_bits, lz77_compress_channels_for_speed,
     lz77_compress_channels_for_speed_with_depth, lz77_compress_for_speed,
-    lz77_compress_for_speed_with_depth, lz77_run_count, write_local_tree_lz77, write_lz_section,
-    write_tree_lz77,
+    lz77_compress_for_speed_with_depth, lz77_run_count, write_local_tree_lz77,
+    write_local_tree_lz77_offsets, write_lz_section, write_lz_section_tail, write_tree_lz77,
 };
 use palette::{
     PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
@@ -223,7 +223,7 @@ pub(crate) fn write_single_channel_lz77_section(
 ) -> bool {
     if tokens
         .iter()
-        .any(|t| crate::entropy::uint_encode(t.value).0 >= LZ77_MIN_SYMBOL)
+        .any(|t| uint_encode(t.value).0 >= LZ77_MIN_SYMBOL)
     {
         return false;
     }
@@ -257,8 +257,11 @@ pub(crate) fn write_single_channel_lz77_section(
 
 /// Independent streams share frozen entropy tables but retain their own ANS
 /// state. Bound simultaneous staging memory as well as the worker count.
+/// `tails`: one `ConstantTail` per group after its tokens, or empty.
+#[allow(clippy::too_many_arguments)]
 fn write_lz_groups(
     groups: &[Vec<LzToken>],
+    tails: &[ConstantTail],
     code: &crate::entropy::EntropyCode<'_>,
     distance_context: u32,
     min_symbol: u32,
@@ -268,6 +271,7 @@ fn write_lz_groups(
 ) {
     write_lz_groups_with_header(
         groups,
+        tails,
         code,
         distance_context,
         min_symbol,
@@ -281,8 +285,10 @@ fn write_lz_groups(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_lz_groups_with_header(
     groups: &[Vec<LzToken>],
+    tails: &[ConstantTail],
     code: &crate::entropy::EntropyCode<'_>,
     distance_context: u32,
     min_symbol: u32,
@@ -291,6 +297,7 @@ fn write_lz_groups_with_header(
     write_header: impl Fn(usize, &mut BitWriter) + Sync,
 ) {
     debug_assert_eq!(groups.len(), sections.len());
+    debug_assert!(tails.is_empty() || tails.len() == groups.len());
     let max_staging = if code.use_prefix_code {
         0
     } else {
@@ -308,7 +315,15 @@ fn write_lz_groups_with_header(
         .min(sections.len());
     let write_group = |i: usize, section: &mut BitWriter| {
         write_header(i, section);
-        write_lz_section(&groups[i], distance_context, code, min_symbol, section);
+        let tail = tails.get(i).copied().unwrap_or(ConstantTail::NONE);
+        write_lz_section_tail(
+            &groups[i],
+            tail,
+            distance_context,
+            code,
+            min_symbol,
+            section,
+        );
         section.zero_pad_to_byte();
     };
     if lanes <= 1 {
@@ -537,6 +552,19 @@ fn lossless_min_symbol(max_bits: u32) -> u32 {
     }
 }
 
+/// The value of a solid alpha plane (every sample equal), else `None`.
+fn constant_alpha_value(alpha: &AlphaPlane) -> Option<i32> {
+    fn constant_of<T: Copy + PartialEq>(data: &[T]) -> Option<T> {
+        let (&first, rest) = data.split_first()?;
+        rest.iter().all(|&v| v == first).then_some(first)
+    }
+    match alpha {
+        AlphaPlane::U8(data) => constant_of(data).map(i32::from),
+        AlphaPlane::U16 { data, .. } => constant_of(data).map(i32::from),
+        AlphaPlane::F32(data) => constant_of(data),
+    }
+}
+
 /// First-stage learned-tree estimate of a frame's pixel bits: the ranking
 /// stage's coarse learn (32 leaves, YCoCg planes, default WP preset, 1024-px
 /// layout), or `None` when no tree beats the flat coder there. Frames of one
@@ -552,7 +580,13 @@ fn coarse_frame_bits(
     scratch: &mut CoderScratch,
 ) -> Option<f64> {
     let (xsize, ysize) = (linear.xsize(), linear.ysize());
-    let source = rgb_ma_source(linear, alpha, xsize, 6);
+    let source = rgb_ma_source(
+        linear,
+        alpha,
+        xsize,
+        6,
+        alpha.and_then(constant_alpha_value),
+    );
     let stage = rank_coarse(
         &source,
         xsize,
@@ -632,6 +666,14 @@ fn encode_frame_lossless_core_impl(
     let xsize = linear.xsize();
     let ysize = linear.ysize();
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
+    // A solid alpha plane is coded as a constant channel (Zero predictor,
+    // offset = the value, one-symbol histogram): no bits, no predictor and
+    // no context-tree work in the decoder, which otherwise ran the Weighted
+    // Predictor over the whole plane.
+    let alpha_constant = alpha.and_then(constant_alpha_value);
+    // Channels that carry samples: size gates treat a solid-alpha image as
+    // its color image.
+    let coded_chans = num_color + usize::from(alpha.is_some() && alpha_constant.is_none());
 
     let xsize_groups = xsize.div_ceil(GROUP_DIM);
     let ysize_groups = ysize.div_ceil(GROUP_DIM);
@@ -863,7 +905,7 @@ fn encode_frame_lossless_core_impl(
         let mut pal_wp = wp_params;
         if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
             let rgb_stage = {
-                let source = rgb_ma_source(linear, alpha, xsize, rct_type);
+                let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
                 rank_coarse(
                     &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
                 )
@@ -883,17 +925,17 @@ fn encode_frame_lossless_core_impl(
             if rgb_stage.as_ref().is_some_and(|stage| {
                 stage.candidate.est_real
                     >= DENSE_FINAL_MIN_BITS_PER_VALUE
-                        * source_values_of(xsize, ysize, nb_chans) as f64
+                        * source_values_of(xsize, ysize, coded_chans) as f64
             }) {
                 final_sampling = (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
             }
             rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
             rank_pal = pal_stage.is_some() && pal_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
 
-            let rank_more = source_values_of(xsize, ysize, nb_chans) >= RANK_MIN_VALUES;
+            let rank_more = source_values_of(xsize, ysize, coded_chans) >= RANK_MIN_VALUES;
             if rank_rgb && rank_more {
                 let (mut best_bits, mut best_coarse, params) = {
-                    let source = rgb_ma_source(linear, alpha, xsize, rct_type);
+                    let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
                     rank_presets(
                         &source,
                         xsize,
@@ -914,8 +956,13 @@ fn encode_frame_lossless_core_impl(
                 {
                     let planes =
                         (runner_up != 6).then(|| rct_planes_fn(ycocg, xsize, ysize, runner_up));
-                    let source =
-                        rgb_ma_source(planes.as_ref().unwrap_or(ycocg), alpha, xsize, runner_up);
+                    let source = rgb_ma_source(
+                        planes.as_ref().unwrap_or(ycocg),
+                        alpha,
+                        xsize,
+                        runner_up,
+                        alpha_constant,
+                    );
                     if let Some(stage) = rank_coarse(
                         &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
                     ) && stage.candidate.est_real + header_bits(wp_params)
@@ -974,14 +1021,14 @@ fn encode_frame_lossless_core_impl(
         // layout only: the 256 layout's first stage costs a sampling pass and
         // its full learn doubles the frame's learning time.
         let rgb_layouts: &[GroupLayout] = if slow_layouts
-            && source_values_of(xsize, ysize, nb_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
+            && source_values_of(xsize, ysize, coded_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
         {
             &[GroupLayout::LARGE]
         } else {
             layouts
         };
         let (layout, rgb_coarse_est, mut learned_tree_decisive, skip_alternatives) = {
-            let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type);
+            let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
             let mut learned_estimated_savings: Option<f64> = None;
             let learned = if rank_rgb {
                 learn_best_layout(
@@ -1143,7 +1190,7 @@ fn encode_frame_lossless_core_impl(
                 // (a UI screen: 60%; a screen-content photo mosaic: 44%,
                 // where the complete frame then loses anyway).
                 if covered * 2 >= xsize * ysize {
-                    let mixed = mixed_ma_source(ycocg, alpha, xsize, &palettes);
+                    let mixed = mixed_ma_source(ycocg, alpha, xsize, &palettes, alpha_constant);
                     let stage = learn_ma_candidate(
                         &mixed,
                         xsize,
@@ -1152,7 +1199,7 @@ fn encode_frame_lossless_core_impl(
                         min_symbol,
                         wp_params,
                         use_wp,
-                        MA_MAX_LEAVES,
+                        mixed.max_leaves(),
                         final_sampling.0,
                         final_sampling.1,
                         pool,
@@ -1172,7 +1219,7 @@ fn encode_frame_lossless_core_impl(
                             stage,
                             min_symbol,
                             use_wp,
-                            MA_MAX_LEAVES,
+                            mixed.max_leaves(),
                             pool,
                             scratch,
                         );
@@ -1234,12 +1281,30 @@ fn encode_frame_lossless_core_impl(
     // Contiguous per-modular-channel predictors: the `num_color` color channels
     // (Y for gray; Y/Co/Cg for color) followed by alpha. For 3-color this is just
     // predictors[..nb_chans]; for gray it is [Y_pred, (alpha_pred)].
-    let chan_preds: Vec<u32> = {
+    let mut chan_preds: Vec<u32> = {
         let mut v: Vec<u32> = (0..num_color).map(|c| predictors[c]).collect();
         if alpha.is_some() {
             v.push(predictors[3]);
         }
         v
+    };
+    // A solid alpha plane: Zero predictor with the value as the leaf offset
+    // (the predictor search's tie-break would pick the Weighted Predictor,
+    // which the decoder then runs over the whole plane) and no tokens; its
+    // channel is a constant tail of every stream (see `ConstantTail`).
+    let mut chan_offsets = vec![0i32; nb_chans];
+    if let Some(value) = alpha_constant {
+        chan_preds[nb_chans - 1] = 0;
+        chan_offsets[nb_chans - 1] = value;
+    }
+    let flat_tail = |w: usize, h: usize| -> ConstantTail {
+        match alpha_constant {
+            Some(_) => ConstantTail {
+                context: channel_to_context(nb_chans - 1, nb_chans),
+                count: w * h,
+            },
+            None => ConstantTail::NONE,
+        }
     };
 
     // Context tree (v1): single-group. Splits each channel's entropy context on
@@ -1251,9 +1316,11 @@ fn encode_frame_lossless_core_impl(
             if try_encode_context_tree_single_group(
                 linear,
                 alpha,
+                alpha_constant,
                 xsize,
                 ysize,
                 layout,
+                frame_kind,
                 &predictors,
                 min_symbol,
                 rct_type,
@@ -1267,9 +1334,11 @@ fn encode_frame_lossless_core_impl(
         } else if try_encode_context_tree_multi_group(
             linear,
             alpha,
+            alpha_constant,
             xsize,
             ysize,
             layout,
+            frame_kind,
             &predictors,
             xsize_groups,
             ysize_groups,
@@ -1330,7 +1399,9 @@ fn encode_frame_lossless_core_impl(
                 pool,
                 scratch,
                 wp_params,
+                alpha_constant,
             );
+            let tail = flat_tail(xsize, ysize);
 
             // LZ77 layer: collapse runs of identical tokens into back-references.
             // The distance context is the (nb_chans)-th context, appended after the
@@ -1340,16 +1411,20 @@ fn encode_frame_lossless_core_impl(
                 lz77_compress_channels_for_speed(channel_tokens, distance_ctx, speed, scratch);
 
             // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
-            let code = build_lz_pixel_code(
-                std::iter::once(lz_tokens.as_slice()),
+            let code = build_lz_pixel_code_tails(
+                &[lz_tokens.as_slice()],
+                &[tail],
                 nb_chans,
                 min_symbol,
                 speed == crate::Speed::Slow,
+                false,
+                None,
                 &mut scratch.lz_entropy,
                 &mut scratch.huffman_pool,
             );
-            write_local_tree_lz77(
+            write_local_tree_lz77_offsets(
                 &chan_preds,
+                &chan_offsets,
                 &code,
                 min_symbol,
                 &mut scratch.huffman_pool,
@@ -1357,7 +1432,14 @@ fn encode_frame_lossless_core_impl(
             );
 
             // Emit the LZ77'd token stream.
-            write_lz_section(&lz_tokens, distance_ctx, &code, min_symbol, &mut section);
+            write_lz_section_tail(
+                &lz_tokens,
+                tail,
+                distance_ctx,
+                &code,
+                min_symbol,
+                &mut section,
+            );
             section.zero_pad_to_byte();
 
             // TOC.
@@ -1410,6 +1492,7 @@ fn encode_frame_lossless_core_impl(
                                 pool,
                                 scratch,
                                 wp_params,
+                                alpha_constant,
                             );
                             deep_lz.as_ref().unwrap().with_depth(|depth| {
                                 lz77_compress_channels_for_speed_with_depth(
@@ -1434,27 +1517,40 @@ fn encode_frame_lossless_core_impl(
                                 grad_pack_fn,
                                 scratch,
                                 wp_params,
+                                alpha_constant,
                             )
                         }
                     },
                 )
             };
+            let group_tails: Vec<ConstantTail> = (0..num_ac_groups)
+                .map(|group_index| {
+                    let x0 = (group_index % xsize_groups) * gdim;
+                    let y0 = (group_index / xsize_groups) * gdim;
+                    flat_tail(gdim.min(xsize - x0), gdim.min(ysize - y0))
+                })
+                .collect();
             // ----- Section 0: DC global -----
             if let ModularFrameKind::Patched(references) = frame_kind {
                 write_patch_dictionary(references, alpha.is_some(), scratch, &mut sections[0]);
             }
-            let code = build_lz_pixel_code(
-                group_lz_tokens.iter().map(Vec::as_slice),
+            let group_slices: Vec<&[LzToken]> = group_lz_tokens.iter().map(Vec::as_slice).collect();
+            let code = build_lz_pixel_code_tails(
+                &group_slices,
+                &group_tails,
                 nb_chans,
                 min_symbol,
                 speed == crate::Speed::Slow,
+                false,
+                None,
                 &mut scratch.lz_entropy,
                 &mut scratch.huffman_pool,
             );
             sections[0].write(1, 1); // dc_quant all_default = 1
             sections[0].write(1, 1); // has_tree = 1
-            write_local_tree_lz77(
+            write_local_tree_lz77_offsets(
                 &chan_preds,
+                &chan_offsets,
                 &code,
                 min_symbol,
                 &mut scratch.huffman_pool,
@@ -1482,6 +1578,7 @@ fn encode_frame_lossless_core_impl(
 
             write_lz_groups(
                 &group_lz_tokens,
+                &group_tails,
                 &code,
                 distance_ctx,
                 min_symbol,
@@ -1943,6 +2040,10 @@ const PROP_WP: u32 = 15; // kNumStaticProperties(2) + 13
 enum CtTree {
     Split(u32, i32, Box<CtTree>, Box<CtTree>),
     Leaf(u32, u32),
+    /// A constant channel: Zero predictor with the value as offset, no
+    /// activity split (the WP property would cost the decoder WP state).
+    /// Its three activity tags share the one context.
+    ConstLeaf(i32, u32),
 }
 
 /// BFS-emit the tree (matches libjxl's FIFO tree decode) and return the context
@@ -1963,6 +2064,13 @@ fn emit_ct_tree(root: &CtTree, out: &mut Vec<Token>) -> std::collections::HashMa
             CtTree::Leaf(pred, tag) => {
                 push_leaf(out, *pred);
                 map.insert(*tag, ctx);
+                ctx += 1;
+            }
+            CtTree::ConstLeaf(offset, tag) => {
+                push_leaf_offset(out, 0, *offset);
+                for bucket in 0..3 {
+                    map.insert(*tag + bucket, ctx);
+                }
                 ctx += 1;
             }
         }
@@ -1998,8 +2106,12 @@ fn act_sub(c: u32, pred: u32, t: i32) -> CtTree {
 
 /// Channel-split tree (same shape as build_balanced_tree_tokens) with each
 /// channel-leaf replaced by its activity subtree.
-fn build_context_tree(nb_chans: usize, preds: &[u32], t: &[i32]) -> CtTree {
-    let a = |c: usize| act_sub(c as u32, preds[c], t[c]);
+/// `constant`: the value of a constant last channel, coded as `ConstLeaf`.
+fn build_context_tree(nb_chans: usize, preds: &[u32], t: &[i32], constant: Option<i32>) -> CtTree {
+    let a = |c: usize| match constant {
+        Some(value) if c + 1 == nb_chans => CtTree::ConstLeaf(value, c as u32 * 3),
+        _ => act_sub(c as u32, preds[c], t[c]),
+    };
     match nb_chans {
         1 => a(0),
         2 => CtTree::Split(0, 0, Box::new(a(1)), Box::new(a(0))),
@@ -2880,6 +2992,7 @@ fn finish_ma_candidate(tree: LearnedTree, sample_scale: f64) -> LearnedCandidate
         est_real,
         flat_real,
         estimated_savings,
+        constant_ctx: None,
     }
 }
 
@@ -3134,9 +3247,78 @@ struct LearnedCandidate {
     flat_real: f64,
     /// Estimated fractional saving over the flat path.
     estimated_savings: f64,
+    /// The context of the constant channel's leaf, once `with_constant_channel`
+    /// wrapped the tree (always 0: the leaf is the root's first child).
+    constant_ctx: Option<u32>,
 }
 
 impl LearnedCandidate {
+    /// The tree routed through a channel split whose upper branch is a
+    /// Zero-predictor leaf with offset `value` for channel `chan_id` (the
+    /// last channel of its stream); the learned tree keeps every other
+    /// channel. Leaf contexts shift by one; the new leaf is context 0.
+    fn with_constant_channel(&self, chan_id: u32, value: i32) -> LearnedCandidate {
+        assert!(
+            chan_id >= 1,
+            "a constant channel follows the color channels"
+        );
+        assert!(self.constant_ctx.is_none(), "one constant channel per tree");
+        let mut nodes = Vec::with_capacity(self.tree.nodes.len() + 2);
+        nodes.push(MaNode::Split {
+            prop: 0,
+            val: chan_id as i32 - 1,
+            gt: 1,
+            le: 2,
+        });
+        nodes.push(MaNode::Leaf { pred: 0 });
+        nodes.extend(self.tree.nodes.iter().map(|node| match *node {
+            MaNode::Split { prop, val, gt, le } => MaNode::Split {
+                prop,
+                val,
+                gt: gt + 2,
+                le: le + 2,
+            },
+            leaf @ MaNode::Leaf { .. } => leaf,
+        }));
+        let tree = LearnedTree {
+            nodes,
+            est_bits: self.tree.est_bits,
+            flat_bits: self.tree.flat_bits,
+        };
+        let (mut tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
+        debug_assert_eq!(num_ctx, self.num_ctx + 1);
+        debug_assert_eq!(leaf_ctx[1], 0);
+        let mut leaf_offset = Vec::with_capacity(num_ctx as usize);
+        leaf_offset.push(value);
+        leaf_offset.extend_from_slice(&self.leaf_offset);
+        for (token, &offset) in tree_tokens
+            .iter_mut()
+            .filter(|token| token.context == TREE_CTX_OFFSET)
+            .zip(&leaf_offset)
+        {
+            token.value = pack_signed(offset);
+        }
+        LearnedCandidate {
+            tree,
+            tree_tokens,
+            leaf_ctx,
+            leaf_offset,
+            num_ctx,
+            est_real: self.est_real,
+            flat_real: self.flat_real,
+            estimated_savings: self.estimated_savings,
+            constant_ctx: Some(0),
+        }
+    }
+
+    /// The tail of a `w` x `h` crop of the constant channel.
+    fn constant_tail(&self, w: usize, h: usize) -> ConstantTail {
+        ConstantTail {
+            context: self.constant_ctx.expect("constant channel leaf"),
+            count: w * h,
+        }
+    }
+
     /// Fill offset tokens in BFS context order from the retained offset sample.
     fn set_leaf_offsets<'a>(
         &mut self,
@@ -3162,6 +3344,10 @@ struct MaChannel<'a> {
     /// their size.
     meta: bool,
     pixels: MaPixels<'a>,
+    /// `Some(value)` for a channel whose every sample is `value`: it is
+    /// neither sampled nor tokenized, and the written tree routes it to a
+    /// Zero-predictor leaf with that offset (see `ConstantTail`).
+    constant: Option<i32>,
 }
 
 /// Borrow the original sample representation, including palette indices and
@@ -3240,6 +3426,12 @@ struct MaPlacement {
 }
 
 impl MaSource<'_> {
+    /// Leaf budget of a final learn: the constant channel's leaf, added when
+    /// the tree is written, must fit the context limit too.
+    fn max_leaves(&self) -> usize {
+        MA_MAX_LEAVES - usize::from(self.channels.iter().any(|ch| ch.constant.is_some()))
+    }
+
     /// Split candidates the learner should evaluate for this source.
     fn max_candidates(&self) -> usize {
         match self.transform {
@@ -3303,8 +3495,39 @@ impl MaSource<'_> {
             .collect()
     }
 
+    /// Values the learner samples and the tokenizer codes (constant
+    /// channels have none).
     fn total_values(&self) -> usize {
-        self.channels.iter().map(|c| c.w * c.h).sum()
+        self.channels
+            .iter()
+            .filter(|c| c.constant.is_none())
+            .map(|c| c.w * c.h)
+            .sum()
+    }
+
+    /// The constant channel of this source with its value, if it has one.
+    /// It is the last channel of its stream, so the root channel split of
+    /// `LearnedCandidate::with_constant_channel` isolates it.
+    fn constant_placement<'p>(
+        &self,
+        placement: &'p [MaPlacement],
+    ) -> Option<(&'p MaPlacement, i32)> {
+        let mut found: Option<(&MaPlacement, i32)> = None;
+        for p in placement {
+            if let Some(value) = self.channels[p.channel].constant {
+                assert!(found.is_none(), "one constant channel per source");
+                found = Some((p, value));
+            }
+        }
+        let (p, value) = found?;
+        assert!(
+            placement
+                .iter()
+                .filter(|q| q.global == p.global)
+                .all(|q| q.chan_id <= p.chan_id),
+            "the constant channel is the last of its stream"
+        );
+        Some((p, value))
     }
 
     /// The override of AC group `group_index`, if it has one.
@@ -3369,8 +3592,9 @@ fn mixed_ma_source<'a>(
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
     palettes: &'a [Option<palette::LocalPaletteGroup>],
+    alpha_constant: Option<i32>,
 ) -> MaSource<'a> {
-    let mut source = rgb_ma_source(ycocg, alpha, xsize, 6);
+    let mut source = rgb_ma_source(ycocg, alpha, xsize, 6, alpha_constant);
     source.group_channels = palettes
         .iter()
         .map(|palette| {
@@ -3383,12 +3607,14 @@ fn mixed_ma_source<'a>(
                         h: num_c,
                         meta: true,
                         pixels: MaPixels::I32(&palette.palette),
+                        constant: None,
                     },
                     MaChannel {
                         w: palette.w,
                         h: palette.h,
                         meta: false,
                         pixels: MaPixels::U16(&palette.indices),
+                        constant: None,
                     },
                 ],
                 nb_colors: palette.nb_colors as u32,
@@ -3405,6 +3631,7 @@ fn rgb_ma_source<'a>(
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
     rct_type: u32,
+    alpha_constant: Option<i32>,
 ) -> MaSource<'a> {
     let ysize = linear.ysize();
     let mut channels: Vec<MaChannel<'a>> = (0..3)
@@ -3415,6 +3642,7 @@ fn rgb_ma_source<'a>(
                 h: ysize,
                 meta: false,
                 pixels: MaPixels::I32(pd),
+                constant: None,
             }
         })
         .collect();
@@ -3428,6 +3656,7 @@ fn rgb_ma_source<'a>(
                 AlphaPlane::U16 { data, .. } => MaPixels::U16(data),
                 AlphaPlane::F32(pixels) => MaPixels::I32(pixels),
             },
+            constant: alpha_constant,
         });
     }
     MaSource {
@@ -3441,8 +3670,7 @@ fn rgb_ma_source<'a>(
 const PATCH_MIN_COVERAGE: f64 = 0.05;
 /// A palette candidate whose first complete layout trails the RGB frame's
 /// final estimate by more than `PALETTE_FINAL_MARGIN` times this does not
-/// learn its 256-px layout (worth ~4% on palette graphics, nothing on the
-/// UI screens where the palette loses anyway).
+/// learn its 256-px layout.
 const PALETTE_LAYOUT_MARGIN: f64 = 1.04;
 /// Below this many values (pixels x channels) the WP-preset and RCT
 /// runner-up rankings are skipped: each is a complete learn of the image
@@ -3506,6 +3734,9 @@ fn learn_ma_candidate(
     let mut jobs: Vec<Job> = Vec::new();
     for p in placement.iter().filter(|p| p.global) {
         let ch = &source.channels[p.channel];
+        if ch.constant.is_some() {
+            continue;
+        }
         jobs.push(Job {
             channel: p.channel,
             chan_id: p.chan_id,
@@ -3543,6 +3774,9 @@ fn learn_ma_candidate(
             }
             for p in placement.iter().filter(|p| !p.global) {
                 let ch = &source.channels[p.channel];
+                if ch.constant.is_some() {
+                    continue;
+                }
                 jobs.push(Job {
                     channel: p.channel,
                     chan_id: p.chan_id,
@@ -3712,7 +3946,7 @@ fn learn_best_layout(
             min_symbol,
             wp_params,
             use_wp,
-            MA_MAX_LEAVES,
+            source.max_leaves(),
             sampling.0,
             sampling.1,
             pool,
@@ -3733,7 +3967,14 @@ fn learn_best_layout(
             continue;
         }
         best_coarse_est = best_coarse_est.min(coarse_est);
-        let cand = finish_ma_learn(stage, min_symbol, use_wp, MA_MAX_LEAVES, pool, scratch);
+        let cand = finish_ma_learn(
+            stage,
+            min_symbol,
+            use_wp,
+            source.max_leaves(),
+            pool,
+            scratch,
+        );
         if learned
             .as_ref()
             .is_none_or(|(_, best)| cand.est_real < best.est_real)
@@ -3785,6 +4026,15 @@ fn write_learned_tree_frame(
     let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
     let single_group = num_ac_groups == 1;
     let placement = source.placement(layout, single_group);
+    let constant = source.constant_placement(&placement);
+    let wrapped;
+    let cand = match constant {
+        Some((p, value)) => {
+            wrapped = cand.with_constant_channel(p.chan_id, value);
+            &wrapped
+        }
+        None => cand,
+    };
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let tokenize = |p: &MaPlacement,
@@ -3816,9 +4066,16 @@ fn write_learned_tree_frame(
         let channel_tokens = pool.steal_map(scratch, placement.len(), |i, _scratch| {
             let p = &placement[i];
             let ch = &source.channels[p.channel];
+            if ch.constant.is_some() {
+                return RawTokens::with_capacity(0);
+            }
             let mut tokens = RawTokens::with_capacity(ch.w * ch.h);
             tokenize(p, 0, 0, 0, ch.w, ch.h, &mut tokens);
             tokens
+        });
+        let tail = constant.map_or(ConstantTail::NONE, |(p, _)| {
+            let ch = &source.channels[p.channel];
+            cand.constant_tail(ch.w, ch.h)
         });
         let mut section = with_raw_streams!(channel_tokens, |channel_tokens| {
             let mut tokens = Vec::with_capacity(source.total_values());
@@ -3843,6 +4100,7 @@ fn write_learned_tree_frame(
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
                             &stream,
+                            tail,
                             source,
                             cand,
                             min_symbol,
@@ -3858,6 +4116,7 @@ fn write_learned_tree_frame(
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
                             &stream,
+                            tail,
                             source,
                             cand,
                             min_symbol,
@@ -3887,11 +4146,35 @@ fn write_learned_tree_frame(
     let mut global_tokens = RawTokens::with_capacity(0);
     for p in placement.iter().filter(|p| p.global) {
         let ch = &source.channels[p.channel];
+        if ch.constant.is_some() {
+            continue;
+        }
         tokenize(p, 0, 0, 0, ch.w, ch.h, &mut global_tokens);
     }
-    let has_global_stream = !global_tokens.is_empty();
+    let global_tail = constant
+        .filter(|(p, _)| p.global)
+        .map_or(ConstantTail::NONE, |(p, _)| {
+            let ch = &source.channels[p.channel];
+            cand.constant_tail(ch.w, ch.h)
+        });
+    let has_global_stream = !global_tokens.is_empty() || global_tail.count > 0;
 
-    let group_placement: Vec<&MaPlacement> = placement.iter().filter(|p| !p.global).collect();
+    let group_placement: Vec<&MaPlacement> = placement
+        .iter()
+        .filter(|p| !p.global && source.channels[p.channel].constant.is_none())
+        .collect();
+    let group_constant = constant.filter(|(p, _)| !p.global);
+    let group_tail = |group_index: usize| -> ConstantTail {
+        if source.group_override(group_index).is_some() {
+            return ConstantTail::NONE;
+        }
+        group_constant.map_or(ConstantTail::NONE, |(p, _)| {
+            let ch = &source.channels[p.channel];
+            let x0 = (group_index % xsize_groups) * gdim;
+            let y0 = (group_index / xsize_groups) * gdim;
+            cand.constant_tail(gdim.min(ch.w - x0), gdim.min(ch.h - y0))
+        })
+    };
     let group_tokens: Vec<RawTokens> = pool.steal_map_with_threads(
         scratch,
         num_ac_groups,
@@ -3944,6 +4227,9 @@ fn write_learned_tree_frame(
     let mut all_tokens: Vec<RawTokens> = Vec::with_capacity(1 + num_ac_groups);
     all_tokens.push(global_tokens);
     all_tokens.extend(group_tokens);
+    let tails: Vec<ConstantTail> = std::iter::once(global_tail)
+        .chain((0..num_ac_groups).map(group_tail))
+        .collect();
     let mut sections = with_raw_streams!(all_tokens, |all_tokens| {
         let variants = choose_tree_streams(
             all_tokens,
@@ -3962,6 +4248,7 @@ fn write_learned_tree_frame(
                 TreeStreams::Literals(streams) => {
                     write_learned_grouped_variant(
                         &streams,
+                        &tails,
                         source,
                         cand,
                         min_symbol,
@@ -3980,6 +4267,7 @@ fn write_learned_tree_frame(
                 TreeStreams::Lz(streams) => {
                     write_learned_grouped_variant(
                         &streams,
+                        &tails,
                         source,
                         cand,
                         min_symbol,
@@ -4088,6 +4376,7 @@ fn tokenize_ma_rect(
     out: &mut RawTokens,
 ) {
     let ch = &source.channels[p.channel];
+    debug_assert!(ch.constant.is_none(), "constant channels are tails");
     let lookup = MaLookup::new(&cand.tree, &cand.leaf_ctx, p.chan_id, stream);
     let refs = source.ref_planes(placement, p, x0, y0);
     with_ma_pixels!(ch, |pixels| tokenize_channel_ma(
@@ -4179,8 +4468,12 @@ fn write_local_tree_sections(
         |group_index, scratch| {
             let (x0, y0) = group_rect(group_index);
             let stream = ac_stream_id(num_dc_groups, group_index);
-            let group_values: usize = placement
-                .iter()
+            let sampled = || {
+                placement
+                    .iter()
+                    .filter(|p| source.channels[p.channel].constant.is_none())
+            };
+            let group_values: usize = sampled()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
                     gdim.min(ch.w - x0) * gdim.min(ch.h - y0)
@@ -4190,15 +4483,14 @@ fn write_local_tree_sections(
             if stride > 1 && stride.is_multiple_of(2) {
                 stride += 1;
             }
-            let capacity = placement
-                .iter()
+            let capacity = sampled()
                 .map(|p| {
                     let ch = &source.channels[p.channel];
                     ma_channel_sample_count(gdim.min(ch.w - x0), gdim.min(ch.h - y0), stride)
                 })
                 .sum();
             let mut samples = MaSamples::with_capacity(capacity);
-            for p in placement {
+            for p in sampled() {
                 let ch = &source.channels[p.channel];
                 let gw = gdim.min(ch.w - x0);
                 let gh = gdim.min(ch.h - y0);
@@ -4223,7 +4515,7 @@ fn write_local_tree_sections(
             let max_leaves = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
                 1
             } else {
-                MA_MAX_LEAVES
+                source.max_leaves()
             };
             // Offsets inspect every fourth row in the original order. Keep
             // only those rows; the dense learner can partition the full set
@@ -4253,6 +4545,15 @@ fn write_local_tree_sections(
         },
     );
 
+    let constant = source.constant_placement(placement);
+    let cands: Vec<LearnedCandidate> = match constant {
+        Some((p, value)) => cands
+            .iter()
+            .map(|cand| cand.with_constant_channel(p.chan_id, value))
+            .collect(),
+        None => cands,
+    };
+
     // Tokenize every group through its own tree, then code each group on
     // its own histograms. Retain raw tokens only for active coding lanes.
     let cands_ref = &cands;
@@ -4272,8 +4573,14 @@ fn write_local_tree_sections(
                 })
                 .sum();
             let mut toks = RawTokens::with_capacity(num_values);
+            let mut tail = ConstantTail::NONE;
             for p in placement {
                 let ch = &source.channels[p.channel];
+                if ch.constant.is_some() {
+                    tail = cands_ref[group_index]
+                        .constant_tail(gdim.min(ch.w - x0), gdim.min(ch.h - y0));
+                    continue;
+                }
                 tokenize_ma_rect(
                     source,
                     placement,
@@ -4293,6 +4600,7 @@ fn write_local_tree_sections(
             match &toks {
                 RawTokens::Compact(tokens) => write_local_tree_group(
                     tokens,
+                    tail,
                     cand,
                     min_symbol,
                     wp_params,
@@ -4302,6 +4610,7 @@ fn write_local_tree_sections(
                 ),
                 RawTokens::Wide(tokens) => write_local_tree_group(
                     tokens,
+                    tail,
                     cand,
                     min_symbol,
                     wp_params,
@@ -4342,6 +4651,7 @@ fn write_local_tree_sections(
 /// estimate is within `VARIANT_WRITE_TOLERANCE`, as on the global path.
 fn write_local_tree_group<T: lz77::LiteralToken>(
     tokens: &[T],
+    tail: ConstantTail,
     cand: &LearnedCandidate,
     min_symbol: u32,
     wp_params: WpParams,
@@ -4370,6 +4680,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
         let lz = deep(scratch);
         write_local_tree_variant(
             &lz,
+            tail,
             cand,
             min_symbol,
             wp_params,
@@ -4383,6 +4694,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
         if e_run > e_lit * deep_lz_max_ratio {
             write_local_tree_variant(
                 tokens,
+                tail,
                 cand,
                 min_symbol,
                 wp_params,
@@ -4394,6 +4706,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             let lz = deep(scratch);
             write_local_tree_variant(
                 &lz,
+                tail,
                 cand,
                 min_symbol,
                 wp_params,
@@ -4403,6 +4716,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             );
             write_local_tree_variant(
                 tokens,
+                tail,
                 cand,
                 min_symbol,
                 wp_params,
@@ -4413,6 +4727,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
         } else {
             write_local_tree_variant(
                 tokens,
+                tail,
                 cand,
                 min_symbol,
                 wp_params,
@@ -4423,6 +4738,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             let lz = deep(scratch);
             write_local_tree_variant(
                 &lz,
+                tail,
                 cand,
                 min_symbol,
                 wp_params,
@@ -4437,6 +4753,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
 
 fn write_local_tree_variant<T: lz77::LzTokenSource>(
     stream: &[T],
+    tail: ConstantTail,
     cand: &LearnedCandidate,
     min_symbol: u32,
     wp_params: WpParams,
@@ -4446,8 +4763,9 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
 ) {
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
-    let code = build_lz_pixel_code_threads(
-        std::iter::once(stream),
+    let code = build_lz_pixel_code_tails(
+        &[stream],
+        &[tail],
         num_ctx as usize,
         min_symbol,
         true,
@@ -4472,7 +4790,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
         &mut scratch.huffman_pool,
         &mut section,
     );
-    write_lz_section(stream, distance_ctx, &code, min_symbol, &mut section);
+    write_lz_section_tail(stream, tail, distance_ctx, &code, min_symbol, &mut section);
     section.zero_pad_to_byte();
     keep_smaller_writer(best, section);
 }
@@ -4480,6 +4798,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
 #[allow(clippy::too_many_arguments)]
 fn write_learned_single_variant<T: lz77::LzTokenSource>(
     stream: &[T],
+    tail: ConstantTail,
     source: &MaSource<'_>,
     cand: &LearnedCandidate,
     min_symbol: u32,
@@ -4492,8 +4811,9 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
 ) {
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
-    let code = build_lz_pixel_code_threads(
-        std::iter::once(stream),
+    let code = build_lz_pixel_code_tails(
+        &[stream],
+        &[tail],
         num_ctx as usize,
         min_symbol,
         true,
@@ -4529,7 +4849,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
         &mut scratch.huffman_pool,
         &mut body,
     );
-    write_lz_section(stream, distance_ctx, &code, min_symbol, &mut body);
+    write_lz_section_tail(stream, tail, distance_ctx, &code, min_symbol, &mut body);
     body.zero_pad_to_byte();
     keep_smaller_writer(best, body);
 }
@@ -4537,6 +4857,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
 #[allow(clippy::too_many_arguments)]
 fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     streams: &[Vec<T>],
+    tails: &[ConstantTail],
     source: &MaSource<'_>,
     cand: &LearnedCandidate,
     min_symbol: u32,
@@ -4554,8 +4875,10 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
-    let code = build_lz_pixel_code_threads(
-        streams.iter().map(Vec::as_slice),
+    let slices: Vec<&[T]> = streams.iter().map(Vec::as_slice).collect();
+    let code = build_lz_pixel_code_tails(
+        &slices,
+        tails,
         num_ctx as usize,
         min_symbol,
         true,
@@ -4564,10 +4887,8 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
-    let estimate = {
-        let slices: Vec<&[T]> = streams.iter().map(Vec::as_slice).collect();
-        estimate_coded_bits(&slices, distance_ctx, &code, min_symbol, pool.num_threads())
-    };
+    let estimate =
+        estimate_coded_bits(&slices, distance_ctx, &code, min_symbol, pool.num_threads());
     if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
         return;
     }
@@ -4590,8 +4911,9 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     write_wp_header(wp_params, &mut sections[0]);
     source.write_transforms(&mut sections[0]);
     if has_global_stream {
-        write_lz_section(
+        write_lz_section_tail(
             &streams[0],
+            tails[0],
             distance_ctx,
             &code,
             min_symbol,
@@ -4616,6 +4938,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     // threads: the code borrows the worker scratch the pool would need).
     let code_ref = &code;
     let group_streams = &streams[1..];
+    let group_tails = &tails[1..];
     let threads = pool.num_threads().clamp(1, num_ac_groups.max(1));
     let chunk = num_ac_groups.div_ceil(threads).max(1);
     let group_sections: Vec<BitWriter> = std::thread::scope(|scope| {
@@ -4643,8 +4966,9 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
                                 }
                                 None => section.write(2, 0),
                             }
-                            write_lz_section(
+                            write_lz_section_tail(
                                 stream,
+                                group_tails[first + offset],
                                 distance_ctx,
                                 code_ref,
                                 min_symbol,
@@ -4757,9 +5081,11 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
 fn try_encode_context_tree_single_group(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
+    alpha_constant: Option<i32>,
     xsize: usize,
     ysize: usize,
     layout: GroupLayout,
+    frame_kind: ModularFrameKind<'_>,
     predictors: &[u32],
     min_symbol: u32,
     rct_type: u32,
@@ -4781,6 +5107,9 @@ fn try_encode_context_tree_single_group(
                 predictors[chan],
                 wp_params,
             )
+        } else if alpha_constant.is_some() {
+            // Zero predictor + offset: every residual is 0, no WP property.
+            (vec![0u32; xsize * ysize], vec![0i64; xsize * ysize])
         } else {
             let a = alpha.expect("alpha channel must exist");
             collect_channel(
@@ -4814,13 +5143,14 @@ fn try_encode_context_tree_single_group(
     }
 
     // Build tree + context map.
-    let tree = build_context_tree(nb_chans, predictors, &ts);
+    let tree = build_context_tree(nb_chans, predictors, &ts, alpha_constant);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
     // Flat lookup over the dense (chan*3+bucket) property space, replacing a
     // per-pixel HashMap probe in the tokenize loop.
     let ctx_lut: Vec<u32> = (0..(nb_chans as u32) * 3).map(|k| ctx_map[&k]).collect();
-    let num_pixel_ctx = nb_chans * 3;
+    // One context per leaf (a constant channel's three tags share one).
+    let num_pixel_ctx = ctx_lut.iter().max().map_or(0, |&m| m as usize + 1);
 
     // Tokenize: each pixel routed to context (channel,bucket).
     let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
@@ -4840,9 +5170,12 @@ fn try_encode_context_tree_single_group(
         tokens.extend(channel);
     }
 
-    // Frame header + single section.
-    write_frame_header_modular(alpha.is_some(), layout, writer);
+    // Frame header + single section (a patched frame's dictionary first).
+    write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
     let mut section = BitWriter::new();
+    if let ModularFrameKind::Patched(references) = frame_kind {
+        write_patch_dictionary(references, alpha.is_some(), scratch, &mut section);
+    }
     section.write(1, 1); // dc_quant all_default = 1
     section.write(1, 0); // has_tree = 0
     section.write(1, 0); // use_global_tree = 0
@@ -4884,9 +5217,11 @@ fn try_encode_context_tree_single_group(
 fn try_encode_context_tree_multi_group(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
+    alpha_constant: Option<i32>,
     xsize: usize,
     ysize: usize,
     layout: GroupLayout,
+    frame_kind: ModularFrameKind<'_>,
     predictors: &[u32],
     xsize_groups: usize,
     ysize_groups: usize,
@@ -4917,8 +5252,12 @@ fn try_encode_context_tree_multi_group(
                 chans.push(collect_channel(get, gw, gh, predictors[chan], wp_params));
             }
             if let Some(a) = alpha {
-                let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                chans.push(collect_channel(get, gw, gh, predictors[3], wp_params));
+                if alpha_constant.is_some() {
+                    chans.push((vec![0u32; gw * gh], vec![0i64; gw * gh]));
+                } else {
+                    let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
+                    chans.push(collect_channel(get, gw, gh, predictors[3], wp_params));
+                }
             }
             chans
         });
@@ -4941,13 +5280,14 @@ fn try_encode_context_tree_multi_group(
     }
 
     // 3) Global context tree + map.
-    let tree = build_context_tree(nb_chans, predictors, &ts);
+    let tree = build_context_tree(nb_chans, predictors, &ts, alpha_constant);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
     // Flat lookup over the dense (chan*3+bucket) property space, replacing a
     // per-pixel HashMap probe in the tokenize loop.
     let ctx_lut: Vec<u32> = (0..(nb_chans as u32) * 3).map(|k| ctx_map[&k]).collect();
-    let num_pixel_ctx = nb_chans * 3;
+    // One context per leaf (a constant channel's three tags share one).
+    let num_pixel_ctx = ctx_lut.iter().max().map_or(0, |&m| m as usize + 1);
     let distance_ctx = num_pixel_ctx as u32;
 
     // 4) Per-group tokens (reusing collected res/prop) + per-group LZ77.
@@ -4986,6 +5326,16 @@ fn try_encode_context_tree_multi_group(
             },
         )
     };
+    // A patched frame's dictionary opens the first section (written before
+    // the code borrows the entropy scratch).
+    let dictionary: Option<BitWriter> = match frame_kind {
+        ModularFrameKind::Patched(references) => {
+            let mut w = BitWriter::new();
+            write_patch_dictionary(references, alpha.is_some(), scratch, &mut w);
+            Some(w)
+        }
+        _ => None,
+    };
     let code = build_lz_pixel_code(
         group_lz_tokens.iter().map(Vec::as_slice),
         num_pixel_ctx,
@@ -4996,10 +5346,13 @@ fn try_encode_context_tree_multi_group(
     );
 
     // 5) Sections (same layout as the flat multi-group path).
-    write_frame_header_modular(alpha.is_some(), layout, writer);
+    write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
+    if let Some(dictionary) = &dictionary {
+        sections[0].append(dictionary);
+    }
     sections[0].write(1, 1); // dc_quant all_default = 1
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
@@ -5028,6 +5381,7 @@ fn try_encode_context_tree_multi_group(
 
     write_lz_groups(
         &group_lz_tokens,
+        &[],
         &code,
         distance_ctx,
         min_symbol,
@@ -5063,6 +5417,34 @@ fn push_split(out: &mut Vec<Token>, property: u32, split_val: i32) {
 
 fn push_leaf(out: &mut Vec<Token>, predictor: u32) {
     push_leaf_mul(out, predictor, 1);
+}
+
+/// Leaf with a predictor offset: the decoder reconstructs
+/// `pred + offset + residual`.
+fn push_leaf_offset(out: &mut Vec<Token>, predictor: u32, offset: i32) {
+    out.push(Token::new(TREE_CTX_PROPERTY, 0));
+    out.push(Token::new(TREE_CTX_PREDICTOR, predictor));
+    out.push(Token::new(TREE_CTX_OFFSET, pack_signed(offset)));
+    out.push(Token::new(TREE_CTX_MULTIPLIER_LOG, 0));
+    out.push(Token::new(TREE_CTX_MULTIPLIER_BITS, 0));
+}
+
+/// `build_balanced_tree_tokens` with a predictor offset per channel.
+pub(super) fn build_balanced_tree_tokens_offsets(
+    predictors: &[u32],
+    offsets: &[i32],
+) -> Vec<Token> {
+    debug_assert_eq!(predictors.len(), offsets.len());
+    let mut tokens = build_balanced_tree_tokens(predictors);
+    // Leaves are emitted in BFS order chan(N-1), ..., chan0.
+    for (token, &offset) in tokens
+        .iter_mut()
+        .filter(|token| token.context == TREE_CTX_OFFSET)
+        .zip(offsets.iter().rev())
+    {
+        token.value = pack_signed(offset);
+    }
+    tokens
 }
 
 /// Leaf with a residual multiplier: the decoder reconstructs
@@ -5949,5 +6331,130 @@ mod context_tree_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod constant_channel_tests {
+    use super::*;
+
+    #[test]
+    fn constant_alpha_value_detects_solid_planes() {
+        assert_eq!(
+            constant_alpha_value(&AlphaPlane::U8(vec![255; 10])),
+            Some(255)
+        );
+        assert_eq!(constant_alpha_value(&AlphaPlane::U8(vec![255, 254])), None);
+        assert_eq!(constant_alpha_value(&AlphaPlane::U8(Vec::new())), None);
+        assert_eq!(
+            constant_alpha_value(&AlphaPlane::U16 {
+                data: vec![65535; 3],
+                bits: 16
+            }),
+            Some(65535)
+        );
+        assert_eq!(
+            constant_alpha_value(&AlphaPlane::F32(vec![-7, -7])),
+            Some(-7)
+        );
+    }
+
+    #[test]
+    fn with_constant_channel_routes_the_channel_to_a_zero_leaf() {
+        let tree = LearnedTree {
+            nodes: vec![
+                MaNode::Split {
+                    prop: 2,
+                    val: 10,
+                    gt: 1,
+                    le: 2,
+                },
+                MaNode::Leaf { pred: 5 },
+                MaNode::Leaf { pred: 6 },
+            ],
+            est_bits: 100.0,
+            flat_bits: 200.0,
+        };
+        let mut cand = finish_ma_candidate(tree, 1.0);
+        cand.leaf_offset = vec![-3, 4];
+        let wrapped = cand.with_constant_channel(3, 255);
+        assert_eq!(wrapped.num_ctx, 3);
+        assert_eq!(wrapped.constant_ctx, Some(0));
+        assert_eq!(wrapped.leaf_offset, vec![255, -3, 4]);
+        assert_eq!(wrapped.est_real, cand.est_real);
+        let offsets: Vec<u32> = wrapped
+            .tree_tokens
+            .iter()
+            .filter(|token| token.context == TREE_CTX_OFFSET)
+            .map(|token| token.value)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![pack_signed(255), pack_signed(-3), pack_signed(4)]
+        );
+        assert_eq!(
+            wrapped.constant_tail(4, 5),
+            ConstantTail {
+                context: 0,
+                count: 20
+            }
+        );
+
+        let mut props = [0i32; NUM_MA_PROPS];
+        let alpha = MaLookup::new(&wrapped.tree, &wrapped.leaf_ctx, 3, 0);
+        assert!(!alpha.needs_wp());
+        props[2] = 20;
+        assert_eq!(alpha.lookup(&props), (0, 0));
+        props[2] = 0;
+        assert_eq!(alpha.lookup(&props), (0, 0));
+        for chan in 0..3 {
+            let color = MaLookup::new(&wrapped.tree, &wrapped.leaf_ctx, chan, 0);
+            props[2] = 20;
+            assert_eq!(color.lookup(&props), (1, 5));
+            props[2] = 0;
+            assert_eq!(color.lookup(&props), (2, 6));
+        }
+    }
+
+    #[test]
+    fn balanced_tree_offsets_follow_the_bfs_leaf_order() {
+        let tokens = build_balanced_tree_tokens_offsets(&[5, 5, 5, 0], &[1, 2, 3, 255]);
+        let offsets: Vec<u32> = tokens
+            .iter()
+            .filter(|token| token.context == TREE_CTX_OFFSET)
+            .map(|token| token.value)
+            .collect();
+        // Leaves are emitted chan 3, 2, 1, 0.
+        assert_eq!(
+            offsets,
+            vec![
+                pack_signed(255),
+                pack_signed(3),
+                pack_signed(2),
+                pack_signed(1)
+            ]
+        );
+        let plain = build_balanced_tree_tokens(&[5, 5, 5, 0]);
+        assert_eq!(tokens.len(), plain.len());
+    }
+
+    #[test]
+    fn context_tree_constant_leaf_shares_one_context() {
+        let tree = build_context_tree(4, &[5, 5, 5, 0], &[8, 8, 8, 8], Some(255));
+        let mut tokens = Vec::new();
+        let map = emit_ct_tree(&tree, &mut tokens);
+        assert_eq!(map[&9], map[&10]);
+        assert_eq!(map[&10], map[&11]);
+        let num_ctx = map.values().max().map_or(0, |&m| m + 1);
+        assert_eq!(num_ctx, 10);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.context == TREE_CTX_OFFSET && token.value == pack_signed(255))
+        );
+        let plain = build_context_tree(4, &[5, 5, 5, 0], &[8, 8, 8, 8], None);
+        let mut plain_tokens = Vec::new();
+        let plain_map = emit_ct_tree(&plain, &mut plain_tokens);
+        assert_eq!(plain_map.values().max(), Some(&11));
     }
 }

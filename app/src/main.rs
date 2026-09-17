@@ -30,7 +30,6 @@ fn main() {
                 .with_distance(distance)
                 .with_progressive(false)
                 .with_patches(true)
-                .with_color_recovery(true)
                 .with_speed(Speed::Slow)
                 .with_num_threads(
                     available_parallelism()
@@ -54,7 +53,6 @@ fn main() {
             .with_speed(Speed::Slow)
             .with_progressive(false)
             .with_decoding_speed(DecodingSpeed::Slow)
-            .with_color_recovery(false)
             .with_patches(true)
             .with_color_encoding(ColorEncoding::srgb())
             .with_num_threads(

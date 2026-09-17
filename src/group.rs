@@ -220,17 +220,10 @@ fn rdoq_block(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    relative_qf: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    // Distortion is in quantizer units. Adapt the price of a bit smoothly
-    // with distance and the block's quantization field relative to the median.
-    // Hold the price fixed over all edges and the nonzero-count token.
-    let distance_ramp = ((distance - 1.0) / 3.0).clamp(0.0, 1.0);
-    let qf_ramp = ((relative_qf - 1.0) / 0.25).clamp(-1.0, 1.0);
-    let multiplier = (1.5 + 0.5 * distance_ramp) * (1.0 + 0.5 * qf_ramp);
-    let lambda = (crate::ac_strategy::RD_LAMBDA * 0.25) * multiplier;
+    const RDOQ_LAMBDA: f32 = crate::ac_strategy::RD_LAMBDA * 0.25;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -274,7 +267,7 @@ fn rdoq_block(
         let mut k = search_end;
         while k < block.len() && remaining != 0 {
             let coef = block[scan[k] as usize];
-            *target += lambda
+            *target += RDOQ_LAMBDA
                 * prices.token_bits(Token::new(context(remaining, k, prev), pack_signed(coef)));
             prev = usize::from(coef != 0);
             remaining -= usize::from(coef != 0);
@@ -346,7 +339,7 @@ fn rdoq_block(
                     [0.0; 2]
                 } else {
                     let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
-                    [lambda * bits[0], lambda * bits[1]]
+                    [RDOQ_LAMBDA * bits[0], RDOQ_LAMBDA * bits[1]]
                 };
                 let state = remaining * 2;
                 let cost0 = distortion + token_cost[0] + tail;
@@ -376,7 +369,7 @@ fn rdoq_block(
         if !tail.is_finite() {
             continue;
         }
-        let cost = tail + lambda * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
+        let cost = tail + RDOQ_LAMBDA * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
         if cost < best_cost {
             best_cost = cost;
             best_remaining = remaining;
@@ -734,8 +727,7 @@ pub(crate) fn quantize_block_ac_scalar(
 }
 
 /// Chroma (X/B) RDOQ opens at the SS2 quant tier: below it the trellis
-/// regresses Kodak HQ BD at every lambda tried (+0.27% unweighted, +0.39%
-/// channel-weighted), above it the channel-weighted form wins −0.137%.
+/// regresses Kodak HQ BD at every lambda tried.
 pub(crate) const CHROMA_RDOQ_MIN_DISTANCE: f32 = 2.25;
 
 pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
@@ -1104,33 +1096,33 @@ pub(crate) fn write_ac_group(
             // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
             // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
-                    STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
-                    STRATEGY_IDENTITY => (
-                        &matrices.inv_matrix_identity(1)[..],
-                        &matrices.matrix_identity(1)[..],
-                    ),
-                    STRATEGY_DCT2X2 => (
-                        &matrices.inv_matrix_dct2x2(1)[..],
-                        &matrices.matrix_dct2x2(1)[..],
-                    ),
-                    STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
-                    STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
-                        (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
-                    }
-                    STRATEGY_AFV0..=STRATEGY_AFV3 => {
-                        (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
-                    }
-                    STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
-                    STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
-                    STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
-                    STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
-                        (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
-                    }
-                    STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
-                        (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
-                    }
-                    _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
-                };
+                STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
+                STRATEGY_IDENTITY => (
+                    &matrices.inv_matrix_identity(1)[..],
+                    &matrices.matrix_identity(1)[..],
+                ),
+                STRATEGY_DCT2X2 => (
+                    &matrices.inv_matrix_dct2x2(1)[..],
+                    &matrices.matrix_dct2x2(1)[..],
+                ),
+                STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                    (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
+                }
+                STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                    (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
+                }
+                STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
+                STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
+                STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
+                    (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
+                }
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
+                    (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
+                }
+                _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
+            };
             source_y[..size].copy_from_slice(&coeffs[1][..size]);
             quantize_roundtrip_y_block(
                 ctx,
@@ -1165,7 +1157,6 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1378,7 +1369,6 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1465,7 +1455,6 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1498,7 +1487,6 @@ pub(crate) fn write_ac_group(
                         fmla(ctx.channel_weight(2), error * error, chroma_distortion);
                 }
             }
-
             // ---- Tokenize in order Y, X, B ----
             let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
             let covered_blocks = cx * cy;
@@ -1718,7 +1706,6 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
-                    if case % 2 == 0 { 1.5 } else { 0.75 },
                     choices,
                     costs,
                 );

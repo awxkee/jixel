@@ -1245,6 +1245,7 @@ fn propose_ans_reclustering(
         &mut assignment,
         Some(thread_pool),
         true,
+        super::cluster::CLUSTERS_LIMIT,
     );
     histograms.truncate(n);
     let context_map: Vec<u8> = dense

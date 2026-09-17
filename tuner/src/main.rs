@@ -122,8 +122,7 @@ fn main() -> ExitCode {
         .with_lossless(lossless)
         .with_distance(distance)
         .with_num_threads(threads.max(1))
-        .with_speed(speed)
-        .with_color_recovery(color_recovery);
+        .with_speed(speed);
     if let Some(b) = boost {
         cfg = cfg.with_dark_aq_config(b);
     }

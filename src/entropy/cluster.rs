@@ -349,23 +349,27 @@ pub(crate) fn cluster_histograms(
     cluster_histograms_inner(histograms, context_map, false, huffman_pool);
 }
 
+/// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced,
+/// for callers that append a cluster of their own afterwards.
 pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     refined: bool,
+    max_clusters: usize,
     fixed: &mut FixedClusterScratch<MAX_CONTEXTS>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> usize {
     let n = histograms.len();
     assert!(n <= MAX_CONTEXTS);
     assert!(context_map.len() >= n);
+    assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
     if n <= 1 {
         context_map[..n].fill(0);
         return n;
     }
 
     const UNMAPPED: u8 = u8::MAX;
-    let max_histograms = CLUSTERS_LIMIT.min(n);
+    let max_histograms = max_clusters.min(n);
     let unassigned = max_histograms as u8;
     let symbols = &mut fixed.symbols[..n];
     symbols.fill(unassigned);
@@ -916,12 +920,15 @@ fn context_map_merge_saving(a: usize, b: usize) -> f64 {
 /// parallel maps with the sequential tie-breaks, and the refinement passes
 /// precompute every move delta against a snapshot and recompute only the
 /// entries whose cluster changed since (exactly the sequential algorithm).
+/// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced.
 pub(crate) fn cluster_histograms_ans(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     pool: Option<&crate::thread_pool::ThreadPool>,
     charge_context_map: bool,
+    max_clusters: usize,
 ) -> usize {
+    assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
     use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
     use crate::coder_scratch::CoderScratch;
     use crate::thread_pool::ThreadPool;
@@ -993,7 +1000,7 @@ pub(crate) fn cluster_histograms_ans(
         context_map[..n].fill(0);
         return 1;
     }
-    while clusters.len() < CLUSTERS_LIMIT {
+    while clusters.len() < max_clusters {
         clusters.push(histograms[seed].clone());
         cluster_costs.push(in_costs[seed]);
         dists[seed] = 0.0;
@@ -1229,7 +1236,13 @@ mod tests {
                 let mut histograms = base[..len].to_vec();
                 let mut map = vec![0u8; len];
                 let pool = crate::thread_pool::ThreadPool::new_lossless(threads);
-                let num = cluster_histograms_ans(&mut histograms, &mut map, Some(&pool), true);
+                let num = cluster_histograms_ans(
+                    &mut histograms,
+                    &mut map,
+                    Some(&pool),
+                    true,
+                    CLUSTERS_LIMIT,
+                );
                 (num, map, histograms[..num].to_vec())
             };
             let (num1, map1, hist1) = run(1);
@@ -1386,6 +1399,7 @@ mod tests {
             &mut actual,
             &mut actual_map,
             refined,
+            CLUSTERS_LIMIT,
             &mut scratch,
             &mut actual_pool,
         );
