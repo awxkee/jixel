@@ -114,6 +114,9 @@ struct DistanceParams {
 }
 
 const DC_REFINE_PEAK: f32 = 1.35;
+const DC_COARSEN_D0: f32 = 1.25;
+const DC_COARSEN_D1: f32 = 3.0;
+const DC_COARSEN_MUL: f32 = 0.7;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
 
@@ -140,14 +143,6 @@ fn dc_refinement(distance: f32) -> f32 {
     }
 }
 
-/// Very-low-quality DC/EPF re-fit (SS2 ~4-45; Optuna study dcepf_vlq
-/// 2026-09-02): a linear ramp from the shipped constants at `DCEPF_VLQ_D0` to
-/// much coarser DC (x0.45) plus stronger EPF (sharpness 1, 3 iterations) at
-/// `DCEPF_VLQ_D1`. Kodak d7-26 at full strength: −6.5% BD-rate at matched SS2
-/// AND −10.4% at matched butteraugli-3-norm, 24/24 images on both. The win is
-/// earned at d>=14 (segment BD: d7-10 neutral, d14+ −8..−16%), and the shipped
-/// values are correct through d≈6.5, hence the late, steep ramp. Gaborish was
-/// probed and stays off.
 const DCEPF_VLQ_D0: f32 = 8.0;
 const DCEPF_VLQ_D1: f32 = 15.0;
 const VLQ_DC_MUL: f32 = 0.45;
@@ -157,13 +152,19 @@ fn dcepf_vlq_t(distance: f32) -> f32 {
     ((distance - DCEPF_VLQ_D0) / (DCEPF_VLQ_D1 - DCEPF_VLQ_D0)).clamp(0.0, 1.0)
 }
 
+#[inline]
+fn dc_coarsen(distance: f32) -> f32 {
+    let t = ((distance - DC_COARSEN_D0) / (DC_COARSEN_D1 - DC_COARSEN_D0)).clamp(0.0, 1.0);
+    fmla(DC_COARSEN_MUL - 1.0, t, 1.0)
+}
+
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
     // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
     // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
-    let refine = dc_refinement(distance);
+    let refine = dc_refinement(distance) * dc_coarsen(distance);
     let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
@@ -3039,9 +3040,10 @@ fn build_stripe(
 #[cfg(test)]
 mod tests {
     use super::{
-        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE,
-        MIN_TOKENS_PER_DC_LEAF, choose_dc_predictors, compute_distance_params, dc_refinement,
-        epf_sharpness_id, quant_dc,
+        DC_COARSEN_D0, DC_COARSEN_D1, DC_COARSEN_MUL, DC_REFINE_HOLD, DC_REFINE_PEAK,
+        DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE, MIN_TOKENS_PER_DC_LEAF,
+        choose_dc_predictors, compute_distance_params, dc_coarsen, dc_refinement, epf_sharpness_id,
+        quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -3200,6 +3202,21 @@ mod tests {
             !sparse[ctx as usize],
             "an underpopulated leaf must not flip"
         );
+    }
+
+    #[test]
+    fn dc_coarsen_is_identity_at_hq_and_ramps_to_the_floor() {
+        assert_eq!(dc_coarsen(0.5), 1.0);
+        assert_eq!(dc_coarsen(DC_COARSEN_D0), 1.0);
+        assert!((dc_coarsen(DC_COARSEN_D1) - DC_COARSEN_MUL).abs() < 1e-6);
+        assert!((dc_coarsen(10.0) - DC_COARSEN_MUL).abs() < 1e-6);
+        let mut prev = dc_coarsen(DC_COARSEN_D0);
+        for i in 1..=40 {
+            let d = DC_COARSEN_D0 + (DC_COARSEN_D1 - DC_COARSEN_D0) * (i as f32 / 40.0);
+            let v = dc_coarsen(d);
+            assert!(v <= prev + 1e-6);
+            prev = v;
+        }
     }
 
     #[test]
