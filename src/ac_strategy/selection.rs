@@ -1549,7 +1549,7 @@ pub(crate) fn fill_ac_strategy(
                 ac_strategy,
                 &mut pipeline.band_scratch[..band_count],
                 &mut pipeline.current_costs,
-                MERGE_UPGRADE_MARGIN,
+                merge_upgrade_margin(distance),
             );
         }
     }
@@ -2429,9 +2429,10 @@ mod tests {
         block_boundary_error_energy, block_boundary_error_stats, cmap_factors, fill_ac_strategy,
         fill_selection_bands, fine_mosaic_lambda, gradient_region_stats_scalar,
         gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
-        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
-        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
-        strategy_cost, sub8_strategy_costs, use_dct8_only,
+        merge_upgrade_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
+        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
+        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
+        use_dct8_only,
     };
     use crate::coder_scratch::{AcStrategyBandScratch, CoderScratch};
     use crate::dc_group_data::{
@@ -3103,6 +3104,13 @@ mod tests {
         assert!((1.5..=2.5).contains(&gate), "gate {gate}");
         assert!((0.95..=1.05).contains(&margin), "margin {margin}");
         assert!(crate::ac_strategy::SelectorPolicy::default().merge_upgrade);
+        // Knife-edge at the gate, slightly optimistic once quality is low,
+        // monotone in between.
+        assert_eq!(merge_upgrade_margin(gate), margin);
+        let low = merge_upgrade_margin(6.0);
+        assert!(low > margin && low <= 1.1, "low margin {low}");
+        assert_eq!(low, merge_upgrade_margin(4.0));
+        assert!(merge_upgrade_margin(3.0) > margin && merge_upgrade_margin(3.0) < low);
     }
 
     /// Every saved child layout is keyed by a selected transform's own first

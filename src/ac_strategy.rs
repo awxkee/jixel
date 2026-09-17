@@ -361,6 +361,21 @@ impl Default for SelectorPolicy {
 
 const MERGE_UPGRADE_MARGIN: f32 = 1.0;
 const MERGE_UPGRADE_MIN_DISTANCE: f32 = 2.0;
+const MERGE_UPGRADE_LOW_MARGIN: f32 = 1.05;
+const MERGE_UPGRADE_LOW_DISTANCE: f32 = 4.0;
+
+/// Reconstruction-domain acceptance margin of the merge upgrade at `distance`.
+#[inline]
+fn merge_upgrade_margin(distance: f32) -> f32 {
+    let t = ((distance - MERGE_UPGRADE_MIN_DISTANCE)
+        / (MERGE_UPGRADE_LOW_DISTANCE - MERGE_UPGRADE_MIN_DISTANCE))
+        .clamp(0.0, 1.0);
+    fmla(
+        t,
+        MERGE_UPGRADE_LOW_MARGIN - MERGE_UPGRADE_MARGIN,
+        MERGE_UPGRADE_MARGIN,
+    )
+}
 const LEAF_FIRST_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
 
 impl SelectorPolicy {
