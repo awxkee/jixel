@@ -479,7 +479,6 @@ impl RunLzWriter {
     }
 }
 
-#[inline]
 pub(super) fn lz77_compress_for_speed(
     tokens: &[Token],
     distance_context: u32,

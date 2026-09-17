@@ -449,7 +449,6 @@ fn tokenize_ac_group_alpha_u16(
     tokenize_ac_group_alpha_with(first_row, interior, samples, stride, x0, y0, gw, gh, dst);
 }
 
-#[inline]
 fn tokenize_ac_group_alpha<T: AlphaSample>(
     samples: &[T],
     stride: usize,

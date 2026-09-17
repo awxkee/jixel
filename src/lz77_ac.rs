@@ -385,7 +385,6 @@ fn estimate_ac_plain_bits_shared(
     }
     bits
 }
-#[inline]
 pub(crate) fn write_ac_lz(
     t: AcLz,
     code: &OwnedEntropyCode,

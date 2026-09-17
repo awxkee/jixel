@@ -123,7 +123,6 @@ fn select_counts_bit_cost_fn() -> CountsBitCostFn {
     counts_bit_cost_scalar
 }
 
-#[inline]
 fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     if total_count == 0 {
         return 0.0;
@@ -159,7 +158,6 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     COUNTS_BIT_COST_FN.get_or_init(select_counts_bit_cost_fn)(counts, total_count)
 }
 
-#[inline]
 fn exact_counts_bit_cost(
     counts: &[u32; ALPHABET_SIZE],
     total_count: u32,
