@@ -1262,8 +1262,6 @@ fn write_ac_global(
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
-    lz_code: &crate::entropy::OwnedEntropyCode,
-    use_lz77: bool,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -1278,16 +1276,11 @@ fn write_ac_global(
     }
     // HfGlobal parses `num_passes` HfPass blocks (jxl-frame hf_global.rs:57-59),
     // each = used_orders(U32 sel 3 + u(13)=0 -> natural order) + hf_dist entropy
-    // code. Each pass gets its own code (ac_codes[p]); the single-pass LZ77 path
-    // instead writes the LZ code in its one HfPass.
+    // code. Each pass gets its own code (ac_codes[p]).
     for code in ac_codes {
         crate::coeff_order::write_coeff_orders(coeff_orders, &mut scratch.huffman_pool, w);
-        if use_lz77 {
-            crate::lz77_ac::write_ac_lz_header_and_code(lz_code, &mut scratch.huffman_pool, w);
-        } else {
-            w.write(1, 0);
-            write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
-        }
+        w.write(1, 0);
+        write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
     }
 }
 
@@ -2160,7 +2153,7 @@ fn encode_frame_core(
         // noise so near-ties keep the battle-tested static tree.
         let payload =
             |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
-                crate::lz77_ac::estimate_ac_plain_bits(
+                crate::entropy::estimate_ac_plain_bits(
                     dc.iter()
                         .map(Vec::as_slice)
                         .chain(meta.iter().map(Vec::as_slice)),
@@ -2271,7 +2264,7 @@ fn encode_frame_core(
         }
         let mut bits = header.bits_written() as u64;
         for (pass, code) in codes.iter().enumerate() {
-            bits += crate::lz77_ac::estimate_ac_plain_bits(
+            bits += crate::entropy::estimate_ac_plain_bits(
                 pending.iter().map(|p| p.tokens[pass].as_slice()),
                 code,
             );
@@ -2364,37 +2357,6 @@ fn encode_frame_core(
         }
     }
 
-    let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
-
-    // LZ77 path is single-pass only for now: it compresses one token stream per
-    // group. Multi-pass uses the per-pass plain codes.
-    let ac_lz_code_owned;
-    let use_lz77;
-    if num_passes == 1 && ctx.speed != Speed::Fastest {
-        let (code, lz_bits) = crate::lz77_ac::build_ac_lz_code(
-            all_pending.iter().map(|p| p.tokens[0].as_slice()),
-            ac_num_contexts,
-            &mut scratch.huffman_pool,
-        );
-        ac_lz_code_owned = code;
-        let plain_bits = crate::lz77_ac::estimate_ac_plain_bits(
-            all_pending
-                .iter()
-                .map(|pending| pending.tokens[0].as_slice()),
-            &ac_code_per_pass[0],
-        );
-        // Require the same margin for the LZ77 header and distance context.
-        use_lz77 = lz_bits + 512 < plain_bits;
-    } else {
-        ac_lz_code_owned = crate::lz77_ac::build_ac_lz_code(
-            std::iter::empty(),
-            ac_num_contexts,
-            &mut scratch.huffman_pool,
-        )
-        .0;
-        use_lz77 = false;
-    }
-
     // Phase 4: write DC global with adaptive DC code.
     if let VarDctFrameKind::Patched(references) = frame_kind {
         crate::lossless::write_patch_dictionary(
@@ -2479,15 +2441,13 @@ fn encode_frame_core(
         &coeff_orders,
         dim.num_groups,
         &ac_code_per_pass,
-        &ac_lz_code_owned,
-        use_lz77,
         scratch,
         &mut sections[1 + dim.num_dc_groups],
     );
 
     // Rate-model reconciliation log (`JIXEL_RATE_LOG=path`): for every coded
     // (block, channel) the model's estimate next to the bits the final
-    // entropy code spends on its tokens (plain-code prices; LZ77 ignored).
+    // entropy code spends on its tokens.
     if let Some(path) = std::env::var_os("JIXEL_RATE_LOG") {
         use std::io::Write;
         let prices: Vec<crate::entropy::FrozenTokenPrices> = ac_code_per_pass
@@ -2525,8 +2485,7 @@ fn encode_frame_core(
 
     // Phase 7: write each (pass, group) AC section. Section index for
     // (pass, group) = 2 + num_dc_groups + pass*num_groups + group_idx
-    // (jxl-frame toc.rs:196-200). With LZ77 (single-pass only) we emit the
-    // compressed stream; otherwise raw tokens via the shared plain code.
+    // (jxl-frame toc.rs:196-200): raw tokens via the shared plain code.
     let num_ac_sections = all_pending.len() * num_passes;
     let ac_sections = ctx
         .thread_pool
@@ -2537,27 +2496,21 @@ fn encode_frame_core(
             let pass_tokens = &pg.tokens[pass];
             let mut w = BitWriter::new();
             let section_idx = 2 + dim.num_dc_groups + pass * dim.num_groups + pg.group_idx;
-            if use_lz77 {
-                for t in crate::lz77_ac::lz77_ac_tokens(pass_tokens) {
-                    crate::lz77_ac::write_ac_lz(t, &ac_lz_code_owned, ac_num_contexts, &mut w);
+            let code_ref = ac_code_per_pass[pass].as_ref();
+            if code_ref.use_prefix_code {
+                for t in pass_tokens {
+                    write_token(*t, &code_ref, &mut w);
                 }
             } else {
-                let code_ref = ac_code_per_pass[pass].as_ref();
-                if code_ref.use_prefix_code {
-                    for t in pass_tokens {
-                        write_token(*t, &code_ref, &mut w);
-                    }
-                } else {
-                    // rANS: the whole group's tokens are encoded as one LIFO unit.
-                    crate::entropy::write_ans_tokens(
-                        pass_tokens,
-                        code_ref.context_map,
-                        code_ref.ans_symbols,
-                        code_ref.ans_reverse_maps,
-                        code_ref.hybrid_uint_configs,
-                        &mut w,
-                    );
-                }
+                // rANS: the whole group's tokens are encoded as one LIFO unit.
+                crate::entropy::write_ans_tokens(
+                    pass_tokens,
+                    code_ref.context_map,
+                    code_ref.ans_symbols,
+                    code_ref.ans_reverse_maps,
+                    code_ref.hybrid_uint_configs,
+                    &mut w,
+                );
             }
             (section_idx, w)
         });

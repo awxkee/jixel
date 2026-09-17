@@ -31,6 +31,7 @@ mod ans;
 mod cluster;
 mod dlog2;
 mod entropy_code;
+mod estimate;
 mod fast_div_u16;
 mod histogram;
 mod huffman_tree;
@@ -47,6 +48,7 @@ pub(crate) use cluster::{
 };
 pub(crate) use dlog2::f_log2;
 pub(crate) use entropy_code::{EntropyCode, FrozenTokenPrices, OwnedEntropyCode};
+pub(crate) use estimate::estimate_ac_plain_bits;
 pub(crate) use histogram::Histogram;
 pub(crate) use huffman_tree::HuffmanNode;
 pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode};
