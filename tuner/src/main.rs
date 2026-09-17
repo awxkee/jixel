@@ -23,7 +23,9 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>] [--boost <cfg>]\n\
-         (--boost: `1`/`on` for the Dark-AQ preset, or the BoostCfg CSV; omitted = off)"
+         [--speed slow|fast] [--color-recovery]\n\
+         (--boost: `1`/`on` for the Dark-AQ preset, or the BoostCfg CSV)\n\
+         (--color-recovery: experimental SDR color recovery; requires --speed slow and distance 1.5..=24)"
     );
     std::process::exit(2);
 }
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
     let mut boost: Option<jixel::DarkAqConfig> = None;
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
+    let mut color_recovery = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -80,6 +83,10 @@ fn main() -> ExitCode {
                 lossless = true;
                 i += 1;
             }
+            "--color-recovery" => {
+                color_recovery = true;
+                i += 1;
+            }
             "-h" | "--help" => usage(),
             other => {
                 positional.push(other.to_string());
@@ -115,7 +122,8 @@ fn main() -> ExitCode {
         .with_lossless(lossless)
         .with_distance(distance)
         .with_num_threads(threads.max(1))
-        .with_speed(speed);
+        .with_speed(speed)
+        .with_color_recovery(color_recovery);
     if let Some(b) = boost {
         cfg = cfg.with_dark_aq_config(b);
     }

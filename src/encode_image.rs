@@ -434,7 +434,7 @@ impl Default for EncodeConfig {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             boost: Some(DarkAqConfig::default()),
-            color_recovery: true,
+            color_recovery: false,
             lossy_modular: LossyModular::Off,
             gain_map: None,
         }

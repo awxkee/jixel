@@ -15,8 +15,8 @@ fn main() {
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 2.0;
-    for _ in 0..1 {
+    let distance = 3.0;
+    for _ in 0..5 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,
@@ -30,6 +30,7 @@ fn main() {
                 .with_distance(distance)
                 .with_progressive(false)
                 .with_patches(true)
+                .with_color_recovery(true)
                 .with_speed(Speed::Slow)
                 .with_num_threads(
                     available_parallelism()
@@ -53,6 +54,7 @@ fn main() {
             .with_speed(Speed::Slow)
             .with_progressive(false)
             .with_decoding_speed(DecodingSpeed::Slow)
+            .with_color_recovery(false)
             .with_patches(true)
             .with_color_encoding(ColorEncoding::srgb())
             .with_num_threads(
