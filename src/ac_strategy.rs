@@ -291,6 +291,43 @@ impl SearchScope {
     }
 }
 
+pub(crate) struct RateCalibration;
+
+impl RateCalibration {
+    /// [pair, 16x16, 32-class] × [hq, mid, low]; hq at d<=1.5, mid at 2.75,
+    /// low from d=4, linear in between.
+    const TABLE: [[f32; 3]; 3] = [[1.0, 0.96, 0.96], [1.0, 0.93, 0.93], [1.0, 0.91, 0.91]];
+
+    #[inline]
+    fn family(strategy: u8) -> Option<usize> {
+        Some(match strategy {
+            STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 0,
+            STRATEGY_DCT16X16 => 1,
+            STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 2,
+            _ => return None,
+        })
+    }
+
+    /// Rate multiplier for `strategy` at `distance` (1.0 for DCT8 and for
+    /// every family outside the table).
+    #[inline]
+    pub(crate) fn scale(strategy: u8, distance: f32) -> f32 {
+        let Some(f) = Self::family(strategy) else {
+            return 1.0;
+        };
+        let [hq, mid, low] = Self::TABLE[f];
+        if distance <= 1.5 {
+            hq
+        } else if distance <= 2.75 {
+            fmla((distance - 1.5) / 1.25, mid - hq, hq)
+        } else if distance <= 4.0 {
+            fmla((distance - 2.75) / 1.25, low - mid, mid)
+        } else {
+            low
+        }
+    }
+}
+
 /// Which AC-strategy selector runs and how merge costs propagate upward.
 /// Study-only switch read from the environment (`JIXEL_SELECT=leaf`,
 /// `JIXEL_SELECT_PROP=raw`); the defaults reproduce the shipped selector
@@ -842,7 +879,10 @@ fn coefficient_dist_and_rate(
         d_total += ctx.channel_weight(c) * d;
         r_total += r;
     }
-    (d_total, r_total)
+    (
+        d_total,
+        r_total * RateCalibration::scale(strategy, distance),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -955,7 +995,7 @@ fn reconstruction_dist_and_rate(
     gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
 ) -> ReconCost {
-    (ctx.recon_dist_and_rate)(
+    let mut cost = (ctx.recon_dist_and_rate)(
         recon,
         &ReconDistInput {
             idct: ctx.idct,
@@ -994,7 +1034,9 @@ fn reconstruction_dist_and_rate(
             },
         },
         &ctx.recon_error_kernels,
-    )
+    );
+    cost.rate *= RateCalibration::scale(strategy, distance);
+    cost
 }
 
 /// Pair-transform gradient protection used only by the reconstruction rerank.

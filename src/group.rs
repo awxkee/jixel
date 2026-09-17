@@ -848,6 +848,7 @@ pub(crate) fn write_ac_group(
     measure_chroma_distortion: bool,
     qf_threshold: u32,
     out: &mut [Vec<Token>],
+    mut rate_records: Option<&mut Vec<BlockRateRecord>>,
 ) -> f32 {
     let matrices = ctx.matrices();
     let xsize_blocks = group_brect.xsize;
@@ -1498,6 +1499,9 @@ pub(crate) fn write_ac_group(
 
             for &c in &[1usize, 0, 2] {
                 let full_block = &quantized[c][..size];
+                let model_bits = rate_records
+                    .as_ref()
+                    .map(|_| model_rate_bits_from_ints(full_block, cx, cy));
 
                 for pass in 0..coeff_shifts.len() {
                     // Materialize the coefficients pass `pass` transmits. With
@@ -1517,6 +1521,7 @@ pub(crate) fn write_ac_group(
                     let block = &pblock[..size];
                     let num_nzeros = &mut num_nzeros[pass];
                     let out = &mut out[pass];
+                    let token_start = out.len();
 
                     let nzeros = if covered_blocks == 1 {
                         num_nonzero_except_dc(block.first_chunk::<64>().unwrap())
@@ -1606,11 +1611,62 @@ pub(crate) fn write_ac_group(
                         "remaining nzeros at end: strategy={} c={} pass={}",
                         strategy_code, c, pass
                     );
+                    if let Some(records) = rate_records.as_deref_mut() {
+                        records.push(BlockRateRecord {
+                            strategy: dc_data.ac_strategy.raw_strategy(global_bx, global_by),
+                            channel: c as u8,
+                            pass: pass as u8,
+                            quant: quant_ac as u16,
+                            nzeros: nzeros as u16,
+                            model_bits: model_bits.unwrap_or(0.0),
+                            start: token_start as u32,
+                            end: out.len() as u32,
+                        });
+                    }
                 }
             }
         }
     }
     chroma_distortion
+}
+
+/// One coded (block, channel, pass) for the rate-model reconciliation study:
+/// the selector's rate estimate recomputed from the final quantized
+/// coefficients next to the token range the coder actually emitted.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockRateRecord {
+    pub(crate) strategy: u8,
+    pub(crate) channel: u8,
+    pub(crate) pass: u8,
+    pub(crate) quant: u16,
+    pub(crate) nzeros: u16,
+    pub(crate) model_bits: f32,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+/// `channel_rd`'s bit estimate (nonzero base + magnitude log2 + header +
+/// visited zeros along the model's scan) evaluated on the quantized block.
+fn model_rate_bits_from_ints(block: &[i32], cx: usize, cy: usize) -> f32 {
+    let width = cx * 8;
+    let height = cy * 8;
+    let lut = crate::inflated_cost::rate_log2_lut();
+    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
+    let (mut nzeros, mut mag_bits, mut max_scan) = (0usize, 0.0f32, 0u32);
+    for v in 0..height {
+        for u in 0..width {
+            if v < cy && u < cx {
+                continue;
+            }
+            let q = block[v * width + u];
+            if q != 0 {
+                nzeros += 1;
+                mag_bits += crate::inflated_cost::rate_log2_with_lut(lut, q.unsigned_abs() as f32);
+                max_scan = max_scan.max(scan_pos[v * width + u]);
+            }
+        }
+    }
+    crate::inflated_cost::model_bits(nzeros, mag_bits, max_scan, cx, cy)
 }
 
 #[inline]

@@ -2485,6 +2485,44 @@ fn encode_frame_core(
         &mut sections[1 + dim.num_dc_groups],
     );
 
+    // Rate-model reconciliation log (`JIXEL_RATE_LOG=path`): for every coded
+    // (block, channel) the model's estimate next to the bits the final
+    // entropy code spends on its tokens (plain-code prices; LZ77 ignored).
+    if let Some(path) = std::env::var_os("JIXEL_RATE_LOG") {
+        use std::io::Write;
+        let prices: Vec<crate::entropy::FrozenTokenPrices> = ac_code_per_pass
+            .iter()
+            .map(crate::entropy::FrozenTokenPrices::new)
+            .collect();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("JIXEL_RATE_LOG");
+        let mut log = std::io::BufWriter::new(file);
+        for pg in &all_pending {
+            for r in &pg.rate_records {
+                let toks = &pg.tokens[r.pass as usize][r.start as usize..r.end as usize];
+                let actual: f32 = toks
+                    .iter()
+                    .map(|&t| prices[r.pass as usize].token_bits(t))
+                    .sum();
+                let _ = writeln!(
+                    log,
+                    "{} {} {} {:.3} {} {} {:.3} {:.3}",
+                    r.strategy,
+                    r.channel,
+                    r.pass,
+                    distp.distance,
+                    r.quant,
+                    r.nzeros,
+                    r.model_bits,
+                    actual
+                );
+            }
+        }
+    }
+
     // Phase 7: write each (pass, group) AC section. Section index for
     // (pass, group) = 2 + num_dc_groups + pass*num_groups + group_idx
     // (jxl-frame toc.rs:196-200). With LZ77 (single-pass only) we emit the
@@ -2584,6 +2622,8 @@ fn encode_frame_core(
 pub(crate) struct PendingAcGroup {
     pub(crate) group_idx: usize,
     pub(crate) tokens: Vec<Vec<Token>>,
+    /// Filled only under `JIXEL_RATE_LOG` (rate-model reconciliation study).
+    pub(crate) rate_records: Vec<crate::group::BlockRateRecord>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2838,6 +2878,8 @@ fn process_ac_group(
         .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
         .collect();
     let mut order_stats = collect_order_stats.then(crate::coeff_order::OrderStats::new);
+    let mut rate_records: Option<Vec<crate::group::BlockRateRecord>> =
+        std::env::var_os("JIXEL_RATE_LOG").map(|_| Vec::new());
 
     for ty in 0..group_ysize_tiles {
         let stripe_x0 = group_x0;
@@ -2888,6 +2930,7 @@ fn process_ac_group(
             false,
             qf_threshold,
             &mut tokens,
+            rate_records.as_mut(),
         );
     }
 
@@ -2895,6 +2938,7 @@ fn process_ac_group(
         PendingAcGroup {
             group_idx: image_gy * dim.xsize_groups + image_gx,
             tokens,
+            rate_records: rate_records.unwrap_or_default(),
         },
         local_quant_dc,
         order_stats,

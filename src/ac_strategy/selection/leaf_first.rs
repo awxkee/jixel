@@ -62,6 +62,10 @@ pub(crate) struct LeafChoice {
     pub(crate) raw_j: f32,
     /// Sub-8 metadata-gate credit if this leaf survives to the final map.
     pub(crate) gain: f32,
+    /// IDENTITY/DCT2X2 shortlisted against DCT8 on the coefficient model
+    /// (`NO_CHILD_BLOCK` = none); admitted after the merges if the block is
+    /// still DCT8.
+    pub(crate) fine: u8,
 }
 
 impl Default for LeafChoice {
@@ -71,6 +75,7 @@ impl Default for LeafChoice {
             j: f32::NAN,
             raw_j: f32::NAN,
             gain: 0.0,
+            fine: NO_CHILD_BLOCK,
         }
     }
 }
@@ -394,19 +399,20 @@ pub(super) fn select_band_leaf_first(
     // IDENTITY/DCT2X2 stay out of the structural leaves (their
     // coefficient-domain cost is not comparable with the orthogonal
     // transforms; as leaves they tie with the post-merge order on every
-    // corpus) and refine the remaining DCT8 blocks afterwards.
-    let with_fine_leaf = false;
+    // corpus): they are shortlisted here and admitted on the remaining DCT8
+    // blocks after the merge hierarchy.
     let sub8_enabled =
         scope.rectangles() && (with_dct4 || distance <= AFV_MAX_DISTANCE || with_fine);
     let bias_afv = BIAS_AFV.at(distance);
     let n_leaves = xsize * (y_end - y_begin);
     output.leaves.clear();
     output.leaves.resize(n_leaves, LeafChoice::default());
+    // Pass 1: the DCT8 incumbent of every block; pass 2 the sub-8 bundle.
     for by in y_begin..y_end {
         for bx in 0..xsize {
             let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
             let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
-            let dct8 = strategy_cost(
+            output.leaves[(by - y_begin) * xsize + bx].j = strategy_cost(
                 ctx,
                 scratch,
                 STRATEGY_DCT,
@@ -419,36 +425,47 @@ pub(super) fn select_band_leaf_first(
                 distance,
                 cmap_factor,
             );
-            let pick = if sub8_enabled {
-                evaluate_sub8(
-                    params,
-                    scratch,
-                    bx,
-                    by,
-                    qac,
-                    meta_r,
-                    Some(dct8),
-                    with_dct4,
-                    with_fine_leaf,
-                    bias_afv,
-                )
-            } else {
-                None
+        }
+    }
+    for by in y_begin..y_end {
+        for bx in 0..xsize {
+            let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
+            let dct8 = output.leaves[(by - y_begin) * xsize + bx].j;
+            let leaf = &mut output.leaves[(by - y_begin) * xsize + bx];
+            *leaf = LeafChoice {
+                strategy: STRATEGY_DCT,
+                j: dct8,
+                raw_j: dct8,
+                gain: 0.0,
+                fine: NO_CHILD_BLOCK,
             };
-            output.leaves[(by - y_begin) * xsize + bx] = match pick {
-                Some(p) => LeafChoice {
-                    strategy: p.strategy,
-                    j: p.biased_j,
-                    raw_j: p.raw_j,
-                    gain: p.gain,
-                },
-                None => LeafChoice {
-                    strategy: STRATEGY_DCT,
-                    j: dct8,
-                    raw_j: dct8,
-                    gain: 0.0,
-                },
-            };
+            if !sub8_enabled {
+                continue;
+            }
+            // One bundle per block covers both the structural leaf (final on
+            // the coefficient model) and the fine shortlist, whose
+            // reconstruction admission waits until the merges are known.
+            let shortlist = sub8_shortlist(
+                params,
+                scratch,
+                bx,
+                by,
+                qac,
+                meta_r,
+                Some(dct8),
+                with_dct4,
+                with_fine,
+                bias_afv,
+            );
+            if let Some(p) = shortlist.structural {
+                leaf.strategy = p.strategy;
+                leaf.j = p.biased_j;
+                leaf.raw_j = p.raw_j;
+                leaf.gain = p.gain;
+            }
+            if let Some(f) = shortlist.fine {
+                leaf.fine = f.strategy;
+            }
         }
     }
     // Commit every non-DCT8 leaf; merges below overwrite the cells they cover.
@@ -685,18 +702,18 @@ pub(super) fn select_band_leaf_first(
     }
 
     if with_fine {
-        // Post-merge fine refinement over whatever is still DCT8.
+        // Post-merge fine admission over whatever is still DCT8 and carries
+        // a shortlisted IDENTITY/DCT2X2 candidate.
         for by in y_begin..y_end {
             for bx in 0..xsize {
-                if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
+                let fine = output.leaves[(by - y_begin) * xsize + bx].fine;
+                if fine == NO_CHILD_BLOCK || ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
                     continue;
                 }
                 let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-                if let Some(p) = evaluate_sub8(
-                    params, scratch, bx, by, qac, meta_r, None, false, true, bias_afv,
-                ) {
-                    ac_strategy.set_first(bx, by, p.strategy);
-                    output.leaves[(by - y_begin) * xsize + bx].gain = p.gain;
+                if let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine) {
+                    ac_strategy.set_first(bx, by, fine);
+                    output.leaves[(by - y_begin) * xsize + bx].gain = gain;
                 }
             }
         }

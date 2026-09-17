@@ -1025,6 +1025,53 @@ fn evaluate_sub8(
     with_fine: bool,
     bias_afv: f32,
 ) -> Option<Sub8Pick> {
+    let shortlist = sub8_shortlist(
+        params,
+        scratch,
+        bx,
+        by,
+        qac,
+        meta_r,
+        cached_dct8,
+        with_dct4,
+        with_fine,
+        bias_afv,
+    );
+    if let Some(fine) = shortlist.fine
+        && fine.biased_j < shortlist.structural_cost
+        && let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine.strategy)
+    {
+        return Some(Sub8Pick { gain, ..fine });
+    }
+    shortlist.structural
+}
+
+/// Coefficient-domain shortlist of one block's sub-8 family: the best
+/// DCT4/AFV candidate (final on its own comparison against DCT8) and the
+/// best IDENTITY/DCT2X2 candidate, which still needs [`fine_recon_admit`].
+struct Sub8Shortlist {
+    /// The DCT4/AFV winner when it beats DCT8 on the coefficient model.
+    structural: Option<Sub8Pick>,
+    /// The DCT4/AFV winner's decision cost even when it lost (`INFINITY`
+    /// when the family is off): the fine candidate must beat it too.
+    structural_cost: f32,
+    /// IDENTITY/DCT2X2 shortlisted against DCT8 (gain not yet known).
+    fine: Option<Sub8Pick>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sub8_shortlist(
+    params: AcStrategyParams<'_>,
+    scratch: &mut CoderScratch,
+    bx: usize,
+    by: usize,
+    qac: f32,
+    meta_r: f32,
+    cached_dct8: Option<f32>,
+    with_dct4: bool,
+    with_fine: bool,
+    bias_afv: f32,
+) -> Sub8Shortlist {
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
@@ -1077,55 +1124,72 @@ fn evaluate_sub8(
         }
         (best, bc, raw)
     };
-
     let (fine, fine_coeff_cost, fine_raw) = if cost_identity < cost_dct2x2 {
         (STRATEGY_IDENTITY, cost_identity, costs.identity)
     } else {
         (STRATEGY_DCT2X2, cost_dct2x2, costs.dct2x2)
     };
-    if fine_coeff_cost < cost8 && fine_coeff_cost < cand_cost {
-        let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
-            strategy_cost_impl(
-                ctx,
-                scratch,
-                strategy,
-                params.opsin,
-                px,
-                py,
-                qac,
-                params.qm_mult_x,
-                meta_r,
-                params.distance,
-                cmap_factor,
-                DistortionModel::Reconstruction,
-            )
-        };
-        let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
-        // The reconstruction scorer over-credits fine transforms; charge the
-        // fitted per-block correction at the floored lambda (see the
-        // constant) before the margin test below.
-        let recon_fine = fmla(
-            fine_mosaic_lambda(params.distance),
-            FINE_ADMIT_RATE_CORRECTION_BITS,
-            reconstruction_cost(scratch, fine),
-        );
-        // A small safety margin absorbs the remaining mismatch between the
-        // local reconstruction metric and the final post-filtered image.
-        if recon_fine < recon8 * FINE_RECON_MARGIN {
-            return Some(Sub8Pick {
-                strategy: fine,
-                biased_j: fine_coeff_cost,
-                raw_j: fine_raw,
-                gain: recon8 - recon_fine,
-            });
-        }
+    Sub8Shortlist {
+        structural: (cand_cost < cost8).then_some(Sub8Pick {
+            strategy: cand,
+            biased_j: cand_cost,
+            raw_j: cand_raw,
+            gain: cost8 - cand_cost,
+        }),
+        structural_cost: cand_cost,
+        fine: (fine_coeff_cost < cost8).then_some(Sub8Pick {
+            strategy: fine,
+            biased_j: fine_coeff_cost,
+            raw_j: fine_raw,
+            gain: 0.0,
+        }),
     }
-    (cand_cost < cost8).then_some(Sub8Pick {
-        strategy: cand,
-        biased_j: cand_cost,
-        raw_j: cand_raw,
-        gain: cost8 - cand_cost,
-    })
+}
+
+/// Reconstruction-domain admission of a shortlisted IDENTITY/DCT2X2 block:
+/// the gain over DCT8 when the candidate beats it by the margin, after the
+/// fitted rate charge.
+fn fine_recon_admit(
+    params: AcStrategyParams<'_>,
+    scratch: &mut CoderScratch,
+    bx: usize,
+    by: usize,
+    qac: f32,
+    meta_r: f32,
+    fine: u8,
+) -> Option<f32> {
+    let ctx = params.ctx;
+    let px = params.dc_group_px + bx * 8;
+    let py = params.dc_group_py + by * 8;
+    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+    let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
+        strategy_cost_impl(
+            ctx,
+            scratch,
+            strategy,
+            params.opsin,
+            px,
+            py,
+            qac,
+            params.qm_mult_x,
+            meta_r,
+            params.distance,
+            cmap_factor,
+            DistortionModel::Reconstruction,
+        )
+    };
+    let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
+    // The reconstruction scorer over-credits fine transforms; charge the
+    // fitted per-block correction at the floored lambda (see the constant)
+    // before the margin test below.
+    let recon_fine = fmla(
+        fine_mosaic_lambda(params.distance),
+        FINE_ADMIT_RATE_CORRECTION_BITS,
+        reconstruction_cost(scratch, fine),
+    );
+    // A small safety margin absorbs the remaining mismatch between the local
+    // reconstruction metric and the final post-filtered image.
+    (recon_fine < recon8 * FINE_RECON_MARGIN).then_some(recon8 - recon_fine)
 }
 
 /// Partition `[0, ysize)` into at most `n` contiguous bands whose interior
@@ -2990,6 +3054,43 @@ mod tests {
                 assert_map_valid(&map);
             }
         }
+    }
+
+    /// The rate calibration prices merged transforms below DCT8 only in the
+    /// mid/low bands (the model over-prices them there), never at HQ, and
+    /// leaves DCT8, the 64 family and the sub-8 family untouched.
+    #[test]
+    fn rate_calibration_is_band_limited_to_merged_families() {
+        use crate::ac_strategy::RateCalibration;
+        for s in [
+            STRATEGY_DCT,
+            STRATEGY_DCT4X4,
+            STRATEGY_IDENTITY,
+            STRATEGY_DCT64X64,
+        ] {
+            for d in [0.5f32, 2.75, 6.0] {
+                assert_eq!(RateCalibration::scale(s, d), 1.0);
+            }
+        }
+        for s in [
+            STRATEGY_DCT16X8,
+            STRATEGY_DCT16X16,
+            STRATEGY_DCT32X32,
+            STRATEGY_DCT32X16,
+        ] {
+            assert_eq!(RateCalibration::scale(s, 1.0), 1.0);
+            let mid = RateCalibration::scale(s, 2.75);
+            assert!((0.85..1.0).contains(&mid), "{s}: {mid}");
+            assert!(RateCalibration::scale(s, 2.0) > mid);
+            assert_eq!(
+                RateCalibration::scale(s, 6.0),
+                RateCalibration::scale(s, 4.0)
+            );
+        }
+        assert!(
+            RateCalibration::scale(STRATEGY_DCT32X32, 4.0)
+                < RateCalibration::scale(STRATEGY_DCT16X8, 4.0)
+        );
     }
 
     /// The upgrade is gated out of the HQ band (it loses there on the
