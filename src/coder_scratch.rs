@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, SavedChild};
+use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -174,6 +174,28 @@ pub(crate) struct FineMergeRollback {
     pub(crate) benefit: f32,
 }
 
+/// A pair/16x16 merge that beat its tiled incumbent on the raw coefficient
+/// model but failed the fitted acceptance margin. The reconstruction rerank
+/// may install it (see `SelectorPolicy::merge_upgrade`).
+#[derive(Clone, Copy)]
+pub(crate) struct MergeUpgradeCandidate {
+    pub(crate) bx: u16,
+    pub(crate) by: u16,
+    pub(crate) strategy: u8,
+}
+
+/// A candidate the reconstruction comparison accepted; installed after the
+/// parallel evaluation pass.
+#[derive(Clone, Copy)]
+pub(crate) struct MergeUpgrade {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) strategy: u8,
+    /// Reconstruction cost without the metadata charge (quant refinement's
+    /// incumbent for the merged footprint).
+    pub(crate) base: f32,
+}
+
 pub(crate) struct AcStrategyBandScratch {
     pub(crate) fine_mosaic: LazyScratch<FineMosaicScratch>,
     pub(crate) strategy: AcStrategyImage,
@@ -184,6 +206,11 @@ pub(crate) struct AcStrategyBandScratch {
     pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
+    /// Leaf-first selector: per-block leaf choices for this band's rows
+    /// (`(by - y0) * xsize + bx`), reused across encodes.
+    pub(crate) leaves: Vec<LeafChoice>,
+    pub(crate) upgrade_candidates: Vec<MergeUpgradeCandidate>,
+    pub(crate) merge_upgrades: Vec<MergeUpgrade>,
 }
 
 impl Default for AcStrategyBandScratch {
@@ -198,6 +225,9 @@ impl Default for AcStrategyBandScratch {
             fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
+            leaves: Vec::new(),
+            upgrade_candidates: Vec::new(),
+            merge_upgrades: Vec::new(),
         }
     }
 }
@@ -220,6 +250,8 @@ impl AcStrategyBandScratch {
         self.fine_rollbacks.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
+        self.upgrade_candidates.clear();
+        self.merge_upgrades.clear();
     }
 
     fn prepare_rerank(&mut self, max_blocks: usize) {
@@ -251,6 +283,9 @@ pub(crate) struct AcStrategyPipelineScratch {
     /// `(by/4)*qx + bx/4`), NaN where the quadrant never went through the
     /// 32-level selection path.
     pub(crate) chosen32_grid: Vec<f32>,
+    /// Leaf-first selector: full-image sub-8 gate credit per block, valid for
+    /// blocks whose committed strategy is a sub-8 leaf (`by * xsize + bx`).
+    pub(crate) leaf_gain: Vec<f32>,
 }
 
 impl AcStrategyPipelineScratch {

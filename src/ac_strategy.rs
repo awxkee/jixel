@@ -30,8 +30,8 @@
 
 use crate::adaptive_quant::fast_exp2;
 use crate::coder_scratch::{
-    AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, QuantRefinement,
-    RerankDowngrade,
+    AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, MergeUpgrade,
+    MergeUpgradeCandidate, QuantRefinement, RerankDowngrade,
 };
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
@@ -49,7 +49,9 @@ use crate::inflated_cost::{
 
 mod selection;
 
-pub(crate) use selection::{Chosen32Cost, FineMosaicScratch, SavedChild, fill_ac_strategy};
+pub(crate) use selection::{
+    Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, fill_ac_strategy,
+};
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
@@ -138,6 +140,15 @@ const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
 /// Reconstruction-domain admission margin: a fine candidate must beat the
 /// DCT8 incumbent's reconstruction cost by this factor.
 const FINE_RECON_MARGIN: f32 = 0.98;
+/// Extra bits charged to a standalone IDENTITY/DCT2X2 candidate in the
+/// per-block reconstruction admission, priced at the floored fine-mosaic
+/// lambda (the plain reconstruction lambda is quarter-price below d≈1.2).
+/// The reconstruction scorer over-credits fine transforms: Kodak/24 BD-rate
+/// vs no charge is monotone through 4/8/12/16/24/32 bits (24: −0.036 cvvdp /
+/// −0.069 SS2 / −0.042 BA3, HQ band −0.12/−0.17/−0.11, 19-21/24 wins) and
+/// disabling the admission outright lands within 0.01% of the plateau; the
+/// 14-crop holdout agrees (−0.053/−0.046/−0.043, HQ −0.32/−0.12/−0.07).
+const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
 
 #[inline]
 fn fine_transform_bias(base: f32, distance: f32) -> f32 {
@@ -277,6 +288,75 @@ impl SearchScope {
     #[inline]
     fn rerank(self, distance: f32) -> bool {
         self == SearchScope::Full || distance <= FAST_RERANK_MAX_DISTANCE
+    }
+}
+
+/// Which AC-strategy selector runs and how merge costs propagate upward.
+/// Study-only switch read from the environment (`JIXEL_SELECT=leaf`,
+/// `JIXEL_SELECT_PROP=raw`); the defaults reproduce the shipped selector
+/// byte-for-byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectorPolicy {
+    /// Bottom-up plan-based selection: every 8x8 picks its best 8x8-family
+    /// transform first, then pairs/16x16 and the 32 class compete against
+    /// those leaves. Off = the legacy merges-first-then-sub-8 order.
+    pub(crate) leaf_first: bool,
+    /// Propagate the unbiased cost of a winning merge to the next level
+    /// instead of its bias-multiplied decision cost.
+    pub(crate) raw_propagation: bool,
+    /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); on by
+    /// default, `JIXEL_MERGE_UPGRADE=0` opts out.
+    pub(crate) merge_upgrade: bool,
+}
+
+impl Default for SelectorPolicy {
+    fn default() -> Self {
+        Self {
+            leaf_first: false,
+            raw_propagation: false,
+            merge_upgrade: true,
+        }
+    }
+}
+
+/// Margin-band merge upgrade: a pair/16x16 that beat its tiled incumbent on
+/// the raw coefficient model but failed the fitted acceptance margin is
+/// reconstructed against the layout actually committed on its footprint
+/// (after the rerank's downgrades and the sub-8 refinement) and installed
+/// when `j_merge < j_layout * MERGE_UPGRADE_MARGIN`. The coefficient-side
+/// margins are fitted for a noisy model; this gives the band they reject a
+/// second opinion in the reconstruction domain. Kodak/24 BD-rate at the
+/// d>=2 gate: −1.05% cvvdp / −0.41% SS2 / −0.45% BA3 (24/19/20 wins);
+/// 14-crop holdout −0.45 / −0.35 / −0.50 (11/13/12). Margin 1.05 buys more
+/// cvvdp/BA at the cost of SS2 consistency (holdout mid band 7/14), 0.9 is
+/// nearly inert; 1.10 turns SS2 flat. Below d=2 the same pass loses badly on
+/// the holdout's HQ band (+3.2% cvvdp ungated, +0.66% gated at 1.5) while
+/// Kodak's saturated cvvdp hides it — hence the hard gate. Extending the
+/// shortlist to the 32 class (32x32 + 32x16/16x32 halves) was REFUTED: at
+/// margin 1.0 it buys cvvdp (−0.46%) for SS2 (+0.26% Kodak / +0.16% holdout,
+/// 5/24 and 3/14 wins) and stiffer margins (0.95, 0.9) lose on every metric —
+/// the reconstruction scorer shares the area-blind rate model, so big merges
+/// stay mispriced in both domains. Widening the shortlist to raw cost below
+/// incumbent × 1.03..1.12 was noise (≤ −0.05% Kodak, ≤ −0.01% holdout): the
+/// band beyond a raw win holds no false negatives. Scoring every rerank arm
+/// at its own refined quantizer (the q-1/q-2/q+1 search) instead of the
+/// initial field was a violent metric trade (SS2 +2.8..3.2% with 0/24 wins
+/// against BA3 −2.4..−3.8%, cvvdp −1.4..−2.1%), not efficiency.
+const MERGE_UPGRADE_MARGIN: f32 = 1.0;
+const MERGE_UPGRADE_MIN_DISTANCE: f32 = 2.0;
+
+impl SelectorPolicy {
+    pub(crate) fn from_env() -> Self {
+        let flag = |name: &str, on: &str| {
+            std::env::var(name)
+                .map(|v| v.eq_ignore_ascii_case(on))
+                .unwrap_or(false)
+        };
+        Self {
+            leaf_first: flag("JIXEL_SELECT", "leaf"),
+            raw_propagation: flag("JIXEL_SELECT_PROP", "raw"),
+            merge_upgrade: !flag("JIXEL_MERGE_UPGRADE", "0"),
+        }
     }
 }
 

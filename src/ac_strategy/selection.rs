@@ -31,6 +31,9 @@
 
 use super::*;
 
+mod leaf_first;
+pub(crate) use leaf_first::LeafChoice;
+
 #[derive(Clone, Copy)]
 struct AcStrategyParams<'a> {
     ctx: &'a EncodingContext,
@@ -58,12 +61,65 @@ struct SuperBlockInput {
     qac: [[f32; 2]; 2],
 }
 
+/// A super-block's raw merge costs and their incumbents, for the margin-band
+/// upgrade shortlist. Index 0 = 16x16, 1..5 = v-left, v-right, h-top, h-bottom.
+struct UpgradeBand {
+    pick_16x16: bool,
+    vertical: bool,
+    use_pairs: [bool; 4],
+    raw: [f32; 5],
+    incumbent: [f32; 5],
+}
+
+/// Shortlist every merge of this super-block that beat its incumbent on the
+/// raw coefficient model yet was not committed (it failed the acceptance
+/// margin, or its arm lost). Pairs under a committed 16x16 are not listed.
+fn record_upgrade_candidates(
+    upgrades: &mut Vec<MergeUpgradeCandidate>,
+    ac_strategy: &AcStrategyImage,
+    bx0: usize,
+    by0: usize,
+    band: UpgradeBand,
+) {
+    if band.pick_16x16 {
+        return;
+    }
+    let mut push = |bx: usize, by: usize, strategy: u8, raw: f32, incumbent: f32| {
+        if raw < incumbent && ac_strategy.can_place_strategy(bx, by, strategy) {
+            upgrades.push(MergeUpgradeCandidate {
+                bx: bx as u16,
+                by: by as u16,
+                strategy,
+            });
+        }
+    };
+    push(bx0, by0, STRATEGY_DCT16X16, band.raw[0], band.incumbent[0]);
+    let committed = [
+        band.vertical && band.use_pairs[0],
+        band.vertical && band.use_pairs[1],
+        !band.vertical && band.use_pairs[2],
+        !band.vertical && band.use_pairs[3],
+    ];
+    let sites = [
+        (bx0, by0, STRATEGY_DCT16X8),
+        (bx0 + 1, by0, STRATEGY_DCT16X8),
+        (bx0, by0, STRATEGY_DCT8X16),
+        (bx0, by0 + 1, STRATEGY_DCT8X16),
+    ];
+    for (k, &(bx, by, strategy)) in sites.iter().enumerate() {
+        if !committed[k] {
+            push(bx, by, strategy, band.raw[k + 1], band.incumbent[k + 1]);
+        }
+    }
+}
+
 fn select_super_block(
     context: &SuperBlockContext<'_>,
     scratch: &mut CoderScratch,
     ac_strategy: &mut AcStrategyImage,
     input: SuperBlockInput,
     saved: &mut Vec<SavedChild>,
+    upgrades: &mut Vec<MergeUpgradeCandidate>,
 ) -> SuperBlockCost {
     let params = context.params;
     let ctx = params.ctx;
@@ -101,45 +157,48 @@ fn select_super_block(
     // Vertical pairs (DCT16X8): one per column. Skipped entirely under
     // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
     let merge = ctx.merge;
-    let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> f32 {
+    let raw_propagation = ctx.selector.raw_propagation;
+    // (decision cost, unbiased cost) per rectangular candidate.
+    let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> (f32, f32) {
         if !context.scope.rectangles() {
-            return f32::INFINITY;
+            return (f32::INFINITY, f32::INFINITY);
         }
-        merge.bias_rect
-            * strategy_cost(
-                ctx,
-                scratch,
-                strategy,
-                params.opsin,
-                px,
-                py,
-                qac,
-                params.qm_mult_x,
-                context.meta_r,
-                params.distance,
-                cmap_factor,
-            )
-    };
-    let v_left = rect_cost(px0, py0, STRATEGY_DCT16X8, qac[0][0].max(qac[1][0]));
-    let v_right = rect_cost(px0 + 8, py0, STRATEGY_DCT16X8, qac[0][1].max(qac[1][1]));
-    let h_top = rect_cost(px0, py0, STRATEGY_DCT8X16, qac[0][0].max(qac[0][1]));
-    let h_bot = rect_cost(px0, py0 + 8, STRATEGY_DCT8X16, qac[1][0].max(qac[1][1]));
-
-    // The single DCT16X16 over all four.
-    let c16 = merge.bias_16x16
-        * strategy_cost(
+        let raw = strategy_cost(
             ctx,
             scratch,
-            STRATEGY_DCT16X16,
+            strategy,
             params.opsin,
-            px0,
-            py0,
-            aggregate_qac_2x2(qac, params.scale, params.distance),
+            px,
+            py,
+            qac,
             params.qm_mult_x,
             context.meta_r,
             params.distance,
             cmap_factor,
         );
+        (merge.bias_rect * raw, raw)
+    };
+    let (v_left, v_left_raw) = rect_cost(px0, py0, STRATEGY_DCT16X8, qac[0][0].max(qac[1][0]));
+    let (v_right, v_right_raw) =
+        rect_cost(px0 + 8, py0, STRATEGY_DCT16X8, qac[0][1].max(qac[1][1]));
+    let (h_top, h_top_raw) = rect_cost(px0, py0, STRATEGY_DCT8X16, qac[0][0].max(qac[0][1]));
+    let (h_bot, h_bot_raw) = rect_cost(px0, py0 + 8, STRATEGY_DCT8X16, qac[1][0].max(qac[1][1]));
+
+    // The single DCT16X16 over all four.
+    let c16_raw = strategy_cost(
+        ctx,
+        scratch,
+        STRATEGY_DCT16X16,
+        params.opsin,
+        px0,
+        py0,
+        aggregate_qac_2x2(qac, params.scale, params.distance),
+        params.qm_mult_x,
+        context.meta_r,
+        params.distance,
+        cmap_factor,
+    );
+    let c16 = merge.bias_16x16 * c16_raw;
 
     let dct8_left = c8[0][0] + c8[1][0];
     let dct8_right = c8[0][1] + c8[1][1];
@@ -161,6 +220,12 @@ fn select_super_block(
     let cost_8x16 =
         if use_h_top { h_top } else { dct8_top } + if use_h_bottom { h_bot } else { dct8_bottom };
     let best_rect = cost_16x8.min(cost_8x16);
+    // Unbiased twins of the two rectangular arms, propagated under
+    // `raw_propagation` so the biases stay local to this decision.
+    let raw_16x8 = if use_v_left { v_left_raw } else { dct8_left }
+        + if use_v_right { v_right_raw } else { dct8_right };
+    let raw_8x16 = if use_h_top { h_top_raw } else { dct8_top }
+        + if use_h_bottom { h_bot_raw } else { dct8_bottom };
 
     let (q_min, q_max) = qac
         .iter()
@@ -175,6 +240,22 @@ fn select_super_block(
             total_dct8,
             risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0),
         );
+
+    if ctx.selector.merge_upgrade && params.distance >= MERGE_UPGRADE_MIN_DISTANCE {
+        record_upgrade_candidates(
+            upgrades,
+            ac_strategy,
+            bx0,
+            by0,
+            UpgradeBand {
+                pick_16x16,
+                vertical: cost_16x8 <= cost_8x16,
+                use_pairs: [use_v_left, use_v_right, use_h_top, use_h_bottom],
+                raw: [c16_raw, v_left_raw, v_right_raw, h_top_raw, h_bot_raw],
+                incumbent: [total_dct8, dct8_left, dct8_right, dct8_top, dct8_bottom],
+            },
+        );
+    }
 
     let chosen = if pick_16x16 {
         // The losing rectangular arm is this merge's true child layout; the
@@ -235,7 +316,7 @@ fn select_super_block(
             });
         }
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
-        c16
+        if raw_propagation { c16_raw } else { c16 }
     } else if cost_16x8 <= cost_8x16 {
         if use_v_left {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X8);
@@ -243,7 +324,7 @@ fn select_super_block(
         if use_v_right {
             ac_strategy.set_first(bx0 + 1, by0, STRATEGY_DCT16X8);
         }
-        cost_16x8
+        if raw_propagation { raw_16x8 } else { cost_16x8 }
     } else {
         if use_h_top {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT8X16);
@@ -251,7 +332,7 @@ fn select_super_block(
         if use_h_bottom {
             ac_strategy.set_first(bx0, by0 + 1, STRATEGY_DCT8X16);
         }
-        cost_8x16
+        if raw_propagation { raw_8x16 } else { cost_8x16 }
     };
 
     SuperBlockCost {
@@ -621,6 +702,7 @@ fn select_band(
     band: (usize, usize),
     chosen32: &mut Vec<Chosen32Cost>,
     saved: &mut Vec<SavedChild>,
+    upgrades: &mut Vec<MergeUpgradeCandidate>,
 ) -> f32 {
     let params = selection.params;
     let ctx = params.ctx;
@@ -663,6 +745,7 @@ fn select_band(
             if four_row && four_col && ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32) {
                 let mut sub_total = 0.0f32;
                 let mut dct8_total = 0.0f32;
+                let upgrade_mark = upgrades.len();
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let sbx = bx + sx * 2;
@@ -678,6 +761,7 @@ fn select_band(
                                 qac,
                             },
                             saved,
+                            upgrades,
                         );
                         sub_total += costs.chosen;
                         dct8_total += costs.dct8;
@@ -756,13 +840,23 @@ fn select_band(
                 }
                 let gate =
                     |accept: f32| risk_gated(merge.risk_k, accept, q_min as f32, q_max as f32, 2.0);
-                let (best_big, best_strategy, accept) =
+                let (best_big, best_big_raw, best_strategy, accept) =
                     if cost_32x32 <= cost_32x16 && cost_32x32 <= cost_16x32 {
-                        (cost_32x32, STRATEGY_DCT32X32, gate(merge.accept_32))
+                        (cost_32x32, cost32, STRATEGY_DCT32X32, gate(merge.accept_32))
                     } else if cost_32x16 <= cost_16x32 {
-                        (cost_32x16, STRATEGY_DCT32X16, gate(merge.accept_32_rect))
+                        (
+                            cost_32x16,
+                            cl + cr,
+                            STRATEGY_DCT32X16,
+                            gate(merge.accept_32_rect),
+                        )
                     } else {
-                        (cost_16x32, STRATEGY_DCT16X32, gate(merge.accept_32_rect))
+                        (
+                            cost_16x32,
+                            ct + cb,
+                            STRATEGY_DCT16X32,
+                            gate(merge.accept_32_rect),
+                        )
                     };
 
                 // Compare against both the already-selected subdivision and the
@@ -770,6 +864,8 @@ fn select_band(
                 // marginal merges from making a 32×32 merge look trustworthy.
                 let merged = best_big < sub_total && merge_beats_dct8(best_big, dct8_total, accept);
                 if merged {
+                    // The 32 covers every shortlisted super-block merge.
+                    upgrades.truncate(upgrade_mark);
                     match best_strategy {
                         STRATEGY_DCT32X32 => {
                             capture_children(ac_strategy, saved, bx, by, 4, 4);
@@ -793,7 +889,13 @@ fn select_band(
                 chosen32.push(Chosen32Cost {
                     bx: bx as u16,
                     by: by as u16,
-                    cost: if merged { best_big } else { sub_total },
+                    cost: if !merged {
+                        sub_total
+                    } else if ctx.selector.raw_propagation {
+                        best_big_raw
+                    } else {
+                        best_big
+                    },
                 });
                 bx += 4;
             } else if four_row {
@@ -805,6 +907,7 @@ fn select_band(
                         ac_strategy,
                         SuperBlockInput { bx, by: sby, qac },
                         saved,
+                        upgrades,
                     );
                 }
                 bx += 2;
@@ -816,6 +919,7 @@ fn select_band(
                     ac_strategy,
                     SuperBlockInput { bx, by, qac },
                     saved,
+                    upgrades,
                 );
                 bx += 2;
             }
@@ -862,6 +966,24 @@ fn select_band(
     benefit
 }
 
+/// A sub-8 candidate that beat DCT8 on the block's own comparison.
+#[derive(Clone, Copy)]
+struct Sub8Pick {
+    strategy: u8,
+    /// Coefficient-domain decision cost (bias applied) — what the block-level
+    /// comparison against DCT8 used, and what a leaf carries into the merge
+    /// levels of the leaf-first selector.
+    biased_j: f32,
+    /// The same cost without the family bias.
+    raw_j: f32,
+    /// Credit for the frame-level sub-8 metadata gate: reconstruction-domain
+    /// delta for IDENTITY/DCT2X2, biased coefficient-domain delta otherwise
+    /// (legacy semantics; the two are not comparable with each other).
+    gain: f32,
+}
+
+/// Legacy interface: `(strategy, gain)` for the block's winning sub-8
+/// candidate, if any.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_sub8_candidate(
     params: AcStrategyParams<'_>,
@@ -875,6 +997,34 @@ fn evaluate_sub8_candidate(
     with_fine: bool,
     bias_afv: f32,
 ) -> Option<(u8, f32)> {
+    evaluate_sub8(
+        params,
+        scratch,
+        bx,
+        by,
+        qac,
+        meta_r,
+        cached_dct8,
+        with_dct4,
+        with_fine,
+        bias_afv,
+    )
+    .map(|pick| (pick.strategy, pick.gain))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_sub8(
+    params: AcStrategyParams<'_>,
+    scratch: &mut CoderScratch,
+    bx: usize,
+    by: usize,
+    qac: f32,
+    meta_r: f32,
+    cached_dct8: Option<f32>,
+    with_dct4: bool,
+    with_fine: bool,
+    bias_afv: f32,
+) -> Option<Sub8Pick> {
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
@@ -903,31 +1053,35 @@ fn evaluate_sub8_candidate(
     // Keep the already-fitted DCT4/AFV chooser intact. IDENTITY/DCT2X2 have
     // non-orthogonal coefficient scales, so their coefficient-domain costs are
     // suitable only as a shortlist; final admission is reconstruction-domain.
-    let (cand, cand_cost) = {
+    let (cand, cand_cost, cand_raw) = {
         let mut best = STRATEGY_DCT4X4;
         let mut bc = cost4;
+        let mut raw = costs.dct4x4;
         if cost48 < bc {
             best = STRATEGY_DCT4X8;
             bc = cost48;
+            raw = costs.dct4x8;
         }
         if cost84 < bc {
             best = STRATEGY_DCT8X4;
             bc = cost84;
+            raw = costs.dct8x4;
         }
         for (kind, &afv_cost) in costs.afv.iter().enumerate() {
             let biased = bias_afv * afv_cost;
             if biased < bc {
                 best = STRATEGY_AFV0 + kind as u8;
                 bc = biased;
+                raw = afv_cost;
             }
         }
-        (best, bc)
+        (best, bc, raw)
     };
 
-    let (fine, fine_coeff_cost) = if cost_identity < cost_dct2x2 {
-        (STRATEGY_IDENTITY, cost_identity)
+    let (fine, fine_coeff_cost, fine_raw) = if cost_identity < cost_dct2x2 {
+        (STRATEGY_IDENTITY, cost_identity, costs.identity)
     } else {
-        (STRATEGY_DCT2X2, cost_dct2x2)
+        (STRATEGY_DCT2X2, cost_dct2x2, costs.dct2x2)
     };
     if fine_coeff_cost < cost8 && fine_coeff_cost < cand_cost {
         let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
@@ -947,14 +1101,31 @@ fn evaluate_sub8_candidate(
             )
         };
         let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
-        let recon_fine = reconstruction_cost(scratch, fine);
+        // The reconstruction scorer over-credits fine transforms; charge the
+        // fitted per-block correction at the floored lambda (see the
+        // constant) before the margin test below.
+        let recon_fine = fmla(
+            fine_mosaic_lambda(params.distance),
+            FINE_ADMIT_RATE_CORRECTION_BITS,
+            reconstruction_cost(scratch, fine),
+        );
         // A small safety margin absorbs the remaining mismatch between the
         // local reconstruction metric and the final post-filtered image.
         if recon_fine < recon8 * FINE_RECON_MARGIN {
-            return Some((fine, recon8 - recon_fine));
+            return Some(Sub8Pick {
+                strategy: fine,
+                biased_j: fine_coeff_cost,
+                raw_j: fine_raw,
+                gain: recon8 - recon_fine,
+            });
         }
     }
-    (cand_cost < cost8).then_some((cand, cost8 - cand_cost))
+    (cand_cost < cost8).then_some(Sub8Pick {
+        strategy: cand,
+        biased_j: cand_cost,
+        raw_j: cand_raw,
+        gain: cost8 - cand_cost,
+    })
 }
 
 /// Partition `[0, ysize)` into at most `n` contiguous bands whose interior
@@ -1035,18 +1206,33 @@ pub(crate) fn fill_ac_strategy(
         meta_r,
         scope,
     };
+    let leaf_first = ctx.selector.leaf_first;
+    let run_band = |scratch: &mut CoderScratch,
+                    output: &mut AcStrategyBandScratch,
+                    strategy: &mut AcStrategyImage,
+                    band: (usize, usize)|
+     -> f32 {
+        if leaf_first {
+            leaf_first::select_band_leaf_first(&selection, scratch, strategy, band, output);
+            0.0
+        } else {
+            select_band(
+                &selection,
+                scratch,
+                strategy,
+                band,
+                &mut output.chosen32,
+                &mut output.saved_children,
+                &mut output.upgrade_candidates,
+            )
+        }
+    };
     let mut benefit = if !parallel_selection {
         let band0 = &mut pipeline.band_scratch[0];
         band0.chosen32.clear();
         band0.saved_children.clear();
-        select_band(
-            &selection,
-            scratch,
-            ac_strategy,
-            (0, ysize),
-            &mut band0.chosen32,
-            &mut band0.saved_children,
-        )
+        band0.upgrade_candidates.clear();
+        run_band(scratch, band0, ac_strategy, (0, ysize))
     } else {
         // Each band selects into its reusable strategy image, reading the shared
         // opsin/quant field; results merge deterministically by row.
@@ -1058,14 +1244,11 @@ pub(crate) fn fill_ac_strategy(
             num_threads,
             |i, output, scratch| {
                 let (y0, y1) = bands[i];
-                output.benefit = select_band(
-                    &selection,
-                    scratch,
-                    &mut output.strategy,
-                    (y0, y1),
-                    &mut output.chosen32,
-                    &mut output.saved_children,
-                );
+                // `output.strategy` is a field of `output`; split the borrow.
+                let mut strategy =
+                    std::mem::replace(&mut output.strategy, AcStrategyImage::new(0, 0));
+                output.benefit = run_band(scratch, output, &mut strategy, (y0, y1));
+                output.strategy = strategy;
             },
         );
         let mut benefit = 0.0f32;
@@ -1075,6 +1258,22 @@ pub(crate) fn fill_ac_strategy(
         }
         benefit
     };
+    if leaf_first {
+        // Sub-8 gate credit is attributed to the layout that finally survives
+        // (after the 64 pass and the rerank), so assemble the per-block leaf
+        // gains now and sum them at the end.
+        pipeline.leaf_gain.clear();
+        pipeline.leaf_gain.resize(xsize * ysize, 0.0);
+        // `fill_selection_bands` always yields at least the single full band.
+        for (&(y0, y1), band) in pipeline.bands.iter().zip(&pipeline.band_scratch) {
+            for (leaf, gain) in band.leaves[..xsize * (y1 - y0)]
+                .iter()
+                .zip(&mut pipeline.leaf_gain[y0 * xsize..y1 * xsize])
+            {
+                *gain = leaf.gain;
+            }
+        }
+    }
 
     // Assemble the full-image quadrant-cost grid for the DCT64 baseline.
     let qx = xsize.div_ceil(4);
@@ -1266,12 +1465,37 @@ pub(crate) fn fill_ac_strategy(
                             ) {
                                 ac_strategy.set_first(bx, by, cand);
                                 benefit += gain;
+                                if leaf_first {
+                                    pipeline.leaf_gain[by * xsize + bx] = gain;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        // Margin-band upgrade: shortlisted merges compete, in the
+        // reconstruction domain, against whatever the downgrades and the
+        // sub-8 refinement left on their footprint.
+        if ctx.selector.merge_upgrade && distance >= MERGE_UPGRADE_MIN_DISTANCE {
+            rerank_upgrade_merges(
+                &rerank,
+                scratch,
+                ac_strategy,
+                &mut pipeline.band_scratch[..band_count],
+                &mut pipeline.current_costs,
+                MERGE_UPGRADE_MARGIN,
+            );
+        }
+    }
+
+    if leaf_first {
+        benefit = ac_strategy
+            .iter_first_blocks()
+            .filter(|&(_, _, s)| crate::dc_group_data::is_sub8_strategy(s))
+            .map(|(bx, by, _)| pipeline.leaf_gain[by * xsize + bx])
+            .fold(0.0, |acc, gain| acc + gain);
     }
 
     // Preserve enough information for the frame-level exact metadata gate to
@@ -1461,9 +1685,6 @@ fn find_rerank_downgrades(
     let ctx = params.ctx;
     let (y0, y1) = band;
     let rerank_margin = ctx.merge.rerank_margin;
-    let pair_gradient_alpha = rerank_pair_gradient_alpha(params.distance);
-    let pair_gradient_peak_alpha = rerank_pair_gradient_peak_alpha(params.distance);
-    let pair_gradient_fit = &PAIR_GRAD_FIT;
     // The rerank's own metadata charge. The selection pass keeps META_R, but
     // here the tiled-DCT8 alternative pays it PER TILE (16x for a 32x32)
     // while the merge pays once — a structural pro-merge credit this
@@ -1505,50 +1726,8 @@ fn find_rerank_downgrades(
         // The gradient term targets the measured sun-beam failure: rectangular
         // pairs whose rate advantage hides a localized directional error. Keep
         // square/larger reranks byte-identical while the pair weight is fitted.
-        let (gradient_alpha, gradient_peak_alpha) = match strat {
-            STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => {
-                let alpha = pair_gradient_alpha;
-                let peak_alpha = pair_gradient_peak_alpha;
-                if alpha == 0.0 && peak_alpha == 0.0 {
-                    (0.0, 0.0)
-                } else {
-                    let (width, height) = if strat == STRATEGY_DCT16X8 {
-                        (8, 16)
-                    } else {
-                        (16, 8)
-                    };
-                    let stats = if params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END {
-                        (ctx.gradient_region_stats)(params.opsin, px, py, width, height, 1e-5)
-                    } else {
-                        (ctx.gradient_region_stats_with_chroma)(
-                            params.opsin,
-                            px,
-                            py,
-                            width,
-                            height,
-                            1e-5,
-                        )
-                    };
-                    (
-                        if stats.dominance >= RERANK_PAIR_GRADIENT_MIN_DOMINANCE {
-                            alpha
-                        } else {
-                            0.0
-                        },
-                        if stats.dominance >= pair_gradient_fit.peak_min_dominance
-                            && stats.mean >= pair_gradient_fit.min_luma
-                            && (params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END
-                                || stats.chroma <= pair_gradient_fit.chroma_cap)
-                        {
-                            peak_alpha
-                        } else {
-                            0.0
-                        },
-                    )
-                }
-            }
-            _ => (0.0, 0.0),
-        };
+        let (gradient_alpha, gradient_peak_alpha) =
+            rerank_pair_gradient_alphas(rerank, strat, px, py);
         let qac_big = region_qac(
             rerank.quant_field,
             bx,
@@ -1916,6 +2095,214 @@ fn find_rerank_downgrades(
     }
 }
 
+/// Pair-gradient penalty weights (sun-beam fix) the rerank applies to a
+/// rectangular pair at pixel `(px, py)`; zero for every other strategy.
+fn rerank_pair_gradient_alphas(
+    rerank: &RerankContext<'_>,
+    strat: u8,
+    px: usize,
+    py: usize,
+) -> (f32, f32) {
+    let params = rerank.params;
+    let ctx = params.ctx;
+    if !matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16) {
+        return (0.0, 0.0);
+    }
+    let alpha = rerank_pair_gradient_alpha(params.distance);
+    let peak_alpha = rerank_pair_gradient_peak_alpha(params.distance);
+    if alpha == 0.0 && peak_alpha == 0.0 {
+        return (0.0, 0.0);
+    }
+    let pair_gradient_fit = &PAIR_GRAD_FIT;
+    let (width, height) = if strat == STRATEGY_DCT16X8 {
+        (8, 16)
+    } else {
+        (16, 8)
+    };
+    let stats = if params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END {
+        (ctx.gradient_region_stats)(params.opsin, px, py, width, height, 1e-5)
+    } else {
+        (ctx.gradient_region_stats_with_chroma)(params.opsin, px, py, width, height, 1e-5)
+    };
+    (
+        if stats.dominance >= RERANK_PAIR_GRADIENT_MIN_DOMINANCE {
+            alpha
+        } else {
+            0.0
+        },
+        if stats.dominance >= pair_gradient_fit.peak_min_dominance
+            && stats.mean >= pair_gradient_fit.min_luma
+            && (params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END
+                || stats.chroma <= pair_gradient_fit.chroma_cap)
+        {
+            peak_alpha
+        } else {
+            0.0
+        },
+    )
+}
+
+/// The `cov_x x cov_y` footprint at `(bx, by)` is tiled exactly by first
+/// blocks lying entirely inside it (so a merge may replace it).
+fn footprint_is_self_contained(
+    map: &AcStrategyImage,
+    bx: usize,
+    by: usize,
+    cov_x: usize,
+    cov_y: usize,
+) -> bool {
+    let mut area = 0;
+    for y in by..by + cov_y {
+        for x in bx..bx + cov_x {
+            if !map.is_first_block(x, y) {
+                continue;
+            }
+            let s = map.raw_strategy(x, y);
+            let cx = AcStrategyImage::covered_blocks_x_of(s);
+            let cy = AcStrategyImage::covered_blocks_y_of(s);
+            if x + cx > bx + cov_x || y + cy > by + cov_y {
+                return false;
+            }
+            area += cx * cy;
+        }
+    }
+    area == cov_x * cov_y
+}
+
+/// Evaluate this band's shortlisted merges against the committed layout of
+/// their footprints (reconstruction domain, same metadata and pair-gradient
+/// treatment as the downgrade pass) and collect the accepted ones.
+fn find_merge_upgrades(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &AcStrategyImage,
+    band: (usize, usize),
+    output: &mut AcStrategyBandScratch,
+    margin: f32,
+) {
+    let params = rerank.params;
+    let ctx = params.ctx;
+    let (y0, y1) = band;
+    let meta_r = RERANK_META_R;
+    output.merge_upgrades.clear();
+    let overlaps_accepted =
+        |accepted: &[MergeUpgrade], bx: usize, by: usize, cx: usize, cy: usize| {
+            accepted.iter().any(|u| {
+                let ux = AcStrategyImage::covered_blocks_x_of(u.strategy);
+                let uy = AcStrategyImage::covered_blocks_y_of(u.strategy);
+                bx < u.bx + ux && u.bx < bx + cx && by < u.by + uy && u.by < by + cy
+            })
+        };
+    for ci in 0..output.upgrade_candidates.len() {
+        let cand = output.upgrade_candidates[ci];
+        let (bx, by, strategy) = (cand.bx as usize, cand.by as usize, cand.strategy);
+        if by < y0 || by >= y1 {
+            continue;
+        }
+        let cx = AcStrategyImage::covered_blocks_x_of(strategy);
+        let cy = AcStrategyImage::covered_blocks_y_of(strategy);
+        // A fine mosaic's footprint may be put back to its original merge by
+        // the frame-level metadata gate; never build on top of one.
+        let touches_mosaic = output.fine_rollbacks.iter().any(|r| {
+            bx < r.bx + r.cov_x && r.bx < bx + cx && by < r.by + r.cov_y && r.by < by + cy
+        });
+        if touches_mosaic
+            || overlaps_accepted(&output.merge_upgrades, bx, by, cx, cy)
+            || !ac_strategy.can_place_strategy(bx, by, strategy)
+            || !footprint_is_self_contained(ac_strategy, bx, by, cx, cy)
+        {
+            continue;
+        }
+        let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
+        let (gradient_alpha, gradient_peak_alpha) =
+            rerank_pair_gradient_alphas(rerank, strategy, px, py);
+        let score =
+            |scratch: &mut CoderScratch, s: u8, x: usize, y: usize, cw: usize, ch: usize| {
+                reconstruction_strategy_cost_and_base(
+                    ctx,
+                    scratch,
+                    s,
+                    params.opsin,
+                    params.dc_group_px + x * 8,
+                    params.dc_group_py + y * 8,
+                    region_qac(
+                        rerank.quant_field,
+                        x,
+                        y,
+                        cw,
+                        ch,
+                        params.scale,
+                        params.distance,
+                    ),
+                    params.qm_mult_x,
+                    meta_r,
+                    params.distance,
+                    cmap_factors(params.ytox_map, params.ytob_map, x, y),
+                    gradient_alpha,
+                    gradient_peak_alpha,
+                    None,
+                )
+            };
+        let big = score(scratch, strategy, bx, by, cx, cy);
+        let mut j_layout = 0.0f32;
+        for y in by..by + cy {
+            for x in bx..bx + cx {
+                if !ac_strategy.is_first_block(x, y) {
+                    continue;
+                }
+                let s = ac_strategy.raw_strategy(x, y);
+                let scx = AcStrategyImage::covered_blocks_x_of(s);
+                let scy = AcStrategyImage::covered_blocks_y_of(s);
+                j_layout += score(scratch, s, x, y, scx, scy).cost;
+            }
+        }
+        if big.cost < j_layout * margin {
+            output.merge_upgrades.push(MergeUpgrade {
+                bx,
+                by,
+                strategy,
+                base: big.base,
+            });
+        }
+    }
+}
+
+/// Parallel evaluation of the margin-band shortlist, then serial install.
+fn rerank_upgrade_merges(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &mut AcStrategyImage,
+    band_scratch: &mut [AcStrategyBandScratch],
+    current_costs: &mut [f32],
+    margin: f32,
+) {
+    let xsize = ac_strategy.xsize();
+    let map_ref: &AcStrategyImage = ac_strategy;
+    rerank
+        .params
+        .ctx
+        .thread_pool
+        .steal_for_each_mut_with_threads(
+            scratch,
+            &mut band_scratch[..rerank.bands.len()],
+            rerank.num_threads,
+            |i, output, scratch| {
+                find_merge_upgrades(rerank, scratch, map_ref, rerank.bands[i], output, margin);
+            },
+        );
+    for band in &band_scratch[..rerank.bands.len()] {
+        for up in &band.merge_upgrades {
+            let cx = AcStrategyImage::covered_blocks_x_of(up.strategy);
+            let cy = AcStrategyImage::covered_blocks_y_of(up.strategy);
+            for y in up.by..up.by + cy {
+                current_costs[y * xsize + up.bx..y * xsize + up.bx + cx].fill(f32::NAN);
+            }
+            current_costs[up.by * xsize + up.bx] = up.base;
+            ac_strategy.set_first(up.bx, up.by, up.strategy);
+        }
+    }
+}
+
 fn rerank_large_transforms(
     rerank: &RerankContext<'_>,
     scratch: &mut CoderScratch,
@@ -1960,21 +2347,23 @@ fn rerank_large_transforms(
 mod tests {
     use super::{
         BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
-        FAST_RERANK_MAX_DISTANCE, MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MergeTuning,
-        RERANK_DOWNGRADE_MARGIN, RERANK_PAIR_GRADIENT_ALPHA, RERANK_PAIR_GRADIENT_FADE_IN_END,
-        RERANK_PAIR_GRADIENT_FADE_IN_START, RERANK_PAIR_GRADIENT_FADE_OUT_END,
-        RERANK_PAIR_GRADIENT_FADE_OUT_START, RERANK_PAIR_GRADIENT_MIN_DOMINANCE,
-        RERANK_PAIR_GRADIENT_PEAK_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_END, RERANK_PAIR_GRADIENT_PEAK_COARSE_START,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
-        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant,
-        block_boundary_error_energy, block_boundary_error_stats, cmap_factors, fill_ac_strategy,
-        fill_selection_bands, gradient_region_stats_scalar,
-        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
-        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
-        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
-        strategy_cost, sub8_strategy_costs, use_dct8_only,
+        FAST_RERANK_MAX_DISTANCE, FINE_ADMIT_RATE_CORRECTION_BITS, MERGE_MARGIN_16,
+        MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MERGE_UPGRADE_MARGIN, MERGE_UPGRADE_MIN_DISTANCE,
+        MergeTuning, RERANK_DOWNGRADE_MARGIN, RERANK_PAIR_GRADIENT_ALPHA,
+        RERANK_PAIR_GRADIENT_FADE_IN_END, RERANK_PAIR_GRADIENT_FADE_IN_START,
+        RERANK_PAIR_GRADIENT_FADE_OUT_END, RERANK_PAIR_GRADIENT_FADE_OUT_START,
+        RERANK_PAIR_GRADIENT_MIN_DOMINANCE, RERANK_PAIR_GRADIENT_PEAK_ALPHA,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_END,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_START, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START, SUB8_MAX_DISTANCE, SearchScope,
+        aggregate_qac_2x2, aggregate_quant, block_boundary_error_energy,
+        block_boundary_error_stats, cmap_factors, fill_ac_strategy, fill_selection_bands,
+        fine_mosaic_lambda, gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar,
+        merge_beats_dct8, merge_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
+        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
+        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
+        use_dct8_only,
     };
     use crate::coder_scratch::CoderScratch;
     use crate::dc_group_data::{
@@ -2343,6 +2732,201 @@ mod tests {
         // The sub-8 refinement is gated on `scope.rectangles()`.
         assert!(!SearchScope::Squares.rectangles());
         assert!(SearchScope::Full.rectangles());
+    }
+
+    fn noise_opsin(w: usize, h: usize, seed: u32) -> Image3F {
+        let mut opsin = Image3F::new(w, h);
+        let mut state = seed;
+        for c in 0..3 {
+            for y in 0..h {
+                for value in opsin.plane_mut(c).row_mut(y) {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // Smooth-ish gradient plus noise so merges of every size
+                    // and sub-8 leaves all get selected somewhere.
+                    let noise = (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                    *value = 0.05 * noise * ((y / 7) % 3) as f32 + 0.002 * y as f32;
+                }
+            }
+        }
+        opsin
+    }
+
+    fn run_selector(
+        speed: crate::Speed,
+        distance: f32,
+        policy: crate::ac_strategy::SelectorPolicy,
+        threads: usize,
+    ) -> (AcStrategyImage, f32) {
+        let mut ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, distance, threads);
+        ctx.selector = policy;
+        let (bw, bh) = (13usize, 11usize);
+        let opsin = noise_opsin(bw * 8, bh * 8, 0x9e37_79b9);
+        let maps = ImageSB::new_fill(2, 2, 0);
+        let mut qf = ImageB::new_fill(bw, bh, 6);
+        for y in 0..bh {
+            for (x, q) in qf.row_mut(y).iter_mut().enumerate() {
+                *q = 4 + ((x * 3 + y * 5) % 7) as u8;
+            }
+        }
+        let mut strategies = AcStrategyImage::new(bw, bh);
+        let mut scratch = CoderScratch::default();
+        let mut fine_rollbacks = Vec::new();
+        let benefit = fill_ac_strategy(
+            &ctx,
+            &mut scratch,
+            &opsin,
+            0,
+            0,
+            distance,
+            1.0,
+            2,
+            &mut qf,
+            &maps,
+            &maps,
+            &mut strategies,
+            &mut fine_rollbacks,
+            threads,
+        );
+        (strategies, benefit)
+    }
+
+    fn strategy_cells(map: &AcStrategyImage) -> Vec<(usize, usize, u8)> {
+        map.iter_first_blocks().collect()
+    }
+
+    /// Every cell belongs to exactly one in-bounds first block.
+    fn assert_map_valid(map: &AcStrategyImage) {
+        let (bw, bh) = (map.xsize(), map.ysize());
+        let mut owner = vec![None; bw * bh];
+        for (bx, by, s) in map.iter_first_blocks() {
+            let cx = AcStrategyImage::covered_blocks_x_of(s);
+            let cy = AcStrategyImage::covered_blocks_y_of(s);
+            for iy in 0..cy {
+                for ix in 0..cx {
+                    let cell = &mut owner[(by + iy) * bw + bx + ix];
+                    assert!(
+                        cell.is_none(),
+                        "cell ({},{}) covered twice",
+                        bx + ix,
+                        by + iy
+                    );
+                    *cell = Some((bx, by));
+                }
+            }
+        }
+        assert!(owner.iter().all(Option::is_some), "uncovered cell");
+    }
+
+    /// With no sub-8 family in play (above the fine-transform band) every
+    /// leaf is DCT8, so the leaf-first planner must reproduce the legacy
+    /// selector's map exactly — same candidates, same margins, same
+    /// tie-breaks — in both search scopes and with parallel bands.
+    #[test]
+    fn leaf_first_reproduces_legacy_when_every_leaf_is_dct8() {
+        use crate::ac_strategy::SelectorPolicy;
+        let legacy = SelectorPolicy::default();
+        let leaf = SelectorPolicy {
+            leaf_first: true,
+            ..SelectorPolicy::default()
+        };
+        for speed in [crate::Speed::Slow, crate::Speed::Fast] {
+            for threads in [1usize, 3] {
+                let (a, ba) = run_selector(speed, 5.5, legacy, threads);
+                let (b, bb) = run_selector(speed, 5.5, leaf, threads);
+                let (ca, cb) = (strategy_cells(&a), strategy_cells(&b));
+                if ca != cb {
+                    let sa: std::collections::BTreeSet<_> = ca.iter().copied().collect();
+                    let sb: std::collections::BTreeSet<_> = cb.iter().copied().collect();
+                    eprintln!(
+                        "{speed:?} x{threads} legacy-only: {:?}",
+                        sa.difference(&sb).collect::<Vec<_>>()
+                    );
+                    eprintln!(
+                        "{speed:?} x{threads} leaf-only:   {:?}",
+                        sb.difference(&sa).collect::<Vec<_>>()
+                    );
+                }
+                assert_eq!(ca, cb, "{speed:?} x{threads}");
+                assert_eq!(ba.to_bits(), bb.to_bits());
+            }
+        }
+    }
+
+    /// The shipped selector is the legacy order with biased propagation;
+    /// leaf-first and raw propagation are opt-in study switches.
+    #[test]
+    fn selector_policy_defaults_to_legacy() {
+        use crate::ac_strategy::SelectorPolicy;
+        let p = SelectorPolicy::default();
+        assert!(!p.leaf_first && !p.raw_propagation);
+    }
+
+    /// The per-block fine admission carries a fitted rate charge: without it
+    /// the reconstruction scorer admits IDENTITY/DCT2X2 blocks that cost
+    /// bytes for no quality (sweep 4..32 bits monotone, plateau 24..32,
+    /// "off" within 0.01% of the plateau on Kodak).
+    #[test]
+    fn fine_admission_charges_the_fitted_correction() {
+        let bits = std::hint::black_box(FINE_ADMIT_RATE_CORRECTION_BITS);
+        assert!((16.0..=32.0).contains(&bits), "bits = {bits}");
+        // Charged at the floored lambda, never at the quarter-price ramp.
+        assert!(fine_mosaic_lambda(0.5) >= crate::ac_strategy::RD_LAMBDA);
+    }
+
+    /// In the sub-8 band the leaf-first planner runs end to end on a mixed
+    /// image, commits a valid map (every covered cell belongs to exactly one
+    /// first block) and credits the gate only for surviving leaves.
+    #[test]
+    fn leaf_first_commits_a_valid_map_with_sub8_leaves() {
+        use crate::ac_strategy::SelectorPolicy;
+        let leaf = SelectorPolicy {
+            leaf_first: true,
+            ..SelectorPolicy::default()
+        };
+        for threads in [1usize, 3] {
+            let (map, benefit) = run_selector(crate::Speed::Slow, 1.0, leaf, threads);
+            assert_map_valid(&map);
+            let sub8 = map
+                .iter_first_blocks()
+                .filter(|&(_, _, s)| crate::dc_group_data::is_sub8_strategy(s))
+                .count();
+            assert!(benefit.is_finite());
+            assert!(
+                sub8 == 0 || benefit > 0.0,
+                "sub-8 leaves survived without credit"
+            );
+        }
+    }
+
+    /// The margin-band upgrade installs only merges whose footprint is
+    /// self-contained and never two overlapping ones: the map stays valid
+    /// under both selectors across the band where it runs.
+    #[test]
+    fn merge_upgrade_keeps_the_map_valid() {
+        use crate::ac_strategy::SelectorPolicy;
+        for leaf_first in [false, true] {
+            let policy = SelectorPolicy {
+                leaf_first,
+                merge_upgrade: true,
+                ..SelectorPolicy::default()
+            };
+            for distance in [1.5f32, 2.0, 3.0, 6.0] {
+                let (map, _) = run_selector(crate::Speed::Slow, distance, policy, 3);
+                assert_map_valid(&map);
+            }
+        }
+    }
+
+    /// The upgrade is gated out of the HQ band (it loses there on the
+    /// holdout) and runs at the knife-edge margin (0.9 is inert, 1.1 turns
+    /// SS2 flat).
+    #[test]
+    fn merge_upgrade_is_gated_and_knife_edge() {
+        let gate = std::hint::black_box(MERGE_UPGRADE_MIN_DISTANCE);
+        let margin = std::hint::black_box(MERGE_UPGRADE_MARGIN);
+        assert!((1.5..=2.5).contains(&gate), "gate {gate}");
+        assert!((0.95..=1.05).contains(&margin), "margin {margin}");
+        assert!(crate::ac_strategy::SelectorPolicy::default().merge_upgrade);
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub(crate) struct EncodingContext {
     channel_weights: [f32; 3],
     /// Transform-merge knobs resolved at this encodes distance.
     pub(crate) merge: ac_strategy::MergeTuning,
+    /// Which AC-strategy selector runs (study switch, see [`ac_strategy::SelectorPolicy`]).
+    pub(crate) selector: ac_strategy::SelectorPolicy,
     base_matrices: &'static DequantMatrices,
     sat_matrices: &'static DequantMatrices,
     pair_b_matrices: &'static DequantMatrices,
@@ -246,6 +248,7 @@ impl EncodingContext {
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
+            selector: ac_strategy::SelectorPolicy::from_env(),
             base_matrices,
             sat_matrices: DequantMatrices::new_saturated(distance),
             pair_b_matrices: if speed == Speed::Slow {

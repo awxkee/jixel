@@ -34,8 +34,9 @@
 //! aom AV1 reference, and (optionally, `--jpeg`) a classic JPEG reference
 //! (cjpegli when available, else cjpeg/libjpeg-turbo, else the image crate)
 //! — over every image in a folder at each requested
-//! butteraugli distance, decodes, scores SSIMULACRA2, and reports the **folder
-//! mean** rate (bits/pixel) and SSIMULACRA2 per series. It prints the per-series
+//! butteraugli distance, decodes, scores SSIMULACRA2 (plus the butteraugli
+//! 3-norm whenever `butteraugli_main` is on PATH), and reports the **folder
+//! mean** rate (bits/pixel) and each metric per series. It prints the per-series
 //! means and draws one aggregate R/D chart (mean SS2 vs mean bpp), one line per
 //! series — the corpus-level analogue of the per-image chart in `stats`.
 //!
@@ -44,6 +45,7 @@
 //! meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]
 //!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]
 //!                  [--no-aom] [--no-cjxl] [--patches] [--jpeg] [--cjpegli PATH]
+//!                  [--no-butteraugli] [--butteraugli-bin PATH]
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -81,10 +83,23 @@ const CVVDP_VENV_BIN: &str = concat!(
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
 const CVVDP_DISPLAY: &str = "standard_4k";
 
+// --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3.
+// On by default when the tool is there (it is cheap next to the encodes);
+// disable with `--no-butteraugli`. It reads the same PPMs cvvdp is fed, so
+// every metric scores exactly the buffers SSIMULACRA2 scored.
+const BUTTERAUGLI_BIN: &str = "butteraugli_main";
+/// p of the butteraugli p-norm reported alongside the max distance.
+const BUTTERAUGLI_PNORM: u32 = 3;
+
 /// One measured (rate, quality) pair for a single image.
 struct Sample {
     bpp: f64,
     ss2: f64,
+    /// butteraugli p-norm distance (lower = better). `None` when butteraugli
+    /// scoring is off or failed for this sample.
+    ba: Option<f64>,
+    /// butteraugli max distance (worst region), lower = better.
+    ba_max: Option<f64>,
     /// ColorVideoVDP quality in JOD (10 = identical, lower = worse). `None`
     /// when cvvdp scoring is off or failed for this sample.
     cvvdp: Option<f64>,
@@ -94,6 +109,10 @@ struct Sample {
 struct Point {
     bpp: f64,
     ss2: f64,
+    /// Folder-mean butteraugli p-norm / max distance; `None` when no sample of
+    /// the bucket had a score.
+    ba: Option<f64>,
+    ba_max: Option<f64>,
     /// Folder-mean CVVDP JOD; `None` when no sample of the bucket had a score.
     cvvdp: Option<f64>,
     /// Chart annotation ("-d 1", "q90"-style — here the butteraugli distance).
@@ -287,6 +306,8 @@ fn main() -> Result<()> {
     let mut cjpegli = "cjpegli".to_string();
     let mut with_cvvdp = false;
     let mut cvvdp_bin: Option<String> = None;
+    let mut with_butteraugli = true;
+    let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
     let mut cvvdp_display = CVVDP_DISPLAY.to_string();
     let mut cvvdp_device: Option<String> = None;
 
@@ -366,6 +387,19 @@ fn main() -> Result<()> {
                 cvvdp_device = Some(arg(&args, i + 1)?.to_string());
                 i += 2;
             }
+            "--butteraugli" => {
+                with_butteraugli = true;
+                i += 1;
+            }
+            "--no-butteraugli" => {
+                with_butteraugli = false;
+                i += 1;
+            }
+            "--butteraugli-bin" => {
+                butteraugli_bin = arg(&args, i + 1)?.to_string();
+                with_butteraugli = true;
+                i += 2;
+            }
             "-h" | "--help" => usage(),
             other => {
                 if folder.is_some() {
@@ -405,6 +439,16 @@ fn main() -> Result<()> {
     } else {
         JpegTool::Builtin
     };
+    // butteraugli 3-norm: on whenever libjxl's `butteraugli_main` is reachable.
+    if with_butteraugli && !available(&butteraugli_bin) {
+        eprintln!(
+            "warning: butteraugli_main not found ({butteraugli_bin}); skipping the butteraugli \
+             {BUTTERAUGLI_PNORM}-norm. Override with --butteraugli-bin or pass --no-butteraugli."
+        );
+        with_butteraugli = false;
+    }
+    let butteraugli = with_butteraugli.then_some(butteraugli_bin);
+
     // ColorVideoVDP: explicit --cvvdp-bin, else `cvvdp` on PATH, else the
     // parameters_fit venv. Warn + skip rather than aborting when none works.
     let mut cvvdp: Option<Cvvdp> = if with_cvvdp {
@@ -540,10 +584,10 @@ fn main() -> Result<()> {
                     ),
                 }
             }
-            if let Some(tool) = cvvdp.as_mut()
-                && !done.is_empty()
-            {
-                let scored = (|| -> Result<Vec<f64>> {
+            // The file-fed metrics (butteraugli, cvvdp) share one set of PPMs:
+            // the reference plus one decode per series, written once per image.
+            if (butteraugli.is_some() || cvvdp.is_some()) && !done.is_empty() {
+                let written = (|| -> Result<(PathBuf, Vec<PathBuf>)> {
                     let ref_ppm = tmp.join(format!("{stem}_ref.ppm"));
                     write_ppm(&ref_ppm, &rgb, w, h)?;
                     let mut tests = Vec::with_capacity(done.len());
@@ -552,15 +596,44 @@ fn main() -> Result<()> {
                         write_ppm(&t, dec, w, h)?;
                         tests.push(t);
                     }
-                    tool.score(&ref_ppm, &tests)
+                    Ok((ref_ppm, tests))
                 })();
-                match scored {
-                    Ok(jods) => {
-                        for ((_, s, _), jod) in done.iter_mut().zip(jods) {
-                            s.cvvdp = Some(jod);
+                match written {
+                    Ok((ref_ppm, tests)) => {
+                        if let Some(bin) = &butteraugli {
+                            for ((idx, s, _), test) in done.iter_mut().zip(&tests) {
+                                match score_butteraugli(bin, &ref_ppm, test) {
+                                    Ok((norm, max)) => {
+                                        s.ba = Some(norm);
+                                        s.ba_max = Some(max);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "  {:<32} {:<18} butteraugli SKIP: {e:#}",
+                                        short_name(img),
+                                        series[*idx].label
+                                    ),
+                                }
+                            }
+                        }
+                        if let Some(tool) = cvvdp.as_mut() {
+                            match tool.score(&ref_ppm, &tests) {
+                                Ok(jods) => {
+                                    for ((_, s, _), jod) in done.iter_mut().zip(jods) {
+                                        s.cvvdp = Some(jod);
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "  {:<32} cvvdp SKIP (all series): {e:#}",
+                                    short_name(img)
+                                ),
+                            }
+                        }
+                        let _ = std::fs::remove_file(&ref_ppm);
+                        for t in &tests {
+                            let _ = std::fs::remove_file(t);
                         }
                     }
-                    Err(e) => eprintln!("  {:<32} cvvdp SKIP (all series): {e:#}", short_name(img)),
+                    Err(e) => eprintln!("  {:<32} metrics SKIP (ppm): {e:#}", short_name(img)),
                 }
             }
             for (idx, s, _) in done {
@@ -579,9 +652,28 @@ fn main() -> Result<()> {
             let bpp: Vec<f64> = bucket.iter().map(|p| p.bpp).collect();
             let ss2: Vec<f64> = bucket.iter().map(|p| p.ss2).collect();
             let jod: Vec<f64> = bucket.iter().filter_map(|p| p.cvvdp).collect();
+            let ba: Vec<f64> = bucket.iter().filter_map(|p| p.ba).collect();
+            let ba_max: Vec<f64> = bucket.iter().filter_map(|p| p.ba_max).collect();
             let mean_bpp = arith_mean(&bpp);
             let mean_ss2 = arith_mean(&ss2);
             let mean_cvvdp = (!jod.is_empty()).then(|| arith_mean(&jod));
+            let mean_ba = (!ba.is_empty()).then(|| arith_mean(&ba));
+            let mean_ba_max = (!ba_max.is_empty()).then(|| arith_mean(&ba_max));
+            let ba_col = match mean_ba {
+                Some(v) => {
+                    let n = if ba.len() == bucket.len() {
+                        String::new()
+                    } else {
+                        format!(" (n={})", ba.len())
+                    };
+                    match mean_ba_max {
+                        Some(m) => format!("  BA{BUTTERAUGLI_PNORM} {v:.4} (max {m:.4}){n}"),
+                        None => format!("  BA{BUTTERAUGLI_PNORM} {v:.4}{n}"),
+                    }
+                }
+                None if butteraugli.is_some() => format!("  BA{BUTTERAUGLI_PNORM} n/a"),
+                None => String::new(),
+            };
             let cvvdp_col = match mean_cvvdp {
                 Some(v) if jod.len() == bucket.len() => format!("  CVVDP {v:.4}"),
                 Some(v) => format!("  CVVDP {v:.4} (n={})", jod.len()),
@@ -589,7 +681,7 @@ fn main() -> Result<()> {
                 None => String::new(),
             };
             println!(
-                "  {:<18} n={:<3}  bpp[arith {:.4} geo {}]  SS2 {:.4}{cvvdp_col}",
+                "  {:<18} n={:<3}  bpp[arith {:.4} geo {}]  SS2 {:.4}{ba_col}{cvvdp_col}",
                 s.label,
                 bucket.len(),
                 mean_bpp,
@@ -599,6 +691,8 @@ fn main() -> Result<()> {
             s.points.push(Point {
                 bpp: mean_bpp,
                 ss2: mean_ss2,
+                ba: mean_ba,
+                ba_max: mean_ba_max,
                 cvvdp: mean_cvvdp,
                 note: dist_note(d),
             });
@@ -619,13 +713,49 @@ fn main() -> Result<()> {
         ),
         &series,
         &YAxis {
-            desc: "mean SSIMULACRA2 (higher = better)",
+            desc: "mean SSIMULACRA2 (higher = better)".into(),
             range: (0.0, 100.0),
             label_dy: 0.4,
             get: |p| Some(p.ss2),
         },
     )?;
     println!("chart -> {}", chart_path.display());
+    if butteraugli.is_some() {
+        let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli.png"));
+        draw_chart(
+            &chart_path,
+            &format!(
+                "{name} — mean butteraugli {BUTTERAUGLI_PNORM}-norm vs rate ({} images)",
+                images.len()
+            ),
+            &series,
+            &YAxis {
+                desc: format!(
+                    "mean butteraugli {BUTTERAUGLI_PNORM}-norm distance (lower = better)"
+                ),
+                range: (0.0, f64::INFINITY),
+                label_dy: 0.02,
+                get: |p| p.ba,
+            },
+        )?;
+        println!("chart -> {}", chart_path.display());
+        let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli_max.png"));
+        draw_chart(
+            &chart_path,
+            &format!(
+                "{name} — mean butteraugli max distance vs rate ({} images)",
+                images.len()
+            ),
+            &series,
+            &YAxis {
+                desc: "mean butteraugli max distance (lower = better)".into(),
+                range: (0.0, f64::INFINITY),
+                label_dy: 0.05,
+                get: |p| p.ba_max,
+            },
+        )?;
+        println!("chart -> {}", chart_path.display());
+    }
     if cvvdp.is_some() {
         let chart_path = out_dir.join(format!("{name}_mean_rd_cvvdp.png"));
         draw_chart(
@@ -636,7 +766,7 @@ fn main() -> Result<()> {
             ),
             &series,
             &YAxis {
-                desc: "mean CVVDP (JOD, 10 = identical, higher = better)",
+                desc: "mean CVVDP (JOD, 10 = identical, higher = better)".into(),
                 range: (0.0, 10.0),
                 label_dy: 0.04,
                 get: |p| p.cvvdp,
@@ -702,6 +832,8 @@ fn bench_jixel(
         Sample {
             bpp: bytes as f64 * 8.0 / npx,
             ss2,
+            ba: None,
+            ba_max: None,
             cvvdp: None,
         },
         dec,
@@ -751,6 +883,8 @@ fn bench_cjxl(
         Sample {
             bpp: bytes as f64 * 8.0 / npx,
             ss2,
+            ba: None,
+            ba_max: None,
             cvvdp: None,
         },
         dec,
@@ -805,6 +939,8 @@ fn bench_avif_aom(
         Sample {
             bpp: bytes as f64 * 8.0 / npx,
             ss2,
+            ba: None,
+            ba_max: None,
             cvvdp: None,
         },
         dec,
@@ -898,6 +1034,8 @@ fn bench_jpeg(
         Sample {
             bpp: jpg.len() as f64 * 8.0 / npx,
             ss2,
+            ba: None,
+            ba_max: None,
             cvvdp: None,
         },
         dec.into_raw(),
@@ -1006,6 +1144,42 @@ fn parse_cvvdp_line(line: &str) -> Option<f64> {
     body.split_whitespace().next()?.parse::<f64>().ok()
 }
 
+/// butteraugli distance between two images via libjxl's `butteraugli_main`.
+/// Returns `(p-norm, max)`; both lower = better. Output shape is the max
+/// distance on the first line, then "`<p>`-norm: `<value>`".
+fn score_butteraugli(bin: &str, reference: &Path, dist: &Path) -> Result<(f64, f64)> {
+    let output = Command::new(bin)
+        .arg(reference)
+        .arg(dist)
+        .arg("--pnorm")
+        .arg(BUTTERAUGLI_PNORM.to_string())
+        .output()
+        .with_context(|| format!("running butteraugli ({bin})"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "butteraugli ({bin}) failed for {}\nstdout: {stdout}\nstderr: {stderr}",
+            dist.display()
+        );
+    }
+    let tag = format!("{BUTTERAUGLI_PNORM}-norm:");
+    let mut max = None;
+    let mut norm = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&tag) {
+            norm = rest.trim().parse::<f64>().ok();
+        } else if max.is_none() {
+            max = line.parse::<f64>().ok();
+        }
+    }
+    match (norm, max) {
+        (Some(n), Some(m)) => Ok((n, m)),
+        _ => bail!("could not parse butteraugli output:\n{stdout}"),
+    }
+}
+
 /// SSIMULACRA2 between two interleaved RGB8 buffers.
 fn score(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
     let to_rgb = |b: &[u8]| -> Result<Rgb> {
@@ -1067,7 +1241,7 @@ fn collect_images(folder: &Path) -> Result<Vec<PathBuf>> {
 
 /// Which quality metric a chart plots on its y axis.
 struct YAxis<F: Fn(&Point) -> Option<f64>> {
-    desc: &'static str,
+    desc: String,
     /// Hard clamp of the padded y range (metric's natural bounds).
     range: (f64, f64),
     /// Vertical offset of the per-point annotation, in axis units.
@@ -1095,7 +1269,7 @@ fn draw_chart<F: Fn(&Point) -> Option<f64>>(
     chart
         .configure_mesh()
         .x_desc("mean rate (bits / pixel)")
-        .y_desc(y.desc)
+        .y_desc(y.desc.as_str())
         .axis_desc_style(("sans-serif", 18))
         .label_style(("sans-serif", 14))
         .draw()?;
@@ -1225,10 +1399,11 @@ fn usage() -> ! {
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
          \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n\
-         \x20                [--no-cvvdp]\n\
+         \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
-         image in FOLDER at each distance, decodes, scores SSIMULACRA2 (and ColorVideoVDP\n  \
-         JOD with --cvvdp), prints the folder mean bpp/SS2[/CVVDP] per series, and writes\n  \
+         image in FOLDER at each distance, decodes, scores SSIMULACRA2 (the butteraugli\n  \
+         3-norm too whenever butteraugli_main is on PATH, and ColorVideoVDP JOD with\n  \
+         --cvvdp), prints the folder mean bpp/SS2[/BA3][/CVVDP] per series, and writes\n  \
          an aggregate R/D chart per metric to DIR."
     );
     std::process::exit(2);
