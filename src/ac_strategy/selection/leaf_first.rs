@@ -34,7 +34,8 @@
 //! transform, so a merge never competes against the best representation of
 //! the blocks it replaces. This selector inverts the order:
 //!
-//! 1. every 8x8 block picks its best 8x8-family transform (its *leaf*);
+//! 1. every 8x8 block picks its best structural 8x8-family transform (its
+//!    *leaf*: DCT8, DCT4x4/4x8/8x4 or AFV; IDENTITY/DCT2X2 come afterwards);
 //! 2. each 2x2 super-block plans the best of {four leaves, vertical pairs,
 //!    horizontal pairs, 16x16}, with merges gated against the leaf sum;
 //! 3. each 4-aligned 4x4 region plans the best of {four super-block plans,
@@ -94,6 +95,19 @@ fn expand_2x2(grid: [u8; 4], sx: usize, sy: usize, into: &mut [u8; 16]) {
             into[(sy * 2 + dy) * 4 + sx * 2 + dx] = grid[dy * 2 + dx];
         }
     }
+}
+
+/// The `cov_x x cov_y` window of a 4x4 child grid at offset `(ox, oy)`,
+/// re-based so its own origin is index 0 (the rerank indexes `iy * 4 + ix`
+/// from the selected transform's first block).
+fn sub_grid(grid: &[u8; 16], ox: usize, oy: usize, cov_x: usize, cov_y: usize) -> [u8; 16] {
+    let mut out = [NO_CHILD_BLOCK; 16];
+    for iy in 0..cov_y {
+        for ix in 0..cov_x {
+            out[iy * 4 + ix] = grid[(oy + iy) * 4 + ox + ix];
+        }
+    }
+    out
 }
 
 fn grid_nontrivial(grid: &[u8]) -> bool {
@@ -377,6 +391,11 @@ pub(super) fn select_band_leaf_first(
     // --- 1. Leaves -------------------------------------------------------
     let with_dct4 = distance <= SUB8_MAX_DISTANCE;
     let with_fine = distance <= FINE_TRANSFORM_MAX_DISTANCE;
+    // IDENTITY/DCT2X2 stay out of the structural leaves (their
+    // coefficient-domain cost is not comparable with the orthogonal
+    // transforms; as leaves they tie with the post-merge order on every
+    // corpus) and refine the remaining DCT8 blocks afterwards.
+    let with_fine_leaf = false;
     let sub8_enabled =
         scope.rectangles() && (with_dct4 || distance <= AFV_MAX_DISTANCE || with_fine);
     let bias_afv = BIAS_AFV.at(distance);
@@ -410,7 +429,7 @@ pub(super) fn select_band_leaf_first(
                     meta_r,
                     Some(dct8),
                     with_dct4,
-                    with_fine,
+                    with_fine_leaf,
                     bias_afv,
                 )
             } else {
@@ -582,14 +601,27 @@ pub(super) fn select_band_leaf_first(
                             expand_2x2(plans[sy][sx].grid, sx, sy, &mut grid);
                         }
                     }
-                    // The rerank restores this child layout on a downgrade;
-                    // the merge's footprint is one grid, halves included.
-                    if grid_nontrivial(&grid) {
-                        saved.push(SavedChild {
-                            bx: bx as u16,
-                            by: by as u16,
-                            grid,
-                        });
+                    // The rerank restores a child layout per selected
+                    // transform, looked up by its own first block: one grid
+                    // for a 32x32, one per half for the rectangles (as the
+                    // legacy `capture_children` does).
+                    let (cov_x, cov_y) = match best_strategy {
+                        STRATEGY_DCT32X32 => (4, 4),
+                        STRATEGY_DCT32X16 => (2, 4),
+                        _ => (4, 2),
+                    };
+                    for (ox, oy) in [(0, 0), (4 - cov_x, 4 - cov_y)] {
+                        let half = sub_grid(&grid, ox, oy, cov_x, cov_y);
+                        if grid_nontrivial(&half) {
+                            saved.push(SavedChild {
+                                bx: (bx + ox) as u16,
+                                by: (by + oy) as u16,
+                                grid: half,
+                            });
+                        }
+                        if cov_x == 4 && cov_y == 4 {
+                            break;
+                        }
                     }
                     match best_strategy {
                         STRATEGY_DCT32X32 => ac_strategy.set_first(bx, by, STRATEGY_DCT32X32),
@@ -650,5 +682,58 @@ pub(super) fn select_band_leaf_first(
             }
         }
         by += if four_row { 4 } else { 2 };
+    }
+
+    if with_fine {
+        // Post-merge fine refinement over whatever is still DCT8.
+        for by in y_begin..y_end {
+            for bx in 0..xsize {
+                if ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
+                    continue;
+                }
+                let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
+                if let Some(p) = evaluate_sub8(
+                    params, scratch, bx, by, qac, meta_r, None, false, true, bias_afv,
+                ) {
+                    ac_strategy.set_first(bx, by, p.strategy);
+                    output.leaves[(by - y_begin) * xsize + bx].gain = p.gain;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NO_CHILD_BLOCK, sub_grid};
+
+    /// A 32x16 pair's child layouts are looked up per half by the rerank, so
+    /// the right half's grid must be re-based to its own origin (and the
+    /// same for a 16x32 pair's bottom half).
+    #[test]
+    fn sub_grid_rebases_rectangle_halves() {
+        let mut grid = [NO_CHILD_BLOCK; 16];
+        for (i, cell) in grid.iter_mut().enumerate() {
+            *cell = i as u8; // unique marker per cell
+        }
+        let left = sub_grid(&grid, 0, 0, 2, 4);
+        let right = sub_grid(&grid, 2, 0, 2, 4);
+        for iy in 0..4 {
+            assert_eq!(left[iy * 4], (iy * 4) as u8);
+            assert_eq!(left[iy * 4 + 1], (iy * 4 + 1) as u8);
+            assert_eq!(right[iy * 4], (iy * 4 + 2) as u8);
+            assert_eq!(right[iy * 4 + 1], (iy * 4 + 3) as u8);
+            assert_eq!(left[iy * 4 + 2], NO_CHILD_BLOCK);
+            assert_eq!(right[iy * 4 + 3], NO_CHILD_BLOCK);
+        }
+        let top = sub_grid(&grid, 0, 0, 4, 2);
+        let bottom = sub_grid(&grid, 0, 2, 4, 2);
+        for ix in 0..4 {
+            assert_eq!(top[ix], ix as u8);
+            assert_eq!(top[4 + ix], (4 + ix) as u8);
+            assert_eq!(bottom[ix], (8 + ix) as u8);
+            assert_eq!(bottom[4 + ix], (12 + ix) as u8);
+            assert_eq!(bottom[8 + ix], NO_CHILD_BLOCK);
+        }
     }
 }

@@ -1206,7 +1206,7 @@ pub(crate) fn fill_ac_strategy(
         meta_r,
         scope,
     };
-    let leaf_first = ctx.selector.leaf_first;
+    let leaf_first = ctx.selector.leaf_first && distance <= LEAF_FIRST_MAX_DISTANCE;
     let run_band = |scratch: &mut CoderScratch,
                     output: &mut AcStrategyBandScratch,
                     strategy: &mut AcStrategyImage,
@@ -2346,30 +2346,35 @@ fn rerank_large_transforms(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
-        FAST_RERANK_MAX_DISTANCE, FINE_ADMIT_RATE_CORRECTION_BITS, MERGE_MARGIN_16,
-        MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MERGE_UPGRADE_MARGIN, MERGE_UPGRADE_MIN_DISTANCE,
-        MergeTuning, RERANK_DOWNGRADE_MARGIN, RERANK_PAIR_GRADIENT_ALPHA,
-        RERANK_PAIR_GRADIENT_FADE_IN_END, RERANK_PAIR_GRADIENT_FADE_IN_START,
-        RERANK_PAIR_GRADIENT_FADE_OUT_END, RERANK_PAIR_GRADIENT_FADE_OUT_START,
-        RERANK_PAIR_GRADIENT_MIN_DOMINANCE, RERANK_PAIR_GRADIENT_PEAK_ALPHA,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_END,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_START, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START, SUB8_MAX_DISTANCE, SearchScope,
-        aggregate_qac_2x2, aggregate_quant, block_boundary_error_energy,
-        block_boundary_error_stats, cmap_factors, fill_ac_strategy, fill_selection_bands,
-        fine_mosaic_lambda, gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar,
-        merge_beats_dct8, merge_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
-        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
-        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
-        use_dct8_only,
+        AcStrategyParams, Chosen32Cost, META_R, NO_CHILD_BLOCK, SavedChild, SelectionContext,
+        leaf_first, select_band,
     };
-    use crate::coder_scratch::CoderScratch;
+    use super::{
+        BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
+        FAST_RERANK_MAX_DISTANCE, FINE_ADMIT_RATE_CORRECTION_BITS, LEAF_FIRST_MAX_DISTANCE,
+        MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MERGE_UPGRADE_MARGIN,
+        MERGE_UPGRADE_MIN_DISTANCE, MergeTuning, RERANK_DOWNGRADE_MARGIN,
+        RERANK_PAIR_GRADIENT_ALPHA, RERANK_PAIR_GRADIENT_FADE_IN_END,
+        RERANK_PAIR_GRADIENT_FADE_IN_START, RERANK_PAIR_GRADIENT_FADE_OUT_END,
+        RERANK_PAIR_GRADIENT_FADE_OUT_START, RERANK_PAIR_GRADIENT_MIN_DOMINANCE,
+        RERANK_PAIR_GRADIENT_PEAK_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_END, RERANK_PAIR_GRADIENT_PEAK_COARSE_START,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
+        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant,
+        block_boundary_error_energy, block_boundary_error_stats, cmap_factors, fill_ac_strategy,
+        fill_selection_bands, fine_mosaic_lambda, gradient_region_stats_scalar,
+        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
+        quant_refinement_steps, rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
+        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
+        strategy_cost, sub8_strategy_costs, use_dct8_only,
+    };
+    use crate::coder_scratch::{AcStrategyBandScratch, CoderScratch};
     use crate::dc_group_data::{
         AcStrategyImage, STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8,
-        STRATEGY_DCT8X4, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64,
-        STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
+        STRATEGY_DCT8X4, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
+        STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+        STRATEGY_IDENTITY,
     };
     use crate::encoding_context::EncodingContext;
     use crate::image::{Image3F, ImageB, ImageSB};
@@ -2823,42 +2828,112 @@ mod tests {
     /// tie-breaks — in both search scopes and with parallel bands.
     #[test]
     fn leaf_first_reproduces_legacy_when_every_leaf_is_dct8() {
-        use crate::ac_strategy::SelectorPolicy;
-        let legacy = SelectorPolicy::default();
-        let leaf = SelectorPolicy {
-            leaf_first: true,
-            ..SelectorPolicy::default()
-        };
-        for speed in [crate::Speed::Slow, crate::Speed::Fast] {
-            for threads in [1usize, 3] {
-                let (a, ba) = run_selector(speed, 5.5, legacy, threads);
-                let (b, bb) = run_selector(speed, 5.5, leaf, threads);
-                let (ca, cb) = (strategy_cells(&a), strategy_cells(&b));
-                if ca != cb {
-                    let sa: std::collections::BTreeSet<_> = ca.iter().copied().collect();
-                    let sb: std::collections::BTreeSet<_> = cb.iter().copied().collect();
-                    eprintln!(
-                        "{speed:?} x{threads} legacy-only: {:?}",
-                        sa.difference(&sb).collect::<Vec<_>>()
-                    );
-                    eprintln!(
-                        "{speed:?} x{threads} leaf-only:   {:?}",
-                        sb.difference(&sa).collect::<Vec<_>>()
-                    );
+        // The distance gate makes the two orders identical by construction
+        // above the sub-8 band, so call the band planners directly at a
+        // distance where no structural sub-8 candidate exists: the leaf-first
+        // planner must then reproduce the legacy super-block/32 decisions,
+        // saved child layouts and 32-level costs exactly.
+        for scope in [SearchScope::Full, SearchScope::Squares] {
+            let distance = 5.5f32;
+            let ctx =
+                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            let (bw, bh) = (13usize, 11usize);
+            let opsin = noise_opsin(bw * 8, bh * 8, 0x9e37_79b9);
+            let maps = ImageSB::new_fill(2, 2, 0);
+            let mut qf = ImageB::new_fill(bw, bh, 6);
+            for y in 0..bh {
+                for (x, q) in qf.row_mut(y).iter_mut().enumerate() {
+                    *q = 4 + ((x * 3 + y * 5) % 7) as u8;
                 }
-                assert_eq!(ca, cb, "{speed:?} x{threads}");
-                assert_eq!(ba.to_bits(), bb.to_bits());
             }
+            let params = AcStrategyParams {
+                ctx: &ctx,
+                opsin: &opsin,
+                dc_group_px: 0,
+                dc_group_py: 0,
+                distance,
+                scale: 1.0,
+                qm_mult_x: 1.0,
+                ytox_map: &maps,
+                ytob_map: &maps,
+            };
+            let selection = SelectionContext {
+                params,
+                quant_field: &qf,
+                meta_r: META_R,
+                scope,
+            };
+            let mut scratch = CoderScratch::default();
+            let mut legacy_map = AcStrategyImage::new(bw, bh);
+            let mut legacy = AcStrategyBandScratch::default();
+            scratch.dct8_costs.clear();
+            let benefit = select_band(
+                &selection,
+                &mut scratch,
+                &mut legacy_map,
+                (0, bh),
+                &mut legacy.chosen32,
+                &mut legacy.saved_children,
+                &mut legacy.upgrade_candidates,
+            );
+            assert_eq!(benefit, 0.0);
+            let mut leaf_map = AcStrategyImage::new(bw, bh);
+            let mut leaf = AcStrategyBandScratch::default();
+            leaf_first::select_band_leaf_first(
+                &selection,
+                &mut scratch,
+                &mut leaf_map,
+                (0, bh),
+                &mut leaf,
+            );
+            assert_eq!(
+                strategy_cells(&legacy_map),
+                strategy_cells(&leaf_map),
+                "{scope:?}"
+            );
+            let costs = |c: &Vec<Chosen32Cost>| {
+                c.iter()
+                    .map(|c| (c.bx, c.by, c.cost.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(costs(&legacy.chosen32), costs(&leaf.chosen32), "{scope:?}");
+            // The rerank sees saved children through a last-wins map keyed by
+            // the selected merge's first block; legacy also leaves dead
+            // 16-level entries under a 32 (never looked up), leaf-first does
+            // not — compare the effective view.
+            let effective = |c: &Vec<SavedChild>, map: &AcStrategyImage| {
+                let mut m = std::collections::BTreeMap::new();
+                for c in c {
+                    m.insert((c.bx, c.by), c.grid);
+                }
+                m.retain(|&(bx, by), _| {
+                    map.is_first_block(bx as usize, by as usize)
+                        && map.raw_strategy(bx as usize, by as usize) != STRATEGY_DCT
+                });
+                m
+            };
+            assert_eq!(
+                effective(&legacy.saved_children, &legacy_map),
+                effective(&leaf.saved_children, &leaf_map),
+                "{scope:?}"
+            );
+            assert!(
+                leaf.leaves
+                    .iter()
+                    .all(|l| l.strategy == STRATEGY_DCT && l.gain == 0.0)
+            );
         }
     }
 
-    /// The shipped selector is the legacy order with biased propagation;
-    /// leaf-first and raw propagation are opt-in study switches.
+    /// The shipped selector is leaf-first inside the DCT4/AFV band with
+    /// biased propagation; raw propagation stays an opt-in study switch and
+    /// the band edge is the sub-8 gate.
     #[test]
-    fn selector_policy_defaults_to_legacy() {
+    fn selector_policy_defaults() {
         use crate::ac_strategy::SelectorPolicy;
         let p = SelectorPolicy::default();
-        assert!(!p.leaf_first && !p.raw_propagation);
+        assert!(p.leaf_first && !p.raw_propagation && p.merge_upgrade);
+        assert_eq!(LEAF_FIRST_MAX_DISTANCE, SUB8_MAX_DISTANCE);
     }
 
     /// The per-block fine admission carries a fitted rate charge: without it
@@ -2927,6 +3002,104 @@ mod tests {
         assert!((1.5..=2.5).contains(&gate), "gate {gate}");
         assert!((0.95..=1.05).contains(&margin), "margin {margin}");
         assert!(crate::ac_strategy::SelectorPolicy::default().merge_upgrade);
+    }
+
+    /// Every saved child layout is keyed by a selected transform's own first
+    /// block and describes exactly that transform's footprint: a 32x16 /
+    /// 16x32 pair gets one grid per half (the rerank looks each half up
+    /// separately), never one 4x4 grid on the first half.
+    #[test]
+    fn leaf_first_saved_children_match_their_transform_footprints() {
+        use crate::ac_strategy::SelectorPolicy;
+        let policy = SelectorPolicy {
+            leaf_first: true,
+            ..SelectorPolicy::default()
+        };
+        let mut seen_rect_halves = 0;
+        let mut histogram = [0usize; crate::dc_group_data::NUM_STRATEGIES];
+        for (distance, pattern) in [
+            (1.0f32, 0u32),
+            (2.5, 0),
+            (4.0, 0),
+            (6.0, 0),
+            (2.5, 1),
+            (4.0, 1),
+            (2.5, 2),
+            (4.0, 2),
+        ] {
+            let mut ctx =
+                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            ctx.selector = policy;
+            let (bw, bh) = (12usize, 12usize);
+            let mut opsin = noise_opsin(bw * 8, bh * 8, 0x1234_abcd);
+            // Patterns 1/2 add a one-directional ramp so that wide (16x32)
+            // and tall (32x16) rectangles beat the square merges somewhere.
+            if pattern != 0 {
+                for c in 0..3 {
+                    for y in 0..bh * 8 {
+                        for (x, v) in opsin.plane_mut(c).row_mut(y).iter_mut().enumerate() {
+                            let t = if pattern == 1 { y } else { x } as f32;
+                            *v = 0.2 * *v + 0.02 * (t * 0.35).sin();
+                        }
+                    }
+                }
+            }
+            let maps = ImageSB::new_fill(2, 2, 0);
+            let qf = ImageB::new_fill(bw, bh, 5);
+            let mut map = AcStrategyImage::new(bw, bh);
+            let mut scratch = CoderScratch::default();
+            let params = AcStrategyParams {
+                ctx: &ctx,
+                opsin: &opsin,
+                dc_group_px: 0,
+                dc_group_py: 0,
+                distance,
+                scale: 1.0,
+                qm_mult_x: 1.0,
+                ytox_map: &maps,
+                ytob_map: &maps,
+            };
+            let selection = SelectionContext {
+                params,
+                quant_field: &qf,
+                meta_r: META_R,
+                scope: SearchScope::Full,
+            };
+            let mut band = AcStrategyBandScratch::default();
+            leaf_first::select_band_leaf_first(
+                &selection,
+                &mut scratch,
+                &mut map,
+                (0, bh),
+                &mut band,
+            );
+            for (_, _, s) in map.iter_first_blocks() {
+                histogram[s as usize] += 1;
+            }
+            for child in &band.saved_children {
+                let (bx, by) = (child.bx as usize, child.by as usize);
+                assert!(map.is_first_block(bx, by), "saved child at a covered cell");
+                let s = map.raw_strategy(bx, by);
+                let cx = AcStrategyImage::covered_blocks_x_of(s);
+                let cy = AcStrategyImage::covered_blocks_y_of(s);
+                assert!(cx * cy > 1, "saved child under a single block");
+                if matches!(s, STRATEGY_DCT32X16 | STRATEGY_DCT16X32) {
+                    seen_rect_halves += 1;
+                }
+                for iy in 0..4 {
+                    for ix in 0..4 {
+                        let g = child.grid[iy * 4 + ix];
+                        assert!(
+                            g == NO_CHILD_BLOCK || (ix < cx && iy < cy),
+                            "child grid cell ({ix},{iy}) outside a {cx}x{cy} footprint at ({bx},{by})"
+                        );
+                    }
+                }
+            }
+        }
+        // Rectangle halves are rare on synthetic content; `sub_grid_rebases_
+        // rectangle_halves` pins the split itself. Keep the counters used.
+        let _ = (seen_rect_halves, histogram);
     }
 
     #[test]
