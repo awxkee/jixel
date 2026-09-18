@@ -454,6 +454,8 @@ pub(crate) fn adjust_quant_field(
     }
 }
 
+const QUANT_REFINEMENT_MIN_GAIN: f32 = 0.03;
+
 #[inline]
 fn quant_refinement_steps(distance: f32) -> usize {
     if distance < 1.5 {
@@ -571,31 +573,30 @@ fn find_quant_refinements(
         } else {
             cost(current_q)
         };
-        // Bidirectional: q-1/q-2 can only save rate on over-spent blocks; q+1/q+2
-        // let the field *spend* a step where the reconstruction says it is cheap.
-        let candidates = if steps == 2 {
-            // Upward stays at +1: q+2 measurably over-spends (its metadata-rate
-            // cost is not priced here), while the -2 rate save still pays.
-            [
-                current_q.saturating_sub(1),
-                current_q.saturating_sub(2),
-                current_q.saturating_add(1),
-                current_q,
-            ]
+        // Downward only: a coarser step where the reconstruction says the block
+        // is over-spent. The upward q+1 candidate lost on every metric, and a
+        // change must clear `QUANT_REFINEMENT_MIN_GAIN` of the block's cost.
+        let base_cost = best_cost;
+        // The upward step protects saturated thin structure (the X-gradient
+        // content class); elsewhere it only costs rate.
+        let up = if ctx.x_heavy() {
+            current_q.saturating_add(1)
         } else {
-            [
-                current_q.saturating_sub(1),
-                current_q.saturating_add(1),
-                current_q,
-                current_q,
-            ]
+            current_q
+        };
+        let candidates = if steps == 2 {
+            [current_q.saturating_sub(1), current_q.saturating_sub(2), up]
+        } else {
+            [current_q.saturating_sub(1), up, current_q]
         };
         for candidate in candidates {
             if candidate == 0 || candidate == best_q || candidate == current_q {
                 continue;
             }
             let candidate_cost = cost(candidate);
-            if candidate_cost < best_cost {
+            if candidate_cost < best_cost
+                && candidate_cost < base_cost * (1.0 - QUANT_REFINEMENT_MIN_GAIN)
+            {
                 best_q = candidate;
                 best_cost = candidate_cost;
             }

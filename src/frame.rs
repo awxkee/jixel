@@ -1412,8 +1412,12 @@ fn encode_frame_vardct(
     } else {
         [0.0; 3]
     };
-    if slow_chromatic && distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
-        let (x_steps, b_steps) = pixel_chromacity_steps(&xyb);
+    let (x_steps, b_steps) = if slow_chromatic {
+        pixel_chromacity_steps(&xyb)
+    } else {
+        (0, 0)
+    };
+    if distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
         ctx.raise_x_qm_scale_floor(2 + x_steps);
         ctx.raise_b_qm_scale(2 + b_steps);
     }
@@ -1434,11 +1438,8 @@ fn encode_frame_vardct(
     // the same point. Ordinary photos measured far below this gate.
     ctx.set_x_heavy(slow_chromatic && x_grad_stat >= X_QM_GRAD_THRESHOLD);
     ctx.set_b_heavy(slow_chromatic && b_grad_stat >= B_GRAD_THRESHOLD);
-    // `x_heavy` is first knowable after conversion to XYB. This used to be
-    // queried by `apply_yellow_opsin` before it was computed, leaving the
-    // advertised blue/green fine-B path permanently disabled.
-    if ctx.x_heavy() {
-        ctx.raise_b_qm_scale(x_heavy_b_qm_scale());
+    if ctx.x_heavy() && b_steps > 0 {
+        ctx.raise_b_qm_scale(X_HEAVY_B_QM_SCALE);
     }
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
@@ -1617,9 +1618,8 @@ const X_QM_GRAD_THRESHOLD: f32 = 0.04;
 /// `x_heavy`)
 const B_GRAD_THRESHOLD: f32 = 0.45;
 
-/// Fine-B precision for the synthetic high-frequency opponent-color class.
-/// Scale 7 is the strongest representable multiplier and remained efficient
-/// at matched rate on the fitted d=0.5/1/1.25/1.5 points.
+const X_HEAVY_B_QM_SCALE: u32 = 7;
+
 /// Below this the X scale is 2 and the extra precision only costs rate.
 const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
 
@@ -1660,11 +1660,6 @@ fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
         _ => 0,
     };
     (x_steps, b_steps)
-}
-
-#[inline]
-fn x_heavy_b_qm_scale() -> u32 {
-    7
 }
 
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
