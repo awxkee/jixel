@@ -308,6 +308,11 @@ fn rdoq_block(
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
         let distortion_weight = crate::inflated_cost::CHANNEL_WEIGHT[c]
+            * if c == 1 {
+                1.0
+            } else {
+                chroma_rdoq_weight(distance)
+            }
             * rdoq_distortion_weight(window_index, window_len, distance);
         let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
         // Distortion uses the encoder's shared Y-bias approximation to decoder
@@ -733,9 +738,17 @@ pub(crate) fn quantize_block_ac_scalar(
     }
 }
 
-/// Chroma (X/B) RDOQ opens at the SS2 quant tier: below it the trellis
-/// regresses Kodak HQ BD at every lambda tried.
-pub(crate) const CHROMA_RDOQ_MIN_DISTANCE: f32 = 2.25;
+const CHROMA_RDOQ_WEIGHT_HQ: f32 = 2.0;
+const CHROMA_RDOQ_WEIGHT_D0: f32 = 2.25;
+const CHROMA_RDOQ_WEIGHT_D1: f32 = 4.0;
+
+/// Chroma trellis distortion-weight multiplier at `distance`.
+#[inline]
+fn chroma_rdoq_weight(distance: f32) -> f32 {
+    let t = ((distance - CHROMA_RDOQ_WEIGHT_D0) / (CHROMA_RDOQ_WEIGHT_D1 - CHROMA_RDOQ_WEIGHT_D0))
+        .clamp(0.0, 1.0);
+    CHROMA_RDOQ_WEIGHT_HQ + t * (1.0 - CHROMA_RDOQ_WEIGHT_HQ)
+}
 
 pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
 pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
@@ -1340,13 +1353,10 @@ pub(crate) fn write_ac_group(
             // Chroma RDOQ (review §8): the trellis is channel-generic — the
             // CfL residuals are the source, contexts/prices/orders are
             // channel-specific, and unlike Y the input coefficients are not
-            // overwritten afterwards. Mid-band only: with CHANNEL_WEIGHT'd
-            // distortion it reads −0.137% Kodak BD at d≥2.5 but +0.39% at
-            // d=1-2.2 (HQ chroma coefficients are precious — same story as
-            // the deadzone/flat-B studies), so it opens at the SS2 tier.
-            if distance >= CHROMA_RDOQ_MIN_DISTANCE
-                && let Some(prices) = rdoq_prices
-            {
+            // overwritten afterwards. Runs at every distance with the
+            // distance-scheduled X/B distortion weight (`chroma_rdoq_weight`):
+            // the plain CHANNEL_WEIGHT'd trellis used to be gated to d ≥ 2.25.
+            if let Some(prices) = rdoq_prices {
                 let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                 let nzero_map = &num_nzeros[0];
                 let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
@@ -1426,9 +1436,7 @@ pub(crate) fn write_ac_group(
                 dz_dc_chroma,
                 &mut quantized[2][..size],
             );
-            if distance >= CHROMA_RDOQ_MIN_DISTANCE
-                && let Some(prices) = rdoq_prices
-            {
+            if let Some(prices) = rdoq_prices {
                 let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                 let nzero_map = &num_nzeros[0];
                 let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
