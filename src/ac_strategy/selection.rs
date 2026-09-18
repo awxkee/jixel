@@ -1225,7 +1225,12 @@ fn fine_recon_admit_against(
     // before the margin test below.
     let recon_fine = fmla(
         fine_mosaic_lambda(params.distance),
-        FINE_ADMIT_RATE_CORRECTION_BITS,
+        FINE_ADMIT_RATE_CORRECTION_BITS
+            + if incumbent == STRATEGY_DCT {
+                0.0
+            } else {
+                FINE_ADMIT_LEAF_EXTRA_BITS
+            },
         reconstruction_cost(scratch, fine),
     );
     // A small safety margin absorbs the remaining mismatch between the local

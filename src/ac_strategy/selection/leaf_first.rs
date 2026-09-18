@@ -659,14 +659,8 @@ pub(super) fn select_band_leaf_first(
     }
 
     if with_fine {
-        // Post-merge fine admission over every surviving DCT8 block that
-        // carries a shortlisted IDENTITY/DCT2X2 candidate. Refining a
-        // surviving DCT4/AFV leaf the same way (reconstruction comparison
-        // against that leaf) measured −0.03..−0.11% worse in the HQ band on
-        // both crop corpora: the reconstruction scorer over-credits the fine
-        // transforms against structural leaves just as it did against DCT8
-        // before `FINE_ADMIT_RATE_CORRECTION_BITS`, and that charge was
-        // fitted against DCT8 only.
+        // Post-merge fine admission over every surviving 1x1 structural leaf
+        // that carries a shortlisted IDENTITY/DCT2X2 candidate.
         for by in y_begin..y_end {
             for bx in 0..xsize {
                 let leaf = output.leaves[(by - y_begin) * xsize + bx];
@@ -675,7 +669,12 @@ pub(super) fn select_band_leaf_first(
                     continue;
                 }
                 let incumbent = ac_strategy.raw_strategy(bx, by);
-                if incumbent != STRATEGY_DCT || leaf.fine_j >= leaf.j {
+                // Any structural 1x1 leaf may be refined; a DCT4/AFV
+                // incumbent pays `FINE_ADMIT_LEAF_EXTRA_BITS` on top.
+                let structural = AcStrategyImage::covered_blocks_x_of(incumbent) == 1
+                    && AcStrategyImage::covered_blocks_y_of(incumbent) == 1
+                    && !matches!(incumbent, STRATEGY_IDENTITY | STRATEGY_DCT2X2);
+                if !structural || leaf.fine_j >= leaf.j {
                     continue;
                 }
                 let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);

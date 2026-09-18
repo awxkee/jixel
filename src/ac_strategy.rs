@@ -146,6 +146,8 @@ const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
 const FINE_RECON_MARGIN: f32 = 0.98;
 const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
 
+const FINE_ADMIT_LEAF_EXTRA_BITS: f32 = 32.0;
+
 #[inline]
 fn fine_transform_bias(base: f32, distance: f32) -> f32 {
     // libjxl normalizes the small-transform entropy multipliers by DCT8's 0.8
