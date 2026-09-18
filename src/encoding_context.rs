@@ -31,8 +31,7 @@ use crate::afv;
 use crate::quant_weights::DequantMatrices;
 use crate::thread_pool::ThreadPool;
 use crate::{
-    Speed, ac_strategy, adaptive_quant, color_correlation, dct, frame, group, inflated_cost,
-    structure_aq, xyb,
+    Speed, ac_strategy, adaptive_quant, color_correlation, dct, frame, group, inflated_cost, xyb,
 };
 
 #[inline]
@@ -88,8 +87,6 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_block_ac: group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: group::QuantizeDcFn,
     pub(crate) quantize_dc_cfl: group::QuantizeDcCflFn,
-    pub(crate) block_features: structure_aq::BlockFeaturesFn,
-    pub(crate) apply_structure_corrections: structure_aq::ApplyCorrectionsFn,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
     pub(crate) mosaic_seam_stats: crate::mosaic_seam::MosaicSeamStatsFn,
     pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
@@ -281,8 +278,6 @@ impl EncodingContext {
             quantize_block_ac: group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
             quantize_dc_cfl: quantize_dc.quantize_cfl,
-            block_features: structure_aq::select_block_features_fn(),
-            apply_structure_corrections: structure_aq::select_apply_corrections_fn(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
             mosaic_seam_stats: crate::mosaic_seam::select_mosaic_seam_stats_fn(),
             gradient_region_stats: ac_strategy::select_gradient_region_stats_fn(),

@@ -2600,27 +2600,14 @@ fn setup_dc_group(
         1.0 / distp.scale,
     );
 
-    if ctx.speed == Speed::Slow {
-        crate::structure_aq::apply(
-            &mut scratch.structure_corrections,
+    if ctx.speed == Speed::Slow && (ctx.x_heavy() || ctx.b_heavy()) {
+        crate::adaptive_quant::apply_chroma_hf_protection(
             opsin,
             &mut dc_data.raw_quant_field,
             dc_group_x0,
             dc_group_y0,
             distp.distance,
-            ctx.dct8x8,
-            ctx.block_features,
-            ctx.apply_structure_corrections,
         );
-        if ctx.x_heavy() || ctx.b_heavy() {
-            crate::adaptive_quant::apply_chroma_hf_protection(
-                opsin,
-                &mut dc_data.raw_quant_field,
-                dc_group_x0,
-                dc_group_y0,
-                distp.distance,
-            );
-        }
     }
 
     // Compute the per-tile CfL slopes before strategy selection so candidate

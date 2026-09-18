@@ -40,7 +40,6 @@ mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
-mod structure_aq;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -76,11 +75,8 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
     tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,
 };
-pub(crate) use quant::{
-    apply_structure_aq_neon, quantize_block_ac_neon, quantize_dc_cfl_neon, quantize_dc_neon,
-};
+pub(crate) use quant::{quantize_block_ac_neon, quantize_dc_cfl_neon, quantize_dc_neon};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_neon, quantize_xyb_tile_colors_neon};
-pub(crate) use structure_aq::block_features_neon;
 pub(crate) use xyb::to_xyb_neon_band;
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_neon;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};

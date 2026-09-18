@@ -323,7 +323,6 @@ impl AcStrategyPipelineScratch {
 pub(crate) struct CoderScratch {
     pub(crate) entropy_of_hist: EntropyOfHistFn,
     pub(crate) aq_map: AqMapScratch,
-    pub(crate) structure_corrections: Vec<f32>,
     pub(crate) lz_repetitions: Vec<u32>,
     pub(crate) lz_depth: Vec<u32>,
     pub(crate) lz_candidate: Vec<LzToken>,
@@ -352,40 +351,36 @@ pub(crate) struct CoderScratch {
 
 impl CoderScratch {
     fn new(reserve_lossy_buffers: bool) -> Self {
-        let (aq_map, structure_corrections, gradient, order0_entropy, threshold) =
-            if reserve_lossy_buffers {
-                (
-                    AqMapScratch {
-                        aq_map: vec![0.0; 256 * 256],
-                        secondary: vec![0.0; 2048 + 512 * 512],
-                    },
-                    vec![0.0; 256 * 256],
-                    GradientScratch {
-                        cur: vec![0; 256],
-                        prev: vec![0; 256],
-                        prev_prev: vec![0; 256],
-                        buf: vec![0; 256],
-                        wp: None,
-                    },
-                    vec![0; 1024],
-                    PickThresholdScratch {
-                        hist_scratch: vec![0; 3 * 1025],
-                    },
-                )
-            } else {
-                (
-                    AqMapScratch::default(),
-                    Vec::new(),
-                    GradientScratch::default(),
-                    Vec::new(),
-                    PickThresholdScratch::default(),
-                )
-            };
+        let (aq_map, gradient, order0_entropy, threshold) = if reserve_lossy_buffers {
+            (
+                AqMapScratch {
+                    aq_map: vec![0.0; 256 * 256],
+                    secondary: vec![0.0; 2048 + 512 * 512],
+                },
+                GradientScratch {
+                    cur: vec![0; 256],
+                    prev: vec![0; 256],
+                    prev_prev: vec![0; 256],
+                    buf: vec![0; 256],
+                    wp: None,
+                },
+                vec![0; 1024],
+                PickThresholdScratch {
+                    hist_scratch: vec![0; 3 * 1025],
+                },
+            )
+        } else {
+            (
+                AqMapScratch::default(),
+                GradientScratch::default(),
+                Vec::new(),
+                PickThresholdScratch::default(),
+            )
+        };
 
         Self {
             entropy_of_hist: selected_entropy_of_hist_fn(),
             aq_map,
-            structure_corrections,
             // Fast never enters the deep LZ path. Slow grows these buffers on
             // first use, and subsequent groups reuse the allocation.
             lz_repetitions: Vec::new(),
@@ -472,7 +467,6 @@ mod tests {
         let scratch = CoderScratch::lossless();
         assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
         assert_eq!(scratch.aq_map.secondary.capacity(), 0);
-        assert_eq!(scratch.structure_corrections.capacity(), 0);
         assert_eq!(scratch.gradient.cur.capacity(), 0);
         assert_eq!(scratch.gradient.prev.capacity(), 0);
         assert_eq!(scratch.gradient.prev_prev.capacity(), 0);

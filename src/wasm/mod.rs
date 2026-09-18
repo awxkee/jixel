@@ -38,7 +38,6 @@ mod lossless_grad;
 mod lz_match;
 mod quant;
 mod quantize_xyb;
-mod structure_aq;
 mod xyb;
 mod ytob;
 
@@ -60,10 +59,7 @@ pub(crate) use inflated_cost::{
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
-pub(crate) use quant::{
-    apply_structure_aq_wasm, quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc_wasm,
-};
+pub(crate) use quant::{quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc_wasm};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm};
-pub(crate) use structure_aq::block_features_wasm;
 pub(crate) use xyb::to_xyb_wasm_band;
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
