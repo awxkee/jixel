@@ -78,6 +78,8 @@ pub(crate) struct EncodingContext {
     /// masking cannot see it (saturated blue detail on low-luma ground).
     b_heavy: std::sync::atomic::AtomicBool,
     b_qm_scale: std::sync::atomic::AtomicU32,
+    /// Content floor for the signaled X quant scale (2 = none).
+    x_qm_scale_floor: std::sync::atomic::AtomicU32,
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
@@ -179,6 +181,16 @@ impl EncodingContext {
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn raise_x_qm_scale_floor(&self, scale: u32) {
+        self.x_qm_scale_floor
+            .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn x_qm_scale_floor(&self) -> u32 {
+        self.x_qm_scale_floor
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn raise_b_qm_scale(&self, scale: u32) {
         self.b_qm_scale
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
@@ -264,6 +276,7 @@ impl EncodingContext {
             pair_b_fine: std::sync::atomic::AtomicBool::new(false),
             b_heavy: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
+            x_qm_scale_floor: std::sync::atomic::AtomicU32::new(2),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),

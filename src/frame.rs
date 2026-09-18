@@ -113,7 +113,7 @@ struct DistanceParams {
 const DC_REFINE_PEAK: f32 = 1.35;
 const DC_COARSEN_D0: f32 = 1.25;
 const DC_COARSEN_D1: f32 = 3.0;
-const DC_COARSEN_MUL: f32 = 0.7;
+const DC_COARSEN_MUL: f32 = 0.65;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
 
@@ -217,19 +217,6 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     }
 }
 
-/// The third EPF pass (libjxl stage 0: the 5x5 filter, only run at
-/// `epf_iters == 3`) at spec sigma scale 0.9 blurs too hard for the mid band
-/// (SS2 −1.5..−2.3 on Kodak d3-8 at zero rate), which is why the schedule
-/// stopped at two passes. Widening its scale (larger = weaker pass) turns it
-/// into a both-metrics win: rate-free Kodak grid 2026-09-07, s=3.6 at d3/4/6
-/// /8/10 = SS2 +0.04/+0.08/+0.12/+0.13/+0.21 (18-23/24, worst −0.06) with
-/// butteraugli-3 −0.19/−0.20/−0.33/−0.54/−0.48% (24/24); holdout crops agree
-/// (d4 +0.08/−0.22%, d8 +0.13/−0.58%, 14/14 BA). d=2 is neutral, so the pass
-/// starts at `EPF_PASS0_START_D`; inside the VLQ ramp the scale eases toward
-/// the fitted spec-strength band (`DCEPF_VLQ_D0`.., 3 passes at 0.9 from
-/// half-ramp), where the default header is written unchanged. Costs the
-/// 8-byte custom-sigma header. An Optuna re-fit of (start, scale, VLQ scale)
-/// confirmed these values as the optimum on a flat surface.
 const EPF_PASS0_START_D: f32 = 2.5;
 const EPF_PASS0_SCALE: f32 = 3.6;
 const EPF_PASS0_SPEC_SCALE: f32 = 0.9;
@@ -1425,6 +1412,11 @@ fn encode_frame_vardct(
     } else {
         [0.0; 3]
     };
+    if slow_chromatic && distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
+        let (x_steps, b_steps) = pixel_chromacity_steps(&xyb);
+        ctx.raise_x_qm_scale_floor(2 + x_steps);
+        ctx.raise_b_qm_scale(2 + b_steps);
+    }
     // Saturated-content tables are validated under Slow only: at Fast the
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
     ctx.set_chroma_heavy(slow_chromatic && saturation_stat >= SAT_QM_THRESHOLD);
@@ -1628,6 +1620,48 @@ const B_GRAD_THRESHOLD: f32 = 0.45;
 /// Fine-B precision for the synthetic high-frequency opponent-color class.
 /// Scale 7 is the strongest representable multiplier and remained efficient
 /// at matched rate on the fitted d=0.5/1/1.25/1.5 points.
+/// Below this the X scale is 2 and the extra precision only costs rate.
+const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
+
+/// libjxl's `PixelStatsForChromacityAdjustment`: extra X and B quant-scale
+/// steps from the worst pixel-to-pixel step of X and of B - Y, plus one B step
+/// for strongly exposed blue. Thresholds are libjxl's.
+fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
+    let (w, h) = (xyb.xsize(), xyb.ysize());
+    let (mut dx, mut db, mut exposed_blue) = (0.0f32, 0.0f32, 0.0f32);
+    for y in 1..h {
+        let (xr, xp) = (xyb.plane_row(0, y), xyb.plane_row(0, y - 1));
+        let (yr, yp) = (xyb.plane_row(1, y), xyb.plane_row(1, y - 1));
+        let (br, bp) = (xyb.plane_row(2, y), xyb.plane_row(2, y - 1));
+        for x in 1..w {
+            dx = dx.max((xr[x] - xr[x - 1]).abs()).max((xr[x] - xp[x]).abs());
+            let diff_b = br[x] - yr[x];
+            db = db
+                .max((diff_b - (br[x - 1] - yr[x - 1])).abs())
+                .max((diff_b - (bp[x] - yp[x])).abs());
+            let exposed = br[x] - yr[x] * 1.2;
+            if exposed >= 0.0 {
+                let step = (br[x] - br[x - 1]).abs() + (br[x] - bp[x]).abs();
+                exposed_blue = exposed_blue.max(exposed * step);
+            }
+        }
+    }
+    let x_steps = match dx {
+        v if v >= 0.026 => 3,
+        v if v >= 0.022 => 2,
+        v if v >= 0.015 => 1,
+        _ => 0,
+    };
+    let blue = u32::from(exposed_blue >= 0.13);
+    let b_steps = match db {
+        v if v > 0.38 => 2 + blue,
+        v if v > 0.33 => 1 + blue,
+        v if v > 0.28 => blue,
+        _ => 0,
+    };
+    (x_steps, b_steps)
+}
+
 #[inline]
 fn x_heavy_b_qm_scale() -> u32 {
     7
@@ -1804,6 +1838,7 @@ fn encode_frame_core(
     if ctx.x_heavy() && distp.x_qm_scale == 2 {
         distp.x_qm_scale = 3;
     }
+    distp.x_qm_scale = distp.x_qm_scale.max(ctx.x_qm_scale_floor());
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
