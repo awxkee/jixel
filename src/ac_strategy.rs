@@ -1272,7 +1272,15 @@ fn sub8_strategy_costs(
         dct4x4: evaluate_dct4(STRATEGY_DCT4X4),
         dct4x8: evaluate_dct4(STRATEGY_DCT4X8),
         dct8x4: evaluate_dct4(STRATEGY_DCT8X4),
-        afv: std::array::from_fn(|kind| evaluate(STRATEGY_AFV0 + kind as u8)),
+        // AFV shares the DCT4 gate plus its own extension band
+        // ([`AFV_MAX_DISTANCE`]); it used to be evaluated unconditionally,
+        // so it competed at every distance the fine pass runs (≤ 5) and only
+        // a rejecting frame gate cleaned those blocks up.
+        afv: if with_dct4 || distance <= AFV_MAX_DISTANCE {
+            std::array::from_fn(|kind| evaluate(STRATEGY_AFV0 + kind as u8))
+        } else {
+            [f32::INFINITY; 4]
+        },
     }
 }
 

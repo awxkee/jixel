@@ -51,6 +51,11 @@ pub(crate) const STRATEGY_DCT2X2: u8 = 18;
 pub(crate) const NUM_STRATEGIES: usize = 19;
 
 #[inline]
+pub(crate) fn is_gated_sub8_strategy(strategy: u8) -> bool {
+    matches!(strategy, STRATEGY_IDENTITY | STRATEGY_DCT2X2)
+}
+
+#[cfg(test)]
 pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
     matches!(
         strategy,

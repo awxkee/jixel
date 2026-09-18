@@ -36,7 +36,7 @@ use crate::color_correlation::choose_ytob_dc;
 use crate::dc_group_data::{
     DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
     STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, is_sub8_strategy,
+    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
 };
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
@@ -2725,7 +2725,8 @@ fn setup_dc_group(
                                 && y >= rollback.by
                                 && y < rollback.by + rollback.cov_y
                         });
-                    if is_sub8_strategy(strategy) && !in_accepted_mosaic {
+                    if crate::dc_group_data::is_gated_sub8_strategy(strategy) && !in_accepted_mosaic
+                    {
                         positions.push((x, y, strategy));
                     }
                 }

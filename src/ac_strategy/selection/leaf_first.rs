@@ -63,9 +63,11 @@ pub(crate) struct LeafChoice {
     /// Sub-8 metadata-gate credit if this leaf survives to the final map.
     pub(crate) gain: f32,
     /// IDENTITY/DCT2X2 shortlisted against DCT8 on the coefficient model
-    /// (`NO_CHILD_BLOCK` = none); admitted after the merges if the block is
-    /// still DCT8.
+    /// (`NO_CHILD_BLOCK` = none); admitted after the merges against whatever
+    /// 1x1 leaf survived.
     pub(crate) fine: u8,
+    /// The fine candidate's coefficient-domain decision cost.
+    pub(crate) fine_j: f32,
 }
 
 impl Default for LeafChoice {
@@ -76,6 +78,7 @@ impl Default for LeafChoice {
             raw_j: f32::NAN,
             gain: 0.0,
             fine: NO_CHILD_BLOCK,
+            fine_j: f32::INFINITY,
         }
     }
 }
@@ -92,6 +95,9 @@ struct SuperPlan {
     /// The losing rectangular/leaf arm when a 16x16 won, for the rerank's
     /// child-layout restore; `None` when that arm is plain DCT8 tiling.
     child: Option<[u8; 4]>,
+    /// The four leaves (`dy * 2 + dx`), so a committed pair can save the
+    /// leaf layout it displaced.
+    leaves: [u8; 4],
 }
 
 fn expand_2x2(grid: [u8; 4], sx: usize, sy: usize, into: &mut [u8; 16]) {
@@ -260,6 +266,7 @@ fn plan_super_block(
     }
 
     let leaf_s = |dy: usize, dx: usize| l[dy][dx].strategy;
+    let leaves = [leaf_s(0, 0), leaf_s(0, 1), leaf_s(1, 0), leaf_s(1, 1)];
     let arm = if vertical {
         [
             if use_v_left {
@@ -319,6 +326,7 @@ fn plan_super_block(
             j: if raw_propagation { c16_raw } else { c16 },
             leaf_total,
             child: grid_nontrivial(&arm).then_some(arm),
+            leaves,
         }
     } else {
         SuperPlan {
@@ -330,6 +338,7 @@ fn plan_super_block(
             },
             leaf_total,
             child: None,
+            leaves,
         }
     }
 }
@@ -359,8 +368,27 @@ fn commit_super_block(
     for dy in 0..2 {
         for dx in 0..2 {
             let s = plan.grid[dy * 2 + dx];
-            if matches!(s, STRATEGY_DCT16X8 | STRATEGY_DCT8X16) {
-                ac_strategy.set_first(bx0 + dx, by0 + dy, s);
+            if !matches!(s, STRATEGY_DCT16X8 | STRATEGY_DCT8X16) {
+                continue;
+            }
+            ac_strategy.set_first(bx0 + dx, by0 + dy, s);
+            // A pair that displaced structural leaves saves them, so the
+            // rerank compares it against that layout and not only against
+            // tiled DCT8 (rebased to the pair's own first block).
+            let mut child = [NO_CHILD_BLOCK; 16];
+            if s == STRATEGY_DCT16X8 {
+                child[0] = plan.leaves[dx];
+                child[4] = plan.leaves[2 + dx];
+            } else {
+                child[0] = plan.leaves[dy * 2];
+                child[1] = plan.leaves[dy * 2 + 1];
+            }
+            if grid_nontrivial(&child) {
+                saved.push(SavedChild {
+                    bx: (bx0 + dx) as u16,
+                    by: (by0 + dy) as u16,
+                    grid: child,
+                });
             }
         }
     }
@@ -438,6 +466,7 @@ pub(super) fn select_band_leaf_first(
                 raw_j: dct8,
                 gain: 0.0,
                 fine: NO_CHILD_BLOCK,
+                fine_j: f32::INFINITY,
             };
             if !sub8_enabled {
                 continue;
@@ -465,6 +494,7 @@ pub(super) fn select_band_leaf_first(
             }
             if let Some(f) = shortlist.fine {
                 leaf.fine = f.strategy;
+                leaf.fine_j = f.biased_j;
             }
         }
     }
@@ -499,6 +529,7 @@ pub(super) fn select_band_leaf_first(
                     j: 0.0,
                     leaf_total: 0.0,
                     child: None,
+                    leaves: [STRATEGY_DCT; 4],
                 }; 2]; 2];
                 let mut sub_total = 0.0f32;
                 let mut leaf_total = 0.0f32;
@@ -702,16 +733,29 @@ pub(super) fn select_band_leaf_first(
     }
 
     if with_fine {
-        // Post-merge fine admission over whatever is still DCT8 and carries
-        // a shortlisted IDENTITY/DCT2X2 candidate.
+        // Post-merge fine admission over every surviving DCT8 block that
+        // carries a shortlisted IDENTITY/DCT2X2 candidate. Refining a
+        // surviving DCT4/AFV leaf the same way (reconstruction comparison
+        // against that leaf) measured −0.03..−0.11% worse in the HQ band on
+        // both crop corpora: the reconstruction scorer over-credits the fine
+        // transforms against structural leaves just as it did against DCT8
+        // before `FINE_ADMIT_RATE_CORRECTION_BITS`, and that charge was
+        // fitted against DCT8 only.
         for by in y_begin..y_end {
             for bx in 0..xsize {
-                let fine = output.leaves[(by - y_begin) * xsize + bx].fine;
-                if fine == NO_CHILD_BLOCK || ac_strategy.raw_strategy(bx, by) != STRATEGY_DCT {
+                let leaf = output.leaves[(by - y_begin) * xsize + bx];
+                let fine = leaf.fine;
+                if fine == NO_CHILD_BLOCK || !ac_strategy.is_first_block(bx, by) {
+                    continue;
+                }
+                let incumbent = ac_strategy.raw_strategy(bx, by);
+                if incumbent != STRATEGY_DCT || leaf.fine_j >= leaf.j {
                     continue;
                 }
                 let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-                if let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine) {
+                if let Some(gain) =
+                    fine_recon_admit_against(params, scratch, bx, by, qac, meta_r, incumbent, fine)
+                {
                     ac_strategy.set_first(bx, by, fine);
                     output.leaves[(by - y_begin) * xsize + bx].gain = gain;
                 }

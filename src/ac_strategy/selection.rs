@@ -1158,6 +1158,24 @@ fn fine_recon_admit(
     meta_r: f32,
     fine: u8,
 ) -> Option<f32> {
+    fine_recon_admit_against(params, scratch, bx, by, qac, meta_r, STRATEGY_DCT, fine)
+}
+
+/// [`fine_recon_admit`] against any surviving 1x1 incumbent (DCT8 or a
+/// structural DCT4/AFV leaf): the fine transform never enters the merge
+/// competition, but once the hierarchy is final it may refine whatever
+/// single block survived.
+#[allow(clippy::too_many_arguments)]
+fn fine_recon_admit_against(
+    params: AcStrategyParams<'_>,
+    scratch: &mut CoderScratch,
+    bx: usize,
+    by: usize,
+    qac: f32,
+    meta_r: f32,
+    incumbent: u8,
+    fine: u8,
+) -> Option<f32> {
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
@@ -1178,7 +1196,7 @@ fn fine_recon_admit(
             DistortionModel::Reconstruction,
         )
     };
-    let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
+    let recon8 = reconstruction_cost(scratch, incumbent);
     // The reconstruction scorer over-credits fine transforms; charge the
     // fitted per-block correction at the floored lambda (see the constant)
     // before the margin test below.
@@ -1555,9 +1573,22 @@ pub(crate) fn fill_ac_strategy(
     }
 
     if leaf_first {
+        // The frame-level exact metadata gate judges only the post-merge
+        // IDENTITY/DCT2X2 refinements: structural DCT4/AFV leaves competed
+        // in the hierarchy under their META_R charge and have no DCT8-only
+        // fallback (see `is_gated_sub8_strategy`). Blocks inside a fine
+        // mosaic carry their own rollback benefit and exact gate.
+        let in_mosaic = |bx: usize, by: usize| {
+            pipeline.band_scratch[..pipeline.bands.len()]
+                .iter()
+                .flat_map(|band| band.fine_rollbacks.iter())
+                .any(|r| bx >= r.bx && bx < r.bx + r.cov_x && by >= r.by && by < r.by + r.cov_y)
+        };
         benefit = ac_strategy
             .iter_first_blocks()
-            .filter(|&(_, _, s)| crate::dc_group_data::is_sub8_strategy(s))
+            .filter(|&(bx, by, s)| {
+                crate::dc_group_data::is_gated_sub8_strategy(s) && !in_mosaic(bx, by)
+            })
             .map(|(bx, by, _)| pipeline.leaf_gain[by * xsize + bx])
             .fold(0.0, |acc, gain| acc + gain);
     }
@@ -2827,6 +2858,20 @@ mod tests {
         policy: crate::ac_strategy::SelectorPolicy,
         threads: usize,
     ) -> (AcStrategyImage, f32) {
+        let (map, benefit, _) = run_selector_full(speed, distance, policy, threads);
+        (map, benefit)
+    }
+
+    fn run_selector_full(
+        speed: crate::Speed,
+        distance: f32,
+        policy: crate::ac_strategy::SelectorPolicy,
+        threads: usize,
+    ) -> (
+        AcStrategyImage,
+        f32,
+        Vec<crate::coder_scratch::FineMergeRollback>,
+    ) {
         let mut ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, distance, threads);
         ctx.selector = policy;
         let (bw, bh) = (13usize, 11usize);
@@ -2857,7 +2902,7 @@ mod tests {
             &mut fine_rollbacks,
             threads,
         );
-        (strategies, benefit)
+        (strategies, benefit, fine_rollbacks)
     }
 
     fn strategy_cells(map: &AcStrategyImage) -> Vec<(usize, usize, u8)> {
@@ -3024,17 +3069,30 @@ mod tests {
             ..SelectorPolicy::default()
         };
         for threads in [1usize, 3] {
-            let (map, benefit) = run_selector(crate::Speed::Slow, 1.0, leaf, threads);
+            let (map, benefit, rollbacks) =
+                run_selector_full(crate::Speed::Slow, 1.0, leaf, threads);
             assert_map_valid(&map);
-            let sub8 = map
+            // Only the post-merge IDENTITY/DCT2X2 refinements are credited to
+            // the frame gate; structural DCT4/AFV leaves competed in the
+            // hierarchy under META_R and carry no gate credit, and fine
+            // mosaics carry their own rollback benefit instead.
+            let in_mosaic = |bx: usize, by: usize| {
+                rollbacks
+                    .iter()
+                    .any(|r| bx >= r.bx && bx < r.bx + r.cov_x && by >= r.by && by < r.by + r.cov_y)
+            };
+            let gated = map
                 .iter_first_blocks()
-                .filter(|&(_, _, s)| crate::dc_group_data::is_sub8_strategy(s))
+                .filter(|&(bx, by, s)| {
+                    crate::dc_group_data::is_gated_sub8_strategy(s) && !in_mosaic(bx, by)
+                })
                 .count();
             assert!(benefit.is_finite());
             assert!(
-                sub8 == 0 || benefit > 0.0,
-                "sub-8 leaves survived without credit"
+                gated == 0 || benefit > 0.0,
+                "fine leaves survived without credit"
             );
+            assert!(gated > 0 || benefit == 0.0, "credit without fine leaves");
         }
     }
 
