@@ -114,6 +114,7 @@ const RERANK_LAMBDA_D1: f32 = 4.0;
 const BIAS_RECT: Banded = Banded::new(1.026_200_7, 0.915);
 const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.05);
 const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.06);
+const BIAS_32X32_LOOSEN: f32 = 0.94;
 const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.02);
 
 const MERGE_MARGIN_PAIR: Banded = Banded::new(0.014_500_806, 0.0288);
@@ -143,14 +144,6 @@ const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
 /// Reconstruction-domain admission margin: a fine candidate must beat the
 /// DCT8 incumbent's reconstruction cost by this factor.
 const FINE_RECON_MARGIN: f32 = 0.98;
-/// Extra bits charged to a standalone IDENTITY/DCT2X2 candidate in the
-/// per-block reconstruction admission, priced at the floored fine-mosaic
-/// lambda (the plain reconstruction lambda is quarter-price below d≈1.2).
-/// The reconstruction scorer over-credits fine transforms: Kodak/24 BD-rate
-/// vs no charge is monotone through 4/8/12/16/24/32 bits (24: −0.036 cvvdp /
-/// −0.069 SS2 / −0.042 BA3, HQ band −0.12/−0.17/−0.11, 19-21/24 wins) and
-/// disabling the admission outright lands within 0.01% of the plateau; the
-/// 14-crop holdout agrees (−0.053/−0.046/−0.043, HQ −0.32/−0.12/−0.07).
 const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
 
 #[inline]
@@ -259,6 +252,9 @@ impl MergeTuning {
             tuning.rerank_margin = lerp(tuning.rerank_margin, VLQ_RERANK_MARGIN);
             tuning.accept_64 = lerp(tuning.accept_64, VLQ_ACCEPT_64);
             tuning.accept_64_rect = lerp(tuning.accept_64_rect, VLQ_ACCEPT_64_RECT);
+        }
+        if distance >= MERGE_BAND_D1 {
+            tuning.bias_32x32 *= BIAS_32X32_LOOSEN;
         }
         tuning
     }
