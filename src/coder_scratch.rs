@@ -175,8 +175,8 @@ pub(crate) struct FineMergeRollback {
 }
 
 /// A pair/16x16 merge that beat its tiled incumbent on the raw coefficient
-/// model but failed the fitted acceptance margin. The reconstruction rerank
-/// may install it (see `SelectorPolicy::merge_upgrade`).
+/// model. Retained even if a parent/competing arm won: a reconstruction
+/// downgrade may expose the footprint again (see `SelectorPolicy::merge_upgrade`).
 #[derive(Clone, Copy)]
 pub(crate) struct MergeUpgradeCandidate {
     pub(crate) bx: u16,

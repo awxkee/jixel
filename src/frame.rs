@@ -33,11 +33,7 @@ use crate::ac_context::compact_block_context_map;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
 use crate::color_correlation::choose_ytob_dc;
-use crate::dc_group_data::{
-    DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
-};
+use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
@@ -47,6 +43,7 @@ use crate::entropy::{
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
+use crate::quant_weights::quant_table_slot_of;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
@@ -55,7 +52,7 @@ use crate::util::EncodeError;
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
 const K_GROUP_DIM: usize = 256;
-const K_DC_GROUP_DIM: usize = 2048;
+pub(crate) const K_DC_GROUP_DIM: usize = 2048;
 const K_GROUP_DIM_IN_BLOCKS: usize = 32; // = K_GROUP_DIM / K_BLOCK_DIM
 const K_TILE_DIM_IN_BLOCKS: usize = 8; // = K_TILE_DIM / K_BLOCK_DIM
 const K_NUM_TREE_CONTEXTS: usize = 6;
@@ -1147,25 +1144,6 @@ fn write_dc_global(
     }
 }
 
-/// Which `custom_tables` slot a strategy's quant table lives in, or `None` when
-/// its table is not one jixel can override (DCT4X4, IDENTITY and DCT2X2 stay
-/// on their spec library tables — a 2026-09 fitted-table experiment for the
-/// fine transforms was refuted on photos).
-#[inline]
-fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
-    Some(match raw_strategy {
-        STRATEGY_DCT => 0,
-        STRATEGY_DCT16X16 => 1,
-        STRATEGY_DCT32X32 => 2,
-        STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 3,
-        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
-        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
-        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
-        STRATEGY_DCT64X64 => 7,
-        _ => return None,
-    })
-}
-
 /// Slots whose transform actually appears in the frame.
 fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
     let mut used = [false; 9];
@@ -1173,9 +1151,6 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
                 used[slot] = true;
-            }
-            if strategy == crate::dc_group_data::STRATEGY_IDENTITY {
-                used[8] = true;
             }
         }
     }
@@ -1875,6 +1850,17 @@ fn encode_frame_core(
         ac_tasks.extend((0..gxs * gys).map(|g| (dc_idx, g % gxs, g / gxs)));
         dc_datas.push(dc_data);
     }
+
+    crate::ac_strategy::account_matrix_headers(
+        ctx,
+        scratch,
+        opsin,
+        distance,
+        distp.scale,
+        distp.x_qm_scale,
+        &group_coords,
+        &mut dc_datas,
+    );
 
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
@@ -2932,6 +2918,33 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arithmetic_matrix_header_cost_matches_writer_for_every_subset() {
+        use crate::quant_weights::{DequantMatrices, MatrixHeaderCost};
+        for distance in [0.5, 1.5, 2.5, 4.0, 8.0] {
+            for matrices in [
+                DequantMatrices::new(distance),
+                DequantMatrices::new_pair_b(distance),
+                DequantMatrices::new_saturated(distance),
+                DequantMatrices::new_x_heavy(distance),
+                DequantMatrices::new_saturated_pair_b(distance),
+                DequantMatrices::new_fast(distance),
+            ] {
+                let header = MatrixHeaderCost::new(matrices);
+                for mask in 0..512u16 {
+                    let used = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+                    let mut writer = crate::bit_writer::BitWriter::new();
+                    super::write_dequant_matrices(matrices, &used, &mut writer);
+                    assert_eq!(
+                        header.bits(mask),
+                        writer.bits_written(),
+                        "d={distance} mask={mask}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::{
         DC_COARSEN_D0, DC_COARSEN_D1, DC_COARSEN_MUL, DC_REFINE_HOLD, DC_REFINE_PEAK,
         DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE, MIN_TOKENS_PER_DC_LEAF,

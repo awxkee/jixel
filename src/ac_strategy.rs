@@ -47,7 +47,10 @@ use crate::inflated_cost::{
     channel_rd,
 };
 
+mod matrix_overhead;
 mod selection;
+
+pub(crate) use matrix_overhead::account_matrix_headers;
 
 pub(crate) use selection::{
     Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, fill_ac_strategy,
@@ -693,8 +696,9 @@ fn strategy_cost(
 struct ReconStrategyCost {
     /// Ramped-lambda RD cost including the caller's metadata charge.
     cost: f32,
-    /// Ramped-lambda RD cost without the metadata charge; quant refinement's
-    /// incumbent.
+    /// Ramped-lambda RD cost without metadata, for quantizer refinement.
+    /// NaN when rerank-only gradient penalties make the score incompatible
+    /// with refinement's unpenalized candidates; the caller must recompute it.
     base: f32,
     distortion: f32,
     rate: f32,
@@ -773,13 +777,17 @@ fn reconstruction_strategy_cost_and_base(
             distortion,
             rate,
         ),
-        base: rd_cost(
-            DistortionModel::Reconstruction,
-            distance,
-            0.0,
-            distortion,
-            rate,
-        ),
+        base: if gradient_alpha == 0.0 && gradient_peak_alpha == 0.0 {
+            rd_cost(
+                DistortionModel::Reconstruction,
+                distance,
+                0.0,
+                distortion,
+                rate,
+            )
+        } else {
+            f32::NAN
+        },
         distortion,
         rate,
         hue_distortion,

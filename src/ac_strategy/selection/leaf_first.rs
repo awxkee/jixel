@@ -27,28 +27,6 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Leaf-first (bottom-up) AC-strategy selection.
-//!
-//! The legacy selector decides pairs, 16x16 and the 32 class against tiled
-//! DCT8 first and only afterwards lets the remaining DCT8 blocks pick a sub-8
-//! transform, so a merge never competes against the best representation of
-//! the blocks it replaces. This selector inverts the order:
-//!
-//! 1. every 8x8 block picks its best structural 8x8-family transform (its
-//!    *leaf*: DCT8, DCT4x4/4x8/8x4 or AFV; IDENTITY/DCT2X2 come afterwards);
-//! 2. each 2x2 super-block plans the best of {four leaves, vertical pairs,
-//!    horizontal pairs, 16x16}, with merges gated against the leaf sum;
-//! 3. each 4-aligned 4x4 region plans the best of {four super-block plans,
-//!    32x32, two 32x16, two 16x32}, gated against the leaf sum.
-//!
-//! Plans are values; the strategy map is written once per region after its
-//! root decision, so no rollback bookkeeping is needed during the search. The
-//! outputs (strategy map, `Chosen32Cost` for the 64 pass, `SavedChild` for the
-//! reconstruction rerank) match the legacy selector's contracts, so every
-//! downstream stage is shared. Merge biases, acceptance margins, the risk gate
-//! and the sub-8 chooser are the fitted legacy ones — the only variable is the
-//! order of competition (plus the optional raw-cost propagation policy).
-
 use super::*;
 
 /// One 8x8 block's best 8x8-family transform.
@@ -256,9 +234,6 @@ fn plan_super_block(
             bx0,
             by0,
             UpgradeBand {
-                pick_16x16,
-                vertical,
-                use_pairs: [use_v_left, use_v_right, use_h_top, use_h_bottom],
                 raw: [c16_raw, v_left_raw, v_right_raw, h_top_raw, h_bot_raw],
                 incumbent: [leaf_total, leaf_left, leaf_right, leaf_top, leaf_bottom],
             },
@@ -531,9 +506,8 @@ pub(super) fn select_band_leaf_first(
                     child: None,
                     leaves: [STRATEGY_DCT; 4],
                 }; 2]; 2];
-                let mut sub_total = 0.0f32;
-                let mut leaf_total = 0.0f32;
-                let upgrade_mark = upgrades.len();
+                let mut children = [[0.0f32; 2]; 2];
+                let mut baseline = [[0.0f32; 2]; 2];
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let plan = plan_super_block(
@@ -545,8 +519,8 @@ pub(super) fn select_band_leaf_first(
                             by + sy * 2,
                             upgrades,
                         );
-                        sub_total += plan.j;
-                        leaf_total += plan.leaf_total;
+                        children[sy][sx] = plan.j;
+                        baseline[sy][sx] = plan.leaf_total;
                         plans[sy][sx] = plan;
                     }
                 }
@@ -589,26 +563,15 @@ pub(super) fn select_band_leaf_first(
                 let ct = rect32(bx, by, STRATEGY_DCT16X32, 4, 2);
                 let cb = rect32(bx, by + 2, STRATEGY_DCT16X32, 4, 2);
 
-                let can_32x32 = ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32);
-                let can_32x16 = ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X16)
-                    && ac_strategy.can_place_strategy(bx + 2, by, STRATEGY_DCT32X16);
-                let can_16x32 = ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT16X32)
-                    && ac_strategy.can_place_strategy(bx, by + 2, STRATEGY_DCT16X32);
-                let cost_32x32 = if can_32x32 {
-                    merge.bias_32x32 * cost32
-                } else {
-                    f32::INFINITY
-                };
-                let cost_32x16 = if can_32x16 {
-                    merge.bias_rect32 * (cl + cr)
-                } else {
-                    f32::INFINITY
-                };
-                let cost_16x32 = if can_16x32 {
-                    merge.bias_rect32 * (ct + cb)
-                } else {
-                    f32::INFINITY
-                };
+                let raw = [cost32, cl, cr, ct, cb];
+                let sites = merge32_sites(bx, by);
+                let mut costs = raw.map(|c| merge.bias_rect32 * c);
+                costs[0] = merge.bias_32x32 * cost32;
+                for (k, &(x, y, strategy)) in sites.iter().enumerate() {
+                    if !ac_strategy.can_place_strategy(x, y, strategy) {
+                        costs[k] = f32::INFINITY;
+                    }
+                }
 
                 let (mut q_min, mut q_max) = (u8::MAX, 0u8);
                 for iy in 0..4 {
@@ -619,73 +582,26 @@ pub(super) fn select_band_leaf_first(
                 }
                 let gate =
                     |accept: f32| risk_gated(merge.risk_k, accept, q_min as f32, q_max as f32, 2.0);
-                let (best_big, best_big_raw, best_strategy, accept) =
-                    if cost_32x32 <= cost_32x16 && cost_32x32 <= cost_16x32 {
-                        (cost_32x32, cost32, STRATEGY_DCT32X32, gate(merge.accept_32))
-                    } else if cost_32x16 <= cost_16x32 {
-                        (
-                            cost_32x16,
-                            cl + cr,
-                            STRATEGY_DCT32X16,
-                            gate(merge.accept_32_rect),
-                        )
-                    } else {
-                        (
-                            cost_16x32,
-                            ct + cb,
-                            STRATEGY_DCT16X32,
-                            gate(merge.accept_32_rect),
-                        )
-                    };
-                // Beat the planned subdivision outright and the leaf incumbent
-                // by the margin, so a chain of marginal merges cannot make the
-                // big transform look trustworthy.
-                let merged = best_big < sub_total && merge_beats_dct8(best_big, leaf_total, accept);
-                if merged {
-                    upgrades.truncate(upgrade_mark);
-                    let mut grid = [NO_CHILD_BLOCK; 16];
-                    for sy in 0..2 {
-                        for sx in 0..2 {
-                            expand_2x2(plans[sy][sx].grid, sx, sy, &mut grid);
-                        }
-                    }
-                    // The rerank restores a child layout per selected
-                    // transform, looked up by its own first block: one grid
-                    // for a 32x32, one per half for the rectangles (as the
-                    // legacy `capture_children` does).
-                    let (cov_x, cov_y) = match best_strategy {
-                        STRATEGY_DCT32X32 => (4, 4),
-                        STRATEGY_DCT32X16 => (2, 4),
-                        _ => (4, 2),
-                    };
-                    for (ox, oy) in [(0, 0), (4 - cov_x, 4 - cov_y)] {
-                        let half = sub_grid(&grid, ox, oy, cov_x, cov_y);
-                        if grid_nontrivial(&half) {
-                            saved.push(SavedChild {
-                                bx: (bx + ox) as u16,
-                                by: (by + oy) as u16,
-                                grid: half,
-                            });
-                        }
-                        if cov_x == 4 && cov_y == 4 {
-                            break;
-                        }
-                    }
-                    match best_strategy {
-                        STRATEGY_DCT32X32 => ac_strategy.set_first(bx, by, STRATEGY_DCT32X32),
-                        STRATEGY_DCT32X16 => {
-                            ac_strategy.set_first(bx, by, STRATEGY_DCT32X16);
-                            ac_strategy.set_first(bx + 2, by, STRATEGY_DCT32X16);
-                        }
-                        STRATEGY_DCT16X32 => {
-                            ac_strategy.set_first(bx, by, STRATEGY_DCT16X32);
-                            ac_strategy.set_first(bx, by + 2, STRATEGY_DCT16X32);
-                        }
-                        _ => unreachable!(),
-                    }
-                } else {
-                    for sy in 0..2 {
-                        for sx in 0..2 {
+                let mask = choose_merge_partition(
+                    children,
+                    baseline,
+                    costs,
+                    [
+                        gate(merge.accept_32),
+                        gate(merge.accept_32_rect),
+                        gate(merge.accept_32_rect),
+                        gate(merge.accept_32_rect),
+                        gate(merge.accept_32_rect),
+                    ],
+                );
+                let mut grid = [NO_CHILD_BLOCK; 16];
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        expand_2x2(plans[sy][sx].grid, sx, sy, &mut grid);
+                        // Only surviving super-blocks publish their children.
+                        // Parent merges save the planned grid directly below.
+                        let covered = mask & (1 | (1 << (1 + sx)) | (1 << (3 + sy))) != 0;
+                        if !covered {
                             commit_super_block(
                                 ac_strategy,
                                 saved,
@@ -696,16 +612,26 @@ pub(super) fn select_band_leaf_first(
                         }
                     }
                 }
+                for (k, &(x, y, strategy)) in sites.iter().enumerate() {
+                    if mask & (1 << k) == 0 {
+                        continue;
+                    }
+                    let cx = AcStrategyImage::covered_blocks_x_of(strategy);
+                    let cy = AcStrategyImage::covered_blocks_y_of(strategy);
+                    let child = sub_grid(&grid, x - bx, y - by, cx, cy);
+                    if grid_nontrivial(&child) {
+                        saved.push(SavedChild {
+                            bx: x as u16,
+                            by: y as u16,
+                            grid: child,
+                        });
+                    }
+                    ac_strategy.set_first(x, y, strategy);
+                }
                 chosen32.push(Chosen32Cost {
                     bx: bx as u16,
                     by: by as u16,
-                    cost: if !merged {
-                        sub_total
-                    } else if raw_propagation {
-                        best_big_raw
-                    } else {
-                        best_big
-                    },
+                    cost: partition_cost(children, if raw_propagation { raw } else { costs }, mask),
                 });
                 bx += 4;
             } else if four_row {

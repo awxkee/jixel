@@ -760,10 +760,7 @@ fn main() -> Result<()> {
         let chart_path = out_dir.join(format!("{name}_mean_rd_cvvdp.png"));
         draw_chart(
             &chart_path,
-            &format!(
-                "{name} — mean ColorVideoVDP vs rate ({} images)",
-                images.len()
-            ),
+            &format!("{name} — mean CVVDP vs rate ({} images)", images.len()),
             &series,
             &YAxis {
                 desc: "mean CVVDP (JOD, 10 = identical, higher = better)".into(),

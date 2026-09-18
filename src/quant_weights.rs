@@ -31,6 +31,64 @@
 use crate::dct::fmla;
 use crate::util::{HeapMatrix, f16_bits_to_f32, f32_to_f16_bits, heap_array_from_fn};
 
+/// Shared by matrix signaling and selection; transposed transforms use one table.
+pub(crate) fn quant_table_slot_of(strategy: u8) -> Option<usize> {
+    use crate::dc_group_data::*;
+    Some(match strategy {
+        STRATEGY_DCT => 0,
+        STRATEGY_DCT16X16 => 1,
+        STRATEGY_DCT32X32 => 2,
+        STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 3,
+        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
+        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
+        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
+        STRATEGY_DCT64X64 => 7,
+        STRATEGY_IDENTITY => 8,
+        _ => return None,
+    })
+}
+
+/// Exact, unaligned matrix-header size. Mode bits are a shared frame cost;
+/// payload bits are paid once per active custom table, regardless of usage.
+pub(crate) struct MatrixHeaderCost {
+    pub(crate) payload: [usize; 9],
+}
+
+impl MatrixHeaderCost {
+    pub(crate) fn new(matrices: &DequantMatrices) -> Self {
+        let mut payload = [0; 9];
+        for (slot, table) in matrices.custom_tables.iter().enumerate() {
+            if let Some(table) = table {
+                payload[slot] = 4 + 3 * 16 * table.num_bands + usize::from(slot == 5) * 48;
+            }
+        }
+        if matrices.identity_weights.is_some() {
+            payload[8] = 9 * 16;
+        }
+        Self { payload }
+    }
+
+    pub(crate) fn custom_mask(&self) -> u16 {
+        self.payload
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (slot, &bits)| {
+                mask | (u16::from(bits != 0) << slot)
+            })
+    }
+
+    pub(crate) fn bits(&self, used: u16) -> usize {
+        let payload: usize = self
+            .payload
+            .iter()
+            .enumerate()
+            .filter(|&(slot, _)| used & (1 << slot) != 0)
+            .map(|(_, &bits)| bits)
+            .sum();
+        1 + payload + usize::from(payload != 0) * (17 * 3)
+    }
+}
+
 /// A signaled distance-band override for one quant table.
 #[derive(Clone, Copy)]
 pub(crate) struct BandOverride {
