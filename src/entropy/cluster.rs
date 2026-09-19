@@ -194,13 +194,11 @@ fn add_counts(dst: &mut [u32; ALPHABET_SIZE], src: &[u32; ALPHABET_SIZE]) {
     }
 }
 
-#[inline]
 fn histogram_add(a: &mut Histogram, b: &Histogram) {
     add_counts(&mut a.counts, &b.counts);
     a.total_count += b.total_count;
 }
 
-#[inline]
 fn histogram_sub(a: &mut Histogram, b: &Histogram) {
     for (dst, &src) in a.counts.iter_mut().zip(b.counts.iter()) {
         *dst -= src;
@@ -208,7 +206,6 @@ fn histogram_sub(a: &mut Histogram, b: &Histogram) {
     a.total_count -= b.total_count;
 }
 
-#[inline]
 fn histogram_distance(
     a: &Histogram,
     b: &Histogram,
@@ -919,12 +916,15 @@ fn context_map_merge_saving(a: usize, b: usize) -> f64 {
 /// precompute every move delta against a snapshot and recompute only the
 /// entries whose cluster changed since (exactly the sequential algorithm).
 /// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced.
+/// `refinement_passes` is the existing relocation search budget; Slow VarDCT
+/// spends six passes, while the other callers retain two.
 pub(crate) fn cluster_histograms_ans(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     pool: Option<&crate::thread_pool::ThreadPool>,
     charge_context_map: bool,
     max_clusters: usize,
+    refinement_passes: usize,
 ) -> usize {
     assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
     use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
@@ -1072,12 +1072,12 @@ pub(crate) fn cluster_histograms_ans(
     };
     rebuild(&mut clusters, &mut cluster_costs, &assignment, &mut scratch);
 
-    for _ in 0..2 {
+    for _ in 0..refinement_passes {
         // Propose every context's best move against a snapshot of the
         // clusters, in parallel; then apply proposals in index order, each
         // re-priced against the current clusters (two cost evaluations per
-        // proposer). Deterministic and independent of `threads`; the second
-        // pass picks up moves the first pass's snapshot could not see.
+        // proposer). Deterministic and independent of `threads`; subsequent
+        // passes pick up moves the previous snapshot could not see.
         let proposals: Vec<Option<u8>> = {
             let clusters = &clusters;
             let cluster_costs = &cluster_costs;
@@ -1240,6 +1240,7 @@ mod tests {
                     Some(&pool),
                     true,
                     CLUSTERS_LIMIT,
+                    6,
                 );
                 (num, map, histograms[..num].to_vec())
             };

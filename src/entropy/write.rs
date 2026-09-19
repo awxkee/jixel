@@ -187,6 +187,7 @@ fn select_hybrid_config_ans_sampled(
     values: &[u32],
     sample_stride: usize,
     stride: usize,
+    acceptance_ratio: f64,
     scratch: &mut HybridAnsSelectorScratch,
 ) -> HybridUintConfig {
     if values.is_empty() {
@@ -228,7 +229,7 @@ fn select_hybrid_config_ans_sampled(
     }
 
     // Shannon cost only nominates the strongest non-default finalist. The
-    // winner and the existing 0.5% stability gate below use actual normalized
+    // winner and the preset's acceptance margin below use actual normalized
     // ANS data and exact table bits for both finalist and default.
     let proxy_best = (0..NUM_HYBRID_CANDIDATES)
         .filter(|&i| i != DEFAULT_HYBRID_INDEX && scratch.valid[i])
@@ -261,7 +262,7 @@ fn select_hybrid_config_ans_sampled(
             best = config;
         }
     }
-    if best_cost >= default_cost * 0.995 {
+    if best_cost >= default_cost * acceptance_ratio {
         HybridUintConfig::DEFAULT
     } else {
         best
@@ -317,6 +318,10 @@ impl HybridUintSamples {
     }
 
     pub(crate) fn select(&self) -> Vec<HybridUintConfig> {
+        self.select_with_acceptance(0.995)
+    }
+
+    fn select_with_acceptance(&self, acceptance_ratio: f64) -> Vec<HybridUintConfig> {
         // Every cluster is selected independently; spread them over scoped
         // threads with one selector scratch each (identical results).
         let n = self.values.len();
@@ -330,7 +335,13 @@ impl HybridUintSamples {
                 .iter()
                 .zip(&self.strides)
                 .map(|(values, &stride)| {
-                    select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                    select_hybrid_config_ans_sampled(
+                        values,
+                        1,
+                        stride,
+                        acceptance_ratio,
+                        &mut scratch,
+                    )
                 })
                 .collect();
         }
@@ -348,7 +359,13 @@ impl HybridUintSamples {
                             .iter()
                             .zip(strides)
                             .map(|(values, &stride)| {
-                                select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                                select_hybrid_config_ans_sampled(
+                                    values,
+                                    1,
+                                    stride,
+                                    acceptance_ratio,
+                                    &mut scratch,
+                                )
                             })
                             .collect::<Vec<_>>()
                     })
@@ -365,6 +382,7 @@ impl HybridUintSamples {
         &self,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
+        acceptance_ratio: f64,
     ) -> Vec<HybridUintConfig> {
         let n = self.values.len();
         if n == 0 {
@@ -381,6 +399,7 @@ impl HybridUintSamples {
                         &self.values[i],
                         1,
                         self.strides[i],
+                        acceptance_ratio,
                         &mut selector,
                     )
                 })
@@ -398,7 +417,7 @@ fn select_hybrid_config_ans(
     scratch: &mut HybridAnsSelectorScratch,
 ) -> HybridUintConfig {
     let stride = values.len().div_ceil(65_536).max(1);
-    select_hybrid_config_ans_sampled(values, stride, stride, scratch)
+    select_hybrid_config_ans_sampled(values, stride, stride, 0.995, scratch)
 }
 
 fn hybrid_ans_candidate_cost(
@@ -555,7 +574,13 @@ pub(crate) fn optimize_entropy_code_ac(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
-    optimize_entropy_code_ac_streams(std::iter::once(tokens), num_contexts, huffman_pool, true)
+    optimize_entropy_code_ac_streams(
+        std::iter::once(tokens),
+        num_contexts,
+        huffman_pool,
+        true,
+        crate::Speed::Fast,
+    )
 }
 
 /// `select_configs = false` keeps every cluster on `HybridUintConfig::DEFAULT`.
@@ -570,6 +595,7 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
+    speed: crate::Speed,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -580,6 +606,11 @@ where
         huffman_pool,
         select_configs,
         false,
+        if speed == crate::Speed::Slow {
+            1.0
+        } else {
+            0.995
+        },
     )
 }
 
@@ -591,7 +622,7 @@ pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
-    optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true)
+    optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true, 0.995)
 }
 
 const ANS_CLUSTER_PROXY_SYMBOL_BITS: f64 = 6.0;
@@ -601,18 +632,17 @@ const XLOG2X_TABLE_SIZE: u32 = 1 << 16;
 
 #[inline]
 fn xlog2x(value: u32) -> f64 {
-    if value <= 1 {
-        0.0
-    } else {
-        value as f64 * f_log2(value as f64)
-    }
+    value as f64 * f_log2(value as f64)
 }
 
 fn xlog2x_table() -> &'static [f64] {
-    // Raw counts can exceed the table. Cache the common small values in
-    // 512 KiB shared by all encodes, retaining the exact calculation above.
     static TABLE: std::sync::OnceLock<Box<[f64]>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| (0..XLOG2X_TABLE_SIZE).map(xlog2x).collect())
+    TABLE.get_or_init(|| {
+        [0.0, 0.0]
+            .into_iter()
+            .chain((2..XLOG2X_TABLE_SIZE).map(xlog2x))
+            .collect()
+    })
 }
 
 /// Cheap Shannon-domain delta used only to nominate an ANS cluster move. The
@@ -1102,7 +1132,13 @@ where
         && refine_ans_clusters_once(code, &streams, thread_pool, scratch);
     let recluster = !matches!(refinement, AnsRefinement::Fast { recluster: false });
     let proposal = if recluster {
-        propose_ans_reclustering(&streams, code.context_map.len(), thread_pool, scratch)
+        propose_ans_reclustering(
+            &streams,
+            code.context_map.len(),
+            thread_pool,
+            scratch,
+            refinement,
+        )
     } else {
         propose_ans_cluster_batch(code, &streams)
     };
@@ -1232,6 +1268,7 @@ fn propose_ans_reclustering(
     num_contexts: usize,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
+    refinement: AnsRefinement,
 ) -> Option<AnsClusterProposal> {
     let mut dense = vec![usize::MAX; num_contexts];
     for tokens in streams {
@@ -1261,6 +1298,11 @@ fn propose_ans_reclustering(
         Some(thread_pool),
         true,
         super::cluster::CLUSTERS_LIMIT,
+        if matches!(refinement, AnsRefinement::Slow) {
+            6
+        } else {
+            2
+        },
     );
     histograms.truncate(n);
     let context_map: Vec<u8> = dense
@@ -1283,7 +1325,15 @@ fn propose_ans_reclustering(
             max_values[cluster] = max_values[cluster].max(token.value);
         }
     }
-    let mut configs = samples.select_with_pool(thread_pool, scratch);
+    let mut configs = samples.select_with_pool(
+        thread_pool,
+        scratch,
+        if matches!(refinement, AnsRefinement::Slow) {
+            1.0
+        } else {
+            0.995
+        },
+    );
     // Sampling may miss a rare large value. Check a conservative upper bound
     // for every selected configuration before rebuilding fixed-size tables.
     for (config, &max_value) in configs.iter_mut().zip(&max_values) {
@@ -1411,6 +1461,7 @@ fn optimize_entropy_code_ac_streams_impl<'a, I>(
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
     fast_cluster: bool,
+    hybrid_acceptance: f64,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -1425,6 +1476,7 @@ where
         huffman_pool,
         select_configs,
         fast_cluster,
+        hybrid_acceptance,
     )
 }
 
@@ -1435,6 +1487,7 @@ fn optimize_entropy_code_ac_slices(
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
     fast_cluster: bool,
+    hybrid_acceptance: f64,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     for tokens in streams {
@@ -1498,7 +1551,7 @@ fn optimize_entropy_code_ac_slices(
                 samples.push(context_map[t.context as usize] as usize, t.value);
             }
         }
-        samples.select()
+        samples.select_with_acceptance(hybrid_acceptance)
     } else {
         vec![HybridUintConfig::DEFAULT; num_clusters]
     };
@@ -2834,10 +2887,30 @@ mod context_map_tests {
                 };
                 values.push(value);
             }
+            let fast = select_hybrid_config_ans(&values, &mut scratch);
             assert_eq!(
-                select_hybrid_config_ans(&values, &mut scratch),
+                fast,
                 exhaustive_selector(&values),
                 "hybrid shortlist diverged on generated case {case}"
+            );
+            let slow = select_hybrid_config_ans_sampled(&values, 1, 1, 1.0, &mut scratch);
+            // Removing the margin can admit a small win from the existing
+            // shortlist, which need not be the exhaustive global optimum.
+            // Independently price the selected configurations: Slow must
+            // never raise the exact cost on the same samples.
+            let exact_cost = |config| {
+                let mut counts = [0u32; ALPHABET_SIZE];
+                let mut extra_bits = 0u64;
+                for &value in &values {
+                    let (symbol, nbits, _) = uint_encode_with_config(value, config);
+                    counts[symbol as usize] += 1;
+                    extra_bits += nbits as u64;
+                }
+                hybrid_ans_candidate_cost(&counts, extra_bits, 1, config)
+            };
+            assert!(
+                exact_cost(slow) <= exact_cost(fast),
+                "Slow raised the exact HybridUint cost on generated case {case}"
             );
         }
     }

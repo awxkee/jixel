@@ -2000,6 +2000,7 @@ fn encode_frame_core(
                 // one-token nudge can push the clustering off a knife-edge merge.
                 // Selection applies to the final codes only.
                 false,
+                ctx.speed,
             );
             crate::entropy::FrozenTokenPrices::new(&provisional_code)
         };
@@ -2113,6 +2114,7 @@ fn encode_frame_core(
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
         ctx.speed != Speed::Fastest,
+        ctx.speed,
     );
     let tree_static = DcTreeChoice::Static(dc_gradient);
 
@@ -2179,6 +2181,7 @@ fn encode_frame_core(
             learned.num_contexts,
             &mut scratch.huffman_pool,
             ctx.speed != Speed::Fastest,
+            ctx.speed,
         );
 
         // Price both arms end to end: serialized tree + entropy-code header
@@ -2281,6 +2284,7 @@ fn encode_frame_core(
                         num_contexts,
                         &mut scratch.huffman_pool,
                         true,
+                        ctx.speed,
                     )
                 }
             })

@@ -1406,6 +1406,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             pool,
             false,
             max_clusters,
+            2,
         )
     } else {
         cluster_histograms_fixed(

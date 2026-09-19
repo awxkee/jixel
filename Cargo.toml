@@ -23,3 +23,7 @@ avx = []
 neon = []
 sse = []
 wasm = []
+
+[profile.profiling]
+inherits = "release"
+debug = "full"
