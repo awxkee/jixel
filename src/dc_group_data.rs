@@ -155,6 +155,7 @@ impl AcStrategyImage {
             [1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1];
         LUT[strategy as usize] as usize
     }
+
     #[inline]
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
