@@ -117,8 +117,16 @@ pub(crate) fn counts_bit_cost_neon(counts: &[u32; ALPHABET_SIZE], total_count: u
     let mut cost0 = vdupq_n_f32(0.0);
     let mut cost1 = vdupq_n_f32(0.0);
     for counts8 in counts.as_chunks::<8>().0 {
-        let count0 = vcvtq_f32_u32(unsafe { vld1q_u32(counts8.as_ptr()) });
-        let count1 = vcvtq_f32_u32(unsafe { vld1q_u32(counts8.as_ptr().add(4)) });
+        let bins0 = unsafe { vld1q_u32(counts8.as_ptr()) };
+        let bins1 = unsafe { vld1q_u32(counts8.as_ptr().add(4)) };
+        // Empty chunks contribute exactly zero to both accumulators. Keep
+        // occupied bins in their original lanes and order: compacting them
+        // would change rounding and potentially the clustering decisions.
+        if vmaxvq_u32(vorrq_u32(bins0, bins1)) == 0 {
+            continue;
+        }
+        let count0 = vcvtq_f32_u32(bins0);
+        let count1 = vcvtq_f32_u32(bins1);
         let positive0 = vmaxq_f32(count0, one);
         let positive1 = vmaxq_f32(count1, one);
         cost0 = vfmaq_f32(
@@ -133,4 +141,76 @@ pub(crate) fn counts_bit_cost_neon(counts: &[u32; ALPHABET_SIZE], total_count: u
         );
     }
     vaddvq_f32(vaddq_f32(cost0, cost1)).max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The original dense kernel is the numeric oracle: a scalar sum has a
+    // different rounding order and cannot check byte-preserving SIMD changes.
+    #[target_feature(enable = "neon")]
+    fn dense_cost(counts: &[u32; ALPHABET_SIZE], total: u32) -> f32 {
+        let log_total = vdupq_n_f32(crate::adaptive_quant::dirty_log2f(total as f32));
+        let mut cost0 = vdupq_n_f32(0.0);
+        let mut cost1 = vdupq_n_f32(0.0);
+        for chunk in counts.as_chunks::<8>().0 {
+            let a = vcvtq_f32_u32(unsafe { vld1q_u32(chunk.as_ptr()) });
+            let b = vcvtq_f32_u32(unsafe { vld1q_u32(chunk.as_ptr().add(4)) });
+            cost0 = vfmaq_f32(
+                cost0,
+                a,
+                vsubq_f32(log_total, dirty_log2f_x4(vmaxq_f32(a, vdupq_n_f32(1.0)))),
+            );
+            cost1 = vfmaq_f32(
+                cost1,
+                b,
+                vsubq_f32(log_total, dirty_log2f_x4(vmaxq_f32(b, vdupq_n_f32(1.0)))),
+            );
+        }
+        vaddvq_f32(vaddq_f32(cost0, cost1)).max(0.0)
+    }
+
+    #[test]
+    fn skipped_empty_chunks_preserve_dense_cost_bits() {
+        let mut state = 0x39e1_268bu32;
+        for case in 0..8192 {
+            let mut counts = [0u32; ALPHABET_SIZE];
+            for (i, count) in counts.iter_mut().enumerate() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                // Dense, sparse, and empty chunks at every position, with
+                // totals crossing f32's exact-integer range.
+                if case % 5 == 0 || (case >> (i / 8 % 12)) & 1 != 0 {
+                    *count = if state & 3 == 0 {
+                        0
+                    } else {
+                        state % 32_000_000
+                    };
+                }
+            }
+            counts[case % ALPHABET_SIZE] += 1;
+            let total = counts.iter().sum();
+            unsafe {
+                assert_eq!(
+                    counts_bit_cost_neon(&counts, total).to_bits(),
+                    dense_cost(&counts, total).to_bits(),
+                    "case {case}"
+                );
+            }
+        }
+        for count in [1, 2, 3, (1 << 24) - 1, 1 << 24, (1 << 24) + 1, u32::MAX] {
+            for symbol in [0, 7, 8, ALPHABET_SIZE - 1] {
+                let mut counts = [0; ALPHABET_SIZE];
+                counts[symbol] = count;
+                unsafe {
+                    assert_eq!(
+                        counts_bit_cost_neon(&counts, count).to_bits(),
+                        dense_cost(&counts, count).to_bits()
+                    );
+                }
+            }
+        }
+    }
 }

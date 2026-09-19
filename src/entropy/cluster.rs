@@ -32,6 +32,8 @@ use super::histogram::Histogram;
 use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
 use crate::adaptive_quant::dirty_log2f;
+use crate::coder_scratch::CoderScratch;
+use crate::thread_pool::ThreadPool;
 use crate::util::heap_array;
 use std::sync::OnceLock;
 
@@ -341,7 +343,16 @@ pub(crate) fn cluster_histograms(
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) {
-    cluster_histograms_inner(histograms, context_map, false, huffman_pool);
+    cluster_histograms_inner(histograms, context_map, false, huffman_pool, None);
+}
+
+pub(crate) fn cluster_histograms_with_pool(
+    histograms: &mut Vec<Histogram>,
+    context_map: &mut Vec<u8>,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
+) {
+    cluster_histograms_inner(histograms, context_map, false, huffman_pool, pool);
 }
 
 /// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced,
@@ -628,6 +639,7 @@ fn cluster_histograms_inner(
     context_map: &mut Vec<u8>,
     refined: bool,
     huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
 ) {
     if histograms.len() <= 1 {
         context_map.clear();
@@ -681,6 +693,12 @@ fn cluster_histograms_inner(
     let mut out_costs: Vec<f32> = Vec::with_capacity(max_histograms);
     let mut scratch = [0u32; ALPHABET_SIZE];
 
+    // Seed distances are independent. The reduction below still runs in
+    // input order, including the floating-point saving and first-best ties.
+    let mut workers = pool
+        .filter(|pool| n >= 1024 && pool.num_threads() > 1)
+        .map(|pool| (pool, CoderScratch::lossless(), vec![0.0f32; n]));
+
     // See the note in `cluster_histograms_fixed`: the stop test is on the total
     // saving a cluster realizes, not on one context's distance.
     while out.len() < max_histograms {
@@ -703,6 +721,25 @@ fn cluster_histograms_inner(
         let mut next_largest_idx = candidate;
         let mut next_largest_dist = 0.0f32;
 
+        if let Some((pool, caller_scratch, distances)) = &mut workers {
+            let mut chunks: Vec<_> = distances.chunks_mut(64).collect();
+            pool.steal_for_each_mut(caller_scratch, &mut chunks, |part, chunk, _| {
+                let mut scratch = [0u32; ALPHABET_SIZE];
+                for (offset, distance) in chunk.iter_mut().enumerate() {
+                    let i = part * 64 + offset;
+                    if dists[i] != 0.0 {
+                        *distance = histogram_distance(
+                            &inp[i],
+                            last_hist,
+                            in_costs[i],
+                            last_cost,
+                            &mut scratch,
+                        );
+                    }
+                }
+            });
+        }
+
         for (i, ((hist, &in_cost), dist)) in inp
             .iter()
             .zip(in_costs.iter())
@@ -713,7 +750,11 @@ fn cluster_histograms_inner(
                 continue;
             }
 
-            let d = histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch);
+            let d = if let Some((_, _, distances)) = &workers {
+                distances[i]
+            } else {
+                histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch)
+            };
             if d < *dist {
                 if *dist != f32::MAX {
                     saving += *dist - d;
@@ -960,7 +1001,9 @@ pub(crate) fn cluster_histograms_ans(
             return (0..n).map(|i| f(i, &mut s)).collect();
         };
         let threads = pool.num_threads().min(n);
-        let chunk = n.div_ceil(threads);
+        // More work items than workers lets a lane finishing sparse contexts
+        // pick up dense ones, rather than waiting for a fixed heavy chunk.
+        let chunk = n.div_ceil(threads * 4);
         let parts = pool.steal_map(caller_scratch, n.div_ceil(chunk), |part, _| {
             let begin = part * chunk;
             let end = (begin + chunk).min(n);
@@ -1388,6 +1431,7 @@ mod tests {
             &mut expected_map,
             refined,
             &mut expected_pool,
+            None,
         );
 
         let mut actual = inputs(n);
@@ -1416,6 +1460,49 @@ mod tests {
         for n in [0, 1, 2, 7, 64, 65, 128, 221] {
             assert_fixed_matches_allocating(n, false);
             assert_fixed_matches_allocating(n, true);
+        }
+    }
+
+    #[test]
+    fn pooled_prefix_clustering_preserves_serial_decisions() {
+        // Cross the parallel threshold and the 64-context chunk boundary.
+        // Repeated populations exercise first-best ties; empty contexts must
+        // keep the same assignments even when they fall between work items.
+        for n in [1023, 1024, 1089] {
+            let input: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut h = Histogram::new();
+                    if i % 11 != 0 {
+                        for j in 0..8 {
+                            let symbol = (i % 17 + j * 13) % ALPHABET_SIZE;
+                            let count = (i % 7 + j * 3 + 1) as u32;
+                            h.counts[symbol] += count;
+                            h.total_count += count;
+                        }
+                    }
+                    h
+                })
+                .collect();
+            let mut expected = input.clone();
+            let mut expected_map = Vec::new();
+            cluster_histograms(&mut expected, &mut expected_map, &mut Vec::new());
+            for threads in [1, 2, 4] {
+                let pool = ThreadPool::new_lossless(threads);
+                let mut actual = input.clone();
+                let mut actual_map = Vec::new();
+                cluster_histograms_with_pool(
+                    &mut actual,
+                    &mut actual_map,
+                    &mut Vec::new(),
+                    Some(&pool),
+                );
+                assert_eq!(actual_map, expected_map, "n={n}, threads={threads}");
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.counts, expected.counts);
+                    assert_eq!(actual.total_count, expected.total_count);
+                }
+            }
         }
     }
 

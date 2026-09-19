@@ -388,7 +388,7 @@ impl HybridUintSamples {
         if n == 0 {
             return Vec::new();
         }
-        let chunk = n.div_ceil(pool.num_threads());
+        let chunk = n.div_ceil(pool.num_threads() * 4);
         pool.steal_map(scratch, n.div_ceil(chunk), |part, _| {
             let begin = part * chunk;
             let end = (begin + chunk).min(n);
@@ -580,6 +580,7 @@ pub(crate) fn optimize_entropy_code_ac(
         huffman_pool,
         true,
         crate::Speed::Fast,
+        None,
     )
 }
 
@@ -596,6 +597,7 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
     speed: crate::Speed,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -611,6 +613,7 @@ where
         } else {
             0.995
         },
+        pool,
     )
 }
 
@@ -618,11 +621,20 @@ pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
     streams: I,
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
-    optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true, 0.995)
+    optimize_entropy_code_ac_streams_impl(
+        streams,
+        num_contexts,
+        huffman_pool,
+        false,
+        true,
+        0.995,
+        pool,
+    )
 }
 
 const ANS_CLUSTER_PROXY_SYMBOL_BITS: f64 = 6.0;
@@ -991,23 +1003,17 @@ fn exact_ans_stream_bits_pair(
     };
 
     const MIN_PARALLEL_TOKENS: usize = 16_384;
-    const MAX_EXACT_LANES: usize = 8;
     let total_tokens: usize = streams.iter().map(|stream| stream.len()).sum();
-    let num_lanes = thread_pool
-        .num_threads()
-        .min(MAX_EXACT_LANES)
-        .min(streams.len());
+    let num_lanes = thread_pool.num_threads().min(streams.len());
     if num_lanes <= 1 || total_tokens < MIN_PARALLEL_TOKENS {
         return sequential(streams);
     }
 
-    let chunk_len = streams.len().div_ceil(num_lanes);
-    let num_chunks = streams.len().div_ceil(chunk_len);
+    // Each stream owns an ANS state. Schedule those independently so groups
+    // with many tokens do not strand workers assigned a lighter fixed chunk.
     thread_pool
-        .steal_map_with_threads(scratch, num_chunks, num_lanes, |lane, _scratch| {
-            let start = lane * chunk_len;
-            let end = (start + chunk_len).min(streams.len());
-            sequential(&streams[start..end])
+        .steal_map(scratch, streams.len(), |i, _scratch| {
+            ans_tokens_bits_pair(streams[i], &first, &second)
         })
         .into_iter()
         .fold((0usize, 0usize), |acc, bits| {
@@ -1462,6 +1468,7 @@ fn optimize_entropy_code_ac_streams_impl<'a, I>(
     select_configs: bool,
     fast_cluster: bool,
     hybrid_acceptance: f64,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -1477,6 +1484,7 @@ where
         select_configs,
         fast_cluster,
         hybrid_acceptance,
+        pool,
     )
 }
 
@@ -1488,6 +1496,7 @@ fn optimize_entropy_code_ac_slices(
     select_configs: bool,
     fast_cluster: bool,
     hybrid_acceptance: f64,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
     for tokens in streams {
@@ -1533,7 +1542,12 @@ fn optimize_entropy_code_ac_slices(
             }
         }));
     } else {
-        cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+        super::cluster::cluster_histograms_with_pool(
+            &mut histograms,
+            &mut context_map,
+            huffman_pool,
+            pool,
+        );
     }
 
     // Second walk: pick each final cluster's HybridUint config from its actual
@@ -1551,7 +1565,11 @@ fn optimize_entropy_code_ac_slices(
                 samples.push(context_map[t.context as usize] as usize, t.value);
             }
         }
-        samples.select_with_acceptance(hybrid_acceptance)
+        if let Some(pool) = pool {
+            samples.select_with_pool(pool, &mut CoderScratch::lossless(), hybrid_acceptance)
+        } else {
+            samples.select_with_acceptance(hybrid_acceptance)
+        }
     } else {
         vec![HybridUintConfig::DEFAULT; num_clusters]
     };
@@ -2496,13 +2514,18 @@ mod ans_refinement_tests {
                 HYBRID_CANDIDATES[11],
             ],
         );
-        let mut streams: Vec<&[Token]> = tokens.chunks(997).collect();
+        // An uneven large first stream followed by small streams exercises
+        // work stealing; every boundary still starts a distinct ANS state.
+        let split = tokens.len() / 2;
+        let mut streams: Vec<&[Token]> = std::iter::once(&tokens[..split])
+            .chain(tokens[split..].chunks(997))
+            .collect();
         streams.push(&[]);
         let expected = (
             serialized(&first, &streams).0,
             serialized(&second, &streams).0,
         );
-        for threads in [1, 4] {
+        for threads in [1, 4, 12] {
             assert_eq!(
                 exact_ans_bundle_bits_pair(
                     &streams,
@@ -2919,6 +2942,30 @@ mod context_map_tests {
 #[cfg(test)]
 mod sampled_hybrid_tests {
     use super::*;
+
+    #[test]
+    fn pooled_selection_preserves_configs_and_acceptance() {
+        let values: Vec<Vec<u32>> = (0..19)
+            .map(|i| {
+                (0..i * i * 37)
+                    .map(|v| ((v * 731) % (17 + i * 193)) as u32)
+                    .collect()
+            })
+            .collect();
+        let strides = (0..values.len()).map(|i| i % 5 + 1).collect();
+        let samples = HybridUintSamples::from_parts(values, strides);
+        for acceptance in [0.995, 1.0] {
+            let expected = samples.select_with_acceptance(acceptance);
+            for threads in [1, 4, 12] {
+                let actual = samples.select_with_pool(
+                    &ThreadPool::new_lossless(threads),
+                    &mut CoderScratch::lossless(),
+                    acceptance,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[test]
     fn bounded_samples_keep_original_cluster_ordinals_and_configs() {

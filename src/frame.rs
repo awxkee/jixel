@@ -2001,6 +2001,7 @@ fn encode_frame_core(
                 // Selection applies to the final codes only.
                 false,
                 ctx.speed,
+                Some(&ctx.thread_pool),
             );
             crate::entropy::FrozenTokenPrices::new(&provisional_code)
         };
@@ -2115,6 +2116,7 @@ fn encode_frame_core(
         &mut scratch.huffman_pool,
         ctx.speed != Speed::Fastest,
         ctx.speed,
+        Some(&ctx.thread_pool),
     );
     let tree_static = DcTreeChoice::Static(dc_gradient);
 
@@ -2182,6 +2184,7 @@ fn encode_frame_core(
             &mut scratch.huffman_pool,
             ctx.speed != Speed::Fastest,
             ctx.speed,
+            Some(&ctx.thread_pool),
         );
 
         // Price both arms end to end: serialized tree + entropy-code header
@@ -2277,6 +2280,7 @@ fn encode_frame_core(
                         pending.iter().map(|p| p.tokens[pass].as_slice()),
                         num_contexts,
                         &mut scratch.huffman_pool,
+                        Some(&ctx.thread_pool),
                     )
                 } else {
                     crate::entropy::optimize_entropy_code_ac_streams(
@@ -2285,6 +2289,7 @@ fn encode_frame_core(
                         &mut scratch.huffman_pool,
                         true,
                         ctx.speed,
+                        Some(&ctx.thread_pool),
                     )
                 }
             })

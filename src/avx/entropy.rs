@@ -136,6 +136,11 @@ pub(crate) fn counts_bit_cost_avx2(counts: &[u32; ALPHABET_SIZE], total_count: u
     let mut cost = _mm256_setzero_ps();
     for counts8 in counts.as_chunks::<8>().0 {
         let count_i = unsafe { _mm256_loadu_si256(counts8.as_ptr().cast()) };
+        // Skip only whole empty blocks, preserving the occupied bins' SIMD
+        // lanes and FMA order so the clustering cost remains bit-identical.
+        if _mm256_testz_si256(count_i, count_i) != 0 {
+            continue;
+        }
         let count = cvtepu32_ps(count_i);
         let positive = _mm256_max_ps(count, one);
         cost = _mm256_fmadd_ps(
@@ -145,4 +150,80 @@ pub(crate) fn counts_bit_cost_avx2(counts: &[u32; ALPHABET_SIZE], total_count: u
         );
     }
     super::ac_strategy::hsum256(cost).max(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Preserve the original AVX2 kernel as the bitwise numeric oracle.
+    #[target_feature(enable = "avx2,fma")]
+    fn dense_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
+        debug_assert_ne!(total_count, 0);
+        let log_total = _mm256_set1_ps(crate::adaptive_quant::dirty_log2f(total_count as f32));
+        let one = _mm256_set1_ps(1.0);
+        // The log reduction consumes most of the 16-register YMM file. Keeping a
+        // second cost chain live forces LLVM to spill the polynomial constants and
+        // `log_total`, so use one full-width chain here.
+        let mut cost = _mm256_setzero_ps();
+        for counts8 in counts.as_chunks::<8>().0 {
+            let count_i = unsafe { _mm256_loadu_si256(counts8.as_ptr().cast()) };
+            let count = cvtepu32_ps(count_i);
+            let positive = _mm256_max_ps(count, one);
+            cost = _mm256_fmadd_ps(
+                count,
+                _mm256_sub_ps(log_total, dirty_log2f_x8::<false>(positive)),
+                cost,
+            );
+        }
+        super::super::ac_strategy::hsum256(cost).max(0.0)
+    }
+
+    #[test]
+    fn skipped_empty_chunks_preserve_dense_cost_bits() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let mut state = 0x39e1_268bu32;
+        // The interpreter exercises the same kernel but makes large SIMD
+        // corpora expensive; native runs cover all generated distributions.
+        for case in 0..if cfg!(miri) { 128 } else { 8192 } {
+            let mut counts = [0u32; ALPHABET_SIZE];
+            for (i, count) in counts.iter_mut().enumerate() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                // Dense, sparse, and empty chunks at every position, with
+                // totals crossing f32's exact-integer range.
+                if case % 5 == 0 || (case >> (i / 8 % 12)) & 1 != 0 {
+                    *count = if state & 3 == 0 {
+                        0
+                    } else {
+                        state % 32_000_000
+                    };
+                }
+            }
+            counts[case % ALPHABET_SIZE] += 1;
+            let total = counts.iter().sum();
+            unsafe {
+                assert_eq!(
+                    counts_bit_cost_avx2(&counts, total).to_bits(),
+                    dense_cost(&counts, total).to_bits(),
+                    "case {case}"
+                );
+            }
+        }
+        for count in [1, 2, 3, (1 << 24) - 1, 1 << 24, (1 << 24) + 1, u32::MAX] {
+            for symbol in [0, 7, 8, ALPHABET_SIZE - 1] {
+                let mut counts = [0; ALPHABET_SIZE];
+                counts[symbol] = count;
+                unsafe {
+                    assert_eq!(
+                        counts_bit_cost_avx2(&counts, count).to_bits(),
+                        dense_cost(&counts, count).to_bits()
+                    );
+                }
+            }
+        }
+    }
 }
