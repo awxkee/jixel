@@ -36,6 +36,7 @@ fn main() -> ExitCode {
     let mut threads: usize = 1;
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
+    let mut splines = false;
     let mut color_recovery = false;
 
     let mut i = 0;
@@ -68,6 +69,10 @@ fn main() -> ExitCode {
                     }
                 };
                 i += 2;
+            }
+            "--splines" => {
+                splines = true;
+                i += 1;
             }
             "--lossless" => {
                 lossless = true;
@@ -112,7 +117,8 @@ fn main() -> ExitCode {
         .with_lossless(lossless)
         .with_distance(distance)
         .with_num_threads(threads.max(1))
-        .with_speed(speed);
+        .with_speed(speed)
+        .with_splines(splines);
     let start = Instant::now();
     let data = match jixel::encode_image(rgb.as_raw(), width, height, &cfg) {
         Ok(d) => d,

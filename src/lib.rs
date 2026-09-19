@@ -73,6 +73,7 @@ mod neon;
 mod orientation;
 mod patches;
 mod quant_weights;
+mod splines;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;

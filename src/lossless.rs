@@ -2887,7 +2887,7 @@ fn unpack_signed(token: u32) -> i32 {
 
 /// Per-context predictor offsets: the median residual of each leaf's chosen
 /// predictor over the samples the finished tree routes to it. Shifting a
-/// leaf's residuals does not change its own entropy, but it centres the
+/// leaf's residuals does not change its own entropy, but it centers the
 /// distribution, which lets ANS clustering merge leaves by shape rather than
 /// by bias and keeps small residuals inside the hybrid-uint's exact symbols.
 fn leaf_offsets<'a>(

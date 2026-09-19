@@ -787,6 +787,7 @@ fn write_frame_header_kind(
     has_alpha: bool,
     coeff_shifts: &[u32],
     kind: VarDctFrameKind<'_>,
+    has_splines: bool,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -799,6 +800,7 @@ fn write_frame_header_kind(
             has_alpha,
             coeff_shifts,
             false,
+            has_splines,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -810,6 +812,7 @@ fn write_frame_header_kind(
             has_alpha,
             coeff_shifts,
             true,
+            has_splines,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
@@ -882,18 +885,25 @@ fn write_frame_header(
     has_alpha: bool,
     coeff_shifts: &[u32],
     has_patches: bool,
+    has_splines: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // Keep decoder-side adaptive DC smoothing enabled. The only optional flag
-    // here is kPatches; the skip-smoothing flag remains clear.
-    if has_patches {
-        w.write(2, 1); // U64 selector for values 1..=16
-        w.write(4, 1); // flags = kPatches (2), encoded as value - 1
-    } else {
-        w.write(2, 0);
+    // Keep decoder-side adaptive DC smoothing enabled. The optional flags are
+    // kPatches (2) and kSplines (16); the skip-smoothing flag remains clear.
+    let flags = if has_patches { 2u64 } else { 0 } + if has_splines { 16 } else { 0 };
+    match flags {
+        0 => w.write(2, 0),
+        1..=16 => {
+            w.write(2, 1); // U64 selector for values 1..=16
+            w.write(4, flags - 1);
+        }
+        _ => {
+            w.write(2, 2); // U64 selector for values 17..=272
+            w.write(8, flags - 17);
+        }
     }
     w.write(2, 0); // no upsampling
 
@@ -1442,8 +1452,24 @@ fn encode_frame_vardct(
         ctx.raise_b_qm_scale(X_HEAVY_B_QM_SCALE);
     }
 
+    let quant_field = if ctx.splines {
+        spline_quant_field(ctx, scratch, &xyb, distp)?
+    } else {
+        Vec::new()
+    };
+    let spline_candidates = if ctx.splines {
+        crate::splines::find_candidates(ctx, scratch, distance, &xyb, &quant_field)
+    } else {
+        None
+    };
+    let select_splines = |image: &mut Image3F, forbidden: Option<&[bool]>| {
+        let candidates = spline_candidates.as_ref()?;
+        crate::splines::select_splines(ctx, distance, image, &quant_field, candidates, forbidden)
+    };
+
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
+        let regular_splines = select_splines(&mut regular, None);
         gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
@@ -1454,6 +1480,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Regular,
+            regular_splines.as_ref(),
             &mut regular_writer,
         )?;
 
@@ -1517,6 +1544,7 @@ fn encode_frame_vardct(
                         width: atlas_w,
                         height: atlas_h,
                     },
+                    None,
                     out,
                 )
             };
@@ -1565,6 +1593,24 @@ fn encode_frame_vardct(
         }
 
         let mut base = plan.base;
+        // Patches replace their rectangles and the decoder draws splines after
+        // them, so no spline may reach into a patch.
+        let base_splines = if spline_candidates.is_some() {
+            let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
+            let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
+            for reference in &references {
+                for &(px, py) in &reference.positions {
+                    for by in py / K_BLOCK_DIM..(py + reference.height).div_ceil(K_BLOCK_DIM) {
+                        for bx in px / K_BLOCK_DIM..(px + reference.width).div_ceil(K_BLOCK_DIM) {
+                            in_patch[by * blocks_w + bx] = true;
+                        }
+                    }
+                }
+            }
+            select_splines(&mut base, Some(&in_patch))
+        } else {
+            None
+        };
         gaborize(&mut base, distp);
         encode_frame_core(
             ctx,
@@ -1574,6 +1620,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Patched(&references),
+            base_splines.as_ref(),
             &mut patched_writer,
         )?;
         if patched_writer.bits_written() < regular_writer.bits_written() {
@@ -1584,6 +1631,7 @@ fn encode_frame_vardct(
         return Ok(());
     }
 
+    let splines = select_splines(&mut xyb, None);
     gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
@@ -1593,8 +1641,45 @@ fn encode_frame_vardct(
         alpha,
         coeff_shifts,
         VarDctFrameKind::Regular,
+        splines.as_ref(),
         writer,
     )
+}
+
+/// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
+/// any spline is removed; the spline RD gate prices blocks with it.
+fn spline_quant_field(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    xyb: &Image3F,
+    distp: &DistanceParams,
+) -> Result<Vec<f32>, EncodeError> {
+    let blocks_w = xyb.xsize().div_ceil(K_BLOCK_DIM);
+    let blocks_h = xyb.ysize().div_ceil(K_BLOCK_DIM);
+    let mut field = vec![0f32; blocks_w * blocks_h];
+    for y0 in (0..xyb.ysize()).step_by(K_DC_GROUP_DIM) {
+        for x0 in (0..xyb.xsize()).step_by(K_DC_GROUP_DIM) {
+            let gw = K_DC_GROUP_DIM.min(xyb.xsize() - x0).div_ceil(K_BLOCK_DIM);
+            let gh = K_DC_GROUP_DIM.min(xyb.ysize() - y0).div_ceil(K_BLOCK_DIM);
+            let mut raw = crate::image::ImageB::try_new_fill(gw, gh, 1)?;
+            (ctx.fill_quant_field)(
+                &mut scratch.aq_map,
+                xyb,
+                &mut raw,
+                x0,
+                y0,
+                distp.distance,
+                1.0 / distp.scale,
+            );
+            for y in 0..gh {
+                let row = &mut field[(y0 / K_BLOCK_DIM + y) * blocks_w + x0 / K_BLOCK_DIM..];
+                for (dst, &q) in row.iter_mut().zip(&raw.row(y)[..gw]) {
+                    *dst = distp.scale * q as f32;
+                }
+            }
+        }
+    }
+    Ok(field)
 }
 
 /// Power-of-two refinement of the modular atlas quantization lattice.
@@ -1843,6 +1928,7 @@ fn encode_frame_core(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
+    splines: Option<&crate::splines::SplineSet>,
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
@@ -2409,6 +2495,9 @@ fn encode_frame_core(
             &mut sections[0],
         );
     }
+    if let Some(set) = splines {
+        crate::splines::write_splines(set, scratch, &mut sections[0]);
+    }
     write_dc_global(
         &distp,
         dim.num_dc_groups,
@@ -2604,6 +2693,7 @@ fn encode_frame_core(
         alpha.is_some(),
         coeff_shifts,
         frame_kind,
+        splines.is_some(),
         writer,
     );
     combine_sections(&mut sections, writer);
