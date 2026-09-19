@@ -210,6 +210,48 @@ fn rdoq_lambda(qf_ratio: f32) -> f32 {
     crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
 }
 
+#[inline(always)]
+fn update_rdoq_state_pair(
+    distortion: f32,
+    token_cost: [f32; 2],
+    tail: f32,
+    candidate: u8,
+    current: &mut [f32; 2],
+    choices: &mut [u8; 2],
+) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        // SAFETY: NEON is enabled for this target. Each load/store accesses
+        // exactly the two f32 elements of its array; no alignment is required.
+        unsafe {
+            let cost = vadd_f32(
+                vadd_f32(vdup_n_f32(distortion), vld1_f32(token_cost.as_ptr())),
+                vdup_n_f32(tail),
+            );
+            let old = vld1_f32(current.as_ptr());
+            let better = vclt_f32(cost, old);
+            vst1_f32(current.as_mut_ptr(), vbsl_f32(better, cost, old));
+            // Narrow the two all-zero/all-one comparison lanes to the two
+            // choice bytes, keeping exactly the same mask as the cost update.
+            let mask16 = vmovn_u32(vcombine_u32(better, better));
+            let mask8 = vmovn_u16(vcombine_u16(mask16, mask16));
+            let mask = vget_lane_u16::<0>(vreinterpret_u16_u8(mask8));
+            let old_choice = u16::from_ne_bytes(*choices);
+            let new_choice = u16::from_ne_bytes([candidate; 2]);
+            *choices = ((new_choice & mask) | (old_choice & !mask)).to_ne_bytes();
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon", target_feature = "neon")))]
+    for prev in 0..2 {
+        let cost = distortion + token_cost[prev] + tail;
+        if cost < current[prev] {
+            current[prev] = cost;
+            choices[prev] = candidate;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
     prices: &FrozenTokenPrices,
@@ -354,16 +396,17 @@ fn rdoq_block(
                     [lambda * bits[0], lambda * bits[1]]
                 };
                 let state = remaining * 2;
-                let cost0 = distortion + token_cost[0] + tail;
-                if cost0 < current_cost[state] {
-                    current_cost[state] = cost0;
-                    choices[window_index * stride + state] = candidate_index as u8;
-                }
-                let cost1 = distortion + token_cost[1] + tail;
-                if cost1 < current_cost[state + 1] {
-                    current_cost[state + 1] = cost1;
-                    choices[window_index * stride + state + 1] = candidate_index as u8;
-                }
+                update_rdoq_state_pair(
+                    distortion,
+                    token_cost,
+                    tail,
+                    candidate_index as u8,
+                    (&mut current_cost[state..state + 2]).try_into().unwrap(),
+                    (&mut choices
+                        [window_index * stride + state..window_index * stride + state + 2])
+                        .try_into()
+                        .unwrap(),
+                );
             }
         }
         std::mem::swap(&mut current_cost, &mut next);
@@ -1689,6 +1732,77 @@ mod tests {
         quantize_ac_thresholds_scaled, quantize_dc_cfl_scalar, quantize_dc_scalar,
         selected_quantize_dc_methods,
     };
+
+    #[test]
+    fn rdoq_state_pair_preserves_scalar_cost_bits_and_choices() {
+        let special = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xffc0_5678),
+        ];
+        let mut seed = 73u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if seed % 4 == 0 {
+                special[seed as usize % special.len()]
+            } else {
+                f32::from_bits(seed)
+            }
+        };
+        let mut masks = [false; 4];
+        for case in 0..16_384 {
+            let distortion = random();
+            let token_cost = [random(), random()];
+            let tail = random();
+            let cost = token_cost.map(|price| distortion + price + tail);
+            let mut initial = [random(), random()];
+            // Deliberate equal-cost candidates must preserve both the prior
+            // choices and their exact cost bits, including signed zeros.
+            if case % 8 == 0 {
+                initial = cost;
+            }
+            let initial_choices = [case as u8, (case >> 3) as u8];
+            let candidate = (case % 5) as u8;
+            let mut expected = initial;
+            let mut expected_choices = initial_choices;
+            let mut mask = 0;
+            for prev in 0..2 {
+                if cost[prev] < expected[prev] {
+                    expected[prev] = cost[prev];
+                    expected_choices[prev] = candidate;
+                    mask |= 1 << prev;
+                }
+            }
+            masks[mask] = true;
+            let mut actual = initial;
+            let mut actual_choices = initial_choices;
+            super::update_rdoq_state_pair(
+                distortion,
+                token_cost,
+                tail,
+                candidate,
+                &mut actual,
+                &mut actual_choices,
+            );
+            assert_eq!(
+                actual.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "costs in case {case}"
+            );
+            assert_eq!(actual_choices, expected_choices, "choices in case {case}");
+        }
+        assert_eq!(masks, [true; 4]);
+    }
 
     #[test]
     fn rdoq_reused_scratch_matches_fresh_scratch() {
