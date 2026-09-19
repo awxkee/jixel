@@ -1628,22 +1628,40 @@ const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
 /// for strongly exposed blue. Thresholds are libjxl's.
 fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
     let (w, h) = (xyb.xsize(), xyb.ysize());
+    if w < 2 || h < 2 {
+        return (0, 0);
+    }
     let (mut dx, mut db, mut exposed_blue) = (0.0f32, 0.0f32, 0.0f32);
-    for y in 1..h {
-        let (xr, xp) = (xyb.plane_row(0, y), xyb.plane_row(0, y - 1));
-        let (yr, yp) = (xyb.plane_row(1, y), xyb.plane_row(1, y - 1));
-        let (br, bp) = (xyb.plane_row(2, y), xyb.plane_row(2, y - 1));
-        for x in 1..w {
-            dx = dx.max((xr[x] - xr[x - 1]).abs()).max((xr[x] - xp[x]).abs());
-            let diff_b = br[x] - yr[x];
-            db = db
-                .max((diff_b - (br[x - 1] - yr[x - 1])).abs())
-                .max((diff_b - (bp[x] - yp[x])).abs());
-            let exposed = br[x] - yr[x] * 1.2;
-            if exposed >= 0.0 {
-                let step = (br[x] - br[x - 1]).abs() + (br[x] - bp[x]).abs();
-                exposed_blue = exposed_blue.max(exposed * step);
-            }
+    let rows = xyb
+        .plane_data(0)
+        .chunks_exact(w)
+        .zip(xyb.plane_data(1).chunks_exact(w))
+        .zip(xyb.plane_data(2).chunks_exact(w));
+    for (((xp, yp), bp), ((xr, yr), br)) in rows.clone().zip(rows.skip(1)) {
+        // Carry the left pixel and its B - Y difference between iterations.
+        let mut current = xr.iter().zip(yr).zip(br);
+        let Some(((&xl, &yl), &bl)) = current.next() else {
+            continue;
+        };
+        let (mut left_x, mut left_b, mut left_diff) = (xl, bl, bl - yl);
+        let previous = xp.iter().zip(yp).zip(bp).skip(1);
+        for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
+            let step_x = (x - left_x).abs().max((x - px).abs());
+            dx = dx.max(step_x);
+            let diff_b = b - y;
+            let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
+            db = db.max(step_b);
+            let exposed = b - y * 1.2;
+            let step = (b - left_b).abs() + (b - pb).abs();
+            // A negative exposure cannot raise this nonnegative maximum;
+            // max also ignores NaNs, as the original conditional did.
+            exposed_blue = exposed_blue.max(exposed * step);
+            left_x = x;
+            left_b = b;
+            left_diff = diff_b;
+        }
+        if dx >= 0.026 && db > 0.38 && exposed_blue >= 0.13 {
+            return (3, 3);
         }
     }
     let x_steps = match dx {
