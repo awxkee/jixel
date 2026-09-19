@@ -505,6 +505,98 @@ fn parallel_token_parts<'a>(
     Some(out)
 }
 
+struct CompactContextPopulations {
+    widths: Vec<u8>,
+    offsets: Vec<usize>,
+    counts: Vec<u32>,
+}
+
+impl CompactContextPopulations {
+    fn for_each(self, mut emit: impl FnMut(usize, Histogram)) {
+        for (context, &width) in self.widths.iter().enumerate() {
+            if width == 0 {
+                continue;
+            }
+            let counts = &self.counts[self.offsets[context]..self.offsets[context + 1]];
+            let mut histogram = Histogram::new();
+            histogram.counts[..counts.len()].copy_from_slice(counts);
+            histogram.total_count = counts.iter().sum();
+            emit(context, histogram);
+        }
+    }
+}
+
+/// Count original contexts without replicating their mostly empty 128-bin
+/// histograms on every worker. First find each context's active alphabet, then
+/// count into packed rows. Only integer counts are reduced, in input order.
+fn parallel_context_populations(
+    streams: &[&[Token]],
+    num_contexts: usize,
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+    symbol: impl Fn(&Token) -> u32 + Sync,
+) -> Option<CompactContextPopulations> {
+    let parts = parallel_token_parts(streams, pool)?;
+    let pool = pool.unwrap();
+    let alphabets = pool.steal_map(scratch, parts.len(), |i, _| {
+        let mut widths = vec![0u8; num_contexts];
+        for tokens in &parts[i] {
+            for token in *tokens {
+                let symbol = symbol(token);
+                assert!((symbol as usize) < ALPHABET_SIZE);
+                let width = &mut widths[token.context as usize];
+                *width = (*width).max(symbol as u8 + 1);
+            }
+        }
+        widths
+    });
+    let mut widths = vec![0u8; num_contexts];
+    for local in alphabets {
+        for (width, local) in widths.iter_mut().zip(local) {
+            *width = (*width).max(local);
+        }
+    }
+    let mut offsets = Vec::with_capacity(num_contexts + 1);
+    offsets.push(0);
+    for &width in &widths {
+        offsets.push(offsets.last().unwrap() + usize::from(width));
+    }
+    let num_bins = offsets[num_contexts];
+    // Bound all replicated count buffers together, including dense inputs.
+    const COUNT_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+    let bytes = num_bins * size_of::<u32>();
+    let max_parts = COUNT_SCRATCH_BYTES / bytes.max(1);
+    if max_parts == 0 {
+        return None;
+    }
+    let group_size = parts.len().div_ceil(max_parts.min(parts.len()));
+    let partial = pool.steal_map(scratch, parts.len().div_ceil(group_size), |i, _| {
+        let mut counts = vec![0u32; num_bins];
+        let start = i * group_size;
+        let end = (start + group_size).min(parts.len());
+        for part in &parts[start..end] {
+            for tokens in part {
+                for token in *tokens {
+                    counts[offsets[token.context as usize] + symbol(token) as usize] += 1;
+                }
+            }
+        }
+        counts
+    });
+    let mut partial = partial.into_iter();
+    let mut counts = partial.next().unwrap();
+    for local in partial {
+        for (count, added) in counts.iter_mut().zip(local) {
+            *count += added;
+        }
+    }
+    Some(CompactContextPopulations {
+        widths,
+        offsets,
+        counts,
+    })
+}
+
 fn clustered_histograms(
     streams: &[&[Token]],
     context_map: &[u8],
@@ -1183,14 +1275,38 @@ fn refine_ans_clusters_once(
     }
     let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
     let mut context_histograms = vec![Histogram::new(); code.context_map.len()];
-    for tokens in streams {
-        for token in *tokens {
-            let context = token.context as usize;
+    if let Some(populations) = parallel_context_populations(
+        streams,
+        code.context_map.len(),
+        Some(thread_pool),
+        scratch,
+        |token| {
+            uint_encode_with_config(
+                token.value,
+                code.hybrid_uint_configs[code.context_map[token.context as usize] as usize],
+            )
+            .0
+        },
+    ) {
+        populations.for_each(|context, histogram| {
             let cluster = code.context_map[context] as usize;
-            let (symbol, _, _) =
-                uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
-            histograms[cluster].add(symbol);
-            context_histograms[context].add(symbol);
+            let target = &mut histograms[cluster];
+            for (count, &added) in target.counts.iter_mut().zip(&histogram.counts) {
+                *count += added;
+            }
+            target.total_count += histogram.total_count;
+            context_histograms[context] = histogram;
+        });
+    } else {
+        for tokens in streams {
+            for token in *tokens {
+                let context = token.context as usize;
+                let cluster = code.context_map[context] as usize;
+                let (symbol, _, _) =
+                    uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
+                histograms[cluster].add(symbol);
+                context_histograms[context].add(symbol);
+            }
         }
     }
     let Some((candidate_histograms, candidate_map, candidate_configs)) =
@@ -1427,25 +1543,39 @@ fn propose_ans_reclustering(
     refinement: AnsRefinement,
 ) -> Option<AnsClusterProposal> {
     let mut dense = vec![usize::MAX; num_contexts];
-    for tokens in streams {
-        for token in *tokens {
-            dense[token.context as usize] = 0;
-        }
-    }
     let mut histograms = Vec::new();
-    for index in &mut dense {
-        if *index != usize::MAX {
-            *index = histograms.len();
-            histograms.push(Histogram::new());
+    if let Some(populations) =
+        parallel_context_populations(streams, num_contexts, Some(thread_pool), scratch, |token| {
+            uint_encode(token.value).0
+        })
+    {
+        populations.for_each(|context, histogram| {
+            dense[context] = histograms.len();
+            histograms.push(histogram);
+        });
+    } else {
+        for tokens in streams {
+            for token in *tokens {
+                dense[token.context as usize] = 0;
+            }
+        }
+        for index in &mut dense {
+            if *index != usize::MAX {
+                *index = histograms.len();
+                histograms.push(Histogram::new());
+            }
+        }
+        if histograms.len() <= 1 {
+            return None;
+        }
+        for tokens in streams {
+            for token in *tokens {
+                histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
+            }
         }
     }
     if histograms.len() <= 1 {
         return None;
-    }
-    for tokens in streams {
-        for token in *tokens {
-            histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
-        }
     }
     let mut assignment = vec![0u8; histograms.len()];
     let n = super::cluster::cluster_histograms_ans(
@@ -1637,8 +1767,18 @@ fn optimize_entropy_code_ac_slices(
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
-    for tokens in streams {
-        build_histograms(tokens, None, &mut histograms);
+    if let Some(populations) = parallel_context_populations(
+        streams,
+        num_contexts,
+        pool,
+        &mut CoderScratch::lossless(),
+        |token| uint_encode(token.value).0,
+    ) {
+        populations.for_each(|context, histogram| histograms[context] = histogram);
+    } else {
+        for tokens in streams {
+            build_histograms(tokens, None, &mut histograms);
+        }
     }
     let mut context_map: Vec<u8> = Vec::new();
     if fast_cluster {
@@ -3080,6 +3220,92 @@ mod context_map_tests {
 #[cfg(test)]
 mod sampled_hybrid_tests {
     use super::*;
+
+    #[test]
+    fn packed_context_populations_match_serial_counts_and_context_order() {
+        const CONTEXTS: usize = 511;
+        for len in [131_071, 131_072, 131_073, 524_309] {
+            let tokens: Vec<_> = (0..len)
+                .map(|i| {
+                    Token::new(
+                        ((i * 31 % (CONTEXTS / 3)) * 3) as u32,
+                        (i as u32).wrapping_mul(731) % 65_537,
+                    )
+                })
+                .collect();
+            let streams = [&tokens[..17], &[], &tokens[17..65_537], &tokens[65_537..]];
+            for config in [
+                HybridUintConfig::DEFAULT,
+                HYBRID_CANDIDATES[0],
+                HYBRID_CANDIDATES[11],
+            ] {
+                let mut expected = vec![Histogram::new(); CONTEXTS];
+                for token in &tokens {
+                    expected[token.context as usize]
+                        .add(uint_encode_with_config(token.value, config).0);
+                }
+                let expected_contexts: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, h)| (h.total_count != 0).then_some(i))
+                    .collect();
+                for threads in [1, 4, 12] {
+                    let pool = ThreadPool::new_lossless(threads);
+                    let result = parallel_context_populations(
+                        &streams,
+                        CONTEXTS,
+                        Some(&pool),
+                        &mut CoderScratch::lossless(),
+                        |token| uint_encode_with_config(token.value, config).0,
+                    );
+                    if threads == 1 || len < 131_072 {
+                        assert!(result.is_none());
+                        continue;
+                    }
+                    let mut contexts = Vec::new();
+                    result.unwrap().for_each(|context, histogram| {
+                        contexts.push(context);
+                        assert_eq!(histogram.counts, expected[context].counts);
+                        assert_eq!(histogram.total_count, expected[context].total_count);
+                    });
+                    assert_eq!(contexts, expected_contexts);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_context_populations_handle_full_alphabets_with_limited_scratch() {
+        // Two MiB of bins per partition: eight initial work items must be
+        // grouped into four count buffers to respect the eight MiB budget.
+        let contexts = 4096;
+        let tokens: Vec<_> = (0..contexts * ALPHABET_SIZE)
+            .map(|i| {
+                Token::new(
+                    (contexts - 1 - i / ALPHABET_SIZE) as u32,
+                    (i % ALPHABET_SIZE) as u32,
+                )
+            })
+            .collect();
+        let pool = ThreadPool::new_lossless(12);
+        let populations = parallel_context_populations(
+            &[&tokens],
+            contexts,
+            Some(&pool),
+            &mut CoderScratch::lossless(),
+            |token| token.value,
+        )
+        .unwrap();
+        assert_eq!(populations.counts.len(), contexts * ALPHABET_SIZE);
+        let mut visited = 0;
+        populations.for_each(|context, histogram| {
+            assert_eq!(context, visited);
+            assert_eq!(histogram.counts, [1; ALPHABET_SIZE]);
+            assert_eq!(histogram.total_count, ALPHABET_SIZE as u32);
+            visited += 1;
+        });
+        assert_eq!(visited, contexts);
+    }
 
     #[test]
     fn parallel_token_passes_preserve_histograms_samples_and_maxima() {
