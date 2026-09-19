@@ -597,6 +597,7 @@ where
 const ANS_CLUSTER_PROXY_SYMBOL_BITS: f64 = 6.0;
 const ANS_CLUSTER_PROXY_BASE_BITS: f64 = 12.0;
 const MAX_ANS_RELOCATION_CONTEXTS: usize = 4096;
+const XLOG2X_TABLE_SIZE: u32 = 1 << 16;
 
 #[inline]
 fn xlog2x(value: u32) -> f64 {
@@ -607,15 +608,29 @@ fn xlog2x(value: u32) -> f64 {
     }
 }
 
+fn xlog2x_table() -> &'static [f64] {
+    // Raw counts can exceed the table. Cache the common small values in
+    // 512 KiB shared by all encodes, retaining the exact calculation above.
+    static TABLE: std::sync::OnceLock<Box<[f64]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| (0..XLOG2X_TABLE_SIZE).map(xlog2x).collect())
+}
+
 /// Cheap Shannon-domain delta used only to nominate an ANS cluster move. The
 /// final decision is made by serializing both complete candidates below.
 fn moved_population_proxy_delta(source: &Histogram, target: &Histogram, moved: &Histogram) -> f64 {
+    let table = xlog2x_table();
+    let cost = |value: u32| {
+        table
+            .get(value as usize)
+            .copied()
+            .unwrap_or_else(|| xlog2x(value))
+    };
     debug_assert!(moved.total_count <= source.total_count);
     let source_after = source.total_count - moved.total_count;
     let target_after = target.total_count + moved.total_count;
-    let mut delta = xlog2x(source_after) + xlog2x(target_after)
-        - xlog2x(source.total_count)
-        - xlog2x(target.total_count);
+    let mut delta = cost(source_after) + cost(target_after)
+        - cost(source.total_count)
+        - cost(target.total_count);
     if source_after == 0 {
         delta -= ANS_CLUSTER_PROXY_BASE_BITS;
     }
@@ -634,9 +649,9 @@ fn moved_population_proxy_delta(source: &Histogram, target: &Histogram, moved: &
         debug_assert!(moved_count <= source_count);
         let source_count_after = source_count - moved_count;
         let target_count_after = target_count + moved_count;
-        delta -= xlog2x(source_count_after) + xlog2x(target_count_after)
-            - xlog2x(source_count)
-            - xlog2x(target_count);
+        delta -= cost(source_count_after) + cost(target_count_after)
+            - cost(source_count)
+            - cost(target_count);
         if source_count_after == 0 {
             delta -= ANS_CLUSTER_PROXY_SYMBOL_BITS;
         }
