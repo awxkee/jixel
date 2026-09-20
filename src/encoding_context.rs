@@ -60,6 +60,14 @@ pub(crate) struct EncodingContext {
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
+    #[cfg(feature = "splines")]
+    pub(crate) spline_continuous_idct: crate::splines::ContinuousIdctFn,
+    #[cfg(feature = "splines")]
+    pub(crate) spline_render_row: crate::splines::RenderRowFn,
+    #[cfg(feature = "splines")]
+    pub(crate) spline_distance: crate::splines::SegmentDistanceFn,
+    #[cfg(feature = "splines")]
+    pub(crate) spline_ridge_row: crate::splines::RidgeRowFn,
     pub(crate) xyb: xyb::XybMatrix,
     /// Cached with the matrix, including a later adaptive yellow selection.
     channel_weights: [f32; 3],
@@ -282,6 +290,14 @@ impl EncodingContext {
             b_heavy: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             x_qm_scale_floor: std::sync::atomic::AtomicU32::new(2),
+            #[cfg(feature = "splines")]
+            spline_continuous_idct: crate::splines::select_continuous_idct_fn(),
+            #[cfg(feature = "splines")]
+            spline_render_row: crate::splines::select_render_row_fn(),
+            #[cfg(feature = "splines")]
+            spline_distance: crate::splines::select_segment_distance_fn(),
+            #[cfg(feature = "splines")]
+            spline_ridge_row: crate::splines::select_ridge_row_fn(),
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),

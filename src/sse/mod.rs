@@ -39,6 +39,8 @@ mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
+#[cfg(feature = "splines")]
+mod splines;
 mod xyb;
 
 pub(crate) use ac_strategy::{
@@ -62,3 +64,6 @@ pub(crate) use modular::{
 pub(crate) use quant::{quantize_block_ac_sse41, quantize_dc_cfl_sse41, quantize_dc_sse41};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41};
 pub(crate) use xyb::to_xyb_sse41_band;
+
+#[cfg(feature = "splines")]
+pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41};

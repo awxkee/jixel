@@ -1465,15 +1465,24 @@ fn encode_frame_vardct(
         None
     };
     #[cfg(feature = "splines")]
-    let select_splines = |image: &mut Image3F, forbidden: Option<&[bool]>| {
-        let candidates = spline_candidates.as_ref()?;
-        crate::splines::select_splines(ctx, distance, image, &quant_field, candidates, forbidden)
-    };
+    let select_splines =
+        |scratch: &mut CoderScratch, image: &mut Image3F, forbidden: Option<&[bool]>| {
+            let candidates = spline_candidates.as_ref()?;
+            crate::splines::select_splines(
+                ctx,
+                scratch,
+                distance,
+                image,
+                &quant_field,
+                candidates,
+                forbidden,
+            )
+        };
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
         #[cfg(feature = "splines")]
-        let regular_splines = select_splines(&mut regular, None);
+        let regular_splines = select_splines(scratch, &mut regular, None);
         gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
@@ -1614,7 +1623,7 @@ fn encode_frame_vardct(
                     }
                 }
             }
-            select_splines(&mut base, Some(&in_patch))
+            select_splines(scratch, &mut base, Some(&in_patch))
         } else {
             None
         };
@@ -1640,7 +1649,7 @@ fn encode_frame_vardct(
     }
 
     #[cfg(feature = "splines")]
-    let splines = select_splines(&mut xyb, None);
+    let splines = select_splines(scratch, &mut xyb, None);
     gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,

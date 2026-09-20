@@ -40,6 +40,8 @@ mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
+#[cfg(feature = "splines")]
+mod splines;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -80,3 +82,8 @@ pub(crate) use quantize_xyb::{quantize_xyb_channels_neon, quantize_xyb_tile_colo
 pub(crate) use xyb::to_xyb_neon_band;
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_neon;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};
+
+#[cfg(feature = "splines")]
+pub(crate) use splines::{
+    continuous_idct_neon, spline_distance_neon, spline_render_row_neon, spline_ridge_row_neon,
+};

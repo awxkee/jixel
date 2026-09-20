@@ -40,9 +40,32 @@ mod detect;
 mod extend;
 mod filter;
 mod fit;
+mod geometry;
 mod lines;
+mod render;
 mod select;
 mod transform;
+
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
+pub(crate) use detect::{ALONG_PENALTY, MAX_SUBPIXEL_OFFSET, RidgeRow, ridge_row_scalar};
+pub(crate) use detect::{RidgeRowFn, select_ridge_row_fn};
+pub(crate) use fit::FitScratch;
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
+pub(crate) use geometry::Segments;
+pub(crate) use geometry::{SegmentDistanceFn, select_segment_distance_fn};
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx")
+))]
+pub(crate) use render::Sample;
+pub(crate) use render::{RenderRowFn, select_render_row_fn};
+pub(crate) use transform::{ContinuousIdctFn, select_continuous_idct_fn};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -53,7 +76,7 @@ use crate::entropy::{
 use crate::image::Image3F;
 
 /// X, Y, B, sigma.
-const CHANNEL_WEIGHT: [f32; 4] = [0.0042, 0.075, 0.07, 0.3333];
+static CHANNEL_WEIGHT: [f32; 4] = [0.0042, 0.075, 0.07, 0.3333];
 const Y_TO_X: f32 = 0.0;
 const Y_TO_B: f32 = 1.0;
 
@@ -299,77 +322,15 @@ pub(crate) type PixelBox = (usize, usize, usize, usize);
 
 /// Adds `sign` times the decoder's render of one spline; returns the touched box.
 pub(crate) fn render_spline(
+    ctx: &EncodingContext,
     sp: &QuantizedSpline,
     adjust: i32,
     xyb: &mut Image3F,
     sign: f32,
 ) -> Option<PixelBox> {
-    let (w, h) = (xyb.xsize(), xyb.ysize());
-    let inv_quant = 1.0 / adjusted_quant(adjust);
-    // Interleave channels so the continuous IDCT can accumulate four SIMD lanes.
-    let mut dct = [[0f32; 4]; 32];
-    for (i, row) in dct.iter_mut().enumerate() {
-        let f = if i == 0 {
-            std::f32::consts::FRAC_1_SQRT_2
-        } else {
-            1.0
-        };
-        for ((v, channel), weight) in row.iter_mut().zip(&sp.dct).zip(CHANNEL_WEIGHT) {
-            *v = channel[i] as f32 * f * weight * inv_quant;
-        }
-        row[0] += Y_TO_X * row[1];
-        row[2] += Y_TO_B * row[1];
-        for v in row {
-            *v *= std::f32::consts::SQRT_2;
-        }
-    }
-    let (samples, arc) = sample_curve(&sp.points);
-    if arc <= 0.0 {
-        return None;
-    }
-    let continuous_idct = transform::selected_continuous_idct();
-    let mut touched: Option<PixelBox> = None;
-    for (k, sample) in samples.iter().enumerate() {
-        let Point { x: cx, y: cy } = sample.position;
-        let mult = sample.multiplier;
-        let t = 31.0 * (k as f32 / arc).min(1.0);
-        // SAFETY: the selector checked the kernel's CPU features before this loop.
-        let [x, y, b, sigma] = unsafe { continuous_idct(&dct, t) };
-        let color = [x, y, b];
-        if !(sigma.is_finite() && sigma != 0.0 && (1.0 / sigma).is_finite()) {
-            continue;
-        }
-        let mut max_color = 0.01f32;
-        for c in color {
-            max_color = max_color.max((c * mult).abs());
-        }
-        let reach = (-2.0 * sigma * sigma * (0.1f32.ln() * 5.0 - max_color.ln())).sqrt();
-        let (x0, x1, y0, y1) = blob_window(cx, cy, reach, w, h);
-        if x0 >= x1 || y0 >= y1 {
-            continue;
-        }
-        let (inv_sigma, amp) = (1.0 / sigma, 0.25 * sigma * mult * sign);
-        for y in y0..y1 {
-            let dy = y as f32 - cy;
-            let [rx, ry, rb] = xyb.all_plane_rows_mut(y);
-            for (x, ((rx, ry), rb)) in (x0..x1).zip(
-                rx[x0..x1]
-                    .iter_mut()
-                    .zip(&mut ry[x0..x1])
-                    .zip(&mut rb[x0..x1]),
-            ) {
-                let li = blob_weight(x as f32 - cx, dy, inv_sigma, amp);
-                *rx += color[0] * li;
-                *ry += color[1] * li;
-                *rb += color[2] * li;
-            }
-        }
-        touched = Some(match touched {
-            None => (x0, y0, x1 - 1, y1 - 1),
-            Some(b) => (b.0.min(x0), b.1.min(y0), b.2.max(x1 - 1), b.3.max(y1 - 1)),
-        });
-    }
-    touched
+    let plan = render::RenderPlan::new(ctx, sp, adjust, xyb.xsize(), xyb.ysize());
+    plan.draw(xyb, sign);
+    plan.bounds
 }
 
 pub(crate) fn spline_tokens(sp: &QuantizedSpline) -> Vec<(u32, u32)> {
@@ -502,13 +463,22 @@ pub(crate) fn find_candidates(
 /// the decoder draws splines on top of the replaced patch pixels).
 pub(crate) fn select_splines(
     ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
     distance: f32,
     image: &mut Image3F,
     quant_field: &[f32],
     candidates: &SplineCandidates,
     forbidden: Option<&[bool]>,
 ) -> Option<SplineSet> {
-    select::rd_select(ctx, distance, image, quant_field, &candidates.0, forbidden)
+    select::rd_select(
+        ctx,
+        scratch,
+        distance,
+        image,
+        quant_field,
+        &candidates.0,
+        forbidden,
+    )
 }
 
 #[cfg(test)]

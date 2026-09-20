@@ -35,6 +35,7 @@
 
 use super::detect::{Chain, gaussian_kernels};
 use super::filter::FilterPlan;
+use super::geometry::Polyline;
 use super::select::{BlockModel, pretest};
 use super::{
     CHANNEL_WEIGHT, Point, QUANT_ADJUST, QuantizedSpline, adjusted_quant, blob_weight,
@@ -65,10 +66,11 @@ const MASK_RADIUS: isize = 2;
 const MAX_COEFFS: usize = 32;
 /// Refinement only needs the alignment signal: few color coefficients, tight window.
 const REFINE_COEFFS: usize = 3;
+const COMPACT_COEFFS: usize = 6;
 const REFINE_NEIGHBOURS: usize = 3;
+const WEIGHT_LUT_STEPS: f32 = 32.0;
 /// Unrefined fits slightly below `MIN_EXPLAINED` may still get there after refinement.
 const QUICK_MIN_EXPLAINED: f64 = 0.45;
-const WEIGHT_LUT_STEPS: f32 = 32.0;
 /// Long faint lines get the cheapest representation there is: sparse control
 /// points, luma only, one to three coefficients. Anything richer fits grain.
 const LONG_LINE_MIN_SPACING: f32 = 64.0;
@@ -212,7 +214,7 @@ fn rdp_control_points(chain: &[Point<f32>]) -> Vec<Point<i32>> {
 /// Catmull-Rom curve until the whole chain lies within `tol` px of it.
 /// Douglas-Peucker measures against the polyline instead and over-samples
 /// every smooth bend.
-fn curve_control_points(chain: &[Point<f32>], tol: f32) -> Vec<Point<i32>> {
+fn curve_control_points(ctx: &EncodingContext, chain: &[Point<f32>], tol: f32) -> Vec<Point<i32>> {
     let sm = smooth_chain(chain, 1.5);
     let mut idx = vec![0usize, sm.len() - 1];
     loop {
@@ -225,9 +227,10 @@ fn curve_control_points(chain: &[Point<f32>], tol: f32) -> Vec<Point<i32>> {
         }
         let control: Vec<Point<f32>> = ctrl.iter().map(|p| p.as_f32()).collect();
         let curve = super::catmull_rom(&control);
+        let curve_distance = Polyline::new(ctx, &curve);
         let (mut worst, mut worst_d) = (0usize, tol * tol);
         for (k, &p) in sm.iter().enumerate() {
-            let d = distance_sq_to_chain(p, &curve);
+            let d = curve_distance.distance(p);
             if d > worst_d && !idx.contains(&k) {
                 (worst, worst_d) = (k, d);
             }
@@ -243,9 +246,14 @@ fn curve_control_points(chain: &[Point<f32>], tol: f32) -> Vec<Point<i32>> {
 /// Remove redundant controls from an already aligned curve. Compare both
 /// directions: checking only the new curve would allow shortcuts across bends.
 /// Each deletion changes at most four spans, so no color fitting is needed.
-fn prune_control_points(points: &[Point<i32>], tolerance: f32) -> Vec<Point<i32>> {
+fn prune_control_points(
+    ctx: &EncodingContext,
+    points: &[Point<i32>],
+    tolerance: f32,
+) -> Vec<Point<i32>> {
     let reference: Vec<_> = points.iter().map(|p| p.as_f32()).collect();
     let reference = super::catmull_rom(&reference);
+    let reference_distance = Polyline::new(ctx, &reference);
     let mut indices: Vec<usize> = (0..points.len()).collect();
     let mut points = points.to_vec();
     let mut errors = vec![None; points.len()];
@@ -259,15 +267,17 @@ fn prune_control_points(points: &[Point<i32>], tolerance: f32) -> Vec<Point<i32>
                 let lo = i.saturating_sub(2);
                 let hi = (i + 1).min(control.len() - 1);
                 let curve = catmull_rom_spans(&control, lo..hi);
+                let curve_distance = Polyline::new(ctx, &curve);
                 let original_hi = if hi >= i { hi + 1 } else { hi };
-                let original = &reference[indices[lo] * 16..=indices[original_hi] * 16];
+                let range = indices[lo] * 16..indices[original_hi] * 16;
+                let original = &reference[range.start..=range.end];
                 let mut error = 0.0f32;
-                for (&p, other) in curve
+                for distance in curve
                     .iter()
-                    .map(|p| (p, original))
-                    .chain(original.iter().map(|p| (p, curve.as_slice())))
+                    .map(|&p| reference_distance.distance_range(p, range.clone()))
+                    .chain(original.iter().map(|&p| curve_distance.distance(p)))
                 {
-                    error = error.max(distance_sq_to_chain(p, other));
+                    error = error.max(distance);
                     if error >= tolerance * tolerance {
                         break;
                     }
@@ -342,13 +352,79 @@ impl Fit {
 }
 
 #[derive(Default)]
-struct FitScratch {
+pub(crate) struct FitScratch {
     slots: Vec<i32>,
     rows: Vec<f64>,
     pixels: Vec<u32>,
-    weight_lut: Vec<f32>,
+    weight_luts: Vec<(i32, isize, Vec<f32>)>,
+    points: Vec<Point<i32>>,
+    samples: Vec<super::ArcSample>,
+    arc: f32,
+    basis: Vec<f64>,
+    basis_coeffs: usize,
     origin: (usize, usize),
     width: usize,
+}
+
+impl FitScratch {
+    fn geometry(&mut self, points: &[Point<i32>]) {
+        if self.points == points {
+            return;
+        }
+        self.points.clear();
+        self.points.extend_from_slice(points);
+        (self.samples, self.arc) = sample_curve(points);
+        self.basis_coeffs = 0;
+    }
+
+    fn prepare_basis(&mut self, coeffs: usize) {
+        if self.basis_coeffs == coeffs {
+            return;
+        }
+        self.basis.clear();
+        for k in 0..self.samples.len() {
+            let t = 31.0 * (k as f32 / self.arc).min(1.0);
+            self.basis.extend((0..coeffs).map(|i| {
+                std::f64::consts::SQRT_2
+                    * (std::f64::consts::PI / 32.0 * i as f64 * (t as f64 + 0.5)).cos()
+            }));
+        }
+        self.basis_coeffs = coeffs;
+    }
+
+    fn weight_table(&mut self, sigma_n: i32, sigma: f32, reach: isize) -> usize {
+        if let Some(i) = self
+            .weight_luts
+            .iter()
+            .position(|&(n, r, _)| n == sigma_n && r == reach)
+        {
+            return i;
+        }
+        let len = ((reach as f32 + 1.0) * std::f32::consts::SQRT_2 * WEIGHT_LUT_STEPS) as usize + 2;
+        let table = (0..len)
+            .map(|i| blob_weight(i as f32 / WEIGHT_LUT_STEPS, 0.0, 1.0 / sigma, 1.0))
+            .collect();
+        self.weight_luts.push((sigma_n, reach, table));
+        self.weight_luts.len() - 1
+    }
+
+    /// Retain ordinary candidate buffers, without keeping an unusually large
+    /// curve's allocations alive on every encoder worker.
+    fn trim(&mut self) {
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+        fn trim<T>(v: &mut Vec<T>) {
+            if v.capacity() > MAX_BYTES / std::mem::size_of::<T>() {
+                *v = Vec::new();
+            }
+        }
+        trim(&mut self.slots);
+        trim(&mut self.rows);
+        trim(&mut self.pixels);
+        if self.basis.capacity() > MAX_BYTES / std::mem::size_of::<f64>() {
+            self.basis = Vec::new();
+            self.basis_coeffs = 0;
+        }
+    }
 }
 
 /// Fit precision: `Full` is what gets quantized, `Probe` ranks geometry moves.
@@ -435,7 +511,8 @@ fn fit_system(
     precision: Precision,
     scratch: &mut FitScratch,
 ) -> Option<FitSystem> {
-    let (samples, arc) = sample_curve(points);
+    scratch.geometry(points);
+    let arc = scratch.arc;
     if arc < MIN_ARC {
         return None;
     }
@@ -447,17 +524,46 @@ fn fit_system(
         reach = (2.6 * sigma + 1.0).ceil() as isize;
     }
     if precision == Precision::Compact {
-        coeffs = coeffs.min(6);
+        coeffs = coeffs.min(COMPACT_COEFFS);
     }
-    // radial weight table per unit amplitude
-    let lut_len = ((reach as f32 + 1.0) * std::f32::consts::SQRT_2 * WEIGHT_LUT_STEPS) as usize + 2;
-    scratch.weight_lut.clear();
-    scratch.weight_lut.extend(
-        (0..lut_len).map(|i| blob_weight(i as f32 / WEIGHT_LUT_STEPS, 0.0, 1.0 / sigma, 1.0)),
-    );
+    scratch.prepare_basis(coeffs);
+    let table = scratch.weight_table(sigma_n, sigma, reach);
+    // Refinement uses three coefficients; compact extension and long-line
+    // fits use six. Expose these common sizes to the compiler without changing
+    // the raster or normal-equation accumulation order.
+    match coeffs {
+        REFINE_COEFFS => raster_system::<REFINE_COEFFS>(
+            targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch,
+        ),
+        COMPACT_COEFFS => raster_system::<COMPACT_COEFFS>(
+            targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch,
+        ),
+        _ => raster_system::<0>(targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch),
+    }
+}
+
+fn raster_system<const FIXED_COEFFS: usize>(
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    sigma_n: i32,
+    sigma: f32,
+    reach: isize,
+    coeffs: usize,
+    table: usize,
+    scratch: &mut FitScratch,
+) -> Option<FitSystem> {
+    let coeffs = if FIXED_COEFFS == 0 {
+        coeffs
+    } else {
+        FIXED_COEFFS
+    };
+    let arc = scratch.arc;
+    let weight_lut = &scratch.weight_luts[table].2;
+    let samples = &scratch.samples;
 
     let (mut bx0, mut by0, mut bx1, mut by1) = (isize::MAX, isize::MAX, isize::MIN, isize::MIN);
-    for sample in &samples {
+    for sample in samples {
         let Point { x: cx, y: cy } = sample.position;
         let (rx, ry) = (round_i32(cx) as isize, round_i32(cy) as isize);
         bx0 = bx0.min(rx - reach);
@@ -478,15 +584,9 @@ fn fit_system(
     scratch.rows.clear();
     scratch.pixels.clear();
 
-    let mut basis = [0f64; MAX_COEFFS];
-    for (k, sample) in samples.iter().enumerate() {
+    for (sample, basis) in samples.iter().zip(scratch.basis.chunks_exact(coeffs)) {
         let Point { x: cx, y: cy } = sample.position;
         let mult = sample.multiplier;
-        let t = 31.0 * (k as f32 / arc).min(1.0);
-        for (i, b) in basis.iter_mut().enumerate().take(coeffs) {
-            *b = std::f64::consts::SQRT_2
-                * (std::f64::consts::PI / 32.0 * i as f64 * (t as f64 + 0.5)).cos();
-        }
         let amp = 0.25 * sigma * mult;
         let (rx, ry) = (round_i32(cx) as isize, round_i32(cy) as isize);
         let x0 = (rx - reach).max(bx0);
@@ -503,20 +603,24 @@ fn fit_system(
                 let pos = (dx * dx + dy * dy).sqrt() * WEIGHT_LUT_STEPS;
                 let cell = pos as usize;
                 let frac = pos - cell as f32;
-                let weight = amp
-                    * (scratch.weight_lut[cell] * (1.0 - frac)
-                        + scratch.weight_lut[cell + 1] * frac);
+                let weight = amp * (weight_lut[cell] * (1.0 - frac) + weight_lut[cell + 1] * frac);
                 if weight.abs() <= 1e-7 {
                     continue;
                 }
                 if *slot < 0 {
                     *slot = scratch.pixels.len() as i32;
                     scratch.pixels.push((y as usize * w + x as usize) as u32);
-                    scratch.rows.resize(scratch.rows.len() + coeffs, 0.0);
-                }
-                let row = &mut scratch.rows[*slot as usize * coeffs..(*slot as usize + 1) * coeffs];
-                for (r, &b) in row.iter_mut().zip(&basis[..coeffs]) {
-                    *r += weight as f64 * b;
+                    // Initialize directly on first contact. Keep the addition
+                    // to +0.0 so signed-zero behavior matches the old update.
+                    scratch
+                        .rows
+                        .extend(basis.iter().map(|&b| 0.0 + weight as f64 * b));
+                } else {
+                    let row =
+                        &mut scratch.rows[*slot as usize * coeffs..(*slot as usize + 1) * coeffs];
+                    for (r, &b) in row.iter_mut().zip(&basis[..coeffs]) {
+                        *r += weight as f64 * b;
+                    }
                 }
             }
         }
@@ -779,6 +883,7 @@ fn refine(
 }
 
 /// Squared distance from `p` to the polyline `chain`.
+#[cfg(test)]
 fn distance_sq_to_chain(p: Point<f32>, chain: &[Point<f32>]) -> f32 {
     let mut best = f32::INFINITY;
     for &[a, b] in chain.array_windows::<2>() {
@@ -798,7 +903,11 @@ fn distance_sq_to_chain(p: Point<f32>, chain: &[Point<f32>]) -> f32 {
 /// Collapse two interior controls, allowing their replacement to leave either
 /// old knot. Test positions on the old curve and a small integer neighborhood;
 /// this is geometry only, before the selector pays for rendering one proposal.
-pub(super) fn collapse_control_pair(points: &[Point<i32>], i: usize) -> Option<Vec<Point<i32>>> {
+pub(super) fn collapse_control_pair(
+    ctx: &EncodingContext,
+    points: &[Point<i32>],
+    i: usize,
+) -> Option<Vec<Point<i32>>> {
     if i == 0 || i + 2 >= points.len() {
         return None;
     }
@@ -807,6 +916,7 @@ pub(super) fn collapse_control_pair(points: &[Point<i32>], i: usize) -> Option<V
     let lo = i.saturating_sub(2);
     let hi = (i + 3).min(points.len() - 1);
     let reference = catmull_rom_spans(&control, lo..hi);
+    let reference_distance = Polyline::new(ctx, &reference);
     let samples = catmull_rom_spans(&control, i..i + 1);
     let mut reduced = points.to_vec();
     reduced.remove(i + 1);
@@ -816,14 +926,9 @@ pub(super) fn collapse_control_pair(points: &[Point<i32>], i: usize) -> Option<V
         }
         let control: Vec<_> = points.iter().map(|p| p.as_f32()).collect();
         let curve = catmull_rom_spans(&control, lo..hi - 1);
-        let forward: f32 = curve
-            .iter()
-            .map(|&p| distance_sq_to_chain(p, &reference))
-            .sum();
-        let backward: f32 = reference
-            .iter()
-            .map(|&p| distance_sq_to_chain(p, &curve))
-            .sum();
+        let curve_distance = Polyline::new(ctx, &curve);
+        let forward: f32 = curve.iter().map(|&p| reference_distance.distance(p)).sum();
+        let backward: f32 = reference.iter().map(|&p| curve_distance.distance(p)).sum();
         forward / curve.len() as f32 + backward / reference.len() as f32
     };
     let (mut best_point, mut best_cost) = (reduced[i], f32::INFINITY);
@@ -863,8 +968,14 @@ pub(super) fn collapse_control_pair(points: &[Point<i32>], i: usize) -> Option<V
 /// +-1 px coordinate descent against the sub-pixel ridge: pulls the
 /// Catmull-Rom curve onto the chain. Pure geometry, no rendering; a control
 /// point only moves the four curve segments around it.
-fn refine_geometric(points: &[Point<i32>], chain: &[Point<f32>], sweeps: usize) -> Vec<Point<i32>> {
+fn refine_geometric(
+    ctx: &EncodingContext,
+    points: &[Point<i32>],
+    chain: &[Point<f32>],
+    sweeps: usize,
+) -> Vec<Point<i32>> {
     let sm = smooth_chain(chain, 1.0);
+    let distance = Polyline::new(ctx, &sm);
     let local_cost = |pts: &[Point<i32>], i: usize| -> f32 {
         if pts.windows(2).any(|p| p[0] == p[1]) {
             return f32::INFINITY;
@@ -881,7 +992,7 @@ fn refine_geometric(points: &[Point<i32>], chain: &[Point<f32>], sweeps: usize) 
         let hi = ((last as f32 * per_point + slack) as usize + 2).min(sm.len());
         curve
             .iter()
-            .map(|&p| distance_sq_to_chain(p, &sm[lo..hi]))
+            .map(|&p| distance.distance_range(p, lo..hi - 1))
             .sum()
     };
     let mut points = points.to_vec();
@@ -931,13 +1042,14 @@ struct Primary {
 
 /// Seeded-width fit of the unrefined control points.
 fn quick_primary(
+    ctx: &EncodingContext,
     targets: &[Vec<f32>; 3],
     w: usize,
     h: usize,
     chain: &Chain,
     scratch: &mut FitScratch,
 ) -> Option<Primary> {
-    let points = prune_control_points(&rdp_control_points(&chain.points), 0.5);
+    let points = prune_control_points(ctx, &rdp_control_points(&chain.points), 0.5);
     if points.len() < 2 || !inside(&points, w, h) {
         return None;
     }
@@ -970,6 +1082,7 @@ fn quick_primary(
 
 /// Refines a primary that survived the RD pre-test and builds its alternatives.
 fn expand(
+    ctx: &EncodingContext,
     targets: &[Vec<f32>; 3],
     source: &Image3F,
     w: usize,
@@ -984,7 +1097,7 @@ fn expand(
         ..
     } = primary;
     if fit.explained() > REFINE_MIN_EXPLAINED {
-        let aligned = refine_geometric(&points, &chain.points, 2);
+        let aligned = refine_geometric(ctx, &points, &chain.points, 2);
         let refined = refine(targets, w, h, &aligned, fit.sigma_n, 1, scratch);
         let at = SIGMA_LATTICE
             .iter()
@@ -1012,9 +1125,9 @@ fn expand(
     let mut alts = vec![primary];
     let mut geometries = vec![points];
     for tol in CURVE_TOLERANCES {
-        let sparse = curve_control_points(&chain.points, tol);
+        let sparse = curve_control_points(ctx, &chain.points, tol);
         if sparse.len() >= 2 {
-            let aligned = refine_geometric(&sparse, &chain.points, 2);
+            let aligned = refine_geometric(ctx, &sparse, &chain.points, 2);
             let refined = if aligned.len() < geometries[0].len() {
                 refine(targets, w, h, &aligned, fit.sigma_n, 1, scratch)
             } else {
@@ -1118,6 +1231,7 @@ fn fit_extension(
 /// Lean luma-only alternatives for a long straight line. Coding value is left
 /// to the RD tests: a faint line's explained fraction is dominated by grain.
 fn fit_long_line(
+    ctx: &EncodingContext,
     targets: &[Vec<f32>; 3],
     w: usize,
     h: usize,
@@ -1129,25 +1243,21 @@ fn fit_long_line(
     if points.len() < 2 || !inside(&points, w, h) {
         return None;
     }
-    let points = refine_geometric(&points, &chain.points, 2);
+    let points = refine_geometric(ctx, &points, &chain.points, 2);
     if !inside(&points, w, h) || points.windows(2).any(|p| p[0] == p[1]) {
         return None;
     }
+    // Geometry and width determine the system; coefficient budgets only solve it.
+    let systems: Vec<FitSystem> = LONG_LINE_WIDTHS
+        .iter()
+        .filter_map(|&n| fit_system(targets, w, h, &points, n, Precision::Compact, scratch))
+        .collect();
     let mut alts: Vec<QuantizedSpline> = Vec::new();
     for k in 1..=LONG_LINE_MAX_COEFFS {
         let mut best: Option<Fit> = None;
-        for &n in &LONG_LINE_WIDTHS {
-            if let Some(fit) = fit_at(
-                targets,
-                w,
-                h,
-                &points,
-                n,
-                Some((0, k, 0)),
-                Precision::Compact,
-                scratch,
-            ) && best.as_ref().is_none_or(|b| fit.gain() > b.gain())
-            {
+        for system in &systems {
+            let fit = system.solve(Some((0, k, 0)));
+            if best.as_ref().is_none_or(|b| fit.gain() > b.gain()) {
                 best = Some(fit);
             }
         }
@@ -1184,32 +1294,41 @@ pub(super) fn fit_candidates(
         .steal_map(
             scratch,
             chains.len() + extensions.len() + long_lines.len(),
-            |i, _| {
-                let fit_scratch = &mut FitScratch::default();
-                // Long lines come last: the greedy selector must see the proper
-                // coloured, curved candidates before a lean straight stand-in.
-                if i >= chains.len() + extensions.len() {
-                    let line = &long_lines[i - chains.len() - extensions.len()];
-                    let candidate = fit_long_line(targets, w, h, line, fit_scratch)?;
-                    return candidate
-                        .alts
-                        .iter()
-                        .any(|alt| pretest(model, xyb, quant_field, alt))
-                        .then_some(candidate);
-                }
-                if i >= chains.len() {
-                    let spline =
-                        fit_extension(targets, w, h, &extensions[i - chains.len()], fit_scratch)?;
-                    return pretest(model, xyb, quant_field, &spline).then_some(Candidate {
-                        alts: vec![spline],
-                        bits_factor: 1.0,
-                    });
-                }
-                let primary = quick_primary(targets, w, h, &chains[i], fit_scratch)?;
-                if !pretest(model, xyb, quant_field, &primary.spline) {
-                    return None;
-                }
-                expand(targets, xyb, w, h, &chains[i], primary, fit_scratch)
+            |i, worker| {
+                let fit_scratch = &mut worker.spline_fit;
+                let result = (|| {
+                    // Long lines come last: the greedy selector must see the proper
+                    // coloured, curved candidates before a lean straight stand-in.
+                    if i >= chains.len() + extensions.len() {
+                        let line = &long_lines[i - chains.len() - extensions.len()];
+                        let candidate = fit_long_line(ctx, targets, w, h, line, fit_scratch)?;
+                        return candidate
+                            .alts
+                            .iter()
+                            .any(|alt| pretest(model, xyb, quant_field, alt))
+                            .then_some(candidate);
+                    }
+                    if i >= chains.len() {
+                        let spline = fit_extension(
+                            targets,
+                            w,
+                            h,
+                            &extensions[i - chains.len()],
+                            fit_scratch,
+                        )?;
+                        return pretest(model, xyb, quant_field, &spline).then_some(Candidate {
+                            alts: vec![spline],
+                            bits_factor: 1.0,
+                        });
+                    }
+                    let primary = quick_primary(ctx, targets, w, h, &chains[i], fit_scratch)?;
+                    if !pretest(model, xyb, quant_field, &primary.spline) {
+                        return None;
+                    }
+                    expand(ctx, targets, xyb, w, h, &chains[i], primary, fit_scratch)
+                })();
+                fit_scratch.trim();
+                result
             },
         )
         .into_iter()
@@ -1222,7 +1341,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn common_coefficient_kernels_match_dynamic_accumulation() {
+        let (w, h) = (93, 67);
+        let targets = std::array::from_fn(|c| {
+            (0..w * h)
+                .map(|i| ((i * 19 + c * 31) % 101) as f32 * 0.003 - 0.15)
+                .collect::<Vec<_>>()
+        });
+        let points = [Point::new(2, 4), Point::new(33, 53), Point::new(88, 58)];
+        let mut scratch = FitScratch::default();
+        for precision in [Precision::Probe, Precision::Compact] {
+            for sigma_n in SIGMA_LATTICE {
+                let fixed =
+                    fit_system(&targets, w, h, &points, sigma_n, precision, &mut scratch).unwrap();
+                let coeffs = if precision == Precision::Probe {
+                    REFINE_COEFFS
+                } else {
+                    COMPACT_COEFFS
+                };
+                assert_eq!(fixed.coeffs, coeffs);
+                let sigma = sigma_n as f32 * sigma_step();
+                let reach = if precision == Precision::Probe {
+                    (2.6 * sigma + 1.0).ceil()
+                } else {
+                    (3.6 * sigma + 1.5).ceil()
+                } as isize;
+                let table = scratch.weight_table(sigma_n, sigma, reach);
+                let dynamic = raster_system::<0>(
+                    &targets,
+                    w,
+                    h,
+                    sigma_n,
+                    sigma,
+                    reach,
+                    coeffs,
+                    table,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_eq!(fixed.ata, dynamic.ata);
+                assert_eq!(fixed.atb, dynamic.atb);
+                assert_eq!(fixed.btb, dynamic.btb);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_geometry_and_widths_do_not_reuse_image_terms() {
+        let (w, h) = (91, 63);
+        let mut targets = std::array::from_fn(|c| {
+            (0..w * h)
+                .map(|i| ((i * 19 + c * 31) % 101) as f32 * 0.003)
+                .collect::<Vec<_>>()
+        });
+        let shapes = [
+            vec![Point::new(2, 4), Point::new(33, 53), Point::new(88, 58)],
+            vec![Point::new(4, 60), Point::new(49, 17), Point::new(89, 3)],
+        ];
+        let mut reused = FitScratch::default();
+        for (shape, width, precision) in [
+            (0, 1, Precision::Full),
+            (0, 6, Precision::Full),
+            (0, 6, Precision::Compact),
+            (1, 4, Precision::Probe),
+            (1, 4, Precision::Full),
+            (0, 1, Precision::Full),
+        ] {
+            let cached = fit_system(
+                &targets,
+                w,
+                h,
+                &shapes[shape],
+                width,
+                precision,
+                &mut reused,
+            )
+            .unwrap();
+            let fresh = fit_system(
+                &targets,
+                w,
+                h,
+                &shapes[shape],
+                width,
+                precision,
+                &mut FitScratch::default(),
+            )
+            .unwrap();
+            assert_eq!(cached.ata, fresh.ata);
+            assert_eq!(cached.atb, fresh.atb);
+            assert_eq!(cached.btb, fresh.btb);
+            assert_eq!(cached.arc, fresh.arc);
+            for plane in &mut targets {
+                for v in plane {
+                    *v *= 0.75;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pair_collapse_relocates_controls_to_preserve_a_bend() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let points: Vec<_> = (0..=8)
             .map(|i| {
                 let a = i as f32 * std::f32::consts::FRAC_PI_2 / 8.0;
@@ -1250,7 +1469,7 @@ mod tests {
         };
         let mut relocated = false;
         for i in 1..points.len() - 2 {
-            let reduced = collapse_control_pair(&points, i).unwrap();
+            let reduced = collapse_control_pair(&kernels, &points, i).unwrap();
             assert_eq!(reduced.len(), points.len() - 1);
             assert_eq!(reduced.first(), points.first());
             assert_eq!(reduced.last(), points.last());
@@ -1267,18 +1486,19 @@ mod tests {
             relocated,
             "merging should improve on merely deleting either old knot"
         );
-        assert!(collapse_control_pair(&points, 0).is_none());
-        assert!(collapse_control_pair(&points, points.len() - 2).is_none());
-        assert!(collapse_control_pair(&points[..3], 1).is_none());
+        assert!(collapse_control_pair(&kernels, &points, 0).is_none());
+        assert!(collapse_control_pair(&kernels, &points, points.len() - 2).is_none());
+        assert!(collapse_control_pair(&kernels, &points[..3], 1).is_none());
     }
 
     #[test]
     fn pruning_keeps_curve_shape_and_collapses_straight_spans() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let straight: Vec<_> = (0..12)
             .map(|i| Point::new(20 + i * 8, 40 + i * 4))
             .collect();
         assert_eq!(
-            prune_control_points(&straight, 0.5),
+            prune_control_points(&kernels, &straight, 0.5),
             [straight[0], straight[11]]
         );
         let chain: Vec<_> = (0..=160)
@@ -1288,7 +1508,7 @@ mod tests {
             })
             .collect();
         let dense = rdp_control_points(&chain);
-        let sparse = prune_control_points(&dense, 0.5);
+        let sparse = prune_control_points(&kernels, &dense, 0.5);
         assert!(sparse.len() < dense.len());
         assert_eq!(sparse.first(), dense.first());
         assert_eq!(sparse.last(), dense.last());
@@ -1305,6 +1525,7 @@ mod tests {
 
     #[test]
     fn residual_fit_leaves_affine_background_in_vardct() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let (w, h) = (96, 64);
         let points = vec![Point::new(16, 30), Point::new(48, 34), Point::new(80, 30)];
         let mut line = QuantizedSpline {
@@ -1316,7 +1537,7 @@ mod tests {
         line.dct[2][0] = -2;
         line.dct[3][0] = 4;
         let mut image = Image3F::new(w, h);
-        super::super::render_spline(&line, QUANT_ADJUST, &mut image, 1.0);
+        super::super::render_spline(&kernels, &line, QUANT_ADJUST, &mut image, 1.0);
         let targets = std::array::from_fn(|c| image.plane_data(c).to_vec());
         let mut scratch = FitScratch::default();
         let system = fit_system(&targets, w, h, &points, 4, Precision::Full, &mut scratch).unwrap();
@@ -1338,6 +1559,7 @@ mod tests {
 
     #[test]
     fn curve_aware_control_points_follow_a_bend_with_fewer_points() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         // a quarter circle of radius 120 px, traced at about 1 px steps
         let chain: Vec<Point<f32>> = (0..=188)
             .map(|k| {
@@ -1345,7 +1567,7 @@ mod tests {
                 Point::new(40.0 + 120.0 * a.sin(), 160.0 - 120.0 * a.cos())
             })
             .collect();
-        let sparse = curve_control_points(&chain, 1.0);
+        let sparse = curve_control_points(&kernels, &chain, 1.0);
         let dense = rdp_control_points(&chain);
         assert!(
             sparse.len() >= 2 && sparse.len() < dense.len(),

@@ -38,8 +38,8 @@ const HYSTERESIS_HIGH: f32 = 0.02;
 const HYSTERESIS_LOW: f32 = 0.008;
 const MIN_CHAIN_LEN: usize = 20;
 /// Line-ness: curvature across the ridge must dominate curvature along it.
-const ALONG_PENALTY: f32 = 1.5;
-const MAX_SUBPIXEL_OFFSET: f32 = 0.75;
+pub(crate) const ALONG_PENALTY: f32 = 1.5;
+pub(crate) const MAX_SUBPIXEL_OFFSET: f32 = 0.75;
 const TRACE_MIN_COS: f32 = 0.35;
 /// Chains are trimmed to this distance from the frame: a line leaving the image
 /// keeps its interior part, a line hugging the border (scan frames) vanishes.
@@ -82,6 +82,107 @@ struct RidgeMap {
     offset: Vec<f32>,
 }
 
+/// Disjoint output rows for the scale that wins at each pixel.
+pub(crate) struct RidgeRow<'a> {
+    pub(crate) strength: &'a mut [f32],
+    pub(crate) nx: &'a mut [f32],
+    pub(crate) ny: &'a mut [f32],
+    pub(crate) scale: &'a mut [f32],
+    pub(crate) polarity: &'a mut [i8],
+    pub(crate) offset: &'a mut [f32],
+}
+
+impl RidgeRow<'_> {
+    /// Check every slice before architecture kernels use full-vector loads.
+    pub(crate) fn validate(&self, derivatives: [&[f32]; 5]) -> usize {
+        let n = self.strength.len();
+        assert_eq!(self.nx.len(), n);
+        assert_eq!(self.ny.len(), n);
+        assert_eq!(self.scale.len(), n);
+        assert_eq!(self.polarity.len(), n);
+        assert_eq!(self.offset.len(), n);
+        for row in derivatives {
+            assert_eq!(row.len(), n);
+        }
+        n
+    }
+}
+
+/// Derivative rows are hxx, hyy, hxy, gx and gy, in that order.
+pub(crate) type RidgeRowFn = fn(f32, [&[f32]; 5], RidgeRow<'_>);
+
+pub(crate) fn select_ridge_row_fn() -> RidgeRowFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |s, derivatives, output| unsafe {
+        crate::neon::spline_ridge_row_neon(s, derivatives, output)
+    };
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return |s, derivatives, output| unsafe {
+            crate::avx::spline_ridge_row_avx2(s, derivatives, output)
+        };
+    }
+    #[allow(unreachable_code)]
+    ridge_row_scalar
+}
+
+pub(crate) fn ridge_row_scalar(s: f32, derivatives: [&[f32]; 5], output: RidgeRow<'_>) {
+    output.validate(derivatives);
+    let [hxx, hyy, hxy, gx, gy] = derivatives;
+    let RidgeRow {
+        strength: strengths,
+        nx,
+        ny,
+        scale: scales,
+        polarity: polarities,
+        offset: offsets,
+    } = output;
+    let s2 = s * s;
+    let hessian = hxx.iter().zip(hyy.iter()).zip(hxy.iter());
+    let gradients = gx.iter().zip(gy.iter());
+    let normals = nx.iter_mut().zip(ny);
+    let attributes = scales.iter_mut().zip(polarities).zip(offsets);
+    let outputs = strengths.iter_mut().zip(normals).zip(attributes);
+    for (derivatives, output) in hessian.zip(gradients).zip(outputs) {
+        let (((&hxx, &hyy), &hxy), (&gx, &gy)) = derivatives;
+        let ((best, (nx, ny)), ((scale, polarity), offset)) = output;
+        let tr = 0.5 * (hxx + hyy);
+        let df = ((0.5 * (hxx - hyy)).powi(2) + hxy * hxy).sqrt();
+        let (la, lb) = (tr + df, tr - df);
+        let (big, small) = if la.abs() > lb.abs() {
+            (la, lb)
+        } else {
+            (lb, la)
+        };
+        let strength = s2 * (big.abs() - ALONG_PENALTY * small.abs()).max(0.0);
+        if strength <= *best {
+            continue;
+        }
+        // a line center has ~zero gradient, a step edge does not
+        if s * fast_hypot(gx, gy) > s2 * big.abs() {
+            continue;
+        }
+        let (mut vx, mut vy) = (hxy, big - hxx);
+        let norm = fast_hypot(vx, vy);
+        if norm < 1e-12 {
+            (vx, vy) = (1.0, 0.0);
+        } else {
+            (vx, vy) = (vx / norm, vy / norm);
+        }
+        let t = if big.abs() < 1e-12 {
+            0.0
+        } else {
+            (-(gx * vx + gy * vy) / big).clamp(-MAX_SUBPIXEL_OFFSET, MAX_SUBPIXEL_OFFSET)
+        };
+        *best = strength;
+        *nx = vx;
+        *ny = vy;
+        *scale = s;
+        *polarity = if big > 0.0 { -1 } else { 1 };
+        *offset = t;
+    }
+}
+
 fn ridge_map(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -109,7 +210,6 @@ fn ridge_map(
         let v0 = FilterPlan::new(h, &k0);
         let v1 = FilterPlan::new(h, &k1);
         let v2 = FilterPlan::new(h, &k2);
-        let s2 = s * s;
         let bands = (ctx.thread_pool.num_threads().max(1) * 4).min(h).max(1);
         let band_len = h.div_ceil(bands) * w;
         struct Band<'a> {
@@ -169,50 +269,18 @@ fn ridge_map(
                     v0.vertical_row(&r1, w, y, gx);
                     v1.vertical_row(&r0, w, y, gy);
                     let (((((strengths, nx), ny), scales), polarities), offsets) = outputs;
-                    let hessian = hxx.iter().zip(hyy.iter()).zip(hxy.iter());
-                    let gradients = gx.iter().zip(gy.iter());
-                    let normals = nx.iter_mut().zip(ny);
-                    let attributes = scales.iter_mut().zip(polarities).zip(offsets);
-                    let outputs = strengths.iter_mut().zip(normals).zip(attributes);
-                    for (derivatives, output) in hessian.zip(gradients).zip(outputs) {
-                        let (((&hxx, &hyy), &hxy), (&gx, &gy)) = derivatives;
-                        let ((best, (nx, ny)), ((scale, polarity), offset)) = output;
-                        let tr = 0.5 * (hxx + hyy);
-                        let df = ((0.5 * (hxx - hyy)).powi(2) + hxy * hxy).sqrt();
-                        let (la, lb) = (tr + df, tr - df);
-                        let (big, small) = if la.abs() > lb.abs() {
-                            (la, lb)
-                        } else {
-                            (lb, la)
-                        };
-                        let strength = s2 * (big.abs() - ALONG_PENALTY * small.abs()).max(0.0);
-                        if strength <= *best {
-                            continue;
-                        }
-                        // a line center has ~zero gradient, a step edge does not
-                        if s * fast_hypot(gx, gy) > s2 * big.abs() {
-                            continue;
-                        }
-                        let (mut vx, mut vy) = (hxy, big - hxx);
-                        let norm = fast_hypot(vx, vy);
-                        if norm < 1e-12 {
-                            (vx, vy) = (1.0, 0.0);
-                        } else {
-                            (vx, vy) = (vx / norm, vy / norm);
-                        }
-                        let t = if big.abs() < 1e-12 {
-                            0.0
-                        } else {
-                            (-(gx * vx + gy * vy) / big)
-                                .clamp(-MAX_SUBPIXEL_OFFSET, MAX_SUBPIXEL_OFFSET)
-                        };
-                        *best = strength;
-                        *nx = vx;
-                        *ny = vy;
-                        *scale = s;
-                        *polarity = if big > 0.0 { -1 } else { 1 };
-                        *offset = t;
-                    }
+                    (ctx.spline_ridge_row)(
+                        s,
+                        [hxx, hyy, hxy, gx, gy],
+                        RidgeRow {
+                            strength: strengths,
+                            nx,
+                            ny,
+                            scale: scales,
+                            polarity: polarities,
+                            offset: offsets,
+                        },
+                    );
                 }
             });
     }
@@ -233,26 +301,90 @@ fn bilinear(plane: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
 
 /// Ridge peaks above the weak threshold. Tracing starts only at strong peaks,
 /// so each retained chain contains its own strong seed without a flood fill.
-fn ridge_mask(map: &RidgeMap, w: usize, h: usize) -> Vec<bool> {
+fn ridge_mask(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    map: &RidgeMap,
+    w: usize,
+    h: usize,
+) -> (Vec<bool>, Vec<u64>) {
     let n = w * h;
     let mut weak = vec![false; n];
-    let rows = weak
-        .chunks_exact_mut(w)
-        .zip(map.strength.chunks_exact(w))
-        .zip(map.nx.chunks_exact(w).zip(map.ny.chunks_exact(w)));
-    for (y, ((weak, strength), (nx, ny))) in rows.enumerate() {
-        let pixels = weak.iter_mut().zip(strength).zip(nx.iter().zip(ny));
-        for (x, ((weak, &s), (&nx, &ny))) in pixels.enumerate() {
-            if s <= HYSTERESIS_LOW {
-                continue;
+    let band_rows = h.div_ceil(ctx.thread_pool.num_threads() * 4).max(1);
+    let mut bands: Vec<_> = weak
+        .chunks_mut(band_rows * w)
+        .map(|mask| (mask, Vec::new()))
+        .collect();
+    ctx.thread_pool
+        .steal_for_each_mut(scratch, &mut bands, |band, (weak, seeds), _| {
+            let offset = band * band_rows * w;
+            let rows = weak
+                .chunks_exact_mut(w)
+                .zip(map.strength[offset..].chunks_exact(w))
+                .zip(
+                    map.nx[offset..]
+                        .chunks_exact(w)
+                        .zip(map.ny[offset..].chunks_exact(w)),
+                );
+            for (row, ((weak, strength), (nx, ny))) in rows.enumerate() {
+                let y = band * band_rows + row;
+                let pixels = weak.iter_mut().zip(strength).zip(nx.iter().zip(ny));
+                for (x, ((weak, &s), (&nx, &ny))) in pixels.enumerate() {
+                    if s <= HYSTERESIS_LOW {
+                        continue;
+                    }
+                    let (fx, fy) = (x as f32, y as f32);
+                    let a = bilinear(&map.strength, w, h, fx + nx, fy + ny);
+                    let b = bilinear(&map.strength, w, h, fx - nx, fy - ny);
+                    *weak = s >= a && s >= b;
+                    if *weak && s > HYSTERESIS_HIGH {
+                        seeds.push(seed_key((y * w + x) as u32, s));
+                    }
+                }
             }
-            let (fx, fy) = (x as f32, y as f32);
-            let a = bilinear(&map.strength, w, h, fx + nx, fy + ny);
-            let b = bilinear(&map.strength, w, h, fx - nx, fy - ny);
-            *weak = s >= a && s >= b;
-        }
+        });
+    // Concatenate in raster order, independent of worker completion order.
+    // This avoids a second serial scan of the full mask and strength plane.
+    let mut seeds = Vec::with_capacity(bands.iter().map(|(_, seeds)| seeds.len()).sum());
+    for (_, mut band_seeds) in bands {
+        seeds.append(&mut band_seeds);
     }
-    weak
+    (weak, seeds)
+}
+
+/// Strong seeds have positive, non-NaN strengths, whose float bits sort in
+/// numerical order. Pack the descending key beside the pixel index so radix
+/// passes never gather strengths from the full image in permuted order.
+fn seed_key(index: u32, strength: f32) -> u64 {
+    ((!strength.to_bits() as u64) << 32) | index as u64
+}
+
+fn sort_seeds(order: &mut Vec<u64>) {
+    if order.len() < 2048 {
+        // Ignore the pixel index: equal-strength seeds retain their input order.
+        order.sort_by_key(|entry| entry >> 32);
+        return;
+    }
+    let mut tmp = vec![0; order.len()];
+    for shift in [32, 40, 48, 56] {
+        let key = |entry: u64| ((entry >> shift) & 255) as usize;
+        let mut offsets = [0usize; 256];
+        for &entry in order.iter() {
+            offsets[key(entry)] += 1;
+        }
+        let mut sum = 0;
+        for offset in &mut offsets {
+            let count = *offset;
+            *offset = sum;
+            sum += count;
+        }
+        for &entry in order.iter() {
+            let offset = &mut offsets[key(entry)];
+            tmp[*offset] = entry;
+            *offset += 1;
+        }
+        std::mem::swap(order, &mut tmp);
+    }
 }
 
 static NEIGHBORS: [(isize, isize); 8] = [
@@ -326,15 +458,12 @@ pub(super) fn detect_chains(
 ) -> Vec<Chain> {
     let (w, h) = (xyb.xsize(), xyb.ysize());
     let map = ridge_map(ctx, scratch, xyb.plane_data(1), w, h);
-    let mut avail = ridge_mask(&map, w, h);
-    let mut order: Vec<u32> = (0..(w * h) as u32)
-        .filter(|&i| avail[i as usize] && map.strength[i as usize] > HYSTERESIS_HIGH)
-        .collect();
-    order.sort_by(|&a, &b| map.strength[b as usize].total_cmp(&map.strength[a as usize]));
+    let (mut avail, mut order) = ridge_mask(ctx, scratch, &map, w, h);
+    sort_seeds(&mut order);
 
     let mut chains = Vec::new();
-    for i in order {
-        let i = i as usize;
+    for entry in order {
+        let i = entry as u32 as usize;
         if !avail[i] {
             continue;
         }
@@ -400,7 +529,164 @@ pub(super) fn detect_chains(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ridge_kernel_matches_scalar_thresholds_tails_and_scale_ties() {
+        let ctx = EncodingContext::default();
+        let mut cases = vec![
+            [0.0, -0.0, 0.0, -0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0], // degenerate eigenvector
+            [-1.0, 0.0, 0.0, -0.0, 0.0],
+            [1.0, -1.0, 0.0, 0.0, 0.0], // equal eigenvalue magnitudes
+            [0.0, 0.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0], // no ridge strength
+        ];
+        for scale in SCALES {
+            for big in [1.0, -1.0, 1e-12f32.next_down(), 1e-12, 1e-12f32.next_up()] {
+                for limit in [scale * big.abs(), MAX_SUBPIXEL_OFFSET * big.abs()] {
+                    for gradient in [limit.next_down(), limit, limit.next_up()] {
+                        cases.push([0.0, big, 0.0, 0.0, gradient]);
+                        cases.push([big, 0.0, 0.0, -gradient, 0.0]);
+                    }
+                }
+            }
+        }
+        // Miri still exercises every vector alignment and tail, but uses a
+        // smaller corpus because interpreting SIMD is much slower than native.
+        if cfg!(miri) {
+            cases.truncate(64);
+        }
+        // Mixed orientations and gradient strengths, with many accepted lanes
+        // as well as isolated rejections inside otherwise accepted vectors.
+        let mut state = 0x71b9a535u32;
+        for i in 0..if cfg!(miri) { 32 } else { 4096 } {
+            let magnitude = [1e-14, 1e-7, 1.0, 1e7][i % 4];
+            cases.push(std::array::from_fn(|channel| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let value = (state as i32 as f32 / i32::MAX as f32) * magnitude;
+                if channel >= 3 { value * 0.25 } else { value }
+            }));
+        }
+        let inputs: [Vec<f32>; 5] = std::array::from_fn(|c| cases.iter().map(|v| v[c]).collect());
+        let make_map = || RidgeMap {
+            strength: vec![0.0; cases.len()],
+            nx: vec![17.0; cases.len()],
+            ny: vec![-19.0; cases.len()],
+            scale: vec![23.0; cases.len()],
+            polarity: vec![7; cases.len()],
+            offset: vec![29.0; cases.len()],
+        };
+        fn row(map: &mut RidgeMap, range: std::ops::Range<usize>) -> RidgeRow<'_> {
+            RidgeRow {
+                strength: &mut map.strength[range.clone()],
+                nx: &mut map.nx[range.clone()],
+                ny: &mut map.ny[range.clone()],
+                scale: &mut map.scale[range.clone()],
+                polarity: &mut map.polarity[range.clone()],
+                offset: &mut map.offset[range],
+            }
+        }
+        // All alignments and short tails, including zero-length rows. Values
+        // outside the supplied slice are sentinels and must remain untouched.
+        for start in 0..8 {
+            for len in (0..=25).chain((cases.len() - 15)..=(cases.len() - 8)) {
+                let range = start..start + len;
+                let derivatives = inputs.each_ref().map(|v| &v[range.clone()]);
+                let (mut expected, mut actual) = (make_map(), make_map());
+                for s in [0.7, 0.7, 1.0, 1.5, 2.2] {
+                    ridge_row_scalar(s, derivatives, row(&mut expected, range.clone()));
+                    (ctx.spline_ridge_row)(s, derivatives, row(&mut actual, range.clone()));
+                    for (a, b) in [
+                        (&actual.strength, &expected.strength),
+                        (&actual.nx, &expected.nx),
+                        (&actual.ny, &expected.ny),
+                        (&actual.scale, &expected.scale),
+                        (&actual.offset, &expected.offset),
+                    ] {
+                        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "range {range:?}, scale {s}, pixel {i}, input {:?}",
+                                cases[i]
+                            );
+                        }
+                    }
+                    assert_eq!(actual.polarity, expected.polarity);
+                }
+            }
+        }
+    }
     use crate::{Speed, xyb::XybMatrix};
+
+    #[test]
+    fn radix_seeds_preserve_strength_order_and_stable_ties() {
+        let strengths: Vec<f32> = (0..10000)
+            .map(|i| match i % 11 {
+                0 => f32::INFINITY,
+                1 => HYSTERESIS_HIGH.next_up(),
+                2 => 0.125,
+                _ => f32::from_bits(0x3c800000 + ((i * 2654435761u64) % 0x04000000) as u32),
+            })
+            .collect();
+        for n in [0, 1, 17, 2047, 2048, 10000] {
+            let mut expected: Vec<u32> = (0..n).rev().collect();
+            let mut order: Vec<u64> = expected
+                .iter()
+                .map(|&i| seed_key(i, strengths[i as usize]))
+                .collect();
+            expected.sort_by(|&a, &b| strengths[b as usize].total_cmp(&strengths[a as usize]));
+            sort_seeds(&mut order);
+            assert_eq!(
+                order.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_peak_collection_preserves_raster_order_and_thresholds() {
+        for (w, h) in [(1, 1), (3, 17), (37, 31), (256, 257)] {
+            let n = w * h;
+            let normals = [(1.0, 0.0), (0.0, 1.0), (0.6, 0.8), (-0.8, 0.6)];
+            let map = RidgeMap {
+                strength: (0..n)
+                    .map(|i| match i % 13 {
+                        0 => HYSTERESIS_LOW,
+                        1 => HYSTERESIS_HIGH,
+                        2 => HYSTERESIS_HIGH.next_up(),
+                        _ => (i * 37 % 19) as f32 * 0.005,
+                    })
+                    .collect(),
+                nx: (0..n).map(|i| normals[i % 4].0).collect(),
+                ny: (0..n).map(|i| normals[i % 4].1).collect(),
+                scale: vec![1.0; n],
+                polarity: vec![1; n],
+                offset: vec![0.0; n],
+            };
+            let expected_mask: Vec<_> = (0..n)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32, (i / w) as f32);
+                    let (nx, ny, s) = (map.nx[i], map.ny[i], map.strength[i]);
+                    s > HYSTERESIS_LOW
+                        && s >= bilinear(&map.strength, w, h, x + nx, y + ny)
+                        && s >= bilinear(&map.strength, w, h, x - nx, y - ny)
+                })
+                .collect();
+            let expected_seeds: Vec<_> = (0..n)
+                .filter(|&i| expected_mask[i] && map.strength[i] > HYSTERESIS_HIGH)
+                .map(|i| seed_key(i as u32, map.strength[i]))
+                .collect();
+            for threads in [1, 4] {
+                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let (mask, seeds) = ridge_mask(&ctx, &mut CoderScratch::default(), &map, w, h);
+                assert_eq!(mask, expected_mask);
+                assert_eq!(seeds, expected_seeds);
+            }
+        }
+    }
 
     #[test]
     fn strong_seed_tracks_weak_tails_but_does_not_start_weak_only_lines() {
