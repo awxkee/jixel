@@ -33,7 +33,8 @@
 //! points are refined by +-1 px coordinate descent. Every candidate leaves with
 //! a few alternative parametrisations for the RD gate to choose from.
 
-use super::detect::{Chain, convolve_cols, convolve_rows, gaussian_kernels};
+use super::detect::{Chain, gaussian_kernels};
+use super::filter::FilterPlan;
 use super::select::{BlockModel, pretest};
 use super::{
     CHANNEL_WEIGHT, Point, QUANT_ADJUST, QuantizedSpline, adjusted_quant, blob_weight,
@@ -114,9 +115,14 @@ fn line_targets(
         }
     }
     let [kernel, _, _] = gaussian_kernels(BACKGROUND_SIGMA);
+    let horizontal = FilterPlan::new(w, &kernel);
+    let vertical = FilterPlan::new(h, &kernel);
+    let mut rows = vec![0.0; w * h];
     let mut blur = |plane: &[f32]| {
-        let rows = convolve_rows(ctx, scratch, plane, w, h, &kernel);
-        convolve_cols(ctx, scratch, &rows, w, h, &kernel)
+        let mut out = vec![0.0; w * h];
+        horizontal.horizontal(ctx, scratch, plane, &mut rows);
+        vertical.vertical(ctx, scratch, &rows, &mut out);
+        out
     };
     let weight = blur(&keep);
     [0, 1, 2].map(|c| {

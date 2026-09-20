@@ -23,9 +23,9 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
-         [--speed slow|fast] [--color-recovery]\n\
-         (--color-recovery: experimental SDR color recovery; requires --speed slow and distance 1.5..=24)"
+         [--speed slow|fast]"
     );
+    eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
     std::process::exit(2);
 }
 
@@ -37,7 +37,6 @@ fn main() -> ExitCode {
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
     let mut splines = false;
-    let mut color_recovery = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -79,8 +78,8 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "--color-recovery" => {
-                color_recovery = true;
-                i += 1;
+                eprintln!("--color-recovery is no longer supported");
+                return ExitCode::FAILURE;
             }
             "-h" | "--help" => usage(),
             other => {
@@ -113,7 +112,7 @@ fn main() -> ExitCode {
     let height = image.height() as usize;
     let rgb = image.to_rgb8();
 
-    let mut cfg = jixel::EncodeConfig::default()
+    let cfg = jixel::EncodeConfig::default()
         .with_lossless(lossless)
         .with_distance(distance)
         .with_num_threads(threads.max(1))

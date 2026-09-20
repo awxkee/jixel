@@ -1452,16 +1452,19 @@ fn encode_frame_vardct(
         ctx.raise_b_qm_scale(X_HEAVY_B_QM_SCALE);
     }
 
+    #[cfg(feature = "splines")]
     let quant_field = if ctx.splines {
         spline_quant_field(ctx, scratch, &xyb, distp)?
     } else {
         Vec::new()
     };
+    #[cfg(feature = "splines")]
     let spline_candidates = if ctx.splines {
         crate::splines::find_candidates(ctx, scratch, distance, &xyb, &quant_field)
     } else {
         None
     };
+    #[cfg(feature = "splines")]
     let select_splines = |image: &mut Image3F, forbidden: Option<&[bool]>| {
         let candidates = spline_candidates.as_ref()?;
         crate::splines::select_splines(ctx, distance, image, &quant_field, candidates, forbidden)
@@ -1469,6 +1472,7 @@ fn encode_frame_vardct(
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
+        #[cfg(feature = "splines")]
         let regular_splines = select_splines(&mut regular, None);
         gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
@@ -1480,6 +1484,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Regular,
+            #[cfg(feature = "splines")]
             regular_splines.as_ref(),
             &mut regular_writer,
         )?;
@@ -1544,6 +1549,7 @@ fn encode_frame_vardct(
                         width: atlas_w,
                         height: atlas_h,
                     },
+                    #[cfg(feature = "splines")]
                     None,
                     out,
                 )
@@ -1595,6 +1601,7 @@ fn encode_frame_vardct(
         let mut base = plan.base;
         // Patches replace their rectangles and the decoder draws splines after
         // them, so no spline may reach into a patch.
+        #[cfg(feature = "splines")]
         let base_splines = if spline_candidates.is_some() {
             let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
             let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
@@ -1620,6 +1627,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Patched(&references),
+            #[cfg(feature = "splines")]
             base_splines.as_ref(),
             &mut patched_writer,
         )?;
@@ -1631,6 +1639,7 @@ fn encode_frame_vardct(
         return Ok(());
     }
 
+    #[cfg(feature = "splines")]
     let splines = select_splines(&mut xyb, None);
     gaborize(&mut xyb, distp);
     encode_frame_core(
@@ -1641,6 +1650,7 @@ fn encode_frame_vardct(
         alpha,
         coeff_shifts,
         VarDctFrameKind::Regular,
+        #[cfg(feature = "splines")]
         splines.as_ref(),
         writer,
     )
@@ -1648,6 +1658,7 @@ fn encode_frame_vardct(
 
 /// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
 /// any spline is removed; the spline RD gate prices blocks with it.
+#[cfg(feature = "splines")]
 fn spline_quant_field(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1928,7 +1939,7 @@ fn encode_frame_core(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
-    splines: Option<&crate::splines::SplineSet>,
+    #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
@@ -2495,6 +2506,7 @@ fn encode_frame_core(
             &mut sections[0],
         );
     }
+    #[cfg(feature = "splines")]
     if let Some(set) = splines {
         crate::splines::write_splines(set, scratch, &mut sections[0]);
     }
@@ -2684,6 +2696,10 @@ fn encode_frame_core(
         }
     }
 
+    #[cfg(feature = "splines")]
+    let has_splines = splines.is_some();
+    #[cfg(not(feature = "splines"))]
+    let has_splines = false;
     write_frame_header_kind(
         distp.x_qm_scale,
         ctx.b_qm_scale(),
@@ -2693,7 +2709,7 @@ fn encode_frame_core(
         alpha.is_some(),
         coeff_shifts,
         frame_kind,
-        splines.is_some(),
+        has_splines,
         writer,
     );
     combine_sections(&mut sections, writer);
@@ -3372,7 +3388,7 @@ mod fused_dc_tests {
                         for x in 0..w {
                             let i = (y * w + x + 1) * (c + 7);
                             dc.quant_dc.plane_row_mut(c, y)[x] =
-                                ((i * 7919 ^ (i / 7 * 1237)) % 65536) as i16;
+                                (((i * 7919) ^ (i / 7 * 1237)) % 65536) as i16;
                         }
                     }
                 }

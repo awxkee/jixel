@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn lookup_preserves_all_routes_near_the_split_capacity() {
         const DEPTH: usize = SPLIT_CAPACITY.ilog2() as usize;
-        assert!(DEPTH + 2 <= NUM_MA_PROPS);
+        const { assert!(DEPTH + 2 <= NUM_MA_PROPS) };
         fn build(
             nodes: &mut Vec<MaNode>,
             contexts: &mut Vec<u32>,

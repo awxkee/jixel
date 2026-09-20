@@ -43,26 +43,21 @@ fn main() {
     }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let bytes = jixel::encode_image(
-        &rgb_img,
-        width,
-        height,
-        &EncodeConfig::default()
-            .with_lossless(false)
-            .with_distance(distance)
-            .with_speed(Speed::Slow)
-            .with_progressive(false)
-            .with_decoding_speed(DecodingSpeed::Slow)
-            .with_patches(true)
-            .with_splines(true)
-            .with_color_encoding(ColorEncoding::srgb())
-            .with_num_threads(
-                available_parallelism()
-                    .unwrap_or(NonZero::new(1).unwrap())
-                    .get(),
-            ),
-    )
-    .unwrap();
+    let cfg = EncodeConfig::default()
+        .with_lossless(false)
+        .with_distance(distance)
+        .with_speed(Speed::Slow)
+        .with_progressive(false)
+        .with_decoding_speed(DecodingSpeed::Slow)
+        .with_patches(true)
+        .with_color_encoding(ColorEncoding::srgb())
+        .with_num_threads(
+            available_parallelism()
+                .unwrap_or(NonZero::new(1).unwrap())
+                .get(),
+        )
+        .with_splines(true);
+    let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();
     std::fs::write(output, &bytes).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;

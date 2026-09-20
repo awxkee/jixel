@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::filter::FilterPlan;
 use super::{Point, fast_hypot};
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
@@ -50,30 +51,6 @@ pub(super) struct Chain {
     pub(super) scale: f32,
 }
 
-/// Runs `f(y, row)` over all rows on the encoder's thread pool.
-pub(super) fn par_plane<F>(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    w: usize,
-    h: usize,
-    f: F,
-) -> Vec<f32>
-where
-    F: Fn(usize, &mut [f32]) + Sync,
-{
-    let bands = (ctx.thread_pool.num_threads().max(1) * 4).min(h).max(1);
-    let rows_per = h.div_ceil(bands);
-    let mut plane = vec![0f32; w * h];
-    let mut parts: Vec<_> = plane.chunks_mut(rows_per * w).collect();
-    ctx.thread_pool
-        .steal_for_each_mut(scratch, &mut parts, |b, rows, _| {
-            for (y, row) in rows.chunks_exact_mut(w).enumerate() {
-                f(b * rows_per + y, row);
-            }
-        });
-    plane
-}
-
 /// Gaussian kernels of derivative order 0, 1 and 2 (radius `4 * sigma`).
 pub(super) fn gaussian_kernels(sigma: f32) -> [Vec<f32>; 3] {
     let radius = (4.0 * sigma + 0.5) as isize;
@@ -94,68 +71,6 @@ pub(super) fn gaussian_kernels(sigma: f32) -> [Vec<f32>; 3] {
         .map(|(&g, j)| ((j * j) as f32 / (s2 * s2) - 1.0 / s2) * g)
         .collect();
     [k0, k1, k2]
-}
-
-pub(super) fn convolve_rows(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    src: &[f32],
-    w: usize,
-    h: usize,
-    kernel: &[f32],
-) -> Vec<f32> {
-    let radius = kernel.len() / 2;
-    par_plane(ctx, scratch, w, h, |y, out| {
-        let row = &src[y * w..(y + 1) * w];
-        if w > 2 * radius {
-            // tap-major over the interior keeps the inner loop a plain saxpy
-            let inner = w - 2 * radius;
-            for (j, &k) in kernel.iter().enumerate() {
-                for (o, &v) in out[radius..radius + inner]
-                    .iter_mut()
-                    .zip(&row[j..j + inner])
-                {
-                    *o += k * v;
-                }
-            }
-        }
-        let edge = |x: usize| -> f32 {
-            kernel
-                .iter()
-                .enumerate()
-                .map(|(j, &k)| k * row[(x + j).saturating_sub(radius).min(w - 1)])
-                .sum()
-        };
-        if w > 2 * radius {
-            for x in (0..radius).chain(w - radius..w) {
-                out[x] = edge(x);
-            }
-        } else {
-            for (x, o) in out.iter_mut().enumerate() {
-                *o = edge(x);
-            }
-        }
-    })
-}
-
-pub(super) fn convolve_cols(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    src: &[f32],
-    w: usize,
-    h: usize,
-    kernel: &[f32],
-) -> Vec<f32> {
-    let radius = kernel.len() / 2;
-    par_plane(ctx, scratch, w, h, |y, out| {
-        out.fill(0.0);
-        for (j, &k) in kernel.iter().enumerate() {
-            let yi = (y + j).saturating_sub(radius).min(h - 1);
-            for (o, &v) in out.iter_mut().zip(&src[yi * w..(yi + 1) * w]) {
-                *o += k * v;
-            }
-        }
-    })
 }
 
 struct RidgeMap {
@@ -183,16 +98,17 @@ fn ridge_map(
         polarity: vec![0; n],
         offset: vec![0.0; n],
     };
+    let mut r0 = vec![0.0; n];
+    let mut r1 = vec![0.0; n];
+    let mut r2 = vec![0.0; n];
     for s in SCALES {
         let [k0, k1, k2] = gaussian_kernels(s);
-        let r0 = convolve_rows(ctx, scratch, luma, w, h, &k0);
-        let r1 = convolve_rows(ctx, scratch, luma, w, h, &k1);
-        let r2 = convolve_rows(ctx, scratch, luma, w, h, &k2);
-        let hxx = convolve_cols(ctx, scratch, &r2, w, h, &k0);
-        let hyy = convolve_cols(ctx, scratch, &r0, w, h, &k2);
-        let hxy = convolve_cols(ctx, scratch, &r1, w, h, &k1);
-        let gx = convolve_cols(ctx, scratch, &r1, w, h, &k0);
-        let gy = convolve_cols(ctx, scratch, &r0, w, h, &k1);
+        FilterPlan::new(w, &k0).horizontal(ctx, scratch, luma, &mut r0);
+        FilterPlan::new(w, &k1).horizontal(ctx, scratch, luma, &mut r1);
+        FilterPlan::new(w, &k2).horizontal(ctx, scratch, luma, &mut r2);
+        let v0 = FilterPlan::new(h, &k0);
+        let v1 = FilterPlan::new(h, &k1);
+        let v2 = FilterPlan::new(h, &k2);
         let s2 = s * s;
         let bands = (ctx.thread_pool.num_threads().max(1) * 4).min(h).max(1);
         let band_len = h.div_ceil(bands) * w;
@@ -226,46 +142,77 @@ fn ridge_map(
                 },
             )
             .collect();
-        let (hxx, hyy, hxy, gx, gy) = (&hxx, &hyy, &hxy, &gx, &gy);
+
         ctx.thread_pool
             .steal_for_each_mut(scratch, &mut items, |_, band, _| {
-                for k in 0..band.strength.len() {
-                    let i = band.start + k;
-                    let tr = 0.5 * (hxx[i] + hyy[i]);
-                    let df = ((0.5 * (hxx[i] - hyy[i])).powi(2) + hxy[i] * hxy[i]).sqrt();
-                    let (la, lb) = (tr + df, tr - df);
-                    let (big, small) = if la.abs() > lb.abs() {
-                        (la, lb)
-                    } else {
-                        (lb, la)
-                    };
-                    let strength = s2 * (big.abs() - ALONG_PENALTY * small.abs()).max(0.0);
-                    if strength <= band.strength[k] {
-                        continue;
+                // Consume derivative rows immediately instead of materializing
+                // five full-image planes. Horizontal passes remain first, so
+                // floating-point accumulation matches the original detector.
+                let mut derivatives = vec![0.0; 5 * w];
+                let (hxx, rest) = derivatives.split_at_mut(w);
+                let (hyy, rest) = rest.split_at_mut(w);
+                let (hxy, rest) = rest.split_at_mut(w);
+                let (gx, gy) = rest.split_at_mut(w);
+                let rows = band
+                    .strength
+                    .chunks_exact_mut(w)
+                    .zip(band.nx.chunks_exact_mut(w))
+                    .zip(band.ny.chunks_exact_mut(w))
+                    .zip(band.scale.chunks_exact_mut(w))
+                    .zip(band.polarity.chunks_exact_mut(w))
+                    .zip(band.offset.chunks_exact_mut(w));
+                for (row, outputs) in rows.enumerate() {
+                    let y = band.start / w + row;
+                    v0.vertical_row(&r2, w, y, hxx);
+                    v2.vertical_row(&r0, w, y, hyy);
+                    v1.vertical_row(&r1, w, y, hxy);
+                    v0.vertical_row(&r1, w, y, gx);
+                    v1.vertical_row(&r0, w, y, gy);
+                    let (((((strengths, nx), ny), scales), polarities), offsets) = outputs;
+                    let hessian = hxx.iter().zip(hyy.iter()).zip(hxy.iter());
+                    let gradients = gx.iter().zip(gy.iter());
+                    let normals = nx.iter_mut().zip(ny);
+                    let attributes = scales.iter_mut().zip(polarities).zip(offsets);
+                    let outputs = strengths.iter_mut().zip(normals).zip(attributes);
+                    for (derivatives, output) in hessian.zip(gradients).zip(outputs) {
+                        let (((&hxx, &hyy), &hxy), (&gx, &gy)) = derivatives;
+                        let ((best, (nx, ny)), ((scale, polarity), offset)) = output;
+                        let tr = 0.5 * (hxx + hyy);
+                        let df = ((0.5 * (hxx - hyy)).powi(2) + hxy * hxy).sqrt();
+                        let (la, lb) = (tr + df, tr - df);
+                        let (big, small) = if la.abs() > lb.abs() {
+                            (la, lb)
+                        } else {
+                            (lb, la)
+                        };
+                        let strength = s2 * (big.abs() - ALONG_PENALTY * small.abs()).max(0.0);
+                        if strength <= *best {
+                            continue;
+                        }
+                        // a line center has ~zero gradient, a step edge does not
+                        if s * fast_hypot(gx, gy) > s2 * big.abs() {
+                            continue;
+                        }
+                        let (mut vx, mut vy) = (hxy, big - hxx);
+                        let norm = fast_hypot(vx, vy);
+                        if norm < 1e-12 {
+                            (vx, vy) = (1.0, 0.0);
+                        } else {
+                            (vx, vy) = (vx / norm, vy / norm);
+                        }
+                        let t = if big.abs() < 1e-12 {
+                            0.0
+                        } else {
+                            (-(gx * vx + gy * vy) / big)
+                                .clamp(-MAX_SUBPIXEL_OFFSET, MAX_SUBPIXEL_OFFSET)
+                        };
+                        *best = strength;
+                        *nx = vx;
+                        *ny = vy;
+                        *scale = s;
+                        *polarity = if big > 0.0 { -1 } else { 1 };
+                        *offset = t;
                     }
-                    // a line center has ~zero gradient, a step edge does not
-                    if s * fast_hypot(gx[i], gy[i]) > s2 * big.abs() {
-                        continue;
-                    }
-                    let (mut vx, mut vy) = (hxy[i], big - hxx[i]);
-                    let norm = fast_hypot(vx, vy);
-                    if norm < 1e-12 {
-                        (vx, vy) = (1.0, 0.0);
-                    } else {
-                        (vx, vy) = (vx / norm, vy / norm);
-                    }
-                    let t = if big.abs() < 1e-12 {
-                        0.0
-                    } else {
-                        (-(gx[i] * vx + gy[i] * vy) / big)
-                            .clamp(-MAX_SUBPIXEL_OFFSET, MAX_SUBPIXEL_OFFSET)
-                    };
-                    band.strength[k] = strength;
-                    band.nx[k] = vx;
-                    band.ny[k] = vy;
-                    band.scale[k] = s;
-                    band.polarity[k] = if big > 0.0 { -1 } else { 1 };
-                    band.offset[k] = t;
                 }
             });
     }
@@ -276,7 +223,7 @@ fn ridge_map(
 fn bilinear(plane: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
-    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x0, y0) = (x as usize, y as usize);
     let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
     let (fx, fy) = (x - x0 as f32, y - y0 as f32);
     let top = plane[y0 * w + x0] * (1.0 - fx) + plane[y0 * w + x1] * fx;
@@ -487,9 +434,9 @@ mod tests {
         for threads in [1, 4] {
             let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
             let mut scratch = Box::<CoderScratch>::default();
-            for (w, h) in [(7, 3), (31, 19)] {
+            for (w, h) in [(1, 1), (1, 9), (9, 1), (7, 3), (16, 4), (31, 19), (64, 65)] {
                 let src: Vec<_> = (0..w * h).map(|i| (i % 37) as f32 * 0.013 - 0.2).collect();
-                for sigma in [0.7, 1.5] {
+                for sigma in [0.7, 1.0, 1.5, 2.2, 3.0] {
                     for kernel in gaussian_kernels(sigma) {
                         let radius = kernel.len() / 2;
                         let mut rows = vec![0f32; w * h];
@@ -504,8 +451,15 @@ mod tests {
                                 }
                             }
                         }
-                        assert_eq!(convolve_rows(&ctx, &mut scratch, &src, w, h, &kernel), rows);
-                        assert_eq!(convolve_cols(&ctx, &mut scratch, &src, w, h, &kernel), cols);
+                        let mut actual = vec![f32::NAN; w * h];
+                        let horizontal = FilterPlan::new(w, &kernel);
+                        let vertical = FilterPlan::new(h, &kernel);
+                        horizontal.horizontal(&ctx, &mut scratch, &src, &mut actual);
+                        assert_eq!(actual, rows);
+                        vertical.vertical(&ctx, &mut scratch, &src, &mut actual);
+                        assert_eq!(actual, cols);
+                        horizontal.horizontal(&ctx, &mut scratch, &src, &mut actual);
+                        assert_eq!(actual, rows, "reused destination must be overwritten");
                     }
                 }
             }

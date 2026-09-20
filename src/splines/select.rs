@@ -29,7 +29,7 @@
 
 //! Greedy RD acceptance of spline candidates with the encoder's own coefficient
 //! rate model on the blocks each spline touches (DCT8 proxy, real quant field).
-//! Alternative parametrisations of a candidate compete; the spline side is
+//! Alternative parametriяations of a candidate compete; the spline side is
 //! priced with an adaptive token-cost model refined over two passes.
 
 use super::fit::Candidate;

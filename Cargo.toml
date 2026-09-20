@@ -18,11 +18,12 @@ exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*", "/too
 rust-version = "1.94.0"
 
 [features]
-default = ["avx", "neon", "sse", "wasm"]
+default = ["avx", "neon", "sse", "wasm", "splines"]
 avx = []
 neon = []
 sse = []
 wasm = []
+splines = []
 
 [profile.profiling]
 inherits = "release"

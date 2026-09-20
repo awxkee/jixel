@@ -301,6 +301,8 @@ pub struct EncodeConfig {
     /// Every spline passes a rate-distortion test against the VarDCT cost of
     /// the same pixels. Slow speed and the default decoding speed only; costs
     /// encode time and some decode time.
+    /// Requires the `splines` Cargo feature. Defaults to false.
+    #[cfg(feature = "splines")]
     pub splines: bool,
     /// Number of VarDCT passes for **lossy** progressive encoding. `None` falls
     /// back to `progressive` (2 passes if set, else 1). `Some(1)` = single pass;
@@ -377,6 +379,7 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) lossless: bool,
     pub(crate) progressive: bool,
     pub(crate) patches: bool,
+    #[cfg(feature = "splines")]
     pub(crate) splines: bool,
     /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
     pub(crate) progressive_passes: Option<u32>,
@@ -414,6 +417,7 @@ impl Default for EncodeConfig {
             lossless: false,
             progressive: false,
             patches: false,
+            #[cfg(feature = "splines")]
             splines: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -447,6 +451,7 @@ impl Default for EncodeConfigImpl {
             lossless: false,
             progressive: false,
             patches: false,
+            #[cfg(feature = "splines")]
             splines: false,
             grayscale: false,
             progressive_passes: None,
@@ -533,6 +538,7 @@ impl EncodeConfigImpl {
         self
     }
 
+    #[cfg(feature = "splines")]
     pub(crate) fn with_splines(mut self, splines: bool) -> Self {
         self.splines = splines;
         self
@@ -550,9 +556,12 @@ impl EncodeConfigImpl {
 
     /// Copy all lossy-progressive settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
-        self.with_progressive(config.progressive)
+        #[cfg(feature = "splines")]
+        let this = self.with_splines(config.splines);
+        #[cfg(not(feature = "splines"))]
+        let this = self;
+        this.with_progressive(config.progressive)
             .with_patches(config.patches)
-            .with_splines(config.splines)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
@@ -698,6 +707,8 @@ impl EncodeConfig {
     }
 
     /// Experimental spline coding for lossy VarDCT (see [`EncodeConfig::splines`]).
+    /// Requires the `splines` Cargo feature.
+    #[cfg(feature = "splines")]
     pub fn with_splines(mut self, splines: bool) -> Self {
         self.splines = splines;
         self
@@ -790,9 +801,12 @@ fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
-    ctx.splines = config.splines
-        && config.speed == Speed::Slow
-        && config.decoding_speed == DecodingSpeed::Slow;
+    #[cfg(feature = "splines")]
+    {
+        ctx.splines = config.splines
+            && config.speed == Speed::Slow
+            && config.decoding_speed == DecodingSpeed::Slow;
+    }
     ctx
 }
 
@@ -2785,6 +2799,7 @@ mod encode_smoke_tests {
 
     /// Thin anti-aliased dark curves on a smooth gradient: the content class
     /// splines exist for.
+    #[cfg(feature = "splines")]
     fn line_art(size: usize) -> Vec<u8> {
         let mut px = vec![0u8; size * size * 3];
         for y in 0..size {
@@ -2806,6 +2821,7 @@ mod encode_smoke_tests {
         px
     }
 
+    #[cfg(feature = "splines")]
     fn slow_lossy(distance: f32) -> EncodeConfig {
         EncodeConfig::default()
             .with_distance(distance)
@@ -2813,6 +2829,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    #[cfg(feature = "splines")]
     fn splines_reduce_thin_line_art() {
         const S: usize = 256;
         let pixels = line_art(S);
@@ -2827,6 +2844,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    #[cfg(feature = "splines")]
     fn splines_are_inert_without_lines() {
         const S: usize = 128;
         let mut pixels = vec![0u8; S * S * 3];
@@ -2844,6 +2862,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    #[cfg(feature = "splines")]
     fn splines_only_run_at_slow_speed_and_default_decoding_speed() {
         const S: usize = 256;
         let pixels = line_art(S);
@@ -2862,6 +2881,7 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    #[cfg(feature = "splines")]
     fn splines_coexist_with_patches() {
         const S: usize = 256;
         let pixels = line_art(S);

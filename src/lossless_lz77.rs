@@ -1956,7 +1956,7 @@ mod tests {
                 let stream: Vec<_> = (0..n)
                     .map(|i| match pattern {
                         0 => LzToken::pixel(0, 0),
-                        1 => LzToken::pixel(i % 3, (i * 137 ^ (i >> 3)) & 65_535),
+                        1 => LzToken::pixel(i % 3, ((i * 137) ^ (i >> 3)) & 65_535),
                         _ if i % 3 == 0 => LzToken::lz77(i % 2, i * 53, 1 + i * 97),
                         _ => LzToken::pixel(i % 3, i & 255),
                     })
@@ -2164,7 +2164,7 @@ mod tests {
                         2 => Token::new((i / 47 % 3) as u32, (i / 47) as u32),
                         _ => Token::new(
                             (i % 3) as u32,
-                            ((i * 137 ^ (i / 7)) as u32) & CompactToken::MAX_VALUE,
+                            (((i * 137) ^ (i / 7)) as u32) & CompactToken::MAX_VALUE,
                         ),
                     })
                     .collect();

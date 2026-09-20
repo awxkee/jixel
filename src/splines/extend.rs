@@ -33,7 +33,7 @@
 //! are sent to fitting; all original candidates keep their original targets.
 
 use super::detect::Chain;
-use super::{Point, fast_hypot};
+use super::{Point, fast_hypot, round_isize};
 use crate::coder_scratch::CoderScratch;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
@@ -237,7 +237,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
 
 fn mark(occupied: &mut [bool], w: usize, h: usize, points: &[Point<f32>]) {
     for p in points {
-        let (x, y) = (p.x.round() as isize, p.y.round() as isize);
+        let (x, y) = (round_isize(p.x), round_isize(p.y));
         for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
             let (xx, yy) = (x + dx, y + dy);
             if xx >= 0 && yy >= 0 && xx < w as isize && yy < h as isize {
@@ -250,7 +250,7 @@ fn novelty(occupied: &[bool], w: usize, h: usize, points: &[Point<f32>]) -> usiz
     points
         .iter()
         .filter(|p| {
-            let (x, y) = (p.x.round() as isize, p.y.round() as isize);
+            let (x, y) = (round_isize(p.x), round_isize(p.y));
             x >= 0
                 && y >= 0
                 && x < w as isize

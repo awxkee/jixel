@@ -6272,7 +6272,7 @@ mod context_tree_tests {
             for width in [0, 1, 2, 3, 4, 5, 9, 257] {
                 for height in [0, 1, 2, 3, 17] {
                     let values: Vec<i32> = (0..width * height)
-                        .map(|i| ((i * 7919 ^ (i / 7 * 1237)) % 65536) as i32 - 32768)
+                        .map(|i| (((i * 7919) ^ (i / 7 * 1237)) % 65536) as i32 - 32768)
                         .collect();
                     let get_row = |y| &values[y * width..][..width];
                     for use_wp in [false, true] {

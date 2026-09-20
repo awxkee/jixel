@@ -38,6 +38,7 @@
 
 mod detect;
 mod extend;
+mod filter;
 mod fit;
 mod lines;
 mod select;
@@ -91,16 +92,26 @@ impl Point<i32> {
     }
 }
 
-/// Signed coordinates and color residuals need the half offset in both directions.
+/// Prepare ties-away rounding for a truncating float-to-integer cast.
 #[inline]
-fn round_i32(value: f32) -> i32 {
+fn biased_for_rounding(value: f32) -> f32 {
     // Adding half would round the float immediately below 0.5 up to 1.0;
     // at 2^23 and above, f32 values are already integral.
     if value.abs() < 0.5 || value.abs() >= 8_388_608.0 {
-        value as i32
+        value
     } else {
-        (value + 0.5f32.copysign(value)) as i32
+        value + 0.5f32.copysign(value)
     }
+}
+
+#[inline]
+fn round_i32(value: f32) -> i32 {
+    biased_for_rounding(value) as i32
+}
+
+#[inline]
+fn round_isize(value: f32) -> isize {
+    biased_for_rounding(value) as isize
 }
 
 #[inline]
@@ -316,12 +327,14 @@ pub(crate) fn render_spline(
     if arc <= 0.0 {
         return None;
     }
+    let continuous_idct = transform::selected_continuous_idct();
     let mut touched: Option<PixelBox> = None;
     for (k, sample) in samples.iter().enumerate() {
         let Point { x: cx, y: cy } = sample.position;
         let mult = sample.multiplier;
         let t = 31.0 * (k as f32 / arc).min(1.0);
-        let [x, y, b, sigma] = transform::continuous_idct(&dct, t);
+        // SAFETY: the selector checked the kernel's CPU features before this loop.
+        let [x, y, b, sigma] = unsafe { continuous_idct(&dct, t) };
         let color = [x, y, b];
         if !(sigma.is_finite() && sigma != 0.0 && (1.0 / sigma).is_finite()) {
             continue;
@@ -534,9 +547,18 @@ mod tests {
             1.5,
             8_388_607.5,
             8_388_609.0,
+            2_147_483_648.0,
+            9_223_372_036_854_775_808.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::NAN,
         ] {
             for value in [value, -value] {
-                assert_eq!(round_i32(value), value.round() as i32);
+                for value in [value.next_down(), value, value.next_up()] {
+                    assert_eq!(round_i32(value), value.round() as i32);
+                    assert_eq!(round_isize(value), value.round() as isize);
+                }
             }
         }
     }

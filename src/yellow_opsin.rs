@@ -971,7 +971,7 @@ mod tests {
         let mut edged = filled(64, 64, [0.0, 0.0, 0.0]);
         for y in (0..64).step_by(SAMPLE_STRIDE) {
             for x in (0..64).step_by(SAMPLE_STRIDE) {
-                let rgb = if (x / SAMPLE_STRIDE + y / SAMPLE_STRIDE) % 4 == 0 {
+                let rgb = if (x / SAMPLE_STRIDE + y / SAMPLE_STRIDE).is_multiple_of(4) {
                     [0.9, 0.85, 0.05]
                 } else {
                     [0.5, 0.0, 0.0]

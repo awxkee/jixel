@@ -1753,7 +1753,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
-            if seed % 4 == 0 {
+            if seed.is_multiple_of(4) {
                 special[seed as usize % special.len()]
             } else {
                 f32::from_bits(seed)

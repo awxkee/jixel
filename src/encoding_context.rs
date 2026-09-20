@@ -58,6 +58,7 @@ pub(crate) struct EncodingContext {
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
     /// Experimental spline coding (see `EncodeConfig::splines`).
+    #[cfg(feature = "splines")]
     pub(crate) splines: bool,
     pub(crate) xyb: xyb::XybMatrix,
     /// Cached with the matrix, including a later adaptive yellow selection.
@@ -256,6 +257,7 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             lossy_modular: crate::LossyModular::Off,
+            #[cfg(feature = "splines")]
             splines: false,
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),

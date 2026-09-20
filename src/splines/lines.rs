@@ -31,7 +31,7 @@
 //! fragments: it breaks at every crossing, where its contrast dips, and where
 //! its polarity flips against a changing background. Fragments lying on one
 //! common line are grouped here, whatever their polarity and however wide the
-//! gaps, and handed to the fitter as one chain; the colour DCT can vanish in
+//! gaps, and handed to the fitter as one chain; the color DCT can vanish in
 //! the gaps and change sign along the way.
 
 use super::Point;
