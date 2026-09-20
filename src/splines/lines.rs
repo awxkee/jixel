@@ -164,6 +164,144 @@ fn join(chains: &[Chain], members: &[usize]) -> Chain {
     }
 }
 
+// Avoid index construction for small fragment sets.
+const INDEX_MIN_FRAGMENTS: usize = 256;
+const ENDPOINT_LEAF_SIZE: usize = 16;
+
+struct Endpoint {
+    point: Point<f32>,
+    fragment: usize,
+}
+
+struct EndpointNode {
+    min: Point<f32>,
+    max: Point<f32>,
+    range: std::ops::Range<usize>,
+    /// Zero for a leaf; the left child immediately follows its parent.
+    right: usize,
+}
+
+struct EndpointIndex {
+    endpoints: Vec<Endpoint>,
+    nodes: Vec<EndpointNode>,
+}
+
+impl EndpointIndex {
+    fn new(chains: &[Chain], fragments: &[Fragment]) -> Option<Self> {
+        if fragments.len() < INDEX_MIN_FRAGMENTS {
+            return None;
+        }
+        let mut endpoints = Vec::with_capacity(2 * fragments.len());
+        for (fragment, f) in fragments.iter().enumerate() {
+            let points = &chains[f.index].points;
+            for point in [points[0], points[points.len() - 1]] {
+                if !point.x.is_finite() || !point.y.is_finite() {
+                    return None;
+                }
+                endpoints.push(Endpoint { point, fragment });
+            }
+        }
+        let mut index = Self {
+            endpoints,
+            nodes: Vec::new(),
+        };
+        index.build(0..index.endpoints.len());
+        Some(index)
+    }
+
+    fn build(&mut self, range: std::ops::Range<usize>) -> usize {
+        let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for e in &self.endpoints[range.clone()] {
+            min = Point::new(min.x.min(e.point.x), min.y.min(e.point.y));
+            max = Point::new(max.x.max(e.point.x), max.y.max(e.point.y));
+        }
+        let node = self.nodes.len();
+        self.nodes.push(EndpointNode {
+            min,
+            max,
+            range: range.clone(),
+            right: 0,
+        });
+        if range.len() > ENDPOINT_LEAF_SIZE {
+            let split = range.start + range.len() / 2;
+            let coord = |p: Point<f32>| {
+                if max.x - min.x >= max.y - min.y {
+                    p.x
+                } else {
+                    p.y
+                }
+            };
+            self.endpoints[range.clone()].select_nth_unstable_by(range.len() / 2, |a, b| {
+                coord(a.point).total_cmp(&coord(b.point))
+            });
+            self.build(range.start..split);
+            self.nodes[node].right = self.build(split..range.end);
+        }
+        node
+    }
+
+    fn candidates(&self, line: &Line, lo: f32, hi: f32, out: &mut Vec<usize>) {
+        out.clear();
+        self.collect(0, line, lo, hi, out);
+        // Original fragment rank resolves equal-gap ties, independent of tree order.
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    fn collect(&self, node_index: usize, line: &Line, lo: f32, hi: f32, out: &mut Vec<usize>) {
+        let node = &self.nodes[node_index];
+        // Bound the exact f32 expressions used by along/across. Each subtraction,
+        // multiplication and addition is monotone: choosing the appropriate box
+        // corners gives conservative bounds without inverse projections or epsilons.
+        let (x0, x1) = if line.dir.x >= 0.0 {
+            (node.min.x, node.max.x)
+        } else {
+            (node.max.x, node.min.x)
+        };
+        let (y0, y1) = if line.dir.y >= 0.0 {
+            (node.min.y, node.max.y)
+        } else {
+            (node.max.y, node.min.y)
+        };
+        let amin = line.along(Point::new(x0, y0));
+        let amax = line.along(Point::new(x1, y1));
+        let (x0, x1) = if line.dir.y >= 0.0 {
+            (node.max.x, node.min.x)
+        } else {
+            (node.min.x, node.max.x)
+        };
+        let (y0, y1) = if line.dir.x >= 0.0 {
+            (node.min.y, node.max.y)
+        } else {
+            (node.max.y, node.min.y)
+        };
+        let cmin = line.across(Point::new(x0, y0));
+        let cmax = line.across(Point::new(x1, y1));
+        // Retain uncertain bounds (for example overflow on artificial inputs).
+        if ![amin, amax, cmin, cmax].iter().any(|v| v.is_nan()) {
+            // gap = max(a-hi, lo-b) can pass only if at least one endpoint
+            // lies in one of these intervals; placement still checks all probes.
+            let near_hi = amax - hi >= -MAX_OVERLAP && amin - hi <= MAX_GAP;
+            let near_lo = lo - amin >= -MAX_OVERLAP && lo - amax <= MAX_GAP;
+            if cmin > MAX_OFFSET || cmax < -MAX_OFFSET || !(near_hi || near_lo) {
+                return;
+            }
+        }
+        if node.right == 0 {
+            out.extend(
+                self.endpoints[node.range.clone()]
+                    .iter()
+                    .map(|e| e.fragment),
+            );
+        } else {
+            // Nodes are stored in preorder; the left child follows this node.
+            self.collect(node_index + 1, line, lo, hi, out);
+            self.collect(node.right, line, lo, hi, out);
+        }
+    }
+}
+
 /// Long straight lines among `chains`: groups of collinear fragments, plus long
 /// straight chains that found no partner.
 pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
@@ -173,6 +311,8 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
         .filter_map(|(i, c)| straight_fragment(i, c))
         .collect();
     fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
+    let index = EndpointIndex::new(chains, &fragments);
+    let mut candidates = Vec::new();
     let mut used = vec![false; chains.len()];
     let mut lines = Vec::new();
     for seed in 0..fragments.len() {
@@ -189,14 +329,14 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
                 (lo, hi) = (lo.min(a), hi.max(b));
             }
             let mut nearest: Option<(f32, usize)> = None;
-            for fragment in &fragments {
+            let mut consider = |fragment: &Fragment| {
                 let j = fragment.index;
                 if used[j] || members.contains(&j) {
-                    continue;
+                    return;
                 }
                 let cos = line.dir.x * fragment.line.dir.x + line.dir.y * fragment.line.dir.y;
                 if cos.abs() < MIN_DIRECTION_COS {
-                    continue;
+                    return;
                 }
                 let (a, b, offset) = placement(&line, &chains[j]);
                 let gap = (a - hi).max(lo - b);
@@ -206,6 +346,14 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
                 {
                     nearest = Some((gap, j));
                 }
+            };
+            if let Some(index) = &index {
+                index.candidates(&line, lo, hi, &mut candidates);
+                for &rank in &candidates {
+                    consider(&fragments[rank]);
+                }
+            } else {
+                fragments.iter().for_each(consider);
             }
             match nearest {
                 Some((_, j)) => members.push(j),
@@ -230,6 +378,66 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
 mod tests {
     use super::*;
 
+    fn find_long_lines_reference(chains: &[Chain]) -> Vec<Chain> {
+        let mut fragments: Vec<Fragment> = chains
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| straight_fragment(i, c))
+            .collect();
+        fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
+        let mut used = vec![false; chains.len()];
+        let mut lines = Vec::new();
+        for seed in 0..fragments.len() {
+            let seed_index = fragments[seed].index;
+            if used[seed_index] {
+                continue;
+            }
+            let mut members = vec![seed_index];
+            loop {
+                let line = Line::through(members.iter().flat_map(|&m| chains[m].points.iter()));
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &m in &members {
+                    let (a, b, _) = placement(&line, &chains[m]);
+                    (lo, hi) = (lo.min(a), hi.max(b));
+                }
+                let mut nearest: Option<(f32, usize)> = None;
+                for fragment in &fragments {
+                    let j = fragment.index;
+                    if used[j] || members.contains(&j) {
+                        continue;
+                    }
+                    let cos = line.dir.x * fragment.line.dir.x + line.dir.y * fragment.line.dir.y;
+                    if cos.abs() < MIN_DIRECTION_COS {
+                        continue;
+                    }
+                    let (a, b, offset) = placement(&line, &chains[j]);
+                    let gap = (a - hi).max(lo - b);
+                    if offset <= MAX_OFFSET
+                        && (-MAX_OVERLAP..=MAX_GAP).contains(&gap)
+                        && nearest.is_none_or(|(g, _)| gap < g)
+                    {
+                        nearest = Some((gap, j));
+                    }
+                }
+                match nearest {
+                    Some((_, j)) => members.push(j),
+                    None => break,
+                }
+            }
+            if members.len() >= 2 {
+                members.iter().for_each(|&m| used[m] = true);
+                lines.push(join(chains, &members));
+            } else if chains[seed_index].points.len() >= MIN_SINGLE {
+                used[seed_index] = true;
+                lines.push(Chain {
+                    points: chains[seed_index].points.clone(),
+                    scale: chains[seed_index].scale,
+                });
+            }
+        }
+        lines
+    }
+
     fn segment(x0: f32, x1: f32, y: f32, slope: f32) -> Chain {
         let n = (x1 - x0).abs() as usize;
         let step = if x1 >= x0 { 1.0 } else { -1.0 };
@@ -240,6 +448,134 @@ mod tests {
             })
             .collect();
         Chain { points, scale: 1.0 }
+    }
+
+    fn assert_same_lines(actual: &[Chain], expected: &[Chain]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert_eq!(a.scale.to_bits(), b.scale.to_bits());
+            assert_eq!(a.points.len(), b.points.len());
+            for (a, b) in a.points.iter().zip(&b.points) {
+                assert_eq!(
+                    (a.x.to_bits(), a.y.to_bits()),
+                    (b.x.to_bits(), b.y.to_bits())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_joining_preserves_original_groups_order_and_geometry() {
+        for shift in [0.0, 16_777_216.0] {
+            let mut chains = Vec::new();
+            for row in 0..40 {
+                for col in 0..9 {
+                    let x = (col * 135) as f32;
+                    let mut chain = segment(x, x + 30.0 + (col % 3) as f32, 30.0 * row as f32, 0.0);
+                    for p in &mut chain.points {
+                        // Mix horizontal, vertical, and both diagonal directions.
+                        let (x, y) = (p.x, p.y);
+                        *p = match row % 4 {
+                            0 => Point::new(x + shift, y + shift),
+                            1 => Point::new(y + shift, x + shift),
+                            2 => Point::new(0.8 * x - 0.6 * y + shift, 0.6 * x + 0.8 * y + shift),
+                            _ => Point::new(0.6 * x + 0.8 * y + shift, -0.8 * x + 0.6 * y + shift),
+                        };
+                    }
+                    if (row + col) % 2 == 0 {
+                        chain.points.reverse();
+                    }
+                    chain.scale = 0.7 + (col % 4) as f32 * 0.3;
+                    chains.push(chain);
+                }
+            }
+            // Equal-gap alternatives must retain stable fragment rank.
+            chains.extend([
+                segment(0.0, 30.0, -50.0, 0.0),
+                segment(60.0, 90.0, -49.0, 0.0),
+                segment(60.0, 90.0, -51.0, 0.0),
+            ]);
+            assert_same_lines(
+                &find_long_lines(&chains),
+                &find_long_lines_reference(&chains),
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_queries_retain_boundary_candidates() {
+        let mut chains = Vec::new();
+        for gap in [-MAX_OVERLAP, MAX_GAP] {
+            for gap in [gap.next_down(), gap, gap.next_up()] {
+                for offset in [-MAX_OFFSET, MAX_OFFSET] {
+                    for offset in [offset.next_down(), offset, offset.next_up()] {
+                        chains.push(segment(40.0 + gap, 70.0 + gap, offset, 0.0));
+                        chains.push(segment(-30.0 - gap, -gap, offset, 0.0));
+                    }
+                }
+            }
+        }
+        // Keep an interior candidate when large-coordinate rounding moves all
+        // of an oblique line's offset-boundary probes outside the tolerance.
+        chains.push(segment(-30.0, 0.0, 0.0, 0.0));
+        while chains.len() < INDEX_MIN_FRAGMENTS {
+            let y = 1000.0 + chains.len() as f32 * 10.0;
+            chains.push(segment(0.0, 30.0, y, 0.0));
+        }
+        for shift in [
+            0.0,
+            16_777_216.0,
+            crate::encode_image::MAX_DIMENSION as f32 - 512.0,
+        ] {
+            for dir in [
+                Point::new(1.0, 0.0),
+                Point::new(-1.0, -0.0),
+                Point::new(0.0, 1.0),
+                Point::new(0.6, 0.8),
+                Point::new(-0.8, 0.6),
+            ] {
+                let line = Line {
+                    center: Point::new(shift, shift),
+                    dir,
+                };
+                let rotated: Vec<_> = chains
+                    .iter()
+                    .map(|chain| Chain {
+                        points: chain
+                            .points
+                            .iter()
+                            .map(|p| {
+                                Point::new(
+                                    shift + (p.x * dir.x - p.y * dir.y),
+                                    shift + (p.x * dir.y + p.y * dir.x),
+                                )
+                            })
+                            .collect(),
+                        scale: chain.scale,
+                    })
+                    .collect();
+                // Query correctness is independent of the fragment's line fit.
+                let fragments: Vec<_> = (0..rotated.len())
+                    .map(|index| Fragment { index, line })
+                    .collect();
+                let index = EndpointIndex::new(&rotated, &fragments).unwrap();
+                let mut candidates = Vec::new();
+                index.candidates(&line, 0.0, 40.0, &mut candidates);
+                let mut accepted = 0;
+                for (rank, fragment) in fragments.iter().enumerate() {
+                    let (a, b, offset) = placement(&line, &rotated[fragment.index]);
+                    let gap = (a - 40.0).max(-b);
+                    if offset <= MAX_OFFSET && (-MAX_OVERLAP..=MAX_GAP).contains(&gap) {
+                        accepted += 1;
+                        assert!(
+                            candidates.binary_search(&rank).is_ok(),
+                            "lost rank {rank}, gap {gap}, offset {offset}, shift {shift}"
+                        );
+                    }
+                }
+                assert!(accepted > 0);
+            }
+        }
     }
 
     #[test]

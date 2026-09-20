@@ -304,12 +304,13 @@ fn bilinear(plane: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
 fn ridge_mask(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
-    map: &RidgeMap,
+    map: &mut RidgeMap,
     w: usize,
     h: usize,
-) -> (Vec<bool>, Vec<u64>) {
-    let n = w * h;
-    let mut weak = vec![false; n];
+) -> (Vec<i8>, Vec<u64>) {
+    // Ridge evaluation is complete: reuse its polarity allocation as the mask.
+    let mut weak = std::mem::take(&mut map.polarity);
+    debug_assert_eq!(weak.len(), w * h);
     let band_rows = h.div_ceil(ctx.thread_pool.num_threads() * 4).max(1);
     let mut bands: Vec<_> = weak
         .chunks_mut(band_rows * w)
@@ -331,14 +332,18 @@ fn ridge_mask(
                 let pixels = weak.iter_mut().zip(strength).zip(nx.iter().zip(ny));
                 for (x, ((weak, &s), (&nx, &ny))) in pixels.enumerate() {
                     if s <= HYSTERESIS_LOW {
+                        *weak = 0;
                         continue;
                     }
                     let (fx, fy) = (x as f32, y as f32);
                     let a = bilinear(&map.strength, w, h, fx + nx, fy + ny);
                     let b = bilinear(&map.strength, w, h, fx - nx, fy - ny);
-                    *weak = s >= a && s >= b;
-                    if *weak && s > HYSTERESIS_HIGH {
-                        seeds.push(seed_key((y * w + x) as u32, s));
+                    if s >= a && s >= b {
+                        if s > HYSTERESIS_HIGH {
+                            seeds.push(seed_key((y * w + x) as u32, s));
+                        }
+                    } else {
+                        *weak = 0;
                     }
                 }
             }
@@ -398,56 +403,95 @@ static NEIGHBORS: [(isize, isize); 8] = [
     (1, 1),
 ];
 
-/// Greedy tangent-following walk over the available ridge pixels.
-fn walk(
-    map: &RidgeMap,
-    avail: &mut [bool],
+#[derive(Clone, Copy)]
+struct Neighbor {
+    dx: isize,
+    dy: isize,
+    index: isize,
+    norm: f32,
+    direction: (f32, f32),
+}
+
+/// Zero marks an unavailable pixel; otherwise the byte stores its polarity.
+/// Suppression still removes both polarities, as in the original walk.
+struct Tracer<'a> {
+    avail: &'a mut [i8],
     w: usize,
     h: usize,
-    start: (usize, usize),
-    mut tangent: (f32, f32),
-    polarity: i8,
-) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let (mut x, mut y) = (start.0 as isize, start.1 as isize);
-    loop {
-        let mut best: Option<(isize, isize, f32, f32)> = None;
-        let mut best_score = TRACE_MIN_COS;
-        for (dx, dy) in NEIGHBORS {
-            let (xx, yy) = (x + dx, y + dy);
-            if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize {
-                continue;
-            }
-            let j = yy as usize * w + xx as usize;
-            if !avail[j] || map.polarity[j] != polarity {
-                continue;
-            }
-            let norm = ((dx * dx + dy * dy) as f32).sqrt();
-            let score = (dx as f32 * tangent.0 + dy as f32 * tangent.1) / norm;
-            if score > best_score {
-                best_score = score;
-                best = Some((xx, yy, dx as f32 / norm, dy as f32 / norm));
-            }
+    neighbors: [Neighbor; 8],
+}
+
+impl<'a> Tracer<'a> {
+    fn new(avail: &'a mut [i8], w: usize, h: usize) -> Self {
+        Self {
+            avail,
+            w,
+            h,
+            neighbors: NEIGHBORS.map(|(dx, dy)| {
+                let norm = ((dx * dx + dy * dy) as f32).sqrt();
+                Neighbor {
+                    dx,
+                    dy,
+                    index: dy * w as isize + dx,
+                    norm,
+                    direction: (dx as f32 / norm, dy as f32 / norm),
+                }
+            }),
         }
-        let Some((nx_, ny_, ddx, ddy)) = best else {
-            return out;
-        };
-        // suppress the perpendicular neighbors of the pixel we leave
-        for (dx, dy) in NEIGHBORS {
-            let (xx, yy) = (x + dx, y + dy);
-            if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize || (xx, yy) == (nx_, ny_) {
-                continue;
+    }
+
+    /// Greedy tangent-following walk, retaining neighbor order and score division.
+    fn walk(
+        &mut self,
+        start: (usize, usize),
+        mut tangent: (f32, f32),
+        polarity: i8,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        out.clear();
+        let (mut x, mut y) = (start.0 as isize, start.1 as isize);
+        loop {
+            let center = y * self.w as isize + x;
+            let interior = x > 0 && y > 0 && x + 1 < self.w as isize && y + 1 < self.h as isize;
+            let in_bounds = |n: &Neighbor| {
+                interior
+                    || (x + n.dx >= 0
+                        && y + n.dy >= 0
+                        && x + n.dx < self.w as isize
+                        && y + n.dy < self.h as isize)
+            };
+            let mut best: Option<Neighbor> = None;
+            let mut best_score = TRACE_MIN_COS;
+            for &n in &self.neighbors {
+                if !in_bounds(&n) || self.avail[(center + n.index) as usize] != polarity {
+                    continue;
+                }
+                let score = (n.dx as f32 * tangent.0 + n.dy as f32 * tangent.1) / n.norm;
+                if score > best_score {
+                    best_score = score;
+                    best = Some(n);
+                }
             }
-            if (dx as f32 * tangent.0 + dy as f32 * tangent.1).abs() < 0.5 {
-                avail[yy as usize * w + xx as usize] = false;
+            let Some(next) = best else { return };
+            // Suppress perpendicular neighbors of the pixel we leave.
+            for n in &self.neighbors {
+                if in_bounds(n)
+                    && n.index != next.index
+                    && (n.dx as f32 * tangent.0 + n.dy as f32 * tangent.1).abs() < 0.5
+                {
+                    self.avail[(center + n.index) as usize] = 0;
+                }
             }
+            self.avail[(center + next.index) as usize] = 0;
+            (x, y) = (x + next.dx, y + next.dy);
+            out.push((x as usize, y as usize));
+            tangent = (
+                0.6 * tangent.0 + 0.4 * next.direction.0,
+                0.6 * tangent.1 + 0.4 * next.direction.1,
+            );
+            let norm = fast_hypot(tangent.0, tangent.1);
+            tangent = (tangent.0 / norm, tangent.1 / norm);
         }
-        avail[ny_ as usize * w + nx_ as usize] = false;
-        out.push((nx_ as usize, ny_ as usize));
-        tangent = (0.6 * tangent.0 + 0.4 * ddx, 0.6 * tangent.1 + 0.4 * ddy);
-        let norm = fast_hypot(tangent.0, tangent.1);
-        tangent = (tangent.0 / norm, tangent.1 / norm);
-        (x, y) = (nx_, ny_);
     }
 }
 
@@ -457,30 +501,24 @@ pub(super) fn detect_chains(
     xyb: &Image3F,
 ) -> Vec<Chain> {
     let (w, h) = (xyb.xsize(), xyb.ysize());
-    let map = ridge_map(ctx, scratch, xyb.plane_data(1), w, h);
-    let (mut avail, mut order) = ridge_mask(ctx, scratch, &map, w, h);
+    let mut map = ridge_map(ctx, scratch, xyb.plane_data(1), w, h);
+    let (mut avail, mut order) = ridge_mask(ctx, scratch, &mut map, w, h);
     sort_seeds(&mut order);
 
+    let mut tracer = Tracer::new(&mut avail, w, h);
+    let (mut forward, mut backward) = (Vec::new(), Vec::new());
     let mut chains = Vec::new();
     for entry in order {
         let i = entry as u32 as usize;
-        if !avail[i] {
+        let polarity = tracer.avail[i];
+        if polarity == 0 {
             continue;
         }
-        avail[i] = false;
+        tracer.avail[i] = 0;
         let start = (i % w, i / w);
         let tangent = (-map.ny[i], map.nx[i]);
-        let polarity = map.polarity[i];
-        let forward = walk(&map, &mut avail, w, h, start, tangent, polarity);
-        let backward = walk(
-            &map,
-            &mut avail,
-            w,
-            h,
-            start,
-            (-tangent.0, -tangent.1),
-            polarity,
-        );
+        tracer.walk(start, tangent, polarity, &mut forward);
+        tracer.walk(start, (-tangent.0, -tangent.1), polarity, &mut backward);
         if backward.len() + 1 + forward.len() < MIN_CHAIN_LEN {
             continue;
         }
@@ -529,6 +567,138 @@ pub(super) fn detect_chains(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greedy tangent-following walk over the available ridge pixels.
+    fn walk_reference(
+        map: &RidgeMap,
+        avail: &mut [bool],
+        w: usize,
+        h: usize,
+        start: (usize, usize),
+        mut tangent: (f32, f32),
+        polarity: i8,
+    ) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let (mut x, mut y) = (start.0 as isize, start.1 as isize);
+        loop {
+            let mut best: Option<(isize, isize, f32, f32)> = None;
+            let mut best_score = TRACE_MIN_COS;
+            for (dx, dy) in NEIGHBORS {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx < 0 || yy < 0 || xx >= w as isize || yy >= h as isize {
+                    continue;
+                }
+                let j = yy as usize * w + xx as usize;
+                if !avail[j] || map.polarity[j] != polarity {
+                    continue;
+                }
+                let norm = ((dx * dx + dy * dy) as f32).sqrt();
+                let score = (dx as f32 * tangent.0 + dy as f32 * tangent.1) / norm;
+                if score > best_score {
+                    best_score = score;
+                    best = Some((xx, yy, dx as f32 / norm, dy as f32 / norm));
+                }
+            }
+            let Some((nx_, ny_, ddx, ddy)) = best else {
+                return out;
+            };
+            // suppress the perpendicular neighbors of the pixel we leave
+            for (dx, dy) in NEIGHBORS {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx < 0
+                    || yy < 0
+                    || xx >= w as isize
+                    || yy >= h as isize
+                    || (xx, yy) == (nx_, ny_)
+                {
+                    continue;
+                }
+                if (dx as f32 * tangent.0 + dy as f32 * tangent.1).abs() < 0.5 {
+                    avail[yy as usize * w + xx as usize] = false;
+                }
+            }
+            avail[ny_ as usize * w + nx_ as usize] = false;
+            out.push((nx_ as usize, ny_ as usize));
+            tangent = (0.6 * tangent.0 + 0.4 * ddx, 0.6 * tangent.1 + 0.4 * ddy);
+            let norm = fast_hypot(tangent.0, tangent.1);
+            tangent = (tangent.0 / norm, tangent.1 / norm);
+            (x, y) = (nx_, ny_);
+        }
+    }
+
+    #[test]
+    fn packed_tracing_matches_reference_paths_and_suppression() {
+        let directions = [
+            (1.0, 0.0),
+            (-0.0, -1.0),
+            (0.6, 0.8),
+            (-0.8, 0.6),
+            (
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ),
+        ];
+        for (w, h) in [(1, 1), (1, 31), (31, 1), (2, 2), (17, 23), (64, 65)] {
+            for pattern in 0..4 {
+                let n = w * h;
+                let map = RidgeMap {
+                    strength: vec![1.0; n],
+                    nx: vec![0.0; n],
+                    ny: vec![1.0; n],
+                    scale: vec![1.0; n],
+                    offset: vec![0.0; n],
+                    polarity: (0..n)
+                        .map(|i| {
+                            if (i * 19 + i / w + pattern) % 7 < 3 {
+                                -1
+                            } else {
+                                1
+                            }
+                        })
+                        .collect(),
+                };
+                let mut expected: Vec<bool> = (0..n)
+                    .map(|i| pattern == 0 || (i * 37 + i / w) % 5 != pattern)
+                    .collect();
+                let mut actual: Vec<i8> = expected
+                    .iter()
+                    .zip(&map.polarity)
+                    .map(|(&v, &p)| if v { p } else { 0 })
+                    .collect();
+                let mut tracer = Tracer::new(&mut actual, w, h);
+                let mut out = Vec::new();
+                for i in (0..n).rev() {
+                    if !expected[i] {
+                        continue;
+                    }
+                    expected[i] = false;
+                    tracer.avail[i] = 0;
+                    let start = (i % w, i / w);
+                    let t = directions[i % directions.len()];
+                    for tangent in [t, (-t.0, -t.1)] {
+                        let reference = walk_reference(
+                            &map,
+                            &mut expected,
+                            w,
+                            h,
+                            start,
+                            tangent,
+                            map.polarity[i],
+                        );
+                        tracer.walk(start, tangent, map.polarity[i], &mut out);
+                        assert_eq!(out, reference, "shape {w}x{h}, pattern {pattern}, seed {i}");
+                        assert!(
+                            tracer
+                                .avail
+                                .iter()
+                                .zip(&expected)
+                                .all(|(&a, &e)| (a != 0) == e)
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ridge_kernel_matches_scalar_thresholds_tails_and_scale_ties() {
@@ -651,7 +821,7 @@ mod tests {
         for (w, h) in [(1, 1), (3, 17), (37, 31), (256, 257)] {
             let n = w * h;
             let normals = [(1.0, 0.0), (0.0, 1.0), (0.6, 0.8), (-0.8, 0.6)];
-            let map = RidgeMap {
+            let mut map = RidgeMap {
                 strength: (0..n)
                     .map(|i| match i % 13 {
                         0 => HYSTERESIS_LOW,
@@ -663,25 +833,32 @@ mod tests {
                 nx: (0..n).map(|i| normals[i % 4].0).collect(),
                 ny: (0..n).map(|i| normals[i % 4].1).collect(),
                 scale: vec![1.0; n],
-                polarity: vec![1; n],
+                polarity: (0..n).map(|i| if i % 3 == 0 { -1 } else { 1 }).collect(),
                 offset: vec![0.0; n],
             };
             let expected_mask: Vec<_> = (0..n)
                 .map(|i| {
                     let (x, y) = ((i % w) as f32, (i / w) as f32);
                     let (nx, ny, s) = (map.nx[i], map.ny[i], map.strength[i]);
-                    s > HYSTERESIS_LOW
+                    if s > HYSTERESIS_LOW
                         && s >= bilinear(&map.strength, w, h, x + nx, y + ny)
                         && s >= bilinear(&map.strength, w, h, x - nx, y - ny)
+                    {
+                        map.polarity[i]
+                    } else {
+                        0
+                    }
                 })
                 .collect();
             let expected_seeds: Vec<_> = (0..n)
-                .filter(|&i| expected_mask[i] && map.strength[i] > HYSTERESIS_HIGH)
+                .filter(|&i| expected_mask[i] != 0 && map.strength[i] > HYSTERESIS_HIGH)
                 .map(|i| seed_key(i as u32, map.strength[i]))
                 .collect();
+            let polarity = map.polarity.clone();
             for threads in [1, 4] {
+                map.polarity.clone_from(&polarity);
                 let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
-                let (mask, seeds) = ridge_mask(&ctx, &mut CoderScratch::default(), &map, w, h);
+                let (mask, seeds) = ridge_mask(&ctx, &mut CoderScratch::default(), &mut map, w, h);
                 assert_eq!(mask, expected_mask);
                 assert_eq!(seeds, expected_seeds);
             }
