@@ -38,6 +38,8 @@ mod lossless_grad;
 mod lz_match;
 mod quant;
 mod quantize_xyb;
+#[cfg(feature = "splines")]
+mod splines;
 mod xyb;
 mod ytob;
 
@@ -63,3 +65,6 @@ pub(crate) use quant::{quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc
 pub(crate) use quantize_xyb::{quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm};
 pub(crate) use xyb::to_xyb_wasm_band;
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
+
+#[cfg(feature = "splines")]
+pub(crate) use splines::continuous_idct_wasm;

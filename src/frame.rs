@@ -42,7 +42,7 @@ use crate::entropy::{
 };
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
-use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
+use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind};
 use crate::quant_weights::quant_table_slot_of;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
@@ -1465,30 +1465,237 @@ fn encode_frame_vardct(
         None
     };
     #[cfg(feature = "splines")]
-    let select_splines = |image: &mut Image3F, forbidden: Option<&[bool]>| {
-        let candidates = spline_candidates.as_ref()?;
-        crate::splines::select_splines(ctx, distance, image, &quant_field, candidates, forbidden)
-    };
+    let select_splines =
+        |scratch: &mut CoderScratch, image: &mut Image3F, forbidden: Option<&[bool]>| {
+            let candidates = spline_candidates.as_ref()?;
+            crate::splines::select_splines(
+                ctx,
+                scratch,
+                distance,
+                image,
+                &quant_field,
+                candidates,
+                forbidden,
+            )
+        };
 
-    if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
-        let mut regular = xyb.clone();
+    let near_tiles = distance.clamp(0.5, 4.0);
+    let glyph_plan = if patches {
+        let singles = distance <= GLYPH_SINGLETON_MAX_DISTANCE;
+        let coarse = if distance < 1.5 {
+            1
+        } else if distance < 2.0 {
+            2
+        } else if distance < 6.0 {
+            4
+        } else {
+            8
+        };
+        crate::patches::find_lossy_glyph_patches(
+            &xyb,
+            &crate::patches::GlyphParams {
+                min_occurrences: if singles { 1 } else { 2 },
+                min_repeat_pixels: if singles { 0 } else { GLYPH_MIN_REPEAT_PIXELS },
+                coarse,
+            },
+        )
+    } else {
+        None
+    };
+    if let Some(plan) = glyph_plan {
+        let mut patched_writer = BitWriter::new();
+        let atlas_alpha = zero_alpha_for_lossy(alpha, plan.atlas_width * plan.atlas_height);
+        crate::lossless::encode_modular_xyb_atlas_tree(
+            &plan.atlas,
+            plan.atlas_width,
+            plan.atlas_height,
+            atlas_alpha.as_ref(),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut patched_writer,
+        );
+
+        // Repeated tiles of what is left (icons, rules, UI chrome). They are
+        // Replace entries and must precede the additive glyph entries, which
+        // then land on top of the replaced rectangles.
+        let mut base = plan.base;
+        let mut references: Vec<crate::patches::PatchReference> = Vec::new();
+        {
+            let tiles16 = crate::patches::find_lossy_patches_sized(
+                &base,
+                crate::patches::PATCH_TILE,
+                near_tiles,
+                &ctx.thread_pool,
+                scratch,
+            );
+            let after16 = tiles16.as_ref().map_or(&base, |t| &t.base);
+            let tiles8 = crate::patches::find_lossy_patches_sized(
+                after16,
+                8,
+                near_tiles,
+                &ctx.thread_pool,
+                scratch,
+            );
+            let covered = tiles16
+                .as_ref()
+                .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
+                + tiles8
+                    .as_ref()
+                    .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+            if covered as f64 >= PATCH_TILE_MIN_COVER * (base.xsize() * base.ysize()) as f64 {
+                let mut tile_refs = Vec::new();
+                let mut tile_atlas: Option<Image3F> = None;
+                let mut next_base: Option<Image3F> = None;
+                if let Some(t) = tiles16 {
+                    let (atlas, refs) =
+                        crate::patches::pack_lossy_atlas(&base, t.groups, PATCH_REF_ID);
+                    tile_atlas = Some(atlas);
+                    tile_refs = refs;
+                    next_base = Some(t.base);
+                }
+                if let Some(t) = tiles8 {
+                    let source = next_base.as_ref().unwrap_or(&base);
+                    let (atlas8, mut refs8) =
+                        crate::patches::pack_lossy_atlas_sized(source, t.groups, 8, PATCH_REF_ID);
+                    tile_atlas = Some(match tile_atlas {
+                        Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
+                        None => atlas8,
+                    });
+                    tile_refs.extend(refs8);
+                    next_base = Some(t.base);
+                }
+                let tile_atlas = tile_atlas.expect("covered > 0");
+                let atlas_distance = distance * ATLAS_DISTANCE_SCALE;
+                let atlas_distp = compute_distance_params(atlas_distance);
+                let tile_alpha = zero_alpha_for_lossy(
+                    alpha,
+                    tile_atlas.xsize().saturating_mul(tile_atlas.ysize()),
+                );
+                let (atlas_w, atlas_h) = (tile_atlas.xsize(), tile_atlas.ysize());
+                let mut tile_atlas = tile_atlas;
+                gaborize(&mut tile_atlas, &atlas_distp);
+                encode_frame_core(
+                    ctx,
+                    scratch,
+                    atlas_distance,
+                    tile_atlas,
+                    tile_alpha.as_ref(),
+                    &[0],
+                    VarDctFrameKind::ReferenceOnly {
+                        width: atlas_w,
+                        height: atlas_h,
+                    },
+                    #[cfg(feature = "splines")]
+                    None,
+                    &mut patched_writer,
+                )?;
+                references.extend(tile_refs);
+                base = next_base.expect("covered > 0");
+            }
+        }
+        let atlas_bits = patched_writer.bits_written();
+        references.extend(plan.references);
+
+        // Additive glyph entries commute with splines; only the Replace tiles
+        // must stay clear of them.
         #[cfg(feature = "splines")]
-        let regular_splines = select_splines(&mut regular, None);
-        gaborize(&mut regular, distp);
-        let mut regular_writer = BitWriter::new();
+        let base_splines = if spline_candidates.is_some() {
+            let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
+            let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
+            for reference in references.iter().filter(|r| !r.add) {
+                for &(px, py) in &reference.positions {
+                    for by in py / K_BLOCK_DIM..(py + reference.height).div_ceil(K_BLOCK_DIM) {
+                        for bx in px / K_BLOCK_DIM..(px + reference.width).div_ceil(K_BLOCK_DIM) {
+                            in_patch[by * blocks_w + bx] = true;
+                        }
+                    }
+                }
+            }
+            select_splines(scratch, &mut base, Some(&in_patch))
+        } else {
+            None
+        };
+        gaborize(&mut base, distp);
         encode_frame_core(
             ctx,
             scratch,
             distance,
-            regular,
+            base,
             alpha,
             coeff_shifts,
-            VarDctFrameKind::Regular,
+            VarDctFrameKind::Patched(&references),
             #[cfg(feature = "splines")]
-            regular_splines.as_ref(),
-            &mut regular_writer,
+            base_splines.as_ref(),
+            &mut patched_writer,
         )?;
 
+        // The patched frame is the sharper one at equal distance, so it only
+        // has to defend its size where the atlas dominates a coarse frame.
+        let atlas_share = atlas_bits as f64 / patched_writer.bits_written() as f64;
+        if distance >= GLYPH_CHECK_MIN_DISTANCE && atlas_share > GLYPH_CHECK_ATLAS_SHARE {
+            let mut regular = xyb.clone();
+            #[cfg(feature = "splines")]
+            let regular_splines = select_splines(scratch, &mut regular, None);
+            gaborize(&mut regular, distp);
+            let mut regular_writer = BitWriter::new();
+            encode_frame_core(
+                ctx,
+                scratch,
+                distance,
+                regular,
+                alpha,
+                coeff_shifts,
+                VarDctFrameKind::Regular,
+                #[cfg(feature = "splines")]
+                regular_splines.as_ref(),
+                &mut regular_writer,
+            )?;
+            if patched_writer.bits_written() as f64
+                >= regular_writer.bits_written() as f64 * GLYPH_BITS_MARGIN
+            {
+                writer.append(&regular_writer);
+                return Ok(());
+            }
+        }
+        writer.append(&patched_writer);
+        return Ok(());
+    }
+
+    // Tile plans are taken on coverage alone: no second, regular encode.
+    let tile_plan = if patches {
+        let plan16 = crate::patches::find_lossy_patches_sized(
+            &xyb,
+            crate::patches::PATCH_TILE,
+            near_tiles,
+            &ctx.thread_pool,
+            scratch,
+        );
+        let after16 = plan16.as_ref().map_or(&xyb, |p| &p.base);
+        let tiles8 = crate::patches::find_lossy_patches_sized(
+            after16,
+            8,
+            near_tiles,
+            &ctx.thread_pool,
+            scratch,
+        );
+        let covered = plan16
+            .as_ref()
+            .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
+            + tiles8
+                .as_ref()
+                .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+        (covered as f64 >= PATCH_TILE_MIN_COVER * (xyb.xsize() * xyb.ysize()) as f64).then(|| {
+            let plan = plan16.unwrap_or_else(|| crate::patches::LossyPatches {
+                base: xyb.clone(),
+                groups: Vec::new(),
+            });
+            (plan, tiles8)
+        })
+    } else {
+        None
+    };
+    if let Some((plan, tiles8)) = tile_plan {
         // Route each patch group to the atlas that codes it best: groups whose
         // quantized tiles fit the running 256-color palette budget go to the
         // modular atlas (measured strictly dominant when the palette hits),
@@ -1591,14 +1798,28 @@ fn encode_frame_vardct(
             }
         }
 
+        let mut base = plan.base;
+        let mut vardct_atlas: Option<Image3F> = None;
         if !vardct_idx.is_empty() {
-            let (vardct_atlas, vardct_refs) =
+            let (atlas, vardct_refs) =
                 crate::patches::pack_lossy_atlas(&xyb, clone_groups(&vardct_idx), PATCH_REF_ID);
-            encode_vardct_atlas(vardct_atlas, scratch, &mut patched_writer)?;
+            vardct_atlas = Some(atlas);
             references.extend(vardct_refs);
         }
+        if let Some(t) = tiles8 {
+            let (atlas8, mut refs8) =
+                crate::patches::pack_lossy_atlas_sized(&base, t.groups, 8, PATCH_REF_ID);
+            vardct_atlas = Some(match vardct_atlas {
+                Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
+                None => atlas8,
+            });
+            references.extend(refs8);
+            base = t.base;
+        }
+        if let Some(atlas) = vardct_atlas {
+            encode_vardct_atlas(atlas, scratch, &mut patched_writer)?;
+        }
 
-        let mut base = plan.base;
         // Patches replace their rectangles and the decoder draws splines after
         // them, so no spline may reach into a patch.
         #[cfg(feature = "splines")]
@@ -1614,7 +1835,7 @@ fn encode_frame_vardct(
                     }
                 }
             }
-            select_splines(&mut base, Some(&in_patch))
+            select_splines(scratch, &mut base, Some(&in_patch))
         } else {
             None
         };
@@ -1631,16 +1852,12 @@ fn encode_frame_vardct(
             base_splines.as_ref(),
             &mut patched_writer,
         )?;
-        if patched_writer.bits_written() < regular_writer.bits_written() {
-            writer.append(&patched_writer);
-        } else {
-            writer.append(&regular_writer);
-        }
+        writer.append(&patched_writer);
         return Ok(());
     }
 
     #[cfg(feature = "splines")]
-    let splines = select_splines(&mut xyb, None);
+    let splines = select_splines(scratch, &mut xyb, None);
     gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
@@ -1692,6 +1909,19 @@ fn spline_quant_field(
     }
     Ok(field)
 }
+
+/// Unrepeated glyphs join the atlas up to this distance.
+const GLYPH_SINGLETON_MAX_DISTANCE: f32 = 1.0;
+/// Box pixels a repeated glyph must save beyond its first occurrence.
+const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
+/// A glyph plan is checked against the regular frame only from this distance
+/// and when the atlas frames take more than this share of the patched bits.
+const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
+const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
+/// Patched bits may exceed the regular frame's by this factor.
+const GLYPH_BITS_MARGIN: f64 = 1.10;
+/// Tile patches are used only when they cover this share of the frame.
+const PATCH_TILE_MIN_COVER: f64 = 0.03;
 
 /// Power-of-two refinement of the modular atlas quantization lattice.
 const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;

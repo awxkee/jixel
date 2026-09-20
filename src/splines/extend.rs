@@ -35,6 +35,7 @@
 use super::detect::Chain;
 use super::{Point, fast_hypot, round_isize};
 use crate::coder_scratch::CoderScratch;
+use crate::dct::fmla;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
 
@@ -56,7 +57,7 @@ const G: [f32; 7] = [
 
 #[inline]
 fn dot(a: Point<f32>, b: Point<f32>) -> f32 {
-    a.x * b.x + a.y * b.y
+    fmla(a.x, b.x, a.y * b.y)
 }
 #[inline]
 fn offset(p: Point<f32>, t: Point<f32>, d: f32) -> Point<f32> {
@@ -66,6 +67,7 @@ fn offset(p: Point<f32>, t: Point<f32>, d: f32) -> Point<f32> {
 fn normal(t: Point<f32>) -> Point<f32> {
     Point::new(-t.y, t.x)
 }
+
 #[inline]
 fn sample(data: &[f32], w: usize, h: usize, p: Point<f32>) -> f32 {
     let x = p.x.clamp(0.0, (w - 1) as f32);
@@ -77,12 +79,14 @@ fn sample(data: &[f32], w: usize, h: usize, p: Point<f32>) -> f32 {
     let b = data[jy * w + ix] * (1.0 - fx) + data[jy * w + jx] * fx;
     a * (1.0 - fy) + b * fy
 }
+
 fn profile(data: &[f32], w: usize, h: usize, p: Point<f32>, n: Point<f32>, sigma: f32) -> [f32; 7] {
     std::array::from_fn(|i| sample(data, w, h, offset(p, n, (i as f32 - 3.0) * sigma)))
 }
 fn amplitude(values: &[f32; 7]) -> f32 {
     values.iter().zip(G).map(|(&v, g)| v * g).sum::<f32>() / G.iter().map(|g| g * g).sum::<f32>()
 }
+
 fn explained(values: &[f32; 7]) -> f32 {
     let dc = values.iter().sum::<f32>() / 7.0;
     let slope = values
@@ -95,8 +99,9 @@ fn explained(values: &[f32; 7]) -> f32 {
     let (mut error, mut energy) = (0.0, 0.0);
     for i in 0..7 {
         let v = values[i] - dc - slope * (i as f32 - 3.0);
-        error += (v - a * G[i]).powi(2);
-        energy += v * v;
+        let jeta = fmla(a, -G[i], v);
+        error = fmla(jeta, jeta, error);
+        energy = fmla(v, v, energy);
     }
     1.0 - error / energy.max(1e-12)
 }
@@ -151,6 +156,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
     let mut extra = Vec::new();
     let mut pending = Vec::new();
     let (mut gaps, mut supported) = (0usize, 0usize);
+    const RCP_CHUNK: f32 = 1.0 / CHUNK as f32;
     for _ in 0..MAX_CHUNKS {
         let n = normal(t);
         let mut best: Option<(f32, Point<f32>, f32)> = None;
@@ -160,7 +166,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
             let mut end = p;
             let mut inside = true;
             for k in 1..=CHUNK {
-                let q = offset(offset(p, t, k as f32), n, shift * k as f32 / CHUNK as f32);
+                let q = offset(offset(p, t, k as f32), n, shift * k as f32 * RCP_CHUNK);
                 if q.x < 4.0 || q.y < 4.0 || q.x > w as f32 - 5.0 || q.y > h as f32 - 5.0 {
                     inside = false;
                     break;
@@ -168,15 +174,15 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
                 let row = profile(data, w, h, q, n, sigma);
                 amps[k - 1] = polarity * amplitude(&row);
                 for j in 0..7 {
-                    average[j] += row[j] / CHUNK as f32;
+                    average[j] += row[j] * RCP_CHUNK;
                 }
                 end = q;
             }
             if !inside {
                 continue;
             }
-            let mean = amps.iter().sum::<f32>() / CHUNK as f32;
-            let variance = amps.iter().map(|a| (a - mean).powi(2)).sum::<f32>() / CHUNK as f32;
+            let mean = amps.iter().sum::<f32>() * RCP_CHUNK;
+            let variance = amps.iter().map(|a| (a - mean).powi(2)).sum::<f32>() * RCP_CHUNK;
             if mean <= PROFILE_FLOOR.max(0.12 * reference)
                 || amps.iter().filter(|&&a| a > 0.0).count() < 6
                 || mean <= variance.sqrt() * 0.7
@@ -211,7 +217,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
         }
         extra.append(&mut pending);
         for k in 1..=CHUNK {
-            extra.push(offset(p, d, k as f32 / CHUNK as f32));
+            extra.push(offset(p, d, k as f32 * RCP_CHUNK));
         }
         supported += 1;
         gaps = 0;

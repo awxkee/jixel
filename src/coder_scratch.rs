@@ -347,6 +347,8 @@ pub(crate) struct CoderScratch {
     pub(crate) patch_tile_colors: LazyScratch<Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>>,
     /// ~63KB of CfL RDO coefficient staging; only Slow lossy workers use it.
     pub(crate) cfl_rdo: LazyScratch<crate::color_correlation::CflRdoScratch>,
+    #[cfg(feature = "splines")]
+    pub(crate) spline_fit: LazyScratch<Box<crate::splines::FitScratch>>,
 }
 
 impl CoderScratch {
@@ -405,6 +407,8 @@ impl CoderScratch {
             dc_predictor: LazyScratch::default(),
             patch_tile_colors: LazyScratch::new(|| heap_array([0; 3])),
             cfl_rdo: LazyScratch::default(),
+            #[cfg(feature = "splines")]
+            spline_fit: LazyScratch::default(),
         }
     }
 

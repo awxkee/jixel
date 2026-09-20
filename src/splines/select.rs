@@ -33,11 +33,13 @@
 //! priced with an adaptive token-cost model refined over two passes.
 
 use super::fit::Candidate;
+use super::render::{RenderPlan, TiledSpline};
 use super::{
     CTX_DCT, CTX_NUM_POINTS, CTX_POINTS, NUM_SPLINE_CONTEXTS, PixelBox, Point, QUANT_ADJUST,
     QuantizedSpline, SplineSet, render_spline, spline_tokens,
 };
 use crate::adaptive_quant::dirty_log2f;
+use crate::coder_scratch::CoderScratch;
 use crate::dct::DctInput;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
@@ -52,6 +54,9 @@ const MARGIN_FAR: (f32, f32) = (8.0, 1.0);
 /// Below this modeled saving the section's fixed cost and the encoder's
 /// decision noise outweigh the gain.
 const MIN_TOTAL_GAIN_BITS: f32 = 256.0;
+/// Bound the combined trial storage of independent candidates to about 12 MiB.
+/// A single larger candidate still uses the existing alternative-parallel path.
+const MAX_BATCH_TILES: usize = 16_384;
 
 fn margin(distance: f32) -> f32 {
     let t = ((distance - MARGIN_NEAR.0) / (MARGIN_FAR.0 - MARGIN_NEAR.0)).clamp(0.0, 1.0);
@@ -168,13 +173,175 @@ impl<'a> BlockModel<'a> {
         }
         (d_total, r_total)
     }
+
+    fn pixels_cost(&self, pixels: &[[f32; 64]; 3], qac: f32) -> (f32, f32) {
+        let (mut distortion, mut rate) = (0.0, 0.0);
+        for (c, plane) in pixels.iter().enumerate() {
+            let mut coef = [0.0; 64];
+            (self.ctx.dct8x8)(DctInput::from_flat(plane), &mut coef);
+            let (d, r) = crate::inflated_cost::channel_rd(
+                self.ctx.sse_and_rate,
+                self.ctx.rate_log2_lut,
+                &coef,
+                self.inv[c],
+                c,
+                qac,
+                self.qm[c],
+                self.distance,
+                1,
+                1,
+            );
+            distortion += self.ctx.channel_weight(c) * d;
+            rate += r;
+        }
+        (distortion, rate)
+    }
 }
 
-fn copy_box(src: &Image3F, dst: &mut Image3F, b: PixelBox) {
-    for c in 0..3 {
-        for y in b.1..=b.3 {
-            dst.plane_row_mut(c, y)[b.0..=b.2].copy_from_slice(&src.plane_row(c, y)[b.0..=b.2]);
+struct TrialBlock {
+    cell: usize,
+    pixels: [[f32; 64]; 3],
+}
+
+/// A trial owns only affected blocks. Coordinates and sample accumulation stay
+/// identical to full-image rendering; different alternatives share no writes.
+struct Trial {
+    blocks: Vec<TrialBlock>,
+}
+
+impl Trial {
+    fn new(current: &Image3F, plans: &[&TiledSpline]) -> Self {
+        let mut cells: Vec<_> = plans
+            .iter()
+            .flat_map(|p| p.tiles.iter().map(|t| t.cell))
+            .collect();
+        if plans.len() > 1 {
+            cells.sort_unstable();
+            cells.dedup();
         }
+        let (w, h) = (current.xsize(), current.ysize());
+        let blocks_w = w.div_ceil(8);
+        let blocks = cells
+            .into_iter()
+            .map(|cell| {
+                let (x0, y0) = (cell % blocks_w * 8, cell / blocks_w * 8);
+                let width = (w - x0).min(8);
+                let mut pixels = [[0.0; 64]; 3];
+                for (c, plane) in pixels.iter_mut().enumerate() {
+                    for (y, row) in plane.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                        row[..width].copy_from_slice(
+                            &current.plane_row(c, (y0 + y).min(h - 1))[x0..x0 + width],
+                        );
+                        let edge = row[width - 1];
+                        row[width..].fill(edge);
+                    }
+                }
+                TrialBlock { cell, pixels }
+            })
+            .collect();
+        Self { blocks }
+    }
+
+    fn draw(&mut self, plan: &TiledSpline, sign: f32) {
+        let mut blocks = self.blocks.iter_mut();
+        for tile in &plan.tiles {
+            let block = blocks.find(|block| block.cell == tile.cell).unwrap();
+            plan.draw_tile(tile, &mut block.pixels, sign);
+        }
+    }
+
+    /// Reuse a prepared residual on a subset of this trial's sorted blocks.
+    fn copy_blocks_from(&mut self, source: &Self) {
+        let mut blocks = self.blocks.iter_mut();
+        for source in &source.blocks {
+            let block = blocks.find(|block| block.cell == source.cell).unwrap();
+            block.pixels = source.pixels;
+        }
+    }
+
+    fn delta(
+        &mut self,
+        model: &BlockModel,
+        current: &Image3F,
+        quant_field: &[f32],
+        cache: &[Option<(f32, f32)>],
+        forbidden: Option<&[bool]>,
+    ) -> Option<f32> {
+        let (w, h) = (current.xsize(), current.ysize());
+        let blocks_w = w.div_ceil(8);
+        let mut delta = 0.0;
+        for block in &mut self.blocks {
+            let (bx, by) = (block.cell % blocks_w, block.cell / blocks_w);
+            let (x0, y0) = (bx * 8, by * 8);
+            let (width, height) = ((w - x0).min(8), (h - y0).min(8));
+            let touched = (0..height).any(|y| {
+                (0..width).any(|x| {
+                    let at = y * 8 + x;
+                    (current.plane_row(1, y0 + y)[x0 + x] - block.pixels[1][at]).abs() > 1e-5
+                        || (current.plane_row(0, y0 + y)[x0 + x] - block.pixels[0][at]).abs() > 1e-6
+                        || (current.plane_row(2, y0 + y)[x0 + x] - block.pixels[2][at]).abs() > 1e-5
+                })
+            });
+            if !touched {
+                continue;
+            }
+            if forbidden.is_some_and(|mask| mask[block.cell]) {
+                return None;
+            }
+            // Replicate the rendered edge, rather than the original edge used
+            // when loading the trial. Interior blocks need no padding work.
+            if width < 8 || height < 8 {
+                for plane in &mut block.pixels {
+                    for y in 0..height {
+                        let edge = plane[y * 8 + width - 1];
+                        plane[y * 8 + width..y * 8 + 8].fill(edge);
+                    }
+                    for y in height..8 {
+                        plane.copy_within((height - 1) * 8..height * 8, y * 8);
+                    }
+                }
+            }
+            let qac = quant_field[block.cell];
+            let (d0, r0) = cache[block.cell].unwrap_or_else(|| model.cost(current, bx, by, qac));
+            let (d1, r1) = model.pixels_cost(&block.pixels, qac);
+            delta += (d1 - d0) + crate::ac_strategy::RD_LAMBDA * (r1 - r0);
+        }
+        Some(delta)
+    }
+
+    fn commit(&self, image: &mut Image3F) {
+        let (w, h) = (image.xsize(), image.ysize());
+        let blocks_w = w.div_ceil(8);
+        for block in &self.blocks {
+            let (x0, y0) = (block.cell % blocks_w * 8, block.cell / blocks_w * 8);
+            let (width, height) = ((w - x0).min(8), (h - y0).min(8));
+            for (c, plane) in block.pixels.iter().enumerate() {
+                for y in 0..height {
+                    image.plane_row_mut(c, y0 + y)[x0..x0 + width]
+                        .copy_from_slice(&plane[y * 8..y * 8 + width]);
+                }
+            }
+        }
+    }
+}
+
+fn cache_blocks(
+    model: &BlockModel,
+    current: &Image3F,
+    quant_field: &[f32],
+    cache: &mut [Option<(f32, f32)>],
+    plan: &TiledSpline,
+) {
+    let blocks_w = current.xsize().div_ceil(8);
+    for tile in &plan.tiles {
+        cache[tile.cell].get_or_insert_with(|| {
+            model.cost(
+                current,
+                tile.cell % blocks_w,
+                tile.cell / blocks_w,
+                quant_field[tile.cell],
+            )
+        });
     }
 }
 
@@ -200,6 +367,7 @@ fn block_touched(a: &Image3F, b: &Image3F, bx: usize, by: usize) -> bool {
     false
 }
 
+#[cfg(test)]
 fn trial_cost(
     model: &BlockModel,
     current: &Image3F,
@@ -235,6 +403,7 @@ fn trial_cost(
 /// color and width coefficients stay fixed, so no image fit is rebuilt.
 fn prune_selected(
     model: &BlockModel,
+    scratch: &mut CoderScratch,
     current: &mut Image3F,
     quant_field: &[f32],
     kept: &mut [QuantizedSpline],
@@ -243,60 +412,92 @@ fn prune_selected(
 ) {
     let (w, h) = (current.xsize(), current.ysize());
     let blocks_w = w.div_ceil(8);
+    // Cap speculation at four proposals: larger batches waste too much work
+    // after early acceptances. One worker retains the serial schedule.
+    let batch_size = model.ctx.thread_pool.num_threads().min(4);
     let mut cache = vec![None; blocks_w * h.div_ceil(8)];
-    let mut trial = current.clone();
-    let mut try_points = |sp: &mut QuantizedSpline, points: Vec<Point<i32>>| -> bool {
-        if points.len() < 2
-            || points.len() >= sp.points.len()
-            || points.array_windows::<2>().any(|p| p[0] == p[1])
-            || points
-                .iter()
-                .any(|p| p.x < 0 || p.y < 0 || p.x >= w as i32 || p.y >= h as i32)
-        {
-            return false;
+    let mut try_points = |sp: &mut QuantizedSpline,
+                          incumbent: &mut TiledSpline,
+                          restored: &mut Option<Trial>,
+                          points: Vec<Vec<Point<i32>>>|
+     -> Option<usize> {
+        let old = incumbent.bounds()?;
+        let proposals = model
+            .ctx
+            .thread_pool
+            .steal_map(scratch, points.len(), |index, _| {
+                let points = &points[index];
+                if points.len() < 2
+                    || points.len() >= sp.points.len()
+                    || points.array_windows::<2>().any(|p| p[0] == p[1])
+                    || points
+                        .iter()
+                        .any(|p| p.x < 0 || p.y < 0 || p.x >= w as i32 || p.y >= h as i32)
+                {
+                    return None;
+                }
+                let simpler = QuantizedSpline {
+                    points: points.clone(),
+                    dct: sp.dct,
+                };
+                let bits = prices.spline_bits(&simpler) - prices.spline_bits(sp);
+                let plan = RenderPlan::new(model.ctx, &simpler, QUANT_ADJUST, w, h).tiled();
+                plan.bounds()?;
+                Some((simpler, plan, bits))
+            });
+        if proposals.iter().all(Option::is_none) {
+            return None;
         }
-        let simpler = QuantizedSpline {
-            points,
-            dct: sp.dct,
-        };
-        let bits = prices.spline_bits(&simpler) - prices.spline_bits(sp);
-        let Some(old) = render_spline(sp, QUANT_ADJUST, &mut trial, 1.0) else {
-            return false;
-        };
-        let Some(new) = render_spline(&simpler, QUANT_ADJUST, &mut trial, -1.0) else {
-            copy_box(current, &mut trial, old);
-            return false;
-        };
-        let b = (
-            old.0.min(new.0),
-            old.1.min(new.1),
-            old.2.max(new.2),
-            old.3.max(new.3),
-        );
-        let delta = trial_cost(
-            model,
-            current,
-            &trial,
-            quant_field,
-            &mut cache,
-            b,
-            forbidden,
-        );
-        if delta.is_some_and(|d| {
-            d + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * bits < 0.0
-        }) {
-            copy_box(&trial, current, b);
+        cache_blocks(model, current, quant_field, &mut cache, incumbent);
+        for (_, plan, _) in proposals.iter().flatten() {
+            cache_blocks(model, current, quant_field, &mut cache, plan);
+        }
+        // Rejected proposals leave both the image and incumbent unchanged.
+        // Preserve the exact sample-by-sample addition once and share its
+        // rounded pixels until an accepted proposal changes the residual.
+        let restored_trial = restored.get_or_insert_with(|| {
+            let mut trial = Trial::new(current, &[incumbent]);
+            trial.draw(incumbent, 1.0);
+            trial
+        });
+        let trials = model
+            .ctx
+            .thread_pool
+            .steal_map(scratch, proposals.len(), |i, _| {
+                let (_, proposal, bits) = proposals[i].as_ref()?;
+                let mut trial = Trial::new(current, &[incumbent, proposal]);
+                trial.copy_blocks_from(restored_trial);
+                trial.draw(proposal, -1.0);
+                let delta = trial.delta(model, current, quant_field, &cache, forbidden)?;
+                (delta + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * bits < 0.0)
+                    .then_some(trial)
+            });
+        // Greedy pruning accepts the first improving proposal, not the best
+        // of the batch. Later trials used stale geometry after this commit.
+        for (index, (trial, proposal)) in trials.into_iter().zip(proposals).enumerate() {
+            let Some(trial) = trial else { continue };
+            let (simpler, proposal, _) = proposal.unwrap();
+            let new = proposal.bounds().unwrap();
+            let b = (
+                old.0.min(new.0),
+                old.1.min(new.1),
+                old.2.max(new.2),
+                old.3.max(new.3),
+            );
+            trial.commit(current);
             *sp = simpler;
+            *incumbent = proposal;
+            *restored = None;
             for by in b.1 / 8..=b.3 / 8 {
                 cache[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(None);
             }
-            true
-        } else {
-            copy_box(current, &mut trial, b);
-            false
+            return Some(index);
         }
+        None
     };
     for sp in kept {
+        let mut incumbent = RenderPlan::new(model.ctx, sp, QUANT_ADJUST, w, h).tiled();
+        let mut restored = None;
         // Deleting only one regularly spaced knot can make its double deltas
         // expensive. These proposals can cross that barrier in one decision.
         for phase in 0..2 {
@@ -310,23 +511,41 @@ fn prune_selected(
                 .filter(|&(i, _)| i == 0 || i + 1 == sp.points.len() || i % 2 == phase)
                 .map(|(_, &p)| p)
                 .collect();
-            try_points(sp, points);
+            try_points(sp, &mut incumbent, &mut restored, vec![points]);
         }
         for merge in [false, true] {
             let mut i = 1;
             while i + 1 < sp.points.len() {
-                let points = if merge {
-                    let Some(points) = super::fit::collapse_control_pair(&sp.points, i) else {
-                        break;
+                let mut proposals = Vec::with_capacity(batch_size);
+                let mut stopped = false;
+                for index in i..(i + batch_size).min(sp.points.len() - 1) {
+                    let points = if merge {
+                        let Some(points) =
+                            super::fit::collapse_control_pair(model.ctx, &sp.points, index)
+                        else {
+                            stopped = true;
+                            break;
+                        };
+                        points
+                    } else {
+                        let mut points = sp.points.clone();
+                        points.remove(index);
+                        points
                     };
-                    points
+                    proposals.push(points);
+                }
+                let count = proposals.len();
+                if count == 0 {
+                    break;
+                }
+                if let Some(accepted) = try_points(sp, &mut incumbent, &mut restored, proposals) {
+                    // Earlier proposals failed; resume at the accepted index
+                    // because deletion shifted the following control into it.
+                    i += accepted;
+                } else if stopped {
+                    break;
                 } else {
-                    let mut points = sp.points.clone();
-                    points.remove(i);
-                    points
-                };
-                if !try_points(sp, points) {
-                    i += 1;
+                    i += count;
                 }
             }
         }
@@ -373,7 +592,7 @@ pub(super) fn pretest(
             .collect(),
         dct: spline.dct,
     };
-    let Some(b) = render_spline(&shifted, QUANT_ADJUST, &mut trial, -1.0) else {
+    let Some(b) = render_spline(model.ctx, &shifted, QUANT_ADJUST, &mut trial, -1.0) else {
         return false;
     };
     let blocks_w = xyb.xsize().div_ceil(8);
@@ -396,6 +615,7 @@ pub(super) fn pretest(
 /// Subtracts the accepted splines from `xyb` and returns them.
 pub(super) fn rd_select(
     ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
     distance: f32,
     xyb: &mut Image3F,
     quant_field: &[f32],
@@ -404,102 +624,205 @@ pub(super) fn rd_select(
 ) -> Option<SplineSet> {
     let lambda = crate::ac_strategy::RD_LAMBDA;
     let margin = margin(distance);
-    let matrices = crate::quant_weights::DequantMatrices::new(distance);
-    let model = BlockModel {
-        ctx,
-        inv: [
-            matrices.inv_matrix(0),
-            matrices.inv_matrix(1),
-            matrices.inv_matrix(2),
-        ],
-        qm: [1.0, 1.0, ctx.b_qm_mul()],
-        distance,
+    let model = BlockModel::new(ctx, distance);
+    let (w, h) = (xyb.xsize(), xyb.ysize());
+    let blocks_w = w.div_ceil(8);
+    let prepared = ctx
+        .thread_pool
+        .steal_map(scratch, candidates.len(), |i, _| {
+            candidates[i]
+                .alts
+                .iter()
+                .map(|alt| RenderPlan::new(model.ctx, alt, QUANT_ADJUST, w, h).tiled())
+                .collect::<Vec<_>>()
+        });
+    struct Evaluation {
+        delta: f32,
+        trial: Trial,
+    }
+    let evaluate = |plan: &TiledSpline, current: &Image3F, cache: &[Option<(f32, f32)>]| {
+        plan.bounds()?;
+        let mut trial = Trial::new(current, &[plan]);
+        trial.draw(plan, -1.0);
+        let delta = trial.delta(&model, current, quant_field, cache, forbidden)?;
+        Some(Evaluation { delta, trial })
     };
-    let blocks_w = xyb.xsize().div_ceil(8);
+    let invalidate = |cache: &mut [Option<(f32, f32)>], b: PixelBox| {
+        for by in b.1 / 8..=b.3 / 8 {
+            cache[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(None);
+        }
+    };
 
-    // Pass one walks the candidates greedily against the running residual and
-    // records every alternative's VarDCT cost change. Pass two re-prices the
-    // tokens and reuses deltas only where earlier choices still agree.
+    // Candidates commit in their original greedy order. Disjoint candidates can
+    // share a residual snapshot while all their alternatives run concurrently.
+    // Keep winning trials and retain preparation across repricing passes.
     let mut prices = CostModel::prior(1.0);
     let mut current = xyb.clone();
-    let mut trial = xyb.clone();
-    let blocks_h = xyb.ysize().div_ceil(8);
-    let mut block_cache: Vec<Option<(f32, f32)>> = vec![None; blocks_w * blocks_h];
+    let mut block_cache = vec![None; blocks_w * h.div_ceil(8)];
     let mut deltas: Vec<Vec<Option<(f32, PixelBox)>>> = Vec::with_capacity(candidates.len());
-    let mut first_pass: Vec<QuantizedSpline> = Vec::new();
+    let mut first_pass = Vec::new();
     let mut first_choices = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let mut row = vec![None; candidate.alts.len()];
-        let mut best: Option<(f32, usize, PixelBox)> = None;
-        for (index, alt) in candidate.alts.iter().enumerate() {
-            let Some(b) = render_spline(alt, QUANT_ADJUST, &mut trial, -1.0) else {
-                continue;
-            };
-            let dj = trial_cost(
-                &model,
-                &current,
-                &trial,
-                quant_field,
-                &mut block_cache,
-                b,
-                forbidden,
-            );
-            copy_box(&current, &mut trial, b);
-            let Some(dj) = dj else { continue };
-            row[index] = Some((dj, b));
-            let j = dj + lambda * margin * candidate.bits_factor * prices.spline_bits(alt);
-            if best.is_none_or(|(bj, _, _)| j < bj) {
-                best = Some((j, index, b));
+    let mut occupied = vec![false; block_cache.len()];
+    let mut next = 0;
+    while next < candidates.len() {
+        let start = next;
+        let mut batch_tiles = 0usize;
+        // The first pass has fixed prices. Only candidates whose complete
+        // alternative supports are disjoint may read the same residual.
+        while next < candidates.len() && next - start < ctx.thread_pool.num_threads().max(1) {
+            let plans = &prepared[next];
+            let tiles: usize = plans.iter().map(|plan| plan.tiles.len()).sum();
+            if next != start
+                && (batch_tiles + tiles > MAX_BATCH_TILES
+                    || plans
+                        .iter()
+                        .any(|plan| plan.tiles.iter().any(|tile| occupied[tile.cell])))
+            {
+                break;
+            }
+            for plan in plans {
+                for tile in &plan.tiles {
+                    occupied[tile.cell] = true;
+                }
+            }
+            batch_tiles += tiles;
+            next += 1;
+        }
+        for plans in &prepared[start..next] {
+            for plan in plans {
+                cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
             }
         }
-        let accepted = best.filter(|&(j, _, _)| j < 0.0);
-        first_choices.push(accepted.map(|(_, index, _)| index));
-        if let Some((_, index, b)) = accepted {
-            let alt = &candidate.alts[index];
-            render_spline(alt, QUANT_ADJUST, &mut current, -1.0);
-            copy_box(&current, &mut trial, b);
-            for by in b.1 / 8..=b.3 / 8 {
-                block_cache[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(None);
+        let assess = |candidate: &Candidate,
+                      plans: &[TiledSpline],
+                      mut evaluations: Vec<Option<Evaluation>>| {
+            let mut row = vec![None; candidate.alts.len()];
+            let mut best: Option<(f32, usize, PixelBox)> = None;
+            for (index, evaluation) in evaluations.iter().enumerate() {
+                let Some(evaluation) = evaluation else {
+                    continue;
+                };
+                let b = plans[index].bounds().unwrap();
+                let dj = evaluation.delta;
+                row[index] = Some((dj, b));
+                let j = dj
+                    + lambda
+                        * margin
+                        * candidate.bits_factor
+                        * prices.spline_bits(&candidate.alts[index]);
+                if best.is_none_or(|(bj, _, _)| j < bj) {
+                    best = Some((j, index, b));
+                }
             }
-            first_pass.push(alt.clone());
-        }
-        deltas.push(row);
-    }
-    current = xyb.clone();
-    trial = xyb.clone();
-    block_cache.fill(None);
-    let mut changed = vec![false; blocks_w * blocks_h];
+            let accepted = best.filter(|&(j, _, _)| j < 0.0);
 
+            let chosen =
+                accepted.map(|(_, index, b)| (index, b, evaluations[index].take().unwrap().trial));
+            (row, chosen)
+        };
+        let results = if next - start == 1 {
+            let plans = &prepared[start];
+            let evaluations = ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
+                evaluate(&plans[i], &current, &block_cache)
+            });
+            vec![assess(&candidates[start], plans, evaluations)]
+        } else {
+            let jobs: Vec<_> = (start..next)
+                .flat_map(|i| (0..prepared[i].len()).map(move |alt| (i, alt)))
+                .collect();
+            let mut evaluations = ctx
+                .thread_pool
+                .steal_map(scratch, jobs.len(), |i, _| {
+                    let (candidate, alt) = jobs[i];
+                    evaluate(&prepared[candidate][alt], &current, &block_cache)
+                })
+                .into_iter();
+            (start..next)
+                .map(|i| {
+                    let plans = &prepared[i];
+                    assess(
+                        &candidates[i],
+                        plans,
+                        evaluations.by_ref().take(plans.len()).collect(),
+                    )
+                })
+                .collect()
+        };
+        for (i, (row, chosen)) in results.into_iter().enumerate() {
+            first_choices.push(chosen.as_ref().map(|(index, _, _)| *index));
+            if let Some((index, b, trial)) = chosen {
+                trial.commit(&mut current);
+                invalidate(&mut block_cache, b);
+                first_pass.push(candidates[start + i].alts[index].clone());
+            }
+            deltas.push(row);
+        }
+        for plans in &prepared[start..next] {
+            for plan in plans {
+                for tile in &plan.tiles {
+                    occupied[tile.cell] = false;
+                }
+            }
+        }
+    }
+    drop(occupied);
+    for c in 0..3 {
+        for y in 0..h {
+            current
+                .plane_row_mut(c, y)
+                .copy_from_slice(xyb.plane_row(c, y));
+        }
+    }
+    block_cache.fill(None);
+    let mut changed = vec![false; block_cache.len()];
     prices = CostModel::prior(0.1);
     for sp in &first_pass {
         for (c, v) in spline_tokens(sp) {
             prices.add(c, v, 1.0);
         }
     }
-    let mut kept: Vec<QuantizedSpline> = Vec::new();
-    let mut gain_bits = 0f32;
-    for ((candidate, row), &first) in candidates.iter().zip(&deltas).zip(&first_choices) {
+    let mut kept = Vec::new();
+    let mut gain_bits = 0.0;
+    for (((candidate, plans), row), &first) in candidates
+        .iter()
+        .zip(&prepared)
+        .zip(&deltas)
+        .zip(&first_choices)
+    {
+        let recompute: Vec<_> = row
+            .iter()
+            .map(|cached| {
+                cached.is_some_and(|(_, b)| {
+                    (b.1 / 8..=b.3 / 8).any(|by| {
+                        changed[by * blocks_w..][b.0 / 8..=b.2 / 8]
+                            .iter()
+                            .any(|&v| v)
+                    })
+                })
+            })
+            .collect();
+        for (plan, &needed) in plans.iter().zip(&recompute) {
+            if needed {
+                cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
+            }
+        }
+        let mut evaluations = if recompute.iter().any(|&needed| needed) {
+            ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
+                recompute[i]
+                    .then(|| evaluate(&plans[i], &current, &block_cache))
+                    .flatten()
+            })
+        } else {
+            std::iter::repeat_with(|| None).take(plans.len()).collect()
+        };
         let mut best: Option<(f32, usize, PixelBox)> = None;
         for (index, (alt, cached)) in candidate.alts.iter().zip(row).enumerate() {
             let Some((mut dj, b)) = *cached else { continue };
-            if (b.1 / 8..=b.3 / 8).any(|by| {
-                changed[by * blocks_w..][b.0 / 8..=b.2 / 8]
-                    .iter()
-                    .any(|&v| v)
-            }) {
-                render_spline(alt, QUANT_ADJUST, &mut trial, -1.0);
-                let cost = trial_cost(
-                    &model,
-                    &current,
-                    &trial,
-                    quant_field,
-                    &mut block_cache,
-                    b,
-                    forbidden,
-                );
-                copy_box(&current, &mut trial, b);
-                let Some(cost) = cost else { continue };
-                dj = cost;
+            if recompute[index] {
+                let Some(evaluation) = &evaluations[index] else {
+                    continue;
+                };
+                dj = evaluation.delta;
             }
             let j = dj + lambda * margin * candidate.bits_factor * prices.spline_bits(alt);
             if best.is_none_or(|(bj, _, _)| j < bj) {
@@ -517,21 +840,26 @@ pub(super) fn rd_select(
             }
         }
         if let Some((j, index, b)) = accepted {
-            let alt = &candidate.alts[index];
-            render_spline(alt, QUANT_ADJUST, &mut current, -1.0);
-            copy_box(&current, &mut trial, b);
-            for by in b.1 / 8..=b.3 / 8 {
-                block_cache[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(None);
-            }
+            let trial = if let Some(evaluation) = evaluations[index].take() {
+                evaluation.trial
+            } else {
+                let mut trial = Trial::new(&current, &[&plans[index]]);
+                trial.draw(&plans[index], -1.0);
+                trial
+            };
+            trial.commit(&mut current);
+            invalidate(&mut block_cache, b);
             gain_bits -= j / lambda;
-            kept.push(alt.clone());
+            kept.push(candidate.alts[index].clone());
         }
     }
     if kept.is_empty() || gain_bits < MIN_TOTAL_GAIN_BITS {
         return None;
     }
+    drop(prepared);
     prune_selected(
         &model,
+        scratch,
         &mut current,
         quant_field,
         &mut kept,
@@ -551,7 +879,233 @@ mod tests {
     use crate::{Speed, xyb::XybMatrix};
 
     #[test]
+    fn sparse_trials_match_full_render_and_rd_at_image_edges() {
+        let kernels = crate::encoding_context::EncodingContext::default();
+        let (w, h) = (137, 91);
+        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let model = BlockModel::new(&ctx, 3.0);
+        let mut current = Image3F::new(w, h);
+        for c in 0..3 {
+            for y in 0..h {
+                for (x, value) in current.plane_row_mut(c, y).iter_mut().enumerate() {
+                    *value = ((x * 19 + y * 31 + c * 7) % 83) as f32 * 0.003;
+                }
+            }
+        }
+        let mut first = QuantizedSpline {
+            points: vec![Point::new(0, 1), Point::new(33, 49), Point::new(136, 89)],
+            dct: [[0; 32]; 4],
+        };
+        first.dct[1][0] = 7;
+        first.dct[2][1] = -5;
+        first.dct[3][0] = 4;
+        first.dct[3][2] = 1;
+        let mut second = first.clone();
+        second.points[1] = Point::new(74, 31);
+        second.dct[0][0] = -13;
+        let a = RenderPlan::new(&kernels, &first, QUANT_ADJUST, w, h).tiled();
+        let b = RenderPlan::new(&kernels, &second, QUANT_ADJUST, w, h).tiled();
+        let mut restored = Trial::new(&current, &[&a]);
+        restored.draw(&a, 1.0);
+        let mut trial = Trial::new(&current, &[&a, &b]);
+        trial.copy_blocks_from(&restored);
+        trial.draw(&b, -1.0);
+        let mut full = current.clone();
+        render_spline(&kernels, &first, QUANT_ADJUST, &mut full, 1.0);
+        render_spline(&kernels, &second, QUANT_ADJUST, &mut full, -1.0);
+        let quant = vec![5.0; w.div_ceil(8) * h.div_ceil(8)];
+        let mut cache = vec![None; quant.len()];
+        let expected = trial_cost(
+            &model,
+            &current,
+            &full,
+            &quant,
+            &mut cache,
+            (0, 0, w - 1, h - 1),
+            None,
+        );
+        assert_eq!(
+            trial.delta(&model, &current, &quant, &cache, None),
+            expected
+        );
+        let mut committed = current.clone();
+        trial.commit(&mut committed);
+        for c in 0..3 {
+            assert!(
+                full.plane_data(c)
+                    .iter()
+                    .zip(committed.plane_data(c))
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+        let forbidden = vec![true; quant.len()];
+        assert!(
+            trial
+                .delta(&model, &current, &quant, &cache, Some(&forbidden))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn alternatives_commit_identically_with_one_or_four_workers() {
+        let kernels = crate::encoding_context::EncodingContext::default();
+        let (w, h) = (263, 193);
+        let mut image = Image3F::new(w, h);
+        let mut candidates = Vec::new();
+        for i in 0..6 {
+            let mut sp = QuantizedSpline {
+                points: vec![
+                    Point::new(4, 15 + i * 28),
+                    Point::new(128, 30 + i * 24),
+                    Point::new(260, 15 + i * 28),
+                ],
+                dct: [[0; 32]; 4],
+            };
+            sp.dct[1][0] = 8;
+            sp.dct[3][0] = 4;
+            render_spline(&kernels, &sp, QUANT_ADJUST, &mut image, 1.0);
+            let mut displaced = sp.clone();
+            displaced.points[1].y += 2;
+            let mut wider = sp.clone();
+            wider.dct[3][0] += 1;
+            candidates.push(Candidate {
+                alts: vec![displaced, sp, wider],
+                bits_factor: 0.01,
+            });
+        }
+        // Duplicate candidates share every affected block: evaluating candidates
+        // against the original image in parallel would subtract them twice.
+        candidates.push(Candidate {
+            alts: candidates[0].alts.clone(),
+            bits_factor: 0.01,
+        });
+        let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
+        let mut results = Vec::new();
+        for threads in [1, 4] {
+            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+            let mut residual = image.clone();
+            let selected = rd_select(
+                &ctx,
+                &mut CoderScratch::default(),
+                3.0,
+                &mut residual,
+                &quant,
+                &candidates,
+                None,
+            )
+            .unwrap();
+            results.push((selected, residual));
+        }
+        let [(a, ar), (b, br)] = results.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!(a.splines.len(), b.splines.len());
+        assert!(a.splines.len() < candidates.len());
+        for (a, b) in a.splines.iter().zip(&b.splines) {
+            assert_eq!(a.points, b.points);
+            assert_eq!(a.dct, b.dct);
+        }
+        for c in 0..3 {
+            assert!(
+                ar.plane_data(c)
+                    .iter()
+                    .zip(br.plane_data(c))
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn batched_pruning_matches_serial_with_overlaps_edges_and_forbidden_blocks() {
+        let kernels = crate::encoding_context::EncodingContext::default();
+        let (w, h) = (263, 193);
+        let mut kept = Vec::new();
+        for i in 0..3 {
+            let points = match i {
+                0 => (0..13).map(|x| Point::new(4 + 21 * x, 48)).collect(),
+                1 => [0, 3, 9, 12, 9, 3, 0, -6, -9]
+                    .iter()
+                    .enumerate()
+                    .map(|(x, &dy)| Point::new(4 + 32 * x as i32, 128 + dy))
+                    .collect(),
+                _ => (0..11)
+                    .map(|x| Point::new(20 + 24 * x, 4 + 18 * x))
+                    .collect(),
+            };
+            let mut sp = QuantizedSpline {
+                points,
+                dct: [[0; 32]; 4],
+            };
+            sp.dct[1][0] = 8 + i;
+            sp.dct[2][0] = 5;
+            sp.dct[3][0] = 4;
+            kept.push(sp);
+        }
+        let mut residual = Image3F::new(w, h);
+        for c in 0..3 {
+            for y in 0..h {
+                for (x, value) in residual.plane_row_mut(c, y).iter_mut().enumerate() {
+                    *value = ((x * 13 + y * 7 + c * 3) % 31) as f32 * 0.0003;
+                }
+            }
+        }
+        for sp in &kept {
+            render_spline(&kernels, sp, QUANT_ADJUST, &mut residual, 1.0);
+        }
+        for sp in &kept {
+            render_spline(&kernels, sp, QUANT_ADJUST, &mut residual, -1.0);
+        }
+        let blocks = w.div_ceil(8) * h.div_ceil(8);
+        let quant = vec![8.0; blocks];
+        let mask: Vec<_> = (0..blocks)
+            .map(|i| i % w.div_ceil(8) == 16 || i / w.div_ceil(8) == 15)
+            .collect();
+        for forbidden in [None, Some(mask.as_slice())] {
+            let mut reference: Option<(Vec<QuantizedSpline>, Image3F)> = None;
+            for threads in [1, 2, 4] {
+                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let mut actual = kept.clone();
+                let mut image = residual.clone();
+                prune_selected(
+                    &BlockModel::new(&ctx, 3.0),
+                    &mut CoderScratch::default(),
+                    &mut image,
+                    &quant,
+                    &mut actual,
+                    &CostModel::prior(1.0),
+                    forbidden,
+                );
+                if let Some((expected, expected_image)) = &reference {
+                    for (a, b) in actual.iter().zip(expected) {
+                        assert_eq!(a.points, b.points);
+                        assert_eq!(a.dct, b.dct);
+                    }
+                    for c in 0..3 {
+                        assert!(
+                            image
+                                .plane_data(c)
+                                .iter()
+                                .zip(expected_image.plane_data(c))
+                                .all(|(a, b)| a.to_bits() == b.to_bits())
+                        );
+                    }
+                } else {
+                    if forbidden.is_none() {
+                        assert!(
+                            actual.iter().map(|s| s.points.len()).sum::<usize>()
+                                < kept.iter().map(|s| s.points.len()).sum::<usize>()
+                        );
+                        assert!(actual.iter().any(|s| s.points.len() > 2));
+                    }
+                    reference = Some((actual, image));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn joint_thinning_crosses_the_single_deletion_rate_barrier() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
         let model = BlockModel::new(&ctx, 3.0);
         let mut sp = QuantizedSpline {
@@ -571,11 +1125,12 @@ mod tests {
             );
         }
         let mut original = Image3F::new(264, 96);
-        render_spline(&sp, QUANT_ADJUST, &mut original, 1.0);
+        render_spline(&kernels, &sp, QUANT_ADJUST, &mut original, 1.0);
         let mut residual = Image3F::new(264, 96);
         let mut kept = vec![sp.clone()];
         prune_selected(
             &model,
+            &mut CoderScratch::default(),
             &mut residual,
             &vec![8.0; 33 * 12],
             &mut kept,
@@ -584,7 +1139,7 @@ mod tests {
         );
         assert!(kept[0].points.len() < sp.points.len());
         assert!(prices.spline_bits(&kept[0]) < prices.spline_bits(&sp));
-        render_spline(&kept[0], QUANT_ADJUST, &mut residual, 1.0);
+        render_spline(&kernels, &kept[0], QUANT_ADJUST, &mut residual, 1.0);
         for c in 0..3 {
             for (&a, &b) in original.plane_data(c).iter().zip(residual.plane_data(c)) {
                 assert!((a - b).abs() < 1e-6);
@@ -594,6 +1149,7 @@ mod tests {
 
     #[test]
     fn selected_straight_line_loses_controls_without_changing_reconstruction() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
         let model = BlockModel::new(&ctx, 3.0);
         let mut sp = QuantizedSpline {
@@ -603,11 +1159,12 @@ mod tests {
         sp.dct[1][0] = 5;
         sp.dct[3][0] = 4;
         let mut original = Image3F::new(192, 96);
-        render_spline(&sp, QUANT_ADJUST, &mut original, 1.0);
+        render_spline(&kernels, &sp, QUANT_ADJUST, &mut original, 1.0);
         let mut residual = Image3F::new(192, 96);
         let mut kept = vec![sp];
         prune_selected(
             &model,
+            &mut CoderScratch::default(),
             &mut residual,
             &vec![8.0; 24 * 12],
             &mut kept,
@@ -615,7 +1172,7 @@ mod tests {
             None,
         );
         assert_eq!(kept[0].points, [Point::new(24, 48), Point::new(168, 48)]);
-        render_spline(&kept[0], QUANT_ADJUST, &mut residual, 1.0);
+        render_spline(&kernels, &kept[0], QUANT_ADJUST, &mut residual, 1.0);
         for c in 0..3 {
             for (&a, &b) in original.plane_data(c).iter().zip(residual.plane_data(c)) {
                 assert!((a - b).abs() < 1e-6);
@@ -625,6 +1182,7 @@ mod tests {
 
     #[test]
     fn repricing_does_not_accept_duplicate_lines_against_a_stale_residual() {
+        let kernels = crate::encoding_context::EncodingContext::default();
         let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
         let model = BlockModel::new(&ctx, 3.0);
         let mut image = Image3F::new(256, 256);
@@ -638,7 +1196,7 @@ mod tests {
             };
             sp.dct[1][0] = 5;
             sp.dct[3][0] = 4;
-            render_spline(&sp, QUANT_ADJUST, &mut image, 1.0);
+            render_spline(&kernels, &sp, QUANT_ADJUST, &mut image, 1.0);
             if i < 8 {
                 for (c, v) in spline_tokens(&sp) {
                     prices.add(c, v, 1.0);
@@ -651,7 +1209,7 @@ mod tests {
         }
         let sp = candidates.last().unwrap().alts[0].clone();
         let mut trial = image.clone();
-        let b = render_spline(&sp, QUANT_ADJUST, &mut trial, -1.0).unwrap();
+        let b = render_spline(&kernels, &sp, QUANT_ADJUST, &mut trial, -1.0).unwrap();
         let saving = -trial_cost(
             &model,
             &image,
@@ -674,7 +1232,16 @@ mod tests {
             alts: vec![sp.clone()],
             bits_factor: factor,
         });
-        let selected = rd_select(&ctx, 3.0, &mut image, &quant, &candidates, None).unwrap();
+        let selected = rd_select(
+            &ctx,
+            &mut CoderScratch::default(),
+            3.0,
+            &mut image,
+            &quant,
+            &candidates,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             selected
                 .splines
@@ -737,6 +1304,292 @@ mod tests {
                         model.cost(&img, bx, by, 0.75),
                         model.cost(&padded, bx, by, 0.75),
                         "{w}x{h}, block ({bx}, {by})"
+                    );
+                }
+            }
+        }
+    }
+    // Original candidate-by-candidate selector: keep independent of the batched
+    // first pass so the differential test detects changes to greedy decisions.
+    fn rd_select_reference(
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        xyb: &mut Image3F,
+        quant_field: &[f32],
+        candidates: &[Candidate],
+        forbidden: Option<&[bool]>,
+    ) -> Option<SplineSet> {
+        let lambda = crate::ac_strategy::RD_LAMBDA;
+        let margin = margin(distance);
+        let model = BlockModel::new(ctx, distance);
+        let (w, h) = (xyb.xsize(), xyb.ysize());
+        let blocks_w = w.div_ceil(8);
+        let prepared = ctx
+            .thread_pool
+            .steal_map(scratch, candidates.len(), |i, _| {
+                candidates[i]
+                    .alts
+                    .iter()
+                    .map(|alt| RenderPlan::new(model.ctx, alt, QUANT_ADJUST, w, h).tiled())
+                    .collect::<Vec<_>>()
+            });
+        struct Evaluation {
+            delta: f32,
+            trial: Trial,
+        }
+        let evaluate = |plan: &TiledSpline, current: &Image3F, cache: &[Option<(f32, f32)>]| {
+            plan.bounds()?;
+            let mut trial = Trial::new(current, &[plan]);
+            trial.draw(plan, -1.0);
+            let delta = trial.delta(&model, current, quant_field, cache, forbidden)?;
+            Some(Evaluation { delta, trial })
+        };
+        let invalidate = |cache: &mut [Option<(f32, f32)>], b: PixelBox| {
+            for by in b.1 / 8..=b.3 / 8 {
+                cache[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(None);
+            }
+        };
+
+        // Candidates still commit in their original greedy order. Only alternatives
+        // reading the same residual run concurrently. Keep the winning trial rather
+        // than rendering it again, and retain preparation across repricing passes.
+        let mut prices = CostModel::prior(1.0);
+        let mut current = xyb.clone();
+        let mut block_cache = vec![None; blocks_w * h.div_ceil(8)];
+        let mut deltas: Vec<Vec<Option<(f32, PixelBox)>>> = Vec::with_capacity(candidates.len());
+        let mut first_pass = Vec::new();
+        let mut first_choices = Vec::with_capacity(candidates.len());
+        for (candidate, plans) in candidates.iter().zip(&prepared) {
+            for plan in plans {
+                cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
+            }
+            let mut evaluations = ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
+                evaluate(&plans[i], &current, &block_cache)
+            });
+            let mut row = vec![None; candidate.alts.len()];
+            let mut best: Option<(f32, usize, PixelBox)> = None;
+            for (index, evaluation) in evaluations.iter().enumerate() {
+                let Some(evaluation) = evaluation else {
+                    continue;
+                };
+                let b = plans[index].bounds().unwrap();
+                let dj = evaluation.delta;
+                row[index] = Some((dj, b));
+                let j = dj
+                    + lambda
+                        * margin
+                        * candidate.bits_factor
+                        * prices.spline_bits(&candidate.alts[index]);
+                if best.is_none_or(|(bj, _, _)| j < bj) {
+                    best = Some((j, index, b));
+                }
+            }
+            let accepted = best.filter(|&(j, _, _)| j < 0.0);
+            first_choices.push(accepted.map(|(_, index, _)| index));
+            if let Some((_, index, b)) = accepted {
+                evaluations[index]
+                    .take()
+                    .unwrap()
+                    .trial
+                    .commit(&mut current);
+                invalidate(&mut block_cache, b);
+                first_pass.push(candidate.alts[index].clone());
+            }
+            deltas.push(row);
+        }
+        for c in 0..3 {
+            for y in 0..h {
+                current
+                    .plane_row_mut(c, y)
+                    .copy_from_slice(xyb.plane_row(c, y));
+            }
+        }
+        block_cache.fill(None);
+        let mut changed = vec![false; block_cache.len()];
+        prices = CostModel::prior(0.1);
+        for sp in &first_pass {
+            for (c, v) in spline_tokens(sp) {
+                prices.add(c, v, 1.0);
+            }
+        }
+        let mut kept = Vec::new();
+        let mut gain_bits = 0.0;
+        for (((candidate, plans), row), &first) in candidates
+            .iter()
+            .zip(&prepared)
+            .zip(&deltas)
+            .zip(&first_choices)
+        {
+            let recompute: Vec<_> = row
+                .iter()
+                .map(|cached| {
+                    cached.is_some_and(|(_, b)| {
+                        (b.1 / 8..=b.3 / 8).any(|by| {
+                            changed[by * blocks_w..][b.0 / 8..=b.2 / 8]
+                                .iter()
+                                .any(|&v| v)
+                        })
+                    })
+                })
+                .collect();
+            for (plan, &needed) in plans.iter().zip(&recompute) {
+                if needed {
+                    cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
+                }
+            }
+            let mut evaluations = if recompute.iter().any(|&needed| needed) {
+                ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
+                    recompute[i]
+                        .then(|| evaluate(&plans[i], &current, &block_cache))
+                        .flatten()
+                })
+            } else {
+                std::iter::repeat_with(|| None).take(plans.len()).collect()
+            };
+            let mut best: Option<(f32, usize, PixelBox)> = None;
+            for (index, (alt, cached)) in candidate.alts.iter().zip(row).enumerate() {
+                let Some((mut dj, b)) = *cached else { continue };
+                if recompute[index] {
+                    let Some(evaluation) = &evaluations[index] else {
+                        continue;
+                    };
+                    dj = evaluation.delta;
+                }
+                let j = dj + lambda * margin * candidate.bits_factor * prices.spline_bits(alt);
+                if best.is_none_or(|(bj, _, _)| j < bj) {
+                    best = Some((j, index, b));
+                }
+            }
+            let accepted = best.filter(|&(j, _, _)| j < 0.0);
+            let choice = accepted.map(|(_, index, _)| index);
+            if first != choice {
+                for index in first.into_iter().chain(choice) {
+                    let (_, b) = row[index].unwrap();
+                    for by in b.1 / 8..=b.3 / 8 {
+                        changed[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(true);
+                    }
+                }
+            }
+            if let Some((j, index, b)) = accepted {
+                let trial = if let Some(evaluation) = evaluations[index].take() {
+                    evaluation.trial
+                } else {
+                    let mut trial = Trial::new(&current, &[&plans[index]]);
+                    trial.draw(&plans[index], -1.0);
+                    trial
+                };
+                trial.commit(&mut current);
+                invalidate(&mut block_cache, b);
+                gain_bits -= j / lambda;
+                kept.push(candidate.alts[index].clone());
+            }
+        }
+        if kept.is_empty() || gain_bits < MIN_TOTAL_GAIN_BITS {
+            return None;
+        }
+        drop(prepared);
+        prune_selected(
+            &model,
+            scratch,
+            &mut current,
+            quant_field,
+            &mut kept,
+            &prices,
+            forbidden,
+        );
+        *xyb = current;
+        Some(SplineSet {
+            adjust: QUANT_ADJUST,
+            splines: kept,
+        })
+    }
+
+    #[test]
+    fn disjoint_candidate_batches_match_original_greedy_selection() {
+        let kernels = EncodingContext::default();
+        let (w, h) = (263usize, 577usize);
+        let mut image = Image3F::new(w, h);
+        let mut candidates = Vec::new();
+        let mut occupied = std::collections::BTreeSet::new();
+        for i in 0..8 {
+            let y = 4 + i * 80;
+            let mut sp = QuantizedSpline {
+                points: vec![Point::new(0, y), Point::new(128, y + 3), Point::new(262, y)],
+                dct: [[0; 32]; 4],
+            };
+            sp.dct[1][0] = 8;
+            sp.dct[3][0] = 4;
+            render_spline(&kernels, &sp, QUANT_ADJUST, &mut image, 1.0);
+            let mut shifted = sp.clone();
+            shifted.points[1].y += 2;
+            let mut wider = sp.clone();
+            wider.dct[3][0] += 1;
+            let candidate = Candidate {
+                alts: vec![shifted, sp, wider],
+                bits_factor: 0.01,
+            };
+            let cells: std::collections::BTreeSet<_> = candidate
+                .alts
+                .iter()
+                .flat_map(|alt| {
+                    RenderPlan::new(&kernels, alt, QUANT_ADJUST, w, h)
+                        .tiled()
+                        .tiles
+                        .into_iter()
+                        .map(|t| t.cell)
+                })
+                .collect();
+            assert!(occupied.is_disjoint(&cells));
+            occupied.extend(cells);
+            candidates.push(candidate);
+        }
+        candidates.push(Candidate {
+            alts: candidates[0].alts.clone(),
+            bits_factor: 0.01,
+        });
+        let blocks_w = w.div_ceil(8);
+        let quant = vec![8.0; blocks_w * h.div_ceil(8)];
+        let forbidden: Vec<_> = (0..quant.len()).map(|i| i / blocks_w == 30).collect();
+        for mask in [None, Some(forbidden.as_slice())] {
+            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+            let mut expected_image = image.clone();
+            let expected = rd_select_reference(
+                &ctx,
+                &mut CoderScratch::default(),
+                3.0,
+                &mut expected_image,
+                &quant,
+                &candidates,
+                mask,
+            )
+            .unwrap();
+            assert!(expected.splines.len() >= 4 && expected.splines.len() < candidates.len());
+            for threads in [2, 4, 8] {
+                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let mut actual_image = image.clone();
+                let actual = rd_select(
+                    &ctx,
+                    &mut CoderScratch::default(),
+                    3.0,
+                    &mut actual_image,
+                    &quant,
+                    &candidates,
+                    mask,
+                )
+                .unwrap();
+                assert_eq!(actual.splines.len(), expected.splines.len());
+                for (a, b) in actual.splines.iter().zip(&expected.splines) {
+                    assert_eq!(a.points, b.points);
+                    assert_eq!(a.dct, b.dct);
+                }
+                for c in 0..3 {
+                    assert!(
+                        actual_image
+                            .plane_data(c)
+                            .iter()
+                            .zip(expected_image.plane_data(c))
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
                     );
                 }
             }
