@@ -73,7 +73,10 @@ impl Line {
             syy += dy * dy;
         }
         let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
-        Line { center: Point::new(cx, cy), dir: Point::new(angle.cos(), angle.sin()) }
+        Line {
+            center: Point::new(cx, cy),
+            dir: Point::new(angle.cos(), angle.sin()),
+        }
     }
 
     #[inline]
@@ -98,14 +101,22 @@ fn straight_fragment(index: usize, chain: &Chain) -> Option<Fragment> {
     }
     let line = Line::through(chain.points.iter());
     let sum: f32 = chain.points.iter().map(|&p| line.across(p).powi(2)).sum();
-    ((sum / chain.points.len() as f32).sqrt() <= MAX_FRAGMENT_RMS).then_some(Fragment { index, line })
+    ((sum / chain.points.len() as f32).sqrt() <= MAX_FRAGMENT_RMS)
+        .then_some(Fragment { index, line })
 }
 
 /// Span of a nearly straight chain along `line` and its largest offset from it.
 fn placement(line: &Line, chain: &Chain) -> (f32, f32, f32) {
     let points = &chain.points;
-    let probes = [points[0], points[points.len() / 2], points[points.len() - 1]];
-    let offset = probes.iter().map(|&p| line.across(p).abs()).fold(0.0, f32::max);
+    let probes = [
+        points[0],
+        points[points.len() / 2],
+        points[points.len() - 1],
+    ];
+    let offset = probes
+        .iter()
+        .map(|&p| line.across(p).abs())
+        .fold(0.0, f32::max);
     let (a, b) = (line.along(probes[0]), line.along(probes[2]));
     (a.min(b), a.max(b), offset)
 }
@@ -122,13 +133,21 @@ fn join(chains: &[Chain], members: &[usize]) -> Chain {
     let (mut scale, mut weight) = (0f32, 0f32);
     for &m in &order {
         let chain = &chains[m];
-        let forward = line.along(chain.points[chain.points.len() - 1]) >= line.along(chain.points[0]);
-        let first = if forward { chain.points[0] } else { chain.points[chain.points.len() - 1] };
+        let forward =
+            line.along(chain.points[chain.points.len() - 1]) >= line.along(chain.points[0]);
+        let first = if forward {
+            chain.points[0]
+        } else {
+            chain.points[chain.points.len() - 1]
+        };
         if let Some(&last) = points.last() {
             let gap = (first.x - last.x).hypot(first.y - last.y) as usize;
             for k in 1..gap {
                 let t = k as f32 / gap as f32;
-                points.push(Point::new(last.x + t * (first.x - last.x), last.y + t * (first.y - last.y)));
+                points.push(Point::new(
+                    last.x + t * (first.x - last.x),
+                    last.y + t * (first.y - last.y),
+                ));
             }
         }
         if forward {
@@ -139,14 +158,20 @@ fn join(chains: &[Chain], members: &[usize]) -> Chain {
         scale += chain.scale * chain.points.len() as f32;
         weight += chain.points.len() as f32;
     }
-    Chain { points, scale: scale / weight.max(1.0) }
+    Chain {
+        points,
+        scale: scale / weight.max(1.0),
+    }
 }
 
 /// Long straight lines among `chains`: groups of collinear fragments, plus long
 /// straight chains that found no partner.
 pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
-    let mut fragments: Vec<Fragment> =
-        chains.iter().enumerate().filter_map(|(i, c)| straight_fragment(i, c)).collect();
+    let mut fragments: Vec<Fragment> = chains
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| straight_fragment(i, c))
+        .collect();
     fragments.sort_by_key(|f| std::cmp::Reverse(chains[f.index].points.len()));
     let mut used = vec![false; chains.len()];
     let mut lines = Vec::new();
@@ -227,10 +252,18 @@ mod tests {
         let lines = find_long_lines(&chains);
         assert_eq!(lines.len(), 1);
         let points = &lines[0].points;
-        assert!((points[0].x - 10.0).abs() < 1e-3 && (points[points.len() - 1].x - 200.0).abs() < 1e-3);
+        assert!(
+            (points[0].x - 10.0).abs() < 1e-3 && (points[points.len() - 1].x - 200.0).abs() < 1e-3
+        );
         for pair in points.windows(2) {
-            assert!(pair[1].x > pair[0].x, "points must run monotonically along the line");
-            assert!((pair[1].x - pair[0].x) <= 1.5, "gaps must be bridged at about 1 px");
+            assert!(
+                pair[1].x > pair[0].x,
+                "points must run monotonically along the line"
+            );
+            assert!(
+                (pair[1].x - pair[0].x) <= 1.5,
+                "gaps must be bridged at about 1 px"
+            );
         }
     }
 
@@ -246,14 +279,20 @@ mod tests {
 
     #[test]
     fn a_long_straight_chain_is_a_line_on_its_own_and_a_short_one_is_not() {
-        let lines = find_long_lines(&[segment(10.0, 100.0, 30.0, -0.2), segment(10.0, 45.0, 90.0, 0.0)]);
+        let lines = find_long_lines(&[
+            segment(10.0, 100.0, 30.0, -0.2),
+            segment(10.0, 45.0, 90.0, 0.0),
+        ]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].points.len(), 91);
     }
 
     #[test]
     fn distant_fragments_are_not_joined() {
-        let chains = [segment(10.0, 40.0, 20.0, 0.0), segment(260.0, 300.0, 20.0, 0.0)];
+        let chains = [
+            segment(10.0, 40.0, 20.0, 0.0),
+            segment(260.0, 300.0, 20.0, 0.0),
+        ];
         assert!(find_long_lines(&chains).is_empty());
     }
 }

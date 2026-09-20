@@ -54,7 +54,7 @@ fn main() {
             .with_progressive(false)
             .with_decoding_speed(DecodingSpeed::Slow)
             .with_patches(true)
-            .with_splines(false)
+            .with_splines(true)
             .with_color_encoding(ColorEncoding::srgb())
             .with_num_threads(
                 available_parallelism()
