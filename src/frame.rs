@@ -33,11 +33,7 @@ use crate::ac_context::compact_block_context_map;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
 use crate::color_correlation::choose_ytob_dc;
-use crate::dc_group_data::{
-    DcGroupData, STRATEGY_DCT, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, is_sub8_strategy,
-};
+use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
@@ -47,6 +43,7 @@ use crate::entropy::{
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind, find_lossy_patches};
+use crate::quant_weights::quant_table_slot_of;
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
@@ -55,7 +52,7 @@ use crate::util::EncodeError;
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
 const K_GROUP_DIM: usize = 256;
-const K_DC_GROUP_DIM: usize = 2048;
+pub(crate) const K_DC_GROUP_DIM: usize = 2048;
 const K_GROUP_DIM_IN_BLOCKS: usize = 32; // = K_GROUP_DIM / K_BLOCK_DIM
 const K_TILE_DIM_IN_BLOCKS: usize = 8; // = K_TILE_DIM / K_BLOCK_DIM
 const K_NUM_TREE_CONTEXTS: usize = 6;
@@ -114,18 +111,11 @@ struct DistanceParams {
 }
 
 const DC_REFINE_PEAK: f32 = 1.35;
+const DC_COARSEN_D0: f32 = 1.25;
+const DC_COARSEN_D1: f32 = 3.0;
+const DC_COARSEN_MUL: f32 = 0.65;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
-
-/// Whether the closed-loop DC rounding pass (`enc_dc_smooth`) runs. Shared by
-/// the pass itself and the `dc_float` capture-plane allocations so no float
-/// DC is stored when the pass is off. Below d≈0.8 the DC steps are fine
-/// enough that the smoothing gate almost never opens and the pass only adds
-/// noise; it is a quality refinement, not worth Fast's time budget.
-#[inline]
-fn dc_smooth_enabled(distance: f32, speed: Speed) -> bool {
-    distance >= 0.8 && speed == Speed::Slow
-}
 
 #[inline]
 fn dc_refinement(distance: f32) -> f32 {
@@ -140,14 +130,6 @@ fn dc_refinement(distance: f32) -> f32 {
     }
 }
 
-/// Very-low-quality DC/EPF re-fit (SS2 ~4-45; Optuna study dcepf_vlq
-/// 2026-09-02): a linear ramp from the shipped constants at `DCEPF_VLQ_D0` to
-/// much coarser DC (x0.45) plus stronger EPF (sharpness 1, 3 iterations) at
-/// `DCEPF_VLQ_D1`. Kodak d7-26 at full strength: −6.5% BD-rate at matched SS2
-/// AND −10.4% at matched butteraugli-3-norm, 24/24 images on both. The win is
-/// earned at d>=14 (segment BD: d7-10 neutral, d14+ −8..−16%), and the shipped
-/// values are correct through d≈6.5, hence the late, steep ramp. Gaborish was
-/// probed and stays off.
 const DCEPF_VLQ_D0: f32 = 8.0;
 const DCEPF_VLQ_D1: f32 = 15.0;
 const VLQ_DC_MUL: f32 = 0.45;
@@ -157,13 +139,19 @@ fn dcepf_vlq_t(distance: f32) -> f32 {
     ((distance - DCEPF_VLQ_D0) / (DCEPF_VLQ_D1 - DCEPF_VLQ_D0)).clamp(0.0, 1.0)
 }
 
+#[inline]
+fn dc_coarsen(distance: f32) -> f32 {
+    let t = ((distance - DC_COARSEN_D0) / (DC_COARSEN_D1 - DC_COARSEN_D0)).clamp(0.0, 1.0);
+    fmla(DC_COARSEN_MUL - 1.0, t, 1.0)
+}
+
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
     // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
     // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
-    let refine = dc_refinement(distance);
+    let refine = dc_refinement(distance) * dc_coarsen(distance);
     let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
@@ -229,19 +217,6 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     }
 }
 
-/// The third EPF pass (libjxl stage 0: the 5x5 filter, only run at
-/// `epf_iters == 3`) at spec sigma scale 0.9 blurs too hard for the mid band
-/// (SS2 −1.5..−2.3 on Kodak d3-8 at zero rate), which is why the schedule
-/// stopped at two passes. Widening its scale (larger = weaker pass) turns it
-/// into a both-metrics win: rate-free Kodak grid 2026-09-07, s=3.6 at d3/4/6
-/// /8/10 = SS2 +0.04/+0.08/+0.12/+0.13/+0.21 (18-23/24, worst −0.06) with
-/// butteraugli-3 −0.19/−0.20/−0.33/−0.54/−0.48% (24/24); holdout crops agree
-/// (d4 +0.08/−0.22%, d8 +0.13/−0.58%, 14/14 BA). d=2 is neutral, so the pass
-/// starts at `EPF_PASS0_START_D`; inside the VLQ ramp the scale eases toward
-/// the fitted spec-strength band (`DCEPF_VLQ_D0`.., 3 passes at 0.9 from
-/// half-ramp), where the default header is written unchanged. Costs the
-/// 8-byte custom-sigma header. An Optuna re-fit of (start, scale, VLQ scale)
-/// confirmed these values as the optimum on a flat surface.
 const EPF_PASS0_START_D: f32 = 2.5;
 const EPF_PASS0_SCALE: f32 = 3.6;
 const EPF_PASS0_SPEC_SCALE: f32 = 0.9;
@@ -812,6 +787,7 @@ fn write_frame_header_kind(
     has_alpha: bool,
     coeff_shifts: &[u32],
     kind: VarDctFrameKind<'_>,
+    has_splines: bool,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -824,6 +800,7 @@ fn write_frame_header_kind(
             has_alpha,
             coeff_shifts,
             false,
+            has_splines,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -835,6 +812,7 @@ fn write_frame_header_kind(
             has_alpha,
             coeff_shifts,
             true,
+            has_splines,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
@@ -907,18 +885,25 @@ fn write_frame_header(
     has_alpha: bool,
     coeff_shifts: &[u32],
     has_patches: bool,
+    has_splines: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // Keep decoder-side adaptive DC smoothing enabled. The only optional flag
-    // here is kPatches; the skip-smoothing flag remains clear.
-    if has_patches {
-        w.write(2, 1); // U64 selector for values 1..=16
-        w.write(4, 1); // flags = kPatches (2), encoded as value - 1
-    } else {
-        w.write(2, 0);
+    // Keep decoder-side adaptive DC smoothing enabled. The optional flags are
+    // kPatches (2) and kSplines (16); the skip-smoothing flag remains clear.
+    let flags = if has_patches { 2u64 } else { 0 } + if has_splines { 16 } else { 0 };
+    match flags {
+        0 => w.write(2, 0),
+        1..=16 => {
+            w.write(2, 1); // U64 selector for values 1..=16
+            w.write(4, flags - 1);
+        }
+        _ => {
+            w.write(2, 2); // U64 selector for values 17..=272
+            w.write(8, flags - 17);
+        }
     }
     w.write(2, 0); // no upsampling
 
@@ -1156,25 +1141,6 @@ fn write_dc_global(
     }
 }
 
-/// Which `custom_tables` slot a strategy's quant table lives in, or `None` when
-/// its table is not one jixel can override (DCT4X4, IDENTITY and DCT2X2 stay
-/// on their spec library tables — a 2026-09 fitted-table experiment for the
-/// fine transforms was refuted on photos).
-#[inline]
-fn quant_table_slot_of(raw_strategy: u8) -> Option<usize> {
-    Some(match raw_strategy {
-        STRATEGY_DCT => 0,
-        STRATEGY_DCT16X16 => 1,
-        STRATEGY_DCT32X32 => 2,
-        STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 3,
-        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 4,
-        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => 5,
-        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
-        STRATEGY_DCT64X64 => 7,
-        _ => return None,
-    })
-}
-
 /// Slots whose transform actually appears in the frame.
 fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
     let mut used = [false; 9];
@@ -1182,9 +1148,6 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
                 used[slot] = true;
-            }
-            if strategy == crate::dc_group_data::STRATEGY_IDENTITY {
-                used[8] = true;
             }
         }
     }
@@ -1271,8 +1234,6 @@ fn write_ac_global(
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
-    lz_code: &crate::entropy::OwnedEntropyCode,
-    use_lz77: bool,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -1287,16 +1248,11 @@ fn write_ac_global(
     }
     // HfGlobal parses `num_passes` HfPass blocks (jxl-frame hf_global.rs:57-59),
     // each = used_orders(U32 sel 3 + u(13)=0 -> natural order) + hf_dist entropy
-    // code. Each pass gets its own code (ac_codes[p]); the single-pass LZ77 path
-    // instead writes the LZ code in its one HfPass.
+    // code. Each pass gets its own code (ac_codes[p]).
     for code in ac_codes {
         crate::coeff_order::write_coeff_orders(coeff_orders, &mut scratch.huffman_pool, w);
-        if use_lz77 {
-            crate::lz77_ac::write_ac_lz_header_and_code(lz_code, &mut scratch.huffman_pool, w);
-        } else {
-            w.write(1, 0);
-            write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
-        }
+        w.write(1, 0);
+        write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
     }
 }
 
@@ -1466,6 +1422,15 @@ fn encode_frame_vardct(
     } else {
         [0.0; 3]
     };
+    let (x_steps, b_steps) = if slow_chromatic {
+        pixel_chromacity_steps(&xyb)
+    } else {
+        (0, 0)
+    };
+    if distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
+        ctx.raise_x_qm_scale_floor(2 + x_steps);
+        ctx.raise_b_qm_scale(2 + b_steps);
+    }
     // Saturated-content tables are validated under Slow only: at Fast the
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
     ctx.set_chroma_heavy(slow_chromatic && saturation_stat >= SAT_QM_THRESHOLD);
@@ -1483,15 +1448,32 @@ fn encode_frame_vardct(
     // the same point. Ordinary photos measured far below this gate.
     ctx.set_x_heavy(slow_chromatic && x_grad_stat >= X_QM_GRAD_THRESHOLD);
     ctx.set_b_heavy(slow_chromatic && b_grad_stat >= B_GRAD_THRESHOLD);
-    // `x_heavy` is first knowable after conversion to XYB. This used to be
-    // queried by `apply_yellow_opsin` before it was computed, leaving the
-    // advertised blue/green fine-B path permanently disabled.
-    if ctx.x_heavy() {
-        ctx.raise_b_qm_scale(x_heavy_b_qm_scale());
+    if ctx.x_heavy() && b_steps > 0 {
+        ctx.raise_b_qm_scale(X_HEAVY_B_QM_SCALE);
     }
+
+    #[cfg(feature = "splines")]
+    let quant_field = if ctx.splines {
+        spline_quant_field(ctx, scratch, &xyb, distp)?
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "splines")]
+    let spline_candidates = if ctx.splines {
+        crate::splines::find_candidates(ctx, scratch, distance, &xyb, &quant_field)
+    } else {
+        None
+    };
+    #[cfg(feature = "splines")]
+    let select_splines = |image: &mut Image3F, forbidden: Option<&[bool]>| {
+        let candidates = spline_candidates.as_ref()?;
+        crate::splines::select_splines(ctx, distance, image, &quant_field, candidates, forbidden)
+    };
 
     if patches && let Some(plan) = find_lossy_patches(&xyb, &ctx.thread_pool, scratch) {
         let mut regular = xyb.clone();
+        #[cfg(feature = "splines")]
+        let regular_splines = select_splines(&mut regular, None);
         gaborize(&mut regular, distp);
         let mut regular_writer = BitWriter::new();
         encode_frame_core(
@@ -1502,6 +1484,8 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Regular,
+            #[cfg(feature = "splines")]
+            regular_splines.as_ref(),
             &mut regular_writer,
         )?;
 
@@ -1565,6 +1549,8 @@ fn encode_frame_vardct(
                         width: atlas_w,
                         height: atlas_h,
                     },
+                    #[cfg(feature = "splines")]
+                    None,
                     out,
                 )
             };
@@ -1613,6 +1599,25 @@ fn encode_frame_vardct(
         }
 
         let mut base = plan.base;
+        // Patches replace their rectangles and the decoder draws splines after
+        // them, so no spline may reach into a patch.
+        #[cfg(feature = "splines")]
+        let base_splines = if spline_candidates.is_some() {
+            let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
+            let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
+            for reference in &references {
+                for &(px, py) in &reference.positions {
+                    for by in py / K_BLOCK_DIM..(py + reference.height).div_ceil(K_BLOCK_DIM) {
+                        for bx in px / K_BLOCK_DIM..(px + reference.width).div_ceil(K_BLOCK_DIM) {
+                            in_patch[by * blocks_w + bx] = true;
+                        }
+                    }
+                }
+            }
+            select_splines(&mut base, Some(&in_patch))
+        } else {
+            None
+        };
         gaborize(&mut base, distp);
         encode_frame_core(
             ctx,
@@ -1622,6 +1627,8 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             VarDctFrameKind::Patched(&references),
+            #[cfg(feature = "splines")]
+            base_splines.as_ref(),
             &mut patched_writer,
         )?;
         if patched_writer.bits_written() < regular_writer.bits_written() {
@@ -1632,6 +1639,8 @@ fn encode_frame_vardct(
         return Ok(());
     }
 
+    #[cfg(feature = "splines")]
+    let splines = select_splines(&mut xyb, None);
     gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
@@ -1641,8 +1650,47 @@ fn encode_frame_vardct(
         alpha,
         coeff_shifts,
         VarDctFrameKind::Regular,
+        #[cfg(feature = "splines")]
+        splines.as_ref(),
         writer,
     )
+}
+
+/// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
+/// any spline is removed; the spline RD gate prices blocks with it.
+#[cfg(feature = "splines")]
+fn spline_quant_field(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    xyb: &Image3F,
+    distp: &DistanceParams,
+) -> Result<Vec<f32>, EncodeError> {
+    let blocks_w = xyb.xsize().div_ceil(K_BLOCK_DIM);
+    let blocks_h = xyb.ysize().div_ceil(K_BLOCK_DIM);
+    let mut field = vec![0f32; blocks_w * blocks_h];
+    for y0 in (0..xyb.ysize()).step_by(K_DC_GROUP_DIM) {
+        for x0 in (0..xyb.xsize()).step_by(K_DC_GROUP_DIM) {
+            let gw = K_DC_GROUP_DIM.min(xyb.xsize() - x0).div_ceil(K_BLOCK_DIM);
+            let gh = K_DC_GROUP_DIM.min(xyb.ysize() - y0).div_ceil(K_BLOCK_DIM);
+            let mut raw = crate::image::ImageB::try_new_fill(gw, gh, 1)?;
+            (ctx.fill_quant_field)(
+                &mut scratch.aq_map,
+                xyb,
+                &mut raw,
+                x0,
+                y0,
+                distp.distance,
+                1.0 / distp.scale,
+            );
+            for y in 0..gh {
+                let row = &mut field[(y0 / K_BLOCK_DIM + y) * blocks_w + x0 / K_BLOCK_DIM..];
+                for (dst, &q) in row.iter_mut().zip(&raw.row(y)[..gw]) {
+                    *dst = distp.scale * q as f32;
+                }
+            }
+        }
+    }
+    Ok(field)
 }
 
 /// Power-of-two refinement of the modular atlas quantization lattice.
@@ -1666,12 +1714,66 @@ const X_QM_GRAD_THRESHOLD: f32 = 0.04;
 /// `x_heavy`)
 const B_GRAD_THRESHOLD: f32 = 0.45;
 
-/// Fine-B precision for the synthetic high-frequency opponent-color class.
-/// Scale 7 is the strongest representable multiplier and remained efficient
-/// at matched rate on the fitted d=0.5/1/1.25/1.5 points.
-#[inline]
-fn x_heavy_b_qm_scale() -> u32 {
-    7
+const X_HEAVY_B_QM_SCALE: u32 = 7;
+
+/// Below this the X scale is 2 and the extra precision only costs rate.
+const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
+
+/// libjxl's `PixelStatsForChromacityAdjustment`: extra X and B quant-scale
+/// steps from the worst pixel-to-pixel step of X and of B - Y, plus one B step
+/// for strongly exposed blue. Thresholds are libjxl's.
+fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
+    let (w, h) = (xyb.xsize(), xyb.ysize());
+    if w < 2 || h < 2 {
+        return (0, 0);
+    }
+    let (mut dx, mut db, mut exposed_blue) = (0.0f32, 0.0f32, 0.0f32);
+    let rows = xyb
+        .plane_data(0)
+        .chunks_exact(w)
+        .zip(xyb.plane_data(1).chunks_exact(w))
+        .zip(xyb.plane_data(2).chunks_exact(w));
+    for (((xp, yp), bp), ((xr, yr), br)) in rows.clone().zip(rows.skip(1)) {
+        // Carry the left pixel and its B - Y difference between iterations.
+        let mut current = xr.iter().zip(yr).zip(br);
+        let Some(((&xl, &yl), &bl)) = current.next() else {
+            continue;
+        };
+        let (mut left_x, mut left_b, mut left_diff) = (xl, bl, bl - yl);
+        let previous = xp.iter().zip(yp).zip(bp).skip(1);
+        for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
+            let step_x = (x - left_x).abs().max((x - px).abs());
+            dx = dx.max(step_x);
+            let diff_b = b - y;
+            let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
+            db = db.max(step_b);
+            let exposed = b - y * 1.2;
+            let step = (b - left_b).abs() + (b - pb).abs();
+            // A negative exposure cannot raise this nonnegative maximum;
+            // max also ignores NaNs, as the original conditional did.
+            exposed_blue = exposed_blue.max(exposed * step);
+            left_x = x;
+            left_b = b;
+            left_diff = diff_b;
+        }
+        if dx >= 0.026 && db > 0.38 && exposed_blue >= 0.13 {
+            return (3, 3);
+        }
+    }
+    let x_steps = match dx {
+        v if v >= 0.026 => 3,
+        v if v >= 0.022 => 2,
+        v if v >= 0.015 => 1,
+        _ => 0,
+    };
+    let blue = u32::from(exposed_blue >= 0.13);
+    let b_steps = match db {
+        v if v > 0.38 => 2 + blue,
+        v if v > 0.33 => 1 + blue,
+        v if v > 0.28 => blue,
+        _ => 0,
+    };
+    (x_steps, b_steps)
 }
 
 fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
@@ -1837,6 +1939,7 @@ fn encode_frame_core(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
+    #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
@@ -1845,6 +1948,7 @@ fn encode_frame_core(
     if ctx.x_heavy() && distp.x_qm_scale == 2 {
         distp.x_qm_scale = 3;
     }
+    distp.x_qm_scale = distp.x_qm_scale.max(ctx.x_qm_scale_floor());
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
@@ -1892,6 +1996,17 @@ fn encode_frame_core(
         dc_datas.push(dc_data);
     }
 
+    crate::ac_strategy::account_matrix_headers(
+        ctx,
+        scratch,
+        opsin,
+        distance,
+        distp.scale,
+        distp.x_qm_scale,
+        &group_coords,
+        &mut dc_datas,
+    );
+
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
     // coefficient statistics; whether any split is *kept* is decided later
@@ -1912,7 +2027,7 @@ fn encode_frame_core(
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, local_float, stats) = process_ac_group(
+            let (p, local, stats) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -1931,16 +2046,15 @@ fn encode_frame_core(
                 want_order_stats,
                 qf_threshold,
             );
-            (dc_idx, gx, gy, p, local, local_float, stats)
+            (dc_idx, gx, gy, p, local, stats)
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     // Adopt the first group's buffers instead of allocating an empty tally.
     // Fast and progressive frames never allocate aggregate order statistics.
     let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
-    for (dc_idx, gx, gy, p, local, local_float, stats) in results {
+    for (dc_idx, gx, gy, p, local, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
-        merge_dc_float(&mut dc_datas[dc_idx], gx, gy, &local_float);
         all_pending.push(p);
         if let Some(s) = stats {
             if let Some(total) = &mut order_stats {
@@ -1983,6 +2097,8 @@ fn encode_frame_core(
                 // one-token nudge can push the clustering off a knife-edge merge.
                 // Selection applies to the final codes only.
                 false,
+                ctx.speed,
+                Some(&ctx.thread_pool),
             );
             crate::entropy::FrozenTokenPrices::new(&provisional_code)
         };
@@ -1993,7 +2109,7 @@ fn encode_frame_core(
             .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _local_float, _) = process_ac_group(
+                let (p, local, _) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -2017,68 +2133,6 @@ fn encode_frame_core(
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
-        }
-
-        // Closed-loop DC rounding against the decoder's adaptive DC
-        // smoothing: sub-quantstep DC precision on smooth content for
-        // near-zero rate. Above the curve across d≈1..6 on both corpora.
-        if dc_smooth_enabled(distance, ctx.speed) {
-            let steps = [
-                1.0 / (crate::quant_weights::INV_DC_QUANT[0] * distp.scale_dc),
-                1.0 / (crate::quant_weights::INV_DC_QUANT[1] * distp.scale_dc),
-                1.0 / (crate::quant_weights::INV_DC_QUANT[2] * distp.scale_dc),
-            ];
-            let r_b = 1.0 + ytob_dc as f32 / crate::color_correlation::K_COLOR_FACTOR;
-            if dc_datas.len() == 1 {
-                let dc = &mut dc_datas[0];
-                crate::dc_smooth::optimize_dc_rounding(
-                    &mut dc.quant_dc,
-                    &dc.dc_float,
-                    steps,
-                    r_b,
-                    Some((&ctx.thread_pool, scratch)),
-                );
-            } else {
-                // The smoothing filter spans the whole DC plane, so stitch
-                // the per-DC-group planes together, optimize once, and
-                // scatter the result back.
-                let (wb, hb) = (dim.xsize_blocks, dim.ysize_blocks);
-                let mut full_q = Image3S::new(wb, hb);
-                let mut full_f = Image3F::new(wb, hb);
-                const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
-                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
-                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
-                    let src_q = &dc_datas[i].quant_dc;
-                    let src_f = &dc_datas[i].dc_float;
-                    for c in 0..3 {
-                        for ly in 0..src_q.ysize() {
-                            let n = src_q.xsize();
-                            full_q.plane_row_mut(c, oy + ly)[ox..ox + n]
-                                .copy_from_slice(&src_q.plane_row(c, ly)[..n]);
-                            full_f.plane_row_mut(c, oy + ly)[ox..ox + n]
-                                .copy_from_slice(&src_f.plane_row(c, ly)[..n]);
-                        }
-                    }
-                }
-                crate::dc_smooth::optimize_dc_rounding(
-                    &mut full_q,
-                    &full_f,
-                    steps,
-                    r_b,
-                    Some((&ctx.thread_pool, scratch)),
-                );
-                for (i, &(gx, gy)) in group_coords.iter().enumerate() {
-                    let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
-                    let dst = &mut dc_datas[i].quant_dc;
-                    for c in 0..3 {
-                        for ly in 0..dst.ysize() {
-                            let n = dst.xsize();
-                            dst.plane_row_mut(c, ly)[..n]
-                                .copy_from_slice(&full_q.plane_row(c, oy + ly)[ox..ox + n]);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -2158,6 +2212,8 @@ fn encode_frame_core(
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
         ctx.speed != Speed::Fastest,
+        ctx.speed,
+        Some(&ctx.thread_pool),
     );
     let tree_static = DcTreeChoice::Static(dc_gradient);
 
@@ -2224,6 +2280,8 @@ fn encode_frame_core(
             learned.num_contexts,
             &mut scratch.huffman_pool,
             ctx.speed != Speed::Fastest,
+            ctx.speed,
+            Some(&ctx.thread_pool),
         );
 
         // Price both arms end to end: serialized tree + entropy-code header
@@ -2232,7 +2290,7 @@ fn encode_frame_core(
         // noise so near-ties keep the battle-tested static tree.
         let payload =
             |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
-                crate::lz77_ac::estimate_ac_plain_bits(
+                crate::entropy::estimate_ac_plain_bits(
                     dc.iter()
                         .map(Vec::as_slice)
                         .chain(meta.iter().map(Vec::as_slice)),
@@ -2319,6 +2377,7 @@ fn encode_frame_core(
                         pending.iter().map(|p| p.tokens[pass].as_slice()),
                         num_contexts,
                         &mut scratch.huffman_pool,
+                        Some(&ctx.thread_pool),
                     )
                 } else {
                     crate::entropy::optimize_entropy_code_ac_streams(
@@ -2326,6 +2385,8 @@ fn encode_frame_core(
                         num_contexts,
                         &mut scratch.huffman_pool,
                         true,
+                        ctx.speed,
+                        Some(&ctx.thread_pool),
                     )
                 }
             })
@@ -2343,7 +2404,7 @@ fn encode_frame_core(
         }
         let mut bits = header.bits_written() as u64;
         for (pass, code) in codes.iter().enumerate() {
-            bits += crate::lz77_ac::estimate_ac_plain_bits(
+            bits += crate::entropy::estimate_ac_plain_bits(
                 pending.iter().map(|p| p.tokens[pass].as_slice()),
                 code,
             );
@@ -2436,37 +2497,6 @@ fn encode_frame_core(
         }
     }
 
-    let ac_num_contexts = ac_plan.num_ac_contexts() + 1;
-
-    // LZ77 path is single-pass only for now: it compresses one token stream per
-    // group. Multi-pass uses the per-pass plain codes.
-    let ac_lz_code_owned;
-    let use_lz77;
-    if num_passes == 1 && ctx.speed != Speed::Fastest {
-        let (code, lz_bits) = crate::lz77_ac::build_ac_lz_code(
-            all_pending.iter().map(|p| p.tokens[0].as_slice()),
-            ac_num_contexts,
-            &mut scratch.huffman_pool,
-        );
-        ac_lz_code_owned = code;
-        let plain_bits = crate::lz77_ac::estimate_ac_plain_bits(
-            all_pending
-                .iter()
-                .map(|pending| pending.tokens[0].as_slice()),
-            &ac_code_per_pass[0],
-        );
-        // Require the same margin for the LZ77 header and distance context.
-        use_lz77 = lz_bits + 512 < plain_bits;
-    } else {
-        ac_lz_code_owned = crate::lz77_ac::build_ac_lz_code(
-            std::iter::empty(),
-            ac_num_contexts,
-            &mut scratch.huffman_pool,
-        )
-        .0;
-        use_lz77 = false;
-    }
-
     // Phase 4: write DC global with adaptive DC code.
     if let VarDctFrameKind::Patched(references) = frame_kind {
         crate::lossless::write_patch_dictionary(
@@ -2475,6 +2505,10 @@ fn encode_frame_core(
             scratch,
             &mut sections[0],
         );
+    }
+    #[cfg(feature = "splines")]
+    if let Some(set) = splines {
+        crate::splines::write_splines(set, scratch, &mut sections[0]);
     }
     write_dc_global(
         &distp,
@@ -2551,16 +2585,51 @@ fn encode_frame_core(
         &coeff_orders,
         dim.num_groups,
         &ac_code_per_pass,
-        &ac_lz_code_owned,
-        use_lz77,
         scratch,
         &mut sections[1 + dim.num_dc_groups],
     );
 
+    // Rate-model reconciliation log (`JIXEL_RATE_LOG=path`): for every coded
+    // (block, channel) the model's estimate next to the bits the final
+    // entropy code spends on its tokens.
+    if let Some(path) = std::env::var_os("JIXEL_RATE_LOG") {
+        use std::io::Write;
+        let prices: Vec<crate::entropy::FrozenTokenPrices> = ac_code_per_pass
+            .iter()
+            .map(crate::entropy::FrozenTokenPrices::new)
+            .collect();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("JIXEL_RATE_LOG");
+        let mut log = std::io::BufWriter::new(file);
+        for pg in &all_pending {
+            for r in &pg.rate_records {
+                let toks = &pg.tokens[r.pass as usize][r.start as usize..r.end as usize];
+                let actual: f32 = toks
+                    .iter()
+                    .map(|&t| prices[r.pass as usize].token_bits(t))
+                    .sum();
+                let _ = writeln!(
+                    log,
+                    "{} {} {} {:.3} {} {} {:.3} {:.3}",
+                    r.strategy,
+                    r.channel,
+                    r.pass,
+                    distp.distance,
+                    r.quant,
+                    r.nzeros,
+                    r.model_bits,
+                    actual
+                );
+            }
+        }
+    }
+
     // Phase 7: write each (pass, group) AC section. Section index for
     // (pass, group) = 2 + num_dc_groups + pass*num_groups + group_idx
-    // (jxl-frame toc.rs:196-200). With LZ77 (single-pass only) we emit the
-    // compressed stream; otherwise raw tokens via the shared plain code.
+    // (jxl-frame toc.rs:196-200): raw tokens via the shared plain code.
     let num_ac_sections = all_pending.len() * num_passes;
     let ac_sections = ctx
         .thread_pool
@@ -2571,27 +2640,21 @@ fn encode_frame_core(
             let pass_tokens = &pg.tokens[pass];
             let mut w = BitWriter::new();
             let section_idx = 2 + dim.num_dc_groups + pass * dim.num_groups + pg.group_idx;
-            if use_lz77 {
-                for t in crate::lz77_ac::lz77_ac_tokens(pass_tokens) {
-                    crate::lz77_ac::write_ac_lz(t, &ac_lz_code_owned, ac_num_contexts, &mut w);
+            let code_ref = ac_code_per_pass[pass].as_ref();
+            if code_ref.use_prefix_code {
+                for t in pass_tokens {
+                    write_token(*t, &code_ref, &mut w);
                 }
             } else {
-                let code_ref = ac_code_per_pass[pass].as_ref();
-                if code_ref.use_prefix_code {
-                    for t in pass_tokens {
-                        write_token(*t, &code_ref, &mut w);
-                    }
-                } else {
-                    // rANS: the whole group's tokens are encoded as one LIFO unit.
-                    crate::entropy::write_ans_tokens(
-                        pass_tokens,
-                        code_ref.context_map,
-                        code_ref.ans_symbols,
-                        code_ref.ans_reverse_maps,
-                        code_ref.hybrid_uint_configs,
-                        &mut w,
-                    );
-                }
+                // rANS: the whole group's tokens are encoded as one LIFO unit.
+                crate::entropy::write_ans_tokens(
+                    pass_tokens,
+                    code_ref.context_map,
+                    code_ref.ans_symbols,
+                    code_ref.ans_reverse_maps,
+                    code_ref.hybrid_uint_configs,
+                    &mut w,
+                );
             }
             (section_idx, w)
         });
@@ -2633,6 +2696,10 @@ fn encode_frame_core(
         }
     }
 
+    #[cfg(feature = "splines")]
+    let has_splines = splines.is_some();
+    #[cfg(not(feature = "splines"))]
+    let has_splines = false;
     write_frame_header_kind(
         distp.x_qm_scale,
         ctx.b_qm_scale(),
@@ -2642,6 +2709,7 @@ fn encode_frame_core(
         alpha.is_some(),
         coeff_shifts,
         frame_kind,
+        has_splines,
         writer,
     );
     combine_sections(&mut sections, writer);
@@ -2656,6 +2724,8 @@ fn encode_frame_core(
 pub(crate) struct PendingAcGroup {
     pub(crate) group_idx: usize,
     pub(crate) tokens: Vec<Vec<Token>>,
+    /// Filled only under `JIXEL_RATE_LOG` (rate-model reconciliation study).
+    pub(crate) rate_records: Vec<crate::group::BlockRateRecord>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2693,47 +2763,14 @@ fn setup_dc_group(
         1.0 / distp.scale,
     );
 
-    // Apply perceptual AQ before transform selection. Candidate costs and the
-    // reconstruction rerank must see the same content-adaptive quant field that
-    // will ultimately be used for coefficient coding. `fill_ac_strategy` applies
-    // the transform-size adjustment to this field after selection.
-    if let Some(boost) = ctx.boost.as_ref() {
-        crate::dark_aq::apply_boost(
-            &mut scratch.dark_octile,
-            boost,
+    if ctx.speed == Speed::Slow && (ctx.x_heavy() || ctx.b_heavy()) {
+        crate::adaptive_quant::apply_chroma_hf_protection(
             opsin,
             &mut dc_data.raw_quant_field,
             dc_group_x0,
             dc_group_y0,
             distp.distance,
-            ctx.b_heavy(),
-            ctx.apply_quant_field_gain,
-            ctx.dark_structure_stats,
-            ctx.fill_blue_tile,
         );
-    }
-
-    if ctx.speed == Speed::Slow {
-        crate::structure_aq::apply(
-            &mut scratch.structure_corrections,
-            opsin,
-            &mut dc_data.raw_quant_field,
-            dc_group_x0,
-            dc_group_y0,
-            distp.distance,
-            ctx.dct8x8,
-            ctx.block_features,
-            ctx.apply_structure_corrections,
-        );
-        if ctx.x_heavy() || ctx.b_heavy() {
-            crate::adaptive_quant::apply_chroma_hf_protection(
-                opsin,
-                &mut dc_data.raw_quant_field,
-                dc_group_x0,
-                dc_group_y0,
-                distp.distance,
-            );
-        }
     }
 
     // Compute the per-tile CfL slopes before strategy selection so candidate
@@ -2824,7 +2861,8 @@ fn setup_dc_group(
                                 && y >= rollback.by
                                 && y < rollback.by + rollback.cov_y
                         });
-                    if is_sub8_strategy(strategy) && !in_accepted_mosaic {
+                    if crate::dc_group_data::is_gated_sub8_strategy(strategy) && !in_accepted_mosaic
+                    {
                         positions.push((x, y, strategy));
                     }
                 }
@@ -2858,28 +2896,6 @@ fn merge_quant_dc(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3S) {
         for ly in 0..ghb {
             let src = local.plane_row(c, ly);
             dc.quant_dc.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
-        }
-    }
-}
-
-/// Merge a group-local unquantized DC plane (same geometry as
-/// [`merge_quant_dc`]) into the DC group's `dc_float`, sizing the
-/// destination on first use. A no-op when the capture is disabled (empty
-/// local image).
-fn merge_dc_float(dc: &mut DcGroupData, gx: usize, gy: usize, local: &Image3F) {
-    if local.xsize() == 0 {
-        return;
-    }
-    if dc.dc_float.xsize() == 0 {
-        dc.dc_float = Image3F::new(dc.quant_dc.xsize(), dc.quant_dc.ysize());
-    }
-    let ox = gx * K_GROUP_DIM_IN_BLOCKS;
-    let oy = gy * K_GROUP_DIM_IN_BLOCKS;
-    let (gwb, ghb) = (local.xsize(), local.ysize());
-    for c in 0..3 {
-        for ly in 0..ghb {
-            let src = local.plane_row(c, ly);
-            dc.dc_float.plane_row_mut(c, oy + ly)[ox..ox + gwb].copy_from_slice(&src[..gwb]);
         }
     }
 }
@@ -2930,7 +2946,6 @@ fn process_ac_group(
 ) -> (
     PendingAcGroup,
     Image3S,
-    Image3F,
     Option<crate::coeff_order::OrderStats>,
 ) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
@@ -2946,13 +2961,6 @@ fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
-    // Float DC targets are only captured when the DC-smoothing rounding pass
-    // is going to consume them (`write_ac_group` skips the empty image).
-    let mut local_dc_float = if num_passes == 1 && dc_smooth_enabled(distp.distance, ctx.speed) {
-        Image3F::new(gwb, ghb)
-    } else {
-        Image3F::new(0, 0)
-    };
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
         .collect();
@@ -2960,6 +2968,8 @@ fn process_ac_group(
         .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
         .collect();
     let mut order_stats = collect_order_stats.then(crate::coeff_order::OrderStats::new);
+    let mut rate_records: Option<Vec<crate::group::BlockRateRecord>> =
+        std::env::var_os("JIXEL_RATE_LOG").map(|_| Vec::new());
 
     for ty in 0..group_ysize_tiles {
         let stripe_x0 = group_x0;
@@ -3000,7 +3010,6 @@ fn process_ac_group(
             dc_data,
             ytob_dc,
             &mut local_quant_dc,
-            &mut local_dc_float,
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
@@ -3011,6 +3020,7 @@ fn process_ac_group(
             false,
             qf_threshold,
             &mut tokens,
+            rate_records.as_mut(),
         );
     }
 
@@ -3018,9 +3028,9 @@ fn process_ac_group(
         PendingAcGroup {
             group_idx: image_gy * dim.xsize_groups + image_gx,
             tokens,
+            rate_records: rate_records.unwrap_or_default(),
         },
         local_quant_dc,
-        local_dc_float,
         order_stats,
     )
 }
@@ -3058,10 +3068,38 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arithmetic_matrix_header_cost_matches_writer_for_every_subset() {
+        use crate::quant_weights::{DequantMatrices, MatrixHeaderCost};
+        for distance in [0.5, 1.5, 2.5, 4.0, 8.0] {
+            for matrices in [
+                DequantMatrices::new(distance),
+                DequantMatrices::new_pair_b(distance),
+                DequantMatrices::new_saturated(distance),
+                DequantMatrices::new_x_heavy(distance),
+                DequantMatrices::new_saturated_pair_b(distance),
+                DequantMatrices::new_fast(distance),
+            ] {
+                let header = MatrixHeaderCost::new(matrices);
+                for mask in 0..512u16 {
+                    let used = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+                    let mut writer = crate::bit_writer::BitWriter::new();
+                    super::write_dequant_matrices(matrices, &used, &mut writer);
+                    assert_eq!(
+                        header.bits(mask),
+                        writer.bits_written(),
+                        "d={distance} mask={mask}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::{
-        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE,
-        MIN_TOKENS_PER_DC_LEAF, choose_dc_predictors, compute_distance_params, dc_refinement,
-        epf_sharpness_id, quant_dc,
+        DC_COARSEN_D0, DC_COARSEN_D1, DC_COARSEN_MUL, DC_REFINE_HOLD, DC_REFINE_PEAK,
+        DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE, MIN_TOKENS_PER_DC_LEAF,
+        choose_dc_predictors, compute_distance_params, dc_coarsen, dc_refinement, epf_sharpness_id,
+        quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -3223,6 +3261,21 @@ mod tests {
     }
 
     #[test]
+    fn dc_coarsen_is_identity_at_hq_and_ramps_to_the_floor() {
+        assert_eq!(dc_coarsen(0.5), 1.0);
+        assert_eq!(dc_coarsen(DC_COARSEN_D0), 1.0);
+        assert!((dc_coarsen(DC_COARSEN_D1) - DC_COARSEN_MUL).abs() < 1e-6);
+        assert!((dc_coarsen(10.0) - DC_COARSEN_MUL).abs() < 1e-6);
+        let mut prev = dc_coarsen(DC_COARSEN_D0);
+        for i in 1..=40 {
+            let d = DC_COARSEN_D0 + (DC_COARSEN_D1 - DC_COARSEN_D0) * (i as f32 / 40.0);
+            let v = dc_coarsen(d);
+            assert!(v <= prev + 1e-6);
+            prev = v;
+        }
+    }
+
+    #[test]
     fn dc_refinement_holds_then_ramps_out_monotonically() {
         // Full refinement through the hold point, none past the release point.
         for d in [0.1, 0.5, 1.0, 2.0, DC_REFINE_HOLD] {
@@ -3335,7 +3388,7 @@ mod fused_dc_tests {
                         for x in 0..w {
                             let i = (y * w + x + 1) * (c + 7);
                             dc.quant_dc.plane_row_mut(c, y)[x] =
-                                ((i * 7919 ^ (i / 7 * 1237)) % 65536) as i16;
+                                (((i * 7919) ^ (i / 7 * 1237)) % 65536) as i16;
                         }
                     }
                 }

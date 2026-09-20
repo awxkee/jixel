@@ -34,8 +34,9 @@
 //! aom AV1 reference, and (optionally, `--jpeg`) a classic JPEG reference
 //! (cjpegli when available, else cjpeg/libjpeg-turbo, else the image crate)
 //! — over every image in a folder at each requested
-//! butteraugli distance, decodes, scores SSIMULACRA2, and reports the **folder
-//! mean** rate (bits/pixel) and SSIMULACRA2 per series. It prints the per-series
+//! butteraugli distance, decodes, scores SSIMULACRA2 (plus the butteraugli
+//! 3-norm whenever `butteraugli_main` is on PATH), and reports the **folder
+//! mean** rate (bits/pixel) and each metric per series. It prints the per-series
 //! means and draws one aggregate R/D chart (mean SS2 vs mean bpp), one line per
 //! series — the corpus-level analogue of the per-image chart in `stats`.
 //!
@@ -44,15 +45,17 @@
 //! meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]
 //!                  [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]
 //!                  [--no-aom] [--no-cjxl] [--patches] [--jpeg] [--cjpegli PATH]
+//!                  [--no-butteraugli] [--butteraugli-bin PATH]
 //! ```
 
 use anyhow::{Context, Result, bail};
 use jixel::Speed;
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::available_parallelism;
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
@@ -64,16 +67,54 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg"];
 const SYS_AVIFENC: &str = "avifenc";
 const SYS_AVIFDEC: &str = "avifdec";
 
+// --- ColorVideoVDP: the `cvvdp` CLI from gfxdisp/ColorVideoVDP (pip package
+// `pycvvdp`, installed from GitHub). Opt-in via `--cvvdp`. One `cvvdp -i`
+// process stays alive for the whole run (torch starts once) and scores every
+// series of an image in a single request against one reference. Inputs are
+// 8-bit PPMs written from the very buffers SSIMULACRA2 scores: pycvvdp reads
+// PNGs through imageio's FreeImage plugin, whose bundled dylib is x86_64-only,
+// while any other extension goes through Pillow.
+const CVVDP_BIN: &str = "cvvdp";
+/// Fallback when `cvvdp` is not on PATH: the parameters_fit venv of this repo.
+const CVVDP_VENV_BIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../parameters_fit/.venv/bin/cvvdp"
+);
+/// Display model passed as `--display` (photometry + geometry the metric assumes).
+const CVVDP_DISPLAY: &str = "standard_4k";
+
+// --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3.
+// On by default when the tool is there (it is cheap next to the encodes);
+// disable with `--no-butteraugli`. It reads the same PPMs cvvdp is fed, so
+// every metric scores exactly the buffers SSIMULACRA2 scored.
+const BUTTERAUGLI_BIN: &str = "butteraugli_main";
+/// p of the butteraugli p-norm reported alongside the max distance.
+const BUTTERAUGLI_PNORM: u32 = 3;
+
 /// One measured (rate, quality) pair for a single image.
 struct Sample {
     bpp: f64,
     ss2: f64,
+    /// butteraugli p-norm distance (lower = better). `None` when butteraugli
+    /// scoring is off or failed for this sample.
+    ba: Option<f64>,
+    /// butteraugli max distance (worst region), lower = better.
+    ba_max: Option<f64>,
+    /// ColorVideoVDP quality in JOD (10 = identical, lower = worse). `None`
+    /// when cvvdp scoring is off or failed for this sample.
+    cvvdp: Option<f64>,
 }
 
 /// A folder-mean R/D point for one series at one distance.
 struct Point {
     bpp: f64,
     ss2: f64,
+    /// Folder-mean butteraugli p-norm / max distance; `None` when no sample of
+    /// the bucket had a score.
+    ba: Option<f64>,
+    ba_max: Option<f64>,
+    /// Folder-mean CVVDP JOD; `None` when no sample of the bucket had a score.
+    cvvdp: Option<f64>,
     /// Chart annotation ("-d 1", "q90"-style — here the butteraugli distance).
     note: String,
 }
@@ -102,6 +143,125 @@ enum JpegTool {
     Cjpeg,
     /// In-process `image`-crate baseline encoder (last resort).
     Builtin,
+}
+
+/// ColorVideoVDP scorer: a lazily spawned, persistent `cvvdp --interactive`
+/// child that takes one argument line per request on stdin and answers with
+/// one bare JOD per test file (`--quiet`). A child that dies mid-run is
+/// dropped and respawned on the next request.
+struct Cvvdp {
+    bin: String,
+    display: String,
+    device: Option<String>,
+    child: Option<CvvdpChild>,
+}
+
+struct CvvdpChild {
+    proc: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Cvvdp {
+    fn spawn_child(&self) -> Result<CvvdpChild> {
+        let mut proc = Command::new(&self.bin)
+            .arg("--interactive")
+            // Python block-buffers stdout on a pipe; we need each answer now.
+            .env("PYTHONUNBUFFERED", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawning cvvdp ({})", self.bin))?;
+        let stdin = proc.stdin.take().context("cvvdp stdin")?;
+        let stdout = BufReader::new(proc.stdout.take().context("cvvdp stdout")?);
+        Ok(CvvdpChild {
+            proc,
+            stdin,
+            stdout,
+        })
+    }
+
+    /// JOD of each `tests` image against `reference`, in order.
+    fn score(&mut self, reference: &Path, tests: &[PathBuf]) -> Result<Vec<f64>> {
+        if self.child.is_none() {
+            self.child = Some(self.spawn_child()?);
+        }
+        let res = self.request(reference, tests);
+        if res.is_err() {
+            // Whatever happened, the stream is out of sync: start over next time.
+            if let Some(mut c) = self.child.take() {
+                let _ = c.proc.kill();
+                let _ = c.proc.wait();
+            }
+        }
+        res
+    }
+
+    fn request(&mut self, reference: &Path, tests: &[PathBuf]) -> Result<Vec<f64>> {
+        let child = self.child.as_mut().context("cvvdp child missing")?;
+        // The child splits the line with shlex: single-quote every path.
+        let mut line = String::from("--test");
+        for t in tests {
+            line.push(' ');
+            line.push_str(&shell_quote(t));
+        }
+        line.push_str(" --ref ");
+        line.push_str(&shell_quote(reference));
+        line.push_str(" --display ");
+        line.push_str(&shell_quote(Path::new(&self.display)));
+        if let Some(dev) = &self.device {
+            line.push_str(" --device ");
+            line.push_str(&shell_quote(Path::new(dev)));
+        }
+        line.push_str(" --quiet\n");
+        child
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| child.stdin.flush())
+            .context("writing to cvvdp stdin (process gone?)")?;
+
+        let mut scores = Vec::with_capacity(tests.len());
+        let mut buf = String::new();
+        while scores.len() < tests.len() {
+            buf.clear();
+            let n = child
+                .stdout
+                .read_line(&mut buf)
+                .context("reading cvvdp stdout")?;
+            if n == 0 {
+                let status = child.proc.wait().ok();
+                bail!(
+                    "cvvdp exited after {} of {} score(s) (status {status:?})",
+                    scores.len(),
+                    tests.len()
+                );
+            }
+            match parse_cvvdp_line(buf.trim()) {
+                Some(v) => scores.push(v),
+                None => bail!("unexpected cvvdp output line: {:?}", buf.trim()),
+            }
+        }
+        Ok(scores)
+    }
+}
+
+impl Drop for Cvvdp {
+    fn drop(&mut self) {
+        if let Some(c) = self.child.take() {
+            // Closing stdin ends the interactive loop; then reap.
+            let CvvdpChild {
+                mut proc, stdin, ..
+            } = c;
+            drop(stdin);
+            let _ = proc.wait();
+        }
+    }
+}
+
+/// POSIX single-quote `p` for shlex.
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 
 /// System libavif (aom / AV1) reference tool configuration.
@@ -144,6 +304,12 @@ fn main() -> Result<()> {
     let mut with_aom = true;
     let mut with_jpeg = false;
     let mut cjpegli = "cjpegli".to_string();
+    let mut with_cvvdp = false;
+    let mut cvvdp_bin: Option<String> = None;
+    let mut with_butteraugli = true;
+    let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
+    let mut cvvdp_display = CVVDP_DISPLAY.to_string();
+    let mut cvvdp_device: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -200,6 +366,40 @@ fn main() -> Result<()> {
                 cjpegli = arg(&args, i + 1)?.to_string();
                 i += 2;
             }
+            "--cvvdp" => {
+                with_cvvdp = true;
+                i += 1;
+            }
+            "--no-cvvdp" => {
+                with_cvvdp = false;
+                i += 1;
+            }
+            "--cvvdp-bin" => {
+                cvvdp_bin = Some(arg(&args, i + 1)?.to_string());
+                with_cvvdp = true;
+                i += 2;
+            }
+            "--cvvdp-display" => {
+                cvvdp_display = arg(&args, i + 1)?.to_string();
+                i += 2;
+            }
+            "--cvvdp-device" => {
+                cvvdp_device = Some(arg(&args, i + 1)?.to_string());
+                i += 2;
+            }
+            "--butteraugli" => {
+                with_butteraugli = true;
+                i += 1;
+            }
+            "--no-butteraugli" => {
+                with_butteraugli = false;
+                i += 1;
+            }
+            "--butteraugli-bin" => {
+                butteraugli_bin = arg(&args, i + 1)?.to_string();
+                with_butteraugli = true;
+                i += 2;
+            }
             "-h" | "--help" => usage(),
             other => {
                 if folder.is_some() {
@@ -238,6 +438,55 @@ fn main() -> Result<()> {
         JpegTool::Cjpeg
     } else {
         JpegTool::Builtin
+    };
+    // butteraugli 3-norm: on whenever libjxl's `butteraugli_main` is reachable.
+    if with_butteraugli && !available(&butteraugli_bin) {
+        eprintln!(
+            "warning: butteraugli_main not found ({butteraugli_bin}); skipping the butteraugli \
+             {BUTTERAUGLI_PNORM}-norm. Override with --butteraugli-bin or pass --no-butteraugli."
+        );
+        with_butteraugli = false;
+    }
+    let butteraugli = with_butteraugli.then_some(butteraugli_bin);
+
+    // ColorVideoVDP: explicit --cvvdp-bin, else `cvvdp` on PATH, else the
+    // parameters_fit venv. Warn + skip rather than aborting when none works.
+    let mut cvvdp: Option<Cvvdp> = if with_cvvdp {
+        let candidates: Vec<String> = match &cvvdp_bin {
+            Some(b) => vec![b.clone()],
+            None => vec![CVVDP_BIN.to_string(), CVVDP_VENV_BIN.to_string()],
+        };
+        match candidates.into_iter().find(|b| available(b)) {
+            Some(bin) => {
+                println!(
+                    "cvvdp: {bin} (--display {cvvdp_display}{})",
+                    cvvdp_device
+                        .as_deref()
+                        .map(|d| format!(" --device {d}"))
+                        .unwrap_or_default()
+                );
+                Some(Cvvdp {
+                    bin,
+                    display: cvvdp_display.clone(),
+                    device: cvvdp_device.clone(),
+                    child: None,
+                })
+            }
+            None => {
+                eprintln!(
+                    "warning: cvvdp not found (tried {}); skipping ColorVideoVDP. \
+                     Install with `pip install git+https://github.com/gfxdisp/ColorVideoVDP.git` \
+                     or pass --cvvdp-bin PATH.",
+                    match &cvvdp_bin {
+                        Some(b) => b.clone(),
+                        None => format!("{CVVDP_BIN}, {CVVDP_VENV_BIN}"),
+                    }
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let images = collect_images(&folder)?;
@@ -316,6 +565,9 @@ fn main() -> Result<()> {
             let npx = (w * h) as f64;
             let stem = img.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
 
+            // Encode/decode/SS2 every series first, then score all decoded
+            // buffers of this image with a single cvvdp request.
+            let mut done: Vec<(usize, Sample, Vec<u8>)> = Vec::with_capacity(kinds.len());
             for (idx, kind) in kinds.iter().enumerate() {
                 let res = match kind {
                     Kind::Jixel => bench_jixel(&rgb, w, h, d, &tmp, stem, npx, threads, patches),
@@ -324,13 +576,68 @@ fn main() -> Result<()> {
                     Kind::Jpeg => bench_jpeg(img, d, &rgb, w, h, &tmp, stem, npx, &jpeg_tool),
                 };
                 match res {
-                    Ok(s) => buckets[idx].push(s),
+                    Ok((s, dec)) => done.push((idx, s, dec)),
                     Err(e) => eprintln!(
                         "  {:<32} {:<18} SKIP: {e:#}",
                         short_name(img),
                         series[idx].label
                     ),
                 }
+            }
+            // The file-fed metrics (butteraugli, cvvdp) share one set of PPMs:
+            // the reference plus one decode per series, written once per image.
+            if (butteraugli.is_some() || cvvdp.is_some()) && !done.is_empty() {
+                let written = (|| -> Result<(PathBuf, Vec<PathBuf>)> {
+                    let ref_ppm = tmp.join(format!("{stem}_ref.ppm"));
+                    write_ppm(&ref_ppm, &rgb, w, h)?;
+                    let mut tests = Vec::with_capacity(done.len());
+                    for (idx, _, dec) in &done {
+                        let t = tmp.join(format!("{stem}_{idx}_d{d}_dec.ppm"));
+                        write_ppm(&t, dec, w, h)?;
+                        tests.push(t);
+                    }
+                    Ok((ref_ppm, tests))
+                })();
+                match written {
+                    Ok((ref_ppm, tests)) => {
+                        if let Some(bin) = &butteraugli {
+                            for ((idx, s, _), test) in done.iter_mut().zip(&tests) {
+                                match score_butteraugli(bin, &ref_ppm, test) {
+                                    Ok((norm, max)) => {
+                                        s.ba = Some(norm);
+                                        s.ba_max = Some(max);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "  {:<32} {:<18} butteraugli SKIP: {e:#}",
+                                        short_name(img),
+                                        series[*idx].label
+                                    ),
+                                }
+                            }
+                        }
+                        if let Some(tool) = cvvdp.as_mut() {
+                            match tool.score(&ref_ppm, &tests) {
+                                Ok(jods) => {
+                                    for ((_, s, _), jod) in done.iter_mut().zip(jods) {
+                                        s.cvvdp = Some(jod);
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "  {:<32} cvvdp SKIP (all series): {e:#}",
+                                    short_name(img)
+                                ),
+                            }
+                        }
+                        let _ = std::fs::remove_file(&ref_ppm);
+                        for t in &tests {
+                            let _ = std::fs::remove_file(t);
+                        }
+                    }
+                    Err(e) => eprintln!("  {:<32} metrics SKIP (ppm): {e:#}", short_name(img)),
+                }
+            }
+            for (idx, s, _) in done {
+                buckets[idx].push(s);
             }
         }
 
@@ -344,10 +651,37 @@ fn main() -> Result<()> {
             }
             let bpp: Vec<f64> = bucket.iter().map(|p| p.bpp).collect();
             let ss2: Vec<f64> = bucket.iter().map(|p| p.ss2).collect();
+            let jod: Vec<f64> = bucket.iter().filter_map(|p| p.cvvdp).collect();
+            let ba: Vec<f64> = bucket.iter().filter_map(|p| p.ba).collect();
+            let ba_max: Vec<f64> = bucket.iter().filter_map(|p| p.ba_max).collect();
             let mean_bpp = arith_mean(&bpp);
             let mean_ss2 = arith_mean(&ss2);
+            let mean_cvvdp = (!jod.is_empty()).then(|| arith_mean(&jod));
+            let mean_ba = (!ba.is_empty()).then(|| arith_mean(&ba));
+            let mean_ba_max = (!ba_max.is_empty()).then(|| arith_mean(&ba_max));
+            let ba_col = match mean_ba {
+                Some(v) => {
+                    let n = if ba.len() == bucket.len() {
+                        String::new()
+                    } else {
+                        format!(" (n={})", ba.len())
+                    };
+                    match mean_ba_max {
+                        Some(m) => format!("  BA{BUTTERAUGLI_PNORM} {v:.4} (max {m:.4}){n}"),
+                        None => format!("  BA{BUTTERAUGLI_PNORM} {v:.4}{n}"),
+                    }
+                }
+                None if butteraugli.is_some() => format!("  BA{BUTTERAUGLI_PNORM} n/a"),
+                None => String::new(),
+            };
+            let cvvdp_col = match mean_cvvdp {
+                Some(v) if jod.len() == bucket.len() => format!("  CVVDP {v:.4}"),
+                Some(v) => format!("  CVVDP {v:.4} (n={})", jod.len()),
+                None if cvvdp.is_some() => "  CVVDP n/a".to_string(),
+                None => String::new(),
+            };
             println!(
-                "  {:<18} n={:<3}  bpp[arith {:.4} geo {}]  SS2 {:.4}",
+                "  {:<18} n={:<3}  bpp[arith {:.4} geo {}]  SS2 {:.4}{ba_col}{cvvdp_col}",
                 s.label,
                 bucket.len(),
                 mean_bpp,
@@ -357,6 +691,9 @@ fn main() -> Result<()> {
             s.points.push(Point {
                 bpp: mean_bpp,
                 ss2: mean_ss2,
+                ba: mean_ba,
+                ba_max: mean_ba_max,
+                cvvdp: mean_cvvdp,
                 note: dist_note(d),
             });
         }
@@ -375,8 +712,65 @@ fn main() -> Result<()> {
             images.len()
         ),
         &series,
+        &YAxis {
+            desc: "mean SSIMULACRA2 (higher = better)".into(),
+            range: (0.0, 100.0),
+            label_dy: 0.4,
+            get: |p| Some(p.ss2),
+        },
     )?;
     println!("chart -> {}", chart_path.display());
+    if butteraugli.is_some() {
+        let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli.png"));
+        draw_chart(
+            &chart_path,
+            &format!(
+                "{name} — mean butteraugli {BUTTERAUGLI_PNORM}-norm vs rate ({} images)",
+                images.len()
+            ),
+            &series,
+            &YAxis {
+                desc: format!(
+                    "mean butteraugli {BUTTERAUGLI_PNORM}-norm distance (lower = better)"
+                ),
+                range: (0.0, f64::INFINITY),
+                label_dy: 0.02,
+                get: |p| p.ba,
+            },
+        )?;
+        println!("chart -> {}", chart_path.display());
+        let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli_max.png"));
+        draw_chart(
+            &chart_path,
+            &format!(
+                "{name} — mean butteraugli max distance vs rate ({} images)",
+                images.len()
+            ),
+            &series,
+            &YAxis {
+                desc: "mean butteraugli max distance (lower = better)".into(),
+                range: (0.0, f64::INFINITY),
+                label_dy: 0.05,
+                get: |p| p.ba_max,
+            },
+        )?;
+        println!("chart -> {}", chart_path.display());
+    }
+    if cvvdp.is_some() {
+        let chart_path = out_dir.join(format!("{name}_mean_rd_cvvdp.png"));
+        draw_chart(
+            &chart_path,
+            &format!("{name} — mean CVVDP vs rate ({} images)", images.len()),
+            &series,
+            &YAxis {
+                desc: "mean CVVDP (JOD, 10 = identical, higher = better)".into(),
+                range: (0.0, 10.0),
+                label_dy: 0.04,
+                get: |p| p.cvvdp,
+            },
+        )?;
+        println!("chart -> {}", chart_path.display());
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
@@ -417,13 +811,15 @@ fn bench_jixel(
     npx: f64,
     threads: usize,
     patches: bool,
-) -> Result<Sample> {
+) -> Result<(Sample, Vec<u8>)> {
     let cfg = jixel::EncodeConfig::default()
         .with_lossless(false)
         .with_distance(d)
         .with_num_threads(threads)
         .with_patches(patches)
         .with_speed(Speed::Slow);
+    #[cfg(feature = "splines")]
+    let cfg = cfg.with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));
@@ -431,10 +827,16 @@ fn bench_jixel(
     let bytes = data.len() as u64;
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
     let ss2 = score(rgb, &dec, w, h)?;
-    Ok(Sample {
-        bpp: bytes as f64 * 8.0 / npx,
-        ss2,
-    })
+    Ok((
+        Sample {
+            bpp: bytes as f64 * 8.0 / npx,
+            ss2,
+            ba: None,
+            ba_max: None,
+            cvvdp: None,
+        },
+        dec,
+    ))
 }
 
 /// Encode with cjxl at (effort, distance), decode with djxl, score.
@@ -449,7 +851,7 @@ fn bench_cjxl(
     tmp: &Path,
     stem: &str,
     npx: f64,
-) -> Result<Sample> {
+) -> Result<(Sample, Vec<u8>)> {
     let jxl = tmp.join(format!("{stem}_cjxl_e{effort}_{d}.jxl"));
     let ext = img.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let _ = std::fs::remove_file(&jxl);
@@ -476,10 +878,16 @@ fn bench_cjxl(
     let bytes = std::fs::metadata(&jxl)?.len();
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
     let ss2 = score(orig, &dec, w, h)?;
-    Ok(Sample {
-        bpp: bytes as f64 * 8.0 / npx,
-        ss2,
-    })
+    Ok((
+        Sample {
+            bpp: bytes as f64 * 8.0 / npx,
+            ss2,
+            ba: None,
+            ba_max: None,
+            cvvdp: None,
+        },
+        dec,
+    ))
 }
 
 /// AV1 reference: encode with system `avifenc -c aom -q <quality>` (mapped from
@@ -495,7 +903,7 @@ fn bench_avif_aom(
     stem: &str,
     npx: f64,
     t: &AvifTools,
-) -> Result<Sample> {
+) -> Result<(Sample, Vec<u8>)> {
     let q = distance_to_quality(d);
     let out = tmp.join(format!("{stem}_aom_q{q}.avif"));
     let _ = std::fs::remove_file(&out);
@@ -526,10 +934,16 @@ fn bench_avif_aom(
     let bytes = std::fs::metadata(&out)?.len();
     let dec = decode_avif(&out, tmp, w, h, &t.dec)?;
     let ss2 = score(orig, &dec, w, h)?;
-    Ok(Sample {
-        bpp: bytes as f64 * 8.0 / npx,
-        ss2,
-    })
+    Ok((
+        Sample {
+            bpp: bytes as f64 * 8.0 / npx,
+            ss2,
+            ba: None,
+            ba_max: None,
+            cvvdp: None,
+        },
+        dec,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,7 +957,7 @@ fn bench_jpeg(
     stem: &str,
     npx: f64,
     tool: &JpegTool,
-) -> Result<Sample> {
+) -> Result<(Sample, Vec<u8>)> {
     let out = tmp.join(format!("{stem}_d{d}.jpg"));
     let _ = std::fs::remove_file(&out);
     let jpg: Vec<u8> = match tool {
@@ -615,10 +1029,16 @@ fn bench_jpeg(
         bail!("jpeg decode size mismatch");
     }
     let ss2 = score(orig, dec.as_raw(), w, h)?;
-    Ok(Sample {
-        bpp: jpg.len() as f64 * 8.0 / npx,
-        ss2,
-    })
+    Ok((
+        Sample {
+            bpp: jpg.len() as f64 * 8.0 / npx,
+            ss2,
+            ba: None,
+            ba_max: None,
+            cvvdp: None,
+        },
+        dec.into_raw(),
+    ))
 }
 
 /// Inverse of jixel's `distance_from_quality` (piecewise): the JPEG quality
@@ -700,6 +1120,65 @@ fn decode_avif(avif: &Path, tmp: &Path, w: usize, h: usize, avifdec: &str) -> Re
     Ok(rgb)
 }
 
+/// Write interleaved RGB8 as a binary PPM (P6): the cvvdp input format, so the
+/// metric sees exactly the buffer SSIMULACRA2 scored.
+fn write_ppm(path: &Path, rgb: &[u8], w: usize, h: usize) -> Result<()> {
+    let mut f = BufWriter::new(
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+    );
+    write!(f, "P6\n{w} {h}\n255\n")?;
+    f.write_all(rgb)?;
+    f.flush()?;
+    Ok(())
+}
+
+/// One cvvdp stdout line -> JOD. Accepts the quiet form (`8.1234`) and the
+/// verbose one (`cvvdp=8.1234 [JOD]`); anything else (warnings, blank) is skipped.
+fn parse_cvvdp_line(line: &str) -> Option<f64> {
+    let body = match line.split_once('=') {
+        Some((k, v)) if k.trim().eq_ignore_ascii_case("cvvdp") => v,
+        Some(_) => return None,
+        None => line,
+    };
+    body.split_whitespace().next()?.parse::<f64>().ok()
+}
+
+/// butteraugli distance between two images via libjxl's `butteraugli_main`.
+/// Returns `(p-norm, max)`; both lower = better. Output shape is the max
+/// distance on the first line, then "`<p>`-norm: `<value>`".
+fn score_butteraugli(bin: &str, reference: &Path, dist: &Path) -> Result<(f64, f64)> {
+    let output = Command::new(bin)
+        .arg(reference)
+        .arg(dist)
+        .arg("--pnorm")
+        .arg(BUTTERAUGLI_PNORM.to_string())
+        .output()
+        .with_context(|| format!("running butteraugli ({bin})"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "butteraugli ({bin}) failed for {}\nstdout: {stdout}\nstderr: {stderr}",
+            dist.display()
+        );
+    }
+    let tag = format!("{BUTTERAUGLI_PNORM}-norm:");
+    let mut max = None;
+    let mut norm = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&tag) {
+            norm = rest.trim().parse::<f64>().ok();
+        } else if max.is_none() {
+            max = line.parse::<f64>().ok();
+        }
+    }
+    match (norm, max) {
+        (Some(n), Some(m)) => Ok((n, m)),
+        _ => bail!("could not parse butteraugli output:\n{stdout}"),
+    }
+}
+
 /// SSIMULACRA2 between two interleaved RGB8 buffers.
 fn score(orig: &[u8], dist: &[u8], w: usize, h: usize) -> Result<f64> {
     let to_rgb = |b: &[u8]| -> Result<Rgb> {
@@ -759,11 +1238,27 @@ fn collect_images(folder: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Aggregate R/D chart: one line per series, folder-mean SS2 vs folder-mean bpp.
-fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
+/// Which quality metric a chart plots on its y axis.
+struct YAxis<F: Fn(&Point) -> Option<f64>> {
+    desc: String,
+    /// Hard clamp of the padded y range (metric's natural bounds).
+    range: (f64, f64),
+    /// Vertical offset of the per-point annotation, in axis units.
+    label_dy: f64,
+    /// Metric accessor; points returning `None` are left off the chart.
+    get: F,
+}
+
+/// Aggregate R/D chart: one line per series, folder-mean metric vs folder-mean bpp.
+fn draw_chart<F: Fn(&Point) -> Option<f64>>(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    y: &YAxis<F>,
+) -> Result<()> {
     let root = BitMapBackend::new(path, (1920, 1080)).into_drawing_area();
     root.fill(&WHITE)?;
-    let (xmin, xmax, ymin, ymax) = bounds(series);
+    let (xmin, xmax, ymin, ymax) = bounds(series, y);
     let mut chart = ChartBuilder::on(&root)
         .caption(title, ("sans-serif", 26))
         .margin(16)
@@ -773,12 +1268,17 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
     chart
         .configure_mesh()
         .x_desc("mean rate (bits / pixel)")
-        .y_desc("mean SSIMULACRA2 (higher = better)")
+        .y_desc(y.desc.as_str())
         .axis_desc_style(("sans-serif", 18))
         .label_style(("sans-serif", 14))
         .draw()?;
     for s in series {
-        let mut pts: Vec<(f64, f64)> = s.points.iter().map(|p| (p.bpp, p.ss2)).collect();
+        let plotted: Vec<(&Point, f64)> = s
+            .points
+            .iter()
+            .filter_map(|p| (y.get)(p).map(|v| (p, v)))
+            .collect();
+        let mut pts: Vec<(f64, f64)> = plotted.iter().map(|(p, v)| (p.bpp, *v)).collect();
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         chart
             .draw_series(LineSeries::new(pts.clone(), s.color.stroke_width(2)))?
@@ -791,9 +1291,9 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
                 .map(|&(x, y)| Circle::new((x, y), 4, s.color.filled())),
         )?;
         let series_color = s.color;
-        chart.draw_series(s.points.iter().map(|pt| {
+        chart.draw_series(plotted.iter().map(|(pt, v)| {
             let style = ("sans-serif", 14).into_font().color(&series_color);
-            Text::new(pt.note.clone(), (pt.bpp + 0.01, pt.ss2 + 0.4), style)
+            Text::new(pt.note.clone(), (pt.bpp + 0.01, v + y.label_dy), style)
         }))?;
     }
     chart
@@ -807,27 +1307,28 @@ fn draw_chart(path: &Path, title: &str, series: &[Series]) -> Result<()> {
     Ok(())
 }
 
-fn bounds(series: &[Series]) -> (f64, f64, f64, f64) {
+fn bounds<F: Fn(&Point) -> Option<f64>>(series: &[Series], y: &YAxis<F>) -> (f64, f64, f64, f64) {
     let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for s in series {
         for p in &s.points {
+            let Some(v) = (y.get)(p) else { continue };
             xmn = xmn.min(p.bpp);
             xmx = xmx.max(p.bpp);
-            ymn = ymn.min(p.ss2);
-            ymx = ymx.max(p.ss2);
+            ymn = ymn.min(v);
+            ymx = ymx.max(v);
         }
     }
     // Guard against an all-empty chart (every series skipped).
     if xmn > xmx {
-        return (0.0, 1.0, 0.0, 100.0);
+        return (0.0, 1.0, y.range.0, y.range.1);
     }
     let xpad = (xmx - xmn) * 0.05 + 1e-6;
     let ypad = (ymx - ymn) * 0.08 + 1e-6;
     (
         xmn - xpad,
         xmx + xpad,
-        (ymn - ypad).max(0.0),
-        (ymx + ypad).min(100.0),
+        (ymn - ypad).max(y.range.0),
+        (ymx + ypad).min(y.range.1),
     )
 }
 
@@ -896,9 +1397,13 @@ fn usage() -> ! {
         "usage: meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]\n\
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
+         \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n\
+         \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
-         image in FOLDER at each distance, decodes, scores SSIMULACRA2, prints the folder\n  \
-         mean bpp/SS2 per series, and writes an aggregate R/D chart to DIR."
+         image in FOLDER at each distance, decodes, scores SSIMULACRA2 (the butteraugli\n  \
+         3-norm too whenever butteraugli_main is on PATH, and ColorVideoVDP JOD with\n  \
+         --cvvdp), prints the folder mean bpp/SS2[/BA3][/CVVDP] per series, and writes\n  \
+         an aggregate R/D chart per metric to DIR."
     );
     std::process::exit(2);
 }

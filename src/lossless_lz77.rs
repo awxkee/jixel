@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens};
+use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens, build_balanced_tree_tokens_offsets};
 use crate::adaptive_quant::dirty_log2f;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
@@ -42,6 +42,11 @@ pub(super) const LZ77_MIN_LENGTH: u32 = 3;
 // special_distance[1] = (dx=1, dy=0) -> one token back.
 pub(super) const LZ77_DIST_VALUE: u32 = 1;
 pub(super) const LZ77_NUM_SPECIAL_DISTANCES: u32 = 120;
+/// The decoder's LZ77 window (libjxl `kWindowSize`): a copy may reach at
+/// most this many tokens back, and the decoder clamps longer distances to
+/// it, so a match further back must not be emitted. A group stream (three
+/// 1024x1024 channels) is three times longer than the window.
+pub(super) const LZ77_WINDOW: usize = 1 << 20;
 
 /// Hybrid-encode `length_value` (`run_length - LZ77_MIN_LENGTH`).
 /// Returns `(alphabet_token, nbits, payload)`.
@@ -117,6 +122,24 @@ impl LzTokenSource for CompactToken {
     fn as_lz(self) -> LzToken {
         self.unpack().as_lz()
     }
+}
+
+/// A run of value-0 literal tokens in one context that follows a stream's
+/// stored tokens: a constant channel coded by a Zero-predictor leaf whose
+/// offset is the constant. The run is never materialized or matched by
+/// LZ77, and its context is clustered alone, so its histogram has one
+/// symbol and the decoder fills the channel without reading a symbol.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ConstantTail {
+    pub(super) context: u32,
+    pub(super) count: usize,
+}
+
+impl ConstantTail {
+    pub(super) const NONE: Self = Self {
+        context: 0,
+        count: 0,
+    };
 }
 
 /// Literal storage preserves the original token hash and comparisons. Only
@@ -258,7 +281,7 @@ fn find_match_ring<T: LiteralToken>(
     } else {
         idx
     };
-    let limit = (tokens.len() - pos).min(1 << 20);
+    let limit = (tokens.len() - pos).min(LZ77_WINDOW);
     let mut best_len = 0usize;
     let mut best_dist = 0usize;
     // Newest-first scan: on equal lengths the nearest (cheapest) distance wins
@@ -266,6 +289,10 @@ fn find_match_ring<T: LiteralToken>(
     for k in 1..=live.min(max_probes) {
         let slot = (idx + RING_BUCKET - k) % RING_BUCKET;
         let candidate_pos = entries[base + slot] as usize;
+        // Older candidates only lie further back than the decoder's window.
+        if pos - candidate_pos > LZ77_WINDOW {
+            break;
+        }
         // Most hash collisions fail immediately; avoid dispatch and vector
         // setup until the first complete token matches.
         if !tokens[candidate_pos].same(tokens[pos]) {
@@ -452,7 +479,6 @@ impl RunLzWriter {
     }
 }
 
-#[inline]
 pub(super) fn lz77_compress_for_speed(
     tokens: &[Token],
     distance_context: u32,
@@ -1234,6 +1260,7 @@ where
     let streams: Vec<&'tokens [T]> = streams.collect();
     build_lz_pixel_code_slices(
         &streams,
+        &[],
         nb_chans,
         min_symbol,
         refined,
@@ -1244,11 +1271,82 @@ where
     )
 }
 
+/// `build_lz_pixel_code_threads` for streams that each end in a constant
+/// tail (`tails[k]` follows `streams[k]`; `ConstantTail::NONE` for none).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_lz_pixel_code_tails<'tokens, 'scratch, T: LzTokenSource + 'tokens>(
+    streams: &[&'tokens [T]],
+    tails: &[ConstantTail],
+    nb_chans: usize,
+    min_symbol: u32,
+    refined: bool,
+    ans_cluster: bool,
+    pool: Option<&ThreadPool>,
+    scratch: &'scratch mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> EntropyCode<'scratch> {
+    debug_assert_eq!(streams.len(), tails.len());
+    build_lz_pixel_code_slices(
+        streams,
+        tails,
+        nb_chans,
+        min_symbol,
+        refined,
+        ans_cluster,
+        pool,
+        scratch,
+        huffman_pool,
+    )
+}
+
+/// The tails' contexts and symbol-0 counts, one entry per distinct context.
+fn tail_counts(tails: &[ConstantTail]) -> Vec<(u32, u32)> {
+    let mut counts: Vec<(u32, u32)> = Vec::new();
+    for tail in tails.iter().filter(|tail| tail.count > 0) {
+        let count = u32::try_from(tail.count).expect("constant tail count");
+        match counts
+            .iter_mut()
+            .find(|(context, _)| *context == tail.context)
+        {
+            Some((_, total)) => *total += count,
+            None => counts.push((tail.context, count)),
+        }
+    }
+    counts
+}
+
+/// Renumber clusters in order of first use over the context ids (the
+/// clusterer's convention) after a cluster was appended out of order.
+fn compact_clusters_first_use(
+    context_map: &mut [u8],
+    histograms: &mut [Histogram],
+    num_clusters: usize,
+) -> usize {
+    let mut remap = vec![u8::MAX; num_clusters];
+    let mut next = 0u8;
+    for entry in context_map.iter_mut() {
+        let old = *entry as usize;
+        if remap[old] == u8::MAX {
+            remap[old] = next;
+            next += 1;
+        }
+        *entry = remap[old];
+    }
+    let old_hists: Vec<Histogram> = histograms[..num_clusters].to_vec();
+    for (old, hist) in old_hists.into_iter().enumerate() {
+        if remap[old] != u8::MAX {
+            histograms[remap[old] as usize] = hist;
+        }
+    }
+    next as usize
+}
+
 // Share entropy setup across iterator adapters while retaining specialized
 // token passes for each token representation.
 #[allow(clippy::too_many_arguments)]
 fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     streams: &[&[T]],
+    tails: &[ConstantTail],
     nb_chans: usize,
     min_symbol: u32,
     refined: bool,
@@ -1284,22 +1382,55 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         histograms.clone_from_slice(&summed);
     }
 
-    let num_clusters = if ans_cluster {
+    // A constant tail's context is clustered alone: its stored tokens (if
+    // any) plus the tail form a histogram the clusterer never sees, appended
+    // as its own cluster afterwards. Sharing a cluster would cost the tail
+    // bits in the other contexts' symbols and the decoder its constant fill.
+    let tail_counts = tail_counts(tails);
+    let pinned: Vec<(u32, Histogram)> = tail_counts
+        .iter()
+        .map(|&(context, count)| {
+            let mut hist = std::mem::take(&mut histograms[context as usize]);
+            hist.counts[0] += count;
+            hist.total_count += count;
+            (context, hist)
+        })
+        .collect();
+
+    // The clusterer leaves the pinned contexts' clusters free.
+    let max_clusters = crate::entropy::CLUSTERS_LIMIT - pinned.len();
+    let mut num_clusters = if ans_cluster {
         crate::entropy::cluster_histograms_ans(
             histograms,
             &mut context_map[..num_contexts],
             pool,
             false,
+            max_clusters,
+            2,
         )
     } else {
         cluster_histograms_fixed(
             histograms,
             &mut context_map[..num_contexts],
             refined,
+            max_clusters,
             clustering,
             huffman_pool,
         )
     };
+    if !pinned.is_empty() {
+        for (context, hist) in pinned {
+            assert!(
+                num_clusters < histograms.len(),
+                "a cluster slot for the constant tail"
+            );
+            histograms[num_clusters] = hist;
+            context_map[context as usize] = num_clusters as u8;
+            num_clusters += 1;
+        }
+        num_clusters =
+            compact_clusters_first_use(&mut context_map[..num_contexts], histograms, num_clusters);
+    }
     let histograms = &mut histograms[..num_clusters];
     let configs = &mut configs[..num_clusters];
 
@@ -1422,6 +1553,11 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             |acc, part| merge_histograms(acc, &part),
         );
         histograms.clone_from_slice(&summed);
+        for &(context, count) in &tail_counts {
+            let cluster = context_map_ref[context as usize] as usize;
+            histograms[cluster].counts[0] += count;
+            histograms[cluster].total_count += count;
+        }
     } else {
         configs.fill(crate::entropy::HybridUintConfig::DEFAULT);
     }
@@ -1516,14 +1652,66 @@ pub(super) fn write_lz_section<T: LzTokenSource>(
     min_symbol: u32,
     w: &mut BitWriter,
 ) {
+    write_lz_section_tail(
+        tokens,
+        ConstantTail::NONE,
+        distance_context,
+        code,
+        min_symbol,
+        w,
+    );
+}
+
+/// `write_lz_section` with a constant tail after the stored tokens.
+pub(super) fn write_lz_section_tail<T: LzTokenSource>(
+    tokens: &[T],
+    tail: ConstantTail,
+    distance_context: u32,
+    code: &EntropyCode<'_>,
+    min_symbol: u32,
+    w: &mut BitWriter,
+) {
     if code.use_prefix_code {
         for t in lz_tokens(tokens) {
             write_lz_token(t, distance_context, code, min_symbol, w);
         }
+        if tail.count > 0 {
+            let hist = code.context_map[tail.context as usize] as usize;
+            let (sym, nbits, _) =
+                crate::entropy::uint_encode_with_config(0, code.hybrid_uint_configs[hist]);
+            // A one-symbol prefix code has a zero-length codeword.
+            if nbits > 0 || code.prefix_codes[hist].depths[sym as usize] > 0 {
+                for _ in 0..tail.count {
+                    write_lz_token(
+                        LzToken::pixel(tail.context, 0),
+                        distance_context,
+                        code,
+                        min_symbol,
+                        w,
+                    );
+                }
+            }
+        }
         return;
     }
 
-    let expanded_len = tokens.len() + lz_tokens(tokens).filter(|token| token.is_lz77()).count();
+    // The tail's symbols: none at all when its cluster has the one symbol
+    // (a single-symbol table moves neither the ANS state nor the stream).
+    let tail_hist = code.context_map[tail.context as usize] as usize;
+    let (tail_sym, tail_nbits, tail_bits) =
+        crate::entropy::uint_encode_with_config(0, code.hybrid_uint_configs[tail_hist]);
+    let tail_count = if tail.count > 0
+        && (tail_nbits > 0
+            || code.ans_symbols[tail_hist][tail_sym as usize].freq as u32
+                != crate::entropy::ANS_TAB_SIZE)
+    {
+        tail.count
+    } else {
+        0
+    };
+
+    let expanded_len =
+        tokens.len() + lz_tokens(tokens).filter(|token| token.is_lz77()).count() + tail_count;
     // Most symbols in a nearly deterministic context emit no ANS word.
     // Keep one presence bit per symbol and only the actual 16-bit words.
     let mut present = vec![0u64; expanded_len.div_ceil(64)];
@@ -1543,6 +1731,10 @@ pub(super) fn write_lz_section<T: LzTokenSource>(
     };
     // A copy's forward order is length, distance; advance the same ANS state
     // in the reverse order. Presence bits and words use that same order.
+    // The tail follows every stored token, so it enters the state first.
+    for _ in 0..tail_count {
+        put(&mut coder, tail_hist, tail_sym);
+    }
     for t in lz_tokens(tokens).rev() {
         let hist = code.context_map[t.context as usize] as usize;
         if t.is_lz77() {
@@ -1586,6 +1778,9 @@ pub(super) fn write_lz_section<T: LzTokenSource>(
                 crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[hist]);
             write(nbits, bits);
         }
+    }
+    for _ in 0..tail_count {
+        write(tail_nbits, tail_bits);
     }
 }
 
@@ -1669,6 +1864,19 @@ pub(super) fn write_local_tree_lz77(
     write_tree_lz77(&tree_tokens, pixel_code, min_symbol, huffman_pool, w);
 }
 
+/// `write_local_tree_lz77` with a predictor offset per channel.
+pub(super) fn write_local_tree_lz77_offsets(
+    predictors: &[u32],
+    offsets: &[i32],
+    pixel_code: &EntropyCode<'_>,
+    min_symbol: u32,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    let tree_tokens = build_balanced_tree_tokens_offsets(predictors, offsets);
+    write_tree_lz77(&tree_tokens, pixel_code, min_symbol, huffman_pool, w);
+}
+
 /// Write a pre-built MA tree (token stream) + the LZ77 pixel code header.
 pub(super) fn write_tree_lz77(
     tree_tokens: &[Token],
@@ -1748,7 +1956,7 @@ mod tests {
                 let stream: Vec<_> = (0..n)
                     .map(|i| match pattern {
                         0 => LzToken::pixel(0, 0),
-                        1 => LzToken::pixel(i % 3, (i * 137 ^ (i >> 3)) & 65_535),
+                        1 => LzToken::pixel(i % 3, ((i * 137) ^ (i >> 3)) & 65_535),
                         _ if i % 3 == 0 => LzToken::lz77(i % 2, i * 53, 1 + i * 97),
                         _ => LzToken::pixel(i % 3, i & 255),
                     })
@@ -1956,7 +2164,7 @@ mod tests {
                         2 => Token::new((i / 47 % 3) as u32, (i / 47) as u32),
                         _ => Token::new(
                             (i % 3) as u32,
-                            ((i * 137 ^ (i / 7)) as u32) & CompactToken::MAX_VALUE,
+                            (((i * 137) ^ (i / 7)) as u32) & CompactToken::MAX_VALUE,
                         ),
                     })
                     .collect();
@@ -2319,5 +2527,169 @@ mod tests {
         for len in [1_000usize, 50_000, 3_000] {
             lz77_compress_with_depth_into(&tokens(len, 5), 8, &mut scratch, &mut out);
         }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::coder_scratch::CoderScratch;
+
+    #[test]
+    fn deep_matcher_never_reaches_past_the_decoder_window() {
+        // A repeated 64-token motif separated by more than a window of
+        // unique filler: the second copy may not reference the first.
+        let motif: Vec<Token> = (0..64).map(|i| Token::new(0, 1000 + i)).collect();
+        let mut tokens = motif.clone();
+        tokens.extend((0..LZ77_WINDOW as u32 + 100).map(|i| Token::new(0, 2000 + (i % 50_000))));
+        tokens.extend(motif.iter().copied());
+        let mut scratch = CoderScratch::default();
+        let mut out = Vec::new();
+        assert!(lz77_compress_with_depth_into_limit(
+            &tokens,
+            8,
+            &mut scratch.lz_depth,
+            &mut out,
+            usize::MAX
+        ));
+        for token in &out {
+            if token.is_lz77() && token.distance != LZ77_DIST_VALUE {
+                let distance = (token.distance - LZ77_NUM_SPECIAL_DISTANCES + 1) as usize;
+                assert!(
+                    distance <= LZ77_WINDOW,
+                    "distance {distance} exceeds the window"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod constant_tail_tests {
+    use super::*;
+    use crate::bit_writer::BitWriter;
+    use crate::coder_scratch::CoderScratch;
+
+    /// A pseudo-random literal stream over contexts `0..contexts`.
+    fn stream(seed: u32, len: usize, contexts: u32) -> Vec<Token> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                Token::new(state % contexts, (state >> 8) % 40)
+            })
+            .collect()
+    }
+
+    /// (refined, ans_cluster): the learned-tree, Slow flat and Fast flat codes.
+    const CODE_KINDS: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
+
+    #[test]
+    fn tail_context_is_pinned_to_a_single_symbol_cluster() {
+        for (refined, ans_cluster) in CODE_KINDS {
+            let tokens = stream(7, 4096, 3);
+            let tail = ConstantTail {
+                context: 3,
+                count: 100_000,
+            };
+            let mut scratch = CoderScratch::default();
+            let code = build_lz_pixel_code_tails(
+                &[tokens.as_slice()],
+                &[tail],
+                4,
+                64,
+                refined,
+                ans_cluster,
+                None,
+                &mut scratch.lz_entropy,
+                &mut scratch.huffman_pool,
+            );
+            let cluster = code.context_map[3] as usize;
+            assert!(
+                code.context_map
+                    .iter()
+                    .enumerate()
+                    .all(|(context, &c)| context == 3 || c as usize != cluster),
+                "the tail shares no cluster ({refined}, {ans_cluster})"
+            );
+            let (symbol, nbits, _) =
+                crate::entropy::uint_encode_with_config(0, code.hybrid_uint_configs[cluster]);
+            assert_eq!(nbits, 0);
+            if code.use_prefix_code {
+                assert_eq!(code.prefix_codes[cluster].depths[symbol as usize], 0);
+            } else {
+                assert_eq!(
+                    code.ans_symbols[cluster][symbol as usize].freq as u32,
+                    crate::entropy::ANS_TAB_SIZE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tail_writes_the_same_bits_as_materialized_zeros() {
+        for (refined, ans_cluster) in CODE_KINDS {
+            for with_runs in [false, true] {
+                let literals = stream(11, 3000, 3);
+                let tail = ConstantTail {
+                    context: 3,
+                    count: 5000,
+                };
+                let tokens: Vec<LzToken> = if with_runs {
+                    lz77_compress_runs_channels(vec![literals.clone()])
+                } else {
+                    lz77_literals(&literals)
+                };
+                let mut scratch = CoderScratch::default();
+                let code = build_lz_pixel_code_tails(
+                    &[tokens.as_slice()],
+                    &[tail],
+                    4,
+                    64,
+                    refined,
+                    ans_cluster,
+                    None,
+                    &mut scratch.lz_entropy,
+                    &mut scratch.huffman_pool,
+                );
+                let mut with_tail = BitWriter::new();
+                write_lz_section_tail(&tokens, tail, 4, &code, 64, &mut with_tail);
+                let mut materialized = tokens.clone();
+                materialized.extend((0..tail.count).map(|_| LzToken::pixel(3, 0)));
+                let mut plain = BitWriter::new();
+                write_lz_section(&materialized, 4, &code, 64, &mut plain);
+                assert_eq!(with_tail.bits_written(), plain.bits_written());
+                with_tail.zero_pad_to_byte();
+                plain.zero_pad_to_byte();
+                assert_eq!(with_tail.into_bytes(), plain.into_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn no_tail_keeps_the_code_and_section_unchanged() {
+        let literals = stream(3, 2000, 3);
+        let mut scratch = CoderScratch::default();
+        let code = build_lz_pixel_code_tails(
+            &[literals.as_slice()],
+            &[ConstantTail::NONE],
+            3,
+            64,
+            true,
+            true,
+            None,
+            &mut scratch.lz_entropy,
+            &mut scratch.huffman_pool,
+        );
+        let mut a = BitWriter::new();
+        write_lz_section_tail(&literals, ConstantTail::NONE, 3, &code, 64, &mut a);
+        let mut b = BitWriter::new();
+        write_lz_section(&literals, 3, &code, 64, &mut b);
+        assert_eq!(a.bits_written(), b.bits_written());
+        a.zero_pad_to_byte();
+        b.zero_pad_to_byte();
+        assert_eq!(a.into_bytes(), b.into_bytes());
     }
 }

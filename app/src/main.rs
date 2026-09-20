@@ -10,13 +10,13 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Burning_Ship_Fractal.png")).unwrap();
+    let image = image::open(Path::new("./assets/Kodak/10.png")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
     let distance = 2.0;
-    for _ in 0..1 {
+    for _ in 0..5 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,
@@ -43,25 +43,21 @@ fn main() {
     }
     let width = image.width() as usize;
     let height = image.height() as usize;
-    let bytes = jixel::encode_image(
-        &rgb_img,
-        width,
-        height,
-        &EncodeConfig::default()
-            .with_lossless(false)
-            .with_distance(distance)
-            .with_speed(Speed::Slow)
-            .with_progressive(false)
-            .with_decoding_speed(DecodingSpeed::Slow)
-            .with_patches(true)
-            .with_color_encoding(ColorEncoding::srgb())
-            .with_num_threads(
-                available_parallelism()
-                    .unwrap_or(NonZero::new(1).unwrap())
-                    .get(),
-            ),
-    )
-    .unwrap();
+    let cfg = EncodeConfig::default()
+        .with_lossless(false)
+        .with_distance(distance)
+        .with_speed(Speed::Slow)
+        .with_progressive(false)
+        .with_decoding_speed(DecodingSpeed::Slow)
+        .with_patches(true)
+        .with_color_encoding(ColorEncoding::srgb())
+        .with_num_threads(
+            available_parallelism()
+                .unwrap_or(NonZero::new(1).unwrap())
+                .get(),
+        )
+        .with_splines(true);
+    let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();
     std::fs::write(output, &bytes).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;

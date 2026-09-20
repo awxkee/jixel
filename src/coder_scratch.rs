@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, SavedChild};
+use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -174,6 +174,28 @@ pub(crate) struct FineMergeRollback {
     pub(crate) benefit: f32,
 }
 
+/// A pair/16x16 merge that beat its tiled incumbent on the raw coefficient
+/// model. Retained even if a parent/competing arm won: a reconstruction
+/// downgrade may expose the footprint again (see `SelectorPolicy::merge_upgrade`).
+#[derive(Clone, Copy)]
+pub(crate) struct MergeUpgradeCandidate {
+    pub(crate) bx: u16,
+    pub(crate) by: u16,
+    pub(crate) strategy: u8,
+}
+
+/// A candidate the reconstruction comparison accepted; installed after the
+/// parallel evaluation pass.
+#[derive(Clone, Copy)]
+pub(crate) struct MergeUpgrade {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) strategy: u8,
+    /// Reconstruction cost without the metadata charge (quant refinement's
+    /// incumbent for the merged footprint).
+    pub(crate) base: f32,
+}
+
 pub(crate) struct AcStrategyBandScratch {
     pub(crate) fine_mosaic: LazyScratch<FineMosaicScratch>,
     pub(crate) strategy: AcStrategyImage,
@@ -184,6 +206,11 @@ pub(crate) struct AcStrategyBandScratch {
     pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
+    /// Leaf-first selector: per-block leaf choices for this band's rows
+    /// (`(by - y0) * xsize + bx`), reused across encodes.
+    pub(crate) leaves: Vec<LeafChoice>,
+    pub(crate) upgrade_candidates: Vec<MergeUpgradeCandidate>,
+    pub(crate) merge_upgrades: Vec<MergeUpgrade>,
 }
 
 impl Default for AcStrategyBandScratch {
@@ -198,6 +225,9 @@ impl Default for AcStrategyBandScratch {
             fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
+            leaves: Vec::new(),
+            upgrade_candidates: Vec::new(),
+            merge_upgrades: Vec::new(),
         }
     }
 }
@@ -220,6 +250,8 @@ impl AcStrategyBandScratch {
         self.fine_rollbacks.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
+        self.upgrade_candidates.clear();
+        self.merge_upgrades.clear();
     }
 
     fn prepare_rerank(&mut self, max_blocks: usize) {
@@ -251,6 +283,9 @@ pub(crate) struct AcStrategyPipelineScratch {
     /// `(by/4)*qx + bx/4`), NaN where the quadrant never went through the
     /// 32-level selection path.
     pub(crate) chosen32_grid: Vec<f32>,
+    /// Leaf-first selector: full-image sub-8 gate credit per block, valid for
+    /// blocks whose committed strategy is a sub-8 leaf (`by * xsize + bx`).
+    pub(crate) leaf_gain: Vec<f32>,
 }
 
 impl AcStrategyPipelineScratch {
@@ -288,14 +323,12 @@ impl AcStrategyPipelineScratch {
 pub(crate) struct CoderScratch {
     pub(crate) entropy_of_hist: EntropyOfHistFn,
     pub(crate) aq_map: AqMapScratch,
-    pub(crate) structure_corrections: Vec<f32>,
     pub(crate) lz_repetitions: Vec<u32>,
     pub(crate) lz_depth: Vec<u32>,
     pub(crate) lz_candidate: Vec<LzToken>,
     /// Entropy tables allocated on demand; Fast group workers never use them.
     pub(crate) lz_entropy: LazyScratch<Box<LzEntropyScratch>>,
     pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 1024>>,
-    pub(crate) dark_octile: Vec<f32>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: LazyScratch<AcGroupScratch>,
@@ -318,42 +351,36 @@ pub(crate) struct CoderScratch {
 
 impl CoderScratch {
     fn new(reserve_lossy_buffers: bool) -> Self {
-        let (aq_map, structure_corrections, dark_octile, gradient, order0_entropy, threshold) =
-            if reserve_lossy_buffers {
-                (
-                    AqMapScratch {
-                        aq_map: vec![0.0; 256 * 256],
-                        secondary: vec![0.0; 2048 + 512 * 512],
-                    },
-                    vec![0.0; 256 * 256],
-                    vec![0.0; 32 * 32],
-                    GradientScratch {
-                        cur: vec![0; 256],
-                        prev: vec![0; 256],
-                        prev_prev: vec![0; 256],
-                        buf: vec![0; 256],
-                        wp: None,
-                    },
-                    vec![0; 1024],
-                    PickThresholdScratch {
-                        hist_scratch: vec![0; 3 * 1025],
-                    },
-                )
-            } else {
-                (
-                    AqMapScratch::default(),
-                    Vec::new(),
-                    Vec::new(),
-                    GradientScratch::default(),
-                    Vec::new(),
-                    PickThresholdScratch::default(),
-                )
-            };
+        let (aq_map, gradient, order0_entropy, threshold) = if reserve_lossy_buffers {
+            (
+                AqMapScratch {
+                    aq_map: vec![0.0; 256 * 256],
+                    secondary: vec![0.0; 2048 + 512 * 512],
+                },
+                GradientScratch {
+                    cur: vec![0; 256],
+                    prev: vec![0; 256],
+                    prev_prev: vec![0; 256],
+                    buf: vec![0; 256],
+                    wp: None,
+                },
+                vec![0; 1024],
+                PickThresholdScratch {
+                    hist_scratch: vec![0; 3 * 1025],
+                },
+            )
+        } else {
+            (
+                AqMapScratch::default(),
+                GradientScratch::default(),
+                Vec::new(),
+                PickThresholdScratch::default(),
+            )
+        };
 
         Self {
             entropy_of_hist: selected_entropy_of_hist_fn(),
             aq_map,
-            structure_corrections,
             // Fast never enters the deep LZ path. Slow grows these buffers on
             // first use, and subsequent groups reuse the allocation.
             lz_repetitions: Vec::new(),
@@ -361,7 +388,6 @@ impl CoderScratch {
             lz_candidate: Vec::new(),
             lz_entropy: LazyScratch::default(),
             recon: LazyScratch::new(|| HeapMatrix::new(0.0)),
-            dark_octile,
             huffman_pool: Vec::with_capacity(1024),
             alpha_tokens: Vec::new(),
             ac_group: LazyScratch::default(),
@@ -441,8 +467,6 @@ mod tests {
         let scratch = CoderScratch::lossless();
         assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
         assert_eq!(scratch.aq_map.secondary.capacity(), 0);
-        assert_eq!(scratch.structure_corrections.capacity(), 0);
-        assert_eq!(scratch.dark_octile.capacity(), 0);
         assert_eq!(scratch.gradient.cur.capacity(), 0);
         assert_eq!(scratch.gradient.prev.capacity(), 0);
         assert_eq!(scratch.gradient.prev_prev.capacity(), 0);

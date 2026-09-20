@@ -507,6 +507,7 @@ fn local_palette_is_better(
         grad_pack_fn,
         scratch,
         WpParams::DEFAULT,
+        None,
     );
     let plain_bits = estimated_local_lz_stream_bits(
         &plain_lz,
@@ -847,6 +848,7 @@ pub(super) fn try_encode_local_palette_multi_group(
                             pool,
                             scratch,
                             WpParams::DEFAULT,
+                            None,
                         );
                         deep_lz.as_ref().unwrap().with_depth(|depth| {
                             lz77_compress_channels_for_speed_with_depth(
@@ -871,6 +873,7 @@ pub(super) fn try_encode_local_palette_multi_group(
                             grad_pack_fn,
                             scratch,
                             WpParams::DEFAULT,
+                            None,
                         )
                     }
                 }
@@ -925,6 +928,7 @@ pub(super) fn try_encode_local_palette_multi_group(
 
     write_lz_groups_with_header(
         &group_lz_tokens,
+        &[],
         &code,
         distance_ctx,
         min_symbol,
@@ -984,12 +988,14 @@ impl GlobalPalette {
                     h: self.num_c,
                     meta: true,
                     pixels: MaPixels::I32(&self.palette),
+                    constant: None,
                 },
                 MaChannel {
                     w: xsize,
                     h: ysize,
                     meta: false,
                     pixels: MaPixels::U16(&self.indices),
+                    constant: None,
                 },
             ],
             transform: MaTransform::Palette {

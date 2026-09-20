@@ -32,7 +32,6 @@ use crate::color::{
     ColorTransform, FloatTransferDecoder, RgbBlockTransform, TransferDecoder, TransferLut,
 };
 use crate::color_encoding::write_color_encoding_with_icc;
-use crate::dark_aq::DarkAqConfig;
 use crate::encoding_context::EncodingContext;
 use crate::frame::encode_frame;
 use crate::gain_map::{EncodedGainMap, GainMap, encode_gain_map};
@@ -297,6 +296,14 @@ pub struct EncodeConfig {
     /// VarDCT encoding. The encoder measures the complete normal and patched
     /// representations and keeps patches only when they reduce the final rate.
     pub patches: bool,
+    /// Experimental: detect thin curvilinear structures (wires, veins, ink
+    /// lines) and code them as JPEG XL splines next to the lossy VarDCT image.
+    /// Every spline passes a rate-distortion test against the VarDCT cost of
+    /// the same pixels. Slow speed and the default decoding speed only; costs
+    /// encode time and some decode time.
+    /// Requires the `splines` Cargo feature. Defaults to false.
+    #[cfg(feature = "splines")]
+    pub splines: bool,
     /// Number of VarDCT passes for **lossy** progressive encoding. `None` falls
     /// back to `progressive` (2 passes if set, else 1). `Some(1)` = single pass;
     /// `Some(n)` for n in 2..=4 = n-pass progressive with an automatic
@@ -328,10 +335,6 @@ pub struct EncodeConfig {
     /// Decode-speed/density tradeoff for lossless encoding (see
     /// [`DecodingSpeed`]). Ignored for lossy.
     pub decoding_speed: DecodingSpeed,
-    /// Optional superblock Variance-Boost / Dark-AQ modulation of the quant field
-    /// (see [`DarkAqConfig`]). `None` (default) leaves the quant field untouched. Ignored
-    /// for lossless. `Some(BoostCfg::default())` enables the validated Dark-AQ preset.
-    pub boost: Option<DarkAqConfig>,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
     /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
@@ -376,6 +379,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) lossless: bool,
     pub(crate) progressive: bool,
     pub(crate) patches: bool,
+    #[cfg(feature = "splines")]
+    pub(crate) splines: bool,
     /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
     pub(crate) progressive_passes: Option<u32>,
     /// Explicit per-pass shift schedule (see `EncodeConfig::progressive_shifts`).
@@ -395,8 +400,6 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) speed: Speed,
     /// Decode-speed/density tradeoff for lossless (see `EncodeConfig::decoding_speed`).
     pub(crate) decoding_speed: DecodingSpeed,
-    /// Superblock Variance-Boost / Dark-AQ config (see `EncodeConfig::boost`).
-    pub(crate) dark_aq: Option<DarkAqConfig>,
     /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
     pub(crate) gain_map: Option<EncodedGainMap>,
 }
@@ -414,6 +417,8 @@ impl Default for EncodeConfig {
             lossless: false,
             progressive: false,
             patches: false,
+            #[cfg(feature = "splines")]
+            splines: false,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -425,7 +430,6 @@ impl Default for EncodeConfig {
                 .get(),
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
-            boost: Some(DarkAqConfig::default()),
             lossy_modular: LossyModular::Off,
             gain_map: None,
         }
@@ -447,6 +451,8 @@ impl Default for EncodeConfigImpl {
             lossless: false,
             progressive: false,
             patches: false,
+            #[cfg(feature = "splines")]
+            splines: false,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -459,7 +465,6 @@ impl Default for EncodeConfigImpl {
                 .get(),
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
-            dark_aq: Some(DarkAqConfig::default()),
             gain_map: None,
         }
     }
@@ -533,6 +538,12 @@ impl EncodeConfigImpl {
         self
     }
 
+    #[cfg(feature = "splines")]
+    pub(crate) fn with_splines(mut self, splines: bool) -> Self {
+        self.splines = splines;
+        self
+    }
+
     pub(crate) fn with_progressive_passes(mut self, passes: Option<u32>) -> Self {
         self.progressive_passes = passes;
         self
@@ -545,18 +556,16 @@ impl EncodeConfigImpl {
 
     /// Copy all lossy-progressive settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
-        self.with_progressive(config.progressive)
+        #[cfg(feature = "splines")]
+        let this = self.with_splines(config.splines);
+        #[cfg(not(feature = "splines"))]
+        let this = self;
+        this.with_progressive(config.progressive)
             .with_patches(config.patches)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
             .with_speed(config.speed)
             .with_decoding_speed(config.decoding_speed)
-            .with_boost(config.boost)
-    }
-
-    pub(crate) fn with_boost(mut self, boost: Option<DarkAqConfig>) -> Self {
-        self.dark_aq = boost;
-        self
     }
 
     pub(crate) fn with_speed(mut self, speed: Speed) -> Self {
@@ -614,19 +623,6 @@ impl EncodeConfig {
     /// See [`distance_from_quality`] for the mapping.
     pub fn with_quality(self, quality: f32) -> Self {
         self.with_distance(distance_from_quality(quality))
-    }
-
-    /// Enable superblock Variance-Boost / Dark-AQ quant-field modulation (lossy only).
-    /// [`DarkAqConfig::default`] is the validated Dark-AQ preset. See [`DarkAqConfig`].
-    pub fn with_dark_aq_config(mut self, boost: DarkAqConfig) -> Self {
-        self.boost = Some(boost);
-        self
-    }
-
-    /// Enable Dark-AQ with the validated defaults (equivalent to
-    /// `with_boost(BoostCfg::default())`).
-    pub fn with_dark_aq(self) -> Self {
-        self.with_dark_aq_config(DarkAqConfig::default())
     }
 
     /// Replace the color encoding (white point / primaries / transfer / intent).
@@ -707,6 +703,14 @@ impl EncodeConfig {
     /// Enable exact patch-dictionary matching with full rate comparison.
     pub fn with_patches(mut self, patches: bool) -> Self {
         self.patches = patches;
+        self
+    }
+
+    /// Experimental spline coding for lossy VarDCT (see [`EncodeConfig::splines`]).
+    /// Requires the `splines` Cargo feature.
+    #[cfg(feature = "splines")]
+    pub fn with_splines(mut self, splines: bool) -> Self {
+        self.splines = splines;
         self
     }
 
@@ -795,8 +799,14 @@ fn lossy_context(
     } else {
         config.num_threads
     };
-    let mut ctx = EncodingContext::new(config.speed, config.boost, xyb, distance, num_threads);
+    let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
+    #[cfg(feature = "splines")]
+    {
+        ctx.splines = config.splines
+            && config.speed == Speed::Slow
+            && config.decoding_speed == DecodingSpeed::Slow;
+    }
     ctx
 }
 
@@ -2785,6 +2795,100 @@ mod encode_smoke_tests {
     #[test]
     fn rgb8_lossy() {
         ok(encode_image(&rgb8(), W, H, &lossy()));
+    }
+
+    /// Thin anti-aliased dark curves on a smooth gradient: the content class
+    /// splines exist for.
+    #[cfg(feature = "splines")]
+    fn line_art(size: usize) -> Vec<u8> {
+        let mut px = vec![0u8; size * size * 3];
+        for y in 0..size {
+            for x in 0..size {
+                let mut v = 150.0 + 60.0 * (x + y) as f32 / (2 * size) as f32;
+                for k in 0..6 {
+                    let phase = k as f32 * 0.9;
+                    let cy = size as f32 * (0.15 + 0.13 * k as f32)
+                        + 18.0 * (x as f32 * 0.035 + phase).sin();
+                    let d = (y as f32 - cy).abs();
+                    v -= 120.0 * (-0.5 * (d / 0.8).powi(2)).exp();
+                }
+                let i = (y * size + x) * 3;
+                px[i] = v.clamp(0.0, 255.0) as u8;
+                px[i + 1] = (v * 0.92).clamp(0.0, 255.0) as u8;
+                px[i + 2] = (v * 0.85).clamp(0.0, 255.0) as u8;
+            }
+        }
+        px
+    }
+
+    #[cfg(feature = "splines")]
+    fn slow_lossy(distance: f32) -> EncodeConfig {
+        EncodeConfig::default()
+            .with_distance(distance)
+            .with_speed(Speed::Slow)
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn splines_reduce_thin_line_art() {
+        const S: usize = 256;
+        let pixels = line_art(S);
+        let plain = encode_image(&pixels, S, S, &slow_lossy(3.0)).unwrap();
+        let with = encode_image(&pixels, S, S, &slow_lossy(3.0).with_splines(true)).unwrap();
+        assert!(
+            with.len() * 100 < plain.len() * 90,
+            "splines should win clearly on thin line art: {} vs {}",
+            with.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn splines_are_inert_without_lines() {
+        const S: usize = 128;
+        let mut pixels = vec![0u8; S * S * 3];
+        for y in 0..S {
+            for x in 0..S {
+                let i = (y * S + x) * 3;
+                pixels[i] = (x * 2) as u8;
+                pixels[i + 1] = (y * 2) as u8;
+                pixels[i + 2] = (x + y) as u8;
+            }
+        }
+        let plain = encode_image(&pixels, S, S, &slow_lossy(2.0)).unwrap();
+        let with = encode_image(&pixels, S, S, &slow_lossy(2.0).with_splines(true)).unwrap();
+        assert_eq!(plain, with);
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn splines_only_run_at_slow_speed_and_default_decoding_speed() {
+        const S: usize = 256;
+        let pixels = line_art(S);
+        let fast = EncodeConfig::default()
+            .with_distance(3.0)
+            .with_speed(Speed::Fast);
+        assert_eq!(
+            encode_image(&pixels, S, S, &fast).unwrap(),
+            encode_image(&pixels, S, S, &fast.clone().with_splines(true)).unwrap()
+        );
+        let quick_decode = slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast);
+        assert_eq!(
+            encode_image(&pixels, S, S, &quick_decode).unwrap(),
+            encode_image(&pixels, S, S, &quick_decode.clone().with_splines(true)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn splines_coexist_with_patches() {
+        const S: usize = 256;
+        let pixels = line_art(S);
+        let both = slow_lossy(3.0).with_splines(true).with_patches(true);
+        let plain = encode_image(&pixels, S, S, &slow_lossy(3.0).with_patches(true)).unwrap();
+        let with = encode_image(&pixels, S, S, &both).unwrap();
+        assert!(with.len() < plain.len());
     }
 
     #[test]

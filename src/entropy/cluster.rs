@@ -32,6 +32,8 @@ use super::histogram::Histogram;
 use super::huffman_tree::{HuffmanNode, create_huffman_tree};
 use super::prefix_code::ALPHABET_SIZE;
 use crate::adaptive_quant::dirty_log2f;
+use crate::coder_scratch::CoderScratch;
+use crate::thread_pool::ThreadPool;
 use crate::util::heap_array;
 use std::sync::OnceLock;
 
@@ -123,7 +125,6 @@ fn select_counts_bit_cost_fn() -> CountsBitCostFn {
     counts_bit_cost_scalar
 }
 
-#[inline]
 fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     if total_count == 0 {
         return 0.0;
@@ -159,7 +160,6 @@ fn counts_bit_cost(counts: &[u32; ALPHABET_SIZE], total_count: u32) -> f32 {
     COUNTS_BIT_COST_FN.get_or_init(select_counts_bit_cost_fn)(counts, total_count)
 }
 
-#[inline]
 fn exact_counts_bit_cost(
     counts: &[u32; ALPHABET_SIZE],
     total_count: u32,
@@ -196,13 +196,11 @@ fn add_counts(dst: &mut [u32; ALPHABET_SIZE], src: &[u32; ALPHABET_SIZE]) {
     }
 }
 
-#[inline]
 fn histogram_add(a: &mut Histogram, b: &Histogram) {
     add_counts(&mut a.counts, &b.counts);
     a.total_count += b.total_count;
 }
 
-#[inline]
 fn histogram_sub(a: &mut Histogram, b: &Histogram) {
     for (dst, &src) in a.counts.iter_mut().zip(b.counts.iter()) {
         *dst -= src;
@@ -210,7 +208,6 @@ fn histogram_sub(a: &mut Histogram, b: &Histogram) {
     a.total_count -= b.total_count;
 }
 
-#[inline]
 fn histogram_distance(
     a: &Histogram,
     b: &Histogram,
@@ -346,26 +343,39 @@ pub(crate) fn cluster_histograms(
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) {
-    cluster_histograms_inner(histograms, context_map, false, huffman_pool);
+    cluster_histograms_inner(histograms, context_map, false, huffman_pool, None);
 }
 
+pub(crate) fn cluster_histograms_with_pool(
+    histograms: &mut Vec<Histogram>,
+    context_map: &mut Vec<u8>,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
+) {
+    cluster_histograms_inner(histograms, context_map, false, huffman_pool, pool);
+}
+
+/// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced,
+/// for callers that append a cluster of their own afterwards.
 pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     refined: bool,
+    max_clusters: usize,
     fixed: &mut FixedClusterScratch<MAX_CONTEXTS>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> usize {
     let n = histograms.len();
     assert!(n <= MAX_CONTEXTS);
     assert!(context_map.len() >= n);
+    assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
     if n <= 1 {
         context_map[..n].fill(0);
         return n;
     }
 
     const UNMAPPED: u8 = u8::MAX;
-    let max_histograms = CLUSTERS_LIMIT.min(n);
+    let max_histograms = max_clusters.min(n);
     let unassigned = max_histograms as u8;
     let symbols = &mut fixed.symbols[..n];
     symbols.fill(unassigned);
@@ -624,11 +634,81 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
     reordered_len
 }
 
+/// Precompute distances against a batch's initial cluster populations. A
+/// cluster changed by an earlier assignment is always rescored on the caller,
+/// so the original input order, floating-point operations and first-best ties
+/// are preserved even though most distances are computed by workers.
+fn assign_prefix_histograms_parallel(
+    inp: &[Histogram],
+    in_costs: &[f32],
+    out: &mut [Histogram],
+    out_costs: &mut [f32],
+    symbols: &mut [u8],
+    pool: Option<&ThreadPool>,
+) -> bool {
+    let Some(pool) = pool.filter(|pool| pool.num_threads() > 1 && out.len() >= 64) else {
+        return false;
+    };
+    let unassigned = CLUSTERS_LIMIT.min(inp.len()) as u8;
+    let pending: Vec<_> = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &symbol)| (symbol == unassigned).then_some(i))
+        .collect();
+    if pending.len() < 1024 {
+        return false;
+    }
+    // Amortize dispatch while bounding the cached distances to 64 KiB.
+    // Four lanes leave enough work per worker even for the smaller clusters.
+    const BATCH: usize = 128;
+    let mut distances = vec![[0.0f32; CLUSTERS_LIMIT]; BATCH];
+    let mut caller_scratch = CoderScratch::lossless();
+    let mut scratch = [0u32; ALPHABET_SIZE];
+    for batch in pending.chunks(BATCH) {
+        pool.steal_for_each_mut_with_threads(
+            &mut caller_scratch,
+            &mut distances[..batch.len()],
+            4,
+            |row, distances, _| {
+                let i = batch[row];
+                let mut scratch = [0u32; ALPHABET_SIZE];
+                for (j, (candidate, &cost)) in out.iter().zip(out_costs.iter()).enumerate() {
+                    distances[j] =
+                        histogram_distance(&inp[i], candidate, in_costs[i], cost, &mut scratch);
+                }
+            },
+        );
+        let mut changed = [false; CLUSTERS_LIMIT];
+        for (&i, distances) in batch.iter().zip(&distances) {
+            let hist = &inp[i];
+            let mut best = 0;
+            let mut best_dist = f32::MAX;
+            for j in 0..out.len() {
+                let distance = if changed[j] {
+                    histogram_distance(hist, &out[j], in_costs[i], out_costs[j], &mut scratch)
+                } else {
+                    distances[j]
+                };
+                if j == 0 || distance < best_dist {
+                    best = j;
+                    best_dist = distance;
+                }
+            }
+            histogram_add(&mut out[best], hist);
+            out_costs[best] = histogram_bit_cost(&out[best]);
+            changed[best] = true;
+            symbols[i] = best as u8;
+        }
+    }
+    true
+}
+
 fn cluster_histograms_inner(
     histograms: &mut Vec<Histogram>,
     context_map: &mut Vec<u8>,
     refined: bool,
     huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
 ) {
     if histograms.len() <= 1 {
         context_map.clear();
@@ -682,6 +762,12 @@ fn cluster_histograms_inner(
     let mut out_costs: Vec<f32> = Vec::with_capacity(max_histograms);
     let mut scratch = [0u32; ALPHABET_SIZE];
 
+    // Seed distances are independent. The reduction below still runs in
+    // input order, including the floating-point saving and first-best ties.
+    let mut workers = pool
+        .filter(|pool| n >= 1024 && pool.num_threads() > 1)
+        .map(|pool| (pool, CoderScratch::lossless(), vec![0.0f32; n]));
+
     // See the note in `cluster_histograms_fixed`: the stop test is on the total
     // saving a cluster realizes, not on one context's distance.
     while out.len() < max_histograms {
@@ -704,6 +790,25 @@ fn cluster_histograms_inner(
         let mut next_largest_idx = candidate;
         let mut next_largest_dist = 0.0f32;
 
+        if let Some((pool, caller_scratch, distances)) = &mut workers {
+            let mut chunks: Vec<_> = distances.chunks_mut(64).collect();
+            pool.steal_for_each_mut(caller_scratch, &mut chunks, |part, chunk, _| {
+                let mut scratch = [0u32; ALPHABET_SIZE];
+                for (offset, distance) in chunk.iter_mut().enumerate() {
+                    let i = part * 64 + offset;
+                    if dists[i] != 0.0 {
+                        *distance = histogram_distance(
+                            &inp[i],
+                            last_hist,
+                            in_costs[i],
+                            last_cost,
+                            &mut scratch,
+                        );
+                    }
+                }
+            });
+        }
+
         for (i, ((hist, &in_cost), dist)) in inp
             .iter()
             .zip(in_costs.iter())
@@ -714,7 +819,11 @@ fn cluster_histograms_inner(
                 continue;
             }
 
-            let d = histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch);
+            let d = if let Some((_, _, distances)) = &workers {
+                distances[i]
+            } else {
+                histogram_distance(hist, last_hist, in_cost, last_cost, &mut scratch)
+            };
             if d < *dist {
                 if *dist != f32::MAX {
                     saving += *dist - d;
@@ -740,28 +849,40 @@ fn cluster_histograms_inner(
     }
 
     if !refined {
-        // Low-effort path: preserve the original single-pass assignment. It is
-        // intentionally cheap and is used by Fast and the many small lossy
-        // entropy bundles.
-        for ((hist, &in_cost), symbol) in inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut()) {
-            if *symbol != unassigned {
-                continue;
-            }
-            let mut best = 0usize;
-            let mut best_dist =
-                histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
-            for (j, (candidate, &candidate_cost)) in
-                out.iter().zip(out_costs.iter()).enumerate().skip(1)
+        if !assign_prefix_histograms_parallel(
+            &inp,
+            &in_costs,
+            &mut out,
+            &mut out_costs,
+            &mut symbols,
+            pool,
+        ) {
+            // Low-effort path: preserve the original single-pass assignment. It is
+            // intentionally cheap and is used by Fast and the many small lossy
+            // entropy bundles.
+            for ((hist, &in_cost), symbol) in
+                inp.iter().zip(in_costs.iter()).zip(symbols.iter_mut())
             {
-                let d = histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
-                if d < best_dist {
-                    best = j;
-                    best_dist = d;
+                if *symbol != unassigned {
+                    continue;
                 }
+                let mut best = 0usize;
+                let mut best_dist =
+                    histogram_distance(hist, &out[0], in_cost, out_costs[0], &mut scratch);
+                for (j, (candidate, &candidate_cost)) in
+                    out.iter().zip(out_costs.iter()).enumerate().skip(1)
+                {
+                    let d =
+                        histogram_distance(hist, candidate, in_cost, candidate_cost, &mut scratch);
+                    if d < best_dist {
+                        best = j;
+                        best_dist = d;
+                    }
+                }
+                histogram_add(&mut out[best], hist);
+                out_costs[best] = histogram_bit_cost(&out[best]);
+                *symbol = best as u8;
             }
-            histogram_add(&mut out[best], hist);
-            out_costs[best] = histogram_bit_cost(&out[best]);
-            *symbol = best as u8;
         }
     } else {
         // Assign remaining inputs against the immutable seed distributions. The
@@ -916,12 +1037,18 @@ fn context_map_merge_saving(a: usize, b: usize) -> f64 {
 /// parallel maps with the sequential tie-breaks, and the refinement passes
 /// precompute every move delta against a snapshot and recompute only the
 /// entries whose cluster changed since (exactly the sequential algorithm).
+/// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced.
+/// `refinement_passes` is the existing relocation search budget; Slow VarDCT
+/// spends six passes, while the other callers retain two.
 pub(crate) fn cluster_histograms_ans(
     histograms: &mut [Histogram],
     context_map: &mut [u8],
     pool: Option<&crate::thread_pool::ThreadPool>,
     charge_context_map: bool,
+    max_clusters: usize,
+    refinement_passes: usize,
 ) -> usize {
+    assert!((1..=CLUSTERS_LIMIT).contains(&max_clusters));
     use super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
     use crate::coder_scratch::CoderScratch;
     use crate::thread_pool::ThreadPool;
@@ -955,7 +1082,9 @@ pub(crate) fn cluster_histograms_ans(
             return (0..n).map(|i| f(i, &mut s)).collect();
         };
         let threads = pool.num_threads().min(n);
-        let chunk = n.div_ceil(threads);
+        // More work items than workers lets a lane finishing sparse contexts
+        // pick up dense ones, rather than waiting for a fixed heavy chunk.
+        let chunk = n.div_ceil(threads * 4);
         let parts = pool.steal_map(caller_scratch, n.div_ceil(chunk), |part, _| {
             let begin = part * chunk;
             let end = (begin + chunk).min(n);
@@ -993,7 +1122,7 @@ pub(crate) fn cluster_histograms_ans(
         context_map[..n].fill(0);
         return 1;
     }
-    while clusters.len() < CLUSTERS_LIMIT {
+    while clusters.len() < max_clusters {
         clusters.push(histograms[seed].clone());
         cluster_costs.push(in_costs[seed]);
         dists[seed] = 0.0;
@@ -1067,12 +1196,12 @@ pub(crate) fn cluster_histograms_ans(
     };
     rebuild(&mut clusters, &mut cluster_costs, &assignment, &mut scratch);
 
-    for _ in 0..2 {
+    for _ in 0..refinement_passes {
         // Propose every context's best move against a snapshot of the
         // clusters, in parallel; then apply proposals in index order, each
         // re-priced against the current clusters (two cost evaluations per
-        // proposer). Deterministic and independent of `threads`; the second
-        // pass picks up moves the first pass's snapshot could not see.
+        // proposer). Deterministic and independent of `threads`; subsequent
+        // passes pick up moves the previous snapshot could not see.
         let proposals: Vec<Option<u8>> = {
             let clusters = &clusters;
             let cluster_costs = &cluster_costs;
@@ -1229,7 +1358,14 @@ mod tests {
                 let mut histograms = base[..len].to_vec();
                 let mut map = vec![0u8; len];
                 let pool = crate::thread_pool::ThreadPool::new_lossless(threads);
-                let num = cluster_histograms_ans(&mut histograms, &mut map, Some(&pool), true);
+                let num = cluster_histograms_ans(
+                    &mut histograms,
+                    &mut map,
+                    Some(&pool),
+                    true,
+                    CLUSTERS_LIMIT,
+                    6,
+                );
                 (num, map, histograms[..num].to_vec())
             };
             let (num1, map1, hist1) = run(1);
@@ -1376,6 +1512,7 @@ mod tests {
             &mut expected_map,
             refined,
             &mut expected_pool,
+            None,
         );
 
         let mut actual = inputs(n);
@@ -1386,6 +1523,7 @@ mod tests {
             &mut actual,
             &mut actual_map,
             refined,
+            CLUSTERS_LIMIT,
             &mut scratch,
             &mut actual_pool,
         );
@@ -1403,6 +1541,150 @@ mod tests {
         for n in [0, 1, 2, 7, 64, 65, 128, 221] {
             assert_fixed_matches_allocating(n, false);
             assert_fixed_matches_allocating(n, true);
+        }
+    }
+
+    #[test]
+    fn speculative_prefix_assignment_matches_ordered_updates() {
+        // Identical adjacent seeds exercise first-best ties. Inputs spanning
+        // many distributions force invalidation of multiple clusters within
+        // each batch; preassigned empty contexts and partial batches are kept.
+        for (clusters, n) in [(64, 1287), (96, 2115), (128, 4129)] {
+            let inp: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut h = Histogram::new();
+                    if i >= clusters && i % 37 == 0 {
+                        return h;
+                    }
+                    let family = i % clusters / 2;
+                    let variation = if i < clusters { family } else { i };
+                    for j in 0..12 {
+                        let symbol = (family * 11 + j * 7) % ALPHABET_SIZE;
+                        let count = ((variation * 17 + j * 13) % 31 + 1) as u32;
+                        h.counts[symbol] += count;
+                        h.total_count += count;
+                    }
+                    h
+                })
+                .collect();
+            let in_costs: Vec<_> = inp.iter().map(histogram_bit_cost).collect();
+            let initial_symbols: Vec<_> = inp
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    if i < clusters {
+                        i as u8
+                    } else if h.total_count == 0 {
+                        0
+                    } else {
+                        CLUSTERS_LIMIT as u8
+                    }
+                })
+                .collect();
+            let mut expected = inp[..clusters].to_vec();
+            let mut expected_costs = in_costs[..clusters].to_vec();
+            let mut expected_symbols = initial_symbols.clone();
+            let mut scratch = [0u32; ALPHABET_SIZE];
+            // Original serial assignment is the oracle, including its exact
+            // comparison order and the immediate population/cost update.
+            for ((hist, &in_cost), symbol) in inp.iter().zip(&in_costs).zip(&mut expected_symbols) {
+                if *symbol != CLUSTERS_LIMIT as u8 {
+                    continue;
+                }
+                let mut best = 0;
+                let mut best_dist = histogram_distance(
+                    hist,
+                    &expected[0],
+                    in_cost,
+                    expected_costs[0],
+                    &mut scratch,
+                );
+                for j in 1..clusters {
+                    let distance = histogram_distance(
+                        hist,
+                        &expected[j],
+                        in_cost,
+                        expected_costs[j],
+                        &mut scratch,
+                    );
+                    if distance < best_dist {
+                        best = j;
+                        best_dist = distance;
+                    }
+                }
+                histogram_add(&mut expected[best], hist);
+                expected_costs[best] = histogram_bit_cost(&expected[best]);
+                *symbol = best as u8;
+            }
+            for threads in [1, 2, 4, 12] {
+                let pool = ThreadPool::new_lossless(threads);
+                let mut actual = inp[..clusters].to_vec();
+                let mut costs = in_costs[..clusters].to_vec();
+                let mut symbols = initial_symbols.clone();
+                let assigned = assign_prefix_histograms_parallel(
+                    &inp,
+                    &in_costs,
+                    &mut actual,
+                    &mut costs,
+                    &mut symbols,
+                    Some(&pool),
+                );
+                if threads == 1 {
+                    assert!(!assigned);
+                    assert_eq!(symbols, initial_symbols);
+                    continue;
+                }
+                assert!(assigned);
+                assert_eq!(symbols, expected_symbols);
+                for j in 0..clusters {
+                    assert_eq!(actual[j].counts, expected[j].counts);
+                    assert_eq!(actual[j].total_count, expected[j].total_count);
+                    assert_eq!(costs[j].to_bits(), expected_costs[j].to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_prefix_clustering_preserves_serial_decisions() {
+        // Cross the parallel threshold and the 64-context chunk boundary.
+        // Repeated populations exercise first-best ties; empty contexts must
+        // keep the same assignments even when they fall between work items.
+        for n in [1023, 1024, 1089] {
+            let input: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut h = Histogram::new();
+                    if i % 11 != 0 {
+                        for j in 0..8 {
+                            let symbol = (i % 17 + j * 13) % ALPHABET_SIZE;
+                            let count = (i % 7 + j * 3 + 1) as u32;
+                            h.counts[symbol] += count;
+                            h.total_count += count;
+                        }
+                    }
+                    h
+                })
+                .collect();
+            let mut expected = input.clone();
+            let mut expected_map = Vec::new();
+            cluster_histograms(&mut expected, &mut expected_map, &mut Vec::new());
+            for threads in [1, 2, 4] {
+                let pool = ThreadPool::new_lossless(threads);
+                let mut actual = input.clone();
+                let mut actual_map = Vec::new();
+                cluster_histograms_with_pool(
+                    &mut actual,
+                    &mut actual_map,
+                    &mut Vec::new(),
+                    Some(&pool),
+                );
+                assert_eq!(actual_map, expected_map, "n={n}, threads={threads}");
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.counts, expected.counts);
+                    assert_eq!(actual.total_count, expected.total_count);
+                }
+            }
         }
     }
 

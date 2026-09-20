@@ -341,7 +341,7 @@ mod tests {
                     0 => 37 - row as i32 * 56,
                     1 => x as i32 * 7 - row as i32 * 11,
                     2 => {
-                        if (x + row) % 2 == 0 {
+                        if (x + row).is_multiple_of(2) {
                             -65_535
                         } else {
                             65_535

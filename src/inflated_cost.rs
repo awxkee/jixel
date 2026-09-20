@@ -312,12 +312,18 @@ pub(crate) fn channel_rd(
             scan_pos,
         )
     };
-    let header = R_HEADER * rate_log2_with_lut(rate_log2_lut, nzeros as f32);
-    let bits = nzeros as f32 * R_NZ_BASE
+    (sse, model_bits(nzeros, mag_bits, max_scan, cx, cy))
+}
+
+/// The coefficient rate model's bit estimate for a channel block from its
+/// nonzero count, summed magnitude log2 and last scan position.
+#[inline]
+pub(crate) fn model_bits(nzeros: usize, mag_bits: f32, max_scan: u32, cx: usize, cy: usize) -> f32 {
+    let header = R_HEADER * rate_log2_with_lut(rate_log2_lut(), nzeros as f32);
+    nzeros as f32 * R_NZ_BASE
         + R_MAG * mag_bits
         + header
-        + R_ZERO * visited_zeros(nzeros, max_scan, cx, cy);
-    (sse, bits)
+        + R_ZERO * visited_zeros(nzeros, max_scan, cx, cy)
 }
 
 pub(crate) fn strategy_pixel_dims(strategy: u8) -> (usize, usize) {

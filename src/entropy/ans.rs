@@ -870,7 +870,6 @@ fn histogram_cost(counts: &[u32], histogram: &AnsHistogram) -> f64 {
 /// per-call `Vec` allocations of the plain version dominated their time.
 pub(crate) struct AnsCostScratch {
     precise: AnsHistogram,
-    flat: AnsHistogram,
     pub(crate) merged: [u32; TABLE_ENTRIES],
 }
 
@@ -884,10 +883,34 @@ impl AnsCostScratch {
         };
         Self {
             precise: blank(),
-            flat: blank(),
             merged: [0; TABLE_ENTRIES],
         }
     }
+}
+
+struct FlatPopulationCost {
+    symbol_bits: Box<[f64]>,
+    table_bits: f64,
+}
+
+fn flat_population_costs() -> &'static [FlatPopulationCost] {
+    static COSTS: OnceLock<Box<[FlatPopulationCost]>> = OnceLock::new();
+    COSTS.get_or_init(|| {
+        let logs = count_log2();
+        (1..=TABLE_ENTRIES)
+            .map(|len| {
+                let flat = flat_histogram(len, len);
+                FlatPopulationCost {
+                    symbol_bits: flat
+                        .freqs
+                        .iter()
+                        .map(|&freq| ANS_LOG_TAB_SIZE as f64 - logs[freq as usize])
+                        .collect(),
+                    table_bits: ans_table_bits(&flat),
+                }
+            })
+            .collect()
+    })
 }
 
 /// `fast_ans_population_cost` without allocation; identical result.
@@ -910,21 +933,28 @@ pub(crate) fn fast_ans_population_cost_scratch(
     let (omit_pos, _) = first_maximum(&precise.freqs);
     precise.method = 12;
     precise.omit_pos = omit_pos as u8;
-    let mut best =
-        ans_data_bits(counts, &precise.freqs) * data_scale as f64 + ans_table_bits(precise);
-    if let Some(base) = (ANS_TAB_SIZE as usize).checked_div(alphabet_size) {
-        let flat = &mut scratch.flat;
-        let remainder = ANS_TAB_SIZE as usize % alphabet_size;
-        flat.freqs.resize(alphabet_size, 0);
-        for (i, freq) in flat.freqs.iter_mut().enumerate() {
-            *freq = (base + usize::from(i < remainder)) as u16;
-        }
-        flat.method = 0;
-        flat.omit_pos = 0;
-        best =
-            best.min(ans_data_bits(counts, &flat.freqs) * data_scale as f64 + ans_table_bits(flat));
+    if alphabet_size == 0 {
+        return ans_table_bits(precise);
     }
-    best
+    // The flat distribution depends only on alphabet length. Cache its exact
+    // symbol prices and serialized table size, and price both candidates in
+    // one scan. Each accumulator retains the original symbol and FMA order.
+    let flat = &flat_population_costs()[alphabet_size - 1];
+    let logs = count_log2();
+    let mut precise_bits = 0.0;
+    let mut flat_bits = 0.0;
+    for ((&count, &freq), &flat_price) in counts.iter().zip(&precise.freqs).zip(&flat.symbol_bits) {
+        if count != 0 {
+            precise_bits = f_fmla(
+                count as f64,
+                ANS_LOG_TAB_SIZE as f64 - logs[freq.max(1) as usize],
+                precise_bits,
+            );
+            flat_bits = f_fmla(count as f64, flat_price, flat_bits);
+        }
+    }
+    (precise_bits * data_scale as f64 + ans_table_bits(precise))
+        .min(flat_bits * data_scale as f64 + flat.table_bits)
 }
 
 pub(crate) fn fast_ans_population_cost(counts: &[u32], data_scale: usize) -> f64 {

@@ -30,8 +30,8 @@
 
 use crate::adaptive_quant::fast_exp2;
 use crate::coder_scratch::{
-    AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, QuantRefinement,
-    RerankDowngrade,
+    AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, MergeUpgrade,
+    MergeUpgradeCandidate, QuantRefinement, RerankDowngrade,
 };
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
@@ -47,9 +47,14 @@ use crate::inflated_cost::{
     channel_rd,
 };
 
+mod matrix_overhead;
 mod selection;
 
-pub(crate) use selection::{Chosen32Cost, FineMosaicScratch, SavedChild, fill_ac_strategy};
+pub(crate) use matrix_overhead::account_matrix_headers;
+
+pub(crate) use selection::{
+    Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, fill_ac_strategy,
+};
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
@@ -109,6 +114,7 @@ const RERANK_LAMBDA_D1: f32 = 4.0;
 const BIAS_RECT: Banded = Banded::new(1.026_200_7, 0.915);
 const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.05);
 const BIAS_32X32: Banded = Banded::new(1.205_927_5, 1.06);
+const BIAS_32X32_LOOSEN: f32 = 0.94;
 const BIAS_RECT32: Banded = Banded::new(1.326_520_2, 1.02);
 
 const MERGE_MARGIN_PAIR: Banded = Banded::new(0.014_500_806, 0.0288);
@@ -138,6 +144,9 @@ const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
 /// Reconstruction-domain admission margin: a fine candidate must beat the
 /// DCT8 incumbent's reconstruction cost by this factor.
 const FINE_RECON_MARGIN: f32 = 0.98;
+const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
+
+const FINE_ADMIT_LEAF_EXTRA_BITS: f32 = 32.0;
 
 #[inline]
 fn fine_transform_bias(base: f32, distance: f32) -> f32 {
@@ -246,6 +255,9 @@ impl MergeTuning {
             tuning.accept_64 = lerp(tuning.accept_64, VLQ_ACCEPT_64);
             tuning.accept_64_rect = lerp(tuning.accept_64_rect, VLQ_ACCEPT_64_RECT);
         }
+        if distance >= MERGE_BAND_D1 {
+            tuning.bias_32x32 *= BIAS_32X32_LOOSEN;
+        }
         tuning
     }
 }
@@ -277,6 +289,108 @@ impl SearchScope {
     #[inline]
     fn rerank(self, distance: f32) -> bool {
         self == SearchScope::Full || distance <= FAST_RERANK_MAX_DISTANCE
+    }
+}
+
+pub(crate) struct RateCalibration;
+
+impl RateCalibration {
+    /// [pair, 16x16, 32-class] × [hq, mid, low]; hq at d<=1.5, mid at 2.75,
+    /// low from d=4, linear in between.
+    const TABLE: [[f32; 3]; 3] = [[1.0, 0.96, 0.96], [1.0, 0.93, 0.93], [1.0, 0.91, 0.91]];
+
+    #[inline]
+    fn family(strategy: u8) -> Option<usize> {
+        Some(match strategy {
+            STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 0,
+            STRATEGY_DCT16X16 => 1,
+            STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 2,
+            _ => return None,
+        })
+    }
+
+    /// Rate multiplier for `strategy` at `distance` (1.0 for DCT8 and for
+    /// every family outside the table).
+    #[inline]
+    pub(crate) fn scale(strategy: u8, distance: f32) -> f32 {
+        let Some(f) = Self::family(strategy) else {
+            return 1.0;
+        };
+        let [hq, mid, low] = Self::TABLE[f];
+        if distance <= 1.5 {
+            hq
+        } else if distance <= 2.75 {
+            fmla((distance - 1.5) / 1.25, mid - hq, hq)
+        } else if distance <= 4.0 {
+            fmla((distance - 2.75) / 1.25, low - mid, mid)
+        } else {
+            low
+        }
+    }
+}
+
+/// Which AC-strategy selector runs and how merge costs propagate upward.
+/// Study-only switch read from the environment (`JIXEL_SELECT=leaf`,
+/// `JIXEL_SELECT_PROP=raw`); the defaults reproduce the shipped selector
+/// byte-for-byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectorPolicy {
+    /// Bottom-up plan-based selection (see [`LEAF_FIRST_MAX_DISTANCE`]):
+    /// every 8x8 picks its best structural transform (DCT8 / DCT4 family /
+    /// AFV) first, then pairs/16x16 and the 32 class compete against those
+    /// leaves; IDENTITY/DCT2X2 refine the remaining DCT8 blocks afterwards.
+    /// On by default; `JIXEL_SELECT=legacy` opts out (merges first, then the
+    /// whole sub-8 family on what is left).
+    pub(crate) leaf_first: bool,
+    /// Propagate the unbiased cost of a winning merge to the next level
+    /// instead of its bias-multiplied decision cost.
+    pub(crate) raw_propagation: bool,
+    /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); on by
+    /// default, `JIXEL_MERGE_UPGRADE=0` opts out.
+    pub(crate) merge_upgrade: bool,
+}
+
+impl Default for SelectorPolicy {
+    fn default() -> Self {
+        Self {
+            leaf_first: true,
+            raw_propagation: false,
+            merge_upgrade: true,
+        }
+    }
+}
+
+const MERGE_UPGRADE_MARGIN: f32 = 1.0;
+const MERGE_UPGRADE_MIN_DISTANCE: f32 = 2.0;
+const MERGE_UPGRADE_LOW_MARGIN: f32 = 1.05;
+const MERGE_UPGRADE_LOW_DISTANCE: f32 = 4.0;
+
+/// Reconstruction-domain acceptance margin of the merge upgrade at `distance`.
+#[inline]
+fn merge_upgrade_margin(distance: f32) -> f32 {
+    let t = ((distance - MERGE_UPGRADE_MIN_DISTANCE)
+        / (MERGE_UPGRADE_LOW_DISTANCE - MERGE_UPGRADE_MIN_DISTANCE))
+        .clamp(0.0, 1.0);
+    fmla(
+        t,
+        MERGE_UPGRADE_LOW_MARGIN - MERGE_UPGRADE_MARGIN,
+        MERGE_UPGRADE_MARGIN,
+    )
+}
+const LEAF_FIRST_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
+
+impl SelectorPolicy {
+    pub(crate) fn from_env() -> Self {
+        let flag = |name: &str, on: &str| {
+            std::env::var(name)
+                .map(|v| v.eq_ignore_ascii_case(on))
+                .unwrap_or(false)
+        };
+        Self {
+            leaf_first: !flag("JIXEL_SELECT", "legacy"),
+            raw_propagation: flag("JIXEL_SELECT_PROP", "raw"),
+            merge_upgrade: !flag("JIXEL_MERGE_UPGRADE", "0"),
+        }
     }
 }
 
@@ -580,8 +694,9 @@ fn strategy_cost(
 struct ReconStrategyCost {
     /// Ramped-lambda RD cost including the caller's metadata charge.
     cost: f32,
-    /// Ramped-lambda RD cost without the metadata charge; quant refinement's
-    /// incumbent.
+    /// Ramped-lambda RD cost without metadata, for quantizer refinement.
+    /// NaN when rerank-only gradient penalties make the score incompatible
+    /// with refinement's unpenalized candidates; the caller must recompute it.
     base: f32,
     distortion: f32,
     rate: f32,
@@ -660,13 +775,17 @@ fn reconstruction_strategy_cost_and_base(
             distortion,
             rate,
         ),
-        base: rd_cost(
-            DistortionModel::Reconstruction,
-            distance,
-            0.0,
-            distortion,
-            rate,
-        ),
+        base: if gradient_alpha == 0.0 && gradient_peak_alpha == 0.0 {
+            rd_cost(
+                DistortionModel::Reconstruction,
+                distance,
+                0.0,
+                distortion,
+                rate,
+            )
+        } else {
+            f32::NAN
+        },
         distortion,
         rate,
         hue_distortion,
@@ -781,7 +900,10 @@ fn coefficient_dist_and_rate(
         d_total += ctx.channel_weight(c) * d;
         r_total += r;
     }
-    (d_total, r_total)
+    (
+        d_total,
+        r_total * RateCalibration::scale(strategy, distance),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -894,7 +1016,7 @@ fn reconstruction_dist_and_rate(
     gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
 ) -> ReconCost {
-    (ctx.recon_dist_and_rate)(
+    let mut cost = (ctx.recon_dist_and_rate)(
         recon,
         &ReconDistInput {
             idct: ctx.idct,
@@ -933,7 +1055,9 @@ fn reconstruction_dist_and_rate(
             },
         },
         &ctx.recon_error_kernels,
-    )
+    );
+    cost.rate *= RateCalibration::scale(strategy, distance);
+    cost
 }
 
 /// Pair-transform gradient protection used only by the reconstruction rerank.
@@ -1154,7 +1278,15 @@ fn sub8_strategy_costs(
         dct4x4: evaluate_dct4(STRATEGY_DCT4X4),
         dct4x8: evaluate_dct4(STRATEGY_DCT4X8),
         dct8x4: evaluate_dct4(STRATEGY_DCT8X4),
-        afv: std::array::from_fn(|kind| evaluate(STRATEGY_AFV0 + kind as u8)),
+        // AFV shares the DCT4 gate plus its own extension band
+        // ([`AFV_MAX_DISTANCE`]); it used to be evaluated unconditionally,
+        // so it competed at every distance the fine pass runs (≤ 5) and only
+        // a rejecting frame gate cleaned those blocks up.
+        afv: if with_dct4 || distance <= AFV_MAX_DISTANCE {
+            std::array::from_fn(|kind| evaluate(STRATEGY_AFV0 + kind as u8))
+        } else {
+            [f32::INFINITY; 4]
+        },
     }
 }
 

@@ -30,7 +30,6 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
-mod dark_aq;
 mod dct;
 mod entropy;
 mod frame;
@@ -39,7 +38,6 @@ mod lossless_grad;
 mod lz_match;
 mod quant;
 mod quantize_xyb;
-mod structure_aq;
 mod xyb;
 mod ytob;
 
@@ -52,7 +50,6 @@ pub(crate) use cfl::{
     apply_cfl_wasm, cfl_closed_loop_cost_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm,
     cfl_regression_wasm,
 };
-pub(crate) use dark_aq::{dark_structure_stats_wasm, fill_blue_tile_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;
@@ -62,11 +59,7 @@ pub(crate) use inflated_cost::{
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
-pub(crate) use quant::{
-    apply_quant_field_gain_wasm, apply_structure_aq_wasm, quantize_block_ac_wasm,
-    quantize_dc_cfl_wasm, quantize_dc_wasm,
-};
+pub(crate) use quant::{quantize_block_ac_wasm, quantize_dc_cfl_wasm, quantize_dc_wasm};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm};
-pub(crate) use structure_aq::block_features_wasm;
 pub(crate) use xyb::to_xyb_wasm_band;
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};

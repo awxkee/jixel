@@ -187,6 +187,7 @@ fn select_hybrid_config_ans_sampled(
     values: &[u32],
     sample_stride: usize,
     stride: usize,
+    acceptance_ratio: f64,
     scratch: &mut HybridAnsSelectorScratch,
 ) -> HybridUintConfig {
     if values.is_empty() {
@@ -228,7 +229,7 @@ fn select_hybrid_config_ans_sampled(
     }
 
     // Shannon cost only nominates the strongest non-default finalist. The
-    // winner and the existing 0.5% stability gate below use actual normalized
+    // winner and the preset's acceptance margin below use actual normalized
     // ANS data and exact table bits for both finalist and default.
     let proxy_best = (0..NUM_HYBRID_CANDIDATES)
         .filter(|&i| i != DEFAULT_HYBRID_INDEX && scratch.valid[i])
@@ -261,7 +262,7 @@ fn select_hybrid_config_ans_sampled(
             best = config;
         }
     }
-    if best_cost >= default_cost * 0.995 {
+    if best_cost >= default_cost * acceptance_ratio {
         HybridUintConfig::DEFAULT
     } else {
         best
@@ -317,6 +318,10 @@ impl HybridUintSamples {
     }
 
     pub(crate) fn select(&self) -> Vec<HybridUintConfig> {
+        self.select_with_acceptance(0.995)
+    }
+
+    fn select_with_acceptance(&self, acceptance_ratio: f64) -> Vec<HybridUintConfig> {
         // Every cluster is selected independently; spread them over scoped
         // threads with one selector scratch each (identical results).
         let n = self.values.len();
@@ -330,7 +335,13 @@ impl HybridUintSamples {
                 .iter()
                 .zip(&self.strides)
                 .map(|(values, &stride)| {
-                    select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                    select_hybrid_config_ans_sampled(
+                        values,
+                        1,
+                        stride,
+                        acceptance_ratio,
+                        &mut scratch,
+                    )
                 })
                 .collect();
         }
@@ -348,7 +359,13 @@ impl HybridUintSamples {
                             .iter()
                             .zip(strides)
                             .map(|(values, &stride)| {
-                                select_hybrid_config_ans_sampled(values, 1, stride, &mut scratch)
+                                select_hybrid_config_ans_sampled(
+                                    values,
+                                    1,
+                                    stride,
+                                    acceptance_ratio,
+                                    &mut scratch,
+                                )
                             })
                             .collect::<Vec<_>>()
                     })
@@ -365,12 +382,13 @@ impl HybridUintSamples {
         &self,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
+        acceptance_ratio: f64,
     ) -> Vec<HybridUintConfig> {
         let n = self.values.len();
         if n == 0 {
             return Vec::new();
         }
-        let chunk = n.div_ceil(pool.num_threads());
+        let chunk = n.div_ceil(pool.num_threads() * 4);
         pool.steal_map(scratch, n.div_ceil(chunk), |part, _| {
             let begin = part * chunk;
             let end = (begin + chunk).min(n);
@@ -381,6 +399,7 @@ impl HybridUintSamples {
                         &self.values[i],
                         1,
                         self.strides[i],
+                        acceptance_ratio,
                         &mut selector,
                     )
                 })
@@ -398,7 +417,7 @@ fn select_hybrid_config_ans(
     scratch: &mut HybridAnsSelectorScratch,
 ) -> HybridUintConfig {
     let stride = values.len().div_ceil(65_536).max(1);
-    select_hybrid_config_ans_sampled(values, stride, stride, scratch)
+    select_hybrid_config_ans_sampled(values, stride, stride, 0.995, scratch)
 }
 
 fn hybrid_ans_candidate_cost(
@@ -448,6 +467,249 @@ fn build_histograms_with(
         };
         histograms[context].add(tok);
     }
+}
+
+/// Contiguous, balanced token ranges for order-independent counting. Only
+/// slice headers are copied; ANS coding still uses the original stream bounds.
+fn parallel_token_parts<'a>(
+    streams: &[&'a [Token]],
+    pool: Option<&ThreadPool>,
+) -> Option<Vec<Vec<&'a [Token]>>> {
+    let threads = pool?.num_threads();
+    let total: usize = streams.iter().map(|tokens| tokens.len()).sum();
+    let parts = (total / 65_536).min(threads * 2);
+    if threads <= 1 || parts <= 1 {
+        return None;
+    }
+    let target = total.div_ceil(parts);
+    let mut out = Vec::with_capacity(parts);
+    let mut current = Vec::new();
+    let mut remaining = target;
+    for &tokens in streams {
+        let mut tokens = tokens;
+        while !tokens.is_empty() {
+            let take = remaining.min(tokens.len());
+            let (head, tail) = tokens.split_at(take);
+            current.push(head);
+            tokens = tail;
+            remaining -= take;
+            if remaining == 0 {
+                out.push(std::mem::take(&mut current));
+                remaining = target;
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    Some(out)
+}
+
+struct CompactContextPopulations {
+    widths: Vec<u8>,
+    offsets: Vec<usize>,
+    counts: Vec<u32>,
+}
+
+impl CompactContextPopulations {
+    fn for_each(self, mut emit: impl FnMut(usize, Histogram)) {
+        for (context, &width) in self.widths.iter().enumerate() {
+            if width == 0 {
+                continue;
+            }
+            let counts = &self.counts[self.offsets[context]..self.offsets[context + 1]];
+            let mut histogram = Histogram::new();
+            histogram.counts[..counts.len()].copy_from_slice(counts);
+            histogram.total_count = counts.iter().sum();
+            emit(context, histogram);
+        }
+    }
+}
+
+/// Count original contexts without replicating their mostly empty 128-bin
+/// histograms on every worker. First find each context's active alphabet, then
+/// count into packed rows. Only integer counts are reduced, in input order.
+fn parallel_context_populations(
+    streams: &[&[Token]],
+    num_contexts: usize,
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+    symbol: impl Fn(&Token) -> u32 + Sync,
+) -> Option<CompactContextPopulations> {
+    let parts = parallel_token_parts(streams, pool)?;
+    let pool = pool.unwrap();
+    let alphabets = pool.steal_map(scratch, parts.len(), |i, _| {
+        let mut widths = vec![0u8; num_contexts];
+        for tokens in &parts[i] {
+            for token in *tokens {
+                let symbol = symbol(token);
+                assert!((symbol as usize) < ALPHABET_SIZE);
+                let width = &mut widths[token.context as usize];
+                *width = (*width).max(symbol as u8 + 1);
+            }
+        }
+        widths
+    });
+    let mut widths = vec![0u8; num_contexts];
+    for local in alphabets {
+        for (width, local) in widths.iter_mut().zip(local) {
+            *width = (*width).max(local);
+        }
+    }
+    let mut offsets = Vec::with_capacity(num_contexts + 1);
+    offsets.push(0);
+    for &width in &widths {
+        offsets.push(offsets.last().unwrap() + usize::from(width));
+    }
+    let num_bins = offsets[num_contexts];
+    // Bound all replicated count buffers together, including dense inputs.
+    const COUNT_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
+    let bytes = num_bins * size_of::<u32>();
+    let max_parts = COUNT_SCRATCH_BYTES / bytes.max(1);
+    if max_parts == 0 {
+        return None;
+    }
+    let group_size = parts.len().div_ceil(max_parts.min(parts.len()));
+    let partial = pool.steal_map(scratch, parts.len().div_ceil(group_size), |i, _| {
+        let mut counts = vec![0u32; num_bins];
+        let start = i * group_size;
+        let end = (start + group_size).min(parts.len());
+        for part in &parts[start..end] {
+            for tokens in part {
+                for token in *tokens {
+                    counts[offsets[token.context as usize] + symbol(token) as usize] += 1;
+                }
+            }
+        }
+        counts
+    });
+    let mut partial = partial.into_iter();
+    let mut counts = partial.next().unwrap();
+    for local in partial {
+        for (count, added) in counts.iter_mut().zip(local) {
+            *count += added;
+        }
+    }
+    Some(CompactContextPopulations {
+        widths,
+        offsets,
+        counts,
+    })
+}
+
+fn clustered_histograms(
+    streams: &[&[Token]],
+    context_map: &[u8],
+    configs: &[HybridUintConfig],
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+) -> Vec<Histogram> {
+    let count = |streams: &[&[Token]]| {
+        let mut histograms = vec![Histogram::new(); configs.len()];
+        for tokens in streams {
+            for token in *tokens {
+                let cluster = context_map[token.context as usize] as usize;
+                histograms[cluster].add(uint_encode_with_config(token.value, configs[cluster]).0);
+            }
+        }
+        histograms
+    };
+    let Some(parts) = parallel_token_parts(streams, pool) else {
+        return count(streams);
+    };
+    let partial = pool
+        .unwrap()
+        .steal_map(scratch, parts.len(), |i, _| count(&parts[i]));
+    let mut histograms = vec![Histogram::new(); configs.len()];
+    for local in partial {
+        for (dst, src) in histograms.iter_mut().zip(local) {
+            for (count, added) in dst.counts.iter_mut().zip(src.counts) {
+                *count += added;
+            }
+            dst.total_count += src.total_count;
+        }
+    }
+    histograms
+}
+
+fn gather_hybrid_samples<const TRACK_MAX: bool>(
+    streams: &[&[Token]],
+    context_map: &[u8],
+    counts: &[usize],
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
+) -> (HybridUintSamples, Vec<u32>) {
+    let mut samples = HybridUintSamples::new(counts);
+    let mut max_values = vec![0u32; counts.len()];
+    let gather = |streams: &[&[Token]], samples: &mut HybridUintSamples, max_values: &mut [u32]| {
+        for tokens in streams {
+            for token in *tokens {
+                let cluster = context_map[token.context as usize] as usize;
+                samples.push(cluster, token.value);
+                if TRACK_MAX {
+                    max_values[cluster] = max_values[cluster].max(token.value);
+                }
+            }
+        }
+    };
+    let Some(parts) = parallel_token_parts(streams, pool) else {
+        gather(streams, &mut samples, &mut max_values);
+        return (samples, max_values);
+    };
+    let pool = pool.unwrap();
+    let part_counts = pool.steal_map(scratch, parts.len(), |i, _| {
+        let mut counts = vec![0usize; counts.len()];
+        for tokens in &parts[i] {
+            for token in *tokens {
+                counts[context_map[token.context as usize] as usize] += 1;
+            }
+        }
+        counts
+    });
+    // Prefix counts recover exactly the serial per-cluster sample ordinals,
+    // including when a partition starts halfway through a sampling stride.
+    let mut running = vec![0usize; counts.len()];
+    let starts: Vec<Vec<usize>> = part_counts
+        .iter()
+        .map(|local| {
+            running
+                .iter_mut()
+                .zip(local)
+                .zip(&samples.strides)
+                .map(|((total, &count), &stride)| {
+                    let remaining = (stride - *total % stride) % stride;
+                    *total += count;
+                    remaining
+                })
+                .collect()
+        })
+        .collect();
+    debug_assert_eq!(running, counts);
+    let partial = pool.steal_map(scratch, parts.len(), |i, _| {
+        let mut local = HybridUintSamples {
+            values: part_counts[i]
+                .iter()
+                .zip(&samples.strides)
+                .map(|(&n, &stride)| Vec::with_capacity(n.div_ceil(stride)))
+                .collect(),
+            strides: samples.strides.clone(),
+            remaining: starts[i].clone(),
+        };
+        let mut maxima = vec![0u32; counts.len()];
+        gather(&parts[i], &mut local, &mut maxima);
+        (local.values, maxima)
+    });
+    for (local, maxima) in partial {
+        for (dst, values) in samples.values.iter_mut().zip(local) {
+            dst.extend(values);
+        }
+        if TRACK_MAX {
+            for (dst, value) in max_values.iter_mut().zip(maxima) {
+                *dst = (*dst).max(value);
+            }
+        }
+    }
+    (samples, max_values)
 }
 
 pub(crate) fn build_huffman_codes(
@@ -555,7 +817,14 @@ pub(crate) fn optimize_entropy_code_ac(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> OwnedEntropyCode {
-    optimize_entropy_code_ac_streams(std::iter::once(tokens), num_contexts, huffman_pool, true)
+    optimize_entropy_code_ac_streams(
+        std::iter::once(tokens),
+        num_contexts,
+        huffman_pool,
+        true,
+        crate::Speed::Fast,
+        None,
+    )
 }
 
 /// `select_configs = false` keeps every cluster on `HybridUintConfig::DEFAULT`.
@@ -570,6 +839,8 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
+    speed: crate::Speed,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -580,6 +851,12 @@ where
         huffman_pool,
         select_configs,
         false,
+        if speed == crate::Speed::Slow {
+            1.0
+        } else {
+            0.995
+        },
+        pool,
     )
 }
 
@@ -587,35 +864,58 @@ pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
     streams: I,
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
 {
-    optimize_entropy_code_ac_streams_impl(streams, num_contexts, huffman_pool, false, true)
+    optimize_entropy_code_ac_streams_impl(
+        streams,
+        num_contexts,
+        huffman_pool,
+        false,
+        true,
+        0.995,
+        pool,
+    )
 }
 
 const ANS_CLUSTER_PROXY_SYMBOL_BITS: f64 = 6.0;
 const ANS_CLUSTER_PROXY_BASE_BITS: f64 = 12.0;
 const MAX_ANS_RELOCATION_CONTEXTS: usize = 4096;
+const XLOG2X_TABLE_SIZE: u32 = 1 << 16;
 
 #[inline]
 fn xlog2x(value: u32) -> f64 {
-    if value <= 1 {
-        0.0
-    } else {
-        value as f64 * f_log2(value as f64)
-    }
+    value as f64 * f_log2(value as f64)
+}
+
+fn xlog2x_table() -> &'static [f64] {
+    static TABLE: std::sync::OnceLock<Box<[f64]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        [0.0, 0.0]
+            .into_iter()
+            .chain((2..XLOG2X_TABLE_SIZE).map(xlog2x))
+            .collect()
+    })
 }
 
 /// Cheap Shannon-domain delta used only to nominate an ANS cluster move. The
 /// final decision is made by serializing both complete candidates below.
 fn moved_population_proxy_delta(source: &Histogram, target: &Histogram, moved: &Histogram) -> f64 {
+    let table = xlog2x_table();
+    let cost = |value: u32| {
+        table
+            .get(value as usize)
+            .copied()
+            .unwrap_or_else(|| xlog2x(value))
+    };
     debug_assert!(moved.total_count <= source.total_count);
     let source_after = source.total_count - moved.total_count;
     let target_after = target.total_count + moved.total_count;
-    let mut delta = xlog2x(source_after) + xlog2x(target_after)
-        - xlog2x(source.total_count)
-        - xlog2x(target.total_count);
+    let mut delta = cost(source_after) + cost(target_after)
+        - cost(source.total_count)
+        - cost(target.total_count);
     if source_after == 0 {
         delta -= ANS_CLUSTER_PROXY_BASE_BITS;
     }
@@ -634,9 +934,9 @@ fn moved_population_proxy_delta(source: &Histogram, target: &Histogram, moved: &
         debug_assert!(moved_count <= source_count);
         let source_count_after = source_count - moved_count;
         let target_count_after = target_count + moved_count;
-        delta -= xlog2x(source_count_after) + xlog2x(target_count_after)
-            - xlog2x(source_count)
-            - xlog2x(target_count);
+        delta -= cost(source_count_after) + cost(target_count_after)
+            - cost(source_count)
+            - cost(target_count);
         if source_count_after == 0 {
             delta -= ANS_CLUSTER_PROXY_SYMBOL_BITS;
         }
@@ -946,23 +1246,17 @@ fn exact_ans_stream_bits_pair(
     };
 
     const MIN_PARALLEL_TOKENS: usize = 16_384;
-    const MAX_EXACT_LANES: usize = 8;
     let total_tokens: usize = streams.iter().map(|stream| stream.len()).sum();
-    let num_lanes = thread_pool
-        .num_threads()
-        .min(MAX_EXACT_LANES)
-        .min(streams.len());
+    let num_lanes = thread_pool.num_threads().min(streams.len());
     if num_lanes <= 1 || total_tokens < MIN_PARALLEL_TOKENS {
         return sequential(streams);
     }
 
-    let chunk_len = streams.len().div_ceil(num_lanes);
-    let num_chunks = streams.len().div_ceil(chunk_len);
+    // Each stream owns an ANS state. Schedule those independently so groups
+    // with many tokens do not strand workers assigned a lighter fixed chunk.
     thread_pool
-        .steal_map_with_threads(scratch, num_chunks, num_lanes, |lane, _scratch| {
-            let start = lane * chunk_len;
-            let end = (start + chunk_len).min(streams.len());
-            sequential(&streams[start..end])
+        .steal_map(scratch, streams.len(), |i, _scratch| {
+            ans_tokens_bits_pair(streams[i], &first, &second)
         })
         .into_iter()
         .fold((0usize, 0usize), |acc, bits| {
@@ -981,14 +1275,38 @@ fn refine_ans_clusters_once(
     }
     let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
     let mut context_histograms = vec![Histogram::new(); code.context_map.len()];
-    for tokens in streams {
-        for token in *tokens {
-            let context = token.context as usize;
+    if let Some(populations) = parallel_context_populations(
+        streams,
+        code.context_map.len(),
+        Some(thread_pool),
+        scratch,
+        |token| {
+            uint_encode_with_config(
+                token.value,
+                code.hybrid_uint_configs[code.context_map[token.context as usize] as usize],
+            )
+            .0
+        },
+    ) {
+        populations.for_each(|context, histogram| {
             let cluster = code.context_map[context] as usize;
-            let (symbol, _, _) =
-                uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
-            histograms[cluster].add(symbol);
-            context_histograms[context].add(symbol);
+            let target = &mut histograms[cluster];
+            for (count, &added) in target.counts.iter_mut().zip(&histogram.counts) {
+                *count += added;
+            }
+            target.total_count += histogram.total_count;
+            context_histograms[context] = histogram;
+        });
+    } else {
+        for tokens in streams {
+            for token in *tokens {
+                let context = token.context as usize;
+                let cluster = code.context_map[context] as usize;
+                let (symbol, _, _) =
+                    uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
+                histograms[cluster].add(symbol);
+                context_histograms[context].add(symbol);
+            }
         }
     }
     let Some((candidate_histograms, candidate_map, candidate_configs)) =
@@ -1087,7 +1405,13 @@ where
         && refine_ans_clusters_once(code, &streams, thread_pool, scratch);
     let recluster = !matches!(refinement, AnsRefinement::Fast { recluster: false });
     let proposal = if recluster {
-        propose_ans_reclustering(&streams, code.context_map.len(), thread_pool, scratch)
+        propose_ans_reclustering(
+            &streams,
+            code.context_map.len(),
+            thread_pool,
+            scratch,
+            refinement,
+        )
     } else {
         propose_ans_cluster_batch(code, &streams)
     };
@@ -1156,14 +1480,13 @@ fn refine_ans_precisions(
     if code.use_prefix_code || code.ans_histograms.is_empty() {
         return false;
     }
-    let mut histograms = vec![Histogram::new(); code.ans_histograms.len()];
-    for tokens in streams {
-        for token in *tokens {
-            let cluster = code.context_map[token.context as usize] as usize;
-            let symbol = uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]).0;
-            histograms[cluster].add(symbol);
-        }
-    }
+    let histograms = clustered_histograms(
+        streams,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        Some(thread_pool),
+        scratch,
+    );
     let proposals = thread_pool.steal_map(scratch, histograms.len(), |i, _| {
         refine_ans_histogram_precision(&histograms[i].counts, &code.ans_histograms[i])
     });
@@ -1217,27 +1540,42 @@ fn propose_ans_reclustering(
     num_contexts: usize,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
+    refinement: AnsRefinement,
 ) -> Option<AnsClusterProposal> {
     let mut dense = vec![usize::MAX; num_contexts];
-    for tokens in streams {
-        for token in *tokens {
-            dense[token.context as usize] = 0;
-        }
-    }
     let mut histograms = Vec::new();
-    for index in &mut dense {
-        if *index != usize::MAX {
-            *index = histograms.len();
-            histograms.push(Histogram::new());
+    if let Some(populations) =
+        parallel_context_populations(streams, num_contexts, Some(thread_pool), scratch, |token| {
+            uint_encode(token.value).0
+        })
+    {
+        populations.for_each(|context, histogram| {
+            dense[context] = histograms.len();
+            histograms.push(histogram);
+        });
+    } else {
+        for tokens in streams {
+            for token in *tokens {
+                dense[token.context as usize] = 0;
+            }
+        }
+        for index in &mut dense {
+            if *index != usize::MAX {
+                *index = histograms.len();
+                histograms.push(Histogram::new());
+            }
+        }
+        if histograms.len() <= 1 {
+            return None;
+        }
+        for tokens in streams {
+            for token in *tokens {
+                histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
+            }
         }
     }
     if histograms.len() <= 1 {
         return None;
-    }
-    for tokens in streams {
-        for token in *tokens {
-            histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
-        }
     }
     let mut assignment = vec![0u8; histograms.len()];
     let n = super::cluster::cluster_histograms_ans(
@@ -1245,6 +1583,12 @@ fn propose_ans_reclustering(
         &mut assignment,
         Some(thread_pool),
         true,
+        super::cluster::CLUSTERS_LIMIT,
+        if matches!(refinement, AnsRefinement::Slow) {
+            6
+        } else {
+            2
+        },
     );
     histograms.truncate(n);
     let context_map: Vec<u8> = dense
@@ -1258,16 +1602,17 @@ fn propose_ans_reclustering(
         })
         .collect();
     let counts: Vec<usize> = histograms.iter().map(|h| h.total_count as usize).collect();
-    let mut samples = HybridUintSamples::new(&counts);
-    let mut max_values = vec![0u32; n];
-    for tokens in streams {
-        for token in *tokens {
-            let cluster = context_map[token.context as usize] as usize;
-            samples.push(cluster, token.value);
-            max_values[cluster] = max_values[cluster].max(token.value);
-        }
-    }
-    let mut configs = samples.select_with_pool(thread_pool, scratch);
+    let (samples, max_values) =
+        gather_hybrid_samples::<true>(streams, &context_map, &counts, Some(thread_pool), scratch);
+    let mut configs = samples.select_with_pool(
+        thread_pool,
+        scratch,
+        if matches!(refinement, AnsRefinement::Slow) {
+            1.0
+        } else {
+            0.995
+        },
+    );
     // Sampling may miss a rare large value. Check a conservative upper bound
     // for every selected configuration before rebuilding fixed-size tables.
     for (config, &max_value) in configs.iter_mut().zip(&max_values) {
@@ -1278,13 +1623,8 @@ fn propose_ans_reclustering(
         }
     }
     if configs.iter().any(|&c| c != HybridUintConfig::DEFAULT) {
-        histograms.fill(Histogram::new());
-        for tokens in streams {
-            for token in *tokens {
-                let cluster = context_map[token.context as usize] as usize;
-                histograms[cluster].add(uint_encode_with_config(token.value, configs[cluster]).0);
-            }
-        }
+        histograms =
+            clustered_histograms(streams, &context_map, &configs, Some(thread_pool), scratch);
     }
     Some((histograms, context_map, configs))
 }
@@ -1395,6 +1735,8 @@ fn optimize_entropy_code_ac_streams_impl<'a, I>(
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
     fast_cluster: bool,
+    hybrid_acceptance: f64,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
     I: IntoIterator<Item = &'a [Token]>,
@@ -1409,6 +1751,8 @@ where
         huffman_pool,
         select_configs,
         fast_cluster,
+        hybrid_acceptance,
+        pool,
     )
 }
 
@@ -1419,10 +1763,22 @@ fn optimize_entropy_code_ac_slices(
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
     fast_cluster: bool,
+    hybrid_acceptance: f64,
+    pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode {
     let mut histograms = vec![Histogram::new(); num_contexts];
-    for tokens in streams {
-        build_histograms(tokens, None, &mut histograms);
+    if let Some(populations) = parallel_context_populations(
+        streams,
+        num_contexts,
+        pool,
+        &mut CoderScratch::lossless(),
+        |token| uint_encode(token.value).0,
+    ) {
+        populations.for_each(|context, histogram| histograms[context] = histogram);
+    } else {
+        for tokens in streams {
+            build_histograms(tokens, None, &mut histograms);
+        }
     }
     let mut context_map: Vec<u8> = Vec::new();
     if fast_cluster {
@@ -1464,7 +1820,12 @@ fn optimize_entropy_code_ac_slices(
             }
         }));
     } else {
-        cluster_histograms(&mut histograms, &mut context_map, huffman_pool);
+        super::cluster::cluster_histograms_with_pool(
+            &mut histograms,
+            &mut context_map,
+            huffman_pool,
+            pool,
+        );
     }
 
     // Second walk: pick each final cluster's HybridUint config from its actual
@@ -1476,13 +1837,18 @@ fn optimize_entropy_code_ac_slices(
     let hybrid_uint_configs = if select_configs {
         // Every AC token contributes one symbol to these clustered counts.
         let counts: Vec<_> = histograms.iter().map(|h| h.total_count as usize).collect();
-        let mut samples = HybridUintSamples::new(&counts);
-        for tokens in streams {
-            for t in *tokens {
-                samples.push(context_map[t.context as usize] as usize, t.value);
-            }
+        let (samples, _) = gather_hybrid_samples::<false>(
+            streams,
+            &context_map,
+            &counts,
+            pool,
+            &mut CoderScratch::lossless(),
+        );
+        if let Some(pool) = pool {
+            samples.select_with_pool(pool, &mut CoderScratch::lossless(), hybrid_acceptance)
+        } else {
+            samples.select_with_acceptance(hybrid_acceptance)
         }
-        samples.select()
     } else {
         vec![HybridUintConfig::DEFAULT; num_clusters]
     };
@@ -1490,14 +1856,13 @@ fn optimize_entropy_code_ac_slices(
         .iter()
         .any(|&c| c != HybridUintConfig::DEFAULT)
     {
-        histograms.fill(Histogram::new());
-        for tokens in streams {
-            for t in *tokens {
-                let cluster = context_map[t.context as usize] as usize;
-                let (symbol, _, _) = uint_encode_with_config(t.value, hybrid_uint_configs[cluster]);
-                histograms[cluster].add(symbol);
-            }
-        }
+        histograms = clustered_histograms(
+            streams,
+            &context_map,
+            &hybrid_uint_configs,
+            pool,
+            &mut CoderScratch::lossless(),
+        );
     }
 
     let prefix_codes = build_huffman_codes(&histograms, huffman_pool);
@@ -2427,13 +2792,18 @@ mod ans_refinement_tests {
                 HYBRID_CANDIDATES[11],
             ],
         );
-        let mut streams: Vec<&[Token]> = tokens.chunks(997).collect();
+        // An uneven large first stream followed by small streams exercises
+        // work stealing; every boundary still starts a distinct ANS state.
+        let split = tokens.len() / 2;
+        let mut streams: Vec<&[Token]> = std::iter::once(&tokens[..split])
+            .chain(tokens[split..].chunks(997))
+            .collect();
         streams.push(&[]);
         let expected = (
             serialized(&first, &streams).0,
             serialized(&second, &streams).0,
         );
-        for threads in [1, 4] {
+        for threads in [1, 4, 12] {
             assert_eq!(
                 exact_ans_bundle_bits_pair(
                     &streams,
@@ -2818,10 +3188,30 @@ mod context_map_tests {
                 };
                 values.push(value);
             }
+            let fast = select_hybrid_config_ans(&values, &mut scratch);
             assert_eq!(
-                select_hybrid_config_ans(&values, &mut scratch),
+                fast,
                 exhaustive_selector(&values),
                 "hybrid shortlist diverged on generated case {case}"
+            );
+            let slow = select_hybrid_config_ans_sampled(&values, 1, 1, 1.0, &mut scratch);
+            // Removing the margin can admit a small win from the existing
+            // shortlist, which need not be the exhaustive global optimum.
+            // Independently price the selected configurations: Slow must
+            // never raise the exact cost on the same samples.
+            let exact_cost = |config| {
+                let mut counts = [0u32; ALPHABET_SIZE];
+                let mut extra_bits = 0u64;
+                for &value in &values {
+                    let (symbol, nbits, _) = uint_encode_with_config(value, config);
+                    counts[symbol as usize] += 1;
+                    extra_bits += nbits as u64;
+                }
+                hybrid_ans_candidate_cost(&counts, extra_bits, 1, config)
+            };
+            assert!(
+                exact_cost(slow) <= exact_cost(fast),
+                "Slow raised the exact HybridUint cost on generated case {case}"
             );
         }
     }
@@ -2830,6 +3220,202 @@ mod context_map_tests {
 #[cfg(test)]
 mod sampled_hybrid_tests {
     use super::*;
+
+    #[test]
+    fn packed_context_populations_match_serial_counts_and_context_order() {
+        const CONTEXTS: usize = 511;
+        for len in [131_071, 131_072, 131_073, 524_309] {
+            let tokens: Vec<_> = (0..len)
+                .map(|i| {
+                    Token::new(
+                        ((i * 31 % (CONTEXTS / 3)) * 3) as u32,
+                        (i as u32).wrapping_mul(731) % 65_537,
+                    )
+                })
+                .collect();
+            let streams = [&tokens[..17], &[], &tokens[17..65_537], &tokens[65_537..]];
+            for config in [
+                HybridUintConfig::DEFAULT,
+                HYBRID_CANDIDATES[0],
+                HYBRID_CANDIDATES[11],
+            ] {
+                let mut expected = vec![Histogram::new(); CONTEXTS];
+                for token in &tokens {
+                    expected[token.context as usize]
+                        .add(uint_encode_with_config(token.value, config).0);
+                }
+                let expected_contexts: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, h)| (h.total_count != 0).then_some(i))
+                    .collect();
+                for threads in [1, 4, 12] {
+                    let pool = ThreadPool::new_lossless(threads);
+                    let result = parallel_context_populations(
+                        &streams,
+                        CONTEXTS,
+                        Some(&pool),
+                        &mut CoderScratch::lossless(),
+                        |token| uint_encode_with_config(token.value, config).0,
+                    );
+                    if threads == 1 || len < 131_072 {
+                        assert!(result.is_none());
+                        continue;
+                    }
+                    let mut contexts = Vec::new();
+                    result.unwrap().for_each(|context, histogram| {
+                        contexts.push(context);
+                        assert_eq!(histogram.counts, expected[context].counts);
+                        assert_eq!(histogram.total_count, expected[context].total_count);
+                    });
+                    assert_eq!(contexts, expected_contexts);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_context_populations_handle_full_alphabets_with_limited_scratch() {
+        // Two MiB of bins per partition: eight initial work items must be
+        // grouped into four count buffers to respect the eight MiB budget.
+        let contexts = 4096;
+        let tokens: Vec<_> = (0..contexts * ALPHABET_SIZE)
+            .map(|i| {
+                Token::new(
+                    (contexts - 1 - i / ALPHABET_SIZE) as u32,
+                    (i % ALPHABET_SIZE) as u32,
+                )
+            })
+            .collect();
+        let pool = ThreadPool::new_lossless(12);
+        let populations = parallel_context_populations(
+            &[&tokens],
+            contexts,
+            Some(&pool),
+            &mut CoderScratch::lossless(),
+            |token| token.value,
+        )
+        .unwrap();
+        assert_eq!(populations.counts.len(), contexts * ALPHABET_SIZE);
+        let mut visited = 0;
+        populations.for_each(|context, histogram| {
+            assert_eq!(context, visited);
+            assert_eq!(histogram.counts, [1; ALPHABET_SIZE]);
+            assert_eq!(histogram.total_count, ALPHABET_SIZE as u32);
+            visited += 1;
+        });
+        assert_eq!(visited, contexts);
+    }
+
+    #[test]
+    fn parallel_token_passes_preserve_histograms_samples_and_maxima() {
+        let context_map = [2, 0, 1, 2, 1, 0, 3];
+        let configs = [
+            HybridUintConfig::DEFAULT,
+            HYBRID_CANDIDATES[0],
+            HYBRID_CANDIDATES[8],
+            HYBRID_CANDIDATES[11],
+            HybridUintConfig::DEFAULT,
+        ];
+        for len in [
+            0, 1, 65_535, 65_536, 65_537, 131_071, 131_072, 131_073, 524_309,
+        ] {
+            let mut tokens: Vec<_> = (0..len)
+                .map(|i| {
+                    Token::new(
+                        ((i * 17 + i / 101) % context_map.len()) as u32,
+                        (i as u32).wrapping_mul(731) % 4097,
+                    )
+                })
+                .collect();
+            if let Some(last) = tokens.last_mut() {
+                // The maximum must survive even when its ordinal is unsampled.
+                last.value = u32::MAX;
+            }
+            let a = len.min(19);
+            let b = len.min(65_537);
+            let layouts = [
+                vec![tokens.as_slice()],
+                vec![&tokens[..a], &[], &tokens[a..b], &tokens[b..], &[]],
+            ];
+            let mut counts = vec![0usize; configs.len()];
+            let mut expected_histograms = vec![Histogram::new(); configs.len()];
+            let mut expected_maxima = vec![0u32; configs.len()];
+            for token in &tokens {
+                let cluster = context_map[token.context as usize] as usize;
+                counts[cluster] += 1;
+                expected_maxima[cluster] = expected_maxima[cluster].max(token.value);
+                expected_histograms[cluster]
+                    .add(uint_encode_with_config(token.value, configs[cluster]).0);
+            }
+            let mut expected_samples = HybridUintSamples::new(&counts);
+            for token in &tokens {
+                expected_samples.push(context_map[token.context as usize] as usize, token.value);
+            }
+            for streams in layouts {
+                for threads in [1, 4, 12] {
+                    let pool = ThreadPool::new_lossless(threads);
+                    let mut scratch = CoderScratch::lossless();
+                    let (samples, maxima) = gather_hybrid_samples::<true>(
+                        &streams,
+                        &context_map,
+                        &counts,
+                        Some(&pool),
+                        &mut scratch,
+                    );
+                    assert_eq!(
+                        samples.values, expected_samples.values,
+                        "len={len}, threads={threads}"
+                    );
+                    assert_eq!(samples.strides, expected_samples.strides);
+                    assert_eq!(maxima, expected_maxima);
+                    let (samples, _) = gather_hybrid_samples::<false>(
+                        &streams,
+                        &context_map,
+                        &counts,
+                        Some(&pool),
+                        &mut scratch,
+                    );
+                    assert_eq!(samples.values, expected_samples.values);
+                    let actual = clustered_histograms(
+                        &streams,
+                        &context_map,
+                        &configs,
+                        Some(&pool),
+                        &mut scratch,
+                    );
+                    for (actual, expected) in actual.iter().zip(&expected_histograms) {
+                        assert_eq!(actual.counts, expected.counts);
+                        assert_eq!(actual.total_count, expected.total_count);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_selection_preserves_configs_and_acceptance() {
+        let values: Vec<Vec<u32>> = (0..19)
+            .map(|i| {
+                (0..i * i * 37)
+                    .map(|v| ((v * 731) % (17 + i * 193)) as u32)
+                    .collect()
+            })
+            .collect();
+        let strides = (0..values.len()).map(|i| i % 5 + 1).collect();
+        let samples = HybridUintSamples::from_parts(values, strides);
+        for acceptance in [0.995, 1.0] {
+            let expected = samples.select_with_acceptance(acceptance);
+            for threads in [1, 4, 12] {
+                let actual = samples.select_with_pool(
+                    &ThreadPool::new_lossless(threads),
+                    &mut CoderScratch::lossless(),
+                    acceptance,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[test]
     fn bounded_samples_keep_original_cluster_ordinals_and_configs() {

@@ -46,9 +46,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
-mod dark_aq;
 mod dc_group_data;
-mod dc_smooth;
 mod dc_tree;
 mod dct;
 mod encode_image;
@@ -75,11 +73,12 @@ mod neon;
 mod orientation;
 mod patches;
 mod quant_weights;
+#[cfg(feature = "splines")]
+mod splines;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
 mod static_entropy_codes;
-mod structure_aq;
 mod thread_pool;
 mod util;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
@@ -91,7 +90,6 @@ mod yellow_opsin;
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
-pub use dark_aq::{DarkAq, DarkAqConfig};
 pub use encode_image::{
     DecodingSpeed, EncodeConfig, LossyModular, Speed, distance_from_quality, encode_image,
     encode_image_10bit, encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32,

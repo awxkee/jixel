@@ -558,6 +558,7 @@ pub(super) fn encode_squeeze_multigroup(
     // ----- DC groups: GroupHeader + any min-shift>=3 large-channel crops -----
     write_lz_groups(
         &dc_group_lz,
+        &[],
         &code,
         distance_ctx,
         min_symbol,
@@ -575,6 +576,7 @@ pub(super) fn encode_squeeze_multigroup(
     // ----- AC groups: GroupHeader + the cropped large-channel tokens -----
     write_lz_groups(
         &ac_group_lz,
+        &[],
         &code,
         distance_ctx,
         min_symbol,
@@ -1423,6 +1425,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     // ----- DC groups -----
     write_lz_groups(
         &dc_group_lz,
+        &[],
         &code,
         distance_ctx,
         min_symbol,
@@ -1440,6 +1443,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     // ----- AC groups -----
     write_lz_groups(
         &ac_group_lz,
+        &[],
         &code,
         distance_ctx,
         min_symbol,

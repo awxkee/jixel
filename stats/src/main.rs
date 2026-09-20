@@ -30,10 +30,11 @@ use anyhow::{Context, Result, bail};
 use jixel::Speed;
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::available_parallelism;
 
 const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
@@ -42,6 +43,21 @@ const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
 const BUTTERAUGLI_BIN: &str = "butteraugli_main";
 /// p of the butteraugli p-norm reported alongside the max distance.
 const BUTTERAUGLI_PNORM: u32 = 3;
+
+// --- ColorVideoVDP: the `cvvdp` CLI from gfxdisp/ColorVideoVDP (pip package
+// `pycvvdp`, installed from GitHub). Opt-in via `--cvvdp`. One `cvvdp -i`
+// process stays alive for the whole run (torch starts once). Inputs are 8-bit
+// PPMs written from the very buffers SSIMULACRA2 scores: pycvvdp reads PNGs
+// through imageio's FreeImage plugin, whose bundled dylib is x86_64-only,
+// while any other extension goes through Pillow. ---
+const CVVDP_BIN: &str = "cvvdp";
+/// Fallback when `cvvdp` is not on PATH: the parameters_fit venv of this repo.
+const CVVDP_VENV_BIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../parameters_fit/.venv/bin/cvvdp"
+);
+/// Display model passed as `--display` (photometry + geometry the metric assumes).
+const CVVDP_DISPLAY: &str = "standard_4k";
 
 // --- AV1 reference: SYSTEM libavif (aom) for both encode and decode (on PATH). ---
 const SYS_AVIFENC: &str = "avifenc";
@@ -74,6 +90,9 @@ struct Scores {
     ba: Option<f64>,
     /// butteraugli max distance (worst region), lower = better.
     ba_max: Option<f64>,
+    /// ColorVideoVDP quality in JOD (10 = identical, lower = worse). `None`
+    /// when cvvdp scoring is off (`--cvvdp` not given).
+    cvvdp: Option<f64>,
 }
 
 /// One measured (rate, quality) point.
@@ -87,7 +106,7 @@ struct Point {
 }
 
 impl Point {
-    /// Console tail: "SS2 96.123  BA3 0.842 (max 3.11)".
+    /// Console tail: "SS2 96.123  BA3 0.842 (max 3.11)  CVVDP 9.8123".
     fn score_str(&self) -> String {
         let mut s = format!("SS2 {:.3}", self.scores.ss2);
         if let Some(ba) = self.scores.ba {
@@ -96,13 +115,122 @@ impl Point {
                 s.push_str(&format!(" (max {m:.3})"));
             }
         }
+        if let Some(jod) = self.scores.cvvdp {
+            s.push_str(&format!("  CVVDP {jod:.4}"));
+        }
         s
     }
 }
 
-/// Scores decoded images against one reference image. Holds the reference both
-/// as pixels (for the in-process SSIMULACRA2) and as a PNG on disk (for the
-/// out-of-process `butteraugli_main`), so both metrics see identical input.
+/// ColorVideoVDP scorer: a lazily spawned, persistent `cvvdp --interactive`
+/// child that takes one argument line per request on stdin and answers with
+/// one bare JOD per test file (`--quiet`). A child that dies mid-run is
+/// dropped and respawned on the next request.
+struct Cvvdp {
+    bin: String,
+    display: String,
+    device: Option<String>,
+    child: Option<CvvdpChild>,
+}
+
+struct CvvdpChild {
+    proc: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Cvvdp {
+    fn spawn_child(&self) -> Result<CvvdpChild> {
+        let mut proc = Command::new(&self.bin)
+            .arg("--interactive")
+            // Python block-buffers stdout on a pipe; we need each answer now.
+            .env("PYTHONUNBUFFERED", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawning cvvdp ({})", self.bin))?;
+        let stdin = proc.stdin.take().context("cvvdp stdin")?;
+        let stdout = BufReader::new(proc.stdout.take().context("cvvdp stdout")?);
+        Ok(CvvdpChild {
+            proc,
+            stdin,
+            stdout,
+        })
+    }
+
+    /// JOD of the `test` image against `reference`.
+    fn score(&mut self, reference: &Path, test: &Path) -> Result<f64> {
+        if self.child.is_none() {
+            self.child = Some(self.spawn_child()?);
+        }
+        let res = self.request(reference, test);
+        if res.is_err() {
+            // Whatever happened, the stream is out of sync: start over next time.
+            if let Some(mut c) = self.child.take() {
+                let _ = c.proc.kill();
+                let _ = c.proc.wait();
+            }
+        }
+        res
+    }
+
+    fn request(&mut self, reference: &Path, test: &Path) -> Result<f64> {
+        let child = self.child.as_mut().context("cvvdp child missing")?;
+        // The child splits the line with shlex: single-quote every path.
+        let mut line = format!(
+            "--test {} --ref {} --display {}",
+            shell_quote(test),
+            shell_quote(reference),
+            shell_quote(Path::new(&self.display))
+        );
+        if let Some(dev) = &self.device {
+            line.push_str(" --device ");
+            line.push_str(&shell_quote(Path::new(dev)));
+        }
+        line.push_str(" --quiet\n");
+        child
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| child.stdin.flush())
+            .context("writing to cvvdp stdin (process gone?)")?;
+
+        let mut buf = String::new();
+        let n = child
+            .stdout
+            .read_line(&mut buf)
+            .context("reading cvvdp stdout")?;
+        if n == 0 {
+            let status = child.proc.wait().ok();
+            bail!("cvvdp exited without a score (status {status:?})");
+        }
+        parse_cvvdp_line(buf.trim())
+            .with_context(|| format!("unexpected cvvdp output line: {:?}", buf.trim()))
+    }
+}
+
+impl Drop for Cvvdp {
+    fn drop(&mut self) {
+        if let Some(c) = self.child.take() {
+            // Closing stdin ends the interactive loop; then reap.
+            let CvvdpChild {
+                mut proc, stdin, ..
+            } = c;
+            drop(stdin);
+            let _ = proc.wait();
+        }
+    }
+}
+
+/// POSIX single-quote `p` for shlex.
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Scores decoded images against one reference image. Holds the reference as
+/// pixels (for the in-process SSIMULACRA2), as a PNG on disk (for the
+/// out-of-process `butteraugli_main`) and as a PPM (for `cvvdp`), so every
+/// metric sees identical input.
 struct Scorer<'a> {
     orig: &'a [u8],
     w: usize,
@@ -110,6 +238,10 @@ struct Scorer<'a> {
     /// `None` disables butteraugli scoring.
     butteraugli: Option<String>,
     ref_png: PathBuf,
+    /// `None` disables ColorVideoVDP scoring. Shared across images so the
+    /// torch process starts once per run.
+    cvvdp: Option<&'a RefCell<Cvvdp>>,
+    ref_ppm: PathBuf,
     tmp: PathBuf,
     /// Serial number for the per-point distorted PNG (unique temp names).
     seq: Cell<u64>,
@@ -123,10 +255,15 @@ impl<'a> Scorer<'a> {
         tmp: &Path,
         stem: &str,
         butteraugli: Option<String>,
+        cvvdp: Option<&'a RefCell<Cvvdp>>,
     ) -> Result<Self> {
         let ref_png = tmp.join(format!("{stem}_ref.png"));
         if butteraugli.is_some() {
             write_png(&ref_png, orig, w, h)?;
+        }
+        let ref_ppm = tmp.join(format!("{stem}_ref.ppm"));
+        if cvvdp.is_some() {
+            write_ppm(&ref_ppm, orig, w, h)?;
         }
         Ok(Self {
             orig,
@@ -134,12 +271,14 @@ impl<'a> Scorer<'a> {
             h,
             butteraugli,
             ref_png,
+            cvvdp,
+            ref_ppm,
             tmp: tmp.to_path_buf(),
             seq: Cell::new(0),
         })
     }
 
-    /// SSIMULACRA2 always; butteraugli too when the tool is configured.
+    /// SSIMULACRA2 always; butteraugli and cvvdp too when configured.
     fn score(&self, dist: &[u8]) -> Result<Scores> {
         let ss2 = score_ss2(self.orig, dist, self.w, self.h)?;
         let (ba, ba_max) = match &self.butteraugli {
@@ -154,7 +293,24 @@ impl<'a> Scorer<'a> {
                 (Some(norm), Some(max))
             }
         };
-        Ok(Scores { ss2, ba, ba_max })
+        let cvvdp = match self.cvvdp {
+            None => None,
+            Some(tool) => {
+                let n = self.seq.get();
+                self.seq.set(n + 1);
+                let ppm = self.tmp.join(format!("_cvvdp_dist_{n}.ppm"));
+                write_ppm(&ppm, dist, self.w, self.h)?;
+                let jod = tool.borrow_mut().score(&self.ref_ppm, &ppm);
+                let _ = std::fs::remove_file(&ppm);
+                Some(jod?)
+            }
+        };
+        Ok(Scores {
+            ss2,
+            ba,
+            ba_max,
+            cvvdp,
+        })
     }
 }
 
@@ -287,6 +443,10 @@ fn main() -> Result<()> {
     let mut with_image_avif = true;
     let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
     let mut with_butteraugli = true;
+    let mut with_cvvdp = false;
+    let mut cvvdp_bin: Option<String> = None;
+    let mut cvvdp_display = CVVDP_DISPLAY.to_string();
+    let mut cvvdp_device: Option<String> = None;
     let mut with_jpeg = false;
     let mut cjpegli = "cjpegli".to_string();
 
@@ -366,6 +526,27 @@ fn main() -> Result<()> {
                 with_butteraugli = false;
                 i += 1;
             }
+            "--cvvdp" => {
+                with_cvvdp = true;
+                i += 1;
+            }
+            "--no-cvvdp" => {
+                with_cvvdp = false;
+                i += 1;
+            }
+            "--cvvdp-bin" => {
+                cvvdp_bin = Some(value!().clone());
+                with_cvvdp = true;
+                i += 2;
+            }
+            "--cvvdp-display" => {
+                cvvdp_display = value!().clone();
+                i += 2;
+            }
+            "--cvvdp-device" => {
+                cvvdp_device = Some(value!().clone());
+                i += 2;
+            }
             "--no-aom" => {
                 with_aom = false;
                 i += 1;
@@ -421,7 +602,9 @@ fn main() -> Result<()> {
              shared: [--avif-yuv 444|420] [--no-avif]\n  \
              JPEG reference: [--jpeg] [--cjpegli PATH]\n  \
              metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
-             [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]"
+             [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]; \
+             ColorVideoVDP (opt-in): [--cvvdp] [--cvvdp-bin PATH] \
+             [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]"
         );
     }
     register_fonts();
@@ -478,6 +661,43 @@ fn main() -> Result<()> {
     }
     let butteraugli = with_butteraugli.then_some(butteraugli_bin);
 
+    // ColorVideoVDP: explicit --cvvdp-bin, else `cvvdp` on PATH, else the
+    // parameters_fit venv.
+    let cvvdp: Option<RefCell<Cvvdp>> = if with_cvvdp {
+        let candidates: Vec<String> = match &cvvdp_bin {
+            Some(b) => vec![b.clone()],
+            None => vec![CVVDP_BIN.to_string(), CVVDP_VENV_BIN.to_string()],
+        };
+        match candidates.iter().find(|b| available(b)) {
+            Some(bin) => {
+                println!(
+                    "cvvdp: {bin} (--display {cvvdp_display}{})",
+                    cvvdp_device
+                        .as_deref()
+                        .map(|d| format!(" --device {d}"))
+                        .unwrap_or_default()
+                );
+                Some(RefCell::new(Cvvdp {
+                    bin: bin.clone(),
+                    display: cvvdp_display.clone(),
+                    device: cvvdp_device.clone(),
+                    child: None,
+                }))
+            }
+            None => {
+                eprintln!(
+                    "warning: cvvdp not found (tried {}); skipping ColorVideoVDP. \
+                     Install pycvvdp (pip install git+https://github.com/gfxdisp/ColorVideoVDP.git) \
+                     or pass --cvvdp-bin PATH.",
+                    candidates.join(", ")
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // JPEG reference: prefer cjpegli (distance-native), then libjpeg-turbo
     // cjpeg, then the in-process image-crate encoder.
     let jpeg_tool = if available(&cjpegli) {
@@ -500,7 +720,15 @@ fn main() -> Result<()> {
         println!("\n=== {} ===", img.display());
         let (orig_rgb, w, h) = load_rgb(img)?;
         let npx = (w * h) as f64;
-        let sc = Scorer::new(&orig_rgb, w, h, &tmp, stem, butteraugli.clone())?;
+        let sc = Scorer::new(
+            &orig_rgb,
+            w,
+            h,
+            &tmp,
+            stem,
+            butteraugli.clone(),
+            cvvdp.as_ref(),
+        )?;
 
         // jixel series.
         let mut jixel = Series {
@@ -712,6 +940,17 @@ fn main() -> Result<()> {
             )?;
             println!("  chart -> {}", ba_max_path.display());
         }
+
+        if cvvdp.is_some() {
+            let cvvdp_path = out_dir.join(format!("{stem}_rd_cvvdp.png"));
+            draw_chart(
+                &cvvdp_path,
+                &format!("{stem} — CVVDP vs rate"),
+                &all,
+                &cvvdp_axis(),
+            )?;
+            println!("  chart -> {}", cvvdp_path.display());
+        }
     }
     let _ = std::fs::remove_dir_all(&tmp);
     println!("\nDone. Charts in {}", out_dir.display());
@@ -750,7 +989,8 @@ fn bench_jixel(
     let cfg = jixel::EncodeConfig::default()
         .with_distance(d)
         .with_num_threads(nthreads)
-        .with_speed(Speed::Slow);
+        .with_speed(Speed::Slow)
+        .with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));
@@ -1205,6 +1445,28 @@ fn write_png(path: &Path, rgb: &[u8], w: usize, h: usize) -> Result<()> {
     .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Write an interleaved RGB8 buffer as a binary PPM (input for `cvvdp`).
+fn write_ppm(path: &Path, rgb: &[u8], w: usize, h: usize) -> Result<()> {
+    let mut f = BufWriter::new(
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?,
+    );
+    write!(f, "P6\n{w} {h}\n255\n")?;
+    f.write_all(rgb)?;
+    f.flush()?;
+    Ok(())
+}
+
+/// One cvvdp stdout line -> JOD. Accepts the quiet form (`8.1234`) and the
+/// verbose one (`cvvdp=8.1234 [JOD]`).
+fn parse_cvvdp_line(line: &str) -> Option<f64> {
+    let body = match line.split_once('=') {
+        Some((k, v)) if k.trim().eq_ignore_ascii_case("cvvdp") => v,
+        Some(_) => return None,
+        None => line,
+    };
+    body.split_whitespace().next()?.parse::<f64>().ok()
+}
+
 /// butteraugli distance between two PNGs via libjxl's `butteraugli_main`.
 /// Returns `(p-norm, max)`; both lower = better. Output shape is the max
 /// distance on the first line, then "`<p>`-norm: `<value>`".
@@ -1312,6 +1574,15 @@ fn ba_max_axis() -> MetricAxis {
         get: |p| p.scores.ba_max,
         clamp: (0.0, f64::INFINITY),
         legend: SeriesLabelPosition::UpperRight,
+    }
+}
+
+fn cvvdp_axis() -> MetricAxis {
+    MetricAxis {
+        desc: "CVVDP (JOD, 10 = identical, higher = better)".into(),
+        get: |p| p.scores.cvvdp,
+        clamp: (0.0, 10.0),
+        legend: SeriesLabelPosition::LowerRight,
     }
 }
 

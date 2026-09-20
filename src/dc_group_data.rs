@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::image::{Image3F, Image3S, ImageB, ImageSB};
+use crate::image::{Image3S, ImageB, ImageSB};
 use crate::util::{EncodeError, try_vec};
 
 pub(crate) const STRATEGY_DCT: u8 = 0;
@@ -51,6 +51,11 @@ pub(crate) const STRATEGY_DCT2X2: u8 = 18;
 pub(crate) const NUM_STRATEGIES: usize = 19;
 
 #[inline]
+pub(crate) fn is_gated_sub8_strategy(strategy: u8) -> bool {
+    matches!(strategy, STRATEGY_IDENTITY | STRATEGY_DCT2X2)
+}
+
+#[cfg(test)]
 pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
     matches!(
         strategy,
@@ -150,6 +155,7 @@ impl AcStrategyImage {
             [1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1];
         LUT[strategy as usize] as usize
     }
+
     #[inline]
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
@@ -240,11 +246,6 @@ impl AcStrategyImage {
 
 pub(crate) struct DcGroupData {
     pub(crate) quant_dc: Image3S,
-    /// Unquantized DC targets in XYB (X and B are true DC, pre-CfL-slope):
-    /// what the decoder's smoothed DC recon is compared against. Empty (0×0)
-    /// unless the DC-smoothing rounding pass is going to run — the VarDCT
-    /// path sizes it after construction; capture sites check for emptiness.
-    pub(crate) dc_float: Image3F,
     pub(crate) raw_quant_field: ImageB,
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
@@ -263,7 +264,6 @@ impl DcGroupData {
         let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         Ok(Self {
             quant_dc: Image3S::try_new(xsize_blocks, ysize_blocks)?,
-            dc_float: Image3F::new(0, 0),
             raw_quant_field: ImageB::try_new_fill(xsize_blocks, ysize_blocks, 1)?,
             ac_strategy: AcStrategyImage::try_new(xsize_blocks, ysize_blocks)?,
             ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,

@@ -29,7 +29,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -186,8 +186,6 @@ impl ThreadPool {
         self.steal_map_with_threads_shared(caller_scratch, len, max_threads, &f)
     }
 
-    // Share collection and cleanup across callback types. Dispatch once per
-    // work item; each callback retains its concrete pixel/stream loops.
     fn steal_map_with_threads_shared<T>(
         &self,
         caller_scratch: &mut CoderScratch,
@@ -198,32 +196,17 @@ impl ThreadPool {
     where
         T: Send,
     {
-        let lanes = self.num_threads.min(max_threads.max(1)).min(len);
-        if lanes <= 1 {
-            return (0..len).map(|i| f(i, caller_scratch)).collect();
-        }
-
-        let cursor = AtomicUsize::new(0);
-        let chunks = Mutex::new(Vec::<Vec<(usize, T)>>::with_capacity(lanes));
-
-        let lane = |scratch: &mut CoderScratch| {
-            let mut out = Vec::new();
-            loop {
-                let i = cursor.fetch_add(1, Ordering::Relaxed);
-                if i >= len {
-                    break;
-                }
-                out.push((i, f(i, scratch)));
-            }
-            chunks.lock().unwrap().push(out);
+        let mut slots: Vec<Option<T>> = Vec::with_capacity(len);
+        slots.resize_with(len, || None);
+        let base = SyncPtr(slots.as_mut_ptr());
+        let write = move |i: usize, scratch: &mut CoderScratch| {
+            let value = f(i, scratch);
+            // SAFETY: `steal_indices` hands out every index in `0..len`
+            // exactly once and finishes all lanes before returning, so no
+            // two writers alias and `slots` outlives every write.
+            unsafe { *base.add(i) = Some(value) };
         };
-
-        self.run_lanes(caller_scratch, lanes, &lane);
-
-        let mut slots: Vec<Option<T>> = (0..len).map(|_| None).collect();
-        for (i, value) in chunks.into_inner().unwrap().into_iter().flatten() {
-            slots[i] = Some(value);
-        }
+        self.steal_indices(caller_scratch, len, max_threads, &write);
         slots.into_iter().map(Option::unwrap).collect()
     }
 
@@ -264,34 +247,43 @@ impl ThreadPool {
     ) where
         T: Send,
     {
-        let lanes = self.num_threads.min(max_threads.max(1)).min(items.len());
+        let len = items.len();
+        let base = SyncPtr(items.as_mut_ptr());
+        let visit = move |i: usize, scratch: &mut CoderScratch| {
+            // SAFETY: every index is handed out exactly once by
+            // `steal_indices`, so concurrent lanes never create overlapping
+            // mutable references, and all lanes complete before this function
+            // returns, keeping `items` alive.
+            let item = unsafe { &mut *base.add(i) };
+            f(i, item, scratch);
+        };
+        self.steal_indices(caller_scratch, len, max_threads, &visit);
+    }
+
+    /// Type-erased work-stealing loop shared by every map/for-each caller:
+    /// hands out `0..len` once each across up to `max_threads` lanes.
+    fn steal_indices(
+        &self,
+        caller_scratch: &mut CoderScratch,
+        len: usize,
+        max_threads: usize,
+        f: &(dyn Fn(usize, &mut CoderScratch) + Sync),
+    ) {
+        let lanes = self.num_threads.min(max_threads.max(1)).min(len);
         if lanes <= 1 {
-            for (i, item) in items.iter_mut().enumerate() {
-                f(i, item, caller_scratch);
+            for i in 0..len {
+                f(i, caller_scratch);
             }
             return;
         }
-
         let cursor = AtomicUsize::new(0);
-        let items_ptr = AtomicPtr::new(items.as_mut_ptr());
-        let len = items.len();
-
-        let lane = |scratch: &mut CoderScratch| {
-            let items_ptr = items_ptr.load(Ordering::Relaxed);
-            loop {
-                let i = cursor.fetch_add(1, Ordering::Relaxed);
-                if i >= len {
-                    break;
-                }
-                // Every index is returned exactly once by `cursor`, so
-                // concurrent lanes cannot create overlapping mutable
-                // references. All lanes complete before this function returns,
-                // keeping `items` alive.
-                let item = unsafe { &mut *items_ptr.add(i) };
-                f(i, item, scratch);
+        let lane = |scratch: &mut CoderScratch| loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            if i >= len {
+                break;
             }
+            f(i, scratch);
         };
-
         self.run_lanes(caller_scratch, lanes, &lane);
     }
 
@@ -335,6 +327,28 @@ impl ThreadPool {
         if let Some(payload) = completion.panic.lock().unwrap().take() {
             resume_unwind(payload);
         }
+    }
+}
+
+struct SyncPtr<T>(*mut T);
+impl<T> Clone for SyncPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SyncPtr<T> {}
+// SAFETY: the pointer is only dereferenced at indices handed out exactly once
+// by `steal_indices`, whose lanes all finish before the owner is released.
+unsafe impl<T> Sync for SyncPtr<T> {}
+unsafe impl<T> Send for SyncPtr<T> {}
+
+impl<T> SyncPtr<T> {
+    /// Method form so closures capture the whole wrapper (edition 2024
+    /// captures disjoint fields, which would expose the bare pointer).
+    #[inline(always)]
+    fn add(self, i: usize) -> *mut T {
+        // SAFETY: callers only offset within the slice/vector the pointer was taken from.
+        unsafe { self.0.add(i) }
     }
 }
 

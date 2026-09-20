@@ -31,7 +31,6 @@ mod adaptive_quant;
 mod afv;
 mod cfl;
 mod color;
-mod dark_aq;
 mod dct;
 mod entropy;
 mod frame;
@@ -41,7 +40,6 @@ mod lz_match;
 mod modular;
 mod quant;
 mod quantize_xyb;
-mod structure_aq;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -56,7 +54,6 @@ pub(crate) use cfl::{
     cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
-pub(crate) use dark_aq::{dark_structure_stats_neon, fill_blue_tile_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
     dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct2x2_8x8_neon, dct4x4_neon, dct4x8_neon,
@@ -78,12 +75,8 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
     tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,
 };
-pub(crate) use quant::{
-    apply_quant_field_gain_neon, apply_structure_aq_neon, quantize_block_ac_neon,
-    quantize_dc_cfl_neon, quantize_dc_neon,
-};
+pub(crate) use quant::{quantize_block_ac_neon, quantize_dc_cfl_neon, quantize_dc_neon};
 pub(crate) use quantize_xyb::{quantize_xyb_channels_neon, quantize_xyb_tile_colors_neon};
-pub(crate) use structure_aq::block_features_neon;
 pub(crate) use xyb::to_xyb_neon_band;
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_neon;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};

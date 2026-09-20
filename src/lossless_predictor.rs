@@ -573,6 +573,7 @@ fn tokenize_all_with_wp(
         pool,
         scratch,
         wp_params,
+        None,
     );
     let total_len = channel_tokens.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(total_len);
@@ -582,6 +583,8 @@ fn tokenize_all_with_wp(
     out
 }
 
+/// `alpha_constant`: a solid alpha plane is coded as a constant tail
+/// (`ConstantTail`), so its channel yields no tokens here.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tokenize_channels_with_wp(
     linear: &Image3Si,
@@ -598,9 +601,13 @@ pub(super) fn tokenize_channels_with_wp(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
+    alpha_constant: Option<i32>,
 ) -> Vec<Vec<Token>> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
     pool.steal_map(scratch, nb_chans, |chan, scratch| {
+        if chan >= num_color && alpha_constant.is_some() {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(gw * gh);
         tokenize_channel_with_wp(
             linear,
@@ -640,10 +647,14 @@ pub(super) fn tokenize_runs_with_wp(
     grad_pack_fn: GradPackInteriorFn,
     scratch: &mut CoderScratch,
     wp_params: WpParams,
+    alpha_constant: Option<i32>,
 ) -> Vec<LzToken> {
     let nb_chans = num_color + usize::from(alpha.is_some());
     let mut out = RunLzWriter::with_capacity(gw * gh * nb_chans);
     for chan in 0..nb_chans {
+        if chan >= num_color && alpha_constant.is_some() {
+            continue;
+        }
         tokenize_channel_with_wp(
             linear,
             alpha,

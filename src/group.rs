@@ -204,6 +204,54 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
     1.0 + strength * (1.0 - scan_position).powi(2)
 }
 
+#[inline]
+fn rdoq_lambda(qf_ratio: f32) -> f32 {
+    const BASE: f32 = 1.25;
+    crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
+}
+
+#[inline(always)]
+fn update_rdoq_state_pair(
+    distortion: f32,
+    token_cost: [f32; 2],
+    tail: f32,
+    candidate: u8,
+    current: &mut [f32; 2],
+    choices: &mut [u8; 2],
+) {
+    #[cfg(all(target_arch = "aarch64", feature = "neon", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        // SAFETY: NEON is enabled for this target. Each load/store accesses
+        // exactly the two f32 elements of its array; no alignment is required.
+        unsafe {
+            let cost = vadd_f32(
+                vadd_f32(vdup_n_f32(distortion), vld1_f32(token_cost.as_ptr())),
+                vdup_n_f32(tail),
+            );
+            let old = vld1_f32(current.as_ptr());
+            let better = vclt_f32(cost, old);
+            vst1_f32(current.as_mut_ptr(), vbsl_f32(better, cost, old));
+            // Narrow the two all-zero/all-one comparison lanes to the two
+            // choice bytes, keeping exactly the same mask as the cost update.
+            let mask16 = vmovn_u32(vcombine_u32(better, better));
+            let mask8 = vmovn_u16(vcombine_u16(mask16, mask16));
+            let mask = vget_lane_u16::<0>(vreinterpret_u16_u8(mask8));
+            let old_choice = u16::from_ne_bytes(*choices);
+            let new_choice = u16::from_ne_bytes([candidate; 2]);
+            *choices = ((new_choice & mask) | (old_choice & !mask)).to_ne_bytes();
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon", target_feature = "neon")))]
+    for prev in 0..2 {
+        let cost = distortion + token_cost[prev] + tail;
+        if cost < current[prev] {
+            current[prev] = cost;
+            choices[prev] = candidate;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
     prices: &FrozenTokenPrices,
@@ -220,10 +268,11 @@ fn rdoq_block(
     cy: usize,
     distance: f32,
     qf_hi: bool,
+    qf_ratio: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    const RDOQ_LAMBDA: f32 = crate::ac_strategy::RD_LAMBDA * 0.25;
+    let lambda = rdoq_lambda(qf_ratio);
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -267,7 +316,7 @@ fn rdoq_block(
         let mut k = search_end;
         while k < block.len() && remaining != 0 {
             let coef = block[scan[k] as usize];
-            *target += RDOQ_LAMBDA
+            *target += lambda
                 * prices.token_bits(Token::new(context(remaining, k, prev), pack_signed(coef)));
             prev = usize::from(coef != 0);
             remaining -= usize::from(coef != 0);
@@ -287,23 +336,30 @@ fn rdoq_block(
     let [next_buf, current_buf] = costs;
     let mut next = &mut next_buf[..stride];
     let mut current_cost = &mut current_buf[..stride];
-    next.fill(f32::INFINITY);
-    current_cost.fill(f32::INFINITY);
     next[suffix_nzeros * 2] = suffix_cost[0];
     next[suffix_nzeros * 2 + 1] = suffix_cost[1];
-    choices[..window_len * stride].fill(u8::MAX);
+    let mut next_min = suffix_nzeros;
+    let mut next_max = suffix_nzeros;
+    // Only the active interval of each row can be read. A finite state always
+    // writes its choice, and backtracking only follows finite states, so the
+    // inactive costs and the choice table do not need a per-block clear.
 
     let mut original_after_nzeros = 0usize;
     for window_index in (0..window_len).rev() {
-        current_cost.fill(f32::INFINITY);
         let k = covered_blocks + window_index;
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
         let distortion_weight = crate::inflated_cost::CHANNEL_WEIGHT[c]
+            * if c == 1 {
+                1.0
+            } else {
+                chroma_rdoq_weight(distance)
+            }
             * rdoq_distortion_weight(window_index, window_len, distance);
         let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
-        // Distortion against what the decoder actually reconstructs (the biased
-        // dequant: +-1 -> +-0.9299, q -> q - 0.145/q), not the raw integer level.
+        // Distortion uses the encoder's shared Y-bias approximation to decoder
+        // dequantization: +-1 -> +-0.9299, q -> q - 0.145/q. X/B may signal
+        // different biases; changing that approximation also needs RD retuning.
         let mut candidate_distortion = [0.0f32; 5];
         for (d, &level) in candidate_distortion[..candidate_count]
             .iter_mut()
@@ -315,7 +371,13 @@ fn rdoq_block(
         let min_remaining = suffix_nzeros + original_after_nzeros.saturating_sub(MAX_NZERO_DELTA);
         let max_remaining =
             suffix_nzeros + (original_after_nzeros + MAX_NZERO_DELTA).min(processed_after);
-        for next_remaining in min_remaining..=max_remaining {
+        // A candidate adds either zero or one nonzero. Clear precisely the
+        // destination interval, and intersect the source interval with the
+        // preceding row before reading it (scratch outside it can be stale).
+        let current_min = min_remaining;
+        let current_max = (max_remaining + 1).min(max_nzeros);
+        current_cost[current_min * 2..(current_max + 1) * 2].fill(f32::INFINITY);
+        for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
             for (candidate_index, &level) in candidates[..candidate_count].iter().enumerate() {
                 let nonzero = usize::from(level != 0);
                 let remaining = next_remaining + nonzero;
@@ -331,35 +393,38 @@ fn rdoq_block(
                     [0.0; 2]
                 } else {
                     let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
-                    [RDOQ_LAMBDA * bits[0], RDOQ_LAMBDA * bits[1]]
+                    [lambda * bits[0], lambda * bits[1]]
                 };
                 let state = remaining * 2;
-                let cost0 = distortion + token_cost[0] + tail;
-                if cost0 < current_cost[state] {
-                    current_cost[state] = cost0;
-                    choices[window_index * stride + state] = candidate_index as u8;
-                }
-                let cost1 = distortion + token_cost[1] + tail;
-                if cost1 < current_cost[state + 1] {
-                    current_cost[state + 1] = cost1;
-                    choices[window_index * stride + state + 1] = candidate_index as u8;
-                }
+                update_rdoq_state_pair(
+                    distortion,
+                    token_cost,
+                    tail,
+                    candidate_index as u8,
+                    (&mut current_cost[state..state + 2]).try_into().unwrap(),
+                    (&mut choices
+                        [window_index * stride + state..window_index * stride + state + 2])
+                        .try_into()
+                        .unwrap(),
+                );
             }
         }
         std::mem::swap(&mut current_cost, &mut next);
+        next_min = current_min;
+        next_max = current_max;
         original_after_nzeros += usize::from(block[idx] != 0);
     }
 
     let nzero_ctx = fine_non_zero_context(predicted as u32, block_ctx);
     let mut best_remaining = 0;
     let mut best_cost = f32::INFINITY;
-    for remaining in 0..=max_nzeros {
+    for remaining in next_min..=next_max {
         let initial_prev = usize::from(remaining <= block.len() / 16);
         let tail = next[remaining * 2 + initial_prev];
         if !tail.is_finite() {
             continue;
         }
-        let cost = tail + RDOQ_LAMBDA * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
+        let cost = tail + lambda * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
         if cost < best_cost {
             best_cost = cost;
             best_remaining = remaining;
@@ -716,10 +781,17 @@ pub(crate) fn quantize_block_ac_scalar(
     }
 }
 
-/// Chroma (X/B) RDOQ opens at the SS2 quant tier: below it the trellis
-/// regresses Kodak HQ BD at every lambda tried (+0.27% unweighted, +0.39%
-/// channel-weighted), above it the channel-weighted form wins −0.137%.
-pub(crate) const CHROMA_RDOQ_MIN_DISTANCE: f32 = 2.25;
+const CHROMA_RDOQ_WEIGHT_HQ: f32 = 2.0;
+const CHROMA_RDOQ_WEIGHT_D0: f32 = 2.25;
+const CHROMA_RDOQ_WEIGHT_D1: f32 = 4.0;
+
+/// Chroma trellis distortion-weight multiplier at `distance`.
+#[inline]
+fn chroma_rdoq_weight(distance: f32) -> f32 {
+    let t = ((distance - CHROMA_RDOQ_WEIGHT_D0) / (CHROMA_RDOQ_WEIGHT_D1 - CHROMA_RDOQ_WEIGHT_D0))
+        .clamp(0.0, 1.0);
+    CHROMA_RDOQ_WEIGHT_HQ + t * (1.0 - CHROMA_RDOQ_WEIGHT_HQ)
+}
 
 pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
 pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
@@ -822,7 +894,6 @@ pub(crate) fn write_ac_group(
     dc_data: &DcGroupData,
     ytob_dc: i32,
     quant_dc: &mut Image3S,
-    dc_float: &mut Image3F,
     qorigin_x: usize,
     qorigin_y: usize,
     num_nzeros: &mut [Image3B],
@@ -833,6 +904,7 @@ pub(crate) fn write_ac_group(
     measure_chroma_distortion: bool,
     qf_threshold: u32,
     out: &mut [Vec<Token>],
+    mut rate_records: Option<&mut Vec<BlockRateRecord>>,
 ) -> f32 {
     let matrices = ctx.matrices();
     let xsize_blocks = group_brect.xsize;
@@ -1077,43 +1149,38 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_target.copy_from_slice(&y_dc_q[row_start..row_start + cov_x]);
-                if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float.plane_row_mut(1, global_by - qorigin_y + iy)
-                        [lbx..lbx + cov_x];
-                    float_target.copy_from_slice(&dc_vals[1][row_start..row_start + cov_x]);
-                }
             }
             // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
             // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
             // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
             let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
-                    STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
-                    STRATEGY_IDENTITY => (
-                        &matrices.inv_matrix_identity(1)[..],
-                        &matrices.matrix_identity(1)[..],
-                    ),
-                    STRATEGY_DCT2X2 => (
-                        &matrices.inv_matrix_dct2x2(1)[..],
-                        &matrices.matrix_dct2x2(1)[..],
-                    ),
-                    STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
-                    STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
-                        (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
-                    }
-                    STRATEGY_AFV0..=STRATEGY_AFV3 => {
-                        (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
-                    }
-                    STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
-                    STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
-                    STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
-                    STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
-                        (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
-                    }
-                    STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
-                        (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
-                    }
-                    _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
-                };
+                STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
+                STRATEGY_IDENTITY => (
+                    &matrices.inv_matrix_identity(1)[..],
+                    &matrices.matrix_identity(1)[..],
+                ),
+                STRATEGY_DCT2X2 => (
+                    &matrices.inv_matrix_dct2x2(1)[..],
+                    &matrices.matrix_dct2x2(1)[..],
+                ),
+                STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                    (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
+                }
+                STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                    (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
+                }
+                STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
+                STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
+                STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
+                    (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
+                }
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
+                    (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
+                }
+                _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
+            };
             source_y[..size].copy_from_slice(&coeffs[1][..size]);
             quantize_roundtrip_y_block(
                 ctx,
@@ -1148,6 +1215,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1287,11 +1355,6 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
-                if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float.plane_row_mut(0, global_by - qorigin_y + iy)
-                        [lbx..lbx + cov_x];
-                    float_target.copy_from_slice(&x_dc_post[row_start..row_start + cov_x]);
-                }
             }
             let inv_qm_x: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(0)[..],
@@ -1333,13 +1396,10 @@ pub(crate) fn write_ac_group(
             // Chroma RDOQ (review §8): the trellis is channel-generic — the
             // CfL residuals are the source, contexts/prices/orders are
             // channel-specific, and unlike Y the input coefficients are not
-            // overwritten afterwards. Mid-band only: with CHANNEL_WEIGHT'd
-            // distortion it reads −0.137% Kodak BD at d≥2.5 but +0.39% at
-            // d=1-2.2 (HQ chroma coefficients are precious — same story as
-            // the deadzone/flat-B studies), so it opens at the SS2 tier.
-            if distance >= CHROMA_RDOQ_MIN_DISTANCE
-                && let Some(prices) = rdoq_prices
-            {
+            // overwritten afterwards. Runs at every distance with the
+            // distance-scheduled X/B distortion weight (`chroma_rdoq_weight`):
+            // the plain CHANNEL_WEIGHT'd trellis used to be gated to d ≥ 2.25.
+            if let Some(prices) = rdoq_prices {
                 let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                 let nzero_map = &num_nzeros[0];
                 let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
@@ -1360,6 +1420,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1380,11 +1441,6 @@ pub(crate) fn write_ac_group(
                     &mut quant_dc.plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
                 let row_start = iy * cov_x;
                 quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
-                if dc_float.xsize() != 0 {
-                    let float_target = &mut dc_float.plane_row_mut(2, global_by - qorigin_y + iy)
-                        [lbx..lbx + cov_x];
-                    float_target.copy_from_slice(&b_dc_post[row_start..row_start + cov_x]);
-                }
             }
             let inv_qm_b: &[f32] = match raw_strategy {
                 STRATEGY_DCT => &matrices.inv_matrix(2)[..],
@@ -1423,9 +1479,7 @@ pub(crate) fn write_ac_group(
                 dz_dc_chroma,
                 &mut quantized[2][..size],
             );
-            if distance >= CHROMA_RDOQ_MIN_DISTANCE
-                && let Some(prices) = rdoq_prices
-            {
+            if let Some(prices) = rdoq_prices {
                 let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                 let nzero_map = &num_nzeros[0];
                 let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
@@ -1446,6 +1500,7 @@ pub(crate) fn write_ac_group(
                     cy,
                     distance,
                     quant_ac as u32 > qf_threshold,
+                    quant_ac as f32 / qf_threshold.max(1) as f32,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1478,7 +1533,6 @@ pub(crate) fn write_ac_group(
                         fmla(ctx.channel_weight(2), error * error, chroma_distortion);
                 }
             }
-
             // ---- Tokenize in order Y, X, B ----
             let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
             let covered_blocks = cx * cy;
@@ -1496,6 +1550,9 @@ pub(crate) fn write_ac_group(
 
             for &c in &[1usize, 0, 2] {
                 let full_block = &quantized[c][..size];
+                let model_bits = rate_records
+                    .as_ref()
+                    .map(|_| model_rate_bits_from_ints(full_block, cx, cy));
 
                 for pass in 0..coeff_shifts.len() {
                     // Materialize the coefficients pass `pass` transmits. With
@@ -1515,6 +1572,7 @@ pub(crate) fn write_ac_group(
                     let block = &pblock[..size];
                     let num_nzeros = &mut num_nzeros[pass];
                     let out = &mut out[pass];
+                    let token_start = out.len();
 
                     let nzeros = if covered_blocks == 1 {
                         num_nonzero_except_dc(block.first_chunk::<64>().unwrap())
@@ -1604,11 +1662,62 @@ pub(crate) fn write_ac_group(
                         "remaining nzeros at end: strategy={} c={} pass={}",
                         strategy_code, c, pass
                     );
+                    if let Some(records) = rate_records.as_deref_mut() {
+                        records.push(BlockRateRecord {
+                            strategy: dc_data.ac_strategy.raw_strategy(global_bx, global_by),
+                            channel: c as u8,
+                            pass: pass as u8,
+                            quant: quant_ac as u16,
+                            nzeros: nzeros as u16,
+                            model_bits: model_bits.unwrap_or(0.0),
+                            start: token_start as u32,
+                            end: out.len() as u32,
+                        });
+                    }
                 }
             }
         }
     }
     chroma_distortion
+}
+
+/// One coded (block, channel, pass) for the rate-model reconciliation study:
+/// the selector's rate estimate recomputed from the final quantized
+/// coefficients next to the token range the coder actually emitted.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockRateRecord {
+    pub(crate) strategy: u8,
+    pub(crate) channel: u8,
+    pub(crate) pass: u8,
+    pub(crate) quant: u16,
+    pub(crate) nzeros: u16,
+    pub(crate) model_bits: f32,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+/// `channel_rd`'s bit estimate (nonzero base + magnitude log2 + header +
+/// visited zeros along the model's scan) evaluated on the quantized block.
+fn model_rate_bits_from_ints(block: &[i32], cx: usize, cy: usize) -> f32 {
+    let width = cx * 8;
+    let height = cy * 8;
+    let lut = crate::inflated_cost::rate_log2_lut();
+    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
+    let (mut nzeros, mut mag_bits, mut max_scan) = (0usize, 0.0f32, 0u32);
+    for v in 0..height {
+        for u in 0..width {
+            if v < cy && u < cx {
+                continue;
+            }
+            let q = block[v * width + u];
+            if q != 0 {
+                nzeros += 1;
+                mag_bits += crate::inflated_cost::rate_log2_with_lut(lut, q.unsigned_abs() as f32);
+                max_scan = max_scan.max(scan_pos[v * width + u]);
+            }
+        }
+    }
+    crate::inflated_cost::model_bits(nzeros, mag_bits, max_scan, cx, cy)
 }
 
 #[inline]
@@ -1623,6 +1732,167 @@ mod tests {
         quantize_ac_thresholds_scaled, quantize_dc_cfl_scalar, quantize_dc_scalar,
         selected_quantize_dc_methods,
     };
+
+    #[test]
+    fn rdoq_state_pair_preserves_scalar_cost_bits_and_choices() {
+        let special = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0xffc0_5678),
+        ];
+        let mut seed = 73u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if seed.is_multiple_of(4) {
+                special[seed as usize % special.len()]
+            } else {
+                f32::from_bits(seed)
+            }
+        };
+        let mut masks = [false; 4];
+        for case in 0..16_384 {
+            let distortion = random();
+            let token_cost = [random(), random()];
+            let tail = random();
+            let cost = token_cost.map(|price| distortion + price + tail);
+            let mut initial = [random(), random()];
+            // Deliberate equal-cost candidates must preserve both the prior
+            // choices and their exact cost bits, including signed zeros.
+            if case % 8 == 0 {
+                initial = cost;
+            }
+            let initial_choices = [case as u8, (case >> 3) as u8];
+            let candidate = (case % 5) as u8;
+            let mut expected = initial;
+            let mut expected_choices = initial_choices;
+            let mut mask = 0;
+            for prev in 0..2 {
+                if cost[prev] < expected[prev] {
+                    expected[prev] = cost[prev];
+                    expected_choices[prev] = candidate;
+                    mask |= 1 << prev;
+                }
+            }
+            masks[mask] = true;
+            let mut actual = initial;
+            let mut actual_choices = initial_choices;
+            super::update_rdoq_state_pair(
+                distortion,
+                token_cost,
+                tail,
+                candidate,
+                &mut actual,
+                &mut actual_choices,
+            );
+            assert_eq!(
+                actual.map(f32::to_bits),
+                expected.map(f32::to_bits),
+                "costs in case {case}"
+            );
+            assert_eq!(actual_choices, expected_choices, "choices in case {case}");
+        }
+        assert_eq!(masks, [true; 4]);
+    }
+
+    #[test]
+    fn rdoq_reused_scratch_matches_fresh_scratch() {
+        use crate::dc_group_data::STRATEGY_CODE_LUT;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+
+        let tokens: Vec<_> = (0..4096)
+            .map(|i| Token::new(i % 2, if i % 3 == 0 { 0 } else { i % 17 }))
+            .collect();
+        let mut code = build_entropy_code_no_cluster(&tokens, 2, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        let mut choices = super::heap_array(0xA5u8);
+        let mut costs = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+        let mut seed = 73u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut changed = 0;
+        for case in 0..384 {
+            let (raw, cx, cy) = [
+                (super::STRATEGY_DCT, 1, 1),
+                (super::STRATEGY_DCT16X8, 2, 1),
+                (super::STRATEGY_DCT16X16, 2, 2),
+                (super::STRATEGY_DCT32X16, 4, 2),
+                (super::STRATEGY_DCT32X32, 4, 4),
+            ][case % 5];
+            let strategy = STRATEGY_CODE_LUT[raw as usize];
+            let c = case % 3;
+            let mut scan = orders.scan_for(strategy, c).to_vec();
+            let size = cx * cy * 64;
+            if case % 2 == 0 {
+                // Learned AC orders need not follow spatial frequency.
+                for i in cx * cy..size {
+                    let j = cx * cy + random() as usize % (size - cx * cy);
+                    scan.swap(i, j);
+                }
+            }
+            let inv_qm = vec![1.; size];
+            let source: Vec<f32> = (0..size)
+                .map(|_| {
+                    if random() % 10 < (case % 10) as u32 {
+                        0.
+                    } else {
+                        (random() % 1024) as f32 / 128. - 4.
+                    }
+                })
+                .collect();
+            let original: Vec<i32> = source.iter().map(|v| v.round() as i32).collect();
+            let mut expected = original.clone();
+            let mut actual = original.clone();
+            let mut fresh_choices = super::heap_array(u8::MAX);
+            let mut fresh_costs = Box::new([[f32::INFINITY; super::RDOQ_MAX_STRIDE]; 2]);
+            let run = |block: &mut [i32], choices: &mut _, costs: &mut _| {
+                super::rdoq_block(
+                    &prices,
+                    &scan,
+                    &source,
+                    &inv_qm,
+                    1.,
+                    block,
+                    raw,
+                    strategy,
+                    c,
+                    (case % 64) as u8,
+                    cx,
+                    cy,
+                    [1., 2., 3., 4.][case % 4],
+                    case % 2 == 0,
+                    [0.5, 1.0, 1.2, 2.0][case % 4],
+                    choices,
+                    costs,
+                );
+            };
+            run(&mut expected, &mut fresh_choices, &mut fresh_costs);
+            run(&mut actual, &mut choices, &mut costs);
+            assert_eq!(actual, expected, "scratch reuse in case {case}");
+            changed += usize::from(actual != original);
+        }
+        assert!(
+            changed > 100,
+            "exercise finite trellis paths, including changed blocks"
+        );
+    }
 
     fn check_dc_quantizers(methods: QuantizeDcMethods) {
         let input = [
