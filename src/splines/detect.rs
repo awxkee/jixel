@@ -37,6 +37,10 @@ static SCALES: [f32; 4] = [0.7, 1.0, 1.5, 2.2];
 const HYSTERESIS_HIGH: f32 = 0.02;
 const HYSTERESIS_LOW: f32 = 0.008;
 const MIN_CHAIN_LEN: usize = 20;
+/// Component discovery pays off only with many seeds and multiple workers.
+const MIN_COMPONENT_SEEDS: usize = 500_000;
+/// Bound discovery of one component before falling back to the serial walk.
+const MAX_COMPONENT_PIXELS: usize = 262_144;
 /// Line-ness: curvature across the ridge must dominate curvature along it.
 pub(crate) const ALONG_PENALTY: f32 = 1.5;
 pub(crate) const MAX_SUBPIXEL_OFFSET: f32 = 0.75;
@@ -412,10 +416,39 @@ struct Neighbor {
     direction: (f32, f32),
 }
 
+trait Availability {
+    fn get(&self, index: usize) -> i8;
+    fn set(&mut self, index: usize, value: i8);
+}
+
+impl Availability for [i8] {
+    #[inline]
+    fn get(&self, index: usize) -> i8 {
+        self[index]
+    }
+    #[inline]
+    fn set(&mut self, index: usize, value: i8) {
+        self[index] = value;
+    }
+}
+
+struct AtomicAvailability<'a>(&'a [std::sync::atomic::AtomicI8]);
+
+impl Availability for AtomicAvailability<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> i8 {
+        self.0[index].load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline]
+    fn set(&mut self, index: usize, value: i8) {
+        self.0[index].store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Zero marks an unavailable pixel; otherwise the byte stores its polarity.
 /// Suppression still removes both polarities, as in the original walk.
-struct Tracer<'a> {
-    avail: &'a mut [i8],
+struct Tracer<'a, A: Availability + ?Sized = [i8]> {
+    avail: &'a mut A,
     w: usize,
     h: usize,
     neighbors: [Neighbor; 8],
@@ -423,6 +456,12 @@ struct Tracer<'a> {
 
 impl<'a> Tracer<'a> {
     fn new(avail: &'a mut [i8], w: usize, h: usize) -> Self {
+        Self::with_availability(avail, w, h)
+    }
+}
+
+impl<'a, A: Availability + ?Sized> Tracer<'a, A> {
+    fn with_availability(avail: &'a mut A, w: usize, h: usize) -> Self {
         Self {
             avail,
             w,
@@ -463,7 +502,7 @@ impl<'a> Tracer<'a> {
             let mut best: Option<Neighbor> = None;
             let mut best_score = TRACE_MIN_COS;
             for &n in &self.neighbors {
-                if !in_bounds(&n) || self.avail[(center + n.index) as usize] != polarity {
+                if !in_bounds(&n) || self.avail.get((center + n.index) as usize) != polarity {
                     continue;
                 }
                 let score = (n.dx as f32 * tangent.0 + n.dy as f32 * tangent.1) / n.norm;
@@ -479,10 +518,10 @@ impl<'a> Tracer<'a> {
                     && n.index != next.index
                     && (n.dx as f32 * tangent.0 + n.dy as f32 * tangent.1).abs() < 0.5
                 {
-                    self.avail[(center + n.index) as usize] = 0;
+                    self.avail.set((center + n.index) as usize, 0);
                 }
             }
-            self.avail[(center + next.index) as usize] = 0;
+            self.avail.set((center + next.index) as usize, 0);
             (x, y) = (x + next.dx, y + next.dy);
             out.push((x as usize, y as usize));
             tangent = (
@@ -495,26 +534,22 @@ impl<'a> Tracer<'a> {
     }
 }
 
-pub(super) fn detect_chains(
-    ctx: &EncodingContext,
-    scratch: &mut CoderScratch,
-    xyb: &Image3F,
-) -> Vec<Chain> {
-    let (w, h) = (xyb.xsize(), xyb.ysize());
-    let mut map = ridge_map(ctx, scratch, xyb.plane_data(1), w, h);
-    let (mut avail, mut order) = ridge_mask(ctx, scratch, &mut map, w, h);
-    sort_seeds(&mut order);
-
-    let mut tracer = Tracer::new(&mut avail, w, h);
+fn trace_seeds<A: Availability + ?Sized>(
+    map: &RidgeMap,
+    tracer: &mut Tracer<'_, A>,
+    order: &[u64],
+    w: usize,
+    h: usize,
+    mut emit: impl FnMut(u64, Chain),
+) {
     let (mut forward, mut backward) = (Vec::new(), Vec::new());
-    let mut chains = Vec::new();
-    for entry in order {
+    for &entry in order {
         let i = entry as u32 as usize;
-        let polarity = tracer.avail[i];
+        let polarity = tracer.avail.get(i);
         if polarity == 0 {
             continue;
         }
-        tracer.avail[i] = 0;
+        tracer.avail.set(i, 0);
         let start = (i % w, i / w);
         let tangent = (-map.ny[i], map.nx[i]);
         tracer.walk(start, tangent, polarity, &mut forward);
@@ -556,12 +591,133 @@ pub(super) fn detect_chains(
         if best.len() < MIN_CHAIN_LEN {
             continue;
         }
-        chains.push(Chain {
-            points: points[best].to_vec(),
-            scale: scale_sum / weight_sum.max(1e-12),
-        });
+        emit(
+            entry,
+            Chain {
+                points: points[best].to_vec(),
+                scale: scale_sum / weight_sum.max(1e-12),
+            },
+        );
     }
+}
+
+fn trace_serial(
+    map: &RidgeMap,
+    avail: &mut [i8],
+    order: &mut Vec<u64>,
+    w: usize,
+    h: usize,
+) -> Vec<Chain> {
+    sort_seeds(order);
+    let mut tracer = Tracer::new(avail, w, h);
+    let mut chains = Vec::new();
+    trace_seeds(map, &mut tracer, order, w, h, |_, chain| chains.push(chain));
     chains
+}
+
+fn trace_components(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    map: &RidgeMap,
+    mut avail: Vec<i8>,
+    mut order: Vec<u64>,
+    w: usize,
+    h: usize,
+) -> Vec<Chain> {
+    let mut nodes = Vec::new();
+    let mut components = Vec::new();
+    // Both polarities belong to the same component: perpendicular suppression
+    // can remove either polarity. Values +/-2 mark visited pixels temporarily.
+    for &entry in &order {
+        let seed = entry as u32 as usize;
+        if avail[seed].abs() != 1 {
+            continue;
+        }
+        nodes.clear();
+        nodes.push(seed as u32);
+        avail[seed] *= 2;
+        let mut at = 0;
+        while at < nodes.len() {
+            if at == MAX_COMPONENT_PIXELS {
+                // Restore all discovery marks, including earlier components.
+                for value in &mut avail {
+                    if value.abs() == 2 {
+                        *value /= 2;
+                    }
+                }
+                return trace_serial(map, &mut avail, &mut order, w, h);
+            }
+            let i = nodes[at] as usize;
+            at += 1;
+            let (x, y) = (i % w, i / w);
+            for yy in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+                for xx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                    let j = yy * w + xx;
+                    if avail[j].abs() == 1 {
+                        avail[j] *= 2;
+                        nodes.push(j as u32);
+                    }
+                }
+            }
+        }
+        if nodes.len() < MIN_CHAIN_LEN {
+            continue;
+        }
+        let mut seeds: Vec<_> = nodes
+            .iter()
+            .copied()
+            .filter(|&i| map.strength[i as usize] > HYSTERESIS_HIGH)
+            .map(|i| seed_key(i, map.strength[i as usize]))
+            .collect();
+        // Raster pixel index resolves equal-strength ties exactly as the global
+        // stable sort. Discovery order inside the component need not be raster.
+        seeds.sort_unstable();
+        components.push((nodes.len(), seeds));
+    }
+    drop(order);
+    if components.is_empty() {
+        return Vec::new();
+    }
+    components.sort_unstable_by_key(|(size, _)| std::cmp::Reverse(*size));
+    let jobs = components.len().min(ctx.thread_pool.num_threads() * 4);
+    let mut batches = vec![Vec::new(); jobs];
+    for (i, (_, mut seeds)) in components.into_iter().enumerate() {
+        batches[i % jobs].append(&mut seeds);
+    }
+    // Different components cannot access each other's initially available
+    // pixels. Atomic bytes permit concurrent zero stores to shared empty halos.
+    let avail: Vec<_> = avail
+        .into_iter()
+        .map(|value| {
+            std::sync::atomic::AtomicI8::new(if value.abs() == 2 { value / 2 } else { value })
+        })
+        .collect();
+    let results = ctx.thread_pool.steal_map(scratch, jobs, |job, _| {
+        let mut availability = AtomicAvailability(&avail);
+        let mut tracer = Tracer::with_availability(&mut availability, w, h);
+        let mut chains = Vec::new();
+        trace_seeds(map, &mut tracer, &batches[job], w, h, |entry, chain| {
+            chains.push((entry, chain))
+        });
+        chains
+    });
+    let mut chains: Vec<_> = results.into_iter().flatten().collect();
+    chains.sort_unstable_by_key(|(entry, _)| *entry);
+    chains.into_iter().map(|(_, chain)| chain).collect()
+}
+
+pub(super) fn detect_chains(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    xyb: &Image3F,
+) -> Vec<Chain> {
+    let (w, h) = (xyb.xsize(), xyb.ysize());
+    let mut map = ridge_map(ctx, scratch, xyb.plane_data(1), w, h);
+    let (mut avail, mut order) = ridge_mask(ctx, scratch, &mut map, w, h);
+    if ctx.thread_pool.num_threads() > 1 && order.len() >= MIN_COMPONENT_SEEDS {
+        return trace_components(ctx, scratch, &map, avail, order, w, h);
+    }
+    trace_serial(&map, &mut avail, &mut order, w, h)
 }
 
 #[cfg(test)]
@@ -926,6 +1082,117 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn independent_components_preserve_greedy_chains() {
+        for pattern in 0..3 {
+            let (w, h) = (137usize, 139usize);
+            let n = w * h;
+            let map = RidgeMap {
+                strength: (0..n)
+                    .map(|i| {
+                        if i % 11 == 0 {
+                            0.012
+                        } else {
+                            0.03 + (i % 3) as f32 * 0.001
+                        }
+                    })
+                    .collect(),
+                nx: vec![1.0; n],
+                ny: vec![0.0; n],
+                scale: vec![1.0; n],
+                offset: (0..n).map(|i| (i % 3) as f32 * 0.0625).collect(),
+                polarity: vec![1; n],
+            };
+            let avail: Vec<i8> = (0..n)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    if pattern == 2 {
+                        return 0;
+                    }
+                    if y > 1 && y + 1 < h && [16, 18, 48, 80, 112].contains(&x) {
+                        1
+                    } else if pattern == 1 && y > 1 && y + 1 < h && [17, 49, 81, 113].contains(&x) {
+                        -1
+                    } else if (x == 126 && (6..26).contains(&y))
+                        || (x == 130 && (6..25).contains(&y))
+                    {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let order: Vec<_> = (0..n)
+                .filter(|&i| avail[i] != 0 && map.strength[i] > HYSTERESIS_HIGH)
+                .map(|i| seed_key(i as u32, map.strength[i]))
+                .collect();
+            let mut sorted = order.clone();
+            sort_seeds(&mut sorted);
+            let mut serial = avail.clone();
+            let mut tracer = Tracer::new(&mut serial, w, h);
+            let mut expected = Vec::new();
+            trace_seeds(&map, &mut tracer, &sorted, w, h, |_, chain| {
+                expected.push(chain)
+            });
+            if pattern != 2 {
+                assert!(expected.len() >= 4);
+                assert!(
+                    expected
+                        .iter()
+                        .any(|chain| chain.points.len() == MIN_CHAIN_LEN)
+                );
+            }
+            for threads in [1, 4, 8] {
+                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let actual = trace_components(
+                    &ctx,
+                    &mut CoderScratch::default(),
+                    &map,
+                    avail.clone(),
+                    order.clone(),
+                    w,
+                    h,
+                );
+                assert_eq!(actual.len(), expected.len());
+                for (a, b) in actual.iter().zip(&expected) {
+                    assert_eq!(a.scale.to_bits(), b.scale.to_bits());
+                    assert_eq!(a.points.len(), b.points.len());
+                    for (a, b) in a.points.iter().zip(&b.points) {
+                        assert_eq!(a.x.to_bits(), b.x.to_bits());
+                        assert_eq!(a.y.to_bits(), b.y.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn giant_component_fallback_restores_discovery_marks() {
+        let (w, h) = (513usize, 513usize);
+        let n = w * h;
+        let map = RidgeMap {
+            strength: vec![0.03; n],
+            nx: vec![1.0; n],
+            ny: vec![0.0; n],
+            scale: vec![1.0; n],
+            offset: vec![0.0; n],
+            polarity: vec![1; n],
+        };
+        let avail = vec![1; n];
+        let order: Vec<_> = (0..n)
+            .map(|i| seed_key(i as u32, map.strength[i]))
+            .collect();
+        let expected = trace_serial(&map, &mut avail.clone(), &mut order.clone(), w, h);
+        assert!(expected.len() > 4);
+        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 4);
+        let actual = trace_components(&ctx, &mut CoderScratch::default(), &map, avail, order, w, h);
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(&expected) {
+            assert_eq!(a.scale.to_bits(), b.scale.to_bits());
+            assert_eq!(a.points, b.points);
         }
     }
 }

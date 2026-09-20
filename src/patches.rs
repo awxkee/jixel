@@ -47,11 +47,11 @@ pub(crate) enum VarDctFrameKind<'a> {
 }
 
 /// Order-sensitive bulk hash of one tile.
-fn hash_tile(linear: &Image3F, x0: usize, y0: usize) -> u64 {
+fn hash_tile(linear: &Image3F, x0: usize, y0: usize, tile: usize) -> u64 {
     let mut h: u64 = 0x9e37_79b9_7f4a_7c15;
     for c in 0..3 {
-        for y in y0..y0 + PATCH_TILE {
-            let row = &linear.plane_row(c, y)[x0..x0 + PATCH_TILE];
+        for y in y0..y0 + tile {
+            let row = &linear.plane_row(c, y)[x0..x0 + tile];
             for pair in row.as_chunks::<2>().0 {
                 let v = u64::from(pair[0].to_bits()) | (u64::from(pair[1].to_bits()) << 32);
                 h = (h ^ v).wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -64,22 +64,22 @@ fn hash_tile(linear: &Image3F, x0: usize, y0: usize) -> u64 {
 
 /// Mean absolute deviation of a tile, summed over channels: a cheap stand-in
 /// for what the tile costs to code as ordinary blocks.
-fn tile_energy(img: &Image3F, x0: usize, y0: usize) -> f32 {
+fn tile_energy(img: &Image3F, x0: usize, y0: usize, tile: usize) -> f32 {
     let mut energy = 0.0;
     for c in 0..3 {
         let mut sum = 0.0;
-        for y in y0..y0 + PATCH_TILE {
-            sum += img.plane_row(c, y)[x0..x0 + PATCH_TILE].iter().sum::<f32>();
+        for y in y0..y0 + tile {
+            sum += img.plane_row(c, y)[x0..x0 + tile].iter().sum::<f32>();
         }
-        let mean = sum / (PATCH_TILE * PATCH_TILE) as f32;
-        for y in y0..y0 + PATCH_TILE {
-            energy += img.plane_row(c, y)[x0..x0 + PATCH_TILE]
+        let mean = sum / (tile * tile) as f32;
+        for y in y0..y0 + tile {
+            energy += img.plane_row(c, y)[x0..x0 + tile]
                 .iter()
                 .map(|v| (v - mean).abs())
                 .sum::<f32>();
         }
     }
-    energy / (PATCH_TILE * PATCH_TILE) as f32
+    energy / (tile * tile) as f32
 }
 
 /// Minimum per-tile energy worth spending a patch on.
@@ -90,12 +90,34 @@ const MIN_PATCH_ENERGY: f32 = 0.017;
 /// pay dictionary positions without amortizing their atlas tile.
 const MIN_PATCH_OCCURRENCES: usize = 5;
 
+/// Most tile groups one plan keeps.
+const MAX_PATCH_GROUPS: usize = 4096;
+
+#[cfg(test)]
 pub(crate) fn find_lossy_patches(
     linear: &Image3F,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<LossyPatches> {
-    let tile = PATCH_TILE;
+    find_lossy_patches_sized(linear, PATCH_TILE, 0.0, pool, scratch)
+}
+
+/// Per-channel (X, Y, B) tolerance of one unit of `near`: about one 8-bit
+/// level of a mid-gray pixel.
+static NEAR_TILE_UNIT: [f32; 3] = [0.0005, 0.0035, 0.006];
+
+const NEAR_TILE_BUCKET_SCAN: usize = 24;
+
+/// `near > 0` also groups tiles whose every sample is within
+/// `near * NEAR_TILE_UNIT` of a group's first tile; they are replaced by that
+/// tile, so the substitution error is bounded per sample.
+pub(crate) fn find_lossy_patches_sized(
+    linear: &Image3F,
+    tile: usize,
+    near: f32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<LossyPatches> {
     let width = linear.xsize();
     let height = linear.ysize();
     if width < tile || height < tile {
@@ -107,7 +129,7 @@ pub(crate) fn find_lossy_patches(
     // pixels, so it stays negligible.
     let rows = pool.steal_map(scratch, tiles_y, |ty, _scratch| {
         (0..tiles_x)
-            .map(|tx| hash_tile(linear, tx * tile, ty * tile))
+            .map(|tx| hash_tile(linear, tx * tile, ty * tile, tile))
             .collect::<Vec<u64>>()
     });
     let mut buckets: HashMap<u64, Vec<(usize, usize)>> =
@@ -122,8 +144,9 @@ pub(crate) fn find_lossy_patches(
     }
 
     let mut groups = Vec::new();
+    let min_occurrences = MIN_PATCH_OCCURRENCES;
     for candidates in buckets.into_values() {
-        if candidates.len() < MIN_PATCH_OCCURRENCES {
+        if candidates.len() < min_occurrences {
             continue;
         }
         let mut exact_groups: Vec<Vec<(usize, usize)>> = Vec::new();
@@ -146,13 +169,122 @@ pub(crate) fn find_lossy_patches(
         groups.extend(
             exact_groups
                 .into_iter()
-                .filter(|g| g.len() >= MIN_PATCH_OCCURRENCES),
+                .filter(|g| g.len() >= min_occurrences),
         );
     }
 
-    groups.retain(|g| tile_energy(linear, g[0].0, g[0].1) >= MIN_PATCH_ENERGY);
+    if near > 0.0 {
+        // The exact groups arrive in hash order; the near pass registers and
+        // scans leaders in sequence, so fix the order first.
+        sort_patch_groups(&mut groups);
+        let tol = NEAR_TILE_UNIT.map(|u| u * near);
+        let mut taken = vec![false; tiles_x * tiles_y];
+        for g in &groups {
+            for &(x, y) in g {
+                taken[(y / tile) * tiles_x + x / tile] = true;
+            }
+        }
+        // Coarse signature: 2x2 cell means of Y plus whole-tile X and B means
+        // in buckets 16 tolerances wide. Two grids half a bucket apart: a
+        // value on a boundary of one sits mid-bucket in the other.
+        let cell = tile / 2;
+        let signature = |x0: usize, y0: usize| -> [u64; 2] {
+            let mut means = [0f32; 6];
+            for cy in 0..2 {
+                for cx in 0..2 {
+                    let mut sum = 0.0f32;
+                    for dy in 0..cell {
+                        let row = linear.plane_row(1, y0 + cy * cell + dy);
+                        sum += row[x0 + cx * cell..x0 + (cx + 1) * cell]
+                            .iter()
+                            .sum::<f32>();
+                    }
+                    means[cy * 2 + cx] = sum / (cell * cell) as f32 / (16.0 * tol[1]);
+                }
+            }
+            for (slot, c) in [(4usize, 0usize), (5, 2)] {
+                let mut sum = 0.0f32;
+                for dy in 0..tile {
+                    sum += linear.plane_row(c, y0 + dy)[x0..x0 + tile]
+                        .iter()
+                        .sum::<f32>();
+                }
+                means[slot] = sum / (tile * tile) as f32 / (16.0 * tol[c]);
+            }
+            [0.0f32, 0.5].map(|shift| {
+                let mut h: u64 = 0x9e37_79b9_7f4a_7c15 ^ shift.to_bits() as u64;
+                for m in means {
+                    h = (h ^ (m + shift).floor() as i64 as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    h ^= h >> 29;
+                }
+                h
+            })
+        };
+        let within = |a: (usize, usize), b: (usize, usize)| -> bool {
+            (0..3).all(|c| {
+                (0..tile).all(|dy| {
+                    let ra = &linear.plane_row(c, a.1 + dy)[a.0..a.0 + tile];
+                    let rb = &linear.plane_row(c, b.1 + dy)[b.0..b.0 + tile];
+                    ra.iter().zip(rb).all(|(p, q)| (p - q).abs() <= tol[c])
+                })
+            })
+        };
+        let exact_count = groups.len();
+        let mut table: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (gi, g) in groups.iter().enumerate() {
+            for key in signature(g[0].0, g[0].1) {
+                table.entry(key).or_default().push(gi);
+            }
+        }
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                if taken[ty * tiles_x + tx] {
+                    continue;
+                }
+                let pos = (tx * tile, ty * tile);
+                if tile_energy(linear, pos.0, pos.1, tile) < MIN_PATCH_ENERGY {
+                    continue;
+                }
+                let keys = signature(pos.0, pos.1);
+                // Textured content fills buckets with unrelated leaders; a
+                // bounded scan keeps the pass linear.
+                let found = keys.iter().find_map(|key| {
+                    table
+                        .get(key)?
+                        .iter()
+                        .take(NEAR_TILE_BUCKET_SCAN)
+                        .copied()
+                        .find(|&gi| within(groups[gi][0], pos))
+                });
+                match found {
+                    Some(gi) => groups[gi].push(pos),
+                    None => {
+                        let mut registered = false;
+                        for key in keys {
+                            let bucket = table.entry(key).or_default();
+                            if bucket.len() < NEAR_TILE_BUCKET_SCAN {
+                                bucket.push(groups.len());
+                                registered = true;
+                            }
+                        }
+                        if registered {
+                            groups.push(vec![pos]);
+                        }
+                    }
+                }
+            }
+        }
+        // Provisional near groups must reach the floor on their own.
+        let mut index = 0;
+        groups.retain(|g| {
+            index += 1;
+            index <= exact_count || g.len() >= min_occurrences
+        });
+    }
+
+    groups.retain(|g| tile_energy(linear, g[0].0, g[0].1, tile) >= MIN_PATCH_ENERGY);
     sort_patch_groups(&mut groups);
-    groups.truncate(256);
+    groups.truncate(MAX_PATCH_GROUPS);
     if groups.is_empty() {
         return None;
     }
@@ -178,8 +310,42 @@ pub(crate) fn pack_lossy_atlas(
     groups: Vec<Vec<(usize, usize)>>,
     ref_frame: u32,
 ) -> (Image3F, Vec<PatchReference>) {
-    let tile = PATCH_TILE;
-    let atlas_cols = groups.len().min(16);
+    pack_lossy_atlas_sized(linear, groups, PATCH_TILE, ref_frame)
+}
+
+/// Put `bottom` under `top` in one atlas; `bottom_refs` move down with it.
+pub(crate) fn stack_atlases(
+    top: Image3F,
+    bottom: Image3F,
+    bottom_refs: &mut [PatchReference],
+) -> Image3F {
+    // Rows of whole 8x8 blocks keep either half off the other's blocks.
+    let top_h = top.ysize().next_multiple_of(16);
+    let width = top.xsize().max(bottom.xsize());
+    let mut atlas = Image3F::new(width, top_h + bottom.ysize());
+    for c in 0..3 {
+        for y in 0..top.ysize() {
+            atlas.plane_row_mut(c, y)[..top.xsize()]
+                .copy_from_slice(&top.plane_row(c, y)[..top.xsize()]);
+        }
+        for y in 0..bottom.ysize() {
+            atlas.plane_row_mut(c, top_h + y)[..bottom.xsize()]
+                .copy_from_slice(&bottom.plane_row(c, y)[..bottom.xsize()]);
+        }
+    }
+    for r in bottom_refs {
+        r.atlas_y += top_h;
+    }
+    atlas
+}
+
+pub(crate) fn pack_lossy_atlas_sized(
+    linear: &Image3F,
+    groups: Vec<Vec<(usize, usize)>>,
+    tile: usize,
+    ref_frame: u32,
+) -> (Image3F, Vec<PatchReference>) {
+    let atlas_cols = groups.len().min(256 / tile);
     let atlas_rows = groups.len().div_ceil(atlas_cols);
     let mut atlas = Image3F::new(atlas_cols * tile, atlas_rows * tile);
     let mut references = Vec::with_capacity(groups.len());
@@ -194,11 +360,12 @@ pub(crate) fn pack_lossy_atlas(
             }
         }
         references.push(PatchReference {
-            width: PATCH_TILE,
-            height: PATCH_TILE,
+            width: tile,
+            height: tile,
             atlas_x,
             atlas_y,
             ref_frame,
+            add: false,
             positions,
         });
     }
@@ -220,6 +387,8 @@ pub(crate) struct PatchReference {
     pub(crate) height: usize,
     /// Which saved reference frame this entry copies from.
     pub(crate) ref_frame: u32,
+    /// Blend with kAdd instead of kReplace.
+    pub(crate) add: bool,
     pub(crate) positions: Vec<(usize, usize)>,
 }
 
@@ -232,7 +401,16 @@ pub(crate) struct LosslessPatches {
 #[derive(Clone, Copy)]
 pub(crate) enum ModularFrameKind<'a> {
     Regular,
-    ReferenceOnly { width: usize, height: usize },
+    ReferenceOnly {
+        width: usize,
+        height: usize,
+    },
+    /// Reference-only atlas inside an `xyb_encoded` codestream: channels are
+    /// Y, X, B-Y on the default LF dequant lattice, saved to the modular slot.
+    XybReferenceOnly {
+        width: usize,
+        height: usize,
+    },
     Patched(&'a [PatchReference]),
 }
 
@@ -360,6 +538,7 @@ pub(crate) fn find_lossless_patches(
             atlas_x,
             atlas_y,
             ref_frame: PATCH_REF_ID,
+            add: false,
             positions,
         });
     }
@@ -671,11 +850,399 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
             width: s.w,
             height: s.h,
             ref_frame: PATCH_REF_ID,
+            add: false,
             positions,
         });
     }
     Some(LosslessPatches {
         atlas,
+        base,
+        references,
+    })
+}
+
+const GLYPH_MAX_INK_SHARE: f64 = 0.6;
+const GLYPH_SCREEN_STRIDE: usize = 64;
+const GLYPH_SCREEN_MAX_INK: f64 = 0.6;
+/// The lossy glyph atlas is a multi-group modular frame; only keep it sane.
+const GLYPH_ATLAS_MAX_HEIGHT: usize = 4096;
+
+/// Glyph patches for the lossy path, libjxl style: connected ink components
+/// over a flat background, stored as the difference from that background on
+/// the modular XYB lattice and blended with kAdd. The base keeps the image
+/// minus the decoded patch, i.e. the flat background plus lattice rounding.
+pub(crate) struct LossyGlyphPatches {
+    /// Lattice channels Y, X, B-Y of the atlas.
+    pub(crate) atlas: [Vec<i32>; 3],
+    pub(crate) atlas_width: usize,
+    pub(crate) atlas_height: usize,
+    pub(crate) base: Image3F,
+    pub(crate) references: Vec<PatchReference>,
+}
+
+pub(crate) struct GlyphParams {
+    pub(crate) min_occurrences: usize,
+    /// (occurrences - 1) * box pixels a group must reach.
+    pub(crate) min_repeat_pixels: usize,
+    /// Lattice values are rounded to multiples of this.
+    pub(crate) coarse: i32,
+}
+
+/// Share of the frame the glyph boxes must cover.
+const GLYPH_MIN_COVER: f64 = 0.005;
+
+pub(crate) fn find_lossy_glyph_patches(
+    xyb: &Image3F,
+    params: &GlyphParams,
+) -> Option<LossyGlyphPatches> {
+    use crate::quant_weights::INV_DC_QUANT;
+    let (width, height) = (xyb.xsize(), xyb.ysize());
+    let bg_tile = GLYPH_BG_TILE;
+    if width < bg_tile || height < bg_tile {
+        return None;
+    }
+    // Cheap screen: on a sparse sample of 16-pixel tiles, how many pixels
+    // differ from their tile's most frequent color. Photos are nearly all
+    // "ink" and leave before the full-frame quantization.
+    {
+        let mut colors = [[0i32; 3]; PATCH_TILE * PATCH_TILE];
+        let mut sample_keys = [0u64; PATCH_TILE * PATCH_TILE];
+        let (mut ink, mut total) = (0usize, 0usize);
+        for y0 in (0..height.saturating_sub(PATCH_TILE)).step_by(GLYPH_SCREEN_STRIDE) {
+            for x0 in (0..width.saturating_sub(PATCH_TILE)).step_by(GLYPH_SCREEN_STRIDE) {
+                crate::xyb::quantize_xyb_tile_colors(xyb, x0, y0, 1, &mut colors);
+                let k = [params.coarse; 3];
+                for (key, c) in sample_keys.iter_mut().zip(&colors) {
+                    // Same granularity as the full pass; tile colors are Y, X, B-Y.
+                    let r = |v: i32, k: i32| (v as f32 / k as f32).round() as i32 * k;
+                    *key = color_key(r(c[0], k[0]), r(c[1], k[1]), r(c[2] + c[0], k[2]));
+                }
+                let mut sorted = sample_keys;
+                let mode = most_frequent_color(&mut sorted);
+                ink += sample_keys.iter().filter(|&&key| key != mode).count();
+                total += sample_keys.len();
+            }
+        }
+        if ink as f64 > GLYPH_SCREEN_MAX_INK * total as f64 {
+            return None;
+        }
+    }
+    let [qy, qx, mut qb] = crate::xyb::quantize_xyb_channels(xyb, 1);
+    let (mut qy, mut qx) = (qy, qx);
+    // Work with the rounded B itself; the atlas goes back to B-Y at the end.
+    for (b, &y) in qb.iter_mut().zip(&qy) {
+        *b += y;
+    }
+    // Coarser atlas values on the same lattice: multiples of `coarse[c]`.
+    for (plane, k) in [&mut qy, &mut qx, &mut qb]
+        .into_iter()
+        .zip([params.coarse; 3])
+    {
+        if k > 1 {
+            for v in plane.iter_mut() {
+                *v = (*v as f32 / k as f32).round() as i32 * k;
+            }
+        }
+    }
+    let planes = [&qy, &qx, &qb];
+    let keys: Vec<u64> = (0..width * height)
+        .map(|i| color_key(qy[i], qx[i], qb[i]))
+        .collect();
+
+    let tiles_x = width.div_ceil(bg_tile);
+    let tiles_y = height.div_ceil(bg_tile);
+    let mut modes = vec![0u64; tiles_x * tiles_y];
+    let mut tile_keys: Vec<u64> = Vec::with_capacity(bg_tile * bg_tile);
+    // A band is one row of tiles: `bg_tile` image rows (fewer at the bottom).
+    let band_len = width * bg_tile;
+    for (band, mode_row) in keys.chunks(band_len).zip(modes.chunks_exact_mut(tiles_x)) {
+        for (tx, mode) in mode_row.iter_mut().enumerate() {
+            let x0 = tx * bg_tile;
+            let x1 = (x0 + bg_tile).min(width);
+            tile_keys.clear();
+            tile_keys.extend(band.chunks_exact(width).flat_map(|row| &row[x0..x1]));
+            *mode = most_frequent_color(&mut tile_keys);
+        }
+    }
+    let mut ink = vec![false; width * height];
+    for (ty, (ink_band, key_band)) in ink
+        .chunks_mut(band_len)
+        .zip(keys.chunks(band_len))
+        .enumerate()
+    {
+        let neighbor_rows = &modes[ty.saturating_sub(1) * tiles_x..(ty + 2).min(tiles_y) * tiles_x];
+        for tx in 0..tiles_x {
+            let (nx0, nx1) = (tx.saturating_sub(1), (tx + 2).min(tiles_x));
+            let mut backgrounds = [0u64; 9];
+            let mut n = 0;
+            for &key in neighbor_rows
+                .chunks_exact(tiles_x)
+                .flat_map(|row| &row[nx0..nx1])
+            {
+                if !backgrounds[..n].contains(&key) {
+                    backgrounds[n] = key;
+                    n += 1;
+                }
+            }
+            let backgrounds = &backgrounds[..n];
+            let x0 = tx * bg_tile;
+            let x1 = (x0 + bg_tile).min(width);
+            for (ink_row, key_row) in ink_band
+                .chunks_exact_mut(width)
+                .zip(key_band.chunks_exact(width))
+            {
+                for (pixel, key) in ink_row[x0..x1].iter_mut().zip(&key_row[x0..x1]) {
+                    *pixel = !backgrounds.contains(key);
+                }
+            }
+        }
+    }
+
+    let ink_pixels = ink.iter().filter(|&&p| p).count();
+    // Text and UI sit on flat backgrounds; when most pixels are ink there is
+    // no page to subtract and the component scan is wasted time.
+    if ink_pixels as f64 > GLYPH_MAX_INK_SHARE * (width * height) as f64 {
+        return None;
+    }
+
+    struct Shape {
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+        label: u32,
+        bg: [i32; 3],
+        hash: u64,
+    }
+    let mut label = vec![0u32; width * height];
+    let mut shapes: Vec<Shape> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut next_label = 0u32;
+    let mut next_pixel = 0;
+    while let Some(offset) = ink[next_pixel..]
+        .iter()
+        .zip(&label[next_pixel..])
+        .position(|(&pixel, &owner)| pixel && owner == 0)
+    {
+        let start = next_pixel + offset;
+        next_pixel = start + 1;
+        next_label += 1;
+        let (x, y) = (start % width, start / width);
+        let (mut x0, mut x1, mut y0, mut y1) = (x, x, y, y);
+        let mut count = 0usize;
+        let mut bg_key: Option<u64> = None;
+        let mut one_bg = true;
+        stack.push((x, y));
+        label[start] = next_label;
+        while let Some((cx, cy)) = stack.pop() {
+            count += 1;
+            x0 = x0.min(cx);
+            x1 = x1.max(cx);
+            y0 = y0.min(cy);
+            y1 = y1.max(cy);
+            let (nx0, nx1) = (cx.saturating_sub(1), (cx + 2).min(width));
+            let (ny0, ny1) = (cy.saturating_sub(1), (cy + 2).min(height));
+            let window = ny0 * width..ny1 * width;
+            let rows = ink[window.clone()]
+                .chunks_exact(width)
+                .zip(label[window.clone()].chunks_exact_mut(width))
+                .zip(keys[window].chunks_exact(width));
+            for (dy, ((ink_row, label_row), key_row)) in rows.enumerate() {
+                let pixels = ink_row[nx0..nx1]
+                    .iter()
+                    .zip(&mut label_row[nx0..nx1])
+                    .zip(&key_row[nx0..nx1]);
+                for (dx, ((&is_ink, owner), &key)) in pixels.enumerate() {
+                    if is_ink {
+                        if *owner == 0 {
+                            *owner = next_label;
+                            stack.push((nx0 + dx, ny0 + dy));
+                        }
+                    } else {
+                        match bg_key {
+                            None => bg_key = Some(key),
+                            Some(k) => one_bg &= k == key,
+                        }
+                    }
+                }
+            }
+        }
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let Some(bg_key) = bg_key else { continue };
+        if !one_bg || count < 2 || w > GLYPH_MAX_SIDE || h > GLYPH_MAX_SIDE {
+            continue;
+        }
+        let bg = key_color(bg_key);
+        let mut hash: u64 = 0x9e37_79b9_7f4a_7c15 ^ ((w as u64) << 32 | h as u64);
+        let rows = y0 * width..(y1 + 1) * width;
+        for (plane, &bg) in planes.iter().zip(&bg) {
+            let plane_rows = plane[rows.clone()].chunks_exact(width);
+            let label_rows = label[rows.clone()].chunks_exact(width);
+            for (values, owners) in plane_rows.zip(label_rows) {
+                for (&value, &owner) in values[x0..=x1].iter().zip(&owners[x0..=x1]) {
+                    let v = if owner == next_label { value - bg } else { 0 };
+                    hash = (hash ^ (v as u32 as u64)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    hash ^= hash >> 29;
+                }
+            }
+        }
+        shapes.push(Shape {
+            x0,
+            y0,
+            w,
+            h,
+            label: next_label,
+            bg,
+            hash,
+        });
+    }
+    if shapes.len() < 4 {
+        return None;
+    }
+    let diff = |s: &Shape, c: usize, dx: usize, dy: usize| -> i32 {
+        let i = (s.y0 + dy) * width + s.x0 + dx;
+        if label[i] == s.label {
+            planes[c][i] - s.bg[c]
+        } else {
+            0
+        }
+    };
+    let same = |a: &Shape, b: &Shape| -> bool {
+        a.w == b.w
+            && a.h == b.h
+            && (0..3).all(|c| {
+                (0..a.h).all(|dy| (0..a.w).all(|dx| diff(a, c, dx, dy) == diff(b, c, dx, dy)))
+            })
+    };
+    let mut buckets: HashMap<u64, Vec<Vec<usize>>> = HashMap::new();
+    for (i, s) in shapes.iter().enumerate() {
+        let groups = buckets.entry(s.hash).or_default();
+        match groups.iter_mut().find(|g| same(&shapes[g[0]], s)) {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = buckets
+        .into_values()
+        .flatten()
+        .filter(|g| {
+            let s = &shapes[g[0]];
+            g.len() >= params.min_occurrences
+                && (g.len().max(2) - 1) * s.w * s.h >= params.min_repeat_pixels
+        })
+        .collect();
+    if groups.len() < 2 {
+        return None;
+    }
+    // Most valuable first; the atlas is one 1024-pixel modular group, so the
+    // tail is dropped when the shapes do not fit.
+    groups.sort_by_key(|g| {
+        let s = &shapes[g[0]];
+        (std::cmp::Reverse(g.len() * s.w * s.h), s.y0, s.x0)
+    });
+    let budget = GLYPH_ATLAS_MAX_WIDTH * GLYPH_ATLAS_MAX_HEIGHT * 3 / 4;
+    let mut area = 0usize;
+    let keep = groups
+        .iter()
+        .take_while(|g| {
+            let s = &shapes[g[0]];
+            area += s.w * s.h;
+            area <= budget
+        })
+        .count();
+    groups.truncate(keep);
+    let (covered, total_area, max_width) = groups.iter().fold((0, 0, 0), |(cv, ar, mw), g| {
+        let s = &shapes[g[0]];
+        (cv + g.len() * s.w * s.h, ar + s.w * s.h, mw.max(s.w))
+    });
+    if (covered as f64) < GLYPH_MIN_COVER * (width * height) as f64 {
+        return None;
+    }
+    groups.sort_by_key(|g| {
+        let s = &shapes[g[0]];
+        (
+            std::cmp::Reverse(s.h),
+            std::cmp::Reverse(g.len() * s.w * s.h),
+            s.y0,
+            s.x0,
+        )
+    });
+    let atlas_width = ((total_area as f64).sqrt() as usize * 3 / 2)
+        .max(max_width)
+        .clamp(16, GLYPH_ATLAS_MAX_WIDTH);
+    let mut slots: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
+    let (mut cx, mut cy, mut shelf_h) = (0usize, 0usize, 0usize);
+    for g in &groups {
+        let s = &shapes[g[0]];
+        if cx + s.w > atlas_width {
+            cx = 0;
+            cy += shelf_h;
+            shelf_h = 0;
+        }
+        slots.push((cx, cy));
+        cx += s.w;
+        shelf_h = shelf_h.max(s.h);
+    }
+    let atlas_height = cy + shelf_h;
+    if atlas_height > GLYPH_ATLAS_MAX_HEIGHT {
+        return None;
+    }
+    let mut atlas = [
+        vec![0i32; atlas_width * atlas_height],
+        vec![0i32; atlas_width * atlas_height],
+        vec![0i32; atlas_width * atlas_height],
+    ];
+    // Plane order of `planes` is Y, X, B; image planes are X, Y, B.
+    let steps = [
+        1.0 / INV_DC_QUANT[1],
+        1.0 / INV_DC_QUANT[0],
+        1.0 / INV_DC_QUANT[2],
+    ];
+    let image_plane = [1usize, 0, 2];
+    let mut base = xyb.clone();
+    let mut references = Vec::with_capacity(groups.len());
+    for (g, (ax, ay)) in groups.into_iter().zip(slots) {
+        let s = &shapes[g[0]];
+        for dy in 0..s.h {
+            for dx in 0..s.w {
+                let at = (ay + dy) * atlas_width + ax + dx;
+                let d = [diff(s, 0, dx, dy), diff(s, 1, dx, dy), diff(s, 2, dx, dy)];
+                atlas[0][at] = d[0];
+                atlas[1][at] = d[1];
+                atlas[2][at] = d[2] - d[0];
+            }
+        }
+        let mut positions = Vec::with_capacity(g.len());
+        for &i in &g {
+            let o = &shapes[i];
+            positions.push((o.x0, o.y0));
+            for c in 0..3 {
+                for dy in 0..o.h {
+                    let row = base.plane_row_mut(image_plane[c], o.y0 + dy);
+                    for dx in 0..o.w {
+                        let d = diff(o, c, dx, dy);
+                        if d != 0 {
+                            row[o.x0 + dx] -= d as f32 * steps[c];
+                        }
+                    }
+                }
+            }
+        }
+        positions.sort_unstable_by_key(|&(x, y)| (y, x));
+        references.push(PatchReference {
+            atlas_x: ax,
+            atlas_y: ay,
+            width: s.w,
+            height: s.h,
+            ref_frame: MODULAR_PATCH_REF_ID,
+            add: true,
+            positions,
+        });
+    }
+    Some(LossyGlyphPatches {
+        atlas,
+        atlas_width,
+        atlas_height,
         base,
         references,
     })
@@ -788,6 +1355,159 @@ mod tests {
     /// Six distinct 16x16 glyphs, each repeated exactly six times (comfortably
     /// past MIN_PATCH_OCCURRENCES), so every group has the same count and only
     /// the tie-break can order them.
+    fn glyph_params(min_occurrences: usize) -> GlyphParams {
+        GlyphParams {
+            min_occurrences,
+            min_repeat_pixels: 0,
+            coarse: 1,
+        }
+    }
+
+    /// A page of two flat backgrounds with two antialiased marks stamped at
+    /// unaligned positions on both, plus one unrepeated mark. Every value sits
+    /// on the XYB lattice so a mark differs between backgrounds only by place.
+    fn glyph_page() -> Image3F {
+        let (w, h) = (192usize, 128usize);
+        let mut img = Image3F::new(w, h);
+        for y in 0..h {
+            let bg = if y < 64 {
+                [4.0f32 / 4096.0, 307.0 / 512.0, 140.0 / 256.0]
+            } else {
+                [-8.0 / 4096.0, 102.0 / 512.0, 64.0 / 256.0]
+            };
+            for (c, &value) in bg.iter().enumerate() {
+                img.plane_row_mut(c, y)[..w].fill(value);
+            }
+        }
+        let mut stamp = |x0: usize, y0: usize, w: usize, h: usize, unit: f32| {
+            for dy in 0..h {
+                for dx in 0..w {
+                    let ink = ((dx * 3 + dy * 5 + w) % 4) as f32 * unit;
+                    img.plane_row_mut(1, y0 + dy)[x0 + dx] -= ink * 16.0 / 512.0;
+                    img.plane_row_mut(2, y0 + dy)[x0 + dx] -= ink * 4.0 / 256.0;
+                    img.plane_row_mut(0, y0 + dy)[x0 + dx] += ink * 2.0 / 4096.0;
+                }
+            }
+        };
+        for &(x, y) in &[(3, 5), (41, 9), (77, 22), (130, 37), (11, 75), (99, 101)] {
+            stamp(x, y, 5, 7, 2.0);
+        }
+        for &(x, y) in &[(20, 40), (160, 12), (60, 90), (140, 110)] {
+            stamp(x, y, 4, 4, 2.0);
+        }
+        stamp(150, 80, 6, 6, 1.0);
+        img
+    }
+
+    /// kAdd semantics: base + decoded patches must give the image back up to
+    /// float rounding, wherever the patches land.
+    fn assert_glyph_plan_reconstructs(img: &Image3F, plan: &LossyGlyphPatches) {
+        use crate::quant_weights::INV_DC_QUANT;
+        let mut recon = plan.base.clone();
+        let [ay, ax, ab] = &plan.atlas;
+        for r in &plan.references {
+            assert!(r.add);
+            for &(px, py) in &r.positions {
+                for dy in 0..r.height {
+                    for dx in 0..r.width {
+                        let at = (r.atlas_y + dy) * plan.atlas_width + r.atlas_x + dx;
+                        recon.plane_row_mut(1, py + dy)[px + dx] += ay[at] as f32 / INV_DC_QUANT[1];
+                        recon.plane_row_mut(0, py + dy)[px + dx] += ax[at] as f32 / INV_DC_QUANT[0];
+                        recon.plane_row_mut(2, py + dy)[px + dx] +=
+                            (ab[at] + ay[at]) as f32 / INV_DC_QUANT[2];
+                    }
+                }
+            }
+        }
+        for c in 0..3 {
+            for y in 0..img.ysize() {
+                for (a, b) in img.plane_row(c, y)[..img.xsize()]
+                    .iter()
+                    .zip(&recon.plane_row(c, y)[..img.xsize()])
+                {
+                    assert!((a - b).abs() < 1e-5, "plane {c} row {y}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lossy_glyph_patches_reconstruct_and_flatten_the_base() {
+        let img = glyph_page();
+        let repeated = find_lossy_glyph_patches(&img, &glyph_params(2)).expect("plan");
+        // The mark differs between the two backgrounds only by where it sits.
+        assert_eq!(repeated.references.len(), 2);
+        let mut counts: Vec<usize> = repeated
+            .references
+            .iter()
+            .map(|r| r.positions.len())
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, [4, 6]);
+        assert_glyph_plan_reconstructs(&img, &repeated);
+        // Under the repeated marks the base is the background again, to within
+        // the lattice rounding of the patch.
+        let step = 1.0 / crate::quant_weights::INV_DC_QUANT[1];
+        assert!((repeated.base.plane_row(1, 8)[5] - 307.0 / 512.0).abs() <= step);
+
+        let all = find_lossy_glyph_patches(&img, &glyph_params(1)).expect("plan");
+        assert_eq!(all.references.len(), 3);
+        assert_glyph_plan_reconstructs(&img, &all);
+    }
+
+    #[test]
+    fn near_tiles_join_within_the_tolerance_only() {
+        let pool = ThreadPool::new(2);
+        let mut scratch = CoderScratch::default();
+        let tile = PATCH_TILE;
+        let mut img = Image3F::new(8 * tile, 2 * tile);
+        let mut state = 7u32;
+        // Top row: six copies of one busy tile, three of them nudged by a
+        // third of the tolerance; bottom row: unrelated noise.
+        let mut proto = vec![0f32; tile * tile];
+        for v in proto.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (state >> 24) as f32 / 255.0 * 0.5;
+        }
+        for ty in 0..2 {
+            for tx in 0..8 {
+                for dy in 0..tile {
+                    for dx in 0..tile {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let noise = (state >> 24) as f32 / 255.0 * 0.5;
+                        let value = if ty == 0 && tx < 6 {
+                            proto[dy * tile + dx]
+                                + if tx >= 3 && (dx + dy) % 2 == 0 {
+                                    NEAR_TILE_UNIT[1] / 3.0
+                                } else {
+                                    0.0
+                                }
+                        } else {
+                            noise
+                        };
+                        img.plane_row_mut(1, ty * tile + dy)[tx * tile + dx] = value;
+                        img.plane_row_mut(2, ty * tile + dy)[tx * tile + dx] = value;
+                    }
+                }
+            }
+        }
+        assert!(find_lossy_patches_sized(&img, tile, 0.0, &pool, &mut scratch).is_none());
+        let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].len(), 6);
+        assert_eq!(plan.groups[0][0], (0, 0));
+        // Hash maps are reseeded per instance; the plan must not notice.
+        for _ in 0..4 {
+            let again =
+                find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
+            assert_eq!(again.groups, plan.groups);
+        }
+        // A nudge beyond the tolerance stays out.
+        img.plane_row_mut(1, 3)[5 * tile + 3] += NEAR_TILE_UNIT[1] * 2.0;
+        let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
+        assert_eq!(plan.groups[0].len(), 5);
+    }
+
     fn equal_length_groups() -> Image3F {
         let tile = PATCH_TILE;
         let (cols, rows) = (6usize, 6usize);

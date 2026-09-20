@@ -1647,6 +1647,9 @@ fn write_frame_header_modular_kind(
     match kind {
         ModularFrameKind::Regular => write_frame_header_modular(has_alpha, layout, w),
         ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, layout, w),
+        ModularFrameKind::XybReferenceOnly { width, height } => {
+            write_frame_header_modular_xyb_reference(width, height, has_alpha, layout, w)
+        }
         ModularFrameKind::ReferenceOnly { width, height } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
@@ -1684,6 +1687,7 @@ fn write_frame_header_modular_xyb_reference(
     width: usize,
     height: usize,
     has_alpha: bool,
+    layout: GroupLayout,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // all_default = false
@@ -1695,7 +1699,7 @@ fn write_frame_header_modular_xyb_reference(
     if has_alpha {
         w.write(2, 0); // ec_upsampling[0] = 1
     }
-    w.write(2, GroupLayout::DEFAULT.shift as u64);
+    w.write(2, layout.shift as u64);
     // Reference-only frames do not serialize Passes.
     w.write(1, 1); // custom size
     write_frame_dimension(width, w);
@@ -1730,7 +1734,6 @@ pub(crate) fn encode_modular_xyb_atlas(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
-    use std::collections::HashMap;
     // The 13-bit residual bound behind LZ77_MIN_SYMBOL caps the refinement.
     debug_assert!(lattice_scale.is_power_of_two() && lattice_scale <= 8);
     let (xsize, ysize) = (atlas.xsize(), atlas.ysize());
@@ -1738,9 +1741,46 @@ pub(crate) fn encode_modular_xyb_atlas(
         return false;
     }
     let ch = quantize_xyb_channels(atlas, lattice_scale);
-    let npx = xsize * ysize;
+    encode_modular_xyb_atlas_ints(
+        ch,
+        xsize,
+        ysize,
+        has_alpha,
+        lattice_scale,
+        speed,
+        use_wp,
+        scratch,
+        writer,
+    )
+}
+
+/// Same as [`encode_modular_xyb_atlas`] for an atlas that is already on the
+/// integer lattice (channels Y, X, B-Y). Accepts up to one 1024-pixel group.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_modular_xyb_atlas_ints(
+    ch: [Vec<i32>; 3],
+    xsize: usize,
+    ysize: usize,
+    has_alpha: bool,
+    lattice_scale: u32,
+    speed: crate::Speed,
+    use_wp: bool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    use std::collections::HashMap;
+    let large = GroupLayout::LARGE.dim();
+    if xsize == 0 || ysize == 0 || xsize > large || ysize > large {
+        return false;
+    }
+    let layout = if xsize > GROUP_DIM || ysize > GROUP_DIM {
+        GroupLayout::LARGE
+    } else {
+        GroupLayout::DEFAULT
+    };
     let grad_pack_fn = selected_grad_pack_interior_fn();
     let slow = speed == crate::Speed::Slow;
+    let npx = xsize * ysize;
 
     // Distinct quantized XYB triples, palette-capped like the lossless path.
     let mut seen: HashMap<[i32; 3], ()> = HashMap::with_capacity(257);
@@ -1754,7 +1794,7 @@ pub(crate) fn encode_modular_xyb_atlas(
     }
     let use_palette = !seen.is_empty() && seen.len() <= 256;
 
-    write_frame_header_modular_xyb_reference(xsize, ysize, has_alpha, writer);
+    write_frame_header_modular_xyb_reference(xsize, ysize, has_alpha, layout, writer);
 
     let mut section = BitWriter::new();
     // LfChannelDequant: the decoder multiplies each channel by these steps.
@@ -1989,18 +2029,57 @@ pub(crate) fn write_patch_dictionary(
                 tokens.push(Token::new(OFFSET, pack_signed(x as i32 - px as i32)));
                 tokens.push(Token::new(OFFSET, pack_signed(y as i32 - py as i32)));
             }
-            tokens.push(Token::new(BLEND_MODE, 1)); // color = Replace
+            // color = Add (2) or Replace (1)
+            tokens.push(Token::new(BLEND_MODE, if reference.add { 2 } else { 1 }));
             if has_alpha {
                 tokens.push(Token::new(BLEND_MODE, 0)); // alpha = None
             }
         }
     }
-    let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
-    let code_ref = code.as_ref();
-    w.write(1, 0); // patch dictionary entropy stream has no LZ77
-    write_entropy_code(&code_ref, &mut scratch.huffman_pool, w);
-    for token in tokens {
-        write_token(token, &code_ref, w);
+    // Dense text makes the dictionary a real share of the frame (a third of
+    // a text page): race the prefix code against a config-selected rANS code.
+    let mut prefix_bits = BitWriter::new();
+    {
+        let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
+        let code_ref = code.as_ref();
+        prefix_bits.write(1, 0); // patch dictionary entropy stream has no LZ77
+        write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut prefix_bits);
+        for &token in &tokens {
+            write_token(token, &code_ref, &mut prefix_bits);
+        }
+    }
+    let mut ans_bits = BitWriter::new();
+    {
+        let code = crate::entropy::optimize_entropy_code_ac_streams(
+            std::iter::once(tokens.as_slice()),
+            NUM_PATCH_CONTEXTS,
+            &mut scratch.huffman_pool,
+            true,
+            crate::Speed::Slow,
+            None,
+        );
+        let code_ref = code.as_ref();
+        ans_bits.write(1, 0);
+        write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut ans_bits);
+        if code_ref.use_prefix_code {
+            for &token in &tokens {
+                write_token(token, &code_ref, &mut ans_bits);
+            }
+        } else {
+            crate::entropy::write_ans_tokens(
+                &tokens,
+                code_ref.context_map,
+                code_ref.ans_symbols,
+                code_ref.ans_reverse_maps,
+                code_ref.hybrid_uint_configs,
+                &mut ans_bits,
+            );
+        }
+    }
+    if ans_bits.bits_written() < prefix_bits.bits_written() {
+        w.append(&ans_bits);
+    } else {
+        w.append(&prefix_bits);
     }
 }
 
@@ -6457,4 +6536,50 @@ mod constant_channel_tests {
         let plain_map = emit_ct_tree(&plain, &mut plain_tokens);
         assert_eq!(plain_map.values().max(), Some(&11));
     }
+}
+
+/// Glyph atlas on the default XYB lattice, coded by the full lossless
+/// machinery (learned tree, palettes, RCT search).
+pub(crate) fn encode_modular_xyb_atlas_tree(
+    ch: &[Vec<i32>; 3],
+    xsize: usize,
+    ysize: usize,
+    alpha: Option<&AlphaPlane>,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    let Ok(mut atlas) = Image3Si::try_new(xsize, ysize) else {
+        return false;
+    };
+    // The core takes YCoCg planes (the lossless front end applies RCT 6) and
+    // searches the other transforms from there.
+    for y in 0..ysize {
+        for x in 0..xsize {
+            let i = y * xsize + x;
+            let (a, b, c) = forward_ycocg(ch[0][i], ch[1][i], ch[2][i]);
+            atlas.plane_row_mut(0, y)[x] = a;
+            atlas.plane_row_mut(1, y)[x] = b;
+            atlas.plane_row_mut(2, y)[x] = c;
+        }
+    }
+    encode_frame_lossless_core(
+        &atlas,
+        alpha,
+        14,
+        false,
+        3,
+        speed,
+        crate::DecodingSpeed::Slow,
+        pool,
+        scratch,
+        ModularFrameKind::XybReferenceOnly {
+            width: xsize,
+            height: ysize,
+        },
+        false,
+        writer,
+    );
+    true
 }

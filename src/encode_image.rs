@@ -291,10 +291,12 @@ pub struct EncodeConfig {
     /// For lossy (`!lossless`) encoding, `true` selects 2-pass progressive
     /// VarDCT (equivalent to `progressive_passes = Some(2)`).
     pub progressive: bool,
-    /// Detect exact repeated, 16x16-aligned regions and encode them through the
-    /// JPEG XL patch dictionary. Supported for both lossless Modular and lossy
-    /// VarDCT encoding. The encoder measures the complete normal and patched
-    /// representations and keeps patches only when they reduce the final rate.
+    /// Encode repeated content through the JPEG XL patch dictionary: glyphs
+    /// and other small marks on flat backgrounds at any position, and
+    /// repeated grid-aligned tiles. Supported for both lossless Modular and
+    /// lossy VarDCT encoding. Lossless keeps patches only when they reduce
+    /// the final size; lossy takes a plan on its coverage, since the patched
+    /// frame is also the sharper one, and photographic content finds none.
     pub patches: bool,
     /// Experimental: detect thin curvilinear structures (wires, veins, ink
     /// lines) and code them as JPEG XL splines next to the lossy VarDCT image.

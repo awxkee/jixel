@@ -157,6 +157,47 @@ impl RenderPlan {
                 }
             }
         }
+        if let Some((x0, y0, x1, y1)) = self.bounds {
+            let bx0 = x0 / 8;
+            let by0 = y0 / 8;
+            let bw = x1 / 8 - bx0 + 1;
+            let bh = y1 / 8 - by0 + 1;
+            // Bound the dense counters by the existing coverage allocation.
+            if bw * bh <= coverage.len() && coverage.len() >= 256 {
+                let mut offsets = vec![0usize; bw * bh];
+                for &(cell, _) in &coverage {
+                    let local = (cell / blocks_w - by0) * bw + cell % blocks_w - bx0;
+                    offsets[local] += 1;
+                }
+                let mut tiles = Vec::new();
+                let mut end = 0;
+                for (local, count) in offsets.iter_mut().enumerate() {
+                    let start = end;
+                    end += *count;
+                    if *count != 0 {
+                        tiles.push(Tile {
+                            cell: (local / bw + by0) * blocks_w + local % bw + bx0,
+                            start,
+                            end,
+                        });
+                    }
+                    *count = start;
+                }
+                let mut sample_indices = vec![0usize; coverage.len()];
+                // Coverage was emitted in sample order: stable scatter keeps
+                // exactly the original sample order within every tile.
+                for (cell, index) in coverage {
+                    let local = (cell / blocks_w - by0) * bw + cell % blocks_w - bx0;
+                    sample_indices[offsets[local]] = index;
+                    offsets[local] += 1;
+                }
+                return TiledSpline {
+                    plan: self,
+                    tiles,
+                    sample_indices,
+                };
+            }
+        }
         // The sample index is a secondary key: each pixel sees additions in
         // decoder order even though different blocks can be rendered separately.
         coverage.sort_unstable();
@@ -289,6 +330,80 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tile_binning_preserves_sorted_coverage_and_sample_order() {
+        let ctx = EncodingContext::default();
+        // Exercise the threshold, a nonzero tile origin, clipped edge tiles,
+        // empty cells inside dense bins, and a large sparse bounding rectangle.
+        for (count, sparse) in [
+            (0, false),
+            (255, false),
+            (256, false),
+            (257, false),
+            (257, true),
+        ] {
+            let width = 263usize;
+            let blocks_w = width.div_ceil(8);
+            let mut plan = RenderPlan {
+                samples: Vec::new(),
+                bounds: None,
+                width,
+                row: ctx.spline_render_row,
+            };
+            for i in 0..count {
+                let (x, y) = if i % 2 == 0 {
+                    if sparse { (8, 8) } else { (240, 32) }
+                } else if sparse {
+                    (256, 576)
+                } else {
+                    (256, 48)
+                };
+                let (x1, y1) = ((x + 8).min(width), y + 1);
+                plan.samples.push(Sample {
+                    position: Point::new(x as f32, y as f32),
+                    color: [1.0; 3],
+                    inv_sigma: 1.0,
+                    amp: 1.0,
+                    window: (x, x1, y, y1),
+                });
+                plan.bounds = Some(match plan.bounds {
+                    None => (x, y, x1 - 1, y1 - 1),
+                    Some(b) => (b.0.min(x), b.1.min(y), b.2.max(x1 - 1), b.3.max(y1 - 1)),
+                });
+            }
+            // The original representation is sorted by (image block, sample).
+            let mut expected = Vec::new();
+            for (index, sample) in plan.samples.iter().enumerate() {
+                let (x0, x1, y0, y1) = sample.window;
+                for by in y0 / 8..=(y1 - 1) / 8 {
+                    for bx in x0 / 8..=(x1 - 1) / 8 {
+                        expected.push((by * blocks_w + bx, index));
+                    }
+                }
+            }
+            expected.sort_unstable();
+            if let Some((x0, y0, x1, y1)) = plan.bounds {
+                let cells = (x1 / 8 - x0 / 8 + 1) * (y1 / 8 - y0 / 8 + 1);
+                assert_eq!(cells > expected.len(), sparse);
+            }
+            let tiled = plan.tiled();
+            let mut actual = Vec::new();
+            let mut end = 0;
+            for tile in &tiled.tiles {
+                assert_eq!(tile.start, end);
+                assert!(tile.start < tile.end);
+                actual.extend(
+                    tiled.sample_indices[tile.start..tile.end]
+                        .iter()
+                        .map(|&i| (tile.cell, i)),
+                );
+                end = tile.end;
+            }
+            assert_eq!(end, tiled.sample_indices.len());
+            assert_eq!(actual, expected, "count={count}, sparse={sparse}");
         }
     }
 
