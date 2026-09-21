@@ -59,10 +59,12 @@ const G: [f32; 7] = [
 fn dot(a: Point<f32>, b: Point<f32>) -> f32 {
     fmla(a.x, b.x, a.y * b.y)
 }
+
 #[inline]
 fn offset(p: Point<f32>, t: Point<f32>, d: f32) -> Point<f32> {
     Point::new(p.x + t.x * d, p.y + t.y * d)
 }
+
 #[inline]
 fn normal(t: Point<f32>) -> Point<f32> {
     Point::new(-t.y, t.x)
@@ -83,6 +85,7 @@ fn sample(data: &[f32], w: usize, h: usize, p: Point<f32>) -> f32 {
 fn profile(data: &[f32], w: usize, h: usize, p: Point<f32>, n: Point<f32>, sigma: f32) -> [f32; 7] {
     std::array::from_fn(|i| sample(data, w, h, offset(p, n, (i as f32 - 3.0) * sigma)))
 }
+
 fn amplitude(values: &[f32; 7]) -> f32 {
     values.iter().zip(G).map(|(&v, g)| v * g).sum::<f32>() / G.iter().map(|g| g * g).sum::<f32>()
 }

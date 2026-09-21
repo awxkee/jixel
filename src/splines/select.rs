@@ -981,7 +981,24 @@ mod tests {
         });
         let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
         let mut results = Vec::new();
-        for threads in [1, 4] {
+        for (duplicates, threads) in [(false, 1), (false, 4), (true, 1), (true, 4)] {
+            let repeated;
+            let candidates = if duplicates {
+                repeated = candidates
+                    .iter()
+                    .map(|candidate| Candidate {
+                        alts: candidate
+                            .alts
+                            .iter()
+                            .flat_map(|alt| [alt.clone(), alt.clone()])
+                            .collect(),
+                        bits_factor: candidate.bits_factor,
+                    })
+                    .collect::<Vec<_>>();
+                &repeated
+            } else {
+                &candidates
+            };
             let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
             let mut residual = image.clone();
             let selected = rd_select(
@@ -990,28 +1007,28 @@ mod tests {
                 3.0,
                 &mut residual,
                 &quant,
-                &candidates,
+                candidates,
                 None,
             )
             .unwrap();
             results.push((selected, residual));
         }
-        let [(a, ar), (b, br)] = results.as_slice() else {
-            unreachable!()
-        };
-        assert_eq!(a.splines.len(), b.splines.len());
+        let (a, ar) = &results[0];
         assert!(a.splines.len() < candidates.len());
-        for (a, b) in a.splines.iter().zip(&b.splines) {
-            assert_eq!(a.points, b.points);
-            assert_eq!(a.dct, b.dct);
-        }
-        for c in 0..3 {
-            assert!(
-                ar.plane_data(c)
-                    .iter()
-                    .zip(br.plane_data(c))
-                    .all(|(a, b)| a.to_bits() == b.to_bits())
-            );
+        for (b, br) in &results[1..] {
+            assert_eq!(a.splines.len(), b.splines.len());
+            for (a, b) in a.splines.iter().zip(&b.splines) {
+                assert_eq!(a.points, b.points);
+                assert_eq!(a.dct, b.dct);
+            }
+            for c in 0..3 {
+                assert!(
+                    ar.plane_data(c)
+                        .iter()
+                        .zip(br.plane_data(c))
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
         }
     }
 

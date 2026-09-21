@@ -26,6 +26,7 @@ fn usage() -> ! {
          [--speed slow|fast]"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
+    eprintln!("         [--patches | --no-patches] (override the speed preset)");
     std::process::exit(2);
 }
 
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
     let mut splines = false;
+    let mut patches = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -71,6 +73,10 @@ fn main() -> ExitCode {
             }
             "--splines" => {
                 splines = true;
+                i += 1;
+            }
+            "--patches" | "--no-patches" => {
+                patches = Some(args[i] == "--patches");
                 i += 1;
             }
             "--lossless" => {
@@ -118,6 +124,11 @@ fn main() -> ExitCode {
         .with_num_threads(threads.max(1))
         .with_speed(speed)
         .with_splines(splines);
+    let cfg = if let Some(patches) = patches {
+        cfg.with_patches(patches)
+    } else {
+        cfg
+    };
     let start = Instant::now();
     let data = match jixel::encode_image(rgb.as_raw(), width, height, &cfg) {
         Ok(d) => d,
