@@ -1707,14 +1707,18 @@ fn encode_vardct_variant(
                     next_base = Some(t.base);
                 }
                 if let Some(t) = tiles8 {
-                    let source = next_base.as_ref().unwrap_or(&base);
-                    let (atlas8, mut refs8) =
-                        crate::patches::pack_lossy_atlas_sized(source, t.groups, 8, PATCH_REF_ID);
-                    tile_atlas = Some(match tile_atlas {
-                        Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
-                        None => atlas8,
-                    });
-                    tile_refs.extend(refs8);
+                    let (reused, groups8) =
+                        crate::patches::reuse_tile_quadrants(&base, &tile_refs, t.groups);
+                    tile_refs.extend(reused);
+                    if !groups8.is_empty() {
+                        let (atlas8, mut refs8) =
+                            crate::patches::pack_lossy_atlas_sized(&base, groups8, 8, PATCH_REF_ID);
+                        tile_atlas = Some(match tile_atlas {
+                            Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
+                            None => atlas8,
+                        });
+                        tile_refs.extend(refs8);
+                    }
                     next_base = Some(t.base);
                 }
                 let tile_atlas = tile_atlas.expect("covered > 0");
@@ -1968,13 +1972,18 @@ fn encode_vardct_variant(
             references.extend(vardct_refs);
         }
         if let Some(t) = tiles8 {
-            let (atlas8, mut refs8) =
-                crate::patches::pack_lossy_atlas_sized(&base, t.groups, 8, PATCH_REF_ID);
-            vardct_atlas = Some(match vardct_atlas {
-                Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
-                None => atlas8,
-            });
-            references.extend(refs8);
+            let (reused, groups8) =
+                crate::patches::reuse_tile_quadrants(&xyb, &references, t.groups);
+            references.extend(reused);
+            if !groups8.is_empty() {
+                let (atlas8, mut refs8) =
+                    crate::patches::pack_lossy_atlas_sized(&xyb, groups8, 8, PATCH_REF_ID);
+                vardct_atlas = Some(match vardct_atlas {
+                    Some(top) => crate::patches::stack_atlases(top, atlas8, &mut refs8),
+                    None => atlas8,
+                });
+                references.extend(refs8);
+            }
             base = t.base;
         }
         if let Some(atlas) = vardct_atlas {

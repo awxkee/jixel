@@ -62,6 +62,36 @@ fn hash_tile(linear: &Image3F, x0: usize, y0: usize, tile: usize) -> u64 {
     h
 }
 
+/// Reuse the full hash of the most recent solid tile in this tile row.
+/// Bitwise tests preserve the original treatment of signed zero and NaNs.
+fn hash_tile_cached(
+    image: &Image3F,
+    x: usize,
+    y: usize,
+    tile: usize,
+    cache: &mut Option<([u32; 3], u64)>,
+) -> (u64, bool) {
+    let colors: [u32; 3] = std::array::from_fn(|c| image.plane_row(c, y)[x].to_bits());
+    let solid = [1, 0, 2].into_iter().all(|c| {
+        (y..y + tile).all(|dy| {
+            image.plane_row(c, dy)[x..x + tile]
+                .iter()
+                .all(|v| v.to_bits() == colors[c])
+        })
+    });
+    if solid
+        && let Some((previous, hash)) = cache
+        && *previous == colors
+    {
+        return (*hash, true);
+    }
+    let hash = hash_tile(image, x, y, tile);
+    if solid {
+        *cache = Some((colors, hash));
+    }
+    (hash, solid)
+}
+
 /// Mean absolute deviation of a tile, summed over channels: a cheap stand-in
 /// for what the tile costs to code as ordinary blocks.
 fn tile_energy(img: &Image3F, x0: usize, y0: usize, tile: usize) -> f32 {
@@ -91,7 +121,7 @@ const MIN_PATCH_ENERGY: f32 = 0.017;
 const MIN_PATCH_OCCURRENCES: usize = 5;
 
 /// Most tile groups one plan keeps.
-const MAX_PATCH_GROUPS: usize = 4096;
+const MAX_PATCH_GROUPS: usize = 16384;
 
 #[cfg(test)]
 pub(crate) fn find_lossy_patches(
@@ -107,10 +137,15 @@ pub(crate) fn find_lossy_patches(
 static NEAR_TILE_UNIT: [f32; 3] = [0.0005, 0.0035, 0.006];
 
 const NEAR_TILE_BUCKET_SCAN: usize = 24;
+/// Textured tiles (at most this share of flat luma samples) may differ from
+/// their leader by this many tolerances per sample; the RMS bound stays one.
+const NEAR_TILE_MAX_FLAT_SHARE: f32 = 0.55;
+const NEAR_TILE_TEXTURED_PEAK: f32 = 4.0;
 
-/// `near > 0` also groups tiles whose every sample is within
-/// `near * NEAR_TILE_UNIT` of a group's first tile; they are replaced by that
-/// tile, so the substitution error is bounded per sample.
+/// `near > 0` also groups tiles close to a group's first tile: per channel the
+/// RMS difference is within `near * NEAR_TILE_UNIT` and every sample within
+/// that (flat tiles) or a few times that (textured tiles). They are replaced
+/// by the first tile, so the substitution error is bounded per sample.
 pub(crate) fn find_lossy_patches_sized(
     linear: &Image3F,
     tile: usize,
@@ -128,24 +163,41 @@ pub(crate) fn find_lossy_patches_sized(
     // Tile rows are independent; the merge below is over tile counts, not
     // pixels, so it stays negligible.
     let rows = pool.steal_map(scratch, tiles_y, |ty, _scratch| {
+        let mut cache = None;
         (0..tiles_x)
-            .map(|tx| hash_tile(linear, tx * tile, ty * tile, tile))
-            .collect::<Vec<u64>>()
+            .map(|tx| hash_tile_cached(linear, tx * tile, ty * tile, tile, &mut cache))
+            .unzip::<_, _, Vec<_>, Vec<_>>()
     });
-    let mut buckets: HashMap<u64, Vec<(usize, usize)>> =
-        HashMap::with_capacity(tiles_x.saturating_mul(tiles_y));
-    for (ty, row) in rows.into_iter().enumerate() {
-        for (tx, hash) in row.into_iter().enumerate() {
-            buckets
-                .entry(hash)
-                .or_default()
-                .push((tx * tile, ty * tile));
-        }
-    }
-
+    let solid: Vec<bool> = rows
+        .iter()
+        .flat_map(|(_, flags)| flags.iter().copied())
+        .collect();
+    let candidates: Vec<Vec<(usize, usize)>> = {
+        let mut hashes: Vec<(u64, usize)> = rows
+            .into_iter()
+            .enumerate()
+            .flat_map(|(ty, (row, _))| {
+                row.into_iter()
+                    .enumerate()
+                    .map(move |(tx, hash)| (hash, ty * tiles_x + tx))
+            })
+            .collect();
+        // Position breaks equal-hash ties to preserve the raster-order source.
+        hashes.sort_unstable();
+        hashes
+            .chunk_by(|a, b| a.0 == b.0)
+            .filter(|bucket| bucket.len() >= MIN_PATCH_OCCURRENCES)
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|&(_, i)| ((i % tiles_x) * tile, (i / tiles_x) * tile))
+                    .collect()
+            })
+            .collect()
+    };
     let mut groups = Vec::new();
     let min_occurrences = MIN_PATCH_OCCURRENCES;
-    for candidates in buckets.into_values() {
+    for candidates in candidates {
         if candidates.len() < min_occurrences {
             continue;
         }
@@ -153,6 +205,16 @@ pub(crate) fn find_lossy_patches_sized(
         for pos in candidates {
             let matching = exact_groups.iter().position(|group| {
                 let first = group[0];
+                // Both tiles were proved constant across all three planes.
+                // Compare their samples with the original float equality, so
+                // NaN remains unequal and ordinary hash collisions stay safe.
+                if solid[(first.1 / tile) * tiles_x + first.0 / tile]
+                    && solid[(pos.1 / tile) * tiles_x + pos.0 / tile]
+                {
+                    return (0..3).all(|c| {
+                        linear.plane_row(c, first.1)[first.0] == linear.plane_row(c, pos.1)[pos.0]
+                    });
+                }
                 (0..3).all(|c| {
                     (0..tile).all(|dy| {
                         linear.plane_row(c, first.1 + dy)[first.0..first.0 + tile]
@@ -188,7 +250,7 @@ pub(crate) fn find_lossy_patches_sized(
         // in buckets 16 tolerances wide. Two grids half a bucket apart: a
         // value on a boundary of one sits mid-bucket in the other.
         let cell = tile / 2;
-        let signature = |x0: usize, y0: usize| -> [u64; 2] {
+        let signature = |x0: usize, y0: usize| -> ([u64; 2], [f32; 6]) {
             let mut means = [0f32; 6];
             for cy in 0..2 {
                 for cx in 0..2 {
@@ -211,41 +273,146 @@ pub(crate) fn find_lossy_patches_sized(
                 }
                 means[slot] = sum / (tile * tile) as f32 / (16.0 * tol[c]);
             }
-            [0.0f32, 0.5].map(|shift| {
+            let keys = [0.0f32, 0.5].map(|shift| {
                 let mut h: u64 = 0x9e37_79b9_7f4a_7c15 ^ shift.to_bits() as u64;
                 for m in means {
                     h = (h ^ (m + shift).floor() as i64 as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
                     h ^= h >> 29;
                 }
                 h
-            })
+            });
+            (keys, means)
         };
-        let within = |a: (usize, usize), b: (usize, usize)| -> bool {
+        // An RMS difference within one tolerance bounds a quarter-tile mean
+        // within two and a whole-tile mean within one (means are in units of
+        // 16 tolerances): bucket-mates that fail this cannot match.
+        let may_match = |a: &[f32; 6], b: &[f32; 6]| {
+            a.iter()
+                .zip(b)
+                .enumerate()
+                .all(|(i, (p, q))| (p - q).abs() <= if i < 4 { 2.02 / 16.0 } else { 1.01 / 16.0 })
+        };
+        // Share of luma samples that equal their left neighbor: UI and text
+        // tiles are mostly flat, where a substituted sample shows; texture
+        // masks it.
+        let is_textured = |p: (usize, usize)| -> bool {
+            let flat: usize = (0..tile)
+                .map(|dy| {
+                    linear.plane_row(1, p.1 + dy)[p.0..p.0 + tile]
+                        .windows(2)
+                        .filter(|w| (w[0] - w[1]).abs() <= NEAR_TILE_UNIT[1] * 0.5)
+                        .count()
+                })
+                .sum();
+            flat as f32 <= NEAR_TILE_MAX_FLAT_SHARE * (tile * (tile - 1)) as f32
+        };
+        // Every sample within `peak` tolerances of the leader's and the
+        // channel's RMS difference within one.
+        let within = |a: (usize, usize), b: (usize, usize), peak: f32| -> bool {
+            // Reject shape mismatches before reading whole channels. This is
+            // only a necessary peak check: survivors still need the complete
+            // peak/RMS check below, with the original accumulation order.
+            for c in [1, 0, 2] {
+                for i in 0..8 {
+                    let y = i * tile / 8;
+                    let x = (i * 5 + tile / 2) % tile;
+                    let d = linear.plane_row(c, a.1 + y)[a.0 + x]
+                        - linear.plane_row(c, b.1 + y)[b.0 + x];
+                    if d.abs() > tol[c] * peak {
+                        return false;
+                    }
+                }
+            }
             (0..3).all(|c| {
+                let peak = tol[c] * peak;
+                let budget = tol[c] * tol[c] * (tile * tile) as f32;
+                let mut energy = 0.0f32;
                 (0..tile).all(|dy| {
                     let ra = &linear.plane_row(c, a.1 + dy)[a.0..a.0 + tile];
                     let rb = &linear.plane_row(c, b.1 + dy)[b.0..b.0 + tile];
-                    ra.iter().zip(rb).all(|(p, q)| (p - q).abs() <= tol[c])
+                    // Most candidates fail on their first samples.
+                    ra.iter().zip(rb).all(|(p, q)| {
+                        let d = p - q;
+                        energy += d * d;
+                        d.abs() <= peak && energy <= budget
+                    })
                 })
             })
         };
-        let exact_count = groups.len();
         let mut table: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (gi, g) in groups.iter().enumerate() {
-            for key in signature(g[0].0, g[0].1) {
-                table.entry(key).or_default().push(gi);
+        let peak_of = |p: (usize, usize)| {
+            if is_textured(p) {
+                NEAR_TILE_TEXTURED_PEAK
+            } else {
+                1.0
+            }
+        };
+        let mut peaks: Vec<f32> = Vec::with_capacity(groups.len());
+        let mut means: Vec<[f32; 6]> = Vec::with_capacity(groups.len());
+        let exact_groups = std::mem::take(&mut groups);
+        groups.reserve(exact_groups.len());
+        for g in exact_groups {
+            let (keys, mean) = signature(g[0].0, g[0].1);
+            // Exact members all equal this source, so one comparison proves
+            // the bound for the entire group. Leaders never change; matches
+            // cannot accumulate error through a chain of representatives.
+            let found = keys.iter().find_map(|key| {
+                table
+                    .get(key)?
+                    .iter()
+                    .take(NEAR_TILE_BUCKET_SCAN)
+                    .copied()
+                    .filter(|&gi| may_match(&means[gi], &mean))
+                    .find(|&gi| within(groups[gi][0], g[0], peaks[gi]))
+            });
+            if let Some(gi) = found {
+                groups[gi].extend(g);
+            } else {
+                let gi = groups.len();
+                peaks.push(peak_of(g[0]));
+                means.push(mean);
+                for key in keys {
+                    table.entry(key).or_default().push(gi);
+                }
+                groups.push(g);
             }
         }
+        let exact_count = groups.len();
+        // Descriptor construction is independent of the deterministic greedy
+        // matching below, so only this image-reading work runs in parallel.
+        let features = (pool.num_threads() > 1 && tiles_x * tiles_y >= 4096).then(|| {
+            pool.steal_map(scratch, tiles_y, |ty, _| {
+                (0..tiles_x)
+                    .map(|tx| {
+                        let pos = (tx * tile, ty * tile);
+                        if taken[ty * tiles_x + tx]
+                            || tile_energy(linear, pos.0, pos.1, tile) < MIN_PATCH_ENERGY
+                        {
+                            None
+                        } else {
+                            Some(signature(pos.0, pos.1))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
                 if taken[ty * tiles_x + tx] {
                     continue;
                 }
                 let pos = (tx * tile, ty * tile);
-                if tile_energy(linear, pos.0, pos.1, tile) < MIN_PATCH_ENERGY {
-                    continue;
-                }
-                let keys = signature(pos.0, pos.1);
+                let (keys, mean) = if let Some(rows) = &features {
+                    let Some(feature) = rows[ty][tx] else {
+                        continue;
+                    };
+                    feature
+                } else {
+                    if tile_energy(linear, pos.0, pos.1, tile) < MIN_PATCH_ENERGY {
+                        continue;
+                    }
+                    signature(pos.0, pos.1)
+                };
                 // Textured content fills buckets with unrelated leaders; a
                 // bounded scan keeps the pass linear.
                 let found = keys.iter().find_map(|key| {
@@ -254,7 +421,8 @@ pub(crate) fn find_lossy_patches_sized(
                         .iter()
                         .take(NEAR_TILE_BUCKET_SCAN)
                         .copied()
-                        .find(|&gi| within(groups[gi][0], pos))
+                        .filter(|&gi| may_match(&means[gi], &mean))
+                        .find(|&gi| within(groups[gi][0], pos, peaks[gi]))
                 });
                 match found {
                     Some(gi) => groups[gi].push(pos),
@@ -269,6 +437,8 @@ pub(crate) fn find_lossy_patches_sized(
                         }
                         if registered {
                             groups.push(vec![pos]);
+                            peaks.push(peak_of(pos));
+                            means.push(mean);
                         }
                     }
                 }
@@ -289,6 +459,11 @@ pub(crate) fn find_lossy_patches_sized(
         return None;
     }
 
+    // Preserve the selected source at index zero; order the remaining
+    // occurrences spatially after concatenating exact groups.
+    for g in &mut groups {
+        g[1..].sort_unstable_by_key(|&(x, y)| (y, x));
+    }
     let mut base = linear.clone();
     for positions in &groups {
         for &(x, y) in positions {
@@ -339,12 +514,215 @@ pub(crate) fn stack_atlases(
     atlas
 }
 
+/// 8x8 groups whose tile equals an aligned quadrant of an already packed
+/// 16x16 tile need no atlas pixels: they become entries pointing into that
+/// tile. Returns those entries and the groups that still need packing.
+/// `image` must hold both the 16x16 sources and the 8x8 tiles untouched.
+pub(crate) fn reuse_tile_quadrants(
+    image: &Image3F,
+    packed: &[PatchReference],
+    groups: Vec<Vec<(usize, usize)>>,
+) -> (Vec<PatchReference>, Vec<Vec<(usize, usize)>>) {
+    const HALF: usize = PATCH_TILE / 2;
+    let same = |a: (usize, usize), b: (usize, usize)| {
+        (0..3).all(|c| {
+            (0..HALF).all(|dy| {
+                image.plane_row(c, a.1 + dy)[a.0..a.0 + HALF]
+                    == image.plane_row(c, b.1 + dy)[b.0..b.0 + HALF]
+            })
+        })
+    };
+    struct Quadrant {
+        /// Index into `packed` and the quadrant's offset inside that tile.
+        tile: usize,
+        offset: (usize, usize),
+        source: (usize, usize),
+    }
+    let mut quadrants: HashMap<u64, Vec<Quadrant>> = HashMap::new();
+    for (index, reference) in packed.iter().enumerate() {
+        if reference.add || reference.width != PATCH_TILE || reference.height != PATCH_TILE {
+            continue;
+        }
+        let (sx, sy) = reference.positions[0];
+        for (qx, qy) in [(0, 0), (HALF, 0), (0, HALF), (HALF, HALF)] {
+            let source = (sx + qx, sy + qy);
+            quadrants
+                .entry(hash_tile(image, source.0, source.1, HALF))
+                .or_default()
+                .push(Quadrant {
+                    tile: index,
+                    offset: (qx, qy),
+                    source,
+                });
+        }
+    }
+    let mut reused = Vec::new();
+    let mut remaining = Vec::with_capacity(groups.len());
+    for positions in groups {
+        let first = positions[0];
+        let found = quadrants
+            .get(&hash_tile(image, first.0, first.1, HALF))
+            .and_then(|candidates| candidates.iter().find(|q| same(q.source, first)));
+        match found {
+            Some(q) => reused.push(PatchReference {
+                atlas_x: packed[q.tile].atlas_x + q.offset.0,
+                atlas_y: packed[q.tile].atlas_y + q.offset.1,
+                width: HALF,
+                height: HALF,
+                ref_frame: packed[q.tile].ref_frame,
+                add: false,
+                positions,
+            }),
+            None => remaining.push(positions),
+        }
+    }
+    (reused, remaining)
+}
+
+/// Visit order that keeps look-alike tiles next to each other in the atlas:
+/// a greedy nearest-neighbour chain over each tile's mean X, Y, B.
+fn similarity_order(linear: &Image3F, groups: &[Vec<(usize, usize)>], tile: usize) -> Vec<usize> {
+    let means: Vec<[f32; 3]> = groups
+        .iter()
+        .map(|g| {
+            let (x0, y0) = g[0];
+            std::array::from_fn(|c| {
+                (0..tile)
+                    .map(|dy| {
+                        linear.plane_row(c, y0 + dy)[x0..x0 + tile]
+                            .iter()
+                            .sum::<f32>()
+                    })
+                    .sum::<f32>()
+                    / (tile * tile) as f32
+            })
+        })
+        .collect();
+    if means.len() > 256 {
+        return morton_similarity_order(&means);
+    }
+    greedy_similarity_order(&means)
+}
+
+fn greedy_similarity_order(means: &[[f32; 3]]) -> Vec<usize> {
+    // X spans a fraction of the Y and B ranges.
+    let distance = |a: &[f32; 3], b: &[f32; 3]| {
+        let d = [(a[0] - b[0]) * 8.0, a[1] - b[1], a[2] - b[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    let mut left: Vec<usize> = (1..means.len()).collect();
+    let mut order = Vec::with_capacity(means.len());
+    let mut current = 0;
+    order.push(current);
+    while !left.is_empty() {
+        let (slot, _) = left
+            .iter()
+            .enumerate()
+            .map(|(slot, &i)| (slot, distance(&means[current], &means[i])))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("non-empty");
+        current = left.swap_remove(slot);
+        order.push(current);
+    }
+    order
+}
+
+/// A spatial sort followed by a bounded local nearest-neighbor chain.
+/// Linked neighbors keep removals O(1); each step compares at most 64 points.
+fn morton_similarity_order(means: &[[f32; 3]]) -> Vec<usize> {
+    let n = means.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let scaled: Vec<[f32; 3]> = means.iter().map(|m| [m[0] * 8.0, m[1], m[2]]).collect();
+    let lo: [f32; 3] =
+        std::array::from_fn(|c| scaled.iter().map(|m| m[c]).fold(f32::INFINITY, f32::min));
+    let hi: [f32; 3] = std::array::from_fn(|c| {
+        scaled
+            .iter()
+            .map(|m| m[c])
+            .fold(f32::NEG_INFINITY, f32::max)
+    });
+    let span = (0..3)
+        .map(|c| hi[c] - lo[c])
+        .fold(0.0f32, f32::max)
+        .max(1e-20);
+    let key = |i: usize| {
+        let q: [u32; 3] =
+            std::array::from_fn(|c| (((scaled[i][c] - lo[c]) / span * 1023.0) as u32).min(1023));
+        let mut result = 0;
+        for bit in 0..10 {
+            for c in 0..3 {
+                result |= ((q[c] >> bit) & 1) << (3 * bit + c);
+            }
+        }
+        result
+    };
+    let mut spatial: Vec<usize> = (0..n).collect();
+    spatial.sort_unstable_by_key(|&i| (key(i), i));
+    let mut slot = vec![0; n];
+    for (s, &i) in spatial.iter().enumerate() {
+        slot[i] = s;
+    }
+    let mut prev: Vec<usize> = (0..n).map(|s| if s == 0 { n } else { s - 1 }).collect();
+    let mut next: Vec<usize> = (0..n).map(|s| s + 1).collect();
+    let mut current = 0;
+    let mut order = Vec::with_capacity(n);
+    while order.len() < n {
+        order.push(current);
+        let s = slot[current];
+        let (mut left, mut right) = (prev[s], next[s]);
+        if left != n {
+            next[left] = right;
+        }
+        if right != n {
+            prev[right] = left;
+        }
+        if order.len() == n {
+            break;
+        }
+        let mut best = (f32::INFINITY, usize::MAX);
+        for _ in 0..32 {
+            for candidate in [left, right] {
+                if candidate == n {
+                    continue;
+                }
+                let id = spatial[candidate];
+                let a = means[current];
+                let b = means[id];
+                let d = [(a[0] - b[0]) * 8.0, a[1] - b[1], a[2] - b[2]];
+                let cost = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                if cost.total_cmp(&best.0).then(id.cmp(&best.1)).is_lt() {
+                    best = (cost, id);
+                }
+            }
+            if left != n {
+                left = prev[left];
+            }
+            if right != n {
+                right = next[right];
+            }
+        }
+        current = best.1;
+    }
+    order
+}
+
 pub(crate) fn pack_lossy_atlas_sized(
     linear: &Image3F,
     groups: Vec<Vec<(usize, usize)>>,
     tile: usize,
     ref_frame: u32,
 ) -> (Image3F, Vec<PatchReference>) {
+    let mut groups = groups;
+    if groups.len() > 2 {
+        let order = similarity_order(linear, &groups, tile);
+        let mut taken: Vec<Option<Vec<(usize, usize)>>> = groups.into_iter().map(Some).collect();
+        groups = order
+            .into_iter()
+            .map(|i| taken[i].take().expect("once"))
+            .collect();
+    }
     let atlas_cols = groups.len().min(256 / tile);
     let atlas_rows = groups.len().div_ceil(atlas_cols);
     let mut atlas = Image3F::new(atlas_cols * tile, atlas_rows * tile);
@@ -373,6 +751,7 @@ pub(crate) fn pack_lossy_atlas_sized(
 }
 
 pub(crate) const PATCH_TILE: usize = 16;
+
 pub(crate) const PATCH_REF_ID: u32 = 3;
 /// Reference slot for the modular atlas; the VarDCT atlas keeps slot 3, so a
 /// hybrid plan can emit both and route each dictionary entry to either.
@@ -1256,6 +1635,153 @@ fn sort_patch_groups(groups: &mut [Vec<(usize, usize)>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_solid_hashes_preserve_float_bits_and_detect_nonuniform_tiles() {
+        for tile in [8, 16] {
+            // Nonzero padding checks that classification respects the tile bounds.
+            let mut image = Image3F::new(tile + 3, tile + 2);
+            for c in 0..3 {
+                for y in 0..image.ysize() {
+                    image.plane_row_mut(c, y).fill(0.75);
+                }
+            }
+            let mut cache = None;
+            for bits in [
+                [0u32; 3],
+                [0u32; 3],
+                [0x80000000, 0, 0],
+                [0x3e800000, 0x3f000000, 0x3f400000],
+                [0x7fc00001, 0, 0],
+            ] {
+                for c in 0..3 {
+                    for y in 1..tile + 1 {
+                        image.plane_row_mut(c, y)[1..tile + 1].fill(f32::from_bits(bits[c]));
+                    }
+                }
+                let (hash, solid) = hash_tile_cached(&image, 1, 1, tile, &mut cache);
+                assert!(solid);
+                assert_eq!(hash, hash_tile(&image, 1, 1, tile));
+                assert_eq!(hash_tile_cached(&image, 1, 1, tile, &mut cache).0, hash);
+                for c in 0..3 {
+                    for (x, y) in [
+                        (0, 0),
+                        (tile - 1, 0),
+                        (0, tile - 1),
+                        (tile - 1, tile - 1),
+                        (tile / 2, tile / 2),
+                    ] {
+                        image.plane_row_mut(c, y + 1)[x + 1] = f32::from_bits(bits[c] ^ 1);
+                        let (actual, solid) = hash_tile_cached(&image, 1, 1, tile, &mut cache);
+                        assert!(!solid, "missed change in channel {c} at ({x}, {y})");
+                        assert_eq!(actual, hash_tile(&image, 1, 1, tile));
+                        image.plane_row_mut(c, y + 1)[x + 1] = f32::from_bits(bits[c]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn near_patch_plan_is_identical_across_thread_counts() {
+        let tile = 16;
+        let mut img = Image3F::new(1024, 1024);
+        for ty in 0..64 {
+            for tx in 0..64 {
+                let id = ty * 64 + tx;
+                for c in 0..3 {
+                    for y in 0..tile {
+                        for x in 0..tile {
+                            img.plane_row_mut(c, ty * tile + y)[tx * tile + x] =
+                                ((x * 7 + y * 3 + id % 23) % 17) as f32 * 0.025
+                                    + (id % 127) as f32 * NEAR_TILE_UNIT[c] / 254.0;
+                        }
+                    }
+                }
+            }
+        }
+        let mut scratch = CoderScratch::default();
+        let serial =
+            find_lossy_patches_sized(&img, tile, 1.0, &ThreadPool::new(1), &mut scratch).unwrap();
+        let parallel =
+            find_lossy_patches_sized(&img, tile, 1.0, &ThreadPool::new(4), &mut scratch).unwrap();
+        assert_eq!(serial.groups, parallel.groups);
+        for c in 0..3 {
+            assert_eq!(serial.base.plane_data(c), parallel.base.plane_data(c));
+        }
+    }
+
+    #[test]
+    fn exact_group_consolidation_does_not_chain_tolerance() {
+        let pool = ThreadPool::new(2);
+        let mut scratch = CoderScratch::default();
+        let tile = 16;
+        let mut img = Image3F::new(15 * tile, tile);
+        for tx in 0..15 {
+            for c in 0..3 {
+                for y in 0..tile {
+                    for x in 0..tile {
+                        img.plane_row_mut(c, y)[tx * tile + x] = if x < 8 { 0.1 } else { 0.5 };
+                        if c == 1 {
+                            img.plane_row_mut(c, y)[tx * tile + x] +=
+                                (tx / 5) as f32 * NEAR_TILE_UNIT[1] * 0.75;
+                        }
+                    }
+                }
+            }
+        }
+        let base = find_lossy_patches_sized(&img, tile, 0.0, &pool, &mut scratch).unwrap();
+        assert_eq!(base.groups.len(), 3);
+        let merged = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).unwrap();
+        assert_eq!(merged.groups.len(), 2);
+        assert_eq!(merged.groups[0].len(), 10);
+        assert_eq!(merged.groups[1].len(), 5);
+        for group in &merged.groups {
+            let (sx, sy) = group[0];
+            for &(px, py) in group {
+                for c in 0..3 {
+                    for y in 0..tile {
+                        for x in 0..tile {
+                            assert!(
+                                (img.plane_row(c, sy + y)[sx + x]
+                                    - img.plane_row(c, py + y)[px + x])
+                                    .abs()
+                                    <= NEAR_TILE_UNIT[c]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for _ in 0..4 {
+            let repeated = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).unwrap();
+            assert_eq!(merged.groups, repeated.groups);
+        }
+    }
+
+    #[test]
+    fn morton_order_is_complete_and_deterministic_with_duplicate_points() {
+        assert!(morton_similarity_order(&[]).is_empty());
+        assert_eq!(morton_similarity_order(&[[0.0; 3]]), [0]);
+        for n in [2, 64, 257, 4096] {
+            let points: Vec<[f32; 3]> = (0..n)
+                .map(|i| {
+                    [
+                        ((i * 17) % 73) as f32 / 1024.0,
+                        ((i * 11) % 29) as f32 / 32.0,
+                        ((i * 7) % 13) as f32 / 16.0,
+                    ]
+                })
+                .collect();
+            for points in [points, vec![[0.125; 3]; n]] {
+                let order = morton_similarity_order(&points);
+                assert_eq!(order[0], 0);
+                assert_eq!(order, morton_similarity_order(&points));
+                let mut sorted = order;
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            }
+        }
+    }
 
     fn assert_glyph_reconstruction(img: &Image3Si, plan: &LosslessPatches) {
         let mut restored = plan.base.clone();
@@ -1502,10 +2028,113 @@ mod tests {
                 find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
             assert_eq!(again.groups, plan.groups);
         }
-        // A nudge beyond the tolerance stays out.
-        img.plane_row_mut(1, 3)[5 * tile + 3] += NEAR_TILE_UNIT[1] * 2.0;
+        // The tile is noise, i.e. textured: one sample may sit a few tolerances
+        // off as long as the RMS bound holds ...
+        img.plane_row_mut(1, 3)[4 * tile + 3] += NEAR_TILE_UNIT[1] * 3.0;
+        let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
+        assert_eq!(plan.groups[0].len(), 6);
+        // ... but not past the textured peak.
+
+        img.plane_row_mut(1, 3)[5 * tile + 3] += NEAR_TILE_UNIT[1] * 6.0;
         let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
         assert_eq!(plan.groups[0].len(), 5);
+    }
+
+    #[test]
+    fn flat_tiles_keep_the_strict_near_peak() {
+        let pool = ThreadPool::new(2);
+        let mut scratch = CoderScratch::default();
+        let tile = PATCH_TILE;
+        // Six copies of a two-tone (UI-like, mostly flat) tile; one carries a
+        // single sample three tolerances off, which texture would have hidden.
+        let mut img = Image3F::new(6 * tile, tile);
+        for tx in 0..6 {
+            for c in 1..3 {
+                for dy in 0..tile {
+                    let row = img.plane_row_mut(c, dy);
+                    row[tx * tile..tx * tile + tile / 2].fill(0.2);
+                    row[tx * tile + tile / 2..(tx + 1) * tile].fill(0.6);
+                }
+            }
+        }
+        img.plane_row_mut(1, 5)[5 * tile + 2] += NEAR_TILE_UNIT[1] * 3.0;
+        let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("exact");
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].len(), 5);
+        // Within the strict peak it does join.
+        img.plane_row_mut(1, 5)[5 * tile + 2] -= NEAR_TILE_UNIT[1] * 2.5;
+        let plan = find_lossy_patches_sized(&img, tile, 1.0, &pool, &mut scratch).expect("near");
+        assert_eq!(plan.groups[0].len(), 6);
+    }
+
+    #[test]
+    fn quadrants_of_packed_tiles_are_reused() {
+        let tile = PATCH_TILE;
+        let half = tile / 2;
+        // One 16x16 tile whose four quadrants differ, and three 8x8 tiles:
+        // its lower-left quadrant, its upper-right quadrant, and a stranger.
+        let mut img = Image3F::new(4 * tile, 2 * tile);
+        let value = |x: usize, y: usize, c: usize| ((x * 7 + y * 13 + c * 5) % 23) as f32 / 23.0;
+        for c in 0..3 {
+            for y in 0..tile {
+                for x in 0..tile {
+                    img.plane_row_mut(c, y)[x] = value(x, y, c);
+                }
+            }
+            for y in 0..half {
+                for x in 0..half {
+                    img.plane_row_mut(c, tile + y)[x] = value(x, half + y, c);
+                    img.plane_row_mut(c, tile + y)[tile + x] = value(half + x, y, c);
+                    img.plane_row_mut(c, tile + y)[2 * tile + x] = value(x, y, c) * 0.5 + 0.3;
+                }
+            }
+        }
+        let packed = [PatchReference {
+            atlas_x: 32,
+            atlas_y: 48,
+            width: tile,
+            height: tile,
+            ref_frame: PATCH_REF_ID,
+            add: false,
+            positions: vec![(0, 0)],
+        }];
+        let groups = vec![
+            vec![(0, tile), (40, 40)],
+            vec![(tile, tile)],
+            vec![(2 * tile, tile)],
+        ];
+        let (reused, remaining) = reuse_tile_quadrants(&img, &packed, groups);
+        assert_eq!(remaining, vec![vec![(2 * tile, tile)]]);
+        assert_eq!(reused.len(), 2);
+        assert_eq!((reused[0].atlas_x, reused[0].atlas_y), (32, 48 + half));
+        assert_eq!((reused[1].atlas_x, reused[1].atlas_y), (32 + half, 48));
+        for r in &reused {
+            assert_eq!(
+                (r.width, r.height, r.ref_frame, r.add),
+                (half, half, PATCH_REF_ID, false)
+            );
+        }
+        assert_eq!(reused[0].positions, vec![(0, tile), (40, 40)]);
+    }
+
+    #[test]
+    fn atlas_order_keeps_every_group_and_chains_neighbors() {
+        let tile = PATCH_TILE;
+        // Tile brightness 0.9, 0.1, 0.8, 0.2: the chain from the first tile
+        // must visit 0.8 before the dark pair.
+        let mut img = Image3F::new(4 * tile, tile);
+        for (i, level) in [0.9f32, 0.1, 0.8, 0.2].into_iter().enumerate() {
+            for c in 0..3 {
+                for y in 0..tile {
+                    img.plane_row_mut(c, y)[i * tile..(i + 1) * tile].fill(level);
+                }
+            }
+        }
+        let groups: Vec<Vec<(usize, usize)>> = (0..4).map(|i| vec![(i * tile, 0)]).collect();
+        assert_eq!(similarity_order(&img, &groups, tile), [0, 2, 3, 1]);
+        let (_, refs) = pack_lossy_atlas(&img, groups, PATCH_REF_ID);
+        let firsts: Vec<usize> = refs.iter().map(|r| r.positions[0].0 / tile).collect();
+        assert_eq!(firsts, [0, 2, 3, 1]);
     }
 
     fn equal_length_groups() -> Image3F {
@@ -1562,20 +2191,28 @@ mod tests {
             first.windows(2).all(|w| w[0] < w[1]),
             "groups must follow the first occurrence in raster order: {first:?}"
         );
-        // Packing preserves that order in atlas slots and stamps the frame id.
+        // Packing chains look-alike tiles, so slots need not follow the group
+        // order; every group must still get its own slot, in raster order of
+        // the returned entries, with the frame id stamped.
         let (atlas, refs) = pack_lossy_atlas(&img, plan.groups, PATCH_REF_ID);
         assert_eq!((atlas.xsize(), atlas.ysize()), (6 * PATCH_TILE, PATCH_TILE));
         for (i, r) in refs.iter().enumerate() {
             assert_eq!((r.atlas_x, r.atlas_y), (i * PATCH_TILE, 0));
             assert_eq!(r.ref_frame, PATCH_REF_ID);
-            assert_eq!(r.positions[0], first[i]);
         }
+        let mut packed: Vec<(usize, usize)> = refs.iter().map(|r| r.positions[0]).collect();
+        let layout = packed.clone();
+        packed.sort_unstable();
+        assert_eq!(packed, first);
         // Within one process the map is seeded once, so repeats here only guard
         // the sort itself; the raster-order assertion above is what pins the
         // layout across processes.
         for _ in 0..4 {
             let again = find_lossy_patches(&img, &pool, &mut scratch).expect("groups");
             assert_eq!(first, signature(&again));
+            let (_, refs) = pack_lossy_atlas(&img, again.groups, PATCH_REF_ID);
+            let repeat: Vec<(usize, usize)> = refs.iter().map(|r| r.positions[0]).collect();
+            assert_eq!(layout, repeat);
         }
     }
 
