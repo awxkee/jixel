@@ -2847,6 +2847,39 @@ mod encode_smoke_tests {
 
     #[test]
     #[cfg(feature = "splines")]
+    fn splines_join_crossed_grid_lines() {
+        const S: usize = 256;
+        let mut pixels = Vec::with_capacity(S * S * 3);
+        for y in 0..S {
+            for x in 0..S {
+                let mut v = 170.0 + 70.0 * (x + y) as f32 / (2 * S) as f32;
+                if (12..S - 12).contains(&x) && (12..S - 12).contains(&y) {
+                    for axis in [x, y] {
+                        let d = ((axis - 12 + 18) % 36) as f32 - 18.0;
+                        v -= 65.0 * (-0.5 * (d / 0.65).powi(2)).exp();
+                    }
+                }
+                pixels.extend([v as u8, (v * 0.95) as u8, (v * 0.9) as u8]);
+            }
+        }
+        let config = slow_lossy(2.0).with_patches(false).with_num_threads(1);
+        let plain = encode_image(&pixels, S, S, &config).unwrap();
+        let config = config.with_splines(true);
+        let joined = encode_image(&pixels, S, S, &config).unwrap();
+        assert!(
+            joined.len() * 100 < plain.len() * 80,
+            "whole grid lines should save more than isolated fragments: {} vs {}",
+            joined.len(),
+            plain.len()
+        );
+        assert_eq!(
+            joined,
+            encode_image(&pixels, S, S, &config.with_num_threads(4)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
     fn splines_are_inert_without_lines() {
         const S: usize = 128;
         let mut pixels = vec![0u8; S * S * 3];
@@ -2891,6 +2924,46 @@ mod encode_smoke_tests {
         let plain = encode_image(&pixels, S, S, &slow_lossy(3.0).with_patches(true)).unwrap();
         let with = encode_image(&pixels, S, S, &both).unwrap();
         assert!(with.len() < plain.len());
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn splines_cross_repeated_tiles() {
+        // Graph paper with a curve. The grid period does not divide the tile
+        // size, so tiles repeat only here and there and every line crosses
+        // some; the noise band keeps the glyph detector away.
+        const S: usize = 256;
+        const PERIOD: f32 = 12.3;
+        let rule = |t: usize| {
+            let d = ((t as f32 + PERIOD / 2.0) % PERIOD - PERIOD / 2.0).abs();
+            (1.0 - d).max(0.0)
+        };
+        let mut pixels = vec![0u8; S * S * 3];
+        let mut state = 0x1234_5678u32;
+        for y in 0..S {
+            for x in 0..S {
+                let mut v = 236.0 - 46.0 * rule(x).max(rule(y));
+                let cy = 48.0 + 30.0 * (x as f32 * 0.021).sin();
+                v -= 170.0 * (-0.5 * ((y as f32 - cy) / 0.9).powi(2)).exp();
+                if y >= 96 {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    v = (state >> 24) as f32;
+                }
+                let i = (y * S + x) * 3;
+                pixels[i] = (v * 0.35).clamp(0.0, 255.0) as u8;
+                pixels[i + 1] = (v * 0.45).clamp(0.0, 255.0) as u8;
+                pixels[i + 2] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+        let patched = encode_image(&pixels, S, S, &slow_lossy(2.0).with_patches(true)).unwrap();
+        let both = slow_lossy(2.0).with_splines(true).with_patches(true);
+        let with = encode_image(&pixels, S, S, &both).unwrap();
+        assert!(
+            with.len() < patched.len(),
+            "splines must survive next to tile patches: {} >= {}",
+            with.len(),
+            patched.len()
+        );
     }
 
     #[test]

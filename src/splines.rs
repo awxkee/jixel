@@ -45,6 +45,7 @@ mod lines;
 mod render;
 mod select;
 mod transform;
+mod trig;
 
 #[cfg(any(
     all(target_arch = "aarch64", feature = "neon"),
@@ -354,12 +355,36 @@ pub(crate) fn spline_tokens(sp: &QuantizedSpline) -> Vec<(u32, u32)> {
     t
 }
 
+/// Greedy nearest-neighbor chain over the starting points. They are coded as
+/// deltas from the previous spline and rendering is additive, so order is free.
+fn coding_order(splines: &[QuantizedSpline]) -> Vec<&QuantizedSpline> {
+    let mut left: Vec<&QuantizedSpline> = splines.iter().collect();
+    let mut order = Vec::with_capacity(left.len());
+    let mut at = Point::new(0, 0);
+    while !left.is_empty() {
+        let (k, _) = left
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, sp)| {
+                let (dx, dy) = (sp.points[0].x - at.x, sp.points[0].y - at.y);
+                let bits = |v: i32| (1 + v.unsigned_abs()).ilog2();
+                (bits(dx) + bits(dy), dx.abs() + dy.abs())
+            })
+            .unwrap();
+        let sp = left.swap_remove(k);
+        at = sp.points[0];
+        order.push(sp);
+    }
+    order
+}
+
 /// LfGlobal spline section (after the patch dictionary, before the DC scales).
 pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut BitWriter) {
+    let splines = coding_order(&set.splines);
     let mut tokens = Vec::new();
-    tokens.push(Token::new(CTX_NUM_SPLINES, (set.splines.len() - 1) as u32));
+    tokens.push(Token::new(CTX_NUM_SPLINES, (splines.len() - 1) as u32));
     let (mut lx, mut ly) = (0i32, 0i32);
-    for (i, sp) in set.splines.iter().enumerate() {
+    for (i, sp) in splines.iter().enumerate() {
         let Point { x, y } = sp.points[0];
         if i == 0 {
             tokens.push(Token::new(CTX_START_POS, x as u32));
@@ -371,7 +396,7 @@ pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut
         (lx, ly) = (x, y);
     }
     tokens.push(Token::new(CTX_QUANT_ADJUST, pack_signed(set.adjust)));
-    for sp in &set.splines {
+    for sp in splines {
         tokens.extend(spline_tokens(sp).into_iter().map(|(c, v)| Token::new(c, v)));
     }
     let code = optimize_entropy_code_ac(&tokens, NUM_SPLINE_CONTEXTS, &mut scratch.huffman_pool);
@@ -423,6 +448,26 @@ fn palette_like(xyb: &Image3F) -> bool {
 
 /// Fitted spline candidates of one image, ready for RD selection.
 pub(crate) struct SplineCandidates(Vec<fit::Candidate>);
+
+impl SplineCandidates {
+    /// Whether any candidate passes through a marked 8x8 block.
+    pub(crate) fn touches(&self, blocks: &[bool], blocks_w: usize) -> bool {
+        self.0.iter().any(|candidate| {
+            candidate.alts.first().is_some_and(|alt| {
+                alt.points.array_windows::<2>().any(|[a, b]| {
+                    let (a, b) = (a.as_f32(), b.as_f32());
+                    let steps = ((b.x - a.x).abs().max((b.y - a.y).abs()) / 4.0).ceil() as usize;
+                    (0..=steps).any(|k| {
+                        let t = k as f32 / steps.max(1) as f32;
+                        let x = (a.x + t * (b.x - a.x)) as usize / 8;
+                        let y = (a.y + t * (b.y - a.y)) as usize / 8;
+                        blocks.get(y * blocks_w + x).is_some_and(|&v| v)
+                    })
+                })
+            })
+        })
+    }
+}
 
 /// Detects curvilinear structures in `xyb` and fits spline candidates to them.
 pub(crate) fn find_candidates(
@@ -484,6 +529,39 @@ pub(crate) fn select_splines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coding_order_chains_neighbouring_starts() {
+        let at = |x: i32, y: i32| QuantizedSpline {
+            points: vec![Point::new(x, y), Point::new(x + 30, y)],
+            dct: [[0; 32]; 4],
+        };
+        let splines = [at(200, 200), at(10, 10), at(210, 190), at(20, 12)];
+        let starts: Vec<_> = coding_order(&splines)
+            .iter()
+            .map(|sp| (sp.points[0].x, sp.points[0].y))
+            .collect();
+        assert_eq!(starts, [(10, 10), (20, 12), (200, 200), (210, 190)]);
+    }
+
+    #[test]
+    fn candidates_touch_only_the_blocks_they_pass_through() {
+        let line = QuantizedSpline {
+            points: vec![Point::new(4, 4), Point::new(60, 4)],
+            dct: [[0; 32]; 4],
+        };
+        let candidates = SplineCandidates(vec![fit::Candidate {
+            alts: vec![line],
+            bits_factor: 1.0,
+        }]);
+        // 8 x 2 blocks: the line runs through the whole top row
+        let mut blocks = vec![false; 16];
+        assert!(!candidates.touches(&blocks, 8));
+        blocks[8 + 3] = true;
+        assert!(!candidates.touches(&blocks, 8));
+        blocks[5] = true;
+        assert!(candidates.touches(&blocks, 8));
+    }
 
     #[test]
     fn local_catmull_rom_spans_match_the_full_curve() {

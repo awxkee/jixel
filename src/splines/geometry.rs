@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn prepared_distances_match_segment_reference_for_every_alignment() {
-        let kernels = crate::encoding_context::EncodingContext::default();
+        let kernels = EncodingContext::default();
         let points: Vec<_> = (0..if cfg!(miri) { 17 } else { 71 })
             .map(|i| {
                 // Include duplicate/degenerate edges as well as short bends.

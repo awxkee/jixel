@@ -34,8 +34,8 @@
 //! gaps, and handed to the fitter as one chain; the color DCT can vanish in
 //! the gaps and change sign along the way.
 
-use super::Point;
 use super::detect::Chain;
+use super::{Point, fast_hypot};
 
 const MIN_FRAGMENT: usize = 20;
 /// RMS distance of a fragment's points from its own line.
@@ -72,10 +72,11 @@ impl Line {
             sxy += dx * dy;
             syy += dy * dy;
         }
-        let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let angle = 0.5 * super::trig::f_atan2f(2.0 * sxy, sxx - syy);
+        let (sin, cos) = super::trig::f_sincosf(angle);
         Line {
             center: Point::new(cx, cy),
-            dir: Point::new(angle.cos(), angle.sin()),
+            dir: Point::new(cos, sin),
         }
     }
 
@@ -141,7 +142,7 @@ fn join(chains: &[Chain], members: &[usize]) -> Chain {
             chain.points[chain.points.len() - 1]
         };
         if let Some(&last) = points.last() {
-            let gap = (first.x - last.x).hypot(first.y - last.y) as usize;
+            let gap = fast_hypot(first.x - last.x, first.y - last.y) as usize;
             for k in 1..gap {
                 let t = k as f32 / gap as f32;
                 points.push(Point::new(
@@ -302,9 +303,15 @@ impl EndpointIndex {
     }
 }
 
+pub(super) struct LongLines {
+    pub(super) chains: Vec<Chain>,
+    /// Indices of well-supported joins to try before their individual fragments.
+    pub(super) joined: Vec<usize>,
+}
+
 /// Long straight lines among `chains`: groups of collinear fragments, plus long
 /// straight chains that found no partner.
-pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
+pub(super) fn find_long_lines(chains: &[Chain]) -> LongLines {
     let mut fragments: Vec<Fragment> = chains
         .iter()
         .enumerate()
@@ -315,6 +322,7 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
     let mut candidates = Vec::new();
     let mut used = vec![false; chains.len()];
     let mut lines = Vec::new();
+    let mut joined = Vec::new();
     for seed in 0..fragments.len() {
         let seed_index = fragments[seed].index;
         if used[seed_index] {
@@ -362,7 +370,15 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
         }
         if members.len() >= 2 {
             members.iter().for_each(|&m| used[m] = true);
-            lines.push(join(chains, &members));
+            let line = join(chains, &members);
+            let observed: usize = members.iter().map(|&m| chains[m].points.len()).sum();
+            // Repeated interruptions provide evidence of a crossing line. Do
+            // not promote a lone line, a pair, or a mostly invented gap ahead
+            // of the ordinary curved and colored candidates.
+            if members.len() >= 3 && observed >= line.points.len().div_ceil(2) {
+                joined.push(lines.len());
+            }
+            lines.push(line);
         } else if chains[seed_index].points.len() >= MIN_SINGLE {
             used[seed_index] = true;
             lines.push(Chain {
@@ -371,7 +387,10 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> Vec<Chain> {
             });
         }
     }
-    lines
+    LongLines {
+        chains: lines,
+        joined,
+    }
 }
 
 #[cfg(test)]
@@ -496,7 +515,7 @@ mod tests {
                 segment(60.0, 90.0, -51.0, 0.0),
             ]);
             assert_same_lines(
-                &find_long_lines(&chains),
+                &find_long_lines(&chains).chains,
                 &find_long_lines_reference(&chains),
             );
         }
@@ -586,8 +605,9 @@ mod tests {
             segment(80.0, 110.0, 20.0, 0.1),
         ];
         let lines = find_long_lines(&chains);
-        assert_eq!(lines.len(), 1);
-        let points = &lines[0].points;
+        assert_eq!(lines.chains.len(), 1);
+        assert_eq!(lines.joined, [0]);
+        let points = &lines.chains[0].points;
         assert!(
             (points[0].x - 10.0).abs() < 1e-3 && (points[points.len() - 1].x - 200.0).abs() < 1e-3
         );
@@ -610,7 +630,7 @@ mod tests {
             segment(80.0, 130.0, 24.0, 0.0),
             segment(80.0, 130.0, 0.0, 0.3),
         ];
-        assert!(find_long_lines(&chains).is_empty());
+        assert!(find_long_lines(&chains).chains.is_empty());
     }
 
     #[test]
@@ -619,8 +639,9 @@ mod tests {
             segment(10.0, 100.0, 30.0, -0.2),
             segment(10.0, 45.0, 90.0, 0.0),
         ]);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].points.len(), 91);
+        assert_eq!(lines.chains.len(), 1);
+        assert_eq!(lines.chains[0].points.len(), 91);
+        assert!(lines.joined.is_empty());
     }
 
     #[test]
@@ -629,6 +650,25 @@ mod tests {
             segment(10.0, 40.0, 20.0, 0.0),
             segment(260.0, 300.0, 20.0, 0.0),
         ];
-        assert!(find_long_lines(&chains).is_empty());
+        assert!(find_long_lines(&chains).chains.is_empty());
+    }
+
+    #[test]
+    fn sparse_joins_and_pairs_keep_the_faint_line_fallback() {
+        for chains in [
+            vec![
+                segment(10.0, 50.0, 20.0, 0.0),
+                segment(60.0, 100.0, 20.0, 0.0),
+            ],
+            vec![
+                segment(10.0, 30.0, 20.0, 0.0),
+                segment(160.0, 180.0, 20.0, 0.0),
+                segment(310.0, 330.0, 20.0, 0.0),
+            ],
+        ] {
+            let lines = find_long_lines(&chains);
+            assert_eq!(lines.chains.len(), 1);
+            assert!(lines.joined.is_empty());
+        }
     }
 }

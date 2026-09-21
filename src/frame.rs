@@ -1410,7 +1410,6 @@ fn encode_frame_vardct(
     patches: bool,
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
-    let mut xyb = xyb;
     let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
     let saturation_stat = if slow_chromatic {
         chroma_saturation_stat(&xyb)
@@ -1435,7 +1434,7 @@ fn encode_frame_vardct(
     // same swap buys chroma with a d=1 rate premium instead of saving bytes.
     ctx.set_chroma_heavy(slow_chromatic && saturation_stat >= SAT_QM_THRESHOLD);
     // Chroma-texture class: thin chromatic detail whose B energy the pair
-    // transforms' coarse first band zeroes. Only the mid band pays off.
+    // transforms' coarse first band zeroes. Only the mid-band pays off.
     let pair_b_fine = slow_chromatic
         && (crate::quant_weights::PAIR_B_FINE_MIN_DISTANCE
             ..crate::quant_weights::PAIR_B_FINE_MAX_DISTANCE)
@@ -1465,16 +1464,163 @@ fn encode_frame_vardct(
         None
     };
     #[cfg(feature = "splines")]
+    if let Some(candidates) = &spline_candidates {
+        let stage = SplineStage {
+            candidates,
+            quant_field: &quant_field,
+            before_tiles: false,
+            tiles: true,
+        };
+        if !patches {
+            return encode_vardct_variant(
+                ctx,
+                scratch,
+                distance,
+                distp,
+                xyb,
+                alpha,
+                coeff_shifts,
+                patches,
+                Some(&stage),
+                writer,
+            )
+            .map(|_| ());
+        }
+        // Tiles cut first keep every repeated rule and frame line, but no
+        // spline may cross them; splines taken first may cross, but claim
+        // lines the tiles would have carried almost for free. Neither order
+        // dominates, so when they can differ both are coded.
+        let mut tiles_first = BitWriter::new();
+        let touched = encode_vardct_variant(
+            ctx,
+            scratch,
+            distance,
+            distp,
+            xyb.clone(),
+            alpha,
+            coeff_shifts,
+            patches,
+            Some(&stage),
+            &mut tiles_first,
+        )?;
+        if touched {
+            let stage = SplineStage {
+                before_tiles: true,
+                ..stage
+            };
+            let mut splines_first = BitWriter::new();
+            encode_vardct_variant(
+                ctx,
+                scratch,
+                distance,
+                distp,
+                xyb.clone(),
+                alpha,
+                coeff_shifts,
+                patches,
+                Some(&stage),
+                &mut splines_first,
+            )?;
+            if splines_first.bits_written() < tiles_first.bits_written() {
+                // The tiles lost their lines to splines; what repeats in the
+                // rest may no longer pay for its atlas.
+                let stage = SplineStage {
+                    tiles: false,
+                    ..stage
+                };
+                let mut no_tiles = BitWriter::new();
+                encode_vardct_variant(
+                    ctx,
+                    scratch,
+                    distance,
+                    distp,
+                    xyb,
+                    alpha,
+                    coeff_shifts,
+                    patches,
+                    Some(&stage),
+                    &mut no_tiles,
+                )?;
+                // Tiles are coded finer than the frame, so going without them
+                // has to save clearly more than it costs in quality.
+                let tiles_lose = no_tiles.bits_written() as f64 * GLYPH_BITS_MARGIN
+                    < splines_first.bits_written() as f64;
+                writer.append(if tiles_lose {
+                    &no_tiles
+                } else {
+                    &splines_first
+                });
+                return Ok(());
+            }
+        }
+        writer.append(&tiles_first);
+        return Ok(());
+    }
+    encode_vardct_variant(
+        ctx,
+        scratch,
+        distance,
+        distp,
+        xyb,
+        alpha,
+        coeff_shifts,
+        patches,
+        #[cfg(feature = "splines")]
+        None,
+        writer,
+    )
+    .map(|_| ())
+}
+
+/// Spline selection of one frame variant.
+#[cfg(feature = "splines")]
+#[derive(Clone, Copy)]
+struct SplineStage<'a> {
+    candidates: &'a crate::splines::SplineCandidates,
+    quant_field: &'a [f32],
+    /// Select before the Replace tiles are detected: splines may then cross
+    /// tiles, which are cut from the spline-subtracted image.
+    before_tiles: bool,
+    /// Whether Replace tiles are looked for at all.
+    tiles: bool,
+}
+
+/// One patched or regular VarDCT frame. Returns whether a spline candidate
+/// passes through a Replace tile it was kept out of.
+#[allow(clippy::too_many_arguments)]
+fn encode_vardct_variant(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    distp: &DistanceParams,
+    xyb: Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    patches: bool,
+    #[cfg(feature = "splines")] stage: Option<&SplineStage>,
+    writer: &mut BitWriter,
+) -> Result<bool, EncodeError> {
+    #[allow(unused_mut)]
+    let mut xyb = xyb;
+    #[allow(unused_mut)]
+    let mut tiles_touched = false;
+    #[cfg(feature = "splines")]
+    let before_tiles = stage.is_some_and(|s| s.before_tiles);
+    #[cfg(feature = "splines")]
+    let tiles = stage.is_none_or(|s| s.tiles);
+    #[cfg(not(feature = "splines"))]
+    let tiles = true;
+    #[cfg(feature = "splines")]
     let select_splines =
         |scratch: &mut CoderScratch, image: &mut Image3F, forbidden: Option<&[bool]>| {
-            let candidates = spline_candidates.as_ref()?;
+            let stage = stage?;
             crate::splines::select_splines(
                 ctx,
                 scratch,
                 distance,
                 image,
-                &quant_field,
-                candidates,
+                stage.quant_field,
+                stage.candidates,
                 forbidden,
             )
         };
@@ -1520,8 +1666,14 @@ fn encode_frame_vardct(
         // Replace entries and must precede the additive glyph entries, which
         // then land on top of the replaced rectangles.
         let mut base = plan.base;
+        #[cfg(feature = "splines")]
+        let early_splines = if before_tiles {
+            select_splines(scratch, &mut base, None)
+        } else {
+            None
+        };
         let mut references: Vec<crate::patches::PatchReference> = Vec::new();
-        {
+        if tiles {
             let tiles16 = crate::patches::find_lossy_patches_sized(
                 &base,
                 crate::patches::PATCH_TILE,
@@ -1597,10 +1749,12 @@ fn encode_frame_vardct(
         let atlas_bits = patched_writer.bits_written();
         references.extend(plan.references);
 
-        // Additive glyph entries commute with splines; only the Replace tiles
-        // must stay clear of them.
+        // Additive glyph entries commute with splines; Replace tiles cut from
+        // the unsubtracted image must stay clear of them.
         #[cfg(feature = "splines")]
-        let base_splines = if spline_candidates.is_some() {
+        let base_splines = if before_tiles {
+            early_splines
+        } else if let Some(stage) = stage {
             let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
             let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
             for reference in references.iter().filter(|r| !r.add) {
@@ -1612,6 +1766,7 @@ fn encode_frame_vardct(
                     }
                 }
             }
+            tiles_touched = stage.candidates.touches(&in_patch, blocks_w);
             select_splines(scratch, &mut base, Some(&in_patch))
         } else {
             None
@@ -1655,15 +1810,21 @@ fn encode_frame_vardct(
                 >= regular_writer.bits_written() as f64 * GLYPH_BITS_MARGIN
             {
                 writer.append(&regular_writer);
-                return Ok(());
+                return Ok(tiles_touched);
             }
         }
         writer.append(&patched_writer);
-        return Ok(());
+        return Ok(tiles_touched);
     }
 
+    #[cfg(feature = "splines")]
+    let early_splines = if before_tiles {
+        select_splines(scratch, &mut xyb, None)
+    } else {
+        None
+    };
     // Tile plans are taken on coverage alone: no second, regular encode.
-    let tile_plan = if patches {
+    let tile_plan = if patches && tiles {
         let plan16 = crate::patches::find_lossy_patches_sized(
             &xyb,
             crate::patches::PATCH_TILE,
@@ -1821,9 +1982,12 @@ fn encode_frame_vardct(
         }
 
         // Patches replace their rectangles and the decoder draws splines after
-        // them, so no spline may reach into a patch.
+        // them, so no spline may reach into a patch cut from the unsubtracted
+        // image.
         #[cfg(feature = "splines")]
-        let base_splines = if spline_candidates.is_some() {
+        let base_splines = if before_tiles {
+            early_splines
+        } else if let Some(stage) = stage {
             let blocks_w = base.xsize().div_ceil(K_BLOCK_DIM);
             let mut in_patch = vec![false; blocks_w * base.ysize().div_ceil(K_BLOCK_DIM)];
             for reference in &references {
@@ -1835,6 +1999,7 @@ fn encode_frame_vardct(
                     }
                 }
             }
+            tiles_touched = stage.candidates.touches(&in_patch, blocks_w);
             select_splines(scratch, &mut base, Some(&in_patch))
         } else {
             None
@@ -1853,11 +2018,15 @@ fn encode_frame_vardct(
             &mut patched_writer,
         )?;
         writer.append(&patched_writer);
-        return Ok(());
+        return Ok(tiles_touched);
     }
 
     #[cfg(feature = "splines")]
-    let splines = select_splines(scratch, &mut xyb, None);
+    let splines = if before_tiles {
+        early_splines
+    } else {
+        select_splines(scratch, &mut xyb, None)
+    };
     gaborize(&mut xyb, distp);
     encode_frame_core(
         ctx,
@@ -1870,7 +2039,8 @@ fn encode_frame_vardct(
         #[cfg(feature = "splines")]
         splines.as_ref(),
         writer,
-    )
+    )?;
+    Ok(tiles_touched)
 }
 
 /// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
