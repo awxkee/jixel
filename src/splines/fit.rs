@@ -1119,8 +1119,10 @@ fn expand(
             .position(|&n| n == fit.sigma_n)
             .unwrap_or(0);
         let nearby = &SIGMA_LATTICE[at.saturating_sub(1)..(at + 2).min(SIGMA_LATTICE.len())];
+        // Width and geometry change pixel support, so compare error removed
+        // rather than raw residual errors over different sets of pixels.
         if let Some(better) = fit_best(targets, w, h, &refined, nearby, None, scratch)
-            && better.err < fit.err
+            && better.gain() > fit.gain()
         {
             (points, fit) = (refined, better);
         }
@@ -1457,6 +1459,65 @@ pub(super) fn fit_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refinement_compares_gain_over_different_pixel_supports() {
+        let ctx = EncodingContext::default();
+        let (w, h) = (128, 96);
+        let points = vec![Point::new(16, 48), Point::new(112, 48)];
+        let mut truth = QuantizedSpline {
+            points: points.clone(),
+            dct: [[0; 32]; 4],
+        };
+        truth.dct[1][0] = 10;
+        truth.dct[3][0] = 6;
+        let mut image = Image3F::new(w, h);
+        super::super::render_spline(&ctx, &truth, QUANT_ADJUST, &mut image, 1.0);
+        let mut targets = std::array::from_fn(|c| image.plane_data(c).to_vec());
+        // Unrelated detail enters the wider fit's support. Its raw residual
+        // error grows even though that width removes more of the actual line.
+        for x in 16..113 {
+            targets[1][55 * w + x] += 0.1;
+        }
+        let mut scratch = FitScratch::default();
+        let initial = fit_at(
+            &targets,
+            w,
+            h,
+            &points,
+            5,
+            None,
+            Precision::Full,
+            &mut scratch,
+        )
+        .unwrap();
+        let wider = fit_at(
+            &targets,
+            w,
+            h,
+            &points,
+            6,
+            None,
+            Precision::Full,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(wider.err > initial.err);
+        assert!(wider.gain() > initial.gain());
+        assert!(initial.explained() > REFINE_MIN_EXPLAINED);
+        let primary = Primary {
+            spline: quantize(&points, &initial),
+            points,
+            fit: initial,
+        };
+        let chain = Chain {
+            points: (16..=112).map(|x| Point::new(x as f32, 48.0)).collect(),
+            scale: 1.5,
+        };
+        let candidate =
+            expand(&ctx, &targets, &image, w, h, &chain, primary, &mut scratch).unwrap();
+        assert_eq!(candidate.alts[0].dct[3][0], truth.dct[3][0]);
+    }
 
     #[test]
     fn two_point_budget_preserves_acceptance_at_rounding_boundaries() {

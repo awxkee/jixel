@@ -1149,6 +1149,76 @@ pub(crate) fn choose_ytob_dc(
     best.1
 }
 
+/// Check the chosen DC predictor on the unrounded source using the same
+/// quantizer as coefficient coding. The initial search operates on integers.
+/// Subtracting two rounded values can invent a coding gain that disappears
+/// when the source is re-quantized. Recheck zero and the proposed slope using
+/// the existing gradient-token rate proxy, including its header charge.
+pub(crate) fn validate_ytob_dc(
+    dc_datas: &[DcGroupData],
+    candidate: i32,
+    scale_dc: f32,
+    quantize: crate::group::QuantizeDcCflFn,
+) -> i32 {
+    if candidate == 0 {
+        return 0;
+    }
+    let cost = |k: i32| {
+        let mut hist = [0u64; 64];
+        let mut extra = 0u64;
+        let mut total = 0u64;
+        let cfl = INV_DC_QUANT[2] * DC_QUANT[1] * (1.0 + k as f32 / K_COLOR_FACTOR);
+        for dc in dc_datas {
+            let Some(source) = &dc.source_dc_b else {
+                return f64::INFINITY;
+            };
+            let w = source.xsize();
+            let h = source.ysize();
+            let mut previous = vec![0i16; w];
+            let mut current = vec![0i16; w];
+            for y in 0..h {
+                let yr = dc.quant_dc.plane_row(1, y);
+                quantize(
+                    source.row(y),
+                    yr,
+                    INV_DC_QUANT[2] * scale_dc,
+                    cfl,
+                    &mut current,
+                );
+                for x in 0..w {
+                    let pred = if y == 0 {
+                        if x == 0 { 0 } else { current[x - 1] as i32 }
+                    } else if x == 0 {
+                        previous[x] as i32
+                    } else {
+                        grad_predict(
+                            previous[x] as i32,
+                            current[x - 1] as i32,
+                            previous[x - 1] as i32,
+                        )
+                    };
+                    add_ytob_token(current[x] as i32 - pred, &mut hist, &mut extra);
+                }
+                std::mem::swap(&mut current, &mut previous);
+            }
+            total += (w * h) as u64;
+        }
+        let inv = 1.0 / total.max(1) as f64;
+        hist.iter()
+            .filter(|&&n| n != 0)
+            .fold(extra as f64, |sum, &n| {
+                sum - n as f64 * f_log2(n as f64 * inv)
+            })
+    };
+    let base = cost(0);
+    let proposed = cost(candidate);
+    if proposed + COLOR_CORRELATION_HEADER_BITS < base {
+        candidate
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,6 +1556,73 @@ mod tests {
             }
         }
         dc
+    }
+
+    #[test]
+    fn source_dc_guard_rejects_double_rounding_gain() {
+        let ctx = EncodingContext::default();
+        let (w, h) = (48, 48);
+        let mut dc = DcGroupData::new(w, h).unwrap();
+        let mut source = crate::image::Plane::new(w, h);
+        let mut rng = 12345u32;
+        for y in 0..h {
+            for x in 0..w {
+                let yv = (80.0 + 64.0 * (x as f32 * 0.15).sin() + 32.0 * (y as f32 * 0.13).sin())
+                    .round() as i16;
+                let bv = (yv as f32 / 168.0).round_ties_even() as i16;
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let fraction = if rng & 0x80000000 == 0 { -0.49 } else { 0.49 };
+                dc.quant_dc.plane_row_mut(1, y)[x] = yv;
+                dc.quant_dc.plane_row_mut(2, y)[x] = bv;
+                source.row_mut(y)[x] = (0.5 * yv as f32 + bv as f32 + fraction) / 256.0;
+            }
+        }
+        // Source and stored baseline DC agree; the lost fraction is the only
+        // difference between the old proxy and re-quantizing the real source.
+        let mut row = vec![0i16; w];
+        for y in 0..h {
+            (ctx.quantize_dc_cfl)(
+                source.row(y),
+                dc.quant_dc.plane_row(1, y),
+                256.0,
+                0.5,
+                &mut row,
+            );
+            assert_eq!(row, dc.quant_dc.plane_row(2, y));
+        }
+        dc.source_dc_b = Some(source);
+        let groups = [dc];
+        let chosen = choose_ytob_dc(
+            &groups,
+            ctx.fill_ytob_row,
+            ctx.accumulate_ytob_weights,
+            ctx.fill_ytob_residuals,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_ne!(chosen, 0, "the integer proxy must propose a change");
+        assert_eq!(
+            validate_ytob_dc(&groups, chosen, 1.0, ctx.quantize_dc_cfl),
+            0
+        );
+    }
+
+    #[test]
+    fn source_dc_guard_preserves_real_correlation() {
+        let ctx = EncodingContext::default();
+        for k in [-9, 5, 11] {
+            let mut dc = dc_group_with_residual_correlation(k as f32 / 168.0);
+            let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+            let mut source = crate::image::Plane::new(w, h);
+            let factor = 0.5 * (1.0 + k as f32 / 84.0);
+            for y in 0..h {
+                for x in 0..w {
+                    source.row_mut(y)[x] = factor * dc.quant_dc.plane_row(1, y)[x] as f32 / 256.0;
+                }
+            }
+            dc.source_dc_b = Some(source);
+            assert_eq!(validate_ytob_dc(&[dc], k, 1.0, ctx.quantize_dc_cfl), k);
+        }
     }
 
     #[test]
