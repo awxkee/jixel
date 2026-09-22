@@ -330,23 +330,18 @@ impl RateCalibration {
 }
 
 /// Which AC-strategy selector runs and how merge costs propagate upward.
-/// Study-only switch read from the environment (`JIXEL_SELECT=leaf`,
-/// `JIXEL_SELECT_PROP=raw`); the defaults reproduce the shipped selector
-/// byte-for-byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SelectorPolicy {
     /// Bottom-up plan-based selection (see [`LEAF_FIRST_MAX_DISTANCE`]):
     /// every 8x8 picks its best structural transform (DCT8 / DCT4 family /
     /// AFV) first, then pairs/16x16 and the 32 class compete against those
     /// leaves; IDENTITY/DCT2X2 refine the remaining DCT8 blocks afterwards.
-    /// On by default; `JIXEL_SELECT=legacy` opts out (merges first, then the
-    /// whole sub-8 family on what is left).
+    /// Enabled by default.
     pub(crate) leaf_first: bool,
     /// Propagate the unbiased cost of a winning merge to the next level
     /// instead of its bias-multiplied decision cost.
     pub(crate) raw_propagation: bool,
-    /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); on by
-    /// default, `JIXEL_MERGE_UPGRADE=0` opts out.
+    /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); enabled by default.
     pub(crate) merge_upgrade: bool,
 }
 
@@ -378,21 +373,6 @@ fn merge_upgrade_margin(distance: f32) -> f32 {
     )
 }
 const LEAF_FIRST_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
-
-impl SelectorPolicy {
-    pub(crate) fn from_env() -> Self {
-        let flag = |name: &str, on: &str| {
-            std::env::var(name)
-                .map(|v| v.eq_ignore_ascii_case(on))
-                .unwrap_or(false)
-        };
-        Self {
-            leaf_first: !flag("JIXEL_SELECT", "legacy"),
-            raw_propagation: flag("JIXEL_SELECT_PROP", "raw"),
-            merge_upgrade: !flag("JIXEL_MERGE_UPGRADE", "0"),
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 struct SuperBlockCost {

@@ -79,8 +79,8 @@ pub(crate) fn compute_lehmer_code(permutation: &[u32], code: &mut [u32]) {
 pub(crate) fn decode_lehmer_code(code: &[u32], permutation: &mut [u32]) {
     let n = code.len();
     let mut available: Vec<u32> = (0..n as u32).collect();
-    for (i, &c) in code.iter().enumerate() {
-        permutation[i] = available.remove(c as usize);
+    for (&c, perm) in code.iter().zip(permutation.iter_mut()) {
+        *perm = available.remove(c as usize);
     }
 }
 

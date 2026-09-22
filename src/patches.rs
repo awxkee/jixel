@@ -142,6 +142,23 @@ const NEAR_TILE_BUCKET_SCAN: usize = 24;
 const NEAR_TILE_MAX_FLAT_SHARE: f32 = 0.55;
 const NEAR_TILE_TEXTURED_PEAK: f32 = 4.0;
 
+#[inline]
+fn floor_patch_bucket(value: f32) -> i64 {
+    if cfg!(all(target_arch = "x86_64", not(target_feature = "sse4.1"))) {
+        floor_patch_bucket_from_truncation(value)
+    } else {
+        value.floor() as i64
+    }
+}
+
+#[inline]
+fn floor_patch_bucket_from_truncation(value: f32) -> i64 {
+    let truncated = value as i64;
+    // Only negative fractions need correction; saturation also preserves the
+    // floor-then-cast result for values below i64::MIN (including -infinity).
+    truncated.saturating_sub(i64::from(value < truncated as f32))
+}
+
 /// `near > 0` also groups tiles close to a group's first tile: per channel the
 /// RMS difference is within `near * NEAR_TILE_UNIT` and every sample within
 /// that (flat tiles) or a few times that (textured tiles). They are replaced
@@ -276,7 +293,8 @@ pub(crate) fn find_lossy_patches_sized(
             let keys = [0.0f32, 0.5].map(|shift| {
                 let mut h: u64 = 0x9e37_79b9_7f4a_7c15 ^ shift.to_bits() as u64;
                 for m in means {
-                    h = (h ^ (m + shift).floor() as i64 as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    h = (h ^ floor_patch_bucket(m + shift) as u64)
+                        .wrapping_mul(0xff51_afd7_ed55_8ccd);
                     h ^= h >> 29;
                 }
                 h
@@ -299,7 +317,7 @@ pub(crate) fn find_lossy_patches_sized(
             let flat: usize = (0..tile)
                 .map(|dy| {
                     linear.plane_row(1, p.1 + dy)[p.0..p.0 + tile]
-                        .windows(2)
+                        .array_windows::<2>()
                         .filter(|w| (w[0] - w[1]).abs() <= NEAR_TILE_UNIT[1] * 0.5)
                         .count()
                 })
@@ -580,7 +598,7 @@ pub(crate) fn reuse_tile_quadrants(
 }
 
 /// Visit order that keeps look-alike tiles next to each other in the atlas:
-/// a greedy nearest-neighbour chain over each tile's mean X, Y, B.
+/// a greedy nearest-neighbor chain over each tile's mean X, Y, B.
 fn similarity_order(linear: &Image3F, groups: &[Vec<(usize, usize)>], tile: usize) -> Vec<usize> {
     let means: Vec<[f32; 3]> = groups
         .iter()
@@ -934,7 +952,7 @@ const GLYPH_MAX_SIDE: usize = 64;
 /// color, or that of its eight neighbors, so boxes and headers whose
 /// edges cross a tile still count as background on both sides).
 const GLYPH_BG_TILE: usize = 32;
-/// A shape must repeat: (occurrences - 1) * box pixels at or above this pays
+/// A shape must repeat: (occurrences - 1) * box pixels at or above these pays
 /// for its atlas entry and per-occurrence position tokens.
 const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
 /// Widest atlas the shapes are shelf-packed into.
@@ -1636,6 +1654,45 @@ fn sort_patch_groups(groups: &mut [Vec<(usize, usize)>]) {
 mod tests {
     use super::*;
     #[test]
+    fn patch_buckets_preserve_floor_and_saturating_cast() {
+        let check = |value: f32| {
+            for shift in [0.0f32, 0.5] {
+                let shifted = value + shift;
+                let expected = shifted.floor() as i64;
+                assert_eq!(
+                    floor_patch_bucket_from_truncation(shifted),
+                    expected,
+                    "bits={:08x}, shift={shift}",
+                    value.to_bits()
+                );
+                assert_eq!(floor_patch_bucket(shifted), expected);
+            }
+        };
+        // Every exponent, both signs, and mantissa boundaries cover subnormals,
+        // infinities, NaNs, and both ends of the saturating i64 cast.
+        for exponent in 0..=255u32 {
+            for mantissa in [0, 1, 0x3fffff, 0x400000, 0x7ffffe, 0x7fffff] {
+                for sign in [0, 0x80000000] {
+                    check(f32::from_bits(sign | exponent << 23 | mantissa));
+                }
+            }
+        }
+        for integer in -64..=64 {
+            let value = integer as f32;
+            for neighbor in [value.next_down(), value, value.next_up()] {
+                check(neighbor);
+            }
+        }
+        let mut bits = 0x4139b812u32;
+        for _ in 0..65536 {
+            bits ^= bits << 13;
+            bits ^= bits >> 17;
+            bits ^= bits << 5;
+            check(f32::from_bits(bits));
+        }
+    }
+
+    #[test]
     fn cached_solid_hashes_preserve_float_bits_and_detect_nonuniform_tiles() {
         for tile in [8, 16] {
             // Nonzero padding checks that classification respects the tile bounds.
@@ -2188,7 +2245,7 @@ mod tests {
         let first = signature(&plan);
         assert_eq!(first.len(), 6);
         assert!(
-            first.windows(2).all(|w| w[0] < w[1]),
+            first.array_windows::<2>().all(|w| w[0] < w[1]),
             "groups must follow the first occurrence in raster order: {first:?}"
         );
         // Packing chains look-alike tiles, so slots need not follow the group
