@@ -1464,34 +1464,56 @@ fn encode_frame_vardct(
         None
     };
     #[cfg(feature = "splines")]
-    if let Some(candidates) = &spline_candidates {
+    let stage = spline_candidates.as_ref().map(|candidates| SplineStage {
+        candidates,
+        quant_field: &quant_field,
+        before_tiles: false,
+    });
+    if !patches {
+        return prepare_vardct_variant(
+            ctx,
+            scratch,
+            distance,
+            distp,
+            xyb,
+            alpha,
+            coeff_shifts,
+            false,
+            true,
+            #[cfg(feature = "splines")]
+            stage.as_ref(),
+        )?
+        .encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+    }
+
+    // Compare bounded residual samples plus the actual atlas, dictionary and
+    // spline costs. Only the selected plan receives a full-frame encode.
+    let mut best = prepare_vardct_variant(
+        ctx,
+        scratch,
+        distance,
+        distp,
+        xyb.clone(),
+        alpha,
+        coeff_shifts,
+        true,
+        true,
+        #[cfg(feature = "splines")]
+        stage.as_ref(),
+    )?;
+    if !best.used_tiles {
+        drop(xyb);
+        return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+    }
+    #[allow(unused_mut)]
+    let mut best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+    #[cfg(feature = "splines")]
+    if best.tiles_touched {
         let stage = SplineStage {
-            candidates,
-            quant_field: &quant_field,
-            before_tiles: false,
-            tiles: true,
+            before_tiles: true,
+            ..stage.expect("candidates touched a tile")
         };
-        if !patches {
-            return encode_vardct_variant(
-                ctx,
-                scratch,
-                distance,
-                distp,
-                xyb,
-                alpha,
-                coeff_shifts,
-                patches,
-                Some(&stage),
-                writer,
-            )
-            .map(|_| ());
-        }
-        // Tiles cut first keep every repeated rule and frame line, but no
-        // spline may cross them; splines taken first may cross, but claim
-        // lines the tiles would have carried almost for free. Neither order
-        // dominates, so when they can differ both are coded.
-        let mut tiles_first = BitWriter::new();
-        let touched = encode_vardct_variant(
+        let mut splines_first = prepare_vardct_variant(
             ctx,
             scratch,
             distance,
@@ -1499,64 +1521,17 @@ fn encode_frame_vardct(
             xyb.clone(),
             alpha,
             coeff_shifts,
-            patches,
+            true,
+            true,
             Some(&stage),
-            &mut tiles_first,
         )?;
-        if touched {
-            let stage = SplineStage {
-                before_tiles: true,
-                ..stage
-            };
-            let mut splines_first = BitWriter::new();
-            encode_vardct_variant(
-                ctx,
-                scratch,
-                distance,
-                distp,
-                xyb.clone(),
-                alpha,
-                coeff_shifts,
-                patches,
-                Some(&stage),
-                &mut splines_first,
-            )?;
-            if splines_first.bits_written() < tiles_first.bits_written() {
-                // The tiles lost their lines to splines; what repeats in the
-                // rest may no longer pay for its atlas.
-                let stage = SplineStage {
-                    tiles: false,
-                    ..stage
-                };
-                let mut no_tiles = BitWriter::new();
-                encode_vardct_variant(
-                    ctx,
-                    scratch,
-                    distance,
-                    distp,
-                    xyb,
-                    alpha,
-                    coeff_shifts,
-                    patches,
-                    Some(&stage),
-                    &mut no_tiles,
-                )?;
-                // Tiles are coded finer than the frame, so going without them
-                // has to save clearly more than it costs in quality.
-                let tiles_lose = no_tiles.bits_written() as f64 * GLYPH_BITS_MARGIN
-                    < splines_first.bits_written() as f64;
-                writer.append(if tiles_lose {
-                    &no_tiles
-                } else {
-                    &splines_first
-                });
-                return Ok(());
-            }
+        let bits = splines_first.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+        if bits < best_bits {
+            best = splines_first;
+            best_bits = bits;
         }
-        writer.append(&tiles_first);
-        return Ok(());
     }
-    encode_vardct_variant(
+    let mut no_tiles = prepare_vardct_variant(
         ctx,
         scratch,
         distance,
@@ -1564,12 +1539,20 @@ fn encode_frame_vardct(
         xyb,
         alpha,
         coeff_shifts,
-        patches,
+        true,
+        false,
         #[cfg(feature = "splines")]
-        None,
-        writer,
-    )
-    .map(|_| ())
+        stage.as_ref(),
+    )?;
+    let no_tile_bits = no_tiles.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+    // Tile atlases are finer than the residual, so dropping them must repay
+    // the same quality margin as the previous full-bitstream comparison.
+    if no_tile_bits * GLYPH_BITS_MARGIN < best_bits {
+        best = no_tiles;
+    } else {
+        drop(no_tiles);
+    }
+    best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
 }
 
 /// Spline selection of one frame variant.
@@ -1581,14 +1564,12 @@ struct SplineStage<'a> {
     /// Select before the Replace tiles are detected: splines may then cross
     /// tiles, which are cut from the spline-subtracted image.
     before_tiles: bool,
-    /// Whether Replace tiles are looked for at all.
-    tiles: bool,
 }
 
-/// One patched or regular VarDCT frame. Returns whether a spline candidate
-/// passes through a Replace tile it was kept out of.
+/// One patched or regular VarDCT frame, with or without Replace `tiles`.
+/// Atlas frames are small and encoded immediately; the full residual is deferred.
 #[allow(clippy::too_many_arguments)]
-fn encode_vardct_variant(
+fn prepare_vardct_variant(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
@@ -1597,19 +1578,17 @@ fn encode_vardct_variant(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
+    tiles: bool,
     #[cfg(feature = "splines")] stage: Option<&SplineStage>,
-    writer: &mut BitWriter,
-) -> Result<bool, EncodeError> {
+) -> Result<PreparedVarDct, EncodeError> {
     #[allow(unused_mut)]
     let mut xyb = xyb;
     #[allow(unused_mut)]
     let mut tiles_touched = false;
+    #[allow(unused_mut)]
+    let mut used_tiles = false;
     #[cfg(feature = "splines")]
     let before_tiles = stage.is_some_and(|s| s.before_tiles);
-    #[cfg(feature = "splines")]
-    let tiles = stage.is_none_or(|s| s.tiles);
-    #[cfg(not(feature = "splines"))]
-    let tiles = true;
     #[cfg(feature = "splines")]
     let select_splines =
         |scratch: &mut CoderScratch, image: &mut Image3F, forbidden: Option<&[bool]>| {
@@ -1625,7 +1604,10 @@ fn encode_vardct_variant(
             )
         };
 
-    let near_tiles = distance.clamp(0.5, 4.0);
+    // Near-duplicate tiles beyond two 8-bit levels of RMS difference match
+    // noise on smooth ground; the frame without them then wins the race and
+    // the plan only adds atlas and sampling work.
+    let near_tiles = distance.clamp(0.5, NEAR_TILES_MAX);
     let glyph_plan = if patches {
         let singles = distance <= GLYPH_SINGLETON_MAX_DISTANCE;
         let coarse = if distance < 1.5 {
@@ -1748,6 +1730,7 @@ fn encode_vardct_variant(
                 )?;
                 references.extend(tile_refs);
                 base = next_base.expect("covered > 0");
+                used_tiles = true;
             }
         }
         let atlas_bits = patched_writer.bits_written();
@@ -1776,49 +1759,42 @@ fn encode_vardct_variant(
             None
         };
         gaborize(&mut base, distp);
-        encode_frame_core(
-            ctx,
-            scratch,
-            distance,
+        let mut prepared = PreparedVarDct {
+            prefix: patched_writer,
             base,
-            alpha,
-            coeff_shifts,
-            VarDctFrameKind::Patched(&references),
+            references,
             #[cfg(feature = "splines")]
-            base_splines.as_ref(),
-            &mut patched_writer,
-        )?;
-
-        // The patched frame is the sharper one at equal distance, so it only
-        // has to defend its size where the atlas dominates a coarse frame.
-        let atlas_share = atlas_bits as f64 / patched_writer.bits_written() as f64;
-        if distance >= GLYPH_CHECK_MIN_DISTANCE && atlas_share > GLYPH_CHECK_ATLAS_SHARE {
-            let mut regular = xyb.clone();
-            #[cfg(feature = "splines")]
-            let regular_splines = select_splines(scratch, &mut regular, None);
-            gaborize(&mut regular, distp);
-            let mut regular_writer = BitWriter::new();
-            encode_frame_core(
-                ctx,
-                scratch,
-                distance,
-                regular,
-                alpha,
-                coeff_shifts,
-                VarDctFrameKind::Regular,
+            splines: base_splines,
+            tiles_touched,
+            used_tiles,
+            estimated_bits: None,
+        };
+        if distance >= GLYPH_CHECK_MIN_DISTANCE {
+            let bits = prepared.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+            if atlas_bits as f64 > bits * GLYPH_CHECK_ATLAS_SHARE {
+                let mut regular = xyb;
                 #[cfg(feature = "splines")]
-                regular_splines.as_ref(),
-                &mut regular_writer,
-            )?;
-            if patched_writer.bits_written() as f64
-                >= regular_writer.bits_written() as f64 * GLYPH_BITS_MARGIN
-            {
-                writer.append(&regular_writer);
-                return Ok(tiles_touched);
+                let regular_splines = select_splines(scratch, &mut regular, None);
+                gaborize(&mut regular, distp);
+                let mut regular = PreparedVarDct {
+                    prefix: BitWriter::new(),
+                    base: regular,
+                    references: Vec::new(),
+                    #[cfg(feature = "splines")]
+                    splines: regular_splines,
+                    tiles_touched,
+                    used_tiles,
+                    estimated_bits: None,
+                };
+                if bits
+                    >= regular.estimate(ctx, scratch, distance, alpha, coeff_shifts)?
+                        * GLYPH_BITS_MARGIN
+                {
+                    return Ok(regular);
+                }
             }
         }
-        writer.append(&patched_writer);
-        return Ok(tiles_touched);
+        return Ok(prepared);
     }
 
     #[cfg(feature = "splines")]
@@ -1827,7 +1803,8 @@ fn encode_vardct_variant(
     } else {
         None
     };
-    // Tile plans are taken on coverage alone: no second, regular encode.
+    // Coverage admits a tile plan; the frame-level rate model compares it
+    // with a plan without tiles before either residual is encoded.
     let tile_plan = if patches && tiles {
         let plan16 = crate::patches::find_lossy_patches_sized(
             &xyb,
@@ -1861,6 +1838,7 @@ fn encode_vardct_variant(
         None
     };
     if let Some((plan, tiles8)) = tile_plan {
+        used_tiles = true;
         // Route each patch group to the atlas that codes it best: groups whose
         // quantized tiles fit the running 256-color palette budget go to the
         // modular atlas (measured strictly dominant when the palette hits),
@@ -2014,20 +1992,16 @@ fn encode_vardct_variant(
             None
         };
         gaborize(&mut base, distp);
-        encode_frame_core(
-            ctx,
-            scratch,
-            distance,
+        return Ok(PreparedVarDct {
+            prefix: patched_writer,
             base,
-            alpha,
-            coeff_shifts,
-            VarDctFrameKind::Patched(&references),
+            references,
             #[cfg(feature = "splines")]
-            base_splines.as_ref(),
-            &mut patched_writer,
-        )?;
-        writer.append(&patched_writer);
-        return Ok(tiles_touched);
+            splines: base_splines,
+            tiles_touched,
+            used_tiles,
+            estimated_bits: None,
+        });
     }
 
     #[cfg(feature = "splines")]
@@ -2037,19 +2011,171 @@ fn encode_vardct_variant(
         select_splines(scratch, &mut xyb, None)
     };
     gaborize(&mut xyb, distp);
-    encode_frame_core(
+    Ok(PreparedVarDct {
+        prefix: BitWriter::new(),
+        base: xyb,
+        references: Vec::new(),
+        #[cfg(feature = "splines")]
+        splines,
+        tiles_touched,
+        used_tiles,
+        estimated_bits: None,
+    })
+}
+
+struct PreparedVarDct {
+    prefix: BitWriter,
+    /// Selected splines/patches removed and inverse Gaborish already applied.
+    base: Image3F,
+    references: Vec<crate::patches::PatchReference>,
+    #[cfg(feature = "splines")]
+    splines: Option<crate::splines::SplineSet>,
+    #[cfg_attr(not(feature = "splines"), allow(dead_code))]
+    tiles_touched: bool,
+    used_tiles: bool,
+    estimated_bits: Option<f64>,
+}
+
+impl PreparedVarDct {
+    #[allow(clippy::too_many_arguments)]
+    fn encode(
+        self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        alpha: Option<&AlphaPlane>,
+        coeff_shifts: &[u32],
+        writer: &mut BitWriter,
+    ) -> Result<(), EncodeError> {
+        writer.append(&self.prefix);
+        encode_frame_core(
+            ctx,
+            scratch,
+            distance,
+            self.base,
+            alpha,
+            coeff_shifts,
+            if self.references.is_empty() {
+                VarDctFrameKind::Regular
+            } else {
+                VarDctFrameKind::Patched(&self.references)
+            },
+            #[cfg(feature = "splines")]
+            self.splines.as_ref(),
+            writer,
+        )?;
+        Ok(())
+    }
+
+    fn estimate(
+        &mut self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        alpha: Option<&AlphaPlane>,
+        coeff_shifts: &[u32],
+    ) -> Result<f64, EncodeError> {
+        if let Some(bits) = self.estimated_bits {
+            return Ok(bits);
+        }
+        let mut extras = BitWriter::new();
+        if !self.references.is_empty() {
+            crate::lossless::write_patch_dictionary(
+                &self.references,
+                alpha.is_some(),
+                scratch,
+                &mut extras,
+            );
+        }
+        #[cfg(feature = "splines")]
+        if let Some(set) = &self.splines {
+            crate::splines::write_splines(set, scratch, &mut extras);
+        }
+        let bits = self.prefix.bits_written() as f64
+            + extras.bits_written() as f64
+            + estimate_residual_bits(ctx, scratch, distance, &self.base, alpha, coeff_shifts)?;
+        self.estimated_bits = Some(bits);
+        Ok(bits)
+    }
+}
+
+/// Encode a bounded, spatially stratified sample with the real transform,
+/// quantization and entropy choices. Scale only its data sections; global
+/// headers and the actual patch/spline syntax are charged once.
+/// Sampled statistics and boundaries can change RDO decisions, so this is a
+/// rate estimate, not an exact predictor of the full bitstream.
+fn estimate_residual_bits(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    source: &Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+) -> Result<f64, EncodeError> {
+    let (w, h) = (source.xsize(), source.ysize());
+    let (sample, sample_alpha) = sample_vardct_residual(source, alpha);
+    let (sw, sh) = (sample.xsize(), sample.ysize());
+    let mut writer = BitWriter::new();
+    let payload = encode_frame_core(
         ctx,
         scratch,
         distance,
-        xyb,
-        alpha,
+        sample,
+        sample_alpha.as_ref(),
         coeff_shifts,
         VarDctFrameKind::Regular,
         #[cfg(feature = "splines")]
-        splines.as_ref(),
-        writer,
+        None,
+        &mut writer,
     )?;
-    Ok(tiles_touched)
+    Ok((writer.bits_written() - payload) as f64
+        + payload as f64 * (w * h) as f64 / (sw * sh) as f64)
+}
+
+/// Keep sample windows on the original pixel lattice and copy alpha through
+/// the same positions. At most sixteen 128x128 windows enter the rate model.
+fn sample_vardct_residual(
+    source: &Image3F,
+    alpha: Option<&AlphaPlane>,
+) -> (Image3F, Option<AlphaPlane>) {
+    let (w, h) = (source.xsize(), source.ysize());
+    let side = (w.min(h) / 2).clamp(8, 128).next_power_of_two().min(128);
+    let (tw, th) = (side.min(w), side.min(h));
+    let (nx, ny) = (w.div_ceil(tw), h.div_ceil(th));
+    let cells = nx * ny;
+    let count = (cells / 4).clamp(1, 16);
+    let columns = count.min(4);
+    let rows = count.div_ceil(columns);
+    let count = columns * rows;
+    let (sw, sh) = (tw * columns, th * rows);
+    let mut sample = Image3F::new(sw, sh);
+    let mut indices = alpha.map(|_| vec![0usize; sw * sh]);
+    for i in 0..count {
+        let cell = ((2 * i + 1) * cells / (2 * count)).min(cells - 1);
+        let sx = ((cell % nx) * tw).min(w - tw);
+        let sy = ((cell / nx) * th).min(h - th);
+        let (dx, dy) = ((i % columns) * tw, (i / columns) * th);
+        for y in 0..th {
+            for c in 0..3 {
+                sample.plane_row_mut(c, dy + y)[dx..dx + tw]
+                    .copy_from_slice(&source.plane_row(c, sy + y)[sx..sx + tw]);
+            }
+            if let Some(indices) = &mut indices {
+                for x in 0..tw {
+                    indices[(dy + y) * sw + dx + x] = (sy + y) * w + sx + x;
+                }
+            }
+        }
+    }
+    let sample_alpha = alpha.zip(indices).map(|(alpha, indices)| match alpha {
+        AlphaPlane::U8(data) => AlphaPlane::U8(indices.iter().map(|&i| data[i]).collect()),
+        AlphaPlane::U16 { data, bits } => AlphaPlane::U16 {
+            data: indices.iter().map(|&i| data[i]).collect(),
+            bits: *bits,
+        },
+        AlphaPlane::F32(data) => AlphaPlane::F32(indices.iter().map(|&i| data[i]).collect()),
+    });
+    (sample, sample_alpha)
 }
 
 /// Effective AC quant (`scale * q`) per 8x8 block, measured on the image before
@@ -2101,6 +2227,7 @@ const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 const GLYPH_BITS_MARGIN: f64 = 1.10;
 /// Tile patches are used only when they cover this share of the frame.
 const PATCH_TILE_MIN_COVER: f64 = 0.03;
+const NEAR_TILES_MAX: f32 = 2.0;
 
 /// Power-of-two refinement of the modular atlas quantization lattice.
 const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
@@ -2339,6 +2466,8 @@ fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
     }
 }
 
+/// Returns DC-group and AC-section bits, excluding the global headers, so
+/// sampled payload can be scaled separately from the frame's fixed costs.
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_core(
     ctx: &EncodingContext,
@@ -2350,7 +2479,7 @@ fn encode_frame_core(
     frame_kind: VarDctFrameKind<'_>,
     #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
     writer: &mut BitWriter,
-) -> Result<(), EncodeError> {
+) -> Result<usize, EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
     let mut distp = compute_distance_params(distance);
@@ -2436,7 +2565,7 @@ fn encode_frame_core(
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, stats) = process_ac_group(
+            let (p, local, source_b, stats) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -2455,15 +2584,26 @@ fn encode_frame_core(
                 want_order_stats,
                 qf_threshold,
             );
-            (dc_idx, gx, gy, p, local, stats)
+            (dc_idx, gx, gy, p, local, source_b, stats)
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     // Adopt the first group's buffers instead of allocating an empty tally.
     // Fast and progressive frames never allocate aggregate order statistics.
     let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
-    for (dc_idx, gx, gy, p, local, stats) in results {
+    for (dc_idx, gx, gy, p, local, source_b, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
+        if let Some(source) = source_b {
+            let dc = &mut dc_datas[dc_idx];
+            let target = dc.source_dc_b.get_or_insert_with(|| {
+                crate::image::Plane::new(dc.quant_dc.xsize(), dc.quant_dc.ysize())
+            });
+            let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+            let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+            for y in 0..source.ysize() {
+                target.row_mut(oy + y)[ox..ox + source.xsize()].copy_from_slice(source.row(y));
+            }
+        }
         all_pending.push(p);
         if let Some(s) = stats {
             if let Some(total) = &mut order_stats {
@@ -2497,6 +2637,15 @@ fn encode_frame_core(
             &mut scratch.dc_cfl_cur,
             &mut scratch.dc_cfl_prev,
         );
+        ytob_dc = crate::color_correlation::validate_ytob_dc(
+            &dc_datas,
+            ytob_dc,
+            distp.scale_dc,
+            ctx.quantize_dc_cfl,
+        );
+        for dc in &mut dc_datas {
+            dc.source_dc_b = None;
+        }
         let prices = {
             let provisional_code = crate::entropy::optimize_entropy_code_ac_streams(
                 all_pending.iter().map(|pg| pg.tokens[0].as_slice()),
@@ -2518,7 +2667,7 @@ fn encode_frame_core(
             .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _) = process_ac_group(
+                let (p, local, _, _) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -3083,8 +3232,14 @@ fn encode_frame_core(
         has_splines,
         writer,
     );
+    let payload_bits = sections
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 0 && *i != 1 + dim.num_dc_groups)
+        .map(|(_, section)| section.bits_written())
+        .sum();
     combine_sections(&mut sections, writer);
-    Ok(())
+    Ok(payload_bits)
 }
 
 /// Per-AC-group buffered tokens. For progressive (multi-pass) encoding the
@@ -3315,6 +3470,7 @@ fn process_ac_group(
 ) -> (
     PendingAcGroup,
     Image3S,
+    Option<crate::image::Plane<f32>>,
     Option<crate::coeff_order::OrderStats>,
 ) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
@@ -3330,6 +3486,7 @@ fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
+    let mut source_dc_b = collect_order_stats.then(|| crate::image::Plane::new(gwb, ghb));
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
         .collect();
@@ -3377,6 +3534,7 @@ fn process_ac_group(
             dc_data,
             ytob_dc,
             &mut local_quant_dc,
+            source_dc_b.as_mut(),
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
@@ -3396,6 +3554,7 @@ fn process_ac_group(
             tokens,
         },
         local_quant_dc,
+        source_dc_b,
         order_stats,
     )
 }
@@ -3433,6 +3592,127 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn residual_rate_sample_preserves_pixels_and_alpha_at_odd_edges() {
+        use crate::encode_image::AlphaPlane;
+        use crate::image::Image3F;
+        for (w, h) in [(1, 1), (7, 19), (257, 385), (1025, 769)] {
+            let mut source = Image3F::new(w, h);
+            for c in 0..3 {
+                for y in 0..h {
+                    for x in 0..w {
+                        source.plane_row_mut(c, y)[x] = (y * w + x) as f32 + c as f32 * 0.25;
+                    }
+                }
+            }
+            let alpha = AlphaPlane::U16 {
+                data: (0..w * h).map(|i| (i % 4096) as u16).collect(),
+                bits: 12,
+            };
+            let (sample, sampled_alpha) = super::sample_vardct_residual(&source, Some(&alpha));
+            let Some(AlphaPlane::U16 { data, bits }) = sampled_alpha else {
+                panic!("sample changed the alpha representation");
+            };
+            assert_eq!(bits, 12);
+            assert!(sample.xsize() * sample.ysize() <= 16 * 128 * 128);
+            assert_eq!(data.len(), sample.xsize() * sample.ysize());
+            for y in 0..sample.ysize() {
+                for x in 0..sample.xsize() {
+                    let index = sample.plane_row(0, y)[x] as usize;
+                    assert!(index < w * h);
+                    assert_eq!(data[y * sample.xsize() + x], (index % 4096) as u16);
+                    for c in 0..3 {
+                        assert_eq!(
+                            sample.plane_row(c, y)[x],
+                            source.plane_row(c, index / w)[index % w]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_tile_cost_keeps_texture_and_rejects_smooth_repetition() {
+        use super::{BitWriter, prepare_vardct_variant};
+        use crate::coder_scratch::CoderScratch;
+        use crate::encoding_context::EncodingContext;
+        use crate::image::Image3F;
+
+        for textured in [false, true] {
+            let distance = 6.0;
+            let ctx =
+                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            let mut scratch = CoderScratch::default();
+            let distp = super::compute_distance_params(distance);
+            let mut source = Image3F::new(512, 256);
+            let mut rng = 12345u32;
+            let mut tile = [0.0; 256];
+            for v in &mut tile {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                *v = 0.25 + (rng >> 24) as f32 / 512.0;
+            }
+            for y in 0..source.ysize() {
+                for x in 0..source.xsize() {
+                    let value = if !textured {
+                        0.5 + if (x % 16 < 8) ^ (y % 16 < 8) {
+                            0.015
+                        } else {
+                            -0.015
+                        }
+                    } else if x < 320 {
+                        tile[(y % 16) * 16 + x % 16]
+                    } else {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        0.25 + (rng >> 24) as f32 / 512.0
+                    };
+                    source.plane_row_mut(1, y)[x] = value;
+                    source.plane_row_mut(2, y)[x] = value;
+                }
+            }
+            let mut estimates = Vec::new();
+            let mut actual = Vec::new();
+            for tiles in [false, true] {
+                let mut plan = prepare_vardct_variant(
+                    &ctx,
+                    &mut scratch,
+                    distance,
+                    &distp,
+                    source.clone(),
+                    None,
+                    &[0],
+                    true,
+                    tiles,
+                    #[cfg(feature = "splines")]
+                    None,
+                )
+                .unwrap();
+                assert_eq!(plan.used_tiles, tiles);
+                let estimate = plan
+                    .estimate(&ctx, &mut scratch, distance, None, &[0])
+                    .unwrap();
+                assert!(estimate.is_finite() && estimate > 0.0);
+                assert_eq!(
+                    estimate,
+                    plan.estimate(&ctx, &mut scratch, distance, None, &[0])
+                        .unwrap()
+                );
+                estimates.push(estimate);
+                let mut writer = BitWriter::new();
+                plan.encode(&ctx, &mut scratch, distance, None, &[0], &mut writer)
+                    .unwrap();
+                actual.push(writer.bits_written() as f64);
+            }
+            let estimated_drop = estimates[0] * super::GLYPH_BITS_MARGIN < estimates[1];
+            let actual_drop = actual[0] * super::GLYPH_BITS_MARGIN < actual[1];
+            assert_eq!(actual_drop, !textured);
+            assert_eq!(
+                estimated_drop, actual_drop,
+                "estimates={estimates:?}, actual={actual:?}"
+            );
+        }
+    }
+
     #[test]
     fn arithmetic_matrix_header_cost_matches_writer_for_every_subset() {
         use crate::quant_weights::{DequantMatrices, MatrixHeaderCost};

@@ -212,14 +212,13 @@ pub(crate) fn find_lossy_patches_sized(
             })
             .collect()
     };
-    let mut groups = Vec::new();
     let min_occurrences = MIN_PATCH_OCCURRENCES;
-    for candidates in candidates {
-        if candidates.len() < min_occurrences {
-            continue;
-        }
+    // Hash buckets are independent, but every candidate still needs the full
+    // equality check: a hash collision must never substitute unequal pixels.
+    // The map keeps bucket order and each bucket keeps raster-order leaders.
+    let exact = pool.steal_map(scratch, candidates.len(), |i, _| {
         let mut exact_groups: Vec<Vec<(usize, usize)>> = Vec::new();
-        for pos in candidates {
+        for &pos in &candidates[i] {
             let matching = exact_groups.iter().position(|group| {
                 let first = group[0];
                 // Both tiles were proved constant across all three planes.
@@ -245,12 +244,10 @@ pub(crate) fn find_lossy_patches_sized(
                 exact_groups.push(vec![pos]);
             }
         }
-        groups.extend(
-            exact_groups
-                .into_iter()
-                .filter(|g| g.len() >= min_occurrences),
-        );
-    }
+        exact_groups.retain(|g| g.len() >= min_occurrences);
+        exact_groups
+    });
+    let mut groups: Vec<_> = exact.into_iter().flatten().collect();
 
     if near > 0.0 {
         // The exact groups arrive in hash order; the near pass registers and
@@ -267,6 +264,7 @@ pub(crate) fn find_lossy_patches_sized(
         // in buckets 16 tolerances wide. Two grids half a bucket apart: a
         // value on a boundary of one sits mid-bucket in the other.
         let cell = tile / 2;
+        let rcp_tol1 = 1.0 / (16.0 * tol[1]);
         let signature = |x0: usize, y0: usize| -> ([u64; 2], [f32; 6]) {
             let mut means = [0f32; 6];
             for cy in 0..2 {
@@ -278,7 +276,7 @@ pub(crate) fn find_lossy_patches_sized(
                             .iter()
                             .sum::<f32>();
                     }
-                    means[cy * 2 + cx] = sum / (cell * cell) as f32 / (16.0 * tol[1]);
+                    means[cy * 2 + cx] = sum / (cell * cell) as f32 * rcp_tol1;
                 }
             }
             for (slot, c) in [(4usize, 0usize), (5, 2)] {
@@ -482,17 +480,66 @@ pub(crate) fn find_lossy_patches_sized(
     for g in &mut groups {
         g[1..].sort_unstable_by_key(|&(x, y)| (y, x));
     }
-    let mut base = linear.clone();
-    for positions in &groups {
+    let base = tile_patch_residual(linear, tile, &groups, pool, scratch);
+    Some(LossyPatches { base, groups })
+}
+
+/// Copy only the uncovered spans into an initially zero residual. Copying the
+/// whole image and then clearing occurrences in group order writes patched
+/// pixels twice and jumps between distant rows.
+fn tile_patch_residual(
+    linear: &Image3F,
+    tile: usize,
+    groups: &[Vec<(usize, usize)>],
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Image3F {
+    let (width, height) = (linear.xsize(), linear.ysize());
+    let (tiles_x, tiles_y) = (width / tile, height / tile);
+    let mut patched = vec![false; tiles_x * tiles_y];
+    for positions in groups {
         for &(x, y) in positions {
-            for c in 0..3 {
-                for dy in 0..tile {
-                    base.plane_row_mut(c, y + dy)[x..x + tile].fill(0.0);
+            patched[y / tile * tiles_x + x / tile] = true;
+        }
+    }
+    let spans: Vec<Vec<_>> = (0..height.div_ceil(tile))
+        .map(|ty| {
+            let mut spans = Vec::new();
+            let mut start = 0;
+            if ty < tiles_y {
+                for tx in 0..tiles_x {
+                    if patched[ty * tiles_x + tx] {
+                        let x = tx * tile;
+                        if start < x {
+                            spans.push(start..x);
+                        }
+                        start = x + tile;
+                    }
+                }
+            }
+            if start < width {
+                spans.push(start..width);
+            }
+            spans
+        })
+        .collect();
+    let mut base = Image3F::new(width, height);
+    let num_bands = (pool.num_threads() * 4).min(height);
+    let band_height = height.div_ceil(num_bands);
+    let mut bands = base.row_bands_mut(num_bands);
+    pool.steal_for_each_mut(scratch, &mut bands, |i, planes, _| {
+        let y0 = i * band_height;
+        for (c, plane) in planes.iter_mut().enumerate() {
+            for (dy, row) in plane.chunks_exact_mut(width).enumerate() {
+                let y = y0 + dy;
+                let source = linear.plane_row(c, y);
+                for span in &spans[y / tile] {
+                    row[span.clone()].copy_from_slice(&source[span.clone()]);
                 }
             }
         }
-    }
-    Some(LossyPatches { base, groups })
+    });
+    base
 }
 
 /// Pack a set of groups into a fresh atlas image whose dictionary entries all
@@ -1733,6 +1780,57 @@ mod tests {
                         assert_eq!(actual, hash_tile(&image, 1, 1, tile));
                         image.plane_row_mut(c, y + 1)[x + 1] = f32::from_bits(bits[c]);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_patch_plan_and_residual_preserve_order_and_borders() {
+        let mut scratch = CoderScratch::default();
+        let serial_pool = ThreadPool::new(1);
+        let parallel_pool = ThreadPool::new(4);
+        for tile in [8, 16] {
+            let mut img = Image3F::new(64 * tile + 3, 33 * tile + 5);
+            for c in 0..3 {
+                for y in 0..img.ysize() {
+                    for x in 0..img.xsize() {
+                        let id = y / tile * 64 + x / tile;
+                        let pattern = if id % 5 == 0 { 10000 + id } else { id % 31 };
+                        img.plane_row_mut(c, y)[x] = pattern as f32 * 0.001
+                            + ((x % tile * 7 + y % tile * 3 + c * 5) % 17) as f32 * 0.025;
+                    }
+                }
+            }
+            // Uncovered edge samples must be copied bit for bit, including
+            // signed zero and NaN payloads, even when bands cut through tiles.
+            img.plane_row_mut(0, 0)[64 * tile] = -0.0;
+            img.plane_row_mut(1, 33 * tile)[0] = f32::from_bits(0x7fc0_0123);
+            let serial =
+                find_lossy_patches_sized(&img, tile, 0.0, &serial_pool, &mut scratch).unwrap();
+            let parallel =
+                find_lossy_patches_sized(&img, tile, 0.0, &parallel_pool, &mut scratch).unwrap();
+            assert!(serial.groups.len() >= 20);
+            assert_eq!(serial.groups, parallel.groups);
+            let mut expected = img.clone();
+            for group in &serial.groups {
+                for &(x, y) in group {
+                    for c in 0..3 {
+                        for dy in 0..tile {
+                            expected.plane_row_mut(c, y + dy)[x..x + tile].fill(0.0);
+                        }
+                    }
+                }
+            }
+            for c in 0..3 {
+                for ((want, serial), parallel) in expected
+                    .plane_data(c)
+                    .iter()
+                    .zip(serial.base.plane_data(c))
+                    .zip(parallel.base.plane_data(c))
+                {
+                    assert_eq!(want.to_bits(), serial.to_bits());
+                    assert_eq!(want.to_bits(), parallel.to_bits());
                 }
             }
         }

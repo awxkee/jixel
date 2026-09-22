@@ -246,6 +246,9 @@ impl AcStrategyImage {
 
 pub(crate) struct DcGroupData {
     pub(crate) quant_dc: Image3S,
+    /// Unrounded B DC from the first coefficient pass, retained only until
+    /// the frame's DC predictor has been checked with the final quantizer.
+    pub(crate) source_dc_b: Option<crate::image::Plane<f32>>,
     pub(crate) raw_quant_field: ImageB,
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
@@ -264,6 +267,7 @@ impl DcGroupData {
         let ytiles = ysize_blocks.div_ceil(TILE_DIM_IN_BLOCKS);
         Ok(Self {
             quant_dc: Image3S::try_new(xsize_blocks, ysize_blocks)?,
+            source_dc_b: None,
             raw_quant_field: ImageB::try_new_fill(xsize_blocks, ysize_blocks, 1)?,
             ac_strategy: AcStrategyImage::try_new(xsize_blocks, ysize_blocks)?,
             ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,

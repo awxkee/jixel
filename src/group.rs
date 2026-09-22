@@ -894,6 +894,7 @@ pub(crate) fn write_ac_group(
     dc_data: &DcGroupData,
     ytob_dc: i32,
     quant_dc: &mut Image3S,
+    mut source_dc_b: Option<&mut crate::image::Plane<f32>>,
     qorigin_x: usize,
     qorigin_y: usize,
     num_nzeros: &mut [Image3B],
@@ -1426,6 +1427,15 @@ pub(crate) fn write_ac_group(
             }
             let row_stride = cx * 8;
 
+            // Keep the fractional source for the DC predictor check. Y DC
+            // and these B lowest frequencies are unchanged by AC reranking.
+            if let Some(source) = source_dc_b.as_mut() {
+                for iy in 0..cov_y {
+                    let bx = global_bx - qorigin_x;
+                    source.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                        .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
+                }
+            }
             // ---- B channel: write CfL'd DC, quantize AC ----
             (ctx.quantize_dc_cfl)(
                 &b_dc_post[..covered_dc],
