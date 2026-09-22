@@ -552,10 +552,77 @@ fn prune_selected(
     }
 }
 
-const PRETEST_PAD: i32 = 24;
+/// Refine the first two width harmonics against the current residual. Keep
+/// the fitted mean width, color and geometry; every trial uses the decoder
+/// render and must pay for its extra coefficients in the residual RD model.
+fn refine_selected_widths(
+    model: &BlockModel,
+    current: &mut Image3F,
+    quant_field: &[f32],
+    kept: &mut [QuantizedSpline],
+    prices: &CostModel,
+    forbidden: Option<&[bool]>,
+) {
+    let (w, h) = (current.xsize(), current.ysize());
+    let mut cache = vec![None; w.div_ceil(8) * h.div_ceil(8)];
+    for sp in kept {
+        let mut incumbent = RenderPlan::new(model.ctx, sp, QUANT_ADJUST, w, h).tiled();
+        for i in 1..=2 {
+            let mut restored = Trial::new(current, &[&incumbent]);
+            restored.draw(&incumbent, 1.0);
+            cache_blocks(model, current, quant_field, &mut cache, &incumbent);
+            let mut best: Option<(f32, QuantizedSpline, TiledSpline, Trial)> = None;
+            for step in [-1, 1] {
+                let mut proposal = sp.clone();
+                let Some(value) = proposal.dct[3][i].checked_add(step) else {
+                    continue;
+                };
+                proposal.dct[3][i] = value;
+                let dc = proposal.dct[3][0] as f32;
+                let swing = std::f32::consts::SQRT_2
+                    * proposal.dct[3][1..]
+                        .iter()
+                        .map(|x| x.unsigned_abs() as f32)
+                        .sum::<f32>();
+                // Bound every arc sample, including those between DCT knots.
+                // Units are the format's quantized sigma lattice.
+                if dc - swing < 0.5 || dc + swing > 12.0 {
+                    continue;
+                }
+                let plan = RenderPlan::new(model.ctx, &proposal, QUANT_ADJUST, w, h).tiled();
+                if plan.bounds().is_none() {
+                    continue;
+                }
+                cache_blocks(model, current, quant_field, &mut cache, &plan);
+                let mut trial = Trial::new(current, &[&incumbent, &plan]);
+                trial.copy_blocks_from(&restored);
+                trial.draw(&plan, -1.0);
+                let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
+                else {
+                    continue;
+                };
+                let bits = prices.spline_bits(&proposal) - prices.spline_bits(sp);
+                let delta = delta + crate::ac_strategy::RD_LAMBDA * margin(model.distance) * bits;
+                if delta < -1e-6 && best.as_ref().is_none_or(|(d, _, _, _)| delta < *d) {
+                    best = Some((delta, proposal, plan, trial));
+                }
+            }
+            if let Some((_, proposal, plan, trial)) = best {
+                trial.commit(current);
+                for block in &trial.blocks {
+                    cache[block.cell] = None;
+                }
+                *sp = proposal;
+                incumbent = plan;
+            }
+        }
+    }
+}
+
 /// The pre-test sees unrefined geometry, so it lets through splines whose
 /// VarDCT saving covers only this share of their (prior-priced) bits.
 const PRETEST_BITS_SHARE: f32 = 0.25;
+const PRETEST_PAD: i32 = 24;
 
 /// Independent, state-free RD pre-test of one spline against the untouched
 /// image, on a block-aligned local copy (so it can run in parallel).
@@ -866,6 +933,14 @@ pub(super) fn rd_select(
         &prices,
         forbidden,
     );
+    refine_selected_widths(
+        &model,
+        &mut current,
+        quant_field,
+        &mut kept,
+        &prices,
+        forbidden,
+    );
     *xyb = current;
     Some(SplineSet {
         adjust: QUANT_ADJUST,
@@ -879,8 +954,61 @@ mod tests {
     use crate::{Speed, xyb::XybMatrix};
 
     #[test]
+    fn width_refinement_recovers_taper_and_preserves_reconstruction() {
+        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 2.0, 1);
+        let model = BlockModel::new(&ctx, 2.0);
+        let (w, h) = (259, 97);
+        let mut truth = QuantizedSpline {
+            points: vec![Point::new(8, 18), Point::new(251, 79)],
+            dct: [[0; 32]; 4],
+        };
+        truth.dct[1][0] = -12;
+        truth.dct[3][0] = 5;
+        truth.dct[3][1] = 1;
+        let mut source = Image3F::new(w, h);
+        for c in 0..3 {
+            for y in 0..h {
+                source.plane_row_mut(c, y).fill(0.5);
+            }
+        }
+        render_spline(&ctx, &truth, QUANT_ADJUST, &mut source, 1.0);
+        let mut initial = truth.clone();
+        initial.dct[3][1] = 0;
+        let mut residual = source.clone();
+        render_spline(&ctx, &initial, QUANT_ADJUST, &mut residual, -1.0);
+        let before = residual.clone();
+        let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
+        let prices = CostModel::prior(1.0);
+        let mut kept = vec![initial.clone()];
+        refine_selected_widths(&model, &mut residual, &quant, &mut kept, &prices, None);
+        assert_eq!(kept[0].dct[3], truth.dct[3]);
+        assert_eq!(kept[0].dct[..3], initial.dct[..3]);
+        assert_eq!(kept[0].points, initial.points);
+        render_spline(&ctx, &kept[0], QUANT_ADJUST, &mut residual, 1.0);
+        for c in 0..3 {
+            for (&actual, &expected) in residual.plane_data(c).iter().zip(source.plane_data(c)) {
+                assert!((actual - expected).abs() < 2e-6);
+            }
+        }
+        let mut forbidden_residual = before.clone();
+        let mut forbidden_splines = vec![initial.clone()];
+        refine_selected_widths(
+            &model,
+            &mut forbidden_residual,
+            &quant,
+            &mut forbidden_splines,
+            &prices,
+            Some(&vec![true; quant.len()]),
+        );
+        assert_eq!(forbidden_splines[0].dct, initial.dct);
+        for c in 0..3 {
+            assert_eq!(forbidden_residual.plane_data(c), before.plane_data(c));
+        }
+    }
+
+    #[test]
     fn sparse_trials_match_full_render_and_rd_at_image_edges() {
-        let kernels = crate::encoding_context::EncodingContext::default();
+        let kernels = EncodingContext::default();
         let (w, h) = (137, 91);
         let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
         let model = BlockModel::new(&ctx, 3.0);
@@ -1509,6 +1637,14 @@ mod tests {
         prune_selected(
             &model,
             scratch,
+            &mut current,
+            quant_field,
+            &mut kept,
+            &prices,
+            forbidden,
+        );
+        refine_selected_widths(
+            &model,
             &mut current,
             quant_field,
             &mut kept,

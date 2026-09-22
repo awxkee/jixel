@@ -270,7 +270,7 @@ impl EncodingContext {
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
-            selector: ac_strategy::SelectorPolicy::from_env(),
+            selector: ac_strategy::SelectorPolicy::default(),
             base_matrices,
             sat_matrices: DequantMatrices::new_saturated(distance),
             pair_b_matrices: if speed == Speed::Slow {
