@@ -671,6 +671,17 @@ fn region_qac(
     scale: f32,
     butteraugli_target: f32,
 ) -> f32 {
+    scale * region_quant(quant_field, bx, by, w, h, butteraugli_target) as f32
+}
+
+fn region_quant(
+    quant_field: &ImageB,
+    bx: usize,
+    by: usize,
+    w: usize,
+    h: usize,
+    butteraugli_target: f32,
+) -> u8 {
     let mut max_q = 1u8;
     let mut sum = 0u32;
     for y in by..by + h {
@@ -679,7 +690,7 @@ fn region_qac(
             sum += u32::from(q);
         }
     }
-    scale * aggregate_quant(max_q, sum, w * h, butteraugli_target) as f32
+    aggregate_quant(max_q, sum, w * h, butteraugli_target)
 }
 
 #[inline]
@@ -970,7 +981,7 @@ fn select_band(
                 continue;
             }
             let cached_dct8 = scratch.dct8_costs[(by - y_begin) * xsize + bx];
-            if let Some((cand, gain)) = evaluate_sub8_candidate(
+            if let Some((cand, gain, _)) = evaluate_sub8_candidate(
                 params,
                 scratch,
                 bx,
@@ -1004,10 +1015,13 @@ struct Sub8Pick {
     /// delta for IDENTITY/DCT2X2, biased coefficient-domain delta otherwise
     /// (legacy semantics; the two are not comparable with each other).
     gain: f32,
+    /// What the frame metadata gate restores if it rejects this pick.
+    fallback: u8,
 }
 
-/// Legacy interface: `(strategy, gain)` for the block's winning sub-8
-/// candidate, if any.
+/// Legacy interface: `(strategy, gain, fallback)` for the block's winning
+/// sub-8 candidate, if any. `fallback` is the structural pick an admitted
+/// IDENTITY/DCT2X2 displaced (DCT8 when none), for the frame metadata gate.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_sub8_candidate(
     params: AcStrategyParams<'_>,
@@ -1020,7 +1034,7 @@ fn evaluate_sub8_candidate(
     with_dct4: bool,
     with_fine: bool,
     bias_afv: f32,
-) -> Option<(u8, f32)> {
+) -> Option<(u8, f32, u8)> {
     evaluate_sub8(
         params,
         scratch,
@@ -1033,7 +1047,7 @@ fn evaluate_sub8_candidate(
         with_fine,
         bias_afv,
     )
-    .map(|pick| (pick.strategy, pick.gain))
+    .map(|pick| (pick.strategy, pick.gain, pick.fallback))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,7 +1079,14 @@ fn evaluate_sub8(
         && fine.biased_j < shortlist.structural_cost
         && let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine.strategy)
     {
-        return Some(Sub8Pick { gain, ..fine });
+        let fallback = shortlist
+            .structural
+            .map_or(STRATEGY_DCT, |structural| structural.strategy);
+        return Some(Sub8Pick {
+            gain,
+            fallback,
+            ..fine
+        });
     }
     shortlist.structural
 }
@@ -1159,6 +1180,7 @@ fn sub8_shortlist(
             biased_j: cand_cost,
             raw_j: cand_raw,
             gain: cost8 - cand_cost,
+            fallback: STRATEGY_DCT,
         }),
         structural_cost: cand_cost,
         fine: (fine_coeff_cost < cost8).then_some(Sub8Pick {
@@ -1166,6 +1188,7 @@ fn sub8_shortlist(
             biased_j: fine_coeff_cost,
             raw_j: fine_raw,
             gain: 0.0,
+            fallback: STRATEGY_DCT,
         }),
     }
 }
@@ -1180,24 +1203,6 @@ fn fine_recon_admit(
     by: usize,
     qac: f32,
     meta_r: f32,
-    fine: u8,
-) -> Option<f32> {
-    fine_recon_admit_against(params, scratch, bx, by, qac, meta_r, STRATEGY_DCT, fine)
-}
-
-/// [`fine_recon_admit`] against any surviving 1x1 incumbent (DCT8 or a
-/// structural DCT4/AFV leaf): the fine transform never enters the merge
-/// competition, but once the hierarchy is final it may refine whatever
-/// single block survived.
-#[allow(clippy::too_many_arguments)]
-fn fine_recon_admit_against(
-    params: AcStrategyParams<'_>,
-    scratch: &mut CoderScratch,
-    bx: usize,
-    by: usize,
-    qac: f32,
-    meta_r: f32,
-    incumbent: u8,
     fine: u8,
 ) -> Option<f32> {
     let ctx = params.ctx;
@@ -1220,18 +1225,13 @@ fn fine_recon_admit_against(
             DistortionModel::Reconstruction,
         )
     };
-    let recon8 = reconstruction_cost(scratch, incumbent);
+    let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
     // The reconstruction scorer over-credits fine transforms; charge the
     // fitted per-block correction at the floored lambda (see the constant)
     // before the margin test below.
     let recon_fine = fmla(
         fine_mosaic_lambda(params.distance),
-        FINE_ADMIT_RATE_CORRECTION_BITS
-            + if incumbent == STRATEGY_DCT {
-                0.0
-            } else {
-                FINE_ADMIT_LEAF_EXTRA_BITS
-            },
+        FINE_ADMIT_RATE_CORRECTION_BITS,
         reconstruction_cost(scratch, fine),
     );
     // A small safety margin absorbs the remaining mismatch between the local
@@ -1275,9 +1275,11 @@ pub(crate) fn fill_ac_strategy(
     ytob_map: &ImageSB,
     ac_strategy: &mut AcStrategyImage,
     fine_rollbacks: &mut Vec<FineMergeRollback>,
+    fine_fallbacks: &mut Vec<u8>,
     num_threads: usize,
 ) -> f32 {
     fine_rollbacks.clear();
+    fine_fallbacks.clear();
     let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
@@ -1375,13 +1377,16 @@ pub(crate) fn fill_ac_strategy(
         // gains now and sum them at the end.
         pipeline.leaf_gain.clear();
         pipeline.leaf_gain.resize(xsize * ysize, 0.0);
+        fine_fallbacks.resize(xsize * ysize, STRATEGY_DCT);
         // `fill_selection_bands` always yields at least the single full band.
         for (&(y0, y1), band) in pipeline.bands.iter().zip(&pipeline.band_scratch) {
-            for (leaf, gain) in band.leaves[..xsize * (y1 - y0)]
+            for ((leaf, gain), fallback) in band.leaves[..xsize * (y1 - y0)]
                 .iter()
                 .zip(&mut pipeline.leaf_gain[y0 * xsize..y1 * xsize])
+                .zip(&mut fine_fallbacks[y0 * xsize..y1 * xsize])
             {
                 *gain = leaf.gain;
+                *fallback = leaf.fallback;
             }
         }
     }
@@ -1530,6 +1535,7 @@ pub(crate) fn fill_ac_strategy(
             quant_field,
             bands: &pipeline.bands,
             num_threads,
+            leaf_first,
         };
         let band_count = pipeline.bands.len();
         rerank_large_transforms(
@@ -1560,7 +1566,7 @@ pub(crate) fn fill_ac_strategy(
                                 continue;
                             }
                             let (bx, by) = (downgrade.bx + ix, downgrade.by + iy);
-                            if let Some((cand, gain)) = evaluate_sub8_candidate(
+                            if let Some((cand, gain, fallback)) = evaluate_sub8_candidate(
                                 params,
                                 scratch,
                                 bx,
@@ -1580,6 +1586,7 @@ pub(crate) fn fill_ac_strategy(
                                 benefit += gain;
                                 if leaf_first {
                                     pipeline.leaf_gain[by * xsize + bx] = gain;
+                                    fine_fallbacks[by * xsize + bx] = fallback;
                                 }
                             }
                         }
@@ -1667,6 +1674,9 @@ struct RerankContext<'a> {
     quant_field: &'a ImageB,
     bands: &'a [(usize, usize)],
     num_threads: usize,
+    /// Each band's `leaves` holds the structural 1x1 winner of every block,
+    /// including those a nested merge's saved grid no longer shows.
+    leaf_first: bool,
 }
 
 const FINE_MOSAIC_BOUNDARY_ALPHA: f32 = 32.0;
@@ -2075,7 +2085,11 @@ fn find_rerank_downgrades(
         let rectangles = SearchScope::for_speed(ctx.speed).rectangles();
         for iy in 0..cyb {
             for ix in 0..cxb {
-                let leaf = saved.map_or(NO_CHILD_BLOCK, |grid| grid[iy * 4 + ix]);
+                let leaf = if rerank.leaf_first {
+                    output.leaves[(by + iy - y0) * ac_strategy.xsize() + bx + ix].strategy
+                } else {
+                    saved.map_or(NO_CHILD_BLOCK, |grid| grid[iy * 4 + ix])
+                };
                 for (candidate_index, s) in [
                     leaf,
                     STRATEGY_DCT16X8,
@@ -2320,6 +2334,7 @@ fn find_rerank_downgrades(
                     cov_x: cxb,
                     cov_y: cyb,
                     strategy: strat,
+                    quant: region_quant(rerank.quant_field, bx, by, cxb, cyb, params.distance),
                     fine_grid,
                     benefit: fine_benefit,
                 });
@@ -3239,6 +3254,7 @@ mod tests {
             &maps,
             &mut strategies,
             &mut fine_rollbacks,
+            &mut Vec::new(),
             1,
         );
         assert_eq!(strategies.raw_strategy(0, 0), STRATEGY_DCT32X32);
@@ -3376,6 +3392,7 @@ mod tests {
             &maps,
             &mut strategies,
             &mut fine_rollbacks,
+            &mut Vec::new(),
             threads,
         );
         (strategies, benefit, fine_rollbacks)
@@ -3635,6 +3652,7 @@ mod tests {
             quant_field: &qf,
             bands: &[(0, 2)],
             num_threads: 1,
+            leaf_first: false,
         };
         let mut map = AcStrategyImage::new(2, 2);
         map.set_first(0, 0, STRATEGY_DCT16X16);
@@ -3955,12 +3973,19 @@ mod tests {
 
     #[test]
     fn reconstruction_round_trips() {
-        // x = N·Fᵀ·(F·x) must return the original block (exact inverse).
-        // DCT4X4/4X8/8X4 use a sub-DC Hadamard (non-orthogonal), so the
-        // `x=N·Fᵀc` inverse doesn't apply — but they are not merge candidates.
+        // Inverse of the forward transform must return the original block.
         let idct = crate::dct::IdctMethods::scalar();
         for strategy in [
             STRATEGY_DCT,
+            STRATEGY_IDENTITY,
+            STRATEGY_DCT2X2,
+            STRATEGY_DCT4X4,
+            STRATEGY_DCT4X8,
+            STRATEGY_DCT8X4,
+            crate::ac_strategy::STRATEGY_AFV0,
+            crate::ac_strategy::STRATEGY_AFV1,
+            crate::ac_strategy::STRATEGY_AFV2,
+            crate::ac_strategy::STRATEGY_AFV3,
             STRATEGY_DCT16X8,
             STRATEGY_DCT16X16,
             STRATEGY_DCT32X32,

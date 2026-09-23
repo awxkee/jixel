@@ -440,13 +440,34 @@ pub(crate) fn reconstruct_error(
         STRATEGY_DCT32X64 => inverse!(idct.idct32x64, 2048, 64, 32),
         _ => {
             let n = strategy_pixel_count(strategy);
-            let matrix = forward_matrix(strategy);
+            let matrix = inverse_matrix(strategy);
             for (row, value) in err_out[..n].iter_mut().enumerate() {
                 let base = row * n;
-                *value = n as f32 * (0..n).map(|k| matrix[base + k] * coeff_err[k]).sum::<f32>();
+                *value = (0..n).map(|k| matrix[base + k] * coeff_err[k]).sum::<f32>();
             }
         }
     }
+}
+
+/// Inverse of an orthogonal (not orthonormal) forward basis:
+/// `x = Σ_k c_k · f_k / ‖f_k‖²`. DCT4/AFV basis vectors have unequal norms, so
+/// the uniform `N·Fᵀ` shortcut that holds for DCT8 is wrong for them.
+pub(crate) fn inverse_matrix(strategy: u8) -> &'static [f32] {
+    static MATRICES: [OnceLock<Vec<f32>>; NUM_STRATEGIES] =
+        [const { OnceLock::new() }; NUM_STRATEGIES];
+    MATRICES[strategy as usize].get_or_init(|| {
+        let n = strategy_pixel_count(strategy);
+        let forward = forward_matrix(strategy);
+        let inv_norm: Vec<f64> = (0..n)
+            .map(|k| {
+                let norm2: f64 = (0..n).map(|p| (forward[p * n + k] as f64).powi(2)).sum();
+                1.0 / norm2
+            })
+            .collect();
+        (0..n * n)
+            .map(|i| (forward[i] as f64 * inv_norm[i % n]) as f32)
+            .collect()
+    })
 }
 
 pub(crate) type ReconQuantizeFn = unsafe fn(

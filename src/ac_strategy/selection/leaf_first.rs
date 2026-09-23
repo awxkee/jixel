@@ -41,11 +41,14 @@ pub(crate) struct LeafChoice {
     /// Sub-8 metadata-gate credit if this leaf survives to the final map.
     pub(crate) gain: f32,
     /// IDENTITY/DCT2X2 shortlisted against DCT8 on the coefficient model
-    /// (`NO_CHILD_BLOCK` = none); admitted after the merges against whatever
+    /// (`NO_CHILD_BLOCK` = none); admitted after the merges over whatever
     /// 1x1 leaf survived.
     pub(crate) fine: u8,
     /// The fine candidate's coefficient-domain decision cost.
     pub(crate) fine_j: f32,
+    /// The 1x1 incumbent an admitted fine transform replaced; `gain` is
+    /// measured against it, so the metadata gate restores it on rejection.
+    pub(crate) fallback: u8,
 }
 
 impl Default for LeafChoice {
@@ -57,6 +60,7 @@ impl Default for LeafChoice {
             gain: 0.0,
             fine: NO_CHILD_BLOCK,
             fine_j: f32::INFINITY,
+            fallback: STRATEGY_DCT,
         }
     }
 }
@@ -436,12 +440,9 @@ pub(super) fn select_band_leaf_first(
             let dct8 = output.leaves[(by - y_begin) * xsize + bx].j;
             let leaf = &mut output.leaves[(by - y_begin) * xsize + bx];
             *leaf = LeafChoice {
-                strategy: STRATEGY_DCT,
                 j: dct8,
                 raw_j: dct8,
-                gain: 0.0,
-                fine: NO_CHILD_BLOCK,
-                fine_j: f32::INFINITY,
+                ..LeafChoice::default()
             };
             if !sub8_enabled {
                 continue;
@@ -669,8 +670,9 @@ pub(super) fn select_band_leaf_first(
                     continue;
                 }
                 let incumbent = ac_strategy.raw_strategy(bx, by);
-                // Any structural 1x1 leaf may be refined; a DCT4/AFV
-                // incumbent pays `FINE_ADMIT_LEAF_EXTRA_BITS` on top.
+                // Any structural 1x1 leaf may be refined when the fine
+                // candidate beats it on the coefficient model; the
+                // reconstruction check is against DCT8, as in `evaluate_sub8`.
                 let structural = AcStrategyImage::covered_blocks_x_of(incumbent) == 1
                     && AcStrategyImage::covered_blocks_y_of(incumbent) == 1
                     && !matches!(incumbent, STRATEGY_IDENTITY | STRATEGY_DCT2X2);
@@ -678,11 +680,11 @@ pub(super) fn select_band_leaf_first(
                     continue;
                 }
                 let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-                if let Some(gain) =
-                    fine_recon_admit_against(params, scratch, bx, by, qac, meta_r, incumbent, fine)
-                {
+                if let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine) {
                     ac_strategy.set_first(bx, by, fine);
-                    output.leaves[(by - y_begin) * xsize + bx].gain = gain;
+                    let leaf = &mut output.leaves[(by - y_begin) * xsize + bx];
+                    leaf.gain = gain;
+                    leaf.fallback = incumbent;
                 }
             }
         }

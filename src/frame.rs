@@ -3314,6 +3314,7 @@ fn setup_dc_group(
         distp.distance,
     );
     let mut fine_rollbacks = Vec::new();
+    let mut fine_fallbacks = Vec::new();
     dc_data.sub8_benefit = crate::ac_strategy::fill_ac_strategy(
         ctx,
         scratch,
@@ -3328,6 +3329,7 @@ fn setup_dc_group(
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
         &mut fine_rollbacks,
+        &mut fine_fallbacks,
         num_threads,
     );
     // A fine mosaic that split an otherwise-retained merge must repay its own
@@ -3338,7 +3340,16 @@ fn setup_dc_group(
     } else {
         let fine_benefit: f32 = fine_rollbacks.iter().map(|r| r.benefit).sum();
         let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        let mut fine_quants = Vec::with_capacity(fine_rollbacks.len());
         for rollback in &fine_rollbacks {
+            let mut quants = [0u8; 16];
+            for iy in 0..rollback.cov_y {
+                let row = dc_data.raw_quant_field.row_mut(rollback.by + iy);
+                let cells = &mut row[rollback.bx..rollback.bx + rollback.cov_x];
+                quants[iy * 4..iy * 4 + rollback.cov_x].copy_from_slice(cells);
+                cells.fill(rollback.quant);
+            }
+            fine_quants.push(quants);
             dc_data
                 .ac_strategy
                 .set_first(rollback.bx, rollback.by, rollback.strategy);
@@ -3348,8 +3359,11 @@ fn setup_dc_group(
         let fine_lambda = crate::ac_strategy::fine_mosaic_lambda(distp.distance);
         let accepted = fine_benefit > fine_lambda * meta_delta;
         if accepted {
-            for rollback in &fine_rollbacks {
+            for (rollback, quants) in fine_rollbacks.iter().zip(&fine_quants) {
                 for iy in 0..rollback.cov_y {
+                    dc_data.raw_quant_field.row_mut(rollback.by + iy)
+                        [rollback.bx..rollback.bx + rollback.cov_x]
+                        .copy_from_slice(&quants[iy * 4..iy * 4 + rollback.cov_x]);
                     for ix in 0..rollback.cov_x {
                         dc_data.ac_strategy.set_first(
                             rollback.bx + ix,
@@ -3394,8 +3408,13 @@ fn setup_dc_group(
         }
         if !positions.is_empty() {
             let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+            let xsize = dc_data.ac_strategy.xsize();
             for &(x, y, _) in &positions {
-                dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT);
+                let fallback = fine_fallbacks
+                    .get(y * xsize + x)
+                    .copied()
+                    .unwrap_or(STRATEGY_DCT);
+                dc_data.ac_strategy.set_first(x, y, fallback);
             }
             let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
             let meta_delta = cost_with.saturating_sub(cost_without) as f32;
@@ -3405,7 +3424,7 @@ fn setup_dc_group(
                     dc_data.ac_strategy.set_first(x, y, strategy);
                 }
             }
-            // Else leave ordinary fine blocks as DCT8.
+            // Else leave ordinary fine blocks on the incumbent they replaced.
         }
     }
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))

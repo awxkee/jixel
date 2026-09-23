@@ -161,8 +161,8 @@ pub(crate) struct RerankDowngrade {
 
 /// A large transform that was split only because an Identity/DCT2x2 mosaic
 /// won the joint boundary-aware rerank. The frame-level metadata gate can
-/// restore `strategy` exactly when the full fine-transform map does not repay
-/// its measured entropy cost.
+/// restore `strategy` and the `quant` it was scored at exactly when the full
+/// fine-transform map does not repay its measured entropy cost.
 #[derive(Clone, Copy)]
 pub(crate) struct FineMergeRollback {
     pub(crate) bx: usize,
@@ -170,6 +170,7 @@ pub(crate) struct FineMergeRollback {
     pub(crate) cov_x: usize,
     pub(crate) cov_y: usize,
     pub(crate) strategy: u8,
+    pub(crate) quant: u8,
     pub(crate) fine_grid: [u8; 16],
     pub(crate) benefit: f32,
 }
