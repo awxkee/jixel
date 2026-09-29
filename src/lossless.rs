@@ -5097,6 +5097,77 @@ const LZ_DEEP_MATCHER_MAX_RATIO_RCT: f64 = 1.01;
 /// factor of the best written one (the estimate itself is ~0.5% accurate).
 const VARIANT_WRITE_TOLERANCE: f64 = 1.005;
 
+/// A priced parse is kept when its estimate is below this share of the
+/// literal one.
+const PRICED_LZ_MAX_RATIO: f64 = 0.95;
+
+/// Priced LZ77 streams of a learned-tree frame (`lz77_compress_priced`),
+/// parsed twice: the second parse prices its matches by the first one's
+/// tokens. `None` unless the estimate clears `PRICED_LZ_MAX_RATIO`.
+fn priced_tree_streams<T: lz77::LiteralToken>(
+    tokens: &[Vec<T>],
+    e_lit: f64,
+    num_contexts: usize,
+    min_symbol: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<Vec<Vec<LzToken>>> {
+    let raw_slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
+    let prices = lz77::LiteralPrices::new(&raw_slices, num_contexts);
+    let threads = group_lz_threads(crate::Speed::Slow, pool);
+    let tables = DeepLzScratchPool::new(threads);
+    let parse = |scratch: &mut CoderScratch, match_prices: &lz77::MatchPrices| {
+        pool.steal_map_with_threads(scratch, tokens.len(), threads, |k, _scratch| {
+            tables.with_depth(|table| {
+                lz77::lz77_compress_priced(
+                    &tokens[k],
+                    &prices,
+                    match_prices,
+                    lz77::PRICED_MAX_PROBES,
+                    table,
+                )
+            })
+        })
+    };
+    // A stream without a parse stays literal.
+    let complete = |streams: Vec<Option<Vec<LzToken>>>| -> Vec<Vec<LzToken>> {
+        streams
+            .into_iter()
+            .zip(tokens)
+            .map(|(stream, literal)| {
+                stream.unwrap_or_else(|| literal.iter().map(|t| t.as_lz()).collect())
+            })
+            .collect()
+    };
+    let estimate = |streams: &[Vec<LzToken>], scratch: &mut CoderScratch| {
+        let slices: Vec<&[LzToken]> = streams.iter().map(Vec::as_slice).collect();
+        estimate_streams_bits(&slices, num_contexts, min_symbol, pool, scratch)
+    };
+    let first = parse(scratch, &lz77::MatchPrices::initial());
+    if first.iter().all(Option::is_none) {
+        return None;
+    }
+    let learned = {
+        let kept: Vec<&[LzToken]> = first.iter().flatten().map(Vec::as_slice).collect();
+        lz77::MatchPrices::learned(&kept, num_contexts)
+    };
+    let first = complete(first);
+    let first_bits = estimate(&first, scratch);
+    if first_bits >= e_lit * PRICED_LZ_MAX_RATIO {
+        return None;
+    }
+    let second = parse(scratch, &learned);
+    if second.iter().all(Option::is_none) {
+        return Some(first);
+    }
+    let second = complete(second);
+    if estimate(&second, scratch) < first_bits {
+        Some(second)
+    } else {
+        Some(first)
+    }
+}
+
 /// Stream variants to try for one learned-tree frame, most promising first:
 /// literal variants reuse the input, and LZ variants own their match streams.
 fn choose_tree_streams<T: lz77::LiteralToken>(
@@ -5142,6 +5213,13 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
     let (e_lit, e_run) =
         estimate_literal_and_run_bits(&raw_slices, num_contexts, min_symbol, pool, scratch);
     if e_run > e_lit * deep_lz_max_ratio {
+        // Runs lose to the literals; a structure repeated further back may
+        // still pay where a match is priced against what it replaces.
+        if let Some(priced) =
+            priced_tree_streams(&tokens, e_lit, num_contexts, min_symbol, pool, scratch)
+        {
+            return vec![TreeStreams::Literals(tokens), TreeStreams::Lz(priced)];
+        }
         return vec![TreeStreams::Literals(tokens)];
     }
     let lz = deep(scratch);

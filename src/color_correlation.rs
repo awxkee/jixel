@@ -276,6 +276,10 @@ static CFL_RDO: CflRdoFit = CflRdoFit {
     max_d: 3.0,
 };
 
+/// From this luma correlation up, an X tile is one hue modulated by
+/// luminance and takes the least-squares multiplier.
+const CFL_X_LS_MIN_CORRELATION: f32 = 0.98;
+
 #[inline]
 fn cfl_deadzone(distance: f32) -> f32 {
     if distance <= CFL_DEADZONE_LO {
@@ -293,13 +297,11 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) ->
         return 0;
     }
     let mut x = -cb / fmla(num as f32 * distance_mul, 0.5, ca);
-    // libjxl `towards_zero` deadzone: shrink toward the base correlation and
-    // snap sub-threshold slopes to it. No-op when `dz` is 0.
-    if x >= dz {
-        x -= dz;
-    } else if x <= -dz {
-        x += dz;
-    } else {
+    // Slopes inside the deadzone are noise fits and snap to the base
+    // correlation. A slope outside it is signal and is kept whole: shrinking
+    // it leaves a residual that is a scaled copy of luma, which the chroma
+    // quantizer drops, desaturating the tile. No-op when `dz` is 0.
+    if x.abs() < dz {
         x = 0.0;
     }
     x.round().clamp(-128.0, 127.0) as i32
@@ -500,6 +502,13 @@ fn optimize_channel_rdo(
         } else {
             1.0
         };
+
+    // The candidate costs count error per coefficient. A multiplier off the
+    // least-squares one leaves a residual that copies luma, and what the
+    // quantizer drops of it shifts the whole tile's saturation one way.
+    if channel == 0 && corr >= CFL_X_LS_MIN_CORRELATION {
+        return target_cand;
+    }
 
     let mut cands = [0i32; 19];
     let mut num_cands = 0usize;
@@ -1401,31 +1410,53 @@ mod tests {
         assert_eq!(cfl_deadzone(3.0), 0.0);
     }
 
-    #[test]
-    fn deadzone_shrinks_slope_at_high_quality_only() {
-        // Perfectly correlated X = 0.3*Y (ytox ≈ 25). At HQ the deadzone shrinks
-        // it toward base; at d ≥ HI it is left untouched.
+    /// X = k*Y on every pixel, so the tile's slope is k*84.
+    fn correlated_tile(k: f32) -> Image3F {
         let mut opsin = Image3F::new(64, 64);
         for y in 0..64 {
             for x in 0..64 {
                 let v = ((x ^ y) as f32) / 64.0;
                 opsin.plane_row_mut(1, y)[x] = v;
-                opsin.plane_row_mut(0, y)[x] = 0.3 * v;
+                opsin.plane_row_mut(0, y)[x] = k * v;
                 opsin.plane_row_mut(2, y)[x] = v;
             }
         }
+        opsin
+    }
+
+    #[test]
+    fn deadzone_keeps_a_real_slope_whole() {
         let ctx = EncodingContext::default();
         let mut scratch = CflScratch {
             block_b: [0.; 64],
             block_x: [0.; 64],
             block_y: [0.; 64],
         };
+        // ytox ≈ 25 and ≈ 4: both outside the deadzone, identical at every
+        // distance.
+        for k in [0.3f32, 0.045] {
+            let opsin = correlated_tile(k);
+            let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5, &mut scratch);
+            let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
+            assert_eq!(ytox_hq, ytox_lq, "k={k}");
+            assert!((ytox_hq as f32 - k * 84.0).abs() <= 1.0, "k={k}: {ytox_hq}");
+        }
+    }
+
+    #[test]
+    fn deadzone_snaps_a_sub_threshold_slope_at_high_quality_only() {
+        let ctx = EncodingContext::default();
+        let mut scratch = CflScratch {
+            block_b: [0.; 64],
+            block_x: [0.; 64],
+            block_y: [0.; 64],
+        };
+        // ytox ≈ 1, inside the 1.5 deadzone.
+        let opsin = correlated_tile(1.0 / 84.0);
         let (ytox_hq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 0.5, &mut scratch);
         let (ytox_lq, _) = compute_cmap_tile(&ctx, &opsin, 0, 0, 8, 8, 2.0, &mut scratch);
-        assert!(
-            ytox_hq < ytox_lq,
-            "deadzone should shrink the HQ slope: hq={ytox_hq} lq={ytox_lq}"
-        );
+        assert_eq!(ytox_hq, 0);
+        assert_eq!(ytox_lq, 1);
     }
 
     fn rdo_tile(opsin: &Image3F, pred_x: i32, pred_b: i32) -> (i32, i32) {

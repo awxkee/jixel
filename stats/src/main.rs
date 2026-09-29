@@ -28,6 +28,8 @@
  */
 use anyhow::{Context, Result, bail};
 use jixel::Speed;
+use plotters::coord::combinators::{LogCoord, WithKeyPoints};
+use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
 use std::cell::{Cell, RefCell};
@@ -449,6 +451,7 @@ fn main() -> Result<()> {
     let mut cvvdp_device: Option<String> = None;
     let mut with_jpeg = false;
     let mut cjpegli = "cjpegli".to_string();
+    let mut log = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -578,6 +581,10 @@ fn main() -> Result<()> {
                 with_jpeg = true;
                 i += 1;
             }
+            "--log" => {
+                log = true;
+                i += 1;
+            }
             "--cjpegli" => {
                 cjpegli = value!().to_string();
                 i += 2;
@@ -604,7 +611,9 @@ fn main() -> Result<()> {
              metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
              [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]; \
              ColorVideoVDP (opt-in): [--cvvdp] [--cvvdp-bin PATH] \
-             [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]"
+             [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n  \
+             charts: [--log] also writes *_log.png with a log rate axis (and log \
+             butteraugli axis)"
         );
     }
     register_fonts();
@@ -913,43 +922,43 @@ fn main() -> Result<()> {
         // }
 
         let chart_path = out_dir.join(format!("{stem}_rd.png"));
-        draw_chart(
+        draw_charts(
             &chart_path,
             &format!("{stem} — SSIMULACRA2 vs rate"),
             &all,
             &ss2_axis(),
+            log,
         )?;
-        println!("  chart -> {}", chart_path.display());
 
         if butteraugli.is_some() {
             let ba_path = out_dir.join(format!("{stem}_rd_butteraugli.png"));
-            draw_chart(
+            draw_charts(
                 &ba_path,
                 &format!("{stem} — butteraugli {BUTTERAUGLI_PNORM}-norm vs rate"),
                 &all,
                 &ba_axis(),
+                log,
             )?;
-            println!("  chart -> {}", ba_path.display());
 
             let ba_max_path = out_dir.join(format!("{stem}_rd_butteraugli_max.png"));
-            draw_chart(
+            draw_charts(
                 &ba_max_path,
                 &format!("{stem} — butteraugli max distance vs rate"),
                 &all,
                 &ba_max_axis(),
+                log,
             )?;
-            println!("  chart -> {}", ba_max_path.display());
         }
 
         if cvvdp.is_some() {
             let cvvdp_path = out_dir.join(format!("{stem}_rd_cvvdp.png"));
-            draw_chart(
+            draw_charts(
                 &cvvdp_path,
                 &format!("{stem} — CVVDP vs rate"),
                 &all,
                 &cvvdp_axis(),
+                log,
             )?;
-            println!("  chart -> {}", cvvdp_path.display());
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1546,6 +1555,8 @@ struct MetricAxis {
     /// Extract the metric; points that lack it are skipped.
     get: fn(&Point) -> Option<f64>,
     clamp: (f64, f64),
+    /// Strictly positive metric that may take a log y axis under `--log`.
+    log_ok: bool,
     /// Legend corner — kept away from where the curves run for this metric.
     legend: SeriesLabelPosition,
 }
@@ -1555,6 +1566,7 @@ fn ss2_axis() -> MetricAxis {
         desc: "SSIMULACRA2 (higher = better)".into(),
         get: |p| Some(p.scores.ss2),
         clamp: (0.0, 100.0),
+        log_ok: false,
         legend: SeriesLabelPosition::LowerRight,
     }
 }
@@ -1564,6 +1576,7 @@ fn ba_axis() -> MetricAxis {
         desc: format!("butteraugli {BUTTERAUGLI_PNORM}-norm distance (lower = better)"),
         get: |p| p.scores.ba,
         clamp: (0.0, f64::INFINITY),
+        log_ok: true,
         legend: SeriesLabelPosition::UpperRight,
     }
 }
@@ -1573,6 +1586,7 @@ fn ba_max_axis() -> MetricAxis {
         desc: "butteraugli max distance (lower = better)".into(),
         get: |p| p.scores.ba_max,
         clamp: (0.0, f64::INFINITY),
+        log_ok: true,
         legend: SeriesLabelPosition::UpperRight,
     }
 }
@@ -1582,28 +1596,111 @@ fn cvvdp_axis() -> MetricAxis {
         desc: "CVVDP (JOD, 10 = identical, higher = better)".into(),
         get: |p| p.scores.cvvdp,
         clamp: (0.0, 10.0),
+        log_ok: false,
         legend: SeriesLabelPosition::LowerRight,
     }
 }
 
-fn draw_chart(path: &Path, title: &str, series: &[Series], axis: &MetricAxis) -> Result<()> {
+/// Linear chart at `path`; with `--log` also a log-rate twin at `<stem>_log.png`.
+fn draw_charts(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    axis: &MetricAxis,
+    log: bool,
+) -> Result<()> {
+    draw_chart(path, title, series, axis, false)?;
+    println!("  chart -> {}", path.display());
+    if log {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chart");
+        let log_path = path.with_file_name(format!("{stem}_log.png"));
+        draw_chart(
+            &log_path,
+            &format!("{title} (log scale)"),
+            series,
+            axis,
+            true,
+        )?;
+        println!("  chart -> {}", log_path.display());
+    }
+    Ok(())
+}
+
+fn draw_chart(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    axis: &MetricAxis,
+    log: bool,
+) -> Result<()> {
+    let log_y = log && axis.log_ok;
+    let (xmin, xmax, ymin, ymax) = bounds(series, axis, log, log_y);
+    match (log, log_y) {
+        (false, _) => render(path, title, series, axis, xmin..xmax, ymin..ymax),
+        (true, false) => render(path, title, series, axis, log_axis(xmin, xmax), ymin..ymax),
+        (true, true) => render(
+            path,
+            title,
+            series,
+            axis,
+            log_axis(xmin, xmax),
+            log_axis(ymin, ymax),
+        ),
+    }
+}
+
+/// Log axis over [lo, hi] with labelled 1-2-3-5 ticks in every decade it
+/// touches (plotters' own log ticks skip everything below the first power of 10).
+fn log_axis(lo: f64, hi: f64) -> WithKeyPoints<LogCoord<f64>> {
+    let decades = (hi / lo).log10();
+    let bold_m: &[f64] = if decades >= 1.5 {
+        &[1.0, 2.0, 3.0, 5.0]
+    } else {
+        &[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    };
+    let ticks = |ms: &[f64]| -> Vec<f64> {
+        let mut out = Vec::new();
+        for e in lo.log10().floor() as i32..=hi.log10().ceil() as i32 {
+            let p = 10f64.powi(e);
+            out.extend(ms.iter().map(|m| m * p).filter(|v| (lo..=hi).contains(v)));
+        }
+        out
+    };
+    let light: Vec<f64> = ticks(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    (lo..hi)
+        .log_scale()
+        .with_key_points(ticks(bold_m))
+        .with_light_points(light)
+}
+
+fn render<XS, YS>(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    axis: &MetricAxis,
+    x_spec: XS,
+    y_spec: YS,
+) -> Result<()>
+where
+    XS: AsRangedCoord<Value = f64>,
+    YS: AsRangedCoord<Value = f64>,
+    XS::CoordDescType: ValueFormatter<f64>,
+    YS::CoordDescType: ValueFormatter<f64>,
+{
     let root = BitMapBackend::new(path, (1920, 1080)).into_drawing_area();
     root.fill(&WHITE)?;
-    let (xmin, xmax, ymin, ymax) = bounds(series, axis);
-    // Annotation offset: a small fraction of the axis range, so it works for
-    // 0..100 SSIMULACRA2 and for sub-unit butteraugli distances alike.
-    let note_dy = (ymax - ymin) * 0.012;
-    let note_dx = (xmax - xmin) * 0.005;
     let mut chart = ChartBuilder::on(&root)
         .caption(title, ("sans-serif", 26))
         .margin(16)
         .x_label_area_size(48)
         .y_label_area_size(56)
-        .build_cartesian_2d(xmin..xmax, ymin..ymax)?;
+        .build_cartesian_2d(x_spec, y_spec)?;
     chart
         .configure_mesh()
         .x_desc("rate (bits / pixel)")
         .y_desc(&axis.desc)
+        .x_label_formatter(&fmt_tick)
+        .y_label_formatter(&fmt_tick)
         .axis_desc_style(("sans-serif", 18))
         .label_style(("sans-serif", 14))
         .draw()?;
@@ -1625,17 +1722,13 @@ fn draw_chart(path: &Path, title: &str, series: &[Series], axis: &MetricAxis) ->
                 .map(|&(x, y)| Circle::new((x, y), 4, s.color.filled())),
         )?;
         // Per-point annotation above each dot ("-d 1" for distance encoders,
-        // "q90" for the quality-driven AVIF encoders), offset so it doesn't
-        // overlap the circle.
+        // "q90" for the quality-driven AVIF encoders), offset in pixels so it
+        // clears the circle on linear and log axes alike.
         let series_color = s.color;
         chart.draw_series(s.points.iter().filter_map(|pt| {
             let y = (axis.get)(pt)?;
             let style = ("sans-serif", 14).into_font().color(&series_color);
-            Some(Text::new(
-                pt.note.clone(),
-                (pt.bpp + note_dx, y + note_dy),
-                style,
-            ))
+            Some(EmptyElement::at((pt.bpp, y)) + Text::new(pt.note.clone(), (4, -18), style))
         }))?;
     }
     chart
@@ -1649,25 +1742,45 @@ fn draw_chart(path: &Path, title: &str, series: &[Series], axis: &MetricAxis) ->
     Ok(())
 }
 
-fn bounds(series: &[Series], axis: &MetricAxis) -> (f64, f64, f64, f64) {
+/// Axis tick label without float noise from log-scale key points (0.30000000000000004).
+fn fmt_tick(v: &f64) -> String {
+    let t = format!("{:.4}", v);
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t == "-0" { "0".into() } else { t.to_string() }
+}
+
+fn bounds(series: &[Series], axis: &MetricAxis, log_x: bool, log_y: bool) -> (f64, f64, f64, f64) {
     let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for s in series {
         for p in &s.points {
             let Some(y) = (axis.get)(p) else { continue };
+            if (log_x && p.bpp <= 0.0) || (log_y && y <= 0.0) {
+                continue;
+            }
             xmn = xmn.min(p.bpp);
             xmx = xmx.max(p.bpp);
             ymn = ymn.min(y);
             ymx = ymx.max(y);
         }
     }
-    let xpad = (xmx - xmn) * 0.05 + 1e-6;
-    let ypad = (ymx - ymn) * 0.08 + 1e-6;
-    (
-        xmn - xpad,
-        xmx + xpad,
-        (ymn - ypad).max(axis.clamp.0),
-        (ymx + ypad).min(axis.clamp.1),
-    )
+    let (xmn, xmx) = pad(xmn, xmx, 0.05, log_x);
+    let (ymn, ymx) = pad(ymn, ymx, 0.08, log_y);
+    if log_y {
+        (xmn, xmx, ymn, ymx.min(axis.clamp.1))
+    } else {
+        (xmn, xmx, ymn.max(axis.clamp.0), ymx.min(axis.clamp.1))
+    }
+}
+
+/// Widen [lo, hi] by `frac` of its span on each side; multiplicatively on a log axis.
+fn pad(lo: f64, hi: f64, frac: f64, log: bool) -> (f64, f64) {
+    if log {
+        let k = (hi / lo).powf(frac).max(1.0 + 1e-6);
+        (lo / k, hi * k)
+    } else {
+        let d = (hi - lo) * frac + 1e-6;
+        (lo - d, hi + d)
+    }
 }
 
 fn parse_f32_list(s: &str) -> Result<Vec<f32>> {

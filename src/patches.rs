@@ -1330,6 +1330,12 @@ pub(crate) struct GlyphParams {
     pub(crate) min_repeat_pixels: usize,
     /// Lattice values are rounded to multiples of this.
     pub(crate) coarse: i32,
+    /// A shape whose largest lattice difference from its background is
+    /// below this is left to VarDCT.
+    pub(crate) min_contrast: i32,
+    /// Unrepeated groups are kept only when together they cover this share
+    /// of the frame (0 keeps them unconditionally).
+    pub(crate) singles_min_cover: f64,
 }
 
 /// Share of the frame the glyph boxes must cover.
@@ -1518,6 +1524,7 @@ pub(crate) fn find_lossy_glyph_patches(
         }
         let bg = key_color(bg_key);
         let mut hash: u64 = 0x9e37_79b9_7f4a_7c15 ^ ((w as u64) << 32 | h as u64);
+        let mut contrast: i32 = 0;
         let rows = y0 * width..(y1 + 1) * width;
         for (plane, &bg) in planes.iter().zip(&bg) {
             let plane_rows = plane[rows.clone()].chunks_exact(width);
@@ -1525,10 +1532,14 @@ pub(crate) fn find_lossy_glyph_patches(
             for (values, owners) in plane_rows.zip(label_rows) {
                 for (&value, &owner) in values[x0..=x1].iter().zip(&owners[x0..=x1]) {
                     let v = if owner == next_label { value - bg } else { 0 };
+                    contrast = contrast.max(v.abs());
                     hash = (hash ^ (v as u32 as u64)).wrapping_mul(0xff51_afd7_ed55_8ccd);
                     hash ^= hash >> 29;
                 }
             }
+        }
+        if contrast < params.min_contrast {
+            continue;
         }
         shapes.push(Shape {
             x0,
@@ -1569,12 +1580,27 @@ pub(crate) fn find_lossy_glyph_patches(
     let mut groups: Vec<Vec<usize>> = buckets
         .into_values()
         .flatten()
-        .filter(|g| {
-            let s = &shapes[g[0]];
-            g.len() >= params.min_occurrences
-                && (g.len().max(2) - 1) * s.w * s.h >= params.min_repeat_pixels
-        })
+        .filter(|g| g.len() >= params.min_occurrences)
         .collect();
+    let pays = |g: &Vec<usize>| {
+        let s = &shapes[g[0]];
+        (g.len().max(2) - 1) * s.w * s.h >= params.min_repeat_pixels
+    };
+    // Unrepeated shapes over most of the frame make it a drawing, which the
+    // atlas takes whole; a few stray ones are left with the base, and the
+    // repeated shapes then have to pay for themselves.
+    if params.singles_min_cover > 0.0 {
+        let single_cover: usize = groups
+            .iter()
+            .filter(|g| g.len() < 2)
+            .map(|g| shapes[g[0]].w * shapes[g[0]].h)
+            .sum();
+        if (single_cover as f64) < params.singles_min_cover * (width * height) as f64 {
+            groups.retain(|g| g.len() >= 2 && pays(g));
+        }
+    } else {
+        groups.retain(pays);
+    }
     if groups.len() < 2 {
         return None;
     }
@@ -2041,6 +2067,8 @@ mod tests {
             min_occurrences,
             min_repeat_pixels: 0,
             coarse: 1,
+            min_contrast: 0,
+            singles_min_cover: 0.0,
         }
     }
 
@@ -2134,6 +2162,48 @@ mod tests {
         let all = find_lossy_glyph_patches(&img, &glyph_params(1)).expect("plan");
         assert_eq!(all.references.len(), 3);
         assert_glyph_plan_reconstructs(&img, &all);
+    }
+
+    /// The repeated marks reach 96 lattice steps on Y, the unrepeated one 48:
+    /// a contrast floor between them drops only the faint mark, and a floor
+    /// above both leaves no plan.
+    #[test]
+    fn faint_shapes_are_left_to_vardct() {
+        let img = glyph_page();
+        let params = GlyphParams {
+            min_contrast: 64,
+            ..glyph_params(1)
+        };
+        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        assert_eq!(plan.references.len(), 2);
+        assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
+        assert_glyph_plan_reconstructs(&img, &plan);
+        let params = GlyphParams {
+            min_contrast: 128,
+            ..glyph_params(1)
+        };
+        assert!(find_lossy_glyph_patches(&img, &params).is_none());
+    }
+
+    /// One 36-pixel unrepeated mark on a 192x128 page is far below any
+    /// coverage share, so it is dropped while the repeated marks stay; a
+    /// zero share keeps it.
+    #[test]
+    fn unrepeated_shapes_need_frame_coverage() {
+        let img = glyph_page();
+        let params = GlyphParams {
+            singles_min_cover: 0.5,
+            ..glyph_params(1)
+        };
+        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        assert_eq!(plan.references.len(), 2);
+        assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
+        let params = GlyphParams {
+            singles_min_cover: 0.001,
+            ..glyph_params(1)
+        };
+        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        assert_eq!(plan.references.len(), 3);
     }
 
     #[test]

@@ -50,6 +50,8 @@
 
 use anyhow::{Context, Result, bail};
 use jixel::Speed;
+use plotters::coord::combinators::{LogCoord, WithKeyPoints};
+use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -310,6 +312,7 @@ fn main() -> Result<()> {
     let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
     let mut cvvdp_display = CVVDP_DISPLAY.to_string();
     let mut cvvdp_device: Option<String> = None;
+    let mut log = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -399,6 +402,10 @@ fn main() -> Result<()> {
                 butteraugli_bin = arg(&args, i + 1)?.to_string();
                 with_butteraugli = true;
                 i += 2;
+            }
+            "--log" => {
+                log = true;
+                i += 1;
             }
             "-h" | "--help" => usage(),
             other => {
@@ -705,7 +712,7 @@ fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("folder");
     let chart_path = out_dir.join(format!("{name}_mean_rd.png"));
-    draw_chart(
+    draw_charts(
         &chart_path,
         &format!(
             "{name} — mean SSIMULACRA2 vs rate ({} images)",
@@ -715,14 +722,14 @@ fn main() -> Result<()> {
         &YAxis {
             desc: "mean SSIMULACRA2 (higher = better)".into(),
             range: (0.0, 100.0),
-            label_dy: 0.4,
+            log_ok: false,
             get: |p| Some(p.ss2),
         },
+        log,
     )?;
-    println!("chart -> {}", chart_path.display());
     if butteraugli.is_some() {
         let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli.png"));
-        draw_chart(
+        draw_charts(
             &chart_path,
             &format!(
                 "{name} — mean butteraugli {BUTTERAUGLI_PNORM}-norm vs rate ({} images)",
@@ -734,13 +741,13 @@ fn main() -> Result<()> {
                     "mean butteraugli {BUTTERAUGLI_PNORM}-norm distance (lower = better)"
                 ),
                 range: (0.0, f64::INFINITY),
-                label_dy: 0.02,
+                log_ok: true,
                 get: |p| p.ba,
             },
+            log,
         )?;
-        println!("chart -> {}", chart_path.display());
         let chart_path = out_dir.join(format!("{name}_mean_rd_butteraugli_max.png"));
-        draw_chart(
+        draw_charts(
             &chart_path,
             &format!(
                 "{name} — mean butteraugli max distance vs rate ({} images)",
@@ -750,26 +757,26 @@ fn main() -> Result<()> {
             &YAxis {
                 desc: "mean butteraugli max distance (lower = better)".into(),
                 range: (0.0, f64::INFINITY),
-                label_dy: 0.05,
+                log_ok: true,
                 get: |p| p.ba_max,
             },
+            log,
         )?;
-        println!("chart -> {}", chart_path.display());
     }
     if cvvdp.is_some() {
         let chart_path = out_dir.join(format!("{name}_mean_rd_cvvdp.png"));
-        draw_chart(
+        draw_charts(
             &chart_path,
             &format!("{name} — mean CVVDP vs rate ({} images)", images.len()),
             &series,
             &YAxis {
                 desc: "mean CVVDP (JOD, 10 = identical, higher = better)".into(),
                 range: (0.0, 10.0),
-                label_dy: 0.04,
+                log_ok: false,
                 get: |p| p.cvvdp,
             },
+            log,
         )?;
-        println!("chart -> {}", chart_path.display());
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1242,10 +1249,29 @@ struct YAxis<F: Fn(&Point) -> Option<f64>> {
     desc: String,
     /// Hard clamp of the padded y range (metric's natural bounds).
     range: (f64, f64),
-    /// Vertical offset of the per-point annotation, in axis units.
-    label_dy: f64,
+    /// Strictly positive metric that may take a log y axis under `--log`.
+    log_ok: bool,
     /// Metric accessor; points returning `None` are left off the chart.
     get: F,
+}
+
+/// Linear chart at `path`; with `--log` also a log-rate twin at `<stem>_log.png`.
+fn draw_charts<F: Fn(&Point) -> Option<f64>>(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    y: &YAxis<F>,
+    log: bool,
+) -> Result<()> {
+    draw_chart(path, title, series, y, false)?;
+    println!("chart -> {}", path.display());
+    if log {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chart");
+        let log_path = path.with_file_name(format!("{stem}_log.png"));
+        draw_chart(&log_path, &format!("{title} (log scale)"), series, y, true)?;
+        println!("chart -> {}", log_path.display());
+    }
+    Ok(())
 }
 
 /// Aggregate R/D chart: one line per series, folder-mean metric vs folder-mean bpp.
@@ -1254,20 +1280,77 @@ fn draw_chart<F: Fn(&Point) -> Option<f64>>(
     title: &str,
     series: &[Series],
     y: &YAxis<F>,
+    log: bool,
 ) -> Result<()> {
+    let log_y = log && y.log_ok;
+    let (xmin, xmax, ymin, ymax) = bounds(series, y, log, log_y);
+    match (log, log_y) {
+        (false, _) => render(path, title, series, y, xmin..xmax, ymin..ymax),
+        (true, false) => render(path, title, series, y, log_axis(xmin, xmax), ymin..ymax),
+        (true, true) => render(
+            path,
+            title,
+            series,
+            y,
+            log_axis(xmin, xmax),
+            log_axis(ymin, ymax),
+        ),
+    }
+}
+
+/// Log axis over [lo, hi] with labelled 1-2-3-5 ticks in every decade it
+/// touches (plotters' own log ticks skip everything below the first power of 10).
+fn log_axis(lo: f64, hi: f64) -> WithKeyPoints<LogCoord<f64>> {
+    let decades = (hi / lo).log10();
+    let bold_m: &[f64] = if decades >= 1.5 {
+        &[1.0, 2.0, 3.0, 5.0]
+    } else {
+        &[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    };
+    let ticks = |ms: &[f64]| -> Vec<f64> {
+        let mut out = Vec::new();
+        for e in lo.log10().floor() as i32..=hi.log10().ceil() as i32 {
+            let p = 10f64.powi(e);
+            out.extend(ms.iter().map(|m| m * p).filter(|v| (lo..=hi).contains(v)));
+        }
+        out
+    };
+    let light: Vec<f64> = ticks(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+    (lo..hi)
+        .log_scale()
+        .with_key_points(ticks(bold_m))
+        .with_light_points(light)
+}
+
+fn render<F, XS, YS>(
+    path: &Path,
+    title: &str,
+    series: &[Series],
+    y: &YAxis<F>,
+    x_spec: XS,
+    y_spec: YS,
+) -> Result<()>
+where
+    F: Fn(&Point) -> Option<f64>,
+    XS: AsRangedCoord<Value = f64>,
+    YS: AsRangedCoord<Value = f64>,
+    XS::CoordDescType: ValueFormatter<f64>,
+    YS::CoordDescType: ValueFormatter<f64>,
+{
     let root = BitMapBackend::new(path, (1920, 1080)).into_drawing_area();
     root.fill(&WHITE)?;
-    let (xmin, xmax, ymin, ymax) = bounds(series, y);
     let mut chart = ChartBuilder::on(&root)
         .caption(title, ("sans-serif", 26))
         .margin(16)
         .x_label_area_size(48)
         .y_label_area_size(56)
-        .build_cartesian_2d(xmin..xmax, ymin..ymax)?;
+        .build_cartesian_2d(x_spec, y_spec)?;
     chart
         .configure_mesh()
         .x_desc("mean rate (bits / pixel)")
         .y_desc(y.desc.as_str())
+        .x_label_formatter(&fmt_tick)
+        .y_label_formatter(&fmt_tick)
         .axis_desc_style(("sans-serif", 18))
         .label_style(("sans-serif", 14))
         .draw()?;
@@ -1289,10 +1372,11 @@ fn draw_chart<F: Fn(&Point) -> Option<f64>>(
             pts.iter()
                 .map(|&(x, y)| Circle::new((x, y), 4, s.color.filled())),
         )?;
+        // Pixel offset so the note clears the dot on linear and log axes alike.
         let series_color = s.color;
         chart.draw_series(plotted.iter().map(|(pt, v)| {
             let style = ("sans-serif", 14).into_font().color(&series_color);
-            Text::new(pt.note.clone(), (pt.bpp + 0.01, v + y.label_dy), style)
+            EmptyElement::at((pt.bpp, *v)) + Text::new(pt.note.clone(), (4, -18), style)
         }))?;
     }
     chart
@@ -1306,11 +1390,26 @@ fn draw_chart<F: Fn(&Point) -> Option<f64>>(
     Ok(())
 }
 
-fn bounds<F: Fn(&Point) -> Option<f64>>(series: &[Series], y: &YAxis<F>) -> (f64, f64, f64, f64) {
+/// Axis tick label without float noise from log-scale key points (0.30000000000000004).
+fn fmt_tick(v: &f64) -> String {
+    let t = format!("{:.4}", v);
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t == "-0" { "0".into() } else { t.to_string() }
+}
+
+fn bounds<F: Fn(&Point) -> Option<f64>>(
+    series: &[Series],
+    y: &YAxis<F>,
+    log_x: bool,
+    log_y: bool,
+) -> (f64, f64, f64, f64) {
     let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for s in series {
         for p in &s.points {
             let Some(v) = (y.get)(p) else { continue };
+            if (log_x && p.bpp <= 0.0) || (log_y && v <= 0.0) {
+                continue;
+            }
             xmn = xmn.min(p.bpp);
             xmx = xmx.max(p.bpp);
             ymn = ymn.min(v);
@@ -1319,16 +1418,31 @@ fn bounds<F: Fn(&Point) -> Option<f64>>(series: &[Series], y: &YAxis<F>) -> (f64
     }
     // Guard against an all-empty chart (every series skipped).
     if xmn > xmx {
-        return (0.0, 1.0, y.range.0, y.range.1);
+        let x0 = if log_x { 0.1 } else { 0.0 };
+        return if log_y {
+            (x0, 1.0, 0.1, 1.0)
+        } else {
+            (x0, 1.0, y.range.0, y.range.1)
+        };
     }
-    let xpad = (xmx - xmn) * 0.05 + 1e-6;
-    let ypad = (ymx - ymn) * 0.08 + 1e-6;
-    (
-        xmn - xpad,
-        xmx + xpad,
-        (ymn - ypad).max(y.range.0),
-        (ymx + ypad).min(y.range.1),
-    )
+    let (xmn, xmx) = pad(xmn, xmx, 0.05, log_x);
+    let (ymn, ymx) = pad(ymn, ymx, 0.08, log_y);
+    if log_y {
+        (xmn, xmx, ymn, ymx.min(y.range.1))
+    } else {
+        (xmn, xmx, ymn.max(y.range.0), ymx.min(y.range.1))
+    }
+}
+
+/// Widen [lo, hi] by `frac` of its span on each side; multiplicatively on a log axis.
+fn pad(lo: f64, hi: f64, frac: f64, log: bool) -> (f64, f64) {
+    if log {
+        let k = (hi / lo).powf(frac).max(1.0 + 1e-6);
+        (lo / k, hi * k)
+    } else {
+        let d = (hi - lo) * frac + 1e-6;
+        (lo - d, hi + d)
+    }
 }
 
 /// Arithmetic mean of a non-empty slice.
@@ -1397,12 +1511,13 @@ fn usage() -> ! {
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
          \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n\
-         \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH]\n\
+         \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH] [--log]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
          image in FOLDER at each distance, decodes, scores SSIMULACRA2 (the butteraugli\n  \
          3-norm too whenever butteraugli_main is on PATH, and ColorVideoVDP JOD with\n  \
          --cvvdp), prints the folder mean bpp/SS2[/BA3][/CVVDP] per series, and writes\n  \
-         an aggregate R/D chart per metric to DIR."
+         an aggregate R/D chart per metric to DIR. --log also writes *_log.png twins\n  \
+         with a log rate axis (and log butteraugli axis)."
     );
     std::process::exit(2);
 }

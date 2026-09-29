@@ -1609,7 +1609,7 @@ fn prepare_vardct_variant(
     // the plan only adds atlas and sampling work.
     let near_tiles = distance.clamp(0.5, NEAR_TILES_MAX);
     let glyph_plan = if patches {
-        let singles = distance <= GLYPH_SINGLETON_MAX_DISTANCE;
+        let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
         let coarse = if distance < 1.5 {
             1
         } else if distance < 2.0 {
@@ -1622,9 +1622,19 @@ fn prepare_vardct_variant(
         crate::patches::find_lossy_glyph_patches(
             &xyb,
             &crate::patches::GlyphParams {
-                min_occurrences: if singles { 1 } else { 2 },
-                min_repeat_pixels: if singles { 0 } else { GLYPH_MIN_REPEAT_PIXELS },
+                min_occurrences: 1,
+                min_repeat_pixels: if free_singles {
+                    0
+                } else {
+                    GLYPH_MIN_REPEAT_PIXELS
+                },
                 coarse,
+                min_contrast: GLYPH_MIN_CONTRAST_STEPS * coarse,
+                singles_min_cover: if free_singles {
+                    0.0
+                } else {
+                    GLYPH_SINGLETON_MIN_COVER
+                },
             },
         )
     } else {
@@ -2215,8 +2225,13 @@ fn spline_quant_field(
     Ok(field)
 }
 
-/// Unrepeated glyphs join the atlas up to this distance.
-const GLYPH_SINGLETON_MAX_DISTANCE: f32 = 1.0;
+/// Unrepeated glyphs join the atlas freely up to this distance; above it
+/// only when together they cover this share of the frame.
+const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
+const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
+/// A glyph must differ from its background by this many lattice rounding
+/// steps somewhere; fainter shapes are shading the base codes for less.
+const GLYPH_MIN_CONTRAST_STEPS: i32 = 2;
 /// Box pixels a repeated glyph must save beyond its first occurrence.
 const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
 /// A glyph plan is checked against the regular frame only from this distance
