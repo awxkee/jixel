@@ -108,6 +108,8 @@ struct DistanceParams {
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
     gab_enabled: bool,
+    /// Multipliers of the default DC steps of X, Y and B.
+    dc_step: [f32; 3],
 }
 
 const DC_REFINE_PEAK: f32 = 1.35;
@@ -214,6 +216,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         epf_iters,
         epf_pass0_scale,
         gab_enabled,
+        dc_step: [1.0; 3],
     }
 }
 
@@ -1090,7 +1093,14 @@ fn write_dc_global(
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    w.write(1, 1); // default dequant DC
+    if let Some(steps) = crate::color_correlation::dc_step_wire(distp.dc_step) {
+        w.write(1, 0);
+        for step in steps {
+            w.write(16, u64::from(step));
+        }
+    } else {
+        w.write(1, 1); // default dequant DC
+    }
     write_quant_scales(distp.global_scale, distp.quant_dc, w);
     write_block_ctx_map(ac_plan, scratch, w);
 
@@ -1609,7 +1619,7 @@ fn prepare_vardct_variant(
     // the plan only adds atlas and sampling work.
     let near_tiles = distance.clamp(0.5, NEAR_TILES_MAX);
     let glyph_plan = if patches {
-        let singles = distance <= GLYPH_SINGLETON_MAX_DISTANCE;
+        let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
         let coarse = if distance < 1.5 {
             1
         } else if distance < 2.0 {
@@ -1622,9 +1632,19 @@ fn prepare_vardct_variant(
         crate::patches::find_lossy_glyph_patches(
             &xyb,
             &crate::patches::GlyphParams {
-                min_occurrences: if singles { 1 } else { 2 },
-                min_repeat_pixels: if singles { 0 } else { GLYPH_MIN_REPEAT_PIXELS },
+                min_occurrences: 1,
+                min_repeat_pixels: if free_singles {
+                    0
+                } else {
+                    GLYPH_MIN_REPEAT_PIXELS
+                },
                 coarse,
+                min_contrast: GLYPH_MIN_CONTRAST_STEPS * coarse,
+                singles_min_cover: if free_singles {
+                    0.0
+                } else {
+                    GLYPH_SINGLETON_MIN_COVER
+                },
             },
         )
     } else {
@@ -1769,7 +1789,9 @@ fn prepare_vardct_variant(
             used_tiles,
             estimated_bits: None,
         };
-        if distance >= GLYPH_CHECK_MIN_DISTANCE {
+        // Below Slow the atlas has neither the learned tree nor a palette
+        // and can outweigh the frame it replaces at any distance.
+        if distance >= GLYPH_CHECK_MIN_DISTANCE || ctx.speed != Speed::Slow {
             let bits = prepared.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
             if atlas_bits as f64 > bits * GLYPH_CHECK_ATLAS_SHARE {
                 let mut regular = xyb;
@@ -2215,12 +2237,20 @@ fn spline_quant_field(
     Ok(field)
 }
 
-/// Unrepeated glyphs join the atlas up to this distance.
-const GLYPH_SINGLETON_MAX_DISTANCE: f32 = 1.0;
+/// Unrepeated glyphs join the atlas freely up to this distance; above it
+/// only when together they cover this share of the frame.
+const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
+const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
+/// A glyph must differ from its background by this many lattice rounding
+/// steps somewhere; fainter shapes are shading the base codes for less.
+const GLYPH_MIN_CONTRAST_STEPS: i32 = 2;
 /// Box pixels a repeated glyph must save beyond its first occurrence.
 const GLYPH_MIN_REPEAT_PIXELS: usize = 48;
 /// A glyph plan is checked against the regular frame only from this distance
 /// and when the atlas frames take more than this share of the patched bits.
+/// Share of the scan walk the custom coefficient orders must remove before
+/// the refine pass's prices are rebuilt on them.
+const RDOQ_FRESH_PRICES_MIN_SCAN_MOVE: f64 = 0.35;
 const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
 const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 /// Patched bits may exceed the regular frame's by this factor.
@@ -2591,17 +2621,21 @@ fn encode_frame_core(
     // Adopt the first group's buffers instead of allocating an empty tally.
     // Fast and progressive frames never allocate aggregate order statistics.
     let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
-    for (dc_idx, gx, gy, p, local, source_b, stats) in results {
+    for (dc_idx, gx, gy, p, local, source, stats) in results {
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
-        if let Some(source) = source_b {
+        if let Some(source) = source {
             let dc = &mut dc_datas[dc_idx];
-            let target = dc.source_dc_b.get_or_insert_with(|| {
-                crate::image::Plane::new(dc.quant_dc.xsize(), dc.quant_dc.ysize())
-            });
+            let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
             let ox = gx * K_GROUP_DIM_IN_BLOCKS;
             let oy = gy * K_GROUP_DIM_IN_BLOCKS;
-            for y in 0..source.ysize() {
-                target.row_mut(oy + y)[ox..ox + source.xsize()].copy_from_slice(source.row(y));
+            for (target, source) in [
+                (&mut dc.source_dc_y, &source.y),
+                (&mut dc.source_dc_b, &source.b),
+            ] {
+                let target = target.get_or_insert_with(|| crate::image::Plane::new(w, h));
+                for y in 0..source.ysize() {
+                    target.row_mut(oy + y)[ox..ox + source.xsize()].copy_from_slice(source.row(y));
+                }
             }
         }
         all_pending.push(p);
@@ -2626,9 +2660,9 @@ fn encode_frame_core(
 
     let mut ytob_dc = 0i32;
     if want_order_stats {
-        if let Some(stats) = &order_stats {
-            crate::coeff_order::derive_orders(stats, &mut coeff_orders);
-        }
+        let scan_moved = order_stats.as_ref().map_or(0.0, |stats| {
+            crate::coeff_order::derive_orders(stats, &mut coeff_orders)
+        });
         ytob_dc = choose_ytob_dc(
             &dc_datas,
             ctx.fill_ytob_row,
@@ -2643,8 +2677,48 @@ fn encode_frame_core(
             distp.scale_dc,
             ctx.quantize_dc_cfl,
         );
+        distp.dc_step =
+            crate::color_correlation::choose_dc_steps(&dc_datas, distp.scale_dc, ytob_dc);
         for dc in &mut dc_datas {
             dc.source_dc_b = None;
+            dc.source_dc_y = None;
+        }
+        // The first pass's tokens follow the natural scans. Once the custom
+        // orders move most of the walk, they no longer describe what the
+        // contexts of the refine pass will see, and the quantizer would price
+        // its choices on them: tokenize again on the orders it codes with.
+        if scan_moved >= RDOQ_FRESH_PRICES_MIN_SCAN_MOVE {
+            // These streams will be replaced; release their token buffers
+            // before allocating the reordered streams for the whole frame.
+            all_pending.clear();
+            let dc_ref = &dc_datas;
+            let reordered = ctx
+                .thread_pool
+                .steal_map(scratch, ac_tasks.len(), |t, scratch| {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    process_ac_group(
+                        ctx,
+                        scratch,
+                        opsin,
+                        &dim,
+                        &distp,
+                        &dc_ref[dc_idx],
+                        num_passes,
+                        coeff_shifts,
+                        dc_gx,
+                        dc_gy,
+                        gx,
+                        gy,
+                        ytob_dc,
+                        None,
+                        &coeff_orders,
+                        false,
+                        qf_threshold,
+                    )
+                    .0
+                });
+            all_pending.extend(reordered);
         }
         let prices = {
             let provisional_code = crate::entropy::optimize_entropy_code_ac_streams(
@@ -3314,6 +3388,7 @@ fn setup_dc_group(
         distp.distance,
     );
     let mut fine_rollbacks = Vec::new();
+    let mut fine_fallbacks = Vec::new();
     dc_data.sub8_benefit = crate::ac_strategy::fill_ac_strategy(
         ctx,
         scratch,
@@ -3328,6 +3403,7 @@ fn setup_dc_group(
         &dc_data.ytob_map,
         &mut dc_data.ac_strategy,
         &mut fine_rollbacks,
+        &mut fine_fallbacks,
         num_threads,
     );
     // A fine mosaic that split an otherwise-retained merge must repay its own
@@ -3338,7 +3414,16 @@ fn setup_dc_group(
     } else {
         let fine_benefit: f32 = fine_rollbacks.iter().map(|r| r.benefit).sum();
         let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+        let mut fine_quants = Vec::with_capacity(fine_rollbacks.len());
         for rollback in &fine_rollbacks {
+            let mut quants = [0u8; 16];
+            for iy in 0..rollback.cov_y {
+                let row = dc_data.raw_quant_field.row_mut(rollback.by + iy);
+                let cells = &mut row[rollback.bx..rollback.bx + rollback.cov_x];
+                quants[iy * 4..iy * 4 + rollback.cov_x].copy_from_slice(cells);
+                cells.fill(rollback.quant);
+            }
+            fine_quants.push(quants);
             dc_data
                 .ac_strategy
                 .set_first(rollback.bx, rollback.by, rollback.strategy);
@@ -3348,8 +3433,11 @@ fn setup_dc_group(
         let fine_lambda = crate::ac_strategy::fine_mosaic_lambda(distp.distance);
         let accepted = fine_benefit > fine_lambda * meta_delta;
         if accepted {
-            for rollback in &fine_rollbacks {
+            for (rollback, quants) in fine_rollbacks.iter().zip(&fine_quants) {
                 for iy in 0..rollback.cov_y {
+                    dc_data.raw_quant_field.row_mut(rollback.by + iy)
+                        [rollback.bx..rollback.bx + rollback.cov_x]
+                        .copy_from_slice(&quants[iy * 4..iy * 4 + rollback.cov_x]);
                     for ix in 0..rollback.cov_x {
                         dc_data.ac_strategy.set_first(
                             rollback.bx + ix,
@@ -3394,8 +3482,13 @@ fn setup_dc_group(
         }
         if !positions.is_empty() {
             let cost_with = meta_entropy_cost(&dc_data, scratch, distp.distance);
+            let xsize = dc_data.ac_strategy.xsize();
             for &(x, y, _) in &positions {
-                dc_data.ac_strategy.set_first(x, y, STRATEGY_DCT);
+                let fallback = fine_fallbacks
+                    .get(y * xsize + x)
+                    .copied()
+                    .unwrap_or(STRATEGY_DCT);
+                dc_data.ac_strategy.set_first(x, y, fallback);
             }
             let cost_without = meta_entropy_cost(&dc_data, scratch, distp.distance);
             let meta_delta = cost_with.saturating_sub(cost_without) as f32;
@@ -3405,7 +3498,7 @@ fn setup_dc_group(
                     dc_data.ac_strategy.set_first(x, y, strategy);
                 }
             }
-            // Else leave ordinary fine blocks as DCT8.
+            // Else leave ordinary fine blocks on the incumbent they replaced.
         }
     }
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
@@ -3470,7 +3563,7 @@ fn process_ac_group(
 ) -> (
     PendingAcGroup,
     Image3S,
-    Option<crate::image::Plane<f32>>,
+    Option<crate::group::SourceDc>,
     Option<crate::coeff_order::OrderStats>,
 ) {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
@@ -3486,7 +3579,10 @@ fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
-    let mut source_dc_b = collect_order_stats.then(|| crate::image::Plane::new(gwb, ghb));
+    let mut source_dc = collect_order_stats.then(|| crate::group::SourceDc {
+        y: crate::image::Plane::new(gwb, ghb),
+        b: crate::image::Plane::new(gwb, ghb),
+    });
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
         .collect();
@@ -3529,12 +3625,13 @@ fn process_ac_group(
             stripe_brect,
             distp.scale,
             distp.scale_dc,
+            distp.dc_step,
             distp.distance,
             distp.x_qm_scale,
             dc_data,
             ytob_dc,
             &mut local_quant_dc,
-            source_dc_b.as_mut(),
+            source_dc.as_mut(),
             qorigin_x,
             qorigin_y,
             &mut num_nzeros,
@@ -3554,7 +3651,7 @@ fn process_ac_group(
             tokens,
         },
         local_quant_dc,
-        source_dc_b,
+        source_dc,
         order_stats,
     )
 }

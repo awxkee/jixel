@@ -155,8 +155,45 @@ pub(crate) fn sse_and_rate_neon<const BIASED: bool>(
     thr: &[f32; 4],
     scan_pos: &[u32],
 ) -> (f32, usize, f32, u32) {
+    sse_and_rate_neon_impl::<BIASED, false>(
+        coeff,
+        inv_matrix,
+        q_scaled,
+        width,
+        height,
+        half,
+        cx,
+        cy,
+        _rate_log2_lut,
+        thr,
+        scan_pos,
+        &mut [],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = vdupq_n_f32(q_scaled);
@@ -228,7 +265,15 @@ pub(crate) fn sse_and_rate_neon<const BIASED: bool>(
 
             // Quantized AC coefficients are commonly zero. Do not run the
             // seven-FMA logarithm when none of this vector contributes rate.
-            if vmaxvq_u32(rate_mask) != 0 {
+            if SAVE_LEVELS {
+                let quantized = vandq_s32(
+                    vcvtaq_s32_f32(a),
+                    vreinterpretq_s32_u32(vandq_u32(keep, active)),
+                );
+                unsafe { vst1q_s32(levels.as_mut_ptr().add(y * width + x), quantized) };
+            }
+
+            if !SAVE_LEVELS && vmaxvq_u32(rate_mask) != 0 {
                 let ratev = neon_log2p1_f32(absq);
                 mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate_mask, ratev, zero));
                 // Scan position of the nonzeros (LLF slots are never nonzero

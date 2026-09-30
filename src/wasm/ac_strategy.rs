@@ -185,8 +185,45 @@ pub(crate) fn sse_and_rate_wasm<const BIASED: bool>(
     thr: &[f32; 4],
     scan_pos: &[u32],
 ) -> (f32, usize, f32, u32) {
+    sse_and_rate_wasm_impl::<BIASED, false>(
+        coeff,
+        inv_matrix,
+        q_scaled,
+        width,
+        height,
+        half,
+        cx,
+        cy,
+        _rate_log2_lut,
+        thr,
+        scan_pos,
+        &mut [],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "simd128")]
+pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = f32x4_splat(q_scaled);
@@ -268,7 +305,18 @@ pub(crate) fn sse_and_rate_wasm<const BIASED: bool>(
             let rate_bits = i32x4_bitmask(rate_mask);
             nzeros += rate_bits.count_ones() as usize;
 
-            if rate_bits != 0 {
+            if SAVE_LEVELS {
+                let truncated = f32x4_trunc(a);
+                let frac = f32x4_sub(a, truncated);
+                let ge_half = f32x4_ge(f32x4_abs(frac), f32x4_splat(0.5));
+                let signed_one = v128_or(f32x4_splat(1.0), v128_and(a, f32x4_splat(-0.0)));
+                let quantized =
+                    i32x4_trunc_sat_f32x4(f32x4_add(truncated, v128_and(signed_one, ge_half)));
+                let quantized = v128_and(quantized, v128_and(keep, active));
+                unsafe { v128_store(levels.as_mut_ptr().add(y * width + x).cast(), quantized) };
+            }
+
+            if !SAVE_LEVELS && rate_bits != 0 {
                 let ratev = wasm_log2p1_f32(absq);
                 mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
                 // Scan position of the nonzeros (masked lanes drop to zero,

@@ -42,7 +42,7 @@ use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, f
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
-use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
+use crate::quant_weights::INV_DC_QUANT;
 use crate::util::{FastRound, HeapMatrix, heap_array};
 use std::sync::OnceLock;
 
@@ -878,6 +878,12 @@ impl Default for AcGroupScratch {
     }
 }
 
+/// Unrounded Y and B DC of an AC group.
+pub(crate) struct SourceDc {
+    pub(crate) y: crate::image::Plane<f32>,
+    pub(crate) b: crate::image::Plane<f32>,
+}
+
 /// Process and tokenize one stripe of an AC group, pushing tokens into `out`.
 /// Callers buffer tokens across all AC groups, build an adaptive entropy code
 /// from the aggregate distribution, then emit them in `encode_frame`.
@@ -889,12 +895,13 @@ pub(crate) fn write_ac_group(
     group_brect: Rect,
     scale: f32,
     scale_dc: f32,
+    dc_step: [f32; 3],
     distance: f32,
     x_qm_scale: u32,
     dc_data: &DcGroupData,
     ytob_dc: i32,
     quant_dc: &mut Image3S,
-    mut source_dc_b: Option<&mut crate::image::Plane<f32>>,
+    mut source_dc: Option<&mut SourceDc>,
     qorigin_x: usize,
     qorigin_y: usize,
     num_nzeros: &mut [Image3B],
@@ -911,16 +918,14 @@ pub(crate) fn write_ac_group(
     let ysize_blocks = group_brect.ysize;
 
     let inv_factor = [
-        INV_DC_QUANT[0] * scale_dc,
-        INV_DC_QUANT[1] * scale_dc,
-        INV_DC_QUANT[2] * scale_dc,
+        INV_DC_QUANT[0] / dc_step[0] * scale_dc,
+        INV_DC_QUANT[1] / dc_step[1] * scale_dc,
+        INV_DC_QUANT[2] / dc_step[2] * scale_dc,
     ];
     // `base_correlation_b` (= 1) plus the frame's signaled `ytob_dc / 84`,
     // converted from dequantized XYB into stored-B-DC units. Folded into the
     // quantizer below so the slope costs no extra rounding error.
-    let cfl_factor_b = INV_DC_QUANT[2]
-        * DC_QUANT[1]
-        * (1.0 + ytob_dc as f32 / crate::color_correlation::K_COLOR_FACTOR);
+    let cfl_factor_b = crate::color_correlation::dc_cfl_factor(dc_step, ytob_dc);
     let x_qm_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
@@ -1143,6 +1148,13 @@ pub(crate) fn write_ac_group(
                 inv_factor[1],
                 &mut y_dc_q[..covered_dc],
             );
+            if let Some(source) = source_dc.as_mut() {
+                for iy in 0..cov_y {
+                    let bx = global_bx - qorigin_x;
+                    source.y.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                        .copy_from_slice(&dc_vals[1][iy * cov_x..(iy + 1) * cov_x]);
+                }
+            }
             for iy in 0..cov_y {
                 let lbx = global_bx - qorigin_x;
                 let quant_target =
@@ -1429,10 +1441,10 @@ pub(crate) fn write_ac_group(
 
             // Keep the fractional source for the DC predictor check. Y DC
             // and these B lowest frequencies are unchanged by AC reranking.
-            if let Some(source) = source_dc_b.as_mut() {
+            if let Some(source) = source_dc.as_mut() {
                 for iy in 0..cov_y {
                     let bx = global_bx - qorigin_x;
-                    source.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                    source.b.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
                         .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
                 }
             }

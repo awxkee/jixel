@@ -45,6 +45,7 @@ mod ytob;
 
 pub(crate) use ac_strategy::{
     gradient_region_stats_wasm, gradient_region_stats_with_chroma_wasm, sse_and_rate_wasm,
+    sse_and_rate_wasm_impl,
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};

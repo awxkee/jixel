@@ -161,8 +161,8 @@ pub(crate) struct RerankDowngrade {
 
 /// A large transform that was split only because an Identity/DCT2x2 mosaic
 /// won the joint boundary-aware rerank. The frame-level metadata gate can
-/// restore `strategy` exactly when the full fine-transform map does not repay
-/// its measured entropy cost.
+/// restore `strategy` and the `quant` it was scored at exactly when the full
+/// fine-transform map does not repay its measured entropy cost.
 #[derive(Clone, Copy)]
 pub(crate) struct FineMergeRollback {
     pub(crate) bx: usize,
@@ -170,6 +170,7 @@ pub(crate) struct FineMergeRollback {
     pub(crate) cov_x: usize,
     pub(crate) cov_y: usize,
     pub(crate) strategy: u8,
+    pub(crate) quant: u8,
     pub(crate) fine_grid: [u8; 16],
     pub(crate) benefit: f32,
 }
@@ -347,6 +348,9 @@ pub(crate) struct CoderScratch {
     pub(crate) patch_tile_colors: LazyScratch<Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>>,
     /// ~63KB of CfL RDO coefficient staging; only Slow lossy workers use it.
     pub(crate) cfl_rdo: LazyScratch<crate::color_correlation::CflRdoScratch>,
+    /// Learned rate prices of the DC group this worker is selecting
+    /// transforms for; see `ac_strategy::RatePricesScope`.
+    pub(crate) rate_prices: Option<std::sync::Arc<crate::ac_strategy::RatePrices>>,
     #[cfg(feature = "splines")]
     pub(crate) spline_fit: LazyScratch<Box<crate::splines::FitScratch>>,
 }
@@ -407,6 +411,7 @@ impl CoderScratch {
             dc_predictor: LazyScratch::default(),
             patch_tile_colors: LazyScratch::new(|| heap_array([0; 3])),
             cfl_rdo: LazyScratch::default(),
+            rate_prices: None,
             #[cfg(feature = "splines")]
             spline_fit: LazyScratch::default(),
         }

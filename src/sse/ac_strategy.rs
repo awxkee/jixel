@@ -189,8 +189,45 @@ pub(crate) fn sse_and_rate_sse<const BIASED: bool>(
     thr: &[f32; 4],
     scan_pos: &[u32],
 ) -> (f32, usize, f32, u32) {
+    sse_and_rate_sse_impl::<BIASED, false>(
+        coeff,
+        inv_matrix,
+        q_scaled,
+        width,
+        height,
+        half,
+        cx,
+        cy,
+        _rate_log2_lut,
+        thr,
+        scan_pos,
+        &mut [],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
     let n = width * height;
-    assert!(coeff.len() >= n && inv_matrix.len() >= n && scan_pos.len() >= n);
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
     debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
 
     let qs = _mm_set1_ps(q_scaled);
@@ -279,7 +316,21 @@ pub(crate) fn sse_and_rate_sse<const BIASED: bool>(
             let rate_bits = _mm_movemask_ps(rate_mask);
             nzeros += rate_bits.count_ones() as usize;
 
-            if rate_bits != 0 {
+            if SAVE_LEVELS {
+                let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(a);
+                let frac = _mm_sub_ps(a, truncated);
+                let ge_half = _mm_cmpge_ps(_mm_andnot_ps(sign_mask, frac), _mm_set1_ps(0.5));
+                let signed_one = _mm_or_ps(_mm_set1_ps(1.0), _mm_and_ps(a, sign_mask));
+                let quantized =
+                    _mm_cvttps_epi32(_mm_add_ps(truncated, _mm_and_ps(signed_one, ge_half)));
+                let quantized =
+                    _mm_and_si128(quantized, _mm_and_si128(_mm_castps_si128(keep), active_i));
+                unsafe {
+                    _mm_storeu_si128(levels.as_mut_ptr().add(y * width + x).cast(), quantized)
+                };
+            }
+
+            if !SAVE_LEVELS && rate_bits != 0 {
                 let ratev = sse_log2p1_f32(absq);
                 mag_acc = _mm_add_ps(mag_acc, _mm_and_ps(ratev, rate_mask));
                 // Scan position of the nonzeros (masked lanes drop to zero,

@@ -48,6 +48,7 @@ mod ytob;
 
 pub(crate) use ac_strategy::{
     gradient_region_stats_avx2, gradient_region_stats_with_chroma_avx2, sse_and_rate_avx2,
+    sse_and_rate_avx2_impl,
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
