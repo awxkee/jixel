@@ -339,6 +339,12 @@ pub struct EncodeConfig {
     pub decoding_speed: DecodingSpeed,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Choose VarDCT transforms by what each candidate costs under the
+    /// image's own coefficient statistics instead of a fixed rate model.
+    /// Patterned and synthetic content compresses much better; photographs
+    /// are about unchanged. Takes effect at [`Speed::Slow`] only, where it
+    /// costs encode time. Defaults to true.
+    pub learned_rate: bool,
     /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
     /// encoded as a second JPEG XL codestream and shipped in a `jhgm`
     /// container box together with its ISO 21496-1 metadata. Forces the
@@ -433,6 +439,7 @@ impl Default for EncodeConfig {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             lossy_modular: LossyModular::Off,
+            learned_rate: true,
             gain_map: None,
         }
     }
@@ -722,6 +729,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Price VarDCT transform candidates by the image's own coefficient
+    /// statistics (see [`EncodeConfig::learned_rate`]).
+    pub fn with_learned_rate(mut self, learned_rate: bool) -> Self {
+        self.learned_rate = learned_rate;
+        self
+    }
+
     /// Attach an HDR gain map (see [`GainMap`]). It is encoded as its own
     /// JPEG XL codestream and written into a `jhgm` container box.
     pub fn with_gain_map(mut self, gain_map: GainMap) -> Self {
@@ -803,6 +817,7 @@ fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
+    ctx.selector.learned_rate = config.learned_rate && config.speed == Speed::Slow;
     #[cfg(feature = "splines")]
     {
         ctx.splines = config.splines
@@ -2974,6 +2989,50 @@ mod encode_smoke_tests {
     }
 
     #[test]
+    fn fast_lossy_patches_are_rate_safe_on_unrepeated_ink() {
+        // Saturated line drawings in separate 60-pixel tiles, each broken
+        // by its own gaps: every tile is a singleton glyph, so the whole
+        // image lands in the atlas, which below Slow is coded without a
+        // palette or a learned tree.
+        const SIZE: usize = 256;
+        let mut pixels = vec![0u8; SIZE * SIZE * 3];
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                if (x % 8 == 3 || y % 8 == 3) && x % 64 < 60 && y % 64 < 60 {
+                    let blue = if (x / 64 + y / 64) % 2 == 0 { 254 } else { 0 };
+                    pixels[(y * SIZE + x) * 3..][..3].copy_from_slice(&[252, 0, blue]);
+                }
+            }
+        }
+        let mut state = 0x2545_f491u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize
+        };
+        for _ in 0..60 {
+            let (x0, y0) = (next() % (SIZE - 8), next() % (SIZE - 8));
+            let (w, h) = (2 + next() % 6, 1 + next() % 5);
+            for y in y0..y0 + h {
+                pixels[(y * SIZE + x0) * 3..][..w * 3].fill(0);
+            }
+        }
+        for distance in [1.0f32, 3.0] {
+            let plain = EncodeConfig::default().with_distance(distance);
+            let patched = plain.clone().with_patches(true);
+            let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
+            let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
+            assert!(
+                patched.len() * 10 <= plain.len() * 11,
+                "d={distance}: {} vs {}",
+                patched.len(),
+                plain.len()
+            );
+        }
+    }
+
+    #[test]
     fn lossy_patches_reduce_repeated_regions() {
         const PW: usize = 256;
         const PH: usize = 256;
@@ -3183,6 +3242,175 @@ mod encode_smoke_tests {
             fastest, fast,
             "Fastest should skip the transform search Fast performs"
         );
+    }
+
+    /// A 4-pixel red checkerboard under a slow brightness drift.
+    fn checkerboard_rgb(size: usize) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(size * size * 3);
+        for y in 0..size {
+            for x in 0..size {
+                let lit = (x / 4 + y / 4) % 2 == 1;
+                let drift = (x * 24 / size + y * 12 / size) as u8;
+                pixels.extend_from_slice(&if lit {
+                    [210 - drift, 8, 6]
+                } else {
+                    [40 - drift.min(40), 0, 0]
+                });
+            }
+        }
+        pixels
+    }
+
+    fn learned_rate_lossy(distance: f32) -> EncodeConfig {
+        EncodeConfig::default()
+            .with_distance(distance)
+            .with_speed(Speed::Slow)
+            .with_patches(false)
+            .with_learned_rate(true)
+    }
+
+    #[test]
+    fn learned_rate_output_is_independent_of_thread_count() {
+        const SIZE: usize = 272;
+        let pixels = checkerboard_rgb(SIZE);
+        for distance in [1.0f32, 2.0, 4.0] {
+            let config = learned_rate_lossy(distance);
+            let single = encode_image(&pixels, SIZE, SIZE, &config.clone().with_num_threads(1))
+                .expect("single-threaded encode failed");
+            for threads in [2, 8] {
+                let threaded = encode_image(
+                    &pixels,
+                    SIZE,
+                    SIZE,
+                    &config.clone().with_num_threads(threads),
+                )
+                .expect("multi-threaded encode failed");
+                assert_eq!(single, threaded, "d={distance} threads={threads}");
+            }
+        }
+    }
+
+    /// Two DC groups: the first is sampled by regions, the second is too
+    /// narrow for that and is its own pilot.
+    #[test]
+    fn learned_rate_is_deterministic_across_dc_groups() {
+        const WIDTH: usize = 2112;
+        const HEIGHT: usize = 128;
+        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let lit = (x / 4 + y / 4) % 2 == 1;
+                let ramp = (x * 97 / WIDTH) as u8;
+                pixels.extend_from_slice(&if lit {
+                    [200 - ramp, 30 + ramp, 12]
+                } else {
+                    [20 + ramp / 2, ramp, 90]
+                });
+            }
+        }
+        let config = learned_rate_lossy(2.0);
+        let single = encode_image(&pixels, WIDTH, HEIGHT, &config.clone().with_num_threads(1))
+            .expect("single-threaded encode failed");
+        let threaded = encode_image(&pixels, WIDTH, HEIGHT, &config.with_num_threads(8))
+            .expect("multi-threaded encode failed");
+        assert_eq!(single, threaded);
+    }
+
+    #[test]
+    fn learned_rate_encodes_images_smaller_than_a_region() {
+        for size in [8usize, 40, 63, 100] {
+            let pixels = checkerboard_rgb(size);
+            for distance in [1.0f32, 3.0] {
+                let bytes = encode_image(&pixels, size, size, &learned_rate_lossy(distance))
+                    .expect("encode failed");
+                assert!(!bytes.is_empty(), "{size} at d={distance}");
+            }
+        }
+    }
+
+    #[test]
+    fn learned_rate_shrinks_a_block_periodic_pattern() {
+        const SIZE: usize = 256;
+        let pixels = checkerboard_rgb(SIZE);
+        for distance in [2.0f32, 3.0] {
+            let learned = learned_rate_lossy(distance).with_num_threads(1);
+            let fixed = learned.clone().with_learned_rate(false);
+            let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
+            let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+            assert!(
+                learned.len() * 10 < fixed.len() * 8,
+                "d={distance}: {} vs {}",
+                learned.len(),
+                fixed.len()
+            );
+        }
+    }
+
+    #[test]
+    fn learned_rate_prices_every_transform_of_a_small_image() {
+        // Nine 64x64 positions: too few for a table by count, enough by
+        // the blocks they cover. Left on the fixed model, the 64x64
+        // transform undercuts the learned ones and takes the image.
+        const SIZE: usize = 192;
+        let pixels = checkerboard_rgb(SIZE);
+        let learned = learned_rate_lossy(1.0).with_num_threads(1);
+        let fixed = learned.clone().with_learned_rate(false);
+        let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
+        let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+        assert!(
+            learned.len() * 2 < fixed.len() * 3,
+            "{} vs {}",
+            learned.len(),
+            fixed.len()
+        );
+    }
+
+    #[test]
+    fn learned_rate_lets_fine_transforms_compete_with_merges() {
+        // One-pixel lines on black every 8 pixels. IDENTITY codes them in
+        // a few tokens per block; under the fixed model they are only
+        // tried on the blocks the merges left.
+        const SIZE: usize = 256;
+        let mut pixels = Vec::with_capacity(SIZE * SIZE * 3);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let ink = x % 8 == 3 || y % 8 == 3;
+                let magenta = (x / 64 + y / 64) % 2 == 0;
+                pixels.extend_from_slice(&match (ink, magenta) {
+                    (false, _) => [0, 0, 0],
+                    (true, true) => [252, 0, 254],
+                    (true, false) => [252, 0, 0],
+                });
+            }
+        }
+        let learned = learned_rate_lossy(2.0).with_num_threads(1);
+        let fixed = learned.clone().with_learned_rate(false);
+        let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
+        let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+        assert!(
+            learned.len() * 3 < fixed.len(),
+            "{} vs {}",
+            learned.len(),
+            fixed.len()
+        );
+    }
+
+    #[test]
+    fn learned_rate_is_a_slow_speed_tool() {
+        const SIZE: usize = 128;
+        let pixels = checkerboard_rgb(SIZE);
+        for speed in [Speed::Fastest, Speed::Fast] {
+            let base = EncodeConfig::default()
+                .with_distance(2.0)
+                .with_speed(speed)
+                .with_learned_rate(false)
+                .with_num_threads(1);
+            assert_eq!(
+                encode_image(&pixels, SIZE, SIZE, &base).unwrap(),
+                encode_image(&pixels, SIZE, SIZE, &base.clone().with_learned_rate(true)).unwrap(),
+                "{speed:?}"
+            );
+        }
     }
 
     #[test]

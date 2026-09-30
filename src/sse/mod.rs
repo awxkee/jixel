@@ -45,6 +45,7 @@ mod xyb;
 
 pub(crate) use ac_strategy::{
     gradient_region_stats_sse41, gradient_region_stats_with_chroma_sse41, sse_and_rate_sse,
+    sse_and_rate_sse_impl,
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};

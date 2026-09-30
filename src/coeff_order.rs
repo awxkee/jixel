@@ -502,8 +502,11 @@ const GATE_MARGIN: f64 = 1.5;
 const BITS_PER_PERMUTATION_TOKEN: f64 = 5.0;
 
 /// Refine the frame's natural coefficient orders from first-pass statistics.
-pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) {
+/// Returns the share of the expected scan walk the adopted orders remove:
+/// how far the scans moved from the ones the statistics were tallied on.
+pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) -> f64 {
     debug_assert_eq!(out.used_mask, 0);
+    let (mut natural_walk, mut saved_walk) = (0.0f64, 0.0f64);
     for (slot, &(order_index, llf, _size)) in ORDER_SPECS.iter().enumerate() {
         let blocks = stats.blocks_in(slot);
         if blocks < MIN_BLOCKS_FOR_ORDER {
@@ -512,12 +515,14 @@ pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) {
         let mut derived: [Cow<'static, [u32]>; 3] = std::array::from_fn(|_| Cow::Borrowed(&[][..]));
         let mut saved_bits = 0.0f64;
         let mut cost_bits = 0.0f64;
+        let mut slot_saved_walk = 0.0f64;
         let mut any = false;
         for channel in 0..3 {
             let natural = out.orders[slot][channel].clone();
             let candidate = stats.derive(slot, channel, &natural, llf);
-            let gain = stats.expected_walk(slot, channel, &natural, llf)
-                - stats.expected_walk(slot, channel, &candidate, llf);
+            let walk = stats.expected_walk(slot, channel, &natural, llf);
+            let gain = walk - stats.expected_walk(slot, channel, &candidate, llf);
+            natural_walk += walk * f64::from(blocks);
             let mut tokens = Vec::new();
             let natural_pos = natural_position_lut(natural.len());
             let zigzag: Vec<u32> = candidate
@@ -529,6 +534,7 @@ pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) {
             let channel_cost = tokens.len() as f64 * BITS_PER_PERMUTATION_TOKEN;
             if gain > 0.0 && channel_saved > channel_cost * GATE_MARGIN {
                 any = true;
+                slot_saved_walk += gain * f64::from(blocks);
                 saved_bits += channel_saved;
                 cost_bits += channel_cost;
                 derived[channel] = Cow::Owned(candidate);
@@ -539,7 +545,13 @@ pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) {
         if any && saved_bits > cost_bits * GATE_MARGIN {
             out.used_mask |= 1 << order_index;
             out.orders[slot] = derived;
+            saved_walk += slot_saved_walk;
         }
+    }
+    if natural_walk > 0.0 {
+        saved_walk / natural_walk
+    } else {
+        0.0
     }
 }
 
@@ -582,7 +594,8 @@ mod tests {
             let raw = *natural.orders[slot][0].last().unwrap() as usize;
             stats.counts[slot][0][raw] = 10_000;
         }
-        derive_orders(&stats, &mut learned);
+        let moved = derive_orders(&stats, &mut learned);
+        assert!((0.0..=1.0).contains(&moved) && moved > 0.0, "{moved}");
         assert_ne!(learned.used_mask, 0);
         assert_eq!(natural.used_mask, 0);
         for (slot, &(order, _, _)) in ORDER_SPECS.iter().enumerate() {

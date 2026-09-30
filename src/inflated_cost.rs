@@ -121,6 +121,185 @@ pub(crate) fn selected_sse_and_rate_fn() -> SseAndRateFn {
     *SSE_AND_RATE_FN.get_or_init(select_sse_and_rate_fn)
 }
 
+/// Coefficient distortion and pricing levels, without the discarded fixed rate.
+pub(crate) type SseAndQuantizeFn = unsafe fn(
+    &[f32],
+    &[f32],
+    f32,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    &RateLog2Lut,
+    &[f32; 4],
+    &[u32],
+    &mut [i32],
+) -> (f32, usize, f32, u32);
+
+fn select_sse_and_quantize_fn() -> SseAndQuantizeFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return crate::avx::sse_and_rate_avx2_impl::<true, true>;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        return crate::sse::sse_and_rate_sse_impl::<true, true>;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        crate::neon::sse_and_rate_neon_impl::<true, true>
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        crate::wasm::sse_and_rate_wasm_impl::<true, true>
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
+    {
+        sse_and_rate_scalar_impl::<true, true>
+    }
+}
+
+static SSE_AND_QUANTIZE_FN: OnceLock<SseAndQuantizeFn> = OnceLock::new();
+
+#[inline]
+pub(crate) fn selected_sse_and_quantize_fn() -> SseAndQuantizeFn {
+    *SSE_AND_QUANTIZE_FN.get_or_init(select_sse_and_quantize_fn)
+}
+
+#[test]
+fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
+    #[allow(unused_mut)]
+    let mut kernels = vec![
+        (selected_sse_and_rate_fn(), selected_sse_and_quantize_fn()),
+        (
+            sse_and_rate_scalar::<true> as SseAndRateFn,
+            sse_and_rate_scalar_impl::<true, true> as SseAndQuantizeFn,
+        ),
+    ];
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse4.1") {
+        kernels.push((
+            crate::sse::sse_and_rate_sse::<true>,
+            crate::sse::sse_and_rate_sse_impl::<true, true>,
+        ));
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        kernels.push((
+            crate::avx::sse_and_rate_avx2::<true>,
+            crate::avx::sse_and_rate_avx2_impl::<true, true>,
+        ));
+    }
+    let quantize = crate::group::selected_quantize_block_ac_fn();
+    for (fixed, fused) in kernels {
+        for (cx, cy) in [
+            (1, 1),
+            (2, 1),
+            (1, 2),
+            (2, 2),
+            (4, 2),
+            (4, 4),
+            (8, 4),
+            (8, 8),
+        ] {
+            let (width, height) = (cx * 8, cy * 8);
+            let size = width * height;
+            for c in 0..3 {
+                for distance in [0.1, 1.0, 4.0] {
+                    for qac in [1.0, 17.5] {
+                        let qm = if c == 0 { 1.25 } else { 1.0 };
+                        let thresholds =
+                            crate::group::quantize_ac_thresholds_scaled(c, cx, cy, distance, qm);
+                        let inverse: Vec<_> = (0..size)
+                            .map(|i| if i % 3 == 0 { 1.0 } else { 0.125 })
+                            .collect();
+                        // Include both signs of exact ties and their neighbouring
+                        // floats, zeros, and larger levels across every quadrant.
+                        let values = [
+                            0.0f32,
+                            0.5,
+                            -0.5,
+                            1.5,
+                            -1.5,
+                            2.5,
+                            -2.5,
+                            0.49999997,
+                            -0.49999997,
+                            0.50000006,
+                            -0.50000006,
+                            31.5,
+                            -128.0,
+                        ];
+                        let coeffs: Vec<_> = (0..size)
+                            .map(|i| values[i % values.len()] / (inverse[i] * qac * qm))
+                            .collect();
+                        let scan = crate::coeff_order::scan_pos_lut(width, height);
+                        let mut expected = vec![0; size];
+                        let mut actual = vec![i32::MAX; size];
+                        quantize(
+                            &coeffs,
+                            c,
+                            &inverse,
+                            1,
+                            qac,
+                            qm,
+                            distance,
+                            cx,
+                            cy,
+                            &mut expected,
+                        );
+                        for row in expected.chunks_exact_mut(width).take(cy) {
+                            row[..cx].fill(0);
+                        }
+                        let original = unsafe {
+                            fixed(
+                                &coeffs,
+                                &inverse,
+                                qac * qm,
+                                width,
+                                height,
+                                width / 2,
+                                cx,
+                                cy,
+                                rate_log2_lut(),
+                                &thresholds,
+                                scan,
+                            )
+                        };
+                        let combined = unsafe {
+                            fused(
+                                &coeffs,
+                                &inverse,
+                                qac * qm,
+                                width,
+                                height,
+                                width / 2,
+                                cx,
+                                cy,
+                                rate_log2_lut(),
+                                &thresholds,
+                                &[],
+                                &mut actual,
+                            )
+                        };
+                        assert_eq!(
+                            original.0.to_bits(),
+                            combined.0.to_bits(),
+                            "{cx}x{cy} c={c} d={distance} q={qac}"
+                        );
+                        assert_eq!(original.1, combined.1);
+                        assert_eq!(expected, actual, "{cx}x{cy} c={c} d={distance} q={qac}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)] // Used by target-specific SSE/WASM test modules.
 pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased: bool) {
@@ -235,6 +414,38 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     thr: &[f32; 4],
     scan_pos: &[u32],
 ) -> (f32, usize, f32, u32) {
+    sse_and_rate_scalar_impl::<BIASED, false>(
+        coeff,
+        inv_matrix,
+        q_scaled,
+        width,
+        height,
+        half,
+        cx,
+        cy,
+        rate_log2_lut,
+        thr,
+        scan_pos,
+        &mut [],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sse_and_rate_scalar_impl<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    rate_log2_lut: &RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
+    assert!(!SAVE_LEVELS || levels.len() >= width * height);
     let mut sse = 0.0f32;
     let mut nzeros = 0usize;
     let mut mag_bits = 0.0f32;
@@ -248,11 +459,17 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
         let yfix = if y >= height / 2 { 2 } else { 0 };
         for (x, (&coefficient, &inverse)) in coeff_row.iter().zip(inv_row.iter()).enumerate() {
             if x < cx && y < cy {
+                if SAVE_LEVELS {
+                    levels[y * width + x] = 0;
+                }
                 continue;
             }
             let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
             let a = inverse * q_scaled * coefficient;
             let q = if a.abs() >= threshold { a.round() } else { 0.0 };
+            if SAVE_LEVELS {
+                levels[y * width + x] = q as i32;
+            }
             let d = if BIASED {
                 a - crate::group::dequantized_level_f32(q)
             } else {
@@ -261,8 +478,10 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
-                mag_bits += rate_log2_with_lut(rate_log2_lut, q.abs());
-                max_scan = max_scan.max(scan_pos[y * width + x]);
+                if !SAVE_LEVELS {
+                    mag_bits += rate_log2_with_lut(rate_log2_lut, q.abs());
+                    max_scan = max_scan.max(scan_pos[y * width + x]);
+                }
             }
         }
     }

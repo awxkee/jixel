@@ -94,6 +94,7 @@ pub(crate) struct EncodingContext {
     pub(crate) to_xyb_band: xyb::ToXybBandFn,
     pub(crate) fill_quant_field: adaptive_quant::FillQuantFieldFn,
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
+    pub(crate) sse_and_quantize: inflated_cost::SseAndQuantizeFn,
     pub(crate) recon_dist_and_rate: inflated_cost::ReconDistAndRateFn,
     pub(crate) recon_error_kernels: inflated_cost::ReconErrorKernels,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
@@ -301,6 +302,7 @@ impl EncodingContext {
             to_xyb_band: xyb::selected_to_xyb_band_fn(),
             fill_quant_field: adaptive_quant::selected_fill_quant_field_fn(),
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
+            sse_and_quantize: inflated_cost::selected_sse_and_quantize_fn(),
             recon_dist_and_rate: inflated_cost::select_recon_dist_and_rate_fn(),
             recon_error_kernels: inflated_cost::ReconErrorKernels {
                 gradient_energy: inflated_cost::select_error_gradient_energy_fn(),

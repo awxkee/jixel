@@ -1160,6 +1160,180 @@ pub(crate) fn choose_ytob_dc(
 
 /// Check the chosen DC predictor on the unrounded source using the same
 /// quantizer as coefficient coding. The initial search operates on integers.
+/// The B DC's share of the stored Y DC: `base_correlation_b` (= 1) plus the
+/// signaled `ytob_dc / 84`, converted from dequantized XYB into stored-B-DC
+/// units under the frame's DC steps.
+#[inline]
+pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32) -> f32 {
+    INV_DC_QUANT[2] / dc_step[2]
+        * (DC_QUANT[1] * dc_step[1])
+        * (1.0 + ytob_dc as f32 / K_COLOR_FACTOR)
+}
+
+/// DC step candidates per channel: the default and finer ones a percent
+/// apart.
+const DC_STEP_CANDIDATES: usize = 9;
+/// Bits of the three signaled steps.
+const DC_STEP_HEADER_BITS: f64 = 48.0;
+/// Share of the DC rate a custom step must save on top of its header.
+const DC_STEP_MIN_GAIN: f64 = 0.02;
+
+/// A DC step multiplier as the decoder reads it back from its 16-bit wire
+/// form.
+fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
+    let wire = DC_QUANT[channel] * 128.0 * multiplier;
+    crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(wire)) / (DC_QUANT[channel] * 128.0)
+}
+
+/// The wire form of a frame's DC steps, or `None` for the defaults.
+pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
+    (dc_step != [1.0; 3]).then(|| {
+        std::array::from_fn(|c| crate::util::f32_to_f16_bits(DC_QUANT[c] * 128.0 * dc_step[c]))
+    })
+}
+
+/// Choose the frame's Y and B DC steps.
+///
+/// A smooth region holds one value per channel. Where that value falls
+/// between two levels of the DC quantizer its blocks round either way, and
+/// the DC plane carries the flicker: more bits, and visible noise on flat
+/// ground. A slightly finer step moves the levels under the value. Textured
+/// images have no such value and keep the default, which costs no header.
+pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: i32) -> [f32; 3] {
+    let default = [1.0f32; 3];
+    if dc_datas
+        .iter()
+        .any(|dc| dc.source_dc_y.is_none() || dc.source_dc_b.is_none())
+    {
+        return default;
+    }
+    let candidates: [f32; DC_STEP_CANDIDATES] = std::array::from_fn(|k| 1.0 - 0.01 * k as f32);
+    let entropy = |hist: &[u64; 64], extra: u64, total: u64| {
+        let inv = 1.0 / total.max(1) as f64;
+        hist.iter()
+            .filter(|&&n| n != 0)
+            .fold(extra as f64, |sum, &n| {
+                sum - n as f64 * f_log2(n as f64 * inv)
+            })
+    };
+    let predict = |current: &[i32], previous: &[i32], x: usize, y: usize| {
+        if y == 0 {
+            if x == 0 { 0 } else { current[x - 1] }
+        } else if x == 0 {
+            previous[x]
+        } else {
+            grad_predict(previous[x], current[x - 1], previous[x - 1])
+        }
+    };
+    let total: u64 = dc_datas
+        .iter()
+        .map(|dc| (dc.quant_dc.xsize() * dc.quant_dc.ysize()) as u64)
+        .sum();
+    // Y levels under `step_y`, and their rate.
+    let quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
+        let factor_y = INV_DC_QUANT[1] / step_y * scale_dc;
+        let (mut hist, mut extra) = ([0u64; 64], 0u64);
+        for (dc, levels) in dc_datas.iter().zip(y_levels) {
+            let source = dc.source_dc_y.as_ref().unwrap();
+            let w = source.xsize();
+            for y in 0..source.ysize() {
+                let (above, row) = levels.split_at_mut(y * w);
+                let row = &mut row[..w];
+                for (level, &value) in row.iter_mut().zip(source.row(y)) {
+                    *level = (value * factor_y).round() as i32;
+                }
+                let previous = if y == 0 {
+                    &row[..0]
+                } else {
+                    &above[(y - 1) * w..]
+                };
+                for x in 0..w {
+                    add_ytob_token(row[x] - predict(row, previous, x, y), &mut hist, &mut extra);
+                }
+            }
+        }
+        entropy(&hist, extra, total)
+    };
+    // Rate of B under both steps, against the Y levels of `step_y`.
+    let max_width = dc_datas
+        .iter()
+        .map(|dc| dc.quant_dc.xsize())
+        .max()
+        .unwrap_or(0);
+    let mut previous = vec![0i32; max_width];
+    let mut current = vec![0i32; max_width];
+    let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
+        let factor_b = INV_DC_QUANT[2] / step_b * scale_dc;
+        let cfl = dc_cfl_factor([1.0, step_y, step_b], ytob_dc);
+        let (mut hist, mut extra) = ([0u64; 64], 0u64);
+        for (dc, levels) in dc_datas.iter().zip(y_levels) {
+            let source = dc.source_dc_b.as_ref().unwrap();
+            let w = source.xsize();
+            let (mut previous, mut current) = (&mut previous[..w], &mut current[..w]);
+            for y in 0..source.ysize() {
+                let luma = &levels[y * w..][..w];
+                for ((level, &value), &luma) in current.iter_mut().zip(source.row(y)).zip(luma) {
+                    *level = fmla(value, factor_b, -(luma as f32) * cfl).round() as i32;
+                }
+                for x in 0..w {
+                    let pred = predict(current, previous, x, y);
+                    add_ytob_token(current[x] - pred, &mut hist, &mut extra);
+                }
+                std::mem::swap(&mut current, &mut previous);
+            }
+        }
+        entropy(&hist, extra, total)
+    };
+    let mut y_levels: Vec<Vec<i32>> = dc_datas
+        .iter()
+        .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
+        .collect();
+    let steps_of = |channel: usize| candidates.map(|step| signaled_dc_step(channel, step));
+    let (steps_y, steps_b) = (steps_of(1), steps_of(2));
+    let mut costs = [[None; DC_STEP_CANDIDATES]; DC_STEP_CANDIDATES];
+    let mut current_y = None;
+    let mut rate_y = 0.0;
+    let mut cost = |y: usize, b: usize| {
+        if let Some(cost) = costs[y][b] {
+            return cost;
+        }
+        if current_y != Some(y) {
+            rate_y = quantize_y(steps_y[y], &mut y_levels);
+            current_y = Some(y);
+        }
+        let cost = rate_y + rate_b(steps_y[y], steps_b[b], &y_levels);
+        costs[y][b] = Some(cost);
+        cost
+    };
+    // B depends on the Y levels, so the two steps are searched in turn: B,
+    // then Y under that B, then B again. Revisited pairs retain their exact
+    // costs and tie order; when Y stays put the last B search needs no scans.
+    let base = cost(0, 0);
+    let (mut best, mut step_y, mut step_b) = (base, 0, 0);
+    for round in 0..3 {
+        if round == 1 {
+            for candidate in 0..DC_STEP_CANDIDATES {
+                let candidate_cost = cost(candidate, step_b);
+                if candidate_cost < best {
+                    (best, step_y) = (candidate_cost, candidate);
+                }
+            }
+        } else {
+            for candidate in 0..DC_STEP_CANDIDATES {
+                let candidate_cost = cost(step_y, candidate);
+                if candidate_cost < best {
+                    (best, step_b) = (candidate_cost, candidate);
+                }
+            }
+        }
+    }
+    if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base < base {
+        [1.0, steps_y[step_y], steps_b[step_b]]
+    } else {
+        default
+    }
+}
+
 /// Subtracting two rounded values can invent a coding gain that disappears
 /// when the source is re-quantized. Recheck zero and the proposed slope using
 /// the existing gradient-token rate proxy, including its header charge.
@@ -1587,6 +1761,80 @@ mod tests {
             }
         }
         dc
+    }
+
+    /// A DC group whose Y is `luma` and whose B source is `blue`, both
+    /// unrounded.
+    fn dc_group_with_sources(
+        luma: impl Fn(usize, usize) -> f32,
+        blue: impl Fn(usize, usize) -> f32,
+    ) -> DcGroupData {
+        let (w, h) = (48usize, 48usize);
+        let mut dc = DcGroupData::new(w, h).unwrap();
+        let mut source_y = crate::image::Plane::new(w, h);
+        let mut source_b = crate::image::Plane::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                source_y.row_mut(y)[x] = luma(x, y);
+                source_b.row_mut(y)[x] = blue(x, y);
+            }
+        }
+        dc.source_dc_y = Some(source_y);
+        dc.source_dc_b = Some(source_b);
+        dc
+    }
+
+    #[test]
+    fn dc_steps_move_the_levels_under_a_flat_value() {
+        // A flat B that sits half a level from its neighbours under the
+        // default step, with a flicker that rounds it either way.
+        let flicker = |x: usize, y: usize| {
+            let mut state = (x as u32 * 7919 + y as u32 * 104729) | 1;
+            for _ in 0..3 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+            }
+            (state >> 16) as f32 / 65536.0 - 0.5
+        };
+        let flat = dc_group_with_sources(
+            |_, _| 0.0,
+            |x, y| (40.5 + 0.2 * flicker(x, y)) / INV_DC_QUANT[2],
+        );
+        let steps = choose_dc_steps(&[flat], 1.0, 0);
+        assert_eq!(steps[0], 1.0);
+        assert!(steps[2] < 1.0, "{steps:?}");
+        // The chosen step is what the decoder reads back.
+        let wire = dc_step_wire(steps).unwrap();
+        assert_eq!(
+            crate::util::f16_bits_to_f32(wire[2]),
+            DC_QUANT[2] * 128.0 * steps[2]
+        );
+    }
+
+    #[test]
+    fn dc_steps_stay_default_on_textured_dc() {
+        let noise = |seed: u32| {
+            move |x: usize, y: usize| {
+                let mut state = (x as u32 * 7919 + y as u32 * 104729 + seed) | 1;
+                for _ in 0..3 {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                }
+                (state >> 12) as f32 / 1_048_576.0 * 300.0 - 150.0
+            }
+        };
+        let (luma, blue) = (noise(1), noise(99));
+        let textured = dc_group_with_sources(
+            |x, y| luma(x, y) / INV_DC_QUANT[1],
+            |x, y| blue(x, y) / INV_DC_QUANT[2],
+        );
+        assert_eq!(choose_dc_steps(&[textured], 1.0, 0), [1.0; 3]);
+        assert!(dc_step_wire([1.0; 3]).is_none());
+        // Without the first pass's sources there is nothing to choose from.
+        let bare = DcGroupData::new(48, 48).unwrap();
+        assert_eq!(choose_dc_steps(&[bare], 1.0, 0), [1.0; 3]);
     }
 
     #[test]

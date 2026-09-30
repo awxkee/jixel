@@ -336,6 +336,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         speed: base.speed,
         decoding_speed: base.decoding_speed,
         lossy_modular: base.lossy_modular,
+        learned_rate: base.learned_rate,
         gain_map: None,
     };
 

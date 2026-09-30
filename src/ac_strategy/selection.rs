@@ -45,6 +45,15 @@ struct AcStrategyParams<'a> {
     qm_mult_x: f32,
     ytox_map: &'a ImageSB,
     ytob_map: &'a ImageSB,
+    /// Learned rate prices of this DC group; every worker that evaluates
+    /// its candidates installs them on its scratch.
+    prices: Option<&'a std::sync::Arc<RatePrices>>,
+}
+
+impl AcStrategyParams<'_> {
+    fn price<'s>(&self, scratch: &'s mut CoderScratch) -> RatePricesScope<'s> {
+        RatePricesScope::new(scratch, self.prices.cloned())
+    }
 }
 
 struct SuperBlockContext<'a> {
@@ -520,8 +529,10 @@ fn find_quant_refinements(
             strategy_coeffs: coeffs,
             transform_gather,
             recon,
+            rate_prices,
             ..
         } = scratch;
+        let prices = rate_prices.as_deref();
         let (cx, cy, _) = prepare_strategy_coeffs(
             ctx,
             coeffs,
@@ -553,6 +564,7 @@ fn find_quant_refinements(
                 0.0,
                 0.0,
                 false,
+                prices,
             );
             rd_cost(
                 DistortionModel::Reconstruction,
@@ -636,10 +648,11 @@ fn refine_quant_field(
                 &mut band_scratch[..context.bands.len()],
                 context.num_threads,
                 |i, band_scratch, scratch| {
+                    let mut scratch = context.params.price(scratch);
                     band_scratch.quant_refinements.clear();
                     find_quant_refinements(
                         &search,
-                        scratch,
+                        &mut scratch,
                         context.bands[i],
                         &mut band_scratch.quant_refinements,
                     );
@@ -1193,6 +1206,12 @@ fn sub8_shortlist(
     }
 }
 
+/// The admission charge of a fine candidate priced by learned prices.
+#[inline]
+fn learned_fine_rate_correction(rate: f32) -> f32 {
+    (FINE_ADMIT_RATE_CORRECTION_SHARE * rate).min(FINE_ADMIT_RATE_CORRECTION_BITS)
+}
+
 /// Reconstruction-domain admission of a shortlisted IDENTITY/DCT2X2 block:
 /// the gain over DCT8 when the candidate beats it by the margin, after the
 /// fitted rate charge.
@@ -1210,7 +1229,7 @@ fn fine_recon_admit(
     let py = params.dc_group_py + by * 8;
     let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
     let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
-        strategy_cost_impl(
+        reconstruction_strategy_cost_and_base(
             ctx,
             scratch,
             strategy,
@@ -1222,17 +1241,25 @@ fn fine_recon_admit(
             meta_r,
             params.distance,
             cmap_factor,
-            DistortionModel::Reconstruction,
+            0.0,
+            0.0,
+            None,
         )
     };
-    let recon8 = reconstruction_cost(scratch, STRATEGY_DCT);
+    let recon8 = reconstruction_cost(scratch, STRATEGY_DCT).cost;
+    let candidate = reconstruction_cost(scratch, fine);
     // The reconstruction scorer over-credits fine transforms; charge the
     // fitted per-block correction at the floored lambda (see the constant)
     // before the margin test below.
+    let correction = if scratch.rate_prices.is_some() {
+        learned_fine_rate_correction(candidate.rate)
+    } else {
+        FINE_ADMIT_RATE_CORRECTION_BITS
+    };
     let recon_fine = fmla(
         fine_mosaic_lambda(params.distance),
-        FINE_ADMIT_RATE_CORRECTION_BITS,
-        reconstruction_cost(scratch, fine),
+        correction,
+        candidate.cost,
     );
     // A small safety margin absorbs the remaining mismatch between the local
     // reconstruction metric and the final post-filtered image.
@@ -1261,6 +1288,166 @@ fn fill_selection_bands(bands: &mut Vec<(usize, usize)>, ysize: usize, n: usize)
     bands.push((previous, ysize));
 }
 
+/// Side of a pilot region in 8x8 blocks: the largest transform and one
+/// chroma-from-luma tile.
+const PILOT_REGION: usize = 8;
+/// Regions of a DC group the pilot selects transforms for.
+const PILOT_REGIONS: usize = 96;
+/// A group with fewer whole regions is its own pilot.
+const PILOT_MIN_REGIONS: usize = 4;
+
+/// Which of the selector's stages run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionPass {
+    /// The whole selector.
+    Full,
+    /// The coefficient-model stage only: the layout a group's rate prices
+    /// are learned from.
+    Pilot,
+}
+
+/// Learn the rate prices of a DC group.
+///
+/// A transform's statistics in the coded frame come from the blocks that
+/// chose it, not from every block it could be applied to: a 32x32 lives on
+/// smooth ground, a DCT4 on edges. So the fixed rate model first selects
+/// transforms for a sample of the group, and every transform is priced by
+/// the blocks that took it there.
+#[allow(clippy::too_many_arguments)]
+fn learn_rate_prices(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    opsin: &Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
+    distance: f32,
+    scale: f32,
+    x_qm_scale: u32,
+    quant_field: &ImageB,
+    ytox_map: &ImageSB,
+    ytob_map: &ImageSB,
+    num_threads: usize,
+) -> std::sync::Arc<RatePrices> {
+    let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
+    let blocks_x = quant_field.xsize().min((opsin.xsize() - dc_group_px) / 8);
+    let blocks_y = quant_field.ysize().min((opsin.ysize() - dc_group_py) / 8);
+    let (regions_x, regions_y) = (blocks_x / PILOT_REGION, blocks_y / PILOT_REGION);
+    let total = regions_x * regions_y;
+    let (mut rollbacks, mut fallbacks) = (Vec::new(), Vec::new());
+    if total < PILOT_MIN_REGIONS {
+        let mut quant = quant_field.clone();
+        let mut layout = AcStrategyImage::new(quant_field.xsize(), quant_field.ysize());
+        select_transforms(
+            ctx,
+            scratch,
+            opsin,
+            dc_group_px,
+            dc_group_py,
+            distance,
+            scale,
+            x_qm_scale,
+            &mut quant,
+            ytox_map,
+            ytob_map,
+            &mut layout,
+            &mut rollbacks,
+            &mut fallbacks,
+            num_threads,
+            None,
+            SelectionPass::Pilot,
+        );
+        return RatePrices::learn(
+            ctx,
+            scratch,
+            opsin,
+            dc_group_px,
+            dc_group_py,
+            quant_field,
+            ytox_map,
+            ytob_map,
+            scale,
+            qm_mult_x,
+            distance,
+            Some(&layout),
+            num_threads,
+        );
+    }
+
+    let count = total.min(PILOT_REGIONS);
+    let columns = (count as f32).sqrt().ceil() as usize;
+    let rows = count.div_ceil(columns);
+    let side = PILOT_REGION * 8;
+    let mut mosaic = Image3F::new(columns * side, rows * side);
+    let mut quant = ImageB::new(columns * PILOT_REGION, rows * PILOT_REGION);
+    let mut ytox = ImageSB::new(columns, rows);
+    let mut ytob = ImageSB::new(columns, rows);
+    // The grid's last row may hold more cells than regions are left; they
+    // repeat the last regions.
+    for cell in 0..columns * rows {
+        let index = cell.min(count - 1);
+        let start = index * total / count;
+        let end = (index + 1) * total / count;
+        let jitter = ((index as u32).wrapping_mul(0x9e37_79b9) >> 16) as usize;
+        let region = start + jitter % (end - start).max(1);
+        let (from_x, from_y) = (region % regions_x, region / regions_x);
+        let (to_x, to_y) = (cell % columns, cell / columns);
+        for y in 0..side {
+            for c in 0..3 {
+                let from = &opsin.plane_row(c, dc_group_py + from_y * side + y)
+                    [dc_group_px + from_x * side..][..side];
+                mosaic.plane_row_mut(c, to_y * side + y)[to_x * side..][..side]
+                    .copy_from_slice(from);
+            }
+        }
+        for y in 0..PILOT_REGION {
+            let from = &quant_field.row(from_y * PILOT_REGION + y)[from_x * PILOT_REGION..]
+                [..PILOT_REGION];
+            quant.row_mut(to_y * PILOT_REGION + y)[to_x * PILOT_REGION..][..PILOT_REGION]
+                .copy_from_slice(from);
+        }
+        let tile =
+            |map: &ImageSB| map.row(from_y.min(map.ysize() - 1))[from_x.min(map.xsize() - 1)];
+        ytox.row_mut(to_y)[to_x] = tile(ytox_map);
+        ytob.row_mut(to_y)[to_x] = tile(ytob_map);
+    }
+    let sampled = quant.clone();
+    let mut layout = AcStrategyImage::new(quant.xsize(), quant.ysize());
+    select_transforms(
+        ctx,
+        scratch,
+        &mosaic,
+        0,
+        0,
+        distance,
+        scale,
+        x_qm_scale,
+        &mut quant,
+        &ytox,
+        &ytob,
+        &mut layout,
+        &mut rollbacks,
+        &mut fallbacks,
+        num_threads,
+        None,
+        SelectionPass::Pilot,
+    );
+    RatePrices::learn(
+        ctx,
+        scratch,
+        &mosaic,
+        0,
+        0,
+        &sampled,
+        &ytox,
+        &ytob,
+        scale,
+        qm_mult_x,
+        distance,
+        Some(&layout),
+        num_threads,
+    )
+}
+
 pub(crate) fn fill_ac_strategy(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1278,6 +1465,65 @@ pub(crate) fn fill_ac_strategy(
     fine_fallbacks: &mut Vec<u8>,
     num_threads: usize,
 ) -> f32 {
+    let learned =
+        ctx.selector.learned_rate && ctx.speed == crate::Speed::Slow && !use_dct8_only(distance);
+    let prices = learned.then(|| {
+        learn_rate_prices(
+            ctx,
+            scratch,
+            opsin,
+            dc_group_px,
+            dc_group_py,
+            distance,
+            scale,
+            x_qm_scale,
+            quant_field,
+            ytox_map,
+            ytob_map,
+            num_threads,
+        )
+    });
+    select_transforms(
+        ctx,
+        scratch,
+        opsin,
+        dc_group_px,
+        dc_group_py,
+        distance,
+        scale,
+        x_qm_scale,
+        quant_field,
+        ytox_map,
+        ytob_map,
+        ac_strategy,
+        fine_rollbacks,
+        fine_fallbacks,
+        num_threads,
+        prices,
+        SelectionPass::Full,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_transforms(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    opsin: &Image3F,
+    dc_group_px: usize,
+    dc_group_py: usize,
+    distance: f32,
+    scale: f32,
+    x_qm_scale: u32,
+    quant_field: &mut ImageB,
+    ytox_map: &ImageSB,
+    ytob_map: &ImageSB,
+    ac_strategy: &mut AcStrategyImage,
+    fine_rollbacks: &mut Vec<FineMergeRollback>,
+    fine_fallbacks: &mut Vec<u8>,
+    num_threads: usize,
+    prices: Option<std::sync::Arc<RatePrices>>,
+    pass: SelectionPass,
+) -> f32 {
     fine_rollbacks.clear();
     fine_fallbacks.clear();
     let speed = ctx.speed;
@@ -1291,6 +1537,8 @@ pub(crate) fn fill_ac_strategy(
     }
     let scope = SearchScope::for_speed(speed);
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
+    let mut scratch = RatePricesScope::new(scratch, prices.clone());
+    let scratch: &mut CoderScratch = &mut scratch;
     // Per-candidate-block metadata rate for the strategy chooser (bits),
     // faded in above d=1 (see strategy_cost).
     let meta_r = META_R;
@@ -1304,6 +1552,7 @@ pub(crate) fn fill_ac_strategy(
         qm_mult_x,
         ytox_map,
         ytob_map,
+        prices: prices.as_ref(),
     };
 
     // Keep all pipeline storage on the worker scratch. Taking ownership lets
@@ -1319,7 +1568,12 @@ pub(crate) fn fill_ac_strategy(
         meta_r,
         scope,
     };
-    let leaf_first = ctx.selector.leaf_first && distance <= LEAF_FIRST_MAX_DISTANCE;
+    let leaf_first_max = if prices.is_some() {
+        LEARNED_LEAF_FIRST_MAX_DISTANCE
+    } else {
+        LEAF_FIRST_MAX_DISTANCE
+    };
+    let leaf_first = ctx.selector.leaf_first && distance <= leaf_first_max;
     let run_band = |scratch: &mut CoderScratch,
                     output: &mut AcStrategyBandScratch,
                     strategy: &mut AcStrategyImage,
@@ -1356,6 +1610,8 @@ pub(crate) fn fill_ac_strategy(
             band_scratch,
             num_threads,
             |i, output, scratch| {
+                let mut scratch = RatePricesScope::new(scratch, prices.clone());
+                let scratch: &mut CoderScratch = &mut scratch;
                 let (y0, y1) = bands[i];
                 // `output.strategy` is a field of `output`; split the borrow.
                 let mut strategy =
@@ -1527,7 +1783,7 @@ pub(crate) fn fill_ac_strategy(
     // The SSIM reconstruction rerank runs in both scopes. Under
     // `SearchScope::Squares` the only merges present are DCT16X16 and
     // DCT32X32, so it scores exactly those.
-    let reranked = scope.rerank(distance);
+    let reranked = pass == SelectionPass::Full && scope.rerank(distance);
     if reranked {
         pipeline.prepare_rerank(xsize, ysize);
         let rerank = RerankContext {
@@ -1657,12 +1913,14 @@ pub(crate) fn fill_ac_strategy(
         num_threads,
     };
     let band_count = pipeline.bands.len();
-    refine_quant_field(
-        &refinement,
-        scratch,
-        quant_field,
-        &mut pipeline.band_scratch[..band_count],
-    );
+    if pass == SelectionPass::Full {
+        refine_quant_field(
+            &refinement,
+            scratch,
+            quant_field,
+            &mut pipeline.band_scratch[..band_count],
+        );
+    }
     scratch.ac_strategy = pipeline;
     benefit
 }
@@ -2145,12 +2403,19 @@ fn find_rerank_downgrades(
                         gradient_peak_alpha,
                         None,
                     );
+                    // A fine leaf carries its admission charge into the
+                    // comparison with the merge it sits under.
+                    let charge = if matches!(s, STRATEGY_IDENTITY | STRATEGY_DCT2X2) {
+                        fine_lambda * learned_fine_rate_correction(cost.rate)
+                    } else {
+                        0.0
+                    };
                     partition_tiles.push(PartitionTile {
                         x: ix,
                         y: iy,
                         width: ccx,
                         height: ccy,
-                        cost: cost.cost,
+                        cost: cost.cost + charge,
                     });
                     partition_costs.push((s, cost));
                 }
@@ -2599,7 +2864,15 @@ fn rerank_upgrade_merges(
             &mut band_scratch[..rerank.bands.len()],
             rerank.num_threads,
             |i, output, scratch| {
-                find_merge_upgrades(rerank, scratch, map_ref, rerank.bands[i], output, margin);
+                let mut scratch = rerank.params.price(scratch);
+                find_merge_upgrades(
+                    rerank,
+                    &mut scratch,
+                    map_ref,
+                    rerank.bands[i],
+                    output,
+                    margin,
+                );
             },
         );
     for band in &band_scratch[..rerank.bands.len()] {
@@ -2633,7 +2906,14 @@ fn rerank_large_transforms(
             &mut band_scratch[..rerank.bands.len()],
             rerank.num_threads,
             |i, output, scratch| {
-                find_rerank_downgrades(rerank, scratch, ac_strategy_ref, rerank.bands[i], output);
+                let mut scratch = rerank.params.price(scratch);
+                find_rerank_downgrades(
+                    rerank,
+                    &mut scratch,
+                    ac_strategy_ref,
+                    rerank.bands[i],
+                    output,
+                );
             },
         );
     debug_assert_eq!(current_costs.len(), ac_strategy.xsize() * ysize);
@@ -3459,6 +3739,7 @@ mod tests {
                 qm_mult_x: 1.0,
                 ytox_map: &maps,
                 ytob_map: &maps,
+                prices: None,
             };
             let selection = SelectionContext {
                 params,
@@ -3646,6 +3927,7 @@ mod tests {
             qm_mult_x: 1.0,
             ytox_map: &maps,
             ytob_map: &maps,
+            prices: None,
         };
         let rerank = super::RerankContext {
             params,
@@ -3795,6 +4077,7 @@ mod tests {
                 qm_mult_x: 1.0,
                 ytox_map: &maps,
                 ytob_map: &maps,
+                prices: None,
             };
             let selection = SelectionContext {
                 params,

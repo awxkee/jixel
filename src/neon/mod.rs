@@ -48,6 +48,7 @@ mod ytob;
 
 pub(crate) use ac_strategy::{
     gradient_region_stats_neon, gradient_region_stats_with_chroma_neon, sse_and_rate_neon,
+    sse_and_rate_neon_impl,
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};

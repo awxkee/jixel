@@ -403,11 +403,12 @@ pub(super) fn select_band_leaf_first(
     // --- 1. Leaves -------------------------------------------------------
     let with_dct4 = distance <= SUB8_MAX_DISTANCE;
     let with_fine = distance <= FINE_TRANSFORM_MAX_DISTANCE;
-    // IDENTITY/DCT2X2 stay out of the structural leaves (their
-    // coefficient-domain cost is not comparable with the orthogonal
-    // transforms; as leaves they tie with the post-merge order on every
-    // corpus): they are shortlisted here and admitted on the remaining DCT8
-    // blocks after the merge hierarchy.
+    // IDENTITY/DCT2X2 stay out of the structural leaves under the fixed
+    // rate model (their coefficient-domain cost is not comparable with the
+    // orthogonal transforms; as leaves they tie with the post-merge order on
+    // every corpus): they are shortlisted here and admitted on the remaining
+    // DCT8 blocks after the merge hierarchy.
+    let fine_leaves = scratch.rate_prices.is_some();
     let sub8_enabled =
         scope.rectangles() && (with_dct4 || distance <= AFV_MAX_DISTANCE || with_fine);
     let bias_afv = BIAS_AFV.at(distance);
@@ -468,9 +469,28 @@ pub(super) fn select_band_leaf_first(
                 leaf.raw_j = p.raw_j;
                 leaf.gain = p.gain;
             }
-            if let Some(f) = shortlist.fine {
-                leaf.fine = f.strategy;
-                leaf.fine_j = f.biased_j;
+            let Some(fine) = shortlist.fine else {
+                continue;
+            };
+            leaf.fine = fine.strategy;
+            leaf.fine_j = fine.biased_j;
+            // Learned prices make a fine candidate's rate comparable with
+            // the merges', so it is admitted here and the merges above
+            // have to beat it.
+            let structural = *leaf;
+            if fine_leaves
+                && fine.biased_j < structural.j
+                && let Some(gain) =
+                    fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine.strategy)
+            {
+                output.leaves[(by - y_begin) * xsize + bx] = LeafChoice {
+                    strategy: fine.strategy,
+                    j: fine.biased_j,
+                    raw_j: fine.raw_j,
+                    gain,
+                    fallback: structural.strategy,
+                    ..LeafChoice::default()
+                };
             }
         }
     }

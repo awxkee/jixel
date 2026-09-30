@@ -48,9 +48,12 @@ use crate::inflated_cost::{
 };
 
 mod matrix_overhead;
+mod rate_prices;
 mod selection;
 
 pub(crate) use matrix_overhead::account_matrix_headers;
+pub(crate) use rate_prices::RatePrices;
+use rate_prices::RatePricesScope;
 
 pub(crate) use selection::{
     Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, fill_ac_strategy,
@@ -145,6 +148,9 @@ const FINE_TRANSFORM_MAX_DISTANCE: f32 = 5.0;
 /// DCT8 incumbent's reconstruction cost by this factor.
 const FINE_RECON_MARGIN: f32 = 0.98;
 const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
+/// With learned prices the charge is this share of the candidate's rate,
+/// up to the fixed charge.
+const FINE_ADMIT_RATE_CORRECTION_SHARE: f32 = 0.1;
 
 #[inline]
 fn fine_transform_bias(base: f32, distance: f32) -> f32 {
@@ -341,6 +347,9 @@ pub(crate) struct SelectorPolicy {
     pub(crate) raw_propagation: bool,
     /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); enabled by default.
     pub(crate) merge_upgrade: bool,
+    /// Price candidates by the frame's own statistics (see [`RatePrices`])
+    /// instead of the fixed rate model.
+    pub(crate) learned_rate: bool,
 }
 
 impl Default for SelectorPolicy {
@@ -349,6 +358,7 @@ impl Default for SelectorPolicy {
             leaf_first: true,
             raw_propagation: false,
             merge_upgrade: true,
+            learned_rate: false,
         }
     }
 }
@@ -371,6 +381,9 @@ fn merge_upgrade_margin(distance: f32) -> f32 {
     )
 }
 const LEAF_FIRST_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
+/// With learned prices the fine transforms are leaves, so the leaf-first
+/// selector runs wherever they are searched.
+const LEARNED_LEAF_FIRST_MAX_DISTANCE: f32 = FINE_TRANSFORM_MAX_DISTANCE;
 
 #[derive(Clone, Copy)]
 struct SuperBlockCost {
@@ -573,6 +586,7 @@ fn strategy_cost64(
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather: input,
+        rate_prices,
         ..
     } = scratch;
     let coeffs: &mut [[f32; 4096]; 3] = coeffs;
@@ -601,6 +615,11 @@ fn strategy_cost64(
     let [x, y, b] = coeffs;
     apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
 
+    if let Some((distortion, rate)) = rate_prices.as_deref().and_then(|prices| {
+        prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
+    }) {
+        return distortion + RD_LAMBDA * (rate + meta_r);
+    }
     let mut distortion = 0.0f32;
     let mut rate = 0.0f32;
     for (c, coeff) in coeffs.iter().enumerate() {
@@ -704,8 +723,10 @@ fn reconstruction_strategy_cost_and_base(
         strategy_coeffs: coeffs,
         transform_gather,
         recon,
+        rate_prices,
         ..
     } = scratch;
+    let prices = rate_prices.as_deref();
     let (cx, cy, _) = prepare_strategy_coeffs(
         ctx,
         coeffs,
@@ -738,6 +759,7 @@ fn reconstruction_strategy_cost_and_base(
         gradient_alpha,
         gradient_peak_alpha,
         keep_spatial_errors,
+        prices,
     );
     if let Some(output) = spatial_errors {
         let n = cx * cy * 64;
@@ -852,7 +874,13 @@ fn coefficient_dist_and_rate(
     distance: f32,
     cx: usize,
     cy: usize,
+    prices: Option<&RatePrices>,
 ) -> (f32, f32) {
+    if let Some(cost) = prices.and_then(|prices| {
+        prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
+    }) {
+        return cost;
+    }
     let mut d_total = 0.0f32;
     let mut r_total = 0.0f32;
     for c in 0..3 {
@@ -903,8 +931,10 @@ fn strategy_cost_impl(
         strategy_coeffs: coeffs,
         transform_gather,
         recon,
+        rate_prices,
         ..
     } = scratch;
+    let prices = rate_prices.as_deref();
     let (cx, cy, size) = prepare_strategy_coeffs(
         ctx,
         coeffs,
@@ -934,10 +964,11 @@ fn strategy_cost_impl(
             0.0,
             0.0,
             false,
+            prices,
         )
         .dist_and_rate(),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
-            ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy,
+            ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy, prices,
         ),
     };
     rd_cost(distortion_model, distance, meta_r, d_total, r_total)
@@ -993,6 +1024,7 @@ fn reconstruction_dist_and_rate(
     gradient_alpha: f32,
     gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
+    prices: Option<&RatePrices>,
 ) -> ReconCost {
     let mut cost = (ctx.recon_dist_and_rate)(
         recon,
@@ -1034,7 +1066,15 @@ fn reconstruction_dist_and_rate(
         },
         &ctx.recon_error_kernels,
     );
-    cost.rate *= RateCalibration::scale(strategy, distance);
+    // The reconstruction kernel quantizes chroma against the reconstructed
+    // luma, so its counts say nothing about the residual priced here.
+    cost.rate = prices
+        .and_then(|prices| {
+            prices.rate(
+                ctx, strategy, coeffs, [false; 3], qac, qm_mult_x, distance, cx, cy,
+            )
+        })
+        .unwrap_or_else(|| cost.rate * RateCalibration::scale(strategy, distance));
     cost
 }
 
@@ -1213,6 +1253,7 @@ fn sub8_strategy_costs(
         gather_pixels(opsin.plane(c), px, py, 8, 8, input);
     }
 
+    let prices = scratch.rate_prices.as_deref();
     let coeffs = &mut scratch.strategy_coeffs;
     let mut evaluate = |strategy| {
         for c in 0..3 {
@@ -1220,8 +1261,9 @@ fn sub8_strategy_costs(
         }
         let [x, y, b] = &mut ***coeffs;
         apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
-        let (distortion, rate) =
-            coefficient_dist_and_rate(ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1);
+        let (distortion, rate) = coefficient_dist_and_rate(
+            ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1, prices,
+        );
         fmla(RD_LAMBDA, rate + meta_r, distortion)
     };
 
