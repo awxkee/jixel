@@ -6,6 +6,7 @@ use super::{
     blob_window, sample_curve,
 };
 use crate::encoding_context::EncodingContext;
+#[cfg(test)]
 use crate::image::Image3F;
 
 pub(crate) struct Sample {
@@ -130,6 +131,7 @@ impl RenderPlan {
         plan
     }
 
+    #[cfg(test)]
     pub(super) fn draw(&self, image: &mut Image3F, sign: f32) {
         for sample in &self.samples {
             let (x0, x1, y0, y1) = sample.window;

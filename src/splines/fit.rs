@@ -77,6 +77,8 @@ const LONG_LINE_MIN_SPACING: f32 = 64.0;
 const LONG_LINE_SPANS: f32 = 3.0;
 const LONG_LINE_MAX_COEFFS: usize = 3;
 static LONG_LINE_WIDTHS: [i32; 5] = [2, 3, 4, 5, 6];
+/// Long-line widths tried, nearest to the ridge-scale prediction first.
+const LONG_LINE_SEEDED_WIDTHS: usize = 3;
 /// A long line touches many blocks, and the DCT8 proxy's optimism adds up over
 /// them: long splines must clear a higher bar on textured ground.
 const LONG_LINE_BITS_FACTOR: f32 = 4.0;
@@ -1310,8 +1312,15 @@ fn fit_long_line(
     if !inside(&points, w, h) || points.windows(2).any(|p| p[0] == p[1]) {
         return None;
     }
+    let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
+    let mut widths = LONG_LINE_WIDTHS;
+    widths.sort_by(|&a, &b| {
+        (a as f32 * sigma_step() - predicted)
+            .abs()
+            .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
+    });
     // Geometry and width determine the system; coefficient budgets only solve it.
-    let systems: Vec<FitSystem> = LONG_LINE_WIDTHS
+    let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
         .iter()
         .filter_map(|&n| fit_system(targets, w, h, &points, n, Precision::Compact, scratch))
         .collect();

@@ -322,6 +322,7 @@ pub(crate) fn blob_window(
 pub(crate) type PixelBox = (usize, usize, usize, usize);
 
 /// Adds `sign` times the decoder's render of one spline; returns the touched box.
+#[cfg(test)]
 pub(crate) fn render_spline(
     ctx: &EncodingContext,
     sp: &QuantizedSpline,

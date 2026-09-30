@@ -34,9 +34,11 @@
 
 use super::fit::Candidate;
 use super::render::{RenderPlan, TiledSpline};
+#[cfg(test)]
+use super::render_spline;
 use super::{
     CTX_DCT, CTX_NUM_POINTS, CTX_POINTS, NUM_SPLINE_CONTEXTS, PixelBox, Point, QUANT_ADJUST,
-    QuantizedSpline, SplineSet, render_spline, spline_tokens,
+    QuantizedSpline, SplineSet, spline_tokens,
 };
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::CoderScratch;
@@ -302,7 +304,11 @@ impl Trial {
                 }
             }
             let qac = quant_field[block.cell];
-            let (d0, r0) = cache[block.cell].unwrap_or_else(|| model.cost(current, bx, by, qac));
+            let (d0, r0) = cache
+                .get(block.cell)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| model.cost(current, bx, by, qac));
             let (d1, r1) = model.pixels_cost(&block.pixels, qac);
             delta += (d1 - d0) + crate::ac_strategy::RD_LAMBDA * (r1 - r0);
         }
@@ -345,6 +351,7 @@ fn cache_blocks(
     }
 }
 
+#[cfg(test)]
 fn block_touched(a: &Image3F, b: &Image3F, bx: usize, by: usize) -> bool {
     let (w, h) = (a.xsize(), a.ysize());
     for y in by * 8..(by * 8 + 8).min(h) {
@@ -622,59 +629,24 @@ fn refine_selected_widths(
 /// The pre-test sees unrefined geometry, so it lets through splines whose
 /// VarDCT saving covers only this share of their (prior-priced) bits.
 const PRETEST_BITS_SHARE: f32 = 0.25;
-const PRETEST_PAD: i32 = 24;
 
 /// Independent, state-free RD pre-test of one spline against the untouched
-/// image, on a block-aligned local copy (so it can run in parallel).
+/// image. Works on the blocks the spline covers only, so it can run in parallel.
 pub(super) fn pretest(
     model: &BlockModel,
     xyb: &Image3F,
     quant_field: &[f32],
     spline: &QuantizedSpline,
 ) -> bool {
-    let (w, h) = (xyb.xsize() as i32, xyb.ysize() as i32);
-    let xs = spline.points.iter().map(|p| p.x);
-    let ys = spline.points.iter().map(|p| p.y);
-    let x0 = ((xs.clone().min().unwrap() - PRETEST_PAD).max(0) / 8 * 8) as usize;
-    let y0 = ((ys.clone().min().unwrap() - PRETEST_PAD).max(0) / 8 * 8) as usize;
-    let x1 = (xs.max().unwrap() + PRETEST_PAD).min(w - 1) as usize;
-    let y1 = (ys.max().unwrap() + PRETEST_PAD).min(h - 1) as usize;
-    // extend to whole blocks, or to the image edge
-    let x1 = ((x1 / 8 + 1) * 8).min(w as usize);
-    let y1 = ((y1 / 8 + 1) * 8).min(h as usize);
-    let mut local = Image3F::new(x1 - x0, y1 - y0);
-    for c in 0..3 {
-        for y in y0..y1 {
-            local
-                .plane_row_mut(c, y - y0)
-                .copy_from_slice(&xyb.plane_row(c, y)[x0..x1]);
-        }
+    let plan = RenderPlan::new(model.ctx, spline, QUANT_ADJUST, xyb.xsize(), xyb.ysize()).tiled();
+    if plan.bounds().is_none() {
+        return false;
     }
-    let mut trial = local.clone();
-    let shifted = QuantizedSpline {
-        points: spline
-            .points
-            .iter()
-            .map(|p| Point::new(p.x - x0 as i32, p.y - y0 as i32))
-            .collect(),
-        dct: spline.dct,
-    };
-    let Some(b) = render_spline(model.ctx, &shifted, QUANT_ADJUST, &mut trial, -1.0) else {
+    let mut trial = Trial::new(xyb, &[&plan]);
+    trial.draw(&plan, -1.0);
+    let Some(dj) = trial.delta(model, xyb, quant_field, &[], None) else {
         return false;
     };
-    let blocks_w = xyb.xsize().div_ceil(8);
-    let mut dj = 0f32;
-    for by in b.1 / 8..=b.3 / 8 {
-        for bx in b.0 / 8..=b.2 / 8 {
-            if !block_touched(&local, &trial, bx, by) {
-                continue;
-            }
-            let qac = quant_field[(y0 / 8 + by) * blocks_w + x0 / 8 + bx];
-            let (d0, r0) = model.cost(&local, bx, by, qac);
-            let (d1, r1) = model.cost(&trial, bx, by, qac);
-            dj += (d1 - d0) + crate::ac_strategy::RD_LAMBDA * (r1 - r0);
-        }
-    }
     let bits = CostModel::prior(1.0).spline_bits(spline);
     dj + crate::ac_strategy::RD_LAMBDA * PRETEST_BITS_SHARE * margin(model.distance) * bits < 0.0
 }
