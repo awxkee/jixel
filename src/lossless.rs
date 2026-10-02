@@ -2917,6 +2917,98 @@ fn tokenize_channel_ma<'a, T: Copy + 'a>(
     );
 }
 
+/// One VarDCT DC group's quantized planes in modular channel order (Y, X, B).
+pub(crate) struct DcPlanes {
+    pub(crate) planes: [Vec<i32>; 3],
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+}
+
+impl DcPlanes {
+    /// Previously coded channels of `c`, most recent first, as the decoder's
+    /// reference properties see them.
+    fn refs(&self, c: usize) -> Vec<MaRefPlane<'_>> {
+        (0..c)
+            .rev()
+            .take(MA_REF_CHANNELS)
+            .map(|r| MaRefPlane {
+                pixels: &self.planes[r],
+                stride: self.w,
+                x0: 0,
+                y0: 0,
+            })
+            .collect()
+    }
+}
+
+/// MA samples of every DC group (stream id `1 + group`, default WP), taking
+/// every `stride`-th pixel.
+pub(crate) fn sample_dc_planes(groups: &[DcPlanes], stride: usize) -> MaSamples {
+    let capacity = groups
+        .iter()
+        .map(|g| 3 * ma_channel_sample_count(g.w, g.h, stride))
+        .sum();
+    let mut samples = MaSamples::with_capacity(capacity);
+    for (group, g) in groups.iter().enumerate() {
+        if g.w == 0 || g.h == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let refs = g.refs(c);
+            let pixels = &g.planes[c];
+            sample_channel_ma(
+                |y| &pixels[y * g.w..(y + 1) * g.w],
+                g.w,
+                g.h,
+                c as u32,
+                1 + group as i32,
+                &refs,
+                WpParams::DEFAULT,
+                true,
+                stride,
+                |props, tok| samples.push(props, tok),
+            );
+        }
+    }
+    samples
+}
+
+/// Tokenize one DC group through a learned tree: every pixel takes its leaf's
+/// context (`leaf_ctx`, indexed by tree node) and predictor.
+pub(crate) fn tokenize_dc_planes(
+    g: &DcPlanes,
+    group: usize,
+    tree: &LearnedTree,
+    leaf_ctx: &[u32],
+    out: &mut Vec<Token>,
+) {
+    if g.w == 0 || g.h == 0 {
+        return;
+    }
+    for c in 0..3 {
+        let refs = g.refs(c);
+        let pixels = &g.planes[c];
+        walk_channel_ma(
+            |y| &pixels[y * g.w..(y + 1) * g.w],
+            g.w,
+            g.h,
+            c as u32,
+            1 + group as i32,
+            &refs,
+            WpParams::DEFAULT,
+            true,
+            |_x, _y, v, p, n, wp_pred| {
+                let (node, pred) = tree.lookup(p);
+                let pv = predictor_value(pred, n, wp_pred);
+                out.push(Token::new(
+                    leaf_ctx[node as usize],
+                    pack_signed((v - pv) as i32),
+                ));
+            },
+        );
+    }
+}
+
 /// BFS-emit a learned tree (matches libjxl's FIFO tree decode). Returns
 /// (tree tokens, context id per node index — leaves only, context count).
 fn emit_learned_tree(tree: &LearnedTree) -> (Vec<Token>, Vec<u32>, u32) {

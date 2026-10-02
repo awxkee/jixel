@@ -3357,8 +3357,10 @@ mod encode_smoke_tests {
         let fixed = learned.clone().with_learned_rate(false);
         let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
         let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+        // The bug this guards took 2.6x the fixed size; a shared-DC saving
+        // shrinks both sides equally, so the bound must not sit at the ratio.
         assert!(
-            learned.len() * 2 < fixed.len() * 3,
+            learned.len() < fixed.len() * 2,
             "{} vs {}",
             learned.len(),
             fixed.len()
