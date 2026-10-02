@@ -10,12 +10,12 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/137237150_p0.png")).unwrap();
+    let image = image::open(Path::new("./assets/cerys.png")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 2.0;
+    let distance = 1.7;
     for _ in 0..5 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(

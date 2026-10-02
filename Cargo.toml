@@ -12,7 +12,6 @@ license = "BSD-3-Clause OR Apache-2.0"
 authors = ["Radzivon Bartoshyk"]
 documentation = "https://docs.rs/jixel"
 categories = ["multimedia::images", "compression", "encoding"]
-homepage = "https://github.com/awxkee/jixel"
 repository = "https://github.com/awxkee/jixel"
 exclude = ["*.jpg", "/assets", "*.png", "*.sh", "/assets/*", "/scripts/*", "/tools/*", "parameters_fit/*", ".github/*"]
 rust-version = "1.94.0"

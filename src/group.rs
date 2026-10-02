@@ -283,6 +283,9 @@ fn rdoq_block(
             | STRATEGY_DCT32X32
             | STRATEGY_DCT32X16
             | STRATEGY_DCT16X32
+            | STRATEGY_DCT64X64
+            | STRATEGY_DCT64X32
+            | STRATEGY_DCT32X64
     ) {
         return;
     }
