@@ -29,6 +29,9 @@
 
 use crate::Speed;
 
+mod dc_smoothing;
+use dc_smoothing::skip_dc_smoothing;
+
 use crate::ac_context::compact_block_context_map;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
@@ -791,6 +794,7 @@ fn write_frame_header_kind(
     coeff_shifts: &[u32],
     kind: VarDctFrameKind<'_>,
     has_splines: bool,
+    skip_dc_smoothing: bool,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -804,6 +808,7 @@ fn write_frame_header_kind(
             coeff_shifts,
             false,
             has_splines,
+            skip_dc_smoothing,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -816,6 +821,7 @@ fn write_frame_header_kind(
             coeff_shifts,
             true,
             has_splines,
+            skip_dc_smoothing,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
@@ -889,14 +895,17 @@ fn write_frame_header(
     coeff_shifts: &[u32],
     has_patches: bool,
     has_splines: bool,
+    skip_dc_smoothing: bool,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // Keep decoder-side adaptive DC smoothing enabled. The optional flags are
-    // kPatches (2) and kSplines (16); the skip-smoothing flag remains clear.
-    let flags = if has_patches { 2u64 } else { 0 } + if has_splines { 16 } else { 0 };
+    // Optional flags: kPatches (2), kSplines (16) and kSkipAdaptiveDCSmoothing
+    // (128), chosen per frame by `skip_dc_smoothing`.
+    let flags = if has_patches { 2u64 } else { 0 }
+        + if has_splines { 16 } else { 0 }
+        + if skip_dc_smoothing { 128 } else { 0 };
     match flags {
         0 => w.write(2, 0),
         1..=16 => {
@@ -2768,6 +2777,17 @@ fn encode_frame_core(
         }
     }
 
+    let skip_dc_smoothing = skip_dc_smoothing(
+        &ctx.thread_pool,
+        scratch,
+        opsin,
+        &dim,
+        &dc_datas,
+        &group_coords,
+        &distp,
+        ytob_dc,
+    )?;
+
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
     // Per-leaf DC predictor selection.
     let token_groups = ctx
@@ -3304,6 +3324,7 @@ fn encode_frame_core(
         coeff_shifts,
         frame_kind,
         has_splines,
+        skip_dc_smoothing,
         writer,
     );
     let payload_bits = sections

@@ -9,3 +9,5 @@ meanstats_out
 docs
 Cargo.lock
 .DS_Store
+scratchpad
+parameters_fit/work
