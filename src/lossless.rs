@@ -1647,9 +1647,11 @@ fn write_frame_header_modular_kind(
     match kind {
         ModularFrameKind::Regular => write_frame_header_modular(has_alpha, layout, w),
         ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, layout, w),
-        ModularFrameKind::XybReferenceOnly { width, height } => {
-            write_frame_header_modular_xyb_reference(width, height, has_alpha, layout, w)
-        }
+        ModularFrameKind::XybReferenceOnly {
+            width,
+            height,
+            slot,
+        } => write_frame_header_modular_xyb_reference(width, height, slot, has_alpha, layout, w),
         ModularFrameKind::ReferenceOnly { width, height } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
@@ -1686,6 +1688,7 @@ fn write_frame_header_modular_kind(
 fn write_frame_header_modular_xyb_reference(
     width: usize,
     height: usize,
+    slot: u32,
     has_alpha: bool,
     layout: GroupLayout,
     w: &mut BitWriter,
@@ -1705,7 +1708,7 @@ fn write_frame_header_modular_xyb_reference(
     write_frame_dimension(width, w);
     write_frame_dimension(height, w);
     // No blending and no is_last for reference-only frames.
-    w.write(2, crate::patches::MODULAR_PATCH_REF_ID as u64); // save_as_reference = 2
+    w.write(2, slot as u64); // save_as_reference
     w.write(1, 1); // save_before_color_transform = true
     w.write(2, 0); // empty name
     // Loop filter off: the atlas is stored exactly as coded; gaborish or EPF
@@ -1794,7 +1797,14 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     }
     let use_palette = !seen.is_empty() && seen.len() <= 256;
 
-    write_frame_header_modular_xyb_reference(xsize, ysize, has_alpha, layout, writer);
+    write_frame_header_modular_xyb_reference(
+        xsize,
+        ysize,
+        crate::patches::MODULAR_PATCH_REF_ID,
+        has_alpha,
+        layout,
+        writer,
+    );
 
     let mut section = BitWriter::new();
     // LfChannelDequant: the decoder multiplies each channel by these steps.
@@ -6720,6 +6730,31 @@ pub(crate) fn encode_modular_xyb_atlas_tree(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
+    encode_modular_xyb_atlas_tree_slot(
+        ch,
+        xsize,
+        ysize,
+        alpha,
+        speed,
+        pool,
+        scratch,
+        crate::patches::MODULAR_PATCH_REF_ID,
+        writer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_modular_xyb_atlas_tree_slot(
+    ch: &[Vec<i32>; 3],
+    xsize: usize,
+    ysize: usize,
+    alpha: Option<&AlphaPlane>,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    slot: u32,
+    writer: &mut BitWriter,
+) -> bool {
     let Ok(mut atlas) = Image3Si::try_new(xsize, ysize) else {
         return false;
     };
@@ -6747,6 +6782,7 @@ pub(crate) fn encode_modular_xyb_atlas_tree(
         ModularFrameKind::XybReferenceOnly {
             width: xsize,
             height: ysize,
+            slot,
         },
         false,
         writer,

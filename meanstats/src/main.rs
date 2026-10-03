@@ -83,7 +83,7 @@ const CVVDP_VENV_BIN: &str = concat!(
     "/../parameters_fit/.venv/bin/cvvdp"
 );
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
-const CVVDP_DISPLAY: &str = "standard_4k";
+const CVVDP_DISPLAY: &str = "standard_fhd";
 
 // --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3.
 // On by default when the tool is there (it is cheap next to the encodes);

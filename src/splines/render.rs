@@ -5,9 +5,33 @@ use super::{
     CHANNEL_WEIGHT, PixelBox, Point, QuantizedSpline, Y_TO_B, Y_TO_X, adjusted_quant, blob_weight,
     blob_window, sample_curve,
 };
+use crate::adaptive_quant::dirty_log2f;
 use crate::encoding_context::EncodingContext;
-#[cfg(test)]
 use crate::image::Image3F;
+use std::sync::Arc;
+
+struct DotPlacement {
+    template: Arc<super::dots::DotTemplate>,
+    x0: i32,
+    y0: i32,
+    quantized: bool,
+}
+
+impl DotPlacement {
+    fn row(&self, y: usize, x: usize, rows: [&mut [f32]; 3], sign: f32) {
+        let (side, planes) = if self.quantized {
+            (self.template.side, &self.template.xyb)
+        } else {
+            (self.template.trial_side, &self.template.trial_xyb)
+        };
+        let start = (y as i32 - self.y0) as usize * side + (x as i32 - self.x0) as usize;
+        for (row, source) in rows.into_iter().zip(planes.chunks_exact(side * side)) {
+            for (out, &v) in row.iter_mut().zip(&source[start..]) {
+                *out += sign * v;
+            }
+        }
+    }
+}
 
 pub(crate) struct Sample {
     pub(crate) position: Point<f32>,
@@ -55,6 +79,7 @@ pub(crate) fn select_render_row_fn() -> RenderRowFn {
 
 pub(super) struct RenderPlan {
     samples: Vec<Sample>,
+    dot: Option<DotPlacement>,
     pub(super) bounds: Option<PixelBox>,
     width: usize,
     row: RenderRowFn,
@@ -68,6 +93,15 @@ impl RenderPlan {
         w: usize,
         h: usize,
     ) -> Self {
+        if super::dots::is_dot(sp) {
+            return Self::dot(
+                ctx,
+                sp,
+                Arc::new(super::dots::DotTemplate::new(super::dots::template_key(sp))),
+                w,
+                h,
+            );
+        }
         let inv_quant = 1.0 / adjusted_quant(adjust);
         let mut dct = [[0f32; 4]; 32];
         for (i, row) in dct.iter_mut().enumerate() {
@@ -88,6 +122,7 @@ impl RenderPlan {
         let (samples, arc) = sample_curve(&sp.points);
         let mut plan = Self {
             samples: Vec::new(),
+            dot: None,
             bounds: None,
             width: w,
             row: ctx.spline_render_row,
@@ -111,7 +146,9 @@ impl RenderPlan {
             for c in color {
                 max_color = max_color.max((c * mult).abs());
             }
-            let reach = (-2.0 * sigma * sigma * (r - max_color.ln())).sqrt();
+            let reach =
+                (-2.0 * sigma * sigma * (r - dirty_log2f(max_color) * std::f32::consts::LN_2))
+                    .sqrt();
             let (x0, x1, y0, y1) = blob_window(cx, cy, reach, w, h);
             if x0 >= x1 || y0 >= y1 {
                 continue;
@@ -131,8 +168,80 @@ impl RenderPlan {
         plan
     }
 
-    #[cfg(test)]
+    /// Shared Gaussian proposal. The retained set is checked using the
+    /// quantized pixels before it is accepted.
+    pub(super) fn dot(
+        ctx: &EncodingContext,
+        sp: &QuantizedSpline,
+        template: Arc<super::dots::DotTemplate>,
+        w: usize,
+        h: usize,
+    ) -> Self {
+        Self::dot_impl(ctx, sp, template, w, h, false)
+    }
+
+    pub(super) fn quantized_dot(
+        ctx: &EncodingContext,
+        sp: &QuantizedSpline,
+        template: Arc<super::dots::DotTemplate>,
+        w: usize,
+        h: usize,
+    ) -> Self {
+        Self::dot_impl(ctx, sp, template, w, h, true)
+    }
+
+    fn dot_impl(
+        ctx: &EncodingContext,
+        sp: &QuantizedSpline,
+        template: Arc<super::dots::DotTemplate>,
+        w: usize,
+        h: usize,
+        quantized: bool,
+    ) -> Self {
+        let (radius, side) = if quantized {
+            (template.radius, template.side)
+        } else {
+            (template.trial_radius, template.trial_side)
+        };
+        let x0 = sp.points[0].x - radius;
+        let y0 = sp.points[0].y - radius;
+        let mut plan = Self {
+            samples: Vec::new(),
+            dot: None,
+            bounds: None,
+            width: w,
+            row: ctx.spline_render_row,
+        };
+        let left = x0.clamp(0, w as i32) as usize;
+        let top = y0.clamp(0, h as i32) as usize;
+        let right = (x0 + side as i32).clamp(0, w as i32) as usize;
+        let bottom = (y0 + side as i32).clamp(0, h as i32) as usize;
+        if (!quantized || !template.empty) && left < right && top < bottom {
+            plan.bounds = Some((left, top, right - 1, bottom - 1));
+            plan.dot = Some(DotPlacement {
+                template,
+                x0,
+                y0,
+                quantized,
+            });
+        }
+        plan
+    }
+
     pub(super) fn draw(&self, image: &mut Image3F, sign: f32) {
+        if let Some(dot) = &self.dot {
+            let (x0, y0, x1, y1) = self.bounds.unwrap();
+            for y in y0..=y1 {
+                let [rx, ry, rb] = image.all_plane_rows_mut(y);
+                dot.row(
+                    y,
+                    x0,
+                    [&mut rx[x0..=x1], &mut ry[x0..=x1], &mut rb[x0..=x1]],
+                    sign,
+                );
+            }
+            return;
+        }
         for sample in &self.samples {
             let (x0, x1, y0, y1) = sample.window;
             for y in y0..y1 {
@@ -150,6 +259,24 @@ impl RenderPlan {
 
     pub(super) fn tiled(self) -> TiledSpline {
         let blocks_w = self.width.div_ceil(8);
+        if self.dot.is_some() {
+            let (x0, y0, x1, y1) = self.bounds.unwrap();
+            let mut tiles = Vec::new();
+            for by in y0 / 8..=y1 / 8 {
+                for bx in x0 / 8..=x1 / 8 {
+                    tiles.push(Tile {
+                        cell: by * blocks_w + bx,
+                        start: 0,
+                        end: 0,
+                    });
+                }
+            }
+            return TiledSpline {
+                plan: self,
+                tiles,
+                sample_indices: Vec::new(),
+            };
+        }
         let mut coverage = Vec::new();
         for (index, sample) in self.samples.iter().enumerate() {
             let (x0, x1, y0, y1) = sample.window;
@@ -244,6 +371,26 @@ impl TiledSpline {
     pub(super) fn draw_tile(&self, tile: &Tile, pixels: &mut [[f32; 64]; 3], sign: f32) {
         let blocks_w = self.plan.width.div_ceil(8);
         let (tx, ty) = (tile.cell % blocks_w * 8, tile.cell / blocks_w * 8);
+        if let Some(dot) = &self.plan.dot {
+            let (sx0, sy0, sx1, sy1) = self.plan.bounds.unwrap();
+            let (x0, x1) = (sx0.max(tx), (sx1 + 1).min(tx + 8));
+            for y in sy0.max(ty)..(sy1 + 1).min(ty + 8) {
+                let start = (y - ty) * 8 + x0 - tx;
+                let end = start + x1 - x0;
+                let [rx, ry, rb] = &mut *pixels;
+                dot.row(
+                    y,
+                    x0,
+                    [
+                        &mut rx[start..end],
+                        &mut ry[start..end],
+                        &mut rb[start..end],
+                    ],
+                    sign,
+                );
+            }
+            return;
+        }
         for &index in &self.sample_indices[tile.start..tile.end] {
             let sample = &self.plan.samples[index];
             let (sx0, sx1, sy0, sy1) = sample.window;
@@ -272,6 +419,71 @@ impl TiledSpline {
 mod tests {
     use super::*;
     use crate::splines::QUANT_ADJUST;
+
+    #[test]
+    fn dot_trials_match_decoded_atlas_at_every_block_alignment() {
+        let ctx = EncodingContext::default();
+        let (w, h) = (47, 39);
+        for sigma in [1, 4, 10, 11] {
+            // The bright, wide case also exercises heap scratch for templates
+            // larger than the constructor's inline capacity.
+            for level in [3, 10, 17, 30] {
+                let template =
+                    Arc::new(super::super::dots::DotTemplate::new((sigma, level, -3, 2)));
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let mut sp = QuantizedSpline {
+                            points: vec![Point::new(16 + x, 16 + y)],
+                            dct: [[0; 32]; 4],
+                        };
+                        sp.dct[3][0] = sigma;
+                        sp.dct[1][0] = level;
+                        sp.dct[0][0] = -3;
+                        sp.dct[2][0] = 2;
+                        let atlas = super::super::dots::build_dot_patches(&[sp.clone()]);
+                        let mut expected = Image3F::new(w, h);
+                        for reference in atlas.references() {
+                            for (px, py) in reference.positions {
+                                for j in 0..reference.height {
+                                    for i in 0..reference.width {
+                                        let k = (reference.atlas_y + j) * atlas.width
+                                            + reference.atlas_x
+                                            + i;
+                                        let y = atlas.atlas[0][k];
+                                        expected.plane_row_mut(0, py + j)[px + i] -=
+                                            atlas.atlas[1][k] as f32 / 4096.0;
+                                        expected.plane_row_mut(1, py + j)[px + i] -=
+                                            y as f32 / 512.0;
+                                        expected.plane_row_mut(2, py + j)[px + i] -=
+                                            (atlas.atlas[2][k] + y) as f32 / 256.0;
+                                    }
+                                }
+                            }
+                        }
+                        let mut actual = Image3F::new(w, h);
+                        let plan =
+                            RenderPlan::quantized_dot(&ctx, &sp, template.clone(), w, h).tiled();
+                        for tile in &plan.tiles {
+                            let mut pixels = [[0.; 64]; 3];
+                            plan.draw_tile(tile, &mut pixels, -1.0);
+                            let (bx, by) =
+                                (tile.cell % w.div_ceil(8) * 8, tile.cell / w.div_ceil(8) * 8);
+                            for c in 0..3 {
+                                for j in 0..8.min(h - by) {
+                                    let width = 8.min(w - bx);
+                                    actual.plane_row_mut(c, by + j)[bx..bx + width]
+                                        .copy_from_slice(&pixels[c][j * 8..j * 8 + width]);
+                                }
+                            }
+                        }
+                        for c in 0..3 {
+                            assert_eq!(actual.plane_data(c), expected.plane_data(c));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn render_row_matches_scalar_for_all_alignments_and_tails() {
@@ -351,6 +563,7 @@ mod tests {
             let blocks_w = width.div_ceil(8);
             let mut plan = RenderPlan {
                 samples: Vec::new(),
+                dot: None,
                 bounds: None,
                 width,
                 row: ctx.spline_render_row,

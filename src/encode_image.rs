@@ -306,6 +306,14 @@ pub struct EncodeConfig {
     /// Requires the `splines` Cargo feature. Defaults to false.
     #[cfg(feature = "splines")]
     pub splines: bool,
+    /// Experimental: detect star-like point sources and code them as Gaussian
+    /// dots drawn from a small template atlas (additive patches), next to the
+    /// lossy VarDCT image. Dots, templates and the whole set pass
+    /// rate-distortion tests; images without point sources encode unchanged.
+    /// Slow speed and the default decoding speed only; costs encode time.
+    /// Requires the `splines` Cargo feature. Defaults to false.
+    #[cfg(feature = "splines")]
+    pub dots: bool,
     /// Number of VarDCT passes for **lossy** progressive encoding. `None` falls
     /// back to `progressive` (2 passes if set, else 1). `Some(1)` = single pass;
     /// `Some(n)` for n in 2..=4 = n-pass progressive with an automatic
@@ -389,6 +397,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) patches: bool,
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
+    #[cfg(feature = "splines")]
+    pub(crate) dots: bool,
     /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
     pub(crate) progressive_passes: Option<u32>,
     /// Explicit per-pass shift schedule (see `EncodeConfig::progressive_shifts`).
@@ -427,6 +437,8 @@ impl Default for EncodeConfig {
             patches: false,
             #[cfg(feature = "splines")]
             splines: false,
+            #[cfg(feature = "splines")]
+            dots: false,
             progressive_passes: None,
             progressive_shifts: None,
             intensity_target: None,
@@ -462,6 +474,8 @@ impl Default for EncodeConfigImpl {
             patches: false,
             #[cfg(feature = "splines")]
             splines: false,
+            #[cfg(feature = "splines")]
+            dots: false,
             grayscale: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -553,6 +567,12 @@ impl EncodeConfigImpl {
         self
     }
 
+    #[cfg(feature = "splines")]
+    pub(crate) fn with_dots(mut self, dots: bool) -> Self {
+        self.dots = dots;
+        self
+    }
+
     pub(crate) fn with_progressive_passes(mut self, passes: Option<u32>) -> Self {
         self.progressive_passes = passes;
         self
@@ -566,7 +586,7 @@ impl EncodeConfigImpl {
     /// Copy all lossy-progressive settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
         #[cfg(feature = "splines")]
-        let this = self.with_splines(config.splines);
+        let this = self.with_splines(config.splines).with_dots(config.dots);
         #[cfg(not(feature = "splines"))]
         let this = self;
         this.with_progressive(config.progressive)
@@ -723,6 +743,14 @@ impl EncodeConfig {
         self
     }
 
+    /// Experimental star-dot coding for lossy VarDCT (see [`EncodeConfig::dots`]).
+    /// Requires the `splines` Cargo feature.
+    #[cfg(feature = "splines")]
+    pub fn with_dots(mut self, dots: bool) -> Self {
+        self.dots = dots;
+        self
+    }
+
     /// Select the lossy encoding arm (see [`LossyModular`]).
     pub fn with_lossy_modular(mut self, mode: LossyModular) -> Self {
         self.lossy_modular = mode;
@@ -820,9 +848,9 @@ fn lossy_context(
     ctx.selector.learned_rate = config.learned_rate && config.speed == Speed::Slow;
     #[cfg(feature = "splines")]
     {
-        ctx.splines = config.splines
-            && config.speed == Speed::Slow
-            && config.decoding_speed == DecodingSpeed::Slow;
+        let slow = config.speed == Speed::Slow && config.decoding_speed == DecodingSpeed::Slow;
+        ctx.splines = config.splines && slow;
+        ctx.dots = config.dots && slow;
     }
     ctx
 }
@@ -2909,6 +2937,117 @@ mod encode_smoke_tests {
         let plain = encode_image(&pixels, S, S, &slow_lossy(2.0)).unwrap();
         let with = encode_image(&pixels, S, S, &slow_lossy(2.0).with_splines(true)).unwrap();
         assert_eq!(plain, with);
+    }
+
+    /// Gaussian point sources on a dark, smooth sky: the content class dots
+    /// exist for.
+    #[cfg(feature = "splines")]
+    fn star_field(size: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as f32 / u32::MAX as f32
+        };
+        let mut sky = vec![[0f32; 3]; size * size];
+        for (i, p) in sky.iter_mut().enumerate() {
+            let (x, y) = ((i % size) as f32, (i / size) as f32);
+            *p = [8.0 + 0.03 * x, 10.0 + 0.02 * y, 22.0 + 0.04 * (x + y)];
+        }
+        for _ in 0..size * size / 160 {
+            let (cx, cy) = (
+                6.0 + next() * (size - 12) as f32,
+                6.0 + next() * (size - 12) as f32,
+            );
+            let amp = 40.0 + 200.0 * next() * next();
+            let sigma = 0.6 + 0.4 * next();
+            let tint = [0.8 + 0.2 * next(), 0.9, 1.0];
+            for y in cy as usize - 4..=cy as usize + 4 {
+                for x in cx as usize - 4..=cx as usize + 4 {
+                    let d2 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    let v = amp * (-0.5 * d2 / (sigma * sigma)).exp();
+                    for (c, t) in sky[y * size + x].iter_mut().zip(tint) {
+                        *c += v * t;
+                    }
+                }
+            }
+        }
+        sky.iter()
+            .flat_map(|p| p.map(|c| c.clamp(0.0, 255.0) as u8))
+            .collect()
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn dots_shrink_star_fields() {
+        const S: usize = 256;
+        let pixels = star_field(S);
+        let config = slow_lossy(3.0).with_num_threads(1);
+        let plain = encode_image(&pixels, S, S, &config).unwrap();
+        let config = config.with_dots(true);
+        let with = encode_image(&pixels, S, S, &config).unwrap();
+        assert!(
+            with.len() * 100 < plain.len() * 97,
+            "dots should win on a star field: {} vs {}",
+            with.len(),
+            plain.len()
+        );
+        assert_eq!(
+            with,
+            encode_image(&pixels, S, S, &config.with_num_threads(4)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn dots_are_inert_without_points() {
+        const S: usize = 128;
+        let pixels = line_art(S);
+        let config = slow_lossy(2.0).with_splines(true);
+        assert_eq!(
+            encode_image(&pixels, S, S, &config).unwrap(),
+            encode_image(&pixels, S, S, &config.clone().with_dots(true)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn dots_with_alpha_are_thread_deterministic() {
+        const S: usize = 256;
+        let rgba: Vec<_> = star_field(S)
+            .chunks_exact(3)
+            .enumerate()
+            .flat_map(|(i, p)| [p[0], p[1], p[2], (64 + i % 192) as u8])
+            .collect();
+        let config = slow_lossy(3.0).with_num_threads(1).with_dots(true);
+        let with = encode_image_with_alpha(&rgba, S, S, &config).unwrap();
+        assert_eq!(
+            with,
+            encode_image_with_alpha(&rgba, S, S, &config.clone().with_num_threads(4)).unwrap()
+        );
+        assert_ne!(
+            with,
+            encode_image_with_alpha(&rgba, S, S, &config.with_dots(false)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn dots_only_run_at_slow_speed_and_default_decoding_speed() {
+        const S: usize = 128;
+        let pixels = star_field(S);
+        for config in [
+            EncodeConfig::default()
+                .with_distance(3.0)
+                .with_speed(Speed::Fast),
+            slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast),
+        ] {
+            assert_eq!(
+                encode_image(&pixels, S, S, &config).unwrap(),
+                encode_image(&pixels, S, S, &config.clone().with_dots(true)).unwrap()
+            );
+        }
     }
 
     #[test]

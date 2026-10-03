@@ -1471,13 +1471,13 @@ fn encode_frame_vardct(
     }
 
     #[cfg(feature = "splines")]
-    let quant_field = if ctx.splines {
+    let quant_field = if ctx.splines || ctx.dots {
         spline_quant_field(ctx, scratch, &xyb, distp)?
     } else {
         Vec::new()
     };
     #[cfg(feature = "splines")]
-    let spline_candidates = if ctx.splines {
+    let spline_candidates = if ctx.splines || ctx.dots {
         crate::splines::find_candidates(ctx, scratch, distance, &xyb, &quant_field)
     } else {
         None
@@ -2068,9 +2068,54 @@ struct PreparedVarDct {
 }
 
 impl PreparedVarDct {
+    /// Moves the selected dots out of the spline set into a template atlas
+    /// (a modular reference frame) and kAdd dictionary entries.
+    #[cfg(feature = "splines")]
+    fn materialize_dots(
+        &mut self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        alpha: Option<&AlphaPlane>,
+    ) {
+        use crate::splines::dots;
+        let Some(set) = self.splines.as_mut() else {
+            return;
+        };
+        let encoding = set.dot_encoding.take();
+        let selected: Vec<_> = set.splines.extract_if(.., |sp| dots::is_dot(sp)).collect();
+        if set.splines.is_empty() {
+            self.splines = None;
+        }
+        if selected.is_empty() {
+            return;
+        }
+        if alpha.is_none()
+            && let Some(encoding) = encoding
+        {
+            self.prefix.append_bits(&encoding.atlas);
+            self.references.extend(encoding.references);
+            return;
+        }
+        let plan = dots::build_dot_patches(&selected);
+        let atlas_alpha = zero_alpha_for_lossy(alpha, plan.width * plan.height);
+        crate::lossless::encode_modular_xyb_atlas_tree_slot(
+            &plan.atlas,
+            plan.width,
+            plan.height,
+            atlas_alpha.as_ref(),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            crate::patches::DOT_PATCH_REF_ID,
+            &mut self.prefix,
+        );
+        self.references.extend(plan.references());
+    }
+
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "splines"), allow(unused_mut))]
     fn encode(
-        self,
+        mut self,
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
         distance: f32,
@@ -2078,6 +2123,8 @@ impl PreparedVarDct {
         coeff_shifts: &[u32],
         writer: &mut BitWriter,
     ) -> Result<(), EncodeError> {
+        #[cfg(feature = "splines")]
+        self.materialize_dots(ctx, scratch, alpha);
         writer.append(&self.prefix);
         encode_frame_core(
             ctx,
@@ -2109,6 +2156,8 @@ impl PreparedVarDct {
         if let Some(bits) = self.estimated_bits {
             return Ok(bits);
         }
+        #[cfg(feature = "splines")]
+        self.materialize_dots(ctx, scratch, alpha);
         let mut extras = BitWriter::new();
         if !self.references.is_empty() {
             crate::lossless::write_patch_dictionary(

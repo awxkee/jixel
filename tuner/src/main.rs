@@ -26,6 +26,7 @@ fn usage() -> ! {
          [--speed slow|fast]"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
+    eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
     eprintln!("         [--patches | --no-patches] (override the speed preset)");
     std::process::exit(2);
 }
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
     let mut splines = false;
+    let mut dots = false;
     let mut patches = None;
 
     let mut i = 0;
@@ -73,6 +75,10 @@ fn main() -> ExitCode {
             }
             "--splines" => {
                 splines = true;
+                i += 1;
+            }
+            "--dots" => {
+                dots = true;
                 i += 1;
             }
             "--patches" | "--no-patches" => {
@@ -123,7 +129,8 @@ fn main() -> ExitCode {
         .with_distance(distance)
         .with_num_threads(threads.max(1))
         .with_speed(speed)
-        .with_splines(splines);
+        .with_splines(splines)
+        .with_dots(dots);
     let cfg = if let Some(patches) = patches {
         cfg.with_patches(patches)
     } else {

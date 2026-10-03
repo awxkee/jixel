@@ -37,6 +37,7 @@
 //! the DCT quantizer or the smoothing filters.
 
 mod detect;
+pub(crate) mod dots;
 mod extend;
 mod filter;
 mod fit;
@@ -130,7 +131,13 @@ fn biased_for_rounding(value: f32) -> f32 {
 
 #[inline]
 fn round_i32(value: f32) -> i32 {
-    biased_for_rounding(value) as i32
+    // Baseline x86 lowers round() to a libm call. Other targets can use a
+    // native rounding conversion (for example, FCVTAS on AArch64).
+    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+        biased_for_rounding(value) as i32
+    } else {
+        value.round() as i32
+    }
 }
 
 #[inline]
@@ -154,6 +161,7 @@ pub(crate) struct QuantizedSpline {
 pub(crate) struct SplineSet {
     pub(crate) adjust: i32,
     pub(crate) splines: Vec<QuantizedSpline>,
+    pub(crate) dot_encoding: Option<dots::DotEncoding>,
 }
 
 #[inline]
@@ -470,7 +478,8 @@ impl SplineCandidates {
     }
 }
 
-/// Detects curvilinear structures in `xyb` and fits spline candidates to them.
+/// Detects curvilinear structures (splines) and star-like points (dots) in
+/// `xyb` and fits candidates to them.
 pub(crate) fn find_candidates(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -484,22 +493,27 @@ pub(crate) fn find_candidates(
     if palette_like(xyb) {
         return None;
     }
-    let chains = detect::detect_chains(ctx, scratch, xyb);
-    if chains.is_empty() {
-        return None;
+    let mut candidates = Vec::new();
+    if ctx.splines {
+        let chains = detect::detect_chains(ctx, scratch, xyb);
+        if !chains.is_empty() {
+            let extensions = extend::find_extensions(ctx, scratch, xyb, &chains);
+            let long_lines = lines::find_long_lines(&chains);
+            candidates = fit::fit_candidates(
+                ctx,
+                scratch,
+                distance,
+                xyb,
+                quant_field,
+                &chains,
+                &extensions,
+                &long_lines,
+            );
+        }
     }
-    let extensions = extend::find_extensions(ctx, scratch, xyb, &chains);
-    let long_lines = lines::find_long_lines(&chains);
-    let candidates = fit::fit_candidates(
-        ctx,
-        scratch,
-        distance,
-        xyb,
-        quant_field,
-        &chains,
-        &extensions,
-        &long_lines,
-    );
+    if ctx.dots {
+        candidates.extend(dots::dot_candidates(&ctx.thread_pool, scratch, xyb));
+    }
     (!candidates.is_empty()).then_some(SplineCandidates(candidates))
 }
 
@@ -516,15 +530,32 @@ pub(crate) fn select_splines(
     candidates: &SplineCandidates,
     forbidden: Option<&[bool]>,
 ) -> Option<SplineSet> {
-    select::rd_select(
-        ctx,
-        scratch,
-        distance,
-        image,
-        quant_field,
-        &candidates.0,
-        forbidden,
-    )
+    // Lines first, exactly as without dots: dots see the line residual, and
+    // dropping every dot leaves the line-only result untouched.
+    let split = candidates
+        .0
+        .iter()
+        .position(|c| c.dot)
+        .unwrap_or(candidates.0.len());
+    let (lines, dots) = candidates.0.split_at(split);
+    let mut set = if lines.is_empty() {
+        None
+    } else {
+        select::rd_select(ctx, scratch, distance, image, quant_field, lines, forbidden)
+    };
+    if !dots.is_empty()
+        && let Some(dot_set) =
+            select::rd_select(ctx, scratch, distance, image, quant_field, dots, forbidden)
+    {
+        match set.as_mut() {
+            Some(set) => {
+                set.splines.extend(dot_set.splines);
+                set.dot_encoding = dot_set.dot_encoding;
+            }
+            None => set = Some(dot_set),
+        }
+    }
+    set
 }
 
 #[cfg(test)]
@@ -554,6 +585,7 @@ mod tests {
         let candidates = SplineCandidates(vec![fit::Candidate {
             alts: vec![line],
             bits_factor: 1.0,
+            dot: false,
         }]);
         // 8 x 2 blocks: the line runs through the whole top row
         let mut blocks = vec![false; 16];
