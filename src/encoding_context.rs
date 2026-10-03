@@ -60,6 +60,9 @@ pub(crate) struct EncodingContext {
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
+    /// Experimental star-dot coding (see `EncodeConfig::dots`).
+    #[cfg(feature = "splines")]
+    pub(crate) dots: bool,
     #[cfg(feature = "splines")]
     pub(crate) spline_continuous_idct: crate::splines::ContinuousIdctFn,
     #[cfg(feature = "splines")]
@@ -268,6 +271,8 @@ impl EncodingContext {
             lossy_modular: crate::LossyModular::Off,
             #[cfg(feature = "splines")]
             splines: false,
+            #[cfg(feature = "splines")]
+            dots: false,
             xyb,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),

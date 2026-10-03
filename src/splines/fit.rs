@@ -90,6 +90,8 @@ pub(super) struct Candidate {
     pub(super) alts: Vec<QuantizedSpline>,
     /// Extra factor on the spline bits in the RD gate.
     pub(super) bits_factor: f32,
+    /// Star dot (see `dots`): priced by position and template, selected after lines.
+    pub(super) dot: bool,
 }
 
 #[inline]
@@ -1197,6 +1199,7 @@ fn expand(
     Some(Candidate {
         alts,
         bits_factor: 1.0,
+        dot: false,
     })
 }
 
@@ -1290,6 +1293,7 @@ fn fit_extension(
     (!alts.is_empty()).then_some(Candidate {
         alts,
         bits_factor: 1.0,
+        dot: false,
     })
 }
 
@@ -1344,6 +1348,7 @@ fn fit_long_line(
     (!alts.is_empty()).then_some(Candidate {
         alts,
         bits_factor: LONG_LINE_BITS_FACTOR,
+        dot: false,
     })
 }
 
@@ -1389,6 +1394,7 @@ fn fit_joined_line(
     (!alts.is_empty()).then_some(Candidate {
         alts,
         bits_factor: LONG_LINE_BITS_FACTOR,
+        dot: false,
     })
 }
 

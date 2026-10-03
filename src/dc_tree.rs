@@ -56,6 +56,8 @@ enum LeafTag {
     /// A refinement leaf under static metadata context `ctx`, numbered in
     /// refinement-subtree walk order via `seq`.
     Refined { ctx: u8, seq: u16 },
+    /// A DC leaf learned by the MA learner, carrying its tree node index.
+    Ma(u32),
 }
 
 #[derive(Clone)]
@@ -505,20 +507,7 @@ pub(crate) fn learn_dc_tree(
         &mut leaves_left,
     );
 
-    // Metadata refinement: per-static-context stats over the West property.
-    // The pseudo-"channel" axis holds the static context, so the same cell
-    // machinery serves; splits emit property 7 and never cross contexts,
-    // which keeps every token's residual valid under its inherited predictor.
-    let mut meta_stats = MetaStats::new();
-    for (group, pr) in meta_tokens.iter().zip(meta_props) {
-        debug_assert_eq!(group.len(), pr.len());
-        for (t, &p) in group.iter().zip(pr) {
-            meta_stats.add(t.context as usize, p, t.value);
-        }
-    }
-    let (meta_side, _static_dc) = static_sides();
-    let meta_side = refine_meta(meta_side, &meta_stats);
-
+    let meta_side = refined_meta_side(meta_tokens, meta_props);
     let root = Node::Split {
         prop: 1,
         splitval: 1 + num_dc_groups as i32,
@@ -568,12 +557,46 @@ pub(crate) fn learn_dc_tree(
         }
     }
 
-    // Metadata context lookup: static context -> (possibly refined) context
-    // per West bin. Unrefined contexts map to a single id for every bin.
+    let meta_context = meta_context_lookup(meta_root, &leaves);
+
+    let num_contexts = leaf_preds.len();
+    let mut leaf_gradient = vec![false; num_contexts];
+    for (ctx, pred) in leaf_preds.iter().enumerate() {
+        leaf_gradient[ctx] = *pred == PRED_GRADIENT;
+    }
+
+    LearnedDcTree {
+        tokens,
+        dc_context,
+        meta_context,
+        leaf_gradient,
+        num_contexts,
+    }
+}
+
+/// Metadata refinement: per-static-context stats over the West property.
+/// The pseudo-"channel" axis holds the static context, so the same cell
+/// machinery serves; splits emit property 7 and never cross contexts, which
+/// keeps every token's residual valid under its inherited predictor.
+fn refined_meta_side(meta_tokens: &[Vec<Token>], meta_props: &[Vec<DcProp>]) -> Node {
+    let mut meta_stats = MetaStats::new();
+    for (group, pr) in meta_tokens.iter().zip(meta_props) {
+        debug_assert_eq!(group.len(), pr.len());
+        for (t, &p) in group.iter().zip(pr) {
+            meta_stats.add(t.context as usize, p, t.value);
+        }
+    }
+    let (meta_side, _static_dc) = static_sides();
+    refine_meta(meta_side, &meta_stats)
+}
+
+/// Metadata context lookup: static context -> (possibly refined) context per
+/// West bin. Unrefined contexts map to a single id for every bin.
+fn meta_context_lookup(meta_root: &Node, leaves: &[(LeafTag, u8)]) -> Vec<u8> {
     let mut refined_ctx: std::collections::HashMap<(u8, u16), u8> =
         std::collections::HashMap::new();
     let mut static_ctx: Vec<Option<u8>> = vec![None; NUM_META_CONTEXTS];
-    for &(tag, ctx) in &leaves {
+    for &(tag, ctx) in leaves {
         match tag {
             LeafTag::Refined { ctx: sc, seq } => {
                 refined_ctx.insert((sc, seq), ctx);
@@ -612,19 +635,68 @@ pub(crate) fn learn_dc_tree(
             meta_context[(sc << 10) | bin] = ctx;
         }
     }
+    meta_context
+}
 
-    let num_contexts = leaf_preds.len();
-    let mut leaf_gradient = vec![false; num_contexts];
-    for (ctx, pred) in leaf_preds.iter().enumerate() {
-        leaf_gradient[ctx] = *pred == PRED_GRADIENT;
+/// Everything the DC write path needs to use an MA-learned DC side.
+pub(crate) struct MaDcTree {
+    pub(crate) tokens: Vec<Token>,
+    /// Context id per node of the MA tree (meaningful for its leaves).
+    pub(crate) leaf_ctx: Vec<u32>,
+    /// `(static metadata context << 10) | West bin` -> context id.
+    pub(crate) meta_context: Vec<u8>,
+    pub(crate) num_contexts: usize,
+}
+
+/// Graft an MA-learned DC subtree under the stream-routing root, beside the
+/// refined metadata side, and number every leaf in global BFS order.
+/// `offsets[node]` is the predictor offset of each MA leaf.
+pub(crate) fn graft_ma_dc_tree(
+    num_dc_groups: usize,
+    ma: &crate::ma_tree::LearnedTree,
+    offsets: &[i32],
+    meta_tokens: &[Vec<Token>],
+    meta_props: &[Vec<DcProp>],
+) -> MaDcTree {
+    fn convert(nodes: &[crate::ma_tree::MaNode], offsets: &[i32], i: u32) -> Node {
+        match nodes[i as usize] {
+            crate::ma_tree::MaNode::Split { prop, val, gt, le } => Node::Split {
+                prop: u32::from(prop),
+                splitval: val,
+                gt: Box::new(convert(nodes, offsets, gt)),
+                le: Box::new(convert(nodes, offsets, le)),
+            },
+            crate::ma_tree::MaNode::Leaf { pred } => Node::Leaf {
+                tag: LeafTag::Ma(i),
+                pred,
+                offset: pack_signed(offsets[i as usize]),
+                mul_log: 0,
+                mul_bits: 0,
+            },
+        }
     }
-
-    LearnedDcTree {
+    let root = Node::Split {
+        prop: 1,
+        splitval: 1 + num_dc_groups as i32,
+        gt: Box::new(refined_meta_side(meta_tokens, meta_props)),
+        le: Box::new(convert(&ma.nodes, offsets, 0)),
+    };
+    let (tokens, leaves, leaf_preds) = serialize(&root);
+    let mut leaf_ctx = vec![u32::MAX; ma.nodes.len()];
+    for &(tag, ctx) in &leaves {
+        if let LeafTag::Ma(i) = tag {
+            leaf_ctx[i as usize] = u32::from(ctx);
+        }
+    }
+    let meta_root = match &root {
+        Node::Split { gt, .. } => gt.as_ref(),
+        Node::Leaf { .. } => unreachable!(),
+    };
+    MaDcTree {
         tokens,
-        dc_context,
-        meta_context,
-        leaf_gradient,
-        num_contexts,
+        leaf_ctx,
+        meta_context: meta_context_lookup(meta_root, &leaves),
+        num_contexts: leaf_preds.len(),
     }
 }
 
@@ -1102,5 +1174,47 @@ mod tests {
         let x_ctx = learned.dc_context[(1usize << 10) | 512];
         let y_ctx = learned.dc_context[512];
         assert_ne!(x_ctx, y_ctx, "channel split should separate X from Y");
+    }
+}
+
+/// Largest |offset| a DC leaf may carry.
+const DC_LEAF_OFFSET_LIMIT: i32 = 8;
+/// Contexts with fewer tokens keep offset 0.
+const DC_LEAF_OFFSET_MIN_TOKENS: u32 = 16;
+
+/// Per-context median residual, clamped to the offset limit.
+pub(crate) fn median_leaf_offsets(tokens: &[Vec<Token>], num_contexts: usize) -> Vec<i32> {
+    const SPAN: usize = 2 * DC_LEAF_OFFSET_LIMIT as usize + 1;
+    let mut counts = vec![[0u32; SPAN]; num_contexts];
+    for t in tokens.iter().flatten() {
+        let r = unpack_signed(t.value).clamp(-DC_LEAF_OFFSET_LIMIT, DC_LEAF_OFFSET_LIMIT);
+        counts[t.context as usize][(r + DC_LEAF_OFFSET_LIMIT) as usize] += 1;
+    }
+    counts
+        .iter()
+        .map(|c| {
+            let total: u32 = c.iter().sum();
+            if total < DC_LEAF_OFFSET_MIN_TOKENS {
+                return 0;
+            }
+            let mut seen = 0;
+            for (i, &n) in c.iter().enumerate() {
+                seen += n;
+                if 2 * seen >= total {
+                    return i as i32 - DC_LEAF_OFFSET_LIMIT;
+                }
+            }
+            0
+        })
+        .collect()
+}
+
+/// Subtract each token's context offset from its residual.
+pub(crate) fn apply_leaf_offsets(tokens: &mut [Vec<Token>], offsets: &[i32]) {
+    for t in tokens.iter_mut().flatten() {
+        let off = offsets[t.context as usize];
+        if off != 0 {
+            t.value = pack_signed(unpack_signed(t.value) - off);
+        }
     }
 }

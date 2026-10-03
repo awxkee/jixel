@@ -32,6 +32,7 @@
 //! Alternative parametriяations of a candidate compete; the spline side is
 //! priced with an adaptive token-cost model refined over two passes.
 
+use super::dots;
 use super::fit::Candidate;
 use super::render::{RenderPlan, TiledSpline};
 #[cfg(test)]
@@ -41,12 +42,15 @@ use super::{
     QuantizedSpline, SplineSet, spline_tokens,
 };
 use crate::adaptive_quant::dirty_log2f;
+use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::dct::DctInput;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
 use crate::image::Image3F;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 const START_POSITION_BITS: f32 = 20.0;
 /// Spline bits are charged `margin` times: the DCT8 proxy is optimistic where
@@ -59,6 +63,10 @@ const MIN_TOTAL_GAIN_BITS: f32 = 256.0;
 /// Bound the combined trial storage of independent candidates to about 12 MiB.
 /// A single larger candidate still uses the existing alternative-parallel path.
 const MAX_BATCH_TILES: usize = 16_384;
+const DOT_POSITION_BITS: f32 = 4.0;
+const DOT_FIRST_PASS_TEMPLATE_BITS: f32 = 12.0;
+const DOT_TEMPLATE_BITS: f32 = 300.0;
+const DOT_BATCH: usize = 256;
 
 fn margin(distance: f32) -> f32 {
     let t = ((distance - MARGIN_NEAR.0) / (MARGIN_FAR.0 - MARGIN_NEAR.0)).clamp(0.0, 1.0);
@@ -559,6 +567,243 @@ fn prune_selected(
     }
 }
 
+fn encode_dot_plan(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    plan: &dots::DotPatches,
+) -> (BitWriter, f32) {
+    let mut atlas = BitWriter::new();
+    crate::lossless::encode_modular_xyb_atlas_tree_slot(
+        &plan.atlas,
+        plan.width,
+        plan.height,
+        None,
+        ctx.speed,
+        &ctx.thread_pool,
+        scratch,
+        crate::patches::DOT_PATCH_REF_ID,
+        &mut atlas,
+    );
+    let mut dictionary = BitWriter::new();
+    crate::lossless::write_patch_dictionary(&plan.references(), false, scratch, &mut dictionary);
+    (atlas, dictionary.bits_written() as f32)
+}
+
+/// Charges the selected dots their real atlas and dictionary bits, shared per
+/// template. Placements on unprofitable templates can reuse a paying template
+/// before being removed. Rechecks the retained residual against the original
+/// image and returns its net gain and final RGB atlas encoding.
+fn prune_dot_templates(
+    model: &BlockModel,
+    scratch: &mut CoderScratch,
+    original: &Image3F,
+    current: &mut Image3F,
+    quant_field: &[f32],
+    kept: &mut Vec<QuantizedSpline>,
+    raw: &mut [f32],
+    candidates: &[Candidate],
+    kept_candidates: &[usize],
+    forbidden: Option<&[bool]>,
+    templates: &HashMap<dots::TemplateKey, Arc<dots::DotTemplate>>,
+) -> (f32, Option<dots::DotEncoding>) {
+    debug_assert!(kept.iter().all(dots::is_dot));
+    debug_assert_eq!(raw.len(), kept.len());
+    debug_assert_eq!(kept_candidates.len(), kept.len());
+    let ctx = model.ctx;
+    let (w, h) = (current.xsize(), current.ysize());
+    let mut alive = vec![true; kept.len()];
+    // A final measurement after the last removal also supplies the exact
+    // encoded atlas used by output, rather than encoding it again.
+    for round in 0..=8 {
+        let idx: Vec<usize> = (0..kept.len())
+            .filter(|&i| alive[i] && dots::is_dot(&kept[i]))
+            .collect();
+        if idx.is_empty() {
+            kept.clear();
+            return (0.0, None);
+        }
+        let set: Vec<QuantizedSpline> = idx.iter().map(|&i| kept[i].clone()).collect();
+        let mut plan = dots::build_dot_patches_with_templates(&set, templates, false);
+        let (mut atlas, mut dictionary_bits) = encode_dot_plan(ctx, scratch, &plan);
+        let mut atlas_bits = atlas.bits_written() as f32;
+        let mut by_key: HashMap<dots::TemplateKey, (f32, usize)> = HashMap::new();
+        for &i in &idx {
+            let e = by_key
+                .entry(templates[&dots::template_key(&kept[i])].key)
+                .or_insert((0.0, 0));
+            e.0 += raw[i];
+            e.1 += 1;
+        }
+        let per_dot = dictionary_bits / idx.len() as f32;
+        let per_template = atlas_bits / by_key.len() as f32;
+        let losing: Vec<usize> = idx
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let (gain, n) = by_key[&templates[&dots::template_key(&kept[i])].key];
+                gain < n as f32 * per_dot + per_template
+            })
+            .collect();
+        // The whole set is judged once every template pays its share.
+        let total: f32 = idx.iter().map(|&i| raw[i]).sum();
+        let dropped = if losing.is_empty() && total < atlas_bits + dictionary_bits {
+            &idx
+        } else {
+            &losing
+        };
+        if dropped.is_empty() || round == 8 {
+            // Zero padding can help Modular prediction, so race the trimmed
+            // layout only once for the final set instead of assuming it wins.
+            let trimmed = dots::build_dot_patches_with_templates(&set, templates, true);
+            let (trimmed_atlas, trimmed_dictionary_bits) = encode_dot_plan(ctx, scratch, &trimmed);
+            let trimmed_bits = trimmed_atlas.bits_written() as f32;
+            if trimmed_bits + trimmed_dictionary_bits < atlas_bits + dictionary_bits {
+                plan = trimmed;
+                atlas = trimmed_atlas;
+                atlas_bits = trimmed_bits;
+                dictionary_bits = trimmed_dictionary_bits;
+            }
+            // Patch entries code signed offsets within each template group.
+            // Race spatial orders against the raster baseline using the real
+            // entropy coder; fitting and template pixels stay unchanged.
+            let mut best_references = plan.references();
+            for band in [None, Some(16), Some(32), Some(64)] {
+                plan.sort_positions(band);
+                let mut dictionary = BitWriter::new();
+                crate::lossless::write_patch_dictionary(
+                    &plan.references(),
+                    false,
+                    scratch,
+                    &mut dictionary,
+                );
+                let bits = dictionary.bits_written() as f32;
+                if bits < dictionary_bits {
+                    dictionary_bits = bits;
+                    best_references = plan.references();
+                }
+            }
+
+            let blocks_w = w.div_ceil(8);
+            let mut touched = vec![false; blocks_w * h.div_ceil(8)];
+            for &i in &idx {
+                let sp = &kept[i];
+                let template = &templates[&dots::template_key(sp)];
+                RenderPlan::dot(ctx, sp, template.clone(), w, h).draw(current, 1.0);
+                RenderPlan::quantized_dot(ctx, sp, template.clone(), w, h).draw(current, -1.0);
+                let x0 = (sp.points[0].x - template.radius) as usize;
+                let y0 = (sp.points[0].y - template.radius) as usize;
+                for by in y0 / 8..=(y0 + template.side - 1) / 8 {
+                    touched[by * blocks_w..][x0 / 8..=(x0 + template.side - 1) / 8].fill(true);
+                }
+            }
+            let mut gain = -(atlas_bits + dictionary_bits);
+            // This final check can cover most of a star field. Price disjoint
+            // block bands concurrently, then sum in raster order so worker
+            // count cannot change the floating-point acceptance decision.
+            const COST_BAND: usize = 64;
+            let gains =
+                ctx.thread_pool
+                    .steal_map(scratch, touched.len().div_ceil(COST_BAND), |band, _| {
+                        let start = band * COST_BAND;
+                        touched[start..(start + COST_BAND).min(touched.len())]
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, &touches)| {
+                                if !touches {
+                                    return None;
+                                }
+                                let cell = start + offset;
+                                let (bx, by) = (cell % blocks_w, cell / blocks_w);
+                                let (d0, r0) = model.cost(original, bx, by, quant_field[cell]);
+                                let (d1, r1) = model.cost(current, bx, by, quant_field[cell]);
+                                Some((d0 - d1) / crate::ac_strategy::RD_LAMBDA + r0 - r1)
+                            })
+                            .collect::<Vec<_>>()
+                    });
+            for delta in gains.into_iter().flatten() {
+                gain += delta;
+            }
+            let mut alive = alive.into_iter();
+            kept.retain(|_| alive.next().unwrap());
+            return (
+                gain,
+                Some(dots::DotEncoding {
+                    atlas: Arc::new(atlas),
+                    references: best_references,
+                }),
+            );
+        }
+        let mut cache = vec![None; w.div_ceil(8) * h.div_ceil(8)];
+        for &i in dropped {
+            let sp = &kept[i];
+            let incumbent =
+                RenderPlan::dot(ctx, sp, templates[&dots::template_key(sp)].clone(), w, h).tiled();
+            // An unprofitable template need not discard every placement. Try
+            // the candidate's existing alternatives that reuse a paying
+            // template: only another position must be coded for those.
+            let alternatives: Vec<_> = candidates[kept_candidates[i]]
+                .alts
+                .iter()
+                .filter(|alt| {
+                    // Keep the fitted point's width and brightness. Sharing
+                    // another shape can hide a local error behind the RD
+                    // proxy's lower aggregate coefficient cost.
+                    if alt.dct[3][0] != sp.dct[3][0] || alt.dct[1][0] != sp.dct[1][0] {
+                        return false;
+                    }
+                    by_key
+                        .get(&dots::template_key(alt))
+                        .is_some_and(|&(gain, n)| gain >= n as f32 * per_dot + per_template)
+                })
+                .map(|alt| {
+                    let plan = RenderPlan::dot(
+                        ctx,
+                        alt,
+                        templates[&dots::template_key(alt)].clone(),
+                        w,
+                        h,
+                    )
+                    .tiled();
+                    (alt, plan)
+                })
+                .collect();
+            if !alternatives.is_empty() {
+                cache_blocks(model, current, quant_field, &mut cache, &incumbent);
+            }
+            let mut restored = Trial::new(current, &[&incumbent]);
+            restored.draw(&incumbent, 1.0);
+            let mut best: Option<(f32, &QuantizedSpline, Trial)> = None;
+            for (alt, plan) in &alternatives {
+                cache_blocks(model, current, quant_field, &mut cache, plan);
+                let mut trial = Trial::new(current, &[&incumbent, plan]);
+                trial.copy_blocks_from(&restored);
+                trial.draw(plan, -1.0);
+                let Some(delta) = trial.delta(model, current, quant_field, &cache, forbidden)
+                else {
+                    continue;
+                };
+                let gain = raw[i] - delta / crate::ac_strategy::RD_LAMBDA;
+                if gain > per_dot && best.as_ref().is_none_or(|(best, _, _)| gain > *best) {
+                    best = Some((gain, alt, trial));
+                }
+            }
+            let trial = if let Some((gain, alt, trial)) = best {
+                raw[i] = gain;
+                kept[i] = alt.clone();
+                trial
+            } else {
+                alive[i] = false;
+                restored
+            };
+            trial.commit(current);
+            for block in &trial.blocks {
+                cache[block.cell] = None;
+            }
+        }
+    }
+    unreachable!()
+}
+
 /// Refine the first two width harmonics against the current residual. Keep
 /// the fitted mean width, color and geometry; every trial uses the decoder
 /// render and must pay for its extra coefficients in the residual RD model.
@@ -573,6 +818,9 @@ fn refine_selected_widths(
     let (w, h) = (current.xsize(), current.ysize());
     let mut cache = vec![None; w.div_ceil(8) * h.div_ceil(8)];
     for sp in kept {
+        if dots::is_dot(sp) {
+            continue;
+        }
         let mut incumbent = RenderPlan::new(model.ctx, sp, QUANT_ADJUST, w, h).tiled();
         for i in 1..=2 {
             let mut restored = Trial::new(current, &[&incumbent]);
@@ -666,13 +914,62 @@ pub(super) fn rd_select(
     let model = BlockModel::new(ctx, distance);
     let (w, h) = (xyb.xsize(), xyb.ysize());
     let blocks_w = w.div_ceil(8);
+    let n_dots = candidates.iter().filter(|c| c.dot).count().max(1) as f32;
+    let dot_start = dirty_log2f((w * h) as f32 / n_dots).clamp(4.0, 16.0) + DOT_POSITION_BITS;
+    let keys: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.dot)
+        .flat_map(|c| c.alts.iter().map(dots::template_key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let dot_templates = dots::share_templates(keys.iter().copied().zip(ctx.thread_pool.steal_map(
+        scratch,
+        keys.len(),
+        |i, _| dots::DotTemplate::new(keys[i]),
+    )));
+    // Second pass: a dot also pays for its template, by that template's share
+    // of the first-pass dots.
+    let popularity: RefCell<Option<(HashMap<dots::TemplateKey, usize>, usize)>> =
+        RefCell::new(None);
+    let price = |prices: &CostModel, candidate: &Candidate, alt: &QuantizedSpline| {
+        if dots::is_dot(alt) {
+            let template = match popularity.borrow().as_ref() {
+                Some((counts, total)) => {
+                    let n = counts
+                        .get(&dot_templates[&dots::template_key(alt)].key)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(1) as f32;
+                    dirty_log2f(*total as f32 / n) + DOT_TEMPLATE_BITS / n
+                }
+                None => DOT_FIRST_PASS_TEMPLATE_BITS,
+            };
+            dot_start + template
+        } else {
+            margin * candidate.bits_factor * prices.spline_bits(alt)
+        }
+    };
     let prepared = ctx
         .thread_pool
         .steal_map(scratch, candidates.len(), |i, _| {
             candidates[i]
                 .alts
                 .iter()
-                .map(|alt| RenderPlan::new(model.ctx, alt, QUANT_ADJUST, w, h).tiled())
+                .map(|alt| {
+                    if candidates[i].dot {
+                        RenderPlan::dot(
+                            ctx,
+                            alt,
+                            dot_templates[&dots::template_key(alt)].clone(),
+                            w,
+                            h,
+                        )
+                        .tiled()
+                    } else {
+                        RenderPlan::new(model.ctx, alt, QUANT_ADJUST, w, h).tiled()
+                    }
+                })
                 .collect::<Vec<_>>()
         });
     struct Evaluation {
@@ -703,12 +1000,19 @@ pub(super) fn rd_select(
     let mut first_choices = Vec::with_capacity(candidates.len());
     let mut occupied = vec![false; block_cache.len()];
     let mut next = 0;
+    let mut second_pass_batches = Vec::new();
     while next < candidates.len() {
         let start = next;
         let mut batch_tiles = 0usize;
         // The first pass has fixed prices. Only candidates whose complete
         // alternative supports are disjoint may read the same residual.
-        while next < candidates.len() && next - start < ctx.thread_pool.num_threads().max(1) {
+        // Dots are tiny and plentiful: wide batches keep the pool busy.
+        let batch = if candidates[start].dot {
+            DOT_BATCH
+        } else {
+            ctx.thread_pool.num_threads().max(1)
+        };
+        while next < candidates.len() && next - start < batch {
             let plans = &prepared[next];
             let tiles: usize = plans.iter().map(|plan| plan.tiles.len()).sum();
             if next != start
@@ -727,6 +1031,7 @@ pub(super) fn rd_select(
             batch_tiles += tiles;
             next += 1;
         }
+        second_pass_batches.push(start..next);
         for plans in &prepared[start..next] {
             for plan in plans {
                 cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
@@ -744,11 +1049,7 @@ pub(super) fn rd_select(
                 let b = plans[index].bounds().unwrap();
                 let dj = evaluation.delta;
                 row[index] = Some((dj, b));
-                let j = dj
-                    + lambda
-                        * margin
-                        * candidate.bits_factor
-                        * prices.spline_bits(&candidate.alts[index]);
+                let j = dj + lambda * price(&prices, candidate, &candidate.alts[index]);
                 if best.is_none_or(|(bj, _, _)| j < bj) {
                     best = Some((j, index, b));
                 }
@@ -815,108 +1116,198 @@ pub(super) fn rd_select(
     block_cache.fill(None);
     let mut changed = vec![false; block_cache.len()];
     prices = CostModel::prior(0.1);
-    for sp in &first_pass {
+    {
+        let mut counts = HashMap::new();
+        let mut total = 0usize;
+        for sp in first_pass.iter().filter(|sp| dots::is_dot(sp)) {
+            *counts
+                .entry(dot_templates[&dots::template_key(sp)].key)
+                .or_insert(0usize) += 1;
+            total += 1;
+        }
+        if total > 0 {
+            *popularity.borrow_mut() = Some((counts, total));
+        }
+    }
+    for sp in first_pass.iter().filter(|sp| !dots::is_dot(sp)) {
         for (c, v) in spline_tokens(sp) {
             prices.add(c, v, 1.0);
         }
     }
     let mut kept = Vec::new();
+    let mut kept_raw: Vec<f32> = Vec::new();
+    let mut kept_candidates = Vec::new();
     let mut gain_bits = 0.0;
-    for (((candidate, plans), row), &first) in candidates
-        .iter()
-        .zip(&prepared)
-        .zip(&deltas)
-        .zip(&first_choices)
-    {
-        let recompute: Vec<_> = row
-            .iter()
-            .map(|cached| {
-                cached.is_some_and(|(_, b)| {
-                    (b.1 / 8..=b.3 / 8).any(|by| {
-                        changed[by * blocks_w..][b.0 / 8..=b.2 / 8]
-                            .iter()
-                            .any(|&v| v)
+    // Prices are fixed during repricing, and the first pass already proved
+    // these complete alternative supports disjoint. Recompute them together
+    // against one snapshot while keeping commits in the original greedy order.
+    for batch in second_pass_batches {
+        let parallel_batch = batch.len() > 1;
+        let recomputations: Vec<Vec<bool>> = batch
+            .clone()
+            .map(|i| {
+                deltas[i]
+                    .iter()
+                    .map(|cached| {
+                        cached.is_some_and(|(_, b)| {
+                            (b.1 / 8..=b.3 / 8).any(|by| {
+                                changed[by * blocks_w..][b.0 / 8..=b.2 / 8]
+                                    .iter()
+                                    .any(|&v| v)
+                            })
+                        })
                     })
-                })
+                    .collect()
             })
             .collect();
-        for (plan, &needed) in plans.iter().zip(&recompute) {
-            if needed {
-                cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
-            }
-        }
-        let mut evaluations = if recompute.iter().any(|&needed| needed) {
-            ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
-                recompute[i]
-                    .then(|| evaluate(&plans[i], &current, &block_cache))
-                    .flatten()
-            })
-        } else {
-            std::iter::repeat_with(|| None).take(plans.len()).collect()
-        };
-        let mut best: Option<(f32, usize, PixelBox)> = None;
-        for (index, (alt, cached)) in candidate.alts.iter().zip(row).enumerate() {
-            let Some((mut dj, b)) = *cached else { continue };
-            if recompute[index] {
-                let Some(evaluation) = &evaluations[index] else {
-                    continue;
-                };
-                dj = evaluation.delta;
-            }
-            let j = dj + lambda * margin * candidate.bits_factor * prices.spline_bits(alt);
-            if best.is_none_or(|(bj, _, _)| j < bj) {
-                best = Some((j, index, b));
-            }
-        }
-        let accepted = best.filter(|&(j, _, _)| j < 0.0);
-        let choice = accepted.map(|(_, index, _)| index);
-        if first != choice {
-            for index in first.into_iter().chain(choice) {
-                let (_, b) = row[index].unwrap();
-                for by in b.1 / 8..=b.3 / 8 {
-                    changed[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(true);
+        for (i, recompute) in batch.clone().zip(&recomputations) {
+            for (plan, &needed) in prepared[i].iter().zip(recompute) {
+                if needed {
+                    cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
                 }
             }
         }
-        if let Some((j, index, b)) = accepted {
-            let trial = if let Some(evaluation) = evaluations[index].take() {
-                evaluation.trial
+        let mut batched_evaluations = if parallel_batch {
+            let jobs: Vec<_> = batch
+                .clone()
+                .zip(&recomputations)
+                .flat_map(|(i, needed)| {
+                    needed
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(alt, &needed)| needed.then_some((i, alt)))
+                })
+                .collect();
+            ctx.thread_pool.steal_map(scratch, jobs.len(), |job, _| {
+                let (i, alt) = jobs[job];
+                evaluate(&prepared[i][alt], &current, &block_cache)
+            })
+        } else {
+            Vec::new()
+        }
+        .into_iter();
+        for (i, recompute) in batch.zip(recomputations) {
+            let candidate = &candidates[i];
+            let plans = &prepared[i];
+            let row = &deltas[i];
+            let first = first_choices[i];
+            let mut evaluations = if parallel_batch {
+                recompute
+                    .iter()
+                    .map(|&needed| {
+                        if needed {
+                            batched_evaluations.next().unwrap()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else if candidate.dot {
+                // A dot's few one-sample trials cost less than a pool dispatch.
+                (0..plans.len())
+                    .map(|i| {
+                        recompute[i]
+                            .then(|| evaluate(&plans[i], &current, &block_cache))
+                            .flatten()
+                    })
+                    .collect()
+            } else if recompute.iter().any(|&needed| needed) {
+                ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
+                    recompute[i]
+                        .then(|| evaluate(&plans[i], &current, &block_cache))
+                        .flatten()
+                })
             } else {
-                let mut trial = Trial::new(&current, &[&plans[index]]);
-                trial.draw(&plans[index], -1.0);
-                trial
+                std::iter::repeat_with(|| None).take(plans.len()).collect()
             };
-            trial.commit(&mut current);
-            invalidate(&mut block_cache, b);
-            gain_bits -= j / lambda;
-            kept.push(candidate.alts[index].clone());
+            let mut best: Option<(f32, usize, PixelBox)> = None;
+            for (index, (alt, cached)) in candidate.alts.iter().zip(row).enumerate() {
+                let Some((mut dj, b)) = *cached else { continue };
+                if recompute[index] {
+                    let Some(evaluation) = &evaluations[index] else {
+                        continue;
+                    };
+                    dj = evaluation.delta;
+                }
+                let j = dj + lambda * price(&prices, candidate, alt);
+                if best.is_none_or(|(bj, _, _)| j < bj) {
+                    best = Some((j, index, b));
+                }
+            }
+            let accepted = best.filter(|&(j, _, _)| j < 0.0);
+            let choice = accepted.map(|(_, index, _)| index);
+            if first != choice {
+                for index in first.into_iter().chain(choice) {
+                    let (_, b) = row[index].unwrap();
+                    for by in b.1 / 8..=b.3 / 8 {
+                        changed[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(true);
+                    }
+                }
+            }
+            if let Some((j, index, b)) = accepted {
+                let trial = if let Some(evaluation) = evaluations[index].take() {
+                    evaluation.trial
+                } else {
+                    let mut trial = Trial::new(&current, &[&plans[index]]);
+                    trial.draw(&plans[index], -1.0);
+                    trial
+                };
+                trial.commit(&mut current);
+                invalidate(&mut block_cache, b);
+                gain_bits -= j / lambda;
+                kept_raw.push(-j / lambda + price(&prices, candidate, &candidate.alts[index]));
+                kept_candidates.push(i);
+                kept.push(candidate.alts[index].clone());
+            }
         }
     }
+    let dot_encoding = if kept.iter().any(dots::is_dot) {
+        let (gain, encoding) = prune_dot_templates(
+            &model,
+            scratch,
+            xyb,
+            &mut current,
+            quant_field,
+            &mut kept,
+            &mut kept_raw,
+            candidates,
+            &kept_candidates,
+            forbidden,
+            &dot_templates,
+        );
+        gain_bits = gain;
+        encoding
+    } else {
+        None
+    };
     if kept.is_empty() || gain_bits < MIN_TOTAL_GAIN_BITS {
         return None;
     }
     drop(prepared);
-    prune_selected(
-        &model,
-        scratch,
-        &mut current,
-        quant_field,
-        &mut kept,
-        &prices,
-        forbidden,
-    );
-    refine_selected_widths(
-        &model,
-        &mut current,
-        quant_field,
-        &mut kept,
-        &prices,
-        forbidden,
-    );
+    if dot_encoding.is_none() {
+        prune_selected(
+            &model,
+            scratch,
+            &mut current,
+            quant_field,
+            &mut kept,
+            &prices,
+            forbidden,
+        );
+        refine_selected_widths(
+            &model,
+            &mut current,
+            quant_field,
+            &mut kept,
+            &prices,
+            forbidden,
+        );
+    }
     *xyb = current;
     Some(SplineSet {
         adjust: QUANT_ADJUST,
         splines: kept,
+        dot_encoding,
     })
 }
 
@@ -924,6 +1315,123 @@ pub(super) fn rd_select(
 mod tests {
     use super::*;
     use crate::{Speed, xyb::XybMatrix};
+
+    #[test]
+    fn dot_template_reuse_preserves_shape_protected_blocks_and_reconstruction() {
+        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 2.0, 1);
+        let model = BlockModel::new(&ctx, 2.0);
+        let (w, h) = (192usize, 128usize);
+        let mut selected = Vec::new();
+        for i in 0..20 {
+            let mut sp = QuantizedSpline {
+                points: vec![Point::new(16 + 32 * (i % 5), 16 + 24 * (i / 5))],
+                dct: [[0; 32]; 4],
+            };
+            sp.dct[3][0] = 4;
+            sp.dct[1][0] = 16;
+            selected.push(sp);
+        }
+        for (sigma, level) in [(4, 16), (5, 16), (4, 17)] {
+            let mut selected = selected.clone();
+            let mut rare = selected[0].clone();
+            rare.points[0] = Point::new(176, 112);
+            rare.dct[0][0] = 1;
+            rare.dct[3][0] = sigma;
+            rare.dct[1][0] = level;
+            let mut shared = selected[0].clone();
+            shared.points[0] = rare.points[0];
+            let mut unused = rare.clone();
+            unused.dct[0][0] = 2;
+            selected.push(rare.clone());
+            let candidates: Vec<_> = selected
+                .iter()
+                .enumerate()
+                .map(|(i, sp)| Candidate {
+                    alts: if i == 20 {
+                        vec![unused.clone(), shared.clone(), rare.clone()]
+                    } else {
+                        vec![sp.clone()]
+                    },
+                    dot: true,
+                    bits_factor: 1.0,
+                })
+                .collect();
+            let keys: BTreeSet<_> = candidates
+                .iter()
+                .flat_map(|c| c.alts.iter().map(dots::template_key))
+                .collect();
+            let templates = dots::share_templates(
+                keys.into_iter()
+                    .map(|key| (key, dots::DotTemplate::new(key))),
+            );
+            let mut original = Image3F::new(w, h);
+            for sp in &selected {
+                RenderPlan::dot(&ctx, sp, templates[&dots::template_key(sp)].clone(), w, h)
+                    .draw(&mut original, 1.0);
+            }
+            let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
+            let mask = vec![true; quant.len()];
+            for forbidden in [None, Some(mask.as_slice())] {
+                let mut residual = original.clone();
+                for sp in &selected {
+                    RenderPlan::dot(&ctx, sp, templates[&dots::template_key(sp)].clone(), w, h)
+                        .draw(&mut residual, -1.0);
+                }
+                let mut kept = selected.clone();
+                let mut raw = vec![500.0; kept.len()];
+                raw[20] = 150.0;
+                let (_, encoding) = prune_dot_templates(
+                    &model,
+                    &mut CoderScratch::default(),
+                    &original,
+                    &mut residual,
+                    &quant,
+                    &mut kept,
+                    &mut raw,
+                    &candidates,
+                    &(0..selected.len()).collect::<Vec<_>>(),
+                    forbidden,
+                    &templates,
+                );
+                assert_eq!(encoding.unwrap().references.len(), 1);
+                if forbidden.is_none() && sigma == 4 && level == 16 {
+                    assert_eq!(kept.len(), selected.len());
+                    assert_eq!(
+                        dots::template_key(kept.last().unwrap()),
+                        dots::template_key(&shared)
+                    );
+                } else {
+                    assert_eq!(kept.len(), selected.len() - 1);
+                    for c in 0..3 {
+                        assert_eq!(
+                            residual.plane_row(c, 112)[176],
+                            original.plane_row(c, 112)[176]
+                        );
+                    }
+                }
+                // The committed residual must match the chosen decoder templates.
+                for sp in &kept {
+                    RenderPlan::quantized_dot(
+                        &ctx,
+                        sp,
+                        templates[&dots::template_key(sp)].clone(),
+                        w,
+                        h,
+                    )
+                    .draw(&mut residual, 1.0);
+                }
+                for c in 0..3 {
+                    assert!(
+                        original
+                            .plane_data(c)
+                            .iter()
+                            .zip(residual.plane_data(c))
+                            .all(|(a, b)| (a - b).abs() < 1e-6)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn width_refinement_recovers_taper_and_preserves_reconstruction() {
@@ -1071,6 +1579,7 @@ mod tests {
             candidates.push(Candidate {
                 alts: vec![displaced, sp, wider],
                 bits_factor: 0.01,
+                dot: false,
             });
         }
         // Duplicate candidates share every affected block: evaluating candidates
@@ -1078,6 +1587,7 @@ mod tests {
         candidates.push(Candidate {
             alts: candidates[0].alts.clone(),
             bits_factor: 0.01,
+            dot: false,
         });
         let quant = vec![8.0; w.div_ceil(8) * h.div_ceil(8)];
         let mut results = Vec::new();
@@ -1093,6 +1603,7 @@ mod tests {
                             .flat_map(|alt| [alt.clone(), alt.clone()])
                             .collect(),
                         bits_factor: candidate.bits_factor,
+                        dot: false,
                     })
                     .collect::<Vec<_>>();
                 &repeated
@@ -1322,6 +1833,7 @@ mod tests {
             candidates.push(Candidate {
                 alts: vec![sp],
                 bits_factor: 0.01,
+                dot: false,
             });
         }
         let sp = candidates.last().unwrap().alts[0].clone();
@@ -1348,6 +1860,7 @@ mod tests {
         candidates.push(Candidate {
             alts: vec![sp.clone()],
             bits_factor: factor,
+            dot: false,
         });
         let selected = rd_select(
             &ctx,
@@ -1627,6 +2140,7 @@ mod tests {
         Some(SplineSet {
             adjust: QUANT_ADJUST,
             splines: kept,
+            dot_encoding: None,
         })
     }
 
@@ -1653,6 +2167,7 @@ mod tests {
             let candidate = Candidate {
                 alts: vec![shifted, sp, wider],
                 bits_factor: 0.01,
+                dot: false,
             };
             let cells: std::collections::BTreeSet<_> = candidate
                 .alts
@@ -1672,6 +2187,7 @@ mod tests {
         candidates.push(Candidate {
             alts: candidates[0].alts.clone(),
             bits_factor: 0.01,
+            dot: false,
         });
         let blocks_w = w.div_ceil(8);
         let quant = vec![8.0; blocks_w * h.div_ceil(8)];

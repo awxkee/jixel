@@ -821,6 +821,9 @@ pub(crate) const PATCH_REF_ID: u32 = 3;
 /// Reference slot for the modular atlas; the VarDCT atlas keeps slot 3, so a
 /// hybrid plan can emit both and route each dictionary entry to either.
 pub(crate) const MODULAR_PATCH_REF_ID: u32 = 2;
+/// Reference slot for the star-dot template atlas.
+#[cfg(feature = "splines")]
+pub(crate) const DOT_PATCH_REF_ID: u32 = 1;
 pub(crate) const NUM_PATCH_CONTEXTS: usize = 10;
 
 #[derive(Clone)]
@@ -854,6 +857,7 @@ pub(crate) enum ModularFrameKind<'a> {
     XybReferenceOnly {
         width: usize,
         height: usize,
+        slot: u32,
     },
     Patched(&'a [PatchReference]),
 }
