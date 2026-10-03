@@ -70,6 +70,13 @@ fn use_dct8_only(distance: f32) -> bool {
     distance <= DCT8_ONLY_MAX_DISTANCE
 }
 
+/// The DCT8-only fit assumes the ordinary fine-quality tables. Point content
+/// retains the flat B row, where the full search also pays at the finest end.
+#[inline]
+fn use_dct8_only_for_content(ctx: &EncodingContext, distance: f32) -> bool {
+    use_dct8_only(distance) && !ctx.point_chroma()
+}
+
 /// Distances bounding the high-quality band: a [`Banded`] knob holds its
 /// high-quality value at or below `MERGE_BAND_D0`, its base value from
 /// `MERGE_BAND_D1` up, and interpolates in between.

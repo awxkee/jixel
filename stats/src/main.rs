@@ -59,7 +59,7 @@ const CVVDP_VENV_BIN: &str = concat!(
     "/../parameters_fit/.venv/bin/cvvdp"
 );
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
-const CVVDP_DISPLAY: &str = "standard_fhd";
+const CVVDP_DISPLAY: &str = "standard_4k";
 
 // --- AV1 reference: SYSTEM libavif (aom) for both encode and decode (on PATH). ---
 const SYS_AVIFENC: &str = "avifenc";
@@ -1000,7 +1000,7 @@ fn bench_jixel(
         .with_num_threads(nthreads)
         .with_speed(Speed::Slow)
         .with_splines(true)
-        .with_dots(false);
+        .with_dots(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));

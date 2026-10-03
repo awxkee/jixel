@@ -478,7 +478,7 @@ impl SplineCandidates {
     }
 }
 
-/// Detects curvilinear structures (splines) and star-like points (dots) in
+/// Detects curvilinear structures (splines) and isolated bright/dark dots in
 /// `xyb` and fits candidates to them.
 pub(crate) fn find_candidates(
     ctx: &EncodingContext,

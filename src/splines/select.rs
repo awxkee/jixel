@@ -133,7 +133,9 @@ pub(super) struct BlockModel<'a> {
 
 impl<'a> BlockModel<'a> {
     pub(super) fn new(ctx: &'a EncodingContext, distance: f32) -> Self {
-        let matrices = crate::quant_weights::DequantMatrices::new(distance);
+        let matrices = ctx
+            .point_chroma_hq_matrices()
+            .unwrap_or_else(|| crate::quant_weights::DequantMatrices::new(distance));
         BlockModel {
             ctx,
             inv: [
@@ -359,6 +361,41 @@ fn cache_blocks(
     }
 }
 
+/// `cache_blocks` over many plans, computing the missing block costs on the
+/// pool. Each cost depends on its own block only, so the cache matches.
+fn cache_blocks_parallel<'p>(
+    model: &BlockModel,
+    scratch: &mut CoderScratch,
+    current: &Image3F,
+    quant_field: &[f32],
+    cache: &mut [Option<(f32, f32)>],
+    plans: impl Iterator<Item = &'p TiledSpline>,
+) {
+    const CHUNK: usize = 16;
+    let blocks_w = current.xsize().div_ceil(8);
+    let cost =
+        |cell: usize| model.cost(current, cell % blocks_w, cell / blocks_w, quant_field[cell]);
+    let mut cells: Vec<usize> = plans
+        .flat_map(|plan| plan.tiles.iter().map(|tile| tile.cell))
+        .filter(|&cell| cache[cell].is_none())
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let costs =
+        model
+            .ctx
+            .thread_pool
+            .steal_map(scratch, cells.len().div_ceil(CHUNK), |chunk, _| {
+                cells[chunk * CHUNK..((chunk + 1) * CHUNK).min(cells.len())]
+                    .iter()
+                    .map(|&cell| cost(cell))
+                    .collect::<Vec<_>>()
+            });
+    for (&cell, cost) in cells.iter().zip(costs.into_iter().flatten()) {
+        cache[cell] = Some(cost);
+    }
+}
+
 #[cfg(test)]
 fn block_touched(a: &Image3F, b: &Image3F, bx: usize, by: usize) -> bool {
     let (w, h) = (a.xsize(), a.ysize());
@@ -567,6 +604,15 @@ fn prune_selected(
     }
 }
 
+fn dictionary_bits_of(
+    scratch: &mut CoderScratch,
+    references: &[crate::patches::PatchReference],
+) -> f32 {
+    let mut dictionary = BitWriter::new();
+    crate::lossless::write_patch_dictionary(references, false, scratch, &mut dictionary);
+    dictionary.bits_written() as f32
+}
+
 fn encode_dot_plan(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -584,9 +630,7 @@ fn encode_dot_plan(
         crate::patches::DOT_PATCH_REF_ID,
         &mut atlas,
     );
-    let mut dictionary = BitWriter::new();
-    crate::lossless::write_patch_dictionary(&plan.references(), false, scratch, &mut dictionary);
-    (atlas, dictionary.bits_written() as f32)
+    (atlas, dictionary_bits_of(scratch, &plan.references()))
 }
 
 /// Charges the selected dots their real atlas and dictionary bits, shared per
@@ -612,8 +656,9 @@ fn prune_dot_templates(
     let ctx = model.ctx;
     let (w, h) = (current.xsize(), current.ysize());
     let mut alive = vec![true; kept.len()];
-    // A final measurement after the last removal also supplies the exact
-    // encoded atlas used by output, rather than encoding it again.
+    // Removal rounds price each template at the second pass's estimate; a
+    // Slow atlas encode costs tens of milliseconds. The final set is encoded
+    // for real, judged on those bits and carried to output.
     for round in 0..=8 {
         let idx: Vec<usize> = (0..kept.len())
             .filter(|&i| alive[i] && dots::is_dot(&kept[i]))
@@ -624,8 +669,8 @@ fn prune_dot_templates(
         }
         let set: Vec<QuantizedSpline> = idx.iter().map(|&i| kept[i].clone()).collect();
         let mut plan = dots::build_dot_patches_with_templates(&set, templates, false);
-        let (mut atlas, mut dictionary_bits) = encode_dot_plan(ctx, scratch, &plan);
-        let mut atlas_bits = atlas.bits_written() as f32;
+        let mut dictionary_bits = dictionary_bits_of(scratch, &plan.references());
+        let mut atlas_bits = DOT_TEMPLATE_BITS * plan.references().len() as f32;
         let mut by_key: HashMap<dots::TemplateKey, (f32, usize)> = HashMap::new();
         for &i in &idx {
             let e = by_key
@@ -652,6 +697,10 @@ fn prune_dot_templates(
             &losing
         };
         if dropped.is_empty() || round == 8 {
+            let (padded_atlas, padded_dictionary_bits) = encode_dot_plan(ctx, scratch, &plan);
+            let mut atlas = padded_atlas;
+            atlas_bits = atlas.bits_written() as f32;
+            dictionary_bits = padded_dictionary_bits;
             // Zero padding can help Modular prediction, so race the trimmed
             // layout only once for the final set instead of assuming it wins.
             let trimmed = dots::build_dot_patches_with_templates(&set, templates, true);
@@ -669,14 +718,7 @@ fn prune_dot_templates(
             let mut best_references = plan.references();
             for band in [None, Some(16), Some(32), Some(64)] {
                 plan.sort_positions(band);
-                let mut dictionary = BitWriter::new();
-                crate::lossless::write_patch_dictionary(
-                    &plan.references(),
-                    false,
-                    scratch,
-                    &mut dictionary,
-                );
-                let bits = dictionary.bits_written() as f32;
+                let bits = dictionary_bits_of(scratch, &plan.references());
                 if bits < dictionary_bits {
                     dictionary_bits = bits;
                     best_references = plan.references();
@@ -899,6 +941,19 @@ pub(super) fn pretest(
     dj + crate::ac_strategy::RD_LAMBDA * PRETEST_BITS_SHARE * margin(model.distance) * bits < 0.0
 }
 
+// Residual distortion and rate are nonnegative in the DCT8 proxy. Even
+// removing every modeled coefficient in the affected blocks cannot save more
+// than their current objective. Cached block costs make this bound cheap.
+fn dot_saving_bound(plan: &TiledSpline, cache: &[Option<(f32, f32)>]) -> Option<f32> {
+    let mut saving = 0.0;
+    for tile in &plan.tiles {
+        let (distortion, rate) = cache.get(tile.cell).copied().flatten()?;
+        saving += distortion + crate::ac_strategy::RD_LAMBDA * rate;
+    }
+    // Slack for accumulation and subtractive rounding in Trial::delta.
+    Some(saving + 0.001 * (1.0 + saving))
+}
+
 /// Subtracts the accepted splines from `xyb` and returns them.
 pub(super) fn rd_select(
     ctx: &EncodingContext,
@@ -914,8 +969,15 @@ pub(super) fn rd_select(
     let model = BlockModel::new(ctx, distance);
     let (w, h) = (xyb.xsize(), xyb.ysize());
     let blocks_w = w.div_ceil(8);
-    let n_dots = candidates.iter().filter(|c| c.dot).count().max(1) as f32;
-    let dot_start = dirty_log2f((w * h) as f32 / n_dots).clamp(4.0, 16.0) + DOT_POSITION_BITS;
+    let mut n_dots = [0usize; 2];
+    for candidate in candidates.iter().filter(|c| c.dot) {
+        n_dots[usize::from(candidate.alts[0].dct[3][0] < 0)] += 1;
+    }
+    // Price each polarity's positions independently. Extra dark proposals
+    // must not make existing bright dots look cheaper in the first pass.
+    let dot_start = n_dots.map(|n| {
+        dirty_log2f((w * h) as f32 / n.max(1) as f32).clamp(4.0, 16.0) + DOT_POSITION_BITS
+    });
     let keys: Vec<_> = candidates
         .iter()
         .filter(|c| c.dot)
@@ -930,8 +992,8 @@ pub(super) fn rd_select(
     )));
     // Second pass: a dot also pays for its template, by that template's share
     // of the first-pass dots.
-    let popularity: RefCell<Option<(HashMap<dots::TemplateKey, usize>, usize)>> =
-        RefCell::new(None);
+    type Popularity = (HashMap<dots::TemplateKey, usize>, [usize; 2]);
+    let popularity: RefCell<Option<Popularity>> = RefCell::new(None);
     let price = |prices: &CostModel, candidate: &Candidate, alt: &QuantizedSpline| {
         if dots::is_dot(alt) {
             let template = match popularity.borrow().as_ref() {
@@ -941,11 +1003,12 @@ pub(super) fn rd_select(
                         .copied()
                         .unwrap_or(0)
                         .max(1) as f32;
-                    dirty_log2f(*total as f32 / n) + DOT_TEMPLATE_BITS / n
+                    dirty_log2f(total[usize::from(alt.dct[3][0] < 0)].max(1) as f32 / n)
+                        + DOT_TEMPLATE_BITS / n
                 }
                 None => DOT_FIRST_PASS_TEMPLATE_BITS,
             };
-            dot_start + template
+            dot_start[usize::from(alt.dct[3][0] < 0)] + template
         } else {
             margin * candidate.bits_factor * prices.spline_bits(alt)
         }
@@ -976,8 +1039,27 @@ pub(super) fn rd_select(
         delta: f32,
         trial: Trial,
     }
-    let evaluate = |plan: &TiledSpline, current: &Image3F, cache: &[Option<(f32, f32)>]| {
+    let dot_floor = |i: usize| {
+        candidates[i]
+            .dot
+            .then(|| dot_start[usize::from(candidates[i].alts[0].dct[3][0] < 0)])
+    };
+    let evaluate = |plan: &TiledSpline,
+                    current: &Image3F,
+                    cache: &[Option<(f32, f32)>],
+                    floor: Option<f32>| {
         plan.bounds()?;
+        if let Some(bits) = floor
+            && let Some(saving) = dot_saving_bound(plan, cache)
+            && saving < lambda * bits
+        {
+            // Retain a rejecting lower bound, rather than None: a changed
+            // residual must still trigger a second-pass trial.
+            return Some(Evaluation {
+                delta: -saving,
+                trial: Trial { blocks: Vec::new() },
+            });
+        }
         let mut trial = Trial::new(current, &[plan]);
         trial.draw(plan, -1.0);
         let delta = trial.delta(&model, current, quant_field, cache, forbidden)?;
@@ -1032,11 +1114,14 @@ pub(super) fn rd_select(
             next += 1;
         }
         second_pass_batches.push(start..next);
-        for plans in &prepared[start..next] {
-            for plan in plans {
-                cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
-            }
-        }
+        cache_blocks_parallel(
+            &model,
+            scratch,
+            &current,
+            quant_field,
+            &mut block_cache,
+            prepared[start..next].iter().flatten(),
+        );
         let assess = |candidate: &Candidate,
                       plans: &[TiledSpline],
                       mut evaluations: Vec<Option<Evaluation>>| {
@@ -1063,7 +1148,7 @@ pub(super) fn rd_select(
         let results = if next - start == 1 {
             let plans = &prepared[start];
             let evaluations = ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
-                evaluate(&plans[i], &current, &block_cache)
+                evaluate(&plans[i], &current, &block_cache, dot_floor(start))
             });
             vec![assess(&candidates[start], plans, evaluations)]
         } else {
@@ -1074,7 +1159,12 @@ pub(super) fn rd_select(
                 .thread_pool
                 .steal_map(scratch, jobs.len(), |i, _| {
                     let (candidate, alt) = jobs[i];
-                    evaluate(&prepared[candidate][alt], &current, &block_cache)
+                    evaluate(
+                        &prepared[candidate][alt],
+                        &current,
+                        &block_cache,
+                        dot_floor(candidate),
+                    )
                 })
                 .into_iter();
             (start..next)
@@ -1118,14 +1208,14 @@ pub(super) fn rd_select(
     prices = CostModel::prior(0.1);
     {
         let mut counts = HashMap::new();
-        let mut total = 0usize;
+        let mut total = [0usize; 2];
         for sp in first_pass.iter().filter(|sp| dots::is_dot(sp)) {
             *counts
                 .entry(dot_templates[&dots::template_key(sp)].key)
                 .or_insert(0usize) += 1;
-            total += 1;
+            total[usize::from(sp.dct[3][0] < 0)] += 1;
         }
-        if total > 0 {
+        if total.iter().any(|&n| n > 0) {
             *popularity.borrow_mut() = Some((counts, total));
         }
     }
@@ -1160,13 +1250,22 @@ pub(super) fn rd_select(
                     .collect()
             })
             .collect();
-        for (i, recompute) in batch.clone().zip(&recomputations) {
-            for (plan, &needed) in prepared[i].iter().zip(recompute) {
-                if needed {
-                    cache_blocks(&model, &current, quant_field, &mut block_cache, plan);
-                }
-            }
-        }
+        cache_blocks_parallel(
+            &model,
+            scratch,
+            &current,
+            quant_field,
+            &mut block_cache,
+            batch
+                .clone()
+                .zip(&recomputations)
+                .flat_map(|(i, recompute)| {
+                    prepared[i]
+                        .iter()
+                        .zip(recompute)
+                        .filter_map(|(plan, &needed)| needed.then_some(plan))
+                }),
+        );
         let mut batched_evaluations = if parallel_batch {
             let jobs: Vec<_> = batch
                 .clone()
@@ -1180,7 +1279,7 @@ pub(super) fn rd_select(
                 .collect();
             ctx.thread_pool.steal_map(scratch, jobs.len(), |job, _| {
                 let (i, alt) = jobs[job];
-                evaluate(&prepared[i][alt], &current, &block_cache)
+                evaluate(&prepared[i][alt], &current, &block_cache, dot_floor(i))
             })
         } else {
             Vec::new()
@@ -1188,6 +1287,7 @@ pub(super) fn rd_select(
         .into_iter();
         for (i, recompute) in batch.zip(recomputations) {
             let candidate = &candidates[i];
+            let floor = dot_floor(i);
             let plans = &prepared[i];
             let row = &deltas[i];
             let first = first_choices[i];
@@ -1207,14 +1307,14 @@ pub(super) fn rd_select(
                 (0..plans.len())
                     .map(|i| {
                         recompute[i]
-                            .then(|| evaluate(&plans[i], &current, &block_cache))
+                            .then(|| evaluate(&plans[i], &current, &block_cache, floor))
                             .flatten()
                     })
                     .collect()
             } else if recompute.iter().any(|&needed| needed) {
                 ctx.thread_pool.steal_map(scratch, plans.len(), |i, _| {
                     recompute[i]
-                        .then(|| evaluate(&plans[i], &current, &block_cache))
+                        .then(|| evaluate(&plans[i], &current, &block_cache, floor))
                         .flatten()
                 })
             } else {
@@ -1905,6 +2005,34 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn dot_bound_covers_measured_savings_and_requires_current_costs() {
+        for distance in [1.0, 4.0] {
+            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, distance, 1);
+            let model = BlockModel::new(&ctx, distance);
+            for width in [-11, -7, 4, 11] {
+                let mut sp = QuantizedSpline {
+                    points: vec![Point::new(23, 19)],
+                    dct: [[0; 32]; 4],
+                };
+                sp.dct[3][0] = width;
+                sp.dct[1][0] = 12;
+                let plan = RenderPlan::new(&ctx, &sp, QUANT_ADJUST, 48, 40).tiled();
+                let mut image = Image3F::new(48, 40);
+                RenderPlan::new(&ctx, &sp, QUANT_ADJUST, 48, 40).draw(&mut image, 1.0);
+                let quant = vec![3.0; 6 * 5];
+                let mut cache = vec![None; quant.len()];
+                assert!(dot_saving_bound(&plan, &cache).is_none());
+                cache_blocks(&model, &image, &quant, &mut cache, &plan);
+                let saving = dot_saving_bound(&plan, &cache).unwrap();
+                let mut trial = Trial::new(&image, &[&plan]);
+                trial.draw(&plan, -1.0);
+                let delta = trial.delta(&model, &image, &quant, &cache, None).unwrap();
+                assert!(-delta <= saving, "distance={distance}, width={width}");
+            }
+        }
     }
 
     #[test]
