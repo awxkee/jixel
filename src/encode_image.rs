@@ -510,7 +510,7 @@ impl EncodeConfigImpl {
         self
     }
 
-    /// Attach an ICC profile. **Panics at encode time** — see field docs.
+    /// Embed an ICC profile in the codestream (predicted + entropy-coded ICC stream).
     pub(crate) fn with_icc_profile(mut self, icc: Option<Vec<u8>>) -> Self {
         self.icc_profile = icc;
         self
@@ -694,7 +694,7 @@ impl EncodeConfig {
         }
     }
 
-    /// Attach an ICC profile. **Panics at encode time** — see field docs.
+    /// Embed an ICC profile in the codestream (predicted + entropy-coded ICC stream).
     pub fn with_icc_profile(mut self, icc: Vec<u8>) -> Self {
         self.icc_profile = Some(icc);
         self
