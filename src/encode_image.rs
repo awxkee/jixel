@@ -89,9 +89,8 @@ pub(crate) enum AlphaPlane {
 /// a raw JXL codestream (vs an ISOBMFF-wrapped one).
 const CODESTREAM_MARKER: u8 = 0x0A;
 
-/// Distances below this give larger files than lossless on photographic
-/// content; we clamp up to this value.
-const MIN_DISTANCE: f32 = 0.03;
+/// Practical lower bound for lossy encoding; lossless bypasses this clamp.
+const MIN_DISTANCE: f32 = 0.05;
 
 /// JXL's image dimension field encodes (size - 1) in either 9, 13, 18, or
 /// 30 bits, so 2^30 is the largest representable dimension.
@@ -264,6 +263,8 @@ impl DecodingSpeed {
 
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
+    /// Positive, finite lossy distance, clamped to a minimum of 0.05.
+    /// Ignored when `lossless` is true.
     pub distance: f32,
     pub color_encoding: ColorEncoding,
     pub icc_profile: Option<Vec<u8>>,
@@ -306,10 +307,10 @@ pub struct EncodeConfig {
     /// Requires the `splines` Cargo feature. Defaults to false.
     #[cfg(feature = "splines")]
     pub splines: bool,
-    /// Experimental: detect star-like point sources and code them as Gaussian
-    /// dots drawn from a small template atlas (additive patches), next to the
-    /// lossy VarDCT image. Dots, templates and the whole set pass
-    /// rate-distortion tests; images without point sources encode unchanged.
+    /// Experimental: detect isolated bright or dark spots and code them as
+    /// signed Gaussian dots drawn from a small template atlas (additive
+    /// patches), next to the lossy VarDCT image. Dots, templates and the whole
+    /// set pass rate-distortion tests; unprofitable sets fall back to VarDCT.
     /// Slow speed and the default decoding speed only; costs encode time.
     /// Requires the `splines` Cargo feature. Defaults to false.
     #[cfg(feature = "splines")]
@@ -743,7 +744,7 @@ impl EncodeConfig {
         self
     }
 
-    /// Experimental star-dot coding for lossy VarDCT (see [`EncodeConfig::dots`]).
+    /// Experimental bright/dark dot coding for lossy VarDCT (see [`EncodeConfig::dots`]).
     /// Requires the `splines` Cargo feature.
     #[cfg(feature = "splines")]
     pub fn with_dots(mut self, dots: bool) -> Self {
@@ -2842,6 +2843,35 @@ mod encode_smoke_tests {
         ok(encode_image(&rgb8(), W, H, &lossy()));
     }
 
+    #[test]
+    fn public_lossy_paths_share_the_minimum_distance() {
+        for speed in [Speed::Fast, Speed::Slow] {
+            let at_floor = EncodeConfig::default()
+                .with_speed(speed)
+                .with_distance(0.05);
+            for distance in [0.001, 0.03, 0.049] {
+                let below = at_floor.clone().with_distance(distance);
+                macro_rules! same_output {
+                    ($encode:ident, $pixels:expr) => {
+                        assert_eq!(
+                            $encode(&$pixels, W, H, &below).unwrap(),
+                            $encode(&$pixels, W, H, &at_floor).unwrap(),
+                            "{}: speed={speed:?} d={distance}",
+                            stringify!($encode)
+                        );
+                    };
+                }
+                same_output!(encode_image, rgb8());
+                same_output!(encode_image_with_alpha, rgba8());
+                same_output!(encode_image_16bit, rgb16());
+                same_output!(encode_image_gray, gray8());
+                same_output!(encode_image_gray_16bit, gray16());
+                same_output!(encode_image_f32, rgb_f32());
+                same_output!(encode_image_gray_f32, gray_f32());
+            }
+        }
+    }
+
     /// Thin anti-aliased dark curves on a smooth gradient: the content class
     /// splines exist for.
     #[cfg(feature = "splines")]
@@ -2990,6 +3020,27 @@ mod encode_smoke_tests {
         assert!(
             with.len() * 100 < plain.len() * 97,
             "dots should win on a star field: {} vs {}",
+            with.len(),
+            plain.len()
+        );
+        assert_eq!(
+            with,
+            encode_image(&pixels, S, S, &config.with_num_threads(4)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn dots_shrink_dark_spot_fields_and_are_thread_deterministic() {
+        const S: usize = 256;
+        let pixels: Vec<_> = star_field(S).into_iter().map(|v| 255 - v).collect();
+        let config = slow_lossy(2.0).with_patches(false).with_num_threads(1);
+        let plain = encode_image(&pixels, S, S, &config).unwrap();
+        let config = config.with_dots(true);
+        let with = encode_image(&pixels, S, S, &config).unwrap();
+        assert!(
+            with.len() < plain.len(),
+            "dark spots: {} vs {}",
             with.len(),
             plain.len()
         );

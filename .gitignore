@@ -4,10 +4,9 @@ app/target
 charts
 assets
 *.jxl
-parameters_fit/.venv
+/parameters_fit/
 meanstats_out
 docs
 Cargo.lock
 .DS_Store
 scratchpad
-parameters_fit/work

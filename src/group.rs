@@ -577,6 +577,18 @@ pub(crate) fn quantize_ac_thresholds(
     quantize_ac_thresholds_scaled(c, xsize, ysize, distance, 1.0)
 }
 
+const X_THRESHOLD_EXTRA: f32 = 0.08;
+const X_FIRST_THRESHOLD_WINDOW: f32 = 0.5;
+static X_DEADZONE_WINDOW: [f32; 4] = [0.5, 0.75, 1.5, 2.0];
+
+#[inline]
+fn x_deadzone_window(distance: f32) -> f32 {
+    let [a, b, c, d] = X_DEADZONE_WINDOW;
+    let up = ((distance - a) / (b - a)).clamp(0.0, 1.0);
+    let down = ((d - distance) / (d - c)).clamp(0.0, 1.0);
+    up.min(down)
+}
+
 /// Quantization zero thresholds for the effective per-channel precision.
 /// Frames which already spend bits on finer B precision preserve near-one
 /// high-frequency B levels instead of applying the ordinary 0.75 deadzone.
@@ -591,8 +603,10 @@ pub(crate) fn quantize_ac_thresholds_scaled(
 ) -> [f32; 4] {
     let mut normal = [0.58f32, 0.635, 0.66, 0.7];
     if c == 0 {
+        let w = x_deadzone_window(distance);
+        normal[0] += w * (X_FIRST_THRESHOLD_WINDOW - normal[0]);
         for t in &mut normal[1..] {
-            *t += 0.08;
+            *t += (1.0 - w) * X_THRESHOLD_EXTRA;
         }
     }
     if c == 2 {

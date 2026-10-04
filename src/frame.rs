@@ -115,6 +115,7 @@ struct DistanceParams {
     dc_step: [f32; 3],
 }
 
+const X_QM_REFINE_MAX_DISTANCE: f32 = 0.299;
 const DC_REFINE_PEAK: f32 = 1.35;
 const DC_COARSEN_D0: f32 = 1.25;
 const DC_COARSEN_D1: f32 = 3.0;
@@ -193,7 +194,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     if distance > 9.0 {
         x_qm_scale += 1;
     }
-    if distance < 0.299 {
+    if distance < X_QM_REFINE_MAX_DISTANCE {
         x_qm_scale += 1;
     }
     static EPF_THRESHOLDS: [f32; 2] = [0.7, 1.5];
@@ -1430,11 +1431,12 @@ fn encode_frame_vardct(
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
     let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
-    let saturation_stat = if slow_chromatic {
-        chroma_saturation_stat(&xyb)
+    let content = if slow_chromatic {
+        chroma_content_stats(&xyb)
     } else {
-        0.0
+        ChromaContentStats::default()
     };
+    let saturation_stat = content.saturation;
     let [x_grad_stat, b_grad_stat, chroma_texture_stat] = if slow_chromatic {
         chroma_gradient_stats(ctx, &xyb, saturation_stat)
     } else {
@@ -1470,6 +1472,7 @@ fn encode_frame_vardct(
         ctx.raise_b_qm_scale(X_HEAVY_B_QM_SCALE);
     }
 
+    apply_point_chroma_policy(ctx, distp, content, is_achromatic);
     #[cfg(feature = "splines")]
     let quant_field = if ctx.splines || ctx.dots {
         spline_quant_field(ctx, scratch, &xyb, distp)?
@@ -2400,22 +2403,121 @@ fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
     (x_steps, b_steps)
 }
 
-fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
-    let mut sum = 0.0;
-    let mut n = 0u64;
-    let mut y = 0;
-    while y < xyb.ysize() {
-        let x_size = xyb.xsize();
-        let xr = &xyb.plane_row(0, y)[..x_size];
-        let yr = &xyb.plane_row(1, y)[..x_size];
-        let br = &xyb.plane_row(2, y)[..x_size];
-        for ((&x, &y), &b) in xr.iter().zip(yr).zip(br).step_by(4) {
-            sum += x.abs() + (b - y).abs();
-            n += 1;
-        }
-        y += 4;
+/// Source-domain companion to the saturation detector. Sparse luminance
+/// impulses can dominate its gradient statistics while diffuse chroma remains
+/// visible between them. Crosses at one and four pixels estimate point prominence
+/// without running the dot fitter or quantizing proxy DCTs.
+#[derive(Default, Clone, Copy, Debug)]
+struct ChromaContentStats {
+    saturation: f32,
+    dark_fraction: f32,
+    point_fraction: f32,
+    point_energy: f32,
+    sharp_energy: f32,
+}
+
+impl ChromaContentStats {
+    fn diffuse_point_chroma(self) -> bool {
+        self.saturation >= 0.005
+            && self.dark_fraction >= 0.5
+            && (0.003..0.05).contains(&self.point_fraction)
+            && self.point_energy >= 0.35
+            && self.sharp_energy >= 0.12
     }
-    if n == 0 { 0.0 } else { sum / n as f32 }
+}
+
+/// Sparse luminance points with diffuse color need extra chroma precision.
+/// Keep that protection as distance decreases through the HQ table boundary.
+fn apply_point_chroma_policy(
+    ctx: &EncodingContext,
+    distp: &DistanceParams,
+    content: ChromaContentStats,
+    is_achromatic: bool,
+) {
+    // X-heavy content already has a separate chroma precision policy.
+    let point_chroma = ctx.speed == crate::Speed::Slow
+        && !is_achromatic
+        && content.diffuse_point_chroma()
+        && !ctx.x_heavy();
+    ctx.set_point_chroma(point_chroma);
+    if point_chroma && distp.distance < 2.25 {
+        let base_x = distp.x_qm_scale.max(ctx.x_qm_scale_floor());
+        // The default X scale already includes this step below the HQ cutoff.
+        let extra_x = u32::from(distp.distance >= X_QM_REFINE_MAX_DISTANCE);
+        ctx.raise_x_qm_scale_floor(base_x.saturating_add(extra_x));
+        ctx.raise_b_qm_scale(ctx.b_qm_scale().saturating_add(1));
+    }
+}
+
+fn chroma_content_stats(xyb: &Image3F) -> ChromaContentStats {
+    let (w, h) = (xyb.xsize(), xyb.ysize());
+    let (mut sum, mut n, mut dark, mut points, mut interior) = (0.0, 0u64, 0u64, 0u64, 0u64);
+    let (mut point_energy, mut contrast_energy) = (0.0f64, 0.0f64);
+    let (mut sharp_energy, mut sharp_contrast) = (0.0f64, 0.0f64);
+    for py in (0..h).step_by(4) {
+        let xr = xyb.plane_row(0, py);
+        let yr = xyb.plane_row(1, py);
+        let br = xyb.plane_row(2, py);
+        for px in (0..w).step_by(4) {
+            let y = yr[px];
+            sum += xr[px].abs() + (br[px] - y).abs();
+            n += 1;
+            dark += u64::from(y < 0.3);
+            if px < 4 || py < 4 || px + 4 >= w || py + 4 >= h {
+                continue;
+            }
+            let ring = [
+                yr[px - 4],
+                yr[px + 4],
+                xyb.plane_row(1, py - 4)[px],
+                xyb.plane_row(1, py + 4)[px],
+            ];
+            let sharp_ring = [
+                yr[px - 1],
+                yr[px + 1],
+                xyb.plane_row(1, py - 1)[px],
+                xyb.plane_row(1, py + 1)[px],
+            ];
+            let sharp_background = sharp_ring.iter().sum::<f32>() * 0.25;
+            let sharp_peak =
+                f64::from((y - sharp_ring.into_iter().fold(f32::NEG_INFINITY, f32::max)).max(0.0));
+            let sharp_delta = f64::from(y - sharp_background);
+            sharp_energy += sharp_peak * sharp_peak;
+            sharp_contrast += sharp_delta * sharp_delta;
+            let background = ring.iter().sum::<f32>() * 0.25;
+            let peak = y - ring.into_iter().fold(f32::NEG_INFINITY, f32::max);
+            let contrast = f64::from(y - background);
+            contrast_energy += contrast * contrast;
+            let positive = f64::from(peak.max(0.0));
+            point_energy += positive * positive;
+            points += u64::from(peak > 0.1 && background < 0.35);
+            interior += 1;
+        }
+    }
+    ChromaContentStats {
+        saturation: if n > 0 { sum / n as f32 } else { 0.0 },
+        dark_fraction: if n > 0 { dark as f32 / n as f32 } else { 0.0 },
+        point_fraction: if interior > 0 {
+            points as f32 / interior as f32
+        } else {
+            0.0
+        },
+        sharp_energy: if sharp_contrast > 1e-15 {
+            (sharp_energy / sharp_contrast) as f32
+        } else {
+            0.0
+        },
+        point_energy: if contrast_energy > 1e-15 {
+            (point_energy / contrast_energy) as f32
+        } else {
+            0.0
+        },
+    }
+}
+
+#[cfg(test)]
+fn chroma_saturation_stat(xyb: &Image3F) -> f32 {
+    chroma_content_stats(xyb).saturation
 }
 
 /// Horizontal opponent-gradient sums on a 1-in-4 row subsample. X and B−Y
@@ -4219,6 +4321,124 @@ mod tests {
         let stat = super::chroma_gradient_stats(&ctx, &xyb, 0.0)[0];
         assert!((stat - 0.5).abs() < 1e-5, "{stat}");
         assert!(stat >= super::X_QM_GRAD_THRESHOLD);
+    }
+
+    #[test]
+    fn point_chroma_policy_preserves_precision_across_hq_boundaries() {
+        use crate::{
+            Speed, encoding_context::EncodingContext, quant_weights::DequantMatrices, xyb,
+        };
+        let content = super::ChromaContentStats {
+            saturation: 0.03,
+            dark_fraction: 0.75,
+            point_fraction: 0.01,
+            point_energy: 0.4,
+            sharp_energy: 0.15,
+        };
+        for distance in [0.03, 0.15, 0.25, 0.295, 0.2989, 0.299, 0.2999, 0.3, 0.3001] {
+            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            let distp = compute_distance_params(distance);
+            super::apply_point_chroma_policy(&ctx, &distp, content, false);
+            assert_eq!(
+                distp.x_qm_scale.max(ctx.x_qm_scale_floor()),
+                3,
+                "d={distance}"
+            );
+            assert_eq!(ctx.b_qm_scale(), 3, "d={distance}");
+            assert!(std::ptr::eq(ctx.matrices(), DequantMatrices::new(0.3)));
+        }
+        // Existing mid-band protection and the upper cutoff stay intact.
+        for (distance, x_scale, b_scale) in [(1.25, 4, 3), (2.249, 4, 3), (2.25, 3, 2)] {
+            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            let distp = compute_distance_params(distance);
+            let matrices = ctx.matrices();
+            super::apply_point_chroma_policy(&ctx, &distp, content, false);
+            assert_eq!(distp.x_qm_scale.max(ctx.x_qm_scale_floor()), x_scale);
+            assert_eq!(ctx.b_qm_scale(), b_scale);
+            assert!(std::ptr::eq(ctx.matrices(), matrices));
+        }
+        // Excluded content retains both its tables and scales.
+        for (speed, achromatic, x_heavy, detected) in [
+            (Speed::Fast, false, false, true),
+            (Speed::Slow, true, false, true),
+            (Speed::Slow, false, true, true),
+            (Speed::Slow, false, false, false),
+        ] {
+            let ctx = EncodingContext::new(speed, xyb::XybMatrix::SPEC, 0.295, 1);
+            ctx.set_x_heavy(x_heavy);
+            let matrices = ctx.matrices();
+            let stats = if detected {
+                content
+            } else {
+                Default::default()
+            };
+            super::apply_point_chroma_policy(
+                &ctx,
+                &compute_distance_params(0.295),
+                stats,
+                achromatic,
+            );
+            assert_eq!(ctx.x_qm_scale_floor(), 2);
+            assert_eq!(ctx.b_qm_scale(), 2);
+            assert!(std::ptr::eq(ctx.matrices(), matrices));
+            assert!(ctx.point_chroma_hq_matrices().is_none());
+        }
+    }
+
+    #[test]
+    fn point_chroma_stats_separate_impulses_from_lines_and_hue_edges() {
+        let mut stars = crate::image::Image3F::new(256, 256);
+        for py in 0..256 {
+            for px in 0..256 {
+                let y = if px % 32 == 12 && py % 32 == 12 {
+                    0.8
+                } else {
+                    0.12
+                };
+                stars.plane_row_mut(0, py)[px] = 0.001;
+                stars.plane_row_mut(1, py)[px] = y;
+                stars.plane_row_mut(2, py)[px] = y + 0.03;
+            }
+        }
+        let stats = super::chroma_content_stats(&stars);
+        assert!(stats.diffuse_point_chroma(), "{stats:?}");
+        assert!(stats.point_energy > 0.7);
+
+        // The same contrast and chroma in continuous lines must not qualify.
+        for py in 0..256 {
+            for px in 0..256 {
+                let y = if px % 32 == 12 { 0.8 } else { 0.12 };
+                stars.plane_row_mut(1, py)[px] = y;
+                stars.plane_row_mut(2, py)[px] = y + 0.03;
+            }
+        }
+        assert!(!super::chroma_content_stats(&stars).diffuse_point_chroma());
+        for py in 0..256 {
+            stars.plane_row_mut(1, py).fill(0.12);
+            stars.plane_row_mut(2, py).fill(0.15);
+            for px in 0..256 {
+                stars.plane_row_mut(0, py)[px] = if (px + py) % 2 == 0 { 0.01 } else { -0.01 };
+            }
+        }
+        assert!(!super::chroma_content_stats(&stars).diffuse_point_chroma());
+    }
+
+    #[test]
+    fn point_chroma_stats_handle_small_and_achromatic_images() {
+        for (w, h) in [(1, 1), (3, 17), (17, 3), (9, 9), (16, 16)] {
+            let mut image = crate::image::Image3F::new(w, h);
+            for py in 0..h {
+                for px in 0..w {
+                    let y = if (px + py) % 5 == 0 { 0.7 } else { 0.1 };
+                    image.plane_row_mut(1, py)[px] = y;
+                    image.plane_row_mut(2, py)[px] = y;
+                }
+            }
+            let stats = super::chroma_content_stats(&image);
+            assert_eq!(stats.saturation, 0.0);
+            assert!(stats.point_fraction.is_finite() && stats.point_energy.is_finite());
+            assert!(!stats.diffuse_point_chroma());
+        }
     }
 
     #[test]

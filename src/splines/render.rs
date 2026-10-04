@@ -424,7 +424,7 @@ mod tests {
     fn dot_trials_match_decoded_atlas_at_every_block_alignment() {
         let ctx = EncodingContext::default();
         let (w, h) = (47, 39);
-        for sigma in [1, 4, 10, 11] {
+        for sigma in [-11, -10, -4, -1, 1, 4, 10, 11] {
             // The bright, wide case also exercises heap scratch for templates
             // larger than the constructor's inline capacity.
             for level in [3, 10, 17, 30] {

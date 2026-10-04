@@ -60,7 +60,7 @@ pub(crate) struct EncodingContext {
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
-    /// Experimental star-dot coding (see `EncodeConfig::dots`).
+    /// Experimental bright/dark dot coding (see `EncodeConfig::dots`).
     #[cfg(feature = "splines")]
     pub(crate) dots: bool,
     #[cfg(feature = "splines")]
@@ -79,6 +79,9 @@ pub(crate) struct EncodingContext {
     /// Which AC-strategy selector runs (study switch, see [`ac_strategy::SelectorPolicy`]).
     pub(crate) selector: ac_strategy::SelectorPolicy,
     base_matrices: &'static DequantMatrices,
+    /// Retain the HQ DCT8 table below its ordinary distance gate for sparse
+    /// point content, where dropping it reverses chroma quality.
+    point_chroma_hq_matrices: Option<&'static DequantMatrices>,
     sat_matrices: &'static DequantMatrices,
     pair_b_matrices: &'static DequantMatrices,
     sat_pair_b_matrices: &'static DequantMatrices,
@@ -86,6 +89,7 @@ pub(crate) struct EncodingContext {
     /// Set once per frame (post-XYB, before any table use) by the
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
+    point_chroma: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
     pair_b_fine: std::sync::atomic::AtomicBool,
     /// Blue-axis twin of `x_heavy`: structure lives in B−Y where luma-driven
@@ -148,13 +152,16 @@ pub(crate) struct EncodingContext {
 impl EncodingContext {
     /// The dequant tables for the current frame: the distance-tier default,
     /// the saturated-content variant when the chroma gate fired, or the
-    /// X-gradient variant (it outranks the chroma gate: both fire on saturated
-    /// red content, where flattened B bands are a strict RD loss).
+    /// X-gradient variant (it outranks the chroma gates: both fire on saturated
+    /// red content, where flattened B bands are a strict RD loss). Sparse
+    /// point content retains the HQ DCT8 table below its normal distance gate.
     #[inline]
     pub(crate) fn matrices(&self) -> &'static DequantMatrices {
         use std::sync::atomic::Ordering::Relaxed;
         if self.x_heavy.load(Relaxed) {
             self.x_heavy_matrices
+        } else if let Some(matrices) = self.point_chroma_hq_matrices() {
+            matrices
         } else {
             match (
                 self.chroma_heavy.load(Relaxed),
@@ -165,6 +172,25 @@ impl EncodingContext {
                 (false, true) => self.pair_b_matrices,
                 (false, false) => self.base_matrices,
             }
+        }
+    }
+
+    pub(crate) fn set_point_chroma(&self, point_chroma: bool) {
+        self.point_chroma
+            .store(point_chroma, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn point_chroma(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.speed == Speed::Slow && self.point_chroma.load(Relaxed) && !self.x_heavy.load(Relaxed)
+    }
+
+    /// The same override is used by the residual encoder and spline RD proxy.
+    pub(crate) fn point_chroma_hq_matrices(&self) -> Option<&'static DequantMatrices> {
+        if self.point_chroma() {
+            self.point_chroma_hq_matrices
+        } else {
+            None
         }
     }
 
@@ -278,6 +304,9 @@ impl EncodingContext {
             merge: ac_strategy::MergeTuning::new(distance),
             selector: ac_strategy::SelectorPolicy::default(),
             base_matrices,
+            point_chroma_hq_matrices: (speed == Speed::Slow
+                && distance < crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)
+                .then(|| DequantMatrices::new(crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)),
             sat_matrices: DequantMatrices::new_saturated(distance),
             pair_b_matrices: if speed == Speed::Slow {
                 DequantMatrices::new_pair_b(distance)
@@ -291,6 +320,7 @@ impl EncodingContext {
                 DequantMatrices::new(0.0)
             },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
+            point_chroma: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
             pair_b_fine: std::sync::atomic::AtomicBool::new(false),
             b_heavy: std::sync::atomic::AtomicBool::new(false),
@@ -373,6 +403,38 @@ impl Default for EncodingContext {
 #[cfg(test)]
 mod tests {
     use super::channel_weights_for_bias;
+
+    #[test]
+    fn point_chroma_tables_preserve_existing_class_precedence() {
+        use super::{DequantMatrices, EncodingContext, Speed, xyb};
+        for distance in [0.295, 0.299, 0.3, 1.25, 2.25] {
+            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            ctx.set_chroma_heavy(true);
+            ctx.set_pair_b_fine(true);
+            let previous = ctx.matrices();
+            ctx.set_point_chroma(true);
+            let expected = if distance < 0.3 {
+                DequantMatrices::new(0.3)
+            } else {
+                previous
+            };
+            assert!(std::ptr::eq(ctx.matrices(), expected));
+            ctx.set_x_heavy(true);
+            assert!(std::ptr::eq(
+                ctx.matrices(),
+                DequantMatrices::new_x_heavy(distance)
+            ));
+            assert!(ctx.point_chroma_hq_matrices().is_none());
+            ctx.set_x_heavy(false);
+            ctx.set_point_chroma(false);
+            assert!(std::ptr::eq(ctx.matrices(), previous));
+        }
+        let ctx = EncodingContext::new(Speed::Fast, xyb::XybMatrix::SPEC, 0.295, 1);
+        let previous = ctx.matrices();
+        ctx.set_point_chroma(true);
+        assert!(std::ptr::eq(ctx.matrices(), previous));
+        assert!(ctx.point_chroma_hq_matrices().is_none());
+    }
 
     #[test]
     fn hue_tables_require_the_frame_content_gate() {

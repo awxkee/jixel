@@ -99,7 +99,7 @@ pub(crate) struct BandOverride {
 
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
 const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
-const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
+pub(crate) const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
 pub(crate) const QM_FLAT_B8_MID_MIN_DISTANCE: f32 = 1.25;
 pub(crate) const PAIR_B_FINE_BAND1: f32 = -0.35;
 pub(crate) const PAIR_B_FINE_MIN_DISTANCE: f32 = QM_FLAT_B8_MID_MIN_DISTANCE;

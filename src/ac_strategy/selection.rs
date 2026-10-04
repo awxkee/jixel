@@ -1206,10 +1206,30 @@ fn sub8_shortlist(
     }
 }
 
-/// The admission charge of a fine candidate priced by learned prices.
+/// The admission charge of a fine candidate priced by learned prices, in
+/// bits. A share of the candidate's own rate, so it is weighed at the
+/// candidate's reconstruction lambda (see [`fine_admit_charge`]).
 #[inline]
 fn learned_fine_rate_correction(rate: f32) -> f32 {
     (FINE_ADMIT_RATE_CORRECTION_SHARE * rate).min(FINE_ADMIT_RATE_CORRECTION_BITS)
+}
+
+/// `(lambda, bits)` of a fine candidate's admission charge. The learned
+/// share is weighed at the candidate's own reconstruction lambda: at the
+/// floored lambda it is a 4x heavier surcharge below the ramp's crossing.
+#[inline]
+fn fine_admit_charge(learned: bool, distance: f32, rate: f32) -> (f32, f32) {
+    if learned {
+        (
+            reconstruction_lambda(distance),
+            learned_fine_rate_correction(rate),
+        )
+    } else {
+        (
+            fine_mosaic_lambda(distance),
+            FINE_ADMIT_RATE_CORRECTION_BITS,
+        )
+    }
 }
 
 /// Reconstruction-domain admission of a shortlisted IDENTITY/DCT2X2 block:
@@ -1249,18 +1269,14 @@ fn fine_recon_admit(
     let recon8 = reconstruction_cost(scratch, STRATEGY_DCT).cost;
     let candidate = reconstruction_cost(scratch, fine);
     // The reconstruction scorer over-credits fine transforms; charge the
-    // fitted per-block correction at the floored lambda (see the constant)
-    // before the margin test below.
-    let correction = if scratch.rate_prices.is_some() {
-        learned_fine_rate_correction(candidate.rate)
-    } else {
-        FINE_ADMIT_RATE_CORRECTION_BITS
-    };
-    let recon_fine = fmla(
-        fine_mosaic_lambda(params.distance),
-        correction,
-        candidate.cost,
+    // fitted per-block correction (the fixed model's at the floored lambda,
+    // see the constant) before the margin test below.
+    let (lambda, correction) = fine_admit_charge(
+        scratch.rate_prices.is_some(),
+        params.distance,
+        candidate.rate,
     );
+    let recon_fine = fmla(lambda, correction, candidate.cost);
     // A small safety margin absorbs the remaining mismatch between the local
     // reconstruction metric and the final post-filtered image.
     (recon_fine < recon8 * FINE_RECON_MARGIN).then_some(recon8 - recon_fine)
@@ -1465,8 +1481,9 @@ pub(crate) fn fill_ac_strategy(
     fine_fallbacks: &mut Vec<u8>,
     num_threads: usize,
 ) -> f32 {
-    let learned =
-        ctx.selector.learned_rate && ctx.speed == crate::Speed::Slow && !use_dct8_only(distance);
+    let learned = ctx.selector.learned_rate
+        && ctx.speed == crate::Speed::Slow
+        && !use_dct8_only_for_content(ctx, distance);
     let prices = learned.then(|| {
         learn_rate_prices(
             ctx,
@@ -1529,10 +1546,9 @@ fn select_transforms(
     let speed = ctx.speed;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
-    // DCT8 wins the high-quality RD comparison outright; Fastest skips the
-    // search by contract. Either way the default strategy image (all DCT8
-    // first blocks) is already the answer.
-    if use_dct8_only(distance) || speed == crate::Speed::Fastest {
+    // Ordinary fine-quality content uses its fitted DCT8-only shortcut.
+    // Point content retains its full search along with the flat chroma table.
+    if use_dct8_only_for_content(ctx, distance) || speed == crate::Speed::Fastest {
         return 0.0;
     }
     let scope = SearchScope::for_speed(speed);
@@ -2406,7 +2422,8 @@ fn find_rerank_downgrades(
                     // A fine leaf carries its admission charge into the
                     // comparison with the merge it sits under.
                     let charge = if matches!(s, STRATEGY_IDENTITY | STRATEGY_DCT2X2) {
-                        fine_lambda * learned_fine_rate_correction(cost.rate)
+                        reconstruction_lambda(params.distance)
+                            * learned_fine_rate_correction(cost.rate)
                     } else {
                         0.0
                     };
@@ -3234,7 +3251,7 @@ mod tests {
         merge_upgrade_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
         rerank_pair_gradient_scale, select_gradient_region_stats_fn,
         select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
-        use_dct8_only,
+        use_dct8_only, use_dct8_only_for_content,
     };
     use crate::coder_scratch::{AcStrategyBandScratch, CoderScratch};
     use crate::dc_group_data::{
@@ -3399,6 +3416,23 @@ mod tests {
         assert!(!use_dct8_only(0.06));
         assert!(!use_dct8_only(0.2));
         assert!(!use_dct8_only(1.0));
+
+        for speed in [
+            crate::Speed::Slow,
+            crate::Speed::Fast,
+            crate::Speed::Fastest,
+        ] {
+            let ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, 0.05, 1);
+            assert!(use_dct8_only_for_content(&ctx, 0.05));
+            ctx.set_point_chroma(true);
+            assert_eq!(
+                use_dct8_only_for_content(&ctx, 0.05),
+                speed != crate::Speed::Slow
+            );
+            assert!(!use_dct8_only_for_content(&ctx, 0.06));
+            ctx.set_x_heavy(true);
+            assert!(use_dct8_only_for_content(&ctx, 0.05));
+        }
     }
 
     #[test]
