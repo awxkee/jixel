@@ -114,18 +114,23 @@ const TYPE_CUSTOM: u64 = 3;
 pub(crate) fn encode_jbrd(
     jpg: &JpegData,
     xmp_app_index: Option<usize>,
+    exif_app_index: Option<usize>,
     icc_app_indices: &[usize],
     compressor: Option<&dyn BrotliCompression>,
 ) -> Result<Vec<u8>, EncodeError> {
-    let mut out = encode_fields(jpg, xmp_app_index, icc_app_indices)
+    let mut out = encode_fields(jpg, xmp_app_index, exif_app_index, icc_app_indices)
         .map_err(|error| EncodeError::Jpeg(error.to_string()))?;
 
     // Order is fixed: unknown-typed APP segments, then COM, then inter-marker
-    // chunks, then the tail. The tagged XMP segment is supplied by the `xml `
-    // container box and the ICC chunks by the codestream, so both are omitted.
+    // chunks, then the tail. The tagged XMP and Exif segments are supplied by
+    // their container boxes and the ICC chunks by the codestream, so all three
+    // are omitted.
     let mut payload = Vec::new();
     for (index, app) in jpg.app_data.iter().enumerate() {
-        if Some(index) == xmp_app_index || icc_app_indices.contains(&index) {
+        if Some(index) == xmp_app_index
+            || Some(index) == exif_app_index
+            || icc_app_indices.contains(&index)
+        {
             continue;
         }
         payload.extend_from_slice(app);
@@ -147,6 +152,7 @@ pub(crate) fn encode_jbrd(
 fn encode_fields(
     jpg: &JpegData,
     xmp_app_index: Option<usize>,
+    exif_app_index: Option<usize>,
     icc_app_indices: &[usize],
 ) -> Result<Vec<u8>, JpegError> {
     let mut w = BitWriter::new();
@@ -168,12 +174,14 @@ fn encode_fields(
         w.write(6, (m - 0xC0) as u64);
     }
 
-    // A recognized XMP APP1 segment is rebuilt from the container's `xml ` box
-    // and ICC chunks from the codestream's profile; all other APP segments
-    // remain byte-for-byte data in the Brotli section.
+    // Recognized XMP and Exif APP1 segments are rebuilt from the container's
+    // `xml ` and `Exif` boxes and ICC chunks from the codestream's profile; all
+    // other APP segments remain byte-for-byte data in the Brotli section.
     for (index, app) in jpg.app_data.iter().enumerate() {
         let marker_type = if Some(index) == xmp_app_index {
             3
+        } else if Some(index) == exif_app_index {
+            2
         } else if icc_app_indices.contains(&index) {
             1
         } else {

@@ -506,7 +506,11 @@ fn recon_dist_and_rate_avx2_impl<const BIASED: bool>(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_avx2::<BIASED>,
+            quantize: if input.quantization.compute_rate {
+                recon_quantize_avx2::<BIASED, true>
+            } else {
+                recon_quantize_avx2::<BIASED, false>
+            },
             ssim: ssim_deficit_avx2,
             prepare: prepare_reconstruction_avx2,
             error,
@@ -537,7 +541,7 @@ fn avx_dequantized_level_f32(q: __m256) -> __m256 {
 
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
-fn recon_quantize_avx2<const BIASED: bool>(
+fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -555,32 +559,31 @@ fn recon_quantize_avx2<const BIASED: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(8));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n && scan_pos.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = _mm256_set1_ps(quant_scale);
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let all = _mm256_set1_epi32(-1);
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
-    let mut nonzero = 0usize;
+    let mut nonzero_acc = _mm256_setzero_si256();
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
 
-    for (y, (((coeff_row, inv_row), error_row), scan_row)) in coeff
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
-        .zip(scan_pos.chunks_exact(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, (((coeff8, inv8), error8), scan8)) in coeff_row
+        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
             .as_chunks::<8>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<8>().0.iter())
             .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
-            .zip(scan_row.as_chunks::<8>().0.iter())
             .enumerate()
         {
             let x = chunk_x * 8;
@@ -621,20 +624,161 @@ fn recon_quantize_avx2<const BIASED: bool>(
             unsafe {
                 _mm256_storeu_ps(error8.as_mut_ptr(), _mm256_and_ps(error, active));
             }
-            let active_quantized = _mm256_and_ps(quantized, active);
-            let absolute_q = _mm256_andnot_ps(sign, active_quantized);
-            let nonzero_mask = _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps());
-            nonzero += _mm256_movemask_ps(nonzero_mask).count_ones() as usize;
-            magnitude_bits = _mm256_add_ps(
-                magnitude_bits,
-                _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
-            );
-            let sv = unsafe { _mm256_loadu_si256(scan8.as_ptr().cast()) };
-            scan_acc = _mm256_max_epu32(
-                scan_acc,
-                _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
-            );
+            if COMPUTE_RATE {
+                let active_quantized = _mm256_and_ps(quantized, active);
+                let absolute_q = _mm256_andnot_ps(sign, active_quantized);
+                let nonzero_mask = _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps());
+                if _mm256_movemask_ps(nonzero_mask) != 0 {
+                    nonzero_acc = _mm256_sub_epi32(nonzero_acc, _mm256_castps_si256(nonzero_mask));
+                    magnitude_bits = _mm256_add_ps(
+                        magnitude_bits,
+                        _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
+                    );
+                    let sv =
+                        unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
+                    scan_acc = _mm256_max_epu32(
+                        scan_acc,
+                        _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
+                    );
+                }
+            }
         }
+    }
+
+    if !COMPUTE_RATE {
+        return 0.0;
+    }
+
+    let v_max = _mm_max_epu32(
+        _mm256_castsi256_si128(scan_acc),
+        _mm256_extracti128_si256::<1>(scan_acc),
+    );
+    let max_scan = hmax_u32(v_max);
+
+    let nonzero = _mm_add_epi32(
+        _mm256_castsi256_si128(nonzero_acc),
+        _mm256_extracti128_si256::<1>(nonzero_acc),
+    );
+    let nonzero = _mm_hadd_epi32(nonzero, nonzero);
+    let nonzero = _mm_hadd_epi32(nonzero, nonzero);
+    let nonzero = _mm_cvtsi128_si32(nonzero) as usize;
+
+    let header_input = _mm256_setr_ps(nonzero as f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let header = _mm_cvtss_f32(_mm256_castps256_ps128(avx2_log2p1_f32(header_input)));
+    nonzero as f32 * 1.6
+        + hsum256(magnitude_bits)
+        + 0.4 * header
+        + crate::inflated_cost::R_ZERO
+            * crate::inflated_cost::visited_zeros(nonzero, max_scan, cx, cy)
+}
+
+// Original per-vector rate reduction, retained as an exact test oracle.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
+    coeff: &[f32],
+    inv: &[f32],
+    quant_scale: f32,
+    thresholds: &[f32; 4],
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    coeff_error: &mut [f32],
+    _rate_log2_lut: &RateLog2Lut,
+    scan_pos: &[u32],
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("coefficient size overflow");
+    assert!(width.is_multiple_of(8));
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(!COMPUTE_RATE || scan_pos.len() >= n);
+    let scale = _mm256_set1_ps(quant_scale);
+    let sign = _mm256_set1_ps(-0.0);
+    let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let all = _mm256_set1_epi32(-1);
+    const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+    let mut nonzero = 0usize;
+    let mut magnitude_bits = _mm256_setzero_ps();
+    let mut scan_acc = _mm256_setzero_si256();
+
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
+        .chunks_exact(width)
+        .zip(inv.chunks_exact(width))
+        .zip(coeff_error.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(inv_row.as_chunks::<8>().0.iter())
+            .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
+            .enumerate()
+        {
+            let x = chunk_x * 8;
+            let threshold = if x + 8 <= half {
+                _mm256_set1_ps(thresholds[yfix])
+            } else if x >= half {
+                _mm256_set1_ps(thresholds[yfix + 1])
+            } else {
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                let high = _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(half as i32 - 1));
+                _mm256_blendv_ps(
+                    _mm256_set1_ps(thresholds[yfix]),
+                    _mm256_set1_ps(thresholds[yfix + 1]),
+                    _mm256_castsi256_ps(high),
+                )
+            };
+            let coeff_v = unsafe { _mm256_loadu_ps(coeff8.as_ptr()) };
+            let inv_v = unsafe { _mm256_loadu_ps(inv8.as_ptr()) };
+            let denominator = _mm256_mul_ps(inv_v, scale);
+            let scaled = _mm256_mul_ps(denominator, coeff_v);
+            let absolute = _mm256_andnot_ps(sign, scaled);
+            let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
+            let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
+            let dequantized = if BIASED {
+                avx_dequantized_level_f32(quantized)
+            } else {
+                quantized
+            };
+            let error = _mm256_div_ps(_mm256_sub_ps(scaled, dequantized), denominator);
+
+            let active_i = if y < cy && x < cx {
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(cx as i32 - 1))
+            } else {
+                all
+            };
+            let active = _mm256_castsi256_ps(active_i);
+            unsafe {
+                _mm256_storeu_ps(error8.as_mut_ptr(), _mm256_and_ps(error, active));
+            }
+            if COMPUTE_RATE {
+                let active_quantized = _mm256_and_ps(quantized, active);
+                let absolute_q = _mm256_andnot_ps(sign, active_quantized);
+                let nonzero_mask = _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps());
+                nonzero += _mm256_movemask_ps(nonzero_mask).count_ones() as usize;
+                magnitude_bits = _mm256_add_ps(
+                    magnitude_bits,
+                    _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
+                );
+                let sv = unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
+                scan_acc = _mm256_max_epu32(
+                    scan_acc,
+                    _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
+                );
+            }
+        }
+    }
+
+    if !COMPUTE_RATE {
+        return 0.0;
     }
 
     let v_max = _mm_max_epu32(
@@ -788,6 +932,97 @@ mod tests {
     }
 
     #[test]
+    fn sparse_reconstruction_rate_preserves_dense_kernel_bits() {
+        if !available() {
+            return;
+        }
+        let special = [
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let mut rng = 73u32;
+        for (width, height, cx, cy) in [
+            (8, 8, 1, 1),
+            (16, 8, 2, 1),
+            (8, 16, 1, 2),
+            (16, 16, 2, 2),
+            (32, 16, 4, 2),
+            (32, 32, 4, 4),
+        ] {
+            let n = width * height;
+            let scan: Vec<u32> = (0..n).map(|i| ((i * 17) % n) as u32).collect();
+            for case in 0..64 {
+                let coeff: Vec<f32> = (0..n)
+                    .map(|_| {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match case % 4 {
+                            0 => 0.0,
+                            1 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2,
+                            2 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 200.0,
+                            _ => special[rng as usize % special.len()],
+                        }
+                    })
+                    .collect();
+                let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
+                let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
+                let thresholds = [0.0, 0.42, 0.57, 0.91];
+                for (original, optimized) in [
+                    (
+                        super::recon_quantize_avx2_reference::<true, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                        super::recon_quantize_avx2::<true, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                    ),
+                    (
+                        super::recon_quantize_avx2_reference::<false, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                        super::recon_quantize_avx2::<false, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                    ),
+                ] {
+                    let mut expected_error = vec![-123.0; n];
+                    let mut actual_error = expected_error.clone();
+                    let run = |kernel: crate::inflated_cost::ReconQuantizeFn, error: &mut [f32]| unsafe {
+                        kernel(
+                            &coeff,
+                            &inv,
+                            scale,
+                            &thresholds,
+                            width,
+                            height,
+                            width / 2,
+                            cx,
+                            cy,
+                            error,
+                            rate_log2_lut(),
+                            &scan,
+                        )
+                    };
+                    let expected = run(original, &mut expected_error);
+                    let actual = run(optimized, &mut actual_error);
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{width}x{height}, case {case}"
+                    );
+                    for (a, e) in actual_error.iter().zip(expected_error) {
+                        assert_eq!(a.to_bits(), e.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ssim_avx2_matches_scalar() {
         if !available() {
             return;
@@ -853,6 +1088,7 @@ mod tests {
             let input = ReconDistInput {
                 idct: &idct,
                 quantization: ReconQuantization {
+                    compute_rate: true,
                     rate_log2_lut: rate_log2_lut(),
                     coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                     inverse_matrices: inv,

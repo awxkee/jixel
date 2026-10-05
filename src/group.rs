@@ -909,6 +909,7 @@ pub(crate) fn write_ac_group(
     ctx: &EncodingContext,
     scratch: &mut AcGroupScratch,
     opsin: &Image3F,
+    opsin_origin: (usize, usize),
     group_brect: Rect,
     scale: f32,
     scale_dc: f32,
@@ -988,8 +989,8 @@ pub(crate) fn write_ac_group(
             let quant_ac = dc_data.raw_quant_field.row(global_by)[global_bx] as i32;
 
             // ---- Forward DCT for all 3 channels ----
-            let opsin_bx = bx * 8;
-            let opsin_by = by * 8;
+            let opsin_bx = opsin_origin.0 + bx * 8;
+            let opsin_by = opsin_origin.1 + by * 8;
             for c in 0..3 {
                 let plane = opsin.plane(c);
                 let stride = plane.xsize();
@@ -1210,7 +1211,9 @@ pub(crate) fn write_ac_group(
                 }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
-            source_y[..size].copy_from_slice(&coeffs[1][..size]);
+            if rdoq_prices.is_some() {
+                source_y[..size].copy_from_slice(&coeffs[1][..size]);
+            }
             quantize_roundtrip_y_block(
                 ctx,
                 inv_qm_y,
@@ -1595,16 +1598,20 @@ pub(crate) fn write_ac_group(
                     // (sent_p << shift_p) over passes to recover `full_block`
                     // (jxl-vardct hf_coeff.rs:185,191). For 2 passes/shifts
                     // [s,0]: pass0 = C>>s, pass1 = C-((C>>s)<<s).
-                    for k in 0..size {
-                        let mut remaining = full_block[k];
-                        let mut sent = 0i32;
-                        for p in 0..=pass {
-                            sent = remaining >> coeff_shifts[p];
-                            remaining -= sent << coeff_shifts[p];
+                    let block = if pass == 0 && coeff_shifts[0] == 0 {
+                        full_block
+                    } else {
+                        for k in 0..size {
+                            let mut remaining = full_block[k];
+                            let mut sent = 0i32;
+                            for p in 0..=pass {
+                                sent = remaining >> coeff_shifts[p];
+                                remaining -= sent << coeff_shifts[p];
+                            }
+                            pblock[k] = sent;
                         }
-                        pblock[k] = sent;
-                    }
-                    let block = &pblock[..size];
+                        &pblock[..size]
+                    };
                     let num_nzeros = &mut num_nzeros[pass];
                     let out = &mut out[pass];
 

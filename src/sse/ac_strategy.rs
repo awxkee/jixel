@@ -233,6 +233,153 @@ pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>
     let qs = _mm_set1_ps(q_scaled);
     let mut sse_acc = _mm_setzero_ps();
     let mut mag_acc = _mm_setzero_ps();
+    let mut nonzero_acc = _mm_setzero_si128();
+    let mut scan_acc = _mm_setzero_si128();
+
+    let zero = _mm_setzero_ps();
+    let sign_mask = _mm_set1_ps(-0.0);
+
+    let lane_ids = _mm_setr_epi32(0, 1, 2, 3);
+    let izero = _mm_setzero_si128();
+    let all_active_i = _mm_cmpeq_epi32(izero, izero);
+
+    // round-to-nearest-even via SSE4.1
+    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        let thr_lo = thr[yfix];
+        let thr_hi = thr[yfix + 1];
+
+        for (x0, (coeff4, inv4)) in coeffs
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(inv_matrix.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            let x = x0 * 4;
+
+            let threshold = if x >= half { thr_hi } else { thr_lo };
+            let thrv = _mm_set1_ps(threshold);
+
+            let cv = unsafe { _mm_loadu_ps(coeff4.as_ptr()) };
+            let mv = unsafe { _mm_loadu_ps(inv4.as_ptr()) };
+
+            // a = inv_matrix * q_scaled * coeff
+            let a = _mm_mul_ps(_mm_mul_ps(mv, qs), cv);
+            let absa = _mm_andnot_ps(sign_mask, a);
+
+            // keep = |a| >= threshold
+            let keep = _mm_cmpge_ps(absa, thrv);
+
+            let rounded = _mm_round_ps::<RND>(a);
+            let q = _mm_and_ps(rounded, keep);
+
+            let d = if BIASED {
+                _mm_sub_ps(a, sse_dequantized_level_f32(q))
+            } else {
+                _mm_sub_ps(a, q)
+            };
+            let d2 = _mm_mul_ps(d, d);
+
+            // Active mask: keep lanes where !(y < cy && x + lane < cx).
+            let active_i = if y < cy && x < cx {
+                let lane_x = _mm_add_epi32(_mm_set1_epi32(x as i32), lane_ids);
+                let cxv = _mm_set1_epi32(cx as i32);
+
+                // llf = cx > lane_x  <=> lane_x < cx
+                let llf = _mm_cmpgt_epi32(cxv, lane_x);
+
+                // active = !llf
+                _mm_andnot_si128(llf, all_active_i)
+            } else {
+                all_active_i
+            };
+
+            let active = _mm_castsi128_ps(active_i);
+
+            // SSE: zero LLF lanes.
+            let d2 = _mm_and_ps(d2, active);
+            sse_acc = _mm_add_ps(sse_acc, d2);
+
+            // Rate mask: active && abs(q) > 0.
+            let absq = _mm_andnot_ps(sign_mask, q);
+            let nz = _mm_cmpgt_ps(absq, zero);
+            let rate_mask = _mm_and_ps(nz, active);
+
+            // Comparison masks contain -1 for each nonzero lane.
+            nonzero_acc = _mm_sub_epi32(nonzero_acc, _mm_castps_si128(rate_mask));
+
+            if SAVE_LEVELS {
+                let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(a);
+                let frac = _mm_sub_ps(a, truncated);
+                let ge_half = _mm_cmpge_ps(_mm_andnot_ps(sign_mask, frac), _mm_set1_ps(0.5));
+                let signed_one = _mm_or_ps(_mm_set1_ps(1.0), _mm_and_ps(a, sign_mask));
+                let quantized =
+                    _mm_cvttps_epi32(_mm_add_ps(truncated, _mm_and_ps(signed_one, ge_half)));
+                let quantized =
+                    _mm_and_si128(quantized, _mm_and_si128(_mm_castps_si128(keep), active_i));
+                unsafe {
+                    _mm_storeu_si128(levels.as_mut_ptr().add(y * width + x).cast(), quantized)
+                };
+            }
+
+            if !SAVE_LEVELS && _mm_movemask_ps(rate_mask) != 0 {
+                let ratev = sse_log2p1_f32(absq);
+                mag_acc = _mm_add_ps(mag_acc, _mm_and_ps(ratev, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe {
+                    _mm_loadu_si128(scan_pos.as_ptr().add(y * width + x) as *const __m128i)
+                };
+                scan_acc = _mm_max_epu32(scan_acc, _mm_and_si128(sv, _mm_castps_si128(rate_mask)));
+            }
+        }
+    }
+
+    let nonzero = _mm_hadd_epi32(nonzero_acc, nonzero_acc);
+    let nonzero = _mm_hadd_epi32(nonzero, nonzero);
+    let nzeros = _mm_cvtsi128_si32(nonzero) as usize;
+
+    (hsum(sse_acc), nzeros, hsum(mag_acc), hmax_u32(scan_acc))
+}
+
+// Original scalar population count, retained as an exact test oracle.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn sse_and_rate_sse_impl_reference<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
+    let n = width * height;
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
+    debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+
+    let qs = _mm_set1_ps(q_scaled);
+    let mut sse_acc = _mm_setzero_ps();
+    let mut mag_acc = _mm_setzero_ps();
     let mut nzeros = 0usize;
     let mut scan_acc = _mm_setzero_si128();
 
@@ -437,6 +584,42 @@ mod tests {
                 ))) as u32);
                 assert!((q1 - q2).abs() < 1e-5, "q1 {} q2 {}", q1, q2);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_count_tests {
+    use super::*;
+
+    #[test]
+    fn lane_counts_preserve_original_rate_distortion_and_coding_levels() {
+        if !std::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        for (original, optimized) in [
+            (
+                sse_and_rate_sse_impl_reference::<false, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_sse_impl::<false, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_sse_impl_reference::<false, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_sse_impl::<false, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_sse_impl_reference::<true, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_sse_impl::<true, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_sse_impl_reference::<true, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_sse_impl::<true, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+        ] {
+            crate::inflated_cost::assert_coefficient_kernel_preserves_original(original, optimized);
         }
     }
 }

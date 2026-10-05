@@ -151,6 +151,44 @@ static HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
 const NUM_HYBRID_CANDIDATES: usize = HYBRID_CANDIDATES.len();
 const DEFAULT_HYBRID_INDEX: usize = 6;
 
+type HybridCounter = fn(&[u32], usize, &mut [u32; ALPHABET_SIZE]) -> (u64, u64, bool);
+
+// Specialize symbolization for each fixed configuration, keeping the same
+// candidate order and sampled values. Split and token shifts become constants.
+static HYBRID_COUNTERS: [HybridCounter; NUM_HYBRID_CANDIDATES] = [
+    count_hybrid::<0>,
+    count_hybrid::<1>,
+    count_hybrid::<2>,
+    count_hybrid::<3>,
+    count_hybrid::<4>,
+    count_hybrid::<5>,
+    count_hybrid::<6>,
+    count_hybrid::<7>,
+    count_hybrid::<8>,
+    count_hybrid::<9>,
+    count_hybrid::<10>,
+    count_hybrid::<11>,
+];
+
+fn count_hybrid<const C: usize>(
+    values: &[u32],
+    sample_stride: usize,
+    counts: &mut [u32; ALPHABET_SIZE],
+) -> (u64, u64, bool) {
+    let mut extra_bits = 0u64;
+    let mut total = 0u64;
+    for &value in values.iter().step_by(sample_stride) {
+        let (symbol, nbits, _) = uint_encode_with_config(value, HYBRID_CANDIDATES[C]);
+        if symbol as usize >= ALPHABET_SIZE {
+            return (extra_bits, total, false);
+        }
+        counts[symbol as usize] += 1;
+        extra_bits += nbits as u64;
+        total += 1;
+    }
+    (extra_bits, total, true)
+}
+
 struct HybridAnsSelectorScratch {
     counts: Box<[[u32; ALPHABET_SIZE]]>,
     extra_bits: [u64; NUM_HYBRID_CANDIDATES],
@@ -194,20 +232,12 @@ fn select_hybrid_config_ans_sampled(
         return HybridUintConfig::DEFAULT;
     }
     scratch.reset();
-    // Reuse one contiguous histogram allocation across every cluster. Keeping
-    // the configuration outside the value loop also lets uint encoding remain
-    // a small, predictable hot loop for each candidate.
-    for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
-        for &value in values.iter().step_by(sample_stride) {
-            let (symbol, nbits, _) = uint_encode_with_config(value, config);
-            if symbol as usize >= ALPHABET_SIZE {
-                scratch.valid[candidate_index] = false;
-                break;
-            }
-            scratch.counts[candidate_index][symbol as usize] += 1;
-            scratch.extra_bits[candidate_index] += nbits as u64;
-            scratch.totals[candidate_index] += 1;
-        }
+    for (candidate_index, counter) in HYBRID_COUNTERS.iter().enumerate() {
+        let (extra_bits, total, valid) =
+            counter(values, sample_stride, &mut scratch.counts[candidate_index]);
+        scratch.extra_bits[candidate_index] = extra_bits;
+        scratch.totals[candidate_index] = total;
+        scratch.valid[candidate_index] = valid;
     }
 
     for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
@@ -2329,6 +2359,37 @@ fn write_prefix_code_single(
     }
 }
 
+/// One prefix code in Brotli's format (which JPEG XL's prefix codes share) for
+/// a fixed alphabet whose simple-code symbols take `alphabet_bits` bits.
+/// `depths` covers the whole alphabet; a single used symbol gets depth 0.
+pub(crate) fn write_brotli_prefix_code(
+    depths: &[u8],
+    alphabet_bits: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    let mut s4 = [0usize; 4];
+    let mut count = 0usize;
+    let mut length = 0usize;
+    for (i, &d) in depths.iter().enumerate() {
+        if d != 0 {
+            if count < 4 {
+                s4[count] = i;
+            }
+            count += 1;
+            length = i + 1;
+        }
+    }
+    match count {
+        0 | 1 => {
+            w.write(4, 1); // simple code, one symbol
+            w.write(alphabet_bits, s4[0] as u64);
+        }
+        2..=4 => store_simple_huffman_tree(depths, &mut s4, count, alphabet_bits, w),
+        _ => store_huffman_tree(&depths[..length], huffman_pool, w),
+    }
+}
+
 /// Write a vector of prefix codes (per WritePrefixCodes in libjxl-tiny).
 /// Serialize one `HybridUintConfig`.
 ///
@@ -3262,6 +3323,52 @@ mod context_map_tests {
 #[cfg(test)]
 mod sampled_hybrid_tests {
     use super::*;
+
+    #[test]
+    fn specialized_hybrid_counts_preserve_every_candidate_and_sample() {
+        let mut rng = 73u32;
+        let edges: Vec<u32> = (0..32)
+            .flat_map(|bit| {
+                let power = 1u32 << bit;
+                [power - 1, power, power.saturating_add(1)]
+            })
+            .chain([u32::MAX])
+            .collect();
+        for len in [0, 1, 31, 256, 4099, 65_537] {
+            for pattern in 0..3 {
+                let values: Vec<u32> = (0..len)
+                    .map(|i| {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match pattern {
+                            0 => rng % 256,
+                            1 => edges[i % edges.len()],
+                            _ => rng,
+                        }
+                    })
+                    .collect();
+                for stride in [1, 2, 3, 17, 257] {
+                    for (candidate, &config) in HYBRID_CANDIDATES.iter().enumerate() {
+                        let mut expected = [0u32; ALPHABET_SIZE];
+                        let mut actual = expected;
+                        let (mut extra_bits, mut total, mut valid) = (0u64, 0u64, true);
+                        for &value in values.iter().step_by(stride) {
+                            let (symbol, nbits, _) = uint_encode_with_config(value, config);
+                            if symbol as usize >= ALPHABET_SIZE {
+                                valid = false;
+                                break;
+                            }
+                            expected[symbol as usize] += 1;
+                            extra_bits += nbits as u64;
+                            total += 1;
+                        }
+                        let result = HYBRID_COUNTERS[candidate](&values, stride, &mut actual);
+                        assert_eq!(result, (extra_bits, total, valid));
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn packed_context_populations_match_serial_counts_and_context_order() {

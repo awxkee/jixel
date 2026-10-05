@@ -2114,6 +2114,89 @@ fn best_reconstruction_plan(
     };
     let mut plans = [empty; 9 * 16];
     let index = |lx: usize, ly: usize, x: usize, y: usize| (ly * 3 + lx) * 16 + y * 4 + x;
+    // Index the same candidates once instead of scanning the whole list for
+    // every subregion. Strict comparisons retain the first candidate on ties.
+    for (i, tile) in tiles.iter().enumerate() {
+        if !tile.width.is_power_of_two()
+            || !tile.height.is_power_of_two()
+            || tile.width > width
+            || tile.height > height
+            || tile.x >= width
+            || tile.y >= height
+            || !tile.x.is_multiple_of(tile.width)
+            || !tile.y.is_multiple_of(tile.height)
+        {
+            continue;
+        }
+        let slot = index(
+            tile.width.ilog2() as usize,
+            tile.height.ilog2() as usize,
+            tile.x,
+            tile.y,
+        );
+        if tile.cost < plans[slot].cost {
+            plans[slot].cost = tile.cost;
+            plans[slot].tiles[tile.y * 4 + tile.x] = i as u8;
+        }
+    }
+    let join = |a: ReconstructionPlan, b: ReconstructionPlan| {
+        let mut tiles = a.tiles;
+        for (i, &tile) in b.tiles.iter().enumerate() {
+            if tile != NO_CHILD_BLOCK {
+                tiles[i] = tile;
+            }
+        }
+        ReconstructionPlan {
+            cost: a.cost + b.cost,
+            tiles,
+        }
+    };
+    for ly in 0..=height.ilog2() as usize {
+        let h = 1 << ly;
+        for lx in 0..=width.ilog2() as usize {
+            let w = 1 << lx;
+            for y in (0..height).step_by(h) {
+                for x in (0..width).step_by(w) {
+                    let mut best = empty;
+                    if lx > 0 {
+                        best = join(
+                            plans[index(lx - 1, ly, x, y)],
+                            plans[index(lx - 1, ly, x + w / 2, y)],
+                        );
+                    }
+                    if ly > 0 {
+                        let split = join(
+                            plans[index(lx, ly - 1, x, y)],
+                            plans[index(lx, ly - 1, x, y + h / 2)],
+                        );
+                        if split.cost < best.cost {
+                            best = split;
+                        }
+                    }
+                    let slot = index(lx, ly, x, y);
+                    if plans[slot].cost < best.cost {
+                        best = plans[slot];
+                    }
+                    plans[slot] = best;
+                }
+            }
+        }
+    }
+    plans[index(width.ilog2() as usize, height.ilog2() as usize, 0, 0)]
+}
+
+#[cfg(test)]
+fn best_reconstruction_plan_reference(
+    tiles: &[PartitionTile],
+    width: usize,
+    height: usize,
+) -> ReconstructionPlan {
+    let empty = ReconstructionPlan {
+        cost: f32::INFINITY,
+        tiles: [NO_CHILD_BLOCK; 16],
+    };
+    let mut plans = [empty; 9 * 16];
+    let index = |lx: usize, ly: usize, x: usize, y: usize| (ly * 3 + lx) * 16 + y * 4 + x;
     let join = |a: ReconstructionPlan, b: ReconstructionPlan| {
         let mut tiles = a.tiles;
         for (i, &tile) in b.tiles.iter().enumerate() {
@@ -2198,6 +2281,8 @@ fn find_rerank_downgrades(
     // The strong yellow rows use B biases 0.85/0.90. Keep the mild/default
     // rows on seam-only acceptance: the hue relaxation overspends there.
     let hue_repair_enabled = coarse_chromatic && ctx.xyb.fwd[8] >= 0.8;
+    let mut partition_tiles = Vec::new();
+    let mut partition_costs = Vec::new();
     for (bx, by, strat) in ac_strategy.iter_first_blocks() {
         if by < y0 || by >= y1 {
             continue;
@@ -2282,8 +2367,10 @@ fn find_rerank_downgrades(
         // Hue repairs reuse this cache; they do not open zero-seam regions.
         let with_fine_mosaic = with_fine_mosaic && big_boundary > 0.0 && big_peak > 0.0;
         let mut j_dct8 = 0.0f32;
-        let mut partition_tiles = Vec::with_capacity(48);
-        let mut partition_costs = Vec::with_capacity(48);
+        partition_tiles.clear();
+        partition_costs.clear();
+        partition_tiles.reserve(48);
+        partition_costs.reserve(48);
         // Per-child candidate cache: (cost, base cost) plus the reconstructed
         // spatial error planes each candidate leaves behind. The joint search
         // below scores whole assignments from these planes; no candidate is
@@ -3116,6 +3203,66 @@ mod tests {
             ),
             6
         );
+    }
+
+    #[test]
+    fn indexed_reconstruction_planner_preserves_costs_and_ties() {
+        use super::PartitionTile;
+        let special = [
+            0.0,
+            -0.0,
+            1.0,
+            2.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let mut state = 31u32;
+        for (width, height) in [(1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2), (4, 4)] {
+            for round in 0..128 {
+                let mut tiles = Vec::new();
+                for h in [1, 2, 4] {
+                    for w in [1, 2, 4] {
+                        if w > width || h > height {
+                            continue;
+                        }
+                        for y in (0..height).step_by(h) {
+                            for x in (0..width).step_by(w) {
+                                // Duplicate footprints exercise candidate ties,
+                                // missing candidates, and non-finite costs.
+                                for _ in 0..3 {
+                                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                                    if state.is_multiple_of(5) {
+                                        continue;
+                                    }
+                                    let cost = if round < 64 {
+                                        special[state as usize % special.len()]
+                                    } else {
+                                        f32::from_bits(0x3f00_0000 + (state >> 10))
+                                    };
+                                    tiles.push(PartitionTile {
+                                        x,
+                                        y,
+                                        width: w,
+                                        height: h,
+                                        cost,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Input order is not necessarily the planner's region order.
+                for i in (1..tiles.len()).rev() {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    tiles.swap(i, state as usize % (i + 1));
+                }
+                let expected = super::best_reconstruction_plan_reference(&tiles, width, height);
+                let actual = super::best_reconstruction_plan(&tiles, width, height);
+                assert_eq!(actual.cost.to_bits(), expected.cost.to_bits());
+                assert_eq!(actual.tiles, expected.tiles);
+            }
+        }
     }
 
     #[test]

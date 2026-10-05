@@ -249,6 +249,172 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
 
     let mut sse_acc = _mm256_setzero_ps();
     let mut mag_acc = _mm256_setzero_ps();
+    let mut nonzero_acc = _mm256_setzero_si256();
+    let mut scan_acc = _mm256_setzero_si256();
+
+    let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let izero = _mm256_setzero_si256();
+    let all_active_i = _mm256_cmpeq_epi32(izero, izero);
+
+    const RND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
+
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        let thr_lo = thr[yfix];
+        let thr_hi = thr[yfix + 1];
+
+        for (x0, (coeff8, inv8)) in coeffs
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(inv_matrix.as_chunks::<8>().0.iter())
+            .enumerate()
+        {
+            let x = x0 * 8;
+
+            let thr_v = if x + 8 <= half {
+                _mm256_set1_ps(thr_lo)
+            } else if x >= half {
+                _mm256_set1_ps(thr_hi)
+            } else {
+                // Only needed for cases like width=8, half=4.
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                let hi_mask_i = _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(half as i32 - 1));
+                let hi_mask = _mm256_castsi256_ps(hi_mask_i);
+
+                _mm256_blendv_ps(_mm256_set1_ps(thr_lo), _mm256_set1_ps(thr_hi), hi_mask)
+            };
+
+            let cv = unsafe { _mm256_loadu_ps(coeff8.as_ptr()) };
+            let mv = unsafe { _mm256_loadu_ps(inv8.as_ptr()) };
+
+            let a = _mm256_mul_ps(_mm256_mul_ps(mv, qs), cv);
+            let absa = _mm256_andnot_ps(sign, a);
+
+            let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absa, thr_v);
+            let rounded = _mm256_round_ps::<RND>(a);
+            let q = _mm256_and_ps(rounded, keep);
+
+            let d = if BIASED {
+                _mm256_sub_ps(a, avx_dequantized_level_f32(q))
+            } else {
+                _mm256_sub_ps(a, q)
+            };
+            let d2 = _mm256_mul_ps(d, d);
+
+            let active_i = if y < cy && x < cx {
+                let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
+                let cxv = _mm256_set1_epi32(cx as i32);
+
+                // llf = x + lane < cx  <=>  cx > x + lane
+                let llf = _mm256_cmpgt_epi32(cxv, lane_x);
+
+                // active = !llf
+                _mm256_andnot_si256(llf, all_active_i)
+            } else {
+                all_active_i
+            };
+
+            let active = _mm256_castsi256_ps(active_i);
+
+            let d2 = _mm256_and_ps(d2, active);
+            sse_acc = _mm256_add_ps(sse_acc, d2);
+
+            let absq = _mm256_andnot_ps(sign, q);
+            let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, zero);
+            let rate_mask = _mm256_and_ps(nz, active);
+
+            // Comparison masks contain -1 for each nonzero lane.
+            nonzero_acc = _mm256_sub_epi32(nonzero_acc, _mm256_castps_si256(rate_mask));
+
+            if SAVE_LEVELS {
+                let truncated = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(a);
+                let frac = _mm256_sub_ps(a, truncated);
+                let ge_half =
+                    _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_andnot_ps(sign, frac), _mm256_set1_ps(0.5));
+                let signed_one = _mm256_or_ps(_mm256_set1_ps(1.0), _mm256_and_ps(a, sign));
+                let quantized = _mm256_cvttps_epi32(_mm256_add_ps(
+                    truncated,
+                    _mm256_and_ps(signed_one, ge_half),
+                ));
+                let quantized = _mm256_and_si256(
+                    quantized,
+                    _mm256_and_si256(_mm256_castps_si256(keep), active_i),
+                );
+                unsafe {
+                    _mm256_storeu_si256(levels.as_mut_ptr().add(y * width + x).cast(), quantized)
+                };
+            }
+
+            if !SAVE_LEVELS && _mm256_movemask_ps(rate_mask) != 0 {
+                let ratev = avx2_log2p1_f32(absq);
+                mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
+                scan_acc = _mm256_max_epu32(
+                    scan_acc,
+                    _mm256_and_si256(sv, _mm256_castps_si256(rate_mask)),
+                );
+            }
+        }
+    }
+
+    let v_max = _mm_max_epu32(
+        _mm256_castsi256_si128(scan_acc),
+        _mm256_extracti128_si256::<1>(scan_acc),
+    );
+    let max_scan = hmax_u32(v_max);
+
+    let nonzero = _mm_add_epi32(
+        _mm256_castsi256_si128(nonzero_acc),
+        _mm256_extracti128_si256::<1>(nonzero_acc),
+    );
+    let nonzero = _mm_hadd_epi32(nonzero, nonzero);
+    let nonzero = _mm_hadd_epi32(nonzero, nonzero);
+    let nzeros = _mm_cvtsi128_si32(nonzero) as usize;
+
+    (hsum256(sse_acc), nzeros, hsum256(mag_acc), max_scan)
+}
+
+// Original scalar population count, retained as an exact test oracle.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn sse_and_rate_avx2_impl_reference<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
+    let n = width * height;
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
+    debug_assert!(width.is_multiple_of(8));
+
+    let qs = _mm256_set1_ps(q_scaled);
+    let sign = _mm256_set1_ps(-0.0);
+    let zero = _mm256_setzero_ps();
+
+    let mut sse_acc = _mm256_setzero_ps();
+    let mut mag_acc = _mm256_setzero_ps();
     let mut nzeros = 0usize;
     let mut scan_acc = _mm256_setzero_si256();
 
@@ -580,6 +746,42 @@ mod tests {
                 let q2 = f32::from_bits(_mm_extract_ps::<0>(_mm256_castps256_ps128(r)) as u32);
                 assert!((q1 - q2).abs() < 1e-5, "q1 {} q2 {}", q1, q2);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_count_tests {
+    use super::*;
+
+    #[test]
+    fn lane_counts_preserve_original_rate_distortion_and_coding_levels() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        for (original, optimized) in [
+            (
+                sse_and_rate_avx2_impl_reference::<false, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_avx2_impl::<false, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_avx2_impl_reference::<false, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_avx2_impl::<false, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_avx2_impl_reference::<true, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_avx2_impl::<true, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_avx2_impl_reference::<true, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_avx2_impl::<true, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+        ] {
+            crate::inflated_cost::assert_coefficient_kernel_preserves_original(original, optimized);
         }
     }
 }

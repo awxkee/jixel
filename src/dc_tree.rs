@@ -476,6 +476,52 @@ pub(crate) struct LearnedDcTree {
     pub(crate) num_contexts: usize,
 }
 
+/// The static tree's DC cutoffs on the WP-error property (libjxl kWPFixedDC).
+static WP_FIXED_DC_CUTOFFS: [i32; 33] = [
+    -500, -392, -255, -191, -127, -95, -63, -47, -31, -23, -15, -11, -7, -4, -3, -1, 0, 1, 3, 5, 7,
+    11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500,
+];
+
+/// libjxl's fixed WP DC tree as `MakeFixedTree` sizes it: below 2^14 DC
+/// samples a cutoff range is split only while it spans more than
+/// `8 * (14 - ceil(log2(samples)))` cutoffs, so small images do not pay for a
+/// 34-leaf tree their few samples cannot use. `None` at full size, where the
+/// static tree is that same tree.
+pub(crate) fn fixed_wp_dc_tree(num_dc_groups: usize, dc_samples: usize) -> Option<LearnedDcTree> {
+    let log_px = dc_samples.max(1).next_power_of_two().trailing_zeros() as usize;
+    if log_px >= 14 {
+        return None;
+    }
+    let min_gap = 8 * (14 - log_px);
+    fn build(begin: usize, end: usize, min_gap: usize) -> Node {
+        if begin + min_gap >= end {
+            return Node::Leaf {
+                tag: LeafTag::Dc,
+                pred: PRED_WEIGHTED,
+                offset: 0,
+                mul_log: 0,
+                mul_bits: 0,
+            };
+        }
+        let split = (begin + end) / 2;
+        Node::Split {
+            prop: 15,
+            splitval: WP_FIXED_DC_CUTOFFS[split],
+            gt: Box::new(build(split + 1, end, min_gap)),
+            le: Box::new(build(begin, split, min_gap)),
+        }
+    }
+    let dc_root = build(0, WP_FIXED_DC_CUTOFFS.len(), min_gap);
+    let (meta_side, _) = static_sides();
+    let root = Node::Split {
+        prop: 1,
+        splitval: 1 + num_dc_groups as i32,
+        gt: Box::new(meta_side),
+        le: Box::new(dc_root),
+    };
+    Some(learned_from_root(root))
+}
+
 /// Learn a per-image tree from both predictor arms of the DC tokens.
 /// `props[g][i]` describes token `i` of group `g`; the two arms share
 /// property values because both run the same WP state.
@@ -514,6 +560,11 @@ pub(crate) fn learn_dc_tree(
         gt: Box::new(meta_side),
         le: Box::new(dc_root),
     };
+    learned_from_root(root)
+}
+
+/// Serialize a stream-split root and derive the token context lookups.
+fn learned_from_root(root: Node) -> LearnedDcTree {
     let (tokens, leaves, leaf_preds) = serialize(&root);
 
     let (meta_root, dc_root) = match &root {
@@ -983,6 +1034,22 @@ pub(crate) fn apply_leaf_offsets(tokens: &mut [Vec<Token>], offsets: &[i32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_dc_tree_shrinks_with_the_image() {
+        let dc_leaves = |samples: usize| {
+            let tree = fixed_wp_dc_tree(1, samples).unwrap();
+            let mut ctx: Vec<u8> = (0..NUM_ERR_BINS).map(|b| tree.dc_context[b]).collect();
+            ctx.dedup();
+            ctx.len()
+        };
+        // libjxl's MakeFixedTree: one leaf at 64x64, a single split at 2^12.
+        assert_eq!(dc_leaves(8 * 8 * 3), 1);
+        assert_eq!(dc_leaves(1 << 12), 2);
+        assert!(dc_leaves(1 << 13) > 2);
+        // Full size is the static tree, which needs no rebuilding.
+        assert!(fixed_wp_dc_tree(1, 1 << 14).is_none());
+    }
     use crate::static_entropy_codes::K_GRADIENT_CONTEXT_LUT;
 
     #[test]

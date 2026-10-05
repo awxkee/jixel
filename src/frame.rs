@@ -1414,10 +1414,14 @@ fn encode_frame_vardct(
     } else {
         [0.0; 3]
     };
-    let (x_steps, b_steps) = if slow_chromatic {
-        pixel_chromacity_steps(&xyb)
-    } else {
-        (0, 0)
+    let (x_steps, b_steps) = match ctx.speed {
+        _ if is_achromatic => (0, 0),
+        crate::Speed::Slow => pixel_chromacity_steps(&xyb),
+        // Without Slow's color machinery the B steps only cost rate.
+        crate::Speed::Fast if distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
+            (pixel_chromacity_steps(&xyb).0, 0)
+        }
+        _ => (0, 0),
     };
     if distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
         ctx.raise_x_qm_scale_floor(2 + x_steps);
@@ -2318,15 +2322,22 @@ const X_HEAVY_B_QM_SCALE: u32 = 7;
 /// Below this the X scale is 2 and the extra precision only costs rate.
 const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
 
+/// A pixel-step level counts once this many pixels pass it; libjxl takes the
+/// single worst pixel, which lets one stray edge refine chroma frame-wide.
+const PIXEL_CHROMACITY_MIN_PIXELS: u32 = 4;
+
 /// libjxl's `PixelStatsForChromacityAdjustment`: extra X and B quant-scale
-/// steps from the worst pixel-to-pixel step of X and of B - Y, plus one B step
-/// for strongly exposed blue. Thresholds are libjxl's.
+/// steps from the pixel-to-pixel steps of X and of B - Y, plus one B step for
+/// strongly exposed blue. Thresholds are libjxl's; the step levels need
+/// `PIXEL_CHROMACITY_MIN_PIXELS` pixels, exposed blue a single one.
 fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
+    const X_LEVELS: [f32; 3] = [0.015, 0.022, 0.026];
+    const B_LEVELS: [f32; 3] = [0.28, 0.33, 0.38];
     let (w, h) = (xyb.xsize(), xyb.ysize());
     if w < 2 || h < 2 {
         return (0, 0);
     }
-    let (mut dx, mut db, mut exposed_blue) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut x_counts, mut b_counts, mut exposed_blue) = ([0u32; 3], [0u32; 3], 0u32);
     let rows = xyb
         .plane_data(0)
         .chunks_exact(w)
@@ -2342,37 +2353,40 @@ fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
         let previous = xp.iter().zip(yp).zip(bp).skip(1);
         for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
             let step_x = (x - left_x).abs().max((x - px).abs());
-            dx = dx.max(step_x);
             let diff_b = b - y;
             let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
-            db = db.max(step_b);
-            let exposed = b - y * 1.2;
+            for (count, level) in x_counts.iter_mut().zip(X_LEVELS) {
+                *count += u32::from(step_x >= level);
+            }
+            for (count, level) in b_counts.iter_mut().zip(B_LEVELS) {
+                *count += u32::from(step_b > level);
+            }
+            // The gradient factor is nonnegative, so negative exposure never passes.
             let step = (b - left_b).abs() + (b - pb).abs();
-            // A negative exposure cannot raise this nonnegative maximum;
-            // max also ignores NaNs, as the original conditional did.
-            exposed_blue = exposed_blue.max(exposed * step);
+            exposed_blue += u32::from((b - y * 1.2) * step >= 0.13);
             left_x = x;
             left_b = b;
             left_diff = diff_b;
         }
-        if dx >= 0.026 && db > 0.38 && exposed_blue >= 0.13 {
+        if x_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
+            && b_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
+            && exposed_blue > 0
+        {
             return (3, 3);
         }
     }
-    let x_steps = match dx {
-        v if v >= 0.026 => 3,
-        v if v >= 0.022 => 2,
-        v if v >= 0.015 => 1,
-        _ => 0,
+    // Counts shrink level by level, so the passed levels are a prefix.
+    let level = |counts: [u32; 3]| {
+        counts
+            .iter()
+            .filter(|&&n| n >= PIXEL_CHROMACITY_MIN_PIXELS)
+            .count() as u32
     };
-    let blue = u32::from(exposed_blue >= 0.13);
-    let b_steps = match db {
-        v if v > 0.38 => 2 + blue,
-        v if v > 0.33 => 1 + blue,
-        v if v > 0.28 => blue,
-        _ => 0,
+    let b_steps = match level(b_counts) {
+        0 => 0,
+        l => l - 1 + u32::from(exposed_blue > 0),
     };
-    (x_steps, b_steps)
+    (level(x_counts), b_steps)
 }
 
 /// Source-domain companion to the saturation detector. Sparse luminance
@@ -3957,17 +3971,25 @@ fn process_ac_group(
         let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
         let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
 
-        let stripe = scratch.ac_stripe.as_mut();
-        build_stripe(
-            stripe,
-            opsin,
-            stripe_x0,
-            stripe_y0,
-            stripe_xsize,
-            stripe_ysize,
-            stripe_xsize_padded,
-            stripe_ysize_padded,
-        );
+        // Whole blocks can be transformed directly from the source image.
+        // Only edge stripes need a copy to replicate their partial blocks.
+        let (stripe, opsin_origin) =
+            if stripe_xsize == stripe_xsize_padded && stripe_ysize == stripe_ysize_padded {
+                (opsin, (stripe_x0, stripe_y0))
+            } else {
+                let stripe = scratch.ac_stripe.as_mut();
+                build_stripe(
+                    stripe,
+                    opsin,
+                    stripe_x0,
+                    stripe_y0,
+                    stripe_xsize,
+                    stripe_ysize,
+                    stripe_xsize_padded,
+                    stripe_ysize_padded,
+                );
+                (&*stripe, (0, 0))
+            };
 
         let stripe_brect = Rect::new(
             qorigin_x,
@@ -3980,6 +4002,7 @@ fn process_ac_group(
             ctx,
             &mut scratch.ac_group,
             stripe,
+            opsin_origin,
             stripe_brect,
             distp.scale,
             distp.scale_dc,
@@ -4047,6 +4070,125 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ac_group_source_views_match_copied_stripes() {
+        use crate::coeff_order::CoeffOrders;
+        use crate::dc_group_data::{DcGroupData, NUM_STRATEGIES};
+        use crate::encoding_context::EncodingContext;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+        use crate::group::{AcGroupScratch, SourceDc};
+        use crate::image::{Image3B, Image3F, Image3S, Plane, Rect};
+
+        let distance = 2.0;
+        let ctx =
+            EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+        let distp = super::compute_distance_params(distance);
+        let mut image = Image3F::new(131, 137);
+        for c in 0..3 {
+            for (i, value) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *value = ((i * 7919 + c * 97) % 104729) as f32 / 104729.0;
+            }
+        }
+        let tokens: Vec<_> = (0..4096)
+            .map(|i| Token::new(i % 2, if i % 3 == 0 { 0 } else { i % 17 }))
+            .collect();
+        let mut code = build_entropy_code_no_cluster(&tokens, 2, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = CoeffOrders::natural();
+        let mut dc = DcGroupData::new(16, 16).unwrap();
+        for (i, q) in dc.raw_quant_field.as_mut_slice().iter_mut().enumerate() {
+            *q = 3 + (i % 17) as u8;
+        }
+        dc.ytox_map.as_mut_slice().fill(7);
+        dc.ytob_map.as_mut_slice().fill(-13);
+        let mut stripe = Image3F::new(64, 64);
+        let mut gathered_scratch = AcGroupScratch::default();
+        let mut view_scratch = AcGroupScratch::default();
+        for strategy in 0..NUM_STRATEGIES as u8 {
+            dc.ac_strategy.reset();
+            dc.ac_strategy.set_first(8, 8, strategy);
+            for origin in [(0, 0), (59, 61)] {
+                super::build_stripe(&mut stripe, &image, origin.0, origin.1, 64, 64, 64, 64);
+                for (shifts, rdoq) in [
+                    (&[0u32][..], None),
+                    (&[0u32][..], Some(&prices)),
+                    (&[2u32, 0][..], None),
+                ] {
+                    let run = |input: &Image3F, origin, scratch: &mut AcGroupScratch| {
+                        let mut quant_dc = Image3S::new(8, 8);
+                        let mut source_dc = SourceDc {
+                            y: Plane::new(8, 8),
+                            b: Plane::new(8, 8),
+                        };
+                        let mut nzeros: Vec<_> =
+                            shifts.iter().map(|_| Image3B::new(32, 32)).collect();
+                        let mut tokens: Vec<_> = shifts.iter().map(|_| Vec::new()).collect();
+                        let distortion = super::write_ac_group(
+                            &ctx,
+                            scratch,
+                            input,
+                            origin,
+                            Rect::new(8, 8, 8, 8),
+                            distp.scale,
+                            distp.scale_dc,
+                            distp.dc_step,
+                            distance,
+                            distp.x_qm_scale,
+                            &dc,
+                            11,
+                            &mut quant_dc,
+                            Some(&mut source_dc),
+                            8,
+                            8,
+                            &mut nzeros,
+                            shifts,
+                            rdoq,
+                            &orders,
+                            None,
+                            true,
+                            10,
+                            &mut tokens,
+                        );
+                        (distortion, quant_dc, source_dc, nzeros, tokens)
+                    };
+                    let (expected_dist, expected_dc, expected_source, expected_nz, expected) =
+                        run(&stripe, (0, 0), &mut gathered_scratch);
+                    let (actual_dist, actual_dc, actual_source, actual_nz, actual) =
+                        run(&image, origin, &mut view_scratch);
+                    assert_eq!(actual_dist.to_bits(), expected_dist.to_bits());
+                    for c in 0..3 {
+                        assert_eq!(actual_dc.plane_data(c), expected_dc.plane_data(c));
+                        for (a, e) in actual_nz.iter().zip(&expected_nz) {
+                            assert_eq!(a.plane_data(c), e.plane_data(c));
+                        }
+                    }
+                    for (a, e) in [
+                        (&actual_source.y, &expected_source.y),
+                        (&actual_source.b, &expected_source.b),
+                    ] {
+                        assert!(
+                            a.as_slice()
+                                .iter()
+                                .zip(e.as_slice())
+                                .all(|(a, e)| a.to_bits() == e.to_bits())
+                        );
+                    }
+                    for (a, e) in actual.iter().zip(&expected) {
+                        assert_eq!(a.len(), e.len());
+                        assert!(
+                            a.iter()
+                                .zip(e)
+                                .all(|(a, e)| a.context == e.context && a.value == e.value)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn residual_rate_sample_preserves_pixels_and_alpha_at_odd_edges() {
         use crate::encode_image::AlphaPlane;
