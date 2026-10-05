@@ -37,8 +37,8 @@ mod parse;
 pub(crate) use parse::{JpegError, parse_jpeg};
 use std::num::NonZeroUsize;
 
-use crate::Speed;
 use crate::util::EncodeError;
+use crate::{Orientation, Speed};
 pub use brotli::BrotliCompression;
 
 /// Appends an ISOBMFF box with the given type and payload.
@@ -143,6 +143,56 @@ fn icc_is_well_formed(icc: &[u8]) -> bool {
     })
 }
 
+/// Finds the first Exif APP1 segment: its index in `app_data` and the TIFF
+/// data that follows the `Exif\0\0` tag.
+fn extract_exif(jpg: &JpegData) -> Option<(usize, &[u8])> {
+    const TAG: &[u8] = b"Exif\0\0";
+    jpg.app_data.iter().enumerate().find_map(|(index, app)| {
+        if app.first() != Some(&0xE1) || app.len() <= 3 + TAG.len() {
+            return None;
+        }
+        let payload = &app[3..];
+        payload
+            .starts_with(TAG)
+            .then(|| (index, &payload[TAG.len()..]))
+    })
+}
+
+/// The orientation tag (0x0112) of a TIFF block's first directory.
+fn exif_orientation(tiff: &[u8]) -> Option<Orientation> {
+    let big_endian = match tiff.get(..4)? {
+        [b'M', b'M', 0, 42] => true,
+        [b'I', b'I', 42, 0] => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| -> Option<u16> {
+        let b: [u8; 2] = tiff.get(at..at + 2)?.try_into().ok()?;
+        Some(if big_endian {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        })
+    };
+    let u32_at = |at: usize| -> Option<u32> {
+        let b: [u8; 4] = tiff.get(at..at + 4)?.try_into().ok()?;
+        Some(if big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    };
+    let ifd = u32_at(4)? as usize;
+    let entries = usize::from(u16_at(ifd)?);
+    (0..entries).find_map(|i| {
+        let entry = ifd + 2 + 12 * i;
+        // A single SHORT, stored in the first half of the value field.
+        if u16_at(entry)? != 0x0112 || u16_at(entry + 2)? != 3 || u32_at(entry + 4)? != 1 {
+            return None;
+        }
+        Orientation::from_exif(u8::try_from(u16_at(entry + 8)?).ok()?)
+    })
+}
+
 /// Extracts the first standard XMP APP1 segment.
 ///
 /// Returns both its index in `app_data` (for JPEG reconstruction tagging) and
@@ -170,10 +220,11 @@ pub struct JpegTranscodeConfig {
     ///
     /// See [`Self::with_num_threads`].
     pub num_threads: usize,
-    /// Optional Brotli implementation for JPEG reconstruction data.
+    /// Optional Brotli implementation for JPEG reconstruction data and the
+    /// Exif and XMP boxes.
     ///
-    /// When absent, Jixel emits a conforming stored-block (uncompressed)
-    /// Brotli stream and does not require a Brotli dependency.
+    /// When absent, Jixel uses its own small Brotli encoder, so no Brotli
+    /// dependency is needed; a stronger one can be supplied here.
     pub brotli_compression: Option<Box<dyn BrotliCompression>>,
     /// Entropy-coding effort. The coefficients, and so the decoded pixels and
     /// the reconstructed JPEG, are the same at every speed. Defaults to
@@ -227,7 +278,8 @@ impl JpegTranscodeConfig {
         self
     }
 
-    /// Uses a caller-provided Brotli encoder for JPEG reconstruction data.
+    /// Uses a caller-provided Brotli encoder for JPEG reconstruction data and
+    /// metadata boxes.
     pub fn with_brotli_compression(mut self, compressor: Box<dyn BrotliCompression>) -> Self {
         self.brotli_compression = Some(compressor);
         self
@@ -252,27 +304,38 @@ pub fn encode_jpeg_lossless_with_config(
     // image reads as sRGB and its APP2 bytes still travel in `jbrd`.
     let icc = extract_icc(&parsed).filter(|icc| icc_is_well_formed(&icc.profile));
     let xmp = extract_xmp(&parsed);
+    let exif = extract_exif(&parsed);
+    // Viewers follow the codestream's orientation, not the Exif tag.
+    let orientation = exif
+        .and_then(|(_, tiff)| exif_orientation(tiff))
+        .unwrap_or_default();
     let codestream = encode::encode_jpeg_codestream(
         &parsed,
         icc.as_ref().map(|icc| icc.profile.as_slice()),
+        orientation,
         config.speed,
         config.num_threads,
     )?;
 
-    if !config.jpeg_reconstruction {
-        // Dropping reconstruction also drops container-only JPEG metadata.
+    let reconstruction = if config.jpeg_reconstruction {
+        Some(jbrd::encode_jbrd(
+            &parsed,
+            xmp.as_ref().map(|(index, _)| *index),
+            exif.map(|(index, _)| index),
+            icc.as_ref()
+                .and_then(|icc| icc.in_order_apps.as_deref())
+                .unwrap_or_default(),
+            config.brotli_compression.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    if reconstruction.is_none() && exif.is_none() && xmp.is_none() {
+        // Nothing needs a container.
         return Ok(codestream);
     }
 
-    let reconstruction = jbrd::encode_jbrd(
-        &parsed,
-        xmp.as_ref().map(|(index, _)| *index),
-        icc.as_ref()
-            .and_then(|icc| icc.in_order_apps.as_deref())
-            .unwrap_or_default(),
-        config.brotli_compression.as_deref(),
-    )?;
-    let mut out = Vec::with_capacity(codestream.len() + reconstruction.len() + 64);
+    let mut out = Vec::with_capacity(codestream.len() + 4096);
     out.extend_from_slice(&[
         0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
     ]);
@@ -282,12 +345,42 @@ pub fn encode_jpeg_lossless_with_config(
         &[b'j', b'x', b'l', b' ', 0, 0, 0, 0, b'j', b'x', b'l', b' '],
     );
     // The reconstruction data has to precede the codestream box.
-    push_box(&mut out, b"jbrd", &reconstruction);
+    if let Some(reconstruction) = &reconstruction {
+        push_box(&mut out, b"jbrd", reconstruction);
+    }
+    let compressor = config.brotli_compression.as_deref();
+    if let Some((_, tiff)) = exif {
+        // A zero offset to the TIFF header, then the TIFF data itself.
+        let mut payload = Vec::with_capacity(4 + tiff.len());
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(tiff);
+        push_metadata_box(&mut out, b"Exif", &payload, compressor)?;
+    }
     push_box(&mut out, b"jxlc", &codestream);
     if let Some((_, xmp)) = xmp {
-        push_box(&mut out, b"xml ", &xmp);
+        push_metadata_box(&mut out, b"xml ", &xmp, compressor)?;
     }
     Ok(out)
+}
+
+/// Appends a metadata box, as a Brotli-compressed `brob` box when that is
+/// smaller.
+fn push_metadata_box(
+    out: &mut Vec<u8>,
+    kind: &[u8; 4],
+    payload: &[u8],
+    compressor: Option<&dyn BrotliCompression>,
+) -> Result<(), EncodeError> {
+    let compressed = brotli::compress(payload, compressor)?;
+    if compressed.len() + 4 < payload.len() {
+        let mut brob = Vec::with_capacity(4 + compressed.len());
+        brob.extend_from_slice(kind);
+        brob.extend_from_slice(&compressed);
+        push_box(out, b"brob", &brob);
+    } else {
+        push_box(out, kind, payload);
+    }
+    Ok(())
 }
 
 /// Number of coefficients in one DCT block.
@@ -564,6 +657,73 @@ mod tests {
         let mut bad_count = good;
         bad_count[128..132].copy_from_slice(&1000u32.to_be_bytes());
         assert!(!icc_is_well_formed(&bad_count));
+    }
+
+    /// A TIFF block whose first directory holds `entries` as (tag, type,
+    /// count, value) with SHORT values left-aligned in the value field.
+    fn tiff(big_endian: bool, entries: &[(u16, u16, u32, u16)]) -> Vec<u8> {
+        let u16b = |v: u16| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let mut t = if big_endian {
+            b"MM\0*".to_vec()
+        } else {
+            b"II*\0".to_vec()
+        };
+        t.extend_from_slice(&u32b(8));
+        t.extend_from_slice(&u16b(entries.len() as u16));
+        for &(tag, kind, count, value) in entries {
+            t.extend_from_slice(&u16b(tag));
+            t.extend_from_slice(&u16b(kind));
+            t.extend_from_slice(&u32b(count));
+            t.extend_from_slice(&u16b(value));
+            t.extend_from_slice(&[0, 0]);
+        }
+        t.extend_from_slice(&u32b(0));
+        t
+    }
+
+    #[test]
+    fn reads_the_exif_orientation_in_either_byte_order() {
+        for big_endian in [true, false] {
+            let t = tiff(big_endian, &[(0x010F, 2, 4, 0), (0x0112, 3, 1, 8)]);
+            assert_eq!(exif_orientation(&t), Orientation::from_exif(8));
+        }
+        // No tag, a wrong type, an out-of-range value or junk: no orientation.
+        assert_eq!(exif_orientation(&tiff(true, &[(0x010F, 2, 4, 0)])), None);
+        assert_eq!(exif_orientation(&tiff(true, &[(0x0112, 4, 1, 6)])), None);
+        assert_eq!(exif_orientation(&tiff(false, &[(0x0112, 3, 1, 9)])), None);
+        assert_eq!(exif_orientation(b"MM\0*\0\0\0\x40"), None);
+        assert_eq!(exif_orientation(b"nonsense"), None);
+    }
+
+    #[test]
+    fn finds_the_first_exif_segment() {
+        let mut exif = vec![0xE1u8, 0, 0];
+        exif.extend_from_slice(b"Exif\0\0");
+        exif.extend_from_slice(&tiff(true, &[(0x0112, 3, 1, 6)]));
+        let jpg = with_app(vec![xmp_app1(b"<x/>"), exif.clone(), exif.clone()]);
+        let (index, data) = extract_exif(&jpg).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(exif_orientation(data), Orientation::from_exif(6));
+        // A bare tag with no TIFF data is not Exif.
+        assert_eq!(
+            extract_exif(&with_app(vec![vec![
+                0xE1, 0, 8, b'E', b'x', b'i', b'f', 0, 0
+            ]])),
+            None
+        );
     }
 
     #[test]

@@ -30,7 +30,6 @@
 //! Builds a JXL VarDCT frame directly from JPEG DCT coefficients.
 
 use super::{DCT_BLOCK_SIZE, JpegData, JpegError, coeff_order};
-use crate::Speed;
 use crate::ac_context::{
     K_NON_ZERO_BUCKETS, K_NUM_ORDERS, K_ZERO_DENSITY_CONTEXT_COUNT, non_zero_bucket,
     zero_density_context_8x8,
@@ -50,6 +49,7 @@ use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
 use crate::thread_pool::ThreadPool;
 use crate::util::EncodeError;
+use crate::{Orientation, Speed};
 
 const BLOCK_DIM: usize = 8;
 const GROUP_DIM: usize = 256;
@@ -138,6 +138,18 @@ impl ChannelLayout {
     }
 }
 
+/// The frame header's per-channel subsampling mode for JPEG sampling factors
+/// `(h, v)`; the decoder reconstructs the factors from it.
+fn sampling_mode(h: usize, v: usize) -> Option<u64> {
+    match (h, v) {
+        (1, 1) => Some(0),
+        (2, 2) => Some(1),
+        (2, 1) => Some(2),
+        (1, 2) => Some(3),
+        _ => None,
+    }
+}
+
 /// Works out the channel layout, rejecting anything JXL cannot express: only
 /// chroma at full resolution or halved in either axis has a representation.
 fn check_supported(jpg: &JpegData) -> Result<ChannelLayout, JpegError> {
@@ -146,23 +158,15 @@ fn check_supported(jpg: &JpegData) -> Result<ChannelLayout, JpegError> {
         // shape the MCU grid, and the decoder rebuilds them from the modes:
         // every channel carries the same one, so no shift is effective.
         let comp = &jpg.components[0];
-        let (mode, max_hshift, max_vshift) = match (comp.h_samp_factor, comp.v_samp_factor) {
-            (1, 1) => (0, 0, 0),
-            (2, 2) => (1, 1, 1),
-            (2, 1) => (2, 1, 0),
-            (1, 2) => (3, 0, 1),
-            _ => {
-                return Err(JpegError::UnsupportedMode(
-                    "sampling factors above 2 are not representable",
-                ));
-            }
-        };
+        let mode = sampling_mode(comp.h_samp_factor, comp.v_samp_factor).ok_or(
+            JpegError::UnsupportedMode("sampling factors above 2 are not representable"),
+        )?;
         return Ok(ChannelLayout {
             hshift: [0; 3],
             vshift: [0; 3],
             mode: [mode; 3],
-            max_hshift,
-            max_vshift,
+            max_hshift: comp.h_samp_factor.trailing_zeros() as usize,
+            max_vshift: comp.v_samp_factor.trailing_zeros() as usize,
             gray: true,
             jpeg_order: JPEG_ORDER_GRAY,
             ycbcr: true,
@@ -205,52 +209,34 @@ fn check_supported(jpg: &JpegData) -> Result<ChannelLayout, JpegError> {
         ));
     }
 
+    // Each channel signals its own JPEG sampling factors; the decoder derives
+    // the effective shifts from them and rebuilds the factors for the JPEG.
     let mut hshift = [0usize; 3];
     let mut vshift = [0usize; 3];
+    let mut mode = [0u64; 3];
     for c in 0..3usize {
         let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
-        if !max_h.is_multiple_of(comp.h_samp_factor) || !max_v.is_multiple_of(comp.v_samp_factor) {
-            return Err(JpegError::UnsupportedMode(
-                "sampling factors are not a power-of-two ratio",
-            ));
-        }
+        mode[c] = sampling_mode(comp.h_samp_factor, comp.v_samp_factor).ok_or(
+            JpegError::UnsupportedMode("sampling factors above 2 are not representable"),
+        )?;
         hshift[c] = (max_h / comp.h_samp_factor).trailing_zeros() as usize;
         vshift[c] = (max_v / comp.v_samp_factor).trailing_zeros() as usize;
-        if (max_h / comp.h_samp_factor).count_ones() != 1
-            || (max_v / comp.v_samp_factor).count_ones() != 1
-        {
-            return Err(JpegError::UnsupportedMode(
-                "sampling factors are not a power-of-two ratio",
-            ));
-        }
     }
-    // Luma must be full resolution and both chroma channels must agree.
-    if hshift[1] != 0 || vshift[1] != 0 || hshift[0] != hshift[2] || vshift[0] != vshift[2] {
+    // Luma must be full resolution.
+    if hshift[1] != 0 || vshift[1] != 0 {
         return Err(JpegError::UnsupportedMode(
-            "only standard chroma subsampling layouts are supported",
+            "chroma at a higher resolution than luma is not supported",
         ));
     }
-
-    // The mode lives on the luma channel; the decoder derives each shift as
-    // `max_shift - table[mode]`.
-    let max_hshift = hshift[0];
-    let max_vshift = vshift[0];
-    let luma_mode = match (max_hshift, max_vshift) {
-        (0, 0) => 0, // 4:4:4
-        (1, 1) => 1, // 4:2:0
-        (1, 0) => 2, // 4:2:2
-        (0, 1) => 3, // 4:4:0
-        _ => {
-            return Err(JpegError::UnsupportedMode(
-                "unsupported chroma subsampling layout",
-            ));
-        }
-    };
+    // The block grid follows the MCU, so it is rounded by the largest factor
+    // even when every channel shares it.
+    let max_hshift = max_h.trailing_zeros() as usize;
+    let max_vshift = max_v.trailing_zeros() as usize;
 
     Ok(ChannelLayout {
         hshift,
         vshift,
-        mode: [0, luma_mode, 0],
+        mode,
         max_hshift,
         max_vshift,
         gray: false,
@@ -373,10 +359,19 @@ fn write_image_metadata(
     w: &mut BitWriter,
     icc: Option<&[u8]>,
     gray: bool,
+    orientation: Orientation,
     scratch: &mut CoderScratch,
 ) {
     w.write(1, 0); // not all-default
-    w.write(1, 0); // no extra fields (orientation, preview, animation)
+    // extra_fields carries the orientation (and preview/animation, never set).
+    let extra_fields = orientation != Orientation::Normal;
+    w.write(1, u64::from(extra_fields));
+    if extra_fields {
+        w.write(3, orientation.to_u3());
+        w.write(1, 0); // have_intrinsic_size
+        w.write(1, 0); // have_preview
+        w.write(1, 0); // have_animation
+    }
     w.write(1, 0); // floating_point_sample = false
     w.write(2, 0); // bits_per_sample = 8
     w.write(1, 1); // modular_16bit_buffer_sufficient
@@ -398,6 +393,9 @@ fn write_image_metadata(
             w,
         ),
         None => w.write(1, 1), // color encoding: all default (sRGB)
+    }
+    if extra_fields {
+        w.write(1, 1); // tone mapping: all default
     }
     w.write(2, 0); // no extensions
     w.write(1, 1); // CustomTransformData: all default
@@ -902,6 +900,7 @@ impl Effort {
 pub(crate) fn encode_jpeg_codestream(
     jpg: &JpegData,
     icc: Option<&[u8]>,
+    orientation: Orientation,
     speed: Speed,
     num_threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -909,12 +908,14 @@ pub(crate) fn encode_jpeg_codestream(
     let dim = Dim::new(jpg.width, jpg.height, &ss);
     let pool = ThreadPool::new(num_threads);
     let mut scratch = Box::<CoderScratch>::default();
-    encode_jpeg_codestream_with_pool(jpg, icc, &ss, &dim, speed, &pool, &mut scratch)
+    encode_jpeg_codestream_with_pool(jpg, icc, orientation, &ss, &dim, speed, &pool, &mut scratch)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_jpeg_codestream_with_pool(
     jpg: &JpegData,
     icc: Option<&[u8]>,
+    orientation: Orientation,
     ss: &ChannelLayout,
     dim: &Dim,
     speed: Speed,
@@ -987,46 +988,103 @@ fn encode_jpeg_codestream_with_pool(
     });
     let dc_datas: Vec<DcGroupData> = dc_datas.into_iter().collect::<Result<_, _>>()?;
 
-    // Tokens
-    let (dc_tokens, meta_tokens): (Vec<Vec<Token>>, Vec<Vec<Token>>) = pool
-        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
-            (
-                collect_dc_tokens(
-                    &dc_datas[i],
-                    &crate::frame::DC_PREDICTOR_WEIGHTED,
-                    &mut Vec::new(),
-                    false,
-                ),
-                // epf_iters = 0 here, so the sharpness id is decoder-ignored;
-                // any distance >= 5 keeps the stream at the historical constant 4.
-                collect_ac_metadata_tokens(&dc_datas[i], &mut Vec::new(), 100.0, false),
-            )
+    // Small images get libjxl's pruned fixed tree; its contexts are looked up
+    // from each token's properties instead of the static tree's numbering.
+    let dc_samples: usize = dc_datas
+        .iter()
+        .map(|d| {
+            (0..3)
+                .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
+                .sum::<usize>()
         })
-        .into_iter()
-        .unzip();
+        .sum();
+    let small_tree = crate::dc_tree::fixed_wp_dc_tree(dim.num_dc_groups, dc_samples);
 
-    let dc_code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
-        dc_tokens
-            .iter()
-            .chain(meta_tokens.iter())
-            .map(Vec::as_slice),
-        K_NUM_DC_CONTEXTS,
-        &mut scratch.huffman_pool,
-        effort.select_configs,
-        Some(pool),
-    );
-    let mut dc_code = dc_code;
-    if let Some(refinement) = effort.refinement {
-        crate::entropy::refine_ans_clusters(
-            &mut dc_code,
-            dc_tokens
-                .iter()
-                .chain(meta_tokens.iter())
-                .map(Vec::as_slice),
-            refinement,
-            pool,
-            scratch,
+    // Tokens, contexts per the static tree (props kept for the pruned one).
+    let collected = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
+        let collect_props = small_tree.is_some();
+        let (mut props, mut meta_props) = (Vec::new(), Vec::new());
+        let dc = collect_dc_tokens(
+            &dc_datas[i],
+            &crate::frame::DC_PREDICTOR_WEIGHTED,
+            &mut props,
+            collect_props,
         );
+        // epf_iters = 0 here, so the sharpness id is decoder-ignored;
+        // any distance >= 5 keeps the stream at the historical constant 4.
+        let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, 100.0, collect_props);
+        (dc, meta, props, meta_props)
+    });
+
+    let build_code = |dc: &[Vec<Token>],
+                      meta: &[Vec<Token>],
+                      num_contexts: usize,
+                      scratch: &mut CoderScratch| {
+        let streams = || dc.iter().chain(meta).map(Vec::as_slice);
+        let mut code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
+            streams(),
+            num_contexts,
+            &mut scratch.huffman_pool,
+            effort.select_configs,
+            Some(pool),
+        );
+        if let Some(refinement) = effort.refinement {
+            crate::entropy::refine_ans_clusters(&mut code, streams(), refinement, pool, scratch);
+        }
+        let mut header = BitWriter::new();
+        write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
+        let bits =
+            header.bits_written() as u64 + crate::entropy::estimate_ac_plain_bits(streams(), &code);
+        (code, bits)
+    };
+
+    let mut dc_tokens = Vec::with_capacity(collected.len());
+    let mut meta_tokens = Vec::with_capacity(collected.len());
+    let mut props = Vec::with_capacity(collected.len());
+    for (dc, meta, dc_props, meta_props) in collected {
+        dc_tokens.push(dc);
+        meta_tokens.push(meta);
+        props.push((dc_props, meta_props));
+    }
+    let (mut dc_code, static_bits) =
+        build_code(&dc_tokens, &meta_tokens, K_NUM_DC_CONTEXTS, scratch);
+
+    // The pruned tree replaces the static one only where it is cheaper in
+    // full: tree, histograms and payload.
+    let mut pruned_tree = None;
+    if let Some(tree) = small_tree {
+        let mut dc_small = dc_tokens.clone();
+        let mut meta_small = meta_tokens.clone();
+        for ((dc, meta), (dc_props, meta_props)) in
+            dc_small.iter_mut().zip(meta_small.iter_mut()).zip(&props)
+        {
+            for (t, &p) in dc.iter_mut().zip(dc_props) {
+                t.context = u32::from(tree.dc_context[p as usize]);
+            }
+            for (t, &p) in meta.iter_mut().zip(meta_props) {
+                let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                t.context = u32::from(tree.meta_context[slot]);
+            }
+        }
+        let (code_small, small_bits) =
+            build_code(&dc_small, &meta_small, tree.num_contexts, scratch);
+        let mut static_header = BitWriter::new();
+        write_context_tree(
+            dim.num_dc_groups,
+            &crate::frame::DC_PREDICTOR_WEIGHTED,
+            &mut scratch.huffman_pool,
+            &mut static_header,
+        );
+        let mut small_header = BitWriter::new();
+        crate::frame::write_tree_tokens(&tree.tokens, &mut scratch.huffman_pool, &mut small_header);
+        if small_bits + (small_header.bits_written() as u64)
+            < static_bits + (static_header.bits_written() as u64)
+        {
+            dc_tokens = dc_small;
+            meta_tokens = meta_small;
+            dc_code = code_small;
+            pruned_tree = Some(tree);
+        }
     }
     let dc_code_ref = dc_code.as_ref();
 
@@ -1073,7 +1131,7 @@ fn encode_jpeg_codestream_with_pool(
         let candidate = plan(&custom_scan, Some(perm_tokens), scratch);
         if effort.try_natural_order {
             let natural = plan(&natural_scan, None, scratch);
-            if candidate.bits < natural.bits {
+            if candidate.estimated_bits() < natural.estimated_bits() {
                 candidate
             } else {
                 natural
@@ -1094,12 +1152,17 @@ fn encode_jpeg_codestream_with_pool(
         write_quant_scales(65536, 1, w);
         bctx.write(scratch, w);
         write_color_correlation(w);
-        write_context_tree(
-            dim.num_dc_groups,
-            &crate::frame::DC_PREDICTOR_WEIGHTED,
-            &mut scratch.huffman_pool,
-            w,
-        );
+        match &pruned_tree {
+            Some(tree) => {
+                crate::frame::write_tree_tokens(&tree.tokens, &mut scratch.huffman_pool, w)
+            }
+            None => write_context_tree(
+                dim.num_dc_groups,
+                &crate::frame::DC_PREDICTOR_WEIGHTED,
+                &mut scratch.huffman_pool,
+                w,
+            ),
+        }
         w.write(1, 0); // no lz77 for the DC histograms
         write_entropy_code(&dc_code_ref, &mut scratch.huffman_pool, w);
     }
@@ -1142,7 +1205,7 @@ fn encode_jpeg_codestream_with_pool(
     out.write(8, 0xFF);
     out.write(8, 0x0A);
     write_size_header(&mut out, dim.xsize, dim.ysize);
-    write_image_metadata(&mut out, icc, ss.gray, scratch);
+    write_image_metadata(&mut out, icc, ss.gray, orientation, scratch);
     write_frame_header(&mut out, ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
@@ -1171,11 +1234,18 @@ struct AcPlan {
     global: BitWriter,
     tokens: Vec<Vec<Token>>,
     code: crate::entropy::OwnedEntropyCode,
-    /// Global section plus estimated payload, for choosing between orderings.
-    bits: u64,
 }
 
 impl AcPlan {
+    /// Global section plus estimated payload, for choosing between orderings.
+    fn estimated_bits(&self) -> u64 {
+        self.global.bits_written() as u64
+            + crate::entropy::estimate_ac_plain_bits(
+                self.tokens.iter().map(Vec::as_slice),
+                &self.code,
+            )
+    }
+
     fn write_groups(&self, pool: &ThreadPool, scratch: &mut CoderScratch) -> Vec<BitWriter> {
         let code = self.code.as_ref();
         pool.steal_map(scratch, self.tokens.len(), |g, _scratch| {
@@ -1261,13 +1331,10 @@ fn plan_ac(
         write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
     }
 
-    let bits = global.bits_written() as u64
-        + crate::entropy::estimate_ac_plain_bits(tokens.iter().map(Vec::as_slice), &code);
     AcPlan {
         global,
         tokens,
         code,
-        bits,
     }
 }
 
@@ -1517,6 +1584,23 @@ mod tests {
         // A later APP14 is found past other APP segments.
         let exif = (0xE1, vec![0xE1, 0, 6, b'E', b'x', b'i']);
         assert!(is_rgb(&three([1, 2, 3], full, &[exif, adobe(0)])));
+    }
+
+    #[test]
+    fn each_channel_signals_its_own_sampling() {
+        // Cb and Cr at different resolutions.
+        let ss = check_supported(&three([1, 2, 3], [(2, 2), (2, 1), (1, 1)], &[])).unwrap();
+        assert_eq!(ss.mode, [2, 1, 0]);
+        assert_eq!((ss.hshift, ss.vshift), ([0, 0, 1], [1, 0, 1]));
+        assert_eq!((ss.max_hshift, ss.max_vshift), (1, 1));
+        // Every component at 2x1 is full resolution, but the factors must
+        // survive for the JPEG and the grid still follows the 2-block MCU.
+        let ss = check_supported(&three([1, 2, 3], [(2, 1); 3], &[])).unwrap();
+        assert_eq!(ss.mode, [2; 3]);
+        assert_eq!((ss.hshift, ss.vshift), ([0; 3], [0; 3]));
+        assert_eq!((ss.max_hshift, ss.max_vshift), (1, 0));
+        // Chroma sharper than luma has no layout here.
+        assert!(check_supported(&three([1, 2, 3], [(1, 1), (2, 2), (2, 2)], &[])).is_err());
     }
 
     #[test]

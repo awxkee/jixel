@@ -2329,6 +2329,37 @@ fn write_prefix_code_single(
     }
 }
 
+/// One prefix code in Brotli's format (which JPEG XL's prefix codes share) for
+/// a fixed alphabet whose simple-code symbols take `alphabet_bits` bits.
+/// `depths` covers the whole alphabet; a single used symbol gets depth 0.
+pub(crate) fn write_brotli_prefix_code(
+    depths: &[u8],
+    alphabet_bits: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    let mut s4 = [0usize; 4];
+    let mut count = 0usize;
+    let mut length = 0usize;
+    for (i, &d) in depths.iter().enumerate() {
+        if d != 0 {
+            if count < 4 {
+                s4[count] = i;
+            }
+            count += 1;
+            length = i + 1;
+        }
+    }
+    match count {
+        0 | 1 => {
+            w.write(4, 1); // simple code, one symbol
+            w.write(alphabet_bits, s4[0] as u64);
+        }
+        2..=4 => store_simple_huffman_tree(depths, &mut s4, count, alphabet_bits, w),
+        _ => store_huffman_tree(&depths[..length], huffman_pool, w),
+    }
+}
+
 /// Write a vector of prefix codes (per WritePrefixCodes in libjxl-tiny).
 /// Serialize one `HybridUintConfig`.
 ///
