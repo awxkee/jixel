@@ -1112,8 +1112,7 @@ mod tests {
             for (cx, cy) in [(16, 16), (40, 24), (64, 48)] {
                 for y in cy - 4..=cy + 4 {
                     for x in cx - 4..=cx + 4 {
-                        let d2 = ((x as f32 - cx as f32).powi(2) + (y as f32 - cy as f32).powi(2))
-                            as f32;
+                        let d2 = (x as f32 - cx as f32).powi(2) + (y as f32 - cy as f32).powi(2);
                         let v = polarity * 0.15 * (-0.5 * d2 / 0.64).exp();
                         for c in [1, 2] {
                             image.plane_row_mut(c, y)[x] += v;

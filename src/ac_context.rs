@@ -31,6 +31,7 @@ use crate::entropy::f_log2;
 pub(crate) const K_NON_ZERO_BUCKETS: usize = 37;
 pub(crate) const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
 pub(crate) const K_NUM_BLOCK_CTXS: usize = 15;
+#[cfg(test)]
 pub(crate) const K_NUM_AC_CONTEXTS: usize =
     K_NUM_BLOCK_CTXS * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT); // 15 * 495
 
@@ -85,12 +86,6 @@ pub(crate) static K_STRATEGY_ORDER: [u8; K_NUM_AC_STRATEGY_CODES] = [
 /// Y, X, B.
 static CHANNEL_ROW: [usize; 3] = [1, 0, 2];
 
-/// The block-context map actually signaled in DC global.
-#[inline]
-pub(crate) fn compact_block_context_map() -> &'static [u8; 39] {
-    &K_COMPACT_BLOCK_CONTEXT_MAP
-}
-
 /// Derived from the signaled map so the encoder and decoder cannot disagree —
 /// the previous code-indexed duplicate silently defaulted unsupported entries
 /// to context 0.
@@ -101,7 +96,7 @@ pub(crate) fn block_context(c: usize, ac_strategy_code: u8) -> u32 {
 }
 
 #[inline]
-fn non_zero_bucket(non_zeros: u32) -> u32 {
+pub(crate) fn non_zero_bucket(non_zeros: u32) -> u32 {
     if non_zeros < 8 {
         non_zeros
     } else if non_zeros >= 64 {
@@ -111,17 +106,12 @@ fn non_zero_bucket(non_zeros: u32) -> u32 {
     }
 }
 
-#[inline]
-pub(crate) fn non_zero_context(non_zeros: u32, block_ctx: u32) -> u32 {
-    non_zero_bucket(non_zeros) * K_NUM_BLOCK_CTXS as u32 + block_ctx
-}
-
 /// Fine tokenization layout for the lossy path: every base block context is
 /// split by a per-image quant-field threshold into two classes. The final
 /// signaled map is decided *after* tokenization from real token statistics
 /// (splits kept only where they pay, within the spec's 16-context budget) and
 /// tokens are remapped; this layout only has to be a superset of every final
-/// map. The JPEG-recompression path stays on the legacy 15-context layout.
+/// map.
 pub(crate) const K_NUM_QF_CLASSES: usize = 2;
 pub(crate) const K_NUM_FINE_BLOCK_CTXS: usize = K_NUM_BLOCK_CTXS * K_NUM_QF_CLASSES;
 pub(crate) const K_NUM_FINE_AC_CONTEXTS: usize =
@@ -166,12 +156,6 @@ pub(crate) fn zero_density_context(
     let nz = (nonzeros_left + covered_blocks - 1) >> log2_covered_blocks;
     let kk = k >> log2_covered_blocks;
     (K_COEFF_NUM_NONZERO_CONTEXT[nz] as usize + K_COEFF_FREQ_CONTEXT[kk] as usize) * 2 + prev
-}
-
-#[inline]
-pub(crate) const fn zero_density_contexts_offset(block_ctx: u32) -> u32 {
-    K_NUM_BLOCK_CTXS as u32 * K_NON_ZERO_BUCKETS as u32
-        + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
 }
 
 /// 8x8 zigzag order. Coefficient at zigzag position k is at raw index

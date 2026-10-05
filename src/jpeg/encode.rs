@@ -30,15 +30,17 @@
 //! Builds a JXL VarDCT frame directly from JPEG DCT coefficients.
 
 use super::{DCT_BLOCK_SIZE, JpegData, JpegError, coeff_order};
+use crate::Speed;
 use crate::ac_context::{
-    K_NUM_AC_CONTEXTS, block_context, non_zero_context, zero_density_context_8x8,
+    K_NON_ZERO_BUCKETS, K_NUM_ORDERS, K_ZERO_DENSITY_CONTEXT_COUNT, non_zero_bucket,
+    zero_density_context_8x8,
 };
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
+use crate::entropy::AnsRefinement;
 use crate::entropy::{
-    Token, optimize_entropy_code, optimize_entropy_code_ac, pack_signed, write_ans_tokens,
-    write_entropy_code, write_token,
+    Token, optimize_entropy_code, pack_signed, write_ans_tokens, write_entropy_code, write_token,
 };
 use crate::frame::{
     collect_ac_metadata_tokens, collect_dc_tokens, combine_sections, write_context_tree,
@@ -62,6 +64,10 @@ static CHANNEL_ORDER: [usize; 3] = [1, 0, 2];
 
 /// JXL channel (X, Y, B) to JPEG component (Cb, Y, Cr).
 static JPEG_ORDER_YCBCR: [usize; 3] = [1, 0, 2];
+/// A grayscale JPEG's single component serves every channel's quant table.
+static JPEG_ORDER_GRAY: [usize; 3] = [0, 0, 0];
+/// RGB JPEGs are coded without the YCbCr transform, channels in R, G, B order.
+static JPEG_ORDER_RGB: [usize; 3] = [0, 1, 2];
 
 /// Geometry of the frame, in pixels, blocks and groups.
 struct Dim {
@@ -76,7 +82,7 @@ struct Dim {
 }
 
 impl Dim {
-    fn new(xsize: usize, ysize: usize, ss: &Subsampling) -> Self {
+    fn new(xsize: usize, ysize: usize, ss: &ChannelLayout) -> Self {
         // Rounded up to a whole MCU so halving it for chroma is exact.
         let xsize_blocks = xsize.div_ceil(BLOCK_DIM << ss.max_hshift) << ss.max_hshift;
         let ysize_blocks = ysize.div_ceil(BLOCK_DIM << ss.max_vshift) << ss.max_vshift;
@@ -97,8 +103,9 @@ impl Dim {
     }
 }
 
-/// The subsampling layout, expressed the way the frame header wants it.
-struct Subsampling {
+/// How the JPEG's components map onto the frame's channels, expressed the way
+/// the frame header wants it.
+struct ChannelLayout {
     /// Per-JXL-channel horizontal and vertical shifts (0 = full resolution).
     hshift: [usize; 3],
     vshift: [usize; 3],
@@ -106,18 +113,92 @@ struct Subsampling {
     mode: [u64; 3],
     max_hshift: usize,
     max_vshift: usize,
+    /// One component: coded as Y with all-zero chroma, as libjxl does.
+    gray: bool,
+    /// JXL channel to JPEG component.
+    jpeg_order: [usize; 3],
+    /// Whether the frame applies the YCbCr transform; false for RGB JPEGs.
+    ycbcr: bool,
+    /// Added to each channel's quantized DC: without the YCbCr transform the
+    /// decoder subtracts `1024 / dc_quant` to recenter the samples.
+    dc_offset: [i16; 3],
+}
+
+impl ChannelLayout {
+    /// The JPEG component behind JXL channel `c`; `None` for the chroma of a
+    /// grayscale JPEG, whose coefficients are all zero.
+    #[inline]
+    fn component<'a>(&self, jpg: &'a JpegData, c: usize) -> Option<&'a super::JpegComponent> {
+        (!self.gray || c == 1).then(|| &jpg.components[self.jpeg_order[c]])
+    }
+
+    #[inline]
+    fn luma<'a>(&self, jpg: &'a JpegData) -> &'a super::JpegComponent {
+        &jpg.components[self.jpeg_order[1]]
+    }
 }
 
 /// Works out the channel layout, rejecting anything JXL cannot express: only
 /// chroma at full resolution or halved in either axis has a representation.
-fn check_supported(jpg: &JpegData) -> Result<Subsampling, JpegError> {
+fn check_supported(jpg: &JpegData) -> Result<ChannelLayout, JpegError> {
+    if jpg.components.len() == 1 {
+        // A lone component is full resolution, but its sampling factors still
+        // shape the MCU grid, and the decoder rebuilds them from the modes:
+        // every channel carries the same one, so no shift is effective.
+        let comp = &jpg.components[0];
+        let (mode, max_hshift, max_vshift) = match (comp.h_samp_factor, comp.v_samp_factor) {
+            (1, 1) => (0, 0, 0),
+            (2, 2) => (1, 1, 1),
+            (2, 1) => (2, 1, 0),
+            (1, 2) => (3, 0, 1),
+            _ => {
+                return Err(JpegError::UnsupportedMode(
+                    "sampling factors above 2 are not representable",
+                ));
+            }
+        };
+        return Ok(ChannelLayout {
+            hshift: [0; 3],
+            vshift: [0; 3],
+            mode: [mode; 3],
+            max_hshift,
+            max_vshift,
+            gray: true,
+            jpeg_order: JPEG_ORDER_GRAY,
+            ycbcr: true,
+            dc_offset: [0; 3],
+        });
+    }
     if jpg.components.len() != 3 {
         return Err(JpegError::UnsupportedMode(
-            "only 3-component JPEGs are transcodable so far",
+            "only 1- and 3-component JPEGs are transcodable",
         ));
     }
     let max_h = jpg.max_h_samp();
     let max_v = jpg.max_v_samp();
+    if is_rgb(jpg) {
+        // Chroma subsampling is only signaled alongside the YCbCr transform.
+        if max_h != 1 || max_v != 1 {
+            return Err(JpegError::UnsupportedMode(
+                "subsampled RGB JPEGs are not representable",
+            ));
+        }
+        let dc_offset = JPEG_ORDER_RGB.map(|i| {
+            let dc_quant = jpg.quant[jpg.components[i].quant_idx as usize].values[0];
+            (1024 / dc_quant.max(1)) as i16
+        });
+        return Ok(ChannelLayout {
+            hshift: [0; 3],
+            vshift: [0; 3],
+            mode: [0; 3],
+            max_hshift: 0,
+            max_vshift: 0,
+            gray: false,
+            jpeg_order: JPEG_ORDER_RGB,
+            ycbcr: false,
+            dc_offset,
+        });
+    }
     if !matches!(max_h, 1 | 2) || !matches!(max_v, 1 | 2) {
         return Err(JpegError::UnsupportedMode(
             "sampling factors above 2 are not representable",
@@ -166,13 +247,41 @@ fn check_supported(jpg: &JpegData) -> Result<Subsampling, JpegError> {
         }
     };
 
-    Ok(Subsampling {
+    Ok(ChannelLayout {
         hshift,
         vshift,
         mode: [0, luma_mode, 0],
         max_hshift,
         max_vshift,
+        gray: false,
+        jpeg_order: JPEG_ORDER_YCBCR,
+        ycbcr: true,
+        dc_offset: [0; 3],
     })
+}
+
+/// Whether a 3-component JPEG holds RGB rather than YCbCr, decided as libjxl
+/// does: a JFIF marker means YCbCr; otherwise the first Adobe APP14 marker's
+/// transform flag, and failing that, component ids 'R', 'G', 'B'.
+fn is_rgb(jpg: &JpegData) -> bool {
+    if jpg.marker_order.contains(&0xE0) {
+        return false;
+    }
+    let mut app = jpg.app_data.iter();
+    for &marker in &jpg.marker_order {
+        if marker & 0xF0 != 0xE0 {
+            continue;
+        }
+        let Some(data) = app.next() else {
+            break;
+        };
+        // [marker, len_hi, len_lo, "Adobe", version, flags0, flags1, transform]
+        if marker == 0xEE && data.len() == 15 && &data[3..8] == b"Adobe" {
+            return data[14] == 0;
+        }
+    }
+    let ids: Vec<u32> = jpg.components.iter().map(|c| c.id).collect();
+    ids == [u32::from(b'R'), u32::from(b'G'), u32::from(b'B')]
 }
 
 /// Writes an IEEE half-precision float exactly as the JXL field coder does.
@@ -260,7 +369,12 @@ fn write_size_header(w: &mut BitWriter, xsize: usize, ysize: usize) {
 
 /// Writes `ImageMetadata`. The key choice is `xyb_encoded = 0`: the frame
 /// carries the JPEG's own channels, so the decoder must not undo XYB.
-fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>, scratch: &mut CoderScratch) {
+fn write_image_metadata(
+    w: &mut BitWriter,
+    icc: Option<&[u8]>,
+    gray: bool,
+    scratch: &mut CoderScratch,
+) {
     w.write(1, 0); // not all-default
     w.write(1, 0); // no extra fields (orientation, preview, animation)
     w.write(1, 0); // floating_point_sample = false
@@ -274,7 +388,13 @@ fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>, scratch: &mut Cod
         Some(_) => crate::color_encoding::write_color_encoding_with_icc(
             &crate::ColorEncoding::default(),
             true,
+            gray,
+            w,
+        ),
+        None if gray => crate::color_encoding::write_color_encoding_with_icc(
+            &crate::ColorEncoding::default(),
             false,
+            true,
             w,
         ),
         None => w.write(1, 1), // color encoding: all default (sRGB)
@@ -288,7 +408,7 @@ fn write_image_metadata(w: &mut BitWriter, icc: Option<&[u8]>, scratch: &mut Cod
 }
 
 /// Writes the frame header.
-fn write_frame_header(w: &mut BitWriter, ss: &Subsampling) {
+fn write_frame_header(w: &mut BitWriter, ss: &ChannelLayout) {
     w.write(1, 0); // not all-default
     w.write(2, 0); // regular frame
     w.write(1, 0); // encoding = VarDCT
@@ -298,10 +418,13 @@ fn write_frame_header(w: &mut BitWriter, ss: &Subsampling) {
     w.write(2, 2);
     w.write(8, 128 - 17);
 
-    w.write(1, 1); // do_ycbcr = true (serialized because xyb_encoded = 0)
-    // YCbCrChromaSubsampling, one 2-bit mode per channel in X, Y, B order.
-    for mode in ss.mode {
-        w.write(2, mode);
+    // do_ycbcr (serialized because xyb_encoded = 0).
+    w.write(1, u64::from(ss.ycbcr));
+    if ss.ycbcr {
+        // YCbCrChromaSubsampling, one 2-bit mode per channel in X, Y, B order.
+        for mode in ss.mode {
+            w.write(2, mode);
+        }
     }
 
     w.write(2, 0); // upsampling = 1
@@ -319,6 +442,354 @@ fn write_frame_header(w: &mut BitWriter, ss: &Subsampling) {
     w.write(2, 0); // no loop-filter extensions
 
     w.write(2, 0); // no frame-header extensions
+}
+
+/// Fixed-point precision of the JPEG chroma-from-luma multiply.
+const CFL_PRECISION: u32 = 11;
+/// CfL factors are signaled in units of 1/84 (`color_factor`).
+const CFL_COLOR_FACTOR: i32 = 84;
+/// Chroma-from-luma tiles are 8x8 blocks.
+const CFL_TILE_DIM_IN_BLOCKS: usize = 8;
+
+/// Integer chroma-from-luma for 4:4:4 JPEGs, exactly as the decoder's JPEG
+/// reconstruction applies it: each chroma coefficient is coded as a residual
+/// against a fixed-point multiple of the co-located luma coefficient.
+struct JpegCfl {
+    /// Luma-to-chroma quant step ratio per JPEG raster position, in
+    /// `CFL_PRECISION` fixed point, per JXL channel (luma row unused).
+    scaled_qtable: [[i32; DCT_BLOCK_SIZE]; 3],
+    xtiles: usize,
+    /// Per-tile factors for X (Cb) and B (Cr).
+    maps: [Vec<i8>; 2],
+}
+
+impl JpegCfl {
+    fn new(
+        jpg: &JpegData,
+        dim: &Dim,
+        ss: &ChannelLayout,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Option<Self> {
+        if ss.gray || ss.hshift.iter().chain(&ss.vshift).any(|&s| s != 0) {
+            return None;
+        }
+        let quant =
+            |c: usize| &jpg.quant[jpg.components[ss.jpeg_order[c]].quant_idx as usize].values;
+        let mut scaled_qtable = [[0i32; DCT_BLOCK_SIZE]; 3];
+        for c in [0usize, 2] {
+            for i in 0..DCT_BLOCK_SIZE {
+                let (num, den) = (i64::from(quant(1)[i]), i64::from(quant(c)[i]));
+                if num <= 0 || den <= 0 {
+                    return None;
+                }
+                let ratio = (num << CFL_PRECISION) / den;
+                // libjxl's bound; beyond it the fixed-point multiply can overflow.
+                if ratio > (256 << CFL_PRECISION) - 1 {
+                    return None;
+                }
+                scaled_qtable[c][i] = ratio as i32;
+            }
+        }
+        let xtiles = dim.xsize_blocks.div_ceil(CFL_TILE_DIM_IN_BLOCKS);
+        let ytiles = dim.ysize_blocks.div_ceil(CFL_TILE_DIM_IN_BLOCKS);
+        let luma = ss.luma(jpg);
+        let mut maps = [Vec::new(), Vec::new()];
+        for (slot, c) in [0usize, 2].into_iter().enumerate() {
+            let chroma = &jpg.components[ss.jpeg_order[c]];
+            let qt = &scaled_qtable[c];
+            let rows = pool.steal_map(scratch, ytiles, |ty, _scratch| {
+                let mut row = vec![0i8; xtiles];
+                for (tx, out) in row.iter_mut().enumerate() {
+                    *out = Self::fit_tile(luma, chroma, qt, dim, tx, ty);
+                }
+                row
+            });
+            maps[slot] = rows.into_iter().flatten().collect();
+        }
+        if maps.iter().all(|m| m.iter().all(|&v| v == 0)) {
+            return None;
+        }
+        Some(Self {
+            scaled_qtable,
+            xtiles,
+            maps,
+        })
+    }
+
+    /// libjxl's tile search: the factor that zeroes the most chroma residuals,
+    /// kept only if it beats factor 0 by more than one coefficient.
+    fn fit_tile(
+        luma: &super::JpegComponent,
+        chroma: &super::JpegComponent,
+        qt: &[i32; DCT_BLOCK_SIZE],
+        dim: &Dim,
+        tx: usize,
+        ty: usize,
+    ) -> i8 {
+        // Index i is factor i - 128, so the 256 slots are exactly the i8 range.
+        // libjxl offsets by 127, making its top slot a factor of 128 that wraps
+        // to -128 when stored.
+        const OFFSET: i32 = 128;
+        let scale = CFL_COLOR_FACTOR as f32;
+        let zero_thresh = scale * 0.5 * 0.9999;
+        let mut d_num_zeros = [0i32; 257];
+        let y0 = ty * CFL_TILE_DIM_IN_BLOCKS;
+        let x0 = tx * CFL_TILE_DIM_IN_BLOCKS;
+        let y1 = dim.ysize_blocks.min(y0 + CFL_TILE_DIM_IN_BLOCKS);
+        let x1 = dim.xsize_blocks.min(x0 + CFL_TILE_DIM_IN_BLOCKS);
+        for by in y0..y1 {
+            for bx in x0..x1 {
+                let m = &luma.coeffs[(by * luma.width_in_blocks + bx) * DCT_BLOCK_SIZE..]
+                    [..DCT_BLOCK_SIZE];
+                let s = &chroma.coeffs[(by * chroma.width_in_blocks + bx) * DCT_BLOCK_SIZE..]
+                    [..DCT_BLOCK_SIZE];
+                for k in 1..DCT_BLOCK_SIZE {
+                    let scaled_m =
+                        f32::from(m[k]) * (1.0 / (1 << CFL_PRECISION) as f32) * qt[k] as f32;
+                    if scaled_m.abs() <= 1e-8 {
+                        continue;
+                    }
+                    let scaled_s = scale * f32::from(s[k]) + OFFSET as f32 * scaled_m;
+                    let (mut from, mut to) = if scaled_m > 0.0 {
+                        (
+                            (scaled_s - zero_thresh) / scaled_m,
+                            (scaled_s + zero_thresh) / scaled_m,
+                        )
+                    } else {
+                        (
+                            (scaled_s + zero_thresh) / scaled_m,
+                            (scaled_s - zero_thresh) / scaled_m,
+                        )
+                    };
+                    from = from.max(0.0);
+                    to = to.min(255.0);
+                    if from <= to {
+                        // Both bounds lie in [0, 256], where truncation is floor;
+                        // f32::ceil/floor are libm calls on baseline x86.
+                        let lo = from as usize;
+                        let lo = lo + usize::from((lo as f32) < from);
+                        d_num_zeros[lo] += 1;
+                        d_num_zeros[(to + 1.0) as usize] -= 1;
+                    }
+                }
+            }
+        }
+        let (mut best_sum, mut val) = (0i32, 0i32);
+        let (mut begin, mut end) = (0usize, 0usize);
+        for (i, &d) in d_num_zeros[..256].iter().enumerate() {
+            val += d;
+            if val > best_sum {
+                best_sum = val;
+                begin = i;
+            }
+            if val == best_sum {
+                end = i;
+            }
+        }
+        let best = ((begin + end + 1) >> 1) as i32;
+        let offset_sum: i32 = d_num_zeros[..=OFFSET as usize].iter().sum();
+        if best_sum > offset_sum + 1 {
+            (best - OFFSET) as i8
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn factor(&self, c: usize, bx: usize, by: usize) -> i32 {
+        let tile = (by / CFL_TILE_DIM_IN_BLOCKS) * self.xtiles + bx / CFL_TILE_DIM_IN_BLOCKS;
+        i32::from(self.maps[c / 2][tile])
+    }
+
+    /// The coded chroma block (JPEG raster order) for the block at `(bx, by)`.
+    #[inline]
+    fn residual(
+        &self,
+        c: usize,
+        bx: usize,
+        by: usize,
+        y: &[i16],
+        chroma: &[i16],
+    ) -> [i32; DCT_BLOCK_SIZE] {
+        let scale = self.factor(c, bx, by) * (1 << CFL_PRECISION) / CFL_COLOR_FACTOR;
+        let round = 1 << (CFL_PRECISION - 1);
+        let qt = &self.scaled_qtable[c];
+        let mut out = [0i32; DCT_BLOCK_SIZE];
+        for k in 0..DCT_BLOCK_SIZE {
+            let coeff_scale = (scale * qt[k] + round) >> CFL_PRECISION;
+            let cfl = (i32::from(y[k]) * coeff_scale + round) >> CFL_PRECISION;
+            out[k] = i32::from(chroma[k]) - cfl;
+        }
+        out
+    }
+}
+
+/// The coefficients of one block as coded (CfL residual for 4:4:4 chroma), in
+/// JPEG raster order. `(bx, by)` are in the channel's own block grid.
+#[inline]
+fn coded_block(
+    jpg: &JpegData,
+    ss: &ChannelLayout,
+    cfl: Option<&JpegCfl>,
+    c: usize,
+    bx: usize,
+    by: usize,
+) -> [i32; DCT_BLOCK_SIZE] {
+    let Some(comp) = ss.component(jpg, c) else {
+        return [0; DCT_BLOCK_SIZE];
+    };
+    let src = &comp.coeffs[(by * comp.width_in_blocks + bx) * DCT_BLOCK_SIZE..][..DCT_BLOCK_SIZE];
+    match cfl {
+        Some(cfl) if c != 1 => {
+            let luma = ss.luma(jpg);
+            let y =
+                &luma.coeffs[(by * luma.width_in_blocks + bx) * DCT_BLOCK_SIZE..][..DCT_BLOCK_SIZE];
+            cfl.residual(c, bx, by, y, src)
+        }
+        _ => std::array::from_fn(|k| i32::from(src[k])),
+    }
+}
+
+/// Block contexts keyed by the luma DC value, libjxl's JPEG layout: one
+/// context per luma DC bucket, chroma buckets paired up.
+struct BlockCtx {
+    /// Luma DC thresholds; a block's bucket counts those below its DC.
+    luma_thresholds: Vec<i32>,
+    /// Indexed by `(row * K_NUM_ORDERS + order) * num_dc_ctxs + dc_idx`, rows
+    /// in Y, X, B order.
+    ctx_map: Vec<u8>,
+    num_ctxs: usize,
+}
+
+impl BlockCtx {
+    fn new(
+        jpg: &JpegData,
+        dim: &Dim,
+        ss: &ChannelLayout,
+        qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+    ) -> Self {
+        let luma = ss.luma(jpg);
+        let mut counts = vec![0u32; 2048];
+        for by in 0..dim.ysize_blocks {
+            for bx in 0..dim.xsize_blocks {
+                // As coded: the decoder buckets the DC image's values.
+                let dc = luma.coeffs[(by * luma.width_in_blocks + bx) * DCT_BLOCK_SIZE]
+                    + ss.dc_offset[1];
+                counts[(i32::from(dc) + 1024).clamp(0, 2047) as usize] += 1;
+            }
+        }
+        let total = dim.xsize_blocks * dim.ysize_blocks;
+        let ceil_log2 = |v: usize| v.max(1).next_power_of_two().trailing_zeros() as i32;
+        // More buckets for larger and higher-quality images.
+        let qsum: i32 = qtable[1..6].iter().sum();
+        let num_thresholds = (ceil_log2(total) - ceil_log2(qsum.max(1) as usize) - 7).clamp(1, 7);
+        let mut luma_thresholds = Vec::new();
+        let mut cumsum = 0usize;
+        let mut cut = total / (num_thresholds as usize + 1);
+        for (j, &n) in counts.iter().enumerate() {
+            cumsum += n as usize;
+            if cumsum > cut {
+                luma_thresholds.push(j as i32 - 1025);
+                cut = total * (luma_thresholds.len() + 1) / (num_thresholds as usize + 1);
+            }
+        }
+        let num_dc = luma_thresholds.len() + 1;
+        let mut ctx_map = vec![0u8; 3 * K_NUM_ORDERS * num_dc];
+        for i in 0..num_dc {
+            ctx_map[i] = i as u8;
+            if ss.gray {
+                // All-zero chroma shares a single context.
+                ctx_map[K_NUM_ORDERS * num_dc + i] = num_dc as u8;
+                ctx_map[2 * K_NUM_ORDERS * num_dc + i] = num_dc as u8;
+            } else {
+                ctx_map[K_NUM_ORDERS * num_dc + i] = (num_dc + i / 2) as u8;
+                ctx_map[2 * K_NUM_ORDERS * num_dc + i] =
+                    (num_dc + (num_dc - 1) / 2 + 1 + i / 2) as u8;
+            }
+        }
+        let num_ctxs = *ctx_map.iter().max().unwrap() as usize + 1;
+        debug_assert!(num_ctxs <= 16);
+        Self {
+            luma_thresholds,
+            ctx_map,
+            num_ctxs,
+        }
+    }
+
+    fn num_ac_contexts(&self) -> usize {
+        self.num_ctxs * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT)
+    }
+
+    /// Block context of a DCT8 block in JXL channel `c` whose co-located luma
+    /// block codes the DC value `luma_dc`.
+    #[inline]
+    fn context(&self, c: usize, luma_dc: i16) -> u32 {
+        let dc_idx = self
+            .luma_thresholds
+            .iter()
+            .filter(|&&t| i32::from(luma_dc) > t)
+            .count();
+        let row = [1, 0, 2][c];
+        let num_dc = self.luma_thresholds.len() + 1;
+        u32::from(self.ctx_map[row * K_NUM_ORDERS * num_dc + dc_idx])
+    }
+
+    #[inline]
+    fn non_zero_context(&self, predicted: u32, block_ctx: u32) -> u32 {
+        non_zero_bucket(predicted) * self.num_ctxs as u32 + block_ctx
+    }
+
+    #[inline]
+    fn zero_density_offset(&self, block_ctx: u32) -> u32 {
+        (self.num_ctxs * K_NON_ZERO_BUCKETS) as u32
+            + K_ZERO_DENSITY_CONTEXT_COUNT as u32 * block_ctx
+    }
+
+    fn write(&self, scratch: &mut CoderScratch, w: &mut BitWriter) {
+        w.write(1, 0); // non-default BlockCtxMap
+        w.write(4, 0); // dc thresholds, X
+        w.write(4, self.luma_thresholds.len() as u64);
+        for &t in &self.luma_thresholds {
+            // kDCThresholdDist: U32(Bits(4), BitsOffset(8,16), BitsOffset(16,272),
+            // BitsOffset(32,65808)) over PackSigned(t).
+            let v = pack_signed(t);
+            if v < 16 {
+                w.write(2, 0);
+                w.write(4, u64::from(v));
+            } else if v < 272 {
+                w.write(2, 1);
+                w.write(8, u64::from(v - 16));
+            } else if v < 65808 {
+                w.write(2, 2);
+                w.write(16, u64::from(v - 272));
+            } else {
+                w.write(2, 3);
+                w.write(32, u64::from(v - 65808));
+            }
+        }
+        w.write(4, 0); // dc thresholds, B
+        w.write(4, 0); // no quant-field thresholds
+        let empty_codes: [crate::entropy::PrefixCode; 0] = [];
+        let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
+        let empty_histograms = [];
+        let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
+        let empty_reverse_maps: [u16; 0] = [];
+        let cm_entropy = crate::entropy::EntropyCode {
+            context_map: &self.ctx_map,
+            num_contexts: self.ctx_map.len(),
+            prefix_codes: &empty_codes,
+            hybrid_uint_configs: &empty_configs,
+            num_prefix_codes: 0,
+            orig_context_map: None,
+            orig_num_contexts: 0,
+            use_prefix_code: true,
+            ans_histograms: &empty_histograms,
+            ans_symbols: &empty_syms,
+            ans_reverse_maps: &empty_reverse_maps,
+        };
+        crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
+    }
 }
 
 /// Writes the `LfChannelDequantization` bundle carrying the JPEG's DC quant.
@@ -395,24 +866,58 @@ fn write_raw_quant_image(
     }
 }
 
+/// Entropy-coding effort per speed tier; the coefficients are fixed.
+#[derive(Clone, Copy)]
+struct Effort {
+    /// Also code the natural coefficient order and keep the cheaper one.
+    try_natural_order: bool,
+    /// Pick per-cluster HybridUint configs instead of the default.
+    select_configs: bool,
+    refinement: Option<AnsRefinement>,
+}
+
+impl Effort {
+    fn new(speed: Speed) -> Self {
+        match speed {
+            Speed::Fastest => Self {
+                try_natural_order: false,
+                select_configs: false,
+                refinement: None,
+            },
+            Speed::Fast => Self {
+                try_natural_order: false,
+                select_configs: true,
+                refinement: Some(AnsRefinement::Fast { recluster: false }),
+            },
+            Speed::Slow => Self {
+                try_natural_order: true,
+                select_configs: true,
+                refinement: Some(AnsRefinement::Slow),
+            },
+        }
+    }
+}
+
 /// Encodes `jpg` as a complete JXL codestream.
 pub(crate) fn encode_jpeg_codestream(
     jpg: &JpegData,
     icc: Option<&[u8]>,
+    speed: Speed,
     num_threads: usize,
 ) -> Result<Vec<u8>, EncodeError> {
     let ss = check_supported(jpg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
     let dim = Dim::new(jpg.width, jpg.height, &ss);
     let pool = ThreadPool::new(num_threads);
     let mut scratch = Box::<CoderScratch>::default();
-    encode_jpeg_codestream_with_pool(jpg, icc, &ss, &dim, &pool, &mut scratch)
+    encode_jpeg_codestream_with_pool(jpg, icc, &ss, &dim, speed, &pool, &mut scratch)
 }
 
 fn encode_jpeg_codestream_with_pool(
     jpg: &JpegData,
     icc: Option<&[u8]>,
-    ss: &Subsampling,
+    ss: &ChannelLayout,
     dim: &Dim,
+    speed: Speed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Result<Vec<u8>, EncodeError> {
@@ -420,7 +925,7 @@ fn encode_jpeg_codestream_with_pool(
     let mut qtable = [0i32; 3 * DCT_BLOCK_SIZE];
     let mut dc_quant = [0f32; 3];
     for c in 0..3usize {
-        let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
+        let comp = &jpg.components[ss.jpeg_order[c]];
         let q = &jpg.quant[comp.quant_idx as usize].values;
         for (y, src) in q.as_chunks::<8>().0.iter().take(8).enumerate() {
             for (x, &src) in src.iter().enumerate() {
@@ -430,6 +935,9 @@ fn encode_jpeg_codestream_with_pool(
         }
         dc_quant[c] = q[0] as f32 / (255.0 * 8.0);
     }
+
+    let effort = Effort::new(speed);
+    let cfl = JpegCfl::new(jpg, dim, ss, pool, scratch);
 
     // DC planes. Each DC group reads a disjoint slab of coefficients.
     let dc_datas = pool.steal_map(scratch, dim.num_dc_groups, |g, _scratch| {
@@ -444,15 +952,34 @@ fn encode_jpeg_codestream_with_pool(
         let sizes = [0usize, 1, 2].map(|c| (bw >> ss.hshift[c], bh >> ss.vshift[c]));
         data.quant_dc = crate::image::Image3S::try_new_per_plane(sizes)?;
         for c in 0..3usize {
-            let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
             let (cw, ch) = sizes[c];
+            let Some(comp) = ss.component(jpg, c) else {
+                for y in 0..ch {
+                    data.quant_dc.plane_row_mut(c, y)[..cw].fill(0);
+                }
+                continue;
+            };
             for y in 0..ch {
                 let row = data.quant_dc.plane_row_mut(c, y);
                 for (x, dst) in row[..cw].iter_mut().enumerate() {
                     let block = ((by0 >> ss.vshift[c]) + y) * comp.width_in_blocks
                         + (bx0 >> ss.hshift[c])
                         + x;
-                    *dst = comp.coeffs[block * DCT_BLOCK_SIZE];
+                    *dst = comp.coeffs[block * DCT_BLOCK_SIZE] + ss.dc_offset[c];
+                }
+            }
+        }
+        if let Some(cfl) = &cfl {
+            let (tx0, ty0) = (bx0 / CFL_TILE_DIM_IN_BLOCKS, by0 / CFL_TILE_DIM_IN_BLOCKS);
+            for (slot, map) in [&mut data.ytox_map, &mut data.ytob_map]
+                .into_iter()
+                .enumerate()
+            {
+                for ty in 0..map.ysize() {
+                    let src = &cfl.maps[slot][(ty0 + ty) * cfl.xtiles + tx0..];
+                    let row = map.row_mut(ty);
+                    let n = row.len();
+                    row.copy_from_slice(&src[..n]);
                 }
             }
         }
@@ -478,14 +1005,29 @@ fn encode_jpeg_codestream_with_pool(
         .into_iter()
         .unzip();
 
-    let mut all_dc: Vec<Token> = Vec::new();
-    for t in &dc_tokens {
-        all_dc.extend_from_slice(t);
+    let dc_code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
+        dc_tokens
+            .iter()
+            .chain(meta_tokens.iter())
+            .map(Vec::as_slice),
+        K_NUM_DC_CONTEXTS,
+        &mut scratch.huffman_pool,
+        effort.select_configs,
+        Some(pool),
+    );
+    let mut dc_code = dc_code;
+    if let Some(refinement) = effort.refinement {
+        crate::entropy::refine_ans_clusters(
+            &mut dc_code,
+            dc_tokens
+                .iter()
+                .chain(meta_tokens.iter())
+                .map(Vec::as_slice),
+            refinement,
+            pool,
+            scratch,
+        );
     }
-    for t in &meta_tokens {
-        all_dc.extend_from_slice(t);
-    }
-    let dc_code = optimize_entropy_code(&all_dc, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let dc_code_ref = dc_code.as_ref();
 
     let natural_scan = {
@@ -497,9 +1039,25 @@ fn encode_jpeg_codestream_with_pool(
         }
         s
     };
-    let baseline = build_ac_sections(jpg, dim, ss, &qtable, &natural_scan, None, pool, scratch);
+    let bctx = BlockCtx::new(jpg, dim, ss, &qtable);
+    let plan =
+        |scan: &[[u8; DCT_BLOCK_SIZE]; 3], perm: Option<Vec<Token>>, scratch: &mut CoderScratch| {
+            plan_ac(
+                jpg,
+                dim,
+                ss,
+                &bctx,
+                cfl.as_ref(),
+                &qtable,
+                scan,
+                perm,
+                effort,
+                pool,
+                scratch,
+            )
+        };
 
-    let orders = compute_coeff_orders(jpg, dim, ss);
+    let orders = compute_coeff_orders(jpg, dim, ss, cfl.as_ref());
     let ac = if orders.iter().any(|o| !coeff_order::is_identity(o)) {
         let mut custom_scan = [[0u8; DCT_BLOCK_SIZE]; 3];
         for c in 0..3 {
@@ -512,23 +1070,19 @@ fn encode_jpeg_codestream_with_pool(
         for order in &orders {
             coeff_order::tokenize_permutation(order, 1, &mut perm_tokens);
         }
-        let candidate = build_ac_sections(
-            jpg,
-            dim,
-            ss,
-            &qtable,
-            &custom_scan,
-            Some(perm_tokens),
-            pool,
-            scratch,
-        );
-        if candidate.bytes < baseline.bytes {
-            candidate
+        let candidate = plan(&custom_scan, Some(perm_tokens), scratch);
+        if effort.try_natural_order {
+            let natural = plan(&natural_scan, None, scratch);
+            if candidate.bits < natural.bits {
+                candidate
+            } else {
+                natural
+            }
         } else {
-            baseline
+            candidate
         }
     } else {
-        baseline
+        plan(&natural_scan, None, scratch)
     };
 
     // Sections. Each is an independent BitWriter, so the per-group ones can be
@@ -538,10 +1092,7 @@ fn encode_jpeg_codestream_with_pool(
         let w = &mut dc_global;
         write_dc_quant(w, dc_quant).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
         write_quant_scales(65536, 1, w);
-        // Written explicitly; the lossy path avoids the shortcut too.
-        w.write(1, 0);
-        w.write(16, 0); // no DC thresholds, no quant-field thresholds
-        crate::frame::write_compact_block_context_map(&mut scratch.huffman_pool, w);
+        bctx.write(scratch, w);
         write_color_correlation(w);
         write_context_tree(
             dim.num_dc_groups,
@@ -579,18 +1130,19 @@ fn encode_jpeg_codestream_with_pool(
             section
         });
 
+    let ac_groups = ac.write_groups(pool, scratch);
     let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
     sections.push(dc_global);
     sections.extend(dc_group_sections);
     sections.push(ac.global);
-    sections.extend(ac.groups);
+    sections.extend(ac_groups);
 
     // Assemble
     let mut out = BitWriter::new();
     out.write(8, 0xFF);
     out.write(8, 0x0A);
     write_size_header(&mut out, dim.xsize, dim.ysize);
-    write_image_metadata(&mut out, icc, scratch);
+    write_image_metadata(&mut out, icc, ss.gray, scratch);
     write_frame_header(&mut out, ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
@@ -613,37 +1165,62 @@ fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut
     }
 }
 
-/// The AC-global section and per-group sections for one coefficient ordering,
-/// with the total size used to choose between orderings.
-struct AcSections {
+/// One coefficient ordering, tokenized and entropy-coded but not yet written:
+/// the AC-global section is final, the groups are emitted only for the winner.
+struct AcPlan {
     global: BitWriter,
-    groups: Vec<BitWriter>,
-    bytes: usize,
+    tokens: Vec<Vec<Token>>,
+    code: crate::entropy::OwnedEntropyCode,
+    /// Global section plus estimated payload, for choosing between orderings.
+    bits: u64,
 }
 
-/// Tokenizes and entropy-codes the AC coefficients under `scan`, returning the
-/// finished sections and their total byte size.
+impl AcPlan {
+    fn write_groups(&self, pool: &ThreadPool, scratch: &mut CoderScratch) -> Vec<BitWriter> {
+        let code = self.code.as_ref();
+        pool.steal_map(scratch, self.tokens.len(), |g, _scratch| {
+            let mut section = BitWriter::new();
+            emit_tokens(&self.tokens[g], &code, &mut section);
+            section
+        })
+    }
+}
+
+/// Tokenizes and entropy-codes the AC coefficients under `scan`.
 ///
 /// `perm` carries the coefficient-order permutation tokens when `scan` is a
 /// custom order; `None` signals the natural order (`used_orders = 0`).
 #[allow(clippy::too_many_arguments)]
-fn build_ac_sections(
+fn plan_ac(
     jpg: &JpegData,
     dim: &Dim,
-    ss: &Subsampling,
+    ss: &ChannelLayout,
+    bctx: &BlockCtx,
+    cfl: Option<&JpegCfl>,
     qtable: &[i32; 3 * DCT_BLOCK_SIZE],
     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
     perm: Option<Vec<Token>>,
+    effort: Effort,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> AcSections {
-    let ac_tokens = tokenize_ac(jpg, dim, ss, scan, pool, scratch);
-    let mut all_ac: Vec<Token> = Vec::new();
-    for t in &ac_tokens {
-        all_ac.extend_from_slice(t);
+) -> AcPlan {
+    let tokens = tokenize_ac(jpg, dim, ss, bctx, cfl, scan, pool, scratch);
+    let mut code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
+        tokens.iter().map(Vec::as_slice),
+        bctx.num_ac_contexts(),
+        &mut scratch.huffman_pool,
+        effort.select_configs,
+        Some(pool),
+    );
+    if let Some(refinement) = effort.refinement {
+        crate::entropy::refine_ans_clusters(
+            &mut code,
+            tokens.iter().map(Vec::as_slice),
+            refinement,
+            pool,
+            scratch,
+        );
     }
-    let ac_code = optimize_entropy_code_ac(&all_ac, K_NUM_AC_CONTEXTS, &mut scratch.huffman_pool);
-    let ac_code_ref = ac_code.as_ref();
 
     let mut global = BitWriter::new();
     {
@@ -681,29 +1258,26 @@ fn build_ac_sections(
             None => w.write(13, 0), // natural order
         }
         w.write(1, 0); // no lz77
-        write_entropy_code(&ac_code_ref, &mut scratch.huffman_pool, w);
+        write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, w);
     }
 
-    let groups: Vec<BitWriter> = pool.steal_map(scratch, dim.num_groups, |g, _scratch| {
-        let mut section = BitWriter::new();
-        emit_tokens(&ac_tokens[g], &ac_code_ref, &mut section);
-        section
-    });
-
-    let bytes = global.bits_written().div_ceil(8)
-        + groups
-            .iter()
-            .map(|s| s.bits_written().div_ceil(8))
-            .sum::<usize>();
-    AcSections {
+    let bits = global.bits_written() as u64
+        + crate::entropy::estimate_ac_plain_bits(tokens.iter().map(Vec::as_slice), &code);
+    AcPlan {
         global,
-        groups,
-        bytes,
+        tokens,
+        code,
+        bits,
     }
 }
 
 /// Derives the per-channel DCT8 coefficient order from non-zero statistics.
-fn compute_coeff_orders(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> [[u8; DCT_BLOCK_SIZE]; 3] {
+fn compute_coeff_orders(
+    jpg: &JpegData,
+    dim: &Dim,
+    ss: &ChannelLayout,
+    cfl: Option<&JpegCfl>,
+) -> [[u8; DCT_BLOCK_SIZE]; 3] {
     // Slot -> source coefficient index: the natural slot's transposed-raster
     // position mapped back into the JPEG block's own raster layout.
     let mut slot_to_src = [0usize; DCT_BLOCK_SIZE];
@@ -712,16 +1286,17 @@ fn compute_coeff_orders(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> [[u8; DC
         *s = (r & 7) * 8 + (r >> 3);
     }
 
-    let mut orders = [[0u8; DCT_BLOCK_SIZE]; 3];
+    let mut orders: [[u8; DCT_BLOCK_SIZE]; 3] = [std::array::from_fn(|k| k as u8); 3];
     for c in 0..3usize {
-        let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
+        if ss.component(jpg, c).is_none() {
+            continue;
+        }
         let cbw = dim.xsize_blocks >> ss.hshift[c];
         let cbh = dim.ysize_blocks >> ss.vshift[c];
         let mut nonzero = [0u64; DCT_BLOCK_SIZE];
         for by in 0..cbh {
             for bx in 0..cbw {
-                let base = (by * comp.width_in_blocks + bx) * DCT_BLOCK_SIZE;
-                let coeffs = &comp.coeffs[base..base + DCT_BLOCK_SIZE];
+                let coeffs = coded_block(jpg, ss, cfl, c, bx, by);
                 for slot in 1..DCT_BLOCK_SIZE {
                     if coeffs[slot_to_src[slot]] != 0 {
                         nonzero[slot] += 1;
@@ -738,7 +1313,9 @@ fn compute_coeff_orders(jpg: &JpegData, dim: &Dim, ss: &Subsampling) -> [[u8; DC
 fn tokenize_ac(
     jpg: &JpegData,
     dim: &Dim,
-    ss: &Subsampling,
+    ss: &ChannelLayout,
+    bctx: &BlockCtx,
+    cfl: Option<&JpegCfl>,
     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -746,7 +1323,7 @@ fn tokenize_ac(
     pool.steal_map(scratch, dim.num_groups, |g, _scratch| {
         let gx = g % dim.xsize_groups;
         let gy = g / dim.xsize_groups;
-        tokenize_ac_group(jpg, dim, ss, scan, gx, gy)
+        tokenize_ac_group(jpg, dim, ss, bctx, cfl, scan, gx, gy)
     })
 }
 
@@ -754,7 +1331,9 @@ fn tokenize_ac(
 fn tokenize_ac_group(
     jpg: &JpegData,
     dim: &Dim,
-    ss: &Subsampling,
+    ss: &ChannelLayout,
+    bctx: &BlockCtx,
+    cfl: Option<&JpegCfl>,
     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
     gx: usize,
     gy: usize,
@@ -782,13 +1361,11 @@ fn tokenize_ac_group(
                             continue;
                         }
                         let (sx, sy) = (bx >> hs, by >> vs);
-                        let comp = &jpg.components[JPEG_ORDER_YCBCR[c]];
-                        let bi = (abs_by >> vs) * comp.width_in_blocks + (abs_bx >> hs);
-                        let src = &comp.coeffs[bi * DCT_BLOCK_SIZE..(bi + 1) * DCT_BLOCK_SIZE];
+                        let src = coded_block(jpg, ss, cfl, c, abs_bx >> hs, abs_by >> vs);
                         // JXL transposes the DCT relative to JPEG.
                         for (y, src_row) in src.as_chunks::<8>().0.iter().enumerate() {
                             for (x, &src) in src_row.iter().enumerate() {
-                                block[x * 8 + y] = src as i32;
+                                block[x * 8 + y] = src;
                             }
                         }
 
@@ -809,11 +1386,13 @@ fn tokenize_ac_group(
                             GROUP_DIM_IN_BLOCKS as u8,
                         );
 
-                        // Always a plain 8x8 DCT, so strategy code 0.
-                        let block_ctx = block_context(c, 0);
-                        let nzero_ctx = non_zero_context(predicted as u32, block_ctx);
-                        let histo_offset =
-                            crate::ac_context::zero_density_contexts_offset(block_ctx);
+                        let luma = ss.luma(jpg);
+                        let luma_dc = luma.coeffs
+                            [(abs_by * luma.width_in_blocks + abs_bx) * DCT_BLOCK_SIZE]
+                            + ss.dc_offset[1];
+                        let block_ctx = bctx.context(c, luma_dc);
+                        let nzero_ctx = bctx.non_zero_context(predicted as u32, block_ctx);
+                        let histo_offset = bctx.zero_density_offset(block_ctx);
 
                         tokens.push(Token::new(nzero_ctx, nzeros));
 
@@ -840,5 +1419,117 @@ fn tokenize_ac_group(
             }
             tokens
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jpeg::JpegComponent;
+
+    fn gray(h: usize, v: usize) -> JpegData {
+        JpegData {
+            components: vec![JpegComponent {
+                id: 1,
+                h_samp_factor: h,
+                v_samp_factor: v,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grayscale_keeps_full_resolution_and_signals_its_sampling() {
+        // The decoder rebuilds the component's sampling factors from the
+        // per-channel modes, so they must survive even though no channel is
+        // actually subsampled.
+        for ((h, v), mode, max) in [
+            ((1, 1), 0, (0, 0)),
+            ((2, 2), 1, (1, 1)),
+            ((2, 1), 2, (1, 0)),
+            ((1, 2), 3, (0, 1)),
+        ] {
+            let ss = check_supported(&gray(h, v)).unwrap();
+            assert!(ss.gray);
+            assert_eq!(ss.mode, [mode; 3]);
+            assert_eq!((ss.max_hshift, ss.max_vshift), max);
+            assert_eq!((ss.hshift, ss.vshift), ([0; 3], [0; 3]));
+        }
+        assert!(check_supported(&gray(4, 1)).is_err());
+    }
+
+    #[test]
+    fn grayscale_chroma_reads_as_zero() {
+        let mut jpg = gray(1, 1);
+        jpg.components[0].width_in_blocks = 1;
+        jpg.components[0].height_in_blocks = 1;
+        jpg.components[0].coeffs = (1..=64).collect();
+        let ss = check_supported(&jpg).unwrap();
+        assert_eq!(coded_block(&jpg, &ss, None, 1, 0, 0)[5], 6);
+        assert_eq!(coded_block(&jpg, &ss, None, 0, 0, 0), [0; DCT_BLOCK_SIZE]);
+        assert_eq!(coded_block(&jpg, &ss, None, 2, 0, 0), [0; DCT_BLOCK_SIZE]);
+    }
+
+    fn three(ids: [u8; 3], samp: [(usize, usize); 3], markers: &[(u8, Vec<u8>)]) -> JpegData {
+        let quant = |dc: i32| super::super::JpegQuantTable {
+            values: std::array::from_fn(|i| if i == 0 { dc } else { 1 }),
+            precision: 0,
+            index: 0,
+            is_last: true,
+        };
+        JpegData {
+            components: (0..3)
+                .map(|i| JpegComponent {
+                    id: u32::from(ids[i]),
+                    h_samp_factor: samp[i].0,
+                    v_samp_factor: samp[i].1,
+                    quant_idx: i as u32,
+                    ..Default::default()
+                })
+                .collect(),
+            quant: vec![quant(3), quant(8), quant(1000)],
+            marker_order: markers.iter().map(|(m, _)| *m).collect(),
+            app_data: markers.iter().map(|(_, d)| d.clone()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn adobe(transform: u8) -> (u8, Vec<u8>) {
+        let mut seg = vec![0xEE, 0, 14];
+        seg.extend_from_slice(b"Adobe\x00\x64\x00\x00\x00\x00");
+        seg.push(transform);
+        (0xEE, seg)
+    }
+
+    #[test]
+    fn rgb_detection_follows_libjxl() {
+        let full = [(1, 1); 3];
+        let jfif = (0xE0, vec![0xE0, 0, 16]);
+        // Component ids alone, when nothing else says otherwise.
+        assert!(is_rgb(&three(*b"RGB", full, &[])));
+        assert!(!is_rgb(&three([1, 2, 3], full, &[])));
+        // Adobe's transform flag wins over the ids...
+        assert!(is_rgb(&three([1, 2, 3], full, &[adobe(0)])));
+        assert!(!is_rgb(&three(*b"RGB", full, &[adobe(1)])));
+        // ...and a JFIF marker means YCbCr whatever else is present.
+        assert!(!is_rgb(&three(*b"RGB", full, &[jfif.clone(), adobe(0)])));
+        // A later APP14 is found past other APP segments.
+        let exif = (0xE1, vec![0xE1, 0, 6, b'E', b'x', b'i']);
+        assert!(is_rgb(&three([1, 2, 3], full, &[exif, adobe(0)])));
+    }
+
+    #[test]
+    fn rgb_layout_skips_ycbcr_and_recenters_dc() {
+        let ss = check_supported(&three(*b"RGB", [(1, 1); 3], &[])).unwrap();
+        assert!(!ss.ycbcr && !ss.gray);
+        assert_eq!(ss.jpeg_order, [0, 1, 2]);
+        assert_eq!(ss.dc_offset, [1024 / 3, 1024 / 8, 1]);
+        // Chroma subsampling cannot be signaled without the YCbCr transform.
+        assert!(check_supported(&three(*b"RGB", [(2, 2), (1, 1), (1, 1)], &[])).is_err());
+
+        let ycc = check_supported(&three([1, 2, 3], [(2, 2), (1, 1), (1, 1)], &[])).unwrap();
+        assert!(ycc.ycbcr);
+        assert_eq!(ycc.dc_offset, [0; 3]);
     }
 }

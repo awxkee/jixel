@@ -938,6 +938,48 @@ fn refine_leaf(
     }
 }
 
+/// Largest |offset| a DC leaf may carry.
+const DC_LEAF_OFFSET_LIMIT: i32 = 8;
+/// Contexts with fewer tokens keep offset 0.
+const DC_LEAF_OFFSET_MIN_TOKENS: u32 = 16;
+
+/// Per-context median residual, clamped to the offset limit.
+pub(crate) fn median_leaf_offsets(tokens: &[Vec<Token>], num_contexts: usize) -> Vec<i32> {
+    const SPAN: usize = 2 * DC_LEAF_OFFSET_LIMIT as usize + 1;
+    let mut counts = vec![[0u32; SPAN]; num_contexts];
+    for t in tokens.iter().flatten() {
+        let r = unpack_signed(t.value).clamp(-DC_LEAF_OFFSET_LIMIT, DC_LEAF_OFFSET_LIMIT);
+        counts[t.context as usize][(r + DC_LEAF_OFFSET_LIMIT) as usize] += 1;
+    }
+    counts
+        .iter()
+        .map(|c| {
+            let total: u32 = c.iter().sum();
+            if total < DC_LEAF_OFFSET_MIN_TOKENS {
+                return 0;
+            }
+            let mut seen = 0;
+            for (i, &n) in c.iter().enumerate() {
+                seen += n;
+                if 2 * seen >= total {
+                    return i as i32 - DC_LEAF_OFFSET_LIMIT;
+                }
+            }
+            0
+        })
+        .collect()
+}
+
+/// Subtract each token's context offset from its residual.
+pub(crate) fn apply_leaf_offsets(tokens: &mut [Vec<Token>], offsets: &[i32]) {
+    for t in tokens.iter_mut().flatten() {
+        let off = offsets[t.context as usize];
+        if off != 0 {
+            t.value = pack_signed(unpack_signed(t.value) - off);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,47 +1216,5 @@ mod tests {
         let x_ctx = learned.dc_context[(1usize << 10) | 512];
         let y_ctx = learned.dc_context[512];
         assert_ne!(x_ctx, y_ctx, "channel split should separate X from Y");
-    }
-}
-
-/// Largest |offset| a DC leaf may carry.
-const DC_LEAF_OFFSET_LIMIT: i32 = 8;
-/// Contexts with fewer tokens keep offset 0.
-const DC_LEAF_OFFSET_MIN_TOKENS: u32 = 16;
-
-/// Per-context median residual, clamped to the offset limit.
-pub(crate) fn median_leaf_offsets(tokens: &[Vec<Token>], num_contexts: usize) -> Vec<i32> {
-    const SPAN: usize = 2 * DC_LEAF_OFFSET_LIMIT as usize + 1;
-    let mut counts = vec![[0u32; SPAN]; num_contexts];
-    for t in tokens.iter().flatten() {
-        let r = unpack_signed(t.value).clamp(-DC_LEAF_OFFSET_LIMIT, DC_LEAF_OFFSET_LIMIT);
-        counts[t.context as usize][(r + DC_LEAF_OFFSET_LIMIT) as usize] += 1;
-    }
-    counts
-        .iter()
-        .map(|c| {
-            let total: u32 = c.iter().sum();
-            if total < DC_LEAF_OFFSET_MIN_TOKENS {
-                return 0;
-            }
-            let mut seen = 0;
-            for (i, &n) in c.iter().enumerate() {
-                seen += n;
-                if 2 * seen >= total {
-                    return i as i32 - DC_LEAF_OFFSET_LIMIT;
-                }
-            }
-            0
-        })
-        .collect()
-}
-
-/// Subtract each token's context offset from its residual.
-pub(crate) fn apply_leaf_offsets(tokens: &mut [Vec<Token>], offsets: &[i32]) {
-    for t in tokens.iter_mut().flatten() {
-        let off = offsets[t.context as usize];
-        if off != 0 {
-            t.value = pack_signed(unpack_signed(t.value) - off);
-        }
     }
 }
