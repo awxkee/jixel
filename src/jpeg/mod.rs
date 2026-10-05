@@ -37,6 +37,7 @@ mod parse;
 pub(crate) use parse::{JpegError, parse_jpeg};
 use std::num::NonZeroUsize;
 
+use crate::Speed;
 use crate::util::EncodeError;
 pub use brotli::BrotliCompression;
 
@@ -55,13 +56,23 @@ fn push_box(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+/// An ICC profile reassembled from the APP2 `ICC_PROFILE` chunks.
+#[derive(Debug, PartialEq)]
+struct JpegIcc {
+    profile: Vec<u8>,
+    /// The chunks' `app_data` indices when they appear in file order as chunk
+    /// 1, 2, .., N. Only then can the decoder regenerate them from the
+    /// codestream's profile, so `jbrd` need not store them a second time.
+    in_order_apps: Option<Vec<usize>>,
+}
+
 /// Reassembles an ICC profile from the APP2 `ICC_PROFILE` chunks.
-fn extract_icc(jpg: &JpegData) -> Option<Vec<u8>> {
+fn extract_icc(jpg: &JpegData) -> Option<JpegIcc> {
     const TAG: &[u8] = b"ICC_PROFILE\0";
     // Each entry is [marker, len_hi, len_lo, payload..].
-    let mut chunks: Vec<(u8, &[u8])> = Vec::new();
+    let mut chunks: Vec<(u8, usize, &[u8])> = Vec::new();
     let mut expected = 0u8;
-    for app in &jpg.app_data {
+    for (index, app) in jpg.app_data.iter().enumerate() {
         if app.first() != Some(&0xE2) || app.len() < 3 + TAG.len() + 2 {
             continue;
         }
@@ -75,21 +86,61 @@ fn extract_icc(jpg: &JpegData) -> Option<Vec<u8>> {
             return None;
         }
         expected = count;
-        chunks.push((seq, &payload[TAG.len() + 2..]));
+        chunks.push((seq, index, &payload[TAG.len() + 2..]));
     }
     if chunks.is_empty() || chunks.len() != usize::from(expected) {
         return None;
     }
-    chunks.sort_by_key(|&(seq, _)| seq);
+    let in_order = chunks
+        .iter()
+        .enumerate()
+        .all(|(i, &(seq, _, _))| usize::from(seq) == i + 1);
+    chunks.sort_by_key(|&(seq, _, _)| seq);
     if chunks
         .iter()
         .enumerate()
-        .any(|(i, &(seq, _))| usize::from(seq) != i + 1)
+        .any(|(i, &(seq, _, _))| usize::from(seq) != i + 1)
     {
         return None;
     }
-    let profile: Vec<u8> = chunks.iter().flat_map(|&(_, data)| data).copied().collect();
-    (!profile.is_empty()).then_some(profile)
+    let profile: Vec<u8> = chunks
+        .iter()
+        .flat_map(|&(_, _, data)| data)
+        .copied()
+        .collect();
+    (!profile.is_empty()).then(|| JpegIcc {
+        profile,
+        in_order_apps: in_order.then(|| chunks.iter().map(|&(_, index, _)| index).collect()),
+    })
+}
+
+/// Structural checks a profile must pass before it is embedded, the ones PNG
+/// writers and color managers also apply: header size field, `acsp`
+/// signature, and every tag inside the profile. Anything else (a corrupted or
+/// foreign APP2 payload) would be handed on to every decoder of the image.
+fn icc_is_well_formed(icc: &[u8]) -> bool {
+    const HEADER: usize = 128;
+    let be32 = |at: usize| -> Option<usize> {
+        let b = icc.get(at..at + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    if icc.len() < HEADER + 4 || be32(0) != Some(icc.len()) || &icc[36..40] != b"acsp" {
+        return false;
+    }
+    let Some(num_tags) = be32(HEADER) else {
+        return false;
+    };
+    let table_end = (num_tags as u64) * 12 + HEADER as u64 + 4;
+    if table_end > icc.len() as u64 {
+        return false;
+    }
+    (0..num_tags).all(|i| {
+        let entry = HEADER + 4 + i * 12;
+        match (be32(entry + 4), be32(entry + 8)) {
+            (Some(offset), Some(size)) => (offset as u64 + size as u64) <= icc.len() as u64,
+            _ => false,
+        }
+    })
 }
 
 /// Extracts the first standard XMP APP1 segment.
@@ -124,6 +175,10 @@ pub struct JpegTranscodeConfig {
     /// When absent, Jixel emits a conforming stored-block (uncompressed)
     /// Brotli stream and does not require a Brotli dependency.
     pub brotli_compression: Option<Box<dyn BrotliCompression>>,
+    /// Entropy-coding effort. The coefficients, and so the decoded pixels and
+    /// the reconstructed JPEG, are the same at every speed. Defaults to
+    /// [`Speed::Fast`].
+    pub speed: Speed,
 }
 
 impl std::fmt::Debug for JpegTranscodeConfig {
@@ -131,6 +186,7 @@ impl std::fmt::Debug for JpegTranscodeConfig {
         f.debug_struct("JpegTranscodeConfig")
             .field("jpeg_reconstruction", &self.jpeg_reconstruction)
             .field("num_threads", &self.num_threads)
+            .field("speed", &self.speed)
             .field(
                 "brotli_compression",
                 &self.brotli_compression.as_ref().map(|_| "custom"),
@@ -147,6 +203,7 @@ impl Default for JpegTranscodeConfig {
                 .unwrap_or(NonZeroUsize::new(1).unwrap())
                 .get(),
             brotli_compression: None,
+            speed: Speed::default(),
         }
     }
 }
@@ -161,6 +218,12 @@ impl JpegTranscodeConfig {
     /// Sets the number of worker threads, which does not affect the output.
     pub fn with_num_threads(mut self, threads: usize) -> Self {
         self.num_threads = threads.max(1);
+        self
+    }
+
+    /// Sets the entropy-coding effort; see [`Self::speed`].
+    pub fn with_speed(mut self, speed: Speed) -> Self {
+        self.speed = speed;
         self
     }
 
@@ -185,9 +248,16 @@ pub fn encode_jpeg_lossless_with_config(
 
     // Embedded in the codestream either way: without it, dropping the `jbrd`
     // box would silently discard the profile and leave the image mislabeled.
-    let icc = extract_icc(&parsed);
+    // A malformed one is left out, as libjxl does for broken chunking: the
+    // image reads as sRGB and its APP2 bytes still travel in `jbrd`.
+    let icc = extract_icc(&parsed).filter(|icc| icc_is_well_formed(&icc.profile));
     let xmp = extract_xmp(&parsed);
-    let codestream = encode::encode_jpeg_codestream(&parsed, icc.as_deref(), config.num_threads)?;
+    let codestream = encode::encode_jpeg_codestream(
+        &parsed,
+        icc.as_ref().map(|icc| icc.profile.as_slice()),
+        config.speed,
+        config.num_threads,
+    )?;
 
     if !config.jpeg_reconstruction {
         // Dropping reconstruction also drops container-only JPEG metadata.
@@ -197,6 +267,9 @@ pub fn encode_jpeg_lossless_with_config(
     let reconstruction = jbrd::encode_jbrd(
         &parsed,
         xmp.as_ref().map(|(index, _)| *index),
+        icc.as_ref()
+            .and_then(|icc| icc.in_order_apps.as_deref())
+            .unwrap_or_default(),
         config.brotli_compression.as_deref(),
     )?;
     let mut out = Vec::with_capacity(codestream.len() + reconstruction.len() + 64);
@@ -413,13 +486,18 @@ mod tests {
             icc_app2(1, 3, b"hello "),
             icc_app2(3, 3, b"!"),
         ]);
-        assert_eq!(extract_icc(&jpg).as_deref(), Some(&b"hello world!"[..]));
+        let icc = extract_icc(&jpg).unwrap();
+        assert_eq!(icc.profile, b"hello world!");
+        // Out of file order, so `jbrd` has to keep the segments verbatim.
+        assert_eq!(icc.in_order_apps, None);
     }
 
     #[test]
     fn reads_a_single_chunk_profile() {
         let jpg = with_app(vec![icc_app2(1, 1, b"profile")]);
-        assert_eq!(extract_icc(&jpg).as_deref(), Some(&b"profile"[..]));
+        let icc = extract_icc(&jpg).unwrap();
+        assert_eq!(icc.profile, b"profile");
+        assert_eq!(icc.in_order_apps.as_deref(), Some(&[0][..]));
     }
 
     #[test]
@@ -435,6 +513,57 @@ mod tests {
         // Sequence numbers are 1-based and contiguous.
         let bad_seq = with_app(vec![icc_app2(0, 1, b"a")]);
         assert_eq!(extract_icc(&bad_seq), None);
+    }
+
+    #[test]
+    fn in_order_chunks_are_reported_for_regeneration() {
+        let mut exif = vec![0xE1u8, 0x00, 0x05];
+        exif.extend_from_slice(b"Exi");
+        let jpg = with_app(vec![
+            icc_app2(1, 2, b"hello "),
+            exif,
+            icc_app2(2, 2, b"world"),
+        ]);
+        let icc = extract_icc(&jpg).unwrap();
+        assert_eq!(icc.profile, b"hello world");
+        assert_eq!(icc.in_order_apps.as_deref(), Some(&[0, 2][..]));
+    }
+
+    /// A minimal structurally valid profile: header plus one tag.
+    fn tiny_profile() -> Vec<u8> {
+        let mut icc = vec![0u8; 128];
+        icc[36..40].copy_from_slice(b"acsp");
+        icc.extend_from_slice(&1u32.to_be_bytes());
+        icc.extend_from_slice(b"desc");
+        icc.extend_from_slice(&144u32.to_be_bytes());
+        icc.extend_from_slice(&4u32.to_be_bytes());
+        icc.extend_from_slice(b"data");
+        let len = icc.len() as u32;
+        icc[..4].copy_from_slice(&len.to_be_bytes());
+        icc
+    }
+
+    #[test]
+    fn well_formed_profiles_pass_and_damaged_ones_do_not() {
+        let good = tiny_profile();
+        assert!(icc_is_well_formed(&good));
+
+        assert!(!icc_is_well_formed(b"hello world"));
+        let mut bad_magic = good.clone();
+        bad_magic[36] = b'x';
+        assert!(!icc_is_well_formed(&bad_magic));
+        // Size field disagrees with the reassembled length.
+        let mut truncated = good.clone();
+        truncated.pop();
+        assert!(!icc_is_well_formed(&truncated));
+        // A tag pointing past the end.
+        let mut bad_tag = good.clone();
+        bad_tag[136..140].copy_from_slice(&200u32.to_be_bytes());
+        assert!(!icc_is_well_formed(&bad_tag));
+        // More tags than the table can hold.
+        let mut bad_count = good;
+        bad_count[128..132].copy_from_slice(&1000u32.to_be_bytes());
+        assert!(!icc_is_well_formed(&bad_count));
     }
 
     #[test]

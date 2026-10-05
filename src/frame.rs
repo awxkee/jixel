@@ -32,7 +32,6 @@ use crate::Speed;
 mod dc_smoothing;
 use dc_smoothing::skip_dc_smoothing;
 
-use crate::ac_context::compact_block_context_map;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
 use crate::color_correlation::choose_ytob_dc;
@@ -978,33 +977,6 @@ fn write_frame_header(
     w.write(2, 0); // no name
     write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, w);
     w.write(2, 0); // no frame header extensions
-}
-
-/// Writes the compact block-context map used whenever the default shortcut is
-/// not taken.
-pub(crate) fn write_compact_block_context_map(
-    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
-    w: &mut BitWriter,
-) {
-    let empty_codes: [crate::entropy::PrefixCode; 0] = [];
-    let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
-    let empty_histograms = [];
-    let empty_syms: [Vec<crate::entropy::AnsEncSymbolInfo>; 0] = [];
-    let empty_reverse_maps: [u16; 0] = [];
-    let cm_entropy = EntropyCode {
-        context_map: compact_block_context_map(),
-        num_contexts: compact_block_context_map().len(),
-        prefix_codes: &empty_codes,
-        hybrid_uint_configs: &empty_configs,
-        num_prefix_codes: 0,
-        orig_context_map: None,
-        orig_num_contexts: 0,
-        use_prefix_code: true,
-        ans_histograms: &empty_histograms,
-        ans_symbols: &empty_syms,
-        ans_reverse_maps: &empty_reverse_maps,
-    };
-    crate::entropy::write_context_map(&cm_entropy, huffman_pool, w);
 }
 
 pub(crate) fn write_quant_scales(global_scale: i32, quant_dc: i32, w: &mut BitWriter) {

@@ -108,20 +108,24 @@ const TYPE_RGB: u64 = 2;
 const TYPE_CUSTOM: u64 = 3;
 
 /// Serializes `jpg` into a complete `jbrd` box payload.
+///
+/// `icc_app_indices` are the APP2 segments the decoder regenerates from the
+/// codestream's ICC profile: every chunk of it, in chunk order.
 pub(crate) fn encode_jbrd(
     jpg: &JpegData,
     xmp_app_index: Option<usize>,
+    icc_app_indices: &[usize],
     compressor: Option<&dyn BrotliCompression>,
 ) -> Result<Vec<u8>, EncodeError> {
-    let mut out =
-        encode_fields(jpg, xmp_app_index).map_err(|error| EncodeError::Jpeg(error.to_string()))?;
+    let mut out = encode_fields(jpg, xmp_app_index, icc_app_indices)
+        .map_err(|error| EncodeError::Jpeg(error.to_string()))?;
 
     // Order is fixed: unknown-typed APP segments, then COM, then inter-marker
     // chunks, then the tail. The tagged XMP segment is supplied by the `xml `
-    // container box instead and is therefore omitted here.
+    // container box and the ICC chunks by the codestream, so both are omitted.
     let mut payload = Vec::new();
     for (index, app) in jpg.app_data.iter().enumerate() {
-        if Some(index) == xmp_app_index {
+        if Some(index) == xmp_app_index || icc_app_indices.contains(&index) {
             continue;
         }
         payload.extend_from_slice(app);
@@ -140,7 +144,11 @@ pub(crate) fn encode_jbrd(
 
 /// Emits the bit-packed field section, zero-padded to a byte boundary. Kept
 /// separate so it can be diffed against libjxl's, whose Brotli tail differs.
-fn encode_fields(jpg: &JpegData, xmp_app_index: Option<usize>) -> Result<Vec<u8>, JpegError> {
+fn encode_fields(
+    jpg: &JpegData,
+    xmp_app_index: Option<usize>,
+    icc_app_indices: &[usize],
+) -> Result<Vec<u8>, JpegError> {
     let mut w = BitWriter::new();
 
     write_bool(&mut w, jpg.components.len() == 1);
@@ -160,13 +168,21 @@ fn encode_fields(jpg: &JpegData, xmp_app_index: Option<usize>) -> Result<Vec<u8>
         w.write(6, (m - 0xC0) as u64);
     }
 
-    // A recognized XMP APP1 segment is rebuilt from the container's `xml ` box;
-    // all other APP segments remain byte-for-byte data in the Brotli section.
+    // A recognized XMP APP1 segment is rebuilt from the container's `xml ` box
+    // and ICC chunks from the codestream's profile; all other APP segments
+    // remain byte-for-byte data in the Brotli section.
     for (index, app) in jpg.app_data.iter().enumerate() {
+        let marker_type = if Some(index) == xmp_app_index {
+            3
+        } else if icc_app_indices.contains(&index) {
+            1
+        } else {
+            0
+        };
         write_u32(
             &mut w,
             [Val(0), Val(1), BitsOffset(1, 2), BitsOffset(2, 4)],
-            if Some(index) == xmp_app_index { 3 } else { 0 },
+            marker_type,
         )?;
         let len = checked_seg_len(app)?;
         w.write(16, len as u64);

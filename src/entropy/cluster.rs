@@ -343,16 +343,26 @@ pub(crate) fn cluster_histograms(
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) {
-    cluster_histograms_inner(histograms, context_map, false, huffman_pool, None);
+    cluster_histograms_inner(histograms, context_map, false, false, huffman_pool, None);
 }
 
+/// `isolate_single_symbol` gives every single-symbol histogram its own cluster
+/// before seeding; see `cluster_histograms_inner`.
 pub(crate) fn cluster_histograms_with_pool(
     histograms: &mut Vec<Histogram>,
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
+    isolate_single_symbol: bool,
     pool: Option<&ThreadPool>,
 ) {
-    cluster_histograms_inner(histograms, context_map, false, huffman_pool, pool);
+    cluster_histograms_inner(
+        histograms,
+        context_map,
+        false,
+        isolate_single_symbol,
+        huffman_pool,
+        pool,
+    );
 }
 
 /// `max_clusters` (at most `CLUSTERS_LIMIT`) bounds the clusters produced,
@@ -707,6 +717,7 @@ fn cluster_histograms_inner(
     histograms: &mut Vec<Histogram>,
     context_map: &mut Vec<u8>,
     refined: bool,
+    isolate_single_symbol: bool,
     huffman_pool: &mut Vec<HuffmanNode>,
     pool: Option<&ThreadPool>,
 ) {
@@ -761,6 +772,42 @@ fn cluster_histograms_inner(
     let mut out: Vec<Histogram> = Vec::with_capacity(max_histograms);
     let mut out_costs: Vec<f32> = Vec::with_capacity(max_histograms);
     let mut scratch = [0u32; ALPHABET_SIZE];
+    if isolate_single_symbol {
+        // Under prefix costs a single-symbol histogram codes for free alone,
+        // and merging anything into it costs a bit per token it holds. With
+        // one dominating the counts (a grayscale JPEG's all-zero chroma), every
+        // distance to it is about equal and farthest-first seeding picks a
+        // near-empty context next, which then absorbs everything. Give each
+        // such symbol its own cluster before seeding.
+        for (i, hist) in inp.iter().enumerate() {
+            if symbols[i] != unassigned || out.len() + 1 >= max_histograms {
+                continue;
+            }
+            let mut used = hist.counts.iter().enumerate().filter(|&(_, &c)| c != 0);
+            let (Some((sym, _)), None) = (used.next(), used.next()) else {
+                continue;
+            };
+            let j = out
+                .iter()
+                .position(|o| o.counts[sym] == o.total_count)
+                .unwrap_or_else(|| {
+                    out.push(Histogram::new());
+                    out_costs.push(0.0);
+                    out.len() - 1
+                });
+            histogram_add(&mut out[j], hist);
+            symbols[i] = j as u8;
+            dists[i] = 0.0;
+        }
+        match (0..n)
+            .filter(|&i| symbols[i] == unassigned && inp[i].total_count != 0)
+            .max_by_key(|&i| inp[i].total_count)
+        {
+            Some(i) => largest_idx = i,
+            // Nothing left to seed.
+            None => largest_idx = usize::MAX,
+        }
+    }
 
     // Seed distances are independent. The reduction below still runs in
     // input order, including the floating-point saving and first-best ties.
@@ -770,7 +817,7 @@ fn cluster_histograms_inner(
 
     // See the note in `cluster_histograms_fixed`: the stop test is on the total
     // saving a cluster realizes, not on one context's distance.
-    while out.len() < max_histograms {
+    while largest_idx != usize::MAX && out.len() < max_histograms {
         let candidate = largest_idx;
         // Pushed speculatively; popped again if the candidate does not earn its
         // header. See the note in `cluster_histograms_fixed`.
@@ -1325,6 +1372,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn single_symbol_context_does_not_derail_seeding() {
+        // A grayscale JPEG's all-zero chroma: one single-symbol context far
+        // larger than the rest. Merging another single-symbol context into it
+        // makes a two-symbol histogram, priced at a bit per token, so
+        // farthest-first picks that near-empty context as the next seed; every
+        // real (Shannon-priced) context is then within a few bits of it and
+        // seeding stops. The four distinct contexts must keep their own.
+        let mut histograms = Vec::new();
+        let mut zeros = Histogram::new();
+        for _ in 0..30_000 {
+            zeros.add(0);
+        }
+        histograms.push(zeros);
+        let mut tiny = Histogram::new();
+        for _ in 0..3 {
+            tiny.add(40);
+        }
+        histograms.push(tiny);
+        for family in 0..4u32 {
+            let mut h = Histogram::new();
+            for i in 0..2000 {
+                h.add(if i % 2 == 0 {
+                    0
+                } else {
+                    1 + family * 6 + (i / 2) % 3
+                });
+            }
+            histograms.push(h);
+        }
+
+        let mut map = Vec::new();
+        cluster_histograms_with_pool(&mut histograms, &mut map, &mut Vec::new(), true, None);
+        assert_ne!(map[0], map[1], "the single-symbol contexts merged");
+        let distinct: std::collections::BTreeSet<u8> = map[2..].iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "distinct contexts merged: {map:?}");
+        assert!(!distinct.contains(&map[0]) && !distinct.contains(&map[1]));
+    }
+
+    #[test]
     fn ans_clustering_is_independent_of_thread_count() {
         // Skewed, finely split contexts (a bilevel image's MA-tree leaves):
         // the parallel maps and the propose-then-verify refinement must give
@@ -1511,6 +1597,7 @@ mod tests {
             &mut expected,
             &mut expected_map,
             refined,
+            false,
             &mut expected_pool,
             None,
         );
@@ -1676,6 +1763,7 @@ mod tests {
                     &mut actual,
                     &mut actual_map,
                     &mut Vec::new(),
+                    false,
                     Some(&pool),
                 );
                 assert_eq!(actual_map, expected_map, "n={n}, threads={threads}");

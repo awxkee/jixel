@@ -850,12 +850,40 @@ where
         num_contexts,
         huffman_pool,
         select_configs,
-        false,
+        AcClustering::Prefix {
+            isolate_single_symbol: false,
+        },
         if speed == crate::Speed::Slow {
             1.0
         } else {
             0.995
         },
+        pool,
+    )
+}
+
+/// JPEG-recompression bundles: as `optimize_entropy_code_ac_streams` at Fast,
+/// but single-symbol contexts (a grayscale JPEG's all-zero chroma) are kept
+/// out of the prefix-cost seeding.
+pub(crate) fn optimize_entropy_code_jpeg_ac_streams<'a, I>(
+    streams: I,
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    select_configs: bool,
+    pool: Option<&ThreadPool>,
+) -> OwnedEntropyCode
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
+    optimize_entropy_code_ac_streams_impl(
+        streams,
+        num_contexts,
+        huffman_pool,
+        select_configs,
+        AcClustering::Prefix {
+            isolate_single_symbol: true,
+        },
+        0.995,
         pool,
     )
 }
@@ -874,7 +902,7 @@ where
         num_contexts,
         huffman_pool,
         false,
-        true,
+        AcClustering::Coarse,
         0.995,
         pool,
     )
@@ -1729,12 +1757,21 @@ fn propose_ans_cluster_batch(
     Some((histograms, map, configs))
 }
 
+#[derive(Clone, Copy)]
+enum AcClustering {
+    /// Fixed coarse buckets, no distance search.
+    Coarse,
+    Prefix {
+        isolate_single_symbol: bool,
+    },
+}
+
 fn optimize_entropy_code_ac_streams_impl<'a, I>(
     streams: I,
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
-    fast_cluster: bool,
+    clustering: AcClustering,
     hybrid_acceptance: f64,
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
@@ -1750,7 +1787,7 @@ where
         num_contexts,
         huffman_pool,
         select_configs,
-        fast_cluster,
+        clustering,
         hybrid_acceptance,
         pool,
     )
@@ -1762,7 +1799,7 @@ fn optimize_entropy_code_ac_slices(
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
-    fast_cluster: bool,
+    clustering: AcClustering,
     hybrid_acceptance: f64,
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode {
@@ -1781,7 +1818,18 @@ fn optimize_entropy_code_ac_slices(
         }
     }
     let mut context_map: Vec<u8> = Vec::new();
-    if fast_cluster {
+    if let AcClustering::Prefix {
+        isolate_single_symbol,
+    } = clustering
+    {
+        super::cluster::cluster_histograms_with_pool(
+            &mut histograms,
+            &mut context_map,
+            huffman_pool,
+            isolate_single_symbol,
+            pool,
+        );
+    } else {
         const COARSE_CLUSTERS: usize = 64;
         const NZ_CONTEXTS: usize = crate::ac_context::K_NON_ZERO_BUCKETS;
         let mut coarse = vec![Histogram::new(); COARSE_CLUSTERS];
@@ -1819,13 +1867,6 @@ fn optimize_entropy_code_ac_slices(
                 0
             }
         }));
-    } else {
-        super::cluster::cluster_histograms_with_pool(
-            &mut histograms,
-            &mut context_map,
-            huffman_pool,
-            pool,
-        );
     }
 
     // Second walk: pick each final cluster's HybridUint config from its actual
