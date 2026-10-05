@@ -403,21 +403,19 @@ pub(crate) fn order_slot_of(strategy_code: u8) -> Option<usize> {
 /// scan puts the most-often-nonzero positions first so the coding loop's walk
 /// ends sooner.
 pub(crate) struct OrderStats {
-    counts: Vec<[Vec<u32>; 3]>,
-    blocks: Vec<u32>,
+    counts: [[Vec<u32>; 3]; ORDER_SPECS.len()],
+    blocks: [u32; ORDER_SPECS.len()],
 }
 
 impl OrderStats {
     pub(crate) fn new() -> Self {
         Self {
-            counts: ORDER_SPECS
-                .iter()
-                .map(|&(_, _, size)| [vec![0u32; size], vec![0u32; size], vec![0u32; size]])
-                .collect(),
-            blocks: vec![0u32; ORDER_SPECS.len()],
+            counts: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
+            blocks: [0u32; ORDER_SPECS.len()],
         }
     }
 
+    /// `tally_block` initializes the slot before any of its channel tallies.
     #[inline]
     pub(crate) fn tally(&mut self, slot: usize, channel: usize, raw_index: usize) {
         self.counts[slot][channel][raw_index] += 1;
@@ -425,11 +423,21 @@ impl OrderStats {
 
     #[inline]
     pub(crate) fn tally_block(&mut self, slot: usize) {
+        if self.counts[slot][0].is_empty() {
+            self.counts[slot] = std::array::from_fn(|_| vec![0u32; ORDER_SPECS[slot].2]);
+        }
         self.blocks[slot] += 1;
     }
 
     pub(crate) fn merge(&mut self, other: &Self) {
         for (dst, src) in self.counts.iter_mut().zip(other.counts.iter()) {
+            if src[0].is_empty() {
+                continue;
+            }
+            if dst[0].is_empty() {
+                dst.clone_from(src);
+                continue;
+            }
             for (d, s) in dst.iter_mut().zip(src.iter()) {
                 for (a, &b) in d.iter_mut().zip(s.iter()) {
                     *a += b;
@@ -578,6 +586,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_order_statistics_preserve_dense_counts_and_derived_scans() {
+        let mut rng = 73u32;
+        for case in 0..32 {
+            let mut expected = OrderStats {
+                counts: std::array::from_fn(|slot| {
+                    std::array::from_fn(|_| vec![0u32; ORDER_SPECS[slot].2])
+                }),
+                blocks: [0; ORDER_SPECS.len()],
+            };
+            let mut actual = OrderStats::new();
+            assert!(actual.counts.iter().flatten().all(Vec::is_empty));
+            for group in 0..16 {
+                let mut part = OrderStats::new();
+                for (slot, &(_, _, size)) in ORDER_SPECS.iter().enumerate() {
+                    if (slot + case + group).is_multiple_of(3) {
+                        continue;
+                    }
+                    let blocks = (case * 17 + group * 13 + slot * 7) % 129;
+                    for _ in 0..blocks {
+                        part.tally_block(slot);
+                        expected.blocks[slot] += 1;
+                        for channel in 0..3 {
+                            for _ in 0..4 {
+                                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                                let raw = rng as usize % size;
+                                part.tally(slot, channel, raw);
+                                expected.counts[slot][channel][raw] += 1;
+                            }
+                        }
+                    }
+                }
+                actual.merge(&part);
+            }
+            assert_eq!(actual.blocks, expected.blocks);
+            for slot in 0..ORDER_SPECS.len() {
+                for channel in 0..3 {
+                    if actual.counts[slot][channel].is_empty() {
+                        assert!(expected.counts[slot][channel].iter().all(|&v| v == 0));
+                    } else {
+                        assert_eq!(actual.counts[slot][channel], expected.counts[slot][channel]);
+                    }
+                }
+            }
+            let mut expected_orders = CoeffOrders::natural();
+            let mut actual_orders = CoeffOrders::natural();
+            assert_eq!(
+                derive_orders(&actual, &mut actual_orders).to_bits(),
+                derive_orders(&expected, &mut expected_orders).to_bits()
+            );
+            assert_eq!(actual_orders.used_mask, expected_orders.used_mask);
+            assert_eq!(actual_orders.orders, expected_orders.orders);
+        }
+        // Empty inputs and unobserved slots stay allocation-free when merged.
+        let mut empty = OrderStats::new();
+        empty.merge(&OrderStats::new());
+        assert!(empty.counts.iter().flatten().all(Vec::is_empty));
+        let mut only_dct8 = OrderStats::new();
+        only_dct8.tally_block(0);
+        only_dct8.tally(0, 1, 63);
+        empty.merge(&only_dct8);
+        assert!(empty.counts[1..].iter().flatten().all(Vec::is_empty));
+        assert_eq!(empty.counts[0][1][63], 1);
+    }
+
+    #[test]
     fn natural_scans_are_shared_and_learned_scans_stay_local() {
         let natural = CoeffOrders::natural();
         let mut learned = CoeffOrders::natural();
@@ -590,6 +663,7 @@ mod tests {
                     learned.orders[slot][c].as_ptr()
                 ));
             }
+            stats.tally_block(slot);
             stats.blocks[slot] = 10_000;
             let raw = *natural.orders[slot][0].last().unwrap() as usize;
             stats.counts[slot][0][raw] = 10_000;
@@ -714,8 +788,16 @@ mod tests {
                     })
                     .collect();
                 let stats = OrderStats {
-                    counts: vec![std::array::from_fn(|_| counts.clone())],
-                    blocks: vec![1],
+                    counts: std::array::from_fn(|slot| {
+                        std::array::from_fn(|_| {
+                            if slot == 0 {
+                                counts.clone()
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                    }),
+                    blocks: [1; ORDER_SPECS.len()],
                 };
                 for llf in [0, 1, n / 3, n] {
                     let mut expected = natural.clone();

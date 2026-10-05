@@ -487,7 +487,11 @@ fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_neon::<BIASED>,
+            quantize: if input.quantization.compute_rate {
+                recon_quantize_neon::<BIASED, true>
+            } else {
+                recon_quantize_neon::<BIASED, false>
+            },
             ssim: ssim_deficit_neon,
             prepare: prepare_reconstruction_neon,
             error,
@@ -497,7 +501,7 @@ fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
 
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "neon")]
-fn recon_quantize_neon<const BIASED: bool>(
+fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -515,30 +519,29 @@ fn recon_quantize_neon<const BIASED: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n && scan_pos.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = vdupq_n_f32(quant_scale);
     let zero = vdupq_n_f32(0.0);
     let all = vdupq_n_u32(u32::MAX);
     let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
-    let mut nonzero = 0usize;
+    let mut nonzero_acc = vdupq_n_u32(0);
     let mut magnitude_bits = vdupq_n_f32(0.0);
     let mut scan_acc = vdupq_n_u32(0);
-    for (y, (((coeff_row, inv_row), error_row), scan_row)) in coeff
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
-        .zip(scan_pos.chunks_exact(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, (((coeff4, inv4), error4), scan4)) in coeff_row
+        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
             .as_chunks::<4>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<4>().0.iter())
             .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
-            .zip(scan_row.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let x = chunk_x * 4;
@@ -570,18 +573,28 @@ fn recon_quantize_neon<const BIASED: bool>(
                 all
             };
             unsafe { vst1q_f32(error4.as_mut_ptr(), vbslq_f32(active, error, zero)) };
-            let active_quantized = vbslq_f32(active, quantized, zero);
-            let absolute_q = vabsq_f32(active_quantized);
-            let nonzero_mask = vcgtq_f32(absolute_q, zero);
-            nonzero += vaddvq_u32(vshrq_n_u32::<31>(nonzero_mask)) as usize;
-            magnitude_bits = vaddq_f32(
-                magnitude_bits,
-                vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
-            );
-            let sv = unsafe { vld1q_u32(scan4.as_ptr()) };
-            scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
+            if COMPUTE_RATE {
+                let active_quantized = vbslq_f32(active, quantized, zero);
+                let absolute_q = vabsq_f32(active_quantized);
+                let nonzero_mask = vcgtq_f32(absolute_q, zero);
+                // Empty vectors add zero to every rate term. Keep counts
+                // lane-local and reduce once, as in the coefficient scorer.
+                if vmaxvq_u32(nonzero_mask) != 0 {
+                    nonzero_acc = vaddq_u32(nonzero_acc, vshrq_n_u32::<31>(nonzero_mask));
+                    magnitude_bits = vaddq_f32(
+                        magnitude_bits,
+                        vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
+                    );
+                    let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
+                    scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
+                }
+            }
         }
     }
+    if !COMPUTE_RATE {
+        return 0.0;
+    }
+    let nonzero = vaddvq_u32(nonzero_acc) as usize;
     let header = vgetq_lane_f32::<0>(neon_log2p1_f32(vsetq_lane_f32::<0>(
         nonzero as f32,
         vdupq_n_f32(0.0),
@@ -718,6 +731,110 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
     deficit
 }
 
+// Original per-vector rate reduction, retained as an exact test oracle.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
+    coeff: &[f32],
+    inv: &[f32],
+    quant_scale: f32,
+    thresholds: &[f32; 4],
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    coeff_error: &mut [f32],
+    _rate_log2_lut: &RateLog2Lut,
+    scan_pos: &[u32],
+) -> f32 {
+    let n = width
+        .checked_mul(height)
+        .expect("coefficient size overflow");
+    assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(!COMPUTE_RATE || scan_pos.len() >= n);
+    let scale = vdupq_n_f32(quant_scale);
+    let zero = vdupq_n_f32(0.0);
+    let all = vdupq_n_u32(u32::MAX);
+    let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
+    let mut nonzero = 0usize;
+    let mut magnitude_bits = vdupq_n_f32(0.0);
+    let mut scan_acc = vdupq_n_u32(0);
+    for (y, ((coeff_row, inv_row), error_row)) in coeff
+        .chunks_exact(width)
+        .zip(inv.chunks_exact(width))
+        .zip(coeff_error.chunks_exact_mut(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(inv_row.as_chunks::<4>().0.iter())
+            .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+            .enumerate()
+        {
+            let x = chunk_x * 4;
+            let threshold = vdupq_n_f32(if x >= half {
+                thresholds[yfix + 1]
+            } else {
+                thresholds[yfix]
+            });
+            let coeff_v = unsafe { vld1q_f32(coeff4.as_ptr()) };
+            let inv_v = unsafe { vld1q_f32(inv4.as_ptr()) };
+            let denominator = vmulq_f32(inv_v, scale);
+            let scaled = vmulq_f32(denominator, coeff_v);
+            let keep = vcgeq_f32(vabsq_f32(scaled), threshold);
+            // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
+            let quantized =
+                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
+            let dequantized = if BIASED {
+                super::ac_strategy::neon_dequantized_level_f32(quantized)
+            } else {
+                quantized
+            };
+            let error = vdivq_f32(vsubq_f32(scaled, dequantized), denominator);
+            let active = if y < cy && x < cx {
+                vcgeq_u32(
+                    vaddq_u32(vdupq_n_u32(x as u32), lanes),
+                    vdupq_n_u32(cx as u32),
+                )
+            } else {
+                all
+            };
+            unsafe { vst1q_f32(error4.as_mut_ptr(), vbslq_f32(active, error, zero)) };
+            if COMPUTE_RATE {
+                let active_quantized = vbslq_f32(active, quantized, zero);
+                let absolute_q = vabsq_f32(active_quantized);
+                let nonzero_mask = vcgtq_f32(absolute_q, zero);
+                nonzero += vaddvq_u32(vshrq_n_u32::<31>(nonzero_mask)) as usize;
+                magnitude_bits = vaddq_f32(
+                    magnitude_bits,
+                    vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
+                );
+                let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
+                scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
+            }
+        }
+    }
+    if !COMPUTE_RATE {
+        return 0.0;
+    }
+    let header = vgetq_lane_f32::<0>(neon_log2p1_f32(vsetq_lane_f32::<0>(
+        nonzero as f32,
+        vdupq_n_f32(0.0),
+    )));
+    nonzero as f32 * 1.6
+        + vaddvq_f32(magnitude_bits)
+        + 0.4 * header
+        + crate::inflated_cost::R_ZERO
+            * crate::inflated_cost::visited_zeros(nonzero, vmaxvq_u32(scan_acc), cx, cy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -733,6 +850,94 @@ mod tests {
         ReconDistInput, ReconErrorKernels, ReconQuantization, ReconScoring, ReconSource,
         ReconTransform, rate_log2_lut, recon_dist_and_rate_scalar, ssim_deficit_scalar,
     };
+
+    #[test]
+    fn sparse_reconstruction_rate_preserves_dense_kernel_bits() {
+        let special = [
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let mut rng = 73u32;
+        for (width, height, cx, cy) in [
+            (8, 8, 1, 1),
+            (16, 8, 2, 1),
+            (8, 16, 1, 2),
+            (16, 16, 2, 2),
+            (32, 16, 4, 2),
+            (32, 32, 4, 4),
+        ] {
+            let n = width * height;
+            let scan: Vec<u32> = (0..n).map(|i| ((i * 17) % n) as u32).collect();
+            for case in 0..64 {
+                let coeff: Vec<f32> = (0..n)
+                    .map(|_| {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match case % 4 {
+                            0 => 0.0,
+                            1 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2,
+                            2 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 200.0,
+                            _ => special[rng as usize % special.len()],
+                        }
+                    })
+                    .collect();
+                let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
+                let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
+                let thresholds = [0.0, 0.42, 0.57, 0.91];
+                for (original, optimized) in [
+                    (
+                        super::recon_quantize_neon_reference::<true, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                        super::recon_quantize_neon::<true, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                    ),
+                    (
+                        super::recon_quantize_neon_reference::<false, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                        super::recon_quantize_neon::<false, true>
+                            as crate::inflated_cost::ReconQuantizeFn,
+                    ),
+                ] {
+                    let mut expected_error = vec![-123.0; n];
+                    let mut actual_error = expected_error.clone();
+                    let run = |kernel: crate::inflated_cost::ReconQuantizeFn, error: &mut [f32]| unsafe {
+                        kernel(
+                            &coeff,
+                            &inv,
+                            scale,
+                            &thresholds,
+                            width,
+                            height,
+                            width / 2,
+                            cx,
+                            cy,
+                            error,
+                            rate_log2_lut(),
+                            &scan,
+                        )
+                    };
+                    let expected = run(original, &mut expected_error);
+                    let actual = run(optimized, &mut actual_error);
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{width}x{height}, case {case}"
+                    );
+                    for (a, e) in actual_error.iter().zip(expected_error) {
+                        assert_eq!(a.to_bits(), e.to_bits());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ssim_neon_matches_scalar() {
@@ -794,6 +999,7 @@ mod tests {
             let input = ReconDistInput {
                 idct: &idct,
                 quantization: ReconQuantization {
+                    compute_rate: true,
                     rate_log2_lut: rate_log2_lut(),
                     coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                     inverse_matrices: inv,

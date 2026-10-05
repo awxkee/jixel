@@ -512,6 +512,21 @@ fn forward_transform(
             (ctx.dct16x32)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
         }
+        STRATEGY_DCT64X64 => {
+            let dst = out.first_chunk_mut::<4096>().unwrap();
+            (ctx.dct64x64)(dct_input(plane, tmp, px, py), dst);
+            (8, 8)
+        }
+        STRATEGY_DCT64X32 => {
+            let dst = out.first_chunk_mut::<2048>().unwrap();
+            (ctx.dct64x32)(dct_input(plane, tmp, px, py), dst);
+            (8, 4)
+        }
+        STRATEGY_DCT32X64 => {
+            let dst = out.first_chunk_mut::<2048>().unwrap();
+            (ctx.dct32x64)(dct_input(plane, tmp, px, py), dst);
+            (8, 4)
+        }
         STRATEGY_DCT4X4 => {
             let dst: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
             (ctx.dct4x4)(dct_input(plane, tmp, px, py), dst);
@@ -596,31 +611,8 @@ fn strategy_cost64(
         rate_prices,
         ..
     } = scratch;
-    let coeffs: &mut [[f32; 4096]; 3] = coeffs;
-    let input: &mut [f32; 4096] = input;
-    let (width, height, size, cx, cy) = match strategy {
-        STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
-        STRATEGY_DCT64X32 => (32, 64, 2048, 8, 4),
-        STRATEGY_DCT32X64 => (64, 32, 2048, 8, 4),
-        _ => unreachable!("not a DCT64-family strategy: {strategy}"),
-    };
-    for (c, coeff) in coeffs.iter_mut().enumerate() {
-        gather_pixels(opsin.plane(c), px, py, width, height, &mut input[..size]);
-        match strategy {
-            STRATEGY_DCT64X64 => (ctx.dct64x64)(DctInput::from_flat(input), coeff),
-            STRATEGY_DCT64X32 => (ctx.dct64x32)(
-                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
-                coeff.first_chunk_mut::<2048>().unwrap(),
-            ),
-            STRATEGY_DCT32X64 => (ctx.dct32x64)(
-                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
-                coeff.first_chunk_mut::<2048>().unwrap(),
-            ),
-            _ => unreachable!(),
-        }
-    }
-    let [x, y, b] = coeffs;
-    apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
+    let (cx, cy, size) =
+        prepare_strategy_coeffs(ctx, coeffs, input, strategy, opsin, px, py, cmap_factor);
 
     if let Some((distortion, rate)) = rate_prices.as_deref().and_then(|prices| {
         prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
@@ -1038,6 +1030,7 @@ fn reconstruction_dist_and_rate(
         &ReconDistInput {
             idct: ctx.idct,
             quantization: ReconQuantization {
+                compute_rate: !prices.is_some_and(|prices| prices.has_table(strategy)),
                 rate_log2_lut: ctx.rate_log2_lut,
                 coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                 inverse_matrices: [

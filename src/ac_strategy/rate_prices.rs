@@ -53,6 +53,7 @@ use crate::ac_context::{
     K_NON_ZERO_BUCKETS, K_NUM_FINE_BLOCK_CTXS, K_ZERO_DENSITY_CONTEXT_COUNT, fine_non_zero_context,
     zero_density_context, zero_density_context_8x8,
 };
+use crate::adaptive_quant::dirty_log2p1f;
 use crate::coeff_order::{CoeffOrders, OrderStats, derive_orders, order_slot_of};
 use crate::dc_group_data::{NUM_STRATEGIES, STRATEGY_CODE_LUT};
 use crate::entropy::{pack_signed, uint_encode};
@@ -155,6 +156,52 @@ fn walk_block(
     let covered = cx * cy;
     let log2_covered = covered.trailing_zeros() as usize;
     let width = cx * 8;
+    // Count one contiguous span so the reduction can vectorize across rows.
+    // Subtract LLF entries separately, retaining their original exclusion even
+    // for inputs whose low frequencies have not already been cleared.
+    let values = &block[..size];
+    let mut nzeros = values.iter().filter(|&&q| q != 0).count();
+    for row in values.chunks_exact(width).take(cy) {
+        nzeros -= row[..cx].iter().filter(|&&q| q != 0).count();
+    }
+    let predicted = ((nzeros + covered - 1) >> log2_covered).min(32) as u32;
+    emit(
+        fine_non_zero_context(predicted, 0) as usize / K_NUM_FINE_BLOCK_CTXS,
+        nzeros as u32,
+    );
+    let scan = orders.scan_for(STRATEGY_CODE_LUT[strategy as usize], c);
+    let mut prev = usize::from(nzeros <= size / 16);
+    let mut remaining = nzeros;
+    let mut k = covered;
+    while k < size && remaining != 0 {
+        let coef = block[scan[k] as usize];
+        let context = if covered == 1 {
+            zero_density_context_8x8(remaining, k, prev)
+        } else {
+            zero_density_context(remaining, k, covered, log2_covered, prev)
+        };
+        emit(K_NON_ZERO_BUCKETS + context, pack_signed(coef));
+        prev = usize::from(coef != 0);
+        remaining -= usize::from(coef != 0);
+        k += 1;
+    }
+}
+
+// Original row-wise count and token walk, retained as an exact test oracle.
+#[cfg(test)]
+fn walk_block_reference(
+    orders: &CoeffOrders,
+    strategy: u8,
+    c: usize,
+    block: &[i32],
+    cx: usize,
+    cy: usize,
+    mut emit: impl FnMut(usize, u32),
+) {
+    let size = cx * cy * 64;
+    let covered = cx * cy;
+    let log2_covered = covered.trailing_zeros() as usize;
+    let width = cx * 8;
     let mut nzeros = 0usize;
     for (v, row) in block[..size].chunks_exact(width).enumerate() {
         let skip = if v < cy { cx } else { 0 };
@@ -236,7 +283,7 @@ fn fixed_model_bits(block: &[i32], cx: usize, cy: usize) -> f32 {
     for (i, &q) in block[..width * height].iter().enumerate() {
         if q != 0 {
             nzeros += 1;
-            mag_bits += (1.0 + q.unsigned_abs() as f32).log2();
+            mag_bits += dirty_log2p1f(q.unsigned_abs() as f32);
             max_scan = max_scan.max(scan_pos[i]);
         }
     }
@@ -258,42 +305,7 @@ fn transform_block(
         transform_gather,
         ..
     } = scratch;
-    let (width, height, size, cx, cy) = match strategy {
-        STRATEGY_DCT64X64 => (64, 64, 4096, 8, 8),
-        STRATEGY_DCT64X32 => (32, 64, 2048, 8, 4),
-        STRATEGY_DCT32X64 => (64, 32, 2048, 8, 4),
-        _ => {
-            return prepare_strategy_coeffs(
-                ctx,
-                coeffs,
-                transform_gather,
-                strategy,
-                opsin,
-                px,
-                py,
-                cmap,
-            );
-        }
-    };
-    let coeffs: &mut [[f32; 4096]; 3] = coeffs;
-    let input: &mut [f32; 4096] = transform_gather;
-    for (c, coeff) in coeffs.iter_mut().enumerate() {
-        gather_pixels(opsin.plane(c), px, py, width, height, &mut input[..size]);
-        match strategy {
-            STRATEGY_DCT64X64 => (ctx.dct64x64)(DctInput::from_flat(input), coeff),
-            STRATEGY_DCT64X32 => (ctx.dct64x32)(
-                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
-                coeff.first_chunk_mut::<2048>().unwrap(),
-            ),
-            _ => (ctx.dct32x64)(
-                DctInput::from_flat(input.first_chunk::<2048>().unwrap()),
-                coeff.first_chunk_mut::<2048>().unwrap(),
-            ),
-        }
-    }
-    let [x, y, b] = coeffs;
-    apply_cfl(ctx, CflXyb { x, y, b }, size, cmap);
-    (cx, cy, size)
+    prepare_strategy_coeffs(ctx, coeffs, transform_gather, strategy, opsin, px, py, cmap)
 }
 
 /// The transforms the selector can place at this speed and distance.
@@ -401,6 +413,10 @@ fn sample_position(index: usize, count: usize, total: usize) -> usize {
 }
 
 impl RatePrices {
+    pub(crate) fn has_table(&self, strategy: u8) -> bool {
+        self.tables[strategy as usize].is_some()
+    }
+
     /// Score coefficient distortion and learned rate in one quantization pass.
     /// The kernel preserves the distortion scorer's rounding and reduction;
     /// the saved levels use the coder's rounding for the learned token walk.
@@ -830,6 +846,133 @@ impl Drop for RatePricesScope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_nonzero_count_preserves_every_learned_rate_token() {
+        let mut rng = 73u32;
+        let natural = CoeffOrders::natural();
+        let mut learned = CoeffOrders::natural();
+        let mut stats = OrderStats::new();
+        for (slot, &(_, _, size)) in crate::coeff_order::ORDER_SPECS.iter().enumerate() {
+            for _ in 0..10_000 {
+                stats.tally_block(slot);
+                for c in 0..3 {
+                    stats.tally(slot, c, size - 1);
+                }
+            }
+        }
+        derive_orders(&stats, &mut learned);
+        for strategy in selectable(crate::Speed::Slow, 1.0) {
+            let x = AcStrategyImage::covered_blocks_x_of(strategy);
+            let y = AcStrategyImage::covered_blocks_y_of(strategy);
+            let (cx, cy) = (x.max(y), x.min(y));
+            let size = cx * cy * 64;
+            for case in 0..32 {
+                let block: Vec<i32> = (0..size + 5)
+                    .map(|i| {
+                        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match case % 4 {
+                            0 => 0,
+                            1 => {
+                                if i % 17 == 0 {
+                                    1
+                                } else {
+                                    0
+                                }
+                            }
+                            2 => (rng as i32) % 7,
+                            _ => rng as i32,
+                        }
+                    })
+                    .collect();
+                // Keep nonzero LF and trailing sentinels: both exclusions are
+                // part of the original block walk, independent of quantization.
+                for orders in [&natural, &learned] {
+                    for c in 0..3 {
+                        let mut expected = Vec::new();
+                        let mut actual = Vec::new();
+                        walk_block_reference(
+                            orders,
+                            strategy,
+                            c,
+                            &block,
+                            cx,
+                            cy,
+                            |context, value| expected.push((context, value)),
+                        );
+                        walk_block(orders, strategy, c, &block, cx, cy, |context, value| {
+                            actual.push((context, value))
+                        });
+                        assert_eq!(
+                            actual, expected,
+                            "strategy {strategy}, channel {c}, case {case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dct64_views_preserve_gathered_coefficients_and_edge_replication() {
+        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 2.0, 1);
+        let mut image = Image3F::new(131, 137);
+        for c in 0..3 {
+            for (i, v) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *v = ((i * 7919 + c * 97) % 104729) as f32 / 104729.0;
+            }
+        }
+        for (strategy, width, height, cx, cy) in [
+            (STRATEGY_DCT64X64, 64, 64, 8, 8),
+            (STRATEGY_DCT64X32, 32, 64, 8, 4),
+            (STRATEGY_DCT32X64, 64, 32, 8, 4),
+        ] {
+            for (px, py) in [(0, 0), (3, 5), (67, 73), (120, 5), (3, 130), (129, 135)] {
+                for c in 0..3 {
+                    let mut gathered = [0.0; 4096];
+                    gather_pixels(image.plane(c), px, py, width, height, &mut gathered);
+                    let mut expected = [0.0; 4096];
+                    match strategy {
+                        STRATEGY_DCT64X64 => {
+                            (ctx.dct64x64)(DctInput::from_flat(&gathered), &mut expected)
+                        }
+                        STRATEGY_DCT64X32 => (ctx.dct64x32)(
+                            DctInput::from_flat(gathered.first_chunk::<2048>().unwrap()),
+                            expected.first_chunk_mut::<2048>().unwrap(),
+                        ),
+                        _ => (ctx.dct32x64)(
+                            DctInput::from_flat(gathered.first_chunk::<2048>().unwrap()),
+                            expected.first_chunk_mut::<2048>().unwrap(),
+                        ),
+                    }
+                    let mut tmp = [123.0; 4096];
+                    let mut actual = [0.0; 4096];
+                    assert_eq!(
+                        forward_transform(
+                            &ctx,
+                            &mut tmp,
+                            strategy,
+                            image.plane(c),
+                            px,
+                            py,
+                            &mut actual
+                        ),
+                        (cx, cy)
+                    );
+                    for (a, e) in actual.iter().zip(expected) {
+                        assert_eq!(
+                            a.to_bits(),
+                            e.to_bits(),
+                            "strategy {strategy}, ({px}, {py})"
+                        );
+                    }
+                    if px + width <= image.xsize() && py + height <= image.ysize() {
+                        assert_eq!(tmp, [123.0; 4096], "interior transforms must not gather");
+                    }
+                }
+            }
+        }
+    }
 
     /// A 4-pixel checkerboard under a slow brightness drift.
     fn checkerboard(size: usize) -> Image3F {

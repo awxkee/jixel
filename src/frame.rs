@@ -3971,17 +3971,25 @@ fn process_ac_group(
         let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
         let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
 
-        let stripe = scratch.ac_stripe.as_mut();
-        build_stripe(
-            stripe,
-            opsin,
-            stripe_x0,
-            stripe_y0,
-            stripe_xsize,
-            stripe_ysize,
-            stripe_xsize_padded,
-            stripe_ysize_padded,
-        );
+        // Whole blocks can be transformed directly from the source image.
+        // Only edge stripes need a copy to replicate their partial blocks.
+        let (stripe, opsin_origin) =
+            if stripe_xsize == stripe_xsize_padded && stripe_ysize == stripe_ysize_padded {
+                (opsin, (stripe_x0, stripe_y0))
+            } else {
+                let stripe = scratch.ac_stripe.as_mut();
+                build_stripe(
+                    stripe,
+                    opsin,
+                    stripe_x0,
+                    stripe_y0,
+                    stripe_xsize,
+                    stripe_ysize,
+                    stripe_xsize_padded,
+                    stripe_ysize_padded,
+                );
+                (&*stripe, (0, 0))
+            };
 
         let stripe_brect = Rect::new(
             qorigin_x,
@@ -3994,6 +4002,7 @@ fn process_ac_group(
             ctx,
             &mut scratch.ac_group,
             stripe,
+            opsin_origin,
             stripe_brect,
             distp.scale,
             distp.scale_dc,
@@ -4061,6 +4070,125 @@ fn build_stripe(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ac_group_source_views_match_copied_stripes() {
+        use crate::coeff_order::CoeffOrders;
+        use crate::dc_group_data::{DcGroupData, NUM_STRATEGIES};
+        use crate::encoding_context::EncodingContext;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+        use crate::group::{AcGroupScratch, SourceDc};
+        use crate::image::{Image3B, Image3F, Image3S, Plane, Rect};
+
+        let distance = 2.0;
+        let ctx =
+            EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+        let distp = super::compute_distance_params(distance);
+        let mut image = Image3F::new(131, 137);
+        for c in 0..3 {
+            for (i, value) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *value = ((i * 7919 + c * 97) % 104729) as f32 / 104729.0;
+            }
+        }
+        let tokens: Vec<_> = (0..4096)
+            .map(|i| Token::new(i % 2, if i % 3 == 0 { 0 } else { i % 17 }))
+            .collect();
+        let mut code = build_entropy_code_no_cluster(&tokens, 2, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = CoeffOrders::natural();
+        let mut dc = DcGroupData::new(16, 16).unwrap();
+        for (i, q) in dc.raw_quant_field.as_mut_slice().iter_mut().enumerate() {
+            *q = 3 + (i % 17) as u8;
+        }
+        dc.ytox_map.as_mut_slice().fill(7);
+        dc.ytob_map.as_mut_slice().fill(-13);
+        let mut stripe = Image3F::new(64, 64);
+        let mut gathered_scratch = AcGroupScratch::default();
+        let mut view_scratch = AcGroupScratch::default();
+        for strategy in 0..NUM_STRATEGIES as u8 {
+            dc.ac_strategy.reset();
+            dc.ac_strategy.set_first(8, 8, strategy);
+            for origin in [(0, 0), (59, 61)] {
+                super::build_stripe(&mut stripe, &image, origin.0, origin.1, 64, 64, 64, 64);
+                for (shifts, rdoq) in [
+                    (&[0u32][..], None),
+                    (&[0u32][..], Some(&prices)),
+                    (&[2u32, 0][..], None),
+                ] {
+                    let run = |input: &Image3F, origin, scratch: &mut AcGroupScratch| {
+                        let mut quant_dc = Image3S::new(8, 8);
+                        let mut source_dc = SourceDc {
+                            y: Plane::new(8, 8),
+                            b: Plane::new(8, 8),
+                        };
+                        let mut nzeros: Vec<_> =
+                            shifts.iter().map(|_| Image3B::new(32, 32)).collect();
+                        let mut tokens: Vec<_> = shifts.iter().map(|_| Vec::new()).collect();
+                        let distortion = super::write_ac_group(
+                            &ctx,
+                            scratch,
+                            input,
+                            origin,
+                            Rect::new(8, 8, 8, 8),
+                            distp.scale,
+                            distp.scale_dc,
+                            distp.dc_step,
+                            distance,
+                            distp.x_qm_scale,
+                            &dc,
+                            11,
+                            &mut quant_dc,
+                            Some(&mut source_dc),
+                            8,
+                            8,
+                            &mut nzeros,
+                            shifts,
+                            rdoq,
+                            &orders,
+                            None,
+                            true,
+                            10,
+                            &mut tokens,
+                        );
+                        (distortion, quant_dc, source_dc, nzeros, tokens)
+                    };
+                    let (expected_dist, expected_dc, expected_source, expected_nz, expected) =
+                        run(&stripe, (0, 0), &mut gathered_scratch);
+                    let (actual_dist, actual_dc, actual_source, actual_nz, actual) =
+                        run(&image, origin, &mut view_scratch);
+                    assert_eq!(actual_dist.to_bits(), expected_dist.to_bits());
+                    for c in 0..3 {
+                        assert_eq!(actual_dc.plane_data(c), expected_dc.plane_data(c));
+                        for (a, e) in actual_nz.iter().zip(&expected_nz) {
+                            assert_eq!(a.plane_data(c), e.plane_data(c));
+                        }
+                    }
+                    for (a, e) in [
+                        (&actual_source.y, &expected_source.y),
+                        (&actual_source.b, &expected_source.b),
+                    ] {
+                        assert!(
+                            a.as_slice()
+                                .iter()
+                                .zip(e.as_slice())
+                                .all(|(a, e)| a.to_bits() == e.to_bits())
+                        );
+                    }
+                    for (a, e) in actual.iter().zip(&expected) {
+                        assert_eq!(a.len(), e.len());
+                        assert!(
+                            a.iter()
+                                .zip(e)
+                                .all(|(a, e)| a.context == e.context && a.value == e.value)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn residual_rate_sample_preserves_pixels_and_alpha_at_odd_edges() {
         use crate::encode_image::AlphaPlane;

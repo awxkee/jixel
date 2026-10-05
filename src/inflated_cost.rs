@@ -400,6 +400,88 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
     }
 }
 
+// Compare the new lane reduction against the original population-count kernel,
+// including the coding quantizer's ties-away levels and special float inputs.
+#[cfg(test)]
+#[allow(dead_code)] // Called by target-specific SSE/AVX/WASM tests.
+pub(crate) fn assert_coefficient_kernel_preserves_original(
+    original: SseAndQuantizeFn,
+    optimized: SseAndQuantizeFn,
+) {
+    let special = [
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.5,
+        -1.5,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    let mut rng = 73u32;
+    for (width, height, cx, cy) in [
+        (8, 8, 1, 1),
+        (16, 8, 2, 1),
+        (8, 16, 1, 2),
+        (16, 16, 2, 2),
+        (32, 16, 4, 2),
+        (32, 32, 4, 4),
+        (64, 32, 8, 4),
+        (64, 64, 8, 8),
+    ] {
+        let n = width * height;
+        let scan: Vec<u32> = (0..n).map(|i| ((i * 17) % n) as u32).collect();
+        for case in 0..32 {
+            let coeff: Vec<f32> = (0..n)
+                .map(|_| {
+                    rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                    match case % 4 {
+                        0 => 0.0,
+                        1 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2,
+                        2 => ((rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 200.0,
+                        _ => special[rng as usize % special.len()],
+                    }
+                })
+                .collect();
+            let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
+            let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
+            let thresholds = [0.0, 0.42, 0.57, 0.91];
+            let mut expected_levels = vec![-123; n + 5];
+            let mut actual_levels = expected_levels.clone();
+            let run = |kernel: SseAndQuantizeFn, levels: &mut [i32]| unsafe {
+                kernel(
+                    &coeff,
+                    &inv,
+                    scale,
+                    width,
+                    height,
+                    width / 2,
+                    cx,
+                    cy,
+                    rate_log2_lut(),
+                    &thresholds,
+                    &scan,
+                    levels,
+                )
+            };
+            let expected = run(original, &mut expected_levels);
+            let actual = run(optimized, &mut actual_levels);
+            assert_eq!(
+                (actual.0.to_bits(), actual.1, actual.2.to_bits(), actual.3),
+                (
+                    expected.0.to_bits(),
+                    expected.1,
+                    expected.2.to_bits(),
+                    expected.3
+                ),
+                "{width}x{height}, case {case}"
+            );
+            assert_eq!(actual_levels, expected_levels);
+        }
+    }
+}
+
 #[allow(unused, clippy::too_many_arguments)]
 pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     coeff: &[f32],
@@ -712,6 +794,8 @@ pub(crate) type ErrorGradientPeakEnergyFn = fn(&[f32], &[f32], usize, usize, f32
 pub(crate) type CombineErrorFn = fn(&[f32], &[f32], f32, &mut [f32]);
 
 pub(crate) struct ReconQuantization<'a> {
+    /// The caller replaces the fixed rate when this transform has learned prices.
+    pub(crate) compute_rate: bool,
     pub(crate) rate_log2_lut: &'a RateLog2Lut,
     pub(crate) coeffs: [&'a [f32]; 3],
     pub(crate) inverse_matrices: [&'a [f32]; 3],
@@ -927,7 +1011,11 @@ fn recon_dist_and_rate_default(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_scalar::<true>,
+            quantize: if input.quantization.compute_rate {
+                recon_quantize_scalar::<true, true>
+            } else {
+                recon_quantize_scalar::<true, false>
+            },
             ssim: ssim_deficit_dispatch_kernel,
             prepare: prepare_reconstruction_scalar,
             error,
@@ -951,7 +1039,11 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
         scratch,
         input,
         &ReconKernels {
-            quantize: recon_quantize_scalar::<BIASED>,
+            quantize: if input.quantization.compute_rate {
+                recon_quantize_scalar::<BIASED, true>
+            } else {
+                recon_quantize_scalar::<BIASED, false>
+            },
             ssim: ssim_deficit_scalar_kernel,
             prepare: prepare_reconstruction_scalar,
             error: &error,
@@ -1110,7 +1202,11 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     else {
         unreachable!()
     };
-    let scan_pos = crate::coeff_order::scan_pos_lut(width, height);
+    let scan_pos = if quantization.compute_rate {
+        crate::coeff_order::scan_pos_lut(width, height)
+    } else {
+        &[]
+    };
     let mut rate = 0.0f32;
     rate += unsafe {
         quantize(
@@ -1442,7 +1538,7 @@ fn prepare_reconstruction_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn recon_quantize_scalar<const BIASED: bool>(
+fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
@@ -1497,12 +1593,15 @@ fn recon_quantize_scalar<const BIASED: bool>(
             } else {
                 (scaled - quantized) / denominator
             };
-            if quantized != 0.0 {
+            if COMPUTE_RATE && quantized != 0.0 {
                 nonzero += 1;
                 magnitude_bits += rate_log2_with_lut(rate_log2_lut, quantized.abs());
                 max_scan = max_scan.max(scan_pos[y * width + x]);
             }
         }
+    }
+    if !COMPUTE_RATE {
+        return 0.0;
     }
     nonzero as f32 * R_NZ_BASE
         + R_MAG * magnitude_bits
@@ -1615,6 +1714,99 @@ mod tests {
     };
 
     #[test]
+    fn omitting_fixed_rate_preserves_reconstruction_and_all_distortion_terms() {
+        use super::*;
+        let idct = IdctMethods::scalar();
+        let mut opsin = Image3F::new(37, 35);
+        for c in 0..3 {
+            for (i, value) in opsin.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *value = ((i * 17 + c * 7) % 29) as f32 * 0.013;
+            }
+        }
+        let coeffs: [[f32; 1024]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.13 - 1.8)
+        });
+        let inverse: [f32; 1024] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
+        let error = ReconErrorKernels {
+            gradient_energy: select_error_gradient_energy_fn(),
+            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
+            combine: select_combine_error_fn(),
+            rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
+        };
+        let kernels: [ReconDistAndRateFn; 3] = [
+            select_recon_dist_and_rate_fn(),
+            recon_dist_and_rate_default,
+            |scratch, input, _| recon_dist_and_rate_scalar::<false>(scratch, input),
+        ];
+        for strategy in (0..NUM_STRATEGIES as u8)
+            .filter(|&s| !matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64))
+        {
+            let (w, h) = strategy_pixel_dims(strategy);
+            let (cx, cy) = (w.max(h), w.min(h));
+            for (px, py) in [(0, 0), (3, 5), (34, 33)] {
+                for qac in [0.5, 7.0, 80.0] {
+                    let mut input = ReconDistInput {
+                        idct: &idct,
+                        quantization: ReconQuantization {
+                            compute_rate: true,
+                            rate_log2_lut: rate_log2_lut(),
+                            coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
+                            inverse_matrices: [&inverse; 3],
+                            qac,
+                            qm_mult_x: 1.2,
+                            qm_mult_b: 1.6,
+                            distance: 1.5,
+                        },
+                        transform: ReconTransform {
+                            blocks_x: cx / 8,
+                            blocks_y: cy / 8,
+                            strategy,
+                        },
+                        source: ReconSource {
+                            opsin: &opsin,
+                            x: px,
+                            y: py,
+                        },
+                        scoring: ReconScoring {
+                            factor_x: 0.15,
+                            factor_b: -0.1,
+                            channel_weights: CHANNEL_WEIGHT,
+                            xyb_matrix: crate::xyb::XybMatrix::SPEC,
+                            rgb_hue_alpha: 800.0,
+                            gradient_alpha: 8.0,
+                            gradient_peak_alpha: 3.0,
+                            keep_spatial_errors: true,
+                        },
+                    };
+                    for kernel in kernels {
+                        let mut expected = [[-123.0; 1024]; 8];
+                        let mut actual = expected;
+                        input.quantization.compute_rate = true;
+                        let full = kernel(&mut expected, &input, &error);
+                        input.quantization.compute_rate = false;
+                        let without_rate = kernel(&mut actual, &input, &error);
+                        assert_eq!(without_rate.rate, 0.0);
+                        assert_eq!(without_rate.distortion.to_bits(), full.distortion.to_bits());
+                        assert_eq!(
+                            without_rate.hue_distortion.to_bits(),
+                            full.hue_distortion.to_bits()
+                        );
+                        for (expected, actual) in
+                            expected.iter().flatten().zip(actual.iter().flatten())
+                        {
+                            assert_eq!(
+                                expected.to_bits(),
+                                actual.to_bits(),
+                                "strategy {strategy}, qac {qac}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reported_hue_cost_matches_the_reused_reconstruction_errors() {
         use super::*;
         let matrix = crate::xyb::XybMatrix::SPEC;
@@ -1640,6 +1832,7 @@ mod tests {
         let mut input = ReconDistInput {
             idct: &idct,
             quantization: ReconQuantization {
+                compute_rate: true,
                 rate_log2_lut: rate_log2_lut(),
                 coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                 inverse_matrices: [&inverse; 3],

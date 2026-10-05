@@ -230,6 +230,147 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
 
     let mut sse_acc = f32x4_splat(0.0);
     let mut mag_acc = f32x4_splat(0.0);
+    let mut nonzero_acc = u32x4_splat(0);
+    let mut scan_acc = u32x4_splat(0);
+
+    let zero = f32x4_splat(0.0);
+
+    let lane_ids_arr = [0i32, 1, 2, 3];
+    let lane_ids = unsafe { v128_load(lane_ids_arr.as_ptr() as *const v128) };
+
+    for (y, (coeffs, inv_matrix)) in coeff
+        .chunks_exact(width)
+        .zip(inv_matrix.chunks_exact(width))
+        .take(height)
+        .enumerate()
+    {
+        let yfix = if y >= height / 2 { 2 } else { 0 };
+        let thr_lo = thr[yfix];
+        let thr_hi = thr[yfix + 1];
+
+        for (x0, (coeff4, inv4)) in coeffs
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(inv_matrix.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            let x = x0 * 4;
+
+            let threshold = if x >= half { thr_hi } else { thr_lo };
+            let thrv = f32x4_splat(threshold);
+
+            let cv = unsafe { v128_load(coeff4.as_ptr() as *const v128) };
+            let mv = unsafe { v128_load(inv4.as_ptr() as *const v128) };
+
+            // a = inv_matrix * q_scaled * coeff
+            let a = f32x4_mul(f32x4_mul(mv, qs), cv);
+            let absa = f32x4_abs(a);
+
+            // keep = |a| >= threshold
+            let keep = f32x4_ge(absa, thrv);
+
+            // round-to-nearest, ties-to-even
+            let rounded = f32x4_nearest(a);
+
+            // zero rounded where not kept
+            let q = v128_and(rounded, keep);
+
+            let d = if BIASED {
+                f32x4_sub(a, wasm_dequantized_level_f32(q))
+            } else {
+                f32x4_sub(a, q)
+            };
+            let d2 = f32x4_mul(d, d);
+
+            // Active mask: keep lanes where !(y < cy && x + lane < cx).
+            let active = if y < cy && x < cx {
+                let lane_x = i32x4_add(i32x4_splat(x as i32), lane_ids);
+
+                // active = x + lane >= cx
+                i32x4_ge(lane_x, i32x4_splat(cx as i32))
+            } else {
+                i32x4_splat(-1)
+            };
+
+            // SSE: zero LLF lanes.
+            let d2 = v128_bitselect(d2, zero, active);
+            sse_acc = f32x4_add(sse_acc, d2);
+
+            // Rate: active && abs(q) > 0.
+            let absq = f32x4_abs(q);
+            let nz = f32x4_gt(absq, zero);
+            let rate_mask = v128_and(nz, active);
+
+            // Comparison masks contain -1 for each nonzero lane.
+            nonzero_acc = i32x4_sub(nonzero_acc, rate_mask);
+
+            if SAVE_LEVELS {
+                let truncated = f32x4_trunc(a);
+                let frac = f32x4_sub(a, truncated);
+                let ge_half = f32x4_ge(f32x4_abs(frac), f32x4_splat(0.5));
+                let signed_one = v128_or(f32x4_splat(1.0), v128_and(a, f32x4_splat(-0.0)));
+                let quantized =
+                    i32x4_trunc_sat_f32x4(f32x4_add(truncated, v128_and(signed_one, ge_half)));
+                let quantized = v128_and(quantized, v128_and(keep, active));
+                unsafe { v128_store(levels.as_mut_ptr().add(y * width + x).cast(), quantized) };
+            }
+
+            if !SAVE_LEVELS && i32x4_bitmask(rate_mask) != 0 {
+                let ratev = wasm_log2p1_f32(absq);
+                mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
+                // Scan position of the nonzeros (masked lanes drop to zero,
+                // which is neutral: LLF slots are never nonzero here).
+                let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x) as *const v128) };
+                scan_acc = u32x4_max(scan_acc, v128_and(sv, rate_mask));
+            }
+        }
+    }
+
+    let max_scan = u32x4_extract_lane::<0>(scan_acc)
+        .max(u32x4_extract_lane::<1>(scan_acc))
+        .max(u32x4_extract_lane::<2>(scan_acc))
+        .max(u32x4_extract_lane::<3>(scan_acc));
+
+    let nzeros = (u32x4_extract_lane::<0>(nonzero_acc)
+        + u32x4_extract_lane::<1>(nonzero_acc)
+        + u32x4_extract_lane::<2>(nonzero_acc)
+        + u32x4_extract_lane::<3>(nonzero_acc)) as usize;
+
+    (hsum4(sse_acc), nzeros, hsum4(mag_acc), max_scan)
+}
+
+// Original scalar population count, retained as an exact test oracle.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "simd128")]
+pub(crate) fn sse_and_rate_wasm_impl_reference<const BIASED: bool, const SAVE_LEVELS: bool>(
+    coeff: &[f32],
+    inv_matrix: &[f32],
+    q_scaled: f32,
+    width: usize,
+    height: usize,
+    half: usize,
+    cx: usize,
+    cy: usize,
+    _rate_log2_lut: &crate::inflated_cost::RateLog2Lut,
+    thr: &[f32; 4],
+    scan_pos: &[u32],
+    levels: &mut [i32],
+) -> (f32, usize, f32, u32) {
+    let n = width * height;
+    assert!(coeff.len() >= n && inv_matrix.len() >= n);
+    assert!(if SAVE_LEVELS {
+        levels.len() >= n
+    } else {
+        scan_pos.len() >= n
+    });
+    debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+
+    let qs = f32x4_splat(q_scaled);
+
+    let mut sse_acc = f32x4_splat(0.0);
+    let mut mag_acc = f32x4_splat(0.0);
     let mut nzeros = 0usize;
     let mut scan_acc = u32x4_splat(0);
 
@@ -394,5 +535,38 @@ mod tests {
             sse_and_rate_wasm::<true>,
             true,
         );
+    }
+}
+
+#[cfg(test)]
+mod lane_count_tests {
+    use super::*;
+
+    #[test]
+    fn lane_counts_preserve_original_rate_distortion_and_coding_levels() {
+        for (original, optimized) in [
+            (
+                sse_and_rate_wasm_impl_reference::<false, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_wasm_impl::<false, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_wasm_impl_reference::<false, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_wasm_impl::<false, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_wasm_impl_reference::<true, false>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_wasm_impl::<true, false> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+            (
+                sse_and_rate_wasm_impl_reference::<true, true>
+                    as crate::inflated_cost::SseAndQuantizeFn,
+                sse_and_rate_wasm_impl::<true, true> as crate::inflated_cost::SseAndQuantizeFn,
+            ),
+        ] {
+            crate::inflated_cost::assert_coefficient_kernel_preserves_original(original, optimized);
+        }
     }
 }
