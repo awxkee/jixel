@@ -1414,10 +1414,14 @@ fn encode_frame_vardct(
     } else {
         [0.0; 3]
     };
-    let (x_steps, b_steps) = if slow_chromatic {
-        pixel_chromacity_steps(&xyb)
-    } else {
-        (0, 0)
+    let (x_steps, b_steps) = match ctx.speed {
+        _ if is_achromatic => (0, 0),
+        crate::Speed::Slow => pixel_chromacity_steps(&xyb),
+        // Without Slow's color machinery the B steps only cost rate.
+        crate::Speed::Fast if distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
+            (pixel_chromacity_steps(&xyb).0, 0)
+        }
+        _ => (0, 0),
     };
     if distance >= PIXEL_CHROMACITY_MIN_DISTANCE {
         ctx.raise_x_qm_scale_floor(2 + x_steps);
@@ -2318,15 +2322,22 @@ const X_HEAVY_B_QM_SCALE: u32 = 7;
 /// Below this the X scale is 2 and the extra precision only costs rate.
 const PIXEL_CHROMACITY_MIN_DISTANCE: f32 = 1.25;
 
+/// A pixel-step level counts once this many pixels pass it; libjxl takes the
+/// single worst pixel, which lets one stray edge refine chroma frame-wide.
+const PIXEL_CHROMACITY_MIN_PIXELS: u32 = 4;
+
 /// libjxl's `PixelStatsForChromacityAdjustment`: extra X and B quant-scale
-/// steps from the worst pixel-to-pixel step of X and of B - Y, plus one B step
-/// for strongly exposed blue. Thresholds are libjxl's.
+/// steps from the pixel-to-pixel steps of X and of B - Y, plus one B step for
+/// strongly exposed blue. Thresholds are libjxl's; the step levels need
+/// `PIXEL_CHROMACITY_MIN_PIXELS` pixels, exposed blue a single one.
 fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
+    const X_LEVELS: [f32; 3] = [0.015, 0.022, 0.026];
+    const B_LEVELS: [f32; 3] = [0.28, 0.33, 0.38];
     let (w, h) = (xyb.xsize(), xyb.ysize());
     if w < 2 || h < 2 {
         return (0, 0);
     }
-    let (mut dx, mut db, mut exposed_blue) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut x_counts, mut b_counts, mut exposed_blue) = ([0u32; 3], [0u32; 3], 0u32);
     let rows = xyb
         .plane_data(0)
         .chunks_exact(w)
@@ -2342,37 +2353,40 @@ fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
         let previous = xp.iter().zip(yp).zip(bp).skip(1);
         for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
             let step_x = (x - left_x).abs().max((x - px).abs());
-            dx = dx.max(step_x);
             let diff_b = b - y;
             let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
-            db = db.max(step_b);
-            let exposed = b - y * 1.2;
+            for (count, level) in x_counts.iter_mut().zip(X_LEVELS) {
+                *count += u32::from(step_x >= level);
+            }
+            for (count, level) in b_counts.iter_mut().zip(B_LEVELS) {
+                *count += u32::from(step_b > level);
+            }
+            // The gradient factor is nonnegative, so negative exposure never passes.
             let step = (b - left_b).abs() + (b - pb).abs();
-            // A negative exposure cannot raise this nonnegative maximum;
-            // max also ignores NaNs, as the original conditional did.
-            exposed_blue = exposed_blue.max(exposed * step);
+            exposed_blue += u32::from((b - y * 1.2) * step >= 0.13);
             left_x = x;
             left_b = b;
             left_diff = diff_b;
         }
-        if dx >= 0.026 && db > 0.38 && exposed_blue >= 0.13 {
+        if x_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
+            && b_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
+            && exposed_blue > 0
+        {
             return (3, 3);
         }
     }
-    let x_steps = match dx {
-        v if v >= 0.026 => 3,
-        v if v >= 0.022 => 2,
-        v if v >= 0.015 => 1,
-        _ => 0,
+    // Counts shrink level by level, so the passed levels are a prefix.
+    let level = |counts: [u32; 3]| {
+        counts
+            .iter()
+            .filter(|&&n| n >= PIXEL_CHROMACITY_MIN_PIXELS)
+            .count() as u32
     };
-    let blue = u32::from(exposed_blue >= 0.13);
-    let b_steps = match db {
-        v if v > 0.38 => 2 + blue,
-        v if v > 0.33 => 1 + blue,
-        v if v > 0.28 => blue,
-        _ => 0,
+    let b_steps = match level(b_counts) {
+        0 => 0,
+        l => l - 1 + u32::from(exposed_blue > 0),
     };
-    (x_steps, b_steps)
+    (level(x_counts), b_steps)
 }
 
 /// Source-domain companion to the saturation detector. Sparse luminance
