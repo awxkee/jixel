@@ -3067,7 +3067,9 @@ mod encode_smoke_tests {
     fn dots_with_alpha_are_thread_deterministic() {
         const S: usize = 256;
         let rgba: Vec<_> = star_field(S)
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .enumerate()
             .flat_map(|(i, p)| [p[0], p[1], p[2], (64 + i % 192) as u8])
             .collect();

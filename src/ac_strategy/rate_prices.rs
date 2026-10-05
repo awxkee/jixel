@@ -967,16 +967,18 @@ mod tests {
     #[test]
     fn compact_prices_preserve_every_context_and_pool() {
         let mut dense = vec![0.0f32; ROWS * SYMBOLS];
-        for (row, counts) in dense.chunks_exact_mut(SYMBOLS).enumerate() {
+        for (row, counts) in dense.as_chunks_mut::<SYMBOLS>().0.iter_mut().enumerate() {
             if row % 7 == 0 {
                 counts[row % SYMBOLS] = row as f32 + 0.25;
             }
         }
         let empty: Vec<bool> = dense
-            .chunks_exact(SYMBOLS)
+            .as_chunks::<SYMBOLS>()
+            .0
+            .iter()
             .map(|row| row.iter().all(|&count| count == 0.0))
             .collect();
-        for slot in dense.chunks_exact_mut(CONTEXTS * SYMBOLS) {
+        for slot in dense.as_chunks_mut::<{ CONTEXTS * SYMBOLS }>().0 {
             let split = K_NON_ZERO_BUCKETS * SYMBOLS;
             price_contexts(&mut slot[..split]);
             price_contexts(&mut slot[split..]);
@@ -998,7 +1000,7 @@ mod tests {
     #[test]
     fn in_place_prices_match_separate_count_and_price_buffers() {
         let mut counts = vec![0f32; 8 * SYMBOLS];
-        for (row, counts) in counts.chunks_exact_mut(SYMBOLS).enumerate() {
+        for (row, counts) in counts.as_chunks_mut::<SYMBOLS>().0.iter_mut().enumerate() {
             if row % 3 == 0 {
                 continue;
             }
@@ -1007,7 +1009,7 @@ mod tests {
             }
         }
         let mut pool = [POOL_FLOOR; SYMBOLS];
-        for row in counts.chunks_exact(SYMBOLS) {
+        for row in counts.as_chunks::<SYMBOLS>().0 {
             for (pooled, count) in pool.iter_mut().zip(row) {
                 *pooled += count;
             }
@@ -1017,7 +1019,7 @@ mod tests {
             *pooled *= POOL_WEIGHT / pool_total;
         }
         let mut expected = Vec::new();
-        for row in counts.chunks_exact(SYMBOLS) {
+        for row in counts.as_chunks::<SYMBOLS>().0 {
             let total = row.iter().sum::<f32>() + POOL_WEIGHT;
             expected.extend(
                 row.iter()

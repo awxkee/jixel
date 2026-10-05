@@ -812,6 +812,7 @@ pub(crate) fn optimize_entropy_code(
 /// the plain AC token bundle, whose header (write_ac_global) and token site
 /// (enc_frame) both branch on use_prefix_code. No other bundle calls this, so
 /// the gate cannot desynchronize a header from its token stream elsewhere.
+#[cfg(any(feature = "splines", test))]
 pub(crate) fn optimize_entropy_code_ac(
     tokens: &[Token],
     num_contexts: usize,
