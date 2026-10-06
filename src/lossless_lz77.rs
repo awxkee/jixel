@@ -548,7 +548,7 @@ fn lz77_compress_for_speed_with_parts<T: LiteralToken>(
 ) -> Vec<LzToken> {
     let run_capacity = run_count.unwrap_or_else(|| tokens.len().min(16 * 1024));
     // Fast stays runs-only
-    if speed != crate::Speed::Slow || !has_repetition(tokens, lz_repetitions) {
+    if !speed.effort().lz_deep || !has_repetition(tokens, lz_repetitions) {
         return lz77_compress_runs_with_capacity(tokens, run_capacity);
     }
     let run_tokens = lz77_compress_runs_with_capacity(tokens, run_capacity);
@@ -672,7 +672,7 @@ pub(super) fn lz77_compress_channels_for_speed(
     scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
     let total_len: usize = channels.iter().map(Vec::len).sum();
-    if speed != crate::Speed::Slow {
+    if !speed.effort().lz_deep {
         return lz77_compress_runs_channels(channels);
     }
 
@@ -696,7 +696,7 @@ pub(super) fn lz77_compress_channels_for_speed_with_depth(
     scratch: &mut CoderScratch,
 ) -> Vec<LzToken> {
     let total_len: usize = channels.iter().map(Vec::len).sum();
-    if speed != crate::Speed::Slow {
+    if !speed.effort().lz_deep {
         return lz77_compress_runs_channels(channels);
     }
 

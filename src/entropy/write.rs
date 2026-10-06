@@ -884,7 +884,7 @@ where
         AcClustering::Prefix {
             isolate_single_symbol: false,
         },
-        if speed == crate::Speed::Slow {
+        if speed.effort().huc_strict {
             1.0
         } else {
             0.995

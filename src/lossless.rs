@@ -138,7 +138,7 @@ fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
 
 #[inline]
 fn group_lz_threads(speed: crate::Speed, pool: &ThreadPool) -> usize {
-    if speed == crate::Speed::Slow {
+    if speed.effort().lz_deep {
         pool.num_threads().min(SLOW_DEEP_LZ_MAX_THREADS)
     } else {
         pool.num_threads()
@@ -702,7 +702,7 @@ fn encode_frame_lossless_core_impl(
             scratch,
             &mut palette_writer,
         ) {
-            if speed == crate::Speed::Slow {
+            if speed.effort().palette_dual {
                 let mut normal_writer = BitWriter::new();
                 let normal_decisive = encode_frame_lossless_core_impl(
                     linear,
@@ -752,7 +752,7 @@ fn encode_frame_lossless_core_impl(
             scratch,
             &mut palette_writer,
         ) {
-            if speed == crate::Speed::Slow {
+            if speed.effort().palette_dual {
                 let mut normal_writer = BitWriter::new();
                 let normal_decisive = encode_frame_lossless_core_impl(
                     linear,
@@ -832,7 +832,7 @@ fn encode_frame_lossless_core_impl(
     // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
     // searches the supported Slow predictor set per channel by estimated cost
     // (one global choice, used for the tree and every group).
-    let adaptive_search = speed == crate::Speed::Slow;
+    let effort = speed.effort();
 
     // RCT re-selection (Slow, regular RGB frames): estimated over the same
     // fixed-context gradient cost libjxl uses. When a non-YCoCg transform
@@ -840,7 +840,7 @@ fn encode_frame_lossless_core_impl(
     let mut rct_type = 6u32;
     let mut rct_planes: Option<Image3Si> = None;
     let rct_ranked: Vec<(u32, f32)> =
-        if frame_kind.allows_learned_tree() && adaptive_search && num_color == 3 {
+        if frame_kind.allows_learned_tree() && effort.rct_search && num_color == 3 {
             rank_rcts(linear, xsize, ysize, pool, scratch)
         } else {
             Vec::new()
@@ -860,7 +860,7 @@ fn encode_frame_lossless_core_impl(
     } else {
         2 + num_dc_groups + num_ac_groups
     };
-    let mut wp_params = if adaptive_search && use_wp {
+    let mut wp_params = if effort.wp_search && use_wp {
         choose_wp_params(linear, alpha, num_color, wp_header_count, pool, scratch)
     } else {
         WpParams::DEFAULT
@@ -870,7 +870,7 @@ fn encode_frame_lossless_core_impl(
     // v1 and flat alternatives. Tree headers, clustering, hybrid uint choices,
     // and LZ77 can otherwise reverse the order predicted from residual entropy.
     let compare_tree_candidates = frame_kind.allows_learned_tree()
-        && adaptive_search
+        && effort.learned_tree
         && num_color == 3
         && decoding_speed.use_ma_trees();
     let mut best_tree_writer: Option<BitWriter> = None;
@@ -882,7 +882,7 @@ fn encode_frame_lossless_core_impl(
     // First the two sources are compared by one first-stage learn each under the proxy
     // preset.
     let (layout, learned_tree_decisive, skip_alternatives) = {
-        let palette = if compare_tree_candidates {
+        let palette = if compare_tree_candidates && effort.tree_global_palette {
             build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
         } else {
             None
@@ -901,9 +901,16 @@ fn encode_frame_lossless_core_impl(
         // candidate must clear before it is grown into a complete frame.
         let mut best_source_coarse;
         let mut rank_pal = compare_tree_candidates && palette.is_some();
-        let mut final_sampling = (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT);
+        let mut final_sampling = if effort.tree_full_sampling {
+            (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT)
+        } else {
+            (MA_LITE_TARGET_SAMPLES, MA_LITE_FULL_SAMPLE_LIMIT)
+        };
         let mut pal_wp = wp_params;
-        if compare_tree_candidates && matches!(decoding_speed, crate::DecodingSpeed::Slow) {
+        if compare_tree_candidates
+            && effort.tree_rank
+            && matches!(decoding_speed, crate::DecodingSpeed::Slow)
+        {
             let rgb_stage = {
                 let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
                 rank_coarse(
@@ -922,11 +929,13 @@ fn encode_frame_lossless_core_impl(
                 })
             };
             let (rgb_coarse, pal_coarse) = (coarse_of(&rgb_stage), coarse_of(&pal_stage));
-            if rgb_stage.as_ref().is_some_and(|stage| {
-                stage.candidate.est_real
-                    >= DENSE_FINAL_MIN_BITS_PER_VALUE
-                        * source_values_of(xsize, ysize, coded_chans) as f64
-            }) {
+            if effort.tree_dense_sampling
+                && rgb_stage.as_ref().is_some_and(|stage| {
+                    stage.candidate.est_real
+                        >= DENSE_FINAL_MIN_BITS_PER_VALUE
+                            * source_values_of(xsize, ysize, coded_chans) as f64
+                })
+            {
                 final_sampling = (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
             }
             rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
@@ -945,6 +954,7 @@ fn encode_frame_lossless_core_impl(
                         rgb_stage,
                         wp_params,
                         &header_bits,
+                        effort.tree_rank_deep,
                         pool,
                         scratch,
                     )
@@ -982,6 +992,7 @@ fn encode_frame_lossless_core_impl(
             }
             if rank_pal
                 && rank_more
+                && effort.tree_rank_deep
                 && let Some(p) = &palette
             {
                 let source = p.source(xsize, ysize);
@@ -994,6 +1005,7 @@ fn encode_frame_lossless_core_impl(
                     pal_stage,
                     wp_params,
                     &header_bits,
+                    true,
                     pool,
                     scratch,
                 );
@@ -1008,6 +1020,7 @@ fn encode_frame_lossless_core_impl(
         // Layouts are processed one at a time so a single sample set is alive.
         // Everything else keeps the codestream default.
         let slow_layouts = compare_tree_candidates
+            && effort.tree_dual_layout
             && matches!(decoding_speed, crate::DecodingSpeed::Slow)
             // An image inside one 256-px group learns the same thing under
             // both layouts.
@@ -1158,7 +1171,11 @@ fn encode_frame_lossless_core_impl(
         // ones, and building them would scan the image for nothing.
         let global_palette_won =
             best_tree_writer.as_ref().map(BitWriter::bits_written) != bytes_before_palette;
-        if compare_tree_candidates && num_color == 3 && !global_palette_won {
+        if compare_tree_candidates
+            && effort.tree_group_palette
+            && num_color == 3
+            && !global_palette_won
+        {
             let gdim = GroupLayout::DEFAULT.dim();
             let groups_x = xsize.div_ceil(gdim);
             let groups_y = ysize.div_ceil(gdim);
@@ -1271,7 +1288,7 @@ fn encode_frame_lossless_core_impl(
     let linear = rct_planes.as_ref().unwrap_or(ycocg);
     // Per-channel predictor search for the v1 context tree and flat paths
     // (deferred: a decisive learned tree never needs it).
-    let predictors = if adaptive_search {
+    let predictors = if effort.predictor_search {
         choose_predictors_with_wp(
             linear, alpha, xsize, ysize, num_color, pool, scratch, wp_params, use_wp,
         )
@@ -1310,7 +1327,7 @@ fn encode_frame_lossless_core_impl(
     // Context tree (v1): single-group. Splits each channel's entropy context on
     // the WP activity property; a big win on smooth+edge content. Falls through
     // to the flat path when it isn't estimated to help.
-    if compare_tree_candidates && use_wp {
+    if compare_tree_candidates && effort.tree_ctx_v1 && use_wp {
         let mut candidate = BitWriter::new();
         if single_group {
             if try_encode_context_tree_single_group(
@@ -1416,7 +1433,7 @@ fn encode_frame_lossless_core_impl(
                 &[tail],
                 nb_chans,
                 min_symbol,
-                speed == crate::Speed::Slow,
+                speed.effort().lz_refined_entropy,
                 false,
                 None,
                 &mut scratch.lz_entropy,
@@ -1463,7 +1480,9 @@ fn encode_frame_lossless_core_impl(
             // every per-group emission is guaranteed to be representable.
             let distance_ctx = nb_chans as u32;
             let group_lz_tokens: Vec<Vec<LzToken>> = {
-                let deep_lz = (speed == crate::Speed::Slow)
+                let deep_lz = speed
+                    .effort()
+                    .lz_deep
                     .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
                 pool.steal_map_with_threads(
                     scratch,
@@ -1476,7 +1495,7 @@ fn encode_frame_lossless_core_impl(
                         let y0 = gy * gdim;
                         let gw = gdim.min(xsize - x0);
                         let gh = gdim.min(ysize - y0);
-                        if speed == crate::Speed::Slow {
+                        if speed.effort().lz_deep {
                             let channel_tokens = tokenize_channels_with_wp(
                                 linear,
                                 alpha,
@@ -1540,7 +1559,7 @@ fn encode_frame_lossless_core_impl(
                 &group_tails,
                 nb_chans,
                 min_symbol,
-                speed == crate::Speed::Slow,
+                speed.effort().lz_refined_entropy,
                 false,
                 None,
                 &mut scratch.lz_entropy,
@@ -1782,7 +1801,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
         GroupLayout::DEFAULT
     };
     let grad_pack_fn = selected_grad_pack_interior_fn();
-    let slow = speed == crate::Speed::Slow;
+    let effort = speed.effort();
     let npx = xsize * ysize;
 
     // Distinct quantized XYB triples, palette-capped like the lossless path.
@@ -1857,7 +1876,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
         write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
         let pget = |gx: usize, gy: usize| palette_ch[gy * nb_colors + gx];
         let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
-        let preds = if slow {
+        let preds = if effort.predictor_search {
             vec![
                 choose_predictor_for_plane(pget, nb_colors, num_c, use_wp),
                 choose_predictor_for_plane(iget, xsize, ysize, use_wp),
@@ -1891,7 +1910,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
         let mut preds = Vec::with_capacity(num_c);
         for (c, data) in ch.iter().enumerate() {
             let get = |gx: usize, gy: usize| data[gy * xsize + gx];
-            let pred = if slow {
+            let pred = if effort.predictor_search {
                 choose_predictor_for_plane(get, xsize, ysize, use_wp)
             } else {
                 fixed_predictor(use_wp)
@@ -1948,7 +1967,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
-        slow,
+        effort.lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
@@ -2459,6 +2478,8 @@ const MA_TARGET_SAMPLES: usize = 1 << 21;
 /// pixel-phase noise than switching abruptly to a full-image sample.
 const MA_FULL_SAMPLE_LIMIT: usize = 1 << 22;
 const MA_FINAL_TARGET_SAMPLES: usize = 1 << 23;
+const MA_LITE_TARGET_SAMPLES: usize = 1 << 19;
+const MA_LITE_FULL_SAMPLE_LIMIT: usize = 1 << 19;
 const MA_FINAL_FULL_SAMPLE_LIMIT: usize = 1 << 24;
 /// The dense final budget applies to sources whose first-stage estimate
 /// costs at least this many bits per value: photos and paintings (2-3 b/v).
@@ -3363,8 +3384,8 @@ fn wp_matters(stage: &CoarseLearn) -> bool {
 /// Rank the WP presets of `source` by their first-stage learns, starting
 /// from `first` (already learned under `first_params`), the rest in order
 /// of how often they win; a preset trailing the best first stage seen by
-/// more than `RANK_COARSE_PRUNE` is dropped. Returns (best bits, best coarse
-/// bits, preset).
+/// more than `RANK_COARSE_PRUNE` is dropped. Without `all_presets` only
+/// `first` is scored. Returns (best bits, best coarse bits, preset).
 #[allow(clippy::too_many_arguments)]
 fn rank_presets(
     source: &MaSource<'_>,
@@ -3375,6 +3396,7 @@ fn rank_presets(
     first: Option<CoarseLearn>,
     first_params: WpParams,
     header_bits: &dyn Fn(WpParams) -> f64,
+    all_presets: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> (f64, f64, WpParams) {
@@ -3382,7 +3404,7 @@ fn rank_presets(
     let mut best_coarse = f64::INFINITY;
     let mut best_params = first_params;
     let mut order: Vec<WpParams> = vec![first_params];
-    if use_wp && first.as_ref().is_none_or(wp_matters) {
+    if use_wp && all_presets && first.as_ref().is_none_or(wp_matters) {
         for &preset in [1usize, 2, 3, 0].iter().map(|&i| &WpParams::PRESETS[i]) {
             if preset != first_params {
                 order.push(preset);

@@ -61,7 +61,7 @@ pub(crate) use selection::{
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
 
-/// Above this distance the [`SearchScope::Squares`] tier stops reranking; see
+/// Above this distance a scope without `full_rerank` stops reranking; see
 /// [`SearchScope::rerank`].
 const FAST_RERANK_MAX_DISTANCE: f32 = 1.7090991223128462;
 
@@ -275,31 +275,43 @@ impl MergeTuning {
 
 /// How much of the transform space the chooser explores.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SearchScope {
-    Squares,
-    Full,
+pub(crate) struct SearchScope {
+    rectangles: bool,
+    full_rerank: bool,
 }
 
 impl SearchScope {
+    #[cfg(test)]
+    pub(crate) const SQUARES: Self = Self {
+        rectangles: false,
+        full_rerank: false,
+    };
+    #[cfg(test)]
+    pub(crate) const FULL: Self = Self {
+        rectangles: true,
+        full_rerank: true,
+    };
+
     #[inline]
     fn for_speed(speed: crate::Speed) -> Self {
-        match speed {
-            // Fastest never reaches the chooser (`fill_ac_strategy` returns
-            // before scoping); Squares is the defensive mapping.
-            crate::Speed::Fastest | crate::Speed::Fast => SearchScope::Squares,
-            crate::Speed::Slow => SearchScope::Full,
+        // Fastest never reaches the chooser (`fill_ac_strategy` returns
+        // before scoping).
+        let effort = speed.effort();
+        Self {
+            rectangles: effort.rectangles,
+            full_rerank: effort.full_rerank,
         }
     }
 
     #[inline]
     fn rectangles(self) -> bool {
-        self == SearchScope::Full
+        self.rectangles
     }
 
     /// Whether the SSIM reconstruction rerank runs.
     #[inline]
     fn rerank(self, distance: f32) -> bool {
-        self == SearchScope::Full || distance <= FAST_RERANK_MAX_DISTANCE
+        self.full_rerank || distance <= FAST_RERANK_MAX_DISTANCE
     }
 }
 
@@ -584,7 +596,7 @@ const fn dct64_rect_accept() -> f32 {
 
 #[inline]
 fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
-    speed == crate::Speed::Slow
+    speed.effort().dct64
         && (distance >= DCT64_MIN_DISTANCE
             || (DCT64_WINDOW_LO..DCT64_WINDOW_HI).contains(&distance))
 }

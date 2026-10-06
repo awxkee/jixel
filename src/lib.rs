@@ -49,6 +49,7 @@ mod color_encoding;
 mod dc_group_data;
 mod dc_tree;
 mod dct;
+mod effort;
 mod encode_image;
 mod encoding_context;
 mod entropy;

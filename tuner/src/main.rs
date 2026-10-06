@@ -23,7 +23,7 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
-         [--speed slow|fast]"
+         [--speed slow|medium|fast]"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
@@ -65,6 +65,7 @@ fn main() -> ExitCode {
                 let v = args.get(i + 1).unwrap_or_else(|| usage());
                 speed = match v.as_str() {
                     "slow" => jixel::Speed::Slow,
+                    "medium" => jixel::Speed::Medium,
                     "fast" => jixel::Speed::Fast,
                     _ => {
                         eprintln!("invalid --speed: {v}");

@@ -225,14 +225,21 @@ impl ToneMappingParams {
     }
 }
 
-/// Encoder speed/transform-search tradeoff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Encoder speed/density tradeoff, ordered from fastest to densest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[non_exhaustive]
 pub enum Speed {
     /// No transform search at all: every block is coded as a plain 8×8 DCT.
     /// Skips everything `Fast` skips, plus the square-merge selection.
     Fastest,
+    /// Square transforms only; lossless uses no learned context trees.
     #[default]
     Fast,
+    /// The full transform search and color tools of `Slow` without its
+    /// costliest coding refinements; lossless learns its context tree from a
+    /// smaller sample and skips the predictor-preset ranking.
+    Medium,
+    /// Every coding tool.
     Slow,
 }
 
@@ -778,15 +785,17 @@ impl EncodeConfig {
         self
     }
 
-    /// Select the transform-search speed/effort tradeoff.
+    /// Select the lossless decode-speed/density tradeoff (see [`DecodingSpeed`]).
     pub fn with_decoding_speed(mut self, decoding_speed: DecodingSpeed) -> Self {
         self.decoding_speed = decoding_speed;
         self
     }
 
+    /// Select the encode-speed/density tradeoff (see [`Speed`]).
+    /// [`Speed::Medium`] and [`Speed::Slow`] also turn on [`EncodeConfig::patches`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
-        if speed == Speed::Slow {
+        if speed.effort().patches_default {
             self.patches = true;
         }
         self
@@ -816,7 +825,7 @@ pub fn distance_from_quality(quality: f32) -> f32 {
 /// after linearization and before any XYB conversion; the non-spec matrix is
 /// signaled via the explicit CustomTransformData bundle in `write_headers`.
 fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32) {
-    if ctx.speed != Speed::Slow {
+    if !ctx.speed.effort().yellow_opsin {
         return;
     }
     let selection = crate::yellow_opsin::select_yellow(linear, distance);
@@ -846,10 +855,10 @@ fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
-    ctx.selector.learned_rate = config.learned_rate && config.speed == Speed::Slow;
+    ctx.selector.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
     #[cfg(feature = "splines")]
     {
-        let slow = config.speed == Speed::Slow && config.decoding_speed == DecodingSpeed::Slow;
+        let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
         ctx.splines = config.splines && slow;
         ctx.dots = config.dots && slow;
     }
@@ -2845,7 +2854,7 @@ mod encode_smoke_tests {
 
     #[test]
     fn public_lossy_paths_share_the_minimum_distance() {
-        for speed in [Speed::Fast, Speed::Slow] {
+        for speed in [Speed::Fast, Speed::Medium, Speed::Slow] {
             let at_floor = EncodeConfig::default()
                 .with_speed(speed)
                 .with_distance(0.05);
@@ -3593,7 +3602,7 @@ mod encode_smoke_tests {
     fn learned_rate_is_a_slow_speed_tool() {
         const SIZE: usize = 128;
         let pixels = checkerboard_rgb(SIZE);
-        for speed in [Speed::Fastest, Speed::Fast] {
+        for speed in [Speed::Fastest, Speed::Fast, Speed::Medium] {
             let base = EncodeConfig::default()
                 .with_distance(2.0)
                 .with_speed(speed)
@@ -3615,7 +3624,7 @@ mod encode_smoke_tests {
             .map(|i| i.wrapping_mul(37).wrapping_add((i / 7).wrapping_mul(13)) as u8)
             .collect();
 
-        for speed in [Speed::Fastest, Speed::Fast, Speed::Slow] {
+        for speed in [Speed::Fastest, Speed::Fast, Speed::Medium, Speed::Slow] {
             let single = encode_image(
                 &input,
                 WIDTH,
@@ -3653,7 +3662,7 @@ mod encode_smoke_tests {
             })
             .collect();
 
-        for speed in [Speed::Fast, Speed::Slow] {
+        for speed in [Speed::Fast, Speed::Medium, Speed::Slow] {
             let encode = |ds: DecodingSpeed| {
                 encode_image(
                     &input,

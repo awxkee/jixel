@@ -948,7 +948,7 @@ pub(crate) fn write_ac_group(
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
     let mut chroma_distortion = 0.0f32;
-    let chroma_deadzone = ctx.speed == crate::Speed::Slow;
+    let chroma_deadzone = ctx.speed.effort().chroma_deadzone;
 
     // All the big per-block buffers live in the worker scratch: re-creating them
     // per group cost ~130 KB of zeroing, and `pblock` was being zeroed once per

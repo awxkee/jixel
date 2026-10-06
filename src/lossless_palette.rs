@@ -245,7 +245,7 @@ pub(super) fn try_encode_palette_single_group(
         let iget = |y: usize| &palette.indices[y * xsize..][..xsize];
 
         // 5) Slow searches predictors per channel; Fast stays fixed Weighted.
-        let preds = if speed == crate::Speed::Slow {
+        let preds = if speed.effort().predictor_search {
             [
                 choose_predictor_for_rows(pget, nb_colors, num_c, use_wp),
                 choose_predictor_for_rows(iget, xsize, ysize, use_wp),
@@ -264,7 +264,7 @@ pub(super) fn try_encode_palette_single_group(
         section.write(1, 1); // wp_default = 1
         write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
 
-        let lz_tokens = if speed == crate::Speed::Slow {
+        let lz_tokens = if speed.effort().lz_deep {
             let mut tokens = Vec::with_capacity(num_c * nb_colors + npx);
             palette.tokenize(
                 nb_chans,
@@ -291,7 +291,7 @@ pub(super) fn try_encode_palette_single_group(
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
@@ -389,7 +389,7 @@ fn estimated_local_lz_stream_bits(
         std::iter::once(lz),
         num_contexts,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
@@ -421,7 +421,7 @@ fn local_palette_is_better(
 ) -> (bool, SqueezePredictorCost) {
     let nb_chans = 3 + usize::from(alpha.is_some());
     let mut index_cost = SqueezePredictorCost::default();
-    let palette_predictors = if speed == crate::Speed::Slow {
+    let palette_predictors = if speed.effort().predictor_search {
         [
             choose_predictor_for_rows(
                 |y| &palette.palette[y * palette.nb_colors..][..palette.nb_colors],
@@ -470,7 +470,7 @@ fn local_palette_is_better(
         ) + palette_transform.bits_written()
     };
 
-    let plain_predictors: Vec<u32> = if speed == crate::Speed::Slow {
+    let plain_predictors: Vec<u32> = if speed.effort().predictor_search {
         (0..nb_chans)
             .map(|chan| {
                 if chan < 3 {
@@ -635,7 +635,7 @@ pub(super) fn try_encode_local_palette_multi_group(
     // Merge only accepted palettes while their group costs are still available;
     // do not retain one set of histograms per group or serialize group scoring.
     let pooled_index_cost = std::sync::Mutex::new(SqueezePredictorCost::default());
-    let palettes = if speed == crate::Speed::Slow {
+    let palettes = if speed.effort().local_palette_select {
         let mut palettes = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
             let gx = group_index % xsize_groups;
             let gy = group_index / xsize_groups;
@@ -720,7 +720,7 @@ pub(super) fn try_encode_local_palette_multi_group(
 
     // The global MA tree sees group-local channel slots. Pool predictor costs
     // for palette/index channels and ordinary YCoCg(A) channels by those slots.
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+    let predictors: Vec<u32> = if speed.effort().predictor_search {
         // Split the remaining palette-meta and plain-channel work by group.
         // Each crop still resets WP; integer histogram merging leaves the
         // final costs and predictor tie-breaking unchanged.
@@ -786,7 +786,9 @@ pub(super) fn try_encode_local_palette_multi_group(
 
     let distance_ctx = nb_chans as u32;
     let group_lz_tokens: Vec<Vec<LzToken>> = {
-        let deep_lz = (speed == crate::Speed::Slow)
+        let deep_lz = speed
+            .effort()
+            .lz_deep
             .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
         pool.steal_map_with_threads(
             scratch,
@@ -832,7 +834,7 @@ pub(super) fn try_encode_local_palette_multi_group(
                     let y0 = gy * GROUP_DIM;
                     let w = GROUP_DIM.min(xsize - x0);
                     let h = GROUP_DIM.min(ysize - y0);
-                    if speed == crate::Speed::Slow {
+                    if speed.effort().lz_deep {
                         let channel_tokens = tokenize_channels_with_wp(
                             linear,
                             alpha,
@@ -891,7 +893,7 @@ pub(super) fn try_encode_local_palette_multi_group(
         group_lz_tokens.iter().map(Vec::as_slice),
         nb_chans,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
