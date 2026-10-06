@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::coder_scratch::CoderScratch;
+use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, Image3Si};
 use crate::thread_pool::ThreadPool;
 use std::collections::HashMap;
@@ -1022,6 +1023,13 @@ fn color_key(c0: i32, c1: i32, c2: i32) -> u64 {
 }
 
 #[inline]
+fn round_to_multiple(v: i32, k: i32) -> i32 {
+    let k = k.unsigned_abs();
+    let r = ((v.unsigned_abs() + k / 2) / k * k) as i32;
+    if v < 0 { -r } else { r }
+}
+
+#[inline]
 fn key_color(key: u64) -> [i32; 3] {
     let f = |shift: u32| ((key >> shift) & GLYPH_KEY_MASK) as i64 - GLYPH_KEY_BIAS;
     [f(42) as i32, f(21) as i32, f(0) as i32]
@@ -1344,8 +1352,11 @@ pub(crate) struct GlyphParams {
 
 /// Share of the frame the glyph boxes must cover.
 const GLYPH_MIN_COVER: f64 = 0.005;
+/// Lattice step of the stored glyph values.
+const GLYPH_ATLAS_STEP: i32 = 6;
 
 pub(crate) fn find_lossy_glyph_patches(
+    ctx: &EncodingContext,
     xyb: &Image3F,
     params: &GlyphParams,
 ) -> Option<LossyGlyphPatches> {
@@ -1368,7 +1379,7 @@ pub(crate) fn find_lossy_glyph_patches(
                 let k = [params.coarse; 3];
                 for (key, c) in sample_keys.iter_mut().zip(&colors) {
                     // Same granularity as the full pass; tile colors are Y, X, B-Y.
-                    let r = |v: i32, k: i32| (v as f32 / k as f32).round() as i32 * k;
+                    let r = round_to_multiple;
                     *key = color_key(r(c[0], k[0]), r(c[1], k[1]), r(c[2] + c[0], k[2]));
                 }
                 let mut sorted = sample_keys;
@@ -1387,15 +1398,13 @@ pub(crate) fn find_lossy_glyph_patches(
     for (b, &y) in qb.iter_mut().zip(&qy) {
         *b += y;
     }
-    // Coarser atlas values on the same lattice: multiples of `coarse[c]`.
-    for (plane, k) in [&mut qy, &mut qx, &mut qb]
-        .into_iter()
-        .zip([params.coarse; 3])
-    {
-        if k > 1 {
-            for v in plane.iter_mut() {
-                *v = (*v as f32 / k as f32).round() as i32 * k;
-            }
+    let fine = [qy.clone(), qx.clone(), qb.clone()];
+    // Shapes are matched on a coarser lattice: multiples of `coarse[c]`.
+    debug_assert!(params.coarse > 0 && (params.coarse as u32).is_power_of_two());
+    if params.coarse > 1 {
+        let shift = params.coarse.trailing_zeros();
+        for plane in [&mut qy, &mut qx, &mut qb] {
+            unsafe { (ctx.round_lattice_pow2)(plane, shift) };
         }
     }
     let planes = [&qy, &qx, &qb];
@@ -1566,6 +1575,17 @@ pub(crate) fn find_lossy_glyph_patches(
             0
         }
     };
+    // Atlas values: the leader's own pixels on a lattice coarser than the
+    // matching one. Every placement subtracts exactly these from the base.
+    let atlas_step = GLYPH_ATLAS_STEP.max(params.coarse);
+    let atlas_value = |s: &Shape, c: usize, dx: usize, dy: usize| -> i32 {
+        let i = (s.y0 + dy) * width + s.x0 + dx;
+        if label[i] == s.label {
+            round_to_multiple(fine[c][i] - s.bg[c], atlas_step)
+        } else {
+            0
+        }
+    };
     let same = |a: &Shape, b: &Shape| -> bool {
         a.w == b.w
             && a.h == b.h
@@ -1680,7 +1700,11 @@ pub(crate) fn find_lossy_glyph_patches(
         for dy in 0..s.h {
             for dx in 0..s.w {
                 let at = (ay + dy) * atlas_width + ax + dx;
-                let d = [diff(s, 0, dx, dy), diff(s, 1, dx, dy), diff(s, 2, dx, dy)];
+                let d = [
+                    atlas_value(s, 0, dx, dy),
+                    atlas_value(s, 1, dx, dy),
+                    atlas_value(s, 2, dx, dy),
+                ];
                 atlas[0][at] = d[0];
                 atlas[1][at] = d[1];
                 atlas[2][at] = d[2] - d[0];
@@ -1694,7 +1718,7 @@ pub(crate) fn find_lossy_glyph_patches(
                 for dy in 0..o.h {
                     let row = base.plane_row_mut(image_plane[c], o.y0 + dy);
                     for dx in 0..o.w {
-                        let d = diff(o, c, dx, dy);
+                        let d = atlas_value(s, c, dx, dy);
                         if d != 0 {
                             row[o.x0 + dx] -= d as f32 * steps[c];
                         }
@@ -2066,6 +2090,10 @@ mod tests {
     /// Six distinct 16x16 glyphs, each repeated exactly six times (comfortably
     /// past MIN_PATCH_OCCURRENCES), so every group has the same count and only
     /// the tie-break can order them.
+    fn glyph_ctx() -> EncodingContext {
+        EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 1.0, 1)
+    }
+
     fn glyph_params(min_occurrences: usize) -> GlyphParams {
         GlyphParams {
             min_occurrences,
@@ -2145,9 +2173,51 @@ mod tests {
     }
 
     #[test]
+    fn lattice_rounding_matches_float_round() {
+        let values: Vec<i32> = (-4099..=4099).chain([i32::MIN / 4, i32::MAX / 4]).collect();
+        for shift in 1..=4u32 {
+            let k = 1i32 << shift;
+            let mut kernels: Vec<(&str, crate::xyb::RoundLatticePow2Fn)> = vec![
+                ("dispatch", crate::xyb::selected_round_lattice_pow2_fn()),
+                ("scalar", crate::xyb::round_lattice_pow2_scalar),
+            ];
+            #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+            if std::is_x86_feature_detected!("sse2") {
+                kernels.push(("sse2", crate::sse::round_lattice_pow2_sse2));
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+            if std::is_x86_feature_detected!("avx2") {
+                kernels.push(("avx2", crate::avx::round_lattice_pow2_avx2));
+            }
+            #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+            kernels.push(("neon", crate::neon::round_lattice_pow2_neon));
+            for (name, f) in kernels {
+                let mut out = values.clone();
+                unsafe { f(&mut out, shift) };
+                for (&v, &got) in values.iter().zip(&out) {
+                    let want = (v as f64 / k as f64).round() as i32 * k;
+                    assert_eq!(got, want, "{name}: v={v} k={k}");
+                }
+            }
+            for &v in &values {
+                let want = (v as f64 / k as f64).round() as i32 * k;
+                assert_eq!(round_to_multiple(v, k), want, "v={v} k={k}");
+            }
+        }
+        for v in -100..=100 {
+            assert_eq!(
+                round_to_multiple(v, 6),
+                (v as f64 / 6.0).round() as i32 * 6,
+                "v={v}"
+            );
+        }
+    }
+
+    #[test]
     fn lossy_glyph_patches_reconstruct_and_flatten_the_base() {
         let img = glyph_page();
-        let repeated = find_lossy_glyph_patches(&img, &glyph_params(2)).expect("plan");
+        let repeated =
+            find_lossy_glyph_patches(&glyph_ctx(), &img, &glyph_params(2)).expect("plan");
         // The mark differs between the two backgrounds only by where it sits.
         assert_eq!(repeated.references.len(), 2);
         let mut counts: Vec<usize> = repeated
@@ -2160,10 +2230,10 @@ mod tests {
         assert_glyph_plan_reconstructs(&img, &repeated);
         // Under the repeated marks the base is the background again, to within
         // the lattice rounding of the patch.
-        let step = 1.0 / crate::quant_weights::INV_DC_QUANT[1];
+        let step = GLYPH_ATLAS_STEP as f32 / 2.0 / crate::quant_weights::INV_DC_QUANT[1];
         assert!((repeated.base.plane_row(1, 8)[5] - 307.0 / 512.0).abs() <= step);
 
-        let all = find_lossy_glyph_patches(&img, &glyph_params(1)).expect("plan");
+        let all = find_lossy_glyph_patches(&glyph_ctx(), &img, &glyph_params(1)).expect("plan");
         assert_eq!(all.references.len(), 3);
         assert_glyph_plan_reconstructs(&img, &all);
     }
@@ -2178,7 +2248,7 @@ mod tests {
             min_contrast: 64,
             ..glyph_params(1)
         };
-        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
         assert_eq!(plan.references.len(), 2);
         assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
         assert_glyph_plan_reconstructs(&img, &plan);
@@ -2186,7 +2256,7 @@ mod tests {
             min_contrast: 128,
             ..glyph_params(1)
         };
-        assert!(find_lossy_glyph_patches(&img, &params).is_none());
+        assert!(find_lossy_glyph_patches(&glyph_ctx(), &img, &params).is_none());
     }
 
     /// One 36-pixel unrepeated mark on a 192x128 page is far below any
@@ -2199,14 +2269,14 @@ mod tests {
             singles_min_cover: 0.5,
             ..glyph_params(1)
         };
-        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
         assert_eq!(plan.references.len(), 2);
         assert!(plan.references.iter().all(|r| r.positions.len() >= 4));
         let params = GlyphParams {
             singles_min_cover: 0.001,
             ..glyph_params(1)
         };
-        let plan = find_lossy_glyph_patches(&img, &params).expect("plan");
+        let plan = find_lossy_glyph_patches(&glyph_ctx(), &img, &params).expect("plan");
         assert_eq!(plan.references.len(), 3);
     }
 

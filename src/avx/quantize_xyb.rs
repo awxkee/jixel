@@ -226,3 +226,20 @@ pub(crate) fn quantize_xyb_tile_colors_avx2(
         store_interleaved3_i32x8_tail(out_tail, yq, xq, bq);
     }
 }
+
+/// Lattice values rounded to multiples of `1 << shift`, halves away from zero.
+#[target_feature(enable = "avx2")]
+pub(crate) fn round_lattice_pow2_avx2(plane: &mut [i32], shift: u32) {
+    let half = _mm256_set1_epi32((1 << shift) >> 1);
+    let mask = _mm256_set1_epi32(-(1 << shift));
+    let (v8s, tail) = plane.as_chunks_mut::<8>();
+    for v8 in v8s {
+        let v = unsafe { _mm256_loadu_si256(v8.as_ptr().cast()) };
+        let sign = _mm256_srai_epi32::<31>(v);
+        let abs = _mm256_abs_epi32(v);
+        let r = _mm256_and_si256(_mm256_add_epi32(abs, half), mask);
+        let out = _mm256_sub_epi32(_mm256_xor_si256(r, sign), sign);
+        unsafe { _mm256_storeu_si256(v8.as_mut_ptr().cast(), out) };
+    }
+    crate::xyb::round_lattice_pow2_scalar(tail, shift);
+}

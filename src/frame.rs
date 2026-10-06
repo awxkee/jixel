@@ -1618,6 +1618,7 @@ fn prepare_vardct_variant(
             8
         };
         crate::patches::find_lossy_glyph_patches(
+            ctx,
             &xyb,
             &crate::patches::GlyphParams {
                 min_occurrences: 1,

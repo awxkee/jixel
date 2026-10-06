@@ -161,3 +161,20 @@ pub(crate) fn quantize_xyb_tile_colors_sse41(
         ];
     }
 }
+
+/// Lattice values rounded to multiples of `1 << shift`, halves away from zero.
+#[target_feature(enable = "sse2")]
+pub(crate) fn round_lattice_pow2_sse2(plane: &mut [i32], shift: u32) {
+    let half = _mm_set1_epi32((1 << shift) >> 1);
+    let mask = _mm_set1_epi32(-(1 << shift));
+    let (v4s, tail) = plane.as_chunks_mut::<4>();
+    for v4 in v4s {
+        let v = unsafe { _mm_loadu_si128(v4.as_ptr().cast()) };
+        let sign = _mm_srai_epi32::<31>(v);
+        let abs = _mm_sub_epi32(_mm_xor_si128(v, sign), sign);
+        let r = _mm_and_si128(_mm_add_epi32(abs, half), mask);
+        let out = _mm_sub_epi32(_mm_xor_si128(r, sign), sign);
+        unsafe { _mm_storeu_si128(v4.as_mut_ptr().cast(), out) };
+    }
+    crate::xyb::round_lattice_pow2_scalar(tail, shift);
+}

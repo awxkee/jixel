@@ -999,8 +999,8 @@ fn bench_jixel(
         .with_distance(d)
         .with_num_threads(nthreads)
         .with_speed(Speed::Slow)
-        .with_splines(true)
-        .with_dots(true);
+        .with_splines(false)
+        .with_dots(false);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));
