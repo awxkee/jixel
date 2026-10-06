@@ -761,8 +761,7 @@ pub(crate) fn fill_cmap(
     // Coarse chroma structure still benefits from searching the
     // quantized residual cost. Dropping to regression at d=3 erases yellow detail
     // on the very frames for which we retain extra X/B precision.
-    let use_rdo = (distance < CFL_RDO.max_d || ctx.x_heavy())
-        && ctx.speed == crate::encode_image::Speed::Slow;
+    let use_rdo = (distance < CFL_RDO.max_d || ctx.x_heavy()) && ctx.speed.effort().cfl_rdo;
 
     for ty in 0..ytiles {
         for tx in 0..xtiles {

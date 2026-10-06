@@ -189,7 +189,7 @@ pub(super) fn encode_squeeze_single_group(
 
     // Slow searches the useful general and directional predictors per channel;
     // Fast avoids the analysis pass and uses fixed Weighted prediction.
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+    let predictors: Vec<u32> = if speed.effort().predictor_search {
         pool.steal_map(scratch, channels.len(), |c, _scratch| {
             let ch = &channels[c];
             let data = &ch.data;
@@ -234,7 +234,7 @@ pub(super) fn encode_squeeze_single_group(
         std::iter::once(lz_tokens.as_slice()),
         nb,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
@@ -350,7 +350,7 @@ pub(super) fn encode_squeeze_multigroup(
         .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
         .unwrap_or(nb);
 
-    let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+    let predictors: Vec<u32> = if speed.effort().predictor_search {
         // The MA tree sees a channel's position inside each modular sub-image,
         // not its index in `channels`. Pool costs by that decoder-visible slot.
         let mut costs: Vec<SqueezePredictorCost> =
@@ -439,7 +439,9 @@ pub(super) fn encode_squeeze_multigroup(
     // the within-group index (sequential over non-empty crops) is exactly the
     // `chan` property the global tree keys on.
     let (dc_group_lz, ac_group_lz) = {
-        let deep_lz = (speed == crate::Speed::Slow)
+        let deep_lz = speed
+            .effort()
+            .lz_deep
             .then(|| DeepLzScratchPool::new(group_lz_threads(speed, pool)));
         let crop_group = |gdim: usize,
                           gx: usize,
@@ -523,7 +525,7 @@ pub(super) fn encode_squeeze_multigroup(
             .chain(ac_group_lz.iter().map(Vec::as_slice)),
         nb,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
@@ -1048,7 +1050,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
 
     if num_ac_groups == 1 {
         // Single-group frame: one section carrying everything.
-        let predictors: Vec<u32> = if speed == crate::Speed::Slow {
+        let predictors: Vec<u32> = if speed.effort().predictor_search {
             let quants_ref = &quants;
             pool.steal_map(scratch, nb, |c, _scratch| {
                 let ch = &channels[c];
@@ -1108,7 +1110,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
             std::iter::once(lz_tokens.as_slice()),
             nb,
             min_symbol,
-            speed == crate::Speed::Slow,
+            speed.effort().lz_refined_entropy,
             &mut scratch.lz_entropy,
             &mut scratch.huffman_pool,
         );
@@ -1389,7 +1391,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
             .chain(ac_group_lz.iter().map(Vec::as_slice)),
         num_ctx,
         min_symbol,
-        speed == crate::Speed::Slow,
+        speed.effort().lz_refined_entropy,
         true,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,

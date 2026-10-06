@@ -1482,7 +1482,7 @@ pub(crate) fn fill_ac_strategy(
     num_threads: usize,
 ) -> f32 {
     let learned = ctx.selector.learned_rate
-        && ctx.speed == crate::Speed::Slow
+        && ctx.speed.effort().learned_rate
         && !use_dct8_only_for_content(ctx, distance);
     let prices = learned.then(|| {
         learn_rate_prices(
@@ -2313,7 +2313,7 @@ fn find_rerank_downgrades(
             params.scale,
             params.distance,
         );
-        let with_fine_mosaic = ctx.speed == crate::Speed::Slow
+        let with_fine_mosaic = ctx.speed.effort().fine_mosaic
             && (params.distance <= FINE_MOSAIC_MAX_DISTANCE || coarse_chromatic)
             && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
         debug_assert!(!with_fine_mosaic || cxb * cyb <= FINE_MOSAIC_MAX_CHILDREN);
@@ -3731,9 +3731,9 @@ mod tests {
     /// over-merges; past the cutoff the rerank costs time to lose rate.
     #[test]
     fn fast_rerank_is_gated_by_distance_but_slow_always_reranks() {
-        assert!(SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE));
-        assert!(!SearchScope::Squares.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
-        assert!(SearchScope::Full.rerank(6.0));
+        assert!(SearchScope::SQUARES.rerank(FAST_RERANK_MAX_DISTANCE));
+        assert!(!SearchScope::SQUARES.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
+        assert!(SearchScope::FULL.rerank(6.0));
     }
 
     /// The sub-8 biases are a fitted pair, not incidental defaults: both are
@@ -3767,25 +3767,28 @@ mod tests {
         );
     }
 
-    /// AFV (with the rest of sub-8) is a Slow-only feature: the sub-8 pass
-    /// runs only under `SearchScope::Full`, and only Slow maps to it.
+    /// AFV (with the rest of sub-8) needs the rectangle search, which starts
+    /// at Medium; only Slow also reranks at every distance.
     #[test]
-    fn sub8_and_afv_are_slow_only() {
+    fn sub8_and_afv_start_at_medium() {
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Fastest),
-            SearchScope::Squares
+            SearchScope::SQUARES
         );
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Fast),
-            SearchScope::Squares
+            SearchScope::SQUARES
         );
+        let medium = SearchScope::for_speed(crate::Speed::Medium);
+        assert!(medium.rectangles());
+        assert!(!medium.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Slow),
-            SearchScope::Full
+            SearchScope::FULL
         );
         // The sub-8 refinement is gated on `scope.rectangles()`.
-        assert!(!SearchScope::Squares.rectangles());
-        assert!(SearchScope::Full.rectangles());
+        assert!(!SearchScope::SQUARES.rectangles());
+        assert!(SearchScope::FULL.rectangles());
     }
 
     fn noise_opsin(w: usize, h: usize, seed: u32) -> Image3F {
@@ -3897,7 +3900,7 @@ mod tests {
         // distance where no structural sub-8 candidate exists: the leaf-first
         // planner must then reproduce the legacy super-block/32 decisions,
         // saved child layouts and 32-level costs exactly.
-        for scope in [SearchScope::Full, SearchScope::Squares] {
+        for scope in [SearchScope::FULL, SearchScope::SQUARES] {
             let distance = 5.5f32;
             let ctx =
                 EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
@@ -4072,7 +4075,7 @@ mod tests {
 
     #[test]
     fn selection_is_independent_of_worker_count() {
-        for speed in [crate::Speed::Fast, crate::Speed::Slow] {
+        for speed in [crate::Speed::Fast, crate::Speed::Medium, crate::Speed::Slow] {
             for distance in [0.5, 1.5, 2.0, 4.0, 6.0] {
                 for raw_propagation in [false, true] {
                     let policy = crate::ac_strategy::SelectorPolicy {
@@ -4264,7 +4267,7 @@ mod tests {
                 params,
                 quant_field: &qf,
                 meta_r: META_R,
-                scope: SearchScope::Full,
+                scope: SearchScope::FULL,
             };
             let mut band = AcStrategyBandScratch::default();
             leaf_first::select_band_leaf_first(

@@ -887,6 +887,11 @@ impl Effort {
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
+            Speed::Medium => Self {
+                try_natural_order: false,
+                select_configs: true,
+                refinement: Some(AnsRefinement::Fast { recluster: true }),
+            },
             Speed::Slow => Self {
                 try_natural_order: true,
                 select_configs: true,

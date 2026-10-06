@@ -183,7 +183,9 @@ impl EncodingContext {
 
     pub(crate) fn point_chroma(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        self.speed == Speed::Slow && self.point_chroma.load(Relaxed) && !self.x_heavy.load(Relaxed)
+        self.speed.effort().chroma_policy
+            && self.point_chroma.load(Relaxed)
+            && !self.x_heavy.load(Relaxed)
     }
 
     /// The same override is used by the residual encoder and spline RD proxy.
@@ -287,7 +289,8 @@ impl EncodingContext {
         let quantize_dc = group::selected_quantize_dc_methods();
         let dc_from_dct = dct::selected_dc_from_dct_methods();
         let afv = afv::selected_afv_methods();
-        let base_matrices = if speed == Speed::Slow {
+        let effort = speed.effort();
+        let base_matrices = if effort.rectangles {
             DequantMatrices::new(distance)
         } else {
             DequantMatrices::new_fast(distance)
@@ -305,17 +308,17 @@ impl EncodingContext {
             merge: ac_strategy::MergeTuning::new(distance),
             selector: ac_strategy::SelectorPolicy::default(),
             base_matrices,
-            point_chroma_hq_matrices: (speed == Speed::Slow
+            point_chroma_hq_matrices: (effort.chroma_policy
                 && distance < crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)
                 .then(|| DequantMatrices::new(crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)),
             sat_matrices: DequantMatrices::new_saturated(distance),
-            pair_b_matrices: if speed == Speed::Slow {
+            pair_b_matrices: if effort.chroma_policy {
                 DequantMatrices::new_pair_b(distance)
             } else {
                 base_matrices
             },
             sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance),
-            x_heavy_matrices: if speed == Speed::Slow {
+            x_heavy_matrices: if effort.chroma_policy {
                 DequantMatrices::new_x_heavy(distance)
             } else {
                 DequantMatrices::new(0.0)

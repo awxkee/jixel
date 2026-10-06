@@ -1336,7 +1336,7 @@ pub(crate) fn encode_frame(
     }
     if alpha.is_none()
         && ctx.lossy_modular == crate::LossyModular::Auto
-        && ctx.speed == crate::Speed::Slow
+        && ctx.speed.effort().lossy_modular_auto
     {
         // Byte cushion for the calibration's per-image quality noise
         // (two-corpus + Optuna joint fit, study lossy_modular_v3 2026-09-02).
@@ -1402,7 +1402,7 @@ fn encode_frame_vardct(
     patches: bool,
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
-    let slow_chromatic = ctx.speed == crate::Speed::Slow && !is_achromatic;
+    let slow_chromatic = ctx.speed.effort().chroma_policy && !is_achromatic;
     let content = if slow_chromatic {
         chroma_content_stats(&xyb)
     } else {
@@ -1416,9 +1416,9 @@ fn encode_frame_vardct(
     };
     let (x_steps, b_steps) = match ctx.speed {
         _ if is_achromatic => (0, 0),
-        crate::Speed::Slow => pixel_chromacity_steps(&xyb),
-        // Without Slow's color machinery the B steps only cost rate.
-        crate::Speed::Fast if distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
+        _ if slow_chromatic => pixel_chromacity_steps(&xyb),
+        // Without the chroma policy the B steps only cost rate.
+        _ if ctx.speed != crate::Speed::Fastest && distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
             (pixel_chromacity_steps(&xyb).0, 0)
         }
         _ => (0, 0),
@@ -1778,9 +1778,9 @@ fn prepare_vardct_variant(
             used_tiles,
             estimated_bits: None,
         };
-        // Below Slow the atlas has neither the learned tree nor a palette
+        // Without learned trees the atlas has neither the tree nor a palette
         // and can outweigh the frame it replaces at any distance.
-        if distance >= GLYPH_CHECK_MIN_DISTANCE || ctx.speed != Speed::Slow {
+        if distance >= GLYPH_CHECK_MIN_DISTANCE || !ctx.speed.effort().learned_tree {
             let bits = prepared.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
             if atlas_bits as f64 > bits * GLYPH_CHECK_ATLAS_SHARE {
                 let mut regular = xyb;
@@ -2422,7 +2422,7 @@ fn apply_point_chroma_policy(
     is_achromatic: bool,
 ) {
     // X-heavy content already has a separate chroma precision policy.
-    let point_chroma = ctx.speed == crate::Speed::Slow
+    let point_chroma = ctx.speed.effort().chroma_policy
         && !is_achromatic
         && content.diffuse_point_chroma()
         && !ctx.x_heavy();
@@ -2736,7 +2736,7 @@ fn encode_frame_core(
     // mere presence perturbs codegen enough to shift a few borderline
     // quantizer roundings on paths that should be untouched.
     let want_order_stats =
-        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed == Speed::Slow;
+        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed.effort().coeff_orders;
     let results = ctx
         .thread_pool
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
@@ -3117,7 +3117,10 @@ fn encode_frame_core(
 
             // Arm C (Slow): the DC side learned over the full modular property set
             // and every predictor, as the lossless path does.
-            let ma_arm = (ctx.speed == Speed::Slow)
+            let ma_arm = ctx
+                .speed
+                .effort()
+                .ma_dc_tree
                 .then(|| {
                     learn_ma_dc_arm(
                         ctx,
@@ -3211,11 +3214,11 @@ fn encode_frame_core(
             }
         };
     let ans_refinement = match ctx.speed {
-        Speed::Slow => Some(crate::entropy::AnsRefinement::Slow),
-        Speed::Fast => Some(crate::entropy::AnsRefinement::Fast {
-            recluster: distance >= 3.0,
-        }),
         Speed::Fastest => None,
+        _ if ctx.speed.effort().ans_refine => Some(crate::entropy::AnsRefinement::Slow),
+        _ => Some(crate::entropy::AnsRefinement::Fast {
+            recluster: distance >= 3.0 || ctx.speed.effort().ans_recluster,
+        }),
     };
     if let Some(refinement) = ans_refinement.filter(|_| !dc_code_refined) {
         crate::entropy::refine_ans_clusters(
@@ -3300,7 +3303,7 @@ fn encode_frame_core(
             });
     };
 
-    let (ac_plan, mut ac_code_per_pass) = if ctx.speed != Speed::Slow {
+    let (ac_plan, mut ac_code_per_pass) = if !ctx.speed.effort().ac_ctx_plan {
         remap_tokens(&mut all_pending, &baseline, scratch);
         let codes = build_codes(&all_pending, baseline.num_ac_contexts(), scratch);
         (baseline, codes)
@@ -3606,7 +3609,7 @@ fn setup_dc_group(
         1.0 / distp.scale,
     );
 
-    if ctx.speed == Speed::Slow && (ctx.x_heavy() || ctx.b_heavy()) {
+    if ctx.speed.effort().chroma_policy && (ctx.x_heavy() || ctx.b_heavy()) {
         crate::adaptive_quant::apply_chroma_hf_protection(
             opsin,
             &mut dc_data.raw_quant_field,
