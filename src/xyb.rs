@@ -340,6 +340,48 @@ pub(crate) fn selected_quantize_xyb_channels_fn() -> QuantizeXybChannelsFn {
     *QUANTIZE_XYB_CHANNELS_FN.get_or_init(select_quantize_xyb_channels_fn)
 }
 
+pub(crate) type RoundLatticePow2Fn = unsafe fn(&mut [i32], u32);
+
+/// `round_lattice_pow2` without SIMD; also the tails of the SIMD kernels.
+pub(crate) fn round_lattice_pow2_scalar(plane: &mut [i32], shift: u32) {
+    let half = (1i32 << shift) >> 1;
+    let mask = -(1i32 << shift);
+    for v in plane.iter_mut() {
+        let sign = *v >> 31;
+        let r = (v.wrapping_abs().wrapping_add(half)) & mask;
+        *v = (r ^ sign).wrapping_sub(sign);
+    }
+}
+
+fn select_round_lattice_pow2_fn() -> RoundLatticePow2Fn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") {
+        return crate::avx::round_lattice_pow2_avx2;
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if std::is_x86_feature_detected!("sse2") {
+        return crate::sse::round_lattice_pow2_sse2;
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return crate::neon::round_lattice_pow2_neon;
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::round_lattice_pow2_wasm;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    round_lattice_pow2_scalar
+}
+
+static ROUND_LATTICE_POW2_FN: OnceLock<RoundLatticePow2Fn> = OnceLock::new();
+
+/// Rounds lattice values to multiples of `1 << shift`, halves away from zero
+/// (`f32::round` semantics, without float conversion or libm).
+#[inline]
+pub(crate) fn selected_round_lattice_pow2_fn() -> RoundLatticePow2Fn {
+    *ROUND_LATTICE_POW2_FN.get_or_init(select_round_lattice_pow2_fn)
+}
+
 /// XYB samples quantized onto the fixed modular-XYB integer lattice.
 pub(crate) fn quantize_xyb_channels(atlas: &Image3F, lattice_scale: u32) -> [Vec<i32>; 3] {
     use crate::quant_weights::INV_DC_QUANT;

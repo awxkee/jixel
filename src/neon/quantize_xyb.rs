@@ -110,3 +110,18 @@ pub(crate) fn quantize_xyb_tile_colors_neon(
         ];
     }
 }
+
+/// Lattice values rounded to multiples of `1 << shift`, halves away from zero.
+#[target_feature(enable = "neon")]
+pub(crate) fn round_lattice_pow2_neon(plane: &mut [i32], shift: u32) {
+    let half = vdupq_n_s32((1 << shift) >> 1);
+    let mask = vdupq_n_s32(-(1 << shift));
+    let (v4s, tail) = plane.as_chunks_mut::<4>();
+    for v4 in v4s {
+        let v = unsafe { vld1q_s32(v4.as_ptr()) };
+        let r = vandq_s32(vaddq_s32(vabsq_s32(v), half), mask);
+        let out = vbslq_s32(vcltzq_s32(v), vnegq_s32(r), r);
+        unsafe { vst1q_s32(v4.as_mut_ptr(), out) };
+    }
+    crate::xyb::round_lattice_pow2_scalar(tail, shift);
+}
