@@ -3972,41 +3972,20 @@ fn process_ac_group(
         let stripe_y0 = group_y0 + ty * K_TILE_DIM;
         let stripe_xsize = group_xsize;
         let stripe_ysize = K_TILE_DIM.min(dim.ysize.saturating_sub(stripe_y0));
-        let stripe_xsize_padded = stripe_xsize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
-        let stripe_ysize_padded = stripe_ysize.div_ceil(K_BLOCK_DIM) * K_BLOCK_DIM;
-
-        // Whole blocks can be transformed directly from the source image.
-        // Only edge stripes need a copy to replicate their partial blocks.
-        let (stripe, opsin_origin) =
-            if stripe_xsize == stripe_xsize_padded && stripe_ysize == stripe_ysize_padded {
-                (opsin, (stripe_x0, stripe_y0))
-            } else {
-                let stripe = scratch.ac_stripe.as_mut();
-                build_stripe(
-                    stripe,
-                    opsin,
-                    stripe_x0,
-                    stripe_y0,
-                    stripe_xsize,
-                    stripe_ysize,
-                    stripe_xsize_padded,
-                    stripe_ysize_padded,
-                );
-                (&*stripe, (0, 0))
-            };
-
         let stripe_brect = Rect::new(
             qorigin_x,
             qorigin_y + ty * K_TILE_DIM_IN_BLOCKS,
-            stripe_xsize_padded / K_BLOCK_DIM,
-            stripe_ysize_padded / K_BLOCK_DIM,
+            stripe_xsize.div_ceil(K_BLOCK_DIM),
+            stripe_ysize.div_ceil(K_BLOCK_DIM),
         );
 
+        // `write_ac_group` reads whole blocks straight from `opsin` and gathers
+        // only footprints that cross the image edge.
         write_ac_group(
             ctx,
             &mut scratch.ac_group,
-            stripe,
-            opsin_origin,
+            opsin,
+            (stripe_x0, stripe_y0),
             stripe_brect,
             distp.scale,
             distp.scale_dc,
@@ -4043,6 +4022,7 @@ fn process_ac_group(
 
 /// Carve a stripe out of the (already-XYB-converted, gaborized) opsin image,
 /// padding to whole blocks by edge-replication.
+#[cfg(test)]
 fn build_stripe(
     stripe: &mut Image3F,
     opsin: &Image3F,
@@ -4114,13 +4094,32 @@ mod tests {
         for strategy in 0..NUM_STRATEGIES as u8 {
             dc.ac_strategy.reset();
             dc.ac_strategy.set_first(8, 8, strategy);
-            for origin in [(0, 0), (59, 61)] {
-                super::build_stripe(&mut stripe, &image, origin.0, origin.1, 64, 64, 64, 64);
+            // (70, 76) crosses the image edge: the view gathers the same
+            // replicated pixels a padded stripe holds.
+            for origin in [(0, 0), (59, 61), (70, 76)] {
+                let visible_x = (image.xsize() - origin.0).min(64);
+                let visible_y = (image.ysize() - origin.1).min(64);
+                let at_edge = visible_x < 64 || visible_y < 64;
+                super::build_stripe(
+                    &mut stripe,
+                    &image,
+                    origin.0,
+                    origin.1,
+                    visible_x,
+                    visible_y,
+                    64,
+                    64,
+                );
                 for (shifts, rdoq) in [
                     (&[0u32][..], None),
                     (&[0u32][..], Some(&prices)),
                     (&[2u32, 0][..], None),
                 ] {
+                    // RDOQ discounts padding error only where it can see the
+                    // image edge, so the padded stripe legitimately differs.
+                    if at_edge && rdoq.is_some() {
+                        continue;
+                    }
                     let run = |input: &Image3F, origin, scratch: &mut AcGroupScratch| {
                         let mut quant_dc = Image3S::new(8, 8);
                         let mut source_dc = SourceDc {

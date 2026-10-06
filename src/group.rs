@@ -42,6 +42,7 @@ use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, f
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
+use crate::inflated_cost::Footprint;
 use crate::quant_weights::INV_DC_QUANT;
 use crate::util::{FastRound, HeapMatrix, heap_array};
 use std::sync::OnceLock;
@@ -269,10 +270,11 @@ fn rdoq_block(
     distance: f32,
     qf_hi: bool,
     qf_ratio: f32,
+    visible: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    let lambda = rdoq_lambda(qf_ratio);
+    let lambda = rdoq_lambda(qf_ratio) / visible;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -880,6 +882,8 @@ pub(crate) struct AcGroupScratch {
     block: Box<[i32; 4096]>,
     rdoq_choices: Box<[u8; RDOQ_MAX_CHOICES]>,
     rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
+    /// Edge-replicated pixels of a footprint that crosses the image edge.
+    gather: Box<[f32; 4096]>,
 }
 
 impl Default for AcGroupScratch {
@@ -891,6 +895,7 @@ impl Default for AcGroupScratch {
             block: heap_array(0),
             rdoq_choices: heap_array(u8::MAX),
             rdoq_costs: HeapMatrix::new(f32::INFINITY),
+            gather: heap_array(0.0),
         }
     }
 }
@@ -961,6 +966,7 @@ pub(crate) fn write_ac_group(
         block: pblock,
         rdoq_choices,
         rdoq_costs,
+        gather,
     } = scratch;
 
     for by in 0..ysize_blocks {
@@ -989,12 +995,18 @@ pub(crate) fn write_ac_group(
             let quant_ac = dc_data.raw_quant_field.row(global_by)[global_bx] as i32;
 
             // ---- Forward DCT for all 3 channels ----
-            let opsin_bx = opsin_origin.0 + bx * 8;
-            let opsin_by = opsin_origin.1 + by * 8;
+            let footprint = Footprint::of_strategy(
+                opsin,
+                opsin_origin.0 + bx * 8,
+                opsin_origin.1 + by * 8,
+                raw_strategy,
+            );
+            debug_assert_eq!((footprint.width, footprint.height), (cov_x * 8, cov_y * 8));
+            // Padding is never shown, so RDOQ charges coefficient error by
+            // the footprint's visible area.
+            let visible = footprint.visible_fraction();
             for c in 0..3 {
-                let plane = opsin.plane(c);
-                let stride = plane.xsize();
-                let input = &opsin.plane_data(c)[opsin_by * stride + opsin_bx..];
+                let (input, stride) = footprint.pixels(opsin.plane(c), &mut gather[..]);
                 match raw_strategy {
                     STRATEGY_DCT => {
                         let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
@@ -1248,6 +1260,7 @@ pub(crate) fn write_ac_group(
                     distance,
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
+                    visible,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1453,6 +1466,7 @@ pub(crate) fn write_ac_group(
                     distance,
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
+                    visible,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1542,6 +1556,7 @@ pub(crate) fn write_ac_group(
                     distance,
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
+                    visible,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1869,6 +1884,7 @@ mod tests {
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
                     [0.5, 1.0, 1.2, 2.0][case % 4],
+                    1.0,
                     choices,
                     costs,
                 );

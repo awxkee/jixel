@@ -647,6 +647,92 @@ pub(crate) fn strategy_pixel_count(strategy: u8) -> usize {
     w * h
 }
 
+/// A transform's pixel footprint and the part of it inside the image. The
+/// rest is edge-replicated padding the decoder crops away, so its error must
+/// not be charged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Footprint {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) visible_width: usize,
+    pub(crate) visible_height: usize,
+}
+
+impl Footprint {
+    #[inline]
+    pub(crate) fn new(
+        image_width: usize,
+        image_height: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            visible_width: width.min(image_width.saturating_sub(x)),
+            visible_height: height.min(image_height.saturating_sub(y)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn of_strategy(image: &Image3F, x: usize, y: usize, strategy: u8) -> Self {
+        let (width, height) = strategy_pixel_dims(strategy);
+        Self::new(image.xsize(), image.ysize(), x, y, width, height)
+    }
+
+    #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        self.visible_width == self.width && self.visible_height == self.height
+    }
+
+    /// The footprint's pixels in `plane` as `(data, stride)`: a view into the
+    /// plane when the footprint lies inside it, otherwise an edge-replicated
+    /// gather into `tmp`.
+    #[inline]
+    pub(crate) fn pixels<'a>(
+        &self,
+        plane: &'a Plane<f32>,
+        tmp: &'a mut [f32],
+    ) -> (&'a [f32], usize) {
+        if self.width <= plane.xsize().saturating_sub(self.x)
+            && self.height <= plane.ysize().saturating_sub(self.y)
+        {
+            let stride = plane.xsize();
+            return (&plane.as_slice()[self.y * stride + self.x..], stride);
+        }
+        let n = self.width * self.height;
+        crate::ac_strategy::gather_pixels(
+            plane,
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            &mut tmp[..n],
+        );
+        (&tmp[..n], self.width)
+    }
+
+    /// Share of the footprint the decoder shows. Coefficient-domain errors
+    /// cannot be split by pixel, so they are charged by area.
+    #[inline]
+    pub(crate) fn visible_fraction(&self) -> f32 {
+        if self.is_full() {
+            return 1.0;
+        }
+        debug_assert!(
+            self.visible_width > 0 && self.visible_height > 0,
+            "footprint origin outside the image"
+        );
+        (self.visible_width * self.visible_height) as f32 / (self.width * self.height) as f32
+    }
+}
+
 pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
     use crate::dct;
     macro_rules! fwd {
@@ -1054,14 +1140,27 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
 /// `sum((dx err)^2 + (dy err)^2)` over one channel's spatial error plane.
 #[allow(dead_code)]
 pub(crate) fn error_gradient_energy_scalar(error: &[f32], width: usize, height: usize) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n);
+    error_gradient_energy_strided(error, width, width, height)
+}
+
+/// [`error_gradient_energy_scalar`] over the leading `width × height` window
+/// of a `stride`-wide plane.
+pub(crate) fn error_gradient_energy_strided(
+    error: &[f32],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> f32 {
+    assert!(width <= stride);
     if width == 0 || height == 0 {
         return 0.0;
     }
-    let rows = error[..n].chunks_exact(width);
+    let n = (height - 1)
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(width))
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n);
+    let rows = error.chunks(stride).take(height).map(|row| &row[..width]);
     let mut grad = 0.0f32;
     for row in rows.clone() {
         for &[left, right] in row.array_windows::<2>() {
@@ -1085,14 +1184,29 @@ pub(crate) fn error_gradient_peak_energy_scalar(
     height: usize,
     floor: f32,
 ) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n && original.len() >= n);
+    error_gradient_peak_energy_strided(error, original, width, width, height, floor)
+}
+
+/// [`error_gradient_peak_energy_scalar`] over the leading `width × height`
+/// window of `stride`-wide planes.
+pub(crate) fn error_gradient_peak_energy_strided(
+    error: &[f32],
+    original: &[f32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    floor: f32,
+) -> f32 {
+    assert!(width <= stride);
     assert!(floor.is_finite() && floor >= 0.0);
     if width == 0 || height == 0 {
         return 0.0;
     }
+    let n = (height - 1)
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(width))
+        .expect("gradient plane size overflow");
+    assert!(error.len() >= n && original.len() >= n);
     let mut total = 0.0f32;
     for cell_y in (0..height).step_by(4) {
         for cell_x in (0..width).step_by(4) {
@@ -1100,7 +1214,7 @@ pub(crate) fn error_gradient_peak_energy_scalar(
             let mut max_y = 0.0f32;
             for y in cell_y..(cell_y + 4).min(height) {
                 for x in cell_x..(cell_x + 4).min(width) {
-                    let p = y * width + x;
+                    let p = y * stride + x;
                     if x + 1 < width {
                         let error_gradient = (error[p + 1] - error[p]).abs();
                         let source_gradient = (original[p + 1] - original[p]).abs();
@@ -1108,8 +1222,8 @@ pub(crate) fn error_gradient_peak_energy_scalar(
                         max_x = max_x.max(excess * excess);
                     }
                     if y + 1 < height {
-                        let error_gradient = (error[p + width] - error[p]).abs();
-                        let source_gradient = (original[p + width] - original[p]).abs();
+                        let error_gradient = (error[p + stride] - error[p]).abs();
+                        let source_gradient = (original[p + stride] - original[p]).abs();
                         let excess = (error_gradient - 0.5 * source_gradient - floor).max(0.0);
                         max_y = max_y.max(excess * excess);
                     }
@@ -1192,14 +1306,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let quant_scales = [qac * qm_mult_x, qac, qac * quantization.qm_mult_b];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
-    let [
-        spatial_error,
-        y_error,
-        combined_error,
-        reconstructed,
-        original,
-    ] = rest
-    else {
+    let [spatial_error, _, combined_error, reconstructed, original] = rest else {
         unreachable!()
     };
     let scan_pos = if quantization.compute_rate {
@@ -1250,7 +1357,15 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         };
     }
 
-    let _ = y_error;
+    let footprint = Footprint::new(
+        opsin.xsize(),
+        opsin.ysize(),
+        px,
+        py,
+        pixel_width,
+        pixel_height,
+    );
+    let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
     let mut distortion = 0.0f32;
     for c in 0..3 {
         reconstruct_error(
@@ -1273,30 +1388,66 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 &mut reconstructed[..n],
             );
         }
-        distortion += input.scoring.channel_weights[c]
-            * unsafe {
-                ssim(
+        let weight = input.scoring.channel_weights[c];
+        if footprint.is_full() {
+            distortion += weight
+                * unsafe {
+                    ssim(
+                        &original[..n],
+                        &reconstructed[..n],
+                        pixel_width,
+                        pixel_height,
+                    )
+                };
+            if gradient_alpha > 0.0 {
+                distortion += weight
+                    * gradient_alpha
+                    * error_gradient_energy(&error[..n], pixel_width, pixel_height);
+            }
+            if gradient_peak_alpha > 0.0 {
+                distortion += weight
+                    * gradient_peak_alpha
+                    * error_gradient_peak_energy(
+                        &error[..n],
+                        &original[..n],
+                        pixel_width,
+                        pixel_height,
+                        gradient_peak_floor,
+                    );
+            }
+        } else {
+            // Edge footprints: score only the pixels the decoder keeps,
+            // reading the footprint-strided buffers in place.
+            distortion += weight
+                * ssim_deficit_visible(
                     &original[..n],
                     &reconstructed[..n],
                     pixel_width,
-                    pixel_height,
-                )
-            };
-        if gradient_alpha > 0.0 {
-            distortion += input.scoring.channel_weights[c]
-                * gradient_alpha
-                * error_gradient_energy(&error[..n], pixel_width, pixel_height);
-        }
-        if gradient_peak_alpha > 0.0 {
-            distortion += input.scoring.channel_weights[c]
-                * gradient_peak_alpha
-                * error_gradient_peak_energy(
-                    &error[..n],
-                    &original[..n],
-                    pixel_width,
-                    pixel_height,
-                    gradient_peak_floor,
+                    visible_width,
+                    visible_height,
                 );
+            if gradient_alpha > 0.0 {
+                distortion += weight
+                    * gradient_alpha
+                    * error_gradient_energy_strided(
+                        &error[..n],
+                        pixel_width,
+                        visible_width,
+                        visible_height,
+                    );
+            }
+            if gradient_peak_alpha > 0.0 {
+                distortion += weight
+                    * gradient_peak_alpha
+                    * error_gradient_peak_energy_strided(
+                        &error[..n],
+                        &original[..n],
+                        pixel_width,
+                        visible_width,
+                        visible_height,
+                        gradient_peak_floor,
+                    );
+            }
         }
         if rgb_hue_alpha > 0.0 || scoring.keep_spatial_errors {
             coeff_error[c][..n].copy_from_slice(error);
@@ -1305,13 +1456,30 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let mut hue_distortion = 0.0;
     if rgb_hue_alpha > 0.0 {
         hue_distortion = rgb_hue_alpha
-            * unsafe {
-                rgb_hue_chroma_edge_loss(
+            * if footprint.is_full() {
+                unsafe {
+                    rgb_hue_chroma_edge_loss(
+                        opsin,
+                        px,
+                        py,
+                        pixel_width,
+                        pixel_height,
+                        [
+                            &coeff_error[0][..n],
+                            &coeff_error[1][..n],
+                            &coeff_error[2][..n],
+                        ],
+                        &scoring.xyb_matrix,
+                    )
+                }
+            } else {
+                rgb_hue_chroma_edge_loss_strided(
                     opsin,
                     px,
                     py,
                     pixel_width,
-                    pixel_height,
+                    visible_width,
+                    visible_height,
                     [
                         &coeff_error[0][..n],
                         &coeff_error[1][..n],
@@ -1438,6 +1606,23 @@ pub(crate) fn rgb_hue_chroma_edge_loss_scalar(
     spatial_error: [&[f32]; 3],
     matrix: &crate::xyb::XybMatrix,
 ) -> f32 {
+    rgb_hue_chroma_edge_loss_strided(opsin, px, py, width, width, height, spatial_error, matrix)
+}
+
+/// [`rgb_hue_chroma_edge_loss_scalar`] over the leading `width × height`
+/// window of `stride`-wide error planes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rgb_hue_chroma_edge_loss_strided(
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    stride: usize,
+    width: usize,
+    height: usize,
+    spatial_error: [&[f32]; 3],
+    matrix: &crate::xyb::XybMatrix,
+) -> f32 {
+    assert!(width <= stride);
     let image_width = opsin.xsize();
     let image_height = opsin.ysize();
     if width == 0 || height == 0 {
@@ -1459,9 +1644,9 @@ pub(crate) fn rgb_hue_chroma_edge_loss_scalar(
             ]
         });
         let error_rows = [
-            &spatial_error[0][y * width..(y + 1) * width],
-            &spatial_error[1][y * width..(y + 1) * width],
-            &spatial_error[2][y * width..(y + 1) * width],
+            &spatial_error[0][y * stride..y * stride + width],
+            &spatial_error[1][y * stride..y * stride + width],
+            &spatial_error[2][y * stride..y * stride + width],
         ];
         for (x, ((&error_x, &error_y), &error_b)) in error_rows[0]
             .iter()
@@ -1645,6 +1830,78 @@ pub(crate) fn validate_ssim_inputs(orig: &[f32], recon: &[f32], width: usize, he
     assert!(orig.len() >= n && recon.len() >= n);
 }
 
+/// [`ssim_deficit`] over the leading `width × height` window of
+/// `stride`-wide planes, any size: windows clipped by the right/bottom edge
+/// take their statistics from the pixels they hold and are weighted by that
+/// count, so whole windows score exactly as the 8-aligned kernel does.
+pub(crate) fn ssim_deficit_visible(
+    orig: &[f32],
+    recon: &[f32],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> f32 {
+    const C1: f32 = 1e-4;
+    const C2: f32 = 9e-4;
+    assert!(width <= stride);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let n = (height - 1)
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(width))
+        .expect("SSIM dimensions overflow");
+    assert!(orig.len() >= n && recon.len() >= n);
+    let mut deficit = 0.0f32;
+    for y0 in (0..height).step_by(8) {
+        let window_height = 8.min(height - y0);
+        for x0 in (0..width).step_by(8) {
+            let window_width = 8.min(width - x0);
+            let count = (window_width * window_height) as f32;
+            let inv_count = 1.0 / count;
+            let rows = || {
+                (y0..y0 + window_height).map(move |y| {
+                    let row = y * stride + x0;
+                    (
+                        &orig[row..row + window_width],
+                        &recon[row..row + window_width],
+                    )
+                })
+            };
+            let base_index = y0 * stride + x0;
+            let base_orig = orig[base_index];
+            let base_recon = recon[base_index];
+            let (mut sum_orig_delta, mut sum_recon_delta) = (0.0f32, 0.0f32);
+            for (orig_row, recon_row) in rows() {
+                for (&orig_value, &recon_value) in orig_row.iter().zip(recon_row) {
+                    sum_orig_delta += orig_value - base_orig;
+                    sum_recon_delta += recon_value - base_recon;
+                }
+            }
+            let mean_orig = base_orig + sum_orig_delta * inv_count;
+            let mean_recon = base_recon + sum_recon_delta * inv_count;
+            let (mut var_orig, mut var_recon, mut covariance) = (0.0f32, 0.0f32, 0.0f32);
+            for (orig_row, recon_row) in rows() {
+                for (&orig_value, &recon_value) in orig_row.iter().zip(recon_row) {
+                    let centered_orig = orig_value - mean_orig;
+                    let centered_recon = recon_value - mean_recon;
+                    var_orig = fmla(centered_orig, centered_orig, var_orig);
+                    var_recon = fmla(centered_recon, centered_recon, var_recon);
+                    covariance = fmla(centered_orig, centered_recon, covariance);
+                }
+            }
+            var_orig *= inv_count;
+            var_recon *= inv_count;
+            covariance *= inv_count;
+            let luminance = (2.0 * mean_orig * mean_recon + C1)
+                / (mean_orig * mean_orig + mean_recon * mean_recon + C1);
+            let structure = (2.0 * covariance + C2) / (var_orig + var_recon + C2);
+            deficit += (1.0 - luminance * structure) * count;
+        }
+    }
+    deficit
+}
+
 fn ssim_deficit_scalar_kernel(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f32 {
     const C1: f32 = 1e-4;
     const C2: f32 = 9e-4;
@@ -1712,6 +1969,205 @@ mod tests {
         select_error_gradient_peak_energy_fn, select_rgb_hue_chroma_edge_loss_fn,
         ssim_deficit_scalar, validate_ssim_inputs,
     };
+
+    fn pseudo_random_plane(n: usize, seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i * 7919 + seed * 104_729) % 1013) as f32 / 1013.0)
+            .collect()
+    }
+
+    #[test]
+    fn visible_ssim_matches_aligned_kernel_on_whole_windows() {
+        for (width, height) in [(8, 8), (16, 8), (32, 16), (24, 32)] {
+            let orig = pseudo_random_plane(width * height, 1);
+            let recon = pseudo_random_plane(width * height, 2);
+            assert_eq!(
+                super::ssim_deficit_visible(&orig, &recon, width, width, height).to_bits(),
+                ssim_deficit_scalar(&orig, &recon, width, height).to_bits(),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn strided_visible_kernels_match_dense_copies() {
+        use super::{
+            error_gradient_energy_strided, error_gradient_peak_energy_strided,
+            rgb_hue_chroma_edge_loss_strided, ssim_deficit_visible,
+        };
+        let stride = 32;
+        let height = 16;
+        let original = pseudo_random_plane(stride * height, 3);
+        let reconstructed = pseudo_random_plane(stride * height, 4);
+        let errors: [Vec<f32>; 3] =
+            std::array::from_fn(|c| pseudo_random_plane(stride * height, 5 + c));
+        let mut opsin = crate::image::Image3F::new(45, 40);
+        for c in 0..3 {
+            for (i, v) in opsin.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *v = ((i * 31 + c * 11) % 97) as f32 * 0.004;
+            }
+        }
+        let dense = |plane: &[f32], w: usize, h: usize| -> Vec<f32> {
+            plane
+                .chunks_exact(stride)
+                .take(h)
+                .flat_map(|row| row[..w].iter().copied())
+                .collect()
+        };
+        for (w, h) in [(1, 1), (5, 8), (13, 11), (8, 16), (31, 3)] {
+            let (o, r) = (dense(&original, w, h), dense(&reconstructed, w, h));
+            assert_eq!(
+                ssim_deficit_visible(&original, &reconstructed, stride, w, h).to_bits(),
+                ssim_deficit_visible(&o, &r, w, w, h).to_bits(),
+                "ssim {w}x{h}"
+            );
+            let e = dense(&errors[0], w, h);
+            assert_eq!(
+                error_gradient_energy_strided(&errors[0], stride, w, h).to_bits(),
+                error_gradient_energy_scalar(&e, w, h).to_bits(),
+                "gradient {w}x{h}"
+            );
+            assert_eq!(
+                error_gradient_peak_energy_strided(&errors[0], &original, stride, w, h, 0.01)
+                    .to_bits(),
+                error_gradient_peak_energy_scalar(&e, &o, w, h, 0.01).to_bits(),
+                "peak {w}x{h}"
+            );
+            let dense_errors: [Vec<f32>; 3] = std::array::from_fn(|c| dense(&errors[c], w, h));
+            assert_eq!(
+                rgb_hue_chroma_edge_loss_strided(
+                    &opsin,
+                    40,
+                    30,
+                    stride,
+                    w,
+                    h,
+                    [&errors[0], &errors[1], &errors[2]],
+                    &crate::xyb::XybMatrix::SPEC,
+                )
+                .to_bits(),
+                rgb_hue_chroma_edge_loss_scalar(
+                    &opsin,
+                    40,
+                    30,
+                    w,
+                    h,
+                    [&dense_errors[0], &dense_errors[1], &dense_errors[2]],
+                    &crate::xyb::XybMatrix::SPEC,
+                )
+                .to_bits(),
+                "hue {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn footprint_views_interior_and_gathers_edges() {
+        use super::Footprint;
+        let mut plane = crate::image::Plane::<f32>::new(21, 19);
+        for (i, v) in plane.as_mut_slice().iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let mut tmp = [0.0f32; 4096];
+        let inside = Footprint::new(21, 19, 8, 8, 8, 8);
+        assert!(inside.is_full());
+        assert_eq!(inside.visible_fraction(), 1.0);
+        let (data, stride) = inside.pixels(&plane, &mut tmp);
+        assert_eq!(stride, 21);
+        assert_eq!(data[0], (8 * 21 + 8) as f32);
+
+        let edge = Footprint::new(21, 19, 16, 16, 8, 8);
+        assert_eq!((edge.visible_width, edge.visible_height), (5, 3));
+        assert_eq!(edge.visible_fraction(), 15.0 / 64.0);
+        let (data, stride) = edge.pixels(&plane, &mut tmp);
+        assert_eq!(stride, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let (sx, sy) = ((16 + x).min(20), (16 + y).min(18));
+                assert_eq!(data[y * 8 + x], plane.row(sy)[sx], "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn edge_reconstruction_cost_skips_padding() {
+        use super::*;
+        let idct = IdctMethods::scalar();
+        // `narrow` ends inside the footprint; `wide` holds the same pixels
+        // plus the replicated padding as real columns/rows.
+        let (narrow_w, narrow_h) = (37, 35);
+        let mut narrow = Image3F::new(narrow_w, narrow_h);
+        let mut wide = Image3F::new(64, 64);
+        for c in 0..3 {
+            for (i, v) in narrow.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *v = ((i * 17 + c * 7) % 29) as f32 * 0.013;
+            }
+            for y in 0..64 {
+                for x in 0..64 {
+                    wide.plane_row_mut(c, y)[x] =
+                        narrow.plane_row(c, y.min(narrow_h - 1))[x.min(narrow_w - 1)];
+                }
+            }
+        }
+        let coeffs: [[f32; 1024]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.13 - 1.8)
+        });
+        let inverse: [f32; 1024] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
+        let error = ReconErrorKernels {
+            gradient_energy: select_error_gradient_energy_fn(),
+            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
+            combine: select_combine_error_fn(),
+            rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
+        };
+        for strategy in [STRATEGY_DCT, STRATEGY_DCT16X16, STRATEGY_DCT32X16] {
+            let (w, h) = strategy_pixel_dims(strategy);
+            let (cx, cy) = (w.max(h), w.min(h));
+            let cost = |opsin: &Image3F| {
+                let input = ReconDistInput {
+                    idct: &idct,
+                    quantization: ReconQuantization {
+                        compute_rate: true,
+                        rate_log2_lut: rate_log2_lut(),
+                        coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
+                        inverse_matrices: [&inverse; 3],
+                        qac: 7.0,
+                        qm_mult_x: 1.2,
+                        qm_mult_b: 1.6,
+                        distance: 1.5,
+                    },
+                    transform: ReconTransform {
+                        blocks_x: cx / 8,
+                        blocks_y: cy / 8,
+                        strategy,
+                    },
+                    source: ReconSource {
+                        opsin,
+                        x: 32,
+                        y: 32,
+                    },
+                    scoring: ReconScoring {
+                        factor_x: 0.15,
+                        factor_b: -0.1,
+                        channel_weights: CHANNEL_WEIGHT,
+                        xyb_matrix: crate::xyb::XybMatrix::SPEC,
+                        rgb_hue_alpha: 800.0,
+                        gradient_alpha: 8.0,
+                        gradient_peak_alpha: 3.0,
+                        keep_spatial_errors: false,
+                    },
+                };
+                recon_dist_and_rate_default(&mut [[0.0; 1024]; 8], &input, &error)
+            };
+            let (visible, padded) = (cost(&narrow), cost(&wide));
+            assert_eq!(visible.rate.to_bits(), padded.rate.to_bits());
+            assert!(
+                visible.distortion < padded.distortion,
+                "strategy {strategy}: {} vs {}",
+                visible.distortion,
+                padded.distortion
+            );
+        }
+    }
 
     #[test]
     fn omitting_fixed_rate_preserves_reconstruction_and_all_distortion_terms() {
