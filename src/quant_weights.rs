@@ -2105,6 +2105,7 @@ impl DequantMatrices {
             Self::new_fast(distance)
         };
         // The template is itself a cached tier, so its address keys the cache.
+        #[allow(clippy::identity_op)]
         let key = (
             (template as *const Self as usize & 0xffff_ffff) as u32,
             rectangles,
