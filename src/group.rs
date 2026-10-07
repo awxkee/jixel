@@ -49,6 +49,19 @@ use std::sync::OnceLock;
 
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
 
+#[inline]
+fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
+    // The YCbCr weights improve rendered RD for both RGB and CMYK input.
+    // RGB and adaptive XYB regress slightly with their reconstruction weights,
+    // so keep the trellis's existing calibration for those transforms.
+    match coding {
+        crate::CodingTransform::YCbCr => coding.channel_weights(),
+        crate::CodingTransform::Xyb | crate::CodingTransform::Rgb => {
+            crate::inflated_cost::CHANNEL_WEIGHT
+        }
+    }
+}
+
 /// Chroma deadzone narrowing for chromatic 8x8 blocks.
 const CHROMA_DZ_SAT_START: f32 = 0.3;
 const CHROMA_DZ_SAT_WIDTH: f32 = 0.3;
@@ -255,6 +268,7 @@ fn update_rdoq_state_pair(
 
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
+    channel_weight: f32,
     prices: &FrozenTokenPrices,
     scan: &[u32],
     source: &[f32],
@@ -354,7 +368,7 @@ fn rdoq_block(
         let k = covered_blocks + window_index;
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
-        let distortion_weight = crate::inflated_cost::CHANNEL_WEIGHT[c]
+        let distortion_weight = channel_weight
             * if c == 1 {
                 1.0
             } else {
@@ -813,6 +827,7 @@ fn chroma_rdoq_weight(distance: f32) -> f32 {
 }
 
 pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
+
 pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
 
 /// [`dequantized_level`] for a float-valued (but integer) level, as produced by
@@ -948,12 +963,13 @@ pub(crate) fn write_ac_group(
     // `base_correlation_b` (= 1) plus the frame's signaled `ytob_dc / 84`,
     // converted from dequantized XYB into stored-B-DC units. Folded into the
     // quantizer below so the slope costs no extra rounding error.
-    let cfl_factor_b = crate::color_correlation::dc_cfl_factor(dc_step, ytob_dc);
+    let cfl_factor_b = crate::color_correlation::dc_cfl_factor(dc_step, ytob_dc, ctx.cfl_base_b());
     let x_qm_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
     let mut chroma_distortion = 0.0f32;
-    let chroma_deadzone = ctx.speed.effort().chroma_deadzone;
+    let chroma_deadzone = ctx.speed.effort().chroma_deadzone && ctx.coding.is_xyb();
+    let cfl_factor_x = crate::color_correlation::dc_cfl_factor_x(dc_step, ctx.cfl_base_x());
 
     // All the big per-block buffers live in the worker scratch: re-creating them
     // per group cost ~130 KB of zeroing, and `pblock` was being zeroed once per
@@ -1245,6 +1261,7 @@ pub(crate) fn write_ac_group(
                 let predicted =
                     predict_from_top_and_left(row_top, nzero_map.plane_row(1, nz_by), bx, 32);
                 rdoq_block(
+                    rdoq_channel_weights(ctx.coding)[1],
                     prices,
                     coeff_orders.scan_for(strategy_code, 1),
                     &source_y[..size],
@@ -1279,8 +1296,8 @@ pub(crate) fn write_ac_group(
             let cmap_x = dc_data.ytox_map.row(ty)[tx];
             let cmap_b = dc_data.ytob_map.row(ty)[tx];
             // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
-            let x_factor = crate::color_correlation::y_to_x_ratio(cmap_x);
-            let b_factor = crate::color_correlation::y_to_b_ratio(cmap_b);
+            let x_factor = crate::color_correlation::y_to_x_ratio(ctx.cfl_base_x(), cmap_x);
+            let b_factor = crate::color_correlation::y_to_b_ratio(ctx.cfl_base_b(), cmap_b);
 
             // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
             // The decoder reverses CfL in coefficient space (DequantLane) using the
@@ -1389,11 +1406,21 @@ pub(crate) fn write_ac_group(
                 (0.0, 0.0)
             };
             let mut chroma_dc_q = [0i16; 64];
-            (ctx.quantize_dc)(
-                &x_dc_post[..covered_dc],
-                inv_factor[0],
-                &mut chroma_dc_q[..covered_dc],
-            );
+            if cfl_factor_x != 0.0 {
+                (ctx.quantize_dc_cfl)(
+                    &x_dc_post[..covered_dc],
+                    &y_dc_q[..covered_dc],
+                    inv_factor[0],
+                    cfl_factor_x,
+                    &mut chroma_dc_q[..covered_dc],
+                );
+            } else {
+                (ctx.quantize_dc)(
+                    &x_dc_post[..covered_dc],
+                    inv_factor[0],
+                    &mut chroma_dc_q[..covered_dc],
+                );
+            }
             for iy in 0..cov_y {
                 let lbx = global_bx - qorigin_x;
                 let quant_dc_row =
@@ -1442,8 +1469,8 @@ pub(crate) fn write_ac_group(
             // CfL residuals are the source, contexts/prices/orders are
             // channel-specific, and unlike Y the input coefficients are not
             // overwritten afterwards. Runs at every distance with the
-            // distance-scheduled X/B distortion weight (`chroma_rdoq_weight`):
-            // the plain CHANNEL_WEIGHT'd trellis used to be gated to d ≥ 2.25.
+            // transform's calibrated weights and the distance-scheduled X/B
+            // multiplier (`chroma_rdoq_weight`).
             if let Some(prices) = rdoq_prices {
                 let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                 let nzero_map = &num_nzeros[0];
@@ -1451,6 +1478,7 @@ pub(crate) fn write_ac_group(
                 let predicted =
                     predict_from_top_and_left(row_top, nzero_map.plane_row(0, nz_by), bx, 32);
                 rdoq_block(
+                    rdoq_channel_weights(ctx.coding)[0],
                     prices,
                     coeff_orders.scan_for(strategy_code, 0),
                     &coeffs[0][..size],
@@ -1541,6 +1569,7 @@ pub(crate) fn write_ac_group(
                 let predicted =
                     predict_from_top_and_left(row_top, nzero_map.plane_row(2, nz_by), bx, 32);
                 rdoq_block(
+                    rdoq_channel_weights(ctx.coding)[2],
                     prices,
                     coeff_orders.scan_for(strategy_code, 2),
                     &coeffs[2][..size],
@@ -1843,6 +1872,11 @@ mod tests {
             ][case % 5];
             let strategy = STRATEGY_CODE_LUT[raw as usize];
             let c = case % 3;
+            let coding = [
+                crate::CodingTransform::Xyb,
+                crate::CodingTransform::YCbCr,
+                crate::CodingTransform::Rgb,
+            ][case / 3 % 3];
             let mut scan = orders.scan_for(strategy, c).to_vec();
             let size = cx * cy * 64;
             if case % 2 == 0 {
@@ -1869,6 +1903,7 @@ mod tests {
             let mut fresh_costs = Box::new([[f32::INFINITY; super::RDOQ_MAX_STRIDE]; 2]);
             let run = |block: &mut [i32], choices: &mut _, costs: &mut _| {
                 super::rdoq_block(
+                    super::rdoq_channel_weights(coding)[c],
                     &prices,
                     &scan,
                     &source,

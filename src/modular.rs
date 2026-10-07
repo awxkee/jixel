@@ -60,11 +60,14 @@ pub(crate) fn write_lfglobal_alpha_section(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
+    step: u32,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     assert_eq!(alpha.len(), xsize * ysize);
-    if xsize <= GROUP_DIM && ysize <= GROUP_DIM {
+    if xsize <= GROUP_DIM && ysize <= GROUP_DIM && step > 1 {
+        write_lattice_section(alpha, step, 0, 0, xsize, ysize, xsize, scratch, w);
+    } else if xsize <= GROUP_DIM && ysize <= GROUP_DIM {
         // Small path: everything in the LfGlobal section. Same two candidates
         // as `write_ac_group_alpha`: plain single-context prefix coding vs the
         // lossless path's LZ77+rANS section; exact bit comparison picks.
@@ -100,10 +103,11 @@ pub(crate) fn write_global_alpha_modular(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
+    step: u32,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    write_lfglobal_alpha_section(alpha, xsize, ysize, scratch, w);
+    write_lfglobal_alpha_section(alpha, xsize, ysize, step, scratch, w);
 }
 
 pub(crate) fn write_ac_group_alpha(
@@ -114,11 +118,16 @@ pub(crate) fn write_ac_group_alpha(
     y0: usize,
     gw: usize,
     gh: usize,
+    step: u32,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
     // Small-image path: alpha lives entirely in LfGlobal; nothing per group.
     if full_xsize <= GROUP_DIM && full_ysize <= GROUP_DIM {
+        return;
+    }
+    if step > 1 {
+        write_lattice_section(alpha, step, x0, y0, gw, gh, full_xsize, scratch, w);
         return;
     }
 
@@ -187,6 +196,113 @@ pub(crate) fn write_ac_group_alpha(
         w.append(&lz);
     } else {
         w.append(&plain);
+    }
+}
+
+/// Snap a plane onto the lattice `{max - step·n}`: the maximum (no ink for
+/// a K channel, opaque for alpha) stays exact and every value moves by at
+/// most half a step.
+pub(crate) fn snap_to_lattice(plane: &mut AlphaPlane, step: u32) {
+    let max = match plane {
+        AlphaPlane::U8(_) => 255u32,
+        AlphaPlane::U16 { bits, .. } => (1u32 << *bits) - 1,
+        AlphaPlane::F32(_) => unreachable!("float planes are not quantized"),
+    };
+    let snap = |v: u32| -> u32 {
+        let ink = max - v.min(max);
+        let q = ((ink + step / 2) / step) * step;
+        max - q.min(max - max % step)
+    };
+    match plane {
+        AlphaPlane::U8(data) => data.iter_mut().for_each(|v| *v = snap(u32::from(*v)) as u8),
+        AlphaPlane::U16 { data, .. } => data
+            .iter_mut()
+            .for_each(|v| *v = snap(u32::from(*v)) as u16),
+        AlphaPlane::F32(_) => unreachable!(),
+    }
+}
+
+/// One modular section of a plane snapped by [`snap_to_lattice`]. Every
+/// stored value is congruent to the maximum modulo `step`, and so is the
+/// Gradient prediction from such values: residuals are whole steps, coded
+/// through the leaf multiplier. The group's first pixel has no neighbors and
+/// predicts 0, so it takes a Zero leaf whose offset restores the residue.
+#[allow(clippy::too_many_arguments)]
+fn write_lattice_section(
+    plane: &AlphaPlane,
+    step: u32,
+    x0: usize,
+    y0: usize,
+    gw: usize,
+    gh: usize,
+    stride: usize,
+    scratch: &mut CoderScratch,
+    w: &mut BitWriter,
+) {
+    const PROP_Y: u32 = 2;
+    const PROP_X: u32 = 3;
+    const PREDICTOR_ZERO: u32 = 0;
+    let max = match plane {
+        AlphaPlane::U8(_) => 255i32,
+        AlphaPlane::U16 { bits, .. } => (1i32 << *bits) - 1,
+        AlphaPlane::F32(_) => unreachable!(),
+    };
+    let step_i = step as i32;
+    let residue = max.rem_euclid(step_i);
+    let log = step.trailing_zeros();
+    let bits = (step >> log) - 1;
+    let leaf = |predictor: u32, offset: i32| {
+        [
+            Token::new(TREE_CTX_PROPERTY, 0),
+            Token::new(TREE_CTX_PREDICTOR, predictor),
+            Token::new(TREE_CTX_OFFSET, pack_signed(offset)),
+            Token::new(TREE_CTX_MULTIPLIER_LOG, log),
+            Token::new(TREE_CTX_MULTIPLIER_BITS, bits),
+        ]
+    };
+    // Breadth first: y > 0 ? leaf 0 : (x > 0 ? leaf 1 : leaf 2).
+    let mut tree_tokens = vec![
+        Token::new(TREE_CTX_PROPERTY, PROP_Y + 1),
+        Token::new(TREE_CTX_SPLITVAL, pack_signed(0)),
+    ];
+    tree_tokens.extend(leaf(PREDICTOR_GRADIENT, 0));
+    tree_tokens.extend([
+        Token::new(TREE_CTX_PROPERTY, PROP_X + 1),
+        Token::new(TREE_CTX_SPLITVAL, pack_signed(0)),
+    ]);
+    tree_tokens.extend(leaf(PREDICTOR_GRADIENT, 0));
+    tree_tokens.extend(leaf(PREDICTOR_ZERO, residue));
+
+    let mut tokens = Vec::with_capacity(gw * gh);
+    for y in 0..gh {
+        for x in 0..gw {
+            let at = |dx: usize, dy: usize| plane.get_i32((y0 + y - dy) * stride + x0 + x - dx);
+            let v = at(0, 0);
+            let (context, pred) = match (x, y) {
+                (0, 0) => (2, residue),
+                (_, 0) => (1, at(1, 0)),
+                (0, _) => (0, at(0, 1)),
+                _ => (0, gradient(at(1, 0), at(0, 1), at(1, 1))),
+            };
+            debug_assert_eq!((v - pred).rem_euclid(step_i), 0, "value off the lattice");
+            tokens.push(Token::new(context, pack_signed((v - pred) / step_i)));
+        }
+    }
+
+    write_group_header_local_tree(w);
+    let tree_code =
+        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
+    w.write(1, 0); // no LZ77 for the tree entropy code
+    write_entropy_code(&tree_code.as_ref(), &mut scratch.huffman_pool, w);
+    for tok in &tree_tokens {
+        write_token(*tok, &tree_code.as_ref(), w);
+    }
+    let pixel_code = build_pixel_code_n(&tokens, 3, &mut scratch.huffman_pool);
+    w.write(1, 0); // no LZ77 for the pixel entropy code
+    write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w);
+    let code_ref = pixel_code.as_ref();
+    for tok in &tokens {
+        write_token(*tok, &code_ref, w);
     }
 }
 
@@ -950,7 +1066,7 @@ mod tests {
         let chan = vec![128u8; 8 * 8];
         let alpha = AlphaPlane::from_u8(chan);
         let mut scratch = CoderScratch::default();
-        write_global_alpha_modular(&alpha, 8, 8, &mut scratch, &mut w);
+        write_global_alpha_modular(&alpha, 8, 8, 1, &mut scratch, &mut w);
         let bits = w.bits_written();
         w.zero_pad_to_byte();
         assert!(!w.into_bytes().is_empty());
@@ -963,7 +1079,7 @@ mod tests {
         let chan = vec![200u8; 512 * 400];
         let alpha = AlphaPlane::from_u8(chan);
         let mut scratch = CoderScratch::default();
-        write_lfglobal_alpha_section(&alpha, 512, 400, &mut scratch, &mut w);
+        write_lfglobal_alpha_section(&alpha, 512, 400, 1, &mut scratch, &mut w);
         // Large path: only 4 bits (GroupHeader).
         assert_eq!(w.bits_written(), 4);
     }

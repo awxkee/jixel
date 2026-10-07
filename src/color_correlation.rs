@@ -307,6 +307,28 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) ->
     x.round().clamp(-128.0, 127.0) as i32
 }
 
+/// The regressions measure X slopes around a base correlation of 0 and B
+/// slopes around 1. Under other bases, shift the planes by the difference so
+/// the same slope lands on the same signaled multiplier.
+#[inline]
+fn shift_to_xyb_bases(
+    ctx: &EncodingContext,
+    block_y: &[f32; 64],
+    block_x: &mut [f32; 64],
+    block_b: &mut [f32; 64],
+) {
+    for (block, shift) in [
+        (block_x, -ctx.cfl_base_x()),
+        (block_b, 1.0 - ctx.cfl_base_b()),
+    ] {
+        if shift != 0.0 {
+            for (v, &y) in block.iter_mut().zip(block_y) {
+                *v = fmla(shift, y, *v);
+            }
+        }
+    }
+}
+
 struct CflScratch {
     block_y: [f32; 64],
     block_x: [f32; 64],
@@ -366,6 +388,7 @@ fn compute_cmap_tile(
             block_y[0] = 0.0;
             block_x[0] = 0.0;
             block_b[0] = 0.0;
+            shift_to_xyb_bases(ctx, &block_y, &mut block_x, &mut block_b);
 
             let sums = (ctx.cfl_regression)(&block_y, &block_x, &block_b, qm_x, qm_b);
             ca_x += sums[0];
@@ -659,6 +682,7 @@ fn compute_cmap_tile_rdo(
                 &mut block_b,
             );
 
+            shift_to_xyb_bases(ctx, &block_y, &mut block_x, &mut block_b);
             dc_abs_x += block_x[0].abs();
             dc_abs_b += block_b[0].abs();
 
@@ -827,15 +851,13 @@ pub(crate) fn fill_cmap(
 
 /// Returns the per-tile factor as a slope (= base_correlation + cmap/84).
 #[inline]
-pub(crate) fn y_to_x_ratio(cmap_x: i8) -> f32 {
-    // base_correlation_x = 0
-    cmap_x as f32 * K_INV_COLOR_FACTOR
+pub(crate) fn y_to_x_ratio(base_x: f32, cmap_x: i8) -> f32 {
+    fmla(cmap_x as f32, K_INV_COLOR_FACTOR, base_x)
 }
 
 #[inline]
-pub(crate) fn y_to_b_ratio(cmap_b: i8) -> f32 {
-    // base_correlation_b = 1
-    fmla(cmap_b as f32, K_INV_COLOR_FACTOR, 1.0)
+pub(crate) fn y_to_b_ratio(base_b: f32, cmap_b: i8) -> f32 {
+    fmla(cmap_b as f32, K_INV_COLOR_FACTOR, base_b)
 }
 
 pub(crate) const K_COLOR_FACTOR: f32 = 84.0;
@@ -1077,12 +1099,13 @@ pub(crate) fn choose_ytob_dc(
     fill_residuals: FillYtobResidualsFn,
     rb_scratch: &mut Vec<i32>,
     ry_scratch: &mut Vec<i32>,
+    dc_step: [f32; 3],
 ) -> i32 {
     // One signaled step moves the stored B DC by this much per stored Y unit:
     // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
     // stored in different units, hence the same `DC_QUANT[1] / DC_QUANT[2]`
     // ratio `enc_group` applies for the `base_correlation_b` term.
-    let step = (INV_DC_QUANT[2] * DC_QUANT[1]) / K_COLOR_FACTOR;
+    let step = (INV_DC_QUANT[2] / dc_step[2] * (DC_QUANT[1] * dc_step[1])) / K_COLOR_FACTOR;
 
     // L1 fit: weighted median of the per-sample ratio, bucketed straight into
     // signaled-slope units so no sort is needed.
@@ -1163,10 +1186,17 @@ pub(crate) fn choose_ytob_dc(
 /// signaled `ytob_dc / 84`, converted from dequantized XYB into stored-B-DC
 /// units under the frame's DC steps.
 #[inline]
-pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32) -> f32 {
+pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32, base_b: f32) -> f32 {
     INV_DC_QUANT[2] / dc_step[2]
         * (DC_QUANT[1] * dc_step[1])
-        * (1.0 + ytob_dc as f32 / K_COLOR_FACTOR)
+        * (base_b + ytob_dc as f32 / K_COLOR_FACTOR)
+}
+
+/// The X DC's share of the stored Y DC: `base_correlation_x` (`ytox_dc` is
+/// never signaled), in stored-X-DC units under the frame's DC steps.
+#[inline]
+pub(crate) fn dc_cfl_factor_x(dc_step: [f32; 3], base_x: f32) -> f32 {
+    INV_DC_QUANT[0] / dc_step[0] * (DC_QUANT[1] * dc_step[1]) * base_x
 }
 
 /// DC step candidates per channel: the default and finer ones a percent
@@ -1198,8 +1228,14 @@ pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
 /// the DC plane carries the flicker: more bits, and visible noise on flat
 /// ground. A slightly finer step moves the levels under the value. Textured
 /// images have no such value and keep the default, which costs no header.
-pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: i32) -> [f32; 3] {
-    let default = [1.0f32; 3];
+pub(crate) fn choose_dc_steps(
+    dc_datas: &[DcGroupData],
+    scale_dc: f32,
+    ytob_dc: i32,
+    base_step: [f32; 3],
+    base_b: f32,
+) -> [f32; 3] {
+    let default = base_step;
     if dc_datas
         .iter()
         .any(|dc| dc.source_dc_y.is_none() || dc.source_dc_b.is_none())
@@ -1230,7 +1266,7 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         .sum();
     // Y levels under `step_y`, and their rate.
     let quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
-        let factor_y = INV_DC_QUANT[1] / step_y * scale_dc;
+        let factor_y = INV_DC_QUANT[1] / (base_step[1] * step_y) * scale_dc;
         let (mut hist, mut extra) = ([0u64; 64], 0u64);
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_y.as_ref().unwrap();
@@ -1262,8 +1298,12 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
     let mut previous = vec![0i32; max_width];
     let mut current = vec![0i32; max_width];
     let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
-        let factor_b = INV_DC_QUANT[2] / step_b * scale_dc;
-        let cfl = dc_cfl_factor([1.0, step_y, step_b], ytob_dc);
+        let factor_b = INV_DC_QUANT[2] / (base_step[2] * step_b) * scale_dc;
+        let cfl = dc_cfl_factor(
+            [base_step[0], base_step[1] * step_y, base_step[2] * step_b],
+            ytob_dc,
+            base_b,
+        );
         let (mut hist, mut extra) = ([0u64; 64], 0u64);
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_b.as_ref().unwrap();
@@ -1287,7 +1327,12 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         .iter()
         .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
         .collect();
-    let steps_of = |channel: usize| candidates.map(|step| signaled_dc_step(channel, step));
+    // Multipliers of the base step, rounded through the wire like the
+    // signaled steps they become.
+    let steps_of = |channel: usize| {
+        candidates
+            .map(|step| signaled_dc_step(channel, base_step[channel] * step) / base_step[channel])
+    };
     let (steps_y, steps_b) = (steps_of(1), steps_of(2));
     let mut costs = [[None; DC_STEP_CANDIDATES]; DC_STEP_CANDIDATES];
     let mut current_y = None;
@@ -1327,7 +1372,11 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         }
     }
     if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base < base {
-        [1.0, steps_y[step_y], steps_b[step_b]]
+        [
+            base_step[0],
+            base_step[1] * steps_y[step_y],
+            base_step[2] * steps_b[step_b],
+        ]
     } else {
         default
     }
@@ -1340,6 +1389,8 @@ pub(crate) fn validate_ytob_dc(
     dc_datas: &[DcGroupData],
     candidate: i32,
     scale_dc: f32,
+    dc_step: [f32; 3],
+    base_b: f32,
     quantize: crate::group::QuantizeDcCflFn,
 ) -> i32 {
     if candidate == 0 {
@@ -1349,7 +1400,7 @@ pub(crate) fn validate_ytob_dc(
         let mut hist = [0u64; 64];
         let mut extra = 0u64;
         let mut total = 0u64;
-        let cfl = INV_DC_QUANT[2] * DC_QUANT[1] * (1.0 + k as f32 / K_COLOR_FACTOR);
+        let cfl = dc_cfl_factor(dc_step, k, base_b);
         for dc in dc_datas {
             let Some(source) = &dc.source_dc_b else {
                 return f64::INFINITY;
@@ -1363,7 +1414,7 @@ pub(crate) fn validate_ytob_dc(
                 quantize(
                     source.row(y),
                     yr,
-                    INV_DC_QUANT[2] * scale_dc,
+                    INV_DC_QUANT[2] / dc_step[2] * scale_dc,
                     cfl,
                     &mut current,
                 );
@@ -1800,7 +1851,7 @@ mod tests {
             |_, _| 0.0,
             |x, y| (40.5 + 0.2 * flicker(x, y)) / INV_DC_QUANT[2],
         );
-        let steps = choose_dc_steps(&[flat], 1.0, 0);
+        let steps = choose_dc_steps(&[flat], 1.0, 0, [1.0; 3], 1.0);
         assert_eq!(steps[0], 1.0);
         assert!(steps[2] < 1.0, "{steps:?}");
         // The chosen step is what the decoder reads back.
@@ -1829,11 +1880,14 @@ mod tests {
             |x, y| luma(x, y) / INV_DC_QUANT[1],
             |x, y| blue(x, y) / INV_DC_QUANT[2],
         );
-        assert_eq!(choose_dc_steps(&[textured], 1.0, 0), [1.0; 3]);
+        assert_eq!(
+            choose_dc_steps(&[textured], 1.0, 0, [1.0; 3], 1.0),
+            [1.0; 3]
+        );
         assert!(dc_step_wire([1.0; 3]).is_none());
         // Without the first pass's sources there is nothing to choose from.
         let bare = DcGroupData::new(48, 48).unwrap();
-        assert_eq!(choose_dc_steps(&[bare], 1.0, 0), [1.0; 3]);
+        assert_eq!(choose_dc_steps(&[bare], 1.0, 0, [1.0; 3], 1.0), [1.0; 3]);
     }
 
     #[test]
@@ -1877,10 +1931,11 @@ mod tests {
             ctx.fill_ytob_residuals,
             &mut Vec::new(),
             &mut Vec::new(),
+            [1.0; 3],
         );
         assert_ne!(chosen, 0, "the integer proxy must propose a change");
         assert_eq!(
-            validate_ytob_dc(&groups, chosen, 1.0, ctx.quantize_dc_cfl),
+            validate_ytob_dc(&groups, chosen, 1.0, [1.0; 3], 1.0, ctx.quantize_dc_cfl),
             0
         );
     }
@@ -1899,7 +1954,10 @@ mod tests {
                 }
             }
             dc.source_dc_b = Some(source);
-            assert_eq!(validate_ytob_dc(&[dc], k, 1.0, ctx.quantize_dc_cfl), k);
+            assert_eq!(
+                validate_ytob_dc(&[dc], k, 1.0, [1.0; 3], 1.0, ctx.quantize_dc_cfl),
+                k
+            );
         }
     }
 
@@ -1920,6 +1978,7 @@ mod tests {
                     selected_fill_ytob_residuals_fn(),
                     &mut s0,
                     &mut s1,
+                    [1.0; 3]
                 ),
                 k,
                 "planted ytob_dc {k}"
@@ -1943,6 +2002,7 @@ mod tests {
                 selected_fill_ytob_residuals_fn(),
                 &mut s0,
                 &mut s1,
+                [1.0; 3]
             ),
             0
         );
@@ -1963,6 +2023,7 @@ mod tests {
                 selected_fill_ytob_residuals_fn(),
                 &mut s0,
                 &mut s1,
+                [1.0; 3],
             );
             assert!((-YTOB_DC_LIMIT..=YTOB_DC_LIMIT).contains(&k), "ytob_dc {k}");
             assert!((0..=255).contains(&(k + 128)));

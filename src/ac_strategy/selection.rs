@@ -195,7 +195,13 @@ fn select_super_block(
     let (bx0, by0) = (input.bx, input.by);
     let (px0, py0) = (params.dc_group_px + bx0 * 8, params.dc_group_py + by0 * 8);
     let qac = input.qac;
-    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx0, by0);
+    let cmap_factor = cmap_factors(
+        params.ctx.cfl_bases(),
+        params.ytox_map,
+        params.ytob_map,
+        bx0,
+        by0,
+    );
 
     // Cost of the four individual DCT8 blocks: cost[dy][dx]. DCT8 is the
     // incumbent; every merge below must beat the corresponding tiled cost by a
@@ -522,7 +528,13 @@ fn find_quant_refinements(
         if current_q <= 1 {
             continue;
         }
-        let cmap = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+        let cmap = cmap_factors(
+            params.ctx.cfl_bases(),
+            params.ytox_map,
+            params.ytob_map,
+            bx,
+            by,
+        );
         let px = params.dc_group_px + bx * 8;
         let py = params.dc_group_py + by * 8;
         let CoderScratch {
@@ -849,7 +861,7 @@ fn select_band(
                     }
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale, distance);
-                let cmap_factor = cmap_factors(ytox_map, ytob_map, bx, by);
+                let cmap_factor = cmap_factors(ctx.cfl_bases(), ytox_map, ytob_map, bx, by);
                 let cost32 = strategy_cost(
                     ctx,
                     scratch,
@@ -1133,7 +1145,13 @@ fn sub8_shortlist(
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
-    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+    let cmap_factor = cmap_factors(
+        params.ctx.cfl_bases(),
+        params.ytox_map,
+        params.ytob_map,
+        bx,
+        by,
+    );
     let costs = sub8_strategy_costs(
         ctx,
         scratch,
@@ -1247,7 +1265,13 @@ fn fine_recon_admit(
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
-    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+    let cmap_factor = cmap_factors(
+        params.ctx.cfl_bases(),
+        params.ytox_map,
+        params.ytob_map,
+        bx,
+        by,
+    );
     let reconstruction_cost = |scratch: &mut CoderScratch, strategy| {
         reconstruction_strategy_cost_and_base(
             ctx,
@@ -1688,7 +1712,7 @@ fn select_transforms(
                 if cost32.iter().flatten().any(|c| !c.is_finite()) {
                     continue;
                 }
-                let cmap = cmap_factors(ytox_map, ytob_map, bx, by);
+                let cmap = cmap_factors(ctx.cfl_bases(), ytox_map, ytob_map, bx, by);
                 let cost64 = BIAS_64X64
                     * strategy_cost64(
                         ctx,
@@ -2329,7 +2353,13 @@ fn find_rerank_downgrades(
             params.qm_mult_x,
             meta_r,
             params.distance,
-            cmap_factors(params.ytox_map, params.ytob_map, bx, by),
+            cmap_factors(
+                params.ctx.cfl_bases(),
+                params.ytox_map,
+                params.ytob_map,
+                bx,
+                by,
+            ),
             gradient_alpha,
             gradient_peak_alpha,
             if with_fine_mosaic {
@@ -2388,7 +2418,13 @@ fn find_rerank_downgrades(
                     params.distance,
                 );
                 let child = iy * cxb + ix;
-                let cmap = cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy);
+                let cmap = cmap_factors(
+                    params.ctx.cfl_bases(),
+                    params.ytox_map,
+                    params.ytob_map,
+                    bx + ix,
+                    by + iy,
+                );
                 for (ci, &strategy) in FINE_MOSAIC_CANDIDATES.iter().enumerate() {
                     if ci > 0 && !with_fine_mosaic {
                         break;
@@ -2501,7 +2537,13 @@ fn find_rerank_downgrades(
                         params.qm_mult_x,
                         meta_r,
                         params.distance,
-                        cmap_factors(params.ytox_map, params.ytob_map, bx + ix, by + iy),
+                        cmap_factors(
+                            params.ctx.cfl_bases(),
+                            params.ytox_map,
+                            params.ytob_map,
+                            bx + ix,
+                            by + iy,
+                        ),
                         gradient_alpha,
                         gradient_peak_alpha,
                         None,
@@ -2881,7 +2923,13 @@ fn find_merge_upgrades(
                     params.qm_mult_x,
                     meta_r,
                     params.distance,
-                    cmap_factors(params.ytox_map, params.ytob_map, x, y),
+                    cmap_factors(
+                        params.ctx.cfl_bases(),
+                        params.ytox_map,
+                        params.ytob_map,
+                        x,
+                        y,
+                    ),
                     gradient_alpha,
                     gradient_peak_alpha,
                     None,
@@ -4538,7 +4586,10 @@ mod tests {
     fn strategy_cfl_factors_match_signaled_tile_maps() {
         let ytox = ImageSB::new_fill(1, 1, 42);
         let ytob = ImageSB::new_fill(1, 1, -42);
-        assert_eq!(cmap_factors(&ytox, &ytob, 0, 0), [0.5, 0.0, 0.5]);
+        assert_eq!(
+            cmap_factors([0.0, 1.0], &ytox, &ytob, 0, 0),
+            [0.5, 0.0, 0.5]
+        );
     }
 
     #[test]

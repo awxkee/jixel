@@ -1336,13 +1336,19 @@ fn sub8_strategy_costs(
 }
 
 #[inline]
-fn cmap_factors(ytox_map: &ImageSB, ytob_map: &ImageSB, bx: usize, by: usize) -> [f32; 3] {
+fn cmap_factors(
+    bases: [f32; 2],
+    ytox_map: &ImageSB,
+    ytob_map: &ImageSB,
+    bx: usize,
+    by: usize,
+) -> [f32; 3] {
     let tx = (bx / 8).min(ytox_map.xsize() - 1);
     let ty = (by / 8).min(ytox_map.ysize() - 1);
     [
-        crate::color_correlation::y_to_x_ratio(ytox_map.row(ty)[tx]),
+        crate::color_correlation::y_to_x_ratio(bases[0], ytox_map.row(ty)[tx]),
         0.0,
-        crate::color_correlation::y_to_b_ratio(ytob_map.row(ty)[tx]),
+        crate::color_correlation::y_to_b_ratio(bases[1], ytob_map.row(ty)[tx]),
     ]
 }
 

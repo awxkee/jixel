@@ -41,7 +41,9 @@ mod afv;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
+mod cmyk;
 mod coder_scratch;
+mod coding;
 mod coeff_order;
 mod color;
 mod color_correlation;
@@ -88,6 +90,8 @@ mod weighted_predictor;
 mod xyb;
 mod yellow_opsin;
 
+pub use cmyk::{InkConvention, encode_image_cmyk, encode_image_cmyk_16bit};
+pub use coding::CodingTransform;
 pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };

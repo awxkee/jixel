@@ -123,6 +123,7 @@ const MEDIUM: Effort = Effort {
     tree_full_sampling: false,
     tree_dual_layout: false,
     tree_ctx_v1: false,
+    patches_default: false,
     ..SLOW
 };
 

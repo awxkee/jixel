@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use anyhow::{Context, Result, bail};
-use jixel::Speed;
+use jixel::{CodingTransform, Speed};
 use plotters::coord::combinators::{LogCoord, WithKeyPoints};
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
@@ -1000,7 +1000,8 @@ fn bench_jixel(
         .with_num_threads(nthreads)
         .with_speed(Speed::Slow)
         .with_splines(false)
-        .with_dots(false);
+        .with_dots(false)
+        .with_coding_transform(CodingTransform::YCbCr);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));

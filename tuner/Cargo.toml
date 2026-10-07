@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 jixel = { path = "../", default-features = true, features = ["neon", "avx", "sse", "splines"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+moxcms = "0.9.1"

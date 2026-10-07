@@ -137,7 +137,13 @@ fn plan_super_block(
     let raw_propagation = ctx.selector.raw_propagation;
     let (px0, py0) = (params.dc_group_px + bx0 * 8, params.dc_group_py + by0 * 8);
     let qac = block_qac_2x2(selection.quant_field, bx0, by0, params.scale);
-    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx0, by0);
+    let cmap_factor = cmap_factors(
+        params.ctx.cfl_bases(),
+        params.ytox_map,
+        params.ytob_map,
+        bx0,
+        by0,
+    );
 
     let l = [
         [leaves.at(bx0, by0), leaves.at(bx0 + 1, by0)],
@@ -419,7 +425,13 @@ pub(super) fn select_band_leaf_first(
     for by in y_begin..y_end {
         for bx in 0..xsize {
             let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-            let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+            let cmap_factor = cmap_factors(
+                params.ctx.cfl_bases(),
+                params.ytox_map,
+                params.ytob_map,
+                bx,
+                by,
+            );
             output.leaves[(by - y_begin) * xsize + bx].j = strategy_cost(
                 ctx,
                 scratch,
@@ -546,7 +558,13 @@ pub(super) fn select_band_leaf_first(
                     }
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale, distance);
-                let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+                let cmap_factor = cmap_factors(
+                    params.ctx.cfl_bases(),
+                    params.ytox_map,
+                    params.ytob_map,
+                    bx,
+                    by,
+                );
                 let cost32 = strategy_cost(
                     ctx,
                     scratch,

@@ -820,11 +820,24 @@ pub(crate) static DEQUANT_MATRIX_16X8: [[f32; 128]; 3] = [
     ],
 ];
 
+/// Parameters of the fine transforms' tables, as signaled.
+pub(crate) struct FineTables {
+    /// kQuantModeDCT2 weights, already scaled by 64.
+    pub(crate) dct2: [[f32; 6]; 3],
+    /// kQuantModeDCT4 distance bands (unit multipliers).
+    pub(crate) dct4x4: [[f32; 4]; 3],
+    /// kQuantModeAFV weights; the table's 4x8 and 4x4 parameters are
+    /// `custom_tables[5]` and `dct4x4`.
+    pub(crate) afv: [[f32; 9]; 3],
+}
+
 // Array references below borrow heap buffers owned by SharedTables/LargeTables.
 // The caches retain HeapMatrix's Box<[f32]> allocations for the process lifetime.
 pub(crate) struct DequantMatrices {
     /// Signaled IDENTITY weights (kQuantModeID) when they differ from spec.
     pub(crate) identity_weights: Option<[[f32; 3]; 3]>,
+    /// Signaled DCT2X2, DCT4X4 and AFV parameters (non-XYB frames only).
+    pub(crate) fine_tables: Option<Box<FineTables>>,
     pub(crate) matrix: HeapMatrix<f32, 3, 64>,
     /// Per-channel inverse matrices (1/weight). Entry [c][0] is zeroed because
     /// DC is quantized separately via DC_QUANT.
@@ -1256,13 +1269,17 @@ fn compute_dct4x8_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 3,
 }
 
 fn compute_dct4x4_matrix() -> HeapMatrix<f32, 3, 64> {
+    compute_dct4x4_matrix_from(&DCT4X4_BANDS)
+}
+
+fn compute_dct4x4_matrix_from(src: &[[f32; 4]; 3]) -> HeapMatrix<f32, 3, 64> {
     const NUM_BANDS: usize = 4;
     let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = DCT4X4_BANDS[c][0];
+        bands[0] = src[c][0];
         for i in 1..NUM_BANDS {
-            bands[i] = bands[i - 1] * band_mult(DCT4X4_BANDS[c][i]);
+            bands[i] = bands[i - 1] * band_mult(src[c][i]);
         }
         let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
         let rcp = scale / 3.0; // (4 - 1)
@@ -1296,13 +1313,21 @@ fn compute_dct4x4_matrix() -> HeapMatrix<f32, 3, 64> {
 /// positions get either fixed corner weights or a 4-band interpolation over
 /// the basis-function frequencies. Returns step sizes (1/weight).
 fn compute_afv_matrix() -> HeapMatrix<f32, 3, 64> {
+    compute_afv_matrix_from(&AFV_BANDS, &DCT4X8_BANDS, &DCT4X4_BANDS)
+}
+
+fn compute_afv_matrix_from(
+    afv: &[[f32; 9]; 3],
+    dct4x8: &[[f32; 4]; 3],
+    dct4x4: &[[f32; 4]; 3],
+) -> HeapMatrix<f32, 3, 64> {
     let mut out = HeapMatrix::new(0.0f32);
     for c in 0..3 {
         // 4×8 radial weights, exactly as compute_dct4x8_matrix builds them.
         let mut bands = [0.0f32; 4];
-        bands[0] = DCT4X8_BANDS[c][0];
+        bands[0] = dct4x8[c][0];
         for i in 1..4 {
-            bands[i] = bands[i - 1] * band_mult(DCT4X8_BANDS[c][i]);
+            bands[i] = bands[i - 1] * band_mult(dct4x8[c][i]);
         }
         let scale = 3.0 / (std::f32::consts::SQRT_2 + 1e-6);
         let mut w4x8 = [0.0f32; 32];
@@ -1316,9 +1341,9 @@ fn compute_afv_matrix() -> HeapMatrix<f32, 3, 64> {
             }
         }
         // 4×4 radial weights, exactly as compute_dct4x4_matrix builds them.
-        bands[0] = DCT4X4_BANDS[c][0];
+        bands[0] = dct4x4[c][0];
         for i in 1..4 {
-            bands[i] = bands[i - 1] * band_mult(DCT4X4_BANDS[c][i]);
+            bands[i] = bands[i - 1] * band_mult(dct4x4[c][i]);
         }
         let mut w4x4 = [0.0f32; 16];
         for y in 0..4 {
@@ -1331,21 +1356,21 @@ fn compute_afv_matrix() -> HeapMatrix<f32, 3, 64> {
             }
         }
         // AFV bands for the non-corner (even, even) positions.
-        bands[0] = AFV_BANDS[c][5];
+        bands[0] = afv[c][5];
         for i in 1..4 {
-            bands[i] = bands[i - 1] * band_mult(AFV_BANDS[c][i + 5]);
+            bands[i] = bands[i - 1] * band_mult(afv[c][i + 5]);
         }
         let mut weights = [0.0f32; 64];
         // Coefficient 0 is the block mean, quantized via the DC plane; libjxl
         // stores weight 1 in the unused slot.
         weights[0] = 1.0;
         // Sub-part DC tendencies: coefficient 8 (4x8 half) and 1 (4x4 quad).
-        weights[8] = AFV_BANDS[c][0];
-        weights[1] = AFV_BANDS[c][1];
+        weights[8] = afv[c][0];
+        weights[1] = afv[c][1];
         // Fixed weights for the 3-pixel AFV corner.
-        weights[16] = AFV_BANDS[c][2];
-        weights[2] = AFV_BANDS[c][3];
-        weights[18] = AFV_BANDS[c][4];
+        weights[16] = afv[c][2];
+        weights[2] = afv[c][3];
+        weights[18] = afv[c][4];
         // Remaining AFV positions from the frequency interpolation.
         for y in 0..4 {
             for x in 0..4 {
@@ -2020,6 +2045,7 @@ impl DequantMatrices {
 
         Self {
             identity_weights,
+            fine_tables: None,
             matrix,
             inv_matrix,
             matrix_identity,
@@ -2057,6 +2083,197 @@ impl DequantMatrices {
             inv_matrix_32x16: &large.inv_matrix_32x16,
             matrix_afv: &shared.matrix_afv,
             inv_matrix_afv: &shared.inv_matrix_afv,
+        }
+    }
+
+    /// Tables of a non-XYB frame: every plane takes the luma row of the XYB
+    /// tier at `distance`, its absolute weights scaled by
+    /// `coding.table_scale()`. The decoder's library tables are XYB rows, so
+    /// every table is signaled.
+    pub(crate) fn new_plain(
+        distance: f32,
+        rectangles: bool,
+        coding: crate::coding::CodingTransform,
+    ) -> &'static Self {
+        type Cache = std::sync::Mutex<Vec<((u32, bool, u8), &'static DequantMatrices)>>;
+        static CACHE: Cache = std::sync::Mutex::new(Vec::new());
+        let template = if rectangles {
+            Self::new(distance)
+        } else {
+            Self::new_fast(distance)
+        };
+        // The template is itself a cached tier, so its address keys the cache.
+        let key = (
+            (template as *const Self as usize & 0xffff_ffff) as u32,
+            rectangles,
+            coding as u8,
+        );
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, m)) = cache.iter().find(|(k, _)| *k == key) {
+            return m;
+        }
+        let m: &'static Self = Box::leak(Box::new(Self::compute_plain(
+            template,
+            coding.table_scale(),
+            coding.table_hf_tilt(),
+        )));
+        cache.push((key, m));
+        m
+    }
+
+    fn compute_plain(template: &Self, scale: [f32; 3], hf_tilt: [f32; 3]) -> Self {
+        fn wire_abs(v: f32) -> f32 {
+            f16_bits_to_f32(f32_to_f16_bits(v / 64.0)) * 64.0
+        }
+        fn wire_rel(v: f32) -> f32 {
+            f16_bits_to_f32(f32_to_f16_bits(v))
+        }
+        // Outermost-band precision multiplier per plane, spread geometrically
+        // over the band transitions so every table size tilts alike.
+        let tilt = |v: f32, per_band: f32| -> f32 {
+            let ratio = band_mult(v) * per_band;
+            if ratio > 1.0 {
+                ratio - 1.0
+            } else {
+                1.0 - 1.0 / ratio
+            }
+        };
+        // Luma row of one DCT-mode slot, replicated with scaled bases.
+        let plain = |luma: &[f32]| -> BandOverride {
+            let mut out = BandOverride {
+                num_bands: luma.len(),
+                bands: [[0.0; 16]; 3],
+            };
+            let transitions = (luma.len() - 1).max(1) as f32;
+            for c in 0..3 {
+                let per_band = hf_tilt[c].powf(1.0 / transitions);
+                for (i, &v) in luma.iter().enumerate() {
+                    out.bands[c][i] = if i == 0 {
+                        wire_abs(v * scale[c])
+                    } else {
+                        wire_rel(tilt(v, per_band))
+                    };
+                }
+            }
+            out
+        };
+        let luma_of = |slot: usize, library: &[f32]| -> BandOverride {
+            match template.custom_tables[slot].as_ref() {
+                Some(o) => plain(&o.bands[1][..o.num_bands]),
+                None => plain(library),
+            }
+        };
+        let o8 = luma_of(0, &DCT8_BANDS[1]);
+        let o16 = luma_of(1, &DCT16X16_BANDS[1]);
+        let o32 = luma_of(2, &DCT32X32_BANDS[1]);
+        let o16x8 = luma_of(3, &DCT16X8_BANDS[1]);
+        let o32x16 = luma_of(4, &DCT16X32_BANDS[1]);
+        let o4x8 = luma_of(5, &DCT4X8_BANDS[1]);
+        let o64r = luma_of(6, &DCT32X64_BANDS[1]);
+        let o64 = luma_of(7, &DCT64X64_BANDS[1]);
+
+        let identity: [[f32; 3]; 3] =
+            std::array::from_fn(|c| IDENTITY_WEIGHTS[1].map(|v| wire_abs(v * scale[c])));
+        let dct2: [[f32; 6]; 3] =
+            std::array::from_fn(|c| DCT2_WEIGHTS[1].map(|v| wire_abs(v * scale[c])));
+        let dct4x4: [[f32; 4]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| {
+                let v = DCT4X4_BANDS[1][i];
+                if i == 0 {
+                    wire_abs(v * scale[c])
+                } else {
+                    wire_rel(v)
+                }
+            })
+        });
+        let afv: [[f32; 9]; 3] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| {
+                let v = AFV_BANDS[1][i];
+                if i < 6 {
+                    wire_abs(v * scale[c])
+                } else {
+                    wire_rel(v)
+                }
+            })
+        });
+        let dct4x8: [[f32; 4]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|i| o4x8.bands[c][i]));
+
+        fn with_inverse<const N: usize>(
+            m: HeapMatrix<f32, 3, N>,
+        ) -> (HeapMatrix<f32, 3, N>, HeapMatrix<f32, 3, N>) {
+            let mut inv = HeapMatrix::new(0.0f32);
+            for c in 0..3 {
+                fill_ac_reciprocals(&m[c], &mut inv[c]);
+            }
+            (m, inv)
+        }
+        fn leak<const N: usize>(
+            (m, inv): (HeapMatrix<f32, 3, N>, HeapMatrix<f32, 3, N>),
+        ) -> (&'static [[f32; N]; 3], &'static [[f32; N]; 3]) {
+            (&**Box::leak(Box::new(m)), &**Box::leak(Box::new(inv)))
+        }
+
+        let (matrix, inv_matrix) = with_inverse(compute_dct8x8_matrix(&o8));
+        let (matrix_identity, inv_matrix_identity) = identity_pair(&identity);
+        let (matrix_dct2x2, inv_matrix_dct2x2) = leak(dct2_pair(&dct2));
+        let (matrix_16x8, inv_matrix_16x8) = with_inverse(compute_dct16x8_matrix(Some(&o16x8)));
+        let (matrix_16x16, inv_matrix_16x16) =
+            leak(with_inverse(compute_dct16x16_matrix(Some(&o16))));
+        let (matrix_32x32, inv_matrix_32x32) =
+            leak(with_inverse(compute_dct32x32_matrix(Some(&o32))));
+        let (matrix_64x64, inv_matrix_64x64) =
+            leak(with_inverse(compute_dct64x64_matrix(Some(&o64))));
+        let (matrix_64x32, inv_matrix_64x32) =
+            leak(with_inverse(compute_dct64x32_matrix(Some(&o64r))));
+        let (matrix_4x4, inv_matrix_4x4) = leak(with_inverse(compute_dct4x4_matrix_from(&dct4x4)));
+        let (matrix_4x8, inv_matrix_4x8) = leak(with_inverse(compute_dct4x8_matrix(Some(&o4x8))));
+        let (matrix_32x16, inv_matrix_32x16) =
+            leak(with_inverse(compute_dct32x16_matrix(Some(&o32x16))));
+        let (matrix_afv, inv_matrix_afv) = leak(with_inverse(compute_afv_matrix_from(
+            &afv, &dct4x8, &dct4x4,
+        )));
+
+        Self {
+            identity_weights: Some(identity),
+            fine_tables: Some(Box::new(FineTables { dct2, dct4x4, afv })),
+            matrix,
+            inv_matrix,
+            matrix_identity,
+            inv_matrix_identity,
+            matrix_dct2x2,
+            inv_matrix_dct2x2,
+            matrix_16x8,
+            inv_matrix_16x8,
+            matrix_16x16,
+            inv_matrix_16x16,
+            matrix_32x32,
+            inv_matrix_32x32,
+            matrix_64x64,
+            inv_matrix_64x64,
+            matrix_64x32,
+            inv_matrix_64x32,
+            custom_tables: heap_array_from_fn(|i| {
+                Some(match i {
+                    0 => o8,
+                    1 => o16,
+                    2 => o32,
+                    3 => o16x8,
+                    4 => o32x16,
+                    5 => o4x8,
+                    6 => o64r,
+                    7 => o64,
+                    _ => unreachable!(),
+                })
+            }),
+            matrix_4x4,
+            inv_matrix_4x4,
+            matrix_4x8,
+            inv_matrix_4x8,
+            matrix_32x16,
+            inv_matrix_32x16,
+            matrix_afv,
+            inv_matrix_afv,
         }
     }
 
