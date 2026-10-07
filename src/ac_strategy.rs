@@ -43,8 +43,8 @@ use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::image::{Image3F, ImageB, ImageSB};
 use crate::inflated_cost::{
-    ReconCost, ReconDistInput, ReconQuantization, ReconScoring, ReconSource, ReconTransform,
-    channel_rd,
+    Footprint, ReconCost, ReconDistInput, ReconQuantization, ReconScoring, ReconSource,
+    ReconTransform, channel_rd,
 };
 
 mod matrix_overhead;
@@ -412,10 +412,10 @@ struct SuperBlockCost {
     dct8: f32,
 }
 
-/// Gather a transform footprint with edge replication, matching
-/// `build_stripe`'s padding.
+/// Gather a transform footprint with edge replication: columns past the image
+/// repeat the row's last pixel, rows past it repeat the last row.
 #[inline]
-fn gather_pixels(
+pub(crate) fn gather_pixels(
     plane: &crate::image::Plane<f32>,
     px: usize,
     py: usize,
@@ -625,11 +625,12 @@ fn strategy_cost64(
     } = scratch;
     let (cx, cy, size) =
         prepare_strategy_coeffs(ctx, coeffs, input, strategy, opsin, px, py, cmap_factor);
+    let visible = Footprint::of_strategy(opsin, px, py, strategy).visible_fraction();
 
     if let Some((distortion, rate)) = rate_prices.as_deref().and_then(|prices| {
         prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
     }) {
-        return distortion + RD_LAMBDA * (rate + meta_r);
+        return distortion * visible + RD_LAMBDA * (rate + meta_r);
     }
     let mut distortion = 0.0f32;
     let mut rate = 0.0f32;
@@ -661,7 +662,7 @@ fn strategy_cost64(
         distortion += ctx.channel_weight(c) * d;
         rate += r;
     }
-    distortion + RD_LAMBDA * (rate + meta_r)
+    distortion * visible + RD_LAMBDA * (rate + meta_r)
 }
 
 /// Full RD cost `J = D + λR` of coding `strategy` at absolute pixel `(px, py)`.
@@ -886,11 +887,12 @@ fn coefficient_dist_and_rate(
     cx: usize,
     cy: usize,
     prices: Option<&RatePrices>,
+    visible: f32,
 ) -> (f32, f32) {
-    if let Some(cost) = prices.and_then(|prices| {
+    if let Some((d, r)) = prices.and_then(|prices| {
         prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
     }) {
-        return cost;
+        return (d * visible, r);
     }
     let mut d_total = 0.0f32;
     let mut r_total = 0.0f32;
@@ -918,7 +920,7 @@ fn coefficient_dist_and_rate(
         r_total += r;
     }
     (
-        d_total,
+        d_total * visible,
         r_total * RateCalibration::scale(strategy, distance),
     )
 }
@@ -979,7 +981,17 @@ fn strategy_cost_impl(
         )
         .dist_and_rate(),
         DistortionModel::Coefficient => coefficient_dist_and_rate(
-            ctx, strategy, coeffs, size, qac, qm_mult_x, distance, cx, cy, prices,
+            ctx,
+            strategy,
+            coeffs,
+            size,
+            qac,
+            qm_mult_x,
+            distance,
+            cx,
+            cy,
+            prices,
+            Footprint::of_strategy(opsin, px, py, strategy).visible_fraction(),
         ),
     };
     rd_cost(distortion_model, distance, meta_r, d_total, r_total)
@@ -1265,6 +1277,7 @@ fn sub8_strategy_costs(
         gather_pixels(opsin.plane(c), px, py, 8, 8, input);
     }
 
+    let visible = Footprint::new(opsin.xsize(), opsin.ysize(), px, py, 8, 8).visible_fraction();
     let prices = scratch.rate_prices.as_deref();
     let coeffs = &mut scratch.strategy_coeffs;
     let mut evaluate = |strategy| {
@@ -1274,7 +1287,7 @@ fn sub8_strategy_costs(
         let [x, y, b] = &mut ***coeffs;
         apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
         let (distortion, rate) = coefficient_dist_and_rate(
-            ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1, prices,
+            ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1, prices, visible,
         );
         fmla(RD_LAMBDA, rate + meta_r, distortion)
     };

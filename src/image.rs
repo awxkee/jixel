@@ -74,6 +74,7 @@ impl<T: Copy + Default> Plane<T> {
         std::mem::swap(&mut self.data, data);
     }
 
+    #[cfg(test)]
     fn resize(&mut self, xsize: usize, ysize: usize) {
         self.data.resize(xsize * ysize, T::default());
         self.xsize = xsize;
@@ -113,6 +114,7 @@ impl<T: Copy + Default> Plane<T> {
 
     /// Borrow one row immutably and a different one mutably. Useful for
     /// replicating a row to fill padding.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn two_rows_mut_safe(&mut self, y_src: usize, y_dst: usize) -> (&[T], &mut [T]) {
         let w = self.xsize;
@@ -169,6 +171,7 @@ impl<T: Copy + Default> Image3<T> {
     }
 
     /// Reuse pixel storage for a new image that the caller will overwrite.
+    #[cfg(test)]
     pub(crate) fn resize(&mut self, xsize: usize, ysize: usize) {
         for plane in &mut self.planes {
             plane.resize(xsize, ysize);

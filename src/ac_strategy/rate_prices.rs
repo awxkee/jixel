@@ -412,6 +412,27 @@ fn sample_position(index: usize, count: usize, total: usize) -> usize {
     start + offset as usize % (end - start).max(1)
 }
 
+/// Coded/learned bits of a large transform relative to DCT8, at d = 1.5,
+/// 2.5 and 4.75 (linear between, flat outside). The learned prices overcharge
+/// large transforms once quantization coarsens.
+fn learned_calibration(strategy: u8, distance: f32) -> f32 {
+    let row: [f32; 3] = match strategy {
+        STRATEGY_DCT16X16 => [0.98, 0.99, 0.92],
+        STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => [1.0, 0.93, 0.83],
+        STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => [0.98, 0.88, 0.74],
+        _ => return 1.0,
+    };
+    if distance <= 1.5 {
+        row[0]
+    } else if distance <= 2.5 {
+        fmla(distance - 1.5, row[1] - row[0], row[0])
+    } else if distance <= 4.75 {
+        fmla((distance - 2.5) / 2.25, row[2] - row[1], row[1])
+    } else {
+        row[2]
+    }
+}
+
 impl RatePrices {
     pub(crate) fn has_table(&self, strategy: u8) -> bool {
         self.tables[strategy as usize].is_some()
@@ -475,7 +496,10 @@ impl RatePrices {
                     Self::channel_bits(table, strategy, c, &levels[..size], cx, cy, qf_hi)
                 };
             }
-            (distortion, bits * self.norm)
+            (
+                distortion,
+                bits * self.norm * learned_calibration(strategy, distance),
+            )
         }))
     }
 
@@ -552,7 +576,7 @@ impl RatePrices {
             }
             bits
         });
-        Some(bits * self.norm)
+        Some(bits * self.norm * learned_calibration(strategy, distance))
     }
 
     /// One transform's table and the bits of its sampled blocks.
