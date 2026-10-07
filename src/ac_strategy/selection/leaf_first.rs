@@ -36,8 +36,6 @@ pub(crate) struct LeafChoice {
     /// Coefficient-domain decision cost (family bias applied) — the incumbent
     /// merges above this block compete against.
     pub(crate) j: f32,
-    /// The same cost without the family bias.
-    pub(crate) raw_j: f32,
     /// Sub-8 metadata-gate credit if this leaf survives to the final map.
     pub(crate) gain: f32,
     /// IDENTITY/DCT2X2 shortlisted against DCT8 on the coefficient model
@@ -56,7 +54,6 @@ impl Default for LeafChoice {
         Self {
             strategy: STRATEGY_DCT,
             j: f32::NAN,
-            raw_j: f32::NAN,
             gain: 0.0,
             fine: NO_CHILD_BLOCK,
             fine_j: f32::INFINITY,
@@ -134,10 +131,15 @@ fn plan_super_block(
     let params = selection.params;
     let ctx = params.ctx;
     let merge = ctx.merge;
-    let raw_propagation = ctx.selector.raw_propagation;
     let (px0, py0) = (params.dc_group_px + bx0 * 8, params.dc_group_py + by0 * 8);
     let qac = block_qac_2x2(selection.quant_field, bx0, by0, params.scale);
-    let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx0, by0);
+    let cmap_factor = cmap_factors(
+        params.ctx.cfl_frame(),
+        params.ytox_map,
+        params.ytob_map,
+        bx0,
+        by0,
+    );
 
     let l = [
         [leaves.at(bx0, by0), leaves.at(bx0 + 1, by0)],
@@ -148,10 +150,6 @@ fn plan_super_block(
     let leaf_top = l[0][0].j + l[0][1].j;
     let leaf_bottom = l[1][0].j + l[1][1].j;
     let leaf_total = leaf_left + leaf_right;
-    let raw_left = l[0][0].raw_j + l[1][0].raw_j;
-    let raw_right = l[0][1].raw_j + l[1][1].raw_j;
-    let raw_top = l[0][0].raw_j + l[0][1].raw_j;
-    let raw_bottom = l[1][0].raw_j + l[1][1].raw_j;
 
     // (decision cost, unbiased cost) per rectangular candidate.
     let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> (f32, f32) {
@@ -208,10 +206,6 @@ fn plan_super_block(
         + if use_v_right { v_right } else { leaf_right };
     let cost_8x16 =
         if use_h_top { h_top } else { leaf_top } + if use_h_bottom { h_bot } else { leaf_bottom };
-    let raw_16x8 = if use_v_left { v_left_raw } else { raw_left }
-        + if use_v_right { v_right_raw } else { raw_right };
-    let raw_8x16 = if use_h_top { h_top_raw } else { raw_top }
-        + if use_h_bottom { h_bot_raw } else { raw_bottom };
     let vertical = cost_16x8 <= cost_8x16;
     let best_rect = cost_16x8.min(cost_8x16);
 
@@ -231,7 +225,7 @@ fn plan_super_block(
             risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0),
         );
 
-    if ctx.selector.merge_upgrade && params.distance >= MERGE_UPGRADE_MIN_DISTANCE {
+    if params.distance >= MERGE_UPGRADE_MIN_DISTANCE {
         record_upgrade_candidates(
             upgrades,
             ac_strategy,
@@ -302,7 +296,7 @@ fn plan_super_block(
                 NO_CHILD_BLOCK,
                 NO_CHILD_BLOCK,
             ],
-            j: if raw_propagation { c16_raw } else { c16 },
+            j: c16,
             leaf_total,
             child: grid_nontrivial(&arm).then_some(arm),
             leaves,
@@ -310,11 +304,7 @@ fn plan_super_block(
     } else {
         SuperPlan {
             grid: arm,
-            j: if raw_propagation {
-                if vertical { raw_16x8 } else { raw_8x16 }
-            } else {
-                best_rect
-            },
+            j: best_rect,
             leaf_total,
             child: None,
             leaves,
@@ -392,7 +382,6 @@ pub(super) fn select_band_leaf_first(
     let meta_r = selection.meta_r;
     let scope = selection.scope;
     let merge = ctx.merge;
-    let raw_propagation = ctx.selector.raw_propagation;
     let (y_begin, y_end) = band;
     let xsize = ac_strategy.xsize();
     let ysize = ac_strategy.ysize();
@@ -419,7 +408,13 @@ pub(super) fn select_band_leaf_first(
     for by in y_begin..y_end {
         for bx in 0..xsize {
             let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-            let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+            let cmap_factor = cmap_factors(
+                params.ctx.cfl_frame(),
+                params.ytox_map,
+                params.ytob_map,
+                bx,
+                by,
+            );
             output.leaves[(by - y_begin) * xsize + bx].j = strategy_cost(
                 ctx,
                 scratch,
@@ -442,7 +437,6 @@ pub(super) fn select_band_leaf_first(
             let leaf = &mut output.leaves[(by - y_begin) * xsize + bx];
             *leaf = LeafChoice {
                 j: dct8,
-                raw_j: dct8,
                 ..LeafChoice::default()
             };
             if !sub8_enabled {
@@ -466,7 +460,6 @@ pub(super) fn select_band_leaf_first(
             if let Some(p) = shortlist.structural {
                 leaf.strategy = p.strategy;
                 leaf.j = p.biased_j;
-                leaf.raw_j = p.raw_j;
                 leaf.gain = p.gain;
             }
             let Some(fine) = shortlist.fine else {
@@ -486,7 +479,6 @@ pub(super) fn select_band_leaf_first(
                 output.leaves[(by - y_begin) * xsize + bx] = LeafChoice {
                     strategy: fine.strategy,
                     j: fine.biased_j,
-                    raw_j: fine.raw_j,
                     gain,
                     fallback: structural.strategy,
                     ..LeafChoice::default()
@@ -546,7 +538,13 @@ pub(super) fn select_band_leaf_first(
                     }
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale, distance);
-                let cmap_factor = cmap_factors(params.ytox_map, params.ytob_map, bx, by);
+                let cmap_factor = cmap_factors(
+                    params.ctx.cfl_frame(),
+                    params.ytox_map,
+                    params.ytob_map,
+                    bx,
+                    by,
+                );
                 let cost32 = strategy_cost(
                     ctx,
                     scratch,
@@ -652,7 +650,7 @@ pub(super) fn select_band_leaf_first(
                 chosen32.push(Chosen32Cost {
                     bx: bx as u16,
                     by: by as u16,
-                    cost: partition_cost(children, if raw_propagation { raw } else { costs }, mask),
+                    cost: partition_cost(children, costs, mask),
                 });
                 bx += 4;
             } else if four_row {

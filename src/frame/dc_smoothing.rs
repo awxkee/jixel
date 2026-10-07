@@ -49,6 +49,7 @@ pub(super) fn skip_dc_smoothing(
     group_coords: &[(usize, usize)],
     distp: &DistanceParams,
     ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
 ) -> Result<bool, EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -59,15 +60,20 @@ pub(super) fn skip_dc_smoothing(
     let steps: [f32; 3] = std::array::from_fn(|c| {
         distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
     });
-    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc);
+    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl);
+    let cfl_x = crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl.base_x);
     let mut recon = Image3F::try_new(w, h)?;
     for (dc, &(gx, gy)) in dc_datas.iter().zip(group_coords) {
         let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
         let q = &dc.quant_dc;
         for ly in 0..q.ysize() {
             let [rx, ry, rb] = recon.all_plane_rows_mut(oy + ly);
-            for (dst, &v) in rx[ox..ox + q.xsize()].iter_mut().zip(q.plane_row(0, ly)) {
-                *dst = v as f32 * steps[0];
+            for ((dst, &v), &y) in rx[ox..ox + q.xsize()]
+                .iter_mut()
+                .zip(q.plane_row(0, ly))
+                .zip(q.plane_row(1, ly))
+            {
+                *dst = fmla(y as f32, cfl_x, v as f32) * steps[0];
             }
             for (dst, &v) in ry[ox..ox + q.xsize()].iter_mut().zip(q.plane_row(1, ly)) {
                 *dst = v as f32 * steps[1];

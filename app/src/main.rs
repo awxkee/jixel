@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 // use image::imageops::FilterType;
-use jixel::{ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
+use jixel::{CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
 use std::num::NonZero;
 use std::path::Path;
 use std::thread::available_parallelism;
@@ -10,13 +10,13 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Burning_Ship_Fractal.png")).unwrap();
+    let image = image::open(Path::new("./assets/inadra.png")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 1.64;
-    for _ in 0..5 {
+    let distance = 2.0;
+    for _ in 0..3 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,
@@ -29,8 +29,8 @@ fn main() {
                 .with_lossless(false)
                 .with_distance(distance)
                 .with_progressive(false)
-                .with_patches(true)
-                .with_speed(Speed::Slow)
+                .with_patches(false)
+                .with_speed(Speed::Medium)
                 .with_num_threads(
                     available_parallelism()
                         .unwrap_or(NonZero::new(1).unwrap())
@@ -51,6 +51,7 @@ fn main() {
         .with_decoding_speed(DecodingSpeed::Slow)
         .with_patches(true)
         .with_color_encoding(ColorEncoding::srgb())
+        .with_coding_transform(CodingTransform::Rgb)
         .with_num_threads(
             available_parallelism()
                 .unwrap_or(NonZero::new(1).unwrap())

@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use crate::Speed;
 use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
@@ -292,7 +293,8 @@ fn cfl_deadzone(distance: f32) -> f32 {
     CFL_DEADZONE_SCALE * (CFL_DEADZONE_HI - distance)
 }
 
-fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) -> i32 {
+/// `units` converts the kernels' 1/84 slope steps to the frame's.
+fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32, units: f32) -> i32 {
     if num == 0 {
         return 0;
     }
@@ -304,7 +306,29 @@ fn solve_multiplier(ca: f32, cb: f32, num: usize, distance_mul: f32, dz: f32) ->
     if x.abs() < dz {
         x = 0.0;
     }
-    x.round().clamp(-128.0, 127.0) as i32
+    (x * units).round().clamp(-128.0, 127.0) as i32
+}
+
+/// The regressions measure X slopes around a base correlation of 0 and B
+/// slopes around 1. Under other bases, shift the planes by the difference so
+/// the same slope lands on the same signaled multiplier.
+#[inline]
+fn shift_to_xyb_bases(
+    ctx: &EncodingContext,
+    block_y: &[f32; 64],
+    block_x: &mut [f32; 64],
+    block_b: &mut [f32; 64],
+) {
+    for (block, shift) in [
+        (block_x, -ctx.cfl_base_x()),
+        (block_b, 1.0 - ctx.cfl_base_b()),
+    ] {
+        if shift != 0.0 {
+            for (v, &y) in block.iter_mut().zip(block_y) {
+                *v = fmla(shift, y, *v);
+            }
+        }
+    }
 }
 
 struct CflScratch {
@@ -366,6 +390,7 @@ fn compute_cmap_tile(
             block_y[0] = 0.0;
             block_x[0] = 0.0;
             block_b[0] = 0.0;
+            shift_to_xyb_bases(ctx, &block_y, &mut block_x, &mut block_b);
 
             let sums = (ctx.cfl_regression)(&block_y, &block_x, &block_b, qm_x, qm_b);
             ca_x += sums[0];
@@ -377,8 +402,9 @@ fn compute_cmap_tile(
     }
 
     let dz = cfl_deadzone(distance);
-    let ytox = solve_multiplier(ca_x, cb_x, num, K_DISTANCE_MULTIPLIER_AC, dz);
-    let ytob = solve_multiplier(ca_b, cb_b, num, K_DISTANCE_MULTIPLIER_AC, dz);
+    let units = ctx.cfl_frame().color_factor / K_COLOR_FACTOR;
+    let ytox = solve_multiplier(ca_x, cb_x, num, K_DISTANCE_MULTIPLIER_AC, dz, units);
+    let ytob = solve_multiplier(ca_b, cb_b, num, K_DISTANCE_MULTIPLIER_AC, dz, units);
     (ytox, ytob)
 }
 
@@ -471,6 +497,7 @@ fn optimize_channel_rdo(
     dc_avg: f32,
     dc_thr: f32,
     tile_q: f32,
+    color_factor: f32,
 ) -> i32 {
     if m.is_empty() {
         return if pred.abs() <= 4 { pred } else { 0 };
@@ -486,7 +513,7 @@ fn optimize_channel_rdo(
 
     // Analytical least-squares seed: argmin_f sum (s - f*m)^2.
     let target_factor = if dot_mm > 1e-6 { dot_ms / dot_mm } else { base };
-    let target_cand = ((target_factor - base) * K_COLOR_FACTOR)
+    let target_cand = ((target_factor - base) * color_factor)
         .round()
         .clamp(-128.0, 127.0) as i32;
 
@@ -539,7 +566,7 @@ fn optimize_channel_rdo(
     });
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
-        let factor = fmla(cand as f32, K_INV_COLOR_FACTOR, base);
+        let factor = fmla(cand as f32, 1.0 / color_factor, base);
         let (distortion, coeff_bits) = if closed_loop {
             // Closed-loop error is the primary term. A small residual-energy
             // term and coefficient-rate proxy retain CfL's compression goal
@@ -659,6 +686,7 @@ fn compute_cmap_tile_rdo(
                 &mut block_b,
             );
 
+            shift_to_xyb_bases(ctx, &block_y, &mut block_x, &mut block_b);
             dc_abs_x += block_x[0].abs();
             dc_abs_b += block_b[0].abs();
 
@@ -713,6 +741,7 @@ fn compute_cmap_tile_rdo(
         dc_avg_x,
         CFL_RDO.dc_thr_x,
         tile_q,
+        ctx.cfl_frame().color_factor,
     );
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
@@ -728,6 +757,7 @@ fn compute_cmap_tile_rdo(
         dc_avg_b,
         CFL_RDO.dc_thr_b,
         tile_q,
+        ctx.cfl_frame().color_factor,
     );
     (ytox, ytob)
 }
@@ -761,7 +791,11 @@ pub(crate) fn fill_cmap(
     // Coarse chroma structure still benefits from searching the
     // quantized residual cost. Dropping to regression at d=3 erases yellow detail
     // on the very frames for which we retain extra X/B precision.
-    let use_rdo = (distance < CFL_RDO.max_d || ctx.x_heavy()) && ctx.speed.effort().cfl_rdo;
+    // YCbCr chroma follows luma with large, content-dependent slopes, which
+    // the regression's deadzone misses; it searches them at Fast too.
+    let ycbcr = ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed != Speed::Fastest;
+    let use_rdo =
+        (distance < CFL_RDO.max_d || ctx.x_heavy()) && (ctx.speed.effort().cfl_rdo || ycbcr);
 
     for ty in 0..ytiles {
         for tx in 0..xtiles {
@@ -827,18 +861,40 @@ pub(crate) fn fill_cmap(
 
 /// Returns the per-tile factor as a slope (= base_correlation + cmap/84).
 #[inline]
-pub(crate) fn y_to_x_ratio(cmap_x: i8) -> f32 {
-    // base_correlation_x = 0
-    cmap_x as f32 * K_INV_COLOR_FACTOR
+pub(crate) fn y_to_x_ratio(cfl: CflFrame, cmap_x: i8) -> f32 {
+    fmla(cmap_x as f32, cfl.inv_factor(), cfl.base_x)
 }
 
 #[inline]
-pub(crate) fn y_to_b_ratio(cmap_b: i8) -> f32 {
-    // base_correlation_b = 1
-    fmla(cmap_b as f32, K_INV_COLOR_FACTOR, 1.0)
+pub(crate) fn y_to_b_ratio(cfl: CflFrame, cmap_b: i8) -> f32 {
+    fmla(cmap_b as f32, cfl.inv_factor(), cfl.base_b)
 }
 
 pub(crate) const K_COLOR_FACTOR: f32 = 84.0;
+
+/// A frame's chroma-from-luma parameters: the base correlations every tile
+/// and the DC offset, and the `color_factor` whose reciprocal is one signaled
+/// step of the per-tile maps and `ytob_dc`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CflFrame {
+    pub(crate) base_x: f32,
+    pub(crate) base_b: f32,
+    pub(crate) color_factor: f32,
+}
+
+impl CflFrame {
+    /// The XYB defaults, which the all-default header bundle implies.
+    pub(crate) const XYB: Self = Self {
+        base_x: 0.0,
+        base_b: 1.0,
+        color_factor: K_COLOR_FACTOR,
+    };
+
+    #[inline]
+    pub(crate) fn inv_factor(self) -> f32 {
+        1.0 / self.color_factor
+    }
+}
 const YTOB_DC_LIMIT: i32 = 127;
 const COLOR_CORRELATION_HEADER_BITS: f64 = 2.0 + 16.0 + 16.0 + 8.0 + 8.0;
 
@@ -1077,12 +1133,14 @@ pub(crate) fn choose_ytob_dc(
     fill_residuals: FillYtobResidualsFn,
     rb_scratch: &mut Vec<i32>,
     ry_scratch: &mut Vec<i32>,
+    dc_step: [f32; 3],
+    color_factor: f32,
 ) -> i32 {
     // One signaled step moves the stored B DC by this much per stored Y unit:
     // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
     // stored in different units, hence the same `DC_QUANT[1] / DC_QUANT[2]`
     // ratio `enc_group` applies for the `base_correlation_b` term.
-    let step = (INV_DC_QUANT[2] * DC_QUANT[1]) / K_COLOR_FACTOR;
+    let step = (INV_DC_QUANT[2] / dc_step[2] * (DC_QUANT[1] * dc_step[1])) / color_factor;
 
     // L1 fit: weighted median of the per-sample ratio, bucketed straight into
     // signaled-slope units so no sort is needed.
@@ -1163,10 +1221,17 @@ pub(crate) fn choose_ytob_dc(
 /// signaled `ytob_dc / 84`, converted from dequantized XYB into stored-B-DC
 /// units under the frame's DC steps.
 #[inline]
-pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32) -> f32 {
+pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32, cfl: CflFrame) -> f32 {
     INV_DC_QUANT[2] / dc_step[2]
         * (DC_QUANT[1] * dc_step[1])
-        * (1.0 + ytob_dc as f32 / K_COLOR_FACTOR)
+        * (cfl.base_b + ytob_dc as f32 / cfl.color_factor)
+}
+
+/// The X DC's share of the stored Y DC: `base_correlation_x` (`ytox_dc` is
+/// never signaled), in stored-X-DC units under the frame's DC steps.
+#[inline]
+pub(crate) fn dc_cfl_factor_x(dc_step: [f32; 3], base_x: f32) -> f32 {
+    INV_DC_QUANT[0] / dc_step[0] * (DC_QUANT[1] * dc_step[1]) * base_x
 }
 
 /// DC step candidates per channel: the default and finer ones a percent
@@ -1198,8 +1263,14 @@ pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
 /// the DC plane carries the flicker: more bits, and visible noise on flat
 /// ground. A slightly finer step moves the levels under the value. Textured
 /// images have no such value and keep the default, which costs no header.
-pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: i32) -> [f32; 3] {
-    let default = [1.0f32; 3];
+pub(crate) fn choose_dc_steps(
+    dc_datas: &[DcGroupData],
+    scale_dc: f32,
+    ytob_dc: i32,
+    base_step: [f32; 3],
+    cfl: CflFrame,
+) -> [f32; 3] {
+    let default = base_step;
     if dc_datas
         .iter()
         .any(|dc| dc.source_dc_y.is_none() || dc.source_dc_b.is_none())
@@ -1230,7 +1301,7 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         .sum();
     // Y levels under `step_y`, and their rate.
     let quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
-        let factor_y = INV_DC_QUANT[1] / step_y * scale_dc;
+        let factor_y = INV_DC_QUANT[1] / (base_step[1] * step_y) * scale_dc;
         let (mut hist, mut extra) = ([0u64; 64], 0u64);
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_y.as_ref().unwrap();
@@ -1262,8 +1333,12 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
     let mut previous = vec![0i32; max_width];
     let mut current = vec![0i32; max_width];
     let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
-        let factor_b = INV_DC_QUANT[2] / step_b * scale_dc;
-        let cfl = dc_cfl_factor([1.0, step_y, step_b], ytob_dc);
+        let factor_b = INV_DC_QUANT[2] / (base_step[2] * step_b) * scale_dc;
+        let cfl = dc_cfl_factor(
+            [base_step[0], base_step[1] * step_y, base_step[2] * step_b],
+            ytob_dc,
+            cfl,
+        );
         let (mut hist, mut extra) = ([0u64; 64], 0u64);
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_b.as_ref().unwrap();
@@ -1287,7 +1362,12 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         .iter()
         .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
         .collect();
-    let steps_of = |channel: usize| candidates.map(|step| signaled_dc_step(channel, step));
+    // Multipliers of the base step, rounded through the wire like the
+    // signaled steps they become.
+    let steps_of = |channel: usize| {
+        candidates
+            .map(|step| signaled_dc_step(channel, base_step[channel] * step) / base_step[channel])
+    };
     let (steps_y, steps_b) = (steps_of(1), steps_of(2));
     let mut costs = [[None; DC_STEP_CANDIDATES]; DC_STEP_CANDIDATES];
     let mut current_y = None;
@@ -1327,7 +1407,11 @@ pub(crate) fn choose_dc_steps(dc_datas: &[DcGroupData], scale_dc: f32, ytob_dc: 
         }
     }
     if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base < base {
-        [1.0, steps_y[step_y], steps_b[step_b]]
+        [
+            base_step[0],
+            base_step[1] * steps_y[step_y],
+            base_step[2] * steps_b[step_b],
+        ]
     } else {
         default
     }
@@ -1340,6 +1424,8 @@ pub(crate) fn validate_ytob_dc(
     dc_datas: &[DcGroupData],
     candidate: i32,
     scale_dc: f32,
+    dc_step: [f32; 3],
+    cfl_frame: CflFrame,
     quantize: crate::group::QuantizeDcCflFn,
 ) -> i32 {
     if candidate == 0 {
@@ -1349,7 +1435,7 @@ pub(crate) fn validate_ytob_dc(
         let mut hist = [0u64; 64];
         let mut extra = 0u64;
         let mut total = 0u64;
-        let cfl = INV_DC_QUANT[2] * DC_QUANT[1] * (1.0 + k as f32 / K_COLOR_FACTOR);
+        let cfl = dc_cfl_factor(dc_step, k, cfl_frame);
         for dc in dc_datas {
             let Some(source) = &dc.source_dc_b else {
                 return f64::INFINITY;
@@ -1363,7 +1449,7 @@ pub(crate) fn validate_ytob_dc(
                 quantize(
                     source.row(y),
                     yr,
-                    INV_DC_QUANT[2] * scale_dc,
+                    INV_DC_QUANT[2] / dc_step[2] * scale_dc,
                     cfl,
                     &mut current,
                 );
@@ -1724,6 +1810,7 @@ mod tests {
                 0.0,
                 0.1,
                 1.0,
+                K_COLOR_FACTOR,
             ),
             3
         );
@@ -1742,6 +1829,7 @@ mod tests {
                 0.0,
                 0.1,
                 1.0,
+                K_COLOR_FACTOR,
             ),
             0
         );
@@ -1800,7 +1888,7 @@ mod tests {
             |_, _| 0.0,
             |x, y| (40.5 + 0.2 * flicker(x, y)) / INV_DC_QUANT[2],
         );
-        let steps = choose_dc_steps(&[flat], 1.0, 0);
+        let steps = choose_dc_steps(&[flat], 1.0, 0, [1.0; 3], CflFrame::XYB);
         assert_eq!(steps[0], 1.0);
         assert!(steps[2] < 1.0, "{steps:?}");
         // The chosen step is what the decoder reads back.
@@ -1829,11 +1917,17 @@ mod tests {
             |x, y| luma(x, y) / INV_DC_QUANT[1],
             |x, y| blue(x, y) / INV_DC_QUANT[2],
         );
-        assert_eq!(choose_dc_steps(&[textured], 1.0, 0), [1.0; 3]);
+        assert_eq!(
+            choose_dc_steps(&[textured], 1.0, 0, [1.0; 3], CflFrame::XYB),
+            [1.0; 3]
+        );
         assert!(dc_step_wire([1.0; 3]).is_none());
         // Without the first pass's sources there is nothing to choose from.
         let bare = DcGroupData::new(48, 48).unwrap();
-        assert_eq!(choose_dc_steps(&[bare], 1.0, 0), [1.0; 3]);
+        assert_eq!(
+            choose_dc_steps(&[bare], 1.0, 0, [1.0; 3], CflFrame::XYB),
+            [1.0; 3]
+        );
     }
 
     #[test]
@@ -1877,10 +1971,19 @@ mod tests {
             ctx.fill_ytob_residuals,
             &mut Vec::new(),
             &mut Vec::new(),
+            [1.0; 3],
+            K_COLOR_FACTOR,
         );
         assert_ne!(chosen, 0, "the integer proxy must propose a change");
         assert_eq!(
-            validate_ytob_dc(&groups, chosen, 1.0, ctx.quantize_dc_cfl),
+            validate_ytob_dc(
+                &groups,
+                chosen,
+                1.0,
+                [1.0; 3],
+                CflFrame::XYB,
+                ctx.quantize_dc_cfl
+            ),
             0
         );
     }
@@ -1899,7 +2002,10 @@ mod tests {
                 }
             }
             dc.source_dc_b = Some(source);
-            assert_eq!(validate_ytob_dc(&[dc], k, 1.0, ctx.quantize_dc_cfl), k);
+            assert_eq!(
+                validate_ytob_dc(&[dc], k, 1.0, [1.0; 3], CflFrame::XYB, ctx.quantize_dc_cfl),
+                k
+            );
         }
     }
 
@@ -1920,6 +2026,8 @@ mod tests {
                     selected_fill_ytob_residuals_fn(),
                     &mut s0,
                     &mut s1,
+                    [1.0; 3],
+                    K_COLOR_FACTOR
                 ),
                 k,
                 "planted ytob_dc {k}"
@@ -1943,6 +2051,8 @@ mod tests {
                 selected_fill_ytob_residuals_fn(),
                 &mut s0,
                 &mut s1,
+                [1.0; 3],
+                K_COLOR_FACTOR
             ),
             0
         );
@@ -1963,6 +2073,8 @@ mod tests {
                 selected_fill_ytob_residuals_fn(),
                 &mut s0,
                 &mut s1,
+                [1.0; 3],
+                K_COLOR_FACTOR,
             );
             assert!((-YTOB_DC_LIMIT..=YTOB_DC_LIMIT).contains(&k), "ytob_dc {k}");
             assert!((0..=255).contains(&(k + 128)));

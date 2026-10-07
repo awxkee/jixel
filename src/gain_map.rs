@@ -340,6 +340,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         lossy_modular: base.lossy_modular,
         learned_rate: base.learned_rate,
         gain_map: None,
+        coding_transform: crate::CodingTransform::Xyb,
     };
 
     let (w, h) = (gm.width, gm.height);

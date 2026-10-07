@@ -1464,3 +1464,396 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     writer.zero_pad_to_byte();
     true
 }
+
+// ============ Lossy extra channel inside a VarDCT frame (squeeze) ============
+
+/// Group sizes of the VarDCT frames this channel rides in.
+const VARDCT_GROUP_DIM: usize = 256;
+const VARDCT_LF_GROUP_DIM: usize = 2048;
+
+/// One extra channel squeezed and quantized like the lossy-modular arm's luma
+/// row, coded in the modular streams of a VarDCT frame. The frame's global
+/// tree belongs to the VarDCT DC, so every section carries a local tree: one
+/// leaf per channel, its quantization step as the residual multiplier.
+pub(crate) struct ExtraSqueeze {
+    channels: Vec<crate::squeeze::Channel>,
+    quants: Vec<u32>,
+    steps: Vec<crate::squeeze::SqueezeStep>,
+    /// Channels before `split` live in the global stream.
+    split: usize,
+    min_symbol: u32,
+    /// Learn a context tree per stream (decoder MA-tree walk) instead of the
+    /// fixed one-Gradient-leaf-per-channel tree.
+    learned_trees: bool,
+}
+
+impl ExtraSqueeze {
+    /// `distance` is in luma-quantizer units; `max` is the channel's largest
+    /// sample. None when the plane is too small to squeeze.
+    pub(crate) fn new(
+        plane: &AlphaPlane,
+        xsize: usize,
+        ysize: usize,
+        distance: f32,
+        learned_trees: bool,
+    ) -> Option<Self> {
+        use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
+        let steps = default_squeeze_steps(xsize, ysize, 1);
+        if steps.is_empty() {
+            return None;
+        }
+        let max = match plane {
+            AlphaPlane::U8(_) => 255.0f32,
+            AlphaPlane::U16 { bits, .. } => ((1u32 << *bits) - 1) as f32,
+            AlphaPlane::F32(_) => return None,
+        };
+        let data: Vec<i32> = (0..xsize * ysize).map(|i| plane.get_i32(i)).collect();
+        let mut channels = vec![Channel {
+            data,
+            w: xsize,
+            h: ysize,
+            hshift: 0,
+            vshift: 0,
+        }];
+        for s in &steps {
+            apply_step_forward(&mut channels, s);
+        }
+        // The arm's luma schedule is in units of 1/4096 of the sample range.
+        let unit = max / LOSSY_MODULAR_XYB_SCALE[1];
+        let quants: Vec<u32> = channels
+            .iter_mut()
+            .map(|ch| {
+                let mut shift = (ch.hshift + ch.vshift).min(16);
+                if shift > 0 {
+                    shift -= 1;
+                }
+                let q = 0.25
+                    * distance
+                    * SQUEEZE_QUALITY_FACTOR_XYB
+                    * SQUEEZE_XYB_QTABLE[0][shift as usize]
+                    * unit;
+                let q = (q as i32).max(1);
+                quantize_channel_divide(ch, q);
+                q as u32
+            })
+            .collect();
+        let split = channels
+            .iter()
+            .position(|c| c.w > VARDCT_GROUP_DIM || c.h > VARDCT_GROUP_DIM)
+            .unwrap_or(channels.len());
+        let max_abs = channels
+            .iter()
+            .flat_map(|ch| ch.data.iter())
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
+        let min_symbol = if value_bits <= 13 {
+            LZ77_MIN_SYMBOL
+        } else {
+            4 * value_bits + 24
+        };
+        Some(Self {
+            channels,
+            quants,
+            steps,
+            split,
+            min_symbol,
+            learned_trees,
+        })
+    }
+
+    /// The GlobalModular image: its header (with the squeeze transform) and
+    /// the channels that fit one group.
+    pub(crate) fn write_global(&self, scratch: &mut CoderScratch, w: &mut BitWriter) {
+        let crops: Vec<(usize, usize, usize, usize, usize)> = (0..self.split)
+            .map(|c| (c, 0, 0, self.channels[c].w, self.channels[c].h))
+            .collect();
+        w.write(1, 0); // use_global_tree = 0
+        w.write(1, 1); // wp_header all_default
+        write_modular_transforms_squeeze_only(&self.steps, w);
+        self.write_crops(&crops, scratch, w);
+    }
+
+    /// The channels of LF group (`gx`, `gy`): minimum shift 3 and up.
+    pub(crate) fn write_lf_group(
+        &self,
+        gx: usize,
+        gy: usize,
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        self.write_group(VARDCT_LF_GROUP_DIM, gx, gy, 3, 1000, scratch, w);
+    }
+
+    /// The channels of AC group (`gx`, `gy`): minimum shift 0..=2.
+    pub(crate) fn write_ac_group(
+        &self,
+        gx: usize,
+        gy: usize,
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        self.write_group(VARDCT_GROUP_DIM, gx, gy, 0, 2, scratch, w);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_group(
+        &self,
+        gdim: usize,
+        gx: usize,
+        gy: usize,
+        minsh: i32,
+        maxsh: i32,
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        let mut crops = Vec::new();
+        for_each_squeeze_group_crop(
+            &self.channels,
+            self.split,
+            gdim,
+            gx,
+            gy,
+            minsh,
+            maxsh,
+            |_within, c, rx0, ry0, rw, rh| crops.push((c, rx0, ry0, rw, rh)),
+        );
+        // A group with no channel in its shift range reads nothing.
+        if crops.is_empty() {
+            return;
+        }
+        w.write(1, 0); // use_global_tree = 0
+        w.write(1, 1); // wp_header all_default
+        w.write(2, 0); // no transforms
+        self.write_crops(&crops, scratch, w);
+    }
+
+    /// Local tree + entropy code + tokens of one stream's channel crops: the
+    /// fixed tree, or with learned trees whichever of the two is smaller.
+    fn write_crops(
+        &self,
+        crops: &[(usize, usize, usize, usize, usize)],
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        if crops.is_empty() {
+            return;
+        }
+        let mut fixed = BitWriter::new();
+        self.write_crops_fixed(crops, scratch, &mut fixed);
+        if self.learned_trees {
+            let mut learned = BitWriter::new();
+            self.write_crops_learned(crops, scratch, &mut learned);
+            if learned.bits_written() < fixed.bits_written() {
+                w.append(&learned);
+                return;
+            }
+        }
+        w.append(&fixed);
+    }
+
+    /// One learned subtree per channel slot, chained on property 0 with the
+    /// slot's step stamped on its leaves (same scheme as the lossy-modular
+    /// arm, restricted to scale-equivariant predictors).
+    fn write_crops_learned(
+        &self,
+        crops: &[(usize, usize, usize, usize, usize)],
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        let pool = ThreadPool::new(1);
+        let n = crops.len();
+        let mut trees: Vec<LearnedTree> = Vec::with_capacity(n);
+        for (slot, &(c, rx0, ry0, rw, rh)) in crops.iter().enumerate() {
+            let ch = &self.channels[c];
+            let (data, stride) = (&ch.data, ch.w);
+            let px = rw * rh;
+            let mut step = px.div_ceil(LM_SAMPLE_TARGET).max(1);
+            if step > 1 && step.is_multiple_of(2) {
+                step += 1;
+            }
+            let mut samples = MaSamples::with_capacity(px / step + 1);
+            sample_channel_ma(
+                |y| &data[(ry0 + y) * stride + rx0..][..rw],
+                rw,
+                rh,
+                slot as u32,
+                0,
+                &[],
+                WpParams::DEFAULT,
+                false,
+                step,
+                |props, tok| samples.push(props, tok),
+            );
+            scale_ma_value_props(&mut samples, self.quants[c] as i32);
+            let params = |max_leaves: usize| MaLearnParams {
+                alphabet: self.min_symbol as usize,
+                max_leaves,
+                split_cost_bits: MA_SPLIT_COST_BITS / step as f32,
+                min_node: MA_MIN_NODE_SAMPLES,
+                allow_wp: false,
+                allowed_preds: LM_SAFE_PRED_MASK,
+                side_preds: 1,
+                max_candidates: MA_PHOTO_CANDIDATES,
+            };
+            let budget = (px / LM_BUDGET_DIV).clamp(1, LM_BUDGET_CAP);
+            let tree = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
+                learn_ma_tree(&samples, params(1), &pool, scratch)
+            } else {
+                let tree = learn_ma_tree(&samples, params(budget), &pool, scratch);
+                let leaves = tree.nodes.len().div_ceil(2);
+                let overhead = tree.nodes.len() as f64 * 10.0 + leaves as f64 * 200.0;
+                if tree.est_bits * step as f64 + overhead < tree.flat_bits * step as f64 {
+                    tree
+                } else {
+                    learn_ma_tree(&samples, params(1), &pool, scratch)
+                }
+            };
+            trees.push(tree);
+        }
+        let mults: Vec<u32> = crops.iter().map(|&(c, ..)| self.quants[c]).collect();
+        let (tree_tokens, leaf_ctx, bases, num_ctx) = emit_slot_forest(&trees, &mults);
+        let mut tokens: Vec<Token> = Vec::new();
+        for (slot, &(c, rx0, ry0, rw, rh)) in crops.iter().enumerate() {
+            let ch = &self.channels[c];
+            let (data, stride) = (&ch.data, ch.w);
+            tokenize_channel_ma_mult(
+                |y| &data[(ry0 + y) * stride + rx0..][..rw],
+                rw,
+                rh,
+                slot as u32,
+                self.quants[c] as i32,
+                &trees[slot],
+                &leaf_ctx,
+                bases[slot],
+                &mut tokens,
+            );
+        }
+        let lz = lz77_literals(&tokens);
+        let code = build_lz_pixel_code_opts(
+            std::iter::once(lz.as_slice()),
+            num_ctx as usize,
+            self.min_symbol,
+            true,
+            true,
+            &mut scratch.lz_entropy,
+            &mut scratch.huffman_pool,
+        );
+        write_tree_lz77(
+            &tree_tokens,
+            &code,
+            self.min_symbol,
+            &mut scratch.huffman_pool,
+            w,
+        );
+        write_lz_section(&lz, num_ctx, &code, self.min_symbol, w);
+    }
+
+    fn write_crops_fixed(
+        &self,
+        crops: &[(usize, usize, usize, usize, usize)],
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
+        let n = crops.len();
+        let grad_pack_fn = selected_grad_pack_interior_fn();
+        let mut tokens: Vec<Token> = Vec::new();
+        for (slot, &(c, rx0, ry0, rw, rh)) in crops.iter().enumerate() {
+            let ch = &self.channels[c];
+            let data = &ch.data;
+            let stride = ch.w;
+            tokenize_plane_rows(
+                channel_to_context(slot, n),
+                |y| &data[(ry0 + y) * stride + rx0..][..rw],
+                rw,
+                rh,
+                PREDICTOR_GRADIENT,
+                grad_pack_fn,
+                &mut scratch.gradient,
+                &mut tokens,
+            );
+        }
+        let lz = lz77_literals(&tokens);
+        let code = build_lz_pixel_code(
+            std::iter::once(lz.as_slice()),
+            n,
+            self.min_symbol,
+            true,
+            &mut scratch.lz_entropy,
+            &mut scratch.huffman_pool,
+        );
+        let leaves: Vec<(u32, u32)> = crops
+            .iter()
+            .map(|&(c, ..)| (PREDICTOR_GRADIENT, self.quants[c]))
+            .collect();
+        write_tree_lz77(
+            &build_balanced_tree_tokens_mul(&leaves),
+            &code,
+            self.min_symbol,
+            &mut scratch.huffman_pool,
+            w,
+        );
+        write_lz_section(&lz, n as u32, &code, self.min_symbol, w);
+    }
+}
+
+/// Chain per-slot learned subtrees on property 0 (the within-stream channel
+/// index) and BFS-emit them, each leaf carrying its slot's multiplier.
+/// Returns the tree tokens, the arena-indexed leaf contexts, each slot's
+/// arena base and the context count.
+fn emit_slot_forest(trees: &[LearnedTree], mults: &[u32]) -> (Vec<Token>, Vec<u32>, Vec<u32>, u32) {
+    use std::collections::VecDeque;
+    let mut nodes: Vec<MaNode> = Vec::new();
+    let mut mult_of: Vec<u32> = Vec::new();
+    let mut bases = vec![0u32; trees.len()];
+    let mut root = 0u32;
+    for (slot, tree) in trees.iter().enumerate() {
+        let base = nodes.len() as u32;
+        bases[slot] = base;
+        for n in &tree.nodes {
+            nodes.push(match *n {
+                MaNode::Split { prop, val, gt, le } => MaNode::Split {
+                    prop,
+                    val,
+                    gt: gt + base,
+                    le: le + base,
+                },
+                MaNode::Leaf { pred } => MaNode::Leaf { pred },
+            });
+            mult_of.push(mults[slot]);
+        }
+        if slot == 0 {
+            root = base;
+        } else {
+            nodes.push(MaNode::Split {
+                prop: 0,
+                val: (slot - 1) as i32,
+                gt: base,
+                le: root,
+            });
+            mult_of.push(1);
+            root = (nodes.len() - 1) as u32;
+        }
+    }
+    let mut tokens = Vec::new();
+    let mut leaf_ctx = vec![u32::MAX; nodes.len()];
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(root);
+    let mut ctx = 0u32;
+    while let Some(i) = queue.pop_front() {
+        match nodes[i as usize] {
+            MaNode::Split { prop, val, gt, le } => {
+                push_split(&mut tokens, prop as u32, val);
+                queue.push_back(gt);
+                queue.push_back(le);
+            }
+            MaNode::Leaf { pred } => {
+                push_leaf_mul(&mut tokens, pred, mult_of[i as usize]);
+                leaf_ctx[i as usize] = ctx;
+                ctx += 1;
+            }
+        }
+    }
+    (tokens, leaf_ctx, bases, ctx)
+}

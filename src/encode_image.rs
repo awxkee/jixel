@@ -28,6 +28,7 @@
  */
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
+use crate::coding::CodingTransform;
 use crate::color::{
     ColorTransform, FloatTransferDecoder, RgbBlockTransform, TransferDecoder, TransferLut,
 };
@@ -45,7 +46,7 @@ use std::num::NonZero;
 use std::sync::Arc;
 use std::thread::available_parallelism;
 
-fn checked_buffer_size<T>(
+pub(crate) fn checked_buffer_size<T>(
     width: usize,
     height: usize,
     channels: usize,
@@ -90,7 +91,7 @@ pub(crate) enum AlphaPlane {
 const CODESTREAM_MARKER: u8 = 0x0A;
 
 /// Practical lower bound for lossy encoding; lossless bypasses this clamp.
-const MIN_DISTANCE: f32 = 0.05;
+pub(crate) const MIN_DISTANCE: f32 = 0.05;
 
 /// JXL's image dimension field encodes (size - 1) in either 9, 13, 18, or
 /// 30 bits, so 2^30 is the largest representable dimension.
@@ -366,6 +367,8 @@ pub struct EncodeConfig {
     /// container box together with its ISO 21496-1 metadata. Forces the
     /// output into the JXL container form.
     pub gain_map: Option<GainMap>,
+    /// Color transform of lossy VarDCT frames (see [`CodingTransform`]).
+    pub coding_transform: CodingTransform,
 }
 
 /// Which arm the **lossy** encoder uses. Besides VarDCT, jixel carries a lossy
@@ -396,6 +399,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) brotli_compression: Option<Arc<dyn BrotliCompression>>,
     pub(crate) orientation: Orientation,
     pub(crate) alpha: Option<AlphaPlane>,
+    /// The `alpha` plane is the K channel of a CMYK image (kBlack).
+    pub(crate) black: bool,
     /// Bit depth declared in the codestream (default: 8).
     pub(crate) bits_per_sample: BitsPerSample,
     /// If true, encode losslessly via the modular encoder. `distance` is then
@@ -461,6 +466,7 @@ impl Default for EncodeConfig {
             lossy_modular: LossyModular::Off,
             learned_rate: true,
             gain_map: None,
+            coding_transform: CodingTransform::Xyb,
         }
     }
 }
@@ -476,6 +482,7 @@ impl Default for EncodeConfigImpl {
             brotli_compression: None,
             orientation: Orientation::Normal,
             alpha: None,
+            black: false,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
             progressive: false,
@@ -546,6 +553,12 @@ impl EncodeConfigImpl {
     /// Length must equal `xsize * ysize` of the image passed to encode.
     pub(crate) fn with_alpha(mut self, alpha: AlphaPlane) -> Self {
         self.alpha = Some(alpha);
+        self
+    }
+
+    /// Declare the extra plane as the K channel of a CMYK image.
+    pub(crate) fn with_black(mut self, black: bool) -> Self {
+        self.black = black;
         self
     }
 
@@ -759,6 +772,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Code lossy frames in `transform` (see [`CodingTransform`]).
+    pub fn with_coding_transform(mut self, transform: CodingTransform) -> Self {
+        self.coding_transform = transform;
+        self
+    }
+
     /// Select the lossy encoding arm (see [`LossyModular`]).
     pub fn with_lossy_modular(mut self, mode: LossyModular) -> Self {
         self.lossy_modular = mode;
@@ -825,7 +844,7 @@ pub fn distance_from_quality(quality: f32) -> f32 {
 /// after linearization and before any XYB conversion; the non-spec matrix is
 /// signaled via the explicit CustomTransformData bundle in `write_headers`.
 fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32) {
-    if !ctx.speed.effort().yellow_opsin {
+    if !ctx.speed.effort().yellow_opsin || !ctx.coding.is_xyb() {
         return;
     }
     let selection = crate::yellow_opsin::select_yellow(linear, distance);
@@ -838,7 +857,7 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     ctx.raise_b_qm_scale(selection.b_qm_scale);
 }
 
-fn lossy_context(
+pub(crate) fn lossy_context(
     config: &EncodeConfig,
     distance: f32,
     xyb: XybMatrix,
@@ -855,7 +874,7 @@ fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
-    ctx.selector.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
+    ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
@@ -1007,6 +1026,7 @@ pub fn encode_image(
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
     let mut ctx = ctx;
+    ctx.set_coding(config.coding_transform, distance);
     apply_yellow_opsin(&mut ctx, &linear, distance);
     let cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
@@ -1019,7 +1039,17 @@ pub fn encode_image(
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
         .with_num_threads(config.num_threads);
-    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+    encode_samples_lossy(
+        Samples::U8 {
+            data: input,
+            stride: 3,
+        },
+        false,
+        &linear,
+        &cfg,
+        &ctx,
+        &mut scratch,
+    )
 }
 
 /// Encode interleaved 8-bit RGBA samples. Lossy RGB samples use
@@ -1081,6 +1111,7 @@ pub fn encode_image_with_alpha(
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
     let mut ctx = ctx;
+    ctx.set_coding(config.coding_transform, distance);
     apply_yellow_opsin(&mut ctx, &linear, distance);
     let alpha_plane = input.as_chunks::<4>().0.iter().map(|px| px[3]).collect();
     let cfg = EncodeConfigImpl::with_distance(distance)
@@ -1095,7 +1126,17 @@ pub fn encode_image_with_alpha(
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
         .with_num_threads(config.num_threads);
-    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+    encode_samples_lossy(
+        Samples::U8 {
+            data: input,
+            stride: 4,
+        },
+        false,
+        &linear,
+        &cfg,
+        &ctx,
+        &mut scratch,
+    )
 }
 
 pub fn encode_image_with_alpha_10bit(
@@ -1246,7 +1287,8 @@ fn encode_gray_impl(
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let decoder = TransferLut::new(8, config.color_encoding.transfer);
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
     let mut cfg = EncodeConfigImpl::with_distance(distance)
@@ -1264,7 +1306,17 @@ fn encode_gray_impl(
     if let Some(a) = alpha {
         cfg = cfg.with_alpha(AlphaPlane::from_u8(a));
     }
-    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+    encode_samples_lossy(
+        Samples::U8 {
+            data: luma,
+            stride: 1,
+        },
+        true,
+        &linear,
+        &cfg,
+        &ctx,
+        &mut scratch,
+    )
 }
 
 /// Encode a 10-bit grayscale image. `input` is `width * height` luma samples (0..=1023).
@@ -1462,7 +1514,8 @@ fn encode_gray_high_depth_impl(
 
     let distance = config.distance.max(MIN_DISTANCE);
     let decoder = TransferLut::new(bps.bits(), config.color_encoding.transfer);
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
 
@@ -1492,7 +1545,18 @@ fn encode_gray_high_depth_impl(
     if let Some(ap) = alpha_plane {
         cfg = cfg.with_alpha(ap);
     }
-    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+    encode_samples_lossy(
+        Samples::U16 {
+            data: luma,
+            stride: 1,
+            max: ((1u32 << bps.bits()) - 1) as u16,
+        },
+        true,
+        &linear,
+        &cfg,
+        &ctx,
+        &mut scratch,
+    )
 }
 
 /// Shared implementation for 10-bit and 12-bit RGBA encoding.
@@ -1555,6 +1619,7 @@ fn encode_high_depth_rgba(
     if has_alpha {
         let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
+        ctx.set_coding(config.coding_transform, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
             .as_chunks::<4>()
@@ -1583,10 +1648,22 @@ fn encode_high_depth_rgba(
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
             .with_num_threads(config.num_threads);
-        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+        encode_samples_lossy(
+            Samples::U16 {
+                data: input,
+                stride: 4,
+                max: bp_max,
+            },
+            false,
+            &linear,
+            &cfg,
+            &ctx,
+            &mut scratch,
+        )
     } else {
         let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
+        ctx.set_coding(config.coding_transform, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
@@ -1600,7 +1677,18 @@ fn encode_high_depth_rgba(
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
             .with_num_threads(config.num_threads);
-        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+        encode_samples_lossy(
+            Samples::U16 {
+                data: input,
+                stride: 3,
+                max: bp_max,
+            },
+            false,
+            &linear,
+            &cfg,
+            &ctx,
+            &mut scratch,
+        )
     }
 }
 
@@ -1669,15 +1757,19 @@ fn encode_f32_lossless_rgba(
     {
         let mut metadata_scratch = Box::new(CoderScratch::lossless());
         write_image_metadata(
-            config.tone_mapping(),
-            &config.color_encoding,
-            alpha.as_ref(),
-            config.icc_profile.as_deref(),
-            BitsPerSample::F32,
-            true,
-            &XybMatrix::SPEC,
-            false,
-            config.orientation,
+            &ImageMetadataParams {
+                tone_mapping: config.tone_mapping(),
+                color_encoding: &config.color_encoding,
+                alpha: alpha.as_ref(),
+                black: false,
+                icc_profile: config.icc_profile.as_deref(),
+                bps: BitsPerSample::F32,
+                lossless: true,
+                xyb_encoded: false,
+                xyb: &XybMatrix::SPEC,
+                grayscale: false,
+                orientation: config.orientation,
+            },
             &mut metadata_scratch,
             &mut w,
         );
@@ -1726,6 +1818,7 @@ fn encode_float_rgba(
     if has_alpha {
         let linear = linearize_rgb::<_, _, 4>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
+        ctx.set_coding(config.coding_transform, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let alpha_plane = input
             .as_chunks::<4>()
@@ -1746,10 +1839,21 @@ fn encode_float_rgba(
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
             .with_num_threads(config.num_threads);
-        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+        encode_samples_lossy(
+            Samples::F32 {
+                data: input,
+                stride: 4,
+            },
+            false,
+            &linear,
+            &cfg,
+            &ctx,
+            &mut scratch,
+        )
     } else {
         let linear = linearize_rgb::<_, _, 3>(input, width, height, &ctx, &mut scratch, &transform);
         let mut ctx = ctx;
+        ctx.set_coding(config.coding_transform, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
         let cfg = EncodeConfigImpl::with_distance(distance)
             .with_progressive_from(config)
@@ -1763,7 +1867,17 @@ fn encode_float_rgba(
             .with_color_encoding(config.color_encoding)
             .with_intensity_target(config.intensity_target)
             .with_num_threads(config.num_threads);
-        encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+        encode_samples_lossy(
+            Samples::F32 {
+                data: input,
+                stride: 3,
+            },
+            false,
+            &linear,
+            &cfg,
+            &ctx,
+            &mut scratch,
+        )
     }
 }
 
@@ -1784,7 +1898,8 @@ fn encode_float_gray(
         });
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
     let decoder = FloatTransferDecoder::new(config.color_encoding.transfer);
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
@@ -1801,7 +1916,17 @@ fn encode_float_gray(
         .with_color_encoding(config.color_encoding)
         .with_intensity_target(config.intensity_target)
         .with_num_threads(config.num_threads);
-    encode_with_context(&linear, &cfg, &ctx, &mut scratch)
+    encode_samples_lossy(
+        Samples::F32 {
+            data: luma,
+            stride: 1,
+        },
+        true,
+        &linear,
+        &cfg,
+        &ctx,
+        &mut scratch,
+    )
 }
 
 /// Encode a 32-bit float RGB image (lossy). `input` is interleaved `[R, G, B]`,
@@ -1878,7 +2003,7 @@ pub fn encode_image_gray_f16(
 /// 0..=3, non-increasing); otherwise it is ignored and we fall back to a count:
 /// `passes` (clamped 1..=4) or the `progressive` bool, yielding the
 /// coarse-to-fine schedule `[n-1, .., 1, 0]`.
-fn progressive_schedule(
+pub(crate) fn progressive_schedule(
     progressive: bool,
     passes: Option<u32>,
     shifts: Option<&[u32]>,
@@ -1899,8 +2024,79 @@ fn progressive_schedule(
     (0..n).rev().map(|p| p as u32).collect()
 }
 
+/// Integer or float samples of one lossy entry point, as the frame codes
+/// them under a non-XYB transform.
+enum Samples<'a> {
+    /// Interleaved integer channels (`stride` per pixel), at most `max`.
+    U8 { data: &'a [u8], stride: usize },
+    U16 {
+        data: &'a [u16],
+        stride: usize,
+        max: u16,
+    },
+    /// Interleaved float channels, coded as given.
+    F32 { data: &'a [f32], stride: usize },
+}
+
+impl Samples<'_> {
+    /// Channel `c` of pixel `px` in nominal [0, 1] units.
+    #[inline]
+    fn get(&self, px: usize, c: usize) -> f32 {
+        match *self {
+            Samples::U8 { data, stride } => f32::from(data[px * stride + c]) * (1.0 / 255.0),
+            Samples::U16 { data, stride, max } => {
+                f32::from(data[px * stride + c].min(max)) / f32::from(max)
+            }
+            Samples::F32 { data, stride } => data[px * stride + c],
+        }
+    }
+}
+
+/// Lossy encode from the input samples. Non-XYB transforms code them as given,
+/// in the image's declared color space (gray as three equal channels); `linear`
+/// then only steers adaptive quantization.
+fn encode_samples_lossy(
+    samples: Samples<'_>,
+    gray: bool,
+    linear: &Image3F,
+    config: &EncodeConfigImpl,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+) -> Result<Vec<u8>, EncodeError> {
+    if ctx.coding.is_xyb() {
+        return encode_with_context(linear, config, ctx, scratch);
+    }
+    let (width, height) = (linear.xsize(), linear.ysize());
+    let mut coded = Image3F::try_new(width, height)?;
+    for y in 0..height {
+        let [p0, p1, p2] = coded.all_plane_rows_mut(y);
+        for x in 0..width {
+            let px = y * width + x;
+            let [r, g, b] = if gray {
+                [samples.get(px, 0); 3]
+            } else {
+                [samples.get(px, 0), samples.get(px, 1), samples.get(px, 2)]
+            };
+            [p0[x], p1[x], p2[x]] = ctx.coding.code(r, g, b);
+        }
+    }
+    encode_with_coded_planes(linear, Some(&coded), config, ctx, scratch)
+}
+
 fn encode_with_context(
     input: &Image3F,
+    config: &EncodeConfigImpl,
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_with_coded_planes(input, None, config, ctx, scratch)
+}
+
+/// `coded` carries the planes of a non-XYB frame when they are not the
+/// sRGB rendition of `input`, which then only steers adaptive quantization.
+pub(crate) fn encode_with_coded_planes(
+    input: &Image3F,
+    coded: Option<&Image3F>,
     config: &EncodeConfigImpl,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1943,15 +2139,19 @@ fn encode_with_context(
         config.progressive_shifts.as_deref(),
     );
     write_image_metadata(
-        config.tone_mapping(),
-        &config.color_encoding,
-        config.alpha.as_ref(),
-        config.icc_profile.as_deref(),
-        config.bits_per_sample,
-        config.lossless,
-        &ctx.xyb,
-        config.grayscale,
-        config.orientation,
+        &ImageMetadataParams {
+            tone_mapping: config.tone_mapping(),
+            color_encoding: &config.color_encoding,
+            alpha: config.alpha.as_ref(),
+            black: config.black,
+            icc_profile: config.icc_profile.as_deref(),
+            bps: config.bits_per_sample,
+            lossless: config.lossless,
+            xyb_encoded: !config.lossless && ctx.coding.is_xyb(),
+            xyb: &ctx.xyb,
+            grayscale: config.grayscale,
+            orientation: config.orientation,
+        },
         scratch,
         &mut w,
     );
@@ -1960,6 +2160,7 @@ fn encode_with_context(
         scratch,
         distance,
         input,
+        coded,
         config.grayscale,
         config.alpha.as_ref(),
         &coeff_shifts,
@@ -1973,7 +2174,7 @@ fn encode_with_context(
         config.exif.as_deref(),
         config.xmp.as_deref(),
         config.brotli_compression.as_deref(),
-        needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits),
+        needs_level_10(config.bits_per_sample.bits(), config.lossless, alpha_bits) || config.black,
         config.gain_map.as_ref(),
     )
 }
@@ -1998,7 +2199,7 @@ impl AsSignedInt for u16 {
 }
 
 /// Encode a linear-light RGB `Image3F` with the supplied configuration.
-fn encode_with_config_loseless<T: AsSignedInt + Copy>(
+pub(crate) fn encode_with_config_loseless<T: AsSignedInt + Copy>(
     input: &[T],
     width: usize,
     height: usize,
@@ -2125,15 +2326,19 @@ fn encode_lossless_planes(
     {
         let mut metadata_scratch = Box::new(CoderScratch::lossless());
         write_image_metadata(
-            config.tone_mapping(),
-            &config.color_encoding,
-            alpha_plane.as_ref(),
-            config.icc_profile.as_deref(),
-            config.bits_per_sample,
-            config.lossless,
-            &XybMatrix::SPEC,
-            config.grayscale,
-            config.orientation,
+            &ImageMetadataParams {
+                tone_mapping: config.tone_mapping(),
+                color_encoding: &config.color_encoding,
+                alpha: alpha_plane.as_ref(),
+                black: config.black,
+                icc_profile: config.icc_profile.as_deref(),
+                bps: config.bits_per_sample,
+                lossless: config.lossless,
+                xyb_encoded: !config.lossless,
+                xyb: &XybMatrix::SPEC,
+                grayscale: config.grayscale,
+                orientation: config.orientation,
+            },
             &mut metadata_scratch,
             &mut w,
         );
@@ -2160,7 +2365,7 @@ fn encode_lossless_planes(
         config.exif.as_deref(),
         config.xmp.as_deref(),
         config.brotli_compression.as_deref(),
-        needs_level_10(max_bp as u32, true, alpha_bits),
+        needs_level_10(max_bp as u32, true, alpha_bits) || config.black,
         config.gain_map.as_ref(),
     )
 }
@@ -2343,19 +2548,42 @@ fn write_float_bit_depth(bits: u32, exp_bits: u32, w: &mut BitWriter) {
     w.write(4, (exp_bits - 1) as u64);
 }
 
-fn write_image_metadata(
-    tm: ToneMappingParams,
-    color_encoding: &ColorEncoding,
-    alpha: Option<&AlphaPlane>,
-    icc_profile: Option<&[u8]>,
+/// The image-level fields `write_image_metadata` serializes.
+#[derive(Clone, Copy)]
+struct ImageMetadataParams<'a> {
+    tone_mapping: ToneMappingParams,
+    color_encoding: &'a ColorEncoding,
+    /// The single extra channel: alpha, or K when `black`.
+    alpha: Option<&'a AlphaPlane>,
+    black: bool,
+    icc_profile: Option<&'a [u8]>,
     bps: BitsPerSample,
     lossless: bool,
-    xyb: &XybMatrix,
+    xyb_encoded: bool,
+    /// Opsin matrix of an XYB codestream; a non-default one is signaled.
+    xyb: &'a XybMatrix,
     grayscale: bool,
     orientation: Orientation,
+}
+
+fn write_image_metadata(
+    params: &ImageMetadataParams<'_>,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
+    let ImageMetadataParams {
+        tone_mapping: tm,
+        color_encoding,
+        alpha,
+        black,
+        icc_profile,
+        bps,
+        lossless,
+        xyb_encoded,
+        xyb,
+        grayscale,
+        orientation,
+    } = *params;
     w.write(1, 0); // all_default = false
     // tone_mapping (HDR luminance) is gated by extra_fields; a non-identity
     // orientation also lives in the extra_fields block, so either forces it on.
@@ -2392,6 +2620,16 @@ fn write_image_metadata(
         // u8 makes the decoder compute opacity = stored/1023 ≈ 0.25 for fully-
         // opaque pixels.
         match alpha.bits() {
+            bits if black => {
+                // kBlack: no all-default form (that one is 8-bit alpha) and
+                // no type-specific fields.
+                w.write(1, 0); // all_default = false
+                w.write(2, 2); // ec_type: BitsOffset(4, 2) selector
+                w.write(4, 4 - 2); // ec_type = Black (4)
+                write_int_bit_depth(bits as u32, w);
+                w.write(2, 0); // dim_shift = 0
+                w.write(2, 0); // name length = 0
+            }
             8 => {
                 w.write(1, 1); // all_default = true → U8 alpha
             }
@@ -2412,9 +2650,9 @@ fn write_image_metadata(
         w.write(2, 0); // num_extra_channels = 0
     }
 
-    // For lossy VarDCT we use XYB (=1). For lossless modular, the codestream
-    // carries un-transformed pixel values (xyb_encoded = 0).
-    w.write(1, if lossless { 0 } else { 1 }); // xyb_encoded
+    // Lossy frames are XYB unless a non-XYB coding transform was chosen;
+    // lossless modular carries un-transformed pixel values.
+    w.write(1, u64::from(xyb_encoded)); // xyb_encoded
     let want_icc = icc_profile.is_some();
     write_color_encoding_with_icc(color_encoding, want_icc, grayscale, w);
     // tone_mapping bundle (gated by extra_fields). ToneMapping fields:
@@ -2432,7 +2670,7 @@ fn write_image_metadata(
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).
-    if lossless || xyb.is_decoder_default() {
+    if !xyb_encoded || xyb.is_decoder_default() {
         w.write(1, 1); // CustomTransformData.all_default = 1
     } else {
         // A non-spec forward opsin matrix needs its matching inverse in the

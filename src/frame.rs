@@ -795,6 +795,8 @@ fn write_frame_header_kind(
     kind: VarDctFrameKind<'_>,
     has_splines: bool,
     skip_dc_smoothing: bool,
+    coding: crate::coding::CodingTransform,
+    epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -809,6 +811,8 @@ fn write_frame_header_kind(
             false,
             has_splines,
             skip_dc_smoothing,
+            coding,
+            epf_channel_scale,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -822,9 +826,12 @@ fn write_frame_header_kind(
             true,
             has_splines,
             skip_dc_smoothing,
+            coding,
+            epf_channel_scale,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
+            debug_assert!(coding.is_xyb(), "patch atlases are XYB-only");
             w.write(1, 0); // not all default
             w.write(2, 0b10); // reference-only frame
             w.write(1, 0); // VarDCT
@@ -842,7 +849,7 @@ fn write_frame_header_kind(
             w.write(2, PATCH_REF_ID as u64);
             w.write(1, 1); // save_before_color_transform
             w.write(2, 0); // empty name
-            write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, w);
+            write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, None, w);
             w.write(2, 0); // no frame-header extensions
         }
     }
@@ -852,9 +859,10 @@ fn write_loop_filter(
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
     gab_enabled: bool,
+    epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
 ) {
-    if epf_iters == 2 && gab_enabled {
+    if epf_iters == 2 && gab_enabled && epf_channel_scale.is_none() {
         w.write(1, 1); // default loop filter (gab=1, epf=2)
     } else {
         w.write(1, 0); // not default
@@ -867,7 +875,16 @@ fn write_loop_filter(
         w.write(2, epf_iters as u64);
         if epf_iters > 0 {
             w.write(1, 0); // default epf sharpness
-            w.write(1, 0); // default epf weights
+            match epf_channel_scale {
+                None => w.write(1, 0), // default epf weights
+                Some(scale) => {
+                    w.write(1, 1); // custom epf weights
+                    // Channel scales, then the spec pass-1/2 zero-flush levels.
+                    for v in [scale[0], scale[1], scale[2], 0.45, 0.6] {
+                        w.write(16, u64::from(crate::util::f32_to_f16_bits(v)));
+                    }
+                }
+            }
             // epf_sigma_custom: [quant_mul, pass0_scale, pass2_scale,
             // border_sad_mul], spec defaults 0.46, 0.9, 6.5, 2/3. Only the
             // pass-0 scale is scheduled; the rest stay at spec.
@@ -896,6 +913,8 @@ fn write_frame_header(
     has_patches: bool,
     has_splines: bool,
     skip_dc_smoothing: bool,
+    coding: crate::coding::CodingTransform,
+    epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
@@ -917,6 +936,15 @@ fn write_frame_header(
             w.write(8, flags - 17);
         }
     }
+    if !coding.is_xyb() {
+        let ycbcr = coding == crate::coding::CodingTransform::YCbCr;
+        w.write(1, u64::from(ycbcr)); // do_YCbCr
+        if ycbcr {
+            for _ in 0..3 {
+                w.write(2, 0); // chroma subsampling 4:4:4
+            }
+        }
+    }
     w.write(2, 0); // no upsampling
 
     // Per-extra-channel upsampling. Same u2S(1,2,4,8) code, default 1:
@@ -925,8 +953,11 @@ fn write_frame_header(
         w.write(2, 0); // ec_upsampling[0] = 1
     }
 
-    w.write(3, x_qm_scale as u64);
-    w.write(3, b_qm_scale as u64); // b_qm_scale
+    // The quant scales are only serialized for XYB frames.
+    if coding.is_xyb() {
+        w.write(3, x_qm_scale as u64);
+        w.write(3, b_qm_scale as u64); // b_qm_scale
+    }
     // Passes bundle (jxl-frame header.rs:127-132):
     //   num_passes: U32(1,2,3,4+u(3))   default 1
     //   if num_passes != 1:
@@ -975,7 +1006,13 @@ fn write_frame_header(
 
     w.write(1, 1); // last frame
     w.write(2, 0); // no name
-    write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, w);
+    write_loop_filter(
+        epf_iters,
+        epf_pass0_scale,
+        gab_enabled,
+        epf_channel_scale,
+        w,
+    );
     w.write(2, 0); // no frame header extensions
 }
 
@@ -1072,6 +1109,9 @@ fn write_dc_global(
     xsize: usize,
     ysize: usize,
     ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
+    extra_step: u32,
+    extra_squeeze: Option<&crate::lossless::ExtraSqueeze>,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -1090,8 +1130,8 @@ fn write_dc_global(
     // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
     // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
     {
-        let factor = crate::color_correlation::K_COLOR_FACTOR as u32;
-        if factor == 84 && ytob_dc == 0 {
+        let factor = cfl.color_factor as u32;
+        if ytob_dc == 0 && cfl == crate::color_correlation::CflFrame::XYB {
             w.write(1, 1); // all_default
         } else {
             w.write(1, 0); // not all-default
@@ -1102,8 +1142,9 @@ fn write_dc_global(
                 w.write(2, 2);
                 w.write(8, (factor - 2) as u64);
             }
-            w.write(16, 0); // base_correlation_x = 0.0
-            w.write(16, 0x3C00); // base_correlation_b = 1.0 (kYToBRatio)
+            for base in [cfl.base_x, cfl.base_b] {
+                w.write(16, u64::from(crate::util::f32_to_f16_bits(base)));
+            }
             w.write(8, 128); // ytox_dc = 0, offset by 128
             w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
         }
@@ -1128,18 +1169,38 @@ fn write_dc_global(
 
     // FullModularImage::read happens HERE in the decoder. If we declared an alpha
     // extra channel, write its GroupHeader + local tree + pixel data now.
-    if let Some(alpha_plane) = alpha {
-        crate::modular::write_global_alpha_modular(alpha_plane, xsize, ysize, scratch, w);
+    if let Some(squeezed) = extra_squeeze {
+        squeezed.write_global(scratch, w);
+    } else if let Some(alpha_plane) = alpha {
+        crate::modular::write_global_alpha_modular(
+            alpha_plane,
+            xsize,
+            ysize,
+            extra_step,
+            scratch,
+            w,
+        );
     }
 }
 
-/// Slots whose transform actually appears in the frame.
-fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
-    let mut used = [false; 9];
+/// Slots whose transform actually appears in the frame: the nine
+/// `quant_table_slot_of` slots, then DCT2X2, DCT4X4 and AFV.
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 12] {
+    use crate::dc_group_data::{
+        STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT2X2,
+        STRATEGY_DCT4X4,
+    };
+    let mut used = [false; 12];
     for dc in dc_datas {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
                 used[slot] = true;
+            }
+            match strategy {
+                STRATEGY_DCT2X2 => used[9] = true,
+                STRATEGY_DCT4X4 => used[10] = true,
+                STRATEGY_AFV0 | STRATEGY_AFV1 | STRATEGY_AFV2 | STRATEGY_AFV3 => used[11] = true,
+                _ => {}
             }
         }
     }
@@ -1148,7 +1209,7 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 9] {
 
 fn write_dequant_matrices(
     matrices: &crate::quant_weights::DequantMatrices,
-    used: &[bool; 9],
+    used: &[bool; 12],
     w: &mut BitWriter,
 ) {
     use crate::util::f32_to_f16_bits;
@@ -1159,11 +1220,35 @@ fn write_dequant_matrices(
             .flatten()
     };
     let identity = used[8].then_some(matrices.identity_weights).flatten();
-    if (0..8).all(|slot| table(slot).is_none()) && identity.is_none() {
+    let fine = matrices.fine_tables.as_deref();
+    let dct2 = fine.filter(|_| used[9]).map(|f| f.dct2);
+    let dct4x4 = fine.filter(|_| used[10]).map(|f| f.dct4x4);
+    let afv = fine.filter(|_| used[11]).map(|f| f.afv);
+    if (0..8).all(|slot| table(slot).is_none())
+        && identity.is_none()
+        && dct2.is_none()
+        && dct4x4.is_none()
+        && afv.is_none()
+    {
         w.write(1, 1); // all_default
         return;
     }
+    let write_dct_params = |bands: &[[f32; 16]; 3], num_bands: usize, w: &mut BitWriter| {
+        w.write(4, num_bands as u64 - 1);
+        for row in bands {
+            for (i, &v) in row[..num_bands].iter().enumerate() {
+                let wire = if i == 0 { v / 64.0 } else { v };
+                w.write(16, u64::from(f32_to_f16_bits(wire)));
+            }
+        }
+    };
+    let pad4 = |rows: &[[f32; 4]; 3]| -> [[f32; 16]; 3] {
+        std::array::from_fn(|c| std::array::from_fn(|i| if i < 4 { rows[c][i] } else { 0.0 }))
+    };
     const K_QUANT_MODE_ID: u64 = 1;
+    const K_QUANT_MODE_DCT2: u64 = 2;
+    const K_QUANT_MODE_DCT4: u64 = 3;
+    const K_QUANT_MODE_AFV: u64 = 5;
     const K_NUM_QUANT_TABLES: usize = 17;
     const K_QUANT_MODE_LIBRARY: u64 = 0;
     // `kQuantModeDCT4X8` carries three F16 `dct4x8multipliers` ahead of the
@@ -1197,6 +1282,50 @@ fn write_dequant_matrices(
             }
             continue;
         }
+        if idx == 2
+            && let Some(dw) = dct2
+        {
+            w.write(3, K_QUANT_MODE_DCT2);
+            for row in &dw {
+                for &v in row {
+                    w.write(16, u64::from(f32_to_f16_bits(v / 64.0)));
+                }
+            }
+            continue;
+        }
+        if idx == 3
+            && let Some(b4) = dct4x4
+        {
+            w.write(3, K_QUANT_MODE_DCT4);
+            for _ in 0..3 {
+                w.write(16, 0x3C00); // dct4multipliers[c][0] = 1.0
+                w.write(16, 0x3C00); // dct4multipliers[c][1] = 1.0
+            }
+            write_dct_params(&pad4(&b4), 4, w);
+            continue;
+        }
+        if idx == 10
+            && let Some(aw) = afv
+        {
+            // AFV carries its own 4x8 and 4x4 parameters; the 4x8 ones are
+            // the frame's DCT4X8 table, the 4x4 ones its DCT4X4 table.
+            let o4x8 = matrices.custom_tables[5]
+                .as_ref()
+                .expect("custom AFV tables come with a custom DCT4X8 table");
+            let b4 = fine
+                .expect("custom AFV tables come with the fine tables")
+                .dct4x4;
+            w.write(3, K_QUANT_MODE_AFV);
+            for row in &aw {
+                for (i, &v) in row.iter().enumerate() {
+                    let wire = if i < 6 { v / 64.0 } else { v };
+                    w.write(16, u64::from(f32_to_f16_bits(wire)));
+                }
+            }
+            write_dct_params(&o4x8.bands, 4, w);
+            write_dct_params(&pad4(&b4), 4, w);
+            continue;
+        }
         match bands {
             None => w.write(3, K_QUANT_MODE_LIBRARY),
             Some(o) => {
@@ -1222,7 +1351,7 @@ fn write_dequant_matrices(
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
-    used_quant_tables: &[bool; 9],
+    used_quant_tables: &[bool; 12],
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
@@ -1305,6 +1434,7 @@ pub(crate) fn encode_frame(
     scratch: &mut CoderScratch,
     distance: f32,
     linear: &Image3F,
+    coded: Option<&Image3F>,
     is_achromatic: bool,
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
@@ -1312,6 +1442,29 @@ pub(crate) fn encode_frame(
     writer: &mut BitWriter,
 ) -> Result<(), EncodeError> {
     let distp = compute_distance_params(distance);
+    if !ctx.coding.is_xyb() {
+        // Non-XYB planes skip every XYB content heuristic: they read as
+        // achromatic to the classifiers, and patches and the lossy-modular
+        // arm quantize on the XYB lattice.
+        let coded = coded
+            .expect("non-XYB frames carry their coded planes")
+            .clone();
+        let _ = ctx.aq_source.set(to_xyb_image(ctx, scratch, linear));
+        ctx.set_plain_matrices(&coded);
+        ctx.set_cfl_frame(crate::coding::fit_cfl_frame(ctx.coding, &coded));
+        return encode_frame_vardct(
+            ctx,
+            scratch,
+            distance,
+            &distp,
+            coded,
+            true,
+            alpha,
+            coeff_shifts,
+            false,
+            writer,
+        );
+    }
     let mut xyb = to_xyb_image(ctx, scratch, linear);
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
@@ -2643,6 +2796,27 @@ fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
     }
 }
 
+/// Largest stored DC level kept clear of the `i16` limit, with room for the
+/// chroma-from-luma terms and the finer DC-step candidates.
+const DC_LEVEL_LIMIT: f32 = 16_000.0;
+
+/// Non-XYB planes hold the image's own samples, which float input may take far
+/// past [0, 1]. Coarsen a plane's DC step only as far as its stored levels
+/// need to stay representable.
+fn dc_steps_in_range(base: [f32; 3], scale_dc: f32, coded: &Image3F) -> [f32; 3] {
+    let peak = (0..3)
+        .flat_map(|c| coded.plane_data(c).iter())
+        .fold(0.0f32, |m, &v| m.max(v.abs()));
+    std::array::from_fn(|c| {
+        let level = peak * crate::quant_weights::INV_DC_QUANT[c] * scale_dc / base[c];
+        if level > DC_LEVEL_LIMIT {
+            base[c] * level / DC_LEVEL_LIMIT
+        } else {
+            base[c]
+        }
+    })
+}
+
 /// Returns DC-group and AC-section bits, excluding the global headers, so
 /// sampled payload can be scaled separately from the frame's fixed costs.
 #[allow(clippy::too_many_arguments)]
@@ -2660,15 +2834,33 @@ fn encode_frame_core(
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
     let mut distp = compute_distance_params(distance);
-    if ctx.x_heavy() && distp.x_qm_scale == 2 {
-        distp.x_qm_scale = 3;
+    if ctx.coding.is_xyb() {
+        if ctx.x_heavy() && distp.x_qm_scale == 2 {
+            distp.x_qm_scale = 3;
+        }
+        distp.x_qm_scale = distp.x_qm_scale.max(ctx.x_qm_scale_floor());
+    } else {
+        // Not serialized: the decoder's X multiplier is 1.
+        distp.x_qm_scale = 2;
+        distp.dc_step = dc_steps_in_range(ctx.coding.dc_step_base(), distp.scale_dc, &opsin);
     }
-    distp.x_qm_scale = distp.x_qm_scale.max(ctx.x_qm_scale_floor());
 
     // Progressive lossy splits each quantized AC coeff across `num_passes`
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
     // C = sum_p (sent_p << shift_p) (jxl-vardct hf_coeff.rs:185,191).
     let num_passes = coeff_shifts.len();
+    let extra_squeeze = alpha
+        .filter(|_| ctx.extra_squeeze_distance > 0.0)
+        .and_then(|plane| {
+            crate::lossless::ExtraSqueeze::new(
+                plane,
+                dim.xsize,
+                dim.ysize,
+                ctx.extra_squeeze_distance,
+                ctx.extra_learned_trees,
+            )
+        });
+    let extra_squeeze = extra_squeeze.as_ref();
 
     let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
@@ -2817,15 +3009,24 @@ fn encode_frame_core(
             ctx.fill_ytob_residuals,
             &mut scratch.dc_cfl_cur,
             &mut scratch.dc_cfl_prev,
+            distp.dc_step,
+            ctx.cfl_frame().color_factor,
         );
         ytob_dc = crate::color_correlation::validate_ytob_dc(
             &dc_datas,
             ytob_dc,
             distp.scale_dc,
+            distp.dc_step,
+            ctx.cfl_frame(),
             ctx.quantize_dc_cfl,
         );
-        distp.dc_step =
-            crate::color_correlation::choose_dc_steps(&dc_datas, distp.scale_dc, ytob_dc);
+        distp.dc_step = crate::color_correlation::choose_dc_steps(
+            &dc_datas,
+            distp.scale_dc,
+            ytob_dc,
+            distp.dc_step,
+            ctx.cfl_frame(),
+        );
         for dc in &mut dc_datas {
             dc.source_dc_b = None;
             dc.source_dc_y = None;
@@ -2924,6 +3125,7 @@ fn encode_frame_core(
         &group_coords,
         &distp,
         ytob_dc,
+        ctx.cfl_frame(),
     )?;
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
@@ -3399,6 +3601,9 @@ fn encode_frame_core(
         dim.xsize,
         dim.ysize,
         ytob_dc,
+        ctx.cfl_frame(),
+        ctx.extra_step,
+        extra_squeeze,
         scratch,
         &mut sections[0],
     );
@@ -3407,7 +3612,7 @@ fn encode_frame_core(
     // streams in parallel, then place their writers back in raster order.
     let dc_sections = ctx
         .thread_pool
-        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
+        .steal_map(scratch, dc_datas.len(), |i, scratch| {
             let dc_data = &dc_datas[i];
             let mut w = BitWriter::new();
             w.write(2, 0); // extra_dc_precision
@@ -3425,6 +3630,11 @@ fn encode_frame_core(
                     dc_code.hybrid_uint_configs,
                     &mut w,
                 );
+            }
+            // ModularLfGroup: the extra channel's coarse squeeze levels.
+            if let Some(squeezed) = extra_squeeze {
+                let (gx, gy) = group_coords[i];
+                squeezed.write_lf_group(gx, gy, scratch, &mut w);
             }
             let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
             let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
@@ -3519,6 +3729,10 @@ fn encode_frame_core(
                     let ac_group_idx =
                         2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id;
                     let mut w = BitWriter::new();
+                    if let Some(squeezed) = extra_squeeze {
+                        squeezed.write_ac_group(image_gx, image_gy, scratch, &mut w);
+                        return (ac_group_idx, w);
+                    }
                     crate::modular::write_ac_group_alpha(
                         alpha_plane,
                         dim.xsize,
@@ -3527,6 +3741,7 @@ fn encode_frame_core(
                         group_y0,
                         group_xsize,
                         group_ysize,
+                        ctx.extra_step,
                         scratch,
                         &mut w,
                     );
@@ -3552,6 +3767,8 @@ fn encode_frame_core(
         frame_kind,
         has_splines,
         skip_dc_smoothing,
+        ctx.coding,
+        ctx.epf_channel_scale,
         writer,
     );
     let payload_bits = sections
@@ -3601,7 +3818,7 @@ fn setup_dc_group(
 
     (ctx.fill_quant_field)(
         &mut scratch.aq_map,
-        opsin,
+        ctx.aq_source.get().unwrap_or(opsin),
         &mut dc_data.raw_quant_field,
         dc_group_x0,
         dc_group_y0,
