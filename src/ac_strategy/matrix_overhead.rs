@@ -134,7 +134,7 @@ pub(crate) fn account_matrix_headers(
                 let px = gx * crate::frame::K_DC_GROUP_DIM + x * 8;
                 let py = gy * crate::frame::K_DC_GROUP_DIM + y * 8;
                 let qac = scale * data.raw_quant_field.row(y)[x] as f32;
-                let cmap = cmap_factors(ctx.cfl_bases(), &data.ytox_map, &data.ytob_map, x, y);
+                let cmap = cmap_factors(ctx.cfl_frame(), &data.ytox_map, &data.ytob_map, x, y);
                 let cost = if matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64)
                 {
                     strategy_cost64(

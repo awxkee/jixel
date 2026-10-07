@@ -49,7 +49,7 @@ pub(super) fn skip_dc_smoothing(
     group_coords: &[(usize, usize)],
     distp: &DistanceParams,
     ytob_dc: i32,
-    cfl_bases: [f32; 2],
+    cfl: crate::color_correlation::CflFrame,
 ) -> Result<bool, EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -60,8 +60,8 @@ pub(super) fn skip_dc_smoothing(
     let steps: [f32; 3] = std::array::from_fn(|c| {
         distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
     });
-    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl_bases[1]);
-    let cfl_x = crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl_bases[0]);
+    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl);
+    let cfl_x = crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl.base_x);
     let mut recon = Image3F::try_new(w, h)?;
     for (dc, &(gx, gy)) in dc_datas.iter().zip(group_coords) {
         let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);

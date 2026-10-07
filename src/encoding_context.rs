@@ -76,11 +76,15 @@ pub(crate) struct EncodingContext {
     pub(crate) coding: crate::coding::CodingTransform,
     /// Resolved EPF channel scales; `None` uses the spec XYB weights.
     pub(crate) epf_channel_scale: Option<[f32; 3]>,
-    /// Tables of non-XYB frames; `None` while coding XYB.
-    plain_matrices: Option<&'static DequantMatrices>,
-    /// The frame's `base_correlation_x` / `_b` (f32 bits): the coding
-    /// transform's defaults, or a per-image fit for non-XYB frames.
-    cfl_base: [std::sync::atomic::AtomicU32; 2],
+    /// Tables of the non-XYB frame, resolved from its coded planes; unset
+    /// while coding XYB.
+    plain_matrices: std::sync::OnceLock<&'static DequantMatrices>,
+    /// Distance the non-XYB tables are built for.
+    plain_distance: f32,
+    /// The frame's chroma-from-luma `base_correlation_x`, `_b` and
+    /// `color_factor` (f32 bits): the coding transform's defaults, or a
+    /// per-image fit for non-XYB frames.
+    cfl_frame: [std::sync::atomic::AtomicU32; 3],
     /// Lattice step of the extra channel (1 = lossless); the plane must be
     /// snapped with `modular::snap_to_lattice` first.
     pub(crate) extra_step: u32,
@@ -96,8 +100,9 @@ pub(crate) struct EncodingContext {
     channel_weights: [f32; 3],
     /// Transform-merge knobs resolved at this encodes distance.
     pub(crate) merge: ac_strategy::MergeTuning,
-    /// Which AC-strategy selector runs (study switch, see [`ac_strategy::SelectorPolicy`]).
-    pub(crate) selector: ac_strategy::SelectorPolicy,
+    /// Price AC-strategy candidates by the frame's own statistics (see
+    /// [`ac_strategy::RatePrices`]) instead of the fixed rate model.
+    pub(crate) learned_rate: bool,
     base_matrices: &'static DequantMatrices,
     /// Retain the HQ DCT8 table below its ordinary distance gate for sparse
     /// point content, where dropping it reverses chroma quality.
@@ -179,7 +184,12 @@ impl EncodingContext {
     #[inline]
     pub(crate) fn matrices(&self) -> &'static DequantMatrices {
         use std::sync::atomic::Ordering::Relaxed;
-        if let Some(plain) = self.plain_matrices {
+        let plain = self.plain_matrices.get();
+        debug_assert!(
+            plain.is_some() || self.coding.is_xyb(),
+            "non-XYB tables are resolved per frame"
+        );
+        if let Some(&plain) = plain {
             plain
         } else if self.x_heavy.load(Relaxed) {
             self.x_heavy_matrices
@@ -279,21 +289,20 @@ impl EncodingContext {
     /// so they share one luma-shaped table set and equal distortion weights.
     pub(crate) fn set_coding(&mut self, coding: crate::coding::CodingTransform, distance: f32) {
         self.coding = coding;
-        self.set_cfl_bases([coding.base_correlation_x(), coding.base_correlation_b()]);
+        self.set_cfl_frame(crate::color_correlation::CflFrame {
+            base_x: coding.base_correlation_x(),
+            base_b: coding.base_correlation_b(),
+            color_factor: crate::color_correlation::K_COLOR_FACTOR,
+        });
         // Reducing only B improves SSIMULACRA2, Butteraugli and CVVDP at Slow.
         // Other efforts retain the transform defaults.
         self.epf_channel_scale = match (coding, self.speed) {
             (crate::coding::CodingTransform::Rgb, Speed::Slow) => Some([5.0, 5.0, 2.5]),
             _ => coding.epf_channel_scale(),
         };
-        if coding.is_xyb() {
-            self.plain_matrices = None;
-        } else {
-            self.plain_matrices = Some(DequantMatrices::new_plain(
-                distance,
-                self.speed.effort().rectangles,
-                coding,
-            ));
+        self.plain_matrices = std::sync::OnceLock::new();
+        self.plain_distance = distance;
+        if !coding.is_xyb() {
             self.channel_weights = coding.channel_weights();
             // Splines and dots render on the XYB planes.
             #[cfg(feature = "splines")]
@@ -304,30 +313,52 @@ impl EncodingContext {
         }
     }
 
-    /// The frame's chroma-from-luma base correlations `[x, b]`.
+    /// Resolve the non-XYB frame's tables from its coded planes.
+    pub(crate) fn set_plain_matrices(&self, coded: &crate::image::Image3F) {
+        self.plain_matrices.get_or_init(|| {
+            DequantMatrices::new_plain(
+                self.plain_distance,
+                self.speed.effort().rectangles,
+                self.coding,
+                self.coding.plane_scale(coded),
+            )
+        });
+    }
+
+    /// The frame's chroma-from-luma parameters.
     #[inline]
-    pub(crate) fn cfl_bases(&self) -> [f32; 2] {
+    pub(crate) fn cfl_frame(&self) -> crate::color_correlation::CflFrame {
         use std::sync::atomic::Ordering::Relaxed;
-        self.cfl_base
+        let [x, b, f] = self
+            .cfl_frame
             .each_ref()
-            .map(|b| f32::from_bits(b.load(Relaxed)))
+            .map(|v| f32::from_bits(v.load(Relaxed)));
+        crate::color_correlation::CflFrame {
+            base_x: x,
+            base_b: b,
+            color_factor: f,
+        }
     }
 
     #[inline]
     pub(crate) fn cfl_base_x(&self) -> f32 {
-        self.cfl_bases()[0]
+        self.cfl_frame().base_x
     }
 
     #[inline]
     pub(crate) fn cfl_base_b(&self) -> f32 {
-        self.cfl_bases()[1]
+        self.cfl_frame().base_b
     }
 
-    /// Set the frame's base correlations; callers pass F16-exact values.
-    pub(crate) fn set_cfl_bases(&self, bases: [f32; 2]) {
+    /// Set the frame's parameters; bases must be F16-exact.
+    pub(crate) fn set_cfl_frame(&self, cfl: crate::color_correlation::CflFrame) {
         use std::sync::atomic::Ordering::Relaxed;
-        for (slot, base) in self.cfl_base.iter().zip(bases) {
-            slot.store(base.to_bits(), Relaxed);
+        for (slot, v) in self
+            .cfl_frame
+            .iter()
+            .zip([cfl.base_x, cfl.base_b, cfl.color_factor])
+        {
+            slot.store(v.to_bits(), Relaxed);
         }
     }
 
@@ -384,10 +415,12 @@ impl EncodingContext {
             xyb,
             coding: crate::coding::CodingTransform::Xyb,
             epf_channel_scale: None,
-            plain_matrices: None,
-            cfl_base: [
+            plain_matrices: std::sync::OnceLock::new(),
+            plain_distance: 0.0,
+            cfl_frame: [
                 std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
                 std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+                std::sync::atomic::AtomicU32::new(84.0f32.to_bits()),
             ],
             aq_source: std::sync::OnceLock::new(),
             extra_step: 1,
@@ -395,7 +428,7 @@ impl EncodingContext {
             extra_learned_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance),
-            selector: ac_strategy::SelectorPolicy::default(),
+            learned_rate: false,
             base_matrices,
             point_chroma_hq_matrices: (effort.chroma_policy
                 && distance < crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)

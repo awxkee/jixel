@@ -2088,14 +2088,16 @@ impl DequantMatrices {
 
     /// Tables of a non-XYB frame: every plane takes the luma row of the XYB
     /// tier at `distance`, its absolute weights scaled by
-    /// `coding.table_scale()`. The decoder's library tables are XYB rows, so
-    /// every table is signaled.
+    /// `coding.table_scale()` and the per-image `plane_scale`. The decoder's
+    /// library tables are XYB rows, so every table is signaled.
     pub(crate) fn new_plain(
         distance: f32,
         rectangles: bool,
         coding: crate::coding::CodingTransform,
+        plane_scale: [f32; 3],
     ) -> &'static Self {
-        type Cache = std::sync::Mutex<Vec<((u32, bool, u8), &'static DequantMatrices)>>;
+        type Key = (u32, bool, u8, [u32; 3]);
+        type Cache = std::sync::Mutex<Vec<(Key, &'static DequantMatrices)>>;
         static CACHE: Cache = std::sync::Mutex::new(Vec::new());
         let template = if rectangles {
             Self::new(distance)
@@ -2107,6 +2109,7 @@ impl DequantMatrices {
             (template as *const Self as usize & 0xffff_ffff) as u32,
             rectangles,
             coding as u8,
+            plane_scale.map(f32::to_bits),
         );
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(_, m)) = cache.iter().find(|(k, _)| *k == key) {
@@ -2114,7 +2117,7 @@ impl DequantMatrices {
         }
         let m: &'static Self = Box::leak(Box::new(Self::compute_plain(
             template,
-            coding.table_scale(),
+            std::array::from_fn(|c| coding.table_scale()[c] * plane_scale[c]),
             coding.table_hf_tilt(),
         )));
         cache.push((key, m));

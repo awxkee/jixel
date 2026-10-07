@@ -874,7 +874,7 @@ pub(crate) fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
-    ctx.selector.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
+    ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;

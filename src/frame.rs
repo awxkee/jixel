@@ -1109,7 +1109,7 @@ fn write_dc_global(
     xsize: usize,
     ysize: usize,
     ytob_dc: i32,
-    base_correlation: [f32; 2],
+    cfl: crate::color_correlation::CflFrame,
     extra_step: u32,
     extra_squeeze: Option<&crate::lossless::ExtraSqueeze>,
     scratch: &mut CoderScratch,
@@ -1130,8 +1130,8 @@ fn write_dc_global(
     // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
     // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
     {
-        let factor = crate::color_correlation::K_COLOR_FACTOR as u32;
-        if factor == 84 && ytob_dc == 0 && base_correlation == [0.0, 1.0] {
+        let factor = cfl.color_factor as u32;
+        if ytob_dc == 0 && cfl == crate::color_correlation::CflFrame::XYB {
             w.write(1, 1); // all_default
         } else {
             w.write(1, 0); // not all-default
@@ -1142,7 +1142,7 @@ fn write_dc_global(
                 w.write(2, 2);
                 w.write(8, (factor - 2) as u64);
             }
-            for base in base_correlation {
+            for base in [cfl.base_x, cfl.base_b] {
                 w.write(16, u64::from(crate::util::f32_to_f16_bits(base)));
             }
             w.write(8, 128); // ytox_dc = 0, offset by 128
@@ -1450,7 +1450,8 @@ pub(crate) fn encode_frame(
             .expect("non-XYB frames carry their coded planes")
             .clone();
         let _ = ctx.aq_source.set(to_xyb_image(ctx, scratch, linear));
-        ctx.set_cfl_bases(crate::coding::fit_cfl_bases(&coded));
+        ctx.set_plain_matrices(&coded);
+        ctx.set_cfl_frame(crate::coding::fit_cfl_frame(ctx.coding, &coded));
         return encode_frame_vardct(
             ctx,
             scratch,
@@ -3009,13 +3010,14 @@ fn encode_frame_core(
             &mut scratch.dc_cfl_cur,
             &mut scratch.dc_cfl_prev,
             distp.dc_step,
+            ctx.cfl_frame().color_factor,
         );
         ytob_dc = crate::color_correlation::validate_ytob_dc(
             &dc_datas,
             ytob_dc,
             distp.scale_dc,
             distp.dc_step,
-            ctx.cfl_base_b(),
+            ctx.cfl_frame(),
             ctx.quantize_dc_cfl,
         );
         distp.dc_step = crate::color_correlation::choose_dc_steps(
@@ -3023,7 +3025,7 @@ fn encode_frame_core(
             distp.scale_dc,
             ytob_dc,
             distp.dc_step,
-            ctx.cfl_base_b(),
+            ctx.cfl_frame(),
         );
         for dc in &mut dc_datas {
             dc.source_dc_b = None;
@@ -3123,7 +3125,7 @@ fn encode_frame_core(
         &group_coords,
         &distp,
         ytob_dc,
-        ctx.cfl_bases(),
+        ctx.cfl_frame(),
     )?;
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
@@ -3599,7 +3601,7 @@ fn encode_frame_core(
         dim.xsize,
         dim.ysize,
         ytob_dc,
-        [ctx.cfl_base_x(), ctx.cfl_base_b()],
+        ctx.cfl_frame(),
         ctx.extra_step,
         extra_squeeze,
         scratch,

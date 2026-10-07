@@ -634,7 +634,7 @@ impl RatePrices {
                 opsin,
                 origin.0 + bx * 8,
                 origin.1 + by * 8,
-                cmap_factors(ctx.cfl_bases(), cfl.0, cfl.1, bx, by),
+                cmap_factors(ctx.cfl_frame(), cfl.0, cfl.1, bx, by),
             );
             for (c, block) in block.chunks_exact_mut(size).enumerate() {
                 quantize_channel(

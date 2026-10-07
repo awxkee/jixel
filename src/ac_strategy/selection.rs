@@ -196,7 +196,7 @@ fn select_super_block(
     let (px0, py0) = (params.dc_group_px + bx0 * 8, params.dc_group_py + by0 * 8);
     let qac = input.qac;
     let cmap_factor = cmap_factors(
-        params.ctx.cfl_bases(),
+        params.ctx.cfl_frame(),
         params.ytox_map,
         params.ytob_map,
         bx0,
@@ -232,7 +232,6 @@ fn select_super_block(
     // Vertical pairs (DCT16X8): one per column. Skipped entirely under
     // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
     let merge = ctx.merge;
-    let raw_propagation = ctx.selector.raw_propagation;
     // (decision cost, unbiased cost) per rectangular candidate.
     let mut rect_cost = |px: usize, py: usize, strategy: u8, qac: f32| -> (f32, f32) {
         if !context.scope.rectangles() {
@@ -295,12 +294,6 @@ fn select_super_block(
     let cost_8x16 =
         if use_h_top { h_top } else { dct8_top } + if use_h_bottom { h_bot } else { dct8_bottom };
     let best_rect = cost_16x8.min(cost_8x16);
-    // Unbiased twins of the two rectangular arms, propagated under
-    // `raw_propagation` so the biases stay local to this decision.
-    let raw_16x8 = if use_v_left { v_left_raw } else { dct8_left }
-        + if use_v_right { v_right_raw } else { dct8_right };
-    let raw_8x16 = if use_h_top { h_top_raw } else { dct8_top }
-        + if use_h_bottom { h_bot_raw } else { dct8_bottom };
 
     let (q_min, q_max) = qac
         .iter()
@@ -316,7 +309,7 @@ fn select_super_block(
             risk_gated(merge.risk_k, merge.accept_16, q_min, q_max, 1.0),
         );
 
-    if ctx.selector.merge_upgrade && params.distance >= MERGE_UPGRADE_MIN_DISTANCE {
+    if params.distance >= MERGE_UPGRADE_MIN_DISTANCE {
         record_upgrade_candidates(
             upgrades,
             ac_strategy,
@@ -388,7 +381,7 @@ fn select_super_block(
             });
         }
         ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X16);
-        if raw_propagation { c16_raw } else { c16 }
+        c16
     } else if cost_16x8 <= cost_8x16 {
         if use_v_left {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT16X8);
@@ -396,7 +389,7 @@ fn select_super_block(
         if use_v_right {
             ac_strategy.set_first(bx0 + 1, by0, STRATEGY_DCT16X8);
         }
-        if raw_propagation { raw_16x8 } else { cost_16x8 }
+        cost_16x8
     } else {
         if use_h_top {
             ac_strategy.set_first(bx0, by0, STRATEGY_DCT8X16);
@@ -404,7 +397,7 @@ fn select_super_block(
         if use_h_bottom {
             ac_strategy.set_first(bx0, by0 + 1, STRATEGY_DCT8X16);
         }
-        if raw_propagation { raw_8x16 } else { cost_8x16 }
+        cost_8x16
     };
 
     SuperBlockCost {
@@ -529,7 +522,7 @@ fn find_quant_refinements(
             continue;
         }
         let cmap = cmap_factors(
-            params.ctx.cfl_bases(),
+            params.ctx.cfl_frame(),
             params.ytox_map,
             params.ytob_map,
             bx,
@@ -861,7 +854,7 @@ fn select_band(
                     }
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale, distance);
-                let cmap_factor = cmap_factors(ctx.cfl_bases(), ytox_map, ytob_map, bx, by);
+                let cmap_factor = cmap_factors(ctx.cfl_frame(), ytox_map, ytob_map, bx, by);
                 let cost32 = strategy_cost(
                     ctx,
                     scratch,
@@ -947,15 +940,7 @@ fn select_band(
                 chosen32.push(Chosen32Cost {
                     bx: bx as u16,
                     by: by as u16,
-                    cost: partition_cost(
-                        children,
-                        if ctx.selector.raw_propagation {
-                            raw
-                        } else {
-                            costs
-                        },
-                        mask,
-                    ),
+                    cost: partition_cost(children, costs, mask),
                 });
                 bx += 4;
             } else if four_row {
@@ -1034,8 +1019,6 @@ struct Sub8Pick {
     /// comparison against DCT8 used, and what a leaf carries into the merge
     /// levels of the leaf-first selector.
     biased_j: f32,
-    /// The same cost without the family bias.
-    raw_j: f32,
     /// Credit for the frame-level sub-8 metadata gate: reconstruction-domain
     /// delta for IDENTITY/DCT2X2, biased coefficient-domain delta otherwise
     /// (legacy semantics; the two are not comparable with each other).
@@ -1146,7 +1129,7 @@ fn sub8_shortlist(
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
     let cmap_factor = cmap_factors(
-        params.ctx.cfl_bases(),
+        params.ctx.cfl_frame(),
         params.ytox_map,
         params.ytob_map,
         bx,
@@ -1176,40 +1159,35 @@ fn sub8_shortlist(
     // Keep the already-fitted DCT4/AFV chooser intact. IDENTITY/DCT2X2 have
     // non-orthogonal coefficient scales, so their coefficient-domain costs are
     // suitable only as a shortlist; final admission is reconstruction-domain.
-    let (cand, cand_cost, cand_raw) = {
+    let (cand, cand_cost) = {
         let mut best = STRATEGY_DCT4X4;
         let mut bc = cost4;
-        let mut raw = costs.dct4x4;
         if cost48 < bc {
             best = STRATEGY_DCT4X8;
             bc = cost48;
-            raw = costs.dct4x8;
         }
         if cost84 < bc {
             best = STRATEGY_DCT8X4;
             bc = cost84;
-            raw = costs.dct8x4;
         }
         for (kind, &afv_cost) in costs.afv.iter().enumerate() {
             let biased = bias_afv * afv_cost;
             if biased < bc {
                 best = STRATEGY_AFV0 + kind as u8;
                 bc = biased;
-                raw = afv_cost;
             }
         }
-        (best, bc, raw)
+        (best, bc)
     };
-    let (fine, fine_coeff_cost, fine_raw) = if cost_identity < cost_dct2x2 {
-        (STRATEGY_IDENTITY, cost_identity, costs.identity)
+    let (fine, fine_coeff_cost) = if cost_identity < cost_dct2x2 {
+        (STRATEGY_IDENTITY, cost_identity)
     } else {
-        (STRATEGY_DCT2X2, cost_dct2x2, costs.dct2x2)
+        (STRATEGY_DCT2X2, cost_dct2x2)
     };
     Sub8Shortlist {
         structural: (cand_cost < cost8).then_some(Sub8Pick {
             strategy: cand,
             biased_j: cand_cost,
-            raw_j: cand_raw,
             gain: cost8 - cand_cost,
             fallback: STRATEGY_DCT,
         }),
@@ -1217,7 +1195,6 @@ fn sub8_shortlist(
         fine: (fine_coeff_cost < cost8).then_some(Sub8Pick {
             strategy: fine,
             biased_j: fine_coeff_cost,
-            raw_j: fine_raw,
             gain: 0.0,
             fallback: STRATEGY_DCT,
         }),
@@ -1266,7 +1243,7 @@ fn fine_recon_admit(
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
     let cmap_factor = cmap_factors(
-        params.ctx.cfl_bases(),
+        params.ctx.cfl_frame(),
         params.ytox_map,
         params.ytob_map,
         bx,
@@ -1505,7 +1482,7 @@ pub(crate) fn fill_ac_strategy(
     fine_fallbacks: &mut Vec<u8>,
     num_threads: usize,
 ) -> f32 {
-    let learned = ctx.selector.learned_rate
+    let learned = ctx.learned_rate
         && ctx.speed.effort().learned_rate
         && !use_dct8_only_for_content(ctx, distance);
     let prices = learned.then(|| {
@@ -1613,7 +1590,7 @@ fn select_transforms(
     } else {
         LEAF_FIRST_MAX_DISTANCE
     };
-    let leaf_first = ctx.selector.leaf_first && distance <= leaf_first_max;
+    let leaf_first = distance <= leaf_first_max;
     let run_band = |scratch: &mut CoderScratch,
                     output: &mut AcStrategyBandScratch,
                     strategy: &mut AcStrategyImage,
@@ -1712,7 +1689,7 @@ fn select_transforms(
                 if cost32.iter().flatten().any(|c| !c.is_finite()) {
                     continue;
                 }
-                let cmap = cmap_factors(ctx.cfl_bases(), ytox_map, ytob_map, bx, by);
+                let cmap = cmap_factors(ctx.cfl_frame(), ytox_map, ytob_map, bx, by);
                 let cost64 = BIAS_64X64
                     * strategy_cost64(
                         ctx,
@@ -1894,7 +1871,7 @@ fn select_transforms(
         // Margin-band upgrade: shortlisted merges compete, in the
         // reconstruction domain, against whatever the downgrades and the
         // sub-8 refinement left on their footprint.
-        if ctx.selector.merge_upgrade && distance >= MERGE_UPGRADE_MIN_DISTANCE {
+        if distance >= MERGE_UPGRADE_MIN_DISTANCE {
             rerank_upgrade_merges(
                 &rerank,
                 scratch,
@@ -2354,7 +2331,7 @@ fn find_rerank_downgrades(
             meta_r,
             params.distance,
             cmap_factors(
-                params.ctx.cfl_bases(),
+                params.ctx.cfl_frame(),
                 params.ytox_map,
                 params.ytob_map,
                 bx,
@@ -2419,7 +2396,7 @@ fn find_rerank_downgrades(
                 );
                 let child = iy * cxb + ix;
                 let cmap = cmap_factors(
-                    params.ctx.cfl_bases(),
+                    params.ctx.cfl_frame(),
                     params.ytox_map,
                     params.ytob_map,
                     bx + ix,
@@ -2538,7 +2515,7 @@ fn find_rerank_downgrades(
                         meta_r,
                         params.distance,
                         cmap_factors(
-                            params.ctx.cfl_bases(),
+                            params.ctx.cfl_frame(),
                             params.ytox_map,
                             params.ytob_map,
                             bx + ix,
@@ -2924,7 +2901,7 @@ fn find_merge_upgrades(
                     meta_r,
                     params.distance,
                     cmap_factors(
-                        params.ctx.cfl_bases(),
+                        params.ctx.cfl_frame(),
                         params.ytox_map,
                         params.ytob_map,
                         x,
@@ -3856,28 +3833,21 @@ mod tests {
         opsin
     }
 
-    fn run_selector(
-        speed: crate::Speed,
-        distance: f32,
-        policy: crate::ac_strategy::SelectorPolicy,
-        threads: usize,
-    ) -> (AcStrategyImage, f32) {
-        let (map, benefit, _) = run_selector_full(speed, distance, policy, threads);
+    fn run_selector(speed: crate::Speed, distance: f32, threads: usize) -> (AcStrategyImage, f32) {
+        let (map, benefit, _) = run_selector_full(speed, distance, threads);
         (map, benefit)
     }
 
     fn run_selector_full(
         speed: crate::Speed,
         distance: f32,
-        policy: crate::ac_strategy::SelectorPolicy,
         threads: usize,
     ) -> (
         AcStrategyImage,
         f32,
         Vec<crate::coder_scratch::FineMergeRollback>,
     ) {
-        let mut ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, distance, threads);
-        ctx.selector = policy;
+        let ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, distance, threads);
         let (bw, bh) = (13usize, 11usize);
         let opsin = noise_opsin(bw * 8, bh * 8, 0x9e37_79b9);
         let maps = ImageSB::new_fill(2, 2, 0);
@@ -4041,14 +4011,10 @@ mod tests {
         }
     }
 
-    /// The shipped selector is leaf-first inside the DCT4/AFV band with
-    /// biased propagation; raw propagation stays an opt-in study switch and
-    /// the band edge is the sub-8 gate.
+    /// The leaf-first selector runs inside the DCT4/AFV band, whose edge is
+    /// the sub-8 gate.
     #[test]
-    fn selector_policy_defaults() {
-        use crate::ac_strategy::SelectorPolicy;
-        let p = SelectorPolicy::default();
-        assert!(p.leaf_first && !p.raw_propagation && p.merge_upgrade);
+    fn leaf_first_band_is_the_sub8_gate() {
         assert_eq!(LEAF_FIRST_MAX_DISTANCE, SUB8_MAX_DISTANCE);
     }
 
@@ -4069,14 +4035,8 @@ mod tests {
     /// first block) and credits the gate only for surviving leaves.
     #[test]
     fn leaf_first_commits_a_valid_map_with_sub8_leaves() {
-        use crate::ac_strategy::SelectorPolicy;
-        let leaf = SelectorPolicy {
-            leaf_first: true,
-            ..SelectorPolicy::default()
-        };
         for threads in [1usize, 3] {
-            let (map, benefit, rollbacks) =
-                run_selector_full(crate::Speed::Slow, 1.0, leaf, threads);
+            let (map, benefit, rollbacks) = run_selector_full(crate::Speed::Slow, 1.0, threads);
             assert_map_valid(&map);
             // Only the post-merge IDENTITY/DCT2X2 refinements are credited to
             // the frame gate; structural DCT4/AFV leaves competed in the
@@ -4104,20 +4064,12 @@ mod tests {
 
     /// The margin-band upgrade installs only merges whose footprint is
     /// self-contained and never two overlapping ones: the map stays valid
-    /// under both selectors across the band where it runs.
+    /// across the band where it runs.
     #[test]
     fn merge_upgrade_keeps_the_map_valid() {
-        use crate::ac_strategy::SelectorPolicy;
-        for leaf_first in [false, true] {
-            let policy = SelectorPolicy {
-                leaf_first,
-                merge_upgrade: true,
-                ..SelectorPolicy::default()
-            };
-            for distance in [1.5f32, 2.0, 3.0, 6.0] {
-                let (map, _) = run_selector(crate::Speed::Slow, distance, policy, 3);
-                assert_map_valid(&map);
-            }
+        for distance in [1.5f32, 2.0, 3.0, 6.0] {
+            let (map, _) = run_selector(crate::Speed::Slow, distance, 3);
+            assert_map_valid(&map);
         }
     }
 
@@ -4125,20 +4077,14 @@ mod tests {
     fn selection_is_independent_of_worker_count() {
         for speed in [crate::Speed::Fast, crate::Speed::Medium, crate::Speed::Slow] {
             for distance in [0.5, 1.5, 2.0, 4.0, 6.0] {
-                for raw_propagation in [false, true] {
-                    let policy = crate::ac_strategy::SelectorPolicy {
-                        raw_propagation,
-                        ..Default::default()
-                    };
-                    let (serial, _) = run_selector(speed, distance, policy, 1);
-                    let (parallel, _) = run_selector(speed, distance, policy, 3);
-                    assert_eq!(
-                        strategy_cells(&serial),
-                        strategy_cells(&parallel),
-                        "{speed:?} d{distance} raw={raw_propagation}"
-                    );
-                    assert_map_valid(&parallel);
-                }
+                let (serial, _) = run_selector(speed, distance, 1);
+                let (parallel, _) = run_selector(speed, distance, 3);
+                assert_eq!(
+                    strategy_cells(&serial),
+                    strategy_cells(&parallel),
+                    "{speed:?} d{distance}"
+                );
+                assert_map_valid(&parallel);
             }
         }
     }
@@ -4245,7 +4191,6 @@ mod tests {
         let margin = std::hint::black_box(MERGE_UPGRADE_MARGIN);
         assert!((1.5..=2.5).contains(&gate), "gate {gate}");
         assert!((0.95..=1.05).contains(&margin), "margin {margin}");
-        assert!(crate::ac_strategy::SelectorPolicy::default().merge_upgrade);
         // Knife-edge at the gate, slightly optimistic once quality is low,
         // monotone in between.
         assert_eq!(merge_upgrade_margin(gate), margin);
@@ -4261,11 +4206,6 @@ mod tests {
     /// separately), never one 4x4 grid on the first half.
     #[test]
     fn leaf_first_saved_children_match_their_transform_footprints() {
-        use crate::ac_strategy::SelectorPolicy;
-        let policy = SelectorPolicy {
-            leaf_first: true,
-            ..SelectorPolicy::default()
-        };
         let mut seen_rect_halves = 0;
         let mut histogram = [0usize; crate::dc_group_data::NUM_STRATEGIES];
         for (distance, pattern) in [
@@ -4278,9 +4218,8 @@ mod tests {
             (2.5, 2),
             (4.0, 2),
         ] {
-            let mut ctx =
+            let ctx =
                 EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
-            ctx.selector = policy;
             let (bw, bh) = (12usize, 12usize);
             let mut opsin = noise_opsin(bw * 8, bh * 8, 0x1234_abcd);
             // Patterns 1/2 add a one-directional ramp so that wide (16x32)
@@ -4587,7 +4526,7 @@ mod tests {
         let ytox = ImageSB::new_fill(1, 1, 42);
         let ytob = ImageSB::new_fill(1, 1, -42);
         assert_eq!(
-            cmap_factors([0.0, 1.0], &ytox, &ytob, 0, 0),
+            cmap_factors(crate::color_correlation::CflFrame::XYB, &ytox, &ytob, 0, 0),
             [0.5, 0.0, 0.5]
         );
     }

@@ -963,7 +963,7 @@ pub(crate) fn write_ac_group(
     // `base_correlation_b` (= 1) plus the frame's signaled `ytob_dc / 84`,
     // converted from dequantized XYB into stored-B-DC units. Folded into the
     // quantizer below so the slope costs no extra rounding error.
-    let cfl_factor_b = crate::color_correlation::dc_cfl_factor(dc_step, ytob_dc, ctx.cfl_base_b());
+    let cfl_factor_b = crate::color_correlation::dc_cfl_factor(dc_step, ytob_dc, ctx.cfl_frame());
     let x_qm_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
@@ -1296,8 +1296,8 @@ pub(crate) fn write_ac_group(
             let cmap_x = dc_data.ytox_map.row(ty)[tx];
             let cmap_b = dc_data.ytob_map.row(ty)[tx];
             // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
-            let x_factor = crate::color_correlation::y_to_x_ratio(ctx.cfl_base_x(), cmap_x);
-            let b_factor = crate::color_correlation::y_to_b_ratio(ctx.cfl_base_b(), cmap_b);
+            let x_factor = crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), cmap_x);
+            let b_factor = crate::color_correlation::y_to_b_ratio(ctx.cfl_frame(), cmap_b);
 
             // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
             // The decoder reverses CfL in coefficient space (DequantLane) using the

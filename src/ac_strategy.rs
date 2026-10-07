@@ -352,36 +352,6 @@ impl RateCalibration {
     }
 }
 
-/// Which AC-strategy selector runs and how merge costs propagate upward.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SelectorPolicy {
-    /// Bottom-up plan-based selection (see [`LEAF_FIRST_MAX_DISTANCE`]):
-    /// every 8x8 picks its best structural transform (DCT8 / DCT4 family /
-    /// AFV) first, then pairs/16x16 and the 32 class compete against those
-    /// leaves; IDENTITY/DCT2X2 refine the remaining DCT8 blocks afterwards.
-    /// Enabled by default.
-    pub(crate) leaf_first: bool,
-    /// Propagate the unbiased cost of a winning merge to the next level
-    /// instead of its bias-multiplied decision cost.
-    pub(crate) raw_propagation: bool,
-    /// Margin-band merge upgrade (see [`MERGE_UPGRADE_MARGIN`]); enabled by default.
-    pub(crate) merge_upgrade: bool,
-    /// Price candidates by the frame's own statistics (see [`RatePrices`])
-    /// instead of the fixed rate model.
-    pub(crate) learned_rate: bool,
-}
-
-impl Default for SelectorPolicy {
-    fn default() -> Self {
-        Self {
-            leaf_first: true,
-            raw_propagation: false,
-            merge_upgrade: true,
-            learned_rate: false,
-        }
-    }
-}
-
 const MERGE_UPGRADE_MARGIN: f32 = 1.0;
 const MERGE_UPGRADE_MIN_DISTANCE: f32 = 2.0;
 const MERGE_UPGRADE_LOW_MARGIN: f32 = 1.05;
@@ -1337,7 +1307,7 @@ fn sub8_strategy_costs(
 
 #[inline]
 fn cmap_factors(
-    bases: [f32; 2],
+    cfl: crate::color_correlation::CflFrame,
     ytox_map: &ImageSB,
     ytob_map: &ImageSB,
     bx: usize,
@@ -1346,9 +1316,9 @@ fn cmap_factors(
     let tx = (bx / 8).min(ytox_map.xsize() - 1);
     let ty = (by / 8).min(ytox_map.ysize() - 1);
     [
-        crate::color_correlation::y_to_x_ratio(bases[0], ytox_map.row(ty)[tx]),
+        crate::color_correlation::y_to_x_ratio(cfl, ytox_map.row(ty)[tx]),
         0.0,
-        crate::color_correlation::y_to_b_ratio(bases[1], ytob_map.row(ty)[tx]),
+        crate::color_correlation::y_to_b_ratio(cfl, ytob_map.row(ty)[tx]),
     ]
 }
 

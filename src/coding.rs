@@ -109,6 +109,46 @@ impl CodingTransform {
         }
     }
 
+    /// Per-image multipliers of `table_scale`. The tables are fitted on
+    /// images whose colour G (or luma) predicts, but where red or blue
+    /// dominates, that colour carries the visible structure: in RGB on its own
+    /// coarser plane, in YCbCr on a luma that sees a fraction of it. Such
+    /// images take finer tables there.
+    pub(crate) fn plane_scale(self, coded: &crate::image::Image3F) -> [f32; 3] {
+        // Full-strength multipliers when red / blue dominates, and the
+        // dominant share of the gradient energy at which they fade in and
+        // saturate.
+        let (red_full, blue_full, start, full) = match self {
+            Self::Xyb => return [1.0; 3],
+            Self::Rgb => ([1.375, 1.0, 1.0], [1.0, 1.0, 2.0], 0.04, 0.20),
+            Self::YCbCr => ([1.375, 2.0, 1.375], [1.375, 2.8125, 1.0], 0.30, 0.80),
+        };
+        let [red, blue] = dominant_gradient_shares(coded, |p| self.decode(p))
+            .map(|share: f32| ((share - start) / (full - start)).clamp(0.0, 1.0));
+        std::array::from_fn(|c| {
+            let m = (1.0 + (red_full[c] - 1.0) * red).max(1.0 + (blue_full[c] - 1.0) * blue);
+            // Sixteenth steps keep the table cache small.
+            (16.0 * m).round() / 16.0
+        })
+    }
+
+    /// Gamma-encoded R, G, B of one coded triple (the decoder's inverse of
+    /// [`Self::code`]).
+    #[inline]
+    fn decode(self, [p0, p1, p2]: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::YCbCr => {
+                let y = p1 + 128.0 / 255.0;
+                [
+                    y + 2.0 * (1.0 - KR) * p2,
+                    y - 2.0 * (1.0 - KB) * KB / KG * p0 - 2.0 * (1.0 - KR) * KR / KG * p2,
+                    y + 2.0 * (1.0 - KB) * p0,
+                ]
+            }
+            Self::Rgb | Self::Xyb => [p0, p1, p2],
+        }
+    }
+
     /// Per-plane distortion weights of the RD searches.
     #[inline]
     pub(crate) fn channel_weights(self) -> [f32; 3] {
@@ -140,39 +180,156 @@ impl CodingTransform {
     }
 }
 
-/// Least-squares slope of each outer plane's local detail against the middle
-/// plane's: the frame's chroma-from-luma base correlations `[x, b]`, which the
-/// per-tile maps refine within +-1.5. Saturated content can track luma well
-/// past that window (red detail in Cr runs at ~1.7x luma).
-pub(crate) fn fit_cfl_bases(coded: &crate::image::Image3F) -> [f32; 2] {
+/// The chroma-from-luma parameters of a non-XYB frame. Each outer plane's
+/// base is the least-squares slope of its local detail against the middle
+/// plane's; the per-tile maps refine it within about +-1.5. Saturated content
+/// tracks luma far from the transform's default (red detail in Cr runs at
+/// ~1.7x luma), and when a mix of such content leaves many textured tiles out
+/// of the maps' reach, the YCbCr base moves to bring the most of them back.
+/// (RGB tiles over a flat G have no meaningful slope to reach.)
+pub(crate) fn fit_cfl_frame(
+    coding: CodingTransform,
+    coded: &crate::image::Image3F,
+) -> crate::color_correlation::CflFrame {
     const LIMIT: f32 = 4.0;
+    // CfL tile side and the reach of a tile's map around the base, short of
+    // its +-127/84 so tiles at the edge keep some room.
+    const TILE: usize = 64;
+    const REACH: f32 = 1.4;
+    // Tiles with at least this share of the mean luma detail have a
+    // meaningful slope; the base moves once this share of them is out of reach.
+    const TEXTURED: f64 = 0.05;
+    const OUT_OF_REACH: f32 = 0.1;
+    // Candidate base step.
+    const STEP: f32 = 1.0 / 64.0;
     let (w, h) = (coded.xsize(), coded.ysize());
-    let (mut yy, mut xy, mut by) = (0.0f64, 0.0f64, 0.0f64);
+    let tiles_x = w.div_ceil(TILE);
+    // Luma detail energy and its products with the outer planes, over the
+    // whole image and per tile (differences within the tile only).
+    let mut all = [0.0f64; 3];
+    let mut tiles = vec![[0.0f64; 3]; tiles_x * h.div_ceil(TILE)];
     for y in 0..h {
         let rows = [0, 1, 2].map(|c| coded.plane_row(c, y));
         let below = (y + 1 < h).then(|| [0, 1, 2].map(|c| coded.plane_row(c, y + 1)));
+        let tile_row = &mut tiles[(y / TILE) * tiles_x..][..tiles_x];
         for x in 0..w {
-            let mut add = |d: [f32; 3]| {
+            let tile = &mut tile_row[x / TILE];
+            let mut add = |d: [f32; 3], within_tile: bool| {
                 let dy = f64::from(d[1]);
-                yy += dy * dy;
-                xy += f64::from(d[0]) * dy;
-                by += f64::from(d[2]) * dy;
+                let terms = [dy * dy, f64::from(d[0]) * dy, f64::from(d[2]) * dy];
+                for i in 0..3 {
+                    all[i] += terms[i];
+                    if within_tile {
+                        tile[i] += terms[i];
+                    }
+                }
             };
             if x + 1 < w {
-                add([0, 1, 2].map(|c| rows[c][x + 1] - rows[c][x]));
+                add(
+                    [0, 1, 2].map(|c| rows[c][x + 1] - rows[c][x]),
+                    (x + 1) % TILE != 0,
+                );
             }
             if let Some(below) = below {
-                add([0, 1, 2].map(|c| below[c][x] - rows[c][x]));
+                add(
+                    [0, 1, 2].map(|c| below[c][x] - rows[c][x]),
+                    (y + 1) % TILE != 0,
+                );
             }
         }
     }
-    if yy <= 0.0 {
-        return [0.0; 2];
+    let yy = all[0];
+    let textured = TEXTURED * tiles.iter().map(|t| t[0]).sum::<f64>() / tiles.len().max(1) as f64;
+    let fit = |plane: usize| -> f32 {
+        if yy <= 0.0 {
+            return 0.0;
+        }
+        let least_squares = ((all[plane] / yy) as f32).clamp(-LIMIT, LIMIT);
+        let slopes: Vec<f32> = tiles
+            .iter()
+            .filter(|t| t[0] > textured)
+            .map(|t| (t[plane] / t[0]) as f32)
+            .collect();
+        let out_of_reach = |base: f32| slopes.iter().filter(|&&s| (s - base).abs() > REACH).count();
+        let at_least_squares = out_of_reach(least_squares);
+        if coding != CodingTransform::YCbCr
+            || (at_least_squares as f32) <= OUT_OF_REACH * slopes.len() as f32
+        {
+            return least_squares;
+        }
+        let mut best = (at_least_squares, 0.0f32, least_squares);
+        for i in 0..=(2.0 * LIMIT / STEP) as i32 {
+            let base = -LIMIT + i as f32 * STEP;
+            let key = (out_of_reach(base), (base - least_squares).abs());
+            if (key.0, key.1) < (best.0, best.1) {
+                best = (key.0, key.1, base);
+            }
+        }
+        best.2
+    };
+    let [base_x, base_b] = [fit(1), fit(2)]
+        .map(|slope| crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(slope)));
+    crate::color_correlation::CflFrame {
+        base_x,
+        base_b,
+        color_factor: crate::color_correlation::K_COLOR_FACTOR,
     }
-    [xy / yy, by / yy].map(|slope| {
-        let slope = (slope as f32).clamp(-LIMIT, LIMIT);
-        crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(slope))
-    })
+}
+
+/// Shares of the image's gradient energy (all of R, G, B; horizontal and
+/// vertical neighbour differences) carried by R and by B where that channel
+/// dominates the pixel: above 0.15 and over 1.6x both others. `decode` maps
+/// coded triples to R, G, B.
+fn dominant_gradient_shares(
+    coded: &crate::image::Image3F,
+    decode: impl Fn([f32; 3]) -> [f32; 3],
+) -> [f32; 2] {
+    const FLOOR: f32 = 0.15;
+    const RATIO: f32 = 1.6;
+    let (w, h) = (coded.xsize(), coded.ysize());
+    let decode_row = |y: usize, out: &mut Vec<[f32; 3]>| {
+        let rows = [0, 1, 2].map(|c| coded.plane_row(c, y));
+        out.clear();
+        out.extend((0..w).map(|x| decode([rows[0][x], rows[1][x], rows[2][x]])));
+    };
+    let (mut row, mut below) = (Vec::with_capacity(w), Vec::with_capacity(w));
+    if h > 0 {
+        decode_row(0, &mut row);
+    }
+    let (mut total, mut dominant) = (0.0f64, [0.0f64; 2]);
+    for y in 0..h {
+        if y + 1 < h {
+            decode_row(y + 1, &mut below);
+        }
+        for x in 0..w {
+            let px = row[x];
+            let mut energy = [0.0f32; 3];
+            for c in 0..3 {
+                if x + 1 < w {
+                    let d = row[x + 1][c] - px[c];
+                    energy[c] += d * d;
+                }
+                if y + 1 < h {
+                    let d = below[x][c] - px[c];
+                    energy[c] += d * d;
+                }
+            }
+            total += f64::from(energy[0] + energy[1] + energy[2]);
+            let [r, g, b] = px;
+            if r > FLOOR && r > RATIO * g.max(b) {
+                dominant[0] += f64::from(energy[0]);
+            }
+            if b > FLOOR && b > RATIO * r.max(g) {
+                dominant[1] += f64::from(energy[2]);
+            }
+        }
+        std::mem::swap(&mut row, &mut below);
+    }
+    if total > 0.0 {
+        dominant.map(|e| (e / total) as f32)
+    } else {
+        [0.0; 2]
+    }
 }
 
 /// The 8-bit JPEG matrix, as the decoder inverts it (libjxl `stage_ycbcr`).
@@ -215,6 +372,70 @@ mod tests {
             y - 0.114 * 1.772 / 0.587 * cb - 0.299 * 1.402 / 0.587 * cr,
             y + 1.772 * cb,
         ]
+    }
+
+    #[test]
+    fn dominant_colour_refines_its_plane() {
+        // A textured channel over two flat ones, coded with `coding`.
+        let textured = |coding: CodingTransform, dominant: usize| {
+            let mut img = crate::image::Image3F::new(32, 32);
+            for y in 0..32 {
+                let [p0, p1, p2] = img.all_plane_rows_mut(y);
+                for x in 0..32 {
+                    let rgb: [f32; 3] = std::array::from_fn(|c| {
+                        if c == dominant {
+                            0.5 + 0.4 * (((x + y) % 4) as f32 / 3.0 - 0.5)
+                        } else {
+                            0.05
+                        }
+                    });
+                    [p0[x], p1[x], p2[x]] = coding.code(rgb[0], rgb[1], rgb[2]);
+                }
+            }
+            img
+        };
+        let scale = |coding: CodingTransform, dominant: usize| {
+            coding.plane_scale(&textured(coding, dominant))
+        };
+        assert_eq!(scale(CodingTransform::Rgb, 0), [1.375, 1.0, 1.0]);
+        assert_eq!(scale(CodingTransform::Rgb, 2), [1.0, 1.0, 2.0]);
+        assert_eq!(scale(CodingTransform::Rgb, 1), [1.0; 3]);
+        assert_eq!(scale(CodingTransform::YCbCr, 0), [1.375, 2.0, 1.375]);
+        assert_eq!(scale(CodingTransform::YCbCr, 2), [1.375, 2.8125, 1.0]);
+        assert_eq!(scale(CodingTransform::YCbCr, 1), [1.0; 3]);
+    }
+
+    #[test]
+    fn cfl_base_reaches_mixed_hue_tiles() {
+        // One CfL tile of red detail (Cr at ~1.67x luma) beside one of green
+        // detail (Cr at ~-0.71x luma): the least-squares base leaves the red
+        // tile out of the maps' reach, so the base moves between the two.
+        let coding = CodingTransform::YCbCr;
+        let mut img = crate::image::Image3F::new(128, 64);
+        for y in 0..64 {
+            let [p0, p1, p2] = img.all_plane_rows_mut(y);
+            for x in 0..128 {
+                let t = 0.5 + 0.3 * (((x * 7 + y * 3) % 5) as f32 / 4.0 - 0.5);
+                let [r, g, b] = if x < 64 { [t, 0.0, 0.0] } else { [0.2, t, 0.2] };
+                [p0[x], p1[x], p2[x]] = coding.code(r, g, b);
+            }
+        }
+        let base = fit_cfl_frame(coding, &img).base_b;
+        assert!(
+            (base - 1.67).abs() <= 1.4 && (base + 0.71).abs() <= 1.4,
+            "{base}"
+        );
+
+        // A single hue keeps the least-squares slope.
+        let red = |x: usize, y: usize| 0.5 + 0.3 * (((x * 7 + y * 3) % 5) as f32 / 4.0 - 0.5);
+        for y in 0..64 {
+            let [p0, p1, p2] = img.all_plane_rows_mut(y);
+            for x in 0..128 {
+                [p0[x], p1[x], p2[x]] = coding.code(red(x, y), 0.0, 0.0);
+            }
+        }
+        let base = fit_cfl_frame(coding, &img).base_b;
+        assert!((base - 0.5 / 0.299).abs() < 0.02, "{base}");
     }
 
     #[test]
