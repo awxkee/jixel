@@ -59,6 +59,8 @@ effort_gates! {
     /// SSIM reconstruction rerank at every distance (otherwise high quality only).
     full_rerank,
     dct64,
+    /// Wider AC trellis for 32/64-family transforms at distance >= 3.
+    large_transform_rdoq,
     fine_mosaic,
     learned_rate,
     /// Chroma content analysis and every policy it drives: saturated/pair-B/x-heavy
@@ -68,9 +70,14 @@ effort_gates! {
     chroma_deadzone,
     yellow_opsin,
     coeff_orders,
+    /// Re-tokenize on the custom orders before pricing RDOQ however little
+    /// the scans moved (otherwise only past `RDOQ_FRESH_PRICES_MIN_SCAN_MOVE`).
+    rdoq_fresh_prices,
     ac_ctx_plan,
     ma_dc_tree,
     ans_refine,
+    /// Broader final hybrid-uint and ANS-table search.
+    ans_exhaustive,
     /// Below `ans_refine`: recluster at every distance (otherwise from d=3).
     ans_recluster,
     lossy_modular_auto,
@@ -83,6 +90,10 @@ effort_gates! {
     lz_deep,
     /// ANS, per-cluster hybrid-uint selection and refined clustering for LZ streams.
     lz_refined_entropy,
+    /// Price every hybrid-uint candidate under its fully searched ANS table.
+    lz_exhaustive_entropy,
+    /// Broader cost-aware LZ77 parses alongside the normal stream candidates.
+    lz_priced_search,
     predictor_search,
     rct_search,
     wp_search,
@@ -102,6 +113,8 @@ effort_gates! {
     tree_full_sampling,
     /// Learn under both the 1024 px and the 256 px group layouts.
     tree_dual_layout,
+    /// Final RCT tree learns score more predictors on each side of a split.
+    tree_wide_side_preds,
     tree_global_palette,
     tree_group_palette,
     tree_ctx_v1,
@@ -127,7 +140,17 @@ const MEDIUM: Effort = Effort {
     ..SLOW
 };
 
-const SLOW: Effort = Effort::ALL;
+const SLOW: Effort = Effort {
+    large_transform_rdoq: false,
+    rdoq_fresh_prices: false,
+    ans_exhaustive: false,
+    lz_exhaustive_entropy: false,
+    lz_priced_search: false,
+    tree_wide_side_preds: false,
+    ..Effort::ALL
+};
+
+const EXTRASLOW: Effort = Effort::ALL;
 
 impl Speed {
     pub(crate) const fn effort(self) -> &'static Effort {
@@ -135,6 +158,7 @@ impl Speed {
             Speed::Fastest | Speed::Fast => &FAST,
             Speed::Medium => &MEDIUM,
             Speed::Slow => &SLOW,
+            Speed::ExtraSlow => &EXTRASLOW,
         }
     }
 }
@@ -145,7 +169,13 @@ mod tests {
 
     #[test]
     fn slower_tiers_keep_every_faster_tool() {
-        let tiers = [Speed::Fastest, Speed::Fast, Speed::Medium, Speed::Slow];
+        let tiers = [
+            Speed::Fastest,
+            Speed::Fast,
+            Speed::Medium,
+            Speed::Slow,
+            Speed::ExtraSlow,
+        ];
         for pair in tiers.windows(2) {
             let (faster, slower) = (pair[0].effort().gates(), pair[1].effort().gates());
             for ((name, on), (_, slower_on)) in faster.into_iter().zip(slower) {

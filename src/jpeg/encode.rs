@@ -892,10 +892,10 @@ impl Effort {
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: true }),
             },
-            Speed::Slow => Self {
+            Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
                 select_configs: true,
-                refinement: Some(AnsRefinement::Slow),
+                refinement: Some(AnsRefinement::slow_for_speed(speed)),
             },
         }
     }

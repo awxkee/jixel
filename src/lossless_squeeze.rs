@@ -231,6 +231,7 @@ pub(super) fn encode_squeeze_single_group(
     let distance_ctx = nb as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(lz_tokens.as_slice()),
         nb,
         min_symbol,
@@ -520,6 +521,7 @@ pub(super) fn encode_squeeze_multigroup(
     };
 
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(global_lz.as_slice())
             .chain(dc_group_lz.iter().map(Vec::as_slice))
             .chain(ac_group_lz.iter().map(Vec::as_slice)),
@@ -1107,6 +1109,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
         let distance_ctx = nb as u32;
         let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
         let code = build_lz_pixel_code(
+            speed.effort().lz_exhaustive_entropy,
             std::iter::once(lz_tokens.as_slice()),
             nb,
             min_symbol,
@@ -1386,6 +1389,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     );
 
     let code = build_lz_pixel_code_opts(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(global_lz.as_slice())
             .chain(dc_group_lz.iter().map(Vec::as_slice))
             .chain(ac_group_lz.iter().map(Vec::as_slice)),
@@ -1732,6 +1736,7 @@ impl ExtraSqueeze {
         }
         let lz = lz77_literals(&tokens);
         let code = build_lz_pixel_code_opts(
+            false,
             std::iter::once(lz.as_slice()),
             num_ctx as usize,
             self.min_symbol,
@@ -1776,6 +1781,7 @@ impl ExtraSqueeze {
         }
         let lz = lz77_literals(&tokens);
         let code = build_lz_pixel_code(
+            false,
             std::iter::once(lz.as_slice()),
             n,
             self.min_symbol,

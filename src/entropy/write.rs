@@ -351,6 +351,66 @@ impl HybridUintSamples {
         self.select_with_acceptance(0.995)
     }
 
+    /// ExtraSlow: compare every candidate with the same fully searched
+    /// tables used by the final writer, including the integer-config header.
+    /// The ordinary selector's incumbent participates in this search too.
+    pub(crate) fn select_exhaustive(&self, min_symbol: u32) -> Vec<HybridUintConfig> {
+        let mut scratch = HybridAnsSelectorScratch::default();
+        self.values
+            .iter()
+            .zip(&self.strides)
+            .map(|(values, &stride)| {
+                select_exhaustive_config(values, stride, min_symbol, &mut scratch)
+            })
+            .collect()
+    }
+
+    fn select_exhaustive_with_pool(
+        &self,
+        min_symbol: u32,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Vec<HybridUintConfig> {
+        let n = self.values.len();
+        if n < 4 || pool.num_threads() <= 1 {
+            return self.select_exhaustive(min_symbol);
+        }
+        let chunk = n.div_ceil(pool.num_threads() * 4);
+        pool.steal_map(scratch, n.div_ceil(chunk), |part, _| {
+            let begin = part * chunk;
+            let end = (begin + chunk).min(n);
+            let mut selector = HybridAnsSelectorScratch::default();
+            (begin..end)
+                .map(|i| {
+                    select_exhaustive_config(
+                        &self.values[i],
+                        self.strides[i],
+                        min_symbol,
+                        &mut selector,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Search the remaining legal integer configurations on a bounded probe.
+    /// Four proxy finalists and the incumbent receive the full table search;
+    /// the caller then verifies the complete bundle on the original tokens.
+    fn select_expanded_with_pool(
+        &self,
+        incumbents: &[HybridUintConfig],
+        maxima: &[u32],
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Vec<HybridUintConfig> {
+        pool.steal_map(scratch, self.values.len(), |i, _| {
+            select_expanded_config(&self.values[i], self.strides[i], incumbents[i], maxima[i])
+        })
+    }
+
     fn select_with_acceptance(&self, acceptance_ratio: f64) -> Vec<HybridUintConfig> {
         // Every cluster is selected independently; spread them over scoped
         // threads with one selector scratch each (identical results).
@@ -439,6 +499,131 @@ impl HybridUintSamples {
         .flatten()
         .collect()
     }
+}
+
+fn select_exhaustive_config(
+    values: &[u32],
+    stride: usize,
+    min_symbol: u32,
+    scratch: &mut HybridAnsSelectorScratch,
+) -> HybridUintConfig {
+    if values.is_empty() {
+        return HybridUintConfig::DEFAULT;
+    }
+    let incumbent = select_hybrid_config_ans_sampled(values, 1, stride, 0.995, scratch);
+    let cost = |i: usize| {
+        let counts: Vec<u32> = scratch.counts[i]
+            .iter()
+            .map(|&count| count.saturating_mul(stride as u32))
+            .collect();
+        let base = optimize_ans_histogram(&counts);
+        let table = refine_ans_histogram_precision(&counts, &base).unwrap_or(base);
+        super::ans::ans_data_bits(&counts, &table.freqs)
+            + super::ans::ans_table_bits(&table)
+            + (scratch.extra_bits[i] as f64 * stride as f64)
+            + hybrid_uint_config_bits(HYBRID_CANDIDATES[i], 3) as f64
+    };
+    let mut best = incumbent;
+    let incumbent_index = HYBRID_CANDIDATES
+        .iter()
+        .position(|&c| c == incumbent)
+        .unwrap();
+    let valid = |i: usize| {
+        scratch.valid[i]
+            && scratch.counts[i][min_symbol.min(ALPHABET_SIZE as u32) as usize..]
+                .iter()
+                .all(|&c| c == 0)
+    };
+    let mut best_cost = if valid(incumbent_index) {
+        cost(incumbent_index)
+    } else {
+        f64::INFINITY
+    };
+    for (i, &config) in HYBRID_CANDIDATES.iter().enumerate() {
+        if !valid(i) {
+            continue;
+        }
+        let candidate_cost = cost(i);
+        if candidate_cost < best_cost {
+            best = config;
+            best_cost = candidate_cost;
+        }
+    }
+    best
+}
+
+fn select_expanded_config(
+    values: &[u32],
+    stride: usize,
+    incumbent: HybridUintConfig,
+    max_value: u32,
+) -> HybridUintConfig {
+    if values.is_empty() {
+        return incumbent;
+    }
+    let probe_stride = values.len().div_ceil(1024).max(1);
+    let scale = stride * probe_stride;
+    let mut candidates = Vec::new();
+    for split in 0..=7 {
+        for msb in 0..=split {
+            for lsb in 0..=split - msb {
+                let config = HybridUintConfig {
+                    split_exponent: split,
+                    msb_in_token: msb,
+                    lsb_in_token: lsb,
+                };
+                let bound = uint_encode_with_config(max_value, config).0 | ((1u32 << lsb) - 1);
+                if bound as usize >= ALPHABET_SIZE {
+                    continue;
+                }
+                let mut counts = [0u32; ALPHABET_SIZE];
+                let mut extra = 0u64;
+                let mut total = 0u32;
+                for &value in values.iter().step_by(probe_stride) {
+                    let (symbol, bits, _) = uint_encode_with_config(value, config);
+                    counts[symbol as usize] += 1;
+                    extra += bits as u64;
+                    total += 1;
+                }
+                let mut proxy = extra as f64;
+                let mut used = 0;
+                for &count in &counts {
+                    if count != 0 {
+                        used += 1;
+                        proxy += count as f64 * f_log2(total as f64 / count as f64);
+                    }
+                }
+                proxy = proxy * scale as f64
+                    + (8 * used + 15) as f64
+                    + hybrid_uint_config_bits(config, 3) as f64;
+                candidates.push((proxy, config, counts, extra));
+            }
+        }
+    }
+    // Stable proxy ties follow the split/msb/lsb enumeration order.
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let cost = |candidate: &(f64, HybridUintConfig, [u32; ALPHABET_SIZE], u64)| {
+        let counts = candidate.2.map(|c| c.saturating_mul(scale as u32));
+        let base = optimize_ans_histogram(&counts);
+        let table = refine_ans_histogram_precision(&counts, &base).unwrap_or(base);
+        super::ans::ans_data_bits(&counts, &table.freqs)
+            + super::ans::ans_table_bits(&table)
+            + candidate.3 as f64 * scale as f64
+            + hybrid_uint_config_bits(candidate.1, 3) as f64
+    };
+    let mut best = incumbent;
+    let mut best_cost = candidates
+        .iter()
+        .find(|c| c.1 == incumbent)
+        .map_or(f64::INFINITY, cost);
+    for candidate in candidates.iter().take(4) {
+        let bits = cost(candidate);
+        if bits < best_cost {
+            best = candidate.1;
+            best_cost = bits;
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -1396,7 +1581,36 @@ fn accept_ans_cluster_proposal(
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
-    let candidate_ans = build_ans_storage(&candidate_histograms);
+    accept_ans_cluster_proposal_precise(
+        code,
+        streams,
+        (candidate_histograms, candidate_map, candidate_configs),
+        thread_pool,
+        scratch,
+        false,
+    )
+}
+
+fn accept_ans_cluster_proposal_precise(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    (candidate_histograms, candidate_map, candidate_configs): AnsClusterProposal,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    refine_precision: bool,
+) -> bool {
+    let candidate_ans = if refine_precision {
+        let selected = candidate_histograms
+            .iter()
+            .map(|h| {
+                let base = optimize_ans_histogram(&h.counts);
+                refine_ans_histogram_precision(&h.counts, &base).unwrap_or(base)
+            })
+            .collect();
+        build_ans_storage_from_selected(&candidate_histograms, selected)
+    } else {
+        build_ans_storage(&candidate_histograms)
+    };
     let original = AnsBundleRef {
         context_map: &code.context_map,
         configs: &code.hybrid_uint_configs,
@@ -1436,7 +1650,18 @@ fn accept_ans_cluster_proposal(
 #[derive(Clone, Copy)]
 pub(crate) enum AnsRefinement {
     Slow,
+    ExtraSlow,
     Fast { recluster: bool },
+}
+
+impl AnsRefinement {
+    pub(crate) fn slow_for_speed(speed: crate::Speed) -> Self {
+        if speed.effort().ans_exhaustive {
+            Self::ExtraSlow
+        } else {
+            Self::Slow
+        }
+    }
 }
 
 /// Refine only the final entropy bundle, after the caller has frozen RDO
@@ -1458,6 +1683,12 @@ where
         return false;
     }
     let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let exhaustive = matches!(refinement, AnsRefinement::ExtraSlow);
+    let refinement = if exhaustive {
+        AnsRefinement::Slow
+    } else {
+        refinement
+    };
     // Slow already had this refinement. Preserve it as the incumbent; Fast
     // did not, so it can go straight to the stronger candidate.
     let mut changed = matches!(refinement, AnsRefinement::Slow)
@@ -1483,7 +1714,106 @@ where
         changed |= refine_ans_precisions(code, &streams, thread_pool, scratch);
     }
     changed |= fill_unused_contexts(code, &streams, scratch);
+    if exhaustive {
+        changed |=
+            refine_ans_entropy_exhaustive(code, streams.iter().copied(), thread_pool, scratch);
+    }
     changed
+}
+
+/// ExtraSlow's additional search on an already finalized Slow bundle. DC tree
+/// candidates keep their ordinary budgets; only the winning tree spends this
+/// budget, avoiding repeated searches over discarded representations.
+pub(crate) fn refine_ans_entropy_exhaustive<'a, I>(
+    code: &mut OwnedEntropyCode,
+    streams: I,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool
+where
+    I: IntoIterator<Item = &'a [Token]>,
+{
+    if code.use_prefix_code {
+        return false;
+    }
+    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let mut changed = refine_ans_integer_configs(code, &streams, pool, scratch);
+    changed |= refine_ans_expanded_configs(code, &streams, pool, scratch);
+    changed |= fill_unused_contexts(code, &streams, scratch);
+    changed
+}
+
+/// Recode frozen tokens on the incumbent context map. Exact header and ANS
+/// state costs retain the Slow bundle whenever sampling nominated a loser.
+fn refine_ans_integer_configs(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool {
+    let histograms = clustered_histograms(
+        streams,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        Some(pool),
+        scratch,
+    );
+    let counts: Vec<usize> = histograms.iter().map(|h| h.total_count as usize).collect();
+    let (samples, maxima) =
+        gather_hybrid_samples::<true>(streams, &code.context_map, &counts, Some(pool), scratch);
+    let mut configs = samples.select_exhaustive_with_pool(ALPHABET_SIZE as u32, pool, scratch);
+    for (i, (&max, config)) in maxima.iter().zip(&mut configs).enumerate() {
+        let bound = uint_encode_with_config(max, *config).0 | ((1u32 << config.lsb_in_token) - 1);
+        if bound as usize >= ALPHABET_SIZE {
+            *config = code.hybrid_uint_configs[i];
+        }
+    }
+    if configs == code.hybrid_uint_configs {
+        return false;
+    }
+    let histograms =
+        clustered_histograms(streams, &code.context_map, &configs, Some(pool), scratch);
+    accept_ans_cluster_proposal_precise(
+        code,
+        streams,
+        (histograms, code.context_map.clone(), configs),
+        pool,
+        scratch,
+        true,
+    )
+}
+
+fn refine_ans_expanded_configs(
+    code: &mut OwnedEntropyCode,
+    streams: &[&[Token]],
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool {
+    let histograms = clustered_histograms(
+        streams,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        Some(pool),
+        scratch,
+    );
+    let counts: Vec<usize> = histograms.iter().map(|h| h.total_count as usize).collect();
+    let (samples, maxima) =
+        gather_hybrid_samples::<true>(streams, &code.context_map, &counts, Some(pool), scratch);
+    let configs =
+        samples.select_expanded_with_pool(&code.hybrid_uint_configs, &maxima, pool, scratch);
+    if configs == code.hybrid_uint_configs {
+        return false;
+    }
+    let histograms =
+        clustered_histograms(streams, &code.context_map, &configs, Some(pool), scratch);
+    accept_ans_cluster_proposal_precise(
+        code,
+        streams,
+        (histograms, code.context_map.clone(), configs),
+        pool,
+        scratch,
+        true,
+    )
 }
 
 /// Contexts without tokens still occupy signaled context-map entries. The
@@ -1643,10 +1973,9 @@ fn propose_ans_reclustering(
         Some(thread_pool),
         true,
         super::cluster::CLUSTERS_LIMIT,
-        if matches!(refinement, AnsRefinement::Slow) {
-            6
-        } else {
-            2
+        match refinement {
+            AnsRefinement::Slow => 6,
+            _ => 2,
         },
     );
     histograms.truncate(n);
@@ -3035,7 +3364,60 @@ mod ans_refinement_tests {
     }
 
     #[test]
-    fn empty_and_single_context_bundles_remain_unchanged() {
+    fn extraslow_keeps_or_shrinks_slow_entropy_and_is_deterministic() {
+        let tokens: Vec<_> = (0..70_000)
+            .map(|i| {
+                Token::new(
+                    i % 19,
+                    if i == 69_999 {
+                        u32::MAX
+                    } else if i % 7 == 0 {
+                        (i * 731) % 4096
+                    } else {
+                        (i / 19) % (3 + i % 19)
+                    },
+                )
+            })
+            .collect();
+        let streams: Vec<_> = tokens.chunks(17_003).collect();
+        let initial = || {
+            code_for(
+                &tokens,
+                (0..19).map(|i| (i % 3) as u8).collect(),
+                vec![HybridUintConfig::DEFAULT; 3],
+            )
+        };
+        let mut slow = initial();
+        refine_ans_clusters(
+            &mut slow,
+            streams.iter().copied(),
+            AnsRefinement::Slow,
+            &ThreadPool::new_lossless(1),
+            &mut CoderScratch::lossless(),
+        );
+        let slow_bits = serialized(&slow, &streams).0;
+        let mut expected = None;
+        for threads in [1, 4] {
+            let mut extra = initial();
+            refine_ans_clusters(
+                &mut extra,
+                streams.iter().copied(),
+                AnsRefinement::ExtraSlow,
+                &ThreadPool::new_lossless(threads),
+                &mut CoderScratch::lossless(),
+            );
+            let actual = serialized(&extra, &streams);
+            assert!(actual.0 <= slow_bits, "{} > {slow_bits}", actual.0);
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected);
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_single_context_bundles_are_rate_safe() {
         let pool = ThreadPool::new_lossless(1);
         let mut scratch = CoderScratch::lossless();
         for tokens in [vec![], vec![Token::new(2, 3); 1000]] {
@@ -3055,6 +3437,16 @@ mod ans_refinement_tests {
                 ));
                 assert_eq!(serialized(&code, &streams), before);
             }
+            // ExtraSlow may reduce the integer-config header even for a
+            // single-symbol distribution; the complete bundle must not grow.
+            refine_ans_clusters(
+                &mut code,
+                streams,
+                AnsRefinement::ExtraSlow,
+                &pool,
+                &mut scratch,
+            );
+            assert!(serialized(&code, &streams).0 <= before.0);
         }
     }
 
@@ -3564,6 +3956,77 @@ mod sampled_hybrid_tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn lossless_hybrid_search_minimizes_final_ans_cost_without_length_collisions() {
+        // Empty clusters, single symbols, skewed residuals, and large values
+        // that disqualify configs sharing the LZ77 length alphabet.
+        let values: Vec<Vec<u32>> = std::iter::once(Vec::new())
+            .chain((0..24).map(|shape| {
+                (0..2048)
+                    .map(|i| {
+                        if shape == 0 {
+                            0
+                        } else if i % (shape + 1) == 0 {
+                            ((i * 731) % (1 << (shape % 14))) as u32
+                        } else {
+                            (i % (shape + 1)) as u32
+                        }
+                    })
+                    .collect()
+            }))
+            .collect();
+        for stride in [1, 17] {
+            let samples = HybridUintSamples::from_parts(values.clone(), vec![stride; values.len()]);
+            let selected = samples.select_exhaustive(64);
+            for (values, config) in values.iter().zip(selected) {
+                if values.is_empty() {
+                    assert_eq!(config, HybridUintConfig::DEFAULT);
+                    continue;
+                }
+                let cost = |config| {
+                    let mut counts = [0u32; ALPHABET_SIZE];
+                    let mut extra = 0u64;
+                    for &value in values {
+                        let (symbol, bits, _) = uint_encode_with_config(value, config);
+                        if symbol >= 64 {
+                            return f64::INFINITY;
+                        }
+                        counts[symbol as usize] += stride as u32;
+                        extra += bits as u64 * stride as u64;
+                    }
+                    let base = optimize_ans_histogram(&counts);
+                    let table = refine_ans_histogram_precision(&counts, &base).unwrap_or(base);
+                    super::super::ans::ans_data_bits(&counts, &table.freqs)
+                        + super::super::ans::ans_table_bits(&table)
+                        + extra as f64
+                        + hybrid_uint_config_bits(config, 3) as f64
+                };
+                let chosen = cost(config);
+                assert!(chosen.is_finite());
+                for candidate in HYBRID_CANDIDATES {
+                    assert!(
+                        chosen <= cost(candidate) + 1e-6,
+                        "{config:?} vs {candidate:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_hybrid_search_checks_unsampled_maximum() {
+        // The bounded probe sees only small residuals. A large outlier outside
+        // the sample must still rule out configs exceeding the ANS alphabet.
+        let values: Vec<_> = (0..8192).map(|i| i % 7).collect();
+        let maximum = u32::MAX;
+        let selected = select_expanded_config(&values, 17, HybridUintConfig::DEFAULT, maximum);
+        assert!(selected.msb_in_token + selected.lsb_in_token <= selected.split_exponent);
+        for value in values.into_iter().chain([maximum]) {
+            assert!(uint_encode_with_config(value, selected).0 < ALPHABET_SIZE as u32);
+        }
+        assert_eq!(select_expanded_config(&[], 1, selected, maximum), selected,);
     }
 
     #[test]

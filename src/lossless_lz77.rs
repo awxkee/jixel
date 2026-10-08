@@ -1113,6 +1113,7 @@ pub(super) fn lz77_literals(tokens: &[Token]) -> Vec<LzToken> {
 }
 
 pub(super) fn build_lz_pixel_code<'tokens, 'scratch, I>(
+    thorough: bool,
     streams: I,
     nb_chans: usize,
     min_symbol: u32,
@@ -1124,6 +1125,7 @@ where
     I: Iterator<Item = &'tokens [LzToken]> + Clone,
 {
     build_lz_pixel_code_opts(
+        thorough,
         streams,
         nb_chans,
         min_symbol,
@@ -1140,6 +1142,7 @@ where
 /// collapses the clustering.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_lz_pixel_code_opts<'tokens, 'scratch, I>(
+    thorough: bool,
     streams: I,
     nb_chans: usize,
     min_symbol: u32,
@@ -1152,6 +1155,7 @@ where
     I: Iterator<Item = &'tokens [LzToken]> + Clone,
 {
     build_lz_pixel_code_threads(
+        thorough,
         streams,
         nb_chans,
         min_symbol,
@@ -1528,6 +1532,7 @@ fn merge_histograms(into: &mut [Histogram], from: &[Histogram]) {
 /// the order-dependent hybrid-uint sampling stays sequential.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_lz_pixel_code_threads<'tokens, 'scratch, I, T: LzTokenSource + 'tokens>(
+    thorough: bool,
     streams: I,
     nb_chans: usize,
     min_symbol: u32,
@@ -1542,6 +1547,7 @@ where
 {
     let streams: Vec<&'tokens [T]> = streams.collect();
     build_lz_pixel_code_slices(
+        thorough,
         &streams,
         &[],
         nb_chans,
@@ -1558,6 +1564,7 @@ where
 /// tail (`tails[k]` follows `streams[k]`; `ConstantTail::NONE` for none).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_lz_pixel_code_tails<'tokens, 'scratch, T: LzTokenSource + 'tokens>(
+    thorough: bool,
     streams: &[&'tokens [T]],
     tails: &[ConstantTail],
     nb_chans: usize,
@@ -1570,6 +1577,7 @@ pub(super) fn build_lz_pixel_code_tails<'tokens, 'scratch, T: LzTokenSource + 't
 ) -> EntropyCode<'scratch> {
     debug_assert_eq!(streams.len(), tails.len());
     build_lz_pixel_code_slices(
+        thorough,
         streams,
         tails,
         nb_chans,
@@ -1628,6 +1636,7 @@ fn compact_clusters_first_use(
 // token passes for each token representation.
 #[allow(clippy::too_many_arguments)]
 fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
+    thorough: bool,
     streams: &[&[T]],
     tails: &[ConstantTail],
     nb_chans: usize,
@@ -1689,7 +1698,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             pool,
             false,
             max_clusters,
-            2,
+            if thorough { 6 } else { 2 },
         )
     } else {
         cluster_histograms_fixed(
@@ -1770,7 +1779,11 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
                 }
             }
             let samples = crate::entropy::HybridUintSamples::from_parts(values, strides);
-            configs.copy_from_slice(&samples.select());
+            configs.copy_from_slice(&if thorough {
+                samples.select_exhaustive(min_symbol)
+            } else {
+                samples.select()
+            });
         }
         // Validate every literal against the chosen config, including values
         // outside the sampled ordinals. No duplicate literal vector is needed.
@@ -2246,6 +2259,7 @@ mod tests {
                     .collect();
                 let mut scratch = CoderScratch::default();
                 let code = build_lz_pixel_code_opts(
+                    false,
                     std::iter::once(stream.as_slice()),
                     3,
                     64,
@@ -2387,6 +2401,7 @@ mod tests {
             let pool = ThreadPool::new_lossless(threads);
             let raw = estimate_streams_bits(&slices, 4, 64, &pool, &mut scratch);
             let code = build_lz_pixel_code_threads(
+                false,
                 slices.iter().copied(),
                 3,
                 64,
@@ -2628,21 +2643,22 @@ mod tests {
         let tokens = periodic_tokens(200);
         let prices = LiteralPrices::new(&[tokens.as_slice()], 3);
         let mut scratch = Vec::new();
-        let first = lz77_compress_priced(
-            &tokens,
-            &prices,
-            &MatchPrices::initial(),
-            PRICED_MAX_PROBES,
-            &mut scratch,
-        )
-        .expect("a periodic stream pays");
-        assert!(same_values(&expand(&first), &tokens));
-        assert!(first.len() * 10 < tokens.len());
-        let learned = MatchPrices::learned(&[first.as_slice()], 3);
-        let second =
-            lz77_compress_priced(&tokens, &prices, &learned, PRICED_MAX_PROBES, &mut scratch)
+        for probes in [PRICED_MAX_PROBES, 64] {
+            let first = lz77_compress_priced(
+                &tokens,
+                &prices,
+                &MatchPrices::initial(),
+                probes,
+                &mut scratch,
+            )
+            .expect("a periodic stream pays");
+            assert!(same_values(&expand(&first), &tokens));
+            assert!(first.len() * 10 < tokens.len());
+            let learned = MatchPrices::learned(&[first.as_slice()], 3);
+            let second = lz77_compress_priced(&tokens, &prices, &learned, probes, &mut scratch)
                 .expect("still pays under learned prices");
-        assert!(same_values(&expand(&second), &tokens));
+            assert!(same_values(&expand(&second), &tokens));
+        }
     }
 
     #[test]
@@ -2964,12 +2980,19 @@ mod constant_tail_tests {
             .collect()
     }
 
-    /// (refined, ans_cluster): the learned-tree, Slow flat and Fast flat codes.
-    const CODE_KINDS: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
+    /// (thorough, refined, ans_cluster): ExtraSlow/Slow learned and flat codes,
+    /// plus Fast's prefix code. All must retain the decoder's constant fill.
+    const CODE_KINDS: [(bool, bool, bool); 5] = [
+        (true, true, true),
+        (true, true, false),
+        (false, true, true),
+        (false, true, false),
+        (false, false, false),
+    ];
 
     #[test]
     fn tail_context_is_pinned_to_a_single_symbol_cluster() {
-        for (refined, ans_cluster) in CODE_KINDS {
+        for (thorough, refined, ans_cluster) in CODE_KINDS {
             let tokens = stream(7, 4096, 3);
             let tail = ConstantTail {
                 context: 3,
@@ -2977,6 +3000,7 @@ mod constant_tail_tests {
             };
             let mut scratch = CoderScratch::default();
             let code = build_lz_pixel_code_tails(
+                thorough,
                 &[tokens.as_slice()],
                 &[tail],
                 4,
@@ -3011,7 +3035,7 @@ mod constant_tail_tests {
 
     #[test]
     fn tail_writes_the_same_bits_as_materialized_zeros() {
-        for (refined, ans_cluster) in CODE_KINDS {
+        for (thorough, refined, ans_cluster) in CODE_KINDS {
             for with_runs in [false, true] {
                 let literals = stream(11, 3000, 3);
                 let tail = ConstantTail {
@@ -3025,6 +3049,7 @@ mod constant_tail_tests {
                 };
                 let mut scratch = CoderScratch::default();
                 let code = build_lz_pixel_code_tails(
+                    thorough,
                     &[tokens.as_slice()],
                     &[tail],
                     4,
@@ -3054,6 +3079,7 @@ mod constant_tail_tests {
         let literals = stream(3, 2000, 3);
         let mut scratch = CoderScratch::default();
         let code = build_lz_pixel_code_tails(
+            false,
             &[literals.as_slice()],
             &[ConstantTail::NONE],
             3,

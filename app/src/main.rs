@@ -10,12 +10,12 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/inadra.png")).unwrap();
+    let image = image::open(Path::new("./assets/banner.png")).unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 2.0;
+    let distance = 0.87;
     for _ in 0..3 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
@@ -46,12 +46,12 @@ fn main() {
     let cfg = EncodeConfig::default()
         .with_lossless(false)
         .with_distance(distance)
-        .with_speed(Speed::Slow)
+        .with_speed(Speed::ExtraSlow)
         .with_progressive(false)
         .with_decoding_speed(DecodingSpeed::Slow)
         .with_patches(true)
         .with_color_encoding(ColorEncoding::srgb())
-        .with_coding_transform(CodingTransform::Rgb)
+        .with_coding_transform(CodingTransform::Xyb)
         .with_num_threads(
             available_parallelism()
                 .unwrap_or(NonZero::new(1).unwrap())
