@@ -351,6 +351,30 @@ pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<Squee
     steps
 }
 
+/// The lossy pyramid over `num_c` channels with the listed chroma channels
+/// pre-squeezed once (4:2:0) ahead of the shared steps; each pre-squeeze
+/// appends its residual after every other channel.
+pub(crate) fn lossy_squeeze_steps_chroma(
+    w: usize,
+    h: usize,
+    num_c: usize,
+    chroma: &[usize],
+) -> Vec<SqueezeStep> {
+    let mut steps = Vec::new();
+    for &c in chroma {
+        for horizontal in [true, false] {
+            steps.push(SqueezeStep {
+                horizontal,
+                in_place: false,
+                begin_c: c,
+                num_c: 1,
+            });
+        }
+    }
+    steps.extend(default_squeeze_steps(w, h, num_c));
+    steps
+}
+
 pub(crate) fn default_squeeze_steps(mut w: usize, mut h: usize, num_c: usize) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     const MAX_PREVIEW: usize = 8;

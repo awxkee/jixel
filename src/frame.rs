@@ -1466,6 +1466,74 @@ fn zero_alpha_for_lossy(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<Alp
     }
 }
 
+/// Auto gate of the lossy-modular arm: byte cushion for the calibration's
+/// per-image quality noise (two-corpus + Optuna joint fit, study
+/// lossy_modular_v3 2026-09-02).
+const LM_GATE_MARGIN: f64 = 1.066;
+
+/// Integer lattice of the plain lossy-modular arm. Squeeze rounds its
+/// averages to the lattice at every level; on the image's own 8-bit codes
+/// that rounding alone costs ~4 SSIMULACRA2 points (kodim20 gray: 8-bit
+/// lattice 19.3 KB @ 68.1, 16-bit 18.0 KB @ 71.5, the XYB arm's 4096-step
+/// lattice 20.9 KB @ 74.2), so the frame declares 16 bits whatever the input
+/// depth.
+const LM_PLAIN_MAX: f32 = 65535.0;
+
+/// The non-XYB frame's integer planes for the lossy-modular arm on the
+/// `LM_PLAIN_MAX` lattice: the coded color planes (gray: its one channel),
+/// then K at its squeeze distance (rescaled to the lattice) or alpha as
+/// stored (coded losslessly). None for float alpha.
+fn lm_plain_input(
+    ctx: &EncodingContext,
+    coded: &Image3F,
+    gray: bool,
+    alpha: Option<&AlphaPlane>,
+) -> Option<crate::lossless::LmPlainInput> {
+    let n = coded.xsize() * coded.ysize();
+    let max = LM_PLAIN_MAX;
+    let round = |v: f32| (v * max).round() as i32;
+    let color: Vec<Vec<i32>> = if gray {
+        // Gray is coded as three equal channels; the modular frame carries
+        // the sample itself (YCbCr's luma plane sits 128/255 below it).
+        let offset = match ctx.coding {
+            crate::coding::CodingTransform::YCbCr => 128.0 / 255.0,
+            _ => 0.0,
+        };
+        vec![
+            coded.plane_data(1)[..n]
+                .iter()
+                .map(|&v| round(v + offset))
+                .collect(),
+        ]
+    } else {
+        (0..3)
+            .map(|c| coded.plane_data(c)[..n].iter().map(|&v| round(v)).collect())
+            .collect()
+    };
+    let extra: Vec<Vec<i32>> = match alpha {
+        Some(AlphaPlane::F32(_)) => return None,
+        Some(plane) if ctx.extra_squeeze_distance > 0.0 => {
+            let scale = max / ((1u32 << plane.bits()) - 1) as f32;
+            vec![
+                (0..n)
+                    .map(|i| (plane.get_i32(i) as f32 * scale).round() as i32)
+                    .collect(),
+            ]
+        }
+        Some(plane) => vec![(0..n).map(|i| plane.get_i32(i)).collect()],
+        None => Vec::new(),
+    };
+    Some(crate::lossless::LmPlainInput {
+        color,
+        extra: extra
+            .into_iter()
+            .map(|v| (v, ctx.extra_squeeze_distance))
+            .collect(),
+        max,
+        coding: ctx.coding,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame(
     ctx: &EncodingContext,
@@ -1477,20 +1545,53 @@ pub(crate) fn encode_frame(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
+    integer_samples: bool,
     writer: &mut BitWriter,
-) -> Result<(), EncodeError> {
+) -> Result<bool, EncodeError> {
     let distp = compute_distance_params(distance);
     if !ctx.coding.is_xyb() {
         // Non-XYB planes skip every XYB content heuristic: they read as
-        // achromatic to the classifiers, and patches and the lossy-modular
-        // arm quantize on the XYB lattice.
-        let coded = coded
-            .expect("non-XYB frames carry their coded planes")
-            .clone();
+        // achromatic to the classifiers, and patches quantize on the XYB
+        // lattice.
+        let coded = coded.expect("non-XYB frames carry their coded planes");
+        // The lossy-modular arm codes the integer samples themselves (gray
+        // as its one channel; alpha or K as an extra channel).
+        let modular = |scratch: &mut CoderScratch| -> Option<BitWriter> {
+            if !integer_samples {
+                return None;
+            }
+            let mut w = BitWriter::new();
+            crate::lossless::encode_frame_lossy_modular_plain(
+                &lm_plain_input(ctx, coded, is_achromatic, alpha)?,
+                coded.xsize(),
+                coded.ysize(),
+                crate::lossless::lm_plain_distance(ctx.coding, distance),
+                ctx.speed,
+                &ctx.thread_pool,
+                scratch,
+                &mut w,
+            )
+            .then_some(w)
+        };
+        let auto =
+            ctx.lossy_modular == crate::LossyModular::Auto && ctx.speed.effort().lossy_modular_auto;
+        let modular_writer = match ctx.lossy_modular {
+            crate::LossyModular::Force => match modular(scratch) {
+                Some(w) => {
+                    writer.append(&w);
+                    return Ok(true);
+                }
+                None => None,
+            },
+            crate::LossyModular::Auto if auto => modular(scratch),
+            _ => None,
+        };
+        let coded = coded.clone();
         let _ = ctx.aq_source.set(to_xyb_image(ctx, scratch, linear));
         ctx.set_plain_matrices(&coded);
         ctx.set_cfl_frame(crate::coding::fit_cfl_frame(ctx.coding, &coded));
-        return encode_frame_vardct(
+        let mut vardct_writer = BitWriter::new();
+        encode_frame_vardct(
             ctx,
             scratch,
             distance,
@@ -1500,8 +1601,21 @@ pub(crate) fn encode_frame(
             alpha,
             coeff_shifts,
             false,
-            writer,
-        );
+            &mut vardct_writer,
+        )?;
+        return Ok(match modular_writer {
+            Some(m)
+                if (m.bits_written() as f64) * LM_GATE_MARGIN
+                    < vardct_writer.bits_written() as f64 =>
+            {
+                writer.append(&m);
+                true
+            }
+            _ => {
+                writer.append(&vardct_writer);
+                false
+            }
+        });
     }
     let mut xyb = to_xyb_image(ctx, scratch, linear);
     if is_achromatic {
@@ -1522,16 +1636,13 @@ pub(crate) fn encode_frame(
             &mut modular_writer,
         ) {
             writer.append(&modular_writer);
-            return Ok(());
+            return Ok(false);
         }
     }
     if alpha.is_none()
         && ctx.lossy_modular == crate::LossyModular::Auto
         && ctx.speed.effort().lossy_modular_auto
     {
-        // Byte cushion for the calibration's per-image quality noise
-        // (two-corpus + Optuna joint fit, study lossy_modular_v3 2026-09-02).
-        const LM_GATE_MARGIN: f64 = 1.066;
         let mut modular_writer = BitWriter::new();
         let have_modular = crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
@@ -1562,7 +1673,7 @@ pub(crate) fn encode_frame(
         } else {
             writer.append(&vardct_writer);
         }
-        return Ok(());
+        return Ok(false);
     }
     encode_frame_vardct(
         ctx,
@@ -1575,7 +1686,8 @@ pub(crate) fn encode_frame(
         coeff_shifts,
         patches,
         writer,
-    )
+    )?;
+    Ok(false)
 }
 
 /// The VarDCT arm of lossy encoding (regular or patched), from a prepared XYB

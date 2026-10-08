@@ -371,7 +371,7 @@ pub struct EncodeConfig {
     /// container box together with its ISO 21496-1 metadata. Forces the
     /// output into the JXL container form.
     pub gain_map: Option<GainMap>,
-    /// Color transform of lossy VarDCT frames (see [`CodingTransform`]).
+    /// Color transform of lossy frames (see [`CodingTransform`]).
     pub coding_transform: CodingTransform,
 }
 
@@ -388,8 +388,10 @@ pub enum LossyModular {
     /// to match the VarDCT arm's quality — and keep the smaller frame.
     /// [`Speed::Slow`] and above (falls back to VarDCT otherwise).
     Auto,
-    /// Always use the modular arm when the frame supports it (RGB without
-    /// alpha, above tiny sizes); other frames fall back to VarDCT.
+    /// Always use the modular arm when the frame supports it (XYB: RGB
+    /// without alpha; other coding transforms: any integer image, gray, CMYK
+    /// and alpha included; all above tiny sizes); other frames fall back to
+    /// VarDCT.
     Force,
 }
 
@@ -1773,6 +1775,7 @@ fn encode_f32_lossless_rgba(
                 xyb: &XybMatrix::SPEC,
                 grayscale: false,
                 orientation: config.orientation,
+                lossy_modular_16: false,
             },
             &mut metadata_scratch,
             &mut w,
@@ -2142,6 +2145,22 @@ pub(crate) fn encode_with_coded_planes(
         config.progressive_passes,
         config.progressive_shifts.as_deref(),
     );
+    // The frame first: a lossy modular frame of a non-XYB codestream changes
+    // the declared bit depth.
+    let mut frame = BitWriter::new();
+    let lossy_modular_16 = encode_frame(
+        ctx,
+        scratch,
+        distance,
+        input,
+        coded,
+        config.grayscale,
+        config.alpha.as_ref(),
+        &coeff_shifts,
+        config.patches,
+        !config.bits_per_sample.is_float(),
+        &mut frame,
+    )?;
     write_image_metadata(
         &ImageMetadataParams {
             tone_mapping: config.tone_mapping(),
@@ -2155,22 +2174,12 @@ pub(crate) fn encode_with_coded_planes(
             xyb: &ctx.xyb,
             grayscale: config.grayscale,
             orientation: config.orientation,
+            lossy_modular_16,
         },
         scratch,
         &mut w,
     );
-    encode_frame(
-        ctx,
-        scratch,
-        distance,
-        input,
-        coded,
-        config.grayscale,
-        config.alpha.as_ref(),
-        &coeff_shifts,
-        config.patches,
-        &mut w,
-    )?;
+    w.append(&frame);
     let codestream = w.into_bytes();
     let alpha_bits = config.alpha.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     finalize_container(
@@ -2342,6 +2351,7 @@ fn encode_lossless_planes(
                 xyb: &XybMatrix::SPEC,
                 grayscale: config.grayscale,
                 orientation: config.orientation,
+                lossy_modular_16: false,
             },
             &mut metadata_scratch,
             &mut w,
@@ -2568,6 +2578,9 @@ struct ImageMetadataParams<'a> {
     xyb: &'a XybMatrix,
     grayscale: bool,
     orientation: Orientation,
+    /// The frame is a lossy modular frame on the 16-bit lattice: the image
+    /// (and K) declare 16 bits whatever the input depth was.
+    lossy_modular_16: bool,
 }
 
 fn write_image_metadata(
@@ -2587,7 +2600,13 @@ fn write_image_metadata(
         xyb,
         grayscale,
         orientation,
+        lossy_modular_16,
     } = *params;
+    let bps = if lossy_modular_16 {
+        BitsPerSample::Sixteen
+    } else {
+        bps
+    };
     w.write(1, 0); // all_default = false
     // tone_mapping (HDR luminance) is gated by extra_fields; a non-identity
     // orientation also lives in the extra_fields block, so either forces it on.
@@ -2610,7 +2629,7 @@ fn write_image_metadata(
     //   * lossless: the color image (YCoCg-R residuals, 17-bit at 16-bit input);
     //   * lossy or lossless: a 16-bit alpha extra channel (values up to 65535).
     let alpha_bits = alpha.map(|a| a.bits() as u32).unwrap_or(0);
-    let needs_32 = (lossless && bps.bits() >= 16) || alpha_bits >= 16;
+    let needs_32 = (lossless && bps.bits() >= 16) || alpha_bits >= 16 || lossy_modular_16;
     w.write(1, if needs_32 { 0 } else { 1 });
 
     if let Some(alpha) = alpha {
@@ -2626,11 +2645,12 @@ fn write_image_metadata(
         match alpha.bits() {
             bits if black => {
                 // kBlack: no all-default form (that one is 8-bit alpha) and
-                // no type-specific fields.
+                // no type-specific fields. A lossy modular frame codes K on
+                // the 16-bit lattice too.
                 w.write(1, 0); // all_default = false
                 w.write(2, 2); // ec_type: BitsOffset(4, 2) selector
                 w.write(4, 4 - 2); // ec_type = Black (4)
-                write_int_bit_depth(bits as u32, w);
+                write_int_bit_depth(if lossy_modular_16 { 16 } else { bits as u32 }, w);
                 w.write(2, 0); // dim_shift = 0
                 w.write(2, 0); // name length = 0
             }

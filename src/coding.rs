@@ -26,7 +26,8 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-/// The color transform lossy VarDCT frames are coded in.
+/// The color transform lossy frames (VarDCT, or the lossy modular arm) are
+/// coded in.
 ///
 /// `Xyb` converts the image to the perceptual XYB space; the decoder renders
 /// it into any output space. The other two keep the samples in the image's own
@@ -35,7 +36,8 @@
 /// equal quality. Float samples are coded in their own units, so linear-light
 /// HDR is better served by `Xyb`. Gray input is coded as three equal
 /// channels. CMYK never uses XYB (it would discard the separations) and takes
-/// `YCbCr` for `Xyb`.
+/// `YCbCr` for `Xyb`. A lossy modular frame of a non-XYB codestream codes the
+/// samples on a 16-bit lattice and declares 16 bits per sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CodingTransform {
     /// Perceptual XYB (the default).

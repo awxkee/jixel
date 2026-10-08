@@ -913,12 +913,275 @@ fn write_lossy_modular_dc_quant(w: &mut BitWriter) {
     }
 }
 
+/// How the arm's modular image maps onto the frame: the XYB lattice, or the
+/// image's own integer samples (a non-XYB frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LmLayout {
+    /// [Y, X, B-Y] on the `LOSSY_MODULAR_XYB_SCALE` lattice, signalled
+    /// through custom dc_quant steps.
+    Xyb,
+    /// The samples in bit-depth units; the decoder divides by the sample
+    /// range. `ycbcr` sets the frame's do_YCbCr bit, `rct` codes the three
+    /// color channels through the YCoCg RCT, `extra` counts the extra
+    /// channels appended after the color ones.
+    Plain {
+        ycbcr: bool,
+        rct: bool,
+        extra: usize,
+    },
+}
+
+impl LmLayout {
+    fn write_frame_header(self, w: &mut BitWriter) {
+        match self {
+            Self::Xyb => write_frame_header_modular_xyb_regular(w),
+            Self::Plain { ycbcr, extra, .. } => {
+                write_frame_header_modular_plain(ycbcr, extra, w);
+            }
+        }
+    }
+
+    /// The LfGlobal dc_quant field.
+    fn write_dc_quant(self, w: &mut BitWriter) {
+        match self {
+            Self::Xyb => write_lossy_modular_dc_quant(w),
+            // Unused by the decoder outside XYB.
+            Self::Plain { .. } => w.write(1, 1),
+        }
+    }
+
+    fn write_transforms(self, steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
+        match self {
+            Self::Plain { rct: true, .. } => write_modular_transforms_rct_squeeze(steps, w),
+            _ => write_modular_transforms_squeeze_only(steps, w),
+        }
+    }
+}
+
+/// Regular single-pass modular frame of a non-XYB codestream, no loop
+/// filters (same shape as the lossless header plus the YCbCr signalling).
+fn write_frame_header_modular_plain(ycbcr: bool, extra: usize, w: &mut BitWriter) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(1, u64::from(ycbcr)); // do_YCbCr
+    if ycbcr {
+        for _ in 0..3 {
+            w.write(2, 0); // chroma subsampling 4:4:4
+        }
+    }
+    w.write(2, 0b00); // upsampling = 1
+    for _ in 0..extra {
+        w.write(2, 0b00); // ec_upsampling = 1
+    }
+    w.write(2, GroupLayout::DEFAULT.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 0); // have_crop = false
+    w.write(2, 0b00); // blending = Replace
+    for _ in 0..extra {
+        w.write(2, 0b00); // extra-channel blending = Replace
+    }
+    w.write(1, 1); // is_last
+    w.write(2, 0b00); // name length = 0
+    w.write(1, 0); // loop_filter not all_default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // 0 EPF iters
+    w.write(2, 0b00); // no LF extensions
+    w.write(2, 0b00); // no FH extensions
+}
+
 /// The lossy-modular arm's quantized state: divided channels, per-channel
 /// steps, and the squeeze script that produced them.
 pub(crate) struct LmQuantized {
     channels: Vec<crate::squeeze::Channel>,
     quants: Vec<u32>,
     steps: Vec<crate::squeeze::SqueezeStep>,
+    layout: LmLayout,
+    xsize: usize,
+    ysize: usize,
+}
+
+/// Quantization role of one channel of a plain-layout pyramid.
+#[derive(Clone, Copy, PartialEq)]
+enum LmRole {
+    Luma,
+    Chroma,
+    /// Extra channel at its own (luma-row) distance; 0 = lossless.
+    Extra(f32),
+}
+
+/// Chroma step relative to luma in the plain layouts: Cb/Cr, and the YCoCg
+/// differences of RGB (twice their range). Slow Kodak sweeps (01/02/05/20,
+/// d 1-4): YCbCr flat over 2-3, RGB flat over 3-6.
+fn lm_plain_chroma_mul(coding: crate::coding::CodingTransform) -> f32 {
+    match coding {
+        crate::coding::CodingTransform::Rgb => 4.0,
+        _ => 2.5,
+    }
+}
+
+/// Map the caller's distance to a plain-layout quantizer distance so the arm
+/// lands on the VarDCT arm's SSIMULACRA2 at the same `d` (same purpose as
+/// [`lm_calibrated_distance`]; fitted on Kodak 01/02/05/20 at Slow with the
+/// chroma multipliers above). Piecewise linear, flat past the ends.
+pub(crate) fn lm_plain_distance(coding: crate::coding::CodingTransform, d: f32) -> f32 {
+    let knots: &[(f32, f32)] = match coding {
+        crate::coding::CodingTransform::Rgb => &[
+            (1.0, 1.49),
+            (1.5, 2.06),
+            (2.0, 2.54),
+            (3.0, 2.85),
+            (4.0, 2.92),
+        ],
+        _ => &[(1.0, 2.38), (1.5, 3.28), (2.0, 3.78), (3.0, 4.33)],
+    };
+    d * interpolate_knots(knots, d)
+}
+
+/// Piecewise-linear lookup through `knots` (sorted by x), flat outside.
+fn interpolate_knots(knots: &[(f32, f32)], x: f32) -> f32 {
+    let (first, last) = (knots[0], knots[knots.len() - 1]);
+    if x <= first.0 {
+        return first.1;
+    }
+    if x >= last.0 {
+        return last.1;
+    }
+    for w in knots.windows(2) {
+        let [(x0, y0), (x1, y1)] = [w[0], w[1]];
+        if x >= x0 && x <= x1 {
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+        }
+    }
+    last.1
+}
+
+/// Luma-row quantization step of a channel in bit-depth units: the arm's
+/// schedule scaled from the XYB luma lattice to `max`.
+fn lossy_modular_q_plain(distance: f32, hshift: i32, vshift: i32, max: f32, mul: f32) -> i32 {
+    let mut shift = (hshift + vshift).min(16);
+    if shift > 0 {
+        shift -= 1;
+    }
+    let unit = max / LOSSY_MODULAR_XYB_SCALE[1];
+    let q = 0.25 * distance * SQUEEZE_QUALITY_FACTOR_XYB * SQUEEZE_XYB_QTABLE[0][shift as usize];
+    ((q * unit * mul) as i32).max(1)
+}
+
+/// The non-XYB frame's integer planes for the arm: `color` holds one (gray)
+/// or three channels in the coded plane order, `extra` the extra channels
+/// with their squeeze distances (0 = lossless), all in units of `max`.
+pub(crate) struct LmPlainInput {
+    pub color: Vec<Vec<i32>>,
+    pub extra: Vec<(Vec<i32>, f32)>,
+    pub max: f32,
+    pub coding: crate::coding::CodingTransform,
+}
+
+/// Build and quantize a plain-layout pyramid at `effective_distance`
+/// (already calibrated). None when the image is too small to squeeze.
+pub(crate) fn lm_quantize_plain(
+    input: &LmPlainInput,
+    xsize: usize,
+    ysize: usize,
+    effective_distance: f32,
+) -> Option<LmQuantized> {
+    use crate::coding::CodingTransform;
+    use crate::squeeze::{
+        Channel, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps_chroma,
+    };
+    let num_color = input.color.len();
+    debug_assert!(num_color == 1 || num_color == 3);
+    let num_c = num_color + input.extra.len();
+    if default_squeeze_steps(xsize, ysize, num_c).is_empty() {
+        return None;
+    }
+    let n = xsize * ysize;
+    let mut planes: Vec<Vec<i32>> = Vec::with_capacity(num_c);
+    let mut roles: Vec<LmRole> = Vec::with_capacity(num_c);
+    let (ycbcr, rct, chroma): (bool, bool, Vec<usize>) = match (num_color, input.coding) {
+        (3, CodingTransform::YCbCr) => (true, false, vec![0, 2]),
+        (3, _) => (false, true, vec![1, 2]),
+        _ => (false, false, Vec::new()),
+    };
+    if rct {
+        let [r, g, b] = [&input.color[0], &input.color[1], &input.color[2]];
+        let mut y = vec![0i32; n];
+        let mut co = vec![0i32; n];
+        let mut cg = vec![0i32; n];
+        for i in 0..n {
+            (y[i], co[i], cg[i]) = crate::lossless::forward_ycocg(r[i], g[i], b[i]);
+        }
+        planes.extend([y, co, cg]);
+    } else {
+        planes.extend(input.color.iter().map(|p| p[..n].to_vec()));
+    }
+    roles.extend((0..num_color).map(|c| {
+        if chroma.contains(&c) {
+            LmRole::Chroma
+        } else {
+            LmRole::Luma
+        }
+    }));
+    for (plane, distance) in &input.extra {
+        planes.push(plane[..n].to_vec());
+        roles.push(LmRole::Extra(*distance));
+    }
+    let steps = lossy_squeeze_steps_chroma(xsize, ysize, num_c, &chroma);
+    let n_pre: usize = steps.iter().filter(|s| !s.in_place).map(|s| s.num_c).sum();
+    let mut channels: Vec<Channel> = planes
+        .into_iter()
+        .map(|data| Channel {
+            data,
+            w: xsize,
+            h: ysize,
+            hshift: 0,
+            vshift: 0,
+        })
+        .collect();
+    for s in &steps {
+        apply_step_forward(&mut channels, s);
+    }
+    let nb = channels.len();
+    let mut quants: Vec<u32> = Vec::with_capacity(nb);
+    for (i, ch) in channels.iter_mut().enumerate() {
+        let role = if i >= nb - n_pre {
+            LmRole::Chroma
+        } else {
+            roles[i % num_c]
+        };
+        let q = match role {
+            LmRole::Luma => {
+                lossy_modular_q_plain(effective_distance, ch.hshift, ch.vshift, input.max, 1.0)
+            }
+            LmRole::Chroma => lossy_modular_q_plain(
+                effective_distance,
+                ch.hshift,
+                ch.vshift,
+                input.max,
+                lm_plain_chroma_mul(input.coding),
+            ),
+            LmRole::Extra(d) if d > 0.0 => {
+                lossy_modular_q_plain(d, ch.hshift, ch.vshift, input.max, 1.0)
+            }
+            LmRole::Extra(_) => 1,
+        };
+        quantize_channel_divide(ch, q);
+        quants.push(q as u32);
+    }
+    Some(LmQuantized {
+        channels,
+        quants,
+        steps,
+        layout: LmLayout::Plain {
+            ycbcr,
+            rct,
+            extra: input.extra.len(),
+        },
+        xsize,
+        ysize,
+    })
 }
 
 /// Build and quantize the arm's channel pyramid at `effective_distance`
@@ -997,6 +1260,9 @@ pub(crate) fn lm_quantize(
         channels,
         quants,
         steps,
+        layout: LmLayout::Xyb,
+        xsize,
+        ysize,
     })
 }
 
@@ -1014,16 +1280,48 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
-    let xsize = xyb.xsize();
-    let ysize = xyb.ysize();
-    let Some(LmQuantized {
+    match lm_quantize(xyb, effective_distance) {
+        Some(quantized) => encode_lm_frame(quantized, speed, pool, scratch, writer),
+        None => false,
+    }
+}
+
+/// Lossy modular frame of a non-XYB codestream: the integer planes in
+/// `input` squeezed and quantized at the plain-layout schedule (see
+/// `lm_plain_distance`). Returns false when the frame cannot take this path.
+pub(crate) fn encode_frame_lossy_modular_plain(
+    input: &LmPlainInput,
+    xsize: usize,
+    ysize: usize,
+    effective_distance: f32,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    match lm_quantize_plain(input, xsize, ysize, effective_distance) {
+        Some(quantized) => encode_lm_frame(quantized, speed, pool, scratch, writer),
+        None => false,
+    }
+}
+
+/// Code one quantized pyramid as a complete modular frame (header, TOC and
+/// sections).
+fn encode_lm_frame(
+    quantized: LmQuantized,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    let LmQuantized {
         channels,
         quants,
         steps,
-    }) = lm_quantize(xyb, effective_distance)
-    else {
-        return false;
-    };
+        layout,
+        xsize,
+        ysize,
+    } = quantized;
     let nb = channels.len();
 
     // Same literal-vs-LZ77 guard as the atlas path, from the actual quantized
@@ -1098,13 +1396,13 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
             tokens.extend(channel);
         }
 
-        write_frame_header_modular_xyb_regular(writer);
+        layout.write_frame_header(writer);
         let mut section = BitWriter::new();
-        write_lossy_modular_dc_quant(&mut section);
+        layout.write_dc_quant(&mut section);
         section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
         section.write(1, 0); // use_global_tree = 0
         section.write(1, 1); // wp_default = 1
-        write_modular_transforms_squeeze_only(&steps, &mut section);
+        layout.write_transforms(&steps, &mut section);
 
         let distance_ctx = nb as u32;
         let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
@@ -1401,13 +1699,13 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
         &mut scratch.huffman_pool,
     );
 
-    write_frame_header_modular_xyb_regular(writer);
+    layout.write_frame_header(writer);
 
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
     // ----- Section 0: LfGlobal = global tree + global modular image -----
-    write_lossy_modular_dc_quant(&mut sections[0]);
+    layout.write_dc_quant(&mut sections[0]);
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
         &tree_tokens,
@@ -1418,7 +1716,7 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
     );
     sections[0].write(1, 1); // use_global_tree = 1
     sections[0].write(1, 1); // wp_default = 1
-    write_modular_transforms_squeeze_only(&steps, &mut sections[0]);
+    layout.write_transforms(&steps, &mut sections[0]);
     write_lz_section(
         &global_lz,
         distance_ctx,
@@ -1862,4 +2160,144 @@ fn emit_slot_forest(trees: &[LearnedTree], mults: &[u32]) -> (Vec<Token>, Vec<u3
         }
     }
     (tokens, leaf_ctx, bases, ctx)
+}
+
+#[cfg(test)]
+mod lm_plain_tests {
+    use super::*;
+    use crate::coding::CodingTransform;
+
+    fn ramp(w: usize, h: usize, seed: i32) -> Vec<i32> {
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as i32, (i / w) as i32);
+                ((x * 523 + y * 311 + seed * 97) % 65536).max(0)
+            })
+            .collect()
+    }
+
+    fn input(coding: CodingTransform, color: usize, extra: Vec<(Vec<i32>, f32)>) -> LmPlainInput {
+        LmPlainInput {
+            color: (0..color).map(|c| ramp(64, 48, c as i32)).collect(),
+            extra,
+            max: 65535.0,
+            coding,
+        }
+    }
+
+    #[test]
+    fn ycbcr_layout_pre_squeezes_the_outer_planes() {
+        let q =
+            lm_quantize_plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 64, 48, 8.0).unwrap();
+        assert_eq!(
+            q.layout,
+            LmLayout::Plain {
+                ycbcr: true,
+                rct: false,
+                extra: 0
+            }
+        );
+        let pre: Vec<(usize, usize)> = q
+            .steps
+            .iter()
+            .filter(|s| !s.in_place)
+            .map(|s| (s.begin_c, s.num_c))
+            .collect();
+        assert_eq!(pre, [(0, 1), (0, 1), (2, 1), (2, 1)]);
+        assert!(q.steps.iter().filter(|s| s.in_place).all(|s| s.num_c == 3));
+        // The chroma pre-squeeze residuals come last and sit on the coarser
+        // chroma schedule.
+        let nb = q.channels.len();
+        assert!(q.quants[nb - 1] > q.quants[nb - 1 - 4]);
+        assert!(q.quants.iter().all(|&v| v >= 1));
+    }
+
+    #[test]
+    fn rgb_layout_uses_the_rct_and_gray_neither() {
+        let q =
+            lm_quantize_plain(&input(CodingTransform::Rgb, 3, Vec::new()), 64, 48, 8.0).unwrap();
+        assert_eq!(
+            q.layout,
+            LmLayout::Plain {
+                ycbcr: false,
+                rct: true,
+                extra: 0
+            }
+        );
+        let pre: Vec<usize> = q
+            .steps
+            .iter()
+            .filter(|s| !s.in_place)
+            .map(|s| s.begin_c)
+            .collect();
+        assert_eq!(pre, [1, 1, 2, 2]);
+        let g =
+            lm_quantize_plain(&input(CodingTransform::Rgb, 1, Vec::new()), 64, 48, 8.0).unwrap();
+        assert_eq!(
+            g.layout,
+            LmLayout::Plain {
+                ycbcr: false,
+                rct: false,
+                extra: 0
+            }
+        );
+        assert!(g.steps.iter().all(|s| s.in_place && s.num_c == 1));
+    }
+
+    #[test]
+    fn extra_channels_follow_their_own_distance() {
+        let lossless = (ramp(64, 48, 7), 0.0);
+        let lossy = (ramp(64, 48, 9), 40.0);
+        let q = lm_quantize_plain(
+            &input(CodingTransform::YCbCr, 3, vec![lossless, lossy]),
+            64,
+            48,
+            8.0,
+        )
+        .unwrap();
+        assert_eq!(
+            q.layout,
+            LmLayout::Plain {
+                ycbcr: true,
+                rct: false,
+                extra: 2
+            }
+        );
+        assert!(q.steps.iter().filter(|s| s.in_place).all(|s| s.num_c == 5));
+        let nb = q.channels.len();
+        // Channel i % 5: 3 = the lossless extra (step 1 everywhere), 4 = the
+        // lossy one (coarser than luma at the same level).
+        for i in 0..nb - 4 {
+            match i % 5 {
+                3 => assert_eq!(q.quants[i], 1, "lossless extra at {i}"),
+                4 => assert!(q.quants[i] >= q.quants[i - 3], "lossy extra at {i}"),
+                _ => {}
+            }
+        }
+        // Tiny frames have no pyramid.
+        assert!(
+            lm_quantize_plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 8, 8, 8.0).is_none()
+        );
+    }
+
+    #[test]
+    fn plain_distance_is_monotonic_and_flat_outside_the_knots() {
+        for coding in [CodingTransform::YCbCr, CodingTransform::Rgb] {
+            let mut last = 0.0;
+            for d in [0.1, 0.5, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 6.0, 10.0] {
+                let e = lm_plain_distance(coding, d);
+                assert!(e > last, "{coding:?} d={d}");
+                assert!(
+                    e > d,
+                    "{coding:?} d={d}: the arm quantizes coarser than its distance"
+                );
+                last = e;
+            }
+            assert_eq!(
+                lm_plain_distance(coding, 0.5) * 2.0,
+                lm_plain_distance(coding, 1.0)
+            );
+        }
+        assert_eq!(interpolate_knots(&[(1.0, 2.0), (3.0, 4.0)], 2.0), 3.0);
+    }
 }

@@ -343,6 +343,10 @@ mod tests {
                     .with_coding_transform(crate::CodingTransform::Rgb),
                 EncodeConfig::default()
                     .with_speed(speed)
+                    .with_distance(1.5)
+                    .with_lossy_modular(crate::LossyModular::Force),
+                EncodeConfig::default()
+                    .with_speed(speed)
                     .with_lossless(true),
             ] {
                 for convention in [InkConvention::Amount, InkConvention::Inverted] {
