@@ -535,7 +535,7 @@ fn ac_metadata_context(left: i32, base: u32) -> u32 {
 pub(crate) fn collect_ac_metadata_tokens(
     dc_data: &DcGroupData,
     props: &mut Vec<crate::dc_tree::DcProp>,
-    distance: f32,
+    epf_sharpness: i32,
     collect_props: bool,
 ) -> Vec<Token> {
     #[inline]
@@ -647,15 +647,46 @@ pub(crate) fn collect_ac_metadata_tokens(
     debug_assert_eq!(first_idx, num_first_blocks);
 
     // (d) EPF tokens (constant stream; refinement can never split it).
-    let sharp = epf_sharpness_id(distance);
     if collect_props {
-        props.resize(props.len() + nblocks, wbin(sharp));
+        props.resize(props.len() + nblocks, wbin(epf_sharpness));
     }
-    tokens.resize(tokens.len() + nblocks, Token::new(0, pack_signed(sharp)));
+    tokens.resize(
+        tokens.len() + nblocks,
+        Token::new(0, pack_signed(epf_sharpness)),
+    );
     tokens
 }
 
-fn epf_sharpness_id(distance: f32) -> i32 {
+/// Fraction of exactly constant 8x8 blocks above which a frame is screen content.
+const SCREEN_CONTENT_CONSTANT_BLOCKS: f32 = 0.15;
+const SCREEN_CONTENT_EPF_MAX_DISTANCE: f32 = 5.0;
+
+/// Fraction of whole 8x8 blocks whose three XYB planes are each constant.
+/// Identical input pixels map to identical XYB values, so the test is exact.
+fn constant_block_fraction(xyb: &Image3F) -> f32 {
+    let (bw, bh) = (xyb.xsize() / 8, xyb.ysize() / 8);
+    if bw == 0 || bh == 0 {
+        return 0.0;
+    }
+    let mut constant = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let x0 = bx * 8;
+            let is_constant = (0..3).all(|c| {
+                let v = xyb.plane_row(c, by * 8)[x0];
+                (0..8).all(|iy| {
+                    xyb.plane_row(c, by * 8 + iy)[x0..x0 + 8]
+                        .iter()
+                        .all(|&p| p == v)
+                })
+            });
+            constant += usize::from(is_constant);
+        }
+    }
+    constant as f32 / (bw * bh) as f32
+}
+
+pub(crate) fn epf_sharpness_id(distance: f32, screen_content: bool) -> i32 {
     let t = dcepf_vlq_t(distance);
     if t >= 0.75 {
         return 1;
@@ -664,7 +695,9 @@ fn epf_sharpness_id(distance: f32) -> i32 {
     } else if t >= 0.25 {
         return 3;
     }
-    if distance < 1.75 {
+    // Hard edges beside flat fills ring visibly; up to d=5 the strongest
+    // filter wins both SSIMULACRA2 and butteraugli there at identical bytes.
+    if distance < 1.75 || (screen_content && distance < SCREEN_CONTENT_EPF_MAX_DISTANCE) {
         7
     } else if distance < 2.75 {
         6
@@ -679,7 +712,12 @@ fn epf_sharpness_id(distance: f32) -> i32 {
 /// freshly optimized entropy code. Used by the sub-8x8 activation gate to weigh
 /// the exact selected set's meta-stream cost against its RD benefit.
 fn meta_entropy_cost(dc_data: &DcGroupData, scratch: &mut CoderScratch, distance: f32) -> u64 {
-    let toks = collect_ac_metadata_tokens(dc_data, &mut Vec::new(), distance, false);
+    let toks = collect_ac_metadata_tokens(
+        dc_data,
+        &mut Vec::new(),
+        epf_sharpness_id(distance, false),
+        false,
+    );
     let code_owned = optimize_entropy_code(&toks, K_NUM_DC_CONTEXTS, &mut scratch.huffman_pool);
     let code = code_owned.as_ref();
     let mut bits = 0u64;
@@ -1602,6 +1640,7 @@ fn encode_frame_vardct(
     }
 
     apply_point_chroma_policy(ctx, distp, content, is_achromatic);
+    ctx.set_screen_content(constant_block_fraction(&xyb) >= SCREEN_CONTENT_CONSTANT_BLOCKS);
     #[cfg(feature = "splines")]
     let quant_field = if ctx.splines || ctx.dots {
         spline_quant_field(ctx, scratch, &xyb, distp)?
@@ -3160,8 +3199,12 @@ fn encode_frame_core(
                 collect_props,
             );
             let mut meta_props = Vec::new();
-            let meta =
-                collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, distance, collect_props);
+            let meta = collect_ac_metadata_tokens(
+                &dc_datas[i],
+                &mut meta_props,
+                epf_sharpness_id(distance, ctx.screen_content()),
+                collect_props,
+            );
             (wp, props, grad, meta, meta_props)
         });
     let mut wp_tokens_per_group = Vec::with_capacity(token_groups.len());
@@ -4946,17 +4989,44 @@ mod tests {
 
     #[test]
     fn epf_sharpness_strengthens_in_the_coarse_band() {
-        assert_eq!(epf_sharpness_id(1.74), 7);
-        assert_eq!(epf_sharpness_id(1.75), 6);
-        assert_eq!(epf_sharpness_id(2.75), 5);
-        assert_eq!(epf_sharpness_id(3.49), 5);
-        assert_eq!(epf_sharpness_id(3.5), 4);
+        assert_eq!(epf_sharpness_id(1.74, false), 7);
+        assert_eq!(epf_sharpness_id(1.75, false), 6);
+        assert_eq!(epf_sharpness_id(2.75, false), 5);
+        assert_eq!(epf_sharpness_id(3.49, false), 5);
+        assert_eq!(epf_sharpness_id(3.5, false), 4);
         // VLQ ramp steps (quarter-points of DCEPF_VLQ_D0..D1 = 8..15).
-        assert_eq!(epf_sharpness_id(9.74), 4);
-        assert_eq!(epf_sharpness_id(9.75), 3);
-        assert_eq!(epf_sharpness_id(11.5), 2);
-        assert_eq!(epf_sharpness_id(13.25), 1);
-        assert_eq!(epf_sharpness_id(25.0), 1);
+        assert_eq!(epf_sharpness_id(9.74, false), 4);
+        assert_eq!(epf_sharpness_id(9.75, false), 3);
+        assert_eq!(epf_sharpness_id(11.5, false), 2);
+        assert_eq!(epf_sharpness_id(13.25, false), 1);
+        assert_eq!(epf_sharpness_id(25.0, false), 1);
+    }
+
+    #[test]
+    fn screen_content_keeps_the_strongest_epf_below_d5() {
+        use super::epf_sharpness_id;
+        assert_eq!(epf_sharpness_id(1.0, true), 7);
+        assert_eq!(epf_sharpness_id(2.5, true), 7);
+        assert_eq!(epf_sharpness_id(4.99, true), 7);
+        assert_eq!(epf_sharpness_id(5.0, true), epf_sharpness_id(5.0, false));
+        assert_eq!(epf_sharpness_id(12.0, true), epf_sharpness_id(12.0, false));
+    }
+
+    #[test]
+    fn constant_block_fraction_counts_exactly_flat_blocks() {
+        use super::constant_block_fraction;
+        use crate::image::Image3F;
+        let mut xyb = Image3F::new(32, 16);
+        // Left half flat, right half a ramp: 4 of 8 blocks are constant.
+        for c in 0..3 {
+            for y in 0..16 {
+                for x in 16..32 {
+                    xyb.plane_row_mut(c, y)[x] = x as f32 * 0.01;
+                }
+            }
+        }
+        assert_eq!(constant_block_fraction(&xyb), 0.5);
+        assert_eq!(constant_block_fraction(&Image3F::new(7, 7)), 0.0);
     }
 
     #[test]
