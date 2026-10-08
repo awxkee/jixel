@@ -188,3 +188,91 @@ fn score_rows(
 fn sum8(v: &[f32; K_BLOCK_DIM]) -> f32 {
     ((v[0] + v[1]) + (v[2] + v[3])) + ((v[4] + v[5]) + (v[6] + v[7]))
 }
+
+/// Largest spread of a 3x3 neighborhood of source block means, in DC
+/// steps, that still counts as one flat value.
+const FLAT_DC_SPREAD: f32 = 0.35;
+
+/// Requantize the X and B DC of flat neighborhoods from the 3x3 mean of the
+/// source block means. Where a flat area's value sits near a DC level
+/// boundary, its source noise rounds neighboring blocks to different levels,
+/// a block mosaic of tint that the decoder's DC smoothing cannot undo. One
+/// shared target per neighborhood puts the blocks on the same level.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn flatten_chroma_dc(
+    opsin: &Image3F,
+    dim: &ImageDim,
+    dc_datas: &mut [DcGroupData],
+    group_coords: &[(usize, usize)],
+    distp: &DistanceParams,
+    ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
+) -> Result<(), EncodeError> {
+    const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
+    let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
+    if w < 3 || h < 3 {
+        return Ok(());
+    }
+    let steps: [f32; 3] = std::array::from_fn(|c| {
+        distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
+    });
+    let cfl_factors = [
+        crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl.base_x),
+        0.0,
+        crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl),
+    ];
+    let mut means = try_vec![0.0f32; w * h]?;
+    // Column sums of a 3-row window of means and of their squares.
+    let mut col_sum = try_vec![0.0f32; w]?;
+    let mut col_sq = try_vec![0.0f32; w]?;
+    for c in [0, 2] {
+        for by in 0..h {
+            let row = &mut means[by * w..(by + 1) * w];
+            row.fill(0.0);
+            for dy in 0..K_BLOCK_DIM {
+                let src = opsin.plane_row(c, (by * K_BLOCK_DIM + dy).min(opsin.ysize() - 1));
+                let (chunks, tail) = src.as_chunks::<K_BLOCK_DIM>();
+                for (m, chunk) in row.iter_mut().zip(chunks) {
+                    *m += sum8(chunk);
+                }
+                if chunks.len() < w {
+                    // A partial last block: repeat its last sample.
+                    let last = *src.last().unwrap_or(&0.0);
+                    let partial =
+                        tail.iter().sum::<f32>() + last * (K_BLOCK_DIM - tail.len()) as f32;
+                    row[chunks.len()] += partial;
+                }
+            }
+            row.iter_mut().for_each(|m| *m *= 1.0 / 64.0);
+        }
+        let max_var = (FLAT_DC_SPREAD * steps[c]) * (FLAT_DC_SPREAD * steps[c]);
+        let inv_step = steps[c].recip();
+        for by in 1..h - 1 {
+            for (bx, (s, q)) in col_sum.iter_mut().zip(col_sq.iter_mut()).enumerate() {
+                let (a, b, d) = (
+                    means[(by - 1) * w + bx],
+                    means[by * w + bx],
+                    means[(by + 1) * w + bx],
+                );
+                *s = a + b + d;
+                *q = a * a + b * b + d * d;
+            }
+            let (gy, ly) = (by / DC_GROUP_BLOCKS, by % DC_GROUP_BLOCKS);
+            for bx in 1..w - 1 {
+                let sum = col_sum[bx - 1] + col_sum[bx] + col_sum[bx + 1];
+                let sq = col_sq[bx - 1] + col_sq[bx] + col_sq[bx + 1];
+                let mean = sum * (1.0 / 9.0);
+                if sq * (1.0 / 9.0) - mean * mean >= max_var {
+                    continue;
+                }
+                let (gx, lx) = (bx / DC_GROUP_BLOCKS, bx % DC_GROUP_BLOCKS);
+                let dc = &mut dc_datas[gy * dim.xsize_dc_groups + gx];
+                debug_assert_eq!(group_coords[gy * dim.xsize_dc_groups + gx], (gx, gy));
+                let y_level = f32::from(dc.quant_dc.plane_row(1, ly)[lx]);
+                let level = fmla(mean, inv_step, -y_level * cfl_factors[c]).round();
+                dc.quant_dc.plane_row_mut(c, ly)[lx] = level as i16;
+            }
+        }
+    }
+    Ok(())
+}

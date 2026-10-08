@@ -297,7 +297,9 @@ impl EncodingContext {
         // Reducing only B improves SSIMULACRA2, Butteraugli and CVVDP at Slow.
         // Other efforts retain the transform defaults.
         self.epf_channel_scale = match (coding, self.speed) {
-            (crate::coding::CodingTransform::Rgb, Speed::Slow) => Some([5.0, 5.0, 2.5]),
+            (crate::coding::CodingTransform::Rgb, Speed::Slow | Speed::ExtraSlow) => {
+                Some([5.0, 5.0, 2.5])
+            }
             _ => coding.epf_channel_scale(),
         };
         self.plain_matrices = std::sync::OnceLock::new();

@@ -30,7 +30,7 @@
 use crate::Speed;
 
 mod dc_smoothing;
-use dc_smoothing::skip_dc_smoothing;
+use dc_smoothing::{flatten_chroma_dc, skip_dc_smoothing};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
@@ -3035,7 +3035,7 @@ fn encode_frame_core(
         // orders move most of the walk, they no longer describe what the
         // contexts of the refine pass will see, and the quantizer would price
         // its choices on them: tokenize again on the orders it codes with.
-        if scan_moved >= RDOQ_FRESH_PRICES_MIN_SCAN_MOVE {
+        if ctx.speed.effort().rdoq_fresh_prices || scan_moved >= RDOQ_FRESH_PRICES_MIN_SCAN_MOVE {
             // These streams will be replaced; release their token buffers
             // before allocating the reordered streams for the whole frame.
             all_pending.clear();
@@ -3116,6 +3116,17 @@ fn encode_frame_core(
         }
     }
 
+    if ctx.coding.is_xyb() {
+        flatten_chroma_dc(
+            opsin,
+            &dim,
+            &mut dc_datas,
+            &group_coords,
+            &distp,
+            ytob_dc,
+            ctx.cfl_frame(),
+        )?;
+    }
     let skip_dc_smoothing = skip_dc_smoothing(
         &ctx.thread_pool,
         scratch,
@@ -3417,7 +3428,9 @@ fn encode_frame_core(
         };
     let ans_refinement = match ctx.speed {
         Speed::Fastest => None,
-        _ if ctx.speed.effort().ans_refine => Some(crate::entropy::AnsRefinement::Slow),
+        _ if ctx.speed.effort().ans_refine => {
+            Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
+        }
         _ => Some(crate::entropy::AnsRefinement::Fast {
             recluster: distance >= 3.0 || ctx.speed.effort().ans_recluster,
         }),
@@ -3430,6 +3443,16 @@ fn encode_frame_core(
                 .map(Vec::as_slice)
                 .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
             refinement,
+            &ctx.thread_pool,
+            scratch,
+        );
+    } else if dc_code_refined && ctx.speed.effort().ans_exhaustive {
+        crate::entropy::refine_ans_entropy_exhaustive(
+            &mut dc_code_owned,
+            dc_tokens_per_group
+                .iter()
+                .map(Vec::as_slice)
+                .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
             &ctx.thread_pool,
             scratch,
         );

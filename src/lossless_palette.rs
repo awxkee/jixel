@@ -288,6 +288,7 @@ pub(super) fn try_encode_palette_single_group(
         (preds, section, lz_tokens)
     };
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
@@ -386,6 +387,7 @@ fn estimated_local_lz_stream_bits(
     scratch: &mut CoderScratch,
 ) -> usize {
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(lz),
         num_contexts,
         min_symbol,
@@ -890,6 +892,7 @@ pub(super) fn try_encode_local_palette_multi_group(
         .collect();
 
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         group_lz_tokens.iter().map(Vec::as_slice),
         nb_chans,
         min_symbol,

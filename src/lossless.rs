@@ -234,6 +234,7 @@ pub(crate) fn write_single_channel_lz77_section(
     }
     let lz = runs.finish();
     let code = build_lz_pixel_code(
+        false,
         std::iter::once(lz.as_slice()),
         1,
         LZ77_MIN_SYMBOL,
@@ -1046,6 +1047,7 @@ fn encode_frame_lossless_core_impl(
             let mut learned_estimated_savings: Option<f64> = None;
             let learned = if rank_rgb {
                 learn_best_layout(
+                    speed,
                     &rgb_source,
                     xsize,
                     ysize,
@@ -1075,6 +1077,7 @@ fn encode_frame_lossless_core_impl(
             if let Some((_, cand, _)) = &learned {
                 let mut candidate = BitWriter::new();
                 let estimated_savings = write_learned_tree_frame(
+                    speed,
                     &rgb_source,
                     alpha.is_some(),
                     frame_kind,
@@ -1117,6 +1120,7 @@ fn encode_frame_lossless_core_impl(
             let palette_source = palette.source(xsize, ysize);
             let coarse_limit = rgb_coarse_est * PALETTE_COARSE_MARGIN;
             if let Some((palette_layout, cand, palette_coarse)) = learn_best_layout(
+                speed,
                 &palette_source,
                 xsize,
                 ysize,
@@ -1139,6 +1143,7 @@ fn encode_frame_lossless_core_impl(
                 if palette_can_win {
                     let mut candidate = BitWriter::new();
                     let estimated_savings = write_learned_tree_frame(
+                        speed,
                         &palette_source,
                         alpha.is_some(),
                         frame_kind,
@@ -1234,6 +1239,7 @@ fn encode_frame_lossless_core_impl(
                         .filter(|s| s.candidate.est_real < best_source_coarse * PER_GROUP_MARGIN)
                     {
                         let cand = finish_ma_learn(
+                            speed,
                             stage,
                             min_symbol,
                             use_wp,
@@ -1243,6 +1249,7 @@ fn encode_frame_lossless_core_impl(
                         );
                         let mut candidate = BitWriter::new();
                         let estimated_savings = write_learned_tree_frame(
+                            speed,
                             &mixed,
                             alpha.is_some(),
                             frame_kind,
@@ -1332,6 +1339,7 @@ fn encode_frame_lossless_core_impl(
         let mut candidate = BitWriter::new();
         if single_group {
             if try_encode_context_tree_single_group(
+                speed,
                 linear,
                 alpha,
                 alpha_constant,
@@ -1350,6 +1358,7 @@ fn encode_frame_lossless_core_impl(
                 keep_smaller_writer(&mut best_tree_writer, candidate);
             }
         } else if try_encode_context_tree_multi_group(
+            speed,
             linear,
             alpha,
             alpha_constant,
@@ -1430,6 +1439,7 @@ fn encode_frame_lossless_core_impl(
 
             // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
             let code = build_lz_pixel_code_tails(
+                speed.effort().lz_exhaustive_entropy,
                 &[lz_tokens.as_slice()],
                 &[tail],
                 nb_chans,
@@ -1556,6 +1566,7 @@ fn encode_frame_lossless_core_impl(
             }
             let group_slices: Vec<&[LzToken]> = group_lz_tokens.iter().map(Vec::as_slice).collect();
             let code = build_lz_pixel_code_tails(
+                speed.effort().lz_exhaustive_entropy,
                 &group_slices,
                 &group_tails,
                 nb_chans,
@@ -1791,6 +1802,12 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
+    // Keep atlas costs used by lossy RDO at the standard budget.
+    let speed = if speed == crate::Speed::ExtraSlow {
+        crate::Speed::Slow
+    } else {
+        speed
+    };
     use std::collections::HashMap;
     let large = GroupLayout::LARGE.dim();
     if xsize == 0 || ysize == 0 || xsize > large || ysize > large {
@@ -1965,6 +1982,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     let distance_ctx = nb_chans as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
@@ -2513,6 +2531,8 @@ const MA_MIN_NODE_SAMPLES: usize = 128;
 /// Predictors each side of a candidate split may choose from (the node's
 /// cheapest ones).
 const MA_SIDE_PREDS: usize = 4;
+/// `MA_SIDE_PREDS` of the final RCT tree learn under `tree_wide_side_preds`.
+const MA_WIDE_SIDE_PREDS: usize = 7;
 
 /// Walk one channel rectangle in scan order, feeding the visitor the property
 /// vector (libjxl ids 0..=15), the neighborhood, and the WP prediction of
@@ -3315,6 +3335,7 @@ fn learn_ma_coarse(
 /// Second stage: re-score the coarse tree on the full probe and keep growing
 /// it, falling back to the coarse tree when the deep one fails its gate.
 fn finish_ma_learn(
+    speed: crate::Speed,
     coarse: CoarseLearn,
     min_symbol: u32,
     use_wp: bool,
@@ -3325,15 +3346,21 @@ fn finish_ma_learn(
     if !coarse.deepen {
         return coarse.candidate;
     }
+    let mut params = ma_learn_params_final(
+        min_symbol,
+        max_leaves,
+        coarse.max_candidates,
+        coarse.stride as f64,
+        use_wp,
+    );
+    // Palette index sources keep the narrow side search: like extra split
+    // candidates, it overfits their near-deterministic contexts.
+    if coarse.leaf_offsets && speed.effort().tree_wide_side_preds {
+        params.side_preds = MA_WIDE_SIDE_PREDS;
+    }
     let (deep_tree, samples) = deepen_ma_tree(
         coarse.samples,
-        ma_learn_params_final(
-            min_symbol,
-            max_leaves,
-            coarse.max_candidates,
-            coarse.stride as f64,
-            use_wp,
-        ),
+        params,
         coarse.candidate.tree.clone(),
         pool,
         scratch,
@@ -4116,6 +4143,7 @@ fn rank_bits(stage: &CoarseLearn) -> f64 {
 /// layout.
 #[allow(clippy::too_many_arguments)]
 fn learn_best_layout(
+    speed: crate::Speed,
     source: &MaSource<'_>,
     xsize: usize,
     ysize: usize,
@@ -4172,6 +4200,7 @@ fn learn_best_layout(
         }
         best_coarse_est = best_coarse_est.min(coarse_est);
         let cand = finish_ma_learn(
+            speed,
             stage,
             min_symbol,
             use_wp,
@@ -4208,6 +4237,7 @@ macro_rules! with_raw_streams {
 /// saving over the flat path.
 #[allow(clippy::too_many_arguments)]
 fn write_learned_tree_frame(
+    speed: crate::Speed,
     source: &MaSource<'_>,
     has_alpha: bool,
     frame_kind: ModularFrameKind<'_>,
@@ -4288,6 +4318,7 @@ fn write_learned_tree_frame(
             }
 
             let variants = choose_tree_streams(
+                speed,
                 vec![tokens],
                 distance_ctx,
                 num_ctx as usize + 1,
@@ -4303,6 +4334,7 @@ fn write_learned_tree_frame(
                     TreeStreams::Literals(streams) => {
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
+                            speed,
                             &stream,
                             tail,
                             source,
@@ -4319,6 +4351,7 @@ fn write_learned_tree_frame(
                     TreeStreams::Lz(streams) => {
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
+                            speed,
                             &stream,
                             tail,
                             source,
@@ -4382,7 +4415,7 @@ fn write_learned_tree_frame(
     let group_tokens: Vec<RawTokens> = pool.steal_map_with_threads(
         scratch,
         num_ac_groups,
-        group_lz_threads(crate::Speed::Slow, pool),
+        group_lz_threads(speed, pool),
         |group_index, _scratch| {
             let x0 = (group_index % xsize_groups) * gdim;
             let y0 = (group_index / xsize_groups) * gdim;
@@ -4436,6 +4469,7 @@ fn write_learned_tree_frame(
         .collect();
     let mut sections = with_raw_streams!(all_tokens, |all_tokens| {
         let variants = choose_tree_streams(
+            speed,
             all_tokens,
             distance_ctx,
             num_ctx as usize + 1,
@@ -4451,6 +4485,7 @@ fn write_learned_tree_frame(
             match variant {
                 TreeStreams::Literals(streams) => {
                     write_learned_grouped_variant(
+                        speed,
                         &streams,
                         &tails,
                         source,
@@ -4470,6 +4505,7 @@ fn write_learned_tree_frame(
                 }
                 TreeStreams::Lz(streams) => {
                     write_learned_grouped_variant(
+                        speed,
                         &streams,
                         &tails,
                         source,
@@ -4499,6 +4535,7 @@ fn write_learned_tree_frame(
     if !has_global_stream
         && local_gate
         && let Some(local) = write_local_tree_sections(
+            speed,
             source,
             &placement,
             xsize,
@@ -4634,6 +4671,7 @@ const LOCAL_TREE_MAX_BITS_PER_VALUE: f64 = 0.5;
 /// order, or `None` when the source has a global stream.
 #[allow(clippy::too_many_arguments)]
 fn write_local_tree_sections(
+    speed: crate::Speed,
     source: &MaSource<'_>,
     placement: &[MaPlacement],
     xsize: usize,
@@ -4762,11 +4800,11 @@ fn write_local_tree_sections(
     // its own histograms. Retain raw tokens only for active coding lanes.
     let cands_ref = &cands;
     let deep_lz_max_ratio = source.deep_lz_max_ratio();
-    let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+    let deep_lz = DeepLzScratchPool::new(group_lz_threads(speed, pool));
     let group_sections: Vec<BitWriter> = pool.steal_map_with_threads(
         scratch,
         num_ac_groups,
-        group_lz_threads(crate::Speed::Slow, pool),
+        group_lz_threads(speed, pool),
         |group_index, scratch| {
             let (x0, y0) = group_rect(group_index);
             let num_values = placement
@@ -4803,6 +4841,7 @@ fn write_local_tree_sections(
             let cand = &cands_ref[group_index];
             match &toks {
                 RawTokens::Compact(tokens) => write_local_tree_group(
+                    speed,
                     tokens,
                     tail,
                     cand,
@@ -4813,6 +4852,7 @@ fn write_local_tree_sections(
                     scratch,
                 ),
                 RawTokens::Wide(tokens) => write_local_tree_group(
+                    speed,
                     tokens,
                     tail,
                     cand,
@@ -4854,6 +4894,7 @@ fn write_local_tree_sections(
 /// order-0 estimates and a later one is written only when its code-based
 /// estimate is within `VARIANT_WRITE_TOLERANCE`, as on the global path.
 fn write_local_tree_group<T: lz77::LiteralToken>(
+    speed: crate::Speed,
     tokens: &[T],
     tail: ConstantTail,
     cand: &LearnedCandidate,
@@ -4873,7 +4914,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             lz77_compress_for_speed_with_depth(
                 tokens,
                 distance_ctx,
-                crate::Speed::Slow,
+                speed,
                 depth,
                 Some(run_count),
                 scratch,
@@ -4883,6 +4924,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
     if (run_count as f64) >= LZ_LITERAL_ALTERNATIVE_MAX_RATIO * tokens.len() as f64 {
         let lz = deep(scratch);
         write_local_tree_variant(
+            speed,
             &lz,
             tail,
             cand,
@@ -4897,6 +4939,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             estimate_literal_and_run_bits_single(tokens, num_ctx as usize + 1, min_symbol);
         if e_run > e_lit * deep_lz_max_ratio {
             write_local_tree_variant(
+                speed,
                 tokens,
                 tail,
                 cand,
@@ -4909,6 +4952,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
         } else if e_run < e_lit {
             let lz = deep(scratch);
             write_local_tree_variant(
+                speed,
                 &lz,
                 tail,
                 cand,
@@ -4919,6 +4963,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
                 &mut best_estimate,
             );
             write_local_tree_variant(
+                speed,
                 tokens,
                 tail,
                 cand,
@@ -4930,6 +4975,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             );
         } else {
             write_local_tree_variant(
+                speed,
                 tokens,
                 tail,
                 cand,
@@ -4941,7 +4987,33 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             );
             let lz = deep(scratch);
             write_local_tree_variant(
+                speed,
                 &lz,
+                tail,
+                cand,
+                min_symbol,
+                wp_params,
+                scratch,
+                &mut best,
+                &mut best_estimate,
+            );
+        }
+    }
+    if speed.effort().lz_priced_search {
+        let (e_lit, _) =
+            estimate_literal_and_run_bits_single(tokens, num_ctx as usize + 1, min_symbol);
+        if let Some(streams) = priced_tree_streams(
+            speed,
+            &[tokens],
+            e_lit,
+            num_ctx as usize + 1,
+            min_symbol,
+            &ThreadPool::new_lossless(1),
+            scratch,
+        ) {
+            write_local_tree_variant(
+                speed,
+                &streams[0],
                 tail,
                 cand,
                 min_symbol,
@@ -4956,6 +5028,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
 }
 
 fn write_local_tree_variant<T: lz77::LzTokenSource>(
+    speed: crate::Speed,
     stream: &[T],
     tail: ConstantTail,
     cand: &LearnedCandidate,
@@ -4968,6 +5041,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let code = build_lz_pixel_code_tails(
+        speed.effort().lz_exhaustive_entropy,
         &[stream],
         &[tail],
         num_ctx as usize,
@@ -5001,6 +5075,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
 
 #[allow(clippy::too_many_arguments)]
 fn write_learned_single_variant<T: lz77::LzTokenSource>(
+    speed: crate::Speed,
     stream: &[T],
     tail: ConstantTail,
     source: &MaSource<'_>,
@@ -5016,6 +5091,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let code = build_lz_pixel_code_tails(
+        speed.effort().lz_exhaustive_entropy,
         &[stream],
         &[tail],
         num_ctx as usize,
@@ -5060,6 +5136,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
 
 #[allow(clippy::too_many_arguments)]
 fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
+    speed: crate::Speed,
     streams: &[Vec<T>],
     tails: &[ConstantTail],
     source: &MaSource<'_>,
@@ -5081,6 +5158,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let slices: Vec<&[T]> = streams.iter().map(Vec::as_slice).collect();
     let code = build_lz_pixel_code_tails(
+        speed.effort().lz_exhaustive_entropy,
         &slices,
         tails,
         num_ctx as usize,
@@ -5230,25 +5308,29 @@ const PRICED_LZ_MAX_RATIO: f64 = 0.95;
 /// parsed twice: the second parse prices its matches by the first one's
 /// tokens. `None` unless the estimate clears `PRICED_LZ_MAX_RATIO`.
 fn priced_tree_streams<T: lz77::LiteralToken>(
-    tokens: &[Vec<T>],
+    speed: crate::Speed,
+    tokens: &[&[T]],
     e_lit: f64,
     num_contexts: usize,
     min_symbol: u32,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<Vec<Vec<LzToken>>> {
-    let raw_slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
-    let prices = lz77::LiteralPrices::new(&raw_slices, num_contexts);
-    let threads = group_lz_threads(crate::Speed::Slow, pool);
+    let prices = lz77::LiteralPrices::new(tokens, num_contexts);
+    let threads = group_lz_threads(speed, pool);
     let tables = DeepLzScratchPool::new(threads);
     let parse = |scratch: &mut CoderScratch, match_prices: &lz77::MatchPrices| {
         pool.steal_map_with_threads(scratch, tokens.len(), threads, |k, _scratch| {
             tables.with_depth(|table| {
                 lz77::lz77_compress_priced(
-                    &tokens[k],
+                    tokens[k],
                     &prices,
                     match_prices,
-                    lz77::PRICED_MAX_PROBES,
+                    if speed.effort().lz_priced_search {
+                        64
+                    } else {
+                        lz77::PRICED_MAX_PROBES
+                    },
                     table,
                 )
             })
@@ -5278,7 +5360,12 @@ fn priced_tree_streams<T: lz77::LiteralToken>(
     };
     let first = complete(first);
     let first_bits = estimate(&first, scratch);
-    if first_bits >= e_lit * PRICED_LZ_MAX_RATIO {
+    let max_ratio = if speed.effort().lz_priced_search {
+        0.99
+    } else {
+        PRICED_LZ_MAX_RATIO
+    };
+    if first_bits >= e_lit * max_ratio {
         return None;
     }
     let second = parse(scratch, &learned);
@@ -5296,6 +5383,51 @@ fn priced_tree_streams<T: lz77::LiteralToken>(
 /// Stream variants to try for one learned-tree frame, most promising first:
 /// literal variants reuse the input, and LZ variants own their match streams.
 fn choose_tree_streams<T: lz77::LiteralToken>(
+    speed: crate::Speed,
+    tokens: Vec<Vec<T>>,
+    distance_ctx: u32,
+    num_contexts: usize,
+    min_symbol: u32,
+    deep_lz_max_ratio: f64,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Vec<TreeStreams<T>> {
+    // Preserve the standard candidates. The broader parse competes using the
+    // final entropy tables and serialized section size in the variant writer.
+    let extra = if speed.effort().lz_priced_search {
+        let slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
+        let (e_lit, _) =
+            estimate_literal_and_run_bits(&slices, num_contexts, min_symbol, pool, scratch);
+        priced_tree_streams(
+            speed,
+            &slices,
+            e_lit,
+            num_contexts,
+            min_symbol,
+            pool,
+            scratch,
+        )
+    } else {
+        None
+    };
+    let mut variants = choose_tree_streams_standard(
+        speed,
+        tokens,
+        distance_ctx,
+        num_contexts,
+        min_symbol,
+        deep_lz_max_ratio,
+        pool,
+        scratch,
+    );
+    if let Some(extra) = extra {
+        variants.push(TreeStreams::Lz(extra));
+    }
+    variants
+}
+
+fn choose_tree_streams_standard<T: lz77::LiteralToken>(
+    speed: crate::Speed,
     tokens: Vec<Vec<T>>,
     distance_ctx: u32,
     num_contexts: usize,
@@ -5312,17 +5444,17 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
     });
     let run_len: usize = run_counts.iter().sum();
     let deep = |scratch: &mut CoderScratch| -> Vec<Vec<LzToken>> {
-        let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+        let deep_lz = DeepLzScratchPool::new(group_lz_threads(speed, pool));
         pool.steal_map_with_threads(
             scratch,
             tokens.len(),
-            group_lz_threads(crate::Speed::Slow, pool),
+            group_lz_threads(speed, pool),
             |k, scratch| {
                 deep_lz.with_depth(|depth| {
                     lz77_compress_for_speed_with_depth(
                         &tokens[k],
                         distance_ctx,
-                        crate::Speed::Slow,
+                        speed,
                         depth,
                         Some(run_counts[k]),
                         scratch,
@@ -5340,9 +5472,15 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
     if e_run > e_lit * deep_lz_max_ratio {
         // Runs lose to the literals; a structure repeated further back may
         // still pay where a match is priced against what it replaces.
-        if let Some(priced) =
-            priced_tree_streams(&tokens, e_lit, num_contexts, min_symbol, pool, scratch)
-        {
+        if let Some(priced) = priced_tree_streams(
+            crate::Speed::Slow,
+            &raw_slices,
+            e_lit,
+            num_contexts,
+            min_symbol,
+            pool,
+            scratch,
+        ) {
             return vec![TreeStreams::Literals(tokens), TreeStreams::Lz(priced)];
         }
         return vec![TreeStreams::Literals(tokens)];
@@ -5361,6 +5499,7 @@ fn choose_tree_streams<T: lz77::LiteralToken>(
 /// if the context tree is estimated to help; false otherwise (caller falls
 /// through to the flat path, having written nothing).
 fn try_encode_context_tree_single_group(
+    speed: crate::Speed,
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     alpha_constant: Option<i32>,
@@ -5465,8 +5604,9 @@ fn try_encode_context_tree_single_group(
     write_modular_transforms(nb_chans, rct_type, &mut section);
 
     let distance_ctx = num_pixel_ctx as u32;
-    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, crate::Speed::Slow, scratch);
+    let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         std::iter::once(lz_tokens.as_slice()),
         num_pixel_ctx,
         min_symbol,
@@ -5497,6 +5637,7 @@ fn try_encode_context_tree_single_group(
 /// routes its group-local pixels through it (fresh WP per group, matching the
 /// decoder). Returns true (and writes the full frame) if it helps; else false.
 fn try_encode_context_tree_multi_group(
+    speed: crate::Speed,
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     alpha_constant: Option<i32>,
@@ -5574,11 +5715,11 @@ fn try_encode_context_tree_multi_group(
 
     // 4) Per-group tokens (reusing collected res/prop) + per-group LZ77.
     let group_lz_tokens: Vec<Vec<LzToken>> = {
-        let deep_lz = DeepLzScratchPool::new(group_lz_threads(crate::Speed::Slow, pool));
+        let deep_lz = DeepLzScratchPool::new(group_lz_threads(speed, pool));
         pool.steal_map_with_threads(
             scratch,
             num_ac_groups,
-            group_lz_threads(crate::Speed::Slow, pool),
+            group_lz_threads(speed, pool),
             |group_index, scratch| {
                 let g = &groups[group_index];
                 let token_count = g.iter().map(|(res, _)| res.len()).sum();
@@ -5599,7 +5740,7 @@ fn try_encode_context_tree_multi_group(
                     lz77_compress_for_speed_with_depth(
                         &toks,
                         distance_ctx,
-                        crate::Speed::Slow,
+                        speed,
                         depth,
                         None,
                         scratch,
@@ -5619,6 +5760,7 @@ fn try_encode_context_tree_multi_group(
         _ => None,
     };
     let code = build_lz_pixel_code(
+        speed.effort().lz_exhaustive_entropy,
         group_lz_tokens.iter().map(Vec::as_slice),
         num_pixel_ctx,
         min_symbol,
@@ -6778,6 +6920,12 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
     slot: u32,
     writer: &mut BitWriter,
 ) -> bool {
+    // Keep atlas costs used by lossy RDO at the standard budget.
+    let speed = if speed == crate::Speed::ExtraSlow {
+        crate::Speed::Slow
+    } else {
+        speed
+    };
     let Ok(mut atlas) = Image3Si::try_new(xsize, ysize) else {
         return false;
     };
