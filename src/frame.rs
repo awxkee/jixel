@@ -28,7 +28,9 @@
  */
 
 mod dc_smoothing;
-use dc_smoothing::{choose_chroma_dc_coding, flatten_chroma_dc, skip_dc_smoothing};
+use dc_smoothing::{
+    choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
+};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
@@ -3418,6 +3420,17 @@ fn encode_frame_core(
         base_x: crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), ytox_dc as i8),
         ..ctx.cfl_frame()
     };
+    // Couple B rounding to the final luma error after AC decisions are fixed.
+    // Flattening and Haar selection must use that same target as well.
+    let compensate_b = ctx.coding.is_xyb()
+        && ctx.speed.effort().chroma_dc_squeeze
+        && compensate_b_dc(
+            &mut dc_datas,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            ctx.dc_rows.compensate_b,
+        );
     if ctx.coding.is_xyb() {
         flatten_chroma_dc(
             opsin,
@@ -3427,10 +3440,19 @@ fn encode_frame_core(
             &distp,
             ytob_dc,
             dc_cfl,
+            compensate_b,
         )?;
     }
     if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze {
-        choose_chroma_dc_coding(&dim, &mut dc_datas, &mut distp, ytob_dc, dc_cfl)?;
+        choose_chroma_dc_coding(
+            &dim,
+            &mut dc_datas,
+            &mut distp,
+            ytob_dc,
+            dc_cfl,
+            compensate_b,
+            ctx.dc_rows.adjust_b,
+        )?;
     }
     let skip_dc_smoothing = skip_dc_smoothing(
         &ctx.thread_pool,
@@ -3442,6 +3464,7 @@ fn encode_frame_core(
         &distp,
         ytob_dc,
         dc_cfl,
+        ctx.dc_rows.reconstruct,
     )?;
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.

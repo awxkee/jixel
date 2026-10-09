@@ -49,6 +49,7 @@ mod color;
 mod color_correlation;
 mod color_encoding;
 mod dc_group_data;
+mod dc_ops;
 mod dc_tree;
 mod dct;
 mod effort;

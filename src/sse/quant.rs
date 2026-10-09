@@ -107,7 +107,7 @@ pub(crate) fn quantize_block_ac_sse41(
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn round_ties_away_i32x4(value: __m128) -> __m128i {
+pub(crate) fn round_ties_away_i32x4(value: __m128) -> __m128i {
     let sign = _mm_set1_ps(-0.0);
     let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(value);
     let fraction = _mm_sub_ps(value, truncated);

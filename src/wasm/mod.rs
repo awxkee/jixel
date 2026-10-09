@@ -30,6 +30,7 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+mod dc_ops;
 mod dct;
 mod entropy;
 mod frame;
@@ -54,6 +55,7 @@ pub(crate) use cfl::{
     apply_cfl_wasm, cfl_closed_loop_cost_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm,
     cfl_regression_wasm,
 };
+pub(crate) use dc_ops::{adjust_b_dc_wasm, compensate_b_dc_wasm, reconstruct_dc_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;

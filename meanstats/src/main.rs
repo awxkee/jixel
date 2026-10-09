@@ -54,6 +54,7 @@ use plotters::coord::combinators::{LogCoord, WithKeyPoints};
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
+use std::fmt::format;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -536,7 +537,7 @@ fn main() -> Result<()> {
     }
     if with_aom {
         series.push(Series {
-            label: "libavif aom (AV1)".into(),
+            label: format!("libavif aom (AV1 s{})", tools.speed).into(),
             color: RGBColor(0xFF, 0x7F, 0x00),
             points: vec![],
         });

@@ -106,8 +106,8 @@ effort_gates! {
     rdoq_fresh_prices,
     ac_ctx_plan,
     ma_dc_tree,
-    /// Per chroma channel, a 2x finer DC step holding a squeeze-smoothed plane
-    /// when that is both cheaper and closer than nearest rounding.
+    /// Luma-error-compensated B DC targets and, per chroma channel, a 2x finer
+    /// DC step holding a squeeze-smoothed plane when cheaper and closer.
     chroma_dc_squeeze,
     /// Frame-level X DC chroma-from-luma search on the unrounded source,
     /// under the final luma levels and DC quantization steps.

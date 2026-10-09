@@ -31,11 +31,58 @@
 use super::{DistanceParams, ImageDim, K_BLOCK_DIM, K_DC_GROUP_DIM};
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
+use crate::dc_ops::{AdjustBdcFn, BdcCompensation, CompensateBdcFn, ReconstructDcFn};
 use crate::dct::fmla;
 use crate::haar::{CHROMA_DC_SQUEEZE_STEP, haar_smooth};
 use crate::image::Image3F;
 use crate::thread_pool::ThreadPool;
 use crate::util::{EncodeError, try_vec};
+
+impl BdcCompensation {
+    fn new(distp: &DistanceParams) -> Self {
+        use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
+        Self {
+            scale_b: INV_DC_QUANT[2] / distp.dc_step[2] * distp.scale_dc,
+            y_step_b: DC_QUANT[1] * distp.dc_step[1] * INV_DC_QUANT[2] / distp.dc_step[2],
+        }
+    }
+}
+
+/// Requantize B from the retained fractional source under the final Y levels.
+/// Return whether the later chroma stages should use compensated targets too.
+/// Keep the original source planes intact for those stages.
+pub(super) fn compensate_b_dc(
+    dc_datas: &mut [DcGroupData],
+    distp: &DistanceParams,
+    ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
+    compensate_row: CompensateBdcFn,
+) -> bool {
+    if dc_datas
+        .iter()
+        .any(|dc| dc.source_dc_y.is_none() || dc.source_dc_b.is_none())
+    {
+        return false;
+    }
+    let compensation = BdcCompensation::new(distp);
+    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl);
+    for dc in dc_datas {
+        let source_b = dc.source_dc_b.as_ref().unwrap();
+        let source_y = dc.source_dc_y.as_ref().unwrap();
+        for row in 0..dc.quant_dc.ysize() {
+            let [_, y, b] = dc.quant_dc.all_plane_rows_mut(row);
+            compensate_row(
+                source_b.row(row),
+                source_y.row(row),
+                y,
+                compensation,
+                cfl_b,
+                b,
+            );
+        }
+    }
+    true
+}
 
 /// Keep the decoder's adaptive DC smoothing only when it improves luma DC
 /// error against the source block means. Stitch the DC groups before filtering
@@ -51,6 +98,7 @@ pub(super) fn skip_dc_smoothing(
     distp: &DistanceParams,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
+    reconstruct_row: ReconstructDcFn,
 ) -> Result<bool, EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -69,23 +117,16 @@ pub(super) fn skip_dc_smoothing(
         let q = &dc.quant_dc;
         for ly in 0..q.ysize() {
             let [rx, ry, rb] = recon.all_plane_rows_mut(oy + ly);
-            for ((dst, &v), &y) in rx[ox..ox + q.xsize()]
-                .iter_mut()
-                .zip(q.plane_row(0, ly))
-                .zip(q.plane_row(1, ly))
-            {
-                *dst = fmla(y as f32, cfl_x, v as f32) * steps[0];
-            }
-            for (dst, &v) in ry[ox..ox + q.xsize()].iter_mut().zip(q.plane_row(1, ly)) {
-                *dst = v as f32 * steps[1];
-            }
-            for ((dst, &b), &y) in rb[ox..ox + q.xsize()]
-                .iter_mut()
-                .zip(q.plane_row(2, ly))
-                .zip(q.plane_row(1, ly))
-            {
-                *dst = fmla(y as f32, cfl_b, b as f32) * steps[2];
-            }
+            reconstruct_row(
+                std::array::from_fn(|c| q.plane_row(c, ly)),
+                [cfl_x, cfl_b],
+                steps,
+                [
+                    &mut rx[ox..ox + q.xsize()],
+                    &mut ry[ox..ox + q.xsize()],
+                    &mut rb[ox..ox + q.xsize()],
+                ],
+            );
         }
     }
 
@@ -208,6 +249,7 @@ pub(super) fn flatten_chroma_dc(
     distp: &DistanceParams,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
+    compensate_b: bool,
 ) -> Result<(), EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -226,6 +268,7 @@ pub(super) fn flatten_chroma_dc(
     // Column sums of a 3-row window of means and of their squares.
     let mut col_sum = try_vec![0.0f32; w]?;
     let mut col_sq = try_vec![0.0f32; w]?;
+    let compensation = BdcCompensation::new(distp);
     for c in [0, 2] {
         for by in 0..h {
             let row = &mut means[by * w..(by + 1) * w];
@@ -269,9 +312,16 @@ pub(super) fn flatten_chroma_dc(
                 let (gx, lx) = (bx / DC_GROUP_BLOCKS, bx % DC_GROUP_BLOCKS);
                 let dc = &mut dc_datas[gy * dim.xsize_dc_groups + gx];
                 debug_assert_eq!(group_coords[gy * dim.xsize_dc_groups + gx], (gx, gy));
-                let y_level = f32::from(dc.quant_dc.plane_row(1, ly)[lx]);
-                let level = fmla(mean, inv_step, -y_level * cfl_factors[c]).round();
-                dc.quant_dc.plane_row_mut(c, ly)[lx] = level as i16;
+                let yq = dc.quant_dc.plane_row(1, ly)[lx];
+                let mut target = fmla(mean, inv_step, -f32::from(yq) * cfl_factors[c]);
+                if c == 2 && compensate_b {
+                    target = compensation.adjust(
+                        target,
+                        dc.source_dc_y.as_ref().unwrap().row(ly)[lx],
+                        yq,
+                    );
+                }
+                dc.quant_dc.plane_row_mut(c, ly)[lx] = target.round() as i16;
             }
         }
     }
@@ -300,6 +350,8 @@ pub(super) fn choose_chroma_dc_coding(
     distp: &mut DistanceParams,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
+    compensate_b: bool,
+    adjust_row: AdjustBdcFn,
 ) -> Result<(), EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -331,6 +383,7 @@ pub(super) fn choose_chroma_dc_coding(
         // Targets in units of the channel's current step, CfL folded out.
         let inv = crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc / step[c];
         let cfl_coarse = cfl_factor(step);
+        let compensation = BdcCompensation::new(distp);
         for (i, dc) in dc_datas.iter().enumerate() {
             let ox = (i % dim.xsize_dc_groups) * DC_GROUP_BLOCKS;
             let oy = (i / dim.xsize_dc_groups) * DC_GROUP_BLOCKS;
@@ -355,6 +408,14 @@ pub(super) fn choose_chroma_dc_coding(
                     .zip(y_row.iter())
                 {
                     *target = fmla(src, inv, -f32::from(y) * cfl_coarse);
+                }
+                if c == 2 && compensate_b {
+                    adjust_row(
+                        &mut t[begin..end],
+                        &dc.source_dc_y.as_ref().unwrap().row(ly)[..width],
+                        y_row,
+                        compensation,
+                    );
                 }
                 for (level, &q) in levels[begin..end]
                     .iter_mut()
@@ -464,8 +525,161 @@ fn plane_price(levels: &[i32], w: usize, dim: &ImageDim, dc_datas: &[DcGroupData
 mod tests {
     use super::*;
     use crate::color_correlation::CflFrame;
+    use crate::dc_ops::{B_DC_Y_COMPENSATION, selected_dc_row_kernels};
     use crate::haar::CHROMA_DC_SQUEEZE_DEADZONE;
     use crate::image::Plane;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    #[test]
+    fn compensation_can_improve_b_minus_y_while_increasing_b_error() {
+        let mut distp = crate::frame::compute_distance_params(2.0);
+        distp.scale_dc = 1.0;
+        distp.dc_step = [1.0; 3];
+        let compensation = BdcCompensation::new(&distp);
+        let (b, y, yq) = (0.99 / 256.0, 0.51 / 512.0, 1);
+        let residual = fmla(b, 256.0, -f32::from(yq) * 0.5);
+        let target = compensation.target(b, y, yq, 0.5);
+        let full_target = residual + 0.5 * f32::from(yq) - y * 256.0;
+        assert_eq!(residual.round(), 0.0);
+        assert_eq!(target.round(), 1.0);
+        assert!((target.round() - residual).abs() > (residual.round() - residual).abs());
+        assert!((target.round() - full_target).abs() < (residual.round() - full_target).abs());
+    }
+
+    #[test]
+    fn compensation_preserves_sources_and_feeds_the_haar_search() {
+        let (dim, mut actual, mut params, slope, cfl) = fixture(5, 3, 0, false);
+        let (_, mut expected, mut expected_params, _, _) = fixture(5, 3, 0, false);
+        params.scale_dc = 1.0;
+        expected_params.scale_dc = 1.0;
+        // Uniform source values and exact binary phases make the independent
+        // source adjustment identical to compensation in B-step units.
+        for dc in actual.iter_mut().chain(expected.iter_mut()) {
+            let mut sy = Plane::new(dc.quant_dc.xsize(), dc.quant_dc.ysize());
+            sy.as_mut_slice().fill(-0.375 / 512.0);
+            dc.source_dc_y = Some(sy);
+            dc.source_dc_b
+                .as_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(1.375 / 256.0);
+        }
+        let original_b = actual[0].source_dc_b.as_ref().unwrap().as_slice().to_vec();
+        for dc in &mut expected {
+            for row in 0..dc.quant_dc.ysize() {
+                let source = dc.source_dc_b.as_mut().unwrap().row_mut(row);
+                for v in source.iter_mut() {
+                    *v += B_DC_Y_COMPENSATION * (0.375 / 512.0);
+                }
+                for (dst, &src) in dc
+                    .quant_dc
+                    .plane_row_mut(2, row)
+                    .iter_mut()
+                    .zip(source.iter())
+                {
+                    *dst = (src * 256.0).round() as i16;
+                }
+            }
+        }
+        assert!(compensate_b_dc(
+            &mut actual,
+            &params,
+            slope,
+            cfl,
+            selected_dc_row_kernels().compensate_b
+        ));
+        assert_eq!(
+            actual[0].source_dc_b.as_ref().unwrap().as_slice(),
+            original_b
+        );
+        reference_choose_chroma_dc_coding(&dim, &mut expected, &mut expected_params, slope, cfl)
+            .unwrap();
+        choose_chroma_dc_coding(
+            &dim,
+            &mut actual,
+            &mut params,
+            slope,
+            cfl,
+            true,
+            selected_dc_row_kernels().adjust_b,
+        )
+        .unwrap();
+        assert_eq!(params.dc_step, expected_params.dc_step);
+        for (a, b) in actual.iter().zip(&expected) {
+            for c in 0..3 {
+                assert_eq!(a.quant_dc.plane_data(c), b.quant_dc.plane_data(c));
+            }
+        }
+    }
+
+    #[test]
+    fn flattening_uses_the_compensated_b_target() {
+        let (dim, mut groups, mut params, slope, cfl) = fixture(5, 5, 0, false);
+        params.scale_dc = 1.0;
+        let mut opsin = Image3F::try_new(dim.xsize, dim.ysize).unwrap();
+        opsin.plane_mut(2).as_mut_slice().fill(0.99 / 256.0);
+        for dc in &mut groups {
+            dc.quant_dc.plane_mut(1).as_mut_slice().fill(1);
+            dc.source_dc_y = Some(Plane::new_fill(5, 5, 0.51 / 512.0));
+            dc.source_dc_b = Some(Plane::new_fill(5, 5, 0.99 / 256.0));
+        }
+        assert!(compensate_b_dc(
+            &mut groups,
+            &params,
+            slope,
+            cfl,
+            selected_dc_row_kernels().compensate_b
+        ));
+        flatten_chroma_dc(
+            &opsin,
+            &dim,
+            &mut groups,
+            &[(0, 0)],
+            &params,
+            slope,
+            cfl,
+            true,
+        )
+        .unwrap();
+        assert_eq!(groups[0].quant_dc.plane_row(2, 2)[2], 1);
+        flatten_chroma_dc(
+            &opsin,
+            &dim,
+            &mut groups,
+            &[(0, 0)],
+            &params,
+            slope,
+            cfl,
+            false,
+        )
+        .unwrap();
+        assert_eq!(groups[0].quant_dc.plane_row(2, 2)[2], 0);
+        assert!(groups[0].quant_dc.plane_data(1).iter().all(|&q| q == 1));
+    }
+
+    #[test]
+    fn missing_luma_source_skips_compensation_for_all_groups() {
+        let (_, mut groups, params, slope, cfl) = fixture(513, 3, 0, false);
+        let dc = &mut groups[0];
+        dc.source_dc_y = Some(Plane::new_fill(
+            dc.quant_dc.xsize(),
+            dc.quant_dc.ysize(),
+            -0.01,
+        ));
+        let before: Vec<_> = groups.iter().map(|dc| dc.quant_dc.clone()).collect();
+        assert!(!compensate_b_dc(
+            &mut groups,
+            &params,
+            slope,
+            cfl,
+            selected_dc_row_kernels().compensate_b
+        ));
+        for (dc, before) in groups.iter().zip(before) {
+            for c in 0..3 {
+                assert_eq!(dc.quant_dc.plane_data(c), before.plane_data(c));
+            }
+        }
+    }
 
     // The original search is an independent oracle for rate decisions, CfL,
     // group boundaries and the final quantized planes.
@@ -713,7 +927,16 @@ mod tests {
         let (_, mut actual, mut actual_params, _, _) = fixture(w, h, family, custom_cfl);
         reference_choose_chroma_dc_coding(&dim, &mut expected, &mut expected_params, ytob_dc, cfl)
             .unwrap();
-        choose_chroma_dc_coding(&dim, &mut actual, &mut actual_params, ytob_dc, cfl).unwrap();
+        choose_chroma_dc_coding(
+            &dim,
+            &mut actual,
+            &mut actual_params,
+            ytob_dc,
+            cfl,
+            false,
+            selected_dc_row_kernels().adjust_b,
+        )
+        .unwrap();
         assert_eq!(
             actual_params.dc_step.map(f32::to_bits),
             expected_params.dc_step.map(f32::to_bits),
@@ -753,7 +976,16 @@ mod tests {
                 groups.last_mut().unwrap().source_dc_b = None;
             }
             let before: Vec<_> = groups.iter().map(|dc| dc.quant_dc.clone()).collect();
-            choose_chroma_dc_coding(&dim, &mut groups, &mut params, ytob_dc, cfl).unwrap();
+            choose_chroma_dc_coding(
+                &dim,
+                &mut groups,
+                &mut params,
+                ytob_dc,
+                cfl,
+                false,
+                selected_dc_row_kernels().adjust_b,
+            )
+            .unwrap();
             assert_eq!(params.dc_step, [1.0; 3]);
             for (dc, before) in groups.iter().zip(before) {
                 for c in 0..3 {
@@ -859,7 +1091,17 @@ mod tests {
                     let search: Search = if mode == 0 {
                         reference_choose_chroma_dc_coding
                     } else {
-                        choose_chroma_dc_coding
+                        |dim, groups, params, ytob_dc, cfl| {
+                            choose_chroma_dc_coding(
+                                dim,
+                                groups,
+                                params,
+                                ytob_dc,
+                                cfl,
+                                false,
+                                selected_dc_row_kernels().adjust_b,
+                            )
+                        }
                     };
                     let start = Instant::now();
                     search(

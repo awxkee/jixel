@@ -100,7 +100,7 @@ pub(crate) fn quantize_block_ac_wasm(
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn round_ties_away_i32x4(value: v128) -> v128 {
+pub(crate) fn round_ties_away_i32x4(value: v128) -> v128 {
     let truncated = f32x4_trunc(value);
     let fraction = f32x4_sub(value, truncated);
     let at_least_half = f32x4_ge(f32x4_abs(fraction), f32x4_splat(0.5));

@@ -31,6 +31,7 @@ mod adaptive_quant;
 mod afv;
 mod cfl;
 mod color;
+mod dc_ops;
 mod dct;
 mod entropy;
 mod frame;
@@ -58,6 +59,7 @@ pub(crate) use cfl::{
     cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
+pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
     dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct2x2_8x8_neon, dct4x4_neon, dct4x8_neon,
