@@ -1334,11 +1334,15 @@ pub(crate) fn write_ac_group(
     coeff_shifts: &[u32],
     rdoq_prices: Option<&FrozenTokenPrices>,
     coeff_orders: &crate::coeff_order::CoeffOrders,
+    alternative_orders: &[crate::coeff_order::CoeffOrders],
     mut order_stats: Option<&mut crate::coeff_order::OrderStats>,
     measure_chroma_distortion: bool,
     qf_threshold: u32,
     out: &mut [Vec<Token>],
 ) -> f32 {
+    let (out, alternative_out) = out.split_at_mut(coeff_shifts.len());
+    debug_assert_eq!(alternative_out.len(), alternative_orders.len());
+    debug_assert!(alternative_out.is_empty() || coeff_shifts.len() == 1);
     let matrices = ctx.matrices();
     let xsize_blocks = group_brect.xsize;
     let ysize_blocks = group_brect.ysize;
@@ -2103,6 +2107,7 @@ pub(crate) fn write_ac_group(
                     let nzero_ctx = fine_non_zero_context(predicted as u32, block_ctx);
                     let histo_offset = fine_zero_density_contexts_offset(block_ctx);
 
+                    let token_start = out.len();
                     write_token_into(Token::new(nzero_ctx, nzeros as u32), out);
 
                     let mut prev: usize = if nzeros as usize > size / 16 { 0 } else { 1 };
@@ -2152,6 +2157,45 @@ pub(crate) fn write_ac_group(
                             remaining -= 1;
                         }
                         k += 1;
+                    }
+                    for (alternative_out, orders) in
+                        alternative_out.iter_mut().zip(alternative_orders)
+                    {
+                        let alternative_scan = orders.scan_for(strategy_code, c);
+                        if alternative_scan == scan {
+                            alternative_out.extend_from_slice(&out[token_start..]);
+                            continue;
+                        }
+                        write_token_into(Token::new(nzero_ctx, nzeros as u32), alternative_out);
+                        let scan = alternative_scan;
+                        let mut prev = if nzeros as usize > size / 16 { 0 } else { 1 };
+                        let mut remaining = nzeros;
+                        let mut k = covered_blocks;
+                        while k < size && remaining != 0 {
+                            let raw = scan[k] as usize;
+                            let coef = block[raw];
+                            let ctx = histo_offset as usize
+                                + if covered_blocks == 1 {
+                                    zero_density_context_8x8(remaining as usize, k, prev)
+                                } else {
+                                    zero_density_context(
+                                        remaining as usize,
+                                        k,
+                                        covered_blocks,
+                                        log2_covered_blocks,
+                                        prev,
+                                    )
+                                };
+                            write_token_into(
+                                Token::new(ctx as u32, pack_signed(coef)),
+                                alternative_out,
+                            );
+                            prev = if coef != 0 { 1 } else { 0 };
+                            if coef != 0 {
+                                remaining -= 1;
+                            }
+                            k += 1;
+                        }
                     }
                     debug_assert_eq!(
                         remaining, 0,
