@@ -1543,16 +1543,65 @@ fn zero_alpha_for_lossy(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<Alp
 }
 
 /// Auto gate of the lossy-modular arm: byte cushion for the calibration's
-/// per-image quality noise (two-corpus + Optuna joint fit, study
-/// lossy_modular_v3 2026-09-02).
-const LM_GATE_MARGIN: f64 = 1.066;
+/// per-image quality noise.
+const LM_GATE_MARGIN: f64 = 1.08;
+
+/// Texture scaling of the lossy-modular arm's calibrated distance: the
+/// VarDCT-matching ratio tracks luma gradient energy (textured images want
+/// the arm coarser, smooth ones finer). Reference gradient, exponents below
+/// and above it.
+const LM_GRAD_REF: f32 = 0.0231;
+const LM_GRAD_EXP_SMOOTH: f32 = 0.16;
+const LM_GRAD_EXP_TEXTURED: f32 = 0.08;
+
+/// `(gradient / LM_GRAD_REF)^exp` from the mean absolute horizontal and
+/// vertical luminance step of the linear image, clamped to the fitted range.
+fn lm_texture_factor(linear: &Image3F) -> f32 {
+    let (w, h) = (linear.xsize(), linear.ysize());
+    let n = w * h;
+    let (r, g, b) = (
+        &linear.plane_data(0)[..n],
+        &linear.plane_data(1)[..n],
+        &linear.plane_data(2)[..n],
+    );
+    let luma = |i: usize| 0.2126 * r[i] + 0.7152 * g[i] + 0.0722 * b[i];
+    let mut sum_h = 0.0f64;
+    let mut sum_v = 0.0f64;
+    for y in 0..h {
+        let row = y * w;
+        let mut prev = luma(row);
+        for x in 1..w {
+            let cur = luma(row + x);
+            sum_h += (cur - prev).abs() as f64;
+            prev = cur;
+        }
+        if y + 1 < h {
+            for x in 0..w {
+                sum_v += (luma(row + w + x) - luma(row + x)).abs() as f64;
+            }
+        }
+    }
+    let mean_h = if w > 1 {
+        sum_h / ((w - 1) * h) as f64
+    } else {
+        0.0
+    };
+    let mean_v = if h > 1 {
+        sum_v / (w * (h - 1)) as f64
+    } else {
+        0.0
+    };
+    let ratio = (0.5 * (mean_h + mean_v)) as f32 / LM_GRAD_REF;
+    let exp = if ratio < 1.0 {
+        LM_GRAD_EXP_SMOOTH
+    } else {
+        LM_GRAD_EXP_TEXTURED
+    };
+    ratio.clamp(0.13, 4.3).powf(exp)
+}
 
 /// Integer lattice of the plain lossy-modular arm. Squeeze rounds its
-/// averages to the lattice at every level; on the image's own 8-bit codes
-/// that rounding alone costs ~4 SSIMULACRA2 points (kodim20 gray: 8-bit
-/// lattice 19.3 KB @ 68.1, 16-bit 18.0 KB @ 71.5, the XYB arm's 4096-step
-/// lattice 20.9 KB @ 74.2), so the frame declares 16 bits whatever the input
-/// depth.
+/// averages to the lattice at every level
 const LM_PLAIN_MAX: f32 = 65535.0;
 
 /// The non-XYB frame's integer planes for the lossy-modular arm on the
@@ -1641,7 +1690,8 @@ pub(crate) fn encode_frame(
                 &lm_plain_input(ctx, coded, is_achromatic, alpha)?,
                 coded.xsize(),
                 coded.ysize(),
-                crate::lossless::lm_plain_distance(ctx.coding, distance),
+                crate::lossless::lm_plain_distance(ctx.coding, distance)
+                    * lm_texture_factor(linear),
                 ctx.speed,
                 &ctx.thread_pool,
                 scratch,
@@ -1705,7 +1755,7 @@ pub(crate) fn encode_frame(
         let mut modular_writer = BitWriter::new();
         if crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
-            crate::lossless::lm_calibrated_distance(distance),
+            crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(linear),
             ctx.speed,
             &ctx.thread_pool,
             scratch,
@@ -1722,7 +1772,7 @@ pub(crate) fn encode_frame(
         let mut modular_writer = BitWriter::new();
         let have_modular = crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
-            crate::lossless::lm_calibrated_distance(distance),
+            crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(linear),
             ctx.speed,
             &ctx.thread_pool,
             scratch,

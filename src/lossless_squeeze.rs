@@ -653,9 +653,14 @@ fn lossy_modular_q(color: usize, hshift: i32, vshift: i32, distance: f32) -> i32
 /// pilot; the byte-only auto gate depends on this). Piecewise linear through
 /// the measured knots, flat past the last one.
 pub(crate) fn lm_calibrated_distance(d: f32) -> f32 {
-    // Jointly re-fitted with LM_ROW_MUL (study lossy_modular_v3): the finer
-    // chroma shifts the arm's SS2-per-distance, so the knots moved with it.
-    static KNOTS: [(f32, f32); 4] = [(1.0, 1.255), (1.5, 1.532), (2.0, 1.888), (3.0, 2.238)];
+    static KNOTS: [(f32, f32); 6] = [
+        (1.0, 1.324),
+        (1.5, 1.851),
+        (2.0, 2.259),
+        (3.0, 2.466),
+        (4.0, 2.504),
+        (5.0, 2.350),
+    ];
     let knots = KNOTS;
     let k = if d <= knots[0].0 {
         knots[0].1
@@ -883,7 +888,7 @@ fn quantize_channel_divide(ch: &mut crate::squeeze::Channel, q: i32) {
 /// Regular is_last modular frame inside the lossy (`xyb_encoded`) codestream.
 /// Identical to `write_frame_header_modular_flags` except the do_YCbCr bit is
 /// absent: with xyb_encoded set the color transform is implicitly XYB.
-fn write_frame_header_modular_xyb_regular(w: &mut BitWriter) {
+fn write_frame_header_modular_xyb_regular(epf: (u32, f32), w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
@@ -895,11 +900,35 @@ fn write_frame_header_modular_xyb_regular(w: &mut BitWriter) {
     w.write(2, 0b00); // blending = Replace
     w.write(1, 1); // is_last
     w.write(2, 0b00); // name length = 0
+    write_lm_loop_filter(epf, w);
+    w.write(2, 0b00); // no FH extensions
+}
+
+/// Decoder-side edge-preserving filter of the lossy-modular frame
+/// (iterations, `epf_sigma_for_modular`), sigma linear in the arm's
+/// effective distance.
+fn lm_epf_schedule(layout: LmLayout, effective_distance: f32) -> (u32, f32) {
+    let eff = effective_distance;
+    match layout {
+        LmLayout::Xyb => (if eff < 5.0 { 1 } else { 2 }, 0.69 + 0.25 * eff),
+        LmLayout::Plain { rct: true, .. } => (2, 1.5 + 0.29 * eff),
+        LmLayout::Plain { .. } => (if eff < 10.0 { 1 } else { 2 }, 1.6 + 0.055 * eff),
+    }
+}
+
+/// Loop-filter field of the modular frame header: no gaborish, EPF at the
+/// arm's schedule (all defaults except the modular sigma).
+fn write_lm_loop_filter(epf: (u32, f32), w: &mut BitWriter) {
+    let (iters, sigma) = epf;
     w.write(1, 0); // loop_filter not all_default
     w.write(1, 0); // no gaborish
-    w.write(2, 0); // 0 EPF iters
+    w.write(2, iters as u64); // EPF iters
+    if iters > 0 {
+        w.write(1, 0); // epf_weight_custom = false
+        w.write(1, 0); // epf_sigma_custom = false
+        w.write(16, crate::util::f32_to_f16_bits(sigma) as u64); // epf_sigma_for_modular
+    }
     w.write(2, 0b00); // no LF extensions
-    w.write(2, 0b00); // no FH extensions
 }
 
 /// Custom dc_quant field: the decoder multiplies stored X/Y/B channels by these
@@ -917,7 +946,7 @@ fn write_lossy_modular_dc_quant(w: &mut BitWriter) {
 /// image's own integer samples (a non-XYB frame).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LmLayout {
-    /// [Y, X, B-Y] on the `LOSSY_MODULAR_XYB_SCALE` lattice, signalled
+    /// [Y, X, B-Y] on the `LOSSY_MODULAR_XYB_SCALE` lattice, signaled
     /// through custom dc_quant steps.
     Xyb,
     /// The samples in bit-depth units; the decoder divides by the sample
@@ -932,11 +961,11 @@ pub(crate) enum LmLayout {
 }
 
 impl LmLayout {
-    fn write_frame_header(self, w: &mut BitWriter) {
+    fn write_frame_header(self, epf: (u32, f32), w: &mut BitWriter) {
         match self {
-            Self::Xyb => write_frame_header_modular_xyb_regular(w),
+            Self::Xyb => write_frame_header_modular_xyb_regular(epf, w),
             Self::Plain { ycbcr, extra, .. } => {
-                write_frame_header_modular_plain(ycbcr, extra, w);
+                write_frame_header_modular_plain(ycbcr, extra, epf, w);
             }
         }
     }
@@ -959,8 +988,8 @@ impl LmLayout {
 }
 
 /// Regular single-pass modular frame of a non-XYB codestream, no loop
-/// filters (same shape as the lossless header plus the YCbCr signalling).
-fn write_frame_header_modular_plain(ycbcr: bool, extra: usize, w: &mut BitWriter) {
+/// filters (same shape as the lossless header plus the YCbCr signaling).
+fn write_frame_header_modular_plain(ycbcr: bool, extra: usize, epf: (u32, f32), w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
@@ -984,10 +1013,7 @@ fn write_frame_header_modular_plain(ycbcr: bool, extra: usize, w: &mut BitWriter
     }
     w.write(1, 1); // is_last
     w.write(2, 0b00); // name length = 0
-    w.write(1, 0); // loop_filter not all_default
-    w.write(1, 0); // no gaborish
-    w.write(2, 0); // 0 EPF iters
-    w.write(2, 0b00); // no LF extensions
+    write_lm_loop_filter(epf, w);
     w.write(2, 0b00); // no FH extensions
 }
 
@@ -998,6 +1024,8 @@ pub(crate) struct LmQuantized {
     quants: Vec<u32>,
     steps: Vec<crate::squeeze::SqueezeStep>,
     layout: LmLayout,
+    /// Decoder EPF (iterations, modular sigma) for the frame header.
+    epf: (u32, f32),
     xsize: usize,
     ysize: usize,
 }
@@ -1023,18 +1051,26 @@ fn lm_plain_chroma_mul(coding: crate::coding::CodingTransform) -> f32 {
 
 /// Map the caller's distance to a plain-layout quantizer distance so the arm
 /// lands on the VarDCT arm's SSIMULACRA2 at the same `d` (same purpose as
-/// [`lm_calibrated_distance`]; fitted on Kodak 01/02/05/20 at Slow with the
-/// chroma multipliers above). Piecewise linear, flat past the ends.
+/// [`lm_calibrated_distance`]; fitted at Slow with the chroma multipliers
+/// above and the frame's EPF). Piecewise linear, flat past the ends.
 pub(crate) fn lm_plain_distance(coding: crate::coding::CodingTransform, d: f32) -> f32 {
     let knots: &[(f32, f32)] = match coding {
         crate::coding::CodingTransform::Rgb => &[
-            (1.0, 1.49),
-            (1.5, 2.06),
-            (2.0, 2.54),
-            (3.0, 2.85),
-            (4.0, 2.92),
+            (1.0, 1.527),
+            (1.5, 2.099),
+            (2.0, 2.599),
+            (3.0, 2.701),
+            (4.0, 2.745),
+            (5.0, 2.641),
         ],
-        _ => &[(1.0, 2.38), (1.5, 3.28), (2.0, 3.78), (3.0, 4.33)],
+        _ => &[
+            (1.0, 2.383),
+            (1.5, 3.324),
+            (2.0, 3.905),
+            (3.0, 3.952),
+            (4.0, 3.895),
+            (5.0, 3.766),
+        ],
     };
     d * interpolate_knots(knots, d)
 }
@@ -1170,15 +1206,17 @@ pub(crate) fn lm_quantize_plain(
         quantize_channel_divide(ch, q);
         quants.push(q as u32);
     }
+    let layout = LmLayout::Plain {
+        ycbcr,
+        rct,
+        extra: input.extra.len(),
+    };
     Some(LmQuantized {
         channels,
         quants,
         steps,
-        layout: LmLayout::Plain {
-            ycbcr,
-            rct,
-            extra: input.extra.len(),
-        },
+        layout,
+        epf: lm_epf_schedule(layout, effective_distance),
         xsize,
         ysize,
     })
@@ -1261,6 +1299,7 @@ pub(crate) fn lm_quantize(
         quants,
         steps,
         layout: LmLayout::Xyb,
+        epf: lm_epf_schedule(LmLayout::Xyb, effective_distance),
         xsize,
         ysize,
     })
@@ -1319,6 +1358,7 @@ fn encode_lm_frame(
         quants,
         steps,
         layout,
+        epf,
         xsize,
         ysize,
     } = quantized;
@@ -1396,7 +1436,7 @@ fn encode_lm_frame(
             tokens.extend(channel);
         }
 
-        layout.write_frame_header(writer);
+        layout.write_frame_header(epf, writer);
         let mut section = BitWriter::new();
         layout.write_dc_quant(&mut section);
         section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
@@ -1699,7 +1739,7 @@ fn encode_lm_frame(
         &mut scratch.huffman_pool,
     );
 
-    layout.write_frame_header(writer);
+    layout.write_frame_header(epf, writer);
 
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
