@@ -66,7 +66,10 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_sse41, tokenize_alpha_u8_interior_sse41,
     tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
 };
-pub(crate) use quant::{quantize_block_ac_sse41, quantize_dc_cfl_sse41, quantize_dc_sse41};
+pub(crate) use quant::{
+    quantize_block_ac_sse41, quantize_dc_cfl_i32_sse41, quantize_dc_cfl_sse41,
+    quantize_dc_i32_sse41, quantize_dc_sse41,
+};
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_sse41, quantize_xyb_tile_colors_sse41, round_lattice_pow2_sse2,
 };

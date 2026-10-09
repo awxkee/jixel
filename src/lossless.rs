@@ -75,7 +75,9 @@ use palette::{
     PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
     try_encode_local_palette_multi_group, try_encode_palette_single_group, write_palette_transform,
 };
-pub(crate) use predictor::{GradPackInteriorFn, GradientScratch, selected_grad_pack_interior_fn};
+pub(crate) use predictor::{
+    GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
+};
 use predictor::{
     PREDICTOR_GRADIENT, PREDICTOR_WEIGHTED, PredictorNeighbors, channel_to_context,
     choose_predictor_for_plane, choose_predictors_with_wp, choose_wp_params, fixed_predictor,

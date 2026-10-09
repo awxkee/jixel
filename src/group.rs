@@ -822,11 +822,41 @@ pub(crate) type QuantizeBlockAcFn = fn(
 pub(crate) type QuantizeDcFn = fn(input: &[f32], scale: f32, output: &mut [i16]);
 pub(crate) type QuantizeDcCflFn =
     fn(input: &[f32], y_quant: &[i16], scale: f32, cfl: f32, output: &mut [i16]);
+pub(crate) type QuantizeDcI32Fn = fn(input: &[f32], scale: f32, output: &mut [i32]);
+pub(crate) type QuantizeDcCflI32Fn =
+    fn(input: &[f32], y_quant: &[i32], scale: f32, cfl: f32, output: &mut [i32]);
 
 #[derive(Clone, Copy)]
 pub(crate) struct QuantizeDcMethods {
     pub(crate) quantize: QuantizeDcFn,
     pub(crate) quantize_cfl: QuantizeDcCflFn,
+    pub(crate) quantize_i32: QuantizeDcI32Fn,
+    pub(crate) quantize_cfl_i32: QuantizeDcCflI32Fn,
+}
+
+/// Wide levels used by DC-step pricing and the plain modular lattice. Keep
+/// Rust's ties-away rounding and saturating float-to-integer conversion.
+#[allow(dead_code)]
+pub(crate) fn quantize_dc_i32_scalar(input: &[f32], scale: f32, output: &mut [i32]) {
+    debug_assert_eq!(input.len(), output.len());
+    for (&value, target) in input.iter().zip(output) {
+        *target = (value * scale).round() as i32;
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn quantize_dc_cfl_i32_scalar(
+    input: &[f32],
+    y_quant: &[i32],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i32],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    for ((&value, &yq), target) in input.iter().zip(y_quant).zip(output) {
+        *target = fmla(value, scale, -(yq as f32) * cfl).round() as i32;
+    }
 }
 
 #[allow(dead_code)]
@@ -859,6 +889,8 @@ fn select_quantize_dc_methods() -> QuantizeDcMethods {
     QuantizeDcMethods {
         quantize: crate::wasm::quantize_dc_wasm,
         quantize_cfl: crate::wasm::quantize_dc_cfl_wasm,
+        quantize_i32: crate::wasm::quantize_dc_i32_wasm,
+        quantize_cfl_i32: crate::wasm::quantize_dc_cfl_i32_wasm,
     }
 }
 
@@ -870,6 +902,12 @@ fn select_quantize_dc_methods() -> QuantizeDcMethods {
         },
         quantize_cfl: |input, y_quant, scale, cfl, output| unsafe {
             crate::neon::quantize_dc_cfl_neon(input, y_quant, scale, cfl, output)
+        },
+        quantize_i32: |input, scale, output| unsafe {
+            crate::neon::quantize_dc_i32_neon(input, scale, output)
+        },
+        quantize_cfl_i32: |input, y_quant, scale, cfl, output| unsafe {
+            crate::neon::quantize_dc_cfl_i32_neon(input, y_quant, scale, cfl, output)
         },
     }
 }
@@ -888,6 +926,12 @@ fn select_quantize_dc_methods() -> QuantizeDcMethods {
             quantize_cfl: |input, y_quant, scale, cfl, output| unsafe {
                 crate::avx::quantize_dc_cfl_avx2(input, y_quant, scale, cfl, output)
             },
+            quantize_i32: |input, scale, output| unsafe {
+                crate::avx::quantize_dc_i32_avx2(input, scale, output)
+            },
+            quantize_cfl_i32: |input, y_quant, scale, cfl, output| unsafe {
+                crate::avx::quantize_dc_cfl_i32_avx2(input, y_quant, scale, cfl, output)
+            },
         };
     }
 
@@ -900,12 +944,20 @@ fn select_quantize_dc_methods() -> QuantizeDcMethods {
             quantize_cfl: |input, y_quant, scale, cfl, output| unsafe {
                 crate::sse::quantize_dc_cfl_sse41(input, y_quant, scale, cfl, output)
             },
+            quantize_i32: |input, scale, output| unsafe {
+                crate::sse::quantize_dc_i32_sse41(input, scale, output)
+            },
+            quantize_cfl_i32: |input, y_quant, scale, cfl, output| unsafe {
+                crate::sse::quantize_dc_cfl_i32_sse41(input, y_quant, scale, cfl, output)
+            },
         };
     }
 
     QuantizeDcMethods {
         quantize: quantize_dc_scalar,
         quantize_cfl: quantize_dc_cfl_scalar,
+        quantize_i32: quantize_dc_i32_scalar,
+        quantize_cfl_i32: quantize_dc_cfl_i32_scalar,
     }
 }
 
@@ -2639,6 +2691,77 @@ mod tests {
             (methods.quantize_cfl)(&input[..len], &y_quant[..len], 1.0, 0.5, &mut got[..len]);
             assert_eq!(got, want, "CfL DC length {len}");
         }
+
+        check_dc_i32_quantizers(methods);
+    }
+
+    fn check_dc_i32_quantizers(methods: QuantizeDcMethods) {
+        let special = [
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+            -0.0,
+            0.0,
+            -0.5,
+            0.5,
+            -1.5,
+            1.5,
+            -2.5,
+            2.5,
+            f32::from_bits(0.5f32.to_bits() - 1),
+            f32::from_bits(0.5f32.to_bits() + 1),
+            -f32::from_bits(0.5f32.to_bits() - 1),
+            -f32::from_bits(0.5f32.to_bits() + 1),
+            -65_535.5,
+            65_535.5,
+            f32::from_bits(2_147_483_648.0f32.to_bits() - 1),
+            2_147_483_648.0,
+            -2_147_483_648.0,
+            -4_294_967_296.0,
+        ];
+        let input: Vec<f32> = (0..257)
+            .map(|i| {
+                if i % 3 == 0 {
+                    special[i / 3 % special.len()]
+                } else {
+                    f32::from_bits(0x3b00_0000 + (i as u32 * 7919) % 0x1000_0000)
+                        * if i % 2 == 0 { 1.0 } else { -1.0 }
+                }
+            })
+            .collect();
+        let y_quant: Vec<i32> = (0..257)
+            .map(|i| match i % 7 {
+                0 => i32::MIN,
+                1 => i32::MAX,
+                _ => (i * 7919) - 900_000,
+            })
+            .collect();
+        for len in (0..=33).chain([63, 64, 65, 127, 128, 129, 257]) {
+            for scale in [0.0, -0.0, 0.5, 1.0, -1.25, 1.137, 65535.0] {
+                let mut want = vec![0x1234_5678i32; len + 2];
+                let mut got = want.clone();
+                super::quantize_dc_i32_scalar(&input[..len], scale, &mut want[1..=len]);
+                (methods.quantize_i32)(&input[..len], scale, &mut got[1..=len]);
+                assert_eq!(got, want, "wide DC length {len}, scale={scale}");
+                for cfl in [0.0, -0.0, 0.5, -0.75, 0.137] {
+                    super::quantize_dc_cfl_i32_scalar(
+                        &input[..len],
+                        &y_quant[..len],
+                        scale,
+                        cfl,
+                        &mut want[1..=len],
+                    );
+                    (methods.quantize_cfl_i32)(
+                        &input[..len],
+                        &y_quant[..len],
+                        scale,
+                        cfl,
+                        &mut got[1..=len],
+                    );
+                    assert_eq!(got, want, "wide CfL length {len}, scale={scale}, cfl={cfl}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2839,13 +2962,19 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     #[test]
     fn avx2_dc_quantizers_match_scalar() {
-        if std::is_x86_feature_detected!("avx2") {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
             check_dc_quantizers(QuantizeDcMethods {
                 quantize: |input, scale, output| unsafe {
                     crate::avx::quantize_dc_avx2(input, scale, output)
                 },
                 quantize_cfl: |input, y_quant, scale, cfl, output| unsafe {
                     crate::avx::quantize_dc_cfl_avx2(input, y_quant, scale, cfl, output)
+                },
+                quantize_i32: |input, scale, output| unsafe {
+                    crate::avx::quantize_dc_i32_avx2(input, scale, output)
+                },
+                quantize_cfl_i32: |input, y_quant, scale, cfl, output| unsafe {
+                    crate::avx::quantize_dc_cfl_i32_avx2(input, y_quant, scale, cfl, output)
                 },
             });
         }
@@ -2861,6 +2990,12 @@ mod tests {
                 },
                 quantize_cfl: |input, y_quant, scale, cfl, output| unsafe {
                     crate::sse::quantize_dc_cfl_sse41(input, y_quant, scale, cfl, output)
+                },
+                quantize_i32: |input, scale, output| unsafe {
+                    crate::sse::quantize_dc_i32_sse41(input, scale, output)
+                },
+                quantize_cfl_i32: |input, y_quant, scale, cfl, output| unsafe {
+                    crate::sse::quantize_dc_cfl_i32_sse41(input, y_quant, scale, cfl, output)
                 },
             });
         }

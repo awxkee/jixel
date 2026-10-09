@@ -112,6 +112,8 @@ effort_gates! {
     /// Frame-level X DC chroma-from-luma search on the unrounded source,
     /// under the final luma levels and DC quantization steps.
     dc_x_cfl,
+    /// Rank B DC CfL slopes with weighted prediction in pooled WP-error contexts.
+    dc_cfl_weighted,
     ans_refine,
     /// Broader final hybrid-uint and ANS-table search.
     ans_exhaustive,
@@ -205,6 +207,7 @@ const MEDIUM: Effort = Effort {
 };
 
 const SLOW: Effort = Effort {
+    dc_cfl_weighted: false,
     large_transform_rdoq: false,
     rdoq_fresh_prices: false,
     ans_exhaustive: false,

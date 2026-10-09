@@ -175,3 +175,73 @@ pub(crate) fn quantize_dc_cfl_wasm(
         output_tail.copy_from_slice(&target[..input_tail.len()]);
     }
 }
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn quantize_dc_i32_wasm(input: &[f32], scale: f32, output: &mut [i32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<4>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
+    let scale = f32x4_splat(scale);
+    for (source, target) in input_chunks.iter().zip(output_chunks) {
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let value = round_ties_away_i32x4(f32x4_mul(value, scale));
+        unsafe { v128_store(target.as_mut_ptr().cast(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let value = round_ties_away_i32x4(f32x4_mul(value, scale));
+        let mut target = [0i32; 4];
+        unsafe { v128_store(target.as_mut_ptr().cast(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn quantize_dc_cfl_i32_value_x4(
+    input: v128,
+    y_quant: v128,
+    scale: v128,
+    negative_cfl: v128,
+) -> v128 {
+    let correction = f32x4_mul(f32x4_convert_i32x4(y_quant), negative_cfl);
+    let value = f32x4_add(f32x4_mul(input, scale), correction);
+    round_ties_away_i32x4(value)
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn quantize_dc_cfl_i32_wasm(
+    input: &[f32],
+    y_quant: &[i32],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i32],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<4>();
+    let (y_chunks, y_tail) = y_quant.as_chunks::<4>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
+    let scale = f32x4_splat(scale);
+    let negative_cfl = f32x4_splat(-cfl);
+    for ((source, y), target) in input_chunks.iter().zip(y_chunks).zip(output_chunks) {
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let y = unsafe { v128_load(y.as_ptr().cast()) };
+        let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);
+        unsafe { v128_store(target.as_mut_ptr().cast(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let mut y = [0i32; 4];
+        y[..y_tail.len()].copy_from_slice(y_tail);
+        let value = unsafe { v128_load(source.as_ptr().cast()) };
+        let y = unsafe { v128_load(y.as_ptr().cast()) };
+        let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);
+        let mut target = [0i32; 4];
+        unsafe { v128_store(target.as_mut_ptr().cast(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}

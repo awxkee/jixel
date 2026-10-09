@@ -551,44 +551,80 @@ fn walk_dc_channel<T: Copy + Into<i64>>(
 ///
 /// NOTE: keep in step with the DC coder (see [`walk_dc_channel`]).
 pub(crate) fn price_dc_plane(levels: &[i32], width: usize, height: usize, stride: usize) -> f64 {
-    const MAX_SYMBOLS: usize = 128;
-    let mut tokens = Vec::with_capacity(width * height);
-    let mut none = Vec::new();
-    let mut props = Vec::new();
-    walk_dc_channel(
-        levels,
-        width,
-        height,
-        stride,
-        0,
-        &DC_PREDICTOR_WEIGHTED,
-        &mut props,
-        false,
-        false,
-        &mut tokens,
-        &mut none,
-    );
-    let mut counts = vec![[0u32; MAX_SYMBOLS]; K_NUM_DC_CONTEXTS];
-    let mut raw_bits = 0u64;
-    for token in &tokens {
-        let (sym, nbits, _) = crate::entropy::uint_encode(token.value);
-        counts[token.context as usize][(sym as usize).min(MAX_SYMBOLS - 1)] += 1;
-        raw_bits += u64::from(nbits);
-    }
-    let mut bits = raw_bits as f64;
-    for ctx in &counts {
-        let total: u32 = ctx.iter().sum();
-        if total == 0 {
-            continue;
+    let mut price = DcPlanePrice::default();
+    price.add(levels, width, height, stride);
+    price.bits()
+}
+
+/// Reusable weighted-predictor price for one channel across DC groups. The
+/// predictor restarts for every group, while all groups share the histograms,
+/// just as they share the final frame's entropy code.
+pub(crate) struct DcPlanePrice {
+    tokens: Vec<Token>,
+    counts: Vec<[u32; crate::entropy::ALPHABET_SIZE]>,
+    raw_bits: u64,
+}
+
+impl Default for DcPlanePrice {
+    fn default() -> Self {
+        Self {
+            tokens: Vec::new(),
+            counts: vec![[0; crate::entropy::ALPHABET_SIZE]; K_NUM_DC_CONTEXTS],
+            raw_bits: 0,
         }
-        let total = f64::from(total);
-        bits += ctx
-            .iter()
-            .filter(|&&n| n != 0)
-            .map(|&n| f64::from(n) * f_log2(total / f64::from(n)))
-            .sum::<f64>();
     }
-    bits
+}
+
+impl DcPlanePrice {
+    pub(crate) fn clear(&mut self) {
+        self.counts.as_flattened_mut().fill(0);
+        self.raw_bits = 0;
+    }
+
+    pub(crate) fn add<T: Copy + Into<i64>>(
+        &mut self,
+        levels: &[T],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) {
+        self.tokens.clear();
+        walk_dc_channel(
+            levels,
+            width,
+            height,
+            stride,
+            0,
+            &DC_PREDICTOR_WEIGHTED,
+            &mut Vec::new(),
+            false,
+            false,
+            &mut self.tokens,
+            &mut Vec::new(),
+        );
+        for token in &self.tokens {
+            let (sym, nbits, _) = crate::entropy::uint_encode(token.value);
+            self.counts[token.context as usize][sym as usize] += 1;
+            self.raw_bits += u64::from(nbits);
+        }
+    }
+
+    pub(crate) fn bits(&self) -> f64 {
+        let mut bits = self.raw_bits as f64;
+        for ctx in &self.counts {
+            let total: u32 = ctx.iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let total = f64::from(total);
+            bits += ctx
+                .iter()
+                .filter(|&&n| n != 0)
+                .map(|&n| f64::from(n) * f_log2(total / f64::from(n)))
+                .sum::<f64>();
+        }
+        bits
+    }
 }
 
 /// AC metadata: ytox/ytob CfL maps (all 0), AC strategy (all 0 = DCT-8x8),
@@ -1619,7 +1655,11 @@ fn lm_plain_input(
 ) -> Option<crate::lossless::LmPlainInput> {
     let n = coded.xsize() * coded.ysize();
     let max = LM_PLAIN_MAX;
-    let round = |v: f32| (v * max).round() as i32;
+    let quantize = |input: &[f32]| {
+        let mut levels = vec![0i32; input.len()];
+        (ctx.quantize_dc_i32)(input, max, &mut levels);
+        levels
+    };
     let color: Vec<Vec<i32>> = if gray {
         // Gray is coded as three equal channels; the modular frame carries
         // the sample itself (YCbCr's luma plane sits 128/255 below it).
@@ -1627,26 +1667,42 @@ fn lm_plain_input(
             crate::coding::CodingTransform::YCbCr => 128.0 / 255.0,
             _ => 0.0,
         };
-        vec![
-            coded.plane_data(1)[..n]
-                .iter()
-                .map(|&v| round(v + offset))
-                .collect(),
-        ]
+        if offset == 0.0 {
+            vec![quantize(&coded.plane_data(1)[..n])]
+        } else {
+            let width = coded.xsize().max(1);
+            let mut source = vec![0.0f32; width];
+            let mut levels = vec![0i32; n];
+            for (row, target) in coded.plane_data(1)[..n]
+                .chunks(width)
+                .zip(levels.chunks_mut(width))
+            {
+                for (value, &input) in source.iter_mut().zip(row) {
+                    *value = input + offset;
+                }
+                (ctx.quantize_dc_i32)(&source[..row.len()], max, target);
+            }
+            vec![levels]
+        }
     } else {
         (0..3)
-            .map(|c| coded.plane_data(c)[..n].iter().map(|&v| round(v)).collect())
+            .map(|c| quantize(&coded.plane_data(c)[..n]))
             .collect()
     };
     let extra: Vec<Vec<i32>> = match alpha {
         Some(AlphaPlane::F32(_)) => return None,
         Some(plane) if ctx.extra_squeeze_distance > 0.0 => {
             let scale = max / ((1u32 << plane.bits()) - 1) as f32;
-            vec![
-                (0..n)
-                    .map(|i| (plane.get_i32(i) as f32 * scale).round() as i32)
-                    .collect(),
-            ]
+            let width = coded.xsize().max(1);
+            let mut source = vec![0.0f32; width];
+            let mut levels = vec![0i32; n];
+            for (y, target) in levels.chunks_mut(width).enumerate() {
+                for (x, value) in source[..target.len()].iter_mut().enumerate() {
+                    *value = plane.get_i32(y * width + x) as f32;
+                }
+                (ctx.quantize_dc_i32)(&source[..target.len()], scale, target);
+            }
+            vec![levels]
         }
         Some(plane) => vec![(0..n).map(|i| plane.get_i32(i)).collect()],
         None => Vec::new(),
@@ -3283,26 +3339,38 @@ fn encode_frame_core(
         let scan_moved = order_stats.as_ref().map_or(0.0, |stats| {
             crate::coeff_order::derive_orders(stats, &mut coeff_orders)
         });
-        ytob_dc = choose_ytob_dc(
-            &dc_datas,
-            ctx.fill_ytob_row,
-            ctx.accumulate_ytob_weights,
-            ctx.fill_ytob_residuals,
-            &mut scratch.dc_cfl_cur,
-            &mut scratch.dc_cfl_prev,
-            distp.dc_step,
-            ctx.cfl_frame().color_factor,
-        );
-        ytob_dc = crate::color_correlation::validate_ytob_dc(
-            &dc_datas,
-            ytob_dc,
-            distp.scale_dc,
-            distp.dc_step,
-            ctx.cfl_frame(),
-            ctx.quantize_dc_cfl,
-        );
+        ytob_dc = if ctx.speed.effort().dc_cfl_weighted {
+            crate::color_correlation::choose_ytob_dc_weighted(
+                &dc_datas,
+                ctx,
+                distp.scale_dc,
+                distp.dc_step,
+                &mut scratch.dc_cfl_cur,
+                &mut scratch.dc_cfl_prev,
+            )
+        } else {
+            let candidate = choose_ytob_dc(
+                &dc_datas,
+                ctx.fill_ytob_row,
+                ctx.accumulate_ytob_weights,
+                ctx.fill_ytob_residuals,
+                &mut scratch.dc_cfl_cur,
+                &mut scratch.dc_cfl_prev,
+                distp.dc_step,
+                ctx.cfl_frame().color_factor,
+            );
+            crate::color_correlation::validate_ytob_dc(
+                &dc_datas,
+                candidate,
+                distp.scale_dc,
+                distp.dc_step,
+                ctx.cfl_frame(),
+                ctx.quantize_dc_cfl,
+            )
+        };
         distp.dc_step = crate::color_correlation::choose_dc_steps(
             &dc_datas,
+            ctx,
             distp.scale_dc,
             ytob_dc,
             distp.dc_step,
@@ -4632,6 +4700,59 @@ fn build_stripe(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn plain_modular_lattice_matches_scalar_rounding() {
+        use crate::coding::CodingTransform;
+        use crate::encode_image::AlphaPlane;
+        use crate::encoding_context::EncodingContext;
+        use crate::image::Image3F;
+
+        for width in [1, 3, 4, 7, 8, 9, 17] {
+            let mut coded = Image3F::new(width, 3);
+            for c in 0..3 {
+                for (i, value) in coded.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                    *value = (i as f32 - 8.5 + c as f32 * 0.25) / super::LM_PLAIN_MAX;
+                }
+            }
+            for coding in [CodingTransform::Rgb, CodingTransform::YCbCr] {
+                let mut ctx = EncodingContext::default();
+                ctx.coding = coding;
+                ctx.extra_squeeze_distance = 1.0;
+                for alpha in [
+                    AlphaPlane::U8((0..width * 3).map(|i| (i * 37) as u8).collect()),
+                    AlphaPlane::U16 {
+                        data: (0..width * 3).map(|i| (i * 977) as u16).collect(),
+                        bits: 16,
+                    },
+                ] {
+                    for gray in [false, true] {
+                        let got = super::lm_plain_input(&ctx, &coded, gray, Some(&alpha)).unwrap();
+                        let channels: &[usize] = if gray { &[1] } else { &[0, 1, 2] };
+                        for (levels, &c) in got.color.iter().zip(channels) {
+                            let offset = if gray && coding == CodingTransform::YCbCr {
+                                128.0 / 255.0
+                            } else {
+                                0.0
+                            };
+                            let want: Vec<i32> = coded.plane_data(c)[..width * 3]
+                                .iter()
+                                .map(|&value| {
+                                    ((value + offset) * super::LM_PLAIN_MAX).round() as i32
+                                })
+                                .collect();
+                            assert_eq!(*levels, want);
+                        }
+                        let scale = super::LM_PLAIN_MAX / ((1u32 << alpha.bits()) - 1) as f32;
+                        let want: Vec<i32> = (0..width * 3)
+                            .map(|i| (alpha.get_i32(i) as f32 * scale).round() as i32)
+                            .collect();
+                        assert_eq!(got.extra[0].0, want);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ac_group_source_views_match_copied_stripes() {
         use crate::coeff_order::CoeffOrders;
         use crate::dc_group_data::{DcGroupData, NUM_STRATEGIES};
@@ -5163,6 +5284,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dc_plane_price_pools_histograms_and_restarts_prediction() {
+        let mut price = super::DcPlanePrice::default();
+        price.add(&[0i16], 1, 1, 1);
+        price.add(&[1i16], 1, 1, 1);
+        // Two equally frequent symbols in one shared context cost two bits;
+        // pricing the one-symbol groups separately would incorrectly cost zero.
+        assert_eq!(price.bits(), 2.0);
+
+        price.clear();
+        assert_eq!(price.bits(), 0.0);
+        price.add(&[100i16], 1, 1, 1);
+        price.add(&[100i16], 1, 1, 1);
+        // Each group's first sample predicts zero, so both tokens are identical.
+        // Treating them as one row would instead code residuals 100 and zero.
+        assert_eq!(price.bits(), 2.0 * super::price_dc_plane(&[100], 1, 1, 1));
+        assert!(super::price_dc_plane(&[100, 100], 2, 1, 2) < price.bits());
     }
 
     #[test]
