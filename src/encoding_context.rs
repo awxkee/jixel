@@ -120,6 +120,9 @@ pub(crate) struct EncodingContext {
     /// Blue-axis twin of `x_heavy`: structure lives in B−Y where luma-driven
     /// masking cannot see it (saturated blue detail on low-luma ground).
     b_heavy: std::sync::atomic::AtomicBool,
+    /// Screen/graphics content (many exactly constant 8x8 blocks): hard
+    /// edges beside flat fills, where the strongest EPF pays on every metric.
+    screen_content: std::sync::atomic::AtomicBool,
     b_qm_scale: std::sync::atomic::AtomicU32,
     /// Content floor for the signaled X quant scale (2 = none).
     x_qm_scale_floor: std::sync::atomic::AtomicU32,
@@ -134,6 +137,7 @@ pub(crate) struct EncodingContext {
     pub(crate) quantize_block_ac: group::QuantizeBlockAcFn,
     pub(crate) quantize_dc: group::QuantizeDcFn,
     pub(crate) quantize_dc_cfl: group::QuantizeDcCflFn,
+    pub(crate) dc_rows: crate::dc_ops::DcRowKernels,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
     pub(crate) mosaic_seam_stats: crate::mosaic_seam::MosaicSeamStatsFn,
     pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
@@ -255,6 +259,16 @@ impl EncodingContext {
     pub(crate) fn set_b_heavy(&self, heavy: bool) {
         self.b_heavy
             .store(heavy, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn screen_content(&self) -> bool {
+        self.screen_content
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_screen_content(&self, screen: bool) {
+        self.screen_content
+            .store(screen, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn raise_x_qm_scale_floor(&self, scale: u32) {
@@ -452,6 +466,7 @@ impl EncodingContext {
             x_heavy: std::sync::atomic::AtomicBool::new(false),
             pair_b_fine: std::sync::atomic::AtomicBool::new(false),
             b_heavy: std::sync::atomic::AtomicBool::new(false),
+            screen_content: std::sync::atomic::AtomicBool::new(false),
             b_qm_scale: std::sync::atomic::AtomicU32::new(2),
             x_qm_scale_floor: std::sync::atomic::AtomicU32::new(2),
             #[cfg(feature = "splines")]
@@ -478,6 +493,7 @@ impl EncodingContext {
             quantize_block_ac: group::selected_quantize_block_ac_fn(),
             quantize_dc: quantize_dc.quantize,
             quantize_dc_cfl: quantize_dc.quantize_cfl,
+            dc_rows: crate::dc_ops::selected_dc_row_kernels(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
             mosaic_seam_stats: crate::mosaic_seam::select_mosaic_seam_stats_fn(),
             gradient_region_stats: ac_strategy::select_gradient_region_stats_fn(),

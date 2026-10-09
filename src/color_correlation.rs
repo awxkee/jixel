@@ -26,7 +26,6 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::Speed;
 use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
@@ -793,7 +792,8 @@ pub(crate) fn fill_cmap(
     // on the very frames for which we retain extra X/B precision.
     // YCbCr chroma follows luma with large, content-dependent slopes, which
     // the regression's deadzone misses; it searches them at Fast too.
-    let ycbcr = ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed != Speed::Fastest;
+    let ycbcr =
+        ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed.effort().cfl_ycbcr_rdo;
     let use_rdo =
         (distance < CFL_RDO.max_d || ctx.x_heavy()) && (ctx.speed.effort().cfl_rdo || ycbcr);
 
@@ -910,6 +910,16 @@ fn add_ytob_token(residual: i32, hist: &mut [u64; 64], extra_bits: &mut u64) {
     *extra_bits += nbits as u64;
 }
 
+/// Order-0 entropy of the DC symbols plus their raw extra bits.
+fn dc_histogram_bits(hist: &[u64], extra_bits: u64, total: u64) -> f64 {
+    let inv = 1.0 / total.max(1) as f64;
+    hist.iter()
+        .filter(|&&n| n != 0)
+        .fold(extra_bits as f64, |sum, &n| {
+            sum - n as f64 * f_log2(n as f64 * inv)
+        })
+}
+
 pub(crate) type FillYtobRowFn = fn(&mut [i32], &[i16], &[i16], f32);
 
 #[inline(always)]
@@ -1006,12 +1016,7 @@ fn ytob_dc_cost(
         return 0.0;
     }
 
-    let inv = 1.0 / total as f64;
-    hist.iter()
-        .filter(|&&count| count != 0)
-        .fold(extra_bits as f64, |bits, &count| {
-            bits - count as f64 * f_log2(count as f64 * inv)
-        })
+    dc_histogram_bits(&hist, extra_bits, total)
 }
 
 #[inline]
@@ -1227,11 +1232,208 @@ pub(crate) fn dc_cfl_factor(dc_step: [f32; 3], ytob_dc: i32, cfl: CflFrame) -> f
         * (cfl.base_b + ytob_dc as f32 / cfl.color_factor)
 }
 
-/// The X DC's share of the stored Y DC: `base_correlation_x` (`ytox_dc` is
-/// never signaled), in stored-X-DC units under the frame's DC steps.
+/// The X DC's share of the stored Y DC, in stored-X-DC units under the
+/// frame's DC steps. DC callers fold `ytox_dc` into `base_x` first; AC keeps
+/// the original frame correlations.
 #[inline]
 pub(crate) fn dc_cfl_factor_x(dc_step: [f32; 3], base_x: f32) -> f32 {
     INV_DC_QUANT[0] / dc_step[0] * (DC_QUANT[1] * dc_step[1]) * base_x
+}
+
+#[derive(Clone, Copy, Debug)]
+struct XdcCost {
+    bits: f64,
+    distortion: f64,
+}
+
+/// Confirm the gradient proposal under the coder's default weighted
+/// predictor and context layout. Small gradient-only gains can otherwise
+/// disappear when the DC entropy search chooses weighted prediction.
+fn ytox_dc_weighted_bits(
+    dc_datas: &[DcGroupData],
+    k: i32,
+    scale: f32,
+    dc_step: [f32; 3],
+    cfl: CflFrame,
+    quantize: crate::group::QuantizeDcCflFn,
+) -> f64 {
+    let factor = dc_cfl_factor_x(dc_step, y_to_x_ratio(cfl, k as i8));
+    let mut total = 0.0;
+    for dc in dc_datas {
+        let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+        let mut levels = Vec::with_capacity(w * h);
+        if k == 0 {
+            levels.extend(
+                dc.quant_dc
+                    .plane(0)
+                    .as_slice()
+                    .iter()
+                    .map(|&v| i32::from(v)),
+            );
+        } else {
+            let source = dc.source_dc_x.as_ref().unwrap();
+            let mut row = vec![0i16; w];
+            for y in 0..h {
+                quantize(
+                    source.row(y),
+                    dc.quant_dc.plane_row(1, y),
+                    scale,
+                    factor,
+                    &mut row,
+                );
+                levels.extend(row.iter().map(|&v| i32::from(v)));
+            }
+        }
+        total += crate::frame::price_dc_plane(&levels, w, h, w);
+    }
+    total
+}
+
+/// Price X after quantizing the original fractional source against the final
+/// stored luma. The zero arm uses the actual incumbent integers. Predictors
+/// restart at DC-group boundaries, as they do in the Modular stream.
+fn ytox_dc_cost(
+    dc_datas: &[DcGroupData],
+    k: i32,
+    scale: f32,
+    dc_step: [f32; 3],
+    cfl: CflFrame,
+    quantize: crate::group::QuantizeDcCflFn,
+    previous: &mut [i16],
+    current: &mut [i16],
+) -> XdcCost {
+    let ratio = y_to_x_ratio(cfl, k as i8);
+    let factor = dc_cfl_factor_x(dc_step, ratio);
+    let (mut hist, mut extra, mut total) = ([0u64; 64], 0u64, 0u64);
+    let mut distortion = 0.0;
+    for dc in dc_datas {
+        let source = dc.source_dc_x.as_ref().unwrap();
+        let w = source.xsize();
+        let (mut previous, mut current) = (&mut previous[..w], &mut current[..w]);
+        for y in 0..source.ysize() {
+            let luma = dc.quant_dc.plane_row(1, y);
+            if k == 0 {
+                current.copy_from_slice(dc.quant_dc.plane_row(0, y));
+            } else {
+                quantize(source.row(y), luma, scale, factor, current);
+            }
+            for x in 0..w {
+                let pred = if y == 0 {
+                    if x == 0 { 0 } else { i32::from(current[x - 1]) }
+                } else if x == 0 {
+                    i32::from(previous[x])
+                } else {
+                    grad_predict(
+                        i32::from(previous[x]),
+                        i32::from(current[x - 1]),
+                        i32::from(previous[x - 1]),
+                    )
+                };
+                add_ytob_token(i32::from(current[x]) - pred, &mut hist, &mut extra);
+                let target = fmla(source.row(y)[x], scale, -(luma[x] as f32) * factor);
+                distortion += f64::from(target - current[x] as f32).powi(2);
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        total += (source.xsize() * source.ysize()) as u64;
+    }
+    let bits = dc_histogram_bits(&hist, extra, total);
+    XdcCost { bits, distortion }
+}
+
+/// Search every signaled X DC slope. A candidate must save its incremental
+/// header under gradient and weighted-predictor prices, and must not increase
+/// squared DC reconstruction error against the
+/// unrounded source. Apply the winner with the coding quantizer, never by
+/// subtracting from previously rounded X integers.
+pub(crate) fn choose_ytox_dc(
+    dc_datas: &mut [DcGroupData],
+    scale_dc: f32,
+    dc_step: [f32; 3],
+    cfl: CflFrame,
+    header_already_paid: bool,
+    quantize: crate::group::QuantizeDcCflFn,
+) -> i32 {
+    if dc_datas.is_empty() || dc_datas.iter().any(|dc| dc.source_dc_x.is_none()) {
+        return 0;
+    }
+    let width = dc_datas
+        .iter()
+        .map(|dc| dc.quant_dc.xsize())
+        .max()
+        .unwrap_or(0);
+    let mut previous = vec![0i16; width];
+    let mut current = vec![0i16; width];
+    let scale = INV_DC_QUANT[0] / dc_step[0] * scale_dc;
+    let base = ytox_dc_cost(
+        dc_datas,
+        0,
+        scale,
+        dc_step,
+        cfl,
+        quantize,
+        &mut previous,
+        &mut current,
+    );
+    let header = if header_already_paid || cfl != CflFrame::XYB {
+        0.0
+    } else {
+        COLOR_CORRELATION_HEADER_BITS
+    };
+    let (mut best_bits, mut best_k) = (base.bits, 0);
+    #[cfg(test)]
+    let mut best_cost = base;
+    for k in (-128..=127).filter(|&k| k != 0) {
+        let cost = ytox_dc_cost(
+            dc_datas,
+            k,
+            scale,
+            dc_step,
+            cfl,
+            quantize,
+            &mut previous,
+            &mut current,
+        );
+        if cost.distortion <= base.distortion && cost.bits + header < best_bits {
+            best_bits = cost.bits + header;
+            best_k = k;
+            #[cfg(test)]
+            {
+                best_cost = cost;
+            }
+        }
+    }
+    if best_k != 0 {
+        let base_bits = ytox_dc_weighted_bits(dc_datas, 0, scale, dc_step, cfl, quantize);
+        let proposed_bits = ytox_dc_weighted_bits(dc_datas, best_k, scale, dc_step, cfl, quantize);
+        if proposed_bits + header >= base_bits {
+            best_k = 0;
+            #[cfg(test)]
+            {
+                best_cost = base;
+            }
+        }
+    }
+    #[cfg(test)]
+    XDC_STUDY.set(Some((best_k, base, best_cost)));
+    if best_k != 0 {
+        let factor = dc_cfl_factor_x(dc_step, y_to_x_ratio(cfl, best_k as i8));
+        for dc in dc_datas {
+            let source = dc.source_dc_x.as_ref().unwrap();
+            for row in 0..source.ysize() {
+                let [x, y, _] = dc.quant_dc.all_plane_rows_mut(row);
+                quantize(source.row(row), y, scale, factor, x);
+            }
+        }
+    }
+    best_k
+}
+
+#[cfg(test)]
+thread_local! {
+    static XDC_STUDY: std::cell::Cell<Option<(i32, XdcCost, XdcCost)>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 /// DC step candidates per channel: the default and finer ones a percent
@@ -1244,7 +1446,7 @@ const DC_STEP_MIN_GAIN: f64 = 0.02;
 
 /// A DC step multiplier as the decoder reads it back from its 16-bit wire
 /// form.
-fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
+pub(crate) fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
     let wire = DC_QUANT[channel] * 128.0 * multiplier;
     crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(wire)) / (DC_QUANT[channel] * 128.0)
 }
@@ -1278,14 +1480,6 @@ pub(crate) fn choose_dc_steps(
         return default;
     }
     let candidates: [f32; DC_STEP_CANDIDATES] = std::array::from_fn(|k| 1.0 - 0.01 * k as f32);
-    let entropy = |hist: &[u64; 64], extra: u64, total: u64| {
-        let inv = 1.0 / total.max(1) as f64;
-        hist.iter()
-            .filter(|&&n| n != 0)
-            .fold(extra as f64, |sum, &n| {
-                sum - n as f64 * f_log2(n as f64 * inv)
-            })
-    };
     let predict = |current: &[i32], previous: &[i32], x: usize, y: usize| {
         if y == 0 {
             if x == 0 { 0 } else { current[x - 1] }
@@ -1322,7 +1516,7 @@ pub(crate) fn choose_dc_steps(
                 }
             }
         }
-        entropy(&hist, extra, total)
+        dc_histogram_bits(&hist, extra, total)
     };
     // Rate of B under both steps, against the Y levels of `step_y`.
     let max_width = dc_datas
@@ -1356,7 +1550,7 @@ pub(crate) fn choose_dc_steps(
                 std::mem::swap(&mut current, &mut previous);
             }
         }
-        entropy(&hist, extra, total)
+        dc_histogram_bits(&hist, extra, total)
     };
     let mut y_levels: Vec<Vec<i32>> = dc_datas
         .iter()
@@ -1471,12 +1665,7 @@ pub(crate) fn validate_ytob_dc(
             }
             total += (w * h) as u64;
         }
-        let inv = 1.0 / total.max(1) as f64;
-        hist.iter()
-            .filter(|&&n| n != 0)
-            .fold(extra as f64, |sum, &n| {
-                sum - n as f64 * f_log2(n as f64 * inv)
-            })
+        dc_histogram_bits(&hist, extra, total)
     };
     let base = cost(0);
     let proposed = cost(candidate);
@@ -1490,6 +1679,188 @@ pub(crate) fn validate_ytob_dc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn x_dc_fixture(k: i32, fraction: f32, w: usize, h: usize) -> DcGroupData {
+        let ctx = EncodingContext::default();
+        let mut dc = DcGroupData::new(w, h).unwrap();
+        let mut source = crate::image::Plane::new(w, h);
+        let factor = dc_cfl_factor_x([1.0; 3], y_to_x_ratio(CflFrame::XYB, k as i8));
+        let mut state = 19u32;
+        for row in 0..h {
+            for x in 0..w {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let y = ((state >> 16) % 2001) as i16 - 1000;
+                dc.quant_dc.plane_row_mut(1, row)[x] = y;
+                dc.quant_dc.plane_row_mut(2, row)[x] = 23;
+                source.row_mut(row)[x] = (factor * f32::from(y) + fraction) / INV_DC_QUANT[0];
+            }
+            (ctx.quantize_dc)(
+                source.row(row),
+                INV_DC_QUANT[0],
+                dc.quant_dc.plane_row_mut(0, row),
+            );
+        }
+        dc.source_dc_x = Some(source);
+        dc
+    }
+
+    #[test]
+    fn x_dc_search_recovers_signed_correlations_and_preserves_y_b() {
+        let ctx = EncodingContext::default();
+        for k in [-128, -42, -9, 5, 42, 127] {
+            let dc = x_dc_fixture(k, 0.0, 48, 48);
+            let y = dc.quant_dc.plane(1).as_slice().to_vec();
+            let b = dc.quant_dc.plane(2).as_slice().to_vec();
+            let mut groups = [dc];
+            assert_eq!(
+                choose_ytox_dc(
+                    &mut groups,
+                    1.0,
+                    [1.0; 3],
+                    CflFrame::XYB,
+                    false,
+                    ctx.quantize_dc_cfl
+                ),
+                k
+            );
+            assert!(
+                groups[0]
+                    .quant_dc
+                    .plane(0)
+                    .as_slice()
+                    .iter()
+                    .all(|&v| v == 0)
+            );
+            assert_eq!(groups[0].quant_dc.plane(1).as_slice(), y);
+            assert_eq!(groups[0].quant_dc.plane(2).as_slice(), b);
+        }
+    }
+
+    #[test]
+    fn x_dc_search_quantizes_the_fractional_source_once() {
+        let ctx = EncodingContext::default();
+        let k = 5;
+        let dc = x_dc_fixture(k, 0.15, 48, 48);
+        let source = dc.source_dc_x.as_ref().unwrap();
+        let factor = dc_cfl_factor_x([1.0; 3], y_to_x_ratio(CflFrame::XYB, k as i8));
+        // Double rounding invents ones; direct source quantization yields zero.
+        assert!(
+            dc.quant_dc
+                .plane(0)
+                .as_slice()
+                .iter()
+                .zip(dc.quant_dc.plane(1).as_slice())
+                .any(|(&x, &y)| i32::from(x) - (factor * f32::from(y)).round() as i32 != 0)
+        );
+        assert!(source.as_slice().iter().all(|v| v.is_finite()));
+        let mut groups = [dc];
+        assert_eq!(
+            choose_ytox_dc(
+                &mut groups,
+                1.0,
+                [1.0; 3],
+                CflFrame::XYB,
+                false,
+                ctx.quantize_dc_cfl
+            ),
+            k
+        );
+        assert!(
+            groups[0]
+                .quant_dc
+                .plane(0)
+                .as_slice()
+                .iter()
+                .all(|&v| v == 0)
+        );
+    }
+
+    #[test]
+    fn x_dc_search_obeys_source_error_and_incremental_header() {
+        let ctx = EncodingContext::default();
+        // It would be cheap to store a zero residual, but a 0.49 phase has
+        // much worse error than the baseline's nearest source rounding.
+        let mut groups = [x_dc_fixture(5, 0.49, 48, 48)];
+        let mut previous = vec![0; 48];
+        let mut current = vec![0; 48];
+        let base = ytox_dc_cost(
+            &groups,
+            0,
+            INV_DC_QUANT[0],
+            [1.0; 3],
+            CflFrame::XYB,
+            ctx.quantize_dc_cfl,
+            &mut previous,
+            &mut current,
+        );
+        let cheap = ytox_dc_cost(
+            &groups,
+            5,
+            INV_DC_QUANT[0],
+            [1.0; 3],
+            CflFrame::XYB,
+            ctx.quantize_dc_cfl,
+            &mut previous,
+            &mut current,
+        );
+        assert!(cheap.bits < base.bits);
+        assert!(cheap.distortion > base.distortion);
+        let chosen = choose_ytox_dc(
+            &mut groups,
+            1.0,
+            [1.0; 3],
+            CflFrame::XYB,
+            false,
+            ctx.quantize_dc_cfl,
+        );
+        assert_ne!(chosen, 5);
+        let actual = ytox_dc_cost(
+            &groups,
+            chosen,
+            INV_DC_QUANT[0],
+            [1.0; 3],
+            CflFrame::XYB,
+            ctx.quantize_dc_cfl,
+            &mut previous,
+            &mut current,
+        );
+        assert!(actual.distortion <= base.distortion);
+        let mut tiny = [x_dc_fixture(42, 0.0, 1, 1)];
+        assert_eq!(
+            choose_ytox_dc(
+                &mut tiny,
+                1.0,
+                [1.0; 3],
+                CflFrame::XYB,
+                false,
+                ctx.quantize_dc_cfl
+            ),
+            0
+        );
+        assert_eq!(
+            choose_ytox_dc(
+                &mut tiny,
+                1.0,
+                [1.0; 3],
+                CflFrame::XYB,
+                true,
+                ctx.quantize_dc_cfl
+            ),
+            42
+        );
+        let mut missing = [DcGroupData::new(48, 48).unwrap()];
+        assert_eq!(
+            choose_ytox_dc(
+                &mut missing,
+                1.0,
+                [1.0; 3],
+                CflFrame::XYB,
+                false,
+                ctx.quantize_dc_cfl
+            ),
+            0
+        );
+    }
 
     #[test]
     fn constant_image_returns_zero() {

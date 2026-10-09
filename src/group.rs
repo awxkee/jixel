@@ -220,7 +220,7 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
 
 #[inline]
 fn rdoq_lambda(qf_ratio: f32) -> f32 {
-    const BASE: f32 = 1.25;
+    const BASE: f32 = 1.5;
     crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
 }
 
@@ -277,6 +277,47 @@ fn rdoq_window_len(covered_blocks: usize, large_window: bool, distance: f32) -> 
     }
 }
 
+/// A block whose source has at most this many distinct colours per 8x8 is
+/// graphic: flat fills with hard edges, where a coefficient the deadzone
+/// zeroed reads as a stray blip once restored.
+const RESTORE_FEW_COLORS_PER_BLOCK: usize = 24;
+/// Rate multiplier a restore must beat in such a block.
+const RESTORE_FEW_COLORS_PENALTY: f32 = 2.0;
+
+/// Whether the source pixels of `[x0, x1) x [y0, y1)` hold at most `limit`
+/// distinct XYB colors (quantized to 1/1024).
+fn few_colors(
+    opsin: &Image3F,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    limit: usize,
+    seen: &mut Vec<u64>,
+) -> bool {
+    seen.clear();
+    seen.reserve(limit);
+    for y in y0..y1 {
+        let rows = [
+            opsin.plane_row(0, y),
+            opsin.plane_row(1, y),
+            opsin.plane_row(2, y),
+        ];
+        for x in x0..x1 {
+            let key = rows.iter().fold(0u64, |k, r| {
+                (k << 21) | (((r[x] * 1024.0) + 0.5) as i64 as u64 & 0x1f_ffff)
+            });
+            if !seen.contains(&key) {
+                if seen.len() == limit {
+                    return false;
+                }
+                seen.push(key);
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
     channel_weight: f32,
@@ -297,6 +338,7 @@ fn rdoq_block(
     qf_hi: bool,
     qf_ratio: f32,
     visible: f32,
+    restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
@@ -323,6 +365,7 @@ fn rdoq_block(
         qf_hi,
         qf_ratio,
         visible,
+        restore_penalty,
         choices,
         costs,
     );
@@ -349,6 +392,7 @@ fn rdoq_block_banded(
     qf_hi: bool,
     qf_ratio: f32,
     visible: f32,
+    restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
@@ -482,7 +526,14 @@ fn rdoq_block_banded(
                     [0.0; 2]
                 } else {
                     let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
-                    [lambda * bits[0], lambda * bits[1]]
+                    // Restoring a deadzone-zeroed coefficient pays the block's
+                    // penalty.
+                    let rate = if block[idx] == 0 && level != 0 {
+                        lambda * restore_penalty
+                    } else {
+                        lambda
+                    };
+                    [rate * bits[0], rate * bits[1]]
                 };
                 let state = (remaining - current_min) * 2;
                 update_rdoq_state_pair(
@@ -1180,6 +1231,8 @@ pub(crate) struct AcGroupScratch {
     rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
     gather: Box<[f32; 4096]>,
+    /// Distinct source colors, reused across RDOQ blocks and groups.
+    few_color_keys: Vec<u64>,
 }
 
 impl Default for AcGroupScratch {
@@ -1192,6 +1245,7 @@ impl Default for AcGroupScratch {
             rdoq_choices: heap_array(u8::MAX),
             rdoq_costs: HeapMatrix::new(f32::INFINITY),
             gather: heap_array(0.0),
+            few_color_keys: Vec::new(),
         }
     }
 }
@@ -1200,6 +1254,7 @@ impl Default for AcGroupScratch {
 pub(crate) struct SourceDc {
     pub(crate) y: crate::image::Plane<f32>,
     pub(crate) b: crate::image::Plane<f32>,
+    pub(crate) x: crate::image::Plane<f32>,
 }
 
 /// Process and tokenize one stripe of an AC group, pushing tokens into `out`.
@@ -1264,6 +1319,7 @@ pub(crate) fn write_ac_group(
         rdoq_choices,
         rdoq_costs,
         gather,
+        few_color_keys,
     } = scratch;
 
     for by in 0..ysize_blocks {
@@ -1302,6 +1358,20 @@ pub(crate) fn write_ac_group(
             // Padding is never shown, so RDOQ charges coefficient error by
             // the footprint's visible area.
             let visible = footprint.visible_fraction();
+            let restore_penalty = if rdoq_prices.is_some() {
+                let x0 = opsin_origin.0 + bx * 8;
+                let y0 = opsin_origin.1 + by * 8;
+                let x1 = (x0 + cov_x * 8).min(opsin.xsize());
+                let y1 = (y0 + cov_y * 8).min(opsin.ysize());
+                let limit = RESTORE_FEW_COLORS_PER_BLOCK * cov_x * cov_y;
+                if few_colors(opsin, x0, y0, x1, y1, limit, few_color_keys) {
+                    RESTORE_FEW_COLORS_PENALTY
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
             for c in 0..3 {
                 let (input, stride) = footprint.pixels(opsin.plane(c), &mut gather[..]);
                 match raw_strategy {
@@ -1560,6 +1630,7 @@ pub(crate) fn write_ac_group(
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
                     visible,
+                    restore_penalty,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1778,6 +1849,7 @@ pub(crate) fn write_ac_group(
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
                     visible,
+                    restore_penalty,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -1791,6 +1863,8 @@ pub(crate) fn write_ac_group(
                     let bx = global_bx - qorigin_x;
                     source.b.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
                         .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
+                    source.x.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                        .copy_from_slice(&x_dc_post[iy * cov_x..(iy + 1) * cov_x]);
                 }
             }
             // ---- B channel: write CfL'd DC, quantize AC ----
@@ -1870,6 +1944,7 @@ pub(crate) fn write_ac_group(
                     quant_ac as u32 > qf_threshold,
                     quant_ac as f32 / qf_threshold.max(1) as f32,
                     visible,
+                    restore_penalty,
                     rdoq_choices,
                     rdoq_costs,
                 );
@@ -2045,6 +2120,33 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn few_colors_counts_distinct_source_colours() {
+        use crate::image::Image3F;
+        let mut xyb = Image3F::new(16, 8);
+        // Left 8x8: two flat halves (2 colours). Right 8x8: a ramp.
+        for c in 0..3 {
+            for y in 0..8 {
+                let row = xyb.plane_row_mut(c, y);
+                for x in 0..8 {
+                    row[x] = if x < 4 { 0.1 } else { 0.5 };
+                    row[8 + x] = (y * 8 + x) as f32 * 0.01;
+                }
+            }
+        }
+        let mut seen = vec![u64::MAX; 100];
+        let storage = seen.as_ptr();
+        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 24, &mut seen));
+        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 2, &mut seen));
+        assert!(!super::few_colors(&xyb, 0, 0, 8, 8, 1, &mut seen));
+        assert!(!super::few_colors(&xyb, 8, 0, 16, 8, 24, &mut seen));
+        assert!(super::few_colors(&xyb, 8, 0, 16, 8, 64, &mut seen));
+        assert!(!super::few_colors(&xyb, 0, 0, 8, 8, 0, &mut seen));
+        assert!(super::few_colors(&xyb, 0, 0, 0, 0, 0, &mut seen));
+        assert!(seen.is_empty());
+        assert_eq!(seen.as_ptr(), storage, "color storage should be reused");
+    }
+
     use super::{
         QuantizeDcMethods, chroma_block_saturation, chroma_deadzone_fixup, quantize_ac_thresholds,
         quantize_ac_thresholds_scaled, quantize_dc_cfl_scalar, quantize_dc_scalar,
@@ -2205,6 +2307,7 @@ mod tests {
                     case % 2 == 0,
                     [0.5, 1.0, 1.2, 2.0][case % 4],
                     1.0,
+                    1.0,
                     choices,
                     costs,
                 );
@@ -2318,6 +2421,7 @@ mod tests {
                     case % 2 == 0,
                     [0.5, 1.0, 1.2, 2.0][case % 4],
                     1.0,
+                    1.0,
                     choices,
                     costs,
                 );
@@ -2340,6 +2444,7 @@ mod tests {
                 [1., 2., 3., 4.][case % 4],
                 case % 2 == 0,
                 [0.5, 1.0, 1.2, 2.0][case % 4],
+                1.0,
                 1.0,
                 &mut fresh_choices,
                 &mut fresh_costs,
@@ -2480,6 +2585,7 @@ mod tests {
                     false,
                     1.,
                     1.,
+                    1.0,
                     &mut choices,
                     &mut costs,
                 );

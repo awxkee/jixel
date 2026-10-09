@@ -877,10 +877,15 @@ struct Effort {
 impl Effort {
     fn new(speed: Speed) -> Self {
         match speed {
-            Speed::Fastest => Self {
+            Speed::UltraFast => Self {
                 try_natural_order: false,
                 select_configs: false,
                 refinement: None,
+            },
+            Speed::Fastest => Self {
+                try_natural_order: false,
+                select_configs: false,
+                refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Fast => Self {
                 try_natural_order: false,
@@ -1017,7 +1022,12 @@ fn encode_jpeg_codestream_with_pool(
         );
         // epf_iters = 0 here, so the sharpness id is decoder-ignored;
         // any distance >= 5 keeps the stream at the historical constant 4.
-        let meta = collect_ac_metadata_tokens(&dc_datas[i], &mut meta_props, 100.0, collect_props);
+        let meta = collect_ac_metadata_tokens(
+            &dc_datas[i],
+            &mut meta_props,
+            crate::frame::epf_sharpness_id(100.0, false),
+            collect_props,
+        );
         (dc, meta, props, meta_props)
     });
 

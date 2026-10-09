@@ -1068,6 +1068,11 @@ where
         select_configs,
         AcClustering::Prefix {
             isolate_single_symbol: false,
+            max_clusters: if speed.effort().wide_clustering {
+                super::cluster::CLUSTERS_LIMIT
+            } else {
+                super::cluster::FAST_CLUSTERS_LIMIT
+            },
         },
         if speed.effort().huc_strict {
             1.0
@@ -1098,6 +1103,7 @@ where
         select_configs,
         AcClustering::Prefix {
             isolate_single_symbol: true,
+            max_clusters: super::cluster::CLUSTERS_LIMIT,
         },
         0.995,
         pool,
@@ -1108,6 +1114,7 @@ pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
     streams: I,
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
+    select_configs: bool,
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
@@ -1117,7 +1124,7 @@ where
         streams,
         num_contexts,
         huffman_pool,
-        false,
+        select_configs,
         AcClustering::Coarse,
         0.995,
         pool,
@@ -2123,6 +2130,7 @@ enum AcClustering {
     Coarse,
     Prefix {
         isolate_single_symbol: bool,
+        max_clusters: usize,
     },
 }
 
@@ -2180,6 +2188,7 @@ fn optimize_entropy_code_ac_slices(
     let mut context_map: Vec<u8> = Vec::new();
     if let AcClustering::Prefix {
         isolate_single_symbol,
+        max_clusters,
     } = clustering
     {
         super::cluster::cluster_histograms_with_pool(
@@ -2187,6 +2196,7 @@ fn optimize_entropy_code_ac_slices(
             &mut context_map,
             huffman_pool,
             isolate_single_symbol,
+            max_clusters,
             pool,
         );
     } else {

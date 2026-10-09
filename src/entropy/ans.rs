@@ -548,29 +548,33 @@ pub(crate) fn write_ans_tokens(
     hybrid_uint_configs: &[super::token::HybridUintConfig],
     w: &mut BitWriter,
 ) {
-    // Only the renormalization word must survive the reverse ANS traversal.
-    // Extra bits can be regenerated from the immutable source tokens.
-    let mut emitted = Vec::with_capacity(tokens.len());
+    // The reverse ANS traversal records, per token, the renormalization word
+    // (or `ANS_NO_EMIT`) in the high half and the extra bits in the low half,
+    // with the extra-bit count alongside, so the forward pass only writes.
+    let mut emitted: Vec<u64> = Vec::with_capacity(tokens.len());
+    let mut extra_bits: Vec<u8> = Vec::with_capacity(tokens.len());
     let mut coder = AnsCoder::new();
     for t in tokens.iter().rev() {
         let hist = context_map[t.context as usize] as usize;
-        let (sym, _, _) = super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
+        let (sym, nbits, bits) =
+            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
         let start = hist * ANS_TAB_SIZE as usize;
         let word = coder.put_symbol(
             &symbol_info[hist][sym as usize],
             &reverse_maps[start..start + ANS_TAB_SIZE as usize],
         );
-        emitted.push(word.map_or(ANS_NO_EMIT, u32::from));
+        emitted.push((u64::from(word.map_or(ANS_NO_EMIT, u32::from)) << 32) | u64::from(bits));
+        extra_bits.push(nbits as u8);
     }
     w.write(32, coder.state() as u64);
-    for (t, word) in tokens.iter().zip(emitted.into_iter().rev()) {
+    for (&packed, &nbits) in emitted.iter().rev().zip(extra_bits.iter().rev()) {
+        let word = (packed >> 32) as u32;
         if word != ANS_NO_EMIT {
-            w.write(16, word as u64);
+            w.write(16, u64::from(word));
         }
-        let hist = context_map[t.context as usize] as usize;
-        let (_, nbits, bits) =
-            super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
-        w.write(nbits as usize, bits as u64);
+        if nbits != 0 {
+            w.write(nbits as usize, packed & 0xffff_ffff);
+        }
     }
 }
 

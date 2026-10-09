@@ -113,6 +113,10 @@ const META_R: f32 = 4.0;
 
 pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 
+/// Bit-equivalent DCT8 cost of a 16x16 quad above which tiers without
+/// `merge_busy_quads` evaluate no merge.
+const MERGE_PRESCREEN_BITS: f32 = 600.0;
+
 const RERANK_META_R: f32 = 2.6465739748323758;
 const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.891_814_53);
 
@@ -278,6 +282,8 @@ impl MergeTuning {
 pub(crate) struct SearchScope {
     rectangles: bool,
     full_rerank: bool,
+    merge_32: bool,
+    busy_quads: bool,
 }
 
 impl SearchScope {
@@ -285,27 +291,45 @@ impl SearchScope {
     pub(crate) const SQUARES: Self = Self {
         rectangles: false,
         full_rerank: false,
+        merge_32: true,
+        busy_quads: true,
     };
     #[cfg(test)]
     pub(crate) const FULL: Self = Self {
         rectangles: true,
         full_rerank: true,
+        merge_32: true,
+        busy_quads: true,
     };
 
     #[inline]
     fn for_speed(speed: crate::Speed) -> Self {
-        // Fastest never reaches the chooser (`fill_ac_strategy` returns
-        // before scoping).
+        // Tiers without `square_merges` never reach the chooser
+        // (`fill_ac_strategy` returns before scoping).
         let effort = speed.effort();
         Self {
             rectangles: effort.rectangles,
             full_rerank: effort.full_rerank,
+            merge_32: effort.merge_32,
+            busy_quads: effort.merge_busy_quads,
         }
     }
 
     #[inline]
     fn rectangles(self) -> bool {
         self.rectangles
+    }
+
+    /// Whether 32x32 merges are searched.
+    #[inline]
+    fn merge_32(self) -> bool {
+        self.merge_32
+    }
+
+    /// Whether merges are evaluated on quads above `MERGE_PRESCREEN_BITS`.
+    #[inline]
+    fn merge_busy_quads(self) -> bool {
+        self.busy_quads
     }
 
     /// Whether the SSIM reconstruction rerank runs.
@@ -380,6 +404,8 @@ struct SuperBlockCost {
     chosen: f32,
     /// Cost of the pure four-DCT8 incumbent before any merge decisions.
     dct8: f32,
+    /// The DCT8 incumbent was too costly for any merge to be evaluated.
+    prescreened: bool,
 }
 
 /// Gather a transform footprint with edge replication: columns past the image

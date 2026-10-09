@@ -31,9 +31,11 @@ mod adaptive_quant;
 mod afv;
 mod cfl;
 mod color;
+mod dc_ops;
 mod dct;
 mod entropy;
 mod frame;
+mod haar;
 mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
@@ -57,6 +59,7 @@ pub(crate) use cfl::{
     cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
+pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};
 pub(crate) use dct::{
     dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon, dc_from_dct32x64_neon,
     dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct2x2_8x8_neon, dct4x4_neon, dct4x8_neon,
@@ -68,6 +71,7 @@ pub(crate) use dct::{
 };
 pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
+pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
     recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
