@@ -231,7 +231,10 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
     // decoding tier rules them out. They add ~20% encode time, so the
     // fast encode tiers keep the fixed tree.
     ctx.extra_learned_trees = config.decoding_speed != crate::DecodingSpeed::Fastest
-        && !matches!(config.speed, crate::Speed::Fastest | crate::Speed::Fast);
+        && !matches!(
+            config.speed,
+            crate::Speed::UltraFast | crate::Speed::Fastest | crate::Speed::Fast
+        );
     if passes.len() > 1 && crate::squeeze::default_squeeze_steps(width, height, 1).is_empty() {
         // Tiny planes have no Squeeze levels; retain the progressive lattice
         // fallback rather than changing their K precision.

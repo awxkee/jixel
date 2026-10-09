@@ -60,6 +60,7 @@ mod frame;
 mod gaborish;
 mod gain_map;
 mod group;
+mod haar;
 mod icc_codec;
 mod image;
 mod inflated_cost;

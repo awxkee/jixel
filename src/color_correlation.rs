@@ -26,7 +26,6 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::Speed;
 use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
@@ -793,7 +792,8 @@ pub(crate) fn fill_cmap(
     // on the very frames for which we retain extra X/B precision.
     // YCbCr chroma follows luma with large, content-dependent slopes, which
     // the regression's deadzone misses; it searches them at Fast too.
-    let ycbcr = ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed != Speed::Fastest;
+    let ycbcr =
+        ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed.effort().cfl_ycbcr_rdo;
     let use_rdo =
         (distance < CFL_RDO.max_d || ctx.x_heavy()) && (ctx.speed.effort().cfl_rdo || ycbcr);
 
@@ -1244,7 +1244,7 @@ const DC_STEP_MIN_GAIN: f64 = 0.02;
 
 /// A DC step multiplier as the decoder reads it back from its 16-bit wire
 /// form.
-fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
+pub(crate) fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
     let wire = DC_QUANT[channel] * 128.0 * multiplier;
     crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(wire)) / (DC_QUANT[channel] * 128.0)
 }

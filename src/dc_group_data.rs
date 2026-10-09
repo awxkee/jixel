@@ -252,6 +252,8 @@ pub(crate) struct DcGroupData {
     /// Unrounded Y DC from the first coefficient pass, retained until the
     /// frame's DC steps are chosen.
     pub(crate) source_dc_y: Option<crate::image::Plane<f32>>,
+    /// Unrounded X DC, kept with `source_dc_b` for the chroma DC coding choice.
+    pub(crate) source_dc_x: Option<crate::image::Plane<f32>>,
     pub(crate) raw_quant_field: ImageB,
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
@@ -272,6 +274,7 @@ impl DcGroupData {
             quant_dc: Image3S::try_new(xsize_blocks, ysize_blocks)?,
             source_dc_b: None,
             source_dc_y: None,
+            source_dc_x: None,
             raw_quant_field: ImageB::try_new_fill(xsize_blocks, ysize_blocks, 1)?,
             ac_strategy: AcStrategyImage::try_new(xsize_blocks, ysize_blocks)?,
             ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,

@@ -33,6 +33,7 @@ mod cfl;
 mod dct;
 mod entropy;
 mod frame;
+mod haar;
 mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
@@ -56,6 +57,7 @@ pub(crate) use cfl::{
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;
+pub(crate) use haar::haar_rows_wasm;
 pub(crate) use inflated_cost::{
     combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
     rgb_hue_chroma_edge_loss_wasm,

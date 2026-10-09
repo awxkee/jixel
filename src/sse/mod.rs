@@ -32,6 +32,7 @@ mod afv;
 mod color;
 mod dct;
 mod entropy;
+mod haar;
 mod inflated_cost;
 mod lossless_grad;
 #[cfg(target_arch = "x86_64")]
@@ -51,6 +52,7 @@ pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
 pub(crate) use color::color_matrix_shaper_sse41;
 pub(crate) use entropy::counts_bit_cost_sse41;
+pub(crate) use haar::haar_rows_sse41;
 pub(crate) use inflated_cost::{
     combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
     rgb_hue_chroma_edge_loss_sse41,

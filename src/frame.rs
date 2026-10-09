@@ -27,10 +27,8 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::Speed;
-
 mod dc_smoothing;
-use dc_smoothing::{flatten_chroma_dc, skip_dc_smoothing};
+use dc_smoothing::{choose_chroma_dc_coding, flatten_chroma_dc, skip_dc_smoothing};
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
@@ -116,9 +114,6 @@ struct DistanceParams {
 
 const X_QM_REFINE_MAX_DISTANCE: f32 = 0.299;
 const DC_REFINE_PEAK: f32 = 1.35;
-const DC_COARSEN_D0: f32 = 1.25;
-const DC_COARSEN_D1: f32 = 3.0;
-const DC_COARSEN_MUL: f32 = 0.65;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
 
@@ -144,19 +139,13 @@ fn dcepf_vlq_t(distance: f32) -> f32 {
     ((distance - DCEPF_VLQ_D0) / (DCEPF_VLQ_D1 - DCEPF_VLQ_D0)).clamp(0.0, 1.0)
 }
 
-#[inline]
-fn dc_coarsen(distance: f32) -> f32 {
-    let t = ((distance - DC_COARSEN_D0) / (DC_COARSEN_D1 - DC_COARSEN_D0)).clamp(0.0, 1.0);
-    fmla(DC_COARSEN_MUL - 1.0, t, 1.0)
-}
-
 fn quant_dc(distance: f32) -> f32 {
     // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
     // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
     // coarsening buys almost no rate while banding dominates the perceptual
     // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
     // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
-    let refine = dc_refinement(distance) * dc_coarsen(distance);
+    let refine = dc_refinement(distance);
     let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
     let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
@@ -219,9 +208,14 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         epf_iters,
         epf_pass0_scale,
         gab_enabled,
-        dc_step: [1.0; 3],
+        dc_step: [X_DC_STEP, 1.0, 1.0],
     }
 }
+
+/// Multiplier of the default X DC step. The spec's X DC quantizer is far
+/// finer than the X AC band it sits under; twice the step buys back 1-2% of
+/// the file at better SSIMULACRA2, butteraugli and cvvdp alike.
+const X_DC_STEP: f32 = 2.0;
 
 const EPF_PASS0_START_D: f32 = 2.5;
 const EPF_PASS0_SCALE: f32 = 3.6;
@@ -380,137 +374,219 @@ fn collect_dc_tokens_with_gradient(
         .sum();
     let mut tokens = Vec::with_capacity(token_count);
     let mut gradient_tokens = Vec::with_capacity(if collect_gradient { token_count } else { 0 });
-
-    // Weighted-predictor DC, mirroring libjxl's kWPFixedDC path (enc_modular.cc
-    // AddVarDCTDC at speed tiers falcon..squirrel): the guess is the
-    // self-correcting WP and the context is the WP-error property (modular
-    // property 15) bucketed by the same +-500 cutoffs the gradient tree used,
-    // so K_GRADIENT_CONTEXT_LUT applies unchanged (write_context_tree emits the
-    // matching tree: identical structure, property 15, Weighted leaves). The WP
-    // state machine and border conventions are the bit-faithful lossless-path
-    // ones, so encoder residuals match the reference decoder exactly.
     for (mchan, c) in [1usize, 0, 2].into_iter().enumerate() {
         let plane = dc_data.quant_dc.plane(c);
-        let ysize = plane.ysize();
-        let xsize = plane.xsize();
-        if xsize == 0 || ysize == 0 {
-            continue;
+        walk_dc_channel(
+            plane.as_slice(),
+            plane.xsize(),
+            plane.ysize(),
+            plane.xsize(),
+            mchan,
+            dc_gradient,
+            props,
+            collect_props,
+            collect_gradient,
+            &mut tokens,
+            &mut gradient_tokens,
+        );
+    }
+    (tokens, gradient_tokens)
+}
+
+/// Tokenize one DC channel: a `xsize`×`ysize` window of rows `stride` apart.
+///
+/// Weighted-predictor DC, mirroring libjxl's kWPFixedDC path (enc_modular.cc
+/// AddVarDCTDC at speed tiers falcon..squirrel): the guess is the
+/// self-correcting WP and the context is the WP-error property (modular
+/// property 15) bucketed by the same +-500 cutoffs the gradient tree used,
+/// so K_GRADIENT_CONTEXT_LUT applies unchanged (write_context_tree emits the
+/// matching tree: identical structure, property 15, Weighted leaves). The WP
+/// state machine and border conventions are the bit-faithful lossless-path
+/// ones, so encoder residuals match the reference decoder exactly.
+///
+/// NOTE: this walk is shared by the DC coder and by [`price_dc_plane`], which
+/// prices the candidate planes of `choose_chroma_dc_coding`. Keep it the
+/// single source of the DC tokenization: a change here reaches both, but a
+/// change to how DC tokens are entropy-coded elsewhere (contexts, learned
+/// trees, token packing) must be mirrored in `price_dc_plane`, or the
+/// squeeze decision prices a coder that no longer exists.
+#[allow(clippy::too_many_arguments)]
+fn walk_dc_channel<T: Copy + Into<i64>>(
+    data: &[T],
+    xsize: usize,
+    ysize: usize,
+    stride: usize,
+    mchan: usize,
+    dc_gradient: &DcPredictorChoice,
+    props: &mut Vec<crate::dc_tree::DcProp>,
+    collect_props: bool,
+    collect_gradient: bool,
+    tokens: &mut Vec<Token>,
+    gradient_tokens: &mut Vec<Token>,
+) {
+    if xsize == 0 || ysize == 0 {
+        return;
+    }
+    let row = |y: usize| &data[y * stride..y * stride + xsize];
+    let mut wp = crate::weighted_predictor::WpState::new(xsize);
+
+    // On the top row every unavailable north-side neighbor collapses to
+    // the value on the left.
+    let first_row = row(0);
+    let mut left = 0i64;
+    for (x, &value) in first_row.iter().enumerate() {
+        let value: i64 = value.into();
+        push_dc_wp_token(
+            tokens,
+            gradient_tokens,
+            collect_gradient,
+            &mut wp,
+            x,
+            0,
+            value,
+            left,
+            left,
+            left,
+            left,
+            left,
+            dc_gradient,
+            mchan,
+            props,
+            collect_props,
+        );
+        left = value;
+    }
+
+    let mut row_above = first_row;
+    let mut row_above2 = first_row;
+    for y in 1..ysize {
+        let current_row = row(y);
+
+        // First column: W and NW replicate N.
+        let n: i64 = row_above[0].into();
+        let ne: i64 = row_above.get(1).copied().unwrap_or(row_above[0]).into();
+        push_dc_wp_token(
+            tokens,
+            gradient_tokens,
+            collect_gradient,
+            &mut wp,
+            0,
+            y,
+            current_row[0].into(),
+            n,
+            n,
+            ne,
+            n,
+            row_above2[0].into(),
+            dc_gradient,
+            mchan,
+            props,
+            collect_props,
+        );
+
+        // Interior columns have every neighbor available.
+        let current_pairs = current_row.array_windows::<2>();
+        let north_triplets = row_above.array_windows::<3>();
+        for (offset, ((current, north), &nn)) in current_pairs
+            .zip(north_triplets)
+            .zip(row_above2.iter().skip(1))
+            .enumerate()
+        {
+            push_dc_wp_token(
+                tokens,
+                gradient_tokens,
+                collect_gradient,
+                &mut wp,
+                offset + 1,
+                y,
+                current[1].into(),
+                north[1].into(),
+                current[0].into(),
+                north[2].into(),
+                north[0].into(),
+                nn.into(),
+                dc_gradient,
+                mchan,
+                props,
+                collect_props,
+            );
         }
 
-        let mut wp = crate::weighted_predictor::WpState::new(xsize);
-        let mut rows = plane.as_slice().chunks_exact(xsize);
-
-        // On the top row every unavailable north-side neighbor collapses to
-        // the value on the left.
-        let first_row = rows.next().unwrap();
-        let mut left = 0i64;
-        for (x, &value) in first_row.iter().enumerate() {
-            let value = value as i64;
+        // Last column: NE replicates N. Width one was handled above.
+        if xsize > 1 {
+            let x = xsize - 1;
+            let n: i64 = row_above[x].into();
             push_dc_wp_token(
-                &mut tokens,
-                &mut gradient_tokens,
+                tokens,
+                gradient_tokens,
                 collect_gradient,
                 &mut wp,
                 x,
-                0,
-                value,
-                left,
-                left,
-                left,
-                left,
-                left,
-                dc_gradient,
-                mchan,
-                props,
-                collect_props,
-            );
-            left = value;
-        }
-
-        let mut row_above = first_row;
-        let mut row_above2 = first_row;
-        for (y, row) in rows.enumerate() {
-            let y = y + 1;
-
-            // First column: W and NW replicate N.
-            let n = row_above[0] as i64;
-            let ne = row_above.get(1).copied().unwrap_or(row_above[0]) as i64;
-            push_dc_wp_token(
-                &mut tokens,
-                &mut gradient_tokens,
-                collect_gradient,
-                &mut wp,
-                0,
                 y,
-                row[0] as i64,
+                current_row[x].into(),
                 n,
+                current_row[x - 1].into(),
                 n,
-                ne,
-                n,
-                row_above2[0] as i64,
+                row_above[x - 1].into(),
+                row_above2[x].into(),
                 dc_gradient,
                 mchan,
                 props,
                 collect_props,
             );
-
-            // Interior columns have every neighbor available.
-            let current_pairs = row.array_windows::<2>();
-            let north_triplets = row_above.array_windows::<3>();
-            for (offset, ((current, north), &nn)) in current_pairs
-                .zip(north_triplets)
-                .zip(row_above2.iter().skip(1))
-                .enumerate()
-            {
-                push_dc_wp_token(
-                    &mut tokens,
-                    &mut gradient_tokens,
-                    collect_gradient,
-                    &mut wp,
-                    offset + 1,
-                    y,
-                    current[1] as i64,
-                    north[1] as i64,
-                    current[0] as i64,
-                    north[2] as i64,
-                    north[0] as i64,
-                    nn as i64,
-                    dc_gradient,
-                    mchan,
-                    props,
-                    collect_props,
-                );
-            }
-
-            // Last column: NE replicates N. Width one was handled above.
-            if xsize > 1 {
-                let x = xsize - 1;
-                let n = row_above[x] as i64;
-                push_dc_wp_token(
-                    &mut tokens,
-                    &mut gradient_tokens,
-                    collect_gradient,
-                    &mut wp,
-                    x,
-                    y,
-                    row[x] as i64,
-                    n,
-                    row[x - 1] as i64,
-                    n,
-                    row_above[x - 1] as i64,
-                    row_above2[x] as i64,
-                    dc_gradient,
-                    mchan,
-                    props,
-                    collect_props,
-                );
-            }
-
-            row_above2 = row_above;
-            row_above = row;
         }
+
+        row_above2 = row_above;
+        row_above = current_row;
     }
-    (tokens, gradient_tokens)
+}
+
+/// Bits to code `levels` — a `width`×`height` window of a DC plane whose rows
+/// are `stride` apart — the way the DC coder codes it: the weighted
+/// predictor's residuals in their WP-error contexts, priced as per-context
+/// order-0 entropy of the hybrid-uint symbols plus their raw bits. This is
+/// the price `choose_chroma_dc_coding` compares its candidate planes with.
+///
+/// NOTE: keep in step with the DC coder (see [`walk_dc_channel`]).
+pub(crate) fn price_dc_plane(levels: &[i32], width: usize, height: usize, stride: usize) -> f64 {
+    const MAX_SYMBOLS: usize = 128;
+    let mut tokens = Vec::with_capacity(width * height);
+    let mut none = Vec::new();
+    let mut props = Vec::new();
+    walk_dc_channel(
+        levels,
+        width,
+        height,
+        stride,
+        0,
+        &DC_PREDICTOR_WEIGHTED,
+        &mut props,
+        false,
+        false,
+        &mut tokens,
+        &mut none,
+    );
+    let mut counts = vec![[0u32; MAX_SYMBOLS]; K_NUM_DC_CONTEXTS];
+    let mut raw_bits = 0u64;
+    for token in &tokens {
+        let (sym, nbits, _) = crate::entropy::uint_encode(token.value);
+        counts[token.context as usize][(sym as usize).min(MAX_SYMBOLS - 1)] += 1;
+        raw_bits += u64::from(nbits);
+    }
+    let mut bits = raw_bits as f64;
+    for ctx in &counts {
+        let total: u32 = ctx.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        let total = f64::from(total);
+        bits += ctx
+            .iter()
+            .filter(|&&n| n != 0)
+            .map(|&n| f64::from(n) * f_log2(total / f64::from(n)))
+            .sum::<f64>();
+    }
+    bits
 }
 
 /// AC metadata: ytox/ytob CfL maps (all 0), AC strategy (all 0 = DCT-8x8),
@@ -1721,7 +1797,7 @@ fn encode_frame_vardct(
         _ if is_achromatic => (0, 0),
         _ if slow_chromatic => pixel_chromacity_steps(&xyb),
         // Without the chroma policy the B steps only cost rate.
-        _ if ctx.speed != crate::Speed::Fastest && distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
+        _ if ctx.speed.effort().pixel_chromacity_x && distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
             (pixel_chromacity_steps(&xyb).0, 0)
         }
         _ => (0, 0),
@@ -3121,6 +3197,7 @@ fn encode_frame_core(
             for (target, source) in [
                 (&mut dc.source_dc_y, &source.y),
                 (&mut dc.source_dc_b, &source.b),
+                (&mut dc.source_dc_x, &source.x),
             ] {
                 let target = target.get_or_insert_with(|| crate::image::Plane::new(w, h));
                 for y in 0..source.ysize() {
@@ -3178,9 +3255,12 @@ fn encode_frame_core(
             distp.dc_step,
             ctx.cfl_frame(),
         );
-        for dc in &mut dc_datas {
-            dc.source_dc_b = None;
-            dc.source_dc_y = None;
+        if !ctx.speed.effort().chroma_dc_squeeze {
+            for dc in &mut dc_datas {
+                dc.source_dc_b = None;
+                dc.source_dc_y = None;
+                dc.source_dc_x = None;
+            }
         }
         // The first pass's tokens follow the natural scans. Once the custom
         // orders move most of the walk, they no longer describe what the
@@ -3278,6 +3358,9 @@ fn encode_frame_core(
             ctx.cfl_frame(),
         )?;
     }
+    if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze {
+        choose_chroma_dc_coding(&dim, &mut dc_datas, &mut distp, ytob_dc, ctx.cfl_frame())?;
+    }
     let skip_dc_smoothing = skip_dc_smoothing(
         &ctx.thread_pool,
         scratch,
@@ -3292,30 +3375,32 @@ fn encode_frame_core(
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
     // Per-leaf DC predictor selection.
+    let effort = ctx.speed.effort();
+    // The learned tree splits on weighted-predictor errors.
+    let dc_predictor_search = effort.dc_predictor_search || effort.dc_learned_tree;
     let token_groups = ctx
         .thread_pool
         .steal_map(scratch, dc_datas.len(), |i, _scratch| {
             let mut props = Vec::new();
-            let predictor = if ctx.speed == Speed::Fastest {
-                &DC_PREDICTOR_GRADIENT
-            } else {
+            let predictor = if dc_predictor_search {
                 &DC_PREDICTOR_WEIGHTED
+            } else {
+                &DC_PREDICTOR_GRADIENT
             };
-            let collect_props = ctx.speed != Speed::Fastest;
             // Both residual candidates use the same WP state and context.
             let (wp, grad) = collect_dc_tokens_with_gradient(
                 &dc_datas[i],
                 predictor,
                 &mut props,
-                collect_props,
-                collect_props,
+                effort.dc_learned_tree,
+                dc_predictor_search,
             );
             let mut meta_props = Vec::new();
             let meta = collect_ac_metadata_tokens(
                 &dc_datas[i],
                 &mut meta_props,
                 epf_sharpness_id(distance, ctx.screen_content()),
-                collect_props,
+                effort.dc_learned_tree,
             );
             (wp, props, grad, meta, meta_props)
         });
@@ -3332,7 +3417,7 @@ fn encode_frame_core(
         meta_props_per_group.push(meta_props);
     }
 
-    let dc_gradient = if ctx.speed == Speed::Fastest {
+    let dc_gradient = if !dc_predictor_search {
         DC_PREDICTOR_GRADIENT
     } else {
         choose_dc_predictors(
@@ -3342,7 +3427,7 @@ fn encode_frame_core(
         )
     };
     // Arm A: the static tree with per-leaf predictor flips.
-    let dc_tokens_static: Vec<Vec<Token>> = if ctx.speed == Speed::Fastest {
+    let dc_tokens_static: Vec<Vec<Token>> = if !dc_predictor_search {
         std::mem::take(&mut wp_tokens_per_group)
     } else {
         wp_tokens_per_group
@@ -3369,7 +3454,7 @@ fn encode_frame_core(
             .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
         K_NUM_DC_CONTEXTS,
         &mut scratch.huffman_pool,
-        ctx.speed != Speed::Fastest,
+        effort.huc_select,
         ctx.speed,
         Some(&ctx.thread_pool),
     );
@@ -3378,7 +3463,7 @@ fn encode_frame_core(
     // `dc_code_refined`: the Slow arm battle already priced both finalists on
     // ANS-refined codes, so the winner needs no second refinement.
     let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree, dc_code_refined) =
-        if ctx.speed == Speed::Fastest {
+        if !effort.dc_learned_tree {
             (
                 dc_tokens_static,
                 meta_tokens_per_group,
@@ -3439,7 +3524,7 @@ fn encode_frame_core(
                     .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
                 learned.num_contexts,
                 &mut scratch.huffman_pool,
-                ctx.speed != Speed::Fastest,
+                effort.huc_select,
                 ctx.speed,
                 Some(&ctx.thread_pool),
             );
@@ -3581,14 +3666,14 @@ fn encode_frame_core(
                 None => (best.0, best.1, best.2, best.3, false),
             }
         };
-    let ans_refinement = match ctx.speed {
-        Speed::Fastest => None,
-        _ if ctx.speed.effort().ans_refine => {
-            Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
-        }
-        _ => Some(crate::entropy::AnsRefinement::Fast {
-            recluster: distance >= 3.0 || ctx.speed.effort().ans_recluster,
-        }),
+    let ans_refinement = if effort.ans_refine {
+        Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
+    } else if effort.ans_fast_refine {
+        Some(crate::entropy::AnsRefinement::Fast {
+            recluster: (distance >= 3.0 && effort.ans_recluster_coarse) || effort.ans_recluster,
+        })
+    } else {
+        None
     };
     if let Some(refinement) = ans_refinement.filter(|_| !dc_code_refined) {
         crate::entropy::refine_ans_clusters(
@@ -3619,10 +3704,10 @@ fn encode_frame_core(
     // The greedy proposes; the arm gate below disposes, comparing real
     // entropy-code headers plus payload estimates because the Shannon proxy
     // reliably overestimates what clustering-aware coding realizes.
-    let baseline = if ctx.speed == Speed::Fastest {
-        crate::ac_context::AcCtxPlan::dct8_only()
-    } else {
+    let baseline = if effort.square_merges {
         crate::ac_context::AcCtxPlan::baseline()
+    } else {
+        crate::ac_context::AcCtxPlan::dct8_only()
     };
 
     let build_codes = |pending: &[PendingAcGroup],
@@ -3631,20 +3716,21 @@ fn encode_frame_core(
      -> Vec<crate::entropy::OwnedEntropyCode> {
         (0..num_passes)
             .map(|pass| {
-                if ctx.speed == Speed::Fastest {
-                    crate::entropy::optimize_entropy_code_ac_streams_fast(
-                        pending.iter().map(|p| p.tokens[pass].as_slice()),
-                        num_contexts,
-                        &mut scratch.huffman_pool,
-                        Some(&ctx.thread_pool),
-                    )
-                } else {
+                if effort.ac_prefix_clustering {
                     crate::entropy::optimize_entropy_code_ac_streams(
                         pending.iter().map(|p| p.tokens[pass].as_slice()),
                         num_contexts,
                         &mut scratch.huffman_pool,
-                        true,
+                        effort.huc_select,
                         ctx.speed,
+                        Some(&ctx.thread_pool),
+                    )
+                } else {
+                    crate::entropy::optimize_entropy_code_ac_streams_fast(
+                        pending.iter().map(|p| p.tokens[pass].as_slice()),
+                        num_contexts,
+                        &mut scratch.huffman_pool,
+                        effort.huc_select,
                         Some(&ctx.thread_pool),
                     )
                 }
@@ -4353,6 +4439,7 @@ fn process_ac_group(
     let mut source_dc = collect_order_stats.then(|| crate::group::SourceDc {
         y: crate::image::Plane::new(gwb, ghb),
         b: crate::image::Plane::new(gwb, ghb),
+        x: crate::image::Plane::new(gwb, ghb),
     });
     let mut num_nzeros: Vec<Image3B> = (0..num_passes)
         .map(|_| Image3B::new(K_GROUP_DIM_IN_BLOCKS, K_GROUP_DIM_IN_BLOCKS))
@@ -4520,6 +4607,7 @@ mod tests {
                         let mut source_dc = SourceDc {
                             y: Plane::new(8, 8),
                             b: Plane::new(8, 8),
+                            x: Plane::new(8, 8),
                         };
                         let mut nzeros: Vec<_> =
                             shifts.iter().map(|_| Image3B::new(32, 32)).collect();
@@ -4736,10 +4824,9 @@ mod tests {
     }
 
     use super::{
-        DC_COARSEN_D0, DC_COARSEN_D1, DC_COARSEN_MUL, DC_REFINE_HOLD, DC_REFINE_PEAK,
-        DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE, MIN_TOKENS_PER_DC_LEAF,
-        choose_dc_predictors, compute_distance_params, dc_coarsen, dc_refinement, epf_sharpness_id,
-        quant_dc,
+        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE,
+        MIN_TOKENS_PER_DC_LEAF, choose_dc_predictors, compute_distance_params, dc_refinement,
+        epf_sharpness_id, quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -5016,21 +5103,6 @@ mod tests {
             !sparse[ctx as usize],
             "an underpopulated leaf must not flip"
         );
-    }
-
-    #[test]
-    fn dc_coarsen_is_identity_at_hq_and_ramps_to_the_floor() {
-        assert_eq!(dc_coarsen(0.5), 1.0);
-        assert_eq!(dc_coarsen(DC_COARSEN_D0), 1.0);
-        assert!((dc_coarsen(DC_COARSEN_D1) - DC_COARSEN_MUL).abs() < 1e-6);
-        assert!((dc_coarsen(10.0) - DC_COARSEN_MUL).abs() < 1e-6);
-        let mut prev = dc_coarsen(DC_COARSEN_D0);
-        for i in 1..=40 {
-            let d = DC_COARSEN_D0 + (DC_COARSEN_D1 - DC_COARSEN_D0) * (i as f32 / 40.0);
-            let v = dc_coarsen(d);
-            assert!(v <= prev + 1e-6);
-            prev = v;
-        }
     }
 
     #[test]

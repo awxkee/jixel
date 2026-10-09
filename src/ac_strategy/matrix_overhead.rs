@@ -98,7 +98,7 @@ pub(crate) fn account_matrix_headers(
 ) {
     let header = MatrixHeaderCost::new(ctx.matrices());
     let custom = header.custom_mask();
-    if custom & !1 == 0 || ctx.speed == crate::Speed::Fastest {
+    if custom & !1 == 0 || !ctx.speed.effort().square_merges {
         return;
     }
     let mut used = 0;

@@ -229,6 +229,22 @@ fn select_super_block(
         }
     }
 
+    let dct8_left = c8[0][0] + c8[1][0];
+    let dct8_right = c8[0][1] + c8[1][1];
+    let dct8_top = c8[0][0] + c8[0][1];
+    let dct8_bottom = c8[1][0] + c8[1][1];
+    let total_dct8 = dct8_left + dct8_right;
+    // A busy DCT8 incumbent rarely loses to a merge; the fast tiers skip it.
+    let prescreened =
+        !context.scope.merge_busy_quads() && total_dct8 > MERGE_PRESCREEN_BITS * RD_LAMBDA;
+    if prescreened {
+        return SuperBlockCost {
+            chosen: total_dct8,
+            dct8: total_dct8,
+            prescreened,
+        };
+    }
+
     // Vertical pairs (DCT16X8): one per column. Skipped entirely under
     // `SearchScope::Squares` — four `strategy_cost` calls per super-block.
     let merge = ctx.merge;
@@ -273,12 +289,6 @@ fn select_super_block(
         cmap_factor,
     );
     let c16 = merge.bias_16x16 * c16_raw;
-
-    let dct8_left = c8[0][0] + c8[1][0];
-    let dct8_right = c8[0][1] + c8[1][1];
-    let dct8_top = c8[0][0] + c8[0][1];
-    let dct8_bottom = c8[1][0] + c8[1][1];
-    let total_dct8 = dct8_left + dct8_right;
 
     let use_v_left = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
         && merge_beats_dct8(v_left, dct8_left, merge.accept_pair);
@@ -403,6 +413,7 @@ fn select_super_block(
     SuperBlockCost {
         chosen,
         dct8: total_dct8,
+        prescreened,
     }
 }
 
@@ -825,13 +836,14 @@ fn select_band(
     let mut by = y_begin;
     while by + 1 < ysize && by < y_end {
         // A 4-block-tall band can host DCT32X32 only when 4-aligned and fitting.
-        let four_row = by.is_multiple_of(4) && by + 4 <= ysize;
+        let four_row = scope.merge_32() && by.is_multiple_of(4) && by + 4 <= ysize;
         let mut bx = 0;
         while bx + 1 < xsize {
             let four_col = bx % 4 == 0 && bx + 4 <= xsize;
             if four_row && four_col && ac_strategy.can_place_strategy(bx, by, STRATEGY_DCT32X32) {
                 let mut children = [[0.0f32; 2]; 2];
                 let mut baseline = [[0.0f32; 2]; 2];
+                let mut prescreened = false;
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let sbx = bx + sx * 2;
@@ -851,7 +863,12 @@ fn select_band(
                         );
                         children[sy][sx] = costs.chosen;
                         baseline[sy][sx] = costs.dct8;
+                        prescreened |= costs.prescreened;
                     }
+                }
+                if prescreened {
+                    bx += 4;
+                    continue;
                 }
                 let qac32 = region_qac(quant_field, bx, by, 4, 4, scale, distance);
                 let cmap_factor = cmap_factors(ctx.cfl_frame(), ytox_map, ytob_map, bx, by);
@@ -1549,7 +1566,7 @@ fn select_transforms(
     let ysize = ac_strategy.ysize();
     // Ordinary fine-quality content uses its fitted DCT8-only shortcut.
     // Point content retains its full search along with the flat chroma table.
-    if use_dct8_only_for_content(ctx, distance) || speed == crate::Speed::Fastest {
+    if use_dct8_only_for_content(ctx, distance) || !speed.effort().square_merges {
         return 0.0;
     }
     let scope = SearchScope::for_speed(speed);
@@ -1914,7 +1931,8 @@ fn select_transforms(
     }
 
     adjust_quant_field(ac_strategy, distance, quant_field);
-    if quant_refinement_steps(distance) != 0 {
+    let quant_refine = speed.effort().quant_refine && quant_refinement_steps(distance) != 0;
+    if quant_refine {
         pipeline.prepare_refinement(xsize);
     }
     let current_costs = if reranked {
@@ -1930,7 +1948,7 @@ fn select_transforms(
         num_threads,
     };
     let band_count = pipeline.bands.len();
-    if pass == SelectionPass::Full {
+    if quant_refine && pass == SelectionPass::Full {
         refine_quant_field(
             &refinement,
             scratch,
@@ -3593,6 +3611,7 @@ mod tests {
             crate::Speed::Slow,
             crate::Speed::Fast,
             crate::Speed::Fastest,
+            crate::Speed::UltraFast,
         ] {
             let ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, 0.05, 1);
             assert!(use_dct8_only_for_content(&ctx, 0.05));
@@ -3796,10 +3815,8 @@ mod tests {
     /// at Medium; only Slow also reranks at every distance.
     #[test]
     fn sub8_and_afv_start_at_medium() {
-        assert_eq!(
-            SearchScope::for_speed(crate::Speed::Fastest),
-            SearchScope::SQUARES
-        );
+        let fastest = SearchScope::for_speed(crate::Speed::Fastest);
+        assert!(!fastest.rectangles() && !fastest.merge_32() && !fastest.merge_busy_quads());
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Fast),
             SearchScope::SQUARES

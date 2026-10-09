@@ -34,6 +34,7 @@ mod color;
 mod dct;
 mod entropy;
 mod frame;
+mod haar;
 mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
@@ -68,6 +69,7 @@ pub(crate) use dct::{
 };
 pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
+pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
     recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,

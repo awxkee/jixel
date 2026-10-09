@@ -38,6 +38,8 @@ use crate::util::heap_array;
 use std::sync::OnceLock;
 
 pub(crate) const CLUSTERS_LIMIT: usize = 128;
+/// Cluster budget of the greedy clustering without `wide_clustering`.
+pub(crate) const FAST_CLUSTERS_LIMIT: usize = 16;
 
 /// A cluster must save at least this many bits, summed over every context that
 /// reassigns to it, to be worth the histogram it costs to describe. Matches
@@ -343,7 +345,15 @@ pub(crate) fn cluster_histograms(
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
 ) {
-    cluster_histograms_inner(histograms, context_map, false, false, huffman_pool, None);
+    cluster_histograms_inner(
+        histograms,
+        context_map,
+        false,
+        false,
+        CLUSTERS_LIMIT,
+        huffman_pool,
+        None,
+    );
 }
 
 /// `isolate_single_symbol` gives every single-symbol histogram its own cluster
@@ -353,6 +363,7 @@ pub(crate) fn cluster_histograms_with_pool(
     context_map: &mut Vec<u8>,
     huffman_pool: &mut Vec<HuffmanNode>,
     isolate_single_symbol: bool,
+    max_clusters: usize,
     pool: Option<&ThreadPool>,
 ) {
     cluster_histograms_inner(
@@ -360,6 +371,7 @@ pub(crate) fn cluster_histograms_with_pool(
         context_map,
         false,
         isolate_single_symbol,
+        max_clusters,
         huffman_pool,
         pool,
     );
@@ -718,6 +730,7 @@ fn cluster_histograms_inner(
     context_map: &mut Vec<u8>,
     refined: bool,
     isolate_single_symbol: bool,
+    max_clusters: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     pool: Option<&ThreadPool>,
 ) {
@@ -729,7 +742,7 @@ fn cluster_histograms_inner(
 
     const UNMAPPED: u8 = u8::MAX;
 
-    let max_histograms = CLUSTERS_LIMIT.min(histograms.len());
+    let max_histograms = CLUSTERS_LIMIT.min(max_clusters).min(histograms.len());
     let unassigned = max_histograms as u8;
 
     let inp = core::mem::take(histograms);
@@ -1070,6 +1083,74 @@ fn context_map_merge_saving(a: usize, b: usize) -> f64 {
     a * f_log2(merged / a) + b * f_log2(merged / b)
 }
 
+/// Only pairs involving a modified cluster need to be priced again. Keep the
+/// original pair traversal so equal deltas still choose the first pair.
+fn merge_final_ans_clusters(
+    clusters: &mut [Histogram],
+    cluster_costs: &mut [f64],
+    assignment: &mut [u8],
+    members: &mut [usize],
+    charge_context_map: bool,
+    mut population_cost: impl FnMut(&[u32; ALPHABET_SIZE]) -> f64,
+) {
+    let n = clusters.len();
+    if n <= 1 {
+        return;
+    }
+    let mut active: Vec<bool> = clusters.iter().map(|c| c.total_count != 0).collect();
+    // Store only pairs a < b, on the heap: at most 64 KiB for 128 clusters.
+    let mut deltas = vec![f64::INFINITY; n * (n - 1) / 2];
+    loop {
+        let mut best_pair = None;
+        let mut best_delta = -1e-6f64;
+        for a in 0..n {
+            if !active[a] {
+                continue;
+            }
+            for b in a + 1..n {
+                if !active[b] {
+                    continue;
+                }
+                let delta = &mut deltas[b * (b - 1) / 2 + a];
+                if *delta == f64::INFINITY {
+                    let mut merged = clusters[a].counts;
+                    add_counts(&mut merged, &clusters[b].counts);
+                    *delta = population_cost(&merged)
+                        - cluster_costs[a]
+                        - cluster_costs[b]
+                        - if charge_context_map {
+                            context_map_merge_saving(members[a], members[b])
+                        } else {
+                            0.0
+                        };
+                }
+                if *delta < best_delta {
+                    best_delta = *delta;
+                    best_pair = Some((a, b));
+                }
+            }
+        }
+        let Some((a, b)) = best_pair else { break };
+        let bh = clusters[b].clone();
+        histogram_add(&mut clusters[a], &bh);
+        cluster_costs[a] = population_cost(&clusters[a].counts);
+        members[a] += members[b];
+        active[b] = false;
+        for m in assignment.iter_mut() {
+            if *m == b as u8 {
+                *m = a as u8;
+            }
+        }
+        for other in 0..n {
+            if other == a {
+                continue;
+            }
+            let (first, second) = if other < a { (other, a) } else { (a, other) };
+            deltas[second * (second - 1) / 2 + first] = f64::INFINITY;
+        }
+    }
+}
+
 /// rANS-aware clustering for context sets whose distributions are too skewed
 /// for the prefix-cost model above: with sub-bit symbols an integer-depth
 /// Huffman cost cannot see the difference between contexts, so the greedy
@@ -1285,13 +1366,16 @@ pub(crate) fn cluster_histograms_ans(
             let h = &histograms[i];
             let mut without = clusters[old].clone();
             histogram_sub(&mut without, h);
-            let remove_delta = cost_of(&without, &mut scratch) - cluster_costs[old];
-            let add_delta = merge_cost(h, &clusters[best], &mut scratch) - cluster_costs[best];
+            let without_cost = cost_of(&without, &mut scratch);
+            let with_cost = merge_cost(h, &clusters[best], &mut scratch);
+            let remove_delta = without_cost - cluster_costs[old];
+            let add_delta = with_cost - cluster_costs[best];
             if remove_delta + add_delta < -0.01 {
-                histogram_sub(&mut clusters[old], h);
+                clusters[old] = without;
                 histogram_add(&mut clusters[best], h);
-                cluster_costs[old] = cost_of(&clusters[old], &mut scratch);
-                cluster_costs[best] = cost_of(&clusters[best], &mut scratch);
+                // Both populations were just priced to validate this move.
+                cluster_costs[old] = without_cost;
+                cluster_costs[best] = with_cost;
                 assignment[i] = best as u8;
                 changed = true;
             }
@@ -1306,50 +1390,20 @@ pub(crate) fn cluster_histograms_ans(
     // signaled context-map entry, so merging two clusters shrinks the map by
     // roughly the order-0 saving of folding their two symbols into one; charge
     // it, or the pass keeps clusters whose payload gain the map eats.
-    let mut active: Vec<bool> = clusters.iter().map(|c| c.total_count != 0).collect();
     let mut members = vec![0usize; num_seeds];
     for (h, &a) in histograms.iter().zip(&assignment) {
         if h.total_count != 0 {
             members[a as usize] += 1;
         }
     }
-    loop {
-        let mut best_pair = None;
-        let mut best_delta = -1e-6f64;
-        for a in 0..num_seeds {
-            if !active[a] {
-                continue;
-            }
-            for b in a + 1..num_seeds {
-                if !active[b] {
-                    continue;
-                }
-                let delta = merge_cost(&clusters[a], &clusters[b], &mut scratch)
-                    - cluster_costs[a]
-                    - cluster_costs[b]
-                    - if charge_context_map {
-                        context_map_merge_saving(members[a], members[b])
-                    } else {
-                        0.0
-                    };
-                if delta < best_delta {
-                    best_delta = delta;
-                    best_pair = Some((a, b));
-                }
-            }
-        }
-        let Some((a, b)) = best_pair else { break };
-        let bh = clusters[b].clone();
-        histogram_add(&mut clusters[a], &bh);
-        cluster_costs[a] = cost_of(&clusters[a], &mut scratch);
-        members[a] += members[b];
-        active[b] = false;
-        for m in assignment.iter_mut() {
-            if *m == b as u8 {
-                *m = a as u8;
-            }
-        }
-    }
+    merge_final_ans_clusters(
+        &mut clusters,
+        &mut cluster_costs,
+        &mut assignment,
+        &mut members,
+        charge_context_map,
+        |counts| fast_ans_population_cost_scratch(counts, 1, &mut scratch),
+    );
 
     // Compact in first-use order (the context map convention downstream).
     let mut remap = vec![u8::MAX; num_seeds];
@@ -1403,11 +1457,159 @@ mod tests {
         }
 
         let mut map = Vec::new();
-        cluster_histograms_with_pool(&mut histograms, &mut map, &mut Vec::new(), true, None);
+        cluster_histograms_with_pool(
+            &mut histograms,
+            &mut map,
+            &mut Vec::new(),
+            true,
+            CLUSTERS_LIMIT,
+            None,
+        );
         assert_ne!(map[0], map[1], "the single-symbol contexts merged");
         let distinct: std::collections::BTreeSet<u8> = map[2..].iter().copied().collect();
         assert_eq!(distinct.len(), 4, "distinct contexts merged: {map:?}");
         assert!(!distinct.contains(&map[0]) && !distinct.contains(&map[1]));
+    }
+
+    fn reference_ans_final_merge(
+        clusters: &mut [Histogram],
+        cluster_costs: &mut [f64],
+        assignment: &mut [u8],
+        members: &mut [usize],
+        charge_context_map: bool,
+        mut population_cost: impl FnMut(&[u32; ALPHABET_SIZE]) -> f64,
+    ) {
+        let mut active: Vec<bool> = clusters.iter().map(|c| c.total_count != 0).collect();
+        loop {
+            let mut best_pair = None;
+            let mut best_delta = -1e-6f64;
+            for a in 0..clusters.len() {
+                if !active[a] {
+                    continue;
+                }
+                for b in a + 1..clusters.len() {
+                    if !active[b] {
+                        continue;
+                    }
+                    let delta = {
+                        let mut merged = clusters[a].counts;
+                        add_counts(&mut merged, &clusters[b].counts);
+                        population_cost(&merged)
+                    } - cluster_costs[a]
+                        - cluster_costs[b]
+                        - if charge_context_map {
+                            context_map_merge_saving(members[a], members[b])
+                        } else {
+                            0.0
+                        };
+                    if delta < best_delta {
+                        best_delta = delta;
+                        best_pair = Some((a, b));
+                    }
+                }
+            }
+            let Some((a, b)) = best_pair else { break };
+            let bh = clusters[b].clone();
+            histogram_add(&mut clusters[a], &bh);
+            cluster_costs[a] = population_cost(&clusters[a].counts);
+            members[a] += members[b];
+            active[b] = false;
+            for m in assignment.iter_mut() {
+                if *m == b as u8 {
+                    *m = a as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_ans_merges_match_recomputing_every_pair() {
+        use super::super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
+        for n in [0, 1, 2, 7, 32, 64, CLUSTERS_LIMIT] {
+            for family in 0..4 {
+                let base: Vec<_> = (0..n)
+                    .map(|i| match family {
+                        // Equal populations exercise first-best ties and many
+                        // merges, including pairs on both sides of a changed row.
+                        0 => histogram(&[(0, 100), (1, 50), (2, 25)]),
+                        1 => histogram(&[(i % ALPHABET_SIZE, 100)]),
+                        2 if i % 7 == 0 => Histogram::new(),
+                        _ => {
+                            let mut h = Histogram::new();
+                            for j in 0..12 {
+                                let symbol = (i % 9 * 11 + j * 7) % ALPHABET_SIZE;
+                                let count = ((i * 17 + j * 13) % 31 + 1) as u32;
+                                h.counts[symbol] += count;
+                                h.total_count += count;
+                            }
+                            h
+                        }
+                    })
+                    .collect();
+                let mut scratch = AnsCostScratch::new();
+                let costs: Vec<_> = base
+                    .iter()
+                    .map(|h| fast_ans_population_cost_scratch(&h.counts, 1, &mut scratch))
+                    .collect();
+                let members: Vec<_> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, h)| if h.total_count == 0 { 0 } else { i % 5 + 1 })
+                    .collect();
+                let assignment: Vec<_> = members
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, &count)| std::iter::repeat_n(i as u8, count))
+                    .collect();
+                for charge_context_map in [false, true] {
+                    let mut expected = base.clone();
+                    let mut expected_costs = costs.clone();
+                    let mut expected_assignment = assignment.clone();
+                    let mut expected_members = members.clone();
+                    let mut expected_calls = 0usize;
+                    reference_ans_final_merge(
+                        &mut expected,
+                        &mut expected_costs,
+                        &mut expected_assignment,
+                        &mut expected_members,
+                        charge_context_map,
+                        |counts| {
+                            expected_calls += 1;
+                            fast_ans_population_cost_scratch(counts, 1, &mut scratch)
+                        },
+                    );
+                    let mut actual = base.clone();
+                    let mut actual_costs = costs.clone();
+                    let mut actual_assignment = assignment.clone();
+                    let mut actual_members = members.clone();
+                    let mut actual_calls = 0usize;
+                    merge_final_ans_clusters(
+                        &mut actual,
+                        &mut actual_costs,
+                        &mut actual_assignment,
+                        &mut actual_members,
+                        charge_context_map,
+                        |counts| {
+                            actual_calls += 1;
+                            fast_ans_population_cost_scratch(counts, 1, &mut scratch)
+                        },
+                    );
+                    assert_eq!(actual_assignment, expected_assignment);
+                    assert_eq!(actual_members, expected_members);
+                    for (a, b) in actual.iter().zip(&expected) {
+                        assert_eq!(a.counts, b.counts);
+                        assert_eq!(a.total_count, b.total_count);
+                    }
+                    for (a, b) in actual_costs.iter().zip(&expected_costs) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                    assert!(actual_calls <= expected_calls);
+                    if n == 64 && family == 0 {
+                        assert!(actual_calls * 8 < expected_calls);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1598,6 +1800,7 @@ mod tests {
             &mut expected_map,
             refined,
             false,
+            CLUSTERS_LIMIT,
             &mut expected_pool,
             None,
         );
@@ -1764,6 +1967,7 @@ mod tests {
                     &mut actual_map,
                     &mut Vec::new(),
                     false,
+                    CLUSTERS_LIMIT,
                     Some(&pool),
                 );
                 assert_eq!(actual_map, expected_map, "n={n}, threads={threads}");

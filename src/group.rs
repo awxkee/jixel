@@ -220,7 +220,7 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
 
 #[inline]
 fn rdoq_lambda(qf_ratio: f32) -> f32 {
-    const BASE: f32 = 1.25;
+    const BASE: f32 = 1.5;
     crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
 }
 
@@ -286,8 +286,17 @@ const RESTORE_FEW_COLORS_PENALTY: f32 = 2.0;
 
 /// Whether the source pixels of `[x0, x1) x [y0, y1)` hold at most `limit`
 /// distinct XYB colors (quantized to 1/1024).
-fn few_colors(opsin: &Image3F, x0: usize, y0: usize, x1: usize, y1: usize, limit: usize) -> bool {
-    let mut seen: Vec<u64> = Vec::with_capacity(limit + 1);
+fn few_colors(
+    opsin: &Image3F,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    limit: usize,
+    seen: &mut Vec<u64>,
+) -> bool {
+    seen.clear();
+    seen.reserve(limit);
     for y in y0..y1 {
         let rows = [
             opsin.plane_row(0, y),
@@ -1222,6 +1231,8 @@ pub(crate) struct AcGroupScratch {
     rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
     gather: Box<[f32; 4096]>,
+    /// Distinct source colors, reused across RDOQ blocks and groups.
+    few_color_keys: Vec<u64>,
 }
 
 impl Default for AcGroupScratch {
@@ -1234,6 +1245,7 @@ impl Default for AcGroupScratch {
             rdoq_choices: heap_array(u8::MAX),
             rdoq_costs: HeapMatrix::new(f32::INFINITY),
             gather: heap_array(0.0),
+            few_color_keys: Vec::new(),
         }
     }
 }
@@ -1242,6 +1254,7 @@ impl Default for AcGroupScratch {
 pub(crate) struct SourceDc {
     pub(crate) y: crate::image::Plane<f32>,
     pub(crate) b: crate::image::Plane<f32>,
+    pub(crate) x: crate::image::Plane<f32>,
 }
 
 /// Process and tokenize one stripe of an AC group, pushing tokens into `out`.
@@ -1306,6 +1319,7 @@ pub(crate) fn write_ac_group(
         rdoq_choices,
         rdoq_costs,
         gather,
+        few_color_keys,
     } = scratch;
 
     for by in 0..ysize_blocks {
@@ -1350,7 +1364,7 @@ pub(crate) fn write_ac_group(
                 let x1 = (x0 + cov_x * 8).min(opsin.xsize());
                 let y1 = (y0 + cov_y * 8).min(opsin.ysize());
                 let limit = RESTORE_FEW_COLORS_PER_BLOCK * cov_x * cov_y;
-                if few_colors(opsin, x0, y0, x1, y1, limit) {
+                if few_colors(opsin, x0, y0, x1, y1, limit, few_color_keys) {
                     RESTORE_FEW_COLORS_PENALTY
                 } else {
                     1.0
@@ -1849,6 +1863,8 @@ pub(crate) fn write_ac_group(
                     let bx = global_bx - qorigin_x;
                     source.b.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
                         .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
+                    source.x.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                        .copy_from_slice(&x_dc_post[iy * cov_x..(iy + 1) * cov_x]);
                 }
             }
             // ---- B channel: write CfL'd DC, quantize AC ----
@@ -2118,11 +2134,17 @@ mod tests {
                 }
             }
         }
-        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 24));
-        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 2));
-        assert!(!super::few_colors(&xyb, 0, 0, 8, 8, 1));
-        assert!(!super::few_colors(&xyb, 8, 0, 16, 8, 24));
-        assert!(super::few_colors(&xyb, 8, 0, 16, 8, 64));
+        let mut seen = vec![u64::MAX; 100];
+        let storage = seen.as_ptr();
+        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 24, &mut seen));
+        assert!(super::few_colors(&xyb, 0, 0, 8, 8, 2, &mut seen));
+        assert!(!super::few_colors(&xyb, 0, 0, 8, 8, 1, &mut seen));
+        assert!(!super::few_colors(&xyb, 8, 0, 16, 8, 24, &mut seen));
+        assert!(super::few_colors(&xyb, 8, 0, 16, 8, 64, &mut seen));
+        assert!(!super::few_colors(&xyb, 0, 0, 8, 8, 0, &mut seen));
+        assert!(super::few_colors(&xyb, 0, 0, 0, 0, 0, &mut seen));
+        assert!(seen.is_empty());
+        assert_eq!(seen.as_ptr(), storage, "color storage should be reused");
     }
 
     use super::{

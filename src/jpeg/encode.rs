@@ -877,10 +877,15 @@ struct Effort {
 impl Effort {
     fn new(speed: Speed) -> Self {
         match speed {
-            Speed::Fastest => Self {
+            Speed::UltraFast => Self {
                 try_natural_order: false,
                 select_configs: false,
                 refinement: None,
+            },
+            Speed::Fastest => Self {
+                try_natural_order: false,
+                select_configs: false,
+                refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Fast => Self {
                 try_natural_order: false,

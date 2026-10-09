@@ -23,7 +23,8 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
-         [--speed extraslow|slow|medium|fast|fastest] [--lossless]"
+         [--speed extraslow|slow|medium|fast|fastest|ultrafast] [--lossless]\n\
+         [--decoding-speed slow|fast|fastest] (lossless only)"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
     let mut splines = false;
     let mut dots = false;
     let mut patches = None;
+    let mut decoding_speed = jixel::DecodingSpeed::Slow;
 
     let mut i = 0;
     while i < args.len() {
@@ -69,8 +71,22 @@ fn main() -> ExitCode {
                     "medium" => jixel::Speed::Medium,
                     "fast" => jixel::Speed::Fast,
                     "fastest" => jixel::Speed::Fastest,
+                    "ultrafast" => jixel::Speed::UltraFast,
                     _ => {
                         eprintln!("invalid --speed: {v}");
+                        std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
+            "--decoding-speed" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                decoding_speed = match v.as_str() {
+                    "slow" => jixel::DecodingSpeed::Slow,
+                    "fast" => jixel::DecodingSpeed::Fast,
+                    "fastest" => jixel::DecodingSpeed::Fastest,
+                    _ => {
+                        eprintln!("invalid --decoding-speed: {v}");
                         std::process::exit(2);
                     }
                 };
@@ -132,6 +148,7 @@ fn main() -> ExitCode {
         .with_distance(distance)
         .with_num_threads(threads.max(1))
         .with_speed(speed)
+        .with_decoding_speed(decoding_speed)
         .with_splines(splines)
         .with_dots(dots);
     let cfg = if let Some(patches) = patches {

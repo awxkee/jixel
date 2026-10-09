@@ -54,6 +54,37 @@ macro_rules! effort_gates {
 
 effort_gates! {
     // --- lossy VarDCT ---
+    /// Full thread budget on small images (otherwise one lane per 64K pixels).
+    full_threads,
+    /// Square merge search (16x16/32x32) over the plain 8x8 DCT grid, with
+    /// the per-strategy block contexts and custom-matrix accounting it needs.
+    square_merges,
+    /// 32x32 merges in the square search (otherwise 16x16 only).
+    merge_32,
+    /// Evaluate merges on quads whose DCT8 incumbent already exceeds
+    /// `MERGE_PRESCREEN_BITS`.
+    merge_busy_quads,
+    /// Per-block quantizer refinement after the transform search.
+    quant_refine,
+    /// Pixel-chromacity X steps outside the chroma policy.
+    pixel_chromacity_x,
+    /// CfL slope search for YCbCr frames.
+    cfl_ycbcr_rdo,
+    /// Weighted DC predictor with per-context gradient fallback.
+    dc_predictor_search,
+    /// Per-image learned DC context tree raced against the static tree.
+    dc_learned_tree,
+    /// Per-cluster hybrid-uint config selection.
+    huc_select,
+    /// Prefix-model AC context clustering (otherwise a coarse context merge).
+    ac_prefix_clustering,
+    /// Greedy context clustering may open every cluster the format allows
+    /// (otherwise `FAST_CLUSTERS_LIMIT`).
+    wide_clustering,
+    /// Fast ANS cluster refinement of the DC and AC codes.
+    ans_fast_refine,
+    /// Below `ans_recluster`: recluster at distance >= 3 during the fast refinement.
+    ans_recluster_coarse,
     /// Rectangular, sub-8x8 (DCT4/AFV/IDENTITY) and leaf-first transform search.
     rectangles,
     /// SSIM reconstruction rerank at every distance (otherwise high quality only).
@@ -75,6 +106,9 @@ effort_gates! {
     rdoq_fresh_prices,
     ac_ctx_plan,
     ma_dc_tree,
+    /// Per chroma channel, a 2x finer DC step holding a squeeze-smoothed plane
+    /// when that is both cheaper and closer than nearest rounding.
+    chroma_dc_squeeze,
     ans_refine,
     /// Broader final hybrid-uint and ANS-table search.
     ans_exhaustive,
@@ -120,7 +154,32 @@ effort_gates! {
     tree_ctx_v1,
 }
 
-const FAST: Effort = Effort::NONE;
+const ULTRAFAST: Effort = Effort::NONE;
+
+const FASTEST: Effort = Effort {
+    square_merges: true,
+    dc_predictor_search: true,
+    ac_prefix_clustering: true,
+    ..ULTRAFAST
+};
+
+const FAST: Effort = Effort {
+    full_threads: true,
+    square_merges: true,
+    merge_32: true,
+    merge_busy_quads: true,
+    quant_refine: true,
+    pixel_chromacity_x: true,
+    cfl_ycbcr_rdo: true,
+    dc_predictor_search: true,
+    dc_learned_tree: true,
+    huc_select: true,
+    ac_prefix_clustering: true,
+    wide_clustering: true,
+    ans_fast_refine: true,
+    ans_recluster_coarse: true,
+    ..Effort::NONE
+};
 
 const MEDIUM: Effort = Effort {
     full_rerank: false,
@@ -128,6 +187,7 @@ const MEDIUM: Effort = Effort {
     coeff_orders: false,
     ac_ctx_plan: false,
     ma_dc_tree: false,
+    chroma_dc_squeeze: false,
     ans_refine: false,
     lossy_modular_auto: false,
     splines: false,
@@ -155,7 +215,9 @@ const EXTRASLOW: Effort = Effort::ALL;
 impl Speed {
     pub(crate) const fn effort(self) -> &'static Effort {
         match self {
-            Speed::Fastest | Speed::Fast => &FAST,
+            Speed::UltraFast => &ULTRAFAST,
+            Speed::Fastest => &FASTEST,
+            Speed::Fast => &FAST,
             Speed::Medium => &MEDIUM,
             Speed::Slow => &SLOW,
             Speed::ExtraSlow => &EXTRASLOW,
@@ -170,6 +232,7 @@ mod tests {
     #[test]
     fn slower_tiers_keep_every_faster_tool() {
         let tiers = [
+            Speed::UltraFast,
             Speed::Fastest,
             Speed::Fast,
             Speed::Medium,

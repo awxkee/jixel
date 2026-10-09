@@ -298,7 +298,7 @@ fn main() -> Result<()> {
     let mut tools = AvifTools {
         enc: SYS_AVIFENC.to_string(),
         dec: SYS_AVIFDEC.to_string(),
-        speed: "6".to_string(),
+        speed: "5".to_string(),
         yuv: "444".to_string(),
     };
     let mut patches = false;
