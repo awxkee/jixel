@@ -109,6 +109,9 @@ effort_gates! {
     /// Per chroma channel, a 2x finer DC step holding a squeeze-smoothed plane
     /// when that is both cheaper and closer than nearest rounding.
     chroma_dc_squeeze,
+    /// Frame-level X DC chroma-from-luma search on the unrounded source,
+    /// under the final luma levels and DC quantization steps.
+    dc_x_cfl,
     ans_refine,
     /// Broader final hybrid-uint and ANS-table search.
     ans_exhaustive,
@@ -188,6 +191,7 @@ const MEDIUM: Effort = Effort {
     ac_ctx_plan: false,
     ma_dc_tree: false,
     chroma_dc_squeeze: false,
+    dc_x_cfl: false,
     ans_refine: false,
     lossy_modular_auto: false,
     splines: false,

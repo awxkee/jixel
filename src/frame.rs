@@ -1222,6 +1222,7 @@ fn write_dc_global(
     alpha: Option<&AlphaPlane>,
     xsize: usize,
     ysize: usize,
+    ytox_dc: i32,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
     extra_step: u32,
@@ -1241,11 +1242,11 @@ fn write_dc_global(
     write_block_ctx_map(ac_plan, scratch, w);
 
     // ColorCorrelationParams. The all-default bundle pins the DC plane to the
-    // XYB base correlations (X: 0, B: 1); a searched `ytob_dc` needs the
+    // XYB base correlations (X: 0, B: 1); either searched DC slope needs the
     // explicit form, which costs COLOR_CORRELATION_HEADER_BITS more.
     {
         let factor = cfl.color_factor as u32;
-        if ytob_dc == 0 && cfl == crate::color_correlation::CflFrame::XYB {
+        if ytox_dc == 0 && ytob_dc == 0 && cfl == crate::color_correlation::CflFrame::XYB {
             w.write(1, 1); // all_default
         } else {
             w.write(1, 0); // not all-default
@@ -1259,7 +1260,7 @@ fn write_dc_global(
             for base in [cfl.base_x, cfl.base_b] {
                 w.write(16, u64::from(crate::util::f32_to_f16_bits(base)));
             }
-            w.write(8, 128); // ytox_dc = 0, offset by 128
+            w.write(8, (ytox_dc + 128) as u64); // ytox_dc, offset by 128
             w.write(8, (ytob_dc + 128) as u64); // ytob_dc, offset by 128
         }
     }
@@ -3397,6 +3398,26 @@ fn encode_frame_core(
         }
     }
 
+    // The retained source DC is invariant under AC reranking. Search against
+    // the final Y levels and steps, then quantize X once from that source.
+    let ytox_dc = if ctx.coding.is_xyb() && ctx.speed.effort().dc_x_cfl {
+        crate::color_correlation::choose_ytox_dc(
+            &mut dc_datas,
+            distp.scale_dc,
+            distp.dc_step,
+            ctx.cfl_frame(),
+            ytob_dc != 0,
+            ctx.quantize_dc_cfl,
+        )
+    } else {
+        0
+    };
+    // Only DC reconstruction uses the extra X slope. The AC map and the
+    // header's base correlations retain the frame's original parameters.
+    let dc_cfl = crate::color_correlation::CflFrame {
+        base_x: crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), ytox_dc as i8),
+        ..ctx.cfl_frame()
+    };
     if ctx.coding.is_xyb() {
         flatten_chroma_dc(
             opsin,
@@ -3405,11 +3426,11 @@ fn encode_frame_core(
             &group_coords,
             &distp,
             ytob_dc,
-            ctx.cfl_frame(),
+            dc_cfl,
         )?;
     }
     if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze {
-        choose_chroma_dc_coding(&dim, &mut dc_datas, &mut distp, ytob_dc, ctx.cfl_frame())?;
+        choose_chroma_dc_coding(&dim, &mut dc_datas, &mut distp, ytob_dc, dc_cfl)?;
     }
     let skip_dc_smoothing = skip_dc_smoothing(
         &ctx.thread_pool,
@@ -3420,7 +3441,7 @@ fn encode_frame_core(
         &group_coords,
         &distp,
         ytob_dc,
-        ctx.cfl_frame(),
+        dc_cfl,
     )?;
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
@@ -3914,6 +3935,7 @@ fn encode_frame_core(
         alpha,
         dim.xsize,
         dim.ysize,
+        ytox_dc,
         ytob_dc,
         ctx.cfl_frame(),
         ctx.extra_step,
