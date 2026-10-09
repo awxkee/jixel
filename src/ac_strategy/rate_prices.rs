@@ -53,7 +53,7 @@ use crate::ac_context::{
     K_NON_ZERO_BUCKETS, K_NUM_FINE_BLOCK_CTXS, K_ZERO_DENSITY_CONTEXT_COUNT, fine_non_zero_context,
     zero_density_context, zero_density_context_8x8,
 };
-use crate::adaptive_quant::dirty_log2p1f;
+use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::coeff_order::{CoeffOrders, OrderStats, derive_orders, order_slot_of};
 use crate::dc_group_data::{NUM_STRATEGIES, STRATEGY_CODE_LUT};
 use crate::entropy::{pack_signed, uint_encode};
@@ -362,7 +362,7 @@ fn price_contexts(counts: &mut [f32]) {
         *pooled *= POOL_WEIGHT / pool_total;
     }
     // Most contexts never occur; they share one smoothed distribution.
-    let empty: [f32; SYMBOLS] = std::array::from_fn(|i| (POOL_WEIGHT / pool[i]).log2());
+    let empty: [f32; SYMBOLS] = std::array::from_fn(|i| dirty_log2f(POOL_WEIGHT / pool[i]));
     // The pool and each row total are known before that row is overwritten,
     // so the count allocation can become the final price table.
     for row in counts {
@@ -372,7 +372,7 @@ fn price_contexts(counts: &mut [f32]) {
         }
         let total = row.iter().sum::<f32>() + POOL_WEIGHT;
         for (count, &pooled) in row.iter_mut().zip(&pool) {
-            *count = (total / (*count + pooled)).log2();
+            *count = dirty_log2f(total / (*count + pooled));
         }
     }
 }
@@ -1186,19 +1186,29 @@ mod tests {
             *pooled *= POOL_WEIGHT / pool_total;
         }
         let mut expected = Vec::new();
+        let mut standard_log_prices = Vec::new();
         for row in counts.as_chunks::<SYMBOLS>().0 {
             let total = row.iter().sum::<f32>() + POOL_WEIGHT;
-            expected.extend(
-                row.iter()
-                    .zip(pool)
-                    .map(|(count, pooled)| (total / (count + pooled)).log2().to_bits()),
-            );
+            for (count, pooled) in row.iter().zip(pool) {
+                let ratio = total / (count + pooled);
+                expected.push(dirty_log2f(ratio).to_bits());
+                standard_log_prices.push(ratio.log2());
+            }
         }
         price_contexts(&mut counts);
         assert_eq!(
             expected,
             counts.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
         );
+        // The storage transformation stays exact under the new kernel;
+        // independently check that its prices still approximate log2.
+        for (&price, reference) in counts.iter().zip(standard_log_prices) {
+            assert!(price.is_finite() && price >= 0.0);
+            assert!(
+                (price - reference).abs() < 2.0e-6,
+                "{price} vs standard log2 {reference}"
+            );
+        }
     }
 
     #[test]

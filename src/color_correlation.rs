@@ -1381,8 +1381,6 @@ pub(crate) fn choose_ytox_dc(
         COLOR_CORRELATION_HEADER_BITS
     };
     let (mut best_bits, mut best_k) = (base.bits, 0);
-    #[cfg(test)]
-    let mut best_cost = base;
     for k in (-128..=127).filter(|&k| k != 0) {
         let cost = ytox_dc_cost(
             dc_datas,
@@ -1397,10 +1395,6 @@ pub(crate) fn choose_ytox_dc(
         if cost.distortion <= base.distortion && cost.bits + header < best_bits {
             best_bits = cost.bits + header;
             best_k = k;
-            #[cfg(test)]
-            {
-                best_cost = cost;
-            }
         }
     }
     if best_k != 0 {
@@ -1408,14 +1402,8 @@ pub(crate) fn choose_ytox_dc(
         let proposed_bits = ytox_dc_weighted_bits(dc_datas, best_k, scale, dc_step, cfl, quantize);
         if proposed_bits + header >= base_bits {
             best_k = 0;
-            #[cfg(test)]
-            {
-                best_cost = base;
-            }
         }
     }
-    #[cfg(test)]
-    XDC_STUDY.set(Some((best_k, base, best_cost)));
     if best_k != 0 {
         let factor = dc_cfl_factor_x(dc_step, y_to_x_ratio(cfl, best_k as i8));
         for dc in dc_datas {
@@ -1427,13 +1415,6 @@ pub(crate) fn choose_ytox_dc(
         }
     }
     best_k
-}
-
-#[cfg(test)]
-thread_local! {
-    static XDC_STUDY: std::cell::Cell<Option<(i32, XdcCost, XdcCost)>> = const {
-        std::cell::Cell::new(None)
-    };
 }
 
 /// DC step candidates per channel: the default and finer ones a percent
