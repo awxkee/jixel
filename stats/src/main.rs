@@ -429,7 +429,7 @@ fn main() -> Result<()> {
     let mut tools = AvifTools {
         aom_enc: SYS_AVIFENC.to_string(),
         aom_dec: SYS_AVIFDEC.to_string(),
-        aom_speed: "6".to_string(),
+        aom_speed: "3".to_string(),
         mt_cli: MAROONTREE_CLI.to_string(),
         avm_dec: AVM_AVIFDEC.to_string(),
         av2_speed: "slow".to_string(),
@@ -998,7 +998,7 @@ fn bench_jixel(
     let cfg = jixel::EncodeConfig::default()
         .with_distance(d)
         .with_num_threads(nthreads)
-        .with_speed(Speed::Slow)
+        .with_speed(Speed::ExtraSlow)
         .with_splines(false)
         .with_dots(false)
         .with_coding_transform(CodingTransform::Xyb);

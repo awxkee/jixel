@@ -232,6 +232,82 @@ pub(crate) fn quantize_dc_cfl_avx2(
     }
 }
 
+#[target_feature(enable = "avx2")]
+pub(crate) fn quantize_dc_i32_avx2(input: &[f32], scale: f32, output: &mut [i32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<8>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<8>();
+    let scale = _mm256_set1_ps(scale);
+    for (source, target) in input_chunks.iter().zip(output_chunks) {
+        let value = unsafe { _mm256_loadu_ps(source.as_ptr()) };
+        let value = round_ties_away_i32x8(_mm256_mul_ps(value, scale));
+        unsafe { _mm256_storeu_si256(target.as_mut_ptr().cast(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 8];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let value = unsafe { _mm256_loadu_ps(source.as_ptr()) };
+        let value = round_ties_away_i32x8(_mm256_mul_ps(value, scale));
+        let mut target = [0i32; 8];
+        unsafe { _mm256_storeu_si256(target.as_mut_ptr().cast(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+fn quantize_dc_cfl_i32_value_x8(
+    input: __m256,
+    y_quant: __m256i,
+    scale: __m256,
+    negative_cfl: __m256,
+) -> __m256i {
+    let correction = _mm256_mul_ps(_mm256_cvtepi32_ps(y_quant), negative_cfl);
+    // Match dct::fmla's fused/unfused arithmetic before rounding.
+    #[cfg(target_feature = "fma")]
+    let value = _mm256_fmadd_ps(input, scale, correction);
+    #[cfg(not(target_feature = "fma"))]
+    let value = _mm256_add_ps(_mm256_mul_ps(input, scale), correction);
+    round_ties_away_i32x8(value)
+}
+
+#[target_feature(enable = "avx2")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+pub(crate) fn quantize_dc_cfl_i32_avx2(
+    input: &[f32],
+    y_quant: &[i32],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i32],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<8>();
+    let (y_chunks, y_tail) = y_quant.as_chunks::<8>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<8>();
+    let scale = _mm256_set1_ps(scale);
+    let negative_cfl = _mm256_set1_ps(-cfl);
+    for ((source, y), target) in input_chunks.iter().zip(y_chunks).zip(output_chunks) {
+        let value = unsafe { _mm256_loadu_ps(source.as_ptr()) };
+        let y = unsafe { _mm256_loadu_si256(y.as_ptr().cast()) };
+        let value = quantize_dc_cfl_i32_value_x8(value, y, scale, negative_cfl);
+        unsafe { _mm256_storeu_si256(target.as_mut_ptr().cast(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 8];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let mut y = [0i32; 8];
+        y[..y_tail.len()].copy_from_slice(y_tail);
+        let value = unsafe { _mm256_loadu_ps(source.as_ptr()) };
+        let y = unsafe { _mm256_loadu_si256(y.as_ptr().cast()) };
+        let value = quantize_dc_cfl_i32_value_x8(value, y, scale, negative_cfl);
+        let mut target = [0i32; 8];
+        unsafe { _mm256_storeu_si256(target.as_mut_ptr().cast(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::group::quantize_block_ac_scalar;

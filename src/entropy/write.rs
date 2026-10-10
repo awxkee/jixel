@@ -151,42 +151,67 @@ static HYBRID_CANDIDATES: [HybridUintConfig; 12] = [
 const NUM_HYBRID_CANDIDATES: usize = HYBRID_CANDIDATES.len();
 const DEFAULT_HYBRID_INDEX: usize = 6;
 
-type HybridCounter = fn(&[u32], usize, &mut [u32; ALPHABET_SIZE]) -> (u64, u64, bool);
+/// Values below this bound symbolize through a per-candidate table. Every
+/// candidate keeps such values inside the 128-symbol alphabet.
+const HYBRID_SMALL_VALUES: usize = 256;
 
-// Specialize symbolization for each fixed configuration, keeping the same
-// candidate order and sampled values. Split and token shifts become constants.
-static HYBRID_COUNTERS: [HybridCounter; NUM_HYBRID_CANDIDATES] = [
-    count_hybrid::<0>,
-    count_hybrid::<1>,
-    count_hybrid::<2>,
-    count_hybrid::<3>,
-    count_hybrid::<4>,
-    count_hybrid::<5>,
-    count_hybrid::<6>,
-    count_hybrid::<7>,
-    count_hybrid::<8>,
-    count_hybrid::<9>,
-    count_hybrid::<10>,
-    count_hybrid::<11>,
-];
+/// `[candidate][value] = (symbol, extra bits)` for small values.
+fn hybrid_small_value_table() -> &'static [[[u8; 2]; HYBRID_SMALL_VALUES]; NUM_HYBRID_CANDIDATES] {
+    static TABLE: std::sync::OnceLock<
+        Box<[[[u8; 2]; HYBRID_SMALL_VALUES]; NUM_HYBRID_CANDIDATES]>,
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        Box::new(core::array::from_fn(|candidate| {
+            core::array::from_fn(|value| {
+                let (symbol, nbits, _) =
+                    uint_encode_with_config(value as u32, HYBRID_CANDIDATES[candidate]);
+                debug_assert!((symbol as usize) < ALPHABET_SIZE);
+                [symbol as u8, nbits as u8]
+            })
+        }))
+    })
+}
 
-fn count_hybrid<const C: usize>(
+/// Symbolize the sampled values under every candidate in one pass. A
+/// candidate whose alphabet overflows is invalid; its partial counts are
+/// never priced.
+fn count_hybrid_candidates(
     values: &[u32],
     sample_stride: usize,
-    counts: &mut [u32; ALPHABET_SIZE],
-) -> (u64, u64, bool) {
-    let mut extra_bits = 0u64;
+    scratch: &mut HybridAnsSelectorScratch,
+) {
+    let table = hybrid_small_value_table();
     let mut total = 0u64;
     for &value in values.iter().step_by(sample_stride) {
-        let (symbol, nbits, _) = uint_encode_with_config(value, HYBRID_CANDIDATES[C]);
-        if symbol as usize >= ALPHABET_SIZE {
-            return (extra_bits, total, false);
-        }
-        counts[symbol as usize] += 1;
-        extra_bits += nbits as u64;
         total += 1;
+        if (value as usize) < HYBRID_SMALL_VALUES {
+            for (candidate, (counts, extra_bits)) in table
+                .iter()
+                .zip(scratch.counts.iter_mut().zip(&mut scratch.extra_bits))
+            {
+                let [symbol, nbits] = candidate[value as usize];
+                counts[symbol as usize] += 1;
+                *extra_bits += u64::from(nbits);
+            }
+        } else {
+            for (candidate, ((counts, extra_bits), valid)) in HYBRID_CANDIDATES.iter().zip(
+                scratch
+                    .counts
+                    .iter_mut()
+                    .zip(&mut scratch.extra_bits)
+                    .zip(&mut scratch.valid),
+            ) {
+                let (symbol, nbits, _) = uint_encode_with_config(value, *candidate);
+                if symbol as usize >= ALPHABET_SIZE {
+                    *valid = false;
+                } else {
+                    counts[symbol as usize] += 1;
+                    *extra_bits += u64::from(nbits);
+                }
+            }
+        }
     }
-    (extra_bits, total, true)
+    scratch.totals.fill(total);
 }
 
 struct HybridAnsSelectorScratch {
@@ -232,13 +257,7 @@ fn select_hybrid_config_ans_sampled(
         return HybridUintConfig::DEFAULT;
     }
     scratch.reset();
-    for (candidate_index, counter) in HYBRID_COUNTERS.iter().enumerate() {
-        let (extra_bits, total, valid) =
-            counter(values, sample_stride, &mut scratch.counts[candidate_index]);
-        scratch.extra_bits[candidate_index] = extra_bits;
-        scratch.totals[candidate_index] = total;
-        scratch.valid[candidate_index] = valid;
-    }
+    count_hybrid_candidates(values, sample_stride, scratch);
 
     for (candidate_index, &config) in HYBRID_CANDIDATES.iter().enumerate() {
         if !scratch.valid[candidate_index] || scratch.totals[candidate_index] == 0 {
@@ -3749,9 +3768,11 @@ mod sampled_hybrid_tests {
                     })
                     .collect();
                 for stride in [1, 2, 3, 17, 257] {
+                    let mut scratch = HybridAnsSelectorScratch::default();
+                    scratch.reset();
+                    count_hybrid_candidates(&values, stride, &mut scratch);
                     for (candidate, &config) in HYBRID_CANDIDATES.iter().enumerate() {
                         let mut expected = [0u32; ALPHABET_SIZE];
-                        let mut actual = expected;
                         let (mut extra_bits, mut total, mut valid) = (0u64, 0u64, true);
                         for &value in values.iter().step_by(stride) {
                             let (symbol, nbits, _) = uint_encode_with_config(value, config);
@@ -3763,9 +3784,12 @@ mod sampled_hybrid_tests {
                             extra_bits += nbits as u64;
                             total += 1;
                         }
-                        let result = HYBRID_COUNTERS[candidate](&values, stride, &mut actual);
-                        assert_eq!(result, (extra_bits, total, valid));
-                        assert_eq!(actual, expected);
+                        assert_eq!(scratch.valid[candidate], valid);
+                        if valid {
+                            assert_eq!(scratch.counts[candidate], expected);
+                            assert_eq!(scratch.extra_bits[candidate], extra_bits);
+                            assert_eq!(scratch.totals[candidate], total);
+                        }
                     }
                 }
             }

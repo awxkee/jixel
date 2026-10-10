@@ -528,7 +528,6 @@ mod tests {
     use crate::dc_ops::{B_DC_Y_COMPENSATION, selected_dc_row_kernels};
     use crate::haar::CHROMA_DC_SQUEEZE_DEADZONE;
     use crate::image::Plane;
-    use crate::quant_weights::INV_DC_QUANT;
 
     #[test]
     fn compensation_can_improve_b_minus_y_while_increasing_b_error() {

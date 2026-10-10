@@ -160,6 +160,76 @@ pub(crate) fn quantize_dc_cfl_neon(
     }
 }
 
+#[target_feature(enable = "neon")]
+pub(crate) fn quantize_dc_i32_neon(input: &[f32], scale: f32, output: &mut [i32]) {
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<4>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
+    let scale = vdupq_n_f32(scale);
+    for (source, target) in input_chunks.iter().zip(output_chunks) {
+        let value = unsafe { vld1q_f32(source.as_ptr()) };
+        let value = vcvtaq_s32_f32(vmulq_f32(value, scale));
+        unsafe { vst1q_s32(target.as_mut_ptr(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let value = unsafe { vld1q_f32(source.as_ptr()) };
+        let value = vcvtaq_s32_f32(vmulq_f32(value, scale));
+        let mut target = [0i32; 4];
+        unsafe { vst1q_s32(target.as_mut_ptr(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn quantize_dc_cfl_i32_value_x4(
+    input: float32x4_t,
+    y_quant: int32x4_t,
+    scale: float32x4_t,
+    negative_cfl: float32x4_t,
+) -> int32x4_t {
+    let correction = vmulq_f32(vcvtq_f32_s32(y_quant), negative_cfl);
+    let value = vfmaq_f32(correction, input, scale);
+    vcvtaq_s32_f32(value)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn quantize_dc_cfl_i32_neon(
+    input: &[f32],
+    y_quant: &[i32],
+    scale: f32,
+    cfl: f32,
+    output: &mut [i32],
+) {
+    debug_assert_eq!(input.len(), y_quant.len());
+    debug_assert_eq!(input.len(), output.len());
+    let (input_chunks, input_tail) = input.as_chunks::<4>();
+    let (y_chunks, y_tail) = y_quant.as_chunks::<4>();
+    let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
+    let scale = vdupq_n_f32(scale);
+    let negative_cfl = vdupq_n_f32(-cfl);
+    for ((source, y), target) in input_chunks.iter().zip(y_chunks).zip(output_chunks) {
+        let value = unsafe { vld1q_f32(source.as_ptr()) };
+        let y = unsafe { vld1q_s32(y.as_ptr()) };
+        let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);
+        unsafe { vst1q_s32(target.as_mut_ptr(), value) };
+    }
+    if !input_tail.is_empty() {
+        let mut source = [0.0; 4];
+        source[..input_tail.len()].copy_from_slice(input_tail);
+        let mut y = [0i32; 4];
+        y[..y_tail.len()].copy_from_slice(y_tail);
+        let value = unsafe { vld1q_f32(source.as_ptr()) };
+        let y = unsafe { vld1q_s32(y.as_ptr()) };
+        let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);
+        let mut target = [0i32; 4];
+        unsafe { vst1q_s32(target.as_mut_ptr(), value) };
+        output_tail.copy_from_slice(&target[..input_tail.len()]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::quantize_block_ac_neon;

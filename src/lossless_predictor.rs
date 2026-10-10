@@ -828,6 +828,31 @@ pub(crate) struct GradientScratch {
     pub(crate) wp: Option<Box<WpState>>,
 }
 
+/// Pack one group-local gradient row. `None` starts a new group: its first
+/// sample predicts zero and the rest predict west. Later rows predict north
+/// in the first column and use the selected SIMD kernel for the interior.
+pub(crate) fn pack_gradient_row(
+    current: &[i32],
+    north: Option<&[i32]>,
+    out: &mut [u32],
+    grad_pack_fn: GradPackInteriorFn,
+) {
+    assert_eq!(out.len(), current.len());
+    let Some((&first, _)) = current.split_first() else {
+        return;
+    };
+    if let Some(north) = north {
+        assert_eq!(north.len(), current.len());
+        out[0] = pack_signed(first.wrapping_sub(north[0]));
+        grad_pack_fn(current, north, out, current.len());
+    } else {
+        out[0] = pack_signed(first);
+        for (dest, &[left, value]) in out[1..].iter_mut().zip(current.array_windows::<2>()) {
+            *dest = pack_signed(value.wrapping_sub(left));
+        }
+    }
+}
+
 fn reset_wp_scratch(
     slot: &mut Option<Box<WpState>>,
     width: usize,
@@ -904,15 +929,12 @@ fn tokenize_plane_rows_shared<'a>(
         let buf = &mut scratch.buf[..w];
         let mut north = get_row(0);
         assert_eq!(north.len(), w);
-        out.push_token(Token::new(ctx, pack_signed(north[0])));
-        for pair in north.array_windows::<2>() {
-            out.push_token(Token::new(ctx, pack_signed(pair[1].wrapping_sub(pair[0]))));
-        }
+        pack_gradient_row(north, None, buf, grad_pack_fn);
+        out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
         for y in 1..h {
             let current = get_row(y);
             assert_eq!(current.len(), w);
-            buf[0] = pack_signed(current[0].wrapping_sub(north[0]));
-            grad_pack_fn(current, north, buf, w);
+            pack_gradient_row(current, Some(north), buf, grad_pack_fn);
             out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
             north = current;
         }
@@ -964,24 +986,18 @@ fn tokenize_sample_rows_shared<'a, T: Copy + 'a>(
         let buf = &mut scratch.buf[..w];
         let first = get_row(0);
         assert_eq!(first.len(), w);
-        out.push_token(Token::new(ctx, pack_signed(i32::from(first[0]))));
-        for pair in first.array_windows::<2>() {
-            out.push_token(Token::new(
-                ctx,
-                pack_signed(i32::from(pair[1]).wrapping_sub(i32::from(pair[0]))),
-            ));
-        }
         for (dest, &value) in north.iter_mut().zip(first) {
             *dest = i32::from(value);
         }
+        pack_gradient_row(north, None, buf, grad_pack_fn);
+        out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
         for y in 1..h {
             let row = get_row(y);
             assert_eq!(row.len(), w);
             for (dest, &value) in current.iter_mut().zip(row) {
                 *dest = i32::from(value);
             }
-            buf[0] = pack_signed(current[0].wrapping_sub(north[0]));
-            grad_pack_fn(current, north, buf, w);
+            pack_gradient_row(current, Some(north), buf, grad_pack_fn);
             out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
             std::mem::swap(&mut current, &mut north);
         }
@@ -1222,6 +1238,9 @@ fn tokenize_plane_with_wp(
     out: &mut impl TokenSink,
     wp_params: WpParams,
 ) {
+    if gw == 0 || gh == 0 {
+        return;
+    }
     if pred_id == PREDICTOR_WEIGHTED {
         tokenize_wp_rows_from_get(ctx, &get, gw, gh, scratch, out, wp_params);
     } else if pred_id == PREDICTOR_GRADIENT {
@@ -1244,15 +1263,7 @@ fn tokenize_plane_with_wp(
             for (gx, c) in cur.iter_mut().enumerate() {
                 *c = get(gx, gy);
             }
-            if gy == 0 {
-                buf[0] = pack_signed(cur[0]); // gx 0: pred = 0
-                for (out, &[left, value]) in buf[1..].iter_mut().zip(cur.array_windows::<2>()) {
-                    *out = pack_signed(value.wrapping_sub(left)); // pred = W
-                }
-            } else {
-                buf[0] = pack_signed(cur[0].wrapping_sub(prev[0])); // gx 0: pred = N
-                grad_pack_fn(cur, prev, buf, gw); // gx in 1..gw
-            }
+            pack_gradient_row(cur, (gy != 0).then_some(&*prev), buf, grad_pack_fn);
             out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
         }
     } else {

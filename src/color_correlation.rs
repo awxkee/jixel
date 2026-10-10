@@ -30,8 +30,11 @@ use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
-use crate::entropy::{f_log2, pack_signed};
+use crate::entropy::f_log2;
 use crate::image::{Image3F, ImageSB};
+use crate::lossless::{
+    GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
+};
 use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
 
 const K_BLOCK_DIM: usize = 8;
@@ -903,11 +906,64 @@ fn grad_predict(n: i32, w: i32, nw: i32) -> i32 {
     (n + w - nw).clamp(n.min(w), n.max(w))
 }
 
-#[inline]
-fn add_ytob_token(residual: i32, hist: &mut [u64; 64], extra_bits: &mut u64) {
-    let (tok, nbits, _) = crate::entropy::uint_encode(pack_signed(residual));
-    hist[(tok as usize).min(hist.len() - 1)] += 1;
-    *extra_bits += nbits as u64;
+struct DcGradientPrice {
+    hist: [u64; 64],
+    extra_bits: u64,
+    total: u64,
+    scratch: GradientScratch,
+    grad_pack: GradPackInteriorFn,
+}
+
+impl Default for DcGradientPrice {
+    fn default() -> Self {
+        Self {
+            hist: [0; 64],
+            extra_bits: 0,
+            total: 0,
+            scratch: GradientScratch::default(),
+            grad_pack: selected_grad_pack_interior_fn(),
+        }
+    }
+}
+
+impl DcGradientPrice {
+    fn clear(&mut self) {
+        self.hist.fill(0);
+        self.extra_bits = 0;
+        self.total = 0;
+    }
+
+    /// Reset prediction on the first row of each DC group while pooling its
+    /// symbols with the other groups. Keep all row buffers across candidates.
+    fn add_row<T: Copy>(&mut self, row: &[T], first_row: bool)
+    where
+        i32: From<T>,
+    {
+        let scratch = &mut self.scratch;
+        scratch.cur.resize(row.len(), 0);
+        scratch.prev.resize(row.len(), 0);
+        scratch.buf.resize(row.len(), 0);
+        for (dest, &value) in scratch.cur.iter_mut().zip(row) {
+            *dest = i32::from(value);
+        }
+        pack_gradient_row(
+            &scratch.cur,
+            (!first_row).then_some(scratch.prev.as_slice()),
+            &mut scratch.buf,
+            self.grad_pack,
+        );
+        for &value in &scratch.buf {
+            let (tok, nbits, _) = crate::entropy::uint_encode(value);
+            self.hist[(tok as usize).min(self.hist.len() - 1)] += 1;
+            self.extra_bits += u64::from(nbits);
+        }
+        self.total += row.len() as u64;
+        std::mem::swap(&mut scratch.cur, &mut scratch.prev);
+    }
+
+    fn bits(&self) -> f64 {
+        dc_histogram_bits(&self.hist, self.extra_bits, self.total)
+    }
 }
 
 /// Order-0 entropy of the DC symbols plus their raw extra bits.
@@ -961,12 +1017,10 @@ fn ytob_dc_cost(
     k: i32,
     step: f32,
     fill_ytob_row: FillYtobRowFn,
-    prev: &mut Vec<i32>,
     cur: &mut Vec<i32>,
+    price: &mut DcGradientPrice,
 ) -> f64 {
-    let mut hist = [0u64; 64];
-    let mut total = 0u64;
-    let mut extra_bits = 0u64;
+    price.clear();
     let slope = k as f32 * step;
 
     for dc in dc_datas {
@@ -978,45 +1032,21 @@ fn ytob_dc_cost(
             continue;
         }
 
-        if prev.len() != xsize {
-            prev.resize(xsize, 0i32);
-        }
         if cur.len() != xsize {
             cur.resize(xsize, 0i32);
         }
 
-        let mut rows = b
+        let rows = b
             .as_slice()
             .chunks_exact(xsize)
             .zip(y.as_slice().chunks_exact(xsize));
 
-        // The top row predicts from its left neighbor only. Keeping it out of
-        // the main loop removes the row-boundary branches from every sample.
-        let (b_row, y_row) = rows.next().unwrap();
-        fill_ytob_row(cur, b_row, y_row, slope);
-        add_ytob_token(cur[0], &mut hist, &mut extra_bits);
-        for pair in cur.array_windows::<2>() {
-            add_ytob_token(pair[1] - pair[0], &mut hist, &mut extra_bits);
-        }
-        std::mem::swap(prev, cur);
-
-        for (b_row, y_row) in rows {
+        for (row, (b_row, y_row)) in rows.enumerate() {
             fill_ytob_row(cur, b_row, y_row, slope);
-            add_ytob_token(cur[0] - prev[0], &mut hist, &mut extra_bits);
-            for (current, above) in cur.array_windows::<2>().zip(prev.array_windows::<2>()) {
-                let prediction = grad_predict(above[1], current[0], above[0]);
-                add_ytob_token(current[1] - prediction, &mut hist, &mut extra_bits);
-            }
-            std::mem::swap(prev, cur);
+            price.add_row(cur, row == 0);
         }
-        total += (xsize * ysize) as u64;
     }
-
-    if total == 0 {
-        return 0.0;
-    }
-
-    dc_histogram_bits(&hist, extra_bits, total)
+    price.bits()
 }
 
 #[inline]
@@ -1131,22 +1161,14 @@ pub(crate) fn selected_fill_ytob_residuals_fn() -> FillYtobResidualsFn {
     fill_ytob_residuals_scalar
 }
 
-pub(crate) fn choose_ytob_dc(
+fn ytob_dc_seed(
     dc_datas: &[DcGroupData],
-    fill_ytob_row: FillYtobRowFn,
     accumulate_weights: AccumulateYtobWeightsFn,
     fill_residuals: FillYtobResidualsFn,
     rb_scratch: &mut Vec<i32>,
     ry_scratch: &mut Vec<i32>,
-    dc_step: [f32; 3],
-    color_factor: f32,
+    step: f32,
 ) -> i32 {
-    // One signaled step moves the stored B DC by this much per stored Y unit:
-    // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
-    // stored in different units, hence the same `DC_QUANT[1] / DC_QUANT[2]`
-    // ratio `enc_group` applies for the `base_correlation_b` term.
-    let step = (INV_DC_QUANT[2] / dc_step[2] * (DC_QUANT[1] * dc_step[1])) / color_factor;
-
     // L1 fit: weighted median of the per-sample ratio, bucketed straight into
     // signaled-slope units so no sort is needed.
     let mut weights = [0u64; (2 * YTOB_DC_LIMIT + 1) as usize];
@@ -1197,24 +1219,105 @@ pub(crate) fn choose_ytob_dc(
 
     let half = weights.iter().sum::<u64>() / 2;
     let mut acc = 0u64;
-    let seed = weights
+    weights
         .iter()
         .position(|&weight| {
             acc += weight;
             acc > half
         })
-        .map_or(0, |idx| idx as i32 - YTOB_DC_LIMIT);
+        .map_or(0, |idx| idx as i32 - YTOB_DC_LIMIT)
+}
+
+pub(crate) fn choose_ytob_dc(
+    dc_datas: &[DcGroupData],
+    fill_ytob_row: FillYtobRowFn,
+    accumulate_weights: AccumulateYtobWeightsFn,
+    fill_residuals: FillYtobResidualsFn,
+    rb_scratch: &mut Vec<i32>,
+    ry_scratch: &mut Vec<i32>,
+    dc_step: [f32; 3],
+    color_factor: f32,
+) -> i32 {
+    // One signaled step moves the stored B DC by this much per stored Y unit:
+    // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
+    // stored in different units, hence the same `DC_QUANT[1] / DC_QUANT[2]`
+    // ratio `enc_group` applies for the `base_correlation_b` term.
+    let step = (INV_DC_QUANT[2] / dc_step[2] * (DC_QUANT[1] * dc_step[1])) / color_factor;
+    let seed = ytob_dc_seed(
+        dc_datas,
+        accumulate_weights,
+        fill_residuals,
+        rb_scratch,
+        ry_scratch,
+        step,
+    );
 
     // Refine over a window around the fit; 0 is always a candidate so the
     // search can decline.
     const WINDOW: i32 = 6;
-    let base_cost = ytob_dc_cost(dc_datas, 0, step, fill_ytob_row, ry_scratch, rb_scratch);
+    let mut price = DcGradientPrice::default();
+    let base_cost = ytob_dc_cost(dc_datas, 0, step, fill_ytob_row, rb_scratch, &mut price);
     let mut best = (base_cost - COLOR_CORRELATION_HEADER_BITS, 0i32);
     let candidates = (seed - WINDOW).max(-YTOB_DC_LIMIT)..=(seed + WINDOW).min(YTOB_DC_LIMIT);
     for k in candidates.filter(|&k| k != 0) {
-        let cost = ytob_dc_cost(dc_datas, k, step, fill_ytob_row, ry_scratch, rb_scratch);
+        let cost = ytob_dc_cost(dc_datas, k, step, fill_ytob_row, rb_scratch, &mut price);
         if cost < best.0 {
             best = (cost, k);
+        }
+    }
+    best.1
+}
+
+/// ExtraSlow B search: retain the fitted candidate window, but quantize every
+/// candidate from the source and rank it in pooled weighted-predictor contexts.
+pub(crate) fn choose_ytob_dc_weighted(
+    dc_datas: &[DcGroupData],
+    ctx: &EncodingContext,
+    scale_dc: f32,
+    dc_step: [f32; 3],
+    rb_scratch: &mut Vec<i32>,
+    ry_scratch: &mut Vec<i32>,
+) -> i32 {
+    if dc_datas.is_empty() || dc_datas.iter().any(|dc| dc.source_dc_b.is_none()) {
+        return 0;
+    }
+    let cfl = ctx.cfl_frame();
+    let step = (INV_DC_QUANT[2] / dc_step[2] * (DC_QUANT[1] * dc_step[1])) / cfl.color_factor;
+    let seed = ytob_dc_seed(
+        dc_datas,
+        ctx.accumulate_ytob_weights,
+        ctx.fill_ytob_residuals,
+        rb_scratch,
+        ry_scratch,
+        step,
+    );
+    let mut price = crate::frame::DcPlanePrice::default();
+    let mut levels = Vec::new();
+    let mut cost = |k| {
+        ytob_dc_weighted_bits(
+            dc_datas,
+            k,
+            INV_DC_QUANT[2] / dc_step[2] * scale_dc,
+            dc_step,
+            cfl,
+            ctx.quantize_dc_cfl,
+            &mut price,
+            &mut levels,
+        )
+    };
+    let header = if cfl == CflFrame::XYB {
+        COLOR_CORRELATION_HEADER_BITS
+    } else {
+        0.0
+    };
+    let mut best = (cost(0), 0);
+    const WINDOW: i32 = 6;
+    for k in ((seed - WINDOW).max(-YTOB_DC_LIMIT)..=(seed + WINDOW).min(YTOB_DC_LIMIT))
+        .filter(|&k| k != 0)
+    {
+        let bits = cost(k) + header;
+        if bits < best.0 {
+            best = (bits, k);
         }
     }
     best.1
@@ -1244,6 +1347,36 @@ pub(crate) fn dc_cfl_factor_x(dc_step: [f32; 3], base_x: f32) -> f32 {
 struct XdcCost {
     bits: f64,
     distortion: f64,
+}
+
+/// Re-quantize B directly from its fractional source, including the zero
+/// candidate, as `validate_ytob_dc` does. Pool weighted-predictor contexts
+/// across groups using the DC coder's shared walk.
+#[allow(clippy::too_many_arguments)]
+fn ytob_dc_weighted_bits(
+    dc_datas: &[DcGroupData],
+    k: i32,
+    scale: f32,
+    dc_step: [f32; 3],
+    cfl: CflFrame,
+    quantize: crate::group::QuantizeDcCflFn,
+    price: &mut crate::frame::DcPlanePrice,
+    levels: &mut Vec<i16>,
+) -> f64 {
+    let factor = dc_cfl_factor(dc_step, k, cfl);
+    price.clear();
+    for dc in dc_datas {
+        let source = dc.source_dc_b.as_ref().unwrap();
+        let (w, h) = (source.xsize(), source.ysize());
+        levels.resize(w * h, 0);
+        for y in 0..h {
+            let luma = dc.quant_dc.plane_row(1, y);
+            let row = &mut levels[y * w..][..w];
+            quantize(source.row(y), luma, scale, factor, row);
+        }
+        price.add(levels, w, h, w);
+    }
+    price.bits()
 }
 
 /// Confirm the gradient proposal under the coder's default weighted
@@ -1299,17 +1432,17 @@ fn ytox_dc_cost(
     dc_step: [f32; 3],
     cfl: CflFrame,
     quantize: crate::group::QuantizeDcCflFn,
-    previous: &mut [i16],
+    price: &mut DcGradientPrice,
     current: &mut [i16],
 ) -> XdcCost {
     let ratio = y_to_x_ratio(cfl, k as i8);
     let factor = dc_cfl_factor_x(dc_step, ratio);
-    let (mut hist, mut extra, mut total) = ([0u64; 64], 0u64, 0u64);
+    price.clear();
     let mut distortion = 0.0;
     for dc in dc_datas {
         let source = dc.source_dc_x.as_ref().unwrap();
         let w = source.xsize();
-        let (mut previous, mut current) = (&mut previous[..w], &mut current[..w]);
+        let current = &mut current[..w];
         for y in 0..source.ysize() {
             let luma = dc.quant_dc.plane_row(1, y);
             if k == 0 {
@@ -1317,27 +1450,14 @@ fn ytox_dc_cost(
             } else {
                 quantize(source.row(y), luma, scale, factor, current);
             }
-            for x in 0..w {
-                let pred = if y == 0 {
-                    if x == 0 { 0 } else { i32::from(current[x - 1]) }
-                } else if x == 0 {
-                    i32::from(previous[x])
-                } else {
-                    grad_predict(
-                        i32::from(previous[x]),
-                        i32::from(current[x - 1]),
-                        i32::from(previous[x - 1]),
-                    )
-                };
-                add_ytob_token(i32::from(current[x]) - pred, &mut hist, &mut extra);
-                let target = fmla(source.row(y)[x], scale, -(luma[x] as f32) * factor);
-                distortion += f64::from(target - current[x] as f32).powi(2);
+            price.add_row(current, y == 0);
+            for ((&src, &luma), &level) in source.row(y).iter().zip(luma).zip(current.iter()) {
+                let target = fmla(src, scale, -(luma as f32) * factor);
+                distortion += f64::from(target - f32::from(level)).powi(2);
             }
-            std::mem::swap(&mut previous, &mut current);
         }
-        total += (source.xsize() * source.ysize()) as u64;
     }
-    let bits = dc_histogram_bits(&hist, extra, total);
+    let bits = price.bits();
     XdcCost { bits, distortion }
 }
 
@@ -1362,7 +1482,7 @@ pub(crate) fn choose_ytox_dc(
         .map(|dc| dc.quant_dc.xsize())
         .max()
         .unwrap_or(0);
-    let mut previous = vec![0i16; width];
+    let mut gradient_price = DcGradientPrice::default();
     let mut current = vec![0i16; width];
     let scale = INV_DC_QUANT[0] / dc_step[0] * scale_dc;
     let base = ytox_dc_cost(
@@ -1372,7 +1492,7 @@ pub(crate) fn choose_ytox_dc(
         dc_step,
         cfl,
         quantize,
-        &mut previous,
+        &mut gradient_price,
         &mut current,
     );
     let header = if header_already_paid || cfl != CflFrame::XYB {
@@ -1381,8 +1501,6 @@ pub(crate) fn choose_ytox_dc(
         COLOR_CORRELATION_HEADER_BITS
     };
     let (mut best_bits, mut best_k) = (base.bits, 0);
-    #[cfg(test)]
-    let mut best_cost = base;
     for k in (-128..=127).filter(|&k| k != 0) {
         let cost = ytox_dc_cost(
             dc_datas,
@@ -1391,16 +1509,12 @@ pub(crate) fn choose_ytox_dc(
             dc_step,
             cfl,
             quantize,
-            &mut previous,
+            &mut gradient_price,
             &mut current,
         );
         if cost.distortion <= base.distortion && cost.bits + header < best_bits {
             best_bits = cost.bits + header;
             best_k = k;
-            #[cfg(test)]
-            {
-                best_cost = cost;
-            }
         }
     }
     if best_k != 0 {
@@ -1408,14 +1522,8 @@ pub(crate) fn choose_ytox_dc(
         let proposed_bits = ytox_dc_weighted_bits(dc_datas, best_k, scale, dc_step, cfl, quantize);
         if proposed_bits + header >= base_bits {
             best_k = 0;
-            #[cfg(test)]
-            {
-                best_cost = base;
-            }
         }
     }
-    #[cfg(test)]
-    XDC_STUDY.set(Some((best_k, base, best_cost)));
     if best_k != 0 {
         let factor = dc_cfl_factor_x(dc_step, y_to_x_ratio(cfl, best_k as i8));
         for dc in dc_datas {
@@ -1427,13 +1535,6 @@ pub(crate) fn choose_ytox_dc(
         }
     }
     best_k
-}
-
-#[cfg(test)]
-thread_local! {
-    static XDC_STUDY: std::cell::Cell<Option<(i32, XdcCost, XdcCost)>> = const {
-        std::cell::Cell::new(None)
-    };
 }
 
 /// DC step candidates per channel: the default and finer ones a percent
@@ -1467,6 +1568,7 @@ pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
 /// images have no such value and keep the default, which costs no header.
 pub(crate) fn choose_dc_steps(
     dc_datas: &[DcGroupData],
+    ctx: &EncodingContext,
     scale_dc: f32,
     ytob_dc: i32,
     base_step: [f32; 3],
@@ -1480,43 +1582,21 @@ pub(crate) fn choose_dc_steps(
         return default;
     }
     let candidates: [f32; DC_STEP_CANDIDATES] = std::array::from_fn(|k| 1.0 - 0.01 * k as f32);
-    let predict = |current: &[i32], previous: &[i32], x: usize, y: usize| {
-        if y == 0 {
-            if x == 0 { 0 } else { current[x - 1] }
-        } else if x == 0 {
-            previous[x]
-        } else {
-            grad_predict(previous[x], current[x - 1], previous[x - 1])
-        }
-    };
-    let total: u64 = dc_datas
-        .iter()
-        .map(|dc| (dc.quant_dc.xsize() * dc.quant_dc.ysize()) as u64)
-        .sum();
     // Y levels under `step_y`, and their rate.
-    let quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
+    let mut y_price = DcGradientPrice::default();
+    let mut quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
         let factor_y = INV_DC_QUANT[1] / (base_step[1] * step_y) * scale_dc;
-        let (mut hist, mut extra) = ([0u64; 64], 0u64);
+        y_price.clear();
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_y.as_ref().unwrap();
             let w = source.xsize();
             for y in 0..source.ysize() {
-                let (above, row) = levels.split_at_mut(y * w);
-                let row = &mut row[..w];
-                for (level, &value) in row.iter_mut().zip(source.row(y)) {
-                    *level = (value * factor_y).round() as i32;
-                }
-                let previous = if y == 0 {
-                    &row[..0]
-                } else {
-                    &above[(y - 1) * w..]
-                };
-                for x in 0..w {
-                    add_ytob_token(row[x] - predict(row, previous, x, y), &mut hist, &mut extra);
-                }
+                let row = &mut levels[y * w..][..w];
+                (ctx.quantize_dc_i32)(source.row(y), factor_y, row);
+                y_price.add_row(row, y == 0);
             }
         }
-        dc_histogram_bits(&hist, extra, total)
+        y_price.bits()
     };
     // Rate of B under both steps, against the Y levels of `step_y`.
     let max_width = dc_datas
@@ -1524,8 +1604,8 @@ pub(crate) fn choose_dc_steps(
         .map(|dc| dc.quant_dc.xsize())
         .max()
         .unwrap_or(0);
-    let mut previous = vec![0i32; max_width];
     let mut current = vec![0i32; max_width];
+    let mut b_price = DcGradientPrice::default();
     let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
         let factor_b = INV_DC_QUANT[2] / (base_step[2] * step_b) * scale_dc;
         let cfl = dc_cfl_factor(
@@ -1533,24 +1613,18 @@ pub(crate) fn choose_dc_steps(
             ytob_dc,
             cfl,
         );
-        let (mut hist, mut extra) = ([0u64; 64], 0u64);
+        b_price.clear();
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_b.as_ref().unwrap();
             let w = source.xsize();
-            let (mut previous, mut current) = (&mut previous[..w], &mut current[..w]);
+            let current = &mut current[..w];
             for y in 0..source.ysize() {
                 let luma = &levels[y * w..][..w];
-                for ((level, &value), &luma) in current.iter_mut().zip(source.row(y)).zip(luma) {
-                    *level = fmla(value, factor_b, -(luma as f32) * cfl).round() as i32;
-                }
-                for x in 0..w {
-                    let pred = predict(current, previous, x, y);
-                    add_ytob_token(current[x] - pred, &mut hist, &mut extra);
-                }
-                std::mem::swap(&mut current, &mut previous);
+                (ctx.quantize_dc_cfl_i32)(source.row(y), luma, factor_b, cfl, current);
+                b_price.add_row(current, y == 0);
             }
         }
-        dc_histogram_bits(&hist, extra, total)
+        b_price.bits()
     };
     let mut y_levels: Vec<Vec<i32>> = dc_datas
         .iter()
@@ -1625,10 +1699,10 @@ pub(crate) fn validate_ytob_dc(
     if candidate == 0 {
         return 0;
     }
-    let cost = |k: i32| {
-        let mut hist = [0u64; 64];
-        let mut extra = 0u64;
-        let mut total = 0u64;
+    let mut price = DcGradientPrice::default();
+    let mut current = Vec::new();
+    let mut cost = |k: i32| {
+        price.clear();
         let cfl = dc_cfl_factor(dc_step, k, cfl_frame);
         for dc in dc_datas {
             let Some(source) = &dc.source_dc_b else {
@@ -1636,8 +1710,7 @@ pub(crate) fn validate_ytob_dc(
             };
             let w = source.xsize();
             let h = source.ysize();
-            let mut previous = vec![0i16; w];
-            let mut current = vec![0i16; w];
+            current.resize(w, 0i16);
             for y in 0..h {
                 let yr = dc.quant_dc.plane_row(1, y);
                 quantize(
@@ -1647,25 +1720,10 @@ pub(crate) fn validate_ytob_dc(
                     cfl,
                     &mut current,
                 );
-                for x in 0..w {
-                    let pred = if y == 0 {
-                        if x == 0 { 0 } else { current[x - 1] as i32 }
-                    } else if x == 0 {
-                        previous[x] as i32
-                    } else {
-                        grad_predict(
-                            previous[x] as i32,
-                            current[x - 1] as i32,
-                            previous[x - 1] as i32,
-                        )
-                    };
-                    add_ytob_token(current[x] as i32 - pred, &mut hist, &mut extra);
-                }
-                std::mem::swap(&mut current, &mut previous);
+                price.add_row(&current, y == 0);
             }
-            total += (w * h) as u64;
         }
-        dc_histogram_bits(&hist, extra, total)
+        price.bits()
     };
     let base = cost(0);
     let proposed = cost(candidate);
@@ -1679,6 +1737,73 @@ pub(crate) fn validate_ytob_dc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gradient_dc_price_matches_group_local_reference() {
+        fn check<T: Copy>(sample: impl Fn(usize) -> T)
+        where
+            i32: From<T>,
+        {
+            let mut price = DcGradientPrice::default();
+            for candidate in 0..3 {
+                price.clear();
+                let (mut hist, mut extra, mut total) = ([0u64; 64], 0u64, 0u64);
+                // Reuse scratch across changing group sizes, including empty
+                // planes, one-column/one-row planes, SIMD widths and tails.
+                for w in [33, 1, 0, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 64, 65, 257] {
+                    for h in [0, 1, 2, 5] {
+                        let data: Vec<T> = (0..w * h).map(|i| sample(i + candidate * 97)).collect();
+                        for y in 0..h {
+                            let row = &data[y * w..][..w];
+                            price.add_row(row, y == 0);
+                            for x in 0..w {
+                                let left = if x > 0 {
+                                    i32::from(row[x - 1])
+                                } else if y > 0 {
+                                    i32::from(data[(y - 1) * w + x])
+                                } else {
+                                    0
+                                };
+                                let north = if y > 0 {
+                                    i32::from(data[(y - 1) * w + x])
+                                } else {
+                                    left
+                                };
+                                let northwest = if x > 0 && y > 0 {
+                                    i32::from(data[(y - 1) * w + x - 1])
+                                } else {
+                                    left
+                                };
+                                let prediction = (i64::from(north) + i64::from(left)
+                                    - i64::from(northwest))
+                                .clamp(i64::from(north.min(left)), i64::from(north.max(left)));
+                                let residual = (i64::from(i32::from(row[x])) - prediction) as i32;
+                                let (token, nbits, _) = crate::entropy::uint_encode(
+                                    crate::entropy::pack_signed(residual),
+                                );
+                                hist[(token as usize).min(hist.len() - 1)] += 1;
+                                extra += u64::from(nbits);
+                            }
+                        }
+                        total += (w * h) as u64;
+                    }
+                }
+                assert_eq!(price.hist, hist);
+                assert_eq!(price.extra_bits, extra);
+                assert_eq!(price.total, total);
+                assert_eq!(price.bits(), dc_histogram_bits(&hist, extra, total));
+            }
+        }
+
+        let sample = |i: usize| match i % 5 {
+            0 => i16::MIN,
+            1 => i16::MAX,
+            2 => 0,
+            _ => (i.wrapping_mul(7919) ^ i.wrapping_mul(104729)) as i16,
+        };
+        check(sample);
+        check(|i| i32::from(sample(i)) * 31);
+    }
 
     fn x_dc_fixture(k: i32, fraction: f32, w: usize, h: usize) -> DcGroupData {
         let ctx = EncodingContext::default();
@@ -1781,7 +1906,7 @@ mod tests {
         // It would be cheap to store a zero residual, but a 0.49 phase has
         // much worse error than the baseline's nearest source rounding.
         let mut groups = [x_dc_fixture(5, 0.49, 48, 48)];
-        let mut previous = vec![0; 48];
+        let mut gradient_price = DcGradientPrice::default();
         let mut current = vec![0; 48];
         let base = ytox_dc_cost(
             &groups,
@@ -1790,7 +1915,7 @@ mod tests {
             [1.0; 3],
             CflFrame::XYB,
             ctx.quantize_dc_cfl,
-            &mut previous,
+            &mut gradient_price,
             &mut current,
         );
         let cheap = ytox_dc_cost(
@@ -1800,7 +1925,7 @@ mod tests {
             [1.0; 3],
             CflFrame::XYB,
             ctx.quantize_dc_cfl,
-            &mut previous,
+            &mut gradient_price,
             &mut current,
         );
         assert!(cheap.bits < base.bits);
@@ -1821,7 +1946,7 @@ mod tests {
             [1.0; 3],
             CflFrame::XYB,
             ctx.quantize_dc_cfl,
-            &mut previous,
+            &mut gradient_price,
             &mut current,
         );
         assert!(actual.distortion <= base.distortion);
@@ -2259,7 +2384,14 @@ mod tests {
             |_, _| 0.0,
             |x, y| (40.5 + 0.2 * flicker(x, y)) / INV_DC_QUANT[2],
         );
-        let steps = choose_dc_steps(&[flat], 1.0, 0, [1.0; 3], CflFrame::XYB);
+        let steps = choose_dc_steps(
+            &[flat],
+            &EncodingContext::default(),
+            1.0,
+            0,
+            [1.0; 3],
+            CflFrame::XYB,
+        );
         assert_eq!(steps[0], 1.0);
         assert!(steps[2] < 1.0, "{steps:?}");
         // The chosen step is what the decoder reads back.
@@ -2289,14 +2421,28 @@ mod tests {
             |x, y| blue(x, y) / INV_DC_QUANT[2],
         );
         assert_eq!(
-            choose_dc_steps(&[textured], 1.0, 0, [1.0; 3], CflFrame::XYB),
+            choose_dc_steps(
+                &[textured],
+                &EncodingContext::default(),
+                1.0,
+                0,
+                [1.0; 3],
+                CflFrame::XYB,
+            ),
             [1.0; 3]
         );
         assert!(dc_step_wire([1.0; 3]).is_none());
         // Without the first pass's sources there is nothing to choose from.
         let bare = DcGroupData::new(48, 48).unwrap();
         assert_eq!(
-            choose_dc_steps(&[bare], 1.0, 0, [1.0; 3], CflFrame::XYB),
+            choose_dc_steps(
+                &[bare],
+                &EncodingContext::default(),
+                1.0,
+                0,
+                [1.0; 3],
+                CflFrame::XYB,
+            ),
             [1.0; 3]
         );
     }
@@ -2357,6 +2503,82 @@ mod tests {
             ),
             0
         );
+        assert_eq!(
+            choose_ytob_dc_weighted(
+                &groups,
+                &ctx,
+                1.0,
+                [1.0; 3],
+                &mut Vec::new(),
+                &mut Vec::new(),
+            ),
+            0,
+            "weighted search must also reject the invented rounding gain"
+        );
+    }
+
+    #[test]
+    fn weighted_b_dc_search_handles_group_borders_steps_and_missing_source() {
+        let ctx = EncodingContext::default();
+        let cfl = CflFrame {
+            base_b: 0.75,
+            color_factor: 128.0,
+            ..CflFrame::XYB
+        };
+        ctx.set_cfl_frame(cfl);
+        let steps = [0.9, 1.1, 0.8];
+        let scale_dc = 0.71;
+        let k = 17;
+        let scale = INV_DC_QUANT[2] / steps[2] * scale_dc;
+        let factor = dc_cfl_factor(steps, k, cfl);
+        let mut groups = Vec::new();
+        let mut state = 19u32;
+        for (w, h) in [(1, 65), (65, 1), (7, 5)] {
+            let mut dc = DcGroupData::new(w, h).unwrap();
+            let mut source = crate::image::Plane::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let luma = ((state >> 16) % 4001) as i16 - 2000;
+                    dc.quant_dc.plane_row_mut(1, y)[x] = luma;
+                    source.row_mut(y)[x] = factor * f32::from(luma) / scale;
+                }
+                let [_, luma, b] = dc.quant_dc.all_plane_rows_mut(y);
+                (ctx.quantize_dc_cfl)(source.row(y), luma, scale, dc_cfl_factor(steps, 0, cfl), b);
+            }
+            dc.source_dc_b = Some(source);
+            groups.push(dc);
+        }
+        let original: Vec<_> = groups
+            .iter()
+            .map(|dc| dc.quant_dc.plane(2).as_slice().to_vec())
+            .collect();
+        assert_eq!(
+            choose_ytob_dc_weighted(
+                &groups,
+                &ctx,
+                scale_dc,
+                steps,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            ),
+            k
+        );
+        for (dc, original) in groups.iter().zip(original) {
+            assert_eq!(dc.quant_dc.plane(2).as_slice(), original);
+        }
+        groups[1].source_dc_b = None;
+        assert_eq!(
+            choose_ytob_dc_weighted(
+                &groups,
+                &ctx,
+                scale_dc,
+                steps,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            ),
+            0
+        );
     }
 
     #[test]
@@ -2373,8 +2595,27 @@ mod tests {
                 }
             }
             dc.source_dc_b = Some(source);
+            let groups = [dc];
             assert_eq!(
-                validate_ytob_dc(&[dc], k, 1.0, [1.0; 3], CflFrame::XYB, ctx.quantize_dc_cfl),
+                validate_ytob_dc(
+                    &groups,
+                    k,
+                    1.0,
+                    [1.0; 3],
+                    CflFrame::XYB,
+                    ctx.quantize_dc_cfl
+                ),
+                k
+            );
+            assert_eq!(
+                choose_ytob_dc_weighted(
+                    &groups,
+                    &ctx,
+                    1.0,
+                    [1.0; 3],
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                ),
                 k
             );
         }

@@ -462,13 +462,13 @@ impl OrderStats {
     /// over positions gives the expected walk length. Positions are treated as
     /// independent — an approximation, but enough to rank two scans.
     fn expected_walk(&self, slot: usize, channel: usize, order: &[u32], llf: usize) -> f64 {
-        let blocks = self.blocks[slot].max(1) as f64;
+        let blocks = 1.0 / self.blocks[slot].max(1) as f64;
         let counts = &self.counts[slot][channel];
         let mut none_at_or_after = 1.0f64;
         let mut expected = 0.0f64;
         for &raw in order[llf..].iter().rev() {
             expected += 1.0 - none_at_or_after;
-            let p = (counts[raw as usize] as f64 / blocks).clamp(0.0, 1.0);
+            let p = (counts[raw as usize] as f64 * blocks).clamp(0.0, 1.0);
             none_at_or_after *= 1.0 - p;
         }
         expected
@@ -563,6 +563,26 @@ pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) -> f64 {
     }
 }
 
+/// Propose frequency-derived scans without pricing their walk or permutation.
+/// ExtraSlow races these against the natural scans after quantization, using
+/// the final entropy codes and the actual serialized permutation cost.
+pub(crate) fn propose_orders(stats: &OrderStats, out: &mut CoeffOrders) {
+    debug_assert_eq!(out.used_mask, 0);
+    for (slot, &(order_index, llf, _)) in ORDER_SPECS.iter().enumerate() {
+        if stats.blocks_in(slot) < MIN_BLOCKS_FOR_ORDER {
+            continue;
+        }
+        for channel in 0..3 {
+            let natural = &out.orders[slot][channel];
+            let candidate = stats.derive(slot, channel, natural, llf);
+            if candidate.as_slice() != natural.as_ref() {
+                out.orders[slot][channel] = Cow::Owned(candidate);
+                out.used_mask |= 1 << order_index;
+            }
+        }
+    }
+}
+
 impl CoeffOrders {
     /// Scan table (scan position -> raw coefficient index) for a strategy and
     /// channel. Hoist this out of per-coefficient loops so the lookup stays a
@@ -584,6 +604,32 @@ impl CoeffOrders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entropy_candidates_do_not_use_the_walk_or_permutation_gate() {
+        let mut stats = OrderStats::new();
+        for _ in 0..MIN_BLOCKS_FOR_ORDER {
+            stats.tally_block(0);
+        }
+        stats.counts[0][0].fill(32);
+        let natural = CoeffOrders::natural();
+        let last = *natural.orders[0][0].last().unwrap() as usize;
+        stats.counts[0][0][last] = 33;
+        let mut gated = CoeffOrders::natural();
+        derive_orders(&stats, &mut gated);
+        assert_eq!(gated.used_mask, 0);
+        let mut proposed = CoeffOrders::natural();
+        propose_orders(&stats, &mut proposed);
+        assert_eq!(proposed.used_mask, 1);
+        assert_eq!(proposed.orders[0][0][0], natural.orders[0][0][0]);
+        assert_eq!(proposed.orders[0][0][1], last as u32);
+        assert_eq!(proposed.orders[0][1..], natural.orders[0][1..]);
+        assert_eq!(proposed.orders[1..], natural.orders[1..]);
+        stats.blocks[0] -= 1;
+        let mut sparse = CoeffOrders::natural();
+        propose_orders(&stats, &mut sparse);
+        assert_eq!(sparse.used_mask, 0);
+    }
 
     #[test]
     fn sparse_order_statistics_preserve_dense_counts_and_derived_scans() {

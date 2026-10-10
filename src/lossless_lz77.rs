@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use super::{NUM_TREE_CONTEXTS, build_balanced_tree_tokens, build_balanced_tree_tokens_offsets};
-use crate::adaptive_quant::dirty_log2f;
+use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS, LzEntropyScratch};
 use crate::entropy::{
@@ -901,18 +901,18 @@ impl MatchPrices {
             for symbol in LZ77_MIN_SYMBOL as usize..PRICE_SYMBOLS {
                 let count = counts[context * PRICE_SYMBOLS + symbol];
                 if count != 0 {
-                    length += count as f64 * (totals[context] as f64 / count as f64).log2();
+                    length += count as f64 * f_log2(totals[context] as f64 / count as f64);
                 }
             }
         }
-        let unseen = ((matches + 1) as f32).log2();
+        let unseen = dirty_log2p1f(matches as f32);
         Self {
             length: (length / matches as f64) as f32,
             distance: distances.map(|count| {
                 if count == 0 {
                     unseen
                 } else {
-                    (matches as f32 / count as f32).log2()
+                    dirty_log2f(matches as f32 / count as f32)
                 }
             }),
         }
@@ -2658,6 +2658,45 @@ mod tests {
             let second = lz77_compress_priced(&tokens, &prices, &learned, probes, &mut scratch)
                 .expect("still pays under learned prices");
             assert!(same_values(&expand(&second), &tokens));
+        }
+    }
+
+    #[test]
+    fn learned_match_prices_agree_with_independent_log_probabilities() {
+        // Three matches among twelve context-0 tokens; context 1 has two
+        // matches of one length and three of another, across a second stream.
+        let mut first = vec![LzToken::pixel(0, 7); 9];
+        first.extend([LzToken::lz77(0, 0, 1); 3]);
+        let mut second = vec![LzToken::lz77(1, 0, 1); 2];
+        second.extend([LzToken::lz77(1, 1, 2); 3]);
+        let prices = MatchPrices::learned(&[&first, &second], 3);
+        let length =
+            (3.0 * 4.0f64.log2() + 2.0 * 2.5f64.log2() + 3.0 * (5.0f64 / 3.0).log2()) / 8.0;
+        assert!((f64::from(prices.length) - length).abs() < 2.0e-6);
+        for (symbol, reference) in [
+            (1, (8.0f64 / 5.0).log2()),
+            (2, (8.0f64 / 3.0).log2()),
+            (3, 9.0f64.log2()), // An unseen distance costs log2(matches + 1).
+        ] {
+            assert!((f64::from(prices.distance[symbol]) - reference).abs() < 2.0e-6);
+        }
+        assert!(
+            prices
+                .distance
+                .iter()
+                .all(|&price| price.is_finite() && price >= 0.0)
+        );
+
+        let only_match = [LzToken::lz77(0, 0, 1)];
+        let prices = MatchPrices::learned(&[&only_match], 3);
+        assert_eq!(prices.length, 0.0); // log2(1) stays exactly zero.
+        assert_eq!(prices.distance[1], 0.0);
+        assert_eq!(prices.distance[2], 1.0);
+        for stream in [&[][..], &first[..9]] {
+            let prices = MatchPrices::learned(&[stream], 3);
+            let defaults = MatchPrices::initial();
+            assert_eq!(prices.length, defaults.length);
+            assert_eq!(prices.distance, defaults.distance);
         }
     }
 

@@ -101,6 +101,9 @@ effort_gates! {
     chroma_deadzone,
     yellow_opsin,
     coeff_orders,
+    /// Race frequency-derived coefficient orders against natural scans using
+    /// serialized permutation headers and final entropy-coded AC streams.
+    coeff_order_entropy_race,
     /// Re-tokenize on the custom orders before pricing RDOQ however little
     /// the scans moved (otherwise only past `RDOQ_FRESH_PRICES_MIN_SCAN_MOVE`).
     rdoq_fresh_prices,
@@ -112,6 +115,8 @@ effort_gates! {
     /// Frame-level X DC chroma-from-luma search on the unrounded source,
     /// under the final luma levels and DC quantization steps.
     dc_x_cfl,
+    /// Rank B DC CfL slopes with weighted prediction in pooled WP-error contexts.
+    dc_cfl_weighted,
     ans_refine,
     /// Broader final hybrid-uint and ANS-table search.
     ans_exhaustive,
@@ -205,6 +210,8 @@ const MEDIUM: Effort = Effort {
 };
 
 const SLOW: Effort = Effort {
+    coeff_order_entropy_race: false,
+    dc_cfl_weighted: false,
     large_transform_rdoq: false,
     rdoq_fresh_prices: false,
     ans_exhaustive: false,
