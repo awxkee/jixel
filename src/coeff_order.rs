@@ -462,13 +462,13 @@ impl OrderStats {
     /// over positions gives the expected walk length. Positions are treated as
     /// independent — an approximation, but enough to rank two scans.
     fn expected_walk(&self, slot: usize, channel: usize, order: &[u32], llf: usize) -> f64 {
-        let blocks = self.blocks[slot].max(1) as f64;
+        let blocks = 1.0 / self.blocks[slot].max(1) as f64;
         let counts = &self.counts[slot][channel];
         let mut none_at_or_after = 1.0f64;
         let mut expected = 0.0f64;
         for &raw in order[llf..].iter().rev() {
             expected += 1.0 - none_at_or_after;
-            let p = (counts[raw as usize] as f64 / blocks).clamp(0.0, 1.0);
+            let p = (counts[raw as usize] as f64 * blocks).clamp(0.0, 1.0);
             none_at_or_after *= 1.0 - p;
         }
         expected

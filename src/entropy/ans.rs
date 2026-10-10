@@ -88,11 +88,17 @@ fn first_maximum(freqs: &[u16]) -> (usize, u16) {
 }
 
 pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
+    normalize_counts_first_maximum(counts, freqs);
+}
+
+/// Normalize and return the position of the first maximum frequency, which
+/// the deficit branch already knows without another scan.
+pub(crate) fn normalize_counts_first_maximum(counts: &[u32], freqs: &mut [u16]) -> usize {
     debug_assert_eq!(counts.len(), freqs.len());
     freqs.fill(0);
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     if total == 0 {
-        return;
+        return 0;
     }
     let table = ANS_TAB_SIZE as i64;
     let mut sum: i64 = 0;
@@ -113,7 +119,7 @@ pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
             // Incrementing the first maximum keeps it the first maximum,
             // so the entire deficit belongs to this same symbol.
             freqs[mi] += (table - sum) as u16;
-            break;
+            return mi;
         } else if mf > 1 {
             freqs[mi] -= 1;
             sum -= 1;
@@ -121,6 +127,23 @@ pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
             break;
         }
     }
+    first_maximum(freqs).0
+}
+
+/// Length of the populated alphabet prefix, scanning eight counts at a time
+/// since most of the 128-entry table is usually empty.
+pub(crate) fn populated_alphabet_size(counts: &[u32]) -> usize {
+    let (chunks, tail) = counts.as_chunks::<8>();
+    if let Some(i) = tail.iter().rposition(|&c| c != 0) {
+        return chunks.len() * 8 + i + 1;
+    }
+    for (k, chunk) in chunks.iter().enumerate().rev() {
+        if chunk.iter().fold(0u32, |acc, &c| acc | c) != 0 {
+            let i = chunk.iter().rposition(|&c| c != 0).unwrap_or(0);
+            return k * 8 + i + 1;
+        }
+    }
+    0
 }
 
 #[derive(Clone, Copy)]
@@ -874,7 +897,6 @@ fn histogram_cost(counts: &[u32], histogram: &AnsHistogram) -> f64 {
 /// per-call `Vec` allocations of the plain version dominated their time.
 pub(crate) struct AnsCostScratch {
     precise: AnsHistogram,
-    pub(crate) merged: [u32; TABLE_ENTRIES],
 }
 
 impl AnsCostScratch {
@@ -885,10 +907,7 @@ impl AnsCostScratch {
             omit_pos: 0,
             cost: 0.0,
         };
-        Self {
-            precise: blank(),
-            merged: [0; TABLE_ENTRIES],
-        }
+        Self { precise: blank() }
     }
 }
 
@@ -924,17 +943,13 @@ pub(crate) fn fast_ans_population_cost_scratch(
     scratch: &mut AnsCostScratch,
 ) -> f64 {
     debug_assert_eq!(counts.len(), TABLE_ENTRIES);
-    let mut alphabet_size = counts.len();
-    while alphabet_size > 0 && counts[alphabet_size - 1] == 0 {
-        alphabet_size -= 1;
-    }
+    let alphabet_size = populated_alphabet_size(counts);
     let precise = &mut scratch.precise;
     // Normalization preserves zero counts. Keep the reusable buffers at the
     // active alphabet length so cost/table scans do not revisit zero tails.
     let counts = &counts[..alphabet_size];
     precise.freqs.resize(alphabet_size, 0);
-    normalize_counts_into(counts, &mut precise.freqs);
-    let (omit_pos, _) = first_maximum(&precise.freqs);
+    let omit_pos = normalize_counts_first_maximum(counts, &mut precise.freqs);
     precise.method = 12;
     precise.omit_pos = omit_pos as u8;
     if alphabet_size == 0 {
@@ -1141,6 +1156,24 @@ fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
             4 + floor_log2(n as u32) as usize
         }
     }
+    fn width(freq: u16) -> usize {
+        (u16::BITS - freq.leading_zeros()) as usize
+    }
+    // Runs cannot cross the omitted count, whose width may be artificial.
+    fn flush_run(bits: &mut usize, freq: u16, run: usize) {
+        if run == 0 {
+            return;
+        }
+        let width = width(freq);
+        let entry_bits = K_BIT_WIDTH_LENGTHS[width] as usize + width.saturating_sub(1);
+        if run >= 5 {
+            *bits += entry_bits
+                + K_BIT_WIDTH_LENGTHS[ANS_LOG_TAB_SIZE as usize + 1] as usize
+                + varlen_bits(run - 5);
+        } else {
+            *bits += run * entry_bits;
+        }
+    }
 
     let alphabet_size = histogram
         .freqs
@@ -1149,44 +1182,54 @@ fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
         .map_or(0, |i| i + 1);
     let freqs = &histogram.freqs[..alphabet_size];
     let omit_pos = histogram.omit_pos as usize;
-    // Only the first three occupied positions are needed to detect small
-    // tables. For larger ones, maximum reductions find the omitted width
-    // without a branch and bit-width calculation for every population.
-    let mut symbols = freqs.iter().enumerate().filter(|&(_, &freq)| freq != 0);
-    let Some((first, _)) = symbols.next() else {
-        return 3;
-    };
-    let Some((second, _)) = symbols.next() else {
-        return 2 + varlen_bits(first);
-    };
-    if symbols.next().is_none() {
-        return 2 + varlen_bits(first) + varlen_bits(second) + ANS_LOG_TAB_SIZE as usize;
-    }
-    let before = freqs[..omit_pos].iter().copied().max().unwrap_or(0);
-    let after = freqs[omit_pos + 1..].iter().copied().max().unwrap_or(0);
-    let omit_width = 10
-        .max((u16::BITS - before.leading_zeros()) as usize + 1)
-        .max((u16::BITS - after.leading_zeros()) as usize);
-
-    // Non-small, non-flat, method 12, alphabet size, and the omitted width.
-    let mut bits = 8 + varlen_bits(alphabet_size - 3) + K_BIT_WIDTH_LENGTHS[omit_width] as usize;
-    // Runs cannot cross the omitted count, whose width may be artificial.
-    for mut remaining in [&freqs[..omit_pos], &freqs[omit_pos + 1..]] {
-        while let Some((&freq, rest)) = remaining.split_first() {
-            let run = 1 + rest.iter().take_while(|&&f| f == freq).count();
-            let width = (u16::BITS - freq.leading_zeros()) as usize;
-            let entry_bits = K_BIT_WIDTH_LENGTHS[width] as usize + width.saturating_sub(1);
-            if run >= 5 {
-                bits += entry_bits
-                    + K_BIT_WIDTH_LENGTHS[ANS_LOG_TAB_SIZE as usize + 1] as usize
-                    + varlen_bits(run - 5);
-            } else {
-                bits += run * entry_bits;
+    // One pass gathers the first occupied positions (small tables), the
+    // maxima on either side of the omitted count (its width) and the
+    // run-length coded entries on both sides.
+    let mut populated = 0usize;
+    let mut first = 0usize;
+    let mut second = 0usize;
+    let mut before = 0u16;
+    let mut after = 0u16;
+    let mut run_bits = 0usize;
+    let mut run_freq = 0u16;
+    let mut run = 0usize;
+    for (i, &freq) in freqs.iter().enumerate() {
+        if freq != 0 {
+            match populated {
+                0 => first = i,
+                1 => second = i,
+                _ => {}
             }
-            remaining = &remaining[run..];
+            populated += 1;
+        }
+        if i == omit_pos {
+            flush_run(&mut run_bits, run_freq, run);
+            run = 0;
+            continue;
+        }
+        if i < omit_pos {
+            before = before.max(freq);
+        } else {
+            after = after.max(freq);
+        }
+        if run != 0 && freq == run_freq {
+            run += 1;
+        } else {
+            flush_run(&mut run_bits, run_freq, run);
+            run_freq = freq;
+            run = 1;
         }
     }
-    bits
+    flush_run(&mut run_bits, run_freq, run);
+    match populated {
+        0 => return 3,
+        1 => return 2 + varlen_bits(first),
+        2 => return 2 + varlen_bits(first) + varlen_bits(second) + ANS_LOG_TAB_SIZE as usize,
+        _ => {}
+    }
+    let omit_width = 10.max(width(before) + 1).max(width(after));
+    // Non-small, non-flat, method 12, alphabet size, and the omitted width.
+    8 + varlen_bits(alphabet_size - 3) + K_BIT_WIDTH_LENGTHS[omit_width] as usize + run_bits
 }
 
 /// Exact table-overhead measurement. Full-precision cost probes can count

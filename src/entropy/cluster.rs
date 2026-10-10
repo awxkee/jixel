@@ -1194,9 +1194,8 @@ pub(crate) fn cluster_histograms_ans(
         }
     }
     fn merge_cost(a: &Histogram, b: &Histogram, s: &mut AnsCostScratch) -> f64 {
-        s.merged = a.counts;
-        add_counts(&mut s.merged, &b.counts);
-        let merged = s.merged;
+        let mut merged = a.counts;
+        add_counts(&mut merged, &b.counts);
         fast_ans_population_cost_scratch(&merged, 1, s)
     }
     /// `(0..n).map(f)` in index order, using the same workers across passes.
@@ -1250,27 +1249,35 @@ pub(crate) fn cluster_histograms_ans(
         context_map[..n].fill(0);
         return 1;
     }
+    // `merge[i * max_clusters + c]` holds `merge_cost(histograms[i], clusters[c])`
+    // for the cluster population it was priced against, or NaN. Seeding fills
+    // it for the assignment below, and the refinement passes keep every entry
+    // whose cluster no move touched, so a pass prices only changed clusters.
+    // Each reused value is the evaluation the pass would otherwise repeat.
+    let mut merge = vec![f64::NAN; n * max_clusters];
     while clusters.len() < max_clusters {
         clusters.push(histograms[seed].clone());
         cluster_costs.push(in_costs[seed]);
         dists[seed] = 0.0;
-        let last = &clusters[clusters.len() - 1];
-        let last_cost = cluster_costs[clusters.len() - 1];
-        let updated: Vec<f64> = {
+        let column = clusters.len() - 1;
+        let last = &clusters[column];
+        let last_cost = cluster_costs[column];
+        let updated: Vec<(f64, f64)> = {
             let dists = &dists;
             par_map(n, &mut workers, |i, s| {
                 let h = &histograms[i];
-                if h.total_count == 0 {
-                    return 0.0;
+                if h.total_count == 0 || dists[i] == 0.0 {
+                    return (0.0, f64::NAN);
                 }
-                if dists[i] == 0.0 {
-                    return 0.0;
-                }
-                let d = merge_cost(h, last, s) - in_costs[i] - last_cost;
-                dists[i].min(d)
+                let merged = merge_cost(h, last, s);
+                let d = merged - in_costs[i] - last_cost;
+                (dists[i].min(d), merged)
             })
         };
-        dists = updated;
+        for (i, (d, merged)) in updated.into_iter().enumerate() {
+            dists[i] = d;
+            merge[i * max_clusters + column] = merged;
+        }
         let mut next_seed = seed;
         let mut next_dist = 0.0f64;
         for (i, &d) in dists.iter().enumerate() {
@@ -1291,15 +1298,22 @@ pub(crate) fn cluster_histograms_ans(
     let mut assignment: Vec<u8> = {
         let clusters = &clusters;
         let cluster_costs = &cluster_costs;
+        let merge = &merge;
         par_map(n, &mut workers, |i, s| {
             let h = &histograms[i];
             if h.total_count == 0 {
                 return 0u8;
             }
+            let row = &merge[i * max_clusters..][..num_seeds];
             let mut best = 0usize;
             let mut best_d = f64::MAX;
-            for c in 0..num_seeds {
-                let d = merge_cost(h, &clusters[c], s) - cluster_costs[c];
+            for (c, &cached) in row.iter().enumerate() {
+                let merged = if cached.is_nan() {
+                    merge_cost(h, &clusters[c], s)
+                } else {
+                    cached
+                };
+                let d = merged - cluster_costs[c];
                 if d < best_d {
                     best_d = d;
                     best = c;
@@ -1324,42 +1338,90 @@ pub(crate) fn cluster_histograms_ans(
     };
     rebuild(&mut clusters, &mut cluster_costs, &assignment, &mut scratch);
 
+    // Rebuilding changed every cluster population.
+    let mut dirty = vec![true; num_seeds];
+    let mut without_costs = vec![f64::NAN; n];
     for _ in 0..refinement_passes {
         // Propose every context's best move against a snapshot of the
         // clusters, in parallel; then apply proposals in index order, each
         // re-priced against the current clusters (two cost evaluations per
         // proposer). Deterministic and independent of `threads`; subsequent
         // passes pick up moves the previous snapshot could not see.
-        let proposals: Vec<Option<u8>> = {
+        let dirty_clusters: Vec<usize> = (0..num_seeds).filter(|&c| dirty[c]).collect();
+        let dirty_slot: Vec<usize> = {
+            let mut slot = vec![usize::MAX; num_seeds];
+            for (k, &c) in dirty_clusters.iter().enumerate() {
+                slot[c] = k;
+            }
+            slot
+        };
+        let proposals: Vec<(Option<u8>, Option<f64>, Vec<f64>)> = {
             let clusters = &clusters;
             let cluster_costs = &cluster_costs;
             let assignment = &assignment;
+            let merge = &merge;
+            let without_costs = &without_costs;
+            let dirty = &dirty;
+            let dirty_clusters = &dirty_clusters;
+            let dirty_slot = &dirty_slot;
             par_map(n, &mut workers, |i, s| {
                 let h = &histograms[i];
                 if h.total_count == 0 {
-                    return None;
+                    return (None, None, Vec::new());
                 }
                 let old = assignment[i] as usize;
-                let mut without = clusters[old].clone();
-                histogram_sub(&mut without, h);
-                let remove_delta = cost_of(&without, s) - cluster_costs[old];
+                // Price the clusters that changed; the own cluster is never a
+                // move target, and any move away from it marks it changed.
+                let fresh: Vec<f64> = dirty_clusters
+                    .iter()
+                    .map(|&c| {
+                        if c == old {
+                            f64::NAN
+                        } else {
+                            merge_cost(h, &clusters[c], s)
+                        }
+                    })
+                    .collect();
+                let without = if dirty[old] || without_costs[i].is_nan() {
+                    let mut without = clusters[old].clone();
+                    histogram_sub(&mut without, h);
+                    Some(cost_of(&without, s))
+                } else {
+                    None
+                };
+                let remove_delta = without.unwrap_or(without_costs[i]) - cluster_costs[old];
+                let row = &merge[i * max_clusters..][..num_seeds];
                 let mut best = old;
                 let mut best_delta = 0.0f64;
                 for c in 0..num_seeds {
                     if c == old {
                         continue;
                     }
-                    let delta = remove_delta + merge_cost(h, &clusters[c], s) - cluster_costs[c];
+                    let merged = if dirty[c] {
+                        fresh[dirty_slot[c]]
+                    } else {
+                        row[c]
+                    };
+                    let delta = remove_delta + merged - cluster_costs[c];
                     if delta < best_delta - 0.01 {
                         best_delta = delta;
                         best = c;
                     }
                 }
-                (best != old).then_some(best as u8)
+                ((best != old).then_some(best as u8), without, fresh)
             })
         };
+        for (i, (_, without, fresh)) in proposals.iter().enumerate() {
+            if let Some(without) = without {
+                without_costs[i] = *without;
+            }
+            for (&c, &merged) in dirty_clusters.iter().zip(fresh) {
+                merge[i * max_clusters + c] = merged;
+            }
+        }
+        dirty.fill(false);
         let mut changed = false;
-        for (i, proposal) in proposals.iter().enumerate() {
+        for (i, (proposal, _, _)) in proposals.iter().enumerate() {
             let Some(best) = *proposal else { continue };
             let best = best as usize;
             let old = assignment[i] as usize;
@@ -1377,6 +1439,8 @@ pub(crate) fn cluster_histograms_ans(
                 cluster_costs[old] = without_cost;
                 cluster_costs[best] = with_cost;
                 assignment[i] = best as u8;
+                dirty[old] = true;
+                dirty[best] = true;
                 changed = true;
             }
         }
