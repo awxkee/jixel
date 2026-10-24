@@ -2072,13 +2072,25 @@ fn select_transforms(
             },
         };
         let band_count = pipeline.bands.len();
-        rerank_large_transforms(
-            &rerank,
-            scratch,
-            ac_strategy,
-            &mut pipeline.band_scratch[..band_count],
-            &mut pipeline.current_costs,
-        );
+        // Where the layout DP installs its layout, it re-decides every
+        // downgrade and upgrade these passes would make.
+        let dp_installs = ctx.speed.effort().layout_retile
+            && !ctx.speed.effort().layout_loop()
+            && ctx.coding.is_xyb();
+        if dp_installs {
+            pipeline.current_costs.fill(f32::NAN);
+            for band in &mut pipeline.band_scratch[..band_count] {
+                band.rerank_downgrades.clear();
+            }
+        } else {
+            rerank_large_transforms(
+                &rerank,
+                scratch,
+                ac_strategy,
+                &mut pipeline.band_scratch[..band_count],
+                &mut pipeline.current_costs,
+            );
+        }
 
         if scope.rectangles() && distance <= AFV_MAX_DISTANCE.max(FINE_TRANSFORM_MAX_DISTANCE) {
             let with_dct4 = distance <= SUB8_MAX_DISTANCE;
@@ -2132,7 +2144,7 @@ fn select_transforms(
         // Margin-band upgrade: shortlisted merges compete, in the
         // reconstruction domain, against whatever the downgrades and the
         // sub-8 refinement left on their footprint.
-        if distance >= MERGE_UPGRADE_MIN_DISTANCE {
+        if distance >= MERGE_UPGRADE_MIN_DISTANCE && !dp_installs {
             rerank_upgrade_merges(
                 &rerank,
                 scratch,
@@ -3597,7 +3609,11 @@ mod tests {
             crate::Speed::Fastest,
             crate::Speed::Fast,
         ];
-        let mut slow_like = vec![crate::Speed::MediumSlow, crate::Speed::Slow];
+        let mut slow_like = vec![
+            crate::Speed::Medium,
+            crate::Speed::MediumSlow,
+            crate::Speed::Slow,
+        ];
         if cfg!(feature = "extraslow") {
             plain.push(crate::Speed::ExtraSlow);
         } else {
@@ -3608,8 +3624,6 @@ mod tests {
                 let p = super::CandidateSearch::for_speed(speed, arbiter);
                 assert!(!p.fine_runner_up && !p.medium_upgrades && !p.merge32_upgrades);
             }
-            let medium = super::CandidateSearch::for_speed(crate::Speed::Medium, arbiter);
-            assert!(medium.fine_runner_up && medium.medium_upgrades && !medium.merge32_upgrades);
             for &speed in &slow_like {
                 let slow = super::CandidateSearch::for_speed(speed, arbiter);
                 assert!(!slow.fine_runner_up && !slow.medium_upgrades);
@@ -4620,7 +4634,7 @@ mod tests {
     }
 
     /// AFV (with the rest of sub-8) needs the rectangle search, which starts
-    /// at Medium; only Slow also reranks at every distance.
+    /// at Medium, as does the rerank at every distance.
     #[test]
     fn sub8_and_afv_start_at_medium() {
         let fastest = SearchScope::for_speed(crate::Speed::Fastest);
@@ -4631,7 +4645,7 @@ mod tests {
         );
         let medium = SearchScope::for_speed(crate::Speed::Medium);
         assert!(medium.rectangles());
-        assert!(!medium.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
+        assert!(medium.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Slow),
             SearchScope::FULL

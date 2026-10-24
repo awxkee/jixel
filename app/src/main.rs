@@ -9,7 +9,10 @@ use std::thread::available_parallelism;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("/Users/radzivon/Downloads/cerys_fix/cerys_d3_diff_crops.png")).unwrap();
+    let image = image::open(Path::new(
+        "/Users/radzivon/Downloads/cerys_fix/cerys_d3_diff_crops.png",
+    ))
+    .unwrap();
     let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();

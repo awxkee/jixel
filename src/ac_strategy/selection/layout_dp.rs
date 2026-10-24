@@ -951,7 +951,12 @@ fn search_tile(
     // luma channel and rate alone cost more than `BOUND_SLACK` of it is
     // dropped before its chroma is scored. The incumbent's pieces are
     // always scored in full.
-    for (i, &strategy) in STRATEGIES.iter().enumerate() {
+    let families = if scores.rerank.params.ctx.speed.effort().layout_retile_32 {
+        STRATEGIES.len()
+    } else {
+        COEFFICIENT_STRATEGIES.len()
+    };
+    for (i, &strategy) in STRATEGIES[..families].iter().enumerate() {
         if matches!(i, 3 | 4 | 6 | 8) {
             prepare_regions(&cache.candidates, width, height, &mut cache.planner);
         }
@@ -1612,7 +1617,7 @@ mod tests {
         };
         assert!(!gate(crate::Speed::UltraFast));
         assert!(gate(crate::Speed::Fast));
-        assert!(gate(crate::Speed::Medium));
+        assert!(!gate(crate::Speed::Medium));
         assert!(!gate(crate::Speed::MediumSlow));
         assert!(!gate(crate::Speed::Slow));
         assert!(!gate(crate::Speed::ExtraSlow));
@@ -1623,6 +1628,7 @@ mod tests {
             let effort = speed.effort();
             effort.layout_retile && !effort.layout_loop()
         };
+        assert!(gate(crate::Speed::Medium));
         assert!(gate(crate::Speed::MediumSlow));
         assert!(gate(crate::Speed::Slow));
         assert_eq!(gate(crate::Speed::ExtraSlow), !cfg!(feature = "extraslow"));
@@ -1630,7 +1636,6 @@ mod tests {
             crate::Speed::UltraFast,
             crate::Speed::Fastest,
             crate::Speed::Fast,
-            crate::Speed::Medium,
         ] {
             assert!(!gate(speed));
         }
