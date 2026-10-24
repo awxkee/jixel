@@ -219,6 +219,9 @@ effort_gates! {
     lz_exhaustive_entropy,
     /// Broader cost-aware LZ77 parses alongside the normal stream candidates.
     lz_priced_search,
+    /// The priced LZ77 parse is a shortest path over token positions
+    /// (otherwise greedy: the best match at each position).
+    lz_optimal_parse,
     /// Ranking learns of every WP preset.
     tree_rank_deep,
     /// Final RCT tree learns score more predictors on each side of a split.
@@ -291,6 +294,7 @@ const SLOW: Effort = Effort {
     ans_exhaustive: false,
     lz_exhaustive_entropy: false,
     lz_priced_search: false,
+    lz_optimal_parse: false,
     tree_rank_deep: false,
     tree_wide_side_preds: false,
     ..Effort::ALL

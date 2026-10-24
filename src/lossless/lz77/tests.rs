@@ -34,7 +34,10 @@ use super::entropy::{
     estimate_literal_and_run_bits, estimate_literal_and_run_bits_single, estimate_streams_bits,
     lz77_literals,
 };
-use super::priced::{LiteralPrices, MatchPrices, PRICED_MAX_PROBES, lz77_compress_priced};
+use super::priced::{
+    LiteralPrices, MatchPrices, PRICED_MAX_PROBES, PRICED_MIN_GAIN, lz77_compress_optimal,
+    lz77_compress_priced,
+};
 use super::write::{write_local_tree_lz77, write_lz_section};
 use super::{
     DEEP_LZ_SCRATCH_WORDS, LZ77_DIST_VALUE, LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL,
@@ -808,4 +811,116 @@ fn deep_search_handles_varied_stream_lengths() {
     for len in [1_000usize, 50_000, 3_000] {
         lz77_compress_with_depth_into(&tokens(len, 5), 8, &mut scratch, &mut out);
     }
+}
+
+/// Priced bits of a parse under the parse's own price model, each match
+/// carrying the margin it must clear.
+fn priced_bits(stream: &[LzToken], prices: &LiteralPrices, match_prices: &MatchPrices) -> f64 {
+    stream
+        .iter()
+        .map(|token| {
+            if token.is_lz77() {
+                let distance = if token.distance == LZ77_DIST_VALUE {
+                    1
+                } else {
+                    (token.distance - LZ77_NUM_SPECIAL_DISTANCES + 1) as usize
+                };
+                f64::from(
+                    match_prices.of((token.value + LZ77_MIN_LENGTH) as usize, distance)
+                        + PRICED_MIN_GAIN,
+                )
+            } else {
+                f64::from(prices.of(Token::new(token.context, token.value)))
+            }
+        })
+        .sum()
+}
+
+#[test]
+fn optimal_parse_round_trips_and_never_prices_above_greedy() {
+    let mut scratch = Vec::new();
+    for tokens in [periodic_tokens(200), periodic_tokens(3000)] {
+        let prices = LiteralPrices::new(&[tokens.as_slice()], 3);
+        let mut match_prices = MatchPrices::initial();
+        for _ in 0..2 {
+            let greedy = lz77_compress_priced(
+                &tokens,
+                &prices,
+                &match_prices,
+                PRICED_MAX_PROBES,
+                &mut scratch,
+            )
+            .expect("a periodic stream pays");
+            let optimal = lz77_compress_optimal(
+                &tokens,
+                &prices,
+                &match_prices,
+                PRICED_MAX_PROBES,
+                &mut scratch,
+            )
+            .expect("a periodic stream pays");
+            assert!(same_values(&expand(&optimal), &tokens));
+            let (greedy_bits, optimal_bits) = (
+                priced_bits(&greedy, &prices, &match_prices),
+                priced_bits(&optimal, &prices, &match_prices),
+            );
+            assert!(
+                optimal_bits <= greedy_bits + 1e-3,
+                "{optimal_bits} > {greedy_bits}"
+            );
+            match_prices = MatchPrices::learned(&[optimal.as_slice()], 3);
+        }
+    }
+}
+
+#[test]
+fn optimal_parse_stops_a_match_early_for_a_longer_one() {
+    // "1..6", then "2..11", then "1..11", then noise. The greedy parse
+    // copies "1..6" from the first span and spells out 7..11, since no
+    // 6-gram of the second span continues them; the optimal parse codes
+    // the literal 1 and copies "2..11" from the second span whole.
+    let mut tokens: Vec<Token> = (1..=6).map(|v| Token::new(0, v)).collect();
+    tokens.extend((2..=11).map(|v| Token::new(0, v)));
+    tokens.extend((1..=11).map(|v| Token::new(0, v)));
+    let mut state = 0x9e37_79b9u32;
+    let mut noise = |floor: u32, shift: u32| {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        Token::new(0, floor + (state >> shift))
+    };
+    tokens.extend((0..17).map(|_| noise(12, 27)));
+    // Six bits a literal: priced on a stream where every value is as rare.
+    let pricing: Vec<Token> = (0..4096).map(|_| noise(0, 26)).collect();
+    let prices = LiteralPrices::new(&[pricing.as_slice()], 1);
+    let match_prices = MatchPrices::initial();
+    let mut scratch = Vec::new();
+    let greedy = lz77_compress_priced(&tokens, &prices, &match_prices, 64, &mut scratch)
+        .expect("the copies pay");
+    let optimal = lz77_compress_optimal(&tokens, &prices, &match_prices, 64, &mut scratch)
+        .expect("the copies pay");
+    assert!(same_values(&expand(&optimal), &tokens));
+    // Tokens of the third span: those after the first 16 literals and
+    // before the noise.
+    let mut covered = 0usize;
+    let third: Vec<(bool, u32)> = optimal
+        .iter()
+        .filter_map(|t| {
+            let len = if t.is_lz77() {
+                t.value + LZ77_MIN_LENGTH
+            } else {
+                1
+            } as usize;
+            let at = covered;
+            covered += len;
+            (16..27).contains(&at).then_some((t.is_lz77(), t.value))
+        })
+        .collect();
+    assert_eq!(third, vec![(false, 1), (true, 10 - LZ77_MIN_LENGTH)]);
+    let (greedy_bits, optimal_bits) = (
+        priced_bits(&greedy, &prices, &match_prices),
+        priced_bits(&optimal, &prices, &match_prices),
+    );
+    assert!(
+        optimal_bits < greedy_bits,
+        "{optimal_bits} vs {greedy_bits}"
+    );
 }
