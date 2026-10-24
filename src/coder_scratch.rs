@@ -137,9 +137,9 @@ impl<T> DerefMut for LazyScratch<T> {
 pub(crate) struct QuantRefinement {
     pub(crate) bx: usize,
     pub(crate) by: usize,
-    pub(crate) cov_x: usize,
-    pub(crate) cov_y: usize,
-    pub(crate) q: u8,
+    /// `(q, cost)` per candidate; entry 0 is the current quantizer.
+    pub(crate) states: [(u8, f32); 4],
+    pub(crate) len: usize,
 }
 
 #[derive(Clone, Copy)]
