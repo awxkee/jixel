@@ -627,33 +627,6 @@ impl DotPatches {
     pub(crate) fn references(&self) -> Vec<PatchReference> {
         self.references.clone()
     }
-
-    pub(super) fn sort_positions(&mut self, band: Option<usize>) {
-        for reference in &mut self.references {
-            if let Some(band) = band {
-                reference.positions.sort_unstable_by_key(|&(x, y)| {
-                    let row = y / band;
-                    (row, if row & 1 == 0 { x } else { usize::MAX - x }, y)
-                });
-            } else {
-                reference
-                    .positions
-                    .sort_unstable_by_key(|&(x, y)| morton(x, y));
-            }
-        }
-    }
-}
-
-fn morton(x: usize, y: usize) -> u64 {
-    let spread = |v: usize| {
-        let mut v = v as u64;
-        v = (v | (v << 16)) & 0x0000_ffff_0000_ffff;
-        v = (v | (v << 8)) & 0x00ff_00ff_00ff_00ff;
-        v = (v | (v << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
-        v = (v | (v << 2)) & 0x3333_3333_3333_3333;
-        (v | (v << 1)) & 0x5555_5555_5555_5555
-    };
-    spread(x) | (spread(y) << 1)
 }
 
 /// Shared Gaussian proposals and the decoder's lattice pixels. Only the
@@ -1175,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn atlas_layout_and_position_orders_preserve_added_pixels() {
+    fn atlas_layout_preserves_added_pixels() {
         let mut splines = Vec::new();
         for (i, (x, y)) in [(16, 17), (42, 22), (31, 47), (57, 53)]
             .into_iter()
@@ -1213,12 +1186,8 @@ mod tests {
             &splines, &templates, false,
         ));
         for trim in [false, true] {
-            let mut plan = build_dot_patches_with_templates(&splines, &templates, trim);
+            let plan = build_dot_patches_with_templates(&splines, &templates, trim);
             assert_eq!(decode(&plan), expected);
-            for band in [None, Some(16), Some(32), Some(64)] {
-                plan.sort_positions(band);
-                assert_eq!(decode(&plan), expected);
-            }
         }
     }
 }

@@ -35,6 +35,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token};
 use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference};
+use crate::path_order;
 
 pub(super) fn write_u64(value: u64, w: &mut BitWriter) {
     match value {
@@ -393,13 +394,29 @@ pub(crate) fn write_patch_dictionary(
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
+    let given = encode_patch_dictionary(&patch_dictionary_tokens(references, has_alpha), scratch);
+    // Occurrences are coded as deltas from the previous one; race a priced
+    // shortest-path order against the given one on the real stream.
+    if let Some(reordered) = reorder_occurrences(references) {
+        let candidate =
+            encode_patch_dictionary(&patch_dictionary_tokens(&reordered, has_alpha), scratch);
+        if candidate.bits_written() < given.bits_written() {
+            w.append(&candidate);
+            return;
+        }
+    }
+    w.append(&given);
+}
+
+const PATCH_POSITION: u32 = 4;
+const PATCH_OFFSET: u32 = 6;
+
+fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Vec<Token> {
     const NUM_REF: u32 = 0;
     const REFERENCE_FRAME: u32 = 1;
     const PATCH_SIZE: u32 = 2;
     const REF_POSITION: u32 = 3;
-    const POSITION: u32 = 4;
     const BLEND_MODE: u32 = 5;
-    const OFFSET: u32 = 6;
     const COUNT: u32 = 7;
     const CLAMP: u32 = 9;
 
@@ -414,12 +431,12 @@ pub(crate) fn write_patch_dictionary(
         tokens.push(Token::new(COUNT, (reference.positions.len() - 1) as u32));
         for (i, &(x, y)) in reference.positions.iter().enumerate() {
             if i == 0 {
-                tokens.push(Token::new(POSITION, x as u32));
-                tokens.push(Token::new(POSITION, y as u32));
+                tokens.push(Token::new(PATCH_POSITION, x as u32));
+                tokens.push(Token::new(PATCH_POSITION, y as u32));
             } else {
                 let (px, py) = reference.positions[i - 1];
-                tokens.push(Token::new(OFFSET, pack_signed(x as i32 - px as i32)));
-                tokens.push(Token::new(OFFSET, pack_signed(y as i32 - py as i32)));
+                tokens.push(Token::new(PATCH_OFFSET, pack_signed(x as i32 - px as i32)));
+                tokens.push(Token::new(PATCH_OFFSET, pack_signed(y as i32 - py as i32)));
             }
             // color = Mul (3), Add (2) or Replace (1); Mul also signals clamp = false
             tokens.push(Token::new(
@@ -440,22 +457,26 @@ pub(crate) fn write_patch_dictionary(
             }
         }
     }
+    tokens
+}
+
+fn encode_patch_dictionary(tokens: &[Token], scratch: &mut CoderScratch) -> BitWriter {
     // Dense text makes the dictionary a real share of the frame (a third of
     // a text page): race the prefix code against a config-selected rANS code.
     let mut prefix_bits = BitWriter::new();
     {
-        let code = optimize_entropy_code(&tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
+        let code = optimize_entropy_code(tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
         let code_ref = code.as_ref();
         prefix_bits.write(1, 0); // patch dictionary entropy stream has no LZ77
         write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut prefix_bits);
-        for &token in &tokens {
+        for &token in tokens {
             write_token(token, &code_ref, &mut prefix_bits);
         }
     }
     let mut ans_bits = BitWriter::new();
     {
         let code = crate::entropy::optimize_entropy_code_ac_streams(
-            std::iter::once(tokens.as_slice()),
+            std::iter::once(tokens),
             NUM_PATCH_CONTEXTS,
             &mut scratch.huffman_pool,
             true,
@@ -466,12 +487,12 @@ pub(crate) fn write_patch_dictionary(
         ans_bits.write(1, 0);
         write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut ans_bits);
         if code_ref.use_prefix_code {
-            for &token in &tokens {
+            for &token in tokens {
                 write_token(token, &code_ref, &mut ans_bits);
             }
         } else {
             crate::entropy::write_ans_tokens(
-                &tokens,
+                tokens,
                 code_ref.context_map,
                 code_ref.ans_symbols,
                 code_ref.ans_reverse_maps,
@@ -481,10 +502,71 @@ pub(crate) fn write_patch_dictionary(
         }
     }
     if ans_bits.bits_written() < prefix_bits.bits_written() {
-        w.append(&ans_bits);
+        ans_bits
     } else {
-        w.append(&prefix_bits);
+        prefix_bits
     }
+}
+
+/// Whether the occurrences of `reference` may be applied in any order: Add
+/// and Mul commute, Replace only while no two of its boxes overlap (the
+/// decoder keeps entry order, so only same-entry pairs can swap).
+fn occurrences_commute(reference: &PatchReference) -> bool {
+    if reference.add || reference.mul {
+        return true;
+    }
+    let mut boxes = reference.positions.clone();
+    boxes.sort_unstable_by_key(|&(x, y)| (y, x));
+    for (k, &(x, y)) in boxes.iter().enumerate() {
+        for &(ox, oy) in &boxes[k + 1..] {
+            if oy >= y + reference.height {
+                break;
+            }
+            if ox.abs_diff(x) < reference.width {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Occurrence orders minimizing the priced position and offset tokens, or
+/// `None` when no entry may move or none moved.
+fn reorder_occurrences(references: &[PatchReference]) -> Option<Vec<PatchReference>> {
+    let movable: Vec<bool> = references
+        .iter()
+        .map(|r| r.positions.len() > 1 && occurrences_commute(r))
+        .collect();
+    if !movable.contains(&true) {
+        return None;
+    }
+    let points: Vec<Vec<path_order::Pos>> = references
+        .iter()
+        .map(|r| {
+            r.positions
+                .iter()
+                .map(|&(x, y)| (x as i32, y as i32))
+                .collect()
+        })
+        .collect();
+    let given = points.iter().map(|p| (0..p.len()).collect()).collect();
+    let orders = path_order::order_sets(&points, &movable, given, false);
+    if orders
+        .iter()
+        .all(|order| order.iter().enumerate().all(|(k, &i)| k == i))
+    {
+        return None;
+    }
+    Some(
+        references
+            .iter()
+            .zip(&orders)
+            .map(|(reference, order)| PatchReference {
+                positions: order.iter().map(|&i| reference.positions[i]).collect(),
+                ..reference.clone()
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn write_modular_transforms(nb_chans: usize, rct_type: u32, w: &mut BitWriter) {
@@ -506,4 +588,71 @@ pub(super) fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
     }
     w.write(2, bucket as u64);
     w.write(BITS[bucket], (byte_len - OFFSETS[bucket]) as u64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(positions: Vec<(usize, usize)>, add: bool) -> PatchReference {
+        PatchReference {
+            atlas_x: 0,
+            atlas_y: 0,
+            width: 8,
+            height: 10,
+            ref_frame: PATCH_REF_ID,
+            add,
+            mul: false,
+            positions,
+        }
+    }
+
+    fn scattered(n: usize) -> Vec<(usize, usize)> {
+        // Boxes on a 20x20 lattice in a scrambled order never overlap.
+        (0..n)
+            .map(|k| (k * 37 % n, k))
+            .map(|(a, _)| ((a % 25) * 20, (a / 25) * 20))
+            .collect()
+    }
+
+    #[test]
+    fn replace_occurrences_commute_only_without_overlap() {
+        assert!(occurrences_commute(&entry(
+            vec![(0, 0), (8, 0), (0, 10)],
+            false
+        )));
+        assert!(!occurrences_commute(&entry(
+            vec![(0, 0), (40, 3), (7, 9)],
+            false
+        )));
+        assert!(occurrences_commute(&entry(
+            vec![(0, 0), (40, 3), (7, 9)],
+            true
+        )));
+    }
+
+    #[test]
+    fn reorder_moves_only_commuting_entries_and_keeps_their_occurrences() {
+        let overlapping = entry(vec![(300, 0), (0, 0), (150, 0), (5, 5)], false);
+        let free = entry(scattered(200), false);
+        let reordered = reorder_occurrences(&[overlapping.clone(), free.clone()]).unwrap();
+        assert_eq!(reordered[0].positions, overlapping.positions);
+        assert_ne!(reordered[1].positions, free.positions);
+        let mut a = reordered[1].positions.clone();
+        let mut b = free.positions.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dictionary_is_never_larger_than_in_given_order() {
+        let mut scratch = CoderScratch::default();
+        let references = [entry(scattered(200), false), entry(scattered(50), true)];
+        let given =
+            encode_patch_dictionary(&patch_dictionary_tokens(&references, false), &mut scratch);
+        let mut w = BitWriter::new();
+        write_patch_dictionary(&references, false, &mut scratch, &mut w);
+        assert!(w.bits_written() < given.bits_written());
+    }
 }
