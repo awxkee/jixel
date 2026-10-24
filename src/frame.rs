@@ -355,6 +355,12 @@ fn choose_dc_predictors(
             extra[slot] += nbits as u64;
         }
     }
+    choose_dc_predictors_from_counts(scratch)
+}
+
+fn choose_dc_predictors_from_counts(scratch: &DcPredictorScratch) -> DcPredictorChoice {
+    let counts = &scratch.counts;
+    let extra = &scratch.extra;
     let cost = |slot: usize| -> f64 {
         let total: u32 = counts[slot].iter().sum();
         if total == 0 {
@@ -640,6 +646,13 @@ impl DcPlanePrice {
             self.counts[token.context as usize][sym as usize] += 1;
             self.raw_bits += u64::from(nbits);
         }
+    }
+
+    /// Count a token from an existing weighted-predictor walk.
+    fn add_token(&mut self, token: Token) {
+        let (sym, nbits, _) = crate::entropy::uint_encode(token.value);
+        self.counts[token.context as usize][sym as usize] += 1;
+        self.raw_bits += u64::from(nbits);
     }
 
     pub(crate) fn bits(&self) -> f64 {

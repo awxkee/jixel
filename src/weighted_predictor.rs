@@ -108,6 +108,20 @@ pub(crate) struct WpRowOffsets {
     previous: usize,
 }
 
+/// What one `update` records for its sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WpUpdate {
+    error: i64,
+    pred_errors: [u32; 4],
+}
+
+/// The sub-predictions behind one `predict`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WpPrediction {
+    pred: i64,
+    prediction: [i64; 4],
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct WpNeighbors {
     pub(crate) north: i64,
@@ -293,13 +307,78 @@ impl WpState {
 
     #[inline(always)]
     fn update_with_row(&mut self, val: i64, x: usize, row: WpRowOffsets) {
-        let valb = Self::add_bits(val);
-        self.error[row.current + x] = self.pred - valb;
+        let update = Self::update_for(self.last_prediction(), val);
+        self.error[row.current + x] = update.error;
         for i in 0..4 {
-            let e = ((self.prediction[i] - valb).abs() + WP_PRED_ROUND) >> WP_EXTRA_BITS;
-            self.pred_errors[i][row.current + x] = e as u32;
+            self.pred_errors[i][row.current + x] = update.pred_errors[i];
             let slot = &mut self.pred_errors[i][row.previous + x + 1];
-            *slot = slot.wrapping_add(e as u32);
+            *slot = slot.wrapping_add(update.pred_errors[i]);
+        }
+    }
+
+    /// The sub-predictions behind the last `predict`.
+    #[inline(always)]
+    pub(crate) fn last_prediction(&self) -> WpPrediction {
+        WpPrediction {
+            pred: self.pred,
+            prediction: self.prediction,
+        }
+    }
+
+    /// What `update` records for `val` after `prediction`.
+    #[inline(always)]
+    pub(crate) fn update_for(prediction: WpPrediction, val: i64) -> WpUpdate {
+        let valb = Self::add_bits(val);
+        WpUpdate {
+            error: prediction.pred - valb,
+            pred_errors: std::array::from_fn(|i| {
+                (((prediction.prediction[i] - valb).abs() + WP_PRED_ROUND) >> WP_EXTRA_BITS) as u32
+            }),
+        }
+    }
+
+    /// The previous row's sub-predictor error slots that row `y`'s updates
+    /// accumulate into, one per column, saved so the row can be predicted
+    /// again from its start after [`Self::restore_row_base`].
+    pub(crate) fn save_row_base(&self, y: usize, into: &mut Vec<[u32; 4]>) {
+        let row = self.row_offsets(y);
+        into.clear();
+        into.extend(
+            (0..self.xsize).map(|x| std::array::from_fn(|i| self.pred_errors[i][row.previous + x])),
+        );
+    }
+
+    pub(crate) fn restore_row_base(&mut self, y: usize, base: &[[u32; 4]]) {
+        let row = self.row_offsets(y);
+        for (x, slots) in base.iter().enumerate() {
+            for (errors, &slot) in self.pred_errors.iter_mut().zip(slots) {
+                errors[row.previous + x] = slot;
+            }
+        }
+    }
+
+    /// Install one path's updates at `x - 1` and `x - 2` as row `y`'s state
+    /// over the row's saved `base`, so `predict` at `x` continues that path.
+    #[inline]
+    pub(crate) fn stage_path(
+        &mut self,
+        x: usize,
+        y: usize,
+        base: &[[u32; 4]],
+        west: Option<WpUpdate>,
+        west2: Option<WpUpdate>,
+    ) {
+        let row = self.row_offsets(y);
+        if let Some(west) = west {
+            self.error[row.current + x - 1] = west.error;
+            for (i, errors) in self.pred_errors.iter_mut().enumerate() {
+                errors[row.previous + x] = base[x][i].wrapping_add(west.pred_errors[i]);
+            }
+        }
+        if let Some(west2) = west2 {
+            for (i, errors) in self.pred_errors.iter_mut().enumerate() {
+                errors[row.previous + x - 1] = base[x - 1][i].wrapping_add(west2.pred_errors[i]);
+            }
         }
     }
 
