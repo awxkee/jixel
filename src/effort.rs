@@ -112,7 +112,12 @@ effort_gates! {
     chroma_policy,
     /// Exact DP re-tiling of closed 64x64 tiles over 8/16/32-family pieces at
     /// any 8-pixel origin; skipped where `layout_loop` re-chooses layouts exactly.
+    /// Where it installs its layout, the rerank's downgrade and upgrade passes
+    /// are skipped: the DP covers both.
     layout_retile,
+    /// 32-family pieces (strips, 32x16/16x32, 32x32) in the `layout_retile` DP;
+    /// otherwise it re-tiles over DCT8, pairs and 16x16 only.
+    layout_retile_32,
     /// Coefficient-model DP re-tiling of the merge search's tiles over DCT8,
     /// pairs and 16x16 at any 8-pixel origin; superseded by `layout_retile`.
     layout_dp_coefficient,
@@ -252,14 +257,13 @@ const FAST: Effort = Effort {
 };
 
 const MEDIUM: Effort = Effort {
-    full_rerank: false,
-    layout_retile: false,
-    learned_rate: false,
+    layout_retile_32: false,
     tree_full_sampling: false,
     ..MEDIUM_SLOW
 };
 
 const MEDIUM_SLOW: Effort = Effort {
+    learned_rate: false,
     vector_layers_default: false,
     clip_continuation: false,
     epf_fit: false,
