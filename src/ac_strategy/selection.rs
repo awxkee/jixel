@@ -30,6 +30,9 @@
 //! AC strategy selection, quant-field refinement, and transform reranking.
 
 use super::*;
+use crate::adaptive_quant::{dirty_log2f, fast_exp2};
+use crate::entropy::pack_signed;
+use crate::frame::ac_metadata_context;
 
 mod layout_dp;
 mod leaf_first;
@@ -522,7 +525,9 @@ pub(crate) fn adjust_quant_field(
     }
 }
 
-const QUANT_REFINEMENT_MIN_GAIN: f32 = 0.03;
+/// Smoothing weight of the geometric prior in the QF residual prices.
+const QF_PRICE_PRIOR_WEIGHT: f32 = 2.0;
+const QF_TRELLIS_ROUNDS: usize = 2;
 
 #[inline]
 fn quant_refinement_steps(distance: f32) -> usize {
@@ -575,8 +580,6 @@ fn find_quant_refinements(
         ) {
             continue;
         }
-        let cov_x = AcStrategyImage::covered_blocks_x_of(strategy);
-        let cov_y = AcStrategyImage::covered_blocks_y_of(strategy);
         let current_q = quant_field.row(by)[bx];
         if current_q <= 1 {
             continue;
@@ -639,21 +642,18 @@ fn find_quant_refinements(
                 rate,
             )
         };
-        let mut best_q = current_q;
         let cached_cost = context
             .current_costs
             .get(by * ac_strategy.xsize() + bx)
             .copied()
             .unwrap_or(f32::NAN);
-        let mut best_cost = if cached_cost.is_finite() {
+        let base_cost = if cached_cost.is_finite() {
             cached_cost
         } else {
             cost(current_q)
         };
         // Downward only: a coarser step where the reconstruction says the block
-        // is over-spent. The upward q+1 candidate lost on every metric, and a
-        // change must clear `QUANT_REFINEMENT_MIN_GAIN` of the block's cost.
-        let base_cost = best_cost;
+        // is over-spent. The upward q+1 candidate lost on every metric.
         // The upward step protects saturated thin structure (the X-gradient
         // content class); elsewhere it only costs rate.
         let up = if ctx.x_heavy() {
@@ -666,27 +666,128 @@ fn find_quant_refinements(
         } else {
             [current_q.saturating_sub(1), up, current_q]
         };
+        let mut refinement = QuantRefinement {
+            bx,
+            by,
+            states: [(current_q, base_cost); 4],
+            len: 1,
+        };
         for candidate in candidates {
-            if candidate == 0 || candidate == best_q || candidate == current_q {
+            if candidate == 0
+                || refinement.states[..refinement.len]
+                    .iter()
+                    .any(|&(q, _)| q == candidate)
+            {
                 continue;
             }
-            let candidate_cost = cost(candidate);
-            if candidate_cost < best_cost
-                && candidate_cost < base_cost * (1.0 - QUANT_REFINEMENT_MIN_GAIN)
-            {
-                best_q = candidate;
-                best_cost = candidate_cost;
+            refinement.states[refinement.len] = (candidate, cost(candidate));
+            refinement.len += 1;
+        }
+        if refinement.len > 1 {
+            refinements.push(refinement);
+        }
+    }
+}
+
+#[inline]
+fn independent_choice(refinement: &QuantRefinement) -> u8 {
+    let mut best = refinement.states[0];
+    for &state in &refinement.states[1..refinement.len] {
+        if state.1 < best.1 {
+            best = state;
+        }
+    }
+    best.0
+}
+
+/// Symbol prices (bits) of the QF residual stream: 4 contexts selected by the
+/// previous coded value, each a smoothed empirical histogram of `chain`.
+fn qf_residual_prices(first_left: i32, chain: &[u8], prices: &mut [[f32; 512]; 4]) {
+    let mut counts = [[0u32; 512]; 4];
+    let mut totals = [0u32; 4];
+    let mut left = first_left;
+    for &q in chain {
+        let qf = q as i32 - 1;
+        let (c, v) = qf_symbol(left, qf);
+        counts[c][v] += 1;
+        totals[c] += 1;
+        left = qf;
+    }
+    for c in 0..4 {
+        let denom = totals[c] as f32 + QF_PRICE_PRIOR_WEIGHT;
+        for v in 0..512 {
+            let prior = QF_PRICE_PRIOR_WEIGHT * fast_exp2(-(v as f32 + 1.0).min(100.0));
+            prices[c][v] = -dirty_log2f((counts[c][v] as f32 + prior) / denom);
+        }
+    }
+}
+
+/// Price-table slot of a QF residual: the writer's context (base 0) and its
+/// packed symbol, clamped to the table.
+#[inline]
+fn qf_symbol(left: i32, qf: i32) -> (usize, usize) {
+    (
+        ac_metadata_context(left, 0) as usize,
+        (pack_signed(qf - left) as usize).min(511),
+    )
+}
+
+/// Viterbi over the QF stream's raster chain of first blocks: per block the
+/// candidate quantizers, scored by their reconstruction RD cost plus the
+/// priced residual against the previous block's choice.
+fn qf_trellis(
+    first_left: i32,
+    fixed: &[u8],
+    states: &[Option<&QuantRefinement>],
+    lambda_bits: f32,
+    prices: &[[f32; 512]; 4],
+    chain: &mut [u8],
+) {
+    let n = fixed.len();
+    let mut back = vec![[0u8; 4]; n];
+    let mut prev_q = [0u8; 4];
+    let mut prev_cost = [0.0f32; 4];
+    let mut prev_len = 0usize;
+    for i in 0..n {
+        let (cur, len): ([(u8, f32); 4], usize) = match states[i] {
+            Some(r) => (r.states, r.len),
+            None => ([(fixed[i], 0.0); 4], 1),
+        };
+        let mut cost = [f32::INFINITY; 4];
+        for s in 0..len {
+            let qf = cur[s].0 as i32 - 1;
+            if i == 0 {
+                let (c, v) = qf_symbol(first_left, qf);
+                cost[s] = cur[s].1 + lambda_bits * prices[c][v];
+                continue;
+            }
+            for p in 0..prev_len {
+                let (c, v) = qf_symbol(prev_q[p] as i32 - 1, qf);
+                let total = prev_cost[p] + cur[s].1 + lambda_bits * prices[c][v];
+                if total < cost[s] {
+                    cost[s] = total;
+                    back[i][s] = p as u8;
+                }
             }
         }
-        if best_q != current_q {
-            refinements.push(QuantRefinement {
-                bx,
-                by,
-                cov_x,
-                cov_y,
-                q: best_q,
-            });
+        for s in 0..len {
+            prev_q[s] = cur[s].0;
         }
+        prev_cost = cost;
+        prev_len = len;
+    }
+    if n == 0 {
+        return;
+    }
+    let mut s = (0..prev_len)
+        .min_by(|&a, &b| prev_cost[a].total_cmp(&prev_cost[b]))
+        .unwrap_or(0);
+    for i in (0..n).rev() {
+        chain[i] = match states[i] {
+            Some(r) => r.states[s].0,
+            None => fixed[i],
+        };
+        s = back[i][s] as usize;
     }
 }
 
@@ -724,13 +825,60 @@ fn refine_quant_field(
                 },
             );
     }
-    for band in &band_scratch[..context.bands.len()] {
-        for refinement in &band.quant_refinements {
-            for iy in 0..refinement.cov_y {
-                quant_field.row_mut(refinement.by + iy)
-                    [refinement.bx..refinement.bx + refinement.cov_x]
-                    .fill(refinement.q);
-            }
+    let ac_strategy = context.ac_strategy;
+    let xsize = ac_strategy.xsize();
+    let mut slot = vec![usize::MAX; xsize * ac_strategy.ysize()];
+    let refinements: Vec<&QuantRefinement> = band_scratch[..context.bands.len()]
+        .iter()
+        .flat_map(|band| band.quant_refinements.iter())
+        .collect();
+    for (i, r) in refinements.iter().enumerate() {
+        slot[r.by * xsize + r.bx] = i;
+    }
+    let first_blocks: Vec<(usize, usize, u8)> = ac_strategy.iter_first_blocks().collect();
+    let fixed: Vec<u8> = first_blocks
+        .iter()
+        .map(|&(bx, by, _)| quant_field.row(by)[bx])
+        .collect();
+    let states: Vec<Option<&QuantRefinement>> = first_blocks
+        .iter()
+        .map(|&(bx, by, _)| refinements.get(slot[by * xsize + bx]).copied())
+        .collect();
+    let mut chain: Vec<u8> = states
+        .iter()
+        .zip(&fixed)
+        .map(|(s, &q)| s.map_or(q, independent_choice))
+        .collect();
+    if !first_blocks.is_empty() {
+        let first_left = ac_strategy.strategy_code(0, 0) as i32;
+        let lambda_bits = rd_cost(
+            DistortionModel::Reconstruction,
+            context.params.distance,
+            0.0,
+            0.0,
+            1.0,
+        );
+        let mut prices = [[0.0f32; 512]; 4];
+        for _ in 0..QF_TRELLIS_ROUNDS {
+            qf_residual_prices(first_left, &chain, &mut prices);
+            qf_trellis(
+                first_left,
+                &fixed,
+                &states,
+                lambda_bits,
+                &prices,
+                &mut chain,
+            );
+        }
+    }
+    for ((&(bx, by, strategy), &q), &old) in first_blocks.iter().zip(&chain).zip(&fixed) {
+        if q == old {
+            continue;
+        }
+        let cov_x = AcStrategyImage::covered_blocks_x_of(strategy);
+        let cov_y = AcStrategyImage::covered_blocks_y_of(strategy);
+        for iy in 0..cov_y {
+            quant_field.row_mut(by + iy)[bx..bx + cov_x].fill(q);
         }
     }
 }

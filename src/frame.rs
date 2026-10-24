@@ -680,7 +680,7 @@ impl DcPlanePrice {
 /// Same as write_ac_metadata_tokens, but returns the tokens. Mirror of
 /// collect_dc_tokens for the AC metadata (YtoX/B, ACS, QF, EPF).
 #[inline]
-fn ac_metadata_context(left: i32, base: u32) -> u32 {
+pub(crate) fn ac_metadata_context(left: i32, base: u32) -> u32 {
     base + if left > 11 {
         0
     } else if left > 5 {
