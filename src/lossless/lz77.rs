@@ -44,7 +44,9 @@ pub(super) use entropy::{
     estimate_literal_and_run_bits, estimate_literal_and_run_bits_single, estimate_streams_bits,
     lz77_literals,
 };
-pub(super) use priced::{LiteralPrices, MatchPrices, PRICED_MAX_PROBES, lz77_compress_priced};
+pub(super) use priced::{
+    LiteralPrices, MatchPrices, PRICED_MAX_PROBES, lz77_compress_optimal, lz77_compress_priced,
+};
 pub(super) use write::{
     write_local_tree_lz77, write_local_tree_lz77_offsets, write_lz_section, write_lz_section_tail,
     write_tree_lz77,
