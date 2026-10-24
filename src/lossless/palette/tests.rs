@@ -31,8 +31,9 @@
 
 use super::super::rct::inverse_ycocg;
 use super::global::{
-    ColorHasher, build_global_palette, cooccurrence_chain, estimate_index_plane_cost,
-    index_cooccurrence, index_cost_rows,
+    ColorHasher, build_global_palette, cooccurrence_chain, cooccurrence_chain_path,
+    estimate_index_plane_cost, improve_chain_tour, index_cooccurrence, index_cost_rows,
+    path_cooccurrence,
 };
 use super::visit_palette_colors;
 use crate::coder_scratch::CoderScratch;
@@ -174,6 +175,44 @@ fn cooccurrence_chain_recovers_a_scrambled_ramp() {
     let ascending = ramp.array_windows::<2>().all(|p| p[1] == p[0] + 1);
     let descending = ramp.array_windows::<2>().all(|p| p[1] == p[0] - 1);
     assert!(ascending || descending, "chain order {ramp:?}");
+}
+
+#[test]
+fn chain_tour_never_lowers_the_path_cooccurrence() {
+    let mut state = 0x9e37_79b9u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut strictly_better = 0usize;
+    for &n in &[1usize, 2, 3, 5, 17, 64] {
+        for _ in 0..8 {
+            // Sparse symmetric weights: most pairs never meet.
+            let mut cooc = vec![0u32; n * n];
+            for a in 0..n {
+                for b in a + 1..n {
+                    let v = next();
+                    let weight = if v % 3 == 0 { (v >> 8) % 1000 } else { 0 };
+                    cooc[a * n + b] = weight;
+                    cooc[b * n + a] = weight;
+                }
+            }
+            let chain = cooccurrence_chain_path(n, &cooc);
+            let tour = improve_chain_tour(n, &cooc, chain.clone());
+            let mut sorted = tour.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            let (before, after) = (
+                path_cooccurrence(n, &cooc, &chain),
+                path_cooccurrence(n, &cooc, &tour),
+            );
+            assert!(after >= before, "{after} < {before} at n={n}");
+            strictly_better += usize::from(after > before);
+        }
+    }
+    assert!(strictly_better > 0);
 }
 
 #[test]

@@ -111,7 +111,12 @@ fn palette_order_candidates(colors: &[[i32; 4]], cooc: &[u32]) -> Vec<Vec<i32>> 
     if n < 3 {
         return orders;
     }
-    orders.push(cooccurrence_chain(n, cooc));
+    let chain = cooccurrence_chain_path(n, cooc);
+    let tour = improve_chain_tour(n, cooc, chain.clone());
+    orders.push(order_of_path(&chain));
+    if tour != chain {
+        orders.push(order_of_path(&tour));
+    }
     // Single precision is ample for the axis (the color cloud spans 16
     // bits; the projection only ranks colors, ties broken by index) and the
     // chain distances are exact integers.
@@ -221,10 +226,25 @@ pub(super) fn index_cooccurrence(
     cooc
 }
 
+/// `order[canonical] = index` of the colors in `path` order.
+fn order_of_path(path: &[usize]) -> Vec<i32> {
+    let mut order = vec![0i32; path.len()];
+    for (index, &canonical) in path.iter().enumerate() {
+        order[canonical] = index as i32;
+    }
+    order
+}
+
 /// Order colors by spatial adjacency rather than by color: grow a chain from
 /// the most-connected color, at each step attaching the unused color with the
 /// most co-occurrences to whichever chain end it touches more.
+#[cfg(test)]
 pub(super) fn cooccurrence_chain(n: usize, cooc: &[u32]) -> Vec<i32> {
+    order_of_path(&cooccurrence_chain_path(n, cooc))
+}
+
+/// The `cooccurrence_chain` as the list of canonical colors in chain order.
+pub(super) fn cooccurrence_chain_path(n: usize, cooc: &[u32]) -> Vec<usize> {
     let total: Vec<u64> = (0..n)
         .map(|i| cooc[i * n..(i + 1) * n].iter().map(|&v| v as u64).sum())
         .collect();
@@ -267,11 +287,163 @@ pub(super) fn cooccurrence_chain(n: usize, cooc: &[u32]) -> Vec<i32> {
             right = next;
         }
     }
-    let mut order = vec![0i32; n];
-    for (index, &canonical) in chain.iter().enumerate() {
-        order[canonical] = index as i32;
+    chain.into()
+}
+
+/// Co-occurrences along a path: the sum over its adjacent pairs.
+#[cfg(test)]
+pub(super) fn path_cooccurrence(n: usize, cooc: &[u32], path: &[usize]) -> u64 {
+    path.array_windows::<2>()
+        .map(|&[a, b]| cooc[a * n + b] as u64)
+        .sum()
+}
+
+/// The chain is a greedy maximum-weight Hamiltonian path on the
+/// co-occurrence graph. Reverse segments (2-opt) and move segments of up to
+/// `TOUR_OR_OPT_SEGMENT` colors (Or-opt) while either raises the path's
+/// co-occurrence. A move pays only where it joins two colors that co-occur
+/// or frees two that do, so the candidates are the non-zero neighbors of
+/// the colors at the ends of the segment moved and the path's own ends, and
+/// a round costs the graph's edges rather than the square of the palette.
+/// Segments of eight beat a dense search over every insertion point.
+pub(super) fn improve_chain_tour(n: usize, cooc: &[u32], mut path: Vec<usize>) -> Vec<usize> {
+    const TOUR_OR_OPT_SEGMENT: usize = 8;
+    const TOUR_MAX_ROUNDS: usize = 16;
+    if n < 3 {
+        return path;
     }
-    order
+    let mut offsets = vec![0usize; n + 1];
+    let mut neighbors = Vec::new();
+    for a in 0..n {
+        neighbors.extend((0..n).filter(|&b| cooc[a * n + b] != 0));
+        offsets[a + 1] = neighbors.len();
+    }
+    let neighbors = |c: usize| &neighbors[offsets[c]..offsets[c + 1]];
+    let w = |a: usize, b: usize| cooc[a * n + b] as i64;
+    let mut pos = vec![0usize; n];
+    for (k, &c) in path.iter().enumerate() {
+        pos[c] = k;
+    }
+    // Co-occurrence of the colors at two path positions, zero past an end.
+    let link = |path: &[usize], a: Option<usize>, b: Option<usize>| match (a, b) {
+        (Some(a), Some(b)) if a < n && b < n => w(path[a], path[b]),
+        _ => 0,
+    };
+    let mut candidates: Vec<usize> = Vec::new();
+    for _ in 0..TOUR_MAX_ROUNDS {
+        let mut improved = false;
+        // 2-opt: reversing [i..=j] joins i-1 with j and i with j+1.
+        for i in 0..n {
+            candidates.clear();
+            if i > 0 {
+                candidates.extend(
+                    neighbors(path[i - 1])
+                        .iter()
+                        .map(|&c| pos[c])
+                        .filter(|&j| j > i),
+                );
+            }
+            candidates.extend(
+                neighbors(path[i])
+                    .iter()
+                    .map(|&c| pos[c])
+                    .filter(|&k| k > i + 1)
+                    .map(|k| k - 1),
+            );
+            let mut best = (0i64, 0usize);
+            for &j in &candidates {
+                let before =
+                    link(&path, i.checked_sub(1), Some(i)) + link(&path, Some(j), Some(j + 1));
+                let after =
+                    link(&path, i.checked_sub(1), Some(j)) + link(&path, Some(i), Some(j + 1));
+                if after - before > best.0 {
+                    best = (after - before, j);
+                }
+            }
+            if best.0 > 0 {
+                let j = best.1;
+                path[i..=j].reverse();
+                for (k, &c) in path.iter().enumerate().take(j + 1).skip(i) {
+                    pos[c] = k;
+                }
+                improved = true;
+            }
+        }
+        // Or-opt: the segment [i, end) moves next to a neighbor of either
+        // of its end colors, keeping or reversing its direction.
+        for len in 1..=TOUR_OR_OPT_SEGMENT.min(n - 2) {
+            for i in 0..=n - len {
+                let end = i + len;
+                let (first, last) = (path[i], path[end - 1]);
+                let removed = link(&path, i.checked_sub(1), Some(i))
+                    + link(&path, Some(end - 1), Some(end))
+                    - link(&path, i.checked_sub(1), Some(end));
+                // Position in the path without the segment.
+                let reduced = |k: usize| if k < i { k } else { k - len };
+                // Neighbors in the path without the segment.
+                // `left_of(0)` and `right_of(n)` are the reduced path's ends.
+                let left_of = |k: usize| -> Option<usize> {
+                    let k = if k == 0 { n } else { k };
+                    let k = if k == end { i } else { k };
+                    k.checked_sub(1).map(|k| path[k])
+                };
+                let right_of = |k: usize| -> Option<usize> {
+                    let k = if k == n { 0 } else { k + 1 };
+                    let k = if k == i { end } else { k };
+                    (k < n).then(|| path[k])
+                };
+                let value = |a: Option<usize>, b: Option<usize>| match (a, b) {
+                    (Some(a), Some(b)) => w(a, b),
+                    _ => 0,
+                };
+                // (gain, insertion index in the reduced path, reversed)
+                let mut best = (0i64, 0usize, false);
+                let mut consider = |left: Option<usize>, right: Option<usize>, at: usize| {
+                    for reversed in [false, true] {
+                        let (head, tail) = if reversed {
+                            (last, first)
+                        } else {
+                            (first, last)
+                        };
+                        let gain = value(left, Some(head)) + value(Some(tail), right)
+                            - value(left, right)
+                            - removed;
+                        if gain > best.0 {
+                            best = (gain, at, reversed);
+                        }
+                    }
+                };
+                // The path's ends cut nothing: a segment between two colors
+                // that co-occur with each other more than with it leaves.
+                consider(None, right_of(n), 0);
+                consider(left_of(0), None, n - len);
+                for &c in neighbors(first).iter().chain(neighbors(last)) {
+                    let k = pos[c];
+                    if (i..end).contains(&k) {
+                        continue;
+                    }
+                    consider(Some(c), right_of(k), reduced(k) + 1);
+                    consider(left_of(k), Some(c), reduced(k));
+                }
+                if best.0 > 0 {
+                    let (_, at, reversed) = best;
+                    let mut segment: Vec<usize> = path.drain(i..end).collect();
+                    if reversed {
+                        segment.reverse();
+                    }
+                    path.splice(at..at, segment);
+                    for (k, &c) in path.iter().enumerate() {
+                        pos[c] = k;
+                    }
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    path
 }
 
 /// Contexts of `estimate_index_plane_cost`: the sign pattern of four
