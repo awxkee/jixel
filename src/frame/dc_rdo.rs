@@ -28,9 +28,12 @@
  */
 //! Predictor-aware chroma DC rounding on the existing quantization lattice.
 
+#![forbid(unsafe_code)]
+
 use super::{
     DC_PREDICTOR_WEIGHTED, DcPlanePrice, DcPredictorChoice, DistanceParams, K_GRAD_RANGE_MAX,
-    K_GRAD_RANGE_MID, K_GRAD_RANGE_MIN, choose_dc_predictors, collect_dc_tokens_with_gradient,
+    K_GRAD_RANGE_MID, K_GRAD_RANGE_MIN, choose_dc_predictors_from_counts,
+    collect_dc_tokens_with_gradient,
 };
 use crate::coder_scratch::DcPredictorScratch;
 use crate::color_correlation::{CflFrame, dc_cfl_factor, dc_cfl_factor_x};
@@ -41,7 +44,7 @@ use crate::entropy::{ALPHABET_SIZE, Token, f_log2, pack_signed, uint_encode};
 use crate::quant_weights::INV_DC_QUANT;
 use crate::static_entropy_codes::{K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS};
 use crate::util::{EncodeError, try_vec};
-use crate::weighted_predictor::WpState;
+use crate::weighted_predictor::{WpParams, WpPrediction, WpState, WpUpdate};
 
 /// Rate penalty in squared DC-step units per bit, ramped linearly between
 /// the two distances.
@@ -50,7 +53,7 @@ static DC_RDO_LAMBDA_DISTANCE: [f32; 2] = [1.0, 2.0];
 /// X rounds toward its prediction more readily than B.
 const DC_RDO_X_LAMBDA_SCALE: f32 = 1.5;
 /// Bound the error of a newly chosen level, retaining larger incumbent errors.
-const DC_RDO_MAX_ERROR: f32 = 0.65;
+const DC_RDO_MAX_ERROR: f32 = 1.0;
 /// Require enough estimated payload gain to absorb small coding-model changes.
 const DC_RDO_MIN_GAIN_BITS: f64 = 8.0;
 
@@ -62,37 +65,51 @@ impl Prices {
     fn new(
         groups: &[DcGroupData],
         scratch: &mut DcPredictorScratch,
-    ) -> Result<(Self, DcPredictorChoice), EncodeError> {
-        let mut wp = Vec::with_capacity(groups.len());
-        let mut grad = Vec::with_capacity(groups.len());
+    ) -> Result<(Self, DcPredictorChoice, [DcPlanePrice; 2]), EncodeError> {
+        // Keep per-channel counts for both predictors while choosing the
+        // frame's predictor from their pooled counts. Token streams can then
+        // be dropped after each group instead of retaining the entire frame.
+        let mut counts = try_vec![[0u32; ALPHABET_SIZE]; 6 * K_NUM_DC_CONTEXTS]?;
+        scratch.counts.as_flattened_mut().fill(0);
+        scratch.extra.fill(0);
+        let mut raw_bits = [0u64; 3];
         for dc in groups {
-            let (w, g) = collect_dc_tokens_with_gradient(
+            let (wp, grad) = collect_dc_tokens_with_gradient(
                 dc,
                 &DC_PREDICTOR_WEIGHTED,
                 &mut Vec::new(),
                 false,
                 true,
             );
-            wp.push(w);
-            grad.push(g);
-        }
-        let predictors = choose_dc_predictors(&wp, &grad, scratch);
-        let mut counts = try_vec![[0u32; ALPHABET_SIZE]; 3 * K_NUM_DC_CONTEXTS]?;
-        for ((dc, wp), grad) in groups.iter().zip(&wp).zip(&grad) {
             let mut offset = 0;
             for (mchan, c) in [1, 0, 2].into_iter().enumerate() {
                 let end = offset + dc.quant_dc.plane(c).as_slice().len();
-                for (w, g) in wp[offset..end].iter().zip(&grad[offset..end]) {
-                    let token = if predictors[w.context as usize] { g } else { w };
-                    let (symbol, _, _) = uint_encode(token.value);
-                    counts[mchan * K_NUM_DC_CONTEXTS + token.context as usize][symbol as usize] +=
-                        1;
+                for (candidate, tokens) in [&wp[offset..end], &grad[offset..end]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for token in tokens {
+                        let context = token.context as usize;
+                        let (symbol, extra, _) = uint_encode(token.value);
+                        let slot = candidate * K_NUM_DC_CONTEXTS + context;
+                        scratch.counts[slot][symbol as usize] += 1;
+                        scratch.extra[slot] += u64::from(extra);
+                        if candidate == 0 {
+                            raw_bits[mchan] += u64::from(extra);
+                        }
+                        counts[(candidate * 3 + mchan) * K_NUM_DC_CONTEXTS + context]
+                            [symbol as usize] += 1;
+                    }
                 }
                 offset = end;
             }
         }
-        let mut bits = try_vec![[0.0; ALPHABET_SIZE]; counts.len()]?;
-        for (counts, bits) in counts.iter().zip(&mut bits) {
+        let predictors = choose_dc_predictors_from_counts(scratch);
+        let mut bits = try_vec![[0.0; ALPHABET_SIZE]; 3 * K_NUM_DC_CONTEXTS]?;
+        for (slot, bits) in bits.iter_mut().enumerate() {
+            let context = slot % K_NUM_DC_CONTEXTS;
+            let candidate = usize::from(predictors[context]);
+            let counts = &counts[candidate * 3 * K_NUM_DC_CONTEXTS + slot];
             // A half-count keeps newly visited contexts and symbols finite.
             let total =
                 counts.iter().map(|&n| f64::from(n)).sum::<f64>() + 0.5 * ALPHABET_SIZE as f64;
@@ -100,9 +117,20 @@ impl Prices {
                 *bits = f_log2(total / (f64::from(count) + 0.5)) as f32;
             }
         }
-        Ok((Self { bits }, predictors))
+        // The pooled baseline prices use the same weighted tokens. Retain
+        // these small histograms instead of walking both chroma planes again.
+        let base_prices = std::array::from_fn(|i| {
+            let mchan = i + 1;
+            DcPlanePrice {
+                tokens: Vec::new(),
+                counts: counts[mchan * K_NUM_DC_CONTEXTS..(mchan + 1) * K_NUM_DC_CONTEXTS].to_vec(),
+                raw_bits: raw_bits[mchan],
+            }
+        });
+        Ok((Self { bits }, predictors, base_prices))
     }
 
+    #[cfg(debug_assertions)]
     #[inline]
     fn residual_bits(&self, mchan: usize, context: usize, residual: i32) -> f32 {
         let (symbol, extra, _) = uint_encode(pack_signed(residual));
@@ -127,7 +155,7 @@ pub(super) fn refine_dc_rounding(
     {
         return Ok(());
     }
-    let (prices, predictors) = Prices::new(groups, scratch)?;
+    let (prices, predictors, base_prices) = Prices::new(groups, scratch)?;
     let inv: [f32; 3] =
         std::array::from_fn(|c| INV_DC_QUANT[c] * distp.scale_dc / distp.dc_step[c]);
     let factors = [
@@ -141,17 +169,31 @@ pub(super) fn refine_dc_rounding(
     let lambda = DC_RDO_LAMBDA[0] + (DC_RDO_LAMBDA[1] - DC_RDO_LAMBDA[0]) * t;
     // Preserve luma: changing it also changes both chroma reconstruction
     // targets. Chroma channels can be raced independently under the final Y.
-    for (mchan, c, lambda) in [(1, 0, lambda * DC_RDO_X_LAMBDA_SCALE), (2, 2, lambda)] {
-        let previous: Vec<Vec<i16>> = groups
-            .iter()
-            .map(|dc| dc.quant_dc.plane(c).as_slice().to_vec())
-            .collect();
-        let (mut base_price, mut candidate_price) =
-            (DcPlanePrice::default(), DcPlanePrice::default());
+    let mut rounding = RoundingScratch::new();
+    let group_sizes: Vec<usize> = groups
+        .iter()
+        .map(|dc| dc.quant_dc.plane(0).as_slice().len())
+        .collect();
+    let mut previous = try_vec![0i16; group_sizes.iter().sum()]?;
+    let mut targets = try_vec![0.0f32; group_sizes.iter().copied().max().unwrap_or(0)]?;
+    let mut candidate_price = DcPlanePrice::default();
+    for ((mchan, c, lambda), base_price) in [(1, 0, lambda * DC_RDO_X_LAMBDA_SCALE), (2, 2, lambda)]
+        .into_iter()
+        .zip(base_prices)
+    {
+        let mut offset = 0;
+        for (dc, &len) in groups.iter().zip(&group_sizes) {
+            previous[offset..offset + len].copy_from_slice(dc.quant_dc.plane(c).as_slice());
+            offset += len;
+        }
+        candidate_price.clear();
         let (mut base_error, mut candidate_error) = (0.0f64, 0.0f64);
-        for (dc, previous) in groups.iter_mut().zip(&previous) {
+        let mut offset = 0;
+        for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
             let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
-            let mut targets = try_vec![0.0f32; w * h]?;
+            let previous = &previous[offset..offset + len];
+            let targets = &mut targets[..len];
+            offset += len;
             let source = match c {
                 0 => dc.source_dc_x.as_ref().unwrap(),
                 1 => dc.source_dc_y.as_ref().unwrap(),
@@ -168,25 +210,24 @@ pub(super) fn refine_dc_rounding(
                     *target = compensation.adjust(*target, sy, yq);
                 }
             }
-            base_price.add(previous, w, h, w);
             base_error += targets
                 .iter()
                 .zip(previous)
                 .map(|(&t, &q)| f64::from(t - f32::from(q)).powi(2))
                 .sum::<f64>();
-            refine_channel(
+            refine_channel_with_scratch(
                 dc.quant_dc.plane_mut(c).as_mut_slice(),
-                &targets,
+                targets,
                 w,
                 h,
                 mchan,
                 &predictors,
                 &prices,
                 lambda,
-                |_| {},
+                &mut rounding,
+                |_, weighted| candidate_price.add_token(weighted),
             );
             let levels = dc.quant_dc.plane(c).as_slice();
-            candidate_price.add(levels, w, h, w);
             candidate_error += targets
                 .iter()
                 .zip(levels)
@@ -201,11 +242,13 @@ pub(super) fn refine_dc_rounding(
         if candidate_bits + DC_RDO_MIN_GAIN_BITS >= base_bits
             || candidate_error + lambda * candidate_bits >= base_error + lambda * base_bits
         {
-            for (dc, previous) in groups.iter_mut().zip(previous) {
+            let mut offset = 0;
+            for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
                 dc.quant_dc
                     .plane_mut(c)
                     .as_mut_slice()
-                    .copy_from_slice(&previous);
+                    .copy_from_slice(&previous[offset..offset + len]);
+                offset += len;
             }
         }
     }
@@ -235,6 +278,51 @@ fn dc_bounds_from_truncation(target: f32) -> [i64; 2] {
     ]
 }
 
+/// Full predictor state is needed only for the last two trellis columns.
+#[derive(Clone, Copy)]
+struct TrellisNode {
+    level: i16,
+    back: u16,
+    cost: f32,
+    update: WpUpdate,
+}
+
+/// Older columns only need the chosen level and predecessor for traceback.
+#[derive(Clone, Copy)]
+struct TrellisStep {
+    level: i16,
+    back: u16,
+}
+
+type TrellisPrediction = (i64, usize, WpPrediction, f32);
+
+struct RoundingScratch {
+    wp: WpState,
+    base: Vec<[u32; 4]>,
+    older: Vec<TrellisNode>,
+    previous: Vec<TrellisNode>,
+    column: Vec<TrellisNode>,
+    history: Vec<TrellisStep>,
+    starts: Vec<usize>,
+    predictions: Vec<TrellisPrediction>,
+}
+
+impl RoundingScratch {
+    fn new() -> Self {
+        Self {
+            wp: WpState::new(0),
+            base: Vec::new(),
+            older: Vec::new(),
+            previous: Vec::new(),
+            column: Vec::new(),
+            history: Vec::new(),
+            starts: Vec::new(),
+            predictions: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn refine_channel(
     levels: &mut [i16],
@@ -245,67 +333,187 @@ fn refine_channel(
     predictors: &DcPredictorChoice,
     prices: &Prices,
     lambda: f32,
-    emit: impl FnMut(Token),
-) {
-    // Dispatch once for the complete causal pass, outside the sample loop.
-    #[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::is_x86_feature_detected!("sse4.1") {
-        // SAFETY: SSE4.1 support was checked above.
-        unsafe {
-            refine_channel_sse41(
-                levels, targets, w, h, mchan, predictors, prices, lambda, emit,
-            );
-        }
-        return;
-    }
-    const NATIVE_ROUND: bool =
-        !cfg!(any(target_arch = "x86", target_arch = "x86_64")) || cfg!(target_feature = "sse4.1");
-    refine_channel_core::<NATIVE_ROUND>(
-        levels, targets, w, h, mchan, predictors, prices, lambda, emit,
-    );
-}
-
-#[cfg(all(feature = "sse", any(target_arch = "x86", target_arch = "x86_64")))]
-#[target_feature(enable = "sse4.1")]
-#[allow(clippy::too_many_arguments)]
-fn refine_channel_sse41(
-    levels: &mut [i16],
-    targets: &[f32],
-    w: usize,
-    h: usize,
-    mchan: usize,
-    predictors: &DcPredictorChoice,
-    prices: &Prices,
-    lambda: f32,
-    emit: impl FnMut(Token),
-) {
-    refine_channel_core::<true>(
-        levels, targets, w, h, mchan, predictors, prices, lambda, emit,
-    );
-}
-
-// Inline the loop into the feature-specific entry point so floor/ceil inherit
-// its SSE4.1 target features and lower to rounding instructions.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn refine_channel_core<const NATIVE_ROUND: bool>(
-    levels: &mut [i16],
-    targets: &[f32],
-    w: usize,
-    h: usize,
-    mchan: usize,
-    predictors: &DcPredictorChoice,
-    prices: &Prices,
-    lambda: f32,
     mut emit: impl FnMut(Token),
 ) {
-    let mut wp = WpState::new(w);
+    refine_channel_with_scratch(
+        levels,
+        targets,
+        w,
+        h,
+        mchan,
+        predictors,
+        prices,
+        lambda,
+        &mut RoundingScratch::new(),
+        |selected, _| emit(selected),
+    );
+}
+
+/// Row-wise Viterbi over each block's candidate levels: its level, the
+/// target's floor and ceiling, its neighbors and the prediction, within
+/// `DC_RDO_MAX_ERROR` of the target. A block's choice is the west neighbour
+/// and weighted-predictor history of the next block's prediction, so every
+/// survivor carries the predictor record its path wrote and each transition
+/// is priced under its own path. Rows below see the finished row.
+#[allow(clippy::too_many_arguments)]
+fn refine_channel_with_scratch(
+    levels: &mut [i16],
+    targets: &[f32],
+    w: usize,
+    h: usize,
+    mchan: usize,
+    predictors: &DcPredictorChoice,
+    prices: &Prices,
+    lambda: f32,
+    scratch: &mut RoundingScratch,
+    mut emit: impl FnMut(Token, Token),
+) {
+    const NATIVE_ROUND: bool =
+        !cfg!(any(target_arch = "x86", target_arch = "x86_64")) || cfg!(target_feature = "sse4.1");
+    if w == 0 || h == 0 {
+        return;
+    }
+    let RoundingScratch {
+        wp,
+        base,
+        older,
+        previous,
+        column,
+        history,
+        starts,
+        predictions,
+    } = scratch;
+    wp.reset(w, WpParams::DEFAULT);
+    let channel_bits = &prices.bits[mchan * K_NUM_DC_CONTEXTS..(mchan + 1) * K_NUM_DC_CONTEXTS];
     for y in 0..h {
+        wp.save_row_base(y, base);
+        history.clear();
+        starts.clear();
+        older.clear();
+        previous.clear();
         for x in 0..w {
             let i = y * w + x;
             let get = |x: usize, y: usize| i64::from(levels[y * w + x]);
-            // The DC tokenizer replicates W at the top edge, N at the left
-            // edge, and N for NE at the right edge. NN is N on the second row.
+            let target = targets[i];
+            let current = i64::from(levels[i]);
+            let max_error = (target - current as f32).abs().max(DC_RDO_MAX_ERROR);
+            // A target off the level range keeps its level at no cost, so
+            // its distortion cannot overflow and freeze the rest of the row.
+            let forced = !target.is_finite() || max_error > 2.0 * f32::from(i16::MAX);
+            starts.push(history.len());
+            column.clear();
+            let push = |nodes: &mut Vec<TrellisNode>, level: i64| {
+                let level = level.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+                if (forced && !nodes.is_empty())
+                    || (target - f32::from(level)).abs() > max_error
+                    || nodes.iter().any(|n| n.level == level)
+                {
+                    return;
+                }
+                nodes.push(TrellisNode {
+                    level,
+                    cost: f32::INFINITY,
+                    back: 0,
+                    update: WpUpdate::default(),
+                });
+            };
+            push(column, current);
+            if target.is_finite() {
+                let [floor, ceil] = dc_rounding_bounds::<NATIVE_ROUND>(target);
+                for candidate in [floor, ceil, current - 1, current + 1] {
+                    push(column, candidate);
+                }
+            }
+            // Predict once per surviving path into this block. Keep the
+            // original candidate and predecessor order, including exact ties.
+            predictions.clear();
+            for s in 0..previous.len().max(1) {
+                let (west_value, path_cost) = if x > 0 {
+                    let node = previous[s];
+                    let west2 = (x > 1).then(|| older[usize::from(node.back)].update);
+                    wp.stage_path(x, y, base, Some(node.update), west2);
+                    (i64::from(node.level), node.cost)
+                } else {
+                    (0, 0.0)
+                };
+                let north = if y > 0 { get(x, y - 1) } else { west_value };
+                let west = if x == 0 { north } else { west_value };
+                let ne = if y > 0 {
+                    get((x + 1).min(w - 1), y - 1)
+                } else {
+                    west
+                };
+                let nw = if y > 0 && x > 0 {
+                    get(x - 1, y - 1)
+                } else {
+                    north
+                };
+                let nn = if y > 1 { get(x, y - 2) } else { north };
+                let prediction = wp.predict(x, y, north, west, ne, nw, nn);
+                let prop = (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX)
+                    as usize;
+                let context = K_GRADIENT_CONTEXT_LUT[prop] as usize;
+                let prediction = if predictors[context] {
+                    (north + west - nw).clamp(north.min(west), north.max(west))
+                } else {
+                    prediction
+                };
+                if target.is_finite() {
+                    push(column, prediction);
+                }
+                predictions.push((prediction, context, wp.last_prediction(), path_cost));
+            }
+            for node in column.iter_mut() {
+                let error = if forced {
+                    0.0
+                } else {
+                    target - f32::from(node.level)
+                };
+                let distortion = error * error;
+                let mut winning_prediction = None;
+                for (back, &(prediction, context, _, path_cost)) in predictions.iter().enumerate() {
+                    let (symbol, extra, _) =
+                        uint_encode(pack_signed((i64::from(node.level) - prediction) as i32));
+                    let cost = path_cost
+                        + distortion
+                        + lambda * (channel_bits[context][symbol as usize] + extra as f32);
+                    if cost < node.cost {
+                        node.cost = cost;
+                        node.back = back as u16;
+                        winning_prediction = Some(back);
+                    }
+                }
+                // Only the winner needs an update; losing transitions never
+                // contribute predictor state to a later column.
+                if let Some(back) = winning_prediction {
+                    node.update = WpState::update_for(predictions[back].2, i64::from(node.level));
+                }
+                history.push(TrellisStep {
+                    level: node.level,
+                    back: node.back,
+                });
+            }
+            std::mem::swap(older, previous);
+            std::mem::swap(previous, column);
+        }
+        let mut best = previous
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
+            .unwrap()
+            .0;
+        #[cfg(debug_assertions)]
+        let (path_cost, mut replay_cost) = (previous[best].cost, 0.0f32);
+        for x in (0..w).rev() {
+            let step = history[starts[x] + best];
+            levels[y * w + x] = step.level;
+            best = usize::from(step.back);
+        }
+        // Commit the row through the real predictor so the rows below, and
+        // the emitted tokens, see exactly what the DC coder will.
+        wp.restore_row_base(y, base);
+        for x in 0..w {
+            let get = |x: usize, y: usize| i64::from(levels[y * w + x]);
             let west = if x > 0 { get(x - 1, y) } else { 0 };
             let north = if y > 0 { get(x, y - 1) } else { west };
             let west = if x == 0 { north } else { west };
@@ -320,46 +528,40 @@ fn refine_channel_core<const NATIVE_ROUND: bool>(
                 north
             };
             let nn = if y > 1 { get(x, y - 2) } else { north };
-            let prediction = wp.predict(x, y, north, west, ne, nw, nn);
+            let weighted = wp.predict(x, y, north, west, ne, nw, nn);
             let prop =
                 (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX) as usize;
             let context = K_GRADIENT_CONTEXT_LUT[prop] as usize;
             let prediction = if predictors[context] {
                 (north + west - nw).clamp(north.min(west), north.max(west))
             } else {
-                prediction
+                weighted
             };
-            let target = targets[i];
-            let current = i64::from(levels[i]);
-            let cost = |level: i64| {
+            let level = get(x, y);
+            #[cfg(debug_assertions)]
+            {
+                let target = targets[y * w + x];
                 let error = target - level as f32;
-                error * error
-                    + lambda * prices.residual_bits(mchan, context, (level - prediction) as i32)
-            };
-            let mut best = current;
-            let mut best_cost = cost(current);
-            let max_error = (target - current as f32).abs().max(DC_RDO_MAX_ERROR);
-            if target.is_finite() {
-                let [floor, ceil] = dc_rounding_bounds::<NATIVE_ROUND>(target);
-                for candidate in [floor, ceil, current - 1, current + 1, prediction] {
-                    let candidate = candidate.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
-                    if (target - candidate as f32).abs() > max_error {
-                        continue;
-                    }
-                    let candidate_cost = cost(candidate);
-                    if candidate_cost < best_cost {
-                        best = candidate;
-                        best_cost = candidate_cost;
-                    }
-                }
+                let error = if !target.is_finite() || error.abs() > 2.0 * f32::from(i16::MAX) {
+                    0.0
+                } else {
+                    error
+                };
+                replay_cost += error * error
+                    + lambda * prices.residual_bits(mchan, context, (level - prediction) as i32);
             }
-            levels[i] = best as i16;
-            emit(Token::new(
-                context as u32,
-                pack_signed((best - prediction) as i32),
-            ));
-            wp.update(best, x, y);
+            emit(
+                Token::new(context as u32, pack_signed((level - prediction) as i32)),
+                Token::new(context as u32, pack_signed((level - weighted) as i32)),
+            );
+            wp.update(level, x, y);
         }
+        // The survivors' staged predictor state must reproduce the real one.
+        #[cfg(debug_assertions)]
+        assert!(
+            (replay_cost - path_cost).abs() <= 1e-3 * path_cost.abs().max(1.0),
+            "row {y}: trellis {path_cost} vs replay {replay_cost}"
+        );
     }
 }
 
@@ -546,6 +748,293 @@ mod tests {
     }
 
     #[test]
+    fn streamed_prices_match_full_token_streams() {
+        let mut groups = Vec::new();
+        for (w, h) in [(64, 64), (17, 9), (1, 5), (3, 2)] {
+            let mut dc = DcGroupData::new(w, h).unwrap();
+            for c in 0..3 {
+                for (i, level) in dc
+                    .quant_dc
+                    .plane_mut(c)
+                    .as_mut_slice()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *level = if c == 0 {
+                        ((i / w + i % w) % 31) as i16
+                    } else {
+                        ((i * 7919 + c * 2971) % 1001) as i16 - 500
+                    };
+                }
+            }
+            groups.push(dc);
+        }
+        let (wp, grad): (Vec<_>, Vec<_>) = groups
+            .iter()
+            .map(|dc| {
+                collect_dc_tokens_with_gradient(
+                    dc,
+                    &DC_PREDICTOR_WEIGHTED,
+                    &mut Vec::new(),
+                    false,
+                    true,
+                )
+            })
+            .unzip();
+        let mut scratch = DcPredictorScratch::default();
+        let expected = super::super::choose_dc_predictors(&wp, &grad, &mut scratch);
+        let (prices, predictors, base_prices) = Prices::new(&groups, &mut scratch).unwrap();
+        assert_eq!(predictors, expected);
+        assert!(expected.iter().any(|&gradient| gradient));
+        assert!(expected.iter().any(|&gradient| !gradient));
+        let mut counts = vec![[0u32; ALPHABET_SIZE]; 3 * K_NUM_DC_CONTEXTS];
+        for ((dc, wp), grad) in groups.iter().zip(wp).zip(grad) {
+            let mut offset = 0;
+            for (mchan, c) in [1, 0, 2].into_iter().enumerate() {
+                let end = offset + dc.quant_dc.plane(c).as_slice().len();
+                for (w, g) in wp[offset..end].iter().zip(&grad[offset..end]) {
+                    let token = if expected[w.context as usize] { g } else { w };
+                    let (symbol, _, _) = uint_encode(token.value);
+                    counts[mchan * K_NUM_DC_CONTEXTS + token.context as usize][symbol as usize] +=
+                        1;
+                }
+                offset = end;
+            }
+        }
+        for (counts, bits) in counts.iter().zip(&prices.bits) {
+            let total =
+                counts.iter().map(|&n| f64::from(n)).sum::<f64>() + 0.5 * ALPHABET_SIZE as f64;
+            for (&count, &bits) in counts.iter().zip(bits) {
+                let expected = f_log2(total / (f64::from(count) + 0.5)) as f32;
+                assert_eq!(bits.to_bits(), expected.to_bits());
+            }
+        }
+        for (c, actual) in [0, 2].into_iter().zip(base_prices) {
+            let mut expected = DcPlanePrice::default();
+            for dc in &groups {
+                let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+                expected.add(dc.quant_dc.plane(c).as_slice(), w, h, w);
+            }
+            assert_eq!(actual.counts, expected.counts);
+            assert_eq!(actual.raw_bits, expected.raw_bits);
+            assert_eq!(actual.bits().to_bits(), expected.bits().to_bits());
+        }
+        let (empty_prices, empty_predictors, _) = Prices::new(&[], &mut scratch).unwrap();
+        assert_eq!(empty_predictors, DC_PREDICTOR_WEIGHTED);
+        assert!(empty_prices.bits.iter().flatten().all(|&b| b == 7.0));
+    }
+
+    #[test]
+    fn rounding_scratch_handles_width_changes() {
+        let mut scratch = RoundingScratch::new();
+        let prices = prices();
+        for (w, h) in [(17, 4), (1, 7), (64, 5), (2, 3), (0, 3), (3, 0), (17, 4)] {
+            let original: Vec<i16> = (0..w * h)
+                .map(|i| ((i * 19 + i / w * 7) % 101) as i16 - 50)
+                .collect();
+            let targets: Vec<f32> = original.iter().map(|&q| f32::from(q) - 0.49).collect();
+            let mut expected = original.clone();
+            let mut actual = original;
+            let mut expected_tokens = Vec::new();
+            let mut actual_tokens = Vec::new();
+            refine_channel(
+                &mut expected,
+                &targets,
+                w,
+                h,
+                1,
+                &DC_PREDICTOR_WEIGHTED,
+                &prices,
+                0.06,
+                |t| expected_tokens.push((t.context, t.value)),
+            );
+            refine_channel_with_scratch(
+                &mut actual,
+                &targets,
+                w,
+                h,
+                1,
+                &DC_PREDICTOR_WEIGHTED,
+                &prices,
+                0.06,
+                &mut scratch,
+                |t, _| actual_tokens.push((t.context, t.value)),
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(actual_tokens, expected_tokens);
+        }
+    }
+
+    #[test]
+    fn replay_prices_match_a_separate_weighted_pass() {
+        let (w, h) = (17, 9);
+        let mut levels: Vec<i16> = (0..w * h)
+            .map(|i| ((i * 19 + i / w * 7) % 101) as i16 - 50)
+            .collect();
+        let targets: Vec<f32> = levels.iter().map(|&q| f32::from(q) - 0.49).collect();
+        let mut actual = DcPlanePrice::default();
+        refine_channel_with_scratch(
+            &mut levels,
+            &targets,
+            w,
+            h,
+            1,
+            &std::array::from_fn(|i| i % 2 == 0),
+            &prices(),
+            0.06,
+            &mut RoundingScratch::new(),
+            |_, weighted| actual.add_token(weighted),
+        );
+        let mut expected = DcPlanePrice::default();
+        expected.add(&levels, w, h, w);
+        assert_eq!(actual.counts, expected.counts);
+        assert_eq!(actual.raw_bits, expected.raw_bits);
+        assert_eq!(actual.bits().to_bits(), expected.bits().to_bits());
+    }
+
+    // Frozen before changing trellis storage or scheduling. Include exact
+    // levels and tokens so equal-cost tie order and WP history are covered.
+    #[test]
+    fn rounding_matches_frozen_trellis_decisions() {
+        let mut prices = prices();
+        for (context, row) in prices.bits.iter_mut().enumerate() {
+            for (symbol, bits) in row.iter_mut().enumerate() {
+                *bits = ((context * 17 + symbol * 13) % 53) as f32 * 0.125;
+            }
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut record = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        let mut random = 0x85eb_ca6bu32;
+        for (w, h) in [
+            (0, 3),
+            (3, 0),
+            (1, 1),
+            (1, 7),
+            (2, 7),
+            (3, 4),
+            (17, 9),
+            (64, 5),
+        ] {
+            for pattern in 0..5 {
+                let original: Vec<i16> = (0..w * h)
+                    .map(|i| {
+                        random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        match pattern {
+                            0 => 20,
+                            1 => (i % 37) as i16 - 18,
+                            2 => (random % 101) as i16 - 50,
+                            _ => random as i16,
+                        }
+                    })
+                    .collect();
+                let targets: Vec<f32> = original
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &q)| {
+                        if pattern == 4 {
+                            match i % 13 {
+                                0 => return f32::NAN,
+                                1 => return f32::INFINITY,
+                                2 => return f32::NEG_INFINITY,
+                                3 => return 1e20,
+                                4 => return -1e20,
+                                5 => return f32::from(i16::MIN) - 0.75,
+                                6 => return f32::from(i16::MAX) + 0.75,
+                                _ => {}
+                            }
+                        }
+                        let offset = [-0.5, 0.5, -0.49, 0.49, -0.6, 0.6, 0.0, 0.25][i % 8];
+                        f32::from(q) + if pattern == 3 { offset * 12.0 } else { offset }
+                    })
+                    .collect();
+                for predictors in [
+                    DC_PREDICTOR_WEIGHTED,
+                    [true; K_NUM_DC_CONTEXTS],
+                    std::array::from_fn(|i| i % 2 == 0),
+                ] {
+                    for mchan in [1, 2] {
+                        for lambda in [0.0, 0.04, 0.225] {
+                            let mut levels = original.clone();
+                            refine_channel(
+                                &mut levels,
+                                &targets,
+                                w,
+                                h,
+                                mchan,
+                                &predictors,
+                                &prices,
+                                lambda,
+                                |token| {
+                                    record(&token.context.to_le_bytes());
+                                    record(&token.value.to_le_bytes());
+                                },
+                            );
+                            for level in levels {
+                                record(&level.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            hash, 0x3978_cea8_1d8d_f792,
+            "trellis decisions: {hash:016x}"
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated DC rounding timing; run in release with --nocapture"]
+    fn benchmark_dc_rounding() {
+        let prices = prices();
+        for (name, w, h, texture) in [
+            ("smooth", 256, 256, false),
+            ("texture", 256, 256, true),
+            ("narrow", 17, 256, true),
+        ] {
+            let original: Vec<i16> = (0..w * h)
+                .map(|i| {
+                    if texture {
+                        ((i * 7919 + i / w * 2971) % 1001) as i16 - 500
+                    } else {
+                        ((i / w + i % w) / 13) as i16
+                    }
+                })
+                .collect();
+            let targets: Vec<f32> = original
+                .iter()
+                .enumerate()
+                .map(|(i, &q)| f32::from(q) + [-0.49, 0.45, -0.6, 0.2, 0.55][i % 5])
+                .collect();
+            let mut levels = original.clone();
+            let start = std::time::Instant::now();
+            for _ in 0..30 {
+                levels.copy_from_slice(&original);
+                refine_channel(
+                    &mut levels,
+                    &targets,
+                    w,
+                    h,
+                    1,
+                    &DC_PREDICTOR_WEIGHTED,
+                    &prices,
+                    0.06,
+                    |_| {},
+                );
+                std::hint::black_box(&levels);
+            }
+            eprintln!(
+                "{name}: {:.3} ms/pass",
+                start.elapsed().as_secs_f64() * 1e3 / 30.0
+            );
+        }
+    }
+
+    #[test]
     fn truncated_bounds_match_clamped_floor_and_ceil() {
         let check = |target: f32| {
             let clamp = |v: i64| v.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
@@ -583,72 +1072,11 @@ mod tests {
     }
 
     #[test]
-    fn rounding_dispatch_matches_portable_path() {
-        for w in [1, 2, 3, 17] {
-            for h in [1, 2, 4, 16] {
-                for predictors in [DC_PREDICTOR_WEIGHTED, std::array::from_fn(|i| i % 2 == 0)] {
-                    let original: Vec<i16> = (0..w * h).map(|i| (i * 7919) as i16).collect();
-                    let targets: Vec<f32> = original
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &q)| match i % 19 {
-                            0 => f32::from(i16::MIN) - 0.75,
-                            1 => f32::from(i16::MAX) + 0.75,
-                            2 => 1e20,
-                            3 => -1e20,
-                            4 => f32::NAN,
-                            5 => f32::INFINITY,
-                            6 => f32::NEG_INFINITY,
-                            7 => f32::from_bits(1),
-                            8 => -f32::from_bits(1),
-                            9 => -0.0,
-                            _ => f32::from(q) + [-0.51, -0.49, 0.0, 0.49, 0.51][i % 5],
-                        })
-                        .collect();
-                    for mchan in [1, 2] {
-                        for lambda in [0.04, 0.225] {
-                            let mut portable = original.clone();
-                            let mut dispatched = original.clone();
-                            let mut portable_tokens = Vec::new();
-                            let mut dispatched_tokens = Vec::new();
-                            let prices = prices();
-                            refine_channel_core::<false>(
-                                &mut portable,
-                                &targets,
-                                w,
-                                h,
-                                mchan,
-                                &predictors,
-                                &prices,
-                                lambda,
-                                |t| portable_tokens.push((t.context, t.value)),
-                            );
-                            refine_channel(
-                                &mut dispatched,
-                                &targets,
-                                w,
-                                h,
-                                mchan,
-                                &predictors,
-                                &prices,
-                                lambda,
-                                |t| dispatched_tokens.push((t.context, t.value)),
-                            );
-                            assert_eq!(portable, dispatched, "w={w}, h={h}");
-                            assert_eq!(portable_tokens, dispatched_tokens, "w={w}, h={h}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn rounding_favors_prediction_near_a_quantization_boundary() {
-        let mut levels = [20, 21, 21];
+        let mut levels = [20, 21, 20];
         refine_channel(
             &mut levels,
-            &[20.0, 20.51, 20.8],
+            &[20.0, 20.51, 20.3],
             3,
             1,
             0,
@@ -657,7 +1085,7 @@ mod tests {
             0.02,
             |_| {},
         );
-        assert_eq!(levels, [20, 20, 21]);
+        assert_eq!(levels, [20, 20, 20]);
     }
 
     #[test]
@@ -668,7 +1096,11 @@ mod tests {
                     let mut levels: Vec<i16> = (0..w * h)
                         .map(|i| ((i * 19 + i / w * 7) % 101) as i16 - 50)
                         .collect();
-                    let targets: Vec<f32> = levels.iter().map(|&q| f32::from(q) - 0.49).collect();
+                    let targets: Vec<f32> = levels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &q)| f32::from(q) + [-0.49, 0.45, -0.6, 0.2, 0.55][i % 5])
+                        .collect();
                     let mut tokens = Vec::new();
                     refine_channel(
                         &mut levels,
@@ -702,6 +1134,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rounding the second block to its nearest level costs less there, but
+    /// every block after it then pays a residual.
+    #[test]
+    fn a_run_is_rounded_as_a_whole() {
+        let targets = [20.0, 20.6, 20.4, 20.4, 20.4, 20.4];
+        let original = [20i16, 21, 20, 20, 20, 20];
+        let row_cost = |levels: &[i16]| {
+            let mut tokens = Vec::new();
+            super::super::walk_dc_channel(
+                levels,
+                levels.len(),
+                1,
+                levels.len(),
+                0,
+                &DC_PREDICTOR_WEIGHTED,
+                &mut Vec::new(),
+                false,
+                false,
+                &mut tokens,
+                &mut Vec::new(),
+            );
+            let prices = prices();
+            tokens
+                .iter()
+                .zip(levels)
+                .zip(targets)
+                .map(|((t, &q), target)| {
+                    let (symbol, extra, _) = uint_encode(t.value);
+                    (target - f32::from(q)).powi(2)
+                        + 0.03 * (prices.bits[t.context as usize][symbol as usize] + extra as f32)
+                })
+                .sum::<f32>()
+        };
+        let mut levels = original;
+        refine_channel(
+            &mut levels,
+            &targets,
+            6,
+            1,
+            0,
+            &DC_PREDICTOR_WEIGHTED,
+            &prices(),
+            0.03,
+            |_| {},
+        );
+        assert_eq!(levels, [20; 6]);
+        assert!(row_cost(&levels) < row_cost(&original));
     }
 
     #[test]
