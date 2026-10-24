@@ -1564,30 +1564,37 @@ fn grow_tree(
     }
 }
 
-/// Grow-then-prune (`MaLearnParams::prune_leaf_bits`): merge sibling leaves
-/// bottom-up while their parent, as the leaf it was scored as, codes no more
-/// than the two of them plus one leaf's bits, then renumber the reachable
-/// nodes in preorder. Children are numbered after their parent, so one
-/// descending pass visits every child first and merges cascade up the
-/// tree. Returns the pruned tree's estimated bits.
+/// Grow-then-prune (`MaLearnParams::prune_leaf_bits`): bottom-up over the
+/// grown tree, a split becomes the leaf it was scored as where that leaf
+/// codes no more than its pruned subtree plus one leaf's bits per split
+/// kept, whatever the subtree's depth. Children are numbered after their
+/// parent, so one descending pass prices every subtree before its parent.
+/// The reachable nodes are then renumbered in preorder. Returns the pruned
+/// tree's estimated bits.
 fn prune_tree(nodes: &mut Vec<MaNode>, info: &[NodeInfo], leaf_bits: f32) -> f64 {
     let n = nodes.len();
+    // Leaf bits of each pruned subtree, and the same plus the penalty of
+    // every split it keeps: the first is the estimate, the second decides.
     let mut subtree_bits = vec![0.0f64; n];
+    let mut priced_bits = vec![0.0f64; n];
     for i in (0..n).rev() {
         match nodes[i] {
-            MaNode::Leaf { .. } => subtree_bits[i] = info[i].base_bits as f64,
+            MaNode::Leaf { .. } => {
+                subtree_bits[i] = info[i].base_bits as f64;
+                priced_bits[i] = subtree_bits[i];
+            }
             MaNode::Split { gt, le, .. } => {
-                let children = subtree_bits[gt as usize] + subtree_bits[le as usize];
-                let both_leaves = matches!(nodes[gt as usize], MaNode::Leaf { .. })
-                    && matches!(nodes[le as usize], MaNode::Leaf { .. });
-                if both_leaves && info[i].base_bits as f64 <= children + leaf_bits as f64 {
+                let kept = priced_bits[gt as usize] + priced_bits[le as usize] + leaf_bits as f64;
+                if info[i].base_bits as f64 <= kept {
                     nodes[i] = MaNode::Leaf {
                         pred: info[i].pred,
                         offset: info[i].offset,
                     };
                     subtree_bits[i] = info[i].base_bits as f64;
+                    priced_bits[i] = subtree_bits[i];
                 } else {
-                    subtree_bits[i] = children;
+                    subtree_bits[i] = subtree_bits[gt as usize] + subtree_bits[le as usize];
+                    priced_bits[i] = kept;
                 }
             }
         }
@@ -2201,9 +2208,20 @@ mod tests {
         assert_eq!(est, 150.0);
 
         // 60 bits per leaf: the merge cascades to the root.
-        let mut nodes = grown;
+        let mut nodes = grown.clone();
         let est = prune_tree(&mut nodes, &infos, 60.0);
         assert_eq!(nodes, vec![leaf(5)]);
         assert_eq!(est, 200.0);
+
+        // 10 bits per leaf: the inner split (40 + 45 + 10 < 100) stays, so
+        // a root leaf of 150 bits beats the whole subtree only with both
+        // splits priced (40 + 45 + 50 + 2 * 10 = 155); merging sibling
+        // leaves alone would keep every node.
+        let mut nodes = grown;
+        let mut infos = infos;
+        infos[0].base_bits = 150.0;
+        let est = prune_tree(&mut nodes, &infos, 10.0);
+        assert_eq!(nodes, vec![leaf(5)]);
+        assert_eq!(est, 150.0);
     }
 }
