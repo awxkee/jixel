@@ -714,19 +714,6 @@ fn prune_dot_templates(
                 atlas_bits = trimmed_bits;
                 dictionary_bits = trimmed_dictionary_bits;
             }
-            // Patch entries code signed offsets within each template group.
-            // Race spatial orders against the raster baseline using the real
-            // entropy coder; fitting and template pixels stay unchanged.
-            let mut best_references = plan.references();
-            for band in [None, Some(16), Some(32), Some(64)] {
-                plan.sort_positions(band);
-                let bits = dictionary_bits_of(scratch, &plan.references());
-                if bits < dictionary_bits {
-                    dictionary_bits = bits;
-                    best_references = plan.references();
-                }
-            }
-
             let blocks_w = w.div_ceil(8);
             let mut touched = vec![false; blocks_w * h.div_ceil(8)];
             for &i in &idx {
@@ -773,7 +760,7 @@ fn prune_dot_templates(
                 gain,
                 Some(dots::DotEncoding {
                     atlas: Arc::new(atlas),
-                    references: best_references,
+                    references: plan.references(),
                 }),
             );
         }
