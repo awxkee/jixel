@@ -30,11 +30,11 @@
 
 #![forbid(unsafe_code)]
 
-use super::{
-    DC_PREDICTOR_WEIGHTED, DcPlanePrice, DcPredictorChoice, DistanceParams, K_GRAD_RANGE_MAX,
-    K_GRAD_RANGE_MID, K_GRAD_RANGE_MIN, choose_dc_predictors_from_counts,
-    collect_dc_tokens_with_gradient,
+use super::dc_tokens::{
+    DC_PREDICTOR_WEIGHTED, DcPlanePrice, DcPredictorChoice, K_GRAD_RANGE_MAX, K_GRAD_RANGE_MID,
+    K_GRAD_RANGE_MIN, choose_dc_predictors_from_counts, collect_dc_tokens_with_gradient,
 };
+use super::quantization::DistanceParams;
 use crate::coder_scratch::DcPredictorScratch;
 use crate::color_correlation::{CflFrame, dc_cfl_factor, dc_cfl_factor_x};
 use crate::dc_group_data::DcGroupData;
@@ -782,7 +782,7 @@ mod tests {
             })
             .unzip();
         let mut scratch = DcPredictorScratch::default();
-        let expected = super::super::choose_dc_predictors(&wp, &grad, &mut scratch);
+        let expected = super::super::dc_tokens::choose_dc_predictors(&wp, &grad, &mut scratch);
         let (prices, predictors, base_prices) = Prices::new(&groups, &mut scratch).unwrap();
         assert_eq!(predictors, expected);
         assert!(expected.iter().any(|&gradient| gradient));
@@ -1114,7 +1114,7 @@ mod tests {
                         |t| tokens.push(t),
                     );
                     let mut expected = Vec::new();
-                    super::super::walk_dc_channel(
+                    super::super::dc_tokens::walk_dc_channel(
                         &levels,
                         w,
                         h,
@@ -1144,7 +1144,7 @@ mod tests {
         let original = [20i16, 21, 20, 20, 20, 20];
         let row_cost = |levels: &[i16]| {
             let mut tokens = Vec::new();
-            super::super::walk_dc_channel(
+            super::super::dc_tokens::walk_dc_channel(
                 levels,
                 levels.len(),
                 1,
@@ -1208,7 +1208,7 @@ mod tests {
         groups[0].quant_dc.plane_mut(1).as_mut_slice().fill(123);
         refine_dc_rounding(
             &mut groups,
-            &super::super::compute_distance_params(4.0),
+            &super::super::quantization::compute_distance_params(4.0),
             0,
             CflFrame::XYB,
             false,
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn constant_chroma_keeps_its_levels_without_a_rate_gain() {
         use crate::image::Plane;
-        let params = super::super::compute_distance_params(4.0);
+        let params = super::super::quantization::compute_distance_params(4.0);
         let mut dc = DcGroupData::new(16, 8).unwrap();
         dc.quant_dc.plane_mut(0).as_mut_slice().fill(10);
         dc.source_dc_x = Some(Plane::new_fill(
@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn x_step_moves_a_level_under_a_flat_offset() {
-        let params = super::super::compute_distance_params(7.0);
+        let params = super::super::quantization::compute_distance_params(7.0);
         // Every block sits 0.4 levels above level 3: all round down alike.
         let mut groups = [x_step_fixture(&params, |_, _| 3.4)];
         let step = choose_x_dc_step(
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn x_step_keeps_the_default_for_unbiased_texture() {
-        let params = super::super::compute_distance_params(7.0);
+        let params = super::super::quantization::compute_distance_params(7.0);
         let mut state = 0x9e37_79b9u32;
         let mut noise = vec![0.0f32; 32 * 32];
         for v in &mut noise {
@@ -1337,7 +1337,7 @@ mod tests {
 
     #[test]
     fn x_step_needs_every_source() {
-        let params = super::super::compute_distance_params(7.0);
+        let params = super::super::quantization::compute_distance_params(7.0);
         let mut groups = [
             x_step_fixture(&params, |_, _| 3.4),
             DcGroupData::new(4, 4).unwrap(),

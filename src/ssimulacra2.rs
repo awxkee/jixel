@@ -132,18 +132,12 @@ impl Ssimulacra2State {
         (100.0 - self.state.score()) as f32
     }
 
-    /// The reconstruction changed inside `r`: refresh, saving what changes
-    /// into `cp` for `rollback`.
-    pub(crate) fn update_checkpointed(
-        &mut self,
-        recon: &Image3F,
-        r: Rect,
-        cp: &mut Ssimulacra2Checkpoint,
-    ) {
+    /// Refresh the linear RGB staging inside the clipped rectangle.
+    fn write_linear(&mut self, recon: &Image3F, r: Rect) -> Option<Rect> {
         let (w, h) = (self.width, self.height);
         let r = Rect::new(r.x0, r.y0, r.x1.min(w), r.y1.min(h));
         if r.x1 <= r.x0 || r.y1 <= r.y0 {
-            return;
+            return None;
         }
         let [lr, lg, lb] = &mut self.linear;
         for y in r.y0..r.y1 {
@@ -158,9 +152,34 @@ impl Ssimulacra2State {
                 [&mut lr[span.clone()], &mut lg[span.clone()], &mut lb[span]],
             );
         }
+        Some(r)
+    }
+
+    /// Commit a reconstruction change without saving rollback data.
+    pub(crate) fn update(&mut self, recon: &Image3F, r: Rect) {
+        let Some(r) = self.write_linear(recon, r) else {
+            return;
+        };
         let result = self
             .state
-            .update_checkpointed(planes(&self.linear, w, h), r, cp);
+            .update(planes(&self.linear, self.width, self.height), r);
+        debug_assert!(result.is_ok(), "non-finite reconstruction");
+    }
+
+    /// The reconstruction changed inside `r`: refresh, saving what changes
+    /// into `cp` for `rollback`.
+    pub(crate) fn update_checkpointed(
+        &mut self,
+        recon: &Image3F,
+        r: Rect,
+        cp: &mut Ssimulacra2Checkpoint,
+    ) {
+        let Some(r) = self.write_linear(recon, r) else {
+            return;
+        };
+        let result =
+            self.state
+                .update_checkpointed(planes(&self.linear, self.width, self.height), r, cp);
         debug_assert!(result.is_ok(), "non-finite reconstruction");
     }
 
@@ -244,6 +263,53 @@ mod tests {
         assert!(d1 > d0);
         state.rollback(&cp);
         assert!((state.deficit() - d0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn committed_updates_match_checkpointed_updates_and_later_rollbacks() {
+        let (w, h) = (65, 49);
+        let source = textured(7, w, h);
+        let mut recon = textured(8, w, h);
+        let reference = Ssimulacra2Reference::new(&source).unwrap();
+        let mut committed = reference.state(&recon);
+        let mut checkpointed = reference.state(&recon);
+        let mut cp = Ssimulacra2Checkpoint::default();
+        let mut trial_cp = Ssimulacra2Checkpoint::default();
+        for r in [
+            Rect::new(7, 9, 24, 31),
+            Rect::new(64, 48, 65, 49),
+            Rect::new(0, 0, w + 5, h + 3),
+            Rect::new(16, 8, 16, 8),
+        ] {
+            for c in 0..3 {
+                for y in r.y0..r.y1.min(h) {
+                    for v in &mut recon.plane_row_mut(c, y)[r.x0..r.x1.min(w)] {
+                        *v += (c + 1) as f32 * 0.0007;
+                    }
+                }
+            }
+            committed.update(&recon, r);
+            checkpointed.update_checkpointed(&recon, r, &mut cp);
+            let base = committed.deficit().to_bits();
+            assert_eq!(base, checkpointed.deficit().to_bits());
+            assert_eq!(committed.linear, checkpointed.linear);
+            assert_eq!(committed.map(), checkpointed.map());
+
+            let mut trial = recon.clone();
+            trial.plane_row_mut(1, 17)[23] += 0.003;
+            let rect = Rect::new(23, 17, 24, 18);
+            committed.update_checkpointed(&trial, rect, &mut trial_cp);
+            checkpointed.update_checkpointed(&trial, rect, &mut cp);
+            assert_eq!(
+                committed.deficit().to_bits(),
+                checkpointed.deficit().to_bits()
+            );
+            committed.rollback(&trial_cp);
+            checkpointed.rollback(&cp);
+            assert_eq!(committed.deficit().to_bits(), base);
+            assert_eq!(checkpointed.deficit().to_bits(), base);
+            assert_eq!(committed.map(), checkpointed.map());
+        }
     }
 
     #[test]

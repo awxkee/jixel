@@ -1773,7 +1773,15 @@ impl Default for ReconScratch {
     }
 }
 
+#[cfg(feature = "extraslow")]
+pub(crate) type PolisherSlot = Option<Box<crate::coef_polish::CoefPolisher>>;
+#[cfg(not(feature = "extraslow"))]
+pub(crate) type PolisherSlot = Option<Box<()>>;
+
 pub(crate) struct AcGroupScratch {
+    /// Study: decoder-feedback coefficient polish, set by the closed loop's
+    /// serial polish pass.
+    pub(crate) polisher: PolisherSlot,
     coeffs: HeapMatrix<f32, 3, 16384>,
     quantized: HeapMatrix<i32, 3, 16384>,
     /// Saved luma coefficients for RDOQ or reconstruction capture.
@@ -1800,6 +1808,7 @@ impl AcGroupScratch {
 impl Default for AcGroupScratch {
     fn default() -> Self {
         Self {
+            polisher: None,
             coeffs: HeapMatrix::new(0.0),
             quantized: HeapMatrix::new(0),
             source_y: None,
@@ -1895,6 +1904,7 @@ pub(crate) fn write_ac_group(
     // block per pass. Every one is written over `..size` before it is read, so
     // carrying values across groups is not observable.
     let AcGroupScratch {
+        polisher,
         coeffs,
         quantized,
         source_y,
@@ -1905,6 +1915,8 @@ pub(crate) fn write_ac_group(
         recon: recon_scratch,
         clip: clip_scratch,
     } = scratch;
+    #[cfg(not(feature = "extraslow"))]
+    let _ = polisher;
 
     // Reuse this small vector across channels and blocks. Only memo misses
     // need the offsets; ordinary encodes never read them.
@@ -2828,6 +2840,82 @@ pub(crate) fn write_ac_group(
                             m.dc.plane_row_mut(c, lby + j)[bx..bx + cov_x].copy_from_slice(src);
                         }
                     }
+                }
+                // ---- Study: decoder-feedback coefficient polish ----
+                #[cfg(feature = "extraslow")]
+                if let (Some(p), Some(prices), Some((plane, y_off, _))) = (
+                    polisher.as_deref_mut().filter(|p| p.is_current()),
+                    rdoq_prices,
+                    recon_y.as_mut(),
+                ) {
+                    let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                    let qf_hi = quant_ac as u32 > qf_threshold;
+                    let weights = rdoq_channel_weights(ctx.coding);
+                    let cw = chroma_rdoq_weight(distance);
+                    macro_rules! channel {
+                        ($c:expr, $source:expr, $inv_qm:expr, $q_scaled:expr) => {{
+                            let c: usize = $c;
+                            let block_ctx = fine_block_context(c, strategy_code, qf_hi);
+                            crate::coef_polish::PolishChannel {
+                                source: $source,
+                                inv_qm: $inv_qm,
+                                q_scaled: $q_scaled,
+                                bias: ctx.dequant_bias(c),
+                                weight: weights[c] * if c == 1 { 1.0 } else { cw },
+                                scan: coeff_orders.scan_for(strategy_code, c),
+                                histo_offset: fine_zero_density_contexts_offset(block_ctx),
+                                nzero_ctx: fine_non_zero_context(
+                                    predicted_ctx[c] as u32,
+                                    block_ctx,
+                                ),
+                            }
+                        }};
+                    }
+                    let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
+                    let source_y = source_y.as_ref().expect("luma saved for polish");
+                    let block = crate::coef_polish::PolishBlock {
+                        raw_strategy,
+                        cx,
+                        cy,
+                        size,
+                        px0: opsin_origin.0 + bx * 8,
+                        py0: opsin_origin.1 + by * 8,
+                        pw,
+                        ph,
+                        lambda: rdoq_lambda(
+                            ctx.arbiter,
+                            quant_ac as f32 / qf_threshold.max(1) as f32,
+                        ) / visible,
+                        channels: [
+                            channel!(
+                                0,
+                                &coeffs[0][..size],
+                                inv_qm_x,
+                                quantize_ac_q_scaled(quant_ac, scale, x_qm_mul)
+                            ),
+                            channel!(
+                                1,
+                                &source_y[..size],
+                                inv_qm_y,
+                                quantize_ac_q_scaled(quant_ac, scale, 1.0)
+                            ),
+                            channel!(
+                                2,
+                                &coeffs[2][..size],
+                                inv_qm_b,
+                                quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul())
+                            ),
+                        ],
+                        cfl: [x_factor, 1.0, b_factor],
+                    };
+                    let [q0, q1, q2] = &mut **quantized;
+                    p.polish(
+                        ctx,
+                        prices,
+                        &block,
+                        &mut [&mut q0[..size], &mut q1[..size], &mut q2[..size]],
+                        (&mut **plane, bx * 8, *y_off + by * 8),
+                    );
                 }
             }
             // ---- Tokenize in order Y, X, B ----

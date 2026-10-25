@@ -52,12 +52,14 @@ pub(crate) struct CvvdpCheckpoint {
 }
 
 pub(crate) struct CvvdpArbiter {
-    reference: PreparedReference,
+    reference: std::sync::Arc<PreparedReference>,
     workspace: Workspace,
     /// Incremental state of the accepted frame, once `reset`.
     state: Option<IncrementalState>,
     /// Linear RGB of the accepted frame (DC included).
     linear: [Vec<f32>; 3],
+    /// DC-adjusted XYB row scratch, reused by full and regional conversions.
+    rows: [Vec<f32>; 3],
     /// Source mean of every 8x8 block (edge blocks over their visible pixels).
     source_dc: Image3F,
     width: usize,
@@ -65,15 +67,31 @@ pub(crate) struct CvvdpArbiter {
 }
 
 impl CvvdpArbiter {
-    pub(crate) fn new(source: &Image3F) -> Option<Self> {
+    /// The analysed source, shareable between arbiters of the same frame.
+    pub(crate) fn prepare(source: &Image3F) -> Option<std::sync::Arc<PreparedReference>> {
         let (width, height) = (source.xsize(), source.ysize());
         let linear = crate::ssimulacra2::linear_of_xyb(source);
         let planes = [&linear[0][..], &linear[1][..], &linear[2][..]];
         let metric = CvvdpLite::new(display()).ok()?;
-        let mut workspace = Workspace::new();
-        workspace.reserve(width, height).ok()?;
         let image = RgbImage::linear_rgb(planes, width, height, width).ok()?;
-        let reference = metric.prepare_reference_with(image, &mut workspace).ok()?;
+        // Reference preparation reserves its analysis buffers itself; full-frame
+        // comparison masks and blur scratch are unused here.
+        Some(std::sync::Arc::new(metric.prepare_reference(image).ok()?))
+    }
+
+    pub(crate) fn new(source: &Image3F) -> Option<Self> {
+        Self::new_shared(source, Self::prepare(source)?)
+    }
+
+    /// An arbiter over an already analysed source.
+    pub(crate) fn new_shared(
+        source: &Image3F,
+        reference: std::sync::Arc<PreparedReference>,
+    ) -> Option<Self> {
+        let (width, height) = (source.xsize(), source.ysize());
+        // Incremental scoring owns its scratch. Full-frame comparisons grow
+        // this workspace lazily, so polishing workers retain no unused pyramid.
+        let workspace = Workspace::new();
         let (xb, yb) = (width.div_ceil(8), height.div_ceil(8));
         let mut source_dc = Image3F::new(xb, yb);
         for c in 0..3 {
@@ -96,11 +114,8 @@ impl CvvdpArbiter {
             reference,
             workspace,
             state: None,
-            linear: [
-                vec![0.0; width * height],
-                vec![0.0; width * height],
-                vec![0.0; width * height],
-            ],
+            linear: Default::default(),
+            rows: Default::default(),
             source_dc,
             width,
             height,
@@ -110,7 +125,7 @@ impl CvvdpArbiter {
     /// Linear RGB of `recon` with every block's DC replaced by `decoded_dc`,
     /// written into `out` (frame-sized planes) over `r`.
     fn write_linear(
-        &self,
+        &mut self,
         recon: &Image3F,
         decoded_dc: &Image3F,
         r: Rect,
@@ -118,7 +133,10 @@ impl CvvdpArbiter {
     ) {
         let w = self.width;
         let n = r.x1 - r.x0;
-        let mut rows = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
+        let rows = &mut self.rows;
+        for row in rows.iter_mut() {
+            row.resize(n, 0.0);
+        }
         let [r_out, g_out, b_out] = out;
         for y in r.y0..r.y1 {
             for (c, row) in rows.iter_mut().enumerate() {
@@ -180,6 +198,9 @@ impl CvvdpArbiter {
     /// Make `recon` with `decoded_dc` the accepted frame that updates follow.
     pub(crate) fn reset(&mut self, recon: &Image3F, decoded_dc: &Image3F) {
         let mut linear = std::mem::take(&mut self.linear);
+        for plane in &mut linear {
+            plane.resize(self.width * self.height, 0.0);
+        }
         self.write_linear(recon, decoded_dc, self.full(), &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
@@ -190,6 +211,21 @@ impl CvvdpArbiter {
     /// Pooled distortion of the accepted frame.
     pub(crate) fn deficit(&self) -> f32 {
         self.state.as_ref().expect("reset").score().distortion as f32
+    }
+
+    /// Commit a reconstruction change without saving rollback data.
+    pub(crate) fn update(&mut self, recon: &Image3F, decoded_dc: &Image3F, r: Rect) -> f32 {
+        let mut linear = std::mem::take(&mut self.linear);
+        self.write_linear(recon, decoded_dc, r, &mut linear);
+        self.linear = linear;
+        let image = self.image(&self.linear);
+        let rect = cvvdp_lite::Rect::new(r.x0, r.y0, r.x1, r.y1);
+        self.state
+            .as_mut()
+            .expect("reset")
+            .update(&self.reference, image, rect)
+            .expect("prepared reference")
+            .distortion as f32
     }
 
     /// Score the accepted frame with `recon` (and `decoded_dc`) inside `r`,
@@ -246,6 +282,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn committed_updates_preserve_scores_rollbacks_and_row_allocations() {
+        let (w, h) = (65, 49);
+        let mut source = Image3F::new(w, h);
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    source.plane_row_mut(c, y)[x] = if c == 1 { 0.4 } else { 0.0 }
+                        + ((x * 173 + y * 311 + c * 71) % 997) as f32 / 20000.0;
+                }
+            }
+        }
+        let reference = CvvdpArbiter::prepare(&source).unwrap();
+        let mut committed = CvvdpArbiter::new_shared(&source, reference.clone()).unwrap();
+        let mut checkpointed = CvvdpArbiter::new_shared(&source, reference).unwrap();
+        let mut dc = committed.source_dc.clone();
+        let mut recon = source.clone();
+        committed.reset(&recon, &dc);
+        checkpointed.reset(&recon, &dc);
+        let allocations: [_; 3] =
+            std::array::from_fn(|c| (committed.rows[c].as_ptr(), committed.rows[c].capacity()));
+        let mut cp = CvvdpCheckpoint::default();
+        let mut trial_cp = CvvdpCheckpoint::default();
+        for r in [
+            Rect::new(7, 9, 24, 31),
+            Rect::new(64, 48, 65, 49),
+            Rect::new(0, 0, w, h),
+            Rect::new(16, 8, 48, 32),
+        ] {
+            // Exercise DC correction as well as reconstruction changes.
+            dc.plane_row_mut(0, r.y0 / 8)[r.x0 / 8] += 0.0003;
+            for c in 0..3 {
+                for y in r.y0..r.y1 {
+                    for v in &mut recon.plane_row_mut(c, y)[r.x0..r.x1] {
+                        *v += (c + 1) as f32 * 0.0007;
+                    }
+                }
+            }
+            let base = committed.update(&recon, &dc, r).to_bits();
+            assert_eq!(
+                base,
+                checkpointed
+                    .update_checkpointed(&recon, &dc, r, &mut cp)
+                    .to_bits()
+            );
+            assert_eq!(committed.linear, checkpointed.linear);
+            for (row, &(ptr, capacity)) in committed.rows.iter().zip(&allocations) {
+                assert_eq!(row.as_ptr(), ptr);
+                assert_eq!(row.capacity(), capacity);
+            }
+
+            let mut trial = recon.clone();
+            trial.plane_row_mut(1, 17)[23] += 0.003;
+            let rect = Rect::new(23, 17, 24, 18);
+            let a = committed.update_checkpointed(&trial, &dc, rect, &mut trial_cp);
+            let b = checkpointed.update_checkpointed(&trial, &dc, rect, &mut cp);
+            assert_eq!(a.to_bits(), b.to_bits());
+            committed.rollback(&trial_cp);
+            checkpointed.rollback(&cp);
+            assert_eq!(committed.deficit().to_bits(), base);
+            assert_eq!(checkpointed.deficit().to_bits(), base);
+            assert_eq!(committed.linear, checkpointed.linear);
+        }
+    }
+
+    #[test]
     fn full_frame_scores_survive_releasing_incremental_storage() {
         let mut source = Image3F::new(65, 49);
         for c in 0..3 {
@@ -257,8 +358,18 @@ mod tests {
             }
         }
         let mut judge = CvvdpArbiter::new(&source).unwrap();
+        // An incremental-only judge must not reserve full-frame comparison scratch.
+        assert_eq!(
+            judge.workspace.allocated_bytes(),
+            Workspace::new().allocated_bytes()
+        );
+        assert!(judge.linear.iter().all(|plane| plane.capacity() == 0));
         let dc = judge.source_dc.clone();
         judge.reset(&source, &dc);
+        assert_eq!(
+            judge.workspace.allocated_bytes(),
+            Workspace::new().allocated_bytes()
+        );
         let mut recon = source.clone();
         for v in recon.plane_mut(1).as_mut_slice() {
             *v += 0.01;
@@ -270,5 +381,7 @@ mod tests {
         assert_eq!(after.to_bits(), before.to_bits());
         assert!(judge.state.is_none());
         assert!(judge.linear.iter().all(|plane| plane.capacity() == 0));
+        judge.reset(&recon, &dc);
+        assert!((judge.deficit() - after).abs() < 1e-5);
     }
 }

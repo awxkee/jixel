@@ -30,6 +30,8 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+#[cfg(feature = "extraslow")]
+mod coef_polish;
 mod dc_ops;
 mod dct;
 mod entropy;
@@ -80,3 +82,6 @@ pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
 
 #[cfg(feature = "splines")]
 pub(crate) use splines::continuous_idct_wasm;
+
+#[cfg(feature = "extraslow")]
+pub(crate) use coef_polish::{polish_add_scaled_wasm, polish_count_nonzero_wasm};

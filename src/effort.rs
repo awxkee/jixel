@@ -200,6 +200,9 @@ effort_gates! {
     // --- ExtraSlow only: always off without the `extraslow` feature ---
     /// Closed-loop quant-field refinement on the reconstructed luma (MS-SSIM).
     aq_closed_loop,
+    /// Per-coefficient polish of the settled frame against the exact
+    /// SSIMULACRA2 and ColorVideoVDP states (`coef_polish`).
+    coef_polish,
     /// 128-family transforms placed by the closed loop's exact SSIMULACRA2 arbiter.
     dct128_loop,
     /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
@@ -286,6 +289,7 @@ const MEDIUM_SLOW: Effort = Effort {
 
 const SLOW: Effort = Effort {
     aq_closed_loop: false,
+    coef_polish: false,
     dct128_loop: false,
     layout_loop: false,
     coeff_order_entropy_race: false,

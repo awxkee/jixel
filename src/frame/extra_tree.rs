@@ -31,7 +31,9 @@
 //! join the DC entropy code, so the AC-group streams carry no tree or
 //! histograms of their own.
 
-use super::{DcTreeChoice, ExtraPalette, ExtraSections, ImageDim, K_GROUP_DIM, write_tree_tokens};
+use super::dc_tokens::{DcTreeChoice, write_tree_tokens};
+use super::extra_channels::{ExtraPalette, ExtraSections};
+use super::{ImageDim, K_GROUP_DIM};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
