@@ -491,7 +491,7 @@ fn palette_like(xyb: &Image3F) -> bool {
 }
 
 /// Fitted spline candidates of one image, ready for RD selection.
-pub(crate) struct SplineCandidates(Vec<fit::Candidate>);
+pub(crate) struct SplineCandidates(Vec<fit::Candidate>, Vec<fit::LineGroup>);
 
 impl SplineCandidates {
     /// Whether any candidate passes through a marked 8x8 block.
@@ -529,12 +529,13 @@ pub(crate) fn find_candidates(
         return None;
     }
     let mut candidates = Vec::new();
+    let mut groups = Vec::new();
     if ctx.splines {
-        let chains = detect::detect_chains(ctx, scratch, xyb);
+        let chains = lines::split_corners(detect::detect_chains(ctx, scratch, xyb));
         if !chains.is_empty() {
             let extensions = extend::find_extensions(ctx, scratch, xyb, &chains);
             let long_lines = lines::find_long_lines(&chains);
-            candidates = fit::fit_candidates(
+            (candidates, groups) = fit::fit_candidates(
                 ctx,
                 scratch,
                 distance,
@@ -549,7 +550,7 @@ pub(crate) fn find_candidates(
     if ctx.dots {
         candidates.extend(dots::dot_candidates(&ctx.thread_pool, scratch, xyb));
     }
-    (!candidates.is_empty()).then_some(SplineCandidates(candidates))
+    (!candidates.is_empty()).then_some(SplineCandidates(candidates, groups))
 }
 
 /// RD-selects candidates against `image` and subtracts the accepted splines
@@ -576,11 +577,28 @@ pub(crate) fn select_splines(
     let mut set = if lines.is_empty() {
         None
     } else {
-        select::rd_select(ctx, scratch, distance, image, quant_field, lines, forbidden)
+        select::rd_select(
+            ctx,
+            scratch,
+            distance,
+            image,
+            quant_field,
+            lines,
+            &candidates.1,
+            forbidden,
+        )
     };
     if !dots.is_empty()
-        && let Some(dot_set) =
-            select::rd_select(ctx, scratch, distance, image, quant_field, dots, forbidden)
+        && let Some(dot_set) = select::rd_select(
+            ctx,
+            scratch,
+            distance,
+            image,
+            quant_field,
+            dots,
+            &[],
+            forbidden,
+        )
     {
         match set.as_mut() {
             Some(set) => {
@@ -617,11 +635,14 @@ mod tests {
             points: vec![Point::new(4, 4), Point::new(60, 4)],
             dct: [[0; 32]; 4],
         };
-        let candidates = SplineCandidates(vec![fit::Candidate {
-            alts: vec![line],
-            bits_factor: 1.0,
-            dot: false,
-        }]);
+        let candidates = SplineCandidates(
+            vec![fit::Candidate {
+                alts: vec![line],
+                bits_factor: 1.0,
+                dot: false,
+            }],
+            Vec::new(),
+        );
         // 8 x 2 blocks: the line runs through the whole top row
         let mut blocks = vec![false; 16];
         assert!(!candidates.touches(&blocks, 8));

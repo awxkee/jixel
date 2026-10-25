@@ -36,6 +36,7 @@
 use super::detect::{Chain, gaussian_kernels};
 use super::filter::FilterPlan;
 use super::geometry::Polyline;
+use super::lines::{LineIndex, curve_samples, unit_tangents};
 use super::select::{BlockModel, pretest};
 use super::{
     CHANNEL_WEIGHT, Point, QUANT_ADJUST, QuantizedSpline, adjusted_quant, blob_weight,
@@ -82,8 +83,17 @@ const LONG_LINE_SEEDED_WIDTHS: usize = 3;
 /// A long line touches many blocks, and the DCT8 proxy's optimism adds up over
 /// them: long splines must clear a higher bar on textured ground.
 const LONG_LINE_BITS_FACTOR: f32 = 4.0;
+/// Bounding-box slack when looking for candidates on a group, in pixels.
+const GROUP_SLACK: f32 = 8.0;
 /// A joined line gets two endpoints only when its ridge stays this close.
 const JOINED_LINE_TOLERANCE: f32 = 0.7;
+
+/// A collinear group from `lines` with whole-line alternatives. Once any of
+/// its pieces is accepted, the gate decides the line as a unit.
+pub(super) struct LineGroup {
+    pub(super) points: Vec<Point<f32>>,
+    pub(super) alts: Vec<QuantizedSpline>,
+}
 
 /// Alternative parametrisations of one detected line; the gate keeps at most one.
 pub(super) struct Candidate {
@@ -1401,6 +1411,150 @@ fn fit_joined_line(
     })
 }
 
+/// Whole-line alternatives for a collinear group: the long-line spacing and
+/// curve-aware sparse geometries, in luma-only and lean color.
+fn fit_whole_line(
+    ctx: &EncodingContext,
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    chain: &Chain,
+    scratch: &mut FitScratch,
+) -> Vec<QuantizedSpline> {
+    let spacing = LONG_LINE_MIN_SPACING.max(chain.points.len() as f32 / LONG_LINE_SPANS);
+    let mut sources = vec![uniform_control_points(&chain.points, spacing)];
+    for tol in CURVE_TOLERANCES {
+        sources.push(curve_control_points(
+            ctx,
+            &chain.points,
+            tol,
+            MAX_CURVE_POINTS,
+        ));
+    }
+    let mut geometries: Vec<Vec<Point<i32>>> = Vec::new();
+    for points in sources {
+        if points.len() < 2 || !inside(&points, w, h) {
+            continue;
+        }
+        let points = refine_geometric(ctx, &points, &chain.points, 2);
+        if inside(&points, w, h)
+            && !points.array_windows::<2>().any(|p| p[0] == p[1])
+            && !geometries.contains(&points)
+        {
+            geometries.push(points);
+        }
+    }
+    let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
+    let mut widths = LONG_LINE_WIDTHS;
+    widths.sort_by(|&a, &b| {
+        (a as f32 * sigma_step() - predicted)
+            .abs()
+            .total_cmp(&(b as f32 * sigma_step() - predicted).abs())
+    });
+    let mut alts: Vec<QuantizedSpline> = Vec::new();
+    for points in &geometries {
+        let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
+            .iter()
+            .filter_map(|&n| fit_system(targets, w, h, points, n, Precision::Compact, scratch))
+            .collect();
+        for k in 1..=LONG_LINE_MAX_COEFFS {
+            for chroma in [0, 1] {
+                let mut best: Option<Fit> = None;
+                for system in &systems {
+                    let fit = system.solve(Some((chroma, k, chroma)));
+                    if best.as_ref().is_none_or(|b| fit.gain() > b.gain()) {
+                        best = Some(fit);
+                    }
+                }
+                let Some(fit) = best else { continue };
+                let mut spline = quantize(points, &fit);
+                if chroma == 0 {
+                    spline.dct[0] = [0; 32];
+                    spline.dct[2] = [0; 32];
+                }
+                if spline.dct[1].iter().any(|&v| v != 0)
+                    && !alts
+                        .iter()
+                        .any(|a| a.points == spline.points && a.dct == spline.dct)
+                {
+                    alts.push(spline);
+                }
+            }
+        }
+    }
+    alts
+}
+
+/// Whole-line alternatives for the groups that some candidate lies on; no
+/// other group can hold an accepted spline.
+fn fit_groups(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    targets: &[Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    long_lines: &super::lines::LongLines,
+    candidates: &[Candidate],
+) -> Vec<LineGroup> {
+    if long_lines.chains.is_empty() {
+        return Vec::new();
+    }
+    let alts: Vec<&QuantizedSpline> = candidates.iter().flat_map(|c| c.alts.iter()).collect();
+    let curves = ctx.thread_pool.steal_map(scratch, alts.len(), |i, _| {
+        let (lo, hi) = alts[i].points.iter().fold(
+            (
+                Point::new(i32::MAX, i32::MAX),
+                Point::new(i32::MIN, i32::MIN),
+            ),
+            |(lo, hi), p| {
+                (
+                    Point::new(lo.x.min(p.x), lo.y.min(p.y)),
+                    Point::new(hi.x.max(p.x), hi.y.max(p.y)),
+                )
+            },
+        );
+        let (positions, tangents) = curve_samples(&alts[i].points);
+        (lo, hi, positions, tangents)
+    });
+    ctx.thread_pool
+        .steal_map(scratch, long_lines.chains.len(), |i, worker| {
+            let chain = &long_lines.chains[i];
+            let (lo, hi) = chain.points.iter().fold(
+                (
+                    Point::new(f32::MAX, f32::MAX),
+                    Point::new(f32::MIN, f32::MIN),
+                ),
+                |(lo, hi), p| {
+                    (
+                        Point::new(lo.x.min(p.x), lo.y.min(p.y)),
+                        Point::new(hi.x.max(p.x), hi.y.max(p.y)),
+                    )
+                },
+            );
+            let index = LineIndex::new(&chain.points, &unit_tangents(&chain.points));
+            let held = curves.iter().any(|(a, b, positions, tangents)| {
+                (b.x as f32) >= lo.x - GROUP_SLACK
+                    && (a.x as f32) <= hi.x + GROUP_SLACK
+                    && (b.y as f32) >= lo.y - GROUP_SLACK
+                    && (a.y as f32) <= hi.y + GROUP_SLACK
+                    && positions.len() >= 2
+                    && index.holds(positions, tangents)
+            });
+            if !held {
+                return None;
+            }
+            let alts = fit_whole_line(ctx, targets, w, h, chain, &mut worker.spline_fit);
+            worker.spline_fit.trim();
+            (!alts.is_empty()).then(|| LineGroup {
+                points: chain.points.clone(),
+                alts,
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 pub(super) fn fit_candidates(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -1410,13 +1564,14 @@ pub(super) fn fit_candidates(
     chains: &[Chain],
     extensions: &[Chain],
     long_lines: &super::lines::LongLines,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, Vec<LineGroup>) {
     let (w, h) = (xyb.xsize(), xyb.ysize());
     let targets = line_targets(ctx, scratch, xyb, chains);
     let targets = &targets;
     let model = BlockModel::new(ctx, distance);
     let model = &model;
-    ctx.thread_pool
+    let candidates: Vec<Candidate> = ctx
+        .thread_pool
         .steal_map(
             scratch,
             long_lines.joined.len() + chains.len() + extensions.len() + long_lines.chains.len(),
@@ -1471,7 +1626,9 @@ pub(super) fn fit_candidates(
         )
         .into_iter()
         .flatten()
-        .collect()
+        .collect();
+    let groups = fit_groups(ctx, scratch, targets, w, h, long_lines, &candidates);
+    (candidates, groups)
 }
 
 #[cfg(test)]

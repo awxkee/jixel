@@ -34,8 +34,9 @@
 //! gaps, and handed to the fitter as one chain; the color DCT can vanish in
 //! the gaps and change sign along the way.
 
-use super::detect::Chain;
-use super::{Point, fast_hypot};
+use super::detect::{Chain, MIN_CHAIN_LEN};
+use super::{Point, fast_hypot, sample_curve};
+use std::collections::HashMap;
 
 const MIN_FRAGMENT: usize = 20;
 /// RMS distance of a fragment's points from its own line.
@@ -393,6 +394,196 @@ pub(super) fn find_long_lines(chains: &[Chain]) -> LongLines {
     }
 }
 
+/// A chain is cut where it turns by more than 45 degrees between the
+/// `CORNER_WINDOW` points before and after.
+const CORNER_MAX_COS: f32 = std::f32::consts::FRAC_1_SQRT_2;
+const CORNER_WINDOW: usize = 6;
+/// Only polyline corners are cut: both arms stay this straight this far.
+const CORNER_ARM: usize = 16;
+const CORNER_ARM_TOLERANCE: f32 = 0.75;
+
+/// Splits chains at polyline corners. A grid or a frame is traced as L-shaped
+/// chains: they never join the straight lines they belong to, Catmull-Rom
+/// overshoots their corner, and their arms run along those lines. A cut is
+/// made only when both pieces stay long enough to be chains themselves.
+pub(super) fn split_corners(chains: Vec<Chain>) -> Vec<Chain> {
+    let mut out = Vec::with_capacity(chains.len());
+    for chain in chains {
+        let cuts = corners(&chain.points);
+        if cuts.is_empty() {
+            out.push(chain);
+            continue;
+        }
+        let n = chain.points.len();
+        let mut start = 0;
+        for &cut in &cuts {
+            out.push(Chain {
+                points: chain.points[start..cut - 2].to_vec(),
+                scale: chain.scale,
+            });
+            start = cut + 3;
+        }
+        out.push(Chain {
+            points: chain.points[start..n].to_vec(),
+            scale: chain.scale,
+        });
+    }
+    out
+}
+
+fn corners(p: &[Point<f32>]) -> Vec<usize> {
+    let n = p.len();
+    let mut cuts: Vec<usize> = Vec::new();
+    if n <= 2 * CORNER_WINDOW {
+        return cuts;
+    }
+    let cos_at = |i: usize| {
+        let (a, b) = (p[i - CORNER_WINDOW], p[i + CORNER_WINDOW]);
+        let (ux, uy) = (p[i].x - a.x, p[i].y - a.y);
+        let (vx, vy) = (b.x - p[i].x, b.y - p[i].y);
+        (ux * vx + uy * vy) / ((ux * ux + uy * uy).sqrt() * (vx * vx + vy * vy).sqrt()).max(1e-6)
+    };
+    let straight = |a: usize, b: usize| {
+        let (pa, pb) = (p[a], p[b]);
+        let (dx, dy) = (pb.x - pa.x, pb.y - pa.y);
+        let length = (dx * dx + dy * dy).sqrt().max(1e-6);
+        p[a..=b]
+            .iter()
+            .all(|q| ((q.x - pa.x) * dy - (q.y - pa.y) * dx).abs() / length <= CORNER_ARM_TOLERANCE)
+    };
+    let mut i = CORNER_WINDOW;
+    while i + CORNER_WINDOW < n {
+        if cos_at(i) >= CORNER_MAX_COS {
+            i += 1;
+            continue;
+        }
+        let mut sharpest = i;
+        let mut j = i;
+        while j + CORNER_WINDOW < n && cos_at(j) < CORNER_MAX_COS {
+            if cos_at(j) < cos_at(sharpest) {
+                sharpest = j;
+            }
+            j += 1;
+        }
+        let start = cuts.last().map_or(0, |&c| c + 3);
+        let arm = CORNER_ARM.min(sharpest).min(n - 1 - sharpest);
+        if sharpest >= start + MIN_CHAIN_LEN + 2
+            && n >= sharpest + 3 + MIN_CHAIN_LEN
+            && arm >= CORNER_WINDOW
+            && straight(sharpest - arm, sharpest - 2)
+            && straight(sharpest + 2, sharpest + arm)
+        {
+            cuts.push(sharpest);
+        }
+        i = j;
+    }
+    cuts
+}
+
+/// A curve sample counts as lying on a line within this distance, running
+/// parallel to it.
+const ON_LINE_REACH: f32 = 2.5;
+const ON_LINE_MIN_COS: f32 = 0.9;
+const ON_LINE_CELL: f32 = 4.0;
+/// A spline belongs to a line when this share of it, or this many samples of
+/// it, lie on the line.
+const MEMBER_SHARE: f32 = 0.6;
+const MEMBER_SAMPLES: usize = 24;
+
+/// Points with unit tangents, bucketed for "lies on this line" queries.
+pub(super) struct LineIndex {
+    cells: HashMap<(i32, i32), Vec<usize>>,
+    points: Vec<Point<f32>>,
+    tangents: Vec<Point<f32>>,
+}
+
+/// Unit tangents of a densely sampled curve, over two samples either side.
+pub(super) fn unit_tangents(points: &[Point<f32>]) -> Vec<Point<f32>> {
+    (0..points.len())
+        .map(|i| {
+            let a = points[i.saturating_sub(2)];
+            let b = points[(i + 2).min(points.len() - 1)];
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            let n = (dx * dx + dy * dy).sqrt().max(1e-6);
+            Point::new(dx / n, dy / n)
+        })
+        .collect()
+}
+
+/// The decoder's 1 px samples of the curve through `points`, with tangents.
+pub(super) fn curve_samples(points: &[Point<i32>]) -> (Vec<Point<f32>>, Vec<Point<f32>>) {
+    let positions: Vec<Point<f32>> = sample_curve(points).0.iter().map(|s| s.position).collect();
+    let tangents = unit_tangents(&positions);
+    (positions, tangents)
+}
+
+impl LineIndex {
+    pub(super) fn new(points: &[Point<f32>], tangents: &[Point<f32>]) -> Self {
+        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (i, p) in points.iter().enumerate() {
+            cells
+                .entry(((p.x / ON_LINE_CELL) as i32, (p.y / ON_LINE_CELL) as i32))
+                .or_default()
+                .push(i);
+        }
+        Self {
+            cells,
+            points: points.to_vec(),
+            tangents: tangents.to_vec(),
+        }
+    }
+
+    pub(super) fn points(&self) -> &[Point<f32>] {
+        &self.points
+    }
+
+    pub(super) fn tangents(&self) -> &[Point<f32>] {
+        &self.tangents
+    }
+
+    pub(super) fn near(&self, q: Point<f32>, t: Point<f32>) -> bool {
+        let (cx, cy) = ((q.x / ON_LINE_CELL) as i32, (q.y / ON_LINE_CELL) as i32);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let Some(list) = self.cells.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                for &i in list {
+                    let p = self.points[i];
+                    let (ex, ey) = (p.x - q.x, p.y - q.y);
+                    if ex * ex + ey * ey <= ON_LINE_REACH * ON_LINE_REACH
+                        && (self.tangents[i].x * t.x + self.tangents[i].y * t.y).abs()
+                            >= ON_LINE_MIN_COS
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Samples of a curve lying on this line.
+    pub(super) fn count_near(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> usize {
+        positions
+            .iter()
+            .zip(tangents)
+            .filter(|&(&q, &t)| self.near(q, t))
+            .count()
+    }
+
+    /// Whether a curve with these samples belongs to this line.
+    pub(super) fn holds(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
+        let near = self.count_near(positions, tangents);
+        near as f32 >= MEMBER_SHARE * positions.len() as f32 || near >= MEMBER_SAMPLES
+    }
+
+    /// Whether a curve this long overlaps this line enough to share it.
+    pub(super) fn overlaps(&self, positions: &[Point<f32>], tangents: &[Point<f32>]) -> bool {
+        self.count_near(positions, tangents) >= MEMBER_SAMPLES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +812,67 @@ mod tests {
                 "gaps must be bridged at about 1 px"
             );
         }
+    }
+
+    fn polyline(corners: &[(f32, f32)]) -> Chain {
+        let mut points = Vec::new();
+        for pair in corners.windows(2) {
+            let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+            let n = (x1 - x0).abs().max((y1 - y0).abs()) as usize;
+            for k in 0..n {
+                let t = k as f32 / n as f32;
+                points.push(Point::new(x0 + t * (x1 - x0), y0 + t * (y1 - y0)));
+            }
+        }
+        let &(x, y) = corners.last().unwrap();
+        points.push(Point::new(x, y));
+        Chain { points, scale: 1.0 }
+    }
+
+    #[test]
+    fn l_shaped_chains_split_into_their_arms() {
+        let pieces = split_corners(vec![polyline(&[(10.0, 10.0), (50.0, 10.0), (50.0, 60.0)])]);
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces[0].points.iter().all(|p| (p.y - 10.0).abs() < 1e-3));
+        assert!(pieces[1].points.iter().all(|p| (p.x - 50.0).abs() < 1e-3));
+        assert!(pieces.iter().all(|c| c.points.len() >= MIN_CHAIN_LEN));
+    }
+
+    #[test]
+    fn curves_and_short_arms_stay_whole() {
+        let arc = Chain {
+            points: (0..=120)
+                .map(|k| {
+                    let a = (k as f32).to_radians();
+                    Point::new(100.0 + 40.0 * a.cos(), 100.0 + 40.0 * a.sin())
+                })
+                .collect(),
+            scale: 1.0,
+        };
+        let hook = polyline(&[(10.0, 10.0), (60.0, 10.0), (60.0, 22.0)]);
+        let chains = split_corners(vec![arc, hook]);
+        assert_eq!(chains.len(), 2);
+    }
+
+    #[test]
+    fn line_membership_needs_parallel_overlap() {
+        let line: Vec<Point<f32>> = (0..=200).map(|x| Point::new(x as f32, 50.0)).collect();
+        let index = LineIndex::new(&line, &unit_tangents(&line));
+        let run = |points: Vec<Point<f32>>| {
+            let tangents = unit_tangents(&points);
+            index.holds(&points, &tangents)
+        };
+        assert!(run((40..=80).map(|x| Point::new(x as f32, 51.0)).collect()));
+        assert!(!run((40..=80)
+            .map(|y| Point::new(100.0, y as f32))
+            .collect()));
+        assert!(!run((40..=80)
+            .map(|x| Point::new(x as f32, 56.0))
+            .collect()));
+        // An L whose long arm runs along the line belongs to it.
+        let mut l: Vec<Point<f32>> = (40..=80).map(|x| Point::new(x as f32, 50.0)).collect();
+        l.extend((51..=100).map(|y| Point::new(80.0, y as f32)));
+        assert!(run(l));
     }
 
     #[test]

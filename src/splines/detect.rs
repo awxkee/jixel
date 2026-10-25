@@ -36,7 +36,7 @@ use crate::image::Image3F;
 static SCALES: [f32; 4] = [0.7, 1.0, 1.5, 2.2];
 const HYSTERESIS_HIGH: f32 = 0.02;
 const HYSTERESIS_LOW: f32 = 0.008;
-const MIN_CHAIN_LEN: usize = 20;
+pub(crate) const MIN_CHAIN_LEN: usize = 20;
 /// Component discovery pays off only with many seeds and multiple workers.
 const MIN_COMPONENT_SEEDS: usize = 500_000;
 /// Bound discovery of one component before falling back to the serial walk.
@@ -50,13 +50,13 @@ const TRACE_MIN_COS: f32 = 0.35;
 const FRAME_MARGIN: f32 = 4.0;
 
 /// A traced ridge: sub-pixel center line and its strength-weighted ridge scale.
-pub(super) struct Chain {
-    pub(super) points: Vec<Point<f32>>,
-    pub(super) scale: f32,
+pub(crate) struct Chain {
+    pub(crate) points: Vec<Point<f32>>,
+    pub(crate) scale: f32,
 }
 
 /// Gaussian kernels of derivative order 0, 1 and 2 (radius `4 * sigma`).
-pub(super) fn gaussian_kernels(sigma: f32) -> [Vec<f32>; 3] {
+pub(crate) fn gaussian_kernels(sigma: f32) -> [Vec<f32>; 3] {
     let radius = (4.0 * sigma + 0.5) as isize;
     let mut k0: Vec<f32> = (-radius..=radius)
         .map(|j| (-0.5 * (j as f32 / sigma).powi(2)).exp())
@@ -706,7 +706,7 @@ fn trace_components(
     chains.into_iter().map(|(_, chain)| chain).collect()
 }
 
-pub(super) fn detect_chains(
+pub(crate) fn detect_chains(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     xyb: &Image3F,

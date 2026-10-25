@@ -71,7 +71,8 @@ const PRICE_CAP: usize = PER_CHANNEL * 6;
 
 /// Pass counter: a polisher left in a worker's scratch from an earlier pass
 /// is inert and gets rebuilt (see `CoefPolisher::is_current`).
-pub(crate) static POLISH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static POLISH_EPOCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// ColorVideoVDP judge of the polish: the incremental arbiter following the
 /// accepted frame, the decoded DC it scores with, and its exchange rate.
@@ -102,7 +103,7 @@ pub(crate) struct CoefPolisher {
     /// Deficit per bit at the frame's exchange rate.
     lambda_bits: f32,
     cv: Option<CvJudge>,
-    epoch: u64,
+    epoch: usize,
     base_d: f32,
     cp: Ssimulacra2Checkpoint,
     delta_coef: Vec<f32>,

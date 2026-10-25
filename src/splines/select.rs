@@ -33,7 +33,8 @@
 //! priced with an adaptive token-cost model refined over two passes.
 
 use super::dots;
-use super::fit::Candidate;
+use super::fit::{Candidate, LineGroup};
+use super::lines::{LineIndex, curve_samples, unit_tangents};
 use super::render::{RenderPlan, TiledSpline};
 #[cfg(test)]
 use super::render_spline;
@@ -943,6 +944,255 @@ fn dot_saving_bound(plan: &TiledSpline, cache: &[Option<(f32, f32)>]) -> Option<
     Some(saving + 0.001 * (1.0 + saving))
 }
 
+/// Groups whose accepted pieces already cover this share of the line are left
+/// alone unless several pieces overlap on it.
+const GROUP_FULL_COVERAGE: f32 = 0.9;
+const GROUP_SLACK: i32 = 8;
+
+/// Decoder curve samples of a kept line spline and its control-point box.
+struct KeptCurve {
+    positions: Vec<Point<f32>>,
+    tangents: Vec<Point<f32>>,
+    lo: Point<i32>,
+    hi: Point<i32>,
+}
+
+impl KeptCurve {
+    fn new(sp: &QuantizedSpline) -> Option<Self> {
+        if dots::is_dot(sp) {
+            return None;
+        }
+        let (positions, tangents) = curve_samples(&sp.points);
+        if positions.len() < 2 {
+            return None;
+        }
+        let (mut lo, mut hi) = (sp.points[0], sp.points[0]);
+        for p in &sp.points {
+            lo = Point::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Point::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+        Some(Self {
+            positions,
+            tangents,
+            lo,
+            hi,
+        })
+    }
+}
+
+fn has_chroma(sp: &QuantizedSpline) -> bool {
+    sp.dct[0].iter().chain(&sp.dct[2]).any(|&v| v != 0)
+}
+
+/// Decides each collinear group as a unit once accepted splines lie on it:
+/// keep the accepted pieces, replace them with one whole-line spline, or drop
+/// them. A line coded in pieces is sharp where a piece is and blurred between,
+/// and pieces overlapping along it subtract the line twice. The whole line
+/// pays the pieces' own charge: it replaces a line already judged worth
+/// coding. Color the pieces carry is never traded for a luma-only line.
+/// Returns the indices removed from `kept`, ascending; replacements are
+/// appended to `kept`.
+#[allow(clippy::too_many_arguments)]
+fn decide_groups(
+    model: &BlockModel,
+    scratch: &mut CoderScratch,
+    current: &mut Image3F,
+    quant_field: &[f32],
+    groups: &[LineGroup],
+    kept: &mut Vec<QuantizedSpline>,
+    kept_price: &mut Vec<f32>,
+    prices: &CostModel,
+    margin: f32,
+    forbidden: Option<&[bool]>,
+    gain_bits: &mut f32,
+) -> Vec<usize> {
+    let lambda = crate::ac_strategy::RD_LAMBDA;
+    let (w, h) = (current.xsize(), current.ysize());
+    let mut curves: Vec<Option<KeptCurve>> = kept.iter().map(KeptCurve::new).collect();
+    // Original index of each kept entry; appended replacements have none.
+    let mut origin: Vec<Option<usize>> = (0..kept.len()).map(Some).collect();
+    let mut removed = Vec::new();
+    let mut cache = vec![None; w.div_ceil(8) * h.div_ceil(8)];
+    let invalidate = |cache: &mut [Option<(f32, f32)>], plans: &[&TiledSpline]| {
+        for plan in plans {
+            for tile in &plan.tiles {
+                cache[tile.cell] = None;
+            }
+        }
+    };
+    for group in groups {
+        let index = LineIndex::new(&group.points, &unit_tangents(&group.points));
+        let (mut lo, mut hi) = (group.points[0], group.points[0]);
+        for p in &group.points {
+            lo = Point::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Point::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+        let (lo, hi) = (
+            Point::new(lo.x as i32 - GROUP_SLACK, lo.y as i32 - GROUP_SLACK),
+            Point::new(hi.x as i32 + GROUP_SLACK, hi.y as i32 + GROUP_SLACK),
+        );
+        let mut members: Vec<usize> = curves
+            .iter()
+            .enumerate()
+            .filter_map(|(i, curve)| {
+                let curve = curve.as_ref()?;
+                (curve.hi.x >= lo.x
+                    && curve.lo.x <= hi.x
+                    && curve.hi.y >= lo.y
+                    && curve.lo.y <= hi.y
+                    && index.holds(&curve.positions, &curve.tangents))
+                .then_some(i)
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        // Pieces traced in a neighboring group of the same line lie on the
+        // whole-line alternatives instead.
+        let alt_samples: Vec<_> = group
+            .alts
+            .iter()
+            .map(|alt| curve_samples(&alt.points))
+            .collect();
+        let alt_index = LineIndex::new(
+            &alt_samples
+                .iter()
+                .flat_map(|s| s.0.iter().copied())
+                .collect::<Vec<_>>(),
+            &alt_samples
+                .iter()
+                .flat_map(|s| s.1.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        let (mut alt_lo, mut alt_hi) = (lo, hi);
+        for p in group.alts.iter().flat_map(|alt| alt.points.iter()) {
+            alt_lo = Point::new(
+                alt_lo.x.min(p.x - GROUP_SLACK),
+                alt_lo.y.min(p.y - GROUP_SLACK),
+            );
+            alt_hi = Point::new(
+                alt_hi.x.max(p.x + GROUP_SLACK),
+                alt_hi.y.max(p.y + GROUP_SLACK),
+            );
+        }
+        for (i, curve) in curves.iter().enumerate() {
+            if let Some(curve) = curve
+                && !members.contains(&i)
+                && curve.hi.x >= alt_lo.x
+                && curve.lo.x <= alt_hi.x
+                && curve.hi.y >= alt_lo.y
+                && curve.lo.y <= alt_hi.y
+                && alt_index.overlaps(&curve.positions, &curve.tangents)
+            {
+                members.push(i);
+            }
+        }
+        members.sort_unstable();
+        let member_points: Vec<Point<f32>> = members
+            .iter()
+            .flat_map(|&i| curves[i].as_ref().unwrap().positions.iter().copied())
+            .collect();
+        let member_tangents: Vec<Point<f32>> = members
+            .iter()
+            .flat_map(|&i| curves[i].as_ref().unwrap().tangents.iter().copied())
+            .collect();
+        let covered = LineIndex::new(&member_points, &member_tangents);
+        let coverage =
+            covered.count_near(index.points(), index.tangents()) as f32 / group.points.len() as f32;
+        if coverage >= GROUP_FULL_COVERAGE && members.len() < 2 {
+            continue;
+        }
+        let member_plans: Vec<TiledSpline> = members
+            .iter()
+            .map(|&i| RenderPlan::new(model.ctx, &kept[i], QUANT_ADJUST, w, h).tiled())
+            .collect();
+        let member_refs: Vec<&TiledSpline> = member_plans.iter().collect();
+        let mut restore = Trial::new(current, &member_refs);
+        for plan in &member_plans {
+            restore.draw(plan, 1.0);
+        }
+        restore.commit(current);
+        invalidate(&mut cache, &member_refs);
+        let colored = members.iter().any(|&i| has_chroma(&kept[i]));
+        let alt_plans = model
+            .ctx
+            .thread_pool
+            .steal_map(scratch, group.alts.len(), |a, _| {
+                let alt = &group.alts[a];
+                if colored && !has_chroma(alt) {
+                    return None;
+                }
+                let plan = RenderPlan::new(model.ctx, alt, QUANT_ADJUST, w, h).tiled();
+                plan.bounds().map(|_| plan)
+            });
+        cache_blocks_parallel(
+            model,
+            scratch,
+            current,
+            quant_field,
+            &mut cache,
+            member_plans.iter().chain(alt_plans.iter().flatten()),
+        );
+        let mut subset = Trial::new(current, &member_refs);
+        for plan in &member_plans {
+            subset.draw(plan, -1.0);
+        }
+        let Some(d_subset) = subset.delta(model, current, quant_field, &cache, forbidden) else {
+            subset.commit(current);
+            invalidate(&mut cache, &member_refs);
+            continue;
+        };
+        let j_subset = d_subset + lambda * members.iter().map(|&i| kept_price[i]).sum::<f32>();
+        let (state, cached): (&Image3F, &[Option<(f32, f32)>]) = (current, &cache);
+        let evaluations = model
+            .ctx
+            .thread_pool
+            .steal_map(scratch, group.alts.len(), |a, _| {
+                let plan = alt_plans[a].as_ref()?;
+                let mut trial = Trial::new(state, &[plan]);
+                trial.draw(plan, -1.0);
+                let d = trial.delta(model, state, quant_field, cached, forbidden)?;
+                Some((
+                    d + lambda * margin * prices.spline_bits(&group.alts[a]),
+                    trial,
+                ))
+            });
+        let mut best: Option<(f32, usize, Trial)> = None;
+        for (a, evaluation) in evaluations.into_iter().enumerate() {
+            if let Some((j, trial)) = evaluation
+                && best.as_ref().is_none_or(|(bj, _, _)| j < *bj)
+            {
+                best = Some((j, a, trial));
+            }
+        }
+        if let Some((j, a, trial)) = best.filter(|&(j, _, _)| j < j_subset && j < 0.0) {
+            trial.commit(current);
+            invalidate(&mut cache, &[alt_plans[a].as_ref().unwrap()]);
+            *gain_bits += (j_subset - j) / lambda;
+            let alt = group.alts[a].clone();
+            kept_price.push(margin * prices.spline_bits(&alt));
+            curves.push(KeptCurve::new(&alt));
+            kept.push(alt);
+            origin.push(None);
+        } else if j_subset >= 0.0 {
+            *gain_bits += j_subset / lambda;
+        } else {
+            subset.commit(current);
+            invalidate(&mut cache, &member_refs);
+            continue;
+        }
+        for &i in members.iter().rev() {
+            removed.extend(origin[i]);
+            kept.remove(i);
+            kept_price.remove(i);
+            curves.remove(i);
+            origin.remove(i);
+        }
+    }
+    removed.sort_unstable();
+    removed
+}
+
 /// Subtracts the accepted splines from `xyb` and returns them.
 pub(super) fn rd_select(
     ctx: &EncodingContext,
@@ -951,6 +1201,7 @@ pub(super) fn rd_select(
     xyb: &mut Image3F,
     quant_field: &[f32],
     candidates: &[Candidate],
+    groups: &[LineGroup],
     forbidden: Option<&[bool]>,
 ) -> Option<SplineSet> {
     let lambda = crate::ac_strategy::RD_LAMBDA;
@@ -1350,6 +1601,33 @@ pub(super) fn rd_select(
             }
         }
     }
+    if !groups.is_empty() && !kept.is_empty() {
+        let mut kept_price: Vec<f32> = kept
+            .iter()
+            .zip(&kept_candidates)
+            .map(|(sp, &i)| price(&prices, &candidates[i], sp))
+            .collect();
+        let removed = decide_groups(
+            &model,
+            scratch,
+            &mut current,
+            quant_field,
+            groups,
+            &mut kept,
+            &mut kept_price,
+            &prices,
+            margin,
+            forbidden,
+            &mut gain_bits,
+        );
+        // Replacements are lines, never dots: only the dot path reads these.
+        for i in removed.into_iter().rev() {
+            kept_raw.remove(i);
+            kept_candidates.remove(i);
+        }
+        kept_raw.resize(kept.len(), 0.0);
+        kept_candidates.resize(kept.len(), usize::MAX);
+    }
     let dot_encoding = if kept.iter().any(dots::is_dot) {
         let (gain, encoding) = prune_dot_templates(
             &model,
@@ -1732,6 +2010,7 @@ mod tests {
                 &mut residual,
                 &quant,
                 candidates,
+                &[],
                 None,
             )
             .unwrap();
@@ -1939,6 +2218,92 @@ mod tests {
         }
     }
 
+    fn group_fixture(
+        line_dct: impl Fn(&mut [[i32; 32]; 4]),
+        pieces: &[(i32, i32)],
+        whole_alt: impl Fn(&mut [[i32; 32]; 4]),
+    ) -> (SplineSet, QuantizedSpline) {
+        let kernels = crate::encoding_context::EncodingContext::default();
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
+        let line = |x0: i32, x1: i32, color: &dyn Fn(&mut [[i32; 32]; 4])| {
+            let mut sp = QuantizedSpline {
+                points: vec![Point::new(x0, 32), Point::new(x1, 32)],
+                dct: [[0; 32]; 4],
+            };
+            color(&mut sp.dct);
+            sp.dct[3][0] = 4;
+            sp
+        };
+        let mut image = Image3F::new(256, 64);
+        render_spline(
+            &kernels,
+            &line(16, 240, &line_dct),
+            QUANT_ADJUST,
+            &mut image,
+            1.0,
+        );
+        let candidates: Vec<Candidate> = pieces
+            .iter()
+            .map(|&(x0, x1)| Candidate {
+                alts: vec![line(x0, x1, &line_dct)],
+                bits_factor: 1.0,
+                dot: false,
+            })
+            .collect();
+        let whole = line(16, 240, &whole_alt);
+        let groups = [LineGroup {
+            points: (16..=240).map(|x| Point::new(x as f32, 32.0)).collect(),
+            alts: vec![whole.clone()],
+        }];
+        let selected = rd_select(
+            &ctx,
+            &mut CoderScratch::default(),
+            3.0,
+            &mut image,
+            &vec![8.0; 32 * 8],
+            &candidates,
+            &groups,
+            None,
+        )
+        .unwrap();
+        (selected, whole)
+    }
+
+    #[test]
+    fn a_line_accepted_in_part_is_coded_whole() {
+        let luma = |dct: &mut [[i32; 32]; 4]| dct[1][0] = 5;
+        let (selected, whole) = group_fixture(luma, &[(16, 96)], luma);
+        assert_eq!(selected.splines.len(), 1);
+        assert_eq!(selected.splines[0].points, whole.points);
+    }
+
+    #[test]
+    fn overlapping_pieces_of_a_line_become_one_spline() {
+        let luma = |dct: &mut [[i32; 32]; 4]| dct[1][0] = 5;
+        let (selected, whole) = group_fixture(luma, &[(16, 140), (110, 240)], luma);
+        assert_eq!(selected.splines.len(), 1);
+        assert_eq!(selected.splines[0].points, whole.points);
+    }
+
+    #[test]
+    fn colored_pieces_are_not_replaced_by_a_luma_only_line() {
+        let colored = |dct: &mut [[i32; 32]; 4]| {
+            dct[1][0] = 5;
+            dct[2][0] = 6;
+        };
+        let luma = |dct: &mut [[i32; 32]; 4]| dct[1][0] = 5;
+        let (selected, whole) = group_fixture(colored, &[(16, 96)], luma);
+        assert!(!selected.splines.is_empty());
+        assert!(selected.splines.iter().all(|sp| sp.points != whole.points));
+        assert!(selected.splines.iter().all(|sp| sp.dct[2][0] != 0));
+    }
+
     #[test]
     fn repricing_does_not_accept_duplicate_lines_against_a_stale_residual() {
         let kernels = crate::encoding_context::EncodingContext::default();
@@ -2006,6 +2371,7 @@ mod tests {
             &mut image,
             &quant,
             &candidates,
+            &[],
             None,
         )
         .unwrap();
@@ -2411,6 +2777,7 @@ mod tests {
                     &mut actual_image,
                     &quant,
                     &candidates,
+                    &[],
                     mask,
                 )
                 .unwrap();
