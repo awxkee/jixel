@@ -76,6 +76,7 @@ use crate::entropy::{
     Token, optimize_entropy_code_ac, pack_signed, write_ans_tokens, write_entropy_code, write_token,
 };
 use crate::image::Image3F;
+use crate::path_order;
 
 /// X, Y, B, sigma.
 static CHANNEL_WEIGHT: [f32; 4] = [0.0042, 0.075, 0.07, 0.3333];
@@ -387,9 +388,19 @@ fn coding_order(splines: &[QuantizedSpline]) -> Vec<&QuantizedSpline> {
     order
 }
 
-/// LfGlobal spline section (after the patch dictionary, before the DC scales).
-pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut BitWriter) {
-    let splines = coding_order(&set.splines);
+/// Start positions priced as the section codes them (the first absolute, then
+/// deltas, all in one context), ordered as the cheapest open path from `chain`.
+fn priced_order<'a>(chain: &[&'a QuantizedSpline]) -> Vec<&'a QuantizedSpline> {
+    let points: Vec<path_order::Pos> = chain
+        .iter()
+        .map(|sp| (sp.points[0].x, sp.points[0].y))
+        .collect();
+    let given = vec![(0..points.len()).collect()];
+    let order = path_order::order_sets(&[points], &[true], given, true);
+    order[0].iter().map(|&i| chain[i]).collect()
+}
+
+fn spline_section_tokens(set: &SplineSet, splines: &[&QuantizedSpline]) -> Vec<Token> {
     let mut tokens = Vec::new();
     tokens.push(Token::new(CTX_NUM_SPLINES, (splines.len() - 1) as u32));
     let (mut lx, mut ly) = (0i32, 0i32);
@@ -408,24 +419,48 @@ pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut
     for sp in splines {
         tokens.extend(spline_tokens(sp).into_iter().map(|(c, v)| Token::new(c, v)));
     }
-    let code = optimize_entropy_code_ac(&tokens, NUM_SPLINE_CONTEXTS, &mut scratch.huffman_pool);
+    tokens
+}
+
+fn encode_spline_section(tokens: &[Token], scratch: &mut CoderScratch) -> BitWriter {
+    let mut w = BitWriter::new();
+    let code = optimize_entropy_code_ac(tokens, NUM_SPLINE_CONTEXTS, &mut scratch.huffman_pool);
     let code_ref = code.as_ref();
     w.write(1, 0); // no LZ77
-    write_entropy_code(&code_ref, &mut scratch.huffman_pool, w);
+    write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut w);
     if code_ref.use_prefix_code {
-        for token in tokens {
-            write_token(token, &code_ref, w);
+        for &token in tokens {
+            write_token(token, &code_ref, &mut w);
         }
     } else {
         write_ans_tokens(
-            &tokens,
+            tokens,
             code_ref.context_map,
             code_ref.ans_symbols,
             code_ref.ans_reverse_maps,
             code_ref.hybrid_uint_configs,
-            w,
+            &mut w,
         );
     }
+    w
+}
+
+/// LfGlobal spline section (after the patch dictionary, before the DC scales).
+pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut BitWriter) {
+    let chain = coding_order(&set.splines);
+    let mut best = encode_spline_section(&spline_section_tokens(set, &chain), scratch);
+    let priced = priced_order(&chain);
+    if priced
+        .iter()
+        .zip(&chain)
+        .any(|(a, b)| !std::ptr::eq(*a, *b))
+    {
+        let candidate = encode_spline_section(&spline_section_tokens(set, &priced), scratch);
+        if candidate.bits_written() < best.bits_written() {
+            best = candidate;
+        }
+    }
+    w.append(&best);
 }
 
 /// Few distinct colors: bilevel / palette art whose hard aliased strokes the

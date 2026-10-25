@@ -89,6 +89,7 @@ mod neon;
 mod noise;
 mod orientation;
 mod patches;
+mod path_order;
 mod quant_weights;
 mod region_frames;
 #[cfg(feature = "splines")]
