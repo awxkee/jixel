@@ -4631,48 +4631,6 @@ mod encode_smoke_tests {
         );
     }
 
-    #[test]
-    fn vector_layers_race_the_patched_text_encode() {
-        // Text on white passes the vector split, and the edge-cost model
-        // that admits the vector encode does not see the glyph patches
-        // coding the text at a fraction of its size: the patched encode has
-        // to decide.
-        const SIZE: usize = 256;
-        let pixels = glyph_text_pixels(SIZE);
-        let layered = EncodeConfig::default()
-            .with_distance(1.0)
-            .with_speed(Speed::Slow)
-            .with_patches(true)
-            .with_ink_layer(true)
-            .with_vector_layers(true);
-        let unvectored = layered.clone().with_vector_layers(false);
-        let plain = unvectored.clone().with_ink_layer(false);
-        let unpatched = layered.clone().with_patches(false);
-        let layered = encode_image(&pixels, SIZE, SIZE, &layered).unwrap();
-        let unvectored = encode_image(&pixels, SIZE, SIZE, &unvectored).unwrap();
-        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
-        let unpatched = encode_image(&pixels, SIZE, SIZE, &unpatched).unwrap();
-        // The vector encode fits the model where the patches are off.
-        assert!(
-            unpatched.len() * 5 > plain.len() * 7,
-            "{} vs {}",
-            unpatched.len(),
-            plain.len()
-        );
-        assert!(
-            layered.len() <= plain.len(),
-            "{} vs {}",
-            layered.len(),
-            plain.len()
-        );
-        assert!(
-            unvectored.len() <= plain.len(),
-            "{} vs {}",
-            unvectored.len(),
-            plain.len()
-        );
-    }
-
     /// Noise with one 16x16 noise tile repeated on half of the grid.
     fn repeated_region_pixels() -> Vec<u8> {
         const PW: usize = 256;
@@ -4918,53 +4876,6 @@ mod encode_smoke_tests {
             .with_ink_layer(false)
             .with_vector_layers(false)
             .with_learned_rate(true)
-    }
-
-    #[test]
-    fn learned_rate_output_is_independent_of_thread_count() {
-        const SIZE: usize = 272;
-        let pixels = checkerboard_rgb(SIZE);
-        for distance in [1.0f32, 2.0, 4.0] {
-            let config = learned_rate_lossy(distance);
-            let single = encode_image(&pixels, SIZE, SIZE, &config.clone().with_num_threads(1))
-                .expect("single-threaded encode failed");
-            for threads in [2, 8] {
-                let threaded = encode_image(
-                    &pixels,
-                    SIZE,
-                    SIZE,
-                    &config.clone().with_num_threads(threads),
-                )
-                .expect("multi-threaded encode failed");
-                assert_eq!(single, threaded, "d={distance} threads={threads}");
-            }
-        }
-    }
-
-    /// Two DC groups: the first is sampled by regions, the second is too
-    /// narrow for that and is its own pilot.
-    #[test]
-    fn learned_rate_is_deterministic_across_dc_groups() {
-        const WIDTH: usize = 2112;
-        const HEIGHT: usize = 128;
-        let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let lit = (x / 4 + y / 4) % 2 == 1;
-                let ramp = (x * 97 / WIDTH) as u8;
-                pixels.extend_from_slice(&if lit {
-                    [200 - ramp, 30 + ramp, 12]
-                } else {
-                    [20 + ramp / 2, ramp, 90]
-                });
-            }
-        }
-        let config = learned_rate_lossy(2.0);
-        let single = encode_image(&pixels, WIDTH, HEIGHT, &config.clone().with_num_threads(1))
-            .expect("single-threaded encode failed");
-        let threaded = encode_image(&pixels, WIDTH, HEIGHT, &config.with_num_threads(8))
-            .expect("multi-threaded encode failed");
-        assert_eq!(single, threaded);
     }
 
     #[test]

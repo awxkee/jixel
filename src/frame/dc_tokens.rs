@@ -167,7 +167,8 @@ const MIN_TOKENS_PER_DC_LEAF: u32 = 256;
 /// Required saving before flipping a leaf away from the weighted predictor.
 const DC_PREDICTOR_MARGIN: f64 = 0.995;
 
-pub(crate) fn collect_dc_tokens(
+#[cfg(test)]
+fn collect_dc_tokens(
     dc_data: &DcGroupData,
     dc_gradient: &DcPredictorChoice,
     props: &mut Vec<crate::dc_tree::DcProp>,
@@ -176,7 +177,7 @@ pub(crate) fn collect_dc_tokens(
     collect_dc_tokens_with_gradient(dc_data, dc_gradient, props, collect_props, false).0
 }
 
-pub(super) fn collect_dc_tokens_with_gradient(
+pub(crate) fn collect_dc_tokens_with_gradient(
     dc_data: &DcGroupData,
     dc_gradient: &DcPredictorChoice,
     props: &mut Vec<crate::dc_tree::DcProp>,
