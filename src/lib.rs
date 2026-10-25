@@ -47,6 +47,8 @@ mod clip_continuation;
 mod cmyk;
 mod coder_scratch;
 mod coding;
+#[cfg(feature = "extraslow")]
+mod coef_polish;
 mod coeff_order;
 mod color;
 mod color_correlation;

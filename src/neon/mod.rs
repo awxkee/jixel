@@ -30,6 +30,8 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+#[cfg(feature = "extraslow")]
+mod coef_polish;
 mod color;
 mod dc_ops;
 mod dct;
@@ -103,3 +105,6 @@ pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fi
 pub(crate) use splines::{
     continuous_idct_neon, spline_distance_neon, spline_render_row_neon, spline_ridge_row_neon,
 };
+
+#[cfg(feature = "extraslow")]
+pub(crate) use coef_polish::{polish_add_scaled_neon, polish_count_nonzero_neon};

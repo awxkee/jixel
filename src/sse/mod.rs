@@ -30,6 +30,8 @@ mod ac_strategy;
 mod adaptive_quant;
 mod afv;
 mod cfl;
+#[cfg(feature = "extraslow")]
+mod coef_polish;
 mod color;
 mod dc_ops;
 mod dct;
@@ -83,3 +85,6 @@ pub(crate) use xyb::{to_linear_rows_sse41, to_xyb_sse41_band};
 
 #[cfg(feature = "splines")]
 pub(crate) use splines::{continuous_idct_sse2, continuous_idct_sse41};
+
+#[cfg(feature = "extraslow")]
+pub(crate) use coef_polish::{polish_add_scaled_sse41, polish_count_nonzero_sse41};

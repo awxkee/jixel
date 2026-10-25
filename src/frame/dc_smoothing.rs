@@ -28,7 +28,8 @@
  */
 #![forbid(unsafe_code)]
 
-use super::{DistanceParams, ImageDim, K_BLOCK_DIM, K_DC_GROUP_DIM};
+use super::quantization::DistanceParams;
+use super::{ImageDim, K_BLOCK_DIM, K_DC_GROUP_DIM};
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
 use crate::dc_ops::{AdjustBdcFn, BdcCompensation, CompensateBdcFn, ReconstructDcFn};
@@ -39,7 +40,7 @@ use crate::thread_pool::ThreadPool;
 use crate::util::{EncodeError, try_vec};
 
 impl BdcCompensation {
-    pub(crate) fn new(distp: &DistanceParams) -> Self {
+    pub(super) fn new(distp: &DistanceParams) -> Self {
         use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
         Self {
             scale_b: INV_DC_QUANT[2] / distp.dc_step[2] * distp.scale_dc,
@@ -614,7 +615,7 @@ mod tests {
 
     #[test]
     fn compensation_can_improve_b_minus_y_while_increasing_b_error() {
-        let mut distp = crate::frame::compute_distance_params(2.0);
+        let mut distp = super::super::quantization::compute_distance_params(2.0);
         distp.scale_dc = 1.0;
         distp.dc_step = [1.0; 3];
         let compensation = BdcCompensation::new(&distp);
@@ -919,7 +920,7 @@ mod tests {
         custom_cfl: bool,
     ) -> (ImageDim, Vec<DcGroupData>, DistanceParams, i32, CflFrame) {
         let dim = ImageDim::new(w * K_BLOCK_DIM - 1, h * K_BLOCK_DIM - 1);
-        let mut params = crate::frame::compute_distance_params(2.0);
+        let mut params = super::super::quantization::compute_distance_params(2.0);
         params.dc_step = if custom_cfl {
             [0.731, 1.173, 1.319]
         } else {
