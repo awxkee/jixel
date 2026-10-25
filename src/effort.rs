@@ -263,16 +263,33 @@ const FAST: Effort = Effort {
 };
 
 const MEDIUM: Effort = Effort {
-    layout_retile_32: false,
-    tree_full_sampling: false,
-    ..MEDIUM_SLOW
+    cfl_rdo: true,
+    yellow_opsin: true,
+    chroma_policy: true,
+    fine_mosaic: true,
+    coeff_orders: true,
+    dc_rdoq: true,
+    chroma_dc_squeeze: true,
+    dc_x_cfl: true,
+    ink_layer_default: true,
+    clip_continuation: true,
+    lz_deep: true,
+    lz_refined_entropy: true,
+    predictor_search: true,
+    rct_dense_rows: true,
+    wp_search: true,
+    local_palette_select: true,
+    palette_dual: true,
+    learned_tree: true,
+    tree_rank: true,
+    tree_global_palette: true,
+    tree_group_palette: true,
+    ..FAST
 };
 
 const MEDIUM_SLOW: Effort = Effort {
-    learned_rate: false,
+    layout_retile_32: false,
     vector_layers_default: false,
-    clip_continuation: false,
-    epf_fit: false,
     ac_ctx_plan: false,
     lossy_modular_auto: false,
     splines: false,

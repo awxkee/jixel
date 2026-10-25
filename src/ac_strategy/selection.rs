@@ -3756,12 +3756,9 @@ mod tests {
             crate::Speed::UltraFast,
             crate::Speed::Fastest,
             crate::Speed::Fast,
-        ];
-        let mut slow_like = vec![
             crate::Speed::Medium,
-            crate::Speed::MediumSlow,
-            crate::Speed::Slow,
         ];
+        let mut slow_like = vec![crate::Speed::MediumSlow, crate::Speed::Slow];
         if cfg!(feature = "extraslow") {
             plain.push(crate::Speed::ExtraSlow);
         } else {
@@ -4782,18 +4779,17 @@ mod tests {
     }
 
     /// AFV (with the rest of sub-8) needs the rectangle search, which starts
-    /// at Medium, as does the rerank at every distance.
+    /// at MediumSlow, as does the rerank at every distance.
     #[test]
-    fn sub8_and_afv_start_at_medium() {
+    fn sub8_and_afv_start_at_medium_slow() {
         let fastest = SearchScope::for_speed(crate::Speed::Fastest);
         assert!(!fastest.rectangles() && !fastest.merge_32() && !fastest.merge_busy_quads());
-        assert_eq!(
-            SearchScope::for_speed(crate::Speed::Fast),
-            SearchScope::SQUARES
-        );
-        let medium = SearchScope::for_speed(crate::Speed::Medium);
-        assert!(medium.rectangles());
-        assert!(medium.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
+        for speed in [crate::Speed::Fast, crate::Speed::Medium] {
+            assert_eq!(SearchScope::for_speed(speed), SearchScope::SQUARES);
+        }
+        let medium_slow = SearchScope::for_speed(crate::Speed::MediumSlow);
+        assert!(medium_slow.rectangles());
+        assert!(medium_slow.rerank(FAST_RERANK_MAX_DISTANCE + 0.001));
         assert_eq!(
             SearchScope::for_speed(crate::Speed::Slow),
             SearchScope::FULL

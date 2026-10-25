@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Bounded candidate search for Medium and Slow.
+//! Bounded candidate search for the rectangle-search tiers.
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct CandidateSearch {
