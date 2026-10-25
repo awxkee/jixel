@@ -42,8 +42,8 @@ use crate::entropy::{
     Token, optimize_entropy_code, pack_signed, write_ans_tokens, write_entropy_code, write_token,
 };
 use crate::frame::{
-    collect_ac_metadata_tokens, collect_dc_tokens, combine_sections, write_context_tree,
-    write_quant_scales,
+    collect_ac_metadata_tokens, collect_dc_tokens_with_gradient, combine_sections,
+    combined_sections_size, write_context_tree, write_quant_scales,
 };
 use crate::image::Image3B;
 use crate::static_entropy_codes::K_NUM_DC_CONTEXTS;
@@ -869,6 +869,8 @@ fn write_raw_quant_image(
 struct Effort {
     /// Also code the natural coefficient order and keep the cheaper one.
     try_natural_order: bool,
+    /// Race the fixed DC tree against a per-image learned tree.
+    learned_dc_tree: bool,
     /// Pick per-cluster HybridUint configs instead of the default.
     select_configs: bool,
     refinement: Option<AnsRefinement>,
@@ -879,26 +881,31 @@ impl Effort {
         match speed {
             Speed::UltraFast => Self {
                 try_natural_order: false,
+                learned_dc_tree: false,
                 select_configs: false,
                 refinement: None,
             },
             Speed::Fastest => Self {
                 try_natural_order: false,
+                learned_dc_tree: false,
                 select_configs: false,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Fast => Self {
                 try_natural_order: false,
+                learned_dc_tree: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Medium | Speed::MediumSlow => Self {
                 try_natural_order: false,
+                learned_dc_tree: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: true }),
             },
             Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
+                learned_dc_tree: true,
                 select_configs: true,
                 refinement: Some(AnsRefinement::slow_for_speed(speed)),
             },
@@ -1010,15 +1017,17 @@ fn encode_jpeg_codestream_with_pool(
         .sum();
     let small_tree = crate::dc_tree::fixed_wp_dc_tree(dim.num_dc_groups, dc_samples);
 
-    // Tokens, contexts per the static tree (props kept for the pruned one).
+    // Fixed-tree tokens, with properties and gradient residuals only where
+    // the pruned or learned tree needs them.
     let collected = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
-        let collect_props = small_tree.is_some();
+        let collect_props = small_tree.is_some() || effort.learned_dc_tree;
         let (mut props, mut meta_props) = (Vec::new(), Vec::new());
-        let dc = collect_dc_tokens(
+        let (dc, gradient) = collect_dc_tokens_with_gradient(
             &dc_datas[i],
             &crate::frame::DC_PREDICTOR_WEIGHTED,
             &mut props,
             collect_props,
+            effort.learned_dc_tree,
         );
         // epf_iters = 0 here, so the sharpness id is decoder-ignored;
         // any distance >= 5 keeps the stream at the historical constant 4.
@@ -1028,7 +1037,7 @@ fn encode_jpeg_codestream_with_pool(
             crate::frame::epf_sharpness_id(100.0, false),
             collect_props,
         );
-        (dc, meta, props, meta_props)
+        (dc, gradient, meta, props, meta_props)
     });
 
     let build_code = |dc: &[Vec<Token>],
@@ -1055,12 +1064,71 @@ fn encode_jpeg_codestream_with_pool(
 
     let mut dc_tokens = Vec::with_capacity(collected.len());
     let mut meta_tokens = Vec::with_capacity(collected.len());
-    let mut props = Vec::with_capacity(collected.len());
-    for (dc, meta, dc_props, meta_props) in collected {
+    let mut gradient_tokens = Vec::with_capacity(collected.len());
+    let mut dc_props = Vec::with_capacity(collected.len());
+    let mut meta_props = Vec::with_capacity(collected.len());
+    for (dc, gradient, meta, props, metadata_props) in collected {
         dc_tokens.push(dc);
+        gradient_tokens.push(gradient);
         meta_tokens.push(meta);
-        props.push((dc_props, meta_props));
+        dc_props.push(props);
+        meta_props.push(metadata_props);
     }
+
+    // Learn from the same predictor walk as the fixed-tree incumbent. The
+    // final race compares serialized sections, including padding and TOC.
+    let learned_dc = effort.learned_dc_tree.then(|| {
+        let tree = crate::dc_tree::learn_dc_tree(
+            dim.num_dc_groups,
+            &dc_tokens,
+            &gradient_tokens,
+            &dc_props,
+            &meta_tokens,
+            &meta_props,
+        );
+        let dc = dc_tokens
+            .iter()
+            .zip(&gradient_tokens)
+            .zip(&dc_props)
+            .map(|((wp, gradient), props)| {
+                wp.iter()
+                    .zip(gradient)
+                    .zip(props)
+                    .map(|((wp, gradient), &prop)| {
+                        let context = tree.dc_context[prop as usize];
+                        let value = if tree.leaf_gradient[context as usize] {
+                            gradient.value
+                        } else {
+                            wp.value
+                        };
+                        Token::new(u32::from(context), value)
+                    })
+                    .collect()
+            })
+            .collect::<Vec<Vec<Token>>>();
+        let meta = meta_tokens
+            .iter()
+            .zip(&meta_props)
+            .map(|(tokens, props)| {
+                tokens
+                    .iter()
+                    .zip(props)
+                    .map(|(token, &prop)| {
+                        let slot = ((token.context as usize) << 10) | (prop & 1023) as usize;
+                        Token::new(u32::from(tree.meta_context[slot]), token.value)
+                    })
+                    .collect()
+            })
+            .collect::<Vec<Vec<Token>>>();
+        let (code, _) = build_code(&dc, &meta, tree.num_contexts, scratch);
+        DcPlan {
+            tree: Some(tree),
+            dc,
+            meta,
+            code,
+        }
+    });
+    drop(gradient_tokens);
     let (mut dc_code, static_bits) =
         build_code(&dc_tokens, &meta_tokens, K_NUM_DC_CONTEXTS, scratch);
 
@@ -1070,8 +1138,10 @@ fn encode_jpeg_codestream_with_pool(
     if let Some(tree) = small_tree {
         let mut dc_small = dc_tokens.clone();
         let mut meta_small = meta_tokens.clone();
-        for ((dc, meta), (dc_props, meta_props)) in
-            dc_small.iter_mut().zip(meta_small.iter_mut()).zip(&props)
+        for ((dc, meta), (dc_props, meta_props)) in dc_small
+            .iter_mut()
+            .zip(meta_small.iter_mut())
+            .zip(dc_props.iter().zip(&meta_props))
         {
             for (t, &p) in dc.iter_mut().zip(dc_props) {
                 t.context = u32::from(tree.dc_context[p as usize]);
@@ -1101,7 +1171,13 @@ fn encode_jpeg_codestream_with_pool(
             pruned_tree = Some(tree);
         }
     }
-    let dc_code_ref = dc_code.as_ref();
+    let dc_plan = DcPlan {
+        tree: pruned_tree,
+        dc: dc_tokens,
+        meta: meta_tokens,
+        code: dc_code,
+    };
+    drop((dc_props, meta_props));
 
     let natural_scan = {
         let mut s = [[0u8; DCT_BLOCK_SIZE]; 3];
@@ -1167,51 +1243,28 @@ fn encode_jpeg_codestream_with_pool(
         write_quant_scales(65536, 1, w);
         bctx.write(scratch, w);
         write_color_correlation(w);
-        match &pruned_tree {
-            Some(tree) => {
-                crate::frame::write_tree_tokens(&tree.tokens, &mut scratch.huffman_pool, w)
-            }
-            None => write_context_tree(
-                dim.num_dc_groups,
-                &crate::frame::DC_PREDICTOR_WEIGHTED,
-                &mut scratch.huffman_pool,
-                w,
-            ),
-        }
-        w.write(1, 0); // no lz77 for the DC histograms
-        write_entropy_code(&dc_code_ref, &mut scratch.huffman_pool, w);
     }
-
-    // DC groups.
-    let dc_group_sections: Vec<BitWriter> =
-        pool.steal_map(scratch, dim.num_dc_groups, |i, _scratch| {
-            let data = &dc_datas[i];
-            let mut section = BitWriter::new();
-            let w = &mut section;
-            w.write(2, 0); // extra_dc_precision = 0
-            w.write(4, 3); // global tree, default weighted predictor, no transforms
-            emit_tokens(&dc_tokens[i], &dc_code_ref, w);
-
-            let num_blocks = data.ac_strategy.xsize() * data.ac_strategy.ysize();
-            let nb_bits = if num_blocks <= 1 {
-                0
-            } else {
-                usize::BITS as usize
-                    - num_blocks.leading_zeros() as usize
-                    - if num_blocks.is_power_of_two() { 1 } else { 0 }
-            };
-            if nb_bits != 0 {
-                w.write(nb_bits, (num_blocks - 1) as u64);
-            }
-            w.write(4, 3);
-            emit_tokens(&meta_tokens[i], &dc_code_ref, w);
-            section
-        });
+    let mut dc_sections = dc_plan.write_sections(&dc_global, &dc_datas, pool, scratch);
+    let learned_sections =
+        learned_dc.map(|plan| plan.write_sections(&dc_global, &dc_datas, pool, scratch));
 
     let ac_groups = ac.write_groups(pool, scratch);
+    if let Some(candidate) = learned_sections {
+        let size = |dc: &[BitWriter]| {
+            let bits: Vec<usize> = dc
+                .iter()
+                .chain(std::iter::once(&ac.global))
+                .chain(&ac_groups)
+                .map(BitWriter::bits_written)
+                .collect();
+            combined_sections_size(&bits)
+        };
+        if size(&candidate) < size(&dc_sections) {
+            dc_sections = candidate;
+        }
+    }
     let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
-    sections.push(dc_global);
-    sections.extend(dc_group_sections);
+    sections.extend(dc_sections);
     sections.push(ac.global);
     sections.extend(ac_groups);
 
@@ -1224,6 +1277,68 @@ fn encode_jpeg_codestream_with_pool(
     write_frame_header(&mut out, ss);
     combine_sections(&mut sections, &mut out);
     Ok(out.into_bytes())
+}
+
+/// A complete DC tree and its entropy-coded DC/metadata streams.
+struct DcPlan {
+    tree: Option<crate::dc_tree::LearnedDcTree>,
+    dc: Vec<Vec<Token>>,
+    meta: Vec<Vec<Token>>,
+    code: crate::entropy::OwnedEntropyCode,
+}
+
+impl DcPlan {
+    fn write_sections(
+        self,
+        common_global: &BitWriter,
+        dc_datas: &[DcGroupData],
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Vec<BitWriter> {
+        let mut global = common_global.clone();
+        match &self.tree {
+            Some(tree) => crate::frame::write_tree_tokens(
+                &tree.tokens,
+                &mut scratch.huffman_pool,
+                &mut global,
+            ),
+            None => write_context_tree(
+                dc_datas.len(),
+                &crate::frame::DC_PREDICTOR_WEIGHTED,
+                &mut scratch.huffman_pool,
+                &mut global,
+            ),
+        }
+        global.write(1, 0); // no lz77 for the DC histograms
+        let code = self.code.as_ref();
+        write_entropy_code(&code, &mut scratch.huffman_pool, &mut global);
+        let groups = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
+            let data = &dc_datas[i];
+            let mut section = BitWriter::new();
+            section.write(2, 0); // extra_dc_precision = 0
+            section.write(4, 3); // global tree, default weighted predictor, no transforms
+            emit_tokens(&self.dc[i], &code, &mut section);
+
+            let num_blocks = data.ac_strategy.xsize() * data.ac_strategy.ysize();
+            let nb_bits = if num_blocks <= 1 {
+                0
+            } else {
+                usize::BITS as usize
+                    - num_blocks.leading_zeros() as usize
+                    - usize::from(num_blocks.is_power_of_two())
+            };
+            if nb_bits != 0 {
+                section.write(nb_bits, (num_blocks - 1) as u64);
+            }
+            section.write(4, 3);
+            emit_tokens(&self.meta[i], &code, &mut section);
+            section
+        });
+        let mut sections = Vec::with_capacity(1 + groups.len());
+        sections.push(global);
+        sections.extend(groups);
+        sections
+    }
 }
 
 fn emit_tokens(tokens: &[Token], code: &crate::entropy::EntropyCode<'_>, w: &mut BitWriter) {

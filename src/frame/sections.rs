@@ -69,6 +69,19 @@ pub(crate) fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWr
     combine_sections_ordered(sections, None, writer);
 }
 
+/// Serialized section and TOC bytes, excluding the shared frame header.
+/// Single-group frames concatenate all four sections before byte padding.
+pub(crate) fn combined_sections_size(section_bits: &[usize]) -> usize {
+    let sizes: Vec<usize> = if section_bits.len() == 4 {
+        vec![section_bits.iter().sum::<usize>().div_ceil(8)]
+    } else {
+        section_bits.iter().map(|bits| bits.div_ceil(8)).collect()
+    };
+    let mut toc = BitWriter::new();
+    write_toc(&sizes, None, &mut toc);
+    toc.bits_written() / 8 + sizes.iter().sum::<usize>()
+}
+
 /// [`combine_sections`] storing the sections in `order` (canonical section
 /// indices in codestream order), signaled through the TOC permutation.
 pub(super) fn combine_sections_ordered(
@@ -179,6 +192,36 @@ fn group_order_key(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn section_size_matches_serialization_at_padding_and_toc_boundaries() {
+        for sizes in [
+            vec![1, 2, 3, 4],
+            vec![8191, 1, 1, 1],
+            vec![8192, 1, 1, 1],
+            vec![1, 2, 3, 4, 5],
+            vec![8184, 8185, 8193, 139256, 139257],
+        ] {
+            let sections: Vec<_> = sizes
+                .iter()
+                .map(|&bits| {
+                    let mut section = crate::bit_writer::BitWriter::new();
+                    for _ in 0..bits {
+                        section.write(1, 1);
+                    }
+                    section
+                })
+                .collect();
+            let expected = super::combined_sections_size(&sizes);
+            for prefix_bits in 0..8 {
+                let mut writer = crate::bit_writer::BitWriter::new();
+                writer.write(prefix_bits, 0);
+                super::combine_sections(&mut sections.clone(), &mut writer);
+                // The first TOC bit shares the last frame-header byte.
+                assert_eq!(writer.into_bytes().len(), expected);
+            }
+        }
+    }
 
     #[test]
     fn center_first_order_is_rings_around_the_center() {

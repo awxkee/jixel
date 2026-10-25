@@ -58,14 +58,14 @@ mod variants;
 
 pub(crate) use chroma::{ChromaGradientSumsFn, selected_chroma_gradient_sums_fn};
 pub(crate) use dc_tokens::{
-    DC_PREDICTOR_WEIGHTED, DcPlanePrice, collect_dc_tokens, price_dc_plane, write_context_tree,
-    write_tree_tokens,
+    DC_PREDICTOR_WEIGHTED, DcPlanePrice, collect_dc_tokens_with_gradient, price_dc_plane,
+    write_context_tree, write_tree_tokens,
 };
 pub(crate) use encoder::encode_frame;
 pub(crate) use header::write_quant_scales;
 pub(crate) use metadata::{ac_metadata_context, collect_ac_metadata_tokens};
 pub(crate) use quantization::epf_sharpness_id;
-pub(crate) use sections::combine_sections;
+pub(crate) use sections::{combine_sections, combined_sections_size};
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;

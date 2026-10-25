@@ -229,6 +229,9 @@ pub struct JpegTranscodeConfig {
     /// Entropy-coding effort. The coefficients, and so the decoded pixels and
     /// the reconstructed JPEG, are the same at every speed. Defaults to
     /// [`Speed::Fast`].
+    ///
+    /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also try a learned DC context
+    /// tree, retaining it only when the complete codestream is smaller.
     pub speed: Speed,
 }
 
