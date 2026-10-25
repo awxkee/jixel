@@ -336,6 +336,8 @@ struct AvifTools {
     mt_cli: String,
     avm_dec: String,
     av2_speed: String, // maroontree -s (slow|medium|fast)
+    // maroontree HEVC (hpvca)
+    hevc_speed: String, // maroontree -s (slow|fast)
     // avm avifenc AV2 (libavif built against libaom2/avm)
     avm_enc: String,
     avm_enc_speed: String, // avifenc -s (default "9")
@@ -420,6 +422,79 @@ fn bench_maroontree_vvc(
     })
 }
 
+/// maroontree HEVC (hpvca): encode with `maroontree-cli -e hevc -q <quality>`
+/// (quality mapped from `d`) to .heic, decode back to PNG with the same CLI.
+#[allow(clippy::too_many_arguments)]
+fn bench_maroontree_hevc(
+    img: &Path,
+    d: f32,
+    sc: &Scorer,
+    w: usize,
+    h: usize,
+    tmp: &Path,
+    stem: &str,
+    npx: f64,
+    t: &AvifTools,
+    nthreads: usize,
+) -> Result<Point> {
+    let q = distance_to_quality(d);
+    let out = tmp.join(format!("{stem}_hevc_q{q}.heic"));
+    let dec_png = tmp.join(format!("{stem}_hevc_q{q}_dec.png"));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&dec_png);
+
+    let output = Command::new(&t.mt_cli)
+        .arg("-e")
+        .arg("hevc")
+        .arg("-q")
+        .arg(q.to_string())
+        .arg("-c")
+        .arg(&t.yuv)
+        .arg("-s")
+        .arg(&t.hevc_speed)
+        .arg("-t")
+        .arg(nthreads.to_string())
+        .arg(img)
+        .arg(&out)
+        .output()
+        .context("running maroontree (hevc encode)")?;
+    if !output.status.success() || !out.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "maroontree hevc encode failed for {} d={d} q={q}\nstdout: {stdout}\nstderr: {stderr}",
+            img.display()
+        );
+    }
+
+    let output = Command::new(&t.mt_cli)
+        .arg(&out)
+        .arg(&dec_png)
+        .output()
+        .context("running maroontree (hevc decode)")?;
+    if !output.status.success() || !dec_png.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "maroontree hevc decode failed for {}\nstdout: {stdout}\nstderr: {stderr}",
+            out.display()
+        );
+    }
+
+    let bytes = std::fs::metadata(&out)?.len();
+    let (dec_rgb, dw, dh) = load_rgb(&dec_png)?;
+    if dw != w || dh != h {
+        bail!("hevc decoded size {dw}x{dh} != {w}x{h}");
+    }
+    let scores = sc.score(&dec_rgb)?;
+    Ok(Point {
+        bpp: bytes as f64 * 8.0 / npx,
+        bytes,
+        scores,
+        note: format!("q{q}"),
+    })
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut images: Vec<PathBuf> = Vec::new();
@@ -433,6 +508,7 @@ fn main() -> Result<()> {
         mt_cli: MAROONTREE_CLI.to_string(),
         avm_dec: AVM_AVIFDEC.to_string(),
         av2_speed: "slow".to_string(),
+        hevc_speed: "slow".to_string(),
         avm_enc: AVM_AVIFENC.to_string(),
         avm_enc_speed: "6".to_string(),
         image_avif_speed: 6,
@@ -441,6 +517,7 @@ fn main() -> Result<()> {
     let mut with_aom = true;
     let mut with_av2 = true;
     let mut with_vvc = true;
+    let mut with_hevc = false;
     let mut with_avm_enc = true;
     let mut with_image_avif = true;
     let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
@@ -502,6 +579,10 @@ fn main() -> Result<()> {
             }
             "--av2-speed" => {
                 tools.av2_speed = value!().clone();
+                i += 2;
+            }
+            "--hevc-speed" => {
+                tools.hevc_speed = value!().clone();
                 i += 2;
             }
             "--avm-enc-speed" => {
@@ -571,6 +652,14 @@ fn main() -> Result<()> {
                 with_vvc = false;
                 i += 1;
             }
+            "--hevc" => {
+                with_hevc = true;
+                i += 1;
+            }
+            "--no-hevc" => {
+                with_hevc = false;
+                i += 1;
+            }
             "--no-avm-enc" => {
                 with_avm_enc = false;
                 i += 1;
@@ -612,6 +701,7 @@ fn main() -> Result<()> {
              [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--no-aom]\n  \
              AVIF (maroontree AV2): [--maroontree PATH] [--avm-avifdec PATH] \
              [--av2-speed slow|medium|fast] [--no-av2]\n  \
+             HEIC (maroontree HEVC/hpvca, opt-in): [--hevc] [--hevc-speed slow|fast] [--maroontree PATH]\n  \
              AVIF (avm avifenc AV2): [--avm-avifenc PATH] [--avm-avifdec PATH] \
              [--avm-enc-speed 9] [--no-avm-enc]\n  \
              AVIF (image crate, ravif/rav1e): [--image-avif-speed 6] [--no-image-avif]\n  \
@@ -653,6 +743,14 @@ fn main() -> Result<()> {
          Override with --maroontree or pass --no-vvc.",
             tools.mt_cli
         );
+    }
+    if with_hevc && !available(&tools.mt_cli) {
+        eprintln!(
+            "warning: maroontree CLI not found ({}); skipping the HEVC series. \
+             Override with --maroontree or drop --hevc.",
+            tools.mt_cli
+        );
+        with_hevc = false;
     }
     if with_image_avif && !available(&tools.aom_dec) {
         eprintln!(
@@ -834,6 +932,28 @@ fn main() -> Result<()> {
                 let p = bench_maroontree(img, d, &sc, w, h, &tmp, stem, npx, &tools, nthreads)?;
                 println!(
                     "  maroontree av1   d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
+                );
+                s.points.push(p);
+            }
+            all.push(s);
+        }
+
+        // maroontree HEVC (hpvca): encode + decode with maroontree-cli.
+        if with_hevc {
+            let mut s = Series {
+                label: "maroontree (HEVC)".into(),
+                color: RGBColor(0x1B, 0x9E, 0x77),
+                points: vec![],
+            };
+            for &d in &distances {
+                let q = distance_to_quality(d);
+                let p =
+                    bench_maroontree_hevc(img, d, &sc, w, h, &tmp, stem, npx, &tools, nthreads)?;
+                println!(
+                    "  maroontree hevc  d={d:<4}->q{q:<3} {:>9} B  {:.3} bpp  {}",
                     p.bytes,
                     p.bpp,
                     p.score_str()

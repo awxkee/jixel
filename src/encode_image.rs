@@ -253,14 +253,14 @@ pub enum Speed {
     /// Square transforms only; lossless uses no learned context trees.
     #[default]
     Fast,
-    /// The full transform search, color tools, custom coefficient orders and
-    /// DC coding tools of `Slow`, with a coefficient-model layout search in
-    /// place of its reconstruction rerank and exact layout search; lossless
-    /// learns its context tree from a smaller sample and skips the
-    /// predictor-preset ranking.
+    /// `Fast`'s square transforms and coefficient-model layout search with
+    /// `Slow`'s custom coefficient orders, DC coding tools, chroma-from-luma
+    /// search, color tools and ink layer; lossless learns its context tree
+    /// from a smaller sample and skips the predictor-preset ranking.
     Medium,
-    /// `Medium` plus `Slow`'s reconstruction rerank, exact layout search and
-    /// learned rate prices; no EPF strength fit, saturated-pixel targets or
+    /// The full transform search of `Slow` with its reconstruction rerank and
+    /// exact layout search over pieces up to 16x16, learned rate prices, the
+    /// learned DC tree, entropy-code refinement and the EPF strength fit; no
     /// content layers (patches, splines, vector layers, region frames) by
     /// default. Lossless learns its context tree from `Slow`'s full sample
     /// but keeps `Medium`'s single group layout, so it decodes as fast.
@@ -458,7 +458,7 @@ pub struct EncodeConfig {
     /// Choose VarDCT transforms by what each candidate costs under the
     /// image's own coefficient statistics instead of a fixed rate model.
     /// Patterned and synthetic content compresses much better; photographs
-    /// are about unchanged. Takes effect at [`Speed::Slow`] and above, where it
+    /// are about unchanged. Takes effect at [`Speed::MediumSlow`] and above, where it
     /// costs encode time. Defaults to true.
     pub learned_rate: bool,
     /// Optional HDR gain map (see [`GainMap`]). When set, the gain map is
