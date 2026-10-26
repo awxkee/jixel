@@ -192,7 +192,7 @@ fn refine_ac_codes(
     refinement: crate::entropy::AnsRefinement,
 ) {
     for (pass, code) in codes.iter_mut().enumerate() {
-        crate::entropy::refine_ans_clusters(
+        crate::entropy::refine_entropy_bundle(
             code,
             pending
                 .iter()

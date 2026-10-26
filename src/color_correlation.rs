@@ -450,34 +450,40 @@ fn compute_cmap_tile(
     (ytox, ytob)
 }
 
-/// Worst-case per-tile coefficient count: a full 8×8-block tile keeps 63 AC
-/// coefficients per block. The candidate cost quantizes every coefficient (it
-/// has no closed-form sufficient statistics, unlike the regression path), so
-/// the tile's worth of them is staged here.
+/// AC coefficient count of a full 8×8-block tile of DCT8s, 63 per block. The
+/// candidate cost quantizes every coefficient (it has no closed-form
+/// sufficient statistics, unlike the regression path), so the tile's worth of
+/// them is staged here. Transforms rooted in a tile may extend past it, so the
+/// staging grows beyond this when a tile's roots own more.
 const CFL_RDO_TILE_AC: usize = K_TILE_DIM_IN_BLOCKS * K_TILE_DIM_IN_BLOCKS * 63;
 
 pub(crate) struct CflRdoScratch {
-    m_x: Box<[f32; CFL_RDO_TILE_AC]>,
-    s_x: Box<[f32; CFL_RDO_TILE_AC]>,
-    m_b: Box<[f32; CFL_RDO_TILE_AC]>,
-    s_b: Box<[f32; CFL_RDO_TILE_AC]>,
+    m_x: Vec<f32>,
+    s_x: Vec<f32>,
+    m_b: Vec<f32>,
+    s_b: Vec<f32>,
     len: usize,
 }
 
 impl CflRdoScratch {
     fn new() -> Self {
-        let alloc = || {
-            vec![0.0f32; CFL_RDO_TILE_AC]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap()
-        };
         CflRdoScratch {
-            m_x: alloc(),
-            s_x: alloc(),
-            m_b: alloc(),
-            s_b: alloc(),
+            m_x: vec![0.0; CFL_RDO_TILE_AC],
+            s_x: vec![0.0; CFL_RDO_TILE_AC],
+            m_b: vec![0.0; CFL_RDO_TILE_AC],
+            s_b: vec![0.0; CFL_RDO_TILE_AC],
             len: 0,
+        }
+    }
+
+    /// Room for `count` more staged positions.
+    fn reserve(&mut self, count: usize) {
+        let need = self.len + count;
+        if need > self.m_x.len() {
+            let size = need.max(2 * self.m_x.len());
+            for v in [&mut self.m_x, &mut self.s_x, &mut self.m_b, &mut self.s_b] {
+                v.resize(size, 0.0);
+            }
         }
     }
 
@@ -495,6 +501,7 @@ impl CflRdoScratch {
         let [qm_x, qm_b] = qm;
         let width = cx * K_BLOCK_DIM;
         let size = cx * cy * K_BLOCK_DIM * K_BLOCK_DIM;
+        self.reserve(size - cx * cy);
         // Each of the first cy rows skips cx DC coefficients. Merge the last
         // such row with all remaining rows into one contiguous span, keeping
         // the packed AC order without per-coefficient division or masking.
@@ -789,7 +796,7 @@ pub(crate) fn fill_cmap(
     dc_group_ysize_blocks: usize,
     raw_quant_field: &crate::image::ImageB,
     scale: f32,
-    rdo_scratch: &mut crate::coder_scratch::LazyScratch<CflRdoScratch>,
+    rdo_scratch: &mut crate::coder_scratch::LazyScratch<Box<CflRdoScratch>>,
     ytox_map: &mut ImageSB,
     ytob_map: &mut ImageSB,
     distance: f32,
@@ -939,12 +946,6 @@ pub(crate) fn refit_cmap_on_layout(
                         py,
                         coeff_y,
                     );
-                    let size = cx * cy * 64;
-                    // Transforms stay inside their tile, whose AC positions
-                    // the scratch holds exactly; the 128 family does not.
-                    if rdo.len + size - cx * cy > CFL_RDO_TILE_AC {
-                        continue;
-                    }
                     crate::ac_strategy::forward_transform(
                         ctx,
                         gather,
@@ -2819,6 +2820,36 @@ mod tests {
         let (ytox, ytob) = refit_tile(&opsin, &dc_data);
         assert!((ytox - 25).abs() < 3, "ytox = {ytox}, expected ~25");
         assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
+    }
+
+    #[test]
+    fn refit_stages_every_coefficient_of_crossing_transforms() {
+        // Blank 8x16 transforms on each row of the first tile, either inside
+        // it or rooted in it and crossing into the next: 72 rooted blocks
+        // exceed a DCT8 tile's 64. The signal sits in the last row's DCT8
+        // blocks, the last ones staged.
+        let mut opsin = Image3F::new(128, 64);
+        for y in 56..64 {
+            for x in 8..56 {
+                let v = ((x ^ y) as f32) / 64.0;
+                opsin.plane_row_mut(1, y)[x] = v;
+                opsin.plane_row_mut(0, y)[x] = 0.3 * v;
+                opsin.plane_row_mut(2, y)[x] = v;
+            }
+        }
+        let fit = |root: usize| {
+            let mut dc_data = DcGroupData::new(16, 8).unwrap();
+            dc_data.raw_quant_field.as_mut_slice().fill(32);
+            for y in 0..8 {
+                dc_data
+                    .ac_strategy
+                    .set_first(root, y, crate::dc_group_data::STRATEGY_DCT8X16);
+            }
+            refit_tile(&opsin, &dc_data)
+        };
+        let aligned = fit(6);
+        assert!((aligned.0 - 25).abs() < 3, "aligned = {aligned:?}");
+        assert_eq!(fit(7), aligned);
     }
 
     #[test]

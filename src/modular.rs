@@ -1165,4 +1165,19 @@ mod tests {
         assert_eq!(bits(false, &mut scratch), 4);
         assert_eq!(bits(true, &mut scratch), 4 + 32);
     }
+
+    #[test]
+    fn near_constant_16bit_alpha_group_takes_the_lz77_section() {
+        // 65535 predicted from zero is literal symbol 67, above the 8-bit
+        // length alphabet start. One impure sample otherwise forces the
+        // prefix floor of a bit per pixel.
+        let (w, h) = (512, 256);
+        let mut data = vec![u16::MAX; w * h];
+        data[1234] = u16::MAX - 1;
+        let alpha = AlphaPlane::U16 { data, bits: 16 };
+        let mut scratch = CoderScratch::default();
+        let mut section = BitWriter::new();
+        write_ac_group_alpha(&alpha, w, h, 0, 0, 256, 256, 1, &mut scratch, &mut section);
+        assert!(section.bits_written() < 1024, "{}", section.bits_written());
+    }
 }

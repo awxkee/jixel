@@ -312,7 +312,7 @@ pub(super) fn plan_global_extra_tree(
         ctx.speed,
         Some(&ctx.thread_pool),
     );
-    crate::entropy::refine_ans_clusters(
+    crate::entropy::refine_entropy_bundle(
         &mut code,
         all(),
         crate::entropy::AnsRefinement::slow_for_speed(ctx.speed),

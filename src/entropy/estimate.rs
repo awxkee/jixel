@@ -68,6 +68,8 @@ fn estimate_ac_plain_bits_shared(
             .collect();
         let mut bits = 0.0f64;
         for tokens in streams {
+            // Every stream carries its 32-bit state, empty or not.
+            bits += 32.0;
             tokens.iter().for_each(|t| {
                 let cl = code.context_map[t.context as usize] as usize;
                 let (sym, nbits, _) =
@@ -83,7 +85,14 @@ fn estimate_ac_plain_bits_shared(
             let cl = code.context_map[t.context as usize] as usize;
             let (sym, nbits, _) =
                 crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
-            bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
+            // A single-symbol code's codeword is empty.
+            let prefix = &code.prefix_codes[cl];
+            let depth = if prefix.single_symbol {
+                0
+            } else {
+                prefix.depths[sym as usize]
+            };
+            bits += depth as u64 + nbits as u64;
         });
     }
     bits

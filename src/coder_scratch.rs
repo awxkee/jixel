@@ -375,7 +375,7 @@ pub(crate) struct CoderScratch {
     pub(crate) dc_predictor: LazyScratch<DcPredictorScratch>,
     pub(crate) patch_tile_colors: LazyScratch<Box<[[i32; 3]; PATCH_TILE * PATCH_TILE]>>,
     /// ~63KB of CfL RDO coefficient staging; only Slow lossy workers use it.
-    pub(crate) cfl_rdo: LazyScratch<crate::color_correlation::CflRdoScratch>,
+    pub(crate) cfl_rdo: LazyScratch<Box<crate::color_correlation::CflRdoScratch>>,
     /// Learned rate prices of the DC group this worker is selecting
     /// transforms for; see `ac_strategy::RatePricesScope`.
     pub(crate) rate_prices: Option<std::sync::Arc<crate::ac_strategy::RatePrices>>,

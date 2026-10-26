@@ -770,8 +770,16 @@ fn qf_trellis(
                 }
             }
         }
-        for s in 0..len {
-            prev_q[s] = cur[s].0;
+        // The survivors share an offset that grows along the chain; dropping
+        // it keeps their f32 differences exact without changing a decision.
+        let floor = cost[..len].iter().copied().fold(f32::INFINITY, f32::min);
+        for (prev, (current, cost)) in prev_q
+            .iter_mut()
+            .zip(cur.iter().zip(cost.iter_mut()))
+            .take(len)
+        {
+            *prev = current.0;
+            *cost -= floor;
         }
         prev_cost = cost;
         prev_len = len;
@@ -3750,6 +3758,23 @@ fn rerank_large_transforms(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qf_trellis_resolves_small_local_gains_on_long_chains() {
+        let n = 65_536;
+        let refinement = crate::coder_scratch::QuantRefinement {
+            bx: 0,
+            by: 0,
+            states: [(14, 100.0), (13, 99.99), (0, 0.0), (0, 0.0)],
+            len: 2,
+        };
+        let fixed = vec![14u8; n];
+        let states = vec![Some(&refinement); n];
+        let prices = [[0.1f32; 512]; 4];
+        let mut chain = fixed.clone();
+        super::qf_trellis(13, &fixed, &states, 1.0, &prices, &mut chain);
+        assert!(chain.iter().all(|&q| q == 13));
+    }
+
     #[test]
     fn candidate_search_respects_speed_and_arbiter() {
         let mut plain = vec![

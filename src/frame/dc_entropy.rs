@@ -290,7 +290,7 @@ pub(super) fn prepare_dc_entropy(
                             // tree (59 contexts -> 3 histograms on kodim20); price
                             // the arm on the code the final ANS refinement would
                             // produce.
-                            crate::entropy::refine_ans_clusters(
+                            crate::entropy::refine_entropy_bundle(
                                 &mut code,
                                 streams(),
                                 crate::entropy::AnsRefinement::Slow,
@@ -329,7 +329,7 @@ pub(super) fn prepare_dc_entropy(
                     // Refine the incumbent too, so both arms are priced on the
                     // codes the final refinement would write.
                     let (best_dc, best_meta, mut best_code, best_tree) = best;
-                    crate::entropy::refine_ans_clusters(
+                    crate::entropy::refine_entropy_bundle(
                         &mut best_code,
                         best_dc
                             .iter()
@@ -364,7 +364,7 @@ pub(super) fn prepare_dc_entropy(
         None
     };
     if let Some(refinement) = ans_refinement.filter(|_| !dc_code_refined) {
-        crate::entropy::refine_ans_clusters(
+        crate::entropy::refine_entropy_bundle(
             &mut dc_code_owned,
             dc_tokens_per_group
                 .iter()
