@@ -217,6 +217,20 @@ impl AcStrategyImage {
         true
     }
 
+    /// The format's own rule only: inside the image and one 256px AC group.
+    /// Unlike `can_place_strategy`, a block may cross 64px CfL tiles (the
+    /// decoder takes the tile of its first block).
+    pub(crate) fn can_place_strategy_crossing(&self, x: usize, y: usize, strategy: u8) -> bool {
+        let cx = Self::covered_blocks_x_of(strategy);
+        let cy = Self::covered_blocks_y_of(strategy);
+        const GROUP: usize = 32;
+        x + cx <= self.xsize
+            && y + cy <= self.ysize
+            && x / GROUP == (x + cx - 1) / GROUP
+            && y / GROUP == (y + cy - 1) / GROUP
+            && !is_128_strategy(strategy)
+    }
+
     /// Mark (x, y) as the first block of a multi-block transform with the
     /// given `strategy`. Fills covered cells with non-first markers.
     pub(crate) fn set_first(&mut self, x: usize, y: usize, strategy: u8) {
@@ -433,6 +447,19 @@ mod tests {
         assert_eq!(a.raw_strategy(1, 0), STRATEGY_DCT8X16);
         assert!(a.is_first_block(0, 1));
         assert_eq!(a.count_first_blocks(), 15);
+    }
+
+    #[test]
+    fn crossing_placement_keeps_only_the_format_rules() {
+        let a = AcStrategyImage::new(40, 40);
+        // Crosses the 64px tile at x=8 while staying inside group 0.
+        assert!(!a.can_place_strategy(7, 0, STRATEGY_DCT8X16));
+        assert!(a.can_place_strategy_crossing(7, 0, STRATEGY_DCT8X16));
+        assert!(a.can_place_strategy_crossing(6, 6, STRATEGY_DCT32X32));
+        // The 256px group, the image bounds and the 128 family stay fenced.
+        assert!(!a.can_place_strategy_crossing(31, 0, STRATEGY_DCT8X16));
+        assert!(!a.can_place_strategy_crossing(39, 0, STRATEGY_DCT8X16));
+        assert!(!a.can_place_strategy_crossing(0, 0, STRATEGY_DCT128X128));
     }
 
     #[test]

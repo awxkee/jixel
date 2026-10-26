@@ -51,6 +51,18 @@ const REGION_COUNT: usize = SIDE * SIDE * (SIDE + 1) * (SIDE + 1);
 const LINE_COUNT: usize = SIDE * (SIDE + 1) * (SIDE + 1);
 /// The 400 grid placements plus at most two incumbent 64-family blocks.
 const MAX_CANDIDATES: usize = 402;
+/// Tile-grid offsets, in blocks, of the re-tiling passes that follow the
+/// aligned one: half a tile diagonally (`layout_crossing`), then along each
+/// axis (`layout_crossing_axes`).
+static CROSSING_GRIDS: [(usize, usize); 3] = [(4, 4), (4, 0), (0, 4)];
+
+fn crossing_grids(effort: &crate::effort::Effort) -> &'static [(usize, usize)] {
+    match (effort.layout_crossing, effort.layout_crossing_axes) {
+        (false, _) => &[],
+        (true, false) => &CROSSING_GRIDS[..1],
+        (true, true) => &CROSSING_GRIDS,
+    }
+}
 /// Frontier states a tile may expand before the remaining states settle for
 /// their guillotine plan.
 const VISIT_BUDGET: usize = 5_000;
@@ -674,6 +686,10 @@ const UNMEASURED: ReconStrategyCost = ReconStrategyCost {
 #[derive(Default)]
 pub(crate) struct LayoutDpScratch {
     reconstruction: Vec<ReconStrategyCost>,
+    /// Scores by absolute block position and strategy, kept across the
+    /// tile grids of one re-tiling so a shifted grid rescores only the
+    /// pieces the aligned grid could not place.
+    global: HashMap<u32, ReconStrategyCost>,
     candidates: Vec<Candidate>,
     planner: PlannerScratch,
     current: Vec<Piece>,
@@ -722,6 +738,11 @@ impl Scores<'_, '_> {
         if cache.reconstruction[key].cost.is_nan() {
             let params = self.rerank.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
+            let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
+            if let Some(&hit) = cache.global.get(&global_key) {
+                cache.reconstruction[key] = hit;
+                return hit;
+            }
             let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
             let (ga, gpa) = rerank_pair_gradient_alphas(self.rerank, p.strategy, px, py);
             let mut score = reconstruction_strategy_cost_bounded(
@@ -760,12 +781,14 @@ impl Scores<'_, '_> {
                     fine_admit_charge(coder.rate_prices.is_some(), params.distance, score.rate);
                 score.cost = fmla(lambda, bits, score.cost);
             }
+            if score.cost.is_finite() {
+                cache.global.insert(global_key, score);
+            }
             cache.reconstruction[key] = score;
         }
         cache.reconstruction[key]
     }
 }
-
 fn leaf(
     scores: &Scores<'_, '_>,
     coder: &mut CoderScratch,
@@ -920,6 +943,7 @@ fn search_tile(
     map: &AcStrategyImage,
     width: usize,
     height: usize,
+    crossing: bool,
     accepted: &mut Vec<MergeUpgrade>,
 ) {
     cache.reset();
@@ -928,14 +952,22 @@ fn search_tile(
     for y in 0..height {
         for x in 0..width {
             if map.is_first_block(scores.bx + x, scores.by + y) {
-                current.push(Piece::new(
-                    x,
-                    y,
-                    map.raw_strategy(scores.bx + x, scores.by + y),
-                ));
+                let p = Piece::new(x, y, map.raw_strategy(scores.bx + x, scores.by + y));
+                if !crossing || (x + p.width() <= width && y + p.height() <= height) {
+                    current.push(p);
+                }
             }
         }
     }
+    // On a shifted grid the cells of incumbent pieces that cross the tile
+    // border keep their piece, as zero-cost placeholders in the plan.
+    let full = (0..height).fold(0u64, |m, y| m | (((1u64 << width) - 1) << (y * 8)));
+    let blocked = if crossing {
+        full & !pieces_mask(&current)
+    } else {
+        0
+    };
+    let is_blocked = |x: usize, y: usize| blocked >> (y * 8 + x) & 1 != 0;
     // Legacy fine credits are accumulated before this pass. Leaf-first credits
     // are instead summed from the final map, so removing those leaves is safe.
     if !scores.rerank.leaf_first
@@ -968,8 +1000,22 @@ fn search_tile(
         for y in 0..=height - h {
             for x in 0..=width - w {
                 let p = Piece::new(x, y, strategy);
-                if !map.can_place_strategy(scores.bx + x, scores.by + y, strategy) {
+                let legal = if crossing {
+                    map.can_place_strategy_crossing(scores.bx + x, scores.by + y, strategy)
+                } else {
+                    map.can_place_strategy(scores.bx + x, scores.by + y, strategy)
+                };
+                if !legal {
                     continue;
+                }
+                if blocked != 0 {
+                    if strategy == STRATEGY_DCT && is_blocked(x, y) {
+                        cache.candidates.push(Candidate::new(p, 0.0));
+                        continue;
+                    }
+                    if pieces_mask(&[p]) & blocked != 0 {
+                        continue;
+                    }
                 }
                 let candidate = if strategy == STRATEGY_DCT {
                     leaf(scores, coder, cache, map, x, y)
@@ -1012,7 +1058,10 @@ fn search_tile(
     let mut layout = std::mem::take(&mut cache.layout);
     layout.clear();
     for &i in &cache.choices {
-        layout.push(cache.candidates[i].piece);
+        let p = cache.candidates[i].piece;
+        if !(p.strategy == STRATEGY_DCT && is_blocked(p.x as usize, p.y as usize)) {
+            layout.push(p);
+        }
     }
     layout.sort_by_key(|p| (p.y, p.x, p.strategy));
     debug_assert_eq!(pieces_mask(&layout), pieces_mask(&current));
@@ -1076,6 +1125,11 @@ impl CoefficientScores<'_, '_> {
         if cache.reconstruction[key].cost.is_nan() {
             let params = self.selection.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
+            let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
+            if let Some(&hit) = cache.global.get(&global_key) {
+                cache.reconstruction[key] = hit;
+                return hit.cost;
+            }
             let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
             let cost = strategy_cost(
                 params.ctx,
@@ -1104,7 +1158,11 @@ impl CoefficientScores<'_, '_> {
                     y,
                 ),
             );
-            cache.reconstruction[key] = ReconStrategyCost { cost, ..UNMEASURED };
+            let score = ReconStrategyCost { cost, ..UNMEASURED };
+            if cost.is_finite() {
+                cache.global.insert(global_key, score);
+            }
+            cache.reconstruction[key] = score;
         }
         cache.reconstruction[key].cost
     }
@@ -1289,6 +1347,7 @@ fn search_tile_coefficient(
     map: &AcStrategyImage,
     width: usize,
     height: usize,
+    crossing: bool,
     accepted: &mut Vec<MergeUpgrade>,
 ) {
     cache.reset();
@@ -1297,14 +1356,30 @@ fn search_tile_coefficient(
     for y in 0..height {
         for x in 0..width {
             if map.is_first_block(scores.bx + x, scores.by + y) {
-                current.push(Piece::new(
-                    x,
-                    y,
-                    map.raw_strategy(scores.bx + x, scores.by + y),
-                ));
+                let p = Piece::new(x, y, map.raw_strategy(scores.bx + x, scores.by + y));
+                if !crossing || (x + p.width() <= width && y + p.height() <= height) {
+                    current.push(p);
+                }
             }
         }
     }
+    // On a shifted grid the cells of incumbents crossing the tile border stay
+    // out of the plan (cell bits are `y * width + x` here).
+    let cells = |p: Piece| {
+        let mut m = 0u64;
+        for y in p.y as usize..p.y as usize + p.height() {
+            for x in p.x as usize..p.x as usize + p.width() {
+                m |= 1 << (y * width + x);
+            }
+        }
+        m
+    };
+    let blocked = if crossing {
+        let full = (0..width * height).fold(0u64, |m, i| m | 1 << i);
+        current.iter().fold(full, |m, &p| m & !cells(p))
+    } else {
+        0
+    };
     if current
         .iter()
         .any(|p| crate::dc_group_data::is_gated_sub8_strategy(p.strategy))
@@ -1328,10 +1403,15 @@ fn search_tile_coefficient(
                 (SMALL_SQUARE, &mut costs.square),
             ] {
                 let p = Piece::new(x, y, small_strategy(choice));
-                if x + p.width() <= width
-                    && y + p.height() <= height
-                    && map.can_place_strategy(scores.bx + x, scores.by + y, p.strategy)
-                {
+                if x + p.width() > width || y + p.height() > height || cells(p) & blocked != 0 {
+                    continue;
+                }
+                let legal = if crossing {
+                    map.can_place_strategy_crossing(scores.bx + x, scores.by + y, p.strategy)
+                } else {
+                    map.can_place_strategy(scores.bx + x, scores.by + y, p.strategy)
+                };
+                if legal {
                     slot[i] = scores.score(coder, cache, p);
                 }
             }
@@ -1355,13 +1435,20 @@ fn search_tile_coefficient(
     let mut layout = std::mem::take(&mut cache.layout);
     let mut small = std::mem::take(&mut cache.small);
     let mut plan_out = std::mem::take(&mut small.plan);
-    let around = plan_small(&costs, fixed, width, height, &mut small, &mut plan_out) + fixed_cost;
+    let around = plan_small(
+        &costs,
+        fixed | blocked,
+        width,
+        height,
+        &mut small,
+        &mut plan_out,
+    ) + fixed_cost;
     layout.clear();
     let mut keep_fixed = true;
     let mut winner = around;
     if fixed != 0 {
         let mut over_out = Vec::new();
-        let over = plan_small(&costs, 0, width, height, &mut small, &mut over_out);
+        let over = plan_small(&costs, blocked, width, height, &mut small, &mut over_out);
         if over < around {
             winner = over;
             keep_fixed = false;
@@ -1425,15 +1512,24 @@ fn find(
     band: (usize, usize),
     output: &mut AcStrategyBandScratch,
     rollbacks: &[(usize, usize, usize, usize)],
+    grid: Grid,
 ) {
     output.merge_upgrades.clear();
     output.dp_regions.clear();
     let mut cache = std::mem::take(&mut output.layout_dp);
-    for by in (band.0.div_ceil(TILE) * TILE..band.1.min(map.ysize())).step_by(TILE) {
-        for bx in (0..map.xsize()).step_by(TILE) {
+    let (crossing, (ox, oy)) = match grid {
+        Grid::Aligned => {
+            cache.global.clear();
+            (false, (0, 0))
+        }
+        Grid::Shifted(offset) => (true, offset),
+    };
+    let first_y = oy + band.0.saturating_sub(oy).div_ceil(TILE) * TILE;
+    for by in (first_y..band.1.min(map.ysize())).step_by(TILE) {
+        for bx in (ox..map.xsize()).step_by(TILE) {
             let (w, h) = ((map.xsize() - bx).min(TILE), (map.ysize() - by).min(TILE));
             if w * h < 2
-                || !footprint_is_self_contained(map, bx, by, w, h)
+                || (!crossing && !footprint_is_self_contained(map, bx, by, w, h))
                 || rollbacks
                     .iter()
                     .any(|&(x, y, cx, cy)| bx < x + cx && x < bx + w && by < y + cy && y < by + h)
@@ -1447,6 +1543,7 @@ fn find(
                 map,
                 w,
                 h,
+                crossing,
                 &mut output.merge_upgrades,
             );
             output.dp_regions.append(&mut cache.proposals);
@@ -1497,11 +1594,57 @@ pub(super) fn retile(
         .thread_pool
         .steal_for_each_mut_with_threads(scratch, bands, rerank.num_threads, |i, out, coder| {
             let mut prices = rerank.params.price(coder);
-            find(rerank, &mut prices, read, rerank.bands[i], out, &rollbacks);
+            find(
+                rerank,
+                &mut prices,
+                read,
+                rerank.bands[i],
+                out,
+                &rollbacks,
+                Grid::Aligned,
+            );
         });
     if install {
         apply(map, bands, current_costs);
+        // Further passes on shifted grids, where pieces may cross the 64px
+        // tiles the aligned grid fences. Each pass sees the previous one's
+        // layout; the score cache carries over.
+        for &offset in crossing_grids(rerank.params.ctx.speed.effort()) {
+            let read: &AcStrategyImage = map;
+            rerank
+                .params
+                .ctx
+                .thread_pool
+                .steal_for_each_mut_with_threads(
+                    scratch,
+                    bands,
+                    rerank.num_threads,
+                    |i, out, coder| {
+                        let mut prices = rerank.params.price(coder);
+                        find(
+                            rerank,
+                            &mut prices,
+                            read,
+                            rerank.bands[i],
+                            out,
+                            &rollbacks,
+                            Grid::Shifted(offset),
+                        );
+                    },
+                );
+            apply(map, bands, current_costs);
+        }
     }
+}
+
+/// The tile grid a re-tiling pass runs on.
+#[derive(Clone, Copy)]
+enum Grid {
+    /// The 64px CfL tiles; pieces stay inside their tile.
+    Aligned,
+    /// A grid shifted by this many blocks, whose pieces may cross the CfL
+    /// tiles (the decoder takes the tile of a piece's first block).
+    Shifted((usize, usize)),
 }
 
 fn find_coefficient(
@@ -1510,13 +1653,22 @@ fn find_coefficient(
     map: &AcStrategyImage,
     band: (usize, usize),
     output: &mut AcStrategyBandScratch,
+    grid: Grid,
 ) {
     output.merge_upgrades.clear();
     let mut cache = std::mem::take(&mut output.layout_dp);
-    for by in (band.0.div_ceil(TILE) * TILE..band.1.min(map.ysize())).step_by(TILE) {
-        for bx in (0..map.xsize()).step_by(TILE) {
+    let (crossing, (ox, oy)) = match grid {
+        Grid::Aligned => {
+            cache.global.clear();
+            (false, (0, 0))
+        }
+        Grid::Shifted(offset) => (true, offset),
+    };
+    let first_y = oy + band.0.saturating_sub(oy).div_ceil(TILE) * TILE;
+    for by in (first_y..band.1.min(map.ysize())).step_by(TILE) {
+        for bx in (ox..map.xsize()).step_by(TILE) {
             let (w, h) = ((map.xsize() - bx).min(TILE), (map.ysize() - by).min(TILE));
-            if w * h < 2 || !footprint_is_self_contained(map, bx, by, w, h) {
+            if w * h < 2 || (!crossing && !footprint_is_self_contained(map, bx, by, w, h)) {
                 continue;
             }
             search_tile_coefficient(
@@ -1526,6 +1678,7 @@ fn find_coefficient(
                 map,
                 w,
                 h,
+                crossing,
                 &mut output.merge_upgrades,
             );
         }
@@ -1552,9 +1705,33 @@ pub(super) fn retile_coefficient(
         .thread_pool
         .steal_for_each_mut_with_threads(scratch, band_scratch, num_threads, |i, out, coder| {
             let mut prices = selection.params.price(coder);
-            find_coefficient(selection, &mut prices, read, bands[i], out);
+            find_coefficient(selection, &mut prices, read, bands[i], out, Grid::Aligned);
         });
     apply(map, band_scratch, current_costs);
+    for &offset in crossing_grids(selection.params.ctx.speed.effort()) {
+        let read: &AcStrategyImage = map;
+        selection
+            .params
+            .ctx
+            .thread_pool
+            .steal_for_each_mut_with_threads(
+                scratch,
+                band_scratch,
+                num_threads,
+                |i, out, coder| {
+                    let mut prices = selection.params.price(coder);
+                    find_coefficient(
+                        selection,
+                        &mut prices,
+                        read,
+                        bands[i],
+                        out,
+                        Grid::Shifted(offset),
+                    );
+                },
+            );
+        apply(map, band_scratch, current_costs);
+    }
 }
 
 #[cfg(test)]
@@ -2078,6 +2255,7 @@ mod tests {
                     &map,
                     8,
                     8,
+                    false,
                     &mut accepted,
                 );
                 assert!(cache.candidates.len() <= MAX_CANDIDATES);
@@ -2155,7 +2333,14 @@ mod protection_tests {
         map.set_first(0, 0, STRATEGY_DCT32X32);
         map.set_first(4, 4, STRATEGY_DCT32X32);
         map.set_first(4, 0, STRATEGY_DCT16X16);
-        find_coefficient(&selection, &mut coder, &map, (0, 8), &mut output);
+        find_coefficient(
+            &selection,
+            &mut coder,
+            &map,
+            (0, 8),
+            &mut output,
+            Grid::Aligned,
+        );
         for up in &output.merge_upgrades {
             assert!(COEFFICIENT_STRATEGIES.contains(&up.strategy));
             assert!(up.base.is_nan());
@@ -2177,8 +2362,37 @@ mod protection_tests {
         // A 128-family footprint stays untouched.
         let mut large = AcStrategyImage::new(16, 16);
         large.set_first(0, 0, crate::dc_group_data::STRATEGY_DCT128X128);
-        find_coefficient(&selection, &mut coder, &large, (0, 16), &mut output);
+        find_coefficient(
+            &selection,
+            &mut coder,
+            &large,
+            (0, 16),
+            &mut output,
+            Grid::Aligned,
+        );
         assert!(output.merge_upgrades.is_empty());
+        // A shifted grid keeps the cells of an incumbent crossing its tile
+        // border out of the plan and never re-tiles over them.
+        let mut crossed = AcStrategyImage::new(8, 8);
+        crossed.set_first(2, 2, STRATEGY_DCT32X32);
+        find_coefficient(
+            &selection,
+            &mut coder,
+            &crossed,
+            (0, 8),
+            &mut output,
+            Grid::Shifted((4, 4)),
+        );
+        for up in &output.merge_upgrades {
+            let w = AcStrategyImage::covered_blocks_x_of(up.strategy);
+            let h = AcStrategyImage::covered_blocks_y_of(up.strategy);
+            assert!(
+                up.bx >= 6 || up.bx + w <= 4 || up.by >= 6 || up.by + h <= 4,
+                "upgrade at ({}, {}) overlaps the crossing incumbent",
+                up.bx,
+                up.by
+            );
+        }
     }
 
     #[test]
@@ -2218,7 +2432,15 @@ mod protection_tests {
         let mut output = AcStrategyBandScratch::default();
         let mut large = AcStrategyImage::new(16, 16);
         large.set_first(0, 0, crate::dc_group_data::STRATEGY_DCT128X128);
-        find(&rerank, &mut coder, &large, (0, 16), &mut output, &[]);
+        find(
+            &rerank,
+            &mut coder,
+            &large,
+            (0, 16),
+            &mut output,
+            &[],
+            Grid::Aligned,
+        );
         assert!(output.merge_upgrades.is_empty());
         assert!(
             output.layout_dp.reconstruction.is_empty(),
@@ -2232,6 +2454,7 @@ mod protection_tests {
             (0, 8),
             &mut output,
             &[(1, 1, 2, 2)],
+            Grid::Aligned,
         );
         assert!(output.merge_upgrades.is_empty());
         assert!(
@@ -2239,17 +2462,58 @@ mod protection_tests {
             "fine-mosaic rollback regions must remain intact"
         );
         small.set_first(0, 0, crate::dc_group_data::STRATEGY_IDENTITY);
-        find(&rerank, &mut coder, &small, (0, 8), &mut output, &[]);
+        find(
+            &rerank,
+            &mut coder,
+            &small,
+            (0, 8),
+            &mut output,
+            &[],
+            Grid::Aligned,
+        );
         assert!(
             output.merge_upgrades.is_empty(),
             "legacy fine credits cannot be removed"
         );
         let thin = AcStrategyImage::new(1, 8);
-        find(&rerank, &mut coder, &thin, (0, 8), &mut output, &[]);
+        find(
+            &rerank,
+            &mut coder,
+            &thin,
+            (0, 8),
+            &mut output,
+            &[],
+            Grid::Aligned,
+        );
         assert!(
             !output.layout_dp.candidates.is_empty(),
             "8-pixel slivers must enter the DP"
         );
         assert!(output.layout_dp.candidates.iter().all(|c| c.width == 1));
+
+        // A shifted grid keeps the cells of an incumbent crossing its tile
+        // border out of the plan and never re-tiles over them.
+        let mut crossed = AcStrategyImage::new(8, 8);
+        crossed.set_first(2, 2, STRATEGY_DCT32X32);
+        find(
+            &rerank,
+            &mut coder,
+            &crossed,
+            (0, 8),
+            &mut output,
+            &[],
+            Grid::Shifted((4, 4)),
+        );
+        assert!(!output.layout_dp.candidates.is_empty());
+        for up in &output.merge_upgrades {
+            let w = AcStrategyImage::covered_blocks_x_of(up.strategy);
+            let h = AcStrategyImage::covered_blocks_y_of(up.strategy);
+            assert!(
+                up.bx >= 6 || up.bx + w <= 4 || up.by >= 6 || up.by + h <= 4,
+                "upgrade at ({}, {}) overlaps the crossing incumbent",
+                up.bx,
+                up.by
+            );
+        }
     }
 }

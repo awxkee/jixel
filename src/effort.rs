@@ -118,6 +118,14 @@ effort_gates! {
     /// 32-family pieces (strips, 32x16/16x32, 32x32) in the `layout_retile` DP;
     /// otherwise it re-tiles over DCT8, pairs and 16x16 only.
     layout_retile_32,
+    /// After the aligned `layout_retile` pass, passes on half-tile-shifted
+    /// grids whose pieces may cross the 64px CfL tiles (the format only
+    /// fences the 256px group). libjxl and jxl-rs decode them exactly;
+    /// jxl-oxide 0.12 applies CfL per tile and deviates on crossing pieces.
+    /// Also drives the shifted passes of the coefficient-model DP.
+    layout_crossing,
+    /// The two axis-shifted grids after the diagonal one of `layout_crossing`.
+    layout_crossing_axes,
     /// Coefficient-model DP re-tiling of the merge search's tiles over DCT8,
     /// pairs and 16x16 at any 8-pixel origin; superseded by `layout_retile`.
     layout_dp_coefficient,
@@ -247,6 +255,7 @@ const FAST: Effort = Effort {
     merge_busy_quads: true,
     quant_refine: true,
     layout_dp_coefficient: true,
+    layout_crossing: true,
     pixel_chromacity_x: true,
     cfl_ycbcr_rdo: true,
     dc_predictor_search: true,
@@ -263,6 +272,8 @@ const FAST: Effort = Effort {
 };
 
 const MEDIUM: Effort = Effort {
+    layout_crossing: true,
+    layout_crossing_axes: true,
     cfl_rdo: true,
     yellow_opsin: true,
     chroma_policy: true,
