@@ -60,11 +60,13 @@ pub(crate) use token::{
 pub(crate) use token_stream::{AcTokens, TokenSlice};
 #[cfg(any(feature = "splines", test))]
 pub(crate) use write::optimize_entropy_code_ac;
+#[cfg(test)]
+pub(crate) use write::refine_ans_clusters;
 pub(crate) use write::{
     AnsRefinement, HybridUintSamples, build_ans_code_parts, build_entropy_code_no_cluster,
     build_huffman_codes, build_huffman_codes_into, optimize_entropy_code,
     optimize_entropy_code_ac_streams, optimize_entropy_code_ac_streams_fast,
-    optimize_entropy_code_jpeg_ac_streams, refine_ans_clusters, refine_ans_entropy_exhaustive,
+    optimize_entropy_code_jpeg_ac_streams, refine_ans_entropy_exhaustive, refine_entropy_bundle,
     write_brotli_prefix_code, write_context_map, write_entropy_code, write_prefix_codes,
     write_token,
 };

@@ -105,56 +105,42 @@ fn extra_palette(plane: &AlphaPlane) -> Option<ExtraPalette> {
     })
 }
 
-/// Code the extra channel losslessly — through a Palette transform when it
-/// has few distinct values, and through the frame's global tree where that
-/// beats the fixed local trees — and, when the context asks for a lossy one,
-/// also squeezed and quantized; keep the smaller. The lossless coding wins
-/// wherever it is no larger, so solid and hard-edged planes stay exact. A
-/// winning global-tree coding moves the frame's DC streams onto the merged
-/// tree through `streams`.
-pub(super) fn prepare_extra_sections(
+/// The lossless sections of the extra channel, through `palette` when given:
+/// its Palette transform and entries in the global stream and the indices per
+/// AC group. Otherwise the values themselves.
+fn lossless_sections(
     ctx: &EncodingContext,
     plane: &AlphaPlane,
+    palette: Option<&ExtraPalette>,
     dim: &ImageDim,
-    dc_group_coords: &[(usize, usize)],
-    last_pass: usize,
-    mut streams: extra_tree::GlobalStreams<'_>,
+    num_dc_groups: usize,
+    global_code_ans: bool,
     scratch: &mut CoderScratch,
 ) -> ExtraSections {
-    let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
-    let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
-    let palette = lossless_plane.then(|| extra_palette(plane)).flatten();
-    let mut lossless = ExtraSections {
+    let mut sections = ExtraSections {
         global: BitWriter::new(),
-        lf: (0..dc_group_coords.len())
-            .map(|_| BitWriter::new())
-            .collect(),
+        lf: (0..num_dc_groups).map(|_| BitWriter::new()).collect(),
         ac: Vec::new(),
     };
-    // A multi-group palette-coded channel codes its palette locally in the
-    // global stream and its indices per AC group. A single-group one keeps
-    // the values' section as the local alternative of its global-tree
-    // coding, which carries the palette.
-    let coded = palette.as_ref().filter(|_| !single);
-    match coded {
+    match palette {
         Some(p) => crate::modular::write_global_palette_alpha_modular(
             &p.entries,
             plane.bits(),
             scratch,
-            &mut lossless.global,
+            &mut sections.global,
         ),
         None => crate::modular::write_global_alpha_modular(
             plane,
             dim.xsize,
             dim.ysize,
             ctx.extra_step,
-            !streams.code.use_prefix_code,
+            global_code_ans,
             scratch,
-            &mut lossless.global,
+            &mut sections.global,
         ),
     }
-    let ac_plane = coded.map_or(plane, |p| &p.indices);
-    lossless.ac = ctx
+    let ac_plane = palette.map_or(plane, |p| &p.indices);
+    sections.ac = ctx
         .thread_pool
         .steal_map(scratch, dim.num_groups, |group_id, scratch| {
             let x0 = (group_id % dim.xsize_groups) * K_GROUP_DIM;
@@ -174,6 +160,54 @@ pub(super) fn prepare_extra_sections(
             );
             w
         });
+    sections
+}
+
+/// Code the extra channel losslessly — through a Palette transform when it
+/// has few distinct values and that is smaller, and through the frame's
+/// global tree where that beats the fixed local trees — and, when the context
+/// asks for a lossy one, also squeezed and quantized; keep the smaller. The
+/// lossless coding wins wherever it is no larger, so solid and hard-edged
+/// planes stay exact. A winning global-tree coding moves the frame's DC
+/// streams onto the merged tree through `streams`.
+pub(super) fn prepare_extra_sections(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    last_pass: usize,
+    mut streams: extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+) -> ExtraSections {
+    let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
+    let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
+    let mut palette = lossless_plane.then(|| extra_palette(plane)).flatten();
+    let ans = !streams.code.use_prefix_code;
+    let groups = dc_group_coords.len();
+    // A multi-group palette-coded channel codes its palette locally in the
+    // global stream and its indices per AC group. Renumbering can break the
+    // gradients the predictor follows, so without a global tree it races the
+    // values coded directly. A global tree can reverse that order and costs
+    // more to plan twice than the race saves; it keeps the palette.
+    // A single-group one keeps the values' section as the local alternative
+    // of its global-tree coding, which carries the palette.
+    let mut lossless = match palette.as_ref().filter(|_| !single) {
+        Some(p) => {
+            let indexed = lossless_sections(ctx, plane, Some(p), dim, groups, ans, scratch);
+            if ctx.extra_learned_trees {
+                indexed
+            } else {
+                let plain = lossless_sections(ctx, plane, None, dim, groups, ans, scratch);
+                if plain.bits() < indexed.bits() {
+                    palette = None;
+                    plain
+                } else {
+                    indexed
+                }
+            }
+        }
+        None => lossless_sections(ctx, plane, None, dim, groups, ans, scratch),
+    };
     let lossy = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
         .then(|| {
             crate::lossless::ExtraSqueeze::new(

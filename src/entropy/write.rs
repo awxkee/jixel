@@ -1706,6 +1706,7 @@ impl AnsRefinement {
 /// resulting sizes. Retain the existing Slow refinement as an
 /// incumbent, then test either independent ANS clustering (which can split
 /// collapsed clusters) or a bounded batch of same-configuration moves.
+#[cfg(test)]
 pub(crate) fn refine_ans_clusters<'a, I>(
     code: &mut OwnedEntropyCode,
     streams: I,
@@ -1721,6 +1722,85 @@ where
         return false;
     }
     let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
+    refine_ans_bundle(code, &streams, refinement, thread_pool, scratch)
+}
+
+/// `refine_ans_clusters`, then race the refined bundle against prefix codes
+/// on the clustering it started from: a bundle's mode is only final once its
+/// rANS side is.
+pub(crate) fn refine_entropy_bundle<'a, I>(
+    code: &mut OwnedEntropyCode,
+    streams: I,
+    refinement: AnsRefinement,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool
+where
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
+{
+    if code.use_prefix_code {
+        return false;
+    }
+    let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
+    let prefix = prefix_alternative(code, &streams, &mut scratch.huffman_pool);
+    let changed = refine_ans_bundle(code, &streams, refinement, thread_pool, scratch);
+    let pool = &mut scratch.huffman_pool;
+    if coded_bits(&prefix, &streams, pool) < coded_bits(code, &streams, pool) {
+        *code = prefix;
+        return true;
+    }
+    changed
+}
+
+/// The prefix-coded twin of a bundle: its context map and hybrid-uint
+/// configs, with Huffman codes built from the streams' tokens.
+fn prefix_alternative(
+    code: &OwnedEntropyCode,
+    streams: &[TokenSlice<'_>],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode {
+    let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
+    for tokens in streams {
+        tokens.iter().for_each(|t| {
+            let cluster = code.context_map[t.context as usize] as usize;
+            let config = code.hybrid_uint_configs[cluster];
+            histograms[cluster].add(uint_encode_with_config(t.value, config).0);
+        });
+    }
+    OwnedEntropyCode {
+        context_map: code.context_map.clone(),
+        prefix_codes: build_huffman_codes(&histograms, huffman_pool),
+        hybrid_uint_configs: code.hybrid_uint_configs.clone(),
+        orig_context_map: code.orig_context_map.clone(),
+        orig_num_contexts: code.orig_num_contexts,
+        use_prefix_code: true,
+        ans_histograms: Vec::new(),
+        ans_pricing_freqs: Vec::new(),
+        ans_symbols: Vec::new(),
+        ans_reverse_maps: Vec::new(),
+    }
+}
+
+/// The bundle's entropy-code header as written, plus its streams' payload:
+/// exact for prefix codes, modeled for rANS with each stream's state.
+fn coded_bits(
+    code: &OwnedEntropyCode,
+    streams: &[TokenSlice<'_>],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> u64 {
+    let mut header = BitWriter::new();
+    write_entropy_code(&code.as_ref(), huffman_pool, &mut header);
+    header.bits_written() as u64 + super::estimate_ac_plain_bits(streams.iter().copied(), code)
+}
+
+fn refine_ans_bundle(
+    code: &mut OwnedEntropyCode,
+    streams: &[TokenSlice<'_>],
+    refinement: AnsRefinement,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> bool {
     let exhaustive = matches!(refinement, AnsRefinement::ExtraSlow);
     let refinement = if exhaustive {
         AnsRefinement::Slow
@@ -1730,28 +1810,28 @@ where
     // Slow already had this refinement. Preserve it as the incumbent; Fast
     // did not, so it can go straight to the stronger candidate.
     let mut changed = matches!(refinement, AnsRefinement::Slow)
-        && refine_ans_clusters_once(code, &streams, thread_pool, scratch);
+        && refine_ans_clusters_once(code, streams, thread_pool, scratch);
     let recluster = !matches!(refinement, AnsRefinement::Fast { recluster: false });
     let proposal = if recluster {
         propose_ans_reclustering(
-            &streams,
+            streams,
             code.context_map.len(),
             thread_pool,
             scratch,
             refinement,
         )
     } else {
-        propose_ans_cluster_batch(code, &streams)
+        propose_ans_cluster_batch(code, streams)
     };
     if let Some(proposal) = proposal {
-        changed |= accept_ans_cluster_proposal(code, &streams, proposal, thread_pool, scratch);
+        changed |= accept_ans_cluster_proposal(code, streams, proposal, thread_pool, scratch);
     }
     // Precision changes do not feed back into clustering or provisional RDO
     // prices. Fast retains its existing table search at every distance.
     if matches!(refinement, AnsRefinement::Slow) {
-        changed |= refine_ans_precisions(code, &streams, thread_pool, scratch);
+        changed |= refine_ans_precisions(code, streams, thread_pool, scratch);
     }
-    changed |= fill_unused_contexts(code, &streams, scratch);
+    changed |= fill_unused_contexts(code, streams, scratch);
     if exhaustive {
         changed |=
             refine_ans_entropy_exhaustive(code, streams.iter().copied(), thread_pool, scratch);
@@ -3192,6 +3272,107 @@ fn write_ans_params(code: &EntropyCode, w: &mut BitWriter) {
     // The normalized distributions, in clustered-histogram order.
     for histogram in code.ans_histograms.iter() {
         encode_histogram(histogram, ANS_LOG_ALPHA_SIZE, w);
+    }
+}
+
+#[cfg(test)]
+mod mode_choice_tests {
+    use super::*;
+
+    /// Header and every stream's payload, as written.
+    fn written_bits(code: &OwnedEntropyCode, streams: &[Vec<Token>]) -> usize {
+        let mut w = BitWriter::new();
+        write_entropy_code(&code.as_ref(), &mut Vec::new(), &mut w);
+        for stream in streams {
+            if code.use_prefix_code {
+                stream
+                    .iter()
+                    .for_each(|&t| write_token(t, &code.as_ref(), &mut w));
+            } else {
+                super::super::ans::write_ans_tokens(
+                    stream.as_slice(),
+                    &code.context_map,
+                    &code.ans_symbols,
+                    &code.ans_reverse_maps,
+                    &code.hybrid_uint_configs,
+                    &mut w,
+                );
+            }
+        }
+        w.bits_written()
+    }
+
+    fn built(streams: &[Vec<Token>]) -> OwnedEntropyCode {
+        optimize_entropy_code_ac_streams(
+            streams.iter().map(Vec::as_slice),
+            1,
+            &mut Vec::new(),
+            false,
+            crate::Speed::Slow,
+            None,
+        )
+    }
+
+    #[test]
+    fn refined_bundle_keeps_the_mode_with_fewer_written_bits() {
+        let constant = |n: usize| vec![Token::new(0, 0); n];
+        let binary = |n: usize| -> Vec<Token> {
+            (0..n)
+                .map(|i| Token::new(0, u32::from(i % 4 == 3)))
+                .collect()
+        };
+        let skewed: Vec<Token> = (0..20_000)
+            .map(|i| Token::new(0, u32::from(i % 100 == 0)))
+            .collect();
+        let cases: [(&str, Vec<Vec<Token>>, bool); 4] = [
+            ("one constant stream", vec![constant(1000)], true),
+            ("16 constant streams", vec![constant(1000); 16], true),
+            ("16 short 3:1 streams", vec![binary(16); 16], true),
+            ("one skewed stream", vec![skewed], false),
+        ];
+        let pool = ThreadPool::new_lossless(1);
+        for (name, streams, prefix_wins) in cases {
+            let incumbent = built(&streams);
+            assert!(!incumbent.use_prefix_code, "{name}");
+            let mut code = built(&streams);
+            refine_entropy_bundle(
+                &mut code,
+                streams.iter().map(Vec::as_slice),
+                AnsRefinement::Slow,
+                &pool,
+                &mut CoderScratch::lossless(),
+            );
+            assert_eq!(code.use_prefix_code, prefix_wins, "{name}");
+            let bits = written_bits(&code, &streams);
+            assert!(bits <= written_bits(&incumbent, &streams), "{name}");
+            if prefix_wins {
+                let slices: Vec<_> = streams
+                    .iter()
+                    .map(|s| TokenSlice::from(s.as_slice()))
+                    .collect();
+                assert_eq!(
+                    bits as u64,
+                    coded_bits(&code, &slices, &mut Vec::new()),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_estimate_charges_no_codeword_for_a_single_symbol_code() {
+        let streams = [vec![Token::new(0, 0); 10_000]];
+        let slices = [TokenSlice::from(streams[0].as_slice())];
+        let code = prefix_alternative(&built(&streams), &slices, &mut Vec::new());
+        let mut w = BitWriter::new();
+        streams[0]
+            .iter()
+            .for_each(|&t| write_token(t, &code.as_ref(), &mut w));
+        assert_eq!(w.bits_written(), 0);
+        assert_eq!(
+            crate::entropy::estimate_ac_plain_bits(streams.iter().map(Vec::as_slice), &code),
+            0
+        );
     }
 }
 

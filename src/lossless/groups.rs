@@ -108,18 +108,22 @@ impl Drop for DeepLzScratchGuard<'_> {
 /// single-leaf Gradient tree, LZ77 run collapse, and the rANS-capable pixel
 /// entropy code shared with the lossless path. Used by the lossy extra-channel
 /// (alpha) path, where near-constant planes otherwise pay the 1 bit/pixel
-/// prefix-code floor. Returns false (writing nothing) when a residual symbol
-/// would collide with the LZ77 length alphabet (huge residuals, e.g. raw-float
-/// alpha bits).
+/// prefix-code floor. The length alphabet starts above the largest literal
+/// symbol, as for lossless input of that depth. Returns false (writing
+/// nothing) when no such start fits the alphabet (huge residuals, e.g.
+/// raw-float alpha bits).
 pub(crate) fn write_single_channel_lz77_section(
     tokens: &[Token],
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) -> bool {
-    if tokens
+    let max_literal = tokens
         .iter()
-        .any(|t| uint_encode(t.value).0 >= LZ77_MIN_SYMBOL)
-    {
+        .map(|t| uint_encode(t.value).0)
+        .max()
+        .unwrap_or(0);
+    let min_symbol = LZ77_MIN_SYMBOL.max(max_literal + 1);
+    if min_symbol > super::lossless_min_symbol(18) {
         return false;
     }
     let mut runs = RunLzWriter::with_capacity(tokens.len());
@@ -131,7 +135,7 @@ pub(crate) fn write_single_channel_lz77_section(
         false,
         std::iter::once(lz.as_slice()),
         1,
-        LZ77_MIN_SYMBOL,
+        min_symbol,
         true,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
@@ -143,11 +147,11 @@ pub(crate) fn write_single_channel_lz77_section(
     write_local_tree_lz77(
         &[PREDICTOR_GRADIENT],
         &code,
-        LZ77_MIN_SYMBOL,
+        min_symbol,
         &mut scratch.huffman_pool,
         w,
     );
-    write_lz_section(&lz, 1, &code, LZ77_MIN_SYMBOL, w);
+    write_lz_section(&lz, 1, &code, min_symbol, w);
     true
 }
 

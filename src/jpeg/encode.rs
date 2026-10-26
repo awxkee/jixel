@@ -1053,7 +1053,7 @@ fn encode_jpeg_codestream_with_pool(
             Some(pool),
         );
         if let Some(refinement) = effort.refinement {
-            crate::entropy::refine_ans_clusters(&mut code, streams(), refinement, pool, scratch);
+            crate::entropy::refine_entropy_bundle(&mut code, streams(), refinement, pool, scratch);
         }
         let mut header = BitWriter::new();
         write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
@@ -1413,7 +1413,7 @@ fn plan_ac(
         Some(pool),
     );
     if let Some(refinement) = effort.refinement {
-        crate::entropy::refine_ans_clusters(
+        crate::entropy::refine_entropy_bundle(
             &mut code,
             tokens.iter().map(Vec::as_slice),
             refinement,

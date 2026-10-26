@@ -5399,4 +5399,22 @@ mod lossy_alpha_tests {
             encode_image_with_alpha_16bit(&deep, W, H, &fast().with_alpha_distance(0.0)).unwrap();
         assert!(deep_lossy.len() < deep_lossless.len());
     }
+
+    #[test]
+    fn multi_group_alpha_keeps_values_where_the_palette_breaks_gradients() {
+        // 64 values over 3..=199 pass the palette gate, but sorted indices
+        // lose the plane's exact Gradient prediction (11 KB through them).
+        let (w, h) = (512, 64);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let a = 80 + 17 * (x % 8) as i32 - 11 * (y % 8) as i32;
+                rgba.extend([120, 60, 200, a as u8]);
+            }
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Fast)
+            .with_alpha_distance(0.0);
+        assert!(encode_image_with_alpha(&rgba, w, h, &config).unwrap().len() < 6000);
+    }
 }

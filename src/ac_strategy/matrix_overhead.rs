@@ -261,6 +261,10 @@ pub(crate) fn account_matrix_headers(
     }
     for region in regions {
         let chosen = best_alternative(&region.alternatives, allowed).unwrap();
+        // A kept incumbent keeps the refined quantizer it was priced with.
+        if chosen.strategy == region.alternatives[0].strategy {
+            continue;
+        }
         let cx = AcStrategyImage::covered_blocks_x_of(chosen.strategy);
         let cy = AcStrategyImage::covered_blocks_y_of(chosen.strategy);
         let data = &mut dc_datas[region.dc];
@@ -435,5 +439,64 @@ mod tests {
             maps
         };
         assert_eq!(run(1), run(3));
+    }
+
+    #[test]
+    fn dropping_a_family_keeps_refined_quantizers_of_retained_incumbents() {
+        let distance = 2.5;
+        let opsin = Image3F::new(256, 256);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
+        let mut scratch = CoderScratch::default();
+        let mut group = DcGroupData::new(32, 32).unwrap();
+        // Refinement moved the field from its pre-selection 8 to 6.
+        for y in 0..32 {
+            group.raw_quant_field.row_mut(y).fill(6);
+        }
+        let mut pre = group.raw_quant_field.clone();
+        for y in 0..32 {
+            pre.row_mut(y).fill(8);
+        }
+        group.block_quant_field = Some(pre);
+        group.ac_strategy.set_first(0, 0, STRATEGY_DCT16X32);
+        let mut roots = Vec::new();
+        for y in (2..32).step_by(2) {
+            for x in (0..32).step_by(2) {
+                if roots.len() < 83 {
+                    group.ac_strategy.set_first(x, y, STRATEGY_DCT16X16);
+                    roots.push((x, y));
+                }
+            }
+        }
+        let mut groups = [group];
+        account_matrix_headers(
+            &ctx,
+            &mut scratch,
+            &opsin,
+            distance,
+            1.0,
+            2,
+            &[(0, 0)],
+            &mut groups,
+        );
+        let group = &groups[0];
+        assert_ne!(group.ac_strategy.raw_strategy(0, 0), STRATEGY_DCT16X32);
+        let mut retained = 0;
+        for &(x, y) in &roots {
+            if group.ac_strategy.is_first_block(x, y)
+                && group.ac_strategy.raw_strategy(x, y) == STRATEGY_DCT16X16
+            {
+                retained += 1;
+                for row in y..y + 2 {
+                    assert_eq!(&group.raw_quant_field.row(row)[x..x + 2], &[6, 6]);
+                }
+            }
+        }
+        assert!(retained > 0);
     }
 }
