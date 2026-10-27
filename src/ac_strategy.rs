@@ -125,6 +125,8 @@ const RERANK_LAMBDA_LO: f32 = 0.25;
 const RERANK_LAMBDA_HI: f32 = 10.0;
 const RERANK_LAMBDA_D0: f32 = 1.0;
 const RERANK_LAMBDA_D1: f32 = 4.0;
+const RERANK_LAMBDA_KNEE: f32 = 2.0;
+const RERANK_LAMBDA_KNEE_POWER: f32 = 1.33;
 
 const BIAS_RECT: Banded = Banded::new(1.026_200_7, 0.915);
 const BIAS_16X16: Banded = Banded::new(1.205_927_5, 1.05);
@@ -1582,7 +1584,17 @@ static PAIR_GRAD_FIT: PairGradFit = PairGradFit {
 fn reconstruction_lambda(distance: f32) -> f32 {
     const RECIP_RERANKING: f32 = 1. / (RERANK_LAMBDA_D1 - RERANK_LAMBDA_D0);
     let ramp = ((distance - RERANK_LAMBDA_D0) * RECIP_RERANKING).clamp(0.0, 1.0);
-    let multiplier = fmla(ramp, RERANK_LAMBDA_HI - RERANK_LAMBDA_LO, RERANK_LAMBDA_LO);
+    let mut multiplier = fmla(ramp, RERANK_LAMBDA_HI - RERANK_LAMBDA_LO, RERANK_LAMBDA_LO);
+    // Below the knee the ramp bows under the line, keeping both of its ends.
+    if distance > RERANK_LAMBDA_D0 && distance < RERANK_LAMBDA_KNEE {
+        const KNEE_RAMP: f32 = (RERANK_LAMBDA_KNEE - RERANK_LAMBDA_D0) * RECIP_RERANKING;
+        let t = (distance - RERANK_LAMBDA_D0) / (RERANK_LAMBDA_KNEE - RERANK_LAMBDA_D0);
+        multiplier = fmla(
+            t.powf(RERANK_LAMBDA_KNEE_POWER),
+            KNEE_RAMP * (RERANK_LAMBDA_HI - RERANK_LAMBDA_LO),
+            RERANK_LAMBDA_LO,
+        );
+    }
     RD_LAMBDA * multiplier
 }
 
