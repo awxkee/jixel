@@ -65,15 +65,18 @@ pub(crate) use color::color_matrix_shaper_neon;
 pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};
 pub(crate) use dct::{
     dc_from_dct8x32_neon, dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon,
-    dc_from_dct32x64_neon, dc_from_dct64x32_neon, dc_from_dct64x64_neon, dc_from_dct64x128_neon,
-    dc_from_dct128x64_neon, dc_from_dct128x128_neon, dct2x2_8x8_neon, dct4x4_neon, dct4x8_neon,
-    dct8x4_neon, dct8x8_neon, dct8x16_neon, dct8x32_neon, dct16x8_neon, dct16x16_neon,
-    dct16x32_neon, dct32x8_neon, dct32x16_neon, dct32x32_neon, dct32x64_neon, dct64x32_neon,
-    dct64x64_neon, dct64x128_neon, dct128x64_neon, dct128x128_neon, identity8x8_neon,
-    inv_dct2x2_8x8_neon, inv_dct8x8_neon, inv_dct8x16_neon, inv_dct8x32_neon, inv_dct16x8_neon,
-    inv_dct16x16_neon, inv_dct16x32_neon, inv_dct32x8_neon, inv_dct32x16_neon, inv_dct32x32_neon,
-    inv_dct32x64_neon, inv_dct64x32_neon, inv_dct64x64_neon, inv_dct64x128_neon,
-    inv_dct128x64_neon, inv_dct128x128_neon, inv_identity8x8_neon,
+    dc_from_dct32x64_neon, dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct2x2_8x8_neon,
+    dct4x4_neon, dct4x8_neon, dct8x4_neon, dct8x8_neon, dct8x16_neon, dct8x32_neon, dct16x8_neon,
+    dct16x16_neon, dct16x32_neon, dct32x8_neon, dct32x16_neon, dct32x32_neon, dct32x64_neon,
+    dct64x32_neon, dct64x64_neon, identity8x8_neon, inv_dct2x2_8x8_neon, inv_dct8x8_neon,
+    inv_dct8x16_neon, inv_dct8x32_neon, inv_dct16x8_neon, inv_dct16x16_neon, inv_dct16x32_neon,
+    inv_dct32x8_neon, inv_dct32x16_neon, inv_dct32x32_neon, inv_dct32x64_neon, inv_dct64x32_neon,
+    inv_dct64x64_neon, inv_identity8x8_neon,
+};
+#[cfg(feature = "extraslow")]
+pub(crate) use dct::{
+    dc_from_dct64x128_neon, dc_from_dct128x64_neon, dc_from_dct128x128_neon, dct64x128_neon,
+    dct128x64_neon, dct128x128_neon, inv_dct64x128_neon, inv_dct128x64_neon, inv_dct128x128_neon,
 };
 pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;

@@ -141,7 +141,7 @@ pub(super) fn process_ac_group(
     let qorigin_y = gy * K_GROUP_DIM_IN_BLOCKS;
 
     let mut local_quant_dc = Image3S::new(gwb, ghb);
-    let mut source_dc = collect_order_stats.then(|| crate::group::SourceDc {
+    let mut source_dc = (collect_order_stats || capture_recon).then(|| crate::group::SourceDc {
         y: crate::image::Plane::new(gwb, ghb),
         b: crate::image::Plane::new(gwb, ghb),
         x: crate::image::Plane::new(gwb, ghb),

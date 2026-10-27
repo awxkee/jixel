@@ -902,8 +902,8 @@ pub(crate) fn refit_cmap_on_layout(
     scale: f32,
     distance: f32,
     x_qm_scale: u32,
-    coeffs: &mut [[f32; 16384]; 3],
-    gather: &mut [f32; 16384],
+    coeffs: &mut [[f32; crate::group::MAX_BLOCK_COEFFICIENTS]; 3],
+    gather: &mut [f32; crate::group::MAX_BLOCK_COEFFICIENTS],
     rdo: &mut CflRdoScratch,
 ) -> (ImageSB, ImageSB) {
     let mut ytox_map = dc_data.ytox_map.clone();
@@ -2773,8 +2773,9 @@ mod tests {
 
     fn refit_tile(opsin: &Image3F, dc_data: &DcGroupData) -> (i32, i32) {
         let ctx = EncodingContext::default();
-        let mut coeffs = crate::util::HeapMatrix::<f32, 3, 16384>::new(0.0);
-        let mut gather: Box<[f32; 16384]> = crate::util::heap_array(0.0);
+        let mut coeffs =
+            crate::util::HeapMatrix::<f32, 3, { crate::group::MAX_BLOCK_COEFFICIENTS }>::new(0.0);
+        let mut gather = crate::util::heap_array(0.0);
         let mut rdo = CflRdoScratch::new();
         let (ytox, ytob) = refit_cmap_on_layout(
             &ctx,

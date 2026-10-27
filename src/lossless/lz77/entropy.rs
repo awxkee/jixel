@@ -676,6 +676,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     scratch: &'scratch mut LzEntropyScratch,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
 ) -> EntropyCode<'scratch> {
+    let thorough = cfg!(any(feature = "extraslow", test)) && thorough;
     let threads = pool.map_or(1, ThreadPool::num_threads);
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;

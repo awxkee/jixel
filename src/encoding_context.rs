@@ -198,8 +198,11 @@ pub(crate) struct EncodingContext {
     pub(crate) dct64x64: &'static dct::DctFn<64, 64, 4096>,
     pub(crate) dct64x32: &'static dct::DctFn<32, 64, 2048>,
     pub(crate) dct32x64: &'static dct::DctFn<64, 32, 2048>,
+    #[cfg(feature = "extraslow")]
     pub(crate) dct128x128: &'static dct::DctFn<128, 128, 16384>,
+    #[cfg(feature = "extraslow")]
     pub(crate) dct128x64: &'static dct::DctFn<64, 128, 8192>,
+    #[cfg(feature = "extraslow")]
     pub(crate) dct64x128: &'static dct::DctFn<128, 64, 8192>,
     pub(crate) dct32x16: &'static dct::DctFn<16, 32, 512>,
     pub(crate) dct16x32: &'static dct::DctFn<32, 16, 512>,
@@ -212,8 +215,11 @@ pub(crate) struct EncodingContext {
     pub(crate) dc_from_dct64x64: dct::DcFromDct64x64Fn,
     pub(crate) dc_from_dct64x32: dct::DcFromDct64x32Fn,
     pub(crate) dc_from_dct32x64: dct::DcFromDct32x64Fn,
+    #[cfg(feature = "extraslow")]
     pub(crate) dc_from_dct128x128: dct::DcFromDct128x128Fn,
+    #[cfg(feature = "extraslow")]
     pub(crate) dc_from_dct128x64: dct::DcFromDct128x64Fn,
+    #[cfg(feature = "extraslow")]
     pub(crate) dc_from_dct64x128: dct::DcFromDct64x128Fn,
     pub(crate) afv0: afv::AfvFn,
     pub(crate) afv1: afv::AfvFn,
@@ -610,8 +616,11 @@ impl EncodingContext {
             dct64x64: dct::selected_dct64x64(),
             dct64x32: dct::selected_dct64x32(),
             dct32x64: dct::selected_dct32x64(),
+            #[cfg(feature = "extraslow")]
             dct128x128: crate::dct128::selected_dct128x128(),
+            #[cfg(feature = "extraslow")]
             dct128x64: crate::dct128::selected_dct128x64(),
+            #[cfg(feature = "extraslow")]
             dct64x128: crate::dct128::selected_dct64x128(),
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
@@ -624,8 +633,11 @@ impl EncodingContext {
             dc_from_dct64x64: dc_from_dct.dct64x64,
             dc_from_dct64x32: dc_from_dct.dct64x32,
             dc_from_dct32x64: dc_from_dct.dct32x64,
+            #[cfg(feature = "extraslow")]
             dc_from_dct128x128: dc_from_dct.dct128x128,
+            #[cfg(feature = "extraslow")]
             dc_from_dct128x64: dc_from_dct.dct128x64,
+            #[cfg(feature = "extraslow")]
             dc_from_dct64x128: dc_from_dct.dct64x128,
             afv0: afv.afv0,
             afv1: afv.afv1,

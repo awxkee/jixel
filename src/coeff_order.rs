@@ -253,11 +253,13 @@ fn natural_scan_generic(cx: usize, cy: usize) -> Vec<u32> {
     out
 }
 
+#[cfg(feature = "extraslow")]
 fn natural_scan_128() -> &'static [u32] {
     static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     SCAN.get_or_init(|| natural_scan_generic(16, 16))
 }
 
+#[cfg(feature = "extraslow")]
 fn natural_scan_128x64() -> &'static [u32] {
     static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     SCAN.get_or_init(|| natural_scan_generic(16, 8))
@@ -283,7 +285,9 @@ pub(crate) fn natural_position_lut_for_order(order: usize) -> Vec<u32> {
         6 => 512,
         7 => 4096,
         8 => 2048,
+        #[cfg(feature = "extraslow")]
         9 => 16384,
+        #[cfg(feature = "extraslow")]
         10 => 8192,
         _ => unreachable!("no natural order for group {order}"),
     })
@@ -331,10 +335,12 @@ pub(crate) fn natural_position_lut(size: usize) -> Vec<u32> {
             .iter()
             .enumerate()
             .for_each(|(k, &r)| set(k, r as usize)),
+        #[cfg(feature = "extraslow")]
         8192 => natural_scan_128x64()
             .iter()
             .enumerate()
             .for_each(|(k, &r)| set(k, r as usize)),
+        #[cfg(feature = "extraslow")]
         16384 => natural_scan_128()
             .iter()
             .enumerate()
@@ -366,8 +372,11 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
             (64, 32),
             (32, 64),
             (64, 64),
+            #[cfg(feature = "extraslow")]
             (128, 64),
+            #[cfg(feature = "extraslow")]
             (64, 128),
+            #[cfg(feature = "extraslow")]
             (128, 128),
         ];
         shapes
@@ -702,7 +711,9 @@ impl CoeffOrders {
             None => match crate::ac_context::K_STRATEGY_ORDER[strategy_code as usize] {
                 7 => natural_scan_64(),
                 8 => natural_scan_64x32(),
+                #[cfg(feature = "extraslow")]
                 9 => natural_scan_128(),
+                #[cfg(feature = "extraslow")]
                 10 => natural_scan_128x64(),
                 order => unreachable!("unsupported natural-only order {order}"),
             },

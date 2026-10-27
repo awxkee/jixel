@@ -59,6 +59,7 @@ mod dc_group_data;
 mod dc_ops;
 mod dc_tree;
 mod dct;
+#[cfg(feature = "extraslow")]
 mod dct128;
 mod effort;
 mod encode_image;

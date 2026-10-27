@@ -75,7 +75,7 @@ pub(crate) static POLISH_EPOCH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// ColorVideoVDP judge of the polish: the incremental arbiter following the
-/// accepted frame, the decoded DC it scores with, and its exchange rate.
+/// accepted frame, the DC error image it scores with, and its exchange rate.
 pub(crate) struct CvJudge {
     judge: CvvdpArbiter,
     dc: Image3F,

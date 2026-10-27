@@ -28,9 +28,12 @@
  */
 
 use crate::dct::{
-    DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
-    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
+    DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32,
+    RESAMPLE_SCALE_32_TO_4, WC4, WC8, WC16, WC32,
 };
+#[cfg(feature = "extraslow")]
+use crate::dct::{INV_WC64, RESAMPLE_SCALE_64_TO_8};
+#[cfg(feature = "extraslow")]
 use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use core::arch::wasm32::*;
 use std::mem::MaybeUninit;
@@ -1203,6 +1206,7 @@ pub(crate) fn dc_from_dct8x32_wasm(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
 
 // Restore the natural frequency order of the 64-point split-radix kernel.
 #[target_feature(enable = "simd128")]
+#[cfg(feature = "extraslow")]
 fn dct1d_64_natural(c: &mut [v128; 64]) {
     dct1d_64_s(c);
     let split = *c;
@@ -1213,6 +1217,7 @@ fn dct1d_64_natural(c: &mut [v128; 64]) {
 
 /// Split-radix DCT-II over 4 independent 128-point columns.
 #[target_feature(enable = "simd128")]
+#[cfg(feature = "extraslow")]
 fn dct1d_128(c: &mut [v128; 128]) {
     for i in 0..32 {
         let bottom = c[i];
@@ -1263,6 +1268,7 @@ fn dct1d_128(c: &mut [v128; 128]) {
 }
 
 // Transposed scratch makes both separable passes use contiguous SIMD loads.
+#[cfg(feature = "extraslow")]
 macro_rules! dct128_wasm {
     ($name:ident, $n:literal, $w:literal, $h:literal, $dct_v:path, $dct_h:path) => {
         #[target_feature(enable = "simd128")]
@@ -1318,8 +1324,11 @@ macro_rules! dct128_wasm {
     };
 }
 
+#[cfg(feature = "extraslow")]
 dct128_wasm!(dct128x128_wasm, 16384, 128, 128, dct1d_128, dct1d_128);
+#[cfg(feature = "extraslow")]
 dct128_wasm!(dct128x64_wasm, 8192, 64, 128, dct1d_128, dct1d_64_natural);
+#[cfg(feature = "extraslow")]
 dct128_wasm!(dct64x128_wasm, 8192, 128, 64, dct1d_64_natural, dct1d_128);
 
 const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
@@ -1424,6 +1433,7 @@ fn inv_dct1d_32_s(c: &mut [v128; 32]) {
 
 #[inline]
 #[target_feature(enable = "simd128")]
+#[cfg(feature = "extraslow")]
 fn inv_dct1d_64_s(c: &mut [v128; 64]) {
     let mut t = [c[0]; 64];
     for i in 0..32 {
@@ -1563,6 +1573,7 @@ inv_dct_natural_wasm!(inv_dct8x32_wasm, 256, 8, 32, inv_dct1d_8_s, inv_dct1d_32_
 inv_dct_transposed_wasm!(inv_dct32x8_wasm, 256, 32, 8, inv_dct1d_32_s, inv_dct1d_8_s);
 
 #[target_feature(enable = "simd128")]
+#[cfg(feature = "extraslow")]
 fn inv_dct1d_128(c: &mut [v128; 128]) {
     let mut even: [v128; 64] = std::array::from_fn(|i| c[2 * i]);
     let mut odd: [v128; 64] = std::array::from_fn(|i| c[2 * i + 1]);
@@ -1582,6 +1593,7 @@ fn inv_dct1d_128(c: &mut [v128; 128]) {
     }
 }
 
+#[cfg(feature = "extraslow")]
 inv_dct_transposed_wasm!(
     inv_dct128x128_wasm,
     16384,
@@ -1591,6 +1603,7 @@ inv_dct_transposed_wasm!(
     inv_dct1d_128,
     Box::<[f32; 16384]>::new_uninit()
 );
+#[cfg(feature = "extraslow")]
 inv_dct_transposed_wasm!(
     inv_dct128x64_wasm,
     8192,
@@ -1600,6 +1613,7 @@ inv_dct_transposed_wasm!(
     inv_dct1d_64_s,
     Box::<[f32; 8192]>::new_uninit()
 );
+#[cfg(feature = "extraslow")]
 inv_dct_natural_wasm!(
     inv_dct64x128_wasm,
     8192,
@@ -1610,6 +1624,7 @@ inv_dct_natural_wasm!(
     Box::<[f32; 8192]>::new_uninit()
 );
 
+#[cfg(feature = "extraslow")]
 macro_rules! dc_from_dct128_wasm {
     ($name:ident, $n:literal, $rows:literal, $inv_v:path) => {
         #[target_feature(enable = "simd128")]
@@ -1652,10 +1667,13 @@ macro_rules! dc_from_dct128_wasm {
     };
 }
 
+#[cfg(feature = "extraslow")]
 dc_from_dct128_wasm!(dc_from_dct128x128_wasm, 16384, 16, inv_dct1d_16_s);
+#[cfg(feature = "extraslow")]
 dc_from_dct128_wasm!(dc_from_dct128x64_wasm, 8192, 8, inv_dct1d_8_s);
 
 #[target_feature(enable = "simd128")]
+#[cfg(feature = "extraslow")]
 pub(crate) fn dc_from_dct64x128_wasm(coeffs: &[f32; 8192], dc: &mut [f32; 128]) {
     let mut transposed = [0.0f32; 128];
     dc_from_dct128x64_wasm(coeffs, &mut transposed);
