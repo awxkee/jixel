@@ -643,8 +643,11 @@ pub(crate) fn strategy_pixel_dims(strategy: u8) -> (usize, usize) {
         STRATEGY_DCT32X32 => (32, 32),
         STRATEGY_DCT64X64 => (64, 64),
         STRATEGY_DCT64X32 => (32, 64),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X128 => (128, 128),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X64 => (64, 128),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT64X128 => (128, 64),
         STRATEGY_DCT32X64 => (64, 32),
         _ => (8, 8),
@@ -787,12 +790,15 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         STRATEGY_DCT64X64 => fwd_input!(dct::selected_dct64x64(), 4096, 64, 64),
         STRATEGY_DCT64X32 => fwd_input!(dct::selected_dct64x32(), 2048, 32, 64),
         STRATEGY_DCT32X64 => fwd_input!(dct::selected_dct32x64(), 2048, 64, 32),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X128 => {
             crate::dct128::dct128x128(DctInput::new(input, 128), out)
         }
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X64 => {
             crate::dct128::dct128x64(DctInput::new(input, 64), out)
         }
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT64X128 => {
             crate::dct128::dct64x128(DctInput::new(input, 128), out)
         }
@@ -847,8 +853,11 @@ pub(crate) fn reconstruct_error(
         STRATEGY_DCT64X64 => inverse!(idct.idct64x64, 4096, 64, 64),
         STRATEGY_DCT64X32 => inverse!(idct.idct64x32, 2048, 64, 32),
         STRATEGY_DCT32X64 => inverse!(idct.idct32x64, 2048, 64, 32),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X128 => inverse!(idct.idct128x128, 16384, 128, 128),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT128X64 => inverse!(idct.idct128x64, 8192, 128, 64),
+        #[cfg(feature = "extraslow")]
         crate::dc_group_data::STRATEGY_DCT64X128 => inverse!(idct.idct64x128, 8192, 128, 64),
         _ => {
             let n = strategy_pixel_count(strategy);

@@ -65,15 +65,18 @@ pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dc_ops::{adjust_b_dc_avx2, compensate_b_dc_avx2, reconstruct_dc_avx2};
 pub(crate) use dct::{
     dc_from_dct8x32_avx2, dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2,
-    dc_from_dct32x64_avx2, dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dc_from_dct64x128_avx2,
-    dc_from_dct128x64_avx2, dc_from_dct128x128_avx2, dct2x2_8x8_avx2, dct4x4_avx2, dct4x8_avx2,
-    dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct8x32_avx2, dct16x8_avx2, dct16x16_avx2,
-    dct16x32_avx2, dct32x8_avx2, dct32x16_avx2, dct32x32_avx2, dct32x64_avx2, dct64x32_avx2,
-    dct64x64_avx2, dct64x128_avx2, dct128x64_avx2, dct128x128_avx2, identity8x8_avx2,
-    inv_dct2x2_8x8_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2, inv_dct8x32_avx2, inv_dct16x8_avx2,
-    inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x8_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2,
-    inv_dct32x64_avx2, inv_dct64x32_avx2, inv_dct64x64_avx2, inv_dct64x128_avx2,
-    inv_dct128x64_avx2, inv_dct128x128_avx2, inv_identity8x8_avx2,
+    dc_from_dct32x64_avx2, dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct2x2_8x8_avx2,
+    dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct8x32_avx2, dct16x8_avx2,
+    dct16x16_avx2, dct16x32_avx2, dct32x8_avx2, dct32x16_avx2, dct32x32_avx2, dct32x64_avx2,
+    dct64x32_avx2, dct64x64_avx2, identity8x8_avx2, inv_dct2x2_8x8_avx2, inv_dct8x8_avx2,
+    inv_dct8x16_avx2, inv_dct8x32_avx2, inv_dct16x8_avx2, inv_dct16x16_avx2, inv_dct16x32_avx2,
+    inv_dct32x8_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2, inv_dct32x64_avx2, inv_dct64x32_avx2,
+    inv_dct64x64_avx2, inv_identity8x8_avx2,
+};
+#[cfg(feature = "extraslow")]
+pub(crate) use dct::{
+    dc_from_dct64x128_avx2, dc_from_dct128x64_avx2, dc_from_dct128x128_avx2, dct64x128_avx2,
+    dct128x64_avx2, dct128x128_avx2, inv_dct64x128_avx2, inv_dct128x64_avx2, inv_dct128x128_avx2,
 };
 pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;

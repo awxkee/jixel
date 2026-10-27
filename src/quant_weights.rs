@@ -1152,6 +1152,7 @@ static DCT32X64_BANDS: [[f32; 8]; 3] = [
 ];
 
 /// JPEG XL DCT128X128 library parameters.
+#[cfg(feature = "extraslow")]
 static DCT128X128_BANDS: [[f32; 8]; 3] = [
     [
         1.8 * 26629.073922049845,
@@ -1186,6 +1187,7 @@ static DCT128X128_BANDS: [[f32; 8]; 3] = [
 ];
 
 /// JPEG XL DCT64X128 library parameters, shared by both orientations.
+#[cfg(feature = "extraslow")]
 static DCT64X128_BANDS: [[f32; 8]; 3] = [
     [
         1.3 * 23629.073922049845,
@@ -1220,6 +1222,7 @@ static DCT64X128_BANDS: [[f32; 8]; 3] = [
 ];
 
 /// A `rows x cols` DCT-mode table (rows <= cols, the normalized layout).
+#[cfg(any(feature = "extraslow", test))]
 fn compute_band_matrix(src: &[[f32; 8]; 3], rows: usize, cols: usize) -> [Vec<f32>; 3] {
     const NUM_BANDS: usize = 8;
     std::array::from_fn(|c| {
@@ -1244,6 +1247,7 @@ fn compute_band_matrix(src: &[[f32; 8]; 3], rows: usize, cols: usize) -> [Vec<f3
     })
 }
 
+#[cfg(feature = "extraslow")]
 pub(crate) struct Tables128 {
     pub(crate) matrix_128x128: [Vec<f32>; 3],
     pub(crate) inv_matrix_128x128: [Vec<f32>; 3],
@@ -1252,6 +1256,7 @@ pub(crate) struct Tables128 {
 }
 
 /// Spec-default tables of the 128 family; never signaled.
+#[cfg(feature = "extraslow")]
 pub(crate) fn tables_128() -> &'static Tables128 {
     static TABLES: std::sync::OnceLock<Tables128> = std::sync::OnceLock::new();
     TABLES.get_or_init(|| {
@@ -2778,6 +2783,7 @@ impl DequantMatrices {
 
     /// Forward/inverse table of a 128-family strategy.
     #[inline]
+    #[cfg(feature = "extraslow")]
     pub(crate) fn matrix_128(&self, strategy: u8, c: usize) -> &'static [f32] {
         let t = tables_128();
         if strategy == crate::dc_group_data::STRATEGY_DCT128X128 {
@@ -2788,6 +2794,7 @@ impl DequantMatrices {
     }
 
     #[inline]
+    #[cfg(feature = "extraslow")]
     pub(crate) fn inv_matrix_128(&self, strategy: u8, c: usize) -> &'static [f32] {
         let t = tables_128();
         if strategy == crate::dc_group_data::STRATEGY_DCT128X128 {
@@ -2815,6 +2822,7 @@ impl DequantMatrices {
             STRATEGY_DCT16X16 => &self.inv_matrix_16x16(c)[..],
             STRATEGY_DCT32X32 => &self.inv_matrix_32x32(c)[..],
             STRATEGY_DCT64X64 => &self.inv_matrix_64x64(c)[..],
+            #[cfg(feature = "extraslow")]
             STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
                 self.inv_matrix_128(strategy, c)
             }
@@ -2932,9 +2940,12 @@ mod tests {
             assert_eq!(&square[c][..], &m64[c][..]);
             assert_eq!(&rect[c][..], &m6432[c][..]);
         }
-        let t = tables_128();
-        assert_eq!(t.matrix_128x128[1].len(), 16384);
-        assert_eq!(t.matrix_128x64[1].len(), 8192);
+        #[cfg(feature = "extraslow")]
+        {
+            let t = tables_128();
+            assert_eq!(t.matrix_128x128[1].len(), 16384);
+            assert_eq!(t.matrix_128x64[1].len(), 8192);
+        }
     }
 
     #[test]

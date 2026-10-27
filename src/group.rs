@@ -38,9 +38,10 @@ use crate::dc_group_data::{
     STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
     STRATEGY_DCT8X16, STRATEGY_DCT8X32, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
     STRATEGY_DCT32X8, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32,
-    STRATEGY_DCT64X64, STRATEGY_DCT64X128, STRATEGY_DCT128X64, STRATEGY_DCT128X128,
-    STRATEGY_IDENTITY,
+    STRATEGY_DCT64X64, STRATEGY_IDENTITY,
 };
+#[cfg(feature = "extraslow")]
+use crate::dc_group_data::{STRATEGY_DCT64X128, STRATEGY_DCT128X64, STRATEGY_DCT128X128};
 use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
@@ -68,6 +69,14 @@ pub(crate) fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
 const RDOQ_MAX_CHOICES: usize = 64 * RDOQ_MAX_STRIDE;
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
+
+// The 128 family is placed only by ExtraSlow's closed loop. Keep ordinary
+// encodes' per-worker buffers sized for the largest enabled transform.
+pub(crate) const MAX_BLOCK_COEFFICIENTS: usize = if cfg!(feature = "extraslow") {
+    128 * 128
+} else {
+    64 * 64
+};
 
 #[inline]
 pub(crate) fn predict_from_top_and_left(
@@ -962,14 +971,17 @@ pub(crate) fn dc_from_coefficients(
             coeffs.first_chunk::<256>().unwrap(),
             dc.first_chunk_mut::<4>().unwrap(),
         ),
+        #[cfg(feature = "extraslow")]
         STRATEGY_DCT128X128 => (ctx.dc_from_dct128x128)(
             coeffs.first_chunk::<16384>().unwrap(),
             dc.first_chunk_mut::<256>().unwrap(),
         ),
+        #[cfg(feature = "extraslow")]
         STRATEGY_DCT128X64 => (ctx.dc_from_dct128x64)(
             coeffs.first_chunk::<8192>().unwrap(),
             dc.first_chunk_mut::<128>().unwrap(),
         ),
+        #[cfg(feature = "extraslow")]
         STRATEGY_DCT64X128 => (ctx.dc_from_dct64x128)(
             coeffs.first_chunk::<8192>().unwrap(),
             dc.first_chunk_mut::<128>().unwrap(),
@@ -1760,8 +1772,8 @@ impl Default for RdoqScratch {
 }
 
 struct ReconScratch {
-    err: Box<[f32; 16384]>,
-    pix: Box<[f32; 16384]>,
+    err: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
+    pix: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
 }
 
 impl Default for ReconScratch {
@@ -1782,14 +1794,14 @@ pub(crate) struct AcGroupScratch {
     /// Study: decoder-feedback coefficient polish, set by the closed loop's
     /// serial polish pass.
     pub(crate) polisher: PolisherSlot,
-    coeffs: HeapMatrix<f32, 3, 16384>,
-    quantized: HeapMatrix<i32, 3, 16384>,
+    coeffs: HeapMatrix<f32, 3, MAX_BLOCK_COEFFICIENTS>,
+    quantized: HeapMatrix<i32, 3, MAX_BLOCK_COEFFICIENTS>,
     /// Saved luma coefficients for RDOQ or reconstruction capture.
-    source_y: Option<Box<[f32; 16384]>>,
-    block: Box<[i32; 16384]>,
+    source_y: Option<Box<[f32; MAX_BLOCK_COEFFICIENTS]>>,
+    block: Box<[i32; MAX_BLOCK_COEFFICIENTS]>,
     rdoq: Option<RdoqScratch>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
-    gather: Box<[f32; 16384]>,
+    gather: Box<[f32; MAX_BLOCK_COEFFICIENTS]>,
     /// Distinct source colors, reused across RDOQ blocks and groups.
     few_color_keys: Vec<u64>,
     /// Y coefficient error and its pixel-domain image for the recon capture.
@@ -1800,7 +1812,12 @@ pub(crate) struct AcGroupScratch {
 impl AcGroupScratch {
     /// The coefficient planes and edge gather buffer, for forward transforms
     /// taken outside the writer.
-    pub(crate) fn transform_buffers(&mut self) -> (&mut [[f32; 16384]; 3], &mut [f32; 16384]) {
+    pub(crate) fn transform_buffers(
+        &mut self,
+    ) -> (
+        &mut [[f32; MAX_BLOCK_COEFFICIENTS]; 3],
+        &mut [f32; MAX_BLOCK_COEFFICIENTS],
+    ) {
         (&mut self.coeffs, &mut self.gather)
     }
 }
@@ -1823,6 +1840,7 @@ impl Default for AcGroupScratch {
 }
 
 /// Unrounded Y and B DC of an AC group.
+#[derive(Clone)]
 pub(crate) struct SourceDc {
     pub(crate) y: crate::image::Plane<f32>,
     pub(crate) b: crate::image::Plane<f32>,
@@ -2053,6 +2071,7 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                 STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
                 STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                #[cfg(feature = "extraslow")]
                 STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => (
                     matrices.inv_matrix_128(raw_strategy, 1),
                     matrices.matrix_128(raw_strategy, 1),
@@ -2196,14 +2215,17 @@ pub(crate) fn write_ac_group(
                             let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                             (ctx.afv3)(DctInput::new(input, stride), dst);
                         }
+                        #[cfg(feature = "extraslow")]
                         STRATEGY_DCT128X128 => {
                             let dst = coeffs[c].first_chunk_mut::<16384>().unwrap();
                             (ctx.dct128x128)(DctInput::new(input, stride), dst);
                         }
+                        #[cfg(feature = "extraslow")]
                         STRATEGY_DCT128X64 => {
                             let dst = coeffs[c].first_chunk_mut::<8192>().unwrap();
                             (ctx.dct128x64)(DctInput::new(input, stride), dst);
                         }
+                        #[cfg(feature = "extraslow")]
                         STRATEGY_DCT64X128 => {
                             let dst = coeffs[c].first_chunk_mut::<8192>().unwrap();
                             (ctx.dct64x128)(DctInput::new(input, stride), dst);
@@ -2502,6 +2524,7 @@ pub(crate) fn write_ac_group(
                         (ctx.dc_from_dct8x32)(xb, x_dc_post.first_chunk_mut::<4>().unwrap());
                         (ctx.dc_from_dct8x32)(bb, b_dc_post.first_chunk_mut::<4>().unwrap());
                     }
+                    #[cfg(feature = "extraslow")]
                     STRATEGY_DCT128X128 => {
                         (ctx.dc_from_dct128x128)(
                             coeffs[0].first_chunk::<16384>().unwrap(),
@@ -2512,6 +2535,7 @@ pub(crate) fn write_ac_group(
                             b_dc_post.first_chunk_mut::<256>().unwrap(),
                         );
                     }
+                    #[cfg(feature = "extraslow")]
                     STRATEGY_DCT128X64 => {
                         (ctx.dc_from_dct128x64)(
                             coeffs[0].first_chunk::<8192>().unwrap(),
@@ -2522,6 +2546,7 @@ pub(crate) fn write_ac_group(
                             b_dc_post.first_chunk_mut::<128>().unwrap(),
                         );
                     }
+                    #[cfg(feature = "extraslow")]
                     STRATEGY_DCT64X128 => {
                         (ctx.dc_from_dct64x128)(
                             coeffs[0].first_chunk::<8192>().unwrap(),
@@ -2546,6 +2571,7 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
                     STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
                     STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(0)[..],
+                    #[cfg(feature = "extraslow")]
                     STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
                         matrices.inv_matrix_128(raw_strategy, 0)
                     }
@@ -2660,6 +2686,7 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
                     STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
                     STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(2)[..],
+                    #[cfg(feature = "extraslow")]
                     STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
                         matrices.inv_matrix_128(raw_strategy, 2)
                     }
@@ -3644,7 +3671,9 @@ mod tests {
             (super::STRATEGY_DCT32X32, 4, 4),
             (super::STRATEGY_DCT64X32, 8, 4),
             (super::STRATEGY_DCT64X64, 8, 8),
+            #[cfg(feature = "extraslow")]
             (super::STRATEGY_DCT128X64, 16, 8),
+            #[cfg(feature = "extraslow")]
             (super::STRATEGY_DCT128X128, 16, 16),
         ];
         let mut changed = 0;

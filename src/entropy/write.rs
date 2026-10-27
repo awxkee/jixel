@@ -1801,7 +1801,8 @@ fn refine_ans_bundle(
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
-    let exhaustive = matches!(refinement, AnsRefinement::ExtraSlow);
+    let exhaustive =
+        cfg!(any(feature = "extraslow", test)) && matches!(refinement, AnsRefinement::ExtraSlow);
     let refinement = if exhaustive {
         AnsRefinement::Slow
     } else {
@@ -1852,6 +1853,11 @@ where
     I: IntoIterator,
     I::Item: Into<TokenSlice<'a>>,
 {
+    // Final AC/DC writers share this entry point. The effort gate alone
+    // cannot remove its search machinery across codegen units.
+    if !cfg!(any(feature = "extraslow", test)) {
+        return false;
+    }
     if code.use_prefix_code {
         return false;
     }

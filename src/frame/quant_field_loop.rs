@@ -107,6 +107,8 @@ pub(super) fn run_quant_field_loop(
         recon: Image3F,
         pending: Vec<Option<PendingAcGroup>>,
         quant_dc: Vec<Option<Image3S>>,
+        /// Unrounded DC image values of each task's blocks.
+        source_dc: Vec<Option<crate::group::SourceDc>>,
         starts: Vec<Vec<(u16, u16, u32)>>,
         /// Per task, the memo evaluation `recon` was last synced with.
         synced: Vec<u32>,
@@ -148,7 +150,7 @@ pub(super) fn run_quant_field_loop(
                 }
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _, _, capture) = process_ac_group(
+                let (p, local, source, _, capture) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -178,13 +180,23 @@ pub(super) fn run_quant_field_loop(
                     }
                     _ => 0.0,
                 };
-                (t, p, local, starts, plane, (dc_gx, dc_gy, gx, gy), hit_bits)
+                (
+                    t,
+                    p,
+                    local,
+                    source,
+                    starts,
+                    plane,
+                    (dc_gx, dc_gy, gx, gy),
+                    hit_bits,
+                )
             });
         let mut dirty = Vec::with_capacity(results.len());
-        for (t, p, local, starts, plane, (dc_gx, dc_gy, gx, gy), hit_bits) in results {
+        for (t, p, local, source, starts, plane, (dc_gx, dc_gy, gx, gy), hit_bits) in results {
             eval.hit_bits[t] = hit_bits;
             eval.pending[t] = Some(p);
             eval.quant_dc[t] = Some(local);
+            eval.source_dc[t] = source;
             eval.starts[t] = starts;
             let x0 = dc_gx * K_DC_GROUP_DIM + gx * K_GROUP_DIM;
             let y0 = dc_gy * K_DC_GROUP_DIM + gy * K_GROUP_DIM;
@@ -236,6 +248,7 @@ pub(super) fn run_quant_field_loop(
         recon: Image3F::new(w, h),
         pending: vec![None; ac_tasks.len()],
         quant_dc: vec![None; ac_tasks.len()],
+        source_dc: vec![None; ac_tasks.len()],
         starts: vec![Vec::new(); ac_tasks.len()],
         synced: vec![0; ac_tasks.len()],
         trial: false,
@@ -247,6 +260,7 @@ pub(super) fn run_quant_field_loop(
         recon: e.recon.clone(),
         pending: vec![None; ac_tasks.len()],
         quant_dc: e.quant_dc.clone(),
+        source_dc: e.source_dc.clone(),
         starts: vec![Vec::new(); ac_tasks.len()],
         synced: e.synced.clone(),
         trial: false,
@@ -268,10 +282,70 @@ pub(super) fn run_quant_field_loop(
                 rect,
                 out,
             );
+            // The judge adds each cell's DC error to the AC-only reconstruction:
+            // decoded minus the unrounded DC image value of the same transform.
+            let (bx0, by0) = (rect.x0 / K_BLOCK_DIM, rect.y0 / K_BLOCK_DIM);
+            let (bx1, by1) = (
+                rect.x1.div_ceil(K_BLOCK_DIM).min(xb),
+                rect.y1.div_ceil(K_BLOCK_DIM).min(yb),
+            );
+            for by in by0..by1 {
+                for bx in bx0..bx1 {
+                    let t = task_of_block[by * xb + bx];
+                    let Some(source) = e.source_dc[t].as_ref() else {
+                        continue;
+                    };
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    let lx = bx - (dc_gx * blocks_per_dc + gx * K_GROUP_DIM_IN_BLOCKS);
+                    let ly = by - (dc_gy * blocks_per_dc + gy * K_GROUP_DIM_IN_BLOCKS);
+                    for (c, plane) in [&source.x, &source.y, &source.b].into_iter().enumerate() {
+                        out.plane_row_mut(c, by)[bx] -= plane.row(ly)[lx];
+                    }
+                }
+            }
         };
     let decoded_dc = |e: &Eval, dp: &DistanceParams| -> Image3F {
         let mut out = Image3F::new(xb, yb);
         fill_decoded_dc(e, dp, crate::ssimulacra2::Rect::new(0, 0, w, h), &mut out);
+        out
+    };
+    // The coefficient polish's ColorVideoVDP judge keeps the decoded DC minus
+    // block means it was tuned with. Judging coefficient moves on the exact
+    // DC error loses 2-3 % cvvdp at matched rate (8/8), unlike the quant-field
+    // loop, which gains 1-3 % on every metric from it.
+    let legacy_dc = |e: &Eval, dp: &DistanceParams| -> Image3F {
+        use crate::quant_weights::INV_DC_QUANT;
+        let mut out = Image3F::new(xb, yb);
+        let steps: [f32; 3] =
+            std::array::from_fn(|c| dp.dc_step[c] / (INV_DC_QUANT[c] * dp.scale_dc));
+        let cfl = ctx.cfl_frame();
+        let cfl_b = crate::color_correlation::dc_cfl_factor(dp.dc_step, ytob_dc, cfl);
+        let cfl_x = crate::color_correlation::dc_cfl_factor_x(dp.dc_step, cfl.base_x);
+        group_map.reconstruct_dc(
+            &e.quant_dc,
+            [cfl_x, cfl_b],
+            steps,
+            ctx.dc_rows.reconstruct,
+            crate::ssimulacra2::Rect::new(0, 0, w, h),
+            &mut out,
+        );
+        for c in 0..3 {
+            for by in 0..yb {
+                let rows = by * K_BLOCK_DIM..(by * K_BLOCK_DIM + K_BLOCK_DIM).min(h);
+                let n_rows = rows.len() as f32;
+                let row = out.plane_row_mut(c, by);
+                for (bx, v) in row[..xb].iter_mut().enumerate() {
+                    let cols = bx * K_BLOCK_DIM..(bx * K_BLOCK_DIM + K_BLOCK_DIM).min(w);
+                    let n = n_rows * cols.len() as f32;
+                    let sum: f32 = rows
+                        .clone()
+                        .map(|y| opsin.plane_row(c, y)[cols.clone()].iter().sum::<f32>())
+                        .sum();
+                    *v -= sum / n;
+                }
+            }
+        }
         out
     };
     // Small trials reuse one plane and reconstruct only cells the judge reads.
@@ -578,7 +652,7 @@ pub(super) fn run_quant_field_loop(
                     [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)))
                 });
             let pcv_pf = polish_cv.as_mut().map(|judge| {
-                [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)))
+                [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &legacy_dc(e, distp)))
             });
             drop(fine);
             // The coarser shift covers half the groups (slope estimate only).
@@ -642,7 +716,7 @@ pub(super) fn run_quant_field_loop(
                 cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
             }
             if let (Some([cv_p, cv_f]), Some(judge)) = (pcv_pf, polish_cv.as_mut()) {
-                let cv_c = judge.deficit_of(&coarse.recon, &decoded_dc(&coarse, distp));
+                let cv_c = judge.deficit_of(&coarse.recon, &legacy_dc(&coarse, distp));
                 let s_fine = (cv_p - cv_f) / (r_f - r_p);
                 let s_coarse = if r_p - r_c > 1e-3 {
                     (cv_c - cv_p) / (r_p - r_c)
@@ -1853,7 +1927,7 @@ pub(super) fn run_quant_field_loop(
         // Near transparency ColorVideoVDP does not separate the shifts (no
         // exchange rate): SSIMULACRA2 alone decides.
         let cv_dc = (polish_cv_slope.is_finite() && polish_cv_slope > 0.0)
-            .then(|| decoded_dc(&e, &distp_out));
+            .then(|| legacy_dc(&e, &distp_out));
         let cv_lambda = polish_cv_slope * 100.0 / bits0;
         let lambda_bits = race_slope * 100.0 / bits0;
         drop(e);
@@ -1947,6 +2021,7 @@ pub(super) fn run_quant_field_loop(
             recon: Image3F::new(0, 0),
             pending: vec![None; ac_tasks.len()],
             quant_dc: vec![None; ac_tasks.len()],
+            source_dc: vec![None; ac_tasks.len()],
             starts: Vec::new(),
             synced: Vec::new(),
             trial: false,

@@ -31,6 +31,7 @@ use crate::dct::{
     DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
     RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
+#[cfg(feature = "extraslow")]
 use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
@@ -1669,6 +1670,7 @@ pub(crate) fn dc_from_dct32x64_neon(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
 
 // Restore the natural frequency order of the 64-point split-radix kernel.
 #[target_feature(enable = "neon")]
+#[cfg(feature = "extraslow")]
 fn dct1d_64_natural(c: &mut [float32x4_t; 64]) {
     dct1d_64_s(c);
     let split = *c;
@@ -1679,6 +1681,7 @@ fn dct1d_64_natural(c: &mut [float32x4_t; 64]) {
 
 /// Split-radix DCT-II over 4 independent 128-point columns.
 #[target_feature(enable = "neon")]
+#[cfg(feature = "extraslow")]
 fn dct1d_128(c: &mut [float32x4_t; 128]) {
     for i in 0..32 {
         let bottom = c[i];
@@ -1731,6 +1734,7 @@ fn dct1d_128(c: &mut [float32x4_t; 128]) {
 }
 
 // Transposed scratch makes both separable passes use contiguous SIMD loads.
+#[cfg(feature = "extraslow")]
 macro_rules! dct128_neon {
     ($name:ident, $n:literal, $w:literal, $h:literal, $dct_v:path, $dct_h:path) => {
         #[target_feature(enable = "neon")]
@@ -1786,11 +1790,15 @@ macro_rules! dct128_neon {
     };
 }
 
+#[cfg(feature = "extraslow")]
 dct128_neon!(dct128x128_neon, 16384, 128, 128, dct1d_128, dct1d_128);
+#[cfg(feature = "extraslow")]
 dct128_neon!(dct128x64_neon, 8192, 64, 128, dct1d_128, dct1d_64_natural);
+#[cfg(feature = "extraslow")]
 dct128_neon!(dct64x128_neon, 8192, 128, 64, dct1d_64_natural, dct1d_128);
 
 #[target_feature(enable = "neon")]
+#[cfg(feature = "extraslow")]
 fn inv_dct1d_128(c: &mut [float32x4_t; 128]) {
     let mut even: [float32x4_t; 64] = std::array::from_fn(|i| c[2 * i]);
     let mut odd: [float32x4_t; 64] = std::array::from_fn(|i| c[2 * i + 1]);
@@ -1807,6 +1815,7 @@ fn inv_dct1d_128(c: &mut [float32x4_t; 128]) {
     }
 }
 
+#[cfg(feature = "extraslow")]
 inv_dct_transposed_neon!(
     inv_dct128x128_neon,
     16384,
@@ -1816,6 +1825,7 @@ inv_dct_transposed_neon!(
     inv_dct1d_128,
     Box::<[f32; 16384]>::new_uninit()
 );
+#[cfg(feature = "extraslow")]
 inv_dct_transposed_neon!(
     inv_dct128x64_neon,
     8192,
@@ -1825,6 +1835,7 @@ inv_dct_transposed_neon!(
     inv_dct1d_64_s,
     Box::<[f32; 8192]>::new_uninit()
 );
+#[cfg(feature = "extraslow")]
 inv_dct_natural_neon!(
     inv_dct64x128_neon,
     8192,
@@ -1835,6 +1846,7 @@ inv_dct_natural_neon!(
     Box::<[f32; 8192]>::new_uninit()
 );
 
+#[cfg(feature = "extraslow")]
 macro_rules! dc_from_dct128_neon {
     ($name:ident, $n:literal, $rows:literal, $inv_v:path) => {
         #[target_feature(enable = "neon")]
@@ -1877,10 +1889,13 @@ macro_rules! dc_from_dct128_neon {
     };
 }
 
+#[cfg(feature = "extraslow")]
 dc_from_dct128_neon!(dc_from_dct128x128_neon, 16384, 16, inv_dct1d_16_s);
+#[cfg(feature = "extraslow")]
 dc_from_dct128_neon!(dc_from_dct128x64_neon, 8192, 8, inv_dct1d_8_s);
 
 #[target_feature(enable = "neon")]
+#[cfg(feature = "extraslow")]
 pub(crate) fn dc_from_dct64x128_neon(coeffs: &[f32; 8192], dc: &mut [f32; 128]) {
     let mut transposed = [0.0f32; 128];
     dc_from_dct128x64_neon(coeffs, &mut transposed);

@@ -28,8 +28,11 @@
  */
 
 //! ColorVideoVDP arbiter of the closed loop under [`crate::Arbiter::Cvvdp`].
-//! The loop's reconstruction carries only the AC quantization error, so each
-//! 8x8 block's DC is replaced by its decoded value before scoring. Whole-frame
+//! The loop's reconstruction carries only the AC quantization error: the
+//! lowest frequencies ride on the DC path. Callers supply each 8x8 cell's DC
+//! error (decoded minus unrounded DC image value), added before scoring. A
+//! block mean is not that value for merged transforms, whose DC image holds
+//! their lowest frequencies' transform instead. Whole-frame
 //! arms are scored in full; per-candidate moves update an incremental state
 //! that follows the accepted frame.
 
@@ -60,8 +63,6 @@ pub(crate) struct CvvdpArbiter {
     linear: [Vec<f32>; 3],
     /// DC-adjusted XYB row scratch, reused by full and regional conversions.
     rows: [Vec<f32>; 3],
-    /// Source mean of every 8x8 block (edge blocks over their visible pixels).
-    source_dc: Image3F,
     width: usize,
     height: usize,
 }
@@ -92,42 +93,23 @@ impl CvvdpArbiter {
         // Incremental scoring owns its scratch. Full-frame comparisons grow
         // this workspace lazily, so polishing workers retain no unused pyramid.
         let workspace = Workspace::new();
-        let (xb, yb) = (width.div_ceil(8), height.div_ceil(8));
-        let mut source_dc = Image3F::new(xb, yb);
-        for c in 0..3 {
-            for by in 0..yb {
-                let rows = by * 8..(by * 8 + 8).min(height);
-                let n_rows = rows.len() as f32;
-                let out = source_dc.plane_row_mut(c, by);
-                for (bx, v) in out[..xb].iter_mut().enumerate() {
-                    let cols = bx * 8..(bx * 8 + 8).min(width);
-                    let n = n_rows * cols.len() as f32;
-                    let sum: f32 = rows
-                        .clone()
-                        .map(|y| source.plane_row(c, y)[cols.clone()].iter().sum::<f32>())
-                        .sum();
-                    *v = sum / n;
-                }
-            }
-        }
         Some(Self {
             reference,
             workspace,
             state: None,
             linear: Default::default(),
             rows: Default::default(),
-            source_dc,
             width,
             height,
         })
     }
 
-    /// Linear RGB of `recon` with every block's DC replaced by `decoded_dc`,
-    /// written into `out` (frame-sized planes) over `r`.
+    /// Linear RGB of `recon` plus every block's DC error `dc_error`, written
+    /// into `out` (frame-sized planes) over `r`.
     fn write_linear(
         &mut self,
         recon: &Image3F,
-        decoded_dc: &Image3F,
+        dc_error: &Image3F,
         r: Rect,
         out: &mut [Vec<f32>; 3],
     ) {
@@ -140,11 +122,10 @@ impl CvvdpArbiter {
         let [r_out, g_out, b_out] = out;
         for y in r.y0..r.y1 {
             for (c, row) in rows.iter_mut().enumerate() {
-                let dc = decoded_dc.plane_row(c, y / 8);
-                let source = self.source_dc.plane_row(c, y / 8);
+                let err = dc_error.plane_row(c, y / 8);
                 let src = &recon.plane_row(c, y)[r.x0..r.x1];
                 for ((v, &s), x) in row.iter_mut().zip(src).zip(r.x0..) {
-                    *v = s + (dc[x / 8] - source[x / 8]);
+                    *v = s + err[x / 8];
                 }
             }
             let span = y * w + r.x0..y * w + r.x1;
@@ -174,12 +155,12 @@ impl CvvdpArbiter {
         RgbImage::linear_rgb(planes, self.width, self.height, self.width).expect("decoded planes")
     }
 
-    /// Pooled distortion (smaller is better) of `recon` with `decoded_dc`,
+    /// Pooled distortion (smaller is better) of `recon` with `dc_error`,
     /// independent of the accepted frame.
-    pub(crate) fn deficit_of(&mut self, recon: &Image3F, decoded_dc: &Image3F) -> f32 {
+    pub(crate) fn deficit_of(&mut self, recon: &Image3F, dc_error: &Image3F) -> f32 {
         let (w, h) = (self.width, self.height);
         let mut linear = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];
-        self.write_linear(recon, decoded_dc, self.full(), &mut linear);
+        self.write_linear(recon, dc_error, self.full(), &mut linear);
         let image = self.image(&linear);
         self.workspace
             .compare(&self.reference, image)
@@ -195,13 +176,13 @@ impl CvvdpArbiter {
         self.linear = Default::default();
     }
 
-    /// Make `recon` with `decoded_dc` the accepted frame that updates follow.
-    pub(crate) fn reset(&mut self, recon: &Image3F, decoded_dc: &Image3F) {
+    /// Make `recon` with `dc_error` the accepted frame that updates follow.
+    pub(crate) fn reset(&mut self, recon: &Image3F, dc_error: &Image3F) {
         let mut linear = std::mem::take(&mut self.linear);
         for plane in &mut linear {
             plane.resize(self.width * self.height, 0.0);
         }
-        self.write_linear(recon, decoded_dc, self.full(), &mut linear);
+        self.write_linear(recon, dc_error, self.full(), &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         self.state =
@@ -214,9 +195,9 @@ impl CvvdpArbiter {
     }
 
     /// Commit a reconstruction change without saving rollback data.
-    pub(crate) fn update(&mut self, recon: &Image3F, decoded_dc: &Image3F, r: Rect) -> f32 {
+    pub(crate) fn update(&mut self, recon: &Image3F, dc_error: &Image3F, r: Rect) -> f32 {
         let mut linear = std::mem::take(&mut self.linear);
-        self.write_linear(recon, decoded_dc, r, &mut linear);
+        self.write_linear(recon, dc_error, r, &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         let rect = cvvdp_lite::Rect::new(r.x0, r.y0, r.x1, r.y1);
@@ -228,12 +209,12 @@ impl CvvdpArbiter {
             .distortion as f32
     }
 
-    /// Score the accepted frame with `recon` (and `decoded_dc`) inside `r`,
+    /// Score the accepted frame with `recon` (and `dc_error`) inside `r`,
     /// keeping it until `rollback(cp)`.
     pub(crate) fn update_checkpointed(
         &mut self,
         recon: &Image3F,
-        decoded_dc: &Image3F,
+        dc_error: &Image3F,
         r: Rect,
         cp: &mut CvvdpCheckpoint,
     ) -> f32 {
@@ -247,7 +228,7 @@ impl CvvdpArbiter {
             }
         }
         let mut linear = std::mem::take(&mut self.linear);
-        self.write_linear(recon, decoded_dc, r, &mut linear);
+        self.write_linear(recon, dc_error, r, &mut linear);
         self.linear = linear;
         let image = self.image(&self.linear);
         let rect = cvvdp_lite::Rect::new(r.x0, r.y0, r.x1, r.y1);
@@ -296,7 +277,7 @@ mod tests {
         let reference = CvvdpArbiter::prepare(&source).unwrap();
         let mut committed = CvvdpArbiter::new_shared(&source, reference.clone()).unwrap();
         let mut checkpointed = CvvdpArbiter::new_shared(&source, reference).unwrap();
-        let mut dc = committed.source_dc.clone();
+        let mut dc = Image3F::new(w.div_ceil(8), h.div_ceil(8));
         let mut recon = source.clone();
         committed.reset(&recon, &dc);
         checkpointed.reset(&recon, &dc);
@@ -364,7 +345,7 @@ mod tests {
             Workspace::new().allocated_bytes()
         );
         assert!(judge.linear.iter().all(|plane| plane.capacity() == 0));
-        let dc = judge.source_dc.clone();
+        let dc = Image3F::new(judge.width.div_ceil(8), judge.height.div_ceil(8));
         judge.reset(&source, &dc);
         assert_eq!(
             judge.workspace.allocated_bytes(),
