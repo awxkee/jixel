@@ -64,6 +64,9 @@ const MAX_COST_BITS: f32 = 2.0;
 const CV_TRIES: usize = 2;
 /// A zeroed coefficient is a restore candidate from this unquantized level.
 const RESTORE_MIN: f32 = 0.25;
+/// After the best move is committed, this many of the round's other
+/// SSIMULACRA2-accepted proposals are re-verified on the changed block.
+const EXTRA_TRIES: usize = 4;
 /// Scan positions examined per channel.
 const MAX_POSITIONS: usize = 256;
 /// Distortion-ranked proposals priced per channel.
@@ -684,41 +687,114 @@ impl CoefPolisher {
             }
             let scored = &mut scored[..nscored];
             scored.sort_by(|x, y| x.0.total_cmp(&y.0));
-            let mut best: Option<PolishMove> = None;
+            let mut best: Option<(PolishMove, usize)> = None;
             for &(_, i) in scored.iter().take(CV_TRIES) {
                 let m = singles[i];
                 match self.judge_cv(ctx, b, rect, &m) {
                     Some(j_cv) if j_cv >= 0.0 => continue,
                     _ => {
-                        best = Some(m);
+                        best = Some((m, i));
                         break;
                     }
                 }
             }
 
             // ---- Accept ----
-            let Some(m) = best else { break };
+            let Some((m, best_i)) = best else { break };
             // The final judge_cv call prepared this move, even without a judge.
-            self.apply_plane_deltas(b, 1.0);
-            self.accept_rect(rect);
-            // Keep the capture plane consistent with the frame reconstruction.
-            for c in 0..3 {
-                for y in rect.y0..rect.y1 {
-                    let src = &self.recon.plane_row(c, y)[rect.x0..rect.x1];
-                    plane.plane_row_mut(c, ly0 + (y - b.py0))[lx0..lx0 + (rect.x1 - rect.x0)]
-                        .copy_from_slice(src);
-                }
-            }
-            quantized[m.c][m.idx] = m.to;
-            nzeros[m.c] = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
-            base_bits[m.c] = block_bits(
-                quantized[m.c],
-                &b.channels[m.c],
-                covered,
-                nzeros[m.c],
+            let at = (&mut *plane, lx0, ly0);
+            self.commit(
                 prices,
+                b,
+                rect,
+                &m,
+                at,
+                quantized,
+                &mut nzeros,
+                &mut base_bits,
             );
+
+            // ---- Further accepted proposals, re-priced and re-judged on the new block ----
+            let mut touched = [(m.c, m.idx); EXTRA_TRIES + 1];
+            let mut ntouched = 1;
+            let mut tries = 0;
+            for &(_, i) in scored.iter() {
+                if tries == EXTRA_TRIES {
+                    break;
+                }
+                let mut m = singles[i];
+                if i == best_i
+                    || touched[..ntouched].contains(&(m.c, m.idx))
+                    || quantized[m.c][m.idx] != m.from
+                {
+                    continue;
+                }
+                quantized[m.c][m.idx] = m.to;
+                let nz = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
+                let bits = block_bits(quantized[m.c], &b.channels[m.c], covered, nz, prices);
+                quantized[m.c][m.idx] = m.from;
+                m.dbits = bits - base_bits[m.c];
+                if m.dbits > MAX_COST_BITS {
+                    continue;
+                }
+                tries += 1;
+                if self.judge_ss2(ctx, b, rect, &m) >= -1e-6 {
+                    continue;
+                }
+                if let Some(j_cv) = self.judge_cv(ctx, b, rect, &m)
+                    && j_cv >= 0.0
+                {
+                    continue;
+                }
+                touched[ntouched] = (m.c, m.idx);
+                ntouched += 1;
+                let at = (&mut *plane, lx0, ly0);
+                self.commit(
+                    prices,
+                    b,
+                    rect,
+                    &m,
+                    at,
+                    quantized,
+                    &mut nzeros,
+                    &mut base_bits,
+                );
+            }
         }
+    }
+
+    /// Commit `m`, whose plane deltas the last judge call prepared.
+    #[allow(clippy::too_many_arguments)]
+    fn commit(
+        &mut self,
+        prices: &FrozenTokenPrices,
+        b: &PolishBlock,
+        rect: Rect,
+        m: &PolishMove,
+        (plane, lx0, ly0): (&mut Image3F, usize, usize),
+        quantized: &mut [&mut [i32]; 3],
+        nzeros: &mut [usize; 3],
+        base_bits: &mut [f32; 3],
+    ) {
+        self.apply_plane_deltas(b, 1.0);
+        self.accept_rect(rect);
+        // Keep the capture plane consistent with the frame reconstruction.
+        for c in 0..3 {
+            for y in rect.y0..rect.y1 {
+                let src = &self.recon.plane_row(c, y)[rect.x0..rect.x1];
+                plane.plane_row_mut(c, ly0 + (y - b.py0))[lx0..lx0 + (rect.x1 - rect.x0)]
+                    .copy_from_slice(src);
+            }
+        }
+        quantized[m.c][m.idx] = m.to;
+        nzeros[m.c] = nzeros[m.c] + usize::from(m.to != 0) - usize::from(m.from != 0);
+        base_bits[m.c] = block_bits(
+            quantized[m.c],
+            &b.channels[m.c],
+            b.cx * b.cy,
+            nzeros[m.c],
+            prices,
+        );
     }
 }
 
