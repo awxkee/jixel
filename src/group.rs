@@ -2003,7 +2003,7 @@ pub(crate) fn write_ac_group(
                 memo.as_deref()
                     .is_some_and(|m| m.keys[c][bi] == memo_keys[c])
             });
-            debug_assert!(memo.is_none() || (!measure_chroma_distortion && source_dc.is_none()));
+            debug_assert!(memo.is_none() || !measure_chroma_distortion);
             // A hit channel's levels (unless its tokens are cached too) and DC.
             if let Some(m) = memo.as_deref() {
                 for c in 0..3 {
@@ -2088,8 +2088,8 @@ pub(crate) fn write_ac_group(
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
                 // Saturated pixels get a free target beyond the clip limit;
-                // the shift rides on Y and B.
-                let clip_shift = ctx.speed.effort().clip_continuation && !hit[1] && {
+                // the shift rides on Y and B, so either one recomputing needs it.
+                let clip_shift = ctx.speed.effort().clip_continuation && (!hit[1] || !hit[2]) && {
                     let (input, stride) = footprint.pixels(opsin.plane(1), &mut gather[..]);
                     crate::clip_continuation::continue_saturated(
                         ctx,
@@ -2945,6 +2945,17 @@ pub(crate) fn write_ac_group(
                     );
                 }
             }
+            // Hit channels skipped their transforms: the memo holds every
+            // channel's unrounded DC (X and B equal post-CfL, Y's LLF being zero).
+            if let (Some(source), Some(m)) = (source_dc.as_mut(), memo.as_deref()) {
+                for iy in 0..cov_y {
+                    let row = (lby + iy) * m.xsize_blocks;
+                    for (c, plane) in [(0, &mut source.x), (1, &mut source.y), (2, &mut source.b)] {
+                        plane.row_mut(lby + iy)[bx..bx + cov_x]
+                            .copy_from_slice(&m.dc_f[c][row + bx..row + bx + cov_x]);
+                    }
+                }
+            }
             // ---- Tokenize in order Y, X, B ----
             if let Some(m) = memo.as_deref_mut()
                 && token_memo
@@ -3398,6 +3409,127 @@ mod tests {
                 assert_eq!(pointers(&scratch), storage);
                 let mut fresh = AcGroupScratch::default();
                 assert_eq!(run(&ctx, &mut fresh, rdoq, capture, shifts), expected);
+            }
+        }
+    }
+
+    /// A warm block memo must reproduce a fresh evaluation of the same
+    /// candidate: tokens, quantized DC and the unrounded source DC, on full
+    /// hits and when only B misses (a B matrix-scale change keeps Y cached).
+    #[cfg(feature = "extraslow")]
+    #[test]
+    fn block_memo_matches_fresh_evaluation_on_partial_and_full_hits() {
+        use super::{AcBlockCache, AcGroupScratch, SourceDc, write_ac_group};
+        use crate::coeff_order::CoeffOrders;
+        use crate::dc_group_data::DcGroupData;
+        use crate::encoding_context::EncodingContext;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+        use crate::image::{Image3B, Image3F, Image3S, Plane, Rect};
+        use crate::xyb::rgb_to_xyb_pixel_f32;
+
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
+        assert!(ctx.speed.effort().clip_continuation);
+        // Black/white edges at a different column in every 8x8 block.
+        let (w, h) = (56, 16);
+        let black = rgb_to_xyb_pixel_f32(&ctx.xyb, 0.0, 0.0, 0.0);
+        let white = rgb_to_xyb_pixel_f32(&ctx.xyb, 1.0, 1.0, 1.0);
+        let mut image = Image3F::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let edge = (x / 8 + y / 8) % 7 + 1;
+                let (vx, vy, vb) = if x % 8 < edge { black } else { white };
+                image.plane_row_mut(0, y)[x] = vx;
+                image.plane_row_mut(1, y)[x] = vy;
+                image.plane_row_mut(2, y)[x] = vb;
+            }
+        }
+        let (bw, bh) = (w / 8, h / 8);
+        let orders = CoeffOrders::natural();
+        let samples: Vec<_> = (0..4096).map(|i| Token::new(i % 2, i % 17)).collect();
+        let mut code = build_entropy_code_no_cluster(&samples, 2, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let run = |dc: &DcGroupData, b_scale: u32, memo: Option<&mut AcBlockCache>| {
+            ctx.set_b_qm_scale(b_scale);
+            let mut scratch = AcGroupScratch::default();
+            let mut quant_dc = Image3S::new(bw, bh);
+            let mut source = SourceDc {
+                y: Plane::new(bw, bh),
+                b: Plane::new(bw, bh),
+                x: Plane::new(bw, bh),
+            };
+            let mut nzeros = vec![Image3B::new(32, 32)];
+            let mut tokens = vec![Vec::new()];
+            let mut starts = Vec::new();
+            let mut memo = memo;
+            let mut recon = match memo.as_deref_mut() {
+                Some(m) => std::mem::replace(m.recon_mut(), Image3F::new(0, 0)),
+                None => Image3F::new(w, h),
+            };
+            write_ac_group(
+                &ctx,
+                &mut scratch,
+                &image,
+                (0, 0),
+                Rect::new(0, 0, bw, bh),
+                1.0,
+                1.0,
+                [1.0; 3],
+                2.0,
+                2,
+                dc,
+                0,
+                &mut quant_dc,
+                Some(&mut source),
+                0,
+                0,
+                &mut nzeros,
+                &[0],
+                Some(&prices),
+                &orders,
+                &[],
+                None,
+                false,
+                8,
+                Some((&mut recon, 0, &mut starts)),
+                memo.as_deref_mut(),
+                &mut tokens,
+            );
+            if let Some(m) = memo {
+                *m.recon_mut() = recon;
+            }
+            let bits =
+                |p: &Plane<f32>| p.as_slice().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            (
+                tokens[0]
+                    .iter()
+                    .map(|t| (t.context, t.value))
+                    .collect::<Vec<_>>(),
+                [0, 1, 2].map(|c| quant_dc.plane_data(c).to_vec()),
+                [bits(&source.x), bits(&source.y), bits(&source.b)],
+            )
+        };
+        for qf in [6u8, 10, 16] {
+            let mut dc = DcGroupData::new(bw, bh).unwrap();
+            dc.raw_quant_field.as_mut_slice().fill(qf);
+            let mut memo = AcBlockCache::new(bw, bh, w, h);
+            let warm = run(&dc, 6, Some(&mut memo));
+            assert_eq!(warm, run(&dc, 6, None), "cold memo, qf {qf}");
+            for b_scale in [7, 7] {
+                let fresh = run(&dc, b_scale, None);
+                assert_eq!(
+                    run(&dc, b_scale, Some(&mut memo)),
+                    fresh,
+                    "qf {qf} b {b_scale}"
+                );
             }
         }
     }

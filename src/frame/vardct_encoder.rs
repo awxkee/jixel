@@ -485,19 +485,20 @@ pub(super) fn encode_frame_core(
                     ytob_dc,
                     qf_threshold,
                     &prices,
+                    epf_recon.is_some(),
                 )
             } else {
                 None
             };
         #[cfg(not(feature = "extraslow"))]
-        let loop_groups: Option<(Vec<RefinedAcGroup>, DistanceParams)> = None;
-        let loop_groups = loop_groups.map(|(groups, chosen)| {
+        let loop_groups: Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> = None;
+        let loop_groups = loop_groups.map(|(groups, chosen, recon)| {
             distp = chosen;
-            groups
+            (groups, recon)
         });
-        let refined = if let Some(groups) = loop_groups {
-            // The closed loop's groups carry no reconstruction capture.
-            epf_recon = None;
+        let refined = if let Some((groups, recon)) = loop_groups {
+            // The loop's final reconstruction replaces the pass-2 captures.
+            epf_recon = recon;
             groups.into_iter().map(|g| (g, None)).collect::<Vec<_>>()
         } else {
             let dc_ref = &dc_datas;
