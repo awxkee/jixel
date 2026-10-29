@@ -71,7 +71,8 @@ pub(super) fn run_quant_field_loop(
     ytob_dc: i32,
     qf_threshold: u32,
     prices: &crate::entropy::FrozenTokenPrices,
-) -> Option<(Vec<RefinedAcGroup>, DistanceParams)> {
+    want_recon: bool,
+) -> Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> {
     /// Marginals and slope come from plain quantization; the ratio of deficit
     /// to bits is what the trellis preserves, at a third of the cost.
     const SHIFT_RDOQ: bool = false;
@@ -480,29 +481,33 @@ pub(super) fn run_quant_field_loop(
         &mut cur,
     );
     let ref_bits = frame_bits(&cur);
-    let finish =
-        |e: Eval, distp: DistanceParams| -> Option<(Vec<RefinedAcGroup>, DistanceParams)> {
-            Some((
-                e.pending
-                    .into_iter()
-                    .zip(e.quant_dc)
-                    .enumerate()
-                    .map(|(t, (p, q))| {
-                        let (dc_idx, gx, gy) = ac_tasks[t];
-                        (
-                            dc_idx,
-                            gx,
-                            gy,
-                            p.expect("pending group"),
-                            q.expect("group dc"),
-                        )
-                    })
-                    .collect(),
-                distp,
-            ))
-        };
+    let finish = |e: Eval,
+                  distp: DistanceParams,
+                  recon: Option<Image3F>|
+     -> Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> {
+        Some((
+            e.pending
+                .into_iter()
+                .zip(e.quant_dc)
+                .enumerate()
+                .map(|(t, (p, q))| {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    (
+                        dc_idx,
+                        gx,
+                        gy,
+                        p.expect("pending group"),
+                        q.expect("group dc"),
+                    )
+                })
+                .collect(),
+            distp,
+            recon,
+        ))
+    };
     if ref_bits <= 0.0 {
-        return finish(cur, *distp);
+        let recon = want_recon.then(|| std::mem::replace(&mut cur.recon, Image3F::new(0, 0)));
+        return finish(cur, *distp, recon);
     }
     let rate_term = |bits: f32| 100.0 * (bits / ref_bits).ln();
     let mut cur_bits = ref_bits;
@@ -788,6 +793,7 @@ pub(super) fn run_quant_field_loop(
             |from: &Eval, to: &mut Eval, tasks: &[usize], r: crate::ssimulacra2::Rect| {
                 for &task in tasks {
                     to.quant_dc[task] = from.quant_dc[task].clone();
+                    to.source_dc[task] = from.source_dc[task].clone();
                     to.synced[task] = from.synced[task];
                 }
                 for c in 0..3 {
@@ -1096,6 +1102,7 @@ pub(super) fn run_quant_field_loop(
         let mut cur_gbits: Vec<f32> = (0..ac_tasks.len()).map(|t| group_bits(&cur, t)).collect();
         let sync_task = |from: &Eval, to: &mut Eval, task: usize, r: crate::ssimulacra2::Rect| {
             to.quant_dc[task] = from.quant_dc[task].clone();
+            to.source_dc[task] = from.source_dc[task].clone();
             to.synced[task] = from.synced[task];
             for c in 0..3 {
                 for y in r.y0..r.y1 {
@@ -1567,6 +1574,7 @@ pub(super) fn run_quant_field_loop(
             |from: &mut Eval, to: &mut Eval, task: usize, r: crate::ssimulacra2::Rect| {
                 std::mem::swap(&mut to.pending[task], &mut from.pending[task]);
                 std::mem::swap(&mut to.quant_dc[task], &mut from.quant_dc[task]);
+                std::mem::swap(&mut to.source_dc[task], &mut from.source_dc[task]);
                 std::mem::swap(&mut to.starts[task], &mut from.starts[task]);
                 to.synced[task] = from.synced[task];
                 for c in 0..3 {
@@ -1811,7 +1819,9 @@ pub(super) fn run_quant_field_loop(
             }
             _ => None,
         };
-        cur.recon = Image3F::new(0, 0);
+        if !want_recon {
+            cur.recon = Image3F::new(0, 0);
+        }
         let mut score = |e: &Eval| -> f32 {
             match judge.as_deref_mut() {
                 Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),
@@ -1879,7 +1889,9 @@ pub(super) fn run_quant_field_loop(
                     tried.push((x, b));
                     if j > best.0 + 1e-6 {
                         best = (j, x, b);
-                        e.recon = Image3F::new(0, 0);
+                        if !want_recon {
+                            e.recon = Image3F::new(0, 0);
+                        }
                         best_eval = Some(e);
                     } else {
                         break;
@@ -1987,7 +1999,7 @@ pub(super) fn run_quant_field_loop(
             for &t in all_tasks.iter().skip(ci * per_chunk).take(per_chunk) {
                 let (dc_idx, gx, gy) = ac_tasks[t];
                 let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _, _, _) = process_ac_group(
+                let (p, local, _, _, capture) = process_ac_group(
                     ctx,
                     scratch,
                     opsin,
@@ -2009,7 +2021,7 @@ pub(super) fn run_quant_field_loop(
                     true,
                     None,
                 );
-                polished.push((t, p, local));
+                polished.push((t, p, local, capture.map(|(image, _)| image)));
             }
             scratch.ac_group.polisher = None;
             polished
@@ -2027,11 +2039,28 @@ pub(super) fn run_quant_field_loop(
             trial: false,
             hit_bits: Vec::new(),
         };
-        for (t, p, local) in results.into_iter().flatten() {
+        // The polished groups' captures make up the frame reconstruction.
+        if want_recon {
+            out.recon = Image3F::new(w, h);
+        }
+        for (t, p, local, capture) in results.into_iter().flatten() {
             out.pending[t] = Some(p);
             out.quant_dc[t] = Some(local);
+            if let (true, Some(plane)) = (want_recon, capture) {
+                let (dc_idx, gx, gy) = ac_tasks[t];
+                let (dc_gx, dc_gy) = group_coords[dc_idx];
+                let x0 = dc_gx * K_DC_GROUP_DIM + gx * K_GROUP_DIM;
+                let y0 = dc_gy * K_DC_GROUP_DIM + gy * K_GROUP_DIM;
+                for c in 0..3 {
+                    for y in 0..plane.ysize() {
+                        let src = &plane.plane_row(c, y)[..plane.xsize()];
+                        out.recon.plane_row_mut(c, y0 + y)[x0..x0 + src.len()].copy_from_slice(src);
+                    }
+                }
+            }
         }
         cur = out;
     }
-    finish(cur, distp_out)
+    let recon = want_recon.then(|| std::mem::replace(&mut cur.recon, Image3F::new(0, 0)));
+    finish(cur, distp_out, recon)
 }
