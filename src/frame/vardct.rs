@@ -32,7 +32,8 @@
 use super::chroma::configure_chroma;
 use super::quantization::DistanceParams;
 use super::variants::{
-    GLYPH_BITS_MARGIN, GlyphStage, LATTICE_BITS_MARGIN, lattice_variants, prepare_vardct_variant,
+    GLYPH_BITS_MARGIN, GLYPH_SINGLETON_FREE_MAX_DISTANCE, GLYPH_SINGLETON_RACE_MAX_DISTANCE,
+    GlyphStage, LATTICE_BITS_MARGIN, lattice_variants, prepare_vardct_variant,
 };
 #[cfg(feature = "splines")]
 use super::variants::{SplineStage, spline_quant_field};
@@ -100,7 +101,14 @@ pub(super) fn encode_frame_vardct(
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
     let lattice = crate::lattice_patches::find(&xyb);
-    let glyphs = GlyphStage::find(ctx, scratch, distance, &xyb, alpha);
+    let mut glyphs = GlyphStage::find(
+        ctx,
+        scratch,
+        distance,
+        &xyb,
+        alpha,
+        distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE,
+    );
     let mut best = prepare_vardct_variant(
         ctx,
         scratch,
@@ -115,6 +123,57 @@ pub(super) fn encode_frame_vardct(
         #[cfg(feature = "splines")]
         stage.as_ref(),
     )?;
+    // Text set in unrepeated glyphs: the atlas codes it near-exactly, so a
+    // plan with them that is also smaller dominates the repeated-only one.
+    // The race arm skips spline selection, which only costs it bits; a
+    // winner is rebuilt with splines.
+    if distance > GLYPH_SINGLETON_FREE_MAX_DISTANCE
+        && distance <= GLYPH_SINGLETON_RACE_MAX_DISTANCE
+        && let Some(singles) = GlyphStage::find(ctx, scratch, distance, &xyb, alpha, true)
+    {
+        let best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+        if (singles.atlas_bits() as f64) < best_bits {
+            let mut arm = prepare_vardct_variant(
+                ctx,
+                scratch,
+                distance,
+                distp,
+                xyb.clone(),
+                alpha,
+                coeff_shifts,
+                true,
+                Some(&singles),
+                true,
+                #[cfg(feature = "splines")]
+                None,
+            )?;
+            if arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)? < best_bits {
+                #[cfg(feature = "splines")]
+                if stage.is_some() {
+                    let full = prepare_vardct_variant(
+                        ctx,
+                        scratch,
+                        distance,
+                        distp,
+                        xyb.clone(),
+                        alpha,
+                        coeff_shifts,
+                        true,
+                        Some(&singles),
+                        true,
+                        stage.as_ref(),
+                    )?;
+                    if full.has_splines() {
+                        arm = full;
+                    } else {
+                        arm.tiles_touched = full.tiles_touched;
+                    }
+                }
+                best = arm;
+                glyphs = Some(singles);
+            }
+        }
+    }
     if !best.used_tiles && lattice.is_none() {
         drop(xyb);
         drop(glyphs);

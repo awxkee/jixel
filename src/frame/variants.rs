@@ -140,8 +140,8 @@ impl GlyphStage {
         distance: f32,
         xyb: &Image3F,
         alpha: Option<&AlphaPlane>,
+        free_singles: bool,
     ) -> Option<Self> {
-        let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
         let coarse = if distance < 1.5 {
             1
         } else if distance < 2.0 {
@@ -187,6 +187,10 @@ impl GlyphStage {
             base: plan.base,
             references: plan.references,
         })
+    }
+
+    pub(super) fn atlas_bits(&self) -> usize {
+        self.atlas.bits_written()
     }
 }
 
@@ -634,6 +638,11 @@ pub(super) struct PreparedVarDct {
 }
 
 impl PreparedVarDct {
+    #[cfg(feature = "splines")]
+    pub(super) fn has_splines(&self) -> bool {
+        self.splines.is_some()
+    }
+
     /// Moves the selected dots out of the spline set into a template atlas
     /// (a modular reference frame) and kAdd dictionary entries.
     #[cfg(feature = "splines")]
@@ -868,8 +877,10 @@ pub(super) fn spline_quant_field(
 }
 
 /// Unrepeated glyphs join the atlas freely up to this distance; above it
-/// only when together they cover this share of the frame.
-const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
+/// only when together they cover this share of the frame, or when the plan
+/// with them wins the bit race up to the race distance.
+pub(super) const GLYPH_SINGLETON_FREE_MAX_DISTANCE: f32 = 1.0;
+pub(super) const GLYPH_SINGLETON_RACE_MAX_DISTANCE: f32 = 2.0;
 const GLYPH_SINGLETON_MIN_COVER: f64 = 0.5;
 /// A glyph must differ from its background by this many lattice rounding
 /// steps somewhere; fainter shapes are shading the base codes for less.

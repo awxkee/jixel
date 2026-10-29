@@ -67,6 +67,18 @@ use crate::util::EncodeError;
 /// the refine pass's prices are rebuilt on them.
 const RDOQ_FRESH_PRICES_MIN_SCAN_MOVE: f64 = 0.35;
 
+/// The closed loop settles a frame's B quant scale in the shared context;
+/// the next frame, or the next sampled estimate, starts from the configured one.
+#[cfg(feature = "extraslow")]
+struct RestoreBQmScale<'a>(&'a EncodingContext, u32);
+
+#[cfg(feature = "extraslow")]
+impl Drop for RestoreBQmScale<'_> {
+    fn drop(&mut self) {
+        self.0.set_b_qm_scale(self.1);
+    }
+}
+
 /// Returns DC-group and AC-section bits, excluding the global headers, so
 /// sampled payload can be scaled separately from the frame's fixed costs.
 #[allow(clippy::too_many_arguments)]
@@ -81,6 +93,8 @@ pub(super) fn encode_frame_core(
     #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
     writer: &mut BitWriter,
 ) -> Result<usize, EncodeError> {
+    #[cfg(feature = "extraslow")]
+    let _b_qm_scale = RestoreBQmScale(ctx, ctx.b_qm_scale());
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
     // Grain is measured on the source XYB before any frame processing; only
