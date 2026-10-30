@@ -55,6 +55,8 @@ pub(crate) fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
 }
 
 const RDOQ_MAX_CHOICES: usize = 64 * RDOQ_MAX_STRIDE;
+const RDOQ_MAX_NZERO_DELTA: usize = 6;
+const RDOQ_BAND_STRIDE: usize = 2 * (2 * RDOQ_MAX_NZERO_DELTA + 2);
 
 /// Levels the trellis may pick for one coefficient. Without `restore` a level
 /// only keeps, steps toward zero or drops, so a coefficient the deadzone
@@ -244,12 +246,12 @@ pub(super) fn rdoq_block(
     // The 128 family always takes the banded trellis: the full DP grows with
     // a block's nonzero count, thousands of states over 16384 coefficients.
     let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
-    // Keep the original 8x8 loop. Factoring amortizes level selection over
-    // shared count contexts in multi-block transforms. Separate instantiations
-    // remove the unused loop and its scratch from each production path.
+    // Factor level selection over shared count contexts. Specialize the
+    // single-block path so its context arithmetic folds to the 8x8 case;
+    // retain the unfactored DP below as a bit-exact test oracle.
     macro_rules! refine {
-        ($factored:literal) => {
-            rdoq_block_banded::<$factored>(
+        ($factored:literal, $single_block:literal) => {
+            rdoq_block_banded::<$factored, $single_block>(
                 channel_weight,
                 window_cap,
                 restore_len,
@@ -276,14 +278,14 @@ pub(super) fn rdoq_block(
         };
     }
     if covered_blocks == 1 {
-        refine!(false);
+        refine!(true, true);
     } else {
-        refine!(true);
+        refine!(true, false);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rdoq_block_banded<const FACTORED: bool>(
+fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
     channel_weight: f32,
     window_cap: usize,
     restore_len: usize,
@@ -307,15 +309,23 @@ fn rdoq_block_banded<const FACTORED: bool>(
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    const MAX_NZERO_DELTA: usize = 6;
-    let covered_blocks = cx * cy;
-    let search_end = block.len().min(covered_blocks + window_cap);
-    let window_len = search_end - covered_blocks;
-    let base_window_len = (24 * covered_blocks)
-        .min(64)
-        .min(block.len() - covered_blocks);
-    const BAND_STRIDE: usize = 2 * (2 * MAX_NZERO_DELTA + 2);
-    assert!(window_len * BAND_STRIDE <= choices.len());
+    const MAX_NZERO_DELTA: usize = RDOQ_MAX_NZERO_DELTA;
+    const BAND_STRIDE: usize = RDOQ_BAND_STRIDE;
+    debug_assert!(!SINGLE_BLOCK || cx * cy == 1);
+    let covered_blocks = if SINGLE_BLOCK { 1 } else { cx * cy };
+    let available = block
+        .len()
+        .checked_sub(covered_blocks)
+        .expect("LLF positions fit in the block");
+    let window_len = window_cap.min(available);
+    // Division avoids overflowing the capacity check. It also proves every
+    // window_index * BAND_STRIDE + pair offset below fits in choices.
+    assert!(
+        window_len <= choices.len() / BAND_STRIDE,
+        "RDOQ window exceeds choice storage"
+    );
+    let search_end = covered_blocks + window_len;
+    let base_window_len = (24 * covered_blocks).min(64).min(available);
 
     let block_ctx = fine_block_context(c, strategy_code, qf_hi);
     let histo_offset = fine_zero_density_contexts_offset(block_ctx);
@@ -371,6 +381,12 @@ fn rdoq_block_banded<const FACTORED: bool>(
     // Only the active interval of each row can be read. A finite state always
     // writes its choice, and backtracking only follows finite states, so the
     // inactive costs and the choice table do not need a per-block clear.
+    //
+    // Scratch-index invariant: after p coefficients, their original nonzero
+    // count a satisfies 0 <= a <= p. The next destination interval is
+    // [suffix + max(a - 6, 0), suffix + min(a + 6, p) + 1], possibly clipped
+    // at max_nzeros. Its width is at most 14 pairs = BAND_STRIDE floats.
+    // The initial row has one pair; swapping rows preserves this bound.
 
     let mut original_after_nzeros = 0usize;
     for window_index in (0..window_len).rev() {
@@ -395,6 +411,7 @@ fn rdoq_block_banded<const FACTORED: bool>(
             *d = distortion_weight * (ideal - bias.level(level)).powi(2);
         }
         let processed_after = window_len - 1 - window_index;
+        debug_assert!(original_after_nzeros <= processed_after);
         let min_remaining = suffix_nzeros + original_after_nzeros.saturating_sub(MAX_NZERO_DELTA);
         let max_remaining =
             suffix_nzeros + (original_after_nzeros + MAX_NZERO_DELTA).min(processed_after);
@@ -403,8 +420,11 @@ fn rdoq_block_banded<const FACTORED: bool>(
         // preceding row before reading it (scratch outside it can be stale).
         let current_min = min_remaining;
         let current_max = (max_remaining + 1).min(max_nzeros);
-        current_cost[..(current_max - current_min + 1) * 2].fill(f32::INFINITY);
+        debug_assert!(current_min <= current_max);
+        debug_assert!(current_max - current_min < BAND_STRIDE / 2);
+        debug_assert!(next_max - next_min < BAND_STRIDE / 2);
         if !FACTORED {
+            current_cost[..(current_max - current_min + 1) * 2].fill(f32::INFINITY);
             for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
                 for (candidate_index, &level) in candidates[..candidate_count].iter().enumerate() {
                     let nonzero = usize::from(level != 0);
@@ -454,6 +474,7 @@ fn rdoq_block_banded<const FACTORED: bool>(
             let zero_candidate = candidates[..candidate_count].iter().position(|&q| q == 0);
             let mut cached_context = u32::MAX;
             let mut local_cost = [[f32::INFINITY; 2]; 5];
+            let mut zero_local_cost = [f32::INFINITY; 2];
             let mut nz_cost = [f32::INFINITY; 2];
             let mut nz_before = [f32::INFINITY; 2];
             let mut nz_choice = [u8::MAX; 2];
@@ -462,16 +483,33 @@ fn rdoq_block_banded<const FACTORED: bool>(
                     && remaining >= source_min
                     && remaining <= source_max
                 {
-                    next[(remaining - next_min) * 2]
+                    // SAFETY: the source interval is intersected with
+                    // [next_min, next_max]. The row invariant bounds its
+                    // pair offset by 13, hence this float offset by 26.
+                    unsafe { *next.get_unchecked((remaining - next_min) * 2) }
                 } else {
                     f32::INFINITY
                 };
                 let nz_tail = if remaining > source_min && remaining - 1 <= source_max {
-                    next[(remaining - 1 - next_min) * 2 + 1]
+                    // SAFETY: these guards put remaining - 1 in the same
+                    // source interval; its second float has offset <= 27.
+                    unsafe { *next.get_unchecked((remaining - 1 - next_min) * 2 + 1) }
                 } else {
                     f32::INFINITY
                 };
+                let state = (remaining - current_min) * 2;
+                // SAFETY: remaining traverses the destination interval, so
+                // its pair offset is <= 13 and state + 2 <= BAND_STRIDE.
+                let current_pair: &mut [f32; 2] = unsafe {
+                    current_cost
+                        .get_unchecked_mut(state..state + 2)
+                        .try_into()
+                        .unwrap()
+                };
                 if !zero_tail.is_finite() && !nz_tail.is_finite() {
+                    // Every reachable pair below is overwritten. Only an
+                    // unreachable pair needs clearing; scratch is reused.
+                    *current_pair = [f32::INFINITY; 2];
                     continue;
                 }
                 let ctx = if remaining == 0 {
@@ -484,8 +522,12 @@ fn rdoq_block_banded<const FACTORED: bool>(
                     nz_cost = [f32::INFINITY; 2];
                     nz_before = [f32::INFINITY; 2];
                     nz_choice = [u8::MAX; 2];
-                    for (candidate_index, &level) in
-                        candidates[..candidate_count].iter().enumerate()
+                    for (candidate_index, ((&level, &distortion), local)) in candidates
+                        [..candidate_count]
+                        .iter()
+                        .zip(&candidate_distortion)
+                        .zip(&mut local_cost)
+                        .enumerate()
                     {
                         let token_cost = if remaining == 0 {
                             [0.0; 2]
@@ -499,9 +541,13 @@ fn rdoq_block_banded<const FACTORED: bool>(
                             [rate * bits[0], rate * bits[1]]
                         };
                         for prev in 0..2 {
-                            let cost = candidate_distortion[candidate_index] + token_cost[prev];
-                            local_cost[candidate_index][prev] = cost;
-                            if level != 0 && cost < nz_cost[prev] {
+                            let cost = distortion + token_cost[prev];
+                            local[prev] = cost;
+                            if level == 0 {
+                                // Save the zero pair for this cached context,
+                                // avoiding a dynamic local_cost[zero] lookup.
+                                zero_local_cost[prev] = cost;
+                            } else if cost < nz_cost[prev] {
                                 nz_before[prev] = nz_cost[prev];
                                 nz_cost[prev] = cost;
                                 nz_choice[prev] = candidate_index as u8;
@@ -509,8 +555,13 @@ fn rdoq_block_banded<const FACTORED: bool>(
                         }
                     }
                 }
-                let state = (remaining - current_min) * 2;
                 let row = window_index * stride + state;
+                // SAFETY: window_index < window_len and state + 2 <= stride.
+                // The capacity check proves row + 2 <= choices.len(), with
+                // no overflowing multiplication. This pair is disjoint
+                // from current_pair: they borrow separate input arrays.
+                let choice_pair: &mut [u8; 2] =
+                    unsafe { choices.get_unchecked_mut(row..row + 2).try_into().unwrap() };
                 for prev in 0..2 {
                     // The original source-ascending loop sees nonzero edges before
                     // the zero edge into this destination, regardless of level order.
@@ -524,8 +575,13 @@ fn rdoq_block_banded<const FACTORED: bool>(
                     // the same f32. Recover the earliest original candidate only
                     // when the cheapest earlier candidate can tie the winner.
                     if cost.is_finite() && nz_before[prev] + nz_tail == cost {
-                        for i in 0..choice as usize {
-                            if candidates[i] != 0 && local_cost[i][prev] + nz_tail == cost {
+                        for (i, (&level, local)) in candidates[..candidate_count]
+                            .iter()
+                            .zip(&local_cost)
+                            .enumerate()
+                            .take(choice as usize)
+                        {
+                            if level != 0 && local[prev] + nz_tail == cost {
                                 choice = i as u8;
                                 break;
                             }
@@ -533,15 +589,15 @@ fn rdoq_block_banded<const FACTORED: bool>(
                     }
                     if zero_tail.is_finite() {
                         let zero = zero_candidate.unwrap();
-                        let zero_cost = local_cost[zero][prev] + zero_tail;
+                        let zero_cost = zero_local_cost[prev] + zero_tail;
                         if zero_cost < cost {
                             cost = zero_cost;
                             choice = zero as u8;
                         }
                     }
-                    current_cost[state + prev] = cost;
+                    current_pair[prev] = cost;
                     if cost.is_finite() {
-                        choices[row + prev] = choice;
+                        choice_pair[prev] = choice;
                     }
                 }
             }
@@ -618,6 +674,153 @@ impl Default for RdoqScratch {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rdoq_scratch_index_model_is_bounded() {
+        let delta = super::RDOQ_MAX_NZERO_DELTA;
+        let stride = super::RDOQ_BAND_STRIDE;
+        let window = super::RDOQ_MAX_CHOICES / stride;
+        // Exhaust every (processed, original nonzeros, last original level)
+        // combination up to the largest window admitted by the entry check.
+        // A second suffix tests arithmetic at the i32 slice-length limit.
+        for suffix in [0, isize::MAX as usize / size_of::<i32>() - window] {
+            for processed in 0..window {
+                for original in 0..=processed {
+                    let min = suffix + original.saturating_sub(delta);
+                    let max = suffix + (original + delta).min(processed);
+                    let current_max = (max + 1).min(suffix + window);
+                    assert!(current_max >= min);
+                    assert!(current_max - min < stride / 2);
+                    for last in 0..=1 {
+                        let (next_min, next_max) = if processed == 0 {
+                            if last != 0 {
+                                continue;
+                            }
+                            (suffix, suffix)
+                        } else {
+                            let Some(previous) = original.checked_sub(last) else {
+                                continue;
+                            };
+                            if previous >= processed {
+                                continue;
+                            }
+                            (
+                                suffix + previous.saturating_sub(delta),
+                                suffix + (previous + delta).min(processed - 1) + 1,
+                            )
+                        };
+                        assert!(next_max - next_min < stride / 2);
+                        let source_min = min.max(next_min);
+                        let source_max = max.min(next_max);
+                        for remaining in min..=current_max {
+                            if remaining >= source_min && remaining <= source_max {
+                                assert!((remaining - next_min) * 2 < stride);
+                            }
+                            if remaining > source_min && remaining - 1 <= source_max {
+                                assert!((remaining - 1 - next_min) * 2 + 1 < stride);
+                            }
+                            let state = (remaining - min) * 2;
+                            assert!(state + 2 <= stride);
+                            let row = (window - 1 - processed) * stride + state;
+                            assert!(row + 2 <= super::RDOQ_MAX_CHOICES);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rdoq_scratch_memory_safety() {
+        use crate::dc_group_data::{STRATEGY_CODE_LUT, STRATEGY_DCT, STRATEGY_DCT16X8};
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let tokens = [Token::new(0, 0), Token::new(0, 1), Token::new(0, 2)];
+        let mut code = build_entropy_code_no_cluster(&tokens, 1, &mut Vec::new());
+        code.context_map = vec![0; crate::ac_context::K_NUM_FINE_AC_CONTEXTS];
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        let run = |cap: usize, cx: usize, source: &[f32], scan: &[u32], block: &mut [i32]| {
+            let mut choices = super::heap_array(0xA5);
+            let mut costs = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+            let inv_qm = vec![1.; block.len()];
+            let refine = if cx == 1 {
+                super::rdoq_block_banded::<true, true>
+            } else {
+                super::rdoq_block_banded::<true, false>
+            };
+            let raw = if cx == 1 {
+                STRATEGY_DCT
+            } else {
+                STRATEGY_DCT16X8
+            };
+            refine(
+                1.,
+                cap,
+                20,
+                false,
+                &prices,
+                scan,
+                source,
+                &inv_qm,
+                1.,
+                block,
+                STRATEGY_CODE_LUT[raw as usize],
+                1,
+                super::DequantBias::DEFAULT[1],
+                32,
+                cx,
+                1,
+                2.,
+                false,
+                0.1,
+                2.,
+                &mut choices,
+                &mut costs,
+            );
+        };
+        // Small enough for Miri, but spans both row kernels, the full
+        // fourteen-state band, finite/unreachable paths and fixed suffixes.
+        for (raw, cx) in [(STRATEGY_DCT, 1), (STRATEGY_DCT16X8, 2)] {
+            let scan = orders.scan_for(STRATEGY_CODE_LUT[raw as usize], 1);
+            for dense in [false, true] {
+                let source: Vec<f32> = (0..cx * 64)
+                    .map(|i| if dense && i % 3 != 0 { 1.25 } else { 0. })
+                    .collect();
+                let initial: Vec<i32> = source.iter().map(|v| v.round() as i32).collect();
+                for cap in [0, 1, 20, usize::MAX] {
+                    run(cap, cx, &source, scan, &mut initial.clone());
+                }
+            }
+        }
+        // Reject malformed dimensions and oversized tables before any
+        // unchecked access, including a cap that would overflow addition.
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                run(usize::MAX, 2, &[], &[], &mut [0]);
+            }))
+            .is_err()
+        );
+        let too_long = super::RDOQ_MAX_CHOICES / super::RDOQ_BAND_STRIDE + 2;
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                run(usize::MAX, 1, &[], &[], &mut vec![0; too_long]);
+            }))
+            .is_err()
+        );
+        // A non-finite search need not select a predecessor. Even finite
+        // inputs can overflow every cost, so backtracking remains checked.
+        for value in [f32::NAN, f32::MAX] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    let scan = orders.scan_for(STRATEGY_CODE_LUT[STRATEGY_DCT as usize], 1);
+                    run(20, 1, &[value; 64], scan, &mut [0; 64]);
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn few_colors_counts_distinct_source_colors() {
         use crate::image::Image3F;
         let mut xyb = Image3F::new(16, 8);
@@ -658,6 +861,8 @@ mod tests {
             f32::from_bits(1),
             f32::from_bits(0x7fc0_1234),
             f32::from_bits(0xffc0_5678),
+            f32::from_bits(0x7f80_1234),
+            f32::from_bits(0xff80_5678),
         ];
         let mut seed = 73u32;
         let mut random = || {
@@ -902,10 +1107,12 @@ mod tests {
                 let mut expected = original.clone();
                 let mut actual = original.clone();
                 let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
-                    let refine = if factored {
-                        super::rdoq_block_banded::<true>
+                    let refine = if factored && cx * cy == 1 {
+                        super::rdoq_block_banded::<true, true>
+                    } else if factored {
+                        super::rdoq_block_banded::<true, false>
                     } else {
-                        super::rdoq_block_banded::<false>
+                        super::rdoq_block_banded::<false, false>
                     };
                     refine(
                         [0.3, 1., 0.6][c],
@@ -988,9 +1195,9 @@ mod tests {
             let mut costs1 = costs0.clone();
             let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
                 let refine = if factored {
-                    super::rdoq_block_banded::<true>
+                    super::rdoq_block_banded::<true, false>
                 } else {
-                    super::rdoq_block_banded::<false>
+                    super::rdoq_block_banded::<false, false>
                 };
                 refine(
                     1.,
