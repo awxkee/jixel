@@ -31,8 +31,9 @@
 //!
 //! Every 8/16/32-family piece is a direct candidate at every legal 8-pixel
 //! origin; the 64-family blocks of the incumbent layout compete only as
-//! placed. Retained fine transforms compete with DCT8 at each leaf. A sparse
-//! frontier memo covers slicing and nonslicing tilings.
+//! placed. Retained fine transforms compete with DCT8 at each leaf. Frontier
+//! memos cover slicing and nonslicing tilings: compact occupancy states for
+//! small pieces, and a sparse skyline memo when larger pieces compete.
 //! Guillotine plans provide feasible upper bounds; independent row/column
 //! relaxations provide admissible lower bounds. Two cuts are not admissible:
 //! a larger piece is dropped once its luma-and-rate bound exceeds
@@ -43,6 +44,8 @@
 
 use super::*;
 use std::collections::HashMap;
+
+mod compact;
 
 const TILE: usize = 8;
 const SIDE: usize = TILE;
@@ -623,6 +626,33 @@ fn plan(
     s: &mut PlannerScratch,
     out: &mut Vec<usize>,
 ) -> f64 {
+    prepare_planner(candidates, width, height, s);
+    let root = visit([0; SIDE], width, height, f64::INFINITY, candidates, s).unwrap_or(EMPTY);
+    out.clear();
+    if !root.cost.is_finite() {
+        return root.cost;
+    }
+    let mut profile = [0; SIDE];
+    while first_open(profile, width).1 < height {
+        let Memo::Solved(entry) = s.memo[&profile_key(profile)] else {
+            unreachable!("a winning backpointer must have an exact suffix");
+        };
+        match entry.choice {
+            Choice::Tile(k) => {
+                out.push(k);
+                profile = advance(profile, candidates[k]);
+            }
+            Choice::Fallback => {
+                unpack_fallback(profile, width, height, s, out);
+                break;
+            }
+            _ => unreachable!("invalid frontier backpointer"),
+        }
+    }
+    root.cost
+}
+
+fn prepare_planner(candidates: &[Candidate], width: usize, height: usize, s: &mut PlannerScratch) {
     assert!((1..=SIDE).contains(&width) && (1..=SIDE).contains(&height));
     s.memo.clear();
     s.budget = VISIT_BUDGET;
@@ -641,39 +671,26 @@ fn plan(
     }
     prepare_regions(candidates, width, height, s);
     prepare_bounds(candidates, width, height, s);
-    let root = visit([0; SIDE], width, height, f64::INFINITY, candidates, s).unwrap_or(EMPTY);
-    out.clear();
-    if !root.cost.is_finite() {
-        return root.cost;
-    }
-    let mut profile = [0; SIDE];
-    while first_open(profile, width).1 < height {
-        let Memo::Solved(entry) = s.memo[&profile_key(profile)] else {
-            unreachable!("a winning backpointer must have an exact suffix");
-        };
-        match entry.choice {
-            Choice::Tile(k) => {
-                out.push(k);
-                profile = advance(profile, candidates[k]);
-            }
-            Choice::Fallback => {
-                let mut x = 0;
-                while x < width {
-                    let start = x;
-                    let y = profile[x] as usize;
-                    while x < width && profile[x] as usize == y {
-                        x += 1;
-                    }
-                    if y < height {
-                        unpack_region(start, y, x - start, height - y, s, out);
-                    }
-                }
-                break;
-            }
-            _ => unreachable!("invalid frontier backpointer"),
+}
+
+fn unpack_fallback(
+    profile: [u8; SIDE],
+    width: usize,
+    height: usize,
+    s: &PlannerScratch,
+    out: &mut Vec<usize>,
+) {
+    let mut x = 0;
+    while x < width {
+        let start = x;
+        let y = profile[x] as usize;
+        while x < width && profile[x] as usize == y {
+            x += 1;
+        }
+        if y < height {
+            unpack_region(start, y, x - start, height - y, s, out);
         }
     }
-    root.cost
 }
 
 const UNMEASURED: ReconStrategyCost = ReconStrategyCost {
@@ -697,6 +714,7 @@ pub(crate) struct LayoutDpScratch {
     choices: Vec<usize>,
     best: Vec<MergeUpgrade>,
     small: SmallPlanner,
+    compact: compact::CompactPlanner,
     proposals: Vec<crate::dc_group_data::DpRegion>,
 }
 impl LayoutDpScratch {
@@ -990,7 +1008,16 @@ fn search_tile(
     };
     for (i, &strategy) in STRATEGIES[..families].iter().enumerate() {
         if matches!(i, 3 | 4 | 6 | 8) {
-            prepare_regions(&cache.candidates, width, height, &mut cache.planner);
+            if families == COEFFICIENT_STRATEGIES.len() {
+                compact::prepare_square_bounds(
+                    &cache.candidates,
+                    width,
+                    height,
+                    &mut cache.planner,
+                );
+            } else {
+                prepare_regions(&cache.candidates, width, height, &mut cache.planner);
+            }
         }
         let w = AcStrategyImage::covered_blocks_x_of(strategy);
         let h = AcStrategyImage::covered_blocks_y_of(strategy);
@@ -1044,11 +1071,12 @@ fn search_tile(
         }
     }
     debug_assert!(cache.candidates.len() <= MAX_CANDIDATES);
-    let winner = plan(
+    let winner = compact::plan(
         &cache.candidates,
         width,
         height,
         &mut cache.planner,
+        &mut cache.compact,
         &mut cache.choices,
     );
     if !winner.is_finite() {
