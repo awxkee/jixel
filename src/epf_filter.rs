@@ -621,14 +621,14 @@ fn choose(distance: f32, baseline: Choice, mut score: impl FnMut(Choice) -> f32)
 pub(crate) fn fit(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
-    source: &Image3F,
+    source_y: &Plane<f32>,
     reconstruction: &Image3F,
     blocks: &FrameBlocks,
     distance: f32,
     baseline: Choice,
 ) -> Choice {
     let reference =
-        crate::epf_proxy::LumaProxy::new(source.plane_data(1), source.xsize(), source.ysize());
+        crate::epf_proxy::LumaProxy::new(source_y.as_slice(), source_y.xsize(), source_y.ysize());
     let mut work = crate::epf_proxy::Scratch::default();
     let make = |choice: Choice| {
         LoopFilter::new(

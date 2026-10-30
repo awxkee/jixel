@@ -145,8 +145,8 @@ pub(super) fn encode_frame_core(
     let group_coords: Vec<(usize, usize)> = (0..dim.ysize_dc_groups)
         .flat_map(|gy| (0..dim.xsize_dc_groups).map(move |gx| (gx, gy)))
         .collect();
-    let opsin_image = opsin;
-    let opsin = &opsin_image;
+    let mut opsin_image = Some(opsin);
+    let opsin = opsin_image.as_ref().unwrap();
 
     // Split the thread budget across nesting levels: `outer` lanes steal DC
     // groups, each parallelizing its AC-strategy bands with the remainder, so
@@ -665,7 +665,13 @@ pub(super) fn encode_frame_core(
         let source = distp
             .gab_enabled
             .then(|| crate::epf_filter::gaborish(opsin));
-        let source = source.as_ref().unwrap_or(opsin);
+        // Source pixel decisions are complete. The EPF proxy needs only Y;
+        // release X/B before allocating its pyramid and candidate output.
+        // A Gaborish source also replaces the original source altogether.
+        let source = source.unwrap_or_else(|| opsin_image.take().unwrap());
+        drop(opsin_image.take());
+        let [source_x, source_y, source_b] = source.into_planes();
+        drop((source_x, source_b));
         if distp.gab_enabled {
             crate::epf_filter::gaborish_in_place(&mut recon);
         }
@@ -679,7 +685,7 @@ pub(super) fn encode_frame_core(
         let chosen = crate::epf_filter::fit(
             ctx,
             scratch,
-            source,
+            &source_y,
             &recon,
             &blocks,
             distance,

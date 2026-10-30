@@ -133,6 +133,12 @@ pub(crate) struct Image3<T> {
 }
 
 impl<T: Copy + Default> Image3<T> {
+    /// Transfer plane ownership without copying pixel storage, allowing
+    /// callers to release channels whose last use precedes the others'.
+    pub(crate) fn into_planes(self) -> [Plane<T>; 3] {
+        self.planes
+    }
+
     /// Builds an image whose planes have independent dimensions, as chroma
     /// subsampling requires.
     pub(crate) fn try_new_per_plane(sizes: [(usize, usize); 3]) -> Result<Self, EncodeError> {
