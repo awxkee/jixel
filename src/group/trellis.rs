@@ -465,6 +465,58 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
                     );
                 }
             }
+        } else if candidate_count == 1 {
+            // The sole level has one predecessor per exact count. Preserve
+            // (distortion + token cost) + tail, but skip level selection and
+            // zero/nonzero comparisons. Only finite paths write choices,
+            // just as in the general factored row below.
+            let level = candidates[0];
+            let nonzero = usize::from(level != 0);
+            let value = pack_signed(level);
+            let rate = if block[idx] == 0 && level != 0 {
+                lambda * restore_penalty
+            } else {
+                lambda
+            };
+            let mut cached_context = u32::MAX;
+            let mut local_cost = [0.0; 2];
+            current_cost[..(current_max - current_min + 1) * 2].fill(f32::INFINITY);
+            for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
+                let remaining = next_remaining + nonzero;
+                if remaining > max_nzeros {
+                    continue;
+                }
+                let tail = next[(next_remaining - next_min) * 2 + nonzero];
+                if !tail.is_finite() {
+                    continue;
+                }
+                let ctx = if remaining == 0 {
+                    u32::MAX - 1
+                } else {
+                    context(remaining, k, 0)
+                };
+                if ctx != cached_context {
+                    cached_context = ctx;
+                    let token_cost = if remaining == 0 {
+                        [0.0; 2]
+                    } else {
+                        prices.token_bits_pair(ctx, value).map(|bits| rate * bits)
+                    };
+                    local_cost = token_cost.map(|cost| candidate_distortion[0] + cost);
+                }
+                let state = (remaining - current_min) * 2;
+                for prev in 0..2 {
+                    let cost = local_cost[prev] + tail;
+                    // A NaN or +infinity cannot beat the initial +infinity.
+                    // Keep that comparison even though there is only one edge.
+                    if cost < f32::INFINITY {
+                        current_cost[state + prev] = cost;
+                        if cost.is_finite() {
+                            choices[window_index * stride + state + prev] = 0;
+                        }
+                    }
+                }
+            }
         } else {
             // Nonzero levels share a tail state. Choose their local minimum
             // once per count context, then compare zero/nonzero transitions
@@ -1159,6 +1211,136 @@ mod tests {
             }
         }
         assert!(changed > 100, "must exercise changed blocks: {changed}");
+    }
+
+    #[test]
+    fn single_candidate_rows_preserve_cost_bits_and_choices() {
+        use crate::dc_group_data::*;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+
+        let tokens: Vec<_> = (0..4096)
+            .map(|i| Token::new(i % 4, if i % 5 == 0 { 0 } else { i % 257 }))
+            .collect();
+        let mut code = build_entropy_code_no_cluster(&tokens, 4, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| ((i / 2 + i % 2) % 4) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        let shapes = [
+            (STRATEGY_DCT, 1, 1),
+            (STRATEGY_DCT16X8, 2, 1),
+            (STRATEGY_DCT16X16, 2, 2),
+            (STRATEGY_DCT32X32, 4, 4),
+            (STRATEGY_DCT64X64, 8, 8),
+            #[cfg(feature = "extraslow")]
+            (STRATEGY_DCT128X128, 16, 16),
+        ];
+        let mut choices0 = super::heap_array(0xA5);
+        let mut choices1 = super::heap_array(0xA5);
+        let mut costs0 = Box::new([[f32::from_bits(0x7fc0_1234); super::RDOQ_MAX_STRIDE]; 2]);
+        let mut costs1 = costs0.clone();
+        let mut single_zero = 0;
+        let mut single_nonzero = 0;
+        for case in 0..72 {
+            let (raw, cx, cy) = shapes[case % shapes.len()];
+            let strategy = STRATEGY_CODE_LUT[raw as usize];
+            let c = case / shapes.len() % 3;
+            let covered = cx * cy;
+            let size = covered * 64;
+            let mut scan = orders.scan_for(strategy, c).to_vec();
+            if case % 2 == 0 {
+                scan[covered..].reverse();
+            }
+            let source: Vec<f32> = (0..size)
+                .map(|i| match (i + case) % 8 {
+                    0 => -0.0,
+                    1 => 0.000_001,
+                    2 => -0.000_001,
+                    3 => 3.0,
+                    4 => -4.125,
+                    5 => 128.0,
+                    6 => -257.0,
+                    _ => 0.49,
+                })
+                .collect();
+            let original: Vec<_> = source
+                .iter()
+                .enumerate()
+                // A sole restoring candidate must keep the incumbent even
+                // when it differs from the nearest source level.
+                .map(|(i, v)| if i % 7 == 0 { 0 } else { v.round() as i32 })
+                .collect();
+            let inv_qm = vec![1.; size];
+            let (cap, restoring) = super::rdoq_window_len(covered);
+            for restore_len in [0, restoring, cap] {
+                for (wi, &idx) in scan.iter().skip(covered).take(cap).enumerate() {
+                    let idx = idx as usize;
+                    let (candidates, n) =
+                        super::rdoq_candidates(source[idx], original[idx], wi < restore_len);
+                    if n == 1 {
+                        if candidates[0] == 0 {
+                            single_zero += 1;
+                        } else {
+                            single_nonzero += 1;
+                        }
+                    }
+                }
+                let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
+                    let refine = if factored && covered == 1 {
+                        super::rdoq_block_banded::<true, true>
+                    } else if factored {
+                        super::rdoq_block_banded::<true, false>
+                    } else {
+                        super::rdoq_block_banded::<false, false>
+                    };
+                    refine(
+                        [0.3, 1., 0.6][c],
+                        cap,
+                        restore_len,
+                        false,
+                        &prices,
+                        &scan,
+                        &source,
+                        &inv_qm,
+                        1.,
+                        block,
+                        strategy,
+                        c,
+                        super::DequantBias::DEFAULT[c],
+                        (case * 17) as u8,
+                        cx,
+                        cy,
+                        [0.05, 2., 4., 8.][case % 4],
+                        case % 2 == 0,
+                        [0., 0.01, 0.1, 1_000_000.][case % 4],
+                        [1., 2.][case % 2],
+                        choices,
+                        costs,
+                    );
+                };
+                let mut expected = original.clone();
+                let mut actual = original.clone();
+                run(false, &mut expected, &mut choices0, &mut costs0);
+                run(true, &mut actual, &mut choices1, &mut costs1);
+                assert_eq!(
+                    actual, expected,
+                    "levels, case={case}, restore={restore_len}"
+                );
+                assert_eq!(
+                    *choices1, *choices0,
+                    "choices, case={case}, restore={restore_len}"
+                );
+                for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cost bits, case={case}, restore={restore_len}"
+                    );
+                }
+            }
+        }
+        assert!(single_zero > 10_000 && single_nonzero > 10_000);
     }
 
     #[test]
