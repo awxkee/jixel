@@ -107,14 +107,14 @@ fn gated_tree_keeps_bfs_tokens_with_leaf_offsets() {
     // Keeping only the original fourth rows must preserve the offsets,
     // even if the full sample set is subsequently partitioned in place.
     let retained = MaSamples {
-        props: samples.props.iter().step_by(4).copied().collect(),
+        props: samples.props.sampled(4),
         tok: samples.tok.iter().step_by(4).copied().collect(),
         val: Vec::new(),
     };
     samples.props.reverse();
     samples.tok.reverse();
     let mut retained_candidate = finish_ma_candidate(tree.clone(), 1., None);
-    retained_candidate.set_leaf_offsets(retained.props.iter().zip(&retained.tok));
+    retained_candidate.set_leaf_offsets(&retained, 1);
     assert_eq!(retained_candidate.leaf_offset, [-3, 5, 0]);
 
     // Admission uses only the unchanged token-count estimate.
