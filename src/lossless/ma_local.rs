@@ -183,7 +183,7 @@ pub(super) fn write_local_tree_sections(
             // only those rows; the dense learner can partition the full set
             // in place instead of allocating a second full set and indices.
             let offsets = (leaf_offsets && max_leaves > 1).then(|| MaSamples {
-                props: samples.props.iter().step_by(4).copied().collect(),
+                props: samples.props.sampled(4),
                 tok: samples.tok.iter().step_by(4).copied().collect(),
                 val: Vec::new(),
             });
@@ -203,7 +203,7 @@ pub(super) fn write_local_tree_sections(
             drop(samples);
             let mut cand = finish_ma_candidate(tree, stride as f64, leaf_price);
             if let Some(offsets) = offsets {
-                cand.set_leaf_offsets(offsets.props.iter().zip(&offsets.tok));
+                cand.set_leaf_offsets(&offsets, 1);
             }
             cand
         },

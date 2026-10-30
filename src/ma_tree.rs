@@ -36,6 +36,11 @@ use crate::thread_pool::ThreadPool;
 use crate::util::heap_array;
 use std::sync::OnceLock;
 
+mod properties;
+pub(crate) use properties::{
+    MaProperties, MaProperty, MaPropertySlice, with_ma_properties, write_property_row,
+};
+
 /// Property vector length (libjxl ids 0..=15). Index 1 is the decoder's
 /// stream id (0 for the global stream, a fixed per-group id for AC groups),
 /// so a global tree can specialize per group the way libjxl's does.
@@ -133,12 +138,16 @@ pub(crate) struct LearnedTree {
 impl LearnedTree {
     /// Route a property vector to (leaf node index, predictor id).
     #[inline]
-    pub(crate) fn lookup(&self, p: &[i32; NUM_MA_PROPS]) -> (u32, u32) {
+    pub(crate) fn lookup<T: MaProperty>(&self, p: &[T; NUM_MA_PROPS]) -> (u32, u32) {
         let mut i = 0usize;
         loop {
             match self.nodes[i] {
                 MaNode::Split { prop, val, gt, le } => {
-                    i = if p[prop as usize] > val { gt } else { le } as usize;
+                    i = if p[prop as usize].into() > val {
+                        gt
+                    } else {
+                        le
+                    } as usize;
                 }
                 MaNode::Leaf { pred, .. } => return (i as u32, pred),
             }
@@ -147,7 +156,7 @@ impl LearnedTree {
 }
 
 pub(crate) struct MaSamples {
-    pub(crate) props: Vec<[i32; NUM_MA_PROPS]>,
+    pub(crate) props: MaProperties,
     pub(crate) tok: Vec<[u8; NUM_MA_PREDS]>,
     /// The sampled value itself, for modal Zero leaves (`MaLearnParams::
     /// modal_offsets`); empty when the learn does not use them.
@@ -166,7 +175,7 @@ impl MaSamples {
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            props: Vec::with_capacity(capacity),
+            props: MaProperties::with_capacity(capacity),
             tok: Vec::with_capacity(capacity),
             val: Vec::new(),
         }
@@ -199,7 +208,7 @@ impl MaSamples {
     /// pass so allocation checks stay outside the sample loop.
     fn select(&self, indices: &[u32]) -> Self {
         Self {
-            props: select_rows(&self.props, indices),
+            props: self.props.select(indices),
             tok: select_rows(&self.tok, indices),
             val: if self.val.is_empty() {
                 Vec::new()
@@ -214,34 +223,22 @@ impl MaSamples {
     /// exact order without allocating another full property array.
     fn into_permuted(mut self, mut indices: Vec<u32>) -> Self {
         assert_eq!(indices.len(), self.len());
-        for start in 0..indices.len() {
-            if indices[start] as usize == start {
-                continue;
-            }
-            let props = self.props[start];
-            let tok = self.tok[start];
-            let val = self.val.get(start).copied();
-            let mut dst = start;
-            loop {
-                let src = indices[dst] as usize;
-                indices[dst] = dst as u32;
-                if src == start {
-                    self.props[dst] = props;
-                    self.tok[dst] = tok;
-                    if let Some(val) = val {
-                        self.val[dst] = val;
-                    }
-                    break;
-                }
-                self.props[dst] = self.props[src];
-                self.tok[dst] = self.tok[src];
-                if val.is_some() {
-                    self.val[dst] = self.val[src];
-                }
-                dst = src;
-            }
-        }
+        with_ma_properties!(&mut self.props, |rows| {
+            permute_sample_rows(rows, &mut self.tok, &mut self.val, &mut indices)
+        });
         self
+    }
+
+    fn partition(&mut self, start: usize, end: usize, prop: u8, threshold: i32) -> usize {
+        with_ma_properties!(&mut self.props, |rows| {
+            partition_rows(
+                &mut rows[start..end],
+                &mut self.tok[start..end],
+                val_range(&mut self.val, start, end),
+                prop,
+                threshold,
+            )
+        })
     }
 
     /// Deterministic evenly spaced selection for the coarse learning stage.
@@ -253,6 +250,41 @@ impl MaSamples {
             indices.push((sample * self.len() / selected) as u32);
         }
         indices
+    }
+}
+
+fn permute_sample_rows<T: Copy>(
+    props: &mut [[T; NUM_MA_PROPS]],
+    tok: &mut [[u8; NUM_MA_PREDS]],
+    val: &mut [i32],
+    indices: &mut [u32],
+) {
+    for start in 0..indices.len() {
+        if indices[start] as usize == start {
+            continue;
+        }
+        let first_props = props[start];
+        let first_tok = tok[start];
+        let first_val = val.get(start).copied();
+        let mut dst = start;
+        loop {
+            let src = indices[dst] as usize;
+            indices[dst] = dst as u32;
+            if src == start {
+                props[dst] = first_props;
+                tok[dst] = first_tok;
+                if let Some(first_val) = first_val {
+                    val[dst] = first_val;
+                }
+                break;
+            }
+            props[dst] = props[src];
+            tok[dst] = tok[src];
+            if first_val.is_some() {
+                val[dst] = val[src];
+            }
+            dst = src;
+        }
     }
 }
 
@@ -450,8 +482,8 @@ fn sort_unique_probe(probe: &mut Vec<i32>, bitmap: &mut [u64; PROBE_BITMAP_BITS 
     probe.truncate(len);
 }
 
-fn pick_candidates(
-    properties: &[[i32; NUM_MA_PROPS]],
+fn pick_candidates<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
     prop: usize,
     max_candidates: usize,
     scratch: &mut MaPropertyScratch,
@@ -462,7 +494,7 @@ fn pick_candidates(
         stride += 1;
     }
     for props in properties.iter().step_by(stride) {
-        scratch.probe.push(props[prop]);
+        scratch.probe.push(props[prop].into());
     }
     sort_unique_probe(&mut scratch.probe, &mut scratch.probe_bitmap);
     if scratch.probe.len() < 2 {
@@ -575,8 +607,8 @@ impl SymbolWindow {
 /// value -> bin table appended to `luts`; `hist_start` is where the
 /// property's block will live and `width` the node's symbol window.
 #[allow(clippy::too_many_arguments)]
-fn plan_split(
-    properties: &[[i32; NUM_MA_PROPS]],
+fn plan_split<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
     prop: usize,
     max_candidates: usize,
     width: usize,
@@ -625,8 +657,8 @@ fn plan_split(
 /// of plan `k`. Pure integer counting, so chunks of rows may be scanned
 /// separately and summed.
 #[allow(clippy::too_many_arguments)]
-fn scan_split_plans(
-    properties: &[[i32; NUM_MA_PROPS]],
+fn scan_split_plans<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
     tokens: &[[u8; NUM_MA_PREDS]],
     plans: &[SplitPlan],
     luts: &[u8],
@@ -652,7 +684,7 @@ fn scan_split_plans(
                 .iter_mut()
                 .zip(plans)
             {
-                let bin = plan.bin_for(props[plan.prop as usize], luts);
+                let bin = plan.bin_for(props[plan.prop as usize].into(), luts);
                 counts[bin] += 1;
                 let stride = plan.pred_stride as usize;
                 let base = plan.hist_start as usize + bin * width;
@@ -670,7 +702,7 @@ fn scan_split_plans(
                 .iter_mut()
                 .zip(plans)
             {
-                let bin = plan.bin_for(props[plan.prop as usize], luts);
+                let bin = plan.bin_for(props[plan.prop as usize].into(), luts);
                 counts[bin] += 1;
                 let stride = plan.pred_stride as usize;
                 let base = plan.hist_start as usize + bin * width;
@@ -789,8 +821,8 @@ fn score_split_plan(
 /// per-predictor raw-bit totals.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn best_split_on_prop(
-    properties: &[[i32; NUM_MA_PROPS]],
+fn best_split_on_prop<T: MaProperty>(
+    properties: &[[T; NUM_MA_PROPS]],
     tokens: &[[u8; NUM_MA_PREDS]],
     prop: usize,
     preds: &[usize],
@@ -923,7 +955,7 @@ impl Learner<'_> {
             node_id,
             start,
             end,
-            &self.s.props[start..end],
+            self.s.props.slice(start..end),
             &self.s.tok[start..end],
             depth,
             zero_offset,
@@ -954,7 +986,46 @@ impl Learner<'_> {
         node_id: u32,
         start: usize,
         end: usize,
-        properties: &[[i32; NUM_MA_PROPS]],
+        properties: MaPropertySlice<'_>,
+        tokens: &[[u8; NUM_MA_PREDS]],
+        depth: u16,
+        zero_offset: i32,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> Pending {
+        match properties {
+            MaPropertySlice::Narrow(rows) => self.evaluate_rows_typed(
+                node_id,
+                start,
+                end,
+                rows,
+                tokens,
+                depth,
+                zero_offset,
+                pool,
+                scratch,
+            ),
+            MaPropertySlice::Wide(rows) => self.evaluate_rows_typed(
+                node_id,
+                start,
+                end,
+                rows,
+                tokens,
+                depth,
+                zero_offset,
+                pool,
+                scratch,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_rows_typed<T: MaProperty>(
+        &self,
+        node_id: u32,
+        start: usize,
+        end: usize,
+        properties: &[[T; NUM_MA_PROPS]],
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
         zero_offset: i32,
@@ -1237,10 +1308,12 @@ fn flat_cost(learner: &Learner<'_>, scratch: &mut CoderScratch) -> f64 {
     let mut flat_bits = 0.0f64;
     let per_channel = samples.len().div_ceil(4);
     let mut chan_idx: [Vec<u32>; 4] = std::array::from_fn(|_| Vec::with_capacity(per_channel));
-    for (sample, props) in samples.props.iter().enumerate() {
-        let c = props[0].clamp(0, 3) as usize;
-        chan_idx[c].push(sample as u32);
-    }
+    with_ma_properties!(&samples.props, |rows| {
+        for (sample, props) in rows.iter().enumerate() {
+            let c = props[0].clamp(0, 3) as usize;
+            chan_idx[c].push(sample as u32);
+        }
+    });
     for channel in &chan_idx {
         if !channel.is_empty() {
             let tokens = channel.iter().map(|&i| &samples.tok[i as usize]);
@@ -1279,8 +1352,8 @@ const SPECULATE_MAX_ROWS: usize = 1 << 16;
 
 /// The learner's two-ended partition: `gt` rows move to the front in their
 /// original relative order, the rest to the back. Returns the first `le` row.
-fn partition_rows(
-    props: &mut [[i32; NUM_MA_PROPS]],
+fn partition_rows<T: MaProperty>(
+    props: &mut [[T; NUM_MA_PROPS]],
     tok: &mut [[u8; NUM_MA_PREDS]],
     val: &mut [i32],
     prop: u8,
@@ -1289,7 +1362,7 @@ fn partition_rows(
     let mut lo = 0;
     let mut hi = props.len();
     while lo < hi {
-        if props[lo][prop as usize] > threshold {
+        if props[lo][prop as usize].into() > threshold {
             lo += 1;
         } else {
             hi -= 1;
@@ -1376,14 +1449,7 @@ fn grow_tree(
             // rows instead of indices. Each child is a contiguous view of the
             // local rows; every child and quantile probe sees exactly the
             // original sequence.
-            let lo = p.start
-                + partition_rows(
-                    &mut learner.s.props[p.start..p.end],
-                    &mut learner.s.tok[p.start..p.end],
-                    val_range(&mut learner.s.val, p.start, p.end),
-                    prop,
-                    threshold,
-                );
+            let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
             let offsets = (
                 learner.rebase(p.start, lo, scratch),
                 learner.rebase(lo, p.end, scratch),
@@ -1413,7 +1479,7 @@ fn grow_tree(
                 for q in next.into_iter().take(window - 1) {
                     let (prop, threshold) = q.split.expect("only splittable nodes are queued");
                     let mut copy = MaSamples {
-                        props: learner.s.props[q.start..q.end].to_vec(),
+                        props: learner.s.props.copy_range(q.start..q.end),
                         tok: learner.s.tok[q.start..q.end].to_vec(),
                         val: if modal {
                             learner.s.val[q.start..q.end].to_vec()
@@ -1421,13 +1487,7 @@ fn grow_tree(
                             Vec::new()
                         },
                     };
-                    let split_at = partition_rows(
-                        &mut copy.props,
-                        &mut copy.tok,
-                        &mut copy.val,
-                        prop,
-                        threshold,
-                    );
+                    let split_at = copy.partition(0, copy.len(), prop, threshold);
                     let offsets = if modal {
                         let hist = &mut scratch.ma_property.multi_bin_count;
                         (
@@ -1471,7 +1531,7 @@ fn grow_tree(
                             0,
                             start,
                             end,
-                            &copy.props[rows.clone()],
+                            copy.props.slice(rows.clone()),
                             &copy.tok[rows],
                             job.depth,
                             offset,
@@ -1505,14 +1565,7 @@ fn grow_tree(
         } else {
             // Scored ahead on a copy: partition the learner's rows now, and
             // rebase the children's Zero tokens as the copy was.
-            let lo = p.start
-                + partition_rows(
-                    &mut learner.s.props[p.start..p.end],
-                    &mut learner.s.tok[p.start..p.end],
-                    val_range(&mut learner.s.val, p.start, p.end),
-                    prop,
-                    threshold,
-                );
+            let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
             learner.rebase(p.start, lo, scratch);
             learner.rebase(lo, p.end, scratch);
         }
@@ -1710,11 +1763,13 @@ pub(crate) fn deepen_ma_tree(
     let (counts, offsets, idx) = {
         let mut leaf_for_sample = Vec::with_capacity(samples.len());
         let mut counts = vec![0usize; seed.nodes.len()];
-        for props in &samples.props {
-            let (leaf, _) = seed.lookup(props);
-            leaf_for_sample.push(leaf);
-            counts[leaf as usize] += 1;
-        }
+        with_ma_properties!(&samples.props, |rows| {
+            for props in rows {
+                let (leaf, _) = seed.lookup(props);
+                leaf_for_sample.push(leaf);
+                counts[leaf as usize] += 1;
+            }
+        });
         let mut offsets = vec![0usize; seed.nodes.len() + 1];
         let mut total = 0;
         for (offset, &count) in offsets.iter_mut().skip(1).zip(&counts) {
@@ -1775,6 +1830,116 @@ pub(crate) fn deepen_ma_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_learning_and_deepening_match_wide_cost_bits_and_row_order() {
+        let params = |leaves| MaLearnParams {
+            alphabet: 64,
+            max_leaves: leaves,
+            split_cost_bits: 4.,
+            min_node: 32,
+            allow_wp: true,
+            allowed_preds: u16::MAX,
+            side_preds: 4,
+            max_candidates: 16,
+            modal_offsets: true,
+            prune_leaf_bits: 2.,
+        };
+        let assert_tree = |a: &LearnedTree, b: &LearnedTree| {
+            assert_eq!(a.nodes, b.nodes);
+            assert_eq!(a.est_bits.to_bits(), b.est_bits.to_bits());
+            assert_eq!(a.flat_bits.to_bits(), b.flat_bits.to_bits());
+        };
+        for count in [4096, PARALLEL_SCAN_MIN_SAMPLES + 33] {
+            let mut samples = MaSamples::with_capacity(count);
+            for i in 0..count {
+                let mut props =
+                    core::array::from_fn(|p| ((i * (2 * p + 1)) % (17 + 3 * p)) as i32 - 16);
+                props[0] = (i / 256 % 4) as i32;
+                props[4] = (i / 64 % 2 * 100 + i % 8) as i32;
+                props[23] = if i % 2 == 0 {
+                    i16::MIN as i32
+                } else {
+                    i16::MAX as i32
+                };
+                let val = (i % 27) as i32 - 13;
+                let tokens = core::array::from_fn(|p| {
+                    let residual = if p == 0 {
+                        val
+                    } else if p == i / 64 % 3 + 1 {
+                        (i % 3) as i32 - 1
+                    } else {
+                        ((i * 7 + p * 13) % 211) as i32 - 105
+                    };
+                    uint_encode(pack_signed(residual)).0 as u8
+                });
+                samples.push_val(props, tokens, val);
+            }
+            assert!(matches!(&samples.props, MaProperties::Narrow(_)));
+            let mut wide = MaSamples {
+                props: MaProperties::Wide(samples.props.iter().collect()),
+                tok: samples.tok.clone(),
+                val: samples.val.clone(),
+            };
+            for threads in [1, 4] {
+                let pool = ThreadPool::new(threads);
+                if threads == 4 {
+                    // An unsplit large root exercises concurrent row-chunk
+                    // histograms before the deepening test's smaller leaves.
+                    let a = learn_ma_tree(&samples, params(8), &pool, &mut CoderScratch::default());
+                    let b = learn_ma_tree(&wide, params(8), &pool, &mut CoderScratch::default());
+                    assert_tree(&a, &b);
+                }
+                let indices = samples.evenly_sampled_indices(1024);
+                let seed = learn_ma_tree_indexed(
+                    &samples,
+                    indices.clone(),
+                    params(8),
+                    &pool,
+                    &mut CoderScratch::default(),
+                );
+                let wide_seed = learn_ma_tree_indexed(
+                    &wide,
+                    indices,
+                    params(8),
+                    &pool,
+                    &mut CoderScratch::default(),
+                );
+                assert_tree(&seed, &wide_seed);
+                // Include the large-node chunk scan and speculative copies.
+                let (narrow_tree, narrow_rows) = deepen_ma_tree(
+                    samples.select(&(0..count as u32).collect::<Vec<_>>()),
+                    params(24),
+                    seed,
+                    &pool,
+                    &mut CoderScratch::default(),
+                );
+                let (wide_tree, wide_rows) = deepen_ma_tree(
+                    wide.select(&(0..count as u32).collect::<Vec<_>>()),
+                    params(24),
+                    wide_seed,
+                    &pool,
+                    &mut CoderScratch::default(),
+                );
+                assert_tree(&narrow_tree, &wide_tree);
+                assert_eq!(
+                    narrow_rows.props.iter().collect::<Vec<_>>(),
+                    wide_rows.props.iter().collect::<Vec<_>>()
+                );
+                assert_eq!(narrow_rows.tok, wide_rows.tok);
+                assert_eq!(narrow_rows.val, wide_rows.val);
+            }
+            // A genuinely wide set must still learn without clamping values.
+            wide.props.map_rows(|row| row[4] *= 100_000);
+            let wide_tree = learn_ma_tree_in_place(
+                &mut wide,
+                params(8),
+                &ThreadPool::new(1),
+                &mut CoderScratch::default(),
+            );
+            assert!(wide_tree.est_bits.is_finite());
+        }
+    }
 
     #[test]
     fn sample_permutation_matches_gather() {
@@ -1905,23 +2070,24 @@ mod tests {
             for prop in [2, 3] {
                 for max_candidates in [16, 32] {
                     for preds in [&[6][..], &[13, 0][..], &[9, 6, 0, 13][..]] {
-                        let actual = best_split_on_prop(
-                            &selected.props,
-                            &selected.tok,
-                            prop,
-                            preds,
-                            alphabet,
-                            max_candidates,
-                            &all_hist,
-                            &all_nbits,
-                            &mut scratch,
-                        );
+                        let actual =
+                            with_ma_properties!(&selected.props, |properties| best_split_on_prop(
+                                properties,
+                                &selected.tok,
+                                prop,
+                                preds,
+                                alphabet,
+                                max_candidates,
+                                &all_hist,
+                                &all_nbits,
+                                &mut scratch,
+                            ));
                         let mut expected = None;
                         for &threshold in &scratch.cands {
                             let mut left_hist = vec![0u32; all_hist.len()];
                             let mut left_count = 0;
                             for &i in &idx {
-                                if samples.props[i as usize][prop] <= threshold {
+                                if samples.props.get(i as usize)[prop] <= threshold {
                                     left_count += 1;
                                     for &p in preds {
                                         left_hist
@@ -1981,7 +2147,7 @@ mod tests {
         selected.props.swap(0, 2);
         selected.tok.swap(0, 2);
         for (row, source) in [17, 4, 31, 4].into_iter().enumerate() {
-            assert_eq!(selected.props[row], samples.props[source]);
+            assert_eq!(selected.props.get(row), samples.props.get(source));
             assert_eq!(selected.tok[row], samples.tok[source]);
         }
     }
@@ -2074,8 +2240,8 @@ mod tests {
         assert_eq!(serial.flat_bits, tree.flat_bits);
         assert!(tree.est_bits < tree.flat_bits);
         for i in 0..s.len() {
-            let (_, pred) = tree.lookup(&s.props[i]);
-            let expected = if s.props[i][4] < 32 { 1 } else { 5 };
+            let (_, pred) = tree.lookup(&s.props.get(i));
+            let expected = if s.props.get(i)[4] < 32 { 1 } else { 5 };
             assert_eq!(pred, expected, "sample {i} routed to wrong predictor");
         }
     }
@@ -2135,7 +2301,7 @@ mod tests {
         let mut copied = MaSamples::with_capacity(indices.len());
         for &index in &indices {
             let index = index as usize;
-            copied.push(samples.props[index], samples.tok[index]);
+            copied.push(samples.props.get(index), samples.tok[index]);
         }
         let params = || MaLearnParams {
             alphabet: 64,

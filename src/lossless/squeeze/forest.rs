@@ -55,11 +55,11 @@ pub(super) fn scale_ma_value_props(samples: &mut MaSamples, q: i32) {
     if q <= 1 {
         return;
     }
-    for p in samples.props.iter_mut() {
+    samples.props.map_rows(|p| {
         for v in &mut p[4..=14] {
             *v *= q;
         }
-    }
+    });
 }
 
 /// Tokenize a (divided) channel rectangle through a learned tree whose splits

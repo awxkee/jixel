@@ -77,11 +77,11 @@ fn unpack_signed(token: u32) -> i32 {
 /// leaf's residuals does not change its own entropy, but it centers the
 /// distribution, which lets ANS clustering merge leaves by shape rather than
 /// by bias and keeps small residuals inside the hybrid-uint's exact symbols.
-pub(super) fn leaf_offsets<'a>(
+pub(super) fn leaf_offsets<'a, T: crate::ma_tree::MaProperty + 'a>(
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     num_ctx: u32,
-    samples: impl Iterator<Item = (&'a [i32; NUM_MA_PROPS], &'a [u8; NUM_MA_PREDS])>,
+    samples: impl Iterator<Item = (&'a [T; NUM_MA_PROPS], &'a [u8; NUM_MA_PREDS])>,
 ) -> Vec<i32> {
     const BINS: usize = 2 * MA_LEAF_OFFSET_LIMIT as usize + 1;
     let mut hist = vec![[0u32; BINS]; num_ctx as usize];
@@ -151,7 +151,7 @@ pub(super) fn gate_ma_tree(
     }
     // Rejected trees do not need the sample-routing pass.
     if let Some(samples) = samples {
-        cand.set_leaf_offsets(samples.props.iter().zip(&samples.tok).step_by(4));
+        cand.set_leaf_offsets(samples, 4);
     }
     Some(cand)
 }
@@ -434,7 +434,7 @@ fn wp_matters(stage: &CoarseLearn) -> bool {
     let mut wp_rows = 0usize;
     for props in stage.samples.props.iter().step_by(16) {
         rows += 1;
-        if tree.lookup(props).1 as usize == crate::ma_tree::PRED_WEIGHTED {
+        if tree.lookup(&props).1 as usize == crate::ma_tree::PRED_WEIGHTED {
             wp_rows += 1;
         }
     }
@@ -609,48 +609,61 @@ pub(super) fn learn_ma_candidate(
         .collect();
     let total_samples = counts.iter().sum();
     let mut samples = MaSamples {
-        props: vec![[0; NUM_MA_PROPS]; total_samples],
+        props: crate::ma_tree::MaProperties::zeroed(total_samples),
         tok: vec![[0; NUM_MA_PREDS]; total_samples],
         val: vec![0; total_samples],
     };
-    let mut props = samples.props.as_mut_slice();
-    let mut tok = samples.tok.as_mut_slice();
-    let mut val = samples.val.as_mut_slice();
-    let mut ranges = Vec::with_capacity(jobs.len());
-    for count in counts {
-        let (p, rest_p) = props.split_at_mut(count);
-        let (t, rest_t) = tok.split_at_mut(count);
-        let (v, rest_v) = val.split_at_mut(count);
-        ranges.push((p, t, v));
-        (props, tok, val) = (rest_p, rest_t, rest_v);
+    loop {
+        let overflow = crate::ma_tree::with_ma_properties!(&mut samples.props, |props| {
+            let mut props = props.as_mut_slice();
+            let mut tok = samples.tok.as_mut_slice();
+            let mut val = samples.val.as_mut_slice();
+            let mut ranges = Vec::with_capacity(jobs.len());
+            for &count in &counts {
+                let (p, rest_p) = props.split_at_mut(count);
+                let (t, rest_t) = tok.split_at_mut(count);
+                let (v, rest_v) = val.split_at_mut(count);
+                ranges.push((p, t, v, false));
+                (props, tok, val) = (rest_p, rest_t, rest_v);
+            }
+            pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
+                let job = &jobs[i];
+                let ch = source.channel_at(job.group_override, job.channel);
+                let mut rows = range
+                    .0
+                    .iter_mut()
+                    .zip(range.1.iter_mut())
+                    .zip(range.2.iter_mut());
+                with_ma_pixels!(ch, |pixels| sample_channel_ma(
+                    |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
+                    job.w,
+                    job.h,
+                    job.chan_id,
+                    job.stream,
+                    &job.refs,
+                    wp_params,
+                    use_wp,
+                    stride,
+                    |p, t, v| {
+                        let ((props, tok), val) = rows.next().expect("sample count");
+                        range.3 |= !crate::ma_tree::write_property_row(props, p);
+                        *tok = t;
+                        *val = v;
+                    },
+                ));
+                debug_assert!(rows.next().is_none());
+            });
+            ranges.iter().any(|range| range.3)
+        });
+        if !overflow {
+            break;
+        }
+        // Retrying in wide storage preserves the exact sampling phases and
+        // order. Release the narrow buffer before allocating its replacement;
+        // the wide fallback does not keep both full property arrays alive.
+        samples.props = crate::ma_tree::MaProperties::Wide(Vec::new());
+        samples.props = crate::ma_tree::MaProperties::Wide(vec![[0; NUM_MA_PROPS]; total_samples]);
     }
-    pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
-        let job = &jobs[i];
-        let ch = source.channel_at(job.group_override, job.channel);
-        let mut rows = range
-            .0
-            .iter_mut()
-            .zip(range.1.iter_mut())
-            .zip(range.2.iter_mut());
-        with_ma_pixels!(ch, |pixels| sample_channel_ma(
-            |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
-            job.w,
-            job.h,
-            job.chan_id,
-            job.stream,
-            &job.refs,
-            wp_params,
-            use_wp,
-            stride,
-            |p, t, v| {
-                let ((props, tok), val) = rows.next().expect("sample count");
-                *props = p;
-                *tok = t;
-                *val = v;
-            },
-        ));
-        debug_assert!(rows.next().is_none());
-    });
     learn_ma_coarse(
         samples,
         stride,

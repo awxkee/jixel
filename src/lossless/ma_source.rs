@@ -42,7 +42,7 @@ use crate::coder_scratch::LZ77_MAX_CONTEXTS;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{Token, pack_signed};
 use crate::image::Image3Si;
-use crate::ma_tree::{LearnedTree, MA_REF_CHANNELS, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS};
+use crate::ma_tree::{LearnedTree, MA_REF_CHANNELS, MaNode, MaSamples};
 
 // ---------------------------------------------------------------------------
 // Learned MA context tree (v2): greedy learned tree over the standard modular
@@ -244,11 +244,15 @@ impl LearnedCandidate {
     }
 
     /// Fill offset tokens in BFS context order from the retained offset sample.
-    pub(super) fn set_leaf_offsets<'a>(
-        &mut self,
-        samples: impl Iterator<Item = (&'a [i32; NUM_MA_PROPS], &'a [u8; NUM_MA_PREDS])>,
-    ) {
-        self.leaf_offset = leaf_offsets(&self.tree, &self.leaf_ctx, self.num_ctx, samples);
+    pub(super) fn set_leaf_offsets(&mut self, samples: &MaSamples, step: usize) {
+        self.leaf_offset = crate::ma_tree::with_ma_properties!(&samples.props, |rows| {
+            leaf_offsets(
+                &self.tree,
+                &self.leaf_ctx,
+                self.num_ctx,
+                rows.iter().zip(&samples.tok).step_by(step),
+            )
+        });
         for (token, &offset) in self
             .tree_tokens
             .iter_mut()
