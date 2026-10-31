@@ -3126,22 +3126,16 @@ mod tests {
 
     #[test]
     fn dequant_matrices_construct_on_a_small_stack() {
-        std::thread::Builder::new()
-            .name("small-stack-dequant-test".into())
-            .stack_size(64 * 1024)
-            .spawn(|| {
-                let _matrices = DequantMatrices::compute(
-                    false,
-                    false,
-                    Some(&FLAT_B8_BANDS_MID),
-                    false,
-                    false,
-                    false,
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        crate::thread_pool::ThreadPool::on_small_stack(|| {
+            let _matrices = DequantMatrices::compute(
+                false,
+                false,
+                Some(&FLAT_B8_BANDS_MID),
+                false,
+                false,
+                false,
+            );
+        });
     }
 
     #[test]

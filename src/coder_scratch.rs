@@ -231,6 +231,9 @@ pub(crate) struct AcStrategyBandScratch {
     pub(crate) leaves: Vec<LeafChoice>,
     pub(crate) upgrade_candidates: Vec<MergeUpgradeCandidate>,
     pub(crate) merge_upgrades: Vec<MergeUpgrade>,
+    /// The merge search's DCT8 costs of this band's rows (`(by - y0) *
+    /// xsize + bx`, NaN where it scored none), for the coefficient DP.
+    pub(crate) dct8_costs: Vec<f32>,
 }
 
 impl Default for AcStrategyBandScratch {
@@ -252,6 +255,7 @@ impl Default for AcStrategyBandScratch {
             leaves: Vec::new(),
             upgrade_candidates: Vec::new(),
             merge_upgrades: Vec::new(),
+            dct8_costs: Vec::new(),
         }
     }
 }
@@ -551,14 +555,8 @@ mod tests {
 
     #[test]
     fn coder_scratch_constructs_on_a_small_stack() {
-        std::thread::Builder::new()
-            .name("small-stack-scratch-test".into())
-            .stack_size(64 * 1024)
-            .spawn(|| {
-                let _scratch = CoderScratch::default();
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        crate::thread_pool::ThreadPool::on_small_stack(|| {
+            let _scratch = CoderScratch::default();
+        });
     }
 }

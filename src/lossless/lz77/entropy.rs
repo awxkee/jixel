@@ -187,17 +187,19 @@ where
     )
 }
 
-/// Split `streams` into `threads` contiguous chunks and reduce a per-chunk
+/// Split `streams` into contiguous pool-sized chunks and reduce a per-chunk
 /// accumulator. Keep chunk boundaries and merge order stable: coded-bit
 /// estimates use floating-point sums, while histogram/count passes use integers.
 fn parallel_streams<R: Send, T: LzTokenSource>(
     streams: &[&[T]],
-    threads: usize,
+    pool: Option<&ThreadPool>,
     init: impl Fn() -> R + Sync,
     accumulate: impl Fn(&mut R, &[T]) + Sync,
     merge: impl FnMut(&mut R, R),
 ) -> R {
-    let threads = threads.max(1).min(streams.len().max(1));
+    let threads = pool
+        .map_or(1, ThreadPool::num_threads)
+        .min(streams.len().max(1));
     if threads <= 1 {
         let mut acc = init();
         for toks in streams {
@@ -206,15 +208,17 @@ fn parallel_streams<R: Send, T: LzTokenSource>(
         return acc;
     }
     let chunk = streams.len().div_ceil(threads);
-    let parts = scoped_chunks(streams.len().div_ceil(chunk), "stream worker", &|ci| {
-        let begin = ci * chunk;
-        let part = &streams[begin..(begin + chunk).min(streams.len())];
-        let mut acc = init();
-        for toks in part {
-            accumulate(&mut acc, toks);
-        }
-        acc
-    });
+    let parts = pool
+        .expect("parallel stream pool")
+        .map(streams.len().div_ceil(chunk), |ci| {
+            let begin = ci * chunk;
+            let part = &streams[begin..(begin + chunk).min(streams.len())];
+            let mut acc = init();
+            for toks in part {
+                accumulate(&mut acc, toks);
+            }
+            acc
+        });
     let mut parts = parts.into_iter();
     let mut acc = parts.next().expect("at least one chunk");
     let mut merge = merge;
@@ -431,7 +435,7 @@ pub(in crate::lossless) fn estimate_coded_bits<T: LzTokenSource>(
     distance_context: u32,
     code: &EntropyCode<'_>,
     min_symbol: u32,
-    threads: usize,
+    pool: Option<&ThreadPool>,
 ) -> f64 {
     let num_clusters = code.num_prefix_codes;
     let mut sym_cost: Vec<Vec<f32>> = Vec::with_capacity(num_clusters);
@@ -466,7 +470,7 @@ pub(in crate::lossless) fn estimate_coded_bits<T: LzTokenSource>(
     let dist_cluster = context_map[distance_context as usize] as usize;
     parallel_streams(
         streams,
-        threads,
+        pool,
         || 0.0f64,
         |acc, toks| {
             let mut bits = 0.0f64;
@@ -490,52 +494,39 @@ pub(in crate::lossless) fn estimate_coded_bits<T: LzTokenSource>(
     )
 }
 
-/// Map every stream independently over `threads` scoped threads, results in
-/// stream order.
+/// Map streams on the shared pool, preserving stream order.
 fn map_streams<R: Send, T: LzTokenSource>(
     streams: &[&[T]],
-    threads: usize,
+    pool: Option<&ThreadPool>,
     f: impl Fn(&[T]) -> R + Sync,
 ) -> Vec<R> {
-    map_streams_indexed(streams, threads, |_, toks| f(toks))
+    map_streams_indexed(streams, pool, |_, toks| f(toks))
 }
 
 fn map_streams_indexed<R: Send, T: LzTokenSource>(
     streams: &[&[T]],
-    threads: usize,
+    pool: Option<&ThreadPool>,
     f: impl Fn(usize, &[T]) -> R + Sync,
 ) -> Vec<R> {
-    let threads = threads.max(1).min(streams.len().max(1));
+    let threads = pool
+        .map_or(1, ThreadPool::num_threads)
+        .min(streams.len().max(1));
     if threads <= 1 {
         return streams.iter().enumerate().map(|(i, t)| f(i, t)).collect();
     }
     let chunk = streams.len().div_ceil(threads);
-    scoped_chunks(streams.len().div_ceil(chunk), "stream mapper", &|ci| {
-        let begin = ci * chunk;
-        let part = &streams[begin..(begin + chunk).min(streams.len())];
-        part.iter()
-            .enumerate()
-            .map(|(k, t)| f(begin + k, t))
-            .collect::<Vec<R>>()
-    })
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-// Callback dispatch is once per thread, outside token and stream loops.
-fn scoped_chunks<R: Send>(
-    count: usize,
-    panic_message: &'static str,
-    run: &(dyn Fn(usize) -> R + Sync),
-) -> Vec<R> {
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..count).map(|i| scope.spawn(move || run(i))).collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect(panic_message))
-            .collect()
-    })
+    pool.expect("parallel stream pool")
+        .map(streams.len().div_ceil(chunk), |ci| {
+            let begin = ci * chunk;
+            let part = &streams[begin..(begin + chunk).min(streams.len())];
+            part.iter()
+                .enumerate()
+                .map(|(k, t)| f(begin + k, t))
+                .collect::<Vec<R>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn merge_histograms(into: &mut [Histogram], from: &[Histogram]) {
@@ -677,7 +668,6 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
 ) -> EntropyCode<'scratch> {
     let thorough = cfg!(any(feature = "extraslow", test)) && thorough;
-    let threads = pool.map_or(1, ThreadPool::num_threads);
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
@@ -696,7 +686,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     {
         let summed = parallel_streams(
             streams,
-            threads,
+            pool,
             || vec![Histogram::new(); num_contexts],
             |acc, toks| lz_add_histograms(lz_tokens(toks), None, acc, min_symbol, distance_context),
             |acc, part| merge_histograms(acc, &part),
@@ -760,7 +750,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         let distance_cluster = context_map[distance_context as usize] as usize;
         let context_map_ref: &[u8] = &context_map[..num_contexts];
         {
-            let per_stream_counts: Vec<Vec<usize>> = map_streams(streams, threads, |toks| {
+            let per_stream_counts: Vec<Vec<usize>> = map_streams(streams, pool, |toks| {
                 let mut c = vec![0usize; num_clusters];
                 for tok in lz_tokens(toks) {
                     let cluster = if tok.is_lz77() {
@@ -786,7 +776,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             let offsets = &offsets;
             let strides_ref = &strides;
             let per_stream_values: Vec<Vec<Vec<u32>>> =
-                map_streams_indexed(streams, threads, |s, toks| {
+                map_streams_indexed(streams, pool, |s, toks| {
                     let mut ordinal = offsets[s].clone();
                     let mut local: Vec<Vec<u32>> = vec![Vec::new(); num_clusters];
                     for tok in lz_tokens(toks) {
@@ -810,9 +800,21 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
             }
             let samples = crate::entropy::HybridUintSamples::from_parts(values, strides);
             configs.copy_from_slice(&if thorough {
-                samples.select_exhaustive(min_symbol)
+                match pool {
+                    Some(pool) => samples.select_exhaustive_with_pool(
+                        min_symbol,
+                        pool,
+                        &mut CoderScratch::lossless(),
+                    ),
+                    None => samples.select_exhaustive(min_symbol),
+                }
             } else {
-                samples.select()
+                match pool {
+                    Some(pool) => {
+                        samples.select_with_pool(pool, &mut CoderScratch::lossless(), 0.995)
+                    }
+                    None => samples.select(),
+                }
             });
         }
         // Validate every literal against the chosen config, including values
@@ -820,7 +822,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
         let valid = parallel_streams(
             streams,
-            threads,
+            pool,
             || vec![true; num_clusters],
             |acc, toks| {
                 for tok in lz_tokens(toks) {
@@ -852,7 +854,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
         let configs_ref: &[crate::entropy::HybridUintConfig] = configs;
         let summed = parallel_streams(
             streams,
-            threads,
+            pool,
             || vec![Histogram::new(); num_clusters],
             |acc, toks| {
                 for tok in lz_tokens(toks) {

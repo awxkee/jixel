@@ -459,15 +459,18 @@ mod tests {
         else {
             return;
         };
-        // Fed from another thread: large streams would otherwise fill both
-        // pipes and deadlock against the decoder's output.
+        // Feeding input and draining output must run concurrently so neither
+        // pipe can fill while its peer waits. Use the shared worker machinery.
         let mut stdin = child.stdin.take().unwrap();
-        let input = encoded.to_vec();
-        let feeder = std::thread::spawn(move || stdin.write_all(&input));
-        let Ok(out) = child.wait_with_output() else {
+        let pool = crate::thread_pool::ThreadPool::new_lossless(2);
+        let (fed, decoded) = pool.join(
+            move || stdin.write_all(encoded),
+            move || child.wait_with_output(),
+        );
+        fed.unwrap();
+        let Ok(out) = decoded else {
             return;
         };
-        feeder.join().unwrap().unwrap();
         assert!(
             out.status.success(),
             "brotli rejected our stream ({} bytes in): {}",

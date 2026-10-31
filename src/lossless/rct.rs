@@ -173,7 +173,7 @@ fn rct_forward_pixel(t: u32, first: i32, second: i32, third: i32) -> (i32, i32, 
 }
 
 #[inline]
-fn rct_from_ycocg_pixel(y: i32, co: i32, cg: i32, rct: u32) -> (i32, i32, i32) {
+pub(crate) fn rct_from_ycocg_pixel(y: i32, co: i32, cg: i32, rct: u32) -> (i32, i32, i32) {
     if rct == 6 {
         return (y, co, cg);
     }
@@ -240,6 +240,7 @@ fn estimate_rct_cost(
     let cg_plane = linear.plane_data(2);
     let mut hist = [[0u64; RCT_NUM_CONTEXTS * RCT_ALPHABET]; 3];
     let mut extra_bits: u64 = 0;
+    let transform = crate::lossless::selected_rct_row_fn();
     row_scratch.prev.resize(3 * xsize, 0);
     row_scratch.cur.resize(3 * xsize, 0);
     row_scratch.prev.fill(0);
@@ -256,11 +257,7 @@ fn estimate_rct_cost(
         let cg = &cg_plane[y * xsize..][..xsize];
         let (out0, rest) = cur.split_at_mut(xsize);
         let (out1, out2) = rest.split_at_mut(xsize);
-        let inputs = yy.iter().zip(co).zip(cg);
-        let outputs = out0.iter_mut().zip(out1).zip(out2);
-        for (((&y_value, &co_value), &cg_value), ((a, b), c)) in inputs.zip(outputs) {
-            (*a, *b, *c) = rct_from_ycocg_pixel(y_value, co_value, cg_value, rct);
-        }
+        transform([yy, co, cg], rct, [out0, out1, out2]);
         if scored {
             for (ch, chist) in hist.iter_mut().enumerate() {
                 let crow = &cur[ch * xsize..][..xsize];
@@ -323,16 +320,14 @@ pub(super) fn rct_planes(
         starts.push(start);
         start += band[0].len();
     }
+    let transform = crate::lossless::selected_rct_row_fn();
     pool.steal_for_each_mut(scratch, &mut bands, |i, [o0, o1, o2], _scratch| {
         let range = starts[i]..starts[i] + o0.len();
-        let inputs = linear.plane_data(0)[range.clone()]
-            .iter()
-            .zip(&linear.plane_data(1)[range.clone()])
-            .zip(&linear.plane_data(2)[range]);
-        let outputs = o0.iter_mut().zip(o1.iter_mut()).zip(o2.iter_mut());
-        for (((&y_value, &co_value), &cg_value), ((a, b), c)) in inputs.zip(outputs) {
-            (*a, *b, *c) = rct_from_ycocg_pixel(y_value, co_value, cg_value, rct);
-        }
+        transform(
+            [0, 1, 2].map(|c| &linear.plane_data(c)[range.clone()]),
+            rct,
+            [o0, o1, o2],
+        );
     });
     out
 }
@@ -352,6 +347,34 @@ pub(super) fn select_rct(
         return None;
     }
     Some((rct, rct_planes(linear, xsize, ysize, rct, pool, scratch)))
+}
+
+pub(crate) type RctRowFn = fn([&[i32]; 3], u32, [&mut [i32]; 3]);
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_rct_row_fn() -> RctRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c| unsafe { crate::avx::rct_row_avx2(a, b, c) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c| unsafe { crate::sse::rct_row_sse41(a, b, c) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c| unsafe { crate::neon::rct_row_neon(a, b, c) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::rct_row_wasm;
+    rct_row_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn rct_row_scalar(src: [&[i32]; 3], kind: u32, out: [&mut [i32]; 3]) {
+    let [a, b, c] = out;
+    for i in 0..a.len() {
+        (a[i], b[i], c[i]) =
+            crate::lossless::rct_from_ycocg_pixel(src[0][i], src[1][i], src[2][i], kind);
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +463,81 @@ mod tests {
                     rct_forward_pixel(rct % 7, rgb[perm[0]], rgb[perm[1]], rgb[perm[2]])
                 };
                 assert_eq!(rct_from_ycocg_pixel(y, co, cg, rct), expected);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_row_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct Rows {
+        rct: RctRowFn,
+    }
+
+    fn backends() -> Vec<Rows> {
+        #[allow(unused_mut)]
+        let mut rows = vec![Rows {
+            rct: rct_row_scalar,
+        }];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            rows.push(Rows {
+                rct: |a, b, c| unsafe { crate::avx::rct_row_avx2(a, b, c) },
+            });
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            rows.push(Rows {
+                rct: |a, b, c| unsafe { crate::sse::rct_row_sse41(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            rows.push(Rows {
+                rct: |a, b, c| unsafe { crate::neon::rct_row_neon(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        {
+            rows.push(Rows {
+                rct: crate::wasm::rct_row_wasm,
+            });
+        }
+        rows.push(Rows {
+            rct: selected_rct_row_fn(),
+        });
+        rows
+    }
+
+    #[test]
+    fn every_rct_permutation_and_tail_matches_scalar() {
+        for len in 0..35 {
+            let src: [Vec<i32>; 3] = std::array::from_fn(|c| {
+                (0..len + 1)
+                    .map(|i| ((i * 377 + c * 997) % 8191) as i32 - 4095)
+                    .collect()
+            });
+            for kind in 0..42 {
+                let mut expected: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0; len]);
+                let [a, b, c] = &mut expected;
+                rct_row_scalar(src.each_ref().map(|p| &p[1..]), kind, [a, b, c]);
+                for backend in backends() {
+                    let mut actual: [Vec<i32>; 3] = std::array::from_fn(|_| vec![0; len + 2]);
+                    let [a, b, c] = &mut actual;
+                    (backend.rct)(
+                        src.each_ref().map(|p| &p[1..]),
+                        kind,
+                        [&mut a[1..1 + len], &mut b[1..1 + len], &mut c[1..1 + len]],
+                    );
+                    for (a, e) in actual.iter().zip(&expected) {
+                        assert_eq!(&a[1..1 + len], e, "kind={kind}, len={len}");
+                        assert_eq!(a[0], 0);
+                        assert_eq!(a[len + 1], 0);
+                    }
+                }
             }
         }
     }

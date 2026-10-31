@@ -38,6 +38,27 @@ pub(crate) fn cfl_rd_cost_neon(
     lambda: f32,
     bias: crate::group::DequantBias,
 ) -> f32 {
+    cfl_rd_cost_bounded_neon(m, s, factor, weight, lambda, bias, 0.0, f32::INFINITY)
+}
+
+/// Coefficients between checks of the running sum against the limit.
+const BOUND_CHECK_COEFFICIENTS: usize = 64;
+
+/// `cfl_rd_cost_neon`, abandoned as `f32::INFINITY` once the running sum
+/// plus `rate` exceeds `limit`. Every coefficient's cost is non-negative
+/// (non-negative weight and lambda), so the full sum would exceed it too.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn cfl_rd_cost_bounded_neon(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    rate: f32,
+    limit: f32,
+) -> f32 {
     use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
     let len = m.len().min(s.len());
     let factor_v = vdupq_n_f32(factor);
@@ -49,25 +70,33 @@ pub(crate) fn cfl_rd_cost_neon(
     let mut acc = zero;
     let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
     let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
-    for (m, s) in m_chunks.iter().zip(s_chunks) {
-        let mv = unsafe { vld1q_f32(m.as_ptr()) };
-        let sv = unsafe { vld1q_f32(s.as_ptr()) };
-        let residual = vsubq_f32(sv, vmulq_f32(factor_v, mv));
-        let zero_cost = vmulq_f32(vmulq_f32(weight_v, residual), residual);
-        let level = vrndaq_f32(residual);
-        let coded_err = vsubq_f32(
-            residual,
-            super::ac_strategy::neon_dequantized_level_f32(level, bias),
-        );
-        let abs_level = vabsq_f32(level);
-        // log2(|level|) = log2(1 + (|level| - 1)); only read where level != 0.
-        let log2_level =
-            super::ac_strategy::neon_log2p1_f32(vmaxq_f32(vsubq_f32(abs_level, one), zero));
-        let bits = vfmaq_f32(nonzero_bits, magnitude_bits, log2_level);
-        let coded = vaddq_f32(vmulq_f32(vmulq_f32(weight_v, coded_err), coded_err), bits);
-        let nonzero = vcgtq_f32(abs_level, zero);
-        let best = vminq_f32(zero_cost, vbslq_f32(nonzero, coded, zero_cost));
-        acc = vaddq_f32(acc, best);
+    let spans = m_chunks
+        .chunks(BOUND_CHECK_COEFFICIENTS / 4)
+        .zip(s_chunks.chunks(BOUND_CHECK_COEFFICIENTS / 4));
+    for (m_span, s_span) in spans {
+        for (m, s) in m_span.iter().zip(s_span) {
+            let mv = unsafe { vld1q_f32(m.as_ptr()) };
+            let sv = unsafe { vld1q_f32(s.as_ptr()) };
+            let residual = vsubq_f32(sv, vmulq_f32(factor_v, mv));
+            let zero_cost = vmulq_f32(vmulq_f32(weight_v, residual), residual);
+            let level = vrndaq_f32(residual);
+            let coded_err = vsubq_f32(
+                residual,
+                super::ac_strategy::neon_dequantized_level_f32(level, bias),
+            );
+            let abs_level = vabsq_f32(level);
+            // log2(|level|) = log2(1 + (|level| - 1)); only read where level != 0.
+            let log2_level =
+                super::ac_strategy::neon_log2p1_f32(vmaxq_f32(vsubq_f32(abs_level, one), zero));
+            let bits = vfmaq_f32(nonzero_bits, magnitude_bits, log2_level);
+            let coded = vaddq_f32(vmulq_f32(vmulq_f32(weight_v, coded_err), coded_err), bits);
+            let nonzero = vcgtq_f32(abs_level, zero);
+            let best = vminq_f32(zero_cost, vbslq_f32(nonzero, coded, zero_cost));
+            acc = vaddq_f32(acc, best);
+        }
+        if vaddvq_f32(acc) + rate > limit {
+            return f32::INFINITY;
+        }
     }
     let mut cost = vaddvq_f32(acc);
     for (&mv, &sv) in m_tail.iter().zip(s_tail) {
@@ -85,6 +114,263 @@ pub(crate) fn cfl_rd_cost_neon(
         cost += best;
     }
     cost
+}
+
+/// Transpose candidates and coefficient lanes without changing any slope's
+/// four accumulation chains. Keep scalar-tail parameters out of this loop's
+/// live registers; scalar tails are handled by the caller after reduction.
+#[inline(never)]
+#[target_feature(enable = "neon")]
+fn cfl_rd_cost_vectors_neon<const N: usize>(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32; N],
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> [f32; N] {
+    use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
+    assert!(N == 2 || N == 4);
+    let len = m.len().min(s.len());
+    let factor_v = if N == 2 {
+        // SAFETY: N == 2 in this arm, so exactly two initialized factors exist.
+        let pair = unsafe { vld1_f32(factors.as_ptr()) };
+        vcombine_f32(pair, pair)
+    } else {
+        // SAFETY: the assertion proves N == 4 in this arm.
+        unsafe { vld1q_f32(factors.as_ptr()) }
+    };
+    let weight_v = vdupq_n_f32(weight);
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let nonzero_bits = vdupq_n_f32(lambda * CFL_NONZERO_BITS);
+    let magnitude_bits = vdupq_n_f32(lambda * CFL_MAGNITUDE_BITS);
+    let cost = |mv, sv, factor_v| {
+        let residual = vsubq_f32(sv, vmulq_f32(factor_v, mv));
+        let zero_cost = vmulq_f32(vmulq_f32(weight_v, residual), residual);
+        let level = vrndaq_f32(residual);
+        let coded_err = vsubq_f32(
+            residual,
+            super::ac_strategy::neon_dequantized_level_f32(level, bias),
+        );
+        let abs_level = vabsq_f32(level);
+        // log2(|level|) = log2(1 + (|level| - 1)); only read where level != 0.
+        let log2_level =
+            super::ac_strategy::neon_log2p1_f32(vmaxq_f32(vsubq_f32(abs_level, one), zero));
+        let bits = vfmaq_f32(nonzero_bits, magnitude_bits, log2_level);
+        let coded = vaddq_f32(vmulq_f32(vmulq_f32(weight_v, coded_err), coded_err), bits);
+        let nonzero = vcgtq_f32(abs_level, zero);
+        // Keep the original zero-versus-coded choice in every lane.
+        vminq_f32(zero_cost, vbslq_f32(nonzero, coded, zero_cost))
+    };
+    // With finite inputs, zero luma makes the squared-error/quantized cost
+    // independent of the finite slope, including signed-zero residuals.
+    let can_share_zero = weight.is_finite()
+        && lambda.is_finite()
+        && bias.one.is_finite()
+        && bias.numerator.is_finite()
+        && vmaxvq_u32(vreinterpretq_u32_f32(vabsq_f32(factor_v))) < f32::INFINITY.to_bits();
+    let mut a0 = zero;
+    let mut a1 = zero;
+    let mut a2 = zero;
+    let mut a3 = zero;
+    for (m, s) in m[..len]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(s[..len].as_chunks::<4>().0)
+    {
+        let mv = unsafe { vld1q_f32(m.as_ptr()) };
+        let sv = unsafe { vld1q_f32(s.as_ptr()) };
+        if can_share_zero
+            && vmaxvq_u32(vreinterpretq_u32_f32(vabsq_f32(mv))) == 0
+            && vmaxvq_u32(vreinterpretq_u32_f32(vabsq_f32(sv))) < f32::INFINITY.to_bits()
+        {
+            let best = cost(mv, sv, vdupq_laneq_f32::<0>(factor_v));
+            if N == 2 {
+                a0 = vaddq_f32(a0, vzip1q_f32(best, best));
+                a1 = vaddq_f32(a1, vzip2q_f32(best, best));
+            } else {
+                a0 = vaddq_f32(a0, vdupq_laneq_f32::<0>(best));
+                a1 = vaddq_f32(a1, vdupq_laneq_f32::<1>(best));
+                a2 = vaddq_f32(a2, vdupq_laneq_f32::<2>(best));
+                a3 = vaddq_f32(a3, vdupq_laneq_f32::<3>(best));
+            }
+        } else {
+            if N == 2 {
+                // [slope0/coef0, slope1/coef0, slope0/coef1, slope1/coef1]
+                a0 = vaddq_f32(a0, cost(vzip1q_f32(mv, mv), vzip1q_f32(sv, sv), factor_v));
+                a1 = vaddq_f32(a1, cost(vzip2q_f32(mv, mv), vzip2q_f32(sv, sv), factor_v));
+            } else {
+                a0 = vaddq_f32(
+                    a0,
+                    cost(vdupq_laneq_f32::<0>(mv), vdupq_laneq_f32::<0>(sv), factor_v),
+                );
+                a1 = vaddq_f32(
+                    a1,
+                    cost(vdupq_laneq_f32::<1>(mv), vdupq_laneq_f32::<1>(sv), factor_v),
+                );
+                a2 = vaddq_f32(
+                    a2,
+                    cost(vdupq_laneq_f32::<2>(mv), vdupq_laneq_f32::<2>(sv), factor_v),
+                );
+                a3 = vaddq_f32(
+                    a3,
+                    cost(vdupq_laneq_f32::<3>(mv), vdupq_laneq_f32::<3>(sv), factor_v),
+                );
+            }
+        }
+    }
+    let mut costs = [0.0; N];
+    if N == 2 {
+        // Reproduce each old vaddvq: (coef0 + coef1) + (coef2 + coef3).
+        let first = vadd_f32(vget_low_f32(a0), vget_high_f32(a0));
+        let second = vadd_f32(vget_low_f32(a1), vget_high_f32(a1));
+        unsafe {
+            vst1_f32(costs.as_mut_ptr(), vadd_f32(first, second));
+        }
+    } else {
+        let reduced = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        unsafe {
+            vst1q_f32(costs.as_mut_ptr(), reduced);
+        }
+    }
+    costs
+}
+
+#[target_feature(enable = "neon")]
+fn cfl_rd_cost_batch_neon<const N: usize>(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32; N],
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> [f32; N] {
+    use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
+    let mut costs = cfl_rd_cost_vectors_neon(m, s, factors, weight, lambda, bias);
+    let len = m.len().min(s.len());
+    for (&mv, &sv) in m[..len]
+        .as_chunks::<4>()
+        .1
+        .iter()
+        .zip(s[..len].as_chunks::<4>().1)
+    {
+        for candidate in 0..N {
+            let residual = sv - factors[candidate] * mv;
+            let mut best = weight * residual * residual;
+            let level = residual.round();
+            if level != 0.0 {
+                let coded_err = residual - bias.level_f32(level);
+                let coded = weight * coded_err * coded_err
+                    + lambda
+                        * (CFL_NONZERO_BITS
+                            + CFL_MAGNITUDE_BITS * crate::adaptive_quant::dirty_log2f(level.abs()));
+                best = best.min(coded);
+            }
+            costs[candidate] += best;
+        }
+    }
+    costs
+}
+
+#[target_feature(enable = "neon")]
+fn cfl_rd_costs_neon_impl<const N: usize>(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32],
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    costs: &mut [f32],
+) {
+    assert_eq!(factors.len(), costs.len());
+    let (batches, rest) = factors.as_chunks::<N>();
+    let (outputs, rest_costs) = costs.as_chunks_mut::<N>();
+    for (batch, output) in batches.iter().zip(outputs) {
+        *output = cfl_rd_cost_batch_neon(m, s, batch, weight, lambda, bias);
+    }
+    for (&factor, output) in rest.iter().zip(rest_costs) {
+        *output = cfl_rd_cost_neon(m, s, factor, weight, lambda, bias);
+    }
+}
+
+/// Sample three coefficient vectors before batching. Dense luma keeps the
+/// original kernel; zero-luma tiles can share quantization work across slopes.
+/// With `bound = (rates, first)`, a dense slope whose cost plus rate provably
+/// exceeds another slope's total comes back as `f32::INFINITY`; `first` is
+/// priced first to set the bar.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn cfl_rd_costs_neon_adaptive<const N: usize>(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32],
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    costs: &mut [f32],
+    bound: Option<(&[f32], usize)>,
+) {
+    assert_eq!(factors.len(), costs.len());
+    let len = m.len().min(s.len());
+    let use_batch = factors.len() >= N && len >= 64 && {
+        [0, (len / 8) * 4, (len / 4 - 1) * 4].iter().any(|&i| {
+            // SAFETY: len >= 64 and each sampled vector ends at or before len.
+            let value = unsafe { vld1q_f32(m.as_ptr().add(i)) };
+            vmaxvq_u32(vreinterpretq_u32_f32(vabsq_f32(value))) == 0
+        })
+    };
+    if use_batch {
+        cfl_rd_costs_neon_impl::<N>(m, s, factors, weight, lambda, bias, costs);
+    } else if let Some((rates, first)) = bound
+        && weight >= 0.0
+        && lambda >= 0.0
+    {
+        assert_eq!(rates.len(), costs.len());
+        let mut limit = f32::INFINITY;
+        let order = std::iter::once(first).chain((0..factors.len()).filter(|&i| i != first));
+        for i in order {
+            let cost =
+                cfl_rd_cost_bounded_neon(m, s, factors[i], weight, lambda, bias, rates[i], limit);
+            costs[i] = cost;
+            let total = cost + rates[i];
+            if total < limit {
+                limit = total;
+            }
+        }
+    } else {
+        for (&factor, cost) in factors.iter().zip(costs) {
+            *cost = cfl_rd_cost_neon(m, s, factor, weight, lambda, bias);
+        }
+    }
+}
+
+/// Slope costs; one that provably loses to another slope once `rates` are
+/// added is `f32::INFINITY`. `first` is priced first.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+pub(crate) fn cfl_rd_costs_neon(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32],
+    rates: &[f32],
+    first: usize,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    costs: &mut [f32],
+) {
+    cfl_rd_costs_neon_adaptive::<4>(
+        m,
+        s,
+        factors,
+        weight,
+        lambda,
+        bias,
+        costs,
+        Some((rates, first)),
+    );
 }
 
 #[target_feature(enable = "neon")]

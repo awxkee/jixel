@@ -38,7 +38,9 @@ mod entropy;
 mod frame;
 mod haar;
 mod inflated_cost;
+mod ink_layer;
 mod lossless_grad;
+mod lossless_search;
 mod lz_match;
 mod noise;
 mod quant;
@@ -55,10 +57,13 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
 pub(crate) use cfl::{
-    apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_refill_wasm, cfl_rdo_stats_wasm,
+    apply_cfl_wasm, cfl_rd_costs_wasm, cfl_rdo_block_wasm, cfl_rdo_refill_wasm, cfl_rdo_stats_wasm,
     cfl_regression_wasm,
 };
-pub(crate) use dc_ops::{adjust_b_dc_wasm, compensate_b_dc_wasm, reconstruct_dc_wasm};
+pub(crate) use dc_ops::{
+    add_scaled_wasm, adjust_b_dc_wasm, compensate_b_dc_wasm, dc_distortion_row_wasm,
+    dc_error_row_wasm, reconstruct_dc_wasm,
+};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;
@@ -67,7 +72,9 @@ pub(crate) use inflated_cost::{
     combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
     rgb_hue_chroma_edge_loss_wasm,
 };
+pub(crate) use ink_layer::{luma_row_wasm, ridge_row_wasm};
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lossless_search::{palette_row_wasm, rct_row_wasm};
 pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
 pub(crate) use noise::{noise_laplacian_stats_wasm, noise_shrink_wasm, noise_texture_score_wasm};
 pub(crate) use quant::{

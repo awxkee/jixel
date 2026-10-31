@@ -402,3 +402,107 @@ pub(crate) fn reconstruct_dc_avx2(
         rb[i..].copy_from_slice(&ob[..tail]);
     }
 }
+
+#[target_feature(enable = "avx2")]
+fn search_fmla(a: __m256, b: __m256, c: __m256) -> __m256 {
+    #[cfg(target_feature = "fma")]
+    {
+        _mm256_fmadd_ps(a, b, c)
+    }
+    #[cfg(not(target_feature = "fma"))]
+    {
+        _mm256_add_ps(_mm256_mul_ps(a, b), c)
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dc_error_row_avx2(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    multiplier: f32,
+    out: &mut [f32],
+) {
+    assert!(src.len() >= out.len() && luma.len() >= out.len() && levels.len() >= out.len());
+    let end = out.len() / 8 * 8;
+    for x in (0..end).step_by(8) {
+        let y: [f32; 8] = std::array::from_fn(|i| -(luma[x + i] as f32));
+        let q: [f32; 8] = std::array::from_fn(|i| levels[x + i] as f32);
+        unsafe {
+            let error = _mm256_sub_ps(
+                search_fmla(
+                    _mm256_loadu_ps(src.as_ptr().add(x)),
+                    _mm256_set1_ps(scale),
+                    _mm256_mul_ps(_mm256_loadu_ps(y.as_ptr()), _mm256_set1_ps(factor)),
+                ),
+                _mm256_loadu_ps(q.as_ptr()),
+            );
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(x),
+                _mm256_mul_ps(error, _mm256_set1_ps(multiplier)),
+            );
+        }
+    }
+    crate::dc_ops::dc_error_row_scalar(
+        &src[end..],
+        &luma[end..],
+        &levels[end..],
+        scale,
+        factor,
+        multiplier,
+        &mut out[end..],
+    );
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn dc_distortion_row_avx2(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    mut sum: f64,
+) -> f64 {
+    assert_eq!(src.len(), luma.len());
+    assert_eq!(src.len(), levels.len());
+    // Only the independent error terms are vectorized. Carry the f64
+    // sum through every row in its original coefficient order.
+    let mut errors = [0.0; 32];
+    for start in (0..src.len()).step_by(errors.len()) {
+        let end = (start + errors.len()).min(src.len());
+        let errors = &mut errors[..end - start];
+        dc_error_row_avx2(
+            &src[start..end],
+            &luma[start..end],
+            &levels[start..end],
+            scale,
+            factor,
+            1.0,
+            errors,
+        );
+        for &error in errors.iter() {
+            sum += f64::from(error).powi(2);
+        }
+    }
+    sum
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) fn add_scaled_avx2(out: &mut [f32], src: &[f32], factor: f32) {
+    assert!(src.len() >= out.len());
+    let end = out.len() / 8 * 8;
+    for x in (0..end).step_by(8) {
+        unsafe {
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(x),
+                _mm256_add_ps(
+                    _mm256_loadu_ps(out.as_ptr().add(x)),
+                    _mm256_mul_ps(_mm256_set1_ps(factor), _mm256_loadu_ps(src.as_ptr().add(x))),
+                ),
+            );
+        }
+    }
+    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
+}

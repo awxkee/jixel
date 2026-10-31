@@ -862,9 +862,9 @@ pub(crate) fn reconstruct_error(
         _ => {
             let n = strategy_pixel_count(strategy);
             let matrix = inverse_matrix(strategy);
-            for (row, value) in err_out[..n].iter_mut().enumerate() {
-                let base = row * n;
-                *value = (0..n).map(|k| matrix[base + k] * coeff_err[k]).sum::<f32>();
+            let coeff_err = &coeff_err[..n];
+            for (value, row) in err_out[..n].iter_mut().zip(matrix.chunks_exact(n)) {
+                *value = row.iter().zip(coeff_err).map(|(m, e)| m * e).sum::<f32>();
             }
         }
     }

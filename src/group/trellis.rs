@@ -218,6 +218,32 @@ pub(super) fn few_colors(
     true
 }
 
+/// How `rdoq_block` searches a block's levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RdoqSearch {
+    /// One backward pass of per-coefficient choices.
+    Greedy,
+    /// The `RDOQ_BEAM_WIDTH` cheapest backward paths by remaining count.
+    Beam,
+    /// The count-banded trellis.
+    Trellis,
+}
+
+impl RdoqSearch {
+    pub(crate) fn of(effort: &crate::effort::Effort) -> Self {
+        if effort.rdoq_trellis {
+            Self::Trellis
+        } else if effort.rdoq_beam {
+            Self::Beam
+        } else {
+            Self::Greedy
+        }
+    }
+}
+
+/// Paths the beam keeps per coefficient.
+const RDOQ_BEAM_WIDTH: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn rdoq_block(
     channel_weight: f32,
@@ -238,11 +264,61 @@ pub(super) fn rdoq_block(
     qf_hi: bool,
     lambda: f32,
     restore_penalty: f32,
+    search: RdoqSearch,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
     let covered_blocks = cx * cy;
     let (window_cap, restore_len) = rdoq_window_len(covered_blocks);
+    if search == RdoqSearch::Beam {
+        rdoq_block_beam::<RDOQ_BEAM_WIDTH>(
+            channel_weight,
+            window_cap,
+            restore_len,
+            prices,
+            scan,
+            source,
+            inv_qm,
+            q_scaled,
+            block,
+            strategy_code,
+            c,
+            bias,
+            predicted,
+            cx,
+            cy,
+            distance,
+            qf_hi,
+            lambda,
+            restore_penalty,
+            choices,
+        );
+        return;
+    }
+    if search == RdoqSearch::Greedy {
+        rdoq_block_greedy(
+            channel_weight,
+            window_cap,
+            restore_len,
+            prices,
+            scan,
+            source,
+            inv_qm,
+            q_scaled,
+            block,
+            strategy_code,
+            c,
+            bias,
+            predicted,
+            cx,
+            cy,
+            distance,
+            qf_hi,
+            lambda,
+            restore_penalty,
+        );
+        return;
+    }
     // The 128 family always takes the banded trellis: the full DP grows with
     // a block's nonzero count, thousands of states over 16384 coefficients.
     let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
@@ -281,6 +357,372 @@ pub(super) fn rdoq_block(
         refine!(true, true);
     } else {
         refine!(true, false);
+    }
+}
+
+/// One backward pass of per-coefficient choices: each window coefficient,
+/// last to first, takes its cheapest candidate given the levels already
+/// chosen behind it, so its remaining-nonzero context is exact. A nonzero
+/// that would end the block also pays the zero run it codes in front of it.
+/// The predecessor flag and the count token use the incoming levels in front.
+#[allow(clippy::too_many_arguments)]
+fn rdoq_block_greedy(
+    channel_weight: f32,
+    window_cap: usize,
+    restore_len: usize,
+    prices: &FrozenTokenPrices,
+    scan: &[u32],
+    source: &[f32],
+    inv_qm: &[f32],
+    q_scaled: f32,
+    block: &mut [i32],
+    strategy_code: u8,
+    c: usize,
+    bias: DequantBias,
+    predicted: u8,
+    cx: usize,
+    cy: usize,
+    distance: f32,
+    qf_hi: bool,
+    lambda: f32,
+    restore_penalty: f32,
+) {
+    let covered_blocks = cx * cy;
+    let size = block.len();
+    let available = size
+        .checked_sub(covered_blocks)
+        .expect("LLF positions fit in the block");
+    let window_len = window_cap.min(available);
+    let search_end = covered_blocks + window_len;
+    let base_window_len = (24 * covered_blocks).min(64).min(available);
+    let block_ctx = fine_block_context(c, strategy_code, qf_hi);
+    let histo_offset = fine_zero_density_contexts_offset(block_ctx);
+    let log2_covered_blocks = covered_blocks.trailing_zeros() as usize;
+    let context = |remaining: usize, k: usize, prev: usize| -> u32 {
+        histo_offset
+            + if covered_blocks == 1 {
+                zero_density_context_8x8(remaining, k, prev) as u32
+            } else {
+                zero_density_context(remaining, k, covered_blocks, log2_covered_blocks, prev) as u32
+            }
+    };
+    let nzero_ctx = fine_non_zero_context(predicted as u32, block_ctx);
+    let nonzero_at = |block: &[i32], k: usize| block[scan[k] as usize] != 0;
+    // The first coefficient's predecessor flag follows the block's count.
+    let initial_prev = |count: usize| usize::from(count <= size / 16);
+    let channel_scale = if c == 1 {
+        1.0
+    } else {
+        chroma_rdoq_weight(distance)
+    };
+    let mut remaining_after = (search_end..size).filter(|&k| nonzero_at(block, k)).count();
+    let mut total = remaining_after
+        + (covered_blocks..search_end)
+            .filter(|&k| nonzero_at(block, k))
+            .count();
+    for window_index in (0..window_len).rev() {
+        let k = covered_blocks + window_index;
+        let idx = scan[k] as usize;
+        let current = block[idx];
+        let ideal = source[idx] * inv_qm[idx] * q_scaled;
+        let (candidates, candidate_count) =
+            rdoq_candidates(ideal, current, window_index < restore_len);
+        let original_nz = usize::from(current != 0);
+        // A zero with nothing coded behind it is not coded either.
+        if candidate_count == 1 || (current == 0 && remaining_after == 0) {
+            remaining_after += original_nz;
+            continue;
+        }
+        let distortion_weight = channel_weight
+            * channel_scale
+            * rdoq_distortion_weight(window_index.min(base_window_len), base_window_len, distance);
+        let others = total - original_nz;
+        let prev = if k == covered_blocks {
+            initial_prev(others + 1)
+        } else {
+            usize::from(nonzero_at(block, k - 1))
+        };
+        // Ending the block here codes the zeros back to the previous nonzero.
+        let run_bits = if remaining_after == 0 {
+            let mut start = k;
+            while start > covered_blocks && !nonzero_at(block, start - 1) {
+                start -= 1;
+            }
+            (start..k)
+                .map(|j| {
+                    let prev = if j > start {
+                        0
+                    } else if j > covered_blocks {
+                        1
+                    } else {
+                        initial_prev(others + 1)
+                    };
+                    prices.token_bits(Token::new(context(1, j, prev), 0))
+                })
+                .sum::<f32>()
+        } else {
+            0.0
+        };
+        let mut best = (f32::INFINITY, current);
+        for &level in &candidates[..candidate_count] {
+            let nonzero = usize::from(level != 0);
+            let remaining = remaining_after + nonzero;
+            let rate = if current == 0 && level != 0 {
+                lambda * restore_penalty
+            } else {
+                lambda
+            };
+            let token_bits = if remaining == 0 {
+                0.0
+            } else {
+                prices.token_bits(Token::new(context(remaining, k, prev), pack_signed(level)))
+                    + if nonzero == 1 { run_bits } else { 0.0 }
+            };
+            let count_bits = prices.token_bits(Token::new(nzero_ctx, (others + nonzero) as u32));
+            let cost = distortion_weight * (ideal - bias.level(level)).powi(2)
+                + rate * token_bits
+                + lambda * count_bits;
+            if cost < best.0 {
+                best = (cost, level);
+            }
+        }
+        block[idx] = best.1;
+        let nonzero = usize::from(best.1 != 0);
+        total = others + nonzero;
+        remaining_after += nonzero;
+    }
+}
+
+/// Backward beam over the remaining-nonzero count. The future of a path
+/// depends on nothing else, so paths reaching one count merge exactly; each
+/// keeps its cost for both values of the predecessor flag of its earliest
+/// coefficient, as the trellis rows do, and the `K` cheapest counts survive.
+/// `back` holds one choice per position, path and predecessor flag: the
+/// parent path above the candidate index.
+#[allow(clippy::too_many_arguments)]
+fn rdoq_block_beam<const K: usize>(
+    channel_weight: f32,
+    window_cap: usize,
+    restore_len: usize,
+    prices: &FrozenTokenPrices,
+    scan: &[u32],
+    source: &[f32],
+    inv_qm: &[f32],
+    q_scaled: f32,
+    block: &mut [i32],
+    strategy_code: u8,
+    c: usize,
+    bias: DequantBias,
+    predicted: u8,
+    cx: usize,
+    cy: usize,
+    distance: f32,
+    qf_hi: bool,
+    lambda: f32,
+    restore_penalty: f32,
+    back: &mut [u8; RDOQ_MAX_CHOICES],
+) {
+    const { assert!(K <= 8) };
+    let covered_blocks = cx * cy;
+    let size = block.len();
+    let available = size
+        .checked_sub(covered_blocks)
+        .expect("LLF positions fit in the block");
+    let window_len = window_cap.min(available);
+    assert!(
+        window_len <= back.len() / (2 * K),
+        "RDOQ window exceeds choice storage"
+    );
+    let search_end = covered_blocks + window_len;
+    let base_window_len = (24 * covered_blocks).min(64).min(available);
+    let block_ctx = fine_block_context(c, strategy_code, qf_hi);
+    let histo_offset = fine_zero_density_contexts_offset(block_ctx);
+    let log2_covered_blocks = covered_blocks.trailing_zeros() as usize;
+    let context = |remaining: usize, k: usize, prev: usize| -> u32 {
+        histo_offset
+            + if covered_blocks == 1 {
+                zero_density_context_8x8(remaining, k, prev) as u32
+            } else {
+                zero_density_context(remaining, k, covered_blocks, log2_covered_blocks, prev) as u32
+            }
+    };
+    let channel_scale = if c == 1 {
+        1.0
+    } else {
+        chroma_rdoq_weight(distance)
+    };
+
+    // The fixed suffix, priced for both predecessor flags as in the trellis.
+    let suffix_nzeros = (search_end..size)
+        .filter(|&k| block[scan[k] as usize] != 0)
+        .count();
+    let mut suffix_cost = [0.0f32; 2];
+    for (initial_prev, target) in suffix_cost.iter_mut().enumerate() {
+        let mut remaining = suffix_nzeros;
+        let mut prev = initial_prev;
+        let mut k = search_end;
+        while k < size && remaining != 0 {
+            let coef = block[scan[k] as usize];
+            *target += lambda
+                * prices.token_bits(Token::new(context(remaining, k, prev), pack_signed(coef)));
+            prev = usize::from(coef != 0);
+            remaining -= usize::from(coef != 0);
+            k += 1;
+        }
+    }
+
+    let mut path_remaining = [0usize; K];
+    let mut path_cost = [[f32::INFINITY; 2]; K];
+    path_remaining[0] = suffix_nzeros;
+    path_cost[0] = suffix_cost;
+    let mut paths = 1;
+    for window_index in (0..window_len).rev() {
+        let k = covered_blocks + window_index;
+        let idx = scan[k] as usize;
+        let current = block[idx];
+        let ideal = source[idx] * inv_qm[idx] * q_scaled;
+        let (candidates, candidate_count) =
+            rdoq_candidates(ideal, current, window_index < restore_len);
+        let distortion_weight = channel_weight
+            * channel_scale
+            * rdoq_distortion_weight(window_index.min(base_window_len), base_window_len, distance);
+        if candidate_count == 1 {
+            // Every path extends by the same level: counts stay distinct and
+            // no path is dropped.
+            let level = candidates[0];
+            let nonzero = usize::from(level != 0);
+            let rate = if current == 0 && level != 0 {
+                lambda * restore_penalty
+            } else {
+                lambda
+            };
+            let distortion = distortion_weight * (ideal - bias.level(level)).powi(2);
+            for (path, (remaining, cost)) in path_remaining[..paths]
+                .iter_mut()
+                .zip(&mut path_cost)
+                .enumerate()
+            {
+                let tail = cost[nonzero];
+                *remaining += nonzero;
+                let token_cost = if *remaining == 0 {
+                    [0.0; 2]
+                } else {
+                    prices
+                        .token_bits_pair(context(*remaining, k, 0), pack_signed(level))
+                        .map(|bits| rate * bits)
+                };
+                *cost = token_cost.map(|token| distortion + token + tail);
+                let row = (window_index * K + path) * 2;
+                back[row..row + 2].fill((path as u8) << 4);
+            }
+            continue;
+        }
+        let mut distortions = [0.0f32; 5];
+        let mut rates = [lambda; 5];
+        for ((distortion, rate), &level) in distortions
+            .iter_mut()
+            .zip(&mut rates)
+            .zip(&candidates[..candidate_count])
+        {
+            *distortion = distortion_weight * (ideal - bias.level(level)).powi(2);
+            if current == 0 && level != 0 {
+                *rate = lambda * restore_penalty;
+            }
+        }
+        // A path's count plus one candidate's nonzero: at most 2K counts.
+        let mut count_of = [0usize; 16];
+        let mut cost_of = [[f32::INFINITY; 2]; 16];
+        let mut choice_of = [[0u8; 2]; 16];
+        let mut counts = 0;
+        let mut slot_of =
+            |remaining: usize| match count_of[..counts].iter().position(|&r| r == remaining) {
+                Some(slot) => slot,
+                None => {
+                    count_of[counts] = remaining;
+                    counts += 1;
+                    counts - 1
+                }
+            };
+        for (path, (&remaining_after, tail_pair)) in
+            path_remaining[..paths].iter().zip(&path_cost).enumerate()
+        {
+            // The destinations of a zero and of a nonzero level.
+            let slots = [slot_of(remaining_after), slot_of(remaining_after + 1)];
+            for (candidate, &level) in candidates[..candidate_count].iter().enumerate() {
+                let nonzero = usize::from(level != 0);
+                // This coefficient is the predecessor of the path's earliest one.
+                let tail = tail_pair[nonzero];
+                if !tail.is_finite() {
+                    continue;
+                }
+                let remaining = remaining_after + nonzero;
+                let token_cost = if remaining == 0 {
+                    [0.0; 2]
+                } else {
+                    prices
+                        .token_bits_pair(context(remaining, k, 0), pack_signed(level))
+                        .map(|bits| rates[candidate] * bits)
+                };
+                let slot = slots[nonzero];
+                for prev in 0..2 {
+                    let cost = distortions[candidate] + token_cost[prev] + tail;
+                    if cost < cost_of[slot][prev] {
+                        cost_of[slot][prev] = cost;
+                        choice_of[slot][prev] = ((path as u8) << 4) | candidate as u8;
+                    }
+                }
+            }
+        }
+        // Keep the K cheapest counts; ties keep the order the counts
+        // appeared in. With room for all of them there is nothing to rank.
+        let mut order = [0usize; 16];
+        for (i, slot) in order[..counts].iter_mut().enumerate() {
+            *slot = i;
+        }
+        if counts > K {
+            let key = |slot: usize| cost_of[slot][0].min(cost_of[slot][1]);
+            order[..counts].sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+        }
+        paths = counts.min(K);
+        for (path, &slot) in order[..paths].iter().enumerate() {
+            path_remaining[path] = count_of[slot];
+            path_cost[path] = cost_of[slot];
+            let row = (window_index * K + path) * 2;
+            back[row..row + 2].copy_from_slice(&choice_of[slot]);
+        }
+    }
+
+    let initial_prev = |remaining: usize| usize::from(remaining <= size / 16);
+    let nzero_ctx = fine_non_zero_context(predicted as u32, block_ctx);
+    let mut best = (f32::INFINITY, usize::MAX);
+    for (path, (&remaining, cost)) in path_remaining[..paths].iter().zip(&path_cost).enumerate() {
+        let tail = cost[initial_prev(remaining)];
+        if !tail.is_finite() {
+            continue;
+        }
+        let cost = tail + lambda * prices.token_bits(Token::new(nzero_ctx, remaining as u32));
+        if cost < best.0 {
+            best = (cost, path);
+        }
+    }
+    if best.1 == usize::MAX {
+        return;
+    }
+    let mut path = best.1;
+    let mut prev = initial_prev(path_remaining[path]);
+    for window_index in 0..window_len {
+        let k = covered_blocks + window_index;
+        let idx = scan[k] as usize;
+        let ideal = source[idx] * inv_qm[idx] * q_scaled;
+        let (candidates, candidate_count) =
+            rdoq_candidates(ideal, block[idx], window_index < restore_len);
+        let choice = back[(window_index * K + path) * 2 + prev];
+        let candidate = usize::from(choice & 15);
+        debug_assert!(candidate < candidate_count);
+        let level = candidates[candidate];
+        block[idx] = level;
+        prev = usize::from(level != 0);
+        path = usize::from(choice >> 4);
     }
 }
 
@@ -480,13 +922,19 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
             };
             let mut cached_context = u32::MAX;
             let mut local_cost = [0.0; 2];
-            current_cost[..(current_max - current_min + 1) * 2].fill(f32::INFINITY);
+            // SAFETY: the destination interval spans at most 14 pairs, so
+            // this prefix of the BAND_STRIDE-float row is in bounds.
+            unsafe { current_cost.get_unchecked_mut(..(current_max - current_min + 1) * 2) }
+                .fill(f32::INFINITY);
             for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
                 let remaining = next_remaining + nonzero;
                 if remaining > max_nzeros {
                     continue;
                 }
-                let tail = next[(next_remaining - next_min) * 2 + nonzero];
+                // SAFETY: next_remaining lies in [next_min, next_max], whose
+                // pair offset the row invariant bounds by 13.
+                let tail =
+                    unsafe { *next.get_unchecked((next_remaining - next_min) * 2 + nonzero) };
                 if !tail.is_finite() {
                     continue;
                 }
@@ -510,9 +958,16 @@ fn rdoq_block_banded<const FACTORED: bool, const SINGLE_BLOCK: bool>(
                     // A NaN or +infinity cannot beat the initial +infinity.
                     // Keep that comparison even though there is only one edge.
                     if cost < f32::INFINITY {
-                        current_cost[state + prev] = cost;
-                        if cost.is_finite() {
-                            choices[window_index * stride + state + prev] = 0;
+                        // SAFETY: remaining lies in [current_min, current_max]
+                        // (it is at least next_remaining >= min_remaining and
+                        // skipped above max_nzeros), so state + prev < BAND_STRIDE;
+                        // the capacity assert bounds the choice row as below.
+                        unsafe {
+                            *current_cost.get_unchecked_mut(state + prev) = cost;
+                            if cost.is_finite() {
+                                *choices.get_unchecked_mut(window_index * stride + state + prev) =
+                                    0;
+                            }
                         }
                     }
                 }
@@ -1055,6 +1510,7 @@ mod tests {
                     case % 2 == 0,
                     super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
+                    super::RdoqSearch::Trellis,
                     choices,
                     costs,
                 );

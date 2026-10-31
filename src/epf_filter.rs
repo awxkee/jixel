@@ -627,8 +627,12 @@ pub(crate) fn fit(
     distance: f32,
     baseline: Choice,
 ) -> Choice {
-    let reference =
-        crate::epf_proxy::LumaProxy::new(source_y.as_slice(), source_y.xsize(), source_y.ysize());
+    let reference = crate::epf_proxy::LumaProxy::new(
+        source_y.as_slice(),
+        source_y.xsize(),
+        source_y.ysize(),
+        &ctx.thread_pool,
+    );
     let mut work = crate::epf_proxy::Scratch::default();
     let make = |choice: Choice| {
         LoopFilter::new(

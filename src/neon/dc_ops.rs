@@ -403,3 +403,100 @@ pub(crate) fn reconstruct_dc_neon(
         rb[i..].copy_from_slice(&ob[..tail]);
     }
 }
+
+#[target_feature(enable = "neon")]
+fn search_fmla(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
+    vfmaq_f32(c, a, b)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_error_row_neon(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    multiplier: f32,
+    out: &mut [f32],
+) {
+    assert!(src.len() >= out.len() && luma.len() >= out.len() && levels.len() >= out.len());
+    let end = out.len() / 4 * 4;
+    for x in (0..end).step_by(4) {
+        let y: [f32; 4] = std::array::from_fn(|i| -(luma[x + i] as f32));
+        let q: [f32; 4] = std::array::from_fn(|i| levels[x + i] as f32);
+        unsafe {
+            let error = vsubq_f32(
+                search_fmla(
+                    vld1q_f32(src.as_ptr().add(x)),
+                    vdupq_n_f32(scale),
+                    vmulq_f32(vld1q_f32(y.as_ptr()), vdupq_n_f32(factor)),
+                ),
+                vld1q_f32(q.as_ptr()),
+            );
+            vst1q_f32(
+                out.as_mut_ptr().add(x),
+                vmulq_f32(error, vdupq_n_f32(multiplier)),
+            );
+        }
+    }
+    crate::dc_ops::dc_error_row_scalar(
+        &src[end..],
+        &luma[end..],
+        &levels[end..],
+        scale,
+        factor,
+        multiplier,
+        &mut out[end..],
+    );
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_distortion_row_neon(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    mut sum: f64,
+) -> f64 {
+    assert_eq!(src.len(), luma.len());
+    assert_eq!(src.len(), levels.len());
+    // Only the independent error terms are vectorized. Carry the f64
+    // sum through every row in its original coefficient order.
+    let mut errors = [0.0; 32];
+    for start in (0..src.len()).step_by(errors.len()) {
+        let end = (start + errors.len()).min(src.len());
+        let errors = &mut errors[..end - start];
+        dc_error_row_neon(
+            &src[start..end],
+            &luma[start..end],
+            &levels[start..end],
+            scale,
+            factor,
+            1.0,
+            errors,
+        );
+        for &error in errors.iter() {
+            sum += f64::from(error).powi(2);
+        }
+    }
+    sum
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn add_scaled_neon(out: &mut [f32], src: &[f32], factor: f32) {
+    assert!(src.len() >= out.len());
+    let end = out.len() / 4 * 4;
+    for x in (0..end).step_by(4) {
+        unsafe {
+            vst1q_f32(
+                out.as_mut_ptr().add(x),
+                vaddq_f32(
+                    vld1q_f32(out.as_ptr().add(x)),
+                    vmulq_f32(vdupq_n_f32(factor), vld1q_f32(src.as_ptr().add(x))),
+                ),
+            );
+        }
+    }
+    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
+}

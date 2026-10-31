@@ -185,6 +185,106 @@ pub(crate) fn selected_dc_row_kernels() -> DcRowKernels {
     *KERNELS.get_or_init(select_dc_row_kernels)
 }
 
+pub(crate) type DcErrorRowFn = fn(&[f32], &[i16], &[i16], f32, f32, f32, &mut [f32]);
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_dc_error_row_fn() -> DcErrorRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c, d, e, f, g| unsafe { crate::avx::dc_error_row_avx2(a, b, c, d, e, f, g) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c, d, e, f, g| unsafe {
+            crate::sse::dc_error_row_sse41(a, b, c, d, e, f, g)
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c, d, e, f, g| unsafe { crate::neon::dc_error_row_neon(a, b, c, d, e, f, g) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::dc_error_row_wasm;
+    dc_error_row_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn dc_error_row_scalar(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    multiplier: f32,
+    out: &mut [f32],
+) {
+    for i in 0..out.len() {
+        out[i] = (crate::dct::fmla(src[i], scale, -(luma[i] as f32) * factor)
+            - f32::from(levels[i]))
+            * multiplier;
+    }
+}
+
+pub(crate) type DcDistortionRowFn = fn(&[f32], &[i16], &[i16], f32, f32, f64) -> f64;
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_dc_distortion_row_fn() -> DcDistortionRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c, d, e, f| unsafe { crate::avx::dc_distortion_row_avx2(a, b, c, d, e, f) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c, d, e, f| unsafe { crate::sse::dc_distortion_row_sse41(a, b, c, d, e, f) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c, d, e, f| unsafe { crate::neon::dc_distortion_row_neon(a, b, c, d, e, f) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::dc_distortion_row_wasm;
+    dc_distortion_row_scalar
+}
+
+// Keep the f64 reduction in coefficient order for bit-exact search decisions.
+#[allow(dead_code)]
+pub(crate) fn dc_distortion_row_scalar(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    mut sum: f64,
+) -> f64 {
+    for ((&src, &luma), &level) in src.iter().zip(luma).zip(levels) {
+        let target = crate::dct::fmla(src, scale, -(luma as f32) * factor);
+        sum += f64::from(target - f32::from(level)).powi(2);
+    }
+    sum
+}
+
+pub(crate) type AddScaledFn = fn(&mut [f32], &[f32], f32);
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_add_scaled_fn() -> AddScaledFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c| unsafe { crate::avx::add_scaled_avx2(a, b, c) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c| unsafe { crate::sse::add_scaled_sse41(a, b, c) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c| unsafe { crate::neon::add_scaled_neon(a, b, c) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::add_scaled_wasm;
+    add_scaled_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn add_scaled_scalar(out: &mut [f32], src: &[f32], factor: f32) {
+    for (out, &src) in out.iter_mut().zip(src) {
+        *out += factor * src;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +540,114 @@ mod tests {
                 }
                 times.sort_by(f64::total_cmp);
                 eprintln!("{name} {operation}, {n} DCs: {:.1} ns/row", times[2]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_row_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct Rows {
+        dc_error: DcErrorRowFn,
+        dc_distortion: DcDistortionRowFn,
+        add_scaled: AddScaledFn,
+    }
+
+    fn backends() -> Vec<Rows> {
+        #[allow(unused_mut)]
+        let mut rows = vec![Rows {
+            dc_error: dc_error_row_scalar,
+            dc_distortion: dc_distortion_row_scalar,
+            add_scaled: add_scaled_scalar,
+        }];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            rows.push(Rows {
+                dc_error: |a, b, c, d, e, f, g| unsafe {
+                    crate::avx::dc_error_row_avx2(a, b, c, d, e, f, g)
+                },
+                dc_distortion: |a, b, c, d, e, f| unsafe {
+                    crate::avx::dc_distortion_row_avx2(a, b, c, d, e, f)
+                },
+                add_scaled: |a, b, c| unsafe { crate::avx::add_scaled_avx2(a, b, c) },
+            });
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            rows.push(Rows {
+                dc_error: |a, b, c, d, e, f, g| unsafe {
+                    crate::sse::dc_error_row_sse41(a, b, c, d, e, f, g)
+                },
+                dc_distortion: |a, b, c, d, e, f| unsafe {
+                    crate::sse::dc_distortion_row_sse41(a, b, c, d, e, f)
+                },
+                add_scaled: |a, b, c| unsafe { crate::sse::add_scaled_sse41(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            rows.push(Rows {
+                dc_error: |a, b, c, d, e, f, g| unsafe {
+                    crate::neon::dc_error_row_neon(a, b, c, d, e, f, g)
+                },
+                dc_distortion: |a, b, c, d, e, f| unsafe {
+                    crate::neon::dc_distortion_row_neon(a, b, c, d, e, f)
+                },
+                add_scaled: |a, b, c| unsafe { crate::neon::add_scaled_neon(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        {
+            rows.push(Rows {
+                dc_error: crate::wasm::dc_error_row_wasm,
+                dc_distortion: crate::wasm::dc_distortion_row_wasm,
+                add_scaled: crate::wasm::add_scaled_wasm,
+            });
+        }
+        rows.push(Rows {
+            dc_error: selected_dc_error_row_fn(),
+            dc_distortion: selected_dc_distortion_row_fn(),
+            add_scaled: selected_add_scaled_fn(),
+        });
+        rows
+    }
+
+    #[test]
+    fn dc_error_and_blur_keep_float_bits() {
+        for len in 0..133 {
+            let src: Vec<_> = (0..len).map(|i| (i as f32 - 37.125) / 31.0).collect();
+            let y: Vec<_> = (0..len).map(|i| (i as i16).wrapping_mul(1729)).collect();
+            let q: Vec<_> = (0..len).map(|i| (i as i16).wrapping_mul(-327)).collect();
+            for (scale, factor, m) in [(0.73, 0.0125, 0.98), (1.0, -0.0, 1.0), (-0.01, 3.25, 0.53)]
+            {
+                let mut expected = vec![0.; len];
+                dc_error_row_scalar(&src, &y, &q, scale, factor, m, &mut expected);
+                for backend in backends() {
+                    let mut actual = vec![0.; len];
+                    for initial in [0.0f64, 0.3333333333333333] {
+                        assert_eq!(
+                            (backend.dc_distortion)(&src, &y, &q, scale, factor, initial).to_bits(),
+                            dc_distortion_row_scalar(&src, &y, &q, scale, factor, initial)
+                                .to_bits()
+                        );
+                    }
+                    (backend.dc_error)(&src, &y, &q, scale, factor, m, &mut actual);
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                    let mut a = actual.clone();
+                    let mut e = actual;
+                    add_scaled_scalar(&mut e, &src, scale);
+                    (backend.add_scaled)(&mut a, &src, scale);
+                    assert_eq!(
+                        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        e.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    );
+                }
             }
         }
     }

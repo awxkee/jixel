@@ -356,6 +356,8 @@ pub(super) fn prepare_dc_entropy(
     drop(meta_props_per_group);
     let ans_refinement = if effort.ans_refine {
         Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
+    } else if effort.ans_fast_refine && !effort.ans_prefix_race {
+        Some(crate::entropy::AnsRefinement::FastNoRace)
     } else if effort.ans_fast_refine {
         Some(crate::entropy::AnsRefinement::Fast {
             recluster: (distance >= 3.0 && effort.ans_recluster_coarse) || effort.ans_recluster,

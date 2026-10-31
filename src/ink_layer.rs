@@ -31,12 +31,13 @@
 //! statistics select the colors before encoding, and the union is inpainted
 //! once so the encoder writes one VarDCT base and one modular ink frame.
 
+use crate::thread_pool::ThreadPool;
 use crate::util::round_i32;
 
 /// Distance to the opposite background samples that define a thin ridge.
-const FEATURE_RADIUS: usize = 5;
+pub(crate) const FEATURE_RADIUS: usize = 5;
 /// Minimum luma/chroma separation from the opposite background samples.
-const THIN_DEV: i32 = 24;
+pub(crate) const THIN_DEV: i32 = 24;
 /// Max per-channel distance from the ink color for a pixel to join a stroke;
 /// lighter antialiasing pixels become partial coverage instead.
 const COLOR_TOL: i32 = 20;
@@ -115,18 +116,20 @@ pub(crate) struct InkCandidates<'a> {
 }
 
 impl<'a> InkCandidates<'a> {
+    /// Scan ridge row bands on the shared pool.
     pub(crate) fn new_fast(
         rgb: &'a [u8],
         alpha: Option<&'a [u8]>,
         width: usize,
         height: usize,
+        pool: &ThreadPool,
     ) -> Option<Self> {
         let n = width * height;
         if n < 64 * 64 {
             return None;
         }
         let rgb = rgb.as_chunks::<3>().0;
-        let (mut thin, mut thin_count) = thin_ridges(rgb, width, height);
+        let (mut thin, mut thin_count) = thin_ridges(rgb, width, height, pool);
         if let Some(alpha) = alpha {
             for (s, &a) in thin.iter_mut().zip(alpha) {
                 if a != 255 {
@@ -697,52 +700,34 @@ fn neighborhood<T>(
 
 /// Opposite samples detect thin luma ridges in linear time. At a clipped
 /// edge use the available background sample on both sides.
-fn thin_ridges(rgb: &[[u8; 3]], width: usize, height: usize) -> (Vec<u8>, usize) {
-    let luma: Vec<u8> = rgb
-        .iter()
-        .map(|&[r, g, b]| ((77 * r as u32 + 150 * g as u32 + 29 * b as u32 + 128) >> 8) as u8)
-        .collect();
+fn thin_ridges(
+    rgb: &[[u8; 3]],
+    width: usize,
+    height: usize,
+    pool: &ThreadPool,
+) -> (Vec<u8>, usize) {
+    let luma_row = selected_luma_row_fn();
+    let ridges = selected_ridge_row_fn();
+    let mut luma = vec![0; rgb.len()];
+    luma_row(rgb, &mut luma);
     let mut thin = vec![0; rgb.len()];
-    let mut count = 0;
-    let r = FEATURE_RADIUS;
-    let ridge = |p: u8, a: u8, b: u8| {
-        let da = p as i32 - a as i32;
-        let db = p as i32 - b as i32;
-        (da > THIN_DEV && db > THIN_DEV) || (da < -THIN_DEV && db < -THIN_DEV)
-    };
-    let chroma = |p: &[u8; 3], a: &[u8; 3]| {
-        let dg = p[1] as i32 - a[1] as i32;
-        (p[0] as i32 - a[0] as i32 - dg)
-            .abs()
-            .max((p[2] as i32 - a[2] as i32 - dg).abs())
-    };
-    let color_ridge = |p: &[u8; 3], a: &[u8; 3], b: &[u8; 3]| {
-        chroma(p, a) > THIN_DEV
-            && chroma(p, b) > THIN_DEV
-            && (0..3).all(|c| a[c].abs_diff(b[c]) < 16)
-    };
-    for (y, row) in thin.chunks_exact_mut(width).enumerate() {
-        let above = y.saturating_sub(r);
-        let below = (y + r).min(height - 1);
-        // Growth reaches unsampled neighbors. Alternating the parity per row
-        // retains seeds on every horizontal or vertical one-pixel stroke.
-        for x in (y & 1..width).step_by(2) {
-            let left = x.saturating_sub(r);
-            let right = (x + r).min(width - 1);
-            let a = y * width + if x < r { right } else { left };
-            let b = y * width + if x + r >= width { left } else { right };
-            let c = (if y < r { below } else { above }) * width + x;
-            let d = (if y + r >= height { above } else { below }) * width + x;
-            let i = y * width + x;
-            row[x] = u8::from(
-                ridge(luma[i], luma[a], luma[b])
-                    || ridge(luma[i], luma[c], luma[d])
-                    || color_ridge(&rgb[i], &rgb[a], &rgb[b])
-                    || color_ridge(&rgb[i], &rgb[c], &rgb[d]),
-            );
-            count += row[x] as usize;
+    let ridge_row = |y: usize, row: &mut [u8]| ridges(rgb, &luma, width, height, y, row);
+    let band = |y_begin: usize, rows: &mut [u8]| {
+        let mut count = 0;
+        for (dy, row) in rows.chunks_exact_mut(width).enumerate() {
+            count += ridge_row(y_begin + dy, row);
         }
-    }
+        count
+    };
+    let rows_per_band = height.div_ceil(pool.num_threads());
+    let mut bands: Vec<_> = thin
+        .chunks_mut(rows_per_band * width)
+        .map(|rows| (rows, 0))
+        .collect();
+    pool.for_each_mut(&mut bands, |i, (rows, count)| {
+        *count = band(i * rows_per_band, rows);
+    });
+    let count = bands.into_iter().map(|(_, count)| count).sum();
     (thin, count)
 }
 
@@ -936,6 +921,104 @@ fn fill_dont_care_with_iters(
     }
 }
 
+pub(crate) fn ridge_positions(x: usize, y: usize, w: usize, h: usize) -> [usize; 5] {
+    const R: usize = crate::ink_layer::FEATURE_RADIUS;
+    let left = x.saturating_sub(R);
+    let right = (x + R).min(w - 1);
+    let above = y.saturating_sub(R);
+    let below = (y + R).min(h - 1);
+    [
+        y * w + x,
+        y * w + if x < R { right } else { left },
+        y * w + if x + R >= w { left } else { right },
+        (if y < R { below } else { above }) * w + x,
+        (if y + R >= h { above } else { below }) * w + x,
+    ]
+}
+
+pub(crate) fn ridge_pixel(rgb: &[[u8; 3]], luma: &[u8], positions: [usize; 5]) -> u8 {
+    let [p, a, b, c, d] = positions;
+    let ridge = |a, b| {
+        let da = luma[p] as i32 - luma[a] as i32;
+        let db = luma[p] as i32 - luma[b] as i32;
+        (da > THIN_DEV && db > THIN_DEV) || (da < -THIN_DEV && db < -THIN_DEV)
+    };
+    let chroma = |a: usize| {
+        let dg = rgb[p][1] as i32 - rgb[a][1] as i32;
+        (rgb[p][0] as i32 - rgb[a][0] as i32 - dg)
+            .abs()
+            .max((rgb[p][2] as i32 - rgb[a][2] as i32 - dg).abs())
+    };
+    let color = |a, b| {
+        chroma(a) > THIN_DEV
+            && chroma(b) > THIN_DEV
+            && (0..3).all(|c| rgb[a][c].abs_diff(rgb[b][c]) < 16)
+    };
+    u8::from(ridge(a, b) || ridge(c, d) || color(a, b) || color(c, d))
+}
+
+pub(crate) type LumaRowFn = fn(&[[u8; 3]], &mut [u8]);
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_luma_row_fn() -> LumaRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b| unsafe { crate::avx::luma_row_avx2(a, b) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b| unsafe { crate::sse::luma_row_sse41(a, b) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b| unsafe { crate::neon::luma_row_neon(a, b) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::luma_row_wasm;
+    luma_row_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn luma_row_scalar(rgb: &[[u8; 3]], out: &mut [u8]) {
+    for (&[r, g, b], out) in rgb.iter().zip(out) {
+        *out = ((77 * r as u32 + 150 * g as u32 + 29 * b as u32 + 128) >> 8) as u8;
+    }
+}
+
+pub(crate) type RidgeRowFn = fn(&[[u8; 3]], &[u8], usize, usize, usize, &mut [u8]) -> usize;
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_ridge_row_fn() -> RidgeRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c, d, e, f| unsafe { crate::avx::ridge_row_avx2(a, b, c, d, e, f) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c, d, e, f| unsafe { crate::sse::ridge_row_sse41(a, b, c, d, e, f) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c, d, e, f| unsafe { crate::neon::ridge_row_neon(a, b, c, d, e, f) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::ridge_row_wasm;
+    ridge_row_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn ridge_row_scalar(
+    rgb: &[[u8; 3]],
+    luma: &[u8],
+    w: usize,
+    h: usize,
+    y: usize,
+    out: &mut [u8],
+) -> usize {
+    let mut count = 0;
+    for x in (y & 1..w).step_by(2) {
+        out[x] = ridge_pixel(rgb, luma, ridge_positions(x, y, w, h));
+        count += usize::from(out[x]);
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,7 +1045,7 @@ mod tests {
         for (x, y, value) in [(0, 12, 0), (1, 24, 64), (77, 36, 128), (159, 48, 254)] {
             alpha[y * width + x] = value;
         }
-        let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height)
+        let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height, &ThreadPool::new(1))
             .unwrap()
             .select(1.5)
             .unwrap();
@@ -995,7 +1078,7 @@ mod tests {
                 })
             })
             .collect();
-        let plan = InkCandidates::new_fast(&rgb, None, width, height)
+        let plan = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
             .unwrap()
             .select(1.5)
             .unwrap();
@@ -1011,8 +1094,14 @@ mod tests {
     fn fast_analysis_rejects_flat_and_nonopaque_sources_and_handles_narrow_images() {
         for (width, height) in [(1, 4096), (2, 2048), (8, 512), (64, 64)] {
             assert!(
-                InkCandidates::new_fast(&vec![200; width * height * 3], None, width, height)
-                    .is_none()
+                InkCandidates::new_fast(
+                    &vec![200; width * height * 3],
+                    None,
+                    width,
+                    height,
+                    &ThreadPool::new(1)
+                )
+                .is_none()
             );
         }
         let (width, height) = (128, 64);
@@ -1020,8 +1109,14 @@ mod tests {
             .flat_map(|i| [if i % width < 3 { 0 } else { 220 }; 3])
             .collect();
         assert!(
-            InkCandidates::new_fast(&rgb, Some(&vec![127; width * height]), width, height)
-                .is_none()
+            InkCandidates::new_fast(
+                &rgb,
+                Some(&vec![127; width * height]),
+                width,
+                height,
+                &ThreadPool::new(1)
+            )
+            .is_none()
         );
     }
 
@@ -1164,11 +1259,11 @@ mod tests {
                 })
             })
             .collect();
-        let a = InkCandidates::new_fast(&rgb, None, width, height)
+        let a = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
             .unwrap()
             .select(1.5)
             .unwrap();
-        let b = InkCandidates::new_fast(&rgb, None, width, height)
+        let b = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(4))
             .unwrap()
             .select(1.5)
             .unwrap();
@@ -1212,7 +1307,8 @@ mod tests {
                 })
             })
             .collect();
-        let candidates = InkCandidates::new_fast(&rgb, None, width, height).unwrap();
+        let candidates =
+            InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1)).unwrap();
         let found: Vec<_> = candidates.plans.map(|p| p.color).collect();
         for color in colors {
             assert!(found.contains(&color), "missing {color:?}");
@@ -1232,7 +1328,7 @@ mod tests {
         for (x, y, a) in excluded {
             alpha[y * width + x] = a;
         }
-        let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height)
+        let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height, &ThreadPool::new(1))
             .unwrap()
             .select(1.5)
             .unwrap();
@@ -1245,17 +1341,118 @@ mod tests {
 
     #[test]
     fn split_rejects_small_images_flat_images_and_specks() {
-        assert!(InkCandidates::new_fast(&vec![200; 32 * 32 * 3], None, 32, 32).is_none());
-        assert!(InkCandidates::new_fast(&vec![200; 64 * 64 * 3], None, 64, 64).is_none());
+        assert!(
+            InkCandidates::new_fast(&vec![200; 32 * 32 * 3], None, 32, 32, &ThreadPool::new(1))
+                .is_none()
+        );
+        assert!(
+            InkCandidates::new_fast(&vec![200; 64 * 64 * 3], None, 64, 64, &ThreadPool::new(1))
+                .is_none()
+        );
         let rgb: Vec<u8> = (0..64)
             .flat_map(|y| {
                 (0..64).flat_map(move |x| [if x % 8 == 0 && y % 8 == 0 { 0 } else { 200 }; 3])
             })
             .collect();
         assert!(
-            InkCandidates::new_fast(&rgb, None, 64, 64)
+            InkCandidates::new_fast(&rgb, None, 64, 64, &ThreadPool::new(1))
                 .and_then(|c| c.select(1.5))
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod search_row_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct Rows {
+        luma: LumaRowFn,
+        ridges: RidgeRowFn,
+    }
+
+    fn backends() -> Vec<Rows> {
+        #[allow(unused_mut)]
+        let mut rows = vec![Rows {
+            luma: luma_row_scalar,
+            ridges: ridge_row_scalar,
+        }];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            rows.push(Rows {
+                luma: |a, b| unsafe { crate::avx::luma_row_avx2(a, b) },
+                ridges: |a, b, c, d, e, f| unsafe { crate::avx::ridge_row_avx2(a, b, c, d, e, f) },
+            });
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            rows.push(Rows {
+                luma: |a, b| unsafe { crate::sse::luma_row_sse41(a, b) },
+                ridges: |a, b, c, d, e, f| unsafe { crate::sse::ridge_row_sse41(a, b, c, d, e, f) },
+            });
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            rows.push(Rows {
+                luma: |a, b| unsafe { crate::neon::luma_row_neon(a, b) },
+                ridges: |a, b, c, d, e, f| unsafe { crate::neon::ridge_row_neon(a, b, c, d, e, f) },
+            });
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        {
+            rows.push(Rows {
+                luma: crate::wasm::luma_row_wasm,
+                ridges: crate::wasm::ridge_row_wasm,
+            });
+        }
+        rows.push(Rows {
+            luma: selected_luma_row_fn(),
+            ridges: selected_ridge_row_fn(),
+        });
+        rows
+    }
+
+    #[test]
+    fn luma_and_clipped_ridges_match_scalar() {
+        for w in 1..35 {
+            for h in [1, 2, 5, 11, 19] {
+                for pattern in 0..4 {
+                    let rgb: Vec<[u8; 3]> = (0..w * h)
+                        .map(|i| {
+                            std::array::from_fn(|c| match pattern {
+                                0 => 127,
+                                1 => {
+                                    if (i + i / w) % 7 == 0 {
+                                        [255, 0, 255][c]
+                                    } else {
+                                        [0, 127, 0][c]
+                                    }
+                                }
+                                _ => ((i * 37 + c * 53 + pattern * 83) % 256) as u8,
+                            })
+                        })
+                        .collect();
+                    let mut expected_luma = vec![0; w * h];
+                    luma_row_scalar(&rgb, &mut expected_luma);
+                    for backend in backends() {
+                        let mut actual_luma = vec![0; w * h];
+                        (backend.luma)(&rgb, &mut actual_luma);
+                        assert_eq!(actual_luma, expected_luma);
+                        for y in 0..h {
+                            let mut expected = vec![0xa5; w];
+                            let count =
+                                ridge_row_scalar(&rgb, &expected_luma, w, h, y, &mut expected);
+                            let mut actual = vec![0xa5; w];
+                            assert_eq!(
+                                (backend.ridges)(&rgb, &expected_luma, w, h, y, &mut actual),
+                                count
+                            );
+                            assert_eq!(actual, expected, "w={w}, h={h}, y={y}, pattern={pattern}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

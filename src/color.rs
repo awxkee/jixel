@@ -364,11 +364,11 @@ fn transform_identity<T: Copy, D: TransferDecoder<T>, const CHANNELS: usize>(
     src: &[[T; CHANNELS]],
     output: [&mut [f32]; 3],
 ) {
-    let [r, g, b] = output;
-    for (i, &pixel) in src.iter().enumerate() {
-        r[i] = decoder.decode(pixel[0]);
-        g[i] = decoder.decode(pixel[1]);
-        b[i] = decoder.decode(pixel[2]);
+    let [r, g, b] = output.map(|plane| &mut plane[..src.len()]);
+    for (((&pixel, r), g), b) in src.iter().zip(r).zip(g).zip(b) {
+        *r = decoder.decode(pixel[0]);
+        *g = decoder.decode(pixel[1]);
+        *b = decoder.decode(pixel[2]);
     }
 }
 
@@ -379,14 +379,14 @@ fn transform_matrix_scalar<T: Copy, D: TransferDecoder<T>, const CHANNELS: usize
     src: &[[T; CHANNELS]],
     output: [&mut [f32]; 3],
 ) {
-    let [r, g, b] = output;
-    for (i, &pixel) in src.iter().enumerate() {
+    let [r, g, b] = output.map(|plane| &mut plane[..src.len()]);
+    for (((&pixel, r), g), b) in src.iter().zip(r).zip(g).zip(b) {
         let lr = decoder.decode(pixel[0]);
         let lg = decoder.decode(pixel[1]);
         let lb = decoder.decode(pixel[2]);
-        r[i] = matrix[0] * lr + matrix[1] * lg + matrix[2] * lb;
-        g[i] = matrix[3] * lr + matrix[4] * lg + matrix[5] * lb;
-        b[i] = matrix[6] * lr + matrix[7] * lg + matrix[8] * lb;
+        *r = matrix[0] * lr + matrix[1] * lg + matrix[2] * lb;
+        *g = matrix[3] * lr + matrix[4] * lg + matrix[5] * lb;
+        *b = matrix[6] * lr + matrix[7] * lg + matrix[8] * lb;
     }
 }
 

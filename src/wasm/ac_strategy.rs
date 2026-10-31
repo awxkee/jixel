@@ -155,7 +155,7 @@ pub(crate) fn gradient_region_stats_with_chroma_wasm(
 /// bounds-validated against `width*height`.
 #[inline]
 #[target_feature(enable = "simd128")]
-fn wasm_dequantized_level_f32(q: v128, bias: crate::group::DequantBias) -> v128 {
+pub(super) fn wasm_dequantized_level_f32(q: v128, bias: crate::group::DequantBias) -> v128 {
     let absq = f32x4_abs(q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
     let big = f32x4_sub(q, f32x4_div(f32x4_splat(bias.numerator), q));

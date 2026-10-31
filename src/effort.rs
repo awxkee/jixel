@@ -98,6 +98,8 @@ effort_gates! {
     wide_clustering,
     /// Fast ANS cluster refinement of the DC and AC codes.
     ans_fast_refine,
+    /// The refined ANS codes race their prefix-coded twins.
+    ans_prefix_race,
     /// Below `ans_recluster`: recluster at distance >= 3 during the fast refinement.
     ans_recluster_coarse,
     /// Rectangular, sub-8x8 (DCT4/AFV/IDENTITY) and leaf-first transform search.
@@ -129,12 +131,21 @@ effort_gates! {
     /// Coefficient-model DP re-tiling of the merge search's tiles over DCT8,
     /// pairs and 16x16 at any 8-pixel origin; superseded by `layout_retile`.
     layout_dp_coefficient,
+    /// The coefficient-model DP also places pairs and 16x16 squares off the
+    /// 16-pixel grid (otherwise only inside aligned 2x2 quads).
+    layout_dp_unaligned,
     cfl_rdo,
     /// Frame-constant EPF strength and pass count fitted on the final
     /// reconstruction by the luma proxy.
     epf_fit,
     yellow_opsin,
+    /// A refine pass re-quantizes every group on custom coefficient orders
+    /// with RDOQ under the first pass's token prices.
     coeff_orders,
+    /// RDOQ by a beam of backward paths (otherwise one greedy pass).
+    rdoq_beam,
+    /// RDOQ by the count-banded trellis (over `rdoq_beam`).
+    rdoq_trellis,
     ac_ctx_plan,
     ma_dc_tree,
     /// Luma-error-compensated B DC targets and, per chroma channel, a 2x finer
@@ -239,10 +250,17 @@ effort_gates! {
     tree_wide_side_preds,
 }
 
-const ULTRAFAST: Effort = Effort::NONE;
+const ULTRAFAST: Effort = Effort {
+    dc_learned_tree: true,
+    ans_fast_refine: true,
+    ..Effort::NONE
+};
 
 const FASTEST: Effort = Effort {
     square_merges: true,
+    merge_32: true,
+    merge_busy_quads: true,
+    layout_dp_coefficient: true,
     dc_predictor_search: true,
     ac_prefix_clustering: true,
     ..ULTRAFAST
@@ -255,6 +273,7 @@ const FAST: Effort = Effort {
     merge_busy_quads: true,
     quant_refine: true,
     layout_dp_coefficient: true,
+    layout_dp_unaligned: true,
     layout_crossing: true,
     pixel_chromacity_x: true,
     cfl_ycbcr_rdo: true,
@@ -264,10 +283,12 @@ const FAST: Effort = Effort {
     ac_prefix_clustering: true,
     wide_clustering: true,
     ans_fast_refine: true,
+    ans_prefix_race: true,
     ans_recluster_coarse: true,
     rct_search: true,
     local_palette_predictors: true,
     flat_wp_contexts: true,
+    coeff_orders: true,
     ..Effort::NONE
 };
 
@@ -276,9 +297,9 @@ const MEDIUM: Effort = Effort {
     layout_crossing_axes: true,
     cfl_rdo: true,
     yellow_opsin: true,
+    rdoq_beam: true,
     chroma_policy: true,
     fine_mosaic: true,
-    coeff_orders: true,
     dc_rdoq: true,
     chroma_dc_squeeze: true,
     dc_x_cfl: true,

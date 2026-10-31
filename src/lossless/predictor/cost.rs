@@ -42,14 +42,25 @@ use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::{WpNeighbors, WpParams, WpState};
 
+/// Side of the corner crops `wp_sample_cost` scores.
+const WP_SAMPLE_CROP: usize = 128;
+
+/// The coordinates along one axis that `wp_sample_cost` reads, in order: a
+/// packed plane of them holds the same crops.
+fn wp_sample_coords(len: usize) -> impl Iterator<Item = usize> {
+    let crop = len.min(WP_SAMPLE_CROP);
+    let tail = if len > crop { len - crop..len } else { 0..0 };
+    (0..crop).chain(tail)
+}
+
 pub(super) fn wp_sample_cost(
     get: impl Fn(usize, usize) -> i32,
     width: usize,
     height: usize,
     params: WpParams,
 ) -> (u64, usize) {
-    let cw = width.min(128);
-    let ch = height.min(128);
+    let cw = width.min(WP_SAMPLE_CROP);
+    let ch = height.min(WP_SAMPLE_CROP);
     let xs = if width > cw { [0, width - cw] } else { [0, 0] };
     let ys = if height > ch {
         [0, height - ch]
@@ -93,25 +104,73 @@ pub(super) fn wp_sample_cost(
     (cost, count)
 }
 
+/// `ycocg` holds YCoCg planes (or one gray plane) and the color channels are
+/// scored under `rct`: only the sampled corners are transformed.
 pub(in crate::lossless) fn choose_wp_params(
-    linear: &Image3Si,
+    ycocg: &Image3Si,
+    rct: u32,
     alpha: Option<&AlphaPlane>,
     num_color: usize,
     header_count: usize,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> WpParams {
-    let width = linear.xsize();
-    let height = linear.ysize();
+    let width = ycocg.xsize();
+    let height = ycocg.ysize();
     let nb_chans = num_color + usize::from(alpha.is_some());
     let total_values = width.saturating_mul(height).saturating_mul(nb_chans);
+    let packed_width = wp_sample_coords(width).count();
+    let packed_height = wp_sample_coords(height).count();
+    let corners = (num_color == 3 && rct != 6).then(|| {
+        let mut planes = std::array::from_fn(|_| vec![0; packed_width * packed_height]);
+        let [a, b, c] = &mut planes;
+        let [p0, p1, p2] = [0, 1, 2].map(|c| ycocg.plane_data(c));
+        let transform = crate::lossless::selected_rct_row_fn();
+        let crop = width.min(WP_SAMPLE_CROP);
+        let tail = if width > crop {
+            width - crop..width
+        } else {
+            0..0
+        };
+        for (row, y) in wp_sample_coords(height).enumerate() {
+            let mut offset = row * packed_width;
+            for xs in [0..crop, tail.clone()] {
+                let len = xs.len();
+                let start = y * width + xs.start;
+                transform(
+                    [p0, p1, p2].map(|p| &p[start..start + len]),
+                    rct,
+                    [
+                        &mut a[offset..offset + len],
+                        &mut b[offset..offset + len],
+                        &mut c[offset..offset + len],
+                    ],
+                );
+                offset += len;
+            }
+        }
+        planes
+    });
     let scores = pool.steal_map(scratch, WpParams::PRESETS.len(), |preset, _scratch| {
         let params = WpParams::PRESETS[preset];
         let mut sample_cost = 0u64;
         let mut samples = 0usize;
         for channel in 0..num_color {
-            let plane = linear.plane_data(channel);
-            let (cost, count) = wp_sample_cost(|x, y| plane[y * width + x], width, height, params);
+            let (cost, count) = match &corners {
+                Some(planes) => {
+                    let plane = &planes[channel];
+                    wp_sample_cost(
+                        |x, y| plane[y * packed_width + x],
+                        packed_width,
+                        packed_height,
+                        params,
+                    )
+                }
+                None => {
+                    let plane = ycocg.plane_data(channel);
+                    wp_sample_cost(|x, y| plane[y * width + x], width, height, params)
+                }
+            };
             sample_cost += cost;
             samples += count;
         }

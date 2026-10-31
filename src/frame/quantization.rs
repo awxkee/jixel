@@ -94,7 +94,9 @@ pub(super) fn compute_distance_params(distance: f32) -> DistanceParams {
     // quantizer while giving AQ enough integer resolution to vary smoothly.
     const K_QUANT_FIELD_TARGET: f32 = 10.0;
 
-    let qdc = quant_dc(distance);
+    let qdc_fine = quant_dc(distance);
+    let coarsen = luma_dc_coarsening(distance);
+    let qdc = qdc_fine / coarsen;
     let scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * K_QUANT_FIELD_TARGET);
     // AC and DC are signaled independently. Capping the AC scale by qdc made
     // it freeze once quant_dc() reached its high-distance cap, producing a
@@ -139,8 +141,32 @@ pub(super) fn compute_distance_params(distance: f32) -> DistanceParams {
         epf_pass0_scale,
         epf_quant_mul: None,
         gab_enabled,
-        dc_step: chroma_dc_steps(qdc),
+        dc_step: {
+            // Chroma DC steps are relative to the luma step; keep them absolute.
+            let [x, y, b] = chroma_dc_steps(qdc_fine);
+            [x / coarsen, y, b / coarsen]
+        },
     }
+}
+
+/// Luma DC step multiplier: held at its peak on the inner band and tapered
+/// linearly to 1 across the outer edges.
+const LUMA_DC_COARSEN: f32 = 1.15;
+const LUMA_DC_COARSEN_BAND: [f32; 4] = [1.25, 1.75, 4.25, 5.0];
+
+#[inline]
+fn luma_dc_coarsening(distance: f32) -> f32 {
+    let [a, b, c, e] = LUMA_DC_COARSEN_BAND;
+    let t = if distance <= a || distance >= e {
+        0.0
+    } else if distance < b {
+        (distance - a) / (b - a)
+    } else if distance <= c {
+        1.0
+    } else {
+        (e - distance) / (e - c)
+    };
+    fmla(t, LUMA_DC_COARSEN - 1.0, 1.0)
 }
 
 /// Multiplier of the default X DC step. The spec's X DC quantizer is far
@@ -246,9 +272,10 @@ mod tests {
     #[test]
     fn chroma_dc_steps_grow_slower_than_luma_past_the_knee() {
         for d in [0.1, 1.0, 2.0, 3.0, CHROMA_DC_GROWTH_DISTANCE] {
+            let k = luma_dc_coarsening(d);
             assert_eq!(
                 compute_distance_params(d).dc_step,
-                [X_DC_STEP, 1.0, 1.0],
+                [X_DC_STEP / k, 1.0, 1.0 / k],
                 "d={d}"
             );
         }
@@ -294,13 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn luma_dc_coarsening_is_a_continuous_band() {
+        let [a, b, c, e] = LUMA_DC_COARSEN_BAND;
+        for d in [0.1, 1.0, a, e, 6.0, 12.0] {
+            assert_eq!(luma_dc_coarsening(d), 1.0, "d={d}");
+        }
+        for d in [b, 2.0, 3.0, c] {
+            assert_eq!(luma_dc_coarsening(d), LUMA_DC_COARSEN, "d={d}");
+        }
+        let mid = luma_dc_coarsening(0.5 * (a + b));
+        assert!((mid - 0.5 * (1.0 + LUMA_DC_COARSEN)).abs() < 1e-6);
+    }
+
+    #[test]
     fn dc_refinement_makes_dc_finer_where_it_applies() {
         // Refining means a *larger* DC scale (finer quantization step), and it
         // must not disturb the AC quantizer, which is signaled independently.
         for d in [0.5, 1.0, 3.0] {
             let p = compute_distance_params(d);
             assert!(p.scale_dc > 0.0);
-            assert!((p.scale_dc - quant_dc(d)).abs() <= 0.5 * p.scale + f32::EPSILON);
+            let qdc = quant_dc(d) / luma_dc_coarsening(d);
+            assert!((p.scale_dc - qdc).abs() <= 0.5 * p.scale + f32::EPSILON);
         }
         assert!(quant_dc(1.0) > quant_dc(1.0) / DC_REFINE_PEAK);
     }
@@ -383,7 +424,8 @@ mod tests {
         for distance in [0.5, 1.0, 3.5, 4.0, 4.5, 6.0] {
             let params = compute_distance_params(distance);
             let rounding_error = 0.5 * params.scale;
-            assert!((params.scale_dc - quant_dc(distance)).abs() <= rounding_error + f32::EPSILON);
+            let qdc = quant_dc(distance) / luma_dc_coarsening(distance);
+            assert!((params.scale_dc - qdc).abs() <= rounding_error + f32::EPSILON);
         }
     }
 }
