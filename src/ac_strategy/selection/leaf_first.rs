@@ -194,7 +194,7 @@ fn plan_super_block(
         params.distance,
         cmap_factor,
     );
-    let c16 = merge.bias_16x16 * c16_raw;
+    let c16 = merge.bias_16x16 * merge.site_bias(params.opsin, px0, py0, 16) * c16_raw;
 
     // Pairs must beat the two leaves they replace by the pair margin.
     let use_v_left = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
@@ -602,8 +602,14 @@ pub(super) fn select_band_leaf_first(
                     record_upgrade32_candidates(upgrades, ac_strategy, bx, by, raw, children);
                 }
                 let sites = merge32_sites(bx, by);
-                let mut costs = raw.map(|c| merge.bias_rect32 * c);
-                costs[0] = merge.bias_32x32 * cost32;
+                let m32 = merge.site_bias(
+                    params.opsin,
+                    params.dc_group_px + bx * 8,
+                    params.dc_group_py + by * 8,
+                    32,
+                );
+                let mut costs = raw.map(|c| merge.bias_rect32 * m32 * c);
+                costs[0] = merge.bias_32x32 * m32 * cost32;
                 for (k, &(x, y, strategy)) in sites.iter().enumerate() {
                     if !ac_strategy.can_place_strategy(x, y, strategy) {
                         costs[k] = f32::INFINITY;

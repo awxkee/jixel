@@ -28,7 +28,7 @@
  */
 //! Adaptive transform (AC strategy) selection via rate-distortion optimization.
 
-use crate::adaptive_quant::fast_exp2;
+use crate::adaptive_quant::{dirty_log2f, fast_exp2};
 use crate::coder_scratch::{
     AcStrategyBandScratch, CachedQuantCost, CoderScratch, FineMergeRollback, MergeUpgrade,
     MergeUpgradeCandidate, QuantRefinement, RerankDowngrade,
@@ -51,6 +51,10 @@ use crate::inflated_cost::{
 mod matrix_overhead;
 mod rate_prices;
 mod selection;
+mod selection_quantizer;
+
+#[cfg(feature = "extraslow")]
+pub(crate) use selection_quantizer::enabled as content_selection_enabled;
 
 pub(crate) use matrix_overhead::account_matrix_headers;
 pub(crate) use rate_prices::RatePrices;
@@ -217,6 +221,51 @@ pub(crate) struct MergeTuning {
     /// DCT64-family acceptance factors (see [`ACCEPT_64`]/[`ACCEPT_64_RECT`]).
     pub(crate) accept_64: f32,
     pub(crate) accept_64_rect: f32,
+    /// Per-site modulation of the 16x16 and 32x32 biases by the site's luma
+    /// variance (see [`SITE_BIAS_K`]); 0 keeps the frame-level biases.
+    pub(crate) site_k16: f32,
+    pub(crate) site_k32: f32,
+}
+
+/// Per-site merge-bias modulation: a 16x16 or 32x32 site's bias is scaled by
+/// `exp(k * clamp(log2(var / SITE_BIAS_V0) / SITE_BIAS_OCTAVES, -1, 1))`, so
+/// busy sites merge less readily and smooth sites more. The selector's
+/// frame-level biases are right on average but the per-image optimum splits
+/// by local texture (2026-10-31, docs/per-image-qm-medium-2026-10-31.md).
+/// Fast, 42 mixed/synthetic/illustration images, BD SS2 / butteraugli vs the
+/// frame-level biases: −0.19 % / −0.27 %, 24 both-win, 2 images over 0.5 %
+/// worse (smooth photos); 18-image photo holdout −0.20 / −0.05, one loss.
+/// Fastest: −0.19 / −0.21 on the 42 (±4 octaves), holdout −0.18 / +0.01. The
+/// 32x32 sites carry most of it; a steeper slope (±4 octaves) gains a little
+/// more on synthetic content but loses on smooth photos, and a one-sided
+/// (busy-only) form keeps those losses. Medium is weaker and the slow tiers
+/// re-decide layouts with the exact metric, so only the fast tiers use it.
+const SITE_BIAS_K: f32 = 0.2;
+/// Luma variance (XYB Y) of a site that keeps its frame-level bias.
+const SITE_BIAS_V0: f32 = 0.003;
+/// Octaves of variance either side of `SITE_BIAS_V0` that span the full modulation.
+const SITE_BIAS_OCTAVES: f32 = 8.0;
+
+/// Luma variance of the `n`×`n` site at (`x0`, `y0`), clipped to the image.
+fn site_variance(opsin: &Image3F, x0: usize, y0: usize, n: usize) -> f32 {
+    site_variance_rect(opsin, x0, y0, n, n)
+}
+
+fn site_variance_rect(opsin: &Image3F, x0: usize, y0: usize, w: usize, h: usize) -> f32 {
+    let (mut s1, mut s2, mut cnt) = (0f64, 0f64, 0usize);
+    for y in y0..(y0 + h).min(opsin.ysize()) {
+        let row = opsin.plane_row(1, y);
+        for &v in &row[x0..(x0 + w).min(opsin.xsize())] {
+            let v = f64::from(v);
+            s1 += v;
+            s2 += v * v;
+            cnt += 1;
+        }
+    }
+    if cnt == 0 {
+        return 0.0;
+    }
+    (s2 / cnt as f64 - (s1 / cnt as f64).powi(2)).max(0.0) as f32
 }
 
 /// Very-low-quality band
@@ -233,9 +282,32 @@ const VLQ_ACCEPT_64: f32 = 0.973;
 const VLQ_ACCEPT_64_RECT: f32 = 0.736;
 
 impl MergeTuning {
-    pub(crate) fn new(distance: f32, arbiter: crate::Arbiter) -> Self {
+    /// Multiplier on the 16x16 (`n` = 16) or 32x32 (`n` = 32) bias at a site.
+    #[inline]
+    pub(crate) fn site_bias(&self, opsin: &Image3F, x0: usize, y0: usize, n: usize) -> f32 {
+        let k = if n == 16 {
+            self.site_k16
+        } else {
+            self.site_k32
+        };
+        if k == 0.0 {
+            return 1.0;
+        }
+        let var = site_variance(opsin, x0, y0, n).max(1e-9);
+        let s = (dirty_log2f(var / SITE_BIAS_V0) / SITE_BIAS_OCTAVES).clamp(-1.0, 1.0);
+        (k * s).exp()
+    }
+
+    pub(crate) fn new(distance: f32, arbiter: crate::Arbiter, speed: crate::Speed) -> Self {
         let accept = |margin: Banded| 1.0 - merge_margin(distance, margin);
+        let site_k = if matches!(speed, crate::Speed::Fast | crate::Speed::Fastest) {
+            SITE_BIAS_K
+        } else {
+            0.0
+        };
         let mut tuning = Self {
+            site_k16: site_k,
+            site_k32: site_k,
             bias_rect: BIAS_RECT.at(distance),
             bias_16x16: BIAS_16X16.at(distance),
             bias_32x32: BIAS_32X32.at(distance),
@@ -751,6 +823,8 @@ fn reconstruction_strategy_cost_bounded(
     spatial_errors: Option<[&mut [f32]; 3]>,
     limit: f32,
 ) -> ReconStrategyCost {
+    let mut qac = qac;
+    let original_qac = qac;
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather,
@@ -778,7 +852,8 @@ fn reconstruction_strategy_cost_bounded(
             py,
             cmap_factor,
         );
-        let cost = reconstruction_dist_and_rate(
+        qac *= selection_quantizer::scale(ctx, strategy, &coeffs[1], qac, distance, meta_r);
+        let cost = reconstruction_dist_and_rate_with_class(
             ctx,
             recon,
             coeffs,
@@ -787,6 +862,7 @@ fn reconstruction_strategy_cost_bounded(
             px,
             py,
             qac,
+            original_qac,
             qm_mult_x,
             distance,
             cmap_factor,
@@ -817,10 +893,21 @@ fn reconstruction_strategy_cost_bounded(
             py,
             &mut coeffs[1],
         );
+        qac *= selection_quantizer::scale(ctx, strategy, &coeffs[1], qac, distance, meta_r);
         let size = cx * cy * 64;
         let y_bits = table.map(|prices| {
             learned_channel_bits(
-                ctx, prices, strategy, &coeffs[1], 1, qac, qm_mult_x, distance, cx, cy,
+                ctx,
+                prices,
+                strategy,
+                &coeffs[1],
+                1,
+                qac,
+                original_qac,
+                qm_mult_x,
+                distance,
+                cx,
+                cy,
             )
         });
         let luma = {
@@ -878,6 +965,7 @@ fn reconstruction_strategy_cost_bounded(
                 recon,
                 0,
                 qac,
+                original_qac,
                 qm_mult_x,
                 distance,
                 cx,
@@ -893,6 +981,7 @@ fn reconstruction_strategy_cost_bounded(
                 recon,
                 2,
                 qac,
+                original_qac,
                 qm_mult_x,
                 distance,
                 cx,
@@ -953,7 +1042,7 @@ fn reconstruction_strategy_cost_bounded(
             distortion,
             rate,
         ),
-        base: if gradient_alpha == 0.0 && gradient_peak_alpha == 0.0 {
+        base: if qac == original_qac && gradient_alpha == 0.0 && gradient_peak_alpha == 0.0 {
             rd_cost(
                 DistortionModel::Reconstruction,
                 distance,
@@ -1135,6 +1224,7 @@ fn coefficient_dist_and_rate(
     coeffs: &[[f32; 4096]; 3],
     size: usize,
     qac: f32,
+    class_qac: f32,
     qm_mult_x: f32,
     distance: f32,
     cx: usize,
@@ -1143,7 +1233,9 @@ fn coefficient_dist_and_rate(
     visible: f32,
 ) -> (f32, f32) {
     if let Some((d, r)) = prices.and_then(|prices| {
-        prices.coefficient_dist_and_rate(ctx, strategy, coeffs, qac, qm_mult_x, distance, cx, cy)
+        prices.coefficient_dist_and_rate_with_class(
+            ctx, strategy, coeffs, qac, class_qac, qm_mult_x, distance, cx, cy,
+        )
     }) {
         return (d * visible, r);
     }
@@ -1210,8 +1302,10 @@ fn strategy_cost_impl(
         cmap_factor,
     );
 
+    let class_qac = qac;
+    let qac = qac * selection_quantizer::scale(ctx, strategy, &coeffs[1], qac, distance, meta_r);
     let (d_total, r_total) = match distortion_model {
-        DistortionModel::Reconstruction => reconstruction_dist_and_rate(
+        DistortionModel::Reconstruction => reconstruction_dist_and_rate_with_class(
             ctx,
             recon,
             coeffs,
@@ -1220,6 +1314,7 @@ fn strategy_cost_impl(
             px,
             py,
             qac,
+            class_qac,
             qm_mult_x,
             distance,
             cmap_factor,
@@ -1251,6 +1346,7 @@ fn strategy_cost_impl(
                 coeffs,
                 size,
                 qac,
+                class_qac,
                 qm_mult_x,
                 distance,
                 cx,
@@ -1364,13 +1460,16 @@ fn learned_channel_bits(
     coeffs: &[f32],
     c: usize,
     qac: f32,
+    class_qac: f32,
     qm_mult_x: f32,
     distance: f32,
     cx: usize,
     cy: usize,
 ) -> f32 {
     prices
-        .channel_rate_bits(ctx, strategy, coeffs, c, qac, qm_mult_x, distance, cx, cy)
+        .channel_rate_bits_with_class(
+            ctx, strategy, coeffs, c, qac, class_qac, qm_mult_x, distance, cx, cy,
+        )
         .expect("priced table")
 }
 
@@ -1385,6 +1484,7 @@ fn chroma_bits(
     recon: &mut [[f32; 4096]; 8],
     c: usize,
     qac: f32,
+    class_qac: f32,
     qm_mult_x: f32,
     distance: f32,
     cx: usize,
@@ -1406,6 +1506,7 @@ fn chroma_bits(
         &rebased[..size],
         c,
         qac,
+        class_qac,
         qm_mult_x,
         distance,
         cx,
@@ -1423,6 +1524,51 @@ fn reconstruction_dist_and_rate(
     px: usize,
     py: usize,
     qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    cx: usize,
+    cy: usize,
+    gradient_alpha: f32,
+    gradient_peak_alpha: f32,
+    keep_spatial_errors: bool,
+    prices: Option<&RatePrices>,
+) -> ReconCost {
+    reconstruction_dist_and_rate_with_class(
+        ctx,
+        recon,
+        coeffs,
+        strategy,
+        opsin,
+        px,
+        py,
+        qac,
+        qac,
+        qm_mult_x,
+        distance,
+        cmap_factor,
+        cx,
+        cy,
+        gradient_alpha,
+        gradient_peak_alpha,
+        keep_spatial_errors,
+        prices,
+    )
+}
+
+/// Uses the selection quantizer for reconstruction and the coding quantizer
+/// for learned entropy classes, matching a selection-only matrix rescale.
+#[allow(clippy::too_many_arguments)]
+fn reconstruction_dist_and_rate_with_class(
+    ctx: &EncodingContext,
+    recon: &mut [[f32; 4096]; 8],
+    coeffs: &[[f32; 4096]; 3],
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    class_qac: f32,
     qm_mult_x: f32,
     distance: f32,
     cmap_factor: [f32; 3],
@@ -1466,6 +1612,7 @@ fn reconstruction_dist_and_rate(
         recon,
         0,
         qac,
+        class_qac,
         qm_mult_x,
         distance,
         cx,
@@ -1473,7 +1620,7 @@ fn reconstruction_dist_and_rate(
         cmap_factor,
     );
     bits += learned_channel_bits(
-        ctx, prices, strategy, &coeffs[1], 1, qac, qm_mult_x, distance, cx, cy,
+        ctx, prices, strategy, &coeffs[1], 1, qac, class_qac, qm_mult_x, distance, cx, cy,
     );
     bits += chroma_bits(
         ctx,
@@ -1483,6 +1630,7 @@ fn reconstruction_dist_and_rate(
         recon,
         2,
         qac,
+        class_qac,
         qm_mult_x,
         distance,
         cx,
@@ -1705,7 +1853,7 @@ fn sub8_strategy_costs(
             );
         }
         let (distortion, rate) = coefficient_dist_and_rate(
-            ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1, prices, visible,
+            ctx, strategy, coeffs, 64, qac, qac, qm_mult_x, distance, 1, 1, prices, visible,
         );
         fmla(RD_LAMBDA, rate + meta_r, distortion)
     };

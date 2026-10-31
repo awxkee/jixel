@@ -141,6 +141,12 @@ pub(crate) struct EncodingContext {
     /// Set once per frame (post-XYB, before any table use) by the
     /// chroma-saturation gate in `frame::encode_frame`.
     chroma_heavy: std::sync::atomic::AtomicBool,
+    /// Luma gradient density of the frame (mean |∇Y| per sampled pixel pair,
+    /// `frame::chroma`); gates the ExtraSlow selection-scale race.
+    luma_texture: std::sync::atomic::AtomicU32,
+    /// Selection-only table sets (16/32 family scaled) in force while a
+    /// transform-selection race arm sets up its DC groups; `None` otherwise.
+    selection_tables: std::sync::RwLock<Option<&'static [&'static DequantMatrices; 4]>>,
     point_chroma: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
     pair_b_fine: std::sync::atomic::AtomicBool,
@@ -243,6 +249,15 @@ impl EncodingContext {
         );
         if let Some(&plain) = plain {
             plain
+        } else if let Some(sets) = *self
+            .selection_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            && !self.x_heavy.load(Relaxed)
+            && self.point_chroma_hq_matrices().is_none()
+        {
+            sets[usize::from(self.chroma_heavy.load(Relaxed))
+                + 2 * usize::from(self.pair_b_fine.load(Relaxed))]
         } else if self.x_heavy.load(Relaxed) {
             self.x_heavy_matrices
         } else if let Some(matrices) = self.point_chroma_hq_matrices() {
@@ -284,6 +299,40 @@ impl EncodingContext {
     pub(crate) fn set_pair_b_fine(&self, fine: bool) {
         self.pair_b_fine
             .store(fine, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Scale the 16/32 family tables seen by transform selection by `family`
+    /// (`None` restores the coding tables). Coding, header accounting and
+    /// signalling always use the coding tables.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn set_selection_family(&self, distance: f32, family: Option<f32>) {
+        let effort = self.speed.effort();
+        let sets = family.filter(|&f| f != 1.0).map(|f| {
+            DequantMatrices::selection_sets(
+                distance,
+                self.arbiter,
+                effort.rectangles,
+                effort.layout_retile && !effort.layout_loop(),
+                f,
+            )
+        });
+        *self
+            .selection_tables
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = sets;
+    }
+
+    pub(crate) fn set_luma_texture(&self, stat: f32) {
+        self.luma_texture
+            .store(stat.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn luma_texture(&self) -> f32 {
+        f32::from_bits(self.luma_texture.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn chroma_heavy(&self) -> bool {
+        self.chroma_heavy.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_chroma_heavy(&self, heavy: bool) {
@@ -525,7 +574,7 @@ impl EncodingContext {
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
-            merge: ac_strategy::MergeTuning::new(distance, arbiter),
+            merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),
             learned_rate: false,
             base_matrices,
             point_chroma_hq_matrices: (effort.chroma_policy
@@ -550,6 +599,8 @@ impl EncodingContext {
                 DequantMatrices::new(0.0, arbiter, retile)
             },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
+            selection_tables: std::sync::RwLock::new(None),
+            luma_texture: std::sync::atomic::AtomicU32::new(0),
             point_chroma: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
             pair_b_fine: std::sync::atomic::AtomicBool::new(false),

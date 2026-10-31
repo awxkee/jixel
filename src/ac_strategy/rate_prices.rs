@@ -523,10 +523,30 @@ impl RatePrices {
         cx: usize,
         cy: usize,
     ) -> Option<(f32, f32)> {
+        self.coefficient_dist_and_rate_with_class(
+            ctx, strategy, coeffs, qac, qac, qm_mult_x, distance, cx, cy,
+        )
+    }
+
+    /// `qac` quantizes the candidate; `class_qac` keeps its coding quantizer's
+    /// entropy class when selection uses a different matrix-equivalent scale.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn coefficient_dist_and_rate_with_class(
+        &self,
+        ctx: &EncodingContext,
+        strategy: u8,
+        coeffs: &[[f32; 4096]; 3],
+        qac: f32,
+        class_qac: f32,
+        qm_mult_x: f32,
+        distance: f32,
+        cx: usize,
+        cy: usize,
+    ) -> Option<(f32, f32)> {
         let table = self.tables[strategy as usize].as_ref()?;
         let (width, height) = (cx * 8, cy * 8);
         let size = width * height;
-        let qf_hi = (qac * self.inv_scale).round() as u32 > self.qf_threshold;
+        let qf_hi = (class_qac * self.inv_scale).round() as u32 > self.qf_threshold;
         Some(LEVELS.with_borrow_mut(|levels| {
             if levels.len() < size {
                 levels.resize(4096, 0);
@@ -602,15 +622,17 @@ impl RatePrices {
         bits
     }
 
-    /// Raw learned bits of one channel, before `norm` and the calibration.
+    /// Raw learned channel bits before `norm` and calibration. Quantizes at
+    /// `qac`, while `class_qac` chooses the coding quantizer's entropy class.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn channel_rate_bits(
+    pub(crate) fn channel_rate_bits_with_class(
         &self,
         ctx: &EncodingContext,
         strategy: u8,
         coeffs: &[f32],
         c: usize,
         qac: f32,
+        class_qac: f32,
         qm_mult_x: f32,
         distance: f32,
         cx: usize,
@@ -618,7 +640,7 @@ impl RatePrices {
     ) -> Option<f32> {
         let table = self.tables[strategy as usize].as_ref()?;
         let size = cx * cy * 64;
-        let qf_hi = (qac * self.inv_scale).round() as u32 > self.qf_threshold;
+        let qf_hi = (class_qac * self.inv_scale).round() as u32 > self.qf_threshold;
         Some(LEVELS.with_borrow_mut(|levels| {
             if levels.len() < size {
                 levels.resize(4096, 0);
@@ -645,9 +667,9 @@ impl RatePrices {
     }
 
     /// Lower bound on a transform's rate without transforming any pixels.
-    pub(crate) fn minimum_rate(&self, strategy: u8, qac: f32, distance: f32) -> Option<f32> {
+    pub(crate) fn minimum_rate(&self, strategy: u8, class_qac: f32, distance: f32) -> Option<f32> {
         let table = self.tables[strategy as usize].as_ref()?;
-        let qf_hi = usize::from((qac * self.inv_scale).round() as u32 > self.qf_threshold);
+        let qf_hi = usize::from((class_qac * self.inv_scale).round() as u32 > self.qf_threshold);
         let mut bits = 0.0;
         for row in table
             .minimum_channel_bits
@@ -954,6 +976,151 @@ impl Drop for RatePricesScope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_quantization_keeps_the_coding_entropy_class() {
+        let distance = 1.0;
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
+        // Give the two quant classes deliberately different prices, with no
+        // sampling or fitted distributions that could accidentally agree.
+        let mut bits = vec![1.0; SYMBOLS * 2];
+        bits[SYMBOLS..].fill(7.0);
+        let mut rows = vec![0; ROWS];
+        for c in 0..3 {
+            let high = (c * QUANT_CLASSES + 1) * CONTEXTS;
+            rows[high..high + CONTEXTS].fill(1);
+        }
+        let table = Table {
+            bits,
+            rows,
+            orders: CoeffOrders::natural(),
+            empty: [[1.0, 7.0]; 3],
+            minimum_channel_bits: OnceLock::new(),
+        };
+        let mut tables: Vec<Option<Table>> = (0..crate::dc_group_data::NUM_STRATEGIES)
+            .map(|_| None)
+            .collect();
+        tables[STRATEGY_DCT as usize] = Some(table);
+        let prices = RatePrices {
+            tables,
+            qf_threshold: 5,
+            inv_scale: 1.0,
+            norm: 1.0,
+        };
+        let mut coeffs = [[0.0; 4096]; 3];
+        // The selection quantizer is above the class boundary in both calls;
+        // only the actual coding quantizer is allowed to choose the class.
+        for (class_qac, token_price) in [(4.0, 1.0), (8.0, 7.0)] {
+            let (distortion, rate) = prices
+                .coefficient_dist_and_rate_with_class(
+                    &ctx,
+                    STRATEGY_DCT,
+                    &coeffs,
+                    8.0,
+                    class_qac,
+                    1.0,
+                    distance,
+                    1,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(distortion, 0.0);
+            assert_eq!(rate, 3.0 * token_price);
+            for c in 0..3 {
+                assert_eq!(
+                    prices
+                        .channel_rate_bits_with_class(
+                            &ctx,
+                            STRATEGY_DCT,
+                            &coeffs[c],
+                            c,
+                            8.0,
+                            class_qac,
+                            1.0,
+                            distance,
+                            1,
+                            1,
+                        )
+                        .unwrap(),
+                    token_price,
+                );
+            }
+        }
+        // Hold the coding class below the boundary while the selection
+        // quantizer crosses this coefficient's zero/nonzero threshold.
+        coeffs[1][1] = 0.1 / inverse_matrix_of(&ctx, STRATEGY_DCT, 1)[1];
+        let score = |qac| {
+            prices
+                .coefficient_dist_and_rate_with_class(
+                    &ctx,
+                    STRATEGY_DCT,
+                    &coeffs,
+                    qac,
+                    4.0,
+                    1.0,
+                    distance,
+                    1,
+                    1,
+                )
+                .unwrap()
+        };
+        let coarse = score(2.0);
+        let fine = score(8.0);
+        assert_eq!(coarse.1, 3.0);
+        assert_ne!(coarse.0, fine.0, "selection qac must change quantization");
+        assert!(
+            fine.1 > coarse.1,
+            "the restored coefficient must emit a token"
+        );
+        let mut levels = [0; 64];
+        for (qac, expect_nonzero) in [(2.0, false), (8.0, true)] {
+            quantize_channel(
+                &ctx,
+                STRATEGY_DCT,
+                1,
+                &coeffs[1][..64],
+                qac,
+                1.0,
+                distance,
+                1,
+                1,
+                &mut levels,
+            );
+            assert_eq!(levels[1] != 0, expect_nonzero);
+            let expected = RatePrices::channel_bits(
+                prices.tables[STRATEGY_DCT as usize].as_ref().unwrap(),
+                STRATEGY_DCT,
+                1,
+                &levels,
+                1,
+                1,
+                false,
+            );
+            assert_eq!(
+                prices
+                    .channel_rate_bits_with_class(
+                        &ctx,
+                        STRATEGY_DCT,
+                        &coeffs[1],
+                        1,
+                        qac,
+                        4.0,
+                        1.0,
+                        distance,
+                        1,
+                        1,
+                    )
+                    .unwrap(),
+                expected,
+            );
+        }
+    }
 
     #[test]
     fn mandatory_token_bound_does_not_exceed_complete_rates() {
