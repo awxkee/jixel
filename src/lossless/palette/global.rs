@@ -31,7 +31,6 @@
 
 use super::super::entropy::EntropyOfHistFn;
 use super::super::ma_source::{MaChannel, MaPixels, MaSource, MaTransform};
-use super::super::predictor::clamped_gradient;
 use super::super::rct::inverse_ycocg;
 use super::{visit_gray_colors, visit_palette_colors};
 use crate::coder_scratch::CoderScratch;
@@ -559,36 +558,38 @@ pub(super) fn index_cost_rows(
     nb_colors: usize,
 ) -> IndexCostHist {
     let mut hist = IndexCostHist::new(nb_colors);
-    let at = |x: usize, y: usize| order[indices[y * xsize + x] as usize];
+    // Rows under `order` with two zeros before and one after: the neighbors
+    // outside the plane.
+    let remap = |y: usize, row: &mut [i32]| {
+        for (dst, &index) in row[2..2 + xsize]
+            .iter_mut()
+            .zip(&indices[y * xsize..][..xsize])
+        {
+            *dst = order[index as usize];
+        }
+    };
+    let mut above = vec![0i32; xsize + 3];
+    let mut row = vec![0i32; xsize + 3];
+    let mut samples = vec![[0; 4]; xsize];
+    let price_row = super::selected_palette_row_fn();
+    if y_begin > 0 {
+        remap(y_begin - 1, &mut above);
+    }
     for y in y_begin..y_end {
-        for x in 0..xsize {
-            let v = at(x, y);
-            let left = if x > 0 { at(x - 1, y) } else { 0 };
-            let left_left = if x > 1 { at(x - 2, y) } else { 0 };
-            let (top, top_left, top_right) = if y > 0 {
-                (
-                    at(x, y - 1),
-                    if x > 0 { at(x - 1, y - 1) } else { 0 },
-                    if x + 1 < xsize { at(x + 1, y - 1) } else { 0 },
-                )
-            } else {
-                (0, 0, 0)
-            };
-            let sign = |d: i32| (d.signum() + 1) as usize;
-            let ctx = sign(left - top_left) * 27
-                + sign(top - top_left) * 9
-                + sign(top - top_right) * 3
-                + sign(left - left_left);
-            let gradient = clamped_gradient(left as i64, top as i64, top_left as i64) as i32;
-            for (pred, prediction) in [left, top, gradient].into_iter().enumerate() {
+        remap(y, &mut row);
+        price_row(&above, &row, &mut samples);
+        for (&[ctx, left, top, gradient], &v) in samples.iter().zip(&row[2..2 + xsize]) {
+            let ctx = ctx as usize;
+            for (pred, residual) in [left, top, gradient].into_iter().enumerate() {
                 let slot = ctx * INDEX_COST_PREDS + pred;
-                let (tok, nb, _) = uint_encode(pack_signed(v - prediction));
+                let (tok, nb, _) = uint_encode(pack_signed(residual));
                 hist.tokens
                     [slot * INDEX_COST_ALPHABET + (tok as usize).min(INDEX_COST_ALPHABET - 1)] += 1;
                 hist.raw_bits[slot] += nb as u64;
             }
             hist.values[ctx * nb_colors + v as usize] += 1;
         }
+        std::mem::swap(&mut above, &mut row);
     }
     hist
 }

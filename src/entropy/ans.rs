@@ -1515,21 +1515,15 @@ mod tests {
 
     #[test]
     fn symbol_info_builds_on_a_small_stack() {
-        std::thread::Builder::new()
-            .name("ans-small-stack".into())
-            .stack_size(64 * 1024)
-            .spawn(|| {
-                let counts: [u32; TABLE_ENTRIES] =
-                    core::array::from_fn(|symbol| (symbol * 37 % 257 + 1) as u32);
-                let mut freqs = Vec::new();
-                normalize_counts(&counts, &mut freqs);
-                let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
-                let symbols = build_symbol_info(&freqs, &mut reverse_map);
-                assert_eq!(symbols.len(), TABLE_ENTRIES);
-            })
-            .expect("failed to spawn ANS stack test")
-            .join()
-            .expect("ANS table construction overflowed its test stack");
+        crate::thread_pool::ThreadPool::on_small_stack(|| {
+            let counts: [u32; TABLE_ENTRIES] =
+                core::array::from_fn(|symbol| (symbol * 37 % 257 + 1) as u32);
+            let mut freqs = Vec::new();
+            normalize_counts(&counts, &mut freqs);
+            let mut reverse_map = vec![0u16; ANS_TAB_SIZE as usize];
+            let symbols = build_symbol_info(&freqs, &mut reverse_map);
+            assert_eq!(symbols.len(), TABLE_ENTRIES);
+        });
     }
 
     #[test]

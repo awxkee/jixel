@@ -241,8 +241,14 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
 
             let q = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rounded), keep));
 
-            let d = if BIASED {
+            let absq = vabsq_f32(q);
+            let nz = vcgtq_f32(absq, zero);
+            // An all-zero vector dequantizes to +0 in every lane: skip the
+            // division, which dominates this loop on high frequencies.
+            let d = if BIASED && vmaxvq_u32(nz) != 0 {
                 vsubq_f32(a, neon_dequantized_level_f32(q, bias))
+            } else if BIASED {
+                vsubq_f32(a, zero)
             } else {
                 vsubq_f32(a, q)
             };
@@ -258,8 +264,6 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let d2 = vbslq_f32(active, d2, zero);
             sse_acc = vaddq_f32(sse_acc, d2);
 
-            let absq = vabsq_f32(q);
-            let nz = vcgtq_f32(absq, zero);
             let rate_mask = vandq_u32(nz, active);
 
             // Keep the count lane-local until the end. A horizontal reduction

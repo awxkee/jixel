@@ -63,6 +63,12 @@ pub(crate) type CflRdoBlockFn = fn(
 
 pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
 pub(crate) type CflRdCostFn = fn(&[f32], &[f32], f32, f32, f32, crate::group::DequantBias) -> f32;
+pub(crate) mod rd_costs;
+/// Slope costs (luma, chroma, factors, rates, first, weight, lambda, bias,
+/// costs): a slope whose cost plus rate provably exceeds another slope's may
+/// come back as `f32::INFINITY`; `first` is the likeliest winner.
+pub(crate) type CflRdCostsFn =
+    fn(&[f32], &[f32], &[f32], &[f32], usize, f32, f32, crate::group::DequantBias, &mut [f32]);
 
 #[derive(Clone, Copy)]
 pub(crate) struct CflRdoRefillParams {
@@ -194,6 +200,55 @@ pub(crate) fn selected_cfl_rd_cost_fn() -> CflRdCostFn {
     }
     #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
     cfl_rd_cost_scalar
+}
+
+/// Price slopes in their original order, preserving the selected backend's
+/// arithmetic and reduction order. `costs` must match `factors` in length.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn cfl_rd_costs_sequential(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32],
+    _rates: &[f32],
+    _first: usize,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    costs: &mut [f32],
+) {
+    assert_eq!(factors.len(), costs.len());
+    let cost_fn = selected_cfl_rd_cost_fn();
+    for (&factor, cost) in factors.iter().zip(costs) {
+        *cost = cost_fn(m, s, factor, weight, lambda, bias);
+    }
+}
+
+pub(crate) fn selected_cfl_rd_costs_fn() -> CflRdCostsFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |m, s, factors, rates, first, weight, lambda, bias, costs| unsafe {
+            crate::neon::cfl_rd_costs_neon(m, s, factors, rates, first, weight, lambda, bias, costs)
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |m, s, f, r, i, w, l, b, c| unsafe {
+            crate::avx::cfl_rd_costs_avx2(m, s, f, r, i, w, l, b, c)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |m, s, f, r, i, w, l, b, c| unsafe {
+            crate::sse::cfl_rd_costs_sse41(m, s, f, r, i, w, l, b, c)
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::cfl_rd_costs_wasm;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+    )))]
+    cfl_rd_costs_sequential
 }
 
 #[allow(dead_code)]
@@ -575,7 +630,7 @@ fn cmap_residual_bits(res: i32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
-    cost_fn: CflRdCostFn,
+    cost_fn: CflRdCostsFn,
     bias: crate::group::DequantBias,
     m: &[f32],
     s: &[f32],
@@ -623,11 +678,32 @@ fn optimize_channel_rdo(
         }
     }
 
+    let mut factors = [0.0; 28];
+    let mut rates = [0.0; 28];
+    for ((&cand, factor), rate) in cands[..num_cands].iter().zip(&mut factors).zip(&mut rates) {
+        *factor = fmla(cand as f32, 1.0 / color_factor, base);
+        *rate = lambda * cmap_residual_bits(cand - pred);
+    }
+    let likeliest = incumbent.unwrap_or(target_cand).clamp(-128, 127);
+    let first = cands[..num_cands]
+        .iter()
+        .position(|&cand| cand == likeliest)
+        .unwrap_or(0);
+    let mut costs = [0.0; 28];
+    cost_fn(
+        m,
+        s,
+        &factors[..num_cands],
+        &rates[..num_cands],
+        first,
+        weight,
+        lambda,
+        bias,
+        &mut costs[..num_cands],
+    );
     let mut best = (f32::MAX, 0i32);
-    for &cand in &cands[..num_cands] {
-        let factor = fmla(cand as f32, 1.0 / color_factor, base);
-        let cost =
-            cost_fn(m, s, factor, weight, lambda, bias) + lambda * cmap_residual_bits(cand - pred);
+    for ((&cand, &cost), &rate) in cands[..num_cands].iter().zip(&costs).zip(&rates) {
+        let cost = cost + rate;
         if cost < best.0 {
             best = (cost, cand);
         }
@@ -757,7 +833,7 @@ fn compute_cmap_tile_rdo(
     let color_factor = ctx.cfl_frame().color_factor;
     let ytox = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
-        ctx.cfl_rd_cost,
+        ctx.cfl_rd_costs,
         ctx.dequant_bias(0),
         &rdo.m_x[..rdo.len],
         &rdo.s_x[..rdo.len],
@@ -770,7 +846,7 @@ fn compute_cmap_tile_rdo(
     );
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
-        ctx.cfl_rd_cost,
+        ctx.cfl_rd_costs,
         ctx.dequant_bias(2),
         &rdo.m_b[..rdo.len],
         &rdo.s_b[..rdo.len],
@@ -985,7 +1061,7 @@ pub(crate) fn refit_cmap_on_layout(
             }
             let ytox = optimize_channel_rdo(
                 ctx.cfl_rdo_stats,
-                ctx.cfl_rd_cost,
+                ctx.cfl_rd_costs,
                 ctx.dequant_bias(0),
                 &rdo.m_x[..rdo.len],
                 &rdo.s_x[..rdo.len],
@@ -998,7 +1074,7 @@ pub(crate) fn refit_cmap_on_layout(
             );
             let ytob = optimize_channel_rdo(
                 ctx.cfl_rdo_stats,
-                ctx.cfl_rd_cost,
+                ctx.cfl_rd_costs,
                 ctx.dequant_bias(2),
                 &rdo.m_b[..rdo.len],
                 &rdo.s_b[..rdo.len],
@@ -1593,6 +1669,7 @@ fn ytox_dc_cost(
     let factor = dc_cfl_factor_x(dc_step, ratio);
     price.clear();
     let mut distortion = 0.0;
+    let distortion_row = crate::dc_ops::selected_dc_distortion_row_fn();
     for dc in dc_datas {
         let source = dc.source_dc_x.as_ref().unwrap();
         let w = source.xsize();
@@ -1605,10 +1682,7 @@ fn ytox_dc_cost(
                 quantize(source.row(y), luma, scale, factor, current);
             }
             price.add_row(current, y == 0);
-            for ((&src, &luma), &level) in source.row(y).iter().zip(luma).zip(current.iter()) {
-                let target = fmla(src, scale, -(luma as f32) * factor);
-                distortion += f64::from(target - f32::from(level)).powi(2);
-            }
+            distortion = distortion_row(source.row(y), luma, current, scale, factor, distortion);
         }
     }
     let bits = price.bits();
@@ -1627,6 +1701,8 @@ pub(crate) fn choose_ytox_dc(
     cfl: CflFrame,
     header_already_paid: bool,
     quantize: crate::group::QuantizeDcCflFn,
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut crate::coder_scratch::CoderScratch,
 ) -> i32 {
     if dc_datas.is_empty() || dc_datas.iter().any(|dc| dc.source_dc_x.is_none()) {
         return 0;
@@ -1654,18 +1730,37 @@ pub(crate) fn choose_ytox_dc(
     } else {
         COLOR_CORRELATION_HEADER_BITS
     };
+    // Every slope is priced independently; contiguous runs per task keep
+    // the row buffers warm, and the pick below scans them in order.
+    let slopes: Vec<i32> = (-128..=127).filter(|&k| k != 0).collect();
+    let tasks = pool.num_threads().clamp(1, slopes.len());
+    let per_task = slopes.len().div_ceil(tasks);
+    let shared: &[DcGroupData] = dc_datas;
+    let costs: Vec<XdcCost> = pool
+        .steal_map(scratch, tasks, |t, _| {
+            let mut price = DcGradientPrice::default();
+            let mut current = vec![0i16; width];
+            slopes[(t * per_task).min(slopes.len())..((t + 1) * per_task).min(slopes.len())]
+                .iter()
+                .map(|&k| {
+                    ytox_dc_cost(
+                        shared,
+                        k,
+                        scale,
+                        dc_step,
+                        cfl,
+                        quantize,
+                        &mut price,
+                        &mut current,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
     let (mut best_bits, mut best_k) = (base.bits, 0);
-    for k in (-128..=127).filter(|&k| k != 0) {
-        let cost = ytox_dc_cost(
-            dc_datas,
-            k,
-            scale,
-            dc_step,
-            cfl,
-            quantize,
-            &mut gradient_price,
-            &mut current,
-        );
+    for (&k, cost) in slopes.iter().zip(costs) {
         if cost.distortion <= base.distortion && cost.bits + header < best_bits {
             best_bits = cost.bits + header;
             best_k = k;
@@ -2060,7 +2155,9 @@ mod tests {
                     [1.0; 3],
                     CflFrame::XYB,
                     false,
-                    ctx.quantize_dc_cfl
+                    ctx.quantize_dc_cfl,
+                    &ctx.thread_pool,
+                    &mut Default::default(),
                 ),
                 k
             );
@@ -2102,7 +2199,9 @@ mod tests {
                 [1.0; 3],
                 CflFrame::XYB,
                 false,
-                ctx.quantize_dc_cfl
+                ctx.quantize_dc_cfl,
+                &ctx.thread_pool,
+                &mut Default::default(),
             ),
             k
         );
@@ -2153,6 +2252,8 @@ mod tests {
             CflFrame::XYB,
             false,
             ctx.quantize_dc_cfl,
+            &ctx.thread_pool,
+            &mut Default::default(),
         );
         assert_ne!(chosen, 5);
         let actual = ytox_dc_cost(
@@ -2174,7 +2275,9 @@ mod tests {
                 [1.0; 3],
                 CflFrame::XYB,
                 false,
-                ctx.quantize_dc_cfl
+                ctx.quantize_dc_cfl,
+                &ctx.thread_pool,
+                &mut Default::default(),
             ),
             0
         );
@@ -2185,7 +2288,9 @@ mod tests {
                 [1.0; 3],
                 CflFrame::XYB,
                 true,
-                ctx.quantize_dc_cfl
+                ctx.quantize_dc_cfl,
+                &ctx.thread_pool,
+                &mut Default::default(),
             ),
             42
         );
@@ -2197,7 +2302,9 @@ mod tests {
                 [1.0; 3],
                 CflFrame::XYB,
                 false,
-                ctx.quantize_dc_cfl
+                ctx.quantize_dc_cfl,
+                &ctx.thread_pool,
+                &mut Default::default(),
             ),
             0
         );
@@ -2875,7 +2982,7 @@ mod tests {
         let pick = |pred| {
             optimize_channel_rdo(
                 cfl_rdo_stats_scalar,
-                cfl_rd_cost_scalar,
+                cfl_rd_costs_sequential,
                 crate::group::DequantBias::DEFAULT[0],
                 &[],
                 &[],

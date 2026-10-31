@@ -53,7 +53,8 @@ use std::sync::OnceLock;
 mod trellis;
 
 use trellis::{
-    RESTORE_FEW_COLORS_PENALTY, RESTORE_FEW_COLORS_PER_BLOCK, RdoqScratch, few_colors, rdoq_block,
+    RESTORE_FEW_COLORS_PENALTY, RESTORE_FEW_COLORS_PER_BLOCK, RdoqScratch, RdoqSearch, few_colors,
+    rdoq_block,
 };
 pub(crate) use trellis::{chroma_rdoq_weight, rdoq_channel_weights, rdoq_lambda};
 
@@ -1577,6 +1578,7 @@ pub(crate) fn write_ac_group(
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
                                 / visible,
                             restore_penalty,
+                            RdoqSearch::of(ctx.speed.effort()),
                             rdoq_choices,
                             rdoq_costs,
                         );
@@ -1880,6 +1882,7 @@ pub(crate) fn write_ac_group(
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
                                 / visible,
                             restore_penalty,
+                            RdoqSearch::of(ctx.speed.effort()),
                             rdoq_choices,
                             rdoq_costs,
                         );
@@ -1980,6 +1983,7 @@ pub(crate) fn write_ac_group(
                             rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
                                 / visible,
                             restore_penalty,
+                            RdoqSearch::of(ctx.speed.effort()),
                             rdoq_choices,
                             rdoq_costs,
                         );

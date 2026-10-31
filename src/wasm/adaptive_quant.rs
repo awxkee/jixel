@@ -198,7 +198,7 @@ fn masking_sqrt_x4(v: v128) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn dirty_log2f_x4(d: v128) -> v128 {
+pub(super) fn dirty_log2f_x4(d: v128) -> v128 {
     let one = f32x4_splat(1.0);
 
     // Same range reduction as scalar dirty_log2f(): reduce into

@@ -39,7 +39,9 @@ mod entropy;
 mod frame;
 mod haar;
 mod inflated_cost;
+mod ink_layer;
 mod lossless_grad;
+mod lossless_search;
 mod lz_match;
 mod modular;
 mod noise;
@@ -58,11 +60,14 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{
-    apply_cfl_neon, cfl_rd_cost_neon, cfl_rdo_block_neon, cfl_rdo_refill_neon, cfl_rdo_stats_neon,
-    cfl_regression_neon,
+    apply_cfl_neon, cfl_rd_cost_neon, cfl_rd_costs_neon, cfl_rdo_block_neon, cfl_rdo_refill_neon,
+    cfl_rdo_stats_neon, cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
-pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};
+pub(crate) use dc_ops::{
+    add_scaled_neon, adjust_b_dc_neon, compensate_b_dc_neon, dc_distortion_row_neon,
+    dc_error_row_neon, reconstruct_dc_neon,
+};
 pub(crate) use dct::{
     dc_from_dct8x32_neon, dc_from_dct16x32_neon, dc_from_dct32x16_neon, dc_from_dct32x32_neon,
     dc_from_dct32x64_neon, dc_from_dct64x32_neon, dc_from_dct64x64_neon, dct2x2_8x8_neon,
@@ -86,7 +91,9 @@ pub(crate) use inflated_cost::{
     recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
     rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
 };
+pub(crate) use ink_layer::{luma_row_neon, ridge_row_neon};
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lossless_search::{palette_row_neon, rct_row_neon};
 pub(crate) use lz_match::{match_len_compact_neon, match_len_neon};
 pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,

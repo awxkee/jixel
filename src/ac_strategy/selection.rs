@@ -1987,9 +1987,10 @@ fn select_transforms(
      -> f32 {
         if leaf_first {
             leaf_first::select_band_leaf_first(&selection, scratch, strategy, band, output);
+            output.dct8_costs.clear();
             0.0
         } else {
-            select_band(
+            let benefit = select_band(
                 &selection,
                 scratch,
                 strategy,
@@ -1997,7 +1998,9 @@ fn select_transforms(
                 &mut output.chosen32,
                 &mut output.saved_children,
                 &mut output.upgrade_candidates,
-            )
+            );
+            output.dct8_costs.clone_from(&scratch.dct8_costs);
+            benefit
         }
     };
     let mut benefit = if !parallel_selection {
@@ -4807,9 +4810,12 @@ mod tests {
     /// at MediumSlow, as does the rerank at every distance.
     #[test]
     fn sub8_and_afv_start_at_medium_slow() {
-        let fastest = SearchScope::for_speed(crate::Speed::Fastest);
-        assert!(!fastest.rectangles() && !fastest.merge_32() && !fastest.merge_busy_quads());
-        for speed in [crate::Speed::Fast, crate::Speed::Medium] {
+        assert!(!SearchScope::for_speed(crate::Speed::Fastest).rectangles());
+        for speed in [
+            crate::Speed::Fastest,
+            crate::Speed::Fast,
+            crate::Speed::Medium,
+        ] {
             assert_eq!(SearchScope::for_speed(speed), SearchScope::SQUARES);
         }
         let medium_slow = SearchScope::for_speed(crate::Speed::MediumSlow);

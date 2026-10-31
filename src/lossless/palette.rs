@@ -31,6 +31,39 @@
 
 mod global;
 mod local;
+
+pub(crate) type PaletteRowFn = fn(&[i32], &[i32], &mut [[i32; 4]]);
+
+#[allow(unreachable_code)]
+pub(crate) fn selected_palette_row_fn() -> PaletteRowFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return |a, b, c| unsafe { crate::avx::palette_row_avx2(a, b, c) };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |a, b, c| unsafe { crate::sse::palette_row_sse41(a, b, c) };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    return |a, b, c| unsafe { crate::neon::palette_row_neon(a, b, c) };
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::palette_row_wasm;
+    palette_row_scalar
+}
+
+#[allow(dead_code)]
+pub(crate) fn palette_row_scalar(above: &[i32], row: &[i32], out: &mut [[i32; 4]]) {
+    for (x, out) in out.iter_mut().enumerate() {
+        let (ll, l, v) = (row[x], row[x + 1], row[x + 2]);
+        let (tl, t, tr) = (above[x + 1], above[x + 2], above[x + 3]);
+        let sign = |v: i32| v.signum() + 1;
+        let ctx = sign(l - tl) * 27 + sign(t - tl) * 9 + sign(t - tr) * 3 + sign(l - ll);
+        let gradient =
+            ((l as i64 + t as i64 - tl as i64).clamp(l.min(t) as i64, l.max(t) as i64)) as i32;
+        *out = [ctx, v - l, v - t, v - gradient];
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -329,4 +362,76 @@ pub(super) fn try_encode_palette_single_group(
     writer.append_byte_aligned(std::slice::from_mut(&mut section));
     writer.zero_pad_to_byte();
     true
+}
+
+#[cfg(test)]
+mod search_row_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct Rows {
+        palette: PaletteRowFn,
+    }
+
+    fn backends() -> Vec<Rows> {
+        #[allow(unused_mut)]
+        let mut rows = vec![Rows {
+            palette: palette_row_scalar,
+        }];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            rows.push(Rows {
+                palette: |a, b, c| unsafe { crate::avx::palette_row_avx2(a, b, c) },
+            });
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            rows.push(Rows {
+                palette: |a, b, c| unsafe { crate::sse::palette_row_sse41(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            rows.push(Rows {
+                palette: |a, b, c| unsafe { crate::neon::palette_row_neon(a, b, c) },
+            });
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        {
+            rows.push(Rows {
+                palette: crate::wasm::palette_row_wasm,
+            });
+        }
+        rows.push(Rows {
+            palette: selected_palette_row_fn(),
+        });
+        rows
+    }
+
+    #[test]
+    fn palette_contexts_and_residuals_match_scalar() {
+        for len in 0..133 {
+            for pattern in 0..6 {
+                let row: Vec<i32> = (0..len + 3)
+                    .map(|x| ((x * 79 + pattern * 17) % 1024) as i32)
+                    .collect();
+                let above: Vec<i32> = (0..len + 3)
+                    .map(|x| {
+                        if pattern == 0 {
+                            row[x]
+                        } else {
+                            ((x * 13 + pattern * 327) % 1024) as i32
+                        }
+                    })
+                    .collect();
+                let mut expected = vec![[0; 4]; len];
+                palette_row_scalar(&above, &row, &mut expected);
+                for backend in backends() {
+                    let mut actual = vec![[0; 4]; len];
+                    (backend.palette)(&above, &row, &mut actual);
+                    assert_eq!(actual, expected, "len={len}, pattern={pattern}");
+                }
+            }
+        }
+    }
 }

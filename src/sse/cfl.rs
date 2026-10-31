@@ -151,3 +151,57 @@ pub(crate) fn cfl_rd_cost_sse41(
 
     hsum(acc) + cfl_rd_cost_scalar(m_tail, s_tail, factor, weight, lambda, bias)
 }
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn cost_term(
+    mv: __m128,
+    sv: __m128,
+    factor: f32,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> __m128 {
+    let factor_v = _mm_set1_ps(factor);
+    let weight_v = _mm_set1_ps(weight);
+    let zero = _mm_setzero_ps();
+    let one = _mm_set1_ps(1.0);
+    let half = _mm_set1_ps(0.5);
+    let sign = _mm_set1_ps(-0.0);
+    let nonzero_bits = _mm_set1_ps(lambda * CFL_NONZERO_BITS);
+    let magnitude_bits = _mm_set1_ps(lambda * CFL_MAGNITUDE_BITS);
+    let residual = _mm_sub_ps(sv, _mm_mul_ps(factor_v, mv));
+    let zero_cost = _mm_mul_ps(_mm_mul_ps(weight_v, residual), residual);
+
+    // Match f32::round (ties away from zero), including values just below
+    // half-integers that adding 0.5 before truncation would round up.
+    let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(residual);
+    let fraction = _mm_andnot_ps(sign, _mm_sub_ps(residual, truncated));
+    let at_least_half = _mm_cmpge_ps(fraction, half);
+    let signed_one = _mm_or_ps(one, _mm_and_ps(sign, residual));
+    let level = _mm_add_ps(truncated, _mm_and_ps(signed_one, at_least_half));
+
+    let coded_err = _mm_sub_ps(residual, sse_dequantized_level_f32(level, bias));
+    let abs_level = _mm_andnot_ps(sign, level);
+    // Clamp zero levels before taking log2; their coded cost is masked out.
+    let log2_level = sse_log2p1_f32(_mm_max_ps(_mm_sub_ps(abs_level, one), zero));
+    let bits = _mm_add_ps(nonzero_bits, _mm_mul_ps(magnitude_bits, log2_level));
+    let coded = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(weight_v, coded_err), coded_err), bits);
+    let nonzero = _mm_cmpgt_ps(abs_level, zero);
+    _mm_min_ps(zero_cost, _mm_blendv_ps(zero_cost, coded, nonzero))
+}
+#[target_feature(enable = "sse4.1")]
+fn cost_load(v: &[f32; 4]) -> __m128 {
+    unsafe { _mm_loadu_ps(v.as_ptr()) }
+}
+crate::color_correlation::rd_costs::batched_costs!(
+    "sse4.1",
+    4,
+    cfl_rd_costs_sse41,
+    cfl_rd_cost_sse41,
+    cost_term,
+    cost_load,
+    _mm_set1_ps,
+    _mm_add_ps,
+    hsum
+);

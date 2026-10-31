@@ -39,7 +39,9 @@ mod entropy;
 mod frame;
 mod haar;
 mod inflated_cost;
+mod ink_layer;
 mod lossless_grad;
+mod lossless_search;
 mod lz_match;
 mod modular;
 mod noise;
@@ -58,11 +60,14 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{
-    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_refill_avx2, cfl_rdo_stats_avx2,
-    cfl_regression_avx2,
+    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rd_costs_avx2, cfl_rdo_block_avx2, cfl_rdo_refill_avx2,
+    cfl_rdo_stats_avx2, cfl_regression_avx2,
 };
 pub(crate) use color::color_matrix_shaper_avx2;
-pub(crate) use dc_ops::{adjust_b_dc_avx2, compensate_b_dc_avx2, reconstruct_dc_avx2};
+pub(crate) use dc_ops::{
+    add_scaled_avx2, adjust_b_dc_avx2, compensate_b_dc_avx2, dc_distortion_row_avx2,
+    dc_error_row_avx2, reconstruct_dc_avx2,
+};
 pub(crate) use dct::{
     dc_from_dct8x32_avx2, dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2,
     dc_from_dct32x64_avx2, dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct2x2_8x8_avx2,
@@ -86,7 +91,9 @@ pub(crate) use inflated_cost::{
     recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
     rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
 };
+pub(crate) use ink_layer::{luma_row_avx2, ridge_row_avx2};
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lossless_search::{palette_row_avx2, rct_row_avx2};
 pub(crate) use lz_match::{match_len_avx2, match_len_compact_avx2};
 pub(crate) use modular::{
     tokenize_alpha_u8_first_row_avx2, tokenize_alpha_u8_interior_avx2,

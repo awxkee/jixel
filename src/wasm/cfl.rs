@@ -1,5 +1,107 @@
 use core::arch::wasm32::*;
 
+/// Match the scalar cost expression, including its unfused log polynomial.
+#[inline]
+#[target_feature(enable = "simd128")]
+fn rd_terms(
+    m: v128,
+    s: v128,
+    factor: v128,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> v128 {
+    use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
+    let r = f32x4_sub(s, f32x4_mul(factor, m));
+    let zero = f32x4_mul(f32x4_mul(f32x4_splat(weight), r), r);
+    let truncated = f32x4_trunc(r);
+    let half = f32x4_ge(f32x4_abs(f32x4_sub(r, truncated)), f32x4_splat(0.5));
+    let signed_one = v128_or(f32x4_splat(1.0), v128_and(r, f32x4_splat(-0.0)));
+    let level = f32x4_add(truncated, v128_and(signed_one, half));
+    let error = f32x4_sub(
+        r,
+        super::ac_strategy::wasm_dequantized_level_f32(level, bias),
+    );
+    let log = super::adaptive_quant::dirty_log2f_x4(f32x4_abs(level));
+    let bits = f32x4_mul(
+        f32x4_splat(lambda),
+        f32x4_add(
+            f32x4_splat(CFL_NONZERO_BITS),
+            f32x4_mul(f32x4_splat(CFL_MAGNITUDE_BITS), log),
+        ),
+    );
+    let coded = f32x4_add(
+        f32x4_mul(f32x4_mul(f32x4_splat(weight), error), error),
+        bits,
+    );
+    // Rust's min ignores a single NaN; Wasm's ordinary min propagates it.
+    let pick = v128_and(
+        f32x4_ne(level, f32x4_splat(0.0)),
+        v128_or(f32x4_lt(coded, zero), f32x4_ne(zero, zero)),
+    );
+    v128_bitselect(coded, zero, pick)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "simd128")]
+pub(crate) fn cfl_rd_costs_wasm(
+    m: &[f32],
+    s: &[f32],
+    factors: &[f32],
+    rates: &[f32],
+    first: usize,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+    costs: &mut [f32],
+) {
+    assert_eq!(factors.len(), costs.len());
+    assert_eq!(rates.len(), costs.len());
+    assert!(factors.is_empty() || first < factors.len());
+    let len = m.len().min(s.len());
+    // Preserve scalar handling of NaN payloads and nonfinite parameters.
+    if ![weight, lambda, bias.one, bias.numerator]
+        .iter()
+        .all(|v| v.is_finite())
+        || !factors
+            .iter()
+            .chain(&m[..len])
+            .chain(&s[..len])
+            .all(|v| v.is_finite())
+    {
+        for (&f, out) in factors.iter().zip(costs) {
+            *out = crate::color_correlation::cfl_rd_cost_scalar(m, s, f, weight, lambda, bias);
+        }
+        return;
+    }
+    let (batches, rest) = factors.as_chunks::<4>();
+    let (outputs, tail) = costs.as_chunks_mut::<4>();
+    for (factors, output) in batches.iter().zip(outputs) {
+        let factor = load(factors);
+        let mut acc = f32x4_splat(0.0);
+        // Each lane is one slope. Every slope retains the original scalar
+        // coefficient accumulation order, with no horizontal reduction.
+        for (&m, &s) in m[..len].iter().zip(&s[..len]) {
+            acc = f32x4_add(
+                acc,
+                rd_terms(f32x4_splat(m), f32x4_splat(s), factor, weight, lambda, bias),
+            );
+        }
+        store(output, acc);
+        if output.iter().any(|v| !v.is_finite()) {
+            // Finite operands can still overflow; retain scalar NaN payloads.
+            for (&factor, out) in factors.iter().zip(output) {
+                *out = crate::color_correlation::cfl_rd_cost_scalar(
+                    m, s, factor, weight, lambda, bias,
+                );
+            }
+        }
+    }
+    for (&f, out) in rest.iter().zip(tail) {
+        *out = crate::color_correlation::cfl_rd_cost_scalar(m, s, f, weight, lambda, bias);
+    }
+}
+
 #[inline]
 #[target_feature(enable = "simd128")]
 fn load(values: &[f32; 4]) -> v128 {

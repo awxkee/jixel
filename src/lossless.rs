@@ -76,6 +76,15 @@ mod tokens;
 mod tree;
 mod xyb;
 
+pub(crate) use rct::{rct_from_ycocg_pixel, selected_rct_row_fn};
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "avx"),
+    all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"),
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+))]
+pub(crate) use {palette::palette_row_scalar, rct::rct_row_scalar};
+
 pub(crate) use context::PickThresholdScratch;
 pub(crate) use entropy::{EntropyOfHistFn, selected_entropy_of_hist_fn};
 pub(crate) use float::encode_frame_lossless_float;

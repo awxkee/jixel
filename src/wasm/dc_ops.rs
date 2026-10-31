@@ -399,3 +399,110 @@ pub(crate) fn reconstruct_dc_wasm(
         rb[i..].copy_from_slice(&ob[..tail]);
     }
 }
+
+#[target_feature(enable = "simd128")]
+fn search_fmla(a: v128, b: v128, c: v128) -> v128 {
+    f32x4_add(f32x4_mul(a, b), c)
+}
+
+#[target_feature(enable = "simd128")]
+unsafe fn fload(p: *const f32) -> v128 {
+    unsafe { v128_load(p.cast()) }
+}
+
+#[target_feature(enable = "simd128")]
+unsafe fn fstore(p: *mut f32, v: v128) {
+    unsafe { v128_store(p.cast(), v) }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dc_error_row_wasm(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    multiplier: f32,
+    out: &mut [f32],
+) {
+    assert!(src.len() >= out.len() && luma.len() >= out.len() && levels.len() >= out.len());
+    let end = out.len() / 4 * 4;
+    for x in (0..end).step_by(4) {
+        let y: [f32; 4] = std::array::from_fn(|i| -(luma[x + i] as f32));
+        let q: [f32; 4] = std::array::from_fn(|i| levels[x + i] as f32);
+        unsafe {
+            let error = f32x4_sub(
+                search_fmla(
+                    fload(src.as_ptr().add(x)),
+                    f32x4_splat(scale),
+                    f32x4_mul(fload(y.as_ptr()), f32x4_splat(factor)),
+                ),
+                fload(q.as_ptr()),
+            );
+            fstore(
+                out.as_mut_ptr().add(x),
+                f32x4_mul(error, f32x4_splat(multiplier)),
+            );
+        }
+    }
+    crate::dc_ops::dc_error_row_scalar(
+        &src[end..],
+        &luma[end..],
+        &levels[end..],
+        scale,
+        factor,
+        multiplier,
+        &mut out[end..],
+    );
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dc_distortion_row_wasm(
+    src: &[f32],
+    luma: &[i16],
+    levels: &[i16],
+    scale: f32,
+    factor: f32,
+    mut sum: f64,
+) -> f64 {
+    assert_eq!(src.len(), luma.len());
+    assert_eq!(src.len(), levels.len());
+    // Only the independent error terms are vectorized. Carry the f64
+    // sum through every row in its original coefficient order.
+    let mut errors = [0.0; 32];
+    for start in (0..src.len()).step_by(errors.len()) {
+        let end = (start + errors.len()).min(src.len());
+        let errors = &mut errors[..end - start];
+        dc_error_row_wasm(
+            &src[start..end],
+            &luma[start..end],
+            &levels[start..end],
+            scale,
+            factor,
+            1.0,
+            errors,
+        );
+        for &error in errors.iter() {
+            sum += f64::from(error).powi(2);
+        }
+    }
+    sum
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn add_scaled_wasm(out: &mut [f32], src: &[f32], factor: f32) {
+    assert!(src.len() >= out.len());
+    let end = out.len() / 4 * 4;
+    for x in (0..end).step_by(4) {
+        unsafe {
+            fstore(
+                out.as_mut_ptr().add(x),
+                f32x4_add(
+                    fload(out.as_ptr().add(x)),
+                    f32x4_mul(f32x4_splat(factor), fload(src.as_ptr().add(x))),
+                ),
+            );
+        }
+    }
+    crate::dc_ops::add_scaled_scalar(&mut out[end..], &src[end..], factor);
+}

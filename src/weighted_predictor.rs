@@ -181,7 +181,8 @@ impl WpState {
         if shift < 0 {
             shift = 0;
         }
-        4 + (((maxweight as u64 * WP_DIV[(x >> shift) as usize] as u64) >> shift) as u32)
+        // x < 2^(shift + 6), so the index is below 64 and the mask is a no-op.
+        4 + (((maxweight as u64 * WP_DIV[(x >> shift) as usize & 63] as u64) >> shift) as u32)
     }
 
     #[inline]
@@ -198,7 +199,9 @@ impl WpState {
         for i in 0..4 {
             sum += pred[i] * w[i] as i64;
         }
-        (sum * WP_DIV[(weight_sum - 1) as usize] as i64) >> 24
+        // Normalized weights total 13..=31 (every weight is at least 4), so
+        // the mask is a no-op.
+        (sum * WP_DIV[(weight_sum - 1) as usize & 63] as i64) >> 24
     }
 
     #[inline]
@@ -224,6 +227,10 @@ impl WpState {
         row: WpRowOffsets,
         n: WpNeighbors,
     ) -> (i64, bool) {
+        self.check_slot(x, row);
+        // SAFETY: `check_slot` bounds every slot read below.
+        let error = |i: usize| unsafe { *self.error.get_unchecked(i) };
+        let pred_error = |p: usize, i: usize| unsafe { *self.pred_errors[p].get_unchecked(i) };
         let pos_n = row.previous + x;
         let pos_ne = if x < self.xsize - 1 { pos_n + 1 } else { pos_n };
         let pos_nw = if x > 0 { pos_n - 1 } else { pos_n };
@@ -239,10 +246,10 @@ impl WpState {
             && n.north == n.north_west
             && n.north == n.north_north
             && (-8192..=8192).contains(&n.north)
-            && (x == 0 || self.error[row.current + x - 1] == 0)
-            && self.error[pos_n] == 0
-            && self.error[pos_nw] == 0
-            && self.error[pos_ne] == 0
+            && (x == 0 || error(row.current + x - 1) == 0)
+            && error(pos_n) == 0
+            && error(pos_nw) == 0
+            && error(pos_ne) == 0
         {
             let common = Self::add_bits(n.north);
             self.prediction = [common; 4];
@@ -252,9 +259,9 @@ impl WpState {
         }
         let mut weights = [0u32; 4];
         for i in 0..4 {
-            let s = self.pred_errors[i][pos_n] as u64
-                + self.pred_errors[i][pos_ne] as u64
-                + self.pred_errors[i][pos_nw] as u64;
+            let s = pred_error(i, pos_n) as u64
+                + pred_error(i, pos_ne) as u64
+                + pred_error(i, pos_nw) as u64;
             weights[i] = Self::error_weight(s, self.params.w[i]);
         }
         let an = Self::add_bits(n.north);
@@ -265,11 +272,11 @@ impl WpState {
         let te_w = if x == 0 {
             0
         } else {
-            self.error[row.current + x - 1]
+            error(row.current + x - 1)
         };
-        let te_n = self.error[pos_n];
-        let te_nw = self.error[pos_nw];
-        let te_ne = self.error[pos_ne];
+        let te_n = error(pos_n);
+        let te_nw = error(pos_nw);
+        let te_ne = error(pos_ne);
         let mut wp_prop = te_w;
         if te_n.abs() > wp_prop.abs() {
             wp_prop = te_n;
@@ -305,14 +312,26 @@ impl WpState {
         }
     }
 
+    /// Every buffer holds two rows of `xsize + 2` slots (`with_params`,
+    /// `reset`) and `row_offsets` starts rows at 0 or `xsize + 2`. With
+    /// `x < xsize` every slot at `x - 1..=x + 1` of either row is in bounds.
+    #[inline(always)]
+    fn check_slot(&self, x: usize, row: WpRowOffsets) {
+        assert!(x < self.xsize && row.previous.max(row.current) <= self.xsize + 2);
+    }
+
     #[inline(always)]
     fn update_with_row(&mut self, val: i64, x: usize, row: WpRowOffsets) {
         let update = Self::update_for(self.last_prediction(), val);
-        self.error[row.current + x] = update.error;
-        for i in 0..4 {
-            self.pred_errors[i][row.current + x] = update.pred_errors[i];
-            let slot = &mut self.pred_errors[i][row.previous + x + 1];
-            *slot = slot.wrapping_add(update.pred_errors[i]);
+        self.check_slot(x, row);
+        // SAFETY: `check_slot` bounds both slots.
+        unsafe {
+            *self.error.get_unchecked_mut(row.current + x) = update.error;
+            for (errors, &error) in self.pred_errors.iter_mut().zip(&update.pred_errors) {
+                *errors.get_unchecked_mut(row.current + x) = error;
+                let slot = errors.get_unchecked_mut(row.previous + x + 1);
+                *slot = slot.wrapping_add(error);
+            }
         }
     }
 
@@ -422,9 +441,12 @@ impl WpState {
             // The shortcut makes all four predictions exactly val << 3.
             // Clear the current errors; adding zero to the north-east
             // subpredictor errors would leave that state unchanged.
-            self.error[row.current + x] = 0;
-            for errors in &mut self.pred_errors {
-                errors[row.current + x] = 0;
+            // SAFETY: the prediction checked this slot (`check_slot`).
+            unsafe {
+                *self.error.get_unchecked_mut(row.current + x) = 0;
+                for errors in &mut self.pred_errors {
+                    *errors.get_unchecked_mut(row.current + x) = 0;
+                }
             }
         } else {
             self.update_with_row(val, x, row);

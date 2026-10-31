@@ -260,7 +260,7 @@ fn direct_literals_match_materialized_codes_estimates_and_sections() {
             &mut scratch.lz_entropy,
             &mut scratch.huffman_pool,
         );
-        let coded = estimate_coded_bits(&slices, 3, &code, 64, threads);
+        let coded = estimate_coded_bits(&slices, 3, &code, 64, Some(&pool));
         let mut writer = BitWriter::new();
         write_local_tree_lz77(
             &[0, 1, 6],
@@ -786,17 +786,12 @@ fn tokens(n: usize, period: usize) -> Vec<Token> {
 fn hash_chain_scratch_is_reset_between_calls() {
     let big = tokens(200_000, 7);
     let small = tokens(5_000, 7);
-    let clean = std::thread::spawn({
-        let small = small.clone();
-        move || {
-            let mut scratch = Vec::new();
-            let mut out = Vec::with_capacity(small.len());
-            lz77_compress_with_depth_into(&small, 8, &mut scratch, &mut out);
-            out.len()
-        }
-    })
-    .join()
-    .unwrap();
+    let clean = {
+        let mut scratch = Vec::new();
+        let mut out = Vec::with_capacity(small.len());
+        lz77_compress_with_depth_into(&small, 8, &mut scratch, &mut out);
+        out.len()
+    };
     let mut scratch = Vec::new();
     let mut out = Vec::with_capacity(big.len());
     lz77_compress_with_depth_into(&big, 8, &mut scratch, &mut out);

@@ -94,6 +94,24 @@ pub(super) fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
     estimated_savings >= MA_DECISIVE_MIN_SAVINGS
 }
 
+/// The color planes under `rct_type`: the YCoCg (or gray) input itself, or
+/// its transform, built on first use and kept in `planes`.
+fn rct_planes_of<'a>(
+    planes: &'a mut Option<Image3Si>,
+    ycocg: &'a Image3Si,
+    num_color: usize,
+    rct_type: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> &'a Image3Si {
+    if num_color != 3 || rct_type == 6 {
+        return ycocg;
+    }
+    planes.get_or_insert_with(|| {
+        rct_planes_fn(ycocg, ycocg.xsize(), ycocg.ysize(), rct_type, pool, scratch)
+    })
+}
+
 pub(crate) fn encode_frame_lossless_core(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
@@ -368,11 +386,11 @@ pub(super) fn encode_frame_lossless_core_impl(
         && t != 6
     {
         rct_type = t;
-        rct_planes = Some(rct_planes_fn(linear, xsize, ysize, t, pool, scratch));
     }
-    // The palette candidate below needs the untransformed YCoCg planes.
+    // The palette candidate below needs the untransformed YCoCg planes. The
+    // transformed ones are built on first use: an ink frame's palette source
+    // usually wins without them.
     let ycocg = linear;
-    let linear = rct_planes.as_ref().unwrap_or(linear);
 
     let wp_header_count = if single_group {
         1
@@ -380,7 +398,15 @@ pub(super) fn encode_frame_lossless_core_impl(
         2 + num_dc_groups + num_ac_groups
     };
     let mut wp_params = if effort.wp_search && use_wp {
-        choose_wp_params(linear, alpha, num_color, wp_header_count, pool, scratch)
+        choose_wp_params(
+            ycocg,
+            rct_type,
+            alpha,
+            num_color,
+            wp_header_count,
+            pool,
+            scratch,
+        )
     } else {
         WpParams::DEFAULT
     };
@@ -474,6 +500,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             let mut rgb_stage = if palette_only {
                 None
             } else {
+                let linear =
+                    rct_planes_of(&mut rct_planes, ycocg, num_color, rct_type, pool, scratch);
                 let source =
                     rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant, num_color);
                 rank_coarse(
@@ -525,6 +553,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             let rank_more = source_values_of(xsize, ysize, coded_chans) >= RANK_MIN_VALUES;
             if rank_rgb && rank_more {
                 let (mut best_bits, mut best_coarse, params, stage) = {
+                    let linear =
+                        rct_planes_of(&mut rct_planes, ycocg, num_color, rct_type, pool, scratch);
                     let source =
                         rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant, num_color);
                     rank_presets(
@@ -619,7 +649,11 @@ pub(super) fn encode_frame_lossless_core_impl(
                 (rgb_rank_stage, pal_rank_stage) = (rgb_stage, pal_stage);
             }
         }
-        let linear = rct_planes.as_ref().unwrap_or(ycocg);
+        let linear = if rank_rgb {
+            rct_planes_of(&mut rct_planes, ycocg, num_color, rct_type, pool, scratch)
+        } else {
+            rct_planes.as_ref().unwrap_or(ycocg)
+        };
 
         // A ranking stage stands in for a final learn's first stage when both
         // sampled the same source under the same layout and budget, and the
@@ -886,7 +920,7 @@ pub(super) fn encode_frame_lossless_core_impl(
     let num_dc_groups = xsize.div_ceil(layout.lf_dim()) * ysize.div_ceil(layout.lf_dim());
     let single_group = num_ac_groups == 1;
 
-    let linear = rct_planes.as_ref().unwrap_or(ycocg);
+    let linear = rct_planes_of(&mut rct_planes, ycocg, num_color, rct_type, pool, scratch);
     // Per-channel predictor search for the v1 context tree and flat paths
     // (deferred: a decisive learned tree never needs it).
     let predictors = if effort.predictor_search {

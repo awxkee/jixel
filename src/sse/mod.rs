@@ -38,7 +38,9 @@ mod dct;
 mod entropy;
 mod haar;
 mod inflated_cost;
+mod ink_layer;
 mod lossless_grad;
+mod lossless_search;
 #[cfg(target_arch = "x86_64")]
 mod lz_match;
 mod modular;
@@ -55,16 +57,22 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
-pub(crate) use cfl::{cfl_rd_cost_sse41, cfl_rdo_refill_sse41};
+pub(crate) use cfl::{cfl_rd_cost_sse41, cfl_rd_costs_sse41, cfl_rdo_refill_sse41};
 pub(crate) use color::color_matrix_shaper_sse41;
-pub(crate) use dc_ops::{adjust_b_dc_sse41, compensate_b_dc_sse41, reconstruct_dc_sse41};
+pub(crate) use dc_ops::{
+    add_scaled_sse41, adjust_b_dc_sse41, compensate_b_dc_sse41, dc_distortion_row_sse41,
+    dc_error_row_sse41, reconstruct_dc_sse41,
+};
+
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use haar::haar_rows_sse41;
 pub(crate) use inflated_cost::{
     combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
     rgb_hue_chroma_edge_loss_sse41,
 };
+pub(crate) use ink_layer::{luma_row_sse41, ridge_row_sse41};
 pub(crate) use lossless_grad::grad_pack_interior;
+pub(crate) use lossless_search::{palette_row_sse41, rct_row_sse41};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use lz_match::{match_len_compact_sse2, match_len_sse2};
 pub(crate) use modular::{

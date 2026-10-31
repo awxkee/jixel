@@ -564,6 +564,8 @@ pub(super) fn encode_frame_core(
             ctx.cfl_frame(),
             ytob_dc != 0,
             ctx.quantize_dc_cfl,
+            &ctx.thread_pool,
+            scratch,
         )
     } else {
         0
@@ -573,7 +575,14 @@ pub(super) fn encode_frame_core(
             base_x: crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), ytox_dc as i8),
             ..ctx.cfl_frame()
         };
-        distp.dc_step = dc_rdo::choose_x_dc_step(&mut dc_datas, &distp, cfl, ctx.quantize_dc_cfl);
+        distp.dc_step = dc_rdo::choose_x_dc_step(
+            &mut dc_datas,
+            &distp,
+            cfl,
+            ctx.quantize_dc_cfl,
+            &ctx.thread_pool,
+            scratch,
+        );
     }
     // Only DC reconstruction uses the extra X slope. The AC map and the
     // header's base correlations retain the frame's original parameters.

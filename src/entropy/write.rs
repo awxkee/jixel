@@ -384,7 +384,7 @@ impl HybridUintSamples {
             .collect()
     }
 
-    fn select_exhaustive_with_pool(
+    pub(crate) fn select_exhaustive_with_pool(
         &self,
         min_symbol: u32,
         pool: &ThreadPool,
@@ -431,63 +431,17 @@ impl HybridUintSamples {
     }
 
     fn select_with_acceptance(&self, acceptance_ratio: f64) -> Vec<HybridUintConfig> {
-        // Every cluster is selected independently; spread them over scoped
-        // threads with one selector scratch each (identical results).
-        let n = self.values.len();
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |t| t.get())
-            .min(n.max(1));
-        if threads <= 1 || n < 4 {
-            let mut scratch = HybridAnsSelectorScratch::default();
-            return self
-                .values
-                .iter()
-                .zip(&self.strides)
-                .map(|(values, &stride)| {
-                    select_hybrid_config_ans_sampled(
-                        values,
-                        1,
-                        stride,
-                        acceptance_ratio,
-                        &mut scratch,
-                    )
-                })
-                .collect();
-        }
-        let chunk = n.div_ceil(threads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..n)
-                .step_by(chunk)
-                .map(|start| {
-                    let end = (start + chunk).min(n);
-                    let values = &self.values[start..end];
-                    let strides = &self.strides[start..end];
-                    scope.spawn(move || {
-                        let mut scratch = HybridAnsSelectorScratch::default();
-                        values
-                            .iter()
-                            .zip(strides)
-                            .map(|(values, &stride)| {
-                                select_hybrid_config_ans_sampled(
-                                    values,
-                                    1,
-                                    stride,
-                                    acceptance_ratio,
-                                    &mut scratch,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("hybrid config selector"))
-                .collect()
-        })
+        let mut scratch = HybridAnsSelectorScratch::default();
+        self.values
+            .iter()
+            .zip(&self.strides)
+            .map(|(values, &stride)| {
+                select_hybrid_config_ans_sampled(values, 1, stride, acceptance_ratio, &mut scratch)
+            })
+            .collect()
     }
 
-    fn select_with_pool(
+    pub(crate) fn select_with_pool(
         &self,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
@@ -1688,7 +1642,11 @@ fn accept_ans_cluster_proposal_precise(
 pub(crate) enum AnsRefinement {
     Slow,
     ExtraSlow,
-    Fast { recluster: bool },
+    Fast {
+        recluster: bool,
+    },
+    /// `Fast` without reclustering or the race against the prefix-coded twin.
+    FastNoRace,
 }
 
 impl AnsRefinement {
@@ -1743,6 +1701,15 @@ where
         return false;
     }
     let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
+    if matches!(refinement, AnsRefinement::FastNoRace) {
+        return refine_ans_bundle(
+            code,
+            &streams,
+            AnsRefinement::Fast { recluster: false },
+            thread_pool,
+            scratch,
+        );
+    }
     let prefix = prefix_alternative(code, &streams, &mut scratch.huffman_pool);
     let changed = refine_ans_bundle(code, &streams, refinement, thread_pool, scratch);
     let pool = &mut scratch.huffman_pool;

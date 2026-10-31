@@ -590,23 +590,26 @@ pub(super) fn choose_x_dc_step(
     distp: &DistanceParams,
     cfl: CflFrame,
     quantize: crate::group::QuantizeDcCflFn,
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut crate::coder_scratch::CoderScratch,
 ) -> [f32; 3] {
     let mut dc_step = distp.dc_step;
     if groups.is_empty() || groups.iter().any(|dc| dc.source_dc_x.is_none()) {
         return dc_step;
     }
+    let dc_error = crate::dc_ops::selected_dc_error_row_fn();
     let base = dc_step[0];
     let kernel = gaussian_kernel(X_DC_STEP_SIGMA);
-    let mut price = DcPlanePrice::default();
-    let (mut levels, mut errors, mut blurred) = (Vec::new(), Vec::new(), Vec::new());
-    let mut cost = |m: f32, apply: bool, groups: &mut [DcGroupData]| -> f64 {
+    // Cost of the X DC levels under `base * m`; `keep` receives each group's.
+    let cost = |m: f32, groups: &[DcGroupData], mut keep: Option<&mut Vec<Vec<i16>>>| -> f64 {
+        let mut price = DcPlanePrice::default();
+        let (mut levels, mut errors, mut blurred) = (Vec::new(), Vec::new(), Vec::new());
         let mut step = dc_step;
         step[0] = base * m;
         let scale = INV_DC_QUANT[0] / step[0] * distp.scale_dc;
         let factor = dc_cfl_factor_x(step, cfl.base_x);
-        price.clear();
         let mut distortion = 0.0f64;
-        for dc in groups.iter_mut() {
+        for dc in groups {
             let source = dc.source_dc_x.as_ref().unwrap();
             let (w, h) = (source.xsize(), source.ysize());
             levels.resize(w * h, 0i16);
@@ -615,40 +618,51 @@ pub(super) fn choose_x_dc_step(
                 let luma = dc.quant_dc.plane_row(1, y);
                 let row = &mut levels[y * w..][..w];
                 quantize(source.row(y), luma, scale, factor, row);
-                for (((&src, &luma), &level), error) in source
-                    .row(y)
-                    .iter()
-                    .zip(luma)
-                    .zip(row.iter())
-                    .zip(&mut errors[y * w..][..w])
-                {
-                    *error = (fmla(src, scale, -(luma as f32) * factor) - f32::from(level)) * m;
-                }
+                dc_error(
+                    source.row(y),
+                    luma,
+                    row,
+                    scale,
+                    factor,
+                    m,
+                    &mut errors[y * w..][..w],
+                );
             }
             distortion += lowpass_energy(&errors, w, h, &kernel, &mut blurred);
             price.add(&levels, w, h, w);
-            if apply {
-                for y in 0..h {
-                    dc.quant_dc
-                        .plane_row_mut(0, y)
-                        .copy_from_slice(&levels[y * w..][..w]);
-                }
+            if let Some(keep) = keep.as_deref_mut() {
+                keep.push(levels[..w * h].to_vec());
             }
         }
         distortion + X_DC_STEP_LAMBDA * price.bits()
     };
     let candidates = ((1.0 - X_DC_STEP_FINEST) / X_DC_STEP_SPACING).round() as usize;
-    let mut best = (cost(1.0, false, groups), 1.0f32);
-    for k in 1..=candidates {
-        let multiplier = 1.0 - X_DC_STEP_SPACING * k as f32;
-        let m = crate::color_correlation::signaled_dc_step(0, base * multiplier) / base;
-        let candidate = cost(m, false, groups);
+    let multipliers: Vec<f32> = std::iter::once(1.0)
+        .chain((1..=candidates).map(|k| {
+            let multiplier = 1.0 - X_DC_STEP_SPACING * k as f32;
+            crate::color_correlation::signaled_dc_step(0, base * multiplier) / base
+        }))
+        .collect();
+    // Candidates are priced independently, then picked in order.
+    let shared: &[DcGroupData] = groups;
+    let costs = pool.steal_map(scratch, multipliers.len(), |i, _| {
+        cost(multipliers[i], shared, None)
+    });
+    let mut best = (costs[0], 1.0f32);
+    for (&m, &candidate) in multipliers.iter().zip(&costs).skip(1) {
         if candidate < best.0 {
             best = (candidate, m);
         }
     }
     if best.1 != 1.0 {
-        cost(best.1, true, groups);
+        let mut levels = Vec::with_capacity(groups.len());
+        cost(best.1, groups, Some(&mut levels));
+        for (dc, levels) in groups.iter_mut().zip(&levels) {
+            let w = dc.source_dc_x.as_ref().unwrap().xsize();
+            for (y, row) in levels.chunks_exact(w).enumerate() {
+                dc.quant_dc.plane_row_mut(0, y).copy_from_slice(row);
+            }
+        }
         dc_step[0] = base * best.1;
     }
     dc_step
@@ -690,6 +704,7 @@ fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut V
         tmp.fill(0.0);
         return 0.0;
     }
+    let add_scaled = crate::dc_ops::selected_add_scaled_fn();
     let r = kernel.len() / 2;
     let padded_len = w + kernel.len() - 1;
     // Reuse the plane's scratch allocation for the padded source row and
@@ -712,9 +727,7 @@ fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut V
         }
         dst.fill(0.0);
         for (j, &tap) in kernel.iter().enumerate() {
-            for (value, &sample) in dst.iter_mut().zip(&padded[j..j + w]) {
-                *value += tap * sample;
-            }
+            add_scaled(dst, &padded[j..j + w], tap);
         }
     }
     let mut energy = 0.0f64;
@@ -722,9 +735,7 @@ fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut V
         accum.fill(0.0);
         for (j, &tap) in kernel.iter().enumerate() {
             let row = mirror(y as isize + j as isize - r as isize, h);
-            for (value, &sample) in accum.iter_mut().zip(&horizontal[row * w..][..w]) {
-                *value += tap * sample;
-            }
+            add_scaled(accum, &horizontal[row * w..][..w], tap);
         }
         energy = accum.iter().fold(energy, |sum, &value| {
             let value = f64::from(value);
@@ -1291,6 +1302,8 @@ mod tests {
             &params,
             CflFrame::XYB,
             crate::group::quantize_dc_cfl_scalar,
+            &crate::thread_pool::ThreadPool::new(2),
+            &mut Default::default(),
         );
         assert!(step[0] < params.dc_step[0], "kept the default step");
         assert_eq!([step[1], step[2]], [params.dc_step[1], params.dc_step[2]]);
@@ -1323,6 +1336,8 @@ mod tests {
             &params,
             CflFrame::XYB,
             crate::group::quantize_dc_cfl_scalar,
+            &crate::thread_pool::ThreadPool::new(2),
+            &mut Default::default(),
         );
         assert_eq!(step, params.dc_step);
         assert!(
@@ -1347,6 +1362,8 @@ mod tests {
             &params,
             CflFrame::XYB,
             crate::group::quantize_dc_cfl_scalar,
+            &crate::thread_pool::ThreadPool::new(2),
+            &mut Default::default(),
         );
         assert_eq!(step, params.dc_step);
         assert!(

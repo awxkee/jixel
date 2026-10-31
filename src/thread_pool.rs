@@ -121,14 +121,18 @@ pub(crate) struct ThreadPool {
 
 impl ThreadPool {
     pub(crate) fn new(num_threads: usize) -> Self {
-        Self::new_with_scratch(num_threads, CoderScratch::default)
+        Self::new_with_scratch(num_threads, CoderScratch::default, None)
     }
 
     pub(crate) fn new_lossless(num_threads: usize) -> Self {
-        Self::new_with_scratch(num_threads, CoderScratch::lossless)
+        Self::new_with_scratch(num_threads, CoderScratch::lossless, None)
     }
 
-    fn new_with_scratch(num_threads: usize, make_scratch: fn() -> CoderScratch) -> Self {
+    fn new_with_scratch(
+        num_threads: usize,
+        make_scratch: fn() -> CoderScratch,
+        stack_size: Option<usize>,
+    ) -> Self {
         let num_threads = num_threads.max(1);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
@@ -138,8 +142,11 @@ impl ThreadPool {
         let workers = (1..num_threads)
             .map(|i| {
                 let shared = Arc::clone(&shared);
-                std::thread::Builder::new()
-                    .name(format!("jixel-worker-{i}"))
+                let mut builder = std::thread::Builder::new().name(format!("jixel-worker-{i}"));
+                if let Some(stack_size) = stack_size {
+                    builder = builder.stack_size(stack_size);
+                }
+                builder
                     .spawn(move || {
                         let mut scratch = Box::new(make_scratch());
                         worker_loop(&shared, &mut scratch);
@@ -157,6 +164,68 @@ impl ThreadPool {
     #[inline]
     pub(crate) fn num_threads(&self) -> usize {
         self.num_threads
+    }
+
+    /// Map work that does not need worker scratch, including work borrowing
+    /// entropy tables from the caller's scratch. A separate, lazy scratch lets
+    /// the caller help queued jobs without aliasing those borrowed tables.
+    pub(crate) fn map<T: Send>(&self, len: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        if self.num_threads <= 1 || len <= 1 {
+            return (0..len).map(f).collect();
+        }
+        let mut scratch = CoderScratch::lossless();
+        self.steal_map(&mut scratch, len, |i, _| f(i))
+    }
+
+    /// Visit disjoint mutable items without borrowing the caller's scratch.
+    pub(crate) fn for_each_mut<T: Send>(&self, items: &mut [T], f: impl Fn(usize, &mut T) + Sync) {
+        if self.num_threads <= 1 || items.len() <= 1 {
+            for (i, item) in items.iter_mut().enumerate() {
+                f(i, item);
+            }
+            return;
+        }
+        let mut scratch = CoderScratch::lossless();
+        self.steal_for_each_mut(&mut scratch, items, |i, item, _| f(i, item));
+    }
+
+    /// Run two independent jobs, allowing each to own or mutably borrow its
+    /// inputs. Running jobs finish before returning or propagating a panic.
+    pub(crate) fn join<A: Send, B: Send>(
+        &self,
+        first: impl FnOnce() -> A + Send,
+        second: impl FnOnce() -> B + Send,
+    ) -> (A, B) {
+        let (mut first, mut second) = (Some(first), Some(second));
+        let (mut a, mut b) = (None, None);
+        let mut run_first = || a = Some(first.take().unwrap()());
+        let mut run_second = || b = Some(second.take().unwrap()());
+        let mut jobs: [&mut (dyn FnMut() + Send); 2] = [&mut run_first, &mut run_second];
+        self.for_each_mut(&mut jobs, |_, run| run());
+        (a.unwrap(), b.unwrap())
+    }
+
+    /// Run stack regression tests on a pool worker whose stack is 64 KiB.
+    /// The caller waits without executing the job on its larger test stack.
+    #[cfg(test)]
+    pub(crate) fn on_small_stack(f: impl FnOnce() + Send + 'static) {
+        let pool = Self::new_with_scratch(2, CoderScratch::lossless, Some(64 * 1024));
+        let completion = Arc::new(Completion {
+            remaining: AtomicUsize::new(1),
+            panic: Mutex::new(None),
+        });
+        pool.shared.push(Task {
+            run: Box::new(move |_| f()),
+            completion: Arc::clone(&completion),
+        });
+        let mut queue = pool.shared.queue.lock().unwrap();
+        while completion.remaining.load(Ordering::Acquire) != 0 {
+            queue = pool.shared.activity.wait(queue).unwrap();
+        }
+        drop(queue);
+        if let Some(payload) = completion.panic.lock().unwrap().take() {
+            resume_unwind(payload);
+        }
     }
 
     pub(crate) fn steal_map<T, F>(
@@ -384,6 +453,98 @@ fn worker_loop(shared: &Shared, scratch: &mut CoderScratch) {
 #[cfg(test)]
 mod tests {
     use super::{CoderScratch, ThreadPool};
+
+    #[test]
+    fn scratch_free_jobs_reuse_workers_and_respect_thread_count() {
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+
+        for threads in [0, 1, 4] {
+            let pool = ThreadPool::new_lossless(threads);
+            let barrier = Barrier::new(pool.num_threads());
+            let workers = || {
+                pool.map(pool.num_threads(), |_| {
+                    let id = std::thread::current().id();
+                    barrier.wait();
+                    id
+                })
+                .into_iter()
+                .collect::<HashSet<_>>()
+            };
+            let first = workers();
+            assert_eq!(first.len(), threads.max(1));
+            assert_eq!(workers(), first);
+        }
+    }
+
+    #[test]
+    fn nested_scratch_free_jobs_can_borrow_worker_scratch() {
+        for threads in [1, 4] {
+            let pool = ThreadPool::new_lossless(threads);
+            let mut scratch = CoderScratch::lossless();
+            let results = pool.steal_map(&mut scratch, 32, |outer, scratch| {
+                scratch.alpha_tokens.clear();
+                scratch
+                    .alpha_tokens
+                    .push(crate::entropy::Token::new(0, outer as u32));
+                let tokens = &scratch.alpha_tokens;
+                let (value, values) = pool.join(
+                    || tokens[0].value,
+                    || pool.map(17, |inner| tokens[0].value as usize * 100 + inner),
+                );
+                assert_eq!(value, outer as u32);
+                assert_eq!(tokens[0].value, outer as u32);
+                values
+            });
+            for (outer, values) in results.into_iter().enumerate() {
+                assert_eq!(values, (0..17).map(|i| outer * 100 + i).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn thread_creation_is_confined_to_the_pool() {
+        fn check_dir(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    check_dir(&path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_name().unwrap() != "thread_pool.rs"
+                {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+                    for forbidden in [
+                        "thread::spawn",
+                        "thread::scope",
+                        "thread::Builder",
+                        "usestd::thread::{",
+                        "usestd::thread::*",
+                    ] {
+                        assert!(
+                            !compact.contains(forbidden),
+                            "{} creates threads outside ThreadPool ({forbidden})",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for dir in [
+            "src",
+            "app/src",
+            "stats/src",
+            "meanstats/src",
+            "tuner/src",
+            "tools",
+        ] {
+            let dir = root.join(dir);
+            if dir.is_dir() {
+                check_dir(&dir);
+            }
+        }
+    }
 
     #[test]
     fn persistent_pool_preserves_index_order() {

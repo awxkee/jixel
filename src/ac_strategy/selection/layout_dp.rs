@@ -72,7 +72,7 @@ const VISIT_BUDGET: usize = 5_000;
 /// A piece is scored in full only while its luma-and-rate lower bound stays
 /// under this fraction of the best tiling of its rectangle by smaller pieces.
 const BOUND_SLACK: f32 = 0.9;
-const STRATEGIES: [u8; 9] = [
+static STRATEGIES: [u8; 9] = [
     STRATEGY_DCT,
     STRATEGY_DCT16X8,
     STRATEGY_DCT8X16,
@@ -84,7 +84,7 @@ const STRATEGIES: [u8; 9] = [
     STRATEGY_DCT32X32,
 ];
 /// The coefficient-model pass: DCT8 leaves, pairs and 16x16 squares only.
-const COEFFICIENT_STRATEGIES: [u8; 4] = [
+static COEFFICIENT_STRATEGIES: [u8; 4] = [
     STRATEGY_DCT,
     STRATEGY_DCT16X8,
     STRATEGY_DCT8X16,
@@ -256,15 +256,23 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
             };
         }
     }
+    assert!(width <= SIDE && height <= SIDE);
+    let regions = &mut s.regions[..REGION_COUNT];
+    // SAFETY: every region read or written below lies inside the
+    // width x height <= SIDE x SIDE tile, so region_index < REGION_COUNT.
+    let cost_of = |regions: &[Entry], x, y, w, h| unsafe {
+        regions.get_unchecked(region_index(x, y, w, h)).cost
+    };
     for h in 1..=height {
         for w in 1..=width {
             for y in 0..=height - h {
                 for x in 0..=width - w {
                     let slot = region_index(x, y, w, h);
-                    let mut best = s.regions[slot];
+                    // SAFETY: as above.
+                    let mut best = unsafe { *regions.get_unchecked(slot) };
                     for cut in 1..w {
-                        let cost = s.regions[region_index(x, y, cut, h)].cost
-                            + s.regions[region_index(x + cut, y, w - cut, h)].cost;
+                        let cost = cost_of(regions, x, y, cut, h)
+                            + cost_of(regions, x + cut, y, w - cut, h);
                         if cost < best.cost {
                             best = Entry {
                                 cost,
@@ -273,8 +281,8 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
                         }
                     }
                     for cut in 1..h {
-                        let cost = s.regions[region_index(x, y, w, cut)].cost
-                            + s.regions[region_index(x, y + cut, w, h - cut)].cost;
+                        let cost = cost_of(regions, x, y, w, cut)
+                            + cost_of(regions, x, y + cut, w, h - cut);
                         if cost < best.cost {
                             best = Entry {
                                 cost,
@@ -282,7 +290,8 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
                             };
                         }
                     }
-                    s.regions[slot] = best;
+                    // SAFETY: as above.
+                    unsafe { *regions.get_unchecked_mut(slot) = best };
                 }
             }
         }
@@ -384,23 +393,28 @@ fn prepare_packing_bound(
         let Some(leave) = leave else {
             break;
         };
-        let pivot = s.tableau[leave * cols + enter];
-        for col in 0..cols {
-            s.tableau[leave * cols + col] /= pivot;
+        // Row slices: every other row reads only the pivot row, and the
+        // elementwise updates vectorize without per-index checks.
+        let (above, rest) = s.tableau[..rows * cols].split_at_mut(leave * cols);
+        let (pivot_row, below) = rest.split_at_mut(cols);
+        let pivot = pivot_row[enter];
+        for v in pivot_row.iter_mut() {
+            *v /= pivot;
         }
-        s.tableau[leave * cols + enter] = 1.0;
-        for row in 0..rows {
-            if row == leave {
-                continue;
-            }
-            let factor = s.tableau[row * cols + enter];
+        pivot_row[enter] = 1.0;
+        let pivot_row = &*pivot_row;
+        for row in above
+            .chunks_exact_mut(cols)
+            .chain(below.chunks_exact_mut(cols))
+        {
+            let factor = row[enter];
             if factor == 0.0 {
                 continue;
             }
-            for col in 0..cols {
-                s.tableau[row * cols + col] -= factor * s.tableau[leave * cols + col];
+            for (v, &p) in row.iter_mut().zip(pivot_row) {
+                *v -= factor * p;
             }
-            s.tableau[row * cols + enter] = 0.0;
+            row[enter] = 0.0;
         }
         basis[leave] = enter;
     }
@@ -470,15 +484,22 @@ fn prepare_bounds(candidates: &[Candidate], width: usize, height: usize, s: &mut
     }
     s.rows.clear();
     s.rows.resize(LINE_COUNT, f64::INFINITY);
+    assert!(width <= SIDE);
+    let rows = &mut s.rows[..LINE_COUNT];
     for (y, edges) in horizontal.iter().enumerate().take(height) {
         for end in 0..=width {
-            s.rows[line_index(y, end, end)] = 0.0;
+            // SAFETY: y < SIDE and every start <= end <= width <= SIDE, so
+            // each line_index below is under LINE_COUNT.
+            unsafe { *rows.get_unchecked_mut(line_index(y, end, end)) = 0.0 };
             for x in (0..end).rev() {
                 let mut best = f64::INFINITY;
-                for w in 1..=end - x {
-                    best = best.min(add_lower(edges[x][w], s.rows[line_index(y, x + w, end)]));
+                for (w, &edge) in edges[x].iter().enumerate().take(end - x + 1).skip(1) {
+                    // SAFETY: as above, with start = x + w <= end.
+                    let tail = unsafe { *rows.get_unchecked(line_index(y, x + w, end)) };
+                    best = best.min(add_lower(edge, tail));
                 }
-                s.rows[line_index(y, x, end)] = best;
+                // SAFETY: as above.
+                unsafe { *rows.get_unchecked_mut(line_index(y, x, end)) = best };
             }
         }
     }
@@ -1145,6 +1166,9 @@ struct CoefficientScores<'a, 'b> {
     selection: &'a SelectionContext<'b>,
     bx: usize,
     by: usize,
+    /// The band's first row and the merge search's DCT8 costs of its rows:
+    /// the same `strategy_cost` this pass would compute.
+    dct8: (usize, &'a [f32]),
 }
 
 impl CoefficientScores<'_, '_> {
@@ -1159,33 +1183,40 @@ impl CoefficientScores<'_, '_> {
                 return hit.cost;
             }
             let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
-            let cost = strategy_cost(
-                params.ctx,
-                coder,
-                p.strategy,
-                params.opsin,
-                px,
-                py,
-                region_qac(
-                    self.selection.quant_field,
-                    x,
-                    y,
-                    p.width(),
-                    p.height(),
-                    params.scale,
+            let stride = self.selection.quant_field.xsize();
+            let cached = (p.strategy == STRATEGY_DCT && y >= self.dct8.0)
+                .then(|| self.dct8.1.get((y - self.dct8.0) * stride + x).copied())
+                .flatten()
+                .filter(|cost| !cost.is_nan());
+            let cost = cached.unwrap_or_else(|| {
+                strategy_cost(
+                    params.ctx,
+                    coder,
+                    p.strategy,
+                    params.opsin,
+                    px,
+                    py,
+                    region_qac(
+                        self.selection.quant_field,
+                        x,
+                        y,
+                        p.width(),
+                        p.height(),
+                        params.scale,
+                        params.distance,
+                    ),
+                    params.qm_mult_x,
+                    self.selection.meta_r,
                     params.distance,
-                ),
-                params.qm_mult_x,
-                self.selection.meta_r,
-                params.distance,
-                cmap_factors(
-                    params.ctx.cfl_frame(),
-                    params.ytox_map,
-                    params.ytob_map,
-                    x,
-                    y,
-                ),
-            );
+                    cmap_factors(
+                        params.ctx.cfl_frame(),
+                        params.ytox_map,
+                        params.ytob_map,
+                        x,
+                        y,
+                    ),
+                )
+            });
             let score = ReconStrategyCost { cost, ..UNMEASURED };
             if cost.is_finite() {
                 cache.global.insert(global_key, score);
@@ -1203,23 +1234,39 @@ const SMALL_WIDE: u16 = 2;
 const SMALL_TALL: u16 = 3;
 const SMALL_SQUARE: u16 = 4;
 const SMALL_STATES: usize = 1 << (SIDE + 2);
+const SMALL_PARENTS: usize = SMALL_STATES / 2;
 
 /// Exact broken-profile DP over 1x1, 2x1, 1x2 and 2x2 pieces on a `w x h`
 /// grid of at most 8x8 cells. Cells are visited in row-major order; a state
 /// holds the filled flags of the next `w + 2` cells, which is all a piece
 /// anchored at the current cell can reach.
-#[derive(Default)]
 struct SmallPlanner {
-    cost: Vec<f32>,
-    next: Vec<f32>,
-    from: Vec<u16>,
-    /// States with a finite cost in `cost` / `next`.
-    active: Vec<u16>,
-    next_active: Vec<u16>,
-    /// Per visited cell, its reached states as `(state, previous_state << 3 | choice)`.
-    layers: Vec<(u16, u16)>,
-    layer_start: Vec<usize>,
+    cost: Box<[f32; SMALL_STATES]>,
+    next: Box<[f32; SMALL_STATES]>,
+    /// States with a finite cost in `cost` / `next`, the first `active_len`
+    /// and `next_len` entries. Each state enters a list at most once.
+    active: Box<[u16; SMALL_STATES]>,
+    next_active: Box<[u16; SMALL_STATES]>,
+    active_len: usize,
+    /// Direct predecessors (`previous_state << 3 | choice`) per cell and state,
+    /// `SMALL_PARENTS` per cell. The incoming fixed bit is constant within a
+    /// layer, so omit that bit.
+    parents: Vec<[u16; SMALL_PARENTS]>,
     plan: Vec<(usize, u16)>,
+}
+
+impl Default for SmallPlanner {
+    fn default() -> Self {
+        Self {
+            cost: Box::new([f32::INFINITY; SMALL_STATES]),
+            next: Box::new([f32::INFINITY; SMALL_STATES]),
+            active: Box::new([0; SMALL_STATES]),
+            next_active: Box::new([0; SMALL_STATES]),
+            active_len: 0,
+            parents: Vec::new(),
+            plan: Vec::new(),
+        }
+    }
 }
 
 /// Costs of the four piece shapes anchored at each cell (`y * w + x`).
@@ -1267,42 +1314,44 @@ fn plan_small(
         };
         live[i] = u8::from(wide) | u8::from(tall) << 1 | u8::from(square) << 2;
     }
-    if s.cost.len() != SMALL_STATES {
-        s.cost = vec![f32::INFINITY; SMALL_STATES];
-        s.next = vec![f32::INFINITY; SMALL_STATES];
-        s.from = vec![0; SMALL_STATES];
+    if s.parents.len() < cells {
+        s.parents.resize(cells, [0; SMALL_PARENTS]);
     }
-    s.active.clear();
-    s.layers.clear();
-    s.layer_start.clear();
+    // States fit in w + 2 <= SIDE + 2 bits and predecessors in w + 1 bits:
+    // the index masks below are no-ops that let the compiler drop checks.
+    const STATE_MASK: usize = SMALL_STATES - 1;
+    const PARENT_MASK: usize = SMALL_PARENTS - 1;
     let start = (fixed & ((1u64 << (w + 2)) - 1)) as usize;
     s.cost[start] = 0.0;
-    s.active.push(start as u16);
+    s.active[0] = start as u16;
+    s.active_len = 1;
     for i in 0..cells {
         let incoming = bit(i + w + 2) << (w + 1);
         let SmallPlanner {
             cost,
             next,
-            from,
             active,
             next_active,
-            layers,
-            layer_start,
+            active_len,
+            parents,
             ..
         } = &mut *s;
-        next_active.clear();
-        for &state in active.iter() {
-            let state = state as usize;
+        let from = &mut parents[i];
+        let mut next_len = 0usize;
+        for &state in &active[..*active_len] {
+            let state = state as usize & STATE_MASK;
             let here = cost[state];
             cost[state] = f32::INFINITY;
             let mut relax = |filled: usize, cost: f32, choice: u16| {
-                let to = (filled >> 1) | incoming;
+                let shifted = filled >> 1;
+                let to = (shifted | incoming) & STATE_MASK;
                 if cost < next[to] {
                     if next[to] == f32::INFINITY {
-                        next_active.push(to as u16);
+                        next_active[next_len & STATE_MASK] = to as u16;
+                        next_len += 1;
                     }
                     next[to] = cost;
-                    from[to] = (state as u16) << 3 | choice;
+                    from[shifted & PARENT_MASK] = (state as u16) << 3 | choice;
                 }
             };
             if state & 1 != 0 {
@@ -1326,27 +1375,23 @@ fn plan_small(
                 );
             }
         }
-        layer_start.push(layers.len());
-        layers.extend(next_active.iter().map(|&to| (to, from[to as usize])));
         std::mem::swap(cost, next);
         std::mem::swap(active, next_active);
+        *active_len = next_len;
     }
     out.clear();
     let total = s.cost[0];
-    for &state in &s.active {
-        s.cost[state as usize] = f32::INFINITY;
+    for &state in &s.active[..s.active_len] {
+        s.cost[state as usize & STATE_MASK] = f32::INFINITY;
     }
     if !total.is_finite() {
         return total;
     }
     let mut state = 0u16;
     for i in (0..cells).rev() {
-        let end = s.layer_start.get(i + 1).copied().unwrap_or(s.layers.len());
-        let layer = &s.layers[s.layer_start[i]..end];
-        let &(_, from) = layer
-            .iter()
-            .find(|&&(reached, _)| reached == state)
-            .expect("the optimum's states were all reached");
+        // Every reached predecessor was written during this plan. Unreached
+        // entries may retain old values; no clearing or layer copies are needed.
+        let from = s.parents[i][state as usize & (SMALL_PARENTS - 1) & ((1 << (w + 1)) - 1)];
         let choice = from & 7;
         if choice != SMALL_PREFILLED {
             out.push((i, choice));
@@ -1415,6 +1460,13 @@ fn search_tile_coefficient(
         cache.current = current;
         return;
     }
+    let unaligned = scores
+        .selection
+        .params
+        .ctx
+        .speed
+        .effort()
+        .layout_dp_unaligned;
     let mut costs = SmallCosts {
         leaf: [f32::INFINITY; SIDE * SIDE],
         wide: [f32::INFINITY; SIDE * SIDE],
@@ -1432,6 +1484,18 @@ fn search_tile_coefficient(
             ] {
                 let p = Piece::new(x, y, small_strategy(choice));
                 if x + p.width() > width || y + p.height() > height || cells(p) & blocked != 0 {
+                    continue;
+                }
+                // Without unaligned placements a piece stays inside its
+                // aligned 2x2 quad.
+                let (gx, gy) = (scores.bx + x, scores.by + y);
+                let off_grid = match choice {
+                    SMALL_WIDE => gx % 2 != 0,
+                    SMALL_TALL => gy % 2 != 0,
+                    SMALL_SQUARE => gx % 2 != 0 || gy % 2 != 0,
+                    _ => false,
+                };
+                if off_grid && !unaligned {
                     continue;
                 }
                 let legal = if crossing {
@@ -1700,7 +1764,12 @@ fn find_coefficient(
                 continue;
             }
             search_tile_coefficient(
-                &CoefficientScores { selection, bx, by },
+                &CoefficientScores {
+                    selection,
+                    bx,
+                    by,
+                    dct8: (band.0, &output.dct8_costs),
+                },
                 coder,
                 &mut cache,
                 map,
@@ -1821,6 +1890,7 @@ mod tests {
             effort.layout_dp_coefficient && !effort.layout_retile
         };
         assert!(!gate(crate::Speed::UltraFast));
+        assert!(gate(crate::Speed::Fastest));
         assert!(gate(crate::Speed::Fast));
         assert!(gate(crate::Speed::Medium));
         assert!(!gate(crate::Speed::MediumSlow));

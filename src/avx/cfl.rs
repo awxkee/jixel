@@ -411,3 +411,61 @@ mod tests {
         }
     }
 }
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn cost_term(
+    mv: __m256,
+    sv: __m256,
+    factor: f32,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> __m256 {
+    let factor_v = _mm256_set1_ps(factor);
+    let weight_v = _mm256_set1_ps(weight);
+    let zero = _mm256_setzero_ps();
+    let one = _mm256_set1_ps(1.0);
+    let half = _mm256_set1_ps(0.5);
+    let sign = _mm256_set1_ps(-0.0);
+    let nonzero_bits = _mm256_set1_ps(lambda * CFL_NONZERO_BITS);
+    let magnitude_bits = _mm256_set1_ps(lambda * CFL_MAGNITUDE_BITS);
+    let residual = _mm256_sub_ps(sv, _mm256_mul_ps(factor_v, mv));
+    let zero_cost = _mm256_mul_ps(_mm256_mul_ps(weight_v, residual), residual);
+
+    // Match f32::round (ties away from zero), including values just below
+    // half-integers that adding 0.5 before truncation would round up.
+    let truncated = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(residual);
+    let fraction = _mm256_andnot_ps(sign, _mm256_sub_ps(residual, truncated));
+    let at_least_half = _mm256_cmp_ps::<_CMP_GE_OQ>(fraction, half);
+    let signed_one = _mm256_or_ps(one, _mm256_and_ps(sign, residual));
+    let level = _mm256_add_ps(truncated, _mm256_and_ps(signed_one, at_least_half));
+
+    let coded_err = _mm256_sub_ps(residual, avx_dequantized_level_f32(level, bias));
+    let abs_level = _mm256_andnot_ps(sign, level);
+    // Clamp zero levels before taking log2; their coded cost is masked out.
+    let log2_level = avx2_log2p1_f32(_mm256_max_ps(_mm256_sub_ps(abs_level, one), zero));
+    let bits = _mm256_fmadd_ps(magnitude_bits, log2_level, nonzero_bits);
+    let coded = _mm256_add_ps(
+        _mm256_mul_ps(_mm256_mul_ps(weight_v, coded_err), coded_err),
+        bits,
+    );
+    let nonzero = _mm256_cmp_ps::<_CMP_GT_OQ>(abs_level, zero);
+    _mm256_min_ps(zero_cost, _mm256_blendv_ps(zero_cost, coded, nonzero))
+}
+#[target_feature(enable = "avx2,fma")]
+fn cost_load(v: &[f32; 8]) -> __m256 {
+    unsafe { _mm256_loadu_ps(v.as_ptr()) }
+}
+
+crate::color_correlation::rd_costs::batched_costs!(
+    "avx2,fma",
+    8,
+    cfl_rd_costs_avx2,
+    cfl_rd_cost_avx2,
+    cost_term,
+    cost_load,
+    _mm256_set1_ps,
+    _mm256_add_ps,
+    hsum256
+);

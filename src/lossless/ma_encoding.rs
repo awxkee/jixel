@@ -498,13 +498,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
-    let estimate = estimate_coded_bits(
-        &[stream],
-        distance_ctx,
-        &code,
-        min_symbol,
-        pool.num_threads(),
-    );
+    let estimate = estimate_coded_bits(&[stream], distance_ctx, &code, min_symbol, Some(pool));
     if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
         return;
     }
@@ -564,8 +558,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
-    let estimate =
-        estimate_coded_bits(&slices, distance_ctx, &code, min_symbol, pool.num_threads());
+    let estimate = estimate_coded_bits(&slices, distance_ctx, &code, min_symbol, Some(pool));
     if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
         return;
     }
@@ -610,57 +603,27 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     write_wp_header(wp_params, &mut sections[ac_global_idx]);
     sections[ac_global_idx].zero_pad_to_byte();
 
-    // Every AC group section is independent given the code (scoped
-    // threads: the code borrows the worker scratch the pool would need).
-    let code_ref = &code;
-    let group_streams = &streams[1..];
-    let group_tails = &tails[1..];
-    let threads = pool.num_threads().clamp(1, num_ac_groups.max(1));
-    let chunk = num_ac_groups.div_ceil(threads).max(1);
-    let group_sections: Vec<BitWriter> = std::thread::scope(|scope| {
-        let handles: Vec<_> = group_streams
-            .chunks(chunk)
-            .enumerate()
-            .map(|(part_index, part)| {
-                let first = part_index * chunk;
-                scope.spawn(move || {
-                    part.iter()
-                        .enumerate()
-                        .map(|(offset, stream)| {
-                            let mut section = BitWriter::new();
-                            section.write(1, 1);
-                            write_wp_header(wp_params, &mut section);
-                            // A palettised group declares its own Palette
-                            // transform here; every other group has none.
-                            match source.group_override(first + offset) {
-                                Some(over) => {
-                                    write_palette_transform(
-                                        over.num_c,
-                                        over.nb_colors,
-                                        &mut section,
-                                    );
-                                }
-                                None => section.write(2, 0),
-                            }
-                            write_lz_section_tail(
-                                stream,
-                                group_tails[first + offset],
-                                distance_ctx,
-                                code_ref,
-                                min_symbol,
-                                &mut section,
-                            );
-                            section.zero_pad_to_byte();
-                            section
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("group section writer"))
-            .collect()
+    // The code borrows caller scratch; scratch-free maps let the same pool
+    // write the independent group sections without aliasing that storage.
+    let group_sections = pool.map(num_ac_groups, |group| {
+        let mut section = BitWriter::new();
+        section.write(1, 1);
+        write_wp_header(wp_params, &mut section);
+        // A palettised group declares its own Palette transform here.
+        match source.group_override(group) {
+            Some(over) => write_palette_transform(over.num_c, over.nb_colors, &mut section),
+            None => section.write(2, 0),
+        }
+        write_lz_section_tail(
+            &streams[1 + group],
+            tails[1 + group],
+            distance_ctx,
+            &code,
+            min_symbol,
+            &mut section,
+        );
+        section.zero_pad_to_byte();
+        section
     });
     for (group_index, section) in group_sections.into_iter().enumerate() {
         sections[2 + num_dc_groups + group_index] = section;

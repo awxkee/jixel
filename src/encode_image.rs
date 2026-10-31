@@ -1297,8 +1297,13 @@ pub fn encode_image(
     // The ink plan serves both layer paths: the ink stack codes it, and the
     // vector race reads its glyph-text flag.
     let layers = config.coding_transform == CodingTransform::Xyb && !config.progressive_dc;
-    let ink_candidates = (layers && (config.ink_layer || (config.vector_layers && config.patches)))
-        .then(|| crate::ink_layer::InkCandidates::new_fast(input, None, width, height))
+    let ink_candidates = (layers
+        && width * height >= 64 * 64
+        && (config.ink_layer || (config.vector_layers && config.patches)))
+        .then(|| {
+            let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+            crate::ink_layer::InkCandidates::new_fast(input, None, width, height, &pool)
+        })
         .flatten();
     let ink_plan = ink_candidates.and_then(|candidates| candidates.select(config.distance));
     let plain_encode = || {
@@ -1447,16 +1452,18 @@ fn select_ink_layered(
     // and the model does not see them: the plain encode decides, and the
     // stack has no quality edge over patched text to pay for.
     let glyph_text = plan.glyph_text && config.patches;
-    let stack = InkStack::new(plan, width, height, config, alpha, budget)?;
-    if !glyph_text && stack.bytes.len() as f64 <= budget {
-        return Ok(stack.bytes);
+    // Only the bytes outlive the stack: release its planes and context before
+    // the plain encode allocates its own.
+    let stack = InkStack::new(plan, width, height, config, alpha, budget)?.bytes;
+    if !glyph_text && stack.len() as f64 <= budget {
+        return Ok(stack);
     }
     // Past the modeled VarDCT size the plain encode decides: the stack, exact
     // on its strokes, may cost one quality step more than it.
     let plain = ordinary()?;
     let step = if glyph_text { 1.0 } else { INK_STACK_STEP };
-    Ok(if stack.bytes.len() as f64 <= plain.len() as f64 * step {
-        stack.bytes
+    Ok(if stack.len() as f64 <= plain.len() as f64 * step {
+        stack
     } else {
         plain
     })
@@ -1556,10 +1563,8 @@ impl InkStack {
                 }
             })
             .collect();
-        let pixels = self.width * self.height;
-        let opaque = alpha
-            .is_none()
-            .then(|| AlphaPlane::from_u8(vec![255; pixels]));
+        // The image header reads only the alpha bit depth.
+        let opaque = alpha.is_none().then(|| AlphaPlane::from_u8(Vec::new()));
         let base_alpha = alpha.or(opaque.as_ref()).expect("base alpha");
         let mut w = BitWriter::new();
         w.write(8, 0xFF);
@@ -1595,7 +1600,7 @@ impl InkStack {
             &self.ctx,
             &transform,
             &palette,
-            &indices,
+            indices,
             self.width,
             self.height,
             config,
@@ -1687,7 +1692,7 @@ fn encode_ink_frame(
     ctx: &EncodingContext,
     transform: &ColorTransform<crate::color::TransferLut>,
     colors: &[([u8; 3], u8)],
-    indices: &[u8],
+    indices: Vec<u8>,
     width: usize,
     height: usize,
     config: &EncodeConfig,
@@ -1715,6 +1720,7 @@ fn encode_ink_frame(
             *a = palette[k as usize].1;
         }
     }
+    drop(indices);
     let alpha = AlphaPlane::from_u8(alpha);
     // The ink frame is a full-resolution learned-tree frame: Slow's LZ77 and
     // refinement take 14% off it on text and the base already paid the time.
@@ -1927,9 +1933,11 @@ pub fn encode_image_with_alpha(
         let AlphaPlane::U8(alpha_bytes) = &alpha else {
             unreachable!()
         };
-        if let Some(candidates) =
-            crate::ink_layer::InkCandidates::new_fast(&rgb, Some(alpha_bytes), width, height)
-        {
+        let candidates = {
+            let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+            crate::ink_layer::InkCandidates::new_fast(&rgb, Some(alpha_bytes), width, height, &pool)
+        };
+        if let Some(candidates) = candidates {
             let plan = candidates.select(config.distance);
             let budget = crate::vector_layers::vardct_bytes(&rgb, width, height, config.distance);
             drop(rgb);

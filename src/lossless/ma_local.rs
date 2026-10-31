@@ -477,7 +477,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );
-    let estimate = estimate_coded_bits(&[stream], distance_ctx, &code, min_symbol, 1);
+    let estimate = estimate_coded_bits(&[stream], distance_ctx, &code, min_symbol, None);
     if estimate >= *best_estimate * VARIANT_WRITE_TOLERANCE {
         return;
     }
