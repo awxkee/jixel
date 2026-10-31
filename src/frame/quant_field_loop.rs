@@ -42,6 +42,7 @@ use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::encoding_context::EncodingContext;
 use crate::entropy::TokenSlice;
 use crate::image::{Image3F, Image3S};
+use crate::util::EncodeError;
 
 /// Closed-loop quant-field refinement (ExtraSlow). Every group is re-quantized
 /// the way pass 2 codes it (custom scan orders, RDOQ at the frozen token
@@ -55,6 +56,11 @@ use crate::image::{Image3F, Image3S};
 /// arbiter's exact metric and kept only if `-deficit - slope * log rate`
 /// improves.
 #[allow(clippy::too_many_arguments)]
+/// Re-runs the frame's DC-group setup (quant field, layout, CfL and the
+/// frame-level follow-ups) under the context's current selection tables.
+pub(super) type Reselect<'a> =
+    &'a mut dyn FnMut(&mut CoderScratch) -> Result<Vec<DcGroupData>, EncodeError>;
+
 pub(super) fn run_quant_field_loop(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -72,6 +78,7 @@ pub(super) fn run_quant_field_loop(
     qf_threshold: u32,
     prices: &crate::entropy::FrozenTokenPrices,
     want_recon: bool,
+    reselect: Option<Reselect<'_>>,
 ) -> Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> {
     /// Marginals and slope come from plain quantization; the ratio of deficit
     /// to bits is what the trellis preserves, at a third of the cost.
@@ -90,6 +97,11 @@ pub(super) fn run_quant_field_loop(
     const MAX_MOVE_FRACTION: f32 = 0.3;
     const MAX_ABS_MOVE: i8 = 2;
     const MIN_FIELD: u8 = 1;
+    /// Luma gradient density above which the selection-scale race runs.
+    const SELECTION_RACE_TEXTURE: f32 = 0.03;
+    /// Rate gap (% of the incumbent's bits) within which a race arm is
+    /// compared at its own rate.
+    const RACE_RATE_MATCH_TOLERANCE: f32 = 0.5;
 
     let (w, h) = (dim.xsize, dim.ysize);
     let (xb, yb) = (w.div_ceil(K_BLOCK_DIM), h.div_ceil(K_BLOCK_DIM));
@@ -511,6 +523,153 @@ pub(super) fn run_quant_field_loop(
     }
     let rate_term = |bits: f32| 100.0 * (bits / ref_bits).ln();
     let mut cur_bits = ref_bits;
+
+    // ---- Selection-scale race (synthetic content) ----
+    // The selector's large-transform calibration is right for photos but
+    // image- and distance-dependent on screen and synthetic content, where
+    // it is worth 2..10 % at matched quality. Re-run the DC-group setup with
+    // the 16/32 tables scaled for selection only (coding tables and header
+    // unchanged) and keep the layout the exact metric prefers.
+    // Gate: saturated content and high-contrast fine detail (game art,
+    // line illustrations, dense texture: luma gradient density ≥ 0.03 on
+    // the probe corpora, where photos sit at 0.002–0.03). Screenshots are
+    // left out: the ExtraSlow layout loop already handles them and forced
+    // scales lose there. Arms are compared at the incumbent's rate, so no
+    // exchange rate is needed here.
+    if let Some(reselect) = reselect
+        && ctx.arbiter == Arbiter::Ssimulacra2
+        && ctx.coding.is_xyb()
+        && (ctx.chroma_heavy() || ctx.luma_texture() >= SELECTION_RACE_TEXTURE)
+    {
+        static FAMILY_WALK: [f32; 3] = [1.25, 1.6, 0.85];
+        {
+            // Layouts move the rate by several percent, beyond what the
+            // linear exchange rate prices well. Each arm is judged at the
+            // incumbent's rate instead: its deficit is interpolated between
+            // its own field and the field shifted one step towards the
+            // incumbent's bits, and the evaluation nearer that rate is what
+            // gets adopted.
+            let mut cur_d = reference.deficit(&cur.recon);
+            let mut adopted = false;
+            // Fresh DC groups carry no retained source DC; where the frame
+            // keeps it, the adopted evaluation's per-task planes rebuild it.
+            let keep_source: Vec<bool> = dc_datas.iter().map(|d| d.source_dc_y.is_some()).collect();
+            // 1.25 first; finer only if it won, coarser only if it lost.
+            let mut i = 0;
+            while i < FAMILY_WALK.len() {
+                let family = FAMILY_WALK[i];
+                ctx.set_selection_family(distp.distance, Some(family));
+                let datas = reselect(scratch);
+                ctx.set_selection_family(distp.distance, None);
+                let Ok(mut datas) = datas else { break };
+                let mut e = new_eval();
+                evaluate(
+                    ctx,
+                    scratch,
+                    opsin,
+                    dim,
+                    distp,
+                    &datas,
+                    ac_tasks,
+                    group_coords,
+                    num_passes,
+                    coeff_shifts,
+                    coeff_orders,
+                    order_alternatives,
+                    ytob_dc,
+                    qf_threshold,
+                    Some(prices),
+                    &all_tasks,
+                    None,
+                    &mut e,
+                );
+                let mut bits = frame_bits(&e);
+                let r_cur = rate_term(cur_bits);
+                let (r0, d0) = (rate_term(bits), reference.deficit(&e.recon));
+                let mut d_at = d0;
+                if (r0 - r_cur).abs() > RACE_RATE_MATCH_TOLERANCE {
+                    let step: i8 = if r0 < r_cur { 1 } else { -1 };
+                    let (_, saved) = apply(&mut datas, &all_moves(step));
+                    let mut shifted = new_eval();
+                    evaluate(
+                        ctx,
+                        scratch,
+                        opsin,
+                        dim,
+                        distp,
+                        &datas,
+                        ac_tasks,
+                        group_coords,
+                        num_passes,
+                        coeff_shifts,
+                        coeff_orders,
+                        order_alternatives,
+                        ytob_dc,
+                        qf_threshold,
+                        Some(prices),
+                        &all_tasks,
+                        None,
+                        &mut shifted,
+                    );
+                    let bits1 = frame_bits(&shifted);
+                    let (r1, d1) = (rate_term(bits1), reference.deficit(&shifted.recon));
+                    if (r1 - r0).abs() > 1e-3 {
+                        d_at = d0 + (d1 - d0) * (r_cur - r0) / (r1 - r0);
+                    }
+                    if (r1 - r_cur).abs() < (r0 - r_cur).abs() {
+                        e = shifted;
+                        bits = bits1;
+                    } else {
+                        restore(&mut datas, saved);
+                    }
+                }
+                let won = d_at < cur_d - 1e-6;
+                if won {
+                    for (slot, data) in dc_datas.iter_mut().zip(datas) {
+                        *slot = data;
+                    }
+                    cur_d = reference.deficit(&e.recon);
+                    cur = e;
+                    cur_bits = bits;
+                    adopted = true;
+                }
+                i = match (i, won) {
+                    (0, true) => 1,
+                    (0, false) => 2,
+                    _ => FAMILY_WALK.len(),
+                };
+            }
+            if adopted {
+                if let Some(memo) = memo {
+                    // The memo describes the previous layout's blocks.
+                    for m in memo {
+                        *m.lock().expect("block memo") = None;
+                    }
+                }
+                for (t, source) in cur.source_dc.iter().enumerate() {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (Some(source), true) = (source, keep_source[dc_idx]) else {
+                        continue;
+                    };
+                    let dc = &mut dc_datas[dc_idx];
+                    let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+                    let ox = gx * K_GROUP_DIM_IN_BLOCKS;
+                    let oy = gy * K_GROUP_DIM_IN_BLOCKS;
+                    for (target, plane) in [
+                        (&mut dc.source_dc_y, &source.y),
+                        (&mut dc.source_dc_b, &source.b),
+                        (&mut dc.source_dc_x, &source.x),
+                    ] {
+                        let target = target.get_or_insert_with(|| crate::image::Plane::new(w, h));
+                        for y in 0..plane.ysize() {
+                            target.row_mut(oy + y)[ox..ox + plane.xsize()]
+                                .copy_from_slice(plane.row(y));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // The incremental state follows every accepted move exactly. Defer the
     // SSIM state until after the full-frame marginal scores: their temporary
     // images would otherwise overlap its retained reconstruction pyramids.
@@ -1972,6 +2131,7 @@ pub(super) fn run_quant_field_loop(
         let cv_prepared =
             cv_dc_ref.and_then(|_| crate::cvvdp_arbiter::CvvdpArbiter::prepare(opsin));
         let cv_prepared_ref = cv_prepared.as_ref();
+        let area_budget = crate::ac_strategy::content_selection_enabled(ctx, distp.distance);
         let build = move || -> Box<crate::coef_polish::CoefPolisher> {
             let state = reference_ref.state(recon_ref);
             let cv = cv_dc_ref.and_then(|dc| {
@@ -1986,12 +2146,10 @@ pub(super) fn run_quant_field_loop(
                     cv_lambda,
                 ))
             });
-            Box::new(crate::coef_polish::CoefPolisher::new(
-                recon_ref.clone(),
-                state,
-                lambda_bits,
-                cv,
-            ))
+            let mut polisher =
+                crate::coef_polish::CoefPolisher::new(recon_ref.clone(), state, lambda_bits, cv);
+            polisher.set_area_budget(area_budget);
+            Box::new(polisher)
         };
         let results = ctx.thread_pool.steal_map(scratch, chunks, |ci, scratch| {
             scratch.ac_group.polisher = Some(build());

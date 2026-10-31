@@ -331,7 +331,7 @@ pub(crate) fn selected_chroma_gradient_sums_fn() -> ChromaGradientSumsFn {
 /// |∇X| + |∇(B−Y)| per sampled pixel pair over the frame's mean |X| + |B−Y|
 /// (`saturation_stat`). High on thin chromatic detail over low-chroma
 /// ground, low on saturated smooth subjects however colorful.
-fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F, saturation_stat: f32) -> [f32; 3] {
+fn chroma_gradient_stats(ctx: &EncodingContext, xyb: &Image3F, saturation_stat: f32) -> [f32; 4] {
     let sums = (ctx.chroma_gradient_sums)(
         xyb.plane_data(0),
         xyb.plane_data(1),
@@ -346,7 +346,7 @@ fn chroma_stats_from_sums(
     width: usize,
     height: usize,
     saturation_stat: f32,
-) -> [f32; 3] {
+) -> [f32; 4] {
     // The kernel visits rows 0, 4, 8, ... and `width - 1` pairs per row.
     let pairs = (height.div_ceil(4) * width.saturating_sub(1)) as f32;
     [
@@ -365,6 +365,8 @@ fn chroma_stats_from_sums(
         } else {
             0.0
         },
+        // Luma gradient density: mean |∇Y| per sampled pixel pair.
+        if pairs > 0.0 { sum_y_x / pairs } else { 0.0 },
     ]
 }
 
@@ -382,11 +384,17 @@ pub(super) fn configure_chroma(
         ChromaContentStats::default()
     };
     let saturation_stat = content.saturation;
-    let [x_grad_stat, b_grad_stat, chroma_texture_stat] = if slow_chromatic {
+    let [
+        x_grad_stat,
+        b_grad_stat,
+        chroma_texture_stat,
+        luma_texture_stat,
+    ] = if slow_chromatic {
         chroma_gradient_stats(ctx, xyb, saturation_stat)
     } else {
-        [0.0; 3]
+        [0.0; 4]
     };
+    ctx.set_luma_texture(luma_texture_stat);
     let (x_steps, b_steps) = match ctx.speed {
         _ if is_achromatic => (0, 0),
         _ if slow_chromatic => pixel_chromacity_steps(xyb),

@@ -481,29 +481,106 @@ pub(super) fn encode_frame_core(
         // groups replace the refined pass.
         all_pending.clear();
         #[cfg(feature = "extraslow")]
-        let loop_groups =
-            if ctx.speed.effort().aq_closed_loop() && ctx.coding.is_xyb() && num_passes == 1 {
-                run_quant_field_loop(
-                    ctx,
-                    scratch,
-                    opsin,
-                    &dim,
-                    &distp,
-                    &mut dc_datas,
-                    &ac_tasks,
-                    &group_coords,
-                    num_passes,
-                    coeff_shifts,
-                    &coeff_orders,
-                    &order_alternatives,
-                    ytob_dc,
-                    qf_threshold,
-                    &prices,
-                    epf_recon.is_some(),
-                )
-            } else {
-                None
-            };
+        let loop_groups = if ctx.speed.effort().aq_closed_loop()
+            && ctx.coding.is_xyb()
+            && num_passes == 1
+        {
+            // The loop's selection-scale race re-runs the DC-group setup
+            // (quant field, layout, CfL) and its frame-level follow-ups
+            // under selection-only scaled tables; coefficient orders,
+            // prices and DC choices stay the first pass's.
+            let mut reselect =
+                |scratch: &mut CoderScratch| -> Result<Vec<DcGroupData>, EncodeError> {
+                    let setups =
+                        ctx.thread_pool
+                            .steal_map(scratch, group_coords.len(), |i, scratch| {
+                                let (dc_gx, dc_gy) = group_coords[i];
+                                setup_dc_group(
+                                    ctx,
+                                    scratch,
+                                    opsin,
+                                    &dim,
+                                    &distp,
+                                    dc_gx,
+                                    dc_gy,
+                                    setup_budget,
+                                )
+                            });
+                    let mut datas: Vec<DcGroupData> = setups
+                        .into_iter()
+                        .map(|r| r.map(|(data, _, _)| data))
+                        .collect::<Result<_, _>>()?;
+                    crate::ac_strategy::account_matrix_headers(
+                        ctx,
+                        scratch,
+                        opsin,
+                        distance,
+                        distp.scale,
+                        distp.x_qm_scale,
+                        &group_coords,
+                        &mut datas,
+                    );
+                    for dc in datas.iter_mut() {
+                        dc.block_quant_field = None;
+                    }
+                    if crate::color_correlation::cfl_slope_search(ctx) {
+                        let dc_ref = &datas;
+                        let maps =
+                            ctx.thread_pool
+                                .steal_map(scratch, group_coords.len(), |i, scratch| {
+                                    let (dc_gx, dc_gy) = group_coords[i];
+                                    let (coeffs, gather) = scratch.ac_group.transform_buffers();
+                                    crate::color_correlation::refit_cmap_on_layout(
+                                        ctx,
+                                        opsin,
+                                        &dc_ref[i],
+                                        dc_gx * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                                        dc_gy * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                                        distp.scale,
+                                        distp.distance,
+                                        distp.x_qm_scale,
+                                        coeffs,
+                                        gather,
+                                        &mut scratch.cfl_rdo,
+                                    )
+                                });
+                        for (dc, (ytox, ytob)) in datas.iter_mut().zip(maps) {
+                            dc.ytox_map = ytox;
+                            dc.ytob_map = ytob;
+                        }
+                    }
+                    Ok(datas)
+                };
+            run_quant_field_loop(
+                ctx,
+                scratch,
+                opsin,
+                &dim,
+                &distp,
+                &mut dc_datas,
+                &ac_tasks,
+                &group_coords,
+                num_passes,
+                coeff_shifts,
+                &coeff_orders,
+                &order_alternatives,
+                ytob_dc,
+                qf_threshold,
+                &prices,
+                epf_recon.is_some(),
+                // Patch atlases and reference frames are judged by the
+                // frames that use them, not by their own reconstruction.
+                if matches!(frame_kind, VarDctFrameKind::Regular)
+                    && !crate::ac_strategy::content_selection_enabled(ctx, distance)
+                {
+                    Some(&mut reselect)
+                } else {
+                    None
+                },
+            )
+        } else {
+            None
+        };
         #[cfg(not(feature = "extraslow"))]
         let loop_groups: Option<(Vec<RefinedAcGroup>, DistanceParams, Option<Image3F>)> = None;
         let loop_groups = loop_groups.map(|(groups, chosen, recon)| {

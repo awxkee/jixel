@@ -340,7 +340,7 @@ fn select_super_block(
         params.distance,
         cmap_factor,
     );
-    let c16 = merge.bias_16x16 * c16_raw;
+    let c16 = merge.bias_16x16 * merge.site_bias(params.opsin, px0, py0, 16) * c16_raw;
 
     let use_v_left = ac_strategy.can_place_strategy(bx0, by0, STRATEGY_DCT16X8)
         && merge_beats_dct8(v_left, dct8_left, merge.accept_pair);
@@ -1124,8 +1124,14 @@ fn select_band(
                     record_upgrade32_candidates(upgrades, ac_strategy, bx, by, raw, children);
                 }
                 let sites = merge32_sites(bx, by);
-                let mut costs = raw.map(|c| merge.bias_rect32 * c);
-                costs[0] = merge.bias_32x32 * cost32;
+                let m32 = merge.site_bias(
+                    params.opsin,
+                    params.dc_group_px + bx * 8,
+                    params.dc_group_py + by * 8,
+                    32,
+                );
+                let mut costs = raw.map(|c| merge.bias_rect32 * m32 * c);
+                costs[0] = merge.bias_32x32 * m32 * cost32;
                 for (k, &(x, y, strategy)) in sites.iter().enumerate() {
                     if !ac_strategy.can_place_strategy(x, y, strategy) {
                         costs[k] = f32::INFINITY;
@@ -5497,8 +5503,8 @@ mod tests {
 
         // At high quality the 19% 16x16 margin rejects a 10% estimated win but
         // accepts a clear 25% one. At coarse quality the guard fades.
-        let hq = MergeTuning::new(0.3, crate::Arbiter::Ssimulacra2);
-        let lowq = MergeTuning::new(4.0, crate::Arbiter::Ssimulacra2);
+        let hq = MergeTuning::new(0.3, crate::Arbiter::Ssimulacra2, crate::Speed::Slow);
+        let lowq = MergeTuning::new(4.0, crate::Arbiter::Ssimulacra2, crate::Speed::Slow);
         assert!(!merge_beats_dct8(90.0, 100.0, hq.accept_16));
         assert!(merge_beats_dct8(75.0, 100.0, hq.accept_16));
         assert!(merge_beats_dct8(95.0, 100.0, lowq.accept_16));

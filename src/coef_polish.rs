@@ -115,6 +115,7 @@ pub(crate) struct CoefPolisher {
     options: Vec<PolishOption>,
     count_nonzero: CountNonzeroFn,
     add_scaled: AddScaledFn,
+    area_budget: bool,
 }
 
 /// One channel of the block being polished.
@@ -169,12 +170,17 @@ struct PolishOption {
     order: usize,
 }
 
+#[cfg(test)]
 fn rank_options(options: &mut Vec<PolishOption>) {
+    rank_options_cap(options, PRICE_CAP);
+}
+
+fn rank_options_cap(options: &mut Vec<PolishOption>, cap: usize) {
     let cmp =
         |a: &PolishOption, b: &PolishOption| a.dd.total_cmp(&b.dd).then(a.order.cmp(&b.order));
-    if options.len() > PRICE_CAP {
-        options.select_nth_unstable_by(PRICE_CAP, cmp);
-        options.truncate(PRICE_CAP);
+    if options.len() > cap {
+        options.select_nth_unstable_by(cap, cmp);
+        options.truncate(cap);
         options.sort_unstable_by(cmp);
     }
 }
@@ -431,7 +437,14 @@ impl CoefPolisher {
             options: Vec::with_capacity(MAX_POSITIONS * 2),
             count_nonzero,
             add_scaled,
+            area_budget: false,
         }
+    }
+
+    /// Keep refinement work proportional to covered area when content-adaptive
+    /// selection chooses a denser layout. Both exact judges remain active.
+    pub(crate) fn set_area_budget(&mut self, enabled: bool) {
+        self.area_budget = enabled;
     }
 
     /// Built for the pass that is running now (stale ones stay in worker scratch).
@@ -593,6 +606,38 @@ impl CoefPolisher {
             plane.resize(plane.len().max(b.pw * b.ph), 0.0);
         }
         let covered = b.cx * b.cy;
+        // Fixed per-transform budgets multiply the work when a 32x32 turns
+        // into sixteen leaves. Spend by area on the adaptive selection path.
+        let positions = if self.area_budget {
+            MAX_POSITIONS.min((b.size - covered).div_ceil(4))
+        } else {
+            MAX_POSITIONS
+        };
+        let per_channel = if self.area_budget {
+            (PER_CHANNEL * covered).div_ceil(16).clamp(1, PER_CHANNEL)
+        } else {
+            PER_CHANNEL
+        };
+        let rounds = if self.area_budget && covered <= 2 {
+            1
+        } else {
+            ROUNDS
+        };
+        let price_cap = if self.area_budget {
+            6 * per_channel
+        } else {
+            PRICE_CAP
+        };
+        let cv_tries = if self.area_budget {
+            CV_TRIES.min(per_channel)
+        } else {
+            CV_TRIES
+        };
+        let extra_tries = if self.area_budget {
+            (EXTRA_TRIES * covered / 16).min(EXTRA_TRIES)
+        } else {
+            EXTRA_TRIES
+        };
         let row_stride = b.cx * 8;
         let mut nzeros: [usize; 3] = std::array::from_fn(|c| {
             count_nonzero_except_llf(quantized[c], b.cx, b.cy, self.count_nonzero)
@@ -601,7 +646,7 @@ impl CoefPolisher {
             block_bits(quantized[c], &b.channels[c], covered, nzeros[c], prices)
         });
 
-        for _round in 0..ROUNDS {
+        for _round in 0..rounds {
             // ---- Proposals: proxy-ranked singles per channel ----
             let mut singles = [PolishMove::default(); PER_CHANNEL * 3];
             let mut nsingles = 0;
@@ -610,7 +655,7 @@ impl CoefPolisher {
                 let ch = &b.channels[c];
                 let block = &mut *quantized[c];
                 options.clear();
-                let end = b.size.min(covered + MAX_POSITIONS);
+                let end = b.size.min(covered + positions);
                 for k in covered..end {
                     let idx = ch.scan[k] as usize;
                     let (v, u) = (idx / row_stride, idx % row_stride);
@@ -640,7 +685,7 @@ impl CoefPolisher {
                     }
                 }
                 // Price the most promising by distortion, then rank by the proxy.
-                rank_options(options);
+                rank_options_cap(options, price_cap);
                 if options.is_empty() {
                     continue;
                 }
@@ -669,7 +714,7 @@ impl CoefPolisher {
                 }
                 let priced = &mut priced[..npriced];
                 priced.sort_by(|a, b| a.proxy.total_cmp(&b.proxy));
-                let len = npriced.min(PER_CHANNEL);
+                let len = npriced.min(per_channel);
                 singles[nsingles..nsingles + len].copy_from_slice(&priced[..len]);
                 nsingles += len;
             }
@@ -688,7 +733,7 @@ impl CoefPolisher {
             let scored = &mut scored[..nscored];
             scored.sort_by(|x, y| x.0.total_cmp(&y.0));
             let mut best: Option<(PolishMove, usize)> = None;
-            for &(_, i) in scored.iter().take(CV_TRIES) {
+            for &(_, i) in scored.iter().take(cv_tries) {
                 let m = singles[i];
                 match self.judge_cv(ctx, b, rect, &m) {
                     Some(j_cv) if j_cv >= 0.0 => continue,
@@ -719,7 +764,7 @@ impl CoefPolisher {
             let mut ntouched = 1;
             let mut tries = 0;
             for &(_, i) in scored.iter() {
-                if tries == EXTRA_TRIES {
+                if tries == extra_tries {
                     break;
                 }
                 let mut m = singles[i];

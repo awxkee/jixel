@@ -2062,14 +2062,42 @@ struct LargeTables {
     inv_matrix_32x16: HeapMatrix<f32, 3, 512>,
 }
 
-fn dct16_override(use_ss2: bool, tilt: Option<Arbiter>) -> Option<BandOverride> {
+/// `family`: the selection-time 16/32 family scale (1 = the signalled tables;
+/// see [`DequantMatrices::selection_sets`]). Below the SS2 gate a scaled
+/// library table is produced, which only a selection-only set may carry.
+fn dct16_override(use_ss2: bool, tilt: Option<Arbiter>, family: f32) -> Option<BandOverride> {
     match tilt {
         Some(a) => Some(tilted_override(
             &DCT16X16_BANDS,
-            QM_SS2_SCALE16,
+            QM_SS2_SCALE16 * family,
             a.tuning().dct16_luma_hf,
         )),
-        None => use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16)),
+        None if use_ss2 => Some(scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16 * family)),
+        None if family != 1.0 => Some(scaled_override(&DCT16X16_BANDS, family)),
+        None => None,
+    }
+}
+
+fn dct32_override(use_ss2: bool, family: f32) -> Option<BandOverride> {
+    if use_ss2 {
+        Some(scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32 * family))
+    } else if family != 1.0 {
+        Some(scaled_override(&DCT32X32_BANDS, family))
+    } else {
+        None
+    }
+}
+
+fn rect32_override(use_ss2: bool, retile: bool, family: f32) -> Option<BandOverride> {
+    if use_ss2 {
+        Some(scaled_override(
+            &DCT16X32_BANDS,
+            rect32_scale(retile) * family,
+        ))
+    } else if family != 1.0 {
+        Some(scaled_override(&DCT16X32_BANDS, family))
+    } else {
+        None
     }
 }
 
@@ -2082,7 +2110,12 @@ fn rect32_scale(retile: bool) -> f32 {
     }
 }
 
-fn large_tables(use_ss2: bool, tilt: Option<Arbiter>, retile: bool) -> &'static LargeTables {
+fn large_tables(
+    use_ss2: bool,
+    tilt: Option<Arbiter>,
+    retile: bool,
+    family: f32,
+) -> &'static LargeTables {
     static DEFAULT: std::sync::OnceLock<LargeTables> = std::sync::OnceLock::new();
     static SS2: [std::sync::OnceLock<LargeTables>; 2] =
         [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
@@ -2090,15 +2123,14 @@ fn large_tables(use_ss2: bool, tilt: Option<Arbiter>, retile: bool) -> &'static 
         [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
         [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
     ];
-    let cache = match tilt {
-        Some(a) => &TILTED[a as usize][usize::from(retile)],
-        None if use_ss2 => &SS2[usize::from(retile)],
-        None => &DEFAULT,
-    };
-    cache.get_or_init(|| {
-        let o16 = dct16_override(use_ss2, tilt);
-        let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
-        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, rect32_scale(retile)));
+    // Selection-time family scales are rare per process: a small keyed list.
+    type ScaledKey = (bool, Option<u8>, bool, u32);
+    static SCALED: std::sync::Mutex<Vec<(ScaledKey, &'static LargeTables)>> =
+        std::sync::Mutex::new(Vec::new());
+    let build = || {
+        let o16 = dct16_override(use_ss2, tilt, family);
+        let o32 = dct32_override(use_ss2, family);
+        let o32x16 = rect32_override(use_ss2, retile, family);
         let matrix_32x16 = compute_dct32x16_matrix(o32x16.as_ref());
         let mut inv_matrix_32x16 = HeapMatrix::new(0.);
         for c in 0..3 {
@@ -2135,7 +2167,23 @@ fn large_tables(use_ss2: bool, tilt: Option<Arbiter>, retile: bool) -> &'static 
             matrix_32x16,
             inv_matrix_32x16,
         }
-    })
+    };
+    if family != 1.0 {
+        let key: ScaledKey = (use_ss2, tilt.map(|a| a as u8), retile, family.to_bits());
+        let mut cache = SCALED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, t)) = cache.iter().find(|(k, _)| *k == key) {
+            return t;
+        }
+        let t: &'static LargeTables = Box::leak(Box::new(build()));
+        cache.push((key, t));
+        return t;
+    }
+    let cache = match tilt {
+        Some(a) => &TILTED[a as usize][usize::from(retile)],
+        None if use_ss2 => &SS2[usize::from(retile)],
+        None => &DEFAULT,
+    };
+    cache.get_or_init(build)
 }
 
 impl DequantMatrices {
@@ -2265,6 +2313,7 @@ impl DequantMatrices {
                     false,
                     None,
                     false,
+                    1.0,
                 )
             });
         }
@@ -2283,6 +2332,7 @@ impl DequantMatrices {
                 false,
                 None,
                 false,
+                1.0,
             )
         })
     }
@@ -2391,7 +2441,163 @@ impl DequantMatrices {
             true,
             tilt,
             retile,
+            1.0,
         )
+    }
+
+    /// The tier set the frame's context would pick for coding (`new`,
+    /// `new_fast`, `new_saturated`, `new_pair_b`, `new_saturated_pair_b`), as
+    /// (base, saturated, pair-B, saturated pair-B).
+    #[cfg(feature = "extraslow")]
+    fn coding_sets(
+        distance: f32,
+        arbiter: Arbiter,
+        rectangles: bool,
+        retile: bool,
+    ) -> [&'static Self; 4] {
+        [
+            if rectangles {
+                Self::new(distance, arbiter, retile)
+            } else {
+                Self::new_fast(distance, arbiter)
+            },
+            Self::new_saturated(distance, arbiter, retile),
+            Self::new_pair_b(distance, arbiter, retile),
+            Self::new_saturated_pair_b(distance, arbiter, retile),
+        ]
+    }
+
+    /// Fresh copy of one coding set with the 16/32 family tables scaled by
+    /// `family` for transform selection only. The signalled `custom_tables`
+    /// stay the coding set's, so header accounting and signalling are unchanged.
+    #[cfg(feature = "extraslow")]
+    #[allow(clippy::too_many_arguments)]
+    fn selection_scaled(
+        distance: f32,
+        arbiter: Arbiter,
+        rectangles: bool,
+        retile: bool,
+        family: f32,
+        saturated: bool,
+        pair_b: bool,
+        coding: &'static Self,
+    ) -> Self {
+        let ss2_from = arbiter.tuning().qm_ss2_distance;
+        let tilt = Self::dct16_tilt(distance, arbiter);
+        let use_ss2 = distance >= ss2_from;
+        let mut set =
+            if pair_b && (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
+                // `new_pair_b` / `new_saturated_pair_b`: `compute`.
+                let bands: &[f32; 6] = if saturated {
+                    &SAT_B8_BANDS
+                } else {
+                    &FLAT_B8_BANDS_MID
+                };
+                Self::compute_with_ordinary_fit(
+                    false,
+                    false,
+                    Some(bands),
+                    true,
+                    saturated,
+                    true,
+                    None,
+                    false,
+                    family,
+                )
+            } else if distance < QM_FLAT_B8_MIN_DISTANCE {
+                // Every constructor: the no-flat spec tier via `compute`.
+                Self::compute_with_ordinary_fit(
+                    false, false, None, false, false, true, None, false, family,
+                )
+            } else if saturated {
+                // `new_saturated`: `compute`/`compute_tilted` with the SAT row.
+                Self::compute_with_ordinary_fit(
+                    use_ss2,
+                    distance >= QM_DCT8_MIN_DISTANCE,
+                    Some(&SAT_B8_BANDS),
+                    false,
+                    true,
+                    true,
+                    tilt,
+                    use_ss2 && retile,
+                    family,
+                )
+            } else if rectangles {
+                // `new`: `compute`/`compute_tilted`.
+                let bands: &[f32; 6] = if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
+                    &FLAT_B8_BANDS_MID
+                } else {
+                    &FLAT_B8_BANDS_HQ
+                };
+                Self::compute_with_ordinary_fit(
+                    use_ss2,
+                    distance >= QM_DCT8_MIN_DISTANCE,
+                    Some(bands),
+                    false,
+                    false,
+                    true,
+                    tilt,
+                    use_ss2 && retile,
+                    family,
+                )
+            } else {
+                // `new_fast`: no ordinary fit, no tilt, no retile.
+                let bands: &[f32; 6] = if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
+                    &FLAT_B8_BANDS_MID
+                } else {
+                    &FLAT_B8_BANDS_HQ
+                };
+                Self::compute_with_ordinary_fit(
+                    use_ss2,
+                    use_ss2 && distance >= ORIGINAL_COARSE_DCT8_DISTANCE,
+                    Some(bands),
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    family,
+                )
+            };
+        set.custom_tables = coding.custom_tables.clone();
+        set
+    }
+
+    /// Selection-only table sets with the 16/32 family scaled by `family`,
+    /// one per coding set the context may pick (see [`Self::coding_sets`]).
+    /// Cached per (tier, scale); the coding sets themselves are unchanged.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn selection_sets(
+        distance: f32,
+        arbiter: Arbiter,
+        rectangles: bool,
+        retile: bool,
+        family: f32,
+    ) -> &'static [&'static Self; 4] {
+        type Key = (u32, u8, bool, bool, u32);
+        static CACHE: std::sync::Mutex<Vec<(Key, &'static [&'static DequantMatrices; 4])>> =
+            std::sync::Mutex::new(Vec::new());
+        let key: Key = (
+            distance.to_bits(),
+            arbiter as u8,
+            rectangles,
+            retile,
+            family.to_bits(),
+        );
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, sets)) = cache.iter().find(|(k, _)| *k == key) {
+            return sets;
+        }
+        let coding = Self::coding_sets(distance, arbiter, rectangles, retile);
+        let sets: [&'static Self; 4] = std::array::from_fn(|i| {
+            let (saturated, pair_b) = (i & 1 != 0, i & 2 != 0);
+            &*Box::leak(Box::new(Self::selection_scaled(
+                distance, arbiter, rectangles, retile, family, saturated, pair_b, coding[i],
+            )))
+        });
+        let sets: &'static [&'static Self; 4] = Box::leak(Box::new(sets));
+        cache.push((key, sets));
+        sets
     }
 
     /// `retile`: the frame runs the exact layout re-tiling, which gets the
@@ -2406,6 +2612,7 @@ impl DequantMatrices {
         ordinary_fit: bool,
         tilt: Option<Arbiter>,
         retile: bool,
+        family: f32,
     ) -> Self {
         let identity_weights = chromatic.then(|| scaled_identity_weights(IDENTITY_CHROMA_FINE));
         let (matrix_identity, inv_matrix_identity) = match identity_weights.as_ref() {
@@ -2434,8 +2641,8 @@ impl DequantMatrices {
         {
             scale_dct8_base_weights(o, [1.0, 1.0, SS2_DCT8_B_SCALE]);
         }
-        let o16 = dct16_override(use_ss2, tilt);
-        let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
+        let o16 = dct16_override(use_ss2, tilt, family);
+        let o32 = dct32_override(use_ss2, family);
         let o64: Option<BandOverride> = None;
         let o64r: Option<BandOverride> = None;
         // These tables never vary across distance or content presets.
@@ -2461,8 +2668,8 @@ impl DequantMatrices {
                 (m, inv)
             }
         };
-        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, rect32_scale(retile)));
-        let large = large_tables(use_ss2, tilt, retile);
+        let o32x16 = rect32_override(use_ss2, retile, family);
+        let large = large_tables(use_ss2, tilt, retile, family);
 
         let (matrix, inv_matrix) = if let Some(o8) = o8.as_ref() {
             let matrix = compute_dct8x8_matrix(o8);
@@ -3555,7 +3762,7 @@ mod shared_storage_tests {
                 DequantMatrices::new_saturated(distance, Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_saturated_pair_b(distance, Arbiter::Ssimulacra2, false),
             ] {
-                let large = large_tables(set.custom_tables[1].is_some(), None, false);
+                let large = large_tables(set.custom_tables[1].is_some(), None, false, 1.0);
                 assert!(std::ptr::eq(set.matrix_16x16, &*large.matrix_16x16));
                 assert!(std::ptr::eq(set.inv_matrix_16x16, &*large.inv_matrix_16x16));
                 assert!(std::ptr::eq(set.matrix_32x32, &*large.matrix_32x32));
