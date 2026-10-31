@@ -32,6 +32,7 @@ mod coeff_order;
 mod encode;
 mod jbrd;
 mod parse;
+mod uhdr;
 
 #[allow(unused_imports)]
 pub(crate) use parse::{JpegError, parse_jpeg};
@@ -215,6 +216,7 @@ pub struct JpegTranscodeConfig {
     /// Whether to embed the data needed to rebuild the original JPEG bytes.
     ///
     /// Defaults to `true`. See [`Self::with_jpeg_reconstruction`].
+    /// Binary Ultra HDR gain maps are written to `jhgm` even when this is false.
     pub jpeg_reconstruction: bool,
     /// Worker threads used while building the codestream. Defaults to 1.
     ///
@@ -264,6 +266,7 @@ impl Default for JpegTranscodeConfig {
 
 impl JpegTranscodeConfig {
     /// Controls whether the original JPEG bytes can be recovered.
+    /// Ultra HDR gain maps with binary metadata are preserved either way.
     pub fn with_jpeg_reconstruction(mut self, enabled: bool) -> Self {
         self.jpeg_reconstruction = enabled;
         self
@@ -291,6 +294,10 @@ impl JpegTranscodeConfig {
 
 /// Losslessly transcodes a JPEG file into JPEG XL, keeping the ability to
 /// reconstruct the original bytes.
+///
+/// Ultra HDR JPEGs with binary ISO 21496-1 metadata are carried over as a
+/// `jhgm` gain map: both JPEG images are transcoded without requantization.
+/// XMP-only gain maps are currently retained only in the reconstruction data.
 pub fn encode_jpeg_lossless(jpeg: &[u8]) -> Result<Vec<u8>, EncodeError> {
     encode_jpeg_lossless_with_config(jpeg, &JpegTranscodeConfig::default())
 }
@@ -312,6 +319,7 @@ pub fn encode_jpeg_lossless_with_config(
     let orientation = exif
         .and_then(|(_, tiff)| exif_orientation(tiff))
         .unwrap_or_default();
+    let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
     let codestream = encode::encode_jpeg_codestream(
         &parsed,
         icc.as_ref().map(|icc| icc.profile.as_slice()),
@@ -333,7 +341,7 @@ pub fn encode_jpeg_lossless_with_config(
     } else {
         None
     };
-    if reconstruction.is_none() && exif.is_none() && xmp.is_none() {
+    if reconstruction.is_none() && exif.is_none() && xmp.is_none() && gain_map.is_none() {
         // Nothing needs a container.
         return Ok(codestream);
     }
@@ -360,6 +368,9 @@ pub fn encode_jpeg_lossless_with_config(
         push_metadata_box(&mut out, b"Exif", &payload, compressor)?;
     }
     push_box(&mut out, b"jxlc", &codestream);
+    if let Some(gain_map) = gain_map {
+        push_box(&mut out, b"jhgm", &gain_map);
+    }
     if let Some((_, xmp)) = xmp {
         push_metadata_box(&mut out, b"xml ", &xmp, compressor)?;
     }
