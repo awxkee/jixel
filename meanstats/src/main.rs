@@ -826,6 +826,7 @@ fn bench_jixel(
         .with_patches(patches)
         .with_speed(Speed::ExtraSlow)
         .with_arbiter(jixel::Arbiter::Ssimulacra2)
+        .with_edge_splines(true)
         .with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

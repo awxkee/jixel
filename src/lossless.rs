@@ -100,7 +100,7 @@ pub(crate) use predictor::{
 };
 pub(crate) use rct::forward_ycocg;
 pub(crate) use squeeze::{
-    ExtraSqueeze, LmPlainInput, StreamCrop, dc_frame_supported, encode_dc_frame,
+    ExtraSqueeze, GlobalPlaneTree, LmPlainInput, StreamCrop, dc_frame_supported, encode_dc_frame,
     encode_frame_lossy_modular_plain, encode_frame_lossy_modular_squeeze, learn_global_plane_tree,
     lm_calibrated_distance, lm_plain_distance,
 };

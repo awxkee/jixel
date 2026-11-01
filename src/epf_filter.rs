@@ -618,21 +618,38 @@ fn choose(distance: f32, baseline: Choice, mut score: impl FnMut(Choice) -> f32)
     rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
 }
 
+/// Compose the decoder's additive luma only for scoring. The filter itself
+/// always receives the base reconstruction, since splines are drawn after EPF.
+fn add_luma_layer(base: &[f32], layer: &[f32], output: &mut [f32]) {
+    assert_eq!(base.len(), layer.len());
+    assert_eq!(base.len(), output.len());
+    for (out, (&base, &layer)) in output.iter_mut().zip(base.iter().zip(layer)) {
+        *out = base + layer;
+    }
+}
+
 pub(crate) fn fit(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     source_y: &Plane<f32>,
+    additive_y: Option<&[f32]>,
     reconstruction: &Image3F,
     blocks: &FrameBlocks,
     distance: f32,
     baseline: Choice,
 ) -> Choice {
+    let composite_source = additive_y.map(|layer| {
+        let mut composite = vec![0.0; source_y.as_slice().len()];
+        add_luma_layer(source_y.as_slice(), layer, &mut composite);
+        composite
+    });
     let reference = crate::epf_proxy::LumaProxy::new(
-        source_y.as_slice(),
+        composite_source.as_deref().unwrap_or(source_y.as_slice()),
         source_y.xsize(),
         source_y.ysize(),
         &ctx.thread_pool,
     );
+    let mut composite_candidate = additive_y.map(|_| vec![0.0; source_y.as_slice().len()]);
     let mut work = crate::epf_proxy::Scratch::default();
     let make = |choice: Choice| {
         LoopFilter::new(
@@ -649,13 +666,162 @@ pub(crate) fn fit(
         } else {
             epf.apply(&ctx.thread_pool, scratch, &make(choice), choice.sharpness)
         };
-        reference.compare(filtered.plane_data(1), &mut work).0
+        let candidate_y = if let Some(layer) = additive_y {
+            let output = composite_candidate.as_mut().unwrap();
+            add_luma_layer(filtered.plane_data(1), layer, output);
+            output.as_slice()
+        } else {
+            filtered.plane_data(1)
+        };
+        reference.compare(candidate_y, &mut work).0
     })
 }
 
 #[cfg(test)]
 mod fit_tests {
     use super::*;
+
+    fn additive_scene() -> (Plane<f32>, Image3F, FrameBlocks, Vec<f32>) {
+        let (w, h) = (32usize, 24usize);
+        let mut source = Plane::new(w, h);
+        let mut recon = Image3F::new(w, h);
+        let mut layer = vec![0.0; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let value = 0.2 + 0.003 * ((x * 7 + y * 3) % 23) as f32;
+                source.row_mut(y)[x] = value;
+                recon.plane_row_mut(1, y)[x] = value + 0.004 * ((x + y) % 3) as f32;
+                recon.plane_row_mut(2, y)[x] = value;
+                layer[y * w + x] = 0.045 * (-0.5 * ((x as f32 - 15.3) / 0.8).powi(2)).exp();
+            }
+        }
+        let blocks = FrameBlocks {
+            xsize: w.div_ceil(8),
+            ysize: h.div_ceil(8),
+            sigma_quant: vec![-1.0; w.div_ceil(8) * h.div_ceil(8)],
+        };
+        (source, recon, blocks, layer)
+    }
+
+    fn additive_baseline() -> Choice {
+        Choice {
+            iters: 2,
+            quant_mul: None,
+            pass0: None,
+            sharpness: 5,
+        }
+    }
+
+    #[test]
+    fn no_additive_luma_matches_zero_layer_choice() {
+        let ctx = EncodingContext::default();
+        let (source, recon, blocks, _) = additive_scene();
+        let mut scratch = CoderScratch::default();
+        let none = fit(
+            &ctx,
+            &mut scratch,
+            &source,
+            None,
+            &recon,
+            &blocks,
+            2.0,
+            additive_baseline(),
+        );
+        let zero = vec![0.0; source.as_slice().len()];
+        let with_zero = fit(
+            &ctx,
+            &mut scratch,
+            &source,
+            Some(&zero),
+            &recon,
+            &blocks,
+            2.0,
+            additive_baseline(),
+        );
+        assert_eq!(none, with_zero);
+    }
+
+    #[test]
+    fn additive_luma_is_scored_after_filtering_the_base() {
+        let ctx = EncodingContext::default();
+        let (source, recon, blocks, layer) = additive_scene();
+        let mut scratch = CoderScratch::default();
+        let actual = fit(
+            &ctx,
+            &mut scratch,
+            &source,
+            Some(&layer),
+            &recon,
+            &blocks,
+            2.0,
+            additive_baseline(),
+        );
+        let full_source: Vec<f32> = source
+            .as_slice()
+            .iter()
+            .zip(&layer)
+            .map(|(&base, &layer)| base + layer)
+            .collect();
+        let reference = crate::epf_proxy::LumaProxy::new(
+            &full_source,
+            source.xsize(),
+            source.ysize(),
+            &ctx.thread_pool,
+        );
+        let mut work = crate::epf_proxy::Scratch::default();
+        let mut epf = Epf::new(&ctx.thread_pool, &recon, &blocks);
+        let expected = choose(2.0, additive_baseline(), |choice| {
+            let filtered = if choice.iters == 0 {
+                &recon
+            } else {
+                epf.apply(
+                    &ctx.thread_pool,
+                    &mut scratch,
+                    &LoopFilter::new(
+                        choice.iters,
+                        choice.pass0,
+                        choice.quant_mul,
+                        ctx.epf_channel_scale,
+                    ),
+                    choice.sharpness,
+                )
+            };
+            let composite: Vec<f32> = filtered
+                .plane_data(1)
+                .iter()
+                .zip(&layer)
+                .map(|(&base, &layer)| base + layer)
+                .collect();
+            reference.compare(&composite, &mut work).0
+        });
+        assert_eq!(actual, expected);
+
+        // Filtering the narrow additive line would change the decoder result.
+        // This detects an accidental pre-filter composition of the two layers.
+        let filter = LoopFilter::new(2, None, Some(1.8), ctx.epf_channel_scale);
+        let base_filtered = epf
+            .apply(&ctx.thread_pool, &mut scratch, &filter, 7)
+            .clone();
+        let mut precomposed = recon.clone();
+        for y in 0..source.ysize() {
+            for x in 0..source.xsize() {
+                precomposed.plane_row_mut(1, y)[x] += layer[y * source.xsize() + x];
+            }
+        }
+        let mut incorrect = Epf::new(&ctx.thread_pool, &precomposed, &blocks);
+        let filtered_layer = incorrect.apply(&ctx.thread_pool, &mut scratch, &filter, 7);
+        let largest_difference = base_filtered
+            .plane_data(1)
+            .iter()
+            .zip(&layer)
+            .zip(filtered_layer.plane_data(1))
+            .map(|((&base, &layer), &wrong)| (base + layer - wrong).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            largest_difference > 1e-4,
+            "test layer did not distinguish the pre-filter route"
+        );
+    }
 
     #[test]
     fn reused_renderers_match_fresh_stages_across_strengths_and_worker_counts() {

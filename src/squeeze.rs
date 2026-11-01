@@ -65,7 +65,7 @@ fn average(a: i32, b: i32) -> i32 {
 }
 
 #[inline]
-fn smooth_tendency(b: i64, a: i64, n: i64) -> i64 {
+pub(crate) fn smooth_tendency(b: i64, a: i64, n: i64) -> i64 {
     // byte-exact libjxl SmoothTendency(B,a,n)
     let mut diff = 0i64;
     if b >= a && a >= n {
@@ -342,6 +342,96 @@ pub(crate) fn apply_step_inverse(channels: &mut Vec<Channel>, s: &SqueezeStep) {
     }
 }
 
+/// Fold one step of a quantized pyramid into its decoded averages. Only the
+/// step's averages and residuals are materialized at full scale; all other
+/// coefficients retain their values and multipliers. Invalid geometry or
+/// overflowing dequantization leaves both vectors unchanged.
+pub(crate) fn fold_quantized_step(
+    channels: &mut Vec<Channel>,
+    quants: &mut Vec<u32>,
+    step: &SqueezeStep,
+) -> bool {
+    if channels.len() != quants.len() || step.num_c == 0 {
+        return false;
+    }
+    let Some(end) = step.begin_c.checked_add(step.num_c) else {
+        return false;
+    };
+    let Some(offset) = (if step.in_place {
+        Some(end)
+    } else {
+        channels.len().checked_sub(step.num_c)
+    }) else {
+        return false;
+    };
+    let Some(res_end) = offset.checked_add(step.num_c) else {
+        return false;
+    };
+    if end > offset || res_end > channels.len() {
+        return false;
+    }
+
+    let dequantize = |ch: &Channel, q: u32| -> Option<Channel> {
+        if q == 0 || ch.w.checked_mul(ch.h)? != ch.data.len() {
+            return None;
+        }
+        let data: Option<Vec<i32>> = ch
+            .data
+            .iter()
+            .map(|&v| i32::try_from(i64::from(v) * i64::from(q)).ok())
+            .collect();
+        Some(Channel {
+            data: data?,
+            w: ch.w,
+            h: ch.h,
+            hshift: ch.hshift,
+            vshift: ch.vshift,
+        })
+    };
+    let mut merged = Vec::with_capacity(step.num_c);
+    for i in 0..step.num_c {
+        let avg_index = step.begin_c + i;
+        let res_index = offset + i;
+        let avg = &channels[avg_index];
+        let res = &channels[res_index];
+        let same_shift = avg.hshift == res.hshift && avg.vshift == res.vshift;
+        let valid_shape = if step.horizontal {
+            avg.w
+                .checked_add(res.w)
+                .is_some_and(|w| avg.h == res.h && avg.w == w.div_ceil(2) && avg.hshift > 0)
+        } else {
+            avg.h
+                .checked_add(res.h)
+                .is_some_and(|h| avg.w == res.w && avg.h == h.div_ceil(2) && avg.vshift > 0)
+        };
+        if !same_shift || !valid_shape || avg.hshift < 0 || avg.vshift < 0 {
+            return false;
+        }
+        let Some(avg) = dequantize(avg, quants[avg_index]) else {
+            return false;
+        };
+        let Some(res) = dequantize(res, quants[res_index]) else {
+            return false;
+        };
+        // Reuse the decoder-matching inverse, including its defined i64 to
+        // i32 output casts for signed intermediate values.
+        merged.push(if step.horizontal {
+            inv_h_squeeze(&avg, &res)
+        } else {
+            inv_v_squeeze(&avg, &res)
+        });
+    }
+
+    // Commit only after every pair was checked and rebuilt successfully.
+    for (i, channel) in merged.into_iter().enumerate() {
+        channels[step.begin_c + i] = channel;
+        quants[step.begin_c + i] = 1;
+    }
+    channels.drain(offset..res_end);
+    quants.drain(offset..res_end);
+    true
+}
+
 /// Build a simple alternating H/V pyramid over channels [0,num_c), squeezing
 /// until both dimensions are <= 8 (kMaxFirstPreviewSize). Valid, explicit
 /// (signaled) sequence — need not match libjxl's chroma-first default.
@@ -519,6 +609,202 @@ mod tests {
                     h
                 );
             }
+        }
+    }
+
+    fn decoded_channels(
+        channels: &[Channel],
+        quants: &[u32],
+        steps: &[SqueezeStep],
+    ) -> Vec<Channel> {
+        let mut result = channels.to_vec();
+        for (channel, &quant) in result.iter_mut().zip(quants) {
+            for value in &mut channel.data {
+                *value = value.wrapping_mul(quant as i32);
+            }
+        }
+        for step in steps.iter().rev() {
+            apply_step_inverse(&mut result, step);
+        }
+        result
+    }
+
+    fn assert_channels_equal(actual: &[Channel], expected: &[Channel]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert_eq!(
+                (a.w, a.h, a.hshift, a.vshift),
+                (b.w, b.h, b.hshift, b.vshift)
+            );
+            assert_eq!(a.data, b.data);
+        }
+    }
+
+    #[test]
+    fn folding_quantized_steps_preserves_mixed_channel_reconstruction() {
+        let mut seed = 1234567;
+        for (w, h) in [(37, 29), (1, 33), (33, 1), (65, 18)] {
+            for pre_chroma in [false, true] {
+                let mut channels: Vec<Channel> = (0..4)
+                    .map(|_| {
+                        let mut channel = Channel::new(w, h);
+                        for value in &mut channel.data {
+                            *value = rnd(&mut seed);
+                        }
+                        channel
+                    })
+                    .collect();
+                let steps = if pre_chroma {
+                    lossy_squeeze_steps_chroma(w, h, 4, &[1, 2])
+                } else {
+                    default_squeeze_steps(w, h, 4)
+                };
+                for step in &steps {
+                    apply_step_forward(&mut channels, step);
+                }
+                let mut quants: Vec<u32> =
+                    (0..channels.len()).map(|i| [1, 2, 3, 7][i % 4]).collect();
+                for (channel, &q) in channels.iter_mut().zip(&quants) {
+                    for value in &mut channel.data {
+                        *value /= q as i32;
+                    }
+                }
+                let expected = decoded_channels(&channels, &quants, &steps);
+                for retained in (0..steps.len()).rev() {
+                    let step = &steps[retained];
+                    let previous = channels.clone();
+                    let old_quants = quants.clone();
+                    let end = step.begin_c + step.num_c;
+                    let offset = if step.in_place {
+                        end
+                    } else {
+                        previous.len() - step.num_c
+                    };
+                    assert!(fold_quantized_step(&mut channels, &mut quants, step));
+                    assert_channels_equal(
+                        &decoded_channels(&channels, &quants, &steps[..retained]),
+                        &expected,
+                    );
+                    // Unrelated color, extra, and previously appended bands
+                    // retain both coefficients and quantizers verbatim.
+                    for i in 0..previous.len() {
+                        if (step.begin_c..end).contains(&i)
+                            || (offset..offset + step.num_c).contains(&i)
+                        {
+                            continue;
+                        }
+                        let target = if i >= offset + step.num_c {
+                            i - step.num_c
+                        } else {
+                            i
+                        };
+                        assert_channels_equal(&channels[target..=target], &previous[i..=i]);
+                        assert_eq!(quants[target], old_quants[i]);
+                    }
+                    assert!(quants[step.begin_c..end].iter().all(|&q| q == 1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn folding_quantized_steps_rejects_invalid_state_transactionally() {
+        let step = SqueezeStep {
+            horizontal: true,
+            in_place: true,
+            begin_c: 1,
+            num_c: 2,
+        };
+        let mut channels: Vec<Channel> = (0..4)
+            .map(|i| {
+                let mut ch = Channel::new(9, 7);
+                ch.data.fill(i + 1);
+                ch
+            })
+            .collect();
+        apply_step_forward(&mut channels, &step);
+        let quants = vec![1; channels.len()];
+        let reject = |mut c: Vec<Channel>, mut q: Vec<u32>, s: SqueezeStep| {
+            let original = c.clone();
+            let original_q = q.clone();
+            assert!(!fold_quantized_step(&mut c, &mut q, &s));
+            assert_channels_equal(&c, &original);
+            assert_eq!(q, original_q);
+        };
+        for invalid in [
+            SqueezeStep { num_c: 0, ..step },
+            SqueezeStep {
+                begin_c: usize::MAX,
+                ..step
+            },
+            SqueezeStep {
+                num_c: usize::MAX,
+                ..step
+            },
+            SqueezeStep { begin_c: 5, ..step },
+            SqueezeStep {
+                begin_c: 3,
+                in_place: false,
+                ..step
+            },
+        ] {
+            reject(channels.clone(), quants.clone(), invalid);
+        }
+        reject(channels.clone(), quants[..quants.len() - 1].to_vec(), step);
+        let mut invalid_q = quants.clone();
+        invalid_q[4] = 0;
+        reject(channels.clone(), invalid_q, step);
+        for value in [i32::MAX, i32::MIN] {
+            let mut c = channels.clone();
+            let mut q = quants.clone();
+            // The first pair is valid; failure in the second must not commit
+            // the already reconstructed first pair.
+            c[4].data[0] = value;
+            q[4] = 2;
+            reject(c, q, step);
+        }
+        let mut invalid = channels.clone();
+        invalid[4].data.pop();
+        reject(invalid, quants.clone(), step);
+        let mut invalid = channels.clone();
+        invalid[4].vshift += 1;
+        reject(invalid, quants.clone(), step);
+        let mut invalid = channels.clone();
+        invalid[4].h += 1;
+        reject(invalid, quants.clone(), step);
+        let mut invalid = channels.clone();
+        invalid[4].w += 2;
+        reject(invalid, quants, step);
+    }
+
+    #[test]
+    fn folding_quantized_steps_matches_inverse_output_casts() {
+        for horizontal in [true, false] {
+            let (w, h, hshift, vshift) = if horizontal {
+                (2, 1, 1, 0)
+            } else {
+                (1, 2, 0, 1)
+            };
+            let channel = Channel {
+                data: vec![i32::MAX; w * h],
+                w,
+                h,
+                hshift,
+                vshift,
+            };
+            let step = SqueezeStep {
+                horizontal,
+                in_place: true,
+                begin_c: 0,
+                num_c: 1,
+            };
+            let mut channels = vec![channel.clone(), channel];
+            let mut quants = vec![1, 1];
+            let expected = decoded_channels(&channels, &quants, &[step]);
+            assert!(expected[0].data.iter().any(|&v| v < 0));
+            assert!(fold_quantized_step(&mut channels, &mut quants, &step));
+            assert_channels_equal(&channels, &expected);
+            assert_eq!(quants, vec![1]);
         }
     }
 }

@@ -65,12 +65,12 @@ pub(crate) fn encode_frame(
         }
         // The lossy-modular arm codes the integer samples themselves (gray
         // as its one channel; alpha or K as an extra channel).
-        let modular = |scratch: &mut CoderScratch| -> Option<BitWriter> {
+        let modular = |scratch: &mut CoderScratch| -> Option<(BitWriter, usize)> {
             if !integer_samples {
                 return None;
             }
             let mut w = BitWriter::new();
-            crate::lossless::encode_frame_lossy_modular_plain(
+            let original_bits = crate::lossless::encode_frame_lossy_modular_plain(
                 &lm_plain_input(ctx, &coded, is_achromatic, alpha)?,
                 coded.xsize(),
                 coded.ysize(),
@@ -80,14 +80,14 @@ pub(crate) fn encode_frame(
                 &ctx.thread_pool,
                 scratch,
                 &mut w,
-            )
-            .then_some(w)
+            )?;
+            Some((w, original_bits))
         };
         let auto =
             ctx.lossy_modular == crate::LossyModular::Auto && ctx.speed.effort().lossy_modular_auto;
         let modular_writer = match ctx.lossy_modular {
             crate::LossyModular::Force => match modular(scratch) {
-                Some(w) => {
+                Some((w, _)) => {
                     writer.append(&w);
                     return Ok(true);
                 }
@@ -117,8 +117,8 @@ pub(crate) fn encode_frame(
             &mut vardct_writer,
         )?;
         return Ok(match modular_writer {
-            Some(m)
-                if (m.bits_written() as f64) * LM_GATE_MARGIN
+            Some((m, original_bits))
+                if (original_bits as f64) * LM_GATE_MARGIN
                     < vardct_writer.bits_written() as f64 =>
             {
                 writer.append(&m);
@@ -159,7 +159,9 @@ pub(crate) fn encode_frame(
             &ctx.thread_pool,
             scratch,
             &mut modular_writer,
-        ) {
+        )
+        .is_some()
+        {
             writer.append(&modular_writer);
             return Ok(false);
         }
@@ -169,7 +171,7 @@ pub(crate) fn encode_frame(
         && ctx.speed.effort().lossy_modular_auto
     {
         let mut modular_writer = BitWriter::new();
-        let have_modular = crate::lossless::encode_frame_lossy_modular_squeeze(
+        let original_modular_bits = crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
             modular_distance,
             ctx.speed,
@@ -190,10 +192,11 @@ pub(crate) fn encode_frame(
             patches,
             &mut vardct_writer,
         )?;
-        if have_modular
-            && (modular_writer.bits_written() as f64) * LM_GATE_MARGIN
-                < vardct_writer.bits_written() as f64
-        {
+        // Preserve the original arm decision: a better representation must
+        // not swap VarDCT for a different lossy reconstruction in Auto mode.
+        if original_modular_bits.is_some_and(|bits| {
+            (bits as f64) * LM_GATE_MARGIN < vardct_writer.bits_written() as f64
+        }) {
             writer.append(&modular_writer);
         } else {
             writer.append(&vardct_writer);

@@ -32,6 +32,7 @@
 mod extra;
 #[cfg(test)]
 mod extra_squeeze_tests;
+mod fold_cost;
 mod forest;
 mod frame;
 #[cfg(test)]
@@ -44,7 +45,7 @@ pub(crate) use frame::{
     dc_frame_supported, encode_dc_frame, encode_frame_lossy_modular_plain,
     encode_frame_lossy_modular_squeeze,
 };
-pub(crate) use plane::{StreamCrop, learn_global_plane_tree};
+pub(crate) use plane::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
 pub(crate) use quantize::{LmPlainInput, lm_calibrated_distance, lm_plain_distance};
 
 use super::groups::{DeepLzScratchPool, group_lz_threads, write_lz_groups};

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::available_parallelism;
 
-const FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
+static FONT: &[u8] = include_bytes!("../../assets/DejaVuSans.ttf");
 
 // --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3. ---
 const BUTTERAUGLI_BIN: &str = "butteraugli_main";
@@ -1134,6 +1134,7 @@ fn bench_jixel(
         .with_dots(true)
         .with_vector_layers(true)
         .with_ink_layer(true)
+        .with_edge_splines(true)
         .with_coding_transform(CodingTransform::Xyb);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

@@ -215,6 +215,9 @@ effort_gates! {
     /// Gradient and photo-like rectangles of a screenshot as cropped frames
     /// of their own (`region_frames`).
     region_frames,
+    /// A squeezed extra channel codes its AC groups through the frame's global
+    /// tree beside the DC tree, raced against their local trees.
+    extra_global_tree,
     ;
     // --- ExtraSlow only: always off without the `extraslow` feature ---
     /// Closed-loop quant-field refinement on the reconstructed luma (MS-SSIM).

@@ -179,6 +179,8 @@ pub(super) struct GlobalStreams<'a> {
     pub(super) meta: &'a mut Vec<Vec<Token>>,
     /// Whether the DC streams are written (not with a DC frame).
     pub(super) dc_written: bool,
+    /// The ANS refinement the DC code got at this speed.
+    pub(super) refinement: Option<crate::entropy::AnsRefinement>,
 }
 
 /// A joint coding of the frame's DC, metadata and extra streams that beats
@@ -277,7 +279,66 @@ pub(super) fn plan_global_extra_tree(
         scratch,
     );
     drop(data);
+    let header_palette = palette.filter(|_| single).map(|p| p.entries.len() as u32);
+    let refinement = Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed));
+    plan_joint(
+        ctx,
+        learned,
+        single,
+        header_palette,
+        refinement,
+        dim,
+        streams,
+        extra,
+        scratch,
+    )
+}
 
+/// Code a squeezed plane's AC-group streams through the frame's global
+/// tree: its fixed context forest (one subtree per within-group channel) hangs
+/// beside the DC tree and its contexts join the DC entropy code, so the AC
+/// groups carry no trees or histograms of their own. Its global and LF-group
+/// streams keep their local trees. `None` when the local codings are smaller.
+pub(super) fn plan_global_squeeze_tree(
+    ctx: &EncodingContext,
+    squeezed: &crate::lossless::ExtraSqueeze,
+    dim: &ImageDim,
+    streams: &GlobalStreams<'_>,
+    extra: &ExtraSections,
+    scratch: &mut CoderScratch,
+) -> Option<GlobalExtraTree> {
+    if streams.code.use_prefix_code || dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM {
+        return None;
+    }
+    let forest = squeezed.global_ac_forest(dim.num_groups, dim.xsize_groups, &ctx.thread_pool)?;
+    plan_joint(
+        ctx,
+        forest,
+        false,
+        None,
+        streams.refinement,
+        dim,
+        streams,
+        extra,
+        scratch,
+    )
+}
+
+/// Merge a plane's subtree beside the DC tree, optimize the joint code of the
+/// DC, metadata and plane streams and price the frame against the local
+/// codings in `extra`.
+#[allow(clippy::too_many_arguments)]
+fn plan_joint(
+    ctx: &EncodingContext,
+    learned: crate::lossless::GlobalPlaneTree,
+    single: bool,
+    header_palette: Option<u32>,
+    refinement: Option<crate::entropy::AnsRefinement>,
+    dim: &ImageDim,
+    streams: &GlobalStreams<'_>,
+    extra: &ExtraSections,
+    scratch: &mut CoderScratch,
+) -> Option<GlobalExtraTree> {
     let dc_tokens = streams.tree.tokens(dim.num_dc_groups);
     let dc_nodes = parse_tree(&dc_tokens);
     let plane_nodes = parse_tree(&learned.tree_tokens);
@@ -294,6 +355,7 @@ pub(super) fn plan_global_extra_tree(
     let num_ctx = dc_map.len() + plane_map.len();
     let dc = remap(streams.dc, &dc_map);
     let meta = remap(streams.meta, &dc_map);
+    let effort = ctx.speed.effort();
     let plane_streams = remap(&learned.crop_tokens, &plane_map);
     drop(learned);
 
@@ -303,7 +365,6 @@ pub(super) fn plan_global_extra_tree(
             .chain(&plane_streams)
             .map(Vec::as_slice)
     };
-    let effort = ctx.speed.effort();
     let mut code = crate::entropy::optimize_entropy_code_ac_streams(
         all(),
         num_ctx,
@@ -312,13 +373,15 @@ pub(super) fn plan_global_extra_tree(
         ctx.speed,
         Some(&ctx.thread_pool),
     );
-    crate::entropy::refine_entropy_bundle(
-        &mut code,
-        all(),
-        crate::entropy::AnsRefinement::slow_for_speed(ctx.speed),
-        &ctx.thread_pool,
-        scratch,
-    );
+    if let Some(refinement) = refinement {
+        crate::entropy::refine_entropy_bundle(
+            &mut code,
+            all(),
+            refinement,
+            &ctx.thread_pool,
+            scratch,
+        );
+    }
 
     let frame_bits = |tree: &[Token],
                       code: &EntropyCode,
@@ -342,11 +405,9 @@ pub(super) fn plan_global_extra_tree(
         scratch,
     ) + extra.bits();
     let joint = code.as_ref();
-    let header_palette = palette.filter(|_| single).map(|p| p.entries.len() as u32);
-    let sections: Vec<BitWriter> = plane_streams
-        .iter()
-        .map(|s| global_section(s, &joint, header_palette))
-        .collect();
+    let sections: Vec<BitWriter> = ctx.thread_pool.map(plane_streams.len(), |i| {
+        global_section(&plane_streams[i], &joint, header_palette)
+    });
     let local_sections: Vec<&BitWriter> = if single {
         vec![&extra.global]
     } else {
@@ -360,7 +421,7 @@ pub(super) fn plan_global_extra_tree(
     let fixed_bits = if single {
         0
     } else {
-        extra.global.bits_written()
+        extra.global.bits_written() + extra.lf.iter().map(BitWriter::bits_written).sum::<usize>()
     };
     let global_bits =
         frame_bits(&tree_tokens, &joint, &dc, &meta, scratch) + plane_bits + fixed_bits;

@@ -207,6 +207,46 @@ pub(crate) struct LmQuantized {
     pub(super) ysize: usize,
 }
 
+impl LmQuantized {
+    /// Fold one coarse step using the integers reconstructed by the decoder.
+    /// Retained bands keep their original multipliers; the merged averages
+    /// become full-scale integer channels. Layout, EPF and DC scaling stay put.
+    pub(super) fn fold_last(&mut self) -> bool {
+        if self.steps.len() <= 1 {
+            return false;
+        }
+        let step = *self.steps.last().unwrap();
+        // Keep the chroma pre-squeeze and at least one explicit step. The
+        // shared coarse suffix always splits all original channels in place.
+        if !step.in_place || step.begin_c != 0 {
+            return false;
+        }
+        let offset = step.num_c;
+        if offset == 0 || offset > self.channels.len() / 2 {
+            return false;
+        }
+        for c in 0..step.num_c {
+            let avg = &self.channels[c];
+            let res = &self.channels[offset + c];
+            let dims = if step.horizontal {
+                avg.w.checked_add(res.w).map(|w| (w, avg.h))
+            } else {
+                avg.h.checked_add(res.h).map(|h| (avg.w, h))
+            };
+            // The current global forest requires global channels. Keeping
+            // every changed average global also leaves all group crops stable.
+            if dims.is_none_or(|(w, h)| w > super::GROUP_DIM || h > super::GROUP_DIM) {
+                return false;
+            }
+        }
+        if !crate::squeeze::fold_quantized_step(&mut self.channels, &mut self.quants, &step) {
+            return false;
+        }
+        self.steps.pop();
+        true
+    }
+}
+
 /// Quantization role of one channel of a plain-layout pyramid.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum LmRole {

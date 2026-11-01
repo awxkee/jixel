@@ -85,6 +85,8 @@ pub(crate) struct EncodingContext {
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
+    #[cfg(feature = "splines")]
+    pub(crate) edge_splines: bool,
     /// Experimental bright/dark dot coding (see `EncodeConfig::dots`).
     #[cfg(feature = "splines")]
     pub(crate) dots: bool,
@@ -120,9 +122,16 @@ pub(crate) struct EncodingContext {
     pub(crate) extra_squeeze_distance: f32,
     /// Learned MA trees for the squeezed extra channel.
     pub(crate) extra_learned_trees: bool,
+    /// Fixed context trees (neighbour-activity splits, Zero prediction of the
+    /// residuals) instead of one Gradient leaf per squeezed channel.
+    pub(crate) extra_context_trees: bool,
     /// XYB rendition of a non-XYB frame. Adaptive quantization reads its
     /// luma instead of the coded planes.
     pub(crate) aq_source: std::sync::OnceLock<crate::image::Image3F>,
+    /// Coverage (0..1) of the layer blended over this frame, per pixel: the
+    /// final image shows `1 - coverage` of this frame's colors.
+    #[cfg(feature = "splines")]
+    pub(crate) overlay_coverage: Option<Vec<f32>>,
     /// Cached with the matrix, including a later adaptive yellow selection.
     channel_weights: [f32; 3],
     /// Transform-merge knobs resolved at this encodes distance.
@@ -429,6 +438,7 @@ impl EncodingContext {
             #[cfg(feature = "splines")]
             {
                 self.splines = false;
+                self.edge_splines = false;
                 self.dots = false;
             }
         }
@@ -557,6 +567,8 @@ impl EncodingContext {
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]
+            edge_splines: false,
+            #[cfg(feature = "splines")]
             dots: false,
             xyb,
             coding: crate::coding::CodingTransform::Xyb,
@@ -570,9 +582,12 @@ impl EncodingContext {
                 std::sync::atomic::AtomicU32::new(84.0f32.to_bits()),
             ],
             aq_source: std::sync::OnceLock::new(),
+            #[cfg(feature = "splines")]
+            overlay_coverage: None,
             extra_step: 1,
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
+            extra_context_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),
             learned_rate: false,

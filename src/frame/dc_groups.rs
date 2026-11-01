@@ -66,6 +66,64 @@ pub(super) fn assemble_source_dc(
 #[allow(clippy::too_many_arguments)]
 /// Set up one DC group (quant field, AC strategy, CfL, sub-8 gate); its AC
 /// groups are encoded separately. Returns the data and its group-grid dims.
+/// DC group with the real AQ field and CfL map on a DCT8-only layout: the
+/// quantizer edge-spline selection judges proposals on before the one full
+/// layout search runs on the changed source.
+#[cfg(feature = "splines")]
+pub(super) fn provisional_dc_group(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    opsin: &Image3F,
+    dim: &ImageDim,
+    distp: &DistanceParams,
+    dc_gx: usize,
+    dc_gy: usize,
+) -> Result<DcGroupData, EncodeError> {
+    let x0 = dc_gx * K_DC_GROUP_DIM;
+    let y0 = dc_gy * K_DC_GROUP_DIM;
+    let xblocks = K_DC_GROUP_DIM
+        .min(dim.xsize.saturating_sub(x0))
+        .div_ceil(K_BLOCK_DIM);
+    let yblocks = K_DC_GROUP_DIM
+        .min(dim.ysize.saturating_sub(y0))
+        .div_ceil(K_BLOCK_DIM);
+    let mut dc_data = DcGroupData::new(xblocks, yblocks)?;
+    (ctx.fill_quant_field)(
+        &mut scratch.aq_map,
+        ctx.aq_source.get().unwrap_or(opsin),
+        &mut dc_data.raw_quant_field,
+        x0,
+        y0,
+        distp.distance,
+        1.0 / distp.scale,
+    );
+    if ctx.speed.effort().chroma_policy && (ctx.x_heavy() || ctx.b_heavy()) {
+        crate::adaptive_quant::apply_chroma_hf_protection(
+            opsin,
+            &mut dc_data.raw_quant_field,
+            x0,
+            y0,
+            distp.distance,
+        );
+    }
+    crate::color_correlation::fill_cmap(
+        ctx,
+        opsin,
+        x0 / K_BLOCK_DIM,
+        y0 / K_BLOCK_DIM,
+        xblocks,
+        yblocks,
+        &dc_data.raw_quant_field,
+        distp.scale,
+        &mut scratch.cfl_rdo,
+        &mut dc_data.ytox_map,
+        &mut dc_data.ytob_map,
+        distp.distance,
+        distp.x_qm_scale,
+    );
+    Ok(dc_data)
+}
+
 pub(super) fn setup_dc_group(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,

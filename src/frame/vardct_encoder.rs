@@ -35,6 +35,8 @@ use super::ac_entropy::{
 #[cfg(not(feature = "extraslow"))]
 use super::ac_groups::RefinedAcGroup;
 use super::ac_groups::{PendingAcGroup, ac_qf_threshold, paste_group, process_ac_group};
+#[cfg(feature = "splines")]
+use super::dc_groups::provisional_dc_group;
 use super::dc_groups::{assemble_source_dc, merge_quant_dc, setup_dc_group};
 use super::dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
@@ -81,6 +83,59 @@ impl Drop for RestoreBQmScale<'_> {
 
 /// Returns DC-group and AC-section bits, excluding the global headers, so
 /// sampled payload can be scaled separately from the frame's fixed costs.
+/// What the decoder shows of each pixel of this frame: alpha and an overlay
+/// blended over a saved base scale its colors' error, and Replace patches
+/// overwrite it before splines are drawn.
+#[cfg(feature = "splines")]
+fn edge_view(
+    ctx: &EncodingContext,
+    frame_kind: VarDctFrameKind,
+    alpha: Option<&AlphaPlane>,
+    width: usize,
+    height: usize,
+) -> crate::splines::EdgeView {
+    let len = width * height;
+    let mut weight: Option<Vec<f32>> = None;
+    if let Some(alpha) = alpha.filter(|a| a.len() == len && !a.is_constant()) {
+        let max = ((1u64 << alpha.bits().min(16)) - 1) as f32;
+        weight = Some(
+            (0..len)
+                .map(|i| {
+                    let a = if alpha.is_float() {
+                        f32::from_bits(alpha.get_i32(i) as u32).clamp(0.0, 1.0)
+                    } else {
+                        alpha.get_i32(i) as f32 / max
+                    };
+                    a * a
+                })
+                .collect(),
+        );
+    }
+    if let Some(cover) = ctx.overlay_coverage.as_ref().filter(|c| c.len() == len) {
+        let weight = weight.get_or_insert_with(|| vec![1.0; len]);
+        for (w, &c) in weight.iter_mut().zip(cover) {
+            *w *= (1.0 - c) * (1.0 - c);
+        }
+    }
+    let replaced = match frame_kind {
+        VarDctFrameKind::Patched(references) => {
+            let mut replaced = vec![false; len];
+            for reference in references.iter().filter(|r| !r.add && !r.mul) {
+                for &(px, py) in &reference.positions {
+                    for y in py.min(height)..(py + reference.height).min(height) {
+                        replaced[y * width + px.min(width)
+                            ..y * width + (px + reference.width).min(width)]
+                            .fill(true);
+                    }
+                }
+            }
+            replaced.contains(&true).then_some(replaced)
+        }
+        _ => None,
+    };
+    crate::splines::EdgeView { weight, replaced }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_frame_core(
     ctx: &EncodingContext,
@@ -91,6 +146,7 @@ pub(super) fn encode_frame_core(
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
     #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
+    #[cfg(feature = "splines")] allow_edge_splines: bool,
     writer: &mut BitWriter,
 ) -> Result<usize, EncodeError> {
     #[cfg(feature = "extraslow")]
@@ -146,6 +202,59 @@ pub(super) fn encode_frame_core(
         .flat_map(|gy| (0..dim.xsize_dc_groups).map(move |gx| (gx, gy)))
         .collect();
     let mut opsin_image = Some(opsin);
+
+    // Edge proposals are judged on native transform footprints with the real
+    // AQ field, quantizers and CfL map, on a DCT8 layout: accepted splines
+    // change the source, so the one full layout search runs after them.
+    // Sample estimates and atlas/progressive/noisy frames never run this search.
+    // Patched frames, the saved base of a layered stack and frames with alpha
+    // take part: the view weights each pixel by what the decoder shows of it.
+    #[cfg(feature = "splines")]
+    let edge_set = if allow_edge_splines
+        && ctx.edge_splines
+        && ctx.coding.is_xyb()
+        && matches!(
+            frame_kind,
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        )
+        && noise.is_none()
+        && !use_dc_frame
+        && !distp.gab_enabled
+        && num_passes == 1
+        && distance > 1.0
+        && distance <= 16.0
+        && dim.xsize >= 64
+        && dim.ysize >= 64
+    {
+        let source = opsin_image.as_ref().unwrap();
+        let provisional: Vec<Result<DcGroupData, EncodeError>> =
+            ctx.thread_pool
+                .steal_map(scratch, group_coords.len(), |i, scratch| {
+                    let (gx, gy) = group_coords[i];
+                    provisional_dc_group(ctx, scratch, source, &dim, &distp, gx, gy)
+                });
+        let provisional: Vec<DcGroupData> = provisional.into_iter().collect::<Result<_, _>>()?;
+        let view = edge_view(ctx, frame_kind, alpha, dim.xsize, dim.ysize);
+        crate::splines::select_edges(
+            ctx,
+            scratch,
+            opsin_image.as_mut().unwrap(),
+            &provisional,
+            crate::splines::edge_model::Quantization {
+                distance,
+                scale: distp.scale,
+                scale_dc: distp.scale_dc,
+                x_qm_scale: distp.x_qm_scale,
+                dc_step: distp.dc_step,
+            },
+            splines,
+            &view,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "splines")]
+    let splines = edge_set.as_ref().or(splines);
     let opsin = opsin_image.as_ref().unwrap();
 
     // Split the thread budget across nesting levels: `outer` lanes steal DC
@@ -191,27 +300,6 @@ pub(super) fn encode_frame_core(
         dc.block_quant_field = None;
     }
 
-    // Layer residuals and progressive/DC frames retain the EPF schedule.
-    let fit_epf = ctx.speed.effort().epf_fit
-        && ctx.coding.is_xyb()
-        && matches!(frame_kind, VarDctFrameKind::Regular)
-        && ctx.frame_role == FrameRole::Last
-        && noise.is_none()
-        && !use_dc_frame
-        && num_passes == 1
-        && (0.5..=24.0).contains(&distance)
-        && dim.xsize >= 16
-        && dim.ysize >= 16;
-    #[cfg(feature = "splines")]
-    let fit_epf = fit_epf && splines.is_none();
-    let mut epf_recon = fit_epf.then(|| Image3F::new(dim.xsize, dim.ysize));
-
-    // Per-image quant-field threshold for the fine AC block-context layout.
-    // The median splits the field into halves with genuinely different
-    // coefficient statistics; whether any split is *kept* is decided later
-    // from real token stats, so a useless threshold costs nothing.
-    let qf_threshold = ac_qf_threshold(&dc_datas);
-
     // The CfL slopes were estimated on fixed 8x8 DCTs so the transform search
     // could price candidates under them; the final layout and quant field
     // are known now, so re-estimate them on the coefficients that get coded.
@@ -241,6 +329,25 @@ pub(super) fn encode_frame_core(
             dc.ytob_map = ytob;
         }
     }
+
+    // Layer residuals and progressive/DC frames retain the EPF schedule.
+    let fit_epf = ctx.speed.effort().epf_fit
+        && ctx.coding.is_xyb()
+        && matches!(frame_kind, VarDctFrameKind::Regular)
+        && ctx.frame_role == FrameRole::Last
+        && noise.is_none()
+        && !use_dc_frame
+        && num_passes == 1
+        && (0.5..=24.0).contains(&distance)
+        && dim.xsize >= 16
+        && dim.ysize >= 16;
+    let mut epf_recon = fit_epf.then(|| Image3F::new(dim.xsize, dim.ysize));
+
+    // Per-image quant-field threshold for the fine AC block-context layout.
+    // The median splits the field into halves with genuinely different
+    // coefficient statistics; whether any split is *kept* is decided later
+    // from real token stats, so a useless threshold costs nothing.
+    let qf_threshold = ac_qf_threshold(&dc_datas);
 
     let dc_ref = &dc_datas;
     let natural_orders = crate::coeff_order::CoeffOrders::natural();
@@ -768,10 +875,18 @@ pub(super) fn encode_frame_core(
             dim.ysize_blocks,
             distp.global_scale,
         );
+        #[cfg(feature = "splines")]
+        // Splines are drawn after the filter: the fit sees them as a layer.
+        let spline_layer =
+            splines.map(|set| crate::splines::additive_y(ctx, set, dim.xsize, dim.ysize));
         let chosen = crate::epf_filter::fit(
             ctx,
             scratch,
             &source_y,
+            #[cfg(feature = "splines")]
+            spline_layer.as_deref(),
+            #[cfg(not(feature = "splines"))]
+            None,
             &recon,
             &blocks,
             distance,
@@ -821,6 +936,7 @@ pub(super) fn encode_frame_core(
                 dc: &mut dc_tokens_per_group,
                 meta: &mut meta_tokens_per_group,
                 dc_written: !use_dc_frame,
+                refinement: ans_refinement,
             },
             scratch,
         )
@@ -959,7 +1075,6 @@ pub(super) fn encode_frame_core(
         ytox_dc,
         ytob_dc,
         ctx.cfl_frame(),
-        extra.as_ref(),
         scratch,
         &mut sections[0],
     );
@@ -990,10 +1105,10 @@ pub(super) fn encode_frame_core(
                     );
                 }
             }
-            // ModularLfGroup: the extra channel's coarse squeeze levels.
-            if let Some(extra) = &extra {
-                w.append(&extra.lf[i]);
-            }
+            // Keep the metadata suffix separate until the extra-channel
+            // representation is selected using final section sizes.
+            let prefix = w;
+            let mut w = BitWriter::new();
             let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
             let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
             let nb_bits = if num_blocks <= 1 {
@@ -1020,10 +1135,12 @@ pub(super) fn encode_frame_core(
                     &mut w,
                 );
             }
-            w
+            (prefix, w)
         });
-    for (i, section) in dc_sections.into_iter().enumerate() {
-        sections[1 + i] = section;
+    let mut dc_suffixes = Vec::with_capacity(dc_sections.len());
+    for (i, (prefix, suffix)) in dc_sections.into_iter().enumerate() {
+        sections[1 + i] = prefix;
+        dc_suffixes.push(suffix);
     }
     drop(dc_tokens_per_group);
     drop(meta_tokens_per_group);
@@ -1055,6 +1172,31 @@ pub(super) fn encode_frame_core(
         sections[section_idx] = section;
     }
     drop(all_pending);
+    // Color coding is complete. Compare exact section padding and TOC costs
+    // before inserting the chosen extra channel at its three wire positions.
+    let extra = extra.map(|prepared| {
+        let mut color_bits: Vec<usize> = sections.iter().map(BitWriter::bits_written).collect();
+        for (i, suffix) in dc_suffixes.iter().enumerate() {
+            color_bits[1 + i] += suffix.bits_written();
+        }
+        prepared.finish(
+            ctx,
+            &dim,
+            &group_coords,
+            num_passes - 1,
+            &color_bits,
+            scratch,
+        )
+    });
+    if let Some(extra) = &extra {
+        sections[0].append(&extra.global);
+    }
+    for (i, suffix) in dc_suffixes.into_iter().enumerate() {
+        if let Some(extra) = &extra {
+            sections[1 + i].append(&extra.lf[i]);
+        }
+        sections[1 + i].append(&suffix);
+    }
     // Modular alpha: extra-channel modular data is decoded in the last pass
     // (the only pass whose modular sub-image shift range is set when num_ds=0,
     // jxl-frame lib.rs:101-108 / pass_group.rs:93). Write it into that section.

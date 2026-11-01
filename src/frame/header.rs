@@ -30,7 +30,6 @@
 //! VarDCT frame headers, global sections and quantization matrices.
 
 use super::dc_tokens::{DcTreeChoice, write_context_tree, write_tree_tokens};
-use super::extra_channels::ExtraSections;
 use super::quantization::DistanceParams;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -426,7 +425,6 @@ pub(super) fn write_dc_global(
     ytox_dc: i32,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
-    extra: Option<&ExtraSections>,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -482,11 +480,8 @@ pub(super) fn write_dc_global(
     // Then the static DC entropy code: this is the global tree's pixel histograms.
     write_entropy_code(dc_code, &mut scratch.huffman_pool, w);
 
-    // FullModularImage::read happens HERE in the decoder. If we declared an alpha
-    // extra channel, write its GroupHeader + local tree + pixel data now.
-    if let Some(extra) = extra {
-        w.append(&extra.global);
-    }
+    // The extra channel's FullModularImage follows this header. The caller
+    // appends it after choosing its representation using final section sizes.
 }
 
 /// Slots whose transform actually appears in the frame: the nine

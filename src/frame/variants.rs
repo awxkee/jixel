@@ -108,6 +108,8 @@ pub(super) fn lattice_variants(
         },
         #[cfg(feature = "splines")]
         None,
+        #[cfg(feature = "splines")]
+        false,
         &mut mul_prefix,
     )?;
     let mul = prepared(mul_prefix, plan.gain, mul_references);
@@ -327,6 +329,8 @@ pub(super) fn prepare_vardct_variant(
                     },
                     #[cfg(feature = "splines")]
                     None,
+                    #[cfg(feature = "splines")]
+                    false,
                     &mut patched_writer,
                 )?;
                 references.extend(tile_refs);
@@ -502,6 +506,8 @@ pub(super) fn prepare_vardct_variant(
                     },
                     #[cfg(feature = "splines")]
                     None,
+                    #[cfg(feature = "splines")]
+                    false,
                     out,
                 )
             };
@@ -715,6 +721,8 @@ impl PreparedVarDct {
             },
             #[cfg(feature = "splines")]
             self.splines.as_ref(),
+            #[cfg(feature = "splines")]
+            true,
             writer,
         )?;
         Ok(())
@@ -787,6 +795,8 @@ fn estimate_residual_bits(
         VarDctFrameKind::Regular,
         #[cfg(feature = "splines")]
         None,
+        #[cfg(feature = "splines")]
+        false,
         &mut writer,
     )?;
     Ok((writer.bits_written() - payload) as f64
