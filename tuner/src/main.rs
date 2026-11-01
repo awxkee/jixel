@@ -27,8 +27,13 @@ fn usage() -> ! {
          [--decoding-speed slow|fast|fastest] [--near-lossless <k>] (lossless only)"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
+    eprintln!(
+        "         [--edge-splines] (experimental edge pairs; requires --speed slow, distance > 1)"
+    );
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
     eprintln!("         [--patches | --no-patches] (override the speed preset)");
+    eprintln!("         [--alpha] (encode the RGBA input with its alpha channel)");
+    eprintln!("         [--alpha-distance <d>] (lossy alpha distance; 0 = lossless)");
     eprintln!("         [--arbiter ssimulacra2|cvvdp]");
     eprintln!("         [--progressive-dc] (code the DC as a progressive DC frame)");
     eprintln!(
@@ -50,8 +55,11 @@ fn main() -> ExitCode {
     let mut lossless = false;
     let mut near_lossless: u16 = 0;
     let mut splines = false;
+    let mut edge_splines = false;
     let mut dots = false;
     let mut patches = None;
+    let mut keep_alpha = false;
+    let mut alpha_distance: Option<f32> = None;
     let mut progressive_dc = false;
     let mut progressive_dc_levels: Option<u32> = None;
     let mut progressive_shifts: Option<Vec<u32>> = None;
@@ -124,9 +132,24 @@ fn main() -> ExitCode {
                 splines = true;
                 i += 1;
             }
+            "--edge-splines" => {
+                edge_splines = true;
+                i += 1;
+            }
             "--dots" => {
                 dots = true;
                 i += 1;
+            }
+            "--alpha" => {
+                keep_alpha = true;
+                i += 1;
+            }
+            "--alpha-distance" => {
+                alpha_distance = args.get(i + 1).and_then(|v| v.parse().ok());
+                if alpha_distance.is_none() {
+                    usage();
+                }
+                i += 2;
             }
             "--patches" | "--no-patches" => {
                 patches = Some(args[i] == "--patches");
@@ -218,6 +241,7 @@ fn main() -> ExitCode {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let rgb = image.to_rgb8();
+    let rgba = keep_alpha.then(|| image.to_rgba8());
 
     let cfg = jixel::EncodeConfig::default()
         .with_lossless(lossless)
@@ -228,6 +252,7 @@ fn main() -> ExitCode {
         .with_decoding_speed(decoding_speed)
         .with_near_lossless(near_lossless)
         .with_splines(splines)
+        .with_edge_splines(edge_splines)
         .with_dots(dots)
         .with_progressive_dc(progressive_dc);
     let cfg = cfg.with_group_order(group_order);
@@ -243,13 +268,21 @@ fn main() -> ExitCode {
         Some(levels) => cfg.with_progressive_dc_levels(levels),
         None => cfg,
     };
+    let cfg = match alpha_distance {
+        Some(d) => cfg.with_alpha_distance(d),
+        None => cfg,
+    };
     let cfg = if let Some(patches) = patches {
         cfg.with_patches(patches)
     } else {
         cfg
     };
     let start = Instant::now();
-    let data = match jixel::encode_image(rgb.as_raw(), width, height, &cfg) {
+    let encoded = match &rgba {
+        Some(rgba) => jixel::encode_image_with_alpha(rgba.as_raw(), width, height, &cfg),
+        None => jixel::encode_image(rgb.as_raw(), width, height, &cfg),
+    };
+    let data = match encoded {
         Ok(d) => d,
         Err(e) => {
             eprintln!("jixel encode failed: {e:?}");

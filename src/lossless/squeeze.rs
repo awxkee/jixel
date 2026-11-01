@@ -32,8 +32,11 @@
 mod extra;
 #[cfg(test)]
 mod extra_squeeze_tests;
+mod fold_cost;
 mod forest;
 mod frame;
+#[cfg(test)]
+mod lm_fold_tests;
 #[cfg(test)]
 mod lm_plain_tests;
 mod plane;

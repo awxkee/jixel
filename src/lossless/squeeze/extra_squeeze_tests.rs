@@ -29,7 +29,7 @@
 
 //! Tests for squeeze.
 
-use super::extra::ExtraSqueeze;
+use super::extra::{ExtraSqueeze, closed_h_squeeze, closed_v_squeeze};
 use crate::encode_image::AlphaPlane;
 
 /// A soft-edged disc: the anti-aliased, feathered alpha lossy coding is for.
@@ -49,7 +49,7 @@ fn soft_disc(w: usize, h: usize) -> AlphaPlane {
 fn unit_steps_reconstruct_the_plane_exactly() {
     let (w, h) = (300, 270);
     let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 1e-3, false).unwrap();
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 1e-3, false, false).unwrap();
     assert!(squeezed.quants.iter().all(|&q| q == 1));
     let want: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
     assert_eq!(squeezed.reconstruct(), want);
@@ -59,7 +59,7 @@ fn unit_steps_reconstruct_the_plane_exactly() {
 fn quantized_reconstruction_stays_close() {
     let (w, h) = (300, 270);
     let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false).unwrap();
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false, true).unwrap();
     assert!(squeezed.quants.iter().any(|&q| q > 1));
     let rec = squeezed.reconstruct();
     let err: Vec<i32> = rec
@@ -70,4 +70,164 @@ fn quantized_reconstruction_stays_close() {
     let mean = err.iter().sum::<i32>() as f32 / err.len() as f32;
     assert!(err.iter().any(|&e| e > 0), "distance 4 should be lossy");
     assert!(mean < 2.0, "mean alpha error {mean}");
+}
+
+/// The closed-loop quantizer tracks exactly what the decoder's inverse
+/// squeeze rebuilds from the decoded averages and the scaled residuals.
+#[test]
+fn closed_loop_steps_mirror_the_inverse_squeeze() {
+    use crate::squeeze::{Channel, fwd_h_squeeze, fwd_v_squeeze, inv_h_squeeze, inv_v_squeeze};
+    for (w, h) in [(37, 29), (64, 64), (1, 9), (9, 1)] {
+        let plane = soft_disc(w, h);
+        let x: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
+        let input = Channel {
+            data: x.clone(),
+            w,
+            h,
+            hshift: 0,
+            vshift: 0,
+        };
+        for horizontal in [true, false] {
+            let (mut avg, _) = if horizontal {
+                fwd_h_squeeze(&input)
+            } else {
+                fwd_v_squeeze(&input)
+            };
+            // Perturb the averages as a coarser level's quantization would.
+            for (i, v) in avg.data.iter_mut().enumerate() {
+                *v += (i as i32 % 5) - 2;
+            }
+            for (q, deadzone) in [(1, 0.0), (7, 0.0), (7, 0.1), (40, 0.25)] {
+                let (res, out) = if horizontal {
+                    closed_h_squeeze(&x, w, h, &avg.data, q, deadzone)
+                } else {
+                    closed_v_squeeze(&x, w, h, &avg.data, q, deadzone)
+                };
+                let (rw, rh) = if horizontal { (w / 2, h) } else { (w, h / 2) };
+                let res = Channel {
+                    data: res.iter().map(|&r| r * q).collect(),
+                    w: rw,
+                    h: rh,
+                    hshift: avg.hshift,
+                    vshift: avg.vshift,
+                };
+                let rebuilt = if horizontal {
+                    inv_h_squeeze(&avg, &res)
+                } else {
+                    inv_v_squeeze(&avg, &res)
+                };
+                assert_eq!(rebuilt.data, out, "{w}x{h} h={horizontal} q={q}");
+            }
+        }
+    }
+}
+
+/// Endpoints and high-contrast detail exercise signed inverse-squeeze values,
+/// including excursions that a final alpha clamp would hide.
+fn patterned_alpha(w: usize, h: usize, bits: u8, wide: bool) -> AlphaPlane {
+    let max = (1u32 << bits) - 1;
+    let data: Vec<u16> = (0..w * h)
+        .map(|i| match i % 11 {
+            0 => 0,
+            1 => max as u16,
+            2 => (max / 2) as u16,
+            _ => {
+                let mixed = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((mixed >> 32) % u64::from(max + 1)) as u16
+            }
+        })
+        .collect();
+    if wide {
+        AlphaPlane::U16 { data, bits }
+    } else {
+        assert_eq!(bits, 8);
+        AlphaPlane::U8(data.into_iter().map(|v| v as u8).collect())
+    }
+}
+
+#[test]
+fn exact_tail_candidates_preserve_unclamped_reconstruction() {
+    let mut saw_partial_tail = false;
+    let mut saw_unclamped_excursion = false;
+    for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
+        let max = (1i32 << bits) - 1;
+        for (w, h) in [(37, 29), (65, 18), (1, 33), (33, 1), (257, 129)] {
+            let plane = patterned_alpha(w, h, bits, wide);
+            for distance in [1e-6, 0.01, 1.0, 6.0] {
+                let original = ExtraSqueeze::new(&plane, w, h, distance, false, true).unwrap();
+                let Some(first) = original.exact_tail_start() else {
+                    continue;
+                };
+                saw_partial_tail |= first > 0;
+                let want = original.reconstruct();
+                saw_unclamped_excursion |= want.iter().any(|&v| v < 0 || v > max);
+                // Test every legal stopping point, including suffixes that end
+                // between horizontal and vertical steps.
+                for retained in first..original.steps.len() {
+                    let candidate = original.without_exact_tail(retained).unwrap();
+                    assert_eq!(
+                        candidate.reconstruct(),
+                        want,
+                        "{w}x{h}, bits={bits}, wide={wide}, d={distance}, retained={retained}"
+                    );
+                }
+                for retained in 0..first {
+                    assert!(original.without_exact_tail(retained).is_none());
+                }
+            }
+        }
+    }
+    assert!(
+        saw_partial_tail,
+        "exercise a mixture of lossy and exact steps"
+    );
+    assert!(
+        saw_unclamped_excursion,
+        "check signed reconstruction, not only values after alpha clamping"
+    );
+}
+
+#[test]
+fn an_entirely_exact_pyramid_can_be_removed() {
+    for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
+        for (w, h) in [(1, 9), (9, 1), (19, 27), (513, 257)] {
+            let plane = patterned_alpha(w, h, bits, wide);
+            let original = ExtraSqueeze::new(&plane, w, h, 1e-6, false, true).unwrap();
+            assert!(original.quants.iter().all(|&q| q == 1));
+            assert_eq!(original.exact_tail_start(), Some(0));
+            let candidate = original.without_exact_tail(0).unwrap();
+            assert!(candidate.steps.is_empty());
+            assert_eq!(candidate.channels.len(), 1);
+            let want: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
+            assert_eq!(candidate.reconstruct(), want);
+        }
+    }
+}
+
+#[test]
+fn exact_tail_removal_rejects_quantized_or_out_of_range_requests() {
+    for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
+        let plane = patterned_alpha(17, 11, bits, wide);
+        let quantized = ExtraSqueeze::new(&plane, 17, 11, 64.0, false, true).unwrap();
+        assert!(quantized.quants.iter().all(|&q| q > 1));
+        assert_eq!(quantized.exact_tail_start(), None);
+        for retained in 0..=quantized.steps.len() + 1 {
+            assert!(quantized.without_exact_tail(retained).is_none());
+        }
+
+        let exact = ExtraSqueeze::new(&plane, 17, 11, 1e-6, false, true).unwrap();
+        assert!(exact.without_exact_tail(exact.steps.len()).is_none());
+        assert!(exact.without_exact_tail(exact.steps.len() + 1).is_none());
+
+        // Unit residual multipliers alone do not make a suffix reversible:
+        // the coarse average must also retain its integer precision.
+        let mut quantized_average = exact;
+        quantized_average.quants[0] = 2;
+        assert_eq!(quantized_average.exact_tail_start(), None);
+        for retained in 0..quantized_average.steps.len() {
+            assert!(quantized_average.without_exact_tail(retained).is_none());
+        }
+    }
 }

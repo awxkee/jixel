@@ -50,6 +50,75 @@ impl ExtraSections {
             + self.lf.iter().map(BitWriter::bits_written).sum::<usize>()
             + self.ac.iter().map(BitWriter::bits_written).sum::<usize>()
     }
+
+    /// Final section padding and TOC size with this extra-channel encoding.
+    fn serialized_size(&self, color_bits: &[usize], dim: &ImageDim, last_pass: usize) -> usize {
+        let mut bits = color_bits.to_vec();
+        bits[0] += self.global.bits_written();
+        for (i, stream) in self.lf.iter().enumerate() {
+            bits[1 + i] += stream.bits_written();
+        }
+        let ac_start = 2 + dim.num_dc_groups + last_pass * dim.num_groups;
+        for (i, stream) in self.ac.iter().enumerate() {
+            bits[ac_start + i] += stream.bits_written();
+        }
+        // A group permutation is independent of the extra representation;
+        // its aligned header has the same size for every candidate.
+        super::sections::combined_sections_size(&bits)
+    }
+}
+
+/// Preserve the original lossless-versus-lossy choice before racing exact
+/// representations. A smaller squeezed representation must not turn a plane
+/// that previously stayed lossless into a lossy one.
+pub(super) struct PreparedExtra {
+    sections: ExtraSections,
+    squeezed: Option<crate::lossless::ExtraSqueeze>,
+    global_code_ans: bool,
+}
+
+impl PreparedExtra {
+    pub(crate) fn finish(
+        self,
+        ctx: &EncodingContext,
+        dim: &ImageDim,
+        dc_group_coords: &[(usize, usize)],
+        last_pass: usize,
+        color_bits: &[usize],
+        scratch: &mut CoderScratch,
+    ) -> ExtraSections {
+        let original = self.sections;
+        let Some(squeezed) = self.squeezed else {
+            return original;
+        };
+        let Some(start) = squeezed.exact_tail_start() else {
+            return original;
+        };
+        let mut best = None;
+        let mut best_size = original.serialized_size(color_bits, dim, last_pass);
+        // The earliest exact cutoff and one more H/V pair give different
+        // coarse prediction contexts. Keep this search bounded at all speeds.
+        for retained in [start, start + 2] {
+            let Some(candidate) = squeezed.without_exact_tail(retained) else {
+                continue;
+            };
+            let sections = squeezed_sections(
+                ctx,
+                &candidate,
+                dim,
+                dc_group_coords,
+                self.global_code_ans,
+                Some((&squeezed, &original)),
+                scratch,
+            );
+            let size = sections.serialized_size(color_bits, dim, last_pass);
+            if size < best_size {
+                best = Some(sections);
+                best_size = size;
+            }
+        }
+        best.unwrap_or(original)
+    }
 }
 
 /// A lossless extra channel of few distinct values, coded through a Palette
@@ -163,6 +232,50 @@ fn lossless_sections(
     sections
 }
 
+fn squeezed_sections(
+    ctx: &EncodingContext,
+    squeezed: &crate::lossless::ExtraSqueeze,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    global_code_ans: bool,
+    previous: Option<(&crate::lossless::ExtraSqueeze, &ExtraSections)>,
+    scratch: &mut CoderScratch,
+) -> ExtraSections {
+    let mut global = BitWriter::new();
+    squeezed.write_global(global_code_ans, scratch, &mut global);
+    let lf = if let Some((_, previous)) =
+        previous.filter(|(original, _)| original.exact_tail_groups_unchanged(squeezed))
+    {
+        previous.lf.clone()
+    } else {
+        ctx.thread_pool
+            .steal_map(scratch, dc_group_coords.len(), |i, scratch| {
+                let (gx, gy) = dc_group_coords[i];
+                let mut w = BitWriter::new();
+                squeezed.write_lf_group(gx, gy, scratch, &mut w);
+                w
+            })
+    };
+    let ac = if let Some((_, previous)) =
+        previous.filter(|(original, _)| original.exact_tail_ac_unchanged(squeezed))
+    {
+        previous.ac.clone()
+    } else {
+        ctx.thread_pool
+            .steal_map(scratch, dim.num_groups, |group_id, scratch| {
+                let mut w = BitWriter::new();
+                squeezed.write_ac_group(
+                    group_id % dim.xsize_groups,
+                    group_id / dim.xsize_groups,
+                    scratch,
+                    &mut w,
+                );
+                w
+            })
+    };
+    ExtraSections { global, lf, ac }
+}
+
 /// Code the extra channel losslessly — through a Palette transform when it
 /// has few distinct values and that is smaller, and through the frame's
 /// global tree where that beats the fixed local trees — and, when the context
@@ -178,7 +291,7 @@ pub(super) fn prepare_extra_sections(
     last_pass: usize,
     mut streams: extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
-) -> ExtraSections {
+) -> PreparedExtra {
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
     let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
     let mut palette = lossless_plane.then(|| extra_palette(plane)).flatten();
@@ -208,7 +321,7 @@ pub(super) fn prepare_extra_sections(
         }
         None => lossless_sections(ctx, plane, None, dim, groups, ans, scratch),
     };
-    let lossy = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
+    let squeezed = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
         .then(|| {
             crate::lossless::ExtraSqueeze::new(
                 plane,
@@ -216,38 +329,13 @@ pub(super) fn prepare_extra_sections(
                 dim.ysize,
                 ctx.extra_squeeze_distance,
                 ctx.extra_learned_trees,
+                ctx.extra_context_trees,
             )
         })
-        .flatten()
-        .map(|squeezed| {
-            let mut lossy = ExtraSections {
-                global: BitWriter::new(),
-                lf: Vec::new(),
-                ac: Vec::new(),
-            };
-            squeezed.write_global(scratch, &mut lossy.global);
-            lossy.lf = ctx
-                .thread_pool
-                .steal_map(scratch, dc_group_coords.len(), |i, scratch| {
-                    let (gx, gy) = dc_group_coords[i];
-                    let mut w = BitWriter::new();
-                    squeezed.write_lf_group(gx, gy, scratch, &mut w);
-                    w
-                });
-            lossy.ac = ctx
-                .thread_pool
-                .steal_map(scratch, dim.num_groups, |group_id, scratch| {
-                    let mut w = BitWriter::new();
-                    squeezed.write_ac_group(
-                        group_id % dim.xsize_groups,
-                        group_id / dim.xsize_groups,
-                        scratch,
-                        &mut w,
-                    );
-                    w
-                });
-            lossy
-        });
+        .flatten();
+    let lossy = squeezed
+        .as_ref()
+        .map(|s| squeezed_sections(ctx, s, dim, dc_group_coords, ans, None, scratch));
     let global_tree = (lossless_plane
         && ctx.extra_learned_trees
         && lossy
@@ -268,12 +356,20 @@ pub(super) fn prepare_extra_sections(
     .flatten();
     let lossless_bits = lossless.bits() - global_tree.as_ref().map_or(0, |t| t.saving());
     match lossy {
-        Some(lossy) if lossy.bits() < lossless_bits => lossy,
+        Some(lossy) if lossy.bits() < lossless_bits => PreparedExtra {
+            sections: lossy,
+            squeezed: squeezed.filter(|s| s.exact_tail_start().is_some()),
+            global_code_ans: ans,
+        },
         _ => {
             if let Some(tree) = global_tree {
                 tree.apply(&mut streams, &mut lossless);
             }
-            lossless
+            PreparedExtra {
+                sections: lossless,
+                squeezed: None,
+                global_code_ans: ans,
+            }
         }
     }
 }
@@ -290,5 +386,52 @@ pub(super) fn zero_alpha_for_lossy(
         }),
         Some(AlphaPlane::F32(_)) => Some(AlphaPlane::F32(vec![0; pixels])),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn writer(bits: usize) -> BitWriter {
+        let mut w = BitWriter::new();
+        for _ in 0..bits {
+            w.write(1, 1);
+        }
+        w
+    }
+
+    #[test]
+    fn extra_size_matches_aligned_sections_and_last_pass() {
+        for (width, height) in [(63, 61), (513, 17), (2051, 257)] {
+            let dim = ImageDim::new(width, height);
+            for passes in [1, 3] {
+                let count = 2 + dim.num_dc_groups + passes * dim.num_groups;
+                for boundary in [7, 8184, 8191, 139256] {
+                    let color_bits: Vec<usize> = (0..count).map(|i| boundary + i % 8).collect();
+                    let extra = ExtraSections {
+                        global: writer(13),
+                        lf: (0..dim.num_dc_groups).map(|i| writer(5 + i)).collect(),
+                        ac: (0..dim.num_groups).map(|i| writer(9 + i)).collect(),
+                    };
+                    let mut sections: Vec<BitWriter> =
+                        color_bits.iter().map(|&bits| writer(bits)).collect();
+                    sections[0].append(&extra.global);
+                    for (i, lf) in extra.lf.iter().enumerate() {
+                        sections[1 + i].append(lf);
+                    }
+                    let last_ac = 2 + dim.num_dc_groups + (passes - 1) * dim.num_groups;
+                    for (i, ac) in extra.ac.iter().enumerate() {
+                        sections[last_ac + i].append(ac);
+                    }
+                    let mut output = BitWriter::new();
+                    super::super::sections::combine_sections(&mut sections, &mut output);
+                    assert_eq!(
+                        extra.serialized_size(&color_bits, &dim, passes - 1),
+                        output.bits_written() / 8,
+                    );
+                }
+            }
+        }
     }
 }

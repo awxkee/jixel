@@ -369,6 +369,15 @@ pub struct EncodeConfig {
     /// Requires the `splines` Cargo feature. Defaults to false.
     #[cfg(feature = "splines")]
     pub splines: bool,
+    /// Experimental: code coherent edge detail as signed pairs of JPEG XL
+    /// splines. Tries bounded amplitudes against the native transform layout,
+    /// including the spline section cost. Independent of `splines`, which
+    /// detects thin lines. Requires Slow effort, XYB, distance > 1 and a
+    /// single-pass, non-progressive frame; patched frames, alpha and the base of
+    /// a layered stack take part, with each pixel weighted by what the decoder
+    /// shows of it. Defaults to false.
+    #[cfg(feature = "splines")]
+    pub edge_splines: bool,
     /// Experimental: detect isolated bright or dark spots and code them as
     /// signed Gaussian dots drawn from a small template atlas (additive
     /// patches), next to the lossy VarDCT image. Dots, templates and the whole
@@ -537,6 +546,8 @@ pub(crate) struct EncodeConfigImpl {
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
     #[cfg(feature = "splines")]
+    pub(crate) edge_splines: bool,
+    #[cfg(feature = "splines")]
     pub(crate) dots: bool,
     /// Number of lossy VarDCT passes (see `EncodeConfig::progressive_passes`).
     pub(crate) progressive_passes: Option<u32>,
@@ -586,6 +597,8 @@ impl Default for EncodeConfig {
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]
+            edge_splines: false,
+            #[cfg(feature = "splines")]
             dots: false,
             progressive_passes: None,
             progressive_shifts: None,
@@ -634,6 +647,8 @@ impl Default for EncodeConfigImpl {
             upsampling: false,
             #[cfg(feature = "splines")]
             splines: false,
+            #[cfg(feature = "splines")]
+            edge_splines: false,
             #[cfg(feature = "splines")]
             dots: false,
             grayscale: false,
@@ -741,6 +756,12 @@ impl EncodeConfigImpl {
     }
 
     #[cfg(feature = "splines")]
+    pub(crate) fn with_edge_splines(mut self, edge_splines: bool) -> Self {
+        self.edge_splines = edge_splines;
+        self
+    }
+
+    #[cfg(feature = "splines")]
     pub(crate) fn with_dots(mut self, dots: bool) -> Self {
         self.dots = dots;
         self
@@ -764,7 +785,10 @@ impl EncodeConfigImpl {
     /// Copy frame settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
         #[cfg(feature = "splines")]
-        let this = self.with_splines(config.splines).with_dots(config.dots);
+        let this = self
+            .with_splines(config.splines)
+            .with_edge_splines(config.edge_splines)
+            .with_dots(config.dots);
         #[cfg(not(feature = "splines"))]
         let this = self;
         this.with_progressive(config.progressive)
@@ -945,6 +969,14 @@ impl EncodeConfig {
     #[cfg(feature = "splines")]
     pub fn with_splines(mut self, splines: bool) -> Self {
         self.splines = splines;
+        self
+    }
+
+    /// Experimental coherent edge coding (see [`EncodeConfig::edge_splines`]).
+    /// Requires the `splines` Cargo feature.
+    #[cfg(feature = "splines")]
+    pub fn with_edge_splines(mut self, edge_splines: bool) -> Self {
+        self.edge_splines = edge_splines;
         self
     }
 
@@ -1151,10 +1183,12 @@ pub(crate) fn lossy_context(
     };
     ctx.extra_squeeze_distance = ALPHA_SQUEEZE_SCALE * alpha_distance;
     ctx.extra_learned_trees = alpha_learned_trees(config);
+    ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
         ctx.splines = config.splines && slow;
+        ctx.edge_splines = config.edge_splines && slow;
         ctx.dots = config.dots && slow;
     }
     ctx
@@ -1504,8 +1538,16 @@ impl InkStack {
         budget: f64,
     ) -> Result<Self, EncodeError> {
         let mut scratch = Box::<CoderScratch>::default();
-        let (ctx, base_frame) =
-            encode_ink_base(&plan.base, width, height, config, alpha, &mut scratch)?;
+        let (ctx, base_frame) = encode_ink_base(
+            &plan.base,
+            &plan.ink,
+            &plan.coverage,
+            width,
+            height,
+            config,
+            alpha,
+            &mut scratch,
+        )?;
         drop(plan.base);
         let mut stack = Self {
             width,
@@ -1619,8 +1661,11 @@ impl InkStack {
 
 /// The VarDCT base of a layered codestream, saved to reference slot 0, with
 /// the context whose opsin matrix every ink frame must share.
+#[allow(clippy::too_many_arguments)]
 fn encode_ink_base(
     base: &[u8],
+    #[cfg_attr(not(feature = "splines"), allow(unused_variables))] ink: &[u8],
+    #[cfg_attr(not(feature = "splines"), allow(unused_variables))] coverage: &[u8],
     width: usize,
     height: usize,
     config: &EncodeConfig,
@@ -1646,6 +1691,17 @@ fn encode_ink_base(
     ctx.extra_squeeze_distance = 0.0;
     ctx.extra_step = 1;
     ctx.frame_role = FrameRole::SavedFirst;
+    // The ink frame is blended over this base: edge splines see only the
+    // uncovered share of each pixel.
+    #[cfg(feature = "splines")]
+    {
+        ctx.overlay_coverage = Some(
+            ink.iter()
+                .zip(coverage)
+                .map(|(&k, &a)| if k == 0 { 0.0 } else { f32::from(a) / 255.0 })
+                .collect(),
+        );
+    }
     let linear = linearize_rgb::<_, _, 3>(base, width, height, &ctx, scratch, &transform);
     ctx.set_coding(CodingTransform::Xyb, distance);
     apply_yellow_opsin(&mut ctx, &linear, distance);
@@ -4487,6 +4543,73 @@ mod encode_smoke_tests {
         assert_eq!(
             encode_image(&pixels, S, S, &quick_decode).unwrap(),
             encode_image(&pixels, S, S, &quick_decode.clone().with_splines(true)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn edge_splines_are_inert_outside_supported_frames() {
+        const S: usize = 96;
+        let pixels = line_art(S);
+        let configurations = [
+            slow_lossy(1.0),
+            slow_lossy(3.0).with_speed(Speed::Fast),
+            slow_lossy(3.0).with_decoding_speed(DecodingSpeed::Fast),
+            slow_lossy(3.0).with_progressive(true),
+            slow_lossy(3.0).with_progressive_dc(true),
+            slow_lossy(3.0).with_coding_transform(CodingTransform::Rgb),
+        ];
+        for config in configurations {
+            let without = encode_image(&pixels, S, S, &config).unwrap();
+            let with = encode_image(&pixels, S, S, &config.with_edge_splines(true)).unwrap();
+            assert_eq!(without, with);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn edge_splines_leave_a_smooth_image_byte_identical() {
+        const S: usize = 96;
+        let pixels: Vec<u8> = (0..S * S)
+            .flat_map(|i| {
+                let (x, y) = (i % S, i / S);
+                [80 + x as u8 / 3, 100 + y as u8 / 3, 140 + (x + y) as u8 / 5]
+            })
+            .collect();
+        let config = slow_lossy(3.0).with_splines(true);
+        assert_eq!(
+            encode_image(&pixels, S, S, &config).unwrap(),
+            encode_image(&pixels, S, S, &config.with_edge_splines(true)).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "splines")]
+    fn edge_splines_reduce_a_coherent_oblique_boundary() {
+        const S: usize = 384;
+        let mut pixels = vec![0; S * S * 3];
+        let low = [45.0, 92.0, 145.0];
+        let high = [207.0, 166.0, 80.0];
+        for y in 0..S {
+            for x in 0..S {
+                let d = (y as f32 - (0.29 * S as f32 + 0.43 * x as f32))
+                    / (1.0f32 + 0.43 * 0.43).sqrt();
+                let coverage = 0.5 + 0.5 * crate::splines::fast_erf(d / (0.55 * 2.0f32.sqrt()));
+                let ramp = 15.0 * ((x + y) as f32 / (S - 1) as f32 - 1.0);
+                for c in 0..3 {
+                    pixels[(y * S + x) * 3 + c] =
+                        (low[c] + coverage * (high[c] - low[c]) + ramp).round() as u8;
+                }
+            }
+        }
+        let config = slow_lossy(4.0).with_splines(true).with_patches(false);
+        let plain = encode_image(&pixels, S, S, &config).unwrap();
+        let with = encode_image(&pixels, S, S, &config.with_edge_splines(true)).unwrap();
+        assert!(
+            with.len() < plain.len(),
+            "{} >= {}",
+            with.len(),
+            plain.len()
         );
     }
 

@@ -38,6 +38,10 @@
 
 mod detect;
 pub(crate) mod dots;
+mod edge_detect;
+mod edge_fit;
+pub(crate) mod edge_model;
+mod edge_select;
 mod extend;
 mod filter;
 mod fit;
@@ -461,6 +465,38 @@ pub(crate) fn write_splines(set: &SplineSet, scratch: &mut CoderScratch, w: &mut
         }
     }
     w.append(&best);
+}
+
+/// Add edge detail only after the native transform layout is available.
+/// A rejected trial restores the source exactly and returns no replacement set.
+pub(crate) use edge_select::{EdgeView, select_edges};
+
+/// The decoder adds this luma layer after filtering the VarDCT base. Render
+/// sparse 8x8 tiles to avoid allocating a second three-channel image.
+pub(crate) fn additive_y(
+    ctx: &EncodingContext,
+    set: &SplineSet,
+    width: usize,
+    height: usize,
+) -> Vec<f32> {
+    let mut layer = vec![0.0; width * height];
+    let blocks_w = width.div_ceil(8);
+    for spline in &set.splines {
+        let plan = render::RenderPlan::new(ctx, spline, set.adjust, width, height).tiled();
+        for tile in &plan.tiles {
+            let mut pixels = [[0.0; 64]; 3];
+            plan.draw_tile(tile, &mut pixels, 1.0);
+            let x0 = tile.cell % blocks_w * 8;
+            let y0 = tile.cell / blocks_w * 8;
+            let n = (width - x0).min(8);
+            for y in 0..(height - y0).min(8) {
+                for x in 0..n {
+                    layer[(y0 + y) * width + x0 + x] += pixels[1][y * 8 + x];
+                }
+            }
+        }
+    }
+    layer
 }
 
 /// Few distinct colors: bilevel / palette art whose hard aliased strokes the

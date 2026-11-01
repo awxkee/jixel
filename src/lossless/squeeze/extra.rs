@@ -65,8 +65,8 @@ const VARDCT_LF_GROUP_DIM: usize = 2048;
 
 /// One extra channel squeezed and quantized like the lossy-modular arm's luma
 /// row, coded in the modular streams of a VarDCT frame. The frame's global
-/// tree belongs to the VarDCT DC, so every section carries a local tree: one
-/// leaf per channel, its quantization step as the residual multiplier.
+/// tree belongs to the VarDCT DC, so nonempty extra-channel streams carry
+/// local trees, with quantization steps as residual multipliers.
 pub(crate) struct ExtraSqueeze {
     pub(super) channels: Vec<crate::squeeze::Channel>,
     pub(super) quants: Vec<u32>,
@@ -77,6 +77,9 @@ pub(crate) struct ExtraSqueeze {
     /// Learn a context tree per stream (decoder MA-tree walk) instead of the
     /// fixed one-Gradient-leaf-per-channel tree.
     pub(super) learned_trees: bool,
+    /// Code the fixed alternative through [`context_tree`]s rather than one
+    /// Gradient leaf per channel.
+    pub(super) context_trees: bool,
 }
 
 impl ExtraSqueeze {
@@ -88,6 +91,7 @@ impl ExtraSqueeze {
         ysize: usize,
         distance: f32,
         learned_trees: bool,
+        context_trees: bool,
     ) -> Option<Self> {
         use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
         let steps = default_squeeze_steps(xsize, ysize, 1);
@@ -107,13 +111,17 @@ impl ExtraSqueeze {
             hshift: 0,
             vshift: 0,
         }];
+        // Keep each step's input: the residuals are quantized coarse to fine
+        // against what the decoder reconstructs.
+        let mut inputs = Vec::with_capacity(steps.len());
         for s in &steps {
+            inputs.push(channels[0].data.clone());
             apply_step_forward(&mut channels, s);
         }
         // The arm's luma schedule is in units of 1/4096 of the sample range.
         let unit = max / LOSSY_MODULAR_XYB_SCALE[1];
         let quants: Vec<u32> = channels
-            .iter_mut()
+            .iter()
             .map(|ch| {
                 let mut shift = (ch.hshift + ch.vshift).min(16);
                 if shift > 0 {
@@ -124,27 +132,38 @@ impl ExtraSqueeze {
                     * SQUEEZE_QUALITY_FACTOR_XYB
                     * SQUEEZE_XYB_QTABLE[0][shift as usize]
                     * unit;
-                let q = (q as i32).max(1);
-                quantize_channel_divide(ch, q);
-                q as u32
+                (q as i32).max(1) as u32
             })
             .collect();
-        let split = channels
+        quantize_channel_divide(&mut channels[0], quants[0] as i32);
+        let mut decoded: Vec<i32> = channels[0]
+            .data
             .iter()
-            .position(|c| c.w > VARDCT_GROUP_DIM || c.h > VARDCT_GROUP_DIM)
-            .unwrap_or(channels.len());
-        let max_abs = channels
-            .iter()
-            .flat_map(|ch| ch.data.iter())
-            .map(|v| v.unsigned_abs())
-            .max()
-            .unwrap_or(0);
-        let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
-        let min_symbol = if value_bits <= 13 {
-            LZ77_MIN_SYMBOL
-        } else {
-            4 * value_bits + 24
-        };
+            .map(|&v| v * quants[0] as i32)
+            .collect();
+        // In place, step k's residual ends up right after the average, behind
+        // the residuals of the coarser steps.
+        for (k, step) in steps.iter().enumerate().rev() {
+            let c = steps.len() - k;
+            let (w, h) = input_dims(&steps, k, xsize, ysize);
+            let quantize = if step.horizontal {
+                closed_h_squeeze
+            } else {
+                closed_v_squeeze
+            };
+            let (residuals, out) = quantize(
+                &inputs[k],
+                w,
+                h,
+                &decoded,
+                quants[c] as i32,
+                SQUEEZE_DEADZONE,
+            );
+            debug_assert_eq!(residuals.len(), channels[c].data.len());
+            channels[c].data = residuals;
+            decoded = out;
+        }
+        let (split, min_symbol) = extra_channel_layout(&channels);
         Some(Self {
             channels,
             quants,
@@ -152,7 +171,65 @@ impl ExtraSqueeze {
             split,
             min_symbol,
             learned_trees,
+            context_trees,
         })
+    }
+
+    /// Earliest retained prefix whose remaining average and residuals are
+    /// exact. Folding this tail changes only the entropy representation.
+    pub(crate) fn exact_tail_start(&self) -> Option<usize> {
+        if self.quants[0] != 1 {
+            return None;
+        }
+        let exact = self.quants[1..].iter().take_while(|&&q| q == 1).count();
+        (exact > 0).then_some(self.steps.len() - exact)
+    }
+
+    /// Invert an exact coarse tail, leaving every retained quantized band
+    /// unchanged. Invert the coded coefficients themselves, so even an
+    /// unclamped reconstruction agrees with the original pyramid.
+    pub(crate) fn without_exact_tail(&self, retained_steps: usize) -> Option<Self> {
+        if retained_steps >= self.steps.len() || retained_steps < self.exact_tail_start()? {
+            return None;
+        }
+        let removed = self.steps.len() - retained_steps;
+        let mut channels = self.channels[..=removed].to_vec();
+        for step in self.steps[retained_steps..].iter().rev() {
+            crate::squeeze::apply_step_inverse(&mut channels, step);
+        }
+        debug_assert_eq!(channels.len(), 1);
+        channels.extend_from_slice(&self.channels[removed + 1..]);
+        let quants = std::iter::once(1)
+            .chain(self.quants[removed + 1..].iter().copied())
+            .collect();
+        let (split, min_symbol) = extra_channel_layout(&channels);
+        Some(Self {
+            channels,
+            quants,
+            steps: self.steps[..retained_steps].to_vec(),
+            split,
+            min_symbol,
+            learned_trees: self.learned_trees,
+            context_trees: self.context_trees,
+        })
+    }
+
+    /// For a candidate derived by `without_exact_tail`, all changed channels
+    /// stay global when its new average fits there. The retained group crops
+    /// then have identical data, quantizers and within-stream slot indices.
+    pub(crate) fn exact_tail_groups_unchanged(&self, candidate: &Self) -> bool {
+        candidate.split > 0 && self.min_symbol == candidate.min_symbol
+    }
+
+    pub(crate) fn exact_tail_ac_unchanged(&self, candidate: &Self) -> bool {
+        // Once the new average has minimum shift three, it and every removed
+        // coarse band live outside the AC streams. Those crops stay identical.
+        self.min_symbol == candidate.min_symbol
+            && (candidate.split > 0
+                || candidate.channels[0]
+                    .hshift
+                    .min(candidate.channels[0].vshift)
+                    >= 3)
     }
 
     /// The plane a decoder reconstructs, before clamping to the sample range.
@@ -180,14 +257,33 @@ impl ExtraSqueeze {
 
     /// The GlobalModular image: its header (with the squeeze transform) and
     /// the channels that fit one group.
-    pub(crate) fn write_global(&self, scratch: &mut CoderScratch, w: &mut BitWriter) {
+    pub(crate) fn write_global(
+        &self,
+        global_code_ans: bool,
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
         let crops: Vec<(usize, usize, usize, usize, usize)> = (0..self.split)
             .map(|c| (c, 0, 0, self.channels[c].w, self.channels[c].h))
             .collect();
-        w.write(1, 0); // use_global_tree = 0
+        // Even an empty global subimage needs a valid entropy header. Reuse
+        // the frame's global tree when all samples live in LF/AC groups.
+        w.write(1, u64::from(self.split == 0));
         w.write(1, 1); // wp_header all_default
-        write_modular_transforms_squeeze_only(&self.steps, w);
-        self.write_crops(&crops, scratch, w);
+        if self.steps.is_empty() {
+            // A Squeeze entry with zero steps requests the decoder's default
+            // pyramid. A completely folded tail needs no transform instead.
+            w.write(2, 0);
+        } else {
+            write_modular_transforms_squeeze_only(&self.steps, w);
+        }
+        if self.split == 0 {
+            if global_code_ans {
+                w.write(32, u64::from(crate::entropy::ANS_SIGNATURE << 16));
+            }
+        } else {
+            self.write_crops(&crops, scratch, w);
+        }
     }
 
     /// The channels of LF group (`gx`, `gy`): minimum shift 3 and up.
@@ -329,8 +425,20 @@ impl ExtraSqueeze {
             };
             trees.push(tree);
         }
+        self.write_crops_with_trees(crops, &trees, scratch, w);
+    }
+
+    /// Code the crops through one tree per slot (chained by
+    /// `emit_slot_forest`), each leaf carrying its slot's step.
+    fn write_crops_with_trees(
+        &self,
+        crops: &[(usize, usize, usize, usize, usize)],
+        trees: &[LearnedTree],
+        scratch: &mut CoderScratch,
+        w: &mut BitWriter,
+    ) {
         let mults: Vec<u32> = crops.iter().map(|&(c, ..)| self.quants[c]).collect();
-        let (tree_tokens, leaf_ctx, bases, num_ctx) = emit_slot_forest(&trees, &mults);
+        let (tree_tokens, leaf_ctx, bases, num_ctx) = emit_slot_forest(trees, &mults);
         let mut tokens: Vec<Token> = Vec::new();
         for (slot, &(c, rx0, ry0, rw, rh)) in crops.iter().enumerate() {
             let ch = &self.channels[c];
@@ -376,6 +484,11 @@ impl ExtraSqueeze {
         scratch: &mut CoderScratch,
         w: &mut BitWriter,
     ) {
+        if self.context_trees {
+            let trees: Vec<LearnedTree> = crops.iter().map(|&(c, ..)| context_tree(c)).collect();
+            self.write_crops_with_trees(crops, &trees, scratch, w);
+            return;
+        }
         let n = crops.len();
         let grad_pack_fn = selected_grad_pack_interior_fn();
         let mut tokens: Vec<Token> = Vec::new();
@@ -416,6 +529,179 @@ impl ExtraSqueeze {
             w,
         );
         write_lz_section(&lz, n as u32, &code, self.min_symbol, w);
+    }
+}
+
+/// Group placement and alphabet bound of this representation. Folding the
+/// average can move it into LF/AC groups or widen high-bit-depth symbols.
+fn extra_channel_layout(channels: &[crate::squeeze::Channel]) -> (usize, u32) {
+    let split = channels
+        .iter()
+        .position(|c| c.w > VARDCT_GROUP_DIM || c.h > VARDCT_GROUP_DIM)
+        .unwrap_or(channels.len());
+    let max_abs = channels
+        .iter()
+        .flat_map(|ch| ch.data.iter())
+        .map(|v| v.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
+    let min_symbol = if value_bits <= 13 {
+        LZ77_MIN_SYMBOL
+    } else {
+        4 * value_bits + 24
+    };
+    (split, min_symbol)
+}
+
+/// Dimensions of the channel that squeeze step `k` splits.
+fn input_dims(
+    steps: &[crate::squeeze::SqueezeStep],
+    k: usize,
+    mut w: usize,
+    mut h: usize,
+) -> (usize, usize) {
+    for s in &steps[..k] {
+        if s.horizontal {
+            w = w.div_ceil(2);
+        } else {
+            h = h.div_ceil(2);
+        }
+    }
+    (w, h)
+}
+
+/// Rounding offset taken off the squeezed residuals' magnitudes before
+/// rounding: small residuals cost more bits than their error is worth.
+const SQUEEZE_DEADZONE: f32 = 0.15;
+
+/// `r / q` rounded to nearest after taking `deadzone` off the magnitude.
+#[inline]
+fn quantize_residual(r: i64, q: i64, deadzone: f32) -> i64 {
+    if q <= 1 {
+        return r;
+    }
+    let m = (r.unsigned_abs() as f32 / q as f32 + 0.5 - deadzone)
+        .floor()
+        .max(0.0) as i64;
+    if r < 0 { -m } else { m }
+}
+
+/// One horizontal squeeze step quantized in closed loop: the residuals of
+/// `x` (`w`×`h`, the step's exact input) under the tendency the decoder
+/// derives from the decoded averages `avg`, and the decoded `x`. Mirrors
+/// `squeeze::inv_h_squeeze`, so the decoder's left neighbour is the decoded
+/// one.
+pub(super) fn closed_h_squeeze(
+    x: &[i32],
+    w: usize,
+    h: usize,
+    avg: &[i32],
+    q: i32,
+    deadzone: f32,
+) -> (Vec<i32>, Vec<i32>) {
+    use crate::squeeze::smooth_tendency;
+    let ow = w.div_ceil(2);
+    let rw = w - ow;
+    let q = i64::from(q);
+    let mut res = vec![0i32; rw * h];
+    let mut out = vec![0i32; w * h];
+    for y in 0..h {
+        let avg_row = &avg[y * ow..(y + 1) * ow];
+        let x_row = &x[y * w..(y + 1) * w];
+        let out_row = &mut out[y * w..(y + 1) * w];
+        let mut left = None;
+        for i in 0..rw {
+            let av = i64::from(avg_row[i]);
+            let next = avg_row.get(i + 1).map_or(av, |&v| i64::from(v));
+            let tendency = smooth_tendency(left.unwrap_or(av), av, next);
+            let diff = i64::from(x_row[2 * i]) - i64::from(x_row[2 * i + 1]);
+            let r = quantize_residual(diff - tendency, q, deadzone);
+            res[y * rw + i] = r as i32;
+            let diff = r * q + tendency;
+            let first = av + diff / 2;
+            out_row[2 * i] = first as i32;
+            out_row[2 * i + 1] = (first - diff) as i32;
+            left = Some(first - diff);
+        }
+        if ow > rw {
+            out_row[w - 1] = avg_row[ow - 1];
+        }
+    }
+    (res, out)
+}
+
+/// The vertical counterpart of [`closed_h_squeeze`] (mirrors
+/// `squeeze::inv_v_squeeze`).
+pub(super) fn closed_v_squeeze(
+    x: &[i32],
+    w: usize,
+    h: usize,
+    avg: &[i32],
+    q: i32,
+    deadzone: f32,
+) -> (Vec<i32>, Vec<i32>) {
+    use crate::squeeze::smooth_tendency;
+    let oh = h.div_ceil(2);
+    let rh = h - oh;
+    let q = i64::from(q);
+    let mut res = vec![0i32; w * rh];
+    let mut out = vec![0i32; w * h];
+    for y in 0..rh {
+        for col in 0..w {
+            let av = i64::from(avg[y * w + col]);
+            let next = if y + 1 < oh {
+                i64::from(avg[(y + 1) * w + col])
+            } else {
+                av
+            };
+            let top = if y > 0 {
+                i64::from(out[(2 * y - 1) * w + col])
+            } else {
+                av
+            };
+            let tendency = smooth_tendency(top, av, next);
+            let diff = i64::from(x[2 * y * w + col]) - i64::from(x[(2 * y + 1) * w + col]);
+            let r = quantize_residual(diff - tendency, q, deadzone);
+            res[y * w + col] = r as i32;
+            let diff = r * q + tendency;
+            let first = av + diff / 2;
+            out[2 * y * w + col] = first as i32;
+            out[(2 * y + 1) * w + col] = (first - diff) as i32;
+        }
+    }
+    if oh > rh {
+        out[(h - 1) * w..h * w].copy_from_slice(&avg[(oh - 1) * w..oh * w]);
+    }
+    (res, out)
+}
+
+/// The fixed context tree of squeezed channel `c`: Zero prediction of the
+/// residual channels (Gradient for the coarsest average) in four contexts,
+/// by whether the north and the west neighbour are nonzero. Most squeezed
+/// residuals are zero away from edges, so this captures most of what a
+/// learned tree finds at the cost of the fixed tree.
+fn context_tree(c: usize) -> LearnedTree {
+    let pred = if c == 0 { PREDICTOR_GRADIENT } else { 0 };
+    let leaf = MaNode::Leaf { pred, offset: 0 };
+    let split = |prop, gt, le| MaNode::Split {
+        prop,
+        val: 0,
+        gt,
+        le,
+    };
+    LearnedTree {
+        nodes: vec![
+            split(4, 1, 2), // |N| > 0
+            split(5, 3, 4), // |W| > 0
+            split(5, 5, 6),
+            leaf,
+            leaf,
+            leaf,
+            leaf,
+        ],
+        est_bits: 0.0,
+        flat_bits: 0.0,
     }
 }
 

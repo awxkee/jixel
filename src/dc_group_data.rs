@@ -268,6 +268,30 @@ impl AcStrategyImage {
             .collect()
     }
 
+    /// True if no transform crosses the boundary of the block region, so a
+    /// new layout can replace exactly the transforms inside it. Transforms may
+    /// cross 64px tiles, so tile alignment alone does not imply this.
+    #[cfg(feature = "extraslow")]
+    pub(crate) fn region_closed(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
+        let mut covered = 0;
+        for yy in y..y + h {
+            for xx in x..x + w {
+                if self.is_first_block(xx, yy) {
+                    let raw = self.raw_strategy(xx, yy);
+                    let (cx, cy) = (
+                        Self::covered_blocks_x_of(raw),
+                        Self::covered_blocks_y_of(raw),
+                    );
+                    if xx + cx > x + w || yy + cy > y + h {
+                        return false;
+                    }
+                    covered += cx * cy;
+                }
+            }
+        }
+        covered == w * h
+    }
+
     #[cfg(feature = "extraslow")]
     pub(crate) fn restore_region(&mut self, x: usize, y: usize, w: usize, saved: &[u8]) {
         for (i, row) in saved.chunks_exact(w).enumerate() {

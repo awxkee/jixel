@@ -235,6 +235,7 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
             config.speed,
             crate::Speed::UltraFast | crate::Speed::Fastest | crate::Speed::Fast
         );
+    ctx.extra_context_trees = config.decoding_speed != crate::DecodingSpeed::Fastest;
     if passes.len() > 1 && crate::squeeze::default_squeeze_steps(width, height, 1).is_empty() {
         // Tiny planes have no Squeeze levels; retain the progressive lattice
         // fallback rather than changing their K precision.

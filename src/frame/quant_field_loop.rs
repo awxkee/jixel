@@ -1180,6 +1180,7 @@ pub(super) fn run_quant_field_loop(
             cells: Vec<u8>,
             field: Vec<u8>,
             memo: Option<crate::group::MemoSnapshot>,
+            memo_was_empty: bool,
         }
         let distance = distp.distance;
         let place = |dc_datas: &mut [DcGroupData],
@@ -1211,7 +1212,10 @@ pub(super) fn run_quant_field_loop(
                 }
             }
             // The memo keys do not carry the layout: forget the new
-            // transforms' cells, and keep the rest for an exact undo.
+            // transforms' cells, and keep the rest for an exact undo. An
+            // empty memo is filled under the trial layout: undo empties it.
+            let memo_was_empty =
+                memo.is_some_and(|memo| memo[task].lock().expect("block memo").is_none());
             let memo_snapshot = memo.and_then(|memo| {
                 let mut guard = memo[task].lock().expect("block memo");
                 let m = guard.as_mut()?;
@@ -1237,6 +1241,7 @@ pub(super) fn run_quant_field_loop(
                 cells,
                 field,
                 memo: memo_snapshot,
+                memo_was_empty,
             }
         };
         let unplace = |dc_datas: &mut [DcGroupData], p: Placed| {
@@ -1247,10 +1252,13 @@ pub(super) fn run_quant_field_loop(
             for (i, row) in p.field.as_chunks::<16>().0.iter().enumerate() {
                 data.raw_quant_field.row_mut(y + i)[x..x + 16].copy_from_slice(row);
             }
-            if let (Some(memo), Some(snapshot)) = (memo, &p.memo)
-                && let Some(m) = memo[p.task].lock().expect("block memo").as_mut()
-            {
-                m.restore(snapshot);
+            if let Some(memo) = memo {
+                let mut slot = memo[p.task].lock().expect("block memo");
+                if p.memo_was_empty {
+                    *slot = None;
+                } else if let (Some(m), Some(snapshot)) = (slot.as_mut(), &p.memo) {
+                    m.restore(snapshot);
+                }
             }
         };
         let group_bits = |e: &Eval, task: usize| -> f32 {
@@ -1305,7 +1313,18 @@ pub(super) fn run_quant_field_loop(
                 let tasks: Vec<usize> = active
                     .iter()
                     .copied()
-                    .filter(|&t| keep(t) && region_bpp(t, variant.1) <= MAX_INCUMBENT_BPP)
+                    .filter(|&t| {
+                        let (x, y) = sites[t][si];
+                        let (rx, ry, rw, rh) = variant.1;
+                        keep(t)
+                            && dc_datas[ac_tasks[t].0].ac_strategy.region_closed(
+                                x + rx,
+                                y + ry,
+                                rw,
+                                rh,
+                            )
+                            && region_bpp(t, variant.1) <= MAX_INCUMBENT_BPP
+                    })
                     .collect();
                 if tasks.is_empty() {
                     return Vec::new();
@@ -1642,6 +1661,7 @@ pub(super) fn run_quant_field_loop(
             cells: Vec<u8>,
             field: Vec<u8>,
             memo: Option<crate::group::MemoSnapshot>,
+            memo_was_empty: bool,
         }
         let distance = distp.distance;
         let place =
@@ -1672,6 +1692,9 @@ pub(super) fn run_quant_field_loop(
                         }
                     }
                 }
+                // An empty memo is filled under the trial layout: undo empties it.
+                let memo_was_empty =
+                    memo.is_some_and(|memo| memo[task].lock().expect("block memo").is_none());
                 let memo_snapshot = memo.and_then(|memo| {
                     let mut guard = memo[task].lock().expect("block memo");
                     let m = guard.as_mut()?;
@@ -1691,6 +1714,7 @@ pub(super) fn run_quant_field_loop(
                     cells,
                     field,
                     memo: memo_snapshot,
+                    memo_was_empty,
                 }
             };
         let unplace = |dc_datas: &mut [DcGroupData], p: Placed| {
@@ -1702,10 +1726,13 @@ pub(super) fn run_quant_field_loop(
             for (i, row) in p.field.chunks_exact(w).enumerate() {
                 data.raw_quant_field.row_mut(y + i)[x..x + w].copy_from_slice(row);
             }
-            if let (Some(memo), Some(snapshot)) = (memo, &p.memo)
-                && let Some(m) = memo[p.task].lock().expect("block memo").as_mut()
-            {
-                m.restore(snapshot);
+            if let Some(memo) = memo {
+                let mut slot = memo[p.task].lock().expect("block memo");
+                if p.memo_was_empty {
+                    *slot = None;
+                } else if let (Some(m), Some(snapshot)) = (slot.as_mut(), &p.memo) {
+                    m.restore(snapshot);
+                }
             }
         };
         let group_bits = |e: &Eval, task: usize| -> f32 {

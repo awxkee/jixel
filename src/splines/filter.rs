@@ -55,13 +55,13 @@ impl FilterBounds {
 
 /// One fixed kernel and precomputed source bounds, reusable across planes.
 /// Interior positions share the kernel instead of storing a copy per pixel.
-pub(super) struct FilterPlan {
+pub(crate) struct FilterPlan {
     kernel: Vec<f32>,
     bounds: Vec<FilterBounds>,
 }
 
 impl FilterPlan {
-    pub(super) fn new(size: usize, kernel: &[f32]) -> Self {
+    pub(crate) fn new(size: usize, kernel: &[f32]) -> Self {
         assert!(size > 0 && !kernel.is_empty() && kernel.len() % 2 == 1);
         let radius = kernel.len() / 2;
         let bounds = (0..size)
@@ -137,7 +137,7 @@ impl FilterPlan {
         }
     }
 
-    pub(super) fn horizontal(
+    pub(crate) fn horizontal(
         &self,
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
@@ -186,7 +186,7 @@ impl FilterPlan {
         dst.copy_from_slice(&sums);
     }
 
-    pub(super) fn vertical_row(&self, src: &[f32], w: usize, y: usize, dst: &mut [f32]) {
+    pub(crate) fn vertical_row(&self, src: &[f32], w: usize, y: usize, dst: &mut [f32]) {
         debug_assert_eq!(src.len(), w * self.bounds.len());
         debug_assert_eq!(dst.len(), w);
         let mut x = 0;
@@ -206,7 +206,7 @@ impl FilterPlan {
         }
     }
 
-    pub(super) fn vertical(
+    pub(crate) fn vertical(
         &self,
         ctx: &EncodingContext,
         scratch: &mut CoderScratch,
