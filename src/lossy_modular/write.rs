@@ -50,6 +50,7 @@ pub(super) fn write_frame(
     min_symbol: u32,
     distance_ctx: u32,
     streams: &Streams,
+    dictionary: Option<BitWriter>,
     pool: &ThreadPool,
     huffman_pool: &mut Vec<HuffmanNode>,
     writer: &mut BitWriter,
@@ -61,7 +62,10 @@ pub(super) fn write_frame(
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
-    // ----- Section 0: LfGlobal = global tree + global modular image -----
+    // ----- Section 0: LfGlobal = patches, global tree + global modular image -----
+    if let Some(dictionary) = dictionary {
+        sections[0] = dictionary;
+    }
     p.layout.write_dc_quant(&mut sections[0]);
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(

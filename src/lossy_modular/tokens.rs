@@ -175,7 +175,7 @@ pub(super) fn tokenize(
                             width,
                             height,
                             group,
-                            &[],
+                            &refs.of_group(channels, tags.split, channel, x0, y0),
                             &mut out,
                             &mut pending,
                         );

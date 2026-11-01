@@ -64,6 +64,13 @@ pub(super) static SQUEEZE_QUALITY_FACTOR_XYB: f32 = 4.8;
 /// discard; Y slightly coarser pays for the chroma.
 static ROW_MUL: [f32; 3] = [1.265, 1.704, 0.546];
 
+/// Further multipliers on screen content ([`crate::frame::is_screen_content`]):
+/// coloured text and UI keep their X and B edges. 11 screenshots at Slow,
+/// SS2 / BA / cvvdp BD -2.29 / -9.40 / -2.63 %, no image worse on two
+/// metrics; 11 held-out illustrations -2.63 / -0.43 / -2.25. Photos keep
+/// `ROW_MUL`: there finer chroma only trades SS2 for BA and cvvdp.
+pub(super) static SCREEN_ROW_MUL: [f32; 3] = [1.0, 0.5, 0.85];
+
 /// DC-frame residual step at the finest squeeze level, in VarDCT DC steps,
 /// per stored color [Y, X, B-Y].
 static DC_FRAME_GAIN: [f32; 3] = [1.5, 2.5, 1.5];
@@ -81,13 +88,20 @@ fn table_depth(hshift: i32, vshift: i32) -> usize {
 }
 
 /// XYB-layout step of one squeezed channel (cjxl's schedule, including the
-/// float->int truncation).
-pub(super) fn xyb_step(color: usize, hshift: i32, vshift: i32, distance: f32) -> i32 {
+/// float->int truncation), times `row_mul` per stored colour.
+pub(super) fn xyb_step(
+    color: usize,
+    hshift: i32,
+    vshift: i32,
+    distance: f32,
+    row_mul: [f32; 3],
+) -> i32 {
     let quantizer = 0.25f32 * distance;
     let q = quantizer
         * SQUEEZE_QUALITY_FACTOR_XYB
         * SQUEEZE_XYB_QTABLE[color][table_depth(hshift, vshift)]
-        * ROW_MUL[color];
+        * ROW_MUL[color]
+        * row_mul[color];
     (q as i32).max(1)
 }
 

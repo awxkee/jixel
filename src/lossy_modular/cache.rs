@@ -126,9 +126,10 @@ impl TreeCache {
     }
 
     pub(super) fn key(&self, q: &Pyramid, channel: usize, stream: usize) -> Option<CacheKey> {
-        // The merged averages change on every fold. DC-frame global trees
-        // also see previous same-shaped channels, whose reference set changes.
-        if channel < self.averages || (q.dc_frame && stream == 0) {
+        // The merged averages change on every fold, and global trees see
+        // previous same-shaped channels, whose reference set a fold changes
+        // (a merged average takes the shape of the residuals of its level).
+        if channel < self.averages || stream == 0 {
             return None;
         }
         let original = channel + self.original_len - q.channels.len();

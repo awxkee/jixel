@@ -432,9 +432,9 @@ pub(crate) fn fold_quantized_step(
     true
 }
 
-/// Build a simple alternating H/V pyramid over channels [0,num_c), squeezing
-/// until both dimensions are <= 8 (kMaxFirstPreviewSize). Valid, explicit
-/// (signaled) sequence — need not match libjxl's chroma-first default.
+/// The XYB lossy pyramid over channels [0,num_c): a 4:2:0 chroma pre-squeeze,
+/// then [`lossy_shared_steps`] until both dimensions are <= 8
+/// (kMaxFirstPreviewSize). Valid, explicit (signaled) sequence.
 pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     if num_c >= 3 {
@@ -447,7 +447,7 @@ pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<Squee
             });
         }
     }
-    steps.extend(default_squeeze_steps(w, h, num_c));
+    steps.extend(lossy_shared_steps(w, h, num_c));
     steps
 }
 
@@ -471,12 +471,29 @@ pub(crate) fn lossy_squeeze_steps_chroma(
             });
         }
     }
-    steps.extend(default_squeeze_steps(w, h, num_c));
+    steps.extend(lossy_shared_steps(w, h, num_c));
     steps
 }
 
 pub(crate) fn default_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
     squeeze_steps_levels(w, h, num_c, usize::MAX)
+}
+
+/// The shared steps of a lossy pyramid: [`default_squeeze_steps`], led by
+/// one vertical step on images taller than wide (libjxl's order).
+fn lossy_shared_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+    const MAX_PREVIEW: usize = 8;
+    if h <= w || h <= MAX_PREVIEW {
+        return default_squeeze_steps(w, h, num_c);
+    }
+    let mut steps = vec![SqueezeStep {
+        horizontal: false,
+        in_place: true,
+        begin_c: 0,
+        num_c,
+    }];
+    steps.extend(default_squeeze_steps(w, h.div_ceil(2), num_c));
+    steps
 }
 
 /// [`default_squeeze_steps`] cut to its `levels` finest levels; a level
@@ -518,6 +535,45 @@ pub(crate) fn squeeze_steps_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossy_pyramids_start_along_the_longer_side_of_portraits() {
+        let preview = |steps: &[SqueezeStep], mut w: usize, mut h: usize| {
+            for s in steps.iter().filter(|s| s.in_place) {
+                if s.horizontal {
+                    w = w.div_ceil(2);
+                } else {
+                    h = h.div_ceil(2);
+                }
+            }
+            (w, h)
+        };
+        for (w, h) in [
+            (512, 768),
+            (100, 1000),
+            (9, 17),
+            (768, 512),
+            (512, 512),
+            (4, 40),
+        ] {
+            let steps = lossy_squeeze_steps(w, h, 3);
+            let first = steps.iter().find(|s| s.in_place).unwrap();
+            assert_eq!(first.horizontal, h <= w, "{w}x{h}");
+            let (pw, ph) = preview(&steps, w, h);
+            assert!(pw <= 8 && ph <= 8, "{w}x{h} -> {pw}x{ph}");
+            let plain = lossy_squeeze_steps_chroma(w, h, 3, &[1, 2]);
+            assert_eq!(
+                plain.iter().find(|s| s.in_place).unwrap().horizontal,
+                h <= w,
+                "{w}x{h}"
+            );
+            // Lossless and lossy-alpha pyramids keep the horizontal start.
+            assert!(
+                default_squeeze_steps(w, h, 1)[0].horizontal || w <= 8,
+                "{w}x{h}"
+            );
+        }
+    }
     fn rnd(seed: &mut u64) -> i32 {
         *seed = seed
             .wrapping_mul(6364136223846793005)

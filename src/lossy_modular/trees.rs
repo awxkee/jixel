@@ -89,7 +89,7 @@ fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
     let refs = if t < tags.split {
         refs.of(&p.channels, t)
     } else {
-        Vec::new()
+        refs.of_group(&p.channels, tags.split, tags.channel[t], 0, 0)
     };
     sample_channel_ma(
         |y| &data[y * w..][..w],

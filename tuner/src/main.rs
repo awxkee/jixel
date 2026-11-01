@@ -36,6 +36,9 @@ fn usage() -> ! {
     eprintln!("         [--alpha-distance <d>] (lossy alpha distance; 0 = lossless)");
     eprintln!("         [--arbiter ssimulacra2|cvvdp]");
     eprintln!("         [--progressive-dc] (code the DC as a progressive DC frame)");
+    eprintln!("         [--lossy-modular off|auto|force] (modular arm instead of VarDCT)");
+    eprintln!("         [--coding xyb|ycbcr|rgb] (coding transform of lossy frames)");
+    eprintln!("         [--no-ink-layer] (no ink or vector layer stacks)");
     eprintln!(
         "         [--progressive-dc-levels <n>] (DC frame squeeze levels; implies --progressive-dc)"
     );
@@ -61,6 +64,9 @@ fn main() -> ExitCode {
     let mut keep_alpha = false;
     let mut alpha_distance: Option<f32> = None;
     let mut progressive_dc = false;
+    let mut lossy_modular = jixel::LossyModular::Off;
+    let mut coding = jixel::CodingTransform::Xyb;
+    let mut ink_layer: Option<bool> = None;
     let mut progressive_dc_levels: Option<u32> = None;
     let mut progressive_shifts: Option<Vec<u32>> = None;
     let mut group_order = jixel::GroupOrder::Scanline;
@@ -171,6 +177,36 @@ fn main() -> ExitCode {
                 progressive_dc = true;
                 i += 1;
             }
+            "--no-ink-layer" => {
+                ink_layer = Some(false);
+                i += 1;
+            }
+            "--coding" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                coding = match v.as_str() {
+                    "xyb" => jixel::CodingTransform::Xyb,
+                    "ycbcr" => jixel::CodingTransform::YCbCr,
+                    "rgb" => jixel::CodingTransform::Rgb,
+                    _ => {
+                        eprintln!("invalid --coding: {v}");
+                        std::process::exit(2)
+                    }
+                };
+                i += 2;
+            }
+            "--lossy-modular" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                lossy_modular = match v.as_str() {
+                    "off" => jixel::LossyModular::Off,
+                    "auto" => jixel::LossyModular::Auto,
+                    "force" => jixel::LossyModular::Force,
+                    _ => {
+                        eprintln!("invalid --lossy-modular: {v}");
+                        std::process::exit(2)
+                    }
+                };
+                i += 2;
+            }
             "--group-order" => {
                 let v = args.get(i + 1).unwrap_or_else(|| usage());
                 group_order = match v.as_str() {
@@ -254,7 +290,13 @@ fn main() -> ExitCode {
         .with_splines(splines)
         .with_edge_splines(edge_splines)
         .with_dots(dots)
-        .with_progressive_dc(progressive_dc);
+        .with_progressive_dc(progressive_dc)
+        .with_lossy_modular(lossy_modular)
+        .with_coding_transform(coding);
+    let cfg = match ink_layer {
+        Some(ink) => cfg.with_ink_layer(ink).with_vector_layers(ink),
+        None => cfg,
+    };
     let cfg = cfg.with_group_order(group_order);
     let cfg = match progressive_shifts {
         Some(shifts) => {

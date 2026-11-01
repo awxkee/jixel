@@ -29,7 +29,8 @@
 
 //! Tests for the lossy extra channel.
 
-use super::alpha::{ExtraSqueeze, closed_h_squeeze, closed_v_squeeze};
+use super::alpha::ExtraSqueeze;
+use super::closed_loop::{Rounding, closed_h_squeeze, closed_v_squeeze};
 use crate::encode_image::AlphaPlane;
 
 /// A soft-edged disc: the anti-aliased, feathered alpha lossy coding is for.
@@ -99,9 +100,9 @@ fn closed_loop_steps_mirror_the_inverse_squeeze() {
             }
             for (q, deadzone) in [(1, 0.0), (7, 0.0), (7, 0.1), (40, 0.25)] {
                 let (res, out) = if horizontal {
-                    closed_h_squeeze(&x, w, h, &avg.data, q, deadzone)
+                    closed_h_squeeze(&x, w, h, &avg.data, q, Rounding::Deadzone(deadzone))
                 } else {
-                    closed_v_squeeze(&x, w, h, &avg.data, q, deadzone)
+                    closed_v_squeeze(&x, w, h, &avg.data, q, Rounding::Deadzone(deadzone))
                 };
                 let (rw, rh) = if horizontal { (w / 2, h) } else { (w, h / 2) };
                 let res = Channel {

@@ -46,7 +46,7 @@ use super::tokens::ForestContexts;
 use super::{single, tokens, trees, write};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::lossless::kit::{LZ77_MIN_SYMBOL, build_lz_pixel_code_opts};
+use crate::lossless::kit::{LZ77_MIN_SYMBOL, build_lz_pixel_code_ans};
 use crate::thread_pool::ThreadPool;
 
 /// Code `p` as a complete frame (header, TOC and sections). With a cache,
@@ -124,7 +124,8 @@ pub(super) fn write_frame(
     }
 
     // 4. One entropy code over all streams, then the sections.
-    let code = build_lz_pixel_code_opts(
+    let dictionary = p.patch_dictionary(scratch);
+    let code = build_lz_pixel_code_ans(
         speed.effort().lz_exhaustive_entropy(),
         std::iter::once(streams.global.as_slice())
             .chain(streams.dc_groups.iter().map(Vec::as_slice))
@@ -143,6 +144,7 @@ pub(super) fn write_frame(
         min_symbol,
         distance_ctx,
         &streams,
+        dictionary,
         pool,
         &mut scratch.huffman_pool,
         writer,

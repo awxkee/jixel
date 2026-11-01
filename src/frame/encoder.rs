@@ -130,15 +130,11 @@ pub(crate) fn encode_frame(
             }
         });
     }
-    let modular_distance = if alpha.is_none()
+    let lossy_modular = alpha.is_none()
         && (ctx.lossy_modular == crate::LossyModular::Force
             || (ctx.lossy_modular == crate::LossyModular::Auto
-                && ctx.speed.effort().lossy_modular_auto))
-    {
-        crate::lossy_modular::calibrated_distance(distance) * lm_texture_factor(&linear)
-    } else {
-        0.0
-    };
+                && ctx.speed.effort().lossy_modular_auto));
+    let texture = lossy_modular.then(|| lm_texture_factor(&linear));
     let mut xyb = to_xyb_image(ctx, scratch, linear);
     if fill_invisible && let Some(alpha) = alpha {
         crate::invisible::fill_invisible(&mut xyb, alpha);
@@ -146,39 +142,44 @@ pub(crate) fn encode_frame(
     if is_achromatic {
         snap_achromatic_xyb(&mut xyb);
     }
+    let screen = lossy_modular && crate::frame::is_screen_content(&xyb);
+    let modular_distance = texture.map_or(0.0, |texture| {
+        crate::lossy_modular::calibrated_distance(distance, screen) * texture
+    });
     // Lossy-modular arm (quantized Squeeze): whole-frame modular encoding of
     // the XYB image at a distance calibrated to match the VarDCT arm's
     // quality. Force always takes the arm when the frame supports it; Auto
-    // (Slow only) dual-encodes and keeps the smaller frame.
-    if alpha.is_none() && ctx.lossy_modular == crate::LossyModular::Force {
-        let mut modular_writer = BitWriter::new();
-        if crate::lossy_modular::encode_xyb_frame(
-            &xyb,
-            modular_distance,
-            ctx.speed,
-            &ctx.thread_pool,
-            scratch,
-            &mut modular_writer,
-        )
-        .is_some()
-        {
-            writer.append(&modular_writer);
-            return Ok(false);
-        }
-    }
+    // (Slow only) dual-encodes screen content and keeps the smaller frame.
+    // On photos the byte gate only picks the arm where its calibration runs
+    // coarse for that image: 16 Kodak images at Slow, Auto against VarDCT
+    // alone SS2 -0.31 / BA +0.19 / cvvdp +1.38 % BD, so they skip it.
     if alpha.is_none()
-        && ctx.lossy_modular == crate::LossyModular::Auto
-        && ctx.speed.effort().lossy_modular_auto
-    {
-        let mut modular_writer = BitWriter::new();
-        let original_modular_bits = crate::lossy_modular::encode_xyb_frame(
-            &xyb,
-            modular_distance,
-            ctx.speed,
-            &ctx.thread_pool,
+        && ctx.lossy_modular == crate::LossyModular::Force
+        && let Some((modular_writer, _)) = encode_modular_xyb(
+            ctx,
             scratch,
-            &mut modular_writer,
+            distance,
+            modular_distance,
+            screen,
+            &xyb,
+            patches,
+        )
+    {
+        writer.append(&modular_writer);
+        return Ok(false);
+    }
+    if screen && ctx.lossy_modular == crate::LossyModular::Auto {
+        let modular = encode_modular_xyb(
+            ctx,
+            scratch,
+            distance,
+            modular_distance,
+            screen,
+            &xyb,
+            patches,
         );
+        let original_modular_bits = modular.as_ref().map(|(_, bits)| *bits);
+        let modular_writer = modular.map(|(w, _)| w).unwrap_or_default();
         let mut vardct_writer = BitWriter::new();
         encode_frame_vardct(
             ctx,
@@ -216,6 +217,85 @@ pub(crate) fn encode_frame(
         writer,
     )?;
     Ok(false)
+}
+
+/// The lossy-modular arm of an XYB frame. With `patches`, repeated glyphs
+/// go to an atlas reference frame and the frame codes the image less them:
+/// on screenshots that is -11.7 % SS2 / -9.5 % BA BD at Slow, so a found
+/// plan is taken without a second, unpatched encode (a byte race would also
+/// prefer the plain frame where the patched one is slightly larger but
+/// better). Unrepeated glyphs join as in VarDCT: freely up to
+/// `GLYPH_SINGLETON_FREE_MAX_DISTANCE`, and up to the race distance when the
+/// frame with them is smaller (text set in unrepeated glyphs: screen0 at d
+/// 1.25 -15 % bytes and +1.6 SS2, where taking them freely there loses BA
+/// +1.0 % BD over 22 screenshots and illustrations). Only a singleton atlas
+/// of at least a quarter of the frame races: winners measure 0.33-0.58 of
+/// it, scattered singletons on illustrations 0.02-0.13. Returns the writer and
+/// the Auto gate's size (before the fold race, atlas included), or None
+/// when the image is too small to squeeze.
+fn encode_modular_xyb(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    modular_distance: f32,
+    screen: bool,
+    xyb: &Image3F,
+    patches: bool,
+) -> Option<(BitWriter, usize)> {
+    use super::variants::{
+        GLYPH_SINGLETON_FREE_MAX_DISTANCE, GLYPH_SINGLETON_RACE_MAX_DISTANCE, GlyphStage,
+    };
+    let encode = |glyphs: Option<GlyphStage>, scratch: &mut CoderScratch| {
+        let (mut writer, image, references) = match glyphs {
+            Some(glyphs) => {
+                let (atlas, base, references) = glyphs.into_parts();
+                (atlas, std::borrow::Cow::Owned(base), references)
+            }
+            None => (
+                BitWriter::new(),
+                std::borrow::Cow::Borrowed(xyb),
+                Vec::new(),
+            ),
+        };
+        let atlas_bits = writer.bits_written();
+        let bits = crate::lossy_modular::encode_xyb_frame(
+            &image,
+            modular_distance,
+            screen,
+            &references,
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut writer,
+        )?;
+        Some((writer, atlas_bits + bits))
+    };
+    let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
+    let glyphs = patches
+        .then(|| GlyphStage::find(ctx, scratch, distance, xyb, None, free_singles))
+        .flatten();
+    let best = encode(glyphs, scratch)?;
+    // The race encodes the frame twice (1.8x on the screenshots it runs on),
+    // so it stays at Slow and above, where Auto runs.
+    if !patches
+        || free_singles
+        || distance > GLYPH_SINGLETON_RACE_MAX_DISTANCE
+        || ctx.speed < crate::Speed::Slow
+    {
+        return Some(best);
+    }
+    let best_bits = best.0.bits_written();
+    match GlyphStage::find(ctx, scratch, distance, xyb, None, true) {
+        Some(singles)
+            if singles.atlas_bits() < best_bits && singles.atlas_bits() * 4 >= best_bits =>
+        {
+            match encode(Some(singles), scratch) {
+                Some(arm) if arm.0.bits_written() < best_bits => Some(arm),
+                _ => Some(best),
+            }
+        }
+        _ => Some(best),
+    }
 }
 
 /// Every opsin row sums to 1, so achromatic input gives L = M = S and hence

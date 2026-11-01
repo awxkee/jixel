@@ -64,9 +64,10 @@ pub(super) enum Layout {
 }
 
 impl Layout {
-    pub(super) fn write_frame_header(self, epf: (u32, f32), w: &mut BitWriter) {
+    /// `patched` sets the frame's kPatches flag (XYB frames only).
+    pub(super) fn write_frame_header(self, epf: (u32, f32), patched: bool, w: &mut BitWriter) {
         match self {
-            Self::Xyb => write_xyb_frame_header(epf, w),
+            Self::Xyb => write_xyb_frame_header(epf, patched, w),
             Self::Plain { ycbcr, extra, .. } => write_plain_frame_header(ycbcr, extra, epf, w),
         }
     }
@@ -102,11 +103,11 @@ impl Layout {
 /// Regular is_last modular frame inside the lossy (`xyb_encoded`) codestream.
 /// Identical to `write_frame_header_modular_flags` except the do_YCbCr bit is
 /// absent: with xyb_encoded set the color transform is implicitly XYB.
-fn write_xyb_frame_header(epf: (u32, f32), w: &mut BitWriter) {
+fn write_xyb_frame_header(epf: (u32, f32), patched: bool, w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
-    write_u64(0, w); // flags
+    write_u64(if patched { 2 } else { 0 }, w); // flags: kPatches
     w.write(2, 0b00); // upsampling = 1
     w.write(2, GroupLayout::DEFAULT.shift as u64);
     w.write(2, 0b00); // num_passes = 1

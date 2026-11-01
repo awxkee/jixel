@@ -156,7 +156,7 @@ pub(super) fn lm_plain_input(
             }
             vec![levels]
         }
-        Some(plane) => vec![(0..n).map(|i| plane.get_i32(i)).collect()],
+        Some(plane) => vec![plane.to_i32_vec(n)],
         None => Vec::new(),
     };
     Some(crate::lossy_modular::PlainInput {

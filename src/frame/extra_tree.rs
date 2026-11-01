@@ -261,7 +261,7 @@ pub(super) fn plan_global_extra_tree(
             .collect()
     };
     let coded = palette.map_or(plane, |p| &p.indices);
-    let mut data: Vec<i32> = (0..coded.len()).map(|i| coded.get_i32(i)).collect();
+    let mut data = coded.to_i32_vec(coded.len());
     // A single-group plane's palette is channel 0 of its stream and the
     // indices channel 1; elsewhere the palette has the global stream to
     // itself and each group's indices are that group's channel 0.

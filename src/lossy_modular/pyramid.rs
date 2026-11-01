@@ -34,15 +34,21 @@
 //! to the 8 px preview) and every resulting channel is divided by its
 //! quantization step.
 
+use super::closed_loop::{Deadzone, requantize};
 use super::layout::{Layout, XYB_SCALE, write_dc_frame_header};
-use super::quantize::{Role, dc_frame_step, plain_step, quantize_channel_divide, xyb_step};
+use super::quantize::{
+    Role, SCREEN_ROW_MUL, dc_frame_step, plain_step, quantize_channel_divide, xyb_step,
+};
 use crate::bit_writer::BitWriter;
+use crate::coder_scratch::CoderScratch;
 use crate::coding::CodingTransform;
 use crate::image::Image3F;
+use crate::patches::PatchReference;
 use crate::squeeze::{
     Channel, SqueezeStep, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps,
     lossy_squeeze_steps_chroma, squeeze_steps_levels,
 };
+use crate::thread_pool::ThreadPool;
 
 /// The non-XYB frame's integer planes for the arm: `color` holds one (gray)
 /// or three channels in the coded plane order, `extra` the extra channels
@@ -67,16 +73,29 @@ pub(super) struct Pyramid {
     pub(super) dc_frame: bool,
     pub(super) xsize: usize,
     pub(super) ysize: usize,
+    /// Patch dictionary entries the decoder adds after the frame (XYB frames;
+    /// the atlas is a reference frame coded before this one).
+    pub(super) patches: Vec<PatchReference>,
 }
 
 impl Pyramid {
-    /// The XYB image at the calibrated `distance`. None when the image is
-    /// too small to squeeze.
-    pub(super) fn xyb(xyb: &Image3F, distance: f32) -> Option<Self> {
+    /// The XYB image at the calibrated `distance`, on the screen-content rows
+    /// when `screen`. None when the image is too small to squeeze.
+    pub(super) fn xyb(
+        xyb: &Image3F,
+        distance: f32,
+        screen: bool,
+        pool: &ThreadPool,
+    ) -> Option<Self> {
         let steps = lossy_squeeze_steps(xyb.xsize(), xyb.ysize(), 3);
-        let pyramid = Self::xyb_with(xyb, steps, |color, hshift, vshift| {
-            xyb_step(color, hshift, vshift, distance)
-        })?;
+        let row_mul = if screen { SCREEN_ROW_MUL } else { [1.0; 3] };
+        let pyramid = Self::xyb_with(
+            xyb,
+            steps,
+            Deadzone::COLOR,
+            pool,
+            |color, hshift, vshift| xyb_step(color, hshift, vshift, distance, row_mul),
+        )?;
         Some(Self {
             epf: Layout::Xyb.epf(distance),
             ..pyramid
@@ -89,6 +108,7 @@ impl Pyramid {
         dc: &Image3F,
         vardct_steps: [f32; 3],
         levels: Option<u32>,
+        pool: &ThreadPool,
     ) -> Option<Self> {
         // Stored color [Y, X, B-Y] -> the VarDCT DC step in lattice units.
         let unit = [
@@ -98,7 +118,7 @@ impl Pyramid {
         ];
         let levels = levels.map_or(usize::MAX, |n| n.max(1) as usize);
         let steps = squeeze_steps_levels(dc.xsize(), dc.ysize(), 3, levels);
-        let pyramid = Self::xyb_with(dc, steps, |color, hshift, vshift| {
+        let pyramid = Self::xyb_with(dc, steps, Deadzone::NONE, pool, |color, hshift, vshift| {
             dc_frame_step(unit, color, hshift, vshift)
         })?;
         Some(Self {
@@ -113,6 +133,8 @@ impl Pyramid {
     fn xyb_with(
         xyb: &Image3F,
         steps: Vec<SqueezeStep>,
+        deadzone: Deadzone,
+        pool: &ThreadPool,
         q_of: impl Fn(usize, i32, i32) -> i32,
     ) -> Option<Self> {
         let xsize = xyb.xsize();
@@ -150,6 +172,7 @@ impl Pyramid {
         for s in &steps {
             apply_step_forward(&mut channels, s);
         }
+        let exact = channels.clone();
         // Quantize every channel on its (color, depth) schedule. Channels are
         // stored divided by their step; the tree leaf multiplier restores the
         // scale. The decoder's full-scale predictions stay consistent because
@@ -169,6 +192,7 @@ impl Pyramid {
             quantize_channel_divide(ch, q);
             quants.push(q as u32);
         }
+        requantize(&mut channels, &quants, &steps, exact, deadzone, pool);
         Some(Self {
             channels,
             quants,
@@ -178,16 +202,21 @@ impl Pyramid {
             dc_frame: false,
             xsize,
             ysize,
+            patches: Vec::new(),
         })
     }
 
-    /// A non-XYB frame's planes at the calibrated `distance`. None when the
-    /// image is too small to squeeze.
+    /// A non-XYB frame's planes at the calibrated `distance`. With
+    /// `unsqueeze_lossless`, trailing lossless extra channels stay out of the
+    /// squeeze (same samples, another coding). None when the image is too
+    /// small to squeeze.
     pub(super) fn plain(
         input: &PlainInput,
         xsize: usize,
         ysize: usize,
         distance: f32,
+        unsqueeze_lossless: bool,
+        pool: &ThreadPool,
     ) -> Option<Self> {
         let num_color = input.color.len();
         debug_assert!(num_color == 1 || num_color == 3);
@@ -231,20 +260,35 @@ impl Pyramid {
             planes.push(plane[..n].to_vec());
             roles.push(Role::Extra(*distance));
         }
-        let steps = lossy_squeeze_steps_chroma(xsize, ysize, num_c, &chroma);
+        let squeezed = if unsqueeze_lossless {
+            num_color
+                + input
+                    .extra
+                    .iter()
+                    .rposition(|&(_, d)| d > 0.0)
+                    .map_or(0, |i| i + 1)
+        } else {
+            num_c
+        };
+        let unsqueezed = num_c - squeezed;
+        let steps = lossy_squeeze_steps_chroma(xsize, ysize, squeezed, &chroma);
         let n_pre: usize = steps.iter().filter(|s| !s.in_place).map(|s| s.num_c).sum();
         let mut channels = full_size_channels(planes.into_iter(), xsize, ysize);
         for s in &steps {
             apply_step_forward(&mut channels, s);
         }
+        let exact = channels.clone();
         let nb = channels.len();
         let mut quants: Vec<u32> = Vec::with_capacity(nb);
         for (i, ch) in channels.iter_mut().enumerate() {
-            // The chroma pre-squeeze residuals come last.
+            // The chroma pre-squeeze residuals come last, after the unsqueezed
+            // extras.
             let role = if i >= nb - n_pre {
                 Role::Chroma
+            } else if i >= nb - n_pre - unsqueezed {
+                Role::Extra(0.0)
             } else {
-                roles[i % num_c]
+                roles[i % squeezed]
             };
             let q = plain_step(
                 role,
@@ -257,6 +301,7 @@ impl Pyramid {
             quantize_channel_divide(ch, q);
             quants.push(q as u32);
         }
+        requantize(&mut channels, &quants, &steps, exact, Deadzone::COLOR, pool);
         let layout = Layout::Plain {
             ycbcr,
             rct,
@@ -271,6 +316,7 @@ impl Pyramid {
             dc_frame: false,
             xsize,
             ysize,
+            patches: Vec::new(),
         })
     }
 
@@ -279,8 +325,19 @@ impl Pyramid {
         if self.dc_frame {
             write_dc_frame_header(w);
         } else {
-            self.layout.write_frame_header(self.epf, w);
+            self.layout
+                .write_frame_header(self.epf, !self.patches.is_empty(), w);
         }
+    }
+
+    /// The patch dictionary that opens the LfGlobal section, if any.
+    pub(super) fn patch_dictionary(&self, scratch: &mut CoderScratch) -> Option<BitWriter> {
+        if self.patches.is_empty() {
+            return None;
+        }
+        let mut w = BitWriter::new();
+        crate::lossless::write_patch_dictionary(&self.patches, false, scratch, &mut w);
+        Some(w)
     }
 }
 

@@ -530,6 +530,8 @@ fn main() -> Result<()> {
     let mut with_jpeg = false;
     let mut cjpegli = "cjpegli".to_string();
     let mut log = false;
+    let mut with_lossy_modular = false;
+    let mut with_cjxl_modular = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -687,6 +689,14 @@ fn main() -> Result<()> {
                 cjpegli = value!().to_string();
                 i += 2;
             }
+            "--lossy-modular" => {
+                with_lossy_modular = true;
+                i += 1;
+            }
+            "--cjxl-modular" => {
+                with_cjxl_modular = true;
+                i += 1;
+            }
             other if other.starts_with("--") => bail!("unknown option {other}"),
             other => {
                 images.push(PathBuf::from(other));
@@ -707,6 +717,7 @@ fn main() -> Result<()> {
              AVIF (image crate, ravif/rav1e): [--image-avif-speed 6] [--no-image-avif]\n  \
              shared: [--avif-yuv 444|420] [--no-avif]\n  \
              JPEG reference: [--jpeg] [--cjpegli PATH]\n  \
+             lossy modular: [--lossy-modular] (jixel forced) [--cjxl-modular] (cjxl -m)\n  \
              metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
              [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]; \
              ColorVideoVDP (opt-in): [--cvvdp] [--cvvdp-bin PATH] \
@@ -848,12 +859,28 @@ fn main() -> Result<()> {
 
         // jixel series.
         let mut jixel = Series {
-            label: format!("jixel ({arbiter:?})"),
+            label: if with_lossy_modular {
+                format!("jixel VarDCT ({arbiter:?})")
+            } else {
+                format!("jixel ({arbiter:?})")
+            },
             color: RGBColor(0xE5, 0x3E, 0x3E),
             points: vec![],
         };
         for &d in &distances {
-            let p = bench_jixel(&orig_rgb, w, h, d, &sc, &tmp, stem, npx, nthreads, arbiter)?;
+            let p = bench_jixel(
+                &orig_rgb,
+                w,
+                h,
+                d,
+                &sc,
+                &tmp,
+                stem,
+                npx,
+                nthreads,
+                arbiter,
+                jixel::LossyModular::Off,
+            )?;
             println!(
                 "  jixel            d={d:<4} {:>9} B  {:.3} bpp  {}",
                 p.bytes,
@@ -861,6 +888,56 @@ fn main() -> Result<()> {
                 p.score_str()
             );
             jixel.points.push(p);
+        }
+        let mut modular_series: Vec<Series> = Vec::new();
+        if with_lossy_modular {
+            let mut s = Series {
+                label: "jixel lossy modular".to_string(),
+                color: RGBColor(0xF0, 0x9A, 0x1A),
+                points: vec![],
+            };
+            for &d in &distances {
+                let p = bench_jixel(
+                    &orig_rgb,
+                    w,
+                    h,
+                    d,
+                    &sc,
+                    &tmp,
+                    stem,
+                    npx,
+                    nthreads,
+                    arbiter,
+                    jixel::LossyModular::Force,
+                )?;
+                println!(
+                    "  jixel modular    d={d:<4} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
+                );
+                s.points.push(p);
+            }
+            modular_series.push(s);
+        }
+        if with_cjxl_modular {
+            let e = efforts.last().copied().unwrap_or(7);
+            let mut s = Series {
+                label: format!("cjxl -m -e{e}"),
+                color: RGBColor(0x2E, 0x9E, 0x5B),
+                points: vec![],
+            };
+            for &d in &distances {
+                let p = bench_cjxl_modular(img, e, d, &sc, w, h, &tmp, stem, npx)?;
+                println!(
+                    "  cjxl -m -e{e}      d={d:<4} {:>9} B  {:.3} bpp  {}",
+                    p.bytes,
+                    p.bpp,
+                    p.score_str()
+                );
+                s.points.push(p);
+            }
+            modular_series.push(s);
         }
 
         // cjxl series, one per effort.
@@ -897,6 +974,7 @@ fn main() -> Result<()> {
         }
 
         let mut all = vec![jixel];
+        all.extend(modular_series);
         all.extend(cjxl_series);
 
         // AV1 reference (system libavif + aom): encode `avifenc`, decode `avifdec`.
@@ -1124,21 +1202,26 @@ fn bench_jixel(
     npx: f64,
     nthreads: usize,
     arbiter: jixel::Arbiter,
+    lossy_modular: jixel::LossyModular,
 ) -> Result<Point> {
+    // A forced lossy-modular frame drops the vector and ink layers, whose
+    // stack would otherwise win the frame and hide the arm.
+    let layers = lossy_modular == jixel::LossyModular::Off;
     let cfg = jixel::EncodeConfig::default()
         .with_distance(d)
         .with_num_threads(nthreads)
         .with_arbiter(arbiter)
         .with_speed(Speed::ExtraSlow)
-        .with_splines(true)
-        .with_dots(true)
-        .with_vector_layers(true)
-        .with_ink_layer(true)
-        .with_edge_splines(true)
+        .with_splines(layers)
+        .with_dots(layers)
+        .with_vector_layers(layers)
+        .with_ink_layer(layers)
+        .with_edge_splines(layers)
+        .with_lossy_modular(lossy_modular)
         .with_coding_transform(CodingTransform::Xyb);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
-    let jxl = tmp.join(format!("{stem}_jixel_{d}.jxl"));
+    let jxl = tmp.join(format!("{stem}_jixel_{lossy_modular:?}_{d}.jxl"));
     std::fs::write(&jxl, &data)?;
     let bytes = data.len() as u64;
     let dec = decode_to_rgb(&jxl, tmp, w, h)?;
@@ -1164,7 +1247,40 @@ fn bench_cjxl(
     stem: &str,
     npx: f64,
 ) -> Result<Point> {
-    let jxl = tmp.join(format!("{stem}_cjxl_e{effort}_{d}.jxl"));
+    bench_cjxl_with(img, effort, d, false, sc, w, h, tmp, stem, npx)
+}
+
+/// [`bench_cjxl`] in cjxl's lossy modular mode (`-m 1`).
+#[allow(clippy::too_many_arguments)]
+fn bench_cjxl_modular(
+    img: &Path,
+    effort: u32,
+    d: f32,
+    sc: &Scorer,
+    w: usize,
+    h: usize,
+    tmp: &Path,
+    stem: &str,
+    npx: f64,
+) -> Result<Point> {
+    bench_cjxl_with(img, effort, d, true, sc, w, h, tmp, stem, npx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_cjxl_with(
+    img: &Path,
+    effort: u32,
+    d: f32,
+    modular: bool,
+    sc: &Scorer,
+    w: usize,
+    h: usize,
+    tmp: &Path,
+    stem: &str,
+    npx: f64,
+) -> Result<Point> {
+    let mode = if modular { "m" } else { "v" };
+    let jxl = tmp.join(format!("{stem}_cjxl_{mode}_e{effort}_{d}.jxl"));
     let ext = img.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let _ = std::fs::remove_file(&jxl);
     let mut cmd = Command::new("cjxl");
@@ -1175,6 +1291,9 @@ fn bench_cjxl(
         .arg("-e")
         .arg(effort.to_string())
         .arg("--quiet");
+    if modular {
+        cmd.arg("-m").arg("1");
+    }
 
     if ext != "png" {
         cmd.arg("--lossless_jpeg=0");

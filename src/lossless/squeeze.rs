@@ -336,11 +336,13 @@ pub(super) fn encode_squeeze_multigroup(
         channels.push(ch);
     }
     if let Some(a) = alpha {
-        let mut ch = Channel::new(xsize, ysize);
-        for (i, value) in ch.data.iter_mut().enumerate() {
-            *value = a.get_i32(i);
-        }
-        channels.push(ch);
+        channels.push(Channel {
+            data: a.to_i32_vec(xsize * ysize),
+            w: xsize,
+            h: ysize,
+            hshift: 0,
+            vshift: 0,
+        });
     }
     let steps = default_squeeze_steps(xsize, ysize, num_c);
     for s in &steps {
