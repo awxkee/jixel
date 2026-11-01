@@ -245,9 +245,11 @@ pub(crate) fn snap_to_lattice(plane: &mut AlphaPlane, step: u32) {
         AlphaPlane::U16 { bits, .. } => (1u32 << *bits) - 1,
         AlphaPlane::F32(_) => unreachable!("float planes are not quantized"),
     };
+    let divider = crate::fast_divide::DividerI32::new(step as i32);
+    let half = step / 2;
     let snap = |v: u32| -> u32 {
         let ink = max - v.min(max);
-        let q = ((ink + step / 2) / step) * step;
+        let q = (((ink + half) as i32 / divider) as u32) * step;
         max - q.min(max - max % step)
     };
     match plane {
@@ -841,6 +843,30 @@ fn tokenize_channel(alpha: &AlphaPlane, xsize: usize, ysize: usize) -> Vec<Token
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lattice_snap_matches_the_division_formula() {
+        for bits in [8u8, 12, 16] {
+            let max = (1u32 << bits) - 1;
+            for step in [1u32, 2, 3, 5, 7, 16, 17, 64, 255, 1000] {
+                let source: Vec<u16> = (0..=max).map(|v| v as u16).collect();
+                let mut plane = AlphaPlane::U16 {
+                    data: source.clone(),
+                    bits,
+                };
+                snap_to_lattice(&mut plane, step);
+                let AlphaPlane::U16 { data, .. } = plane else {
+                    unreachable!()
+                };
+                for (&got, &v) in data.iter().zip(&source) {
+                    let ink = max - u32::from(v).min(max);
+                    let q = ((ink + step / 2) / step) * step;
+                    let want = max - q.min(max - max % step);
+                    assert_eq!(u32::from(got), want, "bits={bits} step={step} v={v}");
+                }
+            }
+        }
+    }
     use crate::encode_image::AlphaPlane;
 
     fn check_ac_group_tokenization<T: AlphaSample>(

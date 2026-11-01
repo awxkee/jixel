@@ -34,6 +34,7 @@ mod cfl;
 mod coef_polish;
 mod dc_ops;
 mod dct;
+mod divide;
 mod entropy;
 mod frame;
 mod haar;
@@ -65,6 +66,7 @@ pub(crate) use dc_ops::{
     dc_error_row_wasm, reconstruct_dc_wasm,
 };
 pub(crate) use dct::*;
+pub(crate) use divide::rounded_quotients_wasm;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;
 pub(crate) use haar::haar_rows_wasm;

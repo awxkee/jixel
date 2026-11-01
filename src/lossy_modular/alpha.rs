@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 11/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,36 +27,31 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Quantized extra-channel Squeeze pyramids inside VarDCT frames.
+//! A lossy extra channel (alpha, CMYK black) inside a VarDCT frame.
+//!
+//! Extra channels are always modular, so a lossy one is one squeezed,
+//! quantized channel coded in the VarDCT frame's modular streams. It shares
+//! the arm's luma step table and the forest's scale-safe tokenizer; unlike
+//! the arm, it quantizes residuals closed-loop against the decoded averages.
 
-use super::super::lz77::{
-    LZ77_MIN_SYMBOL, build_lz_pixel_code, build_lz_pixel_code_opts, lz77_literals,
-    write_lz_section, write_tree_lz77,
-};
-use super::super::ma_sampling::sample_channel_ma;
-use super::super::ma_source::{MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS};
-use super::super::predictor::{
-    PREDICTOR_GRADIENT, channel_to_context, selected_grad_pack_interior_fn, tokenize_plane_rows,
-};
-use super::super::tree::{build_balanced_tree_tokens_mul, push_leaf_mul, push_split};
-use super::forest::{
-    LM_BUDGET_CAP, LM_BUDGET_DIV, LM_SAFE_PRED_MASK, LM_SAMPLE_TARGET, scale_ma_value_props,
-    tokenize_channel_ma_mult,
-};
-use super::quantize::{
-    LOSSY_MODULAR_XYB_SCALE, SQUEEZE_QUALITY_FACTOR_XYB, SQUEEZE_XYB_QTABLE,
-    quantize_channel_divide,
-};
-use super::{for_each_squeeze_group_crop, write_modular_transforms_squeeze_only};
+use super::forest::{BUDGET_CAP, BUDGET_DIV, SAMPLE_TARGET};
+use super::layout::XYB_SCALE;
+use super::quantize::{SQUEEZE_QUALITY_FACTOR_XYB, SQUEEZE_XYB_QTABLE, quantize_channel_divide};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::Token;
+use crate::lossless::kit::{
+    GlobalPlaneTree, LZ77_MIN_SYMBOL, MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS,
+    PREDICTOR_GRADIENT, SAFE_PREDICTORS, build_balanced_tree_tokens_mul, build_lz_pixel_code,
+    build_lz_pixel_code_opts, channel_to_context, for_each_squeeze_group_crop, lz77_literals,
+    push_leaf_mul, push_split, sample_channel_ma, scale_ma_value_props,
+    selected_grad_pack_interior_fn, tokenize_channel_ma_mult, tokenize_plane_rows,
+    write_lz_section, write_modular_transforms_squeeze_only, write_tree_lz77,
+};
 use crate::ma_tree::{LearnedTree, MaLearnParams, MaNode, MaSamples, learn_ma_tree};
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
-
-// ============ Lossy extra channel inside a VarDCT frame (squeeze) ============
 
 /// Group sizes of the VarDCT frames this channel rides in.
 const VARDCT_GROUP_DIM: usize = 256;
@@ -119,7 +114,7 @@ impl ExtraSqueeze {
             apply_step_forward(&mut channels, s);
         }
         // The arm's luma schedule is in units of 1/4096 of the sample range.
-        let unit = max / LOSSY_MODULAR_XYB_SCALE[1];
+        let unit = max / XYB_SCALE[1];
         let quants: Vec<u32> = channels
             .iter()
             .map(|ch| {
@@ -320,7 +315,7 @@ impl ExtraSqueeze {
         num_groups: usize,
         xsize_groups: usize,
         pool: &ThreadPool,
-    ) -> Option<super::plane::GlobalPlaneTree> {
+    ) -> Option<GlobalPlaneTree> {
         let crops: Vec<Vec<_>> = (0..num_groups)
             .map(|g| {
                 let mut crops = Vec::new();
@@ -369,7 +364,7 @@ impl ExtraSqueeze {
             }
             tokens
         });
-        Some(super::plane::GlobalPlaneTree {
+        Some(GlobalPlaneTree {
             tree_tokens,
             crop_tokens,
         })
@@ -447,7 +442,7 @@ impl ExtraSqueeze {
             let ch = &self.channels[c];
             let (data, stride) = (&ch.data, ch.w);
             let px = rw * rh;
-            let mut step = px.div_ceil(LM_SAMPLE_TARGET).max(1);
+            let mut step = px.div_ceil(SAMPLE_TARGET).max(1);
             if step > 1 && step.is_multiple_of(2) {
                 step += 1;
             }
@@ -471,13 +466,13 @@ impl ExtraSqueeze {
                 split_cost_bits: MA_SPLIT_COST_BITS / step as f32,
                 min_node: MA_MIN_NODE_SAMPLES,
                 allow_wp: false,
-                allowed_preds: LM_SAFE_PRED_MASK,
+                allowed_preds: SAFE_PREDICTORS,
                 side_preds: 1,
                 max_candidates: MA_PHOTO_CANDIDATES,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
             };
-            let budget = (px / LM_BUDGET_DIV).clamp(1, LM_BUDGET_CAP);
+            let budget = (px / BUDGET_DIV).clamp(1, BUDGET_CAP);
             let tree = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
                 learn_ma_tree(&samples, params(1), &pool, scratch)
             } else {
@@ -770,30 +765,6 @@ fn context_tree(c: usize) -> LearnedTree {
         est_bits: 0.0,
         flat_bits: 0.0,
     }
-}
-
-/// Divide every value by their common factor; returns the factor (the leaf
-/// multiplier) and the coded alphabet's minimum symbol count.
-pub(super) fn divide_common_factor(data: &mut [i32]) -> (u32, u32) {
-    let q = data.iter().fold(0, |g, &v| gcd(g, v.unsigned_abs())).max(1);
-    if q > 1 {
-        data.iter_mut().for_each(|v| *v /= q as i32);
-    }
-    let max_abs = data.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
-    let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
-    let min_symbol = if value_bits <= 13 {
-        LZ77_MIN_SYMBOL
-    } else {
-        4 * value_bits + 24
-    };
-    (q, min_symbol)
-}
-
-fn gcd(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
 }
 
 /// Chain per-slot learned subtrees on property 0 (the within-stream channel

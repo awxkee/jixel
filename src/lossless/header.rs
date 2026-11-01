@@ -37,7 +37,7 @@ use crate::entropy::{Token, optimize_entropy_code, pack_signed, write_entropy_co
 use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference};
 use crate::path_order;
 
-pub(super) fn write_u64(value: u64, w: &mut BitWriter) {
+pub(crate) fn write_u64(value: u64, w: &mut BitWriter) {
     match value {
         0 => w.write(2, 0),
         1..=16 => {
@@ -579,7 +579,7 @@ pub(super) fn write_modular_transforms(nb_chans: usize, rct_type: u32, w: &mut B
     }
 }
 
-pub(super) fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
+pub(crate) fn write_toc_entry(byte_len: usize, w: &mut BitWriter) {
     static OFFSETS: [usize; 4] = [0, 1024, 17_408, 4_211_712];
     static BITS: [usize; 4] = [10, 14, 22, 30];
     let mut bucket = 0usize;

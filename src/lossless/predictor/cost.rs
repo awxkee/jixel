@@ -199,24 +199,24 @@ pub(in crate::lossless) fn choose_wp_params(
 
 /// Aggregated residual costs across independently predicted modular crops.
 #[derive(Default)]
-pub(in crate::lossless) struct SqueezePredictorCost {
+pub(crate) struct SqueezePredictorCost {
     pub(in crate::lossless) costs: PredictorCosts,
 }
 
 impl SqueezePredictorCost {
-    pub(in crate::lossless) fn with_zero() -> Self {
+    pub(crate) fn with_zero() -> Self {
         let mut c = Self::default();
         c.costs.collect_zero = true;
         c
     }
 
-    pub(in crate::lossless) fn safe_predictor(&self) -> u32 {
+    pub(crate) fn safe_predictor(&self) -> u32 {
         self.costs.best_safe_predictor()
     }
 
     /// Add one independently predicted modular crop. Weighted prediction state
     /// resets here because the decoder resets it for every modular sub-image.
-    pub(in crate::lossless) fn add_crop(
+    pub(crate) fn add_crop(
         &mut self,
         get: impl Fn(usize, usize) -> i32,
         w: usize,
@@ -412,7 +412,7 @@ impl PredictorCosts {
 
 /// Evaluate all Slow-mode predictors in one traversal and choose the lowest
 /// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
-pub(in crate::lossless) fn choose_predictor_for_plane(
+pub(crate) fn choose_predictor_for_plane(
     get: impl Fn(usize, usize) -> i32,
     w: usize,
     h: usize,

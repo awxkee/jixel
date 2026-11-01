@@ -44,7 +44,7 @@ use std::sync::{Condvar, Mutex};
 pub(super) const SLOW_DEEP_LZ_MAX_THREADS: usize = 8;
 
 #[inline]
-pub(super) fn group_lz_threads(speed: crate::Speed, pool: &ThreadPool) -> usize {
+pub(crate) fn group_lz_threads(speed: crate::Speed, pool: &ThreadPool) -> usize {
     if speed.effort().lz_deep {
         pool.num_threads().min(SLOW_DEEP_LZ_MAX_THREADS)
     } else {
@@ -159,7 +159,7 @@ pub(crate) fn write_single_channel_lz77_section(
 /// state. Bound simultaneous staging memory as well as the worker count.
 /// `tails`: one `ConstantTail` per group after its tokens, or empty.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn write_lz_groups(
+pub(crate) fn write_lz_groups(
     groups: &[Vec<LzToken>],
     tails: &[ConstantTail],
     code: &crate::entropy::EntropyCode<'_>,

@@ -41,7 +41,7 @@ use crate::entropy::{EntropyCode, Token, optimize_entropy_code, write_entropy_co
 /// reverse) exactly like `write_ans_tokens`, with the LZ77 symbol mapping of
 /// `write_lz_token` (length = direct symbol `min_symbol + len_tok`; literals
 /// and distances honor the per-cluster hybrid-uint config).
-pub(in crate::lossless) fn write_lz_section<T: LzTokenSource>(
+pub(crate) fn write_lz_section<T: LzTokenSource>(
     tokens: &[T],
     distance_context: u32,
     code: &EntropyCode<'_>,
@@ -275,7 +275,7 @@ pub(in crate::lossless) fn write_local_tree_lz77_offsets(
 }
 
 /// Write a pre-built MA tree (token stream) + the LZ77 pixel code header.
-pub(in crate::lossless) fn write_tree_lz77(
+pub(crate) fn write_tree_lz77(
     tree_tokens: &[Token],
     pixel_code: &EntropyCode<'_>,
     min_symbol: u32,

@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 11/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,85 +27,22 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Lossy modular learned-tree forests and residual multipliers.
+//! The merged MA forest: per-tag subtrees under the stream/channel routing
+//! skeleton, every leaf stamped with its tag's step as the residual
+//! multiplier, and the learning budgets of those subtrees.
 
-use super::super::ma_sampling::{MaRefPlane, walk_channel_ma};
-use super::super::predictor::predictor_value;
-use super::super::tree::{push_leaf_mul, push_split};
-use crate::entropy::{Token, pack_signed};
-use crate::ma_tree::{LearnedTree, MaNode, MaSamples};
-use crate::weighted_predictor::WpParams;
+use crate::entropy::Token;
+use crate::lossless::kit::emit_forest_bfs;
+use crate::ma_tree::{LearnedTree, MaNode};
 
 /// Per-tag MA sample budget; more samples plateaued (<=0.6%) in the 2026-09
 /// knob sweeps, as did larger leaf budgets and split-candidate counts.
-pub(super) const LM_SAMPLE_TARGET: usize = 1 << 16;
+pub(super) const SAMPLE_TARGET: usize = 1 << 16;
 
 /// Learned-subtree leaf budget: pixels/div, clamped.
-pub(super) const LM_BUDGET_DIV: usize = 1024;
+pub(super) const BUDGET_DIV: usize = 1024;
 
-pub(super) const LM_BUDGET_CAP: usize = 256;
-
-pub(super) const LM_SAFE_PRED_MASK: u16 =
-    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 9);
-
-/// Rescale the value-derived MA properties (libjxl ids 4..=14) by `q`:
-/// sampling ran on the divided channel, but the decoder computes properties on
-/// the full-scale reconstruction.
-pub(super) fn scale_ma_value_props(samples: &mut MaSamples, q: i32) {
-    if q <= 1 {
-        return;
-    }
-    samples.props.map_rows(|p| {
-        for v in &mut p[4..=14] {
-            *v *= q;
-        }
-    });
-}
-
-/// Tokenize a (divided) channel rectangle through a learned tree whose splits
-/// live in the full-scale property domain. `base` is the tag's node offset in
-/// the merged forest arena; `leaf_ctx` is arena-indexed.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn tokenize_channel_ma_mult<'a>(
-    get_row: impl Fn(usize) -> &'a [i32],
-    gw: usize,
-    gh: usize,
-    chan: u32,
-    stream: i32,
-    q: i32,
-    tree: &LearnedTree,
-    leaf_ctx: &[u32],
-    base: u32,
-    refs: &[MaRefPlane<'a>],
-    out: &mut Vec<Token>,
-) {
-    walk_channel_ma(
-        get_row,
-        gw,
-        gh,
-        chan,
-        stream,
-        refs,
-        WpParams::DEFAULT,
-        false,
-        |_x, _y, v, p, n, _wp_pred| {
-            let (node, pred) = if q > 1 {
-                let mut sp = *p;
-                for s in &mut sp[4..=14] {
-                    *s *= q;
-                }
-                tree.lookup(&sp)
-            } else {
-                tree.lookup(p)
-            };
-            let pv = predictor_value(pred, n, 0);
-            out.push(Token::new(
-                leaf_ctx[(base + node) as usize],
-                pack_signed((v - pv) as i32),
-            ));
-        },
-    );
-}
+pub(super) const BUDGET_CAP: usize = 256;
 
 /// Merge the per-tag learned subtrees under the stream/channel routing
 /// skeleton and BFS-emit the whole forest, stamping every leaf with its tag's
@@ -115,7 +52,7 @@ pub(super) fn tokenize_channel_ma_mult<'a>(
 /// ordered [global channels][DC slots][AC slots]. Returns the tree tokens,
 /// the arena-indexed leaf context table, each tag's arena base, and the
 /// context count.
-pub(super) fn emit_lm_forest(
+pub(super) fn emit_forest(
     trees: &[LearnedTree],
     tag_mults: &[u32],
     split: usize,
@@ -208,35 +145,4 @@ pub(super) fn emit_lm_forest(
     mult_of.push(1);
     let root = (nodes.len() - 1) as u32;
     emit_forest_bfs(&nodes, &mult_of, root, tag_base)
-}
-
-/// BFS emission of a merged forest from `root` (matches libjxl's FIFO tree
-/// decode), stamping each leaf with its multiplier.
-pub(super) fn emit_forest_bfs(
-    nodes: &[MaNode],
-    mult_of: &[u32],
-    root: u32,
-    tag_base: Vec<u32>,
-) -> (Vec<Token>, Vec<u32>, Vec<u32>, u32) {
-    use std::collections::VecDeque;
-    let mut tokens = Vec::new();
-    let mut leaf_ctx = vec![u32::MAX; nodes.len()];
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    queue.push_back(root);
-    let mut ctx = 0u32;
-    while let Some(i) = queue.pop_front() {
-        match nodes[i as usize] {
-            MaNode::Split { prop, val, gt, le } => {
-                push_split(&mut tokens, prop as u32, val);
-                queue.push_back(gt);
-                queue.push_back(le);
-            }
-            MaNode::Leaf { pred, .. } => {
-                push_leaf_mul(&mut tokens, pred, mult_of[i as usize]);
-                leaf_ctx[i as usize] = ctx;
-                ctx += 1;
-            }
-        }
-    }
-    (tokens, leaf_ctx, tag_base, ctx)
 }

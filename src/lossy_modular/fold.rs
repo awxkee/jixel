@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 10/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 11/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,14 +27,21 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Bounded coarse-only screening for exact Squeeze representation trials.
+//! Stage 3: folding the pyramid's exact coarse tail.
+//!
+//! Once the coarse steps reach unit quantizers, the decoder's averages at
+//! that depth are exact integers. Folding such a step back (merging its
+//! average and residual into the full-scale average) leaves the decoded image
+//! unchanged but codes the coarse prefix differently, sometimes in fewer
+//! bytes. [`select_fold`] screens the candidates on the coarse prefix alone;
+//! [`super::race`] then serializes the frame both ways.
 
-use super::super::predictor::{
-    PREDICTOR_GRADIENT, selected_grad_pack_interior_fn, tokenize_plane_rows,
-};
-use super::quantize::LmQuantized;
+use super::pyramid::Pyramid;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{ALPHABET_SIZE, Token, f_log2, pack_signed, uint_encode};
+use crate::lossless::kit::{
+    GROUP_DIM, PREDICTOR_GRADIENT, selected_grad_pack_interior_fn, tokenize_plane_rows,
+};
 use crate::squeeze::{Channel, fold_quantized_step};
 
 const MODEL_BITS_PER_CHANNEL: f64 = 48.0;
@@ -110,11 +117,51 @@ fn prefix_bits(channels: &[Channel], scratch: &mut CoderScratch) -> f64 {
         .sum()
 }
 
+impl Pyramid {
+    /// Fold one coarse step using the integers reconstructed by the decoder.
+    /// Retained bands keep their original multipliers; the merged averages
+    /// become full-scale integer channels. Layout, EPF and DC scaling stay put.
+    pub(super) fn fold_last(&mut self) -> bool {
+        if self.steps.len() <= 1 {
+            return false;
+        }
+        let step = *self.steps.last().unwrap();
+        // Keep the chroma pre-squeeze and at least one explicit step. The
+        // shared coarse suffix always splits all original channels in place.
+        if !step.in_place || step.begin_c != 0 {
+            return false;
+        }
+        let offset = step.num_c;
+        if offset == 0 || offset > self.channels.len() / 2 {
+            return false;
+        }
+        for c in 0..step.num_c {
+            let avg = &self.channels[c];
+            let res = &self.channels[offset + c];
+            let dims = if step.horizontal {
+                avg.w.checked_add(res.w).map(|w| (w, avg.h))
+            } else {
+                avg.h.checked_add(res.h).map(|h| (avg.w, h))
+            };
+            // The current global forest requires global channels. Keeping
+            // every changed average global also leaves all group crops stable.
+            if dims.is_none_or(|(w, h)| w > GROUP_DIM || h > GROUP_DIM) {
+                return false;
+            }
+        }
+        if !fold_quantized_step(&mut self.channels, &mut self.quants, &step) {
+            return false;
+        }
+        self.steps.pop();
+        true
+    }
+}
+
 /// Pick one promising fold using only the affected coarse prefix. This is a
 /// heuristic work filter, not a coded-size bound: the caller still races the
 /// complete serialized frame before accepting any representation.
 pub(super) fn select_fold(
-    q: &LmQuantized,
+    q: &Pyramid,
     speed: crate::Speed,
     scratch: &mut CoderScratch,
 ) -> Option<usize> {
@@ -149,8 +196,8 @@ pub(super) fn select_fold(
         samples = samples.checked_add(ch.data.len())?;
         if quant == 0
             || ch.w.checked_mul(ch.h)? != ch.data.len()
-            || ch.w > super::GROUP_DIM
-            || ch.h > super::GROUP_DIM
+            || ch.w > GROUP_DIM
+            || ch.h > GROUP_DIM
             || samples > MAX_COARSE_SAMPLES
         {
             return None;
@@ -172,7 +219,7 @@ pub(super) fn select_fold(
             } else {
                 avg.h.checked_add(residual.h).map(|h| (avg.w, h))
             };
-            dims.is_some_and(|(w, h)| w <= super::GROUP_DIM && h <= super::GROUP_DIM)
+            dims.is_some_and(|(w, h)| w <= GROUP_DIM && h <= GROUP_DIM)
         });
         if !fits {
             break;
@@ -193,18 +240,18 @@ pub(super) fn select_fold(
 
 #[cfg(test)]
 mod tests {
-    use super::super::quantize::{LmPlainInput, lm_quantize_plain};
+    use super::super::pyramid::PlainInput;
     use super::*;
     use crate::coding::CodingTransform;
 
-    fn plane(w: usize, h: usize, f: impl Fn(usize, usize) -> i32) -> LmQuantized {
-        let input = LmPlainInput {
+    fn plane(w: usize, h: usize, f: impl Fn(usize, usize) -> i32) -> Pyramid {
+        let input = PlainInput {
             color: vec![(0..w * h).map(|i| f(i % w, i / w)).collect()],
             extra: Vec::new(),
             max: 65535.0,
             coding: CodingTransform::Rgb,
         };
-        lm_quantize_plain(&input, w, h, 0.00001).unwrap()
+        Pyramid::plain(&input, w, h, 0.00001).unwrap()
     }
 
     #[test]
@@ -263,13 +310,13 @@ mod tests {
     fn screen_can_select_a_profitable_coarse_representation() {
         // For a small three-channel image, eliminating the model overhead
         // itself can justify a trial. Larger images require a larger gain.
-        let input = LmPlainInput {
+        let input = PlainInput {
             color: (0..3).map(|c| vec![12000 + c * 1300; 128 * 128]).collect(),
             extra: Vec::new(),
             max: 65535.0,
             coding: CodingTransform::Rgb,
         };
-        let q = lm_quantize_plain(&input, 128, 128, 0.00001).unwrap();
+        let q = Pyramid::plain(&input, 128, 128, 0.00001).unwrap();
         assert_eq!(
             select_fold(&q, crate::Speed::Slow, &mut CoderScratch::default()),
             Some(4),

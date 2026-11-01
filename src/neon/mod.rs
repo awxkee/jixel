@@ -35,6 +35,7 @@ mod coef_polish;
 mod color;
 mod dc_ops;
 mod dct;
+mod divide;
 mod entropy;
 mod frame;
 mod haar;
@@ -83,6 +84,7 @@ pub(crate) use dct::{
     dc_from_dct64x128_neon, dc_from_dct128x64_neon, dc_from_dct128x128_neon, dct64x128_neon,
     dct128x64_neon, dct128x128_neon, inv_dct64x128_neon, inv_dct128x64_neon, inv_dct128x128_neon,
 };
+pub(crate) use divide::rounded_quotients_neon;
 pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use haar::haar_rows_neon;

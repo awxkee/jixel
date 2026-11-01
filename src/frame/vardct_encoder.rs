@@ -189,7 +189,7 @@ pub(super) fn encode_frame_core(
         )
         && alpha.is_none()
         && ctx.coding.is_xyb()
-        && crate::lossless::dc_frame_supported(dim.xsize_blocks, dim.ysize_blocks);
+        && crate::lossy_modular::dc_frame_supported(dim.xsize_blocks, dim.ysize_blocks);
 
     let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
@@ -1213,7 +1213,7 @@ pub(super) fn encode_frame_core(
     if use_dc_frame {
         let dc_image = assemble_source_dc(&dc_datas, &group_coords, &dim);
         let mut dc_writer = BitWriter::new();
-        let coded = crate::lossless::encode_dc_frame(
+        let coded = crate::lossy_modular::encode_dc_frame(
             &dc_image,
             std::array::from_fn(|c| {
                 distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)

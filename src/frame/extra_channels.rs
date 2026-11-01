@@ -74,7 +74,7 @@ impl ExtraSections {
 /// that previously stayed lossless into a lossy one.
 pub(super) struct PreparedExtra {
     sections: ExtraSections,
-    squeezed: Option<crate::lossless::ExtraSqueeze>,
+    squeezed: Option<crate::lossy_modular::ExtraSqueeze>,
     /// The tail race's candidates when they are already coded.
     folds: Vec<ExtraSections>,
     global_code_ans: bool,
@@ -247,11 +247,11 @@ fn lossless_sections(
 
 fn squeezed_sections(
     ctx: &EncodingContext,
-    squeezed: &crate::lossless::ExtraSqueeze,
+    squeezed: &crate::lossy_modular::ExtraSqueeze,
     dim: &ImageDim,
     dc_group_coords: &[(usize, usize)],
     global_code_ans: bool,
-    previous: Option<(&crate::lossless::ExtraSqueeze, &ExtraSections)>,
+    previous: Option<(&crate::lossy_modular::ExtraSqueeze, &ExtraSections)>,
     scratch: &mut CoderScratch,
 ) -> ExtraSections {
     let mut global = BitWriter::new();
@@ -296,7 +296,7 @@ fn squeezed_sections(
 #[allow(clippy::too_many_arguments)]
 fn joint_squeezed(
     ctx: &EncodingContext,
-    squeezed: crate::lossless::ExtraSqueeze,
+    squeezed: crate::lossy_modular::ExtraSqueeze,
     local: ExtraSections,
     dim: &ImageDim,
     dc_group_coords: &[(usize, usize)],
@@ -304,7 +304,7 @@ fn joint_squeezed(
     streams: &mut extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
 ) -> PreparedExtra {
-    let folds: Vec<(crate::lossless::ExtraSqueeze, ExtraSections)> = squeezed
+    let folds: Vec<(crate::lossy_modular::ExtraSqueeze, ExtraSections)> = squeezed
         .exact_tail_start()
         .map(|start| {
             [start, start + 2]
@@ -397,7 +397,7 @@ pub(super) fn prepare_extra_sections(
     };
     let squeezed = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
         .then(|| {
-            crate::lossless::ExtraSqueeze::new(
+            crate::lossy_modular::ExtraSqueeze::new(
                 plane,
                 dim.xsize,
                 dim.ysize,

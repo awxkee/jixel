@@ -29,12 +29,12 @@
 
 //! Global learned trees for modular planes.
 
+use super::super::lz77::LZ77_MIN_SYMBOL;
+use super::super::ma_multiplier::{
+    SAFE_PREDICTORS, emit_forest_bfs, scale_ma_value_props, tokenize_channel_ma_mult,
+};
 use super::super::ma_sampling::sample_channel_ma;
 use super::super::ma_source::{MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES};
-use super::extra::divide_common_factor;
-use super::forest::{
-    LM_SAFE_PRED_MASK, emit_forest_bfs, scale_ma_value_props, tokenize_channel_ma_mult,
-};
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::Token;
 use crate::ma_tree::{MaLearnParams, MaSamples, NUM_MA_PREDS, PRED_WEIGHTED, learn_ma_tree};
@@ -112,7 +112,7 @@ pub(crate) fn learn_global_plane_tree(
         min_node: MA_MIN_NODE_SAMPLES,
         allow_wp: false,
         allowed_preds: if q > 1 {
-            LM_SAFE_PRED_MASK
+            SAFE_PREDICTORS
         } else {
             PLANE_PRED_MASK
         },
@@ -164,4 +164,28 @@ pub(crate) fn learn_global_plane_tree(
         tree_tokens,
         crop_tokens,
     }
+}
+
+/// Divide every value by their common factor; returns the factor (the leaf
+/// multiplier) and the coded alphabet's minimum symbol count.
+pub(crate) fn divide_common_factor(data: &mut [i32]) -> (u32, u32) {
+    let q = data.iter().fold(0, |g, &v| gcd(g, v.unsigned_abs())).max(1);
+    if q > 1 {
+        data.iter_mut().for_each(|v| *v /= q as i32);
+    }
+    let max_abs = data.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
+    let min_symbol = if value_bits <= 13 {
+        LZ77_MIN_SYMBOL
+    } else {
+        4 * value_bits + 24
+    };
+    (q, min_symbol)
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }

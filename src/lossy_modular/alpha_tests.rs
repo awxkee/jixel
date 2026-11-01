@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 11/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,9 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Tests for squeeze.
+//! Tests for the lossy extra channel.
 
-use super::extra::{ExtraSqueeze, closed_h_squeeze, closed_v_squeeze};
+use super::alpha::{ExtraSqueeze, closed_h_squeeze, closed_v_squeeze};
 use crate::encode_image::AlphaPlane;
 
 /// A soft-edged disc: the anti-aliased, feathered alpha lossy coding is for.

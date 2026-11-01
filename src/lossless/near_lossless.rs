@@ -45,10 +45,15 @@ pub(crate) fn quantize_planes(image: &mut Image3Si, max_value: i32, max_error: i
     if max_error <= 0 {
         return;
     }
+    // Samples are non-negative and the step is odd, so the nearest multiple
+    // is the rounded quotient (ties cannot occur) scaled back.
     let step = 2 * max_error + 1;
+    let quotients = crate::fast_divide::selected_rounded_quotients_fn();
     for c in 0..3 {
-        for v in image.plane_mut(c).as_mut_slice() {
-            *v = ((*v + max_error) / step * step).min(max_value);
+        let plane = image.plane_mut(c).as_mut_slice();
+        unsafe { quotients(plane, step) };
+        for v in plane {
+            *v = (*v * step).min(max_value);
         }
     }
 }
@@ -56,6 +61,27 @@ pub(crate) fn quantize_planes(image: &mut Image3Si, max_value: i32, max_error: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_matches_the_floor_formula_for_every_16_bit_value() {
+        let (w, h) = (256, 256);
+        for k in 1..=9 {
+            let step = 2 * k + 1;
+            let mut image = Image3Si::new(w, h);
+            for c in 0..3 {
+                for (i, v) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                    *v = (i as i32).min(65535);
+                }
+            }
+            let source = image.plane_mut(0).as_mut_slice().to_vec();
+            quantize_planes(&mut image, 65535, k);
+            for c in 0..3 {
+                for (&got, &v) in image.plane_mut(c).as_mut_slice().iter().zip(&source) {
+                    assert_eq!(got, ((v + k) / step * step).min(65535), "k={k} v={v}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn quantization_stays_within_the_bound_on_a_shared_grid() {
