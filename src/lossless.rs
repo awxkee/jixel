@@ -57,6 +57,7 @@ mod ma_encoding;
 mod ma_learning;
 mod ma_local;
 mod ma_lookup;
+mod ma_multiplier;
 mod ma_sampling;
 #[cfg(test)]
 #[path = "lossless/tests/ma_sampling_tests.rs"]
@@ -99,11 +100,38 @@ pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
 pub(crate) use rct::forward_ycocg;
-pub(crate) use squeeze::{
-    ExtraSqueeze, GlobalPlaneTree, LmPlainInput, StreamCrop, dc_frame_supported, encode_dc_frame,
-    encode_frame_lossy_modular_plain, encode_frame_lossy_modular_squeeze, learn_global_plane_tree,
-    lm_calibrated_distance, lm_plain_distance,
-};
+pub(crate) use squeeze::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
+
+/// The modular coding primitives [`crate::lossy_modular`] builds on: group
+/// geometry, MA sampling and trees, predictors, LZ77 and entropy sections,
+/// group and TOC writers, and the Squeeze transform entries.
+pub(crate) mod kit {
+    pub(crate) use super::groups::{group_lz_threads, write_lz_groups};
+    pub(crate) use super::header::{write_toc_entry, write_u64};
+    pub(crate) use super::lz77::{
+        LZ77_MIN_SYMBOL, LzToken, LzTokenSource, build_lz_pixel_code, build_lz_pixel_code_opts,
+        lz77_compress_for_speed, lz77_literals, write_lz_section, write_tree_lz77,
+    };
+    pub(crate) use super::ma_multiplier::{
+        SAFE_PREDICTORS, emit_forest_bfs, scale_ma_value_props, tokenize_channel_ma_mult,
+    };
+    pub(crate) use super::ma_sampling::{MaRefPlane, sample_channel_ma};
+    pub(crate) use super::ma_source::{
+        MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS,
+    };
+    pub(crate) use super::predictor::{
+        PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_plane,
+        fixed_predictor, selected_grad_pack_interior_fn, tokenize_plane_rows,
+    };
+    pub(crate) use super::rct::forward_ycocg;
+    pub(crate) use super::squeeze::{
+        GlobalPlaneTree, for_each_squeeze_group_crop, write_modular_transforms_rct_squeeze,
+        write_modular_transforms_squeeze_only,
+    };
+    pub(crate) use super::tree::{build_balanced_tree_tokens_mul, push_leaf_mul, push_split};
+    pub(crate) use super::{GROUP_DIM, GroupLayout, LF_GROUP_DIM};
+}
+
 #[cfg(feature = "splines")]
 pub(crate) use xyb::encode_modular_xyb_atlas_tree_slot;
 pub(crate) use xyb::{
@@ -117,7 +145,7 @@ use lz77::LZ77_MIN_SYMBOL;
 /// Modular group layout: the frame header's `group_size_shift`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GroupLayout {
-    shift: u32,
+    pub(crate) shift: u32,
     /// The frame header's `upsampling` (1, 2, 4 or 8): the frame is coded
     /// at the image size over this factor and the decoder scales it back
     /// with the kernel signaled in the image metadata.
@@ -156,9 +184,9 @@ impl GroupLayout {
     }
 }
 
-const GROUP_DIM: usize = GroupLayout::DEFAULT.dim();
+pub(crate) const GROUP_DIM: usize = GroupLayout::DEFAULT.dim();
 
-const LF_GROUP_DIM: usize = GroupLayout::DEFAULT.lf_dim();
+pub(crate) const LF_GROUP_DIM: usize = GroupLayout::DEFAULT.lf_dim();
 
 #[allow(clippy::too_many_arguments)]
 fn lossless_min_symbol(max_bits: u32) -> u32 {

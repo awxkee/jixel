@@ -301,7 +301,7 @@ pub(super) fn plan_global_extra_tree(
 /// streams keep their local trees. `None` when the local codings are smaller.
 pub(super) fn plan_global_squeeze_tree(
     ctx: &EncodingContext,
-    squeezed: &crate::lossless::ExtraSqueeze,
+    squeezed: &crate::lossy_modular::ExtraSqueeze,
     dim: &ImageDim,
     streams: &GlobalStreams<'_>,
     extra: &ExtraSections,

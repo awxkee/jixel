@@ -85,7 +85,7 @@ pub(super) fn emit_learned_tree(tree: &LearnedTree) -> (Vec<Token>, Vec<u32>, u3
 // All channels share the Gradient predictor with offset 0 and multiplier 1.
 // ---------------------------------------------------------------------------
 
-pub(super) fn push_split(out: &mut Vec<Token>, property: u32, split_val: i32) {
+pub(crate) fn push_split(out: &mut Vec<Token>, property: u32, split_val: i32) {
     out.push(Token::new(TREE_CTX_PROPERTY, property + 1));
     out.push(Token::new(TREE_CTX_SPLIT_VAL, pack_signed(split_val)));
 }
@@ -124,7 +124,7 @@ pub(super) fn build_balanced_tree_tokens_offsets(
 
 /// Leaf with a residual multiplier: the decoder reconstructs
 /// `pred + multiplier * residual` (multiplier = (mul_bits+1) << mul_log).
-pub(super) fn push_leaf_mul(out: &mut Vec<Token>, predictor: u32, multiplier: u32) {
+pub(crate) fn push_leaf_mul(out: &mut Vec<Token>, predictor: u32, multiplier: u32) {
     debug_assert!(multiplier >= 1);
     let mul_log = multiplier.trailing_zeros();
     let mul_bits = (multiplier >> mul_log) - 1;
@@ -137,7 +137,7 @@ pub(super) fn push_leaf_mul(out: &mut Vec<Token>, predictor: u32, multiplier: u3
 
 /// Balanced channel-split tree whose leaves carry per-channel residual
 /// multipliers (the lossy-modular quantization steps).
-pub(super) fn build_balanced_tree_tokens_mul(leaves: &[(u32, u32)]) -> Vec<Token> {
+pub(crate) fn build_balanced_tree_tokens_mul(leaves: &[(u32, u32)]) -> Vec<Token> {
     let n_leaves = leaves.len();
     let mut t = Vec::new();
     match n_leaves {

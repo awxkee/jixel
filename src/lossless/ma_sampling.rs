@@ -42,11 +42,11 @@ use crate::weighted_predictor::{WpNeighbors, WpParams, WpState};
 /// A previously coded channel of the same size as the one being walked,
 /// cropped like it: the source of the decoder's reference properties.
 #[derive(Clone, Copy)]
-pub(super) struct MaRefPlane<'a> {
-    pub(super) pixels: &'a [i32],
-    pub(super) stride: usize,
-    pub(super) x0: usize,
-    pub(super) y0: usize,
+pub(crate) struct MaRefPlane<'a> {
+    pub(crate) pixels: &'a [i32],
+    pub(crate) stride: usize,
+    pub(crate) x0: usize,
+    pub(crate) y0: usize,
 }
 
 /// libjxl `PrecomputeReferences`: per reference channel |v|, v, |v − g|,
@@ -273,7 +273,7 @@ pub(super) fn ma_channel_sample_count(w: usize, h: usize, stride: usize) -> usiz
 }
 
 /// Visit the selected pixels with residual tokens under every decoder predictor.
-pub(super) fn sample_channel_ma<'a, T: Copy + 'a>(
+pub(crate) fn sample_channel_ma<'a, T: Copy + 'a>(
     get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,

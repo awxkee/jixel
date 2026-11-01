@@ -45,7 +45,7 @@ use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::{WpNeighbors, WpParams};
 
 #[inline]
-pub(in crate::lossless) fn channel_to_context(chan: usize, nb_chans: usize) -> u32 {
+pub(crate) fn channel_to_context(chan: usize, nb_chans: usize) -> u32 {
     (nb_chans - 1 - chan) as u32
 }
 
@@ -446,7 +446,7 @@ pub(in crate::lossless) fn tokenize_plane(
 }
 
 /// Slice-backed planes avoid point fetches and temporary input rows.
-pub(in crate::lossless) fn tokenize_plane_rows<'a>(
+pub(crate) fn tokenize_plane_rows<'a>(
     ctx: u32,
     get_row: impl Fn(usize) -> &'a [i32],
     w: usize,

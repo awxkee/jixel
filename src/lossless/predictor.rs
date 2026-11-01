@@ -35,13 +35,12 @@ mod tests;
 mod tokens;
 mod weighted;
 
-pub(super) use cost::{
-    SqueezePredictorCost, choose_predictor_for_plane, choose_predictor_for_rows,
-    choose_predictors_with_wp, choose_wp_params,
-};
+pub(crate) use cost::{SqueezePredictorCost, choose_predictor_for_plane};
+pub(super) use cost::{choose_predictor_for_rows, choose_predictors_with_wp, choose_wp_params};
+pub(crate) use tokens::{channel_to_context, tokenize_plane_rows};
 pub(super) use tokens::{
-    channel_to_context, tokenize_all, tokenize_channels_with_wp, tokenize_plane,
-    tokenize_plane_rows, tokenize_runs_with_wp, tokenize_sample_rows,
+    tokenize_all, tokenize_channels_with_wp, tokenize_plane, tokenize_runs_with_wp,
+    tokenize_sample_rows,
 };
 pub(super) use weighted::{WP_CONTEXT_BUCKETS, WP_CONTEXT_CUTOFFS, WpChannelContexts};
 
@@ -60,7 +59,7 @@ const PREDICTOR_AVERAGE0: u32 = 3;
 
 const PREDICTOR_SELECT: u32 = 4;
 
-pub(super) const PREDICTOR_GRADIENT: u32 = 5;
+pub(crate) const PREDICTOR_GRADIENT: u32 = 5;
 
 pub(super) const PREDICTOR_WEIGHTED: u32 = 6;
 
@@ -90,7 +89,7 @@ static SLOW_PREDICTORS: [u32; 6] = [
 /// Fixed-predictor fallback used wherever Fast mode hardcodes Weighted;
 /// Gradient when the decoding-speed setting excludes the Weighted Predictor.
 #[inline]
-pub(super) fn fixed_predictor(use_wp: bool) -> u32 {
+pub(crate) fn fixed_predictor(use_wp: bool) -> u32 {
     if use_wp {
         PREDICTOR_WEIGHTED
     } else {
@@ -372,7 +371,7 @@ fn reset_wp_scratch(
     }
 }
 
-pub(super) trait TokenSink {
+pub(crate) trait TokenSink {
     fn push_token(&mut self, token: Token);
 
     fn extend_tokens(&mut self, tokens: impl Iterator<Item = Token>) {

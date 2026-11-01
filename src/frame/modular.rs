@@ -104,7 +104,7 @@ pub(super) fn lm_plain_input(
     coded: &Image3F,
     gray: bool,
     alpha: Option<&AlphaPlane>,
-) -> Option<crate::lossless::LmPlainInput> {
+) -> Option<crate::lossy_modular::PlainInput> {
     let n = coded.xsize() * coded.ysize();
     let max = LM_PLAIN_MAX;
     let quantize = |input: &[f32]| {
@@ -159,7 +159,7 @@ pub(super) fn lm_plain_input(
         Some(plane) => vec![(0..n).map(|i| plane.get_i32(i)).collect()],
         None => Vec::new(),
     };
-    Some(crate::lossless::LmPlainInput {
+    Some(crate::lossy_modular::PlainInput {
         color,
         extra: extra
             .into_iter()

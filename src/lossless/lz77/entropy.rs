@@ -125,14 +125,14 @@ fn lz_add_histograms<I>(
 
 /// Materialize literals for paths that own LZ tokens. Learned-tree candidates
 /// can instead use the original Token storage through LzTokenSource.
-pub(in crate::lossless) fn lz77_literals(tokens: &[Token]) -> Vec<LzToken> {
+pub(crate) fn lz77_literals(tokens: &[Token]) -> Vec<LzToken> {
     tokens
         .iter()
         .map(|t| LzToken::pixel(t.context, t.value))
         .collect()
 }
 
-pub(in crate::lossless) fn build_lz_pixel_code<'tokens, 'scratch, I>(
+pub(crate) fn build_lz_pixel_code<'tokens, 'scratch, I>(
     thorough: bool,
     streams: I,
     nb_chans: usize,
@@ -161,7 +161,7 @@ where
 /// the prefix-depth cost model cannot tell sub-bit histograms apart and
 /// collapses the clustering.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::lossless) fn build_lz_pixel_code_opts<'tokens, 'scratch, I>(
+pub(crate) fn build_lz_pixel_code_opts<'tokens, 'scratch, I>(
     thorough: bool,
     streams: I,
     nb_chans: usize,

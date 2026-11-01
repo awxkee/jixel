@@ -70,11 +70,11 @@ pub(crate) fn encode_frame(
                 return None;
             }
             let mut w = BitWriter::new();
-            let original_bits = crate::lossless::encode_frame_lossy_modular_plain(
+            let original_bits = crate::lossy_modular::encode_plain_frame(
                 &lm_plain_input(ctx, &coded, is_achromatic, alpha)?,
                 coded.xsize(),
                 coded.ysize(),
-                crate::lossless::lm_plain_distance(ctx.coding, distance)
+                crate::lossy_modular::plain_distance(ctx.coding, distance)
                     * lm_texture_factor(&linear),
                 ctx.speed,
                 &ctx.thread_pool,
@@ -135,7 +135,7 @@ pub(crate) fn encode_frame(
             || (ctx.lossy_modular == crate::LossyModular::Auto
                 && ctx.speed.effort().lossy_modular_auto))
     {
-        crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(&linear)
+        crate::lossy_modular::calibrated_distance(distance) * lm_texture_factor(&linear)
     } else {
         0.0
     };
@@ -152,7 +152,7 @@ pub(crate) fn encode_frame(
     // (Slow only) dual-encodes and keeps the smaller frame.
     if alpha.is_none() && ctx.lossy_modular == crate::LossyModular::Force {
         let mut modular_writer = BitWriter::new();
-        if crate::lossless::encode_frame_lossy_modular_squeeze(
+        if crate::lossy_modular::encode_xyb_frame(
             &xyb,
             modular_distance,
             ctx.speed,
@@ -171,7 +171,7 @@ pub(crate) fn encode_frame(
         && ctx.speed.effort().lossy_modular_auto
     {
         let mut modular_writer = BitWriter::new();
-        let original_modular_bits = crate::lossless::encode_frame_lossy_modular_squeeze(
+        let original_modular_bits = crate::lossy_modular::encode_xyb_frame(
             &xyb,
             modular_distance,
             ctx.speed,

@@ -1,5 +1,5 @@
 /*
- * // Copyright (c) Radzivon Bartoshyk 5/2026. All rights reserved.
+ * // Copyright (c) Radzivon Bartoshyk 11/2026. All rights reserved.
  * //
  * // Redistribution and use in source and binary forms, with or without modification,
  * // are permitted provided that the following conditions are met:
@@ -27,11 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Tests for squeeze.
+//! Tests for the plain-layout pyramids and their calibration.
 
-use super::quantize::{
-    LmLayout, LmPlainInput, interpolate_knots, lm_plain_distance, lm_quantize_plain,
-};
+use super::calibrate::{interpolate_knots, plain_distance};
+use super::layout::Layout;
+use super::pyramid::{PlainInput, Pyramid};
 
 use crate::coding::CodingTransform;
 
@@ -44,8 +44,8 @@ fn ramp(w: usize, h: usize, seed: i32) -> Vec<i32> {
         .collect()
 }
 
-fn input(coding: CodingTransform, color: usize, extra: Vec<(Vec<i32>, f32)>) -> LmPlainInput {
-    LmPlainInput {
+fn input(coding: CodingTransform, color: usize, extra: Vec<(Vec<i32>, f32)>) -> PlainInput {
+    PlainInput {
         color: (0..color).map(|c| ramp(64, 48, c as i32)).collect(),
         extra,
         max: 65535.0,
@@ -55,10 +55,10 @@ fn input(coding: CodingTransform, color: usize, extra: Vec<(Vec<i32>, f32)>) -> 
 
 #[test]
 fn ycbcr_layout_pre_squeezes_the_outer_planes() {
-    let q = lm_quantize_plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 64, 48, 8.0).unwrap();
+    let q = Pyramid::plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 64, 48, 8.0).unwrap();
     assert_eq!(
         q.layout,
-        LmLayout::Plain {
+        Layout::Plain {
             ycbcr: true,
             rct: false,
             extra: 0
@@ -81,10 +81,10 @@ fn ycbcr_layout_pre_squeezes_the_outer_planes() {
 
 #[test]
 fn rgb_layout_uses_the_rct_and_gray_neither() {
-    let q = lm_quantize_plain(&input(CodingTransform::Rgb, 3, Vec::new()), 64, 48, 8.0).unwrap();
+    let q = Pyramid::plain(&input(CodingTransform::Rgb, 3, Vec::new()), 64, 48, 8.0).unwrap();
     assert_eq!(
         q.layout,
-        LmLayout::Plain {
+        Layout::Plain {
             ycbcr: false,
             rct: true,
             extra: 0
@@ -97,10 +97,10 @@ fn rgb_layout_uses_the_rct_and_gray_neither() {
         .map(|s| s.begin_c)
         .collect();
     assert_eq!(pre, [1, 1, 2, 2]);
-    let g = lm_quantize_plain(&input(CodingTransform::Rgb, 1, Vec::new()), 64, 48, 8.0).unwrap();
+    let g = Pyramid::plain(&input(CodingTransform::Rgb, 1, Vec::new()), 64, 48, 8.0).unwrap();
     assert_eq!(
         g.layout,
-        LmLayout::Plain {
+        Layout::Plain {
             ycbcr: false,
             rct: false,
             extra: 0
@@ -113,7 +113,7 @@ fn rgb_layout_uses_the_rct_and_gray_neither() {
 fn extra_channels_follow_their_own_distance() {
     let lossless = (ramp(64, 48, 7), 0.0);
     let lossy = (ramp(64, 48, 9), 40.0);
-    let q = lm_quantize_plain(
+    let q = Pyramid::plain(
         &input(CodingTransform::YCbCr, 3, vec![lossless, lossy]),
         64,
         48,
@@ -122,7 +122,7 @@ fn extra_channels_follow_their_own_distance() {
     .unwrap();
     assert_eq!(
         q.layout,
-        LmLayout::Plain {
+        Layout::Plain {
             ycbcr: true,
             rct: false,
             extra: 2
@@ -140,7 +140,7 @@ fn extra_channels_follow_their_own_distance() {
         }
     }
     // Tiny frames have no pyramid.
-    assert!(lm_quantize_plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 8, 8, 8.0).is_none());
+    assert!(Pyramid::plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 8, 8, 8.0).is_none());
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn plain_distance_is_monotonic_and_flat_outside_the_knots() {
     for coding in [CodingTransform::YCbCr, CodingTransform::Rgb] {
         let mut last = 0.0;
         for d in [0.1, 0.5, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 6.0, 10.0] {
-            let e = lm_plain_distance(coding, d);
+            let e = plain_distance(coding, d);
             assert!(e > last, "{coding:?} d={d}");
             assert!(
                 e > d,
@@ -157,8 +157,8 @@ fn plain_distance_is_monotonic_and_flat_outside_the_knots() {
             last = e;
         }
         assert_eq!(
-            lm_plain_distance(coding, 0.5) * 2.0,
-            lm_plain_distance(coding, 1.0)
+            plain_distance(coding, 0.5) * 2.0,
+            plain_distance(coding, 1.0)
         );
     }
     assert_eq!(interpolate_knots(&[(1.0, 2.0), (3.0, 4.0)], 2.0), 3.0);

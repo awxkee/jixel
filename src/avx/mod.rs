@@ -35,6 +35,7 @@ mod coef_polish;
 mod color;
 mod dc_ops;
 mod dct;
+mod divide;
 mod entropy;
 mod frame;
 mod haar;
@@ -83,6 +84,7 @@ pub(crate) use dct::{
     dc_from_dct64x128_avx2, dc_from_dct128x64_avx2, dc_from_dct128x128_avx2, dct64x128_avx2,
     dct128x64_avx2, dct128x128_avx2, inv_dct64x128_avx2, inv_dct128x64_avx2, inv_dct128x128_avx2,
 };
+pub(crate) use divide::rounded_quotients_avx2;
 pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use haar::haar_rows_avx2;

@@ -39,24 +39,24 @@ mod tests;
 mod window_tests;
 mod write;
 
+pub(crate) use entropy::{build_lz_pixel_code, build_lz_pixel_code_opts, lz77_literals};
 pub(super) use entropy::{
-    build_lz_pixel_code, build_lz_pixel_code_opts, build_lz_pixel_code_tails, estimate_coded_bits,
-    estimate_literal_and_run_bits, estimate_literal_and_run_bits_single, estimate_streams_bits,
-    lz77_literals,
+    build_lz_pixel_code_tails, estimate_coded_bits, estimate_literal_and_run_bits,
+    estimate_literal_and_run_bits_single, estimate_streams_bits,
 };
 pub(super) use priced::{
     LiteralPrices, MatchPrices, PRICED_MAX_PROBES, lz77_compress_optimal, lz77_compress_priced,
 };
 pub(super) use write::{
-    write_local_tree_lz77, write_local_tree_lz77_offsets, write_lz_section, write_lz_section_tail,
-    write_tree_lz77,
+    write_local_tree_lz77, write_local_tree_lz77_offsets, write_lz_section_tail,
 };
+pub(crate) use write::{write_lz_section, write_tree_lz77};
 
 use crate::coder_scratch::{CoderScratch, LzEntropyScratch};
 use crate::entropy::{CompactToken, Token};
 use entropy::estimate_payload_bits;
 
-pub(super) const LZ77_MIN_SYMBOL: u32 = 64;
+pub(crate) const LZ77_MIN_SYMBOL: u32 = 64;
 
 pub(super) const LZ77_MIN_LENGTH: u32 = 3;
 
@@ -125,7 +125,7 @@ impl LzToken {
 
 /// Token storage used by the LZ entropy passes. Literal streams retain their
 /// wide or compact representation instead of expanding them to LzToken.
-pub(super) trait LzTokenSource: Copy + Sync {
+pub(crate) trait LzTokenSource: Copy + Sync {
     fn as_lz(self) -> LzToken;
 }
 
@@ -156,7 +156,7 @@ impl LzTokenSource for CompactToken {
 /// LZ77, and its context is clustered alone, so its histogram has one
 /// symbol and the decoder fills the channel without reading a symbol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ConstantTail {
+pub(crate) struct ConstantTail {
     pub(super) context: u32,
     pub(super) count: usize,
 }
@@ -538,7 +538,7 @@ impl RunLzWriter {
     }
 }
 
-pub(super) fn lz77_compress_for_speed(
+pub(crate) fn lz77_compress_for_speed(
     tokens: &[Token],
     distance_context: u32,
     speed: crate::Speed,

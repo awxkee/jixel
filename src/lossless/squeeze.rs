@@ -27,26 +27,12 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Progressive lossless modular Squeeze frames and transforms.
+//! Progressive lossless modular Squeeze frames, and the Squeeze transform
+//! entries and group crops the lossy modular coder shares.
 
-mod extra;
-#[cfg(test)]
-mod extra_squeeze_tests;
-mod fold_cost;
-mod forest;
-mod frame;
-#[cfg(test)]
-mod lm_plain_tests;
 mod plane;
-mod quantize;
 
-pub(crate) use extra::ExtraSqueeze;
-pub(crate) use frame::{
-    dc_frame_supported, encode_dc_frame, encode_frame_lossy_modular_plain,
-    encode_frame_lossy_modular_squeeze,
-};
 pub(crate) use plane::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
-pub(crate) use quantize::{LmPlainInput, lm_calibrated_distance, lm_plain_distance};
 
 use super::groups::{DeepLzScratchPool, group_lz_threads, write_lz_groups};
 use super::header::{write_frame_header_modular_kind, write_toc_entry};
@@ -61,7 +47,7 @@ use super::predictor::{
 use super::rct::write_rct_transform;
 use super::{GROUP_DIM, GroupLayout, LF_GROUP_DIM};
 use crate::bit_writer::BitWriter;
-use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS};
+use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::entropy::Token;
 use crate::image::Image3Si;
@@ -69,15 +55,12 @@ use crate::patches::ModularFrameKind;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
 
-/// Lossy-modular context budget: the pre-4096 scratch bound, kept so the
-/// lossless leaf cap can grow without perturbing this path's trees.
-const LM_MAX_CONTEXTS: usize = 1024;
-
-const _: () = assert!(LM_MAX_CONTEXTS <= LZ77_MAX_CONTEXTS);
-
 /// Transform list for RCT + a Squeeze with the given step sequence.
 /// Byte-exact to libjxl Transform/SqueezeParams field encoding.
-fn write_modular_transforms_rct_squeeze(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
+pub(crate) fn write_modular_transforms_rct_squeeze(
+    steps: &[crate::squeeze::SqueezeStep],
+    w: &mut BitWriter,
+) {
     // transforms count = 2 -> selector 2 + Bits(4)=0.
     w.write(2, 0b10);
     w.write(4, 0);
@@ -87,7 +70,10 @@ fn write_modular_transforms_rct_squeeze(steps: &[crate::squeeze::SqueezeStep], w
 
 /// Transform list holding a single Squeeze (XYB channels are already
 /// decorrelated, so no RCT precedes it).
-fn write_modular_transforms_squeeze_only(steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
+pub(crate) fn write_modular_transforms_squeeze_only(
+    steps: &[crate::squeeze::SqueezeStep],
+    w: &mut BitWriter,
+) {
     w.write(2, 0b01); // transforms count = 1 (Val(1))
     write_squeeze_transform_entry(steps, w);
 }
@@ -275,7 +261,7 @@ pub(super) fn encode_squeeze_single_group(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn for_each_squeeze_group_crop(
+pub(crate) fn for_each_squeeze_group_crop(
     channels: &[crate::squeeze::Channel],
     split: usize,
     gdim: usize,

@@ -35,6 +35,7 @@ mod coef_polish;
 mod color;
 mod dc_ops;
 mod dct;
+mod divide;
 mod entropy;
 mod haar;
 mod inflated_cost;
@@ -64,6 +65,7 @@ pub(crate) use dc_ops::{
     dc_error_row_sse41, reconstruct_dc_sse41,
 };
 
+pub(crate) use divide::rounded_quotients_sse41;
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use haar::haar_rows_sse41;
 pub(crate) use inflated_cost::{

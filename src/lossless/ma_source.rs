@@ -99,7 +99,7 @@ pub(super) const MA_DEEPEN_MIN_SAVINGS: f64 = 0.02;
 
 /// Bits a split must save (image domain) before it's kept. Growth is
 /// best-first, so this mostly prunes the tail once the leaf budget is spent.
-pub(super) const MA_SPLIT_COST_BITS: f32 = 100.0;
+pub(crate) const MA_SPLIT_COST_BITS: f32 = 100.0;
 
 /// Split cost of the final learns. Half the first-stage cost grows trees
 /// that code 0.4-2.2% smaller on nearly every photo, painting and UI screen
@@ -116,7 +116,7 @@ pub(super) const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
 pub(super) const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 
 /// Minimum samples in a node before it must become a leaf.
-pub(super) const MA_MIN_NODE_SAMPLES: usize = 128;
+pub(crate) const MA_MIN_NODE_SAMPLES: usize = 128;
 
 /// Grow-then-prune of palette index trees (`with_ma_prune`): growth split
 /// cost and minimum node, and the bits the prune charges per kept leaf.
@@ -300,7 +300,7 @@ macro_rules! with_ma_pixels {
 
 /// Split candidates for a photographic (RGB/RCT) source; palette index
 /// images overfit above `MA_PALETTE_CANDIDATES`.
-pub(super) const MA_PHOTO_CANDIDATES: usize = 32;
+pub(crate) const MA_PHOTO_CANDIDATES: usize = 32;
 
 /// Split candidates for a palette index image: more than this overfits the
 /// near-deterministic index.
