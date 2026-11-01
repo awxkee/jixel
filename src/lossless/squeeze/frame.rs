@@ -499,7 +499,7 @@ fn encode_lm_frame_impl(
         section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
         section.write(1, 0); // use_global_tree = 0
         section.write(1, 1); // wp_default = 1
-        layout.write_transforms(&steps, &mut section);
+        layout.write_transforms(steps, &mut section);
 
         let distance_ctx = nb as u32;
         let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
@@ -967,7 +967,7 @@ fn encode_lm_frame_impl(
         }
         (global_lz, dc_group_lz, ac_group_lz, pending)
     };
-    if let Some(cache) = cache.as_deref_mut() {
+    if let Some(cache) = cache {
         for block in pending {
             cache.retain(block);
         }
@@ -1007,7 +1007,7 @@ fn encode_lm_frame_impl(
     );
     sections[0].write(1, 1); // use_global_tree = 1
     sections[0].write(1, 1); // wp_default = 1
-    layout.write_transforms(&steps, &mut sections[0]);
+    layout.write_transforms(steps, &mut sections[0]);
     write_lz_section(
         &global_lz,
         distance_ctx,

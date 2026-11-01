@@ -936,6 +936,7 @@ pub(super) fn encode_frame_core(
                 dc: &mut dc_tokens_per_group,
                 meta: &mut meta_tokens_per_group,
                 dc_written: !use_dc_frame,
+                refinement: ans_refinement,
             },
             scratch,
         )

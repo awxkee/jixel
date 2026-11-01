@@ -308,6 +308,73 @@ impl ExtraSqueeze {
         self.write_group(VARDCT_GROUP_DIM, gx, gy, 0, 2, scratch, w);
     }
 
+    /// The AC-group channels coded through the frame's global tree: the fixed
+    /// context forest (one subtree per within-group slot, leaves carrying the
+    /// slot's step) and each AC group's pixel tokens under it. None when the
+    /// groups' slots do not hold the same channels, so one forest cannot
+    /// carry every group's steps. A forest learned over every group saves
+    /// up to 3 % more of the file but its deeper walk decodes up to 65 %
+    /// slower, so the fixed contexts serve every speed.
+    pub(crate) fn global_ac_forest(
+        &self,
+        num_groups: usize,
+        xsize_groups: usize,
+        pool: &ThreadPool,
+    ) -> Option<super::plane::GlobalPlaneTree> {
+        let crops: Vec<Vec<_>> = (0..num_groups)
+            .map(|g| {
+                let mut crops = Vec::new();
+                for_each_squeeze_group_crop(
+                    &self.channels,
+                    self.split,
+                    VARDCT_GROUP_DIM,
+                    g % xsize_groups,
+                    g / xsize_groups,
+                    0,
+                    2,
+                    |_within, c, rx0, ry0, rw, rh| crops.push((c, rx0, ry0, rw, rh)),
+                );
+                crops
+            })
+            .collect();
+        let slots: Vec<usize> = crops.first()?.iter().map(|&(c, ..)| c).collect();
+        if slots.is_empty()
+            || crops
+                .iter()
+                .any(|g| !g.iter().map(|&(c, ..)| c).eq(slots.iter().copied()))
+        {
+            return None;
+        }
+        let trees: Vec<LearnedTree> = slots.iter().map(|&c| context_tree(c)).collect();
+        let mults: Vec<u32> = slots.iter().map(|&c| self.quants[c]).collect();
+        let (tree_tokens, leaf_ctx, bases, _) = emit_slot_forest(&trees, &mults);
+        let crop_tokens = pool.map(crops.len(), |g| {
+            let mut tokens = Vec::new();
+            for (slot, &(c, rx0, ry0, rw, rh)) in crops[g].iter().enumerate() {
+                let ch = &self.channels[c];
+                let (data, stride) = (&ch.data, ch.w);
+                tokenize_channel_ma_mult(
+                    |y| &data[(ry0 + y) * stride + rx0..][..rw],
+                    rw,
+                    rh,
+                    slot as u32,
+                    0,
+                    self.quants[c] as i32,
+                    &trees[slot],
+                    &leaf_ctx,
+                    bases[slot],
+                    &[],
+                    &mut tokens,
+                );
+            }
+            tokens
+        });
+        Some(super::plane::GlobalPlaneTree {
+            tree_tokens,
+            crop_tokens,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_group(
         &self,

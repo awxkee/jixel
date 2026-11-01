@@ -231,3 +231,28 @@ fn exact_tail_removal_rejects_quantized_or_out_of_range_requests() {
         }
     }
 }
+
+/// The global forest codes every AC-group sample once, one token stream
+/// per AC group.
+#[test]
+fn global_ac_forest_covers_every_ac_sample() {
+    let (w, h) = (600, 520);
+    let plane = soft_disc(w, h);
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 1.5, true, true).unwrap();
+    let (xg, yg) = (w.div_ceil(256), h.div_ceil(256));
+    let ac_px: usize = squeezed
+        .channels
+        .iter()
+        .skip(squeezed.split)
+        .filter(|ch| ch.hshift.min(ch.vshift) <= 2)
+        .map(|ch| ch.w * ch.h)
+        .sum();
+    assert!(ac_px > 0);
+    let forest = squeezed
+        .global_ac_forest(xg * yg, xg, &crate::thread_pool::ThreadPool::new(2))
+        .unwrap();
+    assert_eq!(forest.crop_tokens.len(), xg * yg);
+    let coded: usize = forest.crop_tokens.iter().map(Vec::len).sum();
+    assert_eq!(coded, ac_px);
+    assert!(!forest.tree_tokens.is_empty());
+}

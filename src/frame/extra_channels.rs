@@ -38,6 +38,7 @@ use crate::encoding_context::EncodingContext;
 
 /// Modular data of the extra channel, coded ahead of the frame sections:
 /// the LfGlobal part, one part per DC group and one per AC group.
+#[derive(Clone)]
 pub(super) struct ExtraSections {
     pub(super) global: BitWriter,
     pub(super) lf: Vec<BitWriter>,
@@ -74,6 +75,8 @@ impl ExtraSections {
 pub(super) struct PreparedExtra {
     sections: ExtraSections,
     squeezed: Option<crate::lossless::ExtraSqueeze>,
+    /// The tail race's candidates when they are already coded.
+    folds: Vec<ExtraSections>,
     global_code_ans: bool,
 }
 
@@ -96,6 +99,16 @@ impl PreparedExtra {
         };
         let mut best = None;
         let mut best_size = original.serialized_size(color_bits, dim, last_pass);
+        if !self.folds.is_empty() {
+            for sections in self.folds {
+                let size = sections.serialized_size(color_bits, dim, last_pass);
+                if size < best_size {
+                    best = Some(sections);
+                    best_size = size;
+                }
+            }
+            return best.unwrap_or(original);
+        }
         // The earliest exact cutoff and one more H/V pair give different
         // coarse prediction contexts. Keep this search bounded at all speeds.
         for retained in [start, start + 2] {
@@ -276,6 +289,67 @@ fn squeezed_sections(
     ExtraSections { global, lf, ac }
 }
 
+/// The squeezed coding through the frame's global tree. The tail race picks
+/// the representation by its local coding; its AC groups then move onto the
+/// global tree where that beats every local coding. Otherwise the folds'
+/// local sections go on to the exact tail race.
+#[allow(clippy::too_many_arguments)]
+fn joint_squeezed(
+    ctx: &EncodingContext,
+    squeezed: crate::lossless::ExtraSqueeze,
+    local: ExtraSections,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    ans: bool,
+    streams: &mut extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+) -> PreparedExtra {
+    let folds: Vec<(crate::lossless::ExtraSqueeze, ExtraSections)> = squeezed
+        .exact_tail_start()
+        .map(|start| {
+            [start, start + 2]
+                .into_iter()
+                .filter_map(|retained| squeezed.without_exact_tail(retained))
+                .map(|fold| {
+                    let sections = squeezed_sections(
+                        ctx,
+                        &fold,
+                        dim,
+                        dc_group_coords,
+                        ans,
+                        Some((&squeezed, &local)),
+                        scratch,
+                    );
+                    (fold, sections)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let best = folds
+        .iter()
+        .min_by_key(|(_, sections)| sections.bits())
+        .filter(|(_, sections)| sections.bits() < local.bits());
+    let (rep, rep_sections) = best.map_or((&squeezed, &local), |(f, s)| (f, s));
+    if let Some(tree) =
+        extra_tree::plan_global_squeeze_tree(ctx, rep, dim, streams, rep_sections, scratch)
+    {
+        let mut sections = rep_sections.clone();
+        tree.apply(streams, &mut sections);
+        return PreparedExtra {
+            sections,
+            squeezed: None,
+            folds: Vec::new(),
+            global_code_ans: ans,
+        };
+    }
+    PreparedExtra {
+        sections: local,
+        squeezed: Some(squeezed),
+        folds: folds.into_iter().map(|(_, sections)| sections).collect(),
+        global_code_ans: ans,
+    }
+}
+
 /// Code the extra channel losslessly — through a Palette transform when it
 /// has few distinct values and that is smaller, and through the frame's
 /// global tree where that beats the fixed local trees — and, when the context
@@ -356,11 +430,27 @@ pub(super) fn prepare_extra_sections(
     .flatten();
     let lossless_bits = lossless.bits() - global_tree.as_ref().map_or(0, |t| t.saving());
     match lossy {
-        Some(lossy) if lossy.bits() < lossless_bits => PreparedExtra {
-            sections: lossy,
-            squeezed: squeezed.filter(|s| s.exact_tail_start().is_some()),
-            global_code_ans: ans,
-        },
+        Some(lossy) if lossy.bits() < lossless_bits => {
+            let squeezed = squeezed.expect("lossy sections come from a squeeze");
+            if ctx.speed.effort().extra_global_tree {
+                return joint_squeezed(
+                    ctx,
+                    squeezed,
+                    lossy,
+                    dim,
+                    dc_group_coords,
+                    ans,
+                    &mut streams,
+                    scratch,
+                );
+            }
+            PreparedExtra {
+                sections: lossy,
+                squeezed: squeezed.exact_tail_start().is_some().then_some(squeezed),
+                folds: Vec::new(),
+                global_code_ans: ans,
+            }
+        }
         _ => {
             if let Some(tree) = global_tree {
                 tree.apply(&mut streams, &mut lossless);
@@ -368,6 +458,7 @@ pub(super) fn prepare_extra_sections(
             PreparedExtra {
                 sections: lossless,
                 squeezed: None,
+                folds: Vec::new(),
                 global_code_ans: ans,
             }
         }

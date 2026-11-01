@@ -443,14 +443,16 @@ impl FitScratch {
         const MAX_BYTES: usize = 32 * 1024 * 1024;
         fn trim<T>(v: &mut Vec<T>) {
             if v.capacity() > MAX_BYTES / size_of::<T>() {
-                *v = Vec::new();
+                v.clear();
+                v.shrink_to_fit();
             }
         }
         trim(&mut self.slots);
         trim(&mut self.rows);
         trim(&mut self.pixels);
         if self.basis.capacity() > MAX_BYTES / size_of::<f64>() {
-            self.basis = Vec::new();
+            self.basis.clear();
+            self.basis.shrink_to_fit();
             self.basis_coeffs = 0;
         }
     }
