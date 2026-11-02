@@ -1801,6 +1801,12 @@ pub(crate) fn signaled_dc_step(channel: usize, multiplier: f32) -> f32 {
     crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(wire)) / (DC_QUANT[channel] * 128.0)
 }
 
+/// Canonicalize custom steps before quantization, so the encoder uses the
+/// same dequantization values that the decoder reads from the header.
+pub(crate) fn signaled_dc_steps(steps: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|c| signaled_dc_step(c, steps[c]))
+}
+
 /// The wire form of a frame's DC steps, or `None` for the defaults.
 pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
     (dc_step != [1.0; 3]).then(|| {
@@ -1836,7 +1842,7 @@ pub(crate) fn choose_dc_steps(
     // Y levels under `step_y`, and their rate.
     let mut y_price = DcGradientPrice::default();
     let mut quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
-        let factor_y = INV_DC_QUANT[1] / (base_step[1] * step_y) * scale_dc;
+        let factor_y = INV_DC_QUANT[1] / step_y * scale_dc;
         y_price.clear();
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_y.as_ref().unwrap();
@@ -1858,12 +1864,8 @@ pub(crate) fn choose_dc_steps(
     let mut current = vec![0i32; max_width];
     let mut b_price = DcGradientPrice::default();
     let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
-        let factor_b = INV_DC_QUANT[2] / (base_step[2] * step_b) * scale_dc;
-        let cfl = dc_cfl_factor(
-            [base_step[0], base_step[1] * step_y, base_step[2] * step_b],
-            ytob_dc,
-            cfl,
-        );
+        let factor_b = INV_DC_QUANT[2] / step_b * scale_dc;
+        let cfl = dc_cfl_factor([base_step[0], step_y, step_b], ytob_dc, cfl);
         b_price.clear();
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_b.as_ref().unwrap();
@@ -1881,11 +1883,10 @@ pub(crate) fn choose_dc_steps(
         .iter()
         .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
         .collect();
-    // Multipliers of the base step, rounded through the wire like the
-    // signaled steps they become.
+    // Keep the absolute decoded values: dividing by the base only to multiply
+    // it back can introduce another rounding before quantization.
     let steps_of = |channel: usize| {
-        candidates
-            .map(|step| signaled_dc_step(channel, base_step[channel] * step) / base_step[channel])
+        candidates.map(|step| signaled_dc_step(channel, base_step[channel] * step))
     };
     let (steps_y, steps_b) = (steps_of(1), steps_of(2));
     let mut costs = [[None; DC_STEP_CANDIDATES]; DC_STEP_CANDIDATES];
@@ -1925,14 +1926,16 @@ pub(crate) fn choose_dc_steps(
             }
         }
     }
-    if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base >= base {
+    let chosen = [base_step[0], steps_y[step_y], steps_b[step_b]];
+    // A custom X step already pays for all three DC values. Charge only
+    // the header bytes this choice adds to the incumbent frame.
+    let header_bits = DC_STEP_HEADER_BITS
+        * f64::from(
+            i32::from(dc_step_wire(chosen).is_some()) - i32::from(dc_step_wire(default).is_some()),
+        );
+    if best + header_bits + DC_STEP_MIN_GAIN * base >= base {
         return default;
     }
-    let chosen = [
-        base_step[0],
-        base_step[1] * steps_y[step_y],
-        base_step[2] * steps_b[step_b],
-    ];
     // A finer lattice can still reproduce the DC worse: a flat color that the
     // default step hits lands between two finer levels. Measure both on the
     // display, where the clamp also forgives any overshoot of white.
@@ -3067,6 +3070,33 @@ mod tests {
             crate::util::f16_bits_to_f32(wire[2]),
             DC_QUANT[2] * 128.0 * steps[2]
         );
+    }
+
+    #[test]
+    fn dc_steps_do_not_charge_an_existing_custom_header_again() {
+        // Removing one isolated rounding flip saves fewer than the 48 header
+        // bits. It is useful only when a custom X step already pays for them.
+        let flat = dc_group_with_sources(
+            |_, _| 100.0 / INV_DC_QUANT[1],
+            |x, y| {
+                let residual = if x == 20 && y == 20 { 40.51 } else { 40.49 };
+                (50.0 + residual) / INV_DC_QUANT[2]
+            },
+        );
+        let choose = |base| {
+            choose_dc_steps(
+                std::slice::from_ref(&flat),
+                &EncodingContext::default(),
+                1.0,
+                0,
+                base,
+                CflFrame::XYB,
+            )
+        };
+        assert_eq!(choose([1.0; 3]), [1.0; 3]);
+        let steps = choose([2.0, 1.0, 1.0]);
+        assert_eq!(steps[0], 2.0);
+        assert!(steps[1] < 1.0 || steps[2] < 1.0, "{steps:?}");
     }
 
     #[test]

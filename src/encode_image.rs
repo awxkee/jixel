@@ -1517,13 +1517,25 @@ fn select_ink_layered(
     let Some(plan) = plan else {
         return ordinary();
     };
+    // More inks leave fewer coverage entries in the shared palette. At high
+    // quality, silently capping the requested precision can flatten the rate
+    // curve even when the source is an exact ink/background mixture.
+    if config.distance < 1.0
+        && ink_levels(config.distance, 1) > (255 / plan.inks.len().max(1)) as u32
+    {
+        drop(plan);
+        return ordinary();
+    }
     // Repeated-glyph patches may code thin text better than the ink frame,
     // and the model does not see them: the plain encode decides, and the
     // stack has no quality edge over patched text to pay for.
     let glyph_text = plan.glyph_text && config.patches;
     // Only the bytes outlive the stack: release its planes and context before
     // the plain encode allocates its own.
-    let stack = InkStack::new(plan, width, height, config, alpha, budget)?.bytes;
+    let Some(stack) = InkStack::new(plan, width, height, config, alpha, budget)? else {
+        return ordinary();
+    };
+    let stack = stack.bytes;
     if !glyph_text && stack.len() as f64 <= budget {
         return Ok(stack);
     }
@@ -1571,7 +1583,7 @@ impl InkStack {
         config: &EncodeConfig,
         alpha: Option<&AlphaPlane>,
         budget: f64,
-    ) -> Result<Self, EncodeError> {
+    ) -> Result<Option<Self>, EncodeError> {
         let mut scratch = Box::<CoderScratch>::default();
         let (ctx, base_frame) = encode_ink_base(
             &plan.base,
@@ -1596,18 +1608,29 @@ impl InkStack {
         };
         // The coverage precision follows the distance, then drops until the
         // modeled VarDCT size, within the model's margin, covers the stack;
-        // the hard mask stands last.
+        // the hard mask stands last from distance 1. Below it, keep at least
+        // the coverage precision of twice the requested distance, like the
+        // vector layer path, or leave the image to the ordinary encoder.
         let budget = budget * crate::vector_layers::VARDCT_BYTES_MARGIN;
         let mut levels = ink_levels(config.distance, stack.inks.len());
+        let floor = if config.distance < 1.0 {
+            ink_levels(2.0 * config.distance, stack.inks.len())
+        } else {
+            1
+        };
         loop {
             stack.bytes = stack.assemble(config, alpha, levels, &mut scratch)?;
             if stack.bytes.len() as f64 <= budget || levels == 1 {
-                return Ok(stack);
+                return Ok(Some(stack));
+            }
+            if levels == floor {
+                return Ok(None);
             }
             levels = [7, 5, 3, 2, 1]
                 .into_iter()
                 .find(|&l| l < levels)
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .max(floor);
         }
     }
 
@@ -3885,6 +3908,73 @@ mod tests {
 #[cfg(test)]
 mod encode_smoke_tests {
     use super::*;
+
+    /// Sixteen exact inks with exact half-coverage edges. Their source-domain
+    /// flattening error is zero, so only coverage precision can reject them.
+    fn many_ink_half_coverage_fixture() -> Vec<u8> {
+        let mut rgb = vec![255u8; 256 * 256 * 3];
+        let mut slot = 0;
+        for r in [1u8, 65] {
+            for g in [1u8, 65] {
+                for b in [1u8, 65, 129, 193] {
+                    let ink = [r, g, b];
+                    let x0 = (slot % 4) * 64 + 5;
+                    let y0 = (slot / 4) * 64 + 3;
+                    for line in 0..3 {
+                        for y in y0..y0 + 57 {
+                            let x = x0 + line * 17 + (y - y0) / 16;
+                            for dx in 0..5 {
+                                let color = if dx == 0 || dx == 4 {
+                                    ink.map(|c| ((255 + u16::from(c)) / 2) as u8)
+                                } else {
+                                    ink
+                                };
+                                let i = (y * 256 + x + dx) * 3;
+                                rgb[i..i + 3].copy_from_slice(&color);
+                            }
+                        }
+                    }
+                    slot += 1;
+                }
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn high_quality_ink_palette_capacity_preserves_the_plain_path() {
+        let rgb = many_ink_half_coverage_fixture();
+        for distance in [0.05, 0.1, 0.3] {
+            let config = EncodeConfig::default()
+                .with_speed(Speed::Medium)
+                .with_distance(distance)
+                .with_num_threads(1)
+                .with_patches(false)
+                .with_vector_layers(false);
+            let inked = encode_image(&rgb, 256, 256, &config).unwrap();
+            let plain = encode_image(&rgb, 256, 256, &config.with_ink_layer(false)).unwrap();
+            assert_eq!(inked, plain, "distance {distance}");
+        }
+    }
+
+    #[test]
+    fn high_quality_ink_budget_cannot_fall_back_to_a_hard_mask() {
+        let rgb = many_ink_half_coverage_fixture();
+        let pool = crate::thread_pool::ThreadPool::new(1);
+        for (distance, accepted) in [(0.6, false), (1.0, true)] {
+            let plan = crate::ink_layer::InkCandidates::new_fast(&rgb, None, 256, 256, &pool)
+                .unwrap()
+                .select(distance)
+                .unwrap();
+            assert_eq!(plan.inks.len(), 16);
+            let config = EncodeConfig::default()
+                .with_speed(Speed::Medium)
+                .with_distance(distance)
+                .with_num_threads(1);
+            let stack = InkStack::new(plan, 256, 256, &config, None, 0.0).unwrap();
+            assert_eq!(stack.is_some(), accepted, "distance {distance}");
+        }
+    }
 
     #[test]
     fn palette_ink_is_deterministic_across_workers_and_preserves_plain_fallback() {

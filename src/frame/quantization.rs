@@ -144,7 +144,7 @@ pub(super) fn compute_distance_params(distance: f32) -> DistanceParams {
         dc_step: {
             // Chroma DC steps are relative to the luma step; keep them absolute.
             let [x, y, b] = chroma_dc_steps(qdc_fine);
-            [x / coarsen, y, b / coarsen]
+            crate::color_correlation::signaled_dc_steps([x / coarsen, y, b / coarsen])
         },
     }
 }
@@ -255,14 +255,15 @@ pub(super) fn dc_steps_in_range(base: [f32; 3], scale_dc: f32, coded: &Image3F) 
     let peak = (0..3)
         .flat_map(|c| coded.plane_data(c).iter())
         .fold(0.0f32, |m, &v| m.max(v.abs()));
-    std::array::from_fn(|c| {
+    let steps = std::array::from_fn(|c| {
         let level = peak * crate::quant_weights::INV_DC_QUANT[c] * scale_dc / base[c];
         if level > DC_LEVEL_LIMIT {
             base[c] * level / DC_LEVEL_LIMIT
         } else {
             base[c]
         }
-    })
+    });
+    crate::color_correlation::signaled_dc_steps(steps)
 }
 
 #[cfg(test)]
@@ -270,12 +271,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dc_steps_match_the_signaled_dequantizer_before_quantization() {
+        assert_eq!(
+            crate::color_correlation::signaled_dc_steps([1.0; 3]),
+            [1.0; 3]
+        );
+        let check = |steps: [f32; 3]| {
+            let wire = crate::color_correlation::dc_step_wire(steps).unwrap();
+            for c in 0..3 {
+                let decoded = crate::util::f16_bits_to_f32(wire[c])
+                    / (crate::quant_weights::DC_QUANT[c] * 128.0);
+                assert_eq!(steps[c], decoded, "channel {c}");
+            }
+            assert_eq!(crate::color_correlation::signaled_dc_steps(steps), steps);
+        };
+        // The luma-coarsening band and the high-distance chroma growth both
+        // produce values that cannot be represented directly in the header.
+        for distance in [1.4, 2.0, 4.5, 6.0, 11.0, 25.0] {
+            check(compute_distance_params(distance).dc_step);
+        }
+        let mut coded = Image3F::new(8, 8);
+        assert_eq!(dc_steps_in_range([1.0; 3], 1.0, &coded), [1.0; 3]);
+        for c in 0..3 {
+            coded.plane_mut(c).as_mut_slice().fill(1.234_567);
+        }
+        check(dc_steps_in_range([1.0; 3], 100.0, &coded));
+    }
+
+    #[test]
     fn chroma_dc_steps_grow_slower_than_luma_past_the_knee() {
         for d in [0.1, 1.0, 2.0, 3.0, CHROMA_DC_GROWTH_DISTANCE] {
             let k = luma_dc_coarsening(d);
             assert_eq!(
                 compute_distance_params(d).dc_step,
-                [X_DC_STEP / k, 1.0, 1.0 / k],
+                crate::color_correlation::signaled_dc_steps([X_DC_STEP / k, 1.0, 1.0 / k]),
                 "d={d}"
             );
         }

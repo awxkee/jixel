@@ -60,6 +60,10 @@ const MIN_CORE_SHARE: f32 = 0.005;
 /// color above which the lines are painted, textured or soft highlights, not
 /// inked: inks with their antialiasing sit at 5-16, soft highlights at 40.
 const MAX_INK_SQUARE: f32 = 24.0;
+/// Below this distance, tighten the flat-color and band residual limits to
+/// preserve the near-lossless endpoint. At ordinary high quality, lifting
+/// slightly varying ink avoids spending AC coefficients on its sharp edges.
+const INK_PRECISION_DISTANCE: f32 = 0.5;
 /// Mean squared residual (summed over channels) of the band pixels from the
 /// mix of their ink and surroundings above which the antialiasing is not a
 /// mix at all (soft highlights at 92) and VarDCT keeps it; inks sit at 0-12,
@@ -245,6 +249,7 @@ fn joint_split(
     distance: f32,
 ) -> Option<InkLayers> {
     let n = rgb.len();
+    let precision = (distance / INK_PRECISION_DISTANCE).min(1.0).powi(2);
     queue.clear();
     let mut buckets = vec![0u32; 32 * 32 * 32];
     for (k, plan) in plans.iter().enumerate() {
@@ -349,7 +354,7 @@ fn joint_split(
         // A stroke is one color: a component that drifts from the ink is a
         // fill or gradient the growth flooded, and stays in the base.
         if queue.len() < if plans[k].local { 4 } else { MIN_COMPONENT }
-            || square as f32 > MAX_INK_SQUARE * distance.min(1.0).powi(2) * queue.len() as f32
+            || square as f32 > MAX_INK_SQUARE * precision * queue.len() as f32
         {
             for &i in queue.iter() {
                 state[i] = 0;
@@ -418,8 +423,7 @@ fn joint_split(
             gain[k] += edge * 0.35 - 2.0;
         }
     }
-    // Below distance 1 the flat ink must match the finer quantizer.
-    let precision = distance.min(1.0).powi(2);
+    // Near the lossless endpoint the flat ink must match the finer quantizer.
     let valid = |k: usize| {
         let share = if plans[k].local {
             0.0005
@@ -1022,6 +1026,30 @@ pub(crate) fn ridge_row_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slightly_varying_ink_is_lifted_at_high_quality_but_not_near_lossless() {
+        let (width, height) = (128, 64);
+        let rgb: Vec<_> = (0..height)
+            .flat_map(|y| {
+                (0..width).flat_map(move |x| {
+                    [if (30..34).contains(&x) {
+                        if y % 2 == 0 { 18 } else { 22 }
+                    } else {
+                        220
+                    }; 3]
+                })
+            })
+            .collect();
+        let select = |distance| {
+            InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
+                .unwrap()
+                .select(distance)
+        };
+        let plan = select(0.6).expect("slight ink variation should not force VarDCT edges");
+        assert_ne!(plan.ink[32 * width + 31], 0);
+        assert!(select(0.1).is_none(), "near-lossless ink must stay precise");
+    }
 
     #[test]
     fn fast_joint_palette_covers_border_strokes_and_preserves_nonopaque_pixels() {
