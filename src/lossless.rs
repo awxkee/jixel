@@ -106,6 +106,7 @@ pub(crate) use squeeze::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
 /// geometry, MA sampling and trees, predictors, LZ77 and entropy sections,
 /// group and TOC writers, and the Squeeze transform entries.
 pub(crate) mod kit {
+    pub(crate) use super::GroupLayout;
     pub(crate) use super::groups::{group_lz_threads, write_lz_groups};
     pub(crate) use super::header::{write_toc_entry, write_u64};
     pub(crate) use super::lz77::{
@@ -130,7 +131,6 @@ pub(crate) mod kit {
         write_modular_transforms_squeeze_only,
     };
     pub(crate) use super::tree::{build_balanced_tree_tokens_mul, push_leaf_mul, push_split};
-    pub(crate) use super::{GROUP_DIM, GroupLayout, LF_GROUP_DIM};
 }
 
 #[cfg(feature = "splines")]

@@ -60,7 +60,7 @@ pub(super) fn write_frame(
     cache: Option<&mut TreeCache>,
 ) {
     let min_symbol = min_symbol(p);
-    let grid = Grid::new(p.xsize, p.ysize);
+    let grid = Grid::new(p);
     // One group: the fixed-predictor single path or the learned forest.
     // Learned contexts take 256x256 crops and thumbnails -9.3 % at Slow and
     // -25.8 % at Fast (same pixels, 12 images x 3 distances); the single path

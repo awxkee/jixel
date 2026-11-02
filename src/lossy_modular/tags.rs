@@ -38,7 +38,7 @@
 //! same in every group.
 
 use super::pyramid::Pyramid;
-use crate::lossless::kit::{GROUP_DIM, LF_GROUP_DIM, MaRefPlane, for_each_squeeze_group_crop};
+use crate::lossless::kit::{MaRefPlane, for_each_squeeze_group_crop};
 use crate::ma_tree::MA_REF_CHANNELS;
 use crate::squeeze::Channel;
 
@@ -51,14 +51,15 @@ pub(super) struct Grid {
 }
 
 impl Grid {
-    pub(super) fn new(xsize: usize, ysize: usize) -> Self {
-        let xsize_groups = xsize.div_ceil(GROUP_DIM);
-        let xsize_dc_groups = xsize.div_ceil(LF_GROUP_DIM);
+    pub(super) fn new(p: &Pyramid) -> Self {
+        let (dim, lf_dim) = (p.group_dim(), p.lf_group_dim());
+        let xsize_groups = p.xsize.div_ceil(dim);
+        let xsize_dc_groups = p.xsize.div_ceil(lf_dim);
         Self {
             xsize_groups,
-            num_ac_groups: xsize_groups * ysize.div_ceil(GROUP_DIM),
+            num_ac_groups: xsize_groups * p.ysize.div_ceil(dim),
             xsize_dc_groups,
-            num_dc_groups: xsize_dc_groups * ysize.div_ceil(LF_GROUP_DIM),
+            num_dc_groups: xsize_dc_groups * p.ysize.div_ceil(lf_dim),
         }
     }
 }
@@ -117,7 +118,7 @@ impl Tags {
         let nb = channels.len();
         let split = channels
             .iter()
-            .position(|c| c.w > GROUP_DIM || c.h > GROUP_DIM)
+            .position(|c| c.w > p.group_dim() || c.h > p.group_dim())
             .unwrap_or(nb);
         let min_shift = |c: usize| channels[c].hshift.min(channels[c].vshift);
         let dc_slot_channels: Vec<usize> = (split..nb).filter(|&c| min_shift(c) >= 3).collect();
@@ -136,7 +137,7 @@ impl Tags {
             channel,
             quants,
             dc: GroupStreams {
-                dim: LF_GROUP_DIM,
+                dim: p.lf_group_dim(),
                 per_row: grid.xsize_dc_groups,
                 count: grid.num_dc_groups,
                 min_shift: 3,
@@ -144,7 +145,7 @@ impl Tags {
                 first_tag: split,
             },
             ac: GroupStreams {
-                dim: GROUP_DIM,
+                dim: p.group_dim(),
                 per_row: grid.xsize_groups,
                 count: grid.num_ac_groups,
                 min_shift: 0,
@@ -156,6 +157,18 @@ impl Tags {
 
     pub(super) fn len(&self) -> usize {
         self.channel.len()
+    }
+
+    /// The decoder's stream id (MA property 1) of group `group` of tag
+    /// `t`'s stream kind; 0 for the global stream. Trained and tokenized
+    /// with it, a tag's tree can split by region: -0.64 % bytes at Fast's
+    /// 256-pixel groups, -0.09 % at Slow's 1024 (same pixels).
+    pub(super) fn stream_id(&self, t: usize, group: usize) -> i32 {
+        match self.stream(t) {
+            0 => 0,
+            1 => (1 + self.dc.count + group) as i32,
+            _ => crate::lossless::ac_stream_id(self.dc.count, group),
+        }
     }
 
     /// Tag `t`'s stream kind: 0 = global, 1 = DC group, 2 = AC group.

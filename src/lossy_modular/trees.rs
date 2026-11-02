@@ -53,6 +53,11 @@ const MAX_CONTEXTS: usize = 1024;
 
 const _: () = assert!(MAX_CONTEXTS <= LZ77_MAX_CONTEXTS);
 
+/// The gate's price of one leaf beyond its tree tokens. Leaves become
+/// contexts that the entropy code clusters, so they cost the context map
+/// and some clustering loss, not a histogram each.
+const LEAF_BITS: f64 = 50.0;
+
 /// Odd sampling stride that keeps a channel of `px` samples near
 /// `SAMPLE_TARGET` samples.
 fn sample_stride(px: usize) -> usize {
@@ -100,11 +105,11 @@ fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
         for group in 0..streams.count {
             streams.for_each_crop(p, tags.split, group, |slot, channel, x0, y0, cw, chh| {
                 if streams.first_tag + slot == t {
-                    crops.push((channel, x0, y0, cw, chh));
+                    crops.push((group, channel, x0, y0, cw, chh));
                 }
             });
         }
-        for (channel, x0, y0, cw, chh) in crops {
+        for (group, channel, x0, y0, cw, chh) in crops {
             let crop = &p.channels[channel];
             let refs = refs.of_group(&p.channels, tags.split, channel, x0, y0);
             sample_channel_ma(
@@ -112,7 +117,7 @@ fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
                 cw,
                 chh,
                 tags.chan(t),
-                0,
+                tags.stream_id(t, group),
                 &refs,
                 WpParams::DEFAULT,
                 false,
@@ -197,7 +202,7 @@ pub(super) fn learn(
             scratch,
         );
         let n_leaves = tree.nodes.len().div_ceil(2);
-        let overhead_bits = tree.nodes.len() as f64 * 10.0 + n_leaves as f64 * 200.0;
+        let overhead_bits = tree.nodes.len() as f64 * 10.0 + n_leaves as f64 * LEAF_BITS;
         let est_real = tree.est_bits * stride as f64 + overhead_bits;
         let flat_real = tree.flat_bits * stride as f64;
         if est_real < flat_real {
