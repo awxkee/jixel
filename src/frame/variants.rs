@@ -194,6 +194,11 @@ impl GlyphStage {
     pub(super) fn atlas_bits(&self) -> usize {
         self.atlas.bits_written()
     }
+
+    /// The coded atlas frame, the image less the patches, and the dictionary.
+    pub(super) fn into_parts(self) -> (BitWriter, Image3F, Vec<crate::patches::PatchReference>) {
+        (self.atlas, self.base, self.references)
+    }
 }
 
 /// One patched or regular VarDCT frame, with or without Replace `tiles`.

@@ -56,7 +56,9 @@ mod vardct;
 mod vardct_encoder;
 mod variants;
 
-pub(crate) use chroma::{ChromaGradientSumsFn, selected_chroma_gradient_sums_fn};
+pub(crate) use chroma::{
+    ChromaGradientSumsFn, is_screen_content, selected_chroma_gradient_sums_fn,
+};
 pub(crate) use dc_tokens::{
     DC_PREDICTOR_WEIGHTED, DcPlanePrice, collect_dc_tokens_with_gradient, price_dc_plane,
     write_context_tree, write_tree_tokens,

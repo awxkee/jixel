@@ -39,9 +39,10 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::Token;
 use crate::lossless::kit::{
-    PREDICTOR_GRADIENT, SqueezePredictorCost, build_balanced_tree_tokens_mul, build_lz_pixel_code,
-    channel_to_context, choose_predictor_for_plane, fixed_predictor, lz77_compress_for_speed,
-    selected_grad_pack_interior_fn, tokenize_plane_rows, write_lz_section, write_tree_lz77,
+    PREDICTOR_GRADIENT, SqueezePredictorCost, build_balanced_tree_tokens_mul,
+    build_lz_pixel_code_ans, channel_to_context, choose_predictor_for_plane, fixed_predictor,
+    lz77_compress_for_speed, selected_grad_pack_interior_fn, tokenize_plane_rows, write_lz_section,
+    write_tree_lz77,
 };
 use crate::thread_pool::ThreadPool;
 
@@ -104,7 +105,7 @@ pub(crate) fn write_frame(
     }
 
     p.write_frame_header(writer);
-    let mut section = BitWriter::new();
+    let mut section = p.patch_dictionary(scratch).unwrap_or_default();
     p.layout.write_dc_quant(&mut section);
     section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
     section.write(1, 0); // use_global_tree = 0
@@ -113,12 +114,13 @@ pub(crate) fn write_frame(
 
     let distance_ctx = nb as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
-    let code = build_lz_pixel_code(
+    let code = build_lz_pixel_code_ans(
         speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz_tokens.as_slice()),
         nb,
         min_symbol,
         speed.effort().lz_refined_entropy,
+        false,
         &mut scratch.lz_entropy,
         &mut scratch.huffman_pool,
     );

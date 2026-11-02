@@ -37,12 +37,12 @@ use crate::ma_tree::{LearnedTree, MaNode};
 
 /// Per-tag MA sample budget; more samples plateaued (<=0.6%) in the 2026-09
 /// knob sweeps, as did larger leaf budgets and split-candidate counts.
-pub(super) const SAMPLE_TARGET: usize = 1 << 16;
+pub(crate) const SAMPLE_TARGET: usize = 1 << 16;
 
 /// Learned-subtree leaf budget: pixels/div, clamped.
-pub(super) const BUDGET_DIV: usize = 1024;
+pub(crate) const BUDGET_DIV: usize = 1024;
 
-pub(super) const BUDGET_CAP: usize = 256;
+pub(crate) const BUDGET_CAP: usize = 256;
 
 /// Merge the per-tag learned subtrees under the stream/channel routing
 /// skeleton and BFS-emit the whole forest, stamping every leaf with its tag's
@@ -52,7 +52,7 @@ pub(super) const BUDGET_CAP: usize = 256;
 /// ordered [global channels][DC slots][AC slots]. Returns the tree tokens,
 /// the arena-indexed leaf context table, each tag's arena base, and the
 /// context count.
-pub(super) fn emit_forest(
+pub(crate) fn emit_forest(
     trees: &[LearnedTree],
     tag_mults: &[u32],
     split: usize,

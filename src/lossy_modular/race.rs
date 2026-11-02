@@ -130,7 +130,15 @@ mod tests {
                 coding: CodingTransform::Rgb,
             };
             for alignment in 0..8 {
-                let quantized = Pyramid::plain(&input, w, h, 6.0).unwrap();
+                let quantized = Pyramid::plain(
+                    &input,
+                    w,
+                    h,
+                    6.0,
+                    false,
+                    &crate::thread_pool::ThreadPool::new(1),
+                )
+                .unwrap();
                 if flat {
                     // Ensure the alignment test reaches the full trial as
                     // well as the coarse screen's direct-encoding fallback.
@@ -186,7 +194,15 @@ mod tests {
             max: 65535.0,
             coding: CodingTransform::Rgb,
         };
-        let mut quantized = Pyramid::plain(&input, w, h, 6.0).unwrap();
+        let mut quantized = Pyramid::plain(
+            &input,
+            w,
+            h,
+            6.0,
+            false,
+            &crate::thread_pool::ThreadPool::new(1),
+        )
+        .unwrap();
         let pool = ThreadPool::new(1);
         let mut scratch = CoderScratch::default();
         let mut cache = TreeCache::new(&quantized);

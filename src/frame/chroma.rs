@@ -35,6 +35,13 @@ use crate::image::Image3F;
 
 /// Fraction of exactly constant 8x8 blocks above which a frame is screen content.
 const SCREEN_CONTENT_CONSTANT_BLOCKS: f32 = 0.15;
+/// Screen content (UI, text, flat-colour graphics): enough exactly constant
+/// 8x8 blocks. Photos measure at most 0.02, screenshots and illustrations
+/// 0.17-0.88.
+pub(crate) fn is_screen_content(xyb: &Image3F) -> bool {
+    constant_block_fraction(xyb) >= SCREEN_CONTENT_CONSTANT_BLOCKS
+}
+
 /// Fraction of whole 8x8 blocks whose three XYB planes are each constant.
 /// Identical input pixels map to identical XYB values, so the test is exact.
 fn constant_block_fraction(xyb: &Image3F) -> f32 {
@@ -430,7 +437,7 @@ pub(super) fn configure_chroma(
     }
 
     apply_point_chroma_policy(ctx, distp, content, is_achromatic);
-    ctx.set_screen_content(constant_block_fraction(xyb) >= SCREEN_CONTENT_CONSTANT_BLOCKS);
+    ctx.set_screen_content(is_screen_content(xyb));
 }
 
 #[cfg(test)]

@@ -36,14 +36,29 @@
 
 use crate::coding::CodingTransform;
 
-/// XYB layout factors, fitted on the 8-image Kodak pilot.
-static XYB_KNOTS: [(f32, f32); 6] = [
-    (1.0, 1.324),
-    (1.5, 1.851),
-    (2.0, 2.259),
-    (3.0, 2.466),
-    (4.0, 2.504),
-    (5.0, 2.350),
+/// XYB layout factors:
+static XYB_KNOTS: [(f32, f32); 7] = [
+    (1.0, 1.247),
+    (1.25, 1.311),
+    (1.5, 1.546),
+    (1.75, 1.902),
+    (2.0, 2.211),
+    (3.0, 2.533),
+    (4.5, 2.570),
+];
+
+/// XYB layout factors on screen content ([`crate::frame::is_screen_content`],
+/// coded on [`super::quantize::SCREEN_ROW_MUL`]): the same fit over 22
+/// screenshots and illustrations, finer than photos at d 1 and coarser from
+/// d 2.
+static XYB_SCREEN_KNOTS: [(f32, f32); 7] = [
+    (1.0, 1.153),
+    (1.25, 1.340),
+    (1.5, 1.684),
+    (1.75, 2.029),
+    (2.0, 2.479),
+    (3.0, 2.625),
+    (4.5, 2.923),
 ];
 
 /// Plain-layout factors of RGB frames (coded through YCoCg).
@@ -66,9 +81,15 @@ static YCBCR_KNOTS: [(f32, f32); 6] = [
     (5.0, 3.766),
 ];
 
-/// The XYB layout's quantizer distance for the caller's `d`.
-pub(crate) fn calibrated_distance(d: f32) -> f32 {
-    d * interpolate_knots(&XYB_KNOTS, d)
+/// The XYB layout's quantizer distance for the caller's `d`, on `screen`
+/// content or not.
+pub(crate) fn calibrated_distance(d: f32, screen: bool) -> f32 {
+    let knots: &[(f32, f32)] = if screen {
+        &XYB_SCREEN_KNOTS
+    } else {
+        &XYB_KNOTS
+    };
+    d * interpolate_knots(knots, d)
 }
 
 /// The plain layout's quantizer distance for the caller's `d`, fitted at

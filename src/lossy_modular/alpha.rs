@@ -34,6 +34,7 @@
 //! the arm's luma step table and the forest's scale-safe tokenizer; unlike
 //! the arm, it quantizes residuals closed-loop against the decoded averages.
 
+use super::closed_loop::{Rounding, closed_h_squeeze, closed_v_squeeze};
 use super::forest::{BUDGET_CAP, BUDGET_DIV, SAMPLE_TARGET};
 use super::layout::XYB_SCALE;
 use super::quantize::{SQUEEZE_QUALITY_FACTOR_XYB, SQUEEZE_XYB_QTABLE, quantize_channel_divide};
@@ -98,7 +99,7 @@ impl ExtraSqueeze {
             AlphaPlane::U16 { bits, .. } => ((1u32 << *bits) - 1) as f32,
             AlphaPlane::F32(_) => return None,
         };
-        let data: Vec<i32> = (0..xsize * ysize).map(|i| plane.get_i32(i)).collect();
+        let data = plane.to_i32_vec(xsize * ysize);
         let mut channels = vec![Channel {
             data,
             w: xsize,
@@ -152,7 +153,7 @@ impl ExtraSqueeze {
                 h,
                 &decoded,
                 quants[c] as i32,
-                SQUEEZE_DEADZONE,
+                RESIDUAL_ROUNDING,
             );
             debug_assert_eq!(residuals.len(), channels[c].data.len());
             channels[c].data = residuals;
@@ -633,114 +634,14 @@ fn input_dims(
     (w, h)
 }
 
-/// Rounding offset taken off the squeezed residuals' magnitudes before
-/// rounding: small residuals cost more bits than their error is worth.
-const SQUEEZE_DEADZONE: f32 = 0.15;
-
-/// `r / q` rounded to nearest after taking `deadzone` off the magnitude.
-#[inline]
-fn quantize_residual(r: i64, q: i64, deadzone: f32) -> i64 {
-    if q <= 1 {
-        return r;
-    }
-    let m = (r.unsigned_abs() as f32 / q as f32 + 0.5 - deadzone)
-        .floor()
-        .max(0.0) as i64;
-    if r < 0 { -m } else { m }
-}
-
-/// One horizontal squeeze step quantized in closed loop: the residuals of
-/// `x` (`w`×`h`, the step's exact input) under the tendency the decoder
-/// derives from the decoded averages `avg`, and the decoded `x`. Mirrors
-/// `squeeze::inv_h_squeeze`, so the decoder's left neighbour is the decoded
-/// one.
-pub(super) fn closed_h_squeeze(
-    x: &[i32],
-    w: usize,
-    h: usize,
-    avg: &[i32],
-    q: i32,
-    deadzone: f32,
-) -> (Vec<i32>, Vec<i32>) {
-    use crate::squeeze::smooth_tendency;
-    let ow = w.div_ceil(2);
-    let rw = w - ow;
-    let q = i64::from(q);
-    let mut res = vec![0i32; rw * h];
-    let mut out = vec![0i32; w * h];
-    for y in 0..h {
-        let avg_row = &avg[y * ow..(y + 1) * ow];
-        let x_row = &x[y * w..(y + 1) * w];
-        let out_row = &mut out[y * w..(y + 1) * w];
-        let mut left = None;
-        for i in 0..rw {
-            let av = i64::from(avg_row[i]);
-            let next = avg_row.get(i + 1).map_or(av, |&v| i64::from(v));
-            let tendency = smooth_tendency(left.unwrap_or(av), av, next);
-            let diff = i64::from(x_row[2 * i]) - i64::from(x_row[2 * i + 1]);
-            let r = quantize_residual(diff - tendency, q, deadzone);
-            res[y * rw + i] = r as i32;
-            let diff = r * q + tendency;
-            let first = av + diff / 2;
-            out_row[2 * i] = first as i32;
-            out_row[2 * i + 1] = (first - diff) as i32;
-            left = Some(first - diff);
-        }
-        if ow > rw {
-            out_row[w - 1] = avg_row[ow - 1];
-        }
-    }
-    (res, out)
-}
-
-/// The vertical counterpart of [`closed_h_squeeze`] (mirrors
-/// `squeeze::inv_v_squeeze`).
-pub(super) fn closed_v_squeeze(
-    x: &[i32],
-    w: usize,
-    h: usize,
-    avg: &[i32],
-    q: i32,
-    deadzone: f32,
-) -> (Vec<i32>, Vec<i32>) {
-    use crate::squeeze::smooth_tendency;
-    let oh = h.div_ceil(2);
-    let rh = h - oh;
-    let q = i64::from(q);
-    let mut res = vec![0i32; w * rh];
-    let mut out = vec![0i32; w * h];
-    for y in 0..rh {
-        for col in 0..w {
-            let av = i64::from(avg[y * w + col]);
-            let next = if y + 1 < oh {
-                i64::from(avg[(y + 1) * w + col])
-            } else {
-                av
-            };
-            let top = if y > 0 {
-                i64::from(out[(2 * y - 1) * w + col])
-            } else {
-                av
-            };
-            let tendency = smooth_tendency(top, av, next);
-            let diff = i64::from(x[2 * y * w + col]) - i64::from(x[(2 * y + 1) * w + col]);
-            let r = quantize_residual(diff - tendency, q, deadzone);
-            res[y * w + col] = r as i32;
-            let diff = r * q + tendency;
-            let first = av + diff / 2;
-            out[2 * y * w + col] = first as i32;
-            out[(2 * y + 1) * w + col] = (first - diff) as i32;
-        }
-    }
-    if oh > rh {
-        out[(h - 1) * w..h * w].copy_from_slice(&avg[(oh - 1) * w..oh * w]);
-    }
-    (res, out)
-}
+/// How the squeezed residuals round: rate-aware at lambda 0.08 (8 alphas,
+/// SS2 better on all 8: Slow -0.30 % SS2 / -0.07 % BA BD, Fast -0.25 /
+/// -0.11, over the earlier flat 0.15 deadzone; per-level deadzones trade).
+const RESIDUAL_ROUNDING: Rounding = Rounding::RateAware(0.08);
 
 /// The fixed context tree of squeezed channel `c`: Zero prediction of the
 /// residual channels (Gradient for the coarsest average) in four contexts,
-/// by whether the north and the west neighbour are nonzero. Most squeezed
+/// by whether the north and the west neighbor are nonzero. Most squeezed
 /// residuals are zero away from edges, so this captures most of what a
 /// learned tree finds at the cost of the fixed tree.
 fn context_tree(c: usize) -> LearnedTree {

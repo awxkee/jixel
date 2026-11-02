@@ -210,6 +210,16 @@ impl AlphaPlane {
             Self::F32(v) => v[idx],
         }
     }
+
+    /// Copy the first `len` samples as `i32`, preserving raw float bits.
+    /// Select the storage type and check the length once before iterating.
+    pub(crate) fn to_i32_vec(&self, len: usize) -> Vec<i32> {
+        match self {
+            Self::U8(data) => data[..len].iter().map(|&v| i32::from(v)).collect(),
+            Self::U16 { data, .. } => data[..len].iter().map(|&v| i32::from(v)).collect(),
+            Self::F32(data) => data[..len].to_vec(),
+        }
+    }
 }
 
 /// The JXL ToneMapping bundle (HDR luminance metadata). All fields are

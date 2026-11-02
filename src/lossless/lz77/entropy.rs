@@ -187,6 +187,40 @@ where
     )
 }
 
+/// [`build_lz_pixel_code_opts`] that always codes with ANS, refined or not.
+/// Streams of mostly-zero residuals under per-pixel contexts need it: a
+/// prefix code spends at least one bit on every token. `refined` still adds
+/// the hybrid-uint selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_lz_pixel_code_ans<'tokens, 'scratch, I>(
+    thorough: bool,
+    streams: I,
+    nb_chans: usize,
+    min_symbol: u32,
+    refined: bool,
+    ans_cluster: bool,
+    scratch: &'scratch mut LzEntropyScratch,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+) -> EntropyCode<'scratch>
+where
+    I: Iterator<Item = &'tokens [LzToken]> + Clone,
+{
+    let streams: Vec<&'tokens [LzToken]> = streams.collect();
+    build_lz_pixel_code_slices(
+        thorough,
+        &streams,
+        &[],
+        nb_chans,
+        min_symbol,
+        refined,
+        ans_cluster,
+        true,
+        None,
+        scratch,
+        huffman_pool,
+    )
+}
+
 /// Split `streams` into contiguous pool-sized chunks and reduce a per-chunk
 /// accumulator. Keep chunk boundaries and merge order stable: coded-bit
 /// estimates use floating-point sums, while histogram/count passes use integers.
@@ -570,6 +604,7 @@ where
         min_symbol,
         refined,
         ans_cluster,
+        false,
         pool,
         scratch,
         huffman_pool,
@@ -604,6 +639,7 @@ pub(in crate::lossless) fn build_lz_pixel_code_tails<
         min_symbol,
         refined,
         ans_cluster,
+        false,
         pool,
         scratch,
         huffman_pool,
@@ -663,6 +699,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     min_symbol: u32,
     refined: bool,
     ans_cluster: bool,
+    ans: bool,
     pool: Option<&ThreadPool>,
     scratch: &'scratch mut LzEntropyScratch,
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
@@ -671,7 +708,7 @@ fn build_lz_pixel_code_slices<'scratch, T: LzTokenSource>(
     let distance_context = nb_chans as u32;
     let num_contexts = nb_chans + 1;
     assert!(num_contexts <= LZ77_MAX_CONTEXTS);
-    let use_ans = refined;
+    let use_ans = refined || ans;
     let LzEntropyScratch {
         histograms,
         prefix_codes,

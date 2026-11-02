@@ -251,7 +251,15 @@ mod tests {
             max: 65535.0,
             coding: CodingTransform::Rgb,
         };
-        Pyramid::plain(&input, w, h, 0.00001).unwrap()
+        Pyramid::plain(
+            &input,
+            w,
+            h,
+            0.00001,
+            false,
+            &crate::thread_pool::ThreadPool::new(1),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -316,7 +324,15 @@ mod tests {
             max: 65535.0,
             coding: CodingTransform::Rgb,
         };
-        let q = Pyramid::plain(&input, 128, 128, 0.00001).unwrap();
+        let q = Pyramid::plain(
+            &input,
+            128,
+            128,
+            0.00001,
+            false,
+            &crate::thread_pool::ThreadPool::new(1),
+        )
+        .unwrap();
         assert_eq!(
             select_fold(&q, crate::Speed::Slow, &mut CoderScratch::default()),
             Some(4),

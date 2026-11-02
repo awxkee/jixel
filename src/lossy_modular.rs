@@ -57,6 +57,7 @@ mod alpha;
 mod alpha_tests;
 mod cache;
 mod calibrate;
+mod closed_loop;
 mod code;
 mod fold;
 mod forest;
@@ -83,18 +84,24 @@ use crate::thread_pool::ThreadPool;
 use pyramid::Pyramid;
 
 /// Lossy modular frame of an XYB codestream. `distance` is the arm's
-/// calibrated quantizer distance ([`calibrated_distance`] and the Auto gate).
+/// calibrated quantizer distance ([`calibrated_distance`] and the Auto gate)
+/// and `screen` whether the image is screen content (its step rows);
+/// `patches` are dictionary entries over an atlas frame the caller has
+/// already written.
 /// Returns the frame size in bits before the fold race, for the Auto gate,
 /// or None when the image is too small to squeeze.
 pub(crate) fn encode_xyb_frame(
     xyb: &Image3F,
     distance: f32,
+    screen: bool,
+    patches: &[crate::patches::PatchReference],
     speed: crate::Speed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> Option<usize> {
-    let pyramid = Pyramid::xyb(xyb, distance)?;
+    let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
+    pyramid.patches = patches.to_vec();
     race::encode(pyramid, speed, pool, scratch, writer)
 }
 
@@ -113,7 +120,33 @@ pub(crate) fn encode_plain_frame(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> Option<usize> {
-    let pyramid = Pyramid::plain(input, xsize, ysize, distance)?;
+    // A lossless extra channel (alpha, say) codes the same samples squeezed
+    // or not: unsqueezed wins on cutouts and stickers (to -27 %), the squeeze
+    // on smooth fades (one vignette +7..+14 % without it). The colour pyramid
+    // is the same either way, so from Slow the extras alone decide, coded
+    // under an all-zero gray plane at Fastest (crops and tile samples break
+    // the fades and pick wrong); faster tiers take unsqueezed, -9.7 % over
+    // eight RGBA images and quicker to code.
+    let unsqueeze = input.extra.last().is_some_and(|&(_, d)| d == 0.0)
+        && (speed < crate::Speed::Slow || {
+            let probe = PlainInput {
+                color: vec![vec![0; xsize * ysize]],
+                extra: input.extra.clone(),
+                max: input.max,
+                coding: input.coding,
+            };
+            let bits = |unsqueeze: bool, scratch: &mut CoderScratch| {
+                let pyramid = Pyramid::plain(&probe, xsize, ysize, distance, unsqueeze, pool)?;
+                let mut w = BitWriter::new();
+                code::write_frame(&pyramid, crate::Speed::Fastest, pool, scratch, &mut w, None);
+                Some(w.bits_written())
+            };
+            match (bits(false, scratch), bits(true, scratch)) {
+                (Some(squeezed), Some(plain)) => plain < squeezed,
+                _ => false,
+            }
+        });
+    let pyramid = Pyramid::plain(input, xsize, ysize, distance, unsqueeze, pool)?;
     race::encode(pyramid, speed, pool, scratch, writer)
 }
 
@@ -132,7 +165,7 @@ pub(crate) fn encode_dc_frame(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
-    match Pyramid::dc_frame(dc, vardct_steps, levels) {
+    match Pyramid::dc_frame(dc, vardct_steps, levels, pool) {
         Some(pyramid) => race::encode(pyramid, speed, pool, scratch, writer).is_some(),
         None => false,
     }

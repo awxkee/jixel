@@ -55,7 +55,15 @@ fn input(coding: CodingTransform, color: usize, extra: Vec<(Vec<i32>, f32)>) -> 
 
 #[test]
 fn ycbcr_layout_pre_squeezes_the_outer_planes() {
-    let q = Pyramid::plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 64, 48, 8.0).unwrap();
+    let q = Pyramid::plain(
+        &input(CodingTransform::YCbCr, 3, Vec::new()),
+        64,
+        48,
+        8.0,
+        false,
+        &crate::thread_pool::ThreadPool::new(1),
+    )
+    .unwrap();
     assert_eq!(
         q.layout,
         Layout::Plain {
@@ -81,7 +89,15 @@ fn ycbcr_layout_pre_squeezes_the_outer_planes() {
 
 #[test]
 fn rgb_layout_uses_the_rct_and_gray_neither() {
-    let q = Pyramid::plain(&input(CodingTransform::Rgb, 3, Vec::new()), 64, 48, 8.0).unwrap();
+    let q = Pyramid::plain(
+        &input(CodingTransform::Rgb, 3, Vec::new()),
+        64,
+        48,
+        8.0,
+        false,
+        &crate::thread_pool::ThreadPool::new(1),
+    )
+    .unwrap();
     assert_eq!(
         q.layout,
         Layout::Plain {
@@ -97,7 +113,15 @@ fn rgb_layout_uses_the_rct_and_gray_neither() {
         .map(|s| s.begin_c)
         .collect();
     assert_eq!(pre, [1, 1, 2, 2]);
-    let g = Pyramid::plain(&input(CodingTransform::Rgb, 1, Vec::new()), 64, 48, 8.0).unwrap();
+    let g = Pyramid::plain(
+        &input(CodingTransform::Rgb, 1, Vec::new()),
+        64,
+        48,
+        8.0,
+        false,
+        &crate::thread_pool::ThreadPool::new(1),
+    )
+    .unwrap();
     assert_eq!(
         g.layout,
         Layout::Plain {
@@ -118,6 +142,8 @@ fn extra_channels_follow_their_own_distance() {
         64,
         48,
         8.0,
+        false,
+        &crate::thread_pool::ThreadPool::new(1),
     )
     .unwrap();
     assert_eq!(
@@ -140,7 +166,17 @@ fn extra_channels_follow_their_own_distance() {
         }
     }
     // Tiny frames have no pyramid.
-    assert!(Pyramid::plain(&input(CodingTransform::YCbCr, 3, Vec::new()), 8, 8, 8.0).is_none());
+    assert!(
+        Pyramid::plain(
+            &input(CodingTransform::YCbCr, 3, Vec::new()),
+            8,
+            8,
+            8.0,
+            false,
+            &crate::thread_pool::ThreadPool::new(1)
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -162,4 +198,55 @@ fn plain_distance_is_monotonic_and_flat_outside_the_knots() {
         );
     }
     assert_eq!(interpolate_knots(&[(1.0, 2.0), (3.0, 4.0)], 2.0), 3.0);
+}
+
+#[test]
+fn lossless_extras_can_stay_out_of_the_squeeze() {
+    let pool = crate::thread_pool::ThreadPool::new(1);
+    let extra = vec![(ramp(64, 48, 11), 0.0)];
+    let squeezed = Pyramid::plain(
+        &input(CodingTransform::YCbCr, 3, extra.clone()),
+        64,
+        48,
+        8.0,
+        false,
+        &pool,
+    )
+    .unwrap();
+    let plain = Pyramid::plain(
+        &input(CodingTransform::YCbCr, 3, extra),
+        64,
+        48,
+        8.0,
+        true,
+        &pool,
+    )
+    .unwrap();
+    // The extra is one full-size unit-step channel ahead of the four chroma
+    // pre-squeeze residuals; the squeeze covers the colour channels only.
+    let nb = plain.channels.len();
+    let alpha = &plain.channels[nb - 5];
+    assert_eq!(
+        (alpha.w, alpha.h, alpha.hshift, alpha.vshift),
+        (64, 48, 0, 0)
+    );
+    assert_eq!(plain.quants[nb - 5], 1);
+    assert_eq!(alpha.data, ramp(64, 48, 11));
+    assert!(
+        plain
+            .steps
+            .iter()
+            .filter(|s| s.in_place)
+            .all(|s| s.num_c == 3)
+    );
+    assert!(
+        squeezed
+            .steps
+            .iter()
+            .filter(|s| s.in_place)
+            .all(|s| s.num_c == 4)
+    );
+    // Squeezed, the extra adds one residual channel per in-place step.
+    let in_place = plain.steps.iter().filter(|s| s.in_place).count();
+    assert_eq!(squeezed.channels.len(), plain.channels.len() + in_place);
 }
