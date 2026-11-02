@@ -37,6 +37,8 @@
 //! 2. [`pyramid`]: put the source planes on the frame's integer [`layout`]
 //!    (the XYB lattice, or the samples themselves through YCoCg), run the
 //!    forward Squeeze, and divide every channel by its [`quantize`] step.
+//!    At ExtraSlow, `polish` then revisits the XYB frame's luma residuals
+//!    against the exact SSIMULACRA2 and ColorVideoVDP arbiters.
 //! 3. [`fold`]: screen folding the pyramid's exact coarse tail back into
 //!    full-scale averages: the same decoded image, another entropy
 //!    representation.
@@ -62,6 +64,8 @@ mod code;
 mod fold;
 mod forest;
 mod layout;
+#[cfg(feature = "extraslow")]
+mod polish;
 mod pyramid;
 #[cfg(test)]
 mod pyramid_tests;
@@ -103,6 +107,10 @@ pub(crate) fn encode_xyb_frame(
     let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
     pyramid.patches = patches.to_vec();
     pyramid.group_shift = group_shift(speed);
+    #[cfg(feature = "extraslow")]
+    if speed.effort().lm_residual_polish() {
+        polish::polish_frame(&mut pyramid, xyb, distance, screen, pool, scratch);
+    }
     race::encode(pyramid, speed, pool, scratch, writer)
 }
 
