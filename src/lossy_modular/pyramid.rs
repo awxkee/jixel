@@ -43,6 +43,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::coding::CodingTransform;
 use crate::image::Image3F;
+use crate::lossless::kit::GroupLayout;
 use crate::patches::PatchReference;
 use crate::squeeze::{
     Channel, SqueezeStep, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps,
@@ -76,6 +77,9 @@ pub(super) struct Pyramid {
     /// Patch dictionary entries the decoder adds after the frame (XYB frames;
     /// the atlas is a reference frame coded before this one).
     pub(super) patches: Vec<PatchReference>,
+    /// The frame's group_size_shift: groups of 128 << it pixels, LF groups
+    /// 8x that.
+    pub(super) group_shift: u32,
 }
 
 impl Pyramid {
@@ -203,6 +207,7 @@ impl Pyramid {
             xsize,
             ysize,
             patches: Vec::new(),
+            group_shift: GroupLayout::DEFAULT.shift,
         })
     }
 
@@ -317,7 +322,18 @@ impl Pyramid {
             xsize,
             ysize,
             patches: Vec::new(),
+            group_shift: GroupLayout::DEFAULT.shift,
         })
+    }
+
+    /// The side of a group, in pixels.
+    pub(super) fn group_dim(&self) -> usize {
+        128 << self.group_shift
+    }
+
+    /// The side of an LF group, in pixels.
+    pub(super) fn lf_group_dim(&self) -> usize {
+        self.group_dim() * 8
     }
 
     /// The frame header: the DC frame's, or the layout's regular one.
@@ -326,7 +342,7 @@ impl Pyramid {
             write_dc_frame_header(w);
         } else {
             self.layout
-                .write_frame_header(self.epf, !self.patches.is_empty(), w);
+                .write_frame_header(self.epf, !self.patches.is_empty(), self.group_shift, w);
         }
     }
 

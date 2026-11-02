@@ -40,7 +40,7 @@ use super::pyramid::Pyramid;
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{ALPHABET_SIZE, Token, f_log2, pack_signed, uint_encode};
 use crate::lossless::kit::{
-    GROUP_DIM, PREDICTOR_GRADIENT, selected_grad_pack_interior_fn, tokenize_plane_rows,
+    PREDICTOR_GRADIENT, selected_grad_pack_interior_fn, tokenize_plane_rows,
 };
 use crate::squeeze::{Channel, fold_quantized_step};
 
@@ -145,7 +145,7 @@ impl Pyramid {
             };
             // The current global forest requires global channels. Keeping
             // every changed average global also leaves all group crops stable.
-            if dims.is_none_or(|(w, h)| w > GROUP_DIM || h > GROUP_DIM) {
+            if dims.is_none_or(|(w, h)| w > self.group_dim() || h > self.group_dim()) {
                 return false;
             }
         }
@@ -196,8 +196,8 @@ pub(super) fn select_fold(
         samples = samples.checked_add(ch.data.len())?;
         if quant == 0
             || ch.w.checked_mul(ch.h)? != ch.data.len()
-            || ch.w > GROUP_DIM
-            || ch.h > GROUP_DIM
+            || ch.w > q.group_dim()
+            || ch.h > q.group_dim()
             || samples > MAX_COARSE_SAMPLES
         {
             return None;
@@ -219,7 +219,7 @@ pub(super) fn select_fold(
             } else {
                 avg.h.checked_add(residual.h).map(|h| (avg.w, h))
             };
-            dims.is_some_and(|(w, h)| w <= GROUP_DIM && h <= GROUP_DIM)
+            dims.is_some_and(|(w, h)| w <= q.group_dim() && h <= q.group_dim())
         });
         if !fits {
             break;

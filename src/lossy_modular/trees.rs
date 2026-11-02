@@ -53,6 +53,11 @@ const MAX_CONTEXTS: usize = 1024;
 
 const _: () = assert!(MAX_CONTEXTS <= LZ77_MAX_CONTEXTS);
 
+/// The gate's price of one leaf beyond its tree tokens. Leaves become
+/// contexts that the entropy code clusters, so they cost the context map
+/// and some clustering loss, not a histogram each.
+const LEAF_BITS: f64 = 50.0;
+
 /// Odd sampling stride that keeps a channel of `px` samples near
 /// `SAMPLE_TARGET` samples.
 fn sample_stride(px: usize) -> usize {
@@ -78,7 +83,11 @@ fn learn_params(min_symbol: u32, stride: usize, max_leaves: usize) -> MaLearnPar
     }
 }
 
-/// MA samples of tag `t`'s channel, value properties at full scale.
+/// MA samples of tag `t`, value properties at full scale. A group tag is
+/// sampled over the crops its streams code, as they code them (crop
+/// positions and edges, crop references): whole-channel samples gave splits
+/// and edge contexts the coder never saw. Same pixels, -1.4 % bytes over 54
+/// forced encodes (photos to -3.7 %, an illustration -15 %).
 fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
     let ch = &p.channels[tags.channel[t]];
     let px = ch.w * ch.h;
@@ -86,11 +95,40 @@ fn sample(p: &Pyramid, tags: &Tags, refs: &References, t: usize) -> MaSamples {
     let mut samples = MaSamples::with_capacity(px / stride + 1);
     let data = &ch.data;
     let w = ch.w;
-    let refs = if t < tags.split {
-        refs.of(&p.channels, t)
-    } else {
-        refs.of_group(&p.channels, tags.split, tags.channel[t], 0, 0)
-    };
+    if t >= tags.split {
+        let streams = if t < tags.ac.first_tag {
+            &tags.dc
+        } else {
+            &tags.ac
+        };
+        let mut crops = Vec::new();
+        for group in 0..streams.count {
+            streams.for_each_crop(p, tags.split, group, |slot, channel, x0, y0, cw, chh| {
+                if streams.first_tag + slot == t {
+                    crops.push((group, channel, x0, y0, cw, chh));
+                }
+            });
+        }
+        for (group, channel, x0, y0, cw, chh) in crops {
+            let crop = &p.channels[channel];
+            let refs = refs.of_group(&p.channels, tags.split, channel, x0, y0);
+            sample_channel_ma(
+                |y| &crop.data[(y0 + y) * crop.w + x0..][..cw],
+                cw,
+                chh,
+                tags.chan(t),
+                tags.stream_id(t, group),
+                &refs,
+                WpParams::DEFAULT,
+                false,
+                stride,
+                |props, tok, _| samples.push(props, tok),
+            );
+        }
+        scale_ma_value_props(&mut samples, tags.quants[t] as i32);
+        return samples;
+    }
+    let refs = refs.of(&p.channels, t);
     sample_channel_ma(
         |y| &data[y * w..][..w],
         ch.w,
@@ -164,7 +202,7 @@ pub(super) fn learn(
             scratch,
         );
         let n_leaves = tree.nodes.len().div_ceil(2);
-        let overhead_bits = tree.nodes.len() as f64 * 10.0 + n_leaves as f64 * 200.0;
+        let overhead_bits = tree.nodes.len() as f64 * 10.0 + n_leaves as f64 * LEAF_BITS;
         let est_real = tree.est_bits * stride as f64 + overhead_bits;
         let flat_real = tree.flat_bits * stride as f64;
         if est_real < flat_real {

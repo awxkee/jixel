@@ -65,10 +65,19 @@ pub(super) enum Layout {
 
 impl Layout {
     /// `patched` sets the frame's kPatches flag (XYB frames only).
-    pub(super) fn write_frame_header(self, epf: (u32, f32), patched: bool, w: &mut BitWriter) {
+    /// `group_shift` is the frame's group_size_shift (groups of 128 << it).
+    pub(super) fn write_frame_header(
+        self,
+        epf: (u32, f32),
+        patched: bool,
+        group_shift: u32,
+        w: &mut BitWriter,
+    ) {
         match self {
-            Self::Xyb => write_xyb_frame_header(epf, patched, w),
-            Self::Plain { ycbcr, extra, .. } => write_plain_frame_header(ycbcr, extra, epf, w),
+            Self::Xyb => write_xyb_frame_header(epf, patched, group_shift, w),
+            Self::Plain { ycbcr, extra, .. } => {
+                write_plain_frame_header(ycbcr, extra, epf, group_shift, w)
+            }
         }
     }
 
@@ -103,13 +112,13 @@ impl Layout {
 /// Regular is_last modular frame inside the lossy (`xyb_encoded`) codestream.
 /// Identical to `write_frame_header_modular_flags` except the do_YCbCr bit is
 /// absent: with xyb_encoded set the color transform is implicitly XYB.
-fn write_xyb_frame_header(epf: (u32, f32), patched: bool, w: &mut BitWriter) {
+fn write_xyb_frame_header(epf: (u32, f32), patched: bool, group_shift: u32, w: &mut BitWriter) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
     write_u64(if patched { 2 } else { 0 }, w); // flags: kPatches
     w.write(2, 0b00); // upsampling = 1
-    w.write(2, GroupLayout::DEFAULT.shift as u64);
+    w.write(2, group_shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false
     w.write(2, 0b00); // blending = Replace
@@ -137,7 +146,13 @@ pub(super) fn write_dc_frame_header(w: &mut BitWriter) {
 
 /// Regular single-pass modular frame of a non-XYB codestream, no loop
 /// filters (same shape as the lossless header plus the YCbCr signaling).
-fn write_plain_frame_header(ycbcr: bool, extra: usize, epf: (u32, f32), w: &mut BitWriter) {
+fn write_plain_frame_header(
+    ycbcr: bool,
+    extra: usize,
+    epf: (u32, f32),
+    group_shift: u32,
+    w: &mut BitWriter,
+) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
@@ -152,7 +167,7 @@ fn write_plain_frame_header(ycbcr: bool, extra: usize, epf: (u32, f32), w: &mut 
     for _ in 0..extra {
         w.write(2, 0b00); // ec_upsampling = 1
     }
-    w.write(2, GroupLayout::DEFAULT.shift as u64);
+    w.write(2, group_shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false
     w.write(2, 0b00); // blending = Replace

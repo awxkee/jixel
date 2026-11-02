@@ -111,7 +111,7 @@ pub(super) fn tokenize(
             width,
             height,
             chan,
-            0,
+            tags.stream_id(tag, group),
             tags.quants[tag] as i32,
             &trees[tag],
             &local_leaf_ctx[tag],

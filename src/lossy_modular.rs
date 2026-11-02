@@ -102,6 +102,7 @@ pub(crate) fn encode_xyb_frame(
 ) -> Option<usize> {
     let mut pyramid = Pyramid::xyb(xyb, distance, screen, pool)?;
     pyramid.patches = patches.to_vec();
+    pyramid.group_shift = group_shift(speed);
     race::encode(pyramid, speed, pool, scratch, writer)
 }
 
@@ -146,8 +147,22 @@ pub(crate) fn encode_plain_frame(
                 _ => false,
             }
         });
-    let pyramid = Pyramid::plain(input, xsize, ysize, distance, unsqueeze, pool)?;
+    let mut pyramid = Pyramid::plain(input, xsize, ysize, distance, unsqueeze, pool)?;
+    pyramid.group_shift = group_shift(speed);
     race::encode(pyramid, speed, pool, scratch, writer)
+}
+
+/// The group_size_shift of a regular frame. From Slow, 1024-pixel groups:
+/// every group edge costs its first row and column their neighbours, so
+/// larger groups code the same pixels in -1.3 % (Slow) / -1.5 % (Fast) over
+/// 54 forced encodes, to -4.6 %. They cost 18-24 % encode time at 8
+/// threads and the decoder's group parallelism, so faster tiers keep 256.
+fn group_shift(speed: crate::Speed) -> u32 {
+    if speed >= crate::Speed::Slow {
+        crate::lossless::kit::GroupLayout::LARGE.shift
+    } else {
+        crate::lossless::kit::GroupLayout::DEFAULT.shift
+    }
 }
 
 /// Progressive DC: the 1:8 DC image of a VarDCT frame as its squeezed DC
