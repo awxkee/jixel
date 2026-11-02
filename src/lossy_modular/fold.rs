@@ -165,7 +165,13 @@ pub(super) fn select_fold(
     speed: crate::Speed,
     scratch: &mut CoderScratch,
 ) -> Option<usize> {
-    if q.dc_frame || !speed.effort().predictor_search || q.channels.len() != q.quants.len() {
+    // A palette's meta channel shifts every channel off the squeeze script's
+    // indices; such frames keep their tail.
+    if q.dc_frame
+        || q.palette.is_some()
+        || !speed.effort().predictor_search
+        || q.channels.len() != q.quants.len()
+    {
         return None;
     }
     let last = *q.steps.last()?;

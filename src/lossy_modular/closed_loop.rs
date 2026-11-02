@@ -448,7 +448,7 @@ pub(super) struct Deadzone {
 }
 
 impl Deadzone {
-    /// No deadzone anywhere (the DC frame: +1.6 % BA BD with the colour one).
+    /// No deadzone anywhere (the DC frame: +1.6 % BA BD with the color one).
     pub(super) const NONE: Self = Self { finest_pair: 0.0 };
 
     pub(super) const COLOR: Self = Self { finest_pair: 0.15 };

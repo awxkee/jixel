@@ -146,6 +146,9 @@ const EXTRA_PALETTE_MAX_COLORS: usize = 256;
 /// The global tree has not cut a plane's fixed lossless coding below a
 /// quarter; past that the squeezed coding is out of its reach.
 const GLOBAL_TREE_MAX_SAVING: usize = 4;
+/// A gradient-only tree has cut it by at most 52 % (32 RGBA images, every
+/// tier up to Fast), so below 1 / 2.5 of it the squeeze always stays.
+const GRADIENT_TREE_MAX_SAVING: f64 = 2.5;
 
 /// The palette of an integer extra channel whose distinct values number at
 /// most `EXTRA_PALETTE_MAX_COLORS` and at most half its span, so that the
@@ -293,60 +296,99 @@ fn squeezed_sections(
 /// the representation by its local coding; its AC groups then move onto the
 /// global tree where that beats every local coding. Otherwise the folds'
 /// local sections go on to the exact tail race.
-#[allow(clippy::too_many_arguments)]
-fn joint_squeezed(
-    ctx: &EncodingContext,
+struct JointSqueeze {
     squeezed: crate::lossy_modular::ExtraSqueeze,
     local: ExtraSections,
-    dim: &ImageDim,
-    dc_group_coords: &[(usize, usize)],
+    folds: Vec<(crate::lossy_modular::ExtraSqueeze, ExtraSections)>,
+    /// The fold the global tree codes (None: the unfolded squeeze).
+    rep: Option<usize>,
+    tree: Option<extra_tree::GlobalExtraTree>,
     ans: bool,
-    streams: &mut extra_tree::GlobalStreams<'_>,
-    scratch: &mut CoderScratch,
-) -> PreparedExtra {
-    let folds: Vec<(crate::lossy_modular::ExtraSqueeze, ExtraSections)> = squeezed
-        .exact_tail_start()
-        .map(|start| {
-            [start, start + 2]
-                .into_iter()
-                .filter_map(|retained| squeezed.without_exact_tail(retained))
-                .map(|fold| {
-                    let sections = squeezed_sections(
-                        ctx,
-                        &fold,
-                        dim,
-                        dc_group_coords,
-                        ans,
-                        Some((&squeezed, &local)),
-                        scratch,
-                    );
-                    (fold, sections)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let best = folds
-        .iter()
-        .min_by_key(|(_, sections)| sections.bits())
-        .filter(|(_, sections)| sections.bits() < local.bits());
-    let (rep, rep_sections) = best.map_or((&squeezed, &local), |(f, s)| (f, s));
-    if let Some(tree) =
-        extra_tree::plan_global_squeeze_tree(ctx, rep, dim, streams, rep_sections, scratch)
-    {
-        let mut sections = rep_sections.clone();
-        tree.apply(streams, &mut sections);
-        return PreparedExtra {
-            sections,
-            squeezed: None,
-            folds: Vec::new(),
-            global_code_ans: ans,
-        };
+}
+
+impl JointSqueeze {
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        ctx: &EncodingContext,
+        squeezed: crate::lossy_modular::ExtraSqueeze,
+        local: ExtraSections,
+        dim: &ImageDim,
+        dc_group_coords: &[(usize, usize)],
+        ans: bool,
+        streams: &extra_tree::GlobalStreams<'_>,
+        scratch: &mut CoderScratch,
+    ) -> Self {
+        let folds: Vec<(crate::lossy_modular::ExtraSqueeze, ExtraSections)> = squeezed
+            .exact_tail_start()
+            .map(|start| {
+                [start, start + 2]
+                    .into_iter()
+                    .filter_map(|retained| squeezed.without_exact_tail(retained))
+                    .map(|fold| {
+                        let sections = squeezed_sections(
+                            ctx,
+                            &fold,
+                            dim,
+                            dc_group_coords,
+                            ans,
+                            Some((&squeezed, &local)),
+                            scratch,
+                        );
+                        (fold, sections)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rep = (0..folds.len())
+            .min_by_key(|&i| folds[i].1.bits())
+            .filter(|&i| folds[i].1.bits() < local.bits());
+        let (rep_squeeze, rep_sections) =
+            rep.map_or((&squeezed, &local), |i| (&folds[i].0, &folds[i].1));
+        let tree = extra_tree::plan_global_squeeze_tree(
+            ctx,
+            rep_squeeze,
+            dim,
+            streams,
+            rep_sections,
+            scratch,
+        );
+        Self {
+            squeezed,
+            local,
+            folds,
+            rep,
+            tree,
+            ans,
+        }
     }
-    PreparedExtra {
-        sections: local,
-        squeezed: Some(squeezed),
-        folds: folds.into_iter().map(|(_, sections)| sections).collect(),
-        global_code_ans: ans,
+
+    /// The smallest coding the plan reaches, before section padding.
+    fn bits(&self) -> usize {
+        let rep = self.rep.map_or(&self.local, |i| &self.folds[i].1);
+        rep.bits() - self.tree.as_ref().map_or(0, |t| t.saving())
+    }
+
+    fn finish(self, streams: &mut extra_tree::GlobalStreams<'_>) -> PreparedExtra {
+        if let Some(tree) = self.tree {
+            let mut sections = self.rep.map_or(self.local, |i| self.folds[i].1.clone());
+            tree.apply(streams, &mut sections);
+            return PreparedExtra {
+                sections,
+                squeezed: None,
+                folds: Vec::new(),
+                global_code_ans: self.ans,
+            };
+        }
+        PreparedExtra {
+            sections: self.local,
+            squeezed: Some(self.squeezed),
+            folds: self
+                .folds
+                .into_iter()
+                .map(|(_, sections)| sections)
+                .collect(),
+            global_code_ans: self.ans,
+        }
     }
 }
 
@@ -381,7 +423,7 @@ pub(super) fn prepare_extra_sections(
     let mut lossless = match palette.as_ref().filter(|_| !single) {
         Some(p) => {
             let indexed = lossless_sections(ctx, plane, Some(p), dim, groups, ans, scratch);
-            if ctx.extra_learned_trees {
+            if ctx.extra_plane_tree.is_some() {
                 indexed
             } else {
                 let plain = lossless_sections(ctx, plane, None, dim, groups, ans, scratch);
@@ -411,10 +453,15 @@ pub(super) fn prepare_extra_sections(
         .as_ref()
         .map(|s| squeezed_sections(ctx, s, dim, dc_group_coords, ans, None, scratch));
     let global_tree = (lossless_plane
-        && ctx.extra_learned_trees
-        && lossy
-            .as_ref()
-            .is_none_or(|lossy| lossless.bits() < GLOBAL_TREE_MAX_SAVING * lossy.bits()))
+        && ctx.extra_plane_tree.is_some_and(|budget| {
+            lossy.as_ref().is_none_or(|lossy| {
+                if budget.gradient_only {
+                    (lossless.bits() as f64) < GRADIENT_TREE_MAX_SAVING * lossy.bits() as f64
+                } else {
+                    lossless.bits() < GLOBAL_TREE_MAX_SAVING * lossy.bits()
+                }
+            })
+        }))
     .then(|| {
         extra_tree::plan_global_extra_tree(
             ctx,
@@ -433,16 +480,39 @@ pub(super) fn prepare_extra_sections(
         Some(lossy) if lossy.bits() < lossless_bits => {
             let squeezed = squeezed.expect("lossy sections come from a squeeze");
             if ctx.speed.effort().extra_global_tree {
-                return joint_squeezed(
+                let joint = JointSqueeze::plan(
                     ctx,
                     squeezed,
                     lossy,
                     dim,
                     dc_group_coords,
                     ans,
+                    &streams,
+                    scratch,
+                );
+                let levels = lossy_palette(
+                    ctx,
+                    plane,
+                    &joint.squeezed,
+                    joint.bits(),
+                    dim,
+                    last_pass,
                     &mut streams,
                     scratch,
                 );
+                return levels.unwrap_or_else(|| joint.finish(&mut streams));
+            }
+            if let Some(levels) = lossy_palette(
+                ctx,
+                plane,
+                &squeezed,
+                lossy.bits(),
+                dim,
+                last_pass,
+                &mut streams,
+                scratch,
+            ) {
+                return levels;
             }
             PreparedExtra {
                 sections: lossy,
@@ -463,6 +533,78 @@ pub(super) fn prepare_extra_sections(
             }
         }
     }
+}
+
+/// The squeezed plane's weighted squared error after the decoder's clamp.
+fn squeezed_error(
+    plane: &AlphaPlane,
+    squeezed: &crate::lossy_modular::ExtraSqueeze,
+    weights: &[f32],
+) -> f64 {
+    let max = (1i64 << plane.bits()) - 1;
+    squeezed
+        .reconstruct()
+        .iter()
+        .zip(weights)
+        .enumerate()
+        .map(|(i, (&v, &w))| {
+            let e = i64::from(v).clamp(0, max) - i64::from(plane.get_i32(i));
+            f64::from(w) * (e * e) as f64
+        })
+        .sum()
+}
+
+/// The lossy palette arm: the fewest levels within part of the squeeze's
+/// weighted squared error ([`super::extra_levels`]), coded losslessly like an
+/// exact plane (palette, the learned plane tree, global tree), when that is
+/// smaller than the squeeze's best coding. Only with a plane tree: the fixed
+/// per-group coding codes palette indices worse than the squeeze.
+#[allow(clippy::too_many_arguments)]
+fn lossy_palette(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    squeezed: &crate::lossy_modular::ExtraSqueeze,
+    squeezed_bits: usize,
+    dim: &ImageDim,
+    last_pass: usize,
+    streams: &mut extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+) -> Option<PreparedExtra> {
+    if ctx.extra_plane_tree.is_none() || ctx.extra_step != 1 {
+        return None;
+    }
+    let weights = super::extra_levels::error_weights(plane, dim.xsize, dim.ysize);
+    let budget =
+        super::extra_levels::LOSSY_PALETTE_ERROR * squeezed_error(plane, squeezed, &weights);
+    let levels = super::extra_levels::fewest_levels(plane, &weights, budget)?;
+    let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
+    let ans = !streams.code.use_prefix_code;
+    let palette = extra_palette(&levels);
+    let groups = dim.num_dc_groups;
+    let local_palette = palette.as_ref().filter(|_| !single);
+    let mut sections = lossless_sections(ctx, &levels, local_palette, dim, groups, ans, scratch);
+    let tree = extra_tree::plan_global_extra_tree(
+        ctx,
+        &levels,
+        palette.as_ref(),
+        dim,
+        last_pass,
+        streams,
+        &sections,
+        scratch,
+    );
+    if sections.bits() - tree.as_ref().map_or(0, |t| t.saving()) >= squeezed_bits {
+        return None;
+    }
+    if let Some(tree) = tree {
+        tree.apply(streams, &mut sections);
+    }
+    Some(PreparedExtra {
+        sections,
+        squeezed: None,
+        folds: Vec::new(),
+        global_code_ans: ans,
+    })
 }
 
 pub(super) fn zero_alpha_for_lossy(

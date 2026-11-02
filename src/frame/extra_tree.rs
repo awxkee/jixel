@@ -269,24 +269,26 @@ pub(super) fn plan_global_extra_tree(
         Some(p) if single => (1, Some(p.entries.as_slice())),
         _ => (0, None),
     };
+    let budget = ctx.extra_plane_tree?;
     let learned = crate::lossless::learn_global_plane_tree(
         &mut data,
         dim.xsize,
         chan,
         palette_row,
         &crops,
+        budget,
         &ctx.thread_pool,
         scratch,
     );
     drop(data);
     let header_palette = palette.filter(|_| single).map(|p| p.entries.len() as u32);
-    let refinement = Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed));
+    // The frame's own refinement: Slow's from Slow, lighter or none below.
     plan_joint(
         ctx,
         learned,
         single,
         header_palette,
-        refinement,
+        streams.refinement,
         dim,
         streams,
         extra,

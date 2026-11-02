@@ -223,7 +223,7 @@ fn lossless_extras_can_stay_out_of_the_squeeze() {
     )
     .unwrap();
     // The extra is one full-size unit-step channel ahead of the four chroma
-    // pre-squeeze residuals; the squeeze covers the colour channels only.
+    // pre-squeeze residuals; the squeeze covers the color channels only.
     let nb = plain.channels.len();
     let alpha = &plain.channels[nb - 5];
     assert_eq!(
@@ -249,4 +249,54 @@ fn lossless_extras_can_stay_out_of_the_squeeze() {
     // Squeezed, the extra adds one residual channel per in-place step.
     let in_place = plain.steps.iter().filter(|s| s.in_place).count();
     assert_eq!(squeezed.channels.len(), plain.channels.len() + in_place);
+}
+
+#[test]
+fn plain_palette_keeps_the_extra_as_indices_behind_its_meta_channel() {
+    let pool = crate::thread_pool::ThreadPool::new(1);
+    let levels = [0, 257 * 40, 257 * 128, 65535];
+    let alpha: Vec<i32> = (0..64 * 48).map(|i| levels[(i * 7 / 64) % 4]).collect();
+    for (coding, color) in [
+        (CodingTransform::YCbCr, 3),
+        (CodingTransform::Rgb, 3),
+        (CodingTransform::Rgb, 1),
+    ] {
+        let source = input(coding, color, vec![(alpha.clone(), 0.0)]);
+        let plain = Pyramid::plain(&source, 64, 48, 2.0, true, &pool).unwrap();
+        let p = Pyramid::plain_palette(&source, 64, 48, 2.0, &pool).unwrap();
+        let c = p.palette.expect("palette");
+        assert_eq!(p.channels.len(), plain.channels.len() + 1);
+        assert_eq!(p.quants[0], 257);
+        assert_eq!(p.channels[0].data, [0, 40, 128, 255]);
+        assert_eq!((p.channels[0].w, p.channels[0].h), (4, 1));
+        // The color channels and their steps are the plain pyramid's.
+        for (i, ch) in plain.channels.iter().enumerate().filter(|&(i, _)| i != c) {
+            assert_eq!(p.channels[i + 1].data, ch.data);
+            assert_eq!(p.quants[i + 1], plain.quants[i]);
+        }
+        let decoded: Vec<i32> = p.channels[c + 1]
+            .data
+            .iter()
+            .map(|&k| p.channels[0].data[k as usize] * p.quants[0] as i32)
+            .collect();
+        assert_eq!(decoded, alpha);
+        assert_eq!(plain.channels[c].data, alpha);
+    }
+    // Entries too wide for the literal alphabet once divided stay unpaletted.
+    let wide: Vec<i32> = (0..64 * 48).map(|i| [1, 65535][i % 2]).collect();
+    let wide = input(CodingTransform::Rgb, 3, vec![(wide, 0.0)]);
+    assert!(Pyramid::plain_palette(&wide, 64, 48, 2.0, &pool).is_none());
+    // A lossy extra, or none, has no palette coding.
+    let lossy = input(CodingTransform::Rgb, 3, vec![(alpha.clone(), 1.0)]);
+    assert!(Pyramid::plain_palette(&lossy, 64, 48, 2.0, &pool).is_none());
+    assert!(
+        Pyramid::plain_palette(
+            &input(CodingTransform::Rgb, 3, Vec::new()),
+            64,
+            48,
+            2.0,
+            &pool
+        )
+        .is_none()
+    );
 }

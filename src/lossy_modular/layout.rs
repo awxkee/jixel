@@ -38,7 +38,7 @@
 use crate::bit_writer::BitWriter;
 use crate::lossless::kit::{
     GroupLayout, write_modular_transforms_rct_squeeze, write_modular_transforms_squeeze_only,
-    write_u64,
+    write_modular_transforms_squeeze_palette, write_u64,
 };
 
 /// XYB float -> integer scale factors in X, Y, B order. Signaled to the decoder
@@ -90,10 +90,25 @@ impl Layout {
         }
     }
 
-    pub(super) fn write_transforms(self, steps: &[crate::squeeze::SqueezeStep], w: &mut BitWriter) {
-        match self {
-            Self::Plain { rct: true, .. } => write_modular_transforms_rct_squeeze(steps, w),
-            _ => write_modular_transforms_squeeze_only(steps, w),
+    /// The transform list: [RCT], Squeeze, then the extra channel's Palette
+    /// as (begin_c in the squeezed list, colors) when `palette` is set.
+    pub(super) fn write_transforms(
+        self,
+        steps: &[crate::squeeze::SqueezeStep],
+        palette: Option<(usize, usize)>,
+        w: &mut BitWriter,
+    ) {
+        let rct = matches!(self, Self::Plain { rct: true, .. });
+        match palette {
+            Some((begin_c, colors)) => write_modular_transforms_squeeze_palette(
+                rct,
+                steps,
+                begin_c as u32,
+                colors as u32,
+                w,
+            ),
+            None if rct => write_modular_transforms_rct_squeeze(steps, w),
+            None => write_modular_transforms_squeeze_only(steps, w),
         }
     }
 

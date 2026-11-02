@@ -347,7 +347,7 @@ pub(crate) fn find(xyb: &Image3F) -> Option<LatticePlan> {
                 *v = (nv * inv_gg) as f32;
             }
         }
-        // Unit RMS: a channel near zero (X on a two-colour pattern) keeps a
+        // Unit RMS: a channel near zero (X on a two-color pattern) keeps a
         // well-conditioned tile and leaves its magnitude and sign to the gain.
         let rms = (tv.iter().map(|v| v * v).sum::<f32>() * inv_t).sqrt();
         if rms > MIN_TILE_RMS {

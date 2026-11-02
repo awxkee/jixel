@@ -211,7 +211,7 @@ fn dp_controls(
 ) -> Option<Vec<Point<i32>>> {
     const NONE: u32 = u32::MAX;
     let n = curve.len();
-    // Catmull-Rom leaves a control point along the secant of its neighbours,
+    // Catmull-Rom leaves a control point along the secant of its neighbors,
     // so tangents are taken at the span's own scale; local tangents would
     // follow detection wiggles a long span averages out.
     let secant = |i: usize, reach: usize| {

@@ -83,6 +83,7 @@ pub(crate) use pyramid::PlainInput;
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
+use crate::entropy::f_log2;
 use crate::image::Image3F;
 use crate::thread_pool::ThreadPool;
 use pyramid::Pyramid;
@@ -131,7 +132,7 @@ pub(crate) fn encode_plain_frame(
 ) -> Option<usize> {
     // A lossless extra channel (alpha, say) codes the same samples squeezed
     // or not: unsqueezed wins on cutouts and stickers (to -27 %), the squeeze
-    // on smooth fades (one vignette +7..+14 % without it). The colour pyramid
+    // on smooth fades (one vignette +7..+14 % without it). The color pyramid
     // is the same either way, so from Slow the extras alone decide, coded
     // under an all-zero gray plane at Fastest (crops and tile samples break
     // the fades and pick wrong); faster tiers take unsqueezed, -9.7 % over
@@ -157,11 +158,189 @@ pub(crate) fn encode_plain_frame(
         });
     let mut pyramid = Pyramid::plain(input, xsize, ysize, distance, unsqueeze, pool)?;
     pyramid.group_shift = group_shift(speed);
-    race::encode(pyramid, speed, pool, scratch, writer)
+    // From Slow, a lossy extra channel (alpha) also races as a lossy
+    // palette, decided by estimated rates: order-0 context entropy of the
+    // squeezed channel and of the palette indices. Calibrated against the
+    // full double encode over 32 RGBA images x 5 distances: 8/160 choices
+    // differ, all near ties (+0.05 % bytes); probe encodes of the extras
+    // cost 1.69x the arm-free frame, the estimate 1.18x.
+    let Some(levels) = (speed >= crate::Speed::Slow)
+        .then(|| lossy_palette_levels(input, &pyramid, xsize, ysize))
+        .flatten()
+    else {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    };
+    let palette_bits = palette_index_bits(&levels, xsize, ysize);
+    if palette_bits >= PALETTE_RATE_MARGIN * squeezed_extra_bits(&pyramid, input.color.len()) {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    }
+    let levels = PlainInput {
+        color: input.color.clone(),
+        extra: vec![(levels, 0.0)],
+        max: input.max,
+        coding: input.coding,
+    };
+    let Some(mut palette) = Pyramid::plain_palette(&levels, xsize, ysize, distance, pool) else {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    };
+    palette.group_shift = pyramid.group_shift;
+    race::encode(palette, speed, pool, scratch, writer)
+}
+
+/// The palette is taken while its estimated index bits stay under this many
+/// times the squeezed channel's: the estimate rates the indices about 1.45x
+/// their learned-tree coding relative to the squeeze's.
+const PALETTE_RATE_MARGIN: f64 = 1.45;
+
+/// Hybrid-uint token and raw bits of a packed residual (split exponent 4,
+/// one mantissa bit), as the frame's entropy code splits it.
+fn residual_token(e: u32) -> (u32, u32) {
+    if e < 16 {
+        (e, 0)
+    } else {
+        let n = 31 - e.leading_zeros();
+        (16 + (n - 4) * 2 + ((e >> (n - 1)) & 1), n - 1)
+    }
+}
+
+/// Order-0 bits of `(context, residual)` samples: per-context token entropy,
+/// raw bits and a small table cost per context.
+fn context_entropy_bits(samples: impl Iterator<Item = (usize, i32)>, contexts: usize) -> f64 {
+    let mut hist = vec![std::collections::HashMap::<u32, u32>::new(); contexts];
+    let mut bits = 0f64;
+    for (c, v) in samples {
+        let (token, raw) = residual_token(crate::entropy::pack_signed(v));
+        *hist[c].entry(token).or_default() += 1;
+        bits += f64::from(raw);
+    }
+    for h in &hist {
+        let n: u32 = h.values().sum();
+        if n == 0 {
+            continue;
+        }
+        bits += 12.0 + 6.0 * h.len() as f64;
+        for &k in h.values() {
+            bits -= f64::from(k) * f_log2(f64::from(k) / f64::from(n));
+        }
+    }
+    bits
+}
+
+/// The decoder's left, top and top-left neighbours of `(x, y)` in a plane.
+fn neighbours(data: &[i32], w: usize, x: usize, y: usize) -> (i32, i32, i32) {
+    let left = if x > 0 {
+        data[y * w + x - 1]
+    } else if y > 0 {
+        data[(y - 1) * w + x]
+    } else {
+        0
+    };
+    let top = if y > 0 { data[(y - 1) * w + x] } else { left };
+    let top_left = if x > 0 && y > 0 {
+        data[(y - 1) * w + x - 1]
+    } else {
+        left
+    };
+    (left, top, top_left)
+}
+
+/// Estimated bits of a plain pyramid's one squeezed extra channel (the last
+/// squeezed plane): its coarsest channel through the clamped gradient, its
+/// residual channels as stored under |W| > 0 / |N| > 0 contexts, like the
+/// fixed extra-channel context tree.
+fn squeezed_extra_bits(p: &Pyramid, num_color: usize) -> f64 {
+    let planes = num_color + 1;
+    let n_pre: usize = p
+        .steps
+        .iter()
+        .filter(|s| !s.in_place)
+        .map(|s| s.num_c)
+        .sum();
+    let channels = &p.channels[..p.channels.len() - n_pre];
+    let samples = channels
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i % planes == num_color)
+        .flat_map(|(i, ch)| {
+            (0..ch.w * ch.h).map(move |k| {
+                let (x, y) = (k % ch.w, k / ch.w);
+                let (left, top, top_left) = neighbours(&ch.data, ch.w, x, y);
+                let v = ch.data[k];
+                if i < planes {
+                    let pred = (left + top - top_left).clamp(left.min(top), left.max(top));
+                    (4, v - pred)
+                } else {
+                    (usize::from(left != 0) * 2 + usize::from(top != 0), v)
+                }
+            })
+        });
+    context_entropy_bits(samples, 5)
+}
+
+/// Estimated bits of the palette indices of `levels`: each index against
+/// its left neighbour under W == N / N == NW contexts.
+fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> f64 {
+    let mut entries = levels.to_vec();
+    entries.sort_unstable();
+    entries.dedup();
+    let indices: Vec<i32> = levels
+        .iter()
+        .map(|v| entries.binary_search(v).unwrap_or(0) as i32)
+        .collect();
+    let samples = (0..xsize * ysize).map(|k| {
+        let (left, top, top_left) = neighbours(&indices, xsize, k % xsize, k / xsize);
+        (
+            usize::from(left == top) * 2 + usize::from(top == top_left),
+            indices[k] - left,
+        )
+    });
+    context_entropy_bits(samples, 4)
+}
+
+/// The lossy palette levels of a plain frame's one lossy extra channel
+/// (alpha): the fewest levels within part of the squeezed channel's weighted
+/// error ([`crate::frame::extra_levels`]), to code losslessly through a
+/// Palette transform. None without such a channel, or when every value is
+/// needed.
+fn lossy_palette_levels(
+    input: &PlainInput,
+    squeezed: &Pyramid,
+    xsize: usize,
+    ysize: usize,
+) -> Option<Vec<i32>> {
+    use crate::encode_image::AlphaPlane;
+    use crate::frame::extra_levels::{LOSSY_PALETTE_ERROR, error_weights, fewest_levels};
+    let [(plane, d)] = input.extra.as_slice() else {
+        return None;
+    };
+    if *d <= 0.0 || plane.iter().any(|&v| !(0..=65535).contains(&v)) {
+        return None;
+    }
+    let source = AlphaPlane::U16 {
+        data: plane.iter().map(|&v| v as u16).collect(),
+        bits: 16,
+    };
+    let weights = error_weights(&source, xsize, ysize);
+    let error: f64 = squeezed
+        .decoded_extra(0)
+        .iter()
+        .zip(plane)
+        .zip(&weights)
+        .map(|((&v, &s), &w)| {
+            let e = f64::from(v.clamp(0, 65535) - s);
+            f64::from(w) * e * e
+        })
+        .sum();
+    let AlphaPlane::U16 { data, .. } =
+        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error)?
+    else {
+        unreachable!("levels keep the plane's type")
+    };
+    Some(data.into_iter().map(i32::from).collect())
 }
 
 /// The group_size_shift of a regular frame. From Slow, 1024-pixel groups:
-/// every group edge costs its first row and column their neighbours, so
+/// every group edge costs its first row and column their neighbors, so
 /// larger groups code the same pixels in -1.3 % (Slow) / -1.5 % (Fast) over
 /// 54 forced encodes, to -4.6 %. They cost 18-24 % encode time at 8
 /// threads and the decoder's group parallelism, so faster tiers keep 256.

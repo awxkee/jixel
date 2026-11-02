@@ -484,7 +484,8 @@ mod tests {
     /// thread count.
     #[test]
     fn region_frames_are_deterministic_across_workers() {
-        let img = screenshot(300, 200, (70, 50, 120, 90));
+        let img = screenshot(200, 136, (60, 44, 72, 64));
+        assert_eq!(plan(&img, None).map(|r| r.len()), Some(1));
         let encode = |threads| {
             let mut w = crate::bit_writer::BitWriter::new();
             crate::lossless::encode_frame_lossless(

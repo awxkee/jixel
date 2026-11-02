@@ -486,7 +486,7 @@ const PROPOSE_MIN_NET_BITS: f64 = 4096.0;
 
 /// Chroma merge candidates, cheapest-first per the offline study; each frees
 /// one id for a split when the 16-id budget is exhausted.
-const CHROMA_MERGE_CANDIDATES: [(u8, u8); 4] = [(10, 11), (8, 9), (12, 13), (13, 14)];
+static CHROMA_MERGE_CANDIDATES: [(u8, u8); 4] = [(10, 11), (8, 9), (12, 13), (13, 14)];
 
 struct PlanStats {
     /// [fine ac context][symbol] counts plus raw extra bits.

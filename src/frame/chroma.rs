@@ -35,7 +35,7 @@ use crate::image::Image3F;
 
 /// Fraction of exactly constant 8x8 blocks above which a frame is screen content.
 const SCREEN_CONTENT_CONSTANT_BLOCKS: f32 = 0.15;
-/// Screen content (UI, text, flat-colour graphics): enough exactly constant
+/// Screen content (UI, text, flat-color graphics): enough exactly constant
 /// 8x8 blocks. Photos measure at most 0.02, screenshots and illustrations
 /// 0.17-0.88.
 pub(crate) fn is_screen_content(xyb: &Image3F) -> bool {

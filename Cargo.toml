@@ -29,6 +29,9 @@ extraslow = ["dep:cvvdp-lite", "dep:ssimu2-lite"]
 cvvdp-lite = { version = "0.1.2", optional = true }
 ssimu2-lite = { version = "0.1.3", optional = true }
 
+[profile.test]
+opt-level = 1
+
 [profile.profiling]
 inherits = "release"
 debug = "full"

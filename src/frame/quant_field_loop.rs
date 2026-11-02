@@ -906,7 +906,7 @@ pub(super) fn run_quant_field_loop(
             // The frame's measured deficit change is attributed to tiles in
             // proportion to their share of the current linearized map. The
             // per-tile differences of the finer map carry pooling cross-talk
-            // from neighbouring tiles and rank worse.
+            // from neighboring tiles and rank worse.
             let sum_map_0: f64 = map_0.iter().sum();
             if sum_map_0 <= 0.0 {
                 break;

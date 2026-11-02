@@ -93,14 +93,41 @@ use global::ColorMap;
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
 /// `TransformId::kPalette`). v1: begin_c=0, num_c=3, nb_deltas=0, predictor=Zero.
 pub(crate) fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
-    debug_assert!((1..=4).contains(&num_c));
     // transforms count U32(Val(0),Val(1),...): selector 1 = Val(1) = 1 transform.
     w.write(2, 0b01);
+    write_palette_transform_entry(0, num_c, nb_colors, w);
+}
+
+/// One Palette transform entry of a transform list: `num_c` channels from
+/// `begin_c`, `nb_colors` entries, no deltas, Zero predictor.
+pub(crate) fn write_palette_transform_entry(
+    begin_c: u32,
+    num_c: u32,
+    nb_colors: u32,
+    w: &mut BitWriter,
+) {
+    debug_assert!((1..=4).contains(&num_c));
     // id U32(Val(RCT=0),Val(Palette=1),...): selector 1 = Palette.
     w.write(2, 0b01);
-    // begin_c U32(Bits(3),...): selector 0 = Bits(3), value 0.
-    w.write(2, 0b00);
-    w.write(3, 0);
+    // begin_c U32(Bits(3), BitsOffset(6,8), BitsOffset(10,72), BitsOffset(13,1096)).
+    match begin_c {
+        0..8 => {
+            w.write(2, 0b00);
+            w.write(3, u64::from(begin_c));
+        }
+        8..72 => {
+            w.write(2, 0b01);
+            w.write(6, u64::from(begin_c - 8));
+        }
+        72..1096 => {
+            w.write(2, 0b10);
+            w.write(10, u64::from(begin_c - 72));
+        }
+        _ => {
+            w.write(2, 0b11);
+            w.write(13, u64::from(begin_c - 1096));
+        }
+    }
     // num_c U32(Val(1),Val(3),Val(4),BitsOffset(13,1)).
     match num_c {
         1 => w.write(2, 0b00),

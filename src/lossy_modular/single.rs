@@ -110,7 +110,8 @@ pub(crate) fn write_frame(
     section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
     section.write(1, 0); // use_global_tree = 0
     section.write(1, 1); // wp_default = 1
-    p.layout.write_transforms(&p.steps, &mut section);
+    let palette = p.palette.map(|c| (c, p.channels[0].w));
+    p.layout.write_transforms(&p.steps, palette, &mut section);
 
     let distance_ctx = nb as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);

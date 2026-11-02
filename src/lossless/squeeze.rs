@@ -32,7 +32,7 @@
 
 mod plane;
 
-pub(crate) use plane::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
+pub(crate) use plane::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_global_plane_tree};
 
 use super::groups::{DeepLzScratchPool, group_lz_threads, write_lz_groups};
 use super::header::{write_frame_header_modular_kind, write_toc_entry};
@@ -76,6 +76,26 @@ pub(crate) fn write_modular_transforms_squeeze_only(
 ) {
     w.write(2, 0b01); // transforms count = 1 (Val(1))
     write_squeeze_transform_entry(steps, w);
+}
+
+/// Transform list of a squeezed frame whose extra channel at `begin_c` of
+/// the squeezed channel list is then coded through a Palette transform of
+/// `nb_colors` entries: [RCT (YCoCg) when `rct`], Squeeze, Palette.
+pub(crate) fn write_modular_transforms_squeeze_palette(
+    rct: bool,
+    steps: &[crate::squeeze::SqueezeStep],
+    begin_c: u32,
+    nb_colors: u32,
+    w: &mut BitWriter,
+) {
+    // transforms count U32(Val0, Val1, BitsOffset(4,2), ...): 2 or 3.
+    w.write(2, 0b10);
+    w.write(4, u64::from(rct));
+    if rct {
+        write_rct_transform(6, w);
+    }
+    write_squeeze_transform_entry(steps, w);
+    super::palette::write_palette_transform_entry(begin_c, 1, nb_colors, w);
 }
 
 /// One Squeeze transform entry with an explicit step sequence.

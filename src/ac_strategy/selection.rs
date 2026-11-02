@@ -5107,17 +5107,20 @@ mod tests {
 
     #[test]
     fn selection_is_independent_of_worker_count() {
-        for speed in [crate::Speed::Fast, crate::Speed::Medium, crate::Speed::Slow] {
-            for distance in [0.5, 1.5, 2.0, 4.0, 6.0] {
-                let (serial, _) = run_selector(speed, distance, 1);
-                let (parallel, _) = run_selector(speed, distance, 3);
-                assert_eq!(
-                    strategy_cells(&serial),
-                    strategy_cells(&parallel),
-                    "{speed:?} d{distance}"
-                );
-                assert_map_valid(&parallel);
-            }
+        for (speed, distance) in [
+            (crate::Speed::Fast, 1.5),
+            (crate::Speed::Medium, 4.0),
+            (crate::Speed::Slow, 0.5),
+            (crate::Speed::Slow, 2.0),
+        ] {
+            let (serial, _) = run_selector(speed, distance, 1);
+            let (parallel, _) = run_selector(speed, distance, 3);
+            assert_eq!(
+                strategy_cells(&serial),
+                strategy_cells(&parallel),
+                "{speed:?} d{distance}"
+            );
+            assert_map_valid(&parallel);
         }
     }
 

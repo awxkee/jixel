@@ -916,20 +916,20 @@ fn changed_regions(current: &[Piece], layout: &[Piece]) -> Vec<(usize, usize, us
             y0 = y0.min(y);
             x1 = x1.max(x + 1);
             y1 = y1.max(y + 1);
-            let mut neighbours = Vec::with_capacity(4);
+            let mut neighbors = Vec::with_capacity(4);
             if x > 0 {
-                neighbours.push(i - 1);
+                neighbors.push(i - 1);
             }
             if x < 7 {
-                neighbours.push(i + 1);
+                neighbors.push(i + 1);
             }
             if y > 0 {
-                neighbours.push(i - 8);
+                neighbors.push(i - 8);
             }
             if y < 7 {
-                neighbours.push(i + 8);
+                neighbors.push(i + 8);
             }
-            for n in neighbours {
+            for n in neighbors {
                 if changed[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);

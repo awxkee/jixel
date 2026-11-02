@@ -100,7 +100,7 @@ pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
 pub(crate) use rct::forward_ycocg;
-pub(crate) use squeeze::{GlobalPlaneTree, StreamCrop, learn_global_plane_tree};
+pub(crate) use squeeze::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_global_plane_tree};
 
 /// The modular coding primitives [`crate::lossy_modular`] builds on: group
 /// geometry, MA sampling and trees, predictors, LZ77 and entropy sections,
@@ -128,7 +128,7 @@ pub(crate) mod kit {
     pub(crate) use super::rct::forward_ycocg;
     pub(crate) use super::squeeze::{
         GlobalPlaneTree, for_each_squeeze_group_crop, write_modular_transforms_rct_squeeze,
-        write_modular_transforms_squeeze_only,
+        write_modular_transforms_squeeze_only, write_modular_transforms_squeeze_palette,
     };
     pub(crate) use super::tree::{build_balanced_tree_tokens_mul, push_leaf_mul, push_split};
 }

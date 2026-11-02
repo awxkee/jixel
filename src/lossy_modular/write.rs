@@ -77,7 +77,9 @@ pub(super) fn write_frame(
     );
     sections[0].write(1, 1); // use_global_tree = 1
     sections[0].write(1, 1); // wp_default = 1
-    p.layout.write_transforms(&p.steps, &mut sections[0]);
+    let palette = p.palette.map(|c| (c, p.channels[0].w));
+    p.layout
+        .write_transforms(&p.steps, palette, &mut sections[0]);
     write_lz_section(
         &streams.global,
         distance_ctx,

@@ -299,6 +299,18 @@ pub(super) fn setup_dc_group(
             // Else leave ordinary fine blocks on the incumbent they replaced.
         }
     }
+    // Color under low alpha coarsens only once every layout and quant-field
+    // decision is made: the refinement trellis prices quant residuals over
+    // the whole field, so an earlier change moves visible blocks too.
+    if let Some(factors) = ctx.alpha_aq.get() {
+        crate::adaptive_quant::apply_alpha_factors(
+            &mut dc_data.raw_quant_field,
+            &dc_data.ac_strategy,
+            factors,
+            dc_group_x0 / K_BLOCK_DIM,
+            dc_group_y0 / K_BLOCK_DIM,
+        );
+    }
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
 }
 

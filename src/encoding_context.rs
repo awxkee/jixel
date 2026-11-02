@@ -59,7 +59,7 @@ pub(crate) enum FrameRole {
     /// The only frame.
     #[default]
     Last,
-    /// First frame, saved to reference slot 0 after the colour transform;
+    /// First frame, saved to reference slot 0 after the color transform;
     /// the ink frame is blended over it.
     SavedFirst,
 }
@@ -122,12 +122,18 @@ pub(crate) struct EncodingContext {
     pub(crate) extra_squeeze_distance: f32,
     /// Learned MA trees for the squeezed extra channel.
     pub(crate) extra_learned_trees: bool,
-    /// Fixed context trees (neighbour-activity splits, Zero prediction of the
+    /// The learned frame-wide tree of a losslessly coded extra channel, at
+    /// this budget; None keeps the fixed per-group coding.
+    pub(crate) extra_plane_tree: Option<crate::lossless::PlaneTreeBudget>,
+    /// Fixed context trees (neighbor-activity splits, Zero prediction of the
     /// residuals) instead of one Gradient leaf per squeezed channel.
     pub(crate) extra_context_trees: bool,
     /// XYB rendition of a non-XYB frame. Adaptive quantization reads its
     /// luma instead of the coded planes.
     pub(crate) aq_source: std::sync::OnceLock<crate::image::Image3F>,
+    /// Per-block quant-field multipliers from the frame's alpha (blocks per
+    /// row, row-major factors): color under low alpha is coarser.
+    pub(crate) alpha_aq: std::sync::OnceLock<(usize, Vec<f32>)>,
     /// Coverage (0..1) of the layer blended over this frame, per pixel: the
     /// final image shows `1 - coverage` of this frame's colors.
     #[cfg(feature = "splines")]
@@ -582,11 +588,13 @@ impl EncodingContext {
                 std::sync::atomic::AtomicU32::new(84.0f32.to_bits()),
             ],
             aq_source: std::sync::OnceLock::new(),
+            alpha_aq: std::sync::OnceLock::new(),
             #[cfg(feature = "splines")]
             overlay_coverage: None,
             extra_step: 1,
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
+            extra_plane_tree: None,
             extra_context_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),

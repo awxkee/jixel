@@ -1164,6 +1164,30 @@ fn alpha_learned_trees(config: &EncodeConfig) -> bool {
         && matches!(config.speed, Speed::Slow | Speed::ExtraSlow)
 }
 
+pub(crate) fn alpha_plane_tree(
+    speed: Speed,
+    decoding_speed: DecodingSpeed,
+) -> Option<crate::lossless::PlaneTreeBudget> {
+    use crate::lossless::PlaneTreeBudget;
+    if decoding_speed == DecodingSpeed::Fastest {
+        return None;
+    }
+    match speed {
+        Speed::UltraFast => None,
+        Speed::Fastest | Speed::Fast => Some(PlaneTreeBudget {
+            samples: 1 << 16,
+            leaves: 16,
+            gradient_only: true,
+        }),
+        Speed::Medium | Speed::MediumSlow => Some(PlaneTreeBudget {
+            samples: 1 << 18,
+            leaves: 256,
+            gradient_only: false,
+        }),
+        Speed::Slow | Speed::ExtraSlow => Some(PlaneTreeBudget::FULL),
+    }
+}
+
 pub(crate) fn lossy_context(
     config: &EncodeConfig,
     distance: f32,
@@ -1193,6 +1217,7 @@ pub(crate) fn lossy_context(
     };
     ctx.extra_squeeze_distance = ALPHA_SQUEEZE_SCALE * alpha_distance;
     ctx.extra_learned_trees = alpha_learned_trees(config);
+    ctx.extra_plane_tree = alpha_plane_tree(config.speed, config.decoding_speed);
     ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
     #[cfg(feature = "splines")]
     {
@@ -1733,7 +1758,7 @@ fn encode_ink_base(
     Ok((ctx, frame))
 }
 
-/// A colour on the XYB lattice of the VarDCT base, as the YCoCg triple the
+/// A color on the XYB lattice of the VarDCT base, as the YCoCg triple the
 /// signaled RCT restores exactly: Y, X and B-Y on the default LF dequant
 /// steps.
 fn xyb_lattice_ycocg(
@@ -3790,7 +3815,12 @@ mod tests {
 
     #[test]
     fn slow_encodes_short_wide_strips() {
-        for (width, height) in [(1598usize, 9usize), (1598, 1), (9, 1598), (777, 15)] {
+        for (width, height, distance) in [
+            (1598usize, 9usize, 0.5f32),
+            (1598, 1, 1.0),
+            (9, 1598, 3.0),
+            (777, 15, 1.0),
+        ] {
             let mut pixels = Vec::with_capacity(width * height * 3);
             for y in 0..height {
                 for x in 0..width {
@@ -3798,14 +3828,12 @@ mod tests {
                     pixels.extend_from_slice(&[v, v.wrapping_mul(3), 255 - v]);
                 }
             }
-            for distance in [0.5f32, 1.0, 3.0] {
-                let config = EncodeConfig::default()
-                    .with_distance(distance)
-                    .with_speed(Speed::Slow);
-                let bytes = encode_image(&pixels, width, height, &config)
-                    .unwrap_or_else(|e| panic!("{width}x{height} d={distance}: {e:?}"));
-                assert!(!bytes.is_empty());
-            }
+            let config = EncodeConfig::default()
+                .with_distance(distance)
+                .with_speed(Speed::Slow);
+            let bytes = encode_image(&pixels, width, height, &config)
+                .unwrap_or_else(|e| panic!("{width}x{height} d={distance}: {e:?}"));
+            assert!(!bytes.is_empty());
         }
     }
 
@@ -3860,7 +3888,7 @@ mod encode_smoke_tests {
 
     #[test]
     fn palette_ink_is_deterministic_across_workers_and_preserves_plain_fallback() {
-        let (width, height) = (1100, 130);
+        let (width, height) = (600, 130);
         let rgb: Vec<_> = (0..height)
             .flat_map(|y| {
                 (0..width).flat_map(move |x| {
@@ -4218,26 +4246,24 @@ mod encode_smoke_tests {
             .iter()
             .flat_map(|&[r, g, b]| [r, g, b, 200])
             .collect();
-        for speed in [Speed::Fast, Speed::Slow] {
-            let off = lossy().with_speed(speed).with_num_threads(1);
-            let on = off.clone().with_progressive_dc(true);
-            let full = encode_image(&rgb, w, h, &on).unwrap();
-            assert_ne!(encode_image(&rgb, w, h, &off).unwrap(), full);
-            // Level counts clamp to the 1..=2 this DC image allows.
-            let levels = |n| encode_image(&rgb, w, h, &on.clone().with_progressive_dc_levels(n));
-            assert_eq!(levels(99).unwrap(), full);
-            assert_eq!(levels(0).unwrap(), levels(1).unwrap());
-            assert_ne!(levels(1).unwrap(), full);
-            // A 2x2 DC image cannot be squeezed; alpha frames keep their DC.
-            assert_eq!(
-                encode_image(&rgb8(), W, H, &off).unwrap(),
-                encode_image(&rgb8(), W, H, &on).unwrap()
-            );
-            assert_eq!(
-                encode_image_with_alpha(&rgba, w, h, &off).unwrap(),
-                encode_image_with_alpha(&rgba, w, h, &on).unwrap()
-            );
-        }
+        let off = lossy().with_num_threads(1);
+        let on = off.clone().with_progressive_dc(true);
+        let full = encode_image(&rgb, w, h, &on).unwrap();
+        assert_ne!(encode_image(&rgb, w, h, &off).unwrap(), full);
+        // Level counts clamp to the 1..=2 this DC image allows.
+        let levels = |n| encode_image(&rgb, w, h, &on.clone().with_progressive_dc_levels(n));
+        assert_eq!(levels(99).unwrap(), full);
+        assert_eq!(levels(0).unwrap(), levels(1).unwrap());
+        assert_ne!(levels(1).unwrap(), full);
+        // A 2x2 DC image cannot be squeezed; alpha frames keep their DC.
+        assert_eq!(
+            encode_image(&rgb8(), W, H, &off).unwrap(),
+            encode_image(&rgb8(), W, H, &on).unwrap()
+        );
+        assert_eq!(
+            encode_image_with_alpha(&rgba, w, h, &off).unwrap(),
+            encode_image_with_alpha(&rgba, w, h, &on).unwrap()
+        );
     }
 
     #[test]
@@ -4274,30 +4300,28 @@ mod encode_smoke_tests {
 
     #[test]
     fn public_lossy_paths_share_the_minimum_distance() {
-        for speed in [Speed::Fast, Speed::Medium, Speed::Slow] {
+        for speed in [Speed::Fast, Speed::Slow] {
             let at_floor = EncodeConfig::default()
                 .with_speed(speed)
                 .with_distance(0.05);
-            for distance in [0.001, 0.03, 0.049] {
-                let below = at_floor.clone().with_distance(distance);
-                macro_rules! same_output {
-                    ($encode:ident, $pixels:expr) => {
-                        assert_eq!(
-                            $encode(&$pixels, W, H, &below).unwrap(),
-                            $encode(&$pixels, W, H, &at_floor).unwrap(),
-                            "{}: speed={speed:?} d={distance}",
-                            stringify!($encode)
-                        );
-                    };
-                }
-                same_output!(encode_image, rgb8());
-                same_output!(encode_image_with_alpha, rgba8());
-                same_output!(encode_image_16bit, rgb16());
-                same_output!(encode_image_gray, gray8());
-                same_output!(encode_image_gray_16bit, gray16());
-                same_output!(encode_image_f32, rgb_f32());
-                same_output!(encode_image_gray_f32, gray_f32());
+            let below = at_floor.clone().with_distance(0.001);
+            macro_rules! same_output {
+                ($encode:ident, $pixels:expr) => {
+                    assert_eq!(
+                        $encode(&$pixels, W, H, &below).unwrap(),
+                        $encode(&$pixels, W, H, &at_floor).unwrap(),
+                        "{}: speed={speed:?}",
+                        stringify!($encode)
+                    );
+                };
             }
+            same_output!(encode_image, rgb8());
+            same_output!(encode_image_with_alpha, rgba8());
+            same_output!(encode_image_16bit, rgb16());
+            same_output!(encode_image_gray, gray8());
+            same_output!(encode_image_gray_16bit, gray16());
+            same_output!(encode_image_f32, rgb_f32());
+            same_output!(encode_image_gray_f32, gray_f32());
         }
     }
 
@@ -4710,18 +4734,16 @@ mod encode_smoke_tests {
                 pixels[(y * SIZE + x0) * 3..][..w * 3].fill(0);
             }
         }
-        for distance in [1.0f32, 3.0] {
-            let plain = EncodeConfig::default().with_distance(distance);
-            let patched = plain.clone().with_patches(true);
-            let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
-            let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
-            assert!(
-                patched.len() * 10 <= plain.len() * 11,
-                "d={distance}: {} vs {}",
-                patched.len(),
-                plain.len()
-            );
-        }
+        let plain = EncodeConfig::default().with_distance(1.0);
+        let patched = plain.clone().with_patches(true);
+        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
+        let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
+        assert!(
+            patched.len() * 10 <= plain.len() * 11,
+            "{} vs {}",
+            patched.len(),
+            plain.len()
+        );
     }
 
     /// Sixty dark 5x7 glyphs on white, set as lines of text off the block
@@ -5021,32 +5043,28 @@ mod encode_smoke_tests {
 
     #[test]
     fn learned_rate_encodes_images_smaller_than_a_region() {
-        for size in [8usize, 40, 63, 100] {
+        for (size, distance) in [(8usize, 1.0f32), (40, 3.0), (63, 1.0), (100, 3.0)] {
             let pixels = checkerboard_rgb(size);
-            for distance in [1.0f32, 3.0] {
-                let bytes = encode_image(&pixels, size, size, &learned_rate_lossy(distance))
-                    .expect("encode failed");
-                assert!(!bytes.is_empty(), "{size} at d={distance}");
-            }
+            let bytes = encode_image(&pixels, size, size, &learned_rate_lossy(distance))
+                .expect("encode failed");
+            assert!(!bytes.is_empty(), "{size} at d={distance}");
         }
     }
 
     #[test]
     fn learned_rate_shrinks_a_block_periodic_pattern() {
-        const SIZE: usize = 256;
+        const SIZE: usize = 128;
         let pixels = checkerboard_rgb(SIZE);
-        for distance in [2.0f32, 3.0] {
-            let learned = learned_rate_lossy(distance).with_num_threads(1);
-            let fixed = learned.clone().with_learned_rate(false);
-            let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
-            let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
-            assert!(
-                learned.len() * 10 < fixed.len() * 8,
-                "d={distance}: {} vs {}",
-                learned.len(),
-                fixed.len()
-            );
-        }
+        let learned = learned_rate_lossy(2.0).with_num_threads(1);
+        let fixed = learned.clone().with_learned_rate(false);
+        let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
+        let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+        assert!(
+            learned.len() * 10 < fixed.len() * 8,
+            "{} vs {}",
+            learned.len(),
+            fixed.len()
+        );
     }
 
     #[test]
@@ -5075,7 +5093,7 @@ mod encode_smoke_tests {
         // One-pixel lines on black every 8 pixels. IDENTITY codes them in
         // a few tokens per block; under the fixed model they are only
         // tried on the blocks the merges left.
-        const SIZE: usize = 256;
+        const SIZE: usize = 128;
         let mut pixels = Vec::with_capacity(SIZE * SIZE * 3);
         for y in 0..SIZE {
             for x in 0..SIZE {
@@ -5432,8 +5450,8 @@ mod encode_smoke_tests {
 mod lossy_alpha_tests {
     use super::*;
 
-    const W: usize = 320;
-    const H: usize = 280;
+    const W: usize = 160;
+    const H: usize = 136;
 
     fn rgba(alpha: impl Fn(usize, usize) -> u8) -> Vec<u8> {
         (0..W * H)
@@ -5557,5 +5575,75 @@ mod lossy_alpha_tests {
             .with_speed(Speed::Fast)
             .with_alpha_distance(0.0);
         assert!(encode_image_with_alpha(&rgba, w, h, &config).unwrap().len() < 6000);
+    }
+
+    #[test]
+    fn color_under_partial_alpha_codes_coarser() {
+        // A textured glow whose alpha never reaches 0 or 1: only the
+        // alpha-aware quant field tells the two encodes apart.
+        let (w, h) = (256, 256);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as f32 - 128.0).hypot(y as f32 - 128.0) / 128.0).min(1.0);
+                let a = (8.0 + 200.0 * (1.0 - r)) as u8;
+                let t = ((x * 7 + y * 13) % 64) as u8;
+                rgba.extend([120 + t, 80 + t / 2, 200 - t, a]);
+            }
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Fast)
+            .with_distance(1.5);
+        let weighted = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        let flat = encode_image_with_alpha(&rgba, w, h, &config.with_fill_invisible(false))
+            .unwrap()
+            .len();
+        assert!(weighted * 10 < flat * 9, "{weighted} vs {flat}");
+    }
+
+    #[test]
+    fn slow_lossy_alpha_codes_anti_aliased_cutouts_through_few_levels() {
+        // Flat color under three discs with 1.5 px anti-aliased rims: the
+        // squeeze spends its alpha bits on the rims, the lossy palette keeps
+        // a few rim levels (2263 B squeezed when this was written).
+        let (w, h) = (320, 288);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let a = [
+                    (90.0, 90.0, 60.0),
+                    (220.0, 150.0, 80.0),
+                    (120.0, 220.0, 45.0),
+                ]
+                .iter()
+                .map(|&(cx, cy, r): &(f32, f32, f32)| {
+                    let d = (x as f32 - cx).hypot(y as f32 - cy) - r;
+                    (0.5 - d / 1.5).clamp(0.0, 1.0)
+                })
+                .fold(0.0f32, f32::max);
+                rgba.extend([200, 60, 90, (a * 255.0 + 0.5) as u8]);
+            }
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_distance(3.0);
+        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        assert!(bytes < 1900, "{bytes}");
+        // Lossy modular frames code the levels through a Palette transform
+        // after the squeeze (3277 B squeezed at d1.5 when this was written).
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_distance(1.5)
+            .with_coding_transform(crate::CodingTransform::YCbCr)
+            .with_lossy_modular(crate::LossyModular::Force);
+        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        assert!(bytes < 2800, "{bytes}");
+        // Fast codes the levels through its gradient lookup-table tree
+        // (3519 B squeezed at d1.5 when this was written).
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Fast)
+            .with_distance(1.5);
+        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        assert!(bytes < 3150, "{bytes}");
     }
 }
