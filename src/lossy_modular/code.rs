@@ -57,17 +57,47 @@ pub(super) fn write_frame(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
-    mut cache: Option<&mut TreeCache>,
+    cache: Option<&mut TreeCache>,
 ) {
     let min_symbol = min_symbol(p);
     let grid = Grid::new(p.xsize, p.ysize);
+    // One group: the fixed-predictor single path or the learned forest.
+    // Learned contexts take 256x256 crops and thumbnails -9.3 % at Slow and
+    // -25.8 % at Fast (same pixels, 12 images x 3 distances); the single path
+    // stays smaller in 3 of 36 (by <= 2 %), so Slow races both and the
+    // fastest tiers keep the single path (2-4x its time).
     if grid.num_ac_groups == 1 && !p.dc_frame {
-        single::write_frame(p, min_symbol, speed, pool, scratch, writer);
-        return;
+        if speed < crate::Speed::Fast {
+            single::write_frame(p, min_symbol, speed, pool, scratch, writer);
+            return;
+        }
+        if speed >= crate::Speed::Slow {
+            let mut single_writer = writer.clone();
+            single::write_frame(p, min_symbol, speed, pool, scratch, &mut single_writer);
+            write_grouped(p, speed, pool, scratch, writer, cache, min_symbol, &grid);
+            if single_writer.bits_written() <= writer.bits_written() {
+                *writer = single_writer;
+            }
+            return;
+        }
     }
+    write_grouped(p, speed, pool, scratch, writer, cache, min_symbol, &grid);
+}
 
+/// The learned-forest path over the frame's tags and group streams.
+#[allow(clippy::too_many_arguments)]
+fn write_grouped(
+    p: &Pyramid,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+    mut cache: Option<&mut TreeCache>,
+    min_symbol: u32,
+    grid: &Grid,
+) {
     // 1. Tags: which stream and slot codes every channel crop.
-    let tags = Tags::new(p, &grid);
+    let tags = Tags::new(p, grid);
     let refs = References::new(p, tags.split);
     let keys: Vec<Option<CacheKey>> = (0..tags.len())
         .map(|t| {
