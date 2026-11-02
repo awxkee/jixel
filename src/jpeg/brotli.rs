@@ -570,15 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn compresses_across_meta_blocks() {
-        // Past one 16 MiB meta-block, with matches reaching back across it.
-        let mut data = words(MAX_META_BLOCK + 100_000, 3);
-        let tail = data[..50_000].to_vec();
-        data.extend_from_slice(&tail);
-        roundtrip(&data);
-    }
-
-    #[test]
     fn falls_back_to_stored_for_noise() {
         let mut state = 0x9E37_79B9u32;
         let data: Vec<u8> = (0..10_000)

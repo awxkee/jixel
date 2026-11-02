@@ -157,7 +157,108 @@ pub(crate) fn encode_plain_frame(
         });
     let mut pyramid = Pyramid::plain(input, xsize, ysize, distance, unsqueeze, pool)?;
     pyramid.group_shift = group_shift(speed);
-    race::encode(pyramid, speed, pool, scratch, writer)
+    // From Slow, a lossy extra channel (alpha) also races as a lossy
+    // palette, decided on the extras alone under an all-zero gray plane like
+    // the unsqueeze choice above. Fastest underrates the palette but never
+    // overrates it: below 1x the squeeze's size it is the palette, above
+    // 1.5x the squeeze, and in between Fast decides (32/160 encodes over 32
+    // RGBA images; all choices 9 bytes from the full double encode's).
+    let Some(levels) = (speed >= crate::Speed::Slow)
+        .then(|| lossy_palette_levels(input, &pyramid, xsize, ysize))
+        .flatten()
+    else {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    };
+    let zero = vec![vec![0; xsize * ysize]];
+    let alone = |extra: Vec<(Vec<i32>, f32)>| PlainInput {
+        color: zero.clone(),
+        extra,
+        max: input.max,
+        coding: input.coding,
+    };
+    let mut levels = alone(vec![(levels, 0.0)]);
+    let probes = Pyramid::plain(
+        &alone(input.extra.clone()),
+        xsize,
+        ysize,
+        distance,
+        false,
+        pool,
+    )
+    .zip(Pyramid::plain_palette(
+        &levels, xsize, ysize, distance, pool,
+    ));
+    let Some(mut probes) = probes else {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    };
+    probes.0.group_shift = pyramid.group_shift;
+    probes.1.group_shift = pyramid.group_shift;
+    let bits = |p: &Pyramid, speed: crate::Speed, scratch: &mut CoderScratch| {
+        let mut w = BitWriter::new();
+        code::write_frame(p, speed, pool, scratch, &mut w, None);
+        w.bits_written() as f64
+    };
+    let ratio = bits(&probes.1, crate::Speed::Fastest, scratch)
+        / bits(&probes.0, crate::Speed::Fastest, scratch);
+    let take = ratio < 1.0
+        || ratio <= PALETTE_PROBE_BAND
+            && bits(&probes.1, crate::Speed::Fast, scratch)
+                < bits(&probes.0, crate::Speed::Fast, scratch);
+    if !take {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    }
+    levels.color = input.color.clone();
+    let Some(mut palette) = Pyramid::plain_palette(&levels, xsize, ysize, distance, pool) else {
+        return race::encode(pyramid, speed, pool, scratch, writer);
+    };
+    palette.group_shift = pyramid.group_shift;
+    race::encode(palette, speed, pool, scratch, writer)
+}
+
+/// Fastest probe ratio (palette over squeeze) up to which Fast re-decides:
+/// the largest Fastest overrating of the squeeze measured was 1.38x.
+const PALETTE_PROBE_BAND: f64 = 1.5;
+
+/// The lossy palette levels of a plain frame's one lossy extra channel
+/// (alpha): the fewest levels within part of the squeezed channel's weighted
+/// error ([`crate::frame::extra_levels`]), to code losslessly through a
+/// Palette transform. None without such a channel, or when every value is
+/// needed.
+fn lossy_palette_levels(
+    input: &PlainInput,
+    squeezed: &Pyramid,
+    xsize: usize,
+    ysize: usize,
+) -> Option<Vec<i32>> {
+    use crate::encode_image::AlphaPlane;
+    use crate::frame::extra_levels::{LOSSY_PALETTE_ERROR, error_weights, fewest_levels};
+    let [(plane, d)] = input.extra.as_slice() else {
+        return None;
+    };
+    if *d <= 0.0 || plane.iter().any(|&v| !(0..=65535).contains(&v)) {
+        return None;
+    }
+    let source = AlphaPlane::U16 {
+        data: plane.iter().map(|&v| v as u16).collect(),
+        bits: 16,
+    };
+    let weights = error_weights(&source, xsize, ysize);
+    let error: f64 = squeezed
+        .decoded_extra(0)
+        .iter()
+        .zip(plane)
+        .zip(&weights)
+        .map(|((&v, &s), &w)| {
+            let e = f64::from(v.clamp(0, 65535) - s);
+            f64::from(w) * e * e
+        })
+        .sum();
+    let AlphaPlane::U16 { data, .. } =
+        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error)?
+    else {
+        unreachable!("levels keep the plane's type")
+    };
+    Some(data.into_iter().map(i32::from).collect())
 }
 
 /// The group_size_shift of a regular frame. From Slow, 1024-pixel groups:

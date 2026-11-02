@@ -51,6 +51,14 @@ use crate::squeeze::{
 };
 use crate::thread_pool::ThreadPool;
 
+/// Bound of a palette's divided entries: 12-bit values keep the frame's
+/// literal symbols below its LZ77 lengths.
+const META_MAX: u32 = 4096;
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// The non-XYB frame's integer planes for the arm: `color` holds one (gray)
 /// or three channels in the coded plane order, `extra` the extra channels
 /// with their squeeze distances (0 = lossless), all in units of `max`.
@@ -63,29 +71,34 @@ pub(crate) struct PlainInput {
 
 /// The arm's quantized state: divided channels, per-channel steps, and the
 /// squeeze script that produced them.
-pub(super) struct Pyramid {
-    pub(super) channels: Vec<Channel>,
-    pub(super) quants: Vec<u32>,
-    pub(super) steps: Vec<SqueezeStep>,
-    pub(super) layout: Layout,
+pub(crate) struct Pyramid {
+    pub(crate) channels: Vec<Channel>,
+    pub(crate) quants: Vec<u32>,
+    pub(crate) steps: Vec<SqueezeStep>,
+    pub(crate) layout: Layout,
     /// Decoder EPF (iterations, modular sigma) for the frame header.
-    pub(super) epf: (u32, f32),
+    pub(crate) epf: (u32, f32),
     /// Code the pyramid as the 1:8 DC frame of a VarDCT frame.
-    pub(super) dc_frame: bool,
-    pub(super) xsize: usize,
-    pub(super) ysize: usize,
+    pub(crate) dc_frame: bool,
+    pub(crate) xsize: usize,
+    pub(crate) ysize: usize,
     /// Patch dictionary entries the decoder adds after the frame (XYB frames;
     /// the atlas is a reference frame coded before this one).
-    pub(super) patches: Vec<PatchReference>,
+    pub(crate) patches: Vec<PatchReference>,
     /// The frame's group_size_shift: groups of 128 << it pixels, LF groups
     /// 8x that.
-    pub(super) group_shift: u32,
+    pub(crate) group_shift: u32,
+    /// An unsqueezed lossless extra channel coded through a Palette transform
+    /// after the squeeze: its index in the squeezed channel list. Channel 0
+    /// is then the palette's meta channel (the entries, ascending) and the
+    /// channel at that index + 1 holds the indices.
+    pub(crate) palette: Option<usize>,
 }
 
 impl Pyramid {
     /// The XYB image at the calibrated `distance`, on the screen-content rows
     /// when `screen`. None when the image is too small to squeeze.
-    pub(super) fn xyb(
+    pub(crate) fn xyb(
         xyb: &Image3F,
         distance: f32,
         screen: bool,
@@ -108,7 +121,7 @@ impl Pyramid {
 
     /// The 1:8 DC image of a VarDCT frame, quantized relative to its
     /// `vardct_steps` and squeezed `levels` deep.
-    pub(super) fn dc_frame(
+    pub(crate) fn dc_frame(
         dc: &Image3F,
         vardct_steps: [f32; 3],
         levels: Option<u32>,
@@ -208,6 +221,7 @@ impl Pyramid {
             ysize,
             patches: Vec::new(),
             group_shift: GroupLayout::DEFAULT.shift,
+            palette: None,
         })
     }
 
@@ -215,7 +229,7 @@ impl Pyramid {
     /// `unsqueeze_lossless`, trailing lossless extra channels stay out of the
     /// squeeze (same samples, another coding). None when the image is too
     /// small to squeeze.
-    pub(super) fn plain(
+    pub(crate) fn plain(
         input: &PlainInput,
         xsize: usize,
         ysize: usize,
@@ -323,21 +337,106 @@ impl Pyramid {
             ysize,
             patches: Vec::new(),
             group_shift: GroupLayout::DEFAULT.shift,
+            palette: None,
         })
     }
 
+    /// [`Self::plain`] with its one extra channel lossless, unsqueezed and
+    /// coded through a Palette transform after the squeeze: the channel's
+    /// distinct values become a meta channel in front, the samples their
+    /// indices. None when the plain pyramid is, when the input carries other
+    /// than one lossless extra, or when its values do not fit a global-stream
+    /// palette (2..=256 entries, at most a group wide).
+    pub(crate) fn plain_palette(
+        input: &PlainInput,
+        xsize: usize,
+        ysize: usize,
+        distance: f32,
+        pool: &ThreadPool,
+    ) -> Option<Self> {
+        if !matches!(input.extra.as_slice(), [(_, d)] if *d == 0.0) {
+            return None;
+        }
+        let mut p = Self::plain(input, xsize, ysize, distance, true, pool)?;
+        // The unsqueezed extra precedes the chroma pre-squeeze residuals.
+        let n_pre: usize = p
+            .steps
+            .iter()
+            .filter(|s| !s.in_place)
+            .map(|s| s.num_c)
+            .sum();
+        let c = p.channels.len() - n_pre - 1;
+        let mut entries = p.channels[c].data.clone();
+        entries.sort_unstable();
+        entries.dedup();
+        // The entries are coded divided by their common step (257 for 8-bit
+        // levels on the 16-bit lattice) under a leaf multiplier; wider ones
+        // would overflow the frame's literal alphabet ([`min_symbol`]).
+        let step = entries
+            .iter()
+            .fold(0u32, |g, &v| gcd(g, v.unsigned_abs()))
+            .max(1);
+        if !(2..=256.min(p.group_dim())).contains(&entries.len())
+            || entries
+                .iter()
+                .any(|&v| v < 0 || v as u32 / step >= META_MAX)
+        {
+            return None;
+        }
+        for v in &mut p.channels[c].data {
+            *v = entries.binary_search(v).expect("an entry") as i32;
+        }
+        let colors = entries.len();
+        p.channels.insert(
+            0,
+            Channel {
+                data: entries.iter().map(|&v| v / step as i32).collect(),
+                w: colors,
+                h: 1,
+                hshift: 0,
+                vshift: 0,
+            },
+        );
+        p.quants.insert(0, step);
+        p.palette = Some(c);
+        Some(p)
+    }
+
+    /// The decoded samples of extra channel `k` before the decoder's clamp
+    /// (no palette): dequantize, then run the squeeze script backwards.
+    pub(crate) fn decoded_extra(&self, k: usize) -> Vec<i32> {
+        debug_assert!(self.palette.is_none());
+        let Layout::Plain { extra, .. } = self.layout else {
+            unreachable!("extra channels live in plain frames")
+        };
+        let mut channels: Vec<Channel> = self
+            .channels
+            .iter()
+            .zip(&self.quants)
+            .map(|(ch, &q)| Channel {
+                data: ch.data.iter().map(|&v| v * q as i32).collect(),
+                ..*ch
+            })
+            .collect();
+        for s in self.steps.iter().rev() {
+            crate::squeeze::apply_step_inverse(&mut channels, s);
+        }
+        let num_color = channels.len() - extra;
+        channels.swap_remove(num_color + k).data
+    }
+
     /// The side of a group, in pixels.
-    pub(super) fn group_dim(&self) -> usize {
+    pub(crate) fn group_dim(&self) -> usize {
         128 << self.group_shift
     }
 
     /// The side of an LF group, in pixels.
-    pub(super) fn lf_group_dim(&self) -> usize {
+    pub(crate) fn lf_group_dim(&self) -> usize {
         self.group_dim() * 8
     }
 
     /// The frame header: the DC frame's, or the layout's regular one.
-    pub(super) fn write_frame_header(&self, w: &mut BitWriter) {
+    pub(crate) fn write_frame_header(&self, w: &mut BitWriter) {
         if self.dc_frame {
             write_dc_frame_header(w);
         } else {
@@ -347,7 +446,7 @@ impl Pyramid {
     }
 
     /// The patch dictionary that opens the LfGlobal section, if any.
-    pub(super) fn patch_dictionary(&self, scratch: &mut CoderScratch) -> Option<BitWriter> {
+    pub(crate) fn patch_dictionary(&self, scratch: &mut CoderScratch) -> Option<BitWriter> {
         if self.patches.is_empty() {
             return None;
         }

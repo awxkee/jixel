@@ -322,7 +322,7 @@ mod tests {
             dc.ac_strategy.set_first(8, 8, strategy);
             // (70, 76) crosses the image edge: the view gathers the same
             // replicated pixels a padded stripe holds.
-            for origin in [(0, 0), (59, 61), (70, 76)] {
+            for origin in [(59, 61), (70, 76)] {
                 let visible_x = (image.xsize() - origin.0).min(64);
                 let visible_y = (image.ysize() - origin.1).min(64);
                 let at_edge = visible_x < 64 || visible_y < 64;

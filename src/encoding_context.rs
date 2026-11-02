@@ -122,6 +122,9 @@ pub(crate) struct EncodingContext {
     pub(crate) extra_squeeze_distance: f32,
     /// Learned MA trees for the squeezed extra channel.
     pub(crate) extra_learned_trees: bool,
+    /// The learned frame-wide tree of a losslessly coded extra channel, at
+    /// this budget; None keeps the fixed per-group coding.
+    pub(crate) extra_plane_tree: Option<crate::lossless::PlaneTreeBudget>,
     /// Fixed context trees (neighbour-activity splits, Zero prediction of the
     /// residuals) instead of one Gradient leaf per squeezed channel.
     pub(crate) extra_context_trees: bool,
@@ -587,6 +590,7 @@ impl EncodingContext {
             extra_step: 1,
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
+            extra_plane_tree: None,
             extra_context_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),

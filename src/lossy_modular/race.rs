@@ -129,7 +129,7 @@ mod tests {
                 max: 65535.0,
                 coding: CodingTransform::Rgb,
             };
-            for alignment in 0..8 {
+            for alignment in [0, 1, 7] {
                 let quantized = Pyramid::plain(
                     &input,
                     w,

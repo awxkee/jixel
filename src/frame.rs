@@ -40,6 +40,7 @@ mod dc_smoothing;
 mod dc_tokens;
 mod encoder;
 mod extra_channels;
+pub(crate) mod extra_levels;
 mod extra_tree;
 mod header;
 #[cfg(feature = "extraslow")]

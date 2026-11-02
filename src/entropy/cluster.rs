@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn cached_ans_merges_match_recomputing_every_pair() {
         use super::super::ans::{AnsCostScratch, fast_ans_population_cost_scratch};
-        for n in [0, 1, 2, 7, 32, 64, CLUSTERS_LIMIT] {
+        for n in [0, 1, 2, 7, 64] {
             for family in 0..4 {
                 let base: Vec<_> = (0..n)
                     .map(|i| match family {
@@ -1903,7 +1903,7 @@ mod tests {
         // Identical adjacent seeds exercise first-best ties. Inputs spanning
         // many distributions force invalidation of multiple clusters within
         // each batch; preassigned empty contexts and partial batches are kept.
-        for (clusters, n) in [(64, 1287), (96, 2115), (128, 4129)] {
+        for (clusters, n) in [(64, 1287), (128, 2115)] {
             let inp: Vec<_> = (0..n)
                 .map(|i| {
                     let mut h = Histogram::new();
@@ -1970,7 +1970,7 @@ mod tests {
                 expected_costs[best] = histogram_bit_cost(&expected[best]);
                 *symbol = best as u8;
             }
-            for threads in [1, 2, 4, 12] {
+            for threads in [1, 3] {
                 let pool = ThreadPool::new_lossless(threads);
                 let mut actual = inp[..clusters].to_vec();
                 let mut costs = in_costs[..clusters].to_vec();

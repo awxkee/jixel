@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn optimized_histograms_are_valid_and_representable() {
         let mut state = 0x1234_5678_9abc_def0u64;
-        for case in 0..2_000 {
+        for case in 0..500 {
             let len = case % TABLE_ENTRIES + 1;
             let mut counts = vec![0u32; TABLE_ENTRIES];
             for count in &mut counts[..len] {

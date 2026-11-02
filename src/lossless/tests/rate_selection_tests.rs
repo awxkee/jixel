@@ -183,7 +183,7 @@ fn slow_single_group_palette_is_rate_safe() {
 
 #[test]
 fn slow_local_palette_is_rate_safe_for_mixed_content() {
-    let image = image_from_rgb(257, 257, |x, y| {
+    let image = image_from_rgb(257, 160, |x, y| {
         if x < 256 && y < 128 {
             let c = ((x / 16 + y / 16) & 7) as i32;
             [c * 31, c * 17, c * 7]

@@ -229,7 +229,6 @@ impl ExtraSqueeze {
     }
 
     /// The plane a decoder reconstructs, before clamping to the sample range.
-    #[cfg(test)]
     pub(crate) fn reconstruct(&self) -> Vec<i32> {
         use crate::squeeze::{Channel, apply_step_inverse};
         let mut channels: Vec<Channel> = self

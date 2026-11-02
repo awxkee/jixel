@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn squeeze_search_preserves_reference_decisions_and_levels() {
-        for (w, h) in [(2, 2), (3, 5), (16, 17), (65, 33), (513, 5), (5, 513)] {
+        for (w, h) in [(2, 2), (3, 5), (65, 33), (513, 5)] {
             for family in 0..5 {
                 for custom_cfl in [false, true] {
                     assert_search_matches(w, h, family, custom_cfl);

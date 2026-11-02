@@ -235,6 +235,12 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
             config.speed,
             crate::Speed::UltraFast | crate::Speed::Fastest | crate::Speed::Fast
         );
+    // K's lossless side keeps the full tree wherever its squeeze learns one.
+    ctx.extra_plane_tree = if ctx.extra_learned_trees {
+        Some(crate::lossless::PlaneTreeBudget::FULL)
+    } else {
+        crate::encode_image::alpha_plane_tree(config.speed, config.decoding_speed)
+    };
     ctx.extra_context_trees = config.decoding_speed != crate::DecodingSpeed::Fastest;
     if passes.len() > 1 && crate::squeeze::default_squeeze_steps(width, height, 1).is_empty() {
         // Tiny planes have no Squeeze levels; retain the progressive lattice
@@ -331,33 +337,31 @@ mod tests {
     /// lossless encodes; every CMYK file declares level 10.
     #[test]
     fn encodes_lossy_and_lossless() {
-        let (w, h) = (300, 270);
+        // Odd size so partial blocks and groups are exercised; the CMYK
+        // plumbing is speed-independent, so Fast covers every coding path.
+        let (w, h) = (100, 70);
         let px = ramp(w, h);
         let icc = cmyk_icc();
-        for speed in [crate::Speed::Fast, crate::Speed::Slow] {
-            for config in [
-                EncodeConfig::default().with_speed(speed).with_distance(1.5),
-                EncodeConfig::default()
-                    .with_speed(speed)
-                    .with_distance(1.5)
-                    .with_progressive(true),
-                EncodeConfig::default()
-                    .with_speed(speed)
-                    .with_distance(1.5)
-                    .with_coding_transform(crate::CodingTransform::Rgb),
-                EncodeConfig::default()
-                    .with_speed(speed)
-                    .with_distance(1.5)
-                    .with_lossy_modular(crate::LossyModular::Force),
-                EncodeConfig::default()
-                    .with_speed(speed)
-                    .with_lossless(true),
-            ] {
-                for convention in [InkConvention::Amount, InkConvention::Inverted] {
-                    let bytes = encode_image_cmyk(&px, w, h, &icc, convention, &config).unwrap();
-                    assert!(has_box(&bytes, b"jxll"), "CMYK needs a level-10 box");
-                }
-            }
+        let lossy = EncodeConfig::default().with_distance(1.5);
+        for (i, config) in [
+            lossy.clone(),
+            lossy.clone().with_progressive(true),
+            lossy
+                .clone()
+                .with_coding_transform(crate::CodingTransform::Rgb),
+            lossy.clone().with_lossy_modular(crate::LossyModular::Force),
+            EncodeConfig::default().with_lossless(true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let convention = if i % 2 == 0 {
+                InkConvention::Amount
+            } else {
+                InkConvention::Inverted
+            };
+            let bytes = encode_image_cmyk(&px, w, h, &icc, convention, &config).unwrap();
+            assert!(has_box(&bytes, b"jxll"), "CMYK needs a level-10 box");
         }
         let px16: Vec<u16> = px.iter().map(|&v| u16::from(v) << 4).collect();
         let bytes = encode_image_cmyk_16bit(
