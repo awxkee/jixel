@@ -437,8 +437,8 @@ fn rdoq_block_greedy(
             * channel_scale
             * rdoq_distortion_weight(window_index.min(base_window_len), base_window_len, distance);
         let others = total - original_nz;
-        let prev = if k == covered_blocks {
-            initial_prev(others + 1)
+        let previous_nonzero = if k == covered_blocks {
+            0 // The first coefficient derives this flag from each candidate's count.
         } else {
             usize::from(nonzero_at(block, k - 1))
         };
@@ -467,6 +467,11 @@ fn rdoq_block_greedy(
         for &level in &candidates[..candidate_count] {
             let nonzero = usize::from(level != 0);
             let remaining = remaining_after + nonzero;
+            let prev = if k == covered_blocks {
+                initial_prev(others + nonzero)
+            } else {
+                previous_nonzero
+            };
             let rate = if current == 0 && level != 0 {
                 lambda * restore_penalty
             } else {
@@ -1180,6 +1185,86 @@ impl Default for RdoqScratch {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn greedy_first_coefficient_prices_its_candidate_count_predecessor() {
+        use crate::ac_context::{
+            K_NUM_FINE_AC_CONTEXTS, fine_block_context, fine_zero_density_contexts_offset,
+            zero_density_context, zero_density_context_8x8,
+        };
+        use crate::dc_group_data::{STRATEGY_CODE_LUT, STRATEGY_DCT, STRATEGY_DCT16X8};
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        for (raw, cx) in [(STRATEGY_DCT, 1), (STRATEGY_DCT16X8, 2)] {
+            let size = cx * 64;
+            let threshold = size / 16;
+            let strategy = STRATEGY_CODE_LUT[raw as usize];
+            let scan = orders.scan_for(strategy, 1);
+            let block_ctx = fine_block_context(1, strategy, false);
+            let offset = fine_zero_density_contexts_offset(block_ctx);
+            let context = |remaining, prev| {
+                offset
+                    + if cx == 1 {
+                        zero_density_context_8x8(remaining, cx, prev) as u32
+                    } else {
+                        zero_density_context(remaining, cx, cx, cx.trailing_zeros() as usize, prev)
+                            as u32
+                    }
+            };
+            let tokens = [Token::new(0, 0), Token::new(1, 0)];
+            let mut code = build_entropy_code_no_cluster(&tokens, 2, &mut Vec::new());
+            // Keep/count tokens cost 15 bits. Only the first zero's true
+            // predecessor context costs one: dropping takes count 5 -> 4
+            // (or 9 -> 8 for the rectangle), changing its initial flag.
+            for prefix in &mut code.prefix_codes {
+                prefix.depths.fill(15);
+                prefix.single_symbol = false;
+            }
+            code.prefix_codes[1].depths[0] = 1;
+            code.context_map = vec![0; K_NUM_FINE_AC_CONTEXTS];
+            code.context_map[context(threshold, 1) as usize] = 1;
+            let prices = FrozenTokenPrices::new(&code);
+            assert_eq!(prices.token_bits(Token::new(context(threshold, 0), 0)), 15.);
+            assert_eq!(prices.token_bits(Token::new(context(threshold, 1), 0)), 1.);
+            for sign in [-1, 1] {
+                let mut source = vec![0.; size];
+                let mut block = vec![0; size];
+                let first = scan[cx] as usize;
+                source[first] = sign as f32 * 0.6;
+                block[first] = sign;
+                for &raw in &scan[cx + 1..cx + 1 + threshold] {
+                    source[raw as usize] = 3.;
+                    block[raw as usize] = 3;
+                }
+                let mut expected = block.clone();
+                expected[first] = 0;
+                // Search only the first coefficient; suffix levels stay fixed.
+                super::rdoq_block_greedy(
+                    1.,
+                    1,
+                    1,
+                    &prices,
+                    scan,
+                    &source,
+                    &vec![1.; size],
+                    1.,
+                    &mut block,
+                    strategy,
+                    1,
+                    super::DequantBias::DEFAULT[1],
+                    32,
+                    cx,
+                    1,
+                    2.,
+                    false,
+                    0.03,
+                    1.,
+                );
+                assert_eq!(block, expected, "shape {cx}x1, sign {sign}");
+            }
+        }
+    }
+
     #[test]
     fn rdoq_scratch_index_model_is_bounded() {
         let delta = super::RDOQ_MAX_NZERO_DELTA;
