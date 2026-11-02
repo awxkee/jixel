@@ -451,10 +451,6 @@ impl Deadzone {
     /// No deadzone anywhere (the DC frame: +1.6 % BA BD with the colour one).
     pub(super) const NONE: Self = Self { finest_pair: 0.0 };
 
-    /// The colour channels: dev 12 images Slow -2.68 % SS2 / -2.95 % BA BD,
-    /// held-out 20 images -2.66 / -2.35 (Fast alike), plain RGB -0.84 /
-    /// -2.10. Flat deadzones only trade the metrics (0.05: SS2 -0.7 / BA
-    /// +1.2), per-shift decays and rate-aware rounding stay behind.
     pub(super) const COLOR: Self = Self { finest_pair: 0.15 };
 
     /// The deadzone of a residual with this shift sum.
