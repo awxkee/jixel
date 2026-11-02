@@ -141,10 +141,18 @@ fn batches_preserve_special_values_and_rounding() {
                     let mut actual = [0.; 7];
                     batch(&m, &s, &factors, &rates, 0, 0.3, lambda, bias, &mut actual);
                     for i in 0..7 {
+                        // A NaN cost never wins a `<` comparison, whatever its
+                        // sign or payload; x86's scalar invalid operations
+                        // return the sign-set default NaN, its SIMD lanes may not.
                         assert!(
                             actual[i] == f32::INFINITY
+                                || actual[i].is_nan() && expected[i].is_nan()
                                 || actual[i].to_bits() == expected[i].to_bits(),
-                            "i={i}, offset={offset}"
+                            "i={i}, offset={offset}, lambda={lambda}: batch {} ({:#x}) vs single {} ({:#x})",
+                            actual[i],
+                            actual[i].to_bits(),
+                            expected[i],
+                            expected[i].to_bits()
                         );
                     }
                     assert_eq!(winner(&actual, &rates), winner(&expected, &rates));

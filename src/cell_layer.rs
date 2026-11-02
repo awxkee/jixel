@@ -30,13 +30,13 @@
 //! Cell layer: the integer-upscaled part of a mixed image (pixel art, a
 //! zoomed screenshot, a 2x asset inside ordinary content) coded as one
 //! frame at the cell grid's resolution, scaled back by the decoder's
-//! nearest-neighbour kernel and alpha-blended over the rest.
+//! nearest-neighbor kernel and alpha-blended over the rest.
 //!
-//! Segmentation is two bitmaps, "pixel equals its right neighbour" and
+//! Segmentation is two bitmaps, "pixel equals its right neighbor" and
 //! "pixel equals the one below", summed so that any N x N cell at any grid
 //! offset is tested in constant time. A constant cell counts as upscaled
 //! content when it differs from both the cell on its left and the one
-//! above (edges between two flat colours only differ on one side), and the
+//! above (edges between two flat colors only differ on one side), and the
 //! textured cells must be dense: pixel art is textured everywhere, UI
 //! corners are isolated. Flat cells next to textured ones join the layer
 //! so a sprite's background rides along.
@@ -141,7 +141,7 @@ struct Grid<'a> {
 
 impl Grid<'_> {
     /// Whether the cell of `n` pixels at (`x`, `y`), clipped to the image,
-    /// is one colour.
+    /// is one color.
     fn constant(&self, x: usize, y: usize, n: usize) -> bool {
         let (w, h) = (self.image.xsize(), self.image.ysize());
         let x1 = (x + n).min(w);
@@ -151,7 +151,7 @@ impl Grid<'_> {
             && self.eq_v.count(x, y, x1, y1 - 1) == (cw * (ch - 1)) as u32
     }
 
-    fn colour(&self, x: usize, y: usize) -> [i32; 3] {
+    fn color(&self, x: usize, y: usize) -> [i32; 3] {
         [
             self.image.plane_row(0, y)[x],
             self.image.plane_row(1, y)[x],
@@ -217,8 +217,8 @@ fn plan_at(grid: &Grid<'_>, n: usize, ox: usize, oy: usize) -> Option<CellPlan> 
             let (x, y) = origin(cx, cy);
             let (lx, ly) = origin(cx - 1, cy);
             let (tx, ty) = origin(cx, cy - 1);
-            let c = grid.colour(x, y);
-            if c != grid.colour(lx, ly) && c != grid.colour(tx, ty) {
+            let c = grid.color(x, y);
+            if c != grid.color(lx, ly) && c != grid.color(tx, ty) {
                 textured[i] = true;
                 any = true;
             }
@@ -257,8 +257,8 @@ fn plan_at(grid: &Grid<'_>, n: usize, ox: usize, oy: usize) -> Option<CellPlan> 
             covered[i] = dense[i] || (y0..y1).any(|y| (x0..x1).any(|x| dense[y * cells_x + x]));
         }
     }
-    // Runs of one colour inside the art are constant cells that differ from
-    // neither neighbour: every constant cell enclosed by the layer joins it
+    // Runs of one color inside the art are constant cells that differ from
+    // neither neighbor: every constant cell enclosed by the layer joins it
     // (those reaching the image border through uncovered cells stay), so
     // the layer has no holes and the base's fill runs unbroken.
     let mut outside = vec![false; cells_x * cells_y];
@@ -273,13 +273,13 @@ fn plan_at(grid: &Grid<'_>, n: usize, ox: usize, oy: usize) -> Option<CellPlan> 
     }
     while let Some(i) = stack.pop() {
         let (cx, cy) = (i % cells_x, i / cells_x);
-        let neighbours = [
+        let neighbors = [
             (cx > 0).then(|| i - 1),
             (cx + 1 < cells_x).then(|| i + 1),
             (cy > 0).then(|| i - cells_x),
             (cy + 1 < cells_y).then(|| i + cells_x),
         ];
-        for j in neighbours.into_iter().flatten() {
+        for j in neighbors.into_iter().flatten() {
             if !covered[j] && !outside[j] {
                 outside[j] = true;
                 stack.push(j);
@@ -411,7 +411,7 @@ pub(crate) fn base(image: &Image3Si, plan: &CellPlan) -> (Image3Si, AlphaPlane) 
 }
 
 /// The layer frame at the cell grid: one sample per cell of the box, the
-/// covered cells' colours with the coverage as alpha; uncovered cells
+/// covered cells' colors with the coverage as alpha; uncovered cells
 /// repeat the cell to their left.
 pub(crate) fn layer(image: &Image3Si, plan: &CellPlan) -> (Image3Si, AlphaPlane) {
     let n = plan.factor;
@@ -446,7 +446,7 @@ mod tests {
     use super::*;
 
     /// A striped UI with specks and, at (`x`, `y`), a `cw` x `ch`-cell
-    /// block of `n`-pixel cells of pseudo-random colours.
+    /// block of `n`-pixel cells of pseudo-random colors.
     fn composite(
         w: usize,
         h: usize,

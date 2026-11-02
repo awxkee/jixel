@@ -243,7 +243,7 @@ fn gradient_lut(tree: &LearnedTree, leaf_ctx: &[u32], chan: u32, stream: i32) ->
 }
 
 /// [`tokenize_channel_ma_mult`] through a [`gradient_lut`]: the decoder's
-/// neighbours, the clamped-gradient prediction and the full-scale (`q`
+/// neighbors, the clamped-gradient prediction and the full-scale (`q`
 /// times the divided) gradient property, without the other properties.
 fn tokenize_gradient_lut<'a>(
     get_row: impl Fn(usize) -> &'a [i32],
@@ -266,7 +266,7 @@ fn tokenize_gradient_lut<'a>(
     for y in 0..gh {
         let row = get_row(y);
         if y == 0 {
-            // The first pixel's neighbours are all zero; the rest of the
+            // The first pixel's neighbors are all zero; the rest of the
             // row sees only its left one.
             let mut left = 0;
             for &v in row {

@@ -1037,3 +1037,337 @@ mod tests {
         assert_eq!(hf_modulation_strength(6.0), hf_modulation_strength(100.0));
     }
 }
+
+/// Coarsest quant-field multiplier of a partially transparent block.
+const ALPHA_AQ_FLOOR: f32 = 0.1;
+
+/// Quant-field multiplier of each 8x8 block from the alpha its color is
+/// composited with: the block's largest alpha, at least [`ALPHA_AQ_FLOOR`].
+/// A pixel's color error reaches the viewer scaled by its alpha, so the
+/// block's most visible pixel sets its precision; glows, shadows and fades
+/// code coarser, edges with any opaque pixel keep theirs. Fully transparent
+/// blocks keep their quant field: their color is already the invisible
+/// fill, and the frame-wide entropy prices that every block's quantization
+/// reads would shift with them (visible pixels 40 px away changed, for
+/// nothing saved).
+pub(crate) fn alpha_block_factors(
+    alpha: &crate::encode_image::AlphaPlane,
+    xsize: usize,
+    ysize: usize,
+) -> (usize, Vec<f32>) {
+    use crate::encode_image::AlphaPlane;
+
+    match alpha {
+        AlphaPlane::U8(data) => alpha_block_factors_with(
+            data,
+            xsize,
+            ysize,
+            |block| f32::from(block.iter().copied().max().unwrap()),
+            |peak| peak / 255.0,
+        ),
+        AlphaPlane::U16 { data, bits } => {
+            let max = ((1u64 << (*bits).min(16)) - 1) as f32;
+            alpha_block_factors_with(
+                data,
+                xsize,
+                ysize,
+                |block| f32::from(block.iter().copied().max().unwrap()),
+                |peak| peak / max,
+            )
+        }
+        AlphaPlane::F32(data) => alpha_block_factors_with(
+            data,
+            xsize,
+            ysize,
+            |block| {
+                // Starting at zero ignores NaNs and negative alpha. Clamp
+                // only the final maximum, as in the per-pixel version.
+                block
+                    .iter()
+                    .map(|&bits| f32::from_bits(bits as u32))
+                    .fold(0.0, f32::max)
+            },
+            |peak| peak.min(1.0),
+        ),
+    }
+}
+
+/// Reduce in sample space before normalizing: integer maxima are exact in
+/// f32, so only one division per block is needed. The row reductions can
+/// vectorize, and each eight-row band stays in cache. Write factors directly
+/// into their final allocation instead of retaining a second peak map.
+fn alpha_block_factors_with<T>(
+    data: &[T],
+    xsize: usize,
+    ysize: usize,
+    row_peak: impl Fn(&[T]) -> f32,
+    normalize: impl Fn(f32) -> f32,
+) -> (usize, Vec<f32>) {
+    let (bw, bh) = (xsize.div_ceil(8), ysize.div_ceil(8));
+    let mut factors = vec![0.0; bw * bh];
+    if factors.is_empty() {
+        return (bw, factors);
+    }
+    for (band, factor_row) in data[..xsize * ysize]
+        .chunks(xsize * 8)
+        .zip(factors.chunks_exact_mut(bw))
+    {
+        for (bx, factor) in factor_row.iter_mut().enumerate() {
+            let x = bx * 8;
+            let end = (x + 8).min(xsize);
+            let peak = band
+                .chunks_exact(xsize)
+                .map(|row| row_peak(&row[x..end]))
+                .fold(0.0, f32::max);
+            let a = normalize(peak);
+            *factor = if a == 0.0 || a >= 1.0 {
+                1.0
+            } else {
+                a.max(ALPHA_AQ_FLOOR)
+            };
+        }
+    }
+    (bw, factors)
+}
+
+/// Scale a DC group's quant field (block origin `bx0, by0`) by
+/// [`alpha_block_factors`]; a multi-block transform takes the largest factor
+/// of the blocks it covers, so its one quant value stays shared.
+pub(crate) fn apply_alpha_factors(
+    raw_quant_field: &mut ImageB,
+    ac_strategy: &crate::dc_group_data::AcStrategyImage,
+    factors: &(usize, Vec<f32>),
+    bx0: usize,
+    by0: usize,
+) {
+    let (bw, f) = factors;
+    for (bx, by, raw) in ac_strategy.iter_first_blocks() {
+        let cx = crate::dc_group_data::AcStrategyImage::covered_blocks_x_of(raw);
+        let cy = crate::dc_group_data::AcStrategyImage::covered_blocks_y_of(raw);
+        let x = bx0 + bx;
+        let y = by0 + by;
+        // Missing edge blocks have factor 1, which is also the largest
+        // possible factor. Check the whole footprint once, then reduce rows.
+        let k = if x + cx > *bw || (y + cy) * bw > f.len() {
+            1.0
+        } else if cx == 1 && cy == 1 {
+            f[y * bw + x]
+        } else {
+            let mut peak = 0.0f32;
+            for row in f[y * bw..(y + cy) * bw].chunks_exact(*bw) {
+                peak = row[x..x + cx].iter().copied().fold(peak, f32::max);
+                if peak == 1.0 {
+                    break;
+                }
+            }
+            peak
+        };
+        let q = ((f32::from(raw_quant_field.row(by)[bx]) * k).round() as i32).clamp(1, 255) as u8;
+        for iy in 0..cy {
+            raw_quant_field.row_mut(by + iy)[bx..bx + cx].fill(q);
+        }
+    }
+}
+
+#[cfg(test)]
+mod alpha_aq_tests {
+    use super::*;
+    use crate::encode_image::AlphaPlane;
+
+    #[test]
+    fn alpha_factors_follow_each_blocks_largest_alpha() {
+        // 24x8: a transparent block, a block with one opaque pixel among
+        // faint ones, and a faint block.
+        let (w, h) = (24, 8);
+        let mut a = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 8..24 {
+                a[y * w + x] = 10;
+            }
+        }
+        a[3 * w + 12] = 255;
+        let (bw, f) = alpha_block_factors(&AlphaPlane::U8(a.clone()), w, h);
+        assert_eq!(bw, 3);
+        assert_eq!(f[0], 1.0, "transparent blocks keep their field");
+        assert_eq!(f[1], 1.0, "an opaque pixel keeps the block exact");
+        assert!((f[2] - ALPHA_AQ_FLOOR).abs() < 1e-6, "{}", f[2]);
+        a[3 * w + 12] = 128;
+        let (_, f) = alpha_block_factors(&AlphaPlane::U8(a), w, h);
+        assert!((f[1] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn alpha_factors_match_reference_for_integer_depths_and_edges() {
+        for w in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 65, 257] {
+            for h in [0usize, 1, 7, 8, 9, 17, 33] {
+                let bytes: Vec<_> = (0..w * h + 3)
+                    .map(|i| ((i * 37 + i / 11) % 256) as u8)
+                    .collect();
+                let plane = AlphaPlane::U8(bytes);
+                assert_factors_match(&plane, w, h);
+                for bits in [8, 10, 12, 16] {
+                    let max = (1u32 << bits) - 1;
+                    let data = (0..w * h + 3)
+                        .map(|i| ((i * 127 + i / 7) as u32 % (max + 1)) as u16)
+                        .collect();
+                    assert_factors_match(&AlphaPlane::U16 { data, bits }, w, h);
+                }
+            }
+        }
+        // Exercise every input value, including the floor and opaque/zero
+        // exceptions, without letting opaque pixels hide lower maxima.
+        for bits in [8, 10, 12, 16] {
+            let max = (1u32 << bits) - 1;
+            let data = (0..=max)
+                .flat_map(|v| std::iter::repeat_n(v as u16, 8))
+                .collect();
+            assert_factors_match(&AlphaPlane::U16 { data, bits }, 8 * (max as usize + 1), 1);
+        }
+    }
+
+    #[test]
+    fn alpha_factors_match_reference_for_float_special_values() {
+        let values = [
+            f32::NAN,
+            f32::from_bits(0x7f800001),
+            f32::from_bits(0xffc00001),
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            0.05,
+            0.1,
+            0.100001,
+            0.5,
+            0.999999,
+            1.0,
+            2.0,
+            f32::INFINITY,
+        ];
+        for w in [0usize, 1, 7, 8, 9, 16, 17, 65] {
+            for h in [0usize, 1, 7, 8, 9, 17] {
+                let data = (0..w * h)
+                    .map(|i| values[(i * 7 + i / 13) % values.len()].to_bits() as i32)
+                    .collect();
+                assert_factors_match(&AlphaPlane::F32(data), w, h);
+            }
+        }
+        for value in values {
+            assert_factors_match(
+                &AlphaPlane::F32(vec![value.to_bits() as i32; 17 * 9]),
+                17,
+                9,
+            );
+        }
+    }
+
+    fn assert_factors_match(plane: &AlphaPlane, w: usize, h: usize) {
+        let (got_bw, got) = alpha_block_factors(plane, w, h);
+        let (want_bw, want) = reference_alpha_block_factors(plane, w, h);
+        assert_eq!(got_bw, want_bw);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{}-bit alpha on {w}x{h}",
+            plane.bits(),
+        );
+    }
+
+    #[test]
+    fn alpha_quant_field_matches_reference_for_all_transforms_and_padding() {
+        use crate::dc_group_data::{AcStrategyImage, NUM_STRATEGIES};
+        let (bw, bh) = (37, 33);
+        for raw in 0..NUM_STRATEGIES as u8 {
+            let mut ac = AcStrategyImage::new(32, 32);
+            ac.set_first(0, 0, raw);
+            ac.set_first(16, 16, raw);
+            for (bx0, by0) in [(0, 0), (3, 5), (30, 28), (37, 0), (0, 33), (100, 100)] {
+                for values in [[0.1, 0.25, 0.5, 0.75], [1.0; 4], [0.1; 4]] {
+                    let factors = (
+                        bw,
+                        (0..bw * bh).map(|i| values[(i * 7 + i / bw) % 4]).collect(),
+                    );
+                    let mut want = ImageB::new(32, 32);
+                    want.as_mut_slice()
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(i, q)| *q = (i % 256) as u8);
+                    let mut got = want.clone();
+                    reference_apply_alpha_factors(&mut want, &ac, &factors, bx0, by0);
+                    apply_alpha_factors(&mut got, &ac, &factors, bx0, by0);
+                    assert_eq!(
+                        got.as_slice(),
+                        want.as_slice(),
+                        "strategy {raw}, origin {bx0},{by0}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Frozen scalar algorithms keep numerical and padding behavior exact.
+    fn reference_alpha_block_factors(
+        alpha: &crate::encode_image::AlphaPlane,
+        xsize: usize,
+        ysize: usize,
+    ) -> (usize, Vec<f32>) {
+        let max = ((1u64 << alpha.bits().min(16)) - 1) as f32;
+        let (bw, bh) = (xsize.div_ceil(8), ysize.div_ceil(8));
+        let mut peak = vec![0f32; bw * bh];
+        for y in 0..ysize {
+            let row = &mut peak[(y / 8) * bw..][..bw];
+            for x in 0..xsize {
+                let i = y * xsize + x;
+                let a = if alpha.is_float() {
+                    f32::from_bits(alpha.get_i32(i) as u32).clamp(0.0, 1.0)
+                } else {
+                    alpha.get_i32(i) as f32 / max
+                };
+                row[x / 8] = row[x / 8].max(a);
+            }
+        }
+        let factors = peak
+            .iter()
+            .map(|&a| {
+                if a == 0.0 || a >= 1.0 {
+                    1.0
+                } else {
+                    a.max(ALPHA_AQ_FLOOR)
+                }
+            })
+            .collect();
+        (bw, factors)
+    }
+
+    fn reference_apply_alpha_factors(
+        raw_quant_field: &mut ImageB,
+        ac_strategy: &crate::dc_group_data::AcStrategyImage,
+        factors: &(usize, Vec<f32>),
+        bx0: usize,
+        by0: usize,
+    ) {
+        let (bw, f) = factors;
+        let factor = |bx: usize, by: usize| {
+            let x = bx0 + bx;
+            if x < *bw {
+                f.get((by0 + by) * bw + x).copied().unwrap_or(1.0)
+            } else {
+                1.0
+            }
+        };
+        for (bx, by, raw) in ac_strategy.iter_first_blocks().collect::<Vec<_>>() {
+            let cx = crate::dc_group_data::AcStrategyImage::covered_blocks_x_of(raw);
+            let cy = crate::dc_group_data::AcStrategyImage::covered_blocks_y_of(raw);
+            let k = (0..cy)
+                .flat_map(|iy| (0..cx).map(move |ix| (ix, iy)))
+                .map(|(ix, iy)| factor(bx + ix, by + iy))
+                .fold(0.0f32, f32::max);
+            let q =
+                ((f32::from(raw_quant_field.row(by)[bx]) * k).round() as i32).clamp(1, 255) as u8;
+            for iy in 0..cy {
+                raw_quant_field.row_mut(by + iy)[bx..bx + cx].fill(q);
+            }
+        }
+    }
+}

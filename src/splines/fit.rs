@@ -68,7 +68,7 @@ const MAX_COEFFS: usize = 32;
 /// Refinement only needs the alignment signal: few color coefficients, tight window.
 const REFINE_COEFFS: usize = 3;
 const COMPACT_COEFFS: usize = 6;
-const REFINE_NEIGHBOURS: usize = 3;
+const REFINE_NEIGHBORS: usize = 3;
 const WEIGHT_LUT_STEPS: f32 = 32.0;
 /// Unrefined fits slightly below `MIN_EXPLAINED` may still get there after refinement.
 const QUICK_MIN_EXPLAINED: f64 = 0.27;
@@ -888,8 +888,8 @@ fn refine(
     for _ in 0..sweeps {
         let mut moved = false;
         for i in 0..points.len() {
-            let lo = i.saturating_sub(REFINE_NEIGHBOURS);
-            let hi = (i + REFINE_NEIGHBOURS).min(points.len() - 1);
+            let lo = i.saturating_sub(REFINE_NEIGHBORS);
+            let hi = (i + REFINE_NEIGHBORS).min(points.len() - 1);
             let local = &mut points[lo..=hi];
             let center = i - lo;
             let mut best_point = local[center];

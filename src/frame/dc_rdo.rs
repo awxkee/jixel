@@ -351,7 +351,7 @@ fn refine_channel(
 
 /// Row-wise Viterbi over each block's candidate levels: its level, the
 /// target's floor and ceiling, its neighbors and the prediction, within
-/// `DC_RDO_MAX_ERROR` of the target. A block's choice is the west neighbour
+/// `DC_RDO_MAX_ERROR` of the target. A block's choice is the west neighbor
 /// and weighted-predictor history of the next block's prediction, so every
 /// survivor carries the predictor record its path wrote and each transition
 /// is priced under its own path. Rows below see the finished row.

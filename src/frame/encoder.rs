@@ -55,6 +55,18 @@ pub(crate) fn encode_frame(
     writer: &mut BitWriter,
 ) -> Result<bool, EncodeError> {
     let distp = compute_distance_params(distance);
+    // Color under partial alpha codes coarser, unless invisible colors are
+    // kept (`fill_invisible` off; also for CMYK, whose extra plane is K).
+    if fill_invisible
+        && let Some(alpha) =
+            alpha.filter(|a| !a.is_constant() && a.len() == linear.xsize() * linear.ysize())
+    {
+        let _ = ctx.alpha_aq.set(crate::adaptive_quant::alpha_block_factors(
+            alpha,
+            linear.xsize(),
+            linear.ysize(),
+        ));
+    }
     if !ctx.coding.is_xyb() {
         // Non-XYB planes skip every XYB content heuristic: they read as
         // achromatic to the classifiers, and patches quantize on the XYB

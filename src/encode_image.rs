@@ -1164,7 +1164,6 @@ fn alpha_learned_trees(config: &EncodeConfig) -> bool {
         && matches!(config.speed, Speed::Slow | Speed::ExtraSlow)
 }
 
-
 pub(crate) fn alpha_plane_tree(
     speed: Speed,
     decoding_speed: DecodingSpeed,
@@ -1759,7 +1758,7 @@ fn encode_ink_base(
     Ok((ctx, frame))
 }
 
-/// A colour on the XYB lattice of the VarDCT base, as the YCoCg triple the
+/// A color on the XYB lattice of the VarDCT base, as the YCoCg triple the
 /// signaled RCT restores exactly: Y, X and B-Y on the default LF dequant
 /// steps.
 fn xyb_lattice_ycocg(
@@ -5579,8 +5578,32 @@ mod lossy_alpha_tests {
     }
 
     #[test]
+    fn color_under_partial_alpha_codes_coarser() {
+        // A textured glow whose alpha never reaches 0 or 1: only the
+        // alpha-aware quant field tells the two encodes apart.
+        let (w, h) = (256, 256);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x as f32 - 128.0).hypot(y as f32 - 128.0) / 128.0).min(1.0);
+                let a = (8.0 + 200.0 * (1.0 - r)) as u8;
+                let t = ((x * 7 + y * 13) % 64) as u8;
+                rgba.extend([120 + t, 80 + t / 2, 200 - t, a]);
+            }
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Fast)
+            .with_distance(1.5);
+        let weighted = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        let flat = encode_image_with_alpha(&rgba, w, h, &config.with_fill_invisible(false))
+            .unwrap()
+            .len();
+        assert!(weighted * 10 < flat * 9, "{weighted} vs {flat}");
+    }
+
+    #[test]
     fn slow_lossy_alpha_codes_anti_aliased_cutouts_through_few_levels() {
-        // Flat colour under three discs with 1.5 px anti-aliased rims: the
+        // Flat color under three discs with 1.5 px anti-aliased rims: the
         // squeeze spends its alpha bits on the rims, the lossy palette keeps
         // a few rim levels (2263 B squeezed when this was written).
         let (w, h) = (320, 288);
@@ -5615,5 +5638,12 @@ mod lossy_alpha_tests {
             .with_lossy_modular(crate::LossyModular::Force);
         let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
         assert!(bytes < 2800, "{bytes}");
+        // Fast codes the levels through its gradient lookup-table tree
+        // (3519 B squeezed at d1.5 when this was written).
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Fast)
+            .with_distance(1.5);
+        let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
+        assert!(bytes < 3150, "{bytes}");
     }
 }

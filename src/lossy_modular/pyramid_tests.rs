@@ -223,7 +223,7 @@ fn lossless_extras_can_stay_out_of_the_squeeze() {
     )
     .unwrap();
     // The extra is one full-size unit-step channel ahead of the four chroma
-    // pre-squeeze residuals; the squeeze covers the colour channels only.
+    // pre-squeeze residuals; the squeeze covers the color channels only.
     let nb = plain.channels.len();
     let alpha = &plain.channels[nb - 5];
     assert_eq!(
@@ -269,7 +269,7 @@ fn plain_palette_keeps_the_extra_as_indices_behind_its_meta_channel() {
         assert_eq!(p.quants[0], 257);
         assert_eq!(p.channels[0].data, [0, 40, 128, 255]);
         assert_eq!((p.channels[0].w, p.channels[0].h), (4, 1));
-        // The colour channels and their steps are the plain pyramid's.
+        // The color channels and their steps are the plain pyramid's.
         for (i, ch) in plain.channels.iter().enumerate().filter(|&(i, _)| i != c) {
             assert_eq!(p.channels[i + 1].data, ch.data);
             assert_eq!(p.quants[i + 1], plain.quants[i]);

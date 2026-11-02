@@ -137,7 +137,7 @@ pub(super) fn write_frame_header_modular_kind(
 
 /// Frame header of the ink frame: a regular modular frame of the lossy
 /// (`xyb_encoded`) codestream, kBlend over reference slot 0 with extra
-/// channel 0 as its alpha, for the colour channels and the alpha itself.
+/// channel 0 as its alpha, for the color channels and the alpha itself.
 fn write_frame_header_modular_xyb_blend(
     has_alpha: bool,
     last: bool,
@@ -263,7 +263,7 @@ fn write_frame_header_modular_layer(
 
 /// The frame's `upsampling` and, with alpha, the matching `ec_upsampling`
 /// (the extra channel is coded on the same grid, which the codestream
-/// requires to be no finer than the colour one).
+/// requires to be no finer than the color one).
 fn write_upsampling(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
     w.write(2, layout.upsampling_selector()); // upsampling: U32(1, 2, 4, 8)
     if has_alpha {

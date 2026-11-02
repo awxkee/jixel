@@ -91,7 +91,7 @@ impl Layout {
     }
 
     /// The transform list: [RCT], Squeeze, then the extra channel's Palette
-    /// as (begin_c in the squeezed list, colours) when `palette` is set.
+    /// as (begin_c in the squeezed list, colors) when `palette` is set.
     pub(super) fn write_transforms(
         self,
         steps: &[crate::squeeze::SqueezeStep],

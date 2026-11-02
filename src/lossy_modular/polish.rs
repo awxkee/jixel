@@ -72,7 +72,7 @@ const VMAX: i32 = 15;
 /// Polish `pyramid`, the arm's quantized `xyb` at `distance`: the exchange
 /// rates come from Slow-coded pyramids at 0.9x and 1.1x the distance (deficit
 /// per coded bit). Without a ColorVideoVDP slope (near transparency the
-/// neighbours do not separate) SSIMULACRA2 decides alone.
+/// neighbors do not separate) SSIMULACRA2 decides alone.
 pub(super) fn polish_frame(
     pyramid: &mut Pyramid,
     xyb: &Image3F,
@@ -210,7 +210,7 @@ impl Prices {
         }
     }
 
-    /// Bits of the value at (x, y) and of the two neighbours whose context it
+    /// Bits of the value at (x, y) and of the two neighbors whose context it
     /// sets, for the channel as it stands.
     #[cfg(test)]
     fn local(&self, res: &[i32], w: usize, h: usize, x: usize, y: usize) -> f32 {
@@ -657,7 +657,7 @@ fn polish_band(
                         let target = if v != 0 {
                             v - v.signum()
                         } else {
-                            // The exact residual against the decoded neighbours.
+                            // The exact residual against the decoded neighbors.
                             let l = &level.l;
                             let avg = &outs[j + 1];
                             let av = i64::from(avg[l.avg_index(line, i)]);
@@ -795,7 +795,7 @@ fn move_bits(level: &Level, x: usize, y: usize, target: i32) -> f32 {
     // Only the right and bottom contexts change. Their values (and escape
     // costs) stay fixed, so calculate each escape just once. Preserve the
     // original local sums' addition order for exactly the same bit delta.
-    let mut neighbour = |idx: usize, other: u32| {
+    let mut neighbor = |idx: usize, other: u32| {
         let value = res[idx];
         let slot = slot(value);
         let extra = Prices::escape(value);
@@ -808,7 +808,7 @@ fn move_bits(level: &Level, x: usize, y: usize, target: i32) -> f32 {
         } else {
             0
         };
-        neighbour(i + 1, top);
+        neighbor(i + 1, top);
     }
     if y + 1 < h {
         let left = if x > 0 {
@@ -816,7 +816,7 @@ fn move_bits(level: &Level, x: usize, y: usize, target: i32) -> f32 {
         } else {
             0
         };
-        neighbour(i + w, left);
+        neighbor(i + w, left);
     }
     after - before
 }

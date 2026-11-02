@@ -65,7 +65,7 @@ pub(super) static SQUEEZE_QUALITY_FACTOR_XYB: f32 = 4.8;
 static ROW_MUL: [f32; 3] = [1.265, 1.704, 0.546];
 
 /// Further multipliers on screen content ([`crate::frame::is_screen_content`]):
-/// coloured text and UI keep their X and B edges. 11 screenshots at Slow,
+/// colored text and UI keep their X and B edges. 11 screenshots at Slow,
 /// SS2 / BA / cvvdp BD -2.29 / -9.40 / -2.63 %, no image worse on two
 /// metrics; 11 held-out illustrations -2.63 / -0.43 / -2.25. Photos keep
 /// `ROW_MUL`: there finer chroma only trades SS2 for BA and cvvdp.
@@ -88,7 +88,7 @@ fn table_depth(hshift: i32, vshift: i32) -> usize {
 }
 
 /// XYB-layout step of one squeezed channel (cjxl's schedule, including the
-/// float->int truncation), times `row_mul` per stored colour.
+/// float->int truncation), times `row_mul` per stored color.
 pub(super) fn xyb_step(
     color: usize,
     hshift: i32,
@@ -105,7 +105,7 @@ pub(super) fn xyb_step(
     (q as i32).max(1)
 }
 
-/// DC-frame step: `unit` is the VarDCT DC step of each stored colour in
+/// DC-frame step: `unit` is the VarDCT DC step of each stored color in
 /// lattice units, finer by `DC_FRAME_LEVEL_RATIO` per coarser level.
 pub(super) fn dc_frame_step(unit: [f32; 3], color: usize, hshift: i32, vshift: i32) -> i32 {
     let level = (hshift + vshift - 1).max(0);

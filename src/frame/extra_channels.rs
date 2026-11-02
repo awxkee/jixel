@@ -556,9 +556,9 @@ fn squeezed_error(
 
 /// The lossy palette arm: the fewest levels within part of the squeeze's
 /// weighted squared error ([`super::extra_levels`]), coded losslessly like an
-/// exact plane (palette, learned trees, global tree), when that is smaller
-/// than the squeeze's best coding. Only with learned trees: the fixed trees
-/// code palette indices worse than the squeeze.
+/// exact plane (palette, the learned plane tree, global tree), when that is
+/// smaller than the squeeze's best coding. Only with a plane tree: the fixed
+/// per-group coding codes palette indices worse than the squeeze.
 #[allow(clippy::too_many_arguments)]
 fn lossy_palette(
     ctx: &EncodingContext,
@@ -570,7 +570,7 @@ fn lossy_palette(
     streams: &mut extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
 ) -> Option<PreparedExtra> {
-    if !ctx.extra_learned_trees || ctx.extra_step != 1 {
+    if ctx.extra_plane_tree.is_none() || ctx.extra_step != 1 {
         return None;
     }
     let weights = super::extra_levels::error_weights(plane, dim.xsize, dim.ysize);
