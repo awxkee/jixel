@@ -52,10 +52,7 @@ mod quantize_xyb;
 mod splines;
 mod xyb;
 
-pub(crate) use ac_strategy::{
-    gradient_region_stats_sse41, gradient_region_stats_with_chroma_sse41, sse_and_rate_sse,
-    sse_and_rate_sse_impl,
-};
+pub(crate) use ac_strategy::{sse_and_rate_sse, sse_and_rate_sse_impl};
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
 pub(crate) use cfl::{cfl_rd_cost_sse41, cfl_rd_costs_sse41, cfl_rdo_refill_sse41};
@@ -68,10 +65,7 @@ pub(crate) use dc_ops::{
 pub(crate) use divide::rounded_quotients_sse41;
 pub(crate) use entropy::counts_bit_cost_sse41;
 pub(crate) use haar::haar_rows_sse41;
-pub(crate) use inflated_cost::{
-    combine_error_sse41, error_gradient_energy_sse41, error_gradient_peak_energy_sse41,
-    rgb_hue_chroma_edge_loss_sse41,
-};
+pub(crate) use inflated_cost::{combine_error_sse41, rgb_hue_chroma_edge_loss_sse41};
 pub(crate) use ink_layer::{luma_row_sse41, ridge_row_sse41};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lossless_search::{palette_row_sse41, rct_row_sse41};

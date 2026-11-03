@@ -424,8 +424,6 @@ pub(super) fn find_downgrade(
             RERANK_META_R,
             params.distance,
             cmap_factors(ctx.cfl_frame(), params.ytox_map, params.ytob_map, x, y),
-            0.0,
-            0.0,
             None,
         )
     };

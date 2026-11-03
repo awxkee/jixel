@@ -54,10 +54,7 @@ mod xyb;
 mod yellow_opsin;
 mod ytob;
 
-pub(crate) use ac_strategy::{
-    gradient_region_stats_neon, gradient_region_stats_with_chroma_neon, sse_and_rate_neon,
-    sse_and_rate_neon_impl,
-};
+pub(crate) use ac_strategy::{sse_and_rate_neon, sse_and_rate_neon_impl};
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{
@@ -89,8 +86,7 @@ pub(crate) use entropy::{counts_bit_cost_neon, entropy_of_hist_neon};
 pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
-    combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-    recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
+    combine_error_neon, recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
     rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
 };
 pub(crate) use ink_layer::{luma_row_neon, ridge_row_neon};

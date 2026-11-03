@@ -783,7 +783,6 @@ impl Scores<'_, '_> {
                 return hit;
             }
             let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
-            let (ga, gpa) = rerank_pair_gradient_alphas(self.rerank, p.strategy, px, py);
             let mut score = reconstruction_strategy_cost_bounded(
                 params.ctx,
                 coder,
@@ -810,8 +809,6 @@ impl Scores<'_, '_> {
                     x,
                     y,
                 ),
-                ga,
-                gpa,
                 None,
                 limit,
             );

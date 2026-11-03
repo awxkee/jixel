@@ -54,10 +54,7 @@ mod xyb;
 mod yellow_opsin;
 mod ytob;
 
-pub(crate) use ac_strategy::{
-    gradient_region_stats_avx2, gradient_region_stats_with_chroma_avx2, sse_and_rate_avx2,
-    sse_and_rate_avx2_impl,
-};
+pub(crate) use ac_strategy::{sse_and_rate_avx2, sse_and_rate_avx2_impl};
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{
@@ -89,8 +86,7 @@ pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use haar::haar_rows_avx2;
 pub(crate) use inflated_cost::{
-    combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-    recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
+    combine_error_avx2, recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
     rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
 };
 pub(crate) use ink_layer::{luma_row_avx2, ridge_row_avx2};

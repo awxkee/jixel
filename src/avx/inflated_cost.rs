@@ -258,181 +258,6 @@ pub(crate) fn rgb_hue_chroma_edge_loss_avx2(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn accumulate_gradient_vectors_x8(left: __m256, right: __m256, sum: __m256) -> __m256 {
-    let difference = _mm256_sub_ps(right, left);
-    _mm256_fmadd_ps(difference, difference, sum)
-}
-
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-fn accumulate_gradient_x8(left: &[f32; 8], right: &[f32; 8], sum: __m256) -> __m256 {
-    let left = unsafe { _mm256_loadu_ps(left.as_ptr()) };
-    let right = unsafe { _mm256_loadu_ps(right.as_ptr()) };
-    accumulate_gradient_vectors_x8(left, right, sum)
-}
-
-/// # Safety
-/// The caller must ensure AVX2 and FMA are available.
-#[target_feature(enable = "avx2,fma")]
-pub(crate) fn error_gradient_energy_avx2(error: &[f32], width: usize, height: usize) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    let rows = error[..n].chunks_exact(width);
-    let mut sum = _mm256_setzero_ps();
-
-    for row in rows.clone() {
-        let (row8, row_tail) = row.as_chunks::<8>();
-        if row_tail.is_empty() {
-            let (right8, _) = row[1..].as_chunks::<8>();
-            for (left, right) in row8.iter().zip(right8) {
-                sum = accumulate_gradient_x8(left, right, sum);
-            }
-            let left = unsafe { _mm256_loadu_ps(row8.last().unwrap().as_ptr()) };
-            let right = _mm256_permutevar8x32_ps(left, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7));
-            sum = accumulate_gradient_vectors_x8(left, right, sum);
-            continue;
-        }
-        let (left8, tail) = row[..width - 1].as_chunks::<8>();
-        let (right8, right_tail) = row[1..].as_chunks::<8>();
-        for (left, right) in left8.iter().zip(right8) {
-            sum = accumulate_gradient_x8(left, right, sum);
-        }
-        if !tail.is_empty() {
-            let mut left = [0.0; 8];
-            let mut right = [0.0; 8];
-            left[..tail.len()].copy_from_slice(tail);
-            right[..right_tail.len()].copy_from_slice(right_tail);
-            sum = accumulate_gradient_x8(&left, &right, sum);
-        }
-    }
-
-    for (top, bottom) in rows.clone().zip(rows.skip(1)) {
-        let (top8, top_tail) = top.as_chunks::<8>();
-        let (bottom8, bottom_tail) = bottom.as_chunks::<8>();
-        for (top, bottom) in top8.iter().zip(bottom8) {
-            sum = accumulate_gradient_x8(top, bottom, sum);
-        }
-        if !top_tail.is_empty() {
-            let mut top = [0.0; 8];
-            let mut bottom = [0.0; 8];
-            top[..top_tail.len()].copy_from_slice(top_tail);
-            bottom[..bottom_tail.len()].copy_from_slice(bottom_tail);
-            sum = accumulate_gradient_x8(&top, &bottom, sum);
-        }
-    }
-    hsum256(sum)
-}
-
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-fn peak_excess_x8(
-    a: __m256,
-    b: __m256,
-    source_a: __m256,
-    source_b: __m256,
-    floor: __m256,
-) -> __m256 {
-    let sign = _mm256_set1_ps(-0.0);
-    let error_gradient = _mm256_andnot_ps(sign, _mm256_sub_ps(b, a));
-    let source_gradient = _mm256_andnot_ps(sign, _mm256_sub_ps(source_b, source_a));
-    let excess = _mm256_max_ps(
-        _mm256_setzero_ps(),
-        _mm256_sub_ps(
-            _mm256_sub_ps(
-                error_gradient,
-                _mm256_mul_ps(source_gradient, _mm256_set1_ps(0.5)),
-            ),
-            floor,
-        ),
-    );
-    _mm256_mul_ps(excess, excess)
-}
-
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-fn pooled_max_x8(value: __m256) -> f32 {
-    // Each 128-bit half is one 4x4 pooling cell. Reduce the halves independently
-    // in registers, then add their two maxima.
-    let pair_max = _mm256_max_ps(value, _mm256_permute_ps::<0x4e>(value));
-    let cell_max = _mm256_max_ps(pair_max, _mm256_permute_ps::<0xb1>(pair_max));
-    let low = _mm256_castps256_ps128(cell_max);
-    let high = _mm256_extractf128_ps::<1>(cell_max);
-    _mm_cvtss_f32(_mm_add_ss(low, high))
-}
-
-/// # Safety
-/// The caller must ensure AVX2 and FMA are available.
-#[target_feature(enable = "avx2,fma")]
-pub(crate) fn error_gradient_peak_energy_avx2(
-    error: &[f32],
-    original: &[f32],
-    width: usize,
-    height: usize,
-    floor: f32,
-) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n && original.len() >= n);
-    assert!(floor.is_finite() && floor >= 0.0);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    if !width.is_multiple_of(8) {
-        return crate::inflated_cost::error_gradient_peak_energy_scalar(
-            error, original, width, height, floor,
-        );
-    }
-
-    let floor = _mm256_set1_ps(floor);
-    let zero = _mm256_setzero_ps();
-    let mut total = 0.0f32;
-    for cell_y in (0..height).step_by(4) {
-        for cell_x in (0..width).step_by(8) {
-            let mut max_x = zero;
-            let mut max_y = zero;
-            for y in cell_y..(cell_y + 4).min(height) {
-                let p = y * width + cell_x;
-                let current = unsafe { _mm256_loadu_ps(error.as_ptr().add(p)) };
-                let source = unsafe { _mm256_loadu_ps(original.as_ptr().add(p)) };
-                let (right, source_right) = if cell_x + 8 < width {
-                    (
-                        unsafe { _mm256_loadu_ps(error.as_ptr().add(p + 1)) },
-                        unsafe { _mm256_loadu_ps(original.as_ptr().add(p + 1)) },
-                    )
-                } else {
-                    let shift = _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7);
-                    (
-                        _mm256_permutevar8x32_ps(current, shift),
-                        _mm256_permutevar8x32_ps(source, shift),
-                    )
-                };
-                max_x = _mm256_max_ps(
-                    max_x,
-                    peak_excess_x8(current, right, source, source_right, floor),
-                );
-                if y + 1 < height {
-                    let below = unsafe { _mm256_loadu_ps(error.as_ptr().add(p + width)) };
-                    let source_below = unsafe { _mm256_loadu_ps(original.as_ptr().add(p + width)) };
-                    max_y = _mm256_max_ps(
-                        max_y,
-                        peak_excess_x8(current, below, source, source_below, floor),
-                    );
-                }
-            }
-            total += pooled_max_x8(max_x) + pooled_max_x8(max_y);
-        }
-    }
-    total
-}
-
-#[inline]
-#[target_feature(enable = "avx2,fma")]
 fn combine_error_x8(spatial: &[f32; 8], luma: &[f32; 8], factor: __m256, combined: &mut [f32; 8]) {
     let spatial = unsafe { _mm256_loadu_ps(spatial.as_ptr()) };
     let luma = unsafe { _mm256_loadu_ps(luma.as_ptr()) };
@@ -948,8 +773,8 @@ pub(crate) fn ssim_deficit_avx2(orig: &[f32], recon: &[f32], width: usize, heigh
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-        recon_dist_and_rate_avx2_impl, rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
+        combine_error_avx2, recon_dist_and_rate_avx2_impl, rgb_hue_chroma_edge_loss_avx2,
+        ssim_deficit_avx2,
     };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
@@ -1152,8 +977,6 @@ mod tests {
                     channel_weights: crate::inflated_cost::CHANNEL_WEIGHT,
                     xyb_matrix: crate::xyb::XybMatrix::SPEC,
                     rgb_hue_alpha: 0.0,
-                    gradient_alpha: 0.0,
-                    gradient_peak_alpha: 3.0,
                     keep_spatial_errors: false,
                 },
             };
@@ -1165,12 +988,6 @@ mod tests {
                     recon_dist_and_rate_scalar::<false>(&mut scalar_scratch, &input)
                 };
                 let error_kernels = ReconErrorKernels {
-                    gradient_energy: |error, width, height| unsafe {
-                        error_gradient_energy_avx2(error, width, height)
-                    },
-                    gradient_peak_energy: |error, original, width, height, floor| unsafe {
-                        error_gradient_peak_energy_avx2(error, original, width, height, floor)
-                    },
                     combine: |spatial, luma, factor, combined| unsafe {
                         combine_error_avx2(spatial, luma, factor, combined)
                     },

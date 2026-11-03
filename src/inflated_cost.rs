@@ -910,8 +910,6 @@ pub(crate) type ReconQuantizeFn = unsafe fn(
 pub(crate) type SsimDeficitFn = unsafe fn(&[f32], &[f32], usize, usize) -> f32;
 pub(crate) type PrepareReconstructionFn =
     unsafe fn(&Plane<f32>, usize, usize, usize, usize, &[f32], &mut [f32], &mut [f32]);
-pub(crate) type ErrorGradientEnergyFn = fn(&[f32], usize, usize) -> f32;
-pub(crate) type ErrorGradientPeakEnergyFn = fn(&[f32], &[f32], usize, usize, f32) -> f32;
 pub(crate) type CombineErrorFn = fn(&[f32], &[f32], f32, &mut [f32]);
 
 pub(crate) struct ReconQuantization<'a> {
@@ -946,10 +944,6 @@ pub(crate) struct ReconScoring {
     pub(crate) xyb_matrix: crate::xyb::XybMatrix,
     /// Linear-RGB/OKLab hue and desaturation penalty on risky chroma edges.
     pub(crate) rgb_hue_alpha: f32,
-    /// Spatial-error gradient weight used by transform reranking.
-    pub(crate) gradient_alpha: f32,
-    /// Peak-pooled spatial-error gradient weight used by transform reranking.
-    pub(crate) gradient_peak_alpha: f32,
     /// Leave each channel's spatial error plane in `scratch[0..3]` after the
     /// call. The joint mosaic rerank reads them back to measure error jumps
     /// across child-block seams without reconstructing a second time.
@@ -965,32 +959,15 @@ pub(crate) struct ReconDistInput<'a> {
 }
 
 /// The luma half of a reconstruction score: the fixed-model rate so far and
-/// the channel's three weighted distortion terms. Every term is nonnegative,
-/// so the luma part is a lower bound on the complete cost.
+/// the channel's weighted SSIM deficit. Both are nonnegative, so the luma
+/// part is a lower bound on the complete cost.
 #[derive(Clone, Copy)]
 pub(crate) struct LumaPhase {
     pub(crate) rate: f32,
-    pub(crate) terms: [f32; 3],
-}
-
-impl LumaPhase {
-    /// The luma distortion as the complete score would accumulate it.
-    pub(crate) fn distortion(&self, gradient_alpha: f32, gradient_peak_alpha: f32) -> f32 {
-        let mut distortion = 0.0f32;
-        distortion += self.terms[0];
-        if gradient_alpha > 0.0 {
-            distortion += self.terms[1];
-        }
-        if gradient_peak_alpha > 0.0 {
-            distortion += self.terms[2];
-        }
-        distortion
-    }
+    pub(crate) distortion: f32,
 }
 
 pub(crate) struct ReconErrorKernels {
-    pub(crate) gradient_energy: ErrorGradientEnergyFn,
-    pub(crate) gradient_peak_energy: ErrorGradientPeakEnergyFn,
     pub(crate) combine: CombineErrorFn,
     pub(crate) rgb_hue_chroma_edge_loss: RgbHueChromaEdgeLossFn,
 }
@@ -1067,68 +1044,6 @@ pub(crate) fn select_combine_error_fn() -> CombineErrorFn {
         };
     }
     combine_error_scalar
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
-    crate::wasm::error_gradient_energy_wasm
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
-    |error, width, height| unsafe { crate::neon::error_gradient_energy_neon(error, width, height) }
-}
-
-#[cfg(not(any(
-    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
-    all(target_arch = "aarch64", feature = "neon")
-)))]
-pub(crate) fn select_error_gradient_energy_fn() -> ErrorGradientEnergyFn {
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return |error, width, height| unsafe {
-            crate::avx::error_gradient_energy_avx2(error, width, height)
-        };
-    }
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    if is_x86_feature_detected!("sse4.1") {
-        return |error, width, height| unsafe {
-            crate::sse::error_gradient_energy_sse41(error, width, height)
-        };
-    }
-    error_gradient_energy_scalar
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
-pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
-    crate::wasm::error_gradient_peak_energy_wasm
-}
-
-#[cfg(all(target_arch = "aarch64", feature = "neon"))]
-pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
-    |error, original, width, height, floor| unsafe {
-        crate::neon::error_gradient_peak_energy_neon(error, original, width, height, floor)
-    }
-}
-
-#[cfg(not(any(
-    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"),
-    all(target_arch = "aarch64", feature = "neon")
-)))]
-pub(crate) fn select_error_gradient_peak_energy_fn() -> ErrorGradientPeakEnergyFn {
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return |error, original, width, height, floor| unsafe {
-            crate::avx::error_gradient_peak_energy_avx2(error, original, width, height, floor)
-        };
-    }
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    if is_x86_feature_detected!("sse4.1") {
-        return |error, original, width, height, floor| unsafe {
-            crate::sse::error_gradient_peak_energy_sse41(error, original, width, height, floor)
-        };
-    }
-    error_gradient_peak_energy_scalar
 }
 
 pub(crate) fn select_recon_dist_and_rate_fn() -> ReconDistAndRateFn {
@@ -1255,8 +1170,6 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
     input: &ReconDistInput<'_>,
 ) -> ReconCost {
     let error = ReconErrorKernels {
-        gradient_energy: error_gradient_energy_scalar,
-        gradient_peak_energy: error_gradient_peak_energy_scalar,
         combine: combine_error_scalar,
         rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_scalar,
     };
@@ -1274,112 +1187,6 @@ pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
             error: &error,
         },
     )
-}
-
-/// `sum((dx err)^2 + (dy err)^2)` over one channel's spatial error plane.
-#[allow(dead_code)]
-pub(crate) fn error_gradient_energy_scalar(error: &[f32], width: usize, height: usize) -> f32 {
-    error_gradient_energy_strided(error, width, width, height)
-}
-
-/// [`error_gradient_energy_scalar`] over the leading `width × height` window
-/// of a `stride`-wide plane.
-pub(crate) fn error_gradient_energy_strided(
-    error: &[f32],
-    stride: usize,
-    width: usize,
-    height: usize,
-) -> f32 {
-    assert!(width <= stride);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    let n = (height - 1)
-        .checked_mul(stride)
-        .and_then(|n| n.checked_add(width))
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n);
-    let rows = error.chunks(stride).take(height).map(|row| &row[..width]);
-    let mut grad = 0.0f32;
-    for row in rows.clone() {
-        for &[left, right] in row.array_windows::<2>() {
-            let d = right - left;
-            grad = fmla(d, d, grad);
-        }
-    }
-    for (top, bottom) in rows.clone().zip(rows.skip(1)) {
-        for (&top, &bottom) in top.iter().zip(bottom) {
-            let d = bottom - top;
-            grad = fmla(d, d, grad);
-        }
-    }
-    grad
-}
-
-pub(crate) fn error_gradient_peak_energy_scalar(
-    error: &[f32],
-    original: &[f32],
-    width: usize,
-    height: usize,
-    floor: f32,
-) -> f32 {
-    error_gradient_peak_energy_strided(error, original, width, width, height, floor)
-}
-
-/// [`error_gradient_peak_energy_scalar`] over the leading `width × height`
-/// window of `stride`-wide planes.
-pub(crate) fn error_gradient_peak_energy_strided(
-    error: &[f32],
-    original: &[f32],
-    stride: usize,
-    width: usize,
-    height: usize,
-    floor: f32,
-) -> f32 {
-    assert!(width <= stride);
-    assert!(floor.is_finite() && floor >= 0.0);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    let n = (height - 1)
-        .checked_mul(stride)
-        .and_then(|n| n.checked_add(width))
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n && original.len() >= n);
-    let mut total = 0.0f32;
-    for cell_y in (0..height).step_by(4) {
-        for cell_x in (0..width).step_by(4) {
-            let mut max_x = 0.0f32;
-            let mut max_y = 0.0f32;
-            for y in cell_y..(cell_y + 4).min(height) {
-                for x in cell_x..(cell_x + 4).min(width) {
-                    let p = y * stride + x;
-                    if x + 1 < width {
-                        let error_gradient = (error[p + 1] - error[p]).abs();
-                        let source_gradient = (original[p + 1] - original[p]).abs();
-                        let excess = (error_gradient - 0.5 * source_gradient - floor).max(0.0);
-                        max_x = max_x.max(excess * excess);
-                    }
-                    if y + 1 < height {
-                        let error_gradient = (error[p + stride] - error[p]).abs();
-                        let source_gradient = (original[p + stride] - original[p]).abs();
-                        let excess = (error_gradient - 0.5 * source_gradient - floor).max(0.0);
-                        max_y = max_y.max(excess * excess);
-                    }
-                }
-            }
-            total += max_x + max_y;
-        }
-    }
-    total
-}
-
-#[inline]
-fn gradient_peak_floor(distance: f32) -> f32 {
-    // Preserve the validated high-quality metric, then reject ordinary coarse
-    // quantization error more aggressively once the long tail engages.
-    let coarse_mix = ((distance - 1.9) / 0.1).clamp(0.0, 1.0);
-    distance * fmla(coarse_mix, 0.0045 - 0.0015, 0.0015)
 }
 
 pub(crate) fn recon_dist_and_rate_with_kernels(
@@ -1401,7 +1208,6 @@ pub(crate) fn recon_luma_phase_with_kernels(
     let quantization = &input.quantization;
     let transform = &input.transform;
     let source = &input.source;
-    let scoring = &input.scoring;
     let rate_log2_lut = quantization.rate_log2_lut;
     let coeffs = quantization.coeffs;
     let inverse_matrices = &quantization.inverse_matrices;
@@ -1414,18 +1220,9 @@ pub(crate) fn recon_luma_phase_with_kernels(
     let opsin = source.opsin;
     let px = source.x;
     let py = source.y;
-    let gradient_alpha = scoring.gradient_alpha;
-    let gradient_peak_alpha = scoring.gradient_peak_alpha;
-    let gradient_peak_floor = if gradient_peak_alpha > 0.0 {
-        gradient_peak_floor(distance)
-    } else {
-        0.0
-    };
     let quantize = kernels.quantize;
     let ssim = kernels.ssim;
     let prepare_reconstruction = kernels.prepare;
-    let error_gradient_energy = kernels.error.gradient_energy;
-    let error_gradient_peak_energy = kernels.error.gradient_peak_energy;
     let n = strategy_pixel_count(strategy);
     let width = cx.checked_mul(8).expect("coefficient width overflow");
     let height = cy.checked_mul(8).expect("coefficient height overflow");
@@ -1468,74 +1265,32 @@ pub(crate) fn recon_luma_phase_with_kernels(
         pixel_height,
     );
     let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
-    // The three distortion terms of one channel: its SSIM deficit and the
-    // two gradient penalties, each already weighted.
-    let channel_terms =
-        |c: usize, error: &[f32], original: &[f32], reconstructed: &[f32]| -> [f32; 3] {
-            let weight = input.scoring.channel_weights[c];
-            let mut terms = [0.0f32; 3];
-            if footprint.is_full() {
-                terms[0] = weight
-                    * unsafe {
-                        ssim(
-                            &original[..n],
-                            &reconstructed[..n],
-                            pixel_width,
-                            pixel_height,
-                        )
-                    };
-                if gradient_alpha > 0.0 {
-                    terms[1] = weight
-                        * gradient_alpha
-                        * error_gradient_energy(&error[..n], pixel_width, pixel_height);
-                }
-                if gradient_peak_alpha > 0.0 {
-                    terms[2] = weight
-                        * gradient_peak_alpha
-                        * error_gradient_peak_energy(
-                            &error[..n],
-                            &original[..n],
-                            pixel_width,
-                            pixel_height,
-                            gradient_peak_floor,
-                        );
-                }
-            } else {
-                // Edge footprints: score only the pixels the decoder keeps,
-                // reading the footprint-strided buffers in place.
-                terms[0] = weight
-                    * ssim_deficit_visible(
+    // One channel's weighted SSIM deficit.
+    let channel_ssim = |c: usize, original: &[f32], reconstructed: &[f32]| -> f32 {
+        let weight = input.scoring.channel_weights[c];
+        if footprint.is_full() {
+            weight
+                * unsafe {
+                    ssim(
                         &original[..n],
                         &reconstructed[..n],
                         pixel_width,
-                        visible_width,
-                        visible_height,
-                    );
-                if gradient_alpha > 0.0 {
-                    terms[1] = weight
-                        * gradient_alpha
-                        * error_gradient_energy_strided(
-                            &error[..n],
-                            pixel_width,
-                            visible_width,
-                            visible_height,
-                        );
+                        pixel_height,
+                    )
                 }
-                if gradient_peak_alpha > 0.0 {
-                    terms[2] = weight
-                        * gradient_peak_alpha
-                        * error_gradient_peak_energy_strided(
-                            &error[..n],
-                            &original[..n],
-                            pixel_width,
-                            visible_width,
-                            visible_height,
-                            gradient_peak_floor,
-                        );
-                }
-            }
-            terms
-        };
+        } else {
+            // Edge footprints: score only the pixels the decoder keeps,
+            // reading the footprint-strided buffers in place.
+            weight
+                * ssim_deficit_visible(
+                    &original[..n],
+                    &reconstructed[..n],
+                    pixel_width,
+                    visible_width,
+                    visible_height,
+                )
+        }
+    };
     let mut rate = 0.0f32;
     rate += unsafe {
         quantize(
@@ -1573,14 +1328,14 @@ pub(crate) fn recon_luma_phase_with_kernels(
                 &mut reconstructed[..n],
             );
         }
-        let terms = channel_terms(1, &y_error[..n], &original[..n], &reconstructed[..n]);
-        LumaPhase { rate, terms }
+        let distortion = channel_ssim(1, &original[..n], &reconstructed[..n]);
+        LumaPhase { rate, distortion }
     }
 }
 
 /// Completes a score whose luma phase is `luma`: quantizes the chroma
-/// channels against the reconstructed luma and sums every channel's terms
-/// in channel order.
+/// channels against the reconstructed luma and sums every channel's SSIM
+/// deficit in channel order.
 pub(crate) fn recon_chroma_phase_with_kernels(
     scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
@@ -1605,19 +1360,10 @@ pub(crate) fn recon_chroma_phase_with_kernels(
     let py = source.y;
     let factor_x = scoring.factor_x;
     let factor_b = scoring.factor_b;
-    let gradient_alpha = scoring.gradient_alpha;
-    let gradient_peak_alpha = scoring.gradient_peak_alpha;
     let rgb_hue_alpha = scoring.rgb_hue_alpha;
-    let gradient_peak_floor = if gradient_peak_alpha > 0.0 {
-        gradient_peak_floor(distance)
-    } else {
-        0.0
-    };
     let quantize = kernels.quantize;
     let ssim = kernels.ssim;
     let prepare_reconstruction = kernels.prepare;
-    let error_gradient_energy = kernels.error.gradient_energy;
-    let error_gradient_peak_energy = kernels.error.gradient_peak_energy;
     let combine_error = kernels.error.combine;
     let rgb_hue_chroma_edge_loss = kernels.error.rgb_hue_chroma_edge_loss;
     let n = strategy_pixel_count(strategy);
@@ -1669,74 +1415,32 @@ pub(crate) fn recon_chroma_phase_with_kernels(
         pixel_height,
     );
     let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
-    // The three distortion terms of one channel: its SSIM deficit and the
-    // two gradient penalties, each already weighted.
-    let channel_terms =
-        |c: usize, error: &[f32], original: &[f32], reconstructed: &[f32]| -> [f32; 3] {
-            let weight = input.scoring.channel_weights[c];
-            let mut terms = [0.0f32; 3];
-            if footprint.is_full() {
-                terms[0] = weight
-                    * unsafe {
-                        ssim(
-                            &original[..n],
-                            &reconstructed[..n],
-                            pixel_width,
-                            pixel_height,
-                        )
-                    };
-                if gradient_alpha > 0.0 {
-                    terms[1] = weight
-                        * gradient_alpha
-                        * error_gradient_energy(&error[..n], pixel_width, pixel_height);
-                }
-                if gradient_peak_alpha > 0.0 {
-                    terms[2] = weight
-                        * gradient_peak_alpha
-                        * error_gradient_peak_energy(
-                            &error[..n],
-                            &original[..n],
-                            pixel_width,
-                            pixel_height,
-                            gradient_peak_floor,
-                        );
-                }
-            } else {
-                // Edge footprints: score only the pixels the decoder keeps,
-                // reading the footprint-strided buffers in place.
-                terms[0] = weight
-                    * ssim_deficit_visible(
+    // One channel's weighted SSIM deficit.
+    let channel_ssim = |c: usize, original: &[f32], reconstructed: &[f32]| -> f32 {
+        let weight = input.scoring.channel_weights[c];
+        if footprint.is_full() {
+            weight
+                * unsafe {
+                    ssim(
                         &original[..n],
                         &reconstructed[..n],
                         pixel_width,
-                        visible_width,
-                        visible_height,
-                    );
-                if gradient_alpha > 0.0 {
-                    terms[1] = weight
-                        * gradient_alpha
-                        * error_gradient_energy_strided(
-                            &error[..n],
-                            pixel_width,
-                            visible_width,
-                            visible_height,
-                        );
+                        pixel_height,
+                    )
                 }
-                if gradient_peak_alpha > 0.0 {
-                    terms[2] = weight
-                        * gradient_peak_alpha
-                        * error_gradient_peak_energy_strided(
-                            &error[..n],
-                            &original[..n],
-                            pixel_width,
-                            visible_width,
-                            visible_height,
-                            gradient_peak_floor,
-                        );
-                }
-            }
-            terms
-        };
+        } else {
+            // Edge footprints: score only the pixels the decoder keeps,
+            // reading the footprint-strided buffers in place.
+            weight
+                * ssim_deficit_visible(
+                    &original[..n],
+                    &reconstructed[..n],
+                    pixel_width,
+                    visible_width,
+                    visible_height,
+                )
+        }
+    };
     let mut rate = luma.rate;
     for c in [0usize, 2] {
         let factor = if c == 0 { factor_x } else { factor_b };
@@ -1767,8 +1471,8 @@ pub(crate) fn recon_chroma_phase_with_kernels(
 
     let mut distortion = 0.0f32;
     for c in 0..3 {
-        let (error, terms): (&[f32], [f32; 3]) = match c {
-            1 => (&y_error[..n], luma.terms),
+        let (error, channel): (&[f32], f32) = match c {
+            1 => (&y_error[..n], luma.distortion),
             _ => {
                 reconstruct_error(
                     input.idct,
@@ -1789,18 +1493,11 @@ pub(crate) fn recon_chroma_phase_with_kernels(
                         &mut reconstructed[..n],
                     );
                 }
-                let terms =
-                    channel_terms(c, &spatial_error[..n], &original[..n], &reconstructed[..n]);
-                (&spatial_error[..n], terms)
+                let channel = channel_ssim(c, &original[..n], &reconstructed[..n]);
+                (&spatial_error[..n], channel)
             }
         };
-        distortion += terms[0];
-        if gradient_alpha > 0.0 {
-            distortion += terms[1];
-        }
-        if gradient_peak_alpha > 0.0 {
-            distortion += terms[2];
-        }
+        distortion += channel;
         if rgb_hue_alpha > 0.0 || scoring.keep_spatial_errors {
             coeff_error[c][..n].copy_from_slice(error);
         }
@@ -2316,11 +2013,9 @@ fn ssim_deficit_scalar_kernel(orig: &[f32], recon: &[f32], width: usize, height:
 #[cfg(test)]
 mod tests {
     use super::{
-        CombineErrorFn, ErrorGradientEnergyFn, ErrorGradientPeakEnergyFn, combine_error_scalar,
-        error_gradient_energy_scalar, error_gradient_peak_energy_scalar, gradient_peak_floor,
-        rgb_hue_chroma_edge_loss_scalar, select_combine_error_fn, select_error_gradient_energy_fn,
-        select_error_gradient_peak_energy_fn, select_rgb_hue_chroma_edge_loss_fn,
-        ssim_deficit_scalar, validate_ssim_inputs,
+        CombineErrorFn, combine_error_scalar, rgb_hue_chroma_edge_loss_scalar,
+        select_combine_error_fn, select_rgb_hue_chroma_edge_loss_fn, ssim_deficit_scalar,
+        validate_ssim_inputs,
     };
 
     fn pseudo_random_plane(n: usize, seed: usize) -> Vec<f32> {
@@ -2344,10 +2039,7 @@ mod tests {
 
     #[test]
     fn strided_visible_kernels_match_dense_copies() {
-        use super::{
-            error_gradient_energy_strided, error_gradient_peak_energy_strided,
-            rgb_hue_chroma_edge_loss_strided, ssim_deficit_visible,
-        };
+        use super::{rgb_hue_chroma_edge_loss_strided, ssim_deficit_visible};
         let stride = 32;
         let height = 16;
         let original = pseudo_random_plane(stride * height, 3);
@@ -2373,18 +2065,6 @@ mod tests {
                 ssim_deficit_visible(&original, &reconstructed, stride, w, h).to_bits(),
                 ssim_deficit_visible(&o, &r, w, w, h).to_bits(),
                 "ssim {w}x{h}"
-            );
-            let e = dense(&errors[0], w, h);
-            assert_eq!(
-                error_gradient_energy_strided(&errors[0], stride, w, h).to_bits(),
-                error_gradient_energy_scalar(&e, w, h).to_bits(),
-                "gradient {w}x{h}"
-            );
-            assert_eq!(
-                error_gradient_peak_energy_strided(&errors[0], &original, stride, w, h, 0.01)
-                    .to_bits(),
-                error_gradient_peak_energy_scalar(&e, &o, w, h, 0.01).to_bits(),
-                "peak {w}x{h}"
             );
             let dense_errors: [Vec<f32>; 3] = std::array::from_fn(|c| dense(&errors[c], w, h));
             assert_eq!(
@@ -2467,8 +2147,6 @@ mod tests {
         });
         let inverse: [f32; 1024] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
         let error = ReconErrorKernels {
-            gradient_energy: select_error_gradient_energy_fn(),
-            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
             combine: select_combine_error_fn(),
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
         };
@@ -2505,8 +2183,6 @@ mod tests {
                         channel_weights: CHANNEL_WEIGHT,
                         xyb_matrix: crate::xyb::XybMatrix::SPEC,
                         rgb_hue_alpha: 800.0,
-                        gradient_alpha: 8.0,
-                        gradient_peak_alpha: 3.0,
                         keep_spatial_errors: false,
                     },
                 };
@@ -2538,8 +2214,6 @@ mod tests {
         });
         let inverse: [f32; 4096] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
         let error = ReconErrorKernels {
-            gradient_energy: select_error_gradient_energy_fn(),
-            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
             combine: select_combine_error_fn(),
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
         };
@@ -2584,8 +2258,6 @@ mod tests {
                             channel_weights: CHANNEL_WEIGHT,
                             xyb_matrix: crate::xyb::XybMatrix::SPEC,
                             rgb_hue_alpha: 800.0,
-                            gradient_alpha: 8.0,
-                            gradient_peak_alpha: 3.0,
                             keep_spatial_errors: true,
                         },
                     };
@@ -2669,14 +2341,10 @@ mod tests {
                 channel_weights: CHANNEL_WEIGHT,
                 xyb_matrix: matrix,
                 rgb_hue_alpha: 0.0,
-                gradient_alpha: 0.0,
-                gradient_peak_alpha: 0.0,
                 keep_spatial_errors: true,
             },
         };
         let error = ReconErrorKernels {
-            gradient_energy: select_error_gradient_energy_fn(),
-            gradient_peak_energy: select_error_gradient_peak_energy_fn(),
             combine: select_combine_error_fn(),
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
         };
@@ -2846,50 +2514,6 @@ mod tests {
         assert!(loss.is_finite() && loss > 0.0);
     }
 
-    #[test]
-    fn peak_gradient_energy_favors_localized_errors() {
-        let mut diffuse = [0.0f32; 64];
-        for y in 0..8 {
-            for x in 0..8 {
-                diffuse[y * 8 + x] = x as f32;
-            }
-        }
-        let mut localized = [0.0f32; 64];
-        for y in 0..8 {
-            localized[y * 8 + 4..y * 8 + 8].fill(1.0);
-        }
-        let diffuse_raw = error_gradient_energy_scalar(&diffuse, 8, 8);
-        let localized_raw = error_gradient_energy_scalar(&localized, 8, 8);
-        let original = [0.0f32; 64];
-        let diffuse_peak = error_gradient_peak_energy_scalar(&diffuse, &original, 8, 8, 0.0);
-        let localized_peak = error_gradient_peak_energy_scalar(&localized, &original, 8, 8, 0.0);
-        assert!(diffuse_raw > localized_raw);
-        assert!(diffuse_raw / localized_raw > diffuse_peak / localized_peak);
-    }
-
-    #[test]
-    fn peak_gradient_energy_exposes_edge_displacement() {
-        let mut original = [0.0f32; 64];
-        let mut aligned_error = [0.0f32; 64];
-        let mut displaced_error = [0.0f32; 64];
-        for y in 0..8 {
-            original[y * 8 + 4..y * 8 + 8].fill(1.0);
-            aligned_error[y * 8 + 4..y * 8 + 8].fill(0.5);
-            displaced_error[y * 8 + 4] = 1.0;
-        }
-        let aligned = error_gradient_peak_energy_scalar(&aligned_error, &original, 8, 8, 0.0);
-        let displaced = error_gradient_peak_energy_scalar(&displaced_error, &original, 8, 8, 0.0);
-        assert_eq!(aligned, 0.0);
-        assert!(displaced > 0.0);
-    }
-
-    #[test]
-    fn peak_gradient_floor_rises_for_the_coarse_tail() {
-        assert!((gradient_peak_floor(1.9) - 0.0015 * 1.9).abs() < 1e-7);
-        assert!((gradient_peak_floor(2.0) - 0.0045 * 2.0).abs() < 1e-7);
-        assert!((gradient_peak_floor(3.0) - 0.0045 * 3.0).abs() < 1e-7);
-    }
-
     fn check_combine_error(kernel: CombineErrorFn) {
         for len in (0usize..=40).chain([65, 257, 1024]) {
             let spatial: Vec<f32> = (0..len)
@@ -2935,121 +2559,6 @@ mod tests {
         if is_x86_feature_detected!("sse4.1") {
             check_combine_error(|spatial, luma, factor, combined| unsafe {
                 crate::sse::combine_error_sse41(spatial, luma, factor, combined)
-            });
-        }
-    }
-
-    fn check_error_gradient_energy(kernel: ErrorGradientEnergyFn) {
-        for &(width, height) in &[
-            (0usize, 0usize),
-            (1, 1),
-            (1, 7),
-            (7, 1),
-            (3, 5),
-            (8, 8),
-            (16, 8),
-            (17, 11),
-            (32, 32),
-        ] {
-            let mut state = 0x9e37_79b9u32;
-            let values: Vec<f32> = (0..width * height)
-                .map(|_| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 8.0
-                })
-                .collect();
-            let expected = error_gradient_energy_scalar(&values, width, height);
-            let actual = kernel(&values, width, height);
-            let tolerance = 2e-5f32.max(expected.abs() * 3e-6);
-            assert!(
-                (actual - expected).abs() <= tolerance,
-                "shape {width}x{height}: actual={actual}, expected={expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn selected_error_gradient_energy_matches_scalar() {
-        check_error_gradient_energy(select_error_gradient_energy_fn());
-    }
-
-    fn check_error_gradient_peak_energy(kernel: ErrorGradientPeakEnergyFn) {
-        for &(width, height) in &[
-            (0usize, 0usize),
-            (1, 1),
-            (1, 7),
-            (7, 1),
-            (3, 5),
-            (4, 4),
-            (8, 8),
-            (16, 8),
-            (8, 16),
-            (17, 11),
-            (32, 32),
-        ] {
-            let mut state = 0x243f_6a88u32;
-            let mut random = || {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (state >> 8) as f32 / (1u32 << 24) as f32
-            };
-            let error: Vec<f32> = (0..width * height)
-                .map(|_| (random() - 0.5) * 0.2)
-                .collect();
-            let original: Vec<f32> = (0..width * height).map(|_| random()).collect();
-            for floor in [0.0, 0.0015, 0.009, 0.05] {
-                let expected =
-                    error_gradient_peak_energy_scalar(&error, &original, width, height, floor);
-                let actual = kernel(&error, &original, width, height, floor);
-                let tolerance = 2e-7f32.max(expected.abs() * 2e-6);
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "shape {width}x{height}, floor={floor}: actual={actual}, expected={expected}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn selected_error_gradient_peak_energy_matches_scalar() {
-        check_error_gradient_peak_energy(select_error_gradient_peak_energy_fn());
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    #[test]
-    fn avx2_error_gradient_energy_matches_scalar() {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            check_error_gradient_energy(|error, width, height| unsafe {
-                crate::avx::error_gradient_energy_avx2(error, width, height)
-            });
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    #[test]
-    fn avx2_error_gradient_peak_energy_matches_scalar() {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            check_error_gradient_peak_energy(|error, original, width, height, floor| unsafe {
-                crate::avx::error_gradient_peak_energy_avx2(error, original, width, height, floor)
-            });
-        }
-    }
-
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    #[test]
-    fn sse41_error_gradient_energy_matches_scalar() {
-        if is_x86_feature_detected!("sse4.1") {
-            check_error_gradient_energy(|error, width, height| unsafe {
-                crate::sse::error_gradient_energy_sse41(error, width, height)
-            });
-        }
-    }
-
-    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
-    #[test]
-    fn sse41_error_gradient_peak_energy_matches_scalar() {
-        if is_x86_feature_detected!("sse4.1") {
-            check_error_gradient_peak_energy(|error, original, width, height, floor| unsafe {
-                crate::sse::error_gradient_peak_energy_sse41(error, original, width, height, floor)
             });
         }
     }
