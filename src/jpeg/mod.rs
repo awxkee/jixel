@@ -234,6 +234,9 @@ pub struct JpegTranscodeConfig {
     ///
     /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also try a learned DC context
     /// tree, retaining it only when the complete codestream is smaller.
+    /// [`Speed::ExtraSlow`] also fits an AC context map to the DC values of
+    /// all three channels on images of about a megapixel or more, kept when
+    /// its AC coding is cheaper.
     pub speed: Speed,
 }
 

@@ -29,6 +29,8 @@
 
 //! Builds a JXL VarDCT frame directly from JPEG DCT coefficients.
 
+mod ctx_opt;
+
 use super::{DCT_BLOCK_SIZE, JpegData, JpegError, coeff_order};
 use crate::ac_context::{
     K_NON_ZERO_BUCKETS, K_NUM_ORDERS, K_ZERO_DENSITY_CONTEXT_COUNT, non_zero_bucket,
@@ -649,11 +651,14 @@ fn coded_block(
     }
 }
 
-/// Block contexts keyed by the luma DC value, libjxl's JPEG layout: one
-/// context per luma DC bucket, chroma buckets paired up.
+/// Block contexts keyed by the quantized DC values of all three channels.
+/// Each plane's thresholds split its DC range into intervals; their product
+/// forms the DC cells, and `ctx_map` gives every (channel, cell) a context.
 struct BlockCtx {
-    /// Luma DC thresholds; a block's bucket counts those below its DC.
-    luma_thresholds: Vec<i32>,
+    /// DC thresholds per JXL plane (X, Y, B); a block's interval on a plane
+    /// counts the thresholds below its DC there.
+    thresholds: [Vec<i32>; 3],
+    num_dc_ctxs: usize,
     /// Indexed by `(row * K_NUM_ORDERS + order) * num_dc_ctxs + dc_idx`, rows
     /// in Y, X, B order.
     ctx_map: Vec<u8>,
@@ -661,7 +666,9 @@ struct BlockCtx {
 }
 
 impl BlockCtx {
-    fn new(
+    /// libjxl's JPEG layout: one context per luma DC bucket, chroma buckets
+    /// paired up.
+    fn luma_quantiles(
         jpg: &JpegData,
         dim: &Dim,
         ss: &ChannelLayout,
@@ -693,23 +700,31 @@ impl BlockCtx {
             }
         }
         let num_dc = luma_thresholds.len() + 1;
-        let mut ctx_map = vec![0u8; 3 * K_NUM_ORDERS * num_dc];
-        for i in 0..num_dc {
-            ctx_map[i] = i as u8;
-            if ss.gray {
+        Self::from_cells([Vec::new(), luma_thresholds, Vec::new()], |row, i| {
+            match row {
+                0 => i as u8,
                 // All-zero chroma shares a single context.
-                ctx_map[K_NUM_ORDERS * num_dc + i] = num_dc as u8;
-                ctx_map[2 * K_NUM_ORDERS * num_dc + i] = num_dc as u8;
-            } else {
-                ctx_map[K_NUM_ORDERS * num_dc + i] = (num_dc + i / 2) as u8;
-                ctx_map[2 * K_NUM_ORDERS * num_dc + i] =
-                    (num_dc + (num_dc - 1) / 2 + 1 + i / 2) as u8;
+                _ if ss.gray => num_dc as u8,
+                1 => (num_dc + i / 2) as u8,
+                _ => (num_dc + (num_dc - 1) / 2 + 1 + i / 2) as u8,
+            }
+        })
+    }
+
+    /// Fills the DCT8 entries of every map row (Y, X, B) from `cell_ctx`.
+    fn from_cells(thresholds: [Vec<i32>; 3], cell_ctx: impl Fn(usize, usize) -> u8) -> Self {
+        let num_dc_ctxs = thresholds.iter().map(|t| t.len() + 1).product::<usize>();
+        let mut ctx_map = vec![0u8; 3 * K_NUM_ORDERS * num_dc_ctxs];
+        for row in 0..3 {
+            for i in 0..num_dc_ctxs {
+                ctx_map[row * K_NUM_ORDERS * num_dc_ctxs + i] = cell_ctx(row, i);
             }
         }
         let num_ctxs = *ctx_map.iter().max().unwrap() as usize + 1;
-        debug_assert!(num_ctxs <= 16);
+        debug_assert!(num_ctxs <= 16 && num_dc_ctxs <= 64);
         Self {
-            luma_thresholds,
+            thresholds,
+            num_dc_ctxs,
             ctx_map,
             num_ctxs,
         }
@@ -719,18 +734,21 @@ impl BlockCtx {
         self.num_ctxs * (K_NON_ZERO_BUCKETS + K_ZERO_DENSITY_CONTEXT_COUNT)
     }
 
-    /// Block context of a DCT8 block in JXL channel `c` whose co-located luma
-    /// block codes the DC value `luma_dc`.
+    /// DC cell of a block whose co-located quantized DC values are `dc`, in
+    /// the decoder's X-major, then B, then Y nesting.
     #[inline]
-    fn context(&self, c: usize, luma_dc: i16) -> u32 {
-        let dc_idx = self
-            .luma_thresholds
-            .iter()
-            .filter(|&&t| i32::from(luma_dc) > t)
-            .count();
+    fn dc_idx(&self, dc: [i32; 3]) -> usize {
+        let interval = |p: usize| self.thresholds[p].iter().filter(|&&t| dc[p] > t).count();
+        (interval(0) * (self.thresholds[2].len() + 1) + interval(2))
+            * (self.thresholds[1].len() + 1)
+            + interval(1)
+    }
+
+    /// Block context of a DCT8 block in JXL channel `c`.
+    #[inline]
+    fn context(&self, c: usize, dc: [i32; 3]) -> u32 {
         let row = [1, 0, 2][c];
-        let num_dc = self.luma_thresholds.len() + 1;
-        u32::from(self.ctx_map[row * K_NUM_ORDERS * num_dc + dc_idx])
+        u32::from(self.ctx_map[row * K_NUM_ORDERS * self.num_dc_ctxs + self.dc_idx(dc)])
     }
 
     #[inline]
@@ -746,27 +764,27 @@ impl BlockCtx {
 
     fn write(&self, scratch: &mut CoderScratch, w: &mut BitWriter) {
         w.write(1, 0); // non-default BlockCtxMap
-        w.write(4, 0); // dc thresholds, X
-        w.write(4, self.luma_thresholds.len() as u64);
-        for &t in &self.luma_thresholds {
-            // kDCThresholdDist: U32(Bits(4), BitsOffset(8,16), BitsOffset(16,272),
-            // BitsOffset(32,65808)) over PackSigned(t).
-            let v = pack_signed(t);
-            if v < 16 {
-                w.write(2, 0);
-                w.write(4, u64::from(v));
-            } else if v < 272 {
-                w.write(2, 1);
-                w.write(8, u64::from(v - 16));
-            } else if v < 65808 {
-                w.write(2, 2);
-                w.write(16, u64::from(v - 272));
-            } else {
-                w.write(2, 3);
-                w.write(32, u64::from(v - 65808));
+        for thresholds in &self.thresholds {
+            w.write(4, thresholds.len() as u64);
+            for &t in thresholds {
+                // kDCThresholdDist: U32(Bits(4), BitsOffset(8,16), BitsOffset(16,272),
+                // BitsOffset(32,65808)) over PackSigned(t).
+                let v = pack_signed(t);
+                if v < 16 {
+                    w.write(2, 0);
+                    w.write(4, u64::from(v));
+                } else if v < 272 {
+                    w.write(2, 1);
+                    w.write(8, u64::from(v - 16));
+                } else if v < 65808 {
+                    w.write(2, 2);
+                    w.write(16, u64::from(v - 272));
+                } else {
+                    w.write(2, 3);
+                    w.write(32, u64::from(v - 65808));
+                }
             }
         }
-        w.write(4, 0); // dc thresholds, B
         w.write(4, 0); // no quant-field thresholds
         let empty_codes: [crate::entropy::PrefixCode; 0] = [];
         let empty_configs: [crate::entropy::HybridUintConfig; 0] = [];
@@ -871,6 +889,8 @@ struct Effort {
     try_natural_order: bool,
     /// Race the fixed DC tree against a per-image learned tree.
     learned_dc_tree: bool,
+    /// Race an entropy-optimized block context map against the luma-quantile one.
+    optimized_ctx_map: bool,
     /// Pick per-cluster HybridUint configs instead of the default.
     select_configs: bool,
     refinement: Option<AnsRefinement>,
@@ -882,30 +902,36 @@ impl Effort {
             Speed::UltraFast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                optimized_ctx_map: false,
                 select_configs: false,
                 refinement: None,
             },
             Speed::Fastest => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                optimized_ctx_map: false,
                 select_configs: false,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Fast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                optimized_ctx_map: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
             },
             Speed::Medium | Speed::MediumSlow => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                optimized_ctx_map: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: true }),
             },
             Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
                 learned_dc_tree: true,
+                // About −0.24 % on large photos for ×1.7 encode time.
+                optimized_ctx_map: speed == Speed::ExtraSlow,
                 select_configs: true,
                 refinement: Some(AnsRefinement::slow_for_speed(speed)),
             },
@@ -1188,50 +1214,102 @@ fn encode_jpeg_codestream_with_pool(
         }
         s
     };
-    let bctx = BlockCtx::new(jpg, dim, ss, &qtable);
-    let plan =
-        |scan: &[[u8; DCT_BLOCK_SIZE]; 3], perm: Option<Vec<Token>>, scratch: &mut CoderScratch| {
-            plan_ac(
-                jpg,
-                dim,
-                ss,
-                &bctx,
-                cfl.as_ref(),
-                &qtable,
-                scan,
-                perm,
-                effort,
-                pool,
-                scratch,
-            )
-        };
-
     let orders = compute_coeff_orders(jpg, dim, ss, cfl.as_ref());
-    let ac = if orders.iter().any(|o| !coeff_order::is_identity(o)) {
-        let mut custom_scan = [[0u8; DCT_BLOCK_SIZE]; 3];
-        for c in 0..3 {
-            for k in 0..DCT_BLOCK_SIZE {
-                custom_scan[c][k] = K_COEFF_ORDER_8X8[orders[c][k] as usize];
+    let custom_scan = orders
+        .iter()
+        .any(|o| !coeff_order::is_identity(o))
+        .then(|| {
+            let mut custom_scan = [[0u8; DCT_BLOCK_SIZE]; 3];
+            for c in 0..3 {
+                for k in 0..DCT_BLOCK_SIZE {
+                    custom_scan[c][k] = K_COEFF_ORDER_8X8[orders[c][k] as usize];
+                }
             }
-        }
-        // Permutation signaling: one order index (DCT8), three channels.
+            custom_scan
+        });
+    // Permutation signaling: one order index (DCT8), three channels.
+    let perm_tokens = || {
         let mut perm_tokens: Vec<Token> = Vec::new();
         for order in &orders {
             coeff_order::tokenize_permutation(order, 1, &mut perm_tokens);
         }
-        let candidate = plan(&custom_scan, Some(perm_tokens), scratch);
-        if effort.try_natural_order {
-            let natural = plan(&natural_scan, None, scratch);
-            if candidate.estimated_bits() < natural.estimated_bits() {
-                candidate
-            } else {
-                natural
-            }
+        perm_tokens
+    };
+    let primary_scan = custom_scan.as_ref().unwrap_or(&natural_scan);
+    let plan_with = |bctx: &BlockCtx,
+                     scan: &[[u8; DCT_BLOCK_SIZE]; 3],
+                     perm: Option<Vec<Token>>,
+                     effort: Effort,
+                     scratch: &mut CoderScratch| {
+        plan_ac(
+            jpg,
+            dim,
+            ss,
+            bctx,
+            cfl.as_ref(),
+            &qtable,
+            scan,
+            perm,
+            effort,
+            pool,
+            scratch,
+        )
+    };
+    let primary_perm = || custom_scan.is_some().then(perm_tokens);
+
+    let mut bctx = BlockCtx::luma_quantiles(jpg, dim, ss, &qtable);
+    let mut primary = None;
+    // Below about a megapixel the optimized map never won on the test sweep.
+    if effort.optimized_ctx_map && dim.xsize_blocks * dim.ysize_blocks >= 1 << 14 {
+        let opt = ctx_opt::optimize(jpg, dim, ss, cfl.as_ref(), primary_scan, pool, scratch);
+        // Raced on a Fast refinement of each arm's clustered code; the
+        // winner's unrefined code then gets the full refinement. Unrefined
+        // codes alone misrank near-ties.
+        let race = |b: &BlockCtx, scratch: &mut CoderScratch| {
+            let unrefined = Effort {
+                refinement: None,
+                ..effort
+            };
+            let plan = plan_with(b, primary_scan, primary_perm(), unrefined, scratch);
+            let mut code = plan.code.clone();
+            crate::entropy::refine_entropy_bundle(
+                &mut code,
+                plan.tokens.iter().map(Vec::as_slice),
+                AnsRefinement::Fast { recluster: false },
+                pool,
+                scratch,
+            );
+            let mut header = BitWriter::new();
+            b.write(scratch, &mut header);
+            write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
+            let bits = header.bits_written() as u64
+                + crate::entropy::estimate_ac_plain_bits(
+                    plan.tokens.iter().map(Vec::as_slice),
+                    &code,
+                );
+            (plan, bits)
+        };
+        let (opt_plan, opt_bits) = race(&opt, scratch);
+        let (base_plan, base_bits) = race(&bctx, scratch);
+        let winner = if opt_bits < base_bits {
+            bctx = opt;
+            opt_plan
         } else {
-            candidate
+            base_plan
+        };
+        primary = Some(winner.refine(dim, &qtable, primary_perm(), effort, pool, scratch));
+    }
+    let primary =
+        primary.unwrap_or_else(|| plan_with(&bctx, primary_scan, primary_perm(), effort, scratch));
+    let ac = if custom_scan.is_some() && effort.try_natural_order {
+        let natural = plan_with(&bctx, &natural_scan, None, effort, scratch);
+        if primary.estimated_bits() < natural.estimated_bits() {
+            primary
+        } else {
+            natural
         }
     } else {
-        plan(&natural_scan, None, scratch)
+        primary
     };
 
     // Sections. Each is an independent BitWriter, so the per-group ones can be
@@ -1367,6 +1445,28 @@ struct AcPlan {
 }
 
 impl AcPlan {
+    /// Applies `effort`'s refinement to a plan clustered without it.
+    fn refine(
+        self,
+        dim: &Dim,
+        qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+        perm: Option<Vec<Token>>,
+        effort: Effort,
+        pool: &ThreadPool,
+        scratch: &mut CoderScratch,
+    ) -> AcPlan {
+        finish_ac_plan(
+            self.tokens,
+            self.code,
+            dim,
+            qtable,
+            perm,
+            effort.refinement,
+            pool,
+            scratch,
+        )
+    }
+
     /// Global section plus estimated payload, for choosing between orderings.
     fn estimated_bits(&self) -> u64 {
         self.global.bits_written() as u64
@@ -1405,14 +1505,38 @@ fn plan_ac(
     scratch: &mut CoderScratch,
 ) -> AcPlan {
     let tokens = tokenize_ac(jpg, dim, ss, bctx, cfl, scan, pool, scratch);
-    let mut code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
+    let code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
         tokens.iter().map(Vec::as_slice),
         bctx.num_ac_contexts(),
         &mut scratch.huffman_pool,
         effort.select_configs,
         Some(pool),
     );
-    if let Some(refinement) = effort.refinement {
+    finish_ac_plan(
+        tokens,
+        code,
+        dim,
+        qtable,
+        perm,
+        effort.refinement,
+        pool,
+        scratch,
+    )
+}
+
+/// Refines a clustered AC code and serializes the AC global section.
+#[allow(clippy::too_many_arguments)]
+fn finish_ac_plan(
+    tokens: Vec<Vec<Token>>,
+    mut code: crate::entropy::OwnedEntropyCode,
+    dim: &Dim,
+    qtable: &[i32; 3 * DCT_BLOCK_SIZE],
+    perm: Option<Vec<Token>>,
+    refinement: Option<AnsRefinement>,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> AcPlan {
+    if let Some(refinement) = refinement {
         crate::entropy::refine_entropy_bundle(
             &mut code,
             tokens.iter().map(Vec::as_slice),
@@ -1535,87 +1659,137 @@ fn tokenize_ac_group(
     gx: usize,
     gy: usize,
 ) -> Vec<Token> {
+    let mut tokens: Vec<Token> = Vec::new();
+    visit_group_blocks(jpg, dim, ss, cfl, gx, gy, |b| {
+        let block_ctx = bctx.context(b.c, b.dc);
+        tokens.push(Token::new(
+            bctx.non_zero_context(b.predicted, block_ctx),
+            b.nzeros,
+        ));
+        let histo_offset = bctx.zero_density_offset(block_ctx);
+        for_each_coeff(&scan[b.c], b.block, b.nzeros, |zdc, coef| {
+            tokens.push(Token::new(histo_offset + zdc as u32, pack_signed(coef)));
+        });
+    });
+    tokens
+}
+
+/// One coded DCT8 block, as the AC tokenizer sees it.
+struct BlockVisit<'a> {
+    /// JXL channel.
+    c: usize,
+    /// Co-located quantized DC of every channel, as the decoder buckets it.
+    dc: [i32; 3],
+    /// Non-zero count predicted from the top and left neighbors.
+    predicted: u32,
+    nzeros: u32,
+    /// Coefficients in JXL's (transposed) raster order.
+    block: &'a [i32; DCT_BLOCK_SIZE],
+}
+
+/// Visits the coded blocks of one group in bitstream order.
+fn visit_group_blocks(
+    jpg: &JpegData,
+    dim: &Dim,
+    ss: &ChannelLayout,
+    cfl: Option<&JpegCfl>,
+    gx: usize,
+    gy: usize,
+    mut visit: impl FnMut(BlockVisit<'_>),
+) {
     let mut block = [0i32; DCT_BLOCK_SIZE];
-    {
-        {
-            let bx0 = gx * GROUP_DIM_IN_BLOCKS;
-            let by0 = gy * GROUP_DIM_IN_BLOCKS;
-            let bw = GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
-            let bh = GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
+    let bx0 = gx * GROUP_DIM_IN_BLOCKS;
+    let by0 = gy * GROUP_DIM_IN_BLOCKS;
+    let bw = GROUP_DIM_IN_BLOCKS.min(dim.xsize_blocks - bx0);
+    let bh = GROUP_DIM_IN_BLOCKS.min(dim.ysize_blocks - by0);
 
-            let mut tokens: Vec<Token> = Vec::new();
-            // Non-zero counts of already-coded neighbors, used as context.
-            let mut num_nzeros = Image3B::new(GROUP_DIM_IN_BLOCKS, GROUP_DIM_IN_BLOCKS);
+    // Non-zero counts of already-coded neighbors, used as context.
+    let mut num_nzeros = Image3B::new(GROUP_DIM_IN_BLOCKS, GROUP_DIM_IN_BLOCKS);
 
-            for by in 0..bh {
-                for bx in 0..bw {
-                    for &c in &CHANNEL_ORDER {
-                        // One block per subsampling cell, at its corner.
-                        let (hs, vs) = (ss.hshift[c], ss.vshift[c]);
-                        let abs_bx = bx0 + bx;
-                        let abs_by = by0 + by;
-                        if (abs_bx >> hs) << hs != abs_bx || (abs_by >> vs) << vs != abs_by {
-                            continue;
-                        }
-                        let (sx, sy) = (bx >> hs, by >> vs);
-                        let src = coded_block(jpg, ss, cfl, c, abs_bx >> hs, abs_by >> vs);
-                        // JXL transposes the DCT relative to JPEG.
-                        for (y, src_row) in src.as_chunks::<8>().0.iter().enumerate() {
-                            for (x, &src) in src_row.iter().enumerate() {
-                                block[x * 8 + y] = src;
-                            }
-                        }
-
-                        let nzeros = block[1..].iter().filter(|&&v| v != 0).count() as u32;
-                        num_nzeros.plane_row_mut(c, sy)[sx] = nzeros as u8;
-
-                        // Context uses the channel's own grid.
-                        let row_top = if sy == 0 {
-                            None
-                        } else {
-                            Some(num_nzeros.plane_row(c, sy - 1))
-                        };
-                        let row = num_nzeros.plane_row(c, sy);
-                        let predicted = crate::group::predict_from_top_and_left(
-                            row_top,
-                            row,
-                            sx,
-                            GROUP_DIM_IN_BLOCKS as u8,
-                        );
-
-                        let luma = ss.luma(jpg);
-                        let luma_dc = luma.coeffs
-                            [(abs_by * luma.width_in_blocks + abs_bx) * DCT_BLOCK_SIZE]
-                            + ss.dc_offset[1];
-                        let block_ctx = bctx.context(c, luma_dc);
-                        let nzero_ctx = bctx.non_zero_context(predicted as u32, block_ctx);
-                        let histo_offset = bctx.zero_density_offset(block_ctx);
-
-                        tokens.push(Token::new(nzero_ctx, nzeros));
-
-                        let mut prev = if nzeros as usize > DCT_BLOCK_SIZE / 16 {
-                            0
-                        } else {
-                            1
-                        };
-                        let mut remaining = nzeros;
-                        let mut k = 1usize;
-                        while k < DCT_BLOCK_SIZE && remaining != 0 {
-                            let coef = block[scan[c][k] as usize];
-                            let ctx = histo_offset as usize
-                                + zero_density_context_8x8(remaining as usize, k, prev);
-                            tokens.push(Token::new(ctx as u32, pack_signed(coef)));
-                            prev = if coef != 0 { 1 } else { 0 };
-                            if coef != 0 {
-                                remaining -= 1;
-                            }
-                            k += 1;
-                        }
+    for by in 0..bh {
+        for bx in 0..bw {
+            let abs_bx = bx0 + bx;
+            let abs_by = by0 + by;
+            let dc = block_dcs(jpg, ss, abs_bx, abs_by);
+            for &c in &CHANNEL_ORDER {
+                // One block per subsampling cell, at its corner.
+                let (hs, vs) = (ss.hshift[c], ss.vshift[c]);
+                if (abs_bx >> hs) << hs != abs_bx || (abs_by >> vs) << vs != abs_by {
+                    continue;
+                }
+                let (sx, sy) = (bx >> hs, by >> vs);
+                let src = coded_block(jpg, ss, cfl, c, abs_bx >> hs, abs_by >> vs);
+                // JXL transposes the DCT relative to JPEG.
+                for (y, src_row) in src.as_chunks::<8>().0.iter().enumerate() {
+                    for (x, &src) in src_row.iter().enumerate() {
+                        block[x * 8 + y] = src;
                     }
                 }
+
+                let nzeros = block[1..].iter().filter(|&&v| v != 0).count() as u32;
+                num_nzeros.plane_row_mut(c, sy)[sx] = nzeros as u8;
+
+                // Context uses the channel's own grid.
+                let row_top = if sy == 0 {
+                    None
+                } else {
+                    Some(num_nzeros.plane_row(c, sy - 1))
+                };
+                let row = num_nzeros.plane_row(c, sy);
+                let predicted = crate::group::predict_from_top_and_left(
+                    row_top,
+                    row,
+                    sx,
+                    GROUP_DIM_IN_BLOCKS as u8,
+                );
+                visit(BlockVisit {
+                    c,
+                    dc,
+                    predicted: predicted as u32,
+                    nzeros,
+                    block: &block,
+                });
             }
-            tokens
         }
+    }
+}
+
+/// Quantized DC of every channel at full-resolution block `(bx, by)`: each
+/// channel's own block covering it, zero for grayscale chroma.
+#[inline]
+fn block_dcs(jpg: &JpegData, ss: &ChannelLayout, bx: usize, by: usize) -> [i32; 3] {
+    std::array::from_fn(|p| {
+        ss.component(jpg, p).map_or(0, |comp| {
+            let block = (by >> ss.vshift[p]) * comp.width_in_blocks + (bx >> ss.hshift[p]);
+            i32::from(comp.coeffs[block * DCT_BLOCK_SIZE] + ss.dc_offset[p])
+        })
+    })
+}
+
+/// Calls `f(zero_density_context, coefficient)` for every coefficient the
+/// bitstream codes, in scan order up to the last non-zero.
+#[inline]
+fn for_each_coeff(
+    scan: &[u8; DCT_BLOCK_SIZE],
+    block: &[i32; DCT_BLOCK_SIZE],
+    nzeros: u32,
+    mut f: impl FnMut(usize, i32),
+) {
+    let mut prev = if nzeros as usize > DCT_BLOCK_SIZE / 16 {
+        0
+    } else {
+        1
+    };
+    let mut remaining = nzeros;
+    let mut k = 1usize;
+    while k < DCT_BLOCK_SIZE && remaining != 0 {
+        let coef = block[scan[k] as usize];
+        f(zero_density_context_8x8(remaining as usize, k, prev), coef);
+        prev = usize::from(coef != 0);
+        if coef != 0 {
+            remaining -= 1;
+        }
+        k += 1;
     }
 }
 
@@ -1745,5 +1919,24 @@ mod tests {
         let ycc = check_supported(&three([1, 2, 3], [(2, 2), (1, 1), (1, 1)], &[])).unwrap();
         assert!(ycc.ycbcr);
         assert_eq!(ycc.dc_offset, [0; 3]);
+    }
+
+    #[test]
+    fn dc_cells_nest_like_the_decoder() {
+        // Two intervals on X and Y, three on B: cell = (x * 3 + b) * 2 + y.
+        let bctx = BlockCtx::from_cells([vec![0], vec![5], vec![-3, 3]], |row, i| {
+            (row * 12 + i) as u8 % 16
+        });
+        assert_eq!(bctx.num_dc_ctxs, 12);
+        assert_eq!(bctx.dc_idx([0, 5, -3]), 0);
+        assert_eq!(bctx.dc_idx([0, 6, -3]), 1);
+        assert_eq!(bctx.dc_idx([0, 5, -2]), 2);
+        assert_eq!(bctx.dc_idx([1, 5, 4]), 10);
+        assert_eq!(bctx.dc_idx([1, 6, 4]), 11);
+        // Map rows are Y, X, B; channels are X, Y, B.
+        let dc = [1, 6, 4];
+        assert_eq!(bctx.context(1, dc), 11);
+        assert_eq!(bctx.context(0, dc), (12 + 11) % 16);
+        assert_eq!(bctx.context(2, dc), (24 + 11) % 16);
     }
 }
