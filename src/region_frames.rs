@@ -491,14 +491,11 @@ mod tests {
             crate::lossless::encode_frame_lossless(
                 &img,
                 None,
-                8,
-                false,
+                crate::lossless::LosslessSettings::rgb8(
+                    crate::Speed::Slow,
+                    crate::DecodingSpeed::Slow,
+                ),
                 true,
-                3,
-                crate::Speed::Slow,
-                crate::DecodingSpeed::Slow,
-                1,
-                false,
                 threads,
                 &mut w,
             );

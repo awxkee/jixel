@@ -67,7 +67,9 @@ pub(crate) fn palette_row_scalar(above: &[i32], row: &[i32], out: &mut [[i32; 4]
 #[cfg(test)]
 mod tests;
 
-pub(super) use global::{PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette};
+pub(super) use global::{
+    GlobalPalette, PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
+};
 #[cfg(test)]
 pub(super) use local::local_palette_coverage_is_sufficient;
 pub(super) use local::{

@@ -29,8 +29,11 @@
 
 //! Lossless modular encoding and shared group layout.
 //!
-//! `frame` orchestrates displayed and reference frames; `encoder` selects coding
-//! candidates. The `ma_*` modules handle learned-tree sources, sampling,
+//! `frame` decides which frames code the image (the whole frame, a region
+//! split, a patched pair); `encoder` codes one frame, step by step: palette
+//! transforms, Squeeze, the color transform, the learned-tree tournament
+//! (`encoder::trees`) and the flat coder (`encoder::flat`), keeping the
+//! smallest complete frame. The `ma_*` modules handle learned-tree sources, sampling,
 //! learning, and encoding. Palette, predictor, LZ77, and Squeeze implementations
 //! live in their own module trees; `header` and `tree` serialize shared syntax.
 //! `near_lossless` is the bounded-error pre-pass applied before the exact coder.
@@ -189,7 +192,99 @@ pub(crate) const GROUP_DIM: usize = GroupLayout::DEFAULT.dim();
 
 pub(crate) const LF_GROUP_DIM: usize = GroupLayout::DEFAULT.lf_dim();
 
-#[allow(clippy::too_many_arguments)]
+/// The frame's modular groups under one [`GroupLayout`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GroupGrid {
+    xsize: usize,
+    ysize: usize,
+    /// Side of an AC group in pixels.
+    pub(super) dim: usize,
+    pub(super) x_groups: usize,
+    pub(super) y_groups: usize,
+    pub(super) x_dc_groups: usize,
+    pub(super) y_dc_groups: usize,
+}
+
+impl GroupGrid {
+    pub(super) fn new(xsize: usize, ysize: usize, layout: GroupLayout) -> Self {
+        Self {
+            xsize,
+            ysize,
+            dim: layout.dim(),
+            x_groups: xsize.div_ceil(layout.dim()),
+            y_groups: ysize.div_ceil(layout.dim()),
+            x_dc_groups: xsize.div_ceil(layout.lf_dim()),
+            y_dc_groups: ysize.div_ceil(layout.lf_dim()),
+        }
+    }
+
+    pub(super) fn num_groups(&self) -> usize {
+        self.x_groups * self.y_groups
+    }
+
+    pub(super) fn num_dc_groups(&self) -> usize {
+        self.x_dc_groups * self.y_dc_groups
+    }
+
+    /// The whole frame is one group: one section, no global tree.
+    pub(super) fn single_group(&self) -> bool {
+        self.num_groups() == 1
+    }
+
+    /// Group `index`'s rectangle in raster order: `(x0, y0, width, height)`.
+    pub(super) fn rect(&self, index: usize) -> (usize, usize, usize, usize) {
+        let x0 = (index % self.x_groups) * self.dim;
+        let y0 = (index / self.x_groups) * self.dim;
+        (
+            x0,
+            y0,
+            self.dim.min(self.xsize - x0),
+            self.dim.min(self.ysize - y0),
+        )
+    }
+}
+
+/// How a lossless frame is coded, apart from its pixels and its kind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LosslessSettings {
+    /// Bit depth of the widest channel, color or alpha.
+    pub(crate) max_bits: u32,
+    /// Squeeze-coded (progressive) frame.
+    pub(crate) progressive: bool,
+    /// 3 for RGB, coded from YCoCg planes; 1 for gray.
+    pub(crate) num_color: usize,
+    pub(crate) speed: crate::Speed,
+    pub(crate) decoding_speed: crate::DecodingSpeed,
+    /// The frame header's `upsampling` (1, 2, 4 or 8).
+    pub(crate) upsampling: u32,
+    /// The planes were quantized onto a `2k+1` grid (see `near_lossless`).
+    pub(crate) near_lossless: bool,
+}
+
+impl LosslessSettings {
+    /// One 8-bit RGB pass at full size: the frames of a layered codestream.
+    pub(crate) fn rgb8(speed: crate::Speed, decoding_speed: crate::DecodingSpeed) -> Self {
+        Self {
+            max_bits: 8,
+            progressive: false,
+            num_color: 3,
+            speed,
+            decoding_speed,
+            upsampling: 1,
+            near_lossless: false,
+        }
+    }
+
+    /// The same settings without Squeeze: reference, patched and region
+    /// frames are never progressive.
+    pub(crate) fn single_pass(self) -> Self {
+        Self {
+            progressive: false,
+            ..self
+        }
+    }
+}
+
 fn lossless_min_symbol(max_bits: u32) -> u32 {
     if max_bits <= 13 {
         LZ77_MIN_SYMBOL

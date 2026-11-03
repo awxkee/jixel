@@ -27,241 +27,33 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Displayed, reference, and region lossless frame orchestration.
+//! Which frames code a lossless image.
+//!
+//! 1. Region split: a screenshot with gradient or photo-like rectangles (see
+//!    `region_frames`) may code as a base saved to reference slot 0 plus one
+//!    cropped kReplace frame per rectangle. When the first-stage estimates
+//!    favour the split, both it and the whole frame are encoded and the
+//!    smaller is kept.
+//! 2. Displayed frame: the image itself or, with patches, a reference-only
+//!    atlas plus the patched image; both compete on complete size.
+//!
+//! Every frame is coded by [`encode_frame_lossless_core`].
 
 use super::encoder::encode_frame_lossless_core;
 use super::header::write_patch_dictionary;
 use super::ma_learning::rank_coarse;
 use super::ma_source::{MA_FULL_SAMPLING, PATCH_MIN_COVERAGE, rgb_ma_source};
-use super::{GroupLayout, constant_alpha_value, lossless_min_symbol};
+use super::{GroupLayout, LosslessSettings, constant_alpha_value, lossless_min_symbol};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
-use crate::patches::{LosslessPatches, ModularFrameKind, find_lossless_patches};
+use crate::patches::{
+    LosslessPatches, ModularFrameKind, find_lossless_glyph_patches, find_lossless_patches,
+};
+use crate::region_frames::Region;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
-
-fn zero_alpha_like(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
-    match alpha {
-        Some(AlphaPlane::U8(_)) => Some(AlphaPlane::U8(vec![0; pixels])),
-        Some(AlphaPlane::U16 { bits, .. }) => Some(AlphaPlane::U16 {
-            data: vec![0; pixels],
-            bits: *bits,
-        }),
-        Some(AlphaPlane::F32(_)) => Some(AlphaPlane::F32(vec![0; pixels])),
-        None => None,
-    }
-}
-
-pub(super) fn keep_smaller_writer(best: &mut Option<BitWriter>, candidate: BitWriter) {
-    if best
-        .as_ref()
-        .is_none_or(|current| candidate.bits_written() < current.bits_written())
-    {
-        *best = Some(candidate);
-    }
-}
-
-pub(crate) fn encode_frame_lossless(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    max_bits: u32,
-    progressive: bool,
-    patches: bool,
-    num_color: usize,
-    speed: crate::Speed,
-    decoding_speed: crate::DecodingSpeed,
-    upsampling: u32,
-    near_lossless: bool,
-    num_threads: usize,
-    writer: &mut BitWriter,
-) {
-    let pool = ThreadPool::new_lossless(num_threads);
-    let mut scratch = Box::new(CoderScratch::lossless());
-    encode_frame_lossless_with_pool(
-        linear,
-        alpha,
-        max_bits,
-        progressive,
-        patches,
-        num_color,
-        speed,
-        decoding_speed,
-        upsampling,
-        near_lossless,
-        &pool,
-        &mut scratch,
-        writer,
-    );
-}
-
-/// The displayed frame, or, for a screenshot with gradient or photo-like
-/// rectangles (see `region_frames`), the base saved to reference slot 0
-/// followed by one cropped kReplace frame per rectangle, whichever is
-/// smaller.
-#[allow(clippy::too_many_arguments)]
-fn encode_frame_lossless_with_pool(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    max_bits: u32,
-    progressive: bool,
-    patches: bool,
-    num_color: usize,
-    speed: crate::Speed,
-    decoding_speed: crate::DecodingSpeed,
-    upsampling: u32,
-    near_lossless: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) {
-    // The whole frame's glyph plan, shared with its encode below.
-    let mut whole_glyphs: Option<Option<LosslessPatches>> = None;
-    if speed.effort().region_frames
-        && upsampling == 1
-        && !progressive
-        && num_color == 3
-        && max_bits == 8
-        && let Some(mut regions) = crate::region_frames::plan(linear, alpha)
-    {
-        let min_symbol = lossless_min_symbol(max_bits);
-        let use_wp = decoding_speed.use_weighted_predictor();
-        let mut estimate = |image: &Image3Si, alpha: Option<&AlphaPlane>| {
-            coarse_frame_bits(image, alpha, min_symbol, use_wp, pool, scratch)
-        };
-        let mut crops: Vec<_> = regions
-            .iter()
-            .map(|r| crate::region_frames::crop(linear, alpha, r))
-            .collect();
-        let mut own: Vec<Option<f64>> =
-            crops.iter().map(|(c, a)| estimate(c, a.as_ref())).collect();
-        // A rectangle of text (a nested screenshot) codes worse as its own
-        // frame than inside the whole, whose glyph patches cover it: it
-        // stays in the base when the patches save a share of its estimate.
-        if patches {
-            let glyphs = whole_glyphs.insert(crate::patches::find_lossless_glyph_patches(linear));
-            if let Some(glyphs) = glyphs {
-                let mut keep = Vec::with_capacity(regions.len());
-                for (i, r) in regions.iter().enumerate() {
-                    let (patched, patched_alpha) =
-                        crate::region_frames::crop(&glyphs.base, alpha, r);
-                    let text_like = match (own[i], estimate(&patched, patched_alpha.as_ref())) {
-                        (Some(own), Some(patched)) => patched < own * (1.0 - REGION_GLYPH_SAVING),
-                        _ => false,
-                    };
-                    keep.push(!text_like);
-                }
-                let mut kept = keep.iter();
-                regions.retain(|_| *kept.next().unwrap_or(&true));
-                let mut kept = keep.iter();
-                crops.retain(|_| *kept.next().unwrap_or(&true));
-                let mut kept = keep.iter();
-                own.retain(|_| *kept.next().unwrap_or(&true));
-            }
-        }
-        let (base, base_alpha) = crate::region_frames::cut(linear, alpha, &regions);
-        let whole = estimate(linear, alpha);
-        let base_bits = estimate(&base, base_alpha.as_ref());
-        let split = own
-            .iter()
-            .copied()
-            .chain([base_bits])
-            .sum::<Option<f64>>()
-            .map(|bits| bits + REGION_FRAME_OVERHEAD_BITS * regions.len() as f64);
-        if !regions.is_empty()
-            && let (Some(whole), Some(split)) = (whole, split)
-            && split < whole * REGION_SPLIT_MARGIN
-        {
-            let mut split_writer = BitWriter::new();
-            encode_displayed_frame(
-                &base,
-                base_alpha.as_ref(),
-                max_bits,
-                progressive,
-                patches,
-                num_color,
-                speed,
-                decoding_speed,
-                upsampling,
-                near_lossless,
-                pool,
-                scratch,
-                true,
-                None,
-                &mut split_writer,
-            );
-            for (i, ((crop, crop_alpha), r)) in crops.iter().zip(&regions).enumerate() {
-                encode_frame_lossless_core(
-                    crop,
-                    crop_alpha.as_ref(),
-                    max_bits,
-                    false,
-                    num_color,
-                    speed,
-                    decoding_speed,
-                    upsampling,
-                    near_lossless,
-                    pool,
-                    scratch,
-                    ModularFrameKind::RgbCrop {
-                        x0: r.x0,
-                        y0: r.y0,
-                        width: r.width,
-                        height: r.height,
-                        last: i + 1 == regions.len(),
-                    },
-                    true,
-                    &mut split_writer,
-                );
-            }
-            // The estimate ranks the two within a few percent and misses
-            // what the cut does to the base's palette and tree, so the
-            // whole frame competes on complete size.
-            let mut whole_writer = BitWriter::new();
-            encode_displayed_frame(
-                linear,
-                alpha,
-                max_bits,
-                progressive,
-                patches,
-                num_color,
-                speed,
-                decoding_speed,
-                upsampling,
-                near_lossless,
-                pool,
-                scratch,
-                false,
-                whole_glyphs.take(),
-                &mut whole_writer,
-            );
-            if whole_writer.bits_written() < split_writer.bits_written() {
-                writer.append(&whole_writer);
-            } else {
-                writer.append(&split_writer);
-            }
-            return;
-        }
-    }
-    encode_displayed_frame(
-        linear,
-        alpha,
-        max_bits,
-        progressive,
-        patches,
-        num_color,
-        speed,
-        decoding_speed,
-        upsampling,
-        near_lossless,
-        pool,
-        scratch,
-        false,
-        whole_glyphs,
-        writer,
-    );
-}
 
 /// Header, TOC and tree of one region frame.
 const REGION_FRAME_OVERHEAD_BITS: f64 = 1600.0;
@@ -276,9 +68,56 @@ const REGION_GLYPH_SAVING: f64 = 0.1;
 /// one of 0.6% lost 3.7%.
 const REGION_SPLIT_MARGIN: f64 = 0.99;
 
+/// A glyph plan's regular frame is encoded only when its first-stage
+/// estimate is within this factor of the patched frame's (base estimate plus
+/// the atlas frame and dictionary): the coarse ratio between the two frames
+/// tracks the final one within a few percent (1.25 coarse vs 1.19 final on a
+/// UI screenshot), and a clear loser's complete encode was a third of the
+/// total time.
+const GLYPH_REGULAR_COARSE_MARGIN: f64 = 1.10;
+
+pub(super) fn keep_smaller_writer(best: &mut Option<BitWriter>, candidate: BitWriter) {
+    if best
+        .as_ref()
+        .is_none_or(|current| candidate.bits_written() < current.bits_written())
+    {
+        *best = Some(candidate);
+    }
+}
+
+/// Appends the smaller of two complete encodes; `first` on a tie.
+fn append_smaller(first: &BitWriter, second: &BitWriter, writer: &mut BitWriter) {
+    if second.bits_written() < first.bits_written() {
+        writer.append(second);
+    } else {
+        writer.append(first);
+    }
+}
+
+/// The lossless image's frames: the displayed frame, or a region split.
+pub(crate) fn encode_frame_lossless(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    settings: LosslessSettings,
+    patches: bool,
+    num_threads: usize,
+    writer: &mut BitWriter,
+) {
+    let pool = ThreadPool::new_lossless(num_threads);
+    let mut scratch = Box::new(CoderScratch::lossless());
+    FrameCoder {
+        settings,
+        patches,
+        pool: &pool,
+        scratch: &mut scratch,
+    }
+    .encode_image(linear, alpha, writer);
+}
+
 /// The base of a cell layer (see `cell_layer`): the 8-bit RGB image with
 /// its opaque alpha, coded with the displayed frame's patches and saved to
 /// reference slot 0 for the layer blended over it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame_lossless_base(
     linear: &Image3Si,
     alpha: &AlphaPlane,
@@ -290,186 +129,278 @@ pub(crate) fn encode_frame_lossless_base(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) {
-    encode_displayed_frame(
-        linear,
-        Some(alpha),
-        8,
-        false,
+    FrameCoder {
+        settings: LosslessSettings {
+            near_lossless,
+            ..LosslessSettings::rgb8(speed, decoding_speed)
+        },
         patches,
-        3,
-        speed,
-        decoding_speed,
-        1,
-        near_lossless,
         pool,
         scratch,
-        true,
-        None,
-        writer,
-    );
+    }
+    .encode_displayed(linear, Some(alpha), true, None, writer);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_displayed_frame(
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    max_bits: u32,
-    progressive: bool,
+/// Everything the frames of one lossless image share.
+struct FrameCoder<'p, 's> {
+    settings: LosslessSettings,
+    /// Patch plans (glyph or tile) compete with the plain frame.
     patches: bool,
-    num_color: usize,
-    speed: crate::Speed,
-    decoding_speed: crate::DecodingSpeed,
-    upsampling: u32,
-    near_lossless: bool,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    saved_first: bool,
-    glyph_plan: Option<Option<LosslessPatches>>,
-    writer: &mut BitWriter,
-) {
-    let regular = if saved_first {
-        ModularFrameKind::RgbSavedFirst
-    } else {
-        ModularFrameKind::Regular
-    };
-    // Glyph plans (arbitrary-position repeated shapes: text, UI) come first
-    // and always compete on complete frame size; tile plans keep the old
-    // decisive-tree skip, having never beaten one. The caller may have
-    // found the plan already.
-    let glyph_plan = match glyph_plan {
-        Some(plan) => plan,
-        None if patches && num_color == 3 => crate::patches::find_lossless_glyph_patches(linear),
-        None => None,
-    };
-    let is_glyph_plan = glyph_plan.is_some();
-    if patches
-        && num_color == 3
-        && let Some(plan) = glyph_plan.or_else(|| find_lossless_patches(linear, pool, scratch))
-    {
+    pool: &'p ThreadPool,
+    scratch: &'s mut CoderScratch,
+}
+
+/// A screenshot cut into a base and one cropped frame per rectangle.
+struct RegionSplit {
+    regions: Vec<Region>,
+    /// Each rectangle's pixels, coded as its own kReplace frame.
+    crops: Vec<(Image3Si, Option<AlphaPlane>)>,
+    /// The image with the rectangles cut out, saved to reference slot 0.
+    base: Image3Si,
+    base_alpha: Option<AlphaPlane>,
+}
+
+impl FrameCoder<'_, '_> {
+    /// Codes one frame (see [`encode_frame_lossless_core`]).
+    fn core(
+        &mut self,
+        image: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        settings: LosslessSettings,
+        kind: ModularFrameKind<'_>,
+        local_trees: bool,
+        writer: &mut BitWriter,
+    ) -> bool {
+        encode_frame_lossless_core(
+            image,
+            alpha,
+            settings,
+            kind,
+            local_trees,
+            self.pool,
+            self.scratch,
+            writer,
+        )
+    }
+
+    /// See [`coarse_frame_bits`].
+    fn coarse_bits(&mut self, image: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<f64> {
+        coarse_frame_bits(
+            image,
+            alpha,
+            lossless_min_symbol(self.settings.max_bits),
+            self.settings.decoding_speed.use_weighted_predictor(),
+            self.pool,
+            self.scratch,
+        )
+    }
+
+    fn encode_image(
+        &mut self,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        writer: &mut BitWriter,
+    ) {
+        // The whole frame's glyph plan, found once for both steps.
+        let mut whole_glyphs: Option<Option<LosslessPatches>> = None;
+
+        // Step 1: the region split, when the estimates favour it.
+        if let Some(split) = self.plan_region_split(linear, alpha, &mut whole_glyphs) {
+            let mut split_writer = BitWriter::new();
+            self.encode_region_split(&split, &mut split_writer);
+            drop(split);
+            // The estimate ranks the two within a few percent and misses
+            // what the cut does to the base's palette and tree, so the
+            // whole frame competes on complete size.
+            let mut whole_writer = BitWriter::new();
+            self.encode_displayed(linear, alpha, false, whole_glyphs.take(), &mut whole_writer);
+            append_smaller(&split_writer, &whole_writer, writer);
+            return;
+        }
+
+        // Step 2: the displayed frame.
+        self.encode_displayed(linear, alpha, false, whole_glyphs, writer);
+    }
+
+    /// The region split of a screenshot whose first-stage estimate beats the
+    /// whole frame's, else `None`. Finds the whole frame's glyph plan into
+    /// `whole_glyphs` along the way.
+    fn plan_region_split(
+        &mut self,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        whole_glyphs: &mut Option<Option<LosslessPatches>>,
+    ) -> Option<RegionSplit> {
+        let s = self.settings;
+        if !s.speed.effort().region_frames
+            || s.upsampling != 1
+            || s.progressive
+            || s.num_color != 3
+            || s.max_bits != 8
+        {
+            return None;
+        }
+        let mut regions = crate::region_frames::plan(linear, alpha)?;
+        let mut crops: Vec<_> = regions
+            .iter()
+            .map(|r| crate::region_frames::crop(linear, alpha, r))
+            .collect();
+        let mut own: Vec<Option<f64>> = crops
+            .iter()
+            .map(|(c, a)| self.coarse_bits(c, a.as_ref()))
+            .collect();
+
+        // A rectangle of text (a nested screenshot) codes worse as its own
+        // frame than inside the whole, whose glyph patches cover it: it
+        // stays in the base when the patches save a share of its estimate.
+        if self.patches
+            && let Some(glyphs) = whole_glyphs.insert(find_lossless_glyph_patches(linear))
+        {
+            let keep: Vec<bool> = regions
+                .iter()
+                .zip(&own)
+                .map(|(r, &own)| {
+                    let (patched, patched_alpha) =
+                        crate::region_frames::crop(&glyphs.base, alpha, r);
+                    let text_like = match (own, self.coarse_bits(&patched, patched_alpha.as_ref()))
+                    {
+                        (Some(own), Some(patched)) => patched < own * (1.0 - REGION_GLYPH_SAVING),
+                        _ => false,
+                    };
+                    !text_like
+                })
+                .collect();
+            retain_kept(&mut regions, &keep);
+            retain_kept(&mut crops, &keep);
+            retain_kept(&mut own, &keep);
+        }
+
+        // The split's estimate: the base, every crop and their headers.
+        let (base, base_alpha) = crate::region_frames::cut(linear, alpha, &regions);
+        let whole = self.coarse_bits(linear, alpha);
+        let base_bits = self.coarse_bits(&base, base_alpha.as_ref());
+        let split = own
+            .iter()
+            .copied()
+            .chain([base_bits])
+            .sum::<Option<f64>>()
+            .map(|bits| bits + REGION_FRAME_OVERHEAD_BITS * regions.len() as f64);
+        let favoured = matches!(
+            (whole, split),
+            (Some(whole), Some(split)) if split < whole * REGION_SPLIT_MARGIN
+        );
+        (!regions.is_empty() && favoured).then_some(RegionSplit {
+            regions,
+            crops,
+            base,
+            base_alpha,
+        })
+    }
+
+    /// The base saved to slot 0, then each crop replacing its rectangle.
+    fn encode_region_split(&mut self, split: &RegionSplit, writer: &mut BitWriter) {
+        self.encode_displayed(&split.base, split.base_alpha.as_ref(), true, None, writer);
+        for (i, ((crop, crop_alpha), r)) in split.crops.iter().zip(&split.regions).enumerate() {
+            self.core(
+                crop,
+                crop_alpha.as_ref(),
+                self.settings.single_pass(),
+                ModularFrameKind::RgbCrop {
+                    x0: r.x0,
+                    y0: r.y0,
+                    width: r.width,
+                    height: r.height,
+                    last: i + 1 == split.regions.len(),
+                },
+                true,
+                writer,
+            );
+        }
+    }
+
+    /// The displayed frame: the image itself, or a patched pair (an atlas
+    /// frame and the image with the patches cut out) when that is smaller.
+    /// `saved_first` saves the frame to reference slot 0 for frames coded
+    /// over it. `glyph_plan` is the caller's glyph search, when it ran one.
+    fn encode_displayed(
+        &mut self,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        saved_first: bool,
+        glyph_plan: Option<Option<LosslessPatches>>,
+        writer: &mut BitWriter,
+    ) {
+        let regular = if saved_first {
+            ModularFrameKind::RgbSavedFirst
+        } else {
+            ModularFrameKind::Regular
+        };
+        let with_patches = self.patches && self.settings.num_color == 3;
+
+        // Step 1: the patch plan. Glyph plans (arbitrary-position repeated
+        // shapes: text, UI) come first; tile plans otherwise.
+        let glyph_plan = match glyph_plan {
+            Some(plan) => plan,
+            None if with_patches => find_lossless_glyph_patches(linear),
+            None => None,
+        };
+        let is_glyph_plan = glyph_plan.is_some();
+        let plan = if with_patches {
+            glyph_plan.or_else(|| find_lossless_patches(linear, self.pool, self.scratch))
+        } else {
+            None
+        };
+        let Some(plan) = plan else {
+            self.core(linear, alpha, self.settings, regular, true, writer);
+            return;
+        };
+
         // Patches change prediction, LZ77, entropy histograms, and add both a
         // reference-only frame and a dictionary. Their true cost cannot be
         // inferred reliably from covered pixel area, so both complete
         // alternatives are compared by their final byte-aligned bit count.
         let mut regular_writer = BitWriter::new();
+
+        // Step 2 (tile plans): the regular frame first. A decisive learned
+        // tree (never beaten by a tile plan) or a plan covering little of the
+        // image (cannot pay for its dictionary and reference frame) skips
+        // the patched encode.
         if !is_glyph_plan {
-            // Tile plans: the regular frame first; a decisive learned tree
-            // (never beaten by a tile plan) or a plan covering little of the
-            // image (cannot pay for its dictionary and reference frame)
-            // skips the patched encode.
-            let decisive_tree = encode_frame_lossless_core(
+            let decisive_tree = self.core(
                 linear,
                 alpha,
-                max_bits,
-                progressive,
-                num_color,
-                speed,
-                decoding_speed,
-                upsampling,
-                near_lossless,
-                pool,
-                scratch,
+                self.settings,
                 regular,
                 true,
                 &mut regular_writer,
             );
-            let covered: usize = plan
-                .references
-                .iter()
-                .map(|r| r.positions.len() * r.width * r.height)
-                .sum::<usize>();
-            let coverage = covered as f64 / (linear.xsize() * linear.ysize()) as f64;
+            let coverage = patch_coverage(&plan, linear.xsize() * linear.ysize());
             if decisive_tree || coverage < PATCH_MIN_COVERAGE {
                 writer.append(&regular_writer);
                 return;
             }
         }
 
+        // Step 3: the patched pair.
         let mut patched_writer = BitWriter::new();
-        let atlas_alpha =
-            zero_alpha_like(alpha, plan.atlas.xsize().saturating_mul(plan.atlas.ysize()));
-        encode_frame_lossless_core(
-            &plan.atlas,
-            atlas_alpha.as_ref(),
-            max_bits,
-            false,
-            num_color,
-            speed,
-            decoding_speed,
-            upsampling,
-            near_lossless,
-            pool,
-            scratch,
-            ModularFrameKind::ReferenceOnly {
-                width: plan.atlas.xsize(),
-                height: plan.atlas.ysize(),
-            },
-            true,
-            &mut patched_writer,
-        );
-        let atlas_bits = patched_writer.bits_written();
-        encode_frame_lossless_core(
-            &plan.base,
-            alpha,
-            max_bits,
-            false,
-            num_color,
-            speed,
-            decoding_speed,
-            upsampling,
-            near_lossless,
-            pool,
-            scratch,
-            ModularFrameKind::Patched {
-                references: &plan.references,
-                saved_first,
-            },
-            true,
-            &mut patched_writer,
-        );
+        let atlas_bits = self.encode_patched(&plan, alpha, saved_first, &mut patched_writer);
 
-        if is_glyph_plan {
-            // Glyph plans win whenever the plan is any good, so the regular
-            // frame (a complete second encode) is written only when the
-            // first-stage estimates leave it a chance; the dense local-tree
-            // learn is spent on the patched frame only.
-            let min_symbol = lossless_min_symbol(max_bits);
-            let use_wp = decoding_speed.use_weighted_predictor();
-            let regular_est = coarse_frame_bits(linear, alpha, min_symbol, use_wp, pool, scratch);
-            let base_est = coarse_frame_bits(&plan.base, alpha, min_symbol, use_wp, pool, scratch);
-            let competitive = match (regular_est, base_est) {
-                (Some(regular), Some(base)) => {
-                    let mut dictionary = BitWriter::new();
-                    write_patch_dictionary(
-                        &plan.references,
-                        alpha.is_some(),
-                        scratch,
-                        &mut dictionary,
-                    );
-                    let patched = base + (atlas_bits + dictionary.bits_written()) as f64;
-                    regular <= patched * GLYPH_REGULAR_COARSE_MARGIN
-                }
-                _ => true,
-            };
-            if competitive {
-                encode_frame_lossless_core(
-                    linear,
-                    alpha,
-                    max_bits,
-                    progressive,
-                    num_color,
-                    speed,
-                    decoding_speed,
-                    upsampling,
-                    near_lossless,
-                    pool,
-                    scratch,
-                    regular,
-                    false,
-                    &mut regular_writer,
-                );
-            }
+        // Step 4 (glyph plans): they win whenever the plan is any good, so
+        // the regular frame (a complete second encode) is written only when
+        // the first-stage estimates leave it a chance; the dense local-tree
+        // learn is spent on the patched frame only.
+        if is_glyph_plan && self.regular_competes(linear, alpha, &plan, atlas_bits) {
+            self.core(
+                linear,
+                alpha,
+                self.settings,
+                regular,
+                false,
+                &mut regular_writer,
+            );
         }
 
+        // Step 5: the smaller complete alternative.
         if regular_writer.bits_written() > 0
             && regular_writer.bits_written() < patched_writer.bits_written()
         {
@@ -477,24 +408,100 @@ fn encode_displayed_frame(
         } else {
             writer.append(&patched_writer);
         }
-        return;
     }
-    encode_frame_lossless_core(
-        linear,
-        alpha,
-        max_bits,
-        progressive,
-        num_color,
-        speed,
-        decoding_speed,
-        upsampling,
-        near_lossless,
-        pool,
-        scratch,
-        regular,
-        true,
-        writer,
-    );
+
+    /// The reference-only atlas frame, then the base coded with the patch
+    /// dictionary. Returns the atlas frame's bits.
+    fn encode_patched(
+        &mut self,
+        plan: &LosslessPatches,
+        alpha: Option<&AlphaPlane>,
+        saved_first: bool,
+        writer: &mut BitWriter,
+    ) -> usize {
+        let (atlas_w, atlas_h) = (plan.atlas.xsize(), plan.atlas.ysize());
+        let atlas_alpha = zero_alpha_like(alpha, atlas_w.saturating_mul(atlas_h));
+        self.core(
+            &plan.atlas,
+            atlas_alpha.as_ref(),
+            self.settings.single_pass(),
+            ModularFrameKind::ReferenceOnly {
+                width: atlas_w,
+                height: atlas_h,
+            },
+            true,
+            writer,
+        );
+        let atlas_bits = writer.bits_written();
+        self.core(
+            &plan.base,
+            alpha,
+            self.settings.single_pass(),
+            ModularFrameKind::Patched {
+                references: &plan.references,
+                saved_first,
+            },
+            true,
+            writer,
+        );
+        atlas_bits
+    }
+
+    /// The regular frame's first-stage estimate is within
+    /// [`GLYPH_REGULAR_COARSE_MARGIN`] of the patched pair's (base estimate
+    /// plus the atlas frame and dictionary); `true` when either estimate is
+    /// missing.
+    fn regular_competes(
+        &mut self,
+        linear: &Image3Si,
+        alpha: Option<&AlphaPlane>,
+        plan: &LosslessPatches,
+        atlas_bits: usize,
+    ) -> bool {
+        let regular_est = self.coarse_bits(linear, alpha);
+        let base_est = self.coarse_bits(&plan.base, alpha);
+        let (Some(regular), Some(base)) = (regular_est, base_est) else {
+            return true;
+        };
+        let mut dictionary = BitWriter::new();
+        write_patch_dictionary(
+            &plan.references,
+            alpha.is_some(),
+            self.scratch,
+            &mut dictionary,
+        );
+        let patched = base + (atlas_bits + dictionary.bits_written()) as f64;
+        regular <= patched * GLYPH_REGULAR_COARSE_MARGIN
+    }
+}
+
+/// Keeps the items whose `keep` flag is set.
+fn retain_kept<T>(items: &mut Vec<T>, keep: &[bool]) {
+    let mut kept = keep.iter();
+    items.retain(|_| *kept.next().unwrap_or(&true));
+}
+
+/// The share of a `pixels`-pixel image the plan's patches cover.
+fn patch_coverage(plan: &LosslessPatches, pixels: usize) -> f64 {
+    let covered: usize = plan
+        .references
+        .iter()
+        .map(|r| r.positions.len() * r.width * r.height)
+        .sum();
+    covered as f64 / pixels as f64
+}
+
+/// An all-zero alpha plane of `alpha`'s type, for the atlas frame.
+fn zero_alpha_like(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
+    match alpha {
+        Some(AlphaPlane::U8(_)) => Some(AlphaPlane::U8(vec![0; pixels])),
+        Some(AlphaPlane::U16 { bits, .. }) => Some(AlphaPlane::U16 {
+            data: vec![0; pixels],
+            bits: *bits,
+        }),
+        Some(AlphaPlane::F32(_)) => Some(AlphaPlane::F32(vec![0; pixels])),
+        None => None,
+    }
 }
 
 /// First-stage learned-tree estimate of a frame's pixel bits: the ranking
@@ -534,11 +541,3 @@ fn coarse_frame_bits(
     )?;
     Some(stage.candidate.est_real.min(stage.candidate.flat_real))
 }
-
-/// A glyph plan's regular frame is encoded only when its first-stage
-/// estimate is within this factor of the patched frame's (base estimate plus
-/// the atlas frame and dictionary): the coarse ratio between the two frames
-/// tracks the final one within a few percent (1.25 coarse vs 1.19 final on a
-/// UI screenshot), and a clear loser's complete encode was a third of the
-/// total time.
-const GLYPH_REGULAR_COARSE_MARGIN: f64 = 1.10;

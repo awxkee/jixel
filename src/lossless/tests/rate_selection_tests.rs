@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+use super::LosslessSettings;
 use super::encoder::{
     MA_DECISIVE_MIN_SAVINGS, encode_frame_lossless_core_impl, learned_tree_is_decisive,
 };
@@ -153,18 +154,12 @@ fn encode_core(image: &Image3Si, allow_palettes: bool) -> BitWriter {
     encode_frame_lossless_core_impl(
         image,
         None,
-        8,
-        false,
-        3,
-        crate::Speed::Slow,
-        crate::DecodingSpeed::Slow,
-        1,
-        false,
-        &pool,
-        &mut scratch,
+        LosslessSettings::rgb8(crate::Speed::Slow, crate::DecodingSpeed::Slow),
         ModularFrameKind::Regular,
         allow_palettes,
         true,
+        &pool,
+        &mut scratch,
         &mut writer,
     );
     writer
