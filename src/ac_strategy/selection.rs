@@ -629,8 +629,6 @@ fn find_quant_refinements(
                 cmap,
                 cx,
                 cy,
-                0.0,
-                0.0,
                 false,
                 prices,
             );
@@ -1520,8 +1518,6 @@ fn fine_recon_choose(
             meta_r,
             params.distance,
             cmap_factor,
-            0.0,
-            0.0,
             None,
         )
     };
@@ -2848,11 +2844,6 @@ fn find_rerank_downgrades(
             continue; // only merges
         }
         let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
-        // The gradient term targets the measured sun-beam failure: rectangular
-        // pairs whose rate advantage hides a localized directional error. Keep
-        // square/larger reranks byte-identical while the pair weight is fitted.
-        let (gradient_alpha, gradient_peak_alpha) =
-            rerank_pair_gradient_alphas(rerank, strat, px, py);
         let qac_big = region_qac(
             rerank.quant_field,
             bx,
@@ -2891,8 +2882,6 @@ fn find_rerank_downgrades(
                 bx,
                 by,
             ),
-            gradient_alpha,
-            gradient_peak_alpha,
             if with_fine_mosaic {
                 let [e0, e1, e2] = &mut *mosaic.big_error;
                 Some([
@@ -2978,8 +2967,6 @@ fn find_rerank_downgrades(
                         meta_r,
                         params.distance,
                         cmap,
-                        gradient_alpha,
-                        gradient_peak_alpha,
                         sink,
                     );
                     if with_fine_mosaic {
@@ -3005,8 +2992,8 @@ fn find_rerank_downgrades(
             }
         }
         // Re-plan all supported subdivisions, not just the one child layout
-        // the coefficient selector saved. Every arm uses the same quantizer,
-        // metadata charge and parent gradient weights. The DP can keep one
+        // the coefficient selector saved. Every arm uses the same quantizer
+        // and metadata charge. The DP can keep one
         // winning child and split another, or change rectangular orientation.
         let child_costs_start = output.current_costs.len();
         let saved = saved_map.get(&(bx as u16, by as u16));
@@ -3081,8 +3068,6 @@ fn find_rerank_downgrades(
                             bx + ix,
                             by + iy,
                         ),
-                        gradient_alpha,
-                        gradient_peak_alpha,
                         None,
                     );
                     // A fine leaf carries its admission charge into the
@@ -3321,53 +3306,6 @@ fn find_rerank_downgrades(
     }
 }
 
-/// Pair-gradient penalty weights (sun-beam fix) the rerank applies to a
-/// rectangular pair at pixel `(px, py)`; zero for every other strategy.
-fn rerank_pair_gradient_alphas(
-    rerank: &RerankContext<'_>,
-    strat: u8,
-    px: usize,
-    py: usize,
-) -> (f32, f32) {
-    let params = rerank.params;
-    let ctx = params.ctx;
-    if !matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16) {
-        return (0.0, 0.0);
-    }
-    let alpha = rerank_pair_gradient_alpha(params.distance);
-    let peak_alpha = rerank_pair_gradient_peak_alpha(params.distance);
-    if alpha == 0.0 && peak_alpha == 0.0 {
-        return (0.0, 0.0);
-    }
-    let pair_gradient_fit = &PAIR_GRAD_FIT;
-    let (width, height) = if strat == STRATEGY_DCT16X8 {
-        (8, 16)
-    } else {
-        (16, 8)
-    };
-    let stats = if params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END {
-        (ctx.gradient_region_stats)(params.opsin, px, py, width, height, 1e-5)
-    } else {
-        (ctx.gradient_region_stats_with_chroma)(params.opsin, px, py, width, height, 1e-5)
-    };
-    (
-        if stats.dominance >= RERANK_PAIR_GRADIENT_MIN_DOMINANCE {
-            alpha
-        } else {
-            0.0
-        },
-        if stats.dominance >= pair_gradient_fit.peak_min_dominance
-            && stats.mean >= pair_gradient_fit.min_luma
-            && (params.distance < RERANK_PAIR_GRADIENT_PEAK_COARSE_END
-                || stats.chroma <= pair_gradient_fit.chroma_cap)
-        {
-            peak_alpha
-        } else {
-            0.0
-        },
-    )
-}
-
 /// The `cov_x x cov_y` footprint at `(bx, by)` is tiled exactly by first
 /// blocks lying entirely inside it (so a merge may replace it).
 fn footprint_is_self_contained(
@@ -3418,8 +3356,8 @@ fn cap_medium_upgrade_candidates(indices: &mut Vec<usize>, candidates: &[MergeUp
 }
 
 /// Evaluate this band's shortlisted merges against the committed layout of
-/// their footprints (reconstruction domain, same metadata and pair-gradient
-/// treatment as the downgrade pass) and collect the accepted ones.
+/// their footprints (reconstruction domain, same metadata treatment as the
+/// downgrade pass) and collect the accepted ones.
 fn find_merge_upgrades(
     rerank: &RerankContext<'_>,
     scratch: &mut CoderScratch,
@@ -3506,9 +3444,6 @@ fn find_merge_upgrades_at_level(
         {
             continue;
         }
-        let (px, py) = (params.dc_group_px + bx * 8, params.dc_group_py + by * 8);
-        let (gradient_alpha, gradient_peak_alpha) =
-            rerank_pair_gradient_alphas(rerank, strategy, px, py);
         let score =
             |scratch: &mut CoderScratch, s: u8, x: usize, y: usize, cw: usize, ch: usize| {
                 reconstruction_strategy_cost_and_base(
@@ -3537,8 +3472,6 @@ fn find_merge_upgrades_at_level(
                         x,
                         y,
                     ),
-                    gradient_alpha,
-                    gradient_peak_alpha,
                     None,
                 )
             };
@@ -4059,61 +3992,6 @@ mod tests {
     }
 
     #[test]
-    fn quantizer_cache_excludes_rerank_only_gradient_penalties() {
-        let distance = 2.5;
-        let ctx = EncodingContext::new(
-            crate::Speed::Slow,
-            crate::Arbiter::Ssimulacra2,
-            crate::xyb::XybMatrix::SPEC,
-            distance,
-            1,
-        );
-        let mut opsin = noise_opsin(16, 16, 0x1234_9876);
-        for c in 0..3 {
-            for y in 0..16 {
-                for (x, value) in opsin.plane_mut(c).row_mut(y).iter_mut().enumerate() {
-                    *value = 0.25 + 0.2 * ((x * 13 + y * 19 + c * 7) as f32).sin();
-                }
-            }
-        }
-        let mut scratch = CoderScratch::default();
-        let mut saw_penalty = false;
-        for strategy in [STRATEGY_DCT, STRATEGY_DCT16X8, super::STRATEGY_DCT8X16] {
-            let mut score = |alpha, peak, metadata| {
-                super::reconstruction_strategy_cost_and_base(
-                    &ctx,
-                    &mut scratch,
-                    strategy,
-                    &opsin,
-                    0,
-                    0,
-                    5.0,
-                    1.0,
-                    metadata,
-                    distance,
-                    [0.0; 3],
-                    alpha,
-                    peak,
-                    None,
-                )
-            };
-            let plain = score(0.0, 0.0, super::RERANK_META_R);
-            let fresh_incumbent = score(0.0, 0.0, 0.0);
-            assert_eq!(plain.base, fresh_incumbent.cost);
-            for (alpha, peak) in [(32.0, 0.0), (0.0, 32.0), (32.0, 32.0)] {
-                let penalized = score(alpha, peak, super::RERANK_META_R);
-                assert!(penalized.cost >= plain.cost);
-                saw_penalty |= penalized.cost > plain.cost;
-                assert!(
-                    penalized.base.is_nan(),
-                    "penalized incumbent must be rescored under refinement's objective"
-                );
-            }
-        }
-        assert!(saw_penalty, "fixture must exercise an actual cost mismatch");
-    }
-
-    #[test]
     fn merge_partitions_match_exhaustive_nonoverlapping_subsets() {
         // An independent footprint oracle includes all 32 subsets, rejecting
         // overlaps rather than using the planner's eight-layout table.
@@ -4405,21 +4283,11 @@ mod tests {
         BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
         FAST_RERANK_MAX_DISTANCE, FINE_ADMIT_RATE_CORRECTION_BITS, LEAF_FIRST_MAX_DISTANCE,
         MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MERGE_UPGRADE_MARGIN,
-        MERGE_UPGRADE_MIN_DISTANCE, MergeTuning, RERANK_PAIR_GRADIENT_ALPHA,
-        RERANK_PAIR_GRADIENT_FADE_IN_END, RERANK_PAIR_GRADIENT_FADE_IN_START,
-        RERANK_PAIR_GRADIENT_FADE_OUT_END, RERANK_PAIR_GRADIENT_FADE_OUT_START,
-        RERANK_PAIR_GRADIENT_MIN_DOMINANCE, RERANK_PAIR_GRADIENT_PEAK_ALPHA,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_END,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_START, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START, SUB8_MAX_DISTANCE, SearchScope,
-        aggregate_qac_2x2, aggregate_quant, block_boundary_error_energy,
-        block_boundary_error_stats, cmap_factors, fill_ac_strategy, fill_selection_bands,
-        fine_mosaic_lambda, gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar,
-        merge_beats_dct8, merge_margin, merge_upgrade_margin, quant_refinement_steps,
-        rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
-        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
-        strategy_cost, sub8_strategy_costs, use_dct8_only, use_dct8_only_for_content,
+        MERGE_UPGRADE_MIN_DISTANCE, MergeTuning, SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2,
+        aggregate_quant, block_boundary_error_energy, block_boundary_error_stats, cmap_factors,
+        fill_ac_strategy, fill_selection_bands, fine_mosaic_lambda, merge_beats_dct8, merge_margin,
+        merge_upgrade_margin, quant_refinement_steps, strategy_cost, sub8_strategy_costs,
+        use_dct8_only, use_dct8_only_for_content,
     };
     use crate::coder_scratch::{AcStrategyBandScratch, CoderScratch};
     use crate::dc_group_data::{
@@ -4657,62 +4525,6 @@ mod tests {
         // High quality admits merges on much stiffer terms than mid/low.
         assert!(MERGE_MARGIN_16.at(0.3) > MERGE_MARGIN_16.at(2.0));
         assert!(BIAS_16X16.at(0.3) > BIAS_16X16.at(2.0));
-    }
-
-    #[test]
-    fn pair_gradient_weights_are_banded() {
-        const { assert!(RERANK_PAIR_GRADIENT_ALPHA > 0.0) };
-        assert!((0.0..1.0).contains(&RERANK_PAIR_GRADIENT_MIN_DOMINANCE));
-        assert_eq!(rerank_pair_gradient_scale(0.35), 0.0);
-        assert_eq!(
-            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_IN_START),
-            0.0
-        );
-        assert_eq!(
-            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_IN_END),
-            1.0
-        );
-        assert_eq!(
-            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_OUT_START),
-            1.0
-        );
-        assert_eq!(
-            rerank_pair_gradient_scale(RERANK_PAIR_GRADIENT_FADE_OUT_END),
-            0.0
-        );
-        assert_eq!(rerank_pair_gradient_scale(3.0), 0.0);
-        let fade_in_mid =
-            0.5 * (RERANK_PAIR_GRADIENT_FADE_IN_START + RERANK_PAIR_GRADIENT_FADE_IN_END);
-        assert!((rerank_pair_gradient_scale(fade_in_mid) - 0.5).abs() < 1e-6);
-        let fade_out_mid =
-            0.5 * (RERANK_PAIR_GRADIENT_FADE_OUT_START + RERANK_PAIR_GRADIENT_FADE_OUT_END);
-        assert!((rerank_pair_gradient_scale(fade_out_mid) - 0.5).abs() < 1e-6);
-
-        const { assert!(RERANK_PAIR_GRADIENT_PEAK_ALPHA > 0.0) };
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START),
-            0.0
-        );
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END),
-            RERANK_PAIR_GRADIENT_PEAK_ALPHA
-        );
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START),
-            RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA
-        );
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_COARSE_START),
-            RERANK_PAIR_GRADIENT_PEAK_ALPHA
-        );
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_COARSE_END),
-            RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA
-        );
-        assert_eq!(
-            rerank_pair_gradient_peak_alpha(RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END),
-            0.0
-        );
     }
 
     #[test]
@@ -5539,56 +5351,5 @@ mod tests {
             cmap_factors(crate::color_correlation::CflFrame::XYB, &ytox, &ytob, 0, 0),
             [0.5, 0.0, 0.5]
         );
-    }
-
-    #[test]
-    fn luma_only_gradient_stats_match_full_stats() {
-        let mut opsin = Image3F::new(16, 16);
-        for c in 0..3 {
-            for y in 0..16 {
-                for x in 0..16 {
-                    opsin.plane_mut(c).row_mut(y)[x] =
-                        0.01 * x as f32 + 0.02 * y as f32 + 0.1 * c as f32;
-                }
-            }
-        }
-        let luma = gradient_region_stats_scalar(&opsin, 0, 0, 16, 8, 1e-5);
-        let full = gradient_region_stats_with_chroma_scalar(&opsin, 0, 0, 16, 8, 1e-5);
-        assert_eq!(luma.dominance, full.dominance);
-        assert_eq!(luma.mean, full.mean);
-        assert!(full.chroma > 0.0);
-    }
-
-    #[test]
-    fn dispatched_gradient_stats_match_scalar() {
-        let mut opsin = Image3F::new(24, 24);
-        for c in 0..3 {
-            for y in 0..24 {
-                for x in 0..24 {
-                    let hash = (x * 37 + y * 61 + c * 17 + x * y * 3) % 101;
-                    opsin.plane_mut(c).row_mut(y)[x] = hash as f32 * 0.007 - 0.2 + c as f32 * 0.03;
-                }
-            }
-        }
-
-        let kernels = [
-            (
-                select_gradient_region_stats_fn(),
-                gradient_region_stats_scalar as super::GradientRegionStatsFn,
-            ),
-            (
-                select_gradient_region_stats_with_chroma_fn(),
-                gradient_region_stats_with_chroma_scalar as super::GradientRegionStatsFn,
-            ),
-        ];
-        for &(simd, scalar) in &kernels {
-            for &(px, py, w, h) in &[(1, 2, 8, 16), (3, 4, 16, 8), (20, 21, 8, 16)] {
-                let got = simd(&opsin, px, py, w, h, 1e-5);
-                let expected = scalar(&opsin, px, py, w, h, 1e-5);
-                assert!((got.dominance - expected.dominance).abs() < 2e-5);
-                assert!((got.mean - expected.mean).abs() < 2e-6);
-                assert!((got.chroma - expected.chroma).abs() < 2e-6);
-            }
-        }
     }
 }

@@ -250,173 +250,6 @@ pub(crate) fn rgb_hue_chroma_edge_loss_neon(
 
 #[inline]
 #[target_feature(enable = "neon")]
-fn accumulate_gradient_vectors_x4(
-    left: float32x4_t,
-    right: float32x4_t,
-    sum: float32x4_t,
-) -> float32x4_t {
-    let difference = vsubq_f32(right, left);
-    vfmaq_f32(sum, difference, difference)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn accumulate_gradient_x4(left: &[f32; 4], right: &[f32; 4], sum: float32x4_t) -> float32x4_t {
-    let left = unsafe { vld1q_f32(left.as_ptr()) };
-    let right = unsafe { vld1q_f32(right.as_ptr()) };
-    accumulate_gradient_vectors_x4(left, right, sum)
-}
-
-/// # Safety
-/// The caller must ensure NEON is available.
-#[target_feature(enable = "neon")]
-pub(crate) fn error_gradient_energy_neon(error: &[f32], width: usize, height: usize) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    let rows = error[..n].chunks_exact(width);
-    let mut sum = vdupq_n_f32(0.0);
-
-    for row in rows.clone() {
-        let (row4, row_tail) = row.as_chunks::<4>();
-        if row_tail.is_empty() {
-            let (right4, _) = row[1..].as_chunks::<4>();
-            for (left, right) in row4.iter().zip(right4) {
-                sum = accumulate_gradient_x4(left, right, sum);
-            }
-            let left = unsafe { vld1q_f32(row4.last().unwrap().as_ptr()) };
-            let right = vsetq_lane_f32::<3>(vgetq_lane_f32::<3>(left), vextq_f32::<1>(left, left));
-            sum = accumulate_gradient_vectors_x4(left, right, sum);
-            continue;
-        }
-        let (left4, tail) = row[..width - 1].as_chunks::<4>();
-        let (right4, right_tail) = row[1..].as_chunks::<4>();
-        for (left, right) in left4.iter().zip(right4) {
-            sum = accumulate_gradient_x4(left, right, sum);
-        }
-        if !tail.is_empty() {
-            let mut left = [0.0; 4];
-            let mut right = [0.0; 4];
-            left[..tail.len()].copy_from_slice(tail);
-            right[..right_tail.len()].copy_from_slice(right_tail);
-            sum = accumulate_gradient_x4(&left, &right, sum);
-        }
-    }
-
-    for (top, bottom) in rows.clone().zip(rows.skip(1)) {
-        let (top4, top_tail) = top.as_chunks::<4>();
-        let (bottom4, bottom_tail) = bottom.as_chunks::<4>();
-        for (top, bottom) in top4.iter().zip(bottom4) {
-            sum = accumulate_gradient_x4(top, bottom, sum);
-        }
-        if !top_tail.is_empty() {
-            let mut top = [0.0; 4];
-            let mut bottom = [0.0; 4];
-            top[..top_tail.len()].copy_from_slice(top_tail);
-            bottom[..bottom_tail.len()].copy_from_slice(bottom_tail);
-            sum = accumulate_gradient_x4(&top, &bottom, sum);
-        }
-    }
-    vaddvq_f32(sum)
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn peak_excess_x4(
-    a: float32x4_t,
-    b: float32x4_t,
-    source_a: float32x4_t,
-    source_b: float32x4_t,
-    floor: float32x4_t,
-) -> float32x4_t {
-    let error_gradient = vabsq_f32(vsubq_f32(b, a));
-    let source_gradient = vabsq_f32(vsubq_f32(source_b, source_a));
-    let excess = vmaxq_f32(
-        vdupq_n_f32(0.0),
-        vsubq_f32(
-            vsubq_f32(error_gradient, vmulq_n_f32(source_gradient, 0.5)),
-            floor,
-        ),
-    );
-    vmulq_f32(excess, excess)
-}
-
-/// # Safety
-/// The caller must ensure NEON is available.
-#[target_feature(enable = "neon")]
-pub(crate) fn error_gradient_peak_energy_neon(
-    error: &[f32],
-    original: &[f32],
-    width: usize,
-    height: usize,
-    floor: f32,
-) -> f32 {
-    let n = width
-        .checked_mul(height)
-        .expect("gradient plane size overflow");
-    assert!(error.len() >= n && original.len() >= n);
-    assert!(floor.is_finite() && floor >= 0.0);
-    if width == 0 || height == 0 {
-        return 0.0;
-    }
-    if !width.is_multiple_of(4) {
-        return crate::inflated_cost::error_gradient_peak_energy_scalar(
-            error, original, width, height, floor,
-        );
-    }
-
-    let floor = vdupq_n_f32(floor);
-    let zero = vdupq_n_f32(0.0);
-    let mut total = 0.0f32;
-    for cell_y in (0..height).step_by(4) {
-        for cell_x in (0..width).step_by(4) {
-            let mut max_x = zero;
-            let mut max_y = zero;
-            for y in cell_y..(cell_y + 4).min(height) {
-                let p = y * width + cell_x;
-                let current = unsafe { vld1q_f32(error.as_ptr().add(p)) };
-                let source = unsafe { vld1q_f32(original.as_ptr().add(p)) };
-                let (right, source_right) = if cell_x + 4 < width {
-                    (unsafe { vld1q_f32(error.as_ptr().add(p + 1)) }, unsafe {
-                        vld1q_f32(original.as_ptr().add(p + 1))
-                    })
-                } else {
-                    (
-                        vsetq_lane_f32::<3>(
-                            vgetq_lane_f32::<3>(current),
-                            vextq_f32::<1>(current, current),
-                        ),
-                        vsetq_lane_f32::<3>(
-                            vgetq_lane_f32::<3>(source),
-                            vextq_f32::<1>(source, source),
-                        ),
-                    )
-                };
-                max_x = vmaxq_f32(
-                    max_x,
-                    peak_excess_x4(current, right, source, source_right, floor),
-                );
-                if y + 1 < height {
-                    let below = unsafe { vld1q_f32(error.as_ptr().add(p + width)) };
-                    let source_below = unsafe { vld1q_f32(original.as_ptr().add(p + width)) };
-                    max_y = vmaxq_f32(
-                        max_y,
-                        peak_excess_x4(current, below, source, source_below, floor),
-                    );
-                }
-            }
-            total += vmaxvq_f32(max_x) + vmaxvq_f32(max_y);
-        }
-    }
-    total
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
 fn combine_error_x4(spatial: &[f32; 4], luma: &[f32; 4], factor: f32, combined: &mut [f32; 4]) {
     let spatial = unsafe { vld1q_f32(spatial.as_ptr()) };
     let luma = unsafe { vld1q_f32(luma.as_ptr()) };
@@ -878,8 +711,8 @@ fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-        recon_dist_and_rate_neon_impl, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
+        combine_error_neon, recon_dist_and_rate_neon_impl, rgb_hue_chroma_edge_loss_neon,
+        ssim_deficit_neon,
     };
     use crate::dc_group_data::{
         STRATEGY_DCT, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
@@ -1069,8 +902,6 @@ mod tests {
                     channel_weights: crate::inflated_cost::CHANNEL_WEIGHT,
                     xyb_matrix: crate::xyb::XybMatrix::SPEC,
                     rgb_hue_alpha: 0.0,
-                    gradient_alpha: 0.0,
-                    gradient_peak_alpha: 3.0,
                     keep_spatial_errors: false,
                 },
             };
@@ -1082,12 +913,6 @@ mod tests {
                     recon_dist_and_rate_scalar::<false>(&mut scalar_scratch, &input)
                 };
                 let error_kernels = ReconErrorKernels {
-                    gradient_energy: |error, width, height| unsafe {
-                        error_gradient_energy_neon(error, width, height)
-                    },
-                    gradient_peak_energy: |error, original, width, height, floor| unsafe {
-                        error_gradient_peak_energy_neon(error, original, width, height, floor)
-                    },
                     combine: |spatial, luma, factor, combined| unsafe {
                         combine_error_neon(spatial, luma, factor, combined)
                     },

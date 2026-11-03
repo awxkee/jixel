@@ -757,8 +757,8 @@ struct ReconStrategyCost {
     /// Ramped-lambda RD cost including the caller's metadata charge.
     cost: f32,
     /// Ramped-lambda RD cost without metadata, for quantizer refinement.
-    /// NaN when rerank-only gradient penalties make the score incompatible
-    /// with refinement's unpenalized candidates; the caller must recompute it.
+    /// NaN when the selection quantizer rescaled the candidate, so the score
+    /// does not match refinement's candidates; the caller must recompute it.
     base: f32,
     distortion: f32,
     rate: f32,
@@ -780,8 +780,6 @@ fn reconstruction_strategy_cost_and_base(
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
-    gradient_alpha: f32,
-    gradient_peak_alpha: f32,
     spatial_errors: Option<[&mut [f32]; 3]>,
 ) -> ReconStrategyCost {
     reconstruction_strategy_cost_bounded(
@@ -796,8 +794,6 @@ fn reconstruction_strategy_cost_and_base(
         meta_r,
         distance,
         cmap_factor,
-        gradient_alpha,
-        gradient_peak_alpha,
         spatial_errors,
         f32::INFINITY,
     )
@@ -818,8 +814,6 @@ fn reconstruction_strategy_cost_bounded(
     meta_r: f32,
     distance: f32,
     cmap_factor: [f32; 3],
-    gradient_alpha: f32,
-    gradient_peak_alpha: f32,
     spatial_errors: Option<[&mut [f32]; 3]>,
     limit: f32,
 ) -> ReconStrategyCost {
@@ -868,8 +862,6 @@ fn reconstruction_strategy_cost_bounded(
             cmap_factor,
             cx,
             cy,
-            gradient_alpha,
-            gradient_peak_alpha,
             keep_spatial_errors,
             prices,
         );
@@ -924,14 +916,12 @@ fn reconstruction_strategy_cost_bounded(
                 cmap_factor,
                 cx,
                 cy,
-                gradient_alpha,
-                gradient_peak_alpha,
                 keep_spatial_errors,
                 table.is_none(),
             );
             (ctx.recon_luma_phase)(recon, &input, &ctx.recon_error_kernels)
         };
-        let luma_distortion = luma.distortion(gradient_alpha, gradient_peak_alpha);
+        let luma_distortion = luma.distortion;
         let y_rate = match (table, y_bits) {
             (Some(prices), Some(bits)) => prices.scaled_rate(strategy, distance, bits),
             _ => luma.rate,
@@ -1012,8 +1002,6 @@ fn reconstruction_strategy_cost_bounded(
             cmap_factor,
             cx,
             cy,
-            gradient_alpha,
-            gradient_peak_alpha,
             keep_spatial_errors,
             table.is_none(),
         );
@@ -1042,7 +1030,7 @@ fn reconstruction_strategy_cost_bounded(
             distortion,
             rate,
         ),
-        base: if qac == original_qac && gradient_alpha == 0.0 && gradient_peak_alpha == 0.0 {
+        base: if qac == original_qac {
             rd_cost(
                 DistortionModel::Reconstruction,
                 distance,
@@ -1320,8 +1308,6 @@ fn strategy_cost_impl(
             cmap_factor,
             cx,
             cy,
-            0.0,
-            0.0,
             false,
             prices,
         )
@@ -1406,8 +1392,6 @@ fn recon_input<'a>(
     cmap_factor: [f32; 3],
     cx: usize,
     cy: usize,
-    gradient_alpha: f32,
-    gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
     compute_rate: bool,
 ) -> ReconDistInput<'a> {
@@ -1444,8 +1428,6 @@ fn recon_input<'a>(
             channel_weights: ctx.channel_weights(),
             xyb_matrix: ctx.xyb,
             rgb_hue_alpha: rerank_rgb_hue_alpha(ctx, distance),
-            gradient_alpha,
-            gradient_peak_alpha,
             keep_spatial_errors,
         },
     }
@@ -1529,8 +1511,6 @@ fn reconstruction_dist_and_rate(
     cmap_factor: [f32; 3],
     cx: usize,
     cy: usize,
-    gradient_alpha: f32,
-    gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
     prices: Option<&RatePrices>,
 ) -> ReconCost {
@@ -1549,8 +1529,6 @@ fn reconstruction_dist_and_rate(
         cmap_factor,
         cx,
         cy,
-        gradient_alpha,
-        gradient_peak_alpha,
         keep_spatial_errors,
         prices,
     )
@@ -1574,8 +1552,6 @@ fn reconstruction_dist_and_rate_with_class(
     cmap_factor: [f32; 3],
     cx: usize,
     cy: usize,
-    gradient_alpha: f32,
-    gradient_peak_alpha: f32,
     keep_spatial_errors: bool,
     prices: Option<&RatePrices>,
 ) -> ReconCost {
@@ -1593,8 +1569,6 @@ fn reconstruction_dist_and_rate_with_class(
         cmap_factor,
         cx,
         cy,
-        gradient_alpha,
-        gradient_peak_alpha,
         keep_spatial_errors,
         table.is_none(),
     );
@@ -1642,29 +1616,6 @@ fn reconstruction_dist_and_rate_with_class(
     cost
 }
 
-/// Pair-transform gradient protection used only by the reconstruction rerank.
-/// The raw energy term handles small high-quality errors; the source-masked,
-/// peak-pooled term takes over as quantization grows. Its coarse tail is limited
-/// to bright, nearly neutral gradients, where blocking remains visible without
-/// texture or chroma masking.
-// Fitted on the sun-beam set, then checked on the general 768px corpus and Kodak.
-const RERANK_PAIR_GRADIENT_FADE_IN_START: f32 = 0.5;
-const RERANK_PAIR_GRADIENT_FADE_IN_END: f32 = 0.8;
-const RERANK_PAIR_GRADIENT_FADE_OUT_START: f32 = 1.0;
-const RERANK_PAIR_GRADIENT_FADE_OUT_END: f32 = 1.5;
-const RERANK_PAIR_GRADIENT_ALPHA: f32 = 8.0;
-const RERANK_PAIR_GRADIENT_MIN_DOMINANCE: f32 = 0.4;
-const RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START: f32 = 1.2;
-const RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END: f32 = 1.8;
-const RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START: f32 = 3.0;
-const RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END: f32 = 3.5;
-const RERANK_PAIR_GRADIENT_PEAK_COARSE_START: f32 = 1.9;
-const RERANK_PAIR_GRADIENT_PEAK_COARSE_END: f32 = 2.0;
-const RERANK_PAIR_GRADIENT_PEAK_ALPHA: f32 = 192.0;
-const RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA: f32 = 96.0;
-const RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE: f32 = 0.4;
-const RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA: f32 = 0.45;
-const RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA: f32 = 0.01;
 const RERANK_RGB_HUE_ALPHA: f32 = 800.0;
 
 fn rerank_rgb_hue_alpha(ctx: &EncodingContext, distance: f32) -> f32 {
@@ -1674,59 +1625,6 @@ fn rerank_rgb_hue_alpha(ctx: &EncodingContext, distance: f32) -> f32 {
     let fade_in = ((distance - 0.35) / 0.40).clamp(0.0, 1.0);
     RERANK_RGB_HUE_ALPHA * fade_in
 }
-
-#[inline]
-fn rerank_pair_gradient_scale(distance: f32) -> f32 {
-    let fade_in = ((distance - RERANK_PAIR_GRADIENT_FADE_IN_START)
-        / (RERANK_PAIR_GRADIENT_FADE_IN_END - RERANK_PAIR_GRADIENT_FADE_IN_START))
-        .clamp(0.0, 1.0);
-    let fade_out = 1.0
-        - ((distance - RERANK_PAIR_GRADIENT_FADE_OUT_START)
-            / (RERANK_PAIR_GRADIENT_FADE_OUT_END - RERANK_PAIR_GRADIENT_FADE_OUT_START))
-            .clamp(0.0, 1.0);
-    fade_in * fade_out
-}
-
-fn rerank_pair_gradient_alpha(distance: f32) -> f32 {
-    RERANK_PAIR_GRADIENT_ALPHA * rerank_pair_gradient_scale(distance)
-}
-
-#[inline]
-fn rerank_pair_gradient_peak_alpha(distance: f32) -> f32 {
-    let fade_in = ((distance - RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START)
-        / (RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END - RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START))
-        .clamp(0.0, 1.0);
-    let fade_out = 1.0
-        - ((distance - RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START)
-            / (RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END - RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START))
-            .clamp(0.0, 1.0);
-    let coarse_mix = ((distance - RERANK_PAIR_GRADIENT_PEAK_COARSE_START)
-        / (RERANK_PAIR_GRADIENT_PEAK_COARSE_END - RERANK_PAIR_GRADIENT_PEAK_COARSE_START))
-        .clamp(0.0, 1.0);
-    let fit = &PAIR_GRAD_FIT;
-    let alpha = fmla(
-        coarse_mix,
-        fit.peak_coarse_alpha - fit.peak_alpha,
-        fit.peak_alpha,
-    );
-    alpha * fade_in * fade_out
-}
-
-struct PairGradFit {
-    peak_alpha: f32,
-    peak_coarse_alpha: f32,
-    min_luma: f32,
-    chroma_cap: f32,
-    peak_min_dominance: f32,
-}
-
-static PAIR_GRAD_FIT: PairGradFit = PairGradFit {
-    peak_alpha: RERANK_PAIR_GRADIENT_PEAK_ALPHA,
-    peak_coarse_alpha: RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
-    min_luma: RERANK_PAIR_GRADIENT_PEAK_MIN_LUMA,
-    chroma_cap: RERANK_PAIR_GRADIENT_PEAK_MAX_COARSE_CHROMA,
-    peak_min_dominance: RERANK_PAIR_GRADIENT_PEAK_MIN_DOMINANCE,
-};
 
 #[inline]
 fn reconstruction_lambda(distance: f32) -> f32 {
@@ -1919,164 +1817,6 @@ fn cmap_factors(
 }
 
 const MERGE_RISK_K: f32 = std::f32::consts::LOG2_E;
-
-/// Fraction of the region's Y variance carried by the smooth >=4px-scale
-/// component. Luminance ramps (sun beams, vignettes) score high; flat sky and
-/// texture-dominated regions score low.
-/// `w`/`h` must be multiples of 4 (transform sizes always are).
-#[derive(Clone, Copy)]
-pub(crate) struct GradientRegionStats {
-    pub(crate) dominance: f32,
-    pub(crate) mean: f32,
-    pub(crate) chroma: f32,
-}
-
-pub(crate) type GradientRegionStatsFn =
-    fn(&Image3F, usize, usize, usize, usize, f32) -> GradientRegionStats;
-
-#[inline]
-pub(crate) fn finish_gradient_region_stats(
-    means: &[f32],
-    within_sum: f32,
-    chroma_sum: f32,
-    pixel_count: usize,
-    eps: f32,
-) -> GradientRegionStats {
-    let n_cells = means.len() as f32;
-    let within = within_sum / n_cells;
-    let grand = means.iter().sum::<f32>() / n_cells;
-    let lf = means.iter().map(|m| (m - grand) * (m - grand)).sum::<f32>() / n_cells;
-    GradientRegionStats {
-        dominance: lf / (lf + within + eps),
-        mean: grand,
-        chroma: chroma_sum / pixel_count as f32,
-    }
-}
-
-pub(crate) fn gradient_region_stats_scalar(
-    opsin: &Image3F,
-    px0: usize,
-    py0: usize,
-    w: usize,
-    h: usize,
-    eps: f32,
-) -> GradientRegionStats {
-    let xs = opsin.xsize();
-    let ys = opsin.ysize();
-    let cw = w / 4;
-    let ch = h / 4;
-    let mut means = [0.0f32; 256]; // 64x64 region -> 16x16 cells max
-    let mut within = 0.0f32;
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let mut s = 0.0f32;
-            let mut s2 = 0.0f32;
-            for dy in 0..4 {
-                let row = opsin.plane_row(1, (py0 + cy * 4 + dy).min(ys - 1));
-                for dx in 0..4 {
-                    let sx = (px0 + cx * 4 + dx).min(xs - 1);
-                    let v = row[sx];
-                    s += v;
-                    s2 = fmla(v, v, s2);
-                }
-            }
-            let m = s * (1.0 / 16.0);
-            means[cy * cw + cx] = m;
-            within += (s2 * (1.0 / 16.0) - m * m).max(0.0);
-        }
-    }
-    finish_gradient_region_stats(&means[..cw * ch], within, 0.0, w * h, eps)
-}
-
-pub(crate) fn gradient_region_stats_with_chroma_scalar(
-    opsin: &Image3F,
-    px0: usize,
-    py0: usize,
-    w: usize,
-    h: usize,
-    eps: f32,
-) -> GradientRegionStats {
-    let xs = opsin.xsize();
-    let ys = opsin.ysize();
-    let cw = w / 4;
-    let ch = h / 4;
-    let mut means = [0.0f32; 256];
-    let mut within = 0.0f32;
-    let mut chroma = 0.0f32;
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let mut s = 0.0f32;
-            let mut s2 = 0.0f32;
-            for dy in 0..4 {
-                let y = (py0 + cy * 4 + dy).min(ys - 1);
-                let row = opsin.plane_row(1, y);
-                let xrow = opsin.plane_row(0, y);
-                let brow = opsin.plane_row(2, y);
-                for dx in 0..4 {
-                    let sx = (px0 + cx * 4 + dx).min(xs - 1);
-                    let v = row[sx];
-                    s += v;
-                    s2 = fmla(v, v, s2);
-                    chroma += xrow[sx].abs() + (brow[sx] - v).abs();
-                }
-            }
-            let m = s * (1.0 / 16.0);
-            means[cy * cw + cx] = m;
-            within += (s2 * (1.0 / 16.0) - m * m).max(0.0);
-        }
-    }
-    finish_gradient_region_stats(&means[..cw * ch], within, chroma, w * h, eps)
-}
-
-pub(crate) fn select_gradient_region_stats_fn() -> GradientRegionStatsFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::neon::gradient_region_stats_neon(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::avx::gradient_region_stats_avx2(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
-    if is_x86_feature_detected!("sse4.1") {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::sse::gradient_region_stats_sse41(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::gradient_region_stats_wasm;
-    #[allow(unreachable_code)]
-    gradient_region_stats_scalar
-}
-
-pub(crate) fn select_gradient_region_stats_with_chroma_fn() -> GradientRegionStatsFn {
-    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-    {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::neon::gradient_region_stats_with_chroma_neon(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::avx::gradient_region_stats_with_chroma_avx2(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
-    if is_x86_feature_detected!("sse4.1") {
-        return |opsin, px, py, w, h, eps| unsafe {
-            crate::sse::gradient_region_stats_with_chroma_sse41(opsin, px, py, w, h, eps)
-        };
-    }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::gradient_region_stats_with_chroma_wasm;
-    #[allow(unreachable_code)]
-    gradient_region_stats_with_chroma_scalar
-}
 
 #[inline]
 fn risk_gated(k: f32, accept: f32, q_min: f32, q_max: f32, area_scale: f32) -> f32 {

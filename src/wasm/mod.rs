@@ -51,10 +51,7 @@ mod splines;
 mod xyb;
 mod ytob;
 
-pub(crate) use ac_strategy::{
-    gradient_region_stats_wasm, gradient_region_stats_with_chroma_wasm, sse_and_rate_wasm,
-    sse_and_rate_wasm_impl,
-};
+pub(crate) use ac_strategy::{sse_and_rate_wasm, sse_and_rate_wasm_impl};
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
 pub(crate) use cfl::{
@@ -70,10 +67,7 @@ pub(crate) use divide::rounded_quotients_wasm;
 pub(crate) use entropy::counts_bit_cost_wasm;
 pub(crate) use frame::chroma_gradient_sums_wasm;
 pub(crate) use haar::haar_rows_wasm;
-pub(crate) use inflated_cost::{
-    combine_error_wasm, error_gradient_energy_wasm, error_gradient_peak_energy_wasm,
-    rgb_hue_chroma_edge_loss_wasm,
-};
+pub(crate) use inflated_cost::{combine_error_wasm, rgb_hue_chroma_edge_loss_wasm};
 pub(crate) use ink_layer::{luma_row_wasm, ridge_row_wasm};
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lossless_search::{palette_row_wasm, rct_row_wasm};

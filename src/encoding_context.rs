@@ -192,8 +192,6 @@ pub(crate) struct EncodingContext {
     pub(crate) dc_rows: crate::dc_ops::DcRowKernels,
     pub(crate) apply_cfl: ac_strategy::ApplyCflFn,
     pub(crate) mosaic_seam_stats: crate::mosaic_seam::MosaicSeamStatsFn,
-    pub(crate) gradient_region_stats: ac_strategy::GradientRegionStatsFn,
-    pub(crate) gradient_region_stats_with_chroma: ac_strategy::GradientRegionStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
     pub(crate) cfl_rdo_refill: color_correlation::CflRdoRefillFn,
@@ -648,8 +646,6 @@ impl EncodingContext {
             recon_luma_phase: inflated_cost::select_recon_luma_phase_fn(),
             recon_chroma_phase: inflated_cost::select_recon_chroma_phase_fn(),
             recon_error_kernels: inflated_cost::ReconErrorKernels {
-                gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
-                gradient_peak_energy: inflated_cost::select_error_gradient_peak_energy_fn(),
                 combine: inflated_cost::select_combine_error_fn(),
                 rgb_hue_chroma_edge_loss: inflated_cost::select_rgb_hue_chroma_edge_loss_fn(),
             },
@@ -662,9 +658,6 @@ impl EncodingContext {
             dc_rows: crate::dc_ops::selected_dc_row_kernels(),
             apply_cfl: ac_strategy::selected_apply_cfl_fn(),
             mosaic_seam_stats: crate::mosaic_seam::select_mosaic_seam_stats_fn(),
-            gradient_region_stats: ac_strategy::select_gradient_region_stats_fn(),
-            gradient_region_stats_with_chroma:
-                ac_strategy::select_gradient_region_stats_with_chroma_fn(),
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
             cfl_rdo_refill: color_correlation::selected_cfl_rdo_refill_fn(),
