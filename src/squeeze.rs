@@ -481,7 +481,7 @@ pub(crate) fn default_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<Squ
 
 /// The shared steps of a lossy pyramid: [`default_squeeze_steps`], led by
 /// one vertical step on images taller than wide (libjxl's order).
-fn lossy_shared_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+pub(crate) fn lossy_shared_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
     const MAX_PREVIEW: usize = 8;
     if h <= w || h <= MAX_PREVIEW {
         return default_squeeze_steps(w, h, num_c);

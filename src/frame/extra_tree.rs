@@ -384,6 +384,11 @@ fn plan_joint(
             scratch,
         );
     }
+    // The joint sections are ANS-coded; a plane whose streams are all zero
+    // can tip the joint bundle to prefix codes, which they cannot carry.
+    if code.use_prefix_code {
+        return None;
+    }
 
     let frame_bits = |tree: &[Token],
                       code: &EntropyCode,

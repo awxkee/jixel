@@ -89,8 +89,8 @@ impl ExtraSqueeze {
         learned_trees: bool,
         context_trees: bool,
     ) -> Option<Self> {
-        use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
-        let steps = default_squeeze_steps(xsize, ysize, 1);
+        use crate::squeeze::{Channel, apply_step_forward, lossy_shared_steps};
+        let steps = lossy_shared_steps(xsize, ysize, 1);
         if steps.is_empty() {
             return None;
         }

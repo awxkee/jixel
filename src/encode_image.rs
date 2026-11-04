@@ -4610,6 +4610,30 @@ mod encode_smoke_tests {
         );
     }
 
+    /// A tall black plane under a faint smooth alpha: every AC-band residual
+    /// of the squeezed alpha rounds to zero, and the joint extra-channel
+    /// bundle then prefers prefix codes, which the ANS-coded joint sections
+    /// cannot carry; the local codings stand instead.
+    #[test]
+    fn faint_smooth_tall_alpha_encodes() {
+        const W: usize = 400;
+        const H: usize = 850;
+        let rgba: Vec<u8> = (0..W * H)
+            .flat_map(|i| {
+                let (x, y) = ((i % W) as f32 / W as f32, (i / W) as f32 / H as f32);
+                let bump = (x * std::f32::consts::PI).sin() * (y * std::f32::consts::PI).sin();
+                [0, 0, 0, (51.0 * bump).round() as u8]
+            })
+            .collect();
+        for speed in [Speed::MediumSlow, Speed::Slow] {
+            let config = EncodeConfig::default()
+                .with_distance(3.0)
+                .with_speed(speed)
+                .with_num_threads(1);
+            encode_image_with_alpha(&rgba, W, H, &config).unwrap();
+        }
+    }
+
     #[test]
     #[cfg(feature = "splines")]
     fn dots_with_alpha_are_thread_deterministic() {
