@@ -581,7 +581,7 @@ fn lossy_palette(
     let weights = super::extra_levels::error_weights(plane, dim.xsize, dim.ysize);
     let budget =
         super::extra_levels::LOSSY_PALETTE_ERROR * squeezed_error(plane, squeezed, &weights);
-    let levels = super::extra_levels::fewest_levels(plane, &weights, budget)?;
+    let levels = super::extra_levels::fewest_levels(plane, &weights, budget, ctx.extra_black)?;
     let indices: Vec<i32> = (0..levels.len()).map(|i| levels.get_i32(i)).collect();
     let estimate = crate::lossy_modular::palette_index_bits(&indices, dim.xsize, dim.ysize);
     if estimate > PALETTE_SCREEN * squeezed_bits as f64 {

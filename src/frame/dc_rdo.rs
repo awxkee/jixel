@@ -80,6 +80,7 @@ impl Prices {
                 &mut Vec::new(),
                 false,
                 true,
+                WpParams::DEFAULT,
             );
             let mut offset = 0;
             for (mchan, c) in [1, 0, 2].into_iter().enumerate() {
@@ -789,6 +790,7 @@ mod tests {
                     &mut Vec::new(),
                     false,
                     true,
+                    WpParams::DEFAULT,
                 )
             })
             .unzip();
@@ -1135,6 +1137,7 @@ mod tests {
                         &mut Vec::new(),
                         false,
                         false,
+                        WpParams::DEFAULT,
                         &mut expected,
                         &mut Vec::new(),
                     );
@@ -1165,6 +1168,7 @@ mod tests {
                 &mut Vec::new(),
                 false,
                 false,
+                WpParams::DEFAULT,
                 &mut tokens,
                 &mut Vec::new(),
             );

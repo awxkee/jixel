@@ -36,7 +36,8 @@
 //! weighted per sample ([`error_weights`]): levels show as contours on smooth
 //! partial ramps, where a squeeze barely errs, so error there counts more.
 //! Zero is never merged and no other value reconstructs to zero, so the
-//! invisible-pixel set (which the color coding reads) is unchanged.
+//! invisible-pixel set (which the color coding reads) is unchanged; a black
+//! plate (`keep_full`) keeps its no-ink value the same way.
 
 use crate::encode_image::AlphaPlane;
 
@@ -184,6 +185,7 @@ pub(crate) fn fewest_levels(
     plane: &AlphaPlane,
     weights: &[f32],
     budget: f64,
+    keep_full: bool,
 ) -> Option<AlphaPlane> {
     let max = match plane {
         AlphaPlane::U8(_) => 255u32,
@@ -194,7 +196,11 @@ pub(crate) fn fewest_levels(
     for (i, &w) in weights.iter().enumerate().take(plane.len()) {
         hist[plane.get_i32(i) as usize] += f64::from(w);
     }
-    let (vals, counts): (Vec<u32>, Vec<f64>) = (1..=max)
+    // Zero never merges (alpha: the invisible set); with `keep_full`
+    // neither does the full value (K: no ink). A cell of the other values
+    // reconstructs strictly inside them, so no level lands on either.
+    let top = if keep_full { max - 1 } else { max };
+    let (vals, counts): (Vec<u32>, Vec<f64>) = (1..=top)
         .filter(|&v| hist[v as usize] > 0.0)
         .map(|v| (v, hist[v as usize]))
         .unzip();
@@ -328,7 +334,7 @@ mod tests {
                 .unzip();
             let budget = f64::from(rnd() % 40_000);
             let want = brute(&vals, &counts, 255, budget);
-            match fewest_levels(&plane, &weights, budget) {
+            match fewest_levels(&plane, &weights, budget, false) {
                 Some(q) => {
                     assert!(sse(&plane, &q, &weights) <= budget + 1e-6);
                     let zeros = data.iter().filter(|&&v| v == 0).count();
@@ -396,7 +402,7 @@ mod tests {
             assert!(vals.len() > MAX_VALUES, "a deep plane");
             for share in [1e-2, 1e-3, 1e-4] {
                 let budget = sums_error(&vals, &counts, max) * share;
-                let q = fewest_levels(&plane, &weights, budget).expect("quantized");
+                let q = fewest_levels(&plane, &weights, budget, false).expect("quantized");
                 assert!(sse(&plane, &q, &weights) <= budget * (1.0 + 1e-9));
                 let zeros = data.iter().filter(|&&v| v == 0).count();
                 assert_eq!(zeros, (0..q.len()).filter(|&i| q.get_i32(i) == 0).count());
@@ -411,12 +417,38 @@ mod tests {
     }
 
     #[test]
+    fn keep_full_preserves_the_no_ink_value_and_zero() {
+        // A plate of near-full values around 255 and near-empty ones around 0.
+        let data: Vec<u8> = (0..4096u32)
+            .map(|i| match i % 8 {
+                0 => 255,
+                1 => 254,
+                2 => 253,
+                3 => 0,
+                4 => 1,
+                5 => 2,
+                _ => 128 + (i % 3) as u8,
+            })
+            .collect();
+        let plane = AlphaPlane::U8(data.clone());
+        let weights = vec![1.0f32; data.len()];
+        let loose = fewest_levels(&plane, &weights, 4096.0 * 4e6, false).expect("quantized");
+        assert!((0..loose.len()).any(|i| data[i] == 255 && loose.get_i32(i) != 255));
+        let kept = fewest_levels(&plane, &weights, 4096.0 * 4e6, true).expect("quantized");
+        for i in 0..kept.len() {
+            assert_eq!(kept.get_i32(i) == 255, data[i] == 255);
+            assert_eq!(kept.get_i32(i) == 0, data[i] == 0);
+        }
+        assert!(levels(&kept) <= levels(&loose) + 1);
+    }
+
+    #[test]
     fn fewest_levels_stay_on_the_values_grid() {
         // 8-bit samples on the 16-bit lattice: every level a multiple of 257.
         let data: Vec<u16> = (0..4096).map(|i| (i % 200 + 1) as u16 * 257).collect();
         let plane = AlphaPlane::U16 { data, bits: 16 };
         let weights = vec![1.0; plane.len()];
-        let q = fewest_levels(&plane, &weights, 4096.0 * 4e6).expect("quantized");
+        let q = fewest_levels(&plane, &weights, 4096.0 * 4e6, false).expect("quantized");
         assert!((0..q.len()).all(|i| q.get_i32(i) % 257 == 0 && q.get_i32(i) > 0));
         assert!(levels(&q) < 200);
     }
@@ -426,7 +458,7 @@ mod tests {
         let data: Vec<u16> = (0..4096).map(|i| (i % 64 * 16) as u16).collect();
         let plane = AlphaPlane::U16 { data, bits: 10 };
         let weights = vec![1.0; plane.len()];
-        let q = fewest_levels(&plane, &weights, 4096.0 * 400.0).expect("quantized");
+        let q = fewest_levels(&plane, &weights, 4096.0 * 400.0, false).expect("quantized");
         assert!(matches!(q, AlphaPlane::U16 { bits: 10, .. }));
         assert!(levels(&q) < 64);
         assert!(sse(&plane, &q, &weights) <= 4096.0 * 400.0);

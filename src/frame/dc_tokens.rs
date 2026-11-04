@@ -38,6 +38,7 @@ use crate::entropy::{
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
+use crate::weighted_predictor::WpParams;
 
 const K_NUM_TREE_CONTEXTS: usize = 6;
 
@@ -174,7 +175,15 @@ fn collect_dc_tokens(
     props: &mut Vec<crate::dc_tree::DcProp>,
     collect_props: bool,
 ) -> Vec<Token> {
-    collect_dc_tokens_with_gradient(dc_data, dc_gradient, props, collect_props, false).0
+    collect_dc_tokens_with_gradient(
+        dc_data,
+        dc_gradient,
+        props,
+        collect_props,
+        false,
+        WpParams::DEFAULT,
+    )
+    .0
 }
 
 pub(crate) fn collect_dc_tokens_with_gradient(
@@ -183,6 +192,7 @@ pub(crate) fn collect_dc_tokens_with_gradient(
     props: &mut Vec<crate::dc_tree::DcProp>,
     collect_props: bool,
     collect_gradient: bool,
+    wp_params: WpParams,
 ) -> (Vec<Token>, Vec<Token>) {
     let token_count = [1usize, 0, 2]
         .into_iter()
@@ -202,6 +212,7 @@ pub(crate) fn collect_dc_tokens_with_gradient(
             props,
             collect_props,
             collect_gradient,
+            wp_params,
             &mut tokens,
             &mut gradient_tokens,
         );
@@ -237,6 +248,7 @@ pub(super) fn walk_dc_channel<T: Copy + Into<i64>>(
     props: &mut Vec<crate::dc_tree::DcProp>,
     collect_props: bool,
     collect_gradient: bool,
+    wp_params: WpParams,
     tokens: &mut Vec<Token>,
     gradient_tokens: &mut Vec<Token>,
 ) {
@@ -244,7 +256,7 @@ pub(super) fn walk_dc_channel<T: Copy + Into<i64>>(
         return;
     }
     let row = |y: usize| &data[y * stride..y * stride + xsize];
-    let mut wp = crate::weighted_predictor::WpState::new(xsize);
+    let mut wp = crate::weighted_predictor::WpState::with_params(xsize, wp_params);
 
     // On the top row every unavailable north-side neighbor collapses to
     // the value on the left.
@@ -413,6 +425,7 @@ impl DcPlanePrice {
             &mut Vec::new(),
             false,
             false,
+            WpParams::DEFAULT,
             &mut self.tokens,
             &mut Vec::new(),
         );
@@ -634,6 +647,7 @@ mod fused_dc_tests {
                             &mut props,
                             collect_props,
                             true,
+                            WpParams::DEFAULT,
                         );
                         let values = |ts: Vec<Token>| {
                             ts.into_iter()

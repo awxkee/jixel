@@ -40,8 +40,8 @@ use super::ma_encoding::tokenize_ma_rect;
 use super::ma_learning::{finish_ma_candidate, ma_leaf_price, ma_learn_params, with_ma_prune};
 use super::ma_sampling::{ma_channel_sample_count, sample_channel_ma};
 use super::ma_source::{
-    LearnedCandidate, MA_MAX_LEAVES, MA_MIN_NODE_SAMPLES, MaPlacement, MaSource, MaTransform,
-    ac_stream_id, with_ma_pixels,
+    LearnedCandidate, MA_MIN_NODE_SAMPLES, MaPlacement, MaSource, MaTransform, ac_stream_id,
+    with_ma_pixels,
 };
 use super::ma_streams::{
     LZ_LITERAL_ALTERNATIVE_MAX_RATIO, VARIANT_WRITE_TOLERANCE, priced_tree_streams,
@@ -70,15 +70,17 @@ const LOCAL_TREE_TARGET_SAMPLES: usize = 1 << 20;
 /// workers.
 const LOCAL_TREE_LEARN_LANES: usize = 4;
 
-/// Local trees are tried when the global tree grew to at least half its
-/// leaf budget and still codes the frame under `LOCAL_TREE_MAX_BITS_PER_VALUE`
-/// bits per value: many contexts, most of them near-deterministic, is the
-/// profile that keeps gaining from denser sampling (IDE screenshot 0.30 b/v
-/// at 4095 leaves: −8%, its patched frame 0.27 b/v at 3773 leaves; a
-/// Buddhabrot render 0.74: −1%; photos 2.2–2.8: −1..0%; a mostly flat
-/// screenshot at 743 leaves: +0.6%; every attempt costs ~2× encode time).
-pub(super) const LOCAL_TREE_MIN_GLOBAL_LEAVES: usize = MA_MAX_LEAVES / 2;
-
+/// Local trees are tried when the global tree codes the frame under this
+/// many bits per value: near-deterministic contexts are the profile that
+/// keeps gaining from denser sampling. Screenshot frames measure 0.03–0.24
+/// at any leaf count (513–4095), a Buddhabrot render 1.0, photos 1.6–3.4.
+/// The frame then takes, per AC group, the smaller of its global-tree and
+/// local-tree section, so flat screenshots whose all-local frame loses
+/// (+13..+17 % at 256-px groups) still gain from the groups that win:
+/// screenshots −0.8..−5.0 % at 1.2–2.3× encode time, everything above the
+/// bound untouched. (The former floor of half the leaf budget skipped
+/// those frames; a whole-image constant-block screen flag instead fires on
+/// illustrations and manga for no gain at 1.5–1.9×.)
 pub(super) const LOCAL_TREE_MAX_BITS_PER_VALUE: f64 = 0.5;
 
 /// Local per-group learned trees: every AC group section carries its own

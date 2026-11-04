@@ -33,22 +33,22 @@ use crate::dct::fmla;
 use crate::image::Image3F;
 
 #[derive(Clone, Copy)]
-pub(super) struct DistanceParams {
-    pub(super) distance: f32,
-    pub(super) global_scale: i32,
-    pub(super) quant_dc: i32,
-    pub(super) scale: f32,
-    pub(super) scale_dc: f32,
-    pub(super) x_qm_scale: u32,
-    pub(super) epf_iters: u32,
-    pub(super) epf_pass0_scale: Option<f32>,
-    pub(super) epf_quant_mul: Option<f32>,
-    pub(super) gab_enabled: bool,
+pub(crate) struct DistanceParams {
+    pub(crate) distance: f32,
+    pub(crate) global_scale: i32,
+    pub(crate) quant_dc: i32,
+    pub(crate) scale: f32,
+    pub(crate) scale_dc: f32,
+    pub(crate) x_qm_scale: u32,
+    pub(crate) epf_iters: u32,
+    pub(crate) epf_pass0_scale: Option<f32>,
+    pub(crate) epf_quant_mul: Option<f32>,
+    pub(crate) gab_enabled: bool,
     /// Multipliers of the default DC steps of X, Y and B.
-    pub(super) dc_step: [f32; 3],
+    pub(crate) dc_step: [f32; 3],
 }
 
-pub(super) const X_QM_REFINE_MAX_DISTANCE: f32 = 0.299;
+pub(crate) const X_QM_REFINE_MAX_DISTANCE: f32 = 0.299;
 const DC_REFINE_PEAK: f32 = 1.35;
 const DC_REFINE_HOLD: f32 = 3.0;
 const DC_REFINE_RELEASE: f32 = 5.0;
@@ -86,7 +86,7 @@ fn quant_dc(distance: f32) -> f32 {
     (k_dc_quant / effective).min(50.0) * refine * vlq
 }
 
-pub(super) fn compute_distance_params(distance: f32) -> DistanceParams {
+pub(crate) fn compute_distance_params(distance: f32) -> DistanceParams {
     const K_GLOBAL_SCALE_DENOM: i32 = 1 << 16;
     const K_AC_QUANT: f32 = 0.8;
     // Keep the integer quant field away from the very coarse 2/3/4 range. The
@@ -238,7 +238,7 @@ pub(crate) fn epf_sharpness_id(distance: f32, screen_content: bool) -> i32 {
 }
 
 /// Pre-invert Gaborish so the decoder's forward pass reproduces `xyb`.
-pub(super) fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
+pub(crate) fn gaborize(xyb: &mut Image3F, distp: &DistanceParams) {
     if distp.gab_enabled {
         crate::gaborish::gaborish_inverse(xyb, 0.990_851_1);
     }
@@ -251,7 +251,7 @@ const DC_LEVEL_LIMIT: f32 = 16_000.0;
 /// Non-XYB planes hold the image's own samples, which float input may take far
 /// past [0, 1]. Coarsen a plane's DC step only as far as its stored levels
 /// need to stay representable.
-pub(super) fn dc_steps_in_range(base: [f32; 3], scale_dc: f32, coded: &Image3F) -> [f32; 3] {
+pub(crate) fn dc_steps_in_range(base: [f32; 3], scale_dc: f32, coded: &Image3F) -> [f32; 3] {
     let peak = (0..3)
         .flat_map(|c| coded.plane_data(c).iter())
         .fold(0.0f32, |m, &v| m.max(v.abs()));

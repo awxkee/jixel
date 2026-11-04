@@ -368,7 +368,7 @@ impl SourcePlan {
 
             // The transform runner-up under the chosen preset, with the same
             // coarse prune.
-            if let Some(&(runner_up, cost)) = color.ranked.get(1)
+            if let Some((runner_up, cost)) = color.runner_up()
                 && cost <= color.ranked[0].1 * RCT_RANK_MARGIN
             {
                 // One RGB sample set alive at a time: a losing runner-up

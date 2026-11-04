@@ -400,7 +400,7 @@ fn lossy_palette_levels(
         })
         .sum();
     let AlphaPlane::U16 { data, .. } =
-        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error)?
+        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error, false)?
     else {
         unreachable!("levels keep the plane's type")
     };

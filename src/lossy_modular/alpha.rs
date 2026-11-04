@@ -44,11 +44,11 @@ use crate::encode_image::AlphaPlane;
 use crate::entropy::Token;
 use crate::lossless::kit::{
     GlobalPlaneTree, LZ77_MIN_SYMBOL, MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS,
-    PREDICTOR_GRADIENT, SAFE_PREDICTORS, build_balanced_tree_tokens_mul, build_lz_pixel_code,
-    build_lz_pixel_code_opts, channel_to_context, for_each_squeeze_group_crop, lz77_literals,
-    push_leaf_mul, push_split, sample_channel_ma, scale_ma_value_props,
-    selected_grad_pack_interior_fn, tokenize_channel_ma_mult, tokenize_plane_rows,
-    write_lz_section, write_modular_transforms_squeeze_only, write_tree_lz77,
+    PREDICTOR_GRADIENT, SAFE_PREDICTORS, build_balanced_tree_tokens_mul, build_lz_pixel_code_ans,
+    channel_to_context, for_each_squeeze_group_crop, lz77_literals, push_leaf_mul, push_split,
+    sample_channel_ma, scale_ma_value_props, selected_grad_pack_interior_fn,
+    tokenize_channel_ma_mult, tokenize_plane_rows, write_lz_section,
+    write_modular_transforms_squeeze_only, write_tree_lz77,
 };
 use crate::ma_tree::{LearnedTree, MaLearnParams, MaNode, MaSamples, learn_ma_tree};
 use crate::thread_pool::ThreadPool;
@@ -89,8 +89,8 @@ impl ExtraSqueeze {
         learned_trees: bool,
         context_trees: bool,
     ) -> Option<Self> {
-        use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
-        let steps = default_squeeze_steps(xsize, ysize, 1);
+        use crate::squeeze::{Channel, apply_step_forward, lossy_shared_steps};
+        let steps = lossy_shared_steps(xsize, ysize, 1);
         if steps.is_empty() {
             return None;
         }
@@ -520,7 +520,7 @@ impl ExtraSqueeze {
             );
         }
         let lz = lz77_literals(&tokens);
-        let code = build_lz_pixel_code_opts(
+        let code = build_lz_pixel_code_ans(
             false,
             std::iter::once(lz.as_slice()),
             num_ctx as usize,
@@ -570,12 +570,13 @@ impl ExtraSqueeze {
             );
         }
         let lz = lz77_literals(&tokens);
-        let code = build_lz_pixel_code(
+        let code = build_lz_pixel_code_ans(
             false,
             std::iter::once(lz.as_slice()),
             n,
             self.min_symbol,
             true,
+            false,
             &mut scratch.lz_entropy,
             &mut scratch.huffman_pool,
         );

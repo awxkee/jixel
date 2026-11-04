@@ -63,12 +63,12 @@ pub(super) fn assemble_source_dc(
     image
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Set up one DC group (quant field, AC strategy, CfL, sub-8 gate); its AC
 /// groups are encoded separately. Returns the data and its group-grid dims.
 /// DC group with the real AQ field and CfL map on a DCT8-only layout: the
 /// quantizer edge-spline selection judges proposals on before the one full
 /// layout search runs on the changed source.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "splines")]
 pub(super) fn provisional_dc_group(
     ctx: &EncodingContext,

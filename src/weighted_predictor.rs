@@ -36,8 +36,10 @@ const WP_PRED_ROUND: i64 = ((1 << WP_EXTRA_BITS) >> 1) - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WpParams {
-    w: [u32; 4],
-    p: [i64; 7],
+    /// Sub-predictor weights (4 bits each).
+    pub(crate) w: [u32; 4],
+    /// Error weights p1, p2, p3a..p3e (5 bits each).
+    pub(crate) p: [i64; 7],
 }
 
 impl WpParams {

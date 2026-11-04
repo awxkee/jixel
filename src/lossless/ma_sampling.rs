@@ -497,7 +497,11 @@ impl DcPlanes {
 
 /// MA samples of every DC group (stream id `1 + group`, default WP), taking
 /// every `stride`-th pixel.
-pub(crate) fn sample_dc_planes(groups: &[DcPlanes], stride: usize) -> MaSamples {
+pub(crate) fn sample_dc_planes(
+    groups: &[DcPlanes],
+    stride: usize,
+    wp_params: WpParams,
+) -> MaSamples {
     let capacity = groups
         .iter()
         .map(|g| 3 * ma_channel_sample_count(g.w, g.h, stride))
@@ -517,7 +521,7 @@ pub(crate) fn sample_dc_planes(groups: &[DcPlanes], stride: usize) -> MaSamples 
                 c as u32,
                 1 + group as i32,
                 &refs,
-                WpParams::DEFAULT,
+                wp_params,
                 true,
                 stride,
                 |props, tok, _| samples.push(props, tok),
@@ -534,6 +538,7 @@ pub(crate) fn tokenize_dc_planes(
     group: usize,
     tree: &LearnedTree,
     leaf_ctx: &[u32],
+    wp_params: WpParams,
     out: &mut Vec<Token>,
 ) {
     if g.w == 0 || g.h == 0 {
@@ -549,7 +554,7 @@ pub(crate) fn tokenize_dc_planes(
             c as u32,
             1 + group as i32,
             &refs,
-            WpParams::DEFAULT,
+            wp_params,
             true,
             |_x, _y, v, p, n, wp_pred| {
                 let (node, pred) = tree.lookup(p);

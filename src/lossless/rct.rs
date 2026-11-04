@@ -104,9 +104,35 @@ pub(super) fn write_rct_transform(rct_type: u32, w: &mut BitWriter) {
 // libjxl: fixed 18-context gradient-residual token entropy per channel.
 // ---------------------------------------------------------------------------
 
-/// Candidate rct_types in libjxl's try order (first 7 = cjxl -e7's set):
-/// none, YCoCg, G-half-avg, subtract-green, and half-average variants.
+/// Candidate rct_types in libjxl's try order (cjxl -e7's set): none, YCoCg,
+/// G-half-avg, subtract-green, and half-average variants.
 static RCT_CANDIDATES: [u32; 7] = [0, 6, 5, 10, 26, 40, 12];
+
+/// Every rct_type: the seven elementary transforms under each of the six
+/// channel permutations (`rct_type = permutation * 7 + transform`).
+static RCT_ALL_TYPES: [u32; 42] = {
+    let mut all = [0u32; 42];
+    let mut t = 0;
+    while t < 42 {
+        all[t] = t as u32;
+        t += 1;
+    }
+    all
+};
+
+/// The rct_types a ranking considers: the whole table when `all_types`.
+pub(super) fn rct_candidates(all_types: bool) -> &'static [u32] {
+    if all_types {
+        &RCT_ALL_TYPES
+    } else {
+        &RCT_CANDIDATES
+    }
+}
+
+/// Rows the coarse pass of a two-stage ranking scores, relative to the fine
+/// pass, and how many of its leaders the fine pass re-scores.
+const RCT_COARSE_ROW_FACTOR: usize = 8;
+const RCT_FINE_CANDIDATES: usize = 7;
 static RCT_CONTEXT_CUTOFFS: [u32; 17] = [
     0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500,
 ];
@@ -275,30 +301,60 @@ fn estimate_rct_cost(
     cost
 }
 
-/// Estimate every candidate RCT and return the winner's planes when it is not
-/// YCoCg (in which case the caller keeps the input planes unchanged).
 /// Every candidate RCT with its estimated cost over every `row_step`-th row,
-/// cheapest first.
+/// cheapest first. More candidates than the fine pass keeps are first ranked
+/// on one row in `RCT_COARSE_ROW_FACTOR` of those, and only the leaders are
+/// scored at `row_step`.
 pub(super) fn rank_rcts(
     linear: &Image3Si,
     xsize: usize,
     ysize: usize,
     row_step: usize,
+    candidates: &[u32],
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<(u32, f32)> {
-    let costs = pool.steal_map(scratch, RCT_CANDIDATES.len(), |i, scratch| {
+    if candidates.len() <= RCT_FINE_CANDIDATES {
+        return rank_rcts_at(linear, xsize, ysize, row_step, candidates, pool, scratch);
+    }
+    let coarse = rank_rcts_at(
+        linear,
+        xsize,
+        ysize,
+        row_step * RCT_COARSE_ROW_FACTOR,
+        candidates,
+        pool,
+        scratch,
+    );
+    let leaders: Vec<u32> = coarse
+        .iter()
+        .take(RCT_FINE_CANDIDATES)
+        .map(|&(t, _)| t)
+        .collect();
+    rank_rcts_at(linear, xsize, ysize, row_step, &leaders, pool, scratch)
+}
+
+fn rank_rcts_at(
+    linear: &Image3Si,
+    xsize: usize,
+    ysize: usize,
+    row_step: usize,
+    candidates: &[u32],
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Vec<(u32, f32)> {
+    let costs = pool.steal_map(scratch, candidates.len(), |i, scratch| {
         estimate_rct_cost(
             linear,
             xsize,
             ysize,
-            RCT_CANDIDATES[i],
+            candidates[i],
             row_step,
             &mut scratch.gradient,
             scratch.entropy_of_hist,
         )
     });
-    let mut ranked: Vec<(u32, f32)> = RCT_CANDIDATES.iter().copied().zip(costs).collect();
+    let mut ranked: Vec<(u32, f32)> = candidates.iter().copied().zip(costs).collect();
     crate::util::sort_small_by(&mut ranked, |a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     ranked
 }
@@ -342,7 +398,7 @@ pub(super) fn select_rct(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<(u32, Image3Si)> {
-    let rct = rank_rcts(linear, xsize, ysize, 1, pool, scratch)[0].0;
+    let rct = rank_rcts(linear, xsize, ysize, 1, &RCT_CANDIDATES, pool, scratch)[0].0;
     if rct == 6 {
         return None;
     }

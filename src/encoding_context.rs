@@ -102,7 +102,7 @@ pub(crate) struct EncodingContext {
     /// Color transform of lossy VarDCT frames.
     pub(crate) coding: crate::coding::CodingTransform,
     /// Per-channel AC dequantization the header signals for `xyb` and `coding`.
-    dequant_bias: [crate::group::DequantBias; 3],
+    dequant_bias: [group::DequantBias; 3],
     /// Resolved EPF channel scales; `None` uses the spec XYB weights.
     pub(crate) epf_channel_scale: Option<[f32; 3]>,
     /// Tables of the non-XYB frame, resolved from its coded planes; unset
@@ -117,6 +117,9 @@ pub(crate) struct EncodingContext {
     /// Lattice step of the extra channel (1 = lossless); the plane must be
     /// snapped with `modular::snap_to_lattice` first.
     pub(crate) extra_step: u32,
+    /// The extra channel is CMYK's black plate (stored inverted: 0 = full
+    /// ink), whose no-ink value must survive a lossy palette exactly.
+    pub(crate) extra_black: bool,
     /// Squeeze-quantize the extra channel at this luma-quantizer distance
     /// (0 = off; takes precedence over `extra_step`).
     pub(crate) extra_squeeze_distance: f32,
@@ -465,13 +468,13 @@ impl EncodingContext {
 
     /// The frame's chroma-from-luma parameters.
     #[inline]
-    pub(crate) fn cfl_frame(&self) -> crate::color_correlation::CflFrame {
+    pub(crate) fn cfl_frame(&self) -> color_correlation::CflFrame {
         use std::sync::atomic::Ordering::Relaxed;
         let [x, b, f] = self
             .cfl_frame
             .each_ref()
             .map(|v| f32::from_bits(v.load(Relaxed)));
-        crate::color_correlation::CflFrame {
+        color_correlation::CflFrame {
             base_x: x,
             base_b: b,
             color_factor: f,
@@ -590,6 +593,7 @@ impl EncodingContext {
             #[cfg(feature = "splines")]
             overlay_coverage: None,
             extra_step: 1,
+            extra_black: false,
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
             extra_plane_tree: None,

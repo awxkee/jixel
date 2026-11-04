@@ -889,6 +889,12 @@ struct Effort {
     try_natural_order: bool,
     /// Race the fixed DC tree against a per-image learned tree.
     learned_dc_tree: bool,
+    /// Race the default DC weighted-predictor parameters against libjxl's
+    /// second preset on the serialized sections.
+    dc_wp_race: bool,
+    /// Pick between them on the static tree's Shannon bits instead and code
+    /// the pick once.
+    dc_wp_proxy_pick: bool,
     /// Race an entropy-optimized block context map against the luma-quantile one.
     optimized_ctx_map: bool,
     /// Pick per-cluster HybridUint configs instead of the default.
@@ -902,6 +908,8 @@ impl Effort {
             Speed::UltraFast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                dc_wp_race: false,
+                dc_wp_proxy_pick: false,
                 optimized_ctx_map: false,
                 select_configs: false,
                 refinement: None,
@@ -909,6 +917,8 @@ impl Effort {
             Speed::Fastest => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                dc_wp_race: false,
+                dc_wp_proxy_pick: false,
                 optimized_ctx_map: false,
                 select_configs: false,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
@@ -916,6 +926,8 @@ impl Effort {
             Speed::Fast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                dc_wp_race: false,
+                dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: false }),
@@ -923,6 +935,8 @@ impl Effort {
             Speed::Medium | Speed::MediumSlow => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                dc_wp_race: false,
+                dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
                 select_configs: true,
                 refinement: Some(AnsRefinement::Fast { recluster: true }),
@@ -930,6 +944,8 @@ impl Effort {
             Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
                 learned_dc_tree: true,
+                dc_wp_race: speed == Speed::ExtraSlow,
+                dc_wp_proxy_pick: speed != Speed::ExtraSlow,
                 // About −0.24 % on large photos for ×1.7 encode time.
                 optimized_ctx_map: speed == Speed::ExtraSlow,
                 select_configs: true,
@@ -1031,179 +1047,215 @@ fn encode_jpeg_codestream_with_pool(
     });
     let dc_datas: Vec<DcGroupData> = dc_datas.into_iter().collect::<Result<_, _>>()?;
 
-    // Small images get libjxl's pruned fixed tree; its contexts are looked up
-    // from each token's properties instead of the static tree's numbering.
-    let dc_samples: usize = dc_datas
-        .iter()
-        .map(|d| {
-            (0..3)
-                .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
-                .sum::<usize>()
-        })
-        .sum();
-    let small_tree = crate::dc_tree::fixed_wp_dc_tree(dim.num_dc_groups, dc_samples);
-
-    // Fixed-tree tokens, with properties and gradient residuals only where
-    // the pruned or learned tree needs them.
-    let collected = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
-        let collect_props = small_tree.is_some() || effort.learned_dc_tree;
-        let (mut props, mut meta_props) = (Vec::new(), Vec::new());
-        let (dc, gradient) = collect_dc_tokens_with_gradient(
-            &dc_datas[i],
-            &crate::frame::DC_PREDICTOR_WEIGHTED,
-            &mut props,
-            collect_props,
-            effort.learned_dc_tree,
-        );
-        // epf_iters = 0 here, so the sharpness id is decoder-ignored;
-        // any distance >= 5 keeps the stream at the historical constant 4.
-        let meta = collect_ac_metadata_tokens(
-            &dc_datas[i],
-            &mut meta_props,
-            crate::frame::epf_sharpness_id(100.0, false),
-            collect_props,
-        );
-        (dc, gradient, meta, props, meta_props)
-    });
-
-    let build_code = |dc: &[Vec<Token>],
-                      meta: &[Vec<Token>],
-                      num_contexts: usize,
-                      scratch: &mut CoderScratch| {
-        let streams = || dc.iter().chain(meta).map(Vec::as_slice);
-        let mut code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
-            streams(),
-            num_contexts,
-            &mut scratch.huffman_pool,
-            effort.select_configs,
-            Some(pool),
-        );
-        if let Some(refinement) = effort.refinement {
-            crate::entropy::refine_entropy_bundle(&mut code, streams(), refinement, pool, scratch);
-        }
-        let mut header = BitWriter::new();
-        write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
-        let bits =
-            header.bits_written() as u64 + crate::entropy::estimate_ac_plain_bits(streams(), &code);
-        (code, bits)
-    };
-
-    let mut dc_tokens = Vec::with_capacity(collected.len());
-    let mut meta_tokens = Vec::with_capacity(collected.len());
-    let mut gradient_tokens = Vec::with_capacity(collected.len());
-    let mut dc_props = Vec::with_capacity(collected.len());
-    let mut meta_props = Vec::with_capacity(collected.len());
-    for (dc, gradient, meta, props, metadata_props) in collected {
-        dc_tokens.push(dc);
-        gradient_tokens.push(gradient);
-        meta_tokens.push(meta);
-        dc_props.push(props);
-        meta_props.push(metadata_props);
-    }
-
-    // Learn from the same predictor walk as the fixed-tree incumbent. The
-    // final race compares serialized sections, including padding and TOC.
-    let learned_dc = effort.learned_dc_tree.then(|| {
-        let tree = crate::dc_tree::learn_dc_tree(
-            dim.num_dc_groups,
-            &dc_tokens,
-            &gradient_tokens,
-            &dc_props,
-            &meta_tokens,
-            &meta_props,
-        );
-        let dc = dc_tokens
+    // The DC plans (fixed tree, and the learned tree where the effort races
+    // one) under one set of weighted-predictor parameters.
+    let plan_dc = |wp_params: crate::weighted_predictor::WpParams, scratch: &mut CoderScratch| {
+        // Small images get libjxl's pruned fixed tree; its contexts are looked up
+        // from each token's properties instead of the static tree's numbering.
+        let dc_samples: usize = dc_datas
             .iter()
-            .zip(&gradient_tokens)
-            .zip(&dc_props)
-            .map(|((wp, gradient), props)| {
-                wp.iter()
-                    .zip(gradient)
-                    .zip(props)
-                    .map(|((wp, gradient), &prop)| {
-                        let context = tree.dc_context[prop as usize];
-                        let value = if tree.leaf_gradient[context as usize] {
-                            gradient.value
-                        } else {
-                            wp.value
-                        };
-                        Token::new(u32::from(context), value)
-                    })
-                    .collect()
+            .map(|d| {
+                (0..3)
+                    .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
+                    .sum::<usize>()
             })
-            .collect::<Vec<Vec<Token>>>();
-        let meta = meta_tokens
-            .iter()
-            .zip(&meta_props)
-            .map(|(tokens, props)| {
-                tokens
-                    .iter()
-                    .zip(props)
-                    .map(|(token, &prop)| {
-                        let slot = ((token.context as usize) << 10) | (prop & 1023) as usize;
-                        Token::new(u32::from(tree.meta_context[slot]), token.value)
-                    })
-                    .collect()
-            })
-            .collect::<Vec<Vec<Token>>>();
-        let (code, _) = build_code(&dc, &meta, tree.num_contexts, scratch);
-        DcPlan {
-            tree: Some(tree),
-            dc,
-            meta,
-            code,
-        }
-    });
-    drop(gradient_tokens);
-    let (mut dc_code, static_bits) =
-        build_code(&dc_tokens, &meta_tokens, K_NUM_DC_CONTEXTS, scratch);
+            .sum();
+        let small_tree = crate::dc_tree::fixed_wp_dc_tree(dim.num_dc_groups, dc_samples);
 
-    // The pruned tree replaces the static one only where it is cheaper in
-    // full: tree, histograms and payload.
-    let mut pruned_tree = None;
-    if let Some(tree) = small_tree {
-        let mut dc_small = dc_tokens.clone();
-        let mut meta_small = meta_tokens.clone();
-        for ((dc, meta), (dc_props, meta_props)) in dc_small
-            .iter_mut()
-            .zip(meta_small.iter_mut())
-            .zip(dc_props.iter().zip(&meta_props))
-        {
-            for (t, &p) in dc.iter_mut().zip(dc_props) {
-                t.context = u32::from(tree.dc_context[p as usize]);
+        // Fixed-tree tokens, with properties and gradient residuals only where
+        // the pruned or learned tree needs them.
+        let collected = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
+            let collect_props = small_tree.is_some() || effort.learned_dc_tree;
+            let (mut props, mut meta_props) = (Vec::new(), Vec::new());
+            let (dc, gradient) = collect_dc_tokens_with_gradient(
+                &dc_datas[i],
+                &crate::frame::DC_PREDICTOR_WEIGHTED,
+                &mut props,
+                collect_props,
+                effort.learned_dc_tree,
+                wp_params,
+            );
+            // epf_iters = 0 here, so the sharpness id is decoder-ignored;
+            // any distance >= 5 keeps the stream at the historical constant 4.
+            let meta = collect_ac_metadata_tokens(
+                &dc_datas[i],
+                &mut meta_props,
+                crate::frame::epf_sharpness_id(100.0, false),
+                collect_props,
+            );
+            (dc, gradient, meta, props, meta_props)
+        });
+
+        let build_code = |dc: &[Vec<Token>],
+                          meta: &[Vec<Token>],
+                          num_contexts: usize,
+                          scratch: &mut CoderScratch| {
+            let streams = || dc.iter().chain(meta).map(Vec::as_slice);
+            let mut code = crate::entropy::optimize_entropy_code_jpeg_ac_streams(
+                streams(),
+                num_contexts,
+                &mut scratch.huffman_pool,
+                effort.select_configs,
+                Some(pool),
+            );
+            if let Some(refinement) = effort.refinement {
+                crate::entropy::refine_entropy_bundle(
+                    &mut code,
+                    streams(),
+                    refinement,
+                    pool,
+                    scratch,
+                );
             }
-            for (t, &p) in meta.iter_mut().zip(meta_props) {
-                let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
-                t.context = u32::from(tree.meta_context[slot]);
+            let mut header = BitWriter::new();
+            write_entropy_code(&code.as_ref(), &mut scratch.huffman_pool, &mut header);
+            let bits = header.bits_written() as u64
+                + crate::entropy::estimate_ac_plain_bits(streams(), &code);
+            (code, bits)
+        };
+
+        let mut dc_tokens = Vec::with_capacity(collected.len());
+        let mut meta_tokens = Vec::with_capacity(collected.len());
+        let mut gradient_tokens = Vec::with_capacity(collected.len());
+        let mut dc_props = Vec::with_capacity(collected.len());
+        let mut meta_props = Vec::with_capacity(collected.len());
+        for (dc, gradient, meta, props, metadata_props) in collected {
+            dc_tokens.push(dc);
+            gradient_tokens.push(gradient);
+            meta_tokens.push(meta);
+            dc_props.push(props);
+            meta_props.push(metadata_props);
+        }
+
+        // Learn from the same predictor walk as the fixed-tree incumbent. The
+        // final race compares serialized sections, including padding and TOC.
+        let learned_dc = effort.learned_dc_tree.then(|| {
+            let tree = crate::dc_tree::learn_dc_tree(
+                dim.num_dc_groups,
+                &dc_tokens,
+                &gradient_tokens,
+                &dc_props,
+                &meta_tokens,
+                &meta_props,
+            );
+            let dc = dc_tokens
+                .iter()
+                .zip(&gradient_tokens)
+                .zip(&dc_props)
+                .map(|((wp, gradient), props)| {
+                    wp.iter()
+                        .zip(gradient)
+                        .zip(props)
+                        .map(|((wp, gradient), &prop)| {
+                            let context = tree.dc_context[prop as usize];
+                            let value = if tree.leaf_gradient[context as usize] {
+                                gradient.value
+                            } else {
+                                wp.value
+                            };
+                            Token::new(u32::from(context), value)
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<Token>>>();
+            let meta = meta_tokens
+                .iter()
+                .zip(&meta_props)
+                .map(|(tokens, props)| {
+                    tokens
+                        .iter()
+                        .zip(props)
+                        .map(|(token, &prop)| {
+                            let slot = ((token.context as usize) << 10) | (prop & 1023) as usize;
+                            Token::new(u32::from(tree.meta_context[slot]), token.value)
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<Token>>>();
+            let (code, _) = build_code(&dc, &meta, tree.num_contexts, scratch);
+            DcPlan {
+                tree: Some(tree),
+                dc,
+                meta,
+                code,
+                wp_params,
+            }
+        });
+        drop(gradient_tokens);
+        let (mut dc_code, static_bits) =
+            build_code(&dc_tokens, &meta_tokens, K_NUM_DC_CONTEXTS, scratch);
+
+        // The pruned tree replaces the static one only where it is cheaper in
+        // full: tree, histograms and payload.
+        let mut pruned_tree = None;
+        if let Some(tree) = small_tree {
+            let mut dc_small = dc_tokens.clone();
+            let mut meta_small = meta_tokens.clone();
+            for ((dc, meta), (dc_props, meta_props)) in dc_small
+                .iter_mut()
+                .zip(meta_small.iter_mut())
+                .zip(dc_props.iter().zip(&meta_props))
+            {
+                for (t, &p) in dc.iter_mut().zip(dc_props) {
+                    t.context = u32::from(tree.dc_context[p as usize]);
+                }
+                for (t, &p) in meta.iter_mut().zip(meta_props) {
+                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                    t.context = u32::from(tree.meta_context[slot]);
+                }
+            }
+            let (code_small, small_bits) =
+                build_code(&dc_small, &meta_small, tree.num_contexts, scratch);
+            let mut static_header = BitWriter::new();
+            write_context_tree(
+                dim.num_dc_groups,
+                &crate::frame::DC_PREDICTOR_WEIGHTED,
+                &mut scratch.huffman_pool,
+                &mut static_header,
+            );
+            let mut small_header = BitWriter::new();
+            crate::frame::write_tree_tokens(
+                &tree.tokens,
+                &mut scratch.huffman_pool,
+                &mut small_header,
+            );
+            if small_bits + (small_header.bits_written() as u64)
+                < static_bits + (static_header.bits_written() as u64)
+            {
+                dc_tokens = dc_small;
+                meta_tokens = meta_small;
+                dc_code = code_small;
+                pruned_tree = Some(tree);
             }
         }
-        let (code_small, small_bits) =
-            build_code(&dc_small, &meta_small, tree.num_contexts, scratch);
-        let mut static_header = BitWriter::new();
-        write_context_tree(
-            dim.num_dc_groups,
-            &crate::frame::DC_PREDICTOR_WEIGHTED,
-            &mut scratch.huffman_pool,
-            &mut static_header,
-        );
-        let mut small_header = BitWriter::new();
-        crate::frame::write_tree_tokens(&tree.tokens, &mut scratch.huffman_pool, &mut small_header);
-        if small_bits + (small_header.bits_written() as u64)
-            < static_bits + (static_header.bits_written() as u64)
-        {
-            dc_tokens = dc_small;
-            meta_tokens = meta_small;
-            dc_code = code_small;
-            pruned_tree = Some(tree);
-        }
-    }
-    let dc_plan = DcPlan {
-        tree: pruned_tree,
-        dc: dc_tokens,
-        meta: meta_tokens,
-        code: dc_code,
+        let dc_plan = DcPlan {
+            tree: pruned_tree,
+            dc: dc_tokens,
+            meta: meta_tokens,
+            code: dc_code,
+            wp_params,
+        };
+        drop((dc_props, meta_props));
+        (dc_plan, learned_dc)
     };
-    drop((dc_props, meta_props));
+    // The default parameters against libjxl's second preset: picked on the
+    // static tree's Shannon bits or, at ExtraSlow, raced on the serialized
+    // sections.
+    let presets = &crate::weighted_predictor::WpParams::PRESETS;
+    let first = if effort.dc_wp_proxy_pick {
+        let mut bits = |params| crate::frame::dc_wp_proxy_bits(pool, scratch, &dc_datas, params);
+        if bits(presets[1]) < bits(presets[0]) {
+            presets[1]
+        } else {
+            presets[0]
+        }
+    } else {
+        presets[0]
+    };
+    let mut dc_candidates = vec![plan_dc(first, scratch)];
+    if effort.dc_wp_race {
+        dc_candidates.push(plan_dc(presets[1], scratch));
+    }
 
     let natural_scan = {
         let mut s = [[0u8; DCT_BLOCK_SIZE]; 3];
@@ -1322,23 +1374,34 @@ fn encode_jpeg_codestream_with_pool(
         bctx.write(scratch, w);
         write_color_correlation(w);
     }
-    let mut dc_sections = dc_plan.write_sections(&dc_global, &dc_datas, pool, scratch);
-    let learned_sections =
-        learned_dc.map(|plan| plan.write_sections(&dc_global, &dc_datas, pool, scratch));
+    let mut dc_section_candidates = Vec::with_capacity(2 * dc_candidates.len());
+    for (dc_plan, learned_dc) in dc_candidates {
+        dc_section_candidates.push(dc_plan.write_sections(&dc_global, &dc_datas, pool, scratch));
+        if let Some(plan) = learned_dc {
+            dc_section_candidates.push(plan.write_sections(&dc_global, &dc_datas, pool, scratch));
+        }
+    }
 
     let ac_groups = ac.write_groups(pool, scratch);
-    if let Some(candidate) = learned_sections {
-        let size = |dc: &[BitWriter]| {
-            let bits: Vec<usize> = dc
-                .iter()
-                .chain(std::iter::once(&ac.global))
-                .chain(&ac_groups)
-                .map(BitWriter::bits_written)
-                .collect();
-            combined_sections_size(&bits)
-        };
-        if size(&candidate) < size(&dc_sections) {
+    // The smallest serialized DC coding, padding and TOC included; ties keep
+    // the earlier (default-parameter, fixed-tree) candidate.
+    let size = |dc: &[BitWriter]| {
+        let bits: Vec<usize> = dc
+            .iter()
+            .chain(std::iter::once(&ac.global))
+            .chain(&ac_groups)
+            .map(BitWriter::bits_written)
+            .collect();
+        combined_sections_size(&bits)
+    };
+    let mut candidates = dc_section_candidates.into_iter();
+    let mut dc_sections = candidates.next().expect("default DC candidate");
+    let mut dc_size = size(&dc_sections);
+    for candidate in candidates {
+        let candidate_size = size(&candidate);
+        if candidate_size < dc_size {
             dc_sections = candidate;
+            dc_size = candidate_size;
         }
     }
     let mut sections = Vec::with_capacity(2 + dim.num_dc_groups + dim.num_groups);
@@ -1363,6 +1426,8 @@ struct DcPlan {
     dc: Vec<Vec<Token>>,
     meta: Vec<Vec<Token>>,
     code: crate::entropy::OwnedEntropyCode,
+    /// The DC streams' weighted-predictor parameters.
+    wp_params: crate::weighted_predictor::WpParams,
 }
 
 impl DcPlan {
@@ -1394,7 +1459,9 @@ impl DcPlan {
             let data = &dc_datas[i];
             let mut section = BitWriter::new();
             section.write(2, 0); // extra_dc_precision = 0
-            section.write(4, 3); // global tree, default weighted predictor, no transforms
+            section.write(1, 1); // global tree
+            crate::weighted_predictor::write_wp_header(self.wp_params, &mut section);
+            section.write(2, 0); // no transforms
             emit_tokens(&self.dc[i], &code, &mut section);
 
             let num_blocks = data.ac_strategy.xsize() * data.ac_strategy.ysize();
