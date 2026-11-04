@@ -29,6 +29,7 @@
 
 //! Modular XYB atlases and layered lossless frames.
 
+use super::LosslessSettings;
 use super::encoder::encode_frame_lossless_core;
 use super::header::{write_frame_header_modular_xyb_reference, write_toc_entry};
 use super::lz77::{
@@ -324,17 +325,14 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
     encode_frame_lossless_core(
         linear,
         Some(alpha),
-        13,
-        false,
-        3,
-        speed,
-        decoding_speed,
-        1,
-        false,
-        pool,
-        scratch,
+        LosslessSettings {
+            max_bits: 13,
+            ..LosslessSettings::rgb8(speed, decoding_speed)
+        },
         ModularFrameKind::XybBlend { last: true },
         true,
+        pool,
+        scratch,
         writer,
     )
 }
@@ -354,17 +352,11 @@ pub(crate) fn encode_frame_lossless_layer(
     encode_frame_lossless_core(
         linear,
         Some(alpha),
-        8,
-        false,
-        3,
-        speed,
-        decoding_speed,
-        1,
-        false,
-        pool,
-        scratch,
+        LosslessSettings::rgb8(speed, decoding_speed),
         kind,
         true,
+        pool,
+        scratch,
         writer,
     );
 }
@@ -427,21 +419,18 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
     encode_frame_lossless_core(
         &atlas,
         alpha,
-        14,
-        false,
-        3,
-        speed,
-        crate::DecodingSpeed::Slow,
-        1,
-        false,
-        pool,
-        scratch,
+        LosslessSettings {
+            max_bits: 14,
+            ..LosslessSettings::rgb8(speed, crate::DecodingSpeed::Slow)
+        },
         ModularFrameKind::XybReferenceOnly {
             width: xsize,
             height: ysize,
             slot,
         },
         false,
+        pool,
+        scratch,
         writer,
     );
     true

@@ -554,6 +554,11 @@ fn squeezed_error(
         .sum()
 }
 
+/// The lossy palette arm skips its exact coding when the order-0 estimate of
+/// its indices ([`crate::lossy_modular::palette_index_bits`]) is above this
+/// many times the squeeze's coded bits.
+const PALETTE_SCREEN: f64 = 4.0;
+
 /// The lossy palette arm: the fewest levels within part of the squeeze's
 /// weighted squared error ([`super::extra_levels`]), coded losslessly like an
 /// exact plane (palette, the learned plane tree, global tree), when that is
@@ -577,6 +582,11 @@ fn lossy_palette(
     let budget =
         super::extra_levels::LOSSY_PALETTE_ERROR * squeezed_error(plane, squeezed, &weights);
     let levels = super::extra_levels::fewest_levels(plane, &weights, budget)?;
+    let indices: Vec<i32> = (0..levels.len()).map(|i| levels.get_i32(i)).collect();
+    let estimate = crate::lossy_modular::palette_index_bits(&indices, dim.xsize, dim.ysize);
+    if estimate > PALETTE_SCREEN * squeezed_bits as f64 {
+        return None;
+    }
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
     let ans = !streams.code.use_prefix_code;
     let palette = extra_palette(&levels);

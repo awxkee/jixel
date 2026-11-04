@@ -52,6 +52,7 @@ pub(crate) struct EntropyCode<'a> {
 
 /// Owned entropy code: heap-allocated context_map and prefix_codes,
 /// suitable for runtime-built codes.
+#[derive(Clone)]
 pub(crate) struct OwnedEntropyCode {
     pub(crate) context_map: Vec<u8>,
     pub(crate) prefix_codes: Vec<PrefixCode>,

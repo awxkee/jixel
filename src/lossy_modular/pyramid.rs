@@ -51,10 +51,6 @@ use crate::squeeze::{
 };
 use crate::thread_pool::ThreadPool;
 
-/// Bound of a palette's divided entries: 12-bit values keep the frame's
-/// literal symbols below its LZ77 lengths.
-const META_MAX: u32 = 4096;
-
 fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -63,10 +59,10 @@ fn gcd(a: u32, b: u32) -> u32 {
 /// or three channels in the coded plane order, `extra` the extra channels
 /// with their squeeze distances (0 = lossless), all in units of `max`.
 pub(crate) struct PlainInput {
-    pub color: Vec<Vec<i32>>,
-    pub extra: Vec<(Vec<i32>, f32)>,
-    pub max: f32,
-    pub coding: CodingTransform,
+    pub(crate) color: Vec<Vec<i32>>,
+    pub(crate) extra: Vec<(Vec<i32>, f32)>,
+    pub(crate) max: f32,
+    pub(crate) coding: CodingTransform,
 }
 
 /// The arm's quantized state: divided channels, per-channel steps, and the
@@ -370,17 +366,14 @@ impl Pyramid {
         entries.sort_unstable();
         entries.dedup();
         // The entries are coded divided by their common step (257 for 8-bit
-        // levels on the 16-bit lattice) under a leaf multiplier; wider ones
-        // would overflow the frame's literal alphabet ([`min_symbol`]).
+        // levels on the 16-bit lattice) under a leaf multiplier. Deep levels
+        // (10- to 16-bit sources) have step 1: their 16-bit entries widen the
+        // frame's literal alphabet, which [`min_symbol`] sizes from them.
         let step = entries
             .iter()
             .fold(0u32, |g, &v| gcd(g, v.unsigned_abs()))
             .max(1);
-        if !(2..=256.min(p.group_dim())).contains(&entries.len())
-            || entries
-                .iter()
-                .any(|&v| v < 0 || v as u32 / step >= META_MAX)
-        {
+        if !(2..=256.min(p.group_dim())).contains(&entries.len()) || entries[0] < 0 {
             return None;
         }
         for v in &mut p.channels[c].data {

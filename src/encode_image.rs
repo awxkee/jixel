@@ -3343,14 +3343,16 @@ fn encode_lossless_planes(
     encode_frame_lossless(
         image3s,
         alpha_plane.as_ref(),
-        eff_bits,
-        config.progressive,
+        crate::lossless::LosslessSettings {
+            max_bits: eff_bits,
+            progressive: config.progressive,
+            num_color,
+            speed: config.speed,
+            decoding_speed: config.decoding_speed,
+            upsampling,
+            near_lossless: config.near_lossless > 0,
+        },
         config.patches,
-        num_color,
-        config.speed,
-        config.decoding_speed,
-        upsampling,
-        config.near_lossless > 0,
         config.num_threads,
         &mut w,
     );
@@ -3395,15 +3397,11 @@ fn encode_lossless_planes(
         crate::lossless::encode_frame_lossless_core(
             &layer,
             Some(&layer_alpha),
-            8,
-            false,
-            3,
-            config.speed,
-            config.decoding_speed,
-            plan.factor as u32,
-            config.near_lossless > 0,
-            &pool,
-            &mut scratch,
+            crate::lossless::LosslessSettings {
+                upsampling: plan.factor as u32,
+                near_lossless: config.near_lossless > 0,
+                ..crate::lossless::LosslessSettings::rgb8(config.speed, config.decoding_speed)
+            },
             crate::patches::ModularFrameKind::RgbBlendCrop {
                 x0: plan.x0,
                 y0: plan.y0,
@@ -3411,6 +3409,8 @@ fn encode_lossless_planes(
                 height: plan.height,
             },
             true,
+            &pool,
+            &mut scratch,
             &mut layered,
         );
         if layered.bits_written() < w.bits_written() {

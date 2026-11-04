@@ -282,10 +282,21 @@ fn plain_palette_keeps_the_extra_as_indices_behind_its_meta_channel() {
         assert_eq!(decoded, alpha);
         assert_eq!(plain.channels[c].data, alpha);
     }
-    // Entries too wide for the literal alphabet once divided stay unpaletted.
-    let wide: Vec<i32> = (0..64 * 48).map(|i| [1, 65535][i % 2]).collect();
-    let wide = input(CodingTransform::Rgb, 3, vec![(wide, 0.0)]);
-    assert!(Pyramid::plain_palette(&wide, 64, 48, 2.0, &pool).is_none());
+    // Deep levels (no common step) keep their 16-bit entries.
+    let deep: Vec<i32> = (0..64 * 48).map(|i| [0, 1, 40961, 65535][i % 4]).collect();
+    let source = input(CodingTransform::Rgb, 3, vec![(deep.clone(), 0.0)]);
+    let p = Pyramid::plain_palette(&source, 64, 48, 2.0, &pool).unwrap();
+    let c = p.palette.expect("palette");
+    assert_eq!(
+        (p.quants[0], p.channels[0].data.as_slice()),
+        (1, &[0, 1, 40961, 65535][..])
+    );
+    let decoded: Vec<i32> = p.channels[c + 1]
+        .data
+        .iter()
+        .map(|&k| p.channels[0].data[k as usize])
+        .collect();
+    assert_eq!(decoded, deep);
     // A lossy extra, or none, has no palette coding.
     let lossy = input(CodingTransform::Rgb, 3, vec![(alpha.clone(), 1.0)]);
     assert!(Pyramid::plain_palette(&lossy, 64, 48, 2.0, &pool).is_none());
