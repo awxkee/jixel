@@ -287,7 +287,10 @@ fn plain_palette_keeps_the_extra_as_indices_behind_its_meta_channel() {
     let source = input(CodingTransform::Rgb, 3, vec![(deep.clone(), 0.0)]);
     let p = Pyramid::plain_palette(&source, 64, 48, 2.0, &pool).unwrap();
     let c = p.palette.expect("palette");
-    assert_eq!((p.quants[0], p.channels[0].data.as_slice()), (1, &[0, 1, 40961, 65535][..]));
+    assert_eq!(
+        (p.quants[0], p.channels[0].data.as_slice()),
+        (1, &[0, 1, 40961, 65535][..])
+    );
     let decoded: Vec<i32> = p.channels[c + 1]
         .data
         .iter()

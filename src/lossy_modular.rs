@@ -37,7 +37,7 @@
 //! 2. [`pyramid`]: put the source planes on the frame's integer [`layout`]
 //!    (the XYB lattice, or the samples themselves through YCoCg), run the
 //!    forward Squeeze, and divide every channel by its [`quantize`] step.
-//!    At ExtraSlow, `polish` then revisits the XYB frame's luma residuals
+//!    At ExtraSlow, `polish` then revisits the XYB frame's luma and chroma residuals
 //!    against the exact SSIMULACRA2 and ColorVideoVDP arbiters.
 //! 3. [`fold`]: screen folding the pyramid's exact coarse tail back into
 //!    full-scale averages: the same decoded image, another entropy
