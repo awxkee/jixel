@@ -906,13 +906,13 @@ pub(super) fn encode_frame_core(
     // and tokens. Release the full-resolution planes before its working sets.
     drop(opsin_image);
 
-    let super::dc_entropy::DcEntropy {
-        tree: dc_tree,
-        dc: dc_tokens_per_group,
-        meta: meta_tokens_per_group,
-        code: mut dc_code_owned,
-        refinement: ans_refinement,
-    } = super::dc_entropy::prepare_dc_entropy(
+    // The DC streams' weighted-predictor parameters: libjxl presets raced on
+    // the complete DC coding (the MA-learned tree is learned once and
+    // re-tokenized under each), then the parameters fitted from the winning
+    // preset on a proxy and priced exactly once. Fast and Medium race the
+    // second preset only, MediumSlow and Slow also fit when it wins (a fit
+    // from the default never paid), ExtraSlow races all four and always fits.
+    let mut dc_entropy = super::dc_entropy::prepare_dc_entropy(
         ctx,
         scratch,
         &dc_datas,
@@ -920,7 +920,61 @@ pub(super) fn encode_frame_core(
         epf_sharpness,
         use_dc_frame,
         distance,
+        crate::weighted_predictor::WpParams::DEFAULT,
+        None,
     );
+    let wp_effort = ctx.speed.effort();
+    let wp_full = wp_effort.dc_wp_fit();
+    if (wp_full || wp_effort.dc_wp_race) && !use_dc_frame {
+        let mut best_bits = dc_entropy.bits(dim.num_dc_groups, scratch);
+        let mut offer = |params: crate::weighted_predictor::WpParams,
+                         dc_entropy: &mut super::dc_entropy::DcEntropy,
+                         scratch: &mut CoderScratch| {
+            let candidate = super::dc_entropy::prepare_dc_entropy(
+                ctx,
+                scratch,
+                &dc_datas,
+                dim.num_dc_groups,
+                epf_sharpness,
+                use_dc_frame,
+                distance,
+                params,
+                dc_entropy.ma_tree.as_ref(),
+            );
+            let bits = candidate.bits(dim.num_dc_groups, scratch);
+            if bits < best_bits {
+                best_bits = bits;
+                *dc_entropy = candidate;
+            }
+        };
+        let presets = &crate::weighted_predictor::WpParams::PRESETS;
+        for &params in if wp_full {
+            &presets[1..]
+        } else {
+            &presets[1..2]
+        } {
+            offer(params, &mut dc_entropy, scratch);
+        }
+        if wp_full
+            || (wp_effort.dc_wp_fit_on_win
+                && dc_entropy.wp_params != crate::weighted_predictor::WpParams::DEFAULT)
+        {
+            let fitted =
+                super::dc_entropy::fit_dc_wp_params(ctx, scratch, &dc_datas, dc_entropy.wp_params);
+            if fitted != dc_entropy.wp_params {
+                offer(fitted, &mut dc_entropy, scratch);
+            }
+        }
+    }
+    let super::dc_entropy::DcEntropy {
+        tree: dc_tree,
+        dc: dc_tokens_per_group,
+        meta: meta_tokens_per_group,
+        code: mut dc_code_owned,
+        refinement: ans_refinement,
+        wp_params: dc_wp_params,
+        ma_tree: _,
+    } = dc_entropy;
     let (mut dc_tree, mut dc_tokens_per_group, mut meta_tokens_per_group) =
         (dc_tree, dc_tokens_per_group, meta_tokens_per_group);
     // The extra channel's sections only touch the DC streams and the AC
@@ -1108,7 +1162,9 @@ pub(super) fn encode_frame_core(
             // With a DC frame, the group carries no DC stream.
             if !use_dc_frame {
                 w.write(2, 0); // extra_dc_precision
-                w.write(4, 3); // use global tree, default wp, no transforms
+                w.write(1, 1); // use_global_tree
+                crate::weighted_predictor::write_wp_header(dc_wp_params, &mut w);
+                w.write(2, 0); // no transforms
                 if dc_code.use_prefix_code {
                     for t in &dc_tokens_per_group[i] {
                         write_token(*t, &dc_code, &mut w);

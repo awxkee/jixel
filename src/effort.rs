@@ -89,6 +89,12 @@ effort_gates! {
     dc_rdoq,
     /// Per-image learned DC context tree raced against the static tree.
     dc_learned_tree,
+    /// The DC streams race the second libjxl weighted-predictor preset
+    /// exactly against the default (Fast and up).
+    dc_wp_race,
+    /// ... and fit the parameters by coordinate descent when it wins
+    /// (`dc_wp_fit` races every preset and always fits).
+    dc_wp_fit_on_win,
     /// Per-cluster hybrid-uint config selection.
     huc_select,
     /// Prefix-model AC context clustering (otherwise a coarse context merge).
@@ -254,17 +260,21 @@ effort_gates! {
     lz_optimal_parse,
     /// Ranking learns of every WP preset.
     tree_rank_deep,
+    /// The VarDCT DC streams race libjxl's four weighted-predictor presets
+    /// exactly, then fit the parameters from the winner by coordinate
+    /// descent on a proxy and price the fit exactly.
+    dc_wp_fit,
     /// Final RCT tree learns score more predictors on each side of a split.
     tree_wide_side_preds,
 }
 
-const ULTRAFAST: Effort = Effort {
+static ULTRAFAST: Effort = Effort {
     dc_learned_tree: true,
     ans_fast_refine: true,
     ..Effort::NONE
 };
 
-const FASTEST: Effort = Effort {
+static FASTEST: Effort = Effort {
     square_merges: true,
     merge_32: true,
     merge_busy_quads: true,
@@ -274,7 +284,7 @@ const FASTEST: Effort = Effort {
     ..ULTRAFAST
 };
 
-const FAST: Effort = Effort {
+static FAST: Effort = Effort {
     full_threads: true,
     square_merges: true,
     merge_32: true,
@@ -287,6 +297,7 @@ const FAST: Effort = Effort {
     cfl_ycbcr_rdo: true,
     dc_predictor_search: true,
     dc_learned_tree: true,
+    dc_wp_race: true,
     huc_select: true,
     ac_prefix_clustering: true,
     wide_clustering: true,
@@ -300,7 +311,7 @@ const FAST: Effort = Effort {
     ..Effort::NONE
 };
 
-const MEDIUM: Effort = Effort {
+static MEDIUM: Effort = Effort {
     layout_crossing: true,
     layout_crossing_axes: true,
     cfl_rdo: true,
@@ -309,6 +320,7 @@ const MEDIUM: Effort = Effort {
     chroma_policy: true,
     fine_mosaic: true,
     dc_rdoq: true,
+    dc_wp_race: true,
     chroma_dc_squeeze: true,
     dc_x_cfl: true,
     ink_layer_default: true,
@@ -327,7 +339,7 @@ const MEDIUM: Effort = Effort {
     ..FAST
 };
 
-const MEDIUM_SLOW: Effort = Effort {
+static MEDIUM_SLOW: Effort = Effort {
     layout_retile_32: false,
     vector_layers_default: false,
     ac_ctx_plan: false,
@@ -344,7 +356,7 @@ const MEDIUM_SLOW: Effort = Effort {
     ..SLOW
 };
 
-const SLOW: Effort = Effort {
+static SLOW: Effort = Effort {
     aq_closed_loop: false,
     coef_polish: false,
     lm_residual_polish: false,
@@ -358,12 +370,13 @@ const SLOW: Effort = Effort {
     lz_priced_search: false,
     lz_optimal_parse: false,
     tree_rank_deep: false,
+    dc_wp_fit: false,
     tree_wide_side_preds: false,
     ..Effort::ALL
 };
 
 #[cfg(feature = "extraslow")]
-const EXTRASLOW: Effort = Effort::ALL;
+static EXTRASLOW: Effort = Effort::ALL;
 
 impl Speed {
     pub(crate) const fn effort(self) -> &'static Effort {

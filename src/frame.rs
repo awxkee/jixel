@@ -34,6 +34,7 @@ mod ac_entropy;
 mod ac_groups;
 mod chroma;
 mod dc_entropy;
+pub(crate) use dc_entropy::dc_wp_proxy_bits;
 mod dc_groups;
 mod dc_rdo;
 mod dc_smoothing;
