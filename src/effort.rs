@@ -178,6 +178,8 @@ effort_gates! {
     lz_refined_entropy,
     predictor_search,
     rct_search,
+    /// RCT ranking covers all 42 rct_types (otherwise cjxl -e7's seven).
+    rct_all_types,
     /// RCT ranking scores every row (otherwise one row in `RCT_DENSE_ROW_STEP`).
     rct_every_row,
     /// RCT ranking scores one row in `RCT_DENSE_ROW_STEP` (otherwise one in

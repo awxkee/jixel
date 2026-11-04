@@ -54,7 +54,7 @@ use super::predictor::{
     GradPackInteriorFn, choose_predictors_with_wp, choose_wp_params, fixed_predictor,
     selected_grad_pack_interior_fn,
 };
-use super::rct::{rank_rcts, rct_planes};
+use super::rct::{rank_rcts, rct_candidates, rct_planes};
 use super::squeeze::{encode_squeeze_multigroup, encode_squeeze_single_group};
 use super::{GroupGrid, GroupLayout, LosslessSettings, constant_alpha_value, lossless_min_symbol};
 use crate::bit_writer::BitWriter;
@@ -542,6 +542,7 @@ impl<'a> ColorTransform<'a> {
                 frame.xsize,
                 frame.ysize,
                 row_step,
+                rct_candidates(effort.rct_all_types),
                 pool,
                 scratch,
             )
@@ -556,6 +557,19 @@ impl<'a> ColorTransform<'a> {
             planes: None,
             ranked,
         }
+    }
+
+    /// The best-ranked transform that is not a cost twin of the winner: a
+    /// permutation that only flips a channel's sign scores the same bits and
+    /// would waste the runner-up race.
+    pub(super) fn runner_up(&self) -> Option<(u32, f32)> {
+        const TWIN_TOLERANCE: f32 = 1e-4;
+        let (_, best) = *self.ranked.first()?;
+        self.ranked
+            .iter()
+            .skip(1)
+            .copied()
+            .find(|&(_, cost)| cost > best * (1.0 + TWIN_TOLERANCE))
     }
 
     /// The color planes under `rct_type`, built on first use.
