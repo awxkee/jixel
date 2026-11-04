@@ -227,6 +227,7 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
     // K uses the same Squeeze quantizer at every pass count. Its coarse
     // levels live in the global/LF streams and its AC levels in the last pass.
     ctx.extra_squeeze_distance = BLACK_DISTANCE_SCALE * distance;
+    ctx.extra_black = true;
     // Learned K trees use no weighted predictor, so only the tree-free
     // decoding tier rules them out. They add ~20% encode time, so the
     // fast encode tiers keep the fixed tree.

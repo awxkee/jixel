@@ -113,9 +113,8 @@ pub(crate) mod kit {
     pub(crate) use super::groups::{group_lz_threads, write_lz_groups};
     pub(crate) use super::header::{write_toc_entry, write_u64};
     pub(crate) use super::lz77::{
-        LZ77_MIN_SYMBOL, LzToken, LzTokenSource, build_lz_pixel_code, build_lz_pixel_code_ans,
-        build_lz_pixel_code_opts, lz77_compress_for_speed, lz77_literals, write_lz_section,
-        write_tree_lz77,
+        LZ77_MIN_SYMBOL, LzToken, LzTokenSource, build_lz_pixel_code_ans, lz77_compress_for_speed,
+        lz77_literals, write_lz_section, write_tree_lz77,
     };
     pub(crate) use super::ma_multiplier::{
         SAFE_PREDICTORS, emit_forest_bfs, scale_ma_value_props, tokenize_channel_ma_mult,

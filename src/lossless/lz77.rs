@@ -39,9 +39,7 @@ mod tests;
 mod window_tests;
 mod write;
 
-pub(crate) use entropy::{
-    build_lz_pixel_code, build_lz_pixel_code_ans, build_lz_pixel_code_opts, lz77_literals,
-};
+pub(crate) use entropy::{build_lz_pixel_code, build_lz_pixel_code_ans, lz77_literals};
 pub(super) use entropy::{
     build_lz_pixel_code_tails, estimate_coded_bits, estimate_literal_and_run_bits,
     estimate_literal_and_run_bits_single, estimate_streams_bits,
