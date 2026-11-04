@@ -394,22 +394,26 @@ pub(crate) fn prepare_dc_entropy(
 
             // Arm C (Slow): the DC side learned over the full modular property set
             // and every predictor, as the lossless path does.
-            let ma_arm = ctx
-                .speed
-                .effort()
-                .ma_dc_tree
-                .then(|| {
+            let ma_budget = if ctx.speed.effort().ma_dc_tree {
+                Some(MaDcBudget::FULL)
+            } else if ctx.speed.effort().ma_dc_tree_lite {
+                Some(MaDcBudget::LITE)
+            } else {
+                None
+            };
+            let ma_arm = ma_budget
+                .and_then(|budget| {
                     learn_ma_dc_arm(
-                        ctx,
+                        &ctx.thread_pool,
                         scratch,
                         dc_datas,
                         &meta_tokens_per_group,
                         &meta_props_per_group,
                         wp_params,
                         ma_tree,
+                        budget,
                     )
                 })
-                .flatten()
                 .and_then(|(variants, meta_tokens, num_contexts, tree)| {
                     learned_ma_tree = Some(tree);
                     variants
@@ -567,10 +571,10 @@ fn dc_planes(dc_datas: &[DcGroupData]) -> Vec<crate::lossless::DcPlanes> {
                     .map(|&v| i32::from(v))
                     .collect()
             };
+            let dims = |c: usize| (q.plane(c).xsize(), q.plane(c).ysize());
             crate::lossless::DcPlanes {
                 planes: [plane(1), plane(0), plane(2)],
-                w: q.xsize(),
-                h: q.ysize(),
+                dims: [dims(1), dims(0), dims(2)],
             }
         })
         .collect()
@@ -581,15 +585,48 @@ fn dc_planes(dc_datas: &[DcGroupData]) -> Vec<crate::lossless::DcPlanes> {
 /// metadata streams through the grafted tree. Returns the candidate
 /// (DC tokens, serialized tree) pairs — without and, when any leaf has one,
 /// with median leaf offsets — the metadata tokens and the context count.
+/// Learning budget of the MA-learned DC arm.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MaDcBudget {
+    /// DC-side sample budget; larger DC images are sampled with an odd stride.
+    pub(crate) target_samples: usize,
+    pub(crate) max_leaves: usize,
+    pub(crate) max_candidates: usize,
+    pub(crate) side_preds: usize,
+    /// Also price the tree with median leaf offsets.
+    pub(crate) offsets_variant: bool,
+}
+
+impl MaDcBudget {
+    pub(crate) const FULL: Self = Self {
+        target_samples: MA_DC_TARGET_SAMPLES,
+        max_leaves: MA_DC_MAX_LEAVES,
+        max_candidates: 32,
+        side_preds: 4,
+        offsets_variant: true,
+    };
+    /// A quarter of the samples, 64 leaves, 8 split candidates, one side
+    /// predictor, no offsets variant: three quarters of the full budget's
+    /// bytes on JPEG transcodes at a third of its time.
+    pub(crate) const LITE: Self = Self {
+        target_samples: 1 << 17,
+        max_leaves: 64,
+        max_candidates: 8,
+        side_preds: 1,
+        offsets_variant: false,
+    };
+}
+
 #[allow(clippy::type_complexity)]
-fn learn_ma_dc_arm(
-    ctx: &EncodingContext,
+pub(crate) fn learn_ma_dc_arm(
+    pool: &crate::thread_pool::ThreadPool,
     scratch: &mut CoderScratch,
     dc_datas: &[DcGroupData],
     meta_tokens: &[Vec<Token>],
     meta_props: &[Vec<crate::dc_tree::DcProp>],
     wp_params: WpParams,
     reuse_tree: Option<&crate::ma_tree::LearnedTree>,
+    budget: MaDcBudget,
 ) -> Option<(
     Vec<(Vec<Vec<Token>>, Vec<Token>)>,
     Vec<Vec<Token>>,
@@ -600,8 +637,8 @@ fn learn_ma_dc_arm(
     let tree = match reuse_tree {
         Some(tree) => tree.clone(),
         None => {
-            let total: usize = groups.iter().map(|g| 3 * g.w * g.h).sum();
-            let mut stride = total.div_ceil(MA_DC_TARGET_SAMPLES).max(1);
+            let total: usize = groups.iter().map(|g| g.len()).sum();
+            let mut stride = total.div_ceil(budget.target_samples).max(1);
             if stride > 1 && stride.is_multiple_of(2) {
                 stride += 1;
             }
@@ -619,17 +656,17 @@ fn learn_ma_dc_arm(
                 + 1;
             let params = crate::ma_tree::MaLearnParams {
                 alphabet,
-                max_leaves: MA_DC_MAX_LEAVES,
+                max_leaves: budget.max_leaves,
                 split_cost_bits: MA_DC_SPLIT_COST_BITS / stride as f32,
                 min_node: MA_DC_MIN_NODE_SAMPLES,
                 allow_wp: true,
                 allowed_preds: u16::MAX,
-                side_preds: 4,
-                max_candidates: 32,
+                side_preds: budget.side_preds,
+                max_candidates: budget.max_candidates,
                 modal_offsets: false,
                 prune_leaf_bits: 0.0,
             };
-            crate::ma_tree::learn_ma_tree(&samples, params, &ctx.thread_pool, scratch)
+            crate::ma_tree::learn_ma_tree(&samples, params, pool, scratch)
         }
     };
     let mut node_offsets = vec![0i32; tree.nodes.len()];
@@ -640,21 +677,12 @@ fn learn_ma_dc_arm(
         meta_tokens,
         meta_props,
     );
-    let mut dc_tokens = ctx
-        .thread_pool
-        .steal_map(scratch, groups.len(), |i, _scratch| {
-            let g = &groups[i];
-            let mut out = Vec::with_capacity(3 * g.w * g.h);
-            crate::lossless::tokenize_dc_planes(
-                g,
-                i,
-                &tree,
-                &grafted.leaf_ctx,
-                wp_params,
-                &mut out,
-            );
-            out
-        });
+    let mut dc_tokens = pool.steal_map(scratch, groups.len(), |i, _scratch| {
+        let g = &groups[i];
+        let mut out = Vec::with_capacity(g.len());
+        crate::lossless::tokenize_dc_planes(g, i, &tree, &grafted.leaf_ctx, wp_params, &mut out);
+        out
+    });
     // Residuals do not depend on the offset: center each leaf on its median
     // and re-serialize the tree with the offsets (context numbering is fixed
     // by the tree's shape). Offsets only pay through clustering, so both
@@ -663,7 +691,7 @@ fn learn_ma_dc_arm(
     let meta_context = std::mem::take(&mut grafted.meta_context);
     let mut variants = vec![(dc_tokens.clone(), grafted.tokens.clone())];
     let ctx_offsets = crate::dc_tree::median_leaf_offsets(&dc_tokens, num_contexts);
-    if ctx_offsets.iter().any(|&o| o != 0) {
+    if budget.offsets_variant && ctx_offsets.iter().any(|&o| o != 0) {
         for (node, &c) in grafted.leaf_ctx.iter().enumerate() {
             if c != u32::MAX {
                 node_offsets[node] = ctx_offsets[c as usize];

@@ -92,6 +92,9 @@ effort_gates! {
     /// The DC streams race the second libjxl weighted-predictor preset
     /// exactly against the default (Fast and up).
     dc_wp_race,
+    /// The MA-learned DC tree arm under its lite budget (`ma_dc_tree` runs
+    /// the full budget).
+    ma_dc_tree_lite,
     /// ... and fit the parameters by coordinate descent when it wins
     /// (`dc_wp_fit` races every preset and always fits).
     dc_wp_fit_on_win,
@@ -298,6 +301,7 @@ static FAST: Effort = Effort {
     dc_predictor_search: true,
     dc_learned_tree: true,
     dc_wp_race: true,
+    ma_dc_tree_lite: true,
     huc_select: true,
     ac_prefix_clustering: true,
     wide_clustering: true,

@@ -889,6 +889,9 @@ struct Effort {
     try_natural_order: bool,
     /// Race the fixed DC tree against a per-image learned tree.
     learned_dc_tree: bool,
+    /// ... and against the MA-learned DC tree (full property set, every
+    /// predictor) the VarDCT path races, under this learning budget.
+    ma_dc_tree: Option<crate::frame::MaDcBudget>,
     /// Race the default DC weighted-predictor parameters against libjxl's
     /// second preset on the serialized sections.
     dc_wp_race: bool,
@@ -908,6 +911,7 @@ impl Effort {
             Speed::UltraFast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                ma_dc_tree: None,
                 dc_wp_race: false,
                 dc_wp_proxy_pick: false,
                 optimized_ctx_map: false,
@@ -917,6 +921,7 @@ impl Effort {
             Speed::Fastest => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                ma_dc_tree: None,
                 dc_wp_race: false,
                 dc_wp_proxy_pick: false,
                 optimized_ctx_map: false,
@@ -926,6 +931,7 @@ impl Effort {
             Speed::Fast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                ma_dc_tree: Some(crate::frame::MaDcBudget::LITE),
                 dc_wp_race: false,
                 dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
@@ -935,6 +941,7 @@ impl Effort {
             Speed::Medium | Speed::MediumSlow => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
+                ma_dc_tree: Some(crate::frame::MaDcBudget::LITE),
                 dc_wp_race: false,
                 dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
@@ -944,6 +951,7 @@ impl Effort {
             Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
                 learned_dc_tree: true,
+                ma_dc_tree: Some(crate::frame::MaDcBudget::FULL),
                 dc_wp_race: speed == Speed::ExtraSlow,
                 dc_wp_proxy_pick: speed != Speed::ExtraSlow,
                 // About −0.24 % on large photos for ×1.7 encode time.
@@ -1065,7 +1073,8 @@ fn encode_jpeg_codestream_with_pool(
         // Fixed-tree tokens, with properties and gradient residuals only where
         // the pruned or learned tree needs them.
         let collected = pool.steal_map(scratch, dc_datas.len(), |i, _scratch| {
-            let collect_props = small_tree.is_some() || effort.learned_dc_tree;
+            let collect_props =
+                small_tree.is_some() || effort.learned_dc_tree || effort.ma_dc_tree.is_some();
             let (mut props, mut meta_props) = (Vec::new(), Vec::new());
             let (dc, gradient) = collect_dc_tokens_with_gradient(
                 &dc_datas[i],
@@ -1174,13 +1183,45 @@ fn encode_jpeg_codestream_with_pool(
                 .collect::<Vec<Vec<Token>>>();
             let (code, _) = build_code(&dc, &meta, tree.num_contexts, scratch);
             DcPlan {
-                tree: Some(tree),
+                tree_tokens: Some(tree.tokens),
                 dc,
                 meta,
                 code,
                 wp_params,
             }
         });
+        // The MA-learned tree over the full property set and every
+        // predictor, with and without median leaf offsets.
+        let ma_plans: Vec<DcPlan> = if let Some(budget) = effort.ma_dc_tree {
+            crate::frame::learn_ma_dc_arm(
+                pool,
+                scratch,
+                &dc_datas,
+                &meta_tokens,
+                &meta_props,
+                wp_params,
+                None,
+                budget,
+            )
+            .map(|(variants, meta, num_contexts, _tree)| {
+                variants
+                    .into_iter()
+                    .map(|(dc, tree_tokens)| {
+                        let (code, _) = build_code(&dc, &meta, num_contexts, scratch);
+                        DcPlan {
+                            tree_tokens: Some(tree_tokens),
+                            dc,
+                            meta: meta.clone(),
+                            code,
+                            wp_params,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         drop(gradient_tokens);
         let (mut dc_code, static_bits) =
             build_code(&dc_tokens, &meta_tokens, K_NUM_DC_CONTEXTS, scratch);
@@ -1229,14 +1270,17 @@ fn encode_jpeg_codestream_with_pool(
             }
         }
         let dc_plan = DcPlan {
-            tree: pruned_tree,
+            tree_tokens: pruned_tree.map(|tree| tree.tokens),
             dc: dc_tokens,
             meta: meta_tokens,
             code: dc_code,
             wp_params,
         };
         drop((dc_props, meta_props));
-        (dc_plan, learned_dc)
+        let mut plans = vec![dc_plan];
+        plans.extend(learned_dc);
+        plans.extend(ma_plans);
+        plans
     };
     // The default parameters against libjxl's second preset: picked on the
     // static tree's Shannon bits or, at ExtraSlow, raced on the serialized
@@ -1375,11 +1419,8 @@ fn encode_jpeg_codestream_with_pool(
         write_color_correlation(w);
     }
     let mut dc_section_candidates = Vec::with_capacity(2 * dc_candidates.len());
-    for (dc_plan, learned_dc) in dc_candidates {
-        dc_section_candidates.push(dc_plan.write_sections(&dc_global, &dc_datas, pool, scratch));
-        if let Some(plan) = learned_dc {
-            dc_section_candidates.push(plan.write_sections(&dc_global, &dc_datas, pool, scratch));
-        }
+    for plan in dc_candidates.into_iter().flatten() {
+        dc_section_candidates.push(plan.write_sections(&dc_global, &dc_datas, pool, scratch));
     }
 
     let ac_groups = ac.write_groups(pool, scratch);
@@ -1422,7 +1463,8 @@ fn encode_jpeg_codestream_with_pool(
 
 /// A complete DC tree and its entropy-coded DC/metadata streams.
 struct DcPlan {
-    tree: Option<crate::dc_tree::LearnedDcTree>,
+    /// The serialized learned tree, or none for the static tree.
+    tree_tokens: Option<Vec<Token>>,
     dc: Vec<Vec<Token>>,
     meta: Vec<Vec<Token>>,
     code: crate::entropy::OwnedEntropyCode,
@@ -1439,12 +1481,10 @@ impl DcPlan {
         scratch: &mut CoderScratch,
     ) -> Vec<BitWriter> {
         let mut global = common_global.clone();
-        match &self.tree {
-            Some(tree) => crate::frame::write_tree_tokens(
-                &tree.tokens,
-                &mut scratch.huffman_pool,
-                &mut global,
-            ),
+        match &self.tree_tokens {
+            Some(tokens) => {
+                crate::frame::write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut global)
+            }
             None => write_context_tree(
                 dc_datas.len(),
                 &crate::frame::DC_PREDICTOR_WEIGHTED,

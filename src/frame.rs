@@ -34,7 +34,7 @@ mod ac_entropy;
 mod ac_groups;
 mod chroma;
 mod dc_entropy;
-pub(crate) use dc_entropy::dc_wp_proxy_bits;
+pub(crate) use dc_entropy::{MaDcBudget, dc_wp_proxy_bits, learn_ma_dc_arm};
 mod dc_groups;
 mod dc_rdo;
 mod dc_smoothing;
