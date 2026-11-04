@@ -651,7 +651,11 @@ fn bias_quotients_for(numerator: f32) -> &'static [f32; BIAS_QUOTIENTS] {
     });
     // The explicit numerator is a constant's f16 round trip, so it is the
     // same on every call.
-    assert_eq!(*bits, numerator.to_bits(), "a third dequantization numerator");
+    assert_eq!(
+        *bits,
+        numerator.to_bits(),
+        "a third dequantization numerator"
+    );
     table
 }
 
@@ -2089,17 +2093,20 @@ pub(crate) fn write_ac_group(
                     let y_off = *y_off;
                     let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
                     let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
-                    for (c, inv_qm, q_scaled) in [(0usize, inv_qm_x, q_x), (2, inv_qm_b, q_b)] {
+                    for (c, q_scaled) in [(0usize, q_x), (2, q_b)] {
                         if hit[c] {
                             continue;
                         }
                         let bias = ctx.dequant_bias(c);
+                        // Dequantize through the forward matrix: no division.
+                        let qm = matrices.matrix_of(raw_strategy, c);
+                        let inv_q_scaled = 1.0 / q_scaled;
                         for i in 0..size {
                             let (v, u) = (i >> row_shift, i & column_mask);
                             recon_err[i] = if v < cy && u < cx {
                                 0.0
                             } else {
-                                bias.level(quantized[c][i]) / (inv_qm[i] * q_scaled) - coeffs[c][i]
+                                bias.level(quantized[c][i]) * (qm[i] * inv_q_scaled) - coeffs[c][i]
                             };
                         }
                         crate::inflated_cost::reconstruct_error(
@@ -2508,7 +2515,11 @@ mod tests {
                 }
                 for quant in [2.5f32, -7.25, 63.5, 1.5, -1.75, 1e9] {
                     let want = quant - numerator / black_box(quant);
-                    assert_eq!(bias.level_f32(quant).to_bits(), want.to_bits(), "q = {quant}");
+                    assert_eq!(
+                        bias.level_f32(quant).to_bits(),
+                        want.to_bits(),
+                        "q = {quant}"
+                    );
                 }
             }
         }

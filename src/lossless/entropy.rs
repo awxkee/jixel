@@ -62,11 +62,12 @@ pub(super) fn entropy_of_hist_scalar(hist: &[u64], total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    let t = total as f32;
+    // One reciprocal per histogram instead of a division per bin.
+    let inv_t = 1.0 / total as f32;
     let mut bits = 0.0;
     for &c in hist.iter() {
         if c != 0 {
-            let p = c as f32 / t;
+            let p = c as f32 * inv_t;
             bits -= c as f32 * dirty_log2f(p);
         }
     }

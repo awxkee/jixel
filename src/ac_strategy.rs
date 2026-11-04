@@ -1117,6 +1117,7 @@ fn luma_coefficient_error(
     crate::inflated_cost::recon_quantize_scalar::<true, false>(
         y,
         inverse_matrix_for(ctx, strategy, 1),
+        matrix_for(ctx, strategy, 1),
         qac,
         ctx.dequant_bias(1),
         &crate::group::quantize_ac_thresholds(1, cx, cy, distance),
@@ -1201,6 +1202,27 @@ fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[
         STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(channel)[..],
         STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(channel)[..],
         _ => &matrices.inv_matrix_16x8(channel)[..],
+    }
+}
+
+/// The forward matrix of [`inverse_matrix_for`] (same strategy mapping).
+#[inline]
+fn matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[f32] {
+    let matrices = ctx.matrices();
+    match strategy {
+        STRATEGY_DCT => &matrices.matrix(channel)[..],
+        STRATEGY_IDENTITY => &matrices.matrix_identity(channel)[..],
+        STRATEGY_DCT2X2 => &matrices.matrix_dct2x2(channel)[..],
+        STRATEGY_DCT4X4 => &matrices.matrix_4x4(channel)[..],
+        STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.matrix_4x8(channel)[..],
+        STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.matrix_afv(channel)[..],
+        STRATEGY_DCT16X16 => &matrices.matrix_16x16(channel)[..],
+        STRATEGY_DCT32X32 => &matrices.matrix_32x32(channel)[..],
+        STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.matrix_32x16(channel)[..],
+        STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.matrix_8x32(channel)[..],
+        STRATEGY_DCT64X64 => &matrices.matrix_64x64(channel)[..],
+        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.matrix_64x32(channel)[..],
+        _ => &matrices.matrix_16x8(channel)[..],
     }
 }
 
@@ -1405,6 +1427,11 @@ fn recon_input<'a>(
                 inverse_matrix_for(ctx, strategy, 0),
                 inverse_matrix_for(ctx, strategy, 1),
                 inverse_matrix_for(ctx, strategy, 2),
+            ],
+            matrices: [
+                matrix_for(ctx, strategy, 0),
+                matrix_for(ctx, strategy, 1),
+                matrix_for(ctx, strategy, 2),
             ],
             qac,
             qm_mult_x,

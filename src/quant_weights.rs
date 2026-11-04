@@ -3040,6 +3040,30 @@ impl DequantMatrices {
         }
     }
 
+    /// The forward (dequantization) matrix of [`Self::inv_matrix_of`].
+    pub(crate) fn matrix_of(&self, strategy: u8, c: usize) -> &[f32] {
+        use crate::dc_group_data::*;
+        match strategy {
+            STRATEGY_DCT => &self.matrix(c)[..],
+            STRATEGY_IDENTITY => &self.matrix_identity(c)[..],
+            STRATEGY_DCT2X2 => &self.matrix_dct2x2(c)[..],
+            STRATEGY_DCT4X4 => &self.matrix_4x4(c)[..],
+            STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &self.matrix_4x8(c)[..],
+            STRATEGY_AFV0..=STRATEGY_AFV3 => &self.matrix_afv(c)[..],
+            STRATEGY_DCT16X16 => &self.matrix_16x16(c)[..],
+            STRATEGY_DCT32X32 => &self.matrix_32x32(c)[..],
+            STRATEGY_DCT64X64 => &self.matrix_64x64(c)[..],
+            #[cfg(feature = "extraslow")]
+            STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
+                self.matrix_128(strategy, c)
+            }
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &self.matrix_64x32(c)[..],
+            STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &self.matrix_32x16(c)[..],
+            STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &self.matrix_8x32(c)[..],
+            _ => &self.matrix_16x8(c)[..],
+        }
+    }
+
     #[inline]
     pub(crate) fn inv_matrix_64x32(&self, c: usize) -> &[f32; 2048] {
         &self.inv_matrix_64x32[c]
@@ -3118,6 +3142,37 @@ fn fill_ac_reciprocals(matrix: &[f32], inv: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Kernels multiply by `matrix_of` where they used to divide by
+    /// `inv_matrix_of`: every AC entry must be the reciprocal partner.
+    #[test]
+    fn forward_matrices_pair_with_their_inverses() {
+        use crate::dc_group_data::NUM_STRATEGIES;
+        for distance in [0.5, 1.0, 3.0, 8.0] {
+            for m in [
+                DequantMatrices::new(distance, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new(distance, Arbiter::Ssimulacra2, true),
+                DequantMatrices::new_fast(distance, Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated(distance, Arbiter::Ssimulacra2, false),
+            ] {
+                for strategy in 0..NUM_STRATEGIES as u8 {
+                    for c in 0..3 {
+                        let (forward, inverse) =
+                            (m.matrix_of(strategy, c), m.inv_matrix_of(strategy, c));
+                        assert_eq!(forward.len(), inverse.len(), "strategy {strategy}");
+                        // Some tables are built from the inverse side, so
+                        // the pair can be an ulp apart; a wrong table is not.
+                        for (i, (&f, &v)) in forward.iter().zip(inverse).enumerate().skip(1) {
+                            assert!(
+                                (f * v - 1.0).abs() <= 4.0 * f32::EPSILON,
+                                "d{distance} strategy {strategy} c{c} [{i}]: {f} vs 1/{v}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn dct8x32_table_sits_at_parity_with_the_pair_table() {

@@ -209,10 +209,10 @@ fn step_scalar<const CROSS: bool, const UPDATE: bool>(
     let [mean, square, cross] = sums;
     let [out_mean, out_square, out_cross] = output;
     for x in 0..mean.len() {
-        out_mean[x] = mean[x] / 5.0;
-        out_square[x] = square[x] / 5.0;
+        out_mean[x] = mean[x] * 0.2;
+        out_square[x] = square[x] * 0.2;
         if CROSS {
-            out_cross[x] = cross[x] / 5.0;
+            out_cross[x] = cross[x] * 0.2;
         }
         if UPDATE {
             let (a, b) = (enter[0][x], leave[0][x]);
@@ -229,7 +229,7 @@ fn horizontal_scalar(src: &[f32], w: usize, dst: &mut [f32]) {
     for (row, dst) in src.chunks_exact(w).zip(dst.chunks_exact_mut(w)) {
         let mut sum: f32 = (-2..=2).map(|x| row[super::mirror(x, w)]).sum();
         for x in 0..w {
-            dst[x] = sum / 5.0;
+            dst[x] = sum * 0.2;
             if x + 1 < w {
                 sum +=
                     row[super::mirror(x as isize + 3, w)] - row[super::mirror(x as isize - 2, w)];
@@ -260,7 +260,7 @@ fn scalar_kernels() -> Kernels {
 #[allow(unused_macros)]
 macro_rules! moments {
     ($feature:literal, $lanes:literal, $load:ident, $store:ident, $splat:ident,
-     $add:ident, $sub:ident, $mul:ident, $div:ident, $horizontal:path) => {
+     $add:ident, $sub:ident, $mul:ident, $horizontal:path) => {
         #[target_feature(enable = $feature)]
         fn accumulate<const CROSS: bool>(src: [&[f32]; 2], sums: [&mut [f32]; 3]) {
             let n = sums[0].len();
@@ -297,17 +297,18 @@ macro_rules! moments {
         ) {
             let n = sums[0].len();
             let end = n / $lanes * $lanes;
-            let five = $splat(5.0);
+            // The box mean: multiply by 1/5 instead of dividing.
+            let fifth = $splat(0.2);
             unsafe {
                 for x in (0..end).step_by($lanes) {
                     let mean = $load(sums[0].as_ptr().add(x));
                     let square = $load(sums[1].as_ptr().add(x));
-                    $store(output[0].as_mut_ptr().add(x), $div(mean, five));
-                    $store(output[1].as_mut_ptr().add(x), $div(square, five));
+                    $store(output[0].as_mut_ptr().add(x), $mul(mean, fifth));
+                    $store(output[1].as_mut_ptr().add(x), $mul(square, fifth));
                     if CROSS {
                         $store(
                             output[2].as_mut_ptr().add(x),
-                            $div($load(sums[2].as_ptr().add(x)), five),
+                            $mul($load(sums[2].as_ptr().add(x)), fifth),
                         );
                     }
                     if UPDATE {
@@ -373,7 +374,7 @@ macro_rules! moments {
 // the four-row working set, including reflected edges and widths below a lane.
 #[allow(unused_macros)]
 macro_rules! horizontal {
-    ($feature:literal, $load:ident, $store:ident, $splat:ident, $add:ident, $sub:ident, $div:ident) => {
+    ($feature:literal, $load:ident, $store:ident, $splat:ident, $add:ident, $sub:ident, $mul:ident) => {
         #[target_feature(enable = $feature)]
         pub(super) fn horizontal(src: &[f32], w: usize, dst: &mut [f32]) {
             unsafe {
@@ -383,10 +384,10 @@ macro_rules! horizontal {
                 for x in -2..=2 {
                     sum = $add(sum, column(super::super::mirror(x, w)));
                 }
-                let five = $splat(5.0);
+                let fifth = $splat(0.2);
                 for x in 0..w {
                     let mut values = [0.0; 4];
-                    $store(values.as_mut_ptr(), $div(sum, five));
+                    $store(values.as_mut_ptr(), $mul(sum, fifth));
                     for r in 0..4 {
                         dst[r * w + x] = values[r];
                     }
@@ -421,7 +422,7 @@ mod sse {
         _mm_set1_ps,
         _mm_add_ps,
         _mm_sub_ps,
-        _mm_div_ps
+        _mm_mul_ps
     );
     #[cfg(feature = "sse")]
     moments!(
@@ -433,7 +434,6 @@ mod sse {
         _mm_add_ps,
         _mm_sub_ps,
         _mm_mul_ps,
-        _mm_div_ps,
         horizontal
     );
 }
@@ -450,7 +450,6 @@ mod avx {
         _mm256_add_ps,
         _mm256_sub_ps,
         _mm256_mul_ps,
-        _mm256_div_ps,
         super::sse::horizontal
     );
 }
@@ -465,7 +464,7 @@ mod neon {
         vdupq_n_f32,
         vaddq_f32,
         vsubq_f32,
-        vdivq_f32
+        vmulq_f32
     );
     moments!(
         "neon",
@@ -476,7 +475,6 @@ mod neon {
         vaddq_f32,
         vsubq_f32,
         vmulq_f32,
-        vdivq_f32,
         horizontal
     );
 }
@@ -499,7 +497,7 @@ mod wasm {
         f32x4_splat,
         f32x4_add,
         f32x4_sub,
-        f32x4_div
+        f32x4_mul
     );
     moments!(
         "simd128",
@@ -510,7 +508,6 @@ mod wasm {
         f32x4_add,
         f32x4_sub,
         f32x4_mul,
-        f32x4_div,
         horizontal
     );
 }
@@ -550,7 +547,7 @@ mod tests {
                 .map(|y| src[super::super::mirror(y, h) * w + x])
                 .sum();
             for y in 0..h {
-                tmp[y * w + x] = sum / 5.;
+                tmp[y * w + x] = sum * 0.2;
                 sum += src[super::super::mirror(y as isize + 3, h) * w + x]
                     - src[super::super::mirror(y as isize - 2, h) * w + x];
             }
@@ -559,7 +556,7 @@ mod tests {
             let row = &tmp[y * w..(y + 1) * w];
             let mut sum: f32 = (-2..=2).map(|x| row[super::super::mirror(x, w)]).sum();
             for x in 0..w {
-                dst[y * w + x] = sum / 5.;
+                dst[y * w + x] = sum * 0.2;
                 sum += row[super::super::mirror(x as isize + 3, w)]
                     - row[super::super::mirror(x as isize - 2, w)];
             }

@@ -375,6 +375,7 @@ fn recon_dist_and_rate_neon_impl<const BIASED: bool>(
 fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
+    matrix: &[f32],
     quant_scale: f32,
     bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
@@ -391,28 +392,31 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
     assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = vdupq_n_f32(quant_scale);
+    let inv_scale = vdupq_n_f32(1.0 / quant_scale);
     let zero = vdupq_n_f32(0.0);
     let all = vdupq_n_u32(u32::MAX);
     let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
     let mut nonzero_acc = vdupq_n_u32(0);
     let mut magnitude_bits = vdupq_n_f32(0.0);
     let mut scan_acc = vdupq_n_u32(0);
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
+        for (chunk_x, (((coeff4, inv4), matrix4), error4)) in coeff_row
             .as_chunks::<4>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<4>().0.iter())
+            .zip(matrix_row.as_chunks::<4>().0.iter())
             .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
             .enumerate()
         {
@@ -435,7 +439,12 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
             } else {
                 quantized
             };
-            let error = vdivq_f32(vsubq_f32(scaled, dequantized), denominator);
+            // Back to the coefficient domain by the forward matrix (no division).
+            let matrix_v = unsafe { vld1q_f32(matrix4.as_ptr()) };
+            let error = vmulq_f32(
+                vsubq_f32(scaled, dequantized),
+                vmulq_f32(matrix_v, inv_scale),
+            );
             let active = if y < cy && x < cx {
                 vcgeq_u32(
                     vaddq_u32(vdupq_n_u32(x as u32), lanes),
@@ -610,6 +619,7 @@ pub(crate) fn ssim_deficit_neon(orig: &[f32], recon: &[f32], width: usize, heigh
 fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
+    matrix: &[f32],
     quant_scale: f32,
     bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
@@ -626,28 +636,31 @@ fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
     assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = vdupq_n_f32(quant_scale);
+    let inv_scale = vdupq_n_f32(1.0 / quant_scale);
     let zero = vdupq_n_f32(0.0);
     let all = vdupq_n_u32(u32::MAX);
     let lanes = unsafe { vld1q_u32([0, 1, 2, 3].as_ptr()) };
     let mut nonzero = 0usize;
     let mut magnitude_bits = vdupq_n_f32(0.0);
     let mut scan_acc = vdupq_n_u32(0);
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff4, inv4), error4)) in coeff_row
+        for (chunk_x, (((coeff4, inv4), matrix4), error4)) in coeff_row
             .as_chunks::<4>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<4>().0.iter())
+            .zip(matrix_row.as_chunks::<4>().0.iter())
             .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
             .enumerate()
         {
@@ -670,7 +683,12 @@ fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             } else {
                 quantized
             };
-            let error = vdivq_f32(vsubq_f32(scaled, dequantized), denominator);
+            // Back to the coefficient domain by the forward matrix (no division).
+            let matrix_v = unsafe { vld1q_f32(matrix4.as_ptr()) };
+            let error = vmulq_f32(
+                vsubq_f32(scaled, dequantized),
+                vmulq_f32(matrix_v, inv_scale),
+            );
             let active = if y < cy && x < cx {
                 vcgeq_u32(
                     vaddq_u32(vdupq_n_u32(x as u32), lanes),
@@ -763,6 +781,7 @@ mod tests {
                     })
                     .collect();
                 let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
+                let forward: Vec<f32> = inv.iter().map(|v| 1.0 / v).collect();
                 let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
                 let thresholds = [0.0, 0.42, 0.57, 0.91];
                 for (original, optimized) in [
@@ -785,6 +804,7 @@ mod tests {
                         kernel(
                             &coeff,
                             &inv,
+                            &forward,
                             scale,
                             crate::group::DequantBias::DEFAULT[case % 3],
                             &thresholds,
@@ -855,6 +875,9 @@ mod tests {
             }
         }
         let inv_storage = [vec![1.0f32; 4096], vec![0.9f32; 4096], vec![1.1f32; 4096]];
+        let forward_storage = inv_storage
+            .clone()
+            .map(|m| m.iter().map(|v| 1.0 / v).collect::<Vec<f32>>());
         let idct = crate::dct::IdctMethods::scalar();
         for (strategy, cx, cy) in [
             (STRATEGY_DCT, 1, 1),
@@ -873,6 +896,11 @@ mod tests {
                 &inv_storage[1][..],
                 &inv_storage[2][..],
             ];
+            let forward = [
+                &forward_storage[0][..],
+                &forward_storage[1][..],
+                &forward_storage[2][..],
+            ];
             let input = ReconDistInput {
                 idct: &idct,
                 quantization: ReconQuantization {
@@ -880,6 +908,7 @@ mod tests {
                     rate_log2_lut: rate_log2_lut(),
                     coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                     inverse_matrices: inv,
+                    matrices: forward,
                     qac: 7.0,
                     qm_mult_x: 1.2,
                     qm_mult_b: 1.6,

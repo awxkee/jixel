@@ -87,8 +87,8 @@ pub(crate) fn entropy_of_hist_avx2(hist: &[u64], total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    let total_f = total as f32;
-    let t = _mm256_set1_ps(total_f);
+    // One reciprocal per histogram instead of a division per bin.
+    let t = _mm256_set1_ps(1.0 / total as f32);
     let mut bits = 0.0f32;
     let mut counts = hist.iter().copied().filter(|&c| c != 0);
     loop {
@@ -107,7 +107,7 @@ pub(crate) fn entropy_of_hist_avx2(hist: &[u64], total: u64) -> f32 {
             return bits;
         }
         let c = unsafe { _mm256_loadu_ps(floats.as_ptr()) };
-        let p = _mm256_div_ps(c, t);
+        let p = _mm256_mul_ps(c, t);
         let terms = _mm256_mul_ps(c, dirty_log2f_x8::<true>(p));
         let mut lanes = [0.0f32; 8];
         unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), terms) };

@@ -113,7 +113,9 @@ fn pixel(row: &FilterRow<'_>, x: usize) -> [f32; 3] {
             acc[c] += weight * n.pixels[c][x];
         }
     }
-    acc.map(|v| v / sum)
+    // One reciprocal shared by the three channels.
+    let inv_sum = 1.0 / sum;
+    acc.map(|v| v * inv_sum)
 }
 fn filter(row: FilterRow<'_>, out: [&mut [f32]; 3]) {
     for x in 0..out[0].len() {
@@ -259,8 +261,10 @@ macro_rules! backend {
                             acc[c] = $add(acc[c], $mul(weight, $load(n.pixels[c].as_ptr().add(x))));
                         }
                     }
+                    // One reciprocal shared by the three channels.
+                    let inv_sum = $div(one, sum);
                     for c in 0..3 {
-                        $store(out[c].as_mut_ptr().add(x), $div(acc[c], sum));
+                        $store(out[c].as_mut_ptr().add(x), $mul(acc[c], inv_sum));
                     }
                 }
             }
