@@ -36,9 +36,7 @@ use super::lz77::{
     ConstantTail, build_lz_pixel_code_tails, estimate_coded_bits, write_lz_section_tail,
     write_tree_lz77,
 };
-use super::ma_local::{
-    LOCAL_TREE_MAX_BITS_PER_VALUE, LOCAL_TREE_MIN_GLOBAL_LEAVES, write_local_tree_sections,
-};
+use super::ma_local::{LOCAL_TREE_MAX_BITS_PER_VALUE, write_local_tree_sections};
 use super::ma_lookup::MaLookup;
 use super::ma_sampling::tokenize_channel_ma;
 use super::ma_source::{
@@ -362,9 +360,9 @@ pub(super) fn write_learned_tree_frame(
         best.expect("learned-tree sections")
     });
 
-    // Local per-group trees (libjxl's streaming layout) compete on size.
+    // Local per-group trees (libjxl's streaming layout) compete on size,
+    // whole frame or group by group.
     let local_gate = local_trees
-        && cand.num_ctx as usize >= LOCAL_TREE_MIN_GLOBAL_LEAVES
         && cand.est_real <= LOCAL_TREE_MAX_BITS_PER_VALUE * source.total_values() as f64;
     if !has_global_stream
         && local_gate
@@ -384,10 +382,31 @@ pub(super) fn write_learned_tree_frame(
             scratch,
         )
     {
+        debug_assert_eq!(local.len(), sections.len());
         let global_bits: usize = sections.iter().map(BitWriter::bits_written).sum();
         let local_bits: usize = local.iter().map(BitWriter::bits_written).sum();
-        if local_bits < global_bits {
-            sections = local;
+        // Hybrid: the global tree and histograms stay in the DC-global
+        // section; each AC group section is self-contained either way
+        // (its own use_global_tree bit), so it takes the smaller one.
+        let first_ac = 2 + num_dc_groups;
+        let hybrid_bits = global_bits
+            - (first_ac..sections.len())
+                .map(|i| {
+                    sections[i]
+                        .bits_written()
+                        .saturating_sub(local[i].bits_written())
+                })
+                .sum::<usize>();
+        if local_bits <= hybrid_bits {
+            if local_bits < global_bits {
+                sections = local;
+            }
+        } else if hybrid_bits < global_bits {
+            for (i, section) in local.into_iter().enumerate().skip(first_ac) {
+                if section.bits_written() < sections[i].bits_written() {
+                    sections[i] = section;
+                }
+            }
         }
     }
 
