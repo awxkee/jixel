@@ -618,12 +618,51 @@ pub(crate) static DEFAULT_QUANT_BIASES: [f32; 4] = [
 pub(crate) static EXPLICIT_QUANT_BIASES: [f32; 4] =
     [1.0 - 0.054_650_075, 1.0 - 0.070_054_5, 1.0, 0.145];
 
+/// Levels below this magnitude read `numerator / |q|` from a table instead of
+/// dividing; the tables hold the same correctly rounded quotients.
+const BIAS_QUOTIENTS: usize = 64;
+
+/// `numerator / q` for `q` in `2..BIAS_QUOTIENTS` (entries 0 and 1 unused).
+const fn bias_quotients(numerator: f32) -> [f32; BIAS_QUOTIENTS] {
+    let mut table = [0.0; BIAS_QUOTIENTS];
+    let mut q = 2;
+    while q < BIAS_QUOTIENTS {
+        table[q] = numerator / q as f32;
+        q += 1;
+    }
+    table
+}
+
+static DEFAULT_BIAS_QUOTIENTS: [f32; BIAS_QUOTIENTS] = bias_quotients(DEFAULT_QUANT_BIASES[3]);
+
+/// The tables of a numerator: the default one's is built at compile time, the
+/// explicit bundle's f16 numerator gets its own on first use.
+fn bias_quotients_for(numerator: f32) -> &'static [f32; BIAS_QUOTIENTS] {
+    if numerator.to_bits() == DEFAULT_QUANT_BIASES[3].to_bits() {
+        return &DEFAULT_BIAS_QUOTIENTS;
+    }
+    static EXPLICIT: std::sync::OnceLock<(u32, [f32; BIAS_QUOTIENTS])> = std::sync::OnceLock::new();
+    let (bits, table) = EXPLICIT.get_or_init(|| {
+        let mut table = [0.0; BIAS_QUOTIENTS];
+        for (q, t) in table.iter_mut().enumerate().skip(2) {
+            *t = numerator / q as f32;
+        }
+        (numerator.to_bits(), table)
+    });
+    // The explicit numerator is a constant's f16 round trip, so it is the
+    // same on every call.
+    assert_eq!(*bits, numerator.to_bits(), "a third dequantization numerator");
+    table
+}
+
 /// The decoder's dequantization of one channel's integer AC levels
 /// (libjxl `AdjustQuantBias`): `±one` at |q| = 1, `q - numerator / q` above.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DequantBias {
     pub(crate) one: f32,
     pub(crate) numerator: f32,
+    /// [`bias_quotients`] of `numerator`.
+    quotients: &'static [f32; BIAS_QUOTIENTS],
 }
 
 impl DequantBias {
@@ -637,6 +676,7 @@ impl DequantBias {
         Self {
             one,
             numerator: DEFAULT_QUANT_BIASES[3],
+            quotients: &DEFAULT_BIAS_QUOTIENTS,
         }
     }
 
@@ -648,9 +688,11 @@ impl DequantBias {
         }
         let f16 = |v: f32| crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(v));
         let numerator = f16(EXPLICIT_QUANT_BIASES[3]);
+        let quotients = bias_quotients_for(numerator);
         std::array::from_fn(|c| DequantBias {
             one: f16(EXPLICIT_QUANT_BIASES[c]),
             numerator,
+            quotients,
         })
     }
 
@@ -666,14 +708,21 @@ impl DequantBias {
                 self.one.copysign(quant)
             }
         } else {
-            quant - self.numerator / quant
+            let a = aq as usize;
+            if a < BIAS_QUOTIENTS && a as f32 == aq {
+                // numerator / -a is exactly -(numerator / a).
+                let t = self.quotients[a];
+                quant - if quant < 0.0 { -t } else { t }
+            } else {
+                quant - self.numerator / quant
+            }
         }
     }
 
     #[inline]
     pub(crate) fn level(self, quant: i32) -> f32 {
-        let aq = quant.unsigned_abs() as f32;
-        if aq < 1.125 {
+        let a = quant.unsigned_abs();
+        if a <= 1 {
             if quant == 0 {
                 0.0
             } else if quant > 0 {
@@ -683,7 +732,13 @@ impl DequantBias {
             }
         } else {
             let q = quant as f32;
-            q - self.numerator / q
+            if (a as usize) < BIAS_QUOTIENTS {
+                // numerator / -a is exactly -(numerator / a).
+                let t = self.quotients[a as usize];
+                q - if quant < 0 { -t } else { t }
+            } else {
+                q - self.numerator / q
+            }
         }
     }
 }
@@ -1888,7 +1943,12 @@ pub(crate) fn write_ac_group(
                         );
                     }
                 }
+                // Every transform spans a power-of-two number of blocks, so a
+                // coefficient index splits into (row, column) by shift and mask.
                 let row_stride = cx * 8;
+                debug_assert!(row_stride.is_power_of_two());
+                let row_shift = row_stride.trailing_zeros();
+                let column_mask = row_stride - 1;
 
                 // Keep the fractional source for the DC predictor check. Y DC
                 // and these B lowest frequencies are unchanged by AC reranking.
@@ -1993,8 +2053,8 @@ pub(crate) fn write_ac_group(
                     let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
                     let bias_x = ctx.dequant_bias(0);
                     for i in 0..size {
-                        let v = i / row_stride;
-                        let u = i % row_stride;
+                        let v = i >> row_shift;
+                        let u = i & column_mask;
                         if v < cy && u < cx {
                             continue;
                         }
@@ -2007,8 +2067,8 @@ pub(crate) fn write_ac_group(
                     let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
                     let bias_b = ctx.dequant_bias(2);
                     for i in 0..size {
-                        let v = i / row_stride;
-                        let u = i % row_stride;
+                        let v = i >> row_shift;
+                        let u = i & column_mask;
                         if v < cy && u < cx {
                             continue;
                         }
@@ -2035,7 +2095,7 @@ pub(crate) fn write_ac_group(
                         }
                         let bias = ctx.dequant_bias(c);
                         for i in 0..size {
-                            let (v, u) = (i / row_stride, i % row_stride);
+                            let (v, u) = (i >> row_shift, i & column_mask);
                             recon_err[i] = if v < cy && u < cx {
                                 0.0
                             } else {
@@ -2428,6 +2488,32 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 
 #[cfg(test)]
 mod tests {
+    /// The quotient tables must reproduce the division bit for bit.
+    #[test]
+    fn dequant_bias_tables_match_the_division() {
+        use super::DequantBias;
+        use std::hint::black_box;
+        for explicit in [false, true] {
+            for bias in DequantBias::channels(explicit) {
+                let numerator = black_box(bias.numerator);
+                for quant in -300i32..=300 {
+                    let want = match quant.unsigned_abs() {
+                        0 => 0.0,
+                        1 => bias.one.copysign(quant as f32),
+                        _ => quant as f32 - numerator / black_box(quant as f32),
+                    };
+                    assert_eq!(bias.level(quant).to_bits(), want.to_bits(), "q = {quant}");
+                    let level = bias.level_f32(quant as f32);
+                    assert_eq!(level.to_bits(), want.to_bits(), "q = {quant} (f32)");
+                }
+                for quant in [2.5f32, -7.25, 63.5, 1.5, -1.75, 1e9] {
+                    let want = quant - numerator / black_box(quant);
+                    assert_eq!(bias.level_f32(quant).to_bits(), want.to_bits(), "q = {quant}");
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "extraslow")]
     #[test]
     fn block_memo_compaction_preserves_all_streams_and_snapshot_rollback() {

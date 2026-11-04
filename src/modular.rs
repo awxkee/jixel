@@ -287,6 +287,7 @@ fn write_lattice_section(
         AlphaPlane::F32(_) => unreachable!(),
     };
     let step_i = step as i32;
+    let divider = crate::fast_divide::DividerI32::new(step_i);
     let residue = max.rem_euclid(step_i);
     let log = step.trailing_zeros();
     let bits = (step >> log) - 1;
@@ -324,7 +325,7 @@ fn write_lattice_section(
                 _ => (0, gradient(at(1, 0), at(0, 1), at(1, 1))),
             };
             debug_assert_eq!((v - pred).rem_euclid(step_i), 0, "value off the lattice");
-            tokens.push(Token::new(context, pack_signed((v - pred) / step_i)));
+            tokens.push(Token::new(context, pack_signed((v - pred) / divider)));
         }
     }
 
