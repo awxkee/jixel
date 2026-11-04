@@ -171,7 +171,10 @@ pub(crate) fn encode_plain_frame(
         return race::encode(pyramid, speed, pool, scratch, writer);
     };
     let palette_bits = palette_index_bits(&levels, xsize, ysize);
-    if palette_bits >= PALETTE_RATE_MARGIN * squeezed_extra_bits(&pyramid, input.color.len()) {
+    let take =
+        palette_bits < PALETTE_RATE_MARGIN * squeezed_extra_bits(&pyramid, input.color.len());
+    let tiled = repeated_share(&input.extra[0].0, xsize) > TILED_SHARE;
+    if !take && !tiled {
         return race::encode(pyramid, speed, pool, scratch, writer);
     }
     let levels = PlainInput {
@@ -184,7 +187,72 @@ pub(crate) fn encode_plain_frame(
         return race::encode(pyramid, speed, pool, scratch, writer);
     };
     palette.group_shift = pyramid.group_shift;
-    race::encode(palette, speed, pool, scratch, writer)
+    if !tiled {
+        return race::encode(palette, speed, pool, scratch, writer);
+    }
+    let mut squeezed = writer.clone();
+    let squeezed_bits = race::encode(pyramid, speed, pool, scratch, &mut squeezed);
+    let palette_bits = race::encode(palette, speed, pool, scratch, writer);
+    if squeezed.bits_written() < writer.bits_written() {
+        *writer = squeezed;
+        return squeezed_bits;
+    }
+    palette_bits
+}
+
+/// Tiled alpha races both codings exactly instead: LZ77 copies its repeats,
+/// which neither order-0 estimate sees, so either coding can win by 2-4x (a
+/// tiled background at 8 to 16 bits, both ways). Over 18 deep and 18 8-bit
+/// RGBA images the tile's [`repeated_share`] is 0.79-0.93 and the next 0.71;
+/// a race taken in vain only costs time.
+const TILED_SHARE: f64 = 0.75;
+
+/// Share of the plane's samples in non-constant 16-sample windows (raster
+/// order) that LZ77 could copy from more than two rows back in runs of at
+/// least 128. Nearer repeats (a straight edge continuing) and short ones
+/// (antialiased edges alike) are the estimates' contexts' to see.
+fn repeated_share(plane: &[i32], xsize: usize) -> f64 {
+    const WINDOW: usize = 16;
+    const MIN_RUN: usize = 128;
+    const HASH_BITS: u32 = 18;
+    let hash = |w: &[i32]| {
+        let h = w.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &v| {
+            (h ^ u64::from(v as u32)).wrapping_mul(0x0100_0000_01b3)
+        });
+        (h >> (64 - HASH_BITS)) as usize
+    };
+    let mut last = vec![u32::MAX; 1 << HASH_BITS];
+    let (mut varied, mut repeated) = (0usize, 0usize);
+    let mut i = 0;
+    while i + WINDOW <= plane.len() {
+        let w = &plane[i..i + WINDOW];
+        if w.iter().all(|&v| v == w[0]) {
+            i += 1;
+            continue;
+        }
+        let h = hash(w);
+        let j = last[h] as usize;
+        last[h] = i as u32;
+        if j < i && plane[j..j + WINDOW] == *w {
+            let mut run = WINDOW;
+            while i + run < plane.len() && plane[j + run] == plane[i + run] {
+                run += 1;
+            }
+            varied += run;
+            if run >= MIN_RUN && i - j > 2 * xsize {
+                repeated += run;
+            }
+            i += run;
+        } else {
+            varied += 1;
+            i += 1;
+        }
+    }
+    if varied == 0 {
+        0.0
+    } else {
+        repeated as f64 / varied as f64
+    }
 }
 
 /// The palette is taken while its estimated index bits stay under this many
@@ -279,7 +347,7 @@ fn squeezed_extra_bits(p: &Pyramid, num_color: usize) -> f64 {
 
 /// Estimated bits of the palette indices of `levels`: each index against
 /// its left neighbour under W == N / N == NW contexts.
-fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> f64 {
+pub(crate) fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> f64 {
     let mut entries = levels.to_vec();
     entries.sort_unstable();
     entries.dedup();

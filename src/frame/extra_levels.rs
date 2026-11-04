@@ -40,8 +40,13 @@
 
 use crate::encode_image::AlphaPlane;
 
-/// Most distinct nonzero values the program runs over (O(values² · levels)).
+/// Most distinct nonzero values the exhaustive program runs over
+/// (O(values² · levels)); deeper planes take the divide-and-conquer one
+/// (O(values · log values · levels)).
 const MAX_VALUES: usize = 256;
+
+/// Most nonzero levels of a deep plane: its palette holds 256 entries.
+const MAX_DEEP_LEVELS: usize = 255;
 
 /// Share of the squeeze's weighted squared error the lossy palette may
 /// spend. Equal error is not equal quality: at 1.0 levels still band text
@@ -132,15 +137,49 @@ impl Sums {
     }
 }
 
+/// One more cell for ends `lo..=hi` of a deep plane: the least error of
+/// `vals[..=j]` with the last cell starting in `first..=last` (its earliest
+/// start is `k`, one value per earlier cell), recursing on the middle end's
+/// best start.
+#[allow(clippy::too_many_arguments)]
+fn split_points(
+    sums: &Sums,
+    cost: &[f64],
+    k: usize,
+    lo: usize,
+    hi: usize,
+    first: usize,
+    last: usize,
+    next: &mut [f64],
+    start: &mut [u16],
+) {
+    let j = (lo + hi) / 2;
+    let mut best = (f64::INFINITY, first);
+    for i in first.max(k)..=last.min(j) {
+        let c = cost[i - 1] + sums.cell(i, j).1;
+        if c < best.0 {
+            best = (c, i);
+        }
+    }
+    (next[j], start[j]) = (best.0, best.1 as u16);
+    if lo < j {
+        split_points(sums, cost, k, lo, j - 1, first, best.1, next, start);
+    }
+    if j < hi {
+        split_points(sums, cost, k, j + 1, hi, best.1, last, next, start);
+    }
+}
+
 fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// The plane with the fewest levels whose squared error, weighted by
-/// `weights`, is at most `budget`, or None when the plane is not integer, has
-/// too many distinct values, or needs every one of them. The levels stay on
-/// the values' own grid (their greatest common divisor), so a plane scaled
-/// onto a wider lattice keeps a divisible palette.
+/// `weights`, is at most `budget`, or None when the plane is not integer,
+/// needs every one of its values, or (deep planes) more than
+/// `MAX_DEEP_LEVELS` levels. The levels stay on the values' own grid (their
+/// greatest common divisor), so a plane scaled onto a wider lattice keeps a
+/// divisible palette.
 pub(crate) fn fewest_levels(
     plane: &AlphaPlane,
     weights: &[f32],
@@ -160,7 +199,8 @@ pub(crate) fn fewest_levels(
         .map(|v| (v, hist[v as usize]))
         .unzip();
     let m = vals.len();
-    if !(2..=MAX_VALUES).contains(&m) {
+    let deep = m > MAX_VALUES;
+    if m < 2 || m > usize::from(u16::MAX) {
         return None;
     }
     let sums = Sums::new(&vals, &counts, max);
@@ -169,18 +209,22 @@ pub(crate) fn fewest_levels(
     let mut cost: Vec<f64> = (0..m).map(|j| sums.cell(0, j).1).collect();
     let mut starts: Vec<Vec<u16>> = vec![vec![0; m]];
     while cost[m - 1] > budget {
-        if starts.len() + 1 >= m {
+        if starts.len() + 1 >= m || (deep && starts.len() >= MAX_DEEP_LEVELS) {
             return None;
         }
         let k = starts.len();
         let mut next = vec![f64::INFINITY; m];
         let mut start = vec![0u16; m];
-        for j in k..m {
-            for i in k..=j {
-                let c = cost[i - 1] + sums.cell(i, j).1;
-                if c < next[j] {
-                    next[j] = c;
-                    start[j] = i as u16;
+        if deep {
+            split_points(&sums, &cost, k, k, m - 1, k, m - 1, &mut next, &mut start);
+        } else {
+            for j in k..m {
+                for i in k..=j {
+                    let c = cost[i - 1] + sums.cell(i, j).1;
+                    if c < next[j] {
+                        next[j] = c;
+                        start[j] = i as u16;
+                    }
                 }
             }
         }
@@ -295,6 +339,75 @@ mod tests {
                 None => assert_eq!(want, vals.len()),
             }
         }
+    }
+
+    /// Fewest cells by the exhaustive program, at any number of values.
+    fn exhaustive(vals: &[u32], counts: &[f64], max: u32, budget: f64) -> usize {
+        let sums = Sums::new(vals, counts, max);
+        let m = vals.len();
+        let mut cost: Vec<f64> = (0..m).map(|j| sums.cell(0, j).1).collect();
+        let mut k = 1;
+        while cost[m - 1] > budget {
+            let mut next = vec![f64::INFINITY; m];
+            for j in k..m {
+                for i in k..=j {
+                    next[j] = next[j].min(cost[i - 1] + sums.cell(i, j).1);
+                }
+            }
+            cost = next;
+            k += 1;
+        }
+        k
+    }
+
+    #[test]
+    fn deep_levels_match_the_exhaustive_program() {
+        let mut seed = 0x9e3779b9u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for bits in [10, 12, 16] {
+            let max = (1u32 << bits) - 1;
+            let n = 6000;
+            // Mostly empty or full, antialiased edges in between.
+            let data: Vec<u16> = (0..n)
+                .map(|_| match rnd() % 4 {
+                    0 => 0,
+                    1 => max as u16,
+                    _ => (rnd() % max + 1) as u16,
+                })
+                .collect();
+            let plane = AlphaPlane::U16 {
+                data: data.clone(),
+                bits,
+            };
+            let weights: Vec<f32> = (0..n).map(|_| 1.0 + (rnd() % 3) as f32).collect();
+            let mut hist = vec![0f64; max as usize + 1];
+            for (&v, &w) in data.iter().zip(&weights) {
+                hist[v as usize] += f64::from(w);
+            }
+            let (vals, counts): (Vec<u32>, Vec<f64>) = (1..=max)
+                .filter(|&v| hist[v as usize] > 0.0)
+                .map(|v| (v, hist[v as usize]))
+                .unzip();
+            assert!(vals.len() > MAX_VALUES, "a deep plane");
+            for share in [1e-2, 1e-3, 1e-4] {
+                let budget = sums_error(&vals, &counts, max) * share;
+                let q = fewest_levels(&plane, &weights, budget).expect("quantized");
+                assert!(sse(&plane, &q, &weights) <= budget * (1.0 + 1e-9));
+                let zeros = data.iter().filter(|&&v| v == 0).count();
+                assert_eq!(zeros, (0..q.len()).filter(|&i| q.get_i32(i) == 0).count());
+                assert_eq!(levels(&q), exhaustive(&vals, &counts, max, budget) + 1);
+            }
+        }
+    }
+
+    /// Squared error of one cell over every value.
+    fn sums_error(vals: &[u32], counts: &[f64], max: u32) -> f64 {
+        Sums::new(vals, counts, max).cell(0, vals.len() - 1).1
     }
 
     #[test]

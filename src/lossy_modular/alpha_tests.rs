@@ -257,3 +257,32 @@ fn global_ac_forest_covers_every_ac_sample() {
     assert_eq!(coded, ac_px);
     assert!(!forest.tree_tokens.is_empty());
 }
+
+#[test]
+fn repeated_share_marks_tiled_alpha_only() {
+    use super::{TILED_SHARE, repeated_share};
+    let (w, h) = (400, 400);
+    // An antialiased ring per 40x40 tile, repeated over the plane.
+    let ring = |x: usize, y: usize| {
+        let (dx, dy) = (x as f32 - 19.5, y as f32 - 19.5);
+        let r = (dx * dx + dy * dy).sqrt();
+        ((1.0 - (r - 12.0).abs() / 4.0).clamp(0.0, 1.0) * 65535.0) as i32
+    };
+    let tiled: Vec<i32> = (0..w * h).map(|i| ring(i % w % 40, i / w % 40)).collect();
+    assert!(repeated_share(&tiled, w) > TILED_SHARE);
+    // One large soft ring fading downwards: its rows never recur (an exactly
+    // mirrored shape repeats its rows, which LZ77 copies too).
+    let single: Vec<i32> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let (dx, dy) = (x as f32 - 199.5, y as f32 - 199.5);
+            let r = (dx * dx + dy * dy).sqrt();
+            let fade = 1.0 - y as f32 / (2 * h) as f32;
+            ((1.0 - (r - 120.0).abs() / 40.0).clamp(0.0, 1.0) * fade * 65535.0) as i32
+        })
+        .collect();
+    assert!(repeated_share(&single, w) < 0.1);
+    // A straight vertical ramp repeats only from the row above.
+    let ramp: Vec<i32> = (0..w * h).map(|i| (i % w * 163) as i32).collect();
+    assert!(repeated_share(&ramp, w) < 0.1);
+}

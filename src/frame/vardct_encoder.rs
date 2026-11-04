@@ -923,132 +923,151 @@ pub(super) fn encode_frame_core(
     );
     let (mut dc_tree, mut dc_tokens_per_group, mut meta_tokens_per_group) =
         (dc_tree, dc_tokens_per_group, meta_tokens_per_group);
-    let extra = alpha.map(|plane| {
-        prepare_extra_sections(
-            ctx,
-            plane,
-            &dim,
-            &group_coords,
-            num_passes - 1,
-            extra_tree::GlobalStreams {
-                tree: &mut dc_tree,
-                code: &mut dc_code_owned,
-                dc: &mut dc_tokens_per_group,
-                meta: &mut meta_tokens_per_group,
-                dc_written: !use_dc_frame,
-                refinement: ans_refinement,
+    // The extra channel's sections only touch the DC streams and the AC
+    // entropy plan never reads them, so the two run side by side (on its own
+    // scratch); the extra channel's trees are a serial phase on small images.
+    let mut extra_scratch = CoderScratch::default();
+    let (extra, (ac_plan, ac_code_per_pass, raced_ac_sections, coeff_orders, all_pending)) =
+        ctx.thread_pool.join(
+            || {
+                alpha.map(|plane| {
+                    prepare_extra_sections(
+                        ctx,
+                        plane,
+                        &dim,
+                        &group_coords,
+                        num_passes - 1,
+                        extra_tree::GlobalStreams {
+                            tree: &mut dc_tree,
+                            code: &mut dc_code_owned,
+                            dc: &mut dc_tokens_per_group,
+                            meta: &mut meta_tokens_per_group,
+                            dc_written: !use_dc_frame,
+                            refinement: ans_refinement,
+                        },
+                        &mut extra_scratch,
+                    )
+                })
             },
-            scratch,
-        )
-    });
-    let dc_code = dc_code_owned.as_ref();
-
-    // Separate scan arms before context planning: each gets its own final
-    // context map, hybrid-uint configuration, clustering and ANS refinement.
-    let mut alternative_pending: Vec<Vec<PendingAcGroup>> = (0..order_alternatives.len())
-        .map(|_| Vec::with_capacity(all_pending.len()))
-        .collect();
-    for p in &mut all_pending {
-        for (tokens, arm) in p.tokens.drain(num_passes..).zip(&mut alternative_pending) {
-            arm.push(PendingAcGroup {
-                group_idx: p.group_idx,
-                tokens: vec![tokens],
-            });
-        }
-    }
-    let mut raced_ac_sections = None;
-    let (ac_plan, ac_code_per_pass) = if order_alternatives.is_empty() {
-        finalize_ac_entropy(
-            ctx,
-            scratch,
-            &mut all_pending,
-            num_passes,
-            qf_threshold,
-            ans_refinement,
-        )
-    } else {
-        let used_tables = used_quant_table_slots(&dc_datas);
-        let mut arms: Vec<OrderArm> = Vec::with_capacity(1 + order_alternatives.len());
-        // Stage 1: every arm gets its context plan, hybrid-uint configurations,
-        // clustering and the Slow refinement, then serializes.
-        for (orders, mut pending) in std::iter::once((coeff_orders, all_pending))
-            .chain(order_alternatives.into_iter().zip(alternative_pending))
-        {
-            let (plan, codes) = finalize_ac_entropy(
-                ctx,
-                scratch,
-                &mut pending,
-                num_passes,
-                qf_threshold,
-                ans_refinement.map(|_| crate::entropy::AnsRefinement::Slow),
-            );
-            let (bits, global, streams) = encode_order_arm(
-                ctx,
-                scratch,
-                &pending,
-                &plan,
-                &codes,
-                &orders,
-                &used_tables,
-                dim.num_groups,
-                dim.num_dc_groups,
-            );
-            arms.push(OrderArm {
-                orders,
-                pending,
-                plan,
-                codes,
-                bits,
-                global,
-                streams,
-            });
-        }
-        // Stage 2: the exhaustive table search moves every arm by nearly the
-        // same amount, so only arms within reach of the leader buy it.
-        let leader = arms.iter().map(|arm| arm.bits).min().unwrap_or(0);
-        let reach = leader + (leader as f64 * ORDER_RACE_REFINE_MARGIN) as usize;
-        if matches!(
-            ans_refinement,
-            Some(crate::entropy::AnsRefinement::ExtraSlow)
-        ) {
-            for arm in arms.iter_mut().filter(|arm| arm.bits <= reach) {
-                for (pass, code) in arm.codes.iter_mut().enumerate() {
-                    crate::entropy::refine_ans_entropy_exhaustive(
-                        code,
-                        arm.pending.iter().map(|p| p.tokens[pass].as_slice()),
-                        &ctx.thread_pool,
-                        scratch,
-                    );
+            || {
+                let mut raced_ac_sections = None;
+                // Separate scan arms before context planning: each gets its own final
+                // context map, hybrid-uint configuration, clustering and ANS refinement.
+                let mut alternative_pending: Vec<Vec<PendingAcGroup>> = (0..order_alternatives
+                    .len())
+                    .map(|_| Vec::with_capacity(all_pending.len()))
+                    .collect();
+                for p in &mut all_pending {
+                    for (tokens, arm) in p.tokens.drain(num_passes..).zip(&mut alternative_pending)
+                    {
+                        arm.push(PendingAcGroup {
+                            group_idx: p.group_idx,
+                            tokens: vec![tokens],
+                        });
+                    }
                 }
-                (arm.bits, arm.global, arm.streams) = encode_order_arm(
-                    ctx,
-                    scratch,
-                    &arm.pending,
-                    &arm.plan,
-                    &arm.codes,
-                    &arm.orders,
-                    &used_tables,
-                    dim.num_groups,
-                    dim.num_dc_groups,
-                );
-            }
-        }
-        // Prefer natural on ties, otherwise retain the incumbent.
-        let mut best = 0;
-        for (i, arm) in arms.iter().enumerate().skip(1) {
-            if arm.bits < arms[best].bits
-                || (arm.bits == arms[best].bits && arm.orders.used_mask == 0)
-            {
-                best = i;
-            }
-        }
-        let winner = arms.swap_remove(best);
-        coeff_orders = winner.orders;
-        all_pending = winner.pending;
-        // Retain the winning serialized sections; do not encode them again.
-        raced_ac_sections = Some((winner.global, winner.streams));
-        (winner.plan, winner.codes)
-    };
+                let (ac_plan, ac_code_per_pass) = if order_alternatives.is_empty() {
+                    finalize_ac_entropy(
+                        ctx,
+                        scratch,
+                        &mut all_pending,
+                        num_passes,
+                        qf_threshold,
+                        ans_refinement,
+                    )
+                } else {
+                    let used_tables = used_quant_table_slots(&dc_datas);
+                    let mut arms: Vec<OrderArm> = Vec::with_capacity(1 + order_alternatives.len());
+                    // Stage 1: every arm gets its context plan, hybrid-uint configurations,
+                    // clustering and the Slow refinement, then serializes.
+                    for (orders, mut pending) in std::iter::once((coeff_orders, all_pending))
+                        .chain(order_alternatives.into_iter().zip(alternative_pending))
+                    {
+                        let (plan, codes) = finalize_ac_entropy(
+                            ctx,
+                            scratch,
+                            &mut pending,
+                            num_passes,
+                            qf_threshold,
+                            ans_refinement.map(|_| crate::entropy::AnsRefinement::Slow),
+                        );
+                        let (bits, global, streams) = encode_order_arm(
+                            ctx,
+                            scratch,
+                            &pending,
+                            &plan,
+                            &codes,
+                            &orders,
+                            &used_tables,
+                            dim.num_groups,
+                            dim.num_dc_groups,
+                        );
+                        arms.push(OrderArm {
+                            orders,
+                            pending,
+                            plan,
+                            codes,
+                            bits,
+                            global,
+                            streams,
+                        });
+                    }
+                    // Stage 2: the exhaustive table search moves every arm by nearly the
+                    // same amount, so only arms within reach of the leader buy it.
+                    let leader = arms.iter().map(|arm| arm.bits).min().unwrap_or(0);
+                    let reach = leader + (leader as f64 * ORDER_RACE_REFINE_MARGIN) as usize;
+                    if matches!(
+                        ans_refinement,
+                        Some(crate::entropy::AnsRefinement::ExtraSlow)
+                    ) {
+                        for arm in arms.iter_mut().filter(|arm| arm.bits <= reach) {
+                            for (pass, code) in arm.codes.iter_mut().enumerate() {
+                                crate::entropy::refine_ans_entropy_exhaustive(
+                                    code,
+                                    arm.pending.iter().map(|p| p.tokens[pass].as_slice()),
+                                    &ctx.thread_pool,
+                                    scratch,
+                                );
+                            }
+                            (arm.bits, arm.global, arm.streams) = encode_order_arm(
+                                ctx,
+                                scratch,
+                                &arm.pending,
+                                &arm.plan,
+                                &arm.codes,
+                                &arm.orders,
+                                &used_tables,
+                                dim.num_groups,
+                                dim.num_dc_groups,
+                            );
+                        }
+                    }
+                    // Prefer natural on ties, otherwise retain the incumbent.
+                    let mut best = 0;
+                    for (i, arm) in arms.iter().enumerate().skip(1) {
+                        if arm.bits < arms[best].bits
+                            || (arm.bits == arms[best].bits && arm.orders.used_mask == 0)
+                        {
+                            best = i;
+                        }
+                    }
+                    let winner = arms.swap_remove(best);
+                    coeff_orders = winner.orders;
+                    all_pending = winner.pending;
+                    // Retain the winning serialized sections; do not encode them again.
+                    raced_ac_sections = Some((winner.global, winner.streams));
+                    (winner.plan, winner.codes)
+                };
+                (
+                    ac_plan,
+                    ac_code_per_pass,
+                    raced_ac_sections,
+                    coeff_orders,
+                    all_pending,
+                )
+            },
+        );
+    let dc_code = dc_code_owned.as_ref();
 
     // Write DC global with adaptive DC code.
     if let VarDctFrameKind::Patched(references) = frame_kind {
