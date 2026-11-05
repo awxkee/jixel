@@ -145,7 +145,7 @@ static CELL_COORDS: [[u16; SIDE * SIDE + 1]; SIDE + 1] = {
     while width <= SIDE {
         let mut cell = 0;
         while cell <= SIDE * SIDE {
-            coords[width][cell] = ((cell / width) << 8 | cell % width) as u16;
+            coords[width][cell] = (((cell / width) << 8) | (cell % width)) as u16;
             cell += 1;
         }
         width += 1;

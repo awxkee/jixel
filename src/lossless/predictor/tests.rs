@@ -266,8 +266,10 @@ fn palette_flat_spans_preserve_cost_histograms() {
 
 #[test]
 fn gradient_simd_matches_scalar_at_chunk_boundaries() {
-    let mut kernels: Vec<(&str, GradPackInteriorFn)> = Vec::new();
-    kernels.push(("selected", selected_grad_pack_interior_fn()));
+    // Only x86 builds push SIMD kernels after the portable one.
+    #[allow(unused_mut)]
+    let mut kernels: Vec<(&str, GradPackInteriorFn)> =
+        vec![("selected", selected_grad_pack_interior_fn())];
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if is_x86_feature_detected!("avx2") {
         kernels.push(("avx2", |c, p, o, g| unsafe {

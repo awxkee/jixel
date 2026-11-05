@@ -62,6 +62,7 @@ use crate::encode_image::AlphaPlane;
 use crate::encoding_context::{EncodingContext, FrameRole};
 use crate::entropy::write_token;
 use crate::image::Image3F;
+use crate::noise::GrainPass;
 use crate::patches::VarDctFrameKind;
 use crate::util::EncodeError;
 
@@ -136,6 +137,11 @@ fn edge_view(
     crate::splines::EdgeView { weight, replaced }
 }
 
+/// Encode one VarDCT frame. `Grain::Auto` on a displayed frame first codes
+/// the frame plainly and reads the measured grain's survival off that
+/// reconstruction: when the quantizer keeps the grain the plain coding is
+/// kept as well, otherwise the frame is coded again denoised with the
+/// decoder's grain replacing what was lost.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_frame_core(
     ctx: &EncodingContext,
@@ -147,8 +153,90 @@ pub(super) fn encode_frame_core(
     frame_kind: VarDctFrameKind<'_>,
     #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
     #[cfg(feature = "splines")] allow_edge_splines: bool,
+    grain_pass: GrainPass,
     writer: &mut BitWriter,
 ) -> Result<usize, EncodeError> {
+    let displayed = matches!(
+        frame_kind,
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+    );
+    if matches!(grain_pass, GrainPass::Inherit)
+        && ctx.grain == crate::Grain::Auto
+        && displayed
+        && let Some((measured, stats)) = crate::noise::auto_candidate(&opsin, ctx)
+    {
+        let original = opsin.clone();
+        let mut probe = BitWriter::new();
+        let (bits, survival) = encode_frame_core_inner(
+            ctx,
+            scratch,
+            distance,
+            opsin,
+            alpha,
+            coeff_shifts,
+            frame_kind,
+            #[cfg(feature = "splines")]
+            splines,
+            #[cfg(feature = "splines")]
+            allow_edge_splines,
+            GrainPass::Probe(stats.clone()),
+            &mut probe,
+        )?;
+        let survival = survival.unwrap_or(1.0);
+        let weight = crate::noise::grain_weight(survival);
+        if weight <= 0.0 {
+            writer.append(&probe);
+            return Ok(bits);
+        }
+        drop(probe);
+        return encode_frame_core_inner(
+            ctx,
+            scratch,
+            distance,
+            original,
+            alpha,
+            coeff_shifts,
+            frame_kind,
+            #[cfg(feature = "splines")]
+            splines,
+            #[cfg(feature = "splines")]
+            allow_edge_splines,
+            GrainPass::Apply(measured, stats, weight),
+            writer,
+        )
+        .map(|(bits, _)| bits);
+    }
+    encode_frame_core_inner(
+        ctx,
+        scratch,
+        distance,
+        opsin,
+        alpha,
+        coeff_shifts,
+        frame_kind,
+        #[cfg(feature = "splines")]
+        splines,
+        #[cfg(feature = "splines")]
+        allow_edge_splines,
+        grain_pass,
+        writer,
+    )
+    .map(|(bits, _)| bits)
+}
+
+fn encode_frame_core_inner(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    opsin: Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    frame_kind: VarDctFrameKind<'_>,
+    #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
+    #[cfg(feature = "splines")] allow_edge_splines: bool,
+    grain_pass: GrainPass,
+    writer: &mut BitWriter,
+) -> Result<(usize, Option<f32>), EncodeError> {
     #[cfg(feature = "extraslow")]
     let _b_qm_scale = RestoreBQmScale(ctx, ctx.b_qm_scale());
     let num_threads = ctx.thread_pool.num_threads();
@@ -156,13 +244,24 @@ pub(super) fn encode_frame_core(
     // Grain is measured on the source XYB before any frame processing; only
     // displayed frames carry it (an atlas frame's header has no flags).
     let mut opsin = opsin;
-    let noise = if matches!(
+    let displayed = matches!(
         frame_kind,
         VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
-    ) {
-        crate::noise::NoiseParams::resolve(ctx.grain, ctx, scratch, distance, &mut opsin)
-    } else {
-        None
+    );
+    let probe_stats = match &grain_pass {
+        GrainPass::Probe(stats) | GrainPass::Apply(_, stats, _) => Some(stats),
+        _ => None,
+    };
+    let mut noise = match &grain_pass {
+        GrainPass::Off | GrainPass::Probe(_) => None,
+        GrainPass::Apply(measured, _, weight) if displayed => {
+            crate::noise::apply_measured(ctx, scratch, distance, &mut opsin, *measured, *weight)
+        }
+        GrainPass::Apply(..) => None,
+        GrainPass::Inherit if displayed => {
+            crate::noise::NoiseParams::resolve(ctx.grain, ctx, scratch, distance, &mut opsin)
+        }
+        GrainPass::Inherit => None,
     };
     let mut distp = compute_distance_params(distance);
     if ctx.coding.is_xyb() {
@@ -335,13 +434,14 @@ pub(super) fn encode_frame_core(
         && ctx.coding.is_xyb()
         && matches!(frame_kind, VarDctFrameKind::Regular)
         && ctx.frame_role == FrameRole::Last
-        && noise.is_none()
         && !use_dc_frame
         && num_passes == 1
         && (0.5..=24.0).contains(&distance)
         && dim.xsize >= 16
         && dim.ysize >= 16;
-    let mut epf_recon = fit_epf.then(|| Image3F::new(dim.xsize, dim.ysize));
+    // The grain probe reads its survival off the same reconstruction.
+    let want_recon = fit_epf || (probe_stats.is_some() && !use_dc_frame && num_passes == 1);
+    let mut epf_recon = want_recon.then(|| Image3F::new(dim.xsize, dim.ysize));
 
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
@@ -387,10 +487,10 @@ pub(super) fn encode_frame_core(
                 None,
                 &natural_orders,
                 &[],
-                want_order_stats || use_dc_frame || fit_epf,
+                want_order_stats || use_dc_frame || want_recon,
                 qf_threshold,
                 // Without custom orders this pass is the final quantization.
-                fit_epf && !want_order_stats,
+                want_recon && !want_order_stats,
                 None,
             );
             (
@@ -438,7 +538,7 @@ pub(super) fn encode_frame_core(
     // Other DC tools key on the source planes, so only a copy outlives the
     // first pass when nothing else asked for them.
     let mut epf_source_dc = None;
-    if fit_epf && !want_order_stats && !use_dc_frame {
+    if want_recon && !want_order_stats && !use_dc_frame {
         epf_source_dc = Some(assemble_source_dc(&dc_datas, &group_coords, &dim));
         for dc in &mut dc_datas {
             dc.source_dc_b = None;
@@ -520,7 +620,7 @@ pub(super) fn encode_frame_core(
             );
         }
         if !ctx.speed.effort().chroma_dc_squeeze && !use_dc_frame {
-            if fit_epf && epf_source_dc.is_none() {
+            if want_recon && epf_source_dc.is_none() {
                 epf_source_dc = Some(assemble_source_dc(&dc_datas, &group_coords, &dim));
             }
             for dc in &mut dc_datas {
@@ -723,7 +823,7 @@ pub(super) fn encode_frame_core(
                         &order_alternatives,
                         false,
                         qf_threshold,
-                        fit_epf,
+                        want_recon,
                         None,
                     );
                     ((dc_idx, gx, gy, p, local), capture.map(|(image, _)| image))
@@ -833,6 +933,7 @@ pub(super) fn encode_frame_core(
             ctx.dc_rows.reconstruct,
         )?;
     let mut epf_sharpness = epf_sharpness_id(distance, ctx.screen_content());
+    let mut survival = None;
     if let Some(mut recon) = epf_recon {
         let decoded_dc = dc_smoothing::decoded_dc(
             &dim,
@@ -855,16 +956,6 @@ pub(super) fn encode_frame_core(
             &dc_datas,
             &group_coords,
         );
-        let source = distp
-            .gab_enabled
-            .then(|| crate::epf_filter::gaborish(opsin));
-        // Source pixel decisions are complete. The EPF proxy needs only Y;
-        // release X/B before allocating its pyramid and candidate output.
-        // A Gaborish source also replaces the original source altogether.
-        let source = source.unwrap_or_else(|| opsin_image.take().unwrap());
-        drop(opsin_image.take());
-        let [source_x, source_y, source_b] = source.into_planes();
-        drop((source_x, source_b));
         if distp.gab_enabled {
             crate::epf_filter::gaborish_in_place(&mut recon);
         }
@@ -875,32 +966,63 @@ pub(super) fn encode_frame_core(
             dim.ysize_blocks,
             distp.global_scale,
         );
-        #[cfg(feature = "splines")]
-        // Splines are drawn after the filter: the fit sees them as a layer.
-        let spline_layer =
-            splines.map(|set| crate::splines::additive_y(ctx, set, dim.xsize, dim.ysize));
-        let chosen = crate::epf_filter::fit(
-            ctx,
-            scratch,
-            &source_y,
+        if fit_epf {
+            let source = distp
+                .gab_enabled
+                .then(|| crate::epf_filter::gaborish(opsin));
+            // Source pixel decisions are complete. The EPF proxy needs only Y;
+            // release X/B before allocating its pyramid and candidate output.
+            // A Gaborish source also replaces the original source altogether.
+            let source = source.unwrap_or_else(|| opsin_image.take().unwrap());
+            drop(opsin_image.take());
+            let [source_x, source_y, source_b] = source.into_planes();
+            drop((source_x, source_b));
             #[cfg(feature = "splines")]
-            spline_layer.as_deref(),
-            #[cfg(not(feature = "splines"))]
-            None,
-            &recon,
-            &blocks,
-            distance,
-            crate::epf_filter::Choice {
-                iters: distp.epf_iters,
-                quant_mul: distp.epf_quant_mul,
-                pass0: distp.epf_pass0_scale,
-                sharpness: epf_sharpness,
-            },
-        );
-        distp.epf_iters = chosen.iters;
-        distp.epf_pass0_scale = chosen.pass0;
-        distp.epf_quant_mul = chosen.quant_mul;
-        epf_sharpness = chosen.sharpness;
+            // Splines are drawn after the filter: the fit sees them as a layer.
+            let spline_layer =
+                splines.map(|set| crate::splines::additive_y(ctx, set, dim.xsize, dim.ysize));
+            let chosen = crate::epf_filter::fit(
+                ctx,
+                scratch,
+                &source_y,
+                #[cfg(feature = "splines")]
+                spline_layer.as_deref(),
+                #[cfg(not(feature = "splines"))]
+                None,
+                &recon,
+                &blocks,
+                distance,
+                crate::epf_filter::Choice {
+                    iters: distp.epf_iters,
+                    quant_mul: distp.epf_quant_mul,
+                    pass0: distp.epf_pass0_scale,
+                    sharpness: epf_sharpness,
+                },
+            );
+            distp.epf_iters = chosen.iters;
+            distp.epf_pass0_scale = chosen.pass0;
+            distp.epf_quant_mul = chosen.quant_mul;
+            epf_sharpness = chosen.sharpness;
+        }
+        if let Some(stats) = probe_stats {
+            // Survival as the decoder shows it: after this frame's EPF.
+            let lf = crate::epf_filter::LoopFilter::new(
+                distp.epf_iters,
+                distp.epf_pass0_scale,
+                distp.epf_quant_mul,
+                ctx.epf_channel_scale,
+            );
+            let mut epf = crate::epf_filter::Epf::new(&ctx.thread_pool, &recon, &blocks);
+            let filtered = epf.apply(&ctx.thread_pool, scratch, &lf, epf_sharpness);
+            let s = stats.survival(filtered, ctx.noise_kernels);
+            survival = Some(s.overall);
+            if let (GrainPass::Apply(_, _, weight), Some(params)) = (&grain_pass, noise.as_mut()) {
+                params.fill_gap(&s, *weight);
+                if !params.has_any() {
+                    noise = None;
+                }
+            }
+        }
     }
     // Pixel-domain decisions are finished; entropy coding only reads DC data
     // and tokens. Release the full-resolution planes before its working sets.
@@ -1386,5 +1508,5 @@ pub(super) fn encode_frame_core(
         order.as_deref().map(|o| (o, &mut scratch.huffman_pool)),
         writer,
     );
-    Ok(payload_bits)
+    Ok((payload_bits, survival))
 }

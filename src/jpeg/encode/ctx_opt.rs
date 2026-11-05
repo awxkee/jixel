@@ -168,32 +168,6 @@ impl Stats {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fine_cell_keys_round_trip_with_unit_and_uneven_axes() {
-        for sizes in [[1, 1, 1], [16, 32, 16], [3, 5, 7], [1, 7, 3], [5, 1, 1]] {
-            let stats = Stats {
-                axes: sizes.map(|n| Axis {
-                    lo: vec![0; n],
-                    lut: Vec::new(),
-                }),
-                key_dividers: sizes.map(|n| DividerU64::new(n as u64)),
-                key_start: Vec::new(),
-                syms: Vec::new(),
-                counts: Vec::new(),
-            };
-            for key in 0..3 * sizes.iter().product::<usize>() {
-                let (c, f) = stats.unkey(key);
-                assert!(c < 3 && (0..3).all(|p| f[p] < sizes[p]));
-                assert_eq!(stats.key(c, f), key);
-            }
-        }
-    }
-}
-
 fn collect_stats(
     jpg: &JpegData,
     dim: &Dim,
@@ -817,4 +791,30 @@ pub(super) fn optimize(
         let c = [1, 0, 2][row];
         best.assign[c * num_cells + i].unwrap_or(0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fine_cell_keys_round_trip_with_unit_and_uneven_axes() {
+        for sizes in [[1, 1, 1], [16, 32, 16], [3, 5, 7], [1, 7, 3], [5, 1, 1]] {
+            let stats = Stats {
+                axes: sizes.map(|n| Axis {
+                    lo: vec![0; n],
+                    lut: Vec::new(),
+                }),
+                key_dividers: sizes.map(|n| DividerU64::new(n as u64)),
+                key_start: Vec::new(),
+                syms: Vec::new(),
+                counts: Vec::new(),
+            };
+            for key in 0..3 * sizes.iter().product::<usize>() {
+                let (c, f) = stats.unkey(key);
+                assert!(c < 3 && (0..3).all(|p| f[p] < sizes[p]));
+                assert_eq!(stats.key(c, f), key);
+            }
+        }
+    }
 }

@@ -93,6 +93,13 @@ impl DividerI32 {
     }
 }
 
+// Accessors for the SIMD dividers that rebuild the scalar algorithm.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "avx"),
+    all(target_arch = "aarch64", feature = "neon"),
+    all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+))]
 impl DividerI32 {
     /// The multiplier; 0 for a power of two, which is a plain shift.
     #[inline(always)]

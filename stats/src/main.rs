@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use anyhow::{Context, Result, bail};
-use jixel::{CodingTransform, Speed};
+use jixel::{CodingTransform, Grain, Speed};
 use plotters::coord::combinators::{LogCoord, WithKeyPoints};
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
@@ -1218,7 +1218,8 @@ fn bench_jixel(
         .with_ink_layer(layers)
         .with_edge_splines(layers)
         .with_lossy_modular(lossy_modular)
-        .with_coding_transform(CodingTransform::Xyb);
+        .with_coding_transform(CodingTransform::Xyb)
+        .with_grain(Grain::Auto);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
     let jxl = tmp.join(format!("{stem}_jixel_{lossy_modular:?}_{d}.jxl"));
