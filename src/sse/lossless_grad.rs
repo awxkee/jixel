@@ -32,46 +32,87 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[inline]
+#[target_feature(enable = "sse4.1")]
+fn grad_pack_vector(
+    left: &[i32; 4],
+    top: &[i32; 4],
+    topleft: &[i32; 4],
+    px: &[i32; 4],
+    out: &mut [u32; 4],
+) {
+    let zero = _mm_setzero_si128();
+    let left = unsafe { _mm_loadu_si128(left.as_ptr() as *const __m128i) };
+    let top = unsafe { _mm_loadu_si128(top.as_ptr() as *const __m128i) };
+    let topleft = unsafe { _mm_loadu_si128(topleft.as_ptr() as *const __m128i) };
+    let px = unsafe { _mm_loadu_si128(px.as_ptr() as *const __m128i) };
+
+    // fjxl PredictPixels: grad = (left-topleft) + top; clamp to the nearer of
+    // {left, top} via the XOR-sign of the neighbor differences.
+    let ac = _mm_sub_epi32(left, topleft);
+    let ab = _mm_sub_epi32(left, top);
+    let bc = _mm_sub_epi32(top, topleft);
+    let grad = _mm_add_epi32(ac, top);
+    let d = _mm_xor_si128(ab, bc);
+    let clamp = _mm_blendv_epi8(left, top, _mm_cmpgt_epi32(zero, d)); // d<0 ? top : left
+    let s = _mm_xor_si128(ac, bc);
+    let pred = _mm_blendv_epi8(clamp, grad, _mm_cmpgt_epi32(zero, s)); // s<0 ? grad : clamp
+
+    let res = _mm_sub_epi32(px, pred);
+    // pack_signed: (res << 1) ^ (res >> 31)  (zig-zag), exact in i32.
+    let packed = _mm_xor_si128(_mm_slli_epi32::<1>(res), _mm_srai_epi32::<31>(res));
+    unsafe { _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, packed) };
+}
+
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
     assert!(cur.len() >= gw && prev.len() >= gw && out.len() >= gw);
-    let zero = _mm_setzero_si128();
-    let mut gx = 1usize;
-    while gx + 4 <= gw {
-        let left = unsafe { _mm_loadu_si128(cur.as_ptr().add(gx - 1) as *const __m128i) };
-        let top = unsafe { _mm_loadu_si128(prev.as_ptr().add(gx) as *const __m128i) };
-        let topleft = unsafe { _mm_loadu_si128(prev.as_ptr().add(gx - 1) as *const __m128i) };
-        let px = unsafe { _mm_loadu_si128(cur.as_ptr().add(gx) as *const __m128i) };
-
-        // fjxl PredictPixels: grad = (left-topleft) + top; clamp to the nearer of
-        // {left, top} via the XOR-sign of the neighbor differences.
-        let ac = _mm_sub_epi32(left, topleft);
-        let ab = _mm_sub_epi32(left, top);
-        let bc = _mm_sub_epi32(top, topleft);
-        let grad = _mm_add_epi32(ac, top);
-        let d = _mm_xor_si128(ab, bc);
-        let clamp = _mm_blendv_epi8(left, top, _mm_cmpgt_epi32(zero, d)); // d<0 ? top : left
-        let s = _mm_xor_si128(ac, bc);
-        let pred = _mm_blendv_epi8(clamp, grad, _mm_cmpgt_epi32(zero, s)); // s<0 ? grad : clamp
-
-        let res = _mm_sub_epi32(px, pred);
-        // pack_signed: (res << 1) ^ (res >> 31)  (zig-zag), exact in i32.
-        let packed = _mm_xor_si128(_mm_slli_epi32::<1>(res), _mm_srai_epi32::<31>(res));
-        unsafe { _mm_storeu_si128(out.as_mut_ptr().add(gx) as *mut __m128i, packed) };
-        gx += 4;
+    if gw <= 1 {
+        return;
     }
-    // Scalar tail (identical math).
-    while gx < gw {
-        let w = cur[gx - 1];
-        let n = prev[gx];
-        let nw = prev[gx - 1];
+    let (left, left_tail) = cur[..gw - 1].as_chunks::<4>();
+    let (top, top_tail) = prev[1..gw].as_chunks::<4>();
+    let (topleft, topleft_tail) = prev[..gw - 1].as_chunks::<4>();
+    let (px, px_tail) = cur[1..gw].as_chunks::<4>();
+    let (out, out_tail) = out[1..gw].as_chunks_mut::<4>();
+
+    let (left_pairs, left_single) = left.as_chunks::<2>();
+    let (top_pairs, top_single) = top.as_chunks::<2>();
+    let (topleft_pairs, topleft_single) = topleft.as_chunks::<2>();
+    let (px_pairs, px_single) = px.as_chunks::<2>();
+    let (out_pairs, out_single) = out.as_chunks_mut::<2>();
+    for ((((left, top), topleft), px), out) in left_pairs
+        .iter()
+        .zip(top_pairs)
+        .zip(topleft_pairs)
+        .zip(px_pairs)
+        .zip(out_pairs)
+    {
+        grad_pack_vector(&left[0], &top[0], &topleft[0], &px[0], &mut out[0]);
+        grad_pack_vector(&left[1], &top[1], &topleft[1], &px[1], &mut out[1]);
+    }
+    for ((((left, top), topleft), px), out) in left_single
+        .iter()
+        .zip(top_single)
+        .zip(topleft_single)
+        .zip(px_single)
+        .zip(out_single)
+    {
+        grad_pack_vector(left, top, topleft, px, out);
+    }
+    for ((((&w, &n), &nw), &value), out) in left_tail
+        .iter()
+        .zip(top_tail)
+        .zip(topleft_tail)
+        .zip(px_tail)
+        .zip(out_tail)
+    {
         let ac = w.wrapping_sub(nw);
         let bc = n.wrapping_sub(nw);
         let grad = ac.wrapping_add(n);
         let clamp = if (w.wrapping_sub(n) ^ bc) < 0 { n } else { w };
         let pred = if (ac ^ bc) < 0 { grad } else { clamp };
-        let r = cur[gx].wrapping_sub(pred) as i64;
-        out[gx] = ((r << 1) ^ (r >> 63)) as u32;
-        gx += 1;
+        let r = value.wrapping_sub(pred) as i64;
+        *out = ((r << 1) ^ (r >> 63)) as u32;
     }
 }

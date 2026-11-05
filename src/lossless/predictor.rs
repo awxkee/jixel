@@ -99,14 +99,14 @@ pub(crate) fn fixed_predictor(use_wp: bool) -> u32 {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub(super) struct PredictorNeighbors {
-    pub(super) left: i64,
-    pub(super) top: i64,
-    pub(super) top_left: i64,
-    pub(super) top_right: i64,
-    pub(super) left_left: i64,
-    pub(super) top_top: i64,
-    pub(super) top_right_right: i64,
+pub(crate) struct PredictorNeighbors {
+    pub(crate) left: i64,
+    pub(crate) top: i64,
+    pub(crate) top_left: i64,
+    pub(crate) top_right: i64,
+    pub(crate) left_left: i64,
+    pub(crate) top_top: i64,
+    pub(crate) top_right_right: i64,
 }
 
 #[inline]
@@ -288,7 +288,7 @@ fn visit_predictor_rows<'a, T: Copy + 'a>(
 }
 
 #[inline]
-pub(super) fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
+pub(crate) fn predictor_value(pred_id: u32, n: PredictorNeighbors, weighted: i64) -> i64 {
     match pred_id {
         PREDICTOR_ZERO => 0,
         PREDICTOR_LEFT => n.left,

@@ -205,6 +205,68 @@ fn palette_flat_spans_preserve_cost_histograms() {
 }
 
 #[test]
+fn gradient_simd_matches_scalar_at_chunk_boundaries() {
+    let mut kernels: Vec<(&str, GradPackInteriorFn)> = Vec::new();
+    kernels.push(("selected", selected_grad_pack_interior_fn()));
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        kernels.push(("avx2", |c, p, o, g| unsafe {
+            crate::avx::grad_pack_interior(c, p, o, g)
+        }));
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        kernels.push(("sse4.1", |c, p, o, g| unsafe {
+            crate::sse::grad_pack_interior(c, p, o, g)
+        }));
+    }
+
+    let extremes = [i32::MIN, i32::MAX, -1, 0, 1, i32::MIN / 2, i32::MAX / 2];
+    let mut seed = 0x1234_5678u32;
+    for width in (0..=65).chain([127, 128, 129, 255, 256, 257]) {
+        for offset in 0..4 {
+            for padding in [0, 5] {
+                for pattern in 0..3 {
+                    let len = offset + width + padding;
+                    let mut sample = |i: usize| match pattern {
+                        0 => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed as i32
+                        }
+                        1 => extremes[i % extremes.len()],
+                        _ => (i as i32 * 977) % 65536 - 32768,
+                    };
+                    let cur: Vec<i32> = (0..len).map(&mut sample).collect();
+                    let prev: Vec<i32> = (1..=len).map(&mut sample).collect();
+                    let mut expected = vec![0xdead_beef; len];
+                    grad_pack_interior_scalar(
+                        &cur[offset..],
+                        &prev[offset..],
+                        &mut expected[offset..],
+                        width,
+                    );
+                    for &(name, kernel) in &kernels {
+                        let mut actual = vec![0xdead_beef; len];
+                        kernel(
+                            &cur[offset..],
+                            &prev[offset..],
+                            &mut actual[offset..],
+                            width,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "{name}: width={width}, offset={offset}, padding={padding}, pattern={pattern}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn row_tokens_match_point_fetched_predictions() {
     for w in (0..=9).chain([15, 16, 17, 33, 257]) {
         for h in [0, 1, 2, 5] {

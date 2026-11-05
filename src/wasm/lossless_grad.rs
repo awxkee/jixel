@@ -28,41 +28,83 @@
  */
 use core::arch::wasm32::*;
 
+#[inline]
+#[target_feature(enable = "simd128")]
+fn grad_pack_vector(
+    left: &[i32; 4],
+    top: &[i32; 4],
+    topleft: &[i32; 4],
+    px: &[i32; 4],
+    out: &mut [u32; 4],
+) {
+    let zero = i32x4_splat(0);
+    let left = unsafe { v128_load(left.as_ptr().cast()) };
+    let top = unsafe { v128_load(top.as_ptr().cast()) };
+    let topleft = unsafe { v128_load(topleft.as_ptr().cast()) };
+    let px = unsafe { v128_load(px.as_ptr().cast()) };
+    let ac = i32x4_sub(left, topleft);
+    let ab = i32x4_sub(left, top);
+    let bc = i32x4_sub(top, topleft);
+    let grad = i32x4_add(ac, top);
+    let d = v128_xor(ab, bc);
+    let clamp = v128_bitselect(top, left, i32x4_lt(d, zero)); // d<0 ? top : left
+    let s = v128_xor(ac, bc);
+    let pred = v128_bitselect(grad, clamp, i32x4_lt(s, zero)); // s<0 ? grad : clamp
+    let res = i32x4_sub(px, pred);
+    // pack_signed: (res << 1) ^ (res >> 31)
+    let packed = v128_xor(i32x4_shl(res, 1), i32x4_shr(res, 31));
+    unsafe { v128_store(out.as_mut_ptr().cast(), packed) };
+}
+
 #[target_feature(enable = "simd128")]
 pub(crate) fn grad_pack_interior(cur: &[i32], prev: &[i32], out: &mut [u32], gw: usize) {
     assert!(cur.len() >= gw && prev.len() >= gw && out.len() >= gw);
-    let zero = i32x4_splat(0);
-    let mut gx = 1usize;
-    while gx + 4 <= gw {
-        let left = unsafe { v128_load(cur.as_ptr().add(gx - 1).cast()) };
-        let top = unsafe { v128_load(prev.as_ptr().add(gx).cast()) };
-        let topleft = unsafe { v128_load(prev.as_ptr().add(gx - 1).cast()) };
-        let px = unsafe { v128_load(cur.as_ptr().add(gx).cast()) };
-        let ac = i32x4_sub(left, topleft);
-        let ab = i32x4_sub(left, top);
-        let bc = i32x4_sub(top, topleft);
-        let grad = i32x4_add(ac, top);
-        let d = v128_xor(ab, bc);
-        let clamp = v128_bitselect(top, left, i32x4_lt(d, zero)); // d<0 ? top : left
-        let s = v128_xor(ac, bc);
-        let pred = v128_bitselect(grad, clamp, i32x4_lt(s, zero)); // s<0 ? grad : clamp
-        let res = i32x4_sub(px, pred);
-        // pack_signed: (res << 1) ^ (res >> 31)
-        let packed = v128_xor(i32x4_shl(res, 1), i32x4_shr(res, 31));
-        unsafe { v128_store(out.as_mut_ptr().add(gx).cast(), packed) };
-        gx += 4;
+    if gw <= 1 {
+        return;
     }
-    while gx < gw {
-        let w = cur[gx - 1];
-        let n = prev[gx];
-        let nw = prev[gx - 1];
+    let (left, left_tail) = cur[..gw - 1].as_chunks::<4>();
+    let (top, top_tail) = prev[1..gw].as_chunks::<4>();
+    let (topleft, topleft_tail) = prev[..gw - 1].as_chunks::<4>();
+    let (px, px_tail) = cur[1..gw].as_chunks::<4>();
+    let (out, out_tail) = out[1..gw].as_chunks_mut::<4>();
+
+    let (left_pairs, left_single) = left.as_chunks::<2>();
+    let (top_pairs, top_single) = top.as_chunks::<2>();
+    let (topleft_pairs, topleft_single) = topleft.as_chunks::<2>();
+    let (px_pairs, px_single) = px.as_chunks::<2>();
+    let (out_pairs, out_single) = out.as_chunks_mut::<2>();
+    for ((((left, top), topleft), px), out) in left_pairs
+        .iter()
+        .zip(top_pairs)
+        .zip(topleft_pairs)
+        .zip(px_pairs)
+        .zip(out_pairs)
+    {
+        grad_pack_vector(&left[0], &top[0], &topleft[0], &px[0], &mut out[0]);
+        grad_pack_vector(&left[1], &top[1], &topleft[1], &px[1], &mut out[1]);
+    }
+    for ((((left, top), topleft), px), out) in left_single
+        .iter()
+        .zip(top_single)
+        .zip(topleft_single)
+        .zip(px_single)
+        .zip(out_single)
+    {
+        grad_pack_vector(left, top, topleft, px, out);
+    }
+    for ((((&w, &n), &nw), &value), out) in left_tail
+        .iter()
+        .zip(top_tail)
+        .zip(topleft_tail)
+        .zip(px_tail)
+        .zip(out_tail)
+    {
         let ac = w.wrapping_sub(nw);
         let bc = n.wrapping_sub(nw);
         let grad = ac.wrapping_add(n);
         let clamp = if (w.wrapping_sub(n) ^ bc) < 0 { n } else { w };
         let pred = if (ac ^ bc) < 0 { grad } else { clamp };
-        let r = cur[gx].wrapping_sub(pred) as i64;
-        out[gx] = ((r << 1) ^ (r >> 63)) as u32;
-        gx += 1;
+        let r = value.wrapping_sub(pred) as i64;
+        *out = ((r << 1) ^ (r >> 63)) as u32;
     }
 }

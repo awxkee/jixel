@@ -2903,19 +2903,45 @@ mod tests {
         let y_quant = [
             -31i16, -29, -23, -19, -17, -13, -11, -7, -5, -3, 2, 4, 8, 10, 14, 16, 20, 22, 26,
         ];
+        let input: Vec<f32> = (0..260).map(|i| input[i % input.len()]).collect();
+        let y_quant: Vec<i16> = (0..260).map(|i| y_quant[i % y_quant.len()]).collect();
 
-        for len in 1..=input.len() {
-            let mut want = [i16::MIN; 19];
-            let mut got = [i16::MIN; 19];
-            quantize_dc_scalar(&input[..len], 1.0, &mut want[..len]);
-            (methods.quantize)(&input[..len], 1.0, &mut got[..len]);
-            assert_eq!(got, want, "plain DC length {len}");
+        for len in (0..=33).chain([63, 64, 65, 127, 128, 129, 257]) {
+            for offset in [0, 1, 3] {
+                let input = &input[offset..offset + len];
+                let y_quant = &y_quant[offset..offset + len];
+                for scale in [0.0, 0.5, 1.0, -1.25] {
+                    let mut want = vec![0x1234i16; len + offset + 2];
+                    let mut got = want.clone();
+                    quantize_dc_scalar(input, scale, &mut want[offset..offset + len]);
+                    (methods.quantize)(input, scale, &mut got[offset..offset + len]);
+                    assert_eq!(
+                        got, want,
+                        "plain DC length {len}, offset={offset}, scale={scale}"
+                    );
 
-            want.fill(i16::MIN);
-            got.fill(i16::MIN);
-            quantize_dc_cfl_scalar(&input[..len], &y_quant[..len], 1.0, 0.5, &mut want[..len]);
-            (methods.quantize_cfl)(&input[..len], &y_quant[..len], 1.0, 0.5, &mut got[..len]);
-            assert_eq!(got, want, "CfL DC length {len}");
+                    for cfl in [0.0, 0.5, -0.75] {
+                        quantize_dc_cfl_scalar(
+                            input,
+                            y_quant,
+                            scale,
+                            cfl,
+                            &mut want[offset..offset + len],
+                        );
+                        (methods.quantize_cfl)(
+                            input,
+                            y_quant,
+                            scale,
+                            cfl,
+                            &mut got[offset..offset + len],
+                        );
+                        assert_eq!(
+                            got, want,
+                            "CfL DC length {len}, offset={offset}, scale={scale}, cfl={cfl}"
+                        );
+                    }
+                }
+            }
         }
 
         check_dc_i32_quantizers(methods);

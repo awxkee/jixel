@@ -104,6 +104,7 @@ pub(crate) use palette::write_palette_transform;
 pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
+pub(crate) use predictor::{PredictorNeighbors, predictor_value};
 pub(crate) use rct::forward_ycocg;
 pub(crate) use squeeze::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_global_plane_tree};
 

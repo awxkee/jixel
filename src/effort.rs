@@ -87,6 +87,9 @@ effort_gates! {
     dc_predictor_search,
     /// Chroma DC rounding with frozen residual prices and a pooled rate check.
     dc_rdoq,
+    /// ... refined once more under the written DC tree's contexts, leaf
+    /// predictors and clustered histograms, then re-tokenized under it.
+    dc_rdoq_refit,
     /// Per-image learned DC context tree raced against the static tree.
     dc_learned_tree,
     /// The DC streams race the second libjxl weighted-predictor preset
@@ -328,6 +331,7 @@ static MEDIUM: Effort = Effort {
     chroma_policy: true,
     fine_mosaic: true,
     dc_rdoq: true,
+    dc_rdoq_refit: true,
     dc_wp_race: true,
     chroma_dc_squeeze: true,
     dc_x_cfl: true,

@@ -52,6 +52,10 @@ pub(crate) struct DcEntropy {
     pub(crate) wp_params: WpParams,
     /// The MA-learned DC tree, for a re-run under other predictor parameters.
     pub(crate) ma_tree: Option<MaDcTrees>,
+    /// Context id per node of the written DC tree and the predictor offset
+    /// per node (empty without the MA arm).
+    pub(crate) ma_leaf_ctx: Vec<u32>,
+    pub(crate) ma_offsets: Vec<i32>,
 }
 
 impl DcEntropy {
@@ -247,16 +251,15 @@ pub(crate) fn prepare_dc_entropy(
 
     // Price an arm end to end: serialized tree + entropy-code header
     // (measured by writing them) plus the payload estimate.
-    let payload = |dc: &[Vec<Token>],
-                   meta: &[Vec<Token>],
-                   code: &crate::entropy::OwnedEntropyCode| {
-        crate::entropy::estimate_ac_plain_bits(
-            dc.iter()
-                .map(Vec::as_slice)
-                .chain(meta.iter().map(Vec::as_slice)),
-            code,
-        )
-    };
+    let payload =
+        |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
+            crate::entropy::estimate_ac_plain_bits(
+                dc.iter()
+                    .map(Vec::as_slice)
+                    .chain(meta.iter().map(Vec::as_slice)),
+                code,
+            )
+        };
     let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
         let mut w = BitWriter::new();
         match tree {
@@ -279,6 +282,7 @@ pub(crate) fn prepare_dc_entropy(
     // has won every image measured, so the static and learned arms are then
     // not built at all; small images still race all three.
     let mut learned_ma_tree: Option<MaDcTrees> = None;
+    let mut ma_leaf_map: (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
     let ma_budget = if effort.ma_dc_tree {
         Some(MaDcBudget::FULL)
     } else if effort.ma_dc_tree_lite {
@@ -342,7 +346,16 @@ pub(crate) fn prepare_dc_entropy(
                     let tree = DcTreeChoice::Learned(tree_tokens);
                     let cost = header(&tree, &code.as_ref(), scratch)
                         + payload(&dc_tokens, &meta_tokens, &code);
-                    (cost, dc_tokens, meta_tokens, code, tree, dc_leaf_ctx, offsets, meta_learned)
+                    (
+                        cost,
+                        dc_tokens,
+                        meta_tokens,
+                        code,
+                        tree,
+                        dc_leaf_ctx,
+                        offsets,
+                        meta_learned,
+                    )
                 };
                 let mut best = arms
                     .into_iter()
@@ -354,12 +367,7 @@ pub(crate) fn prepare_dc_entropy(
                 // (offsets, metadata side) is assembled and priced again.
                 if effort.ma_dc_repick()
                     && let Some(repicked) = repick_leaf_predictors(
-                        dc_datas,
-                        &trees,
-                        &best.5,
-                        &best.6,
-                        &best.3,
-                        wp_params,
+                        dc_datas, &trees, &best.5, &best.6, &best.3, wp_params,
                     )
                 {
                     let with_offsets = best.6.iter().any(|&o| o != 0);
@@ -389,6 +397,7 @@ pub(crate) fn prepare_dc_entropy(
                     }
                 }
                 learned_ma_tree = Some(trees);
+                ma_leaf_map = (best.5, best.6);
                 Some((best.0, best.1, best.2, best.3, best.4))
             })
     };
@@ -409,6 +418,9 @@ pub(crate) fn prepare_dc_entropy(
                 (dc_tokens, meta_tokens, code, tree, true)
             }
             ma_arm => {
+                if ma_arm.is_none() {
+                    ma_leaf_map = (Vec::new(), Vec::new());
+                }
                 let dc_gradient = if !dc_predictor_search {
                     DC_PREDICTOR_GRADIENT
                 } else {
@@ -556,6 +568,7 @@ pub(crate) fn prepare_dc_entropy(
                         if cost + LEARNED_TREE_MARGIN_BITS < best_cost {
                             (dc_tokens, meta_tokens, code, tree, true)
                         } else {
+                            ma_leaf_map = (Vec::new(), Vec::new());
                             (best_dc, best_meta, best_code, best_tree, true)
                         }
                     }
@@ -609,6 +622,8 @@ pub(crate) fn prepare_dc_entropy(
         refinement: ans_refinement,
         wp_params,
         ma_tree: learned_ma_tree,
+        ma_leaf_ctx: ma_leaf_map.0,
+        ma_offsets: ma_leaf_map.1,
     }
 }
 
@@ -794,7 +809,9 @@ fn learn_planes(
         return None;
     }
     let params = ma_dc_params(&samples, budget, max_leaves, stride);
-    Some(crate::ma_tree::learn_ma_tree(&samples, params, pool, scratch))
+    Some(crate::ma_tree::learn_ma_tree(
+        &samples, params, pool, scratch,
+    ))
 }
 
 /// Learner parameters of the DC arm.
@@ -879,9 +896,24 @@ fn learn_meta_parts(
     // Routing prefix: channel > 2 → EPF; channel > 1 → (y > 0 → QF, else
     // strategy); else CfL.
     let mut nodes = vec![
-        MaNode::Split { prop: 0, val: 2, gt: 0, le: 1 },
-        MaNode::Split { prop: 0, val: 1, gt: 2, le: 0 },
-        MaNode::Split { prop: 2, val: 0, gt: 0, le: 0 },
+        MaNode::Split {
+            prop: 0,
+            val: 2,
+            gt: 0,
+            le: 1,
+        },
+        MaNode::Split {
+            prop: 0,
+            val: 1,
+            gt: 2,
+            le: 0,
+        },
+        MaNode::Split {
+            prop: 2,
+            val: 0,
+            gt: 0,
+            le: 0,
+        },
     ];
     let mut roots = [0u32; 4];
     for (part, part_nodes) in parts.into_iter().enumerate() {
@@ -897,9 +929,24 @@ fn learn_meta_parts(
             leaf => leaf,
         }));
     }
-    nodes[0] = MaNode::Split { prop: 0, val: 2, gt: roots[3], le: 1 };
-    nodes[1] = MaNode::Split { prop: 0, val: 1, gt: 2, le: roots[0] };
-    nodes[2] = MaNode::Split { prop: 2, val: 0, gt: roots[2], le: roots[1] };
+    nodes[0] = MaNode::Split {
+        prop: 0,
+        val: 2,
+        gt: roots[3],
+        le: 1,
+    };
+    nodes[1] = MaNode::Split {
+        prop: 0,
+        val: 1,
+        gt: 2,
+        le: roots[0],
+    };
+    nodes[2] = MaNode::Split {
+        prop: 2,
+        val: 0,
+        gt: roots[2],
+        le: roots[1],
+    };
     Some(LearnedTree {
         nodes,
         est_bits,
@@ -1042,7 +1089,11 @@ fn assemble_ma_arms(
         if offsets && !with_offsets {
             continue;
         }
-        let offs = if offsets { &node_offsets } else { &zero_offsets };
+        let offs = if offsets {
+            &node_offsets
+        } else {
+            &zero_offsets
+        };
         let mut dc_tokens = dc_nodes.clone();
         if offsets {
             crate::dc_tree::apply_leaf_offsets(&mut dc_tokens, offs);
@@ -1135,12 +1186,12 @@ fn repick_leaf_predictors(
     for (node, n) in dc.nodes.iter_mut().enumerate() {
         if let MaNode::Leaf { pred, .. } = n {
             let row = &cost[node * NUM_MA_PREDS..(node + 1) * NUM_MA_PREDS];
-            let (best, _) = row
-                .iter()
-                .enumerate()
-                .fold((*pred as usize, row[*pred as usize]), |acc, (p, &c)| {
+            let (best, _) = row.iter().enumerate().fold(
+                (*pred as usize, row[*pred as usize]),
+                |acc, (p, &c)| {
                     if c < acc.1 { (p, c) } else { acc }
-                });
+                },
+            );
             if best != *pred as usize {
                 *pred = best as u32;
                 changed = true;
@@ -1152,4 +1203,3 @@ fn repick_leaf_predictors(
         meta: trees.meta.clone(),
     })
 }
-

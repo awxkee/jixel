@@ -966,6 +966,45 @@ pub(super) fn encode_frame_core(
             }
         }
     }
+    // Refit: the chroma DC rounding priced by the written tree instead of
+    // the frozen static contexts, then re-tokenized under the same tree.
+    if ctx.coding.is_xyb()
+        && ctx.speed.effort().dc_rdoq
+        && ctx.speed.effort().dc_rdoq_refit
+        && !use_dc_frame
+        && !dc_entropy.ma_leaf_ctx.is_empty()
+        && let Some(trees) = dc_entropy.ma_tree.as_ref()
+    {
+        let rates = dc_rdo::LearnedDcRates {
+            tree: &trees.dc,
+            leaf_ctx: &dc_entropy.ma_leaf_ctx,
+            offsets: &dc_entropy.ma_offsets,
+            code: &dc_entropy.code,
+            wp_params: dc_entropy.wp_params,
+        };
+        let changed = dc_rdo::refine_dc_rounding_learned(
+            &mut dc_datas,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            compensate_b,
+            &rates,
+        )?;
+        if changed {
+            let trees = trees.clone();
+            dc_entropy = super::dc_entropy::prepare_dc_entropy(
+                ctx,
+                scratch,
+                &dc_datas,
+                dim.num_dc_groups,
+                epf_sharpness,
+                use_dc_frame,
+                distp.distance,
+                dc_entropy.wp_params,
+                Some(&trees),
+            );
+        }
+    }
     let super::dc_entropy::DcEntropy {
         tree: dc_tree,
         dc: dc_tokens_per_group,
@@ -974,6 +1013,8 @@ pub(super) fn encode_frame_core(
         refinement: ans_refinement,
         wp_params: dc_wp_params,
         ma_tree: _,
+        ma_leaf_ctx: _,
+        ma_offsets: _,
     } = dc_entropy;
     let (mut dc_tree, mut dc_tokens_per_group, mut meta_tokens_per_group) =
         (dc_tree, dc_tokens_per_group, meta_tokens_per_group);
