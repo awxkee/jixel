@@ -29,6 +29,7 @@
 
 //! Per-group palettes and multi-group palette frame encoding.
 
+use super::super::entropy::selected_entropy_of_hist_fn;
 use super::super::groups::{
     DeepLzScratchPool, SLOW_DEEP_LZ_MAX_THREADS, group_lz_threads, write_lz_groups_with_header,
 };
@@ -45,7 +46,10 @@ use super::super::predictor::{
     tokenize_runs_with_wp, tokenize_sample_rows,
 };
 use super::super::{GROUP_DIM, GroupLayout};
-use super::global::ColorMap;
+use super::global::{
+    ColorMap, cooccurrence_chain_path, improve_chain_tour, index_cooccurrence, index_cost_rows,
+    order_of_path,
+};
 use super::{visit_palette_colors, write_palette_transform};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -81,6 +85,7 @@ pub(in crate::lossless) fn local_palette_coverage_is_sufficient(
         >= total_pixels.saturating_mul(LOCAL_PALETTE_MIN_COVERAGE_NUM)
 }
 
+#[derive(Clone)]
 pub(in crate::lossless) struct LocalPaletteGroup {
     pub(in crate::lossless) palette: Vec<i32>,
     pub(in crate::lossless) indices: Vec<u16>,
@@ -173,21 +178,23 @@ fn estimated_local_lz_stream_bits(
     writer.bits_written()
 }
 
+/// Bits of one order of a group palette under the flat coder: its chosen
+/// predictors, the run/literal stream estimate and the transform header,
+/// with the index channel's predictor costs.
 #[allow(clippy::too_many_arguments)]
-fn local_palette_is_better(
+pub(super) fn local_palette_flat_bits(
     palette: &LocalPaletteGroup,
-    linear: &Image3Si,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    x0: usize,
-    y0: usize,
+    nb_chans: usize,
     min_symbol: u32,
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
     use_wp: bool,
     scratch: &mut CoderScratch,
-) -> (bool, SqueezePredictorCost) {
-    let nb_chans = 3 + usize::from(alpha.is_some());
+) -> (usize, SqueezePredictorCost) {
+    // Below Slow the price keeps the fixed predictor: the frame pools one
+    // index predictor over every palette group, so a per-group best
+    // predictor prices orders the frame never codes that way (opendoodles
+    // at Fast: +10 % when it did).
     let mut index_cost = SqueezePredictorCost::default();
     let palette_predictors = if speed.effort().predictor_search {
         [
@@ -226,17 +233,91 @@ fn local_palette_is_better(
         palette.nb_colors as u32,
         &mut palette_transform,
     );
-    let palette_bits = {
-        let palette_lz = palette_tokens.finish();
-        estimated_local_lz_stream_bits(
-            &palette_lz,
-            &palette_predictors,
-            2,
+    let palette_lz = palette_tokens.finish();
+    let bits = estimated_local_lz_stream_bits(
+        &palette_lz,
+        &palette_predictors,
+        2,
+        min_symbol,
+        speed,
+        scratch,
+    ) + palette_transform.bits_written();
+    (bits, index_cost)
+}
+
+/// The cheapest index order of a group palette under the flat coder: the
+/// color sort it was built with against the co-occurrence chain and its
+/// tour, each priced by `local_palette_flat_bits`. The index-plane
+/// estimator misranks them by a few percent on illustrations; the coder's
+/// own price does not. Returns the winner with its bits and index costs.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn race_local_palette_orders(
+    palette: LocalPaletteGroup,
+    nb_chans: usize,
+    min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+    use_wp: bool,
+    scratch: &mut CoderScratch,
+) -> (LocalPaletteGroup, usize, SqueezePredictorCost) {
+    let (mut best_bits, mut best_cost) = local_palette_flat_bits(
+        &palette,
+        nb_chans,
+        min_symbol,
+        grad_pack_fn,
+        speed,
+        use_wp,
+        scratch,
+    );
+    let mut best = None;
+    for order in local_palette_order_candidates(&palette) {
+        let mut candidate = palette.clone();
+        apply_palette_order(&mut candidate, &order);
+        let (bits, cost) = local_palette_flat_bits(
+            &candidate,
+            nb_chans,
             min_symbol,
+            grad_pack_fn,
             speed,
+            use_wp,
             scratch,
-        ) + palette_transform.bits_written()
-    };
+        );
+        if bits < best_bits {
+            best_bits = bits;
+            best_cost = cost;
+            best = Some(candidate);
+        }
+    }
+    (best.unwrap_or(palette), best_bits, best_cost)
+}
+
+/// The group's palette frame (in its cheapest index order) against its
+/// plain channels, both priced by the flat coder. Returns the palette when
+/// it is the smaller.
+#[allow(clippy::too_many_arguments)]
+fn local_palette_is_better(
+    palette: LocalPaletteGroup,
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    x0: usize,
+    y0: usize,
+    min_symbol: u32,
+    grad_pack_fn: GradPackInteriorFn,
+    speed: crate::Speed,
+    use_wp: bool,
+    scratch: &mut CoderScratch,
+) -> Option<(LocalPaletteGroup, SqueezePredictorCost)> {
+    let nb_chans = 3 + usize::from(alpha.is_some());
+    let (palette, palette_bits, index_cost) = race_local_palette_orders(
+        palette,
+        nb_chans,
+        min_symbol,
+        grad_pack_fn,
+        speed,
+        use_wp,
+        scratch,
+    );
 
     let plain_predictors: Vec<u32> = if speed.effort().predictor_search {
         (0..nb_chans)
@@ -287,7 +368,7 @@ fn local_palette_is_better(
         scratch,
     ) + 2; // zero-transform count
 
-    (palette_bits < plain_bits, index_cost)
+    (palette_bits < plain_bits).then_some((palette, index_cost))
 }
 
 /// The flat path's builder: the original 256-color cap.
@@ -381,6 +462,72 @@ pub(in crate::lossless) fn build_local_palette_group_limited(
     })
 }
 
+/// Index orders of a group palette besides the color sort it was built
+/// with, as `order[canonical] = index`: the spatial co-occurrence chain and
+/// its 2-opt/Or-opt tour (when the tour changed it). Gradient predictors
+/// on the index image only work when adjacent indices are adjacent in the
+/// image, which a color sort cannot know.
+pub(in crate::lossless) fn local_palette_order_candidates(
+    group: &LocalPaletteGroup,
+) -> Vec<Vec<i32>> {
+    let n = group.nb_colors;
+    if n < 3 {
+        return Vec::new();
+    }
+    let cooc = index_cooccurrence(&group.indices, group.w, group.h, n);
+    let chain = cooccurrence_chain_path(n, &cooc);
+    let tour = improve_chain_tour(n, &cooc, chain.clone());
+    let mut orders = vec![order_of_path(&chain)];
+    if tour != chain {
+        orders.push(order_of_path(&tour));
+    }
+    orders
+}
+
+/// Re-indexes the group's palette and index image by `order`.
+pub(in crate::lossless) fn apply_palette_order(group: &mut LocalPaletteGroup, order: &[i32]) {
+    let n = group.nb_colors;
+    let num_c = group.palette.len() / n;
+    for v in group.indices.iter_mut() {
+        *v = order[*v as usize] as u16;
+    }
+    let old = std::mem::replace(&mut group.palette, vec![0; num_c * n]);
+    for c in 0..num_c {
+        for (canonical, &index) in order.iter().enumerate() {
+            group.palette[c * n + index as usize] = old[c * n + canonical];
+        }
+    }
+}
+
+/// Re-indexes a group palette by whichever of its candidate orders the
+/// index-plane estimator prices lowest, keeping the color sort when none
+/// beats it. The learned-tree path's per-group arm: the estimator's pick is
+/// raced against the color sort by a first-stage learn there, since it
+/// cannot see what the tree makes of either.
+pub(in crate::lossless) fn order_local_palette(group: &mut LocalPaletteGroup) {
+    let n = group.nb_colors;
+    let orders = local_palette_order_candidates(group);
+    if orders.is_empty() {
+        return;
+    }
+    let entropy_of_hist = selected_entropy_of_hist_fn();
+    let identity: Vec<i32> = (0..n as i32).collect();
+    let mut best_cost =
+        index_cost_rows(&group.indices, group.w, 0, group.h, &identity, n).cost(entropy_of_hist);
+    let mut best = None;
+    for order in &orders {
+        let cost =
+            index_cost_rows(&group.indices, group.w, 0, group.h, order, n).cost(entropy_of_hist);
+        if cost < best_cost {
+            best_cost = cost;
+            best = Some(order);
+        }
+    }
+    if let Some(order) = best {
+        apply_palette_order(group, order);
+    }
+}
+
 /// Group step of the local-palette frame's plain-channel predictor costs
 /// under `local_palette_predictors` alone.
 const PLAIN_PREDICTOR_GROUP_STEP: usize = 4;
@@ -411,7 +558,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
     // do not retain one set of histograms per group or serialize group scoring.
     let pooled_index_cost = std::sync::Mutex::new(SqueezePredictorCost::default());
     let palettes = if speed.effort().local_palette_select {
-        let mut palettes = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
+        let palettes = pool.steal_map(scratch, num_ac_groups, |group_index, _scratch| {
             let gx = group_index % xsize_groups;
             let gy = group_index / xsize_groups;
             let x0 = gx * GROUP_DIM;
@@ -429,13 +576,11 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
             return false;
         }
 
-        let palette_is_better = pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
-            let Some(palette) = &palettes[group_index] else {
-                return false;
-            };
+        pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
+            let palette = palettes[group_index].clone()?;
             let gx = group_index % xsize_groups;
             let gy = group_index / xsize_groups;
-            let (keep, index_cost) = local_palette_is_better(
+            let (palette, index_cost) = local_palette_is_better(
                 palette,
                 linear,
                 alpha,
@@ -447,22 +592,14 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
                 speed,
                 use_wp,
                 scratch,
-            );
-            if keep {
-                pooled_index_cost
-                    .lock()
-                    .unwrap()
-                    .costs
-                    .merge(&index_cost.costs);
-            }
-            keep
-        });
-        for (palette, keep) in palettes.iter_mut().zip(palette_is_better) {
-            if !keep {
-                *palette = None;
-            }
-        }
-        palettes
+            )?;
+            pooled_index_cost
+                .lock()
+                .unwrap()
+                .costs
+                .merge(&index_cost.costs);
+            Some(palette)
+        })
     } else {
         pool.steal_map(scratch, num_ac_groups, |group_index, scratch| {
             let gx = group_index % xsize_groups;
@@ -473,7 +610,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
             let h = GROUP_DIM.min(ysize - y0);
             let palette = build_local_palette_group(linear, alpha, xsize, x0, y0, w, h)?;
             local_palette_is_better(
-                &palette,
+                palette,
                 linear,
                 alpha,
                 xsize,
@@ -485,8 +622,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
                 use_wp,
                 scratch,
             )
-            .0
-            .then_some(palette)
+            .map(|(palette, _)| palette)
         })
     };
     if !palettes.iter().any(Option::is_some) {

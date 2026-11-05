@@ -164,6 +164,10 @@ pub(super) fn learn_tree_candidates(
     }
 }
 
+/// The co-occurrence-ordered per-group palettes replace the color-sorted
+/// ones only when their first-stage estimate leads by this factor.
+const ORDERED_GROUP_PALETTE_MARGIN: f64 = 0.97;
+
 /// The group layouts the learns try.
 ///
 /// With every decoding tool available, Slow lossless runs the first learning
@@ -654,36 +658,63 @@ impl Tournament {
         if covered * 2 < frame.xsize * frame.ysize {
             return;
         }
-        let mixed = mixed_ma_source(
-            frame.ycocg,
-            frame.alpha,
-            frame.xsize,
-            &palettes,
-            frame.alpha_constant,
-        );
+        // Two index orders per group race on their first-stage estimate: the
+        // color sort (luma first), which the learned tree codes cheaper on
+        // antialiased text and UI, and the spatial co-occurrence chain, which
+        // wins on screen maps and quantised fields. The index-plane
+        // estimator alone cannot tell them apart under a learned tree (it
+        // picked the chain on screenshots at +2.7..+3.5 % of the frame).
+        let ordered: Vec<Option<palette::LocalPaletteGroup>> =
+            pool.steal_map(scratch, grid.num_groups(), |group_index, _scratch| {
+                let mut group = palettes[group_index].clone()?;
+                palette::order_local_palette(&mut group);
+                Some(group)
+            });
         let layout = frame.default_layout();
-        let stage = learn_ma_candidate(
-            &mixed,
-            frame.xsize,
-            frame.ysize,
-            layout,
-            frame.min_symbol,
-            sources.wp_params,
-            frame.use_wp,
-            mixed.max_leaves(),
-            sources.final_sampling,
-            pool,
-            scratch,
-        );
+        let mut raced: Option<(MaSource<'_>, CoarseLearn)> = None;
+        for palettes in [&palettes, &ordered] {
+            let mixed = mixed_ma_source(
+                frame.ycocg,
+                frame.alpha,
+                frame.xsize,
+                palettes,
+                frame.alpha_constant,
+            );
+            let stage = learn_ma_candidate(
+                &mixed,
+                frame.xsize,
+                frame.ysize,
+                layout,
+                frame.min_symbol,
+                sources.wp_params,
+                frame.use_wp,
+                mixed.max_leaves(),
+                sources.final_sampling,
+                pool,
+                scratch,
+            );
+            let Some(stage) = stage else {
+                continue;
+            };
+            // The chain's estimate runs ~2 % optimistic against its written
+            // frame (the final tree recovers more from the color sort), so
+            // it has to lead by more than that.
+            if raced.as_ref().is_none_or(|(_, leader)| {
+                stage.candidate.est_real < leader.candidate.est_real * ORDERED_GROUP_PALETTE_MARGIN
+            }) {
+                raced = Some((mixed, stage));
+            }
+        }
         // The first stage is grown into a frame only when it is close to the
         // best source's own first stage (a winning per-group plan lands at
         // 0.75, the losers at 1.08 and above; the margin covers a
         // screen-content tie).
-        let Some(stage) =
-            stage.filter(|s| s.candidate.est_real < self.best_source_coarse * PER_GROUP_MARGIN)
-        else {
+        let Some((mixed, stage)) = raced else {
             return;
         };
+        if stage.candidate.est_real >= self.best_source_coarse * PER_GROUP_MARGIN {
+            return;
+        }
         let cand = finish_ma_learn(
             frame.settings.speed,
             stage,
