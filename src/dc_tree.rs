@@ -58,6 +58,8 @@ enum LeafTag {
     Refined { ctx: u8, seq: u16 },
     /// A DC leaf learned by the MA learner, carrying its tree node index.
     Ma(u32),
+    /// A metadata leaf learned by the MA learner, carrying its node index.
+    MaMeta(u32),
 }
 
 #[derive(Clone)]
@@ -145,13 +147,13 @@ fn parse_static() -> Node {
     build(&flat, 0)
 }
 
-fn serialize(root: &Node) -> (Vec<Token>, Vec<(LeafTag, u8)>, Vec<u32>) {
+fn serialize(root: &Node) -> (Vec<Token>, Vec<(LeafTag, u16)>, Vec<u32>) {
     let mut tokens = Vec::new();
-    let mut leaves: Vec<(LeafTag, u8)> = Vec::new();
+    let mut leaves: Vec<(LeafTag, u16)> = Vec::new();
     let mut leaf_preds: Vec<u32> = Vec::new();
     let mut queue: std::collections::VecDeque<&Node> = std::collections::VecDeque::new();
     queue.push_back(root);
-    let mut next_ctx = 0u8;
+    let mut next_ctx = 0u16;
     while let Some(node) = queue.pop_front() {
         match node {
             Node::Leaf {
@@ -468,9 +470,9 @@ fn bfs_dc_leaves(root: &Node) -> Vec<*const Node> {
 pub(crate) struct LearnedDcTree {
     pub(crate) tokens: Vec<Token>,
     /// `(channel << 10) | bin` -> context id.
-    pub(crate) dc_context: Vec<u8>,
+    pub(crate) dc_context: Vec<u16>,
     /// `(static metadata context << 10) | West bin` -> context id.
-    pub(crate) meta_context: Vec<u8>,
+    pub(crate) meta_context: Vec<u16>,
     /// Context id -> serve the gradient predictor (meaningful for DC leaves).
     pub(crate) leaf_gradient: Vec<bool>,
     pub(crate) num_contexts: usize,
@@ -574,14 +576,14 @@ fn learned_from_root(root: Node) -> LearnedDcTree {
 
     // DC context lookup: decoder-faithful walk, leaves matched through their
     // relative BFS order (identical in the full tree and the subtree alone).
-    let dc_leaf_ctx: Vec<u8> = leaves
+    let dc_leaf_ctx: Vec<u16> = leaves
         .iter()
         .filter(|(tag, _)| *tag == LeafTag::Dc)
         .map(|&(_, ctx)| ctx)
         .collect();
     let dc_leaves = bfs_dc_leaves(dc_root);
     debug_assert_eq!(dc_leaves.len(), dc_leaf_ctx.len());
-    let mut dc_context = vec![0u8; NUM_CHANNELS * NUM_ERR_BINS];
+    let mut dc_context = vec![0u16; NUM_CHANNELS * NUM_ERR_BINS];
     for ch in 0..NUM_CHANNELS {
         for bin in 0..NUM_ERR_BINS {
             let err = bin as i32 - 512;
@@ -643,10 +645,10 @@ fn refined_meta_side(meta_tokens: &[Vec<Token>], meta_props: &[Vec<DcProp>]) -> 
 
 /// Metadata context lookup: static context -> (possibly refined) context per
 /// West bin. Unrefined contexts map to a single id for every bin.
-fn meta_context_lookup(meta_root: &Node, leaves: &[(LeafTag, u8)]) -> Vec<u8> {
-    let mut refined_ctx: std::collections::HashMap<(u8, u16), u8> =
+fn meta_context_lookup(meta_root: &Node, leaves: &[(LeafTag, u16)]) -> Vec<u16> {
+    let mut refined_ctx: std::collections::HashMap<(u8, u16), u16> =
         std::collections::HashMap::new();
-    let mut static_ctx: Vec<Option<u8>> = vec![None; NUM_META_CONTEXTS];
+    let mut static_ctx: Vec<Option<u16>> = vec![None; NUM_META_CONTEXTS];
     for &(tag, ctx) in leaves {
         match tag {
             LeafTag::Refined { ctx: sc, seq } => {
@@ -658,7 +660,7 @@ fn meta_context_lookup(meta_root: &Node, leaves: &[(LeafTag, u8)]) -> Vec<u8> {
             _ => {}
         }
     }
-    let mut meta_context = vec![0u8; NUM_META_CONTEXTS * NUM_ERR_BINS];
+    let mut meta_context = vec![0u16; NUM_META_CONTEXTS * NUM_ERR_BINS];
     let refinements = collect_refinements(meta_root);
     for sc in 0..NUM_META_CONTEXTS {
         for bin in 0..NUM_ERR_BINS {
@@ -695,8 +697,74 @@ pub(crate) struct MaDcTree {
     /// Context id per node of the MA tree (meaningful for its leaves).
     pub(crate) leaf_ctx: Vec<u32>,
     /// `(static metadata context << 10) | West bin` -> context id.
-    pub(crate) meta_context: Vec<u8>,
+    pub(crate) meta_context: Vec<u16>,
     pub(crate) num_contexts: usize,
+}
+
+/// An MA-learned tree as a `Node` subtree; `offsets[node]` is the predictor
+/// offset of each leaf (zeros for a metadata tree).
+fn ma_subtree(nodes: &[crate::ma_tree::MaNode], offsets: &[i32], i: u32, meta: bool) -> Node {
+    match nodes[i as usize] {
+        crate::ma_tree::MaNode::Split { prop, val, gt, le } => Node::Split {
+            prop: u32::from(prop),
+            splitval: val,
+            gt: Box::new(ma_subtree(nodes, offsets, gt, meta)),
+            le: Box::new(ma_subtree(nodes, offsets, le, meta)),
+        },
+        crate::ma_tree::MaNode::Leaf { pred, .. } => Node::Leaf {
+            tag: if meta {
+                LeafTag::MaMeta(i)
+            } else {
+                LeafTag::Ma(i)
+            },
+            pred,
+            offset: pack_signed(offsets[i as usize]),
+            mul_log: 0,
+            mul_bits: 0,
+        },
+    }
+}
+
+/// The DC write path's view of a tree whose DC and metadata sides are both
+/// MA-learned: context id per node of either tree (meaningful for leaves).
+pub(crate) struct MaDcMetaTree {
+    pub(crate) tokens: Vec<Token>,
+    pub(crate) dc_leaf_ctx: Vec<u32>,
+    pub(crate) meta_leaf_ctx: Vec<u32>,
+    pub(crate) num_contexts: usize,
+}
+
+/// Graft MA-learned DC and metadata subtrees under the stream-routing root
+/// and number every leaf in global BFS order.
+pub(crate) fn graft_ma_dc_meta_tree(
+    num_dc_groups: usize,
+    dc: &crate::ma_tree::LearnedTree,
+    dc_offsets: &[i32],
+    meta: &crate::ma_tree::LearnedTree,
+) -> MaDcMetaTree {
+    let meta_offsets = vec![0i32; meta.nodes.len()];
+    let root = Node::Split {
+        prop: 1,
+        splitval: 1 + num_dc_groups as i32,
+        gt: Box::new(ma_subtree(&meta.nodes, &meta_offsets, 0, true)),
+        le: Box::new(ma_subtree(&dc.nodes, dc_offsets, 0, false)),
+    };
+    let (tokens, leaves, leaf_preds) = serialize(&root);
+    let mut dc_leaf_ctx = vec![u32::MAX; dc.nodes.len()];
+    let mut meta_leaf_ctx = vec![u32::MAX; meta.nodes.len()];
+    for &(tag, ctx) in &leaves {
+        match tag {
+            LeafTag::Ma(i) => dc_leaf_ctx[i as usize] = u32::from(ctx),
+            LeafTag::MaMeta(i) => meta_leaf_ctx[i as usize] = u32::from(ctx),
+            _ => {}
+        }
+    }
+    MaDcMetaTree {
+        tokens,
+        dc_leaf_ctx,
+        meta_leaf_ctx,
+        num_contexts: leaf_preds.len(),
+    }
 }
 
 /// Graft an MA-learned DC subtree under the stream-routing root, beside the
@@ -709,28 +777,11 @@ pub(crate) fn graft_ma_dc_tree(
     meta_tokens: &[Vec<Token>],
     meta_props: &[Vec<DcProp>],
 ) -> MaDcTree {
-    fn convert(nodes: &[crate::ma_tree::MaNode], offsets: &[i32], i: u32) -> Node {
-        match nodes[i as usize] {
-            crate::ma_tree::MaNode::Split { prop, val, gt, le } => Node::Split {
-                prop: u32::from(prop),
-                splitval: val,
-                gt: Box::new(convert(nodes, offsets, gt)),
-                le: Box::new(convert(nodes, offsets, le)),
-            },
-            crate::ma_tree::MaNode::Leaf { pred, .. } => Node::Leaf {
-                tag: LeafTag::Ma(i),
-                pred,
-                offset: pack_signed(offsets[i as usize]),
-                mul_log: 0,
-                mul_bits: 0,
-            },
-        }
-    }
     let root = Node::Split {
         prop: 1,
         splitval: 1 + num_dc_groups as i32,
         gt: Box::new(refined_meta_side(meta_tokens, meta_props)),
-        le: Box::new(convert(&ma.nodes, offsets, 0)),
+        le: Box::new(ma_subtree(&ma.nodes, offsets, 0, false)),
     };
     let (tokens, leaves, leaf_preds) = serialize(&root);
     let mut leaf_ctx = vec![u32::MAX; ma.nodes.len()];
@@ -1039,7 +1090,7 @@ mod tests {
     fn fixed_dc_tree_shrinks_with_the_image() {
         let dc_leaves = |samples: usize| {
             let tree = fixed_wp_dc_tree(1, samples).unwrap();
-            let mut ctx: Vec<u8> = (0..NUM_ERR_BINS).map(|b| tree.dc_context[b]).collect();
+            let mut ctx: Vec<u16> = (0..NUM_ERR_BINS).map(|b| tree.dc_context[b]).collect();
             ctx.dedup();
             ctx.len()
         };
@@ -1124,7 +1175,7 @@ mod tests {
         }
         // Static leaves keep their identity numbering in a pure round trip.
         for (tag, ctx) in &leaves {
-            assert_eq!(*tag, LeafTag::Static(*ctx));
+            assert_eq!(*tag, LeafTag::Static(*ctx as u8));
         }
     }
 
@@ -1268,10 +1319,10 @@ mod tests {
             9 | 15 => 1,
             _ => 1,
         });
-        let meta_ctxs: std::collections::HashSet<u8> =
+        let meta_ctxs: std::collections::HashSet<u16> =
             learned.meta_context.iter().copied().collect();
         assert!(
-            meta_ctxs.contains(&(meta_ctx as u8)),
+            meta_ctxs.contains(&(meta_ctx as u16)),
             "metadata walk landed outside the remapped metadata contexts"
         );
         // The synthetic QF stream must have been split on West: the two West

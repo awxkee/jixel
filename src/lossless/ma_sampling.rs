@@ -471,12 +471,15 @@ pub(super) fn tokenize_channel_ma<'a, T: Copy + 'a>(
     );
 }
 
-/// One VarDCT DC group's quantized planes in modular channel order (Y, X, B).
+/// The modular channels of one VarDCT DC-group stream (DC planes in channel
+/// order Y, X, B, or the AC-metadata image) with the decoder's stream id.
 pub(crate) struct DcPlanes {
-    pub(crate) planes: [Vec<i32>; 3],
+    pub(crate) planes: Vec<Vec<i32>>,
     /// Width and height of each plane: chroma DC planes of a subsampled JPEG
-    /// transcode are smaller than luma's.
-    pub(crate) dims: [(usize, usize); 3],
+    /// transcode are smaller than luma's; metadata channels all differ.
+    pub(crate) dims: Vec<(usize, usize)>,
+    /// The stream property the decoder sees for this modular image.
+    pub(crate) stream: i32,
 }
 
 impl DcPlanes {
@@ -498,14 +501,13 @@ impl DcPlanes {
             .collect()
     }
 
-    /// Pixels over the three planes.
+    /// Pixels over the planes.
     pub(crate) fn len(&self) -> usize {
         self.dims.iter().map(|&(w, h)| w * h).sum()
     }
 }
 
-/// MA samples of every DC group (stream id `1 + group`, default WP), taking
-/// every `stride`-th pixel.
+/// MA samples of every stream's planes, taking every `stride`-th pixel.
 pub(crate) fn sample_dc_planes(
     groups: &[DcPlanes],
     stride: usize,
@@ -521,8 +523,8 @@ pub(crate) fn sample_dc_planes(
         })
         .sum();
     let mut samples = MaSamples::with_capacity(capacity);
-    for (group, g) in groups.iter().enumerate() {
-        for c in 0..3 {
+    for g in groups {
+        for c in 0..g.planes.len() {
             let (w, h) = g.dims[c];
             if w == 0 || h == 0 {
                 continue;
@@ -534,7 +536,7 @@ pub(crate) fn sample_dc_planes(
                 w,
                 h,
                 c as u32,
-                1 + group as i32,
+                g.stream,
                 &refs,
                 wp_params,
                 true,
@@ -546,17 +548,15 @@ pub(crate) fn sample_dc_planes(
     samples
 }
 
-/// Tokenize one DC group through a learned tree: every pixel takes its leaf's
-/// context (`leaf_ctx`, indexed by tree node) and predictor.
-pub(crate) fn tokenize_dc_planes(
+/// Walk one stream's planes through a learned tree, handing the visitor
+/// each pixel's leaf node and its residual under every decoder predictor.
+pub(crate) fn walk_dc_planes_predictors(
     g: &DcPlanes,
-    group: usize,
     tree: &LearnedTree,
-    leaf_ctx: &[u32],
     wp_params: WpParams,
-    out: &mut Vec<Token>,
+    mut visit: impl FnMut(u32, &[i64; NUM_MA_PREDS]),
 ) {
-    for c in 0..3 {
+    for c in 0..g.planes.len() {
         let (w, h) = g.dims[c];
         if w == 0 || h == 0 {
             continue;
@@ -568,7 +568,44 @@ pub(crate) fn tokenize_dc_planes(
             w,
             h,
             c as u32,
-            1 + group as i32,
+            g.stream,
+            &refs,
+            wp_params,
+            true,
+            |_x, _y, v, p, n, wp_pred| {
+                let (node, _) = tree.lookup(p);
+                let mut residuals = [0i64; NUM_MA_PREDS];
+                for (pred, r) in residuals.iter_mut().enumerate() {
+                    *r = v - predictor_value(pred as u32, n, wp_pred);
+                }
+                visit(node, &residuals);
+            },
+        );
+    }
+}
+
+/// Tokenize one stream's planes through a learned tree: every pixel takes
+/// its leaf's context (`leaf_ctx`, indexed by tree node) and predictor.
+pub(crate) fn tokenize_dc_planes(
+    g: &DcPlanes,
+    tree: &LearnedTree,
+    leaf_ctx: &[u32],
+    wp_params: WpParams,
+    out: &mut Vec<Token>,
+) {
+    for c in 0..g.planes.len() {
+        let (w, h) = g.dims[c];
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let refs = g.refs(c);
+        let pixels = &g.planes[c];
+        walk_channel_ma(
+            |y| &pixels[y * w..(y + 1) * w],
+            w,
+            h,
+            c as u32,
+            g.stream,
             &refs,
             wp_params,
             true,

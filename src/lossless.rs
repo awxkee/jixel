@@ -96,7 +96,9 @@ pub(crate) use frame::{encode_frame_lossless, encode_frame_lossless_base};
 pub(crate) use groups::write_single_channel_lz77_section;
 pub(crate) use header::write_patch_dictionary;
 pub(crate) use lz77::LzToken;
-pub(crate) use ma_sampling::{DcPlanes, sample_dc_planes, tokenize_dc_planes};
+pub(crate) use ma_sampling::{
+    DcPlanes, sample_dc_planes, tokenize_dc_planes, walk_dc_planes_predictors,
+};
 pub(crate) use ma_source::ac_stream_id;
 pub(crate) use palette::write_palette_transform;
 pub(crate) use predictor::{

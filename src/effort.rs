@@ -269,6 +269,10 @@ effort_gates! {
     dc_wp_fit,
     /// Final RCT tree learns score more predictors on each side of a split.
     tree_wide_side_preds,
+    /// One EM step on the MA-learned DC tree: leaves re-pick their predictor
+    /// under the clustered histograms and the winning arm is priced again
+    /// (−0.012 % at Slow for +5..13 % time, so ExtraSlow only).
+    ma_dc_repick,
 }
 
 static ULTRAFAST: Effort = Effort {
@@ -376,6 +380,7 @@ static SLOW: Effort = Effort {
     tree_rank_deep: false,
     dc_wp_fit: false,
     tree_wide_side_preds: false,
+    ma_dc_repick: false,
     ..Effort::ALL
 };
 

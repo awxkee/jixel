@@ -1522,8 +1522,6 @@ fn bench_maroontree(
         .arg(&t.av2_speed)
         .arg("-t")
         .arg(nthreads.to_string())
-        .arg("-s")
-        .arg("slow")
         .arg(img)
         .arg(&out)
         .output()

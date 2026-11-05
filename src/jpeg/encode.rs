@@ -931,7 +931,10 @@ impl Effort {
             Speed::Fast => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
-                ma_dc_tree: Some(crate::frame::MaDcBudget::LITE),
+                ma_dc_tree: Some(crate::frame::MaDcBudget {
+                    learn_meta: false,
+                    ..crate::frame::MaDcBudget::LITE
+                }),
                 dc_wp_race: false,
                 dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
@@ -941,7 +944,10 @@ impl Effort {
             Speed::Medium | Speed::MediumSlow => Self {
                 try_natural_order: false,
                 learned_dc_tree: false,
-                ma_dc_tree: Some(crate::frame::MaDcBudget::LITE),
+                ma_dc_tree: Some(crate::frame::MaDcBudget {
+                    learn_meta: false,
+                    ..crate::frame::MaDcBudget::LITE
+                }),
                 dc_wp_race: false,
                 dc_wp_proxy_pick: true,
                 optimized_ctx_map: false,
@@ -951,7 +957,12 @@ impl Effort {
             Speed::Slow | Speed::ExtraSlow => Self {
                 try_natural_order: true,
                 learned_dc_tree: true,
-                ma_dc_tree: Some(crate::frame::MaDcBudget::FULL),
+                // A transcode's metadata streams are constant (DCT8, one
+                // QF), so the learned metadata side has nothing to win.
+                ma_dc_tree: Some(crate::frame::MaDcBudget {
+                    learn_meta: false,
+                    ..crate::frame::MaDcBudget::FULL
+                }),
                 dc_wp_race: speed == Speed::ExtraSlow,
                 dc_wp_proxy_pick: speed != Speed::ExtraSlow,
                 // About −0.24 % on large photos for ×1.7 encode time.
@@ -1199,19 +1210,19 @@ fn encode_jpeg_codestream_with_pool(
                 &dc_datas,
                 &meta_tokens,
                 &meta_props,
+                crate::frame::epf_sharpness_id(100.0, false),
                 wp_params,
                 None,
                 budget,
             )
-            .map(|(variants, meta, num_contexts, _tree)| {
-                variants
-                    .into_iter()
-                    .map(|(dc, tree_tokens)| {
-                        let (code, _) = build_code(&dc, &meta, num_contexts, scratch);
+            .map(|(arms, _trees)| {
+                arms.into_iter()
+                    .map(|arm| {
+                        let (code, _) = build_code(&arm.dc, &arm.meta, arm.num_contexts, scratch);
                         DcPlan {
-                            tree_tokens: Some(tree_tokens),
-                            dc,
-                            meta: meta.clone(),
+                            tree_tokens: Some(arm.tree),
+                            dc: arm.dc,
+                            meta: arm.meta,
                             code,
                             wp_params,
                         }
