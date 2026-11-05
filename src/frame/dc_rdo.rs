@@ -52,6 +52,9 @@ static DC_RDO_LAMBDA: [f32; 2] = [0.04, 0.15];
 static DC_RDO_LAMBDA_DISTANCE: [f32; 2] = [1.0, 2.0];
 /// X rounds toward its prediction more readily than B.
 const DC_RDO_X_LAMBDA_SCALE: f32 = 1.5;
+/// Luma is rounded under the written tree only (`refine_dc_rounding_learned`;
+/// it has no slack under the static prices) and more cautiously than chroma.
+const DC_RDO_LUMA_LAMBDA_SCALE: f32 = 0.5;
 /// Bound the error of a newly chosen level, retaining larger incumbent errors.
 const DC_RDO_MAX_ERROR: f32 = 1.0;
 /// Require enough estimated payload gain to absorb small coding-model changes.
@@ -878,7 +881,7 @@ fn learned_props(
 }
 
 /// `refine_dc_rounding` priced by the written DC tree instead of the
-/// frozen static contexts. Returns whether any plane changed.
+/// frozen static contexts, luma included. Returns whether any plane changed.
 pub(super) fn refine_dc_rounding_learned(
     groups: &mut [DcGroupData],
     distp: &DistanceParams,
@@ -916,8 +919,10 @@ pub(super) fn refine_dc_rounding_learned(
     let mut targets = try_vec![0.0f32; group_sizes.iter().copied().max().unwrap_or(0)]?;
     let mut changed = false;
     // Modular channel order Y, X, B: X references Y, B references X and Y.
+    // Luma first, so the chroma targets below see the moved Y.
     for (mchan, c, lambda) in [
-        (1usize, 0usize, lambda * DC_RDO_X_LAMBDA_SCALE),
+        (0usize, 1usize, lambda * DC_RDO_LUMA_LAMBDA_SCALE),
+        (1, 0, lambda * DC_RDO_X_LAMBDA_SCALE),
         (2, 2, lambda),
     ] {
         let mut offset = 0;
@@ -957,13 +962,13 @@ pub(super) fn refine_dc_rounding_learned(
             let to_i32 = |p: &[i16]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
             let y_plane = to_i32(dc.quant_dc.plane(1).as_slice());
             let x_plane = to_i32(dc.quant_dc.plane(0).as_slice());
-            let ref_planes: Vec<RefPlane<'_>> = if c == 0 {
-                vec![RefPlane {
+            let ref_planes: Vec<RefPlane<'_>> = match c {
+                1 => Vec::new(),
+                0 => vec![RefPlane {
                     pixels: &y_plane,
                     width: w,
-                }]
-            } else {
-                vec![
+                }],
+                _ => vec![
                     RefPlane {
                         pixels: &x_plane,
                         width: w,
@@ -972,7 +977,7 @@ pub(super) fn refine_dc_rounding_learned(
                         pixels: &y_plane,
                         width: w,
                     },
-                ]
+                ],
             };
             let stream = 1 + group as i32;
             base_bits += learned_plane_bits(
