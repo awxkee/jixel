@@ -97,6 +97,7 @@ mod patches;
 mod path_order;
 mod quant_weights;
 mod region_frames;
+mod simd;
 #[cfg(feature = "splines")]
 mod splines;
 mod squeeze;

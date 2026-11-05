@@ -459,10 +459,69 @@ fn evaluate_bias(samples: &[SamplePixel], m: &XybMatrix, steps: [f32; 3]) -> Bia
 /// gradient over the strong yellow samples (the `YELLOW_EDGE_MIN` gate
 /// statistic). Both directions avoid making the selector orientation
 /// dependent.
-fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
+/// Yellow-edge strength and strong-risk fraction over every pixel: the mean
+/// absolute luma step from a risky pixel to each of its four neighbors. A
+/// one-sided, subsampled version moved by 9 % with the image's orientation
+/// and put Kodak 13 on either side of `YELLOW_EDGE_MIN` (+16 % bytes).
+fn yellow_edge_and_strong_fraction(linear: &Image3F) -> (f32, f32) {
     let (w, h) = (linear.xsize(), linear.ysize());
     if w == 0 || h == 0 {
-        return (Vec::new(), 0.0);
+        return (0.0, 0.0);
+    }
+    let rp = linear.plane_data(0);
+    let gp = linear.plane_data(1);
+    let bp = linear.plane_data(2);
+    let luma: Vec<f32> = rp
+        .iter()
+        .zip(gp)
+        .zip(bp)
+        .map(|((&r, &g), &b)| 0.3 * r + 0.6 * g + 0.1 * b)
+        .collect();
+    let risky: Vec<bool> = rp
+        .iter()
+        .zip(gp)
+        .zip(bp)
+        .map(|((&r, &g), &b)| yellow_pixel_risk(r, g, b) > STRONG_SCORE)
+        .collect();
+    let (mut edge_sum, mut edge_n, mut strong) = (0.0f64, 0u64, 0u64);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !risky[i] {
+                continue;
+            }
+            strong += 1;
+            let c = luma[i];
+            if x > 0 {
+                edge_sum += f64::from((luma[i - 1] - c).abs());
+                edge_n += 1;
+            }
+            if x + 1 < w {
+                edge_sum += f64::from((luma[i + 1] - c).abs());
+                edge_n += 1;
+            }
+            if y > 0 {
+                edge_sum += f64::from((luma[i - w] - c).abs());
+                edge_n += 1;
+            }
+            if y + 1 < h {
+                edge_sum += f64::from((luma[i + w] - c).abs());
+                edge_n += 1;
+            }
+        }
+    }
+    let edge = if edge_n > 0 {
+        (edge_sum / edge_n as f64) as f32
+    } else {
+        0.0
+    };
+    (edge, strong as f32 / (w * h) as f32)
+}
+
+fn collect_samples(linear: &Image3F) -> Vec<SamplePixel> {
+    let (w, h) = (linear.xsize(), linear.ysize());
+    if w == 0 || h == 0 {
+        return Vec::new();
     }
 
     let rp = linear.plane_data(0);
@@ -471,9 +530,6 @@ fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
     let sample_count = h.div_ceil(SAMPLE_STRIDE) * w.div_ceil(SAMPLE_STRIDE);
     let mut samples = vec![SamplePixel::default(); sample_count];
     let mut samples_iter = samples.iter_mut();
-    let mut edge_sum = 0.0f32;
-    let mut edge_n = 0usize;
-    let luma = |r: f32, g: f32, b: f32| 0.3 * r + 0.6 * g + 0.1 * b;
     for (sample_y, r_row) in rp.chunks_exact(w).step_by(SAMPLE_STRIDE).enumerate() {
         let y = sample_y * SAMPLE_STRIDE;
         let row = y * w;
@@ -486,30 +542,12 @@ fn collect_samples(linear: &Image3F) -> (Vec<SamplePixel>, f32) {
             .zip(samples_iter.by_ref())
         {
             let x = sample_x * SAMPLE_STRIDE;
-            let i = row + x;
             let rgb = [r, g_row[x], b_row[x]];
             let risk = yellow_pixel_risk(rgb[0], rgb[1], rgb[2]);
-            if risk > STRONG_SCORE {
-                let center_luma = luma(rgb[0], rgb[1], rgb[2]);
-                if x + 1 < w {
-                    edge_sum +=
-                        (luma(r_row[x + 1], g_row[x + 1], b_row[x + 1]) - center_luma).abs();
-                    edge_n += 1;
-                }
-                if y + 1 < h {
-                    edge_sum += (luma(rp[i + w], gp[i + w], bp[i + w]) - center_luma).abs();
-                    edge_n += 1;
-                }
-            }
             *sample = SamplePixel { rgb, risk };
         }
     }
-    let yellow_edge = if edge_n > 0 {
-        edge_sum / edge_n as f32
-    } else {
-        0.0
-    };
-    (samples, yellow_edge)
+    samples
 }
 
 /// Tier-2: mild yellow matrix. Low-area detections additionally need the
@@ -568,9 +606,8 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool, bool) 
         return (SPEC_BIAS, false, false);
     }
 
-    let (samples, yellow_edge) = collect_samples(linear);
-    let strong = samples.iter().filter(|s| s.risk > STRONG_SCORE).count();
-    let strong_frac = strong as f32 / samples.len().max(1) as f32;
+    let samples = collect_samples(linear);
+    let (yellow_edge, strong_frac) = yellow_edge_and_strong_fraction(linear);
     let mut tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance, strong_frac);
     let default_weights = strong_frac < TIER2_AREA_MIN && tier2_bias > SPEC_BIAS;
     if default_weights
@@ -909,33 +946,32 @@ mod tests {
         assert!(smooth_selection.matrix.is_none());
         assert_eq!(smooth_selection.b_qm_scale, 2);
 
+        // Every other column steps to a grey (mild edges) or to black
+        // (strong edges); the statistic runs over every risky pixel.
         let mut tier2 = filled(64, 64, [0.9, 0.85, 0.05]);
-        for y in (0..64).step_by(SAMPLE_STRIDE) {
-            for x in (0..64).step_by(SAMPLE_STRIDE) {
-                if x + 1 < 64 {
-                    for c in 0..3 {
-                        tier2.plane_row_mut(c, y)[x + 1] = 0.6;
-                    }
+        for y in 0..64 {
+            for x in (1..64).step_by(2) {
+                for c in 0..3 {
+                    tier2.plane_row_mut(c, y)[x] = 0.6;
                 }
             }
         }
-        assert!(collect_samples(&tier2).1 >= TIER2_EDGE_FULL);
-        assert!(collect_samples(&tier2).1 < YELLOW_EDGE_MIN);
+        let (tier2_edge, _) = yellow_edge_and_strong_fraction(&tier2);
+        assert!(tier2_edge >= TIER2_EDGE_FULL);
+        assert!(tier2_edge < YELLOW_EDGE_MIN);
         let tier2_selection = select_yellow(&tier2, 1.0);
         assert!(tier2_selection.matrix.is_some());
         assert_eq!(tier2_selection.b_qm_scale, 2);
 
         let mut edged = filled(64, 64, [0.9, 0.85, 0.05]);
-        for y in (0..64).step_by(SAMPLE_STRIDE) {
-            for x in (0..64).step_by(SAMPLE_STRIDE) {
-                if x + 1 < 64 {
-                    for c in 0..3 {
-                        edged.plane_row_mut(c, y)[x + 1] = 0.0;
-                    }
+        for y in 0..64 {
+            for x in (1..64).step_by(2) {
+                for c in 0..3 {
+                    edged.plane_row_mut(c, y)[x] = 0.0;
                 }
             }
         }
-        assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
+        assert!(yellow_edge_and_strong_fraction(&edged).0 >= YELLOW_EDGE_MIN);
         assert_eq!(selected_b_qm_scale(true, true, 1.0), 5);
         assert_eq!(selected_b_qm_scale(true, false, 1.0), 2);
     }
@@ -988,7 +1024,7 @@ mod tests {
                 }
             }
         }
-        assert!(collect_samples(&edged).1 >= YELLOW_EDGE_MIN);
+        assert!(yellow_edge_and_strong_fraction(&edged).0 >= YELLOW_EDGE_MIN);
         assert!(has_coarse_x_structure(&edged));
         let bias = choose_b_bias(&edged, 2.0);
         assert!(bias > SPEC_BIAS);

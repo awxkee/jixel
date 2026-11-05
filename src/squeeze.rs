@@ -29,6 +29,14 @@
 
 #![allow(dead_code)]
 
+mod row_kernels;
+
+pub(crate) use row_kernels::{ClosedRow, ClosedVerticalFn, InverseRow, ResidualRounding};
+
+pub(crate) fn selected_closed_vertical_fn() -> ClosedVerticalFn {
+    row_kernels::selected().closed_vertical
+}
+
 /// A modular channel: integer samples in row-major `w`×`h`, plus shifts.
 #[derive(Clone)]
 pub(crate) struct Channel {
@@ -108,31 +116,17 @@ pub(crate) fn fwd_h_squeeze(chin: &Channel) -> (Channel, Channel) {
         hshift: chin.hshift + 1,
         vshift: chin.vshift,
     };
-    for y in 0..h {
-        let row = &chin.data[y * w..y * w + w];
-        let (pairs, tail) = row.as_chunks::<2>();
-        let avg_row = &mut avg.data[y * ow..(y + 1) * ow];
-        let res_row = &mut res.data[y * rw..(y + 1) * rw];
-        let mut next_averages = pairs
-            .iter()
-            .skip(1)
-            .map(|&[a, b]| average(a, b))
-            .chain(tail.iter().copied());
-        let mut left = None;
-        for ((&[a_pix, b_pix], avg_out), res_out) in
-            pairs.iter().zip(avg_row.iter_mut()).zip(res_row)
-        {
-            let av = average(a_pix, b_pix);
-            *avg_out = av;
-            let diff = a_pix - b_pix;
-            let next_avg = next_averages.next().unwrap_or(av);
-            let tendency = smooth_tendency(left.unwrap_or(av) as i64, av as i64, next_avg as i64);
-            *res_out = (diff as i64 - tendency) as i32;
-            left = Some(b_pix);
-        }
-        if let Some(&last) = tail.first() {
-            *avg_row.last_mut().unwrap() = last;
-        }
+    if w == 0 {
+        return (avg, res);
+    }
+    let forward = row_kernels::selected().forward_horizontal;
+    for (y, (row, avg_row)) in chin
+        .data
+        .chunks_exact(w)
+        .zip(avg.data.chunks_exact_mut(ow))
+        .enumerate()
+    {
+        forward(row, avg_row, &mut res.data[y * rw..(y + 1) * rw]);
     }
     (avg, res)
 }
@@ -194,6 +188,7 @@ pub(crate) fn fwd_v_squeeze(chin: &Channel) -> (Channel, Channel) {
         hshift: chin.hshift,
         vshift: chin.vshift + 1,
     };
+    let forward = row_kernels::selected().forward_vertical;
     for y in 0..rh {
         let row_a = &chin.data[(2 * y) * w..(2 * y) * w + w];
         let row_b = &chin.data[(2 * y + 1) * w..(2 * y + 1) * w + w];
@@ -216,28 +211,21 @@ pub(crate) fn fwd_v_squeeze(chin: &Channel) -> (Channel, Channel) {
         } else {
             None
         };
-        let avg_out = &mut avg.data[y * w..y * w + w];
-        let res_out = &mut res.data[y * w..y * w + w];
-        for x in 0..w {
-            let a_pix = row_a[x];
-            let b_pix = row_b[x];
-            let av = average(a_pix, b_pix);
-            avg_out[x] = av;
-            let diff = a_pix - b_pix;
-            let next_avg = match next_pair {
-                Some((r2, r3)) => average(r2[x], r3[x]),
-                None => match next_lone {
-                    Some(r2) => r2[x],
-                    None => av,
-                },
-            };
-            let top = match row_top {
-                Some(rt) => rt[x],
-                None => av,
-            };
-            let tendency = smooth_tendency(top as i64, av as i64, next_avg as i64);
-            res_out[x] = (diff as i64 - tendency) as i32;
-        }
+        let next = next_pair.map_or_else(
+            || next_lone.map_or([row_a, row_b], |row| [row, row]),
+            |(a, b)| [a, b],
+        );
+        forward(
+            row_kernels::ForwardRow {
+                pixels: [row_a, row_b],
+                top: row_top,
+                next,
+            },
+            [
+                &mut avg.data[y * w..(y + 1) * w],
+                &mut res.data[y * w..(y + 1) * w],
+            ],
+        );
     }
     if h & 1 == 1 {
         let src = &chin.data[(2 * (oh - 1)) * w..(2 * (oh - 1)) * w + w];
@@ -261,6 +249,7 @@ pub(crate) fn inv_v_squeeze(avg: &Channel, res: &Channel) -> Channel {
     if w == 0 || h == 0 {
         return out;
     }
+    let inverse = row_kernels::selected().inverse_vertical;
     let avg_rows = avg.data.chunks_exact(w);
     let mut next_avg_rows = avg_rows.clone().skip(1);
     let mut top_row: Option<&[i32]> = None;
@@ -270,21 +259,15 @@ pub(crate) fn inv_v_squeeze(avg: &Channel, res: &Channel) -> Channel {
     {
         let next_avg_row = next_avg_rows.next().unwrap_or(avg_row);
         let (a_row, b_row) = out_pair.split_at_mut(w);
-        let mut top_values = top_row.into_iter().flatten();
-        for (((&av, &residual), &next_avg), (a_pix, b_pix)) in avg_row
-            .iter()
-            .zip(res_row)
-            .zip(next_avg_row)
-            .zip(a_row.iter_mut().zip(b_row.iter_mut()))
-        {
-            let av = i64::from(av);
-            let top = top_values.next().map_or(av, |&top| i64::from(top));
-            let tendency = smooth_tendency(top, av, i64::from(next_avg));
-            let diff = i64::from(residual) + tendency;
-            let first = av + (diff / 2);
-            *a_pix = first as i32;
-            *b_pix = (first - diff) as i32;
-        }
+        inverse(
+            row_kernels::InverseRow {
+                average: avg_row,
+                residual: res_row,
+                top: top_row,
+                next: next_avg_row,
+            },
+            [a_row, b_row],
+        );
         top_row = Some(b_row);
     }
     if oh > rh {

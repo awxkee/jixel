@@ -127,7 +127,7 @@ pub(crate) mod kit {
         MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS,
     };
     pub(crate) use super::predictor::{
-        PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_plane,
+        PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_rows,
         fixed_predictor, selected_grad_pack_interior_fn, tokenize_plane_rows,
     };
     pub(crate) use super::rct::forward_ycocg;

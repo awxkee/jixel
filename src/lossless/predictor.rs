@@ -30,13 +30,14 @@
 //! Modular predictors, neighborhoods, and gradient row kernels.
 
 mod cost;
+pub(crate) mod row_kernels;
 #[cfg(test)]
 mod tests;
 mod tokens;
 mod weighted;
 
-pub(crate) use cost::{SqueezePredictorCost, choose_predictor_for_plane};
-pub(super) use cost::{choose_predictor_for_rows, choose_predictors_with_wp, choose_wp_params};
+pub(crate) use cost::{SqueezePredictorCost, choose_predictor_for_rows};
+pub(super) use cost::{choose_predictors_with_wp, choose_wp_params};
 pub(crate) use tokens::{channel_to_context, tokenize_plane_rows};
 pub(super) use tokens::{
     tokenize_all, tokenize_channels_with_wp, tokenize_plane, tokenize_runs_with_wp,

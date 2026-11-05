@@ -37,14 +37,14 @@
 //! as `squeeze::inv_h_squeeze` / `inv_v_squeeze` rebuild them.
 
 use crate::adaptive_quant::dirty_log2f;
-use crate::fast_divide::DividerI32;
-use crate::squeeze::{Channel, SqueezeStep};
+use crate::squeeze::{Channel, ClosedRow, InverseRow, ResidualRounding, SqueezeStep};
 use crate::thread_pool::ThreadPool;
 
 /// How a residual's magnitude rounds once divided by its step.
 #[derive(Clone, Copy)]
 pub(crate) enum Rounding {
     /// To nearest after taking this much of a step off the magnitude.
+    #[cfg(test)]
     Deadzone(f32),
     /// To nearest, or one step toward zero where that saves more estimated
     /// bits, times this lambda, than it adds in squared error (in steps²).
@@ -61,6 +61,7 @@ fn quantize_residual(r: i64, q: i64, rounding: Rounding) -> i64 {
     let f = r.unsigned_abs() as f32 / q as f32;
     let m = match rounding {
         // Casting a nonnegative float truncates toward zero, which is floor.
+        #[cfg(test)]
         Rounding::Deadzone(deadzone) => (f + 0.5 - deadzone).max(0.0) as i64,
         Rounding::RateAware(lambda) => {
             let nearest = (f + 0.5) as i64;
@@ -80,42 +81,6 @@ fn quantize_residual(r: i64, q: i64, rounding: Rounding) -> i64 {
         }
     };
     if r < 0 { -m } else { m }
-}
-
-/// [`quantize_residual`] for one step `q`, without its float division when
-/// there is no deadzone: `floor(|r| / q + 1/2)` is then the integer rounded
-/// quotient, exact through a precomputed divider for every `|r| < 2^23`
-/// (beyond that the f32 path is kept, bit for bit).
-#[derive(Clone, Copy)]
-struct ResidualRounding {
-    q: i64,
-    half: i32,
-    divider: DividerI32,
-    deadzone: f32,
-}
-
-impl ResidualRounding {
-    const EXACT_MAGNITUDE: u64 = 1 << 23;
-
-    fn new(q: i64, deadzone: f32) -> Self {
-        let step = q.clamp(1, i64::from(i32::MAX)) as i32;
-        Self {
-            q,
-            half: step / 2,
-            divider: DividerI32::new(step),
-            deadzone,
-        }
-    }
-
-    #[inline(always)]
-    fn apply(self, r: i64) -> i64 {
-        let magnitude = r.unsigned_abs();
-        if self.q <= 1 || self.deadzone != 0.0 || magnitude >= Self::EXACT_MAGNITUDE {
-            return quantize_residual(r, self.q, Rounding::Deadzone(self.deadzone));
-        }
-        let m = i64::from((magnitude as i32 + self.half) / self.divider);
-        if r < 0 { -m } else { m }
-    }
 }
 
 /// One horizontal squeeze step quantized in closed loop: the residuals of
@@ -333,11 +298,11 @@ fn closed_v_from_exact(
     deadzone: f32,
     pool: &ThreadPool,
 ) -> (Channel, Vec<i32>, Vec<i32>) {
-    use crate::squeeze::smooth_tendency;
     let (w, oh, rh) = (avg.w, avg.h, res.h);
     let h = oh + rh;
     let q = i64::from(q);
     let rounding = ResidualRounding::new(q, deadzone);
+    let closed_row = crate::squeeze::selected_closed_vertical_fn();
     let stripe = COLUMNS_PER_STRIPE;
     // Each stripe codes its columns into its own buffers, `sw` columns wide,
     // scattered back afterwards.
@@ -371,38 +336,18 @@ fn closed_v_from_exact(
             let (out0, remaining) = remaining.split_at_mut(sw);
             let out1 = &mut remaining[..sw];
             let r_row = &mut r[y * sw..(y + 1) * sw];
-            let exact = exact_avg
-                .iter()
-                .zip(next_exact)
-                .zip(top_exact)
-                .zip(exact_res);
-            let decoded = dec_avg.iter().zip(next_dec).zip(top_dec);
-            let outputs = x0
-                .iter_mut()
-                .zip(x1)
-                .zip(r_row)
-                .zip(out0.iter_mut().zip(out1));
-            for ((exact, decoded), outputs) in exact.zip(decoded).zip(outputs) {
-                let (((&av, &next), &top), &exact_res) = exact;
-                let ((&av_dec, &next_dec), &top_dec) = decoded;
-                let (((x0, x1), residual), (out0, out1)) = outputs;
-                let av = i64::from(av);
-                let tendency = smooth_tendency(i64::from(top), av, i64::from(next));
-                let diff = i64::from(exact_res) + tendency;
-                let first = av + diff / 2;
-                *x0 = first as i32;
-                *x1 = (first - diff) as i32;
-
-                let av = i64::from(av_dec);
-                let tendency = smooth_tendency(i64::from(top_dec), av, i64::from(next_dec));
-                let diff = i64::from(*x0) - i64::from(*x1);
-                let quantized = rounding.apply(diff - tendency);
-                *residual = quantized as i32;
-                let diff = quantized * q + tendency;
-                let first = av + diff / 2;
-                *out0 = first as i32;
-                *out1 = (first - diff) as i32;
-            }
+            let row = ClosedRow {
+                exact: InverseRow {
+                    average: exact_avg,
+                    residual: exact_res,
+                    top: Some(top_exact),
+                    next: next_exact,
+                },
+                average: dec_avg,
+                top: top_dec,
+                next: next_dec,
+            };
+            closed_row(row, rounding, [x0, x1, r_row, out0, out1]);
         }
         if oh > rh {
             x[(h - 1) * sw..].copy_from_slice(&avg.data[(oh - 1) * w + c0..][..sw]);

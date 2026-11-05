@@ -125,26 +125,26 @@ pub(super) fn scalar() -> Kernels {
 }
 #[allow(unused_macros)]
 macro_rules! backend {
-    ($feature:literal,$lanes:literal,$load:ident,$store:ident,$splat:ident,$add:ident,$sub:ident,$mul:ident,$div:ident,$abs:ident,$max:ident,$nonzero:ident) => {
+    ($feature:literal, $lanes:literal) => {
         #[target_feature(enable=$feature)]
         fn half<const BIAS: bool>(src: [&[f32]; 2], out: &mut [f32]) {
             let end = out.len() / $lanes * $lanes;
             unsafe {
                 for x in (0..end).step_by($lanes) {
-                    let mut taps = [$splat(0.0); 4];
+                    let mut taps = [v::splat(0.0); 4];
                     for t in 0..4 {
                         let v: [f32; $lanes] =
                             std::array::from_fn(|i| src[t % 2][2 * (x + i) + t / 2]);
-                        taps[t] = $load(v.as_ptr());
+                        taps[t] = v::load(v.as_ptr());
                         if BIAS {
-                            taps[t] = $add(taps[t], $splat(0.01));
+                            taps[t] = v::add(taps[t], v::splat(0.01));
                         }
                     }
-                    $store(
+                    v::store(
                         out.as_mut_ptr().add(x),
-                        $mul(
-                            $splat(0.25),
-                            $add($add($add(taps[0], taps[1]), taps[2]), taps[3]),
+                        v::mul(
+                            v::splat(0.25),
+                            v::add(v::add(v::add(taps[0], taps[1]), taps[2]), taps[3]),
                         ),
                     );
                 }
@@ -158,18 +158,18 @@ macro_rules! backend {
             for y in 0..h / 2 {
                 unsafe {
                     for x in (0..end).step_by($lanes) {
-                        let mut taps = [$splat(0.0); 4];
+                        let mut taps = [v::splat(0.0); 4];
                         for t in 0..4 {
                             let v: [f32; $lanes] = std::array::from_fn(|i| {
                                 values[(2 * y + t % 2) * w + 2 * (x + i) + t / 2]
                             });
-                            taps[t] = $load(v.as_ptr());
+                            taps[t] = v::load(v.as_ptr());
                         }
-                        $store(
+                        v::store(
                             values.as_mut_ptr().add(y * ow + x),
-                            $mul(
-                                $splat(0.25),
-                                $add($add($add(taps[0], taps[1]), taps[2]), taps[3]),
+                            v::mul(
+                                v::splat(0.25),
+                                v::add(v::add(v::add(taps[0], taps[1]), taps[2]), taps[3]),
                             ),
                         );
                     }
@@ -186,10 +186,13 @@ macro_rules! backend {
             let end = out.len() / $lanes * $lanes;
             unsafe {
                 for x in (0..end).step_by($lanes) {
-                    let m = $load(mean.as_ptr().add(x));
-                    $store(
+                    let m = v::load(mean.as_ptr().add(x));
+                    v::store(
                         out.as_mut_ptr().add(x),
-                        $max($sub($load(square.as_ptr().add(x)), $mul(m, m)), $splat(0.0)),
+                        v::max(
+                            v::sub(v::load(square.as_ptr().add(x)), v::mul(m, m)),
+                            v::splat(0.0),
+                        ),
                     );
                 }
             }
@@ -200,31 +203,31 @@ macro_rules! backend {
             let end = src[0].len() / $lanes * $lanes;
             unsafe {
                 for x in (0..end).step_by($lanes) {
-                    let [b, square, cross, a, variance] = src.map(|s| $load(s.as_ptr().add(x)));
-                    let zero = $splat(0.0);
-                    let one = $splat(1.0);
-                    let c = $splat(0.0009);
-                    let var = $max($sub(square, $mul(b, b)), zero);
-                    let cov = $nonzero($sub(cross, $mul(a, b)), variance, var);
-                    let delta = $sub(a, b);
-                    let s = $max(
-                        $sub(
+                    let [b, square, cross, a, variance] = src.map(|s| v::load(s.as_ptr().add(x)));
+                    let zero = v::splat(0.0);
+                    let one = v::splat(1.0);
+                    let c = v::splat(0.0009);
+                    let var = v::max(v::sub(square, v::mul(b, b)), zero);
+                    let cov = v::mask_nonzero(v::sub(cross, v::mul(a, b)), variance, var);
+                    let delta = v::sub(a, b);
+                    let s = v::max(
+                        v::sub(
                             one,
-                            $div(
-                                $mul(
-                                    $sub(one, $mul(delta, delta)),
-                                    $add($mul($splat(2.0), cov), c),
+                            v::div(
+                                v::mul(
+                                    v::sub(one, v::mul(delta, delta)),
+                                    v::add(v::mul(v::splat(2.0), cov), c),
                                 ),
-                                $add($add(variance, var), c),
+                                v::add(v::add(variance, var), c),
                             ),
                         ),
                         zero,
                     );
-                    let fourth = $mul($mul($mul(s, s), s), s);
+                    let fourth = v::mul(v::mul(v::mul(s, s), s), s);
                     let mut terms = [0.0; $lanes];
                     let mut powers = [0.0; $lanes];
-                    $store(terms.as_mut_ptr(), s);
-                    $store(powers.as_mut_ptr(), fourth);
+                    v::store(terms.as_mut_ptr(), s);
+                    v::store(powers.as_mut_ptr(), fourth);
                     for i in 0..$lanes {
                         sum[0] += terms[i];
                         sum[1] += powers[i];
@@ -238,20 +241,20 @@ macro_rules! backend {
             let end = src[0].len() / $lanes * $lanes;
             unsafe {
                 for x in (0..end).step_by($lanes) {
-                    let [ai, aj, bi, bj] = src.map(|s| $load(s.as_ptr().add(x)));
-                    let a = $sub(aj, ai);
-                    let b = $sub(bj, bi);
-                    let zero = $splat(0.0);
-                    let error = $abs($sub(b, a));
-                    let excess = $max($sub($abs(b), $abs(a)), zero);
-                    let loss = $max($sub($abs(a), $abs(b)), zero);
-                    let loss4 = $mul($mul($mul(loss, loss), loss), loss);
+                    let [ai, aj, bi, bj] = src.map(|s| v::load(s.as_ptr().add(x)));
+                    let a = v::sub(aj, ai);
+                    let b = v::sub(bj, bi);
+                    let zero = v::splat(0.0);
+                    let error = v::abs(v::sub(b, a));
+                    let excess = v::max(v::sub(v::abs(b), v::abs(a)), zero);
+                    let loss = v::max(v::sub(v::abs(a), v::abs(b)), zero);
+                    let loss4 = v::mul(v::mul(v::mul(loss, loss), loss), loss);
                     let mut e = [0.0; $lanes];
                     let mut ex = [0.0; $lanes];
                     let mut l = [0.0; $lanes];
-                    $store(e.as_mut_ptr(), error);
-                    $store(ex.as_mut_ptr(), excess);
-                    $store(l.as_mut_ptr(), loss4);
+                    v::store(e.as_mut_ptr(), error);
+                    v::store(ex.as_mut_ptr(), excess);
+                    v::store(l.as_mut_ptr(), loss4);
                     for i in 0..$lanes {
                         sum[0] += e[i];
                         sum[1] += ex[i];
@@ -280,127 +283,23 @@ macro_rules! backend {
 }
 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
 mod sse {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    #[target_feature(enable = "sse2")]
-    fn abs(v: __m128) -> __m128 {
-        _mm_andnot_ps(_mm_set1_ps(-0.0), v)
-    }
-    #[target_feature(enable = "sse2")]
-    fn nonzero(v: __m128, a: __m128, b: __m128) -> __m128 {
-        _mm_and_ps(
-            v,
-            _mm_and_ps(
-                _mm_cmpneq_ps(a, _mm_setzero_ps()),
-                _mm_cmpneq_ps(b, _mm_setzero_ps()),
-            ),
-        )
-    }
-    backend!(
-        "sse2",
-        4,
-        _mm_loadu_ps,
-        _mm_storeu_ps,
-        _mm_set1_ps,
-        _mm_add_ps,
-        _mm_sub_ps,
-        _mm_mul_ps,
-        _mm_div_ps,
-        abs,
-        _mm_max_ps,
-        nonzero
-    );
+    use crate::simd::sse::f32 as v;
+    backend!("sse2", 4);
 }
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx {
-    use std::arch::x86_64::*;
-    #[target_feature(enable = "avx2")]
-    fn abs(v: __m256) -> __m256 {
-        _mm256_andnot_ps(_mm256_set1_ps(-0.0), v)
-    }
-    #[target_feature(enable = "avx2")]
-    fn nonzero(v: __m256, a: __m256, b: __m256) -> __m256 {
-        _mm256_and_ps(
-            v,
-            _mm256_and_ps(
-                _mm256_cmp_ps::<_CMP_NEQ_UQ>(a, _mm256_setzero_ps()),
-                _mm256_cmp_ps::<_CMP_NEQ_UQ>(b, _mm256_setzero_ps()),
-            ),
-        )
-    }
-    backend!(
-        "avx2",
-        8,
-        _mm256_loadu_ps,
-        _mm256_storeu_ps,
-        _mm256_set1_ps,
-        _mm256_add_ps,
-        _mm256_sub_ps,
-        _mm256_mul_ps,
-        _mm256_div_ps,
-        abs,
-        _mm256_max_ps,
-        nonzero
-    );
+    use crate::simd::avx::f32 as v;
+    backend!("avx2", 8);
 }
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon {
-    use std::arch::aarch64::*;
-    #[target_feature(enable = "neon")]
-    fn nonzero(v: float32x4_t, a: float32x4_t, b: float32x4_t) -> float32x4_t {
-        vbslq_f32(vorrq_u32(vceqzq_f32(a), vceqzq_f32(b)), vdupq_n_f32(0.0), v)
-    }
-    backend!(
-        "neon",
-        4,
-        vld1q_f32,
-        vst1q_f32,
-        vdupq_n_f32,
-        vaddq_f32,
-        vsubq_f32,
-        vmulq_f32,
-        vdivq_f32,
-        vabsq_f32,
-        vmaxnmq_f32,
-        nonzero
-    );
+    use crate::simd::neon::f32 as v;
+    backend!("neon", 4);
 }
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm {
-    use std::arch::wasm32::*;
-    #[target_feature(enable = "simd128")]
-    unsafe fn load(p: *const f32) -> v128 {
-        unsafe { v128_load(p.cast()) }
-    }
-    #[target_feature(enable = "simd128")]
-    unsafe fn store(p: *mut f32, v: v128) {
-        unsafe { v128_store(p.cast(), v) }
-    }
-    #[target_feature(enable = "simd128")]
-    fn max(a: v128, b: v128) -> v128 {
-        v128_bitselect(a, b, f32x4_gt(a, b))
-    }
-    #[target_feature(enable = "simd128")]
-    fn nonzero(v: v128, a: v128, b: v128) -> v128 {
-        let z = f32x4_splat(0.0);
-        v128_bitselect(z, v, v128_or(f32x4_eq(a, z), f32x4_eq(b, z)))
-    }
-    backend!(
-        "simd128",
-        4,
-        load,
-        store,
-        f32x4_splat,
-        f32x4_add,
-        f32x4_sub,
-        f32x4_mul,
-        f32x4_div,
-        f32x4_abs,
-        max,
-        nonzero
-    );
+    use crate::simd::wasm::f32 as v;
+    backend!("simd128", 4);
 }
 #[cfg(test)]
 pub(super) fn available() -> Vec<(&'static str, Kernels)> {

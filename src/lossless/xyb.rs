@@ -38,8 +38,8 @@ use super::lz77::{
 };
 use super::palette::write_palette_transform;
 use super::predictor::{
-    channel_to_context, choose_predictor_for_plane, fixed_predictor,
-    selected_grad_pack_interior_fn, tokenize_plane, tokenize_plane_rows,
+    channel_to_context, choose_predictor_for_rows, fixed_predictor, selected_grad_pack_interior_fn,
+    tokenize_plane, tokenize_plane_rows,
 };
 use super::rct::forward_ycocg;
 use super::{GROUP_DIM, GroupLayout};
@@ -193,12 +193,20 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
             .collect();
 
         write_palette_transform(num_c as u32, nb_colors as u32, &mut section);
-        let pget = |gx: usize, gy: usize| palette_ch[gy * nb_colors + gx];
-        let iget = |gx: usize, gy: usize| index_img[gy * xsize + gx];
         let preds = if effort.predictor_search {
             vec![
-                choose_predictor_for_plane(pget, nb_colors, num_c, use_wp),
-                choose_predictor_for_plane(iget, xsize, ysize, use_wp),
+                choose_predictor_for_rows(
+                    |y| &palette_ch[y * nb_colors..][..nb_colors],
+                    nb_colors,
+                    num_c,
+                    use_wp,
+                ),
+                choose_predictor_for_rows(
+                    |y| &index_img[y * xsize..][..xsize],
+                    xsize,
+                    ysize,
+                    use_wp,
+                ),
             ]
         } else {
             vec![fixed_predictor(use_wp); 2]
@@ -228,9 +236,8 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
         section.write(2, 0b00); // 0 transforms: Y/X/B-Y are already decorrelated
         let mut preds = Vec::with_capacity(num_c);
         for (c, data) in ch.iter().enumerate() {
-            let get = |gx: usize, gy: usize| data[gy * xsize + gx];
             let pred = if effort.predictor_search {
-                choose_predictor_for_plane(get, xsize, ysize, use_wp)
+                choose_predictor_for_rows(|y| &data[y * xsize..][..xsize], xsize, ysize, use_wp)
             } else {
                 fixed_predictor(use_wp)
             };

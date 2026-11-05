@@ -41,7 +41,7 @@ use super::lz77::{
     write_local_tree_lz77, write_lz_section,
 };
 use super::predictor::{
-    GradPackInteriorFn, SqueezePredictorCost, channel_to_context, choose_predictor_for_plane,
+    GradPackInteriorFn, SqueezePredictorCost, channel_to_context, choose_predictor_for_rows,
     fixed_predictor, tokenize_plane_rows,
 };
 use super::rct::write_rct_transform;
@@ -217,8 +217,7 @@ pub(super) fn encode_squeeze_single_group(
             let ch = &channels[c];
             let data = &ch.data;
             let w = ch.w;
-            let get = move |gx: usize, gy: usize| data[gy * w + gx];
-            choose_predictor_for_plane(get, ch.w, ch.h, use_wp)
+            choose_predictor_for_rows(|y| &data[y * w..][..w], ch.w, ch.h, use_wp)
         })
     } else {
         vec![fixed_predictor(use_wp); nb]
@@ -384,7 +383,7 @@ pub(super) fn encode_squeeze_multigroup(
         let mut costs: Vec<SqueezePredictorCost> =
             (0..nb).map(|_| SqueezePredictorCost::default()).collect();
         for (cost, ch) in costs[..split].iter_mut().zip(&channels[..split]) {
-            cost.add_crop(|x, y| ch.data[y * ch.w + x], ch.w, ch.h, use_wp);
+            cost.add_rows(|y| &ch.data[y * ch.w..][..ch.w], ch.w, ch.h, use_wp);
         }
         for gy in 0..ysize_dc_groups {
             for gx in 0..xsize_dc_groups {
@@ -398,8 +397,8 @@ pub(super) fn encode_squeeze_multigroup(
                     1000,
                     |within, c, x0, y0, w, h| {
                         let ch = &channels[c];
-                        costs[within].add_crop(
-                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
+                        costs[within].add_rows(
+                            |y| &ch.data[(y0 + y) * ch.w + x0..][..w],
                             w,
                             h,
                             use_wp,
@@ -420,8 +419,8 @@ pub(super) fn encode_squeeze_multigroup(
                     2,
                     |within, c, x0, y0, w, h| {
                         let ch = &channels[c];
-                        costs[within].add_crop(
-                            |x, y| ch.data[(y0 + y) * ch.w + x0 + x],
+                        costs[within].add_rows(
+                            |y| &ch.data[(y0 + y) * ch.w + x0..][..w],
                             w,
                             h,
                             use_wp,

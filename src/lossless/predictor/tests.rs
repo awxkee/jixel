@@ -179,6 +179,66 @@ fn row_costs_match_point_fetched_histograms_and_predictors() {
 }
 
 #[test]
+fn row_costs_preserve_every_wp_preset_and_zero_histogram() {
+    let (w, h) = (33, 7);
+    let data: Vec<i32> = (0..w * h)
+        .map(|i| {
+            if i / w < 3 {
+                37
+            } else {
+                ((i * 97 + i / w * 31) % 2048) as i32 - 1024
+            }
+        })
+        .collect();
+    let get = |x, y| data[y * w + x];
+    for params in WpParams::PRESETS {
+        for use_wp in [false, true] {
+            let mut reference = SqueezePredictorCost::with_zero();
+            let mut wp = WpState::with_params(w, params);
+            for y in 0..h {
+                for x in 0..w {
+                    let n = predictor_neighbors(&get, x, y, w);
+                    let value = get(x, y) as i64;
+                    let weighted = if use_wp {
+                        wp.predict(x, y, n.top, n.left, n.top_right, n.top_left, n.top_top)
+                    } else {
+                        0
+                    };
+                    reference.costs.add(value, n, weighted);
+                    if use_wp {
+                        wp.update(value, x, y);
+                    }
+                }
+            }
+            for flat in [false, true] {
+                let mut actual = SqueezePredictorCost::with_zero();
+                if flat {
+                    actual.add_rows_shared::<_, true>(
+                        &|y| &data[y * w..][..w],
+                        w,
+                        h,
+                        use_wp,
+                        params,
+                    );
+                } else {
+                    actual.add_rows_shared::<_, false>(
+                        &|y| &data[y * w..][..w],
+                        w,
+                        h,
+                        use_wp,
+                        params,
+                    );
+                }
+                assert_eq!(actual.costs.histograms, reference.costs.histograms);
+                assert_eq!(actual.costs.zero_hist, reference.costs.zero_hist);
+                assert_eq!(actual.costs.total, reference.costs.total);
+                assert_eq!(actual.predictor(use_wp), reference.predictor(use_wp));
+            }
+        }
+    }
+}
+
+#[test]
 fn palette_flat_spans_preserve_cost_histograms() {
     for w in [1, 17, 64] {
         let h = 8;
