@@ -137,6 +137,22 @@ impl State {
     }
 }
 
+// Tile widths are 1..=SIDE and a terminal cell is at most SIDE*SIDE.
+// Cache both coordinates so recursive visits need no runtime division.
+static CELL_COORDS: [[u16; SIDE * SIDE + 1]; SIDE + 1] = {
+    let mut coords = [[0; SIDE * SIDE + 1]; SIDE + 1];
+    let mut width = 1;
+    while width <= SIDE {
+        let mut cell = 0;
+        while cell <= SIDE * SIDE {
+            coords[width][cell] = ((cell / width) << 8 | cell % width) as u16;
+            cell += 1;
+        }
+        width += 1;
+    }
+    coords
+};
+
 fn visit(
     state: State,
     profile: [u8; SIDE],
@@ -152,7 +168,8 @@ fn visit(
         Some(Memo::AtLeast(bound)) if bound >= budget => return None,
         _ => {}
     }
-    let (x, y) = (state.cell % width, state.cell / width);
+    let coords = CELL_COORDS[width][state.cell];
+    let (x, y) = (usize::from(coords & 0xff), usize::from(coords >> 8));
     debug_assert_eq!(first_open(profile, width), (x, y));
     if y == height {
         return Some(Entry {

@@ -47,6 +47,8 @@ use super::token::Token;
 use crate::bit_writer::BitWriter;
 use crate::entropy::dlog2::{f_fmla, f_log2};
 use crate::entropy::fast_div_u16::FastDivU16;
+#[cfg(not(target_arch = "aarch64"))]
+use crate::fast_divide::DividerU64;
 use std::sync::OnceLock;
 
 pub(crate) const ANS_LOG_TAB_SIZE: u32 = 12;
@@ -102,13 +104,19 @@ pub(crate) fn normalize_counts_first_maximum(counts: &[u32], freqs: &mut [u16]) 
     if total == 0 {
         return 0;
     }
+    // AArch64's hardware divide wins over reciprocal setup for these short
+    // histograms; other targets reuse the precomputed 64-bit divisor.
+    #[cfg(target_arch = "aarch64")]
+    let divider = total;
+    #[cfg(not(target_arch = "aarch64"))]
+    let divider = DividerU64::new(total);
     let table = ANS_TAB_SIZE as i64;
     let mut sum: i64 = 0;
     for (freq, &count) in freqs.iter_mut().zip(counts.iter()) {
         if count == 0 {
             continue;
         }
-        let mut f = (count as u64 * ANS_TAB_SIZE as u64 / total) as i64;
+        let mut f = (count as u64 * ANS_TAB_SIZE as u64 / divider) as i64;
         if f < 1 {
             f = 1;
         }
