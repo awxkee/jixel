@@ -164,7 +164,10 @@ pub(crate) struct EncodingContext {
     luma_texture: std::sync::atomic::AtomicU32,
     /// Selection-only table sets (16/32 family scaled) in force while a
     /// transform-selection race arm sets up its DC groups; `None` otherwise.
-    selection_tables: std::sync::RwLock<Option<&'static [&'static DequantMatrices; 4]>>,
+    /// Only immutable, process-lifetime sets from `selection_sets` are stored;
+    /// null restores the coding tables. Readers never modify the pointee.
+    #[cfg(feature = "extraslow")]
+    selection_tables: std::sync::atomic::AtomicPtr<[&'static DequantMatrices; 4]>,
     point_chroma: std::sync::atomic::AtomicBool,
     x_heavy: std::sync::atomic::AtomicBool,
     pair_b_fine: std::sync::atomic::AtomicBool,
@@ -265,10 +268,7 @@ impl EncodingContext {
         );
         if let Some(&plain) = plain {
             plain
-        } else if let Some(sets) = *self
-            .selection_tables
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        } else if let Some(sets) = self.selection_matrices()
             && !self.x_heavy.load(Relaxed)
             && self.point_chroma_hq_matrices().is_none()
         {
@@ -288,6 +288,24 @@ impl EncodingContext {
                 (false, true) => self.pair_b_matrices,
                 (false, false) => self.base_matrices,
             }
+        }
+    }
+
+    #[inline]
+    fn selection_matrices(&self) -> Option<&'static [&'static DequantMatrices; 4]> {
+        #[cfg(feature = "extraslow")]
+        {
+            let sets = self
+                .selection_tables
+                .load(std::sync::atomic::Ordering::Acquire);
+            // SAFETY: set_selection_family publishes only immutable, leaked
+            // table sets with release ordering. They remain valid even after
+            // another set is published or the override is cleared.
+            unsafe { sets.as_ref() }
+        }
+        #[cfg(not(feature = "extraslow"))]
+        {
+            None
         }
     }
 
@@ -332,10 +350,12 @@ impl EncodingContext {
                 f,
             )
         });
-        *self
-            .selection_tables
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = sets;
+        self.selection_tables.store(
+            sets.map_or(std::ptr::null_mut(), |sets| {
+                std::ptr::from_ref(sets).cast_mut()
+            }),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub(crate) fn set_luma_texture(&self, stat: f32) {
@@ -624,7 +644,8 @@ impl EncodingContext {
                 DequantMatrices::new(0.0, arbiter, retile)
             },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
-            selection_tables: std::sync::RwLock::new(None),
+            #[cfg(feature = "extraslow")]
+            selection_tables: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             luma_texture: std::sync::atomic::AtomicU32::new(0),
             point_chroma: std::sync::atomic::AtomicBool::new(false),
             x_heavy: std::sync::atomic::AtomicBool::new(false),
@@ -734,6 +755,78 @@ impl Default for EncodingContext {
 #[cfg(test)]
 mod tests {
     use super::channel_weights_for_bias;
+
+    #[cfg(feature = "extraslow")]
+    #[test]
+    fn selection_family_switches_and_restores_each_content_class() {
+        use super::{DequantMatrices, EncodingContext, Speed, xyb};
+        let distance = 1.0;
+        let ctx = EncodingContext::new(
+            Speed::ExtraSlow,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            distance,
+            2,
+        );
+        let effort = ctx.speed.effort();
+        for (class, (chroma, pair_b)) in
+            [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            ctx.set_chroma_heavy(chroma);
+            ctx.set_pair_b_fine(pair_b);
+            let coding = ctx.matrices();
+            for family in [Some(1.25), Some(0.85), None, Some(1.25), Some(1.0)] {
+                let expected = match family {
+                    Some(scale) if scale != 1.0 => DequantMatrices::selection_sets(
+                        distance,
+                        ctx.arbiter,
+                        effort.rectangles,
+                        effort.layout_retile && !effort.layout_loop(),
+                        scale,
+                    )[class],
+                    _ => coding,
+                };
+                ctx.set_selection_family(distance, family);
+                // Workers see each publication, including replacement and
+                // both ways of restoring the coding tables.
+                ctx.thread_pool.map(4, |_| {
+                    assert!(std::ptr::eq(ctx.matrices(), expected));
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "extraslow")]
+    #[test]
+    fn selection_family_preserves_point_and_x_overrides() {
+        use super::{EncodingContext, Speed, xyb};
+        let distance = 0.295;
+        let ctx = EncodingContext::new(
+            Speed::ExtraSlow,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
+        ctx.set_point_chroma(true);
+        let point = ctx.matrices();
+        ctx.set_x_heavy(true);
+        let x = ctx.matrices();
+        assert!(!std::ptr::eq(point, x));
+
+        ctx.set_selection_family(distance, Some(1.25));
+        assert!(std::ptr::eq(ctx.matrices(), x));
+        ctx.set_x_heavy(false);
+        assert!(std::ptr::eq(ctx.matrices(), point));
+        ctx.set_point_chroma(false);
+        let selection = ctx.matrices();
+        assert!(!std::ptr::eq(selection, point));
+        assert!(!std::ptr::eq(selection, x));
+        ctx.set_selection_family(distance, None);
+        assert!(!std::ptr::eq(ctx.matrices(), selection));
+    }
 
     #[test]
     fn point_chroma_tables_preserve_existing_class_precedence() {
