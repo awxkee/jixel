@@ -87,11 +87,17 @@ effort_gates! {
     dc_predictor_search,
     /// Chroma DC rounding with frozen residual prices and a pooled rate check.
     dc_rdoq,
+    /// ... refined once more under the written DC tree's contexts, leaf
+    /// predictors and clustered histograms, then re-tokenized under it.
+    dc_rdoq_refit,
     /// Per-image learned DC context tree raced against the static tree.
     dc_learned_tree,
     /// The DC streams race the second libjxl weighted-predictor preset
     /// exactly against the default (Fast and up).
     dc_wp_race,
+    /// The MA-learned DC tree arm under its lite budget (`ma_dc_tree` runs
+    /// the full budget).
+    ma_dc_tree_lite,
     /// ... and fit the parameters by coordinate descent when it wins
     /// (`dc_wp_fit` races every preset and always fits).
     dc_wp_fit_on_win,
@@ -266,6 +272,10 @@ effort_gates! {
     dc_wp_fit,
     /// Final RCT tree learns score more predictors on each side of a split.
     tree_wide_side_preds,
+    /// One EM step on the MA-learned DC tree: leaves re-pick their predictor
+    /// under the clustered histograms and the winning arm is priced again
+    /// (−0.012 % at Slow for +5..13 % time, so ExtraSlow only).
+    ma_dc_repick,
 }
 
 static ULTRAFAST: Effort = Effort {
@@ -298,6 +308,7 @@ static FAST: Effort = Effort {
     dc_predictor_search: true,
     dc_learned_tree: true,
     dc_wp_race: true,
+    ma_dc_tree_lite: true,
     huc_select: true,
     ac_prefix_clustering: true,
     wide_clustering: true,
@@ -320,6 +331,7 @@ static MEDIUM: Effort = Effort {
     chroma_policy: true,
     fine_mosaic: true,
     dc_rdoq: true,
+    dc_rdoq_refit: true,
     dc_wp_race: true,
     chroma_dc_squeeze: true,
     dc_x_cfl: true,
@@ -372,6 +384,7 @@ static SLOW: Effort = Effort {
     tree_rank_deep: false,
     dc_wp_fit: false,
     tree_wide_side_preds: false,
+    ma_dc_repick: false,
     ..Effort::ALL
 };
 

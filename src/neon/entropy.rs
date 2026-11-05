@@ -65,26 +65,27 @@ pub(crate) fn entropy_of_hist_neon(hist: &[u64], total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    let total_f = total as f32;
-    let t = vdupq_n_f32(total_f);
+    // One reciprocal per histogram instead of a division per bin.
+    let inv_total = 1.0 / total as f32;
+    let t = vdupq_n_f32(inv_total);
     let mut bits = 0.0f32;
     // Residual histograms often have long empty regions. Pack only occupied
     // bins into SIMD lanes instead of evaluating logarithms of zero bins.
     let mut counts = hist.iter().copied().filter(|&c| c != 0);
     while let Some(c0) = counts.next() {
         let Some(c1) = counts.next() else {
-            bits -= c0 as f32 * crate::adaptive_quant::dirty_log2f(c0 as f32 / total_f);
+            bits -= c0 as f32 * crate::adaptive_quant::dirty_log2f(c0 as f32 * inv_total);
             break;
         };
         let Some(c2) = counts.next() else {
             for c in [c0, c1] {
-                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 / total_f);
+                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 * inv_total);
             }
             break;
         };
         let Some(c3) = counts.next() else {
             for c in [c0, c1, c2] {
-                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 / total_f);
+                bits -= c as f32 * crate::adaptive_quant::dirty_log2f(c as f32 * inv_total);
             }
             break;
         };
@@ -92,7 +93,7 @@ pub(crate) fn entropy_of_hist_neon(hist: &[u64], total: u64) -> f32 {
         // u64 counts twice and disagree with the scalar calculation.
         let floats = [c0 as f32, c1 as f32, c2 as f32, c3 as f32];
         let c = unsafe { vld1q_f32(floats.as_ptr()) };
-        let p = vdivq_f32(c, t);
+        let p = vmulq_f32(c, t);
         let terms = vmulq_f32(c, dirty_log2f_x4(p));
         let mut lanes = [0.0f32; 4];
         unsafe { vst1q_f32(lanes.as_mut_ptr(), terms) };

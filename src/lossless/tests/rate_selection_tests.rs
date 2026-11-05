@@ -48,9 +48,11 @@ fn hist_entropy_fma_reference(hist: &[u64], total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
+    // Same reciprocal-multiply probability as the kernels.
+    let inv_t = 1.0 / total as f32;
     let mut bits = 0.0;
     for &count in hist.iter().filter(|&&c| c != 0) {
-        let p = count as f32 / total as f32;
+        let p = count as f32 * inv_t;
         let ix = p.to_bits().wrapping_add(0x3f80_0000 - 0x3f35_04f3);
         let exponent = (ix >> 23) as i32 - 127;
         let a = f32::from_bits((ix & 0x007f_ffff) + 0x3f35_04f3);

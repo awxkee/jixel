@@ -295,7 +295,8 @@ fn tokenize_gradient_lut<'a>(
 pub(crate) fn divide_common_factor(data: &mut [i32]) -> (u32, u32) {
     let q = data.iter().fold(0, |g, &v| gcd(g, v.unsigned_abs())).max(1);
     if q > 1 {
-        data.iter_mut().for_each(|v| *v /= q as i32);
+        let divider = crate::fast_divide::DividerI32::new(q as i32);
+        data.iter_mut().for_each(|v| *v = *v / divider);
     }
     let max_abs = data.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
     let value_bits = 33 - (2 * max_abs).max(1).leading_zeros();
@@ -318,6 +319,19 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::lossless::tree::{TREE_CTX_PREDICTOR, TREE_CTX_PROPERTY, TREE_CTX_SPLIT_VAL};
+
+    #[test]
+    fn common_factor_division_preserves_signed_quotients() {
+        for factor in [2i32, 3, 257, 65535, 1 << 30] {
+            let mut values: Vec<_> = (-3i32..=3).filter_map(|v| v.checked_mul(factor)).collect();
+            let expected: Vec<_> = values.iter().map(|&v| v / factor).collect();
+            assert_eq!(divide_common_factor(&mut values).0, factor as u32);
+            assert_eq!(values, expected);
+        }
+        let mut values = [i32::MIN, 0];
+        assert_eq!(divide_common_factor(&mut values).0, 1 << 31);
+        assert_eq!(values, [1, 0]); // Preserve the existing q-as-i32 divisor.
+    }
 
     fn unpack(v: u32) -> i32 {
         if v & 1 == 0 {

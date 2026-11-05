@@ -30,16 +30,17 @@
 //! Channel and plane tokenization with fixed or weighted predictors.
 
 use super::super::lz77::{LzToken, RunLzWriter};
+use super::row_kernels::{self, Rows, Sample};
 use super::weighted::{
     WpBucketContexts, WpChannelContexts, tokenize_plane_with_wp, tokenize_wp_row_slices,
 };
 use super::{
     GradPackInteriorFn, GradientScratch, PREDICTOR_GRADIENT, PREDICTOR_WEIGHTED, TokenSink,
-    pack_gradient_row, predictor_value, push_wp_token, reset_wp_scratch, visit_predictor_rows,
+    pack_gradient_row, push_wp_token, reset_wp_scratch, visit_predictor_rows,
 };
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
-use crate::entropy::{Token, pack_signed};
+use crate::entropy::Token;
 use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::{WpNeighbors, WpParams};
@@ -494,7 +495,7 @@ fn tokenize_plane_rows_shared<'a>(
 
 /// Expand byte/word samples only for the i32 gradient kernel's two input rows;
 /// other predictors read the original palette indices or alpha samples directly.
-pub(in crate::lossless) fn tokenize_sample_rows<'a, T: Copy + 'a>(
+pub(in crate::lossless) fn tokenize_sample_rows<'a, T: Sample + 'a>(
     ctx: u32,
     get_row: impl Fn(usize) -> &'a [T],
     w: usize,
@@ -510,7 +511,7 @@ pub(in crate::lossless) fn tokenize_sample_rows<'a, T: Copy + 'a>(
     tokenize_sample_rows_shared(ctx, &get_row, w, h, pred_id, grad_pack_fn, scratch, out);
 }
 
-fn tokenize_sample_rows_shared<'a, T: Copy + 'a>(
+fn tokenize_sample_rows_shared<'a, T: Sample + 'a>(
     ctx: u32,
     get_row: &dyn Fn(usize) -> &'a [T],
     w: usize,
@@ -555,7 +556,7 @@ fn tokenize_sample_rows_shared<'a, T: Copy + 'a>(
     }
 }
 
-fn tokenize_predictor_rows<'a, T: Copy + 'a>(
+fn tokenize_predictor_rows<'a, T: Sample + 'a>(
     ctx: u32,
     // Dispatch once per row so getter closures share the large pixel kernels.
     get_row: &dyn Fn(usize) -> &'a [T],
@@ -585,9 +586,25 @@ fn tokenize_predictor_rows<'a, T: Copy + 'a>(
             push_wp_token(ctx, value, prediction, out);
         });
     } else {
-        visit_predictor_rows(get_row, w, h, |_, _, value, n| {
-            let prediction = predictor_value(pred_id, n, 0);
-            out.push_token(Token::new(ctx, pack_signed((value - prediction) as i32)));
-        });
+        let kernels = row_kernels::selected();
+        scratch.buf.resize(w, 0);
+        let buf = &mut scratch.buf[..w];
+        let (mut north, mut north_north) = (None, None);
+        for y in 0..h {
+            let current = get_row(y);
+            T::pack(
+                kernels,
+                Rows {
+                    current,
+                    north,
+                    north_north,
+                },
+                pred_id,
+                buf,
+            );
+            out.extend_tokens(buf.iter().map(|&value| Token::new(ctx, value)));
+            north_north = north;
+            north = Some(current);
+        }
     }
 }

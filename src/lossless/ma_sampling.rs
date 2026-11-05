@@ -471,32 +471,43 @@ pub(super) fn tokenize_channel_ma<'a, T: Copy + 'a>(
     );
 }
 
-/// One VarDCT DC group's quantized planes in modular channel order (Y, X, B).
+/// The modular channels of one VarDCT DC-group stream (DC planes in channel
+/// order Y, X, B, or the AC-metadata image) with the decoder's stream id.
 pub(crate) struct DcPlanes {
-    pub(crate) planes: [Vec<i32>; 3],
-    pub(crate) w: usize,
-    pub(crate) h: usize,
+    pub(crate) planes: Vec<Vec<i32>>,
+    /// Width and height of each plane: chroma DC planes of a subsampled JPEG
+    /// transcode are smaller than luma's; metadata channels all differ.
+    pub(crate) dims: Vec<(usize, usize)>,
+    /// The stream property the decoder sees for this modular image.
+    pub(crate) stream: i32,
 }
 
 impl DcPlanes {
-    /// Previously coded channels of `c`, most recent first, as the decoder's
-    /// reference properties see them.
+    /// Previously coded channels of `c` with its dimensions, most recent
+    /// first, as the decoder's reference properties see them (channels of
+    /// another size are skipped).
     pub(super) fn refs(&self, c: usize) -> Vec<MaRefPlane<'_>> {
+        let (w, h) = self.dims[c];
         (0..c)
             .rev()
+            .filter(|&r| self.dims[r] == (w, h))
             .take(MA_REF_CHANNELS)
             .map(|r| MaRefPlane {
                 pixels: &self.planes[r],
-                stride: self.w,
+                stride: w,
                 x0: 0,
                 y0: 0,
             })
             .collect()
     }
+
+    /// Pixels over the planes.
+    pub(crate) fn len(&self) -> usize {
+        self.dims.iter().map(|&(w, h)| w * h).sum()
+    }
 }
 
-/// MA samples of every DC group (stream id `1 + group`, default WP), taking
-/// every `stride`-th pixel.
+/// MA samples of every stream's planes, taking every `stride`-th pixel.
 pub(crate) fn sample_dc_planes(
     groups: &[DcPlanes],
     stride: usize,
@@ -504,22 +515,28 @@ pub(crate) fn sample_dc_planes(
 ) -> MaSamples {
     let capacity = groups
         .iter()
-        .map(|g| 3 * ma_channel_sample_count(g.w, g.h, stride))
+        .map(|g| {
+            g.dims
+                .iter()
+                .map(|&(w, h)| ma_channel_sample_count(w, h, stride))
+                .sum::<usize>()
+        })
         .sum();
     let mut samples = MaSamples::with_capacity(capacity);
-    for (group, g) in groups.iter().enumerate() {
-        if g.w == 0 || g.h == 0 {
-            continue;
-        }
-        for c in 0..3 {
+    for g in groups {
+        for c in 0..g.planes.len() {
+            let (w, h) = g.dims[c];
+            if w == 0 || h == 0 {
+                continue;
+            }
             let refs = g.refs(c);
             let pixels = &g.planes[c];
             sample_channel_ma(
-                |y| &pixels[y * g.w..(y + 1) * g.w],
-                g.w,
-                g.h,
+                |y| &pixels[y * w..(y + 1) * w],
+                w,
+                h,
                 c as u32,
-                1 + group as i32,
+                g.stream,
                 &refs,
                 wp_params,
                 true,
@@ -531,28 +548,64 @@ pub(crate) fn sample_dc_planes(
     samples
 }
 
-/// Tokenize one DC group through a learned tree: every pixel takes its leaf's
-/// context (`leaf_ctx`, indexed by tree node) and predictor.
+/// Walk one stream's planes through a learned tree, handing the visitor
+/// each pixel's leaf node and its residual under every decoder predictor.
+pub(crate) fn walk_dc_planes_predictors(
+    g: &DcPlanes,
+    tree: &LearnedTree,
+    wp_params: WpParams,
+    mut visit: impl FnMut(u32, &[i64; NUM_MA_PREDS]),
+) {
+    for c in 0..g.planes.len() {
+        let (w, h) = g.dims[c];
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let refs = g.refs(c);
+        let pixels = &g.planes[c];
+        walk_channel_ma(
+            |y| &pixels[y * w..(y + 1) * w],
+            w,
+            h,
+            c as u32,
+            g.stream,
+            &refs,
+            wp_params,
+            true,
+            |_x, _y, v, p, n, wp_pred| {
+                let (node, _) = tree.lookup(p);
+                let mut residuals = [0i64; NUM_MA_PREDS];
+                for (pred, r) in residuals.iter_mut().enumerate() {
+                    *r = v - predictor_value(pred as u32, n, wp_pred);
+                }
+                visit(node, &residuals);
+            },
+        );
+    }
+}
+
+/// Tokenize one stream's planes through a learned tree: every pixel takes
+/// its leaf's context (`leaf_ctx`, indexed by tree node) and predictor.
 pub(crate) fn tokenize_dc_planes(
     g: &DcPlanes,
-    group: usize,
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     wp_params: WpParams,
     out: &mut Vec<Token>,
 ) {
-    if g.w == 0 || g.h == 0 {
-        return;
-    }
-    for c in 0..3 {
+    for c in 0..g.planes.len() {
+        let (w, h) = g.dims[c];
+        if w == 0 || h == 0 {
+            continue;
+        }
         let refs = g.refs(c);
         let pixels = &g.planes[c];
         walk_channel_ma(
-            |y| &pixels[y * g.w..(y + 1) * g.w],
-            g.w,
-            g.h,
+            |y| &pixels[y * w..(y + 1) * w],
+            w,
+            h,
             c as u32,
-            1 + group as i32,
+            g.stream,
             &refs,
             wp_params,
             true,

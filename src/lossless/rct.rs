@@ -138,6 +138,7 @@ static RCT_CONTEXT_CUTOFFS: [u32; 17] = [
 ];
 const RCT_NUM_CONTEXTS: usize = 18;
 const RCT_ALPHABET: usize = 64;
+pub(super) type RctHistogram = [u64; RCT_NUM_CONTEXTS * RCT_ALPHABET];
 const RCT_CONTEXT_MAX_DIFF: u32 = 500;
 
 static RCT_CONTEXT_LUT: [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] = {
@@ -159,13 +160,9 @@ static RCT_CONTEXT_LUT: [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] = {
     lut
 };
 
-fn context_lut() -> [u8; RCT_CONTEXT_MAX_DIFF as usize + 1] {
-    RCT_CONTEXT_LUT
-}
-
 #[inline(always)]
 pub(super) fn rct_context(max_diff: u32) -> usize {
-    context_lut()[max_diff.min(RCT_CONTEXT_MAX_DIFF) as usize] as usize
+    RCT_CONTEXT_LUT[max_diff.min(RCT_CONTEXT_MAX_DIFF) as usize] as usize
 }
 
 /// Channel order fed to the elementary transform for permutation `perm`
@@ -214,12 +211,33 @@ pub(crate) fn rct_gradient_row(
     crow: &[i32],
     prow: &[i32],
     first_row: bool,
-    hist: &mut [u64; RCT_NUM_CONTEXTS * RCT_ALPHABET],
+    hist: &mut RctHistogram,
+) -> u64 {
+    (super::predictor::row_kernels::selected().rct)(crow, prow, first_row, hist)
+}
+
+#[allow(dead_code)]
+pub(super) fn rct_gradient_row_scalar(
+    crow: &[i32],
+    prow: &[i32],
+    first_row: bool,
+    hist: &mut RctHistogram,
+) -> u64 {
+    rct_gradient_span(crow, prow, first_row, 0..crow.len(), hist)
+}
+
+pub(super) fn rct_gradient_span(
+    crow: &[i32],
+    prow: &[i32],
+    first_row: bool,
+    range: std::ops::Range<usize>,
+    hist: &mut RctHistogram,
 ) -> u64 {
     assert_eq!(crow.len(), prow.len());
-    let Some((&first, tail)) = crow.split_first() else {
+    assert!(range.start <= range.end && range.end <= crow.len());
+    if range.is_empty() {
         return 0;
-    };
+    }
     let mut extra_bits = 0u64;
     let mut record = |value: i32, prediction: i64, ctx: usize| {
         let (tok, nb, _) = uint_encode(pack_signed((value as i64 - prediction) as i32));
@@ -227,20 +245,29 @@ pub(crate) fn rct_gradient_row(
         extra_bits += nb as u64;
     };
     let edge_ctx = rct_context(0);
+    if range.start == 0 {
+        record(
+            crow[0],
+            if first_row { 0 } else { i64::from(prow[0]) },
+            edge_ctx,
+        );
+    }
+    let start = range.start.max(1);
+    let tail = &crow[start..range.end];
+    let left = &crow[start - 1..range.end - 1];
     if first_row {
         // With no north row all three neighbors equal the west sample.
-        record(first, 0, edge_ctx);
-        for (&value, &left) in tail.iter().zip(crow) {
+        for (&value, &left) in tail.iter().zip(left) {
             record(value, left as i64, edge_ctx);
         }
     } else {
-        let (&top, north_tail) = prow.split_first().expect("equal nonempty rows");
-        // At x = 0 all three neighbors equal the north sample.
-        record(first, top as i64, edge_ctx);
-        for (((&value, &left), &top), &topleft) in tail.iter().zip(crow).zip(north_tail).zip(prow) {
+        let north = &prow[start..range.end];
+        let north_west = &prow[start - 1..range.end - 1];
+        for (((&value, &left), &top), &topleft) in tail.iter().zip(left).zip(north).zip(north_west)
+        {
             let mx = left.max(top).max(topleft);
             let mn = left.min(top).min(topleft);
-            let ctx = rct_context((mx - mn) as u32);
+            let ctx = rct_context(mx.wrapping_sub(mn) as u32);
             let prediction = clamped_gradient(left as i64, top as i64, topleft as i64);
             record(value, prediction, ctx);
         }

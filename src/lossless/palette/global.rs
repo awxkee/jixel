@@ -226,7 +226,7 @@ pub(super) fn index_cooccurrence(
 }
 
 /// `order[canonical] = index` of the colors in `path` order.
-fn order_of_path(path: &[usize]) -> Vec<i32> {
+pub(super) fn order_of_path(path: &[usize]) -> Vec<i32> {
     let mut order = vec![0i32; path.len()];
     for (index, &canonical) in path.iter().enumerate() {
         order[canonical] = index as i32;

@@ -179,6 +179,66 @@ fn row_costs_match_point_fetched_histograms_and_predictors() {
 }
 
 #[test]
+fn row_costs_preserve_every_wp_preset_and_zero_histogram() {
+    let (w, h) = (33, 7);
+    let data: Vec<i32> = (0..w * h)
+        .map(|i| {
+            if i / w < 3 {
+                37
+            } else {
+                ((i * 97 + i / w * 31) % 2048) as i32 - 1024
+            }
+        })
+        .collect();
+    let get = |x, y| data[y * w + x];
+    for params in WpParams::PRESETS {
+        for use_wp in [false, true] {
+            let mut reference = SqueezePredictorCost::with_zero();
+            let mut wp = WpState::with_params(w, params);
+            for y in 0..h {
+                for x in 0..w {
+                    let n = predictor_neighbors(&get, x, y, w);
+                    let value = get(x, y) as i64;
+                    let weighted = if use_wp {
+                        wp.predict(x, y, n.top, n.left, n.top_right, n.top_left, n.top_top)
+                    } else {
+                        0
+                    };
+                    reference.costs.add(value, n, weighted);
+                    if use_wp {
+                        wp.update(value, x, y);
+                    }
+                }
+            }
+            for flat in [false, true] {
+                let mut actual = SqueezePredictorCost::with_zero();
+                if flat {
+                    actual.add_rows_shared::<_, true>(
+                        &|y| &data[y * w..][..w],
+                        w,
+                        h,
+                        use_wp,
+                        params,
+                    );
+                } else {
+                    actual.add_rows_shared::<_, false>(
+                        &|y| &data[y * w..][..w],
+                        w,
+                        h,
+                        use_wp,
+                        params,
+                    );
+                }
+                assert_eq!(actual.costs.histograms, reference.costs.histograms);
+                assert_eq!(actual.costs.zero_hist, reference.costs.zero_hist);
+                assert_eq!(actual.costs.total, reference.costs.total);
+                assert_eq!(actual.predictor(use_wp), reference.predictor(use_wp));
+            }
+        }
+    }
+}
+
+#[test]
 fn palette_flat_spans_preserve_cost_histograms() {
     for w in [1, 17, 64] {
         let h = 8;
@@ -200,6 +260,70 @@ fn palette_flat_spans_preserve_cost_histograms() {
             assert_eq!(rows.costs.zero_hist, reference.costs.zero_hist);
             assert_eq!(rows.costs.total, reference.costs.total);
             assert_eq!(rows.predictor(true), reference.predictor(true));
+        }
+    }
+}
+
+#[test]
+fn gradient_simd_matches_scalar_at_chunk_boundaries() {
+    // Only x86 builds push SIMD kernels after the portable one.
+    #[allow(unused_mut)]
+    let mut kernels: Vec<(&str, GradPackInteriorFn)> =
+        vec![("selected", selected_grad_pack_interior_fn())];
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if is_x86_feature_detected!("avx2") {
+        kernels.push(("avx2", |c, p, o, g| unsafe {
+            crate::avx::grad_pack_interior(c, p, o, g)
+        }));
+    }
+    #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+    if is_x86_feature_detected!("sse4.1") {
+        kernels.push(("sse4.1", |c, p, o, g| unsafe {
+            crate::sse::grad_pack_interior(c, p, o, g)
+        }));
+    }
+
+    let extremes = [i32::MIN, i32::MAX, -1, 0, 1, i32::MIN / 2, i32::MAX / 2];
+    let mut seed = 0x1234_5678u32;
+    for width in (0..=65).chain([127, 128, 129, 255, 256, 257]) {
+        for offset in 0..4 {
+            for padding in [0, 5] {
+                for pattern in 0..3 {
+                    let len = offset + width + padding;
+                    let mut sample = |i: usize| match pattern {
+                        0 => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed as i32
+                        }
+                        1 => extremes[i % extremes.len()],
+                        _ => (i as i32 * 977) % 65536 - 32768,
+                    };
+                    let cur: Vec<i32> = (0..len).map(&mut sample).collect();
+                    let prev: Vec<i32> = (1..=len).map(&mut sample).collect();
+                    let mut expected = vec![0xdead_beef; len];
+                    grad_pack_interior_scalar(
+                        &cur[offset..],
+                        &prev[offset..],
+                        &mut expected[offset..],
+                        width,
+                    );
+                    for &(name, kernel) in &kernels {
+                        let mut actual = vec![0xdead_beef; len];
+                        kernel(
+                            &cur[offset..],
+                            &prev[offset..],
+                            &mut actual[offset..],
+                            width,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "{name}: width={width}, offset={offset}, padding={padding}, pattern={pattern}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

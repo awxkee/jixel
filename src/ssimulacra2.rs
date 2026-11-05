@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 //! SSIMULACRA 2 of XYB images for the closed loop, on the `ssimu2-lite`
-//! crate: the source is analysed once, candidates are scored in full or by
+//! crate: the source is analyzed once, candidates are scored in full or by
 //! region-incremental updates in linear RGB.
 use crate::image::Image3F;
 use ssimu2_lite::{IncrementalState, PreparedReference, RgbImage};

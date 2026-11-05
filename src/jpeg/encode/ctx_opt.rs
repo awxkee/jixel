@@ -38,6 +38,7 @@ use super::{
 use crate::ac_context::{K_NON_ZERO_BUCKETS, K_ZERO_DENSITY_CONTEXT_COUNT, non_zero_bucket};
 use crate::coder_scratch::CoderScratch;
 use crate::entropy::{pack_signed, uint_encode};
+use crate::fast_divide::DividerU64;
 use crate::thread_pool::ThreadPool;
 
 /// Default HybridUint tokens per zero-density context; larger ones saturate.
@@ -136,6 +137,7 @@ impl Axis {
 /// Sparse coded-symbol counts of every (channel, fine DC cell) key.
 struct Stats {
     axes: [Axis; 3],
+    key_dividers: [DividerU64; 3],
     /// `key_start[k]..key_start[k + 1]` indexes `syms`/`counts`.
     key_start: Vec<u32>,
     syms: Vec<u16>,
@@ -154,12 +156,10 @@ impl Stats {
 
     #[inline]
     fn unkey(&self, key: usize) -> (usize, [usize; 3]) {
-        let n = [self.axes[0].len(), self.axes[1].len(), self.axes[2].len()];
-        let f2 = key % n[2];
-        let rest = key / n[2];
-        let f0 = rest % n[0];
-        let rest = rest / n[0];
-        (rest / n[1], [f0, rest % n[1], f2])
+        let (rest, f2) = self.key_dividers[2].div_rem(key as u64);
+        let (rest, f0) = self.key_dividers[0].div_rem(rest);
+        let (c, f1) = self.key_dividers[1].div_rem(rest);
+        (c as usize, [f0 as usize, f1 as usize, f2 as usize])
     }
 
     #[inline]
@@ -192,8 +192,10 @@ fn collect_stats(
         }
         Axis::new(&counts, FINE[p])
     });
+    let key_dividers = std::array::from_fn(|p| DividerU64::new(axes[p].len() as u64));
     let mut stats = Stats {
         axes,
+        key_dividers,
         key_start: Vec::new(),
         syms: Vec::new(),
         counts: Vec::new(),
@@ -554,17 +556,20 @@ fn cluster(stats: &Stats, starts: &[Vec<usize>; 3], f: &NLogN, acc: &mut Accum) 
     // Until NEIGHBOR_PHASE_CTXS remain, only contexts of one channel whose
     // cells touch in DC space merge; pricing every pair of up to 192 contexts
     // dominates the search otherwise.
-    let coords = |ctx: usize| {
-        let (c, cell) = (ctx / num_cells, ctx % num_cells);
-        let i1 = cell % n[1];
-        let i2 = (cell / n[1]) % n[2];
-        (c, [cell / n[1] / n[2], i1, i2])
-    };
+    let coords: Vec<_> = ctx_ids
+        .iter()
+        .map(|&ctx| {
+            let (c, cell) = (ctx / num_cells, ctx % num_cells);
+            let i1 = cell % n[1];
+            let i2 = (cell / n[1]) % n[2];
+            (c, [cell / n[1] / n[2], i1, i2])
+        })
+        .collect();
     let mut adjacent = vec![false; m * m];
     for i in 0..m {
-        let (ci, a) = coords(ctx_ids[i]);
+        let (ci, a) = coords[i];
         for j in i + 1..m {
-            let (cj, b) = coords(ctx_ids[j]);
+            let (cj, b) = coords[j];
             let dist: usize = (0..3).map(|p| a[p].abs_diff(b[p])).sum();
             adjacent[i * m + j] = ci == cj && dist == 1;
         }
@@ -786,4 +791,30 @@ pub(super) fn optimize(
         let c = [1, 0, 2][row];
         best.assign[c * num_cells + i].unwrap_or(0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fine_cell_keys_round_trip_with_unit_and_uneven_axes() {
+        for sizes in [[1, 1, 1], [16, 32, 16], [3, 5, 7], [1, 7, 3], [5, 1, 1]] {
+            let stats = Stats {
+                axes: sizes.map(|n| Axis {
+                    lo: vec![0; n],
+                    lut: Vec::new(),
+                }),
+                key_dividers: sizes.map(|n| DividerU64::new(n as u64)),
+                key_start: Vec::new(),
+                syms: Vec::new(),
+                counts: Vec::new(),
+            };
+            for key in 0..3 * sizes.iter().product::<usize>() {
+                let (c, f) = stats.unkey(key);
+                assert!(c < 3 && (0..3).all(|p| f[p] < sizes[p]));
+                assert_eq!(stats.key(c, f), key);
+            }
+        }
+    }
 }

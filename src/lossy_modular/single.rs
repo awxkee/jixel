@@ -40,7 +40,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::entropy::Token;
 use crate::lossless::kit::{
     PREDICTOR_GRADIENT, SqueezePredictorCost, build_balanced_tree_tokens_mul,
-    build_lz_pixel_code_ans, channel_to_context, choose_predictor_for_plane, fixed_predictor,
+    build_lz_pixel_code_ans, channel_to_context, choose_predictor_for_rows, fixed_predictor,
     lz77_compress_for_speed, selected_grad_pack_interior_fn, tokenize_plane_rows, write_lz_section,
     write_tree_lz77,
 };
@@ -63,13 +63,13 @@ pub(crate) fn write_frame(
             let ch = &channels[c];
             let data = &ch.data;
             let w = ch.w;
-            let get = move |gx: usize, gy: usize| data[gy * w + gx];
+            let get_row = |y| &data[y * w..][..w];
             if quants[c] > 1 {
                 let mut costs = SqueezePredictorCost::with_zero();
-                costs.add_crop(get, ch.w, ch.h, use_wp);
+                costs.add_rows(get_row, ch.w, ch.h, use_wp);
                 costs.safe_predictor()
             } else {
-                choose_predictor_for_plane(get, ch.w, ch.h, use_wp)
+                choose_predictor_for_rows(get_row, ch.w, ch.h, use_wp)
             }
         })
     } else {

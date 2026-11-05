@@ -30,10 +30,10 @@
 //! Predictor and weighted-predictor preset cost estimation.
 
 use super::super::entropy::{EntropyOfHistFn, selected_entropy_of_hist_fn};
+use super::row_kernels::{self, Rows, Sample};
 use super::{
     PREDICTOR_GRADIENT, PREDICTOR_LEFT, PREDICTOR_SELECT, PREDICTOR_TOP, PREDICTOR_ZERO,
-    PredictorNeighbors, SLOW_PREDICTORS, fixed_predictor, predictor_neighbors, predictor_value,
-    visit_predictor_rows,
+    SLOW_PREDICTORS, fixed_predictor, predictor_neighbors,
 };
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
@@ -216,6 +216,7 @@ impl SqueezePredictorCost {
 
     /// Add one independently predicted modular crop. Weighted prediction state
     /// resets here because the decoder resets it for every modular sub-image.
+    #[cfg(test)]
     pub(crate) fn add_crop(
         &mut self,
         get: impl Fn(usize, usize) -> i32,
@@ -257,7 +258,7 @@ impl SqueezePredictorCost {
         self.costs.best_predictor(use_wp)
     }
 
-    pub(in crate::lossless) fn add_rows<'a, T: Copy + 'a>(
+    pub(crate) fn add_rows<'a, T: Sample + 'a>(
         &mut self,
         get_row: impl Fn(usize) -> &'a [T],
         w: usize,
@@ -266,44 +267,81 @@ impl SqueezePredictorCost {
     ) where
         i64: From<T>,
     {
-        self.add_rows_shared(&get_row, w, h, use_wp);
+        self.add_rows_shared::<_, true>(&get_row, w, h, use_wp, WpParams::DEFAULT);
     }
 
     // Getter dispatch is once per row, outside the specialized pixel loops.
-    pub(super) fn add_rows_shared<'a, T: Copy + 'a>(
+    pub(super) fn add_rows_shared<'a, T: Sample + 'a, const FLAT_SHORTCUT: bool>(
         &mut self,
         get_row: &dyn Fn(usize) -> &'a [T],
         w: usize,
         h: usize,
         use_wp: bool,
+        wp_params: WpParams,
     ) where
         i64: From<T>,
     {
-        if use_wp {
-            // Row-backed costs are used for palette candidates, where flat
-            // spans are common. Keep every WP state update and histogram bump.
-            let mut wp = WpState::new(w);
-            visit_predictor_rows(get_row, w, h, |x, y, value, n| {
-                let weighted = wp.predict_and_update_flat(
-                    value,
-                    x,
-                    wp.row_offsets(y),
-                    WpNeighbors {
-                        north: n.top,
-                        west: n.left,
-                        north_east: n.top_right,
-                        north_west: n.top_left,
-                        north_north: n.top_top,
+        if w == 0 || h == 0 {
+            return;
+        }
+        let kernels = row_kernels::selected();
+        let mut wp = use_wp.then(|| WpState::with_params(w, wp_params));
+        let (mut north, mut north_north) = (None, None);
+        for y in 0..h {
+            let current = get_row(y);
+            let rows = Rows {
+                current,
+                north,
+                north_north,
+            };
+            if let Some(wp) = &mut wp {
+                let row = wp.row_offsets(y);
+                super::visit_predictor_row(
+                    current,
+                    north.unwrap_or(current),
+                    north_north.or(north).unwrap_or(current),
+                    y == 0,
+                    |x, value, n| {
+                        let neighbors = WpNeighbors {
+                            north: n.top,
+                            west: n.left,
+                            north_east: n.top_right,
+                            north_west: n.top_left,
+                            north_north: n.top_top,
+                        };
+                        let weighted = if FLAT_SHORTCUT {
+                            wp.predict_and_update_flat(value, x, row, neighbors)
+                        } else {
+                            wp.predict_and_update(value, x, row, neighbors)
+                        };
+                        add_symbol(
+                            &mut self.costs.histograms[0],
+                            pack_signed((value - weighted) as i32),
+                        );
                     },
                 );
-                self.costs.add(value, n, weighted);
-            });
-        } else {
-            visit_predictor_rows(get_row, w, h, |_, _, value, n| {
-                self.costs.add(value, n, 0);
-            });
+            }
+            T::costs(
+                kernels,
+                rows,
+                &mut self.costs.histograms,
+                self.costs.collect_zero.then_some(&mut self.costs.zero_hist),
+                wp.is_none(),
+            );
+            self.costs.total += w as u64;
+            north_north = north;
+            north = Some(current);
         }
     }
+}
+
+#[inline]
+pub(super) fn add_symbol(hist: &mut Vec<u64>, symbol: u32) {
+    let symbol = symbol as usize;
+    if hist.len() <= symbol {
+        hist.resize(symbol + 1, 0);
+    }
+    hist[symbol] += 1;
 }
 
 pub(in crate::lossless) struct PredictorCosts {
@@ -349,10 +387,12 @@ impl PredictorCosts {
         }
         self.total += other.total;
     }
+
     #[inline]
-    pub(super) fn add(&mut self, value: i64, neighbors: PredictorNeighbors, weighted: i64) {
+    #[cfg(test)]
+    pub(super) fn add(&mut self, value: i64, neighbors: super::PredictorNeighbors, weighted: i64) {
         for (candidate, &pred_id) in SLOW_PREDICTORS.iter().enumerate() {
-            let pred = predictor_value(pred_id, neighbors, weighted);
+            let pred = super::predictor_value(pred_id, neighbors, weighted);
             let symbol = pack_signed((value - pred) as i32) as usize;
             let hist = &mut self.histograms[candidate];
             if hist.len() <= symbol {
@@ -412,6 +452,7 @@ impl PredictorCosts {
 
 /// Evaluate all Slow-mode predictors in one traversal and choose the lowest
 /// order-0 residual entropy. Weighted remains the deterministic tie-breaker.
+#[cfg(test)]
 pub(crate) fn choose_predictor_for_plane(
     get: impl Fn(usize, usize) -> i32,
     w: usize,
@@ -421,7 +462,7 @@ pub(crate) fn choose_predictor_for_plane(
     choose_predictor_for_plane_with_wp(get, w, h, WpParams::DEFAULT, use_wp)
 }
 
-pub(in crate::lossless) fn choose_predictor_for_rows<'a, T: Copy + 'a>(
+pub(crate) fn choose_predictor_for_rows<'a, T: Sample + 'a>(
     get_row: impl Fn(usize) -> &'a [T],
     w: usize,
     h: usize,
@@ -438,7 +479,8 @@ where
     costs.predictor(use_wp)
 }
 
-fn choose_predictor_for_plane_with_wp(
+#[cfg(test)]
+pub(super) fn choose_predictor_for_plane_with_wp(
     get: impl Fn(usize, usize) -> i32,
     w: usize,
     h: usize,
@@ -491,25 +533,43 @@ pub(in crate::lossless) fn choose_predictors_with_wp(
     let mut preds = [fixed_predictor(use_wp); 4];
     let num_channels = num_color + usize::from(alpha.is_some());
     let selected = pool.steal_map(scratch, num_channels, |chan, _scratch| {
+        let mut costs = SqueezePredictorCost::default();
         if chan < num_color {
             let pd = linear.plane_data(chan);
-            choose_predictor_for_plane_with_wp(
-                |x, y| pd[y * xsize + x],
+            costs.add_rows_shared::<_, false>(
+                &|y| &pd[y * xsize..][..xsize],
                 xsize,
                 ysize,
-                wp_params,
                 use_wp,
+                wp_params,
             )
         } else {
             let a = alpha.expect("alpha channel must exist");
-            choose_predictor_for_plane_with_wp(
-                |x, y| a.get_i32(y * xsize + x),
-                xsize,
-                ysize,
-                wp_params,
-                use_wp,
-            )
+            match a {
+                AlphaPlane::U8(data) => costs.add_rows_shared::<_, false>(
+                    &|y| &data[y * xsize..][..xsize],
+                    xsize,
+                    ysize,
+                    use_wp,
+                    wp_params,
+                ),
+                AlphaPlane::U16 { data, .. } => costs.add_rows_shared::<_, false>(
+                    &|y| &data[y * xsize..][..xsize],
+                    xsize,
+                    ysize,
+                    use_wp,
+                    wp_params,
+                ),
+                AlphaPlane::F32(data) => costs.add_rows_shared::<_, false>(
+                    &|y| &data[y * xsize..][..xsize],
+                    xsize,
+                    ysize,
+                    use_wp,
+                    wp_params,
+                ),
+            }
         }
+        costs.predictor(use_wp)
     });
     preds[..num_color].copy_from_slice(&selected[..num_color]);
     if alpha.is_some() {

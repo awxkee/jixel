@@ -74,7 +74,7 @@ pub(super) use global::{
 pub(super) use local::local_palette_coverage_is_sufficient;
 pub(super) use local::{
     LOCAL_PALETTE_MAX_COLORS, LocalPaletteGroup, build_local_palette_group_limited,
-    try_encode_local_palette_multi_group,
+    order_local_palette, try_encode_local_palette_multi_group,
 };
 
 use super::GroupLayout;
@@ -318,6 +318,17 @@ pub(super) fn try_encode_palette_single_group(
             w: xsize,
             h: ysize,
         };
+        // The index order: the color sort against the co-occurrence chain
+        // and its tour, priced by the flat coder.
+        let (palette, _, _) = local::race_local_palette_orders(
+            palette,
+            num_c,
+            min_symbol,
+            grad_pack_fn,
+            speed,
+            use_wp,
+            scratch,
+        );
         // 4) Channel accessors (channel 0 = palette, channel 1 = index).
         let pget = |y: usize| &palette.palette[y * nb_colors..][..nb_colors];
         let iget = |y: usize| &palette.indices[y * xsize..][..xsize];

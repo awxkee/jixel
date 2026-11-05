@@ -401,6 +401,7 @@ fn avx_dequantized_level_f32(q: __m256, bias: crate::group::DequantBias) -> __m2
 fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
+    matrix: &[f32],
     quant_scale: f32,
     bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
@@ -417,9 +418,10 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(8));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
     assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = _mm256_set1_ps(quant_scale);
+    let inv_scale = _mm256_set1_ps(1.0 / quant_scale);
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let all = _mm256_set1_epi32(-1);
@@ -428,19 +430,21 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
 
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
+        for (chunk_x, (((coeff8, inv8), matrix8), error8)) in coeff_row
             .as_chunks::<8>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<8>().0.iter())
+            .zip(matrix_row.as_chunks::<8>().0.iter())
             .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
             .enumerate()
         {
@@ -470,7 +474,12 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
             } else {
                 quantized
             };
-            let error = _mm256_div_ps(_mm256_sub_ps(scaled, dequantized), denominator);
+            // Back to the coefficient domain by the forward matrix (no division).
+            let matrix_v = unsafe { _mm256_loadu_ps(matrix8.as_ptr()) };
+            let error = _mm256_mul_ps(
+                _mm256_sub_ps(scaled, dequantized),
+                _mm256_mul_ps(matrix_v, inv_scale),
+            );
 
             let active_i = if y < cy && x < cx {
                 let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
@@ -537,6 +546,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
 fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
+    matrix: &[f32],
     quant_scale: f32,
     bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
@@ -553,9 +563,10 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
         .checked_mul(height)
         .expect("coefficient size overflow");
     assert!(width.is_multiple_of(8));
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
     assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = _mm256_set1_ps(quant_scale);
+    let inv_scale = _mm256_set1_ps(1.0 / quant_scale);
     let sign = _mm256_set1_ps(-0.0);
     let lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     let all = _mm256_set1_epi32(-1);
@@ -564,19 +575,21 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     let mut magnitude_bits = _mm256_setzero_ps();
     let mut scan_acc = _mm256_setzero_si256();
 
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, ((coeff8, inv8), error8)) in coeff_row
+        for (chunk_x, (((coeff8, inv8), matrix8), error8)) in coeff_row
             .as_chunks::<8>()
             .0
             .iter()
             .zip(inv_row.as_chunks::<8>().0.iter())
+            .zip(matrix_row.as_chunks::<8>().0.iter())
             .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
             .enumerate()
         {
@@ -606,7 +619,12 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             } else {
                 quantized
             };
-            let error = _mm256_div_ps(_mm256_sub_ps(scaled, dequantized), denominator);
+            // Back to the coefficient domain by the forward matrix (no division).
+            let matrix_v = unsafe { _mm256_loadu_ps(matrix8.as_ptr()) };
+            let error = _mm256_mul_ps(
+                _mm256_sub_ps(scaled, dequantized),
+                _mm256_mul_ps(matrix_v, inv_scale),
+            );
 
             let active_i = if y < cy && x < cx {
                 let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
@@ -832,6 +850,7 @@ mod tests {
                     })
                     .collect();
                 let inv: Vec<f32> = (0..n).map(|i| 0.01 + (i % 7) as f32 * 0.15).collect();
+                let forward: Vec<f32> = inv.iter().map(|v| 1.0 / v).collect();
                 let scale = [0.01, 0.5, 1.0, 7.0, 80.0][case % 5];
                 let thresholds = [0.0, 0.42, 0.57, 0.91];
                 for (original, optimized) in [
@@ -854,6 +873,7 @@ mod tests {
                         kernel(
                             &coeff,
                             &inv,
+                            &forward,
                             scale,
                             crate::group::DequantBias::DEFAULT[case % 3],
                             &thresholds,
@@ -930,6 +950,9 @@ mod tests {
             }
         }
         let inv_storage = [vec![1.0f32; 4096], vec![0.9f32; 4096], vec![1.1f32; 4096]];
+        let forward_storage = inv_storage
+            .clone()
+            .map(|m| m.iter().map(|v| 1.0 / v).collect::<Vec<f32>>());
         let idct = crate::dct::IdctMethods::scalar();
         for (strategy, cx, cy) in [
             (STRATEGY_DCT, 1, 1),
@@ -948,6 +971,11 @@ mod tests {
                 &inv_storage[1][..],
                 &inv_storage[2][..],
             ];
+            let forward = [
+                &forward_storage[0][..],
+                &forward_storage[1][..],
+                &forward_storage[2][..],
+            ];
             let input = ReconDistInput {
                 idct: &idct,
                 quantization: ReconQuantization {
@@ -955,6 +983,7 @@ mod tests {
                     rate_log2_lut: rate_log2_lut(),
                     coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                     inverse_matrices: inv,
+                    matrices: forward,
                     qac: 7.0,
                     qm_mult_x: 1.2,
                     qm_mult_b: 1.6,

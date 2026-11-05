@@ -5306,7 +5306,6 @@ mod tests {
                 max_off = max_off.max(dot.abs());
             }
         }
-        println!("max off-diagonal |<f_j,f_k>| = {max_off}");
         assert!(max_off < 1e-4, "DCT8 basis not orthogonal: {max_off}");
     }
 

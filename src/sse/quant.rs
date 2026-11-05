@@ -134,6 +134,13 @@ fn store_i16x4(output: &mut [i16; 4], value: __m128i) {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+fn store_i16x8(output: &mut [[i16; 4]; 2], value0: __m128i, value1: __m128i) {
+    let packed = _mm_packs_epi32(value0, value1);
+    unsafe { _mm_storeu_si128(output.as_mut_ptr().cast(), packed) };
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn quantize_dc_cfl_value_x4(
     input: __m128,
     y_quant: __m128i,
@@ -153,7 +160,16 @@ pub(crate) fn quantize_dc_sse41(input: &[f32], scale: f32, output: &mut [i16]) {
     let (output4, output_tail) = output.as_chunks_mut::<4>();
     let scale = _mm_set1_ps(scale);
 
-    for (source, target) in input4.iter().zip(output4) {
+    let (input_pairs, input_single) = input4.as_chunks::<2>();
+    let (output_pairs, output_single) = output4.as_chunks_mut::<2>();
+    for ([source0, source1], target) in input_pairs.iter().zip(output_pairs) {
+        let value0 = unsafe { _mm_loadu_ps(source0.as_ptr()) };
+        let value1 = unsafe { _mm_loadu_ps(source1.as_ptr()) };
+        let value0 = round_ties_away_i32x4(_mm_mul_ps(value0, scale));
+        let value1 = round_ties_away_i32x4(_mm_mul_ps(value1, scale));
+        store_i16x8(target, value0, value1);
+    }
+    for (source, target) in input_single.iter().zip(output_single) {
         let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
         store_i16x4(target, round_ties_away_i32x4(_mm_mul_ps(value, scale)));
     }
@@ -184,7 +200,21 @@ pub(crate) fn quantize_dc_cfl_sse41(
     let scale = _mm_set1_ps(scale);
     let negative_cfl = _mm_set1_ps(-cfl);
 
-    for ((source, y), target) in input4.iter().zip(y4).zip(output4) {
+    let (input_pairs, input_single) = input4.as_chunks::<2>();
+    let (y_pairs, y_single) = y4.as_chunks::<2>();
+    let (output_pairs, output_single) = output4.as_chunks_mut::<2>();
+    for (([source0, source1], [y0, y1]), target) in
+        input_pairs.iter().zip(y_pairs).zip(output_pairs)
+    {
+        let value0 = unsafe { _mm_loadu_ps(source0.as_ptr()) };
+        let value1 = unsafe { _mm_loadu_ps(source1.as_ptr()) };
+        let y0 = unsafe { _mm_loadl_epi64(y0.as_ptr().cast()) };
+        let y1 = unsafe { _mm_loadl_epi64(y1.as_ptr().cast()) };
+        let value0 = quantize_dc_cfl_value_x4(value0, y0, scale, negative_cfl);
+        let value1 = quantize_dc_cfl_value_x4(value1, y1, scale, negative_cfl);
+        store_i16x8(target, value0, value1);
+    }
+    for ((source, y), target) in input_single.iter().zip(y_single).zip(output_single) {
         let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
         let y = unsafe { _mm_loadl_epi64(y.as_ptr().cast()) };
         store_i16x4(
@@ -215,7 +245,17 @@ pub(crate) fn quantize_dc_i32_sse41(input: &[f32], scale: f32, output: &mut [i32
     let (input_chunks, input_tail) = input.as_chunks::<4>();
     let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
     let scale = _mm_set1_ps(scale);
-    for (source, target) in input_chunks.iter().zip(output_chunks) {
+    let (input_pairs, input_single) = input_chunks.as_chunks::<2>();
+    let (output_pairs, output_single) = output_chunks.as_chunks_mut::<2>();
+    for ([source0, source1], [target0, target1]) in input_pairs.iter().zip(output_pairs) {
+        let value0 = unsafe { _mm_loadu_ps(source0.as_ptr()) };
+        let value1 = unsafe { _mm_loadu_ps(source1.as_ptr()) };
+        let value0 = round_ties_away_i32x4(_mm_mul_ps(value0, scale));
+        let value1 = round_ties_away_i32x4(_mm_mul_ps(value1, scale));
+        unsafe { _mm_storeu_si128(target0.as_mut_ptr().cast(), value0) };
+        unsafe { _mm_storeu_si128(target1.as_mut_ptr().cast(), value1) };
+    }
+    for (source, target) in input_single.iter().zip(output_single) {
         let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
         let value = round_ties_away_i32x4(_mm_mul_ps(value, scale));
         unsafe { _mm_storeu_si128(target.as_mut_ptr().cast(), value) };
@@ -265,7 +305,22 @@ pub(crate) fn quantize_dc_cfl_i32_sse41(
     let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
     let scale = _mm_set1_ps(scale);
     let negative_cfl = _mm_set1_ps(-cfl);
-    for ((source, y), target) in input_chunks.iter().zip(y_chunks).zip(output_chunks) {
+    let (input_pairs, input_single) = input_chunks.as_chunks::<2>();
+    let (y_pairs, y_single) = y_chunks.as_chunks::<2>();
+    let (output_pairs, output_single) = output_chunks.as_chunks_mut::<2>();
+    for (([source0, source1], [y0, y1]), [target0, target1]) in
+        input_pairs.iter().zip(y_pairs).zip(output_pairs)
+    {
+        let value0 = unsafe { _mm_loadu_ps(source0.as_ptr()) };
+        let value1 = unsafe { _mm_loadu_ps(source1.as_ptr()) };
+        let y0 = unsafe { _mm_loadu_si128(y0.as_ptr().cast()) };
+        let y1 = unsafe { _mm_loadu_si128(y1.as_ptr().cast()) };
+        let value0 = quantize_dc_cfl_i32_value_x4(value0, y0, scale, negative_cfl);
+        let value1 = quantize_dc_cfl_i32_value_x4(value1, y1, scale, negative_cfl);
+        unsafe { _mm_storeu_si128(target0.as_mut_ptr().cast(), value0) };
+        unsafe { _mm_storeu_si128(target1.as_mut_ptr().cast(), value1) };
+    }
+    for ((source, y), target) in input_single.iter().zip(y_single).zip(output_single) {
         let value = unsafe { _mm_loadu_ps(source.as_ptr()) };
         let y = unsafe { _mm_loadu_si128(y.as_ptr().cast()) };
         let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);

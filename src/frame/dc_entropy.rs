@@ -51,7 +51,11 @@ pub(crate) struct DcEntropy {
     /// Weighted-predictor parameters of the DC streams (their GroupHeaders).
     pub(crate) wp_params: WpParams,
     /// The MA-learned DC tree, for a re-run under other predictor parameters.
-    pub(crate) ma_tree: Option<crate::ma_tree::LearnedTree>,
+    pub(crate) ma_tree: Option<MaDcTrees>,
+    /// Context id per node of the written DC tree and the predictor offset
+    /// per node (empty without the MA arm).
+    pub(crate) ma_leaf_ctx: Vec<u32>,
+    pub(crate) ma_offsets: Vec<i32>,
 }
 
 impl DcEntropy {
@@ -194,7 +198,7 @@ pub(crate) fn prepare_dc_entropy(
     use_dc_frame: bool,
     distance: f32,
     wp_params: WpParams,
-    ma_tree: Option<&crate::ma_tree::LearnedTree>,
+    ma_tree: Option<&MaDcTrees>,
 ) -> DcEntropy {
     // Build adaptive DC entropy code from all DC + AC-metadata tokens.
     // Per-leaf DC predictor selection.
@@ -245,252 +249,331 @@ pub(crate) fn prepare_dc_entropy(
         meta_props_per_group.push(meta_props);
     }
 
-    let dc_gradient = if !dc_predictor_search {
-        DC_PREDICTOR_GRADIENT
-    } else {
-        choose_dc_predictors(
-            &wp_tokens_per_group,
-            &grad_tokens_per_group,
-            &mut scratch.dc_predictor,
-        )
-    };
-    // Arm A: the static tree with per-leaf predictor flips.
-    let dc_tokens_static: Vec<Vec<Token>> = if !dc_predictor_search {
-        std::mem::take(&mut wp_tokens_per_group)
-    } else {
-        wp_tokens_per_group
-            .iter()
-            .zip(&grad_tokens_per_group)
-            .map(|(wp, grad)| {
-                wp.iter()
-                    .zip(grad)
-                    .map(|(w, g)| {
-                        if dc_gradient[w.context as usize] {
-                            *g
-                        } else {
-                            *w
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
-    };
-    let code_static = crate::entropy::optimize_entropy_code_ac_streams(
-        dc_tokens_static
-            .iter()
-            .map(Vec::as_slice)
-            .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
-        K_NUM_DC_CONTEXTS,
-        &mut scratch.huffman_pool,
-        effort.huc_select,
-        ctx.speed,
-        Some(&ctx.thread_pool),
-    );
-    let tree_static = DcTreeChoice::Static(dc_gradient);
-
-    // `dc_code_refined`: the Slow arm battle already priced both finalists on
-    // ANS-refined codes, so the winner needs no second refinement.
-    let mut learned_ma_tree: Option<crate::ma_tree::LearnedTree> = None;
-    let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree, dc_code_refined) =
-        if !effort.dc_learned_tree || use_dc_frame {
-            (
-                dc_tokens_static,
-                meta_tokens_per_group,
-                code_static,
-                tree_static,
-                false,
-            )
-        } else {
-            // Arm B: a per-image learned tree over WP error and channel, with its own
-            // per-leaf predictor choice. Leaf renumbering shifts the metadata contexts,
-            // so those tokens are remapped alongside.
-            let learned = crate::dc_tree::learn_dc_tree(
-                num_dc_groups,
-                &wp_tokens_per_group,
-                &grad_tokens_per_group,
-                &props_per_group,
-                &meta_tokens_per_group,
-                &meta_props_per_group,
-            );
-            let dc_tokens_learned: Vec<Vec<Token>> = wp_tokens_per_group
-                .iter()
-                .zip(&grad_tokens_per_group)
-                .zip(&props_per_group)
-                .map(|((wp, grad), props)| {
-                    wp.iter()
-                        .zip(grad)
-                        .zip(props)
-                        .map(|((w, g), &p)| {
-                            let ctx = learned.dc_context[p as usize];
-                            let value = if learned.leaf_gradient[ctx as usize] {
-                                g.value
-                            } else {
-                                w.value
-                            };
-                            Token::new(u32::from(ctx), value)
-                        })
-                        .collect()
-                })
-                .collect();
-            let meta_tokens_learned: Vec<Vec<Token>> = meta_tokens_per_group
-                .iter()
-                .zip(&meta_props_per_group)
-                .map(|(group, props)| {
-                    group
-                        .iter()
-                        .zip(props)
-                        .map(|(t, &p)| {
-                            let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
-                            Token::new(u32::from(learned.meta_context[slot]), t.value)
-                        })
-                        .collect()
-                })
-                .collect();
-            let code_learned = crate::entropy::optimize_entropy_code_ac_streams(
-                dc_tokens_learned
-                    .iter()
+    // Price an arm end to end: serialized tree + entropy-code header
+    // (measured by writing them) plus the payload estimate.
+    let payload =
+        |dc: &[Vec<Token>], meta: &[Vec<Token>], code: &crate::entropy::OwnedEntropyCode| {
+            crate::entropy::estimate_ac_plain_bits(
+                dc.iter()
                     .map(Vec::as_slice)
-                    .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
-                learned.num_contexts,
-                &mut scratch.huffman_pool,
-                effort.huc_select,
-                ctx.speed,
-                Some(&ctx.thread_pool),
-            );
+                    .chain(meta.iter().map(Vec::as_slice)),
+                code,
+            )
+        };
+    let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
+        let mut w = BitWriter::new();
+        match tree {
+            DcTreeChoice::Static(grad) => {
+                write_context_tree(num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
+            }
+            DcTreeChoice::Learned(tokens) => {
+                write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut w);
+            }
+        }
+        write_entropy_code(code, &mut scratch.huffman_pool, &mut w);
+        w.bits_written() as u64
+    };
+    // The margin absorbs the small estimator noise so near-ties keep the
+    // battle-tested static tree.
+    const LEARNED_TREE_MARGIN_BITS: u64 = 64;
 
-            // Price both arms end to end: serialized tree + entropy-code header
-            // (measured by writing them) plus the payload estimate, and require the
-            // learned arm to win by a margin. The margin absorbs the small estimator
-            // noise so near-ties keep the battle-tested static tree.
-            let payload = |dc: &[Vec<Token>],
-                           meta: &[Vec<Token>],
-                           code: &crate::entropy::OwnedEntropyCode| {
-                crate::entropy::estimate_ac_plain_bits(
-                    dc.iter()
-                        .map(Vec::as_slice)
-                        .chain(meta.iter().map(Vec::as_slice)),
-                    code,
+    // Arm C: the DC side learned over the full modular property set and
+    // every predictor, as the lossless path does. Above a few DC samples it
+    // has won every image measured, so the static and learned arms are then
+    // not built at all; small images still race all three.
+    let mut learned_ma_tree: Option<MaDcTrees> = None;
+    let mut ma_leaf_map: (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
+    let ma_budget = if effort.ma_dc_tree {
+        Some(MaDcBudget::FULL)
+    } else if effort.ma_dc_tree_lite {
+        Some(MaDcBudget::LITE)
+    } else {
+        None
+    };
+    let ma_arm = if use_dc_frame {
+        None
+    } else {
+        ma_budget
+            .and_then(|budget| {
+                learn_ma_dc_arm(
+                    &ctx.thread_pool,
+                    scratch,
+                    dc_datas,
+                    &meta_tokens_per_group,
+                    &meta_props_per_group,
+                    epf_sharpness,
+                    wp_params,
+                    ma_tree,
+                    budget,
                 )
-            };
-            let header = |tree: &DcTreeChoice, code: &EntropyCode, scratch: &mut CoderScratch| {
-                let mut w = BitWriter::new();
-                match tree {
-                    DcTreeChoice::Static(grad) => {
-                        write_context_tree(num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
-                    }
-                    DcTreeChoice::Learned(tokens) => {
-                        write_tree_tokens(tokens, &mut scratch.huffman_pool, &mut w);
-                    }
-                }
-                write_entropy_code(code, &mut scratch.huffman_pool, &mut w);
-                w.bits_written() as u64
-            };
-            const LEARNED_TREE_MARGIN_BITS: u64 = 64;
-            let tree_learned = DcTreeChoice::Learned(learned.tokens);
-            let cost_static = header(&tree_static, &code_static.as_ref(), scratch)
-                + payload(&dc_tokens_static, &meta_tokens_per_group, &code_static);
-            let cost_learned = header(&tree_learned, &code_learned.as_ref(), scratch)
-                + payload(&dc_tokens_learned, &meta_tokens_learned, &code_learned);
-
-            // Arm C (Slow): the DC side learned over the full modular property set
-            // and every predictor, as the lossless path does.
-            let ma_arm = ctx
-                .speed
-                .effort()
-                .ma_dc_tree
-                .then(|| {
-                    learn_ma_dc_arm(
-                        ctx,
-                        scratch,
-                        dc_datas,
-                        &meta_tokens_per_group,
-                        &meta_props_per_group,
-                        wp_params,
-                        ma_tree,
-                    )
-                })
-                .flatten()
-                .and_then(|(variants, meta_tokens, num_contexts, tree)| {
-                    learned_ma_tree = Some(tree);
-                    variants
-                        .into_iter()
-                        .map(|(dc_tokens, tree_tokens)| {
-                            let streams = || {
-                                dc_tokens
-                                    .iter()
-                                    .map(Vec::as_slice)
-                                    .chain(meta_tokens.iter().map(Vec::as_slice))
-                            };
-                            let mut code = crate::entropy::optimize_entropy_code_ac_streams(
-                                streams(),
-                                num_contexts,
-                                &mut scratch.huffman_pool,
-                                true,
-                                ctx.speed,
-                                Some(&ctx.thread_pool),
-                            );
-                            // The prefix-cost clustering collapses a context-rich
-                            // tree (59 contexts -> 3 histograms on kodim20); price
-                            // the arm on the code the final ANS refinement would
-                            // produce.
-                            crate::entropy::refine_entropy_bundle(
-                                &mut code,
-                                streams(),
-                                crate::entropy::AnsRefinement::Slow,
-                                &ctx.thread_pool,
-                                scratch,
-                            );
-                            let tree = DcTreeChoice::Learned(tree_tokens);
-                            let cost = header(&tree, &code.as_ref(), scratch)
-                                + payload(&dc_tokens, &meta_tokens, &code);
-                            (cost, dc_tokens, code, tree)
-                        })
-                        .min_by_key(|v| v.0)
-                        .map(|(cost, dc_tokens, code, tree)| {
-                            (cost, dc_tokens, meta_tokens, code, tree)
-                        })
-                });
-
-            let use_learned = cost_learned + LEARNED_TREE_MARGIN_BITS < cost_static;
-            let best = if use_learned {
-                (
-                    dc_tokens_learned,
-                    meta_tokens_learned,
-                    code_learned,
-                    tree_learned,
-                )
-            } else {
-                (
-                    dc_tokens_static,
-                    meta_tokens_per_group,
-                    code_static,
-                    tree_static,
-                )
-            };
-            match ma_arm {
-                Some((cost, dc_tokens, meta_tokens, code, tree)) => {
-                    // Refine the incumbent too, so both arms are priced on the
-                    // codes the final refinement would write.
-                    let (best_dc, best_meta, mut best_code, best_tree) = best;
-                    crate::entropy::refine_entropy_bundle(
-                        &mut best_code,
-                        best_dc
+            })
+            .and_then(|(arms, trees)| {
+                let price = |arm: MaDcArm, scratch: &mut CoderScratch| {
+                    let MaDcArm {
+                        dc: dc_tokens,
+                        meta: meta_tokens,
+                        tree: tree_tokens,
+                        num_contexts,
+                        dc_leaf_ctx,
+                        offsets,
+                        meta_learned,
+                    } = arm;
+                    let streams = || {
+                        dc_tokens
                             .iter()
                             .map(Vec::as_slice)
-                            .chain(best_meta.iter().map(Vec::as_slice)),
+                            .chain(meta_tokens.iter().map(Vec::as_slice))
+                    };
+                    let mut code = crate::entropy::optimize_entropy_code_ac_streams(
+                        streams(),
+                        num_contexts,
+                        &mut scratch.huffman_pool,
+                        true,
+                        ctx.speed,
+                        Some(&ctx.thread_pool),
+                    );
+                    // The prefix-cost clustering collapses a context-rich
+                    // tree (59 contexts -> 3 histograms on kodim20); price
+                    // the arm on the code the final ANS refinement would
+                    // produce.
+                    crate::entropy::refine_entropy_bundle(
+                        &mut code,
+                        streams(),
                         crate::entropy::AnsRefinement::Slow,
                         &ctx.thread_pool,
                         scratch,
                     );
-                    let best_cost = header(&best_tree, &best_code.as_ref(), scratch)
-                        + payload(&best_dc, &best_meta, &best_code);
-                    if cost + LEARNED_TREE_MARGIN_BITS < best_cost {
-                        (dc_tokens, meta_tokens, code, tree, true)
-                    } else {
-                        (best_dc, best_meta, best_code, best_tree, true)
+                    let tree = DcTreeChoice::Learned(tree_tokens);
+                    let cost = header(&tree, &code.as_ref(), scratch)
+                        + payload(&dc_tokens, &meta_tokens, &code);
+                    (
+                        cost,
+                        dc_tokens,
+                        meta_tokens,
+                        code,
+                        tree,
+                        dc_leaf_ctx,
+                        offsets,
+                        meta_learned,
+                    )
+                };
+                let mut best = arms
+                    .into_iter()
+                    .map(|arm| price(arm, scratch))
+                    .min_by_key(|v| v.0)?;
+                let mut trees = trees;
+                // One EM step: leaves re-pick their predictor under the
+                // clustered histograms, and the winning arm's configuration
+                // (offsets, metadata side) is assembled and priced again.
+                if effort.ma_dc_repick()
+                    && let Some(repicked) = repick_leaf_predictors(
+                        dc_datas, &trees, &best.5, &best.6, &best.3, wp_params,
+                    )
+                {
+                    let with_offsets = best.6.iter().any(|&o| o != 0);
+                    let arms = assemble_ma_arms(
+                        &ctx.thread_pool,
+                        scratch,
+                        dc_datas,
+                        &meta_tokens_per_group,
+                        &meta_props_per_group,
+                        epf_sharpness,
+                        wp_params,
+                        &repicked,
+                        with_offsets,
+                    );
+                    if let Some(better) = arms
+                        .into_iter()
+                        .filter(|arm| {
+                            arm.meta_learned == best.7
+                                && arm.offsets.iter().any(|&o| o != 0) == with_offsets
+                        })
+                        .map(|arm| price(arm, scratch))
+                        .min_by_key(|v| v.0)
+                        && better.0 < best.0
+                    {
+                        best = better;
+                        trees = repicked;
                     }
                 }
-                None => (best.0, best.1, best.2, best.3, false),
+                learned_ma_tree = Some(trees);
+                ma_leaf_map = (best.5, best.6);
+                Some((best.0, best.1, best.2, best.3, best.4))
+            })
+    };
+
+    // `dc_code_refined`: the arm pricing already used ANS-refined codes, so
+    // the winner needs no second refinement.
+    let dc_samples: usize = dc_datas
+        .iter()
+        .map(|d| {
+            (0..3)
+                .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
+                .sum::<usize>()
+        })
+        .sum();
+    let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree, dc_code_refined) =
+        match ma_arm {
+            Some((_, dc_tokens, meta_tokens, code, tree)) if dc_samples >= MA_ARM_ALONE_SAMPLES => {
+                (dc_tokens, meta_tokens, code, tree, true)
+            }
+            ma_arm => {
+                if ma_arm.is_none() {
+                    ma_leaf_map = (Vec::new(), Vec::new());
+                }
+                let dc_gradient = if !dc_predictor_search {
+                    DC_PREDICTOR_GRADIENT
+                } else {
+                    choose_dc_predictors(
+                        &wp_tokens_per_group,
+                        &grad_tokens_per_group,
+                        &mut scratch.dc_predictor,
+                    )
+                };
+                // Arm A: the static tree with per-leaf predictor flips.
+                let dc_tokens_static: Vec<Vec<Token>> = if !dc_predictor_search {
+                    std::mem::take(&mut wp_tokens_per_group)
+                } else {
+                    wp_tokens_per_group
+                        .iter()
+                        .zip(&grad_tokens_per_group)
+                        .map(|(wp, grad)| {
+                            wp.iter()
+                                .zip(grad)
+                                .map(|(w, g)| {
+                                    if dc_gradient[w.context as usize] {
+                                        *g
+                                    } else {
+                                        *w
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect()
+                };
+                let code_static = crate::entropy::optimize_entropy_code_ac_streams(
+                    dc_tokens_static
+                        .iter()
+                        .map(Vec::as_slice)
+                        .chain(meta_tokens_per_group.iter().map(Vec::as_slice)),
+                    K_NUM_DC_CONTEXTS,
+                    &mut scratch.huffman_pool,
+                    effort.huc_select,
+                    ctx.speed,
+                    Some(&ctx.thread_pool),
+                );
+                let tree_static = DcTreeChoice::Static(dc_gradient);
+                let best = if !effort.dc_learned_tree || use_dc_frame {
+                    (
+                        dc_tokens_static,
+                        meta_tokens_per_group,
+                        code_static,
+                        tree_static,
+                    )
+                } else {
+                    // Arm B: a per-image learned tree over WP error and channel, with
+                    // its own per-leaf predictor choice. Leaf renumbering shifts the
+                    // metadata contexts, so those tokens are remapped alongside.
+                    let learned = crate::dc_tree::learn_dc_tree(
+                        num_dc_groups,
+                        &wp_tokens_per_group,
+                        &grad_tokens_per_group,
+                        &props_per_group,
+                        &meta_tokens_per_group,
+                        &meta_props_per_group,
+                    );
+                    let dc_tokens_learned: Vec<Vec<Token>> = wp_tokens_per_group
+                        .iter()
+                        .zip(&grad_tokens_per_group)
+                        .zip(&props_per_group)
+                        .map(|((wp, grad), props)| {
+                            wp.iter()
+                                .zip(grad)
+                                .zip(props)
+                                .map(|((w, g), &p)| {
+                                    let ctx = learned.dc_context[p as usize];
+                                    let value = if learned.leaf_gradient[ctx as usize] {
+                                        g.value
+                                    } else {
+                                        w.value
+                                    };
+                                    Token::new(u32::from(ctx), value)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let meta_tokens_learned: Vec<Vec<Token>> = meta_tokens_per_group
+                        .iter()
+                        .zip(&meta_props_per_group)
+                        .map(|(group, props)| {
+                            group
+                                .iter()
+                                .zip(props)
+                                .map(|(t, &p)| {
+                                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                                    Token::new(u32::from(learned.meta_context[slot]), t.value)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let code_learned = crate::entropy::optimize_entropy_code_ac_streams(
+                        dc_tokens_learned
+                            .iter()
+                            .map(Vec::as_slice)
+                            .chain(meta_tokens_learned.iter().map(Vec::as_slice)),
+                        learned.num_contexts,
+                        &mut scratch.huffman_pool,
+                        effort.huc_select,
+                        ctx.speed,
+                        Some(&ctx.thread_pool),
+                    );
+                    let tree_learned = DcTreeChoice::Learned(learned.tokens);
+                    let cost_static = header(&tree_static, &code_static.as_ref(), scratch)
+                        + payload(&dc_tokens_static, &meta_tokens_per_group, &code_static);
+                    let cost_learned = header(&tree_learned, &code_learned.as_ref(), scratch)
+                        + payload(&dc_tokens_learned, &meta_tokens_learned, &code_learned);
+                    if cost_learned + LEARNED_TREE_MARGIN_BITS < cost_static {
+                        (
+                            dc_tokens_learned,
+                            meta_tokens_learned,
+                            code_learned,
+                            tree_learned,
+                        )
+                    } else {
+                        (
+                            dc_tokens_static,
+                            meta_tokens_per_group,
+                            code_static,
+                            tree_static,
+                        )
+                    }
+                };
+                match ma_arm {
+                    Some((cost, dc_tokens, meta_tokens, code, tree)) => {
+                        // Refine the incumbent too, so both arms are priced on
+                        // the codes the final refinement would write.
+                        let (best_dc, best_meta, mut best_code, best_tree) = best;
+                        crate::entropy::refine_entropy_bundle(
+                            &mut best_code,
+                            best_dc
+                                .iter()
+                                .map(Vec::as_slice)
+                                .chain(best_meta.iter().map(Vec::as_slice)),
+                            crate::entropy::AnsRefinement::Slow,
+                            &ctx.thread_pool,
+                            scratch,
+                        );
+                        let best_cost = header(&best_tree, &best_code.as_ref(), scratch)
+                            + payload(&best_dc, &best_meta, &best_code);
+                        if cost + LEARNED_TREE_MARGIN_BITS < best_cost {
+                            (dc_tokens, meta_tokens, code, tree, true)
+                        } else {
+                            ma_leaf_map = (Vec::new(), Vec::new());
+                            (best_dc, best_meta, best_code, best_tree, true)
+                        }
+                    }
+                    None => (best.0, best.1, best.2, best.3, false),
+                }
             }
         };
     drop(wp_tokens_per_group);
@@ -539,6 +622,8 @@ pub(crate) fn prepare_dc_entropy(
         refinement: ans_refinement,
         wp_params,
         ma_tree: learned_ma_tree,
+        ma_leaf_ctx: ma_leaf_map.0,
+        ma_offsets: ma_leaf_map.1,
     }
 }
 
@@ -547,7 +632,10 @@ pub(crate) fn prepare_dc_entropy(
 const MA_DC_TARGET_SAMPLES: usize = 1 << 19;
 /// Leaf budget of the MA-learned DC side (the metadata side adds at most
 /// ~25 more; context ids stay below 256).
-const MA_DC_MAX_LEAVES: usize = 160;
+/// Binds on large images only: small DC images stop splitting well before
+/// it, and the coder clusters the contexts to 128 histograms regardless
+/// (a 256-cluster coder was tried: no gain).
+const MA_DC_MAX_LEAVES: usize = 400;
 /// Estimated header bits of one more DC leaf: its tree tokens, context-map
 /// entry and a share of a histogram.
 const MA_DC_SPLIT_COST_BITS: f32 = 50.0;
@@ -558,7 +646,8 @@ const MA_DC_MIN_NODE_SAMPLES: usize = 64;
 fn dc_planes(dc_datas: &[DcGroupData]) -> Vec<crate::lossless::DcPlanes> {
     dc_datas
         .iter()
-        .map(|dc| {
+        .enumerate()
+        .map(|(group, dc)| {
             let q = &dc.quant_dc;
             let plane = |c: usize| {
                 q.plane(c)
@@ -567,10 +656,52 @@ fn dc_planes(dc_datas: &[DcGroupData]) -> Vec<crate::lossless::DcPlanes> {
                     .map(|&v| i32::from(v))
                     .collect()
             };
+            let dims = |c: usize| (q.plane(c).xsize(), q.plane(c).ysize());
             crate::lossless::DcPlanes {
-                planes: [plane(1), plane(0), plane(2)],
-                w: q.xsize(),
-                h: q.ysize(),
+                planes: vec![plane(1), plane(0), plane(2)],
+                dims: vec![dims(1), dims(0), dims(2)],
+                stream: 1 + group as i32,
+            }
+        })
+        .collect()
+}
+
+/// The AC-metadata modular image of every DC group as planes: the CfL tile
+/// maps, the block-info channel (first blocks wide; transform type over
+/// QF − 1) and the EPF sharpness plane, with the decoder's stream id.
+fn meta_planes(dc_datas: &[DcGroupData], epf_sharpness: i32) -> Vec<crate::lossless::DcPlanes> {
+    let num_dc_groups = dc_datas.len();
+    dc_datas
+        .iter()
+        .enumerate()
+        .map(|(group, dc)| {
+            let tile = |m: &crate::image::ImageSB| -> Vec<i32> {
+                m.as_slice().iter().map(|&v| i32::from(v)).collect()
+            };
+            let (xt, yt) = (dc.ytox_map.xsize(), dc.ytox_map.ysize());
+            let (xb, yb) = (dc.ac_strategy.xsize(), dc.ac_strategy.ysize());
+            let first = dc.ac_strategy.count_first_blocks();
+            let mut info = Vec::with_capacity(2 * first);
+            let mut qfs = Vec::with_capacity(first);
+            for y in 0..yb {
+                let row = dc.raw_quant_field.row(y);
+                for x in 0..xb {
+                    if dc.ac_strategy.is_first_block(x, y) {
+                        info.push(dc.ac_strategy.strategy_code(x, y) as i32);
+                        qfs.push(i32::from(row[x]) - 1);
+                    }
+                }
+            }
+            info.extend(qfs);
+            crate::lossless::DcPlanes {
+                planes: vec![
+                    tile(&dc.ytox_map),
+                    tile(&dc.ytob_map),
+                    info,
+                    vec![epf_sharpness; xb * yb],
+                ],
+                dims: vec![(xt, yt), (xt, yt), (first, 2), (xb, yb)],
+                stream: (1 + 2 * num_dc_groups + group) as i32,
             }
         })
         .collect()
@@ -581,117 +712,494 @@ fn dc_planes(dc_datas: &[DcGroupData]) -> Vec<crate::lossless::DcPlanes> {
 /// metadata streams through the grafted tree. Returns the candidate
 /// (DC tokens, serialized tree) pairs — without and, when any leaf has one,
 /// with median leaf offsets — the metadata tokens and the context count.
-#[allow(clippy::type_complexity)]
-fn learn_ma_dc_arm(
-    ctx: &EncodingContext,
+/// Learning budget of the MA-learned DC arm.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MaDcBudget {
+    /// DC-side sample budget; larger DC images are sampled with an odd stride.
+    pub(crate) target_samples: usize,
+    pub(crate) max_leaves: usize,
+    pub(crate) max_candidates: usize,
+    pub(crate) side_preds: usize,
+    /// Also price the tree with median leaf offsets.
+    pub(crate) offsets_variant: bool,
+    /// Also learn the metadata side over the modular property set and race
+    /// it against the static refined side.
+    pub(crate) learn_meta: bool,
+}
+
+impl MaDcBudget {
+    /// Slow and up. Over the 160-leaf / 4-side-predictor / static-metadata
+    /// budget on 14 references at d1/2/4: every side predictor scored per
+    /// split side −0.09 % (large images −0.5 %, Kodak ±0.1 %), the 400-leaf
+    /// cap −0.2 % (binds on large images only), the learned metadata side
+    /// −0.06 % (city/screenshots −0.1..−0.26 %); together −0.34 % at ×1.13
+    /// single-thread Slow. 64 split candidates were +8 % time for −0.03 %.
+    pub(crate) const FULL: Self = Self {
+        target_samples: MA_DC_TARGET_SAMPLES,
+        max_leaves: MA_DC_MAX_LEAVES,
+        max_candidates: 32,
+        side_preds: 14,
+        offsets_variant: true,
+        learn_meta: true,
+    };
+    /// Fast and Medium: a quarter of the samples, 128 leaves, 8 split
+    /// candidates, four side predictors, no offsets variant, learned
+    /// metadata side. Over the 64-leaf / 1-side / static-metadata budget:
+    /// Fast −0.63 % at ×1.15, Medium −0.46 % at ×1.08 (33/42 and 31/42 wins).
+    pub(crate) const LITE: Self = Self {
+        target_samples: 1 << 17,
+        max_leaves: 128,
+        max_candidates: 8,
+        side_preds: 4,
+        offsets_variant: false,
+        learn_meta: true,
+    };
+}
+
+/// The MA-learned trees of a DC arm, for a re-run under other predictor
+/// parameters: the DC side and, when learned, the metadata side.
+#[derive(Clone)]
+pub(crate) struct MaDcTrees {
+    pub(crate) dc: crate::ma_tree::LearnedTree,
+    pub(crate) meta: Option<crate::ma_tree::LearnedTree>,
+}
+
+/// One priced candidate of the MA-learned DC arm: DC and metadata tokens
+/// numbered by the serialized tree's contexts.
+pub(crate) struct MaDcArm {
+    pub(crate) dc: Vec<Vec<Token>>,
+    pub(crate) meta: Vec<Vec<Token>>,
+    pub(crate) tree: Vec<Token>,
+    pub(crate) num_contexts: usize,
+    /// Context id per node of the DC tree (meaningful for its leaves).
+    pub(crate) dc_leaf_ctx: Vec<u32>,
+    /// Predictor offset per node of the DC tree.
+    pub(crate) offsets: Vec<i32>,
+    /// Whether the metadata side is the learned one.
+    pub(crate) meta_learned: bool,
+}
+
+const MA_META_MAX_LEAVES: usize = 64;
+/// DC samples from which the MA arm alone is coded: below it the static and
+/// learned arms still win now and then (abstract 365x547 +0.5 % without
+/// them at d4), above it they never have.
+const MA_ARM_ALONE_SAMPLES: usize = 32_768;
+
+/// Contexts the DC and metadata sides may take together: the coder
+/// clusters them anyway, and the context map grows with each.
+const MA_MAX_TREE_CONTEXTS: usize = 512;
+
+/// Learn one MA tree over the planes of every group, sampling large images
+/// with an odd stride down to the budget.
+fn learn_planes(
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut CoderScratch,
+    planes: &[crate::lossless::DcPlanes],
+    budget: MaDcBudget,
+    max_leaves: usize,
+    wp_params: WpParams,
+) -> Option<crate::ma_tree::LearnedTree> {
+    let total: usize = planes.iter().map(|g| g.len()).sum();
+    let mut stride = total.div_ceil(budget.target_samples).max(1);
+    if stride > 1 && stride.is_multiple_of(2) {
+        stride += 1;
+    }
+    let samples = crate::lossless::sample_dc_planes(planes, stride, wp_params);
+    if samples.len() < 4 * MA_DC_MIN_NODE_SAMPLES {
+        return None;
+    }
+    let params = ma_dc_params(&samples, budget, max_leaves, stride);
+    Some(crate::ma_tree::learn_ma_tree(
+        &samples, params, pool, scratch,
+    ))
+}
+
+/// Learner parameters of the DC arm.
+fn ma_dc_params(
+    samples: &crate::ma_tree::MaSamples,
+    budget: MaDcBudget,
+    max_leaves: usize,
+    stride: usize,
+) -> crate::ma_tree::MaLearnParams {
+    let alphabet = samples
+        .tok
+        .iter()
+        .flat_map(|t| t.iter())
+        .copied()
+        .max()
+        .unwrap_or(0) as usize
+        + 1;
+    crate::ma_tree::MaLearnParams {
+        alphabet,
+        max_leaves,
+        split_cost_bits: MA_DC_SPLIT_COST_BITS / stride as f32,
+        min_node: MA_DC_MIN_NODE_SAMPLES,
+        allow_wp: true,
+        allowed_preds: u16::MAX,
+        side_preds: budget.side_preds,
+        max_candidates: budget.max_candidates,
+        modal_offsets: false,
+        prune_leaf_bits: 0.0,
+    }
+}
+
+/// Learn the metadata side as one subtree per part — the CfL maps, the
+/// strategy row, the QF row and the EPF plane — each on its own samples,
+/// routed by fixed channel/row splits so no leaf mixes streams whose
+/// statistics differ by construction. `cap` bounds the leaves in all.
+fn learn_meta_parts(
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut CoderScratch,
+    planes: &[crate::lossless::DcPlanes],
+    budget: MaDcBudget,
+    cap: usize,
+) -> Option<crate::ma_tree::LearnedTree> {
+    use crate::ma_tree::{LearnedTree, MaNode};
+    let total: usize = planes.iter().map(|g| g.len()).sum();
+    let mut stride = total.div_ceil(budget.target_samples).max(1);
+    if stride > 1 && stride.is_multiple_of(2) {
+        stride += 1;
+    }
+    let samples = crate::lossless::sample_dc_planes(planes, stride, WpParams::DEFAULT);
+    // Part of each sample: 0 CfL, 1 strategy row, 2 QF row, 3 EPF.
+    let mut idx: [Vec<u32>; 4] = Default::default();
+    for (i, row) in samples.props.iter().enumerate() {
+        let part = match (row[0], row[2]) {
+            (0 | 1, _) => 0,
+            (2, 0) => 1,
+            (2, _) => 2,
+            _ => 3,
+        };
+        idx[part].push(i as u32);
+    }
+    // Leaves per part: the block-info rows carry the bits.
+    let caps = [
+        (cap / 8).max(2),
+        (cap * 2 / 5).max(4),
+        (cap * 2 / 5).max(4),
+        2,
+    ];
+    let mut parts: Vec<Vec<MaNode>> = Vec::with_capacity(4);
+    let mut est_bits = 0.0;
+    let mut flat_bits = 0.0;
+    for (part, part_idx) in idx.into_iter().enumerate() {
+        if part_idx.len() < MA_DC_MIN_NODE_SAMPLES {
+            parts.push(vec![MaNode::Leaf { pred: 0, offset: 0 }]);
+            continue;
+        }
+        let params = ma_dc_params(&samples, budget, caps[part], stride);
+        let tree = crate::ma_tree::learn_ma_tree_indexed(&samples, part_idx, params, pool, scratch);
+        est_bits += tree.est_bits;
+        flat_bits += tree.flat_bits;
+        parts.push(tree.nodes);
+    }
+    // Routing prefix: channel > 2 → EPF; channel > 1 → (y > 0 → QF, else
+    // strategy); else CfL.
+    let mut nodes = vec![
+        MaNode::Split {
+            prop: 0,
+            val: 2,
+            gt: 0,
+            le: 1,
+        },
+        MaNode::Split {
+            prop: 0,
+            val: 1,
+            gt: 2,
+            le: 0,
+        },
+        MaNode::Split {
+            prop: 2,
+            val: 0,
+            gt: 0,
+            le: 0,
+        },
+    ];
+    let mut roots = [0u32; 4];
+    for (part, part_nodes) in parts.into_iter().enumerate() {
+        let base = nodes.len() as u32;
+        roots[part] = base;
+        nodes.extend(part_nodes.into_iter().map(|n| match n {
+            MaNode::Split { prop, val, gt, le } => MaNode::Split {
+                prop,
+                val,
+                gt: gt + base,
+                le: le + base,
+            },
+            leaf => leaf,
+        }));
+    }
+    nodes[0] = MaNode::Split {
+        prop: 0,
+        val: 2,
+        gt: roots[3],
+        le: 1,
+    };
+    nodes[1] = MaNode::Split {
+        prop: 0,
+        val: 1,
+        gt: 2,
+        le: roots[0],
+    };
+    nodes[2] = MaNode::Split {
+        prop: 2,
+        val: 0,
+        gt: roots[2],
+        le: roots[1],
+    };
+    Some(LearnedTree {
+        nodes,
+        est_bits,
+        flat_bits,
+    })
+}
+
+/// Learn the DC side of the global tree with the lossless MA learner (full
+/// property set, every predictor) and, on request, the metadata side too;
+/// tokenize the DC groups and the metadata streams through every grafted
+/// tree. Returns the candidate arms — without and, when any leaf has one,
+/// with median DC leaf offsets, each with the static refined metadata side
+/// and with the learned one — and the trees for a re-run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn learn_ma_dc_arm(
+    pool: &crate::thread_pool::ThreadPool,
     scratch: &mut CoderScratch,
     dc_datas: &[DcGroupData],
     meta_tokens: &[Vec<Token>],
     meta_props: &[Vec<crate::dc_tree::DcProp>],
+    epf_sharpness: i32,
     wp_params: WpParams,
-    reuse_tree: Option<&crate::ma_tree::LearnedTree>,
-) -> Option<(
-    Vec<(Vec<Vec<Token>>, Vec<Token>)>,
-    Vec<Vec<Token>>,
-    usize,
-    crate::ma_tree::LearnedTree,
-)> {
+    reuse: Option<&MaDcTrees>,
+    budget: MaDcBudget,
+) -> Option<(Vec<MaDcArm>, MaDcTrees)> {
     let groups = dc_planes(dc_datas);
-    let tree = match reuse_tree {
-        Some(tree) => tree.clone(),
+
+    let trees = match reuse {
+        Some(trees) => trees.clone(),
         None => {
-            let total: usize = groups.iter().map(|g| 3 * g.w * g.h).sum();
-            let mut stride = total.div_ceil(MA_DC_TARGET_SAMPLES).max(1);
-            if stride > 1 && stride.is_multiple_of(2) {
-                stride += 1;
-            }
-            let samples = crate::lossless::sample_dc_planes(&groups, stride, wp_params);
-            if samples.len() < 4 * MA_DC_MIN_NODE_SAMPLES {
-                return None;
-            }
-            let alphabet = samples
-                .tok
-                .iter()
-                .flat_map(|t| t.iter())
-                .copied()
-                .max()
-                .unwrap_or(0) as usize
-                + 1;
-            let params = crate::ma_tree::MaLearnParams {
-                alphabet,
-                max_leaves: MA_DC_MAX_LEAVES,
-                split_cost_bits: MA_DC_SPLIT_COST_BITS / stride as f32,
-                min_node: MA_DC_MIN_NODE_SAMPLES,
-                allow_wp: true,
-                allowed_preds: u16::MAX,
-                side_preds: 4,
-                max_candidates: 32,
-                modal_offsets: false,
-                prune_leaf_bits: 0.0,
+            let dc = learn_planes(pool, scratch, &groups, budget, budget.max_leaves, wp_params)?;
+            let meta = if budget.learn_meta {
+                let dc_leaves = dc
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n, crate::ma_tree::MaNode::Leaf { .. }))
+                    .count();
+                let cap = MA_META_MAX_LEAVES.min(MA_MAX_TREE_CONTEXTS.saturating_sub(dc_leaves));
+                if cap >= 8 {
+                    let planes = meta_planes(dc_datas, epf_sharpness);
+                    learn_meta_parts(pool, scratch, &planes, budget, cap)
+                } else {
+                    None
+                }
+            } else {
+                None
             };
-            crate::ma_tree::learn_ma_tree(&samples, params, &ctx.thread_pool, scratch)
+            MaDcTrees { dc, meta }
         }
     };
-    let mut node_offsets = vec![0i32; tree.nodes.len()];
-    let mut grafted = crate::dc_tree::graft_ma_dc_tree(
-        dc_datas.len(),
-        &tree,
-        &node_offsets,
+    let arms = assemble_ma_arms(
+        pool,
+        scratch,
+        dc_datas,
         meta_tokens,
         meta_props,
+        epf_sharpness,
+        wp_params,
+        &trees,
+        budget.offsets_variant,
     );
-    let mut dc_tokens = ctx
-        .thread_pool
-        .steal_map(scratch, groups.len(), |i, _scratch| {
-            let g = &groups[i];
-            let mut out = Vec::with_capacity(3 * g.w * g.h);
+    Some((arms, trees))
+}
+
+/// Tokenize the DC groups and the metadata streams through every graft of
+/// `trees`: without and, when any leaf has one, with median DC leaf
+/// offsets, each with the static refined metadata side and, when learned,
+/// the learned one.
+#[allow(clippy::too_many_arguments)]
+fn assemble_ma_arms(
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut CoderScratch,
+    dc_datas: &[DcGroupData],
+    meta_tokens: &[Vec<Token>],
+    meta_props: &[Vec<crate::dc_tree::DcProp>],
+    epf_sharpness: i32,
+    wp_params: WpParams,
+    trees: &MaDcTrees,
+    offsets_variant: bool,
+) -> Vec<MaDcArm> {
+    let groups = dc_planes(dc_datas);
+    let num_dc_groups = dc_datas.len();
+    // Tokens carry their leaf's node index as context; each graft maps them
+    // to its BFS context numbering.
+    let dc_identity: Vec<u32> = (0..trees.dc.nodes.len() as u32).collect();
+    let dc_nodes = pool.steal_map(scratch, groups.len(), |i, _scratch| {
+        let g = &groups[i];
+        let mut out = Vec::with_capacity(g.len());
+        crate::lossless::tokenize_dc_planes(g, &trees.dc, &dc_identity, wp_params, &mut out);
+        out
+    });
+    let meta_nodes: Option<Vec<Vec<Token>>> = trees.meta.as_ref().map(|meta_tree| {
+        let planes = meta_planes(dc_datas, epf_sharpness);
+        let identity: Vec<u32> = (0..meta_tree.nodes.len() as u32).collect();
+        pool.steal_map(scratch, planes.len(), |i, _scratch| {
+            let mut out = Vec::with_capacity(planes[i].len());
             crate::lossless::tokenize_dc_planes(
-                g,
-                i,
-                &tree,
-                &grafted.leaf_ctx,
-                wp_params,
+                &planes[i],
+                meta_tree,
+                &identity,
+                WpParams::DEFAULT,
                 &mut out,
             );
             out
-        });
-    // Residuals do not depend on the offset: center each leaf on its median
-    // and re-serialize the tree with the offsets (context numbering is fixed
-    // by the tree's shape). Offsets only pay through clustering, so both
-    // variants are priced.
-    let num_contexts = grafted.num_contexts;
-    let meta_context = std::mem::take(&mut grafted.meta_context);
-    let mut variants = vec![(dc_tokens.clone(), grafted.tokens.clone())];
-    let ctx_offsets = crate::dc_tree::median_leaf_offsets(&dc_tokens, num_contexts);
-    if ctx_offsets.iter().any(|&o| o != 0) {
-        for (node, &c) in grafted.leaf_ctx.iter().enumerate() {
-            if c != u32::MAX {
-                node_offsets[node] = ctx_offsets[c as usize];
-            }
+        })
+    });
+    let map_ctx = |tokens: &[Vec<Token>], leaf_ctx: &[u32]| -> Vec<Vec<Token>> {
+        tokens
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|t| Token::new(leaf_ctx[t.context as usize], t.value))
+                    .collect()
+            })
+            .collect()
+    };
+    let static_meta = |meta_context: &[u16]| -> Vec<Vec<Token>> {
+        meta_tokens
+            .iter()
+            .zip(meta_props)
+            .map(|(group, props)| {
+                group
+                    .iter()
+                    .zip(props)
+                    .map(|(t, &p)| {
+                        let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                        Token::new(u32::from(meta_context[slot]), t.value)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    // Residuals do not depend on the offset: center each DC leaf on its
+    // median. Offsets only pay through clustering, so both are priced.
+    let node_offsets = crate::dc_tree::median_leaf_offsets(&dc_nodes, trees.dc.nodes.len());
+    let with_offsets = offsets_variant && node_offsets.iter().any(|&o| o != 0);
+    let zero_offsets = vec![0i32; trees.dc.nodes.len()];
+    let mut arms = Vec::new();
+    for offsets in [false, true] {
+        if offsets && !with_offsets {
+            continue;
         }
-        crate::dc_tree::apply_leaf_offsets(&mut dc_tokens, &ctx_offsets);
-        grafted = crate::dc_tree::graft_ma_dc_tree(
-            dc_datas.len(),
-            &tree,
-            &node_offsets,
+        let offs = if offsets {
+            &node_offsets
+        } else {
+            &zero_offsets
+        };
+        let mut dc_tokens = dc_nodes.clone();
+        if offsets {
+            crate::dc_tree::apply_leaf_offsets(&mut dc_tokens, offs);
+        }
+        let grafted = crate::dc_tree::graft_ma_dc_tree(
+            num_dc_groups,
+            &trees.dc,
+            offs,
             meta_tokens,
             meta_props,
         );
-        variants.push((dc_tokens, grafted.tokens));
+        arms.push(MaDcArm {
+            dc: map_ctx(&dc_tokens, &grafted.leaf_ctx),
+            meta: static_meta(&grafted.meta_context),
+            tree: grafted.tokens,
+            num_contexts: grafted.num_contexts,
+            dc_leaf_ctx: grafted.leaf_ctx,
+            offsets: offs.clone(),
+            meta_learned: false,
+        });
+        if let (Some(meta_tree), Some(meta_nodes)) = (&trees.meta, &meta_nodes) {
+            let joint =
+                crate::dc_tree::graft_ma_dc_meta_tree(num_dc_groups, &trees.dc, offs, meta_tree);
+            arms.push(MaDcArm {
+                dc: map_ctx(&dc_tokens, &joint.dc_leaf_ctx),
+                meta: map_ctx(meta_nodes, &joint.meta_leaf_ctx),
+                tree: joint.tokens,
+                num_contexts: joint.num_contexts,
+                dc_leaf_ctx: joint.dc_leaf_ctx,
+                offsets: offs.clone(),
+                meta_learned: true,
+            });
+        }
     }
-    let meta_tokens = meta_tokens
+    arms
+}
+
+/// Re-pick every DC leaf's predictor by the cost of its residuals under the
+/// leaf's clustered histogram in `code` (the learner picked by the leaf's
+/// own order-0 entropy, before clustering merged it with others). Returns
+/// the trees with the new leaves when any changed.
+fn repick_leaf_predictors(
+    dc_datas: &[DcGroupData],
+    trees: &MaDcTrees,
+    arm_leaf_ctx: &[u32],
+    arm_offsets: &[i32],
+    code: &OwnedEntropyCode,
+    wp_params: WpParams,
+) -> Option<MaDcTrees> {
+    use crate::ma_tree::{MaNode, NUM_MA_PREDS};
+    if code.use_prefix_code {
+        return None;
+    }
+    let cost_tables: Vec<Vec<f32>> = code
+        .ans_histograms
         .iter()
-        .zip(meta_props)
-        .map(|(group, props)| {
-            group
+        .map(|h| {
+            h.freqs
                 .iter()
-                .zip(props)
-                .map(|(t, &p)| {
-                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
-                    Token::new(u32::from(meta_context[slot]), t.value)
+                .map(|&f| {
+                    if f == 0 {
+                        crate::entropy::ANS_LOG_TAB_SIZE as f32
+                    } else {
+                        (f64::from(crate::entropy::ANS_LOG_TAB_SIZE) - f_log2(f64::from(f))) as f32
+                    }
                 })
                 .collect()
         })
         .collect();
-    Some((variants, meta_tokens, num_contexts, tree))
+    let nodes = trees.dc.nodes.len();
+    let mut cost = vec![0f32; nodes * NUM_MA_PREDS];
+    for g in dc_planes(dc_datas) {
+        crate::lossless::walk_dc_planes_predictors(&g, &trees.dc, wp_params, |node, residuals| {
+            let ctx = arm_leaf_ctx[node as usize] as usize;
+            let cl = code.context_map[ctx] as usize;
+            let config = code.hybrid_uint_configs[cl];
+            let table = &cost_tables[cl];
+            let row = &mut cost[node as usize * NUM_MA_PREDS..(node as usize + 1) * NUM_MA_PREDS];
+            for (c, &r) in row.iter_mut().zip(residuals) {
+                let (sym, nbits, _) = crate::entropy::uint_encode_with_config(
+                    crate::entropy::pack_signed((r - i64::from(arm_offsets[node as usize])) as i32),
+                    config,
+                );
+                *c += table[(sym as usize).min(table.len() - 1)] + nbits as f32;
+            }
+        });
+    }
+    let mut changed = false;
+    let mut dc = trees.dc.clone();
+    for (node, n) in dc.nodes.iter_mut().enumerate() {
+        if let MaNode::Leaf { pred, .. } = n {
+            let row = &cost[node * NUM_MA_PREDS..(node + 1) * NUM_MA_PREDS];
+            let (best, _) = row.iter().enumerate().fold(
+                (*pred as usize, row[*pred as usize]),
+                |acc, (p, &c)| {
+                    if c < acc.1 { (p, c) } else { acc }
+                },
+            );
+            if best != *pred as usize {
+                *pred = best as u32;
+                changed = true;
+            }
+        }
+    }
+    changed.then(|| MaDcTrees {
+        dc,
+        meta: trees.meta.clone(),
+    })
 }

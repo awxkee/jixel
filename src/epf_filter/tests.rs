@@ -90,8 +90,9 @@ fn reference_stage(
                     acc[c] += weight * sample(image, c, nx, ny);
                 }
             }
+            let inv_sum = 1.0 / sum;
             for c in 0..3 {
-                out.plane_row_mut(c, y)[x] = acc[c] / sum;
+                out.plane_row_mut(c, y)[x] = acc[c] * inv_sum;
             }
         }
     }

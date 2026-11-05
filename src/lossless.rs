@@ -96,12 +96,15 @@ pub(crate) use frame::{encode_frame_lossless, encode_frame_lossless_base};
 pub(crate) use groups::write_single_channel_lz77_section;
 pub(crate) use header::write_patch_dictionary;
 pub(crate) use lz77::LzToken;
-pub(crate) use ma_sampling::{DcPlanes, sample_dc_planes, tokenize_dc_planes};
+pub(crate) use ma_sampling::{
+    DcPlanes, sample_dc_planes, tokenize_dc_planes, walk_dc_planes_predictors,
+};
 pub(crate) use ma_source::ac_stream_id;
 pub(crate) use palette::write_palette_transform;
 pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
+pub(crate) use predictor::{PredictorNeighbors, predictor_value};
 pub(crate) use rct::forward_ycocg;
 pub(crate) use squeeze::{GlobalPlaneTree, PlaneTreeBudget, StreamCrop, learn_global_plane_tree};
 
@@ -124,7 +127,7 @@ pub(crate) mod kit {
         MA_MIN_NODE_SAMPLES, MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS,
     };
     pub(crate) use super::predictor::{
-        PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_plane,
+        PREDICTOR_GRADIENT, SqueezePredictorCost, channel_to_context, choose_predictor_for_rows,
         fixed_predictor, selected_grad_pack_interior_fn, tokenize_plane_rows,
     };
     pub(crate) use super::rct::forward_ycocg;

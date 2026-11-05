@@ -142,6 +142,13 @@ pub enum Grain {
     /// fixed high-pass grain does not preserve the source's noise spectrum.
     /// Sources with no flat areas to measure on get none.
     Measured(f32),
+    /// `Measured(1.0)` on sources that carry sensor or film grain, nothing
+    /// on the rest: the grain level is measured as for `Measured`, and the
+    /// frame gets synthesized grain only when the flat areas it was measured
+    /// on cover enough of the image and the level is above what the
+    /// quantizer would keep for free. Clean renders, screenshots and
+    /// denoised photos are left untouched.
+    Auto,
     /// Explicit strength LUT, one value in `0..1` per intensity point
     /// `i / 6` (the last point covers intensities above 1).
     Lut([f32; NUM_POINTS]),
@@ -191,23 +198,63 @@ impl NoiseParams {
             Grain::PhotonIso(iso) if iso > 0.0 => photon_noise(opsin.xsize(), opsin.ysize(), iso),
             Grain::PhotonIso(_) => return None,
             Grain::Measured(mul) if mul > 0.0 => {
-                let measured = measured_grain_with_kernels(opsin, ctx.noise_kernels);
-                // From d=1.5 on the quantizer removes the grain itself;
-                // denoising there costs quality for almost no bytes.
-                let denoise_scale = ((3.0 - distance) / 1.5).clamp(0.0, 1.0);
-                if measured.has_any() && denoise_scale > 0.0 {
-                    denoise(ctx, scratch, opsin, &measured, denoise_scale);
-                }
-                let mut lut = measured.lut;
-                for v in &mut lut {
-                    *v = (*v * mul).clamp(0.0, LUT_MAX);
-                }
-                NoiseParams { lut }
+                let (measured, _) = measured_grain_with_kernels(opsin, ctx.noise_kernels);
+                Self::denoise_and_scale(ctx, scratch, distance, opsin, measured, mul, 1.0)
             }
             Grain::Measured(_) => return None,
+            // Decided by `encode_frame_core` from the probe reconstruction.
+            Grain::Auto => return None,
             Grain::Lut(lut) => NoiseParams { lut },
         };
         params.has_any().then_some(params)
+    }
+
+    fn denoise_and_scale(
+        ctx: &crate::encoding_context::EncodingContext,
+        scratch: &mut crate::coder_scratch::CoderScratch,
+        distance: f32,
+        opsin: &mut Image3F,
+        measured: NoiseParams,
+        mul: f32,
+        weight: f32,
+    ) -> Self {
+        // From d=1.5 on the quantizer removes the grain itself;
+        // denoising there costs quality for almost no bytes.
+        let denoise_scale = ((3.0 - distance) / 1.5).clamp(0.0, 1.0) * weight;
+        if measured.has_any() && denoise_scale > 0.0 {
+            denoise(ctx, scratch, opsin, &measured, denoise_scale);
+        }
+        let mut lut = measured.lut;
+        for v in &mut lut {
+            *v = (*v * mul).clamp(0.0, LUT_MAX);
+        }
+        NoiseParams { lut }
+    }
+
+    /// Mean strength over the image's own intensity distribution: what the
+    /// decoder would add on average, in LUT units.
+    fn effective_strength(&self, block_intensities: &[f32]) -> f32 {
+        if block_intensities.is_empty() {
+            return 0.0;
+        }
+        block_intensities
+            .iter()
+            .map(|&i| self.strength_at(i))
+            .sum::<f32>()
+            / block_intensities.len() as f32
+    }
+
+    /// Scale the LUT to the gap the coded image leaves: with `survival` of
+    /// the source grain level still in the reconstruction at each LUT
+    /// point, the decoder adds the quadrature remainder there so the total
+    /// comes out at the source level at every intensity.
+    pub(crate) fn fill_gap(&mut self, survival: &Survival, weight: f32) {
+        for (v, &s) in self.lut.iter_mut().zip(&survival.per_point) {
+            let k = (1.0 - s.clamp(0.0, 1.0).powi(2)).max(0.0).sqrt();
+            // On the ramp the look moves with the bytes: a partly denoised
+            // frame gets a partly restored grain level, not the full one.
+            *v = (*v * k * weight).clamp(0.0, LUT_MAX);
+        }
     }
 
     /// Strength at an intensity, as the decoder interpolates it.
@@ -373,16 +420,162 @@ const DECODER_NOISE_SCALE: f32 = 0.22 * std::f32::consts::SQRT_2 * 1.13;
 /// LUT is fit to those samples.
 #[cfg(test)]
 fn measured_grain(opsin: &Image3F) -> NoiseParams {
-    measured_grain_with_kernels(opsin, selected_noise_kernels())
+    measured_grain_with_kernels(opsin, selected_noise_kernels()).0
 }
 
-fn measured_grain_with_kernels(opsin: &Image3F, kernels: NoiseKernels) -> NoiseParams {
-    let samples = noise_samples(opsin, kernels);
+/// What the estimator saw, for the automatic gate and the survival measure.
+#[derive(Clone)]
+pub(crate) struct GrainStats {
+    /// Mean intensity of every 8x8 block, flat or not.
+    block_intensities: Vec<f32>,
+    /// Flat patches the LUT was fitted on, as a fraction of all blocks.
+    flat_fraction: f32,
+    /// The flat patches: origin, mean intensity and measured source level.
+    flat_blocks: Vec<(usize, usize, f32, f32)>,
+}
+
+/// How much of the measured grain a reconstruction still carries, overall
+/// and per decoder LUT point (1 = the source level, 0 = none).
+pub(crate) struct Survival {
+    pub(crate) overall: f32,
+    pub(crate) per_point: [f32; NUM_POINTS],
+}
+
+/// How `encode_frame_core` treats grain for one encode of a frame.
+pub(crate) enum GrainPass {
+    /// Follow `EncodingContext::grain`.
+    Inherit,
+    /// No grain, whatever the configuration (rate probes, reference frames).
+    Off,
+    /// The first pass of `Grain::Auto`: plain coding whose reconstruction
+    /// tells how much of the measured grain survives quantization.
+    Probe(GrainStats),
+    /// The second pass of `Grain::Auto`: denoise and set the flag, with the
+    /// LUT scaled down by whatever grain this pass's reconstruction still
+    /// carries so the decoded total matches the source.
+    Apply(NoiseParams, GrainStats, f32),
+}
+
+/// Weight of the grain pass from the plain coding's grain survival: 1 when
+/// the quantizer removes the grain, 0 when it keeps it (replacing coded
+/// grain by synthesized grain only trades real detail for a look-alike),
+/// and a ramp in between so neighbouring distances and similar images do
+/// not flip between two different encodes. The weight scales the denoiser;
+/// the LUT is then set from whatever the second pass still carries.
+pub(crate) fn grain_weight(survival: f32) -> f32 {
+    const HIGH: f32 = 0.75;
+    const LOW: f32 = 0.55;
+    ((HIGH - survival) / (HIGH - LOW)).clamp(0.0, 1.0)
+}
+
+/// `Grain::Auto` first stage, on the source: the measured LUT and the
+/// estimator's statistics when the source carries enough grain on enough
+/// flat area for the decoder's grain to be worth considering.
+pub(crate) fn auto_candidate(
+    opsin: &Image3F,
+    ctx: &crate::encoding_context::EncodingContext,
+) -> Option<(NoiseParams, GrainStats)> {
+    let (measured, stats) = measured_grain_with_kernels(opsin, ctx.noise_kernels);
+    stats.accept(&measured).then_some((measured, stats))
+}
+
+/// `Grain::Auto` second stage: remove the measured grain from the image to
+/// be coded and return the LUT the decoder re-synthesizes it with.
+pub(crate) fn apply_measured(
+    ctx: &crate::encoding_context::EncodingContext,
+    scratch: &mut crate::coder_scratch::CoderScratch,
+    distance: f32,
+    opsin: &mut Image3F,
+    measured: NoiseParams,
+    weight: f32,
+) -> Option<NoiseParams> {
+    let params =
+        NoiseParams::denoise_and_scale(ctx, scratch, distance, opsin, measured, 1.0, weight);
+    params.has_any().then_some(params)
+}
+
+impl GrainStats {
+    /// Smallest mean LUT strength worth synthesizing: 0.004 is about 0.12
+    /// 8-bit levels of Y standard deviation at mid-gray, below which the
+    /// grain is invisible and only the LUT's 80 bits and the SS2 loss remain.
+    const MIN_STRENGTH: f32 = 0.006;
+    /// The LUT must have been fitted on a real population of flat patches.
+    const MIN_FLAT_FRACTION: f32 = 0.15;
+
+    pub(crate) fn effective_strength(&self, params: &NoiseParams) -> f32 {
+        params.effective_strength(&self.block_intensities)
+    }
+
+    /// Flat patches the LUT fit and the survival measure need at least.
+    const MIN_FLAT_BLOCKS: usize = 64;
+
+    fn accept(&self, params: &NoiseParams) -> bool {
+        self.flat_blocks.len() >= Self::MIN_FLAT_BLOCKS
+            && self.flat_fraction >= Self::MIN_FLAT_FRACTION
+            && self.effective_strength(params) >= Self::MIN_STRENGTH
+    }
+
+    /// Fraction of the measured grain level a reconstruction keeps on the
+    /// flat patches the grain was measured on (1 = all of it), overall and
+    /// per LUT point with the fit's linear weights. A point no flat patch
+    /// reaches reports the overall value.
+    pub(crate) fn survival(&self, recon: &Image3F, kernels: NoiseKernels) -> Survival {
+        let scale = (NUM_POINTS - 2) as f32;
+        let mut src = [0.0f32; NUM_POINTS];
+        let mut dec = [0.0f32; NUM_POINTS];
+        for &(x0, y0, intensity, level) in &self.flat_blocks {
+            if x0 + BLOCK > recon.xsize() || y0 + BLOCK > recon.ysize() {
+                continue;
+            }
+            let patch = y_patch(recon, x0, y0);
+            let got = (kernels.laplacian_stats)(&patch)[1];
+            let pos = (intensity.max(0.0) * scale).min(scale + 1.0 - 1e-4);
+            let i = (pos.floor() as usize).min(NUM_POINTS - 2);
+            let f = pos - i as f32;
+            for (k, w) in [(i, 1.0 - f), (i + 1, f)] {
+                src[k] += w * level;
+                dec[k] += w * got;
+            }
+        }
+        let total_src: f32 = src.iter().sum();
+        let total_dec: f32 = dec.iter().sum();
+        let overall = if total_src <= 0.0 {
+            0.0
+        } else {
+            total_dec / total_src
+        };
+        // Require a few patches' worth of level before trusting a point.
+        let floor = 4.0 * 1e-3;
+        let per_point = std::array::from_fn(|k| {
+            if src[k] > floor {
+                dec[k] / src[k]
+            } else {
+                overall
+            }
+        });
+        Survival { overall, per_point }
+    }
+}
+
+fn measured_grain_with_kernels(
+    opsin: &Image3F,
+    kernels: NoiseKernels,
+) -> (NoiseParams, GrainStats) {
+    let (samples, block_intensities) = noise_samples(opsin, kernels);
+    let blocks = block_intensities.len().max(1) as f32;
+    let stats = GrainStats {
+        flat_fraction: samples.len() as f32 / blocks,
+        flat_blocks: samples
+            .iter()
+            .map(|s| (s.x0, s.y0, s.intensity, s.level))
+            .collect(),
+        block_intensities,
+    };
     let mut lut = fit_lut(&samples);
     for v in &mut lut {
         *v = v.clamp(0.0, LUT_MAX);
     }
-    NoiseParams { lut }
+    (NoiseParams { lut }, stats)
 }
 
 /// One flat patch: mean intensity `(X + Y) / 2` and the mean absolute
@@ -391,6 +584,8 @@ fn measured_grain_with_kernels(opsin: &Image3F, kernels: NoiseKernels) -> NoiseP
 struct NoiseSample {
     intensity: f32,
     level: f32,
+    x0: usize,
+    y0: usize,
 }
 
 const BLOCK: usize = 8;
@@ -409,15 +604,16 @@ fn intensity_bin(intensity: f32) -> usize {
 /// the histogram mode of the scores is taken as the flat-patch level within
 /// each intensity bin. A global cutoff would reject noisy shadows whenever
 /// quieter highlights dominate the image (or vice versa).
-fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
+fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> (Vec<NoiseSample>, Vec<f32>) {
     let xsize = opsin.xsize();
     let ysize = opsin.ysize();
     if xsize < BLOCK || ysize < BLOCK {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let bx = xsize / BLOCK;
     let by = ysize / BLOCK;
     let mut scores = Vec::with_capacity(bx * by);
+    let mut intensities = Vec::with_capacity(bx * by);
     let mut histograms = [[0u32; 256]; INTENSITY_BINS];
     for gy in 0..by {
         for gx in 0..bx {
@@ -426,6 +622,7 @@ fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
             let intensity = patch.iter().sum::<f32>() / (BLOCK * BLOCK) as f32;
             let bin = intensity_bin(intensity);
             scores.push((score, bin));
+            intensities.push(intensity);
             histograms[bin][((score * 256.0) as usize).min(255)] += 1;
         }
     }
@@ -454,7 +651,8 @@ fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
             let x0 = gx * BLOCK;
             let y0 = gy * BLOCK;
             let patch = intensity_patch(opsin, x0, y0);
-            let [intensity, level] = (kernels.laplacian_stats)(&patch);
+            let intensity = (kernels.laplacian_stats)(&patch)[0];
+            let level = (kernels.laplacian_stats)(&y_patch(opsin, x0, y0))[1];
             // Periodic texture can match the center sub-patch almost exactly
             // despite a large high-frequency response. White noise's mean
             // Laplacian is smaller than its 12-pixel SAD; leave ample margin
@@ -462,10 +660,15 @@ fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
             if level > 2.0 * score + 1e-6 {
                 continue;
             }
-            samples.push(NoiseSample { intensity, level });
+            samples.push(NoiseSample {
+                intensity,
+                level,
+                x0,
+                y0,
+            });
         }
     }
-    samples
+    (samples, intensities)
 }
 
 /// Mean intensity and mean absolute 3x3 Laplacian of an 8x8 patch.
@@ -576,11 +779,22 @@ pub(crate) fn texture_score_from_simd_sads(patch: &[f32; 64], mut sads: [f32; 20
     texture_score_from_sads(sads)
 }
 
-/// Mean |3x3 Laplacian| of the intensity `(X + Y) / 2` that one unit of LUT
-/// strength produces in the decoded image (measured on flat mid-gray through
-/// libjxl and jxl-oxide, which agree). Dividing a source patch's Laplacian
-/// level by it gives the strength that reproduces that level.
-const LAPLACIAN_LEVEL_PER_UNIT: f32 = 1.157;
+/// Mean |3x3 Laplacian| of the decoded Y plane that one unit of LUT strength
+/// produces, calibrated end to end on flat grays and colours with known noise
+/// (gain 0.98-1.07 at sigma 1.5-6, gray 16-240). Dividing a source patch's Y
+/// Laplacian level by it gives the strength that reproduces that level. The
+/// level is measured on Y alone: the decoder's grain is luma-dominant, while
+/// the intensity `(X + Y) / 2` also counts chroma noise it does not reproduce.
+const LAPLACIAN_LEVEL_PER_UNIT: f32 = 2.06;
+
+/// The 8x8 Y patch at `(x0, y0)`, where the grain level is measured.
+fn y_patch(opsin: &Image3F, x0: usize, y0: usize) -> [f32; 64] {
+    let mut patch = [0.0; 64];
+    for (y, row) in patch.as_chunks_mut::<BLOCK>().0.iter_mut().enumerate() {
+        row.copy_from_slice(&opsin.plane_row(1, y0 + y)[x0..x0 + BLOCK]);
+    }
+    patch
+}
 
 /// Least-squares fit of the 8-point LUT to the samples with a small
 /// smoothness prior, by Gauss-Seidel on the normal equations. The result
@@ -906,10 +1120,10 @@ mod tests {
                 laplacian_stats: noise_laplacian_stats_scalar,
                 ..kernels
             };
-            let expected = measured_grain_with_kernels(&image, scalar);
+            let expected = measured_grain_with_kernels(&image, scalar).0;
             assert!(expected.has_any());
             assert_eq!(
-                measured_grain_with_kernels(&image, kernels),
+                measured_grain_with_kernels(&image, kernels).0,
                 expected,
                 "{name}"
             );
@@ -1256,7 +1470,7 @@ mod tests {
                 let measured = measured_grain(&img);
                 for (mean, sigma) in means.into_iter().zip(sigmas) {
                     let level = (2.0 / std::f32::consts::PI).sqrt() * 29.25f32.sqrt() * sigma * 0.5;
-                    let want = level / LAPLACIAN_LEVEL_PER_UNIT;
+                    let want = level * 2.0 / LAPLACIAN_LEVEL_PER_UNIT;
                     let got = measured.strength_at(mean * 0.5);
                     assert!(
                         got > want * 0.6 && got < want * 1.3,
@@ -1300,7 +1514,7 @@ mod tests {
         // Mean |Laplacian| of white noise: sqrt(2/pi) * ||kernel|| * sigma/2.
         let level =
             (2.0 / std::f32::consts::PI).sqrt() * (25.0f32 + 4.0 + 0.25).sqrt() * sigma * 0.5;
-        let want = level / LAPLACIAN_LEVEL_PER_UNIT;
+        let want = level * 2.0 / LAPLACIAN_LEVEL_PER_UNIT;
         let got = lut[1] * 0.5 + lut[2] * 0.5;
         assert!(
             got > want * 0.6 && got < want * 1.2,

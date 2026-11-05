@@ -319,19 +319,20 @@ fn neighbor_lists(points: &[Pos]) -> (Vec<usize>, Vec<usize>) {
         .fold((i32::MAX, i32::MIN), |(a, b), p| (a.min(p.1), b.max(p.1)));
     let (w, h) = ((max_x - min_x + 1) as i64, (max_y - min_y + 1) as i64);
     let cell = (((w * h) as f64 / n as f64).sqrt().ceil() as i64).max(1);
+    let divider = crate::fast_divide::DividerI64::new(cell);
     let (gw, gh) = (
         ((w + cell - 1) / cell) as usize,
         ((h + cell - 1) / cell) as usize,
     );
     let cell_of = |p: Pos| {
         (
-            ((p.0 - min_x) as i64 / cell) as usize,
-            ((p.1 - min_y) as i64 / cell) as usize,
+            ((p.0 - min_x) as i64 / divider) as usize,
+            ((p.1 - min_y) as i64 / divider) as usize,
         )
     };
+    let cells: Vec<_> = points.iter().map(|&p| cell_of(p)).collect();
     let mut start = vec![0usize; gw * gh + 1];
-    for &p in points {
-        let (cx, cy) = cell_of(p);
+    for &(cx, cy) in &cells {
         start[cy * gw + cx + 1] += 1;
     }
     for k in 0..gw * gh {
@@ -339,8 +340,7 @@ fn neighbor_lists(points: &[Pos]) -> (Vec<usize>, Vec<usize>) {
     }
     let mut fill = start.clone();
     let mut members = vec![0usize; n];
-    for (i, &p) in points.iter().enumerate() {
-        let (cx, cy) = cell_of(p);
+    for (i, &(cx, cy)) in cells.iter().enumerate() {
         members[fill[cy * gw + cx]] = i;
         fill[cy * gw + cx] += 1;
     }
@@ -369,7 +369,7 @@ fn neighbor_lists(points: &[Pos]) -> (Vec<usize>, Vec<usize>) {
     let mut near: Vec<(i32, usize)> = Vec::with_capacity(NEIGHBORS + 1);
     for (i, &p) in points.iter().enumerate() {
         near.clear();
-        let (cx, cy) = cell_of(p);
+        let (cx, cy) = cells[i];
         for ring in 0..gw.max(gh) {
             // Points in ring r are at least (r - 1) * cell + 1 away.
             if near.len() == NEIGHBORS && (ring as i64 - 1) * cell >= near[NEIGHBORS - 1].0 as i64 {

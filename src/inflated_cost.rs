@@ -894,6 +894,7 @@ pub(crate) fn inverse_matrix(strategy: u8) -> &'static [f32] {
 pub(crate) type ReconQuantizeFn = unsafe fn(
     &[f32],
     &[f32],
+    &[f32],
     f32,
     crate::group::DequantBias,
     &[f32; 4],
@@ -918,6 +919,9 @@ pub(crate) struct ReconQuantization<'a> {
     pub(crate) rate_log2_lut: &'a RateLog2Lut,
     pub(crate) coeffs: [&'a [f32]; 3],
     pub(crate) inverse_matrices: [&'a [f32]; 3],
+    /// The forward (dequantization) matrices of `inverse_matrices`: the
+    /// kernels multiply by them instead of dividing by the inverse.
+    pub(crate) matrices: [&'a [f32]; 3],
     pub(crate) qac: f32,
     pub(crate) qm_mult_x: f32,
     pub(crate) qm_mult_b: f32,
@@ -1211,6 +1215,7 @@ pub(crate) fn recon_luma_phase_with_kernels(
     let rate_log2_lut = quantization.rate_log2_lut;
     let coeffs = quantization.coeffs;
     let inverse_matrices = &quantization.inverse_matrices;
+    let matrices = &quantization.matrices;
     let qac = quantization.qac;
     let qm_mult_x = quantization.qm_mult_x;
     let distance = quantization.distance;
@@ -1234,6 +1239,7 @@ pub(crate) fn recon_luma_phase_with_kernels(
         "strategy and coefficient dimensions disagree"
     );
     assert!(inverse_matrices.iter().all(|matrix| matrix.len() >= n));
+    assert!(matrices.iter().all(|matrix| matrix.len() >= n));
     assert!(qac.is_finite() && qac > 0.0);
     assert!(qm_mult_x.is_finite() && qm_mult_x > 0.0);
     assert!((0..3).all(|c| opsin.plane(c).xsize() != 0 && opsin.plane(c).ysize() != 0));
@@ -1296,6 +1302,7 @@ pub(crate) fn recon_luma_phase_with_kernels(
         quantize(
             &coeffs[1][..n],
             &inverse_matrices[1][..n],
+            &matrices[1][..n],
             quant_scales[1],
             quantization.dequant_bias[1],
             &thresholds[1],
@@ -1349,6 +1356,7 @@ pub(crate) fn recon_chroma_phase_with_kernels(
     let rate_log2_lut = quantization.rate_log2_lut;
     let coeffs = quantization.coeffs;
     let inverse_matrices = &quantization.inverse_matrices;
+    let matrices = &quantization.matrices;
     let qac = quantization.qac;
     let qm_mult_x = quantization.qm_mult_x;
     let distance = quantization.distance;
@@ -1377,6 +1385,7 @@ pub(crate) fn recon_chroma_phase_with_kernels(
         "strategy and coefficient dimensions disagree"
     );
     assert!(inverse_matrices.iter().all(|matrix| matrix.len() >= n));
+    assert!(matrices.iter().all(|matrix| matrix.len() >= n));
     assert!(qac.is_finite() && qac > 0.0);
     assert!(qm_mult_x.is_finite() && qm_mult_x > 0.0);
     assert!((0..3).all(|c| opsin.plane(c).xsize() != 0 && opsin.plane(c).ysize() != 0));
@@ -1454,6 +1463,7 @@ pub(crate) fn recon_chroma_phase_with_kernels(
             quantize(
                 &combined_error[..n],
                 &inverse_matrices[c][..n],
+                &matrices[c][..n],
                 quant_scales[c],
                 quantization.dequant_bias[c],
                 &thresholds[c],
@@ -1775,6 +1785,7 @@ fn prepare_reconstruction_scalar(
 pub(crate) fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
+    matrix: &[f32],
     quant_scale: f32,
     bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
@@ -1790,20 +1801,25 @@ pub(crate) fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool
     let n = width
         .checked_mul(height)
         .expect("coefficient size overflow");
-    assert!(coeff.len() >= n && inv.len() >= n && coeff_error.len() >= n);
+    assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
+    // Errors return to the coefficient domain through the forward matrix:
+    // `(scaled - level) * matrix / quant_scale`, no per-coefficient division.
+    let inv_scale = 1.0 / quant_scale;
     let (mut nonzero, mut magnitude_bits) = (0usize, 0.0f32);
     let mut max_scan = 0u32;
-    for (y, ((coeff_row, inv_row), error_row)) in coeff
+    for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
+        .zip(matrix.chunks_exact(width))
         .zip(coeff_error.chunks_exact_mut(width))
         .take(height)
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (x, ((&coefficient, &inverse), error)) in coeff_row
+        for (x, (((&coefficient, &inverse), &forward), error)) in coeff_row
             .iter()
             .zip(inv_row.iter())
+            .zip(matrix_row.iter())
             .zip(error_row.iter_mut())
             .enumerate()
         {
@@ -1823,10 +1839,11 @@ pub(crate) fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool
             } else {
                 0.0
             };
+            let to_coefficient = forward * inv_scale;
             *error = if BIASED {
-                (scaled - bias.level_f32(quantized)) / denominator
+                (scaled - bias.level_f32(quantized)) * to_coefficient
             } else {
-                (scaled - quantized) / denominator
+                (scaled - quantized) * to_coefficient
             };
             if COMPUTE_RATE && quantized != 0.0 {
                 nonzero += 1;
@@ -2146,6 +2163,7 @@ mod tests {
             std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.13 - 1.8)
         });
         let inverse: [f32; 1024] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
+        let forward = inverse.map(|v| 1.0 / v);
         let error = ReconErrorKernels {
             combine: select_combine_error_fn(),
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
@@ -2161,6 +2179,7 @@ mod tests {
                         rate_log2_lut: rate_log2_lut(),
                         coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                         inverse_matrices: [&inverse; 3],
+                        matrices: [&forward; 3],
                         qac: 7.0,
                         qm_mult_x: 1.2,
                         qm_mult_b: 1.6,
@@ -2213,6 +2232,7 @@ mod tests {
             std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.13 - 1.8)
         });
         let inverse: [f32; 4096] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
+        let forward = inverse.map(|v| 1.0 / v);
         let error = ReconErrorKernels {
             combine: select_combine_error_fn(),
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
@@ -2236,6 +2256,7 @@ mod tests {
                             rate_log2_lut: rate_log2_lut(),
                             coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                             inverse_matrices: [&inverse; 3],
+                            matrices: [&forward; 3],
                             qac,
                             qm_mult_x: 1.2,
                             qm_mult_b: 1.6,
@@ -2311,6 +2332,7 @@ mod tests {
             std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.013 - 0.18)
         });
         let inverse = [1.0; 64];
+        let forward = inverse.map(|v| 1.0 / v);
         let idct = IdctMethods::scalar();
         let mut input = ReconDistInput {
             idct: &idct,
@@ -2319,6 +2341,7 @@ mod tests {
                 rate_log2_lut: rate_log2_lut(),
                 coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
                 inverse_matrices: [&inverse; 3],
+                matrices: [&forward; 3],
                 qac: 7.0,
                 qm_mult_x: 1.2,
                 qm_mult_b: 1.6,

@@ -93,6 +93,13 @@ impl DividerI32 {
     }
 }
 
+// Accessors for the SIMD dividers that rebuild the scalar algorithm.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "avx"),
+    all(target_arch = "aarch64", feature = "neon"),
+    all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"),
+    all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+))]
 impl DividerI32 {
     /// The multiplier; 0 for a power of two, which is a plain shift.
     #[inline(always)]
@@ -144,6 +151,119 @@ impl Div<DividerI32> for i32 {
     }
 }
 
+/// An exact unsigned 64-bit reciprocal divider. Like zaft's divider, this
+/// uses the high half of a 128-bit product, but one native division sets up
+/// the reciprocal instead of a 128-bit division.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DividerU64 {
+    magic: u64,
+    divisor: u64,
+}
+
+impl DividerU64 {
+    pub(crate) const fn new(divisor: u64) -> Self {
+        assert!(divisor != 0, "division by zero");
+        Self {
+            magic: u64::MAX / divisor,
+            divisor,
+        }
+    }
+
+    // floor((2^64 - 1) / d) differs from 2^64/d by at most one.
+    // Its multiply-high quotient is therefore exact or one too small,
+    // including d = 1. The product q*d cannot exceed the numerator.
+    #[inline(always)]
+    fn quotient_remainder(self, numerator: u64) -> (u64, u64) {
+        let q = ((numerator as u128 * self.magic as u128) >> 64) as u64;
+        (q, numerator - q * self.divisor)
+    }
+
+    #[inline(always)]
+    pub(crate) fn div_rem(self, numerator: u64) -> (u64, u64) {
+        let (q, r) = self.quotient_remainder(numerator);
+        if r >= self.divisor {
+            (q + 1, r - self.divisor)
+        } else {
+            (q, r)
+        }
+    }
+}
+
+impl Div<DividerU64> for u64 {
+    type Output = u64;
+
+    #[inline(always)]
+    fn div(self, denom: DividerU64) -> Self::Output {
+        let (q, r) = denom.quotient_remainder(self);
+        q + u64::from(r >= denom.divisor)
+    }
+}
+
+/// A precomputed signed 64-bit divisor, adapted from osclet with the signed
+/// power-of-two and wrapping arithmetic fixes used by [`DividerI32`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DividerI64 {
+    magic: i64,
+    more: u8,
+}
+
+impl DividerI64 {
+    pub(crate) fn new(divisor: i64) -> Self {
+        assert!(divisor != 0, "division by zero");
+        let ud = divisor.unsigned_abs();
+        let floor_log = 63 - ud.leading_zeros();
+        let sign = if divisor < 0 { 0x80 } else { 0 };
+        if ud.is_power_of_two() {
+            return Self {
+                magic: 0,
+                more: floor_log as u8 | sign,
+            };
+        }
+        let numerator = 1u128 << (floor_log + 63);
+        let mut proposed = (numerator / ud as u128) as u64;
+        let remainder = (numerator % ud as u128) as u64;
+        let mut more = if ud - remainder < 1u64 << floor_log {
+            (floor_log - 1) as u8
+        } else {
+            proposed = proposed.wrapping_add(proposed);
+            let twice_remainder = remainder.wrapping_add(remainder);
+            if twice_remainder >= ud || twice_remainder < remainder {
+                proposed = proposed.wrapping_add(1);
+            }
+            floor_log as u8 | 0x40
+        };
+        let mut magic = proposed.wrapping_add(1) as i64;
+        if divisor < 0 {
+            more |= sign;
+            magic = magic.wrapping_neg();
+        }
+        Self { magic, more }
+    }
+}
+
+impl Div<DividerI64> for i64 {
+    type Output = i64;
+
+    #[inline(always)]
+    fn div(self, denom: DividerI64) -> Self::Output {
+        let shift = denom.more & 0x3f;
+        let sign = ((denom.more as i8) >> 7) as i64;
+        if denom.magic == 0 {
+            assert!(self != i64::MIN || denom.more != 0x80, "division overflow");
+            let mask = (1u64 << shift) - 1;
+            let q = (self as u64).wrapping_add((self >> 63) as u64 & mask) as i64;
+            ((q >> shift) ^ sign).wrapping_sub(sign)
+        } else {
+            let mut q = ((self as i128 * denom.magic as i128) >> 64) as i64;
+            if denom.more & 0x40 != 0 {
+                q = q.wrapping_add((self ^ sign).wrapping_sub(sign));
+            }
+            q >>= shift;
+            q + i64::from(q < 0)
+        }
+    }
+}
+
 /// A plane kernel: rounds every sample to its nearest multiple of `q > 1`
 /// (ties away from zero) and stores the quotient. `|sample| + q / 2` must
 /// fit in an `i32`.
@@ -191,6 +311,87 @@ pub(crate) fn selected_rounded_quotients_fn() -> RoundedQuotientsFn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
+    #[test]
+    fn unsigned_64_matches_full_width_division() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut divisors: Vec<u64> = (1..=1024).collect();
+        for shift in 1..64 {
+            let power = 1u64 << shift;
+            divisors.extend([power - 1, power, power + 1]);
+        }
+        divisors.extend([u64::MAX, u64::MAX - 1]);
+        divisors.extend((0..4096).map(|_| next_u64(&mut state).max(1)));
+        for d in divisors {
+            let divider = DividerU64::new(d);
+            for x in [0, 1, d - 1, d, d.saturating_add(1), u64::MAX] {
+                assert_eq!(x / divider, x / d, "x={x}, divisor={d}");
+                assert_eq!(divider.div_rem(x), (x / d, x % d));
+            }
+            for _ in 0..128 {
+                let x = next_u64(&mut state);
+                assert_eq!(x / divider, x / d, "x={x}, divisor={d}");
+                assert_eq!(divider.div_rem(x), (x / d, x % d));
+            }
+        }
+    }
+
+    #[test]
+    fn signed_64_matches_full_width_division() {
+        let mut state = 0x6a09_e667_f3bc_c909;
+        let mut divisors = vec![i64::MIN, i64::MIN + 1, i64::MAX];
+        for shift in 0..63 {
+            let power = 1i64 << shift;
+            for d in [power - 1, power, power + 1] {
+                if d != 0 {
+                    divisors.extend([d, -d]);
+                }
+            }
+        }
+        divisors.extend((0..4096).map(|_| {
+            let d = next_u64(&mut state) as i64;
+            if d == 0 { 1 } else { d }
+        }));
+        for d in divisors {
+            let divider = DividerI64::new(d);
+            for x in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX, d] {
+                if let Some(want) = x.checked_div(d) {
+                    assert_eq!(x / divider, want, "x={x}, divisor={d}");
+                }
+            }
+            for _ in 0..128 {
+                let x = next_u64(&mut state) as i64;
+                if let Some(want) = x.checked_div(d) {
+                    assert_eq!(x / divider, want, "x={x}, divisor={d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn unsigned_64_rejects_zero() {
+        DividerU64::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn signed_64_rejects_zero() {
+        DividerI64::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "division overflow")]
+    fn signed_64_rejects_overflow() {
+        let _ = i64::MIN / DividerI64::new(-1);
+    }
 
     #[test]
     fn matches_truncating_division() {

@@ -638,7 +638,10 @@ impl CoefPolisher {
         } else {
             EXTRA_TRIES
         };
+        // Transforms span a power-of-two number of blocks: shift and mask.
         let row_stride = b.cx * 8;
+        debug_assert!(row_stride.is_power_of_two());
+        let (row_shift, column_mask) = (row_stride.trailing_zeros(), row_stride - 1);
         let mut nzeros: [usize; 3] = std::array::from_fn(|c| {
             count_nonzero_except_llf(quantized[c], b.cx, b.cy, self.count_nonzero)
         });
@@ -658,7 +661,7 @@ impl CoefPolisher {
                 let end = b.size.min(covered + positions);
                 for k in covered..end {
                     let idx = ch.scan[k] as usize;
-                    let (v, u) = (idx / row_stride, idx % row_stride);
+                    let (v, u) = (idx >> row_shift, idx & column_mask);
                     if v < b.cy && u < b.cx {
                         continue;
                     }

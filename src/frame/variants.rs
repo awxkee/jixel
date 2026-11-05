@@ -110,6 +110,7 @@ pub(super) fn lattice_variants(
         None,
         #[cfg(feature = "splines")]
         false,
+        crate::noise::GrainPass::Inherit,
         &mut mul_prefix,
     )?;
     let mul = prepared(mul_prefix, plan.gain, mul_references);
@@ -336,6 +337,7 @@ pub(super) fn prepare_vardct_variant(
                     None,
                     #[cfg(feature = "splines")]
                     false,
+                    crate::noise::GrainPass::Inherit,
                     &mut patched_writer,
                 )?;
                 references.extend(tile_refs);
@@ -513,6 +515,7 @@ pub(super) fn prepare_vardct_variant(
                     None,
                     #[cfg(feature = "splines")]
                     false,
+                    crate::noise::GrainPass::Inherit,
                     out,
                 )
             };
@@ -728,6 +731,7 @@ impl PreparedVarDct {
             self.splines.as_ref(),
             #[cfg(feature = "splines")]
             true,
+            crate::noise::GrainPass::Inherit,
             writer,
         )?;
         Ok(())
@@ -802,6 +806,7 @@ fn estimate_residual_bits(
         None,
         #[cfg(feature = "splines")]
         false,
+        crate::noise::GrainPass::Off,
         &mut writer,
     )?;
     Ok((writer.bits_written() - payload) as f64

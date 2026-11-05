@@ -138,64 +138,29 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
-
-        for (x0, (coeff4, inv4)) in coeffs
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(inv_matrix.as_chunks::<4>().0.iter())
-            .enumerate()
-        {
-            let x = x0 * 4;
-
+        let mut prepare = |x: usize| {
             let threshold = if x >= half { thr_hi } else { thr_lo };
-            let thrv = f32x4_splat(threshold);
-
-            let cv = unsafe { v128_load(coeff4.as_ptr() as *const v128) };
-            let mv = unsafe { v128_load(inv4.as_ptr() as *const v128) };
-
-            // a = inv_matrix * q_scaled * coeff
+            let cv = unsafe { v128_load(coeffs.as_ptr().add(x).cast()) };
+            let mv = unsafe { v128_load(inv_matrix.as_ptr().add(x).cast()) };
             let a = f32x4_mul(f32x4_mul(mv, qs), cv);
-            let absa = f32x4_abs(a);
-
-            // keep = |a| >= threshold
-            let keep = f32x4_ge(absa, thrv);
-
-            // round-to-nearest, ties-to-even
-            let rounded = f32x4_nearest(a);
-
-            // zero rounded where not kept
-            let q = v128_and(rounded, keep);
-
+            let keep = f32x4_ge(f32x4_abs(a), f32x4_splat(threshold));
+            let q = v128_and(f32x4_nearest(a), keep);
             let d = if BIASED {
                 f32x4_sub(a, wasm_dequantized_level_f32(q, bias))
             } else {
                 f32x4_sub(a, q)
             };
-            let d2 = f32x4_mul(d, d);
-
-            // Active mask: keep lanes where !(y < cy && x + lane < cx).
             let active = if y < cy && x < cx {
-                let lane_x = i32x4_add(i32x4_splat(x as i32), lane_ids);
-
-                // active = x + lane >= cx
-                i32x4_ge(lane_x, i32x4_splat(cx as i32))
+                i32x4_ge(
+                    i32x4_add(i32x4_splat(x as i32), lane_ids),
+                    i32x4_splat(cx as i32),
+                )
             } else {
                 i32x4_splat(-1)
             };
-
-            // SSE: zero LLF lanes.
-            let d2 = v128_bitselect(d2, zero, active);
-            sse_acc = f32x4_add(sse_acc, d2);
-
-            // Rate: active && abs(q) > 0.
+            let d2 = v128_bitselect(f32x4_mul(d, d), zero, active);
             let absq = f32x4_abs(q);
-            let nz = f32x4_gt(absq, zero);
-            let rate_mask = v128_and(nz, active);
-
-            // Comparison masks contain -1 for each nonzero lane.
-            nonzero_acc = i32x4_sub(nonzero_acc, rate_mask);
-
+            let rate_mask = v128_and(f32x4_gt(absq, zero), active);
             if SAVE_LEVELS {
                 let truncated = f32x4_trunc(a);
                 let frac = f32x4_sub(a, truncated);
@@ -206,14 +171,51 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
                 let quantized = v128_and(quantized, v128_and(keep, active));
                 unsafe { v128_store(levels.as_mut_ptr().add(y * width + x).cast(), quantized) };
             }
-
-            if !SAVE_LEVELS && i32x4_bitmask(rate_mask) != 0 {
-                let ratev = wasm_log2p1_f32(absq);
-                mag_acc = f32x4_add(mag_acc, v128_bitselect(ratev, zero, rate_mask));
-                // Scan position of the nonzeros (masked lanes drop to zero,
-                // which is neutral: LLF slots are never nonzero here).
-                let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x) as *const v128) };
-                scan_acc = u32x4_max(scan_acc, v128_and(sv, rate_mask));
+            (d2, absq, rate_mask)
+        };
+        // Prepare two vectors before either accumulation, exposing independent
+        // arithmetic while preserving the original order of floating additions.
+        let paired = width / 8 * 8;
+        for x in (0..paired).step_by(8) {
+            let (d0, q0, mask0) = prepare(x);
+            let (d1, q1, mask1) = prepare(x + 4);
+            sse_acc = f32x4_add(sse_acc, d0);
+            sse_acc = f32x4_add(sse_acc, d1);
+            nonzero_acc = i32x4_sub(nonzero_acc, mask0);
+            nonzero_acc = i32x4_sub(nonzero_acc, mask1);
+            if !SAVE_LEVELS {
+                let bits0 = i32x4_bitmask(mask0);
+                let bits1 = i32x4_bitmask(mask1);
+                if bits0 != 0 && bits1 != 0 {
+                    // Both logarithms can execute independently. Sparse pairs
+                    // still skip the polynomial for each all-zero vector.
+                    let (r0, r1) = (wasm_log2p1_f32(q0), wasm_log2p1_f32(q1));
+                    mag_acc = f32x4_add(mag_acc, v128_bitselect(r0, zero, mask0));
+                    mag_acc = f32x4_add(mag_acc, v128_bitselect(r1, zero, mask1));
+                } else if bits0 != 0 {
+                    mag_acc = f32x4_add(mag_acc, v128_bitselect(wasm_log2p1_f32(q0), zero, mask0));
+                } else if bits1 != 0 {
+                    mag_acc = f32x4_add(mag_acc, v128_bitselect(wasm_log2p1_f32(q1), zero, mask1));
+                }
+                if bits0 != 0 {
+                    let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x).cast()) };
+                    scan_acc = u32x4_max(scan_acc, v128_and(sv, mask0));
+                }
+                if bits1 != 0 {
+                    let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x + 4).cast()) };
+                    scan_acc = u32x4_max(scan_acc, v128_and(sv, mask1));
+                }
+            }
+        }
+        if paired + 4 <= width {
+            let x = paired;
+            let (d, q, mask) = prepare(x);
+            sse_acc = f32x4_add(sse_acc, d);
+            nonzero_acc = i32x4_sub(nonzero_acc, mask);
+            if !SAVE_LEVELS && i32x4_bitmask(mask) != 0 {
+                mag_acc = f32x4_add(mag_acc, v128_bitselect(wasm_log2p1_f32(q), zero, mask));
+                let sv = unsafe { v128_load(scan_pos.as_ptr().add(y * width + x).cast()) };
+                scan_acc = u32x4_max(scan_acc, v128_and(sv, mask));
             }
         }
     }
@@ -435,7 +437,7 @@ mod lane_count_tests {
     use super::*;
 
     #[test]
-    fn lane_counts_preserve_original_rate_distortion_and_coding_levels() {
+    fn interleaved_vectors_preserve_original_rate_distortion_and_coding_levels() {
         for (original, optimized) in [
             (
                 sse_and_rate_wasm_impl_reference::<false, false>
@@ -459,6 +461,40 @@ mod lane_count_tests {
             ),
         ] {
             crate::inflated_cost::assert_coefficient_kernel_preserves_original(original, optimized);
+            // Exercise the single-vector tail as well as a complete pair.
+            for width in [4, 12, 20] {
+                let n = width * 8;
+                let values = [0.0, 0.5, -0.5, 1.5, -1.5, 0.125];
+                let coeff: Vec<_> = (0..n).map(|i| values[i % values.len()]).collect();
+                let inverse = vec![1.0; n];
+                let scan: Vec<_> = (0..n as u32).collect();
+                let mut expected_levels = vec![-123; n + 5];
+                let mut actual_levels = expected_levels.clone();
+                let run = |kernel: crate::inflated_cost::SseAndQuantizeFn, levels: &mut [i32]| unsafe {
+                    kernel(
+                        &coeff,
+                        &inverse,
+                        1.0,
+                        crate::group::DequantBias::DEFAULT[0],
+                        width,
+                        8,
+                        width / 8 * 4,
+                        1,
+                        1,
+                        crate::inflated_cost::rate_log2_lut(),
+                        &[0.0, 0.42, 0.57, 0.91],
+                        &scan,
+                        levels,
+                    )
+                };
+                let expected = run(original, &mut expected_levels);
+                let actual = run(optimized, &mut actual_levels);
+                assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+                assert_eq!(actual.1, expected.1);
+                assert_eq!(actual.2.to_bits(), expected.2.to_bits());
+                assert_eq!(actual.3, expected.3);
+                assert_eq!(actual_levels, expected_levels);
+            }
         }
     }
 }

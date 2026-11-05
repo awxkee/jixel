@@ -100,6 +100,13 @@ fn store_i16x4(output: &mut [i16; 4], value: int32x4_t) {
     unsafe { vst1_s16(output.as_mut_ptr(), vqmovn_s32(value)) };
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn store_i16x8(output: &mut [[i16; 4]; 2], value0: int32x4_t, value1: int32x4_t) {
+    let packed = vcombine_s16(vqmovn_s32(value0), vqmovn_s32(value1));
+    unsafe { vst1q_s16(output.as_mut_ptr().cast(), packed) };
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn quantize_dc_neon(input: &[f32], scale: f32, output: &mut [i16]) {
     debug_assert_eq!(input.len(), output.len());
@@ -107,7 +114,16 @@ pub(crate) fn quantize_dc_neon(input: &[f32], scale: f32, output: &mut [i16]) {
     let (output4, output_tail) = output.as_chunks_mut::<4>();
     let scale = vdupq_n_f32(scale);
 
-    for (source, target) in input4.iter().zip(output4) {
+    let (input_pairs, input_single) = input4.as_chunks::<2>();
+    let (output_pairs, output_single) = output4.as_chunks_mut::<2>();
+    for ([source0, source1], target) in input_pairs.iter().zip(output_pairs) {
+        let value0 = unsafe { vld1q_f32(source0.as_ptr()) };
+        let value1 = unsafe { vld1q_f32(source1.as_ptr()) };
+        let value0 = vcvtaq_s32_f32(vmulq_f32(value0, scale));
+        let value1 = vcvtaq_s32_f32(vmulq_f32(value1, scale));
+        store_i16x8(target, value0, value1);
+    }
+    for (source, target) in input_single.iter().zip(output_single) {
         let value = unsafe { vld1q_f32(source.as_ptr()) };
         store_i16x4(target, vcvtaq_s32_f32(vmulq_f32(value, scale)));
     }
@@ -137,7 +153,23 @@ pub(crate) fn quantize_dc_cfl_neon(
     let (output4, output_tail) = output.as_chunks_mut::<4>();
     let negative_cfl = vdupq_n_f32(-cfl);
 
-    for ((source, y), target) in input4.iter().zip(y4).zip(output4) {
+    let (input_pairs, input_single) = input4.as_chunks::<2>();
+    let (y_pairs, y_single) = y4.as_chunks::<2>();
+    let (output_pairs, output_single) = output4.as_chunks_mut::<2>();
+    for (([source0, source1], [y0, y1]), target) in
+        input_pairs.iter().zip(y_pairs).zip(output_pairs)
+    {
+        let value0 = unsafe { vld1q_f32(source0.as_ptr()) };
+        let value1 = unsafe { vld1q_f32(source1.as_ptr()) };
+        let y0 = unsafe { vld1_s16(y0.as_ptr()) };
+        let y1 = unsafe { vld1_s16(y1.as_ptr()) };
+        let correction0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(y0)), negative_cfl);
+        let value0 = vcvtaq_s32_f32(vfmaq_n_f32(correction0, value0, scale));
+        let correction1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(y1)), negative_cfl);
+        let value1 = vcvtaq_s32_f32(vfmaq_n_f32(correction1, value1, scale));
+        store_i16x8(target, value0, value1);
+    }
+    for ((source, y), target) in input_single.iter().zip(y_single).zip(output_single) {
         let value = unsafe { vld1q_f32(source.as_ptr()) };
         let y = unsafe { vld1_s16(y.as_ptr()) };
         let correction = vmulq_f32(vcvtq_f32_s32(vmovl_s16(y)), negative_cfl);
@@ -166,7 +198,17 @@ pub(crate) fn quantize_dc_i32_neon(input: &[f32], scale: f32, output: &mut [i32]
     let (input_chunks, input_tail) = input.as_chunks::<4>();
     let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
     let scale = vdupq_n_f32(scale);
-    for (source, target) in input_chunks.iter().zip(output_chunks) {
+    let (input_pairs, input_single) = input_chunks.as_chunks::<2>();
+    let (output_pairs, output_single) = output_chunks.as_chunks_mut::<2>();
+    for ([source0, source1], [target0, target1]) in input_pairs.iter().zip(output_pairs) {
+        let value0 = unsafe { vld1q_f32(source0.as_ptr()) };
+        let value1 = unsafe { vld1q_f32(source1.as_ptr()) };
+        let value0 = vcvtaq_s32_f32(vmulq_f32(value0, scale));
+        let value1 = vcvtaq_s32_f32(vmulq_f32(value1, scale));
+        unsafe { vst1q_s32(target0.as_mut_ptr(), value0) };
+        unsafe { vst1q_s32(target1.as_mut_ptr(), value1) };
+    }
+    for (source, target) in input_single.iter().zip(output_single) {
         let value = unsafe { vld1q_f32(source.as_ptr()) };
         let value = vcvtaq_s32_f32(vmulq_f32(value, scale));
         unsafe { vst1q_s32(target.as_mut_ptr(), value) };
@@ -210,7 +252,22 @@ pub(crate) fn quantize_dc_cfl_i32_neon(
     let (output_chunks, output_tail) = output.as_chunks_mut::<4>();
     let scale = vdupq_n_f32(scale);
     let negative_cfl = vdupq_n_f32(-cfl);
-    for ((source, y), target) in input_chunks.iter().zip(y_chunks).zip(output_chunks) {
+    let (input_pairs, input_single) = input_chunks.as_chunks::<2>();
+    let (y_pairs, y_single) = y_chunks.as_chunks::<2>();
+    let (output_pairs, output_single) = output_chunks.as_chunks_mut::<2>();
+    for (([source0, source1], [y0, y1]), [target0, target1]) in
+        input_pairs.iter().zip(y_pairs).zip(output_pairs)
+    {
+        let value0 = unsafe { vld1q_f32(source0.as_ptr()) };
+        let value1 = unsafe { vld1q_f32(source1.as_ptr()) };
+        let y0 = unsafe { vld1q_s32(y0.as_ptr()) };
+        let y1 = unsafe { vld1q_s32(y1.as_ptr()) };
+        let value0 = quantize_dc_cfl_i32_value_x4(value0, y0, scale, negative_cfl);
+        let value1 = quantize_dc_cfl_i32_value_x4(value1, y1, scale, negative_cfl);
+        unsafe { vst1q_s32(target0.as_mut_ptr(), value0) };
+        unsafe { vst1q_s32(target1.as_mut_ptr(), value1) };
+    }
+    for ((source, y), target) in input_single.iter().zip(y_single).zip(output_single) {
         let value = unsafe { vld1q_f32(source.as_ptr()) };
         let y = unsafe { vld1q_s32(y.as_ptr()) };
         let value = quantize_dc_cfl_i32_value_x4(value, y, scale, negative_cfl);
