@@ -171,7 +171,7 @@ impl<'a> InkCandidates<'a> {
         })
     }
 
-    pub(crate) fn select(mut self, distance: f32) -> Option<InkLayers> {
+    pub(crate) fn select(mut self, distance: f32, pool: &ThreadPool) -> Option<InkLayers> {
         let mut ranked: Vec<_> = self.plans.by_ref().collect();
         // Background colors are common throughout the image, whereas useful
         // inks concentrate on ridges. Rank their excess ridge support.
@@ -230,13 +230,73 @@ impl<'a> InkCandidates<'a> {
             &mut self.queue,
             &plans,
             distance,
+            pool,
         )
     }
+}
+
+/// Rows per band when a pass splits the image into row bands on the pool:
+/// a few per thread, since strokes cluster.
+fn band_rows(pool: &ThreadPool, height: usize) -> usize {
+    height.div_ceil(4 * pool.num_threads()).max(1)
 }
 
 /// Classify all selected inks together, then inpaint their union once. The
 /// state holds the pixel's ink (1-based) above three growth flags, then the
 /// ink alone with the top bit marking the component scan.
+/// Classify pixel `i` against the inks whose color cell it falls in: the
+/// nearest within tolerance, as a seed when it lies on a ridge it may grow
+/// from, else ungrown.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn classify_pixel(
+    rgb: &[[u8; 3]],
+    alpha: Option<&[u8]>,
+    thin: &[u8],
+    plans: &[InkPlan],
+    buckets: &[u32],
+    i: usize,
+    s: &mut u8,
+    seeds: &mut Vec<usize>,
+) {
+    *s = u8::MAX;
+    if alpha.is_some_and(|a| a[i] != 255) {
+        return;
+    }
+    let p = &rgb[i];
+    let mut best = (u8::MAX, 0usize);
+    let mut choices =
+        buckets[((p[0] as usize >> 3) << 10) | ((p[1] as usize >> 3) << 5) | (p[2] as usize >> 3)];
+    while choices != 0 {
+        let k = choices.trailing_zeros() as usize;
+        choices &= choices - 1;
+        let plan = &plans[k];
+        let d = p
+            .iter()
+            .zip(plan.color)
+            .map(|(&a, b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        if d < if plan.local {
+            LOCAL_TOL
+        } else {
+            COLOR_TOL as u8
+        } && d < best.0
+        {
+            best = (d, k);
+        }
+    }
+    if best.0 == u8::MAX {
+        return;
+    }
+    let seed = thin[i] & if plans[best.1].local { 3 } else { 1 } != 0;
+    *s = ((best.1 as u8 + 1) << 3) | if seed { 0 } else { UNGROWN };
+    if seed {
+        seeds.push(i);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn joint_split(
     rgb: &[[u8; 3]],
     alpha: Option<&[u8]>,
@@ -247,8 +307,11 @@ fn joint_split(
     queue: &mut Vec<usize>,
     plans: &[InkPlan],
     distance: f32,
+    pool: &ThreadPool,
 ) -> Option<InkLayers> {
     let n = rgb.len();
+    let rows = band_rows(pool, height);
+    let num_bands = height.div_ceil(rows);
     let precision = (distance / INK_PRECISION_DISTANCE).min(1.0).powi(2);
     queue.clear();
     let mut buckets = vec![0u32; 32 * 32 * 32];
@@ -268,41 +331,20 @@ fn joint_split(
             }
         }
     }
-    for (i, (p, s)) in rgb.iter().zip(state.iter_mut()).enumerate() {
-        *s = u8::MAX;
-        if alpha.is_some_and(|a| a[i] != 255) {
-            continue;
+    // Pixels classify independently; seeds join in raster order.
+    let mut bands: Vec<_> = state
+        .chunks_mut(rows * width)
+        .map(|states| (states, Vec::new()))
+        .collect();
+    pool.for_each_mut(&mut bands, |b, (states, seeds)| {
+        let start = b * rows * width;
+        for (o, s) in states.iter_mut().enumerate() {
+            let i = start + o;
+            classify_pixel(rgb, alpha, &*thin, plans, &buckets, i, s, seeds);
         }
-        let mut best = (u8::MAX, 0usize);
-        let mut choices = buckets
-            [((p[0] as usize >> 3) << 10) | ((p[1] as usize >> 3) << 5) | (p[2] as usize >> 3)];
-        while choices != 0 {
-            let k = choices.trailing_zeros() as usize;
-            choices &= choices - 1;
-            let plan = &plans[k];
-            let d = p
-                .iter()
-                .zip(plan.color)
-                .map(|(&a, b)| a.abs_diff(b))
-                .max()
-                .unwrap();
-            if d < if plan.local {
-                LOCAL_TOL
-            } else {
-                COLOR_TOL as u8
-            } && d < best.0
-            {
-                best = (d, k);
-            }
-        }
-        if best.0 == u8::MAX {
-            continue;
-        }
-        let seed = thin[i] & if plans[best.1].local { 3 } else { 1 } != 0;
-        *s = ((best.1 as u8 + 1) << 3) | if seed { 0 } else { UNGROWN };
-        if seed {
-            queue.push(i);
-        }
+    });
+    for (_, seeds) in bands {
+        queue.extend(seeds);
     }
     // Strokes are 8-connected: a one-pixel diagonal touches only by corner.
     let mut head = 0;
@@ -372,16 +414,24 @@ fn joint_split(
     // An ink whose strokes mostly lie within the band of another ink's
     // strokes is that ink's antialiasing level, not a color of its own.
     let mut touching = vec![0usize; plans.len()];
-    for i in 0..n {
-        let color = state[i];
-        if color == 0 {
-            continue;
+    let band_touching = pool.map(num_bands, |b| {
+        let mut touching = vec![0usize; plans.len()];
+        for y in b * rows..((b + 1) * rows).min(height) {
+            for x in 0..width {
+                let color = state[y * width + x];
+                if color != 0
+                    && neighborhood(state, width, height, x, y, BAND_RADIUS)
+                        .any(|row| row.iter().any(|&s| s != 0 && s != color))
+                {
+                    touching[color as usize - 1] += 1;
+                }
+            }
         }
-        let (x, y) = (i % width, i / width);
-        if neighborhood(state, width, height, x, y, BAND_RADIUS)
-            .any(|row| row.iter().any(|&s| s != 0 && s != color))
-        {
-            touching[color as usize - 1] += 1;
+        touching
+    });
+    for band in band_touching {
+        for (total, count) in touching.iter_mut().zip(band) {
+            *total += count;
         }
     }
     for k in 0..plans.len() {
@@ -398,30 +448,40 @@ fn joint_split(
     // distance: the edge costs are those of distance 1, and the coverage
     // precision follows the distance later.
     let costs: [f32; 256] = std::array::from_fn(|v| (1.0 + v as f32 / 4.0).log2());
-    let mut gain = vec![0f64; plans.len()];
-    for (i, &color) in state.iter().enumerate() {
-        if color == 0 {
-            continue;
-        }
-        let k = color as usize - 1;
-        let x = i % width;
-        for j in [
-            x.checked_sub(1).map(|_| i - 1),
-            (x + 1 < width).then_some(i + 1),
-            i.checked_sub(width),
-            (i + width < n).then_some(i + width),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if state[j] == color {
+    // Edge terms are found in bands and summed in raster order, as one
+    // serial pass would.
+    let state_ref: &[u8] = state;
+    let band_terms = pool.map(num_bands, |b| {
+        let mut terms = Vec::new();
+        for i in b * rows * width..((b + 1) * rows).min(height) * width {
+            let color = state_ref[i];
+            if color == 0 {
                 continue;
             }
-            let edge: f64 = (0..3)
-                .map(|c| costs[rgb[i][c].abs_diff(rgb[j][c]) as usize] as f64)
-                .sum();
-            gain[k] += edge * 0.35 - 2.0;
+            let x = i % width;
+            for j in [
+                x.checked_sub(1).map(|_| i - 1),
+                (x + 1 < width).then_some(i + 1),
+                i.checked_sub(width),
+                (i + width < n).then_some(i + width),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if state_ref[j] == color {
+                    continue;
+                }
+                let edge: f64 = (0..3)
+                    .map(|c| costs[rgb[i][c].abs_diff(rgb[j][c]) as usize] as f64)
+                    .sum();
+                terms.push((color - 1, edge * 0.35 - 2.0));
+            }
         }
+        terms
+    });
+    let mut gain = vec![0f64; plans.len()];
+    for (k, term) in band_terms.into_iter().flatten() {
+        gain[k as usize] += term;
     }
     // Near the lossless endpoint the flat ink must match the finer quantizer.
     let valid = |k: usize| {
@@ -473,154 +533,216 @@ fn joint_split(
         // mix an ink with the surroundings, which only pixels outside the band
         // show.
         let mut near = vec![false; n];
-        for i in 0..n {
-            if state[i] != 0 {
-                let (x, y) = (i % width, i / width);
-                let (x0, y0) = (x.saturating_sub(BAND_RADIUS), y.saturating_sub(BAND_RADIUS));
-                for row in near[y0 * width..(y + BAND_RADIUS + 1).min(height) * width]
-                    .chunks_exact_mut(width)
-                {
-                    row[x0..(x + BAND_RADIUS + 1).min(width)].fill(true);
+        let state_ref: &[u8] = state;
+        let mut near_bands: Vec<_> = near.chunks_mut(rows * width).collect();
+        pool.for_each_mut(&mut near_bands, |b, near| {
+            let y0 = b * rows;
+            let y1 = y0 + near.len() / width;
+            for y in y0.saturating_sub(BAND_RADIUS)..(y1 + BAND_RADIUS).min(height) {
+                for x in 0..width {
+                    if state_ref[y * width + x] == 0 {
+                        continue;
+                    }
+                    let (x0, x1) = (
+                        x.saturating_sub(BAND_RADIUS),
+                        (x + BAND_RADIUS + 1).min(width),
+                    );
+                    for yy in y.saturating_sub(BAND_RADIUS).max(y0)..(y + BAND_RADIUS + 1).min(y1) {
+                        near[(yy - y0) * width..][x0..x1].fill(true);
+                    }
                 }
             }
+        });
+        drop(near_bands);
+        let near = &near;
+        if base.len() != n {
+            // Zeroed pages: the bands fault them in as they write.
+            base = vec![[0.0; 3]; n];
         }
-        thin.fill(1);
-        base.clear();
-        base.extend(rgb.iter().map(|p| p.map(f32::from)));
-        for i in 0..n {
-            let color = state[i];
-            if color != 0 {
-                ink[i] = slots[color as usize - 1] as u8 + 1;
-                coverage[i] = 255;
-                thin[i] = 0;
-                continue;
+        // Pixels mix independently; their residuals sum in raster order.
+        let mut bands: Vec<_> = ink
+            .chunks_mut(rows * width)
+            .zip(coverage.chunks_mut(rows * width))
+            .zip(thin.chunks_mut(rows * width))
+            .zip(base.chunks_mut(rows * width))
+            .map(|(((ink, coverage), thin), base)| (ink, coverage, thin, base, Vec::new()))
+            .collect();
+        pool.for_each_mut(&mut bands, |b, (ink, coverage, thin, base, mixes)| {
+            let start = b * rows * width;
+            thin.fill(1);
+            for (out, p) in base.iter_mut().zip(&rgb[start..]) {
+                *out = p.map(f32::from);
             }
-            if !near[i] || alpha.is_some_and(|a| a[i] != 255) {
-                continue;
-            }
-            let (x, y) = (i % width, i / width);
-            let (x0, y0) = (
-                x.saturating_sub(BAND_RADIUS + 1),
-                y.saturating_sub(BAND_RADIUS + 1),
-            );
-            let mut fill = [0f32; 3];
-            let mut count = 0;
-            // Inks within the band radius: the pixel mixes one of them.
-            let mut adjacent = 0u32;
-            for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, BAND_RADIUS + 1)
-                .zip(neighborhood(state, width, height, x, y, BAND_RADIUS + 1))
-                .enumerate()
-            {
-                for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
-                    let (xx, yy) = (x0 + dx, y0 + dy);
-                    let j = yy * width + xx;
-                    if s != 0 {
-                        if xx.abs_diff(x) <= BAND_RADIUS && yy.abs_diff(y) <= BAND_RADIUS {
-                            adjacent |= 1 << (s - 1);
+            for o in 0..ink.len() {
+                let i = start + o;
+                let color = state_ref[i];
+                if color != 0 {
+                    ink[o] = slots[color as usize - 1] as u8 + 1;
+                    coverage[o] = 255;
+                    thin[o] = 0;
+                    continue;
+                }
+                if !near[i] || alpha.is_some_and(|a| a[i] != 255) {
+                    continue;
+                }
+                let (x, y) = (i % width, i / width);
+                let (x0, y0) = (
+                    x.saturating_sub(BAND_RADIUS + 1),
+                    y.saturating_sub(BAND_RADIUS + 1),
+                );
+                let mut fill = [0f32; 3];
+                let mut count = 0;
+                // Inks within the band radius: the pixel mixes one of them.
+                let mut adjacent = 0u32;
+                for (dy, (pixels, states)) in
+                    neighborhood(rgb, width, height, x, y, BAND_RADIUS + 1)
+                        .zip(neighborhood(
+                            state_ref,
+                            width,
+                            height,
+                            x,
+                            y,
+                            BAND_RADIUS + 1,
+                        ))
+                        .enumerate()
+                {
+                    for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
+                        let (xx, yy) = (x0 + dx, y0 + dy);
+                        let j = yy * width + xx;
+                        if s != 0 {
+                            if xx.abs_diff(x) <= BAND_RADIUS && yy.abs_diff(y) <= BAND_RADIUS {
+                                adjacent |= 1 << (s - 1);
+                            }
+                            continue;
                         }
+                        if near[j] || alpha.is_some_and(|a| a[j] != 255) {
+                            continue;
+                        }
+                        for c in 0..3 {
+                            fill[c] += p[c] as f32;
+                        }
+                        count += 1;
+                    }
+                }
+                if adjacent == 0 || count == 0 {
+                    continue;
+                }
+                fill = fill.map(|v| v / count as f32);
+                let mut best = (f32::INFINITY, 0usize, 0f32, 0u8);
+                for (k, plan) in plans.iter().enumerate() {
+                    if slots[k] == usize::MAX || adjacent & (1 << k) == 0 {
                         continue;
                     }
-                    if near[j] || alpha.is_some_and(|a| a[j] != 255) {
+                    let ink = plan.color.map(f32::from);
+                    let d: [f32; 3] = std::array::from_fn(|c| fill[c] - ink[c]);
+                    let dd: f32 = d.iter().map(|v| v * v).sum();
+                    if dd < 100.0 {
                         continue;
                     }
-                    for c in 0..3 {
-                        fill[c] += p[c] as f32;
+                    let c = ((0..3)
+                        .map(|j| (fill[j] - rgb[i][j] as f32) * d[j])
+                        .sum::<f32>()
+                        / dd)
+                        .clamp(0.0, 1.0);
+                    let a = round_i32(c * 255.0) as u8;
+                    if a == 0 {
+                        continue;
                     }
-                    count += 1;
+                    let error: f32 = (0..3)
+                        .map(|j| {
+                            let e = fill[j] - d[j] * c - rgb[i][j] as f32;
+                            e * e
+                        })
+                        .sum();
+                    if error < best.0 {
+                        best = (error, k, c, a);
+                    }
                 }
-            }
-            if adjacent == 0 || count == 0 {
-                continue;
-            }
-            fill = fill.map(|v| v / count as f32);
-            let mut best = (f32::INFINITY, 0usize, 0f32, 0u8);
-            for (k, plan) in plans.iter().enumerate() {
-                if slots[k] == usize::MAX || adjacent & (1 << k) == 0 {
+                if !best.0.is_finite() {
                     continue;
                 }
-                let ink = plan.color.map(f32::from);
-                let d: [f32; 3] = std::array::from_fn(|c| fill[c] - ink[c]);
-                let dd: f32 = d.iter().map(|v| v * v).sum();
-                if dd < 100.0 {
-                    continue;
-                }
-                let c = ((0..3)
-                    .map(|j| (fill[j] - rgb[i][j] as f32) * d[j])
-                    .sum::<f32>()
-                    / dd)
-                    .clamp(0.0, 1.0);
-                let a = round_i32(c * 255.0) as u8;
-                if a == 0 {
-                    continue;
-                }
-                let error: f32 = (0..3)
-                    .map(|j| {
-                        let e = fill[j] - d[j] * c - rgb[i][j] as f32;
-                        e * e
-                    })
-                    .sum();
-                if error < best.0 {
-                    best = (error, k, c, a);
+                let (_, k, c, a) = best;
+                mixes.push((k as u8, best.0));
+                ink[o] = slots[k] as u8 + 1;
+                coverage[o] = a;
+                // Mostly surroundings: the base keeps them with the ink taken out.
+                if c < 0.5 {
+                    for j in 0..3 {
+                        base[o][j] = ((rgb[i][j] as f32 - plans[k].color[j] as f32 * c)
+                            / (1.0 - c))
+                            .clamp(0.0, 255.0);
+                    }
+                } else {
+                    thin[o] = 0;
                 }
             }
-            if !best.0.is_finite() {
-                continue;
-            }
-            let (_, k, c, a) = best;
-            residual[k] += best.0 as f64;
-            band[k] += 1;
-            ink[i] = slots[k] as u8 + 1;
-            coverage[i] = a;
-            // Mostly surroundings: the base keeps them with the ink taken out.
-            if c < 0.5 {
-                for j in 0..3 {
-                    base[i][j] = ((rgb[i][j] as f32 - plans[k].color[j] as f32 * c) / (1.0 - c))
-                        .clamp(0.0, 255.0);
-                }
-            } else {
-                thin[i] = 0;
-            }
+        });
+        for (k, error) in bands.into_iter().flat_map(|band| band.4) {
+            residual[k as usize] += error as f64;
+            band[k as usize] += 1;
         }
         // The base continues its surroundings under the strokes and their band.
         // The faint fringe one pixel further, which the mix does not claim, is
         // taken out of the fill (it would seep under every glyph) and put back
         // exact: it is what the strokes' edges look like.
-        for i in 0..n {
-            if coverage[i] == 0 {
-                continue;
-            }
-            for j in neighbors8(i, width, height) {
-                if coverage[j] != 0 || thin[j] == 0 || alpha.is_some_and(|a| a[j] != 255) {
+        // Each band visits the stroke pixels on its rows and the rows next to
+        // it, and takes the fringe pixels on its own rows; the fringe is a set.
+        let coverage_ref: &[u8] = &coverage;
+        let mut bands: Vec<_> = thin
+            .chunks_mut(rows * width)
+            .map(|thin| (thin, Vec::new()))
+            .collect();
+        pool.for_each_mut(&mut bands, |b, (thin, fringe)| {
+            let start = b * rows * width;
+            let end = start + thin.len();
+            let scan_from = start.saturating_sub(width);
+            let scan_to = (end + width).min(n);
+            for i in scan_from..scan_to {
+                if coverage_ref[i] == 0 {
                     continue;
                 }
-                let (x, y) = (j % width, j / width);
-                let (x0, y0) = (x.saturating_sub(2), y.saturating_sub(2));
-                let mut fill = [0i32; 3];
-                let mut count = 0;
-                for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, 2)
-                    .zip(neighborhood(state, width, height, x, y, 2))
-                    .enumerate()
-                {
-                    for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
-                        let m = (y0 + dy) * width + x0 + dx;
-                        if s != 0 || near[m] || alpha.is_some_and(|a| a[m] != 255) {
-                            continue;
+                for j in neighbors8(i, width, height) {
+                    if j < start
+                        || j >= end
+                        || coverage_ref[j] != 0
+                        || thin[j - start] == 0
+                        || alpha.is_some_and(|a| a[j] != 255)
+                    {
+                        continue;
+                    }
+                    let (x, y) = (j % width, j / width);
+                    let (x0, y0) = (x.saturating_sub(2), y.saturating_sub(2));
+                    let mut fill = [0i32; 3];
+                    let mut count = 0;
+                    for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, 2)
+                        .zip(neighborhood(state_ref, width, height, x, y, 2))
+                        .enumerate()
+                    {
+                        for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
+                            let m = (y0 + dy) * width + x0 + dx;
+                            if s != 0 || near[m] || alpha.is_some_and(|a| a[m] != 255) {
+                                continue;
+                            }
+                            for c in 0..3 {
+                                fill[c] += p[c] as i32;
+                            }
+                            count += 1;
                         }
-                        for c in 0..3 {
-                            fill[c] += p[c] as i32;
-                        }
-                        count += 1;
+                    }
+                    // Deep inside the text no surroundings show: it is fringe too.
+                    if count == 0
+                        || (0..3).all(|c| {
+                            (rgb[j][c] as i32 - fill[c] / count).unsigned_abs() <= FRINGE_TOL
+                        })
+                    {
+                        thin[j - start] = 0;
+                        fringe.push(j);
                     }
                 }
-                // Deep inside the text no surroundings show: it is fringe too.
-                if count == 0
-                    || (0..3)
-                        .all(|c| (rgb[j][c] as i32 - fill[c] / count).unsigned_abs() <= FRINGE_TOL)
-                {
-                    thin[j] = 0;
-                    fringe.push(j);
-                }
             }
+        });
+        for (_, band) in bands {
+            fringe.extend(band);
         }
         let limit = MAX_BAND_RESIDUAL * precision as f64;
         let mut dropped = false;
@@ -656,16 +778,23 @@ fn joint_split(
     let components: usize = kept().map(|k| components[k]).sum();
     let glyph_text = (band as f32) >= MAX_TEXT_BAND_RATIO * core as f32
         || core <= MAX_GLYPH_COMPONENT * components;
-    fill_dont_care_with_iters(&mut base, thin, width, height, queue, 8);
+    fill_dont_care_with_iters(&mut base, thin, width, height, queue, 8, pool);
     for &i in &fringe {
         base[i] = rgb[i].map(f32::from);
     }
+    let mut bytes = vec![0u8; 3 * n];
+    let mut chunks: Vec<_> = bytes
+        .chunks_mut(3 * rows * width)
+        .zip(base.chunks(rows * width))
+        .collect();
+    pool.for_each_mut(&mut chunks, |_, (bytes, base)| {
+        for (b, &v) in bytes.iter_mut().zip(base.as_flattened()) {
+            *b = round_i32(v).clamp(0, 255) as u8;
+        }
+    });
+    drop(chunks);
     Some(InkLayers {
-        base: base
-            .as_flattened()
-            .iter()
-            .map(|&v| round_i32(v).clamp(0, 255) as u8)
-            .collect(),
+        base: bytes,
         inks,
         ink,
         coverage,
@@ -789,7 +918,15 @@ fn fill_dont_care(
     height: usize,
     dont_care: &mut Vec<usize>,
 ) {
-    fill_dont_care_with_iters(base, filled, width, height, dont_care, DIFFUSION_ITERS);
+    fill_dont_care_with_iters(
+        base,
+        filled,
+        width,
+        height,
+        dont_care,
+        DIFFUSION_ITERS,
+        &ThreadPool::new(3),
+    );
 }
 
 fn fill_dont_care_with_iters(
@@ -799,14 +936,22 @@ fn fill_dont_care_with_iters(
     height: usize,
     dont_care: &mut Vec<usize>,
     iterations: usize,
+    pool: &ThreadPool,
 ) {
+    let rows_per_band = band_rows(pool, height);
+    let band_pixels = rows_per_band * width;
+    let num_bands = height.div_ceil(rows_per_band);
     dont_care.clear();
-    dont_care.extend(
-        filled
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &s)| (s == 0).then_some(i)),
-    );
+    let filled_ref: &[u8] = filled;
+    for band in pool.map(num_bands, |b| {
+        let start = b * band_pixels;
+        let end = (start + band_pixels).min(filled_ref.len());
+        (start..end)
+            .filter(|&i| filled_ref[i] == 0)
+            .collect::<Vec<_>>()
+    }) {
+        dont_care.extend(band);
+    }
     if dont_care.is_empty() {
         return;
     }
@@ -816,34 +961,49 @@ fn fill_dont_care_with_iters(
             (x.saturating_sub(1)..(x + 2).min(width)).map(move |xx| yy * width + xx)
         })
     };
-    let mut frontier: Vec<usize> = dont_care
-        .iter()
-        .copied()
-        .filter(|&i| neighbors(i).any(|j| filled[j] == 1))
-        .collect();
+    // Order-preserving parallel passes over a pixel list.
+    const CHUNK: usize = 4096;
+    let mut frontier: Vec<usize> = pool
+        .map(dont_care.len().div_ceil(CHUNK), |c| {
+            dont_care[c * CHUNK..((c + 1) * CHUNK).min(dont_care.len())]
+                .iter()
+                .copied()
+                .filter(|&i| neighbors(i).any(|j| filled_ref[j] == 1))
+                .collect::<Vec<_>>()
+        })
+        .concat();
     // Inward fill in rings: each ring takes the mean of its filled neighbors.
     // State 2 claims a pixel for the next ring without making its value visible.
     let mut next = Vec::new();
     while !frontier.is_empty() {
-        for &i in &frontier {
-            let mut sum = [0f32; 3];
-            let mut count = 0usize;
-            let (x, y) = (i % width, i / width);
-            for (pixels, states) in neighborhood(base, width, height, x, y, 1)
-                .zip(neighborhood(filled, width, height, x, y, 1))
-            {
-                for (p, &s) in pixels.iter().zip(states) {
-                    if s == 1 {
-                        for (sum, &v) in sum.iter_mut().zip(p) {
-                            *sum += v;
+        // The current ring is still unfilled, so its new values cannot be
+        // read by another pixel until the whole ring is committed.
+        let (base_ref, filled_ref): (&[[f32; 3]], &[u8]) = (base, filled);
+        let values = pool.map(frontier.len().div_ceil(CHUNK), |c| {
+            frontier[c * CHUNK..((c + 1) * CHUNK).min(frontier.len())]
+                .iter()
+                .map(|&i| {
+                    let mut sum = [0f32; 3];
+                    let mut count = 0usize;
+                    let (x, y) = (i % width, i / width);
+                    for (pixels, states) in neighborhood(base_ref, width, height, x, y, 1)
+                        .zip(neighborhood(filled_ref, width, height, x, y, 1))
+                    {
+                        for (p, &s) in pixels.iter().zip(states) {
+                            if s == 1 {
+                                for (sum, &v) in sum.iter_mut().zip(p) {
+                                    *sum += v;
+                                }
+                                count += 1;
+                            }
                         }
-                        count += 1;
                     }
-                }
-            }
-            // The current ring is still unfilled, so its new values cannot
-            // be read by another pixel until the whole ring is committed.
-            base[i] = sum.map(|v| v / count.max(1) as f32);
+                    sum.map(|v| v / count.max(1) as f32)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (&i, v) in frontier.iter().zip(values.into_iter().flatten()) {
+            base[i] = v;
         }
         for &i in &frontier {
             filled[i] = 1;
@@ -861,39 +1021,108 @@ fn fill_dont_care_with_iters(
     }
     drop(frontier);
     drop(next);
-    // Delay each row's writes until the following active row has been read.
-    // A 3x3 stencil cannot see an earlier row after that point. This preserves
-    // Jacobi's evaluation order with two rows of values instead of a second
-    // float buffer covering every free pixel.
     let mut rows = Vec::new();
     let mut start = 0;
-    let mut max_row = 0;
     while start < dont_care.len() {
         let y = dont_care[start] / width;
         let end = start + dont_care[start..].partition_point(|&i| i / width == y);
         rows.push((y, start, end));
-        max_row = max_row.max(end - start);
         start = end;
     }
+    // Jacobi box diffusion in row bands. A band reads the image rows just
+    // outside it from copies taken before each iteration, so it may write
+    // its own rows while its neighbours still read their old values.
+    let mut bands: Vec<&[(usize, usize, usize)]> = Vec::new();
+    let mut rest = rows.as_slice();
+    while !rest.is_empty() {
+        let last = rest[0].0 + rows_per_band;
+        let take = rest.partition_point(|r| r.0 < last);
+        let (band, tail) = rest.split_at(take);
+        bands.push(band);
+        rest = tail;
+    }
+    for _ in 0..iterations {
+        let halos: Vec<_> = bands
+            .iter()
+            .map(|band| {
+                let (y0, y1) = (band[0].0, band[band.len() - 1].0);
+                let row = |y: usize| base[y * width..(y + 1) * width].to_vec();
+                (
+                    y0.checked_sub(1).map(row),
+                    (y1 + 1 < height).then(|| row(y1 + 1)),
+                )
+            })
+            .collect();
+        let mut slices = Vec::with_capacity(bands.len());
+        let mut tail: &mut [[f32; 3]] = &mut *base;
+        let mut tail_y = 0;
+        for band in &bands {
+            let (y0, y1) = (band[0].0, band[band.len() - 1].0);
+            let (_, from_y0) = std::mem::take(&mut tail).split_at_mut((y0 - tail_y) * width);
+            let (own, after) = from_y0.split_at_mut((y1 + 1 - y0) * width);
+            slices.push((own, y0));
+            tail = after;
+            tail_y = y1 + 1;
+        }
+        let dont_care: &[usize] = dont_care;
+        pool.for_each_mut(&mut slices, |b, (own, y0)| {
+            let (above, below) = &halos[b];
+            diffuse_band(
+                bands[b],
+                dont_care,
+                own,
+                *y0,
+                above.as_deref(),
+                below.as_deref(),
+                width,
+                height,
+            );
+        });
+    }
+}
+
+/// One Jacobi pass over a band's free rows. `own` holds image rows `y0..`
+/// through the band's last row; `above`/`below` are the rows around it.
+/// Each row's writes wait until the next free row has been read, so a 3x3
+/// stencil only sees the previous iteration's values.
+#[allow(clippy::too_many_arguments)]
+fn diffuse_band(
+    rows: &[(usize, usize, usize)],
+    dont_care: &[usize],
+    own: &mut [[f32; 3]],
+    y0: usize,
+    above: Option<&[[f32; 3]]>,
+    below: Option<&[[f32; 3]]>,
+    width: usize,
+    height: usize,
+) {
+    let y_end = y0 + own.len() / width;
+    let max_row = rows.iter().map(|&(_, s, e)| e - s).max().unwrap_or(0);
     let mut previous = vec![[0f32; 3]; max_row];
     let mut current = vec![[0f32; 3]; max_row];
-    for _ in 0..iterations {
-        let mut pending = &dont_care[..0];
-        for &(y, start, end) in &rows {
-            let row_start = y * width;
-            let row_end = row_start + width;
-            let indices = &dont_care[start..end];
+    let mut pending = &dont_care[..0];
+    for &(y, start, end) in rows {
+        let indices = &dont_care[start..end];
+        {
+            let row = |yy: usize| -> &[[f32; 3]] {
+                if yy < y0 {
+                    above.unwrap()
+                } else if yy >= y_end {
+                    below.unwrap()
+                } else {
+                    &own[(yy - y0) * width..][..width]
+                }
+            };
+            let (y_lo, y_hi) = (y.saturating_sub(1), (y + 2).min(height));
+            let interior_rows = (y > 0 && y + 1 < height).then(|| [row(y - 1), row(y), row(y + 1)]);
             for (slot, &i) in current.iter_mut().zip(indices) {
+                let x = i - y * width;
                 let mut sum = [0f32; 3];
-                if y > 0 && y + 1 < height && i > row_start && i + 1 < row_end {
-                    // The interior has a fixed stencil, without coordinate
-                    // division or clipped-window setup in every iteration.
-                    for row in [
-                        &base[i - width - 1..][..3],
-                        &base[i - 1..][..3],
-                        &base[i + width - 1..][..3],
-                    ] {
-                        for p in row {
+                if let Some(rows3) = interior_rows.filter(|_| x > 0 && x + 1 < width) {
+                    // The interior has a fixed stencil, without clipped-window
+                    // setup in every iteration.
+                    for r in rows3 {
+                        for p in &r[x - 1..x + 2] {
                             for (sum, &v) in sum.iter_mut().zip(p) {
                                 *sum += v;
                             }
@@ -901,27 +1130,28 @@ fn fill_dont_care_with_iters(
                     }
                     *slot = sum.map(|v| v / 9.0);
                 } else {
+                    let (x_lo, x_hi) = (x.saturating_sub(1), (x + 2).min(width));
                     let mut count = 0;
-                    for row in neighborhood(base, width, height, i - row_start, y, 1) {
-                        for p in row {
+                    for yy in y_lo..y_hi {
+                        for p in &row(yy)[x_lo..x_hi] {
                             for (sum, &v) in sum.iter_mut().zip(p) {
                                 *sum += v;
                             }
                         }
-                        count += row.len();
+                        count += x_hi - x_lo;
                     }
                     *slot = sum.map(|v| v / count as f32);
                 }
             }
-            for (&i, &v) in pending.iter().zip(&previous) {
-                base[i] = v;
-            }
-            std::mem::swap(&mut previous, &mut current);
-            pending = indices;
         }
         for (&i, &v) in pending.iter().zip(&previous) {
-            base[i] = v;
+            own[i - y0 * width] = v;
         }
+        std::mem::swap(&mut previous, &mut current);
+        pending = indices;
+    }
+    for (&i, &v) in pending.iter().zip(&previous) {
+        own[i - y0 * width] = v;
     }
 }
 
@@ -1025,6 +1255,7 @@ pub(crate) fn ridge_row_scalar(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1044,7 +1275,7 @@ mod tests {
         let select = |distance| {
             InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
                 .unwrap()
-                .select(distance)
+                .select(distance, &ThreadPool::new(1))
         };
         let plan = select(0.6).expect("slight ink variation should not force VarDCT edges");
         assert_ne!(plan.ink[32 * width + 31], 0);
@@ -1075,7 +1306,7 @@ mod tests {
         }
         let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height, &ThreadPool::new(1))
             .unwrap()
-            .select(1.5)
+            .select(1.5, &ThreadPool::new(1))
             .unwrap();
         assert!(plan.inks.len() <= 4);
         for (x, y, ink) in [(0, 60, inks[0]), (159, 60, inks[0]), (77, 60, inks[1])] {
@@ -1108,7 +1339,7 @@ mod tests {
             .collect();
         let plan = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
             .unwrap()
-            .select(1.5)
+            .select(1.5, &ThreadPool::new(1))
             .unwrap();
         assert_eq!(
             plan.inks[plan.ink[16 * width + 32] as usize - 1],
@@ -1289,11 +1520,11 @@ mod tests {
             .collect();
         let a = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(1))
             .unwrap()
-            .select(1.5)
+            .select(1.5, &ThreadPool::new(1))
             .unwrap();
         let b = InkCandidates::new_fast(&rgb, None, width, height, &ThreadPool::new(4))
             .unwrap()
-            .select(1.5)
+            .select(1.5, &ThreadPool::new(4))
             .unwrap();
         assert_eq!(a.base, b.base);
         assert_eq!(a.inks, b.inks);
@@ -1358,7 +1589,7 @@ mod tests {
         }
         let plan = InkCandidates::new_fast(&rgb, Some(&alpha), width, height, &ThreadPool::new(1))
             .unwrap()
-            .select(1.5)
+            .select(1.5, &ThreadPool::new(1))
             .unwrap();
         for (x, y, _) in excluded {
             let i = y * width + x;
@@ -1384,7 +1615,7 @@ mod tests {
             .collect();
         assert!(
             InkCandidates::new_fast(&rgb, None, 64, 64, &ThreadPool::new(1))
-                .and_then(|c| c.select(1.5))
+                .and_then(|c| c.select(1.5, &ThreadPool::new(1)))
                 .is_none()
         );
     }

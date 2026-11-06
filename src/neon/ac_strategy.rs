@@ -91,7 +91,8 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
     } else {
         scan_pos.len() >= n
     });
-    debug_assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+    // Two vectors per step; `half` is a vector boundary.
+    assert!(width.is_multiple_of(8) && half.is_multiple_of(4));
 
     let qs = vdupq_n_f32(q_scaled);
     let mut sse_acc = vdupq_n_f32(0.0);
@@ -111,76 +112,117 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
         let yfix = if y >= height / 2 { 2 } else { 0 };
         let thr_lo = thr[yfix];
         let thr_hi = thr[yfix + 1];
+        let llf_row = y < cy;
 
         for (x0, (coeff, inv_matrix)) in coeffs
-            .as_chunks::<4>()
+            .as_chunks::<8>()
             .0
             .iter()
-            .zip(inv_matrix.as_chunks::<4>().0.iter())
+            .zip(inv_matrix.as_chunks::<8>().0.iter())
             .enumerate()
         {
-            let x = x0 * 4;
-            let threshold = if x >= half { thr_hi } else { thr_lo };
-            let thrv = vdupq_n_f32(threshold);
+            let x = x0 * 8;
+            let thr0 = vdupq_n_f32(if x >= half { thr_hi } else { thr_lo });
+            let thr1 = vdupq_n_f32(if x + 4 >= half { thr_hi } else { thr_lo });
 
-            let cv = unsafe { vld1q_f32(coeff.as_ptr()) };
-            let mv = unsafe { vld1q_f32(inv_matrix.as_ptr()) };
+            let c0 = unsafe { vld1q_f32(coeff.as_ptr()) };
+            let c1 = unsafe { vld1q_f32(coeff.as_ptr().add(4)) };
+            let m0 = unsafe { vld1q_f32(inv_matrix.as_ptr()) };
+            let m1 = unsafe { vld1q_f32(inv_matrix.as_ptr().add(4)) };
 
-            let a = vmulq_f32(vmulq_f32(mv, qs), cv);
-            let absa = vabsq_f32(a);
-
-            let keep = vcgeq_f32(absa, thrv);
+            let a0 = vmulq_f32(vmulq_f32(m0, qs), c0);
+            let a1 = vmulq_f32(vmulq_f32(m1, qs), c1);
+            let keep0 = vcgeq_f32(vabsq_f32(a0), thr0);
+            let keep1 = vcgeq_f32(vabsq_f32(a1), thr1);
             // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
-            let rounded = vrndaq_f32(a);
+            let q0 = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(a0)), keep0));
+            let q1 = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(a1)), keep1));
+            let absq0 = vabsq_f32(q0);
+            let absq1 = vabsq_f32(q1);
+            let nz0 = vcgtq_f32(absq0, zero);
+            let nz1 = vcgtq_f32(absq1, zero);
 
-            let q = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rounded), keep));
-
-            let absq = vabsq_f32(q);
-            let nz = vcgtq_f32(absq, zero);
-            // An all-zero vector dequantizes to +0 in every lane: skip the
-            // division, which dominates this loop on high frequencies.
-            let d = if BIASED && vmaxvq_u32(nz) != 0 {
-                vsubq_f32(a, neon_dequantized_level_f32(q, bias))
-            } else if BIASED {
-                vsubq_f32(a, zero)
-            } else {
-                vsubq_f32(a, q)
-            };
-            let d2 = vmulq_f32(d, d);
-
-            let active = if y < cy && x < cx {
+            let (active0, active1) = if llf_row && x < cx {
+                let cxv = vdupq_n_u32(cx as u32);
                 let lane_x = vaddq_u32(vdupq_n_u32(x as u32), lane_ids);
-                vcgeq_u32(lane_x, vdupq_n_u32(cx as u32))
+                (
+                    vcgeq_u32(lane_x, cxv),
+                    vcgeq_u32(vaddq_u32(lane_x, vdupq_n_u32(4)), cxv),
+                )
             } else {
-                all_active
+                (all_active, all_active)
             };
+            let rate0 = vandq_u32(nz0, active0);
+            let rate1 = vandq_u32(nz1, active1);
 
-            let d2 = vbslq_f32(active, d2, zero);
-            sse_acc = vaddq_f32(sse_acc, d2);
+            // Most pairs quantize to all zeros (65-90 % of them in real
+            // encodes): one lane-max per pair skips the dequantization and
+            // the rate for those, where every term is zero anyway (masked
+            // LLF lanes contribute nothing either way). A nonzero pair
+            // gathers the biased level and its magnitude rate from the
+            // 16-entry tables by the integer level, with the division and
+            // the polynomial only for a level of 16 or more (a few percent
+            // of the nonzero pairs).
+            let (d0, d1) = if vmaxvq_u32(vorrq_u32(rate0, rate1)) != 0 {
+                let tables = SmallLevelTables::new(&bias);
+                let lk0 = SmallLevelIndex::new(absq0);
+                let lk1 = SmallLevelIndex::new(absq1);
+                let mut dq0 = if BIASED {
+                    tables.dequantized(lk0, q0)
+                } else {
+                    q0
+                };
+                let mut dq1 = if BIASED {
+                    tables.dequantized(lk1, q1)
+                } else {
+                    q1
+                };
+                let mut lg0 = tables.log2p1(lk0);
+                let mut lg1 = tables.log2p1(lk1);
+                if vmaxvq_u32(vorrq_u32(lk0.big, lk1.big)) != 0 {
+                    if BIASED {
+                        dq0 = vbslq_f32(lk0.big, neon_dequantized_level_f32(q0, bias), dq0);
+                        dq1 = vbslq_f32(lk1.big, neon_dequantized_level_f32(q1, bias), dq1);
+                    }
+                    if !SAVE_LEVELS {
+                        lg0 = vbslq_f32(lk0.big, neon_log2p1_f32(absq0), lg0);
+                        lg1 = vbslq_f32(lk1.big, neon_log2p1_f32(absq1), lg1);
+                    }
+                }
+                if !SAVE_LEVELS {
+                    // Same lane order as one vector at a time, so the sums
+                    // round identically.
+                    mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate0, lg0, zero));
+                    mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate1, lg1, zero));
+                    // Scan position of the nonzeros (LLF slots are never
+                    // nonzero here, so masked-to-zero lanes are neutral).
+                    let sv = unsafe { scan_pos.as_ptr().add(y * width + x) };
+                    let sv0 = unsafe { vld1q_u32(sv) };
+                    let sv1 = unsafe { vld1q_u32(sv.add(4)) };
+                    scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv0, rate0));
+                    scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv1, rate1));
+                }
+                (vsubq_f32(a0, dq0), vsubq_f32(a1, dq1))
+            } else if BIASED {
+                // The biased level of every lane is +0 here: a - 0 = a.
+                (a0, a1)
+            } else {
+                // A level may be -0 here, which a - q folds to +0.
+                (vsubq_f32(a0, q0), vsubq_f32(a1, q1))
+            };
+            let d2_0 = vmulq_f32(d0, d0);
+            let d2_1 = vmulq_f32(d1, d1);
+            sse_acc = vaddq_f32(sse_acc, vbslq_f32(active0, d2_0, zero));
+            sse_acc = vaddq_f32(sse_acc, vbslq_f32(active1, d2_1, zero));
+            nz_acc = vaddq_u32(nz_acc, vshrq_n_u32::<31>(rate0));
+            nz_acc = vaddq_u32(nz_acc, vshrq_n_u32::<31>(rate1));
 
-            let rate_mask = vandq_u32(nz, active);
-
-            // Keep the count lane-local until the end. A horizontal reduction
-            // for every four coefficients was a sizable part of this loop.
-            nz_acc = vaddq_u32(nz_acc, vshrq_n_u32::<31>(rate_mask));
-
-            // Quantized AC coefficients are commonly zero. Do not run the
-            // seven-FMA logarithm when none of this vector contributes rate.
             if SAVE_LEVELS {
-                let quantized = vandq_s32(
-                    vcvtaq_s32_f32(a),
-                    vreinterpretq_s32_u32(vandq_u32(keep, active)),
-                );
-                unsafe { vst1q_s32(levels.as_mut_ptr().add(y * width + x), quantized) };
-            }
-
-            if !SAVE_LEVELS && vmaxvq_u32(rate_mask) != 0 {
-                let ratev = neon_log2p1_f32(absq);
-                mag_acc = vaddq_f32(mag_acc, vbslq_f32(rate_mask, ratev, zero));
-                // Scan position of the nonzeros (LLF slots are never nonzero
-                // here, so masked-to-zero lanes are neutral for the max).
-                let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
-                scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, rate_mask));
+                let keep0 = vreinterpretq_s32_u32(vandq_u32(keep0, active0));
+                let keep1 = vreinterpretq_s32_u32(vandq_u32(keep1, active1));
+                let out = unsafe { levels.as_mut_ptr().add(y * width + x) };
+                unsafe { vst1q_s32(out, vandq_s32(vcvtaq_s32_f32(a0), keep0)) };
+                unsafe { vst1q_s32(out.add(4), vandq_s32(vcvtaq_s32_f32(a1), keep1)) };
             }
         }
     }
@@ -190,6 +232,78 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
         vaddvq_f32(mag_acc),
         vmaxvq_u32(scan_acc),
     )
+}
+
+/// `log2(1 + k)` for `k < SMALL_LEVELS` as [`neon_log2p1_f32`] evaluates it,
+/// so the table path is bit-identical with the polynomial path.
+static LOG2P1_SMALL: std::sync::LazyLock<[f32; crate::group::SMALL_LEVELS]> =
+    std::sync::LazyLock::new(|| {
+        std::array::from_fn(|k| unsafe {
+            vgetq_lane_f32::<0>(neon_log2p1_f32(vdupq_n_f32(k as f32)))
+        })
+    });
+
+/// Byte indices of four integer levels into a 16-entry `f32` table, with the
+/// lanes at or above 16 flagged (they index past the table and read zero).
+#[derive(Clone, Copy)]
+pub(crate) struct SmallLevelIndex {
+    bytes: uint8x16_t,
+    pub(crate) big: uint32x4_t,
+}
+
+impl SmallLevelIndex {
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn new(absq: float32x4_t) -> Self {
+        const _: () = assert!(crate::group::SMALL_LEVELS == 16);
+        let sixteen = vdupq_n_u32(16);
+        // Integer-valued floats convert exactly; huge ones saturate past 16.
+        let k = vminq_u32(vcvtq_u32_f32(absq), sixteen);
+        // Lane k reads bytes 4k..4k+3: replicate 4k and add the byte offsets.
+        let bytes = vorrq_u32(
+            vmulq_u32(k, vdupq_n_u32(0x0404_0404)),
+            vdupq_n_u32(0x0302_0100),
+        );
+        Self {
+            bytes: vreinterpretq_u8_u32(bytes),
+            big: vceqq_u32(k, sixteen),
+        }
+    }
+}
+
+/// The 16-entry dequantization and rate tables of one channel, loaded into
+/// registers for `vqtbl4q_u8` gathers.
+#[derive(Clone, Copy)]
+pub(crate) struct SmallLevelTables {
+    dequant: uint8x16x4_t,
+    log2p1: uint8x16x4_t,
+}
+
+impl SmallLevelTables {
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn new(bias: &crate::group::DequantBias) -> Self {
+        Self {
+            dequant: unsafe { vld1q_u8_x4(bias.small_levels.as_ptr().cast()) },
+            log2p1: unsafe { vld1q_u8_x4(LOG2P1_SMALL.as_ptr().cast()) },
+        }
+    }
+
+    /// [`neon_dequantized_level_f32`] of `q` for lanes below 16 (zero above).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn dequantized(self, index: SmallLevelIndex, q: float32x4_t) -> float32x4_t {
+        let magnitude = vreinterpretq_u32_u8(vqtbl4q_u8(self.dequant, index.bytes));
+        let sign = vandq_u32(vreinterpretq_u32_f32(q), vdupq_n_u32(0x8000_0000));
+        vreinterpretq_f32_u32(vorrq_u32(magnitude, sign))
+    }
+
+    /// [`neon_log2p1_f32`] of `|q|` for lanes below 16 (zero above).
+    #[inline]
+    #[target_feature(enable = "neon")]
+    pub(crate) fn log2p1(self, index: SmallLevelIndex) -> float32x4_t {
+        vreinterpretq_f32_u8(vqtbl4q_u8(self.log2p1, index.bytes))
+    }
 }
 
 /// NEON counterpart of `DequantBias::level_f32`: the decoder's biased

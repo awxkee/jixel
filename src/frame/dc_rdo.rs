@@ -68,15 +68,28 @@ impl Prices {
     fn new(
         groups: &[DcGroupData],
         scratch: &mut DcPredictorScratch,
+        pool: &crate::thread_pool::ThreadPool,
     ) -> Result<(Self, DcPredictorChoice, [DcPlanePrice; 2]), EncodeError> {
         // Keep per-channel counts for both predictors while choosing the
-        // frame's predictor from their pooled counts. Token streams can then
-        // be dropped after each group instead of retaining the entire frame.
-        let mut counts = try_vec![[0u32; ALPHABET_SIZE]; 6 * K_NUM_DC_CONTEXTS]?;
-        scratch.counts.as_flattened_mut().fill(0);
-        scratch.extra.fill(0);
-        let mut raw_bits = [0u64; 3];
-        for dc in groups {
+        // frame's predictor from their pooled counts. Groups are tokenized
+        // independently and their counts summed, so token streams are
+        // dropped per group instead of retaining the entire frame.
+        struct GroupCounts {
+            /// Per predictor and context, as `DcPredictorScratch` keeps them.
+            pooled: Vec<[u32; ALPHABET_SIZE]>,
+            extra: Vec<u64>,
+            /// Per predictor, channel and context.
+            counts: Vec<[u32; ALPHABET_SIZE]>,
+            raw_bits: [u64; 3],
+        }
+        let per_group = pool.map(groups.len(), |g| {
+            let dc = &groups[g];
+            let mut group = GroupCounts {
+                pooled: vec![[0u32; ALPHABET_SIZE]; 2 * K_NUM_DC_CONTEXTS],
+                extra: vec![0u64; 2 * K_NUM_DC_CONTEXTS],
+                counts: vec![[0u32; ALPHABET_SIZE]; 6 * K_NUM_DC_CONTEXTS],
+                raw_bits: [0u64; 3],
+            };
             let (wp, grad) = collect_dc_tokens_with_gradient(
                 dc,
                 &DC_PREDICTOR_WEIGHTED,
@@ -96,16 +109,44 @@ impl Prices {
                         let context = token.context as usize;
                         let (symbol, extra, _) = uint_encode(token.value);
                         let slot = candidate * K_NUM_DC_CONTEXTS + context;
-                        scratch.counts[slot][symbol as usize] += 1;
-                        scratch.extra[slot] += u64::from(extra);
+                        group.pooled[slot][symbol as usize] += 1;
+                        group.extra[slot] += u64::from(extra);
                         if candidate == 0 {
-                            raw_bits[mchan] += u64::from(extra);
+                            group.raw_bits[mchan] += u64::from(extra);
                         }
-                        counts[(candidate * 3 + mchan) * K_NUM_DC_CONTEXTS + context]
+                        group.counts[(candidate * 3 + mchan) * K_NUM_DC_CONTEXTS + context]
                             [symbol as usize] += 1;
                     }
                 }
                 offset = end;
+            }
+            group
+        });
+        let mut counts = try_vec![[0u32; ALPHABET_SIZE]; 6 * K_NUM_DC_CONTEXTS]?;
+        scratch.counts.as_flattened_mut().fill(0);
+        scratch.extra.fill(0);
+        let mut raw_bits = [0u64; 3];
+        for group in &per_group {
+            for (sum, &count) in scratch
+                .counts
+                .as_flattened_mut()
+                .iter_mut()
+                .zip(group.pooled.as_flattened())
+            {
+                *sum += count;
+            }
+            for (sum, &extra) in scratch.extra.iter_mut().zip(&group.extra) {
+                *sum += extra;
+            }
+            for (sum, &count) in counts
+                .as_flattened_mut()
+                .iter_mut()
+                .zip(group.counts.as_flattened())
+            {
+                *sum += count;
+            }
+            for (sum, &bits) in raw_bits.iter_mut().zip(&group.raw_bits) {
+                *sum += bits;
             }
         }
         let predictors = choose_dc_predictors_from_counts(scratch);
@@ -145,6 +186,7 @@ pub(super) fn refine_dc_rounding(
     cfl: CflFrame,
     compensate_b: bool,
     scratch: &mut DcPredictorScratch,
+    pool: &crate::thread_pool::ThreadPool,
 ) -> Result<(), EncodeError> {
     if groups
         .iter()
@@ -152,7 +194,7 @@ pub(super) fn refine_dc_rounding(
     {
         return Ok(());
     }
-    let (prices, predictors, base_prices) = Prices::new(groups, scratch)?;
+    let (prices, predictors, base_prices) = Prices::new(groups, scratch, pool)?;
     let inv: [f32; 3] =
         std::array::from_fn(|c| INV_DC_QUANT[c] * distp.scale_dc / distp.dc_step[c]);
     let factors = [
@@ -165,32 +207,29 @@ pub(super) fn refine_dc_rounding(
     let t = ((distp.distance - d0) / (d1 - d0)).clamp(0.0, 1.0);
     let lambda = DC_RDO_LAMBDA[0] + (DC_RDO_LAMBDA[1] - DC_RDO_LAMBDA[0]) * t;
     // Preserve luma: changing it also changes both chroma reconstruction
-    // targets. Chroma channels can be raced independently under the final Y.
-    let mut rounding = RoundingScratch::new();
+    // targets. The chroma planes are independent under the final Y and each
+    // group starts its own predictor state, so every plane of every group is
+    // refined as its own job; each plane is then accepted as a whole from
+    // its jobs' prices and errors, summed in group order.
+    let channels = [
+        (1usize, 0usize, lambda * DC_RDO_X_LAMBDA_SCALE),
+        (2, 2, lambda),
+    ];
     let group_sizes: Vec<usize> = groups
         .iter()
         .map(|dc| dc.quant_dc.plane(0).as_slice().len())
         .collect();
-    let mut previous = try_vec![0i16; group_sizes.iter().sum()]?;
-    let mut targets = try_vec![0.0f32; group_sizes.iter().copied().max().unwrap_or(0)]?;
-    let mut candidate_price = DcPlanePrice::default();
-    for ((mchan, c, lambda), base_price) in [(1, 0, lambda * DC_RDO_X_LAMBDA_SCALE), (2, 2, lambda)]
-        .into_iter()
-        .zip(base_prices)
-    {
-        let mut offset = 0;
+    let total: usize = group_sizes.iter().sum();
+    let mut previous = try_vec![0i16; 2 * total]?;
+    let mut targets = try_vec![0.0f32; 2 * total]?;
+    let mut base_error = [0.0f64; 2];
+    for (ci, &(_, c, _)) in channels.iter().enumerate() {
+        let mut offset = ci * total;
         for (dc, &len) in groups.iter().zip(&group_sizes) {
-            previous[offset..offset + len].copy_from_slice(dc.quant_dc.plane(c).as_slice());
+            let previous = &mut previous[offset..offset + len];
+            let targets = &mut targets[offset..offset + len];
             offset += len;
-        }
-        candidate_price.clear();
-        let (mut base_error, mut candidate_error) = (0.0f64, 0.0f64);
-        let mut offset = 0;
-        for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
-            let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
-            let previous = &previous[offset..offset + len];
-            let targets = &mut targets[..len];
-            offset += len;
+            previous.copy_from_slice(dc.quant_dc.plane(c).as_slice());
             let source = match c {
                 0 => dc.source_dc_x.as_ref().unwrap(),
                 1 => dc.source_dc_y.as_ref().unwrap(),
@@ -207,27 +246,76 @@ pub(super) fn refine_dc_rounding(
                     *target = compensation.adjust(*target, sy, yq);
                 }
             }
-            base_error += targets
+            base_error[ci] += targets
                 .iter()
-                .zip(previous)
+                .zip(previous.iter())
                 .map(|(&t, &q)| f64::from(t - f32::from(q)).powi(2))
                 .sum::<f64>();
-            refine_channel_with_scratch(
-                dc.quant_dc.plane_mut(c).as_mut_slice(),
-                targets,
+        }
+    }
+    struct Job<'a> {
+        levels: &'a mut [i16],
+        targets: &'a [f32],
+        w: usize,
+        h: usize,
+        mchan: usize,
+        lambda: f32,
+        price: DcPlanePrice,
+    }
+    let mut jobs = Vec::with_capacity(2 * groups.len());
+    let mut offset = 0;
+    for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
+        let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+        let [x_plane, _, b_plane] = dc.quant_dc.all_planes_mut();
+        for (ci, (plane, &(mchan, _, lambda))) in
+            [x_plane, b_plane].into_iter().zip(&channels).enumerate()
+        {
+            let start = ci * total + offset;
+            jobs.push(Job {
+                levels: plane.as_mut_slice(),
+                targets: &targets[start..start + len],
                 w,
                 h,
                 mchan,
-                &predictors,
-                &prices,
                 lambda,
-                &mut rounding,
-                |_, weighted| candidate_price.add_token(weighted),
-            );
-            let levels = dc.quant_dc.plane(c).as_slice();
-            candidate_error += targets
+                price: DcPlanePrice::default(),
+            });
+        }
+        offset += len;
+    }
+    pool.for_each_mut(&mut jobs, |_, job| {
+        let Job {
+            levels,
+            targets,
+            w,
+            h,
+            mchan,
+            lambda,
+            price,
+        } = job;
+        refine_channel_with_scratch(
+            levels,
+            targets,
+            *w,
+            *h,
+            *mchan,
+            &predictors,
+            &prices,
+            *lambda,
+            &mut RoundingScratch::new(),
+            |_, weighted| price.add_token(weighted),
+        );
+    });
+    let mut candidate_price = DcPlanePrice::default();
+    for (ci, (&(_, _, lambda), base_price)) in channels.iter().zip(base_prices).enumerate() {
+        candidate_price.clear();
+        let mut candidate_error = 0.0f64;
+        for job in jobs.iter().skip(ci).step_by(2) {
+            candidate_price.merge(&job.price);
+            candidate_error += job
+                .targets
                 .iter()
-                .zip(levels)
+                .zip(job.levels.iter())
                 .map(|(&t, &q)| f64::from(t - f32::from(q)).powi(2))
                 .sum::<f64>();
         }
@@ -237,14 +325,12 @@ pub(super) fn refine_dc_rounding(
         let (base_bits, candidate_bits) = (base_price.bits(), candidate_price.bits());
         let lambda = f64::from(lambda);
         if candidate_bits + DC_RDO_MIN_GAIN_BITS >= base_bits
-            || candidate_error + lambda * candidate_bits >= base_error + lambda * base_bits
+            || candidate_error + lambda * candidate_bits >= base_error[ci] + lambda * base_bits
         {
-            let mut offset = 0;
-            for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
-                dc.quant_dc
-                    .plane_mut(c)
-                    .as_mut_slice()
-                    .copy_from_slice(&previous[offset..offset + len]);
+            let mut offset = ci * total;
+            for job in jobs.iter_mut().skip(ci).step_by(2) {
+                let len = job.levels.len();
+                job.levels.copy_from_slice(&previous[offset..offset + len]);
                 offset += len;
             }
         }
@@ -284,14 +370,29 @@ struct TrellisNode {
     update: WpUpdate,
 }
 
-/// Older columns only need the chosen level and predecessor for traceback.
+/// Older columns keep the chosen level and predecessor for traceback, and
+/// the winning transition's model values and predictor record, so the row
+/// commits without predicting its chosen path again.
 #[derive(Clone, Copy)]
 struct TrellisStep {
     level: i16,
     back: u16,
+    context: u32,
+    bits: f32,
+    prediction: i64,
+    weighted: i64,
+    update: WpUpdate,
 }
 
-type TrellisPrediction = (i64, usize, WpPrediction, f32);
+/// One surviving path's prediction into the current block.
+#[derive(Clone, Copy)]
+struct TrellisPrediction {
+    prediction: i64,
+    weighted: i64,
+    context: u32,
+    wp: WpPrediction,
+    path_cost: f32,
+}
 
 struct RoundingScratch {
     wp: WpState,
@@ -301,6 +402,7 @@ struct RoundingScratch {
     column: Vec<TrellisNode>,
     history: Vec<TrellisStep>,
     starts: Vec<usize>,
+    path: Vec<usize>,
     predictions: Vec<TrellisPrediction>,
 }
 
@@ -314,8 +416,35 @@ impl RoundingScratch {
             column: Vec::new(),
             history: Vec::new(),
             starts: Vec::new(),
+            path: Vec::new(),
             predictions: Vec::new(),
         }
+    }
+}
+
+/// Trace the cheapest finished path of a row back through `history`, writing
+/// its levels and leaving each column's step index in `path`.
+fn trace_row(
+    levels: &mut [i16],
+    previous: &[TrellisNode],
+    history: &[TrellisStep],
+    starts: &[usize],
+    path: &mut Vec<usize>,
+) {
+    let w = starts.len();
+    path.clear();
+    path.resize(w, 0);
+    let mut best = previous
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
+        .unwrap()
+        .0;
+    for x in (0..w).rev() {
+        let step = history[starts[x] + best];
+        levels[x] = step.level;
+        path[x] = starts[x] + best;
+        best = usize::from(step.back);
     }
 }
 
@@ -378,6 +507,7 @@ fn refine_channel_with_scratch(
         column,
         history,
         starts,
+        path,
         predictions,
     } = scratch;
     wp.reset(w, WpParams::DEFAULT);
@@ -446,19 +576,25 @@ fn refine_channel_with_scratch(
                     north
                 };
                 let nn = if y > 1 { get(x, y - 2) } else { north };
-                let prediction = wp.predict(x, y, north, west, ne, nw, nn);
+                let weighted = wp.predict(x, y, north, west, ne, nw, nn);
                 let prop = (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX)
                     as usize;
                 let context = K_GRADIENT_CONTEXT_LUT[prop] as usize;
                 let prediction = if predictors[context] {
                     (north + west - nw).clamp(north.min(west), north.max(west))
                 } else {
-                    prediction
+                    weighted
                 };
                 if target.is_finite() {
                     push(column, prediction);
                 }
-                predictions.push((prediction, context, wp.last_prediction(), path_cost));
+                predictions.push(TrellisPrediction {
+                    prediction,
+                    weighted,
+                    context: context as u32,
+                    wp: wp.last_prediction(),
+                    path_cost,
+                });
             }
             for node in column.iter_mut() {
                 let error = if forced {
@@ -468,12 +604,13 @@ fn refine_channel_with_scratch(
                 };
                 let distortion = error * error;
                 let mut winning_prediction = None;
-                for (back, &(prediction, context, _, path_cost)) in predictions.iter().enumerate() {
+                for (back, p) in predictions.iter().enumerate() {
                     let (symbol, extra, _) =
-                        uint_encode(pack_signed((i64::from(node.level) - prediction) as i32));
-                    let cost = path_cost
+                        uint_encode(pack_signed((i64::from(node.level) - p.prediction) as i32));
+                    let cost = p.path_cost
                         + distortion
-                        + lambda * (channel_bits[context][symbol as usize] + extra as f32);
+                        + lambda
+                            * (channel_bits[p.context as usize][symbol as usize] + extra as f32);
                     if cost < node.cost {
                         node.cost = cost;
                         node.back = back as u16;
@@ -481,63 +618,37 @@ fn refine_channel_with_scratch(
                     }
                 }
                 // Only the winner needs an update; losing transitions never
-                // contribute predictor state to a later column.
-                if let Some(back) = winning_prediction {
-                    node.update = WpState::update_for(predictions[back].2, i64::from(node.level));
-                }
+                // contribute predictor state to a later column. Every
+                // transition has a finite cost, so a winner always exists.
+                let winner = predictions[winning_prediction.unwrap_or_default()];
+                node.update = WpState::update_for(winner.wp, i64::from(node.level));
                 history.push(TrellisStep {
                     level: node.level,
                     back: node.back,
+                    context: winner.context,
+                    bits: 0.0,
+                    prediction: winner.prediction,
+                    weighted: winner.weighted,
+                    update: node.update,
                 });
             }
             std::mem::swap(older, previous);
             std::mem::swap(previous, column);
         }
-        let mut best = previous
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
-            .unwrap()
-            .0;
-        for x in (0..w).rev() {
-            let step = history[starts[x] + best];
-            levels[y * w + x] = step.level;
-            best = usize::from(step.back);
-        }
-        // Commit the row through the real predictor so the rows below, and
-        // the emitted tokens, see exactly what the DC coder will.
+        trace_row(&mut levels[y * w..][..w], previous, history, starts, path);
+        // Commit the row as the real predictor would: each chosen step was
+        // predicted over its own path's state, which is the sequential state
+        // of the chosen row, so its record and tokens are what the DC coder
+        // sees for the rows below.
         wp.restore_row_base(y, base);
-        for x in 0..w {
-            let get = |x: usize, y: usize| i64::from(levels[y * w + x]);
-            let west = if x > 0 { get(x - 1, y) } else { 0 };
-            let north = if y > 0 { get(x, y - 1) } else { west };
-            let west = if x == 0 { north } else { west };
-            let ne = if y > 0 {
-                get((x + 1).min(w - 1), y - 1)
-            } else {
-                west
-            };
-            let nw = if y > 0 && x > 0 {
-                get(x - 1, y - 1)
-            } else {
-                north
-            };
-            let nn = if y > 1 { get(x, y - 2) } else { north };
-            let weighted = wp.predict(x, y, north, west, ne, nw, nn);
-            let prop =
-                (K_GRAD_RANGE_MID + wp.wp_prop).clamp(K_GRAD_RANGE_MIN, K_GRAD_RANGE_MAX) as usize;
-            let context = K_GRADIENT_CONTEXT_LUT[prop] as usize;
-            let prediction = if predictors[context] {
-                (north + west - nw).clamp(north.min(west), north.max(west))
-            } else {
-                weighted
-            };
-            let level = get(x, y);
+        for (x, &step) in path.iter().enumerate() {
+            let step = history[step];
+            let level = i64::from(step.level);
             emit(
-                Token::new(context as u32, pack_signed((level - prediction) as i32)),
-                Token::new(context as u32, pack_signed((level - weighted) as i32)),
+                Token::new(step.context, pack_signed((level - step.prediction) as i32)),
+                Token::new(step.context, pack_signed((level - step.weighted) as i32)),
             );
-            wp.update(level, x, y);
+            wp.install_update(step.update, x, y);
         }
     }
 }
@@ -785,10 +896,40 @@ struct RefPlane<'a> {
     width: usize,
 }
 
+/// The decoder's reference-plane properties of a pixel (`walk_channel_ma`'s
+/// rules), which depend on the previously coded planes only; they stay in
+/// `props` while [`learned_props`] fills the rest for each path.
+#[inline]
+fn learned_ref_props(
+    x: usize,
+    y: usize,
+    refs: &[RefPlane<'_>],
+    props: &mut [i32; crate::ma_tree::NUM_MA_PROPS],
+) {
+    for (r, out) in refs.iter().zip(props[16..].as_chunks_mut::<4>().0) {
+        let row = &r.pixels[y * r.width..];
+        let v = i64::from(row[x]);
+        let rl = if x > 0 { i64::from(row[x - 1]) } else { 0 };
+        let (rt, rtl) = if y > 0 {
+            let up = &r.pixels[(y - 1) * r.width..];
+            (
+                i64::from(up[x]),
+                if x > 0 { i64::from(up[x - 1]) } else { rl },
+            )
+        } else {
+            (rl, rl)
+        };
+        let g = (rl + rt - rtl).clamp(rl.min(rt), rl.max(rt));
+        let d = v - g;
+        *out = [v.abs() as i32, v as i32, d.abs() as i32, d as i32];
+    }
+}
+
 /// The decoder's property vector of a pixel (`walk_channel_ma`'s rules)
 /// from its path-dependent west values and the finished rows above, plus
 /// the predictor neighbors. `west`/`west_west` are the levels at x−1 and
-/// x−2 (0 where absent), `above(x)` / `above2(x)` the rows y−1 / y−2.
+/// x−2 (0 where absent), `above(x)` / `above2(x)` the rows y−1 / y−2. The
+/// reference-plane properties are [`learned_ref_props`]'s.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn learned_props(
@@ -802,7 +943,6 @@ fn learned_props(
     west: i64,
     west_west: i64,
     wp_prop: i64,
-    refs: &[RefPlane<'_>],
     props: &mut [i32; crate::ma_tree::NUM_MA_PROPS],
 ) -> crate::lossless::PredictorNeighbors {
     let north = if y > 0 { above(x) } else { west };
@@ -852,23 +992,6 @@ fn learned_props(
     props[13] = (north - top_top) as i32;
     props[14] = (left - left_left) as i32;
     props[15] = wp_prop as i32;
-    for (r, out) in refs.iter().zip(props[16..].as_chunks_mut::<4>().0) {
-        let row = &r.pixels[y * r.width..];
-        let v = i64::from(row[x]);
-        let rl = if x > 0 { i64::from(row[x - 1]) } else { 0 };
-        let (rt, rtl) = if y > 0 {
-            let up = &r.pixels[(y - 1) * r.width..];
-            (
-                i64::from(up[x]),
-                if x > 0 { i64::from(up[x - 1]) } else { rl },
-            )
-        } else {
-            (rl, rl)
-        };
-        let g = (rl + rt - rtl).clamp(rl.min(rt), rl.max(rt));
-        let d = v - g;
-        *out = [v.abs() as i32, v as i32, d.abs() as i32, d as i32];
-    }
     crate::lossless::PredictorNeighbors {
         left,
         top: north,
@@ -889,6 +1012,7 @@ pub(super) fn refine_dc_rounding_learned(
     cfl: CflFrame,
     compensate_b: bool,
     rates: &LearnedDcRates<'_>,
+    pool: &crate::thread_pool::ThreadPool,
 ) -> Result<bool, EncodeError> {
     if groups
         .iter()
@@ -910,34 +1034,32 @@ pub(super) fn refine_dc_rounding_learned(
     let [d0, d1] = DC_RDO_LAMBDA_DISTANCE;
     let t = ((distp.distance - d0) / (d1 - d0)).clamp(0.0, 1.0);
     let lambda = DC_RDO_LAMBDA[0] + (DC_RDO_LAMBDA[1] - DC_RDO_LAMBDA[0]) * t;
-    let mut rounding = RoundingScratch::new();
     let group_sizes: Vec<usize> = groups
         .iter()
         .map(|dc| dc.quant_dc.plane(0).as_slice().len())
         .collect();
-    let mut previous = try_vec![0i16; group_sizes.iter().sum()]?;
-    let mut targets = try_vec![0.0f32; group_sizes.iter().copied().max().unwrap_or(0)]?;
+    let total: usize = group_sizes.iter().sum();
+    let mut previous = try_vec![0i16; total]?;
+    let mut targets = try_vec![0.0f32; total]?;
     let mut changed = false;
     // Modular channel order Y, X, B: X references Y, B references X and Y.
-    // Luma first, so the chroma targets below see the moved Y.
+    // Luma first, so the chroma targets below see the moved Y. Within a
+    // plane, each group's base price and its refinement are independent
+    // jobs; the plane is accepted as a whole from their results, summed in
+    // group order.
     for (mchan, c, lambda) in [
         (0usize, 1usize, lambda * DC_RDO_LUMA_LAMBDA_SCALE),
         (1, 0, lambda * DC_RDO_X_LAMBDA_SCALE),
         (2, 2, lambda),
     ] {
+        let mut base_error = 0.0f64;
+        let mut planes: Vec<[Vec<i32>; 2]> = Vec::with_capacity(groups.len());
         let mut offset = 0;
         for (dc, &len) in groups.iter().zip(&group_sizes) {
-            previous[offset..offset + len].copy_from_slice(dc.quant_dc.plane(c).as_slice());
+            let previous = &mut previous[offset..offset + len];
+            let targets = &mut targets[offset..offset + len];
             offset += len;
-        }
-        let (mut base_error, mut candidate_error) = (0.0f64, 0.0f64);
-        let (mut base_bits, mut candidate_bits) = (0.0f64, 0.0f64);
-        let mut offset = 0;
-        for (group, (dc, &len)) in groups.iter_mut().zip(&group_sizes).enumerate() {
-            let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
-            let previous = &previous[offset..offset + len];
-            let targets = &mut targets[..len];
-            offset += len;
+            previous.copy_from_slice(dc.quant_dc.plane(c).as_slice());
             let source = match c {
                 0 => dc.source_dc_x.as_ref().unwrap(),
                 1 => dc.source_dc_y.as_ref().unwrap(),
@@ -956,57 +1078,108 @@ pub(super) fn refine_dc_rounding_learned(
             }
             base_error += targets
                 .iter()
-                .zip(previous)
+                .zip(previous.iter())
                 .map(|(&t, &q)| f64::from(t - f32::from(q)).powi(2))
                 .sum::<f64>();
             let to_i32 = |p: &[i16]| -> Vec<i32> { p.iter().map(|&v| i32::from(v)).collect() };
-            let y_plane = to_i32(dc.quant_dc.plane(1).as_slice());
-            let x_plane = to_i32(dc.quant_dc.plane(0).as_slice());
-            let ref_planes: Vec<RefPlane<'_>> = match c {
-                1 => Vec::new(),
-                0 => vec![RefPlane {
-                    pixels: &y_plane,
-                    width: w,
-                }],
-                _ => vec![
-                    RefPlane {
-                        pixels: &x_plane,
-                        width: w,
-                    },
-                    RefPlane {
-                        pixels: &y_plane,
-                        width: w,
-                    },
-                ],
-            };
+            planes.push([
+                to_i32(dc.quant_dc.plane(0).as_slice()),
+                to_i32(dc.quant_dc.plane(1).as_slice()),
+            ]);
+        }
+        let ref_planes: Vec<Vec<RefPlane<'_>>> = groups
+            .iter()
+            .zip(&planes)
+            .map(|(dc, [x_plane, y_plane])| {
+                let width = dc.quant_dc.xsize();
+                let x_plane = RefPlane {
+                    pixels: x_plane,
+                    width,
+                };
+                let y_plane = RefPlane {
+                    pixels: y_plane,
+                    width,
+                };
+                match c {
+                    1 => Vec::new(),
+                    0 => vec![y_plane],
+                    _ => vec![x_plane, y_plane],
+                }
+            })
+            .collect();
+        struct Job<'a> {
+            /// Price the plane as it is (`levels` is its copy) instead of
+            /// refining it.
+            base: bool,
+            levels: &'a mut [i16],
+            targets: &'a [f32],
+            w: usize,
+            h: usize,
+            stream: i32,
+            refs: &'a [RefPlane<'a>],
+            bits: f64,
+        }
+        let mut jobs = Vec::with_capacity(2 * groups.len());
+        let mut rest: &mut [i16] = &mut previous;
+        let mut offset = 0;
+        for (group, ((dc, &len), refs)) in groups
+            .iter_mut()
+            .zip(&group_sizes)
+            .zip(&ref_planes)
+            .enumerate()
+        {
+            let (w, h) = (dc.quant_dc.xsize(), dc.quant_dc.ysize());
+            let (previous, tail) = rest.split_at_mut(len);
+            rest = tail;
+            let targets = &targets[offset..offset + len];
+            offset += len;
             let stream = 1 + group as i32;
-            base_bits += learned_plane_bits(
-                previous,
-                w,
-                h,
-                mchan as i32,
-                stream,
-                &ref_planes,
-                rates,
-                &cost,
-            );
-            candidate_bits += refine_channel_learned(
-                dc.quant_dc.plane_mut(c).as_mut_slice(),
-                targets,
-                w,
-                h,
-                mchan as i32,
-                stream,
-                &ref_planes,
-                rates,
-                &cost,
-                lambda,
-                &mut rounding,
-            );
-            let levels = dc.quant_dc.plane(c).as_slice();
-            candidate_error += targets
+            for (base, levels) in [
+                (true, previous),
+                (false, dc.quant_dc.plane_mut(c).as_mut_slice()),
+            ] {
+                jobs.push(Job {
+                    base,
+                    levels,
+                    targets,
+                    w,
+                    h,
+                    stream,
+                    refs,
+                    bits: 0.0,
+                });
+            }
+        }
+        pool.for_each_mut(&mut jobs, |_, job| {
+            let chan = mchan as i32;
+            job.bits = if job.base {
+                learned_plane_bits(
+                    job.levels, job.w, job.h, chan, job.stream, job.refs, rates, &cost,
+                )
+            } else {
+                refine_channel_learned(
+                    job.levels,
+                    job.targets,
+                    job.w,
+                    job.h,
+                    chan,
+                    job.stream,
+                    job.refs,
+                    rates,
+                    &cost,
+                    lambda,
+                    &mut RoundingScratch::new(),
+                )
+            };
+        });
+        let (mut base_bits, mut candidate_bits, mut candidate_error) = (0.0f64, 0.0f64, 0.0f64);
+        for [base, refined] in jobs.as_chunks::<2>().0 {
+            base_bits += base.bits;
+            candidate_bits += refined.bits;
+            candidate_error += refined
+                .targets
                 .iter()
-                .zip(levels)
+                .zip(refined.levels.iter())
                 .map(|(&t, &q)| f64::from(t - f32::from(q)).powi(2))
                 .sum::<f64>();
         }
@@ -1014,13 +1187,8 @@ pub(super) fn refine_dc_rounding_learned(
         if candidate_bits + DC_RDO_MIN_GAIN_BITS >= base_bits
             || candidate_error + lambda * candidate_bits >= base_error + lambda * base_bits
         {
-            let mut offset = 0;
-            for (dc, &len) in groups.iter_mut().zip(&group_sizes) {
-                dc.quant_dc
-                    .plane_mut(c)
-                    .as_mut_slice()
-                    .copy_from_slice(&previous[offset..offset + len]);
-                offset += len;
+            for [base, refined] in jobs.as_chunks_mut::<2>().0 {
+                refined.levels.copy_from_slice(base.levels);
             }
         } else {
             changed = true;
@@ -1072,9 +1240,9 @@ fn learned_plane_bits(
             let nw = if x > 0 && y > 0 { above(x - 1) } else { left };
             let nn = if y > 1 { above2(x) } else { north };
             let wp_pred = wp.predict(x, y, north, left, ne, nw, nn);
+            learned_ref_props(x, y, refs, &mut props);
             let n = learned_props(
-                chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, refs,
-                &mut props,
+                chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, &mut props,
             );
             let (node, pred) = rates.tree.lookup(&props);
             let prediction = crate::lossless::predictor_value(pred, n, wp_pred)
@@ -1120,6 +1288,7 @@ fn refine_channel_learned(
         column,
         history,
         starts,
+        path,
         predictions,
     } = scratch;
     wp.reset(w, rates.wp_params);
@@ -1164,6 +1333,7 @@ fn refine_channel_learned(
                 }
             }
             predictions.clear();
+            learned_ref_props(x, y, refs, &mut props);
             for s in 0..previous.len().max(1) {
                 let (west, west_west, path_cost) = if x > 0 {
                     let node = previous[s];
@@ -1188,8 +1358,7 @@ fn refine_channel_learned(
                 let nn = if y > 1 { above2(x) } else { north };
                 let wp_pred = wp.predict(x, y, north, left, ne, nw, nn);
                 let n = learned_props(
-                    chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, refs,
-                    &mut props,
+                    chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, &mut props,
                 );
                 let (node, pred) = rates.tree.lookup(&props);
                 let prediction = crate::lossless::predictor_value(pred, n, wp_pred)
@@ -1197,12 +1366,13 @@ fn refine_channel_learned(
                 if target.is_finite() {
                     push(column, prediction);
                 }
-                predictions.push((
+                predictions.push(TrellisPrediction {
                     prediction,
-                    rates.leaf_ctx[node as usize] as usize,
-                    wp.last_prediction(),
+                    weighted: wp_pred,
+                    context: rates.leaf_ctx[node as usize],
+                    wp: wp.last_prediction(),
                     path_cost,
-                ));
+                });
             }
             for node in column.iter_mut() {
                 let error = if forced {
@@ -1212,77 +1382,42 @@ fn refine_channel_learned(
                 };
                 let distortion = error * error;
                 let mut winning_prediction = None;
-                for (back, &(prediction, ctx, _, path_cost)) in predictions.iter().enumerate() {
+                let mut winning_bits = 0.0;
+                for (back, p) in predictions.iter().enumerate() {
                     let bits =
-                        cost.bits(rates.code, ctx as u32, i64::from(node.level) - prediction);
-                    let c = path_cost + distortion + lambda * bits;
+                        cost.bits(rates.code, p.context, i64::from(node.level) - p.prediction);
+                    let c = p.path_cost + distortion + lambda * bits;
                     if c < node.cost {
                         node.cost = c;
                         node.back = back as u16;
                         winning_prediction = Some(back);
+                        winning_bits = bits;
                     }
                 }
-                if let Some(back) = winning_prediction {
-                    node.update = WpState::update_for(predictions[back].2, i64::from(node.level));
-                }
+                // Every transition has a finite cost, so a winner always exists.
+                let winner = predictions[winning_prediction.unwrap_or_default()];
+                node.update = WpState::update_for(winner.wp, i64::from(node.level));
                 history.push(TrellisStep {
                     level: node.level,
                     back: node.back,
+                    context: winner.context,
+                    bits: winning_bits,
+                    prediction: winner.prediction,
+                    weighted: winner.weighted,
+                    update: node.update,
                 });
             }
             std::mem::swap(older, previous);
             std::mem::swap(previous, column);
         }
-        let mut best = previous
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.cost.total_cmp(&b.cost))
-            .unwrap()
-            .0;
-        for x in (0..w).rev() {
-            let step = history[starts[x] + best];
-            levels[y * w + x] = step.level;
-            best = usize::from(step.back);
-        }
-        // Commit the row through the real predictor and model.
+        trace_row(&mut levels[y * w..][..w], previous, history, starts, path);
+        // Commit the row as the real predictor and model would (see
+        // `refine_channel_with_scratch`).
         wp.restore_row_base(y, base);
-        for x in 0..w {
-            let above = |x: usize| i64::from(levels[(y - 1) * w + x]);
-            let above2 = |x: usize| i64::from(levels[(y - 2) * w + x]);
-            let west = if x > 0 {
-                i64::from(levels[y * w + x - 1])
-            } else {
-                0
-            };
-            let west_west = if x > 1 {
-                i64::from(levels[y * w + x - 2])
-            } else {
-                0
-            };
-            let north = if y > 0 { above(x) } else { west };
-            let left = if x > 0 { west } else { north };
-            let ne = if x + 1 < w && y > 0 {
-                above(x + 1)
-            } else {
-                north
-            };
-            let nw = if x > 0 && y > 0 { above(x - 1) } else { left };
-            let nn = if y > 1 { above2(x) } else { north };
-            let wp_pred = wp.predict(x, y, north, left, ne, nw, nn);
-            let n = learned_props(
-                chan, stream, x, y, w, &above, &above2, west, west_west, wp.wp_prop, refs,
-                &mut props,
-            );
-            let (node, pred) = rates.tree.lookup(&props);
-            let prediction = crate::lossless::predictor_value(pred, n, wp_pred)
-                + i64::from(rates.offsets[node as usize]);
-            let level = i64::from(levels[y * w + x]);
-            total_bits += f64::from(cost.bits(
-                rates.code,
-                rates.leaf_ctx[node as usize],
-                level - prediction,
-            ));
-            wp.update(level, x, y);
+        for (x, &step) in path.iter().enumerate() {
+            let step = history[step];
+            total_bits += f64::from(step.bits);
+            wp.install_update(step.update, x, y);
         }
     }
     total_bits
@@ -1337,7 +1472,12 @@ mod tests {
             .unzip();
         let mut scratch = DcPredictorScratch::default();
         let expected = super::super::dc_tokens::choose_dc_predictors(&wp, &grad, &mut scratch);
-        let (prices, predictors, base_prices) = Prices::new(&groups, &mut scratch).unwrap();
+        let (prices, predictors, base_prices) = Prices::new(
+            &groups,
+            &mut scratch,
+            &crate::thread_pool::ThreadPool::new(2),
+        )
+        .unwrap();
         assert_eq!(predictors, expected);
         assert!(expected.iter().any(|&gradient| gradient));
         assert!(expected.iter().any(|&gradient| !gradient));
@@ -1373,7 +1513,8 @@ mod tests {
             assert_eq!(actual.raw_bits, expected.raw_bits);
             assert_eq!(actual.bits().to_bits(), expected.bits().to_bits());
         }
-        let (empty_prices, empty_predictors, _) = Prices::new(&[], &mut scratch).unwrap();
+        let (empty_prices, empty_predictors, _) =
+            Prices::new(&[], &mut scratch, &crate::thread_pool::ThreadPool::new(2)).unwrap();
         assert_eq!(empty_predictors, DC_PREDICTOR_WEIGHTED);
         assert!(empty_prices.bits.iter().flatten().all(|&b| b == 7.0));
     }
@@ -1769,6 +1910,7 @@ mod tests {
             CflFrame::XYB,
             false,
             &mut DcPredictorScratch::default(),
+            &crate::thread_pool::ThreadPool::new(2),
         )
         .unwrap();
         assert!(
@@ -1802,6 +1944,7 @@ mod tests {
             CflFrame::XYB,
             false,
             &mut DcPredictorScratch::default(),
+            &crate::thread_pool::ThreadPool::new(2),
         )
         .unwrap();
         assert!(

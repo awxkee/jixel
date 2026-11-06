@@ -1366,15 +1366,15 @@ pub fn encode_image(
     // The ink plan serves both layer paths: the ink stack codes it, and the
     // vector race reads its glyph-text flag.
     let layers = config.coding_transform == CodingTransform::Xyb && !config.progressive_dc;
-    let ink_candidates = (layers
+    let ink_pool = (layers
         && width * height >= 64 * 64
         && (config.ink_layer || (config.vector_layers && config.patches)))
-        .then(|| {
-            let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
-            crate::ink_layer::InkCandidates::new_fast(input, None, width, height, &pool)
-        })
-        .flatten();
-    let ink_plan = ink_candidates.and_then(|candidates| candidates.select(config.distance));
+        .then(|| crate::thread_pool::ThreadPool::new_lossless(config.num_threads));
+    let ink_plan = ink_pool.as_ref().and_then(|pool| {
+        crate::ink_layer::InkCandidates::new_fast(input, None, width, height, pool)
+            .and_then(|candidates| candidates.select(config.distance, pool))
+    });
+    drop(ink_pool);
     let plain_encode = || {
         let mut plain_config = config.clone();
         plain_config.ink_layer = false;
@@ -2047,12 +2047,17 @@ pub fn encode_image_with_alpha(
         let AlphaPlane::U8(alpha_bytes) = &alpha else {
             unreachable!()
         };
-        let candidates = {
-            let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
-            crate::ink_layer::InkCandidates::new_fast(&rgb, Some(alpha_bytes), width, height, &pool)
-        };
+        let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+        let candidates = crate::ink_layer::InkCandidates::new_fast(
+            &rgb,
+            Some(alpha_bytes),
+            width,
+            height,
+            &pool,
+        );
         if let Some(candidates) = candidates {
-            let plan = candidates.select(config.distance);
+            let plan = candidates.select(config.distance, &pool);
+            drop(pool);
             let budget = crate::vector_layers::vardct_bytes(&rgb, width, height, config.distance);
             drop(rgb);
             return select_ink_layered(plan, width, height, config, Some(&alpha), budget, || {
@@ -3964,7 +3969,7 @@ mod encode_smoke_tests {
         for (distance, accepted) in [(0.6, false), (1.0, true)] {
             let plan = crate::ink_layer::InkCandidates::new_fast(&rgb, None, 256, 256, &pool)
                 .unwrap()
-                .select(distance)
+                .select(distance, &pool)
                 .unwrap();
             assert_eq!(plan.inks.len(), 16);
             let config = EncodeConfig::default()

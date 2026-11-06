@@ -388,10 +388,12 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
     _rate_log2_lut: &RateLog2Lut,
     scan_pos: &[u32],
 ) -> f32 {
+    use super::ac_strategy::{SmallLevelIndex, SmallLevelTables};
     let n = width
         .checked_mul(height)
         .expect("coefficient size overflow");
-    assert!(width.is_multiple_of(4) && half.is_multiple_of(4));
+    // Two vectors per step on the rate path; `half` is a vector boundary.
+    assert!(width.is_multiple_of(8) && half.is_multiple_of(4));
     assert!(coeff.len() >= n && inv.len() >= n && matrix.len() >= n && coeff_error.len() >= n);
     assert!(!COMPUTE_RATE || scan_pos.len() >= n);
     let scale = vdupq_n_f32(quant_scale);
@@ -402,6 +404,67 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
     let mut nonzero_acc = vdupq_n_u32(0);
     let mut magnitude_bits = vdupq_n_f32(0.0);
     let mut scan_acc = vdupq_n_u32(0);
+    if !COMPUTE_RATE {
+        // Without the rate there is nothing to skip: the branch-free
+        // one-vector loop is the fastest shape for this path.
+        for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
+            .chunks_exact(width)
+            .zip(inv.chunks_exact(width))
+            .zip(matrix.chunks_exact(width))
+            .zip(coeff_error.chunks_exact_mut(width))
+            .take(height)
+            .enumerate()
+        {
+            let yfix = if y >= height / 2 { 2 } else { 0 };
+            for (chunk_x, (((coeff4, inv4), matrix4), error4)) in coeff_row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(inv_row.as_chunks::<4>().0.iter())
+                .zip(matrix_row.as_chunks::<4>().0.iter())
+                .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+                .enumerate()
+            {
+                let x = chunk_x * 4;
+                let threshold = vdupq_n_f32(if x >= half {
+                    thresholds[yfix + 1]
+                } else {
+                    thresholds[yfix]
+                });
+                let coeff_v = unsafe { vld1q_f32(coeff4.as_ptr()) };
+                let inv_v = unsafe { vld1q_f32(inv4.as_ptr()) };
+                let denominator = vmulq_f32(inv_v, scale);
+                let scaled = vmulq_f32(denominator, coeff_v);
+                let keep = vcgeq_f32(vabsq_f32(scaled), threshold);
+                // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
+                let quantized = vreinterpretq_f32_u32(vandq_u32(
+                    vreinterpretq_u32_f32(vrndaq_f32(scaled)),
+                    keep,
+                ));
+                let dequantized = if BIASED {
+                    super::ac_strategy::neon_dequantized_level_f32(quantized, bias)
+                } else {
+                    quantized
+                };
+                // Back to the coefficient domain by the forward matrix (no division).
+                let matrix_v = unsafe { vld1q_f32(matrix4.as_ptr()) };
+                let error = vmulq_f32(
+                    vsubq_f32(scaled, dequantized),
+                    vmulq_f32(matrix_v, inv_scale),
+                );
+                let active = if y < cy && x < cx {
+                    vcgeq_u32(
+                        vaddq_u32(vdupq_n_u32(x as u32), lanes),
+                        vdupq_n_u32(cx as u32),
+                    )
+                } else {
+                    all
+                };
+                unsafe { vst1q_f32(error4.as_mut_ptr(), vbslq_f32(active, error, zero)) };
+            }
+        }
+        return 0.0;
+    }
     for (y, (((coeff_row, inv_row), matrix_row), error_row)) in coeff
         .chunks_exact(width)
         .zip(inv.chunks_exact(width))
@@ -411,69 +474,97 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
         .enumerate()
     {
         let yfix = if y >= height / 2 { 2 } else { 0 };
-        for (chunk_x, (((coeff4, inv4), matrix4), error4)) in coeff_row
-            .as_chunks::<4>()
+        let llf_row = y < cy;
+        for (chunk_x, (((coeff8, inv8), matrix8), error8)) in coeff_row
+            .as_chunks::<8>()
             .0
             .iter()
-            .zip(inv_row.as_chunks::<4>().0.iter())
-            .zip(matrix_row.as_chunks::<4>().0.iter())
-            .zip(error_row.as_chunks_mut::<4>().0.iter_mut())
+            .zip(inv_row.as_chunks::<8>().0.iter())
+            .zip(matrix_row.as_chunks::<8>().0.iter())
+            .zip(error_row.as_chunks_mut::<8>().0.iter_mut())
             .enumerate()
         {
-            let x = chunk_x * 4;
-            let threshold = vdupq_n_f32(if x >= half {
-                thresholds[yfix + 1]
-            } else {
-                thresholds[yfix]
-            });
-            let coeff_v = unsafe { vld1q_f32(coeff4.as_ptr()) };
-            let inv_v = unsafe { vld1q_f32(inv4.as_ptr()) };
-            let denominator = vmulq_f32(inv_v, scale);
-            let scaled = vmulq_f32(denominator, coeff_v);
-            let keep = vcgeq_f32(vabsq_f32(scaled), threshold);
+            let x = chunk_x * 8;
+            let thr0 = vdupq_n_f32(thresholds[yfix + usize::from(x >= half)]);
+            let thr1 = vdupq_n_f32(thresholds[yfix + usize::from(x + 4 >= half)]);
+            let c0 = unsafe { vld1q_f32(coeff8.as_ptr()) };
+            let c1 = unsafe { vld1q_f32(coeff8.as_ptr().add(4)) };
+            let i0 = unsafe { vld1q_f32(inv8.as_ptr()) };
+            let i1 = unsafe { vld1q_f32(inv8.as_ptr().add(4)) };
+            let scaled0 = vmulq_f32(vmulq_f32(i0, scale), c0);
+            let scaled1 = vmulq_f32(vmulq_f32(i1, scale), c1);
+            let keep0 = vcgeq_f32(vabsq_f32(scaled0), thr0);
+            let keep1 = vcgeq_f32(vabsq_f32(scaled1), thr1);
             // Ties-away rounding, matching the real quantizer (vcvtaq/fast_round).
-            let quantized =
-                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
-            let dequantized = if BIASED {
-                super::ac_strategy::neon_dequantized_level_f32(quantized, bias)
-            } else {
-                quantized
-            };
-            // Back to the coefficient domain by the forward matrix (no division).
-            let matrix_v = unsafe { vld1q_f32(matrix4.as_ptr()) };
-            let error = vmulq_f32(
-                vsubq_f32(scaled, dequantized),
-                vmulq_f32(matrix_v, inv_scale),
-            );
-            let active = if y < cy && x < cx {
-                vcgeq_u32(
-                    vaddq_u32(vdupq_n_u32(x as u32), lanes),
-                    vdupq_n_u32(cx as u32),
+            let q0 =
+                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled0)), keep0));
+            let q1 =
+                vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled1)), keep1));
+            let absq0 = vabsq_f32(q0);
+            let absq1 = vabsq_f32(q1);
+            let (active0, active1) = if llf_row && x < cx {
+                let cxv = vdupq_n_u32(cx as u32);
+                let lane_x = vaddq_u32(vdupq_n_u32(x as u32), lanes);
+                (
+                    vcgeq_u32(lane_x, cxv),
+                    vcgeq_u32(vaddq_u32(lane_x, vdupq_n_u32(4)), cxv),
                 )
             } else {
-                all
+                (all, all)
             };
-            unsafe { vst1q_f32(error4.as_mut_ptr(), vbslq_f32(active, error, zero)) };
-            if COMPUTE_RATE {
-                let active_quantized = vbslq_f32(active, quantized, zero);
-                let absolute_q = vabsq_f32(active_quantized);
-                let nonzero_mask = vcgtq_f32(absolute_q, zero);
-                // Empty vectors add zero to every rate term. Keep counts
-                // lane-local and reduce once, as in the coefficient scorer.
-                if vmaxvq_u32(nonzero_mask) != 0 {
-                    nonzero_acc = vaddq_u32(nonzero_acc, vshrq_n_u32::<31>(nonzero_mask));
-                    magnitude_bits = vaddq_f32(
-                        magnitude_bits,
-                        vbslq_f32(nonzero_mask, neon_log2p1_f32(absolute_q), zero),
-                    );
-                    let sv = unsafe { vld1q_u32(scan_pos.as_ptr().add(y * width + x)) };
-                    scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv, nonzero_mask));
+            let rate0 = vandq_u32(vcgtq_f32(absq0, zero), active0);
+            let rate1 = vandq_u32(vcgtq_f32(absq1, zero), active1);
+            let m0 = unsafe { vld1q_f32(matrix8.as_ptr()) };
+            let m1 = unsafe { vld1q_f32(matrix8.as_ptr().add(4)) };
+            // Most pairs are all zeros: one lane-max per pair skips the
+            // dequantization and the rate for those (masked LLF lanes
+            // contribute nothing either way). The magnitude rate of a
+            // nonzero pair comes from the 16-entry table by the integer
+            // level, with the polynomial only for a level of 16 or more.
+            let (e0, e1) = if vmaxvq_u32(vorrq_u32(rate0, rate1)) != 0 {
+                let tables = SmallLevelTables::new(&bias);
+                let lk0 = SmallLevelIndex::new(absq0);
+                let lk1 = SmallLevelIndex::new(absq1);
+                let mut lg0 = tables.log2p1(lk0);
+                let mut lg1 = tables.log2p1(lk1);
+                if vmaxvq_u32(vorrq_u32(lk0.big, lk1.big)) != 0 {
+                    lg0 = vbslq_f32(lk0.big, neon_log2p1_f32(absq0), lg0);
+                    lg1 = vbslq_f32(lk1.big, neon_log2p1_f32(absq1), lg1);
                 }
-            }
+                // Lane-local sums in the one-vector order, reduced once.
+                nonzero_acc = vaddq_u32(nonzero_acc, vshrq_n_u32::<31>(rate0));
+                nonzero_acc = vaddq_u32(nonzero_acc, vshrq_n_u32::<31>(rate1));
+                magnitude_bits = vaddq_f32(magnitude_bits, vbslq_f32(rate0, lg0, zero));
+                magnitude_bits = vaddq_f32(magnitude_bits, vbslq_f32(rate1, lg1, zero));
+                let sv = unsafe { scan_pos.as_ptr().add(y * width + x) };
+                let sv0 = unsafe { vld1q_u32(sv) };
+                let sv1 = unsafe { vld1q_u32(sv.add(4)) };
+                scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv0, rate0));
+                scan_acc = vmaxq_u32(scan_acc, vandq_u32(sv1, rate1));
+                let dq0 = if BIASED {
+                    super::ac_strategy::neon_dequantized_level_f32(q0, bias)
+                } else {
+                    q0
+                };
+                let dq1 = if BIASED {
+                    super::ac_strategy::neon_dequantized_level_f32(q1, bias)
+                } else {
+                    q1
+                };
+                (vsubq_f32(scaled0, dq0), vsubq_f32(scaled1, dq1))
+            } else if BIASED {
+                // The biased level of every lane is +0 here: scaled - 0 = scaled.
+                (scaled0, scaled1)
+            } else {
+                // A level may be -0 here, which scaled - q folds to +0.
+                (vsubq_f32(scaled0, q0), vsubq_f32(scaled1, q1))
+            };
+            // Back to the coefficient domain by the forward matrix (no division).
+            let error0 = vmulq_f32(e0, vmulq_f32(m0, inv_scale));
+            let error1 = vmulq_f32(e1, vmulq_f32(m1, inv_scale));
+            unsafe { vst1q_f32(error8.as_mut_ptr(), vbslq_f32(active0, error0, zero)) };
+            unsafe { vst1q_f32(error8.as_mut_ptr().add(4), vbslq_f32(active1, error1, zero)) };
         }
-    }
-    if !COMPUTE_RATE {
-        return 0.0;
     }
     let nonzero = vaddvq_u32(nonzero_acc) as usize;
     let header = vgetq_lane_f32::<0>(neon_log2p1_f32(vsetq_lane_f32::<0>(

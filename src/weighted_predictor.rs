@@ -324,7 +324,18 @@ impl WpState {
 
     #[inline(always)]
     fn update_with_row(&mut self, val: i64, x: usize, row: WpRowOffsets) {
-        let update = Self::update_for(self.last_prediction(), val);
+        self.install_with_row(Self::update_for(self.last_prediction(), val), x, row);
+    }
+
+    /// Record `update` as row `y`'s state at `x`: what [`Self::update`]
+    /// writes for the sample whose `predict` produced `update`.
+    #[inline]
+    pub(crate) fn install_update(&mut self, update: WpUpdate, x: usize, y: usize) {
+        self.install_with_row(update, x, self.row_offsets(y));
+    }
+
+    #[inline(always)]
+    fn install_with_row(&mut self, update: WpUpdate, x: usize, row: WpRowOffsets) {
         self.check_slot(x, row);
         // SAFETY: `check_slot` bounds both slots.
         unsafe {
@@ -458,6 +469,7 @@ impl WpState {
 
     /// Compatibility API for callers that perform work between prediction and
     /// error-state update.
+    #[inline]
     pub(crate) fn predict(
         &mut self,
         x: usize,

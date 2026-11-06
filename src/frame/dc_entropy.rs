@@ -357,10 +357,20 @@ pub(crate) fn prepare_dc_entropy(
                         meta_learned,
                     )
                 };
-                let mut best = arms
-                    .into_iter()
-                    .map(|arm| price(arm, scratch))
-                    .min_by_key(|v| v.0)?;
+                // Arms price independently, one worker each, kept in arm
+                // order so ties resolve as in a serial pass.
+                let price_arms = |arms: Vec<MaDcArm>, scratch: &mut CoderScratch| {
+                    let mut slots: Vec<_> = arms.into_iter().map(|arm| (Some(arm), None)).collect();
+                    ctx.thread_pool
+                        .steal_for_each_mut(scratch, &mut slots, |_, slot, scratch| {
+                            slot.1 = slot.0.take().map(|arm| price(arm, scratch));
+                        });
+                    slots
+                        .into_iter()
+                        .filter_map(|slot| slot.1)
+                        .collect::<Vec<_>>()
+                };
+                let mut best = price_arms(arms, scratch).into_iter().min_by_key(|v| v.0)?;
                 let mut trees = trees;
                 // One EM step: leaves re-pick their predictor under the
                 // clustered histograms, and the winning arm's configuration
@@ -382,14 +392,14 @@ pub(crate) fn prepare_dc_entropy(
                         &repicked,
                         with_offsets,
                     );
-                    if let Some(better) = arms
+                    let arms = arms
                         .into_iter()
                         .filter(|arm| {
                             arm.meta_learned == best.7
                                 && arm.offsets.iter().any(|&o| o != 0) == with_offsets
                         })
-                        .map(|arm| price(arm, scratch))
-                        .min_by_key(|v| v.0)
+                        .collect();
+                    if let Some(better) = price_arms(arms, scratch).into_iter().min_by_key(|v| v.0)
                         && better.0 < best.0
                     {
                         best = better;
@@ -804,7 +814,7 @@ fn learn_planes(
     if stride > 1 && stride.is_multiple_of(2) {
         stride += 1;
     }
-    let samples = crate::lossless::sample_dc_planes(planes, stride, wp_params);
+    let samples = crate::lossless::sample_dc_planes(pool, planes, stride, wp_params);
     if samples.len() < 4 * MA_DC_MIN_NODE_SAMPLES {
         return None;
     }
@@ -860,7 +870,7 @@ fn learn_meta_parts(
     if stride > 1 && stride.is_multiple_of(2) {
         stride += 1;
     }
-    let samples = crate::lossless::sample_dc_planes(planes, stride, WpParams::DEFAULT);
+    let samples = crate::lossless::sample_dc_planes(pool, planes, stride, WpParams::DEFAULT);
     // Part of each sample: 0 CfL, 1 strategy row, 2 QF row, 3 EPF.
     let mut idx: [Vec<u32>; 4] = Default::default();
     for (i, row) in samples.props.iter().enumerate() {
@@ -1011,6 +1021,34 @@ pub(crate) fn learn_ma_dc_arm(
     Some((arms, trees))
 }
 
+/// Tokenize every stream through `tree`, one pool task per channel, joined
+/// per stream in channel order.
+fn tokenize_streams(
+    pool: &crate::thread_pool::ThreadPool,
+    scratch: &mut CoderScratch,
+    streams: &[crate::lossless::DcPlanes],
+    tree: &crate::ma_tree::LearnedTree,
+    leaf_ctx: &[u32],
+    wp_params: WpParams,
+) -> Vec<Vec<Token>> {
+    let channels = crate::lossless::dc_channels(streams);
+    let parts = pool.steal_map(scratch, channels.len(), |i, _scratch| {
+        let (g, c) = channels[i];
+        let (w, h) = streams[g].dims[c];
+        let mut out = Vec::with_capacity(w * h);
+        crate::lossless::tokenize_dc_channel(&streams[g], c, tree, leaf_ctx, wp_params, &mut out);
+        out
+    });
+    let mut tokens: Vec<Vec<Token>> = streams
+        .iter()
+        .map(|g| Vec::with_capacity(g.len()))
+        .collect();
+    for (&(g, _), part) in channels.iter().zip(parts) {
+        tokens[g].extend(part);
+    }
+    tokens
+}
+
 /// Tokenize the DC groups and the metadata streams through every graft of
 /// `trees`: without and, when any leaf has one, with median DC leaf
 /// offsets, each with the static refined metadata side and, when learned,
@@ -1032,26 +1070,18 @@ fn assemble_ma_arms(
     // Tokens carry their leaf's node index as context; each graft maps them
     // to its BFS context numbering.
     let dc_identity: Vec<u32> = (0..trees.dc.nodes.len() as u32).collect();
-    let dc_nodes = pool.steal_map(scratch, groups.len(), |i, _scratch| {
-        let g = &groups[i];
-        let mut out = Vec::with_capacity(g.len());
-        crate::lossless::tokenize_dc_planes(g, &trees.dc, &dc_identity, wp_params, &mut out);
-        out
-    });
+    let dc_nodes = tokenize_streams(pool, scratch, &groups, &trees.dc, &dc_identity, wp_params);
     let meta_nodes: Option<Vec<Vec<Token>>> = trees.meta.as_ref().map(|meta_tree| {
         let planes = meta_planes(dc_datas, epf_sharpness);
         let identity: Vec<u32> = (0..meta_tree.nodes.len() as u32).collect();
-        pool.steal_map(scratch, planes.len(), |i, _scratch| {
-            let mut out = Vec::with_capacity(planes[i].len());
-            crate::lossless::tokenize_dc_planes(
-                &planes[i],
-                meta_tree,
-                &identity,
-                WpParams::DEFAULT,
-                &mut out,
-            );
-            out
-        })
+        tokenize_streams(
+            pool,
+            scratch,
+            &planes,
+            meta_tree,
+            &identity,
+            WpParams::DEFAULT,
+        )
     });
     let map_ctx = |tokens: &[Vec<Token>], leaf_ctx: &[u32]| -> Vec<Vec<Token>> {
         tokens

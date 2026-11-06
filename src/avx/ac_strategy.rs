@@ -174,13 +174,6 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let rounded = _mm256_round_ps::<RND>(a);
             let q = _mm256_and_ps(rounded, keep);
 
-            let d = if BIASED {
-                _mm256_sub_ps(a, avx_dequantized_level_f32(q, bias))
-            } else {
-                _mm256_sub_ps(a, q)
-            };
-            let d2 = _mm256_mul_ps(d, d);
-
             let active_i = if y < cy && x < cx {
                 let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
                 let cxv = _mm256_set1_epi32(cx as i32);
@@ -196,15 +189,58 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
 
             let active = _mm256_castsi256_ps(active_i);
 
-            let d2 = _mm256_and_ps(d2, active);
-            sse_acc = _mm256_add_ps(sse_acc, d2);
-
             let absq = _mm256_andnot_ps(sign, q);
             let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, zero);
             let rate_mask = _mm256_and_ps(nz, active);
 
             // Comparison masks contain -1 for each nonzero lane.
             nonzero_acc = _mm256_sub_epi32(nonzero_acc, _mm256_castps_si256(rate_mask));
+
+            // Most vectors quantize to all zeros: skip the dequantization
+            // and the rate for those, where every term is zero anyway
+            // (masked LLF lanes contribute nothing either way). A nonzero
+            // vector gathers the biased level and its magnitude rate from
+            // the 16-entry tables by the integer level, with the division
+            // and the polynomial only for a level of 16 or more.
+            let d = if _mm256_movemask_ps(rate_mask) != 0 {
+                let tables = SmallLevelTables::new(&bias);
+                let index = SmallLevelIndex::new(absq);
+                let mut dq = if BIASED {
+                    tables.dequantized(index, q)
+                } else {
+                    q
+                };
+                let mut lg = tables.log2p1(index);
+                if _mm256_movemask_ps(_mm256_castsi256_ps(index.big)) != 0 {
+                    let big = _mm256_castsi256_ps(index.big);
+                    if BIASED {
+                        dq = _mm256_blendv_ps(dq, avx_dequantized_level_f32(q, bias), big);
+                    }
+                    if !SAVE_LEVELS {
+                        lg = _mm256_blendv_ps(lg, avx2_log2p1_f32(absq), big);
+                    }
+                }
+                if !SAVE_LEVELS {
+                    mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(lg, rate_mask));
+                    // Scan position of the nonzeros (masked lanes drop to
+                    // zero, which is neutral: LLF slots are never nonzero).
+                    let sv =
+                        unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
+                    scan_acc = _mm256_max_epu32(
+                        scan_acc,
+                        _mm256_and_si256(sv, _mm256_castps_si256(rate_mask)),
+                    );
+                }
+                _mm256_sub_ps(a, dq)
+            } else if BIASED {
+                // The biased level of every lane is +0 here: a - 0 = a.
+                a
+            } else {
+                // A level may be -0 here, which a - q folds to +0.
+                _mm256_sub_ps(a, q)
+            };
+            let d2 = _mm256_mul_ps(d, d);
+            sse_acc = _mm256_add_ps(sse_acc, _mm256_and_ps(d2, active));
 
             if SAVE_LEVELS {
                 let truncated = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(a);
@@ -224,18 +260,6 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
                     _mm256_storeu_si256(levels.as_mut_ptr().add(y * width + x).cast(), quantized)
                 };
             }
-
-            if !SAVE_LEVELS && _mm256_movemask_ps(rate_mask) != 0 {
-                let ratev = avx2_log2p1_f32(absq);
-                mag_acc = _mm256_add_ps(mag_acc, _mm256_and_ps(ratev, rate_mask));
-                // Scan position of the nonzeros (masked lanes drop to zero,
-                // which is neutral: LLF slots are never nonzero here).
-                let sv = unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
-                scan_acc = _mm256_max_epu32(
-                    scan_acc,
-                    _mm256_and_si256(sv, _mm256_castps_si256(rate_mask)),
-                );
-            }
         }
     }
 
@@ -254,6 +278,99 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
     let nzeros = _mm_cvtsi128_si32(nonzero) as usize;
 
     (hsum256(sse_acc), nzeros, hsum256(mag_acc), max_scan)
+}
+
+/// `log2(1 + k)` for `k < SMALL_LEVELS` as [`avx2_log2p1_f32`] evaluates it,
+/// so the table path is bit-identical with the polynomial path.
+static LOG2P1_SMALL: std::sync::LazyLock<[f32; crate::group::SMALL_LEVELS]> =
+    std::sync::LazyLock::new(|| {
+        // Only reached from the AVX2 kernels, after feature detection.
+        std::array::from_fn(|k| unsafe {
+            _mm_cvtss_f32(_mm256_castps256_ps128(avx2_log2p1_f32(_mm256_set1_ps(
+                k as f32,
+            ))))
+        })
+    });
+
+/// Eight integer levels as permute indices into a 16-entry `f32` table,
+/// with the lanes at or above 16 flagged.
+#[derive(Clone, Copy)]
+pub(crate) struct SmallLevelIndex {
+    /// The level clamped to 16; the low three bits index each table half.
+    k: __m256i,
+    /// Lanes whose level is 16 or more (indexed as 16).
+    pub(crate) big: __m256i,
+    /// Lanes that read the upper table half (8..15).
+    upper: __m256,
+}
+
+impl SmallLevelIndex {
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(crate) fn new(absq: __m256) -> Self {
+        const _: () = assert!(crate::group::SMALL_LEVELS == 16);
+        let sixteen = _mm256_set1_epi32(16);
+        // Integer-valued floats convert exactly; out-of-range ones give
+        // 0x8000_0000, which the unsigned minimum clamps to 16 as well.
+        let k = _mm256_min_epu32(_mm256_cvttps_epi32(absq), sixteen);
+        Self {
+            k,
+            big: _mm256_cmpeq_epi32(k, sixteen),
+            upper: _mm256_castsi256_ps(_mm256_cmpgt_epi32(k, _mm256_set1_epi32(7))),
+        }
+    }
+}
+
+/// The 16-entry dequantization and rate tables of one channel, as two
+/// register halves each for `vpermps` gathers.
+#[derive(Clone, Copy)]
+pub(crate) struct SmallLevelTables {
+    dequant: [__m256; 2],
+    log2p1: [__m256; 2],
+}
+
+impl SmallLevelTables {
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(crate) fn new(bias: &crate::group::DequantBias) -> Self {
+        let halves = |table: &[f32; crate::group::SMALL_LEVELS]| unsafe {
+            [
+                _mm256_loadu_ps(table.as_ptr()),
+                _mm256_loadu_ps(table.as_ptr().add(8)),
+            ]
+        };
+        Self {
+            dequant: halves(&bias.small_levels),
+            log2p1: halves(&LOG2P1_SMALL),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    fn gather(table: [__m256; 2], index: SmallLevelIndex) -> __m256 {
+        _mm256_blendv_ps(
+            _mm256_permutevar8x32_ps(table[0], index.k),
+            _mm256_permutevar8x32_ps(table[1], index.k),
+            index.upper,
+        )
+    }
+
+    /// [`avx_dequantized_level_f32`] of `q` for lanes below 16 (the
+    /// level-16 lanes read entry 8, to be replaced by the caller).
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(crate) fn dequantized(self, index: SmallLevelIndex, q: __m256) -> __m256 {
+        let magnitude = Self::gather(self.dequant, index);
+        _mm256_or_ps(magnitude, _mm256_and_ps(q, _mm256_set1_ps(-0.0)))
+    }
+
+    /// [`avx2_log2p1_f32`] of `|q|` for lanes below 16 (the level-16 lanes
+    /// read entry 8, to be replaced by the caller).
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(crate) fn log2p1(self, index: SmallLevelIndex) -> __m256 {
+        Self::gather(self.log2p1, index)
+    }
 }
 
 // Original scalar population count, retained as an exact test oracle.

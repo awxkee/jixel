@@ -27,7 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::avx::ac_strategy::{avx2_log2p1_f32, hmax_u32, hsum256};
+use crate::avx::ac_strategy::{
+    SmallLevelIndex, SmallLevelTables, avx2_log2p1_f32, hmax_u32, hsum256,
+};
 use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
     LumaPhase, RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
@@ -469,18 +471,6 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
             let absolute = _mm256_andnot_ps(sign, scaled);
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
             let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
-            let dequantized = if BIASED {
-                avx_dequantized_level_f32(quantized, bias)
-            } else {
-                quantized
-            };
-            // Back to the coefficient domain by the forward matrix (no division).
-            let matrix_v = unsafe { _mm256_loadu_ps(matrix8.as_ptr()) };
-            let error = _mm256_mul_ps(
-                _mm256_sub_ps(scaled, dequantized),
-                _mm256_mul_ps(matrix_v, inv_scale),
-            );
-
             let active_i = if y < cy && x < cx {
                 let lane_x = _mm256_add_epi32(_mm256_set1_epi32(x as i32), lane_ids);
                 _mm256_cmpgt_epi32(lane_x, _mm256_set1_epi32(cx as i32 - 1))
@@ -488,26 +478,71 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
                 all
             };
             let active = _mm256_castsi256_ps(active_i);
-            unsafe {
-                _mm256_storeu_ps(error8.as_mut_ptr(), _mm256_and_ps(error, active));
-            }
-            if COMPUTE_RATE {
-                let active_quantized = _mm256_and_ps(quantized, active);
-                let absolute_q = _mm256_andnot_ps(sign, active_quantized);
-                let nonzero_mask = _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps());
+            let matrix_v = unsafe { _mm256_loadu_ps(matrix8.as_ptr()) };
+            let difference = if COMPUTE_RATE {
+                let absolute_q = _mm256_andnot_ps(sign, quantized);
+                let nonzero_mask = _mm256_and_ps(
+                    _mm256_cmp_ps::<_CMP_GT_OQ>(absolute_q, _mm256_setzero_ps()),
+                    active,
+                );
+                // Most vectors are all zeros: skip the dequantization and
+                // the rate for those (masked LLF lanes contribute nothing
+                // either way). A nonzero vector gathers the biased level and
+                // its magnitude rate from the 16-entry tables by the integer
+                // level, with the division and the polynomial only for a
+                // level of 16 or more.
                 if _mm256_movemask_ps(nonzero_mask) != 0 {
+                    let tables = SmallLevelTables::new(&bias);
+                    let index = SmallLevelIndex::new(absolute_q);
+                    let mut dequantized = if BIASED {
+                        // The table carries the sign of a -0 level, which
+                        // `scaled - dq` would fold -0 - -0 to +0; the
+                        // reference dequantizes zero levels to +0.
+                        _mm256_and_ps(tables.dequantized(index, quantized), nonzero_mask)
+                    } else {
+                        quantized
+                    };
+                    let mut magnitude = tables.log2p1(index);
+                    if _mm256_movemask_ps(_mm256_castsi256_ps(index.big)) != 0 {
+                        let big = _mm256_castsi256_ps(index.big);
+                        if BIASED {
+                            dequantized = _mm256_blendv_ps(
+                                dequantized,
+                                avx_dequantized_level_f32(quantized, bias),
+                                big,
+                            );
+                        }
+                        magnitude = _mm256_blendv_ps(magnitude, avx2_log2p1_f32(absolute_q), big);
+                    }
                     nonzero_acc = _mm256_sub_epi32(nonzero_acc, _mm256_castps_si256(nonzero_mask));
-                    magnitude_bits = _mm256_add_ps(
-                        magnitude_bits,
-                        _mm256_and_ps(avx2_log2p1_f32(absolute_q), nonzero_mask),
-                    );
+                    magnitude_bits =
+                        _mm256_add_ps(magnitude_bits, _mm256_and_ps(magnitude, nonzero_mask));
                     let sv =
                         unsafe { _mm256_loadu_si256(scan_pos.as_ptr().add(y * width + x).cast()) };
                     scan_acc = _mm256_max_epu32(
                         scan_acc,
                         _mm256_and_si256(sv, _mm256_castps_si256(nonzero_mask)),
                     );
+                    _mm256_sub_ps(scaled, dequantized)
+                } else if BIASED {
+                    // The biased level of every lane is +0 here.
+                    scaled
+                } else {
+                    // A level may be -0 here, which scaled - q folds to +0.
+                    _mm256_sub_ps(scaled, quantized)
                 }
+            } else {
+                let dequantized = if BIASED {
+                    avx_dequantized_level_f32(quantized, bias)
+                } else {
+                    quantized
+                };
+                _mm256_sub_ps(scaled, dequantized)
+            };
+            // Back to the coefficient domain by the forward matrix (no division).
+            let error = _mm256_mul_ps(difference, _mm256_mul_ps(matrix_v, inv_scale));
+            unsafe {
+                _mm256_storeu_ps(error8.as_mut_ptr(), _mm256_and_ps(error, active));
             }
         }
     }

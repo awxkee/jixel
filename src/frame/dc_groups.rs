@@ -108,6 +108,7 @@ pub(super) fn provisional_dc_group(
     }
     crate::color_correlation::fill_cmap(
         ctx,
+        scratch,
         opsin,
         x0 / K_BLOCK_DIM,
         y0 / K_BLOCK_DIM,
@@ -115,7 +116,6 @@ pub(super) fn provisional_dc_group(
         yblocks,
         &dc_data.raw_quant_field,
         distp.scale,
-        &mut scratch.cfl_rdo,
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
         distp.distance,
@@ -170,6 +170,7 @@ pub(super) fn setup_dc_group(
     // costs use the same Y-to-X/Y-to-B subtraction as final coefficient coding.
     crate::color_correlation::fill_cmap(
         ctx,
+        scratch,
         opsin,
         dc_group_x0 / K_BLOCK_DIM,
         dc_group_y0 / K_BLOCK_DIM,
@@ -177,7 +178,6 @@ pub(super) fn setup_dc_group(
         dc_group_ysize_blocks,
         &dc_data.raw_quant_field,
         distp.scale,
-        &mut scratch.cfl_rdo,
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
         distp.distance,

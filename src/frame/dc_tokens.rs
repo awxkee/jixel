@@ -443,6 +443,17 @@ impl DcPlanePrice {
         self.raw_bits += u64::from(nbits);
     }
 
+    /// Count another plane price's tokens here, as if they had been added
+    /// to this one.
+    pub(super) fn merge(&mut self, other: &Self) {
+        for (mine, theirs) in self.counts.iter_mut().zip(&other.counts) {
+            for (count, &extra) in mine.iter_mut().zip(theirs) {
+                *count += extra;
+            }
+        }
+        self.raw_bits += other.raw_bits;
+    }
+
     pub(crate) fn bits(&self) -> f64 {
         let mut bits = self.raw_bits as f64;
         for ctx in &self.counts {

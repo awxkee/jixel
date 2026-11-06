@@ -408,9 +408,9 @@ fn encode_frame_core_inner(
             .thread_pool
             .steal_map(scratch, group_coords.len(), |i, scratch| {
                 let (dc_gx, dc_gy) = group_coords[i];
-                let (coeffs, gather) = scratch.ac_group.transform_buffers();
                 crate::color_correlation::refit_cmap_on_layout(
                     ctx,
+                    scratch,
                     opsin,
                     &dc_ref[i],
                     dc_gx * K_DC_GROUP_DIM / K_BLOCK_DIM,
@@ -418,9 +418,6 @@ fn encode_frame_core_inner(
                     distp.scale,
                     distp.distance,
                     distp.x_qm_scale,
-                    coeffs,
-                    gather,
-                    &mut scratch.cfl_rdo,
                 )
             });
         for (dc, (ytox, ytob)) in dc_datas.iter_mut().zip(maps) {
@@ -736,9 +733,9 @@ fn encode_frame_core_inner(
                             ctx.thread_pool
                                 .steal_map(scratch, group_coords.len(), |i, scratch| {
                                     let (dc_gx, dc_gy) = group_coords[i];
-                                    let (coeffs, gather) = scratch.ac_group.transform_buffers();
                                     crate::color_correlation::refit_cmap_on_layout(
                                         ctx,
+                                        scratch,
                                         opsin,
                                         &dc_ref[i],
                                         dc_gx * K_DC_GROUP_DIM / K_BLOCK_DIM,
@@ -746,9 +743,6 @@ fn encode_frame_core_inner(
                                         distp.scale,
                                         distp.distance,
                                         distp.x_qm_scale,
-                                        coeffs,
-                                        gather,
-                                        &mut scratch.cfl_rdo,
                                     )
                                 });
                         for (dc, (ytox, ytob)) in datas.iter_mut().zip(maps) {
@@ -917,6 +911,7 @@ fn encode_frame_core_inner(
             dc_cfl,
             compensate_b,
             &mut scratch.dc_predictor,
+            &ctx.thread_pool,
         )?;
     }
     let skip_dc_smoothing = !use_dc_frame
@@ -1111,6 +1106,7 @@ fn encode_frame_core_inner(
             dc_cfl,
             compensate_b,
             &rates,
+            &ctx.thread_pool,
         )?;
         if changed {
             let trees = trees.clone();
