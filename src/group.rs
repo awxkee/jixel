@@ -667,6 +667,27 @@ pub(crate) struct DequantBias {
     pub(crate) numerator: f32,
     /// [`bias_quotients`] of `numerator`.
     quotients: &'static [f32; BIAS_QUOTIENTS],
+    /// [`Self::level`] of `0..SMALL_LEVELS`: the SIMD kernels gather from
+    /// this table instead of dividing (the entries are the same correctly
+    /// rounded values, so the paths agree bit for bit).
+    pub(crate) small_levels: [f32; SMALL_LEVELS],
+}
+
+/// Number of entries in [`DequantBias::small_levels`]: one 64-byte NEON
+/// table lookup, or two 8-lane AVX2 permutes.
+pub(crate) const SMALL_LEVELS: usize = 16;
+
+/// `|q| - numerator / |q|` for `q` in `2..SMALL_LEVELS`, with `0` and `one`
+/// in the first two slots.
+const fn small_levels(one: f32, quotients: &[f32; BIAS_QUOTIENTS]) -> [f32; SMALL_LEVELS] {
+    let mut table = [0.0; SMALL_LEVELS];
+    table[1] = one;
+    let mut q = 2;
+    while q < SMALL_LEVELS {
+        table[q] = q as f32 - quotients[q];
+        q += 1;
+    }
+    table
 }
 
 impl DequantBias {
@@ -681,6 +702,7 @@ impl DequantBias {
             one,
             numerator: DEFAULT_QUANT_BIASES[3],
             quotients: &DEFAULT_BIAS_QUOTIENTS,
+            small_levels: small_levels(one, &DEFAULT_BIAS_QUOTIENTS),
         }
     }
 
@@ -693,10 +715,14 @@ impl DequantBias {
         let f16 = |v: f32| crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(v));
         let numerator = f16(EXPLICIT_QUANT_BIASES[3]);
         let quotients = bias_quotients_for(numerator);
-        std::array::from_fn(|c| DequantBias {
-            one: f16(EXPLICIT_QUANT_BIASES[c]),
-            numerator,
-            quotients,
+        std::array::from_fn(|c| {
+            let one = f16(EXPLICIT_QUANT_BIASES[c]);
+            DequantBias {
+                one,
+                numerator,
+                quotients,
+                small_levels: small_levels(one, quotients),
+            }
         })
     }
 

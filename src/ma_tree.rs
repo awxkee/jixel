@@ -204,6 +204,14 @@ impl MaSamples {
         self.props.len()
     }
 
+    /// Append `other`'s rows (neither carries values).
+    pub(crate) fn append(&mut self, other: &Self) {
+        debug_assert!(self.val.is_empty() && other.val.is_empty());
+        for (i, &tok) in other.tok.iter().enumerate() {
+            self.push(other.props.get(i), tok);
+        }
+    }
+
     /// Materialize a learner's current order once. Copy each field in one
     /// pass so allocation checks stay outside the sample loop.
     fn select(&self, indices: &[u32]) -> Self {

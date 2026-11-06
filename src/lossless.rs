@@ -97,7 +97,7 @@ pub(crate) use groups::write_single_channel_lz77_section;
 pub(crate) use header::write_patch_dictionary;
 pub(crate) use lz77::LzToken;
 pub(crate) use ma_sampling::{
-    DcPlanes, sample_dc_planes, tokenize_dc_planes, walk_dc_planes_predictors,
+    DcPlanes, dc_channels, sample_dc_planes, tokenize_dc_channel, walk_dc_planes_predictors,
 };
 pub(crate) use ma_source::ac_stream_id;
 pub(crate) use palette::write_palette_transform;

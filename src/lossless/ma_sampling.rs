@@ -508,44 +508,56 @@ impl DcPlanes {
 }
 
 /// MA samples of every stream's planes, taking every `stride`-th pixel.
+/// Channels sample independently on the pool and join in stream order.
 pub(crate) fn sample_dc_planes(
+    pool: &crate::thread_pool::ThreadPool,
     groups: &[DcPlanes],
     stride: usize,
     wp_params: WpParams,
 ) -> MaSamples {
-    let capacity = groups
-        .iter()
-        .map(|g| {
-            g.dims
-                .iter()
-                .map(|&(w, h)| ma_channel_sample_count(w, h, stride))
-                .sum::<usize>()
-        })
-        .sum();
-    let mut samples = MaSamples::with_capacity(capacity);
-    for g in groups {
-        for c in 0..g.planes.len() {
-            let (w, h) = g.dims[c];
-            if w == 0 || h == 0 {
-                continue;
-            }
-            let refs = g.refs(c);
-            let pixels = &g.planes[c];
-            sample_channel_ma(
-                |y| &pixels[y * w..(y + 1) * w],
-                w,
-                h,
-                c as u32,
-                g.stream,
-                &refs,
-                wp_params,
-                true,
-                stride,
-                |props, tok, _| samples.push(props, tok),
-            );
-        }
+    let channels = dc_channels(groups);
+    let parts = pool.map(channels.len(), |i| {
+        let (g, c) = channels[i];
+        let g = &groups[g];
+        let (w, h) = g.dims[c];
+        let mut part = MaSamples::with_capacity(ma_channel_sample_count(w, h, stride));
+        let refs = g.refs(c);
+        let pixels = &g.planes[c];
+        sample_channel_ma(
+            |y| &pixels[y * w..(y + 1) * w],
+            w,
+            h,
+            c as u32,
+            g.stream,
+            &refs,
+            wp_params,
+            true,
+            stride,
+            |props, tok, _| part.push(props, tok),
+        );
+        part
+    });
+    let mut samples = MaSamples::with_capacity(parts.iter().map(MaSamples::len).sum());
+    for part in &parts {
+        samples.append(part);
     }
     samples
+}
+
+/// The non-empty `(stream, channel)` pairs of `groups` in coding order.
+pub(crate) fn dc_channels(groups: &[DcPlanes]) -> Vec<(usize, usize)> {
+    groups
+        .iter()
+        .enumerate()
+        .flat_map(|(g, planes)| {
+            planes
+                .dims
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(w, h))| w != 0 && h != 0)
+                .map(move |(c, _)| (g, c))
+        })
+        .collect()
 }
 
 /// Walk one stream's planes through a learned tree, handing the visitor
@@ -584,39 +596,40 @@ pub(crate) fn walk_dc_planes_predictors(
     }
 }
 
-/// Tokenize one stream's planes through a learned tree: every pixel takes
-/// its leaf's context (`leaf_ctx`, indexed by tree node) and predictor.
-pub(crate) fn tokenize_dc_planes(
+/// Tokenize channel `c` of one stream through a learned tree: every pixel
+/// takes its leaf's context (`leaf_ctx`, indexed by tree node) and
+/// predictor. Channels read only earlier channels' pixels, so a stream's
+/// tokens are its channels' in order.
+pub(crate) fn tokenize_dc_channel(
     g: &DcPlanes,
+    c: usize,
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     wp_params: WpParams,
     out: &mut Vec<Token>,
 ) {
-    for c in 0..g.planes.len() {
-        let (w, h) = g.dims[c];
-        if w == 0 || h == 0 {
-            continue;
-        }
-        let refs = g.refs(c);
-        let pixels = &g.planes[c];
-        walk_channel_ma(
-            |y| &pixels[y * w..(y + 1) * w],
-            w,
-            h,
-            c as u32,
-            g.stream,
-            &refs,
-            wp_params,
-            true,
-            |_x, _y, v, p, n, wp_pred| {
-                let (node, pred) = tree.lookup(p);
-                let pv = predictor_value(pred, n, wp_pred);
-                out.push(Token::new(
-                    leaf_ctx[node as usize],
-                    pack_signed((v - pv) as i32),
-                ));
-            },
-        );
+    let (w, h) = g.dims[c];
+    if w == 0 || h == 0 {
+        return;
     }
+    let refs = g.refs(c);
+    let pixels = &g.planes[c];
+    walk_channel_ma(
+        |y| &pixels[y * w..(y + 1) * w],
+        w,
+        h,
+        c as u32,
+        g.stream,
+        &refs,
+        wp_params,
+        true,
+        |_x, _y, v, p, n, wp_pred| {
+            let (node, pred) = tree.lookup(p);
+            let pv = predictor_value(pred, n, wp_pred);
+            out.push(Token::new(
+                leaf_ctx[node as usize],
+                pack_signed((v - pv) as i32),
+            ));
+        },
+    );
 }

@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 use crate::adaptive_quant::dirty_log2f;
+use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -593,9 +594,9 @@ impl Default for CflRdoScratch {
 
 /// Clamped-gradient prediction of a tile's multiplier from its causal
 /// neighbors — the same predictor `tokenize_dc_global` charges the map with,
-/// so rate-to-pred here is rate-to-pred in the bitstream. Safe because
-/// `fill_cmap` walks tiles serially in raster order (the upstream fork races
-/// here; jixel does not).
+/// so rate-to-pred here is rate-to-pred in the bitstream. Safe because the
+/// slope searches only visit a tile after its neighbors (`cmap_wavefront`;
+/// the upstream fork races here; jixel does not).
 fn cmap_tile_pred(map: &ImageSB, tx: usize, ty: usize) -> i32 {
     if tx == 0 && ty == 0 {
         return 0;
@@ -860,11 +861,45 @@ fn compute_cmap_tile_rdo(
     (ytox, ytob)
 }
 
+/// Fill both maps tile by tile on the pool. `tile(tx, ty, ytox, ytob, scratch)`
+/// may read the maps' causal neighbors of `(tx, ty)` (left, top, top-left),
+/// which all lie on earlier anti-diagonals, so each diagonal's tiles are
+/// independent and the result equals the serial raster scan.
+fn cmap_wavefront(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    ytox_map: &mut ImageSB,
+    ytob_map: &mut ImageSB,
+    tile: impl Fn(usize, usize, &ImageSB, &ImageSB, &mut CoderScratch) -> Option<(i32, i32)> + Sync,
+) {
+    let xtiles = ytox_map.xsize();
+    let ytiles = ytox_map.ysize();
+    for d in 0..(xtiles + ytiles).saturating_sub(1) {
+        let ty0 = d.saturating_sub(xtiles - 1);
+        let ty1 = d.min(ytiles - 1);
+        let (ytox, ytob) = (&*ytox_map, &*ytob_map);
+        let slopes = ctx
+            .thread_pool
+            .steal_map(scratch, ty1 + 1 - ty0, |i, scratch| {
+                let ty = ty0 + i;
+                tile(d - ty, ty, ytox, ytob, scratch)
+            });
+        for (i, slopes) in slopes.into_iter().enumerate() {
+            if let Some((x, b)) = slopes {
+                let (tx, ty) = (d - ty0 - i, ty0 + i);
+                ytox_map.row_mut(ty)[tx] = x as i8;
+                ytob_map.row_mut(ty)[tx] = b as i8;
+            }
+        }
+    }
+}
+
 /// Fill `ytox_map` / `ytob_map` (sized `(xtiles, ytiles)`) by running the
 /// per-tile regression on `opsin`. `(dc_group_x0_blocks, dc_group_y0_blocks)`
 /// is the block offset of this DC group's (0, 0) tile into `opsin`.
 pub(crate) fn fill_cmap(
     ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
     opsin: &Image3F,
     dc_group_x0_blocks: usize,
     dc_group_y0_blocks: usize,
@@ -872,25 +907,19 @@ pub(crate) fn fill_cmap(
     dc_group_ysize_blocks: usize,
     raw_quant_field: &crate::image::ImageB,
     scale: f32,
-    rdo_scratch: &mut crate::coder_scratch::LazyScratch<Box<CflRdoScratch>>,
     ytox_map: &mut ImageSB,
     ytob_map: &mut ImageSB,
     distance: f32,
     x_qm_scale: u32,
 ) {
-    let xtiles = ytox_map.xsize();
-    let ytiles = ytox_map.ysize();
-
-    let mut scratch = CflScratch {
-        block_b: [0.; 64],
-        block_x: [0.; 64],
-        block_y: [0.; 64],
-    };
-
     let use_rdo = cfl_slope_search(ctx);
 
-    for ty in 0..ytiles {
-        for tx in 0..xtiles {
+    cmap_wavefront(
+        ctx,
+        scratch,
+        ytox_map,
+        ytob_map,
+        |tx, ty, ytox_map, ytob_map, scratch| {
             let bx0 = dc_group_x0_blocks + tx * K_TILE_DIM_IN_BLOCKS;
             let by0 = dc_group_y0_blocks + ty * K_TILE_DIM_IN_BLOCKS;
             let bx_count = K_TILE_DIM_IN_BLOCKS
@@ -898,13 +927,14 @@ pub(crate) fn fill_cmap(
             let by_count = K_TILE_DIM_IN_BLOCKS
                 .min(dc_group_ysize_blocks.saturating_sub(ty * K_TILE_DIM_IN_BLOCKS));
             if bx_count == 0 || by_count == 0 {
-                continue;
+                return None;
             }
-            let (ytox, ytob) = if use_rdo {
-                // The predictor reads only already-written tiles: this loop
-                // is serial raster order, matching the token predictor.
-                let pred_x = cmap_tile_pred(ytox_map, tx, ty);
-                let pred_b = cmap_tile_pred(ytob_map, tx, ty);
+            let mut dct = CflScratch {
+                block_b: [0.; 64],
+                block_x: [0.; 64],
+                block_y: [0.; 64],
+            };
+            Some(if use_rdo {
                 compute_cmap_tile_rdo(
                     ctx,
                     CflRdoTile {
@@ -924,31 +954,20 @@ pub(crate) fn fill_cmap(
                             block_y: ty * K_TILE_DIM_IN_BLOCKS,
                         },
                         prediction: CflTilePrediction {
-                            ytox: pred_x,
-                            ytob: pred_b,
+                            ytox: cmap_tile_pred(ytox_map, tx, ty),
+                            ytob: cmap_tile_pred(ytob_map, tx, ty),
                         },
                     },
                     CflRdoTileScratch {
-                        dct: &mut scratch,
-                        rdo: rdo_scratch,
+                        dct: &mut dct,
+                        rdo: &mut scratch.cfl_rdo,
                     },
                 )
             } else {
-                compute_cmap_tile(
-                    ctx,
-                    opsin,
-                    bx0,
-                    by0,
-                    bx_count,
-                    by_count,
-                    distance,
-                    &mut scratch,
-                )
-            };
-            ytox_map.row_mut(ty)[tx] = ytox as i8;
-            ytob_map.row_mut(ty)[tx] = ytob as i8;
-        }
-    }
+                compute_cmap_tile(ctx, opsin, bx0, by0, bx_count, by_count, distance, &mut dct)
+            })
+        },
+    );
 }
 
 /// Whether this frame searches its CfL slopes with the kill-rule model
@@ -966,11 +985,12 @@ pub(crate) fn cfl_slope_search(ctx: &EncodingContext) -> bool {
 /// `compute_cmap_tile_rdo` scored the fixed-DCT8 estimate on. A block's
 /// coefficients take the slope of the tile holding its first block, as the AC
 /// writer reads them; its lowest frequencies ride on the DC path and are left
-/// out. The candidates add the slope the layout was chosen under. `coeffs` and
-/// `gather` are the writer's transform buffers.
+/// out. The candidates add the slope the layout was chosen under; transforms
+/// run in each worker's writer buffers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refit_cmap_on_layout(
     ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
     opsin: &Image3F,
     dc_data: &DcGroupData,
     dc_group_x0_blocks: usize,
@@ -978,14 +998,9 @@ pub(crate) fn refit_cmap_on_layout(
     scale: f32,
     distance: f32,
     x_qm_scale: u32,
-    coeffs: &mut [[f32; crate::group::MAX_BLOCK_COEFFICIENTS]; 3],
-    gather: &mut [f32; crate::group::MAX_BLOCK_COEFFICIENTS],
-    rdo: &mut CflRdoScratch,
 ) -> (ImageSB, ImageSB) {
     let mut ytox_map = dc_data.ytox_map.clone();
     let mut ytob_map = dc_data.ytob_map.clone();
-    let xtiles = ytox_map.xsize();
-    let ytiles = ytox_map.ysize();
     let strategy = &dc_data.ac_strategy;
     let matrices = ctx.matrices();
     let x_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
@@ -996,10 +1011,15 @@ pub(crate) fn refit_cmap_on_layout(
     let color_factor = ctx.cfl_frame().color_factor;
     let shift_x = -ctx.cfl_base_x();
     let shift_b = 1.0 - ctx.cfl_base_b();
-    let [coeff_x, coeff_y, coeff_b] = coeffs;
 
-    for ty in 0..ytiles {
-        for tx in 0..xtiles {
+    cmap_wavefront(
+        ctx,
+        scratch,
+        &mut ytox_map,
+        &mut ytob_map,
+        |tx, ty, ytox_map, ytob_map, scratch| {
+            let ([coeff_x, coeff_y, coeff_b], gather) = scratch.ac_group.transform_buffers();
+            let rdo = &mut *scratch.cfl_rdo;
             rdo.len = 0;
             let bx0 = tx * K_TILE_DIM_IN_BLOCKS;
             let by0 = ty * K_TILE_DIM_IN_BLOCKS;
@@ -1067,7 +1087,7 @@ pub(crate) fn refit_cmap_on_layout(
                 &rdo.s_x[..rdo.len],
                 weight_x * chroma_weight,
                 lambda,
-                cmap_tile_pred(&ytox_map, tx, ty),
+                cmap_tile_pred(ytox_map, tx, ty),
                 0.0,
                 color_factor,
                 Some(dc_data.ytox_map.row(ty)[tx] as i32),
@@ -1080,15 +1100,14 @@ pub(crate) fn refit_cmap_on_layout(
                 &rdo.s_b[..rdo.len],
                 weight_b * chroma_weight,
                 lambda,
-                cmap_tile_pred(&ytob_map, tx, ty),
+                cmap_tile_pred(ytob_map, tx, ty),
                 1.0,
                 color_factor,
                 Some(dc_data.ytob_map.row(ty)[tx] as i32),
             );
-            ytox_map.row_mut(ty)[tx] = ytox as i8;
-            ytob_map.row_mut(ty)[tx] = ytob as i8;
-        }
-    }
+            Some((ytox, ytob))
+        },
+    );
     (ytox_map, ytob_map)
 }
 
@@ -2883,23 +2902,9 @@ mod tests {
 
     fn refit_tile(opsin: &Image3F, dc_data: &DcGroupData) -> (i32, i32) {
         let ctx = EncodingContext::default();
-        let mut coeffs =
-            crate::util::HeapMatrix::<f32, 3, { crate::group::MAX_BLOCK_COEFFICIENTS }>::new(0.0);
-        let mut gather = crate::util::heap_array(0.0);
-        let mut rdo = CflRdoScratch::new();
-        let (ytox, ytob) = refit_cmap_on_layout(
-            &ctx,
-            opsin,
-            dc_data,
-            0,
-            0,
-            1.0 / 32.0,
-            1.0,
-            2,
-            &mut coeffs,
-            &mut gather,
-            &mut rdo,
-        );
+        let mut scratch = CoderScratch::lossless();
+        let (ytox, ytob) =
+            refit_cmap_on_layout(&ctx, &mut scratch, opsin, dc_data, 0, 0, 1.0 / 32.0, 1.0, 2);
         (ytox.row(0)[0] as i32, ytob.row(0)[0] as i32)
     }
 
