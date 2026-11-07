@@ -37,6 +37,7 @@ use crate::lossless::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
 use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
+use crate::thread_pool::ThreadPool;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM_IN_BLOCKS: usize = 8;
@@ -1486,6 +1487,7 @@ pub(crate) fn choose_ytob_dc(
     ry_scratch: &mut Vec<i32>,
     dc_step: [f32; 3],
     color_factor: f32,
+    pool: &ThreadPool,
 ) -> i32 {
     // One signaled step moves the stored B DC by this much per stored Y unit:
     // the slope is `ytob_dc / 84` in dequantized XYB, and the two planes are
@@ -1502,14 +1504,29 @@ pub(crate) fn choose_ytob_dc(
     );
 
     // Refine over a window around the fit; 0 is always a candidate so the
-    // search can decline.
+    // search can decline. Every candidate is priced on the pool from its
+    // own integer gradient histogram, then ranked in window order.
     const WINDOW: i32 = 6;
-    let mut price = DcGradientPrice::default();
-    let base_cost = ytob_dc_cost(dc_datas, 0, step, fill_ytob_row, rb_scratch, &mut price);
-    let mut best = (base_cost - COLOR_CORRELATION_HEADER_BITS, 0i32);
-    let candidates = (seed - WINDOW).max(-YTOB_DC_LIMIT)..=(seed + WINDOW).min(YTOB_DC_LIMIT);
-    for k in candidates.filter(|&k| k != 0) {
-        let cost = ytob_dc_cost(dc_datas, k, step, fill_ytob_row, rb_scratch, &mut price);
+    let candidates: Vec<i32> = std::iter::once(0)
+        .chain(
+            ((seed - WINDOW).max(-YTOB_DC_LIMIT)..=(seed + WINDOW).min(YTOB_DC_LIMIT))
+                .filter(|&k| k != 0),
+        )
+        .collect();
+    let costs = pool.map(candidates.len(), |i| {
+        let mut price = DcGradientPrice::default();
+        let mut current = Vec::new();
+        ytob_dc_cost(
+            dc_datas,
+            candidates[i],
+            step,
+            fill_ytob_row,
+            &mut current,
+            &mut price,
+        )
+    });
+    let mut best = (costs[0] - COLOR_CORRELATION_HEADER_BITS, 0i32);
+    for (&k, &cost) in candidates[1..].iter().zip(&costs[1..]) {
         if cost < best.0 {
             best = (cost, k);
         }
@@ -1858,9 +1875,9 @@ pub(crate) fn choose_dc_steps(
         return default;
     }
     let candidates: [f32; DC_STEP_CANDIDATES] = std::array::from_fn(|k| 1.0 - 0.01 * k as f32);
+    let pool = &ctx.thread_pool;
     // Y levels under `step_y`, and their rate.
-    let mut y_price = DcGradientPrice::default();
-    let mut quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>]| {
+    let quantize_y = |step_y: f32, y_levels: &mut [Vec<i32>], y_price: &mut DcGradientPrice| {
         let factor_y = INV_DC_QUANT[1] / step_y * scale_dc;
         y_price.clear();
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
@@ -1880,12 +1897,15 @@ pub(crate) fn choose_dc_steps(
         .map(|dc| dc.quant_dc.xsize())
         .max()
         .unwrap_or(0);
-    let mut current = vec![0i32; max_width];
-    let mut b_price = DcGradientPrice::default();
-    let mut rate_b = |step_y: f32, step_b: f32, y_levels: &[Vec<i32>]| {
+    let rate_b = |step_y: f32,
+                  step_b: f32,
+                  y_levels: &[Vec<i32>],
+                  current: &mut Vec<i32>,
+                  b_price: &mut DcGradientPrice| {
         let factor_b = INV_DC_QUANT[2] / step_b * scale_dc;
         let cfl = dc_cfl_factor([base_step[0], step_y, step_b], ytob_dc, cfl);
         b_price.clear();
+        current.resize(max_width, 0);
         for (dc, levels) in dc_datas.iter().zip(y_levels) {
             let source = dc.source_dc_b.as_ref().unwrap();
             let w = source.xsize();
@@ -1898,10 +1918,12 @@ pub(crate) fn choose_dc_steps(
         }
         b_price.bits()
     };
-    let mut y_levels: Vec<Vec<i32>> = dc_datas
-        .iter()
-        .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
-        .collect();
+    let new_levels = || -> Vec<Vec<i32>> {
+        dc_datas
+            .iter()
+            .map(|dc| vec![0i32; dc.quant_dc.xsize() * dc.quant_dc.ysize()])
+            .collect()
+    };
     // Keep the absolute decoded values: dividing by the base only to multiply
     // it back can introduce another rounding before quantization.
     let steps_of = |channel: usize| {
@@ -1909,36 +1931,87 @@ pub(crate) fn choose_dc_steps(
     };
     let (steps_y, steps_b) = (steps_of(1), steps_of(2));
     let mut costs = [[None; DC_STEP_CANDIDATES]; DC_STEP_CANDIDATES];
-    let mut current_y = None;
-    let mut rate_y = 0.0;
-    let mut cost = |y: usize, b: usize| {
-        if let Some(cost) = costs[y][b] {
-            return cost;
-        }
-        if current_y != Some(y) {
-            rate_y = quantize_y(steps_y[y], &mut y_levels);
-            current_y = Some(y);
-        }
-        let cost = rate_y + rate_b(steps_y[y], steps_b[b], &y_levels);
-        costs[y][b] = Some(cost);
-        cost
-    };
+    // The Y levels of the incumbent `step_y`, and their rate.
+    let mut y_levels = new_levels();
+    let mut rate_y = quantize_y(steps_y[0], &mut y_levels, &mut DcGradientPrice::default());
+    let base = rate_y
+        + rate_b(
+            steps_y[0],
+            steps_b[0],
+            &y_levels,
+            &mut Vec::new(),
+            &mut DcGradientPrice::default(),
+        );
+    costs[0][0] = Some(base);
     // B depends on the Y levels, so the two steps are searched in turn: B,
     // then Y under that B, then B again. Revisited pairs retain their exact
     // costs and tie order; when Y stays put the last B search needs no scans.
-    let base = cost(0, 0);
+    // A round's unpriced candidates are priced on the pool, each from its
+    // own integer histograms (a Y candidate quantizes its own levels), and
+    // ranked in candidate order afterwards.
     let (mut best, mut step_y, mut step_b) = (base, 0, 0);
     for round in 0..3 {
         if round == 1 {
-            for candidate in 0..DC_STEP_CANDIDATES {
-                let candidate_cost = cost(candidate, step_b);
+            let priced = pool.map(DC_STEP_CANDIDATES, |candidate| {
+                if costs[candidate][step_b].is_some() {
+                    return None;
+                }
+                let mut levels = new_levels();
+                let rate_y = quantize_y(
+                    steps_y[candidate],
+                    &mut levels,
+                    &mut DcGradientPrice::default(),
+                );
+                let cost = rate_y
+                    + rate_b(
+                        steps_y[candidate],
+                        steps_b[step_b],
+                        &levels,
+                        &mut Vec::new(),
+                        &mut DcGradientPrice::default(),
+                    );
+                Some((cost, rate_y, levels))
+            });
+            let mut winner = None;
+            for (candidate, priced) in priced.into_iter().enumerate() {
+                let candidate_cost = match priced {
+                    Some((cost, rate_y, levels)) => {
+                        costs[candidate][step_b] = Some(cost);
+                        if cost < best {
+                            winner = Some((rate_y, levels));
+                        }
+                        cost
+                    }
+                    None => costs[candidate][step_b].unwrap(),
+                };
                 if candidate_cost < best {
                     (best, step_y) = (candidate_cost, candidate);
                 }
             }
+            if let Some((winner_rate, winner_levels)) = winner {
+                (rate_y, y_levels) = (winner_rate, winner_levels);
+            }
         } else {
-            for candidate in 0..DC_STEP_CANDIDATES {
-                let candidate_cost = cost(step_y, candidate);
+            let priced = pool.map(DC_STEP_CANDIDATES, |candidate| {
+                if costs[step_y][candidate].is_some() {
+                    return None;
+                }
+                Some(
+                    rate_y
+                        + rate_b(
+                            steps_y[step_y],
+                            steps_b[candidate],
+                            &y_levels,
+                            &mut Vec::new(),
+                            &mut DcGradientPrice::default(),
+                        ),
+                )
+            });
+            for (candidate, priced) in priced.into_iter().enumerate() {
+                if let Some(cost) = priced {
+                    costs[step_y][candidate] = Some(cost);
+                }
+                let candidate_cost = costs[step_y][candidate].unwrap();
                 if candidate_cost < best {
                     (best, step_b) = (candidate_cost, candidate);
                 }
@@ -1958,7 +2031,18 @@ pub(crate) fn choose_dc_steps(
     // A finer lattice can still reproduce the DC worse: a flat color that the
     // default step hits lands between two finer levels. Measure both on the
     // display, where the clamp also forgives any overshoot of white.
-    let mut distortion = |dc_step: [f32; 3]| -> f64 {
+    // Rows quantize and decode independently: the pool computes the squared
+    // errors in row bands, and they are added in the raster order of the
+    // single scan.
+    const DISTORTION_BAND_ROWS: usize = 32;
+    let mut bands = Vec::new();
+    for (g, dc) in dc_datas.iter().enumerate() {
+        let rows = dc.source_dc_y.as_ref().unwrap().ysize();
+        for y0 in (0..rows).step_by(DISTORTION_BAND_ROWS) {
+            bands.push((g, y0, (y0 + DISTORTION_BAND_ROWS).min(rows)));
+        }
+    }
+    let distortion = |dc_step: [f32; 3]| -> f64 {
         let factor_y = INV_DC_QUANT[1] / dc_step[1] * scale_dc;
         let factor_b = INV_DC_QUANT[2] / dc_step[2] * scale_dc;
         let cfl = dc_cfl_factor(dc_step, ytob_dc, cfl);
@@ -1970,20 +2054,21 @@ pub(crate) fn choose_dc_steps(
                 1.055 * v.powf(1.0 / 2.4) - 0.055
             }
         };
-        let mut sum = 0.0f64;
-        for (dc, levels) in dc_datas.iter().zip(&mut y_levels) {
+        let errors = pool.map(bands.len(), |band| {
+            let (g, y0, y1) = bands[band];
+            let dc = &dc_datas[g];
             let (source_y, source_b) = (
                 dc.source_dc_y.as_ref().unwrap(),
                 dc.source_dc_b.as_ref().unwrap(),
             );
-            for y in 0..source_y.ysize() {
+            let w = source_y.xsize();
+            let mut errors = Vec::with_capacity((y1 - y0) * w * 3);
+            let (mut y_quant, mut b_quant) = (vec![0i32; w], vec![0i32; w]);
+            for y in y0..y1 {
                 let (row_y, row_b) = (source_y.row(y), source_b.row(y));
                 let row_x = dc.source_dc_x.as_ref().map(|p| p.row(y));
-                let w = row_y.len();
-                let y_quant = &mut levels[y * w..][..w];
-                let b_quant = &mut current[..w];
-                (ctx.quantize_dc_i32)(row_y, factor_y, y_quant);
-                (ctx.quantize_dc_cfl_i32)(row_b, y_quant, factor_b, cfl, b_quant);
+                (ctx.quantize_dc_i32)(row_y, factor_y, &mut y_quant);
+                (ctx.quantize_dc_cfl_i32)(row_b, &y_quant, factor_b, cfl, &mut b_quant);
                 for x in 0..row_y.len() {
                     let sx = row_x.map_or(0.0, |r| r[x]);
                     let yq = y_quant[x] as f32;
@@ -1997,9 +2082,16 @@ pub(crate) fn choose_dc_steps(
                     let source = crate::xyb::xyb_to_rgb_pixel_f32(&ctx.xyb, sx, row_y[x], row_b[x]);
                     for c in 0..3 {
                         let e = (oetf(decoded[c]) - oetf(source[c])) as f64;
-                        sum += e * e;
+                        errors.push(e * e);
                     }
                 }
+            }
+            errors
+        });
+        let mut sum = 0.0f64;
+        for errors in &errors {
+            for &e in errors {
+                sum += e;
             }
         }
         sum
@@ -3192,6 +3284,7 @@ mod tests {
             &mut Vec::new(),
             [1.0; 3],
             K_COLOR_FACTOR,
+            &ThreadPool::new(1),
         );
         assert_ne!(chosen, 0, "the integer proxy must propose a change");
         assert_eq!(
@@ -3341,7 +3434,8 @@ mod tests {
                     &mut s0,
                     &mut s1,
                     [1.0; 3],
-                    K_COLOR_FACTOR
+                    K_COLOR_FACTOR,
+                    &ThreadPool::new(1),
                 ),
                 k,
                 "planted ytob_dc {k}"
@@ -3366,7 +3460,8 @@ mod tests {
                 &mut s0,
                 &mut s1,
                 [1.0; 3],
-                K_COLOR_FACTOR
+                K_COLOR_FACTOR,
+                &ThreadPool::new(1),
             ),
             0
         );
@@ -3389,6 +3484,7 @@ mod tests {
                 &mut s1,
                 [1.0; 3],
                 K_COLOR_FACTOR,
+                &ThreadPool::new(1),
             );
             assert!((-YTOB_DC_LIMIT..=YTOB_DC_LIMIT).contains(&k), "ytob_dc {k}");
             assert!((0..=255).contains(&(k + 128)));

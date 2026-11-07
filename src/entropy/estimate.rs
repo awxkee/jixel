@@ -31,7 +31,8 @@
 //! rate-model reconciliation log rely on.
 
 use crate::adaptive_quant::dirty_log2f;
-use crate::entropy::{OwnedEntropyCode, TokenSlice};
+use crate::entropy::{ALPHABET_SIZE, OwnedEntropyCode, TokenSlice};
+use crate::thread_pool::ThreadPool;
 
 pub(crate) fn estimate_ac_plain_bits<'a, I>(streams: I, code: &OwnedEntropyCode) -> u64
 where
@@ -96,6 +97,89 @@ fn estimate_ac_plain_bits_shared(
         });
     }
     bits
+}
+
+/// `estimate_ac_plain_bits` with the streams counted on the pool: a prefix
+/// code's bits are integers and sum in any order; the rANS price is the
+/// per-cluster symbol counts (integers, merged in stream order) times the
+/// cost table, one f64 term per (cluster, symbol) instead of one per token.
+/// That reorders the serial token-order sum by about 1e-6 bit, which the
+/// truncation to whole bits practically never sees (0 of 60 encodes changed
+/// a byte); the result is the same at any thread count.
+pub(crate) fn estimate_ac_plain_bits_pooled(
+    streams: &[TokenSlice<'_>],
+    code: &OwnedEntropyCode,
+    pool: Option<&ThreadPool>,
+) -> u64 {
+    fn map<T: Send>(
+        pool: Option<&ThreadPool>,
+        len: usize,
+        f: impl Fn(usize) -> T + Sync,
+    ) -> Vec<T> {
+        match pool {
+            Some(pool) => pool.map(len, f),
+            None => (0..len).map(f).collect(),
+        }
+    }
+    if code.use_prefix_code {
+        return map(pool, streams.len(), |i| {
+            let mut bits = 0u64;
+            streams[i].iter().for_each(|t| {
+                let cl = code.context_map[t.context as usize] as usize;
+                let (sym, nbits, _) =
+                    crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
+                let prefix = &code.prefix_codes[cl];
+                let depth = if prefix.single_symbol {
+                    0
+                } else {
+                    prefix.depths[sym as usize]
+                };
+                bits += depth as u64 + nbits as u64;
+            });
+            bits
+        })
+        .into_iter()
+        .sum();
+    }
+    let num_clusters = code.ans_histograms.len();
+    let counted = map(pool, streams.len(), |i| {
+        let mut counts = vec![0u32; num_clusters * ALPHABET_SIZE];
+        let mut raw_bits = 0u64;
+        streams[i].iter().for_each(|t| {
+            let cl = code.context_map[t.context as usize] as usize;
+            let (sym, nbits, _) =
+                crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
+            counts[cl * ALPHABET_SIZE + sym as usize] += 1;
+            raw_bits += u64::from(nbits);
+        });
+        (counts, raw_bits)
+    });
+    let mut counts = vec![0u64; num_clusters * ALPHABET_SIZE];
+    let mut raw_bits = 0u64;
+    for (stream_counts, stream_raw_bits) in counted {
+        for (total, count) in counts.iter_mut().zip(stream_counts) {
+            *total += u64::from(count);
+        }
+        raw_bits += stream_raw_bits;
+    }
+    // Every stream carries its 32-bit state, empty or not.
+    let mut bits = 32.0 * streams.len() as f64;
+    for (cl, histogram) in code.ans_histograms.iter().enumerate() {
+        for (sym, &f) in histogram.freqs.iter().enumerate() {
+            let count = counts[cl * ALPHABET_SIZE + sym];
+            if count == 0 {
+                continue;
+            }
+            let cost = if f == 0 {
+                crate::entropy::ANS_LOG_TAB_SIZE as f32
+            } else {
+                crate::entropy::ANS_LOG_TAB_SIZE as f32 - dirty_log2f(f as f32)
+            };
+            bits += count as f64 * cost as f64;
+        }
+    }
+    bits += raw_bits as f64;
+    bits as u64
 }
 
 #[cfg(test)]

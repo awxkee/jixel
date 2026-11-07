@@ -32,6 +32,7 @@
 use super::quantization::{DistanceParams, X_QM_REFINE_MAX_DISTANCE};
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use crate::thread_pool::ThreadPool;
 
 /// Fraction of exactly constant 8x8 blocks above which a frame is screen content.
 const SCREEN_CONTENT_CONSTANT_BLOCKS: f32 = 0.15;
@@ -91,50 +92,63 @@ const PIXEL_CHROMACITY_MIN_PIXELS: u32 = 4;
 /// steps from the pixel-to-pixel steps of X and of B - Y, plus one B step for
 /// strongly exposed blue. Thresholds are libjxl's; the step levels need
 /// `PIXEL_CHROMACITY_MIN_PIXELS` pixels, exposed blue a single one.
-fn pixel_chromacity_steps(xyb: &Image3F) -> (u32, u32) {
-    const X_LEVELS: [f32; 3] = [0.015, 0.022, 0.026];
-    const B_LEVELS: [f32; 3] = [0.28, 0.33, 0.38];
+///
+/// The rows are counted in bands on the pool; the counts are integers, so
+/// their sum is the serial scan's. That scan returned (3, 3) as soon as its
+/// running counts passed every level, which is what the final counts yield
+/// whenever they do.
+fn pixel_chromacity_steps(xyb: &Image3F, pool: &ThreadPool) -> (u32, u32) {
+    static X_LEVELS: [f32; 3] = [0.015, 0.022, 0.026];
+    static B_LEVELS: [f32; 3] = [0.28, 0.33, 0.38];
+    static BAND_ROWS: usize = 64;
     let (w, h) = (xyb.xsize(), xyb.ysize());
     if w < 2 || h < 2 {
         return (0, 0);
     }
     let (mut x_counts, mut b_counts, mut exposed_blue) = ([0u32; 3], [0u32; 3], 0u32);
-    let rows = xyb
-        .plane_data(0)
-        .chunks_exact(w)
-        .zip(xyb.plane_data(1).chunks_exact(w))
-        .zip(xyb.plane_data(2).chunks_exact(w));
-    for (((xp, yp), bp), ((xr, yr), br)) in rows.clone().zip(rows.skip(1)) {
-        // Carry the left pixel and its B - Y difference between iterations.
-        let mut current = xr.iter().zip(yr).zip(br);
-        let Some(((&xl, &yl), &bl)) = current.next() else {
-            continue;
-        };
-        let (mut left_x, mut left_b, mut left_diff) = (xl, bl, bl - yl);
-        let previous = xp.iter().zip(yp).zip(bp).skip(1);
-        for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
-            let step_x = (x - left_x).abs().max((x - px).abs());
-            let diff_b = b - y;
-            let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
-            for (count, level) in x_counts.iter_mut().zip(X_LEVELS) {
-                *count += u32::from(step_x >= level);
+    // Row pairs (y - 1, y) for y in 1..h, by bands of the current row.
+    let partials = pool.map((h - 1).div_ceil(BAND_ROWS), |band| {
+        let (mut x_counts, mut b_counts, mut exposed_blue) = ([0u32; 3], [0u32; 3], 0u32);
+        let y0 = 1 + band * BAND_ROWS;
+        let y1 = (y0 + BAND_ROWS).min(h);
+        for y in y0..y1 {
+            let [xp, yp, bp] = [0, 1, 2].map(|c| xyb.plane_row(c, y - 1));
+            let [xr, yr, br] = [0, 1, 2].map(|c| xyb.plane_row(c, y));
+            // Carry the left pixel and its B - Y difference between iterations.
+            let mut current = xr.iter().zip(yr).zip(br);
+            let Some(((&xl, &yl), &bl)) = current.next() else {
+                continue;
+            };
+            let (mut left_x, mut left_b, mut left_diff) = (xl, bl, bl - yl);
+            let previous = xp.iter().zip(yp).zip(bp).skip(1);
+            for (((&x, &y), &b), ((&px, &py), &pb)) in current.zip(previous) {
+                let step_x = (x - left_x).abs().max((x - px).abs());
+                let diff_b = b - y;
+                let step_b = (diff_b - left_diff).abs().max((diff_b - (pb - py)).abs());
+                for (count, level) in x_counts.iter_mut().zip(X_LEVELS) {
+                    *count += u32::from(step_x >= level);
+                }
+                for (count, level) in b_counts.iter_mut().zip(B_LEVELS) {
+                    *count += u32::from(step_b > level);
+                }
+                // The gradient factor is nonnegative, so negative exposure never passes.
+                let step = (b - left_b).abs() + (b - pb).abs();
+                exposed_blue += u32::from((b - y * 1.2) * step >= 0.13);
+                left_x = x;
+                left_b = b;
+                left_diff = diff_b;
             }
-            for (count, level) in b_counts.iter_mut().zip(B_LEVELS) {
-                *count += u32::from(step_b > level);
-            }
-            // The gradient factor is nonnegative, so negative exposure never passes.
-            let step = (b - left_b).abs() + (b - pb).abs();
-            exposed_blue += u32::from((b - y * 1.2) * step >= 0.13);
-            left_x = x;
-            left_b = b;
-            left_diff = diff_b;
         }
-        if x_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
-            && b_counts[2] >= PIXEL_CHROMACITY_MIN_PIXELS
-            && exposed_blue > 0
-        {
-            return (3, 3);
+        (x_counts, b_counts, exposed_blue)
+    });
+    for (x, b, exposed) in partials {
+        for (count, extra) in x_counts.iter_mut().zip(x) {
+            *count += extra;
         }
+        for (count, extra) in b_counts.iter_mut().zip(b) {
+            *count += extra;
+        }
+        exposed_blue += exposed;
     }
     // Counts shrink level by level, so the passed levels are a prefix.
     let level = |counts: [u32; 3]| {
@@ -404,10 +418,10 @@ pub(super) fn configure_chroma(
     ctx.set_luma_texture(luma_texture_stat);
     let (x_steps, b_steps) = match ctx.speed {
         _ if is_achromatic => (0, 0),
-        _ if slow_chromatic => pixel_chromacity_steps(xyb),
+        _ if slow_chromatic => pixel_chromacity_steps(xyb, &ctx.thread_pool),
         // Without the chroma policy the B steps only cost rate.
         _ if ctx.speed.effort().pixel_chromacity_x && distance >= PIXEL_CHROMACITY_MIN_DISTANCE => {
-            (pixel_chromacity_steps(xyb).0, 0)
+            (pixel_chromacity_steps(xyb, &ctx.thread_pool).0, 0)
         }
         _ => (0, 0),
     };

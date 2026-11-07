@@ -95,9 +95,14 @@ effort_gates! {
     /// The DC streams race the second libjxl weighted-predictor preset
     /// exactly against the default (Fast and up).
     dc_wp_race,
-    /// The MA-learned DC tree arm under its lite budget (`ma_dc_tree` runs
-    /// the full budget).
+    /// The MA-learned DC tree arm under its xlite budget (32 leaves, 64K
+    /// samples, one side predictor, static metadata side).
+    ma_dc_tree_xlite,
+    /// ... under its lite budget (`ma_dc_tree` runs the full budget).
     ma_dc_tree_lite,
+    /// ... with 400 leaves learned from every DC sample (Medium; large
+    /// screenshots carry it, small DC planes never fill the lite cap).
+    ma_dc_tree_deep,
     /// ... and fit the parameters by coordinate descent when it wins
     /// (`dc_wp_fit` races every preset and always fits).
     dc_wp_fit_on_win,
@@ -290,6 +295,7 @@ static FASTEST: Effort = Effort {
     merge_busy_quads: true,
     layout_dp_coefficient: true,
     dc_predictor_search: true,
+    ma_dc_tree_xlite: true,
     ac_prefix_clustering: true,
     ..ULTRAFAST
 };
@@ -308,6 +314,7 @@ static FAST: Effort = Effort {
     dc_predictor_search: true,
     dc_learned_tree: true,
     dc_wp_race: true,
+    ma_dc_tree_xlite: true,
     ma_dc_tree_lite: true,
     huc_select: true,
     ac_prefix_clustering: true,
@@ -333,6 +340,7 @@ static MEDIUM: Effort = Effort {
     dc_rdoq: true,
     dc_rdoq_refit: true,
     dc_wp_race: true,
+    ma_dc_tree_deep: true,
     chroma_dc_squeeze: true,
     dc_x_cfl: true,
     ink_layer_default: true,

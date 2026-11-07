@@ -1141,7 +1141,7 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     if !ctx.speed.effort().yellow_opsin || !ctx.coding.is_xyb() {
         return;
     }
-    let selection = crate::yellow_opsin::select_yellow(linear, distance);
+    let selection = crate::yellow_opsin::select_yellow(linear, distance, &ctx.thread_pool);
     if let Some(m) = selection.matrix {
         ctx.set_xyb_matrix(m, distance, selection.default_channel_weights);
     }

@@ -596,6 +596,7 @@ fn encode_frame_core_inner(
                 &mut scratch.dc_cfl_prev,
                 distp.dc_step,
                 ctx.cfl_frame().color_factor,
+                &ctx.thread_pool,
             );
             crate::color_correlation::validate_ytob_dc(
                 &dc_datas,
@@ -901,6 +902,7 @@ fn encode_frame_core_inner(
             dc_cfl,
             compensate_b,
             ctx.dc_rows.adjust_b,
+            &ctx.thread_pool,
         )?;
     }
     if ctx.coding.is_xyb() && ctx.speed.effort().dc_rdoq && !use_dc_frame {
@@ -1023,6 +1025,11 @@ fn encode_frame_core_inner(
     // and tokens. Release the full-resolution planes before its working sets.
     drop(opsin_image);
 
+    /// A weighted-predictor candidate whose estimate under the incumbent's
+    /// code is this much worse (per 10 000) is not coded: on 30 encodes the
+    /// closest candidate that then won sat at +0.8 ‰, the worst miss of the
+    /// estimate against the coded candidate at 4 ‰ on losers only.
+    const DC_WP_SKIP_MARGIN_PER_10K: u64 = 15;
     // The DC streams' weighted-predictor parameters: libjxl presets raced on
     // the complete DC coding (the MA-learned tree is learned once and
     // re-tokenized under each), then the parameters fitted from the winning
@@ -1047,17 +1054,31 @@ fn encode_frame_core_inner(
         let mut offer = |params: crate::weighted_predictor::WpParams,
                          dc_entropy: &mut super::dc_entropy::DcEntropy,
                          scratch: &mut CoderScratch| {
-            let candidate = super::dc_entropy::prepare_dc_entropy(
-                ctx,
-                scratch,
-                &dc_datas,
-                dim.num_dc_groups,
-                epf_sharpness,
-                use_dc_frame,
-                distance,
-                params,
-                dc_entropy.ma_tree.as_ref(),
-            );
+            // Under the MA arm the candidate parameters are priced first
+            // under the incumbent's tree and code.
+            let candidate = match dc_entropy.dc_tokens_under(ctx, scratch, &dc_datas, params) {
+                Some(dc) => {
+                    let estimate = dc_entropy.bits_with(dim.num_dc_groups, scratch, &dc, params);
+                    if estimate * 10_000 >= best_bits * (10_000 + DC_WP_SKIP_MARGIN_PER_10K) {
+                        return;
+                    }
+                    dc_entropy.warmed(ctx, scratch, dc, params)
+                }
+                None => None,
+            }
+            .unwrap_or_else(|| {
+                super::dc_entropy::prepare_dc_entropy(
+                    ctx,
+                    scratch,
+                    &dc_datas,
+                    dim.num_dc_groups,
+                    epf_sharpness,
+                    use_dc_frame,
+                    distance,
+                    params,
+                    dc_entropy.ma_tree.as_ref(),
+                )
+            });
             let bits = candidate.bits(dim.num_dc_groups, scratch);
             if bits < best_bits {
                 best_bits = bits;
@@ -1109,18 +1130,30 @@ fn encode_frame_core_inner(
             &ctx.thread_pool,
         )?;
         if changed {
+            // The DC levels moved by a few steps: re-tokenize through the
+            // same tree and warm-start the code from the pre-refit one
+            // (recount, Slow refinement). On 30 encodes at Medium and
+            // MediumSlow that matched a rebuild from scratch (bytes
+            // −0.0006 % in all, −0.20..+0.03 % per image) at a third of
+            // the call's time.
             let trees = trees.clone();
-            dc_entropy = super::dc_entropy::prepare_dc_entropy(
-                ctx,
-                scratch,
-                &dc_datas,
-                dim.num_dc_groups,
-                epf_sharpness,
-                use_dc_frame,
-                distp.distance,
-                dc_entropy.wp_params,
-                Some(&trees),
-            );
+            let warmed = dc_entropy
+                .dc_tokens_under(ctx, scratch, &dc_datas, dc_entropy.wp_params)
+                .and_then(|dc| dc_entropy.warmed(ctx, scratch, dc, dc_entropy.wp_params));
+            dc_entropy = match warmed {
+                Some(entropy) => entropy,
+                None => super::dc_entropy::prepare_dc_entropy(
+                    ctx,
+                    scratch,
+                    &dc_datas,
+                    dim.num_dc_groups,
+                    epf_sharpness,
+                    use_dc_frame,
+                    distp.distance,
+                    dc_entropy.wp_params,
+                    Some(&trees),
+                ),
+            };
         }
     }
     let super::dc_entropy::DcEntropy {

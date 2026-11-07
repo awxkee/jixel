@@ -330,13 +330,13 @@ fn write_lattice_section(
     }
 
     write_group_header_local_tree(w);
-    let tree_code =
-        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
-    w.write(1, 0); // no LZ77 for the tree entropy code
-    write_entropy_code(&tree_code.as_ref(), &mut scratch.huffman_pool, w);
-    for tok in &tree_tokens {
-        write_token(*tok, &tree_code.as_ref(), w);
-    }
+    // The tree's entropy code (no LZ77), then its tokens.
+    crate::entropy::write_raced_token_stream(
+        &tree_tokens,
+        NUM_TREE_CONTEXTS,
+        &mut scratch.huffman_pool,
+        w,
+    );
     let pixel_code = build_pixel_code_n(&tokens, 3, &mut scratch.huffman_pool);
     w.write(1, 0); // no LZ77 for the pixel entropy code
     write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w);
@@ -678,15 +678,13 @@ pub(crate) fn write_tree_and_pixel_histograms(
         Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
         Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
     ];
-    let tree_code =
-        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
-    let tree_code_ref = tree_code.as_ref();
-
-    w.write(1, 0); // no LZ77 for tree entropy code
-    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
-    for tok in &tree_tokens {
-        write_token(*tok, &tree_code_ref, w);
-    }
+    // The tree's entropy code (no LZ77), then its tokens.
+    crate::entropy::write_raced_token_stream(
+        &tree_tokens,
+        NUM_TREE_CONTEXTS,
+        &mut scratch.huffman_pool,
+        w,
+    );
 
     // num_contexts = 1: decoder skips context map entirely — write prefix
     // codes directly (no write_context_map).
@@ -729,15 +727,13 @@ fn write_split_tree(scratch: &mut CoderScratch, w: &mut BitWriter) {
         Token::new(TREE_CTX_MULTIPLIER_LOG, 0),
         Token::new(TREE_CTX_MULTIPLIER_BITS, 0),
     ];
-    let tree_code =
-        optimize_entropy_code(&tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
-    let tree_code_ref = tree_code.as_ref();
-
-    w.write(1, 0); // no LZ77 for tree entropy code
-    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
-    for tok in &tree_tokens {
-        write_token(*tok, &tree_code_ref, w);
-    }
+    // The tree's entropy code (no LZ77), then its tokens.
+    crate::entropy::write_raced_token_stream(
+        &tree_tokens,
+        NUM_TREE_CONTEXTS,
+        &mut scratch.huffman_pool,
+        w,
+    );
 }
 
 pub(crate) fn build_pixel_code(tokens: &[Token], scratch: &mut CoderScratch) -> OwnedEntropyCode {

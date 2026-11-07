@@ -33,7 +33,7 @@ use super::GroupLayout;
 use super::rct::write_rct_transform;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::entropy::{Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token};
+use crate::entropy::{Token, pack_signed};
 use crate::patches::{ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference};
 use crate::path_order;
 
@@ -462,50 +462,9 @@ fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Ve
 
 fn encode_patch_dictionary(tokens: &[Token], scratch: &mut CoderScratch) -> BitWriter {
     // Dense text makes the dictionary a real share of the frame (a third of
-    // a text page): race the prefix code against a config-selected rANS code.
-    let mut prefix_bits = BitWriter::new();
-    {
-        let code = optimize_entropy_code(tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool);
-        let code_ref = code.as_ref();
-        prefix_bits.write(1, 0); // patch dictionary entropy stream has no LZ77
-        write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut prefix_bits);
-        for &token in tokens {
-            write_token(token, &code_ref, &mut prefix_bits);
-        }
-    }
-    let mut ans_bits = BitWriter::new();
-    {
-        let code = crate::entropy::optimize_entropy_code_ac_streams(
-            std::iter::once(tokens),
-            NUM_PATCH_CONTEXTS,
-            &mut scratch.huffman_pool,
-            true,
-            crate::Speed::Slow,
-            None,
-        );
-        let code_ref = code.as_ref();
-        ans_bits.write(1, 0);
-        write_entropy_code(&code_ref, &mut scratch.huffman_pool, &mut ans_bits);
-        if code_ref.use_prefix_code {
-            for &token in tokens {
-                write_token(token, &code_ref, &mut ans_bits);
-            }
-        } else {
-            crate::entropy::write_ans_tokens(
-                tokens,
-                code_ref.context_map,
-                code_ref.ans_symbols,
-                code_ref.ans_reverse_maps,
-                code_ref.hybrid_uint_configs,
-                &mut ans_bits,
-            );
-        }
-    }
-    if ans_bits.bits_written() < prefix_bits.bits_written() {
-        ans_bits
-    } else {
-        prefix_bits
-    }
+    // a text page): the prefix code raced against config-selected codes in
+    // both modes by exact bits.
+    crate::entropy::raced_token_stream(tokens, NUM_PATCH_CONTEXTS, &mut scratch.huffman_pool)
 }
 
 /// Whether the occurrences of `reference` may be applied in any order: Add

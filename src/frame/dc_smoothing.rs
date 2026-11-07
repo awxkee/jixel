@@ -431,6 +431,7 @@ pub(super) fn choose_chroma_dc_coding(
     cfl: crate::color_correlation::CflFrame,
     compensate_b: bool,
     adjust_row: AdjustBdcFn,
+    pool: &ThreadPool,
 ) -> Result<(), EncodeError> {
     const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
@@ -444,9 +445,15 @@ pub(super) fn choose_chroma_dc_coding(
         return Ok(());
     }
     let mut t = try_vec![0.0f32; w * h]?;
-    let mut rec = try_vec![0.0f32; w * h]?;
     let mut levels = try_vec![0i32; w * h]?;
     let mut best_levels = try_vec![0i32; w * h]?;
+    // Per-candidate Haar reconstruction and levels, with the candidate's
+    // (distortion, bits) once priced.
+    type HfCandidate = (Vec<f32>, Vec<i32>, Option<(f64, f64)>);
+    let mut hf_candidates: Vec<HfCandidate> = Vec::new();
+    for _ in CHROMA_DC_SQUEEZE_HF_STEPS {
+        hf_candidates.push((try_vec![0.0f32; w * h]?, try_vec![0i32; w * h]?, None));
+    }
     // Luma is unchanged by the chroma search. Stitch it once, then price each
     // candidate in raster order without resolving DC-group coordinates again.
     let mut y_levels = try_vec![0i16; w * h]?;
@@ -529,12 +536,16 @@ pub(super) fn choose_chroma_dc_coding(
         let fine_level = |value: f32, y_level: f32| -> i32 {
             ((value + y_level * cfl_coarse) / ratio - y_level * cfl_fine).round() as i32
         };
-        let mut best = None;
-        for &q_hf in &CHROMA_DC_SQUEEZE_HF_STEPS {
-            haar_smooth(&t, w, h, q_hf, &mut rec);
+        // The candidates smooth, quantize and price on the pool, each in its
+        // own buffers, and are judged in step order afterwards: the price is
+        // an integer histogram's, the distortion each candidate's own sum.
+        let (t_ref, y_levels_ref, dc_ref): (&[f32], &[i16], &[DcGroupData]) =
+            (&t, &y_levels, dc_datas);
+        pool.for_each_mut(&mut hf_candidates, |ci, (rec, levels, priced)| {
+            haar_smooth(t_ref, w, h, CHROMA_DC_SQUEEZE_HF_STEPS[ci], rec);
             let mut d = 0.0f64;
             for (((level, &value), &target), &y) in
-                levels.iter_mut().zip(&rec).zip(&t).zip(&y_levels)
+                levels.iter_mut().zip(rec.iter()).zip(t_ref).zip(y_levels_ref)
             {
                 let y_level = f32::from(y);
                 let l = fine_level(value, y_level);
@@ -542,10 +553,13 @@ pub(super) fn choose_chroma_dc_coding(
                 let back = (l as f32 + y_level * cfl_fine) * ratio - y_level * cfl_coarse;
                 d += f64::from(target - back).powi(2);
             }
-            if d > max_d {
+            *priced = (d <= max_d).then(|| (d, plane_price(levels, w, dim, dc_ref)));
+        });
+        let mut best = None;
+        for (_, levels, priced) in hf_candidates.iter_mut() {
+            let Some((d, bits)) = *priced else {
                 continue;
-            }
-            let bits = plane_price(&levels, w, dim, dc_datas);
+            };
             if bits > base_bits {
                 continue;
             }
@@ -553,8 +567,8 @@ pub(super) fn choose_chroma_dc_coding(
             if best.is_none_or(|b| score < b) {
                 best = Some(score);
                 // Preserve the winner without another Haar and quantization
-                // pass. The next candidate overwrites every scratch level.
-                std::mem::swap(&mut levels, &mut best_levels);
+                // pass; the candidate's buffer is not read again.
+                std::mem::swap(levels, &mut best_levels);
             }
         }
         let Some(score) = best else {
@@ -685,6 +699,7 @@ mod tests {
             cfl,
             true,
             selected_dc_row_kernels().adjust_b,
+            &ThreadPool::new(1),
         )
         .unwrap();
         assert_eq!(params.dc_step, expected_params.dc_step);
@@ -1018,6 +1033,7 @@ mod tests {
             cfl,
             false,
             selected_dc_row_kernels().adjust_b,
+            &ThreadPool::new(1),
         )
         .unwrap();
         assert_eq!(
@@ -1067,6 +1083,7 @@ mod tests {
                 cfl,
                 false,
                 selected_dc_row_kernels().adjust_b,
+                &ThreadPool::new(1),
             )
             .unwrap();
             assert_eq!(params.dc_step, [1.0; 3]);
@@ -1183,6 +1200,7 @@ mod tests {
                                 cfl,
                                 false,
                                 selected_dc_row_kernels().adjust_b,
+                                &ThreadPool::new(1),
                             )
                         }
                     };

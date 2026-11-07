@@ -648,9 +648,38 @@ pub(crate) struct AnsTokenCodeRef<'a> {
     pub(crate) hybrid_uint_configs: &'a [super::token::HybridUintConfig],
 }
 
+/// Exact bits of one ANS stream under `code`: its 32-bit state plus every
+/// token's extra bits and renormalization words.
+pub(crate) fn ans_tokens_bits_under<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
+    code: &AnsTokenCodeRef<'_>,
+) -> usize {
+    let tokens = tokens.into();
+    let mut coder = AnsCoder::new();
+    let mut bits = 32usize;
+    tokens.iter().rev().for_each(|token| {
+        let hist = code.context_map[token.context as usize] as usize;
+        let (symbol, nbits, _) =
+            super::token::uint_encode_with_config(token.value, code.hybrid_uint_configs[hist]);
+        let reverse_start = hist * ANS_TAB_SIZE as usize;
+        if coder
+            .put_symbol(
+                &code.symbol_info[hist][symbol as usize],
+                &code.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
+            )
+            .is_some()
+        {
+            bits += 16;
+        }
+        bits += nbits as usize;
+    });
+    bits
+}
+
 /// Count two ANS streams in one traversal, sharing symbolization when their
 /// configurations agree. Reclustering may choose different configurations,
 /// so each state must use its own symbol and extra-bit count in that case.
+#[cfg(test)]
 pub(crate) fn ans_tokens_bits_pair<'a>(
     tokens: impl Into<TokenSlice<'a>>,
     first: &AnsTokenCodeRef<'_>,

@@ -183,39 +183,48 @@ pub(super) fn few_colors(
             (k << 21) | (((r[x] * 1024.0) + 0.5) as i64 as u64 & 0x1f_ffff)
         })
     };
+    // `seen` is an open-addressing set of the keys met so far (63-bit keys,
+    // so all-ones marks an empty slot), sized for `limit + 1` distinct keys
+    // at half load; the scan stops at the first key past the limit.
+    const EMPTY: u64 = u64::MAX;
+    let capacity = (2 * (limit + 1)).next_power_of_two().max(16);
+    let shift = 64 - capacity.trailing_zeros();
+    let mask = capacity - 1;
     seen.clear();
-    // Large footprints: the linear scan is quadratic in the color limit.
-    if limit > 64 {
+    seen.resize(capacity, EMPTY);
+    let mut distinct = 0usize;
+    let few = 'scan: {
         for y in y0..y1 {
             let rows = [
                 opsin.plane_row(0, y),
                 opsin.plane_row(1, y),
                 opsin.plane_row(2, y),
             ];
-            seen.extend((x0..x1).map(|x| key_at(&rows, x)));
-        }
-        seen.sort_unstable();
-        seen.dedup();
-        return seen.len() <= limit;
-    }
-    seen.reserve(limit);
-    for y in y0..y1 {
-        let rows = [
-            opsin.plane_row(0, y),
-            opsin.plane_row(1, y),
-            opsin.plane_row(2, y),
-        ];
-        for x in x0..x1 {
-            let key = key_at(&rows, x);
-            if !seen.contains(&key) {
-                if seen.len() == limit {
-                    return false;
+            for x in x0..x1 {
+                let key = key_at(&rows, x);
+                let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
+                loop {
+                    let held = seen[slot];
+                    if held == key {
+                        break;
+                    }
+                    if held == EMPTY {
+                        if distinct == limit {
+                            break 'scan false;
+                        }
+                        seen[slot] = key;
+                        distinct += 1;
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
                 }
-                seen.push(key);
             }
         }
-    }
-    true
+        true
+    };
+    // The table is rebuilt per call; leave the scratch empty.
+    seen.clear();
+    few
 }
 
 /// How `rdoq_block` searches a block's levels.
@@ -686,7 +695,18 @@ fn rdoq_block_beam<const K: usize>(
         }
         if counts > K {
             let key = |slot: usize| cost_of[slot][0].min(cost_of[slot][1]);
-            order[..counts].sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+            // The stable sort's first K: each step brings the cheapest
+            // remaining count forward (the first one on ties) and keeps the
+            // others in order.
+            for p in 0..K {
+                let mut best = p;
+                for q in p + 1..counts {
+                    if key(order[q]).total_cmp(&key(order[best])) == std::cmp::Ordering::Less {
+                        best = q;
+                    }
+                }
+                order[p..=best].rotate_right(1);
+            }
         }
         paths = counts.min(K);
         for (path, &slot) in order[..paths].iter().enumerate() {
@@ -1426,7 +1446,9 @@ mod tests {
                 }
             }
         }
-        let mut seen = vec![u64::MAX; 100];
+        // Room for the table a limit of 64 colors builds (2 × 65 → 256
+        // slots), so every call below reuses the storage.
+        let mut seen = vec![u64::MAX; 256];
         let storage = seen.as_ptr();
         assert!(super::few_colors(&xyb, 0, 0, 8, 8, 24, &mut seen));
         assert!(super::few_colors(&xyb, 0, 0, 8, 8, 2, &mut seen));
