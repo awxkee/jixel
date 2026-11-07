@@ -242,6 +242,25 @@ fn histogram_merge_increment(
 /// repay one additional histogram header. The approximate search only proposes
 /// clusters; every merge accepted here strictly reduces the old exact model
 /// (`payload + 64 bits per distinct histogram`).
+/// Exact saving of merging clusters `a < b` (both active): before, cost(a)
+/// + header + cost(b) + header; after, combined + header.
+fn exact_merge_delta(
+    a: usize,
+    b: usize,
+    clusters: &[Histogram],
+    costs: &[f32; CLUSTERS_LIMIT],
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> f32 {
+    let mut merged_counts = clusters[a].counts;
+    add_counts(&mut merged_counts, &clusters[b].counts);
+    let combined = exact_counts_bit_cost(
+        &merged_counts,
+        clusters[a].total_count + clusters[b].total_count,
+        huffman_pool,
+    );
+    combined - costs[a] - costs[b] - MIN_DISTANCE_FOR_DISTINCT
+}
+
 fn update_exact_merge_pair(
     i: usize,
     j: usize,
@@ -255,21 +274,18 @@ fn update_exact_merge_pair(
         return;
     }
     let (a, b) = if i < j { (i, j) } else { (j, i) };
-    let mut merged_counts = clusters[a].counts;
-    add_counts(&mut merged_counts, &clusters[b].counts);
-    let combined = exact_counts_bit_cost(
-        &merged_counts,
-        clusters[a].total_count + clusters[b].total_count,
-        huffman_pool,
-    );
-    // Before: cost(a) + header + cost(b) + header. After: combined + header.
-    deltas[a * CLUSTERS_LIMIT + b] = combined - costs[a] - costs[b] - MIN_DISTANCE_FOR_DISTINCT;
+    deltas[a * CLUSTERS_LIMIT + b] = exact_merge_delta(a, b, clusters, costs, huffman_pool);
 }
+
+/// Active clusters from which the initial pair matrix is priced on the pool
+/// (one row per cluster, each pair independent of the others).
+const EXACT_MERGE_PARALLEL_MIN_CLUSTERS: usize = 24;
 
 fn exact_merge_final_clusters(
     clusters: &mut [Histogram],
     symbols: &mut [u8],
     huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
 ) {
     let n = clusters.len();
     if n <= 1 {
@@ -284,9 +300,46 @@ fn exact_merge_final_clusters(
     }
 
     let mut deltas = [f32::INFINITY; CLUSTERS_LIMIT * CLUSTERS_LIMIT];
-    for i in 0..n {
-        for j in i + 1..n {
-            update_exact_merge_pair(i, j, clusters, &active, &costs, &mut deltas, huffman_pool);
+    let active_count = active[..n].iter().filter(|&&a| a).count();
+    match pool
+        .filter(|pool| pool.num_threads() > 1 && active_count >= EXACT_MERGE_PARALLEL_MIN_CLUSTERS)
+    {
+        Some(pool) => {
+            // Every pair is priced on its own; the rows land in the same
+            // cells the serial loop fills.
+            let clusters_ref = &*clusters;
+            let (active_ref, costs_ref) = (&active, &costs);
+            let rows: Vec<Vec<f32>> = pool.map(n, |i| {
+                let mut row = vec![f32::INFINITY; n];
+                if active_ref[i] {
+                    let mut huffman_pool = Vec::new();
+                    for (j, cell) in row.iter_mut().enumerate().skip(i + 1) {
+                        if active_ref[j] {
+                            *cell =
+                                exact_merge_delta(i, j, clusters_ref, costs_ref, &mut huffman_pool);
+                        }
+                    }
+                }
+                row
+            });
+            for (i, row) in rows.into_iter().enumerate() {
+                deltas[i * CLUSTERS_LIMIT..i * CLUSTERS_LIMIT + n].copy_from_slice(&row);
+            }
+        }
+        None => {
+            for i in 0..n {
+                for j in i + 1..n {
+                    update_exact_merge_pair(
+                        i,
+                        j,
+                        clusters,
+                        &active,
+                        &costs,
+                        &mut deltas,
+                        huffman_pool,
+                    );
+                }
+            }
         }
     }
 
@@ -623,7 +676,7 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
         }
     }
 
-    exact_merge_final_clusters(&mut clusters[..num_clusters], symbols, huffman_pool);
+    exact_merge_final_clusters(&mut clusters[..num_clusters], symbols, huffman_pool, None);
     let mut compact = [UNMAPPED; CLUSTERS_LIMIT];
     let mut compact_len = 0usize;
     for (old, histogram) in clusters[..num_clusters].iter().enumerate() {
@@ -660,6 +713,13 @@ pub(crate) fn cluster_histograms_fixed<const MAX_CONTEXTS: usize>(
 /// cluster changed by an earlier assignment is always rescored on the caller,
 /// so the original input order, floating-point operations and first-best ties
 /// are preserved even though most distances are computed by workers.
+/// Unassigned contexts from which the prefix assignment prices its
+/// distances on the pool: a 400-leaf DC tree (~300 pending against 128
+/// seeds) is 7 ms serial. Lanes per batch of 128 rows: eight leave every
+/// worker a 16-row slice.
+const ASSIGN_PARALLEL_MIN_PENDING: usize = 256;
+const ASSIGN_PARALLEL_LANES: usize = 8;
+
 fn assign_prefix_histograms_parallel(
     inp: &[Histogram],
     in_costs: &[f32],
@@ -677,11 +737,10 @@ fn assign_prefix_histograms_parallel(
         .enumerate()
         .filter_map(|(i, &symbol)| (symbol == unassigned).then_some(i))
         .collect();
-    if pending.len() < 1024 {
+    if pending.len() < ASSIGN_PARALLEL_MIN_PENDING {
         return false;
     }
     // Amortize dispatch while bounding the cached distances to 64 KiB.
-    // Four lanes leave enough work per worker even for the smaller clusters.
     const BATCH: usize = 128;
     let mut distances = vec![[0.0f32; CLUSTERS_LIMIT]; BATCH];
     let mut caller_scratch = CoderScratch::lossless();
@@ -690,7 +749,7 @@ fn assign_prefix_histograms_parallel(
         pool.steal_for_each_mut_with_threads(
             &mut caller_scratch,
             &mut distances[..batch.len()],
-            4,
+            ASSIGN_PARALLEL_LANES,
             |row, distances, _| {
                 let i = batch[row];
                 let mut scratch = [0u32; ALPHABET_SIZE];
@@ -828,8 +887,6 @@ fn cluster_histograms_inner(
         .filter(|pool| n >= 1024 && pool.num_threads() > 1)
         .map(|pool| (pool, CoderScratch::lossless(), vec![0.0f32; n]));
 
-    // See the note in `cluster_histograms_fixed`: the stop test is on the total
-    // saving a cluster realizes, not on one context's distance.
     while largest_idx != usize::MAX && out.len() < max_histograms {
         let candidate = largest_idx;
         // Pushed speculatively; popped again if the candidate does not earn its
@@ -1026,7 +1083,7 @@ fn cluster_histograms_inner(
         }
     }
 
-    exact_merge_final_clusters(&mut out, &mut symbols, huffman_pool);
+    exact_merge_final_clusters(&mut out, &mut symbols, huffman_pool, pool);
     // Drop clusters emptied by relocation or exact merging and update
     // assignments before the stable first-occurrence reindex below.
     let mut compact = vec![UNMAPPED; out.len()];
@@ -1229,6 +1286,15 @@ pub(crate) fn cluster_histograms_ans(
         .map(|pool| (pool, CoderScratch::lossless()));
     let mut scratch = AnsCostScratch::new();
     let in_costs: Vec<f64> = par_map(n, &mut workers, |i, s| cost_of(&histograms[i], s));
+    // Each seeding round prices only `n` merges (~0.1 µs each); below a few
+    // thousand contexts the dispatch costs more than the work.
+    const SEED_PARALLEL_MIN_CONTEXTS: usize = 2048;
+    let mut no_workers = None;
+    let seed_workers = if n >= SEED_PARALLEL_MIN_CONTEXTS {
+        &mut workers
+    } else {
+        &mut no_workers
+    };
 
     // Greedy k-center: seed with the heaviest context, keep adding the context
     // farthest (most expensive to fold into any existing cluster) while
@@ -1264,7 +1330,7 @@ pub(crate) fn cluster_histograms_ans(
         let last_cost = cluster_costs[column];
         let updated: Vec<(f64, f64)> = {
             let dists = &dists;
-            par_map(n, &mut workers, |i, s| {
+            par_map(n, seed_workers, |i, s| {
                 let h = &histograms[i];
                 if h.total_count == 0 || dists[i] == 0.0 {
                     return (0.0, f64::NAN);
@@ -2054,7 +2120,7 @@ mod tests {
         let mut huffman_pool = Vec::new();
         let before = exact_model_cost(&clusters, &mut huffman_pool);
 
-        exact_merge_final_clusters(&mut clusters, &mut symbols, &mut huffman_pool);
+        exact_merge_final_clusters(&mut clusters, &mut symbols, &mut huffman_pool, None);
 
         let after = exact_model_cost(&clusters, &mut huffman_pool);
         assert!(after < before);
@@ -2069,7 +2135,7 @@ mod tests {
         let mut huffman_pool = Vec::new();
         let before = exact_model_cost(&clusters, &mut huffman_pool);
 
-        exact_merge_final_clusters(&mut clusters, &mut symbols, &mut huffman_pool);
+        exact_merge_final_clusters(&mut clusters, &mut symbols, &mut huffman_pool, None);
 
         let after = exact_model_cost(&clusters, &mut huffman_pool);
         assert_eq!(after, before);

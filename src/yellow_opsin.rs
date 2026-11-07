@@ -31,6 +31,7 @@
 
 use crate::image::Image3F;
 use crate::quant_weights::DequantMatrices;
+use crate::thread_pool::ThreadPool;
 use crate::xyb::{XybMatrix, rgb_to_xyb_pixel_f32, xyb_to_rgb_pixel_f32};
 
 /// Spec forward-matrix row constants (duplicated from `xyb.rs` consts so a
@@ -463,7 +464,14 @@ fn evaluate_bias(samples: &[SamplePixel], m: &XybMatrix, steps: [f32; 3]) -> Bia
 /// absolute luma step from a risky pixel to each of its four neighbors. A
 /// one-sided, subsampled version moved by 9 % with the image's orientation
 /// and put Kodak 13 on either side of `YELLOW_EDGE_MIN` (+16 % bytes).
-fn yellow_edge_and_strong_fraction(linear: &Image3F) -> (f32, f32) {
+///
+/// Scanned in row bands on the pool, each computing the luma of its rows
+/// plus a one-row halo. The band height is fixed, so the band partials and
+/// the order they are added in do not depend on the thread count; the f64
+/// sum of ~10⁷ f32 steps is then rounded to f32, which absorbs the
+/// reordering (relative noise 1e-13 against an f32 ulp of 6e-8).
+fn yellow_edge_and_strong_fraction(linear: &Image3F, pool: &ThreadPool) -> (f32, f32) {
+    const BAND_ROWS: usize = 64;
     let (w, h) = (linear.xsize(), linear.ysize());
     if w == 0 || h == 0 {
         return (0.0, 0.0);
@@ -471,44 +479,48 @@ fn yellow_edge_and_strong_fraction(linear: &Image3F) -> (f32, f32) {
     let rp = linear.plane_data(0);
     let gp = linear.plane_data(1);
     let bp = linear.plane_data(2);
-    let luma: Vec<f32> = rp
-        .iter()
-        .zip(gp)
-        .zip(bp)
-        .map(|((&r, &g), &b)| 0.3 * r + 0.6 * g + 0.1 * b)
-        .collect();
-    let risky: Vec<bool> = rp
-        .iter()
-        .zip(gp)
-        .zip(bp)
-        .map(|((&r, &g), &b)| yellow_pixel_risk(r, g, b) > STRONG_SCORE)
-        .collect();
-    let (mut edge_sum, mut edge_n, mut strong) = (0.0f64, 0u64, 0u64);
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if !risky[i] {
-                continue;
-            }
-            strong += 1;
-            let c = luma[i];
-            if x > 0 {
-                edge_sum += f64::from((luma[i - 1] - c).abs());
-                edge_n += 1;
-            }
-            if x + 1 < w {
-                edge_sum += f64::from((luma[i + 1] - c).abs());
-                edge_n += 1;
-            }
-            if y > 0 {
-                edge_sum += f64::from((luma[i - w] - c).abs());
-                edge_n += 1;
-            }
-            if y + 1 < h {
-                edge_sum += f64::from((luma[i + w] - c).abs());
-                edge_n += 1;
+    let partials = pool.map(h.div_ceil(BAND_ROWS), |band| {
+        let y0 = band * BAND_ROWS;
+        let y1 = (y0 + BAND_ROWS).min(h);
+        let (ly0, ly1) = (y0.saturating_sub(1), (y1 + 1).min(h));
+        let luma: Vec<f32> = (ly0 * w..ly1 * w)
+            .map(|i| 0.3 * rp[i] + 0.6 * gp[i] + 0.1 * bp[i])
+            .collect();
+        let (mut edge_sum, mut edge_n, mut strong) = (0.0f64, 0u64, 0u64);
+        for y in y0..y1 {
+            for x in 0..w {
+                let i = y * w + x;
+                if yellow_pixel_risk(rp[i], gp[i], bp[i]) <= STRONG_SCORE {
+                    continue;
+                }
+                strong += 1;
+                let l = (y - ly0) * w + x;
+                let c = luma[l];
+                if x > 0 {
+                    edge_sum += f64::from((luma[l - 1] - c).abs());
+                    edge_n += 1;
+                }
+                if x + 1 < w {
+                    edge_sum += f64::from((luma[l + 1] - c).abs());
+                    edge_n += 1;
+                }
+                if y > 0 {
+                    edge_sum += f64::from((luma[l - w] - c).abs());
+                    edge_n += 1;
+                }
+                if y + 1 < h {
+                    edge_sum += f64::from((luma[l + w] - c).abs());
+                    edge_n += 1;
+                }
             }
         }
+        (edge_sum, edge_n, strong)
+    });
+    let (mut edge_sum, mut edge_n, mut strong) = (0.0f64, 0u64, 0u64);
+    for (sum, n, s) in partials {
+        edge_sum += sum;
+        edge_n += n;
+        strong += s;
     }
     let edge = if edge_n > 0 {
         (edge_sum / edge_n as f64) as f32
@@ -601,13 +613,13 @@ fn choose_tier2_bias(
 /// unless the biased matrix demonstrably reduces yellow-chroma damage more
 /// than it costs on ordinary content. The last flag keeps default reconstruction
 /// weights for the low-area, textured-yellow fallback.
-fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool, bool) {
+fn choose_b_bias_and_tier(linear: &Image3F, distance: f32, pool: &ThreadPool) -> (f32, bool, bool) {
     if !has_yellow_risk(linear) {
         return (SPEC_BIAS, false, false);
     }
 
     let samples = collect_samples(linear);
-    let (yellow_edge, strong_frac) = yellow_edge_and_strong_fraction(linear);
+    let (yellow_edge, strong_frac) = yellow_edge_and_strong_fraction(linear, pool);
     let mut tier2_bias = choose_tier2_bias(&samples, yellow_edge, distance, strong_frac);
     let default_weights = strong_frac < TIER2_AREA_MIN && tier2_bias > SPEC_BIAS;
     if default_weights
@@ -677,7 +689,7 @@ fn choose_b_bias_and_tier(linear: &Image3F, distance: f32) -> (f32, bool, bool) 
 
 #[cfg(test)]
 fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
-    choose_b_bias_and_tier(linear, distance).0
+    choose_b_bias_and_tier(linear, distance, &ThreadPool::new(1)).0
 }
 
 pub(crate) struct YellowSelection {
@@ -709,8 +721,8 @@ fn selected_b_qm_scale(custom: bool, strong: bool, distance: f32) -> u32 {
 
 /// Entry point used by the encoder: one detector + proxy pass yielding both
 /// the opsin decision and the band-class signal.
-pub(crate) fn select_yellow(linear: &Image3F, distance: f32) -> YellowSelection {
-    let (bias, tier1, default_channel_weights) = choose_b_bias_and_tier(linear, distance);
+pub(crate) fn select_yellow(linear: &Image3F, distance: f32, pool: &ThreadPool) -> YellowSelection {
+    let (bias, tier1, default_channel_weights) = choose_b_bias_and_tier(linear, distance, pool);
     let custom = (bias - SPEC_BIAS).abs() >= 1e-6;
     // A custom row can come from either tier. Only thin/high-frequency tier-1
     // content validated the fine B multiplier; smooth tier-2 yellow uses the
@@ -942,7 +954,7 @@ mod tests {
     #[test]
     fn fine_b_is_reserved_for_the_high_frequency_tier() {
         let smooth = filled(64, 64, [0.9, 0.85, 0.05]);
-        let smooth_selection = select_yellow(&smooth, 1.0);
+        let smooth_selection = select_yellow(&smooth, 1.0, &ThreadPool::new(1));
         assert!(smooth_selection.matrix.is_none());
         assert_eq!(smooth_selection.b_qm_scale, 2);
 
@@ -956,10 +968,10 @@ mod tests {
                 }
             }
         }
-        let (tier2_edge, _) = yellow_edge_and_strong_fraction(&tier2);
+        let (tier2_edge, _) = yellow_edge_and_strong_fraction(&tier2, &ThreadPool::new(1));
         assert!(tier2_edge >= TIER2_EDGE_FULL);
         assert!(tier2_edge < YELLOW_EDGE_MIN);
-        let tier2_selection = select_yellow(&tier2, 1.0);
+        let tier2_selection = select_yellow(&tier2, 1.0, &ThreadPool::new(1));
         assert!(tier2_selection.matrix.is_some());
         assert_eq!(tier2_selection.b_qm_scale, 2);
 
@@ -971,7 +983,7 @@ mod tests {
                 }
             }
         }
-        assert!(yellow_edge_and_strong_fraction(&edged).0 >= YELLOW_EDGE_MIN);
+        assert!(yellow_edge_and_strong_fraction(&edged, &ThreadPool::new(1)).0 >= YELLOW_EDGE_MIN);
         assert_eq!(selected_b_qm_scale(true, true, 1.0), 5);
         assert_eq!(selected_b_qm_scale(true, false, 1.0), 2);
     }
@@ -1024,13 +1036,13 @@ mod tests {
                 }
             }
         }
-        assert!(yellow_edge_and_strong_fraction(&edged).0 >= YELLOW_EDGE_MIN);
+        assert!(yellow_edge_and_strong_fraction(&edged, &ThreadPool::new(1)).0 >= YELLOW_EDGE_MIN);
         assert!(has_coarse_x_structure(&edged));
         let bias = choose_b_bias(&edged, 2.0);
         assert!(bias > SPEC_BIAS);
         for distance in [2.5, 2.999, 3.0, 3.001, 4.0, 5.0, 6.0, 25.0] {
             assert_eq!(choose_b_bias(&edged, distance), bias);
-            assert_eq!(select_yellow(&edged, distance).b_qm_scale, 2);
+            assert_eq!(select_yellow(&edged, distance, &ThreadPool::new(1)).b_qm_scale, 2);
         }
     }
 }

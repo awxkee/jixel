@@ -28,7 +28,7 @@
  */
 
 use super::ans::{
-    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, ans_tokens_bits_pair,
+    ANS_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram, AnsTokenCodeRef, ans_tokens_bits_under,
     build_symbol_info, choose_use_prefix_code, encode_histogram, fast_ans_population_cost,
     normalize_counts_into, optimize_ans_histogram, refine_ans_histogram_precision,
 };
@@ -182,17 +182,14 @@ fn count_hybrid_candidates(
 ) {
     let table = hybrid_small_value_table();
     let mut total = 0u64;
+    // Small values (nearly all of them) are histogrammed once and folded
+    // into every candidate afterwards: integer counts, so the same totals
+    // as symbolizing each value under each candidate.
+    let mut small = [0u32; HYBRID_SMALL_VALUES];
     for &value in values.iter().step_by(sample_stride) {
         total += 1;
         if (value as usize) < HYBRID_SMALL_VALUES {
-            for (candidate, (counts, extra_bits)) in table
-                .iter()
-                .zip(scratch.counts.iter_mut().zip(&mut scratch.extra_bits))
-            {
-                let [symbol, nbits] = candidate[value as usize];
-                counts[symbol as usize] += 1;
-                *extra_bits += u64::from(nbits);
-            }
+            small[value as usize] += 1;
         } else {
             for (candidate, ((counts, extra_bits), valid)) in HYBRID_CANDIDATES.iter().zip(
                 scratch
@@ -208,6 +205,17 @@ fn count_hybrid_candidates(
                     counts[symbol as usize] += 1;
                     *extra_bits += u64::from(nbits);
                 }
+            }
+        }
+    }
+    for (candidate, (counts, extra_bits)) in table
+        .iter()
+        .zip(scratch.counts.iter_mut().zip(&mut scratch.extra_bits))
+    {
+        for (&[symbol, nbits], &n) in candidate.iter().zip(&small) {
+            if n != 0 {
+                counts[symbol as usize] += n;
+                *extra_bits += u64::from(nbits) * u64::from(n);
             }
         }
     }
@@ -1241,11 +1249,15 @@ fn compact_ans_clusters(
 /// relocation and one whole-cluster merge. Moves are restricted to equal
 /// HybridUint configurations, so histogram addition is exact and no candidate
 /// requires retokenizing all values under a different representation.
+/// Populated contexts from which the relocation search runs on the pool.
+const RELOCATION_PARALLEL_MIN_CONTEXTS: usize = 64;
+
 fn propose_ans_cluster_refinement(
     histograms: &[Histogram],
     context_histograms: &[Histogram],
     context_map: &[u8],
     configs: &[HybridUintConfig],
+    pool: Option<&ThreadPool>,
 ) -> Option<AnsClusterProposal> {
     if histograms.len() <= 1 {
         return None;
@@ -1263,16 +1275,19 @@ fn propose_ans_cluster_refinement(
         populated_contexts.truncate(MAX_ANS_RELOCATION_CONTEXTS);
     }
 
-    let mut best_relocation = None;
-    let mut best_delta = -0.25f64;
-    for context in populated_contexts {
+    // Each context's best target (the first of its minimum), then the first
+    // context of the overall minimum: the serial scan's answer, with the
+    // per-context scans spread over the pool.
+    let best_target = |context: usize| -> Option<(usize, usize, usize, f64)> {
         let source = context_map[context] as usize;
         let moved = &context_histograms[context];
         // Emptying a cluster also requires deciding where its tokenless
         // contexts go. Whole-cluster merging handles that case cleanly.
         if moved.total_count == histograms[source].total_count {
-            continue;
+            return None;
         }
+        let mut best = None;
+        let mut best_delta = -0.25f64;
         for target in 0..histograms.len() {
             if target == source || configs[target] != configs[source] {
                 continue;
@@ -1281,8 +1296,29 @@ fn propose_ans_cluster_refinement(
                 moved_population_proxy_delta(&histograms[source], &histograms[target], moved);
             if delta < best_delta {
                 best_delta = delta;
-                best_relocation = Some((context, source, target));
+                best = Some((context, source, target, delta));
             }
+        }
+        best
+    };
+    let per_context: Vec<Option<(usize, usize, usize, f64)>> = match pool.filter(|pool| {
+        pool.num_threads() > 1 && populated_contexts.len() >= RELOCATION_PARALLEL_MIN_CONTEXTS
+    }) {
+        Some(pool) => {
+            let contexts = &populated_contexts;
+            pool.map(contexts.len(), |i| best_target(contexts[i]))
+        }
+        None => populated_contexts
+            .iter()
+            .map(|&context| best_target(context))
+            .collect(),
+    };
+    let mut best_relocation = None;
+    let mut best_delta = -0.25f64;
+    for (context, source, target, delta) in per_context.into_iter().flatten() {
+        if delta < best_delta {
+            best_delta = delta;
+            best_relocation = Some((context, source, target));
         }
     }
 
@@ -1299,9 +1335,11 @@ fn propose_ans_cluster_refinement(
         changed = true;
     }
 
-    let mut best_merge = None;
-    let mut best_delta = -0.25f64;
-    for source in 0..candidate_histograms.len() {
+    // Likewise per source cluster: its first best merge target, then the
+    // first source of the overall minimum.
+    let best_merge_of = |source: usize| -> Option<(usize, f64)> {
+        let mut best = None;
+        let mut best_delta = -0.25f64;
         for target in 0..source {
             if candidate_configs[target] != candidate_configs[source] {
                 continue;
@@ -1313,8 +1351,24 @@ fn propose_ans_cluster_refinement(
             );
             if delta < best_delta {
                 best_delta = delta;
-                best_merge = Some((source, target));
+                best = Some((target, delta));
             }
+        }
+        best
+    };
+    let per_source: Vec<Option<(usize, f64)>> =
+        match pool.filter(|pool| pool.num_threads() > 1 && candidate_histograms.len() >= 32) {
+            Some(pool) => pool.map(candidate_histograms.len(), best_merge_of),
+            None => (0..candidate_histograms.len()).map(best_merge_of).collect(),
+        };
+    let mut best_merge = None;
+    let mut best_delta = -0.25f64;
+    for (source, merge) in per_source.into_iter().enumerate() {
+        if let Some((target, delta)) = merge
+            && delta < best_delta
+        {
+            best_delta = delta;
+            best_merge = Some((source, target));
         }
     }
     if let Some((source, target)) = best_merge {
@@ -1341,30 +1395,54 @@ fn propose_ans_cluster_refinement(
     Some((candidate_histograms, candidate_map, candidate_configs))
 }
 
+/// Histograms from which the symbol tables are built on the pool (each
+/// table is a function of its own histogram alone).
+const ANS_STORAGE_PARALLEL_MIN_HISTOGRAMS: usize = 16;
+
 fn build_ans_storage_from_selected(
     histograms: &[Histogram],
     selected_histograms: Vec<AnsHistogram>,
+    pool: Option<&ThreadPool>,
 ) -> AnsCodeStorage {
-    let mut ans = AnsCodeStorage {
+    let n = histograms.len();
+    let mut pricing_freqs = vec![0u16; n * ALPHABET_SIZE];
+    let mut reverse_maps = vec![0u16; n * ANS_TAB_SIZE as usize];
+    let symbols = match pool
+        .filter(|pool| pool.num_threads() > 1 && n >= ANS_STORAGE_PARALLEL_MIN_HISTOGRAMS)
+    {
+        Some(pool) => {
+            let mut items: Vec<(&mut [u16], &mut [u16], Vec<AnsEncSymbolInfo>)> = pricing_freqs
+                .chunks_mut(ALPHABET_SIZE)
+                .zip(reverse_maps.chunks_mut(ANS_TAB_SIZE as usize))
+                .map(|(pricing, reverse)| (pricing, reverse, Vec::new()))
+                .collect();
+            let selected = &selected_histograms;
+            pool.for_each_mut(&mut items, |i, (pricing, reverse, symbols)| {
+                normalize_counts_into(&histograms[i].counts, pricing);
+                *symbols = build_symbol_info(&selected[i].freqs, reverse);
+            });
+            items.into_iter().map(|(_, _, symbols)| symbols).collect()
+        }
+        None => {
+            let (pricing_tables, remainder) = pricing_freqs.as_chunks_mut::<ALPHABET_SIZE>();
+            debug_assert!(remainder.is_empty());
+            for (source, pricing) in histograms.iter().zip(pricing_tables) {
+                normalize_counts_into(&source.counts, pricing);
+            }
+            selected_histograms
+                .iter()
+                .zip(reverse_maps.chunks_mut(ANS_TAB_SIZE as usize))
+                .map(|(histogram, reverse)| build_symbol_info(&histogram.freqs, reverse))
+                .collect()
+        }
+    };
+    AnsCodeStorage {
         use_prefix_code: false,
         histograms: selected_histograms,
-        pricing_freqs: vec![0; histograms.len() * ALPHABET_SIZE],
-        symbols: Vec::with_capacity(histograms.len()),
-        reverse_maps: vec![0; histograms.len() * ANS_TAB_SIZE as usize],
-    };
-    let (pricing_tables, remainder) = ans.pricing_freqs.as_chunks_mut::<ALPHABET_SIZE>();
-    debug_assert!(remainder.is_empty());
-    for (source, pricing) in histograms.iter().zip(pricing_tables) {
-        normalize_counts_into(&source.counts, pricing);
+        pricing_freqs,
+        symbols,
+        reverse_maps,
     }
-    for (histogram_index, histogram) in ans.histograms.iter().enumerate() {
-        let reverse_start = histogram_index * ANS_TAB_SIZE as usize;
-        ans.symbols.push(build_symbol_info(
-            &histogram.freqs,
-            &mut ans.reverse_maps[reverse_start..reverse_start + ANS_TAB_SIZE as usize],
-        ));
-    }
-    ans
 }
 
 /// ANS tables for externally managed (already clustered) histograms:
@@ -1389,16 +1467,16 @@ pub(crate) fn build_ans_code_parts(
             }
         })
         .collect();
-    let storage = build_ans_storage_from_selected(histograms, selected_histograms);
+    let storage = build_ans_storage_from_selected(histograms, selected_histograms, None);
     (storage.histograms, storage.symbols, storage.reverse_maps)
 }
 
-fn build_ans_storage(histograms: &[Histogram]) -> AnsCodeStorage {
+fn build_ans_storage(histograms: &[Histogram], pool: Option<&ThreadPool>) -> AnsCodeStorage {
     let selected_histograms = histograms
         .iter()
         .map(|histogram| optimize_ans_histogram(&histogram.counts))
         .collect();
-    build_ans_storage_from_selected(histograms, selected_histograms)
+    build_ans_storage_from_selected(histograms, selected_histograms, pool)
 }
 
 struct AnsBundleRef<'a> {
@@ -1436,6 +1514,7 @@ impl AnsBundleRef<'_> {
     }
 }
 
+#[cfg(test)]
 fn exact_ans_bundle_bits_pair(
     streams: &[TokenSlice<'_>],
     num_contexts: usize,
@@ -1466,6 +1545,49 @@ fn exact_ans_bundle_bits_pair(
     )
 }
 
+/// Exact bits of one bundle: its header as written plus every stream's
+/// ANS payload. `exact_ans_bundle_bits_pair` on one bundle, for a candidate
+/// whose incumbent's bits are already known.
+fn exact_ans_bundle_bits(
+    streams: &[TokenSlice<'_>],
+    num_contexts: usize,
+    bundle: &AnsBundleRef<'_>,
+    thread_pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> usize {
+    let mut header = BitWriter::new();
+    write_entropy_code(
+        &bundle.entropy_code(num_contexts),
+        &mut scratch.huffman_pool,
+        &mut header,
+    );
+    let code = bundle.token_code();
+    const MIN_PARALLEL_TOKENS: usize = 16_384;
+    let total_tokens: usize = streams.iter().map(|stream| stream.len()).sum();
+    let num_lanes = thread_pool.num_threads().min(streams.len());
+    let data: usize = if num_lanes <= 1 || total_tokens < MIN_PARALLEL_TOKENS {
+        streams
+            .iter()
+            .map(|tokens| ans_tokens_bits_under(*tokens, &code))
+            .sum()
+    } else {
+        thread_pool
+            .steal_map(scratch, streams.len(), |i, _scratch| {
+                ans_tokens_bits_under(streams[i], &code)
+            })
+            .into_iter()
+            .sum()
+    };
+    header.bits_written() + data
+}
+
+/// Exact bits of the bundle an acceptance step starts from, carried across
+/// the steps of one refinement: a step that rejects its candidate leaves the
+/// incumbent and its bits as they were, one that accepts makes the
+/// candidate's bits the incumbent's, so each step prices one bundle.
+type IncumbentBits = Option<usize>;
+
+#[cfg(test)]
 fn exact_ans_stream_bits_pair(
     streams: &[TokenSlice<'_>],
     first: AnsTokenCodeRef<'_>,
@@ -1475,7 +1597,7 @@ fn exact_ans_stream_bits_pair(
 ) -> (usize, usize) {
     let sequential = |streams: &[TokenSlice<'_>]| {
         streams.iter().fold((0usize, 0usize), |acc, tokens| {
-            let bits = ans_tokens_bits_pair(tokens, &first, &second);
+            let bits = super::ans::ans_tokens_bits_pair(tokens, &first, &second);
             (acc.0 + bits.0, acc.1 + bits.1)
         })
     };
@@ -1491,7 +1613,7 @@ fn exact_ans_stream_bits_pair(
     // with many tokens do not strand workers assigned a lighter fixed chunk.
     thread_pool
         .steal_map(scratch, streams.len(), |i, _scratch| {
-            ans_tokens_bits_pair(streams[i], &first, &second)
+            super::ans::ans_tokens_bits_pair(streams[i], &first, &second)
         })
         .into_iter()
         .fold((0usize, 0usize), |acc, bits| {
@@ -1504,6 +1626,7 @@ fn refine_ans_clusters_once(
     streams: &[TokenSlice<'_>],
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
+    incumbent_bits: &mut IncumbentBits,
 ) -> bool {
     if code.use_prefix_code || code.hybrid_uint_configs.len() <= 1 {
         return false;
@@ -1544,14 +1667,14 @@ fn refine_ans_clusters_once(
             });
         }
     }
-    let Some((candidate_histograms, candidate_map, candidate_configs)) =
-        propose_ans_cluster_refinement(
-            &histograms,
-            &context_histograms,
-            &code.context_map,
-            &code.hybrid_uint_configs,
-        )
-    else {
+    let proposal = propose_ans_cluster_refinement(
+        &histograms,
+        &context_histograms,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        Some(thread_pool),
+    );
+    let Some((candidate_histograms, candidate_map, candidate_configs)) = proposal else {
         return false;
     };
     accept_ans_cluster_proposal(
@@ -1560,6 +1683,7 @@ fn refine_ans_clusters_once(
         (candidate_histograms, candidate_map, candidate_configs),
         thread_pool,
         scratch,
+        incumbent_bits,
     )
 }
 
@@ -1571,6 +1695,7 @@ fn accept_ans_cluster_proposal(
     (candidate_histograms, candidate_map, candidate_configs): AnsClusterProposal,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
+    incumbent_bits: &mut IncumbentBits,
 ) -> bool {
     accept_ans_cluster_proposal_precise(
         code,
@@ -1579,6 +1704,7 @@ fn accept_ans_cluster_proposal(
         thread_pool,
         scratch,
         false,
+        incumbent_bits,
     )
 }
 
@@ -1589,6 +1715,7 @@ fn accept_ans_cluster_proposal_precise(
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
     refine_precision: bool,
+    incumbent_bits: &mut IncumbentBits,
 ) -> bool {
     let candidate_ans = if refine_precision {
         let selected = candidate_histograms
@@ -1598,9 +1725,9 @@ fn accept_ans_cluster_proposal_precise(
                 refine_ans_histogram_precision(&h.counts, &base).unwrap_or(base)
             })
             .collect();
-        build_ans_storage_from_selected(&candidate_histograms, selected)
+        build_ans_storage_from_selected(&candidate_histograms, selected, Some(thread_pool))
     } else {
-        build_ans_storage(&candidate_histograms)
+        build_ans_storage(&candidate_histograms, Some(thread_pool))
     };
     let original = AnsBundleRef {
         context_map: &code.context_map,
@@ -1616,17 +1743,28 @@ fn accept_ans_cluster_proposal_precise(
         symbols: &candidate_ans.symbols,
         reverse_maps: &candidate_ans.reverse_maps,
     };
-    let (original_bits, candidate_bits) = exact_ans_bundle_bits_pair(
+    let original_bits = match *incumbent_bits {
+        Some(bits) => bits,
+        None => exact_ans_bundle_bits(
+            streams,
+            code.orig_num_contexts,
+            &original,
+            thread_pool,
+            scratch,
+        ),
+    };
+    let candidate_bits = exact_ans_bundle_bits(
         streams,
         code.orig_num_contexts,
-        &original,
         &candidate,
         thread_pool,
         scratch,
     );
     if candidate_bits >= original_bits {
+        *incumbent_bits = Some(original_bits);
         return false;
     }
+    *incumbent_bits = Some(candidate_bits);
 
     code.context_map = candidate_map;
     code.prefix_codes = build_huffman_codes(&candidate_histograms, &mut scratch.huffman_pool);
@@ -1710,14 +1848,89 @@ where
             scratch,
         );
     }
-    let prefix = prefix_alternative(code, &streams, &mut scratch.huffman_pool);
+    let prefix = prefix_alternative(code, &streams, Some(thread_pool), scratch);
     let changed = refine_ans_bundle(code, &streams, refinement, thread_pool, scratch);
     let pool = &mut scratch.huffman_pool;
-    if coded_bits(&prefix, &streams, pool) < coded_bits(code, &streams, pool) {
+    if coded_bits(&prefix, &streams, pool, Some(thread_pool))
+        < coded_bits(code, &streams, pool, Some(thread_pool))
+    {
         *code = prefix;
         return true;
     }
     changed
+}
+
+/// `code` for other tokens: the same context map, hybrid-uint configs and
+/// coding mode, with the histograms recounted and the tables rebuilt.
+/// `None` when a token no longer fits its cluster's config (the configs
+/// were chosen on the old tokens' value range).
+pub(crate) fn recount_entropy_code<'a, I>(
+    code: &OwnedEntropyCode,
+    streams: I,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<OwnedEntropyCode>
+where
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
+{
+    let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
+    let num_clusters = code.hybrid_uint_configs.len();
+    let maxima: Vec<u32> = pool
+        .steal_map(scratch, streams.len(), |i, _| {
+            let mut maxima = vec![0u32; num_clusters];
+            streams[i].iter().for_each(|token| {
+                let cluster = code.context_map[token.context as usize] as usize;
+                maxima[cluster] = maxima[cluster].max(token.value);
+            });
+            maxima
+        })
+        .into_iter()
+        .fold(vec![0u32; num_clusters], |mut acc, local| {
+            for (a, l) in acc.iter_mut().zip(local) {
+                *a = (*a).max(l);
+            }
+            acc
+        });
+    for (&max_value, &config) in maxima.iter().zip(&code.hybrid_uint_configs) {
+        let max_symbol =
+            uint_encode_with_config(max_value, config).0 | ((1u32 << config.lsb_in_token) - 1);
+        if max_symbol as usize >= ALPHABET_SIZE {
+            return None;
+        }
+    }
+    let histograms = clustered_histograms(
+        &streams,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        Some(pool),
+        scratch,
+    );
+    let prefix_codes = build_huffman_codes(&histograms, &mut scratch.huffman_pool);
+    let ans = if code.use_prefix_code {
+        AnsCodeStorage {
+            use_prefix_code: true,
+            ..AnsCodeStorage::default()
+        }
+    } else {
+        let selected = histograms
+            .iter()
+            .map(|h| optimize_ans_histogram(&h.counts))
+            .collect();
+        build_ans_storage_from_selected(&histograms, selected, Some(pool))
+    };
+    Some(OwnedEntropyCode {
+        context_map: code.context_map.clone(),
+        prefix_codes,
+        hybrid_uint_configs: code.hybrid_uint_configs.clone(),
+        orig_context_map: code.orig_context_map.clone(),
+        orig_num_contexts: code.orig_num_contexts,
+        use_prefix_code: ans.use_prefix_code,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
+    })
 }
 
 /// The prefix-coded twin of a bundle: its context map and hybrid-uint
@@ -1725,19 +1938,19 @@ where
 fn prefix_alternative(
     code: &OwnedEntropyCode,
     streams: &[TokenSlice<'_>],
-    huffman_pool: &mut Vec<HuffmanNode>,
+    pool: Option<&ThreadPool>,
+    scratch: &mut CoderScratch,
 ) -> OwnedEntropyCode {
-    let mut histograms = vec![Histogram::new(); code.hybrid_uint_configs.len()];
-    for tokens in streams {
-        tokens.iter().for_each(|t| {
-            let cluster = code.context_map[t.context as usize] as usize;
-            let config = code.hybrid_uint_configs[cluster];
-            histograms[cluster].add(uint_encode_with_config(t.value, config).0);
-        });
-    }
+    let histograms = clustered_histograms(
+        streams,
+        &code.context_map,
+        &code.hybrid_uint_configs,
+        pool,
+        scratch,
+    );
     OwnedEntropyCode {
         context_map: code.context_map.clone(),
-        prefix_codes: build_huffman_codes(&histograms, huffman_pool),
+        prefix_codes: build_huffman_codes(&histograms, &mut scratch.huffman_pool),
         hybrid_uint_configs: code.hybrid_uint_configs.clone(),
         orig_context_map: code.orig_context_map.clone(),
         orig_num_contexts: code.orig_num_contexts,
@@ -1755,10 +1968,11 @@ fn coded_bits(
     code: &OwnedEntropyCode,
     streams: &[TokenSlice<'_>],
     huffman_pool: &mut Vec<HuffmanNode>,
+    thread_pool: Option<&ThreadPool>,
 ) -> u64 {
     let mut header = BitWriter::new();
     write_entropy_code(&code.as_ref(), huffman_pool, &mut header);
-    header.bits_written() as u64 + super::estimate_ac_plain_bits(streams.iter().copied(), code)
+    header.bits_written() as u64 + super::estimate_ac_plain_bits_pooled(streams, code, thread_pool)
 }
 
 fn refine_ans_bundle(
@@ -1777,8 +1991,12 @@ fn refine_ans_bundle(
     };
     // Slow already had this refinement. Preserve it as the incumbent; Fast
     // did not, so it can go straight to the stronger candidate.
+    // The incumbent's exact bits carry from one acceptance step to the next
+    // (each step either keeps the incumbent or makes its candidate the new
+    // one), so every step prices only its candidate.
+    let mut incumbent_bits: IncumbentBits = None;
     let mut changed = matches!(refinement, AnsRefinement::Slow)
-        && refine_ans_clusters_once(code, streams, thread_pool, scratch);
+        && refine_ans_clusters_once(code, streams, thread_pool, scratch, &mut incumbent_bits);
     let recluster = !matches!(refinement, AnsRefinement::Fast { recluster: false });
     let proposal = if recluster {
         propose_ans_reclustering(
@@ -1792,12 +2010,19 @@ fn refine_ans_bundle(
         propose_ans_cluster_batch(code, streams)
     };
     if let Some(proposal) = proposal {
-        changed |= accept_ans_cluster_proposal(code, streams, proposal, thread_pool, scratch);
+        changed |= accept_ans_cluster_proposal(
+            code,
+            streams,
+            proposal,
+            thread_pool,
+            scratch,
+            &mut incumbent_bits,
+        );
     }
     // Precision changes do not feed back into clustering or provisional RDO
     // prices. Fast retains its existing table search at every distance.
     if matches!(refinement, AnsRefinement::Slow) {
-        changed |= refine_ans_precisions(code, streams, thread_pool, scratch);
+        changed |= refine_ans_precisions(code, streams, thread_pool, scratch, &mut incumbent_bits);
     }
     changed |= fill_unused_contexts(code, streams, scratch);
     if exhaustive {
@@ -1872,6 +2097,7 @@ fn refine_ans_integer_configs(
         pool,
         scratch,
         true,
+        &mut None,
     )
 }
 
@@ -1905,6 +2131,7 @@ fn refine_ans_expanded_configs(
         pool,
         scratch,
         true,
+        &mut None,
     )
 }
 
@@ -1957,6 +2184,7 @@ fn refine_ans_precisions(
     streams: &[TokenSlice<'_>],
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
+    incumbent_bits: &mut IncumbentBits,
 ) -> bool {
     if code.use_prefix_code || code.ans_histograms.is_empty() {
         return false;
@@ -1979,7 +2207,7 @@ fn refine_ans_precisions(
         .zip(&code.ans_histograms)
         .map(|(proposal, incumbent)| proposal.unwrap_or_else(|| incumbent.clone()))
         .collect();
-    let candidate_ans = build_ans_storage_from_selected(&histograms, selected);
+    let candidate_ans = build_ans_storage_from_selected(&histograms, selected, Some(thread_pool));
     let original = AnsBundleRef {
         context_map: &code.context_map,
         configs: &code.hybrid_uint_configs,
@@ -1996,17 +2224,28 @@ fn refine_ans_precisions(
     };
     // The histogram model nominates tables; actual ANS states decide whether
     // the complete entropy bundle improves on the already reclustered code.
-    let (original_bits, candidate_bits) = exact_ans_bundle_bits_pair(
+    let original_bits = match *incumbent_bits {
+        Some(bits) => bits,
+        None => exact_ans_bundle_bits(
+            streams,
+            code.orig_num_contexts,
+            &original,
+            thread_pool,
+            scratch,
+        ),
+    };
+    let candidate_bits = exact_ans_bundle_bits(
         streams,
         code.orig_num_contexts,
-        &original,
         &candidate,
         thread_pool,
         scratch,
     );
     if candidate_bits >= original_bits {
+        *incumbent_bits = Some(original_bits);
         return false;
     }
+    *incumbent_bits = Some(candidate_bits);
     code.ans_histograms = candidate_ans.histograms;
     code.ans_symbols = candidate_ans.symbols;
     code.ans_reverse_maps = candidate_ans.reverse_maps;
@@ -2373,7 +2612,7 @@ fn optimize_entropy_code_ac_slices(
             .collect();
         ans.use_prefix_code = choose_use_prefix_code(&histograms, &selected_histograms, &depths);
         if !ans.use_prefix_code {
-            ans = build_ans_storage_from_selected(&histograms, selected_histograms);
+            ans = build_ans_storage_from_selected(&histograms, selected_histograms, pool);
         }
     }
 
@@ -3325,7 +3564,7 @@ mod mode_choice_tests {
                     .collect();
                 assert_eq!(
                     bits as u64,
-                    coded_bits(&code, &slices, &mut Vec::new()),
+                    coded_bits(&code, &slices, &mut Vec::new(), None),
                     "{name}"
                 );
             }
@@ -3336,7 +3575,12 @@ mod mode_choice_tests {
     fn plain_estimate_charges_no_codeword_for_a_single_symbol_code() {
         let streams = [vec![Token::new(0, 0); 10_000]];
         let slices = [TokenSlice::from(streams[0].as_slice())];
-        let code = prefix_alternative(&built(&streams), &slices, &mut Vec::new());
+        let code = prefix_alternative(
+            &built(&streams),
+            &slices,
+            None,
+            &mut CoderScratch::lossless(),
+        );
         let mut w = BitWriter::new();
         streams[0]
             .iter()
@@ -3363,7 +3607,7 @@ mod ans_refinement_tests {
             let h = map[token.context as usize] as usize;
             histograms[h].add(uint_encode_with_config(token.value, configs[h]).0);
         }
-        let ans = build_ans_storage(&histograms);
+        let ans = build_ans_storage(&histograms, None);
         OwnedEntropyCode {
             orig_num_contexts: map.len(),
             context_map: map,
@@ -3700,6 +3944,7 @@ mod ans_refinement_tests {
                     &streams,
                     &ThreadPool::new_lossless(threads),
                     &mut CoderScratch::lossless(),
+                    &mut None,
                 );
                 let after = serialized(&code, &streams);
                 if changed {
@@ -4266,4 +4511,117 @@ mod sampled_hybrid_tests {
             }
         }
     }
+}
+
+/// `tokens` under `code` as the decoder reads a standalone stream: the
+/// `no_lz77` bit, the code and the tokens in the code's mode.
+fn serialize_token_stream(
+    tokens: &[Token],
+    code: &OwnedEntropyCode,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> BitWriter {
+    let mut w = BitWriter::new();
+    let code = code.as_ref();
+    w.write(1, 0); // no LZ77
+    write_entropy_code(&code, huffman_pool, &mut w);
+    if code.use_prefix_code {
+        for &t in tokens {
+            write_token(t, &code, &mut w);
+        }
+    } else {
+        super::ans::write_ans_tokens(
+            tokens,
+            code.context_map,
+            code.ans_symbols,
+            code.ans_reverse_maps,
+            code.hybrid_uint_configs,
+            &mut w,
+        );
+    }
+    w
+}
+
+/// `code` with its clusters and hybrid-uint configs in the other coding
+/// mode (prefix codes for a rANS code, rANS tables for a prefix code),
+/// recounted on `tokens`.
+fn flipped_mode_code(
+    tokens: &[Token],
+    code: &OwnedEntropyCode,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> OwnedEntropyCode {
+    let configs = &code.hybrid_uint_configs;
+    let mut histograms = vec![Histogram::new(); configs.len()];
+    for t in tokens {
+        let cluster = code.context_map[t.context as usize] as usize;
+        histograms[cluster].add(uint_encode_with_config(t.value, configs[cluster]).0);
+    }
+    let ans = if code.use_prefix_code {
+        let selected: Vec<AnsHistogram> = histograms
+            .iter()
+            .map(|h| optimize_ans_histogram(&h.counts))
+            .collect();
+        build_ans_storage_from_selected(&histograms, selected, None)
+    } else {
+        AnsCodeStorage::default()
+    };
+    OwnedEntropyCode {
+        context_map: code.context_map.clone(),
+        prefix_codes: if code.use_prefix_code {
+            code.prefix_codes.clone()
+        } else {
+            build_huffman_codes(&histograms, huffman_pool)
+        },
+        hybrid_uint_configs: configs.clone(),
+        orig_context_map: code.orig_context_map.clone(),
+        orig_num_contexts: code.orig_num_contexts,
+        use_prefix_code: !code.use_prefix_code,
+        ans_histograms: ans.histograms,
+        ans_pricing_freqs: ans.pricing_freqs,
+        ans_symbols: ans.symbols,
+        ans_reverse_maps: ans.reverse_maps,
+    }
+}
+
+/// A standalone token stream with its own entropy code — a context tree, a
+/// coefficient order, a patch dictionary — serialized (the `no_lz77` bit,
+/// the code, the tokens) as the smallest by exact bits of the clustered
+/// prefix code on the default hybrid-uint config (the incumbent), the AC
+/// builder's config-selected code in the mode its cost model picks, and
+/// that code in the other mode. On the DC trees (200–3000 tokens) the
+/// selected configs save 2–3 % of the tree, rANS wins a fifth of them;
+/// lossless MA trees (up to 4095 leaves) −3..−7 %, nearly all from the
+/// configs on prefix codes; rANS on the default config never pays.
+pub(crate) fn raced_token_stream(
+    tokens: &[Token],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+) -> BitWriter {
+    let prefix = optimize_entropy_code(tokens, num_contexts, huffman_pool);
+    let mut best = serialize_token_stream(tokens, &prefix, huffman_pool);
+    let selected = optimize_entropy_code_ac_streams(
+        std::iter::once(tokens),
+        num_contexts,
+        huffman_pool,
+        true,
+        crate::Speed::Slow,
+        None,
+    );
+    let flipped = flipped_mode_code(tokens, &selected, huffman_pool);
+    for code in [&selected, &flipped] {
+        let candidate = serialize_token_stream(tokens, code, huffman_pool);
+        if candidate.bits_written() < best.bits_written() {
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// `raced_token_stream` appended to `w`.
+pub(crate) fn write_raced_token_stream(
+    tokens: &[Token],
+    num_contexts: usize,
+    huffman_pool: &mut Vec<HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    w.append_bits(&raced_token_stream(tokens, num_contexts, huffman_pool));
 }

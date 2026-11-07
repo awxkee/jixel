@@ -32,9 +32,7 @@
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::DcPredictorScratch;
 use crate::dc_group_data::DcGroupData;
-use crate::entropy::{
-    Token, f_log2, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
-};
+use crate::entropy::{Token, f_log2, pack_signed};
 use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
@@ -201,22 +199,54 @@ pub(crate) fn collect_dc_tokens_with_gradient(
     let mut tokens = Vec::with_capacity(token_count);
     let mut gradient_tokens = Vec::with_capacity(if collect_gradient { token_count } else { 0 });
     for (mchan, c) in [1usize, 0, 2].into_iter().enumerate() {
-        let plane = dc_data.quant_dc.plane(c);
-        walk_dc_channel(
-            plane.as_slice(),
-            plane.xsize(),
-            plane.ysize(),
-            plane.xsize(),
+        let (channel_tokens, channel_gradient) = collect_dc_channel_tokens(
+            dc_data,
             mchan,
+            c,
             dc_gradient,
             props,
             collect_props,
             collect_gradient,
             wp_params,
-            &mut tokens,
-            &mut gradient_tokens,
         );
+        tokens.extend(channel_tokens);
+        gradient_tokens.extend(channel_gradient);
     }
+    (tokens, gradient_tokens)
+}
+
+/// One channel of [`collect_dc_tokens_with_gradient`]: plane `c` of the
+/// group coded as modular channel `mchan`. Channels carry no state across
+/// each other, so a group's tokens are its channels' in order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_dc_channel_tokens(
+    dc_data: &DcGroupData,
+    mchan: usize,
+    c: usize,
+    dc_gradient: &DcPredictorChoice,
+    props: &mut Vec<crate::dc_tree::DcProp>,
+    collect_props: bool,
+    collect_gradient: bool,
+    wp_params: WpParams,
+) -> (Vec<Token>, Vec<Token>) {
+    let plane = dc_data.quant_dc.plane(c);
+    let token_count = plane.as_slice().len();
+    let mut tokens = Vec::with_capacity(token_count);
+    let mut gradient_tokens = Vec::with_capacity(if collect_gradient { token_count } else { 0 });
+    walk_dc_channel(
+        plane.as_slice(),
+        plane.xsize(),
+        plane.ysize(),
+        plane.xsize(),
+        mchan,
+        dc_gradient,
+        props,
+        collect_props,
+        collect_gradient,
+        wp_params,
+        &mut tokens,
+        &mut gradient_tokens,
+    );
     (tokens, gradient_tokens)
 }
 
@@ -530,19 +560,13 @@ pub(crate) fn write_tree_tokens(
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     writer: &mut BitWriter,
 ) {
-    // OptimizeEntropyCode clusters the K_NUM_TREE_CONTEXTS=6 contexts.
-    let code = optimize_entropy_code(tokens, K_NUM_TREE_CONTEXTS, huffman_pool);
-    let code_ref = code.as_ref();
-
     writer.write(1, 1); // not an empty tree
-    writer.write(1, 0); // no lz77
-    write_entropy_code(&code_ref, huffman_pool, writer);
-    for t in tokens {
-        write_token(*t, &code_ref, writer);
-    }
+    // The tree's own code over its K_NUM_TREE_CONTEXTS=6 contexts.
+    crate::entropy::write_raced_token_stream(tokens, K_NUM_TREE_CONTEXTS, huffman_pool, writer);
 }
 
 /// Which context tree the DC bundle is written with.
+#[derive(Clone)]
 pub(super) enum DcTreeChoice {
     /// The static blob with per-leaf predictor flips.
     Static(DcPredictorChoice),

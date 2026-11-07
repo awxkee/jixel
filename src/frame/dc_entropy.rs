@@ -31,7 +31,8 @@
 
 use super::dc_tokens::{
     DC_PREDICTOR_GRADIENT, DC_PREDICTOR_WEIGHTED, DcTreeChoice, choose_dc_predictors,
-    collect_dc_tokens_with_gradient, write_context_tree, write_tree_tokens,
+    collect_dc_channel_tokens, collect_dc_tokens_with_gradient, write_context_tree,
+    write_tree_tokens,
 };
 use super::metadata::collect_ac_metadata_tokens;
 use crate::bit_writer::BitWriter;
@@ -62,8 +63,20 @@ impl DcEntropy {
     /// Bits of the DC-global tree and code headers plus the DC and metadata
     /// payload estimate: what one choice of predictor parameters costs.
     pub(crate) fn bits(&self, num_dc_groups: usize, scratch: &mut CoderScratch) -> u64 {
+        self.bits_with(num_dc_groups, scratch, &self.dc, self.wp_params)
+    }
+
+    /// `bits` with other DC tokens and predictor parameters under this
+    /// entropy's tree, code and metadata tokens.
+    pub(crate) fn bits_with(
+        &self,
+        num_dc_groups: usize,
+        scratch: &mut CoderScratch,
+        dc: &[Vec<Token>],
+        wp_params: WpParams,
+    ) -> u64 {
         let mut w = BitWriter::new();
-        crate::weighted_predictor::write_wp_header(self.wp_params, &mut w);
+        crate::weighted_predictor::write_wp_header(wp_params, &mut w);
         match &self.tree {
             DcTreeChoice::Static(grad) => {
                 write_context_tree(num_dc_groups, grad, &mut scratch.huffman_pool, &mut w);
@@ -75,12 +88,90 @@ impl DcEntropy {
         write_entropy_code(&self.code.as_ref(), &mut scratch.huffman_pool, &mut w);
         w.bits_written() as u64
             + crate::entropy::estimate_ac_plain_bits(
-                self.dc
-                    .iter()
+                dc.iter()
                     .map(Vec::as_slice)
                     .chain(self.meta.iter().map(Vec::as_slice)),
                 &self.code,
             )
+    }
+
+    /// The DC tokens of every group through this entropy's MA-learned tree
+    /// under `wp_params` (or the current DC values under the same
+    /// parameters), numbered and offset as the written tree has them.
+    /// `None` without the MA arm.
+    pub(crate) fn dc_tokens_under(
+        &self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        dc_datas: &[DcGroupData],
+        wp_params: WpParams,
+    ) -> Option<Vec<Vec<Token>>> {
+        let trees = self.ma_tree.as_ref()?;
+        if self.ma_leaf_ctx.is_empty() {
+            return None;
+        }
+        let groups = dc_planes(dc_datas);
+        let pool = &ctx.thread_pool;
+        if self.ma_offsets.iter().all(|&o| o == 0) {
+            return Some(tokenize_streams(
+                pool,
+                scratch,
+                &groups,
+                &trees.dc,
+                &self.ma_leaf_ctx,
+                wp_params,
+            ));
+        }
+        // Offsets apply per node before the contexts are mapped.
+        let identity: Vec<u32> = (0..trees.dc.nodes.len() as u32).collect();
+        let mut tokens = tokenize_streams(pool, scratch, &groups, &trees.dc, &identity, wp_params);
+        crate::dc_tree::apply_leaf_offsets(&mut tokens, &self.ma_offsets);
+        let leaf_ctx = &self.ma_leaf_ctx;
+        Some(pool.map(tokens.len(), |g| {
+            tokens[g]
+                .iter()
+                .map(|t| Token::new(leaf_ctx[t.context as usize], t.value))
+                .collect()
+        }))
+    }
+
+    /// This entropy with its DC tokens replaced by `dc` (through the same
+    /// tree) and its code warm-started from the finished one: the context
+    /// map, hybrid-uint configs and coding mode stay, the histograms are
+    /// recounted, the tables rebuilt, then the Slow refinement runs from
+    /// there. `None` when a token no longer fits its cluster's config.
+    pub(crate) fn warmed(
+        &self,
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        dc: Vec<Vec<Token>>,
+        wp_params: WpParams,
+    ) -> Option<DcEntropy> {
+        let streams = || {
+            dc.iter()
+                .map(Vec::as_slice)
+                .chain(self.meta.iter().map(Vec::as_slice))
+        };
+        let mut code =
+            crate::entropy::recount_entropy_code(&self.code, streams(), &ctx.thread_pool, scratch)?;
+        crate::entropy::refine_entropy_bundle(
+            &mut code,
+            streams(),
+            crate::entropy::AnsRefinement::Slow,
+            &ctx.thread_pool,
+            scratch,
+        );
+        Some(DcEntropy {
+            tree: self.tree.clone(),
+            dc,
+            meta: self.meta.clone(),
+            code,
+            refinement: self.refinement,
+            wp_params,
+            ma_tree: self.ma_tree.clone(),
+            ma_leaf_ctx: self.ma_leaf_ctx.clone(),
+            ma_offsets: self.ma_offsets.clone(),
+        })
     }
 }
 
@@ -205,43 +296,62 @@ pub(crate) fn prepare_dc_entropy(
     let effort = ctx.speed.effort();
     // The learned tree splits on weighted-predictor errors.
     let dc_predictor_search = effort.dc_predictor_search || effort.dc_learned_tree;
-    let token_groups = ctx
+    // One task per DC channel of each group (the channels carry no state
+    // across each other) plus one for the group's metadata streams: a 4K
+    // image has four DC groups, two of them large.
+    const PARTS: usize = 4;
+    let parts = ctx
         .thread_pool
-        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
-            let mut props = Vec::new();
+        .steal_map(scratch, dc_datas.len() * PARTS, |i, _scratch| {
+            let (group, part) = (i / PARTS, i % PARTS);
             let predictor = if dc_predictor_search {
                 &DC_PREDICTOR_WEIGHTED
             } else {
                 &DC_PREDICTOR_GRADIENT
             };
-            // Both residual candidates use the same WP state and context.
-            let (wp, grad) = if use_dc_frame {
-                (Vec::new(), Vec::new())
+            let mut props = Vec::new();
+            if part < 3 {
+                // Both residual candidates use the same WP state and context.
+                let (wp, grad) = if use_dc_frame {
+                    (Vec::new(), Vec::new())
+                } else {
+                    collect_dc_channel_tokens(
+                        &dc_datas[group],
+                        part,
+                        [1usize, 0, 2][part],
+                        predictor,
+                        &mut props,
+                        effort.dc_learned_tree,
+                        dc_predictor_search,
+                        wp_params,
+                    )
+                };
+                (wp, props, grad)
             } else {
-                collect_dc_tokens_with_gradient(
-                    &dc_datas[i],
-                    predictor,
+                let meta = collect_ac_metadata_tokens(
+                    &dc_datas[group],
                     &mut props,
+                    epf_sharpness,
                     effort.dc_learned_tree,
-                    dc_predictor_search,
-                    wp_params,
-                )
-            };
-            let mut meta_props = Vec::new();
-            let meta = collect_ac_metadata_tokens(
-                &dc_datas[i],
-                &mut meta_props,
-                epf_sharpness,
-                effort.dc_learned_tree,
-            );
-            (wp, props, grad, meta, meta_props)
+                );
+                (meta, props, Vec::new())
+            }
         });
-    let mut wp_tokens_per_group = Vec::with_capacity(token_groups.len());
-    let mut props_per_group = Vec::with_capacity(token_groups.len());
-    let mut grad_tokens_per_group = Vec::with_capacity(token_groups.len());
-    let mut meta_tokens_per_group = Vec::with_capacity(token_groups.len());
-    let mut meta_props_per_group = Vec::with_capacity(token_groups.len());
-    for (wp, props, grad, meta, meta_props) in token_groups {
+    let mut wp_tokens_per_group = Vec::with_capacity(dc_datas.len());
+    let mut props_per_group = Vec::with_capacity(dc_datas.len());
+    let mut grad_tokens_per_group = Vec::with_capacity(dc_datas.len());
+    let mut meta_tokens_per_group = Vec::with_capacity(dc_datas.len());
+    let mut meta_props_per_group = Vec::with_capacity(dc_datas.len());
+    let mut parts = parts.into_iter();
+    for _ in 0..dc_datas.len() {
+        let (mut wp, mut props, mut grad) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let (channel_wp, channel_props, channel_grad) = parts.next().expect("channel part");
+            wp.extend(channel_wp);
+            props.extend(channel_props);
+            grad.extend(channel_grad);
+        }
+        let (meta, meta_props, _) = parts.next().expect("metadata part");
         wp_tokens_per_group.push(wp);
         props_per_group.push(props);
         grad_tokens_per_group.push(grad);
@@ -276,6 +386,17 @@ pub(crate) fn prepare_dc_entropy(
     // The margin absorbs the small estimator noise so near-ties keep the
     // battle-tested static tree.
     const LEARNED_TREE_MARGIN_BITS: u64 = 64;
+    let ans_refinement = if effort.ans_refine {
+        Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
+    } else if effort.ans_fast_refine && !effort.ans_prefix_race {
+        Some(crate::entropy::AnsRefinement::FastNoRace)
+    } else if effort.ans_fast_refine {
+        Some(crate::entropy::AnsRefinement::Fast {
+            recluster: (distance >= 3.0 && effort.ans_recluster_coarse) || effort.ans_recluster,
+        })
+    } else {
+        None
+    };
 
     // Arm C: the DC side learned over the full modular property set and
     // every predictor, as the lossless path does. Above a few DC samples it
@@ -283,13 +404,16 @@ pub(crate) fn prepare_dc_entropy(
     // not built at all; small images still race all three.
     let mut learned_ma_tree: Option<MaDcTrees> = None;
     let mut ma_leaf_map: (Vec<u32>, Vec<i32>) = (Vec::new(), Vec::new());
-    let ma_budget = if effort.ma_dc_tree {
-        Some(MaDcBudget::FULL)
-    } else if effort.ma_dc_tree_lite {
-        Some(MaDcBudget::LITE)
-    } else {
-        None
-    };
+    let dc_samples: usize = dc_datas
+        .iter()
+        .map(|d| {
+            (0..3)
+                .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
+                .sum::<usize>()
+        })
+        .sum();
+    let ma_budget = ma_dc_budget(effort).filter(|budget| dc_samples >= budget.min_samples);
+
     let ma_arm = if use_dc_frame {
         None
     } else {
@@ -335,7 +459,12 @@ pub(crate) fn prepare_dc_entropy(
                     // The prefix-cost clustering collapses a context-rich
                     // tree (59 contexts -> 3 histograms on kodim20); price
                     // the arm on the code the final ANS refinement would
-                    // produce.
+                    // produce. (Pricing with the tier's own refinement was
+                    // measured on 15 images: +0.34 % bytes at Fast and
+                    // +0.32 % at Medium; Fast for the race and Slow once on
+                    // the winner +0.005 % / +0.015 %, up to +0.28 % on one
+                    // image, for −1..−2.5 % single-thread wall and nothing
+                    // at 12 threads, where the arms refine side by side.)
                     crate::entropy::refine_entropy_bundle(
                         &mut code,
                         streams(),
@@ -414,14 +543,6 @@ pub(crate) fn prepare_dc_entropy(
 
     // `dc_code_refined`: the arm pricing already used ANS-refined codes, so
     // the winner needs no second refinement.
-    let dc_samples: usize = dc_datas
-        .iter()
-        .map(|d| {
-            (0..3)
-                .map(|c| d.quant_dc.plane(c).xsize() * d.quant_dc.plane(c).ysize())
-                .sum::<usize>()
-        })
-        .sum();
     let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree, dc_code_refined) =
         match ma_arm {
             Some((_, dc_tokens, meta_tokens, code, tree)) if dc_samples >= MA_ARM_ALONE_SAMPLES => {
@@ -590,17 +711,6 @@ pub(crate) fn prepare_dc_entropy(
     drop(grad_tokens_per_group);
     drop(props_per_group);
     drop(meta_props_per_group);
-    let ans_refinement = if effort.ans_refine {
-        Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
-    } else if effort.ans_fast_refine && !effort.ans_prefix_race {
-        Some(crate::entropy::AnsRefinement::FastNoRace)
-    } else if effort.ans_fast_refine {
-        Some(crate::entropy::AnsRefinement::Fast {
-            recluster: (distance >= 3.0 && effort.ans_recluster_coarse) || effort.ans_recluster,
-        })
-    } else {
-        None
-    };
     if let Some(refinement) = ans_refinement.filter(|_| !dc_code_refined) {
         crate::entropy::refine_entropy_bundle(
             &mut dc_code_owned,
@@ -735,15 +845,14 @@ pub(crate) struct MaDcBudget {
     /// Also learn the metadata side over the modular property set and race
     /// it against the static refined side.
     pub(crate) learn_meta: bool,
+    /// DC samples (all channels) below which the arm is not built: its
+    /// fixed cost (tokenizing through the tree, the code build and its Slow
+    /// refinement) is a loss on small images at the fast tiers.
+    pub(crate) min_samples: usize,
 }
 
 impl MaDcBudget {
-    /// Slow and up. Over the 160-leaf / 4-side-predictor / static-metadata
-    /// budget on 14 references at d1/2/4: every side predictor scored per
-    /// split side −0.09 % (large images −0.5 %, Kodak ±0.1 %), the 400-leaf
-    /// cap −0.2 % (binds on large images only), the learned metadata side
-    /// −0.06 % (city/screenshots −0.1..−0.26 %); together −0.34 % at ×1.13
-    /// single-thread Slow. 64 split candidates were +8 % time for −0.03 %.
+    /// Slow and up. Over the 160-leaf / 4-side-predictor / static-metadata.
     pub(crate) const FULL: Self = Self {
         target_samples: MA_DC_TARGET_SAMPLES,
         max_leaves: MA_DC_MAX_LEAVES,
@@ -751,11 +860,10 @@ impl MaDcBudget {
         side_preds: 14,
         offsets_variant: true,
         learn_meta: true,
+        min_samples: 0,
     };
     /// Fast and Medium: a quarter of the samples, 128 leaves, 8 split
-    /// candidates, four side predictors, no offsets variant, learned
-    /// metadata side. Over the 64-leaf / 1-side / static-metadata budget:
-    /// Fast −0.63 % at ×1.15, Medium −0.46 % at ×1.08 (33/42 and 31/42 wins).
+    /// candidates.
     pub(crate) const LITE: Self = Self {
         target_samples: 1 << 17,
         max_leaves: 128,
@@ -763,6 +871,26 @@ impl MaDcBudget {
         side_preds: 4,
         offsets_variant: false,
         learn_meta: true,
+        min_samples: 0,
+    };
+    /// Medium: the lite budget with 400 leaves learned from every DC sample
+    /// up to the full budget's. 
+    pub(crate) const DEEP_LITE: Self = Self {
+        target_samples: MA_DC_TARGET_SAMPLES,
+        max_leaves: MA_DC_MAX_LEAVES,
+        ..Self::LITE
+    };
+    
+    /// Fastest: 64K samples, 32 leaves, 4 split candidates, one side
+    /// predictor.
+    pub(crate) const XLITE: Self = Self {
+        target_samples: 1 << 16,
+        max_leaves: 32,
+        max_candidates: 4,
+        side_preds: 1,
+        offsets_variant: false,
+        learn_meta: false,
+        min_samples: 1 << 16,
     };
 }
 
@@ -889,19 +1017,37 @@ fn learn_meta_parts(
         (cap * 2 / 5).max(4),
         2,
     ];
+    // The parts learn independently of each other, one pool task each
+    // (each learner uses the pool for its own scans as well).
+    let learned: Vec<Option<LearnedTree>> = {
+        let (samples, idx) = (&samples, &idx);
+        pool.steal_map(scratch, idx.len(), |part, worker_scratch| {
+            let part_idx = &idx[part];
+            if part_idx.len() < MA_DC_MIN_NODE_SAMPLES {
+                return None;
+            }
+            let params = ma_dc_params(samples, budget, caps[part], stride);
+            Some(crate::ma_tree::learn_ma_tree_indexed(
+                samples,
+                part_idx.clone(),
+                params,
+                pool,
+                worker_scratch,
+            ))
+        })
+    };
     let mut parts: Vec<Vec<MaNode>> = Vec::with_capacity(4);
     let mut est_bits = 0.0;
     let mut flat_bits = 0.0;
-    for (part, part_idx) in idx.into_iter().enumerate() {
-        if part_idx.len() < MA_DC_MIN_NODE_SAMPLES {
-            parts.push(vec![MaNode::Leaf { pred: 0, offset: 0 }]);
-            continue;
+    for tree in learned {
+        match tree {
+            None => parts.push(vec![MaNode::Leaf { pred: 0, offset: 0 }]),
+            Some(tree) => {
+                est_bits += tree.est_bits;
+                flat_bits += tree.flat_bits;
+                parts.push(tree.nodes);
+            }
         }
-        let params = ma_dc_params(&samples, budget, caps[part], stride);
-        let tree = crate::ma_tree::learn_ma_tree_indexed(&samples, part_idx, params, pool, scratch);
-        est_bits += tree.est_bits;
-        flat_bits += tree.flat_bits;
-        parts.push(tree.nodes);
     }
     // Routing prefix: channel > 2 → EPF; channel > 1 → (y > 0 → QF, else
     // strategy); else CfL.
@@ -983,27 +1129,60 @@ pub(crate) fn learn_ma_dc_arm(
     budget: MaDcBudget,
 ) -> Option<(Vec<MaDcArm>, MaDcTrees)> {
     let groups = dc_planes(dc_datas);
-
     let trees = match reuse {
         Some(trees) => trees.clone(),
         None => {
-            let dc = learn_planes(pool, scratch, &groups, budget, budget.max_leaves, wp_params)?;
-            let meta = if budget.learn_meta {
-                let dc_leaves = dc
-                    .nodes
-                    .iter()
-                    .filter(|n| matches!(n, crate::ma_tree::MaNode::Leaf { .. }))
-                    .count();
-                let cap = MA_META_MAX_LEAVES.min(MA_MAX_TREE_CONTEXTS.saturating_sub(dc_leaves));
-                if cap >= 8 {
+            // The metadata side's leaf cap leaves room for the DC side's
+            // leaves; when the DC leaf budget alone settles it (every budget
+            // in use), the two sides learn at the same time, the metadata
+            // learner filling the lanes the DC learner's deep tail leaves
+            // idle. Neither reads the other's samples.
+            let meta_cap_from_budget = (budget.learn_meta
+                && MA_MAX_TREE_CONTEXTS.saturating_sub(budget.max_leaves) >= MA_META_MAX_LEAVES)
+                .then_some(MA_META_MAX_LEAVES);
+            let (dc, meta) = match meta_cap_from_budget {
+                Some(cap) => {
                     let planes = meta_planes(dc_datas, epf_sharpness);
-                    learn_meta_parts(pool, scratch, &planes, budget, cap)
-                } else {
-                    None
+                    let mut meta_scratch = CoderScratch::lossless();
+                    pool.join(
+                        || {
+                            learn_planes(
+                                pool,
+                                scratch,
+                                &groups,
+                                budget,
+                                budget.max_leaves,
+                                wp_params,
+                            )
+                        },
+                        || learn_meta_parts(pool, &mut meta_scratch, &planes, budget, cap),
+                    )
                 }
-            } else {
-                None
+                None => {
+                    let dc =
+                        learn_planes(pool, scratch, &groups, budget, budget.max_leaves, wp_params);
+                    let meta = match (&dc, budget.learn_meta) {
+                        (Some(dc), true) => {
+                            let dc_leaves = dc
+                                .nodes
+                                .iter()
+                                .filter(|n| matches!(n, crate::ma_tree::MaNode::Leaf { .. }))
+                                .count();
+                            let cap = MA_META_MAX_LEAVES
+                                .min(MA_MAX_TREE_CONTEXTS.saturating_sub(dc_leaves));
+                            if cap >= 8 {
+                                let planes = meta_planes(dc_datas, epf_sharpness);
+                                learn_meta_parts(pool, scratch, &planes, budget, cap)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    (dc, meta)
+                }
             };
+            let dc = dc?;
             MaDcTrees { dc, meta }
         }
     };
@@ -1083,31 +1262,26 @@ fn assemble_ma_arms(
             WpParams::DEFAULT,
         )
     });
+    // Per-group renumbering of the tokens, one pool task per group.
     let map_ctx = |tokens: &[Vec<Token>], leaf_ctx: &[u32]| -> Vec<Vec<Token>> {
-        tokens
-            .iter()
-            .map(|g| {
-                g.iter()
-                    .map(|t| Token::new(leaf_ctx[t.context as usize], t.value))
-                    .collect()
-            })
-            .collect()
+        pool.map(tokens.len(), |g| {
+            tokens[g]
+                .iter()
+                .map(|t| Token::new(leaf_ctx[t.context as usize], t.value))
+                .collect()
+        })
     };
     let static_meta = |meta_context: &[u16]| -> Vec<Vec<Token>> {
-        meta_tokens
-            .iter()
-            .zip(meta_props)
-            .map(|(group, props)| {
-                group
-                    .iter()
-                    .zip(props)
-                    .map(|(t, &p)| {
-                        let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
-                        Token::new(u32::from(meta_context[slot]), t.value)
-                    })
-                    .collect()
-            })
-            .collect()
+        pool.map(meta_tokens.len(), |g| {
+            meta_tokens[g]
+                .iter()
+                .zip(&meta_props[g])
+                .map(|(t, &p)| {
+                    let slot = ((t.context as usize) << 10) | (p & 1023) as usize;
+                    Token::new(u32::from(meta_context[slot]), t.value)
+                })
+                .collect()
+        })
     };
     // Residuals do not depend on the offset: center each DC leaf on its
     // median. Offsets only pay through clustering, so both are priced.
@@ -1232,4 +1406,19 @@ fn repick_leaf_predictors(
         dc,
         meta: trees.meta.clone(),
     })
+}
+
+/// The MA-learned DC arm's budget at this effort.
+pub(crate) fn ma_dc_budget(effort: &crate::effort::Effort) -> Option<MaDcBudget> {
+    if effort.ma_dc_tree {
+        Some(MaDcBudget::FULL)
+    } else if effort.ma_dc_tree_deep {
+        Some(MaDcBudget::DEEP_LITE)
+    } else if effort.ma_dc_tree_lite {
+        Some(MaDcBudget::LITE)
+    } else if effort.ma_dc_tree_xlite {
+        Some(MaDcBudget::XLITE)
+    } else {
+        None
+    }
 }

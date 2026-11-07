@@ -43,7 +43,6 @@
 //! slack 1.0 loses quality and an unbounded budget changes almost nothing.
 
 use super::*;
-use std::collections::HashMap;
 
 mod compact;
 
@@ -190,9 +189,110 @@ enum Memo {
     AtLeast(f64),
 }
 
+/// Open-addressing table keyed by a `u32`: Fibonacci hashing, linear
+/// probing, and a generation stamp in place of clearing.
+struct OpenTable<V: Copy + Default> {
+    keys: Vec<u32>,
+    stamps: Vec<u32>,
+    values: Vec<V>,
+    generation: u32,
+    len: usize,
+    shift: u32,
+}
+
+impl<V: Copy + Default> Default for OpenTable<V> {
+    fn default() -> Self {
+        let mut table = Self {
+            keys: Vec::new(),
+            stamps: Vec::new(),
+            values: Vec::new(),
+            generation: 1,
+            len: 0,
+            shift: 32,
+        };
+        table.resize(1 << 12);
+        table
+    }
+}
+
+impl<V: Copy + Default> OpenTable<V> {
+    fn resize(&mut self, capacity: usize) {
+        debug_assert!(capacity.is_power_of_two());
+        self.keys = vec![0; capacity];
+        self.stamps = vec![0; capacity];
+        self.values = vec![V::default(); capacity];
+        self.shift = 32 - capacity.trailing_zeros();
+        self.len = 0;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.stamps.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    /// The slot holding `key`, or the empty slot it belongs in.
+    #[inline]
+    fn slot(&self, key: u32) -> (usize, bool) {
+        let mask = self.keys.len() - 1;
+        let mut slot = (key.wrapping_mul(0x9E37_79B1) >> self.shift) as usize;
+        loop {
+            if self.stamps[slot] != self.generation {
+                return (slot, false);
+            }
+            if self.keys[slot] == key {
+                return (slot, true);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: u32) -> Option<V> {
+        let (slot, found) = self.slot(key);
+        found.then(|| self.values[slot])
+    }
+
+    fn insert(&mut self, key: u32, value: V) {
+        let (slot, found) = self.slot(key);
+        if !found {
+            if (self.len + 1) * 2 > self.keys.len() {
+                let live: Vec<(u32, V)> = (0..self.keys.len())
+                    .filter(|&i| self.stamps[i] == self.generation)
+                    .map(|i| (self.keys[i], self.values[i]))
+                    .collect();
+                self.resize(self.keys.len() * 2);
+                for (key, value) in live {
+                    self.insert(key, value);
+                }
+                return self.insert(key, value);
+            }
+            self.keys[slot] = key;
+            self.stamps[slot] = self.generation;
+            self.len += 1;
+        }
+        self.values[slot] = value;
+    }
+}
+
+impl Default for Memo {
+    fn default() -> Self {
+        Self::AtLeast(0.0)
+    }
+}
+
+impl Default for ReconStrategyCost {
+    fn default() -> Self {
+        UNMEASURED
+    }
+}
+
 #[derive(Default)]
 struct PlannerScratch {
-    memo: HashMap<u32, Memo>,
+    memo: OpenTable<Memo>,
     regions: Vec<Entry>,
     anchors: Vec<Vec<usize>>,
     columns: [[f64; SIDE + 1]; SIDE],
@@ -560,7 +660,7 @@ fn visit(
     s: &mut PlannerScratch,
 ) -> Option<Entry> {
     let key = profile_key(profile);
-    match s.memo.get(&key).copied() {
+    match s.memo.get(key) {
         Some(Memo::Solved(best)) => return Some(best),
         Some(Memo::AtLeast(bound)) if bound >= budget => return None,
         _ => {}
@@ -590,7 +690,7 @@ fn visit(
             continue;
         }
         let next = advance(profile, c);
-        let bound = match s.memo.get(&profile_key(next)).copied() {
+        let bound = match s.memo.get(profile_key(next)) {
             Some(Memo::Solved(entry)) => entry.cost,
             Some(Memo::AtLeast(bound)) => bound,
             None => {
@@ -655,7 +755,7 @@ fn plan(
     }
     let mut profile = [0; SIDE];
     while first_open(profile, width).1 < height {
-        let Memo::Solved(entry) = s.memo[&profile_key(profile)] else {
+        let Some(Memo::Solved(entry)) = s.memo.get(profile_key(profile)) else {
             unreachable!("a winning backpointer must have an exact suffix");
         };
         match entry.choice {
@@ -727,7 +827,7 @@ pub(crate) struct LayoutDpScratch {
     /// Scores by absolute block position and strategy, kept across the
     /// tile grids of one re-tiling so a shifted grid rescores only the
     /// pieces the aligned grid could not place.
-    global: HashMap<u32, ReconStrategyCost>,
+    global: OpenTable<ReconStrategyCost>,
     candidates: Vec<Candidate>,
     planner: PlannerScratch,
     current: Vec<Piece>,
@@ -778,7 +878,7 @@ impl Scores<'_, '_> {
             let params = self.rerank.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
             let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
-            if let Some(&hit) = cache.global.get(&global_key) {
+            if let Some(hit) = cache.global.get(global_key) {
                 cache.reconstruction[key] = hit;
                 return hit;
             }
@@ -1175,7 +1275,7 @@ impl CoefficientScores<'_, '_> {
             let params = self.selection.params;
             let (x, y) = (self.bx + p.x as usize, self.by + p.y as usize);
             let global_key = ((y * 256 + x) << 5 | p.strategy as usize) as u32;
-            if let Some(&hit) = cache.global.get(&global_key) {
+            if let Some(hit) = cache.global.get(global_key) {
                 cache.reconstruction[key] = hit;
                 return hit.cost;
             }
@@ -2117,13 +2217,13 @@ mod tests {
         scratch.memo.clear();
         for budget in [4.0, 4.5] {
             assert!(visit([0; SIDE], 3, 3, budget, &c, &mut scratch).is_none());
-            assert!(matches!(scratch.memo[&0],Memo::AtLeast(bound) if bound >= budget));
+            assert!(matches!(scratch.memo.get(0),Some(Memo::AtLeast(bound)) if bound >= budget));
         }
         assert_eq!(
             visit([0; SIDE], 3, 3, 6.0, &c, &mut scratch).unwrap().cost,
             5.0
         );
-        assert!(matches!(scratch.memo[&0],Memo::Solved(entry) if entry.cost == 5.0));
+        assert!(matches!(scratch.memo.get(0),Some(Memo::Solved(entry)) if entry.cost == 5.0));
     }
 
     #[test]

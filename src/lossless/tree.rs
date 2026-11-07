@@ -31,9 +31,7 @@
 
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::entropy::{
-    OwnedEntropyCode, Token, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
-};
+use crate::entropy::{OwnedEntropyCode, Token, pack_signed, write_entropy_code};
 use crate::ma_tree::{LearnedTree, MaNode};
 
 pub(super) const TREE_CTX_SPLIT_VAL: u32 = 0;
@@ -227,14 +225,13 @@ pub(super) fn write_tree_and_pixel_code_nolz(
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    let tree_code =
-        optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS, &mut scratch.huffman_pool);
-    let tree_code_ref = tree_code.as_ref();
-    w.write(1, 0); // tree entropy code: no LZ77
-    write_entropy_code(&tree_code_ref, &mut scratch.huffman_pool, w);
-    for tok in tree_tokens {
-        write_token(*tok, &tree_code_ref, w);
-    }
+    // The tree's own entropy code (no LZ77 in the tree), then its tokens.
+    crate::entropy::write_raced_token_stream(
+        tree_tokens,
+        NUM_TREE_CONTEXTS,
+        &mut scratch.huffman_pool,
+        w,
+    );
     // Pixel entropy code: LZ77 DISABLED (1 bit = 0), then the code itself.
     w.write(1, 0);
     write_entropy_code(&pixel_code.as_ref(), &mut scratch.huffman_pool, w);

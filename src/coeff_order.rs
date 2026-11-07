@@ -459,13 +459,8 @@ pub(crate) fn write_permutation(
 ) {
     let mut tokens: Vec<Token> = Vec::new();
     tokenize_permutation(permutation, 0, &mut tokens);
-    let code = crate::entropy::optimize_entropy_code(&tokens, PERMUTATION_CONTEXTS, huffman_pool);
-    let code_ref = code.as_ref();
-    w.write(1, 0); // no lz77 for the permutation stream
-    crate::entropy::write_entropy_code(&code_ref, huffman_pool, w);
-    for t in &tokens {
-        crate::entropy::write_token(*t, &code_ref, w);
-    }
+    // The permutation stream's own code (no LZ77), then its tokens.
+    crate::entropy::write_raced_token_stream(&tokens, PERMUTATION_CONTEXTS, huffman_pool, w);
 }
 
 /// Write the `used_orders` field and, when any group is signaled, the shared
@@ -497,13 +492,8 @@ pub(crate) fn write_coeff_orders(
             tokenize_permutation(&zigzag, llf, &mut tokens);
         }
     }
-    let code = crate::entropy::optimize_entropy_code(&tokens, PERMUTATION_CONTEXTS, huffman_pool);
-    let code_ref = code.as_ref();
-    w.write(1, 0); // no lz77 for the permutation stream
-    crate::entropy::write_entropy_code(&code_ref, huffman_pool, w);
-    for t in &tokens {
-        crate::entropy::write_token(*t, &code_ref, w);
-    }
+    // The orders' shared code (no LZ77), then every permutation's tokens.
+    crate::entropy::write_raced_token_stream(&tokens, PERMUTATION_CONTEXTS, huffman_pool, w);
 }
 
 /// Slot in [`ORDER_SPECS`] for a strategy's order group, or `None` if the

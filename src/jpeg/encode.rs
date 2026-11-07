@@ -40,9 +40,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::dc_group_data::DcGroupData;
 use crate::entropy::AnsRefinement;
-use crate::entropy::{
-    Token, optimize_entropy_code, pack_signed, write_ans_tokens, write_entropy_code, write_token,
-};
+use crate::entropy::{Token, pack_signed, write_ans_tokens, write_entropy_code, write_token};
 use crate::frame::{
     collect_ac_metadata_tokens, collect_dc_tokens_with_gradient, combine_sections,
     combined_sections_size, write_context_tree, write_quant_scales,
@@ -1688,14 +1686,12 @@ fn finish_ac_plan(
                 w.write(13, 1); // custom order for DCT8
                 // Its own entropy stream, then the tokens, exactly as libjxl's
                 // EncodeCoeffOrders lays it out.
-                let perm_code = optimize_entropy_code(
+                crate::entropy::write_raced_token_stream(
                     perm_tokens,
                     coeff_order::PERMUTATION_CONTEXTS,
                     &mut scratch.huffman_pool,
+                    w,
                 );
-                w.write(1, 0); // no lz77
-                write_entropy_code(&perm_code.as_ref(), &mut scratch.huffman_pool, w);
-                emit_tokens(perm_tokens, &perm_code.as_ref(), w);
             }
             None => w.write(13, 0), // natural order
         }

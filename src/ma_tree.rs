@@ -1349,9 +1349,12 @@ struct Ahead {
 fn speculative_splits(pool: &ThreadPool) -> usize {
     match pool.num_threads() {
         1 => 1,
-        threads => (2 * threads).min(8),
+        threads => (2 * threads).min(SPECULATE_MAX_WINDOW),
     }
 }
+
+/// Upper bound of the speculation window (nodes scored per round).
+const SPECULATE_MAX_WINDOW: usize = 8;
 
 /// Rows of a node scored ahead of its turn are partitioned on a copy, so the
 /// learner's own row order (which leaf-offset sampling later reads) changes
@@ -1435,48 +1438,28 @@ fn grow_tree(
 ) -> LearnedTree {
     let window = speculative_splits(pool);
     let mut ahead: std::collections::HashMap<u32, Ahead> = std::collections::HashMap::new();
-    // Rows to score: the committed node's children in place, plus the
-    // speculated nodes' children on their partitioned copies.
-    struct Job {
-        node_id: u32,
-        start: usize,
-        lo: usize,
-        end: usize,
-        depth: u16,
-        /// Modal offsets of the `gt` and `le` children.
-        offsets: (i32, i32),
-        copy: Option<MaSamples>,
-    }
     let modal = learner.p.modal_offsets && !learner.s.val.is_empty();
     while learner.leaves < learner.p.max_leaves as u32 {
         let Some(p) = heap.pop() else { break };
         let (prop, threshold) = p.split.expect("only splittable nodes are queued");
         if !ahead.contains_key(&p.node_id) {
-            let mut jobs: Vec<Job> = Vec::with_capacity(window);
-            // Use the original two-ended partition order, but move complete
-            // rows instead of indices. Each child is a contiguous view of the
-            // local rows; every child and quantile probe sees exactly the
-            // original sequence.
+            // The committed node: use the original two-ended partition order,
+            // but move complete rows instead of indices. Each child is a
+            // contiguous view of the local rows; every child and quantile
+            // probe sees exactly the original sequence.
             let lo = p.start + learner.s.partition(p.start, p.end, prop, threshold);
             let offsets = (
                 learner.rebase(p.start, lo, scratch),
                 learner.rebase(lo, p.end, scratch),
             );
-            jobs.push(Job {
-                node_id: p.node_id,
-                start: p.start,
-                lo,
-                end: p.end,
-                depth: p.depth + 1,
-                offsets,
-                copy: None,
-            });
+            let committed_live = lo != p.start && lo != p.end;
+            // Speculated nodes: the next best pending splits by gain (ties
+            // may pick either, which only decides what is computed early,
+            // never what is committed). Their rows are untouched until they
+            // commit, so a copy partitioned the same way holds exactly the
+            // rows the children will then own.
+            let mut speculated: Vec<(u32, usize, usize, u8, i32, u16)> = Vec::new();
             if window > 1 {
-                // The next best pending splits by gain (ties may pick either,
-                // which only decides what is computed early, never what is
-                // committed). Their rows are untouched until they commit, so
-                // a copy partitioned the same way holds exactly the rows the
-                // children will then own.
                 let mut next: Vec<&Pending> = heap
                     .iter()
                     .filter(|q| {
@@ -1486,89 +1469,106 @@ fn grow_tree(
                 next.sort_by(|a, b| b.gain.total_cmp(&a.gain));
                 for q in next.into_iter().take(window - 1) {
                     let (prop, threshold) = q.split.expect("only splittable nodes are queued");
-                    let mut copy = MaSamples {
-                        props: learner.s.props.copy_range(q.start..q.end),
-                        tok: learner.s.tok[q.start..q.end].to_vec(),
-                        val: if modal {
-                            learner.s.val[q.start..q.end].to_vec()
-                        } else {
-                            Vec::new()
-                        },
-                    };
-                    let split_at = copy.partition(0, copy.len(), prop, threshold);
-                    let offsets = if modal {
-                        let hist = &mut scratch.ma_property.multi_bin_count;
-                        (
-                            rebase_zero(&mut copy.tok[..split_at], &copy.val[..split_at], hist),
-                            rebase_zero(&mut copy.tok[split_at..], &copy.val[split_at..], hist),
-                        )
-                    } else {
-                        (0, 0)
-                    };
-                    let lo = q.start + split_at;
-                    jobs.push(Job {
-                        node_id: q.node_id,
-                        start: q.start,
-                        lo,
-                        end: q.end,
-                        depth: q.depth + 1,
-                        offsets,
-                        copy: Some(copy),
-                    });
+                    speculated.push((q.node_id, q.start, q.end, prop, threshold, q.depth + 1));
                 }
             }
-            let live: Vec<&Job> = jobs
-                .iter()
-                .filter(|job| job.lo != job.start && job.lo != job.end)
-                .collect();
+            // Two tasks per node, `gt` then `le`. The committed node's score
+            // its partitioned rows in place; a speculated node's each copy
+            // and partition the node's rows themselves (the copy is private
+            // to the task, and both tasks of a node partition it alike), so
+            // the copies are made off the committing thread.
+            let committed_tasks = if committed_live { 2 } else { 0 };
             let learner_ref = &learner;
-            let score = |k: usize, worker_scratch: &mut CoderScratch| {
-                let job = live[k / 2];
-                let (start, end, offset) = if k.is_multiple_of(2) {
-                    (job.start, job.lo, job.offsets.0)
-                } else {
-                    (job.lo, job.end, job.offsets.1)
-                };
-                match &job.copy {
-                    None => {
-                        learner_ref.evaluate(0, start, end, job.depth, offset, pool, worker_scratch)
-                    }
-                    Some(copy) => {
-                        let rows = start - job.start..end - job.start;
-                        learner_ref.evaluate_rows(
-                            0,
-                            start,
-                            end,
-                            copy.props.slice(rows.clone()),
-                            &copy.tok[rows],
-                            job.depth,
-                            offset,
-                            pool,
-                            worker_scratch,
-                        )
-                    }
+            let speculated_ref = &speculated;
+            let score = |k: usize, worker_scratch: &mut CoderScratch| -> Option<(usize, Pending)> {
+                if k < committed_tasks {
+                    let (start, end, offset) = if k == 0 {
+                        (p.start, lo, offsets.0)
+                    } else {
+                        (lo, p.end, offsets.1)
+                    };
+                    let pending = learner_ref.evaluate(
+                        0,
+                        start,
+                        end,
+                        p.depth + 1,
+                        offset,
+                        pool,
+                        worker_scratch,
+                    );
+                    return Some((lo, pending));
                 }
+                let j = (k - committed_tasks) / 2;
+                let (_, start, end, prop, threshold, depth) = speculated_ref[j];
+                let mut copy = MaSamples {
+                    props: learner_ref.s.props.copy_range(start..end),
+                    tok: learner_ref.s.tok[start..end].to_vec(),
+                    val: if modal {
+                        learner_ref.s.val[start..end].to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                let split_at = copy.partition(0, copy.len(), prop, threshold);
+                if split_at == 0 || split_at == copy.len() {
+                    // Quantile candidate straddled no actual sample boundary.
+                    return None;
+                }
+                let rows = if (k - committed_tasks).is_multiple_of(2) {
+                    0..split_at
+                } else {
+                    split_at..copy.len()
+                };
+                let offset = if modal {
+                    rebase_zero(
+                        &mut copy.tok[rows.clone()],
+                        &copy.val[rows.clone()],
+                        &mut worker_scratch.ma_property.multi_bin_count,
+                    )
+                } else {
+                    0
+                };
+                let pending = learner_ref.evaluate_rows(
+                    0,
+                    start + rows.start,
+                    start + rows.end,
+                    copy.props.slice(rows.clone()),
+                    &copy.tok[rows],
+                    depth,
+                    offset,
+                    pool,
+                    worker_scratch,
+                );
+                Some((start + split_at, pending))
             };
-            let smallest = live
-                .iter()
-                .map(|job| (job.lo - job.start).min(job.end - job.lo))
-                .min()
-                .unwrap_or(0);
-            let scored: Vec<Pending> = if pool.num_threads() > 1
-                && (live.len() > 1 || smallest >= PARALLEL_CHILD_MIN_SAMPLES)
-            {
-                pool.steal_map(scratch, live.len() * 2, score)
+            let tasks = committed_tasks + 2 * speculated.len();
+            let smallest = if committed_live {
+                (lo - p.start).min(p.end - lo)
             } else {
-                (0..live.len() * 2).map(|k| score(k, scratch)).collect()
+                0
+            };
+            let scored: Vec<Option<(usize, Pending)>> = if pool.num_threads() > 1
+                && (tasks > 2 || smallest >= PARALLEL_CHILD_MIN_SAMPLES)
+            {
+                pool.steal_map(scratch, tasks, score)
+            } else {
+                (0..tasks).map(|k| score(k, scratch)).collect()
             };
             let mut scored = scored.into_iter();
-            for job in &jobs {
-                let children = (job.lo != job.start && job.lo != job.end).then(|| {
-                    let gt = scored.next().expect("gt child");
-                    let le = scored.next().expect("le child");
-                    (job.lo, gt, le)
-                });
-                ahead.insert(job.node_id, Ahead { children });
+            let children = committed_live.then(|| {
+                let (_, gt) = scored.next().expect("gt child").expect("committed gt");
+                let (_, le) = scored.next().expect("le child").expect("committed le");
+                (lo, gt, le)
+            });
+            ahead.insert(p.node_id, Ahead { children });
+            for &(node_id, ..) in &speculated {
+                let gt = scored.next().expect("gt child");
+                let le = scored.next().expect("le child");
+                let children = match (gt, le) {
+                    (Some((lo, gt)), Some((_, le))) => Some((lo, gt, le)),
+                    _ => None,
+                };
+                ahead.insert(node_id, Ahead { children });
             }
         } else {
             // Scored ahead on a copy: partition the learner's rows now, and

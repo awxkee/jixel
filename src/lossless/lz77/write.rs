@@ -34,7 +34,7 @@ use super::super::tree::{
 };
 use super::{ConstantTail, LzToken, LzTokenSource, lz_tokens, lz77_length_encode};
 use crate::bit_writer::BitWriter;
-use crate::entropy::{EntropyCode, Token, optimize_entropy_code, write_entropy_code, write_token};
+use crate::entropy::{EntropyCode, Token, write_entropy_code};
 
 /// Emit a full section's `LzToken` stream: prefix codes stream token-by-token;
 /// rANS buffers the section (one ANS state per section, symbols pushed in
@@ -282,15 +282,8 @@ pub(crate) fn write_tree_lz77(
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     w: &mut BitWriter,
 ) {
-    let tree_code = optimize_entropy_code(tree_tokens, NUM_TREE_CONTEXTS, huffman_pool);
-    let tree_code_ref = tree_code.as_ref();
-
-    // Tree's entropy code: no LZ77 in the tree itself.
-    w.write(1, 0);
-    write_entropy_code(&tree_code_ref, huffman_pool, w);
-    for tok in tree_tokens {
-        write_token(*tok, &tree_code_ref, w);
-    }
+    // Tree's entropy code (no LZ77 in the tree itself), then its tokens.
+    crate::entropy::write_raced_token_stream(tree_tokens, NUM_TREE_CONTEXTS, huffman_pool, w);
 
     // Pixel entropy code: LZ77 ENABLED for the main bitstream.
     write_lz77_header(min_symbol, w);

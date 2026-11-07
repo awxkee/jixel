@@ -343,74 +343,195 @@ fn joint_split(
             classify_pixel(rgb, alpha, &*thin, plans, &buckets, i, s, seeds);
         }
     });
-    for (_, seeds) in bands {
-        queue.extend(seeds);
-    }
     // Strokes are 8-connected: a one-pixel diagonal touches only by corner.
-    let mut head = 0;
-    while let Some(&i) = queue.get(head) {
-        head += 1;
-        let color = state[i] & !7;
-        for j in neighbors8(i, width, height) {
-            if state[j] == color | UNGROWN {
-                state[j] = color;
-                queue.push(j);
+    // Growth is reachability from the seeds, so it is the same set however
+    // it is traversed: every band floods its own rows from its own seeds,
+    // and a pixel grown on a band's edge row seeds the neighbouring band in
+    // the next round, until no band grows further.
+    let mut bands: Vec<_> = bands
+        .into_iter()
+        .map(|(states, seeds)| (states, seeds, Vec::new(), Vec::new(), Vec::new()))
+        .collect();
+    loop {
+        pool.for_each_mut(&mut bands, |b, (states, seeds, foreign, up, down)| {
+            let start = b * rows * width;
+            let end = start + states.len();
+            let grow = |j: usize, color: u8, states: &mut [u8], seeds: &mut Vec<usize>| {
+                if (start..end).contains(&j) && states[j - start] == color | UNGROWN {
+                    states[j - start] = color;
+                    seeds.push(j);
+                }
+            };
+            // Seeds carried from the neighbouring bands have grown there;
+            // only their neighbours in this band remain to be grown.
+            for (i, color) in foreign.drain(..) {
+                for j in neighbors8(i, width, height) {
+                    grow(j, color, states, seeds);
+                }
+            }
+            let mut head = 0;
+            while let Some(&i) = seeds.get(head) {
+                head += 1;
+                let color = states[i - start] & !7;
+                for j in neighbors8(i, width, height) {
+                    grow(j, color, states, seeds);
+                }
+                if i < start + width && start > 0 {
+                    up.push((i, color));
+                }
+                if i + width >= end && end < width * height {
+                    down.push((i, color));
+                }
+            }
+            seeds.clear();
+        });
+        // Hand each band's edge pixels to the band they border.
+        let mut pending = 0usize;
+        for b in 0..bands.len() {
+            if b > 0 {
+                let down = std::mem::take(&mut bands[b - 1].4);
+                pending += down.len();
+                bands[b].2.extend(down);
+            }
+            if b + 1 < bands.len() {
+                let up = std::mem::take(&mut bands[b + 1].3);
+                pending += up.len();
+                bands[b].2.extend(up);
             }
         }
+        if pending == 0 {
+            break;
+        }
     }
-    for s in state.iter_mut() {
-        *s = if *s & 7 == 0 { *s >> 3 } else { 0 };
-    }
-    const VISITED: u8 = 0x80;
+    drop(bands);
+    pool.for_each_mut(&mut state.chunks_mut(rows * width).collect::<Vec<_>>(), |_, states| {
+        for s in states.iter_mut() {
+            *s = if *s & 7 == 0 { *s >> 3 } else { 0 };
+        }
+    });
     let mut counts = vec![0usize; plans.len()];
     let mut components = vec![0usize; plans.len()];
     // Squared error of drawing the strokes in the flat ink color.
     let mut squares = vec![0u64; plans.len()];
-    let mut seed = 0;
-    while let Some(offset) = state[seed..]
-        .iter()
-        .position(|&s| (1..=MAX_INKS as u8).contains(&s))
-    {
-        seed += offset;
-        let color = state[seed];
-        let k = color as usize - 1;
-        queue.clear();
-        queue.push(seed);
-        state[seed] |= VISITED;
-        let mut square = 0u64;
-        let mut head = 0;
-        while let Some(&i) = queue.get(head) {
-            head += 1;
-            square += rgb[i]
-                .iter()
-                .zip(plans[k].color)
-                .map(|(&a, b)| (a.abs_diff(b) as u64).pow(2))
-                .sum::<u64>();
-            for j in neighbors8(i, width, height) {
-                if state[j] == color {
-                    state[j] |= VISITED;
-                    queue.push(j);
+    // Components are labelled per band, joined across the band borders
+    // with a union-find, and judged by their totals: the sizes and squares
+    // are integer sums, so this is what one raster-order flood found.
+    let mut labels = vec![0u32; n];
+    let state_ref: &[u8] = state;
+    let mut label_bands: Vec<_> = labels
+        .chunks_mut(rows * width)
+        .map(|labels| (labels, Vec::<(u8, usize, u64)>::new()))
+        .collect();
+    pool.for_each_mut(&mut label_bands, |b, (labels, found)| {
+        let start = b * rows * width;
+        let end = start + labels.len();
+        let mut queue = Vec::new();
+        for o in 0..labels.len() {
+            let color = state_ref[start + o];
+            if !(1..=MAX_INKS as u8).contains(&color) || labels[o] != 0 {
+                continue;
+            }
+            let k = color as usize - 1;
+            let label = found.len() as u32 + 1;
+            queue.clear();
+            queue.push(start + o);
+            labels[o] = label;
+            let mut square = 0u64;
+            let mut head = 0;
+            while let Some(&i) = queue.get(head) {
+                head += 1;
+                square += rgb[i]
+                    .iter()
+                    .zip(plans[k].color)
+                    .map(|(&a, b)| (a.abs_diff(b) as u64).pow(2))
+                    .sum::<u64>();
+                for j in neighbors8(i, width, height) {
+                    if (start..end).contains(&j) && state_ref[j] == color && labels[j - start] == 0 {
+                        labels[j - start] = label;
+                        queue.push(j);
+                    }
+                }
+            }
+            found.push((color, queue.len(), square));
+        }
+    });
+    let mut offsets = Vec::with_capacity(label_bands.len() + 1);
+    offsets.push(0usize);
+    let mut comps: Vec<(u8, usize, u64)> = Vec::new();
+    for (_, found) in &label_bands {
+        comps.extend_from_slice(found);
+        offsets.push(comps.len());
+    }
+    drop(label_bands);
+    let global = |b: usize, label: u32| offsets[b] + label as usize - 1;
+    let mut parent: Vec<usize> = (0..comps.len()).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    debug_assert_eq!(offsets.len(), num_bands + 1);
+    for b in 1..num_bands {
+        let y = b * rows;
+        for x in 0..width {
+            let i = y * width + x;
+            let color = state_ref[i];
+            if color == 0 {
+                continue;
+            }
+            for xx in x.saturating_sub(1)..(x + 2).min(width) {
+                let j = i - width - x + xx;
+                if state_ref[j] == color {
+                    let (ra, rb) = (
+                        find(&mut parent, global(b, labels[i])),
+                        find(&mut parent, global(b - 1, labels[j])),
+                    );
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
                 }
             }
         }
+    }
+    let roots: Vec<usize> = (0..comps.len()).map(|i| find(&mut parent, i)).collect();
+    let mut sizes = vec![0usize; comps.len()];
+    let mut total_squares = vec![0u64; comps.len()];
+    for (i, &(_, size, square)) in comps.iter().enumerate() {
+        sizes[roots[i]] += size;
+        total_squares[roots[i]] += square;
+    }
+    let mut rejected = vec![false; comps.len()];
+    for (i, &(color, _, _)) in comps.iter().enumerate() {
+        if roots[i] != i {
+            continue;
+        }
+        let k = color as usize - 1;
+        let (size, square) = (sizes[i], total_squares[i]);
         // A stroke is one color: a component that drifts from the ink is a
         // fill or gradient the growth flooded, and stays in the base.
-        if queue.len() < if plans[k].local { 4 } else { MIN_COMPONENT }
-            || square as f32 > MAX_INK_SQUARE * precision * queue.len() as f32
+        if size < if plans[k].local { 4 } else { MIN_COMPONENT }
+            || square as f32 > MAX_INK_SQUARE * precision * size as f32
         {
-            for &i in queue.iter() {
-                state[i] = 0;
-            }
+            rejected[i] = true;
         } else {
-            counts[k] += queue.len();
+            counts[k] += size;
             components[k] += 1;
             squares[k] += square;
         }
-        seed += 1;
     }
-    for s in state.iter_mut() {
-        *s &= !VISITED;
-    }
+    let labels_ref: &[u32] = &labels;
+    pool.for_each_mut(&mut state.chunks_mut(rows * width).collect::<Vec<_>>(), |b, states| {
+        let start = b * rows * width;
+        for (o, s) in states.iter_mut().enumerate() {
+            let label = labels_ref[start + o];
+            if label != 0 && rejected[roots[global(b, label)]] {
+                *s = 0;
+            }
+        }
+    });
+    drop(labels);
     // An ink whose strokes mostly lie within the band of another ink's
     // strokes is that ink's antialiasing level, not a color of its own.
     let mut touching = vec![0usize; plans.len()];
