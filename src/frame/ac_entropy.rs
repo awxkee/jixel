@@ -98,10 +98,8 @@ pub(super) fn finalize_ac_entropy(
         }
         let mut bits = header.bits_written() as u64;
         for (pass, code) in codes.iter().enumerate() {
-            let streams: Vec<crate::entropy::TokenSlice<'_>> = pending
-                .iter()
-                .map(|p| p.tokens[pass].as_slice())
-                .collect();
+            let streams: Vec<crate::entropy::TokenSlice<'_>> =
+                pending.iter().map(|p| p.tokens[pass].as_slice()).collect();
             bits += crate::entropy::estimate_ac_plain_bits_pooled(
                 &streams,
                 code,

@@ -1042,7 +1042,10 @@ mod tests {
         assert!(bias > SPEC_BIAS);
         for distance in [2.5, 2.999, 3.0, 3.001, 4.0, 5.0, 6.0, 25.0] {
             assert_eq!(choose_b_bias(&edged, distance), bias);
-            assert_eq!(select_yellow(&edged, distance, &ThreadPool::new(1)).b_qm_scale, 2);
+            assert_eq!(
+                select_yellow(&edged, distance, &ThreadPool::new(1)).b_qm_scale,
+                2
+            );
         }
     }
 }

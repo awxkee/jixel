@@ -311,3 +311,30 @@ fn plain_palette_keeps_the_extra_as_indices_behind_its_meta_channel() {
         .is_none()
     );
 }
+
+#[test]
+fn lossy_palette_keeps_the_full_value_only_for_a_black_plate() {
+    let pool = crate::thread_pool::ThreadPool::new(1);
+    // Mostly the full value beside light tints, at a coarse distance: one
+    // cell can absorb them all. The values share no grid, so a merged level
+    // cannot round back onto the full value.
+    let plane: Vec<i32> = (0..64 * 48)
+        .map(|i: usize| [65535, 65535, 64000, 64001, 63000][(i * i * 7 + i * 3) % 5])
+        .collect();
+    let source = input(CodingTransform::Rgb, 3, vec![(plane.clone(), 60.0)]);
+    let squeezed = Pyramid::plain(&source, 64, 48, 2.0, false, &pool).unwrap();
+    let levels = |black_plate| {
+        super::lossy_palette_levels(&source, &squeezed, 64, 48, black_plate).expect("levels")
+    };
+    // Alpha has no such value: the full samples may merge.
+    assert!(
+        plane
+            .iter()
+            .zip(levels(false))
+            .any(|(&s, l)| s == 65535 && l != 65535)
+    );
+    // K: exactly the no-ink samples stay at the full value.
+    for (&s, l) in plane.iter().zip(levels(true)) {
+        assert_eq!(s == 65535, l == 65535);
+    }
+}

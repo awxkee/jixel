@@ -88,6 +88,7 @@ pub(crate) fn encode_frame(
                 coded.ysize(),
                 crate::lossy_modular::plain_distance(ctx.coding, distance)
                     * lm_texture_factor(&linear),
+                ctx.extra_black,
                 ctx.speed,
                 &ctx.thread_pool,
                 scratch,
