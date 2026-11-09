@@ -544,8 +544,11 @@ pub(super) fn choose_chroma_dc_coding(
         pool.for_each_mut(&mut hf_candidates, |ci, (rec, levels, priced)| {
             haar_smooth(t_ref, w, h, CHROMA_DC_SQUEEZE_HF_STEPS[ci], rec);
             let mut d = 0.0f64;
-            for (((level, &value), &target), &y) in
-                levels.iter_mut().zip(rec.iter()).zip(t_ref).zip(y_levels_ref)
+            for (((level, &value), &target), &y) in levels
+                .iter_mut()
+                .zip(rec.iter())
+                .zip(t_ref)
+                .zip(y_levels_ref)
             {
                 let y_level = f32::from(y);
                 let l = fine_level(value, y_level);

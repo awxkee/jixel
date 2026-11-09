@@ -404,11 +404,14 @@ fn joint_split(
         }
     }
     drop(bands);
-    pool.for_each_mut(&mut state.chunks_mut(rows * width).collect::<Vec<_>>(), |_, states| {
-        for s in states.iter_mut() {
-            *s = if *s & 7 == 0 { *s >> 3 } else { 0 };
-        }
-    });
+    pool.for_each_mut(
+        &mut state.chunks_mut(rows * width).collect::<Vec<_>>(),
+        |_, states| {
+            for s in states.iter_mut() {
+                *s = if *s & 7 == 0 { *s >> 3 } else { 0 };
+            }
+        },
+    );
     let mut counts = vec![0usize; plans.len()];
     let mut components = vec![0usize; plans.len()];
     // Squared error of drawing the strokes in the flat ink color.
@@ -446,7 +449,8 @@ fn joint_split(
                     .map(|(&a, b)| (a.abs_diff(b) as u64).pow(2))
                     .sum::<u64>();
                 for j in neighbors8(i, width, height) {
-                    if (start..end).contains(&j) && state_ref[j] == color && labels[j - start] == 0 {
+                    if (start..end).contains(&j) && state_ref[j] == color && labels[j - start] == 0
+                    {
                         labels[j - start] = label;
                         queue.push(j);
                     }
@@ -522,15 +526,18 @@ fn joint_split(
         }
     }
     let labels_ref: &[u32] = &labels;
-    pool.for_each_mut(&mut state.chunks_mut(rows * width).collect::<Vec<_>>(), |b, states| {
-        let start = b * rows * width;
-        for (o, s) in states.iter_mut().enumerate() {
-            let label = labels_ref[start + o];
-            if label != 0 && rejected[roots[global(b, label)]] {
-                *s = 0;
+    pool.for_each_mut(
+        &mut state.chunks_mut(rows * width).collect::<Vec<_>>(),
+        |b, states| {
+            let start = b * rows * width;
+            for (o, s) in states.iter_mut().enumerate() {
+                let label = labels_ref[start + o];
+                if label != 0 && rejected[roots[global(b, label)]] {
+                    *s = 0;
+                }
             }
-        }
-    });
+        },
+    );
     drop(labels);
     // An ink whose strokes mostly lie within the band of another ink's
     // strokes is that ink's antialiasing level, not a color of its own.

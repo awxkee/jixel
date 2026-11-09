@@ -472,7 +472,13 @@ pub(crate) fn assert_coefficient_kernel_preserves_original(
             let actual = run(optimized, &mut actual_levels);
             // Bit-exact, except that a NaN's sign and payload are not
             // specified by Rust and differ with release codegen.
-            let bits = |v: f32| if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+            let bits = |v: f32| {
+                if v.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    v.to_bits()
+                }
+            };
             assert_eq!(
                 (bits(actual.0), actual.1, bits(actual.2), actual.3),
                 (bits(expected.0), expected.1, bits(expected.2), expected.3),

@@ -118,13 +118,15 @@ pub(crate) fn encode_xyb_frame(
 /// Lossy modular frame of a non-XYB codestream: the integer planes in
 /// `input` at the plain-layout schedule ([`plain_distance`]). Returns the
 /// frame size in bits before the fold race, for the Auto gate, or None when
-/// the image is too small to squeeze.
+/// the image is too small to squeeze. `black_plate` says the extra channel is
+/// CMYK's K, stored inverted, whose no-ink value a lossy palette must keep.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_plain_frame(
     input: &PlainInput,
     xsize: usize,
     ysize: usize,
     distance: f32,
+    black_plate: bool,
     speed: crate::Speed,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -165,7 +167,7 @@ pub(crate) fn encode_plain_frame(
     // differ, all near ties (+0.05 % bytes); probe encodes of the extras
     // cost 1.69x the arm-free frame, the estimate 1.18x.
     let Some(levels) = (speed >= crate::Speed::Slow)
-        .then(|| lossy_palette_levels(input, &pyramid, xsize, ysize))
+        .then(|| lossy_palette_levels(input, &pyramid, xsize, ysize, black_plate))
         .flatten()
     else {
         return race::encode(pyramid, speed, pool, scratch, writer);
@@ -369,12 +371,13 @@ pub(crate) fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> 
 /// (alpha): the fewest levels within part of the squeezed channel's weighted
 /// error ([`crate::frame::extra_levels`]), to code losslessly through a
 /// Palette transform. None without such a channel, or when every value is
-/// needed.
+/// needed. A `black_plate` keeps its no-ink value (the full one) exact.
 fn lossy_palette_levels(
     input: &PlainInput,
     squeezed: &Pyramid,
     xsize: usize,
     ysize: usize,
+    black_plate: bool,
 ) -> Option<Vec<i32>> {
     use crate::encode_image::AlphaPlane;
     use crate::frame::extra_levels::{LOSSY_PALETTE_ERROR, error_weights, fewest_levels};
@@ -400,7 +403,7 @@ fn lossy_palette_levels(
         })
         .sum();
     let AlphaPlane::U16 { data, .. } =
-        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error, false)?
+        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error, black_plate)?
     else {
         unreachable!("levels keep the plane's type")
     };
