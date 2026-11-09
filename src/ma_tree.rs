@@ -98,7 +98,11 @@ const MAX_DEPTH: usize = 26;
 /// `PARALLEL_SCAN_CHUNK_SAMPLES` (one multi-property histogram per chunk,
 /// summed afterwards), instead of streaming the rows once per property.
 const PARALLEL_SCAN_MIN_SAMPLES: usize = 1 << 17;
+
 const PARALLEL_SCAN_CHUNK_SAMPLES: usize = 8192;
+/// Single-threaded, nodes with at least this many rows bin every property
+/// in one pass too.
+const SERIAL_MULTI_SCAN_MIN_SAMPLES: usize = 1 << 14;
 /// Smaller nodes score their properties concurrently, one task per
 /// property, from this many rows on; below it the tasks cost more than the
 /// scans.
@@ -207,9 +211,8 @@ impl MaSamples {
     /// Append `other`'s rows (neither carries values).
     pub(crate) fn append(&mut self, other: &Self) {
         debug_assert!(self.val.is_empty() && other.val.is_empty());
-        for (i, &tok) in other.tok.iter().enumerate() {
-            self.push(other.props.get(i), tok);
-        }
+        self.props.append(&other.props);
+        self.tok.extend_from_slice(&other.tok);
     }
 
     /// Materialize a learner's current order once. Copy each field in one
@@ -344,7 +347,7 @@ pub(crate) struct MaPropertyScratch {
     luts: Vec<u8>,
     /// Every plan's `[side pred][bin][symbol]` histogram, back to back.
     multi_hist: Vec<u32>,
-    /// Every plan's rows per bin.
+    /// Value histogram scratch of `rebase_zero` (modal offsets).
     multi_bin_count: Vec<u32>,
     /// Per side predictor: raw bits of every candidate bin.
     bin_nbits: Vec<u64>,
@@ -661,10 +664,9 @@ fn plan_split<T: MaProperty>(
 
 /// One pass over the node's rows, binning every planned property at once.
 /// Per plan the block is `[side pred i][bin][symbol - lo]` (i indexing
-/// `preds`) and `bin_count[k * (MAX_CANDIDATES + 1) + bin]` counts the rows
-/// of plan `k`. Pure integer counting, so chunks of rows may be scanned
-/// separately and summed.
-#[allow(clippy::too_many_arguments)]
+/// `preds`); every side predictor's token lies in the window, so a bin's
+/// row count is the sum of any predictor's row of it. Pure integer
+/// counting, so chunks of rows may be scanned separately and summed.
 fn scan_split_plans<T: MaProperty>(
     properties: &[[T; NUM_MA_PROPS]],
     tokens: &[[u8; NUM_MA_PREDS]],
@@ -673,7 +675,6 @@ fn scan_split_plans<T: MaProperty>(
     preds: &[usize],
     window: (usize, usize),
     hist: &mut [u32],
-    bin_count: &mut [u32],
 ) {
     debug_assert_eq!(properties.len(), tokens.len());
     let (lo, width) = window;
@@ -686,14 +687,8 @@ fn scan_split_plans<T: MaProperty>(
             let t1 = toks[p1] as usize - lo;
             let t2 = toks[p2] as usize - lo;
             let t3 = toks[p3] as usize - lo;
-            for (counts, plan) in bin_count
-                .as_chunks_mut::<{ MAX_CANDIDATES + 1 }>()
-                .0
-                .iter_mut()
-                .zip(plans)
-            {
+            for plan in plans {
                 let bin = plan.bin_for(props[plan.prop as usize].into(), luts);
-                counts[bin] += 1;
                 let stride = plan.pred_stride as usize;
                 let base = plan.hist_start as usize + bin * width;
                 hist[base + t0] += 1;
@@ -704,14 +699,8 @@ fn scan_split_plans<T: MaProperty>(
         }
     } else {
         for (props, toks) in properties.iter().zip(tokens) {
-            for (counts, plan) in bin_count
-                .as_chunks_mut::<{ MAX_CANDIDATES + 1 }>()
-                .0
-                .iter_mut()
-                .zip(plans)
-            {
+            for plan in plans {
                 let bin = plan.bin_for(props[plan.prop as usize].into(), luts);
-                counts[bin] += 1;
                 let stride = plan.pred_stride as usize;
                 let base = plan.hist_start as usize + bin * width;
                 for (i, &p) in preds.iter().enumerate() {
@@ -736,9 +725,9 @@ fn raw_bits_windowed(bin: &[u32], lo: usize, syms: &[u16]) -> u64 {
 }
 
 /// Best threshold of one planned property from its binned block. `hist` is
-/// the plan's `[side pred][bin][symbol - lo]` block and `bin_count` its row
-/// counts per bin; `all_hist` / `all_nbits` are the node's per-predictor
-/// token histograms and raw-bit totals.
+/// the plan's `[side pred][bin][symbol - lo]` block; `all_hist` /
+/// `all_nbits` are the node's per-predictor token histograms and raw-bit
+/// totals.
 #[allow(clippy::too_many_arguments)]
 fn score_split_plan(
     plan: &SplitPlan,
@@ -746,7 +735,6 @@ fn score_split_plan(
     alphabet: usize,
     window: &SymbolWindow,
     hist: &[u32],
-    bin_count: &[u32],
     all_hist: &[u32],
     all_nbits: &[u64; NUM_MA_PREDS],
     total_count: u32,
@@ -772,19 +760,17 @@ fn score_split_plan(
     scratch.left_nbits[..preds.len()].fill(0);
     let mut left_count = 0u32;
     let mut best: Option<(i32, f32)> = None;
-    for (j, (&candidate, &count)) in plan.cands[..ncand]
-        .iter()
-        .zip(&bin_count[..ncand])
-        .enumerate()
-    {
-        left_count += count;
+    for (j, &candidate) in plan.cands[..ncand].iter().enumerate() {
+        // Rows of bin j: every row's first side-predictor token lies in the
+        // window, so its row of the bin sums to the bin's row count.
+        left_count += hist[j * width..(j + 1) * width].iter().sum::<u32>();
         let mut best_l = f32::INFINITY;
         let mut best_r = f32::INFINITY;
-        for (i, (&p, syms)) in preds.iter().zip(&window.syms).enumerate() {
-            let left = &mut scratch.left_hist[i * alphabet..(i + 1) * alphabet];
+        for (i, &p) in preds.iter().enumerate() {
+            let left = &mut scratch.left_hist[i * alphabet + lo..i * alphabet + lo + width];
             let bin = &hist[i * stride + j * width..i * stride + (j + 1) * width];
-            for &s in syms {
-                left[s as usize] += bin[s as usize - lo];
+            for (l, &b) in left.iter_mut().zip(bin) {
+                *l += b;
             }
             scratch.left_nbits[i] += scratch.bin_nbits[i * bins + j];
             if left_count == 0 || left_count == total_count {
@@ -793,16 +779,18 @@ fn score_split_plan(
             let right_count = total_count - left_count;
             let log_left = count_log2(left_count, logs);
             let log_right = count_log2(right_count, logs);
+            let node = &all_hist[p * alphabet + lo..p * alphabet + lo + width];
+            // Dense over the window: a symbol the predictor never uses has
+            // no rows on either side and contributes nothing, so this is
+            // the sparse sum in the same order (a vector log was slower
+            // than these table lookups on M3).
             let mut cost_l = 0.0f32;
             let mut cost_r = 0.0f32;
-            let node = &all_hist[p * alphabet..(p + 1) * alphabet];
-            for &s in syms {
-                let s = s as usize;
-                let l = left[s];
+            for (&l, &n) in left.iter().zip(node) {
                 if l != 0 {
                     cost_l += l as f32 * (log_left - count_log2(l, logs));
                 }
-                let c = node[s] - l;
+                let c = n - l;
                 if c != 0 {
                     cost_r += c as f32 * (log_right - count_log2(c, logs));
                 }
@@ -854,7 +842,6 @@ fn best_split_on_prop<T: MaProperty>(
         scratch,
     )?;
     let mut hist = vec![0u32; preds.len() * plan.pred_stride as usize];
-    let mut bin_count = vec![0u32; MAX_CANDIDATES + 1];
     scan_split_plans(
         properties,
         tokens,
@@ -863,7 +850,6 @@ fn best_split_on_prop<T: MaProperty>(
         preds,
         (window.lo, window.width),
         &mut hist,
-        &mut bin_count,
     );
     score_split_plan(
         &plan,
@@ -871,7 +857,6 @@ fn best_split_on_prop<T: MaProperty>(
         alphabet,
         &window,
         &hist,
-        &bin_count,
         all_hist,
         all_nbits,
         properties.len() as u32,
@@ -1081,13 +1066,11 @@ impl Learner<'_> {
                 plans,
                 luts,
                 multi_hist: hist,
-                multi_bin_count: bin_count,
                 ..
             } = &mut scratch.ma_property;
             let mut plans = std::mem::take(plans);
             let mut luts = std::mem::take(luts);
             let mut hist = std::mem::take(hist);
-            let mut bin_count = std::mem::take(bin_count);
             plans.clear();
             luts.clear();
             let mut hist_len = 0usize;
@@ -1105,45 +1088,49 @@ impl Learner<'_> {
                     plans.push(plan);
                 }
             }
-            let bc_len = plans.len() * (MAX_CANDIDATES + 1);
 
             let win = (window.lo, window.width);
-            if n >= PARALLEL_SCAN_MIN_SAMPLES && pool.num_threads() > 1 {
+            let multi_scan = if pool.num_threads() > 1 {
+                n >= PARALLEL_SCAN_MIN_SAMPLES
+            } else {
+                n >= SERIAL_MULTI_SCAN_MIN_SAMPLES
+            };
+            if multi_scan {
                 // Large node: its rows no longer sit in cache, so one pass
                 // bins every property at once, in concurrent row chunks
-                // whose histograms are summed afterwards.
+                // whose histograms are summed afterwards (one chunk on a
+                // single thread).
                 hist.clear();
                 hist.resize(hist_len, 0);
-                bin_count.clear();
-                bin_count.resize(bc_len, 0);
-                let chunks = (n / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
                 let (plans_ref, luts_ref, preds_ref) = (&plans, &luts, &preds);
-                let parts = pool.steal_map(scratch, chunks, |c, _worker_scratch| {
-                    let start = c * n / chunks;
-                    let end = (c + 1) * n / chunks;
-                    let mut hist = vec![0u32; hist_len];
-                    let mut bin_count = vec![0u32; bc_len];
+                if pool.num_threads() > 1 {
+                    let chunks = (n / PARALLEL_SCAN_CHUNK_SAMPLES).clamp(2, pool.num_threads());
+                    let parts = pool.steal_map(scratch, chunks, |c, _worker_scratch| {
+                        let start = c * n / chunks;
+                        let end = (c + 1) * n / chunks;
+                        let mut hist = vec![0u32; hist_len];
+                        scan_split_plans(
+                            &properties[start..end],
+                            &tokens[start..end],
+                            plans_ref,
+                            luts_ref,
+                            preds_ref,
+                            win,
+                            &mut hist,
+                        );
+                        hist
+                    });
+                    for part_hist in &parts {
+                        for (a, &b) in hist.iter_mut().zip(part_hist) {
+                            *a += b;
+                        }
+                    }
+                } else {
                     scan_split_plans(
-                        &properties[start..end],
-                        &tokens[start..end],
-                        plans_ref,
-                        luts_ref,
-                        preds_ref,
-                        win,
-                        &mut hist,
-                        &mut bin_count,
+                        properties, tokens, plans_ref, luts_ref, preds_ref, win, &mut hist,
                     );
-                    (hist, bin_count)
-                });
-                for (part_hist, part_counts) in &parts {
-                    for (a, &b) in hist.iter_mut().zip(part_hist) {
-                        *a += b;
-                    }
-                    for (a, &b) in bin_count.iter_mut().zip(part_counts) {
-                        *a += b;
-                    }
                 }
-                for (k, plan) in plans.iter().enumerate() {
+                for plan in plans.iter() {
                     let start = plan.hist_start as usize;
                     let end = start + preds.len() * plan.pred_stride as usize;
                     let score = score_split_plan(
@@ -1152,7 +1139,6 @@ impl Learner<'_> {
                         alphabet,
                         &window,
                         &hist[start..end],
-                        &bin_count[k * (MAX_CANDIDATES + 1)..(k + 1) * (MAX_CANDIDATES + 1)],
                         &all_hist,
                         &all_nbits,
                         n as u32,
@@ -1174,11 +1160,8 @@ impl Learner<'_> {
                     let mut local = *plan;
                     local.hist_start = 0;
                     let mut hist = std::mem::take(&mut sc.multi_hist);
-                    let mut bin_count = std::mem::take(&mut sc.multi_bin_count);
                     hist.clear();
                     hist.resize(preds.len() * plan.pred_stride as usize, 0);
-                    bin_count.clear();
-                    bin_count.resize(MAX_CANDIDATES + 1, 0);
                     scan_split_plans(
                         properties,
                         tokens,
@@ -1187,14 +1170,12 @@ impl Learner<'_> {
                         &preds,
                         win,
                         &mut hist,
-                        &mut bin_count,
                     );
                     let score = score_split_plan(
-                        &local, &preds, alphabet, &window, &hist, &bin_count, &all_hist,
-                        &all_nbits, n as u32, sc,
+                        &local, &preds, alphabet, &window, &hist, &all_hist, &all_nbits, n as u32,
+                        sc,
                     );
                     sc.multi_hist = hist;
-                    sc.multi_bin_count = bin_count;
                     score
                 };
                 let scores: Vec<Option<(i32, f32)>> =
@@ -1220,7 +1201,6 @@ impl Learner<'_> {
             scratch.ma_property.plans = plans;
             scratch.ma_property.luts = luts;
             scratch.ma_property.multi_hist = hist;
-            scratch.ma_property.multi_bin_count = bin_count;
             if let Some((prop, threshold, bits)) = best {
                 let g = base_bits - bits - self.p.split_cost_bits;
                 if g > 0.0 {

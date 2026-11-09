@@ -157,6 +157,22 @@ impl MaProperties {
         }
     }
 
+    /// Append another set's rows, widening this one if the other is wide.
+    /// Rows already checked narrow by the other set need no re-check.
+    pub(crate) fn append(&mut self, other: &Self) {
+        if let Self::Wide(_) = other {
+            self.widen();
+        }
+        match (self, other) {
+            (Self::Narrow(rows), Self::Narrow(more)) => rows.extend_from_slice(more),
+            (Self::Wide(rows), Self::Wide(more)) => rows.extend_from_slice(more),
+            (Self::Wide(rows), Self::Narrow(more)) => {
+                rows.extend(more.iter().map(|row| row.map(i32::from)))
+            }
+            (Self::Narrow(_), Self::Wide(_)) => unreachable!("widened above"),
+        }
+    }
+
     pub(crate) fn select(&self, indices: &[u32]) -> Self {
         match self {
             Self::Narrow(rows) => Self::Narrow(indices.iter().map(|&i| rows[i as usize]).collect()),

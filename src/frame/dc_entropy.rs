@@ -874,13 +874,13 @@ impl MaDcBudget {
         min_samples: 0,
     };
     /// Medium: the lite budget with 400 leaves learned from every DC sample
-    /// up to the full budget's. 
+    /// up to the full budget's.
     pub(crate) const DEEP_LITE: Self = Self {
         target_samples: MA_DC_TARGET_SAMPLES,
         max_leaves: MA_DC_MAX_LEAVES,
         ..Self::LITE
     };
-    
+
     /// Fastest: 64K samples, 32 leaves, 4 split candidates, one side
     /// predictor.
     pub(crate) const XLITE: Self = Self {
@@ -942,13 +942,17 @@ fn learn_planes(
     if stride > 1 && stride.is_multiple_of(2) {
         stride += 1;
     }
-    let samples = crate::lossless::sample_dc_planes(pool, planes, stride, wp_params);
+    let mut samples = crate::lossless::sample_dc_planes(pool, planes, stride, wp_params);
     if samples.len() < 4 * MA_DC_MIN_NODE_SAMPLES {
         return None;
     }
     let params = ma_dc_params(&samples, budget, max_leaves, stride);
-    Some(crate::ma_tree::learn_ma_tree(
-        &samples, params, pool, scratch,
+    // The samples are not read again: learn in place instead of on a copy.
+    Some(crate::ma_tree::learn_ma_tree_in_place(
+        &mut samples,
+        params,
+        pool,
+        scratch,
     ))
 }
 
