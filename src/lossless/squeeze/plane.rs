@@ -40,7 +40,7 @@ use crate::coder_scratch::CoderScratch;
 use crate::entropy::{Token, pack_signed};
 use crate::ma_tree::{
     LearnedTree, MaLearnParams, MaNode, MaSamples, NUM_MA_PREDS, NUM_MA_PROPS, PRED_WEIGHTED,
-    learn_ma_tree,
+    learn_ma_tree_in_place,
 };
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
@@ -161,7 +161,7 @@ pub(crate) fn learn_global_plane_tree(
         modal_offsets: false,
         prune_leaf_bits: 0.0,
     };
-    let tree = learn_ma_tree(&samples, params, pool, scratch);
+    let tree = learn_ma_tree_in_place(&mut samples, params, pool, scratch);
     drop(samples);
     let mults = vec![q; tree.nodes.len()];
     let (tree_tokens, leaf_ctx, ..) = emit_forest_bfs(&tree.nodes, &mults, 0, Vec::new());
