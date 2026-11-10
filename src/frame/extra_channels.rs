@@ -446,6 +446,7 @@ pub(super) fn prepare_extra_sections(
                 ctx.extra_squeeze_distance,
                 ctx.extra_learned_trees,
                 ctx.extra_context_trees,
+                ctx.extra_black,
             )
         })
         .flatten();

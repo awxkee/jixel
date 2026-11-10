@@ -50,17 +50,50 @@ fn soft_disc(w: usize, h: usize) -> AlphaPlane {
 fn unit_steps_reconstruct_the_plane_exactly() {
     let (w, h) = (300, 270);
     let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 1e-3, false, false).unwrap();
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 1e-3, false, false, false).unwrap();
     assert!(squeezed.quants.iter().all(|&q| q == 1));
     let want: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
     assert_eq!(squeezed.reconstruct(), want);
 }
 
 #[test]
+fn black_plate_keeps_more_paper_free_of_ink() {
+    // Ink strokes on paper; K is stored inverted, so 255 is no ink. At K's
+    // coarse distance the squeeze overshoots next to every stroke.
+    let (w, h) = (96, 64);
+    let data: Vec<u8> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            if (x + 2 * y) % 23 < 3 || x % 31 < 2 {
+                0
+            } else {
+                255
+            }
+        })
+        .collect();
+    let plane = AlphaPlane::U8(data.clone());
+    let inked_paper = |black_plate| {
+        let squeezed = ExtraSqueeze::new(&plane, w, h, 24.0, false, true, black_plate).unwrap();
+        squeezed
+            .reconstruct()
+            .iter()
+            .zip(&data)
+            .filter(|&(&v, &source)| source == 255 && v.clamp(0, 255) < 255)
+            .count()
+    };
+    let (plain, black) = (inked_paper(false), inked_paper(true));
+    assert!(plain > 0, "the plain squeeze should ink some paper");
+    assert!(
+        black < plain,
+        "black plate inks {black} paper pixels, plain {plain}"
+    );
+}
+
+#[test]
 fn quantized_reconstruction_stays_close() {
     let (w, h) = (300, 270);
     let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false, true).unwrap();
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false, true, false).unwrap();
     assert!(squeezed.quants.iter().any(|&q| q > 1));
     let rec = squeezed.reconstruct();
     let err: Vec<i32> = rec
@@ -157,7 +190,8 @@ fn exact_tail_candidates_preserve_unclamped_reconstruction() {
         for (w, h) in [(37, 29), (65, 18), (1, 33), (33, 1), (257, 129)] {
             let plane = patterned_alpha(w, h, bits, wide);
             for distance in [1e-6, 0.01, 1.0, 6.0] {
-                let original = ExtraSqueeze::new(&plane, w, h, distance, false, true).unwrap();
+                let original =
+                    ExtraSqueeze::new(&plane, w, h, distance, false, true, false).unwrap();
                 let Some(first) = original.exact_tail_start() else {
                     continue;
                 };
@@ -195,7 +229,7 @@ fn an_entirely_exact_pyramid_can_be_removed() {
     for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
         for (w, h) in [(1, 9), (9, 1), (19, 27), (513, 257)] {
             let plane = patterned_alpha(w, h, bits, wide);
-            let original = ExtraSqueeze::new(&plane, w, h, 1e-6, false, true).unwrap();
+            let original = ExtraSqueeze::new(&plane, w, h, 1e-6, false, true, false).unwrap();
             assert!(original.quants.iter().all(|&q| q == 1));
             assert_eq!(original.exact_tail_start(), Some(0));
             let candidate = original.without_exact_tail(0).unwrap();
@@ -211,14 +245,14 @@ fn an_entirely_exact_pyramid_can_be_removed() {
 fn exact_tail_removal_rejects_quantized_or_out_of_range_requests() {
     for (bits, wide) in [(8, false), (8, true), (10, true), (12, true), (16, true)] {
         let plane = patterned_alpha(17, 11, bits, wide);
-        let quantized = ExtraSqueeze::new(&plane, 17, 11, 64.0, false, true).unwrap();
+        let quantized = ExtraSqueeze::new(&plane, 17, 11, 64.0, false, true, false).unwrap();
         assert!(quantized.quants.iter().all(|&q| q > 1));
         assert_eq!(quantized.exact_tail_start(), None);
         for retained in 0..=quantized.steps.len() + 1 {
             assert!(quantized.without_exact_tail(retained).is_none());
         }
 
-        let exact = ExtraSqueeze::new(&plane, 17, 11, 1e-6, false, true).unwrap();
+        let exact = ExtraSqueeze::new(&plane, 17, 11, 1e-6, false, true, false).unwrap();
         assert!(exact.without_exact_tail(exact.steps.len()).is_none());
         assert!(exact.without_exact_tail(exact.steps.len() + 1).is_none());
 
@@ -239,7 +273,7 @@ fn exact_tail_removal_rejects_quantized_or_out_of_range_requests() {
 fn global_ac_forest_covers_every_ac_sample() {
     let (w, h) = (600, 520);
     let plane = soft_disc(w, h);
-    let squeezed = ExtraSqueeze::new(&plane, w, h, 1.5, true, true).unwrap();
+    let squeezed = ExtraSqueeze::new(&plane, w, h, 1.5, true, true, false).unwrap();
     let (xg, yg) = (w.div_ceil(256), h.div_ceil(256));
     let ac_px: usize = squeezed
         .channels
