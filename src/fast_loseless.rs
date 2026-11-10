@@ -776,7 +776,15 @@ fn prepare_header(
     scratch: &mut crate::coder_scratch::CoderScratch,
 ) {
     let have_alpha = nb == 2 || nb == 4;
-    let extra_fields = m.orientation != Orientation::Normal || m.intrinsic_size.is_some();
+    // HDR transfers declare libjxl's default peak (PQ 10 000, HLG 1000 nits)
+    // in the tone-mapping bundle, which lives under extra_fields.
+    let intensity_target = match m.icc {
+        None => crate::color::default_intensity_target(m.transfer),
+        Some(_) => None,
+    };
+    let extra_fields = m.orientation != Orientation::Normal
+        || m.intrinsic_size.is_some()
+        || intensity_target.is_some();
     o.write(16, 0x0AFF);
     o.write(1, 0);
     wsz(o, h);
@@ -822,8 +830,17 @@ fn prepare_header(
     o.write(1, 0); // xyb_encoded = 0
     write_color(o, cs, m);
     if extra_fields {
-        o.write(1, 1);
-    } // tone_mapping all_default (cond extra_fields)
+        match intensity_target {
+            Some(nits) => {
+                o.write(1, 0); // tone_mapping all_default = 0
+                o.write(16, crate::util::f32_to_f16_bits(nits) as u64); // intensity_target
+                o.write(16, 0); // min_nits = 0
+                o.write(1, 0); // relative_to_max_display = false
+                o.write(16, 0); // linear_below = 0
+            }
+            None => o.write(1, 1), // tone_mapping all_default
+        }
+    } // tone_mapping (cond extra_fields)
     o.write(2, 0); // extensions = 0
     o.write(1, 1); // default_m = 1
     if let Some(icc) = &m.icc {

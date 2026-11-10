@@ -72,6 +72,81 @@ fn pq_to_linear(v: f32) -> f32 {
     relative_to_10k * (10_000.0 / 255.0)
 }
 
+/// Peak luminance in nits that an HDR transfer implies when the image states
+/// none. PQ is absolute up to 10 000 nits; HLG is graded for the BT.2100
+/// nominal 1000-nit display. Both match libjxl's defaults.
+pub(crate) fn default_intensity_target(transfer: TransferFunction) -> Option<f32> {
+    match transfer {
+        TransferFunction::Smpte2084 => Some(10_000.0),
+        TransferFunction::Hlg => Some(1_000.0),
+        _ => None,
+    }
+}
+
+/// The BT.2100 HLG OOTF for a display of the given peak, mapping HLG scene
+/// light ([`hlg_to_linear`], 0..1) to display light on the opsin scale
+/// (1.0 = 255 nits), as libjxl does before XYB. Decoders undo it with the
+/// image's `intensity_target`, so both sides must use the same peak.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HlgOotf {
+    /// System gamma minus one; `None` when the gamma is close enough to 1
+    /// that libjxl skips the luminance scaling (peaks near 300 nits).
+    exponent: Option<f32>,
+    /// Display peak over the 255-nit opsin white.
+    scale: f32,
+}
+
+impl HlgOotf {
+    pub(crate) fn new(intensity_target: f32) -> Self {
+        let gamma = 1.2 * 1.111f32.powf((intensity_target / 1000.0).log2());
+        let skip = (295.0..=305.0).contains(&intensity_target);
+        Self {
+            exponent: (!skip).then_some(gamma - 1.0),
+            scale: intensity_target / 255.0,
+        }
+    }
+
+    /// The OOTF when `transfer` is HLG, at the given (or default 1000-nit) peak.
+    pub(crate) fn for_transfer(
+        transfer: TransferFunction,
+        intensity_target: Option<f32>,
+    ) -> Option<Self> {
+        (transfer == TransferFunction::Hlg).then(|| Self::new(intensity_target.unwrap_or(1_000.0)))
+    }
+
+    /// Grey: the luminance is the sample itself.
+    #[inline]
+    fn apply_gray(&self, y: f32) -> f32 {
+        let y = y.max(0.0);
+        match self.exponent {
+            Some(e) => y.powf(e + 1.0) * self.scale,
+            None => y * self.scale,
+        }
+    }
+
+    /// Scale linear-sRGB scene light by `Y^(gamma-1)`. The primaries matrix
+    /// preserves Y, so the sRGB luminance weights here equal the source
+    /// primaries' weights libjxl uses before converting.
+    fn apply_planes(&self, r: &mut [f32], g: &mut [f32], b: &mut [f32]) {
+        let Some(e) = self.exponent else {
+            for v in r.iter_mut().chain(g.iter_mut()).chain(b.iter_mut()) {
+                *v *= self.scale;
+            }
+            return;
+        };
+        for ((r, g), b) in r.iter_mut().zip(g.iter_mut()).zip(b.iter_mut()) {
+            let y = (0.212_639 * *r + 0.715_169 * *g + 0.072_192 * *b).max(0.0);
+            let ratio = if y > 0.0 { y.powf(e).min(1e9) } else { 0.0 };
+            let k = ratio * self.scale;
+            *r *= k;
+            *g *= k;
+            *b *= k;
+        }
+    }
+}
+
+/// HLG inverse OETF: signal to normalized scene light (0..1). Display light
+/// additionally needs the [`HlgOotf`].
 #[inline]
 fn hlg_to_linear(v: f32) -> f32 {
     let v = v.clamp(0.0, 1.0);
@@ -202,10 +277,28 @@ pub(crate) struct TransferLut {
 
 impl TransferLut {
     pub(crate) fn new(bits: u32, transfer: TransferFunction) -> Self {
-        type Cache = HashMap<(u32, u32), Arc<[f32]>>;
+        Self::build(bits, transfer, None)
+    }
+
+    /// A grey LUT: HLG folds its OOTF in (a grey sample is its own
+    /// luminance), every other transfer decodes as in [`Self::new`].
+    pub(crate) fn for_gray(
+        bits: u32,
+        transfer: TransferFunction,
+        intensity_target: Option<f32>,
+    ) -> Self {
+        Self::build(
+            bits,
+            transfer,
+            HlgOotf::for_transfer(transfer, intensity_target),
+        )
+    }
+
+    fn build(bits: u32, transfer: TransferFunction, ootf: Option<HlgOotf>) -> Self {
+        type Cache = HashMap<(u32, u32, u32), Arc<[f32]>>;
         static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
-        let key = (bits, transfer as u32);
+        let key = (bits, transfer as u32, ootf.map_or(0, |o| o.scale.to_bits()));
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(values) = cache.lock().unwrap().get(&key).cloned() {
             return Self { values };
@@ -227,6 +320,9 @@ impl TransferLut {
             let decode = select_transfer(transfer);
             for (v, slot) in built[..size].iter_mut().enumerate() {
                 *slot = decode(v as f32 / max);
+                if let Some(ootf) = &ootf {
+                    *slot = ootf.apply_gray(*slot);
+                }
             }
         }
         let built: Arc<[f32]> = built.into();
@@ -266,12 +362,23 @@ impl TransferDecoder<u16> for TransferLut {
 
 pub(crate) struct FloatTransferDecoder {
     decode: TransferFn,
+    /// Grey HLG only: the OOTF folded into each sample.
+    gray_ootf: Option<HlgOotf>,
 }
 
 impl FloatTransferDecoder {
     pub(crate) fn new(transfer: TransferFunction) -> Self {
         Self {
             decode: select_transfer(transfer),
+            gray_ootf: None,
+        }
+    }
+
+    /// See [`TransferLut::for_gray`].
+    pub(crate) fn for_gray(transfer: TransferFunction, intensity_target: Option<f32>) -> Self {
+        Self {
+            decode: select_transfer(transfer),
+            gray_ootf: HlgOotf::for_transfer(transfer, intensity_target),
         }
     }
 }
@@ -279,7 +386,11 @@ impl FloatTransferDecoder {
 impl TransferDecoder<f32> for FloatTransferDecoder {
     #[inline(always)]
     fn decode(&self, sample: f32) -> f32 {
-        (self.decode)(sample)
+        let v = (self.decode)(sample);
+        match &self.gray_ootf {
+            Some(ootf) => ootf.apply_gray(v),
+            None => v,
+        }
     }
 }
 
@@ -322,22 +433,47 @@ impl PrimariesTransform {
 pub(crate) struct ColorTransform<D> {
     decoder: D,
     primaries: PrimariesTransform,
+    /// HLG: scene light to display light, after the primaries matrix.
+    ootf: Option<HlgOotf>,
 }
 
 impl ColorTransform<TransferLut> {
-    pub(crate) fn for_integer(bits: u32, transfer: TransferFunction, primaries: Primaries) -> Self {
+    /// `intensity_target` is the image's declared peak; HLG uses it (default
+    /// 1000 nits) for its OOTF, other transfers ignore it.
+    pub(crate) fn for_integer(
+        bits: u32,
+        transfer: TransferFunction,
+        primaries: Primaries,
+        intensity_target: Option<f32>,
+    ) -> Self {
         Self {
             decoder: TransferLut::new(bits, transfer),
             primaries: PrimariesTransform::select(primaries),
+            ootf: HlgOotf::for_transfer(transfer, intensity_target),
         }
     }
 }
 
 impl ColorTransform<FloatTransferDecoder> {
-    pub(crate) fn for_float(transfer: TransferFunction, primaries: Primaries) -> Self {
+    /// See [`ColorTransform::for_integer`].
+    pub(crate) fn for_float(
+        transfer: TransferFunction,
+        primaries: Primaries,
+        intensity_target: Option<f32>,
+    ) -> Self {
         Self {
             decoder: FloatTransferDecoder::new(transfer),
             primaries: PrimariesTransform::select(primaries),
+            ootf: HlgOotf::for_transfer(transfer, intensity_target),
+        }
+    }
+}
+
+impl<D> ColorTransform<D> {
+    #[inline]
+    fn finish(&self, len: usize, [r, g, b]: [&mut [f32]; 3]) {
+        if let Some(ootf) = &self.ootf {
+            ootf.apply_planes(&mut r[..len], &mut g[..len], &mut b[..len]);
         }
     }
 }
@@ -429,16 +565,19 @@ macro_rules! impl_integer_block_transform {
                 output: [&mut [f32]; 3],
             ) {
                 validate_block(src, &output);
+                let [r, g, b] = output;
+                let planes = [&mut *r, &mut *g, &mut *b];
                 match self.primaries {
-                    PrimariesTransform::Identity => transform_identity(&self.decoder, src, output),
+                    PrimariesTransform::Identity => transform_identity(&self.decoder, src, planes),
                     PrimariesTransform::Matrix(matrix) => transform_integer_matrix::<
                         $sample,
                         $lut_size,
                         CHANNELS,
                     >(
-                        &self.decoder, &matrix, src, output
+                        &self.decoder, &matrix, src, planes
                     ),
                 }
+                self.finish(src.len(), [r, g, b]);
             }
         }
     };
@@ -454,12 +593,15 @@ impl RgbBlockTransform<f32> for ColorTransform<FloatTransferDecoder> {
         output: [&mut [f32]; 3],
     ) {
         validate_block(src, &output);
+        let [r, g, b] = output;
+        let planes = [&mut *r, &mut *g, &mut *b];
         match self.primaries {
-            PrimariesTransform::Identity => transform_identity(&self.decoder, src, output),
+            PrimariesTransform::Identity => transform_identity(&self.decoder, src, planes),
             PrimariesTransform::Matrix(matrix) => {
-                transform_matrix_scalar(&self.decoder, &matrix, src, output)
+                transform_matrix_scalar(&self.decoder, &matrix, src, planes)
             }
         }
+        self.finish(src.len(), [r, g, b]);
     }
 }
 
@@ -525,7 +667,7 @@ mod tests {
             [1024, 4096, 16384],
         ];
         let transform =
-            ColorTransform::for_integer(16, TransferFunction::Smpte2084, Primaries::Bt2020);
+            ColorTransform::for_integer(16, TransferFunction::Smpte2084, Primaries::Bt2020, None);
         let mut r = [0.0; 7];
         let mut g = [0.0; 7];
         let mut b = [0.0; 7];
@@ -543,6 +685,51 @@ mod tests {
                     "actual={actual} expected={expected}"
                 );
             }
+        }
+    }
+
+    /// BT.2100 HLG reference white (75 % signal) on the nominal 1000-nit
+    /// display is 203 nits: the OOTF (gamma 1.2) must run, not just the
+    /// inverse OETF (which alone gives 0.265 × 255 = 68 nits).
+    #[test]
+    fn hlg_reference_white_is_203_nits() {
+        let transform = ColorTransform::for_float(TransferFunction::Hlg, Primaries::Bt2020, None);
+        let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
+        transform.transform_block(&[[0.75f32; 3]], [&mut r, &mut g, &mut b]);
+        let nits = g[0] * 255.0;
+        assert!((nits - 203.0).abs() < 0.5, "{nits}");
+        assert!((r[0] - g[0]).abs() < 1e-5 && (b[0] - g[0]).abs() < 1e-5);
+
+        // Grey folds the OOTF into its LUT; a neutral RGB pixel must agree.
+        let gray = TransferLut::for_gray(16, TransferFunction::Hlg, None);
+        let code = (0.75f32 * 65535.0).round() as u16;
+        let rgb = ColorTransform::for_integer(16, TransferFunction::Hlg, Primaries::Bt2020, None);
+        rgb.transform_block(&[[code; 3]], [&mut r, &mut g, &mut b]);
+        assert!(
+            (gray.decode(code) - g[0]).abs() < 1e-5,
+            "{} {}",
+            gray.decode(code),
+            g[0]
+        );
+    }
+
+    /// The system gamma follows the declared peak: 1.2 × 1.111^log2(L/1000).
+    #[test]
+    fn hlg_ootf_tracks_intensity_target() {
+        let decode = |it| {
+            let t = ColorTransform::for_float(TransferFunction::Hlg, Primaries::Bt709, Some(it));
+            let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
+            t.transform_block(&[[0.5f32; 3]], [&mut r, &mut g, &mut b]);
+            g[0]
+        };
+        let scene = 0.25f32 / 3.0;
+        for it in [400.0f32, 1000.0, 4000.0] {
+            let gamma = 1.2 * 1.111f32.powf((it / 1000.0).log2());
+            let expected = scene.powf(gamma) * it / 255.0;
+            assert!(
+                (decode(it) - expected).abs() < 1e-5 * expected.max(1.0),
+                "{it}"
+            );
         }
     }
 

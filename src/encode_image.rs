@@ -1473,6 +1473,7 @@ pub fn encode_image(
         8,
         config.color_encoding.transfer,
         config.color_encoding.primaries,
+        config.intensity_target,
     );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
@@ -1695,6 +1696,7 @@ impl InkStack {
             8,
             config.color_encoding.transfer,
             config.color_encoding.primaries,
+            config.intensity_target,
         );
         w.append(&encode_ink_frame(
             &self.ctx,
@@ -1736,6 +1738,7 @@ fn encode_ink_base(
         8,
         config.color_encoding.transfer,
         config.color_encoding.primaries,
+        config.intensity_target,
     );
     let pixels = width * height;
     let opaque = original_alpha
@@ -2073,6 +2076,7 @@ pub fn encode_image_with_alpha(
         8,
         config.color_encoding.transfer,
         config.color_encoding.primaries,
+        config.intensity_target,
     );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
@@ -2256,7 +2260,7 @@ fn encode_gray_impl(
         );
     }
     let distance = config.distance.max(MIN_DISTANCE);
-    let decoder = TransferLut::new(8, config.color_encoding.transfer);
+    let decoder = TransferLut::for_gray(8, config.color_encoding.transfer, config.intensity_target);
     let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
@@ -2485,7 +2489,11 @@ fn encode_gray_high_depth_impl(
     }
 
     let distance = config.distance.max(MIN_DISTANCE);
-    let decoder = TransferLut::new(bps.bits(), config.color_encoding.transfer);
+    let decoder = TransferLut::for_gray(
+        bps.bits(),
+        config.color_encoding.transfer,
+        config.intensity_target,
+    );
     let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
@@ -2579,6 +2587,7 @@ fn encode_high_depth_rgba(
         bps.bits(),
         config.color_encoding.transfer,
         config.color_encoding.primaries,
+        config.intensity_target,
     );
     let ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     let mut scratch = Box::<CoderScratch>::default();
@@ -2790,6 +2799,7 @@ fn encode_float_rgba(
     let transform = ColorTransform::for_float(
         config.color_encoding.transfer,
         config.color_encoding.primaries,
+        config.intensity_target,
     );
 
     if has_alpha {
@@ -2878,7 +2888,8 @@ fn encode_float_gray(
     let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, width * height);
     ctx.set_coding(config.coding_transform, distance);
     let mut scratch = Box::<CoderScratch>::default();
-    let decoder = FloatTransferDecoder::new(config.color_encoding.transfer);
+    let decoder =
+        FloatTransferDecoder::for_gray(config.color_encoding.transfer, config.intensity_target);
     let linear = linearize_gray(luma, width, height, &ctx, &mut scratch, &decoder);
     let cfg = EncodeConfigImpl::with_distance(distance)
         .with_progressive_from(config)
@@ -3659,6 +3670,15 @@ fn write_image_metadata(
         extra_16,
         upsampling_kernel,
     } = *params;
+    // HDR transfers without an explicit peak declare libjxl's defaults (PQ
+    // 10 000, HLG 1000 nits): decoders invert the HLG OOTF and tone-map with
+    // this value, and the HLG linearization above used it.
+    let tm = ToneMappingParams {
+        intensity_target: tm
+            .intensity_target
+            .or_else(|| crate::color::default_intensity_target(color_encoding.transfer)),
+        ..tm
+    };
     let bps = if lossy_modular_16 {
         BitsPerSample::Sixteen
     } else {
