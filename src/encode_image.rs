@@ -1219,6 +1219,7 @@ pub(crate) fn lossy_context(
     ctx.extra_learned_trees = alpha_learned_trees(config);
     ctx.extra_plane_tree = alpha_plane_tree(config.speed, config.decoding_speed);
     ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
+    ctx.alpha_patches = config.patches;
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;

@@ -131,6 +131,9 @@ pub(crate) struct EncodingContext {
     /// Fixed context trees (neighbor-activity splits, Zero prediction of the
     /// residuals) instead of one Gradient leaf per squeezed channel.
     pub(crate) extra_context_trees: bool,
+    /// Permit repeated coverage masks to use their own patch atlas. Follows
+    /// the public patch setting; exact extra-channel coding is independent.
+    pub(crate) alpha_patches: bool,
     /// XYB rendition of a non-XYB frame. Adaptive quantization reads its
     /// luma instead of the coded planes.
     pub(crate) aq_source: std::sync::OnceLock<crate::image::Image3F>,
@@ -599,7 +602,7 @@ impl EncodingContext {
             dots: false,
             xyb,
             coding: crate::coding::CodingTransform::Xyb,
-            dequant_bias: crate::group::DequantBias::channels(!xyb.is_decoder_default()),
+            dequant_bias: group::DequantBias::channels(!xyb.is_decoder_default()),
             epf_channel_scale: None,
             plain_matrices: std::sync::OnceLock::new(),
             plain_distance: 0.0,
@@ -618,6 +621,7 @@ impl EncodingContext {
             extra_learned_trees: false,
             extra_plane_tree: None,
             extra_context_trees: false,
+            alpha_patches: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),
             learned_rate: false,

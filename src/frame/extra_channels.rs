@@ -405,8 +405,62 @@ pub(super) fn prepare_extra_sections(
     dim: &ImageDim,
     dc_group_coords: &[(usize, usize)],
     last_pass: usize,
+    streams: extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+) -> PreparedExtra {
+    prepare_extra_sections_impl(
+        ctx,
+        plane,
+        dim,
+        dc_group_coords,
+        last_pass,
+        streams,
+        scratch,
+        false,
+    )
+}
+
+/// Code a strongly repeated alpha plane exactly, including its learned tree.
+/// A repeated mask can have an exceptionally expensive fixed stream and a
+/// tiny learned stream, beyond the lossy path's usual fourfold cost bound.
+///
+/// The caller screens for substantial nonconstant repetitions and races the
+/// completed frame against the normal path. The shared DC entropy bundle can
+/// change, so an extra-channel bit estimate alone cannot guarantee no growth.
+/// The context must retain exact samples (`extra_step == 1`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_extra_sections_lossless(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    last_pass: usize,
+    streams: extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+) -> PreparedExtra {
+    debug_assert_eq!(ctx.extra_step, 1);
+    prepare_extra_sections_impl(
+        ctx,
+        plane,
+        dim,
+        dc_group_coords,
+        last_pass,
+        streams,
+        scratch,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_extra_sections_impl(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    last_pass: usize,
     mut streams: extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
+    force_lossless: bool,
 ) -> PreparedExtra {
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
     let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
@@ -437,7 +491,7 @@ pub(super) fn prepare_extra_sections(
         }
         None => lossless_sections(ctx, plane, None, dim, groups, ans, scratch),
     };
-    let squeezed = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
+    let squeezed = (!force_lossless && ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
         .then(|| {
             crate::lossy_modular::ExtraSqueeze::new(
                 plane,
@@ -525,6 +579,21 @@ pub(super) fn prepare_extra_sections(
         _ => {
             if let Some(tree) = global_tree {
                 tree.apply(&mut streams, &mut lossless);
+                // The joint code is ANS: a large plane planned on a prefix-coded
+                // frame re-writes its global header with the ANS signature. A
+                // palette's global section has its own local tree.
+                if !ans && palette.is_none() && !single {
+                    lossless.global = BitWriter::new();
+                    crate::modular::write_global_alpha_modular(
+                        plane,
+                        dim.xsize,
+                        dim.ysize,
+                        ctx.extra_step,
+                        true,
+                        scratch,
+                        &mut lossless.global,
+                    );
+                }
             }
             PreparedExtra {
                 sections: lossless,

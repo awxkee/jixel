@@ -662,6 +662,7 @@ pub(crate) fn reuse_tile_quadrants(
                 width: HALF,
                 height: HALF,
                 ref_frame: packed[q.tile].ref_frame,
+                alpha_only: false,
                 add: false,
                 mul: false,
                 positions,
@@ -836,6 +837,7 @@ pub(crate) fn pack_lossy_atlas_sized(
             atlas_x,
             atlas_y,
             ref_frame,
+            alpha_only: false,
             add: false,
             mul: false,
             positions,
@@ -863,6 +865,8 @@ pub(crate) struct PatchReference {
     pub(crate) height: usize,
     /// Which saved reference frame this entry copies from.
     pub(crate) ref_frame: u32,
+    /// Replace alpha from the atlas while leaving color untouched.
+    pub(crate) alpha_only: bool,
     /// Blend with kAdd instead of kReplace.
     pub(crate) add: bool,
     /// Blend with kMul (the entry scales what is already there); `add` is
@@ -1065,6 +1069,7 @@ pub(crate) fn find_lossless_patches(
             atlas_x,
             atlas_y,
             ref_frame: PATCH_REF_ID,
+            alpha_only: false,
             add: false,
             mul: false,
             positions,
@@ -1385,6 +1390,7 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
             width: s.w,
             height: s.h,
             ref_frame: PATCH_REF_ID,
+            alpha_only: false,
             add: false,
             mul: false,
             positions,
@@ -1813,6 +1819,7 @@ pub(crate) fn find_lossy_glyph_patches(
             width: s.w,
             height: s.h,
             ref_frame: MODULAR_PATCH_REF_ID,
+            alpha_only: false,
             add: true,
             mul: false,
             positions,
@@ -2499,6 +2506,7 @@ mod tests {
             width: tile,
             height: tile,
             ref_frame: PATCH_REF_ID,
+            alpha_only: false,
             add: false,
             mul: false,
             positions: vec![(0, 0)],

@@ -851,6 +851,7 @@ pub(super) fn build_dot_patches_with_templates(
             width: side,
             height: side,
             ref_frame: DOT_PATCH_REF_ID,
+            alpha_only: false,
             add: true,
             mul: false,
             positions,
