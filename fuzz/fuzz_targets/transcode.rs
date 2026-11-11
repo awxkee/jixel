@@ -34,6 +34,7 @@ fn check_container(out: &[u8], reconstruction: bool) {
     let mut pos = 0usize;
     let mut seen_jbrd = false;
     let mut seen_codestream = false;
+    let mut seen_gain_map = false;
 
     while pos < out.len() {
         assert!(
@@ -65,14 +66,17 @@ fn check_container(out: &[u8], reconstruction: bool) {
         match &kind {
             b"jbrd" => seen_jbrd = true,
             b"jxlc" | b"jxlp" => seen_codestream = true,
+            b"jhgm" => seen_gain_map = true,
             _ => {}
         }
         pos += size;
     }
 
     assert_eq!(pos, out.len(), "boxes do not tile the buffer exactly");
-    assert_eq!(
-        seen_jbrd, reconstruction,
+    // An arithmetic Ultra HDR base skips reconstruction when jhgm carries
+    // the gain map. Explicitly disabling reconstruction always omits jbrd.
+    assert!(
+        seen_jbrd == reconstruction || (reconstruction && seen_gain_map),
         "unexpected JPEG reconstruction state"
     );
     assert!(seen_codestream, "no codestream box");

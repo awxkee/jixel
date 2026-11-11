@@ -184,6 +184,8 @@ pub struct JpegTranscodeConfig {
     ///
     /// Defaults to `true`. See [`Self::with_jpeg_reconstruction`].
     /// Binary Ultra HDR gain maps are written to `jhgm` even when this is false.
+    /// JPEG reconstruction is omitted for an arithmetic-coded Ultra HDR base
+    /// when its binary gain map can be stored in `jhgm`.
     pub jpeg_reconstruction: bool,
     /// Worker threads used while building the codestream. Defaults to 1.
     ///
@@ -235,7 +237,7 @@ impl Default for JpegTranscodeConfig {
 }
 
 impl JpegTranscodeConfig {
-    /// Controls whether the original JPEG bytes can be recovered.
+    /// Controls whether JPEG reconstruction data is embedded when supported.
     /// Ultra HDR gain maps with binary metadata are preserved either way.
     pub fn with_jpeg_reconstruction(mut self, enabled: bool) -> Self {
         self.jpeg_reconstruction = enabled;
@@ -268,12 +270,12 @@ impl JpegTranscodeConfig {
 /// For arithmetic-coded JPEGs (SOF9/SOF10), reconstruction produces a
 /// Huffman-coded JPEG with the same image coefficients and quantization.
 /// Reconstruction may consolidate table definitions and restart intervals.
-/// Arithmetic-coded MPF images with a secondary JPEG require reconstruction
-/// to be disabled because rewriting the JPEG changes the MPF offsets.
 ///
 /// Ultra HDR JPEGs with binary ISO 21496-1 metadata are carried over as a
 /// `jhgm` gain map: both JPEG images are transcoded without requantization.
-/// XMP-only gain maps are currently retained only in the reconstruction data.
+/// If the base uses arithmetic coding, the transcoder omits reconstruction
+/// because rewriting the base would invalidate MPF offsets. XMP-only gain maps
+/// rely on JPEG reconstruction.
 pub fn encode_jpeg_lossless(jpeg: &[u8]) -> Result<Vec<u8>, EncodeError> {
     encode_jpeg_lossless_with_config(jpeg, &JpegTranscodeConfig::default())
 }
@@ -283,7 +285,15 @@ pub fn encode_jpeg_lossless_with_config(
     config: &JpegTranscodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut parsed = parse_jpeg(jpeg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
-    if parsed.is_arithmetic && config.jpeg_reconstruction {
+    let mut exif = extract_exif(&parsed);
+    // Viewers follow the codestream's orientation, not the Exif tag.
+    let orientation = exif
+        .and_then(|(_, tiff)| Orientation::from_exif_tiff(tiff))
+        .unwrap_or_default();
+    let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
+
+    let reconstruct = config.jpeg_reconstruction && !(parsed.is_arithmetic && gain_map.is_some());
+    if parsed.is_arithmetic && reconstruct {
         let has_mpf = parsed
             .app_data
             .iter()
@@ -294,6 +304,7 @@ pub fn encode_jpeg_lossless_with_config(
             ));
         }
         arith::synthesize_huffman(&mut parsed).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+        exif = extract_exif(&parsed);
     }
 
     // Embedded in the codestream either way: without it, dropping the `jbrd`
@@ -302,12 +313,6 @@ pub fn encode_jpeg_lossless_with_config(
     // image reads as sRGB and its APP2 bytes still travel in `jbrd`.
     let icc = extract_icc(&parsed).filter(|icc| icc_is_well_formed(&icc.profile));
     let xmp = extract_xmp(&parsed);
-    let exif = extract_exif(&parsed);
-    // Viewers follow the codestream's orientation, not the Exif tag.
-    let orientation = exif
-        .and_then(|(_, tiff)| Orientation::from_exif_tiff(tiff))
-        .unwrap_or_default();
-    let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
     let codestream = encode::encode_jpeg_codestream(
         &parsed,
         icc.as_ref().map(|icc| icc.profile.as_slice()),
@@ -316,7 +321,7 @@ pub fn encode_jpeg_lossless_with_config(
         config.num_threads,
     )?;
 
-    let reconstruction = if config.jpeg_reconstruction {
+    let reconstruction = if reconstruct {
         Some(jbrd::encode_jbrd(
             &parsed,
             xmp.as_ref().map(|(index, _)| *index),

@@ -1420,6 +1420,71 @@ mod tests {
     }
 
     #[test]
+    fn ultra_hdr_with_arithmetic_jpeg_preserves_the_gain_map() {
+        let metadata = crate::IsoGainMap {
+            gain_map_max_n: [1; 3],
+            alternate_hdr_headroom_n: 1,
+            ..Default::default()
+        }
+        .to_metadata()
+        .unwrap();
+        let append_iso = |jpeg: &mut Vec<u8>, metadata: &[u8]| {
+            let tag = b"urn:iso:std:iso:ts:21496:-1\0";
+            let len = u16::try_from(2 + tag.len() + metadata.len()).unwrap();
+            jpeg.extend_from_slice(&[0xFF, 0xE2]);
+            jpeg.extend_from_slice(&len.to_be_bytes());
+            jpeg.extend_from_slice(tag);
+            jpeg.extend_from_slice(metadata);
+        };
+        for (base, gain, reconstruct) in [
+            (TINY_ARITH_SEQ, TINY_HUFFMAN, false),
+            (TINY_HUFFMAN, TINY_ARITH_SEQ, true),
+        ] {
+            let mut primary = base[..2].to_vec();
+            append_iso(&mut primary, &[0; 4]);
+            let mut secondary = gain[..2].to_vec();
+            append_iso(&mut secondary, &metadata);
+            secondary.extend_from_slice(&gain[2..]);
+
+            // Two-entry MP Index IFD, with sizes measured through each EOI
+            // and the secondary offset measured from the TIFF header.
+            let mut mpf = *b"\xff\xe2\x00\x58MPF\0MM\x00\x2a\x00\x00\x00\x08\x00\x03\
+                \xb0\x00\x00\x07\x00\x00\x00\x040100\
+                \xb0\x01\x00\x04\x00\x00\x00\x01\x00\x00\x00\x02\
+                \xb0\x02\x00\x07\x00\x00\x00\x20\x00\x00\x00\x32\x00\x00\x00\x00\
+                \x00\x03\x00\x00\0\0\0\0\0\0\0\0\0\0\0\0\
+                \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            let primary_size = (primary.len() + mpf.len() + base.len() - 2) as u32;
+            let secondary_offset = primary_size - primary.len() as u32 - 8;
+            mpf[62..66].copy_from_slice(&primary_size.to_be_bytes());
+            mpf[78..82].copy_from_slice(&(secondary.len() as u32).to_be_bytes());
+            mpf[82..86].copy_from_slice(&secondary_offset.to_be_bytes());
+            primary.extend_from_slice(&mpf);
+            primary.extend_from_slice(&base[2..]);
+            primary.extend_from_slice(&secondary);
+
+            let out = super::super::encode_jpeg_lossless(&primary).unwrap();
+            let mut boxes = out.as_slice();
+            let mut has_jbrd = false;
+            let mut jhgm = None;
+            while !boxes.is_empty() {
+                let size = u32::from_be_bytes(boxes[..4].try_into().unwrap()) as usize;
+                let (chunk, rest) = boxes.split_at(size);
+                match &chunk[4..8] {
+                    b"jbrd" => has_jbrd = true,
+                    b"jhgm" => jhgm = crate::gain_map::parse_jhgm_bundle(&chunk[8..]),
+                    _ => {}
+                }
+                boxes = rest;
+            }
+            assert_eq!(has_jbrd, reconstruct);
+            let jhgm = jhgm.unwrap();
+            assert_eq!(jhgm.metadata, metadata);
+            assert!(jhgm.codestream.starts_with(&[0xFF, 0x0A]));
+        }
+    }
+
+    #[test]
     fn arithmetic_rejects_duplicate_first_scan() {
         let mut data = TINY_ARITH_PROG_RST.to_vec();
         let start = data.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
