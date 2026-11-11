@@ -1424,15 +1424,11 @@ fn fit_whole_line(
     scratch: &mut FitScratch,
 ) -> Vec<QuantizedSpline> {
     let spacing = LONG_LINE_MIN_SPACING.max(chain.points.len() as f32 / LONG_LINE_SPANS);
-    let mut sources = vec![uniform_control_points(&chain.points, spacing)];
-    for tol in CURVE_TOLERANCES {
-        sources.push(curve_control_points(
-            ctx,
-            &chain.points,
-            tol,
-            MAX_CURVE_POINTS,
-        ));
-    }
+    let sources = std::iter::once(uniform_control_points(&chain.points, spacing)).chain(
+        CURVE_TOLERANCES
+            .into_iter()
+            .map(|tol| curve_control_points(ctx, &chain.points, tol, MAX_CURVE_POINTS)),
+    );
     let mut geometries: Vec<Vec<Point<i32>>> = Vec::new();
     for points in sources {
         if points.len() < 2 || !inside(&points, w, h) {

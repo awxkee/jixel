@@ -450,10 +450,10 @@ pub(super) fn choose_chroma_dc_coding(
     // Per-candidate Haar reconstruction and levels, with the candidate's
     // (distortion, bits) once priced.
     type HfCandidate = (Vec<f32>, Vec<i32>, Option<(f64, f64)>);
-    let mut hf_candidates: Vec<HfCandidate> = Vec::new();
-    for _ in CHROMA_DC_SQUEEZE_HF_STEPS {
-        hf_candidates.push((try_vec![0.0f32; w * h]?, try_vec![0i32; w * h]?, None));
-    }
+    let mut hf_candidates: Vec<HfCandidate> = CHROMA_DC_SQUEEZE_HF_STEPS
+        .iter()
+        .map(|_| Ok((try_vec![0.0f32; w * h]?, try_vec![0i32; w * h]?, None)))
+        .collect::<Result<_, EncodeError>>()?;
     // Luma is unchanged by the chroma search. Stitch it once, then price each
     // candidate in raster order without resolving DC-group coordinates again.
     let mut y_levels = try_vec![0i16; w * h]?;

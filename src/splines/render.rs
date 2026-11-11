@@ -263,13 +263,11 @@ impl RenderPlan {
             let (x0, y0, x1, y1) = self.bounds.unwrap();
             let mut tiles = Vec::new();
             for by in y0 / 8..=y1 / 8 {
-                for bx in x0 / 8..=x1 / 8 {
-                    tiles.push(Tile {
-                        cell: by * blocks_w + bx,
-                        start: 0,
-                        end: 0,
-                    });
-                }
+                tiles.extend((x0 / 8..=x1 / 8).map(|bx| Tile {
+                    cell: by * blocks_w + bx,
+                    start: 0,
+                    end: 0,
+                }));
             }
             return TiledSpline {
                 plan: self,
@@ -281,9 +279,7 @@ impl RenderPlan {
         for (index, sample) in self.samples.iter().enumerate() {
             let (x0, x1, y0, y1) = sample.window;
             for by in y0 / 8..=(y1 - 1) / 8 {
-                for bx in x0 / 8..=(x1 - 1) / 8 {
-                    coverage.push((by * blocks_w + bx, index));
-                }
+                coverage.extend((x0 / 8..=(x1 - 1) / 8).map(|bx| (by * blocks_w + bx, index)));
             }
         }
         if let Some((x0, y0, x1, y1)) = self.bounds {

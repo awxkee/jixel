@@ -357,6 +357,45 @@ pub struct EncodeConfig {
     /// so solid and hard-edged alpha stays exact. Values are clamped to
     /// `0.0..=25.0`; NaN means lossless. Ignored when `lossless` is true.
     pub alpha_distance: Option<f32>,
+    /// Nested Palette/profile coding of coherent alpha gradients (8- to
+    /// 16-bit) and 8-bit CMYK black plates in single-pass VarDCT frames of at
+    /// most 8 MP, at
+    /// [`Speed::Medium`] and above, in any color space (with an ICC profile
+    /// only the single-frame form below). Fits bounded
+    /// whole-plane models and keeps the ordinary coding unless a model is
+    /// smaller and passes the sample/perceptual checks. Lossless alpha
+    /// permits only exact models. Defaults to true; planes without such
+    /// structure are screened out in a few milliseconds.
+    ///
+    /// With lossy alpha, a plane that a function explains only in part (a
+    /// glow around a hard-edged shape, rings) may instead be written as two
+    /// layers: an undisplayed base frame holding the function and the
+    /// displayed frame holding the lossy residual, added to it by the
+    /// decoder (extra-channel `kAdd` blending). It is kept only when its
+    /// coding is smaller and a multi-scale SSIM proxy, pooled over the alpha
+    /// plane and its lightness composites over black and white, does not
+    /// drop against the ordinary coding ([`Speed::ExtraSlow`] with the
+    /// `extraslow` Cargo feature asks SSIMULACRA2 and CVVDP instead, on SDR
+    /// sRGB input). The
+    /// residual may also be coded with its misfits of one or two code values
+    /// dropped. A plane that repeats one tile on a grid (a pattern mask)
+    /// takes the same form with the tile as the function and the samples
+    /// that break the repetition coded exactly; this one also applies to
+    /// lossless alpha.
+    ///
+    /// Uses standard delta-palette syntax that jxl-oxide 0.12.6 does not decode
+    /// correctly; libjxl and jxl-rs support it. See
+    /// [`EncodeConfig::function_fields_portable`] for files that decoder reads.
+    pub function_fields: bool,
+    /// Keep [`EncodeConfig::function_fields`] to syntax jxl-oxide 0.12.6
+    /// decodes: the function is written with one ordinary Palette and its
+    /// coordinate plane coded directly, instead of through a second Palette
+    /// with explicit deltas. A function under a residual goes into a modular
+    /// frame of its own with 1024-pixel groups, where this costs about what
+    /// the delta form does up to 1024x1024 and the axes once more per extra
+    /// group beyond; a function that is the whole plane stays in the image
+    /// frame's 256-pixel groups and wins less often. Off by default.
+    pub function_fields_portable: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -601,6 +640,8 @@ impl Default for EncodeConfig {
             lossless: false,
             fill_invisible: true,
             alpha_distance: None,
+            function_fields: true,
+            function_fields_portable: false,
             progressive: false,
             patches: false,
             upsampling: false,
@@ -922,11 +963,13 @@ impl EncodeConfig {
         self.icc_profile = Some(icc);
         self
     }
+
     /// Embed EXIF/TIFF metadata (raw TIFF bytes) via an `Exif` container box.
     pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
         self.exif = Some(exif);
         self
     }
+
     /// Embed an XMP packet via an uncompressed `xml ` container box.
     pub fn with_xmp(mut self, xmp: Vec<u8>) -> Self {
         self.xmp = Some(xmp);
@@ -959,6 +1002,20 @@ impl EncodeConfig {
     /// `0.0` keeps alpha lossless.
     pub fn with_alpha_distance(mut self, alpha_distance: f32) -> Self {
         self.alpha_distance = Some(alpha_distance);
+        self
+    }
+
+    /// Function-like extra-channel coding (see
+    /// [`EncodeConfig::function_fields`]). Enabled by default.
+    pub fn with_function_fields(mut self, enabled: bool) -> Self {
+        self.function_fields = enabled;
+        self
+    }
+
+    /// Restrict function fields to syntax jxl-oxide 0.12.6 decodes (see
+    /// [`EncodeConfig::function_fields_portable`]). Disabled by default.
+    pub fn with_function_fields_portable(mut self, enabled: bool) -> Self {
+        self.function_fields_portable = enabled;
         self
     }
 
@@ -1220,6 +1277,29 @@ pub(crate) fn lossy_context(
     ctx.extra_plane_tree = alpha_plane_tree(config.speed, config.decoding_speed);
     ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
     ctx.alpha_patches = config.patches;
+    // The representation is color-agnostic: the plane is judged against its
+    // own ordinary coding, on views that need no color management.
+    ctx.function_fields = config.function_fields
+        && config.speed >= Speed::Medium
+        && pixels <= crate::function_fields::MAX_PIXELS
+        && config.grain == Grain::Off
+        && !config.progressive_dc
+        && progressive_schedule(
+            config.progressive,
+            config.progressive_passes,
+            config.progressive_shifts.as_deref(),
+        ) == [0]
+        && config.decoding_speed == DecodingSpeed::Slow;
+    ctx.function_fields_layered = ctx.function_fields && config.icc_profile.is_none();
+    ctx.function_fields_portable = config.function_fields_portable;
+    ctx.function_fields_exact = ctx.function_fields
+        && cfg!(feature = "extraslow")
+        && config.speed >= Speed::ExtraSlow
+        && config.icc_profile.is_none()
+        && config.color_encoding.primaries == crate::Primaries::Bt709
+        && config.color_encoding.white_point == crate::WhitePoint::D65
+        && config.color_encoding.transfer == crate::TransferFunction::Srgb
+        && config.intensity_target.is_none_or(|nits| nits <= 255.0);
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
@@ -1416,7 +1496,10 @@ pub fn encode_image(
             };
             let encoded = encode_vector_layers(split, width, height, config)?;
             let mut fitted = None;
-            if encoded.bytes.len() as f64 <= budget {
+            // The budget judges the two-frame encode, as the model was fitted
+            // on it; the single frame only ever makes an accepted encode
+            // smaller.
+            if encoded.layered as f64 <= budget {
                 fitted = Some(encoded.bytes);
             } else if (encoded.base as f64) < budget {
                 let room = ((budget - encoded.base as f64) / encoded.band.max(1) as f64
@@ -1867,6 +1950,8 @@ fn encode_ink_frame(
 /// to reference slot 0, then the coverage frame blended over it (kBlend).
 struct VectorEncode {
     bytes: Vec<u8>,
+    /// Bytes of the two-frame encode, before the single-frame race.
+    layered: usize,
     /// Bytes of the palette base frame and of the coverage band frame.
     base: usize,
     band: usize,
@@ -1946,6 +2031,7 @@ fn encode_vector_layers(
         DecodingSpeed::Fast
     };
     let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+    let header = w.clone();
     let start = w.bits_written();
     crate::lossless::encode_frame_lossless_layer(
         &base,
@@ -1975,15 +2061,55 @@ fn encode_vector_layers(
         );
     }
     let band_bytes = (w.bits_written() - start) / 8 - base_bytes;
+    let layered_bytes = w.bits_written().div_ceil(8);
+    if banded {
+        // The same pixels as one lossless frame (a palette of the fills and
+        // their mixes on flat art): the band blended over the base.
+        let AlphaPlane::U8(alpha) = &coverage else {
+            unreachable!()
+        };
+        let composite: Vec<u8> = split
+            .base
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(split.layer.as_chunks::<3>().0)
+            .zip(alpha)
+            .flat_map(|((b, l), &a)| {
+                let a = a as f32 * (1.0 / 255.0);
+                std::array::from_fn::<u8, 3, _>(|k| {
+                    crate::util::round_i32(b[k] as f32 + (l[k] as f32 - b[k] as f32) * a)
+                        .clamp(0, 255) as u8
+                })
+            })
+            .collect();
+        let mut single = header;
+        crate::lossless::encode_frame_lossless_layer(
+            &planes(&composite),
+            &opaque,
+            ModularFrameKind::Regular,
+            speed,
+            decoding_speed,
+            &pool,
+            &mut scratch,
+            &mut single,
+        );
+        if single.bits_written() < w.bits_written() {
+            w = single;
+        }
+    }
+    let saved = layered_bytes - w.bits_written().div_ceil(8);
+    let bytes = finalize_container(
+        w.into_bytes(),
+        config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
+        false,
+        encode_gain_map(config)?.as_ref(),
+    )?;
     Ok(VectorEncode {
-        bytes: finalize_container(
-            w.into_bytes(),
-            config.exif.as_deref(),
-            config.xmp.as_deref(),
-            config.brotli_compression.as_deref(),
-            false,
-            encode_gain_map(config)?.as_ref(),
-        )?,
+        layered: bytes.len() + saved,
+        bytes,
         base: base_bytes,
         band: band_bytes,
     })
@@ -3967,6 +4093,59 @@ mod encode_smoke_tests {
         rgb
     }
 
+    /// Two flat discs with antialiased rims on a flat background.
+    fn antialiased_discs_fixture(size: usize) -> Vec<u8> {
+        let bg = [236.0f32, 240.0, 248.0];
+        let discs = [
+            (0.35, 0.4, 0.25, [40.0f32, 90.0, 200.0]),
+            (0.7, 0.65, 0.2, [230.0, 120.0, 30.0]),
+        ];
+        let mut rgb = Vec::with_capacity(size * size * 3);
+        for y in 0..size {
+            for x in 0..size {
+                let mut color = bg;
+                for &(cx, cy, r, fill) in &discs {
+                    let (dx, dy) = (
+                        x as f32 + 0.5 - cx * size as f32,
+                        y as f32 + 0.5 - cy * size as f32,
+                    );
+                    let edge = r * size as f32 - (dx * dx + dy * dy).sqrt();
+                    let a = (edge + 0.5).clamp(0.0, 1.0);
+                    for k in 0..3 {
+                        color[k] += (fill[k] - color[k]) * a;
+                    }
+                }
+                rgb.extend(color.map(|c| c.round() as u8));
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn vector_layers_single_frame_never_exceeds_the_layered_encode() {
+        let size = 256;
+        let rgb = antialiased_discs_fixture(size);
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_num_threads(1);
+        let steps = crate::vector_layers::coverage_steps(1.5);
+        let split = crate::vector_layers::split(&rgb, size, size, steps).expect("flat art splits");
+        assert!(
+            split.coverage.iter().any(|&a| a != 0),
+            "the rims form a band"
+        );
+        let encoded = encode_vector_layers(split, size, size, &config).unwrap();
+        assert!(encoded.bytes.len() <= encoded.layered);
+        // The rims mix only two fills each: one palette of fills and mixes
+        // beats a base plus a coverage frame.
+        assert!(
+            encoded.bytes.len() < encoded.layered,
+            "{} vs {}",
+            encoded.bytes.len(),
+            encoded.layered
+        );
+    }
+
     #[test]
     fn high_quality_ink_palette_capacity_preserves_the_plain_path() {
         let rgb = many_ink_half_coverage_fixture();
@@ -5785,5 +5964,57 @@ mod lossy_alpha_tests {
             .with_distance(1.5);
         let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
         assert!(bytes < 3150, "{bytes}");
+    }
+
+    #[test]
+    fn function_fields_portable_is_opt_in() {
+        let config = EncodeConfig::default();
+        assert!(!config.function_fields_portable);
+        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
+        let portable = config.with_function_fields_portable(true);
+        assert!(lossy_context(&portable, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
+    }
+
+    #[test]
+    fn function_fields_default_on_where_supported() {
+        for (speed, supported) in [
+            (Speed::Fast, false),
+            (Speed::Medium, true),
+            (Speed::Slow, true),
+            (Speed::ExtraSlow, true),
+        ] {
+            let config = EncodeConfig::default()
+                .with_speed(speed)
+                .with_num_threads(1);
+            assert!(config.function_fields);
+            assert_eq!(
+                lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields,
+                supported,
+                "{speed:?}"
+            );
+            let off = config.with_function_fields(false);
+            assert!(!lossy_context(&off, 1.5, XybMatrix::SPEC, 65536).function_fields);
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_num_threads(1);
+        assert!(
+            !lossy_context(
+                &config.clone().with_progressive(true),
+                1.5,
+                XybMatrix::SPEC,
+                65536
+            )
+            .function_fields
+        );
+        assert!(
+            !lossy_context(
+                &config,
+                1.5,
+                XybMatrix::SPEC,
+                crate::function_fields::MAX_PIXELS + 1
+            )
+            .function_fields
+        );
     }
 }

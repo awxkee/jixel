@@ -301,20 +301,37 @@ fn write_frame_header(
     // Color-channel BlendingInfo: mode=Replace, full_frame=true means
     // source/alpha_channel/clamp are all omitted. The two zero bits select
     // BlendingMode::Replace.
-    w.write(2, 0); // color blend mode = Replace
+    //
+    // A frame that adds its extra channel to the function frame also adds
+    // its color to that frame's (black) color instead of replacing it.
+    // Decoders disagree on when an extra channel's `source` is present:
+    // libjxl and jxl-rs go by that channel's own mode, jxl-oxide by the
+    // color mode. With Add on both, every reading has the same bits.
+    let add = role == FrameRole::LastExtraAdd && has_alpha;
+    if add {
+        w.write(2, 1); // color blend mode = Add
+        w.write(2, 0); // source = slot 0
+    } else {
+        w.write(2, 0); // color blend mode = Replace
+    }
 
     // Per-extra-channel BlendingInfo. With num_extra_channels=1, BlendingInfo
     // for the alpha channel has:
-    //   mode = Replace (2 bits = 00)
+    //   mode = Replace (2 bits = 00) or Add (01)
     //   alpha_channel: NOT written (mode != Blend/AWA)
     //   clamp: NOT written (mode != Blend/AWA/Mul)
-    //   source: NOT written (full_frame && Replace)
+    //   source: NOT written for Replace on a full frame, slot 0 for Add
     if has_alpha {
-        w.write(2, 0); // ec_blending_info[0].mode = Replace
+        if add {
+            w.write(2, 1); // ec_blending_info[0].mode = Add
+            w.write(2, 0); // source = slot 0
+        } else {
+            w.write(2, 0); // ec_blending_info[0].mode = Replace
+        }
     }
 
     match role {
-        FrameRole::Last => w.write(1, 1), // last frame
+        FrameRole::Last | FrameRole::LastExtraAdd => w.write(1, 1), // last frame
         FrameRole::SavedFirst => {
             w.write(1, 0); // not the last frame
             w.write(2, 0); // save_as_reference = 0

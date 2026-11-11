@@ -206,9 +206,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
             {
                 break;
             }
-            for k in 1..=CHUNK {
-                pending.push(offset(p, t, k as f32));
-            }
+            pending.extend((1..=CHUNK).map(|k| offset(p, t, k as f32)));
             p = offset(p, t, CHUNK as f32);
             continue;
         };
@@ -219,9 +217,7 @@ fn trace(data: &[f32], w: usize, h: usize, seed: &[Point<f32>], scale: f32) -> O
             break;
         }
         extra.append(&mut pending);
-        for k in 1..=CHUNK {
-            extra.push(offset(p, d, k as f32 * RCP_CHUNK));
-        }
+        extra.extend((1..=CHUNK).map(|k| offset(p, d, k as f32 * RCP_CHUNK)));
         supported += 1;
         gaps = 0;
         t = Point::new(t.x + next.x, t.y + next.y);

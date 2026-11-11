@@ -43,6 +43,7 @@ mod encoder;
 mod extra_channels;
 pub(crate) mod extra_levels;
 mod extra_tree;
+mod function_quality;
 mod header;
 #[cfg(feature = "extraslow")]
 mod loop_arbiter;

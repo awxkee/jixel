@@ -361,11 +361,12 @@ pub(crate) fn spline_tokens(sp: &QuantizedSpline) -> Vec<(u32, u32)> {
         t.push((CTX_POINTS, pack_signed(dy - pdy)));
         (pdx, pdy, px, py) = (dx, dy, x, y);
     }
-    for row in &sp.dct {
-        for &v in row {
-            t.push((CTX_DCT, pack_signed(v)));
-        }
-    }
+    t.extend(
+        sp.dct
+            .as_flattened()
+            .iter()
+            .map(|&v| (CTX_DCT, pack_signed(v))),
+    );
     t
 }
 

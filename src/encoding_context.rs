@@ -62,6 +62,9 @@ pub(crate) enum FrameRole {
     /// First frame, saved to reference slot 0 after the color transform;
     /// the ink frame is blended over it.
     SavedFirst,
+    /// Last frame whose extra channel and color are added to the frame saved
+    /// in slot 0, whose color is black.
+    LastExtraAdd,
 }
 
 pub(crate) struct EncodingContext {
@@ -134,6 +137,20 @@ pub(crate) struct EncodingContext {
     /// Permit repeated coverage masks to use their own patch atlas. Follows
     /// the public patch setting; exact extra-channel coding is independent.
     pub(crate) alpha_patches: bool,
+    /// Native coherent extra-channel function fields.
+    pub(crate) function_fields: bool,
+    /// Function fields may use a second frame (function base + residual).
+    /// libjxl cannot blend onto a saved frame when the image carries an ICC
+    /// profile (djxl fails to decode; jxl-rs accepts it), so those images
+    /// keep to single-frame functions.
+    pub(crate) function_fields_layered: bool,
+    /// Gate function fields with SSIMULACRA2 and CVVDP instead of the proxy:
+    /// the slowest tier, on SDR sRGB input (what their composites assume).
+    pub(crate) function_fields_exact: bool,
+    /// Code a function's coordinate plane directly under one Palette instead
+    /// of through a second Palette with explicit deltas, which jxl-oxide 0.12
+    /// cannot read.
+    pub(crate) function_fields_portable: bool,
     /// XYB rendition of a non-XYB frame. Adaptive quantization reads its
     /// luma instead of the coded planes.
     pub(crate) aq_source: std::sync::OnceLock<crate::image::Image3F>,
@@ -622,6 +639,10 @@ impl EncodingContext {
             extra_plane_tree: None,
             extra_context_trees: false,
             alpha_patches: false,
+            function_fields: false,
+            function_fields_layered: false,
+            function_fields_exact: false,
+            function_fields_portable: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
             merge: ac_strategy::MergeTuning::new(distance, arbiter, speed),
             learned_rate: false,

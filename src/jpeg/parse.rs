@@ -30,11 +30,11 @@
 //! The JPEG marker/entropy parser.
 //!
 //! Only the subset of JPEG that is actually transcodable to JXL is accepted:
-//! 8-bit Huffman-coded baseline (SOF0/SOF1) and progressive (SOF2) images with
-//! at most four components. Arithmetic coding, hierarchical mode, 12-bit
-//! samples and lossless JPEG are all rejected up front rather than parsed
-//! incorrectly.
+//! 8-bit baseline/extended (SOF0/SOF1/SOF9) and progressive (SOF2/SOF10)
+//! images with at most four components, Huffman- or arithmetic-coded.
+//! Hierarchical mode, 12-bit samples and lossless JPEG are rejected up front.
 
+use super::arith::{self, ArithConditioning};
 use super::{
     DCT_BLOCK_SIZE, ExtraZeroRunInfo, HUFF_ALPHABET_SIZE, HUFF_MAX_BIT_LENGTH, JpegComponent,
     JpegComponentScanInfo, JpegData, JpegHuffmanCode, JpegQuantTable, JpegScanInfo, MAX_COMPONENTS,
@@ -50,8 +50,7 @@ pub(crate) enum JpegError {
     Truncated,
     /// A marker segment declared an implausible length.
     BadSegmentLength(u8),
-    /// A coding mode we deliberately do not support (arithmetic, hierarchical,
-    /// lossless, 12-bit, ...).
+    /// A coding mode or parameter outside the supported JPEG subset.
     UnsupportedMode(&'static str),
     /// A frame header was malformed or contradicted an earlier one.
     BadFrameHeader,
@@ -350,6 +349,9 @@ const MAX_PIXELS: usize = 1 << 28;
 const M_SOF0: u8 = 0xC0;
 const M_SOF1: u8 = 0xC1;
 const M_SOF2: u8 = 0xC2;
+const M_SOF9: u8 = 0xC9;
+const M_SOF10: u8 = 0xCA;
+const M_DAC: u8 = 0xCC;
 const M_DHT: u8 = 0xC4;
 const M_SOI: u8 = 0xD8;
 const M_EOI: u8 = 0xD9;
@@ -382,15 +384,111 @@ static IS_VALID_MARKER: [bool; 64] = {
 fn find_next_marker(data: &[u8], mut pos: usize) -> usize {
     let start = pos;
     while pos + 1 < data.len() {
+        // Arithmetic-coding markers are parsed too, though reconstruction
+        // never emits them: the frame is rewritten as Huffman-coded.
         let is_marker = data[pos] == 0xFF
             && data[pos + 1] >= 0xC0
-            && IS_VALID_MARKER[(data[pos + 1] - 0xC0) as usize];
+            && (IS_VALID_MARKER[(data[pos + 1] - 0xC0) as usize]
+                || matches!(data[pos + 1], M_SOF9 | M_SOF10 | M_DAC));
         if is_marker {
             break;
         }
         pos += 1;
     }
     pos - start
+}
+
+struct ArithmeticFrame {
+    conditioning: ArithConditioning,
+    // The last transmitted Al for each component and spectral position.
+    low_bit: [[Option<u8>; DCT_BLOCK_SIZE]; MAX_COMPONENTS],
+    quant_idx: [Option<usize>; MAX_COMPONENTS],
+}
+
+impl ArithmeticFrame {
+    fn record_scan(&mut self, jpg: &JpegData, scan: &JpegScanInfo) -> Result<(), JpegError> {
+        if scan.ah != 0 && scan.ah != scan.al + 1 {
+            return Err(JpegError::BadScanHeader);
+        }
+        let (ss, se) = (scan.ss as usize, scan.se as usize);
+        let previous = (scan.ah != 0).then_some(scan.ah as u8);
+        for csi in &scan.components[..scan.num_components as usize] {
+            let comp = csi.comp_idx as usize;
+            let bits = &mut self.low_bit[comp];
+            if ss != 0 && bits[0].is_none() {
+                return Err(JpegError::BadScanHeader);
+            }
+            let band = &mut bits[ss..=se];
+            if band.iter().any(|&bit| bit != previous) {
+                return Err(JpegError::BadScanHeader);
+            }
+            band.fill(Some(scan.al as u8));
+            // A component latches the most recent definition of its table
+            // when it first appears in a scan.
+            if self.quant_idx[comp].is_none() {
+                let slot = jpg.components[comp].quant_idx;
+                self.quant_idx[comp] = Some(
+                    jpg.quant
+                        .iter()
+                        .rposition(|q| q.index == slot)
+                        .ok_or(JpegError::BadTable("quantization"))?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, jpg: &mut JpegData) -> Result<(), JpegError> {
+        let mut used = [usize::MAX; MAX_COMPONENTS];
+        for (i, c) in jpg.components.iter_mut().enumerate() {
+            let index = self.quant_idx[i].ok_or(JpegError::BadScanHeader)?;
+            c.quant_idx = index as u32;
+            used[i] = index;
+        }
+        used.sort_unstable();
+        let mut slots = 0u8;
+        let unique_slots = jpg.quant.iter().all(|q| {
+            let bit = 1 << q.index;
+            let new_slot = slots & bit == 0;
+            slots |= bit;
+            new_slot
+        });
+        if unique_slots && (0..jpg.quant.len()).all(|i| used.contains(&i)) {
+            return Ok(());
+        }
+
+        // Reconstruction can carry the active tables through the codestream.
+        // Emit each of those tables once, using distinct destinations even if
+        // different components latched different definitions of one slot.
+        let mut previous = None;
+        let mut quant = Vec::with_capacity(jpg.components.len());
+        for index in used.into_iter().take(jpg.components.len()) {
+            if previous == Some(index) {
+                continue;
+            }
+            previous = Some(index);
+            let slot = quant.len() as u32;
+            let mut table = jpg.quant[index].clone();
+            table.index = slot;
+            table.is_last = false;
+            quant.push(table);
+            for (i, c) in jpg.components.iter_mut().enumerate() {
+                if self.quant_idx[i] == Some(index) {
+                    c.quant_idx = slot;
+                }
+            }
+        }
+        quant.last_mut().ok_or(JpegError::BadFrameHeader)?.is_last = true;
+        jpg.quant = quant;
+        jpg.marker_order.retain(|&m| m != M_DQT);
+        let sos = jpg
+            .marker_order
+            .iter()
+            .position(|&m| m == M_SOS)
+            .ok_or(JpegError::BadScanHeader)?;
+        jpg.marker_order.insert(sos, M_DQT);
+        Ok(())
+    }
 }
 
 /// Parses a complete JPEG file into a [`JpegData`].
@@ -407,6 +505,10 @@ pub(crate) fn parse_jpeg(data: &[u8]) -> Result<JpegData, JpegError> {
     let mut ac_tables: [HuffTable; 4] = Default::default();
     let mut seen_sof = false;
     let mut seen_sos = false;
+    // `Some` once an arithmetic-coded frame header has been read.
+    let mut arithmetic: Option<ArithmeticFrame> = None;
+    // DAC segments may precede the frame header.
+    let mut pending_dac = Vec::new();
     let mut pos = 2usize;
 
     loop {
@@ -431,13 +533,36 @@ pub(crate) fn parse_jpeg(data: &[u8]) -> Result<JpegData, JpegError> {
                 jpg.tail_data = data[pos..].to_vec();
                 break;
             }
-            M_SOF0 | M_SOF1 | M_SOF2 => {
+            M_SOF0 | M_SOF1 | M_SOF2 | M_SOF9 | M_SOF10 => {
                 if seen_sof {
                     return Err(JpegError::UnexpectedMarker(marker));
                 }
                 seen_sof = true;
-                jpg.is_progressive = marker == M_SOF2;
+                jpg.is_progressive = matches!(marker, M_SOF2 | M_SOF10);
+                if matches!(marker, M_SOF9 | M_SOF10) {
+                    let mut conditioning = ArithConditioning::default();
+                    for (start, _) in pending_dac.drain(..) {
+                        arith::process_dac(data, start, &mut conditioning)?;
+                    }
+                    arithmetic = Some(ArithmeticFrame {
+                        conditioning,
+                        low_bit: [[None; DCT_BLOCK_SIZE]; MAX_COMPONENTS],
+                        quant_idx: [None; MAX_COMPONENTS],
+                    });
+                }
                 pos = process_sof(data, pos, &mut jpg)?;
+            }
+            M_DAC => {
+                if let Some(frame) = &mut arithmetic {
+                    pos = arith::process_dac(data, pos, &mut frame.conditioning)?;
+                } else {
+                    let len = read_u16(data, pos)? as usize;
+                    if len < 2 || pos + len > data.len() {
+                        return Err(JpegError::BadSegmentLength(M_DAC));
+                    }
+                    pending_dac.push((pos, pos + len));
+                    pos += len;
+                }
             }
             M_DHT => pos = process_dht(data, pos, &mut jpg, &mut dc_tables, &mut ac_tables)?,
             M_DQT => pos = process_dqt(data, pos, &mut jpg)?,
@@ -447,10 +572,18 @@ pub(crate) fn parse_jpeg(data: &[u8]) -> Result<JpegData, JpegError> {
                     return Err(JpegError::UnexpectedMarker(marker));
                 }
                 seen_sos = true;
-                pos = process_sos(data, pos, &mut jpg, &dc_tables, &ac_tables)?;
+                pos = process_sos(
+                    data,
+                    pos,
+                    &mut jpg,
+                    &dc_tables,
+                    &ac_tables,
+                    arithmetic.as_mut(),
+                )?;
             }
             0xE0..=0xEF => pos = capture_segment(data, pos, marker, &mut jpg.app_data)?,
             M_COM => pos = capture_segment(data, pos, marker, &mut jpg.com_data)?,
+            0xD0..=0xD7 if arithmetic.is_some() => return Err(JpegError::UnexpectedMarker(marker)),
             // Restart markers outside a scan carry no payload.
             0xD0..=0xD7 => {}
             other => return Err(JpegError::UnexpectedMarker(other)),
@@ -464,8 +597,33 @@ pub(crate) fn parse_jpeg(data: &[u8]) -> Result<JpegData, JpegError> {
     if !seen_sos {
         return Err(JpegError::UnexpectedMarker(M_SOS));
     }
+    if let Some(frame) = arithmetic {
+        frame.finish(&mut jpg)?;
+        jpg.is_arithmetic = true;
+        return Ok(jpg);
+    }
     if jpg.huffman_code.is_empty() {
         return Err(JpegError::BadTable("Huffman"));
+    }
+
+    if !pending_dac.is_empty() {
+        // Huffman scans ignore DAC. Carry the original bytes as inter-marker
+        // data so the Huffman file can still be reconstructed byte for byte.
+        let mut skipped = core::mem::take(&mut jpg.inter_marker_data).into_iter();
+        let mut dac = pending_dac.into_iter();
+        for marker in &mut jpg.marker_order {
+            match *marker {
+                0xFF => jpg.inter_marker_data.extend(skipped.next()),
+                M_DAC => {
+                    let (start, end) = dac
+                        .next()
+                        .ok_or(JpegError::BadTable("arithmetic conditioning"))?;
+                    jpg.inter_marker_data.push(data[start - 2..end].to_vec());
+                    *marker = 0xFF;
+                }
+                _ => {}
+            }
+        }
     }
 
     // Components reference quantization tables by DQT slot while parsing, but
@@ -748,6 +906,7 @@ fn process_sos(
     jpg: &mut JpegData,
     dc_tables: &[HuffTable; 4],
     ac_tables: &[HuffTable; 4],
+    arithmetic: Option<&mut ArithmeticFrame>,
 ) -> Result<usize, JpegError> {
     let len = read_u16(data, pos)? as usize;
     let end = pos + len;
@@ -811,7 +970,16 @@ fn process_sos(
         return Err(JpegError::BadScanHeader);
     }
 
-    let next = decode_scan(data, p, jpg, &mut scan, dc_tables, ac_tables)?;
+    let next = match arithmetic {
+        Some(frame) => {
+            if p != end || (jpg.is_progressive && scan.ss == 0 && scan.se != 0) {
+                return Err(JpegError::BadScanHeader);
+            }
+            frame.record_scan(jpg, &scan)?;
+            arith::decode_scan(data, p, jpg, &scan, &frame.conditioning)?
+        }
+        None => decode_scan(data, p, jpg, &mut scan, dc_tables, ac_tables)?,
+    };
     jpg.scan_info.push(scan);
     Ok(next)
 }
@@ -937,9 +1105,8 @@ fn record_padding(jpg: &mut JpegData, br: &mut BitReader<'_>) {
     if bits != all_ones {
         jpg.has_zero_padding_bit = true;
     }
-    for i in (0..n).rev() {
-        jpg.padding_bits.push(((bits >> i) & 1) as u8);
-    }
+    jpg.padding_bits
+        .extend((0..n).rev().map(|i| ((bits >> i) & 1) as u8));
 }
 
 #[allow(clippy::too_many_arguments)]

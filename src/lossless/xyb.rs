@@ -82,6 +82,7 @@ pub(crate) fn encode_modular_xyb_atlas(
         ysize,
         has_alpha,
         lattice_scale,
+        crate::patches::MODULAR_PATCH_REF_ID,
         speed,
         use_wp,
         scratch,
@@ -90,7 +91,8 @@ pub(crate) fn encode_modular_xyb_atlas(
 }
 
 /// Same as [`encode_modular_xyb_atlas`] for an atlas that is already on the
-/// integer lattice (channels Y, X, B-Y). Accepts up to one 1024-pixel group.
+/// integer lattice (channels Y, X, B-Y), saved to reference `slot`. Accepts
+/// up to one 1024-pixel group.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_modular_xyb_atlas_ints(
     ch: [Vec<i32>; 3],
@@ -98,6 +100,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     ysize: usize,
     has_alpha: bool,
     lattice_scale: u32,
+    slot: u32,
     speed: crate::Speed,
     use_wp: bool,
     scratch: &mut CoderScratch,
@@ -135,14 +138,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     }
     let use_palette = !seen.is_empty() && seen.len() <= 256;
 
-    write_frame_header_modular_xyb_reference(
-        xsize,
-        ysize,
-        crate::patches::MODULAR_PATCH_REF_ID,
-        has_alpha,
-        layout,
-        writer,
-    );
+    write_frame_header_modular_xyb_reference(xsize, ysize, slot, has_alpha, layout, writer);
 
     let mut section = BitWriter::new();
     // LfChannelDequant: the decoder multiplies each channel by these steps.

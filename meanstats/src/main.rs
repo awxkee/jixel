@@ -525,14 +525,12 @@ fn main() -> Result<()> {
     let mut kinds: Vec<Kind> = vec![Kind::Jixel];
     if with_cjxl {
         let n_eff = efforts.len();
-        for (k, &e) in efforts.iter().enumerate() {
-            series.push(Series {
-                label: format!("cjxl -e{e}"),
-                color: cjxl_color(k, n_eff),
-                points: vec![],
-            });
-            kinds.push(Kind::Cjxl(e));
-        }
+        series.extend(efforts.iter().enumerate().map(|(k, &e)| Series {
+            label: format!("cjxl -e{e}"),
+            color: cjxl_color(k, n_eff),
+            points: vec![],
+        }));
+        kinds.extend(efforts.iter().copied().map(Kind::Cjxl));
     }
     if with_aom {
         series.push(Series {

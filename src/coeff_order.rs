@@ -99,10 +99,11 @@ pub(crate) fn tokenize_permutation(zigzag: &[u32], skip: usize, tokens: &mut Vec
         (end - skip) as u32,
     ));
     let mut last = 0u32;
-    for &l in &lehmer[skip..end] {
-        tokens.push(Token::new(coeff_order_context(last), l));
+    tokens.extend(lehmer[skip..end].iter().map(|&l| {
+        let token = Token::new(coeff_order_context(last), l);
         last = l;
-    }
+        token
+    }));
 }
 
 /// The order groups jixel can actually produce, as
@@ -132,9 +133,8 @@ fn natural_scan_64() -> &'static [u32] {
         const LLF: usize = 8;
         let mut out = Vec::with_capacity(SIDE * SIDE);
         for y in 0..LLF {
-            for x in 0..LLF {
-                out.push((y * SIDE + x) as u32);
-            }
+            let start = (y * SIDE) as u32;
+            out.extend(start..start + LLF as u32);
         }
         for sum in 0..=(2 * (SIDE - 1)) {
             let lo = sum.saturating_sub(SIDE - 1);

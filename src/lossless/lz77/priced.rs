@@ -209,6 +209,16 @@ fn priced_hash<T: LiteralToken>(tokens: &[T], pos: usize) -> usize {
     (hash.wrapping_mul(0xc2b2_ae35) >> (32 - PRICED_HASH_BITS)) as usize
 }
 
+fn literal_price_prefix<T: LiteralToken>(tokens: &[T], prices: &LiteralPrices) -> Vec<f32> {
+    let mut sum = 0.0f64;
+    std::iter::once(0.0)
+        .chain(tokens.iter().map(|token| {
+            sum += f64::from(prices.of(token.as_token()));
+            sum as f32
+        }))
+        .collect()
+}
+
 /// LZ77 parse that takes a match only where it is cheaper than the literals
 /// it replaces: under a learned tree most literals cost a fraction of a bit,
 /// and a match of fixed minimum length loses to them. Candidates come from a
@@ -231,13 +241,7 @@ pub(in crate::lossless) fn lz77_compress_priced<T: LiteralToken>(
     let match_kernel = T::match_kernel();
     // Literal bits of tokens[..k]: a span's price is one subtraction, and a
     // position whose longest possible match cannot pay is never searched.
-    let mut prefix: Vec<f32> = Vec::with_capacity(n + 1);
-    let mut sum = 0f64;
-    prefix.push(0.0);
-    for token in tokens {
-        sum += prices.of(token.as_token()) as f64;
-        prefix.push(sum as f32);
-    }
+    let prefix = literal_price_prefix(tokens, prices);
     let span = |from: usize, len: usize| -> f32 { prefix[from + len] - prefix[from] };
     let cheapest_match = match_prices.of(LZ77_MIN_LENGTH as usize, 1);
     let insert = |heads: &mut [u32], chain: &mut [u32], pos: usize| {
@@ -389,13 +393,7 @@ pub(in crate::lossless) fn lz77_compress_optimal<T: LiteralToken>(
     let (heads, rest) = scratch.split_at_mut(heads_len);
     let (chain, edges) = rest.split_at_mut(n);
     let match_kernel = T::match_kernel();
-    let mut prefix: Vec<f32> = Vec::with_capacity(n + 1);
-    let mut sum = 0f64;
-    prefix.push(0.0);
-    for token in tokens {
-        sum += prices.of(token.as_token()) as f64;
-        prefix.push(sum as f32);
-    }
+    let prefix = literal_price_prefix(tokens, prices);
     let span = |from: usize, len: usize| -> f32 { prefix[from + len] - prefix[from] };
     // Path costs in f64: a stream runs to millions of bits and the edges
     // differ by fractions of one.

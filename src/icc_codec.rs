@@ -264,10 +264,10 @@ fn predict_and_shuffle(
         return None;
     }
     let start = out.len();
-    for i in 0..num {
+    out.extend((0..num).map(|i| {
         let predicted = linear_predict_icc_value(icc, *pos, i, stride, width, order);
-        out.push(icc[*pos + i].wrapping_sub(predicted));
-    }
+        icc[*pos + i].wrapping_sub(predicted)
+    }));
     *pos += num;
     if width > 1 {
         unshuffle(&mut out[start..], width);
@@ -280,11 +280,12 @@ fn predict_icc_minimal(icc: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(icc.len() + 32);
     encode_varint(icc.len() as u64, &mut out);
     let mut header = icc_initial_header_prediction(icc.len() as u64);
-    let mut header_data = Vec::with_capacity(K_ICC_HEADER_SIZE);
-    for i in 0..K_ICC_HEADER_SIZE.min(icc.len()) {
-        icc_predict_header(icc, &mut header, i);
-        header_data.push(icc[i].wrapping_sub(header[i]));
-    }
+    let header_data: Vec<_> = (0..K_ICC_HEADER_SIZE.min(icc.len()))
+        .map(|i| {
+            icc_predict_header(icc, &mut header, i);
+            icc[i].wrapping_sub(header[i])
+        })
+        .collect();
     let mut commands = Vec::new();
     if icc.len() > K_ICC_HEADER_SIZE {
         encode_varint(0, &mut commands); // no tag list
@@ -313,10 +314,10 @@ fn predict_icc(icc: &[u8]) -> Option<Vec<u8>> {
 
     encode_varint(size as u64, &mut result);
     let mut header = icc_initial_header_prediction(size as u64);
-    for i in 0..K_ICC_HEADER_SIZE.min(size) {
+    data.extend((0..K_ICC_HEADER_SIZE.min(size)).map(|i| {
         icc_predict_header(icc, &mut header, i);
-        data.push(icc[i].wrapping_sub(header[i]));
-    }
+        icc[i].wrapping_sub(header[i])
+    }));
     if size <= K_ICC_HEADER_SIZE {
         encode_varint(0, &mut result); // no commands
         result.extend_from_slice(&data);
@@ -1542,9 +1543,7 @@ mod tests {
                 trc = (offset, data.len());
             }
             body.extend_from_slice(data);
-            while body.len() % 4 != 0 {
-                body.push(0);
-            }
+            body.resize(body.len().next_multiple_of(4), 0);
             offset = K_ICC_HEADER_SIZE + 4 + num_tags * 12 + body.len();
         }
         for tag in [b"gTRC", b"bTRC"] {

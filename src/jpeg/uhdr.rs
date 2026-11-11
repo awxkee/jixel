@@ -30,8 +30,8 @@
 //! Binary ISO 21496-1 gain maps in two-image Ultra HDR JPEGs.
 //!
 //! As in gainforge and libultrahdr, the gain map is the JPEG following the
-//! primary image's EOI. The existing JPEG parser keeps all those original
-//! bytes in `tail_data`, so `jbrd` can still reconstruct the complete file.
+//! primary image's EOI. For a Huffman-coded base, `jbrd` includes those
+//! original bytes from `tail_data`.
 
 use super::{JpegData, JpegTranscodeConfig, encode, extract_icc, icc_is_well_formed, parse_jpeg};
 use crate::gain_map::write_jhgm_bundle;

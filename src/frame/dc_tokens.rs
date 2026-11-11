@@ -516,15 +516,11 @@ pub(crate) fn write_context_tree(
 /// The static context tree's tokens.
 fn context_tree_tokens(num_dc_groups: usize, dc_gradient: &DcPredictorChoice) -> Vec<Token> {
     // Build tokens with the patched value at index 1.
-    let mut tokens: Vec<Token> = Vec::with_capacity(K_CONTEXT_TREE_TOKENS.len());
-    for (i, &(ctx, val)) in K_CONTEXT_TREE_TOKENS.iter().enumerate() {
-        let v = if i == 1 {
-            pack_signed(1 + num_dc_groups as i32)
-        } else {
-            val
-        };
-        tokens.push(Token::new(ctx, v));
-    }
+    let mut tokens: Vec<Token> = K_CONTEXT_TREE_TOKENS
+        .iter()
+        .map(|&(ctx, val)| Token::new(ctx, val))
+        .collect();
+    tokens[1].value = pack_signed(1 + num_dc_groups as i32);
     // Retarget the DC-image region (leaves 11..=44) at the Weighted predictor,
     // mirroring libjxl's kWPFixedDC tree (enc_modular.cc / enc_ma PredefinedTree):
     // identical 33 cutoffs, but splitting on the WP-error property (15) instead

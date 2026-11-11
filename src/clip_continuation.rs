@@ -96,10 +96,11 @@ pub(crate) fn continue_saturated(
     // is classified like it: it is never shown, so where it goes does not
     // matter, and a view and a copy of the same stripe agree.
     scratch.class.clear();
+    scratch.class.reserve(n);
     let mut saturated = 0;
     let (mut any_white, mut any_black, mut any_normal) = (false, false, false);
     for row in input.chunks(stride).take(ph) {
-        for &v in &row[..pw] {
+        scratch.class.extend(row[..pw].iter().map(|&v| {
             let class = if v >= white - Y_TOLERANCE {
                 any_white = true;
                 WHITE
@@ -111,8 +112,8 @@ pub(crate) fn continue_saturated(
                 NORMAL
             };
             saturated += usize::from(class != NORMAL);
-            scratch.class.push(class);
-        }
+            class
+        }));
     }
     // A footprint at one limit only has nothing to constrain it; one with
     // both limits is pinned by the sign pattern and gains the most.

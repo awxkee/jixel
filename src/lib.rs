@@ -71,6 +71,8 @@ mod epf_proxy;
 mod fast_divide;
 mod fast_loseless;
 mod frame;
+mod function_fields;
+mod function_fields_deep;
 mod gaborish;
 mod gain_map;
 mod group;

@@ -144,13 +144,13 @@ fn join(chains: &[Chain], members: &[usize]) -> Chain {
         };
         if let Some(&last) = points.last() {
             let gap = fast_hypot(first.x - last.x, first.y - last.y) as usize;
-            for k in 1..gap {
+            points.extend((1..gap).map(|k| {
                 let t = k as f32 / gap as f32;
-                points.push(Point::new(
+                Point::new(
                     last.x + t * (first.x - last.x),
                     last.y + t * (first.y - last.y),
-                ));
-            }
+                )
+            }));
         }
         if forward {
             points.extend_from_slice(&chain.points);
@@ -819,10 +819,10 @@ mod tests {
         for pair in corners.windows(2) {
             let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
             let n = (x1 - x0).abs().max((y1 - y0).abs()) as usize;
-            for k in 0..n {
+            points.extend((0..n).map(|k| {
                 let t = k as f32 / n as f32;
-                points.push(Point::new(x0 + t * (x1 - x0), y0 + t * (y1 - y0)));
-            }
+                Point::new(x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+            }));
         }
         let &(x, y) = corners.last().unwrap();
         points.push(Point::new(x, y));

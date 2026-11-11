@@ -321,7 +321,9 @@ pub(super) fn prepare_vardct_variant(
                 );
                 let (atlas_w, atlas_h) = (tile_atlas.xsize(), tile_atlas.ysize());
                 let mut tile_atlas = tile_atlas;
+                let lattice = lattice_atlas(ctx, &tile_atlas, alpha.is_some(), scratch);
                 gaborize(&mut tile_atlas, &atlas_distp);
+                let mut vardct = BitWriter::new();
                 encode_frame_core(
                     ctx,
                     scratch,
@@ -338,8 +340,9 @@ pub(super) fn prepare_vardct_variant(
                     #[cfg(feature = "splines")]
                     false,
                     crate::noise::GrainPass::Inherit,
-                    &mut patched_writer,
+                    &mut vardct,
                 )?;
+                patched_writer.append(&smaller_atlas(vardct, lattice));
                 references.extend(tile_refs);
                 base = next_base.expect("covered > 0");
                 used_tiles = true;
@@ -580,7 +583,10 @@ pub(super) fn prepare_vardct_variant(
             }
         }
         if let Some(atlas) = vardct_atlas {
-            encode_vardct_atlas(atlas, scratch, &mut patched_writer)?;
+            let lattice = lattice_atlas(ctx, &atlas, alpha.is_some(), scratch);
+            let mut vardct = BitWriter::new();
+            encode_vardct_atlas(atlas, scratch, &mut vardct)?;
+            patched_writer.append(&smaller_atlas(vardct, lattice));
         }
 
         // Patches replace their rectangles and the decoder draws splines after
@@ -924,6 +930,41 @@ const MODULAR_ATLAS_LATTICE_SCALE: u32 = 8;
 
 /// The VarDCT atlas is coded this much finer than the frame it serves.
 const ATLAS_DISTANCE_SCALE: f32 = 0.45;
+
+/// The VarDCT atlas's content as a modular frame on the finest XYB lattice,
+/// in the same reference slot: sharper than the VarDCT atlas, so the smaller
+/// of the two can be kept by bits alone. None when the atlas exceeds one
+/// 1024-pixel group. Small graphics atlases (a few 8x8 tiles of flat UI
+/// color) cost the VarDCT frame 2-4x the modular one; photographic tiles
+/// keep VarDCT.
+fn lattice_atlas(
+    ctx: &EncodingContext,
+    atlas: &Image3F,
+    has_alpha: bool,
+    scratch: &mut CoderScratch,
+) -> Option<BitWriter> {
+    let mut out = BitWriter::new();
+    crate::lossless::encode_modular_xyb_atlas_ints(
+        crate::xyb::quantize_xyb_channels(atlas, MODULAR_ATLAS_LATTICE_SCALE),
+        atlas.xsize(),
+        atlas.ysize(),
+        has_alpha,
+        MODULAR_ATLAS_LATTICE_SCALE,
+        PATCH_REF_ID,
+        ctx.speed,
+        true,
+        scratch,
+        &mut out,
+    )
+    .then_some(out)
+}
+
+fn smaller_atlas(vardct: BitWriter, lattice: Option<BitWriter>) -> BitWriter {
+    match lattice {
+        Some(lattice) if lattice.bits_written() < vardct.bits_written() => lattice,
+        _ => vardct,
+    }
+}
 
 #[cfg(test)]
 mod tests {

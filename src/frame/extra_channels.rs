@@ -35,6 +35,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
+use std::borrow::Cow;
 
 /// Modular data of the extra channel, coded ahead of the frame sections:
 /// the LfGlobal part, one part per DC group and one per AC group.
@@ -78,9 +79,24 @@ pub(super) struct PreparedExtra {
     /// The tail race's candidates when they are already coded.
     folds: Vec<ExtraSections>,
     global_code_ans: bool,
+    /// Actual selected lossy samples, after the decoder's sample clamp.
+    /// Only retained for the opt-in function-field race. `None` means the
+    /// input stays exact, or reconstruction tracking was not requested.
+    reconstruction: Option<AlphaPlane>,
+    /// What this coding adds to the frame before section padding: its own
+    /// sections, less what a shared global tree saves on the DC streams.
+    net_bits: usize,
 }
 
 impl PreparedExtra {
+    pub(super) fn reconstruction(&self) -> Option<&AlphaPlane> {
+        self.reconstruction.as_ref()
+    }
+
+    pub(super) fn net_bits(&self) -> usize {
+        self.net_bits
+    }
+
     pub(crate) fn finish(
         self,
         ctx: &EncodingContext,
@@ -181,9 +197,11 @@ fn extra_palette(plane: &AlphaPlane) -> Option<ExtraPalette> {
     for (index, &v) in entries.iter().enumerate() {
         index_of[v as usize] = index as u8;
     }
-    let indices = (0..plane.len())
-        .map(|i| index_of[plane.get_i32(i) as usize])
-        .collect();
+    let indices = match plane {
+        AlphaPlane::U8(data) => data.iter().map(|&v| index_of[usize::from(v)]).collect(),
+        AlphaPlane::U16 { data, .. } => data.iter().map(|&v| index_of[usize::from(v)]).collect(),
+        AlphaPlane::F32(_) => return None,
+    };
     Some(ExtraPalette {
         entries,
         indices: AlphaPlane::U8(indices),
@@ -368,18 +386,26 @@ impl JointSqueeze {
         rep.bits() - self.tree.as_ref().map_or(0, |t| t.saving())
     }
 
-    fn finish(self, streams: &mut extra_tree::GlobalStreams<'_>) -> PreparedExtra {
+    fn finish(
+        mut self,
+        streams: &mut extra_tree::GlobalStreams<'_>,
+        reconstruction: Option<AlphaPlane>,
+    ) -> PreparedExtra {
+        let net_bits = self.bits();
         if let Some(tree) = self.tree {
-            let mut sections = self.rep.map_or(self.local, |i| self.folds[i].1.clone());
+            let mut sections = self.rep.map_or(self.local, |i| self.folds.swap_remove(i).1);
             tree.apply(streams, &mut sections);
             return PreparedExtra {
                 sections,
                 squeezed: None,
                 folds: Vec::new(),
                 global_code_ans: self.ans,
+                reconstruction,
+                net_bits,
             };
         }
         PreparedExtra {
+            net_bits,
             sections: self.local,
             squeezed: Some(self.squeezed),
             folds: self
@@ -388,8 +414,53 @@ impl JointSqueeze {
                 .map(|(_, sections)| sections)
                 .collect(),
             global_code_ans: self.ans,
+            reconstruction,
         }
     }
+}
+
+/// Native nested Palette/profile sections. They carry their own trees and
+/// leave the frame's shared DC entropy bundle unchanged.
+pub(super) fn prepare_nested_sections(
+    pool: &crate::thread_pool::ThreadPool,
+    profile: &[i32],
+    u: &[i32],
+    v: &[i32],
+    dim: &ImageDim,
+    reconstruction: &AlphaPlane,
+    portable: bool,
+    scratch: &mut CoderScratch,
+) -> Option<PreparedExtra> {
+    if u.len() != dim.xsize
+        || v.len() != dim.ysize
+        || reconstruction.len() != dim.xsize.checked_mul(dim.ysize)?
+    {
+        return None;
+    }
+    // The single-palette coding costs the first row and column of every
+    // group; it is the choice only where the file must stay readable by
+    // decoders that cannot parse a palette's explicit deltas.
+    let (global, ac) = if portable {
+        crate::modular::portable_profile::encode(pool, profile, u, v, scratch)?
+    } else {
+        crate::modular::nested_profile::encode(pool, profile, u, v, scratch)?
+    };
+    if ac.len() != dim.num_groups {
+        return None;
+    }
+    let net_bits = global.bits_written() + ac.iter().map(BitWriter::bits_written).sum::<usize>();
+    Some(PreparedExtra {
+        net_bits,
+        sections: ExtraSections {
+            global,
+            lf: (0..dim.num_dc_groups).map(|_| BitWriter::new()).collect(),
+            ac,
+        },
+        squeezed: None,
+        folds: Vec::new(),
+        global_code_ans: true,
+        reconstruction: None,
+    })
 }
 
 /// Code the extra channel losslessly — through a Palette transform when it
@@ -399,6 +470,7 @@ impl JointSqueeze {
 /// lossless coding wins wherever it is no larger, so solid and hard-edged
 /// planes stay exact. A winning global-tree coding moves the frame's DC
 /// streams onto the merged tree through `streams`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_extra_sections(
     ctx: &EncodingContext,
     plane: &AlphaPlane,
@@ -407,6 +479,7 @@ pub(super) fn prepare_extra_sections(
     last_pass: usize,
     streams: extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
+    track_reconstruction: bool,
 ) -> PreparedExtra {
     prepare_extra_sections_impl(
         ctx,
@@ -417,6 +490,37 @@ pub(super) fn prepare_extra_sections(
         streams,
         scratch,
         false,
+        1.0,
+        None,
+        track_reconstruction,
+    )
+}
+
+/// [`prepare_extra_sections`] with the context's lossy distance scaled.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_extra_sections_scaled(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    last_pass: usize,
+    streams: extra_tree::GlobalStreams<'_>,
+    scratch: &mut CoderScratch,
+    distance_scale: f32,
+    memo: Option<&LevelsMemo>,
+) -> PreparedExtra {
+    prepare_extra_sections_impl(
+        ctx,
+        plane,
+        dim,
+        dc_group_coords,
+        last_pass,
+        streams,
+        scratch,
+        false,
+        distance_scale,
+        memo,
+        true,
     )
 }
 
@@ -448,6 +552,9 @@ pub(super) fn prepare_extra_sections_lossless(
         streams,
         scratch,
         true,
+        1.0,
+        None,
+        false,
     )
 }
 
@@ -461,6 +568,9 @@ fn prepare_extra_sections_impl(
     mut streams: extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
     force_lossless: bool,
+    distance_scale: f32,
+    memo: Option<&LevelsMemo>,
+    track_reconstruction: bool,
 ) -> PreparedExtra {
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
     let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
@@ -497,7 +607,7 @@ fn prepare_extra_sections_impl(
                 plane,
                 dim.xsize,
                 dim.ysize,
-                ctx.extra_squeeze_distance,
+                ctx.extra_squeeze_distance * distance_scale,
                 ctx.extra_learned_trees,
                 ctx.extra_context_trees,
                 ctx.extra_black,
@@ -533,7 +643,9 @@ fn prepare_extra_sections_impl(
     let lossless_bits = lossless.bits() - global_tree.as_ref().map_or(0, |t| t.saving());
     match lossy {
         Some(lossy) if lossy.bits() < lossless_bits => {
+            drop((lossless, palette, global_tree));
             let squeezed = squeezed.expect("lossy sections come from a squeeze");
+            let mut reconstruction = None;
             if ctx.speed.effort().extra_global_tree {
                 let joint = JointSqueeze::plan(
                     ctx,
@@ -554,8 +666,16 @@ fn prepare_extra_sections_impl(
                     last_pass,
                     &mut streams,
                     scratch,
+                    memo,
+                    track_reconstruction.then_some(&mut reconstruction),
                 );
-                return levels.unwrap_or_else(|| joint.finish(&mut streams));
+                return levels.unwrap_or_else(|| {
+                    let reconstruction = reconstruction.or_else(|| {
+                        track_reconstruction
+                            .then(|| squeezed_reconstruction(plane, joint.squeezed.reconstruct()))
+                    });
+                    joint.finish(&mut streams, reconstruction)
+                });
             }
             if let Some(levels) = lossy_palette(
                 ctx,
@@ -566,14 +686,21 @@ fn prepare_extra_sections_impl(
                 last_pass,
                 &mut streams,
                 scratch,
+                memo,
+                track_reconstruction.then_some(&mut reconstruction),
             ) {
                 return levels;
             }
+            let reconstruction = reconstruction.or_else(|| {
+                track_reconstruction.then(|| squeezed_reconstruction(plane, squeezed.reconstruct()))
+            });
             PreparedExtra {
+                net_bits: lossy.bits(),
                 sections: lossy,
                 squeezed: squeezed.exact_tail_start().is_some().then_some(squeezed),
                 folds: Vec::new(),
                 global_code_ans: ans,
+                reconstruction,
             }
         }
         _ => {
@@ -600,28 +727,78 @@ fn prepare_extra_sections_impl(
                 squeezed: None,
                 folds: Vec::new(),
                 global_code_ans: ans,
+                reconstruction: None,
+                net_bits: lossless_bits,
             }
         }
     }
 }
 
-/// The squeezed plane's weighted squared error after the decoder's clamp.
-fn squeezed_error(
-    plane: &AlphaPlane,
-    squeezed: &crate::lossy_modular::ExtraSqueeze,
-    weights: &[f32],
-) -> f64 {
-    let max = (1i64 << plane.bits()) - 1;
-    squeezed
-        .reconstruct()
-        .iter()
-        .zip(weights)
-        .enumerate()
-        .map(|(i, (&v, &w))| {
-            let e = i64::from(v).clamp(0, max) - i64::from(plane.get_i32(i));
-            f64::from(w) * (e * e) as f64
-        })
-        .sum()
+/// Convert the selected squeeze to the samples actually exposed by a decoder.
+/// K's no-ink bias may leave the raw inverse outside the nominal sample range.
+fn squeezed_reconstruction(plane: &AlphaPlane, samples: Vec<i32>) -> AlphaPlane {
+    match plane {
+        AlphaPlane::U8(_) => {
+            AlphaPlane::U8(samples.into_iter().map(|v| v.clamp(0, 255) as u8).collect())
+        }
+        AlphaPlane::U16 { bits, .. } => {
+            let max = (1i32 << *bits) - 1;
+            AlphaPlane::U16 {
+                data: samples
+                    .into_iter()
+                    .map(|v| v.clamp(0, max) as u16)
+                    .collect(),
+                bits: *bits,
+            }
+        }
+        AlphaPlane::F32(_) => unreachable!("float extra channels are not squeezed"),
+    }
+}
+
+/// The exact coding of lossy-palette level planes, shared by codings that
+/// start from identical DC streams (the alternatives of one extra-channel
+/// race). Different planes often quantize to the same few levels, and the
+/// learned tree of a level plane is most of what coding it costs.
+#[derive(Default)]
+pub(super) struct LevelsMemo {
+    entries: std::sync::Mutex<Vec<LevelsEntry>>,
+}
+
+type LevelsCoding = (ExtraSections, Option<extra_tree::GlobalExtraTree>);
+type LevelsEntry = (
+    AlphaPlane,
+    std::sync::Arc<std::sync::OnceLock<LevelsCoding>>,
+);
+
+impl LevelsMemo {
+    /// The slot for `levels`; a coding already under way elsewhere is waited
+    /// for rather than repeated.
+    fn slot(
+        &self,
+        levels: &AlphaPlane,
+    ) -> Option<std::sync::Arc<std::sync::OnceLock<LevelsCoding>>> {
+        let same = |a: &AlphaPlane, b: &AlphaPlane| match (a, b) {
+            (AlphaPlane::U8(a), AlphaPlane::U8(b)) => a == b,
+            (
+                AlphaPlane::U16 {
+                    data: a,
+                    bits: abits,
+                },
+                AlphaPlane::U16 {
+                    data: b,
+                    bits: bbits,
+                },
+            ) => abits == bbits && a == b,
+            _ => false,
+        };
+        let mut entries = self.entries.lock().ok()?;
+        if let Some((_, slot)) = entries.iter().find(|(known, _)| same(known, levels)) {
+            return Some(slot.clone());
+        }
+        let slot = std::sync::Arc::default();
+        entries.push((levels.clone(), std::sync::Arc::clone(&slot)));
+        Some(slot)
+    }
 }
 
 /// The lossy palette arm skips its exact coding when the order-0 estimate of
@@ -644,46 +821,75 @@ fn lossy_palette(
     last_pass: usize,
     streams: &mut extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
+    memo: Option<&LevelsMemo>,
+    reconstruction: Option<&mut Option<AlphaPlane>>,
 ) -> Option<PreparedExtra> {
     if ctx.extra_plane_tree.is_none() || ctx.extra_step != 1 {
         return None;
     }
     let weights = super::extra_levels::error_weights(plane, dim.xsize, dim.ysize);
-    let budget =
-        super::extra_levels::LOSSY_PALETTE_ERROR * squeezed_error(plane, squeezed, &weights);
+    let samples = squeezed.reconstruct();
+    let budget = super::extra_levels::squeeze_budget(plane, &samples, &weights);
+    let track_reconstruction = reconstruction.is_some();
+    if let Some(reconstruction) = reconstruction {
+        *reconstruction = Some(squeezed_reconstruction(plane, samples));
+    } else {
+        drop(samples);
+    }
     let levels = super::extra_levels::fewest_levels(plane, &weights, budget, ctx.extra_black)?;
-    let indices: Vec<i32> = (0..levels.len()).map(|i| levels.get_i32(i)).collect();
-    let estimate = crate::lossy_modular::palette_index_bits(&indices, dim.xsize, dim.ysize);
+    let estimate = match &levels {
+        AlphaPlane::U8(data) => {
+            crate::lossy_modular::palette_index_bits_u8(data, dim.xsize, dim.ysize)
+        }
+        _ => crate::lossy_modular::palette_index_bits(
+            &levels.to_i32_vec(levels.len()),
+            dim.xsize,
+            dim.ysize,
+        ),
+    };
     if estimate > PALETTE_SCREEN * squeezed_bits as f64 {
         return None;
     }
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
     let ans = !streams.code.use_prefix_code;
-    let palette = extra_palette(&levels);
     let groups = dim.num_dc_groups;
-    let local_palette = palette.as_ref().filter(|_| !single);
-    let mut sections = lossless_sections(ctx, &levels, local_palette, dim, groups, ans, scratch);
-    let tree = extra_tree::plan_global_extra_tree(
-        ctx,
-        &levels,
-        palette.as_ref(),
-        dim,
-        last_pass,
-        streams,
-        &sections,
-        scratch,
-    );
-    if sections.bits() - tree.as_ref().map_or(0, |t| t.saving()) >= squeezed_bits {
+    let code = |scratch: &mut CoderScratch| {
+        let palette = extra_palette(&levels);
+        let local_palette = palette.as_ref().filter(|_| !single);
+        let sections = lossless_sections(ctx, &levels, local_palette, dim, groups, ans, scratch);
+        let tree = extra_tree::plan_global_extra_tree(
+            ctx,
+            &levels,
+            palette.as_ref(),
+            dim,
+            last_pass,
+            streams,
+            &sections,
+            scratch,
+        );
+        (sections, tree)
+    };
+    let slot = memo.and_then(|memo| memo.slot(&levels));
+    let coding = match slot.as_ref() {
+        Some(slot) => Cow::Borrowed(slot.get_or_init(|| code(scratch))),
+        None => Cow::Owned(code(scratch)),
+    };
+    let (sections, tree) = coding.as_ref();
+    let net_bits = sections.bits() - tree.as_ref().map_or(0, |t| t.saving());
+    if net_bits >= squeezed_bits {
         return None;
     }
+    let (mut sections, tree) = coding.into_owned();
     if let Some(tree) = tree {
         tree.apply(streams, &mut sections);
     }
     Some(PreparedExtra {
+        net_bits,
         sections,
         squeezed: None,
         folds: Vec::new(),
         global_code_ans: ans,
+        reconstruction: track_reconstruction.then_some(levels),
     })
 }
 
@@ -745,6 +951,27 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tracked_black_reconstruction_clamps_the_no_ink_bias() {
+        for plane in [
+            AlphaPlane::U8(vec![255; 33 * 35]),
+            AlphaPlane::U16 {
+                data: vec![65535; 33 * 35],
+                bits: 16,
+            },
+        ] {
+            let squeeze =
+                crate::lossy_modular::ExtraSqueeze::new(&plane, 33, 35, 1.5, false, false, true)
+                    .unwrap();
+            let max = (1i32 << plane.bits()) - 1;
+            assert!(squeeze.reconstruct().iter().any(|&v| v > max));
+            let tracked = squeezed_reconstruction(&plane, squeeze.reconstruct());
+            assert_eq!(tracked.bits(), plane.bits());
+            assert_eq!(tracked.len(), plane.len());
+            assert!((0..tracked.len()).all(|i| tracked.get_i32(i) == max));
         }
     }
 }

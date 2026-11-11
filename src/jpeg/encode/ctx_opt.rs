@@ -37,7 +37,7 @@ use super::{
 };
 use crate::ac_context::{K_NON_ZERO_BUCKETS, K_ZERO_DENSITY_CONTEXT_COUNT, non_zero_bucket};
 use crate::coder_scratch::CoderScratch;
-use crate::entropy::{pack_signed, uint_encode};
+use crate::entropy::{f_log2, pack_signed, uint_encode};
 use crate::fast_divide::DividerU64;
 use crate::thread_pool::ThreadPool;
 
@@ -60,7 +60,7 @@ const MAX_CTXS: usize = 16;
 /// Interval counts (Y, X, B) tried; each is optimized, clustered and priced.
 /// Between them they come within 0.1 % (model bits) of the best of ten
 /// factorizations on the photo originals.
-const CANDIDATES: [[usize; 3]; 2] = [[8, 8, 1], [16, 1, 4]];
+static CANDIDATES: [[usize; 3]; 2] = [[8, 8, 1], [16, 1, 4]];
 /// Contexts left when clustering starts pricing non-neighboring pairs.
 const NEIGHBOR_PHASE_CTXS: usize = 32;
 
@@ -75,7 +75,7 @@ impl NLogN {
                     if n == 0 {
                         0.0
                     } else {
-                        n as f64 * (n as f64).log2()
+                        n as f64 * f_log2(n as f64)
                     }
                 })
                 .collect(),
@@ -86,7 +86,7 @@ impl NLogN {
     fn get(&self, n: u32) -> f64 {
         match self.0.get(n as usize) {
             Some(&v) => v,
-            None => n as f64 * (n as f64).log2(),
+            None => n as f64 * f_log2(n as f64),
         }
     }
 }

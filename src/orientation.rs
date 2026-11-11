@@ -78,6 +78,53 @@ impl Orientation {
         })
     }
 
+    /// Reads the orientation tag (0x0112) from the first directory (IFD0) of
+    /// a TIFF block, the same bytes [`EncodeConfig::with_exif`] takes: a PNG
+    /// `eXIf` chunk, or a HEIF/JPEG Exif payload after its offset or
+    /// `Exif\0\0` prefix. Both byte orders are read; returns `None` when the
+    /// tag is missing, malformed or outside 1..=8.
+    ///
+    /// The pixel encode path does not read this on its own: viewers follow the
+    /// codestream's orientation, not the Exif tag, so pass the result to
+    /// [`EncodeConfig::with_orientation`] unless the pixels were already
+    /// rotated upright.
+    ///
+    /// [`EncodeConfig::with_exif`]: crate::EncodeConfig::with_exif
+    /// [`EncodeConfig::with_orientation`]: crate::EncodeConfig::with_orientation
+    pub fn from_exif_tiff(tiff: &[u8]) -> Option<Self> {
+        let big_endian = match tiff.get(..4)? {
+            [b'M', b'M', 0, 42] => true,
+            [b'I', b'I', 42, 0] => false,
+            _ => return None,
+        };
+        let u16_at = |at: usize| -> Option<u16> {
+            let b: [u8; 2] = tiff.get(at..at.checked_add(2)?)?.try_into().ok()?;
+            Some(if big_endian {
+                u16::from_be_bytes(b)
+            } else {
+                u16::from_le_bytes(b)
+            })
+        };
+        let u32_at = |at: usize| -> Option<u32> {
+            let b: [u8; 4] = tiff.get(at..at.checked_add(4)?)?.try_into().ok()?;
+            Some(if big_endian {
+                u32::from_be_bytes(b)
+            } else {
+                u32::from_le_bytes(b)
+            })
+        };
+        let ifd = usize::try_from(u32_at(4)?).ok()?;
+        let entries = usize::from(u16_at(ifd)?);
+        (0..entries).find_map(|i| {
+            let entry = ifd.checked_add(2 + 12 * i)?;
+            // A single SHORT, stored in the first half of the value field.
+            if u16_at(entry)? != 0x0112 || u16_at(entry + 2)? != 3 || u32_at(entry + 4)? != 1 {
+                return None;
+            }
+            Orientation::from_exif(u8::try_from(u16_at(entry + 8)?).ok()?)
+        })
+    }
+
     /// The JXL codestream payload for the orientation field, which is encoded
     /// as `1 + u(3)`. Returns the 3-bit value `to_exif() - 1` (0..=7).
     pub(crate) fn to_u3(self) -> u64 {

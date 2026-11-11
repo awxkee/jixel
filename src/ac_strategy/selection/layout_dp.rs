@@ -1645,9 +1645,11 @@ fn search_tile_coefficient(
         }
     }
     if winner.is_finite() {
-        for &(i, choice) in &plan_out {
-            layout.push(Piece::new(i % width, i / width, small_strategy(choice)));
-        }
+        layout.extend(
+            plan_out
+                .iter()
+                .map(|&(i, choice)| Piece::new(i % width, i / width, small_strategy(choice))),
+        );
         if keep_fixed {
             layout.extend(
                 current

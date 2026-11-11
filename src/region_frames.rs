@@ -102,12 +102,7 @@ fn pixel_keys(linear: &Image3Si, alpha: Option<&[u8]>) -> Vec<u64> {
             linear.plane_row(2, y),
         );
         let a = alpha.map(|a| &a[y * w..][..w]);
-        for x in 0..w {
-            keys.push(pack(
-                [p0[x], p1[x], p2[x]],
-                a.map_or(0, |a| i32::from(a[x])),
-            ));
-        }
+        keys.extend((0..w).map(|x| pack([p0[x], p1[x], p2[x]], a.map_or(0, |a| i32::from(a[x])))));
     }
     keys
 }
@@ -138,11 +133,9 @@ pub(crate) fn plan(linear: &Image3Si, alpha: Option<&AlphaPlane>) -> Option<Vec<
             tile_keys.clear();
             let mut rare_count = 0usize;
             for y in ty * TILE..((ty + 1) * TILE).min(h) {
-                for x in tx * TILE..((tx + 1) * TILE).min(w) {
-                    let i = y * w + x;
-                    tile_keys.push(keys[i]);
-                    rare_count += usize::from(rare[i]);
-                }
+                let row = y * w + tx * TILE..y * w + ((tx + 1) * TILE).min(w);
+                rare_count += rare[row.clone()].iter().filter(|&&pixel| pixel).count();
+                tile_keys.extend_from_slice(&keys[row]);
             }
             let n = tile_keys.len() as f32;
             tile_keys.sort_unstable();

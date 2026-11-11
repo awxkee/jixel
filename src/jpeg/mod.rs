@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod arith;
 mod brotli;
 mod coeff_order;
 mod encode;
@@ -159,41 +160,6 @@ fn extract_exif(jpg: &JpegData) -> Option<(usize, &[u8])> {
     })
 }
 
-/// The orientation tag (0x0112) of a TIFF block's first directory.
-fn exif_orientation(tiff: &[u8]) -> Option<Orientation> {
-    let big_endian = match tiff.get(..4)? {
-        [b'M', b'M', 0, 42] => true,
-        [b'I', b'I', 42, 0] => false,
-        _ => return None,
-    };
-    let u16_at = |at: usize| -> Option<u16> {
-        let b: [u8; 2] = tiff.get(at..at + 2)?.try_into().ok()?;
-        Some(if big_endian {
-            u16::from_be_bytes(b)
-        } else {
-            u16::from_le_bytes(b)
-        })
-    };
-    let u32_at = |at: usize| -> Option<u32> {
-        let b: [u8; 4] = tiff.get(at..at + 4)?.try_into().ok()?;
-        Some(if big_endian {
-            u32::from_be_bytes(b)
-        } else {
-            u32::from_le_bytes(b)
-        })
-    };
-    let ifd = u32_at(4)? as usize;
-    let entries = usize::from(u16_at(ifd)?);
-    (0..entries).find_map(|i| {
-        let entry = ifd + 2 + 12 * i;
-        // A single SHORT, stored in the first half of the value field.
-        if u16_at(entry)? != 0x0112 || u16_at(entry + 2)? != 3 || u32_at(entry + 4)? != 1 {
-            return None;
-        }
-        Orientation::from_exif(u8::try_from(u16_at(entry + 8)?).ok()?)
-    })
-}
-
 /// Extracts the first standard XMP APP1 segment.
 ///
 /// Returns both its index in `app_data` (for JPEG reconstruction tagging) and
@@ -214,9 +180,12 @@ fn extract_xmp(jpg: &JpegData) -> Option<(usize, Vec<u8>)> {
 /// Options for [`encode_jpeg_lossless_with_config`].
 pub struct JpegTranscodeConfig {
     /// Whether to embed the data needed to rebuild the original JPEG bytes.
+    /// For arithmetic-coded input this rebuilds the Huffman-coded equivalent.
     ///
     /// Defaults to `true`. See [`Self::with_jpeg_reconstruction`].
     /// Binary Ultra HDR gain maps are written to `jhgm` even when this is false.
+    /// JPEG reconstruction is omitted for an arithmetic-coded Ultra HDR base
+    /// when its binary gain map can be stored in `jhgm`.
     pub jpeg_reconstruction: bool,
     /// Worker threads used while building the codestream. Defaults to 1.
     ///
@@ -268,7 +237,7 @@ impl Default for JpegTranscodeConfig {
 }
 
 impl JpegTranscodeConfig {
-    /// Controls whether the original JPEG bytes can be recovered.
+    /// Controls whether JPEG reconstruction data is embedded when supported.
     /// Ultra HDR gain maps with binary metadata are preserved either way.
     pub fn with_jpeg_reconstruction(mut self, enabled: bool) -> Self {
         self.jpeg_reconstruction = enabled;
@@ -298,9 +267,15 @@ impl JpegTranscodeConfig {
 /// Losslessly transcodes a JPEG file into JPEG XL, keeping the ability to
 /// reconstruct the original bytes.
 ///
+/// For arithmetic-coded JPEGs (SOF9/SOF10), reconstruction produces a
+/// Huffman-coded JPEG with the same image coefficients and quantization.
+/// Reconstruction may consolidate table definitions and restart intervals.
+///
 /// Ultra HDR JPEGs with binary ISO 21496-1 metadata are carried over as a
 /// `jhgm` gain map: both JPEG images are transcoded without requantization.
-/// XMP-only gain maps are currently retained only in the reconstruction data.
+/// If the base uses arithmetic coding, the transcoder omits reconstruction
+/// because rewriting the base would invalidate MPF offsets. XMP-only gain maps
+/// rely on JPEG reconstruction.
 pub fn encode_jpeg_lossless(jpeg: &[u8]) -> Result<Vec<u8>, EncodeError> {
     encode_jpeg_lossless_with_config(jpeg, &JpegTranscodeConfig::default())
 }
@@ -309,7 +284,28 @@ pub fn encode_jpeg_lossless_with_config(
     jpeg: &[u8],
     config: &JpegTranscodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    let parsed = parse_jpeg(jpeg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    let mut parsed = parse_jpeg(jpeg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    let mut exif = extract_exif(&parsed);
+    // Viewers follow the codestream's orientation, not the Exif tag.
+    let orientation = exif
+        .and_then(|(_, tiff)| Orientation::from_exif_tiff(tiff))
+        .unwrap_or_default();
+    let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
+
+    let reconstruct = config.jpeg_reconstruction && !(parsed.is_arithmetic && gain_map.is_some());
+    if parsed.is_arithmetic && reconstruct {
+        let has_mpf = parsed
+            .app_data
+            .iter()
+            .any(|app| app.first() == Some(&0xE2) && app.get(3..7) == Some(b"MPF\0"));
+        if has_mpf && parsed.tail_data.windows(2).any(|w| w == [0xFF, 0xD8]) {
+            return Err(EncodeError::Jpeg(
+                "arithmetic-coded MPF requires disabling JPEG reconstruction".into(),
+            ));
+        }
+        arith::synthesize_huffman(&mut parsed).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+        exif = extract_exif(&parsed);
+    }
 
     // Embedded in the codestream either way: without it, dropping the `jbrd`
     // box would silently discard the profile and leave the image mislabeled.
@@ -317,12 +313,6 @@ pub fn encode_jpeg_lossless_with_config(
     // image reads as sRGB and its APP2 bytes still travel in `jbrd`.
     let icc = extract_icc(&parsed).filter(|icc| icc_is_well_formed(&icc.profile));
     let xmp = extract_xmp(&parsed);
-    let exif = extract_exif(&parsed);
-    // Viewers follow the codestream's orientation, not the Exif tag.
-    let orientation = exif
-        .and_then(|(_, tiff)| exif_orientation(tiff))
-        .unwrap_or_default();
-    let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
     let codestream = encode::encode_jpeg_codestream(
         &parsed,
         icc.as_ref().map(|icc| icc.profile.as_slice()),
@@ -331,7 +321,7 @@ pub fn encode_jpeg_lossless_with_config(
         config.num_threads,
     )?;
 
-    let reconstruction = if config.jpeg_reconstruction {
+    let reconstruction = if reconstruct {
         Some(jbrd::encode_jbrd(
             &parsed,
             xmp.as_ref().map(|(index, _)| *index),
@@ -504,7 +494,7 @@ pub(crate) struct JpegComponent {
     pub(crate) coeffs: Vec<i16>,
 }
 
-/// Everything recovered from a JPEG file, sufficient to rebuild it exactly.
+/// The coefficients and metadata recovered from a JPEG file.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JpegData {
     pub(crate) width: usize,
@@ -534,6 +524,9 @@ pub(crate) struct JpegData {
     pub(crate) padding_bits: Vec<u8>,
     /// True if the frame used SOF2 (progressive) rather than SOF0/SOF1.
     pub(crate) is_progressive: bool,
+    /// True if the source was arithmetic-coded (SOF9/SOF10). Reconstruction
+    /// requires preparing the equivalent Huffman markers and tables first.
+    pub(crate) is_arithmetic: bool,
 }
 
 impl JpegData {
@@ -715,14 +708,23 @@ mod tests {
     fn reads_the_exif_orientation_in_either_byte_order() {
         for big_endian in [true, false] {
             let t = tiff(big_endian, &[(0x010F, 2, 4, 0), (0x0112, 3, 1, 8)]);
-            assert_eq!(exif_orientation(&t), Orientation::from_exif(8));
+            assert_eq!(Orientation::from_exif_tiff(&t), Orientation::from_exif(8));
         }
         // No tag, a wrong type, an out-of-range value or junk: no orientation.
-        assert_eq!(exif_orientation(&tiff(true, &[(0x010F, 2, 4, 0)])), None);
-        assert_eq!(exif_orientation(&tiff(true, &[(0x0112, 4, 1, 6)])), None);
-        assert_eq!(exif_orientation(&tiff(false, &[(0x0112, 3, 1, 9)])), None);
-        assert_eq!(exif_orientation(b"MM\0*\0\0\0\x40"), None);
-        assert_eq!(exif_orientation(b"nonsense"), None);
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(true, &[(0x010F, 2, 4, 0)])),
+            None
+        );
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(true, &[(0x0112, 4, 1, 6)])),
+            None
+        );
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(false, &[(0x0112, 3, 1, 9)])),
+            None
+        );
+        assert_eq!(Orientation::from_exif_tiff(b"MM\0*\0\0\0\x40"), None);
+        assert_eq!(Orientation::from_exif_tiff(b"nonsense"), None);
     }
 
     #[test]
@@ -733,7 +735,7 @@ mod tests {
         let jpg = with_app(vec![xmp_app1(b"<x/>"), exif.clone(), exif.clone()]);
         let (index, data) = extract_exif(&jpg).unwrap();
         assert_eq!(index, 1);
-        assert_eq!(exif_orientation(data), Orientation::from_exif(6));
+        assert_eq!(Orientation::from_exif_tiff(data), Orientation::from_exif(6));
         // A bare tag with no TIFF data is not Exif.
         assert_eq!(
             extract_exif(&with_app(vec![vec![

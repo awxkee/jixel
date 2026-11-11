@@ -443,17 +443,17 @@ fn shortlist(source: &Image3F, target: &Target, contour: &Contour) -> Option<Geo
     let (points, normals) = smooth(contour);
     let mut profiles = Vec::new();
     for i in (0..points.len()).step_by(points.len().div_ceil(MAX_PROFILE_SECTIONS).max(1)) {
-        for j in -PROFILE_REACH..=PROFILE_REACH {
+        profiles.extend((-PROFILE_REACH..=PROFILE_REACH).map(|j| {
             let t = j as f32 * 0.5;
-            profiles.push(target.at(
+            target.at(
                 source,
                 Point::new(
                     points[i].x + t * normals[i].x,
                     points[i].y + t * normals[i].y,
                 ),
                 normals[i],
-            ));
-        }
+            )
+        }));
     }
     let energy = profile_energy(&profiles);
     if energy <= 1e-12 {

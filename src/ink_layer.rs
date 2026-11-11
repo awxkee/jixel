@@ -346,7 +346,7 @@ fn joint_split(
     // Strokes are 8-connected: a one-pixel diagonal touches only by corner.
     // Growth is reachability from the seeds, so it is the same set however
     // it is traversed: every band floods its own rows from its own seeds,
-    // and a pixel grown on a band's edge row seeds the neighbouring band in
+    // and a pixel grown on a band's edge row seeds the neighboring band in
     // the next round, until no band grows further.
     let mut bands: Vec<_> = bands
         .into_iter()
@@ -362,8 +362,8 @@ fn joint_split(
                     seeds.push(j);
                 }
             };
-            // Seeds carried from the neighbouring bands have grown there;
-            // only their neighbours in this band remain to be grown.
+            // Seeds carried from the neighboring bands have grown there;
+            // only their neighbors in this band remain to be grown.
             for (i, color) in foreign.drain(..) {
                 for j in neighbors8(i, width, height) {
                     grow(j, color, states, seeds);
@@ -1159,7 +1159,7 @@ fn fill_dont_care_with_iters(
     }
     // Jacobi box diffusion in row bands. A band reads the image rows just
     // outside it from copies taken before each iteration, so it may write
-    // its own rows while its neighbours still read their old values.
+    // its own rows while its neighbors still read their old values.
     let mut bands: Vec<&[(usize, usize, usize)]> = Vec::new();
     let mut rest = rows.as_slice();
     while !rest.is_empty() {
