@@ -41,7 +41,7 @@ use super::dc_groups::{assemble_source_dc, merge_quant_dc, setup_dc_group};
 use super::dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
 };
-use super::extra_channels::prepare_extra_sections;
+use super::extra_channels::{prepare_extra_sections, prepare_extra_sections_lossless};
 use super::header::{
     used_quant_table_slots, write_ac_global, write_dc_global, write_frame_header_kind,
 };
@@ -65,6 +65,10 @@ use crate::image::Image3F;
 use crate::noise::GrainPass;
 use crate::patches::VarDctFrameKind;
 use crate::util::EncodeError;
+
+#[cfg(test)]
+#[path = "vardct_encoder_tests.rs"]
+mod tests;
 
 /// Share of the scan walk the custom coefficient orders must remove before
 /// the refine pass's prices are rebuilt on them.
@@ -121,7 +125,10 @@ fn edge_view(
     let replaced = match frame_kind {
         VarDctFrameKind::Patched(references) => {
             let mut replaced = vec![false; len];
-            for reference in references.iter().filter(|r| !r.add && !r.mul) {
+            for reference in references
+                .iter()
+                .filter(|r| !r.alpha_only && !r.add && !r.mul)
+            {
                 for &(px, py) in &reference.positions {
                     for y in py.min(height)..(py + reference.height).min(height) {
                         replaced[y * width + px.min(width)
@@ -156,6 +163,167 @@ pub(super) fn encode_frame_core(
     grain_pass: GrainPass,
     writer: &mut BitWriter,
 ) -> Result<usize, EncodeError> {
+    // These candidates own reference slot 2 until the final frame. Sampled
+    // rate probes, layered bases and frames with other image features keep
+    // the ordinary path. In particular, probes rescale payload estimates and
+    // must never include an unscaled reference atlas.
+    let eligible = matches!(frame_kind, VarDctFrameKind::Regular)
+        && matches!(grain_pass, GrainPass::Inherit)
+        && ctx.frame_role == FrameRole::Last
+        && ctx.coding.is_xyb()
+        && ctx.speed >= crate::Speed::Slow
+        && !ctx.extra_black
+        && ctx.extra_step == 1
+        && (ctx.alpha_patches || ctx.extra_squeeze_distance > 0.0)
+        && ctx
+            .extra_plane_tree
+            .is_some_and(|budget| !budget.gradient_only)
+        && ctx.grain == crate::Grain::Off
+        && !ctx.progressive_dc
+        && coeff_shifts == [0]
+        && opsin.xsize().saturating_mul(opsin.ysize()) <= 16 * 1024 * 1024;
+    #[cfg(feature = "splines")]
+    let eligible = eligible
+        && splines.is_none()
+        && !ctx.splines
+        && !ctx.edge_splines
+        && !ctx.dots
+        && ctx.overlay_coverage.is_none();
+    let plan = eligible
+        .then(|| crate::alpha_patches::find_alpha_patches(alpha?, opsin.xsize(), opsin.ysize()))
+        .flatten();
+    let Some(plan) = plan else {
+        return encode_frame_core_plain(
+            ctx,
+            scratch,
+            distance,
+            opsin,
+            alpha,
+            coeff_shifts,
+            frame_kind,
+            #[cfg(feature = "splines")]
+            splines,
+            #[cfg(feature = "splines")]
+            allow_edge_splines,
+            grain_pass,
+            writer,
+        );
+    };
+
+    // Keep the incumbent complete frame, including its incoming bit offset.
+    // The candidates may change the shared DC entropy bundle, so comparing
+    // extra-channel estimates alone is insufficient to prevent file growth.
+    let mut best = writer.clone();
+    let mut best_payload = encode_frame_core_plain(
+        ctx,
+        scratch,
+        distance,
+        opsin.clone(),
+        alpha,
+        coeff_shifts,
+        frame_kind,
+        #[cfg(feature = "splines")]
+        splines,
+        #[cfg(feature = "splines")]
+        allow_edge_splines,
+        grain_pass,
+        &mut best,
+    )?;
+    let mut candidate_scratch = CoderScratch::default();
+    if ctx.extra_squeeze_distance > 0.0 {
+        // A repeated mask can violate the fixed fourfold bound used to
+        // screen its learned exact tree. Compare the actual exact-alpha
+        // frame, retaining the incumbent when exact coding costs more.
+        let mut exact = writer.clone();
+        if let Ok((payload, _)) = encode_frame_core_inner(
+            ctx,
+            &mut candidate_scratch,
+            distance,
+            opsin.clone(),
+            alpha,
+            ExtraCoding {
+                alpha: None,
+                lossless: true,
+            },
+            coeff_shifts,
+            frame_kind,
+            #[cfg(feature = "splines")]
+            splines,
+            #[cfg(feature = "splines")]
+            false,
+            GrainPass::Off,
+            &mut exact,
+        ) && exact.bits_written() < best.bits_written()
+        {
+            best = exact;
+            best_payload = payload;
+        }
+    }
+
+    if !ctx.alpha_patches {
+        *writer = best;
+        return Ok(best_payload);
+    }
+    let mut patched = writer.clone();
+    let start = patched.bits_written();
+    let channels = std::array::from_fn(|_| vec![0; plan.atlas_width * plan.atlas_height]);
+    if crate::lossless::encode_modular_xyb_atlas_tree(
+        &channels,
+        plan.atlas_width,
+        plan.atlas_height,
+        Some(&plan.atlas_alpha),
+        ctx.speed,
+        &ctx.thread_pool,
+        &mut candidate_scratch,
+        &mut patched,
+    ) {
+        let atlas_bits = patched.bits_written() - start;
+        // Color visibility always reads the target alpha. The substituted
+        // base samples are only the entropy representation of that channel.
+        if let Ok((payload, _)) = encode_frame_core_inner(
+            ctx,
+            &mut candidate_scratch,
+            distance,
+            opsin,
+            alpha,
+            ExtraCoding {
+                alpha: Some(&plan.base_alpha),
+                lossless: true,
+            },
+            coeff_shifts,
+            VarDctFrameKind::Patched(&plan.references),
+            #[cfg(feature = "splines")]
+            None,
+            #[cfg(feature = "splines")]
+            false,
+            GrainPass::Off,
+            &mut patched,
+        ) && patched.bits_written() < best.bits_written()
+        {
+            best = patched;
+            best_payload = payload + atlas_bits;
+        }
+    }
+    *writer = best;
+    Ok(best_payload)
+}
+
+/// Grain handling shared by the ordinary frame and the incumbent of the
+/// repeated-alpha representation race.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_core_plain(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    opsin: Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    frame_kind: VarDctFrameKind<'_>,
+    #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
+    #[cfg(feature = "splines")] allow_edge_splines: bool,
+    grain_pass: GrainPass,
+    writer: &mut BitWriter,
+) -> Result<usize, EncodeError> {
     let displayed = matches!(
         frame_kind,
         VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
@@ -173,6 +341,7 @@ pub(super) fn encode_frame_core(
             distance,
             opsin,
             alpha,
+            ExtraCoding::default(),
             coeff_shifts,
             frame_kind,
             #[cfg(feature = "splines")]
@@ -195,6 +364,7 @@ pub(super) fn encode_frame_core(
             distance,
             original,
             alpha,
+            ExtraCoding::default(),
             coeff_shifts,
             frame_kind,
             #[cfg(feature = "splines")]
@@ -212,6 +382,7 @@ pub(super) fn encode_frame_core(
         distance,
         opsin,
         alpha,
+        ExtraCoding::default(),
         coeff_shifts,
         frame_kind,
         #[cfg(feature = "splines")]
@@ -224,12 +395,27 @@ pub(super) fn encode_frame_core(
     .map(|(bits, _)| bits)
 }
 
+#[derive(Clone, Copy, Default)]
+struct ExtraCoding<'a> {
+    alpha: Option<&'a AlphaPlane>,
+    lossless: bool,
+}
+
+fn color_is_unpatched(frame_kind: VarDctFrameKind<'_>) -> bool {
+    match frame_kind {
+        VarDctFrameKind::Regular => true,
+        VarDctFrameKind::Patched(references) => references.iter().all(|r| r.alpha_only),
+        VarDctFrameKind::ReferenceOnly { .. } => false,
+    }
+}
+
 fn encode_frame_core_inner(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
     opsin: Image3F,
     alpha: Option<&AlphaPlane>,
+    extra_coding: ExtraCoding<'_>,
     coeff_shifts: &[u32],
     frame_kind: VarDctFrameKind<'_>,
     #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
@@ -429,7 +615,7 @@ fn encode_frame_core_inner(
     // Layer residuals and progressive/DC frames retain the EPF schedule.
     let fit_epf = ctx.speed.effort().epf_fit
         && ctx.coding.is_xyb()
-        && matches!(frame_kind, VarDctFrameKind::Regular)
+        && color_is_unpatched(frame_kind)
         && ctx.frame_role == FrameRole::Last
         && !use_dc_frame
         && num_passes == 1
@@ -772,7 +958,7 @@ fn encode_frame_core_inner(
                 epf_recon.is_some(),
                 // Patch atlases and reference frames are judged by the
                 // frames that use them, not by their own reconstruction.
-                if matches!(frame_kind, VarDctFrameKind::Regular)
+                if color_is_unpatched(frame_kind)
                     && !crate::ac_strategy::content_selection_enabled(ctx, distance)
                 {
                     Some(&mut reselect)
@@ -1176,8 +1362,13 @@ fn encode_frame_core_inner(
     let (extra, (ac_plan, ac_code_per_pass, raced_ac_sections, coeff_orders, all_pending)) =
         ctx.thread_pool.join(
             || {
-                alpha.map(|plane| {
-                    prepare_extra_sections(
+                extra_coding.alpha.or(alpha).map(|plane| {
+                    let prepare = if extra_coding.lossless {
+                        prepare_extra_sections_lossless
+                    } else {
+                        prepare_extra_sections
+                    };
+                    prepare(
                         ctx,
                         plane,
                         &dim,

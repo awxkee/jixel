@@ -59,6 +59,10 @@ const VARDCT_GROUP_DIM: usize = 256;
 
 const VARDCT_LF_GROUP_DIM: usize = 2048;
 
+/// How far above the sample range a black plate's no-ink samples (the top
+/// value: K is stored inverted) enter the squeeze, in 8-bit units.
+const BLACK_NO_INK_BIAS: f32 = 4.0;
+
 /// One extra channel squeezed and quantized like the lossy-modular arm's luma
 /// row, coded in the modular streams of a VarDCT frame. The frame's global
 /// tree belongs to the VarDCT DC, so nonempty extra-channel streams carry
@@ -80,7 +84,9 @@ pub(crate) struct ExtraSqueeze {
 
 impl ExtraSqueeze {
     /// `distance` is in luma-quantizer units; `max` is the channel's largest
-    /// sample. None when the plane is too small to squeeze.
+    /// sample. A `black_plate` (CMYK's K) codes its no-ink samples
+    /// [`BLACK_NO_INK_BIAS`] above the range. None when the plane is too small
+    /// to squeeze.
     pub(crate) fn new(
         plane: &AlphaPlane,
         xsize: usize,
@@ -88,6 +94,7 @@ impl ExtraSqueeze {
         distance: f32,
         learned_trees: bool,
         context_trees: bool,
+        black_plate: bool,
     ) -> Option<Self> {
         use crate::squeeze::{Channel, apply_step_forward, lossy_shared_steps};
         let steps = lossy_shared_steps(xsize, ysize, 1);
@@ -99,7 +106,14 @@ impl ExtraSqueeze {
             AlphaPlane::U16 { bits, .. } => ((1u32 << *bits) - 1) as f32,
             AlphaPlane::F32(_) => return None,
         };
-        let data = plane.to_i32_vec(xsize * ysize);
+        let mut data = plane.to_i32_vec(xsize * ysize);
+        if black_plate {
+            let top = max as i32;
+            let bias = (BLACK_NO_INK_BIAS * max / 255.0).round() as i32;
+            data.iter_mut()
+                .filter(|v| **v == top)
+                .for_each(|v| *v = top + bias);
+        }
         let mut channels = vec![Channel {
             data,
             w: xsize,

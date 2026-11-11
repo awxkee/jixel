@@ -126,8 +126,16 @@ fn remap(streams: &[Vec<Token>], map: &[u32]) -> Vec<Vec<Token>> {
         .collect()
 }
 
-fn ans_bits(tokens: &[Token], code: &EntropyCode) -> usize {
+/// Bits of `tokens` under `code`, ANS or prefix coded. A prefix-coded frame
+/// prices its local DC and metadata streams with its own prefix codes.
+fn code_bits(tokens: &[Token], code: &EntropyCode) -> usize {
     let mut w = BitWriter::new();
+    if code.use_prefix_code {
+        for &t in tokens {
+            crate::entropy::write_token(t, code, &mut w);
+        }
+        return w.bits_written();
+    }
     crate::entropy::write_ans_tokens(
         tokens,
         code.context_map,
@@ -227,6 +235,11 @@ impl GlobalExtraTree {
 /// one), merge it beside the DC tree and price the frame's DC, metadata and
 /// extra streams under the joint code against the local codings in `extra`.
 /// `None` when the local codings are smaller.
+///
+/// A frame whose DC code is prefix coded is planned too: the joint code is
+/// always ANS, so winning switches the DC streams to it. Without this, a
+/// small image's prefix DC kept exact alpha on its fixed local streams, which
+/// cost up to 20 times the learned tree (72 vs 3.5 kB on a repeated mask).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_global_extra_tree(
     ctx: &EncodingContext,
@@ -238,7 +251,7 @@ pub(super) fn plan_global_extra_tree(
     extra: &ExtraSections,
     scratch: &mut CoderScratch,
 ) -> Option<GlobalExtraTree> {
-    if matches!(plane, AlphaPlane::F32(_)) || streams.code.use_prefix_code {
+    if matches!(plane, AlphaPlane::F32(_)) {
         return None;
     }
     let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
@@ -396,13 +409,13 @@ fn plan_joint(
                       meta: &[Vec<Token>],
                       scratch: &mut CoderScratch| {
         let dc_bits: usize = if streams.dc_written {
-            dc.iter().map(|s| ans_bits(s, code)).sum()
+            dc.iter().map(|s| code_bits(s, code)).sum()
         } else {
             0
         };
         header_bits(tree, code, scratch)
             + dc_bits
-            + meta.iter().map(|s| ans_bits(s, code)).sum::<usize>()
+            + meta.iter().map(|s| code_bits(s, code)).sum::<usize>()
     };
     let local_bits = frame_bits(
         &dc_tokens,

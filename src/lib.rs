@@ -38,6 +38,7 @@ mod ac_context;
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod alpha_patches;
 mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;

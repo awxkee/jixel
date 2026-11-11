@@ -439,9 +439,12 @@ fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Ve
                 tokens.push(Token::new(PATCH_OFFSET, pack_signed(y as i32 - py as i32)));
             }
             // color = Mul (3), Add (2) or Replace (1); Mul also signals clamp = false
+            let alpha_only = reference.alpha_only;
             tokens.push(Token::new(
                 BLEND_MODE,
-                if reference.mul {
+                if alpha_only {
+                    0
+                } else if reference.mul {
                     3
                 } else if reference.add {
                     2
@@ -453,7 +456,7 @@ fn patch_dictionary_tokens(references: &[PatchReference], has_alpha: bool) -> Ve
                 tokens.push(Token::new(CLAMP, 0));
             }
             if has_alpha {
-                tokens.push(Token::new(BLEND_MODE, 0)); // alpha = None
+                tokens.push(Token::new(BLEND_MODE, if alpha_only { 1 } else { 0 }));
             }
         }
     }
@@ -560,6 +563,7 @@ mod tests {
             width: 8,
             height: 10,
             ref_frame: PATCH_REF_ID,
+            alpha_only: false,
             add,
             mul: false,
             positions,
@@ -572,6 +576,20 @@ mod tests {
             .map(|k| (k * 37 % n, k))
             .map(|(a, _)| ((a % 25) * 20, (a / 25) * 20))
             .collect()
+    }
+
+    #[test]
+    fn alpha_patch_keeps_color_patch_operations_independent() {
+        let color = entry(vec![(0, 0)], false);
+        let mut alpha = entry(vec![(20, 0)], false);
+        alpha.alpha_only = true;
+        let tokens = patch_dictionary_tokens(&[color, alpha], true);
+        let modes: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.context == 5)
+            .map(|t| t.value)
+            .collect();
+        assert_eq!(modes, [1, 0, 0, 1]); // color Replace/A None; color None/A Replace
     }
 
     #[test]
