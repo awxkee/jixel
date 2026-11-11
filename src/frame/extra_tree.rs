@@ -194,6 +194,7 @@ pub(super) struct GlobalStreams<'a> {
 /// A joint coding of the frame's DC, metadata and extra streams that beats
 /// the local trees: the merged tree, its code, the remapped DC streams and
 /// the extra channel's sections.
+#[derive(Clone)]
 pub(super) struct GlobalExtraTree {
     tree: Vec<Token>,
     code: OwnedEntropyCode,

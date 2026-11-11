@@ -357,6 +357,35 @@ pub struct EncodeConfig {
     /// so solid and hard-edged alpha stays exact. Values are clamped to
     /// `0.0..=25.0`; NaN means lossless. Ignored when `lossless` is true.
     pub alpha_distance: Option<f32>,
+    /// Nested Palette/profile coding of coherent alpha gradients (8- to
+    /// 16-bit) and 8-bit CMYK black plates in single-pass VarDCT frames of at
+    /// most 8 MP, at
+    /// [`Speed::Medium`] and above, in any color space (with an ICC profile
+    /// only the single-frame form below). Fits bounded
+    /// whole-plane models and keeps the ordinary coding unless a model is
+    /// smaller and passes the sample/perceptual checks. Lossless alpha
+    /// permits only exact models. Defaults to true; planes without such
+    /// structure are screened out in a few milliseconds.
+    ///
+    /// With lossy alpha, a plane that a function explains only in part (a
+    /// glow around a hard-edged shape, rings) may instead be written as two
+    /// layers: an undisplayed base frame holding the function and the
+    /// displayed frame holding the lossy residual, added to it by the
+    /// decoder (extra-channel `kAdd` blending). It is kept only when its
+    /// coding is smaller and a multi-scale SSIM proxy, pooled over the alpha
+    /// plane and its lightness composites over black and white, does not
+    /// drop against the ordinary coding ([`Speed::ExtraSlow`] with the
+    /// `extraslow` Cargo feature asks SSIMULACRA2 and CVVDP instead, on SDR
+    /// sRGB input). The
+    /// residual may also be coded with its misfits of one or two code values
+    /// dropped. A plane that repeats one tile on a grid (a pattern mask)
+    /// takes the same form with the tile as the function and the samples
+    /// that break the repetition coded exactly; this one also applies to
+    /// lossless alpha.
+    ///
+    /// Uses standard delta-palette syntax that jxl-oxide 0.12.6 does not decode
+    /// correctly; libjxl and jxl-rs support it.
+    pub function_fields: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -601,6 +630,7 @@ impl Default for EncodeConfig {
             lossless: false,
             fill_invisible: true,
             alpha_distance: None,
+            function_fields: true,
             progressive: false,
             patches: false,
             upsampling: false,
@@ -962,6 +992,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Function-like extra-channel coding (see
+    /// [`EncodeConfig::function_fields`]). Enabled by default.
+    pub fn with_function_fields(mut self, enabled: bool) -> Self {
+        self.function_fields = enabled;
+        self
+    }
+
     /// Enable progressive lossless. Only effective when `lossless`.
     pub fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
@@ -1220,6 +1257,28 @@ pub(crate) fn lossy_context(
     ctx.extra_plane_tree = alpha_plane_tree(config.speed, config.decoding_speed);
     ctx.extra_context_trees = config.decoding_speed != DecodingSpeed::Fastest;
     ctx.alpha_patches = config.patches;
+    // The representation is color-agnostic: the plane is judged against its
+    // own ordinary coding, on views that need no color management.
+    ctx.function_fields = config.function_fields
+        && config.speed >= Speed::Medium
+        && pixels <= crate::function_fields::MAX_PIXELS
+        && config.grain == Grain::Off
+        && !config.progressive_dc
+        && progressive_schedule(
+            config.progressive,
+            config.progressive_passes,
+            config.progressive_shifts.as_deref(),
+        ) == [0]
+        && config.decoding_speed == DecodingSpeed::Slow;
+    ctx.function_fields_layered = ctx.function_fields && config.icc_profile.is_none();
+    ctx.function_fields_exact = ctx.function_fields
+        && cfg!(feature = "extraslow")
+        && config.speed >= Speed::ExtraSlow
+        && config.icc_profile.is_none()
+        && config.color_encoding.primaries == crate::Primaries::Bt709
+        && config.color_encoding.white_point == crate::WhitePoint::D65
+        && config.color_encoding.transfer == crate::TransferFunction::Srgb
+        && config.intensity_target.is_none_or(|nits| nits <= 255.0);
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
@@ -5785,5 +5844,48 @@ mod lossy_alpha_tests {
             .with_distance(1.5);
         let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
         assert!(bytes < 3150, "{bytes}");
+    }
+
+    #[test]
+    fn function_fields_default_on_where_supported() {
+        for (speed, supported) in [
+            (Speed::Fast, false),
+            (Speed::Medium, true),
+            (Speed::Slow, true),
+            (Speed::ExtraSlow, true),
+        ] {
+            let config = EncodeConfig::default()
+                .with_speed(speed)
+                .with_num_threads(1);
+            assert!(config.function_fields);
+            assert_eq!(
+                lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields,
+                supported,
+                "{speed:?}"
+            );
+            let off = config.with_function_fields(false);
+            assert!(!lossy_context(&off, 1.5, XybMatrix::SPEC, 65536).function_fields);
+        }
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_num_threads(1);
+        assert!(
+            !lossy_context(
+                &config.clone().with_progressive(true),
+                1.5,
+                XybMatrix::SPEC,
+                65536
+            )
+            .function_fields
+        );
+        assert!(
+            !lossy_context(
+                &config,
+                1.5,
+                XybMatrix::SPEC,
+                crate::function_fields::MAX_PIXELS + 1
+            )
+            .function_fields
+        );
     }
 }

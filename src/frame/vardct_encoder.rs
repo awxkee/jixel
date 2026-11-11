@@ -65,6 +65,7 @@ use crate::image::Image3F;
 use crate::noise::GrainPass;
 use crate::patches::VarDctFrameKind;
 use crate::util::EncodeError;
+use std::borrow::Cow;
 
 #[cfg(test)]
 #[path = "vardct_encoder_tests.rs"]
@@ -163,6 +164,343 @@ pub(super) fn encode_frame_core(
     grain_pass: GrainPass,
     writer: &mut BitWriter,
 ) -> Result<usize, EncodeError> {
+    {
+        // Color patches keep their atlas in another reference slot and
+        // leave the extra channel alone, so they combine with either form.
+        let eligible = ctx.function_fields
+            && match frame_kind {
+                VarDctFrameKind::Regular => true,
+                VarDctFrameKind::Patched(references) => {
+                    references.iter().all(|r| !r.alpha_only && r.ref_frame != 0)
+                }
+                VarDctFrameKind::ReferenceOnly { .. } => false,
+            }
+            && matches!(grain_pass, GrainPass::Inherit)
+            && ctx.frame_role == FrameRole::Last
+            && (ctx.coding.is_xyb() || ctx.extra_black)
+            && ctx.speed >= crate::Speed::Medium
+            && ctx.extra_step == 1
+            && ctx.grain == crate::Grain::Off
+            && !ctx.progressive_dc
+            && coeff_shifts == [0]
+            && opsin.xsize().saturating_mul(opsin.ysize()) <= crate::function_fields::MAX_PIXELS;
+        #[cfg(feature = "splines")]
+        let eligible = eligible
+            && splines.is_none()
+            && !ctx.splines
+            && !ctx.edge_splines
+            && !ctx.dots
+            && ctx.overlay_coverage.is_none();
+        if eligible && let Some(source @ (AlphaPlane::U8(_) | AlphaPlane::U16 { .. })) = alpha {
+            let (width, height) = (opsin.xsize(), opsin.ysize());
+            // Deeper planes take their geometry from the 8-bit fits and keep
+            // their own profile, residual and judge.
+            let deep = matches!(source, AlphaPlane::U16 { .. });
+            let fits: Vec<_> = crate::function_fields::fit(source, width, height)
+                .into_iter()
+                .filter(|fit| {
+                    fit.max_error <= 2
+                        && (ctx.extra_squeeze_distance > 0.0 || fit.squared_error == 0)
+                })
+                .collect();
+            // A function that only explains most of the plane: its misfit is
+            // coded as an ordinary lossy residual in the displayed frame and
+            // added to a base frame holding the function. K plates (no-ink
+            // bias) keep the single-frame candidates.
+            // A repeated tile is the same construction with an exactly coded
+            // residual, so it also serves exact requests.
+            let lossy = ctx.extra_squeeze_distance > 0.0;
+            let residual_fit =
+                (ctx.function_fields_layered && ctx.coding.is_xyb() && !ctx.extra_black)
+                    .then(|| {
+                        if deep {
+                            return crate::function_fields_deep::fit(
+                                &ctx.thread_pool,
+                                source,
+                                width,
+                                height,
+                                lossy,
+                            );
+                        }
+                        let (periodic, smooth) = ctx.thread_pool.join(
+                            || crate::function_fields::fit_periodic(source, width, height),
+                            || {
+                                lossy
+                                    .then(|| {
+                                        crate::function_fields::fit_residual(
+                                            &ctx.thread_pool,
+                                            source,
+                                            width,
+                                            height,
+                                        )
+                                    })
+                                    .flatten()
+                            },
+                        );
+                        periodic.or(smooth)
+                    })
+                    .flatten();
+            if !fits.is_empty() || residual_fit.is_some() {
+                let repeated = !ctx.extra_black
+                    && crate::alpha_patches::find_alpha_patches(source, width, height).is_some();
+                // The base frame holds the function; its size is part of
+                // every candidate that adds a residual to it.
+                let based = residual_fit.as_ref().and_then(|fit| {
+                    let mut candidate_scratch = CoderScratch::default();
+                    let mut based = writer.clone();
+                    let start = based.bits_written();
+                    // Black color and a self-contained extra channel: nothing
+                    // in this frame rewards effort, so it is coded on a
+                    // minimal context of its own.
+                    let base_ctx = EncodingContext::new(
+                        crate::Speed::Fastest,
+                        ctx.arbiter,
+                        ctx.xyb,
+                        distance,
+                        ctx.thread_pool.num_threads(),
+                    );
+                    encode_frame_core_inner(
+                        &base_ctx,
+                        &mut candidate_scratch,
+                        distance,
+                        Cow::Owned(Image3F::new(width, height)),
+                        Some(&fit.base.reconstructed),
+                        ExtraCoding {
+                            profile: Some(&fit.base),
+                            role: Some(FrameRole::SavedFirst),
+                            ..ExtraCoding::default()
+                        },
+                        coeff_shifts,
+                        VarDctFrameKind::Regular,
+                        #[cfg(feature = "splines")]
+                        None,
+                        #[cfg(feature = "splines")]
+                        false,
+                        GrainPass::Off,
+                        &mut based,
+                    )
+                    .ok()?;
+                    let bits = based.bits_written() - start;
+                    Some((based, bits))
+                });
+                // (dead zone, distance scale). The function's own misfit and
+                // the source's rounding noise are what a fine residual spends
+                // its bits on: either drop residuals within the dead zone,
+                // which leaves a sparse plane the exact coder takes, or keep
+                // them all and quantize, a little finer when the nominal
+                // distance scores below the incumbent.
+                let smooth = [(2u8, 1.0f32), (0, 1.0), (1, 1.0), (0, 0.8), (0, 0.65)];
+                let zoned: Vec<AlphaPlane> = match &residual_fit {
+                    Some(fit) if !fit.periodic && based.is_some() => smooth
+                        .iter()
+                        .filter(|&&(zone, _)| zone != 0)
+                        .map(|&(zone, _)| {
+                            if deep {
+                                crate::function_fields_deep::dead_zone(fit, source, zone)
+                            } else {
+                                fit.dead_zone(source, zone)
+                            }
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut alternatives: Vec<ExtraAlternative<'_>> =
+                    fits.iter().map(ExtraAlternative::Nested).collect();
+                let mut zone_indices = [None; 3];
+                if let (Some(fit), Some(_)) = (&residual_fit, &based) {
+                    if fit.periodic {
+                        // What a tile misses is sparse and always coded
+                        // exactly: a pattern mask the ordinary path keeps
+                        // exact stays so.
+                        alternatives.push(ExtraAlternative::Plane {
+                            plane: &fit.residual,
+                            lossless: true,
+                            scale: 1.0,
+                            based: true,
+                        });
+                    } else {
+                        let mut zones = zoned.iter();
+                        for (zone, scale) in smooth {
+                            if scale == 1.0 {
+                                zone_indices[[1, 2, 0][usize::from(zone)]] =
+                                    Some(alternatives.len());
+                            }
+                            alternatives.push(ExtraAlternative::Plane {
+                                plane: if zone == 0 {
+                                    &fit.residual
+                                } else {
+                                    zones.next().expect("one plane per dead zone")
+                                },
+                                lossless: false,
+                                scale,
+                                based: true,
+                            });
+                        }
+                    }
+                }
+                // The exact coding a repeated mask is raced against in the
+                // ordinary path.
+                let exact_source = (repeated && lossy && ctx.speed >= crate::Speed::Slow)
+                    .then_some(alternatives.len());
+                if exact_source.is_some() {
+                    alternatives.push(ExtraAlternative::Plane {
+                        plane: source,
+                        lossless: true,
+                        scale: 1.0,
+                        based: false,
+                    });
+                }
+                let color = &opsin;
+                let incumbent_scores = super::function_quality::GateCache::default();
+                let deep_scores = crate::function_fields_deep::GateCache::default();
+                let judge = |index: usize, incumbent: &AlphaPlane, coded: &AlphaPlane| {
+                    if Some(index) == exact_source {
+                        return Some(0.0);
+                    }
+                    match (&alternatives[index], &residual_fit) {
+                        (ExtraAlternative::Nested(fit), _) => super::function_quality::score(
+                            ctx,
+                            color,
+                            source,
+                            incumbent,
+                            &fit.reconstructed,
+                            false,
+                            &incumbent_scores,
+                        ),
+                        (ExtraAlternative::Plane { .. }, Some(fit)) if deep => {
+                            crate::function_fields_deep::compose(fit, coded).and_then(|decoded| {
+                                crate::function_fields_deep::score(
+                                    ctx,
+                                    color,
+                                    source,
+                                    incumbent,
+                                    &decoded,
+                                    &deep_scores,
+                                )
+                            })
+                        }
+                        (ExtraAlternative::Plane { .. }, Some(fit)) => {
+                            fit.compose(coded).and_then(|decoded| {
+                                super::function_quality::score(
+                                    ctx,
+                                    color,
+                                    source,
+                                    incumbent,
+                                    &decoded,
+                                    true,
+                                    &incumbent_scores,
+                                )
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                let (based_writer, base_bits) = match based {
+                    Some((writer, bits)) => (Some(writer), bits),
+                    None => (None, 0),
+                };
+                let race = ExtraRace {
+                    alternatives: &alternatives,
+                    base_bits,
+                    judge: &judge,
+                    based: std::sync::Mutex::new(based_writer),
+                    chosen: std::sync::Mutex::new(None),
+                    zones: match zone_indices {
+                        [Some(strong), Some(none), Some(weak)] => Some([strong, none, weak]),
+                        _ => None,
+                    },
+                };
+                // One frame encode: color is coded once and every extra
+                // coding is costed against the same DC streams.
+                let mut best = writer.clone();
+                let (mut payload, _) = encode_frame_core_inner(
+                    ctx,
+                    scratch,
+                    distance,
+                    Cow::Borrowed(&opsin),
+                    alpha,
+                    ExtraCoding {
+                        race: Some(&race),
+                        ..ExtraCoding::default()
+                    },
+                    coeff_shifts,
+                    frame_kind,
+                    #[cfg(feature = "splines")]
+                    splines,
+                    #[cfg(feature = "splines")]
+                    allow_edge_splines,
+                    GrainPass::Off,
+                    &mut best,
+                )?;
+                let chosen = race.chosen.lock().ok().and_then(|chosen| *chosen);
+                if chosen.is_some_and(|index| alternatives[index].based()) {
+                    payload += base_bits;
+                }
+                drop(race);
+                drop(alternatives);
+                drop((incumbent_scores, zoned, residual_fit, fits));
+                // With alpha patches on, a repeated mask may do better as an
+                // atlas: that needs its own frames.
+                if repeated && ctx.alpha_patches {
+                    let mut masked = writer.clone();
+                    let masked_payload = encode_frame_core_masks(
+                        ctx,
+                        scratch,
+                        distance,
+                        opsin,
+                        alpha,
+                        coeff_shifts,
+                        frame_kind,
+                        #[cfg(feature = "splines")]
+                        splines,
+                        #[cfg(feature = "splines")]
+                        allow_edge_splines,
+                        GrainPass::Inherit,
+                        &mut masked,
+                    )?;
+                    if masked.bits_written() < best.bits_written() {
+                        best = masked;
+                        payload = masked_payload;
+                    }
+                }
+                *writer = best;
+                return Ok(payload);
+            }
+        }
+    }
+    encode_frame_core_masks(
+        ctx,
+        scratch,
+        distance,
+        opsin,
+        alpha,
+        coeff_shifts,
+        frame_kind,
+        #[cfg(feature = "splines")]
+        splines,
+        #[cfg(feature = "splines")]
+        allow_edge_splines,
+        grain_pass,
+        writer,
+    )
+}
+
+/// The ordinary frame, raced against the exact and atlas codings of a
+/// repeated coverage mask.
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_core_masks(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    opsin: Image3F,
+    alpha: Option<&AlphaPlane>,
+    coeff_shifts: &[u32],
+    frame_kind: VarDctFrameKind<'_>,
+    #[cfg(feature = "splines")] splines: Option<&crate::splines::SplineSet>,
+    #[cfg(feature = "splines")] allow_edge_splines: bool,
+    grain_pass: GrainPass,
+    writer: &mut BitWriter,
+) -> Result<usize, EncodeError> {
     // These candidates own reference slot 2 until the final frame. Sampled
     // rate probes, layered bases and frames with other image features keep
     // the ordinary path. In particular, probes rescale payload estimates and
@@ -239,11 +577,12 @@ pub(super) fn encode_frame_core(
             ctx,
             &mut candidate_scratch,
             distance,
-            opsin.clone(),
+            Cow::Owned(opsin.clone()),
             alpha,
             ExtraCoding {
                 alpha: None,
                 lossless: true,
+                ..ExtraCoding::default()
             },
             coeff_shifts,
             frame_kind,
@@ -284,11 +623,12 @@ pub(super) fn encode_frame_core(
             ctx,
             &mut candidate_scratch,
             distance,
-            opsin,
+            Cow::Owned(opsin),
             alpha,
             ExtraCoding {
                 alpha: Some(&plan.base_alpha),
                 lossless: true,
+                ..ExtraCoding::default()
             },
             coeff_shifts,
             VarDctFrameKind::Patched(&plan.references),
@@ -339,7 +679,7 @@ fn encode_frame_core_plain(
             ctx,
             scratch,
             distance,
-            opsin,
+            Cow::Owned(opsin),
             alpha,
             ExtraCoding::default(),
             coeff_shifts,
@@ -362,7 +702,7 @@ fn encode_frame_core_plain(
             ctx,
             scratch,
             distance,
-            original,
+            Cow::Owned(original),
             alpha,
             ExtraCoding::default(),
             coeff_shifts,
@@ -380,7 +720,7 @@ fn encode_frame_core_plain(
         ctx,
         scratch,
         distance,
-        opsin,
+        Cow::Owned(opsin),
         alpha,
         ExtraCoding::default(),
         coeff_shifts,
@@ -395,10 +735,61 @@ fn encode_frame_core_plain(
     .map(|(bits, _)| bits)
 }
 
+/// Largest plane whose extra-channel alternatives are costed side by side.
+const PARALLEL_RACE_PIXELS: usize = 2 * 1024 * 1024;
+
+/// Another coding of the frame's extra channel, costed beside the ordinary
+/// one inside a single frame encode.
+#[derive(Clone, Copy)]
+enum ExtraAlternative<'a> {
+    /// `plane` through the ordinary extra-channel coder; `based` planes are
+    /// residuals the decoder adds to the function frame in slot 0.
+    Plane {
+        plane: &'a AlphaPlane,
+        lossless: bool,
+        scale: f32,
+        based: bool,
+    },
+    /// A whole-plane function in this frame.
+    Nested(&'a crate::function_fields::FittedProfile),
+}
+
+impl ExtraAlternative<'_> {
+    fn based(&self) -> bool {
+        matches!(self, Self::Plane { based: true, .. })
+    }
+
+    /// Only costed when no first-round alternative passes the judge.
+    fn fallback(&self) -> bool {
+        matches!(self, Self::Plane { scale, lossless: false, .. } if *scale != 1.0)
+    }
+}
+
+struct ExtraRace<'a> {
+    alternatives: &'a [ExtraAlternative<'a>],
+    /// Size of the base frame every `based` alternative also pays.
+    base_bits: usize,
+    /// `(alternative, incumbent samples, alternative's coded samples)`:
+    /// `None` when the alternative may not replace the ordinary coding,
+    /// otherwise its distance from the source (lower is better).
+    judge: &'a (dyn Fn(usize, &AlphaPlane, &AlphaPlane) -> Option<f64> + Sync),
+    /// The incoming bits followed by the base frame; the displayed frame is
+    /// written after it when a `based` alternative wins.
+    based: std::sync::Mutex<Option<BitWriter>>,
+    chosen: std::sync::Mutex<Option<usize>>,
+    /// `[strong dead zone, none, weak dead zone]` among the alternatives: the
+    /// weak one codes like the other two wherever those two code alike.
+    zones: Option<[usize; 3]>,
+}
+
 #[derive(Clone, Copy, Default)]
 struct ExtraCoding<'a> {
     alpha: Option<&'a AlphaPlane>,
     lossless: bool,
+    profile: Option<&'a crate::function_fields::FittedProfile>,
+    /// Frame header role when it differs from the context's.
+    role: Option<FrameRole>,
+    race: Option<&'a ExtraRace<'a>>,
 }
 
 fn color_is_unpatched(frame_kind: VarDctFrameKind<'_>) -> bool {
@@ -413,7 +804,7 @@ fn encode_frame_core_inner(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
-    opsin: Image3F,
+    opsin: Cow<'_, Image3F>,
     alpha: Option<&AlphaPlane>,
     extra_coding: ExtraCoding<'_>,
     coeff_shifts: &[u32],
@@ -441,11 +832,11 @@ fn encode_frame_core_inner(
     let mut noise = match &grain_pass {
         GrainPass::Off | GrainPass::Probe(_) => None,
         GrainPass::Apply(measured, _, weight) if displayed => {
-            crate::noise::apply_measured(ctx, scratch, distance, &mut opsin, *measured, *weight)
+            crate::noise::apply_measured(ctx, scratch, distance, opsin.to_mut(), *measured, *weight)
         }
         GrainPass::Apply(..) => None,
         GrainPass::Inherit if displayed => {
-            crate::noise::NoiseParams::resolve(ctx.grain, ctx, scratch, distance, &mut opsin)
+            crate::noise::NoiseParams::resolve(ctx.grain, ctx, scratch, distance, opsin.to_mut())
         }
         GrainPass::Inherit => None,
     };
@@ -523,7 +914,7 @@ fn encode_frame_core_inner(
         crate::splines::select_edges(
             ctx,
             scratch,
-            opsin_image.as_mut().unwrap(),
+            opsin_image.as_mut().unwrap().to_mut(),
             &provisional,
             crate::splines::edge_model::Quantization {
                 distance,
@@ -1156,10 +1547,13 @@ fn encode_frame_core_inner(
             // Source pixel decisions are complete. The EPF proxy needs only Y;
             // release X/B before allocating its pyramid and candidate output.
             // A Gaborish source also replaces the original source altogether.
-            let source = source.unwrap_or_else(|| opsin_image.take().unwrap());
-            drop(opsin_image.take());
-            let [source_x, source_y, source_b] = source.into_planes();
-            drop((source_x, source_b));
+            let source_y = match (source, opsin_image.take().unwrap()) {
+                (Some(source), _) | (None, Cow::Owned(source)) => {
+                    let [_, y, _] = source.into_planes();
+                    Cow::Owned(y)
+                }
+                (None, Cow::Borrowed(source)) => Cow::Borrowed(source.plane(1)),
+            };
             #[cfg(feature = "splines")]
             // Splines are drawn after the filter: the fit sees them as a layer.
             let spline_layer =
@@ -1363,27 +1757,328 @@ fn encode_frame_core_inner(
         ctx.thread_pool.join(
             || {
                 extra_coding.alpha.or(alpha).map(|plane| {
-                    let prepare = if extra_coding.lossless {
-                        prepare_extra_sections_lossless
-                    } else {
-                        prepare_extra_sections
+                    let snapshot = extra_coding.race.map(|_| {
+                        (
+                            dc_tree.clone(),
+                            dc_code_owned.clone(),
+                            dc_tokens_per_group.clone(),
+                            meta_tokens_per_group.clone(),
+                        )
+                    });
+                    // Ordinary extra codings can merge their own DC tree.
+                    // Nested profiles use the original DC streams directly.
+                    let race = extra_coding.race;
+                    let levels_memo = super::extra_channels::LevelsMemo::default();
+                    let cost = |indices: &[usize]| {
+                        let Some((race, snapshot)) = race.zip(snapshot.as_ref()) else {
+                            return Vec::new();
+                        };
+                        let job = |slot: usize| {
+                            let index = indices[slot];
+                            let alternative = &race.alternatives[index];
+                            let mut scratch = CoderScratch::default();
+                            let (candidate, streams) = match *alternative {
+                                ExtraAlternative::Nested(fit) => (
+                                    super::extra_channels::prepare_nested_sections(
+                                        &ctx.thread_pool,
+                                        &fit.model.profile,
+                                        &fit.model.u,
+                                        &fit.model.v,
+                                        &dim,
+                                        &fit.reconstructed,
+                                        &mut scratch,
+                                    )?,
+                                    None,
+                                ),
+                                ExtraAlternative::Plane {
+                                    plane,
+                                    lossless,
+                                    scale,
+                                    ..
+                                } => {
+                                    let mut streams = snapshot.clone();
+                                    let global = extra_tree::GlobalStreams {
+                                        tree: &mut streams.0,
+                                        code: &mut streams.1,
+                                        dc: &mut streams.2,
+                                        meta: &mut streams.3,
+                                        dc_written: !use_dc_frame,
+                                        refinement: ans_refinement,
+                                    };
+                                    let candidate = if lossless {
+                                        prepare_extra_sections_lossless(
+                                            ctx,
+                                            plane,
+                                            &dim,
+                                            &group_coords,
+                                            num_passes - 1,
+                                            global,
+                                            &mut scratch,
+                                        )
+                                    } else {
+                                        super::extra_channels::prepare_extra_sections_scaled(
+                                            ctx,
+                                            plane,
+                                            &dim,
+                                            &group_coords,
+                                            num_passes - 1,
+                                            global,
+                                            &mut scratch,
+                                            scale,
+                                            Some(&levels_memo),
+                                        )
+                                    };
+                                    (candidate, Some(streams))
+                                }
+                            };
+                            let bits = candidate.net_bits()
+                                + if alternative.based() {
+                                    race.base_bits
+                                } else {
+                                    0
+                                };
+                            Some((bits, index, candidate, streams))
+                        };
+                        let mut coded: Vec<_> = ctx
+                            .thread_pool
+                            .map(indices.len(), job)
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        // The first passing candidate sets the size window.
+                        coded.sort_by_key(|&(bits, index, ..)| (bits, index));
+                        coded
                     };
-                    prepare(
-                        ctx,
-                        plane,
-                        &dim,
-                        &group_coords,
-                        num_passes - 1,
-                        extra_tree::GlobalStreams {
-                            tree: &mut dc_tree,
-                            code: &mut dc_code_owned,
-                            dc: &mut dc_tokens_per_group,
-                            meta: &mut meta_tokens_per_group,
-                            dc_written: !use_dc_frame,
-                            refinement: ans_refinement,
+                    // The finer residuals only matter when nothing at the
+                    // nominal distance passes, which is the rare case.
+                    let (first, second): (Vec<usize>, Vec<usize>) = race
+                        .map(|race| {
+                            (0..race.alternatives.len())
+                                .partition(|&index| !race.alternatives[index].fallback())
+                        })
+                        .unwrap_or_default();
+                    // Costing an alternative takes working memory of the
+                    // order of the frame's own (about 75 bytes a sample on
+                    // top of the color state still held here): side by side
+                    // with each other and the ordinary coding they tripled
+                    // the encoder's peak on large planes. Above this size
+                    // they are costed and judged one at a time, after the
+                    // ordinary coding, and only the current pick is kept.
+                    let streamed = dim.xsize * dim.ysize > PARALLEL_RACE_PIXELS;
+                    let (mut prepared, first_round) = ctx.thread_pool.join(
+                        || {
+                            let nested = extra_coding.profile.and_then(|fit| {
+                                super::extra_channels::prepare_nested_sections(
+                                    &ctx.thread_pool,
+                                    &fit.model.profile,
+                                    &fit.model.u,
+                                    &fit.model.v,
+                                    &dim,
+                                    &fit.reconstructed,
+                                    &mut extra_scratch,
+                                )
+                            });
+                            nested.unwrap_or_else(|| {
+                                let streams = extra_tree::GlobalStreams {
+                                    tree: &mut dc_tree,
+                                    code: &mut dc_code_owned,
+                                    dc: &mut dc_tokens_per_group,
+                                    meta: &mut meta_tokens_per_group,
+                                    dc_written: !use_dc_frame,
+                                    refinement: ans_refinement,
+                                };
+                                if extra_coding.lossless {
+                                    prepare_extra_sections_lossless(
+                                        ctx,
+                                        plane,
+                                        &dim,
+                                        &group_coords,
+                                        num_passes - 1,
+                                        streams,
+                                        &mut extra_scratch,
+                                    )
+                                } else {
+                                    prepare_extra_sections(
+                                        ctx,
+                                        plane,
+                                        &dim,
+                                        &group_coords,
+                                        num_passes - 1,
+                                        streams,
+                                        &mut extra_scratch,
+                                        race.is_some(),
+                                    )
+                                }
+                            })
                         },
-                        &mut extra_scratch,
-                    )
+                        // A large plane costs nothing beside the ordinary
+                        // coding: its alternatives follow one at a time.
+                        || if streamed { Vec::new() } else { cost(&first) },
+                    );
+                    if let Some(race) = race {
+                        let incumbent = prepared.reconstruction().unwrap_or(plane);
+                        let incumbent_bits = prepared.net_bits();
+                        let mut first_round = Some(first_round);
+                        let mut winner = None;
+                        // The same choice as the batch below, reached without
+                        // holding the alternatives: sizes and distances of
+                        // the passing ones are remembered, the coding of the
+                        // current pick alone is kept, and a pick that falls
+                        // out of the size window later hands over to one
+                        // that is costed again if it was already let go.
+                        for indices in [&first, &second] {
+                            if !streamed {
+                                break;
+                            }
+                            let mut seen = Vec::new();
+                            let mut passing: Vec<(usize, f64, usize)> = Vec::new();
+                            let mut kept = None;
+                            let mut below = false;
+                            let pick = |passing: &[(usize, f64, usize)]| {
+                                let smallest = passing.iter().map(|p| p.0).min()?;
+                                passing
+                                    .iter()
+                                    .filter(|p| p.0 * 10 <= smallest * 11)
+                                    .min_by(|a, b| {
+                                        a.1.total_cmp(&b.1).then((a.0, a.2).cmp(&(b.0, b.2)))
+                                    })
+                                    .map(|p| p.2)
+                            };
+                            let mut sizes: Vec<(usize, usize)> = Vec::new();
+                            for &index in indices.iter() {
+                                // Where the strong dead zone and none code to
+                                // the same size, so does the weak one (27 of
+                                // 27 such races): it is not costed.
+                                let size =
+                                    |of: usize| sizes.iter().find(|s| s.0 == of).map(|s| s.1);
+                                if race.zones.is_some_and(|[strong, none, weak]| {
+                                    index == weak
+                                        && size(strong).is_some()
+                                        && size(strong) == size(none)
+                                }) {
+                                    continue;
+                                }
+                                // The base frame alone already costs as much
+                                // as the ordinary coding.
+                                if race.alternatives[index].based()
+                                    && race.base_bits >= incumbent_bits
+                                {
+                                    continue;
+                                }
+                                let Some((bits, index, candidate, streams)) =
+                                    cost(&[index]).into_iter().next()
+                                else {
+                                    continue;
+                                };
+                                sizes.push((index, bits));
+                                below |= bits < incumbent_bits;
+                                let smallest = passing.iter().map(|p| p.0).min();
+                                if bits >= incumbent_bits
+                                    || seen.contains(&bits)
+                                    || smallest.is_some_and(|size| bits * 10 > size * 11)
+                                {
+                                    continue;
+                                }
+                                seen.push(bits);
+                                let decoded = candidate.reconstruction().unwrap_or(
+                                    match &race.alternatives[index] {
+                                        ExtraAlternative::Plane { plane, .. } => plane,
+                                        ExtraAlternative::Nested(fit) => &fit.reconstructed,
+                                    },
+                                );
+                                let Some(distance) = (race.judge)(index, incumbent, decoded) else {
+                                    continue;
+                                };
+                                passing.push((bits, distance, index));
+                                let picked = pick(&passing);
+                                if picked == Some(index) {
+                                    kept = Some((index, candidate, streams));
+                                } else if kept
+                                    .as_ref()
+                                    .is_some_and(|k: &(usize, _, _)| Some(k.0) != picked)
+                                {
+                                    kept = None;
+                                }
+                            }
+                            if let Some(picked) = pick(&passing) {
+                                winner = kept.filter(|k| k.0 == picked).or_else(|| {
+                                    cost(&[picked]).into_iter().next().map(
+                                        |(_, index, candidate, streams)| {
+                                            (index, candidate, streams)
+                                        },
+                                    )
+                                });
+                                break;
+                            }
+                            // The finer residuals are larger: with nothing
+                            // below the ordinary coding's size at the nominal
+                            // distance there is nothing for them to rescue
+                            // (0 of 42 such rounds found a winner).
+                            if !below {
+                                break;
+                            }
+                        }
+                        for _ in 0..2 {
+                            if streamed {
+                                break;
+                            }
+                            let costed = match first_round.take() {
+                                Some(costed) => costed,
+                                None => cost(&second),
+                            };
+                            // See the same test above.
+                            let below = costed.first().is_some_and(|c| c.0 < incumbent_bits);
+                            // The smallest that passes, unless one within a
+                            // tenth of its size is closer to the source: a
+                            // dead zone can save 5 % and double the error.
+                            let mut smallest = None;
+                            let mut previous_bits = None;
+                            let mut best = None;
+                            for (bits, index, candidate, streams) in costed {
+                                if bits >= incumbent_bits
+                                    || smallest.is_some_and(|size| bits * 10 > size * 11)
+                                {
+                                    break;
+                                }
+                                // Zoned and plain residuals often quantize alike.
+                                if previous_bits.replace(bits) == Some(bits) {
+                                    continue;
+                                }
+                                let decoded = candidate.reconstruction().unwrap_or(
+                                    match &race.alternatives[index] {
+                                        ExtraAlternative::Plane { plane, .. } => plane,
+                                        ExtraAlternative::Nested(fit) => &fit.reconstructed,
+                                    },
+                                );
+                                let Some(distance) = (race.judge)(index, incumbent, decoded) else {
+                                    continue;
+                                };
+                                smallest.get_or_insert(bits);
+                                if best.is_none_or(|score| distance.total_cmp(&score).is_lt()) {
+                                    best = Some(distance);
+                                    winner = Some((index, candidate, streams));
+                                }
+                            }
+                            if winner.is_some() || !below {
+                                break;
+                            }
+                        }
+                        if let Some((index, candidate, streams)) = winner {
+                            (
+                                dc_tree,
+                                dc_code_owned,
+                                dc_tokens_per_group,
+                                meta_tokens_per_group,
+                            ) = streams
+                                .or(snapshot)
+                                .expect("the race retains its DC streams");
+                            prepared = candidate;
+                            if let Ok(mut chosen) = race.chosen.lock() {
+                                *chosen = Some(index);
+                            }
+                        }
+                    }
+                    prepared
                 })
             },
             || {
@@ -1691,6 +2386,25 @@ fn encode_frame_core_inner(
     let has_splines = splines.is_some();
     #[cfg(not(feature = "splines"))]
     let has_splines = false;
+    let role = extra_coding.role.unwrap_or(ctx.frame_role);
+    // A residual alternative won: this frame follows the function frame and
+    // adds its extra channel to it.
+    let role = match extra_coding.race {
+        Some(race)
+            if race
+                .chosen
+                .lock()
+                .ok()
+                .and_then(|chosen| *chosen)
+                .is_some_and(|index| race.alternatives[index].based()) =>
+        {
+            if let Some(based) = race.based.lock().ok().and_then(|mut based| based.take()) {
+                *writer = based;
+            }
+            FrameRole::LastExtraAdd
+        }
+        _ => role,
+    };
     write_frame_header_kind(
         distp.x_qm_scale,
         ctx.b_qm_scale(),
@@ -1707,7 +2421,7 @@ fn encode_frame_core_inner(
         use_dc_frame,
         ctx.coding,
         ctx.epf_channel_scale,
-        ctx.frame_role,
+        role,
         writer,
     );
     let payload_bits = dc_frame_bits

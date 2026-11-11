@@ -297,13 +297,13 @@ fn context_entropy_bits(samples: impl Iterator<Item = (usize, i32)>, contexts: u
 }
 
 /// The decoder's left, top and top-left neighbours of `(x, y)` in a plane.
-fn neighbours(data: &[i32], w: usize, x: usize, y: usize) -> (i32, i32, i32) {
+fn neighbours<T: Copy + Default>(data: &[T], w: usize, x: usize, y: usize) -> (T, T, T) {
     let left = if x > 0 {
         data[y * w + x - 1]
     } else if y > 0 {
         data[(y - 1) * w + x]
     } else {
-        0
+        T::default()
     };
     let top = if y > 0 { data[(y - 1) * w + x] } else { left };
     let top_left = if x > 0 && y > 0 {
@@ -357,11 +357,36 @@ pub(crate) fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> 
         .iter()
         .map(|v| entries.binary_search(v).unwrap_or(0) as i32)
         .collect();
+    palette_rank_bits(&indices, xsize, ysize, |index| index)
+}
+
+/// The same estimate for a byte plane, whose sorted palette ranks fit a LUT.
+pub(crate) fn palette_index_bits_u8(levels: &[u8], xsize: usize, ysize: usize) -> f64 {
+    let mut seen = [false; 256];
+    for &level in levels {
+        seen[usize::from(level)] = true;
+    }
+    let mut ranks = [0u8; 256];
+    for (rank, level) in (0..seen.len()).filter(|&level| seen[level]).enumerate() {
+        ranks[level] = rank as u8;
+    }
+    palette_rank_bits(levels, xsize, ysize, |level| {
+        i32::from(ranks[usize::from(level)])
+    })
+}
+
+fn palette_rank_bits<T: Copy + Default>(
+    levels: &[T],
+    xsize: usize,
+    ysize: usize,
+    rank: impl Fn(T) -> i32,
+) -> f64 {
     let samples = (0..xsize * ysize).map(|k| {
-        let (left, top, top_left) = neighbours(&indices, xsize, k % xsize, k / xsize);
+        let (left, top, top_left) = neighbours(levels, xsize, k % xsize, k / xsize);
+        let (left, top, top_left) = (rank(left), rank(top), rank(top_left));
         (
             usize::from(left == top) * 2 + usize::from(top == top_left),
-            indices[k] - left,
+            rank(levels[k]) - left,
         )
     });
     context_entropy_bits(samples, 4)
@@ -380,7 +405,7 @@ fn lossy_palette_levels(
     black_plate: bool,
 ) -> Option<Vec<i32>> {
     use crate::encode_image::AlphaPlane;
-    use crate::frame::extra_levels::{LOSSY_PALETTE_ERROR, error_weights, fewest_levels};
+    use crate::frame::extra_levels::{error_weights, fewest_levels, squeeze_budget};
     let [(plane, d)] = input.extra.as_slice() else {
         return None;
     };
@@ -392,18 +417,8 @@ fn lossy_palette_levels(
         bits: 16,
     };
     let weights = error_weights(&source, xsize, ysize);
-    let error: f64 = squeezed
-        .decoded_extra(0)
-        .iter()
-        .zip(plane)
-        .zip(&weights)
-        .map(|((&v, &s), &w)| {
-            let e = f64::from(v.clamp(0, 65535) - s);
-            f64::from(w) * e * e
-        })
-        .sum();
-    let AlphaPlane::U16 { data, .. } =
-        fewest_levels(&source, &weights, LOSSY_PALETTE_ERROR * error, black_plate)?
+    let budget = squeeze_budget(&source, &squeezed.decoded_extra(0), &weights);
+    let AlphaPlane::U16 { data, .. } = fewest_levels(&source, &weights, budget, black_plate)?
     else {
         unreachable!("levels keep the plane's type")
     };

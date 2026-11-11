@@ -28,6 +28,7 @@ extraslow = ["dep:cvvdp-lite", "dep:ssimu2-lite"]
 [dependencies]
 cvvdp-lite = { version = "0.1.3", optional = true }
 ssimu2-lite = { version = "0.1.3", optional = true }
+msssim-lite = { version = "0.1.0", path = "../msssim-lite" }
 
 [profile.test]
 opt-level = 1
