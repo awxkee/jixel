@@ -603,7 +603,7 @@ pub(crate) fn fit_residual(
     if let Some(angle) = gradient_angle(data, width, height, &coarse) {
         geometries.push(Geometry::Linear(angle));
     }
-    // Circles in pixels, then the plane's own aspect and its neighbours.
+    // Circles in pixels, then the plane's own aspect and its neighbors.
     let aspect = ((height - 1) as f64 / (width - 1) as f64).powi(2);
     let mut centres = vec![(0.5, 0.5)];
     let moment = moment_geometry(&coarse, width, height);

@@ -249,37 +249,21 @@ pub(super) fn encode_frame_core(
                     let mut candidate_scratch = CoderScratch::default();
                     let mut based = writer.clone();
                     let start = based.bits_written();
-                    // Black color and a self-contained extra channel: nothing
-                    // in this frame rewards effort, so it is coded on a
-                    // minimal context of its own.
-                    let base_ctx = EncodingContext::new(
-                        crate::Speed::Fastest,
-                        ctx.arbiter,
-                        ctx.xyb,
-                        distance,
-                        ctx.thread_pool.num_threads(),
-                    );
-                    encode_frame_core_inner(
-                        &base_ctx,
+                    // A modular frame of its own, black with the function
+                    // in the extra channel: none of a VarDCT frame's
+                    // overhead, and 1024-pixel groups. Its coordinate goes
+                    // through a second Palette unless the file must stay
+                    // readable without explicit deltas.
+                    let model = &fit.base.model;
+                    crate::modular::portable_profile::encode_frame(
+                        &ctx.thread_pool,
+                        &model.profile,
+                        &model.u,
+                        &model.v,
+                        !ctx.function_fields_portable,
                         &mut candidate_scratch,
-                        distance,
-                        Cow::Owned(Image3F::new(width, height)),
-                        Some(&fit.base.reconstructed),
-                        ExtraCoding {
-                            profile: Some(&fit.base),
-                            role: Some(FrameRole::SavedFirst),
-                            ..ExtraCoding::default()
-                        },
-                        coeff_shifts,
-                        VarDctFrameKind::Regular,
-                        #[cfg(feature = "splines")]
-                        None,
-                        #[cfg(feature = "splines")]
-                        false,
-                        GrainPass::Off,
                         &mut based,
-                    )
-                    .ok()?;
+                    )?;
                     let bits = based.bits_written() - start;
                     Some((based, bits))
                 });
@@ -1786,6 +1770,7 @@ fn encode_frame_core_inner(
                                         &fit.model.v,
                                         &dim,
                                         &fit.reconstructed,
+                                        ctx.function_fields_portable,
                                         &mut scratch,
                                     )?,
                                     None,
@@ -1875,6 +1860,7 @@ fn encode_frame_core_inner(
                                     &fit.model.v,
                                     &dim,
                                     &fit.reconstructed,
+                                    ctx.function_fields_portable,
                                     &mut extra_scratch,
                                 )
                             });

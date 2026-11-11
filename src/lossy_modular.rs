@@ -296,8 +296,8 @@ fn context_entropy_bits(samples: impl Iterator<Item = (usize, i32)>, contexts: u
     bits
 }
 
-/// The decoder's left, top and top-left neighbours of `(x, y)` in a plane.
-fn neighbours<T: Copy + Default>(data: &[T], w: usize, x: usize, y: usize) -> (T, T, T) {
+/// The decoder's left, top and top-left neighbors of `(x, y)` in a plane.
+fn neighbors<T: Copy + Default>(data: &[T], w: usize, x: usize, y: usize) -> (T, T, T) {
     let left = if x > 0 {
         data[y * w + x - 1]
     } else if y > 0 {
@@ -334,7 +334,7 @@ fn squeezed_extra_bits(p: &Pyramid, num_color: usize) -> f64 {
         .flat_map(|(i, ch)| {
             (0..ch.w * ch.h).map(move |k| {
                 let (x, y) = (k % ch.w, k / ch.w);
-                let (left, top, top_left) = neighbours(&ch.data, ch.w, x, y);
+                let (left, top, top_left) = neighbors(&ch.data, ch.w, x, y);
                 let v = ch.data[k];
                 if i < planes {
                     let pred = (left + top - top_left).clamp(left.min(top), left.max(top));
@@ -348,7 +348,7 @@ fn squeezed_extra_bits(p: &Pyramid, num_color: usize) -> f64 {
 }
 
 /// Estimated bits of the palette indices of `levels`: each index against
-/// its left neighbour under W == N / N == NW contexts.
+/// its left neighbor under W == N / N == NW contexts.
 pub(crate) fn palette_index_bits(levels: &[i32], xsize: usize, ysize: usize) -> f64 {
     let mut entries = levels.to_vec();
     entries.sort_unstable();
@@ -382,7 +382,7 @@ fn palette_rank_bits<T: Copy + Default>(
     rank: impl Fn(T) -> i32,
 ) -> f64 {
     let samples = (0..xsize * ysize).map(|k| {
-        let (left, top, top_left) = neighbours(levels, xsize, k % xsize, k / xsize);
+        let (left, top, top_left) = neighbors(levels, xsize, k % xsize, k / xsize);
         let (left, top, top_left) = (rank(left), rank(top), rank(top_left));
         (
             usize::from(left == top) * 2 + usize::from(top == top_left),

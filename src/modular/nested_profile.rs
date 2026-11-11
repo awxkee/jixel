@@ -89,7 +89,7 @@ pub(crate) fn encode(
     Some(best)
 }
 
-fn validate(profile: &[i32], u: &[i32], v: &[i32]) -> Option<()> {
+pub(super) fn validate(profile: &[i32], u: &[i32], v: &[i32]) -> Option<()> {
     if profile.is_empty()
         || profile.len() > MAX_COLORS
         || u.is_empty()
@@ -291,7 +291,13 @@ fn encode_plan(
     (global, ac)
 }
 
-fn write_palette(begin: usize, colors: usize, deltas: usize, predictor: u32, out: &mut BitWriter) {
+pub(super) fn write_palette(
+    begin: usize,
+    colors: usize,
+    deltas: usize,
+    predictor: u32,
+    out: &mut BitWriter,
+) {
     out.write(2, 1); // Palette transform
     out.write(2, 0);
     out.write(3, begin as u64);
@@ -324,7 +330,7 @@ fn write_palette(begin: usize, colors: usize, deltas: usize, predictor: u32, out
     out.write(4, u64::from(predictor));
 }
 
-fn write_tokens(
+pub(super) fn write_tokens(
     tokens: &[Token],
     contexts: usize,
     scratch: &mut CoderScratch,

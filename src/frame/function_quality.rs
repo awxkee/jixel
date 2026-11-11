@@ -40,6 +40,7 @@
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::image::Image3F;
+use msssim_lite::{GrayImage, PreparedReference, Rect};
 
 /// How much one view's deficit (`msssim_lite::Score::deficit`: mean per
 /// pixel, summed over the scales) may grow when the pooled deficit does not.
@@ -49,7 +50,7 @@ const VIEW_SLACK: f64 = 1e-4;
 /// prepared, and the ordinary coding's distance from them.
 pub(super) struct Incumbent {
     luma_scale: f32,
-    views: Vec<msssim_lite::PreparedReference>,
+    views: Vec<PreparedReference>,
     deficits: Vec<f64>,
 }
 
@@ -209,8 +210,19 @@ pub(super) fn score(
                     })
                 })
                 .as_ref()?;
-            let deficits =
-                layout.deficits(ctx, &reference.views, candidate, reference.luma_scale)?;
+            let deficits = local_rect(source, candidate, width, height)
+                .and_then(|rect| {
+                    layout.patch_deficits(
+                        ctx,
+                        &reference.views,
+                        candidate,
+                        reference.luma_scale,
+                        rect,
+                    )
+                })
+                .or_else(|| {
+                    layout.deficits(ctx, &reference.views, candidate, reference.luma_scale)
+                })?;
             let reference = &reference.deficits;
             // The comparison is between two sums of the same windows: a
             // relative margin only absorbs their summation order.
@@ -575,6 +587,49 @@ fn finite_luma(value: f32) -> f32 {
     }
 }
 
+// The proxy's default scales share tiles aligned to the coarsest 8×8 window.
+const PROXY_TILE: usize = 8 << (msssim_lite::DEFAULT_SCALES - 1);
+
+/// Bound the differences from the source, so every proxy view outside this
+/// rectangle is identical to its prepared reference. Use the full comparison
+/// for widespread differences.
+fn local_rect(source: &[u8], candidate: &[u8], width: usize, height: usize) -> Option<Rect> {
+    let budget = width.div_ceil(PROXY_TILE) * height.div_ceil(PROXY_TILE) / 8;
+    if budget == 0 {
+        return None;
+    }
+    let rows = source
+        .chunks_exact(width)
+        .zip(candidate.chunks_exact(width));
+    let y0 = rows.clone().position(|(a, b)| a != b)?;
+    let y1 = rows.clone().rposition(|(a, b)| a != b)? + 1;
+    let tile_rows = y1.div_ceil(PROXY_TILE) - y0 / PROXY_TILE;
+    if tile_rows > budget {
+        return None;
+    }
+
+    let (mut x0, mut x1) = (width, 0);
+    for (a, b) in rows.skip(y0).take(y1 - y0) {
+        // Search only where the bounds can grow. Slice equality skips
+        // unchanged spans before searching for the exact end pixels.
+        if a[..x0] != b[..x0] {
+            x0 = a[..x0].iter().zip(&b[..x0]).position(|(a, b)| a != b)?;
+        }
+        if a[x1..] != b[x1..] {
+            x1 += a[x1..].iter().zip(&b[x1..]).rposition(|(a, b)| a != b)? + 1;
+        }
+        let tile_columns = x1.div_ceil(PROXY_TILE) - x0 / PROXY_TILE;
+        if tile_columns * tile_rows > budget {
+            return None;
+        }
+    }
+    Some(Rect::new(x0, y0, x1, y1))
+}
+
+fn ink_amount(sample: u8) -> f32 {
+    1.0 - f32::from(sample) * (1.0 / 255.0)
+}
+
 #[derive(Clone, Copy)]
 struct Layout<'a> {
     width: usize,
@@ -596,33 +651,46 @@ impl Layout<'_> {
         view: usize,
         plane: &[u8],
         luma_scale: f32,
-        use_image: impl FnOnce(msssim_lite::GrayImage<'_>) -> Option<T>,
+        use_image: impl FnOnce(GrayImage<'_>) -> Option<T>,
     ) -> Option<T> {
         if view == 0 {
-            let image =
-                msssim_lite::GrayImage::u8(plane, self.width, self.height, self.width).ok()?;
+            let image = GrayImage::u8(plane, self.width, self.height, self.width).ok()?;
             return use_image(image);
         }
         let samples: Vec<f32> = if self.black {
-            plane
-                .iter()
-                .map(|&sample| 1.0 - f32::from(sample) * (1.0 / 255.0))
-                .collect()
-        } else if view == 1 {
-            self.lightness_composite::<false>(plane, luma_scale)
+            plane.iter().copied().map(ink_amount).collect()
         } else {
-            self.lightness_composite::<true>(plane, luma_scale)
+            self.composite(
+                view,
+                plane,
+                luma_scale,
+                Rect::new(0, 0, self.width, self.height),
+            )
         };
-        let image =
-            msssim_lite::GrayImage::unit_f32(&samples, self.width, self.height, self.width).ok()?;
+        let image = GrayImage::unit_f32(&samples, self.width, self.height, self.width).ok()?;
         use_image(image)
     }
 
-    fn lightness_composite<const WHITE: bool>(&self, plane: &[u8], scale: f32) -> Vec<f32> {
-        let mut samples = Vec::with_capacity(plane.len());
-        for (y, row) in plane.chunks_exact(self.width).enumerate() {
-            let luma = &self.color.plane_row(1, y)[..self.width];
-            samples.extend(row.iter().zip(luma).map(|(&alpha, &luma)| {
+    fn composite(&self, view: usize, plane: &[u8], scale: f32, rect: Rect) -> Vec<f32> {
+        if view == 1 {
+            self.lightness_composite::<false>(plane, scale, rect)
+        } else {
+            self.lightness_composite::<true>(plane, scale, rect)
+        }
+    }
+
+    fn lightness_composite<const WHITE: bool>(
+        &self,
+        plane: &[u8],
+        scale: f32,
+        rect: Rect,
+    ) -> Vec<f32> {
+        let mut samples = Vec::with_capacity((rect.x1 - rect.x0) * (rect.y1 - rect.y0));
+        for y in rect.y0..rect.y1 {
+            let row = y * self.width;
+            let alpha = &plane[row + rect.x0..row + rect.x1];
+            let luma = &self.color.plane_row(1, y)[rect.x0..rect.x1];
+            samples.extend(alpha.iter().zip(luma).map(|(&alpha, &luma)| {
                 let alpha = f32::from(alpha) * (1.0 / 255.0);
                 let lightness = (finite_luma(luma) * scale) * alpha;
                 if WHITE {
@@ -635,16 +703,57 @@ impl Layout<'_> {
         samples
     }
 
+    fn patch_deficits(
+        &self,
+        ctx: &EncodingContext,
+        reference: &[PreparedReference],
+        plane: &[u8],
+        scale: f32,
+        rect: Rect,
+    ) -> Option<Vec<f64>> {
+        let width = rect.x1 - rect.x0;
+        let height = rect.y1 - rect.y0;
+        ctx.thread_pool
+            .map(reference.len(), |view| {
+                let samples: Vec<f32>;
+                let patch = if view == 0 {
+                    let start = rect.y0 * self.width + rect.x0;
+                    GrayImage::u8(&plane[start..], width, height, self.width).ok()?
+                } else {
+                    samples = if self.black {
+                        let mut samples = Vec::with_capacity(width * height);
+                        for y in rect.y0..rect.y1 {
+                            let start = y * self.width + rect.x0;
+                            samples.extend(
+                                plane[start..start + width].iter().copied().map(ink_amount),
+                            );
+                        }
+                        samples
+                    } else {
+                        self.composite(view, plane, scale, rect)
+                    };
+                    GrayImage::unit_f32(&samples, width, height, width).ok()?
+                };
+                let deficit = reference[view]
+                    .compare_patch(patch, rect.x0, rect.y0)
+                    .ok()?
+                    .deficit();
+                deficit.is_finite().then_some(deficit)
+            })
+            .into_iter()
+            .collect()
+    }
+
     fn prepare(
         &self,
         ctx: &EncodingContext,
         plane: &[u8],
         luma_scale: f32,
-    ) -> Option<Vec<msssim_lite::PreparedReference>> {
+    ) -> Option<Vec<PreparedReference>> {
         ctx.thread_pool
             .map(self.views(), |view| {
                 self.with_view(view, plane, luma_scale, |image| {
-                    msssim_lite::PreparedReference::new(image).ok()
+                    PreparedReference::new(image).ok()
                 })
             })
             .into_iter()
@@ -655,7 +764,7 @@ impl Layout<'_> {
     fn deficits(
         &self,
         ctx: &EncodingContext,
-        reference: &[msssim_lite::PreparedReference],
+        reference: &[PreparedReference],
         plane: &[u8],
         luma_scale: f32,
     ) -> Option<Vec<f64>> {
@@ -732,6 +841,74 @@ mod tests {
         assert_eq!(table.convert(f32::NAN), 0);
         assert_eq!(table.convert(f32::NEG_INFINITY), 0);
         assert_eq!(table.convert(f32::INFINITY), 255);
+    }
+
+    #[test]
+    fn local_alpha_and_ink_trials_match_full_scoring() {
+        let (width, height) = (195, 133);
+        let mut color = Image3F::try_new(width, height).unwrap();
+        for y in 0..height {
+            for (x, sample) in color.plane_row_mut(1, y)[..width].iter_mut().enumerate() {
+                *sample = ((x * 13 + y * 17) % 127) as f32 / 256.0;
+            }
+        }
+        let source: Vec<u8> = (0..width * height).map(|i| 40 + (i % 127) as u8).collect();
+        let incumbent: Vec<u8> = source.iter().map(|&sample| sample + 2).collect();
+        let mut candidate = source.clone();
+        let rect = Rect::new(width - 7, height - 8, width, height);
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                candidate[y * width + x] += 1;
+            }
+        }
+        assert_eq!(local_rect(&source, &candidate, width, height), Some(rect));
+        let mut spread = candidate.clone();
+        spread[0] += 1;
+        assert!(local_rect(&source, &spread, width, height).is_none());
+
+        for black in [false, true] {
+            let mut ctx = context();
+            ctx.extra_black = black;
+            let layout = Layout {
+                width,
+                height,
+                black,
+                color: &color,
+            };
+            let scale = if black {
+                1.0
+            } else {
+                source_luma_scale(&ctx, &color)
+            };
+            let references = layout.prepare(&ctx, &source, scale).unwrap();
+            let full = layout
+                .deficits(&ctx, &references, &candidate, scale)
+                .unwrap();
+            let local = layout
+                .patch_deficits(&ctx, &references, &candidate, scale, rect)
+                .unwrap();
+            for (full, local) in full.iter().zip(&local) {
+                assert!((full - local).abs() < 1e-12);
+            }
+
+            let source = AlphaPlane::U8(source.clone());
+            let incumbent = AlphaPlane::U8(incumbent.clone());
+            let candidate = AlphaPlane::U8(candidate.clone());
+            let cache = GateCache::default();
+            for with_residual in [false, true, false] {
+                let pooled = score(
+                    &ctx,
+                    &color,
+                    &source,
+                    &incumbent,
+                    &candidate,
+                    with_residual,
+                    &cache,
+                )
+                .expect("the local candidate improves on the ordinary coding");
+                assert!((pooled - full.iter().sum::<f64>()).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]

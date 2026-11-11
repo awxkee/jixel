@@ -459,7 +459,7 @@ pub(crate) enum GrainPass {
 /// Weight of the grain pass from the plain coding's grain survival: 1 when
 /// the quantizer removes the grain, 0 when it keeps it (replacing coded
 /// grain by synthesized grain only trades real detail for a look-alike),
-/// and a ramp in between so neighbouring distances and similar images do
+/// and a ramp in between so neighboring distances and similar images do
 /// not flip between two different encodes. The weight scales the denoiser;
 /// the LUT is then set from whatever the second pass still carries.
 pub(crate) fn grain_weight(survival: f32) -> f32 {

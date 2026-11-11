@@ -384,8 +384,18 @@ pub struct EncodeConfig {
     /// lossless alpha.
     ///
     /// Uses standard delta-palette syntax that jxl-oxide 0.12.6 does not decode
-    /// correctly; libjxl and jxl-rs support it.
+    /// correctly; libjxl and jxl-rs support it. See
+    /// [`EncodeConfig::function_fields_portable`] for files that decoder reads.
     pub function_fields: bool,
+    /// Keep [`EncodeConfig::function_fields`] to syntax jxl-oxide 0.12.6
+    /// decodes: the function is written with one ordinary Palette and its
+    /// coordinate plane coded directly, instead of through a second Palette
+    /// with explicit deltas. A function under a residual goes into a modular
+    /// frame of its own with 1024-pixel groups, where this costs about what
+    /// the delta form does up to 1024x1024 and the axes once more per extra
+    /// group beyond; a function that is the whole plane stays in the image
+    /// frame's 256-pixel groups and wins less often. Off by default.
+    pub function_fields_portable: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -631,6 +641,7 @@ impl Default for EncodeConfig {
             fill_invisible: true,
             alpha_distance: None,
             function_fields: true,
+            function_fields_portable: false,
             progressive: false,
             patches: false,
             upsampling: false,
@@ -999,6 +1010,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Restrict function fields to syntax jxl-oxide 0.12.6 decodes (see
+    /// [`EncodeConfig::function_fields_portable`]). Disabled by default.
+    pub fn with_function_fields_portable(mut self, enabled: bool) -> Self {
+        self.function_fields_portable = enabled;
+        self
+    }
+
     /// Enable progressive lossless. Only effective when `lossless`.
     pub fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
@@ -1271,6 +1289,7 @@ pub(crate) fn lossy_context(
         ) == [0]
         && config.decoding_speed == DecodingSpeed::Slow;
     ctx.function_fields_layered = ctx.function_fields && config.icc_profile.is_none();
+    ctx.function_fields_portable = config.function_fields_portable;
     ctx.function_fields_exact = ctx.function_fields
         && cfg!(feature = "extraslow")
         && config.speed >= Speed::ExtraSlow
@@ -5844,6 +5863,15 @@ mod lossy_alpha_tests {
             .with_distance(1.5);
         let bytes = encode_image_with_alpha(&rgba, w, h, &config).unwrap().len();
         assert!(bytes < 3150, "{bytes}");
+    }
+
+    #[test]
+    fn function_fields_portable_is_opt_in() {
+        let config = EncodeConfig::default();
+        assert!(!config.function_fields_portable);
+        assert!(!lossy_context(&config, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
+        let portable = config.with_function_fields_portable(true);
+        assert!(lossy_context(&portable, 1.5, XybMatrix::SPEC, 65536).function_fields_portable);
     }
 
     #[test]

@@ -428,6 +428,7 @@ pub(super) fn prepare_nested_sections(
     v: &[i32],
     dim: &ImageDim,
     reconstruction: &AlphaPlane,
+    portable: bool,
     scratch: &mut CoderScratch,
 ) -> Option<PreparedExtra> {
     if u.len() != dim.xsize
@@ -436,7 +437,14 @@ pub(super) fn prepare_nested_sections(
     {
         return None;
     }
-    let (global, ac) = crate::modular::nested_profile::encode(pool, profile, u, v, scratch)?;
+    // The single-palette coding costs the first row and column of every
+    // group; it is the choice only where the file must stay readable by
+    // decoders that cannot parse a palette's explicit deltas.
+    let (global, ac) = if portable {
+        crate::modular::portable_profile::encode(pool, profile, u, v, scratch)?
+    } else {
+        crate::modular::nested_profile::encode(pool, profile, u, v, scratch)?
+    };
     if ac.len() != dim.num_groups {
         return None;
     }

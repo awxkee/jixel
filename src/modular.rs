@@ -36,6 +36,7 @@ use crate::entropy::{
 use std::sync::OnceLock;
 
 pub(crate) mod nested_profile;
+pub(crate) mod portable_profile;
 
 const TREE_CTX_SPLITVAL: u32 = 0;
 const TREE_CTX_PROPERTY: u32 = 1;

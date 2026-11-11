@@ -325,6 +325,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         fill_invisible: base.fill_invisible,
         alpha_distance: None,
         function_fields: false,
+        function_fields_portable: false,
         progressive: false,
         patches: base.patches,
         #[cfg(feature = "splines")]
