@@ -1496,7 +1496,10 @@ pub fn encode_image(
             };
             let encoded = encode_vector_layers(split, width, height, config)?;
             let mut fitted = None;
-            if encoded.bytes.len() as f64 <= budget {
+            // The budget judges the two-frame encode, as the model was fitted
+            // on it; the single frame only ever makes an accepted encode
+            // smaller.
+            if encoded.layered as f64 <= budget {
                 fitted = Some(encoded.bytes);
             } else if (encoded.base as f64) < budget {
                 let room = ((budget - encoded.base as f64) / encoded.band.max(1) as f64
@@ -1947,6 +1950,8 @@ fn encode_ink_frame(
 /// to reference slot 0, then the coverage frame blended over it (kBlend).
 struct VectorEncode {
     bytes: Vec<u8>,
+    /// Bytes of the two-frame encode, before the single-frame race.
+    layered: usize,
     /// Bytes of the palette base frame and of the coverage band frame.
     base: usize,
     band: usize,
@@ -2026,6 +2031,7 @@ fn encode_vector_layers(
         DecodingSpeed::Fast
     };
     let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+    let header = w.clone();
     let start = w.bits_written();
     crate::lossless::encode_frame_lossless_layer(
         &base,
@@ -2055,15 +2061,55 @@ fn encode_vector_layers(
         );
     }
     let band_bytes = (w.bits_written() - start) / 8 - base_bytes;
+    let layered_bytes = w.bits_written().div_ceil(8);
+    if banded {
+        // The same pixels as one lossless frame (a palette of the fills and
+        // their mixes on flat art): the band blended over the base.
+        let AlphaPlane::U8(alpha) = &coverage else {
+            unreachable!()
+        };
+        let composite: Vec<u8> = split
+            .base
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(split.layer.as_chunks::<3>().0)
+            .zip(alpha)
+            .flat_map(|((b, l), &a)| {
+                let a = a as f32 * (1.0 / 255.0);
+                std::array::from_fn::<u8, 3, _>(|k| {
+                    crate::util::round_i32(b[k] as f32 + (l[k] as f32 - b[k] as f32) * a)
+                        .clamp(0, 255) as u8
+                })
+            })
+            .collect();
+        let mut single = header;
+        crate::lossless::encode_frame_lossless_layer(
+            &planes(&composite),
+            &opaque,
+            ModularFrameKind::Regular,
+            speed,
+            decoding_speed,
+            &pool,
+            &mut scratch,
+            &mut single,
+        );
+        if single.bits_written() < w.bits_written() {
+            w = single;
+        }
+    }
+    let saved = layered_bytes - w.bits_written().div_ceil(8);
+    let bytes = finalize_container(
+        w.into_bytes(),
+        config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
+        false,
+        encode_gain_map(config)?.as_ref(),
+    )?;
     Ok(VectorEncode {
-        bytes: finalize_container(
-            w.into_bytes(),
-            config.exif.as_deref(),
-            config.xmp.as_deref(),
-            config.brotli_compression.as_deref(),
-            false,
-            encode_gain_map(config)?.as_ref(),
-        )?,
+        layered: bytes.len() + saved,
+        bytes,
         base: base_bytes,
         band: band_bytes,
     })
@@ -4045,6 +4091,59 @@ mod encode_smoke_tests {
             }
         }
         rgb
+    }
+
+    /// Two flat discs with antialiased rims on a flat background.
+    fn antialiased_discs_fixture(size: usize) -> Vec<u8> {
+        let bg = [236.0f32, 240.0, 248.0];
+        let discs = [
+            (0.35, 0.4, 0.25, [40.0f32, 90.0, 200.0]),
+            (0.7, 0.65, 0.2, [230.0, 120.0, 30.0]),
+        ];
+        let mut rgb = Vec::with_capacity(size * size * 3);
+        for y in 0..size {
+            for x in 0..size {
+                let mut color = bg;
+                for &(cx, cy, r, fill) in &discs {
+                    let (dx, dy) = (
+                        x as f32 + 0.5 - cx * size as f32,
+                        y as f32 + 0.5 - cy * size as f32,
+                    );
+                    let edge = r * size as f32 - (dx * dx + dy * dy).sqrt();
+                    let a = (edge + 0.5).clamp(0.0, 1.0);
+                    for k in 0..3 {
+                        color[k] += (fill[k] - color[k]) * a;
+                    }
+                }
+                rgb.extend(color.map(|c| c.round() as u8));
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn vector_layers_single_frame_never_exceeds_the_layered_encode() {
+        let size = 256;
+        let rgb = antialiased_discs_fixture(size);
+        let config = EncodeConfig::default()
+            .with_speed(Speed::Slow)
+            .with_num_threads(1);
+        let steps = crate::vector_layers::coverage_steps(1.5);
+        let split = crate::vector_layers::split(&rgb, size, size, steps).expect("flat art splits");
+        assert!(
+            split.coverage.iter().any(|&a| a != 0),
+            "the rims form a band"
+        );
+        let encoded = encode_vector_layers(split, size, size, &config).unwrap();
+        assert!(encoded.bytes.len() <= encoded.layered);
+        // The rims mix only two fills each: one palette of fills and mixes
+        // beats a base plus a coverage frame.
+        assert!(
+            encoded.bytes.len() < encoded.layered,
+            "{} vs {}",
+            encoded.bytes.len(),
+            encoded.layered
+        );
     }
 
     #[test]

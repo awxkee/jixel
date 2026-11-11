@@ -106,7 +106,7 @@ pub(crate) fn process_dac(
     }
     let len = ((data[pos] as usize) << 8) | data[pos + 1] as usize;
     let end = pos + len;
-    if len < 4 || (len - 2) % 2 != 0 || end > data.len() {
+    if len < 4 || !(len - 2).is_multiple_of(2) || end > data.len() {
         return Err(JpegError::BadSegmentLength(M_DAC));
     }
     let mut p = pos + 2;
