@@ -10,8 +10,7 @@ fn has_oversized_frame(data: &[u8]) -> bool {
             continue;
         }
         let marker = data[i + 1];
-        // SOF0/1/2 are the only frame headers the transcoder accepts.
-        if matches!(marker, 0xC0..=0xC2) {
+        if matches!(marker, 0xC0..=0xC2 | 0xC9 | 0xCA) {
             let height = usize::from(data[i + 5]) << 8 | usize::from(data[i + 6]);
             let width = usize::from(data[i + 7]) << 8 | usize::from(data[i + 8]);
             if width.saturating_mul(height) > MAX_FUZZ_PIXELS {

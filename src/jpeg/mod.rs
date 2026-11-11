@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod arith;
 mod brotli;
 mod coeff_order;
 mod encode;
@@ -214,6 +215,7 @@ fn extract_xmp(jpg: &JpegData) -> Option<(usize, Vec<u8>)> {
 /// Options for [`encode_jpeg_lossless_with_config`].
 pub struct JpegTranscodeConfig {
     /// Whether to embed the data needed to rebuild the original JPEG bytes.
+    /// For arithmetic-coded input this rebuilds the Huffman-coded equivalent.
     ///
     /// Defaults to `true`. See [`Self::with_jpeg_reconstruction`].
     /// Binary Ultra HDR gain maps are written to `jhgm` even when this is false.
@@ -298,6 +300,12 @@ impl JpegTranscodeConfig {
 /// Losslessly transcodes a JPEG file into JPEG XL, keeping the ability to
 /// reconstruct the original bytes.
 ///
+/// For arithmetic-coded JPEGs (SOF9/SOF10), reconstruction produces a
+/// Huffman-coded JPEG with the same image coefficients and quantization.
+/// Reconstruction may consolidate table definitions and restart intervals.
+/// Arithmetic-coded MPF images with a secondary JPEG require reconstruction
+/// to be disabled because rewriting the JPEG changes the MPF offsets.
+///
 /// Ultra HDR JPEGs with binary ISO 21496-1 metadata are carried over as a
 /// `jhgm` gain map: both JPEG images are transcoded without requantization.
 /// XMP-only gain maps are currently retained only in the reconstruction data.
@@ -309,7 +317,19 @@ pub fn encode_jpeg_lossless_with_config(
     jpeg: &[u8],
     config: &JpegTranscodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    let parsed = parse_jpeg(jpeg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    let mut parsed = parse_jpeg(jpeg).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    if parsed.is_arithmetic && config.jpeg_reconstruction {
+        let has_mpf = parsed
+            .app_data
+            .iter()
+            .any(|app| app.first() == Some(&0xE2) && app.get(3..7) == Some(b"MPF\0"));
+        if has_mpf && parsed.tail_data.windows(2).any(|w| w == [0xFF, 0xD8]) {
+            return Err(EncodeError::Jpeg(
+                "arithmetic-coded MPF requires disabling JPEG reconstruction".into(),
+            ));
+        }
+        arith::synthesize_huffman(&mut parsed).map_err(|e| EncodeError::Jpeg(e.to_string()))?;
+    }
 
     // Embedded in the codestream either way: without it, dropping the `jbrd`
     // box would silently discard the profile and leave the image mislabeled.
@@ -504,7 +524,7 @@ pub(crate) struct JpegComponent {
     pub(crate) coeffs: Vec<i16>,
 }
 
-/// Everything recovered from a JPEG file, sufficient to rebuild it exactly.
+/// The coefficients and metadata recovered from a JPEG file.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JpegData {
     pub(crate) width: usize,
@@ -534,6 +554,9 @@ pub(crate) struct JpegData {
     pub(crate) padding_bits: Vec<u8>,
     /// True if the frame used SOF2 (progressive) rather than SOF0/SOF1.
     pub(crate) is_progressive: bool,
+    /// True if the source was arithmetic-coded (SOF9/SOF10). Reconstruction
+    /// requires preparing the equivalent Huffman markers and tables first.
+    pub(crate) is_arithmetic: bool,
 }
 
 impl JpegData {
