@@ -155,13 +155,11 @@ pub(crate) fn fit(plane: &AlphaPlane, width: usize, height: usize) -> Vec<Fitted
     if let Some(angle) = gradient_angle(data, width, height, &samples) {
         geometries.push(Geometry::Linear(angle));
     }
-    for ratio in [0.25, 0.5, 1.0, 2.0, 4.0] {
-        geometries.push(Geometry::Quadratic {
-            cx: 0.5,
-            cy: 0.5,
-            ratio,
-        });
-    }
+    geometries.extend([0.25, 0.5, 1.0, 2.0, 4.0].map(|ratio| Geometry::Quadratic {
+        cx: 0.5,
+        cy: 0.5,
+        ratio,
+    }));
     if let Some(geometry) = moment_geometry(&samples, width, height) {
         geometries.push(geometry);
     }
@@ -611,9 +609,13 @@ pub(crate) fn fit_residual(
         centres.push((cx, cy));
     }
     for (cx, cy) in centres {
-        for ratio in [aspect, 1.0, 0.5 * aspect, 2.0 * aspect] {
-            geometries.push(Geometry::Quadratic { cx, cy, ratio });
-        }
+        geometries.extend(
+            [aspect, 1.0, 0.5 * aspect, 2.0 * aspect].map(|ratio| Geometry::Quadratic {
+                cx,
+                cy,
+                ratio,
+            }),
+        );
     }
     geometries.extend(moment);
     for invert in [false, true] {

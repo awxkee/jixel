@@ -199,12 +199,15 @@ impl Pyramid {
                 i % num_c
             }
         };
-        let mut quants: Vec<u32> = Vec::with_capacity(nb);
-        for (i, ch) in channels.iter_mut().enumerate() {
-            let q = q_of(color_of(i), ch.hshift, ch.vshift);
-            quantize_channel_divide(ch, q);
-            quants.push(q as u32);
-        }
+        let quants: Vec<u32> = channels
+            .iter_mut()
+            .enumerate()
+            .map(|(i, ch)| {
+                let q = q_of(color_of(i), ch.hshift, ch.vshift);
+                quantize_channel_divide(ch, q);
+                q as u32
+            })
+            .collect();
         requantize(&mut channels, &quants, &steps, exact, deadzone, pool);
         Some(Self {
             channels,
@@ -271,10 +274,13 @@ impl Pyramid {
                 Role::Luma
             }
         }));
-        for (plane, distance) in &input.extra {
-            planes.push(plane[..n].to_vec());
-            roles.push(Role::Extra(*distance));
-        }
+        planes.extend(input.extra.iter().map(|(plane, _)| plane[..n].to_vec()));
+        roles.extend(
+            input
+                .extra
+                .iter()
+                .map(|&(_, distance)| Role::Extra(distance)),
+        );
         let squeezed = if unsqueeze_lossless {
             num_color
                 + input
@@ -294,28 +300,31 @@ impl Pyramid {
         }
         let exact = channels.clone();
         let nb = channels.len();
-        let mut quants: Vec<u32> = Vec::with_capacity(nb);
-        for (i, ch) in channels.iter_mut().enumerate() {
-            // The chroma pre-squeeze residuals come last, after the unsqueezed
-            // extras.
-            let role = if i >= nb - n_pre {
-                Role::Chroma
-            } else if i >= nb - n_pre - unsqueezed {
-                Role::Extra(0.0)
-            } else {
-                roles[i % squeezed]
-            };
-            let q = plain_step(
-                role,
-                distance,
-                ch.hshift,
-                ch.vshift,
-                input.max,
-                input.coding,
-            );
-            quantize_channel_divide(ch, q);
-            quants.push(q as u32);
-        }
+        let quants: Vec<u32> = channels
+            .iter_mut()
+            .enumerate()
+            .map(|(i, ch)| {
+                // The chroma pre-squeeze residuals come last, after the unsqueezed
+                // extras.
+                let role = if i >= nb - n_pre {
+                    Role::Chroma
+                } else if i >= nb - n_pre - unsqueezed {
+                    Role::Extra(0.0)
+                } else {
+                    roles[i % squeezed]
+                };
+                let q = plain_step(
+                    role,
+                    distance,
+                    ch.hshift,
+                    ch.vshift,
+                    input.max,
+                    input.coding,
+                );
+                quantize_channel_divide(ch, q);
+                q as u32
+            })
+            .collect();
         requantize(&mut channels, &quants, &steps, exact, Deadzone::COLOR, pool);
         let layout = Layout::Plain {
             ycbcr,

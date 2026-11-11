@@ -562,17 +562,23 @@ fn trace_seeds<A: Availability + ?Sized>(
             .rev()
             .chain(std::iter::once(&start))
             .chain(forward.iter());
-        let mut points = Vec::with_capacity(backward.len() + 1 + forward.len());
         let (mut scale_sum, mut weight_sum) = (0f32, 0f32);
-        for &(x, y) in pixels {
-            let j = y * w + x;
-            points.push(Point::new(
-                x as f32 + map.offset[j] * map.nx[j],
-                y as f32 + map.offset[j] * map.ny[j],
-            ));
-            scale_sum += map.scale[j] * map.strength[j];
-            weight_sum += map.strength[j];
-        }
+        let points: Vec<_> = pixels
+            .map(|&(x, y)| {
+                // Each trace point seeks to its raster index in the zipped planes.
+                let (((&strength, &scale), &offset), (&nx, &ny)) = map
+                    .strength
+                    .iter()
+                    .zip(&map.scale)
+                    .zip(&map.offset)
+                    .zip(map.nx.iter().zip(&map.ny))
+                    .nth(y * w + x)
+                    .expect("traced pixel must be in the ridge map");
+                scale_sum += scale * strength;
+                weight_sum += strength;
+                Point::new(x as f32 + offset * nx, y as f32 + offset * ny)
+            })
+            .collect();
         let interior = |p: &Point<f32>| {
             p.x >= FRAME_MARGIN
                 && p.y >= FRAME_MARGIN

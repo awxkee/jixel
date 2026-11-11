@@ -118,10 +118,12 @@ pub(super) fn tokenize_permutation(
         (end - skip) as u32,
     ));
     let mut last = 0u32;
-    for &digit in lehmer.iter().take(end).skip(skip) {
-        out.push(Token::new(coeff_order_context(last), digit as u32));
-        last = digit as u32;
-    }
+    out.extend(lehmer.iter().take(end).skip(skip).map(|&digit| {
+        let digit = u32::from(digit);
+        let token = Token::new(coeff_order_context(last), digit);
+        last = digit;
+        token
+    }));
 }
 
 #[cfg(test)]

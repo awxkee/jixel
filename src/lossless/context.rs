@@ -435,16 +435,18 @@ pub(super) fn try_encode_context_tree_single_group(
 
     // Tokenize: each pixel routed to context (channel,bucket).
     let channel_tokens = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
-        let mut tokens = Vec::with_capacity(xsize * ysize);
         let res = &chan_res[chan];
         let prp = &chan_prp[chan];
         let t = ts[chan] as i64;
-        for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
-            let bucket = bucket_of(prp, t);
-            let ctx = ctx_lut[chan * 3 + bucket as usize];
-            tokens.push(Token::new(ctx, res));
-        }
-        tokens
+        prp[..res.len()]
+            .iter()
+            .zip(res)
+            .map(|(&prp, &res)| {
+                let bucket = bucket_of(prp, t);
+                let ctx = ctx_lut[chan * 3 + bucket as usize];
+                Token::new(ctx, res)
+            })
+            .collect::<Vec<_>>()
     });
     let mut tokens: Vec<Token> = Vec::with_capacity(xsize * ysize * nb_chans);
     for channel in channel_tokens {
@@ -602,11 +604,11 @@ pub(super) fn try_encode_context_tree_multi_group(
                     .zip(ctx_lut.as_chunks::<3>().0)
                 {
                     let t = threshold as i64;
-                    for (&prp, &res) in prp[..res.len()].iter().zip(res.iter()) {
+                    toks.extend(prp[..res.len()].iter().zip(res).map(|(&prp, &res)| {
                         let bucket = bucket_of(prp, t);
                         let ctx = contexts[bucket as usize];
-                        toks.push(Token::new(ctx, res));
-                    }
+                        Token::new(ctx, res)
+                    }));
                 }
                 deep_lz.with_depth(|depth| {
                     lz77_compress_for_speed_with_depth(

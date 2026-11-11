@@ -759,11 +759,13 @@ fn parallel_context_populations(
             *width = (*width).max(local);
         }
     }
-    let mut offsets = Vec::with_capacity(num_contexts + 1);
-    offsets.push(0);
-    for &width in &widths {
-        offsets.push(offsets.last().unwrap() + usize::from(width));
-    }
+    let mut offset = 0;
+    let offsets: Vec<_> = std::iter::once(0)
+        .chain(widths.iter().map(|&width| {
+            offset += usize::from(width);
+            offset
+        }))
+        .collect();
     let num_bins = offsets[num_contexts];
     // Bound all replicated count buffers together, including dense inputs.
     const COUNT_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
@@ -920,11 +922,10 @@ pub(crate) fn build_huffman_codes(
     histograms: &[Histogram],
     huffman_pool: &mut Vec<HuffmanNode>,
 ) -> Vec<PrefixCode> {
-    let mut out = Vec::with_capacity(histograms.len());
-    for histogram in histograms {
-        out.push(build_huffman_code(histogram, huffman_pool));
-    }
-    out
+    histograms
+        .iter()
+        .map(|histogram| build_huffman_code(histogram, huffman_pool))
+        .collect()
 }
 
 pub(crate) fn build_huffman_codes_into(
@@ -2792,11 +2793,9 @@ fn write_huffman_tree_repetitions(
         repetitions -= 1;
     }
     if repetitions < 3 {
-        for _ in 0..repetitions {
-            tree.push(value);
-            extra.push(0);
-            *tree_size += 1;
-        }
+        tree.resize(tree.len() + repetitions, value);
+        extra.resize(extra.len() + repetitions, 0);
+        *tree_size += repetitions;
     } else {
         repetitions -= 3;
         let start = *tree_size;
@@ -2829,11 +2828,9 @@ fn write_huffman_tree_repetitions_zeros(
         repetitions -= 1;
     }
     if repetitions < 3 {
-        for _ in 0..repetitions {
-            tree.push(0);
-            extra.push(0);
-            *tree_size += 1;
-        }
+        tree.resize(tree.len() + repetitions, 0);
+        extra.resize(extra.len() + repetitions, 0);
+        *tree_size += repetitions;
     } else {
         repetitions -= 3;
         let start = *tree_size;
@@ -3186,11 +3183,11 @@ pub(crate) fn write_context_map(
     // The entries in signaled order.
     let mut entries: Vec<u8> = Vec::with_capacity(num_contexts);
     match code.orig_context_map {
-        Some(orig) => {
-            for i in 0..code.orig_num_contexts {
-                entries.push(code.context_map[orig[i] as usize]);
-            }
-        }
+        Some(orig) => entries.extend(
+            orig[..code.orig_num_contexts]
+                .iter()
+                .map(|&context| code.context_map[context as usize]),
+        ),
         None => entries.extend_from_slice(code.context_map),
     }
 
@@ -3407,9 +3404,7 @@ fn run_length_symbols(symbols: &[u8]) -> Vec<RunSymbol> {
                 length_value: extra - LZ77_MIN_LENGTH,
             });
         } else {
-            for _ in 0..extra {
-                out.push(RunSymbol::Literal(symbols[i]));
-            }
+            out.resize(out.len() + extra as usize, RunSymbol::Literal(symbols[i]));
         }
         i = j + 1;
     }
@@ -3982,9 +3977,7 @@ mod context_map_tests {
                 RunSymbol::Copy { length_value } => {
                     let length = length_value + LZ77_MIN_LENGTH;
                     let last = *out.last().expect("copy with empty history");
-                    for _ in 0..length {
-                        out.push(last);
-                    }
+                    out.resize(out.len() + length as usize, last);
                 }
             }
         }

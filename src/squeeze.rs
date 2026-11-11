@@ -421,14 +421,12 @@ pub(crate) fn fold_quantized_step(
 pub(crate) fn lossy_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     if num_c >= 3 {
-        for horizontal in [true, false] {
-            steps.push(SqueezeStep {
-                horizontal,
-                in_place: false,
-                begin_c: 1,
-                num_c: 2,
-            });
-        }
+        steps.extend([true, false].map(|horizontal| SqueezeStep {
+            horizontal,
+            in_place: false,
+            begin_c: 1,
+            num_c: 2,
+        }));
     }
     steps.extend(lossy_shared_steps(w, h, num_c));
     steps
@@ -445,14 +443,12 @@ pub(crate) fn lossy_squeeze_steps_chroma(
 ) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     for &c in chroma {
-        for horizontal in [true, false] {
-            steps.push(SqueezeStep {
-                horizontal,
-                in_place: false,
-                begin_c: c,
-                num_c: 1,
-            });
-        }
+        steps.extend([true, false].map(|horizontal| SqueezeStep {
+            horizontal,
+            in_place: false,
+            begin_c: c,
+            num_c: 1,
+        }));
     }
     steps.extend(lossy_shared_steps(w, h, num_c));
     steps

@@ -458,10 +458,9 @@ impl AcCtxPlan {
             1
         };
         let mut out = Vec::with_capacity(3 * K_NUM_ORDERS * qf_classes);
-        for base in K_COMPACT_BLOCK_CONTEXT_MAP.iter() {
-            for qf_idx in 0..qf_classes {
-                out.push(self.fine_to_final[*base as usize * K_NUM_QF_CLASSES + qf_idx]);
-            }
+        for &base in &K_COMPACT_BLOCK_CONTEXT_MAP {
+            let start = base as usize * K_NUM_QF_CLASSES;
+            out.extend_from_slice(&self.fine_to_final[start..start + qf_classes]);
         }
         out
     }

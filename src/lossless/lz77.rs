@@ -530,9 +530,11 @@ impl RunLzWriter {
                 LZ77_DIST_VALUE,
             ));
         } else {
-            for &context in &self.next_contexts[..copied] {
-                self.out.push(LzToken::pixel(context, token.value));
-            }
+            self.out.extend(
+                self.next_contexts[..copied]
+                    .iter()
+                    .map(|&context| LzToken::pixel(context, token.value)),
+            );
         }
         self.count = 0;
     }

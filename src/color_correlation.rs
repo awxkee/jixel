@@ -2038,9 +2038,11 @@ pub(crate) fn choose_dc_steps(
     let mut bands = Vec::new();
     for (g, dc) in dc_datas.iter().enumerate() {
         let rows = dc.source_dc_y.as_ref().unwrap().ysize();
-        for y0 in (0..rows).step_by(DISTORTION_BAND_ROWS) {
-            bands.push((g, y0, (y0 + DISTORTION_BAND_ROWS).min(rows)));
-        }
+        bands.extend(
+            (0..rows)
+                .step_by(DISTORTION_BAND_ROWS)
+                .map(|y0| (g, y0, (y0 + DISTORTION_BAND_ROWS).min(rows))),
+        );
     }
     let distortion = |dc_step: [f32; 3]| -> f64 {
         let factor_y = INV_DC_QUANT[1] / dc_step[1] * scale_dc;
@@ -2080,10 +2082,10 @@ pub(crate) fn choose_dc_steps(
                         (bq + yq * cfl) / factor_b,
                     );
                     let source = crate::xyb::xyb_to_rgb_pixel_f32(&ctx.xyb, sx, row_y[x], row_b[x]);
-                    for c in 0..3 {
+                    errors.extend((0..3).map(|c| {
                         let e = (oetf(decoded[c]) - oetf(source[c])) as f64;
-                        errors.push(e * e);
-                    }
+                        e * e
+                    }));
                 }
             }
             errors

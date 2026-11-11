@@ -397,13 +397,13 @@ pub(super) fn run_quant_field_loop(
     let tile_of_block = |bx: usize, by: usize| (by / TILE_BLOCKS) * tiles_x + bx / TILE_BLOCKS;
     let tile_blocks = |t: usize| -> Vec<(usize, usize)> {
         let (tx, ty) = (t % tiles_x, t / tiles_x);
-        let mut v = Vec::new();
-        for by in ty * TILE_BLOCKS..((ty + 1) * TILE_BLOCKS).min(yb) {
-            for bx in tx * TILE_BLOCKS..((tx + 1) * TILE_BLOCKS).min(xb) {
-                v.push((bx, by));
-            }
+        let xs = tx * TILE_BLOCKS..((tx + 1) * TILE_BLOCKS).min(xb);
+        let ys = ty * TILE_BLOCKS..((ty + 1) * TILE_BLOCKS).min(yb);
+        let mut blocks = Vec::with_capacity(xs.len() * ys.len());
+        for by in ys {
+            blocks.extend(xs.clone().map(|bx| (bx, by)));
         }
-        v
+        blocks
     };
     // Sum a per-pixel map over each tile.
     let tile_sums = |map: &[f32]| -> Vec<f64> {

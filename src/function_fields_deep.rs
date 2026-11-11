@@ -379,20 +379,20 @@ fn image(
 /// Lightness of the source color in `0..=1`: its XYB luma over the luma of
 /// SDR white, or of the brightest sample when the image goes above that.
 fn lightness(ctx: &EncodingContext, color: &Image3F) -> Vec<f32> {
-    let (width, height) = (color.xsize(), color.ysize());
     let mut peak = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, 1.0, 1.0, 1.0).1;
-    let mut luma = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for &value in &color.plane_row(1, y)[..width] {
+    let mut luma: Vec<_> = color
+        .plane_data(1)
+        .iter()
+        .map(|&value| {
             let value = if value.is_finite() {
                 value.max(0.0)
             } else {
                 0.0
             };
             peak = peak.max(value);
-            luma.push(value);
-        }
-    }
+            value
+        })
+        .collect();
     if peak > 0.0 {
         let scale = 1.0 / peak;
         for value in &mut luma {
@@ -405,6 +405,32 @@ fn lightness(ctx: &EncodingContext, color: &Image3F) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lightness_clamps_samples_and_normalizes_in_raster_order() {
+        let ctx = EncodingContext::default();
+        let white = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, 1.0, 1.0, 1.0).1;
+        let mut color = Image3F::new(3, 2);
+        color
+            .plane_row_mut(1, 0)
+            .copy_from_slice(&[-1.0, white * 0.5, f32::NAN]);
+        color.plane_row_mut(1, 1).copy_from_slice(&[
+            f32::INFINITY,
+            white * 0.25,
+            f32::NEG_INFINITY,
+        ]);
+
+        let check = |color: &Image3F, expected: [f32; 6]| {
+            let values = lightness(&ctx, color);
+            assert_eq!(values.len(), expected.len());
+            for (value, expected) in values.into_iter().zip(expected) {
+                assert!((value - expected).abs() <= f32::EPSILON);
+            }
+        };
+        check(&color, [0.0, 0.5, 0.0, 0.0, 0.25, 0.0]);
+        color.plane_row_mut(1, 1)[1] = white * 2.0;
+        check(&color, [0.0, 0.25, 0.0, 0.0, 1.0, 0.0]);
+    }
 
     /// A radial glow at `bits` with a hard-edged disc and a little noise in
     /// the low bits.

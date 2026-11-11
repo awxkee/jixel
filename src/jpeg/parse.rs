@@ -937,9 +937,8 @@ fn record_padding(jpg: &mut JpegData, br: &mut BitReader<'_>) {
     if bits != all_ones {
         jpg.has_zero_padding_bit = true;
     }
-    for i in (0..n).rev() {
-        jpg.padding_bits.push(((bits >> i) & 1) as u8);
-    }
+    jpg.padding_bits
+        .extend((0..n).rev().map(|i| ((bits >> i) & 1) as u8));
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -256,11 +256,9 @@ impl MaSamples {
     /// Retain ordinals here so the learner materializes only its selected rows.
     pub(crate) fn evenly_sampled_indices(&self, target: usize) -> Vec<u32> {
         let selected = self.len().min(target);
-        let mut indices = Vec::with_capacity(selected);
-        for sample in 0..selected {
-            indices.push((sample * self.len() / selected) as u32);
-        }
-        indices
+        (0..selected)
+            .map(|sample| (sample * self.len() / selected) as u32)
+            .collect()
     }
 }
 
@@ -504,9 +502,12 @@ fn pick_candidates<T: MaProperty>(
     if stride > 1 && stride.is_multiple_of(2) {
         stride += 1;
     }
-    for props in properties.iter().step_by(stride) {
-        scratch.probe.push(props[prop].into());
-    }
+    scratch.probe.extend(
+        properties
+            .iter()
+            .step_by(stride)
+            .map(|props| Into::<i32>::into(props[prop])),
+    );
     sort_unique_probe(&mut scratch.probe, &mut scratch.probe_bitmap);
     if scratch.probe.len() < 2 {
         return 0;
