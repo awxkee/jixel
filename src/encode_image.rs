@@ -963,11 +963,13 @@ impl EncodeConfig {
         self.icc_profile = Some(icc);
         self
     }
+
     /// Embed EXIF/TIFF metadata (raw TIFF bytes) via an `Exif` container box.
     pub fn with_exif(mut self, exif: Vec<u8>) -> Self {
         self.exif = Some(exif);
         self
     }
+
     /// Embed an XMP packet via an uncompressed `xml ` container box.
     pub fn with_xmp(mut self, xmp: Vec<u8>) -> Self {
         self.xmp = Some(xmp);

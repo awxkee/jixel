@@ -160,41 +160,6 @@ fn extract_exif(jpg: &JpegData) -> Option<(usize, &[u8])> {
     })
 }
 
-/// The orientation tag (0x0112) of a TIFF block's first directory.
-fn exif_orientation(tiff: &[u8]) -> Option<Orientation> {
-    let big_endian = match tiff.get(..4)? {
-        [b'M', b'M', 0, 42] => true,
-        [b'I', b'I', 42, 0] => false,
-        _ => return None,
-    };
-    let u16_at = |at: usize| -> Option<u16> {
-        let b: [u8; 2] = tiff.get(at..at + 2)?.try_into().ok()?;
-        Some(if big_endian {
-            u16::from_be_bytes(b)
-        } else {
-            u16::from_le_bytes(b)
-        })
-    };
-    let u32_at = |at: usize| -> Option<u32> {
-        let b: [u8; 4] = tiff.get(at..at + 4)?.try_into().ok()?;
-        Some(if big_endian {
-            u32::from_be_bytes(b)
-        } else {
-            u32::from_le_bytes(b)
-        })
-    };
-    let ifd = u32_at(4)? as usize;
-    let entries = usize::from(u16_at(ifd)?);
-    (0..entries).find_map(|i| {
-        let entry = ifd + 2 + 12 * i;
-        // A single SHORT, stored in the first half of the value field.
-        if u16_at(entry)? != 0x0112 || u16_at(entry + 2)? != 3 || u32_at(entry + 4)? != 1 {
-            return None;
-        }
-        Orientation::from_exif(u8::try_from(u16_at(entry + 8)?).ok()?)
-    })
-}
-
 /// Extracts the first standard XMP APP1 segment.
 ///
 /// Returns both its index in `app_data` (for JPEG reconstruction tagging) and
@@ -340,7 +305,7 @@ pub fn encode_jpeg_lossless_with_config(
     let exif = extract_exif(&parsed);
     // Viewers follow the codestream's orientation, not the Exif tag.
     let orientation = exif
-        .and_then(|(_, tiff)| exif_orientation(tiff))
+        .and_then(|(_, tiff)| Orientation::from_exif_tiff(tiff))
         .unwrap_or_default();
     let gain_map = uhdr::encode_gain_map(&parsed, orientation, config)?;
     let codestream = encode::encode_jpeg_codestream(
@@ -738,14 +703,23 @@ mod tests {
     fn reads_the_exif_orientation_in_either_byte_order() {
         for big_endian in [true, false] {
             let t = tiff(big_endian, &[(0x010F, 2, 4, 0), (0x0112, 3, 1, 8)]);
-            assert_eq!(exif_orientation(&t), Orientation::from_exif(8));
+            assert_eq!(Orientation::from_exif_tiff(&t), Orientation::from_exif(8));
         }
         // No tag, a wrong type, an out-of-range value or junk: no orientation.
-        assert_eq!(exif_orientation(&tiff(true, &[(0x010F, 2, 4, 0)])), None);
-        assert_eq!(exif_orientation(&tiff(true, &[(0x0112, 4, 1, 6)])), None);
-        assert_eq!(exif_orientation(&tiff(false, &[(0x0112, 3, 1, 9)])), None);
-        assert_eq!(exif_orientation(b"MM\0*\0\0\0\x40"), None);
-        assert_eq!(exif_orientation(b"nonsense"), None);
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(true, &[(0x010F, 2, 4, 0)])),
+            None
+        );
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(true, &[(0x0112, 4, 1, 6)])),
+            None
+        );
+        assert_eq!(
+            Orientation::from_exif_tiff(&tiff(false, &[(0x0112, 3, 1, 9)])),
+            None
+        );
+        assert_eq!(Orientation::from_exif_tiff(b"MM\0*\0\0\0\x40"), None);
+        assert_eq!(Orientation::from_exif_tiff(b"nonsense"), None);
     }
 
     #[test]
@@ -756,7 +730,7 @@ mod tests {
         let jpg = with_app(vec![xmp_app1(b"<x/>"), exif.clone(), exif.clone()]);
         let (index, data) = extract_exif(&jpg).unwrap();
         assert_eq!(index, 1);
-        assert_eq!(exif_orientation(data), Orientation::from_exif(6));
+        assert_eq!(Orientation::from_exif_tiff(data), Orientation::from_exif(6));
         // A bare tag with no TIFF data is not Exif.
         assert_eq!(
             extract_exif(&with_app(vec![vec![
