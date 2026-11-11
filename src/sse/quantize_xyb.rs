@@ -33,7 +33,7 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn round_ties_away_i32(v: __m128) -> __m128i {
+pub(super) fn round_ties_away_i32(v: __m128) -> __m128i {
     let sign = _mm_set1_ps(-0.0);
     let truncated = _mm_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(v);
     let fraction = _mm_sub_ps(v, truncated);

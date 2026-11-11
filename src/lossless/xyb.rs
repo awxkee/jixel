@@ -41,7 +41,7 @@ use super::predictor::{
     channel_to_context, choose_predictor_for_rows, fixed_predictor, selected_grad_pack_interior_fn,
     tokenize_plane, tokenize_plane_rows,
 };
-use super::rct::forward_ycocg;
+use super::rct_simd::forward_ycocg_planes;
 use super::{GROUP_DIM, GroupLayout};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
@@ -340,6 +340,35 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
     )
 }
 
+/// A crop frame of the lossy codestream (see `crop_frames`): XYB lattice ints
+/// (Y, X, B-Y through YCoCg, as the ink frame) replacing a rectangle of
+/// reference slot 0, coded by the learned-tree coder.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_frame_lossless_xyb_crop(
+    linear: &Image3Si,
+    kind: ModularFrameKind<'_>,
+    speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    debug_assert!(matches!(kind, ModularFrameKind::XybCrop { .. }));
+    encode_frame_lossless_core(
+        linear,
+        None,
+        LosslessSettings {
+            max_bits: 13,
+            ..LosslessSettings::rgb8(speed, decoding_speed)
+        },
+        kind,
+        true,
+        pool,
+        scratch,
+        writer,
+    )
+}
+
 /// One lossless 8-bit RGB(+alpha) frame of a layered codestream.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame_lossless_layer(
@@ -410,15 +439,11 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
     };
     // The core takes YCoCg planes (the lossless front end applies RCT 6) and
     // searches the other transforms from there.
-    for y in 0..ysize {
-        for x in 0..xsize {
-            let i = y * xsize + x;
-            let (a, b, c) = forward_ycocg(ch[0][i], ch[1][i], ch[2][i]);
-            atlas.plane_row_mut(0, y)[x] = a;
-            atlas.plane_row_mut(1, y)[x] = b;
-            atlas.plane_row_mut(2, y)[x] = c;
-        }
-    }
+    let len = xsize * ysize;
+    forward_ycocg_planes(
+        ch.each_ref().map(|plane| &plane[..len]),
+        atlas.all_planes_mut().map(|plane| plane.as_mut_slice()),
+    );
     encode_frame_lossless_core(
         &atlas,
         alpha,

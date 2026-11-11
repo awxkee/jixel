@@ -255,14 +255,10 @@ impl Pyramid {
             let mut y = vec![0i32; n];
             let mut co = vec![0i32; n];
             let mut cg = vec![0i32; n];
-            for (((y, co), cg), ((&r, &g), &b)) in y
-                .iter_mut()
-                .zip(&mut co)
-                .zip(&mut cg)
-                .zip(r[..n].iter().zip(&g[..n]).zip(&b[..n]))
-            {
-                (*y, *co, *cg) = crate::lossless::kit::forward_ycocg(r, g, b);
-            }
+            crate::lossless::rct_simd::forward_ycocg_planes(
+                [&r[..n], &g[..n], &b[..n]],
+                [&mut y, &mut co, &mut cg],
+            );
             planes.extend([y, co, cg]);
         } else {
             planes.extend(input.color.iter().map(|p| p[..n].to_vec()));

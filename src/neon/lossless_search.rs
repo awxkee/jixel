@@ -67,10 +67,8 @@ pub(crate) fn rct_row_neon(src: [&[i32]; 3], kind: u32, out: [&mut [i32]; 3]) {
         let rgb = [vaddq_s32(blue, co), vaddq_s32(cg, tmp), blue];
         let [first, second, third] = perm.map(|p| rgb[p]);
         let (v0, v1, v2) = if t == 6 {
-            let v1 = vsubq_s32(first, third);
-            let tmp = vaddq_s32(third, shr::<1>(v1));
-            let v2 = vsubq_s32(second, tmp);
-            (vaddq_s32(tmp, shr::<1>(v2)), v1, v2)
+            let [y, co, cg] = crate::lossless::rct_simd::neon::forward_vec(first, second, third);
+            (y, co, cg)
         } else {
             let v1 = match t >> 1 {
                 1 => vsubq_s32(second, first),

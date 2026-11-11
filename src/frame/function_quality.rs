@@ -423,70 +423,8 @@ fn composite(view: usize, black_plate: bool, plane: &[u8], rgb: &[[u8; 3]], out:
             *dst = [alpha ^ flip; 3];
         }
     } else {
-        debug_assert_eq!(plane.len(), rgb.len());
-        if view == 1 {
-            composite_color::<false>(plane, rgb, out);
-        } else {
-            composite_color::<true>(plane, rgb, out);
-        }
-    }
-}
-
-#[cfg(all(
-    feature = "extraslow",
-    not(all(target_arch = "aarch64", feature = "neon"))
-))]
-fn composite_color<const WHITE: bool>(plane: &[u8], rgb: &[[u8; 3]], out: &mut [[u8; 3]]) {
-    static OVER_BLACK: std::sync::OnceLock<Box<[[u8; 256]; 256]>> = std::sync::OnceLock::new();
-    let over_black = OVER_BLACK.get_or_init(|| {
-        let mut table = Box::new([[0u8; 256]; 256]);
-        for (alpha, row) in table.iter_mut().enumerate() {
-            for (value, cell) in row.iter_mut().enumerate() {
-                *cell = ((alpha * value * 2 + 255) / 510) as u8;
-            }
-        }
-        table
-    });
-    for ((&alpha, &color), dst) in plane.iter().zip(rgb).zip(out) {
-        let row = &over_black[usize::from(alpha)];
-        // Over white the uncovered share adds exactly `255 - alpha`.
-        let lift = if WHITE { 255 - alpha } else { 0 };
-        *dst = color.map(|value| row[usize::from(value)] + lift);
-    }
-}
-
-#[cfg(all(feature = "extraslow", target_arch = "aarch64", feature = "neon"))]
-fn composite_color<const WHITE: bool>(plane: &[u8], rgb: &[[u8; 3]], out: &mut [[u8; 3]]) {
-    use std::arch::aarch64::*;
-
-    let done = plane.len().min(rgb.len()).min(out.len()) / 16 * 16;
-    // SAFETY: each complete block has 16 alpha and 16 interleaved RGB pixels.
-    unsafe {
-        let half = vdupq_n_u16(128);
-        let multiply = |alpha, color| {
-            let lo = vmlal_u8(half, vget_low_u8(alpha), vget_low_u8(color));
-            let hi = vmlal_high_u8(half, alpha, color);
-            // Round a byte product p divided by 255 using only u16 lanes.
-            let lo = vaddq_u16(lo, vshrq_n_u16::<8>(lo));
-            let hi = vaddq_u16(hi, vshrq_n_u16::<8>(hi));
-            vshrn_high_n_u16::<8>(vshrn_n_u16::<8>(lo), hi)
-        };
-        for i in (0..done).step_by(16) {
-            let a = vld1q_u8(plane.as_ptr().add(i));
-            let c = vld3q_u8(rgb.as_ptr().add(i).cast());
-            let [r, g, b] = [multiply(a, c.0), multiply(a, c.1), multiply(a, c.2)];
-            let color = if WHITE {
-                let lift = vmvnq_u8(a);
-                uint8x16x3_t(vaddq_u8(r, lift), vaddq_u8(g, lift), vaddq_u8(b, lift))
-            } else {
-                uint8x16x3_t(r, g, b)
-            };
-            vst3q_u8(out.as_mut_ptr().add(i).cast(), color);
-        }
-    }
-    for ((&alpha, &color), dst) in plane[done..].iter().zip(&rgb[done..]).zip(&mut out[done..]) {
-        let lift = if WHITE { 255 - alpha } else { 0 };
-        *dst = color.map(|v| ((u16::from(alpha) * u16::from(v) + 127) / 255) as u8 + lift);
+        let background = if view == 1 { 0 } else { 255 };
+        crate::simd::rgb8_blend::blend_over_gray(out, rgb, plane, background);
     }
 }
 

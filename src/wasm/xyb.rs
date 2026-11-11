@@ -107,22 +107,27 @@ unsafe fn to_linear_rows<const N: usize>(
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn halley_cbrt_wasm(x: v128, a: v128) -> v128 {
+fn halley_cbrt_wasm<const SCALAR_ORDER: bool>(x: v128, a: v128) -> v128 {
     let tx = f32x4_mul(f32x4_mul(x, x), x);
     let two = f32x4_splat(2.0);
     let num = f32x4_add(tx, f32x4_mul(a, two));
     let den = f32x4_add(a, f32x4_mul(tx, two));
 
-    f32x4_mul(x, f32x4_div(num, den))
+    if SCALAR_ORDER {
+        f32x4_div(f32x4_mul(x, num), den)
+    } else {
+        f32x4_mul(x, f32x4_div(num, den))
+    }
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn integer_pow_1_3_wasm(hx: v128) -> v128 {
-    let scale = u32x4_splat(341);
+fn integer_pow_1_3_wasm<const SCALAR_ORDER: bool>(hx: v128) -> v128 {
+    let scale = u32x4_splat(if SCALAR_ORDER { 0xaaaa_aaab } else { 341 });
+    let shift = if SCALAR_ORDER { 33 } else { 10 };
 
-    let lo64 = u64x2_shr(u64x2_extmul_low_u32x4(hx, scale), 10);
-    let hi64 = u64x2_shr(u64x2_extmul_high_u32x4(hx, scale), 10);
+    let lo64 = u64x2_shr(u64x2_extmul_low_u32x4(hx, scale), shift);
+    let hi64 = u64x2_shr(u64x2_extmul_high_u32x4(hx, scale), shift);
     i8x16_shuffle::<
         0,
         1,
@@ -145,25 +150,38 @@ fn integer_pow_1_3_wasm(hx: v128) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn cbrt_seed_positive_wasm(x: v128) -> v128 {
-    i32x4_add(integer_pow_1_3_wasm(x), i32x4_splat(709958130))
+fn cbrt_seed_positive_wasm<const SCALAR_ORDER: bool>(x: v128) -> v128 {
+    i32x4_add(
+        integer_pow_1_3_wasm::<SCALAR_ORDER>(x),
+        i32x4_splat(709958130),
+    )
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
 pub(crate) fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, v128, v128) {
-    let mut x0 = cbrt_seed_positive_wasm(a0);
-    let mut x1 = cbrt_seed_positive_wasm(a1);
-    let mut x2 = cbrt_seed_positive_wasm(a2);
+    cbrt3_positive_wasm::<false>(a0, a1, a2)
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn cbrt3_positive_wasm<const SCALAR_ORDER: bool>(
+    a0: v128,
+    a1: v128,
+    a2: v128,
+) -> (v128, v128, v128) {
+    let mut x0 = cbrt_seed_positive_wasm::<SCALAR_ORDER>(a0);
+    let mut x1 = cbrt_seed_positive_wasm::<SCALAR_ORDER>(a1);
+    let mut x2 = cbrt_seed_positive_wasm::<SCALAR_ORDER>(a2);
 
     // Interleave the three cube roots to expose independent work.
-    x0 = halley_cbrt_wasm(x0, a0);
-    x1 = halley_cbrt_wasm(x1, a1);
-    x2 = halley_cbrt_wasm(x2, a2);
+    x0 = halley_cbrt_wasm::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_wasm::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_wasm::<SCALAR_ORDER>(x2, a2);
 
-    x0 = halley_cbrt_wasm(x0, a0);
-    x1 = halley_cbrt_wasm(x1, a1);
-    x2 = halley_cbrt_wasm(x2, a2);
+    x0 = halley_cbrt_wasm::<SCALAR_ORDER>(x0, a0);
+    x1 = halley_cbrt_wasm::<SCALAR_ORDER>(x1, a1);
+    x2 = halley_cbrt_wasm::<SCALAR_ORDER>(x2, a2);
 
     let zero = f32x4_splat(0.0);
     x0 = v128_bitselect(zero, x0, f32x4_eq(a0, zero));
@@ -175,7 +193,12 @@ pub(crate) fn vcbrt_fast3_positive_wasm(a0: v128, a1: v128, a2: v128) -> (v128, 
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn rgb_to_xyb_f32x4_wasm(m: &XybMatrix, r: v128, g: v128, b: v128) -> (v128, v128, v128) {
+fn rgb_to_xyb_f32x4_wasm<const SCALAR_ORDER: bool>(
+    m: &XybMatrix,
+    r: v128,
+    g: v128,
+    b: v128,
+) -> (v128, v128, v128) {
     let bias = f32x4_splat(OPSIN_BIAS);
 
     // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
@@ -194,11 +217,17 @@ fn rgb_to_xyb_f32x4_wasm(m: &XybMatrix, r: v128, g: v128, b: v128) -> (v128, v12
     mixed2 = f32x4_add(mixed2, f32x4_mul(r, f32x4_splat(m.fwd[6])));
 
     let zero = f32x4_splat(0.0);
-    mixed0 = f32x4_max(mixed0, zero);
-    mixed1 = f32x4_max(mixed1, zero);
-    mixed2 = f32x4_max(mixed2, zero);
+    if SCALAR_ORDER {
+        mixed0 = v128_and(mixed0, f32x4_gt(mixed0, zero));
+        mixed1 = v128_and(mixed1, f32x4_gt(mixed1, zero));
+        mixed2 = v128_and(mixed2, f32x4_gt(mixed2, zero));
+    } else {
+        mixed0 = f32x4_max(mixed0, zero);
+        mixed1 = f32x4_max(mixed1, zero);
+        mixed2 = f32x4_max(mixed2, zero);
+    }
 
-    let (tm0, tm1, tm2) = vcbrt_fast3_positive_wasm(mixed0, mixed1, mixed2);
+    let (tm0, tm1, tm2) = cbrt3_positive_wasm::<SCALAR_ORDER>(mixed0, mixed1, mixed2);
 
     let neg_bias = f32x4_splat(NEG_BIAS_CBRT);
 
@@ -212,6 +241,48 @@ fn rgb_to_xyb_f32x4_wasm(m: &XybMatrix, r: v128, g: v128, b: v128) -> (v128, v12
     let y = f32x4_mul(f32x4_add(tm0, tm1), half);
 
     (x, y, tm2)
+}
+
+/// Convert the complete SIMD vectors of the modular XYB lattice.
+#[target_feature(enable = "simd128")]
+pub(crate) fn xyb_lattice_wasm(
+    m: &XybMatrix,
+    [r, g, b]: [&[f32]; 3],
+    [luma, co, cg]: [&mut [i32]; 3],
+) -> usize {
+    use super::quantize_xyb::round_ties_away_i32;
+    use crate::lossless::rct_simd::wasm::forward_vec;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    let [sx, sy, sb] = [
+        f32x4_splat(INV_DC_QUANT[0]),
+        f32x4_splat(INV_DC_QUANT[1]),
+        f32x4_splat(INV_DC_QUANT[2]),
+    ];
+    let r = r.as_chunks::<4>().0;
+    let g = g.as_chunks::<4>().0;
+    let b = b.as_chunks::<4>().0;
+    let luma = luma.as_chunks_mut::<4>().0;
+    let co = co.as_chunks_mut::<4>().0;
+    let cg = cg.as_chunks_mut::<4>().0;
+    for (((r, g), b), ((luma, co_out), cg_out)) in
+        r.iter().zip(g).zip(b).zip(luma.iter_mut().zip(co).zip(cg))
+    {
+        let r = unsafe { v128_load(r.as_ptr().cast()) };
+        let g = unsafe { v128_load(g.as_ptr().cast()) };
+        let b = unsafe { v128_load(b.as_ptr().cast()) };
+        let (x, y, b) = rgb_to_xyb_f32x4_wasm::<true>(m, r, g, b);
+        let y = round_ties_away_i32(f32x4_mul(y, sy));
+        let x = round_ties_away_i32(f32x4_mul(x, sx));
+        let b_minus_y = i32x4_sub(round_ties_away_i32(f32x4_mul(b, sb)), y);
+        let [luma_value, co, cg] = forward_vec(y, x, b_minus_y);
+        unsafe {
+            v128_store(luma.as_mut_ptr().cast(), luma_value);
+            v128_store(co_out.as_mut_ptr().cast(), co);
+            v128_store(cg_out.as_mut_ptr().cast(), cg);
+        }
+    }
+    r.len() * 4
 }
 
 /// Transform one row-band into separate output planes.
@@ -251,7 +322,7 @@ pub(crate) fn to_xyb_wasm_band(
             let g = unsafe { v128_load(g4.as_ptr().cast()) };
             let b = unsafe { v128_load(b4.as_ptr().cast()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm::<false>(m, r, g, b);
 
             unsafe {
                 v128_store(x4.as_mut_ptr().cast(), xv);
@@ -273,7 +344,7 @@ pub(crate) fn to_xyb_wasm_band(
             let g = unsafe { v128_load(g4.as_ptr().cast()) };
             let b = unsafe { v128_load(b4.as_ptr().cast()) };
 
-            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm(m, r, g, b);
+            let (xv, yv, bv) = rgb_to_xyb_f32x4_wasm::<false>(m, r, g, b);
 
             unsafe {
                 v128_store(r4.as_mut_ptr().cast(), xv);

@@ -34,8 +34,6 @@ fn fuzz_encode(data: &[u8]) {
         _ => 2, // grayscale + alpha
     };
 
-    println!("width {} height {}", width, height);
-
     let pixels = exact_size_pixels(&data[HEADER_LEN..], width * height * channels);
     let quality = f32::from(control >> 3) * (100.0 / 31.0);
     let config = EncodeConfig::default()

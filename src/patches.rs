@@ -920,6 +920,17 @@ pub(crate) enum ModularFrameKind<'a> {
         height: usize,
         last: bool,
     },
+    /// A crop frame of an `xyb_encoded` codestream (see `crop_frames`): the
+    /// crop at (`x0`, `y0`) on the XYB lattice of the VarDCT base, replacing
+    /// that rectangle of reference slot 0, saved back to the slot unless it
+    /// is the last frame.
+    XybCrop {
+        x0: usize,
+        y0: usize,
+        width: usize,
+        height: usize,
+        last: bool,
+    },
     /// The last frame of a cell-layer codestream (see `cell_layer`): a crop
     /// at (`x0`, `y0`) of `width` x `height` image pixels, coded at that
     /// size over the frame's upsampling factor, alpha-blended (kBlend with
@@ -946,6 +957,7 @@ impl ModularFrameKind<'_> {
                 | Self::RgbSavedFirst
                 | Self::RgbBlendLast
                 | Self::RgbCrop { .. }
+                | Self::XybCrop { .. }
                 | Self::RgbBlendCrop { .. }
         )
     }

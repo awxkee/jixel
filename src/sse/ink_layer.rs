@@ -50,32 +50,10 @@ fn any(v: __m128i) -> bool {
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn luma_row_sse41(rgb: &[[u8; 3]], out: &mut [u8]) {
     assert!(rgb.len() >= out.len());
-    let masks: [[__m128i; 3]; 3] = std::array::from_fn(|c| {
-        std::array::from_fn(|part| {
-            let indices: [i8; 16] = std::array::from_fn(|i| {
-                if (3 * i + c) / 16 == part {
-                    ((3 * i + c) % 16) as i8
-                } else {
-                    -128
-                }
-            });
-            unsafe { _mm_loadu_si128(indices.as_ptr().cast()) }
-        })
-    });
     let end = out.len() / 16 * 16;
-    for x in (0..end).step_by(16) {
-        let src: [__m128i; 3] = std::array::from_fn(|part| unsafe {
-            _mm_loadu_si128(rgb.as_ptr().add(x).cast::<u8>().add(part * 16).cast())
-        });
-        let channels: [__m128i; 3] = std::array::from_fn(|c| {
-            _mm_or_si128(
-                _mm_or_si128(
-                    _mm_shuffle_epi8(src[0], masks[c][0]),
-                    _mm_shuffle_epi8(src[1], masks[c][1]),
-                ),
-                _mm_shuffle_epi8(src[2], masks[c][2]),
-            )
-        });
+    for (x, pixels) in rgb[..end].as_chunks::<16>().0.iter().enumerate() {
+        let x = x * 16;
+        let channels = crate::simd::sse::deinterleave_rgb8(pixels);
         let zero = _mm_setzero_si128();
         let half = |hi: bool| {
             let [r, g, b] = channels.map(|v| {

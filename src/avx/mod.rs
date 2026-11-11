@@ -105,6 +105,7 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2, round_lattice_pow2_avx2,
 };
+pub(crate) use xyb::xyb_lattice_avx2;
 pub(crate) use xyb::{to_linear_rows_avx2, to_xyb_avx2_band};
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

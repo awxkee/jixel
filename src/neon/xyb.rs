@@ -233,6 +233,47 @@ pub(super) fn rgb_to_xyb_f32x4_neon<const SCALAR_ORDER: bool>(
     (x, y, tm2)
 }
 
+/// Convert the complete SIMD vectors of the modular XYB lattice.
+#[target_feature(enable = "neon")]
+pub(crate) fn xyb_lattice_neon(
+    m: &XybMatrix,
+    [r, g, b]: [&[f32]; 3],
+    [luma, co, cg]: [&mut [i32]; 3],
+) -> usize {
+    use crate::lossless::rct_simd::neon::forward_vec;
+    use crate::quant_weights::INV_DC_QUANT;
+
+    let [sx, sy, sb] = [
+        vdupq_n_f32(INV_DC_QUANT[0]),
+        vdupq_n_f32(INV_DC_QUANT[1]),
+        vdupq_n_f32(INV_DC_QUANT[2]),
+    ];
+    let r = r.as_chunks::<4>().0;
+    let g = g.as_chunks::<4>().0;
+    let b = b.as_chunks::<4>().0;
+    let luma = luma.as_chunks_mut::<4>().0;
+    let co = co.as_chunks_mut::<4>().0;
+    let cg = cg.as_chunks_mut::<4>().0;
+    for (((r, g), b), ((luma, co_out), cg_out)) in
+        r.iter().zip(g).zip(b).zip(luma.iter_mut().zip(co).zip(cg))
+    {
+        let r = unsafe { vld1q_f32(r.as_ptr()) };
+        let g = unsafe { vld1q_f32(g.as_ptr()) };
+        let b = unsafe { vld1q_f32(b.as_ptr()) };
+        let (x, y, b) = rgb_to_xyb_f32x4_neon::<true>(m, r, g, b);
+        let y = vcvtaq_s32_f32(vmulq_f32(y, sy));
+        let x = vcvtaq_s32_f32(vmulq_f32(x, sx));
+        let b_minus_y = vsubq_s32(vcvtaq_s32_f32(vmulq_f32(b, sb)), y);
+        let [luma_value, co, cg] = forward_vec(y, x, b_minus_y);
+        unsafe {
+            vst1q_s32(luma.as_mut_ptr(), luma_value);
+            vst1q_s32(co_out.as_mut_ptr(), co);
+            vst1q_s32(cg_out.as_mut_ptr(), cg);
+        }
+    }
+    r.len() * 4
+}
+
 /// Transform one row-band into separate output planes.
 #[target_feature(enable = "neon")]
 pub(crate) fn to_xyb_neon_band(

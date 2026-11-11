@@ -80,6 +80,7 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm, round_lattice_pow2_wasm,
 };
+pub(crate) use xyb::xyb_lattice_wasm;
 pub(crate) use xyb::{to_linear_rows_wasm, to_xyb_wasm_band};
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
 

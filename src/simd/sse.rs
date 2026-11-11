@@ -27,6 +27,30 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+pub(crate) fn deinterleave_rgb8(pixels: &[[u8; 3]; 16]) -> [__m128i; 3] {
+    let src = pixels.as_ptr().cast::<u8>();
+    let loads: [_; 3] = std::array::from_fn(|i| unsafe { _mm_loadu_si128(src.add(16 * i).cast()) });
+    super::RGB8_SHUFFLE.each_ref().map(|channel| {
+        let masks = channel
+            .each_ref()
+            .map(|part| unsafe { _mm_loadu_si128(part.as_ptr().cast()) });
+        _mm_or_si128(
+            _mm_or_si128(
+                _mm_shuffle_epi8(loads[0], masks[0]),
+                _mm_shuffle_epi8(loads[1], masks[1]),
+            ),
+            _mm_shuffle_epi8(loads[2], masks[2]),
+        )
+    })
+}
+
 #[cfg(feature = "sse")]
 pub(crate) mod i32 {
     pub(crate) type Vector = __m128i;

@@ -31,7 +31,7 @@
 
 use super::super::entropy::EntropyOfHistFn;
 use super::super::ma_source::{MaChannel, MaPixels, MaSource, MaTransform};
-use super::super::rct::inverse_ycocg;
+use super::super::rct::selected_rct_row_fn;
 use super::{visit_gray_colors, visit_palette_colors};
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
@@ -644,17 +644,12 @@ pub(in crate::lossless) fn build_global_palette(
             let mut indices: Vec<u16> = Vec::with_capacity(npx);
             let mut previous = ([0; 4], -1);
             // YCoCg is reversible, so distinct input tuples identify exactly the same
-            // colors. Reconstruct RGB only when adding a new palette entry.
+            // colors. Reconstruct the accepted palette entries in batches.
             let visit = |color: [i32; 4]| {
                 if previous.1 < 0 || previous.0 != color {
                     let next = first_seen.len() as i32;
                     let id = *seen.entry(color).or_insert_with(|| {
-                        let (r, g, b) = if gray {
-                            (color[0], color[0], color[0])
-                        } else {
-                            inverse_ycocg(color[0], color[1], color[2])
-                        };
-                        first_seen.push([r, g, b, color[3]]);
+                        first_seen.push(color);
                         next
                     });
                     if first_seen.len() > GLOBAL_PALETTE_MAX_COLORS {
@@ -690,6 +685,28 @@ pub(in crate::lossless) fn build_global_palette(
             };
             if !narrower {
                 return None;
+            }
+            if !gray {
+                let inverse = selected_rct_row_fn();
+                const BLOCK: usize = 64;
+                let mut src = [[0; BLOCK]; 3];
+                let mut rgb = [[0; BLOCK]; 3];
+                for colors in first_seen.chunks_mut(BLOCK) {
+                    let len = colors.len();
+                    let [y, co, cg] = &mut src;
+                    for (i, &[a, b, c, _]) in colors.iter().enumerate() {
+                        (y[i], co[i], cg[i]) = (a, b, c);
+                    }
+                    inverse(
+                        src.each_ref().map(|p| &p[..len]),
+                        0,
+                        rgb.each_mut().map(|p| &mut p[..len]),
+                    );
+                    let [r, g, b] = &rgb;
+                    for (i, color) in colors.iter_mut().enumerate() {
+                        color[..3].copy_from_slice(&[r[i], g[i], b[i]]);
+                    }
+                }
             }
             (first_seen, indices)
         };

@@ -37,6 +37,8 @@ use crate::entropy::{pack_signed, uint_encode};
 use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
 
+pub(crate) mod row_kernels;
+
 // ---------------------------------------------------------------------------
 // Forward reversible YCoCg (RCT type 6, matches libjxl's InvRCTRow<6>).
 //
@@ -180,10 +182,7 @@ fn rct_perm(perm: usize) -> [usize; 3] {
 #[inline]
 fn rct_forward_pixel(t: u32, first: i32, second: i32, third: i32) -> (i32, i32, i32) {
     if t == 6 {
-        let o1 = first - third;
-        let tmp = third + (o1 >> 1);
-        let o2 = second - tmp;
-        (tmp + (o2 >> 1), o1, o2)
+        forward_ycocg(first, second, third)
     } else {
         let s = match t >> 1 {
             1 => second - first,

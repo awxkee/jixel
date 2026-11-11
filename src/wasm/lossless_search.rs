@@ -72,10 +72,8 @@ pub(crate) fn rct_row_wasm(src: [&[i32]; 3], kind: u32, out: [&mut [i32]; 3]) {
         let rgb = [i32x4_add(blue, co), i32x4_add(cg, tmp), blue];
         let [first, second, third] = perm.map(|p| rgb[p]);
         let (v0, v1, v2) = if t == 6 {
-            let v1 = i32x4_sub(first, third);
-            let tmp = i32x4_add(third, shr::<1>(v1));
-            let v2 = i32x4_sub(second, tmp);
-            (i32x4_add(tmp, shr::<1>(v2)), v1, v2)
+            let [y, co, cg] = crate::lossless::rct_simd::wasm::forward_vec(first, second, third);
+            (y, co, cg)
         } else {
             let v1 = match t >> 1 {
                 1 => i32x4_sub(second, first),

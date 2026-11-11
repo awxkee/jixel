@@ -38,7 +38,8 @@ use crate::frame::encode_frame;
 use crate::gain_map::{EncodedGainMap, GainMap, encode_gain_map};
 use crate::image::{Image3F, Image3Si};
 use crate::jpeg::BrotliCompression;
-use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
+use crate::lossless::rct_simd::{forward_ycocg_in_place, rgb8_to_ycocg};
+use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float};
 use crate::orientation::Orientation;
 use crate::xyb::XybMatrix;
 use crate::{ColorEncoding, EncodeError, Grain};
@@ -497,6 +498,12 @@ pub struct EncodeConfig {
     /// usual. 8-bit RGB input only; the output is near-lossless and
     /// independent of `distance`. Defaults to false.
     pub vector_layers: bool,
+    /// Crop frames for mixed composites (slides, posters, screen captures
+    /// with photos): flat rectangles of an image the whole-image layer arms
+    /// reject are cut out as cropped frames on the XYB lattice over a
+    /// VarDCT base filled smooth under them, raced against the ordinary
+    /// encode. 8-bit RGB lossy XYB only. Defaults to false.
+    pub crop_frames: bool,
     /// Progressive DC for lossy VarDCT: the 1:8 DC image is coded as its own
     /// squeezed modular frame ahead of the main frame, so a decoder can show
     /// previews refining from 1:256 to 1:8 before any AC data arrives.
@@ -667,6 +674,7 @@ impl Default for EncodeConfig {
             lossy_modular: LossyModular::Off,
             ink_layer: false,
             vector_layers: false,
+            crop_frames: false,
             progressive_dc: false,
             progressive_dc_levels: None,
             group_order: GroupOrder::Scanline,
@@ -1087,6 +1095,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Crop frames for mixed composites (see [`EncodeConfig::crop_frames`]).
+    pub fn with_crop_frames(mut self, crop_frames: bool) -> Self {
+        self.crop_frames = crop_frames;
+        self
+    }
+
     /// Code the lossy DC as a progressive DC frame (see
     /// [`EncodeConfig::progressive_dc`]).
     pub fn with_progressive_dc(mut self, progressive_dc: bool) -> Self {
@@ -1154,8 +1168,9 @@ impl EncodeConfig {
     }
 
     /// Select the encode-speed/density tradeoff (see [`Speed`]).
-    /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also turn on [`EncodeConfig::patches`]
-    /// and [`EncodeConfig::vector_layers`]; [`Speed::Medium`] and above turn on
+    /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also turn on [`EncodeConfig::patches`],
+    /// [`EncodeConfig::vector_layers`] and [`EncodeConfig::crop_frames`];
+    /// [`Speed::Medium`] and above turn on
     /// [`EncodeConfig::ink_layer`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
@@ -1167,6 +1182,7 @@ impl EncodeConfig {
         }
         if speed.effort().vector_layers_default {
             self.vector_layers = true;
+            self.crop_frames = true;
         }
         self
     }
@@ -1444,6 +1460,31 @@ pub fn encode_image(
                 .with_num_threads(config.num_threads),
         );
     }
+    let (whole, ordinary) = encode_image_arms(input, width, height, config)?;
+    // Crop frames race the whole-image encode on mixed composites, where the
+    // ordinary encode stood: crops over a plain VarDCT base do not beat a
+    // vector or ink stack that already took the image.
+    if config.crop_frames
+        && ordinary
+        && config.coding_transform == CodingTransform::Xyb
+        && !config.progressive
+        && !config.progressive_dc
+        && let Some(stack) = encode_crop_stack(input, width, height, config, whole.len())?
+        && stack.len() < whole.len()
+    {
+        return Ok(stack);
+    }
+    Ok(whole)
+}
+
+/// The whole-image arms (vector layers, ink stack, VarDCT) of a validated
+/// lossy RGB encode, and whether the ordinary (plain) encode stood.
+fn encode_image_arms(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<(Vec<u8>, bool), EncodeError> {
     // The ink plan serves both layer paths: the ink stack codes it, and the
     // vector race reads its glyph-text flag.
     let layers = config.coding_transform == CodingTransform::Xyb && !config.progressive_dc;
@@ -1460,6 +1501,7 @@ pub fn encode_image(
         let mut plain_config = config.clone();
         plain_config.ink_layer = false;
         plain_config.vector_layers = false;
+        plain_config.crop_frames = false;
         encode_image(input, width, height, &plain_config)
     };
     let mut plain = None;
@@ -1514,7 +1556,7 @@ pub fn encode_image(
                 }
             }
             match (fitted, &plain) {
-                (Some(bytes), None) => return Ok(bytes),
+                (Some(bytes), None) => return Ok((bytes, false)),
                 (Some(bytes), Some(_)) => vector = Some(bytes),
                 (None, _) => {}
             }
@@ -1529,6 +1571,9 @@ pub fn encode_image(
         }
     };
     if config.ink_layer && ink_plan.is_some() {
+        // A copy of the ordinary encode, when the ink selection asked for it,
+        // tells whether it stood.
+        let ordinary = std::cell::RefCell::new(None);
         let inked = select_ink_layered(
             ink_plan,
             width,
@@ -1536,20 +1581,29 @@ pub fn encode_image(
             config,
             None,
             crate::vector_layers::vardct_bytes(input, width, height, config.distance),
-            || match plain {
-                Some(plain) => Ok(plain),
-                None => plain_encode(),
+            || {
+                let bytes = match plain {
+                    Some(plain) => plain,
+                    None => plain_encode()?,
+                };
+                *ordinary.borrow_mut() = Some(bytes.clone());
+                Ok(bytes)
             },
         )?;
-        return Ok(match vector {
+        let chosen = match vector {
             Some(vector) => smaller(vector, inked),
             None => inked,
-        });
+        };
+        let stood = ordinary.borrow().as_ref() == Some(&chosen);
+        return Ok((chosen, stood));
     }
     match (vector, plain) {
-        (Some(vector), Some(plain)) => return Ok(smaller(vector, plain)),
-        (Some(vector), None) => return Ok(vector),
-        (None, Some(plain)) => return Ok(plain),
+        (Some(vector), Some(plain)) => {
+            let stood = vector.len() > plain.len();
+            return Ok((smaller(vector, plain), stood));
+        }
+        (Some(vector), None) => return Ok((vector, false)),
+        (None, Some(plain)) => return Ok((plain, true)),
         (None, None) => {}
     }
     let distance = config.distance.max(MIN_DISTANCE);
@@ -1587,6 +1641,7 @@ pub fn encode_image(
         &ctx,
         &mut scratch,
     )
+    .map(|bytes| (bytes, true))
 }
 
 /// Encode the selected decomposition once, or use the ordinary path.
@@ -1868,30 +1923,35 @@ fn encode_ink_base(
     Ok((ctx, frame))
 }
 
-/// A color on the XYB lattice of the VarDCT base, as the YCoCg triple the
-/// signaled RCT restores exactly: Y, X and B-Y on the default LF dequant
-/// steps.
-fn xyb_lattice_ycocg(
-    ctx: &EncodingContext,
-    transform: &ColorTransform<crate::color::TransferLut>,
-    rgb: [u8; 3],
-) -> (i32, i32, i32) {
-    let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
-    transform.transform_block(&[rgb], [&mut r, &mut g, &mut b]);
-    let (x, y, b) = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, r[0], g[0], b[0]);
-    let y = (y * crate::quant_weights::INV_DC_QUANT[1]).round() as i32;
-    forward_ycocg(
-        y,
-        (x * crate::quant_weights::INV_DC_QUANT[0]).round() as i32,
-        (b * crate::quant_weights::INV_DC_QUANT[2]).round() as i32 - y,
-    )
+/// Use a bounded RGB staging buffer for both ink palettes and full crops.
+fn rgb_to_xyb_lattice(
+    matrix: &XybMatrix,
+    transform: &ColorTransform<TransferLut>,
+    rgb: &[[u8; 3]],
+    [luma, co, cg]: [&mut [i32]; 3],
+) {
+    const BLOCK: usize = 256;
+    let mut linear = [[0.0; BLOCK]; 3];
+    for (((pixels, luma), co), cg) in rgb
+        .chunks(BLOCK)
+        .zip(luma.chunks_mut(BLOCK))
+        .zip(co.chunks_mut(BLOCK))
+        .zip(cg.chunks_mut(BLOCK))
+    {
+        transform.transform_block(pixels, linear.each_mut().map(|p| &mut p[..pixels.len()]));
+        crate::xyb::xyb_lattice_ycocg(
+            matrix,
+            linear.each_ref().map(|p| &p[..pixels.len()]),
+            [luma, co, cg],
+        );
+    }
 }
 
 /// The palette of inks on the base frame's XYB lattice, with exact coverage.
 #[allow(clippy::too_many_arguments)]
 fn encode_ink_frame(
     ctx: &EncodingContext,
-    transform: &ColorTransform<crate::color::TransferLut>,
+    transform: &ColorTransform<TransferLut>,
     colors: &[([u8; 3], u8)],
     indices: Vec<u8>,
     width: usize,
@@ -1899,27 +1959,31 @@ fn encode_ink_frame(
     config: &EncodeConfig,
     scratch: &mut CoderScratch,
 ) -> Result<BitWriter, EncodeError> {
-    let palette: Vec<_> = colors
-        .iter()
-        .map(|&(ink, alpha)| (xyb_lattice_ycocg(ctx, transform, ink), alpha))
-        .collect();
+    let mut rgb = [[0; 3]; 256];
+    let rgb = &mut rgb[..colors.len()];
+    for (rgb, &(ink, _)) in rgb.iter_mut().zip(colors) {
+        *rgb = ink;
+    }
+    let mut palette = [[0; 256]; 3];
+    rgb_to_xyb_lattice(
+        &ctx.xyb,
+        transform,
+        rgb,
+        palette.each_mut().map(|p| &mut p[..colors.len()]),
+    );
+    let [palette_y, palette_co, palette_cg] = &palette;
     let mut image = Image3Si::new(width, height);
     let mut alpha = vec![0u8; width * height];
-    for (y, row) in indices.chunks_exact(width).enumerate() {
-        for c in 0..3 {
-            let dst = image.plane_row_mut(c, y);
-            for (d, &k) in dst.iter_mut().zip(row) {
-                let v = palette[k as usize].0;
-                *d = match c {
-                    0 => v.0,
-                    1 => v.1,
-                    _ => v.2,
-                };
-            }
-        }
-        for (a, &k) in alpha[y * width..][..width].iter_mut().zip(row) {
-            *a = palette[k as usize].1;
-        }
+    let [luma, co, cg] = image.all_planes_mut().map(|plane| plane.as_mut_slice());
+    let dst = luma.iter_mut().zip(co).zip(cg).zip(&mut alpha);
+    for ((((luma, co), cg), alpha), &index) in dst.zip(&indices) {
+        let index = usize::from(index);
+        (*luma, *co, *cg, *alpha) = (
+            palette_y[index],
+            palette_co[index],
+            palette_cg[index],
+            colors[index].1,
+        );
     }
     drop(indices);
     let alpha = AlphaPlane::from_u8(alpha);
@@ -1946,6 +2010,205 @@ fn encode_ink_frame(
     Ok(frame)
 }
 
+/// Crop frames for a mixed composite (see `crop_frames`): the image with the
+/// chosen flat rectangles filled flat, as a VarDCT base saved to reference
+/// slot 0, then each rectangle as a cropped kReplace frame on the base's XYB
+/// lattice. A rectangle is chosen when its frame costs less than the plain
+/// VarDCT encode of the same crop (the edge model of `vector_layers` ranks
+/// screen crops wrongly: text it overprices, bars and rounded sheets it
+/// underprices). `None` when none is chosen or the stack cannot beat
+/// `whole` bytes.
+fn encode_crop_stack(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    whole: usize,
+) -> Result<Option<Vec<u8>>, EncodeError> {
+    use crate::crop_frames;
+    use crate::encoding_context::FrameRole;
+    use crate::patches::ModularFrameKind;
+    let boxes = crop_frames::plan(input, width, height);
+    if boxes.is_empty() {
+        return Ok(None);
+    }
+    let distance = config.distance.max(MIN_DISTANCE);
+    let transform = ColorTransform::for_integer(
+        8,
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+        config.intensity_target,
+    );
+    let speed = if config.speed >= Speed::Slow {
+        Speed::Slow
+    } else {
+        Speed::Medium
+    };
+    let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+    let mut scratch = Box::<CoderScratch>::default();
+    // One crop frame on the lattice of `ctx`'s opsin matrix; `None` when the
+    // coder refuses it.
+    let crop_frame = |ctx: &EncodingContext,
+                      rgb: &[u8],
+                      b: &crop_frames::CropBox,
+                      last: bool,
+                      speed: Speed,
+                      scratch: &mut CoderScratch|
+     -> Option<BitWriter> {
+        let mut image = Image3Si::new(b.width, b.height);
+        rgb_to_xyb_lattice(
+            &ctx.xyb,
+            &transform,
+            rgb.as_chunks::<3>().0,
+            image.all_planes_mut().map(|plane| plane.as_mut_slice()),
+        );
+        let mut frame = BitWriter::new();
+        crate::lossless::encode_frame_lossless_xyb_crop(
+            &image,
+            ModularFrameKind::XybCrop {
+                x0: b.x0,
+                y0: b.y0,
+                width: b.width,
+                height: b.height,
+                last,
+            },
+            speed,
+            config.decoding_speed,
+            &pool,
+            scratch,
+            &mut frame,
+        )
+        .then_some(frame)
+    };
+    // Choose on the spec matrix's lattice: the base's own matrix is only
+    // known once the base is coded, and moves the crop size by a few bytes.
+    let spec = lossy_context(config, distance, XybMatrix::SPEC, width * height);
+    // Both sides of the choice are priced at a fast tier: Fast VarDCT runs
+    // ~5-10 % over Slow on a crop and the Medium lossless frame ~5 % over
+    // Slow, so the comparison holds at a fraction of the time.
+    let mut vardct_config = config.clone();
+    vardct_config.ink_layer = false;
+    vardct_config.vector_layers = false;
+    vardct_config.crop_frames = false;
+    vardct_config.speed = Speed::Fast;
+    let mut chosen = Vec::new();
+    let mut estimated_saving = 0.0;
+    for b in &boxes {
+        let crop = crop_frames::cut(input, width, b);
+        // What VarDCT spends on the rectangle: the crop coded on its own by
+        // the plain encoder at this distance.
+        let model = encode_image(&crop, b.width, b.height, &vardct_config)?.len() as f64;
+        let content = crop_frames::content(crop, b, config.distance);
+        let Some(frame) = crop_frame(&spec, &content, b, false, Speed::Medium, &mut scratch) else {
+            continue;
+        };
+        let bytes = frame.bits_written() as f64 / 8.0 + crop_frames::FRAME_OVERHEAD;
+        if bytes < model {
+            estimated_saving += model - bytes;
+            chosen.push((*b, content, model - bytes, bytes));
+        }
+    }
+    drop(spec);
+    if chosen.is_empty() || estimated_saving < 0.01 * whole as f64 {
+        return Ok(None);
+    }
+    // The filled base and the chosen crops over it, finalized.
+    // `None` with the base's bytes when the stack cannot beat `whole`.
+    let stack = |chosen: &[&(crop_frames::CropBox, Vec<u8>, f64, f64)],
+                 scratch: &mut CoderScratch|
+     -> Result<(Option<Vec<u8>>, usize), EncodeError> {
+        let rects: Vec<_> = chosen.iter().map(|(b, ..)| *b).collect();
+        let filled = crop_frames::fill(input, width, &rects);
+        let pixels = width * height;
+        let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, pixels);
+        ctx.lossy_modular = LossyModular::Off;
+        ctx.frame_role = FrameRole::SavedFirst;
+        let linear = linearize_rgb::<_, _, 3>(&filled, width, height, &ctx, scratch, &transform);
+        drop(filled);
+        ctx.set_coding(CodingTransform::Xyb, distance);
+        apply_yellow_opsin(&mut ctx, &linear, distance);
+        let mut base = BitWriter::new();
+        encode_frame(
+            &ctx,
+            scratch,
+            distance,
+            linear,
+            None,
+            false,
+            None,
+            config.fill_invisible,
+            &[0],
+            config.patches,
+            true,
+            &mut base,
+        )?;
+        let base_bytes = base.bits_written() / 8;
+        if base_bytes >= whole {
+            return Ok((None, base_bytes));
+        }
+        let mut w = BitWriter::new();
+        w.write(8, 0xFF);
+        w.write(8, CODESTREAM_MARKER as u64);
+        write_size_header(width, height, &mut w);
+        write_image_metadata(
+            &ImageMetadataParams {
+                tone_mapping: config.tone_mapping(),
+                color_encoding: &config.color_encoding,
+                alpha: None,
+                black: false,
+                icc_profile: config.icc_profile.as_deref(),
+                bps: BitsPerSample::Eight,
+                lossless: false,
+                xyb_encoded: true,
+                xyb: &ctx.xyb,
+                grayscale: false,
+                orientation: config.orientation,
+                lossy_modular_16: false,
+                extra_16: false,
+                upsampling_kernel: None,
+            },
+            scratch,
+            &mut w,
+        );
+        w.append(&base);
+        drop(base);
+        let last = chosen.len() - 1;
+        for (i, (b, content, ..)) in chosen.iter().enumerate() {
+            let Some(frame) = crop_frame(&ctx, content, b, i == last, speed, scratch) else {
+                return Ok((None, base_bytes));
+            };
+            w.append(&frame);
+        }
+        finalize_container(
+            w.into_bytes(),
+            config.exif.as_deref(),
+            config.xmp.as_deref(),
+            config.brotli_compression.as_deref(),
+            false,
+            encode_gain_map(config)?.as_ref(),
+        )
+        .map(|bytes| (Some(bytes), base_bytes))
+    };
+    let all: Vec<_> = chosen.iter().collect();
+    let (first, first_base) = stack(&all, &mut scratch)?;
+    if first.as_ref().is_some_and(|bytes| bytes.len() < whole) || chosen.len() == 1 {
+        return Ok(first);
+    }
+    // The plain crop encode overprices a rectangle the whole encode codes
+    // cheaply (its patches, its shared context), so a full set can lose
+    // where its best member alone wins: one more base, that member alone.
+    let best = chosen
+        .iter()
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .expect("chosen is not empty");
+    // The second base fills less, so it costs at least the first: with the
+    // best crop's frame on top already past `whole`, it cannot win.
+    if best.2 < 0.03 * whole as f64 || first_base as f64 + best.3 >= whole as f64 {
+        return Ok(first);
+    }
+    Ok(stack(&[best], &mut scratch)?.0)
+}
+
 /// Two lossless modular frames for a vector split: the palette base saved
 /// to reference slot 0, then the coverage frame blended over it (kBlend).
 struct VectorEncode {
@@ -1967,22 +2230,10 @@ fn encode_vector_layers(
     let pixels = width * height;
     let planes = |rgb: &[u8]| {
         let mut image = Image3Si::new(width, height);
-        let mut row = vec![(0i32, 0i32, 0i32); width];
-        for (y, src) in rgb.as_chunks::<3>().0.chunks_exact(width).enumerate() {
-            for (out, &[r, g, b]) in row.iter_mut().zip(src) {
-                *out = forward_ycocg(r as i32, g as i32, b as i32);
-            }
-            for c in 0..3 {
-                let dst = image.plane_row_mut(c, y);
-                for (d, v) in dst.iter_mut().zip(&row) {
-                    *d = match c {
-                        0 => v.0,
-                        1 => v.1,
-                        _ => v.2,
-                    };
-                }
-            }
-        }
+        rgb8_to_ycocg(
+            rgb.as_chunks::<3>().0,
+            image.all_planes_mut().map(|plane| plane.as_mut_slice()),
+        );
         image
     };
     let base = planes(&split.base);
@@ -2068,21 +2319,12 @@ fn encode_vector_layers(
         let AlphaPlane::U8(alpha) = &coverage else {
             unreachable!()
         };
-        let composite: Vec<u8> = split
-            .base
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(split.layer.as_chunks::<3>().0)
-            .zip(alpha)
-            .flat_map(|((b, l), &a)| {
-                let a = a as f32 * (1.0 / 255.0);
-                std::array::from_fn::<u8, 3, _>(|k| {
-                    crate::util::round_i32(b[k] as f32 + (l[k] as f32 - b[k] as f32) * a)
-                        .clamp(0, 255) as u8
-                })
-            })
-            .collect();
+        let mut composite = split.base;
+        crate::simd::rgb8_blend::blend_in_place(
+            composite.as_chunks_mut::<3>().0,
+            split.layer.as_chunks::<3>().0,
+            alpha,
+        );
         let mut single = header;
         crate::lossless::encode_frame_lossless_layer(
             &planes(&composite),
@@ -3420,12 +3662,7 @@ pub(crate) fn encode_with_config_loseless<T: AsSignedInt + Copy>(
         let max_value = ((1u32 << max_bp) - 1) as i32;
         crate::lossless::quantize_planes(&mut image3s, max_value, i32::from(config.near_lossless));
     }
-    for y in 0..height {
-        let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
-        for ((r, g), b) in r_row.iter_mut().zip(g_row.iter_mut()).zip(b_row.iter_mut()) {
-            (*r, *g, *b) = forward_ycocg(*r, *g, *b);
-        }
-    }
+    forward_ycocg_in_place(image3s.all_planes_mut().map(|plane| plane.as_mut_slice()));
 
     encode_lossless_planes(&image3s, &alpha_plane, max_bp, config)
 }

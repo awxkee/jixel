@@ -109,6 +109,7 @@ impl<'f, 'a> FlatCoder<'f, 'a> {
                 | ModularFrameKind::RgbSavedFirst
                 | ModularFrameKind::RgbBlendLast
                 | ModularFrameKind::RgbCrop { .. }
+                | ModularFrameKind::XybCrop { .. }
                 | ModularFrameKind::RgbBlendCrop { .. }
         );
         let wp_tree = (frame.effort.flat_wp_contexts && frame.use_wp && displayed)

@@ -30,7 +30,7 @@ use core::arch::wasm32::*;
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn round_ties_away_i32(v: v128) -> v128 {
+pub(super) fn round_ties_away_i32(v: v128) -> v128 {
     let truncated = f32x4_trunc(v);
     let fraction = f32x4_sub(v, truncated);
     let at_least_half = f32x4_ge(f32x4_abs(fraction), f32x4_splat(0.5));

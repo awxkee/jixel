@@ -92,7 +92,28 @@ pub(super) fn write_frame_header_modular_kind(
             width,
             height,
             last,
-        } => write_frame_header_modular_crop(has_alpha, [x0, y0, width, height], layout, last, w),
+        } => write_frame_header_modular_crop(
+            has_alpha,
+            false,
+            [x0, y0, width, height],
+            layout,
+            last,
+            w,
+        ),
+        ModularFrameKind::XybCrop {
+            x0,
+            y0,
+            width,
+            height,
+            last,
+        } => write_frame_header_modular_crop(
+            has_alpha,
+            true,
+            [x0, y0, width, height],
+            layout,
+            last,
+            w,
+        ),
         ModularFrameKind::RgbBlendCrop {
             x0,
             y0,
@@ -281,6 +302,7 @@ pub(super) fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w
 /// frame always signals its source and never `save_before_color_transform`.
 fn write_frame_header_modular_crop(
     has_alpha: bool,
+    xyb_encoded: bool,
     rect: [usize; 4],
     layout: GroupLayout,
     last: bool,
@@ -290,7 +312,10 @@ fn write_frame_header_modular_crop(
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
     write_u64(0, w); // flags
-    w.write(1, 0); // do_ycbcr = false
+    if !xyb_encoded {
+        // With xyb_encoded set the color transform is XYB and the bit is absent.
+        w.write(1, 0); // do_ycbcr = false
+    }
     // The crop's origin and size are in image coordinates whatever the
     // frame's upsampling: the decoder codes the frame at the size over the
     // factor and scales it back onto the rectangle.
