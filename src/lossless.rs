@@ -142,7 +142,7 @@ pub(crate) mod kit {
 pub(crate) use xyb::encode_modular_xyb_atlas_tree_slot;
 pub(crate) use xyb::{
     encode_frame_lossless_layer, encode_frame_lossless_xyb_ink, encode_modular_xyb_atlas,
-    encode_modular_xyb_atlas_tree,
+    encode_modular_xyb_atlas_ints, encode_modular_xyb_atlas_tree,
 };
 
 use crate::encode_image::AlphaPlane;
