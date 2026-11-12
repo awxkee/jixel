@@ -164,7 +164,7 @@ pub(super) fn encode_frame_lossless_core_impl(
     let predictors = if frame.effort.predictor_search {
         choose_predictors_with_wp(
             planes,
-            frame.alpha,
+            frame.alpha.filter(|_| frame.alpha_constant.is_none()),
             frame.xsize,
             frame.ysize,
             frame.num_color,
@@ -491,6 +491,7 @@ impl<'a> CoreFrame<'a> {
                 self.ycocg,
                 rct_type,
                 self.alpha,
+                self.alpha_constant,
                 self.num_color,
                 self.wp_header_count(),
                 pool,

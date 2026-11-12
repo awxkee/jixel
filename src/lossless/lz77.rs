@@ -265,6 +265,7 @@ const RING_ENTRIES_LEN: usize = RING_HASH_SIZE * RING_BUCKET;
 const DEEP_LZ_SCRATCH_WORDS: usize = RING_ENTRIES_LEN + RING_HASH_SIZE + 1;
 
 #[inline]
+#[cfg(test)]
 fn ring_hash<T: LiteralToken>(tokens: &[T], pos: usize) -> usize {
     fingerprint(tokens, pos) as usize & (RING_HASH_SIZE - 1)
 }
@@ -297,6 +298,7 @@ fn ring_insert(entries: &mut [u32], cursors: &mut [u32], h: usize, pos: usize, e
     cursors[h] = (epoch << 16) | wrapped | next as u32;
 }
 
+#[cfg(test)]
 fn find_match_ring<T: LiteralToken>(
     tokens: &[T],
     pos: usize,
@@ -616,13 +618,18 @@ fn lz77_compress_for_speed_with_parts<T: LiteralToken, const GRAM: usize>(
     // Slow mode's broader candidate selection protects the major Modular
     // alternatives, so do not discard useful 2..10% LZ wins at this local gate.
     let max_candidate_len = run_tokens.len().saturating_mul(98) / 100;
-    if !lz77_compress_with_depth_into_limit_gram::<_, GRAM>(
-        tokens,
-        8,
-        lz_depth,
-        lz_candidate,
-        max_candidate_len,
-    ) {
+    // Even the longest possible copies need a first literal and one token
+    // per window of remaining input.
+    let min_candidate_len = 1 + tokens.len().saturating_sub(1).div_ceil(LZ77_WINDOW);
+    if max_candidate_len < min_candidate_len
+        || !lz77_compress_with_depth_into_limit_gram::<_, GRAM>(
+            tokens,
+            8,
+            lz_depth,
+            lz_candidate,
+            max_candidate_len,
+        )
+    {
         return run_tokens;
     }
     let deep_bits = estimate_payload_bits(
@@ -794,20 +801,17 @@ fn lz77_compress_with_depth_into_limit_gram<T: LiteralToken, const GRAM: usize>(
     let match_kernel = T::match_kernel();
     let mut i = 0usize;
     while i < tokens.len() {
-        let (match_len, distance) = if GRAM == 3 {
-            find_match_ring(tokens, i, entries, cursors, max_probes, epoch, match_kernel)
-        } else {
-            find_match_ring_hashed(
-                tokens,
-                i,
-                ring_hash_gram::<T, GRAM>(tokens, i),
-                entries,
-                cursors,
-                max_probes,
-                epoch,
-                match_kernel,
-            )
-        };
+        let hash = ring_hash_gram::<T, GRAM>(tokens, i);
+        let (match_len, distance) = find_match_ring_hashed(
+            tokens,
+            i,
+            hash,
+            entries,
+            cursors,
+            max_probes,
+            epoch,
+            match_kernel,
+        );
         let threshold = if distance <= 16 { 4 } else { 5 };
         if match_len >= threshold {
             let distance_value = if distance == 1 {
@@ -823,16 +827,19 @@ fn lz77_compress_with_depth_into_limit_gram<T: LiteralToken, const GRAM: usize>(
             if out.len() > max_output {
                 return false;
             }
-            let mut insert_start = i;
-            if GRAM > 3 {
-                // All grams inside a constant prefix share one bucket. Only
-                // its newest RING_BUCKET entries can survive insertion, so
-                // skip those that would immediately be overwritten. Preserve
-                // every gram crossing the end of the constant prefix.
-                let constant =
-                    1 + match_kernel(&tokens[i..i + match_len - 1], &tokens[i + 1..i + match_len]);
-                insert_start += constant.saturating_sub(GRAM + RING_BUCKET - 1);
-            }
+            // A distance-one copy is a constant run. All grams wholly
+            // inside its constant prefix land in one bucket, where only the
+            // newest RING_BUCKET entries survive. Skip whole revolutions so
+            // the bucket ends with the same cursor and entries.
+            let constant = if distance == 1 {
+                match_len
+            } else if GRAM > 3 {
+                1 + match_kernel(&tokens[i..i + match_len - 1], &tokens[i + 1..i + match_len])
+            } else {
+                0
+            };
+            let overwritten = constant.saturating_sub(GRAM + RING_BUCKET - 1);
+            let insert_start = i + overwritten / RING_BUCKET * RING_BUCKET;
             for pos in insert_start..i + match_len {
                 ring_insert(
                     entries,
@@ -849,13 +856,7 @@ fn lz77_compress_with_depth_into_limit_gram<T: LiteralToken, const GRAM: usize>(
             if out.len() > max_output {
                 return false;
             }
-            ring_insert(
-                entries,
-                cursors,
-                ring_hash_gram::<T, GRAM>(tokens, i),
-                i,
-                epoch,
-            );
+            ring_insert(entries, cursors, hash, i, epoch);
             i += 1;
         }
     }

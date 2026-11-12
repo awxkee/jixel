@@ -274,24 +274,69 @@ pub(super) fn rct_gradient_span(
     extra_bits
 }
 
-/// Port of libjxl's EstimateCost: gradient-predictor residual token entropy
-/// over 18 local-activity contexts per channel, plus raw bits. Candidate pixels
-/// are derived directly from the input YCoCg planes, avoiding a temporary RGB
-/// image shared by the seven scoring passes.
-fn estimate_rct_cost(
+/// Channel formulas shared by the RCT candidates. The YCoCg lifting outputs
+/// retain their exact transform and lane, except Co, which is an RGB difference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RctPlane {
+    Rgb(usize),
+    Difference(usize, usize),
+    Centered(usize),
+    YCoCg(u32, usize),
+}
+
+impl RctPlane {
+    fn for_transform(rct: u32) -> [Self; 3] {
+        if rct == 6 {
+            return [0, 1, 2].map(|ch| Self::YCoCg(rct, ch));
+        }
+        let [first, second, third] = rct_perm((rct / 7) as usize);
+        let transform = rct % 7;
+        if transform == 6 {
+            return [
+                Self::YCoCg(rct, 0),
+                Self::Difference(first, third),
+                Self::YCoCg(rct, 2),
+            ];
+        }
+        let middle = match transform >> 1 {
+            1 => Self::Difference(second, first),
+            2 => Self::Centered(second),
+            _ => Self::Rgb(second),
+        };
+        let last = if transform & 1 != 0 {
+            Self::Difference(third, first)
+        } else {
+            Self::Rgb(third)
+        };
+        [Self::Rgb(first), middle, last]
+    }
+}
+
+#[derive(Default)]
+struct RctPlaneCost {
+    extra_bits: u64,
+    entropy: [f32; RCT_NUM_CONTEXTS],
+}
+
+/// Port of libjxl's EstimateCost: gradient residual token entropy over 18
+/// local-activity contexts per channel, plus raw bits. Transform only the
+/// scored rows and their predecessors, and build histograms only for lanes
+/// whose costs are still needed.
+fn estimate_rct_plane_costs(
     linear: &Image3Si,
     xsize: usize,
     ysize: usize,
     rct: u32,
     row_step: usize,
+    score: [bool; 3],
     row_scratch: &mut GradientScratch,
     entropy_of_hist: EntropyOfHistFn,
-) -> f32 {
+) -> [RctPlaneCost; 3] {
     let y_plane = linear.plane_data(0);
     let co_plane = linear.plane_data(1);
     let cg_plane = linear.plane_data(2);
     let mut hist = [[0u64; RCT_NUM_CONTEXTS * RCT_ALPHABET]; 3];
-    let mut extra_bits: u64 = 0;
+    let mut costs: [RctPlaneCost; 3] = Default::default();
     let transform = crate::lossless::selected_rct_row_fn();
     row_scratch.prev.resize(3 * xsize, 0);
     row_scratch.cur.resize(3 * xsize, 0);
@@ -311,20 +356,24 @@ fn estimate_rct_cost(
         let (out1, out2) = rest.split_at_mut(xsize);
         transform([yy, co, cg], rct, [out0, out1, out2]);
         if scored {
-            for (ch, chist) in hist.iter_mut().enumerate() {
+            for (ch, chist) in hist.iter_mut().enumerate().filter(|(ch, _)| score[*ch]) {
                 let crow = &cur[ch * xsize..][..xsize];
                 let prow = &prev[ch * xsize..][..xsize];
-                extra_bits += rct_gradient_row(crow, prow, y == 0, chist);
+                costs[ch].extra_bits += rct_gradient_row(crow, prow, y == 0, chist);
             }
         }
         std::mem::swap(&mut prev, &mut cur);
     }
-    let mut cost = extra_bits as f32;
-    for h in hist.as_flattened().as_chunks::<RCT_ALPHABET>().0 {
-        let total: u64 = h.iter().sum();
-        cost += entropy_of_hist(h, total);
+    for (ch, chist) in hist.iter().enumerate().filter(|(ch, _)| score[*ch]) {
+        for (entropy, h) in costs[ch]
+            .entropy
+            .iter_mut()
+            .zip(chist.as_chunks::<RCT_ALPHABET>().0)
+        {
+            *entropy = entropy_of_hist(h, h.iter().sum());
+        }
     }
-    cost
+    costs
 }
 
 /// Every candidate RCT with its estimated cost over every `row_step`-th row,
@@ -369,18 +418,61 @@ fn rank_rcts_at(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<(u32, f32)> {
-    let costs = pool.steal_map(scratch, candidates.len(), |i, scratch| {
-        estimate_rct_cost(
+    let mut planes = Vec::new();
+    let mut jobs = Vec::new();
+    let candidate_planes: Vec<_> = candidates
+        .iter()
+        .map(|&rct| {
+            let mut score = [false; 3];
+            let formulas = RctPlane::for_transform(rct);
+            let job = jobs.len();
+            let indices: [(usize, usize); 3] = std::array::from_fn(|ch| {
+                let plane = formulas[ch];
+                if let Some((_, index)) = planes.iter().find(|&&(p, _)| p == plane) {
+                    *index
+                } else {
+                    let index = (job, ch);
+                    planes.push((plane, index));
+                    score[ch] = true;
+                    index
+                }
+            });
+            if score.contains(&true) {
+                jobs.push((rct, score));
+            }
+            indices
+        })
+        .collect();
+    let costs = pool.steal_map(scratch, jobs.len(), |i, scratch| {
+        let (rct, score) = jobs[i];
+        estimate_rct_plane_costs(
             linear,
             xsize,
             ysize,
-            candidates[i],
+            rct,
             row_step,
+            score,
             &mut scratch.gradient,
             scratch.entropy_of_hist,
         )
     });
-    let mut ranked: Vec<(u32, f32)> = candidates.iter().copied().zip(costs).collect();
+    let mut ranked: Vec<_> = candidates
+        .iter()
+        .zip(candidate_planes)
+        .map(|(&rct, indices)| {
+            let costs = indices.map(|(job, ch)| &costs[job][ch]);
+            // Retain the original floating-point addition order. Summing
+            // each plane's entropy first can change a close ranking.
+            let extra_bits = costs.iter().map(|cost| cost.extra_bits).sum::<u64>();
+            let mut total = extra_bits as f32;
+            for cost in costs {
+                for entropy in cost.entropy {
+                    total += entropy;
+                }
+            }
+            (rct, total)
+        })
+        .collect();
     crate::util::sort_small_by(&mut ranked, |a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     ranked
 }
@@ -462,6 +554,90 @@ pub(crate) fn rct_row_scalar(src: [&[i32]; 3], kind: u32, out: [&mut [i32]; 3]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_plane_scores_match_independent_rct_ranking() {
+        let pool = ThreadPool::new_lossless(3);
+        let mut scratch = Box::new(CoderScratch::lossless());
+        let transform = selected_rct_row_fn();
+        let entropy = scratch.entropy_of_hist;
+        for (width, height) in [(1, 1), (3, 37), (17, 65), (33, 129), (257, 33)] {
+            let mut input = Image3Si::new(width, height);
+            for y in 0..height {
+                let [luma, co, cg] = input.all_plane_rows_mut(y);
+                for x in 0..width {
+                    let samples = std::array::from_fn::<_, 3, _>(|ch| {
+                        let seed = (x * 977 + y * 619 + ch * 887) ^ (x * y * (ch + 3) * 37);
+                        match (x + y + ch) % 8 {
+                            0 => 0,
+                            1 => 65_535,
+                            2 => -65_535,
+                            _ => (seed & 0x1_ffff) as i32 - 65_535,
+                        }
+                    });
+                    (luma[x], co[x], cg[x]) = forward_ycocg(samples[0], samples[1], samples[2]);
+                }
+            }
+            let reference = |candidates: &[u32], row_step| {
+                let mut ranked = Vec::new();
+                let mut current = std::array::from_fn::<_, 3, _>(|_| vec![0; width]);
+                let mut previous = current.clone();
+                let source_row =
+                    |y| [0, 1, 2].map(|ch| &input.plane_data(ch)[y * width..][..width]);
+                for &rct in candidates {
+                    let mut histogram = [[0; RCT_NUM_CONTEXTS * RCT_ALPHABET]; 3];
+                    let mut extra_bits = 0;
+                    for y in (0..height).step_by(row_step) {
+                        let [a, b, c] = &mut current;
+                        transform(source_row(y), rct, [a, b, c]);
+                        if y != 0 {
+                            let [a, b, c] = &mut previous;
+                            transform(source_row(y - 1), rct, [a, b, c]);
+                        }
+                        for ch in 0..3 {
+                            extra_bits += rct_gradient_row(
+                                &current[ch],
+                                &previous[ch],
+                                y == 0,
+                                &mut histogram[ch],
+                            );
+                        }
+                    }
+                    let mut cost = extra_bits as f32;
+                    for h in histogram.as_flattened().as_chunks::<RCT_ALPHABET>().0 {
+                        cost += entropy(h, h.iter().sum());
+                    }
+                    ranked.push((rct, cost));
+                }
+                ranked.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                ranked
+            };
+            let as_bits = |ranked: Vec<(u32, f32)>| {
+                ranked
+                    .into_iter()
+                    .map(|(rct, cost)| (rct, cost.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            for row_step in [1, 4, 16] {
+                for candidates in [&RCT_CANDIDATES[..], &RCT_ALL_TYPES[..]] {
+                    let actual = rank_rcts_at(
+                        &input,
+                        width,
+                        height,
+                        row_step,
+                        candidates,
+                        &pool,
+                        &mut scratch,
+                    );
+                    assert_eq!(
+                        as_bits(actual),
+                        as_bits(reference(candidates, row_step)),
+                        "width={width}, height={height}, row_step={row_step}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn split_gradient_rows_match_pixelwise_histograms() {

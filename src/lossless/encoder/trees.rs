@@ -364,7 +364,11 @@ impl SourcePlan {
                     ysize,
                     frame.min_symbol,
                     frame.use_wp,
-                    rgb_stage.take(),
+                    if palette_only {
+                        coarse(&source, self.wp_params, scratch)
+                    } else {
+                        rgb_stage.take()
+                    },
                     self.wp_params,
                     &header_bits,
                     rank_presets_deep,
@@ -383,9 +387,15 @@ impl SourcePlan {
             if let Some((runner_up, cost)) = color.runner_up()
                 && cost <= color.ranked[0].1 * RCT_RANK_MARGIN
             {
-                // One RGB sample set alive at a time: a losing runner-up
-                // leaves the final learn to sample afresh.
-                rgb_stage = None;
+                // The runner-up samples the same number of rows. Keep the
+                // first stage when both sets fit the ranking sample budget
+                // and the final learn can reuse it if the runner-up loses.
+                rgb_stage = rgb_stage.filter(|stage| {
+                    let rows = stage.samples.len();
+                    self.final_sampling == self.rank_sampling
+                        && rows > MA_COARSE_TARGET_SAMPLES
+                        && rows <= self.rank_sampling.0 / 2
+                });
                 let planes = (runner_up != 6)
                     .then(|| rct_planes(color.ycocg, xsize, ysize, runner_up, pool, scratch));
                 let source = rgb_ma_source(
@@ -674,18 +684,27 @@ impl Tournament {
         // picked the chain on screenshots at +2.7..+3.5 % of the frame).
         let ordered: Vec<Option<palette::LocalPaletteGroup>> =
             pool.steal_map(scratch, grid.num_groups(), |group_index, _scratch| {
-                let mut group = palettes[group_index].clone()?;
-                palette::order_local_palette(&mut group);
-                Some(group)
+                palette::ordered_local_palette(palettes[group_index].as_ref()?)
             });
         let layout = frame.default_layout();
         let mut raced: Option<(MaSource<'_>, CoarseLearn)> = None;
-        for palettes in [&palettes, &ordered] {
+        let has_reordered = ordered.iter().any(Option::is_some);
+        for use_reordered in [false, true]
+            .into_iter()
+            .take(1 + usize::from(has_reordered))
+        {
+            let groups = palettes.iter().zip(&ordered).map(|(original, changed)| {
+                if use_reordered {
+                    changed.as_ref().or(original.as_ref())
+                } else {
+                    original.as_ref()
+                }
+            });
             let mixed = mixed_ma_source(
                 frame.ycocg,
                 frame.alpha,
                 frame.xsize,
-                palettes,
+                groups,
                 frame.alpha_constant,
             );
             let stage = learn_ma_candidate(
