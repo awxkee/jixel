@@ -830,7 +830,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 
-    sections[0].write(1, 1); // dc_quant all_default
+    crate::lossless::header::write_dc_quant(frame_kind, &mut sections[0]);
     sections[0].write(1, 1); // has global tree
     write_local_tree_lz77(
         &predictors,

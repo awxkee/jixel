@@ -240,8 +240,7 @@ impl<'f, 'a> FlatCoder<'f, 'a> {
         if let ModularFrameKind::Patched { references, .. } = frame.kind {
             write_patch_dictionary(references, frame.alpha.is_some(), scratch, &mut section);
         }
-        // 1 bit: dc_quant all_default = 1
-        section.write(1, 1);
+        crate::lossless::header::write_dc_quant(frame.kind, &mut section);
         // 1 bit: has_tree = 0  (no global tree; the local tree lives in the GroupHeader).
         section.write(1, 0);
         // GroupHeader: use_global_tree=0, wp_default=1, RCT transform on R/G/B.
@@ -386,7 +385,7 @@ impl<'f, 'a> FlatCoder<'f, 'a> {
             &mut scratch.lz_entropy,
             &mut scratch.huffman_pool,
         );
-        sections[0].write(1, 1); // dc_quant all_default = 1
+        crate::lossless::header::write_dc_quant(frame.kind, &mut sections[0]);
         sections[0].write(1, 1); // has_tree = 1
         write_flat_tree(
             self.wp_tree.as_ref(),

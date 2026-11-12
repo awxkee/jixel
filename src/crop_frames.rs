@@ -150,35 +150,30 @@ pub(crate) fn plan(rgb: &[u8], width: usize, height: usize) -> Vec<CropBox> {
     boxes
 }
 
-/// The image with each box filled with its own most common color: the
-/// crop's background, which the surrounding flat art usually continues.
+/// A crop's most common color, which the surrounding flat art usually
+/// continues.
 /// (A Coons patch of the border pixels streaks a neighbouring photo's grain
 /// across the box: base +4..+8 %, and the corpus wins shrink by a third.)
-pub(crate) fn fill(rgb: &[u8], width: usize, boxes: &[CropBox]) -> Vec<u8> {
-    let mut out = rgb.to_vec();
-    for b in boxes {
-        let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
-        for y in b.y0..b.y0 + b.height {
-            let row = &rgb[(y * width + b.x0) * 3..(y * width + b.x0 + b.width) * 3];
-            for &p in row.as_chunks::<3>().0 {
-                *counts.entry(p).or_default() += 1;
-            }
-        }
-        let Some(mode) = counts
-            .into_iter()
-            .max_by_key(|&(c, n)| (n, c))
-            .map(|(c, _)| c)
-        else {
-            continue;
-        };
-        for y in b.y0..b.y0 + b.height {
-            let row = &mut out[(y * width + b.x0) * 3..(y * width + b.x0 + b.width) * 3];
-            for p in row.as_chunks_mut::<3>().0 {
-                *p = mode;
-            }
+pub(crate) fn background_color(rgb: &[u8], width: usize, b: CropBox) -> [u8; 3] {
+    let pixels = rgb.as_chunks::<3>().0;
+    let mut crop = (b.y0..b.y0 + b.height).flat_map(|y| &pixels[y * width + b.x0..][..b.width]);
+    let mut color = *crop.next().expect("nonempty crop rectangle");
+    let mut run = 1usize;
+    let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
+    for &pixel in crop {
+        if pixel == color {
+            run += 1;
+        } else {
+            *counts.entry(color).or_default() += run;
+            color = pixel;
+            run = 1;
         }
     }
-    out
+    if counts.is_empty() {
+        return color;
+    }
+    *counts.entry(color).or_default() += run;
+    counts.into_iter().max_by_key(|&(c, n)| (n, c)).unwrap().0
 }
 
 /// Detail crops stop here: coarser, the squeeze loses its edge over VarDCT
@@ -453,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_paints_each_box_with_its_most_common_color() {
+    fn background_color_counts_only_the_box_and_keeps_color_ties() {
         let (w, h) = (96, 64);
         let mut rgb = vec![10u8; w * h * 3];
         let b = CropBox {
@@ -469,20 +464,12 @@ mod tests {
             }
         }
         rgb[(5 * w + 40) * 3..][..3].copy_from_slice(&[1, 2, 3]);
-        let filled = fill(&rgb, w, &[b]);
-        for y in 0..h {
-            for x in 0..w {
-                let p = &filled[(y * w + x) * 3..][..3];
-                let inside = (32..64).contains(&x) && y < 32;
-                assert_eq!(
-                    p,
-                    if inside {
-                        &[200, 100, 50][..]
-                    } else {
-                        &[10, 10, 10][..]
-                    }
-                );
-            }
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 50]);
+        rgb[(5 * w + 40) * 3..][..3].copy_from_slice(&[200, 100, 50]);
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 50]);
+        for y in 0..16 {
+            rgb.as_chunks_mut::<3>().0[y * w + 32..y * w + 64].fill([200, 100, 51]);
         }
+        assert_eq!(background_color(&rgb, w, b), [200, 100, 51]);
     }
 }

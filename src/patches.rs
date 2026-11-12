@@ -1441,16 +1441,71 @@ const GLYPH_ATLAS_MAX_HEIGHT: usize = 4096;
 /// over a flat background, stored as the difference from that background on
 /// the modular XYB lattice and blended with kAdd. The base keeps the image
 /// minus the decoded patch, i.e. the flat background plus lattice rounding.
-pub(crate) struct LossyGlyphPatches {
+pub(crate) struct LossyGlyphPatches<Base> {
     /// Lattice channels Y, X, B-Y of the atlas.
     pub(crate) atlas: [Vec<i32>; 3],
     pub(crate) atlas_width: usize,
     pub(crate) atlas_height: usize,
-    pub(crate) base: Image3F,
+    pub(crate) base: Base,
     pub(crate) references: Vec<PatchReference>,
     /// 8-bit atlas alpha: template coverage, zero under the kAdd entries.
     /// `None` when no template was placed.
     pub(crate) alpha_atlas: Option<Vec<u8>>,
+}
+
+impl LossyGlyphPatches<Option<Image3F>> {
+    /// Materialize the additive residual after the atlas has been coded.
+    /// The template base, if present, already has its blend-above patches
+    /// removed. Additive placements keep their original order until the
+    /// subtraction finishes, since their bounding boxes can overlap.
+    pub(crate) fn materialize(self, xyb: &Image3F) -> LossyGlyphPatches<Image3F> {
+        use crate::quant_weights::INV_DC_QUANT;
+
+        let Self {
+            atlas,
+            atlas_width,
+            atlas_height,
+            base,
+            mut references,
+            alpha_atlas,
+        } = self;
+        let mut base = base.unwrap_or_else(|| xyb.clone());
+        // Atlas order is Y, X, B-Y, while the image planes are X, Y, B.
+        let image_planes = [1usize, 0, 2];
+        let steps = image_planes.map(|c| 1.0 / INV_DC_QUANT[c]);
+        for r in references.iter_mut().filter(|r| r.add) {
+            for &(x, y) in &r.positions {
+                for c in 0..3 {
+                    for dy in 0..r.height {
+                        let row = base.plane_row_mut(image_planes[c], y + dy);
+                        let start = (r.atlas_y + dy) * atlas_width + r.atlas_x;
+                        let pixels = row[x..][..r.width]
+                            .iter_mut()
+                            .zip(&atlas[c][start..][..r.width]);
+                        for (dx, (pixel, &sample)) in pixels.enumerate() {
+                            let d = if c == 2 {
+                                sample + atlas[0][start + dx]
+                            } else {
+                                sample
+                            };
+                            if d != 0 {
+                                *pixel -= d as f32 * steps[c];
+                            }
+                        }
+                    }
+                }
+            }
+            r.positions.sort_unstable_by_key(|&(x, y)| (y, x));
+        }
+        LossyGlyphPatches {
+            atlas,
+            atlas_width,
+            atlas_height,
+            base,
+            references,
+            alpha_atlas,
+        }
+    }
 }
 
 pub(crate) struct GlyphParams {
@@ -1515,12 +1570,12 @@ struct GlyphTemplates {
 }
 
 impl GlyphTemplates {
-    fn into_patches(self) -> LossyGlyphPatches {
+    fn into_patches(self) -> LossyGlyphPatches<Option<Image3F>> {
         LossyGlyphPatches {
             atlas: self.atlas,
             atlas_width: self.width,
             atlas_height: self.height,
-            base: self.base,
+            base: Some(self.base),
             references: self.references,
             alpha_atlas: Some(self.alpha),
         }
@@ -1547,12 +1602,11 @@ fn grow_atlas_plane<T: Copy + Default>(
     }
 }
 
-pub(crate) fn find_lossy_glyph_patches(
+pub(crate) fn plan_lossy_glyph_patches(
     ctx: &EncodingContext,
     xyb: &Image3F,
     params: &GlyphParams,
-) -> Option<LossyGlyphPatches> {
-    use crate::quant_weights::INV_DC_QUANT;
+) -> Option<LossyGlyphPatches<Option<Image3F>>> {
     let (width, height) = (xyb.xsize(), xyb.ysize());
     let bg_tile = GLYPH_BG_TILE;
     if width < bg_tile || height < bg_tile {
@@ -1590,21 +1644,41 @@ pub(crate) fn find_lossy_glyph_patches(
         *b += y;
     }
     let fine = [qy, qx, qb];
-    // Shapes are matched on a coarser lattice: multiples of `coarse[c]`.
+    // Full-frame color keys use the same rounding kernel on bounded chunks.
+    // Matching reads coarse samples only within glyph boxes.
     debug_assert!(params.coarse > 0 && (params.coarse as u32).is_power_of_two());
-    let coarse = (params.coarse > 1).then(|| {
-        let mut rounded = fine.clone();
-        let shift = params.coarse.trailing_zeros();
-        for plane in &mut rounded {
-            unsafe { (ctx.round_lattice_pow2)(plane, shift) };
+    let shift = params.coarse.trailing_zeros();
+    let coarse_value = |v| crate::xyb::round_lattice_pow2_value(v, shift);
+    let [qy, qx, qb] = &fine;
+    let mut keys = Vec::with_capacity(width * height);
+    if shift == 0 {
+        keys.extend(
+            qy.iter()
+                .zip(qx)
+                .zip(qb)
+                .map(|((&y, &x), &b)| color_key(y, x, b)),
+        );
+    } else {
+        const BLOCK: usize = 512;
+        let mut rounded = [[0; BLOCK]; 3];
+        for ((y, x), b) in qy.chunks(BLOCK).zip(qx.chunks(BLOCK)).zip(qb.chunks(BLOCK)) {
+            let len = y.len();
+            for (dest, src) in rounded.each_mut().into_iter().zip([y, x, b]) {
+                let dest = &mut dest[..len];
+                dest.copy_from_slice(src);
+                // SAFETY: The context selects a supported rounding kernel.
+                unsafe { (ctx.round_lattice_pow2)(dest, shift) };
+            }
+            let [y, x, b] = &rounded;
+            keys.extend(
+                y[..len]
+                    .iter()
+                    .zip(&x[..len])
+                    .zip(&b[..len])
+                    .map(|((&y, &x), &b)| color_key(y, x, b)),
+            );
         }
-        rounded
-    });
-    let planes = coarse.as_ref().unwrap_or(&fine);
-    let [qy, qx, qb] = planes;
-    let keys: Vec<u64> = (0..width * height)
-        .map(|i| color_key(qy[i], qx[i], qb[i]))
-        .collect();
+    }
 
     let tiles_x = width.div_ceil(bg_tile);
     let tiles_y = height.div_ceil(bg_tile);
@@ -1724,12 +1798,16 @@ pub(crate) fn find_lossy_glyph_patches(
         let mut hash: u64 = 0x9e37_79b9_7f4a_7c15 ^ ((w as u64) << 32 | h as u64);
         let mut contrast: i32 = 0;
         let rows = y0 * width..(y1 + 1) * width;
-        for (plane, &bg) in planes.iter().zip(&bg) {
+        for (plane, &bg) in fine.iter().zip(&bg) {
             let plane_rows = plane[rows.clone()].chunks_exact(width);
             let label_rows = label[rows.clone()].chunks_exact(width);
             for (values, owners) in plane_rows.zip(label_rows) {
                 for (&value, &owner) in values[x0..=x1].iter().zip(&owners[x0..=x1]) {
-                    let v = if owner == next_label { value - bg } else { 0 };
+                    let v = if owner == next_label {
+                        coarse_value(value) - bg
+                    } else {
+                        0
+                    };
                     contrast = contrast.max(v.abs());
                     hash = (hash ^ (v as u32 as u64)).wrapping_mul(0xff51_afd7_ed55_8ccd);
                     hash ^= hash >> 29;
@@ -1781,7 +1859,7 @@ pub(crate) fn find_lossy_glyph_patches(
     let diff = |s: &GlyphShape, c: usize, dx: usize, dy: usize| -> i32 {
         let i = (s.y0 + dy) * width + s.x0 + dx;
         if label[i] == s.label {
-            planes[c][i] - s.bg[c]
+            coarse_value(fine[c][i]) - s.bg[c]
         } else {
             0
         }
@@ -1915,25 +1993,15 @@ pub(crate) fn find_lossy_glyph_patches(
             atlas: std::array::from_fn(|_| vec![0; atlas_width * atlas_height]),
             atlas_width,
             atlas_height,
-            base: xyb.clone(),
+            base: None,
             references: Vec::with_capacity(groups.len()),
             alpha_atlas: None,
         },
     };
     let atlas_width = patches.atlas_width;
 
-    // Plane order of `planes` is Y, X, B; image planes are X, Y, B.
-    let steps = [
-        1.0 / INV_DC_QUANT[1],
-        1.0 / INV_DC_QUANT[0],
-        1.0 / INV_DC_QUANT[2],
-    ];
-    let image_plane = [1usize, 0, 2];
     let LossyGlyphPatches {
-        atlas,
-        base,
-        references,
-        ..
+        atlas, references, ..
     } = &mut patches;
     for (g, (ax, ay)) in groups.into_iter().zip(slots) {
         let ay = ay + template_height;
@@ -1951,29 +2019,6 @@ pub(crate) fn find_lossy_glyph_patches(
                 atlas[2][at] = d[2] - d[0];
             }
         }
-        let mut positions = Vec::with_capacity(g.len());
-        for &i in &g {
-            let o = &shapes[i];
-            positions.push((o.x0, o.y0));
-            for c in 0..3 {
-                for dy in 0..o.h {
-                    let row = base.plane_row_mut(image_plane[c], o.y0 + dy);
-                    let start = (ay + dy) * atlas_width + ax;
-                    let pixels = row[o.x0..][..o.w].iter_mut().zip(&atlas[c][start..][..o.w]);
-                    for (dx, (pixel, &sample)) in pixels.enumerate() {
-                        let d = if c == 2 {
-                            sample + atlas[0][start + dx]
-                        } else {
-                            sample
-                        };
-                        if d != 0 {
-                            *pixel -= d as f32 * steps[c];
-                        }
-                    }
-                }
-            }
-        }
-        positions.sort_unstable_by_key(|&(x, y)| (y, x));
         references.push(PatchReference {
             atlas_x: ax,
             atlas_y: ay,
@@ -1983,7 +2028,10 @@ pub(crate) fn find_lossy_glyph_patches(
             alpha_only: false,
             add: true,
             mul: false,
-            positions,
+            positions: g
+                .into_iter()
+                .map(|i| (shapes[i].x0, shapes[i].y0))
+                .collect(),
         });
     }
     Some(patches)
@@ -2762,7 +2810,7 @@ mod tests {
 
     /// kAdd semantics: base + decoded patches must give the image back up to
     /// float rounding, wherever the patches land.
-    fn assert_glyph_plan_reconstructs(img: &Image3F, plan: &LossyGlyphPatches) {
+    fn assert_glyph_plan_reconstructs(img: &Image3F, plan: &LossyGlyphPatches<Image3F>) {
         use crate::quant_weights::INV_DC_QUANT;
         let mut recon = plan.base.clone();
         let [ay, ax, ab] = &plan.atlas;
@@ -2790,6 +2838,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn find_lossy_glyph_patches(
+        ctx: &EncodingContext,
+        xyb: &Image3F,
+        params: &GlyphParams,
+    ) -> Option<LossyGlyphPatches<Image3F>> {
+        plan_lossy_glyph_patches(ctx, xyb, params).map(|plan| plan.materialize(xyb))
+    }
+
+    #[test]
+    fn glyph_base_subtracts_overlapping_placements_before_sorting() {
+        let mut img = Image3F::new(3, 1);
+        img.plane_row_mut(1, 0)[1] = 0.1;
+        let plan = LossyGlyphPatches {
+            atlas: [vec![-6, 120], vec![0; 2], vec![6, -120]],
+            atlas_width: 2,
+            atlas_height: 1,
+            base: None,
+            references: vec![PatchReference {
+                atlas_x: 0,
+                atlas_y: 0,
+                width: 2,
+                height: 1,
+                ref_frame: MODULAR_PATCH_REF_ID,
+                alpha_only: false,
+                add: true,
+                mul: false,
+                positions: vec![(1, 0), (0, 0)],
+            }],
+            alpha_atlas: None,
+        }
+        .materialize(&img);
+        let expected = (0.1f32 - (-6.0 / 512.0)) - 120.0 / 512.0;
+        let reversed = (0.1f32 - 120.0 / 512.0) - (-6.0 / 512.0);
+        assert_ne!(expected.to_bits(), reversed.to_bits());
+        assert_eq!(plan.base.plane_row(1, 0)[1].to_bits(), expected.to_bits());
+        assert_eq!(plan.references[0].positions, [(0, 0), (1, 0)]);
     }
 
     #[test]

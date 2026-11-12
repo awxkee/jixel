@@ -69,6 +69,28 @@ pub(crate) fn write_frame_dimension(value: usize, w: &mut BitWriter) {
     }
 }
 
+/// The LfGlobal dc_quant field of a modular frame: all_default, or the
+/// refined XYB lattice of a crop or ink frame ([`crate::xyb::CROP_LATTICE_SCALE`]).
+pub(super) fn write_dc_quant(kind: ModularFrameKind<'_>, w: &mut BitWriter) {
+    let scale = match kind {
+        ModularFrameKind::XybCrop { .. } | ModularFrameKind::XybBlend { .. } => {
+            crate::xyb::CROP_LATTICE_SCALE
+        }
+        _ => 1,
+    };
+    if scale == 1 {
+        w.write(1, 1); // dc_quant all_default = 1
+        return;
+    }
+    use crate::quant_weights::INV_DC_QUANT;
+    w.write(1, 0);
+    for inv in INV_DC_QUANT {
+        // Read as value / 128; powers of two keep every step F16-exact.
+        let step_x128 = 128.0 / (inv * scale as f32);
+        w.write(16, crate::util::f32_to_f16_bits(step_x128) as u64);
+    }
+}
+
 pub(super) fn write_frame_header_modular_kind(
     has_alpha: bool,
     kind: ModularFrameKind<'_>,

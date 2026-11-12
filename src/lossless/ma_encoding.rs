@@ -168,6 +168,7 @@ pub(super) fn write_learned_tree_frame(
                     TreeStreams::Literals(streams) => {
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
+                            frame_kind,
                             speed,
                             &stream,
                             tail,
@@ -185,6 +186,7 @@ pub(super) fn write_learned_tree_frame(
                     TreeStreams::Lz(streams) => {
                         let stream = streams.into_iter().next().expect("one stream");
                         write_learned_single_variant(
+                            frame_kind,
                             speed,
                             &stream,
                             tail,
@@ -319,6 +321,7 @@ pub(super) fn write_learned_tree_frame(
             match variant {
                 TreeStreams::Literals(streams) => {
                     write_learned_grouped_variant(
+                        frame_kind,
                         speed,
                         &streams,
                         &tails,
@@ -338,6 +341,7 @@ pub(super) fn write_learned_tree_frame(
                 }
                 TreeStreams::Lz(streams) => {
                     write_learned_grouped_variant(
+                        frame_kind,
                         speed,
                         &streams,
                         &tails,
@@ -367,6 +371,7 @@ pub(super) fn write_learned_tree_frame(
     if !has_global_stream
         && local_gate
         && let Some(local) = write_local_tree_sections(
+            frame_kind,
             speed,
             source,
             &placement,
@@ -490,6 +495,7 @@ pub(super) fn tokenize_ma_rect(
 
 #[allow(clippy::too_many_arguments)]
 fn write_learned_single_variant<T: lz77::LzTokenSource>(
+    frame_kind: ModularFrameKind<'_>,
     speed: crate::Speed,
     stream: &[T],
     tail: ConstantTail,
@@ -526,7 +532,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
     if let Some(dictionary) = dictionary {
         body.append(dictionary);
     }
-    body.write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut body);
     body.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
     body.write(1, 0); // use_global_tree = 0
     write_wp_header(wp_params, &mut body);
@@ -545,6 +551,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
 
 #[allow(clippy::too_many_arguments)]
 fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
+    frame_kind: ModularFrameKind<'_>,
     speed: crate::Speed,
     streams: &[Vec<T>],
     tails: &[ConstantTail],
@@ -587,7 +594,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     if let Some(dictionary) = dictionary {
         sections[0].append(dictionary);
     }
-    sections[0].write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut sections[0]);
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
         &cand.tree_tokens,

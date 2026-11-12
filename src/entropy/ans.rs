@@ -99,9 +99,9 @@ pub(crate) fn normalize_counts_into(counts: &[u32], freqs: &mut [u16]) {
 /// the deficit branch already knows without another scan.
 pub(crate) fn normalize_counts_first_maximum(counts: &[u32], freqs: &mut [u16]) -> usize {
     debug_assert_eq!(counts.len(), freqs.len());
-    freqs.fill(0);
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     if total == 0 {
+        freqs.fill(0);
         return 0;
     }
     // AArch64's hardware divide wins over reciprocal setup for these short
@@ -111,17 +111,18 @@ pub(crate) fn normalize_counts_first_maximum(counts: &[u32], freqs: &mut [u16]) 
     #[cfg(not(target_arch = "aarch64"))]
     let divider = DividerU64::new(total);
     let table = ANS_TAB_SIZE as i64;
+    // A positive count below twice one normalized unit always produces 1
+    // after the minimum-frequency clamp. The shifted threshold avoids
+    // overflowing even when the total count is large.
+    let unit_limit = (total - 1) >> (ANS_LOG_TAB_SIZE - 1);
     let mut sum: i64 = 0;
     for (freq, &count) in freqs.iter_mut().zip(counts.iter()) {
-        if count == 0 {
-            continue;
-        }
-        let mut f = (count as u64 * ANS_TAB_SIZE as u64 / divider) as i64;
-        if f < 1 {
-            f = 1;
-        }
-        *freq = f as u16;
-        sum += f;
+        *freq = if u64::from(count) <= unit_limit {
+            u16::from(count != 0)
+        } else {
+            (u64::from(count) * u64::from(ANS_TAB_SIZE) / divider) as u16
+        };
+        sum += i64::from(*freq);
     }
     while sum != table {
         let (mi, mf) = first_maximum(freqs);
@@ -938,18 +939,14 @@ fn histogram_cost(counts: &[u32], histogram: &AnsHistogram) -> f64 {
 /// evaluate hundreds of thousands of candidate merges per frame, and the
 /// per-call `Vec` allocations of the plain version dominated their time.
 pub(crate) struct AnsCostScratch {
-    precise: AnsHistogram,
+    freqs: [u16; TABLE_ENTRIES],
 }
 
 impl AnsCostScratch {
     pub(crate) fn new() -> Self {
-        let blank = || AnsHistogram {
-            freqs: vec![0u16; TABLE_ENTRIES],
-            method: 12,
-            omit_pos: 0,
-            cost: 0.0,
-        };
-        Self { precise: blank() }
+        Self {
+            freqs: [0; TABLE_ENTRIES],
+        }
     }
 }
 
@@ -986,17 +983,14 @@ pub(crate) fn fast_ans_population_cost_scratch(
 ) -> f64 {
     debug_assert_eq!(counts.len(), TABLE_ENTRIES);
     let alphabet_size = populated_alphabet_size(counts);
-    let precise = &mut scratch.precise;
+    if alphabet_size == 0 {
+        return 3.0;
+    }
     // Normalization preserves zero counts. Keep the reusable buffers at the
     // active alphabet length so cost/table scans do not revisit zero tails.
     let counts = &counts[..alphabet_size];
-    precise.freqs.resize(alphabet_size, 0);
-    let omit_pos = normalize_counts_first_maximum(counts, &mut precise.freqs);
-    precise.method = 12;
-    precise.omit_pos = omit_pos as u8;
-    if alphabet_size == 0 {
-        return ans_table_bits(precise);
-    }
+    let freqs = &mut scratch.freqs[..alphabet_size];
+    let omit_pos = normalize_counts_first_maximum(counts, freqs);
     // The flat distribution depends only on alphabet length. Cache its exact
     // symbol prices and serialized table size, and price both candidates in
     // one scan. Each accumulator retains the original symbol and FMA order.
@@ -1004,7 +998,7 @@ pub(crate) fn fast_ans_population_cost_scratch(
     let logs = count_log2();
     let mut precise_bits = 0.0;
     let mut flat_bits = 0.0;
-    for ((&count, &freq), &flat_price) in counts.iter().zip(&precise.freqs).zip(&flat.symbol_bits) {
+    for ((&count, &freq), &flat_price) in counts.iter().zip(freqs.iter()).zip(&flat.symbol_bits) {
         if count != 0 {
             precise_bits = f_fmla(
                 count as f64,
@@ -1014,7 +1008,7 @@ pub(crate) fn fast_ans_population_cost_scratch(
             flat_bits = f_fmla(count as f64, flat_price, flat_bits);
         }
     }
-    (precise_bits * data_scale as f64 + ans_table_bits(precise))
+    (precise_bits * data_scale as f64 + precise_ans_table_bits(freqs, omit_pos) as f64)
         .min(flat_bits * data_scale as f64 + flat.table_bits)
 }
 
@@ -1190,7 +1184,7 @@ pub(crate) fn huffman_data_bits(counts: &[u32], depths: &[u8]) -> f64 {
 /// Count the full-precision header used by the clustering cost model. Its
 /// mantissas need exactly `bit_width - 1` bits, so count them alongside the
 /// width codes without building the serializer's width and run arrays.
-fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
+fn precise_ans_table_bits(freqs: &[u16], omit_pos: usize) -> usize {
     fn varlen_bits(n: usize) -> usize {
         if n == 0 {
             1
@@ -1202,83 +1196,77 @@ fn precise_ans_table_bits(histogram: &AnsHistogram) -> usize {
         (u16::BITS - freq.leading_zeros()) as usize
     }
     // Runs cannot cross the omitted count, whose width may be artificial.
-    fn flush_run(bits: &mut usize, freq: u16, run: usize) {
-        if run == 0 {
-            return;
-        }
+    fn run_bits(freq: u16, run: usize) -> usize {
         let width = width(freq);
         let entry_bits = K_BIT_WIDTH_LENGTHS[width] as usize + width.saturating_sub(1);
         if run >= 5 {
-            *bits += entry_bits
+            entry_bits
                 + K_BIT_WIDTH_LENGTHS[ANS_LOG_TAB_SIZE as usize + 1] as usize
-                + varlen_bits(run - 5);
+                + varlen_bits(run - 5)
         } else {
-            *bits += run * entry_bits;
+            run * entry_bits
         }
     }
 
-    let alphabet_size = histogram
-        .freqs
+    let mut symbols = freqs
         .iter()
-        .rposition(|&f| f != 0)
-        .map_or(0, |i| i + 1);
-    let freqs = &histogram.freqs[..alphabet_size];
-    let omit_pos = histogram.omit_pos as usize;
-    // One pass gathers the first occupied positions (small tables), the
-    // maxima on either side of the omitted count (its width) and the
-    // run-length coded entries on both sides.
-    let mut populated = 0usize;
-    let mut first = 0usize;
-    let mut second = 0usize;
-    let mut before = 0u16;
-    let mut after = 0u16;
-    let mut run_bits = 0usize;
-    let mut run_freq = 0u16;
-    let mut run = 0usize;
-    for (i, &freq) in freqs.iter().enumerate() {
-        if freq != 0 {
-            match populated {
-                0 => first = i,
-                1 => second = i,
-                _ => {}
+        .enumerate()
+        .filter_map(|(i, &freq)| (freq != 0).then_some(i));
+    let Some(first) = symbols.next() else {
+        return 3;
+    };
+    let Some(second) = symbols.next() else {
+        return 2 + varlen_bits(first);
+    };
+    if symbols.next().is_none() {
+        return 2 + varlen_bits(first) + varlen_bits(second) + ANS_LOG_TAB_SIZE as usize;
+    }
+
+    fn side_bits(freqs: &[u16]) -> (usize, u16) {
+        let Some((&first, rest)) = freqs.split_first() else {
+            return (0, 0);
+        };
+        let mut bits = 0;
+        let mut max_freq = 0;
+        let mut run_freq = first;
+        let mut run = 1;
+        for &freq in rest {
+            if freq == run_freq {
+                run += 1;
+            } else {
+                bits += run_bits(run_freq, run);
+                max_freq = max_freq.max(run_freq);
+                run_freq = freq;
+                run = 1;
             }
-            populated += 1;
         }
-        if i == omit_pos {
-            flush_run(&mut run_bits, run_freq, run);
-            run = 0;
-            continue;
-        }
-        if i < omit_pos {
-            before = before.max(freq);
-        } else {
-            after = after.max(freq);
-        }
-        if run != 0 && freq == run_freq {
-            run += 1;
-        } else {
-            flush_run(&mut run_bits, run_freq, run);
-            run_freq = freq;
-            run = 1;
-        }
+        (bits + run_bits(run_freq, run), max_freq.max(run_freq))
     }
-    flush_run(&mut run_bits, run_freq, run);
-    match populated {
-        0 => return 3,
-        1 => return 2 + varlen_bits(first),
-        2 => return 2 + varlen_bits(first) + varlen_bits(second) + ANS_LOG_TAB_SIZE as usize,
-        _ => {}
-    }
+
+    let (before, rest) = freqs.split_at(omit_pos.min(freqs.len()));
+    let (before_bits, before) = side_bits(before);
+    let (after_bits, after) = side_bits(rest.get(1..).unwrap_or_default());
     let omit_width = 10.max(width(before) + 1).max(width(after));
     // Non-small, non-flat, method 12, alphabet size, and the omitted width.
-    8 + varlen_bits(alphabet_size - 3) + K_BIT_WIDTH_LENGTHS[omit_width] as usize + run_bits
+    8 + varlen_bits(freqs.len() - 3)
+        + K_BIT_WIDTH_LENGTHS[omit_width] as usize
+        + before_bits
+        + after_bits
 }
 
 /// Exact table-overhead measurement. Full-precision cost probes can count
 /// width codes and mantissas together; other forms use the actual serializer.
 pub(crate) fn ans_table_bits(histogram: &AnsHistogram) -> f64 {
     if histogram.method == 12 {
-        return precise_ans_table_bits(histogram) as f64;
+        let alphabet_size = histogram
+            .freqs
+            .iter()
+            .rposition(|&f| f != 0)
+            .map_or(0, |i| i + 1);
+        return precise_ans_table_bits(
+            &histogram.freqs[..alphabet_size],
+            histogram.omit_pos as usize,
+        ) as f64;
     }
     let mut w = HistogramBitCounter::default();
     encode_histogram(histogram, LOG_ALPHA_SIZE as u32, &mut w);

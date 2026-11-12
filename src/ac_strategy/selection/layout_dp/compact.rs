@@ -38,19 +38,11 @@ const AT_LEAST: u16 = 1;
 const FALLBACK: u16 = 2;
 const FIRST_TILE: u16 = 3;
 
-#[derive(Clone, Copy)]
-struct CompactMemo {
-    cost: f64,
-    choice: u16,
-}
-const EMPTY_MEMO: CompactMemo = CompactMemo {
-    cost: 0.0,
-    choice: UNSEEN,
-};
-
 #[derive(Default)]
 pub(super) struct CompactPlanner {
-    memo: Vec<CompactMemo>,
+    // Separate the f64 and u16 arrays to avoid six padding bytes per state.
+    costs: Vec<f64>,
+    choices: Vec<u16>,
     touched: Vec<u16>,
 }
 
@@ -59,25 +51,26 @@ impl CompactPlanner {
         // Only clear slots actually used by the previous tile. The index is
         // independent of the previous tile's dimensions once recorded here.
         for i in self.touched.drain(..) {
-            self.memo[i as usize].choice = UNSEEN;
+            self.choices[usize::from(i)] = UNSEEN;
         }
         let len = (width * height + 1) << width;
-        if self.memo.len() < len {
-            self.memo.resize(len, EMPTY_MEMO);
+        if self.choices.len() < len {
+            self.costs.resize(len, 0.0);
+            self.choices.resize(len, UNSEEN);
         }
     }
 
     fn get(&self, state: State, width: usize) -> Option<Memo> {
-        let entry = self.memo[state.key(width)];
-        match entry.choice {
+        let index = state.key(width);
+        match self.choices[index] {
             UNSEEN => None,
-            AT_LEAST => Some(Memo::AtLeast(entry.cost)),
+            AT_LEAST => Some(Memo::AtLeast(self.costs[index])),
             choice => Some(Memo::Solved(Entry {
-                cost: entry.cost,
+                cost: self.costs[index],
                 choice: if choice == FALLBACK {
                     Choice::Fallback
                 } else {
-                    Choice::Tile((choice - FIRST_TILE) as usize)
+                    Choice::Tile(choice - FIRST_TILE)
                 },
             })),
         }
@@ -85,23 +78,22 @@ impl CompactPlanner {
 
     fn insert(&mut self, state: State, width: usize, value: Memo) {
         let i = state.key(width);
-        if self.memo[i].choice == UNSEEN {
+        if self.choices[i] == UNSEEN {
             self.touched.push(i as u16);
         }
-        self.memo[i] = match value {
-            Memo::AtLeast(cost) => CompactMemo {
-                cost,
-                choice: AT_LEAST,
-            },
-            Memo::Solved(entry) => CompactMemo {
-                cost: entry.cost,
-                choice: match entry.choice {
+        let (cost, choice) = match value {
+            Memo::AtLeast(cost) => (cost, AT_LEAST),
+            Memo::Solved(entry) => (
+                entry.cost,
+                match entry.choice {
                     Choice::Fallback => FALLBACK,
-                    Choice::Tile(k) => FIRST_TILE + k as u16,
+                    Choice::Tile(k) => FIRST_TILE + k,
                     _ => unreachable!("only finite nonterminal suffixes are memoized"),
                 },
-            },
+            ),
         };
+        self.costs[i] = cost;
+        self.choices[i] = choice;
     }
 }
 
@@ -225,7 +217,7 @@ fn visit(
             if cost < best.cost {
                 best = Entry {
                     cost,
-                    choice: Choice::Tile(k),
+                    choice: Choice::Tile(k as u16),
                 };
             }
         }
@@ -275,6 +267,7 @@ pub(super) fn plan(
         };
         match entry.choice {
             Choice::Tile(k) => {
+                let k = usize::from(k);
                 out.push(k);
                 state = state.advance(State::mask(candidates[k], width));
                 profile = advance(profile, candidates[k]);
@@ -442,7 +435,7 @@ mod tests {
             let b = plan(&c, 8, 8, &mut s, &mut compact, &mut actual);
             assert_eq!(a.to_bits(), b.to_bits());
             assert_eq!(expected, actual);
-            assert!(compact.memo.is_empty());
+            assert!(compact.choices.is_empty());
         }
     }
 

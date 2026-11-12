@@ -459,7 +459,7 @@ pub(super) fn try_encode_context_tree_single_group(
     if let ModularFrameKind::Patched { references, .. } = frame_kind {
         write_patch_dictionary(references, alpha.is_some(), scratch, &mut section);
     }
-    section.write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut section);
     section.write(1, 0); // has_tree = 0
     section.write(1, 0); // use_global_tree = 0
     write_wp_header(wp_params, &mut section);
@@ -651,7 +651,7 @@ pub(super) fn try_encode_context_tree_multi_group(
     if let Some(dictionary) = &dictionary {
         sections[0].append(dictionary);
     }
-    sections[0].write(1, 1); // dc_quant all_default = 1
+    super::header::write_dc_quant(frame_kind, &mut sections[0]);
     sections[0].write(1, 1); // has_tree = 1
     write_tree_lz77(
         &tree_tokens,

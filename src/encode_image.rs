@@ -1429,6 +1429,58 @@ where
     linear
 }
 
+/// Apply the crop backgrounds before linearization using one bounded RGB
+/// block per worker. Only blocks touching a crop need a mutable copy.
+fn linearize_crop_base(
+    input: &[u8],
+    width: usize,
+    height: usize,
+    fills: &[(crate::crop_frames::CropBox, [u8; 3])],
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    transform: &ColorTransform<TransferLut>,
+) -> Image3F {
+    // A multiple of the color shapers' 1-, 2-, and 4-pixel SIMD batches
+    // preserves the lane and tail positions within each original row band.
+    const BLOCK: usize = 2048;
+    let input = input.as_chunks::<3>().0;
+    let mut linear = Image3F::new(width, height);
+    for_each_linear_band(&mut linear, ctx, scratch, |pixel_start, [r, g, b]| {
+        let mut staged = [[0u8; 3]; BLOCK];
+        let band = &input[pixel_start..][..r.len()];
+        for (i, (((src, r), g), b)) in band
+            .chunks(BLOCK)
+            .zip(r.chunks_mut(BLOCK))
+            .zip(g.chunks_mut(BLOCK))
+            .zip(b.chunks_mut(BLOCK))
+            .enumerate()
+        {
+            let start = pixel_start + i * BLOCK;
+            let end = start + src.len();
+            let first_row = start / width;
+            let end_row = end.div_ceil(width);
+            let mut painted = false;
+            for &(bounds, color) in fills {
+                for y in first_row.max(bounds.y0)..end_row.min(bounds.y0 + bounds.height) {
+                    let row_start = y * width + bounds.x0;
+                    let from = start.max(row_start);
+                    let to = end.min(row_start + bounds.width);
+                    if from < to {
+                        if !painted {
+                            staged[..src.len()].copy_from_slice(src);
+                            painted = true;
+                        }
+                        staged[from - start..to - start].fill(color);
+                    }
+                }
+            }
+            let src = if painted { &staged[..src.len()] } else { src };
+            transform.transform_block(src, [r, g, b]);
+        }
+    });
+    linear
+}
+
 fn linearize_gray<T, D>(
     input: &[T],
     width: usize,
@@ -2108,11 +2160,12 @@ fn fit_base_overlay(ctx: &EncodingContext, distance: f32, width: usize, height: 
 }
 
 /// Use a bounded RGB staging buffer for both ink palettes and full crops.
-fn rgb_to_xyb_lattice(
+fn rgb_to_xyb_lattice_scaled(
     matrix: &XybMatrix,
     transform: &ColorTransform<TransferLut>,
     rgb: &[[u8; 3]],
     [luma, co, cg]: [&mut [i32]; 3],
+    scale: u32,
 ) {
     const BLOCK: usize = 256;
     let mut linear = [[0.0; BLOCK]; 3];
@@ -2123,10 +2176,11 @@ fn rgb_to_xyb_lattice(
         .zip(cg.chunks_mut(BLOCK))
     {
         transform.transform_block(pixels, linear.each_mut().map(|p| &mut p[..pixels.len()]));
-        crate::xyb::xyb_lattice_ycocg(
+        crate::xyb::xyb_lattice_ycocg_scaled(
             matrix,
             linear.each_ref().map(|p| &p[..pixels.len()]),
             [luma, co, cg],
+            scale,
         );
     }
 }
@@ -2149,11 +2203,12 @@ fn encode_ink_frame(
         *rgb = ink;
     }
     let mut palette = [[0; 256]; 3];
-    rgb_to_xyb_lattice(
+    rgb_to_xyb_lattice_scaled(
         &ctx.xyb,
         transform,
         rgb,
         palette.each_mut().map(|p| &mut p[..colors.len()]),
+        crate::xyb::CROP_LATTICE_SCALE,
     );
     let [palette_y, palette_co, palette_cg] = &palette;
     let mut image = Image3Si::new(width, height);
@@ -2209,6 +2264,14 @@ fn encode_crop_stack(
     use crate::crop_frames;
     use crate::encoding_context::FrameRole;
     use crate::patches::ModularFrameKind;
+    struct CropCandidate {
+        bounds: crop_frames::CropBox,
+        content: Vec<u8>,
+        saving: f64,
+        estimated_bytes: f64,
+        lossy: bool,
+        background: [u8; 3],
+    }
     let boxes = crop_frames::plan(input, width, height);
     // Achromatic sharp detail goes to lossy modular crops, where the squeeze
     // beats VarDCT on luma-only edges.
@@ -2244,11 +2307,12 @@ fn encode_crop_stack(
                       scratch: &mut CoderScratch|
      -> BitWriter {
         let mut image = Image3Si::new(b.width, b.height);
-        rgb_to_xyb_lattice(
+        rgb_to_xyb_lattice_scaled(
             &ctx.xyb,
             &transform,
             rgb.as_chunks::<3>().0,
             image.all_planes_mut().map(|plane| plane.as_mut_slice()),
+            crate::xyb::CROP_LATTICE_SCALE,
         );
         let mut frame = BitWriter::new();
         crate::lossless::encode_frame_lossless_xyb_crop(
@@ -2309,7 +2373,14 @@ fn encode_crop_stack(
         let frame = crop_frame(&spec, &content, b, false, Speed::Medium, &mut scratch);
         let bytes = frame.bits_written() as f64 / 8.0 + crop_frames::FRAME_OVERHEAD;
         if bytes < model {
-            chosen.push((*b, content, model - bytes, bytes, false));
+            chosen.push(CropCandidate {
+                bounds: *b,
+                content,
+                saving: model - bytes,
+                estimated_bytes: bytes,
+                lossy: false,
+                background: crop_frames::background_color(input, width, *b),
+            });
         }
     }
     for b in &detail {
@@ -2320,16 +2391,27 @@ fn encode_crop_stack(
         };
         let bytes = frame.bits_written() as f64 / 8.0 + crop_frames::FRAME_OVERHEAD;
         if bytes < crop_frames::DETAIL_MARGIN * model {
-            chosen.push((*b, crop, model - bytes, bytes, true));
+            chosen.push(CropCandidate {
+                bounds: *b,
+                content: crop,
+                saving: model - bytes,
+                estimated_bytes: bytes,
+                lossy: true,
+                background: crop_frames::background_color(input, width, *b),
+            });
         }
     }
     drop(spec);
     // Each kind must promise 1 % of the whole on its own: flat crops that
     // promise less do not join a stack the detail crops pay for.
     for lossy in [false, true] {
-        let saving: f64 = chosen.iter().filter(|c| c.4 == lossy).map(|c| c.2).sum();
+        let saving: f64 = chosen
+            .iter()
+            .filter(|c| c.lossy == lossy)
+            .map(|c| c.saving)
+            .sum();
         if saving < 0.01 * whole as f64 {
-            chosen.retain(|c| c.4 != lossy);
+            chosen.retain(|c| c.lossy != lossy);
         }
     }
     if chosen.is_empty() {
@@ -2337,25 +2419,23 @@ fn encode_crop_stack(
     }
     // The filled base and the chosen crops over it, finalized.
     // `None` with the base's bytes when the stack cannot beat `whole`.
-    let stack = |chosen: &[&(crop_frames::CropBox, Vec<u8>, f64, f64, bool)],
+    let stack = |chosen: &[&CropCandidate],
                  scratch: &mut CoderScratch|
      -> Result<(Option<Vec<u8>>, usize), EncodeError> {
-        let rects: Vec<_> = chosen.iter().map(|(b, ..)| *b).collect();
-        let filled = crop_frames::fill(input, width, &rects);
+        let fills: Vec<_> = chosen.iter().map(|c| (c.bounds, c.background)).collect();
         let pixels = width * height;
         let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, pixels);
         ctx.lossy_modular = LossyModular::Off;
         ctx.frame_role = FrameRole::SavedFirst;
         ctx.crop_base = true;
-        let linear = linearize_rgb::<_, _, 3>(&filled, width, height, &ctx, scratch, &transform);
-        drop(filled);
+        let linear = linearize_crop_base(input, width, height, &fills, &ctx, scratch, &transform);
         ctx.set_coding(CodingTransform::Xyb, distance);
         apply_yellow_opsin(&mut ctx, &linear, distance);
         if fit_base_overlay(&ctx, distance, width, height) {
             // The crop frames replace their boxes: the base under them does
             // not count in the edge-preserving filter fit.
             let mut coverage = vec![0; pixels];
-            for b in &rects {
+            for (b, _) in &fills {
                 for row in coverage.chunks_exact_mut(width).skip(b.y0).take(b.height) {
                     row[b.x0..b.x0 + b.width].fill(1);
                 }
@@ -2406,17 +2486,17 @@ fn encode_crop_stack(
             scratch,
             &mut w,
         );
-        w.append(&base);
+        w.append_bits(&base);
         drop(base);
         let last = chosen.len() - 1;
-        for (i, (b, content, _, _, lossy)) in chosen.iter().enumerate() {
-            let frame = if *lossy {
-                lossy_frame(&ctx, content, b, i == last, scratch)
+        for (i, crop) in chosen.iter().enumerate() {
+            let frame = if crop.lossy {
+                lossy_frame(&ctx, &crop.content, &crop.bounds, i == last, scratch)
                     .expect("the crop squeezed when it was priced")
             } else {
-                crop_frame(&ctx, content, b, i == last, speed, scratch)
+                crop_frame(&ctx, &crop.content, &crop.bounds, i == last, speed, scratch)
             };
-            w.append(&frame);
+            w.append_bits(&frame);
         }
         finalize_container(
             w.into_bytes(),
@@ -2431,8 +2511,8 @@ fn encode_crop_stack(
     // The flat crops race the whole encode on their own first, as they do
     // without detail crops: a set that loses must not ride in on a detail
     // crop's saving.
-    let flat: Vec<_> = chosen.iter().filter(|c| !c.4).collect();
-    let lossy: Vec<_> = chosen.iter().filter(|c| c.4).collect();
+    let flat: Vec<_> = chosen.iter().filter(|c| !c.lossy).collect();
+    let lossy: Vec<_> = chosen.iter().filter(|c| c.lossy).collect();
     let mut best_stack: Option<Vec<u8>> = None;
     let mut flat_stood = false;
     if !flat.is_empty() {
@@ -2449,17 +2529,18 @@ fn encode_crop_stack(
             // member alone.
             let best = flat
                 .iter()
-                .max_by(|a, b| a.2.total_cmp(&b.2))
+                .max_by(|a, b| a.saving.total_cmp(&b.saving))
                 .expect("flat is not empty");
             // The second base fills less, so it costs at least the first:
             // with the best crop's frame on top already past `whole`, it
             // cannot win.
-            best_stack =
-                if best.2 < 0.03 * whole as f64 || first_base as f64 + best.3 >= whole as f64 {
-                    first
-                } else {
-                    stack(&[best], &mut scratch)?.0
-                };
+            best_stack = if best.saving < 0.03 * whole as f64
+                || first_base as f64 + best.estimated_bytes >= whole as f64
+            {
+                first
+            } else {
+                stack(&[best], &mut scratch)?.0
+            };
         }
     }
     if lossy.is_empty() {
@@ -4503,6 +4584,83 @@ fn write_image_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_base_staging_matches_filled_rgb_linearization() {
+        use crate::crop_frames::CropBox;
+
+        let (width, height) = (113, 71);
+        let input: Vec<u8> = (0..width * height * 3)
+            .map(|i| ((i * 31) ^ (i / 7)) as u8)
+            .collect();
+        let fills = [
+            (
+                CropBox {
+                    x0: 11,
+                    y0: 9,
+                    width: 67,
+                    height: 52,
+                },
+                [200, 100, 51],
+            ),
+            (
+                CropBox {
+                    x0: 57,
+                    y0: 37,
+                    width: 41,
+                    height: 9,
+                },
+                [2, 5, 19],
+            ),
+        ];
+        let mut filled = input.clone();
+        for (bounds, color) in fills {
+            for y in bounds.y0..bounds.y0 + bounds.height {
+                filled.as_chunks_mut::<3>().0[y * width + bounds.x0..][..bounds.width].fill(color);
+            }
+        }
+        for threads in [1, 3] {
+            let config = EncodeConfig::default()
+                .with_speed(Speed::Slow)
+                .with_num_threads(threads);
+            let ctx = lossy_context(&config, 2.0, XybMatrix::SPEC, width * height);
+            let mut scratch = Box::<CoderScratch>::default();
+            for (transfer, primaries) in [
+                (crate::TransferFunction::Srgb, crate::Primaries::Bt709),
+                (crate::TransferFunction::Srgb, crate::Primaries::Smpte432),
+                (crate::TransferFunction::Hlg, crate::Primaries::Bt2020),
+            ] {
+                let transform = ColorTransform::for_integer(8, transfer, primaries, None);
+                let expected = linearize_rgb::<_, _, 3>(
+                    &filled,
+                    width,
+                    height,
+                    &ctx,
+                    &mut scratch,
+                    &transform,
+                );
+                let staged = linearize_crop_base(
+                    &input,
+                    width,
+                    height,
+                    &fills,
+                    &ctx,
+                    &mut scratch,
+                    &transform,
+                );
+                for c in 0..3 {
+                    assert!(
+                        staged
+                            .plane_data(c)
+                            .iter()
+                            .zip(expected.plane_data(c))
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{transfer:?} {primaries:?}, {threads} threads, plane {c}",
+                    );
+                }
+            }
+        }
+    }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4

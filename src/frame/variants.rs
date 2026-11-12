@@ -162,7 +162,7 @@ impl GlyphStage {
         } else {
             8
         };
-        let plan = crate::patches::find_lossy_glyph_patches(
+        let mut plan = crate::patches::plan_lossy_glyph_patches(
             ctx,
             xyb,
             &crate::patches::GlyphParams {
@@ -186,7 +186,7 @@ impl GlyphStage {
         let mut atlas = BitWriter::new();
         // Template coverage rides in the atlas alpha; kAdd entries leave it zero.
         let coverage = match alpha {
-            Some(AlphaPlane::U8(_)) => plan.alpha_atlas.map(AlphaPlane::U8),
+            Some(AlphaPlane::U8(_)) => plan.alpha_atlas.take().map(AlphaPlane::U8),
             _ => None,
         };
         let zero_alpha;
@@ -206,6 +206,7 @@ impl GlyphStage {
             scratch,
             &mut atlas,
         );
+        let plan = plan.materialize(xyb);
         let luma = retain_epf_luma.then(|| {
             let [samples, _, _] = plan.atlas;
             Arc::new(GlyphAtlasLuma {

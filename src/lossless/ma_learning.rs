@@ -608,10 +608,17 @@ pub(super) fn learn_ma_candidate(
         .map(|job| ma_channel_sample_count(job.w, job.h, stride))
         .collect();
     let total_samples = counts.iter().sum();
+    let leaf_offsets = matches!(source.transform, MaTransform::Rct(_));
     let mut samples = MaSamples {
         props: crate::ma_tree::MaProperties::zeroed(total_samples),
         tok: vec![[0; NUM_MA_PREDS]; total_samples],
-        val: vec![0; total_samples],
+        // RCT trees fit leaf offsets from routed residual symbols. Only the
+        // modal Zero leaves of other sources need the original sample value.
+        val: if leaf_offsets {
+            Vec::new()
+        } else {
+            vec![0; total_samples]
+        },
     };
     loop {
         let overflow = crate::ma_tree::with_ma_properties!(&mut samples.props, |props| {
@@ -622,18 +629,15 @@ pub(super) fn learn_ma_candidate(
             for &count in &counts {
                 let (p, rest_p) = props.split_at_mut(count);
                 let (t, rest_t) = tok.split_at_mut(count);
-                let (v, rest_v) = val.split_at_mut(count);
+                let (v, rest_v) = val.split_at_mut(if leaf_offsets { 0 } else { count });
                 ranges.push((p, t, v, false));
                 (props, tok, val) = (rest_p, rest_t, rest_v);
             }
             pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
                 let job = &jobs[i];
                 let ch = source.channel_at(job.group_override, job.channel);
-                let mut rows = range
-                    .0
-                    .iter_mut()
-                    .zip(range.1.iter_mut())
-                    .zip(range.2.iter_mut());
+                let mut rows = range.0.iter_mut().zip(range.1.iter_mut());
+                let mut values = range.2.iter_mut();
                 with_ma_pixels!(ch, |pixels| sample_channel_ma(
                     |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
                     job.w,
@@ -645,13 +649,16 @@ pub(super) fn learn_ma_candidate(
                     use_wp,
                     stride,
                     |p, t, v| {
-                        let ((props, tok), val) = rows.next().expect("sample count");
+                        let (props, tok) = rows.next().expect("sample count");
                         range.3 |= !crate::ma_tree::write_property_row(props, p);
                         *tok = t;
-                        *val = v;
+                        if let Some(val) = values.next() {
+                            *val = v;
+                        }
                     },
                 ));
                 debug_assert!(rows.next().is_none());
+                debug_assert!(values.next().is_none());
             });
             ranges.iter().any(|range| range.3)
         });
@@ -671,7 +678,7 @@ pub(super) fn learn_ma_candidate(
         use_wp,
         max_leaves,
         max_candidates,
-        matches!(source.transform, MaTransform::Rct(_)),
+        leaf_offsets,
         pool,
         scratch,
     )

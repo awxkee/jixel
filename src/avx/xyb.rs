@@ -116,11 +116,21 @@ unsafe fn to_linear_rows<const N: usize>(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn halley_cbrt_avx2<const SCALAR_ORDER: bool>(x: __m256, a: __m256) -> __m256 {
+fn mul_add_avx2<const FUSED: bool>(a: __m256, b: __m256, c: __m256) -> __m256 {
+    if FUSED {
+        _mm256_fmadd_ps(a, b, c)
+    } else {
+        _mm256_add_ps(_mm256_mul_ps(a, b), c)
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn halley_cbrt_avx2<const SCALAR_ORDER: bool, const FUSED: bool>(x: __m256, a: __m256) -> __m256 {
     let tx = _mm256_mul_ps(_mm256_mul_ps(x, x), x);
     let two = _mm256_set1_ps(2.0);
-    let num = _mm256_fmadd_ps(a, two, tx);
-    let den = _mm256_fmadd_ps(tx, two, a);
+    let num = mul_add_avx2::<FUSED>(a, two, tx);
+    let den = mul_add_avx2::<FUSED>(tx, two, a);
 
     if SCALAR_ORDER {
         _mm256_div_ps(_mm256_mul_ps(x, num), den)
@@ -176,12 +186,12 @@ pub(crate) fn vcbrt_fast3_positive_avx2(
     a1: __m256,
     a2: __m256,
 ) -> (__m256, __m256, __m256) {
-    cbrt3_positive_avx2::<false>(a0, a1, a2)
+    cbrt3_positive_avx2::<false, true>(a0, a1, a2)
 }
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn cbrt3_positive_avx2<const SCALAR_ORDER: bool>(
+fn cbrt3_positive_avx2<const SCALAR_ORDER: bool, const FUSED: bool>(
     a0: __m256,
     a1: __m256,
     a2: __m256,
@@ -190,13 +200,13 @@ fn cbrt3_positive_avx2<const SCALAR_ORDER: bool>(
     let mut x1 = cbrt_seed_positive_avx2::<SCALAR_ORDER>(a1);
     let mut x2 = cbrt_seed_positive_avx2::<SCALAR_ORDER>(a2);
 
-    x0 = halley_cbrt_avx2::<SCALAR_ORDER>(x0, a0);
-    x1 = halley_cbrt_avx2::<SCALAR_ORDER>(x1, a1);
-    x2 = halley_cbrt_avx2::<SCALAR_ORDER>(x2, a2);
+    x0 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x0, a0);
+    x1 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x1, a1);
+    x2 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x2, a2);
 
-    x0 = halley_cbrt_avx2::<SCALAR_ORDER>(x0, a0);
-    x1 = halley_cbrt_avx2::<SCALAR_ORDER>(x1, a1);
-    x2 = halley_cbrt_avx2::<SCALAR_ORDER>(x2, a2);
+    x0 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x0, a0);
+    x1 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x1, a1);
+    x2 = halley_cbrt_avx2::<SCALAR_ORDER, FUSED>(x2, a2);
 
     let zero = _mm256_setzero_ps();
     x0 = _mm256_blendv_ps(x0, zero, _mm256_cmp_ps::<_CMP_EQ_OQ>(a0, zero));
@@ -216,29 +226,27 @@ pub(super) fn rgb_to_xyb_f32x8_avx2<const SCALAR_ORDER: bool>(
     g: __m256,
     b: __m256,
 ) -> (__m256, __m256, __m256) {
+    rgb_to_xyb_avx2::<SCALAR_ORDER, true>(m, r, g, b)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn rgb_to_xyb_avx2<const SCALAR_ORDER: bool, const FUSED: bool>(
+    m: &XybMatrix,
+    r: __m256,
+    g: __m256,
+    b: __m256,
+) -> (__m256, __m256, __m256) {
     let bias = _mm256_set1_ps(OPSIN_BIAS);
-
-    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
-    let mut mixed0 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[2]), bias);
-    mixed0 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[1]), mixed0);
-    mixed0 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[0]), mixed0);
-
-    // mixed rows: m.fwd[r0..r2] per channel + OPSIN_BIAS
-    let mut mixed1 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[5]), bias);
-    mixed1 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[4]), mixed1);
-    mixed1 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[3]), mixed1);
-
-    // mixed2 = m20*r + m21*g + m22*b + OPSIN_BIAS (B row selected by RED)
-    let mut mixed2 = _mm256_fmadd_ps(b, _mm256_set1_ps(m.fwd[8]), bias);
-    mixed2 = _mm256_fmadd_ps(g, _mm256_set1_ps(m.fwd[7]), mixed2);
-    mixed2 = _mm256_fmadd_ps(r, _mm256_set1_ps(m.fwd[6]), mixed2);
-
     let zero = _mm256_setzero_ps();
-    mixed0 = _mm256_max_ps(mixed0, zero);
-    mixed1 = _mm256_max_ps(mixed1, zero);
-    mixed2 = _mm256_max_ps(mixed2, zero);
+    let row = |offset: usize| {
+        let mixed = mul_add_avx2::<FUSED>(b, _mm256_set1_ps(m.fwd[offset + 2]), bias);
+        let mixed = mul_add_avx2::<FUSED>(g, _mm256_set1_ps(m.fwd[offset + 1]), mixed);
+        let mixed = mul_add_avx2::<FUSED>(r, _mm256_set1_ps(m.fwd[offset]), mixed);
+        _mm256_max_ps(mixed, zero)
+    };
 
-    let (tm0, tm1, tm2) = cbrt3_positive_avx2::<SCALAR_ORDER>(mixed0, mixed1, mixed2);
+    let (tm0, tm1, tm2) = cbrt3_positive_avx2::<SCALAR_ORDER, FUSED>(row(0), row(3), row(6));
 
     let neg_bias = _mm256_set1_ps(NEG_BIAS_CBRT);
     let tm0 = _mm256_add_ps(tm0, neg_bias);
@@ -265,7 +273,7 @@ fn tail_mask_avx2(len: usize) -> __m256i {
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn xyb_lattice_vec(
+fn xyb_lattice_vec<const FUSED: bool>(
     m: &XybMatrix,
     [r, g, b]: [__m256; 3],
     [sx, sy, sb]: [__m256; 3],
@@ -273,30 +281,48 @@ fn xyb_lattice_vec(
     use super::quantize_xyb::round_ties_away_i32;
     use crate::lossless::rct_simd::avx::forward_vec;
 
-    let (x, y, b) = rgb_to_xyb_f32x8_avx2::<true>(m, r, g, b);
+    let (x, y, b) = rgb_to_xyb_avx2::<true, FUSED>(m, r, g, b);
     let y = round_ties_away_i32(_mm256_mul_ps(y, sy));
     let x = round_ties_away_i32(_mm256_mul_ps(x, sx));
     let b_minus_y = _mm256_sub_epi32(round_ties_away_i32(_mm256_mul_ps(b, sb)), y);
     forward_vec(y, x, b_minus_y)
 }
 
-/// Mask the tail so every pixel uses the same FMA arithmetic.
-/// The input and output planes must have equal lengths.
+/// Mask the tail so every pixel uses the same arithmetic.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. All six planes must have equal lengths.
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn xyb_lattice_avx2(
     m: &XybMatrix,
     input: [&[f32]; 3],
     output: [&mut [i32]; 3],
+    scale: u32,
 ) -> usize {
-    use crate::quant_weights::INV_DC_QUANT;
+    // The base lattice already used fused arithmetic. For refined lattices,
+    // follow dct::fmla so generic x86 builds match their scalar quantization.
+    if scale == 1 || cfg!(target_feature = "fma") {
+        unsafe { xyb_lattice_avx2_impl::<true>(m, input, output, scale) }
+    } else {
+        unsafe { xyb_lattice_avx2_impl::<false>(m, input, output, scale) }
+    }
+}
 
-    let scales = INV_DC_QUANT.map(|scale| _mm256_set1_ps(scale));
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn xyb_lattice_avx2_impl<const FUSED: bool>(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [i32]; 3],
+    scale: u32,
+) -> usize {
+    let scales = scaled_lattice_quantizers(scale).map(|quantizer| _mm256_set1_ps(quantizer));
     let len = input[0].len();
     let end = len / 8 * 8;
     let output = output.map(|p| p.as_mut_ptr());
     for i in (0..end).step_by(8) {
         let rgb = input.map(|p| unsafe { _mm256_loadu_ps(p.as_ptr().add(i)) });
-        let values = xyb_lattice_vec(m, rgb, scales);
+        let values = xyb_lattice_vec::<FUSED>(m, rgb, scales);
         for (p, value) in output.into_iter().zip(values) {
             unsafe { _mm256_storeu_si256(p.add(i).cast(), value) };
         }
@@ -304,7 +330,7 @@ pub(crate) unsafe fn xyb_lattice_avx2(
     if end < len {
         let mask = tail_mask_avx2(len - end);
         let rgb = input.map(|p| unsafe { _mm256_maskload_ps(p.as_ptr().add(end), mask) });
-        let values = xyb_lattice_vec(m, rgb, scales);
+        let values = xyb_lattice_vec::<FUSED>(m, rgb, scales);
         for (p, value) in output.into_iter().zip(values) {
             unsafe { _mm256_maskstore_epi32(p.add(end), mask, value) };
         }

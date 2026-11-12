@@ -239,15 +239,11 @@ pub(crate) fn xyb_lattice_neon(
     m: &XybMatrix,
     [r, g, b]: [&[f32]; 3],
     [luma, co, cg]: [&mut [i32]; 3],
+    scale: u32,
 ) -> usize {
     use crate::lossless::rct_simd::neon::forward_vec;
-    use crate::quant_weights::INV_DC_QUANT;
 
-    let [sx, sy, sb] = [
-        vdupq_n_f32(INV_DC_QUANT[0]),
-        vdupq_n_f32(INV_DC_QUANT[1]),
-        vdupq_n_f32(INV_DC_QUANT[2]),
-    ];
+    let [sx, sy, sb] = scaled_lattice_quantizers(scale).map(|quantizer| vdupq_n_f32(quantizer));
     let r = r.as_chunks::<4>().0;
     let g = g.as_chunks::<4>().0;
     let b = b.as_chunks::<4>().0;

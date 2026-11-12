@@ -165,12 +165,14 @@ impl Candidate {
     }
 }
 
+// A tile has at most MAX_CANDIDATES pieces and cuts are at most SIDE - 1.
+// Narrow payloads leave each f64 cost and its backpointer in 16 bytes.
 #[derive(Clone, Copy, Debug)]
 enum Choice {
     None,
-    Tile(usize),
-    Vertical(usize),
-    Horizontal(usize),
+    Tile(u16),
+    Vertical(u16),
+    Horizontal(u16),
     Fallback,
 }
 #[derive(Clone, Copy, Debug)]
@@ -204,16 +206,14 @@ struct OpenTable<V: Copy + Default> {
 
 impl<V: Copy + Default> Default for OpenTable<V> {
     fn default() -> Self {
-        let mut table = Self {
+        Self {
             keys: Vec::new(),
             stamps: Vec::new(),
             values: Vec::new(),
             generation: 1,
             len: 0,
             shift: 32,
-        };
-        table.resize(1 << 12);
-        table
+        }
     }
 }
 
@@ -254,11 +254,17 @@ impl<V: Copy + Default> OpenTable<V> {
 
     #[inline]
     fn get(&self, key: u32) -> Option<V> {
+        if self.len == 0 {
+            return None;
+        }
         let (slot, found) = self.slot(key);
         found.then(|| self.values[slot])
     }
 
     fn insert(&mut self, key: u32, value: V) {
+        if self.keys.is_empty() {
+            self.resize(1 << 12);
+        }
         let (slot, found) = self.slot(key);
         if !found {
             if (self.len + 1) * 2 > self.keys.len() {
@@ -283,12 +289,6 @@ impl<V: Copy + Default> OpenTable<V> {
 impl Default for Memo {
     fn default() -> Self {
         Self::AtLeast(0.0)
-    }
-}
-
-impl Default for ReconStrategyCost {
-    fn default() -> Self {
-        UNMEASURED
     }
 }
 
@@ -347,6 +347,7 @@ fn add_lower(a: f64, b: f64) -> f64 {
 }
 
 fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mut PlannerScratch) {
+    debug_assert!(candidates.len() <= MAX_CANDIDATES);
     s.regions.clear();
     s.regions.resize(REGION_COUNT, EMPTY);
     for (i, &c) in candidates.iter().enumerate() {
@@ -357,7 +358,7 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
         if c.cost < r.cost {
             *r = Entry {
                 cost: c.cost,
-                choice: Choice::Tile(i),
+                choice: Choice::Tile(i as u16),
             };
         }
     }
@@ -381,7 +382,7 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
                         if cost < best.cost {
                             best = Entry {
                                 cost,
-                                choice: Choice::Vertical(cut),
+                                choice: Choice::Vertical(cut as u16),
                             };
                         }
                     }
@@ -391,7 +392,7 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
                         if cost < best.cost {
                             best = Entry {
                                 cost,
-                                choice: Choice::Horizontal(cut),
+                                choice: Choice::Horizontal(cut as u16),
                             };
                         }
                     }
@@ -400,6 +401,28 @@ fn prepare_regions(candidates: &[Candidate], width: usize, height: usize, s: &mu
                 }
             }
         }
+    }
+}
+
+fn entering_column(objective: &[f64]) -> Option<usize> {
+    const LIMIT: f64 = -1e-10;
+    let (quads, tail) = objective.as_chunks::<4>();
+    let mut minima = [LIMIT; 4];
+    for quad in quads {
+        for (minimum, &value) in minima.iter_mut().zip(quad) {
+            *minimum = minimum.min(value);
+        }
+    }
+    let mut reduced = minima.into_iter().fold(LIMIT, f64::min);
+    for &value in tail {
+        reduced = reduced.min(value);
+    }
+    // Only costs strictly below LIMIT can enter. Look up the first
+    // occurrence of the minimum to preserve the original pivot on ties.
+    if reduced < LIMIT {
+        objective.iter().position(|&value| value == reduced)
+    } else {
+        None
     }
 }
 
@@ -430,7 +453,7 @@ fn prepare_packing_bound(
     }
     let mut variables = Vec::new();
     for (k, &c) in candidates.iter().enumerate() {
-        if !c.cost.is_finite() {
+        if !c.cost.is_finite() || c.width * c.height == 1 {
             continue;
         }
         let mut baseline = 0.0;
@@ -441,9 +464,9 @@ fn prepare_packing_bound(
                 baseline_upper = -add_lower(-baseline_upper, -leaves[y * width + x]);
             }
         }
-        if c.width * c.height > 1 && c.cost >= baseline_upper {
+        if c.cost >= baseline_upper {
             s.dominated[k] = true;
-        } else if c.width * c.height > 1 {
+        } else {
             variables.push((k, baseline - c.cost));
         }
     }
@@ -468,18 +491,7 @@ fn prepare_packing_bound(
         s.tableau[row * cols + cols - 1] = 1.0;
     }
     for _ in 0..PIVOTS {
-        let mut enter = None;
-        let mut reduced = -1e-10;
-        for (col, &value) in s.tableau[objective..objective + cols - 1]
-            .iter()
-            .enumerate()
-        {
-            if value < reduced {
-                reduced = value;
-                enter = Some(col);
-            }
-        }
-        let Some(enter) = enter else {
+        let Some(enter) = entering_column(&s.tableau[objective..objective + cols - 1]) else {
             break;
         };
         let mut leave = None;
@@ -727,7 +739,7 @@ fn visit(
             if cost < best.cost {
                 best = Entry {
                     cost,
-                    choice: Choice::Tile(k),
+                    choice: Choice::Tile(k as u16),
                 };
             }
         }
@@ -743,12 +755,14 @@ fn visit(
 
 fn unpack_region(x: usize, y: usize, w: usize, h: usize, s: &PlannerScratch, out: &mut Vec<usize>) {
     match s.regions[region_index(x, y, w, h)].choice {
-        Choice::Tile(k) => out.push(k),
+        Choice::Tile(k) => out.push(usize::from(k)),
         Choice::Vertical(cut) => {
+            let cut = usize::from(cut);
             unpack_region(x, y, cut, h, s, out);
             unpack_region(x + cut, y, w - cut, h, s, out);
         }
         Choice::Horizontal(cut) => {
+            let cut = usize::from(cut);
             unpack_region(x, y, w, cut, s, out);
             unpack_region(x, y + cut, w, h - cut, s, out);
         }
@@ -776,6 +790,7 @@ fn plan(
         };
         match entry.choice {
             Choice::Tile(k) => {
+                let k = usize::from(k);
                 out.push(k);
                 profile = advance(profile, candidates[k]);
             }
@@ -791,6 +806,7 @@ fn plan(
 
 fn prepare_planner(candidates: &[Candidate], width: usize, height: usize, s: &mut PlannerScratch) {
     assert!((1..=SIDE).contains(&width) && (1..=SIDE).contains(&height));
+    debug_assert!(candidates.len() <= MAX_CANDIDATES);
     s.memo.clear();
     s.budget = VISIT_BUDGET;
     s.anchors.resize_with(SIDE * SIDE, Vec::new);
@@ -830,20 +846,29 @@ fn unpack_fallback(
     }
 }
 
-const UNMEASURED: ReconStrategyCost = ReconStrategyCost {
-    cost: f32::NAN,
-    base: f32::NAN,
-    distortion: f32::NAN,
-    rate: f32::NAN,
-    hue_distortion: f32::NAN,
-};
+/// Only the final cost and the accepted piece's baseline outlive scoring.
+#[derive(Clone, Copy)]
+struct CachedCost {
+    cost: f32,
+    base: f32,
+}
+
+impl Default for CachedCost {
+    fn default() -> Self {
+        Self {
+            cost: f32::NAN,
+            base: f32::NAN,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutDpScratch {
-    reconstruction: Vec<ReconStrategyCost>,
+    reconstruction: Vec<CachedCost>,
     /// Scores by absolute block position and strategy, kept across the
     /// tile grids of one re-tiling so a shifted grid rescores only the
     /// pieces the aligned grid could not place.
-    global: OpenTable<ReconStrategyCost>,
+    global: OpenTable<CachedCost>,
     candidates: Vec<Candidate>,
     planner: PlannerScratch,
     current: Vec<Piece>,
@@ -856,8 +881,9 @@ pub(crate) struct LayoutDpScratch {
 }
 impl LayoutDpScratch {
     fn reset(&mut self) {
-        self.reconstruction.resize(CACHE_SIZE, UNMEASURED);
-        self.reconstruction.fill(UNMEASURED);
+        self.reconstruction.clear();
+        self.reconstruction
+            .resize(CACHE_SIZE, CachedCost::default());
         self.candidates.clear();
         self.choices.clear();
         self.best.clear();
@@ -876,7 +902,7 @@ impl Scores<'_, '_> {
         coder: &mut CoderScratch,
         cache: &mut LayoutDpScratch,
         p: Piece,
-    ) -> ReconStrategyCost {
+    ) -> CachedCost {
         self.reconstruction_bounded(coder, cache, p, f32::INFINITY)
     }
 
@@ -888,7 +914,7 @@ impl Scores<'_, '_> {
         cache: &mut LayoutDpScratch,
         p: Piece,
         limit: f32,
-    ) -> ReconStrategyCost {
+    ) -> CachedCost {
         let key = p.key();
         if cache.reconstruction[key].cost.is_nan() {
             let params = self.rerank.params;
@@ -933,6 +959,10 @@ impl Scores<'_, '_> {
                     fine_admit_charge(coder.rate_prices.is_some(), params.distance, score.rate);
                 score.cost = fmla(lambda, bits, score.cost);
             }
+            let score = CachedCost {
+                cost: score.cost,
+                base: score.base,
+            };
             if score.cost.is_finite() {
                 cache.global.insert(global_key, score);
             }
@@ -1330,7 +1360,10 @@ impl CoefficientScores<'_, '_> {
                     ),
                 )
             });
-            let score = ReconStrategyCost { cost, ..UNMEASURED };
+            let score = CachedCost {
+                cost,
+                ..CachedCost::default()
+            };
             if cost.is_finite() {
                 cache.global.insert(global_key, score);
             }
@@ -2283,6 +2316,19 @@ mod tests {
             5.0
         );
         assert!(matches!(scratch.memo.get(0),Some(Memo::Solved(entry)) if entry.cost == 5.0));
+    }
+
+    #[test]
+    fn entering_column_uses_the_first_strict_minimum() {
+        assert_eq!(entering_column(&[0.0, -0.0, -1e-10, f64::NAN]), None);
+        assert_eq!(
+            entering_column(&[f64::NAN, -2.0, -1.0, -0.0, -2.0, f64::INFINITY, -2.0]),
+            Some(1),
+        );
+        assert_eq!(
+            entering_column(&[-2.0, 0.0, 0.0, 0.0, f64::NEG_INFINITY]),
+            Some(4)
+        );
     }
 
     #[test]
