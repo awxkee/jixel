@@ -580,12 +580,13 @@ impl FitScratch {
     }
 }
 
-/// Fit precision: `Full` is what gets quantized, `Probe` ranks geometry moves.
+/// Fit support and number of basis columns.
 #[derive(Clone, Copy, PartialEq)]
 enum Precision {
     Full,
     Probe,
     Compact,
+    Lean,
 }
 
 /// A leading block of the factor is also the factor for that block of ata.
@@ -676,18 +677,19 @@ fn fit_system(
     let mut coeffs = ((arc / ARC_PER_COEFF + 0.5) as usize).clamp(1, MAX_COEFFS);
     let sigma = sigma_n as f32 * sigma_step();
     let mut reach = (3.6 * sigma + 1.5).ceil() as isize;
-    if precision == Precision::Probe {
-        coeffs = coeffs.min(REFINE_COEFFS);
-        reach = (2.6 * sigma + 1.0).ceil() as isize;
-    }
-    if precision == Precision::Compact {
-        coeffs = coeffs.min(COMPACT_COEFFS);
+    match precision {
+        Precision::Full => {}
+        Precision::Probe => {
+            coeffs = coeffs.min(REFINE_COEFFS);
+            reach = (2.6 * sigma + 1.0).ceil() as isize;
+        }
+        Precision::Compact => coeffs = coeffs.min(COMPACT_COEFFS),
+        Precision::Lean => coeffs = coeffs.min(LONG_LINE_MAX_COEFFS),
     }
     scratch.prepare_basis(coeffs);
     let table = scratch.weight_table(sigma_n, sigma, reach);
-    // Refinement uses three coefficients; compact extension and long-line
-    // fits use six. Expose these common sizes to the compiler without changing
-    // the raster or normal-equation accumulation order.
+    // Expose the common three- and six-column fits to the compiler while
+    // preserving the raster and normal-equation accumulation order.
     match coeffs {
         REFINE_COEFFS => raster_system::<REFINE_COEFFS>(
             targets, w, h, sigma_n, sigma, reach, coeffs, table, scratch,
@@ -1031,6 +1033,7 @@ fn refine(
     // A control point only shapes the curve a few spans around it: rank its
     // moves on that sub-curve instead of re-fitting the whole spline.
     let mut points = points.to_vec();
+    let mut previous = None;
     for _ in 0..sweeps {
         let mut moved = false;
         for i in 0..points.len() {
@@ -1038,12 +1041,23 @@ fn refine(
             let hi = (i + REFINE_NEIGHBORS).min(points.len() - 1);
             let local = &mut points[lo..=hi];
             let center = i - lo;
-            let mut best_point = local[center];
-            let mut best = cost(local, scratch);
+            let start = local[center];
+            let start_cost = match previous {
+                Some((a, b, value)) if (a, b) == (lo, hi) => value,
+                _ => cost(local, scratch),
+            };
+            let mut best_point = start;
+            let mut best = start_cost;
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let trial = Point::new(best_point.x + dx, best_point.y + dy);
                 local[center] = trial;
-                let value = cost(local, scratch);
+                // A reverse move can revisit the starting geometry after an
+                // accepted step. Neighboring knots can also share a window.
+                let value = if trial == start {
+                    start_cost
+                } else {
+                    cost(local, scratch)
+                };
                 if value < best - 1e-12 {
                     best = value;
                     best_point = trial;
@@ -1051,6 +1065,7 @@ fn refine(
                 }
             }
             local[center] = best_point;
+            previous = Some((lo, hi, best));
         }
         if !moved {
             break;
@@ -1497,7 +1512,7 @@ fn fit_long_line(
     // Geometry and width determine the system; coefficient budgets only solve it.
     let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
         .iter()
-        .filter_map(|&n| fit_system(targets, w, h, &points, n, Precision::Compact, scratch))
+        .filter_map(|&n| fit_system(targets, w, h, &points, n, Precision::Lean, scratch))
         .collect();
     let mut alts: Vec<QuantizedSpline> = Vec::new();
     for k in 1..=LONG_LINE_MAX_COEFFS {
@@ -1609,7 +1624,7 @@ fn fit_whole_line(
     for points in &geometries {
         let systems: Vec<FitSystem> = widths[..LONG_LINE_SEEDED_WIDTHS]
             .iter()
-            .filter_map(|&n| fit_system(targets, w, h, points, n, Precision::Compact, scratch))
+            .filter_map(|&n| fit_system(targets, w, h, points, n, Precision::Lean, scratch))
             .collect();
         for k in 1..=LONG_LINE_MAX_COEFFS {
             for chroma in [0, 1] {
@@ -2292,6 +2307,43 @@ mod tests {
         assert_eq!(full.sol, compact.sol);
         assert_eq!(full.e0, compact.e0);
         assert!((full.err - compact.err).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lean_fit_preserves_compact_scores_and_quantization() {
+        let (w, h) = (128, 96);
+        let targets = std::array::from_fn(|c| {
+            (0..w * h)
+                .map(|i| (((i * 19 + c * 31) % 101) as f32 - 50.0) * 0.003)
+                .collect()
+        });
+        let mut scratch = FitScratch::default();
+        for points in [
+            [Point::new(3, 5), Point::new(123, 89)],
+            [Point::new(40, 47), Point::new(56, 49)],
+        ] {
+            for sigma_n in LONG_LINE_WIDTHS {
+                let system = |precision, scratch: &mut FitScratch| {
+                    fit_system(&targets, w, h, &points, sigma_n, precision, scratch).unwrap()
+                };
+                let compact = system(Precision::Compact, &mut scratch);
+                let lean = system(Precision::Lean, &mut scratch);
+                assert_eq!(lean.coeffs, compact.coeffs.min(LONG_LINE_MAX_COEFFS));
+                for k in 1..=LONG_LINE_MAX_COEFFS {
+                    for chroma in [0, 1] {
+                        let budget = Some((chroma, k, chroma));
+                        let full = compact.solve(budget);
+                        let trimmed = lean.solve(budget);
+                        assert_eq!(full.err.to_bits(), trimmed.err.to_bits());
+                        assert_eq!(full.e0.to_bits(), trimmed.e0.to_bits());
+                        assert_eq!(
+                            quantize(&points, &full).dct,
+                            quantize(&points, &trimmed).dct
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

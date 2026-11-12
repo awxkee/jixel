@@ -40,8 +40,48 @@ pub(crate) struct Segments {
     pub(crate) len2: [f32; 4],
 }
 
+const BOUNDS_BLOCKS: usize = 8;
+
+struct SegmentBounds {
+    min: Point<f32>,
+    max: Point<f32>,
+}
+
+impl SegmentBounds {
+    fn new(blocks: &[Segments]) -> Self {
+        let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for block in blocks {
+            for i in 0..4 {
+                let (x, y) = (block.x[i], block.y[i]);
+                // The distance kernel clamps t to [0, 1] in a + t * d.
+                // Include the rounded endpoint computed by that expression.
+                let (end_x, end_y) = (x + block.dx[i], y + block.dy[i]);
+                if [x, y, end_x, end_y].iter().any(|v| !v.is_finite()) {
+                    return Self {
+                        min: Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+                        max: Point::new(f32::INFINITY, f32::INFINITY),
+                    };
+                }
+                min.x = min.x.min(x).min(end_x);
+                min.y = min.y.min(y).min(end_y);
+                max.x = max.x.max(x).max(end_x);
+                max.y = max.y.max(y).max(end_y);
+            }
+        }
+        Self { min, max }
+    }
+
+    fn distance(&self, p: Point<f32>) -> f32 {
+        let dx = p.x - p.x.clamp(self.min.x, self.max.x);
+        let dy = p.y - p.y.clamp(self.min.y, self.max.y);
+        dx * dx + dy * dy
+    }
+}
+
 pub(super) struct Polyline {
     blocks: Vec<Segments>,
+    bounds: Vec<SegmentBounds>,
     len: usize,
     distance_blocks: SegmentDistanceFn,
 }
@@ -63,8 +103,17 @@ impl Polyline {
             block.dy[lane] = dy;
             block.len2[lane] = dx * dx + dy * dy;
         }
+        let bounds = if blocks.len() >= 3 * BOUNDS_BLOCKS {
+            blocks
+                .chunks_exact(BOUNDS_BLOCKS)
+                .map(SegmentBounds::new)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             blocks,
+            bounds,
             len,
             distance_blocks: ctx.spline_distance,
         }
@@ -84,11 +133,54 @@ impl Polyline {
         }
         let end = segments.end / 4 * 4;
         if prefix < end {
-            let blocks = &self.blocks[prefix / 4..end / 4];
-            best = best.min((self.distance_blocks)(p, blocks));
+            best = self.distance_block_range(p, prefix / 4..end / 4, best);
         }
         for i in prefix.max(end)..segments.end {
             best = best.min(self.scalar(p, i));
+        }
+        best
+    }
+
+    fn distance_block_range(&self, p: Point<f32>, blocks: Range<usize>, mut best: f32) -> f32 {
+        let first = blocks.start.div_ceil(BOUNDS_BLOCKS);
+        let end = blocks.end / BOUNDS_BLOCKS;
+        if end < first + 3 || !p.x.is_finite() || !p.y.is_finite() {
+            return best.min((self.distance_blocks)(p, &self.blocks[blocks]));
+        }
+        for partial in [
+            blocks.start..first * BOUNDS_BLOCKS,
+            end * BOUNDS_BLOCKS..blocks.end,
+        ] {
+            if !partial.is_empty() {
+                best = best.min((self.distance_blocks)(p, &self.blocks[partial]));
+            }
+        }
+        // Start from the nearest box to get a tight upper bound even when the
+        // query lies close to the far end of a long segment range.
+        let mut seed = None;
+        let mut lower = best;
+        for (i, bounds) in self.bounds[first..end].iter().enumerate() {
+            let distance = bounds.distance(p);
+            if distance < lower {
+                lower = distance;
+                seed = Some(first + i);
+            }
+        }
+        if let Some(seed) = seed {
+            let at = seed * BOUNDS_BLOCKS;
+            best = best.min((self.distance_blocks)(
+                p,
+                &self.blocks[at..at + BOUNDS_BLOCKS],
+            ));
+            for i in first..end {
+                if i != seed && self.bounds[i].distance(p) < best {
+                    let at = i * BOUNDS_BLOCKS;
+                    best = best.min((self.distance_blocks)(
+                        p,
+                        &self.blocks[at..at + BOUNDS_BLOCKS],
+                    ));
+                }
+            }
         }
         best
     }
@@ -200,5 +292,36 @@ mod tests {
             Polyline::new(&kernels, &[]).distance(points[0]),
             f32::INFINITY
         );
+    }
+
+    #[test]
+    fn bounded_ranges_match_reference_across_group_edges() {
+        let ctx = EncodingContext::default();
+        let points: Vec<_> = (0..193)
+            .map(|i| {
+                let t = (i / 2) as f32;
+                Point::new(t * 11.3, t * 1.4 + (t * 0.16).sin() * 19.0)
+            })
+            .collect();
+        let line = Polyline::new(&ctx, &points);
+        assert!(line.bounds.len() >= 3);
+        for start in [0, 1, 3, 4, 31, 32, 33, 64, 65] {
+            for end in [157, 160, 163, 191, 192] {
+                for p in [
+                    points[start],
+                    points[end],
+                    points[(start + end) / 2],
+                    Point::new(448.125, 88.75),
+                    Point::new(1800.0, 12.0),
+                    Point::new(-1e7, 1e7),
+                ] {
+                    assert_eq!(
+                        line.distance_range(p, start..end).to_bits(),
+                        reference(p, &points[start..=end]).to_bits(),
+                        "point {p:?}, range {start}..{end}",
+                    );
+                }
+            }
+        }
     }
 }

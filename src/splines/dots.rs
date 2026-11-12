@@ -52,6 +52,7 @@ use std::sync::Arc;
 
 const OPEN_RADIUS: usize = 3;
 const RING: isize = 4;
+const FIT_AREA: usize = ((2 * RING + 1) * (2 * RING + 1)) as usize;
 const BORDER: usize = 5;
 const MIN_TOP_HAT: f32 = 0.025;
 const MIN_DARK_TOP_HAT: f32 = 0.015;
@@ -297,7 +298,9 @@ fn dot_alts(
     cx: f32,
     cy: f32,
     n0: i32,
-    targets: &[Vec<f32>; 3],
+    luma: &[f32],
+    chroma: &mut [[f32; FIT_AREA]; 2],
+    init_chroma: impl FnOnce(&mut [[f32; FIT_AREA]; 2]),
     x: i32,
     y: i32,
     r: isize,
@@ -308,7 +311,8 @@ fn dot_alts(
     let side = (2 * r + 1) as usize;
     let (px, py) = (cx.round() as i32, cy.round() as i32);
     let mut alts = Vec::new();
-    let energy: f32 = targets[1].iter().map(|v| v * v).sum();
+    let energy: f32 = luma.iter().map(|v| v * v).sum();
+    let mut init_chroma = Some(init_chroma);
     for n in [n0 - 1, n0, n0 + 1] {
         if n < 1 {
             continue;
@@ -346,7 +350,7 @@ fn dot_alts(
                 .sum::<f32>()
                 / ff
         };
-        let cyv = proj(&targets[1]);
+        let cyv = proj(luma);
         // Reject edges and texture before paying for chroma and template RD.
         let explained = cyv * cyv * ff;
         if explained < min_explained * energy {
@@ -355,7 +359,11 @@ fn dot_alts(
         if cyv * polarity < Y0 {
             continue;
         }
-        let (cxv, cbv) = (proj(&targets[0]), proj(&targets[2]));
+        if let Some(init) = init_chroma.take() {
+            init(chroma);
+        }
+        let [x, b] = &*chroma;
+        let (cxv, cbv) = (proj(&x[..side * side]), proj(&b[..side * side]));
         let level = (Y_LEVELS_PER_OCTAVE * dirty_log2f(cyv.abs() / Y0)).round() as i32;
         let yq = quantized_y(level) * polarity;
         let xc = (cxv / yq / X_RATIO_STEP)
@@ -441,19 +449,16 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
     let mut out = Vec::new();
     let mut ring = Vec::with_capacity(32);
     let mut kernels = FitKernels::new();
-    'peaks: for (index, &(peak, x, y)) in peaks.iter().enumerate() {
+    let mut luma = [0.0; FIT_AREA];
+    let mut chroma = [[0.0; FIT_AREA]; 2];
+    for (index, &(peak, x, y)) in peaks.iter().enumerate() {
         let polarity = peak.signum();
         let (xi, yi) = (x as isize, y as isize);
         let px = |c: usize, dx: isize, dy: isize| {
             xyb.plane_row(c, (yi + dy) as usize)[(xi + dx) as usize]
         };
-        // Per-channel background: median of the ring; a peak in busy
-        // surroundings (texture) is not a dot.
-        let mut bg = [0f32; 3];
-        let mut slope = [[0f32; 2]; 3];
-        // Test Y isolation before fitting chroma: textured images reject most
-        // peaks here and need neither of the other two ring medians.
-        for c in [1, 0, 2] {
+        let background = |c: usize, ring: &mut Vec<f32>| {
+            let mut slope = [0f32; 2];
             if polarity < 0.0 {
                 // Opposite ring differences estimate the illumination slope
                 // robustly; an isolated mark on the ring cannot set the plane.
@@ -461,15 +466,14 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
                 for (i, k) in (-RING..=RING).enumerate() {
                     gradients[i] = (px(c, RING, k) - px(c, -RING, k)) / (2 * RING) as f32;
                 }
-                slope[c][0] = median(&mut gradients);
+                slope[0] = median(&mut gradients);
                 for (i, k) in (-RING..=RING).enumerate() {
                     gradients[i] = (px(c, k, RING) - px(c, k, -RING)) / (2 * RING) as f32;
                 }
-                slope[c][1] = median(&mut gradients);
+                slope[1] = median(&mut gradients);
             }
-            let detrended = |dx: isize, dy: isize| {
-                px(c, dx, dy) - slope[c][0] * dx as f32 - slope[c][1] * dy as f32
-            };
+            let detrended =
+                |dx: isize, dy: isize| px(c, dx, dy) - slope[0] * dx as f32 - slope[1] * dy as f32;
             ring.clear();
             for k in -RING..=RING {
                 ring.push(detrended(k, -RING));
@@ -479,28 +483,26 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
                     ring.push(detrended(RING, k));
                 }
             }
-            bg[c] = median(&mut ring);
-            if c == 1 {
-                // The scaled median absolute deviation passes exactly when
-                // more than half of the ring's deviations pass.
-                let med = bg[c];
-                let passing = ring
-                    .iter()
-                    .filter(|&&v| peak.abs() >= MIN_ISOLATION * ((v - med).abs() * 1.4826 + 1e-4))
-                    .count();
-                if passing <= ring.len() / 2 {
-                    continue 'peaks;
-                }
-            }
+            (median(ring), slope)
+        };
+        let luma_bg = background(1, &mut ring);
+        // The scaled median absolute deviation passes exactly when more than
+        // half of the ring's deviations pass.
+        let passing = ring
+            .iter()
+            .filter(|&&v| peak.abs() >= MIN_ISOLATION * ((v - luma_bg.0).abs() * 1.4826 + 1e-4))
+            .count();
+        if passing <= ring.len() / 2 {
+            continue;
         }
-        let contrast = |c: usize, dx: isize, dy: isize| {
-            px(c, dx, dy) - bg[c] - slope[c][0] * dx as f32 - slope[c][1] * dy as f32
+        let contrast = |c: usize, (bg, slope): (f32, [f32; 2]), dx: isize, dy: isize| {
+            px(c, dx, dy) - bg - slope[0] * dx as f32 - slope[1] * dy as f32
         };
         // Centroid and spread of the Y contrast.
         let (mut sw, mut sx, mut sy) = (0f32, 0f32, 0f32);
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let v = (polarity * contrast(1, dx, dy)).max(0.0);
+                let v = (polarity * contrast(1, luma_bg, dx, dy)).max(0.0);
                 sw += v;
                 sx += v * dx as f32;
                 sy += v * dy as f32;
@@ -513,7 +515,7 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
         let (mut vw, mut vr) = (0f32, 0f32);
         for dy in -2..=2 {
             for dx in -2..=2 {
-                let v = (polarity * contrast(1, dx, dy)).max(0.0);
+                let v = (polarity * contrast(1, luma_bg, dx, dy)).max(0.0);
                 let (rx, ry) = (xi as f32 + dx as f32 - cx, yi as f32 + dy as f32 - cy);
                 vw += v;
                 vr += v * (rx * rx + ry * ry);
@@ -523,23 +525,26 @@ fn fit_peaks(xyb: &Image3F, peaks: &[(f32, usize, usize)]) -> Vec<(usize, Candid
         let n0 = (var.sqrt() / sigma_step()).round().clamp(1.0, 10.0) as i32;
         let r = ((3.0 * (n0 + 1) as f32 * sigma_step() + 1.5).ceil() as isize).min(RING);
         let side = (2 * r + 1) as usize;
-        let mut targets = [
-            vec![0f32; side * side],
-            vec![0f32; side * side],
-            vec![0f32; side * side],
-        ];
-        for (c, t) in targets.iter_mut().enumerate() {
+        let target = |c, bg, values: &mut [f32; FIT_AREA]| {
             for dy in -r..=r {
                 for dx in -r..=r {
-                    t[((dy + r) as usize) * side + (dx + r) as usize] = contrast(c, dx, dy);
+                    values[((dy + r) as usize) * side + (dx + r) as usize] =
+                        contrast(c, bg, dx, dy);
                 }
             }
-        }
+        };
+        target(1, luma_bg, &mut luma);
         let alts = dot_alts(
             cx,
             cy,
             n0,
-            &targets,
+            &luma[..side * side],
+            &mut chroma,
+            |chroma| {
+                for (c, values) in [0, 2].into_iter().zip(chroma) {
+                    target(c, background(c, &mut ring), values);
+                }
+            },
             x as i32,
             y as i32,
             r,
@@ -620,7 +625,7 @@ pub(crate) struct DotPatches {
     pub(crate) atlas: [Vec<i32>; 3],
     pub(crate) width: usize,
     pub(crate) height: usize,
-    references: Vec<PatchReference>,
+    pub(super) references: Vec<PatchReference>,
 }
 
 impl DotPatches {
@@ -915,7 +920,12 @@ mod tests {
                     x as f32,
                     32.0,
                     4,
-                    &targets,
+                    &targets[1],
+                    &mut [[0.0; FIT_AREA]; 2],
+                    |[x, b]| {
+                        x.copy_from_slice(&targets[0]);
+                        b.copy_from_slice(&targets[2]);
+                    },
                     x as i32,
                     32,
                     r,
@@ -948,7 +958,7 @@ mod tests {
             }
         }
         for polarity in [-1.0, 1.0] {
-            let targets = targets
+            let targets: [Vec<f32>; 3] = targets
                 .clone()
                 .map(|values| values.into_iter().map(|v| -polarity * v).collect());
             assert!(
@@ -956,7 +966,9 @@ mod tests {
                     16.0,
                     16.0,
                     4,
-                    &targets,
+                    &targets[1],
+                    &mut [[0.0; FIT_AREA]; 2],
+                    |_| panic!("a rejected luma fit must not read chroma"),
                     16,
                     16,
                     r,

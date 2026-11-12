@@ -2802,11 +2802,16 @@ fn encode_lossy_u8_alpha<const CHANNELS: usize>(
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
     let pixels = input.as_chunks::<CHANNELS>().0;
+    let lossy_alpha = config.alpha_distance.is_none_or(|d| d > 0.0);
     let make_alpha = || {
         if CHANNELS == 3 {
             vec![255; width * height]
         } else {
-            pixels.iter().map(|px| px[3]).collect()
+            let mut alpha: Vec<u8> = pixels.iter().map(|px| px[3]).collect();
+            if lossy_alpha {
+                crate::alpha_fringe::clear(&mut alpha, width, height);
+            }
+            alpha
         }
     };
     let mut alpha = None;

@@ -49,7 +49,6 @@ use crate::dct::DctInput;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::uint_encode;
 use crate::image::Image3F;
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -246,17 +245,38 @@ struct Trial {
 
 impl Trial {
     fn new(current: &Image3F, plans: &[&TiledSpline]) -> Self {
+        if let [plan] = plans {
+            return Self {
+                blocks: plan
+                    .tiles
+                    .iter()
+                    .map(|tile| TrialBlock::load(current, tile.cell))
+                    .collect(),
+            };
+        }
         let mut cells: Vec<_> = plans
             .iter()
             .flat_map(|p| p.tiles.iter().map(|t| t.cell))
             .collect();
-        if plans.len() > 1 {
-            cells.sort_unstable();
-            cells.dedup();
-        }
+        cells.sort_unstable();
+        cells.dedup();
         let blocks = cells
             .into_iter()
             .map(|cell| TrialBlock::load(current, cell))
+            .collect();
+        Self { blocks }
+    }
+
+    /// Load and draw one alternative in block order.
+    fn drawn(current: &Image3F, plan: &TiledSpline) -> Self {
+        let blocks = plan
+            .tiles
+            .iter()
+            .map(|tile| {
+                let mut block = TrialBlock::load(current, tile.cell);
+                plan.draw_tile(tile, &mut block.pixels, -1.0);
+                block
+            })
             .collect();
         Self { blocks }
     }
@@ -313,12 +333,19 @@ impl Trial {
             let (x0, y0) = (bx * 8, by * 8);
             let (width, height) = ((w - x0).min(8), (h - y0).min(8));
             let touched = (0..height).any(|y| {
-                (0..width).any(|x| {
-                    let at = y * 8 + x;
-                    (current.plane_row(1, y0 + y)[x0 + x] - block.pixels[1][at]).abs() > 1e-5
-                        || (current.plane_row(0, y0 + y)[x0 + x] - block.pixels[0][at]).abs() > 1e-6
-                        || (current.plane_row(2, y0 + y)[x0 + x] - block.pixels[2][at]).abs() > 1e-5
-                })
+                let xs = x0..x0 + width;
+                let a = &current.plane_row(0, y0 + y)[xs.clone()];
+                let b = &current.plane_row(1, y0 + y)[xs.clone()];
+                let c = &current.plane_row(2, y0 + y)[xs];
+                let [x, yy, z] = &block.pixels;
+                let at = y * 8;
+                a.iter()
+                    .zip(b)
+                    .zip(c)
+                    .zip(x[at..].iter().zip(&yy[at..]).zip(&z[at..]))
+                    .any(|(((&a, &b), &c), ((&x, &y), &z))| {
+                        (b - y).abs() > 1e-5 || (a - x).abs() > 1e-6 || (c - z).abs() > 1e-5
+                    })
             });
             if !touched {
                 continue;
@@ -401,6 +428,12 @@ fn cache_blocks_parallel<'p>(
     let blocks_w = current.xsize().div_ceil(8);
     let cost =
         |cell: usize| model.cost(current, cell % blocks_w, cell / blocks_w, quant_field[cell]);
+    if model.ctx.thread_pool.num_threads() == 1 {
+        for cell in plans.flat_map(|plan| plan.tiles.iter().map(|tile| tile.cell)) {
+            cache[cell].get_or_insert_with(|| cost(cell));
+        }
+        return;
+    }
     let mut cells: Vec<usize> = plans
         .flat_map(|plan| plan.tiles.iter().map(|tile| tile.cell))
         .filter(|&cell| cache[cell].is_none())
@@ -642,7 +675,7 @@ fn encode_dot_plan(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     plan: &dots::DotPatches,
-) -> (BitWriter, f32) {
+) -> BitWriter {
     let mut atlas = BitWriter::new();
     crate::lossless::encode_modular_xyb_atlas_tree_slot(
         &plan.atlas,
@@ -655,7 +688,7 @@ fn encode_dot_plan(
         crate::patches::DOT_PATCH_REF_ID,
         &mut atlas,
     );
-    (atlas, dictionary_bits_of(scratch, &plan.references()))
+    atlas
 }
 
 /// Charges the selected dots their real atlas and dictionary bits, shared per
@@ -694,8 +727,8 @@ fn prune_dot_templates(
         }
         let set: Vec<QuantizedSpline> = idx.iter().map(|&i| kept[i].clone()).collect();
         let mut plan = dots::build_dot_patches_with_templates(&set, templates, false);
-        let mut dictionary_bits = dictionary_bits_of(scratch, &plan.references());
-        let mut atlas_bits = DOT_TEMPLATE_BITS * plan.references().len() as f32;
+        let mut dictionary_bits = dictionary_bits_of(scratch, &plan.references);
+        let mut atlas_bits = DOT_TEMPLATE_BITS * plan.references.len() as f32;
         let mut by_key: HashMap<dots::TemplateKey, (f32, usize)> = HashMap::new();
         for &i in &idx {
             let e = by_key
@@ -722,14 +755,13 @@ fn prune_dot_templates(
             &losing
         };
         if dropped.is_empty() || round == 8 {
-            let (padded_atlas, padded_dictionary_bits) = encode_dot_plan(ctx, scratch, &plan);
-            let mut atlas = padded_atlas;
+            let mut atlas = encode_dot_plan(ctx, scratch, &plan);
             atlas_bits = atlas.bits_written() as f32;
-            dictionary_bits = padded_dictionary_bits;
             // Zero padding can help Modular prediction, so race the trimmed
             // layout only once for the final set instead of assuming it wins.
             let trimmed = dots::build_dot_patches_with_templates(&set, templates, true);
-            let (trimmed_atlas, trimmed_dictionary_bits) = encode_dot_plan(ctx, scratch, &trimmed);
+            let trimmed_atlas = encode_dot_plan(ctx, scratch, &trimmed);
+            let trimmed_dictionary_bits = dictionary_bits_of(scratch, &trimmed.references);
             let trimmed_bits = trimmed_atlas.bits_written() as f32;
             if trimmed_bits + trimmed_dictionary_bits < atlas_bits + dictionary_bits {
                 plan = trimmed;
@@ -783,7 +815,7 @@ fn prune_dot_templates(
                 gain,
                 Some(dots::DotEncoding {
                     atlas: Arc::new(atlas),
-                    references: plan.references(),
+                    references: plan.references,
                 }),
             );
         }
@@ -1250,28 +1282,10 @@ pub(super) fn rd_select(
         keys.len(),
         |i, _| dots::DotTemplate::new(keys[i]),
     )));
-    // Second pass: a dot also pays for its template, by that template's share
-    // of the first-pass dots.
-    type Popularity = (HashMap<dots::TemplateKey, usize>, [usize; 2]);
-    let popularity: RefCell<Option<Popularity>> = RefCell::new(None);
-    let price = |prices: &CostModel, candidate: &Candidate, alt: &QuantizedSpline| {
-        if dots::is_dot(alt) {
-            let template = match popularity.borrow().as_ref() {
-                Some((counts, total)) => {
-                    let n = counts
-                        .get(&dot_templates[&dots::template_key(alt)].key)
-                        .copied()
-                        .unwrap_or(0)
-                        .max(1) as f32;
-                    dirty_log2f(total[usize::from(alt.dct[3][0] < 0)].max(1) as f32 / n)
-                        + DOT_TEMPLATE_BITS / n
-                }
-                None => DOT_FIRST_PASS_TEMPLATE_BITS,
-            };
-            dot_start[usize::from(alt.dct[3][0] < 0)] + template
-        } else {
-            margin * candidate.bits_factor * prices.spline_bits(alt)
-        }
+    // All placements of a template share its price within each pass.
+    let first_dot_price = dot_start.map(|bits| bits + DOT_FIRST_PASS_TEMPLATE_BITS);
+    let line_price = |prices: &CostModel, candidate: &Candidate, alt: &QuantizedSpline| {
+        margin * candidate.bits_factor * prices.spline_bits(alt)
     };
     let prepared = ctx
         .thread_pool
@@ -1320,8 +1334,7 @@ pub(super) fn rd_select(
                 trial: Trial { blocks: Vec::new() },
             });
         }
-        let mut trial = Trial::new(current, &[plan]);
-        trial.draw(plan, -1.0);
+        let mut trial = Trial::drawn(current, plan);
         let delta = trial.delta(&model, current, quant_field, cache, forbidden)?;
         Some(Evaluation { delta, trial })
     };
@@ -1341,6 +1354,7 @@ pub(super) fn rd_select(
     let mut first_pass = Vec::new();
     let mut first_choices = Vec::with_capacity(candidates.len());
     let mut occupied = vec![false; block_cache.len()];
+    let mut changed = vec![false; block_cache.len()];
     let mut next = 0;
     let mut second_pass_batches = Vec::new();
     while next < candidates.len() {
@@ -1394,7 +1408,13 @@ pub(super) fn rd_select(
                 let b = plans[index].bounds().unwrap();
                 let dj = evaluation.delta;
                 row[index] = Some((dj, b));
-                let j = dj + lambda * price(&prices, candidate, &candidate.alts[index]);
+                let alt = &candidate.alts[index];
+                let bits = if dots::is_dot(alt) {
+                    first_dot_price[usize::from(alt.dct[3][0] < 0)]
+                } else {
+                    line_price(&prices, candidate, alt)
+                };
+                let j = dj + lambda * bits;
                 if best.is_none_or(|(bj, _, _)| j < bj) {
                     best = Some((j, index, b));
                 }
@@ -1443,6 +1463,9 @@ pub(super) fn rd_select(
             if let Some((index, b, trial)) = chosen {
                 trial.commit(&mut current);
                 invalidate(&mut block_cache, b);
+                for by in b.1 / 8..=b.3 / 8 {
+                    changed[by * blocks_w..][b.0 / 8..=b.2 / 8].fill(true);
+                }
                 first_pass.push(candidates[start + i].alts[index].clone());
             }
             deltas.push(row);
@@ -1463,22 +1486,47 @@ pub(super) fn rd_select(
                 .copy_from_slice(xyb.plane_row(c, y));
         }
     }
-    block_cache.fill(None);
-    let mut changed = vec![false; block_cache.len()];
+    // Cached costs for blocks untouched in the first pass still describe
+    // the original pixels. Discard only costs that may reflect its commits.
+    for (cost, modified) in block_cache.iter_mut().zip(&mut changed) {
+        if *modified {
+            *cost = None;
+            *modified = false;
+        }
+    }
     prices = CostModel::prior(0.1);
-    {
+    let dot_prices = {
         let mut counts = HashMap::new();
         let mut total = [0usize; 2];
         for sp in first_pass.iter().filter(|sp| dots::is_dot(sp)) {
-            *counts
-                .entry(dot_templates[&dots::template_key(sp)].key)
-                .or_insert(0usize) += 1;
+            *counts.entry(dots::template_key(sp)).or_insert(0usize) += 1;
             total[usize::from(sp.dct[3][0] < 0)] += 1;
         }
-        if total.iter().any(|&n| n > 0) {
-            *popularity.borrow_mut() = Some((counts, total));
+        if counts.is_empty() {
+            HashMap::new()
+        } else {
+            keys.into_iter()
+                .map(|key| {
+                    let dark = usize::from(key.0 < 0);
+                    let n = counts.get(&key).copied().unwrap_or(0).max(1) as f32;
+                    let template =
+                        dirty_log2f(total[dark].max(1) as f32 / n) + DOT_TEMPLATE_BITS / n;
+                    (key, dot_start[dark] + template)
+                })
+                .collect()
         }
-    }
+    };
+    let price = |prices: &CostModel, candidate: &Candidate, alt: &QuantizedSpline| {
+        if dots::is_dot(alt) {
+            if dot_prices.is_empty() {
+                first_dot_price[usize::from(alt.dct[3][0] < 0)]
+            } else {
+                dot_prices[&dots::template_key(alt)]
+            }
+        } else {
+            line_price(prices, candidate, alt)
+        }
+    };
     for sp in first_pass.iter().filter(|sp| !dots::is_dot(sp)) {
         for (c, v) in spline_tokens(sp) {
             prices.add(c, v, 1.0);
@@ -1608,9 +1656,7 @@ pub(super) fn rd_select(
                 let trial = if let Some(evaluation) = evaluations[index].take() {
                     evaluation.trial
                 } else {
-                    let mut trial = Trial::new(&current, &[&plans[index]]);
-                    trial.draw(&plans[index], -1.0);
-                    trial
+                    Trial::drawn(&current, &plans[index])
                 };
                 trial.commit(&mut current);
                 invalidate(&mut block_cache, b);
